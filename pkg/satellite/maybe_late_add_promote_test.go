@@ -115,10 +115,16 @@ func TestMaybeLateAddPromote_SkipsWhenPeerHasData(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect(lateAddStatusKey, storage.FakeResponse{Stdout: []byte(`[{
 	  "name":"pvc-la","node-id":0,"role":"Secondary",
-	  "devices":[{"volume":2,"disk-state":"Inconsistent"}],
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
 	  "connections":[{
 	    "peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
-	    "peer_devices":[{"volume":2,"peer-disk-state":"UpToDate","replication-state":"SyncTarget","resync-suspended":"no"}]
+	    "peer_devices":[
+	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
+	      {"volume":2,"peer-disk-state":"UpToDate","replication-state":"SyncTarget","resync-suspended":"no"}
+	    ]
 	  }]
 	}]`)})
 

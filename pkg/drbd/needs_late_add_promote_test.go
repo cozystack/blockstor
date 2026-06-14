@@ -74,15 +74,21 @@ func TestNeedsLateAddPromote_WedgedLateVolume(t *testing.T) {
 
 // Not the lowest node-id: a peer with a LOWER node-id is also wedged on
 // vol-2, so it is the elected promoter — we must defer (no split-brain).
+// (vol-0 UpToDate everywhere → past day0, peer Connected → gates 1+2 OK.)
 func TestNeedsLateAddPromote_DefersToLowerNodeID(t *testing.T) {
 	adm := admWithLateAddStatus(t, `[{
 	  "name":"pvc-late","node-id":2,"role":"Secondary",
-	  "devices":[{"volume":2,"disk-state":"Inconsistent"}],
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
 	  "connections":[{
 	    "peer-node-id":0,"name":"n1","connection-state":"Connected",
 	    "peer-role":"Secondary",
-	    "peer_devices":[{"volume":2,"peer-disk-state":"Inconsistent",
-	      "replication-state":"Established","resync-suspended":"no"}]
+	    "peer_devices":[
+	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
+	      {"volume":2,"peer-disk-state":"Inconsistent","replication-state":"Established","resync-suspended":"no"}
+	    ]
 	  }]
 	}]`)
 
@@ -97,12 +103,17 @@ func TestNeedsLateAddPromote_DefersToLowerNodeID(t *testing.T) {
 func TestNeedsLateAddPromote_PeerHasDataVeto(t *testing.T) {
 	adm := admWithLateAddStatus(t, `[{
 	  "name":"pvc-late","node-id":0,"role":"Secondary",
-	  "devices":[{"volume":2,"disk-state":"Inconsistent"}],
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
 	  "connections":[{
 	    "peer-node-id":1,"name":"n2","connection-state":"Connected",
 	    "peer-role":"Secondary",
-	    "peer_devices":[{"volume":2,"peer-disk-state":"UpToDate",
-	      "replication-state":"SyncTarget","resync-suspended":"no"}]
+	    "peer_devices":[
+	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
+	      {"volume":2,"peer-disk-state":"UpToDate","replication-state":"SyncTarget","resync-suspended":"no"}
+	    ]
 	  }]
 	}]`)
 
@@ -116,12 +127,17 @@ func TestNeedsLateAddPromote_PeerHasDataVeto(t *testing.T) {
 func TestNeedsLateAddPromote_ActiveResyncDefers(t *testing.T) {
 	adm := admWithLateAddStatus(t, `[{
 	  "name":"pvc-late","node-id":0,"role":"Secondary",
-	  "devices":[{"volume":2,"disk-state":"Inconsistent"}],
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
 	  "connections":[{
 	    "peer-node-id":1,"name":"n2","connection-state":"Connected",
 	    "peer-role":"Secondary",
-	    "peer_devices":[{"volume":2,"peer-disk-state":"Inconsistent",
-	      "replication-state":"SyncSource","resync-suspended":"no"}]
+	    "peer_devices":[
+	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
+	      {"volume":2,"peer-disk-state":"Inconsistent","replication-state":"SyncSource","resync-suspended":"no"}
+	    ]
 	  }]
 	}]`)
 
@@ -134,17 +150,68 @@ func TestNeedsLateAddPromote_ActiveResyncDefers(t *testing.T) {
 func TestNeedsLateAddPromote_PeerPrimaryVeto(t *testing.T) {
 	adm := admWithLateAddStatus(t, `[{
 	  "name":"pvc-late","node-id":0,"role":"Secondary",
-	  "devices":[{"volume":2,"disk-state":"Inconsistent"}],
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
 	  "connections":[{
 	    "peer-node-id":1,"name":"n2","connection-state":"Connected",
 	    "peer-role":"Primary",
-	    "peer_devices":[{"volume":2,"peer-disk-state":"Inconsistent",
-	      "replication-state":"Established","resync-suspended":"no"}]
+	    "peer_devices":[
+	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
+	      {"volume":2,"peer-disk-state":"Inconsistent","replication-state":"Established","resync-suspended":"no"}
+	    ]
 	  }]
 	}]`)
 
 	if adm.NeedsLateAddPromote(t.Context(), "pvc-late") {
 		t.Fatal("a Primary peer must veto the late-add-promote")
+	}
+}
+
+// SPLIT-BRAIN SAFETY gate 1: a pure day0 bootstrap — EVERY volume
+// transiently Inconsistent, NO UpToDate sibling — must NOT fire, even
+// though "all replicas Inconsistent, no SyncSource" superficially looks
+// like the wedge. The normal day0 winner-election + auto-promote own
+// this; misfiring here is exactly what split-brained vol-0 on the stand.
+func TestNeedsLateAddPromote_Day0BootstrapNoFire(t *testing.T) {
+	adm := admWithLateAddStatus(t, `[{
+	  "name":"pvc-late","node-id":0,"role":"Secondary",
+	  "devices":[{"volume":0,"disk-state":"Inconsistent"}],
+	  "connections":[{
+	    "peer-node-id":1,"name":"n2","connection-state":"Connected",
+	    "peer-role":"Secondary",
+	    "peer_devices":[{"volume":0,"peer-disk-state":"Inconsistent",
+	      "replication-state":"Established","resync-suspended":"no"}]
+	  }]
+	}]`)
+
+	if adm.NeedsLateAddPromote(t.Context(), "pvc-late") {
+		t.Fatal("day0 bootstrap (no UpToDate sibling) must NOT trigger late-add-promote — normal winner election owns it")
+	}
+}
+
+// SPLIT-BRAIN SAFETY gate 2: a peer that is NOT fully Connected (the
+// day0 t+1s StandAlone/Connecting state) means the lowest-node-id
+// election would run over a partial peer set. Defer until every peer is
+// connected, so EXACTLY ONE node promotes — never two simultaneously.
+func TestNeedsLateAddPromote_PartialConnectivityNoFire(t *testing.T) {
+	adm := admWithLateAddStatus(t, `[{
+	  "name":"pvc-late","node-id":1,"role":"Secondary",
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
+	  "connections":[
+	    {"peer-node-id":0,"name":"n1","connection-state":"StandAlone","peer-role":"Unknown",
+	     "peer_devices":[{"volume":2,"peer-disk-state":"DUnknown","replication-state":"Off","resync-suspended":"no"}]},
+	    {"peer-node-id":2,"name":"n3","connection-state":"Connected","peer-role":"Secondary",
+	     "peer_devices":[{"volume":2,"peer-disk-state":"Inconsistent","replication-state":"Established","resync-suspended":"no"}]}
+	  ]
+	}]`)
+
+	if adm.NeedsLateAddPromote(t.Context(), "pvc-late") {
+		t.Fatal("a not-fully-connected peer set must defer the promote (incomplete election → split-brain risk)")
 	}
 }
 

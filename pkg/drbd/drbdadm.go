@@ -1390,31 +1390,44 @@ func localIsUpToDate(devices []drbdsetupStatusDevice) bool {
 //     short-circuits before even probing.
 //   - NeedsSoloPromote requires ZERO peers; here peers exist.
 //
-// Returns true ONLY when ALL hold, so EXACTLY ONE deterministic node
-// promotes and the force-primary is data-safe + self-limiting:
+// SPLIT-BRAIN SAFETY (the two gates that make this distinct from a day0
+// bootstrap — without them the predicate misfired on a fresh RD's vol-0
+// and two non-lowest nodes simultaneously force-primaried into
+// split-brain):
+//
+//  1. A LATE-add wedge means the RD is PAST first activation, so at
+//     least one local volume is already UpToDate (the earlier
+//     volumes). A pure day0 bootstrap has NO UpToDate volume yet —
+//     EVERY volume is transiently Inconsistent while the normal winner
+//     election + auto-promote run. Requiring a local UpToDate sibling
+//     means this predicate can NEVER fire during day0.
+//  2. EVERY peer connection must be fully Connected with the wedged
+//     volume's peer-disk OBSERVED. The lowest-node-id election is only
+//     sound with COMPLETE peer information; at day0 t+1s peers are still
+//     StandAlone / Connecting, so each node would see a partial peer set
+//     and several could each conclude "I am lowest" → simultaneous
+//     force-primary. Deferring until every peer is connected guarantees
+//     every node computes the election over the same full set, so
+//     EXACTLY ONE (the true lowest id) promotes.
+//
+// Beyond those, returns true ONLY when ALL hold, so the force-primary is
+// data-safe + self-limiting:
 //   - the kernel slot exists and reports a my-node-id;
-//   - the local role is NOT Primary and NO peer is Primary (never
-//     disturb an existing Primary that already drives the sync);
+//   - the local role is NOT Primary and NO peer is Primary;
 //   - at least one LOCAL diskful volume is Inconsistent, and for EVERY
 //     such volume NO connected peer exposes committed data
-//     (peer-disk UpToDate / Consistent / Outdated) — i.e. there is no
-//     real data source anywhere, the defining late-add wedge. If any
-//     peer held data the correct action is to SyncTarget from it, never
-//     force-primary (that is the Bug 342 unrelated-data guard);
-//   - none of those wedged volumes is already being actively resynced
-//     from a peer (SyncTarget/WFBitMapT in progress) — let a live resync
-//     finish on its own;
-//   - this node's my-node-id is the LOWEST among the diskful replicas
-//     (local + every peer that is NOT diskless on the wedged volume), so
-//     a single deterministic node promotes — no split-brain race.
+//     (peer-disk UpToDate / Consistent / Outdated) — the defining wedge;
+//     a peer with data means SyncTarget instead (Bug 342 guard);
+//   - none of those wedged volumes is already being actively resynced;
+//   - this node's my-node-id is the LOWEST among the wedged volume's
+//     diskful replicas.
 //
 // Data-safety: a fresh late-added volume's metadata was seeded at the
 // deterministic day0 current-UUID on every replica (the seed path runs
 // before bring-up), so `primary --force` here mints no UNRELATED UUID;
 // the Inconsistent peers simply SyncTarget from this now-Primary source.
-// Self-limiting: once the peers reach UpToDate they are no longer
-// Inconsistent and the predicate stops holding. Conservative on any
-// probe/parse failure → false (a missed promote just retries next pass).
+// Self-limiting: once the peers reach UpToDate the predicate stops
+// holding. Conservative on any probe/parse failure → false.
 func (a *Adm) NeedsLateAddPromote(ctx context.Context, resource string) bool {
 	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
 	if err != nil {
@@ -1441,6 +1454,19 @@ func (a *Adm) NeedsLateAddPromote(ctx context.Context, resource string) bool {
 		}
 	}
 
+	// Gate 1 (split-brain safety): the RD must be PAST day0 — at least one
+	// local volume already UpToDate. A pure day0 bootstrap has none, so
+	// the predicate cannot misfire there.
+	if !localHasUpToDateVolume(res.Devices) {
+		return false
+	}
+
+	// Gate 2 (split-brain safety): every peer must be fully connected so
+	// the lowest-node-id election runs over COMPLETE peer information.
+	if !allPeersConnected(res.Connections) {
+		return false
+	}
+
 	// Which local diskful volumes are wedged Inconsistent?
 	wedged := localInconsistentVolumes(res.Devices)
 	if len(wedged) == 0 {
@@ -1453,6 +1479,41 @@ func (a *Adm) NeedsLateAddPromote(ctx context.Context, resource string) bool {
 	for vol := range wedged {
 		ok := lateAddVolumeNeedsLocalPromote(res.Connections, vol, *res.NodeID)
 		if !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+// localHasUpToDateVolume reports whether at least one local device is
+// UpToDate — the proof that the RD is past first activation (a day0
+// bootstrap has every volume still Inconsistent). Gate 1 of the
+// split-brain-safe NeedsLateAddPromote.
+func localHasUpToDateVolume(devices []drbdsetupStatusDevice) bool {
+	for _, d := range devices {
+		if DiskState(d.DiskState) == DiskStateUpToDate {
+			return true
+		}
+	}
+
+	return false
+}
+
+// allPeersConnected reports whether EVERY peer connection is in the
+// Connected connection-state. Gate 2 of NeedsLateAddPromote: the
+// lowest-node-id promoter election is only sound with complete peer
+// information, so any StandAlone / Connecting / unconnected peer (the
+// day0 t+1s state) defers the self-heal. A resource with zero peer
+// connections is NOT covered here (that is NeedsSoloPromote's domain) —
+// returns false so the late-add gate never acts peerless.
+func allPeersConnected(conns []drbdsetupStatusConnection) bool {
+	if len(conns) == 0 {
+		return false
+	}
+
+	for _, conn := range conns {
+		if conn.ConnectionStr != "Connected" {
 			return false
 		}
 	}
