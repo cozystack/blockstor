@@ -238,3 +238,103 @@ func TestNeedsLateAddPromote_AllUpToDateNoOp(t *testing.T) {
 		t.Fatal("a fully-converged RD must NOT trigger any promote")
 	}
 }
+
+// BUG-048 (≥3-replica double-promoter wedge). A LOWER-node-id diskful peer
+// whose freshly late-added volume is still in a TRANSIENT bring-up state
+// (DUnknown — connection negotiated, peer disk not yet reported) is the
+// rightful promoter. The old election only counted a lower-id peer as a
+// competitor when it observed it as Inconsistent, so this node (id 2) saw
+// the lower-id peer mid-bring-up, concluded "I am lowest", and force-
+// primaried — and once the lower-id peer settled it ALSO promoted →
+// divergent current-UUIDs → PausedSyncS / StandAlone wedge (stand-observed
+// on 3-diskful: node-id 1 and node-id 0 both force-primaried the same late
+// volume). This node MUST defer to the lower-id peer regardless of its
+// transient per-volume state.
+func TestNeedsLateAddPromote_DefersToLowerNodeIDStillBringingUp(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		peerState string
+	}{
+		{"DUnknown", "DUnknown"},
+		{"Negotiating", "Negotiating"},
+		{"Attaching", "Attaching"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			adm := admWithLateAddStatus(t, `[{
+			  "name":"pvc-late","node-id":2,"role":"Secondary",
+			  "devices":[
+			    {"volume":0,"disk-state":"UpToDate"},
+			    {"volume":2,"disk-state":"Inconsistent"}
+			  ],
+			  "connections":[{
+			    "peer-node-id":0,"name":"n1","connection-state":"Connected",
+			    "peer-role":"Secondary",
+			    "peer_devices":[
+			      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
+			      {"volume":2,"peer-disk-state":"`+tc.peerState+`","replication-state":"Established","resync-suspended":"no"}
+			    ]
+			  }]
+			}]`)
+
+			if adm.NeedsLateAddPromote(t.Context(), "pvc-late") {
+				t.Fatalf("a lower-node-id diskful peer still bringing up the volume (%s) is the elected promoter; "+
+					"this node (id 2) must defer or both promote and wedge the volume (BUG-048)", tc.peerState)
+			}
+		})
+	}
+}
+
+// BUG-048 companion: deferring to a transient lower-id peer must NOT
+// deadlock when the lower-id peer is a PERMANENT diskless witness
+// (tiebreaker). A diskless peer never becomes a diskful promoter, so a
+// lower-id Diskless peer must be IGNORED (not deferred to) — this node
+// (id 2), the lowest DISKFUL replica, still promotes. (The witness shows
+// steady-state "Diskless"; a diskful peer mid-bring-up shows DUnknown /
+// Negotiating / Attaching, handled by the test above.)
+func TestNeedsLateAddPromote_PromotesOverLowerIDDisklessWitness(t *testing.T) {
+	adm := admWithLateAddStatus(t, `[{
+	  "name":"pvc-late","node-id":2,"role":"Secondary",
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
+	  "connections":[{
+	    "peer-node-id":0,"name":"tiebreaker","connection-state":"Connected",
+	    "peer-role":"Secondary",
+	    "peer_devices":[
+	      {"volume":0,"peer-disk-state":"Diskless","replication-state":"Established","resync-suspended":"no"},
+	      {"volume":2,"peer-disk-state":"Diskless","replication-state":"Established","resync-suspended":"no"}
+	    ]
+	  }]
+	}]`)
+
+	if !adm.NeedsLateAddPromote(t.Context(), "pvc-late") {
+		t.Fatal("a lower-id DISKLESS witness never promotes; this node (the lowest DISKFUL replica) " +
+			"must still force-primary to seed the SyncSource (deferring would deadlock the volume forever)")
+	}
+}
+
+// BUG-048 companion: the true-lowest diskful node still promotes even when
+// a HIGHER-id peer is mid-bring-up (DUnknown). A higher-id transient peer
+// is not a competitor — this node (id 0) is lowest and must seed.
+func TestNeedsLateAddPromote_LowestPromotesDespiteHigherIDBringingUp(t *testing.T) {
+	adm := admWithLateAddStatus(t, `[{
+	  "name":"pvc-late","node-id":0,"role":"Secondary",
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
+	  "connections":[{
+	    "peer-node-id":1,"name":"n2","connection-state":"Connected",
+	    "peer-role":"Secondary",
+	    "peer_devices":[
+	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
+	      {"volume":2,"peer-disk-state":"DUnknown","replication-state":"Established","resync-suspended":"no"}
+	    ]
+	  }]
+	}]`)
+
+	if !adm.NeedsLateAddPromote(t.Context(), "pvc-late") {
+		t.Fatal("the lowest diskful node must promote even when a higher-id peer is still bringing up the volume")
+	}
+}

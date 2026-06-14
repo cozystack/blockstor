@@ -1569,10 +1569,34 @@ func lateAddVolumeNeedsLocalPromote(conns []drbdsetupStatusConnection, vol, myID
 					// it finish rather than churn a promote.
 					return false
 				}
-			case DiskStateDiskless, DiskStateAttaching, DiskStateDetaching,
-				DiskStateFailed, DiskStateNegotiating, DiskStateDUnknown:
-				// Diskless witness / transient — not a data source and
-				// not a competing diskful promoter; ignore.
+			case DiskStateAttaching, DiskStateNegotiating, DiskStateDUnknown:
+				// BUG-048 (≥3-replica double-promoter wedge): a freshly
+				// late-added volume on a LOWER-id diskful peer passes
+				// through Attaching/Negotiating/DUnknown while its kernel
+				// slot brings the new volume up — the peer has NOT yet
+				// settled to Inconsistent. The old code treated these
+				// transient states as "not a competing diskful promoter;
+				// ignore", so a HIGHER-id node observing a lower-id peer
+				// mid-bring-up wrongly concluded "I am lowest" and force-
+				// primaried. Both the higher-id node AND the true-lowest
+				// node (once it finished bring-up) then promoted, minting
+				// divergent current-UUIDs → the volume wedged PausedSyncS /
+				// StandAlone split-brain with no convergence (stand-observed
+				// on 3-diskful: node-id 1 and node-id 0 both force-primaried
+				// the same late volume). A lower-id peer in a transient
+				// bring-up state is a real diskful replica that WILL win the
+				// election, so defer to it. DUnknown is also the
+				// connection-not-fully-negotiated state of a diskful peer —
+				// deferring is the conservative, split-brain-safe choice
+				// (the next reconcile re-evaluates once the peer settles).
+				if conn.PeerNodeID < myID {
+					weAreLowest = false
+				}
+			case DiskStateDiskless, DiskStateDetaching, DiskStateFailed:
+				// Diskless witness (steady-state of a tiebreaker — never a
+				// diskful promoter, deferring to it would deadlock the
+				// promote) or a failed/detaching local-disk peer that holds
+				// no data. Not a competing diskful promoter; ignore.
 			default:
 				// Unknown/empty — ignore.
 			}
