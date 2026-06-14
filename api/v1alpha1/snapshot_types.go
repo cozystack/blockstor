@@ -241,7 +241,7 @@ type SnapshotPerNodeStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
-// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name == self.spec.resourceDefinitionName + '.' + self.spec.snapshotName",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.snapshotName>",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.resourceDefinitionName + '.' + self.spec.snapshotName).lowerAscii()",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.snapshotName> (case-insensitive)",optionalOldSelf=true
 
 // Snapshot is the Schema for the snapshots API.
 //
