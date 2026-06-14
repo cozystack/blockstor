@@ -504,6 +504,98 @@ func (a *Adm) NewCurrentUUID(ctx context.Context, resource string) error {
 	return a.run(ctx, "new-current-uuid", resource)
 }
 
+// MintLateAddSource makes THIS node an UpToDate source for every LOCAL
+// Inconsistent volume of `resource`, so the Inconsistent peers can
+// SyncTarget from it (BUG-048, the all-Inconsistent late-add wedge where
+// NO replica ever won the volume's UpToDate seed).
+//
+// Why not `primary --force`: the existing late-add-promote ran
+// `drbdadm primary --force <res>`, but the kernel REJECTS it with
+// "(-16) Disk state is lower than outdated" whenever ANY volume of the
+// resource is Inconsistent (stand-observed: the promote retried every
+// throttle window and never took, the volume stayed Inconsistent on all
+// replicas forever). `primary` is also resource-wide, so a single
+// Inconsistent late volume blocks promoting the whole resource even though
+// the sibling volumes are UpToDate.
+//
+// Instead, mint the source per-volume the way DRBD's own skip-initial-sync
+// does: `drbdsetup new-current-uuid --clear-bitmap <minor>` marks the
+// volume UpToDate with a clean bitmap. That call requires the volume's
+// peers to be StandAlone, so the sequence is:
+//
+//  1. `drbdadm disconnect <res>` — quiesce every peer (resource-wide; DRBD
+//     carries all volumes over one connection per peer). UpToDate sibling
+//     volumes (vol-0/vol-1) are unaffected: on reconnect they re-handshake
+//     at their shared UUID and stay Established (no resync).
+//  2. for each LOCAL Inconsistent volume: `new-current-uuid --clear-bitmap
+//     <minor>` → that volume flips UpToDate with a clean bitmap.
+//  3. `drbdadm adjust <res>` — reconnect every peer. The peers, still
+//     Inconsistent, now see an UpToDate source and SyncTarget from it.
+//
+// Data-safety: the late-added volume is genuinely fresh/empty on every
+// replica (day0 lineage; this gate fires only when NO peer holds committed
+// data — the caller's NeedsLateAddPromote enforces that), so minting an
+// empty UpToDate source loses nothing — the Inconsistent peers were equally
+// empty and simply adopt this clean copy. Gated by NeedsLateAddPromote
+// (lowest-id node, no peer data, no Primary), so exactly one deterministic
+// node mints the source and no split-brain race is possible.
+//
+// Returns the cleared minors (for logging) and the first error. A disconnect
+// failure is best-effort-ignored (a peer already StandAlone is fine); a
+// clear-bitmap or adjust failure surfaces.
+func (a *Adm) MintLateAddSource(ctx context.Context, resource string) ([]int32, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return nil, errors.Wrapf(err, "drbdsetup status %s", resource)
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 {
+		return nil, errors.Wrapf(err, "parse drbdsetup status %s", resource)
+	}
+
+	var minors []int32
+
+	for _, dev := range status[0].Devices {
+		if DiskState(dev.DiskState) == DiskStateInconsistent {
+			minors = append(minors, dev.Minor)
+		}
+	}
+
+	if len(minors) == 0 {
+		return nil, nil
+	}
+
+	// Best-effort disconnect of all peers — new-current-uuid --clear-bitmap
+	// requires StandAlone; a peer already StandAlone returns non-zero, which
+	// we ignore.
+	_, _ = a.exec.Run(ctx, "drbdadm", "disconnect", resource)
+
+	for _, minor := range minors {
+		_, mintErr := a.exec.Run(ctx, "drbdsetup", "new-current-uuid",
+			"--clear-bitmap", strconv.Itoa(int(minor)))
+		if mintErr != nil {
+			// Reconnect before bailing so a half-applied mint does not
+			// leave the resource StandAlone.
+			_ = a.run(ctx, "adjust", resource)
+
+			return minors, errors.Wrapf(mintErr,
+				"new-current-uuid --clear-bitmap %d", minor)
+		}
+	}
+
+	// Reconnect every peer; the Inconsistent peers now SyncTarget from the
+	// freshly-UpToDate local volumes.
+	err = a.run(ctx, "adjust", resource)
+	if err != nil {
+		return minors, errors.Wrapf(err, "adjust %s after mint", resource)
+	}
+
+	return minors, nil
+}
+
 // SuspendIO runs `drbdadm suspend-io <resource>` — freezes the
 // resource's block-I/O path on the local satellite so a backing
 // snapshot (LVM-thin / ZFS / file) captures bytes at a stable

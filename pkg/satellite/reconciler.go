@@ -2736,17 +2736,26 @@ func (r *Reconciler) maybeRecoveryPromote(ctx context.Context, dr *intent.Desire
 // when a local diskful volume is Inconsistent, NO connected peer holds
 // committed data for it (so there is no real SyncSource to wait for),
 // no replica is Primary, and this node is the deterministic lowest
-// node-id — so exactly one node force-primaries and it is data-safe
-// (every replica shares the volume's day0 current-UUID; primary --force
-// mints no unrelated UUID, and the Inconsistent peers SyncTarget from
-// this now-Primary source). Self-limiting: once the peers converge the
-// predicate stops holding.
+// node-id — so exactly one node mints the source and it is data-safe
+// (every replica shares the volume's day0 current-UUID and is equally
+// empty, so the minted UpToDate copy loses nothing; the Inconsistent peers
+// SyncTarget from it). Self-limiting: once the peers converge the predicate
+// stops holding.
+//
+// How the source is minted: NOT `drbdadm primary --force`. The kernel
+// REJECTS that with "(-16) Disk state is lower than outdated" whenever any
+// volume of the resource is Inconsistent (stand-observed: the old promote
+// retried every throttle window and never took — the wedge persisted on all
+// replicas). Instead MintLateAddSource disconnects, runs the per-volume
+// `drbdsetup new-current-uuid --clear-bitmap <minor>` (the same skip-init
+// path DRBD uses to mark a fresh volume UpToDate), and reconnects — so the
+// Inconsistent peers SyncTarget from the freshly-UpToDate local volumes.
 //
 // NOT gated on autoPromote/autoPrimaryReplica by design — those are
 // exactly what is missing on the late-add path. It IS gated on the same
 // recoveryPromoteThrottle so a still-converging resync isn't churned by
-// repeated promotes. Skipped on diskless replicas (no disk to promote)
-// and when Adm is unwired (storage-only unit tests).
+// repeated mints. Skipped on diskless replicas (no disk to mint) and when
+// Adm is unwired (storage-only unit tests).
 func (r *Reconciler) maybeLateAddPromote(ctx context.Context, dr *intent.DesiredResource, diskless bool) error {
 	if diskless || r.cfg.Adm == nil {
 		return nil
@@ -2760,10 +2769,18 @@ func (r *Reconciler) maybeLateAddPromote(ctx context.Context, dr *intent.Desired
 		return nil
 	}
 
-	log.FromContext(ctx).Info("BUG-048 late-add-promote: force-primary to seed SyncSource for late-added volume wedged Inconsistent on every replica",
+	log.FromContext(ctx).Info("BUG-048 late-add-promote: mint UpToDate source (disconnect + new-current-uuid --clear-bitmap + reconnect) for a late-added volume wedged Inconsistent on every replica",
 		"resource", dr.GetName())
 
-	return r.runAutoPromote(ctx, dr)
+	minors, err := r.cfg.Adm.MintLateAddSource(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "late-add-promote mint source %s", dr.GetName())
+	}
+
+	log.FromContext(ctx).Info("BUG-048 late-add-promote: minted UpToDate source",
+		"resource", dr.GetName(), "minors", minors)
+
+	return nil
 }
 
 // maybeKickLateAddResync is the BUG-048 self-heal for a late-added volume

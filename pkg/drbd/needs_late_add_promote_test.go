@@ -19,6 +19,7 @@ limitations under the License.
 package drbd_test
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -336,5 +337,76 @@ func TestNeedsLateAddPromote_LowestPromotesDespiteHigherIDBringingUp(t *testing.
 
 	if !adm.NeedsLateAddPromote(t.Context(), "pvc-late") {
 		t.Fatal("the lowest diskful node must promote even when a higher-id peer is still bringing up the volume")
+	}
+}
+
+// MintLateAddSource clears the bitmap for ONLY the local Inconsistent
+// volumes (per-minor), wrapped in disconnect → ... → adjust, and never the
+// rejected resource-wide `primary --force`.
+func TestMintLateAddSource_ClearsInconsistentMinorsOnly(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Responses["drbdsetup status pvc-mint --json"] = storage.FakeResponse{Stdout: []byte(`[{
+	  "name":"pvc-mint","node-id":0,"role":"Secondary",
+	  "devices":[
+	    {"volume":0,"minor":1000,"disk-state":"UpToDate"},
+	    {"volume":1,"minor":1001,"disk-state":"Inconsistent"},
+	    {"volume":2,"minor":1002,"disk-state":"Inconsistent"}
+	  ],
+	  "connections":[]
+	}]`)}
+
+	adm := drbd.NewAdm(fx)
+
+	minors, err := adm.MintLateAddSource(t.Context(), "pvc-mint")
+	if err != nil {
+		t.Fatalf("MintLateAddSource: %v", err)
+	}
+	if !slices.Equal(minors, []int32{1001, 1002}) {
+		t.Fatalf("expected cleared minors [1001 1002], got %v", minors)
+	}
+
+	cmds := fx.CommandLines()
+	want := []string{
+		"drbdadm disconnect pvc-mint",
+		"drbdsetup new-current-uuid --clear-bitmap 1001",
+		"drbdsetup new-current-uuid --clear-bitmap 1002",
+		"drbdadm adjust pvc-mint",
+	}
+	for _, w := range want {
+		if !slices.Contains(cmds, w) {
+			t.Errorf("expected command %q, got: %v", w, cmds)
+		}
+	}
+	// The UpToDate sibling (minor 1000) must NOT be cleared.
+	if slices.Contains(cmds, "drbdsetup new-current-uuid --clear-bitmap 1000") {
+		t.Errorf("must NOT clear-bitmap the UpToDate sibling minor 1000, got: %v", cmds)
+	}
+	// The kernel-rejected resource-wide primary --force must not appear.
+	if slices.Contains(cmds, "drbdadm primary --force pvc-mint") {
+		t.Errorf("must NOT use primary --force, got: %v", cmds)
+	}
+}
+
+// No local Inconsistent volume → MintLateAddSource is a no-op (no
+// disconnect, no clear-bitmap).
+func TestMintLateAddSource_NoopWhenNothingInconsistent(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Responses["drbdsetup status pvc-mint --json"] = storage.FakeResponse{Stdout: []byte(`[{
+	  "name":"pvc-mint","node-id":0,"role":"Secondary",
+	  "devices":[{"volume":0,"minor":1000,"disk-state":"UpToDate"}],
+	  "connections":[]
+	}]`)}
+
+	adm := drbd.NewAdm(fx)
+
+	minors, err := adm.MintLateAddSource(t.Context(), "pvc-mint")
+	if err != nil {
+		t.Fatalf("MintLateAddSource: %v", err)
+	}
+	if len(minors) != 0 {
+		t.Fatalf("expected no minors cleared, got %v", minors)
+	}
+	if slices.Contains(fx.CommandLines(), "drbdadm disconnect pvc-mint") {
+		t.Errorf("must NOT disconnect when nothing is Inconsistent, got: %v", fx.CommandLines())
 	}
 }

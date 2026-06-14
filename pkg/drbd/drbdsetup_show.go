@@ -152,6 +152,11 @@ type drbdsetupStatusDevice struct {
 	// DiskState is this node's local disk state for the volume
 	// (`disk-state`): UpToDate / Inconsistent / Diskless / …
 	DiskState string `json:"disk-state"`
+	// Minor is the kernel minor number backing this volume (`/dev/drbdN`).
+	// Used by the BUG-048 late-add source-mint (MintLateAddSource) to
+	// target `drbdsetup new-current-uuid --clear-bitmap <minor>` at the
+	// specific stuck volume.
+	Minor int32 `json:"minor"`
 }
 
 // drbdsetupStatusConnection is one peer connection slot, as emitted by

@@ -42,9 +42,9 @@ const lateAddStatusKey = "drbdsetup status pvc-la --json"
 const lateAddStatusWedged = `[{
   "name":"pvc-la","node-id":0,"role":"Secondary",
   "devices":[
-    {"volume":0,"disk-state":"UpToDate"},
-    {"volume":1,"disk-state":"UpToDate"},
-    {"volume":2,"disk-state":"Inconsistent"}
+    {"volume":0,"minor":1000,"disk-state":"UpToDate"},
+    {"volume":1,"minor":1001,"disk-state":"UpToDate"},
+    {"volume":2,"minor":1002,"disk-state":"Inconsistent"}
   ],
   "connections":[{
     "peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
@@ -72,8 +72,9 @@ func lateAddDR() *intent.DesiredResource {
 	}
 }
 
-// The wedge fires the force-primary (and the demote after) even though
-// no auto-primary flag was ever stamped — the whole point of the gate.
+// The wedge mints an UpToDate source via disconnect + per-volume
+// new-current-uuid --clear-bitmap + reconnect (NOT primary --force, which
+// the kernel rejects while a volume is Inconsistent).
 func TestMaybeLateAddPromote_FiresForWedgedLateVolume(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect(lateAddStatusKey, storage.FakeResponse{Stdout: []byte(lateAddStatusWedged)})
@@ -85,11 +86,23 @@ func TestMaybeLateAddPromote_FiresForWedgedLateVolume(t *testing.T) {
 	}
 
 	cmds := fx.CommandLines()
-	if !slices.Contains(cmds, "drbdadm primary --force pvc-la") {
-		t.Errorf("expected `drbdadm primary --force pvc-la`, got: %v", cmds)
+	if !slices.Contains(cmds, "drbdadm disconnect pvc-la") {
+		t.Errorf("expected `drbdadm disconnect pvc-la`, got: %v", cmds)
 	}
-	if !slices.Contains(cmds, "drbdadm secondary pvc-la") {
-		t.Errorf("expected `drbdadm secondary pvc-la` (demote after promote), got: %v", cmds)
+	if !slices.Contains(cmds, "drbdsetup new-current-uuid --clear-bitmap 1002") {
+		t.Errorf("expected `drbdsetup new-current-uuid --clear-bitmap 1002` (the Inconsistent vol-2 minor), got: %v", cmds)
+	}
+	if !slices.Contains(cmds, "drbdadm adjust pvc-la") {
+		t.Errorf("expected `drbdadm adjust pvc-la` (reconnect after mint), got: %v", cmds)
+	}
+	// Must NOT touch the UpToDate sibling volumes' minors.
+	if slices.Contains(cmds, "drbdsetup new-current-uuid --clear-bitmap 1000") ||
+		slices.Contains(cmds, "drbdsetup new-current-uuid --clear-bitmap 1001") {
+		t.Errorf("must NOT clear-bitmap UpToDate sibling volumes, got: %v", cmds)
+	}
+	// The rejected resource-wide primary --force is gone.
+	if slices.Contains(cmds, "drbdadm primary --force pvc-la") {
+		t.Errorf("must NOT use the kernel-rejected `primary --force` on the late-add path, got: %v", cmds)
 	}
 }
 
@@ -104,8 +117,8 @@ func TestMaybeLateAddPromote_SkipsDiskless(t *testing.T) {
 		t.Fatalf("maybeLateAddPromote: %v", err)
 	}
 
-	if slices.Contains(fx.CommandLines(), "drbdadm primary --force pvc-la") {
-		t.Errorf("diskless replica must NOT be promoted, got: %v", fx.CommandLines())
+	if slices.Contains(fx.CommandLines(), "drbdadm disconnect pvc-la") {
+		t.Errorf("diskless replica must NOT mint a source, got: %v", fx.CommandLines())
 	}
 }
 
@@ -134,7 +147,7 @@ func TestMaybeLateAddPromote_SkipsWhenPeerHasData(t *testing.T) {
 		t.Fatalf("maybeLateAddPromote: %v", err)
 	}
 
-	if slices.Contains(fx.CommandLines(), "drbdadm primary --force pvc-la") {
-		t.Errorf("must NOT force-primary when a peer holds data, got: %v", fx.CommandLines())
+	if slices.Contains(fx.CommandLines(), "drbdadm disconnect pvc-la") {
+		t.Errorf("must NOT mint a source when a peer holds data, got: %v", fx.CommandLines())
 	}
 }
