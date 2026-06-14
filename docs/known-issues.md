@@ -288,12 +288,36 @@ Idempotency of `provider.DeleteVolume` was already guaranteed by Bug 33's contra
 
 **Related commits / tests**: `pkg/satellite/controllers/storage_sweeper.go` + `pkg/satellite/controllers/storage_sweeper_test.go` (7 unit tests covering owned-leave-alone, orphan-reap, foreign-prefix immunity, per-node scope, rate-limit, skip-annotation, mid-delete-race protection, missing-RD wildcard protection); `pkg/storage/storage.go` adds the `VolumeLister` optional interface + `VolumeRef`; ZFS / LVM-thin / LVM-thick providers implement it. E2e validation via `lc-rd-delete-churn.sh` (passes 10 iters without ZVOL leak).
 
+## Bug 50: concurrent rapid late `vd c` wedges or drops the second volume
+
+**Status**: open (campaign tracking id: BUG-048)
+**Severity**: P1 (availability; NOT data-loss, NOT a node-reboot deadlock; recoverable)
+**Scenario reference**: tests/e2e/cli-matrix/multi-volume-late-vd-create.sh
+**Surfaced by**: release-gate validation campaign
+**Reproduction steps**:
+
+1. Create a multi-replica ResourceDefinition and let it converge (at least one VolumeDefinition, all replicas UpToDate).
+2. Issue two `linstor volume-definition create <rd> <size>` calls back-to-back in rapid succession (concurrently, or scripted with no wait between them).
+
+**Expected behaviour**: Both volume-definitions are created; each new volume is laid down on every replica and reaches `UpToDate` (with one replica electing SyncSource), exactly as a sequential add would.
+
+**Actual behaviour**: Intermittently one of two faults occurs — (a) the second `vd c` returns SUCCESS but the VolumeDefinition is silently dropped (only one VD ends up persisted), or (b) the second volume is created but wedges `Inconsistent` with no SyncSource elected, so it never reaches `UpToDate`. In case (a) both calls report success.
+
+**Scope / reachability**: NOT reachable through the production CSI path. linstor-csi maps one PVC to one ResourceDefinition with exactly one VolumeDefinition, created in a single request; autoplace and `ControllerPublishVolume` add no VolumeDefinitions, and resize grows the existing volume in place. The fault is reachable only when an operator (or a script) issues concurrent / rapid back-to-back manual `vd c` calls against an existing multi-replica RD. No data is lost or corrupted (md5 held across all validation runs) and no node reboot is required.
+
+**Recovery**: Delete the wedged or missing volume-definition (`linstor vd d <rd> <vnr>`) and re-add it sequentially — issue one `vd c`, wait for it to reach `UpToDate`, then issue the next. Always add late volume-definitions one at a time.
+
+**Recommended fix**: Serialise concurrent VolumeDefinition creation on a given ResourceDefinition (optimistic-concurrency precondition on the RD volume-minor allocation plus the auto-numbered VD create) so the second add observes the first, and seed the new volume's GI / current-UUID before peers attach so a deterministic SyncSource is elected. A first attempt (PR #164) reduced the silent-drop and fixed a day0 split-brain leg but regressed the CSI-reachable single-late-VD path, so it was not merged; a corrected fix that does not touch the single-VD path is tracked.
+
+**Related commits / tests**: cli-matrix cell `tests/e2e/cli-matrix/multi-volume-late-vd-create.sh` honestly catches this (as of #162); PR #164 (deferred). No closing commit yet.
+
 ## Recommended next-fix order
 
 1. **Bug 35** (P0, placer FreeCapacity) — only P0; blocks placer 1.0 and risks ENOSPC at create time.
 2. **Bug 42** (P1, piraeus pod-CIDR drift) — blocks the iptables-mode e2e lane.
 3. **Bug 36 + 37** (P1, VD props merge) — fix together; 37 depends on 36's merge plumbing.
 4. **Bug 39 + 40** (P1, toggle-disk retry/cancel) — fix together; together they unlock Bug 34's Option B state machine.
-5. **Bug 34 Option B** (P1 follow-up) — wrap migrate-disk in the new state machine once 39/40 land.
-6. **Bug 38** (P2, cosmetic STATE_INFO on shrink) — pure UX, do last.
-7. **Bug 32** (P2, observation) — document only; no code fix needed.
+5. **Bug 50** (P1, concurrent late `vd c`) — serialise VolumeDefinition create on the RD and seed GI before peer attach; operator-only path, recoverable, not data-loss. A corrected fix (superseding the deferred PR #164) is tracked.
+6. **Bug 34 Option B** (P1 follow-up) — wrap migrate-disk in the new state machine once 39/40 land.
+7. **Bug 38** (P2, cosmetic STATE_INFO on shrink) — pure UX, do last.
+8. **Bug 32** (P2, observation) — document only; no code fix needed.
