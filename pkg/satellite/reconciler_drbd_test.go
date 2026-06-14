@@ -3026,6 +3026,122 @@ func TestApplyDRBDAllocatesBackingForLateAddedVolume(t *testing.T) {
 	}
 }
 
+// TestApplyLateAddedVolumePerVolumeMetadataRunsDespitePreRenderedRes pins
+// BUG-048 (P1, availability): the per-volume create-md + winner-seed pass
+// MUST fire for a late-added volume EVEN WHEN the on-disk .res already
+// carries the new volume's `volume N {` block.
+//
+// Root cause: the gate that admitted ensurePerVolumeMetadata used to be
+// hasLateAddedVolume(resPath, dr) — a comparison of the desired volume
+// set against the `volume N {` blocks rendered in the OLD .res. But the
+// FSM dispatch runs renderResFile as a preamble for every adjust/up, so
+// on a concurrent late vd-add an EARLIER reconcile's adjust re-rendered
+// .res to include the new volume's block BEFORE this gate read it. The
+// gate then saw "no late volume" → SKIPPED create-md + the winner seed
+// → the new volume came up via the kernel adjust with no metadata and no
+// elected SyncSource → Inconsistent on every replica, permanently
+// wedged. The gate now keys off the race-free MetadataCreated signal
+// (this RD is past first activation), and the idempotent per-volume
+// HasMD probe inside ensurePerVolumeMetadata is the sole authority for
+// which volumes actually need create-md.
+//
+// Distinguishing factor vs TestApplyDRBDAllocatesBackingForLateAddedVolume:
+// here the seeded .res ALREADY contains `volume 1 { ... }` (simulating
+// the pre-render race). Under the old .res-count gate this Apply did
+// NOTHING for vol-1; under the fix it still create-md's + seeds it.
+func TestApplyLateAddedVolumePerVolumeMetadataRunsDespitePreRenderedRes(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-race_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-race_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-race_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-race_00000|1048576\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-race_00001",
+		storage.FakeResponse{Stdout: []byte("pvc-race_00001\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-race_00001",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-race_00001|1048576\n")})
+
+	// vol-0 already has metadata; vol-1 does NOT (the late-added volume).
+	fx.Expect("drbdadm dump-md pvc-race/0",
+		storage.FakeResponse{Stdout: []byte("version \"v09\";\nla-size-sect 2048;\n")})
+	fx.Expect("drbdadm dump-md pvc-race/1",
+		storage.FakeResponse{Err: errDrbdadmDumpMdNoMeta})
+
+	// The fix MUST still create-md vol-1 despite the pre-rendered .res.
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race/1", drbd.MaxPeers-1),
+		storage.FakeResponse{})
+
+	fx.Expect("drbdsetup status pvc-race",
+		storage.FakeResponse{Stdout: []byte("pvc-race role:Secondary\n  volume:0 disk:UpToDate\n")})
+	fx.Expect("drbdsetup status --verbose pvc-race",
+		storage.FakeResponse{Stdout: []byte("pvc-race role:Secondary\n  volume:0 disk:UpToDate\n")})
+	fx.Expect("drbdadm adjust pvc-race", storage.FakeResponse{})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// THE RACE: the .res ALREADY carries volume 1 (the FSM render-preamble
+	// of a prior reconcile pre-populated it). The old hasLateAddedVolume
+	// gate would see both blocks present and skip create-md for vol-1.
+	resPath := filepath.Join(dir, "pvc-race.res")
+	preRendered := "resource pvc-race {\n" +
+		"  on n1 {\n" +
+		"    volume 0 {\n    }\n" +
+		"    volume 1 {\n    }\n" +
+		"  }\n}\n"
+	if err := os.WriteFile(resPath, []byte(preRendered), 0o600); err != nil {
+		t.Fatalf("seed .res: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pvc-race.md-created"), nil, 0o600); err != nil {
+		t.Fatalf("seed md-created: %v", err)
+	}
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:            "pvc-race",
+			NodeName:        "n1",
+			MetadataCreated: true,
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+				{VolumeNumber: 1, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply: expected Ok=true; got results=%+v", results)
+	}
+
+	calls := fx.CommandLines()
+
+	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race/1", drbd.MaxPeers-1)
+	if !slices.Contains(calls, wantCreateMD) {
+		t.Errorf("BUG-048: per-volume create-md for vol-1 SKIPPED despite pre-rendered .res — "+
+			"the late-added volume gets no metadata + no winner seed and wedges Inconsistent; "+
+			"want %q in %v", wantCreateMD, calls)
+	}
+
+	// vol-0 must NOT be re-created (would wipe its GI + bitmap).
+	forbidden := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race/0", drbd.MaxPeers-1)
+	if slices.Contains(calls, forbidden) {
+		t.Errorf("re-ran create-md on vol-0 (would wipe operator-stamped metadata): %v", calls)
+	}
+}
+
 // TestApplyLateAddedVolumeWinnerSeedsUpToDate pins Bug 384 (P0, data
 // integrity — regression of Bug 79/332): when `linstor vd c <rd> 1G`
 // adds vol-1 to a multi-replica RD whose vol-0 already reached
