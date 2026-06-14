@@ -66,10 +66,17 @@ fi
 # show_max_buffers <node> — echo the effective max-buffers for $RD as
 # the running kernel sees it. `drbdsetup show` dumps the live config in
 # the same `net { max-buffers <n>; }` shape the .res carries.
+#
+# Capture drbdsetup's output into a variable FIRST, then awk the string.
+# Piping `drbdsetup show | awk '... exit'` closed the pipe on the first
+# match while drbdsetup was still writing → SIGPIPE on the writer, which
+# under `set -o pipefail` surfaced as exit 141 from the command
+# substitution in wait_max_buffers and aborted the cell. The here-string
+# has no writer to signal, so the early awk `exit` is harmless.
 show_max_buffers() {
-    local node=$1
-    on_node "$node" drbdsetup show "$RD" 2>/dev/null \
-        | awk '/max-buffers/ { gsub(/[;]/,""); print $2; exit }'
+    local node=$1 out
+    out=$(on_node "$node" drbdsetup show "$RD" 2>/dev/null) || out=""
+    awk '/max-buffers/ { gsub(/[;]/,""); print $2; exit }' <<<"$out"
 }
 
 # wait_max_buffers <node> <want> — poll the kernel config until the
@@ -99,18 +106,22 @@ echo ">> rd c + vd c + r c (--auto-place=2 -s $POOL)"
 "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" >/dev/null
 
 echo ">> wait for 2 diskful replicas (auto-tiebreaker may add a 3rd, diskless row)"
-deadline=$(( $(date +%s) + 60 ))
-while :; do
-    diskful_n=$(linstor_diskful_nodes "$RD" | grep -c . || true)
-    [[ "$diskful_n" == "2" ]] && break
-    if (( $(date +%s) > deadline )); then
-        die "never reached 2 diskful replicas (last=$diskful_n)"
-    fi
-    sleep 2
-done
+# Use wait_diskful_count (DISKLESS/TIE_BREAKER rows excluded) — same
+# helper the lifecycle catchers use. The previous `linstor_diskful_nodes
+# | grep -c .` / `| head -1` forms raced SIGPIPE under `set -o pipefail`:
+# `head -1` closes the pipe after the first node while the helper's
+# internal `while read` loop is still emitting the rest, so the pipeline
+# exited 141 and `set -e` aborted the cell before C1 ever ran. Consume
+# the helper via mapfile/process-substitution (no pipe) — the project
+# convention every other cell already follows.
+if ! wait_diskful_count "$RD" 2 60; then
+    die "never reached 2 diskful replicas"
+fi
 
-# Pick a diskful node to probe the kernel config on.
-node=$(linstor_diskful_nodes "$RD" | head -1)
+# Pick a diskful node to probe the kernel config on. mapfile over a
+# process substitution — no pipe, so no SIGPIPE under pipefail.
+mapfile -t diskful_nodes < <(linstor_diskful_nodes "$RD")
+node=${diskful_nodes[0]:-}
 [[ -n "$node" ]] || die "no diskful node for $RD"
 
 echo ">> [C1] assert controller max-buffers ($CTRL_MB) inherited into $RD on $node"

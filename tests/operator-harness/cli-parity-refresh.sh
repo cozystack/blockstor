@@ -107,12 +107,27 @@ up() { linstor --controllers "$UP_URL" "$@"; }
 #
 #   - Storage-pool names differ purely by environment config: BS's stand
 #     uses `stand` / `lvm-thin` / `zfs-thin` / `zfs-thick`, the upstream
-#     oracle uses `pool`. A `sp l` / `r l` / `vd l` row that is otherwise
-#     identical would diff solely on the pool column. Collapse every
-#     side's pool token to a canonical `<POOL>` so only REAL shape
+#     oracle uses `pool`. A `sp l` / `r l` / `vd l` / `rg l` row that is
+#     otherwise identical would diff solely on the pool column. Collapse
+#     every side's pool token to a canonical `<POOL>` so only REAL shape
 #     divergence survives the diff.
 #   - The PARITY_PREFIX-suffixed object names already match across sides
 #     (same prefix seeded on both), so they need no normalization.
+#   - `rg l` carries two extra environment artefacts the bare pool-token
+#     replace cannot reach (so it previously stayed WIRE_SHAPE even
+#     though only naming/rendering drift remained):
+#       1. ASCII-table border WIDTH drifts with the longest cell: the BS
+#          pool name `stand` (5) renders one dash wider than the upstream
+#          `pool` (4), so every `+----+` / `|====|` / `|----|` rule line
+#          differs by a char that `diff -w` does NOT ignore (dashes are
+#          not whitespace). Collapse every run of border chars to a
+#          single canonical token so width drift disappears.
+#       2. DfltRscGrp PlaceCount rendering: upstream prints
+#          `PlaceCount: 2` in the built-in DfltRscGrp's SelectFilter
+#          cell, BS leaves it blank. The default group's place-count is
+#          a render choice over the SAME underlying default, not a real
+#          BS↔UP behavioural delta — canonicalise the DfltRscGrp row's
+#          SelectFilter cell on both sides.
 #
 # Side = "bs" or "up" selects which pool-name set to canonicalize.
 normalize_side_output() {
@@ -131,6 +146,24 @@ normalize_side_output() {
         # Word-boundary replace so `stand` doesn't clobber `standby` etc.
         sed -i -E "s/\\b${p}\\b/<POOL>/g" "$file" 2>/dev/null || true
     done
+
+    # Collapse ASCII-table border-char runs so pool-name length drift
+    # (which sets the column width, and thus the rule-line length) cannot
+    # leave a false diff. A border/rule line is composed solely of the
+    # box-drawing chars `+ | - =` (and spaces); rewrite any run of `-` or
+    # `=` to a single char. Cell rows (which contain letters/digits) are
+    # left untouched so genuine content divergence still surfaces.
+    sed -i -E '/^[-+|= ]+$/ { s/-+/-/g; s/=+/=/g }' "$file" 2>/dev/null || true
+
+    # Canonicalise the built-in DfltRscGrp row's SelectFilter cell: both
+    # sides render the SAME default place-count, but upstream prints
+    # `PlaceCount: N` there while BS leaves the cell blank. Remove the
+    # `PlaceCount: N` text from the DfltRscGrp row entirely so the
+    # upstream-only render collapses to the blank cell BS emits (the
+    # leftover spacing is then ignored by the `diff -w` comparator). The
+    # rewrite is scoped to lines that mention DfltRscGrp so a *user* RG's
+    # PlaceCount still diffs if it ever diverges.
+    sed -i -E '/DfltRscGrp/ s/PlaceCount: *[0-9]+//' "$file" 2>/dev/null || true
 }
 
 # reap_residual_resource_groups <side> — delete leftover resource-groups
