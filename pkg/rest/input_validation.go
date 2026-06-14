@@ -27,10 +27,12 @@ import (
 // Bug 97: every user-supplied LINSTOR identifier (RD name, RG name,
 // Node name, StoragePool name, Snapshot name) lands as a Kubernetes
 // `metadata.name` once the CRD store writes it. The k8s store's
-// `Name()` helper (pkg/store/k8s/crdname.go) slugifies + hashes the
-// input to keep distinct LINSTOR-cased names from colliding on the
-// same k8s name, but that mangling runs UNCONDITIONALLY — including
-// for whitespace-only or empty-after-trim inputs.
+// `Name()` helper (pkg/store/k8s/crdname.go) lowercases the input,
+// short-circuits when the lowercased form is already rfc1123-clean,
+// and otherwise slugifies + hashes it so distinct LINSTOR-cased names
+// never collide on the same k8s name. That mangling used to run
+// UNCONDITIONALLY — including for whitespace-only or empty-after-trim
+// inputs.
 //
 // The result before this gate: `linstor rd c "  "` got slugged into
 // `<8-char-hex>-` (a bare trailing hyphen), the k8s API server
@@ -43,34 +45,55 @@ import (
 //
 // That message exposes (a) the internal hash-prefix scheme, and (b)
 // the k8s-layer details the LINSTOR wire surface is supposed to
-// hide. We refuse the name at the REST boundary BEFORE Name()
-// mangles it, with a LINSTOR-shaped envelope that names the offending
-// input and the rule it violated.
+// hide. We refuse the name at the REST boundary BEFORE Name() mangles
+// it, with a LINSTOR-shaped envelope that names the offending input
+// and the rule it violated.
 //
-// The chosen ruleset is RFC 1123 subdomain (lowercase alphanumerics +
-// hyphen, can't start/end with hyphen) capped at 48 chars (Bug 360).
-// Upstream LINSTOR's wire-side regex is `^[A-Za-z][A-Za-z0-9_-]{1,47}$`
-// — permissive on case + underscore, but the same 48-char length cap
-// we mirror here. We pick RFC 1123 (lowercase-only, no underscore)
-// because the k8s store is authoritative for storage: any name that
-// would later fail the metadata.Name regex is rejected up front, so
-// the operator sees ONE consistent failure mode rather than "linstor
-// said OK, but kubectl says no".
-
-// rfc1123SubdomainName is the wire-level identifier regex applied to
-// every user-supplied LINSTOR name (Bug 97). Mirrors
-// pkg/store/k8s/crdname.go's `rfc1123` regex (used by Name() to
-// short-circuit when the input is already clean). The duplication is
-// deliberate — pkg/rest must not import pkg/store/k8s.
+// BUG-047 (csi-sanity conformance): the original gate enforced an
+// RFC 1123 subdomain (lowercase-only, no underscore) — STRICTER than
+// upstream LINSTOR. csi-sanity's CreateVolume names carry uppercase
+// hex (e.g. `pvc-2A1B4B95EA8C4D7E`); the upstream linstor-csi sidecar
+// forwards the CO name verbatim as the RD name, so the lowercase-only
+// gate rejected 19 conformance specs with code=Internal.
 //
-// Pattern: a lowercase alphanumeric, optionally followed by
-// alphanumerics or hyphens, ending with an alphanumeric. The dotted
-// form `a.b.c` k8s allows is NOT permitted for LINSTOR names because
-// `<rd>.<node>` is the metadata.name convention for Resource CRDs —
-// an embedded '.' in either side would shift the split and cause
-// silent collisions (the same gate fires for Resource create at
+// Oracle evidence (upstream LINSTOR controller, dev stand 2026-06-14)
+// established the ACTUAL upstream ruleset for resource-definition
+// names:
+//
+//	TestUpperCase123      → SUCCESS (uppercase accepted, case preserved)
+//	pvc-2A1B4B95EA8C4D7E  → SUCCESS (csi-sanity-shaped name accepted)
+//	Has_Underscore_1      → SUCCESS (underscore accepted)
+//	foo-                  → SUCCESS (trailing hyphen accepted)
+//	CaseTest / casetest   → second create "already exists" (case-INSENSITIVE)
+//	1foo                  → ERROR "Cannot begin with character '1'"
+//	a                     → ERROR "Name length 1 is less than minimum length 2"
+//	48 chars              → SUCCESS; 49 chars → ERROR "max length 48"
+//	foo.bar / "Foo Bar" / foo/bar → ERROR "Cannot contain character …"
+//
+// i.e. upstream's wire regex is `^[A-Za-z][A-Za-z0-9_-]{1,47}$`: a
+// leading ASCII letter, then 1–47 of {letter, digit, '_', '-'}, total
+// length 2–48. We now MIRROR that ruleset exactly so blockstor is
+// neither stricter (the csi-sanity gap) nor laxer than upstream. The
+// k8s store's case-insensitive Name() folds `Foo`/`foo` onto the same
+// CRD, matching upstream's case-insensitive identity, so the relaxed
+// gate stays collision-safe end-to-end.
+//
+// We still reject the dotted form `a.b.c` (upstream rejects '.' too)
+// because `<rd>.<node>` is the metadata.name convention for Resource
+// CRDs — an embedded '.' would shift the split and cause silent
+// collisions (the same gate fires for Resource create at
 // pkg/rest/autoplace.go).
-var rfc1123SubdomainName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+// linstorName is the wire-level identifier regex applied to every
+// user-supplied LINSTOR name (Bug 97, relaxed for BUG-047). Mirrors
+// upstream LINSTOR's `^[A-Za-z][A-Za-z0-9_-]{1,47}$`: a leading ASCII
+// letter, followed by 1–47 of {letter, digit, '_', '-'}. The length
+// bounds it encodes (min 2 via the `{1,47}` tail, max 48) are belt-
+// and-suspenders alongside the explicit maxLinstorName check, which
+// emits a clearer "exceeds N characters" envelope for the over-cap
+// case (Bug 360). Pattern duplication vs pkg/store/k8s is deliberate —
+// pkg/rest must not import pkg/store/k8s.
+var linstorName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{1,47}$`)
 
 // maxLinstorName caps the wire-side identifier length. Upstream
 // LINSTOR's wire-level regex tops out at 48 characters
@@ -91,8 +114,18 @@ var rfc1123SubdomainName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 // rejection happens up front, BEFORE the partial-create lands and
 // BEFORE the k8s label cap can ever fire. 48 also matches upstream
 // LINSTOR's documented identifier length for forward-compat with any
-// caller that relies on the upstream limit.
+// caller that relies on the upstream limit (BUG-047 oracle confirmed:
+// 48 chars → SUCCESS, 49 → "Name length 49 is greater than maximum
+// length 48").
 const maxLinstorName = 48
+
+// minLinstorName is upstream LINSTOR's lower length bound: a single
+// character is refused ("Name length 1 is less than minimum length
+// 2", BUG-047 oracle). The regex already encodes this via its `{1,47}`
+// tail, but we check it explicitly so the operator gets the same
+// "too short" envelope upstream emits rather than the generic
+// "not a valid identifier" message.
+const minLinstorName = 2
 
 // ErrInvalidLinstorName is the static sentinel for Bug-97 rejections.
 // Callers wrap it via fmt.Errorf("%w: …") with object-kind + name +
@@ -109,11 +142,12 @@ var ErrInvalidLinstorName = errors.New("invalid name")
 // kind so the operator-facing message still reads naturally.
 var ErrLinstorNameRequired = errors.New("name is required")
 
-// validateLinstorName enforces the RFC 1123 subdomain rules at the
-// REST wire boundary. Empty/whitespace-only input is rejected with a
-// distinct message because the underlying regex accepts neither and
-// the empty case is the one the python CLI's `rd c "  "` invocation
-// produces.
+// validateLinstorName enforces upstream LINSTOR's identifier rules at
+// the REST wire boundary (BUG-047): a leading ASCII letter, then
+// {letter, digit, '_', '-'}, length 2–48. Empty/whitespace-only input
+// is rejected with a distinct message because the underlying regex
+// accepts neither and the empty case is the one the python CLI's
+// `rd c "  "` invocation produces.
 //
 // The `kind` argument names the object being created ("resource
 // definition", "node", "resource group", …) so the envelope's
@@ -131,10 +165,15 @@ func validateLinstorName(kind, name string) error {
 			ErrInvalidLinstorName, kind, name, maxLinstorName)
 	}
 
-	if !rfc1123SubdomainName.MatchString(name) {
+	if len(name) < minLinstorName {
+		return fmt.Errorf("%w: %s name %q is shorter than %d characters",
+			ErrInvalidLinstorName, kind, name, minLinstorName)
+	}
+
+	if !linstorName.MatchString(name) {
 		return fmt.Errorf("%w: %s name %q is not a valid identifier "+
-			"(lowercase alphanumerics and '-', must start and end with "+
-			"an alphanumeric, no spaces, no uppercase)",
+			"(letters, digits, '_' and '-'; must start with a letter; "+
+			"no '.', no spaces, no path separators)",
 			ErrInvalidLinstorName, kind, name)
 	}
 
