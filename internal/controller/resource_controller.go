@@ -1624,6 +1624,24 @@ func backfillRDMinorsFromStatus(rd *blockstoriov1alpha1.ResourceDefinition) bool
 // satellite/REST owners of the other VolumeDefinition fields read them
 // off Spec elsewhere, and we re-send the size/props verbatim to avoid
 // dropping them.
+//
+// BUG-048 (P1, the silent VD drop): because a JSON merge-patch REPLACES
+// the volumeDefinitions array (RFC 7386 has no array-merge), this write
+// stamps the WHOLE list from the in-memory snapshot the reconciler read
+// at the top of ensureRDVolumeMinors. If a concurrent number-less
+// `linstor vd c` appended a new volume AFTER that read but before this
+// patch, the wholesale replace silently drops it — and both `vd c`
+// return success because the clobber is an async reconciler write, not
+// their own. The original code claimed "optimistic concurrency" in a
+// comment but never actually set metadata.resourceVersion, so the patch
+// could NEVER 409 and the IsConflict re-read branch in the caller was
+// dead. We now embed metadata.resourceVersion in the merge-patch body
+// (exactly what client.MergeFromWithOptimisticLock does for typed
+// patches): the apiserver rejects the patch with Conflict when a racing
+// VD append moved the RD on, the caller re-reads, and the next reconcile
+// re-allocates minors against the now-complete list — the appended
+// volume survives. A missing resourceVersion (RD freshly built in a unit
+// path) degrades to the prior blind patch rather than failing the write.
 func (r *ResourceReconciler) patchRDVolumeMinors(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
 	vols := make([]map[string]any, 0, len(rd.Spec.VolumeDefinitions))
 	for i := range rd.Spec.VolumeDefinitions {
@@ -1645,15 +1663,26 @@ func (r *ResourceReconciler) patchRDVolumeMinors(ctx context.Context, rd *blocks
 		vols = append(vols, entry)
 	}
 
+	meta := map[string]any{}
+	if rv := rd.ResourceVersion; rv != "" {
+		// Optimistic-lock precondition: the apiserver enforces
+		// metadata.resourceVersion on any patch body, so a racing VD
+		// append (which bumped the RD past this snapshot) makes the
+		// wholesale volumeDefinitions replace 409 instead of clobbering
+		// the appended volume.
+		meta["resourceVersion"] = rv
+	}
+
 	body := map[string]any{patchKeySpec: map[string]any{"volumeDefinitions": vols}}
+	if len(meta) > 0 {
+		body["metadata"] = meta
+	}
 
 	patchBytes, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
 
-	// Optimistic concurrency: include resourceVersion so a racing
-	// minor write is rejected with Conflict and we re-read.
 	patchTarget := &blockstoriov1alpha1.ResourceDefinition{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       resourceDefinitionKindName,
