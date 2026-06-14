@@ -182,11 +182,18 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		// and break the cross-RD suspend-window invariant for its
 		// already-suspended siblings.
 		preservedGroupID := existing.Spec.GroupID
+		// b046/b353: GroupSize is the group-assembled denominator the
+		// controller's suspend barrier gates on. Like GroupID it is
+		// stamped once at Create time and a REST prop-patch must not
+		// clobber it — a lost GroupSize would let the barrier open early
+		// (or never) and break the cross-RD suspend-window invariant.
+		preservedGroupSize := existing.Spec.GroupSize
 
 		existing.Spec = wireToCRDSnapshotSpec(in)
 		existing.Spec.SuspendIO = preservedSuspendIO
 		existing.Spec.TakeSnapshot = preservedTakeSnapshot
 		existing.Spec.GroupID = preservedGroupID
+		existing.Spec.GroupSize = preservedGroupSize
 		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
 		return s.c.Update(ctx, &existing)
@@ -398,7 +405,7 @@ func snapshotVolumesFromVDs(vds []crdv1alpha1.SnapshotVolumeRef) []apiv1.Snapsho
 
 func wireToCRDSnapshot(in *apiv1.Snapshot) *crdv1alpha1.Snapshot {
 	spec := wireToCRDSnapshotSpec(in)
-	// Bug 351: every freshly-created Snapshot enters the
+	// Bug 351: a freshly-created SINGLE-snapshot enters the
 	// controller-side orchestration's Phase 1 with
 	// Spec.SuspendIO=true. The satellite reconcilers see the
 	// flag, run `drbdsetup suspend-io <rd>`, and stamp
@@ -407,7 +414,21 @@ func wireToCRDSnapshot(in *apiv1.Snapshot) *crdv1alpha1.Snapshot {
 	// (TakeSnapshot=true) and Phase 3 (clear both). The store-only
 	// stamp keeps the REST handler oblivious to the orchestration
 	// shape — the wire DTO doesn't carry these flags.
-	spec.SuspendIO = true
+	//
+	// Bug 046 / Bug-353 atomicity fix: a GROUPED snapshot (non-empty
+	// GroupID) must NOT enter suspend at Create time. The siblings of a
+	// `snapshot create-multiple` batch are created sequentially, so
+	// stamping SuspendIO here would freeze each sibling's volumes the
+	// instant its own CRD landed — siblings ~15s apart, blowing the
+	// ≤5s consistency budget. Instead the controller-side
+	// SnapshotReconciler holds the whole group at Phase 0 until every
+	// member exists (Spec.GroupSize observed) and then opens the
+	// suspend-io barrier on ALL siblings in one pass, so they enter
+	// suspend together. Leaving SuspendIO=false here is what defers
+	// Phase 1 entry to that coordinated flip.
+	if in.GroupID == "" {
+		spec.SuspendIO = true
+	}
 
 	labels := map[string]string{
 		LabelResourceDefinition: in.ResourceName,
@@ -440,6 +461,7 @@ func wireToCRDSnapshotSpec(in *apiv1.Snapshot) crdv1alpha1.SnapshotSpec {
 		Nodes:                  in.Nodes,
 		Props:                  in.Props,
 		GroupID:                in.GroupID,
+		GroupSize:              in.GroupSize,
 	}
 
 	if len(in.VolumeDefinitions) > 0 {

@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"math"
 	"net/http"
 	"strings"
 
@@ -98,11 +99,45 @@ func (s *Server) handleSnapshotCreateMulti(w http.ResponseWriter, r *http.Reques
 
 	results := make([]apiv1.APICallRc, 0, len(body.Snapshots))
 
+	// groupSize is the denominator the controller-side
+	// SnapshotReconciler uses to decide the group is fully ASSEMBLED
+	// before opening the suspend-io barrier. The siblings are created
+	// sequentially below (one Store.Create per entry, with hydration +
+	// an offline pre-check between each), so the last sibling's CRD can
+	// land seconds after the first; stamping the expected count lets
+	// the controller hold every sibling at Phase 0 until all are
+	// present and then flip SuspendIO on the whole group in one pass —
+	// bounding the suspend-entry slip under the consistency budget
+	// (Bug 046 / Bug-353 atomicity fix).
+	//
+	// Clamp the count to int32 defensively (gosec G115). A real group
+	// has a handful of RDs; the clamp only matters for a pathological
+	// request and a saturated denominator still gates correctly (the
+	// controller never sees more siblings than were created).
+	groupSize := clampInt32(len(body.Snapshots))
+
 	for i := range body.Snapshots {
-		results = append(results, s.createOneFromMulti(r.Context(), &body.Snapshots[i], groupID))
+		results = append(results, s.createOneFromMulti(r.Context(), &body.Snapshots[i], groupID, groupSize))
 	}
 
 	writeJSON(w, http.StatusCreated, results)
+}
+
+// clampInt32 narrows a non-negative count to int32, saturating at
+// math.MaxInt32 rather than wrapping (gosec G115). The multi-snapshot
+// batch size is always a small positive number in practice; the clamp
+// only guards the pathological case and never produces a negative
+// denominator the controller's group-assembled gate could misread.
+func clampInt32(n int) int32 {
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+
+	if n < 0 {
+		return 0
+	}
+
+	return int32(n)
 }
 
 // newSnapshotGroupID returns a 128-bit hex group identifier
@@ -134,7 +169,7 @@ func newSnapshotGroupID() (string, error) {
 // SnapshotReconciler can list same-Group siblings via a label
 // selector. b353.
 func (s *Server) createOneFromMulti(
-	ctx context.Context, entry *multiSnapshotCreateEntry, groupID string,
+	ctx context.Context, entry *multiSnapshotCreateEntry, groupID string, groupSize int32,
 ) apiv1.APICallRc {
 	if entry.ResourceName == "" || entry.Name == "" {
 		return apiv1.APICallRc{
@@ -151,6 +186,7 @@ func (s *Server) createOneFromMulti(
 		Flags:             entry.Flags,
 		VolumeDefinitions: entry.VolumeDefs,
 		GroupID:           groupID,
+		GroupSize:         groupSize,
 	}
 
 	err := s.hydrateSnapshotFromRD(ctx, &snap, entry.ResourceName)

@@ -77,6 +77,38 @@ spec:
                   Empty GroupID is the single-snap path (Bug 351 behaviour
                   preserved verbatim — siblings denominator collapses to self).
                 type: string
+              groupSize:
+                description: |-
+                  groupSize is the number of Snapshot CRDs the apiserver fanned
+                  out for this transactional batch (len of the
+                  `snapshot create-multiple` entry list). It is the denominator the
+                  controller-side SnapshotReconciler uses to decide when the group
+                  is fully ASSEMBLED before it opens the suspend-io barrier.
+
+                  Bug 046 / Bug-353 atomicity fix: the apiserver creates the
+                  sibling CRDs SEQUENTIALLY (one Store.Create per entry, with
+                  hydration + an offline pre-check between each), so on a busy
+                  stand the last sibling's CRD can land ~15s after the first. If
+                  each satellite started `drbdsetup suspend-io` the instant its
+                  own sibling appeared (the old behaviour, with SuspendIO stamped
+                  at Create time), the group's volumes would freeze ~15s APART —
+                  well over the ≤5s consistency budget — so a DB's data volume and
+                  WAL volume on separate RDs would be captured at different
+                  instants and a group restore could be corrupt.
+
+                  With GroupSize the controller holds the WHOLE group at Phase 0
+                  (no SuspendIO) until it observes every member, then flips
+                  SuspendIO=true on every sibling in a single reconcile pass so
+                  they all enter suspend within one controller cycle (sub-second),
+                  bounding the suspend-entry slip far under budget.
+
+                  Zero means "not a coordinated batch" (the single-snap Bug-351
+                  path, or a legacy grouped Snapshot created before this field
+                  existed) — in that case the controller falls back to the
+                  observed-siblings count so a GroupID with no GroupSize still
+                  makes progress instead of hanging on a missing denominator.
+                format: int32
+                type: integer
               nodes:
                 description: |-
                   nodes are the satellites the snapshot should live on. Empty means
