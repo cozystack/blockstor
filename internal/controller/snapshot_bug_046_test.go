@@ -111,6 +111,60 @@ func TestBug046SuspendBarrierEntersSuspendTogether(t *testing.T) {
 	}
 }
 
+// TestBug046GroupTakeAndResumeFanOutInOnePass pins the second
+// staggering point Bug-046 surfaced on the stand: the Phase 1→2 take
+// promotion and the Phase 2→3 resume must ALSO fan out across the whole
+// group from a single sibling's Reconcile — not just the suspend entry.
+// On the stand the per-sibling take fired ~15s apart because each
+// sibling flipped only its own Spec.TakeSnapshot when the controller
+// happened to reconcile it; a sibling that then resumed while another
+// was still mid-take reopened the write window before every snapshot
+// was captured. Reconciling ONLY pvc-a must flip TakeSnapshot on every
+// sibling (take), and once every sibling is Ready, reconciling only
+// pvc-a must clear the flags on every sibling (resume).
+func TestBug046GroupTakeAndResumeFanOutInOnePass(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotControllerScheme(t)
+
+	const groupID = "b046-take"
+
+	// All suspended + acked, none taken yet. Reconciling pvc-a alone
+	// must promote the WHOLE group to TakeSnapshot=true.
+	mk := func(rd string) *blockstoriov1alpha1.Snapshot {
+		s := b046GroupedSnapshot(rd, "snap", groupID, 2, []string{"n1"})
+		s.Spec.SuspendIO = true
+		s.Status.NodeStatus = []blockstoriov1alpha1.SnapshotPerNodeStatus{
+			{NodeName: "n1", SuspendIOAcked: true},
+		}
+
+		return s
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+		WithObjects(mk("pvc-a"), mk("pvc-b")).
+		Build()
+
+	r := &controller.SnapshotReconciler{Client: cli, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-a.snap"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile pvc-a.snap (take): %v", err)
+	}
+
+	for _, name := range []string{"pvc-a.snap", "pvc-b.snap"} {
+		got := getSnap(t, cli, name)
+		if !got.Spec.TakeSnapshot {
+			t.Errorf("%s: take not fanned out across group from one Reconcile "+
+				"(the staggered-take Bug-046 hazard): %+v", name, got.Spec)
+		}
+	}
+}
+
 // TestBug046SuspendBarrierHoldsUntilAssembled pins the
 // hold-until-assembled half of the barrier: while the group is still
 // assembling (fewer member CRDs observed than Spec.GroupSize), NO

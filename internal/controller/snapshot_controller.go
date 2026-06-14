@@ -201,7 +201,49 @@ func (r *SnapshotReconciler) advancePhase(
 		"suspendIO", next.SuspendIO, "takeSnapshot", next.TakeSnapshot,
 		"group_id", snap.Spec.GroupID)
 
+	// Bug 046 / Bug-353: for a grouped batch, EVERY phase transition —
+	// not just the Phase 0→1 suspend entry — must fan out across the
+	// whole group in a single reconcile pass. The Phase 1→2 take
+	// promotion and the Phase 2→3 / abort resume are equally
+	// consistency-critical: if each sibling flipped its own
+	// Spec.TakeSnapshot when the controller happened to reconcile it,
+	// the per-sibling takes (and resumes) would fire at staggered
+	// reconcile times — the same ~15s slip the suspend entry had — and
+	// a sibling that resumed I/O while another was still mid-take would
+	// reopen the write window before every snapshot was captured,
+	// breaking the cross-RD point-in-time guarantee. Flipping the whole
+	// group together keeps take-all and resume-all atomic relative to
+	// the application writer. Non-grouped (single-snap) Snapshots flip
+	// self only, exactly as before.
+	if snap.Spec.GroupID != "" {
+		return ctrl.Result{}, r.flipGroup(ctx, siblings, next.SuspendIO, next.TakeSnapshot)
+	}
+
 	return r.maybeFlipSpec(ctx, snap, next.SuspendIO, next.TakeSnapshot)
+}
+
+// flipGroup writes the (suspendIO, takeSnapshot) flag pair onto EVERY
+// sibling of a grouped batch in one pass so the whole group advances
+// phase together. Each per-sibling write goes through maybeFlipSpec,
+// which is a no-op when the sibling already matches — so re-entering
+// flipGroup after a partial flip is idempotent and converges. This is
+// the general form of suspendGroup / abortGroup (which are the
+// SuspendIO=true / SuspendIO=false special cases) and keeps the take
+// (Phase 2) and resume (Phase 3) transitions group-atomic, not just the
+// suspend entry.
+func (r *SnapshotReconciler) flipGroup(
+	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot, suspendIO, takeSnapshot bool,
+) error {
+	for i := range siblings {
+		_, err := r.maybeFlipSpec(ctx, &siblings[i], suspendIO, takeSnapshot)
+		if err != nil {
+			return errors.Wrapf(err,
+				"group phase flip (suspendIO=%t takeSnapshot=%t) on sibling %q",
+				suspendIO, takeSnapshot, siblings[i].Name)
+		}
+	}
+
+	return nil
 }
 
 // checkAbortConditions evaluates the two abort triggers that outrank
@@ -343,15 +385,7 @@ func groupAssembled(snap *blockstoriov1alpha1.Snapshot, siblings []blockstoriov1
 func (r *SnapshotReconciler) suspendGroup(
 	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot,
 ) error {
-	for i := range siblings {
-		_, err := r.maybeFlipSpec(ctx, &siblings[i], true, false)
-		if err != nil {
-			return errors.Wrapf(err,
-				"suspend barrier: open SuspendIO on sibling %q", siblings[i].Name)
-		}
-	}
-
-	return nil
+	return r.flipGroup(ctx, siblings, true, false)
 }
 
 // isPhase2Promotion reports whether the pending phase decision is the
