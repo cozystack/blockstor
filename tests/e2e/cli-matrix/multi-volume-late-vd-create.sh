@@ -69,27 +69,56 @@ echo ">> [Bug 332] rd c + vd c (vol-0)"
 echo ">> [Bug 332] r c --auto-place=3 -s $POOL"
 "${LCTL[@]}" resource create --auto-place=3 --storage-pool="$POOL" "$RD" >/dev/null
 
-# 240s: a 1G x3 initial sync shares the stand with the rest of the
-# sweep; the previous 120s budget flaked under load (the failure dump
-# printed all three replicas UpToDate moments after the deadline).
-echo ">> wait up to 240s for vol-0 to reach UpToDate on all 3 replicas"
-deadline=$(( $(date +%s) + 240 ))
-all_up=false
-while (( $(date +%s) < deadline )); do
-    # Per-replica volume-0 state, three rows expected. The wire
-    # shape is `linstor r l --resources <rd>` → DiskState column.
-    states=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-        | jq -r '[.[][]? | .vlms[]? | select(.vlm_nr == 0) | .state.disk_state // "Unknown"] | join(",")' \
-        2>/dev/null || echo "")
-    if [[ "$states" == "UpToDate,UpToDate,UpToDate" ]]; then
-        all_up=true
-        break
-    fi
-    sleep 3
-done
+# Resolve the 3 diskful nodes auto-place picked, so every convergence
+# check below reads the per-replica Resource.Status directly.
+echo ">> wait for 3 diskful replicas to be placed"
+if ! wait_diskful_count "$RD" 3 90; then
+    echo "FAIL: auto-place did not land 3 diskful replicas" >&2
+    "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -30 >&2
+    exit 1
+fi
+mapfile -t DISKFUL_NODES < <(linstor_diskful_nodes "$RD")
+if (( ${#DISKFUL_NODES[@]} != 3 )); then
+    echo "FAIL: expected 3 diskful nodes, got ${#DISKFUL_NODES[@]}: ${DISKFUL_NODES[*]}" >&2
+    exit 1
+fi
+echo "   diskful nodes: ${DISKFUL_NODES[*]}"
 
-if [[ "$all_up" != "true" ]]; then
-    echo "FAIL: vol-0 did not reach UpToDate on all 3 replicas within 120s" >&2
+# wait_all_replicas_volume_uptodate <vol> <timeout> — poll
+# Resource.Status.volumes[<vol>].diskState on EVERY diskful node until
+# all report UpToDate, or timeout. Reads the observer-stamped CRD via
+# status_disk_state (lib.sh) — the SAME wire surface the passing cells
+# use. NOTE: the `--machine-readable resource list` projection leaves
+# `.vlms` null on this apiserver, so the previous jq-on-vlms detection
+# always read empty and timed out even while `linstor r l` (which reads
+# Resource.Status) showed every replica UpToDate. status_disk_state
+# reads the populated CRD field instead.
+wait_all_replicas_volume_uptodate() {
+    local vol=$1 timeout=$2
+    local deadline=$(( $(date +%s) + timeout ))
+    local node st all_ok
+    while (( $(date +%s) < deadline )); do
+        all_ok=true
+        for node in "${DISKFUL_NODES[@]}"; do
+            st=$(status_disk_state "$RD" "$node" "$vol")
+            if [[ "$st" != "UpToDate" ]]; then
+                all_ok=false
+                break
+            fi
+        done
+        if [[ "$all_ok" == "true" ]]; then
+            return 0
+        fi
+        sleep 3
+    done
+    return 1
+}
+
+# 240s: a 1G x3 initial sync shares the stand with the rest of the
+# sweep; the previous 120s budget flaked under load.
+echo ">> wait up to 240s for vol-0 to reach UpToDate on all 3 replicas"
+if ! wait_all_replicas_volume_uptodate 0 240; then
+    echo "FAIL: vol-0 did not reach UpToDate on all 3 replicas within 240s" >&2
     "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -30 >&2
     exit 1
 fi
@@ -101,32 +130,30 @@ echo ">> [Bug 332] late vd c (vol-1)"
 echo ">> [Bug 332] late vd c (vol-2)"
 "${LCTL[@]}" volume-definition create "$RD" 1G >/dev/null
 
-echo ">> wait up to 60s for vol-1 + vol-2 to reach UpToDate on all 3 replicas"
-deadline=$(( $(date +%s) + 60 ))
-late_up=false
-while (( $(date +%s) < deadline )); do
-    # Pull every (replica, volume) disk_state. We need exactly:
-    #   3 rows × 3 volumes = 9 disk_state strings, all UpToDate.
-    # A Bug-332-bitten path will show vol-1/vol-2 stuck on
-    # "Diskless" with the operator-set DISKLESS flag absent.
-    states=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-        | jq -r '[.[][]? | .vlms[]? | .state.disk_state // "Unknown"] | join(",")' \
-        2>/dev/null || echo "")
-    count_uptodate=$(awk -F, '{ for (i=1;i<=NF;i++) if ($i=="UpToDate") n++ } END { print n+0 }' <<<"$states")
-    if (( count_uptodate == 9 )); then
-        late_up=true
+# Each late-added 1G volume needs its own initial sync on every replica;
+# under sweep load that takes well past the old 60s budget, so give the
+# late volumes the same 240s headroom vol-0 gets.
+echo ">> wait up to 240s for vol-1 + vol-2 to reach UpToDate on all 3 replicas"
+late_up=true
+for vol in 1 2; do
+    if ! wait_all_replicas_volume_uptodate "$vol" 240; then
+        late_up=false
         break
     fi
-    sleep 3
 done
 
 if [[ "$late_up" != "true" ]]; then
-    echo "FAIL (Bug 332): late-added vol-1/vol-2 not UpToDate on all 3 replicas within 60s" >&2
+    echo "FAIL (Bug 332): late-added vol-1/vol-2 not UpToDate on all 3 replicas within 240s" >&2
     "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -40 >&2
-    # Surface the smoking gun: a Diskless line for a non-DISKLESS spec.
-    echo "----- linstor r l --resources $RD (with flags) -----" >&2
-    "${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-        | jq -r '.[][]? | "\(.node_name) vol=\(.vlms[]?.vlm_nr) state=\(.vlms[]?.state.disk_state) flags=\(.flags//[])"' >&2 || true
+    # Surface the smoking gun: per (node, vol) disk_state straight from
+    # the populated Resource.Status — a Bug-332-bitten path shows vol-1
+    # or vol-2 stuck on Diskless on a non-DISKLESS replica.
+    echo "----- per (node, vol) Resource.Status diskState -----" >&2
+    for node in "${DISKFUL_NODES[@]}"; do
+        for vol in 0 1 2; do
+            echo "  $node vol=$vol state=$(status_disk_state "$RD" "$node" "$vol")" >&2
+        done
+    done
     exit 1
 fi
 
@@ -135,10 +162,13 @@ fi
 # MUST NOT report any volume as Diskless when the spec lacks the
 # DISKLESS flag. This is the kernel-truth assertion that distinguishes
 # Bug 332 (Unintentional Diskless) from spec-pinned diskless replicas.
-echo ">> [Bug 332] kernel-truth: drbdadm status on a diskful node"
-satellite_node=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-    | jq -r '.[][]? | select((.flags//[]) | (map(. == "DISKLESS") | any | not)) | .node_name' \
-    2>/dev/null | head -1)
+echo ">> [Bug 332] kernel-truth: drbdsetup status on a diskful node"
+# Use the already-resolved diskful node set (reliable, CRD-backed) and
+# probe the kernel directly via the satellite pod (on_node, lib.sh) —
+# the same drbdsetup status path the parent helpers use. The previous
+# `--machine-readable ... | jq .flags | head -1` resolution shared the
+# null-vlms / SIGPIPE failure modes of the wait loops above.
+satellite_node=${DISKFUL_NODES[0]:-}
 
 if [[ -z "$satellite_node" ]]; then
     echo "SKIP-PARTIAL: could not resolve a diskful node for kernel-truth check"
@@ -146,7 +176,7 @@ if [[ -z "$satellite_node" ]]; then
     exit 0
 fi
 
-if status_out=$(kubectl debug node/"$satellite_node" --image=alpine -- chroot /host drbdadm status "$RD" 2>&1); then
+if status_out=$(on_node "$satellite_node" drbdsetup status "$RD" --verbose 2>&1); then
     echo "$status_out"
     if grep -E 'volume:[12].*disk:Diskless' <<<"$status_out" >/dev/null; then
         echo "FAIL (Bug 332): diskful node $satellite_node reports volume:1 or volume:2 as Diskless on kernel state" >&2
@@ -154,7 +184,7 @@ if status_out=$(kubectl debug node/"$satellite_node" --image=alpine -- chroot /h
         exit 1
     fi
 else
-    echo "SKIP-PARTIAL: kubectl debug to inspect drbdadm status failed (RBAC / image pull); REST-level pin still asserted"
+    echo "SKIP-PARTIAL: drbdsetup status on $satellite_node failed; REST-level pin still asserted"
 fi
 
 echo ">> multi-volume-late-vd-create OK (Bug 332 pinned: late vd c on $RD brought vol-1/vol-2 to UpToDate, no Unintentional Diskless)"
