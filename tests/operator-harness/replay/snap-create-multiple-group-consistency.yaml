@@ -76,8 +76,17 @@ steps:
       timeout_s: 240
 
   # ---- Bug-046: group snapshot — single suspend barrier, all-or-nothing --
+  # CLI form (linstor-client 1.27.1): the snapshot name is a single
+  # POSITIONAL and the resource names go to `-r`/--resource_names (one
+  # shared snapshot name across all listed RDs). The snapshot name MUST
+  # come before `-r` — argparse's variadic `-r A B grp` would greedily
+  # eat `grp` into --resource_names and leave no positional ("too few
+  # arguments", exit 2). The previous positional colon form
+  # (`{{rd}}:grp bug046-multi-b:grp`) is not accepted at all and aborted
+  # with argparse exit 2, so this step (and thus BUG-046's L7 coverage)
+  # never ran.
   - name: snapshot-create-multiple
-    cmd: ["snapshot", "create-multiple", "{{rd}}:grp", "bug046-multi-b:grp"]
+    cmd: ["snapshot", "create-multiple", "grp", "-r", "{{rd}}", "bug046-multi-b"]
     expect_exit: 0
   - name: both-snapshots-visible
     cmd: ["snapshot", "list"]
