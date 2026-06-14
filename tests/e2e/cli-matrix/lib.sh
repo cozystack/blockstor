@@ -361,6 +361,32 @@ wait_replica_absent() {
     return 1
 }
 
+# ---- bounded kubectl-exec wrapper -----------------------------------------
+#
+# bs_exec <timeout-seconds> -- kubectl exec ... — run a `kubectl exec`
+# (or any command) under a hard wall-clock cap so a wedged exec can never
+# stall the whole sweep. A `kubectl exec ... lvs|awk` against a satellite
+# whose lvm2 metadata daemon is hung (observed on a FILE_THIN pool node)
+# blocks indefinitely with no client-side deadline — one such hang stalled
+# a full cli-matrix sweep for ~2h. `timeout` sends SIGTERM at the cap and
+# SIGKILL shortly after, so the caller gets control back and the exec's
+# non-zero exit is swallowed by the caller's `|| true` / `2>/dev/null`.
+#
+# Portable: if `timeout` is not on PATH (rare), fall back to running the
+# command bare so behaviour is unchanged on hosts that lack coreutils
+# timeout. The default cap (BS_EXEC_TIMEOUT, 30s) is far above any healthy
+# exec's latency but well under the multi-minute waits the cells budget.
+BS_EXEC_TIMEOUT="${BS_EXEC_TIMEOUT:-30}"
+bs_exec() {
+    local secs=$1
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${secs}s" "$@"
+    else
+        "$@"
+    fi
+}
+
 # ---- no-orphans invariant -------------------------------------------------
 #
 # After a cli-matrix cell tears down its RD, assert the cluster is
@@ -369,6 +395,11 @@ wait_replica_absent() {
 # Best-effort — prints divergence to stderr but does NOT fail the
 # test on residue unless STRICT_ORPHANS=1, so a noisy concurrent
 # scenario on the same stand doesn't false-FAIL this one.
+#
+# Every per-satellite probe goes through bs_exec so a wedged kubectl
+# exec (e.g. lvs against a hung lvm2 daemon) can't stall teardown —
+# the bounded exec just times out and is treated as "no residue
+# observed on that pod" (best-effort semantics already in force here).
 assert_no_orphans() {
     local rd=$1
     local fail=0
@@ -389,24 +420,25 @@ assert_no_orphans() {
     # Kernel layer + .res / LV / zvol residue on every satellite.
     for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
         # drbd kernel slot
-        if kubectl -n "$NS" exec "$pod" -- drbdsetup status "$rd" >/dev/null 2>&1; then
+        if bs_exec "$BS_EXEC_TIMEOUT" kubectl -n "$NS" exec "$pod" -- drbdsetup status "$rd" >/dev/null 2>&1; then
             echo "ORPHAN(drbd): ${pod} still has kernel slot for ${rd}" >&2
             fail=1
         fi
         # .res file
-        if kubectl -n "$NS" exec "$pod" -- test -f "/etc/drbd.d/${rd}.res" 2>/dev/null; then
+        if bs_exec "$BS_EXEC_TIMEOUT" kubectl -n "$NS" exec "$pod" -- test -f "/etc/drbd.d/${rd}.res" 2>/dev/null; then
             echo "ORPHAN(.res): ${pod} still has /etc/drbd.d/${rd}.res" >&2
             fail=1
         fi
-        # LVM LVs named after the rd (lvm + lvm-thin pools)
-        res=$(kubectl -n "$NS" exec "$pod" -- bash -c \
+        # LVM LVs named after the rd (lvm + lvm-thin pools). bs_exec caps
+        # this — a hung lvm2 daemon here is what stalled a full sweep ~2h.
+        res=$(bs_exec "$BS_EXEC_TIMEOUT" kubectl -n "$NS" exec "$pod" -- bash -c \
             "lvs --noheadings -o lv_name 2>/dev/null | awk '\$1 ~ /${rd}_/'" 2>/dev/null || true)
         if [[ -n "$res" ]]; then
             echo "ORPHAN(lvm): ${pod} still has LV(s) for ${rd}: $res" >&2
             fail=1
         fi
         # ZFS datasets named after the rd (zfs/zfs-thin pools)
-        res=$(kubectl -n "$NS" exec "$pod" -- bash -c \
+        res=$(bs_exec "$BS_EXEC_TIMEOUT" kubectl -n "$NS" exec "$pod" -- bash -c \
             "zfs list -H -o name 2>/dev/null | awk '/\\/${rd}_/ {print}'" 2>/dev/null || true)
         if [[ -n "$res" ]]; then
             echo "ORPHAN(zfs): ${pod} still has dataset(s) for ${rd}: $res" >&2
