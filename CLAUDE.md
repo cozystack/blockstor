@@ -45,7 +45,7 @@ Copy the closest existing YAML and fill:
 - `teardown[]` — cleanup CLI invocations.
 - `invariants[]` — currently only `no_orphans` is implemented.
 
-Available `await.kind` values: `replica_count`, `disk_state`, `all_uptodate`, `replica_diskless`, `no_tiebreaker`, `sync_clean`, `resource_absent`, `rd_absent`, `vd_size_kib`, `pvc_capacity`, `pod_md5_invariant`. See the header comment of `tests/operator-harness/replay-runner.sh` for the contract.
+Available `await.kind` values: `replica_count`, `disk_state`, `all_uptodate`, `replica_diskless`, `no_tiebreaker`, `sync_clean`, `resource_absent`, `rd_absent`, `vd_size_kib`, `vd_count`, `pvc_capacity`, `pod_md5_invariant`. See the header comment of `tests/operator-harness/replay-runner.sh` for the contract.
 
 ## Running the harness
 
