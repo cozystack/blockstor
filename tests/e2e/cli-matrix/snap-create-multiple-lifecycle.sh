@@ -465,25 +465,58 @@ partial_rc=0
 partial_out=$("${LCTL[@]}" snapshot create-multiple \
     "${RD_A}:${BAD_SNAP}" "${RD_MISSING}:${BAD_SNAP}" 2>&1) || partial_rc=$?
 
+# The colon `rd:snap` form is not the grammar this linstor client uses
+# (it wants `-r RD... SNAP`), so the CLI rejects it with an argparse
+# `usage:`/`error: argument` message that names neither RD — that is a
+# CLI-grammar artefact, NOT the apiserver's partial-failure envelope.
+# Mirror Phase 3: when the CLI form is rejected, drive the SAME batch
+# (good RD + missing RD) through the REST endpoint so we test the
+# apiserver's real partial-failure contract. curl -fsS returns non-zero
+# on a non-2xx, so partial_rc reflects the server verdict and
+# partial_out carries the server's error body.
+if (( partial_rc != 0 )) && grep -qiE 'usage:|error: argument|unrecognized arguments|invalid choice' <<<"$partial_out"; then
+    echo "   note: CLI 'create-multiple' colon form rejected; driving partial-fail batch via POST /v1/actions/snapshot/multi"
+    body=$(cat <<EOF
+{"snapshots":[
+  {"resource_name":"${RD_A}","name":"${BAD_SNAP}"},
+  {"resource_name":"${RD_MISSING}","name":"${BAD_SNAP}"}
+]}
+EOF
+)
+    partial_rc=0
+    partial_out=$(curl -fsS -X POST "http://127.0.0.1:${LCTL_PORT}/v1/actions/snapshot/multi" \
+        -H 'Content-Type: application/json' -d "$body" 2>&1) || partial_rc=$?
+fi
+
 if (( partial_rc == 0 )); then
-    # CLI returned 0 — possibly the CLI swallowed the per-entry
-    # error. Verify on the wire: how many Snapshot CRDs got
-    # created? If RD_MISSING produced no CRD AND RD_A produced
-    # one, that is silent partial success — FAIL.
+    # Exit 0 (CLI swallowed the error, or REST returned a 2xx). The
+    # apiserver's /v1/actions/snapshot/multi handler is best-effort
+    # per-entry: it returns HTTP 201 with a JSON array carrying one
+    # SUCCESS entry for the good RD and one ERROR entry naming the
+    # missing RD ("...: object not found"). That per-entry error
+    # envelope IS the acceptable shape (the operator can correlate the
+    # bad entry) — even though the good-side snap was created. The
+    # FAIL we guard against is SILENT partial success: one snap created
+    # with NO error reported anywhere. So inspect the body first.
     post_count=$(kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v s="$BAD_SNAP" '$1 ~ s {n++} END {print n+0}')
-    if (( post_count == 1 )); then
-        echo "FAIL (Bug 353 partial-fail): create-multiple silently created 1/2 snaps when one RD was missing" >&2
-        echo "  CLI output:" >&2
+    named_bad=false
+    if grep -qE "(${RD_MISSING}|not.found|object not found|no.such|missing|does.not.exist)" <<<"$partial_out"; then
+        named_bad=true
+    fi
+    if $named_bad; then
+        echo "   → per-entry error envelope names the offending RD ($RD_MISSING); partial best-effort with error reporting is acceptable"
+        # Reap the good-side snap so the final teardown loop is clean.
+        "${LCTL[@]}" snapshot delete "$RD_A" "$BAD_SNAP" 2>/dev/null || true
+    elif (( post_count == 1 )); then
+        echo "FAIL (Bug 353 partial-fail): create-multiple SILENTLY created 1/2 snaps when one RD was missing (no per-entry error reported)" >&2
+        echo "  output:" >&2
         echo "  $partial_out" >&2
-        echo "  → must either fail-fast (zero CRDs created) or report per-entry error envelope." >&2
-        # Best-effort cleanup of the orphan good-side snap so the
-        # final delete loop doesn't double-fail.
+        echo "  → must either fail-fast (zero CRDs created) or report a per-entry error envelope naming the bad entry." >&2
         "${LCTL[@]}" snapshot delete "$RD_A" "$BAD_SNAP" 2>/dev/null || true
         exit 1
-    fi
-    if (( post_count == 0 )); then
-        echo "   → CLI returned 0 but no CRD was created — apiserver fail-fast detected at validation time, acceptable"
+    elif (( post_count == 0 )); then
+        echo "   → exit 0 but no CRD was created — apiserver fail-fast detected at validation time, acceptable"
     fi
 else
     # Non-zero exit: the CLI surfaced an error. The output must
