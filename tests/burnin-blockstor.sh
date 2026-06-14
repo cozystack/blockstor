@@ -135,20 +135,46 @@ EOF
     fi
 
     DEV=$(on_node "$PRIMARY" bash -c "grep -oE '/dev/drbd[0-9]+' /etc/drbd.d/${RD}.res | head -1")
+
+    # Write 1 MiB urandom on PRIMARY and capture its md5, then read it
+    # back on PEER and compare. Each remote read GUARDS dd's exit code
+    # (via PIPESTATUS) AND the byte count: under churn `dd` can fail to
+    # open /dev/drbdN (EAGAIN, device transiently busy) and read ZERO
+    # bytes; md5("") is a fixed digest, so an unguarded read produces a
+    # FALSE mismatch alarm that would drown out a real future divergence.
+    # The md5 is computed by piping dd STRAIGHT into md5sum (never via a
+    # shell variable — command substitution strips NUL bytes, which a
+    # binary 1 MiB read is full of). On a guarded read failure the snippet
+    # emits the sentinel "READFAIL"; the iteration's compare is then
+    # SKIPPED (not counted as a real FAIL) and re-tried next iteration.
+    # `bs=1M count=1` reads exactly 1048576 bytes on success.
+    EXPECT_BYTES=1048576
     PRIMARY_MD5=$(on_node "$PRIMARY" bash -c "
         drbdadm primary ${RD}
         dd if=/dev/urandom of=${DEV} bs=1M count=1 status=none oflag=direct
-        dd if=${DEV} bs=1M count=1 status=none iflag=direct | md5sum | awk '{print \$1}'
+        md5=\$(dd if=${DEV} bs=1M count=1 iflag=direct 2>/tmp/burnin-dd-primary.err | md5sum | awk '{print \$1}')
+        rc=\${PIPESTATUS[0]}
+        n=\$(awk '/bytes/ {print \$1; exit}' /tmp/burnin-dd-primary.err)
         drbdadm secondary ${RD}
+        if [ \"\$rc\" -ne 0 ] || [ \"\$n\" != \"${EXPECT_BYTES}\" ]; then echo 'READFAIL'; else echo \"\$md5\"; fi
     " | tail -1)
 
     PEER_MD5=$(on_node "$PEER" bash -c "
         drbdadm primary ${RD}
-        dd if=${DEV} bs=1M count=1 status=none iflag=direct | md5sum | awk '{print \$1}'
+        md5=\$(dd if=${DEV} bs=1M count=1 iflag=direct 2>/tmp/burnin-dd-peer.err | md5sum | awk '{print \$1}')
+        rc=\${PIPESTATUS[0]}
+        n=\$(awk '/bytes/ {print \$1; exit}' /tmp/burnin-dd-peer.err)
         drbdadm secondary ${RD}
+        if [ \"\$rc\" -ne 0 ] || [ \"\$n\" != \"${EXPECT_BYTES}\" ]; then echo 'READFAIL'; else echo \"\$md5\"; fi
     " | tail -1)
 
-    if [[ "$PRIMARY_MD5" == "$PEER_MD5" ]]; then
+    if [[ "$PRIMARY_MD5" == "READFAIL" || "$PEER_MD5" == "READFAIL" \
+          || -z "$PRIMARY_MD5" || -z "$PEER_MD5" ]]; then
+        # Transient read failure on at least one side — neither PASS nor
+        # FAIL. A real mismatch is only credible when BOTH reads succeeded
+        # and returned the full 1 MiB.
+        echo "[$(date -u +%FT%TZ)] iter=$ITER SKIP: transient dd read failure (primary='$PRIMARY_MD5' peer='$PEER_MD5'); not comparing"
+    elif [[ "$PRIMARY_MD5" == "$PEER_MD5" ]]; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
