@@ -410,6 +410,37 @@ func parsePeerNodeID(raw string) *int32 {
 // the clear, a reader between the two frames sees stale "(NN%)"
 // on what the kernel already considers a settled replica.
 func peerDeviceVolumeObservation(ev drbd.Event, volNum int32) []volumeObservation {
+	// SyncSource invariant (BUG-045): a node reporting
+	// `replication:SyncSource` toward a peer is feeding that peer's
+	// resync, which the kernel only permits from a LOCAL disk that is
+	// itself UpToDate. The local `device` frame's `disk:UpToDate` may
+	// be missing or stale on a Secondary SyncSource (it is only
+	// re-emitted on an actual local disk-state transition, and a peer-
+	// device frame can create the volume-cache entry first with an
+	// empty DiskState). Stamp DiskState=UpToDate off the reliably-
+	// emitted peer-device frame so the CRD status projection never
+	// leaves a live source's diskState blank — the U130 last-copy
+	// delete guard reads exactly this field. mergeVolumeInto only ever
+	// upgrades a cached DiskState to a non-empty value, and UpToDate is
+	// the terminal disk-state, so this is idempotent and never
+	// downgrades a richer local-frame observation.
+	if ev.Fields["replication"] == drbdReplStateSyncSource {
+		obs := volumeObservation{
+			VolumeNumber: volNum,
+			DiskState:    drbdDiskStateUpToDate,
+		}
+
+		if oosStr, ok := ev.Fields["out-of-sync"]; ok {
+			oos, err := strconv.ParseInt(oosStr, 10, 64)
+			if err == nil {
+				obs.OutOfSyncKib = oos
+				obs.HasSync = true
+			}
+		}
+
+		return []volumeObservation{obs}
+	}
+
 	if oosStr, ok := ev.Fields["out-of-sync"]; ok {
 		oos, err := strconv.ParseInt(oosStr, 10, 64)
 		if err == nil {
@@ -564,6 +595,21 @@ const (
 	// `annotateSyncProgress` stops decorating bare UpToDate with a
 	// stale "(NN%)" suffix.
 	drbdStateEstablished = "Established"
+	// drbdReplStateSyncSource is the DRBD-9 per-peer replication-state
+	// token meaning "this node is feeding the resync of a SyncTarget
+	// peer". It is a hard DRBD invariant that a SyncSource's LOCAL
+	// disk is UpToDate — a node cannot serve a resync from a disk that
+	// is not itself a complete, current copy. The observer uses this
+	// to re-stamp the local volume's DiskState=UpToDate off the
+	// reliably-emitted peer-device frame, closing the BUG-045 race
+	// where the local `device` frame's `disk:UpToDate` is missing or
+	// stale on a Secondary SyncSource (see peerDeviceVolumeObservation).
+	drbdReplStateSyncSource = "SyncSource"
+	// drbdDiskStateUpToDate is the DRBD-9 device disk_state token
+	// meaning the local replica holds a complete, current copy. Used
+	// as the value the SyncSource invariant stamps onto the local
+	// volume's DiskState.
+	drbdDiskStateUpToDate = "UpToDate"
 	// drbdRolePrimary is the DRBD-9 role token meaning the
 	// replica is open for write. Maps to ResourceStatus.InUse.
 	drbdRolePrimary = "Primary"
