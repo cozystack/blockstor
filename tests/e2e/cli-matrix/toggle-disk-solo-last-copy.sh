@@ -53,17 +53,52 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo ">> init: 2 diskful ($N1,$N2) on $RD, reach UpToDate (latches RD.Initialized)"
+echo ">> init: 2 diskful ($N1,$N2) on $RD, reach UpToDate"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 512M >/dev/null
 "${LCTL[@]}" resource create "$N1" "$RD" --storage-pool="$POOL" >/dev/null
 "${LCTL[@]}" resource create "$N2" "$RD" --storage-pool="$POOL" >/dev/null
 wait_uptodate "$RD" "$N1" "$N2"
 
-init=$(kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" \
-    -o jsonpath='{.spec.initialized}' 2>/dev/null || echo "")
+# RD.Spec.Initialized does NOT latch on bare UpToDate. The controller's
+# ensureSkipInitSyncDecision flips it true only when a diskful peer is
+# PROVEN data-bearing — i.e. its volume's DRBD CurrentGI has been
+# observed AND differs from the deterministic day0 GI
+# (anyProvenDataBearingDiskfulPeer / isDay0SeededDiskfulVolume in
+# internal/controller/resource_controller.go). A freshly-created,
+# never-written pair sits at the day0 GI forever, so the old
+# "UpToDate ⇒ Initialized" precondition was wrong and always died here.
+# Trigger the real latch by writing real data: promote $N1, write a few
+# MiB to advance the generation past day0, demote. This is the same
+# advance-past-day0 device write u145-write-then-add-replica-syncs uses.
+echo ">> write real data on $N1 to advance GI past day0 (the actual Initialized latch trigger)"
+N1_DEV=$(kubectl get resource "${RD}.${N1}" -o jsonpath='{.status.volumes[0].devicePath}' 2>/dev/null || echo "")
+if [[ -z "$N1_DEV" ]]; then
+    N1_MINOR=$(kubectl get resource "${RD}.${N1}" -o jsonpath='{.status.drbdMinor}' 2>/dev/null || echo "")
+    [[ -n "$N1_MINOR" ]] && N1_DEV="/dev/drbd${N1_MINOR}"
+fi
+[[ -n "$N1_DEV" ]] || N1_DEV=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null || echo "")
+[[ -n "$N1_DEV" ]] \
+    || die "precondition: could not resolve $N1 DRBD device to write the latch-triggering data"
+on_node "$N1" sh -c "
+    D=${N1_DEV};
+    drbdsetup primary $RD --force 2>/dev/null || drbdadm primary --force $RD 2>/dev/null || true;
+    dd if=/dev/urandom of=\$D bs=1M count=16 oflag=direct 2>/dev/null;
+    sync;
+    drbdadm secondary $RD 2>/dev/null || true;
+" || die "precondition: write to $N1 DRBD device ($N1_DEV) failed"
+
+echo ">> wait up to 60s for RD.Spec.Initialized to latch true after the write"
+init=""
+init_deadline=$(( $(date +%s) + 60 ))
+while (( $(date +%s) < init_deadline )); do
+    init=$(kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" \
+        -o jsonpath='{.spec.initialized}' 2>/dev/null || echo "")
+    [[ "$init" == "true" ]] && break
+    sleep 2
+done
 [[ "$init" == "true" ]] \
-    || die "precondition: RD.Spec.Initialized='$init', want true after 2 diskful UpToDate"
+    || die "precondition: RD.Spec.Initialized='$init', want true after a real data write past day0"
 
 echo ">> collapse: delete BOTH diskful (RD.Initialized stays latched)"
 "${LCTL[@]}" resource delete "$N1" "$RD" >/dev/null

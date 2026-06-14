@@ -99,7 +99,14 @@ _out=$("${LCTL[@]}" resource create "$N2" "$RD" --storage-pool=stand 2>&1) \
 _out=$("${LCTL[@]}" resource create "$N3" "$RD" --storage-pool=stand 2>&1) \
     || { echo "FAIL: r c $N3 $RD: $_out" >&2; exit 1; }
 
-wait_uptodate "$RD" "$N1" "$N2" "$N3"
+# wait_uptodate is a 2-peer helper: (rd, primary, peer, [vol]). Passing a
+# third NODE here landed $N3 in the `vol` slot, which the kernel
+# ground-truth path feeds to jq as `--argjson v "$N3"` → jq aborts on a
+# non-numeric ("big-worker-3 is not valid JSON"), failing the setup. For a
+# 3-replica RD, anchor on $N1 and wait it UpToDate against each peer in
+# turn — one query on $N1 covers all three replicas.
+wait_uptodate "$RD" "$N1" "$N2"
+wait_uptodate "$RD" "$N1" "$N3"
 
 # =====================================================================
 # Step 1: deactivate $N3 → INACTIVE

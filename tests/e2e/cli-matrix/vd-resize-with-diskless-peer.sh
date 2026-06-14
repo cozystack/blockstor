@@ -114,25 +114,50 @@ else
 fi
 
 # The diskless peer should converge to a Diskless (or UpToDate-diskless)
-# disk state, NOT Failed. Accept either Diskless or UpToDate — a diskless
-# DRBD replica that has connected reads UpToDate from peers.
-echo ">> wait diskless peer $DLNODE attaches (Diskless/UpToDate, not Failed)"
+# disk state and, crucially, must NOT wedge (Failed/Inconsistent).
+#
+# An empty diskState is ALSO acceptable here: the observer omits the
+# volumes[] row for a flag-only diskless replica that has no local kernel
+# device (ensureVolumesForView synthesis path — same reason
+# wait_status_diskless accepts `disk == "Diskless" || -z disk`). The old
+# assertion treated empty as a hard FAIL, so this cell flaked purely on
+# the diskless peer's (legitimately) empty device-state projection even
+# though the resize itself was fine. Gate on the DISKLESS flag being
+# present (proves the replica really is diskless) + reject only the
+# explicit wedge states; accept Diskless / UpToDate / empty.
+diskless_state_ok() {
+    case "$1" in
+        Failed|Inconsistent|Attaching|Detaching|Negotiating|DUnknown) return 1 ;;
+        *) return 0 ;;  # Diskless / UpToDate / empty are all fine
+    esac
+}
+echo ">> wait diskless peer $DLNODE attaches (Diskless/UpToDate/empty, never Failed/Inconsistent)"
 dl_deadline=$(( $(date +%s) + 120 ))
 dl_state=""
+dl_flags=""
 while (( $(date +%s) < dl_deadline )); do
+    dl_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${DLNODE}" \
+        -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     dl_state="$(status_disk_state "$RD" "$DLNODE" 0)"
-    case "$dl_state" in
-        Diskless|UpToDate) break ;;
-    esac
+    # Converged once the DISKLESS flag is stamped and the state is not a
+    # wedge — empty is the steady state for a flag-only diskless replica.
+    if [[ "$dl_flags" == *"DISKLESS"* ]] && diskless_state_ok "$dl_state"; then
+        case "$dl_state" in
+            Diskless|UpToDate) break ;;  # definitively attached
+            "") break ;;                  # flag-only diskless, no volume row
+        esac
+    fi
     sleep 3
 done
-case "$dl_state" in
-    Diskless|UpToDate) echo "   diskless peer state=$dl_state OK" ;;
-    *)
-        echo "FAIL: diskless peer $DLNODE never reached Diskless/UpToDate (last=$dl_state)" >&2
-        exit 1
-        ;;
-esac
+if [[ "$dl_flags" != *"DISKLESS"* ]]; then
+    echo "FAIL: peer $DLNODE never got the DISKLESS flag (flags='$dl_flags')" >&2
+    exit 1
+fi
+if ! diskless_state_ok "$dl_state"; then
+    echo "FAIL: diskless peer $DLNODE wedged (state=$dl_state)" >&2
+    exit 1
+fi
+echo "   diskless peer state='${dl_state:-<empty, flag-only>}' flags='$dl_flags' OK"
 
 # Sanity: the diskless peer must have NO backing LV before the grow.
 dl_lv_before=$(on_node "$DLNODE" bash -c \
@@ -186,15 +211,19 @@ fi
 echo "   diskless peer $DLNODE has no backing LV — resize correctly skipped it"
 
 echo ">> assert the diskless peer did not wedge (not Failed/Inconsistent)"
+# Same empty-state tolerance as the attach check above: the load-bearing
+# U48 assertion is "no backing LV on the diskless peer" (already checked);
+# here we only need to confirm the resize did not WEDGE the diskless
+# replica. An empty diskState is the steady state for a flag-only diskless
+# replica and must not be read as a wedge.
 dl_state_post="$(status_disk_state "$RD" "$DLNODE" 0)"
-case "$dl_state_post" in
-    Diskless|UpToDate) echo "   diskless peer post-grow state=$dl_state_post OK" ;;
-    *)
-        echo "FAIL (U48): diskless peer $DLNODE post-grow state=$dl_state_post" >&2
-        echo "      (\"requires a local disk\" wedge — resize was fanned to diskless)" >&2
-        exit 1
-        ;;
-esac
+if diskless_state_ok "$dl_state_post"; then
+    echo "   diskless peer post-grow state='${dl_state_post:-<empty, flag-only>}' OK"
+else
+    echo "FAIL (U48): diskless peer $DLNODE post-grow state=$dl_state_post" >&2
+    echo "      (\"requires a local disk\" wedge — resize was fanned to diskless)" >&2
+    exit 1
+fi
 
 echo ">> vd-resize-with-diskless-peer (U48) OK"
 cleanup

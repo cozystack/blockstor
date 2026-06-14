@@ -15,9 +15,20 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      containers:
+      # linstor-csi is a NON-TERMINATING server: it serves CSI gRPC on
+      # /csi/csi.sock forever. As a plain Job container it kept the pod
+      # Running even after csi-sanity exited, so the Job never completed
+      # and the harness `kubectl wait --for=condition=complete` blocked
+      # for the full ~1h timeout. Run it as a Kubernetes NATIVE SIDECAR —
+      # an initContainer with restartPolicy: Always — which the kubelet
+      # starts before the regular containers AND terminates automatically
+      # once all regular containers (csi-sanity) have exited. The Job then
+      # completes on csi-sanity's exit code. Native sidecars are GA from
+      # k8s 1.29 (the stand runs 1.34).
+      initContainers:
         - name: linstor-csi
           image: quay.io/piraeusdatastore/piraeus-csi:v1.10.1
+          restartPolicy: Always
           # Use a real Node (test-worker-1) so linstor-csi's
           # ControllerPublishVolume / NodeStageVolume lookups land on
           # the node where autoplace actually placed the Resource.
@@ -77,6 +88,7 @@ spec:
           volumeMounts:
             - {name: csi, mountPath: /csi}
 
+      containers:
         - name: csi-sanity
           image: golang:1.25
           # Wait for linstor-csi to open the socket, then run the

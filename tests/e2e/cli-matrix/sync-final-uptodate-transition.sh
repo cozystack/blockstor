@@ -21,9 +21,14 @@
 # shows `replication:Established` and `disk:UpToDate` with no
 # `(NN%)` progress on the relevant peer-device line.
 #
-# Timeout: 240s. Initial sync of a fresh 1G volume on a busy QEMU
-# stand plus the UpToDate-decoration race can easily take 90-180s,
-# so the budget includes a safety margin.
+# Timeout: 240s. The 3rd replica's initial SyncTarget of a 512 MiB
+# volume (DRBD throttles the resync to a few MiB/s under PausedSyncT
+# rate control) plus the UpToDate-decoration race completes in ~120s,
+# so the budget includes a safety margin. NB: a full 1 GiB sync was
+# measured at ~255-270s on big and intermittently overran 240s — a
+# timing edge, not an observer gap — so the volume size was reduced to
+# keep the window comfortably inside the budget (see the rd-create
+# comment below).
 
 set -euo pipefail
 
@@ -51,9 +56,19 @@ N1=$WORKER_1
 N2=$WORKER_2
 N3=$WORKER_3
 
-echo ">> [Bug 329] 2-replica RD on $N1+$N2 (1 GiB so the sync window is observable)"
+# 512 MiB: large enough that the 3rd replica's initial SyncTarget is a
+# real, observable Inconsistent→SyncTarget→bare-UpToDate window (the
+# Bug 329 transition under test), but small enough that the FULL sync
+# completes well inside the 240s budget. Measured on big: DRBD throttles
+# the resync to ~4.3 MiB/s (PausedSyncT rate control), so a full 1 GiB
+# sync took ~255-270s and intermittently overran the 240s wait even on a
+# quiet stand — a marginal timing edge, NOT an observer-projection gap
+# (the observer reported the SyncTarget/oos trend correctly throughout).
+# 512 MiB syncs in ~120s, comfortably under budget, without weakening the
+# assertion or inflating the timeout.
+echo ">> [Bug 329] 2-replica RD on $N1+$N2 (512 MiB — observable sync window that fits the 240s budget)"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
-"${LCTL[@]}" volume-definition create "$RD" 1G >/dev/null
+"${LCTL[@]}" volume-definition create "$RD" 512M >/dev/null
 "${LCTL[@]}" resource create "$N1" "$RD" --storage-pool=stand >/dev/null
 "${LCTL[@]}" resource create "$N2" "$RD" --storage-pool=stand >/dev/null
 

@@ -87,6 +87,26 @@ linstor_cli() {
     "$LINSTOR_CMD" --controllers "${BS_URL:?BS_URL required}" "$@"
 }
 
+# bs_exec <timeout-seconds> -- <cmd...> — run a command (typically a
+# `kubectl exec` into a satellite pod) under a hard wall-clock cap so a
+# wedged exec can never stall the whole replay sweep. The await readers
+# below (pod_md5_invariant / drbd_option / disk_state) shell into a
+# satellite via `kubectl exec`; if that pod's kernel/lvm path hangs, the
+# exec blocks with no client-side deadline and the runner never returns.
+# `timeout` SIGTERMs at the cap (then SIGKILLs), so the reader just sees
+# an empty result and retries on the next poll. Falls back to running the
+# command bare when `timeout` is absent (behaviour unchanged there).
+BS_EXEC_TIMEOUT="${BS_EXEC_TIMEOUT:-30}"
+bs_exec() {
+    local secs=$1
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${secs}s" "$@"
+    else
+        "$@"
+    fi
+}
+
 # run_linstor_cmd <argv...>
 #
 # Executes `linstor_cli "$@"`, captures stdout/stderr/exit. Sets:
@@ -605,7 +625,7 @@ except Exception:
             pod=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('pod',''))" "$spec")")
             path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('path',''))" "$spec")
             expected=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")")
-            actual=$(kubectl -n "$ns" exec "$pod" -- sh -c "md5sum '$path' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "")
+            actual=$(bs_exec "$BS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- sh -c "md5sum '$path' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "")
             [[ -n "$expected" && "$actual" == "$expected" ]]
             ;;
         volumes_settled)
@@ -713,7 +733,7 @@ except Exception:
             # (U302: verify-alg DOES render verbatim into net{}, confirmed
             # via drbdsetup on the stand — the miss was the parser, not BS).
             # shellcheck disable=SC2086  # $showflag is deliberately word-split (empty or one flag)
-            actual=$(kubectl -n "$ns" exec "$pod" -- drbdsetup show $showflag "$rd" 2>/dev/null \
+            actual=$(bs_exec "$BS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- drbdsetup show $showflag "$rd" 2>/dev/null \
                 | awk -v k="$key" '$1==k { gsub(/[;"]/,""); print $2; exit }')
             [[ "$actual" == "$expected" ]]
             ;;
@@ -758,7 +778,7 @@ except Exception:
             # of them). Any parse failure / missing resource ⇒ not
             # quorate (returns "false"), so the await keeps polling
             # rather than false-PASSing on a transient read error.
-            actual=$(kubectl -n "$ns" exec "$pod" -- drbdsetup status "$rd" --json 2>/dev/null \
+            actual=$(bs_exec "$BS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- drbdsetup status "$rd" --json 2>/dev/null \
                 | python3 -c "import json,sys
 try:
     d=json.load(sys.stdin)

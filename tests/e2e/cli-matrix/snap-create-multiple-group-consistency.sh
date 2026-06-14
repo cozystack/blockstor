@@ -126,11 +126,26 @@ on_node "$N1" bash -c "
         echo 'note: could not resolve drbd device paths'
         exit 0
     fi
+    # xxd is absent on Talos satellite containers — \`printf %016x | xxd
+    # -r -p\` aborted the pipe, so \`|| break\` killed the writer on its
+    # first iteration and the marker counter never advanced (the
+    # consistency assertion then read a stale/zero counter on both RDs
+    # and falsely passed). Emit the 8 big-endian counter bytes via the
+    # remote bash's own \`printf '\xNN'\` instead — bash IS present in
+    # the satellite container and its printf honours \\xNN escapes (unlike
+    # the /bin/sh dash). write8be() turns a 16-hex-digit string into the
+    # \\xNN-escaped form and printf-writes the raw bytes.
+    write8be() {
+        local hex esc
+        hex=\$(printf '%016x' \"\$1\")
+        esc=\$(printf '%s' \"\$hex\" | sed -E 's/(..)/\\\\x\\1/g')
+        printf \"\$esc\"
+    }
     n=0
     while true; do
         n=\$((n+1))
-        printf '%016x' \"\$n\" | xxd -r -p | dd of=\"\$dev_a\" bs=8 count=1 conv=fsync oflag=direct status=none 2>/dev/null || break
-        printf '%016x' \"\$n\" | xxd -r -p | dd of=\"\$dev_b\" bs=8 count=1 conv=fsync oflag=direct status=none 2>/dev/null || break
+        write8be \"\$n\" | dd of=\"\$dev_a\" bs=8 count=1 conv=fsync oflag=direct status=none 2>/dev/null || break
+        write8be \"\$n\" | dd of=\"\$dev_b\" bs=8 count=1 conv=fsync oflag=direct status=none 2>/dev/null || break
     done >/tmp/cli-matrix-multi-writer.log 2>&1 &
     echo \$! > /tmp/cli-matrix-multi-writer.pid
 " || true
@@ -206,6 +221,9 @@ sleep 3
 # ---- Read the first 8 bytes (counter) from each snapshot ----------------
 read_counter() {
     local node=$1 rd=$2
+    # xxd is absent on Talos satellites; \`head -c 8 | od -An -tx1 | tr -d
+    # ' \\n'\` produces the same continuous-hex digest of the 8 marker
+    # bytes that \`xxd -p\` did, using only od/tr (both present).
     on_node "$node" bash -c "
         # ZFS
         snap_full=\$(zfs list -H -t snapshot 2>/dev/null \
@@ -214,7 +232,7 @@ read_counter() {
             # Clone to ephemeral RW dataset to read first 8 bytes
             tmp_clone=\"\${snap_full%@*}/cli-matrix-counter-read-${rd}\"
             zfs clone \"\$snap_full\" \"\$tmp_clone\" 2>/dev/null && \
-            head -c 8 \"/dev/zvol/\$tmp_clone\" 2>/dev/null | xxd -p
+            head -c 8 \"/dev/zvol/\$tmp_clone\" 2>/dev/null | od -An -tx1 | tr -d ' \n'
             zfs destroy \"\$tmp_clone\" 2>/dev/null
             exit 0
         fi
@@ -223,14 +241,14 @@ read_counter() {
             | grep -E '${rd}.*${SNAP}' | head -1 | tr -d ' ')
         if [ -n \"\$lv\" ]; then
             lvchange -ay \"\$lv\" 2>/dev/null || true
-            head -c 8 \"/dev/\$lv\" 2>/dev/null | xxd -p
+            head -c 8 \"/dev/\$lv\" 2>/dev/null | od -An -tx1 | tr -d ' \n'
             lvchange -an \"\$lv\" 2>/dev/null || true
             exit 0
         fi
         # FILE_THIN snapshot — .img sibling at /var/lib/blockstor-pool
         img=\$(ls /var/lib/blockstor-pool/${rd}_${SNAP}_*.img 2>/dev/null | head -1)
         if [ -n \"\$img\" ]; then
-            head -c 8 \"\$img\" 2>/dev/null | xxd -p
+            head -c 8 \"\$img\" 2>/dev/null | od -An -tx1 | tr -d ' \n'
             exit 0
         fi
         echo ''
