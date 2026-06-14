@@ -2774,38 +2774,46 @@ func (r *Reconciler) maybeLateAddPromote(ctx context.Context, dr *intent.Desired
 // concurrently-added volume of a 3-diskful RD, oos frozen at full / a
 // peer stuck below UpToDate forever):
 //
-//   - dependency deadlock: a SyncSource is elected but sits PausedSyncS
-//     with resync-suspended "dependency" toward its peers, which in turn
-//     wait in WFBitMapT/resync-suspended "peer" for a bitmap exchange the
-//     paused source never starts. Nobody ever reaches UpToDate.
-//   - partial stall: one peer reaches UpToDate (a real SyncSource), but a
-//     SECOND peer stays WFBitMapT / Outdated and never finalises — the
-//     source fed one peer but not the other.
+//   - partial stall: one peer reaches UpToDate (a real SyncSource), but
+//     THIS replica stays WFBitMapT / Outdated / Inconsistent and never
+//     finalises — the source fed another peer but not us.
+//   - dependency deadlock (post-promote): once maybeLateAddPromote
+//     force-primaries the lowest-id node to UpToDate, the remaining
+//     Inconsistent replicas have an UpToDate peer but their resync stays
+//     paused (resync-suspended:dependency) and never advances.
 //
 // Why neither promote self-heal covers it: maybeLateAddPromote fires only
 // when NO peer holds data and the volume is Inconsistent on EVERY replica
-// (it mints a source); here a source exists (or a peer is already
-// UpToDate) but the resync machinery is latched. maybeRecoveryPromote
-// needs the local already-UpToDate. A force-primary does not clear a
-// resync-suspended:dependency latch — only a connection re-handshake does.
+// (it mints a source); here an UpToDate peer EXISTS but the local resync
+// is latched. maybeRecoveryPromote needs the local already-UpToDate.
 //
-// NeedsLateAddResyncKick is the kernel-truth gate: it fires ONLY when no
-// replica is Primary, the RD is past day0 (a local UpToDate volume
-// exists), every peer is Connected, and a peer-device is in a stalled
-// resync (PausedSync*/WFBitMap* with a non-"no" resync-suspended). The
-// kick (Adm.LateAddResyncKick) `disconnect`s then `adjust`s, re-running
-// the GI handshake so DRBD restarts the resync from the correct
-// direction. Data-safe (disconnect/reconnect never mutates data) and
-// self-limiting (once the resync finishes no stalled peer-device remains).
-// Throttled via the shared recoveryPromoteThrottle so a still-converging
-// resync isn't churned by repeated kicks. Skipped on diskless replicas
-// (no local resync to kick) and when Adm is unwired (storage-only tests).
+// Why `invalidate` and not a connection re-handshake: every replica of a
+// fresh late-added volume shares the day0 current-UUID, so disconnect+
+// reconnect reads "same generation ⇒ no resync needed" and abandons the
+// dirty bitmap — a WORSE wedge (verified on-stand: connection went
+// StandAlone / Established with out-of-sync frozen). `drbdadm invalidate
+// <res>/<vol>` instead discards the empty, non-authoritative LOCAL copy of
+// that one volume and forces a full SyncTarget FROM the UpToDate peer.
+//
+// LateAddResyncKickVolumes is the kernel-truth gate: it returns the local
+// volumes below UpToDate that have a connected UpToDate peer (the
+// SyncTarget source) and are not already being actively pulled — ONLY when
+// no replica is Primary, the RD is past day0, and every peer is Connected.
+// Each returned volume is invalidated locally. Data-safe (only a
+// non-authoritative local copy is discarded, and only when an UpToDate
+// peer exists to re-pull from) and self-limiting (once a volume reaches
+// UpToDate it no longer qualifies). A 45s stall-dwell ensures only a
+// GENUINELY frozen resync is invalidated, never the normal transient
+// volume-resync serialization. Throttled via the shared
+// recoveryPromoteThrottle. Skipped on diskless replicas (no local copy to
+// invalidate) and when Adm is unwired (storage-only tests).
 func (r *Reconciler) maybeKickLateAddResync(ctx context.Context, dr *intent.DesiredResource, diskless bool) error {
 	if diskless || r.cfg.Adm == nil {
 		return nil
 	}
 
-	if !r.cfg.Adm.NeedsLateAddResyncKick(ctx, dr.GetName()) {
+	volumes := r.cfg.Adm.LateAddResyncKickVolumes(ctx, dr.GetName())
+	if len(volumes) == 0 {
 		// Not stalled (or converged): clear any pending dwell so a future
 		// transient stall starts its window fresh.
 		r.clearLateAddStall(dr.GetName())
@@ -2813,9 +2821,9 @@ func (r *Reconciler) maybeKickLateAddResync(ctx context.Context, dr *intent.Desi
 		return nil
 	}
 
-	// Dwell gate: only kick once the stall has PERSISTED beyond
+	// Dwell gate: only invalidate once the stall has PERSISTED beyond
 	// lateAddStallDwell, so the normal transient volume-resync
-	// serialization (a few seconds of PausedSyncS/dependency while a
+	// serialization (a few seconds of PausedSync*/dependency while a
 	// sibling volume finishes) is never disrupted — only a genuinely
 	// frozen resync is.
 	if !r.lateAddStallDwellElapsed(dr.GetName()) {
@@ -2826,11 +2834,17 @@ func (r *Reconciler) maybeKickLateAddResync(ctx context.Context, dr *intent.Desi
 		return nil
 	}
 
-	log.FromContext(ctx).Info("BUG-048 late-add resync-kick: disconnect+adjust to restart a stalled resync (paused/bitmap-exchange-wedged) for a late-added volume",
-		"resource", dr.GetName())
+	for _, vol := range volumes {
+		log.FromContext(ctx).Info("BUG-048 late-add resync-kick: invalidate locally to re-pull a stalled late-added volume from its UpToDate peer",
+			"resource", dr.GetName(), "volume", vol)
 
-	return errors.Wrapf(r.cfg.Adm.LateAddResyncKick(ctx, dr.GetName()),
-		"late-add resync-kick %s", dr.GetName())
+		err := r.cfg.Adm.InvalidateVolume(ctx, dr.GetName(), vol)
+		if err != nil {
+			return errors.Wrapf(err, "late-add resync-kick invalidate %s/%d", dr.GetName(), vol)
+		}
+	}
+
+	return nil
 }
 
 // lateAddStallDwellElapsed records the first time a resource was observed

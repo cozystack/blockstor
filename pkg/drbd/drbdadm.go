@@ -92,33 +92,23 @@ func (a *Adm) Adjust(ctx context.Context, resource string) error {
 	return a.run(ctx, "adjust", resource)
 }
 
-// LateAddResyncKick unsticks a STALLED late-add resync (BUG-048): it
-// `disconnect`s every peer of the resource then `adjust`s to reconnect,
-// re-running the DRBD GI handshake from scratch. The handshake re-derives
-// the correct sync direction from generation-UUIDs / bitmaps and restarts
-// the resync, clearing a stale paused-SyncSource (resync-suspended
-// "dependency") or a never-completing WFBitMapT (resync-suspended "peer")
-// that no longer advances on its own. Gated by the kernel-truth
-// NeedsLateAddResyncKick predicate, which fires ONLY on the genuine wedge
-// (no Primary anywhere, RD past day0, every peer Connected, a stalled
-// resync present).
+// InvalidateVolume runs `drbdadm invalidate <resource>/<vol>` — marks the
+// LOCAL copy of ONE volume as out-of-sync and forces a full SyncTarget of
+// that volume from an UpToDate peer. The per-volume target (`<res>/<vol>`)
+// confines the discard to the named volume so sibling volumes' data is
+// untouched. Requires an UpToDate peer as the resync source (drbdadm
+// refuses otherwise); callers gate on LateAddResyncKickVolumes, which only
+// returns a volume when a connected peer is UpToDate for it.
 //
-// Data-safe: disconnect/reconnect never mutates on-disk data, and DRBD's
-// post-reconnect handshake picks the sync direction from metadata — it
-// can never copy the wrong way. The `disconnect` is best-effort (a peer
-// already StandAlone returns non-zero, which we ignore); the `adjust`
-// reconnects every peer the .res still describes (drbdadm adjust re-adds
-// connection objects, the inverse of the down a disconnect leaves). A
-// failed adjust surfaces so a genuinely stuck reconnect is not silently
-// swallowed.
-func (a *Adm) LateAddResyncKick(ctx context.Context, resource string) error {
-	// Best-effort disconnect of all peers — quiesces the stale
-	// connection objects so the adjust re-runs a clean handshake.
-	_, _ = a.exec.Run(ctx, "drbdadm", "disconnect", resource)
+// Used by the BUG-048 late-add resync-kick self-heal to recover a stalled
+// late-add resync: the fresh, empty, non-authoritative local copy is
+// thrown away and re-pulled from the UpToDate peer, working WITH the
+// bitmap (unlike a connection re-handshake, which the shared day0 GI makes
+// conclude "no resync needed").
+func (a *Adm) InvalidateVolume(ctx context.Context, resource string, volume int32) error {
+	target := fmt.Sprintf("%s/%d", resource, volume)
 
-	// Reconnect every configured peer; restarts the resync from the
-	// re-run GI handshake.
-	return a.run(ctx, "adjust", resource)
+	return a.run(ctx, "invalidate", target)
 }
 
 // AdjustSkipDisk is the Failed-replica variant of Adjust that
@@ -1635,84 +1625,82 @@ func lateAddVolumeNeedsLocalPromote(conns []drbdsetupStatusConnection, vol, myID
 	return weAreLowest
 }
 
-// NeedsLateAddResyncKick probes the live kernel via `drbdsetup status
-// <res> --json` and reports whether a LATE-ADDED volume's resync is
-// STALLED — present but suspended/waiting, making no progress — so the
-// satellite should kick it (disconnect + adjust to re-run the handshake
-// and restart the resync) (BUG-048, the ≥3-replica concurrent late-add
-// convergence wedge).
+// LateAddResyncKickVolumes probes the live kernel via `drbdsetup status
+// <res> --json` and returns the LOCAL volume numbers whose late-add
+// resync is STALLED and recoverable by a local `drbdadm invalidate
+// <res>/<vol>` — the ≥3-replica concurrent late-add convergence wedge
+// (BUG-048). Empty slice ⇒ nothing to do.
 //
-// Distinct from NeedsLateAddPromote: that predicate fires when NO
-// SyncSource exists at all (every replica Inconsistent, no peer holds
-// data) and force-primaries the lowest-id node to MINT a source. This
-// predicate fires when a resync EXISTS but is wedged in a paused /
-// bitmap-exchange state that never advances — the two stand-observed
-// signatures:
+// Why `invalidate` and not disconnect/reconnect: every replica of a
+// freshly late-added volume shares the deterministic day0 current-UUID,
+// so a connection re-handshake (disconnect+adjust/connect) reads "same
+// generation ⇒ no resync needed" and ABANDONS the dirty bitmap — leaving
+// the volume Established/Inconsistent with out-of-sync frozen, a WORSE
+// wedge. `drbdadm invalidate <res>/<vol>` instead explicitly discards the
+// (empty, non-authoritative) LOCAL copy of that one volume and forces a
+// full SyncTarget FROM an UpToDate peer — it works WITH the bitmap rather
+// than re-deriving sync direction from the ambiguous day0 GI.
 //
-//   - "dependency deadlock": a peer-device is PausedSyncS with
-//     resync-suspended "dependency" (DRBD serialised this volume's
-//     resync behind another that has already finished, but the
-//     dependency latch never cleared), and its partner peers sit in
-//     WFBitMapT/resync-suspended "peer" waiting for a bitmap exchange
-//     that the paused source never starts. out-of-sync stays at the
-//     full volume size forever.
-//   - "partial stall": one peer reached UpToDate (a genuine SyncSource
-//     exists) but a SECOND peer is stuck in WFBitMapT (peerdisk
-//     Outdated/Inconsistent) and never finalises — the source fed one
-//     peer but not the other. The waiting peer's bitmap exchange never
-//     completes.
+// The two stand-observed wedge signatures both reduce to "a local volume
+// is below UpToDate, an UpToDate peer for it EXISTS, yet no live resync is
+// pulling it up":
 //
-// In BOTH a force-primary alone does not help: the source/bitmap
-// machinery is latched in a paused/waiting state that only a connection
-// re-handshake clears. Disconnecting and re-adjusting tears down the
-// stale connection objects and re-runs the GI handshake, from which DRBD
-// re-derives the correct sync direction and restarts the resync cleanly.
+//   - "partial stall": one peer reached UpToDate (a real source) but THIS
+//     replica is stuck WFBitMapT / PausedSyncT / Established with
+//     out-of-sync frozen — the source fed another peer but not us.
+//   - "dependency deadlock" (post-promote): once maybeLateAddPromote
+//     force-primaries the lowest-id node to UpToDate, the remaining
+//     Inconsistent replicas have an UpToDate peer but their resync stays
+//     paused (resync-suspended:dependency/peer) — invalidate restarts it.
 //
-// Returns true ONLY when ALL hold, so the kick is data-safe and
-// self-limiting:
+// A volume qualifies ONLY when ALL hold, so the invalidate is data-safe
+// and self-limiting:
 //   - the kernel slot exists and reports a my-node-id;
-//   - NO replica anywhere (local nor any peer-role) is Primary (never
-//     disconnect a resource an application is actively writing — the
-//     resume on a Primary is handled by the normal resync path; a kick
-//     here would needlessly flap a live device);
+//   - NO replica anywhere (local nor any peer-role) is Primary — never
+//     invalidate a volume an application may be writing (would discard
+//     live data);
 //   - at least one local volume is already UpToDate — the RD is PAST
 //     first activation (a pure day0 bootstrap is excluded, same as
 //     NeedsLateAddPromote gate 1), so this can never fire mid-bring-up;
-//   - every peer connection is fully Connected (the resync states are
-//     only authoritative over a settled connection — a Connecting /
-//     StandAlone peer is a transient that the next reconcile re-reads);
-//   - at least one peer-device of any volume is a STALLED resync: a
-//     paused/waiting replication-state (PausedSyncS/PausedSyncT/
-//     WFBitMapS/WFBitMapT) whose resync-suspended is NOT "no" (i.e.
-//     "dependency"/"peer"/"user") — the precise wedge signature, never a
-//     healthy progressing SyncSource (resync-suspended "no").
+//   - every peer connection is fully Connected (resync state is only
+//     authoritative over a settled connection);
+//   - the LOCAL volume is below UpToDate (Inconsistent/Outdated) — only a
+//     non-authoritative local copy is ever discarded, never an UpToDate
+//     one;
+//   - a connected PEER is UpToDate for that SAME volume — the authoritative
+//     source `invalidate` will SyncTarget from (without one, invalidate
+//     has nothing to pull and would fail; maybeLateAddPromote owns minting
+//     the source for the all-Inconsistent case);
+//   - the volume is NOT already being actively SyncTarget-pulled
+//     (replication-state SyncTarget with resync-suspended "no") — a live
+//     resync finishes on its own and must not be churned.
 //
-// Conservative on any probe/parse failure → false. Self-limiting: once
-// the kick lets the resync finish and the volume reaches UpToDate, no
-// stalled peer-device remains and the predicate stops holding.
-func (a *Adm) NeedsLateAddResyncKick(ctx context.Context, resource string) bool {
+// Conservative on any probe/parse failure → empty. Self-limiting: once a
+// volume reaches UpToDate it no longer qualifies, so the predicate stops
+// returning it.
+func (a *Adm) LateAddResyncKickVolumes(ctx context.Context, resource string) []int32 {
 	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
 	if err != nil {
-		return false
+		return nil
 	}
 
 	var status drbdsetupStatusRoot
 
 	err = json.Unmarshal(out, &status)
 	if err != nil || len(status) == 0 || status[0].NodeID == nil {
-		return false
+		return nil
 	}
 
 	res := status[0]
 
-	// Never kick a resource an application is actively writing.
+	// Never invalidate a volume an application may be writing.
 	if Role(res.Role).IsPrimary() {
-		return false
+		return nil
 	}
 
 	for _, conn := range res.Connections {
 		if Role(conn.PeerRole).IsPrimary() {
-			return false
+			return nil
 		}
 	}
 
@@ -1720,57 +1708,80 @@ func (a *Adm) NeedsLateAddResyncKick(ctx context.Context, resource string) bool 
 	// so this can never misfire during a fresh RD's first-activation
 	// bring-up where every volume is transiently Inconsistent.
 	if !localHasUpToDateVolume(res.Devices) {
-		return false
+		return nil
 	}
 
 	// Gate: every peer fully Connected — the resync-state read is only
 	// authoritative over a settled connection.
 	if !allPeersConnected(res.Connections) {
-		return false
+		return nil
 	}
 
-	// Fire only when a genuine STALLED resync peer-device is present.
-	for _, conn := range res.Connections {
-		if slices.ContainsFunc(conn.PeerDevices, peerDeviceResyncStalled) {
-			return true
+	var kick []int32
+
+	for _, dev := range res.Devices {
+		if lateAddVolumeNeedsInvalidate(res.Connections, dev) {
+			kick = append(kick, dev.VolumeNumber)
 		}
 	}
 
-	return false
+	return kick
 }
 
-// peerDeviceResyncStalled reports whether a peer-device is wedged in a
-// resync that is present but suspended/waiting and making no progress —
-// the BUG-048 late-add convergence-wedge signature. True when the
-// replication-state is a paused or bitmap-exchange-wait state
-// (PausedSyncS/PausedSyncT/WFBitMapS/WFBitMapT) AND resync-suspended is
-// a non-"no" reason ("dependency"/"peer"/"user", possibly comma-joined).
-//
-// A healthy progressing resync (SyncSource/SyncTarget, or a WF* step
-// with resync-suspended "no") is NOT stalled — it advances on its own
-// and must be left alone. An empty resync-suspended token is treated as
-// "no" (drbd-utils omits the field when nothing is suspended), so a
-// transient WF* with no suspension is not mistaken for a wedge.
-func peerDeviceResyncStalled(peerDev drbdsetupStatusPeerDevice) bool {
-	switch ReplicationState(peerDev.ReplicationState) {
-	case ReplicationStatePausedSyncS, ReplicationStatePausedSyncT,
-		ReplicationStateWFBitMapS, ReplicationStateWFBitMapT:
-		// A paused or bitmap-exchange-wait state — candidate.
-	case ReplicationStateOff, ReplicationStateEstablished,
-		ReplicationStateStartingSyncS, ReplicationStateStartingSyncT,
-		ReplicationStateWFSyncUUID, ReplicationStateSyncSource,
-		ReplicationStateSyncTarget, ReplicationStateVerifyS,
-		ReplicationStateVerifyT, ReplicationStateAhead,
-		ReplicationStateBehind:
-		// Progressing or steady-state — not a stalled wedge.
+// lateAddVolumeNeedsInvalidate reports whether THIS node's local `dev` is
+// a stalled late-add volume that a local `invalidate` would recover: the
+// local copy is below UpToDate (Inconsistent/Outdated), a connected peer
+// is UpToDate for the volume (the SyncTarget source), and the volume is
+// not already being actively pulled (SyncTarget/resync-suspended:no).
+func lateAddVolumeNeedsInvalidate(conns []drbdsetupStatusConnection, dev drbdsetupStatusDevice) bool {
+	switch DiskState(dev.DiskState) {
+	case DiskStateInconsistent, DiskStateOutdated:
+		// Below UpToDate — a candidate to re-pull. Never touch an
+		// UpToDate local (authoritative) copy.
+	case DiskStateUpToDate, DiskStateConsistent, DiskStateDiskless,
+		DiskStateAttaching, DiskStateDetaching, DiskStateFailed,
+		DiskStateNegotiating, DiskStateDUnknown:
 		return false
 	default:
 		return false
 	}
 
-	rss := peerDev.ResyncSuspended
+	var (
+		peerUpToDate    bool
+		activelyPulling bool
+	)
 
-	return rss != "" && rss != wireNo
+	for _, conn := range conns {
+		for _, peerDev := range conn.PeerDevices {
+			if peerDev.VolumeNumber != dev.VolumeNumber {
+				continue
+			}
+
+			if DiskState(peerDev.PeerDiskState) == DiskStateUpToDate {
+				peerUpToDate = true
+			}
+
+			if peerDeviceActivelyPulling(peerDev) {
+				activelyPulling = true
+			}
+		}
+	}
+
+	return peerUpToDate && !activelyPulling
+}
+
+// peerDeviceActivelyPulling reports whether this peer-device is a live,
+// unsuspended SyncTarget — a resync already pulling local data up to date
+// that must be left to finish. Mirrors peerDeviceActivelySyncing but for
+// the receive direction (StartingSyncT / WFBitMapT-with-resync-running are
+// NOT counted: WFBitMapT with resync-suspended != "no" is the wedge this
+// recovers).
+func peerDeviceActivelyPulling(peerDev drbdsetupStatusPeerDevice) bool {
+	if ReplicationState(peerDev.ReplicationState) != ReplicationStateSyncTarget {
+		return false
+	}
+
+	return peerDev.ResyncSuspended == "" || peerDev.ResyncSuspended == wireNo
 }
 
 // DownVeto is the tri-state outcome of the Bug 350 kernel-truth probe

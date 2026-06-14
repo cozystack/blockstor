@@ -20,21 +20,22 @@ package drbd_test
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
-var errKickProbe = errors.New("drbdsetup status: exit 1")
-
 // Regression pins for the BUG-048 late-add resync-KICK predicate
-// (NeedsLateAddResyncKick). It exists to unstick a late-added volume
-// whose resync EXISTS but wedged in a paused / bitmap-exchange state
-// that never advances — the ≥3-replica concurrent-add convergence wedge.
-// It must fire ONLY on that stalled-resync signature and never on a
-// healthy progressing sync, a day0 bootstrap, a Primary-held resource,
-// or a not-fully-connected peer set.
+// (LateAddResyncKickVolumes). It returns the LOCAL volume numbers whose
+// late-add resync is STALLED and recoverable by `drbdadm invalidate
+// <res>/<vol>` — a local copy below UpToDate, an UpToDate peer to pull
+// from, and no live resync already running. It must return ONLY genuine
+// stragglers and never an UpToDate local, a volume with no UpToDate peer,
+// a live SyncTarget, a day0 bootstrap, or a Primary-held resource.
+
+var errKickProbe = errors.New("drbdsetup status: exit 1")
 
 const lateAddKickKey = "drbdsetup status pvc-kick --json"
 
@@ -47,14 +48,13 @@ func admWithKickStatus(t *testing.T, json string) *drbd.Adm {
 	return drbd.NewAdm(fx)
 }
 
-// Stand-observed signature 1 — "dependency deadlock" (B-3r RUN2/RUN8):
-// vol-0/vol-1 UpToDate, the late vol-2 Inconsistent locally, a peer is
-// PausedSyncS/resync-suspended:dependency (an elected source whose
-// resync is paused on a stale dependency) and the partner waits in
-// WFBitMapT/resync-suspended:peer. oos frozen at full. No Primary.
-func TestNeedsLateAddResyncKick_DependencyDeadlock(t *testing.T) {
+// Stand-observed "partial stall" (B-3r RUN9): vol-0/vol-1 UpToDate, the
+// late vol-2 stuck Inconsistent locally while a peer (n2) reached
+// UpToDate for vol-2 — but this replica is stuck WFBitMapT and never
+// finalises. An UpToDate peer exists ⇒ invalidate vol-2 locally.
+func TestLateAddResyncKickVolumes_PartialStall(t *testing.T) {
 	adm := admWithKickStatus(t, `[{
-	  "name":"pvc-kick","node-id":0,"role":"Secondary",
+	  "name":"pvc-kick","node-id":2,"role":"Secondary",
 	  "devices":[
 	    {"volume":0,"disk-state":"UpToDate"},
 	    {"volume":1,"disk-state":"UpToDate"},
@@ -63,109 +63,123 @@ func TestNeedsLateAddResyncKick_DependencyDeadlock(t *testing.T) {
 	  "connections":[
 	    {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
 	     "peer_devices":[
-	       {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	       {"volume":1,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	       {"volume":2,"peer-disk-state":"Inconsistent","replication-state":"PausedSyncS","resync-suspended":"dependency"}
-	     ]},
-	    {"peer-node-id":2,"name":"n3","connection-state":"Connected","peer-role":"Secondary",
-	     "peer_devices":[
-	       {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	       {"volume":1,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	       {"volume":2,"peer-disk-state":"Inconsistent","replication-state":"WFBitMapT","resync-suspended":"peer"}
-	     ]}
-	  ]
-	}]`)
-
-	if !adm.NeedsLateAddResyncKick(t.Context(), "pvc-kick") {
-		t.Fatal("expected kick for the dependency-deadlock wedge")
-	}
-}
-
-// Stand-observed signature 2 — "partial stall" (B-3r RUN9): one peer
-// reached UpToDate (a real SyncSource exists) but a SECOND peer is stuck
-// WFBitMapT / peerdisk Outdated and never finalises. The waiting peer's
-// resync-suspended is "peer". No Primary.
-func TestNeedsLateAddResyncKick_PartialStall(t *testing.T) {
-	adm := admWithKickStatus(t, `[{
-	  "name":"pvc-kick","node-id":2,"role":"Secondary",
-	  "devices":[
-	    {"volume":0,"disk-state":"UpToDate"},
-	    {"volume":1,"disk-state":"UpToDate"},
-	    {"volume":2,"disk-state":"Outdated"}
-	  ],
-	  "connections":[
-	    {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
-	     "peer_devices":[
-	       {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	       {"volume":1,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
 	       {"volume":2,"peer-disk-state":"UpToDate","replication-state":"WFBitMapT","resync-suspended":"peer"}
 	     ]},
 	    {"peer-node-id":0,"name":"n1","connection-state":"Connected","peer-role":"Secondary",
 	     "peer_devices":[
-	       {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	       {"volume":1,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
 	       {"volume":2,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"}
 	     ]}
 	  ]
 	}]`)
 
-	if !adm.NeedsLateAddResyncKick(t.Context(), "pvc-kick") {
-		t.Fatal("expected kick for the partial-stall wedge")
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if !slices.Equal(got, []int32{2}) {
+		t.Fatalf("expected to invalidate [2], got %v", got)
 	}
 }
 
-// A HEALTHY progressing initial sync (SyncSource / SyncTarget with
-// resync-suspended "no") must NOT be kicked — it advances on its own,
-// and a kick would needlessly abort it.
-func TestNeedsLateAddResyncKick_HealthySyncNotKicked(t *testing.T) {
+// Post-promote dependency case: a peer is now UpToDate (the promoted
+// source) but this Inconsistent replica's resync stays paused
+// (resync-suspended:dependency). An UpToDate peer exists ⇒ invalidate.
+func TestLateAddResyncKickVolumes_PostPromoteDependency(t *testing.T) {
 	adm := admWithKickStatus(t, `[{
-	  "name":"pvc-kick","node-id":0,"role":"Secondary",
+	  "name":"pvc-kick","node-id":2,"role":"Secondary",
 	  "devices":[
 	    {"volume":0,"disk-state":"UpToDate"},
-	    {"volume":1,"disk-state":"Inconsistent"}
+	    {"volume":2,"disk-state":"Inconsistent"}
 	  ],
 	  "connections":[{
-	    "peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
+	    "peer-node-id":0,"name":"n1","connection-state":"Connected","peer-role":"Secondary",
 	    "peer_devices":[
-	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	      {"volume":1,"peer-disk-state":"Inconsistent","replication-state":"SyncSource","resync-suspended":"no"}
+	      {"volume":2,"peer-disk-state":"UpToDate","replication-state":"PausedSyncT","resync-suspended":"dependency"}
 	    ]
 	  }]
 	}]`)
 
-	if adm.NeedsLateAddResyncKick(t.Context(), "pvc-kick") {
-		t.Fatal("must NOT kick a healthy progressing SyncSource")
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if !slices.Equal(got, []int32{2}) {
+		t.Fatalf("expected to invalidate [2], got %v", got)
 	}
 }
 
-// A transient bitmap-exchange step with resync-suspended "no" (a sync
-// about to start, not wedged) must NOT be kicked.
-func TestNeedsLateAddResyncKick_WFBitMapNotSuspendedNotKicked(t *testing.T) {
+// No UpToDate peer for the stalled volume (all-Inconsistent dependency
+// deadlock BEFORE promote): invalidate has no source, so this predicate
+// must NOT return the volume — maybeLateAddPromote owns minting the
+// source first.
+func TestLateAddResyncKickVolumes_NoUpToDatePeerSkipped(t *testing.T) {
 	adm := admWithKickStatus(t, `[{
 	  "name":"pvc-kick","node-id":0,"role":"Secondary",
 	  "devices":[
 	    {"volume":0,"disk-state":"UpToDate"},
-	    {"volume":1,"disk-state":"Inconsistent"}
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
+	  "connections":[
+	    {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
+	     "peer_devices":[
+	       {"volume":2,"peer-disk-state":"Inconsistent","replication-state":"PausedSyncS","resync-suspended":"dependency"}
+	     ]},
+	    {"peer-node-id":2,"name":"n3","connection-state":"Connected","peer-role":"Secondary",
+	     "peer_devices":[
+	       {"volume":2,"peer-disk-state":"Inconsistent","replication-state":"WFBitMapT","resync-suspended":"peer"}
+	     ]}
+	  ]
+	}]`)
+
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if len(got) != 0 {
+		t.Fatalf("must NOT invalidate when no peer is UpToDate, got %v", got)
+	}
+}
+
+// A live, unsuspended SyncTarget (resync-suspended "no") must NOT be
+// invalidated — it is actively pulling and finishes on its own.
+func TestLateAddResyncKickVolumes_ActiveSyncTargetSkipped(t *testing.T) {
+	adm := admWithKickStatus(t, `[{
+	  "name":"pvc-kick","node-id":2,"role":"Secondary",
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
 	  ],
 	  "connections":[{
-	    "peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
+	    "peer-node-id":0,"name":"n1","connection-state":"Connected","peer-role":"Secondary",
 	    "peer_devices":[
-	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	      {"volume":1,"peer-disk-state":"Inconsistent","replication-state":"WFBitMapT","resync-suspended":"no"}
+	      {"volume":2,"peer-disk-state":"UpToDate","replication-state":"SyncTarget","resync-suspended":"no"}
 	    ]
 	  }]
 	}]`)
 
-	if adm.NeedsLateAddResyncKick(t.Context(), "pvc-kick") {
-		t.Fatal("must NOT kick a WFBitMapT that is not suspended (sync starting)")
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if len(got) != 0 {
+		t.Fatalf("must NOT invalidate a live SyncTarget, got %v", got)
 	}
 }
 
-// Day0 bootstrap: NO local UpToDate volume yet (every volume transiently
-// Inconsistent while the fresh-RD winner election runs). A paused sync
-// here must NOT be kicked — the gate requires a local UpToDate sibling so
-// this can never misfire during first activation.
-func TestNeedsLateAddResyncKick_Day0NotKicked(t *testing.T) {
+// An UpToDate local volume is authoritative — never invalidate it even if
+// a peer-device shows a stalled state.
+func TestLateAddResyncKickVolumes_UpToDateLocalSkipped(t *testing.T) {
+	adm := admWithKickStatus(t, `[{
+	  "name":"pvc-kick","node-id":0,"role":"Secondary",
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"UpToDate"}
+	  ],
+	  "connections":[{
+	    "peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
+	    "peer_devices":[
+	      {"volume":2,"peer-disk-state":"UpToDate","replication-state":"PausedSyncS","resync-suspended":"dependency"}
+	    ]
+	  }]
+	}]`)
+
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if len(got) != 0 {
+		t.Fatalf("must NOT invalidate an UpToDate local volume, got %v", got)
+	}
+}
+
+// Day0 bootstrap: NO local UpToDate volume yet. Even with an Inconsistent
+// local + UpToDate peer, the gate refuses (RD not past first activation).
+func TestLateAddResyncKickVolumes_Day0Skipped(t *testing.T) {
 	adm := admWithKickStatus(t, `[{
 	  "name":"pvc-kick","node-id":0,"role":"Secondary",
 	  "devices":[
@@ -174,95 +188,95 @@ func TestNeedsLateAddResyncKick_Day0NotKicked(t *testing.T) {
 	  "connections":[{
 	    "peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
 	    "peer_devices":[
-	      {"volume":0,"peer-disk-state":"Inconsistent","replication-state":"PausedSyncS","resync-suspended":"dependency"}
+	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"PausedSyncT","resync-suspended":"dependency"}
 	    ]
 	  }]
 	}]`)
 
-	if adm.NeedsLateAddResyncKick(t.Context(), "pvc-kick") {
-		t.Fatal("must NOT kick during day0 (no local UpToDate volume)")
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if len(got) != 0 {
+		t.Fatalf("must NOT invalidate during day0 (no local UpToDate volume), got %v", got)
 	}
 }
 
-// A Primary anywhere (local or peer) vetoes the kick — never disconnect a
-// resource an application is actively writing.
-func TestNeedsLateAddResyncKick_PrimaryVetoes(t *testing.T) {
+// A Primary anywhere (local or peer) vetoes invalidate — never discard a
+// volume an application may be writing.
+func TestLateAddResyncKickVolumes_PrimaryVetoes(t *testing.T) {
 	adm := admWithKickStatus(t, `[{
-	  "name":"pvc-kick","node-id":0,"role":"Primary",
+	  "name":"pvc-kick","node-id":2,"role":"Secondary",
 	  "devices":[
 	    {"volume":0,"disk-state":"UpToDate"},
-	    {"volume":1,"disk-state":"Inconsistent"}
+	    {"volume":2,"disk-state":"Inconsistent"}
 	  ],
 	  "connections":[{
-	    "peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
+	    "peer-node-id":0,"name":"n1","connection-state":"Connected","peer-role":"Primary",
 	    "peer_devices":[
-	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	      {"volume":1,"peer-disk-state":"Inconsistent","replication-state":"PausedSyncS","resync-suspended":"dependency"}
+	      {"volume":2,"peer-disk-state":"UpToDate","replication-state":"PausedSyncT","resync-suspended":"dependency"}
 	    ]
 	  }]
 	}]`)
 
-	if adm.NeedsLateAddResyncKick(t.Context(), "pvc-kick") {
-		t.Fatal("must NOT kick while a Primary holds the resource")
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if len(got) != 0 {
+		t.Fatalf("must NOT invalidate while a Primary holds the resource, got %v", got)
 	}
 }
 
-// A not-fully-connected peer (Connecting / StandAlone) defers the kick:
-// the resync-state read is only authoritative over a settled connection.
-func TestNeedsLateAddResyncKick_PeerNotConnectedDefers(t *testing.T) {
+// A not-fully-connected peer (Connecting / StandAlone) defers — the
+// resync-state read is only authoritative over a settled connection.
+func TestLateAddResyncKickVolumes_PeerNotConnectedDefers(t *testing.T) {
 	adm := admWithKickStatus(t, `[{
-	  "name":"pvc-kick","node-id":0,"role":"Secondary",
+	  "name":"pvc-kick","node-id":2,"role":"Secondary",
 	  "devices":[
 	    {"volume":0,"disk-state":"UpToDate"},
-	    {"volume":1,"disk-state":"Inconsistent"}
+	    {"volume":2,"disk-state":"Inconsistent"}
 	  ],
 	  "connections":[
-	    {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
+	    {"peer-node-id":0,"name":"n1","connection-state":"Connected","peer-role":"Secondary",
 	     "peer_devices":[
-	       {"volume":1,"peer-disk-state":"Inconsistent","replication-state":"PausedSyncS","resync-suspended":"dependency"}
+	       {"volume":2,"peer-disk-state":"UpToDate","replication-state":"PausedSyncT","resync-suspended":"dependency"}
 	     ]},
-	    {"peer-node-id":2,"name":"n3","connection-state":"Connecting","peer-role":"Unknown",
+	    {"peer-node-id":1,"name":"n2","connection-state":"Connecting","peer-role":"Unknown",
 	     "peer_devices":[]}
 	  ]
 	}]`)
 
-	if adm.NeedsLateAddResyncKick(t.Context(), "pvc-kick") {
-		t.Fatal("must NOT kick when a peer is not fully Connected")
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if len(got) != 0 {
+		t.Fatalf("must NOT invalidate when a peer is not fully Connected, got %v", got)
 	}
 }
 
-// Fully converged (every peer Established, resync-suspended "no") — no
-// stalled resync remains, so the predicate stops holding (self-limiting).
-func TestNeedsLateAddResyncKick_ConvergedNotKicked(t *testing.T) {
+// Fully converged (every volume UpToDate) — nothing to invalidate.
+func TestLateAddResyncKickVolumes_ConvergedEmpty(t *testing.T) {
 	adm := admWithKickStatus(t, `[{
 	  "name":"pvc-kick","node-id":0,"role":"Secondary",
 	  "devices":[
 	    {"volume":0,"disk-state":"UpToDate"},
-	    {"volume":1,"disk-state":"UpToDate"},
 	    {"volume":2,"disk-state":"UpToDate"}
 	  ],
 	  "connections":[{
 	    "peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
 	    "peer_devices":[
 	      {"volume":0,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
-	      {"volume":1,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"},
 	      {"volume":2,"peer-disk-state":"UpToDate","replication-state":"Established","resync-suspended":"no"}
 	    ]
 	  }]
 	}]`)
 
-	if adm.NeedsLateAddResyncKick(t.Context(), "pvc-kick") {
-		t.Fatal("must NOT kick a fully converged resource")
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if len(got) != 0 {
+		t.Fatalf("must return nothing for a converged resource, got %v", got)
 	}
 }
 
-// Probe failure (drbdsetup errors) → conservative false, no kick.
-func TestNeedsLateAddResyncKick_ProbeFailureFalse(t *testing.T) {
+// Probe failure (drbdsetup errors) → conservative empty.
+func TestLateAddResyncKickVolumes_ProbeFailureEmpty(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Responses[lateAddKickKey] = storage.FakeResponse{Err: errKickProbe}
 
 	adm := drbd.NewAdm(fx)
-	if adm.NeedsLateAddResyncKick(t.Context(), "pvc-kick") {
-		t.Fatal("must return false on a probe failure")
+	if got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick"); len(got) != 0 {
+		t.Fatalf("must return empty on a probe failure, got %v", got)
 	}
 }
