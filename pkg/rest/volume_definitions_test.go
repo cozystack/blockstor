@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -66,6 +67,102 @@ func TestVolumeDefinitionsCreateRoundTrip(t *testing.T) {
 
 	if len(vds) != 1 || vds[0].SizeKib != 32768 {
 		t.Errorf("got %+v, want one VD with SizeKib=32768", vds)
+	}
+}
+
+// TestVolumeDefinitionsConcurrentAutoNumberNoLostUpdate is the BUG-048
+// (P1, availability) regression: two back-to-back number-less
+// `linstor vd c <rd>` POSTs against an RD that already carries vol-0
+// must BOTH succeed and land at DISTINCT VolumeNumbers (1 and 2) — none
+// silently dropped.
+//
+// Pre-fix the auto-assign picked the smallest free number in a REST-side
+// List BEFORE the store Create, so both requests read `[vol-0]`, both
+// chose VlmNr=1, the loser was rejected FAIL_EXISTS_VLM_DFN, and the
+// operator's second intended volume vanished (only vol-0 + vol-1 left).
+// The store-side CreateAutoNumbered re-derives the hole inside its
+// conflict-retry loop, so the loser lands at vol-2.
+//
+// This is the L1 half of the BUG-048 fix; the kernel-truth convergence
+// half is tests/e2e/cli-matrix/multi-volume-late-vd-create.sh.
+func TestVolumeDefinitionsConcurrentAutoNumberNoLostUpdate(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+	// vol-0 already present — this is the "late vd-add" precondition.
+	if err := st.VolumeDefinitions().Create(t.Context(), "pvc-1", &apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 32768}); err != nil {
+		t.Fatalf("seed vol-0: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Number-less create body — the auto-assign path the python CLI's
+	// `linstor vd c <rd> <size>` takes: the wire body OMITS the
+	// `volume_number` key entirely (a marshalled apiv1.VolumeDefinition
+	// would emit `"volume_number":0` because the field has no omitempty,
+	// which the handler reads as an EXPLICIT 0 — that is NOT what the
+	// CLI sends, so the test crafts the raw omitted-key body directly).
+	body := []byte(`{"volume_definition":{"size_kib":32768}}`)
+
+	const concurrent = 2
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		statuses []int
+	)
+
+	for range concurrent {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/volume-definitions", body)
+			defer func() { _ = resp.Body.Close() }()
+
+			mu.Lock()
+			statuses = append(statuses, resp.StatusCode)
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+
+	for i, code := range statuses {
+		if code != http.StatusOK {
+			t.Errorf("concurrent vd c #%d: status %d, want 200 (no request may be lost/rejected)", i, code)
+		}
+	}
+
+	listResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/volume-definitions")
+	defer func() { _ = listResp.Body.Close() }()
+
+	var vds []apiv1.VolumeDefinition
+	if jErr := json.NewDecoder(listResp.Body).Decode(&vds); jErr != nil {
+		t.Fatalf("decode: %v", jErr)
+	}
+
+	// Exactly three VDs: vol-0 (seeded) + the two concurrent adds at 1, 2.
+	if len(vds) != 3 {
+		t.Fatalf("got %d VDs, want 3 (vol-0 + two concurrent adds); a lost-update would leave 2: %+v", len(vds), vds)
+	}
+
+	seen := map[int32]bool{}
+	for i := range vds {
+		if seen[vds[i].VolumeNumber] {
+			t.Fatalf("duplicate VolumeNumber %d in %+v", vds[i].VolumeNumber, vds)
+		}
+		seen[vds[i].VolumeNumber] = true
+	}
+
+	for i := range 3 {
+		want := int32(i)
+		if !seen[want] {
+			t.Errorf("missing VolumeNumber %d (set: %v) — a concurrent add was silently dropped", want, seen)
+		}
 	}
 }
 

@@ -103,6 +103,75 @@ func (s *volumeDefinitions) Create(ctx context.Context, rdName string, vd *apiv1
 	}), "update RD %q to add volume %d", rdName, vd.VolumeNumber)
 }
 
+// CreateAutoNumbered allocates the smallest free non-negative
+// VolumeNumber INSIDE the conflict-retry loop and persists `vd` under
+// it, returning the assigned number. BUG-048 (P1, availability): the
+// REST handler used to pick the number in a separate "List the RD →
+// smallest hole" step BEFORE this Create, so two concurrent
+// `linstor vd c <rd>` calls both read `[vol-0]`, both decided VlmNr=1,
+// and the loser was rejected with FAIL_EXISTS_VLM_DFN — the operator's
+// second intended volume silently vanished (only one VD landed, no
+// usable error: the message claimed vol-1 "already exists" though the
+// operator never named a number). Re-deriving the hole on every retry
+// attempt makes the read-of-existing-set and the append atomic with
+// respect to a racing CreateAutoNumbered: the loser's retry re-fetches
+// the RD now carrying `[vol-0, vol-1]` and lands at vol-2.
+//
+// On the k8s backend the optimistic-concurrency guarantee comes from
+// the apiserver's resourceVersion check on Update: if a racing write
+// landed between our fetch and Update, the Update 409s, isConflictOr
+// NotFound retries, and the whole allocate+append re-runs against the
+// fresh RD. (Mirrors the existing explicit-number Create's retry; the
+// only difference is the number is computed here rather than supplied.)
+func (s *volumeDefinitions) CreateAutoNumbered(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) (int32, error) {
+	if vd == nil {
+		return 0, errors.New("nil VolumeDefinition")
+	}
+
+	var assigned int32
+
+	err := retry.OnError(retry.DefaultRetry, isConflictOrNotFound, func() error {
+		rd, fetchErr := s.fetchRD(ctx, rdName)
+		if fetchErr != nil {
+			return fetchErr
+		}
+
+		assigned = smallestFreeVolumeNumber(rd.Spec.VolumeDefinitions)
+
+		entry := wireToCRDVD(vd)
+		entry.VolumeNumber = assigned
+
+		rd.Spec.VolumeDefinitions = append(rd.Spec.VolumeDefinitions, entry)
+
+		return s.c.Update(ctx, rd)
+	})
+	if err != nil {
+		return 0, errors.Wrapf(err, "auto-numbered create on RD %q", rdName)
+	}
+
+	vd.VolumeNumber = assigned
+
+	return assigned, nil
+}
+
+// smallestFreeVolumeNumber returns the lowest non-negative VolumeNumber
+// not present in vds. Mirrors upstream LINSTOR's smallest-hole rule
+// (VDs 0 and 2 present → 1, not 3).
+func smallestFreeVolumeNumber(vds []crdv1alpha1.ResourceDefinitionVolume) int32 {
+	used := make(map[int32]bool, len(vds))
+	for i := range vds {
+		used[vds[i].VolumeNumber] = true
+	}
+
+	for candidate := int32(0); candidate >= 0; candidate++ {
+		if !used[candidate] {
+			return candidate
+		}
+	}
+
+	return 0
+}
+
 func (s *volumeDefinitions) Update(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error {
 	if vd == nil {
 		return errors.New("nil VolumeDefinition")

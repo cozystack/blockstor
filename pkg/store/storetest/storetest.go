@@ -208,6 +208,10 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
 		}
 	})
+	// BUG-048: CreateAutoNumbered allocates the smallest free hole and
+	// the allocation is atomic with the write (the REST handler routes
+	// every number-less `linstor vd c` here).
+	runVolumeDefinitionAutoNumberCases(t, newStore)
 	t.Run("GetMissing", func(t *testing.T) {
 		s := newStore(t)
 		seedRD(t, s, "pvc-1")
@@ -330,6 +334,62 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 	})
 	t.Run("CreateNilArg", func(t *testing.T) { testVDCreateNilArg(t, newStore) })
 	t.Run("UpdateNilArg", func(t *testing.T) { testVDUpdateNilArg(t, newStore) })
+}
+
+// runVolumeDefinitionAutoNumberCases pins the BUG-048 atomic-allocate
+// contract: sequential adds land at 0, 1, 2 … and a hole opened by a
+// Delete is reused (upstream LINSTOR's smallest-hole rule). Split out
+// of RunVolumeDefinitionStore to keep that function under maintidx.
+func runVolumeDefinitionAutoNumberCases(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	t.Run("CreateAutoNumberedSequential", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-1")
+		ctx := t.Context()
+
+		for i := range 3 {
+			want := int32(i)
+			vd := apiv1.VolumeDefinition{SizeKib: 1024}
+
+			got, err := s.VolumeDefinitions().CreateAutoNumbered(ctx, "pvc-1", &vd)
+			if err != nil {
+				t.Fatalf("CreateAutoNumbered #%d: %v", want, err)
+			}
+			if got != want {
+				t.Fatalf("CreateAutoNumbered #%d: got VlmNr=%d, want %d", want, got, want)
+			}
+			if vd.VolumeNumber != want {
+				t.Fatalf("CreateAutoNumbered #%d: vd.VolumeNumber=%d, want %d", want, vd.VolumeNumber, want)
+			}
+		}
+	})
+	t.Run("CreateAutoNumberedReusesHole", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-1")
+		ctx := t.Context()
+
+		for range 3 {
+			vd := apiv1.VolumeDefinition{SizeKib: 1024}
+			if _, err := s.VolumeDefinitions().CreateAutoNumbered(ctx, "pvc-1", &vd); err != nil {
+				t.Fatalf("seed CreateAutoNumbered: %v", err)
+			}
+		}
+		// Remove the middle volume so a hole opens at 1.
+		if err := s.VolumeDefinitions().Delete(ctx, "pvc-1", 1); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+
+		vd := apiv1.VolumeDefinition{SizeKib: 1024}
+
+		got, err := s.VolumeDefinitions().CreateAutoNumbered(ctx, "pvc-1", &vd)
+		if err != nil {
+			t.Fatalf("CreateAutoNumbered after delete: %v", err)
+		}
+		if got != 1 {
+			t.Fatalf("CreateAutoNumbered after delete: got VlmNr=%d, want 1 (smallest hole)", got)
+		}
+	})
 }
 
 func testVDCreateNilArg(t *testing.T, newStore Factory) {

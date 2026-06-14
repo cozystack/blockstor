@@ -86,6 +86,43 @@ func (s *inMemoryVolumeDefinitions) Create(_ context.Context, rdName string, vd 
 	return nil
 }
 
+// CreateAutoNumbered allocates the smallest free non-negative
+// VolumeNumber under the write lock so the read of the existing set and
+// the insert are a single atomic step — the InMemory equivalent of the
+// k8s backend's allocate-inside-RetryOnConflict. BUG-048: a REST-side
+// "List then Create" sequence has a TOCTOU window two concurrent
+// `vd c` calls fall into (both pick the same hole, the loser is
+// rejected and its volume silently lost); doing the allocation here
+// closes it.
+func (s *inMemoryVolumeDefinitions) CreateAutoNumbered(_ context.Context, rdName string, vd *apiv1.VolumeDefinition) (int32, error) {
+	if vd == nil {
+		return 0, errors.New("nil VolumeDefinition")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Smallest-hole walk under the lock so the read of the used set and
+	// the insert are a single atomic step. Mirrors upstream LINSTOR's
+	// rule (VDs 0 and 2 present → 1, not 3).
+	used := make(map[int32]bool)
+
+	for k := range s.m {
+		if k.rd == rdName {
+			used[k.vol] = true
+		}
+	}
+
+	var assigned int32
+	for assigned = 0; used[assigned]; assigned++ { //nolint:revive // empty body: the increment IS the body
+	}
+
+	vd.VolumeNumber = assigned
+	s.m[vdKey{rdName, assigned}] = *vd
+
+	return assigned, nil
+}
+
 func (s *inMemoryVolumeDefinitions) Update(_ context.Context, rdName string, vd *apiv1.VolumeDefinition) error {
 	if vd == nil {
 		return errors.New("nil VolumeDefinition")
