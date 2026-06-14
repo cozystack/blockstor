@@ -1734,21 +1734,29 @@ func (a *Adm) LateAddResyncKickVolumes(ctx context.Context, resource string) []i
 // is UpToDate for the volume (the SyncTarget source), and the volume is
 // not already being actively pulled (SyncTarget/resync-suspended:no).
 func lateAddVolumeNeedsInvalidate(conns []drbdsetupStatusConnection, dev drbdsetupStatusDevice) bool {
+	// Only a genuinely-stuck Inconsistent local copy is invalidated.
+	// Outdated is DELIBERATELY excluded: after an invalidate the volume
+	// transits Inconsistent → (resync) → Outdated → UpToDate, and a fresh
+	// SyncSource peer is briefly Outdated mid-handshake. Re-invalidating an
+	// Outdated copy re-dirties a volume that is actually converging, which
+	// FLAPS the resync (stand-observed: oos drops to 0, invalidate re-fires,
+	// oos jumps back to full). Leaving Outdated alone lets the in-flight
+	// resync finish.
 	switch DiskState(dev.DiskState) {
-	case DiskStateInconsistent, DiskStateOutdated:
-		// Below UpToDate — a candidate to re-pull. Never touch an
-		// UpToDate local (authoritative) copy.
-	case DiskStateUpToDate, DiskStateConsistent, DiskStateDiskless,
-		DiskStateAttaching, DiskStateDetaching, DiskStateFailed,
-		DiskStateNegotiating, DiskStateDUnknown:
+	case DiskStateInconsistent:
+		// Genuinely below-UpToDate and not a transient post-resync state —
+		// the invalidate candidate.
+	case DiskStateUpToDate, DiskStateConsistent, DiskStateOutdated,
+		DiskStateDiskless, DiskStateAttaching, DiskStateDetaching,
+		DiskStateFailed, DiskStateNegotiating, DiskStateDUnknown:
 		return false
 	default:
 		return false
 	}
 
 	var (
-		peerUpToDate    bool
-		activelyPulling bool
+		peerUpToDate   bool
+		activeResyncIP bool
 	)
 
 	for _, conn := range conns {
@@ -1761,27 +1769,47 @@ func lateAddVolumeNeedsInvalidate(conns []drbdsetupStatusConnection, dev drbdset
 				peerUpToDate = true
 			}
 
-			if peerDeviceActivelyPulling(peerDev) {
-				activelyPulling = true
+			// Back off if ANY peer-device on this volume has a resync
+			// actively in progress (either direction) — an invalidate now
+			// would abort/re-dirty a converging resync and flap it.
+			if peerDeviceResyncInProgress(peerDev) {
+				activeResyncIP = true
 			}
 		}
 	}
 
-	return peerUpToDate && !activelyPulling
+	return peerUpToDate && !activeResyncIP
 }
 
-// peerDeviceActivelyPulling reports whether this peer-device is a live,
-// unsuspended SyncTarget — a resync already pulling local data up to date
-// that must be left to finish. Mirrors peerDeviceActivelySyncing but for
-// the receive direction (StartingSyncT / WFBitMapT-with-resync-running are
-// NOT counted: WFBitMapT with resync-suspended != "no" is the wedge this
-// recovers).
-func peerDeviceActivelyPulling(peerDev drbdsetupStatusPeerDevice) bool {
-	if ReplicationState(peerDev.ReplicationState) != ReplicationStateSyncTarget {
+// peerDeviceResyncInProgress reports whether this peer-device has a resync
+// actively running or starting in EITHER direction — i.e. NOT stalled. A
+// volume with any such peer-device is converging on its own and must not be
+// invalidated (doing so re-dirties it and flaps the resync). True for
+// SyncSource / SyncTarget / StartingSync* and for a WFBitMap* handshake
+// that is NOT suspended (resync-suspended "no"/empty — the bitmap exchange
+// is proceeding). A WFBitMap* / PausedSync* with a non-"no" resync-suspended
+// is the STALLED wedge — that is NOT "in progress", so the kick may fire.
+func peerDeviceResyncInProgress(peerDev drbdsetupStatusPeerDevice) bool {
+	switch ReplicationState(peerDev.ReplicationState) {
+	case ReplicationStateSyncSource, ReplicationStateSyncTarget,
+		ReplicationStateStartingSyncS, ReplicationStateStartingSyncT:
+		// A resync is actively transferring data — always in progress.
+		return true
+	case ReplicationStateWFBitMapS, ReplicationStateWFBitMapT,
+		ReplicationStateWFSyncUUID:
+		// A handshake step: in progress ONLY if not suspended. A non-"no"
+		// resync-suspended (dependency/peer/user) is the stalled wedge.
+		return peerDev.ResyncSuspended == "" || peerDev.ResyncSuspended == wireNo
+	case ReplicationStateOff, ReplicationStateEstablished,
+		ReplicationStatePausedSyncS, ReplicationStatePausedSyncT,
+		ReplicationStateVerifyS, ReplicationStateVerifyT,
+		ReplicationStateAhead, ReplicationStateBehind:
+		// Established (done), explicitly paused, or non-resync states — not
+		// a resync in progress.
 		return false
 	}
 
-	return peerDev.ResyncSuspended == "" || peerDev.ResyncSuspended == wireNo
+	return false
 }
 
 // DownVeto is the tri-state outcome of the Bug 350 kernel-truth probe

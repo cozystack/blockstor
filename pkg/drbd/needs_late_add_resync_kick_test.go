@@ -154,6 +154,60 @@ func TestLateAddResyncKickVolumes_ActiveSyncTargetSkipped(t *testing.T) {
 	}
 }
 
+// Flap guard (multi-peer): the local volume is Inconsistent and one peer
+// is stalled (PausedSyncS/dependency) BUT another peer is actively pulling
+// it up (SyncTarget/resync-suspended:no). A resync is in progress, so
+// invalidating now would re-dirty a converging volume and FLAP it — must
+// back off and let the live resync finish.
+func TestLateAddResyncKickVolumes_InProgressMultiPeerSkipped(t *testing.T) {
+	adm := admWithKickStatus(t, `[{
+	  "name":"pvc-kick","node-id":2,"role":"Secondary",
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Inconsistent"}
+	  ],
+	  "connections":[
+	    {"peer-node-id":0,"name":"n1","connection-state":"Connected","peer-role":"Secondary",
+	     "peer_devices":[
+	       {"volume":2,"peer-disk-state":"UpToDate","replication-state":"SyncTarget","resync-suspended":"no"}
+	     ]},
+	    {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
+	     "peer_devices":[
+	       {"volume":2,"peer-disk-state":"Inconsistent","replication-state":"PausedSyncS","resync-suspended":"dependency"}
+	     ]}
+	  ]
+	}]`)
+
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if len(got) != 0 {
+		t.Fatalf("must NOT invalidate while a live resync is converging the volume, got %v", got)
+	}
+}
+
+// An Outdated local volume is a TRANSIENT post-resync / mid-handshake state
+// — re-invalidating it re-dirties a converging volume (the stand-observed
+// flap). Only a genuinely-stuck Inconsistent local is ever invalidated.
+func TestLateAddResyncKickVolumes_OutdatedLocalSkipped(t *testing.T) {
+	adm := admWithKickStatus(t, `[{
+	  "name":"pvc-kick","node-id":2,"role":"Secondary",
+	  "devices":[
+	    {"volume":0,"disk-state":"UpToDate"},
+	    {"volume":2,"disk-state":"Outdated"}
+	  ],
+	  "connections":[{
+	    "peer-node-id":0,"name":"n1","connection-state":"Connected","peer-role":"Secondary",
+	    "peer_devices":[
+	      {"volume":2,"peer-disk-state":"UpToDate","replication-state":"WFBitMapT","resync-suspended":"peer"}
+	    ]
+	  }]
+	}]`)
+
+	got := adm.LateAddResyncKickVolumes(t.Context(), "pvc-kick")
+	if len(got) != 0 {
+		t.Fatalf("must NOT invalidate an Outdated (transient/recovering) local volume, got %v", got)
+	}
+}
+
 // An UpToDate local volume is authoritative — never invalidate it even if
 // a peer-device shows a stalled state.
 func TestLateAddResyncKickVolumes_UpToDateLocalSkipped(t *testing.T) {

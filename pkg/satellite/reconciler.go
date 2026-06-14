@@ -323,18 +323,18 @@ type Reconciler struct {
 const recoveryPromoteThrottle = 10 * time.Second
 
 // lateAddStallDwell is how long a late-add resync must REMAIN stalled
-// (NeedsLateAddResyncKick continuously true) before maybeKickLateAddResync
-// fires the disconnect+adjust kick. It must comfortably exceed the normal,
-// transient DRBD volume-resync serialization gap — when two volumes are
-// added at once, vol-N legitimately sits PausedSyncS/resync-suspended:
-// dependency for a few seconds while vol-(N-1) finishes its resync, which
-// looks identical to the wedge for a moment. The dwell ensures the kick
-// only disrupts a resync that is GENUINELY stuck (oos frozen for the whole
-// window), never a healthy serialized sync that is about to advance on its
-// own. The genuine wedge sits stalled indefinitely, so it always clears
-// the dwell; a transient serialization clears the predicate (and resets
-// the dwell) well before it elapses.
-const lateAddStallDwell = 45 * time.Second
+// (LateAddResyncKickVolumes continuously non-empty) before
+// maybeKickLateAddResync fires the per-volume invalidate. It is a SECONDARY
+// guard against disrupting the normal, transient DRBD volume-resync
+// serialization — the PRIMARY guard is peerDeviceResyncInProgress, which
+// already backs the kick off whenever any resync on the volume is actively
+// progressing (so a freshly-serialized vol-N that is about to start is not
+// invalidated). The dwell adds a small settling margin so a stall that is
+// momentarily mis-read clears on its own first. Kept short so a genuine
+// FROZEN wedge (oos never moves) recovers well inside the operator/L7
+// convergence budget; far longer than the sub-second window in which a
+// just-added volume transitions through its handshake states.
+const lateAddStallDwell = 20 * time.Second
 
 // restoreSnapshotMissingBudget bounds how many consecutive reconcile
 // passes a node-local snapshot-restore volume may REQUEUE on a
@@ -2834,17 +2834,22 @@ func (r *Reconciler) maybeKickLateAddResync(ctx context.Context, dr *intent.Desi
 		return nil
 	}
 
-	for _, vol := range volumes {
-		log.FromContext(ctx).Info("BUG-048 late-add resync-kick: invalidate locally to re-pull a stalled late-added volume from its UpToDate peer",
-			"resource", dr.GetName(), "volume", vol)
+	// Invalidate ONE volume per kick (the lowest-numbered stalled one).
+	// DRBD serialises resyncs per connection, so invalidating every stalled
+	// volume at once would re-create the very dependency-serialization that
+	// wedges — vol-N's invalidate would sit PausedSyncT/dependency behind
+	// vol-(N-1)'s and, looking stalled, get re-invalidated and flap. One at
+	// a time lets each invalidated volume's resync run (and back off the
+	// kick via peerDeviceResyncInProgress) before the next reconcile picks
+	// up the next straggler. volumes is built in ascending volume order by
+	// the kernel device scan.
+	vol := volumes[0]
 
-		err := r.cfg.Adm.InvalidateVolume(ctx, dr.GetName(), vol)
-		if err != nil {
-			return errors.Wrapf(err, "late-add resync-kick invalidate %s/%d", dr.GetName(), vol)
-		}
-	}
+	log.FromContext(ctx).Info("BUG-048 late-add resync-kick: invalidate locally to re-pull a stalled late-added volume from its UpToDate peer",
+		"resource", dr.GetName(), "volume", vol)
 
-	return nil
+	return errors.Wrapf(r.cfg.Adm.InvalidateVolume(ctx, dr.GetName(), vol),
+		"late-add resync-kick invalidate %s/%d", dr.GetName(), vol)
 }
 
 // lateAddStallDwellElapsed records the first time a resource was observed
