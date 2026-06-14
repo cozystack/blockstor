@@ -184,20 +184,26 @@ if (( vdc_rc != 0 )); then
     echo "   note: a concurrent vd c exited non-zero but both volumes were created" >&2
 fi
 
-# Each late-added 1G volume needs its own initial sync on every replica;
-# under sweep load that takes well past the old 60s budget, so give the
-# late volumes the same 240s headroom vol-0 gets.
-echo ">> wait up to 240s for vol-1 + vol-2 to reach UpToDate on all 3 replicas"
+# Each late-added 1G volume needs its own initial sync on every replica.
+# Here TWO 1G volumes are added concurrently on a 3-diskful RD, so up to
+# 6 fresh (replica,volume) initial syncs run at once and share the loop
+# substrate's I/O — convergence routinely runs past the single-volume
+# 240s budget (observed: vol-2 still `Outdated` — i.e. converging, NOT
+# the wedge's `Inconsistent` — at the 240s mark, UpToDate moments later).
+# 360s per volume keeps the concurrent path from flaking while still
+# being far inside the wedge discriminator (a real BUG-048 wedge sits
+# Inconsistent forever with no SyncSource and never advances).
+echo ">> wait up to 360s for vol-1 + vol-2 to reach UpToDate on all 3 replicas"
 late_up=true
 for vol in 1 2; do
-    if ! wait_all_replicas_volume_uptodate "$vol" 240; then
+    if ! wait_all_replicas_volume_uptodate "$vol" 360; then
         late_up=false
         break
     fi
 done
 
 if [[ "$late_up" != "true" ]]; then
-    echo "FAIL (Bug 332): late-added vol-1/vol-2 not UpToDate on all 3 replicas within 240s" >&2
+    echo "FAIL (Bug 332): late-added vol-1/vol-2 not UpToDate on all 3 replicas within 360s" >&2
     "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -40 >&2
     # Surface the smoking gun: per (node, vol) disk_state straight from
     # the populated Resource.Status — a Bug-332-bitten path shows vol-1
