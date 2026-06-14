@@ -256,7 +256,7 @@ func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error 
 //
 // Upstream LINSTOR equivalent:
 //
-//	lvcreate -s --kernel --activate y --name <tgt> <vg>/<src-snap>
+//	lvcreate -s --setactivationskip n --activate y --name <tgt> <vg>/<src-snap>
 //
 // Idempotent: target LV present → resumed reconcile, no-op.
 func (t *Thin) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
@@ -272,7 +272,6 @@ func (t *Thin) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vol
 
 	_, err := t.exec.Run(ctx, "lvcreate",
 		Args("--snapshot",
-			"--kernel",
 			"--setactivationskip", "n",
 			"--activate", "y",
 			"--name", tgtName,

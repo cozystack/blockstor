@@ -65,6 +65,29 @@ func disklessReplica(rd, node string, flag string) *apiv1.Resource {
 	}
 }
 
+// syncSourceUnstampedReplica is the BUG-045 shape: a diskful replica
+// that is actively feeding a peer's resync (SyncSource replication-state
+// toward `peer`) but whose local diskState projection is blank — the
+// satellite observer's device-frame `disk:UpToDate` was not re-stamped
+// on the Secondary SyncSource. The kernel ground truth (SyncSource) says
+// it IS an UpToDate source; the guard must trust that, not the empty
+// diskState.
+func syncSourceUnstampedReplica(rd, node, peer string) *apiv1.Resource {
+	return &apiv1.Resource{
+		Name:     rd,
+		NodeName: node,
+		Volumes: []apiv1.Volume{{
+			VolumeNumber: 0,
+			State: apiv1.VolumeState{
+				DiskState: "", // BUG-045: projection left it blank
+				ReplicationStates: map[string]apiv1.ReplicationState{
+					peer: {ReplicationState: drbdReplStateSyncSource},
+				},
+			},
+		}},
+	}
+}
+
 // TestU130RejectsDeleteOfLastUpToDateWhilePeerSyncing is the core
 // repro: 1 diskful UpToDate source + 1 diskful SyncTarget (mid-sync) +
 // 1 diskless Primary. Deleting the UpToDate source must be refused.
@@ -158,6 +181,119 @@ func TestU130RejectsViaPeerReplicationStateSyncTarget(t *testing.T) {
 
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("status: got %d, want 409 (U130 refusal via repl-state)", resp.StatusCode)
+	}
+}
+
+// TestU130RejectsSyncSourceTargetWithBlankDiskState is the BUG-045
+// repro: the deleted target is the SOURCE replica (a Secondary feeding
+// the resync) whose CRD diskState projection is BLANK because the
+// satellite observer never re-stamped `disk:UpToDate` on the Secondary
+// SyncSource. Its SyncSource replication-state toward the mid-sync peer
+// is kernel ground truth that it holds an UpToDate copy. The guard must
+// NOT trust the blank diskState and conclude "not a source" — it must
+// refuse the delete that would strand the SyncTarget.
+func TestU130RejectsSyncSourceTargetWithBlankDiskState(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+	rd := "pvc-u130-bug045"
+
+	seedU130RD(t, st, rd)
+
+	// n1: the source being deleted — Secondary SyncSource, blank
+	// diskState (the BUG-045 unstamped-projection window).
+	if err := st.Resources().Create(ctx, syncSourceUnstampedReplica(rd, "n1", "n2")); err != nil {
+		t.Fatalf("seed n1: %v", err)
+	}
+	// n2: freshly-added second diskful, still catching up.
+	if err := st.Resources().Create(ctx, diskfulReplica(rd, "n2", drbdDiskStateSyncTarget)); err != nil {
+		t.Fatalf("seed n2: %v", err)
+	}
+	// n3: diskless Primary/InUse holding the resource open.
+	if err := st.Resources().Create(ctx, disklessReplica(rd, "n3", apiv1.ResourceFlagDiskless)); err != nil {
+		t.Fatalf("seed n3: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/"+rd+"/resources/n1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409 (BUG-045: blank-diskState SyncSource must still be refused)", resp.StatusCode)
+	}
+
+	if _, err := st.Resources().Get(ctx, rd, "n1"); err != nil {
+		t.Errorf("n1 must survive the refused delete; got err=%v", err)
+	}
+}
+
+// TestU130RejectsBlankDiskStateTargetMidSync pins the fail-safe widening
+// independent of any replication-state signal on the target: a diskful
+// target with a completely UNKNOWN diskState (no SyncSource token either
+// — e.g. the projection has not landed any field yet) while a diskful
+// peer is mid-sync must be refused. Refusing in doubt is the load-bearing
+// data-safety property; a false allow strands the SyncTarget.
+func TestU130RejectsBlankDiskStateTargetMidSync(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+	rd := "pvc-u130-blank"
+
+	seedU130RD(t, st, rd)
+
+	// n1: diskful target with an entirely blank state surface.
+	if err := st.Resources().Create(ctx, diskfulReplica(rd, "n1", "")); err != nil {
+		t.Fatalf("seed n1: %v", err)
+	}
+	if err := st.Resources().Create(ctx, diskfulReplica(rd, "n2", drbdDiskStateSyncTarget)); err != nil {
+		t.Fatalf("seed n2: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/"+rd+"/resources/n1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409 (fail-safe: blank-diskState target mid-sync must be refused)", resp.StatusCode)
+	}
+}
+
+// TestU130AllowsDeleteWhenSyncSourceSiblingSurvives pins that a SyncSource
+// SIBLING with a blank diskState counts as a surviving UpToDate source:
+// deleting one UpToDate diskful is allowed because the SyncSource peer
+// keeps feeding the SyncTarget. Without crediting the SyncSource sibling
+// the guard would over-refuse a legitimate delete (must-not-regress).
+func TestU130AllowsDeleteWhenSyncSourceSiblingSurvives(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+	rd := "pvc-u130-srcsib"
+
+	seedU130RD(t, st, rd)
+
+	// n1: the delete target — plainly UpToDate.
+	if err := st.Resources().Create(ctx, diskfulReplica(rd, "n1", drbdDiskStateUpToDate)); err != nil {
+		t.Fatalf("seed n1: %v", err)
+	}
+	// n2: a SyncSource sibling (blank diskState) — kernel-confirmed
+	// surviving source that keeps feeding n3.
+	if err := st.Resources().Create(ctx, syncSourceUnstampedReplica(rd, "n2", "n3")); err != nil {
+		t.Fatalf("seed n2: %v", err)
+	}
+	// n3: the SyncTarget being fed by n2.
+	if err := st.Resources().Create(ctx, diskfulReplica(rd, "n3", drbdDiskStateSyncTarget)); err != nil {
+		t.Fatalf("seed n3: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/"+rd+"/resources/n1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (SyncSource sibling survives as source)", resp.StatusCode)
 	}
 }
 
@@ -343,6 +479,51 @@ func TestU130PredicateUnit(t *testing.T) {
 			siblings: []*apiv1.Resource{
 				diskfulReplica(rd, "n1", drbdDiskStateInconsistent),
 				diskfulReplica(rd, "n2", drbdDiskStateSyncTarget),
+			},
+			refuse: false,
+		},
+		{
+			// BUG-045: the source's diskState is blank but it is a
+			// SyncSource feeding the mid-sync peer — must refuse.
+			name:   "syncsource-target-blank-diskstate",
+			target: syncSourceUnstampedReplica(rd, "n1", "n2"),
+			siblings: []*apiv1.Resource{
+				syncSourceUnstampedReplica(rd, "n1", "n2"),
+				diskfulReplica(rd, "n2", drbdDiskStateSyncTarget),
+			},
+			refuse: true,
+		},
+		{
+			// Fail-safe: an entirely blank-state diskful target while a
+			// peer is mid-sync — refuse in doubt.
+			name:   "blank-diskstate-target-midsync",
+			target: diskfulReplica(rd, "n1", ""),
+			siblings: []*apiv1.Resource{
+				diskfulReplica(rd, "n1", ""),
+				diskfulReplica(rd, "n2", drbdDiskStateSyncTarget),
+			},
+			refuse: true,
+		},
+		{
+			// A blank-state diskful target with NO peer mid-sync is the
+			// genuine last-copy case — still allowed (no regression).
+			name:   "blank-diskstate-target-no-sync",
+			target: diskfulReplica(rd, "n1", ""),
+			siblings: []*apiv1.Resource{
+				diskfulReplica(rd, "n1", ""),
+				disklessReplica(rd, "n2", apiv1.ResourceFlagDiskless),
+			},
+			refuse: false,
+		},
+		{
+			// A SyncSource sibling (blank diskState) is a confirmed
+			// surviving source — dropping one UpToDate copy is allowed.
+			name:   "syncsource-sibling-survives",
+			target: diskfulReplica(rd, "n1", drbdDiskStateUpToDate),
+			siblings: []*apiv1.Resource{
+				diskfulReplica(rd, "n1", drbdDiskStateUpToDate),
+				syncSourceUnstampedReplica(rd, "n2", "n3"),
+				diskfulReplica(rd, "n3", drbdDiskStateSyncTarget),
 			},
 			refuse: false,
 		},

@@ -126,7 +126,7 @@ if [[ "$late_up" != "true" ]]; then
     # Surface the smoking gun: a Diskless line for a non-DISKLESS spec.
     echo "----- linstor r l --resources $RD (with flags) -----" >&2
     "${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-        | jq -r '.[][]? | "\(.node_name) vol=\(.vlms[]?.vlm_nr) state=\(.vlms[]?.state.disk_state) flags=\(.rsc_flags//[])"' >&2 || true
+        | jq -r '.[][]? | "\(.node_name) vol=\(.vlms[]?.vlm_nr) state=\(.vlms[]?.state.disk_state) flags=\(.flags//[])"' >&2 || true
     exit 1
 fi
 
@@ -137,7 +137,7 @@ fi
 # Bug 332 (Unintentional Diskless) from spec-pinned diskless replicas.
 echo ">> [Bug 332] kernel-truth: drbdadm status on a diskful node"
 satellite_node=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-    | jq -r '.[][]? | select((.rsc_flags//[]) | (map(. == "DISKLESS") | any | not)) | .node_name' \
+    | jq -r '.[][]? | select((.flags//[]) | (map(. == "DISKLESS") | any | not)) | .node_name' \
     2>/dev/null | head -1)
 
 if [[ -z "$satellite_node" ]]; then

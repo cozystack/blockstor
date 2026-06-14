@@ -1,0 +1,109 @@
+name: snap-create-multiple-group-consistency
+description: |
+  Bug-046 / Bug-353: `linstor snapshot create-multiple` (consistency-group
+  snapshot across multiple RDs) must be point-in-time atomic.
+
+  Models the "DB data volume + WAL volume on separate RDs" case operators
+  rely on for a consistent group restore: two independent 2-replica
+  diskful RDs (rd-a, rd-b) on node1+node2 are snapshotted together via the
+  multi-create endpoint. The apiserver stamps both member CRDs with a
+  shared GroupID + GroupSize; the controller-side suspend barrier holds the
+  whole group at Phase 0 until both members are observable, then opens
+  `drbdsetup suspend-io` on every sibling in a single pass so they enter
+  suspend within one controller cycle (the <=5s consistency budget). Only
+  once every member is suspended does any take run, and both resume
+  together.
+
+  Both `snapshot create-multiple` returning exit 0 is itself the
+  resume proof — the controller flips Spec.SuspendIO=false (and the
+  satellites issue `drbdsetup resume-io`) only after the group take
+  completes, so a group that never resumed would never reach the visible
+  state the step asserts and the follow-up all_uptodate re-assertions would
+  hang. A regression to the old per-RD independent suspend (siblings
+  freezing ~15s apart) would still pass exit-0 here; the byte-level
+  point-in-time assertion lives in the companion cli-matrix cell
+  (snap-create-multiple-group-consistency.sh, the <=1 counter-diff check).
+  This replay codifies the operator sequence + the no-stuck-suspended /
+  no-orphans convergence contract.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: bug046-multi-a
+
+steps:
+  - name: create-rd-a
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-a
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-a-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-a-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate-a
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+  - name: create-rd-b
+    cmd: ["resource-definition", "create", "bug046-multi-b"]
+    expect_exit: 0
+  - name: create-vd-b
+    cmd: ["volume-definition", "create", "bug046-multi-b", "64M"]
+    expect_exit: 0
+  - name: r-c-b-node1
+    cmd: ["resource", "create", "{{node1}}", "bug046-multi-b", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-b-node2
+    cmd: ["resource", "create", "{{node2}}", "bug046-multi-b", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate-b
+    cmd: ["resource", "list", "--resources", "bug046-multi-b"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: bug046-multi-b
+      timeout_s: 240
+
+  # ---- Bug-046: group snapshot — single suspend barrier, all-or-nothing --
+  - name: snapshot-create-multiple
+    cmd: ["snapshot", "create-multiple", "{{rd}}:grp", "bug046-multi-b:grp"]
+    expect_exit: 0
+  - name: both-snapshots-visible
+    cmd: ["snapshot", "list"]
+    expect_exit: 0
+
+  # ---- After the group snapshot both resources resumed I/O (uptodate) ----
+  - name: a-still-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 120
+  - name: b-still-uptodate
+    cmd: ["resource", "list", "--resources", "bug046-multi-b"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: bug046-multi-b
+      timeout_s: 120
+
+teardown:
+  - cmd: ["snapshot", "delete", "{{rd}}", "grp"]
+  - cmd: ["snapshot", "delete", "bug046-multi-b", "grp"]
+  - cmd: ["resource-definition", "delete", "bug046-multi-b"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

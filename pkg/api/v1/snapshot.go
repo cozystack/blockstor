@@ -59,6 +59,15 @@ type Snapshot struct {
 	// to the upstream wire shape — golinstor ignores unknown JSON
 	// fields, so the new key flows through transparently.
 	GroupID string `json:"group_id,omitempty"`
+
+	// GroupSize is the number of entries the `snapshot
+	// create-multiple` batch fanned out. Stamped alongside GroupID by
+	// handleSnapshotCreateMulti so the controller-side
+	// SnapshotReconciler knows when the whole group has been assembled
+	// and can open the suspend-io barrier on every sibling in one pass
+	// (Bug 046 / Bug-353 atomicity fix). Like GroupID it is an internal
+	// coordination field that never reaches the upstream LINSTOR wire.
+	GroupSize int32 `json:"group_size,omitempty"`
 }
 
 // SnapshotVolumeDef is one volume slot inside a Snapshot. F20:

@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // TestCrdToWireSnapshotStatusNodeStatus pins the per-node status
@@ -83,5 +84,60 @@ func TestCrdToWireSnapshotStatusNodeStatus(t *testing.T) {
 			t.Errorf("[%d] SnapshotName: got %q, want snap-1",
 				i, got.Snapshots[i].SnapshotName)
 		}
+	}
+}
+
+// TestWireToCRDSnapshotSuspendIOByGroup pins the Bug-046 / Bug-353
+// suspend-deferral contract at the store boundary:
+//
+//   - A SINGLE snapshot (empty GroupID) keeps the Bug-351 behaviour —
+//     SuspendIO=true stamped at Create time so its lone satellite begins
+//     the suspend immediately.
+//   - A GROUPED snapshot (non-empty GroupID) must NOT be stamped
+//     SuspendIO=true at Create time. The controller-side suspend barrier
+//     owns that flip and only opens it once the whole group is assembled,
+//     so the siblings enter suspend together rather than ~15s apart. The
+//     GroupSize denominator the barrier gates on must carry through.
+func TestWireToCRDSnapshotSuspendIOByGroup(t *testing.T) {
+	t.Parallel()
+
+	single := wireToCRDSnapshot(&apiv1.Snapshot{
+		ResourceName: "pvc-a",
+		Name:         "snap-1",
+		Nodes:        []string{"n1"},
+	})
+	if !single.Spec.SuspendIO {
+		t.Errorf("single snapshot: SuspendIO=false at Create, want true (Bug-351 path)")
+	}
+
+	if single.Spec.GroupID != "" {
+		t.Errorf("single snapshot: GroupID=%q, want empty", single.Spec.GroupID)
+	}
+
+	grouped := wireToCRDSnapshot(&apiv1.Snapshot{
+		ResourceName: "pvc-a",
+		Name:         "snap-1",
+		Nodes:        []string{"n1"},
+		GroupID:      "g-batch-1",
+		GroupSize:    3,
+	})
+	if grouped.Spec.SuspendIO {
+		t.Errorf("grouped snapshot: SuspendIO=true at Create — early freeze, " +
+			"the Bug-046 hazard; the controller barrier must own the flip")
+	}
+
+	if grouped.Spec.GroupID != "g-batch-1" {
+		t.Errorf("grouped snapshot: GroupID=%q, want g-batch-1", grouped.Spec.GroupID)
+	}
+
+	if grouped.Spec.GroupSize != 3 {
+		t.Errorf("grouped snapshot: GroupSize=%d, want 3", grouped.Spec.GroupSize)
+	}
+
+	// The GroupID label must be mirrored so the controller can List
+	// siblings by selector.
+	if grouped.Labels[LabelSnapshotGroupID] != "g-batch-1" {
+		t.Errorf("grouped snapshot: group-id label=%q, want g-batch-1",
+			grouped.Labels[LabelSnapshotGroupID])
 	}
 }
