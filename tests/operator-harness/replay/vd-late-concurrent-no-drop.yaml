@@ -85,10 +85,17 @@ steps:
     expect_exit: 0
     await:
       # Every volume of every replica converges — the elected per-fresh-
-      # volume winner seeds a SyncSource for both late adds.
+      # volume winner seeds a SyncSource for both late adds. When the
+      # concurrent seed races and a volume comes up Inconsistent on every
+      # replica, the late-add-promote self-heal recovers it, but that adds
+      # latency (wedge-detect + the recoveryPromoteThrottle window + the
+      # force-primary + resync). On a contended stand that recovery path
+      # runs past the bare-convergence budget, so allow 360s — still far
+      # inside the wedge discriminator (a real unfixed wedge never
+      # advances at all).
       kind: all_uptodate
       rd: "{{rd}}"
-      timeout_s: 240
+      timeout_s: 360
 
 teardown:
   - cmd: ["resource-definition", "delete", "{{rd}}"]
