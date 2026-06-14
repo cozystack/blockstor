@@ -283,6 +283,18 @@ type Reconciler struct {
 	// resets it (at worst one extra promote).
 	lastRecoveryPromoteAt map[string]time.Time
 
+	// firstLateAddStallAt records, per resource name, the first wall-clock
+	// time this node observed a STALLED late-add resync (BUG-048
+	// NeedsLateAddResyncKick) without yet kicking it. The kick
+	// (disconnect+adjust) only fires once the stall has PERSISTED beyond
+	// lateAddStallDwell, so the normal, transient DRBD volume-resync
+	// serialization (vol-N legitimately PausedSyncS/dependency for a few
+	// seconds while vol-(N-1) finishes) is never mistaken for the wedge
+	// and disrupted. Cleared when the stall clears (predicate stops
+	// holding). Process-memory only; a restart resets it (at worst one
+	// extra dwell window before the kick).
+	firstLateAddStallAt map[string]time.Time
+
 	// restoreSnapshotMissingTries counts, per "<resource>/<volNumber>",
 	// how many consecutive reconcile passes a snapshot-restore-backed
 	// volume found its source `@snap` ABSENT locally (ErrNotFound from
@@ -309,6 +321,20 @@ type Reconciler struct {
 // wedge (peer truly stuck Inconsistent with no Primary) still gets a
 // fresh nudge promptly.
 const recoveryPromoteThrottle = 10 * time.Second
+
+// lateAddStallDwell is how long a late-add resync must REMAIN stalled
+// (NeedsLateAddResyncKick continuously true) before maybeKickLateAddResync
+// fires the disconnect+adjust kick. It must comfortably exceed the normal,
+// transient DRBD volume-resync serialization gap — when two volumes are
+// added at once, vol-N legitimately sits PausedSyncS/resync-suspended:
+// dependency for a few seconds while vol-(N-1) finishes its resync, which
+// looks identical to the wedge for a moment. The dwell ensures the kick
+// only disrupts a resync that is GENUINELY stuck (oos frozen for the whole
+// window), never a healthy serialized sync that is about to advance on its
+// own. The genuine wedge sits stalled indefinitely, so it always clears
+// the dwell; a transient serialization clears the predicate (and resets
+// the dwell) well before it elapses.
+const lateAddStallDwell = 45 * time.Second
 
 // restoreSnapshotMissingBudget bounds how many consecutive reconcile
 // passes a node-local snapshot-restore volume may REQUEUE on a
@@ -338,6 +364,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		seenStuckAt:                 map[string]time.Time{},
 		restoreBlankFallback:        map[string]bool{},
 		lastRecoveryPromoteAt:       map[string]time.Time{},
+		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
 	}
 }
@@ -2520,6 +2547,21 @@ func (r *Reconciler) maybePromoteSelfHeals(ctx context.Context, dr *intent.Desir
 		return err
 	}
 
+	// BUG-048 late-add resync-kick self-heal — unstick a late-added
+	// volume whose resync EXISTS but wedged in a paused/bitmap-exchange
+	// state that never advances (the ≥3-replica concurrent-add
+	// convergence wedge: a SyncSource is elected but its resync sits
+	// PausedSyncS/resync-suspended:dependency while partner peers wait in
+	// WFBitMapT/resync-suspended:peer, or one peer reaches UpToDate while
+	// a second stalls WFBitMapT/Outdated forever). Distinct from
+	// maybeLateAddPromote: that mints a source when NONE exists; this
+	// re-handshakes an EXISTING-but-stalled resync via disconnect+adjust.
+	// See maybeKickLateAddResync / Adm.NeedsLateAddResyncKick.
+	err = r.maybeKickLateAddResync(ctx, dr, diskless)
+	if err != nil {
+		return err
+	}
+
 	// Solo diskless→diskful toggle self-heal — force-promote a lone,
 	// peerless diskful replica wedged below UpToDate. See maybeSoloPromote
 	// for the full why (the auto-primary suppression × offline-safety
@@ -2722,6 +2764,104 @@ func (r *Reconciler) maybeLateAddPromote(ctx context.Context, dr *intent.Desired
 		"resource", dr.GetName())
 
 	return r.runAutoPromote(ctx, dr)
+}
+
+// maybeKickLateAddResync is the BUG-048 self-heal for a late-added volume
+// whose resync EXISTS but wedged in a paused / bitmap-exchange state that
+// never advances — the ≥3-replica concurrent late-add convergence wedge.
+//
+// Two stand-observed signatures it unsticks (both on the last
+// concurrently-added volume of a 3-diskful RD, oos frozen at full / a
+// peer stuck below UpToDate forever):
+//
+//   - dependency deadlock: a SyncSource is elected but sits PausedSyncS
+//     with resync-suspended "dependency" toward its peers, which in turn
+//     wait in WFBitMapT/resync-suspended "peer" for a bitmap exchange the
+//     paused source never starts. Nobody ever reaches UpToDate.
+//   - partial stall: one peer reaches UpToDate (a real SyncSource), but a
+//     SECOND peer stays WFBitMapT / Outdated and never finalises — the
+//     source fed one peer but not the other.
+//
+// Why neither promote self-heal covers it: maybeLateAddPromote fires only
+// when NO peer holds data and the volume is Inconsistent on EVERY replica
+// (it mints a source); here a source exists (or a peer is already
+// UpToDate) but the resync machinery is latched. maybeRecoveryPromote
+// needs the local already-UpToDate. A force-primary does not clear a
+// resync-suspended:dependency latch — only a connection re-handshake does.
+//
+// NeedsLateAddResyncKick is the kernel-truth gate: it fires ONLY when no
+// replica is Primary, the RD is past day0 (a local UpToDate volume
+// exists), every peer is Connected, and a peer-device is in a stalled
+// resync (PausedSync*/WFBitMap* with a non-"no" resync-suspended). The
+// kick (Adm.LateAddResyncKick) `disconnect`s then `adjust`s, re-running
+// the GI handshake so DRBD restarts the resync from the correct
+// direction. Data-safe (disconnect/reconnect never mutates data) and
+// self-limiting (once the resync finishes no stalled peer-device remains).
+// Throttled via the shared recoveryPromoteThrottle so a still-converging
+// resync isn't churned by repeated kicks. Skipped on diskless replicas
+// (no local resync to kick) and when Adm is unwired (storage-only tests).
+func (r *Reconciler) maybeKickLateAddResync(ctx context.Context, dr *intent.DesiredResource, diskless bool) error {
+	if diskless || r.cfg.Adm == nil {
+		return nil
+	}
+
+	if !r.cfg.Adm.NeedsLateAddResyncKick(ctx, dr.GetName()) {
+		// Not stalled (or converged): clear any pending dwell so a future
+		// transient stall starts its window fresh.
+		r.clearLateAddStall(dr.GetName())
+
+		return nil
+	}
+
+	// Dwell gate: only kick once the stall has PERSISTED beyond
+	// lateAddStallDwell, so the normal transient volume-resync
+	// serialization (a few seconds of PausedSyncS/dependency while a
+	// sibling volume finishes) is never disrupted — only a genuinely
+	// frozen resync is.
+	if !r.lateAddStallDwellElapsed(dr.GetName()) {
+		return nil
+	}
+
+	if !r.recoveryPromoteDue(dr.GetName()) {
+		return nil
+	}
+
+	log.FromContext(ctx).Info("BUG-048 late-add resync-kick: disconnect+adjust to restart a stalled resync (paused/bitmap-exchange-wedged) for a late-added volume",
+		"resource", dr.GetName())
+
+	return errors.Wrapf(r.cfg.Adm.LateAddResyncKick(ctx, dr.GetName()),
+		"late-add resync-kick %s", dr.GetName())
+}
+
+// lateAddStallDwellElapsed records the first time a resource was observed
+// with a stalled late-add resync and reports whether the stall has now
+// persisted at least lateAddStallDwell. The first observation stamps the
+// timestamp and returns false (start the window); a later observation
+// returns true once the window has elapsed. Serialised by r.mu.
+func (r *Reconciler) lateAddStallDwellElapsed(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+
+	first, ok := r.firstLateAddStallAt[name]
+	if !ok {
+		r.firstLateAddStallAt[name] = now
+
+		return false
+	}
+
+	return now.Sub(first) >= lateAddStallDwell
+}
+
+// clearLateAddStall drops the recorded stall start for a resource, so a
+// transient stall that cleared restarts its dwell window from scratch the
+// next time one is observed. Serialised by r.mu.
+func (r *Reconciler) clearLateAddStall(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.firstLateAddStallAt, name)
 }
 
 // recoveryPromoteDue reports whether enough time has elapsed since this
