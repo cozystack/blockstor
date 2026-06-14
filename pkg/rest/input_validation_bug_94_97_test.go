@@ -233,9 +233,13 @@ func TestBug97RDCreateRefusedOnWhitespaceName(t *testing.T) {
 
 // TestBug97RDCreateRefusedOnInvalidNameShapes drives the wire shape
 // through several invalid forms the operator-facing CLI/REST may
-// emit: uppercase + space (`Foo Bar`), pure uppercase, embedded dot,
-// leading hyphen. All must 4xx with the same envelope shape; none
-// must persist.
+// emit. BUG-047 relaxed the gate to upstream's ruleset
+// (`^[A-Za-z][A-Za-z0-9_-]{1,47}$`), so the still-invalid forms are:
+// embedded space, embedded dot, path separator, leading hyphen,
+// leading digit, single char, empty. All must 4xx with the same
+// envelope shape; none must persist. (Pure-uppercase / underscore /
+// trailing-hyphen are now VALID upstream — see
+// TestBug047UppercaseNamesAccepted.)
 func TestBug97RDCreateRefusedOnInvalidNameShapes(t *testing.T) {
 	t.Parallel()
 
@@ -243,11 +247,12 @@ func TestBug97RDCreateRefusedOnInvalidNameShapes(t *testing.T) {
 		name string
 		body string
 	}{
-		{"uppercase+space", `{"resource_definition":{"name":"Foo Bar"}}`},
-		{"pure-uppercase", `{"resource_definition":{"name":"FOOBAR"}}`},
+		{"embedded-space", `{"resource_definition":{"name":"Foo Bar"}}`},
 		{"embedded-dot", `{"resource_definition":{"name":"foo.bar"}}`},
+		{"path-separator", `{"resource_definition":{"name":"foo/bar"}}`},
 		{"leading-hyphen", `{"resource_definition":{"name":"-foo"}}`},
-		{"trailing-hyphen", `{"resource_definition":{"name":"foo-"}}`},
+		{"leading-digit", `{"resource_definition":{"name":"1foo"}}`},
+		{"single-char", `{"resource_definition":{"name":"a"}}`},
 		{"empty", `{"resource_definition":{"name":""}}`},
 	}
 
@@ -292,7 +297,7 @@ func TestBug97RDCreateAcceptedOnValidName(t *testing.T) {
 		"pvc-1",
 		"pvc-c8a1d6b9-3e2f-4d1b-8e8f-2c5e9e8e8e8e",
 		"foo123",
-		"a",
+		"ab",
 	}
 
 	for _, name := range cases {
@@ -331,7 +336,9 @@ func TestBug97RDCreateAcceptedOnValidName(t *testing.T) {
 func TestBug97NodeCreateRefusedOnInvalidName(t *testing.T) {
 	t.Parallel()
 
-	cases := []string{"", "  ", "Foo Bar", "FOO", "node.with.dot"}
+	// BUG-047: pure-uppercase ("FOO") is now valid upstream, dropped
+	// from the reject set. Embedded space / dot / empty stay invalid.
+	cases := []string{"", "  ", "Foo Bar", "node.with.dot"}
 
 	for _, name := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -375,7 +382,9 @@ func TestBug97NodeCreateRefusedOnInvalidName(t *testing.T) {
 func TestBug97RGCreateRefusedOnInvalidName(t *testing.T) {
 	t.Parallel()
 
-	cases := []string{"", "  ", "Bad Name", "BAD"}
+	// BUG-047: pure-uppercase ("BAD") is now valid upstream, dropped
+	// from the reject set. Embedded space / empty stay invalid.
+	cases := []string{"", "  ", "Bad Name"}
 
 	for _, name := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -406,7 +415,7 @@ func TestBug97RGCreateRefusedOnInvalidName(t *testing.T) {
 			// would have stamped — we never went through RD-create here,
 			// so the store must remain empty.
 			for _, rg := range rgs {
-				if rg.Name == "" || rg.Name == "Bad Name" || rg.Name == "BAD" || rg.Name == "  " {
+				if rg.Name == "" || rg.Name == "Bad Name" || rg.Name == "  " {
 					t.Errorf("RG persisted despite 400 (name=%q)", name)
 				}
 			}

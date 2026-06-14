@@ -305,9 +305,10 @@ spec:
         type: object
         x-kubernetes-validations:
         - message: metadata.name must equal <spec.resourceDefinitionName>.<spec.snapshotName>
+            (case-insensitive)
           optionalOldSelf: true
-          rule: oldSelf.hasValue() || self.metadata.name == self.spec.resourceDefinitionName
-            + '.' + self.spec.snapshotName
+          rule: oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.resourceDefinitionName
+            + '.' + self.spec.snapshotName).lowerAscii()
     served: true
     storage: true
     subresources:

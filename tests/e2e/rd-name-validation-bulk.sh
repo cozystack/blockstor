@@ -185,13 +185,17 @@ assert_accept() {
 # here is the recommended way to widen the gate; mirrors the
 # TestSnapshotRestoreRejectsInvalidRdName / TestResourceGroupSpawn
 # RejectsInvalidRdName table in the unit-test sibling.
+# BUG-047: the gate now mirrors upstream LINSTOR
+# (^[A-Za-z][A-Za-z0-9_-]{1,47}$), so mixed-case / uppercase /
+# underscore / trailing-hyphen names are VALID and moved to the
+# happy-path block below. Only the forms upstream still refuses remain.
 INVALID_NAMES=(
-    "hunt3-Bad"        # mixed-case, the operator-poke repro
-    "BADNAME"          # pure uppercase
-    "bad_underscore"   # underscore
-    "bad-"             # trailing hyphen
     "-bad"             # leading hyphen
+    "1bad"             # leading digit (upstream: "Cannot begin with '1'")
     "bad.name"         # embedded dot
+    "bad name"         # embedded space
+    "bad/name"         # path separator
+    "a"                # single char (upstream: min length 2)
 )
 
 # 1. rd c — already gated (Bug 97); assert the contract still holds so
@@ -256,6 +260,29 @@ if ! kubectl get resourcedefinition e2e-c4-good-spawn -o name >/dev/null 2>&1; t
     exit 1
 fi
 echo "   ok: valid RD 'e2e-c4-good-spawn' persisted"
+
+# BUG-047: an uppercase-hex name (the csi-sanity shape) must now be
+# accepted, mirroring upstream LINSTOR. The k8s store folds it onto a
+# lowercase slug, so the CRD lands under that slug — assert the spawn
+# succeeds and the RD is resolvable via the linstor view.
+echo
+echo ">> 5b. BUG-047: uppercase-hex name (csi-sanity shape) is accepted"
+UPPER_RD="e2e-C4-2A1B4B95EA8C4D7E"
+assert_accept "/v1/resource-groups/${RG}/spawn" \
+    "{\"resource_definition_name\":\"${UPPER_RD}\",\"volume_sizes\":[1048576]}" \
+    "rg spawn '${UPPER_RD}'"
+
+# Resolve back through the linstor view by the ORIGINAL name (the REST
+# surface re-resolves case-insensitively via Name()); the spawn would
+# have erred above if the gate still rejected it.
+if ! curl -sS "${API}/v1/resource-definitions/${UPPER_RD}" | grep -qi "${UPPER_RD}"; then
+    echo "FAIL: uppercase RD '${UPPER_RD}' not resolvable via the linstor view after spawn"
+    exit 1
+fi
+echo "   ok: uppercase RD '${UPPER_RD}' accepted and resolvable"
+
+# Track it for cleanup (k8s slug form is lowercased).
+delete_rd "$UPPER_RD" 2>/dev/null || true
 
 echo
 echo "PASS: rd-name-validation-bulk — all 4 RD-minting REST entry points reject invalid names without leaking state"

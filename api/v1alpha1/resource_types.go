@@ -522,7 +522,7 @@ type ResourceVolumeStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
-// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name == self.spec.resourceDefinitionName + '.' + self.spec.nodeName",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.nodeName>",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.resourceDefinitionName + '.' + self.spec.nodeName).lowerAscii()",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.nodeName> (case-insensitive)",optionalOldSelf=true
 
 // Resource is the Schema for the resources API.
 //
@@ -531,6 +531,15 @@ type ResourceVolumeStatus struct {
 // Keeping the composite key encoded in the name lets operators grep for
 // `<node>.` across kinds (Resource, Snapshot, StoragePool) and find every
 // resource bound to one satellite at once.
+//
+// BUG-047: the comparison is case-INSENSITIVE (.lowerAscii() on both
+// sides), mirroring StoragePool. LINSTOR identifiers are case-insensitive
+// and the k8s store's Name() helper lowercases metadata.name, while
+// spec.resourceDefinitionName preserves the caller's original case. With
+// an uppercase RD name (e.g. csi-sanity's `…BA880D4F…`) a case-SENSITIVE
+// rule rejected the Resource create with "must equal" even though the
+// names address the same object. lowerAscii() on both sides keeps the
+// `<rd>.<node>` convention intact while tolerating case differences.
 type Resource struct {
 	metav1.TypeMeta `json:",inline"`
 
