@@ -4,6 +4,35 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.13 — 2026-06-15
+
+Release-gate hardening release. A full independent acceptance gate (default NO-GO, re-verify-everything against the live Talos+QEMU stand plus a completed 24-hour ZFS-thick endurance burn-in) was run against this candidate; the fixes below were mined and validated over that campaign. Primary backend focus is ZFS thick. Every fix is pinned at L1 unit and, where operator-CLI-reachable, L6 cli-matrix + L7 replay, and was exercised on the live stand.
+
+### Fixed
+
+- **day0 first-activation `mkfs` is never lost (#147, BUG-028)** — a fresh volume's first activation could skip the initial `mkfs` under a reconcile race, leaving the device unformatted. The day0 path now guarantees the format step runs exactly once before the volume is presented.
+- **Last-UpToDate replica delete race on a Secondary SyncSource (#159, BUG-045)** — deleting a replica that was the Secondary SyncSource mid-resync could remove the last UpToDate copy. The guard now stamps `DiskState=UpToDate` on a SyncSource Secondary and refuses the delete that would drop the last good copy (HTTP 409) — a data-availability hole closed.
+- **Cross-node clone/restore converges; cross-backend clone rejected (#153, BUG-038)** — clone/restore across nodes now regenerates the replica mesh and converges to UpToDate; a clone that would cross storage backends is rejected instead of silently producing an inconsistent target.
+- **Consistency-group snapshots are atomic (#160, BUG-046)** — multi-volume group snapshots take a coordinated suspend-IO barrier so the snapshot is crash-consistent across all member volumes.
+- **Auto-tiebreaker witness honours `AutoplaceTarget=false` (#154, BUG-040)** — an auto-managed witness could land on a node excluded from autoplacement, producing a phantom-quorum state that could wedge IO. The witness now respects the exclusion, avoiding the deadlock.
+- **Witness-reap vs redundancy-backfill race closed (#157, BUG-041)** — concurrent witness removal and redundancy restore could race on the same node; the reap now uses ResourceVersion+UID preconditions so it never deletes a row another path is reusing.
+- **Invalid `lvcreate --kernel` flag dropped (#158, BUG-043/044)** — was breaking LVM-thin clone/restore; removed, with a regression harness for the restore path.
+- **`ControllerProps` synced with the `ControllerConfig` CRD (#138, BUG-022)** — controller-level properties round-trip through the backing CRD instead of living only in process memory.
+- **Uppercase LINSTOR identifiers accepted for CSI conformance (#163, BUG-047)** — the RD-name validator was stricter than upstream and rejected valid uppercase identifiers (e.g. csi-sanity uppercase-hex names). It now mirrors the upstream LINSTOR ruleset (case-insensitive); k8s-name folding verified collision-safe.
+- **Read-after-write reliability under informer-cache lag (#149/#150/#151)** — read-modify-write REST handlers retry on store conflict and the CSI create/restore hot paths absorb informer-cache lag, so a read immediately after a write no longer returns a transient 404/stale view.
+- **Ghost tiebreaker witness no longer re-created on a just-deleted node (#140)** and **rebalance-pending annotation strip now reaches the CRD (#139)**.
+- **`use_zfs_clone` accepted and VD-bearing RD clones materialised (#142)**; **encryption create-passphrase unlocks LUKS provisioning (#143)**.
+
+### Known issues
+
+- **Concurrent rapid late `vd c` (BUG-048; "Bug 50" in `docs/known-issues.md`)** — two back-to-back manual `volume-definition create` calls on an existing multi-replica RD can intermittently drop or wedge the second volume. Operator-only (NOT reachable via CSI, which creates exactly one volume-definition per resource-definition), availability-only (no data loss, no node-reboot deadlock), recoverable by deleting and re-adding the volume-definition sequentially. A code fix is in progress.
+
+### Testing & infrastructure
+
+- **Honest CI (#135, #137)** — `set -o pipefail` before piped `tee` so test jobs fail when tests fail (a non-zero test exit could previously be masked); the integration suite made honest under pipefail and re-pinned.
+- **Independent release-gate validation** — an extensive cli-matrix / operator-replay / cli-parity sweep plus a completed 24-hour ZFS-thick endurance burn-in, with triage and harness fixes (#155, #156, #161, #162) and a 2 TiB quorum-loss + no-reboot recovery scenario (#146, COV-011).
+- **Coverage & harness** — RD `layer_data` oracle delta whitelisted in the contract layer (#133); burn-in storage-pool override and worktree-aware build-SHA detection (#131, #132); concurrent-reader-safe FakeExec (#134); DRBD device resolution via `drbdadm sh-dev` across remaining cli-matrix cells (#136, #141); LUKS cli-matrix and rd-clone data-plane coverage repaired (#152/BUG-039, #143, #145, #144, #148).
+
 ## v0.1.12 — 2026-06-08
 
 Bugfix release. Two operator-CLI parity fixes mined against the upstream LINSTOR 1.33.2 oracle, both validated on the live Talos+QEMU stand.
