@@ -183,6 +183,26 @@ func (s *volumeDefinitions) CreateAutoNumbered(ctx context.Context, rdName strin
 		// allocate+append re-runs against the now-correct state. This
 		// makes the silent drop impossible: the create either persists or
 		// retries — it never returns success having lost the volume.
+		//
+		// Crucially this only holds when the verifying read is LIVE. With
+		// no uncached reader wired (apiReader == nil) the re-read falls
+		// back to the informer cache, which trails the Update we just
+		// committed — so it routinely fails to observe our own freshly
+		// written volume and surfaces a FALSE synthetic Conflict. The
+		// retry then re-derives the next free number off the same lagging
+		// cache and appends a SECOND volume, so a single auto-numbered
+		// create can leave several phantom VolumeDefinitions behind
+		// (BUG-048 de-regress). A successful optimistic-locked Update is
+		// already the apiserver's authoritative confirmation; without a
+		// live reader there is nothing trustworthy to verify against, so
+		// skip the check rather than second-guess a committed write
+		// against a stale cache. Production wires mgr.GetAPIReader(), so
+		// the live verification path is preserved where it actually
+		// guards the lost-update.
+		if s.apiReader == nil {
+			return nil
+		}
+
 		return s.verifyVolumeLanded(ctx, rdName, assigned)
 	})
 	if err != nil {

@@ -105,7 +105,17 @@ func StartStack(t *testing.T) *Stack {
 		t.Fatalf("build manager: %v", err)
 	}
 
-	st := storek8s.New(mgr.GetClient())
+	// Mirror cmd/apiserver/main.go: the REST-serving store is built
+	// with the manager's direct (uncached) API reader. CreateAutoNumbered's
+	// retry loop reads the parent RD through this reader so a conflict-
+	// retry observes the just-committed VolumeDefinition rather than a
+	// stale informer-cache revision. Without it (the plain New) the
+	// cache-lag re-read re-derives the same hole, 409-storms against the
+	// RD reconciler's concurrent writes, and the slow create makes the
+	// linstor client re-POST — leaving duplicate auto-numbered VDs
+	// (BUG-048 de-regress). Production never hit this because the apiserver
+	// always wires GetAPIReader(); the harness must match.
+	st := storek8s.NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
 
 	// Wire every reconciler / runnable cmd/controller/main.go
 	// registers. Mirror order exactly so a future split-or-merge
