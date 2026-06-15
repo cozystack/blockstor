@@ -19,6 +19,9 @@ name: Release Images
 #   Pre-release tags (v1.33.0-rc.1) get `1.33.0-rc.1` only — no `latest`.
 # This matches the repo's `vMAJOR.MINOR.PATCH[-rc.N]` tag convention
 # (see `git tag -l`).
+#
+# After the images publish, the workflow ALSO cuts the GitHub Release object
+# for the tag (body taken from the matching CHANGELOG.md section).
 
 on:
   push:
@@ -122,3 +125,57 @@ jobs:
             GIT_HASH=${{ steps.stamp.outputs.git_hash }}
             BUILD_TIME=${{ steps.stamp.outputs.build_time }}
           provenance: false
+
+  github-release:
+    name: Create GitHub Release
+    # After all three images publish, cut the GitHub Release for the tag:
+    # title = the tag, body = the matching "## <tag> — <date>" section of
+    # CHANGELOG.md (the same content used for prior releases). Pre-release tags
+    # (vMAJOR.MINOR.PATCH-rc.N / -alpha / -beta) are marked pre-release and not
+    # "Latest". Idempotent: updates the release if it already exists (re-run).
+    needs: build-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Cut the GitHub Release from the CHANGELOG section
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # vMAJOR.MINOR.PATCH[-rc.N] convention: pre-release tags are not Latest.
+          prerelease=()
+          latest=(--latest)
+          case "$TAG" in
+            *-rc*|*-alpha*|*-beta*) prerelease=(--prerelease); latest=(--latest=false) ;;
+          esac
+
+          # Body = the CHANGELOG.md section under "## <tag> — <date>", up to the
+          # next "## " heading; leading/trailing blank lines trimmed.
+          notes="$(mktemp)"
+          awk -v tag="$TAG" '
+            index($0, "## " tag " ") == 1 { f=1; next }
+            f && /^## / { exit }
+            f { print }
+          ' CHANGELOG.md | sed '/./,$!d' > "$notes"
+          awk 'NF{p=NR} {a[NR]=$0} END{for (i=1;i<=p;i++) print a[i]}' "$notes" > "$notes.trim"
+          mv "$notes.trim" "$notes"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; updating it."
+            edit_body=()
+            [ -s "$notes" ] && edit_body=(--notes-file "$notes")
+            gh release edit "$TAG" --title "$TAG" "${edit_body[@]}" "${prerelease[@]}" "${latest[@]}"
+          elif [ -s "$notes" ]; then
+            gh release create "$TAG" --title "$TAG" --verify-tag --notes-file "$notes" "${prerelease[@]}" "${latest[@]}"
+          else
+            echo "::warning::CHANGELOG.md has no section for $TAG; using auto-generated notes."
+            gh release create "$TAG" --title "$TAG" --verify-tag --generate-notes "${prerelease[@]}" "${latest[@]}"
+          fi
