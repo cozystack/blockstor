@@ -603,6 +603,30 @@ except Exception:
     print(0)" "$vol" 2>/dev/null || echo 0)
             [[ "$actual" == "$expected" ]]
             ;;
+        vd_count)
+            # BUG-048: assert the RD carries EXACTLY `expected`
+            # VolumeDefinitions. A concurrent-auto-assign lost-update
+            # drops the second of two back-to-back number-less `vd c`
+            # calls, leaving one VD short — this is the wire-level
+            # signature that catches the silent drop independent of
+            # whether DRBD later converged the survivors.
+            local rd expected actual
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',0))" "$spec")
+            actual=$(linstor_cli -m volume-definition list --resource-definitions "$rd" 2>/dev/null \
+                | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    while isinstance(d, list) and d and isinstance(d[0], list):
+        d=d[0]
+    n=0
+    for it in d if isinstance(d, list) else []:
+        n += len(it.get('vlm_dfns', []) or it.get('volume_definitions', []) or [])
+    print(n)
+except Exception:
+    print(0)" 2>/dev/null || echo 0)
+            [[ "$actual" == "$expected" ]]
+            ;;
         pvc_capacity)
             # PVC.Status.Capacity matches expected (e.g. "2Gi").
             # Verifies the operator-visible size propagation through

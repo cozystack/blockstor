@@ -2,7 +2,8 @@
 #
 # usage: multi-volume-late-vd-create.sh WORK_DIR
 #
-# L6 cli-matrix cell — Bug 332 (regression of Bug 79, P1).
+# L6 cli-matrix cell — Bug 332 (regression of Bug 79, P1) +
+# BUG-048 (P1, availability — concurrent late vd-add).
 #
 # Reproduction from the e2e2 stand:
 #
@@ -10,8 +11,8 @@
 #   $ linstor vd c test2 1G                       # vol-0
 #   $ linstor r c test2 --auto-place=3 -s lvm-thin
 #   # wait until all 3 replicas reach UpToDate
-#   $ linstor vd c test2 1G                       # vol-1 — late VD
-#   $ linstor vd c test2 1G                       # vol-2 — late VD
+#   $ linstor vd c test2 1G &                      # vol-1 — late VD
+#   $ linstor vd c test2 1G &                      # vol-2 — late VD (concurrent!)
 #
 #   $ drbdadm status test2
 #   test2 role:Secondary suspended:quorum
@@ -19,14 +20,30 @@
 #     volume:1 disk:Diskless quorum:no     ← Unintentional Diskless
 #     volume:2 disk:Diskless quorum:no     ← Unintentional Diskless
 #
-# Expected: late-added vol-1 / vol-2 each get their backing LV
-# allocated on every diskful replica, drbdmeta create-md fires
-# per-volume, the kernel slot picks up the new volumes, and every
-# (replica, volume) pair settles UpToDate within 60s.
+# Two distinct failure modes are pinned here:
 #
-# Unit pin: pkg/satellite/reconciler_drbd_test.go::
-#   TestApplyDRBDAllocatesBackingForLateAddedVolume
-# verifies the satellite's per-volume create-md gate via FakeExec.
+#   - Bug 332 (per-volume create-md): a late VD's backing LV is never
+#     stamped, so the kernel brings it up disk:Diskless while the spec
+#     lacks DISKLESS ("Unintentional Diskless").
+#
+#   - BUG-048 (concurrent auto-assign lost-update): two BACK-TO-BACK
+#     number-less `vd c` calls both auto-assign the smallest free
+#     VolumeNumber off the same pre-write snapshot, both pick VlmNr=1,
+#     and the loser is rejected — the operator's SECOND volume silently
+#     vanishes (only vol-0 + vol-1 land, vol-2 never created). The two
+#     late adds below run CONCURRENTLY to exercise this; the cell then
+#     asserts the RD carries exactly 3 VolumeDefinitions.
+#
+# Expected (post-fix): both concurrent late adds land at distinct
+# VolumeNumbers (1 and 2), each gets its backing LV + per-volume
+# create-md on every diskful replica, the satellite's per-fresh-volume
+# winner election seeds a SyncSource, and every (replica, volume) pair
+# settles UpToDate.
+#
+# Unit pins: pkg/satellite/reconciler_drbd_test.go::
+#   TestApplyDRBDAllocatesBackingForLateAddedVolume (per-volume create-md)
+#   and pkg/rest/volume_definitions_test.go::
+#   TestVolumeDefinitionsConcurrentAutoNumberNoLostUpdate (BUG-048 race).
 # This L6 cell is the kernel-truth half — only the real stand can
 # observe the actual `drbdadm status` output that surfaced the bug.
 
@@ -123,27 +140,70 @@ if ! wait_all_replicas_volume_uptodate 0 240; then
     exit 1
 fi
 
-# THE BUG: add vol-1 and vol-2 AFTER vol-0 is UpToDate.
-echo ">> [Bug 332] late vd c (vol-1)"
-"${LCTL[@]}" volume-definition create "$RD" 1G >/dev/null
+# THE BUG (BUG-048, P1 availability): add vol-1 and vol-2 AFTER vol-0 is
+# UpToDate, CONCURRENTLY (back-to-back, no convergence wait between them).
+# Both number-less `vd c` calls auto-assign the smallest free VolumeNumber
+# — pre-fix each read [vol-0] and BOTH chose VlmNr=1, so the loser was
+# rejected FAIL_EXISTS_VLM_DFN and the operator's second intended volume
+# silently vanished (only vol-0 + vol-1 persisted; vol-2 never created).
+# Running them truly concurrently is what exercises the lost-update race;
+# the prior sequential `vd c \n vd c` shape let the first REST response
+# land before the second auto-assign ran and so masked the bug.
+echo ">> [BUG-048] CONCURRENT late vd c (vol-1 + vol-2 back-to-back)"
+vdc_rc=0
+"${LCTL[@]}" volume-definition create "$RD" 1G >/tmp/bug048-vdcA.out 2>&1 &
+pA=$!
+"${LCTL[@]}" volume-definition create "$RD" 1G >/tmp/bug048-vdcB.out 2>&1 &
+pB=$!
+wait "$pA" || vdc_rc=1
+wait "$pB" || vdc_rc=1
 
-echo ">> [Bug 332] late vd c (vol-2)"
-"${LCTL[@]}" volume-definition create "$RD" 1G >/dev/null
+# BUG-048 wire-level assertion: BOTH concurrent adds must land. The RD
+# must carry exactly THREE VolumeDefinitions (vol-0 + the two late adds);
+# a lost-update leaves only two and one `vd c` reports a spurious
+# "volume definition 1 already exists" even though the operator named no
+# number. This catches the silent drop BEFORE the (slower) convergence
+# wait below — and even if DRBD later happened to converge the survivors.
+echo ">> [BUG-048] assert no concurrent vd-add was dropped (expect 3 VDs)"
+vd_count=$("${LCTL[@]}" --machine-readable volume-definition list \
+    --resource-definitions "$RD" 2>/dev/null \
+    | jq -r '[.[]? | .[]? | (.vlm_dfns // .volume_definitions // [])[]?] | length' \
+    2>/dev/null || echo 0)
+if [[ "$vd_count" != "3" ]]; then
+    echo "FAIL (BUG-048): RD $RD has $vd_count VolumeDefinitions after two concurrent late vd c, want 3 — a concurrent add was silently dropped" >&2
+    echo "----- vd c #A output -----" >&2; cat /tmp/bug048-vdcA.out >&2 || true
+    echo "----- vd c #B output -----" >&2; cat /tmp/bug048-vdcB.out >&2 || true
+    "${LCTL[@]}" volume-definition list --resource-definitions "$RD" 2>&1 | tail -20 >&2
+    exit 1
+fi
+echo "   3 VolumeDefinitions present — no concurrent add dropped"
 
-# Each late-added 1G volume needs its own initial sync on every replica;
-# under sweep load that takes well past the old 60s budget, so give the
-# late volumes the same 240s headroom vol-0 gets.
-echo ">> wait up to 240s for vol-1 + vol-2 to reach UpToDate on all 3 replicas"
+if (( vdc_rc != 0 )); then
+    # Both VDs landed (count==3) yet a CLI returned non-zero: that is the
+    # acceptable-but-noteworthy "fail loudly" path, not the silent wedge.
+    echo "   note: a concurrent vd c exited non-zero but both volumes were created" >&2
+fi
+
+# Each late-added 1G volume needs its own initial sync on every replica.
+# Here TWO 1G volumes are added concurrently on a 3-diskful RD, so up to
+# 6 fresh (replica,volume) initial syncs run at once and share the loop
+# substrate's I/O — convergence routinely runs past the single-volume
+# 240s budget (observed: vol-2 still `Outdated` — i.e. converging, NOT
+# the wedge's `Inconsistent` — at the 240s mark, UpToDate moments later).
+# 360s per volume keeps the concurrent path from flaking while still
+# being far inside the wedge discriminator (a real BUG-048 wedge sits
+# Inconsistent forever with no SyncSource and never advances).
+echo ">> wait up to 360s for vol-1 + vol-2 to reach UpToDate on all 3 replicas"
 late_up=true
 for vol in 1 2; do
-    if ! wait_all_replicas_volume_uptodate "$vol" 240; then
+    if ! wait_all_replicas_volume_uptodate "$vol" 360; then
         late_up=false
         break
     fi
 done
 
 if [[ "$late_up" != "true" ]]; then
-    echo "FAIL (Bug 332): late-added vol-1/vol-2 not UpToDate on all 3 replicas within 240s" >&2
+    echo "FAIL (Bug 332): late-added vol-1/vol-2 not UpToDate on all 3 replicas within 360s" >&2
     "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -40 >&2
     # Surface the smoking gun: per (node, vol) disk_state straight from
     # the populated Resource.Status — a Bug-332-bitten path shows vol-1
@@ -187,4 +247,4 @@ else
     echo "SKIP-PARTIAL: drbdsetup status on $satellite_node failed; REST-level pin still asserted"
 fi
 
-echo ">> multi-volume-late-vd-create OK (Bug 332 pinned: late vd c on $RD brought vol-1/vol-2 to UpToDate, no Unintentional Diskless)"
+echo ">> multi-volume-late-vd-create OK (Bug 332 + BUG-048 pinned: two CONCURRENT late vd c on $RD both landed at distinct VlmNrs and brought vol-1/vol-2 to UpToDate, no dropped VD, no Unintentional Diskless)"

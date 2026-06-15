@@ -1,0 +1,108 @@
+name: vd-late-concurrent-no-drop
+description: |
+  BUG-048 catcher (P1, availability). Short name on purpose: the
+  replay-runner prefixes `replay-` and suffixes a random token, and the
+  resulting RD name must stay within DRBD's resource-name length limit —
+  a longer name makes `resource-definition create` fail outright.
+
+  Two back-to-back number-less
+  `linstor vd c <rd>` calls against an RD that already carries vol-0
+  (and whose RD.Spec.Initialized has flipped true) must BOTH land at
+  distinct VolumeNumbers — none silently dropped.
+
+  Root cause: the REST handler auto-assigned the smallest free
+  VolumeNumber in a List taken BEFORE the store Create, so two adds
+  racing in the same window both read [vol-0], both chose VlmNr=1, the
+  loser was rejected FAIL_EXISTS_VLM_DFN, and the operator's second
+  intended volume silently vanished. When the loser backgrounds its CLI
+  there is no error surfaced at all — the volume simply never exists.
+
+  Post-fix the smallest-free allocation moved INTO the store layer
+  (VolumeDefinitionStore.CreateAutoNumbered), re-derived on every
+  conflict-retry attempt, so the loser re-reads [vol-0, vol-1] and
+  lands at vol-2.
+
+  Harness note: replay-runner executes each `cmd` as a single
+  sequential `linstor` invocation and has no concurrency primitive, so
+  this YAML drives the late adds back-to-back sequentially and pins the
+  POST-FIX invariant with `vd_count: 3` (the exact wire-level signature
+  a lost-update would violate — it leaves 2) plus `all_uptodate`. The
+  TRUE concurrent-race reproduction (background `&` + wait, which is
+  what exercises the auto-assign window) lives in the L6 kernel-truth
+  cell tests/e2e/cli-matrix/multi-volume-late-vd-create.sh, and the L1
+  unit pin is pkg/rest/volume_definitions_test.go::
+  TestVolumeDefinitionsConcurrentAutoNumberNoLostUpdate.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vol0
+    # 64M (not 1G): BUG-048 is a control-plane allocation defect, not a
+    # sync-timing race, so the trigger is size-independent. 64M converges
+    # in seconds on the I/O-constrained stand and keeps the all_uptodate
+    # awaits well inside budget.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-vol0-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: late-vd-create-second
+    # Late add #1 on the already-initialized RD → auto-assigns vol-1.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: late-vd-create-third
+    # Late add #2 back-to-back → MUST auto-assign vol-2 (not collide on
+    # vol-1). Pre-fix, when these two raced, this one was the dropped add.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+    await:
+      # BUG-048 signature: exactly 3 VDs must exist (vol-0,1,2). A
+      # lost-update leaves 2.
+      kind: vd_count
+      rd: "{{rd}}"
+      expected: 3
+      timeout_s: 30
+  - name: wait-all-volumes-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # Every volume of every replica converges — the elected per-fresh-
+      # volume winner seeds a SyncSource for both late adds. Two BUG-048
+      # self-heals recover a concurrent-seed race: (a) when a volume comes
+      # up Inconsistent on EVERY replica with no source, the
+      # late-add-promote self-heal force-primaries the lowest-id node; (b)
+      # when a resync IS elected but STALLS (paused/bitmap-exchange-wedged
+      # on a >=3-replica add — out-of-sync frozen, two replicas never
+      # converge), the late-add resync-KICK self-heal disconnect+adjusts to
+      # restart it. Both add latency (wedge-detect + the 45s stall-dwell /
+      # recoveryPromoteThrottle window + the kick/promote + resync). On a
+      # contended stand those recovery paths run past the bare-convergence
+      # budget, so allow 360s — still far inside the wedge discriminator (a
+      # real unfixed wedge never advances at all).
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 360
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

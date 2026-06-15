@@ -257,7 +257,14 @@ func main() {
 	// CRD-backed store is the only supported persistence layer
 	// post-Phase-11 — the apiserver/controller split made
 	// in-process state pointless across replicas.
-	st := storek8s.New(mgr.GetClient())
+	//
+	// BUG-048: pass the manager's direct (uncached) API reader so the
+	// atomic VolumeNumber allocation re-reads live RD state on each
+	// conflict-retry. With only the informer-cached client, two
+	// concurrent `vd c` against one RD both retry against a stale cache,
+	// re-derive the same number, exhaust the retry budget, and silently
+	// drop the second volume.
+	st := storek8s.NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
 
 	ready := newReadyState()
 

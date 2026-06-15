@@ -250,6 +250,26 @@ type VolumeDefinitionStore interface {
 	List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error)
 	Get(ctx context.Context, rdName string, volumeNumber int32) (apiv1.VolumeDefinition, error)
 	Create(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
+
+	// CreateAutoNumbered allocates the smallest free non-negative
+	// VolumeNumber for the parent RD and persists `vd` under it,
+	// returning the assigned number. Unlike a REST-side "List then pick
+	// the hole then Create" sequence, the allocation happens INSIDE the
+	// store's conflict-retry loop (k8s) / write lock (inmemory), so the
+	// read of the existing VD set and the write of the new entry are
+	// atomic with respect to a concurrent CreateAutoNumbered on the same
+	// RD. This closes the BUG-048 lost-update race: two back-to-back
+	// `linstor vd c <rd>` calls used to both read `[vol-0]`, both pick
+	// VlmNr=1, and the loser was rejected with FAIL_EXISTS_VLM_DFN — the
+	// operator's second intended volume was silently dropped. With the
+	// allocation re-run per retry attempt, the loser re-reads `[vol-0,
+	// vol-1]` and lands at vol-2.
+	//
+	// vd.VolumeNumber on input is ignored — the store owns the
+	// allocation. On success vd.VolumeNumber is set to the assigned
+	// value for the caller's convenience and the same value is returned.
+	CreateAutoNumbered(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) (int32, error)
+
 	Update(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
 	Delete(ctx context.Context, rdName string, volumeNumber int32) error
 

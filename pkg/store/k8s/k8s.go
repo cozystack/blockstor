@@ -63,13 +63,25 @@ type Store struct {
 
 // New wraps a controller-runtime client and returns a store.Store.
 func New(c ctrlclient.Client) *Store {
+	return NewWithAPIReader(c, nil)
+}
+
+// NewWithAPIReader is New plus a direct (uncached) API reader. The
+// reader is used ONLY where a cache-lag read would be incorrect — the
+// BUG-048 atomic VolumeNumber allocation, where retrying an optimistic-
+// lock conflict against a stale informer cache re-derives the SAME
+// number and the create-loop never converges (the second of two
+// concurrent `vd c` is dropped). Pass mgr.GetAPIReader() in production;
+// nil is accepted and every path falls back to the cached client
+// (in-memory / unit harnesses that have no informer).
+func NewWithAPIReader(c ctrlclient.Client, apiReader ctrlclient.Reader) *Store {
 	s := &Store{c: c}
 	s.nodes = &nodes{c: c}
 	s.storagePools = &storagePools{c: c}
 	s.resourceGroups = &resourceGroups{c: c}
 	s.resourceDefinitions = &resourceDefinitions{c: c}
 	s.resources = &resources{c: c}
-	s.volumeDefinitions = &volumeDefinitions{c: c}
+	s.volumeDefinitions = &volumeDefinitions{c: c, apiReader: apiReader}
 	s.snapshots = &snapshots{c: c}
 	s.physicalDevices = &physicalDevices{c: c}
 	s.controllerProps = &controllerProps{c: c}

@@ -283,6 +283,18 @@ type Reconciler struct {
 	// resets it (at worst one extra promote).
 	lastRecoveryPromoteAt map[string]time.Time
 
+	// firstLateAddStallAt records, per resource name, the first wall-clock
+	// time this node observed a STALLED late-add resync (BUG-048
+	// NeedsLateAddResyncKick) without yet kicking it. The kick
+	// (disconnect+adjust) only fires once the stall has PERSISTED beyond
+	// lateAddStallDwell, so the normal, transient DRBD volume-resync
+	// serialization (vol-N legitimately PausedSyncS/dependency for a few
+	// seconds while vol-(N-1) finishes) is never mistaken for the wedge
+	// and disrupted. Cleared when the stall clears (predicate stops
+	// holding). Process-memory only; a restart resets it (at worst one
+	// extra dwell window before the kick).
+	firstLateAddStallAt map[string]time.Time
+
 	// restoreSnapshotMissingTries counts, per "<resource>/<volNumber>",
 	// how many consecutive reconcile passes a snapshot-restore-backed
 	// volume found its source `@snap` ABSENT locally (ErrNotFound from
@@ -309,6 +321,20 @@ type Reconciler struct {
 // wedge (peer truly stuck Inconsistent with no Primary) still gets a
 // fresh nudge promptly.
 const recoveryPromoteThrottle = 10 * time.Second
+
+// lateAddStallDwell is how long a late-add resync must REMAIN stalled
+// (LateAddResyncKickVolumes continuously non-empty) before
+// maybeKickLateAddResync fires the per-volume invalidate. It is a SECONDARY
+// guard against disrupting the normal, transient DRBD volume-resync
+// serialization — the PRIMARY guard is peerDeviceResyncInProgress, which
+// already backs the kick off whenever any resync on the volume is actively
+// progressing (so a freshly-serialized vol-N that is about to start is not
+// invalidated). The dwell adds a small settling margin so a stall that is
+// momentarily mis-read clears on its own first. Kept short so a genuine
+// FROZEN wedge (oos never moves) recovers well inside the operator/L7
+// convergence budget; far longer than the sub-second window in which a
+// just-added volume transitions through its handshake states.
+const lateAddStallDwell = 20 * time.Second
 
 // restoreSnapshotMissingBudget bounds how many consecutive reconcile
 // passes a node-local snapshot-restore volume may REQUEUE on a
@@ -338,6 +364,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		seenStuckAt:                 map[string]time.Time{},
 		restoreBlankFallback:        map[string]bool{},
 		lastRecoveryPromoteAt:       map[string]time.Time{},
+		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
 	}
 }
@@ -1854,71 +1881,6 @@ func extractResFilePeers(body string) []string {
 // bogus --node-id=0 collision against the local slot. Reads via
 // os.ReadFile so a transient I/O hiccup degrades to no-op
 // instead of wedging the reconcile.
-// hasLateAddedVolume reports whether the desired-state Volumes[]
-// includes at least one volume number that is NOT yet represented
-// as a `volume <N> {` block in the OLD .res file at resPath.
-//
-// Bug 332: the `linstor vd c <rd> 1G` flow grows VolumeDefinitions[]
-// after the RD has already passed first-activation. The dispatcher
-// hands the satellite a DesiredResource with the new volume in
-// Volumes[], but the on-disk .res still describes the smaller set —
-// so a strict greater-than on the rendered block count is the
-// late-VD signal. Returns false when the .res file is absent
-// (cold-start path; the existing firstActivation gate owns
-// metadata creation), when the file is unreadable (fail-safe to
-// "no late vol → no extra work"), or when the desired set matches
-// what's already rendered.
-//
-// Parser is intentionally simple: matches "volume <N> {" inside an
-// `on <node> {` block. False positives across multi-host blocks are
-// harmless — the helper de-duplicates by recording each volNumber
-// once across the file.
-func hasLateAddedVolume(resPath string, dr *intent.DesiredResource) bool {
-	if dr == nil {
-		return false
-	}
-
-	body, err := os.ReadFile(resPath)
-	if err != nil {
-		// No .res yet → cold start, existing firstActivation path
-		// will create metadata for every volume via the standard
-		// chain. Late-VD signal is "old file exists with fewer
-		// volumes", not "no file at all".
-		return false
-	}
-
-	rendered := map[int32]struct{}{}
-
-	for line := range strings.SplitSeq(string(body), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "volume ") {
-			continue
-		}
-
-		rest := strings.TrimPrefix(trimmed, "volume ")
-		head, _, ok := strings.Cut(rest, "{")
-
-		if !ok {
-			continue
-		}
-
-		num, parseErr := strconv.ParseInt(strings.TrimSpace(head), 10, 32)
-		if parseErr != nil {
-			continue
-		}
-
-		rendered[int32(num)] = struct{}{}
-	}
-
-	for _, vol := range dr.GetVolumes() {
-		if _, ok := rendered[vol.GetVolumeNumber()]; !ok {
-			return true
-		}
-	}
-
-	return false
-}
-
 func extractResFilePeerNodeIDs(resPath string) map[string]int32 {
 	body, err := os.ReadFile(resPath)
 	if err != nil {
@@ -2135,15 +2097,28 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// upstream LINSTOR DrbdLayer.adjustResource: per-volume
 	// hasMetaData probe, per-volume createMd for those that lack it.
 	//
-	// Scope: NARROW to the "late-VD added" signal — desired Volumes[]
-	// count strictly exceeds the OLD .res's `volume N {` block count.
-	// Without this narrowing, the steady-state path would shell out
-	// `drbdadm dump-md` on every reconcile, perturbing existing tests
-	// that pin "no metadata work on retry" (e.g. mid-Apply abort
-	// scenarios) and adding shell cost on every converged pass.
-	// Skipped on diskless replicas (no lower disk to stamp) and on
-	// the diskless→diskful flip path (Bug 319 owns that re-stamp).
-	if !diskless && hasLateAddedVolume(resPath, dr) &&
+	// Scope: gate on "this RD is already past first activation"
+	// (MetadataCreated Condition / .md-created marker) rather than the
+	// OLD .res's `volume N {` block count.
+	//
+	// BUG-048 (P1, availability): the previous `.res`-count gate raced
+	// the FSM dispatch's renderResFile preamble. On a concurrent late
+	// vd-add the FSM `adjust` of an EARLIER reconcile already re-rendered
+	// `.res` to include the new volume's `volume N {` block BEFORE this
+	// gate read the file, so hasLateAddedVolume(resPath) flipped FALSE,
+	// ensurePerVolumeMetadata was SKIPPED, and the new volume came up via
+	// the kernel adjust with NO metadata + NO winner-election GI seed —
+	// Inconsistent on every replica, no SyncSource, permanently wedged
+	// (~half of concurrent two-VD adds). The on-disk metadata, not the
+	// rendered .res, is the race-free truth: ensurePerVolumeMetadata
+	// probes `drbdadm dump-md` per volume and only creates+seeds the ones
+	// that actually lack metadata (len(freshlyCreated)==0 → early return),
+	// so running it on every post-activation diskful reconcile is
+	// idempotent and converged passes pay only the cheap per-volume
+	// dump-md probe. Skipped on diskless replicas (no lower disk to
+	// stamp) and on the diskless→diskful flip path (Bug 319 owns that
+	// re-stamp).
+	if !diskless && dr.GetMetadataCreated() &&
 		!r.isDisklessToDiskfulFlip(ctx, dr, diskless) {
 		err = r.ensurePerVolumeMetadata(ctx, dr, devices, diskless)
 		if err != nil {
@@ -2561,6 +2536,32 @@ func (r *Reconciler) maybePromoteSelfHeals(ctx context.Context, dr *intent.Desir
 		return err
 	}
 
+	// BUG-048 late-add-promote self-heal — drive a late-added volume that
+	// wedged Inconsistent on EVERY diskful replica (no SyncSource, no peer
+	// holds data) to UpToDate. Distinct from maybeRecoveryPromote: that
+	// path needs the local already-UpToDate + the dispatcher's
+	// auto-primary, BOTH false for a late-add to an initialized RD. See
+	// maybeLateAddPromote / Adm.NeedsLateAddPromote.
+	err = r.maybeLateAddPromote(ctx, dr, diskless)
+	if err != nil {
+		return err
+	}
+
+	// BUG-048 late-add resync-kick self-heal — unstick a late-added
+	// volume whose resync EXISTS but wedged in a paused/bitmap-exchange
+	// state that never advances (the ≥3-replica concurrent-add
+	// convergence wedge: a SyncSource is elected but its resync sits
+	// PausedSyncS/resync-suspended:dependency while partner peers wait in
+	// WFBitMapT/resync-suspended:peer, or one peer reaches UpToDate while
+	// a second stalls WFBitMapT/Outdated forever). Distinct from
+	// maybeLateAddPromote: that mints a source when NONE exists; this
+	// re-handshakes an EXISTING-but-stalled resync via disconnect+adjust.
+	// See maybeKickLateAddResync / Adm.NeedsLateAddResyncKick.
+	err = r.maybeKickLateAddResync(ctx, dr, diskless)
+	if err != nil {
+		return err
+	}
+
 	// Solo diskless→diskful toggle self-heal — force-promote a lone,
 	// peerless diskful replica wedged below UpToDate. See maybeSoloPromote
 	// for the full why (the auto-primary suppression × offline-safety
@@ -2718,6 +2719,185 @@ func (r *Reconciler) maybeRecoveryPromote(ctx context.Context, dr *intent.Desire
 		"resource", dr.GetName())
 
 	return r.runAutoPromote(ctx, dr)
+}
+
+// maybeLateAddPromote is the BUG-048 self-heal for a late-added volume
+// that wedged Inconsistent on EVERY diskful replica with no SyncSource.
+//
+// Why it cannot reuse maybeRecoveryPromote: that path is gated on the
+// dispatcher's `auto-primary` (autoPrimaryReplica), which is suppressed
+// on an INITIALIZED RD — and a late `vd c` ALWAYS lands on an
+// initialized RD. Its kernel-truth predicate (NeedsRecoveryPromote) also
+// requires the local replica to be already UpToDate; in this wedge the
+// local late-added volume is itself Inconsistent. So neither the gate
+// nor the predicate can ever fire for the late-add wedge.
+//
+// NeedsLateAddPromote is the dedicated kernel-truth gate: it fires ONLY
+// when a local diskful volume is Inconsistent, NO connected peer holds
+// committed data for it (so there is no real SyncSource to wait for),
+// no replica is Primary, and this node is the deterministic lowest
+// node-id — so exactly one node mints the source and it is data-safe
+// (every replica shares the volume's day0 current-UUID and is equally
+// empty, so the minted UpToDate copy loses nothing; the Inconsistent peers
+// SyncTarget from it). Self-limiting: once the peers converge the predicate
+// stops holding.
+//
+// How the source is minted: NOT `drbdadm primary --force`. The kernel
+// REJECTS that with "(-16) Disk state is lower than outdated" whenever any
+// volume of the resource is Inconsistent (stand-observed: the old promote
+// retried every throttle window and never took — the wedge persisted on all
+// replicas). Instead MintLateAddSource disconnects, runs the per-volume
+// `drbdsetup new-current-uuid --clear-bitmap <minor>` (the same skip-init
+// path DRBD uses to mark a fresh volume UpToDate), and reconnects — so the
+// Inconsistent peers SyncTarget from the freshly-UpToDate local volumes.
+//
+// NOT gated on autoPromote/autoPrimaryReplica by design — those are
+// exactly what is missing on the late-add path. It IS gated on the same
+// recoveryPromoteThrottle so a still-converging resync isn't churned by
+// repeated mints. Skipped on diskless replicas (no disk to mint) and when
+// Adm is unwired (storage-only unit tests).
+func (r *Reconciler) maybeLateAddPromote(ctx context.Context, dr *intent.DesiredResource, diskless bool) error {
+	if diskless || r.cfg.Adm == nil {
+		return nil
+	}
+
+	if !r.cfg.Adm.NeedsLateAddPromote(ctx, dr.GetName()) {
+		return nil
+	}
+
+	if !r.recoveryPromoteDue(dr.GetName()) {
+		return nil
+	}
+
+	log.FromContext(ctx).Info("BUG-048 late-add-promote: mint UpToDate source (disconnect + new-current-uuid --clear-bitmap + reconnect) for a late-added volume wedged Inconsistent on every replica",
+		"resource", dr.GetName())
+
+	minors, err := r.cfg.Adm.MintLateAddSource(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "late-add-promote mint source %s", dr.GetName())
+	}
+
+	log.FromContext(ctx).Info("BUG-048 late-add-promote: minted UpToDate source",
+		"resource", dr.GetName(), "minors", minors)
+
+	return nil
+}
+
+// maybeKickLateAddResync is the BUG-048 self-heal for a late-added volume
+// whose resync EXISTS but wedged in a paused / bitmap-exchange state that
+// never advances — the ≥3-replica concurrent late-add convergence wedge.
+//
+// Two stand-observed signatures it unsticks (both on the last
+// concurrently-added volume of a 3-diskful RD, oos frozen at full / a
+// peer stuck below UpToDate forever):
+//
+//   - partial stall: one peer reaches UpToDate (a real SyncSource), but
+//     THIS replica stays WFBitMapT / Outdated / Inconsistent and never
+//     finalises — the source fed another peer but not us.
+//   - dependency deadlock (post-promote): once maybeLateAddPromote
+//     force-primaries the lowest-id node to UpToDate, the remaining
+//     Inconsistent replicas have an UpToDate peer but their resync stays
+//     paused (resync-suspended:dependency) and never advances.
+//
+// Why neither promote self-heal covers it: maybeLateAddPromote fires only
+// when NO peer holds data and the volume is Inconsistent on EVERY replica
+// (it mints a source); here an UpToDate peer EXISTS but the local resync
+// is latched. maybeRecoveryPromote needs the local already-UpToDate.
+//
+// Why `invalidate` and not a connection re-handshake: every replica of a
+// fresh late-added volume shares the day0 current-UUID, so disconnect+
+// reconnect reads "same generation ⇒ no resync needed" and abandons the
+// dirty bitmap — a WORSE wedge (verified on-stand: connection went
+// StandAlone / Established with out-of-sync frozen). `drbdadm invalidate
+// <res>/<vol>` instead discards the empty, non-authoritative LOCAL copy of
+// that one volume and forces a full SyncTarget FROM the UpToDate peer.
+//
+// LateAddResyncKickVolumes is the kernel-truth gate: it returns the local
+// volumes below UpToDate that have a connected UpToDate peer (the
+// SyncTarget source) and are not already being actively pulled — ONLY when
+// no replica is Primary, the RD is past day0, and every peer is Connected.
+// Each returned volume is invalidated locally. Data-safe (only a
+// non-authoritative local copy is discarded, and only when an UpToDate
+// peer exists to re-pull from) and self-limiting (once a volume reaches
+// UpToDate it no longer qualifies). A 45s stall-dwell ensures only a
+// GENUINELY frozen resync is invalidated, never the normal transient
+// volume-resync serialization. Throttled via the shared
+// recoveryPromoteThrottle. Skipped on diskless replicas (no local copy to
+// invalidate) and when Adm is unwired (storage-only tests).
+func (r *Reconciler) maybeKickLateAddResync(ctx context.Context, dr *intent.DesiredResource, diskless bool) error {
+	if diskless || r.cfg.Adm == nil {
+		return nil
+	}
+
+	volumes := r.cfg.Adm.LateAddResyncKickVolumes(ctx, dr.GetName())
+	if len(volumes) == 0 {
+		// Not stalled (or converged): clear any pending dwell so a future
+		// transient stall starts its window fresh.
+		r.clearLateAddStall(dr.GetName())
+
+		return nil
+	}
+
+	// Dwell gate: only invalidate once the stall has PERSISTED beyond
+	// lateAddStallDwell, so the normal transient volume-resync
+	// serialization (a few seconds of PausedSync*/dependency while a
+	// sibling volume finishes) is never disrupted — only a genuinely
+	// frozen resync is.
+	if !r.lateAddStallDwellElapsed(dr.GetName()) {
+		return nil
+	}
+
+	if !r.recoveryPromoteDue(dr.GetName()) {
+		return nil
+	}
+
+	// Invalidate ONE volume per kick (the lowest-numbered stalled one).
+	// DRBD serialises resyncs per connection, so invalidating every stalled
+	// volume at once would re-create the very dependency-serialization that
+	// wedges — vol-N's invalidate would sit PausedSyncT/dependency behind
+	// vol-(N-1)'s and, looking stalled, get re-invalidated and flap. One at
+	// a time lets each invalidated volume's resync run (and back off the
+	// kick via peerDeviceResyncInProgress) before the next reconcile picks
+	// up the next straggler. volumes is built in ascending volume order by
+	// the kernel device scan.
+	vol := volumes[0]
+
+	log.FromContext(ctx).Info("BUG-048 late-add resync-kick: invalidate locally to re-pull a stalled late-added volume from its UpToDate peer",
+		"resource", dr.GetName(), "volume", vol)
+
+	return errors.Wrapf(r.cfg.Adm.InvalidateVolume(ctx, dr.GetName(), vol),
+		"late-add resync-kick invalidate %s/%d", dr.GetName(), vol)
+}
+
+// lateAddStallDwellElapsed records the first time a resource was observed
+// with a stalled late-add resync and reports whether the stall has now
+// persisted at least lateAddStallDwell. The first observation stamps the
+// timestamp and returns false (start the window); a later observation
+// returns true once the window has elapsed. Serialised by r.mu.
+func (r *Reconciler) lateAddStallDwellElapsed(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+
+	first, ok := r.firstLateAddStallAt[name]
+	if !ok {
+		r.firstLateAddStallAt[name] = now
+
+		return false
+	}
+
+	return now.Sub(first) >= lateAddStallDwell
+}
+
+// clearLateAddStall drops the recorded stall start for a resource, so a
+// transient stall that cleared restarts its dwell window from scratch the
+// next time one is observed. Serialised by r.mu.
+func (r *Reconciler) clearLateAddStall(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.firstLateAddStallAt, name)
 }
 
 // recoveryPromoteDue reports whether enough time has elapsed since this

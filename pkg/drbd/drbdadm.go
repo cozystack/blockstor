@@ -92,6 +92,25 @@ func (a *Adm) Adjust(ctx context.Context, resource string) error {
 	return a.run(ctx, "adjust", resource)
 }
 
+// InvalidateVolume runs `drbdadm invalidate <resource>/<vol>` — marks the
+// LOCAL copy of ONE volume as out-of-sync and forces a full SyncTarget of
+// that volume from an UpToDate peer. The per-volume target (`<res>/<vol>`)
+// confines the discard to the named volume so sibling volumes' data is
+// untouched. Requires an UpToDate peer as the resync source (drbdadm
+// refuses otherwise); callers gate on LateAddResyncKickVolumes, which only
+// returns a volume when a connected peer is UpToDate for it.
+//
+// Used by the BUG-048 late-add resync-kick self-heal to recover a stalled
+// late-add resync: the fresh, empty, non-authoritative local copy is
+// thrown away and re-pulled from the UpToDate peer, working WITH the
+// bitmap (unlike a connection re-handshake, which the shared day0 GI makes
+// conclude "no resync needed").
+func (a *Adm) InvalidateVolume(ctx context.Context, resource string, volume int32) error {
+	target := fmt.Sprintf("%s/%d", resource, volume)
+
+	return a.run(ctx, "invalidate", target)
+}
+
 // AdjustSkipDisk is the Failed-replica variant of Adjust that
 // appends drbd-utils' `--skip-disk` flag. Used after the observer
 // detected `disk:Failed` and stamped `DrbdOptions/SkipDisk=True`
@@ -483,6 +502,98 @@ func (a *Adm) Invalidate(ctx context.Context, resource string) error {
 // recovery tool.
 func (a *Adm) NewCurrentUUID(ctx context.Context, resource string) error {
 	return a.run(ctx, "new-current-uuid", resource)
+}
+
+// MintLateAddSource makes THIS node an UpToDate source for every LOCAL
+// Inconsistent volume of `resource`, so the Inconsistent peers can
+// SyncTarget from it (BUG-048, the all-Inconsistent late-add wedge where
+// NO replica ever won the volume's UpToDate seed).
+//
+// Why not `primary --force`: the existing late-add-promote ran
+// `drbdadm primary --force <res>`, but the kernel REJECTS it with
+// "(-16) Disk state is lower than outdated" whenever ANY volume of the
+// resource is Inconsistent (stand-observed: the promote retried every
+// throttle window and never took, the volume stayed Inconsistent on all
+// replicas forever). `primary` is also resource-wide, so a single
+// Inconsistent late volume blocks promoting the whole resource even though
+// the sibling volumes are UpToDate.
+//
+// Instead, mint the source per-volume the way DRBD's own skip-initial-sync
+// does: `drbdsetup new-current-uuid --clear-bitmap <minor>` marks the
+// volume UpToDate with a clean bitmap. That call requires the volume's
+// peers to be StandAlone, so the sequence is:
+//
+//  1. `drbdadm disconnect <res>` — quiesce every peer (resource-wide; DRBD
+//     carries all volumes over one connection per peer). UpToDate sibling
+//     volumes (vol-0/vol-1) are unaffected: on reconnect they re-handshake
+//     at their shared UUID and stay Established (no resync).
+//  2. for each LOCAL Inconsistent volume: `new-current-uuid --clear-bitmap
+//     <minor>` → that volume flips UpToDate with a clean bitmap.
+//  3. `drbdadm adjust <res>` — reconnect every peer. The peers, still
+//     Inconsistent, now see an UpToDate source and SyncTarget from it.
+//
+// Data-safety: the late-added volume is genuinely fresh/empty on every
+// replica (day0 lineage; this gate fires only when NO peer holds committed
+// data — the caller's NeedsLateAddPromote enforces that), so minting an
+// empty UpToDate source loses nothing — the Inconsistent peers were equally
+// empty and simply adopt this clean copy. Gated by NeedsLateAddPromote
+// (lowest-id node, no peer data, no Primary), so exactly one deterministic
+// node mints the source and no split-brain race is possible.
+//
+// Returns the cleared minors (for logging) and the first error. A disconnect
+// failure is best-effort-ignored (a peer already StandAlone is fine); a
+// clear-bitmap or adjust failure surfaces.
+func (a *Adm) MintLateAddSource(ctx context.Context, resource string) ([]int32, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return nil, errors.Wrapf(err, "drbdsetup status %s", resource)
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 {
+		return nil, errors.Wrapf(err, "parse drbdsetup status %s", resource)
+	}
+
+	var minors []int32
+
+	for _, dev := range status[0].Devices {
+		if DiskState(dev.DiskState) == DiskStateInconsistent {
+			minors = append(minors, dev.Minor)
+		}
+	}
+
+	if len(minors) == 0 {
+		return nil, nil
+	}
+
+	// Best-effort disconnect of all peers — new-current-uuid --clear-bitmap
+	// requires StandAlone; a peer already StandAlone returns non-zero, which
+	// we ignore.
+	_, _ = a.exec.Run(ctx, "drbdadm", "disconnect", resource)
+
+	for _, minor := range minors {
+		_, mintErr := a.exec.Run(ctx, "drbdsetup", "new-current-uuid",
+			"--clear-bitmap", strconv.Itoa(int(minor)))
+		if mintErr != nil {
+			// Reconnect before bailing so a half-applied mint does not
+			// leave the resource StandAlone.
+			_ = a.run(ctx, "adjust", resource)
+
+			return minors, errors.Wrapf(mintErr,
+				"new-current-uuid --clear-bitmap %d", minor)
+		}
+	}
+
+	// Reconnect every peer; the Inconsistent peers now SyncTarget from the
+	// freshly-UpToDate local volumes.
+	err = a.run(ctx, "adjust", resource)
+	if err != nil {
+		return minors, errors.Wrapf(err, "adjust %s after mint", resource)
+	}
+
+	return minors, nil
 }
 
 // SuspendIO runs `drbdadm suspend-io <resource>` — freezes the
@@ -1372,6 +1483,425 @@ func localIsUpToDate(devices []drbdsetupStatusDevice) bool {
 	}
 
 	return true
+}
+
+// NeedsLateAddPromote probes the live kernel via `drbdsetup status
+// <res> --json` and reports whether THIS node must `primary --force`
+// to unstick a LATE-ADDED volume that wedged Inconsistent on every
+// diskful replica with no SyncSource (BUG-048, the concurrent two-VD
+// add on a ≥3-diskful RD).
+//
+// Why a separate gate from NeedsRecoveryPromote / NeedsSoloPromote:
+//   - NeedsRecoveryPromote requires the LOCAL to be already UpToDate and
+//     a PEER Inconsistent — but in this wedge the local volume is ALSO
+//     Inconsistent (no replica ever won the volume's UpToDate seed), so
+//     that predicate can never fire. It is also gated by the dispatcher's
+//     `auto-primary`, which is suppressed on an INITIALIZED RD (every
+//     late-add lands on one) so the satellite-side maybeRecoveryPromote
+//     short-circuits before even probing.
+//   - NeedsSoloPromote requires ZERO peers; here peers exist.
+//
+// SPLIT-BRAIN SAFETY (the two gates that make this distinct from a day0
+// bootstrap — without them the predicate misfired on a fresh RD's vol-0
+// and two non-lowest nodes simultaneously force-primaried into
+// split-brain):
+//
+//  1. A LATE-add wedge means the RD is PAST first activation, so at
+//     least one local volume is already UpToDate (the earlier
+//     volumes). A pure day0 bootstrap has NO UpToDate volume yet —
+//     EVERY volume is transiently Inconsistent while the normal winner
+//     election + auto-promote run. Requiring a local UpToDate sibling
+//     means this predicate can NEVER fire during day0.
+//  2. EVERY peer connection must be fully Connected with the wedged
+//     volume's peer-disk OBSERVED. The lowest-node-id election is only
+//     sound with COMPLETE peer information; at day0 t+1s peers are still
+//     StandAlone / Connecting, so each node would see a partial peer set
+//     and several could each conclude "I am lowest" → simultaneous
+//     force-primary. Deferring until every peer is connected guarantees
+//     every node computes the election over the same full set, so
+//     EXACTLY ONE (the true lowest id) promotes.
+//
+// Beyond those, returns true ONLY when ALL hold, so the force-primary is
+// data-safe + self-limiting:
+//   - the kernel slot exists and reports a my-node-id;
+//   - the local role is NOT Primary and NO peer is Primary;
+//   - at least one LOCAL diskful volume is Inconsistent, and for EVERY
+//     such volume NO connected peer exposes committed data
+//     (peer-disk UpToDate / Consistent / Outdated) — the defining wedge;
+//     a peer with data means SyncTarget instead (Bug 342 guard);
+//   - none of those wedged volumes is already being actively resynced;
+//   - this node's my-node-id is the LOWEST among the wedged volume's
+//     diskful replicas.
+//
+// Data-safety: a fresh late-added volume's metadata was seeded at the
+// deterministic day0 current-UUID on every replica (the seed path runs
+// before bring-up), so `primary --force` here mints no UNRELATED UUID;
+// the Inconsistent peers simply SyncTarget from this now-Primary source.
+// Self-limiting: once the peers reach UpToDate the predicate stops
+// holding. Conservative on any probe/parse failure → false.
+func (a *Adm) NeedsLateAddPromote(ctx context.Context, resource string) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 || status[0].NodeID == nil {
+		return false
+	}
+
+	res := status[0]
+
+	// Never disturb an existing Primary anywhere in the RD.
+	if Role(res.Role).IsPrimary() {
+		return false
+	}
+
+	for _, conn := range res.Connections {
+		if Role(conn.PeerRole).IsPrimary() {
+			return false
+		}
+	}
+
+	// Gate 1 (split-brain safety): the RD must be PAST day0 — at least one
+	// local volume already UpToDate. A pure day0 bootstrap has none, so
+	// the predicate cannot misfire there.
+	if !localHasUpToDateVolume(res.Devices) {
+		return false
+	}
+
+	// Gate 2 (split-brain safety): every peer must be fully connected so
+	// the lowest-node-id election runs over COMPLETE peer information.
+	if !allPeersConnected(res.Connections) {
+		return false
+	}
+
+	// Which local diskful volumes are wedged Inconsistent?
+	wedged := localInconsistentVolumes(res.Devices)
+	if len(wedged) == 0 {
+		return false
+	}
+
+	// For every wedged volume: no peer may hold data (else SyncTarget),
+	// none may be actively resyncing (else let it finish), and we must be
+	// the lowest node-id among its non-diskless diskful replicas.
+	for vol := range wedged {
+		ok := lateAddVolumeNeedsLocalPromote(res.Connections, vol, *res.NodeID)
+		if !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+// localHasUpToDateVolume reports whether at least one local device is
+// UpToDate — the proof that the RD is past first activation (a day0
+// bootstrap has every volume still Inconsistent). Gate 1 of the
+// split-brain-safe NeedsLateAddPromote.
+func localHasUpToDateVolume(devices []drbdsetupStatusDevice) bool {
+	for _, d := range devices {
+		if DiskState(d.DiskState) == DiskStateUpToDate {
+			return true
+		}
+	}
+
+	return false
+}
+
+// allPeersConnected reports whether EVERY peer connection is in the
+// Connected connection-state. Gate 2 of NeedsLateAddPromote: the
+// lowest-node-id promoter election is only sound with complete peer
+// information, so any StandAlone / Connecting / unconnected peer (the
+// day0 t+1s state) defers the self-heal. A resource with zero peer
+// connections is NOT covered here (that is NeedsSoloPromote's domain) —
+// returns false so the late-add gate never acts peerless.
+func allPeersConnected(conns []drbdsetupStatusConnection) bool {
+	if len(conns) == 0 {
+		return false
+	}
+
+	for _, conn := range conns {
+		if conn.ConnectionStr != "Connected" {
+			return false
+		}
+	}
+
+	return true
+}
+
+// localInconsistentVolumes returns the set of local volume numbers whose
+// disk-state is Inconsistent. A volume in any other state (UpToDate,
+// Diskless, Negotiating, …) is excluded — only a stuck-Inconsistent
+// local volume is a late-add-promote candidate.
+func localInconsistentVolumes(devices []drbdsetupStatusDevice) map[int32]struct{} {
+	out := map[int32]struct{}{}
+
+	for _, d := range devices {
+		if DiskState(d.DiskState) == DiskStateInconsistent {
+			out[d.VolumeNumber] = struct{}{}
+		}
+	}
+
+	return out
+}
+
+// lateAddVolumeNeedsLocalPromote reports whether `vol` is a genuine
+// late-add wedge that THIS node (myID) must force-primary: no connected
+// peer exposes committed data for it, no peer is actively resyncing it,
+// and myID is the lowest node-id among the volume's non-diskless diskful
+// replicas. Conservative: any peer with data, any active resync, or any
+// lower-id non-diskless peer returns false.
+func lateAddVolumeNeedsLocalPromote(conns []drbdsetupStatusConnection, vol, myID int32) bool {
+	weAreLowest := true
+
+	for _, conn := range conns {
+		for _, peerDev := range conn.PeerDevices {
+			if peerDev.VolumeNumber != vol {
+				continue
+			}
+
+			switch DiskState(peerDev.PeerDiskState) {
+			case DiskStateUpToDate, DiskStateConsistent, DiskStateOutdated:
+				// A peer holds real data — must SyncTarget from it, never
+				// force-primary (Bug 342 unrelated-data guard).
+				return false
+			case DiskStateInconsistent:
+				// A fellow wedged diskful replica. It competes for the
+				// lowest-id promoter election; if it outranks us, defer.
+				if conn.PeerNodeID < myID {
+					weAreLowest = false
+				}
+
+				if peerDeviceActivelySyncing(peerDev) {
+					// A live resync is already driving this volume — let
+					// it finish rather than churn a promote.
+					return false
+				}
+			case DiskStateAttaching, DiskStateNegotiating, DiskStateDUnknown:
+				// BUG-048 (≥3-replica double-promoter wedge): a freshly
+				// late-added volume on a LOWER-id diskful peer passes
+				// through Attaching/Negotiating/DUnknown while its kernel
+				// slot brings the new volume up — the peer has NOT yet
+				// settled to Inconsistent. The old code treated these
+				// transient states as "not a competing diskful promoter;
+				// ignore", so a HIGHER-id node observing a lower-id peer
+				// mid-bring-up wrongly concluded "I am lowest" and force-
+				// primaried. Both the higher-id node AND the true-lowest
+				// node (once it finished bring-up) then promoted, minting
+				// divergent current-UUIDs → the volume wedged PausedSyncS /
+				// StandAlone split-brain with no convergence (stand-observed
+				// on 3-diskful: node-id 1 and node-id 0 both force-primaried
+				// the same late volume). A lower-id peer in a transient
+				// bring-up state is a real diskful replica that WILL win the
+				// election, so defer to it. DUnknown is also the
+				// connection-not-fully-negotiated state of a diskful peer —
+				// deferring is the conservative, split-brain-safe choice
+				// (the next reconcile re-evaluates once the peer settles).
+				if conn.PeerNodeID < myID {
+					weAreLowest = false
+				}
+			case DiskStateDiskless, DiskStateDetaching, DiskStateFailed:
+				// Diskless witness (steady-state of a tiebreaker — never a
+				// diskful promoter, deferring to it would deadlock the
+				// promote) or a failed/detaching local-disk peer that holds
+				// no data. Not a competing diskful promoter; ignore.
+			default:
+				// Unknown/empty — ignore.
+			}
+		}
+	}
+
+	return weAreLowest
+}
+
+// LateAddResyncKickVolumes probes the live kernel via `drbdsetup status
+// <res> --json` and returns the LOCAL volume numbers whose late-add
+// resync is STALLED and recoverable by a local `drbdadm invalidate
+// <res>/<vol>` — the ≥3-replica concurrent late-add convergence wedge
+// (BUG-048). Empty slice ⇒ nothing to do.
+//
+// Why `invalidate` and not disconnect/reconnect: every replica of a
+// freshly late-added volume shares the deterministic day0 current-UUID,
+// so a connection re-handshake (disconnect+adjust/connect) reads "same
+// generation ⇒ no resync needed" and ABANDONS the dirty bitmap — leaving
+// the volume Established/Inconsistent with out-of-sync frozen, a WORSE
+// wedge. `drbdadm invalidate <res>/<vol>` instead explicitly discards the
+// (empty, non-authoritative) LOCAL copy of that one volume and forces a
+// full SyncTarget FROM an UpToDate peer — it works WITH the bitmap rather
+// than re-deriving sync direction from the ambiguous day0 GI.
+//
+// The two stand-observed wedge signatures both reduce to "a local volume
+// is below UpToDate, an UpToDate peer for it EXISTS, yet no live resync is
+// pulling it up":
+//
+//   - "partial stall": one peer reached UpToDate (a real source) but THIS
+//     replica is stuck WFBitMapT / PausedSyncT / Established with
+//     out-of-sync frozen — the source fed another peer but not us.
+//   - "dependency deadlock" (post-promote): once maybeLateAddPromote
+//     force-primaries the lowest-id node to UpToDate, the remaining
+//     Inconsistent replicas have an UpToDate peer but their resync stays
+//     paused (resync-suspended:dependency/peer) — invalidate restarts it.
+//
+// A volume qualifies ONLY when ALL hold, so the invalidate is data-safe
+// and self-limiting:
+//   - the kernel slot exists and reports a my-node-id;
+//   - NO replica anywhere (local nor any peer-role) is Primary — never
+//     invalidate a volume an application may be writing (would discard
+//     live data);
+//   - at least one local volume is already UpToDate — the RD is PAST
+//     first activation (a pure day0 bootstrap is excluded, same as
+//     NeedsLateAddPromote gate 1), so this can never fire mid-bring-up;
+//   - every peer connection is fully Connected (resync state is only
+//     authoritative over a settled connection);
+//   - the LOCAL volume is below UpToDate (Inconsistent/Outdated) — only a
+//     non-authoritative local copy is ever discarded, never an UpToDate
+//     one;
+//   - a connected PEER is UpToDate for that SAME volume — the authoritative
+//     source `invalidate` will SyncTarget from (without one, invalidate
+//     has nothing to pull and would fail; maybeLateAddPromote owns minting
+//     the source for the all-Inconsistent case);
+//   - the volume is NOT already being actively SyncTarget-pulled
+//     (replication-state SyncTarget with resync-suspended "no") — a live
+//     resync finishes on its own and must not be churned.
+//
+// Conservative on any probe/parse failure → empty. Self-limiting: once a
+// volume reaches UpToDate it no longer qualifies, so the predicate stops
+// returning it.
+func (a *Adm) LateAddResyncKickVolumes(ctx context.Context, resource string) []int32 {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return nil
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 || status[0].NodeID == nil {
+		return nil
+	}
+
+	res := status[0]
+
+	// Never invalidate a volume an application may be writing.
+	if Role(res.Role).IsPrimary() {
+		return nil
+	}
+
+	for _, conn := range res.Connections {
+		if Role(conn.PeerRole).IsPrimary() {
+			return nil
+		}
+	}
+
+	// Gate: the RD must be PAST day0 (at least one local UpToDate volume),
+	// so this can never misfire during a fresh RD's first-activation
+	// bring-up where every volume is transiently Inconsistent.
+	if !localHasUpToDateVolume(res.Devices) {
+		return nil
+	}
+
+	// Gate: every peer fully Connected — the resync-state read is only
+	// authoritative over a settled connection.
+	if !allPeersConnected(res.Connections) {
+		return nil
+	}
+
+	var kick []int32
+
+	for _, dev := range res.Devices {
+		if lateAddVolumeNeedsInvalidate(res.Connections, dev) {
+			kick = append(kick, dev.VolumeNumber)
+		}
+	}
+
+	return kick
+}
+
+// lateAddVolumeNeedsInvalidate reports whether THIS node's local `dev` is
+// a stalled late-add volume that a local `invalidate` would recover: the
+// local copy is below UpToDate (Inconsistent/Outdated), a connected peer
+// is UpToDate for the volume (the SyncTarget source), and the volume is
+// not already being actively pulled (SyncTarget/resync-suspended:no).
+func lateAddVolumeNeedsInvalidate(conns []drbdsetupStatusConnection, dev drbdsetupStatusDevice) bool {
+	// Only a genuinely-stuck Inconsistent local copy is invalidated.
+	// Outdated is DELIBERATELY excluded: after an invalidate the volume
+	// transits Inconsistent → (resync) → Outdated → UpToDate, and a fresh
+	// SyncSource peer is briefly Outdated mid-handshake. Re-invalidating an
+	// Outdated copy re-dirties a volume that is actually converging, which
+	// FLAPS the resync (stand-observed: oos drops to 0, invalidate re-fires,
+	// oos jumps back to full). Leaving Outdated alone lets the in-flight
+	// resync finish.
+	switch DiskState(dev.DiskState) {
+	case DiskStateInconsistent:
+		// Genuinely below-UpToDate and not a transient post-resync state —
+		// the invalidate candidate.
+	case DiskStateUpToDate, DiskStateConsistent, DiskStateOutdated,
+		DiskStateDiskless, DiskStateAttaching, DiskStateDetaching,
+		DiskStateFailed, DiskStateNegotiating, DiskStateDUnknown:
+		return false
+	default:
+		return false
+	}
+
+	var (
+		peerUpToDate   bool
+		activeResyncIP bool
+	)
+
+	for _, conn := range conns {
+		for _, peerDev := range conn.PeerDevices {
+			if peerDev.VolumeNumber != dev.VolumeNumber {
+				continue
+			}
+
+			if DiskState(peerDev.PeerDiskState) == DiskStateUpToDate {
+				peerUpToDate = true
+			}
+
+			// Back off if ANY peer-device on this volume has a resync
+			// actively in progress (either direction) — an invalidate now
+			// would abort/re-dirty a converging resync and flap it.
+			if peerDeviceResyncInProgress(peerDev) {
+				activeResyncIP = true
+			}
+		}
+	}
+
+	return peerUpToDate && !activeResyncIP
+}
+
+// peerDeviceResyncInProgress reports whether this peer-device has a resync
+// actively running or starting in EITHER direction — i.e. NOT stalled. A
+// volume with any such peer-device is converging on its own and must not be
+// invalidated (doing so re-dirties it and flaps the resync). True for
+// SyncSource / SyncTarget / StartingSync* and for a WFBitMap* handshake
+// that is NOT suspended (resync-suspended "no"/empty — the bitmap exchange
+// is proceeding). A WFBitMap* / PausedSync* with a non-"no" resync-suspended
+// is the STALLED wedge — that is NOT "in progress", so the kick may fire.
+func peerDeviceResyncInProgress(peerDev drbdsetupStatusPeerDevice) bool {
+	switch ReplicationState(peerDev.ReplicationState) {
+	case ReplicationStateSyncSource, ReplicationStateSyncTarget,
+		ReplicationStateStartingSyncS, ReplicationStateStartingSyncT:
+		// A resync is actively transferring data — always in progress.
+		return true
+	case ReplicationStateWFBitMapS, ReplicationStateWFBitMapT,
+		ReplicationStateWFSyncUUID:
+		// A handshake step: in progress ONLY if not suspended. A non-"no"
+		// resync-suspended (dependency/peer/user) is the stalled wedge.
+		return peerDev.ResyncSuspended == "" || peerDev.ResyncSuspended == wireNo
+	case ReplicationStateOff, ReplicationStateEstablished,
+		ReplicationStatePausedSyncS, ReplicationStatePausedSyncT,
+		ReplicationStateVerifyS, ReplicationStateVerifyT,
+		ReplicationStateAhead, ReplicationStateBehind:
+		// Established (done), explicitly paused, or non-resync states — not
+		// a resync in progress.
+		return false
+	}
+
+	return false
 }
 
 // DownVeto is the tri-state outcome of the Bug 350 kernel-truth probe

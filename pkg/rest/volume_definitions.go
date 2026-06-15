@@ -316,8 +316,18 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 
 	vd := envelope.VolumeDefinition
 
-	if !s.resolveVolumeNumber(w, r, rd, rawBody, &vd) {
-		return
+	autoNumber := !vdCreateVolumeNumberExplicit(rawBody)
+
+	// Validate the explicit number (Bug 363) before the size gate so the
+	// operator-facing rejection order is stable. The auto-number path
+	// owns the number itself (the store allocates it), so it skips this.
+	if !autoNumber {
+		nrErr := validateVolumeNumber(vd.VolumeNumber)
+		if nrErr != nil {
+			writeVDNumberRejection(w, rd, vd.VolumeNumber, nrErr)
+
+			return
+		}
 	}
 
 	// Bug 155: refuse out-of-bounds sizes at the REST boundary so the
@@ -330,25 +340,7 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = s.Store.VolumeDefinitions().Create(r.Context(), rd, &vd)
-	if err != nil {
-		// Bug 140: duplicate-VD conflict gets a typed envelope with
-		// the upstream FAIL_EXISTS_VLM_DFN sub-code plus actionable
-		// cause/correction so scripts and audit-log greppers route
-		// the same way they do for upstream's `linstor vd c` reply.
-		// The bare writeStoreError fallback emitted apiCallRcError
-		// alone — high-bit error, no sub-code, no cause/correction
-		// — which the Python CLI rendered as a generic "object
-		// already exists" line that didn't tell the operator which
-		// VlmNr to twist.
-		if errors.Is(err, store.ErrAlreadyExists) {
-			writeVDExistsConflict(w, rd, vd.VolumeNumber)
-
-			return
-		}
-
-		writeStoreError(w, err)
-
+	if !s.persistNewVolumeDefinition(w, r, rd, &vd, autoNumber) {
 		return
 	}
 
@@ -363,42 +355,58 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
-// resolveVolumeNumber folds the auto-assign + explicit-VlmNr
-// validation branches out of handleVDCreate so the parent stays under
-// the funlen threshold. Returns true on success (vd.VolumeNumber is
-// populated and within bounds) and false when an envelope was already
-// written to w (the caller must return immediately).
+// persistNewVolumeDefinition writes the new VD to the store and, on
+// failure, emits the right typed envelope. Returns true on success and
+// false when an HTTP error envelope was already written (the caller
+// must return immediately). Split out of handleVDCreate so the handler
+// stays under the funlen budget.
 //
-// Bug 191: auto-assign fires when the raw POST body does NOT carry an
-// explicit `volume_number` key — Go's int32 zero would otherwise
-// silently collide with VlmNr=0 on the second `vd c` against the
-// same RD. Bug 363: when the caller DOES specify a volume_number, it
-// must lie inside DRBD-9's addressable [0, 65535] range; out-of-bound
-// values would otherwise hang the satellite in "waiting for DRBD-ID
-// allocation" because no positive minor can be derived from them.
-func (s *Server) resolveVolumeNumber(
+// BUG-048 (P1, availability): when the operator did NOT name a
+// VolumeNumber, the allocation MUST happen atomically with the write —
+// route through CreateAutoNumbered, which picks the smallest free hole
+// INSIDE the store's conflict-retry loop. The previous flow picked the
+// number in a separate REST-side List (autoAssignVolumeNumber) BEFORE
+// the Create, so two concurrent `linstor vd c <rd>` calls both read
+// `[vol-0]`, both chose VlmNr=1, the loser was rejected FAIL_EXISTS_
+// VLM_DFN, and the operator's second intended volume silently vanished.
+// The explicit-number path keeps the plain Create (its retry loop
+// already converges correctly and a genuine duplicate must still 409).
+func (s *Server) persistNewVolumeDefinition(
 	w http.ResponseWriter,
 	r *http.Request,
 	rd string,
-	rawBody []byte,
 	vd *apiv1.VolumeDefinition,
+	autoNumber bool,
 ) bool {
-	if !vdCreateVolumeNumberExplicit(rawBody) {
-		assigned, assignErr := s.autoAssignVolumeNumber(r.Context(), rd)
-		if assignErr != nil {
-			writeStoreError(w, assignErr)
+	if autoNumber {
+		_, err := s.Store.VolumeDefinitions().CreateAutoNumbered(r.Context(), rd, vd)
+		if err != nil {
+			writeStoreError(w, err)
 
 			return false
 		}
 
-		vd.VolumeNumber = assigned
-
 		return true
 	}
 
-	nrErr := validateVolumeNumber(vd.VolumeNumber)
-	if nrErr != nil {
-		writeVDNumberRejection(w, rd, vd.VolumeNumber, nrErr)
+	err := s.Store.VolumeDefinitions().Create(r.Context(), rd, vd)
+	if err != nil {
+		// Bug 140: duplicate-VD conflict gets a typed envelope with
+		// the upstream FAIL_EXISTS_VLM_DFN sub-code plus actionable
+		// cause/correction so scripts and audit-log greppers route
+		// the same way they do for upstream's `linstor vd c` reply.
+		// The bare writeStoreError fallback emitted apiCallRcError
+		// alone — high-bit error, no sub-code, no cause/correction
+		// — which the Python CLI rendered as a generic "object
+		// already exists" line that didn't tell the operator which
+		// VlmNr to twist.
+		if errors.Is(err, store.ErrAlreadyExists) {
+			writeVDExistsConflict(w, rd, vd.VolumeNumber)
+
+			return false
+		}
+
+		writeStoreError(w, err)
 
 		return false
 	}
@@ -469,36 +477,12 @@ func rawHasNonNullKey(obj map[string]json.RawMessage, key string) bool {
 	return !bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
-// autoAssignVolumeNumber returns the smallest free non-negative
-// VolumeNumber under the given RD. Mirrors upstream LINSTOR's
-// CtrlVlmDfnCrtApiCallHandler smallest-hole rule: with VDs 0 and 2
-// present, an auto-assign POST lands at 1 — not 3.
-//
-// A missing RD surfaces here as the underlying store's ErrNotFound;
-// the caller routes it through writeStoreError so the wire shape
-// matches the pre-fix 404 path for an unknown parent RD.
-func (s *Server) autoAssignVolumeNumber(ctx context.Context, rd string) (int32, error) {
-	vds, err := s.Store.VolumeDefinitions().List(ctx, rd)
-	if err != nil {
-		return 0, err //nolint:wrapcheck // surfaced to writeStoreError
-	}
-
-	used := make(map[int32]bool, len(vds))
-	for i := range vds {
-		used[vds[i].VolumeNumber] = true
-	}
-
-	for candidate := int32(0); candidate >= 0; candidate++ {
-		if !used[candidate] {
-			return candidate, nil
-		}
-	}
-
-	// Unreachable for any sane RD (the smallest-free walk terminates
-	// at the first gap; an RD with 2^31 VDs is impossible on real
-	// storage). Pin the contract anyway.
-	return 0, errors.New("auto-assign: VolumeNumber space exhausted")
-}
+// Auto-assign of the smallest free VolumeNumber now lives in the store
+// layer (VolumeDefinitionStore.CreateAutoNumbered) so the read of the
+// existing set and the write of the new entry are atomic — see BUG-048.
+// The former REST-side autoAssignVolumeNumber helper (a separate List
+// before the Create) was removed because its TOCTOU window dropped the
+// second of two concurrent `linstor vd c` calls.
 
 // minVolumeDefinitionSizeKib is the smallest accepted size_kib on
 // `POST /v1/resource-definitions/{rd}/volume-definitions` (Bug 155).
