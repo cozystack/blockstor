@@ -2101,25 +2101,43 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// (MetadataCreated Condition / .md-created marker) rather than the
 	// OLD .res's `volume N {` block count.
 	//
-	// BUG-048 (P1, availability): the previous `.res`-count gate raced
-	// the FSM dispatch's renderResFile preamble. On a concurrent late
-	// vd-add the FSM `adjust` of an EARLIER reconcile already re-rendered
-	// `.res` to include the new volume's `volume N {` block BEFORE this
-	// gate read the file, so hasLateAddedVolume(resPath) flipped FALSE,
-	// ensurePerVolumeMetadata was SKIPPED, and the new volume came up via
-	// the kernel adjust with NO metadata + NO winner-election GI seed —
-	// Inconsistent on every replica, no SyncSource, permanently wedged
-	// (~half of concurrent two-VD adds). The on-disk metadata, not the
-	// rendered .res, is the race-free truth: ensurePerVolumeMetadata
-	// probes `drbdadm dump-md` per volume and only creates+seeds the ones
-	// that actually lack metadata (len(freshlyCreated)==0 → early return),
-	// so running it on every post-activation diskful reconcile is
-	// idempotent and converged passes pay only the cheap per-volume
-	// dump-md probe. Skipped on diskless replicas (no lower disk to
+	// BUG-048 (P1, availability): the original `.res`-count gate
+	// (hasLateAddedVolume) raced the FSM dispatch's renderResFile preamble.
+	// On a concurrent late vd-add the FSM `adjust` of an EARLIER reconcile
+	// already re-rendered `.res` to include the new volume's `volume N {`
+	// block BEFORE this gate read the file, so hasLateAddedVolume(resPath)
+	// flipped FALSE, ensurePerVolumeMetadata was SKIPPED, and the new volume
+	// came up via the kernel adjust with NO metadata + NO winner-election GI
+	// seed — Inconsistent on every replica, no SyncSource, permanently
+	// wedged (~half of concurrent two-VD adds). PR #164 widened the gate to
+	// the race-free `dr.GetMetadataCreated()` — but that fires the per-volume
+	// pass on EVERY post-activation diskful reconcile.
+	//
+	// BUG-048 RESIZE DEADLOCK (this fix): even though ensurePerVolumeMetadata
+	// only create-md's volumes that lack metadata, it still runs a per-volume
+	// `drbdadm dump-md` probe on EVERY volume first — and dump-md is an
+	// md_buffer consumer. During a `vd s` resize DRBD holds md_buffer for the
+	// whole cluster-wide size change (change_cluster_wide_device_size /
+	// drbd_determine_dev_size); a per-reconcile dump-md then perpetually
+	// loses the cluster-wide state-change arbitration, the resize never
+	// completes, md_buffer is never released, and the resource deadlocks
+	// cluster-wide, reboot-proof. The unconditional `GetMetadataCreated()`
+	// gate fired this on every reconcile of a converged/resizing RD.
+	//
+	// Narrow the gate to the race-free, deadlock-safe truth: fire the
+	// per-volume metadata pass ONLY when some DESIRED volume is NOT
+	// present-and-attached in the kernel (absent entirely, or present but
+	// Diskless / no-metadata). A volume that IS attached already has a valid
+	// DRBD-9 superblock (the kernel cannot attach a lower disk without one),
+	// so dump-md on it is pointless AND is the md_buffer consumer that
+	// contends with a resize. This still fires on a genuine late-add (the new
+	// volume is unattached → BUG-048 #164 / the pre-rendered-.res test
+	// preserved) and on a re-attach, but skips a converged steady-state and a
+	// resize-in-flight (every desired volume attached) → no dump-md → no
+	// md_buffer contention. Skipped on diskless replicas (no lower disk to
 	// stamp) and on the diskless→diskful flip path (Bug 319 owns that
 	// re-stamp).
-	if !diskless && dr.GetMetadataCreated() &&
-		!r.isDisklessToDiskfulFlip(ctx, dr, diskless) {
+	if r.shouldEnsurePerVolumeMetadata(ctx, dr, diskless) {
 		err = r.ensurePerVolumeMetadata(ctx, dr, devices, diskless)
 		if err != nil {
 			return err
@@ -2515,19 +2533,32 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 
 	// Steady-state promote self-heals — run after the firstActivation
 	// promote so a wedged replica still converges. Folded into one helper
-	// so finishDRBDApply stays under the gocyclo budget.
-	return r.maybePromoteSelfHeals(ctx, dr, diskless, autoPromote, autoPrimaryReplica)
+	// so finishDRBDApply stays under the gocyclo budget. `resized` gates the
+	// BUG-048 late-add self-heals OUT for this pass (resize-deadlock guard).
+	return r.maybePromoteSelfHeals(ctx, dr, diskless, autoPromote, autoPrimaryReplica, resized)
 }
 
-// maybePromoteSelfHeals runs the two steady-state force-primary self-heals
-// in order: the Bug 366 recovery-promote (a fresh RD whose late replica
-// wedged Inconsistent with a data-bearing peer and no Primary) and the
-// solo-promote (a lone, peerless diskful replica wedged below UpToDate
-// after a diskless→diskful toggle). Both read live kernel state and are
-// self-limiting; their predicates are mutually exclusive (recovery needs a
-// peer, solo needs none), so at most one acts per pass. Extracted from
-// finishDRBDApply to keep that function under the gocyclo budget.
-func (r *Reconciler) maybePromoteSelfHeals(ctx context.Context, dr *intent.DesiredResource, diskless, autoPromote, autoPrimaryReplica bool) error {
+// maybePromoteSelfHeals runs the steady-state force-primary / resync self-
+// heals in order: the Bug 366 recovery-promote (a fresh RD whose late replica
+// wedged Inconsistent with a data-bearing peer and no Primary), the BUG-048
+// late-add promote + resync-kick, and the solo-promote (a lone, peerless
+// diskful replica wedged below UpToDate after a diskless→diskful toggle). All
+// read live kernel state and are self-limiting. Extracted from finishDRBDApply
+// to keep that function under the gocyclo budget.
+//
+// `resizing` is true when THIS reconcile pass just issued a `drbdadm resize`
+// (pickup-time `vd s`). The BUG-048 late-add self-heals are gated OUT in that
+// case as a resize-deadlock guard: their kernel-truth probes only act on an
+// Inconsistent volume and would already veto a normal converged resize (the
+// volume stays UpToDate while only the grown region resyncs), but the
+// cluster-wide size change can transiently dip a volume below UpToDate, and
+// the heals' recovery actions (MintLateAddSource = disconnect +
+// new-current-uuid --clear-bitmap + adjust; InvalidateVolume) are exactly the
+// cluster-wide state-change / md_buffer operations that contend with DRBD's
+// in-flight change_cluster_wide_device_size and reintroduce the BUG-048
+// reboot-proof deadlock. A genuine late-add wedge is recovered on the very
+// next non-resize reconcile.
+func (r *Reconciler) maybePromoteSelfHeals(ctx context.Context, dr *intent.DesiredResource, diskless, autoPromote, autoPrimaryReplica, resizing bool) error {
 	// Bug 366 recovery-promote self-heal — re-arm the auto-primary seed
 	// when a fresh RD wedged with the late replica stuck Inconsistent and
 	// no Primary anywhere. See maybeRecoveryPromote for the full why.
@@ -2541,25 +2572,29 @@ func (r *Reconciler) maybePromoteSelfHeals(ctx context.Context, dr *intent.Desir
 	// holds data) to UpToDate. Distinct from maybeRecoveryPromote: that
 	// path needs the local already-UpToDate + the dispatcher's
 	// auto-primary, BOTH false for a late-add to an initialized RD. See
-	// maybeLateAddPromote / Adm.NeedsLateAddPromote.
-	err = r.maybeLateAddPromote(ctx, dr, diskless)
-	if err != nil {
-		return err
-	}
+	// maybeLateAddPromote / Adm.NeedsLateAddPromote. Skipped during a resize
+	// (see `resizing` note above).
+	if !resizing {
+		err = r.maybeLateAddPromote(ctx, dr, diskless)
+		if err != nil {
+			return err
+		}
 
-	// BUG-048 late-add resync-kick self-heal — unstick a late-added
-	// volume whose resync EXISTS but wedged in a paused/bitmap-exchange
-	// state that never advances (the ≥3-replica concurrent-add
-	// convergence wedge: a SyncSource is elected but its resync sits
-	// PausedSyncS/resync-suspended:dependency while partner peers wait in
-	// WFBitMapT/resync-suspended:peer, or one peer reaches UpToDate while
-	// a second stalls WFBitMapT/Outdated forever). Distinct from
-	// maybeLateAddPromote: that mints a source when NONE exists; this
-	// re-handshakes an EXISTING-but-stalled resync via disconnect+adjust.
-	// See maybeKickLateAddResync / Adm.NeedsLateAddResyncKick.
-	err = r.maybeKickLateAddResync(ctx, dr, diskless)
-	if err != nil {
-		return err
+		// BUG-048 late-add resync-kick self-heal — unstick a late-added
+		// volume whose resync EXISTS but wedged in a paused/bitmap-exchange
+		// state that never advances (the ≥3-replica concurrent-add
+		// convergence wedge: a SyncSource is elected but its resync sits
+		// PausedSyncS/resync-suspended:dependency while partner peers wait in
+		// WFBitMapT/resync-suspended:peer, or one peer reaches UpToDate while
+		// a second stalls WFBitMapT/Outdated forever). Distinct from
+		// maybeLateAddPromote: that mints a source when NONE exists; this
+		// re-handshakes an EXISTING-but-stalled resync via disconnect+adjust.
+		// See maybeKickLateAddResync / Adm.NeedsLateAddResyncKick. Skipped
+		// during a resize (see `resizing` note above).
+		err = r.maybeKickLateAddResync(ctx, dr, diskless)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Solo diskless→diskful toggle self-heal — force-promote a lone,
@@ -3293,6 +3328,62 @@ func (r *Reconciler) isDisklessToDiskfulFlip(ctx context.Context, dr *intent.Des
 	}
 
 	return disklessVol
+}
+
+// hasUnattachedDesiredVolume reports whether some DESIRED volume of dr is
+// NOT present-and-attached in the kernel — i.e. a volume that genuinely
+// still needs DRBD-9 metadata (absent from the kernel device list entirely,
+// or present but Diskless / mid-transition / no-metadata). It is the gate
+// for ensurePerVolumeMetadata's per-volume `drbdadm dump-md` + create-md +
+// winner-seed pass.
+//
+// BUG-048 resize deadlock (this fix): a volume that IS attached already has
+// a valid DRBD-9 superblock (the kernel cannot attach a lower disk without
+// one), so dump-md on it is pointless — and dump-md is an md_buffer consumer
+// that, fired on every post-activation reconcile by PR #164's
+// `GetMetadataCreated()` gate, contends with an in-flight `vd s` resize's
+// cluster-wide md_buffer hold and deadlocks the cluster reboot-proof. Firing
+// the pass ONLY when a desired volume is still unattached:
+//   - preserves BUG-048 #164: a genuine late-add volume is unattached (or
+//     comes up Diskless without metadata) → the pass fires → it gets
+//     create-md + the winner-election seed → converges;
+//   - skips a converged steady-state and a resize-in-flight (every desired
+//     volume attached, just resyncing the grown region) → no dump-md → no
+//     md_buffer contention → no deadlock.
+//
+// Conservative toward FIRING (fail-toward-correctness): AttachedVolumes
+// returns an empty set on any probe/parse failure AND when the kernel slot
+// is not loaded yet (cold start / transient down window). An empty set means
+// "nothing is known-attached", so every desired volume looks unattached and
+// the (idempotent, HasMD-gated) pass runs — exactly the pre-#164 behaviour.
+// The deadlock-relevant skip only happens once the kernel positively reports
+// every desired volume attached, which is precisely the converged/resizing
+// state where dump-md must NOT run.
+func (r *Reconciler) hasUnattachedDesiredVolume(ctx context.Context, dr *intent.DesiredResource) bool {
+	attached := r.cfg.Adm.AttachedVolumes(ctx, dr.GetName())
+
+	for _, vol := range dr.GetVolumes() {
+		if _, ok := attached[vol.GetVolumeNumber()]; !ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// shouldEnsurePerVolumeMetadata gates the per-volume create-md + winner-seed
+// pass (ensurePerVolumeMetadata). It fires only for a diskful replica of an
+// RD that is past first activation (MetadataCreated) which still has a
+// genuinely-unattached desired volume (hasUnattachedDesiredVolume — the
+// BUG-048 resize-deadlock guard that keeps the md_buffer-consuming dump-md
+// off a converged / resizing RD), excluding the diskless→diskful flip path
+// (Bug 319 owns that re-stamp). Extracted from applyDRBD so the gate's
+// reasoning lives in one place and applyDRBD stays under the gocyclo budget.
+func (r *Reconciler) shouldEnsurePerVolumeMetadata(ctx context.Context, dr *intent.DesiredResource, diskless bool) bool {
+	return !diskless &&
+		dr.GetMetadataCreated() &&
+		r.hasUnattachedDesiredVolume(ctx, dr) &&
+		!r.isDisklessToDiskfulFlip(ctx, dr, diskless)
 }
 
 // ensureMetadata is the upstream-aligned create-md entry point. It
