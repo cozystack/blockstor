@@ -324,3 +324,72 @@ func parseShowJSON(out []byte) map[string]KernelSlot {
 
 	return slots
 }
+
+// AttachedVolumes probes `drbdsetup status <res> --json` and returns the
+// set of LOCAL volume numbers that are present-and-attached in the kernel —
+// i.e. the kernel has a lower disk attached and a valid DRBD-9 metadata
+// block for them (disk-state UpToDate / Inconsistent / Consistent /
+// Outdated). A volume that is absent from the device list entirely, or
+// present but Diskless / DUnknown / mid-transition (Attaching / Detaching /
+// Failed / Negotiating), is NOT in the returned set.
+//
+// DRBD invariant exploited by the BUG-048 resize-deadlock fix: the kernel
+// CANNOT attach a lower disk without a valid metadata block, so an attached
+// volume ALREADY has metadata — there is nothing for ensurePerVolumeMetadata
+// to create-md and a `drbdadm dump-md` probe on it is pointless. That
+// dump-md is an md_buffer consumer; firing it on every post-activation
+// reconcile contends with an in-flight `vd s` resize (DRBD holds md_buffer
+// in change_cluster_wide_device_size / drbd_determine_dev_size), which is
+// the reboot-proof cluster-wide deadlock BUG-048's #164 gate widening
+// introduced. The reconciler gates the per-volume metadata pass on "some
+// DESIRED volume is NOT in this set" so the probe only fires for a genuine
+// late-add (a volume that really still needs metadata) and never on a
+// converged or resizing RD whose volumes are all attached.
+//
+// Conservative on any probe/parse failure (kernel slot absent, status
+// non-zero, malformed JSON, missing node-id) → empty set. An empty set means
+// "nothing is known-attached", so the caller treats every desired volume as
+// possibly needing metadata and runs the (idempotent) per-volume pass — the
+// fail-toward-correctness direction (the pre-BUG-048 behaviour).
+func (a *Adm) AttachedVolumes(ctx context.Context, resource string) map[int32]struct{} {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return nil
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 {
+		return nil
+	}
+
+	return attachedVolumeSet(status[0].Devices)
+}
+
+// attachedVolumeSet returns the volume numbers from `devices` whose
+// disk-state proves the lower disk is attached with a valid metadata block.
+// Split out of AttachedVolumes so unit tests can drive it from fixtures
+// without the FakeExec round-trip.
+func attachedVolumeSet(devices []drbdsetupStatusDevice) map[int32]struct{} {
+	out := map[int32]struct{}{}
+
+	for _, dev := range devices {
+		switch DiskState(dev.DiskState) {
+		case DiskStateUpToDate, DiskStateInconsistent,
+			DiskStateConsistent, DiskStateOutdated:
+			// Lower disk attached with metadata — DRBD cannot reach any of
+			// these states without a valid DRBD-9 superblock. No create-md /
+			// dump-md needed for this volume.
+			out[dev.VolumeNumber] = struct{}{}
+		case DiskStateDiskless, DiskStateAttaching, DiskStateDetaching,
+			DiskStateFailed, DiskStateNegotiating, DiskStateDUnknown:
+			// Diskless (no lower disk), or a transient / failed state where
+			// the disk is not cleanly attached: treat as still-needing the
+			// metadata pass so a genuine late-add or a re-attach is not
+			// skipped.
+		}
+	}
+
+	return out
+}

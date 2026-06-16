@@ -1,0 +1,145 @@
+name: bug048-resize
+description: |
+  BUG-048 resize deadlock (P0, availability) — a `vd s` resize on a
+  2-diskful + 1-diskless-client RD must COMPLETE; PR #164's widened
+  ensurePerVolumeMetadata gate (dr.GetMetadataCreated()) ran a per-volume
+  `drbdadm dump-md` (md_buffer consumer) plus the cluster-wide late-add
+  self-heals on EVERY post-activation reconcile. During the resize DRBD
+  holds md_buffer for the cluster-wide size change
+  (change_cluster_wide_device_size); the per-reconcile md probe + self-heals
+  perpetually lose the state-change arbitration, the resize never completes,
+  md_buffer is never released, and the resource deadlocks cluster-wide,
+  reboot-proof (forensic repro: size-change retry count 10,790 vs 2-20
+  normal, zfs-thin 2-diskful + 1-diskless-client).
+
+  Operator sequence:
+    rd c → vd c 1G → r c node1 + r c node2 (diskful) →
+    r c --drbd-diskless node3 → grow 1G→2G→3G
+
+  CLI-side contract (each grow):
+    - the grow returns 0 AND vd size reflects the new size within a bounded
+      window (with the bug it never lands — the resize wedges)
+    - every replica reconverges (all_uptodate tolerates the Diskless peer)
+    - the diskless client STAYS Diskless across the resize, never wedges
+
+  HONEST SCOPE: the full kernel md_buffer deadlock needs scale/contention to
+  escalate, so the DETERMINISTIC CI guard for this bug is the L1 unit
+  regression (pkg/satellite/reconciler_bug048_resize_deadlock_test.go, proven
+  to FAIL on the pre-fix gate). This replay is a BEST-EFFORT stand
+  reproduction — the orchestrator runs it under load; a hang/timeout here is
+  the deadlock, a clean pass is strong corroboration. The kernel-truth
+  no-StandAlone/suspended surface check lives in the L6 cli-matrix cell
+  tests/e2e/cli-matrix/bug-048-resize-deadlock-zfs-thin.sh.
+
+  If this YAML goes red, no fix in:
+    - pkg/satellite/reconciler.go (ensurePerVolumeMetadata gate /
+      maybePromoteSelfHeals resize guard)
+    - pkg/drbd/drbdsetup_show.go (AttachedVolumes)
+  may be claimed closed.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-1g
+    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 1048576
+      timeout_s: 30
+  - name: r-c-node1-diskful
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2-diskful
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-2-diskful-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      # 1G full sync to a fresh peer at ~4 MB/s on this stand => minutes.
+      timeout_s: 600
+  - name: r-c-node3-diskless
+    # node + rd are positional FIRST, then the flag — the linstor 1.27.1
+    # client parses `r c --drbd-diskless <rd> <node>` as <rd>=<node>.
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--drbd-diskless"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 120
+
+  # ---- Grow 1G → 2G (the deadlock window: cluster-wide size change under
+  #      the per-reconcile pressure PR #164 introduced) ----
+  - name: grow-2g
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "2G"]
+    expect_exit: 0
+    await:
+      # Bug => this never lands (resize wedged mid-change_cluster_wide_device_size,
+      # md_buffer never released). 180s is the deadlock discriminator, NOT a
+      # convergence target — a healthy grow lands in seconds.
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 2097152
+      timeout_s: 180
+  - name: wait-uptodate-after-2g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 600
+
+  # ---- Grow 2G → 3G (second cluster-wide size change; the bug's retry
+  #      storm compounds across successive resizes) ----
+  - name: grow-3g
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "3G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 3145728
+      timeout_s: 180
+  - name: wait-uptodate-after-3g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 600
+  - name: diskless-client-still-diskless-not-wedged
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # After both grows the diskless client is STILL Diskless — a deadlock
+      # / resize fan-out would have wedged it to Failed/Inconsistent.
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 60
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+
+invariants:
+  - no_orphans
