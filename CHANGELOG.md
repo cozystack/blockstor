@@ -4,6 +4,19 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.14 — 2026-06-17
+
+Bugfix release. Completes the BUG-048 concurrent late-volume-add fix (noted as a known issue in v0.1.13): late volume-definition adds now converge, and a kernel-DRBD resize deadlock that the first fix attempt introduced is guarded out. Validated by an independent release gate on the live Talos+QEMU stand plus a completed 24-hour ZFS-thick endurance burn-in. Primary backend focus: ZFS thick.
+
+### Fixed
+
+- **Concurrent / rapid late `vd c` no longer drops or wedges the second volume (#164, BUG-048)** — two back-to-back manual `volume-definition create` calls on an existing multi-replica resource-definition could silently drop the second volume-definition, or leave the second volume `Inconsistent` with no SyncSource. The lost-update race in auto-numbered volume-definition creation is closed (the smallest-free VolumeNumber is allocated under an optimistic-locked store write and the create is verified live against the apiserver), and the satellite seeds the late-added volume race-free and elects a deterministic SyncSource. Both the operator-CLI concurrent path and the linstor-csi single-VD path converge. Pinned at L1 + L6 cli-matrix (`multi-volume-late-vd-create`) + L7 replay (`vd-late-concurrent-no-drop`).
+- **No resize deadlock from the late-add self-heal (#168, BUG-048)** — the late-add metadata/self-heal pass added by #164 was gated to fire on every diskful reconcile, so its per-volume metadata probe and cluster-wide self-heals contended for the DRBD metadata buffer with an in-flight `vd s` resize. On the ZFS-thin 2-diskful + 1-diskless-client shape this could spiral into a never-converging cluster-wide size-change loop that held the metadata buffer indefinitely and deadlocked DRBD state changes (down / disconnect) cluster-wide — unrecoverable without a coordinated rebuild. The pass now fires only when a desired volume is genuinely not yet attached in the kernel (a race-free `drbdsetup status` check) and is skipped during an in-flight resize, removing the contention while preserving late-add convergence. Pinned at L1 (`reconciler_bug048_resize_deadlock_test`, which fails on the pre-fix gate) + L6 (`bug-048-resize-deadlock-zfs-thin`) + L7 (`bug048-resize`); validated over a 24-hour ZFS-thick burn-in with zero metadata-buffer waits.
+
+### Testing & infrastructure
+
+- **Releases are cut automatically on a version tag (#167)** — pushing a `vX.Y.Z` tag now builds and publishes the three ghcr.io images and creates the GitHub Release from the matching CHANGELOG section (pre-release tags marked accordingly; idempotent on re-run), so the Release object is no longer a manual step.
+
 ## v0.1.13 — 2026-06-15
 
 Release-gate hardening release. A full independent acceptance gate (default NO-GO, re-verify-everything against the live Talos+QEMU stand plus a completed 24-hour ZFS-thick endurance burn-in) was run against this candidate; the fixes below were mined and validated over that campaign. Primary backend focus is ZFS thick. Every fix is pinned at L1 unit and, where operator-CLI-reachable, L6 cli-matrix + L7 replay, and was exercised on the live stand.
