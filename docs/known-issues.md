@@ -290,7 +290,7 @@ Idempotency of `provider.DeleteVolume` was already guaranteed by Bug 33's contra
 
 ## Bug 50: concurrent rapid late `vd c` wedges or drops the second volume
 
-**Status**: open (campaign tracking id: BUG-048)
+**Status**: closed (#164 converge + #168 resize-deadlock guard; v0.1.14) (campaign tracking id: BUG-048)
 **Severity**: P1 (availability; NOT data-loss, NOT a node-reboot deadlock; recoverable)
 **Scenario reference**: tests/e2e/cli-matrix/multi-volume-late-vd-create.sh
 **Surfaced by**: release-gate validation campaign
@@ -317,7 +317,7 @@ Idempotency of `provider.DeleteVolume` was already guaranteed by Bug 33's contra
 2. **Bug 42** (P1, piraeus pod-CIDR drift) — blocks the iptables-mode e2e lane.
 3. **Bug 36 + 37** (P1, VD props merge) — fix together; 37 depends on 36's merge plumbing.
 4. **Bug 39 + 40** (P1, toggle-disk retry/cancel) — fix together; together they unlock Bug 34's Option B state machine.
-5. **Bug 50** (P1, concurrent late `vd c`) — serialise VolumeDefinition create on the RD and seed GI before peer attach; operator-only path, recoverable, not data-loss. A corrected fix (superseding the deferred PR #164) is tracked.
+5. **Bug 50** (FIXED in v0.1.14, #164+#168) — serialise VolumeDefinition create on the RD and seed GI before peer attach; operator-only path, recoverable, not data-loss. Closed by #164 (converge) + #168 (resize-deadlock guard).
 6. **Bug 34 Option B** (P1 follow-up) — wrap migrate-disk in the new state machine once 39/40 land.
 7. **Bug 38** (P2, cosmetic STATE_INFO on shrink) — pure UX, do last.
 8. **Bug 32** (P2, observation) — document only; no code fix needed.
