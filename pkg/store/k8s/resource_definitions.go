@@ -37,6 +37,17 @@ import (
 
 type resourceDefinitions struct {
 	c ctrlclient.Client
+
+	// apiReader is a direct, UNCACHED reader (mgr.GetAPIReader()). The
+	// cached client's Get trails a just-committed RD create by the
+	// informer watch round-trip, so a GET /v1/resource-definitions/{rd}
+	// that load-balances to a replica whose cache has not yet observed
+	// the create returns 404 while the RD already exists in the API
+	// server. linstor-csi then fails ControllerPublishVolume with a
+	// transient 404 and backs off, slowing bulk attach. On a cache
+	// NotFound we re-read live before concluding the RD is absent. nil in
+	// non-production stores (in-memory / unit) → keep the cached result.
+	apiReader ctrlclient.Reader
 }
 
 func (s *resourceDefinitions) List(ctx context.Context) ([]apiv1.ResourceDefinition, error) {
@@ -61,15 +72,18 @@ func (s *resourceDefinitions) Get(ctx context.Context, name string) (apiv1.Resou
 	var crd crdv1alpha1.ResourceDefinition
 
 	err := s.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &crd)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return apiv1.ResourceDefinition{}, errors.Wrapf(store.ErrNotFound, "resource definition %q", name)
-		}
+	if err == nil {
+		return crdToWireRD(&crd), nil
+	}
 
+	if !apierrors.IsNotFound(err) {
 		return apiv1.ResourceDefinition{}, errors.Wrapf(err, "get ResourceDefinition %q", name)
 	}
 
-	return crdToWireRD(&crd), nil
+	// Cache NotFound: re-read live before concluding the RD is absent, so a
+	// just-created RD not yet in this replica's informer cache is not
+	// reported as a spurious 404 to linstor-csi (see the apiReader doc).
+	return s.getUncached(ctx, name)
 }
 
 func (s *resourceDefinitions) Create(ctx context.Context, in *apiv1.ResourceDefinition) error {
@@ -287,6 +301,27 @@ func (s *resourceDefinitions) Delete(ctx context.Context, name string) error {
 	}
 
 	return nil
+}
+
+// getUncached resolves a cache-miss RD Get against the direct API reader.
+// nil apiReader (unit/in-memory stores) keeps the cached NotFound.
+func (s *resourceDefinitions) getUncached(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
+	if s.apiReader == nil {
+		return apiv1.ResourceDefinition{}, errors.Wrapf(store.ErrNotFound, "resource definition %q", name)
+	}
+
+	var crd crdv1alpha1.ResourceDefinition
+
+	err := s.apiReader.Get(ctx, types.NamespacedName{Name: Name(name)}, &crd)
+	if err == nil {
+		return crdToWireRD(&crd), nil
+	}
+
+	if apierrors.IsNotFound(err) {
+		return apiv1.ResourceDefinition{}, errors.Wrapf(store.ErrNotFound, "resource definition %q", name)
+	}
+
+	return apiv1.ResourceDefinition{}, errors.Wrapf(err, "get ResourceDefinition %q (uncached)", name)
 }
 
 func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
