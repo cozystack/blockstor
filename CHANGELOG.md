@@ -4,6 +4,15 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.15 — 2026-06-22
+
+Bugfix release. Two satellite/apiserver robustness fixes surfaced while validating blockstor as the cozystack storage backend (full heavy-app e2e on a 3-node Talos+QEMU stand). Primary backend focus: ZFS thin (zvol-backed).
+
+### Fixed
+
+- **Satellite waits for the backing zvol device before mkfs/attach (#170)** — on ZFS-thin, `zfs create` returns before udev has created the `/dev/zvol/...` device node, so the satellite's mkfs/attach could fire against a not-yet-present device and fail with "does not exist" on the first reconcile, leaving the volume unattached until a later retry. The satellite now polls the backing block device (`blockdev --getsize64`, with a best-effort `udevadm settle`) up to a bounded timeout before mkfs/attach, closing the zfs/udev race. Pinned at L1 (`reconciler_zvol_device_wait_test`, which fails on the pre-fix path).
+- **apiserver resolves a cache-missed resource-definition via the direct API reader (#170)** — the apiserver runs multiple replicas with no leader election, so a `GET /v1/resource-definitions/{rd}` can load-balance to a replica whose informer cache has not yet observed a just-committed RD and return a spurious 404 (surfaced by linstor-csi as `ControllerPublishVolume failed: 404`). The RD GET now falls back to the uncached API reader on a cache NotFound — mirroring the existing volume-definition cache-lag handling — so a committed-but-not-yet-cached RD is resolved instead of 404'd. Pinned at L1 (`resource_definitions_rd404_internal_test`, which fails on the pre-fix path).
+
 ## v0.1.14 — 2026-06-17
 
 Bugfix release. Completes the BUG-048 concurrent late-volume-add fix (noted as a known issue in v0.1.13): late volume-definition adds now converge, and a kernel-DRBD resize deadlock that the first fix attempt introduced is guarded out. Validated by an independent release gate on the live Talos+QEMU stand plus a completed 24-hour ZFS-thick endurance burn-in. Primary backend focus: ZFS thick.
