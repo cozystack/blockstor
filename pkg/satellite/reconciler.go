@@ -60,6 +60,13 @@ type ReconcilerConfig struct {
 	// StateDir is where `.res` files land. Required when Adm is set.
 	StateDir string
 
+	// DeviceWaitTimeout/DeviceWaitPoll bound waitForBlockDevice, which
+	// closes the zfs-create/udev race before a freshly created zvol is
+	// consumed. Zero values fall back to deviceWaitTimeoutDefault /
+	// deviceWaitPollDefault; tests shrink them to keep the wait loop fast.
+	DeviceWaitTimeout time.Duration
+	DeviceWaitPoll    time.Duration
+
 	// NodeName is this satellite's identifier; the reconciler uses it
 	// to know which Peer entries describe local vs. remote.
 	NodeName string
@@ -1510,6 +1517,24 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 		}
 
 		devices[vol.GetVolumeNumber()] = status.DevicePath
+
+		// zfs-create/udev race: `zfs create -V` returns before udev has
+		// finished creating the /dev/zvol/<pool>/<vol> symlink, so the
+		// device path reported by VolumeStatus may not exist on disk yet.
+		// The storage-only (local SC) path is the most exposed: it runs
+		// runStorageOnlyMkfs -> runAutoMkfs immediately, with no DRBD
+		// setup in between to give udev time to settle, so it raced the
+		// symlink and failed with "mkfs.ext4 ...: The file ... does not
+		// exist and no size was specified." The DRBD path can lose the
+		// same race when drbdadm attaches the backing device. Block here
+		// until the device is usable so every downstream consumer (mkfs,
+		// DRBD attach, LUKS) sees a ready node; re-queue the resource if
+		// it never appears rather than acting on a missing device.
+		err = r.waitForBlockDevice(ctx, status.DevicePath)
+		if err != nil {
+			return nil, false, false, errors.Wrapf(err,
+				"wait for backing device %s/%d", dr.GetName(), vol.GetVolumeNumber())
+		}
 	}
 
 	if len(dr.GetVolumes()) > 0 {
@@ -1517,6 +1542,65 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	}
 
 	return devices, resized, cloned, nil
+}
+
+// deviceWaitTimeoutDefault/deviceWaitPollDefault back the same-named
+// ReconcilerConfig knobs when those are left zero (the production path).
+const (
+	deviceWaitTimeoutDefault = 60 * time.Second
+	deviceWaitPollDefault    = 500 * time.Millisecond
+)
+
+// waitForBlockDevice blocks until `device` is a usable block device or the
+// bounded deadline elapses. It exists to close the zfs-create/udev race
+// described at the applyStorage call site: after `zfs create -V` the
+// /dev/zvol/<pool>/<vol> symlink is created asynchronously by udev, and
+// callers that consume the path immediately (notably the storage-only mkfs
+// path) would otherwise act on a node that does not exist yet.
+//
+// `blockdev --getsize64` is the authoritative readiness probe — it opens
+// the device and so errors on a missing or dangling node. Best-effort
+// `udevadm settle` between attempts nudges udev to drain its event queue;
+// it is intentionally ignored on error (it may be absent in unit tests or
+// already idle). An empty device path (diskless replica) or a nil Exec is
+// a no-op. On timeout it returns an error so the caller re-queues the
+// resource instead of mkfs-ing / attaching a path that is not there.
+func (r *Reconciler) waitForBlockDevice(ctx context.Context, device string) error {
+	if device == "" || r.cfg.Exec == nil {
+		return nil
+	}
+
+	timeout := r.cfg.DeviceWaitTimeout
+	if timeout <= 0 {
+		timeout = deviceWaitTimeoutDefault
+	}
+
+	poll := r.cfg.DeviceWaitPoll
+	if poll <= 0 {
+		poll = deviceWaitPollDefault
+	}
+
+	deadline := time.Now().Add(timeout)
+
+	for {
+		_, err := r.cfg.Exec.Run(ctx, "blockdev", "--getsize64", device)
+		if err == nil {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return errors.Errorf("block device %s did not appear within %s "+
+				"(zfs create -> udev /dev/zvol symlink race)", device, timeout)
+		}
+
+		_, _ = r.cfg.Exec.Run(ctx, "udevadm", "settle", "--timeout=5")
+
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "wait for block device")
+		case <-time.After(poll):
+		}
+	}
 }
 
 // materializeVolume picks the right provider call: clone from a
