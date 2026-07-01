@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -338,25 +339,44 @@ func (r *AutoSnapshotRunnable) createAutoSnapshot(
 // uncreated snapshot (bumped without snapshot). The Snapshot CRD is
 // the source of truth so id-only inconsistency is recoverable on
 // retry.
+// The rd argument comes from Tick's List and is stale by the time we
+// write: the Snapshot create right before this wakes reconcilers that
+// update the RD concurrently, so a bare Update on the listed object
+// 409s (observed deterministically in the L-integration stack). The
+// stamp re-reads the RD fresh and retries the conflict away — losing
+// the stamp is worse than the extra read: the next tick re-derives
+// the SAME id and only createAutoSnapshot's AlreadyExists guard keeps
+// the loop idempotent.
 func (r *AutoSnapshotRunnable) stampRDAfterCreate(
 	ctx context.Context,
 	rd *blockstoriov1alpha1.ResourceDefinition,
 	nextID int64,
 	now time.Time,
 ) error {
-	if rd.Spec.Props == nil {
-		rd.Spec.Props = make(map[string]string)
-	}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh blockstoriov1alpha1.ResourceDefinition
 
-	rd.Spec.Props[PropAutoSnapshotNextID] = strconv.FormatInt(nextID, 10)
+		getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(rd), &fresh)
+		if getErr != nil {
+			// Bare error: RetryOnConflict matches on the apierrors type.
+			return getErr
+		}
 
-	if rd.Annotations == nil {
-		rd.Annotations = make(map[string]string)
-	}
+		if fresh.Spec.Props == nil {
+			fresh.Spec.Props = make(map[string]string)
+		}
 
-	rd.Annotations[AnnotationAutoSnapshotLastAt] = now.UTC().Format(time.RFC3339Nano)
+		fresh.Spec.Props[PropAutoSnapshotNextID] = strconv.FormatInt(nextID, 10)
 
-	err := r.Client.Update(ctx, rd)
+		if fresh.Annotations == nil {
+			fresh.Annotations = make(map[string]string)
+		}
+
+		fresh.Annotations[AnnotationAutoSnapshotLastAt] = now.UTC().Format(time.RFC3339Nano)
+
+		// Bare error: RetryOnConflict matches on the apierrors type.
+		return r.Client.Update(ctx, &fresh)
+	})
 	if err != nil {
 		return errors.Wrap(err, "update RD")
 	}
