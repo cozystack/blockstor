@@ -22,6 +22,7 @@ package harness
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -35,12 +36,15 @@ import (
 // elapses. Fails the test via t.Fatalf on timeout. The default
 // poll interval is 100ms — short enough that a 30s budget gives
 // 300 attempts, long enough that the apiserver isn't hammered.
+//
+// The budget is stretched by scaledTimeout on CI — see its comment.
 func Eventually(t *testing.T, timeout time.Duration, predicate func() bool, msg string) {
 	t.Helper()
 
 	const pollInterval = 100 * time.Millisecond
 
-	deadline := time.Now().Add(timeout)
+	effective := scaledTimeout(timeout)
+	deadline := time.Now().Add(effective)
 
 	for {
 		if predicate() {
@@ -48,11 +52,30 @@ func Eventually(t *testing.T, timeout time.Duration, predicate func() bool, msg 
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("Eventually timed out after %s: %s", timeout, msg)
+			t.Fatalf("Eventually timed out after %s: %s", effective, msg)
 		}
 
 		time.Sleep(pollInterval)
 	}
+}
+
+// scaledTimeout stretches every Eventually budget on CI. The per-group
+// convergence constants (30s) were tuned on dev machines; GitHub-hosted
+// runners under a full suite run are several times slower, so a random
+// group blows its budget and the Integration lane rotate-flakes
+// (GroupI's ResourceConnectionPathCreate one run, GroupJ's
+// CSICreateVolumeFromEmpty the next). Eventually carries only
+// positive-convergence asserts — it returns the moment the predicate
+// passes — so green runs pay nothing for the stretch; only genuinely
+// failing runs report slower, still capped by the job-level -timeout.
+func scaledTimeout(timeout time.Duration) time.Duration {
+	const ciScale = 3
+
+	if os.Getenv("CI") == "" {
+		return timeout
+	}
+
+	return timeout * ciScale
 }
 
 // MustList returns the .Items slice of the given list-type. The
