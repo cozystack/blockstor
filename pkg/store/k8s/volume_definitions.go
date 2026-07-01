@@ -72,13 +72,27 @@ func (s *volumeDefinitions) List(ctx context.Context, rdName string) ([]apiv1.Vo
 
 func (s *volumeDefinitions) Get(ctx context.Context, rdName string, volumeNumber int32) (apiv1.VolumeDefinition, error) {
 	rd, err := s.fetchRD(ctx, rdName)
-	if err != nil {
+	if err == nil {
+		if vd := vdByNumber(rd, volumeNumber); vd != nil {
+			return crdToWireVD(vd), nil
+		}
+	} else if !errors.Is(err, store.ErrNotFound) || s.apiReader == nil {
 		return apiv1.VolumeDefinition{}, err
 	}
 
-	for i := range rd.Spec.VolumeDefinitions {
-		if rd.Spec.VolumeDefinitions[i].VolumeNumber == volumeNumber {
-			return crdToWireVD(&rd.Spec.VolumeDefinitions[i]), nil
+	// Cache miss — or a STALE cached RD revision: volume-definitions are
+	// embedded in the RD spec, so a lagging replica's cache can hold the
+	// RD while still missing a just-committed VD (observed live as
+	// `GET .../volume-definitions/0 -> 404` on the cozystack e2e stand).
+	// One live re-read before concluding 404.
+	if s.apiReader != nil {
+		rd, err = s.fetchRDLive(ctx, rdName)
+		if err != nil {
+			return apiv1.VolumeDefinition{}, err
+		}
+
+		if vd := vdByNumber(rd, volumeNumber); vd != nil {
+			return crdToWireVD(vd), nil
 		}
 	}
 
@@ -440,4 +454,16 @@ func wireToCRDVD(vd *apiv1.VolumeDefinition) crdv1alpha1.ResourceDefinitionVolum
 		Props:        vd.Props,
 		Flags:        vd.Flags,
 	}
+}
+
+// vdByNumber returns the embedded volume-definition with the given
+// VolumeNumber, or nil when the RD spec does not carry it.
+func vdByNumber(rd *crdv1alpha1.ResourceDefinition, volumeNumber int32) *crdv1alpha1.ResourceDefinitionVolume {
+	for i := range rd.Spec.VolumeDefinitions {
+		if rd.Spec.VolumeDefinitions[i].VolumeNumber == volumeNumber {
+			return &rd.Spec.VolumeDefinitions[i]
+		}
+	}
+
+	return nil
 }
