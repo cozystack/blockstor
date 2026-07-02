@@ -4,6 +4,19 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.16 — 2026-07-02
+
+Bugfix release. Production-readiness hardening pass over v0.1.15: a multi-replica read-consistency alignment in the apiserver, an auto-snapshot bookkeeping race fix, and an Integration-lane reliability fix surfaced while re-validating the release on CI.
+
+### Fixed
+
+- **apiserver answers VD GETs consistently with RD GETs on a lagging replica (#172)** — volume-definitions are embedded in the RD CRD spec, so after the v0.1.15 RD-404 fix the same committed RD answered differently by path on a multi-replica apiserver: `GET /v1/resource-definitions/{rd}` resolved through the RD store's uncached fallback while `GET .../volume-definitions/{vn}` read only the lagging informer cache and returned a spurious 404 (observed live on the cozystack e2e stand with the REST cache-retry budget exhausted). `volumeDefinitions.Get` now does one live re-read on a cache miss or a stale cached RD revision, mirroring the RD path. The uncached fallback is deliberately NOT extended to other stores — raw store Gets stay cache-only (REST existence probes and read-your-writes flows depend on it; `get*WithCacheRetry` absorbs cross-replica lag at the REST layer), and `NewWithAPIReader`'s doc now pins that boundary. Pinned at L1 (`store_cache_miss_fallback_internal_test`, which fails on the pre-fix path).
+- **auto-snapshot tick no longer loses its RD bookkeeping to a reconciler race (#173)** — the RD object the tick stamps (`NextAutoId` + last-at annotation) came from Tick's List, and the Snapshot create right before the stamp wakes reconcilers that update the RD concurrently, so the stamp's bare Update landed on a stale resourceVersion and 409'd; Tick swallows per-RD errors, so the bookkeeping was silently dropped and the next tick re-derived the SAME id every interval (only the create's AlreadyExists guard kept the loop idempotent). The stamp now re-reads the RD fresh inside `RetryOnConflict`. Pinned at L1 (`autosnapshot_stamp_conflict_test`, which fails on the pre-fix path) and at L-integration (`TestGroupG/AutoSnapshotPeriodicTick`, red 3/3 → green 3/3).
+
+### Testing & infrastructure
+
+- **Integration lane no longer rotate-flakes on loaded CI runners (#173)** — the per-group 30s convergence budgets were tuned on dev machines; GitHub-hosted runners under a full suite run are several times slower, so a random group blew its budget each run (GroupI one run, GroupJ the next). `harness.Eventually` budgets are now scaled ×3 on CI; green runs pay nothing (Eventually returns the moment the predicate passes).
+
 ## v0.1.15 — 2026-06-22
 
 Bugfix release. Two satellite/apiserver robustness fixes surfaced while validating blockstor as the cozystack storage backend (full heavy-app e2e on a 3-node Talos+QEMU stand). Primary backend focus: ZFS thin (zvol-backed).
