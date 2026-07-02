@@ -71,9 +71,22 @@ func New(c ctrlclient.Client) *Store {
 // BUG-048 atomic VolumeNumber allocation, where retrying an optimistic-
 // lock conflict against a stale informer cache re-derives the SAME
 // number and the create-loop never converges (the second of two
-// concurrent `vd c` is dropped). Pass mgr.GetAPIReader() in production;
-// nil is accepted and every path falls back to the cached client
-// (in-memory / unit harnesses that have no informer).
+// concurrent `vd c` is dropped), and the RD/VD GET cache-miss fallback
+// (a multi-replica apiserver GET can land on a replica whose cache has
+// not observed a just-committed RD yet; VDs are embedded in the RD, so
+// both paths must answer consistently). Pass mgr.GetAPIReader() in
+// production; nil is accepted and every path falls back to the cached
+// client (in-memory / unit harnesses that have no informer).
+//
+// Do NOT extend the uncached fallback to the other stores' Gets: raw
+// store Gets are cache-only by design. REST existence probes rely on a
+// fast cached NotFound, and cross-replica lag on read endpoints is
+// absorbed at the REST layer by get*WithCacheRetry, which POLLS the
+// cached read so subsequent cached Lists stay read-your-writes
+// coherent. A store-level fallback short-circuits that convergence
+// wait (a CI snapshot-pagination regression demonstrated this when it
+// was tried: the create flow's read-back resolved uncached while the
+// cached List still under-reported).
 func NewWithAPIReader(c ctrlclient.Client, apiReader ctrlclient.Reader) *Store {
 	s := &Store{c: c}
 	s.nodes = &nodes{c: c}
