@@ -1,0 +1,158 @@
+name: vd-modify-preserves-drbd-minor
+description: |
+  Bug 433 (P2 correctness+availability) — a LEGAL, in-bounds VD-scoped
+  modify (`vd set-size` grow or `vd set-property`) must NOT change the
+  per-volume DRBDMinor, the /dev/drbd<N> device identity.
+
+  The pre-fix store round-trips the inline VolumeDefinition through
+  wireToCRDVD on the VD-scoped write paths (Update /
+  PatchVolumeDefinitionSpec); the wire shape apiv1.VolumeDefinition has no
+  DRBDMinor, so the round-trip zeroed it. In isolation the allocator
+  re-picks the same value (self-heals), but once a LOWER minor has been
+  freed by routine RD churn the controller's allocate-if-nil pass hands
+  the resized volume that lower minor instead — a permanent
+  device-identity change on a live volume, driven purely by a resize.
+
+  This replay reproduces the divergence at the operator-CLI level:
+    - rd-a grabs the lowest minor (20000), rd-b the next (20001);
+    - rd-a is deleted, freeing 20000;
+    - a legal grow AND a legal set-property are issued on rd-b vol0;
+    - rd-b's DRBDMinor must stay 20001 throughout (pre-fix it flips to
+      20000). The drbd_minor await with hold_s is the catcher.
+
+  NOTE: the expected minors (20000 / 20001) assume a stand whose DRBD
+  minor range floor ([20000, 65535]) is free at the start. On a dirty
+  stand, adjust the two `expected` values to the minors rd-a / rd-b
+  actually receive (steps confirm-rd-a-minor / confirm-rd-b-minor read
+  them). The invariant under test — rd-b's minor is UNCHANGED across the
+  modify — holds regardless of the absolute value.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  # ---- rd-a grabs the lowest minor (20000) ----
+  - name: create-rd-a
+    cmd: ["resource-definition", "create", "{{rd}}-a"]
+    expect_exit: 0
+  - name: create-vd-a-1g
+    cmd: ["volume-definition", "create", "{{rd}}-a", "1G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}-a"
+      vol: 0
+      expected_kib: 1048576
+      timeout_s: 30
+  - name: place-rd-a
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}-a", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}-a"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 240
+  - name: confirm-rd-a-minor
+    cmd: ["volume-definition", "list", "--resource-definitions", "{{rd}}-a"]
+    expect_exit: 0
+    await:
+      kind: drbd_minor
+      rd: "{{rd}}-a"
+      vol: 0
+      expected: 20000
+      timeout_s: 60
+
+  # ---- rd-b grabs the next minor (20001) — its stable identity ----
+  - name: create-rd-b
+    cmd: ["resource-definition", "create", "{{rd}}-b"]
+    expect_exit: 0
+  - name: create-vd-b-1g
+    cmd: ["volume-definition", "create", "{{rd}}-b", "1G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}-b"
+      vol: 0
+      expected_kib: 1048576
+      timeout_s: 30
+  - name: place-rd-b
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}-b", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}-b"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 240
+  - name: confirm-rd-b-minor
+    cmd: ["volume-definition", "list", "--resource-definitions", "{{rd}}-b"]
+    expect_exit: 0
+    await:
+      kind: drbd_minor
+      rd: "{{rd}}-b"
+      vol: 0
+      expected: 20001
+      timeout_s: 60
+
+  # ---- free the lower minor (20000) via rd-a delete ----
+  - name: delete-rd-a-frees-lower-minor
+    cmd: ["resource-definition", "delete", "{{rd}}-a"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}-a"
+      timeout_s: 60
+
+  # ---- legal grow on rd-b vol0: minor MUST stay 20001 ----
+  - name: grow-rd-b-2g
+    cmd: ["volume-definition", "set-size", "{{rd}}-b", "0", "2G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}-b"
+      vol: 0
+      expected_kib: 2097152
+      timeout_s: 60
+  - name: minor-stable-after-grow
+    cmd: ["volume-definition", "list", "--resource-definitions", "{{rd}}-b"]
+    expect_exit: 0
+    await:
+      kind: drbd_minor
+      rd: "{{rd}}-b"
+      vol: 0
+      expected: 20001
+      hold_s: 6
+      timeout_s: 60
+
+  # ---- legal set-property on rd-b vol0: minor MUST stay 20001 ----
+  - name: set-property-rd-b
+    cmd: ["volume-definition", "set-property", "{{rd}}-b", "0", "Aux/bug433-probe", "x"]
+    expect_exit: 0
+  - name: minor-stable-after-set-property
+    cmd: ["volume-definition", "list", "--resource-definitions", "{{rd}}-b"]
+    expect_exit: 0
+    await:
+      kind: drbd_minor
+      rd: "{{rd}}-b"
+      vol: 0
+      expected: 20001
+      hold_s: 6
+      timeout_s: 60
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}-b"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}-b"
+      timeout_s: 60
+  - cmd: ["resource-definition", "delete", "{{rd}}-a"]
+    expect_exit: [0, 1, 10]
+
+invariants:
+  - no_orphans

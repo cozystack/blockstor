@@ -603,6 +603,35 @@ except Exception:
     print(0)" "$vol" 2>/dev/null || echo 0)
             [[ "$actual" == "$expected" ]]
             ;;
+        drbd_minor)
+            # Bug 433: assert the per-volume DRBDMinor — the /dev/drbd<N>
+            # device identity — on RD.Spec.VolumeDefinitions[<vol>] equals
+            # `expected`. A VD-scoped modify (`vd set-size` / `vd
+            # set-property`) must NOT change it; the pre-fix wire round-trip
+            # dropped the minor and, once a lower minor was freed by routine
+            # RD churn, the allocator re-stamped a DIFFERENT one — a
+            # permanent device-identity change on a live volume. Pair with
+            # hold_s so a transient nil→re-heal can't be mistaken for
+            # stability; an unset minor reads as "".
+            local rd vol expected actual
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            vol=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('vol',0))" "$spec")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")
+            actual=$(kubectl get resourcedefinition "$rd" -o json 2>/dev/null \
+                | python3 -c "import json,sys
+try:
+    target=int(sys.argv[1])
+    d=json.load(sys.stdin)
+    for v in (d.get('spec', {}).get('volumeDefinitions') or []):
+        if v.get('volumeNumber', -1) == target:
+            m=v.get('drbdMinor')
+            print('' if m is None else m)
+            sys.exit(0)
+    print('')
+except Exception:
+    print('')" "$vol" 2>/dev/null || echo "")
+            [[ "$actual" == "$expected" ]]
+            ;;
         vd_count)
             # BUG-048: assert the RD carries EXACTLY `expected`
             # VolumeDefinitions. A concurrent-auto-assign lost-update
