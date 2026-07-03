@@ -177,6 +177,36 @@ func TestVDPutAtBoundsAccepted(t *testing.T) {
 	})
 }
 
+// TestVDPutInBoundsForceShrinkStillWorks: a legitimate in-bounds
+// force-shrink (1 GiB → 8 MiB, well above the 4 MiB floor) must still
+// land 200 and persist. The bounds gate must not regress the
+// scenario-4.W13 force-shrink path linstor-csi drives after a
+// `resize2fs -s` on the consumer — `force` still clears the shrink-
+// direction gate, and the in-bounds size passes the new floor/ceiling.
+func TestVDPutInBoundsForceShrinkStillWorks(t *testing.T) {
+	st := store.NewInMemory()
+	seedRDWithVD(t, st, "r4-inbounds-shrink-rd", 1024*1024) // 1 GiB
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	newSize := int64(8 * 1024) // 8 MiB, comfortably in-bounds
+	body, err := json.Marshal(volumeDefinitionModifyBody{SizeKib: &newSize, Force: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/resource-definitions/r4-inbounds-shrink-rd/volume-definitions/0", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		rb, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got %d, want 200 (in-bounds force-shrink must still land); body=%s", resp.StatusCode, rb)
+	}
+
+	assertVDSize(t, st, "r4-inbounds-shrink-rd", newSize)
+}
+
 // assertVDSizeRejectionEnvelope pins that a rejected resize returns the
 // single-entry LINSTOR envelope with the FAIL_INVLD_VLM_SIZE sub-code
 // (create-path parity) and a message naming the specific bound.
