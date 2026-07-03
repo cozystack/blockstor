@@ -68,8 +68,17 @@ func Eventually(t *testing.T, timeout time.Duration, predicate func() bool, msg 
 // positive-convergence asserts — it returns the moment the predicate
 // passes — so green runs pay nothing for the stretch; only genuinely
 // failing runs report slower, still capped by the job-level -timeout.
+//
+// ×3 (90s) still wasn't enough headroom for the heaviest autoplace-
+// convergence cases under full-suite CI contention: GroupFR's
+// ToggleDiskful2DisklessReapsTieBreaker and GroupJ's
+// CSICreateVolumeFromEmpty both timed out at exactly 90s on a loaded
+// runner while completing in ~8s locally — starvation, not a hang. The
+// scale is ×5 (150s) to give the placer/mock-satellite reconcile loop
+// more wall-clock under contention. A genuinely stuck test still fails
+// the job at the -timeout=15m ceiling, and green runs still pay nothing.
 func scaledTimeout(timeout time.Duration) time.Duration {
-	const ciScale = 3
+	const ciScale = 5
 
 	if os.Getenv("CI") == "" {
 		return timeout

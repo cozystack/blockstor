@@ -28,12 +28,15 @@ import (
 // TestScaledTimeoutStretchesOnCI pins the CI budget stretch: the
 // per-group convergence constants are tuned for dev machines, and the
 // Integration lane rotate-flaked on GitHub runners until Eventually
-// budgets were scaled there (GroupI / GroupJ 30s timeouts).
+// budgets were scaled there (GroupI / GroupJ 30s timeouts). The scale
+// is ×5 (30s → 150s): ×3 (90s) still rotate-flaked the heaviest
+// autoplace-convergence cases (GroupFR / GroupJ) under full-suite
+// contention while they complete in ~8s locally.
 func TestScaledTimeoutStretchesOnCI(t *testing.T) {
 	t.Setenv("CI", "true")
 
-	if got := scaledTimeout(30 * time.Second); got != 90*time.Second {
-		t.Fatalf("scaledTimeout on CI: got %s, want 90s", got)
+	if got := scaledTimeout(30 * time.Second); got != 150*time.Second {
+		t.Fatalf("scaledTimeout on CI: got %s, want 150s", got)
 	}
 
 	t.Setenv("CI", "")
