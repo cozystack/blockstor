@@ -271,7 +271,9 @@ func (s *volumeDefinitions) Update(ctx context.Context, rdName string, vd *apiv1
 			return errors.Wrapf(store.ErrNotFound, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
 		}
 
-		rd.Spec.VolumeDefinitions[idx] = wireToCRDVD(vd)
+		// Bug 433: carry the operator-only DRBDMinor across the wire
+		// rebuild so a routine REST modify can't wipe the device identity.
+		rd.Spec.VolumeDefinitions[idx] = wireToCRDVDPreserving(&rd.Spec.VolumeDefinitions[idx], vd)
 
 		return s.c.Update(ctx, rd)
 	}), "update RD %q for volume %d", rdName, vd.VolumeNumber)
@@ -321,8 +323,10 @@ func (s *volumeDefinitions) PatchVolumeDefinitionSpec(ctx context.Context, rdNam
 		}
 
 		// Re-derive the inline CRD entry from the mutated wire value
-		// and write it back into the parent RD's slice.
-		rd.Spec.VolumeDefinitions[idx] = wireToCRDVD(&wire)
+		// and write it back into the parent RD's slice. Bug 433: the
+		// wire shape has no DRBDMinor, so carry the operator-only device
+		// identity across the rebuild instead of zeroing it.
+		rd.Spec.VolumeDefinitions[idx] = wireToCRDVDPreserving(&rd.Spec.VolumeDefinitions[idx], &wire)
 
 		return s.c.Patch(ctx, rd, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
 	}), "patch RD %q for volume %d", rdName, volumeNumber)
@@ -454,6 +458,34 @@ func wireToCRDVD(vd *apiv1.VolumeDefinition) crdv1alpha1.ResourceDefinitionVolum
 		Props:        vd.Props,
 		Flags:        vd.Flags,
 	}
+}
+
+// wireToCRDVDPreserving re-derives the inline CRD VolumeDefinition entry
+// from a mutated wire value while carrying across the CRD-only typed
+// fields that have NO counterpart on the wire shape.
+//
+// Today that is the per-volume DRBDMinor — the /dev/drbd<N> device
+// identity, which apiv1.VolumeDefinition does not carry (it transcodes
+// only VolumeNumber/SizeKib/Props/Flags). A naive wireToCRDVD round-trip
+// therefore zeroes the minor. Per the CRD contract a non-nil minor is
+// authoritative and "is NEVER overwritten … the store-side
+// VolumeDefinitions carry-across preserves the value through a REST
+// modify" (api/v1alpha1/resourcedefinition_types.go). Both VD-scoped
+// write paths (volumeDefinitions.Update, PatchVolumeDefinitionSpec) MUST
+// route their write-back through this helper so a legal `vd set-size` /
+// `vd set-property` cannot silently change the DRBD device identity of a
+// live volume.
+//
+// Bug 433 — the same wire-rebuild-drops-operator-only-field class as the
+// carry-across family (Bug 206 RD.VolumeDefinitions, Bug 208 Node ranges,
+// Bug 209 RD.Encryption). The RD-scoped path preserves the whole
+// VolumeDefinitions slice wholesale (so DRBDMinor rode along for free),
+// which is why only the VD-scoped element rebuild dropped it.
+func wireToCRDVDPreserving(prev *crdv1alpha1.ResourceDefinitionVolume, wire *apiv1.VolumeDefinition) crdv1alpha1.ResourceDefinitionVolume {
+	out := wireToCRDVD(wire)
+	out.DRBDMinor = prev.DRBDMinor
+
+	return out
 }
 
 // vdByNumber returns the embedded volume-definition with the given
