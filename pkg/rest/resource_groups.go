@@ -215,11 +215,12 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	// PUT's contribution.
 	var rebalanceScheduled bool
 
-	// Bug 367 / 361: refuse negative or absurdly-large place_count
-	// on the patch body BEFORE we hand it to PatchResourceGroup. See
-	// rgUpdatePlaceCountGate — keeps the wire-validation rule out of
-	// the store error path and the handler under the funlen budget.
-	gateErr := rgUpdatePlaceCountGate(raw, &patch)
+	// Bug 367 / 361 + Bug 434: refuse a negative/absurd place_count OR an
+	// invalid select_filter.layer_stack on the patch body BEFORE we hand
+	// it to PatchResourceGroup. See rgUpdateWireGate — keeps the
+	// wire-validation rules out of the store error path and the handler
+	// under the funlen budget.
+	gateErr := rgUpdateWireGate(raw, &patch)
 	if gateErr != nil {
 		writeError(w, http.StatusBadRequest, gateErr.Error())
 
@@ -895,8 +896,9 @@ func rgDeleteRefusedMessage(name string, count int) string {
 // allocates against an absurd target.
 const rgPlaceCountSanityCeiling = 1_000_000
 
-// rgUpdatePlaceCountGate runs the Bug 367 / 361 wire-validation
-// rule on the PUT patch body BEFORE PatchResourceGroup sees it.
+// rgUpdateWireGate runs the PUT patch body's wire-validation rules
+// (Bug 367 / 361 place_count + Bug 434 layer_stack) BEFORE
+// PatchResourceGroup sees it.
 //
 // Extracted from handleRGUpdate to keep the handler under the funlen
 // budget; the split tracks the natural "validate → patch → persist"
@@ -910,7 +912,7 @@ const rgPlaceCountSanityCeiling = 1_000_000
 // validator's actionable message; routing the error through the
 // PatchResourceGroup callback would demote it to a 500 (writeStoreError
 // has no band for "bad request").
-func rgUpdatePlaceCountGate(raw []byte, patch *apiv1.ResourceGroup) error {
+func rgUpdateWireGate(raw []byte, patch *apiv1.ResourceGroup) error {
 	mentioned := rgSelectFilterKeys(raw)
 	if _, ok := mentioned["place_count"]; ok {
 		err := validateRGSelectFilterPlaceCount(patch.SelectFilter.PlaceCount, 0)
@@ -921,6 +923,20 @@ func rgUpdatePlaceCountGate(raw []byte, patch *apiv1.ResourceGroup) error {
 
 	if _, ok := mentioned["additional_place_count"]; ok {
 		err := validateRGSelectFilterPlaceCount(0, patch.SelectFilter.AdditionalPlaceCount)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Bug 434: `rg modify` must reject an invalid select_filter.layer_stack
+	// with the same 400 the create path (handleRGCreate) returns, instead
+	// of storing it unvalidated for a child RD to inherit
+	// (handleRDCreate → inheritLayerStackFromRG). Validate exactly the
+	// value mergeRGSelectFilterLists would persist (patch.LayerStack !=
+	// nil); a nil/empty stack is the legitimate "clear to default" and
+	// validateLayerStack accepts it.
+	if patch.SelectFilter.LayerStack != nil {
+		err := validateLayerStack(patch.SelectFilter.LayerStack)
 		if err != nil {
 			return err
 		}
