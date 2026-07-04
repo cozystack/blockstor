@@ -72,6 +72,10 @@
 #   - resource_absent      wait until r d takes effect on a node
 #   - rd_absent            wait until rd is gone everywhere
 #   - vd_size_kib          VolumeDefinition.size_kib equals expected_kib
+#   - drbd_minor           RD.Spec.VolumeDefinitions[vol].drbdMinor equals
+#                          `expected` — the /dev/drbd<N> device identity is
+#                          stable across a VD-scoped modify (Bug 433); pair
+#                          with hold_s (an unset minor reads as "")
 #   - vd_count             RD carries EXACTLY `expected` VolumeDefinitions
 #                          (BUG-048 concurrent-add lost-update catcher)
 #   - pvc_capacity         PVC.Status.Capacity.storage matches expected

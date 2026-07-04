@@ -247,6 +247,31 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 		},
 		mustCarryAcross: map[string]bool{},
 	},
+	"ResourceDefinitionVolume": {
+		// Not a Spec: the inline element-shape of
+		// ResourceDefinitionSpec.VolumeDefinitions, rebuilt per-element by
+		// wireToCRDVD (wire shape apiv1.VolumeDefinition) on the VD-scoped
+		// Update / PatchVolumeDefinitionSpec paths.
+		kind: "ResourceDefinitionVolume element (pkg/store/k8s/volume_definitions.go::wireToCRDVD / wireToCRDVDPreserving; wire shape apiv1.VolumeDefinition)",
+		wireDerived: map[string]bool{
+			"VolumeNumber": true,
+			"SizeKib":      true,
+			"Props":        true,
+			"Flags":        true,
+		},
+		mustCarryAcross: map[string]bool{
+			// Bug 433: the per-volume DRBDMinor is the /dev/drbd<N>
+			// device identity and has NO counterpart on
+			// apiv1.VolumeDefinition. The RD-scoped write preserves the
+			// whole VolumeDefinitions slice wholesale (so the minor rode
+			// along for free — see ResourceDefinitionSpec above), but the
+			// VD-scoped element rebuild dropped it until the write-back
+			// was routed through wireToCRDVDPreserving. Same
+			// wire-rebuild-drops-operator-only-field class as Bug 206 /
+			// 208 / 209.
+			"DRBDMinor": true,
+		},
+	},
 }
 
 // specsUnderTest lists every CRD Spec whose Update / Patch path
@@ -263,10 +288,13 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 // not apply.
 //
 // ResourceDefinitionVolume is the inline element-shape of
-// ResourceDefinitionSpec.VolumeDefinitions and is itself rebuilt by
-// `wireToCRDVD`, but every field there has a wire counterpart on
-// apiv1.VolumeDefinition (volumeNumber, sizeKib, props, flags) — no
-// operator-only fields to carry across.
+// ResourceDefinitionSpec.VolumeDefinitions, itself rebuilt per-element by
+// `wireToCRDVD` on the VD-scoped Update / PatchVolumeDefinitionSpec
+// paths. It carries one operator-only field with NO wire counterpart —
+// DRBDMinor, the /dev/drbd<N> device identity (Bug 433) — so it IS under
+// test here (this is what the pre-433 "every field has a wire
+// counterpart" assumption missed). The store-side write-back routes
+// through wireToCRDVDPreserving to carry the minor across the rebuild.
 func specsUnderTest() []reflect.Type {
 	return []reflect.Type{
 		reflect.TypeOf(crdv1alpha1.NodeSpec{}),
@@ -276,6 +304,7 @@ func specsUnderTest() []reflect.Type {
 		reflect.TypeOf(crdv1alpha1.StoragePoolSpec{}),
 		reflect.TypeOf(crdv1alpha1.SnapshotSpec{}),
 		reflect.TypeOf(crdv1alpha1.PhysicalDeviceSpec{}),
+		reflect.TypeOf(crdv1alpha1.ResourceDefinitionVolume{}),
 	}
 }
 
