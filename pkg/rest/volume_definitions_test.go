@@ -810,12 +810,18 @@ func TestVolumeDefinitionsUpdateShrinkWithForceQueryAccepted(t *testing.T) {
 	}
 }
 
-// TestVolumeDefinitionsUpdateLargeSizeKibRoundTrip pins that
-// petabyte-scale `size_kib` values survive the JSON round-trip
-// without truncation. The wire field is int64 on our side and uint64
-// in golinstor; a regression that decoded into int32 would clamp
-// anything above ~2 TiB. 2^40 KiB = 1 PiB — covers the largest
-// volumes any sane cluster would carve.
+// TestVolumeDefinitionsUpdateLargeSizeKibRoundTrip pins that a large
+// (multi-TiB) `size_kib` survives the JSON round-trip without
+// truncation. The wire field is int64 on our side and uint64 in
+// golinstor; a regression that decoded into int32 would clamp anything
+// above ~2 TiB. The guard uses DRBD's 16 TiB per-device ceiling
+// (maxVolumeDefinitionSizeKib, Bug 155) — the largest accepted size and
+// still 8× above the int32 clamp point, so it exercises the >int32 wire
+// path while remaining a size the resize bounds gate accepts. Petabyte-
+// scale sizes are refused on BOTH create and resize (see
+// TestBug155VDCreateRefusesAbsurdSize and the round-4 resize-bounds
+// regressions); this test previously used 1 PiB, which pinned the exact
+// create/resize bounds asymmetry the round-4 gate closed.
 func TestVolumeDefinitionsUpdateLargeSizeKibRoundTrip(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
@@ -832,9 +838,9 @@ func TestVolumeDefinitionsUpdateLargeSizeKibRoundTrip(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	const oneEiB = int64(1) << 40 // 1 PiB in KiB
+	const largeInBoundsKib = maxVolumeDefinitionSizeKib // 16 TiB, the largest accepted size (~8× int32 max)
 
-	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: oneEiB})
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: largeInBoundsKib})
 
 	resp := httpPut(t, base+"/v1/resource-definitions/pvc-pib/volume-definitions/0", body)
 	_ = resp.Body.Close()
@@ -848,8 +854,8 @@ func TestVolumeDefinitionsUpdateLargeSizeKibRoundTrip(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if got.SizeKib != oneEiB {
-		t.Errorf("SizeKib after large PUT: got %d, want %d (truncation?)", got.SizeKib, oneEiB)
+	if got.SizeKib != largeInBoundsKib {
+		t.Errorf("SizeKib after large PUT: got %d, want %d (truncation?)", got.SizeKib, largeInBoundsKib)
 	}
 }
 

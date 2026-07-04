@@ -819,12 +819,51 @@ func rejectVDPatchSize(
 		return true
 	}
 
+	// Adversarial round 4 (2026-07-03): mirror the CREATE path's Bug 155
+	// bounds gate on the RESIZE path. The create path refuses size_kib
+	// outside [4 MiB, 16 TiB] via validateVDSize so the satellite never
+	// hot-loops on `drbdadm create-md`; `linstor vd set-size` previously
+	// skipped that check, so a below-floor force-shrink or an over-ceiling
+	// grow was stored verbatim and reproduced the Bug 155 hot-loop through
+	// the resize verb. Runs — like the Bug 383 non-positive floor above —
+	// BEFORE the shrink-vs-force gate: `force` waives the shrink-direction
+	// opt-in, never the physical floor/ceiling, and checking bounds first
+	// gives the operator the accurate "invalid size" envelope instead of an
+	// "add --force" hint on a size that would be refused even with force.
+	if rejectVDPatchOutOfBounds(w, patch, rd, vn) {
+		return true
+	}
+
 	// Scenario 4.W13: reject any shrink (`new < previous`) unless the
 	// operator opted in via `force=true`. Runs BEFORE the merge + store
 	// write so a rejected shrink leaves the stored spec untouched — a
 	// partial update would desync the controller spec from the
 	// satellite reality.
 	return rejectShrinkWithoutForce(w, r, patch, rd, vn, previousSizeKib)
+}
+
+// rejectVDPatchOutOfBounds writes a 400 + FAIL_INVLD_VLM_SIZE envelope
+// when the patch carries a `size_kib` outside the accepted
+// [minVolumeDefinitionSizeKib, maxVolumeDefinitionSizeKib] range and
+// returns true to signal the caller to short-circuit. Reuses the create
+// path's validateVDSize + writeVDSizeRejection so the wire shape is
+// byte-identical across the create and resize verbs (Bug 155 parity).
+// A patch that does not touch size (`SizeKib == nil`) is left alone.
+func rejectVDPatchOutOfBounds(
+	w http.ResponseWriter, patch *volumeDefinitionModifyBody, rd string, vn int32,
+) bool {
+	if patch.SizeKib == nil {
+		return false
+	}
+
+	sizeErr := validateVDSize(*patch.SizeKib)
+	if sizeErr == nil {
+		return false
+	}
+
+	writeVDSizeRejection(w, rd, vn, *patch.SizeKib, sizeErr)
+
+	return true
 }
 
 // rejectVDNonPositiveSize writes a 400 + FAIL_INVLD_VLM_SIZE envelope
