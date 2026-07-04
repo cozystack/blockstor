@@ -1,0 +1,51 @@
+name: rg-modify-invalid-layer-rejected
+description: |
+  Bug 434 (P2 correctness+availability) — `rg modify` must reject an
+  invalid select_filter.layer_stack the create path already refuses,
+  instead of storing it unvalidated for a child RD to inherit.
+
+  Pre-fix, handleRGUpdate gated only place_count (so the invalid stack was
+  merged + persisted), and handleRDCreate validated an EXPLICIT layer_list
+  BEFORE inheritLayerStackFromRG (so an RD created against the RG inherited
+  the invalid stack unchecked). On the stand the satellite/dispatcher can't
+  materialise an out-of-order layer chain (drbdadm / LVM config error).
+
+  Codified purely via exit-code contracts (the runner has no layer-stack
+  await kind; the RD-inherit invariant — the RD gets the VALID stack, never
+  [STORAGE,DRBD] — is asserted at the L6 layer in
+  tests/e2e/cli-matrix/rg-modify-invalid-layer-rejected.sh, which reads the
+  RD's spec.layerStack). Sequence: rg c <rg> --layer-list drbd,storage →
+  `rg m <rg> --layer-list storage,drbd` MUST be rejected → rd c inheriting
+  from the (still-valid) rg succeeds.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: b434-inherit-rd
+
+steps:
+  - name: create-rg-valid-layer
+    cmd: ["resource-group", "create", "b434-rg", "--layer-list", "drbd,storage"]
+    expect_exit: 0
+  # ---- Contract: rg modify to STORAGE-before-DRBD is refused ----
+  - name: rg-modify-invalid-layer-rejected
+    cmd: ["resource-group", "modify", "b434-rg", "--layer-list", "storage,drbd"]
+    expect_exit: [1, 10]
+  # The RG survived the refused modify and still resolves.
+  - name: rg-still-present
+    cmd: ["resource-group", "list", "--resource-groups", "b434-rg"]
+    expect_exit: 0
+  # ---- An RD inheriting from the (still-valid) RG is accepted ----
+  - name: create-rd-inherits-valid
+    cmd: ["resource-definition", "create", "{{rd}}", "--resource-group", "b434-rg"]
+    expect_exit: 0
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+  - cmd: ["resource-group", "delete", "b434-rg"]
+
+invariants:
+  - no_orphans

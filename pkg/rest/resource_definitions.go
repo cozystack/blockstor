@@ -310,6 +310,19 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 434 (defense-in-depth): validateRDCreateBody validates an
+	// EXPLICIT layer_list, but it runs BEFORE the RG inherit above — so an
+	// invalid stack inherited from an RG (e.g. one that predates the
+	// rg-modify validation gate) would reach the store unchecked. Re-validate
+	// the resolved (possibly inherited) stack here, mirroring the create
+	// path's 400, so an unmaterialisable layer chain never persists onto an RD.
+	lsErr := validateLayerStack(rd.LayerStack)
+	if lsErr != nil {
+		writeError(w, http.StatusBadRequest, lsErr.Error())
+
+		return
+	}
+
 	// Bug 262 (P2): stand-caught — `linstor rd lp <new-rd> | grep
 	// quorum` reported `DrbdOptions/Resource/quorum off` on freshly-
 	// created RDs because the RG-create surface never seeded the
