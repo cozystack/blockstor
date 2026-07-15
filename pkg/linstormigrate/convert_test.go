@@ -30,6 +30,7 @@ import (
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
+	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // The fixture under testdata/dump is a synthetic LINSTOR k8s-backend
@@ -225,6 +226,51 @@ func TestDRBDIdentityCarriedVerbatim(t *testing.T) {
 		if replica.Spec.DRBDPort == nil || *replica.Spec.DRBDPort != 7001 {
 			t.Errorf("%s drbdPort = %v, want 7001", name, replica.Spec.DRBDPort)
 		}
+	}
+}
+
+// TestZvolNameAdoptionInvariant pins B2: adoption is name-based —
+// blockstor addresses each zvol as `<zpool>/<RD metadata.name>_<vol%05d>`
+// (pkg/storage/zfs/zfs.go volumeDataset) and CreateVolume is idempotent
+// only when that dataset already exists. LINSTOR wrote the on-disk zvols
+// as `<zpool>/<rd-lowercased>_00000`. So the RD's converted
+// metadata.name MUST equal the lowercased LINSTOR name verbatim — any
+// slug/hash from k8sstore.Name (triggered by a non-RFC-1123 name) would
+// make blockstor look for a dataset that does not exist and create a
+// fresh EMPTY zvol. Every production RD name is a clean `pvc-<uuid>`
+// (verified across both dumps: 113/113 + 679/679), which lowercases to
+// an RFC-1123-clean name that Name() passes through unchanged. This
+// test pins that verbatim-lowercase invariant for the fixture and for a
+// real uppercase UUID; if a future change made the converter hash a
+// clean name, single-replica STORAGE-only volumes would silently adopt
+// an empty disk.
+func TestZvolNameAdoptionInvariant(t *testing.T) {
+	res := convertFixture(t)
+
+	for i := range res.ResourceDefinitions {
+		rd := &res.ResourceDefinitions[i]
+		// The fixture original is the uppercase LINSTOR key (e.g.
+		// PVC-VOL1); its lowercase form is RFC-1123-clean, so the
+		// converted metadata.name must be exactly that — no hash prefix.
+		original := k8sstore.OriginalName(&rd.ObjectMeta)
+		if original == "" {
+			continue // name needed no annotation → already lowercase-clean
+		}
+
+		want := strings.ToLower(original)
+
+		if rd.Name != want {
+			t.Errorf("RD metadata.name = %q, want verbatim-lowercase %q (a slug/hash breaks zvol adoption)", rd.Name, want)
+		}
+	}
+
+	// A real production-shaped uppercase UUID must pass through as the
+	// plain lowercased name (no hash) so its zvol path is predictable.
+	const prodName = "PVC-6A5F9F68-5DF2-4398-A92F-CDF41C4F2653"
+
+	got := objectMeta(prodName).Name
+	if got != strings.ToLower(prodName) {
+		t.Errorf("k8sstore.Name(%q) = %q, want plain lowercase; a hashed name would miss the on-disk zvol", prodName, got)
 	}
 }
 
