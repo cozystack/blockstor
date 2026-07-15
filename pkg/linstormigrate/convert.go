@@ -448,12 +448,34 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 
 		def.Spec.VolumeDefinitions = c.volumeDefinitionsFor(row.ResourceName, dsp)
 
+		if c.rdHasLuks(row.ResourceName) {
+			// LAYER_LUKS_VOLUMES carries the volume passphrase encrypted
+			// with the LINSTOR master key; decrypting it needs the
+			// operator's master passphrase and LINSTOR's KDF, which this
+			// converter does not implement yet. The layer stack is
+			// preserved, but the volume cannot be opened until the
+			// passphrase is provisioned into blockstor by hand.
+			c.warnf("resource definition %s: LUKS passphrase NOT migrated (encrypted with the LINSTOR master key) — provision spec.encryption manually before adopting", dsp)
+		}
+
 		defs = append(defs, def)
 	}
 
 	sortByName(defs, func(d crdv1alpha1.ResourceDefinition) string { return d.Name })
 
 	return defs
+}
+
+// rdHasLuks reports whether any live replica of the RD carries a LUKS
+// layer volume (an encrypted passphrase row).
+func (c *converter) rdHasLuks(rdName string) bool {
+	for key := range c.luksVol {
+		if key.rd == rdName {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (c *converter) volumeDefinitionsFor(rdName, rdDsp string) []crdv1alpha1.ResourceDefinitionVolume {

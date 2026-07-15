@@ -256,6 +256,36 @@ func TestSkippedRows(t *testing.T) {
 	}
 }
 
+// TestLuksPassphraseWarning pins the phase-1 LUKS posture: the
+// encrypted volume converts with its layer stack intact, and the
+// non-migratable master-key-encrypted passphrase is loudly reported
+// instead of silently dropped.
+func TestLuksPassphraseWarning(t *testing.T) {
+	res := convertFixture(t)
+
+	var vol3 *crdv1alpha1.ResourceDefinition
+
+	for i := range res.ResourceDefinitions {
+		if res.ResourceDefinitions[i].Name == "pvc-vol3" {
+			vol3 = &res.ResourceDefinitions[i]
+
+			break
+		}
+	}
+
+	if vol3 == nil {
+		t.Fatal("LUKS RD pvc-vol3 not converted")
+	}
+
+	if !slices.Equal(vol3.Spec.LayerStack, []string{"DRBD", "LUKS", "STORAGE"}) {
+		t.Errorf("pvc-vol3 layerStack = %v, want [DRBD LUKS STORAGE]", vol3.Spec.LayerStack)
+	}
+
+	if !hasWarning(res, "pvc-vol3: LUKS passphrase NOT migrated") {
+		t.Errorf("LUKS passphrase warning missing; warnings: %v", res.Warnings)
+	}
+}
+
 func hasWarning(res *Result, substr string) bool {
 	for _, w := range res.Warnings {
 		if strings.Contains(w, substr) {
