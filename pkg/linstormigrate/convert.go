@@ -414,9 +414,18 @@ func (c *converter) netInterfacesFor(nodeName string) []NodeNetInterfaceRow {
 func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 	pools := make([]crdv1alpha1.StoragePool, 0, len(c.dump.NodeStorPools))
 
-	for _, row := range c.dump.NodeStorPools {
+	for i := range c.dump.NodeStorPools {
+		row := &c.dump.NodeStorPools[i]
 		nodeDsp := c.displayNode(row.NodeName)
 		poolDsp := displayName(c.poolDsp[row.PoolName], row.PoolName)
+
+		// A pool on a node that did not convert (e.g. a CONTROLLER-only
+		// node blockstor never adopts) is dead config — drop it.
+		if !c.convertedNode[row.NodeName] {
+			c.warnf("storage pool %s.%s: host node was not migrated — skipped", poolDsp, nodeDsp)
+
+			continue
+		}
 
 		pool := crdv1alpha1.StoragePool{
 			TypeMeta:   typeMeta("StoragePool"),
