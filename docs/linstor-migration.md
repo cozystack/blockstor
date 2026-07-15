@@ -45,6 +45,21 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 
 4. **Back up the ZFS/LVM pools' snapshots** (optional but recommended): a `zfs snapshot -r` of each pool gives an instant rollback point that is independent of both control planes.
 
+5. **Verify the zvol names blockstor will adopt match what is on disk.** Adoption is name-based: blockstor addresses each volume as `<zpool>/<rd-name-lowercased>_<volume-number-%05d>` (e.g. `data/pvc-abc…_00000`), and `CreateVolume` is idempotent only when that dataset already exists. A byte mismatch (ZFS names are case-sensitive) makes blockstor create a fresh EMPTY zvol next to the real one. Multi-replica DRBD would self-heal by SyncTarget, but **single-replica `["STORAGE"]` volumes have no resync fallback** — a mismatch there silently presents an empty disk. Cross-check before cutover, read-only, on each satellite:
+
+   ```bash
+   # what is on disk:
+   zfs list -H -o name -t volume | sort > /tmp/ondisk-zvols.txt
+   # what blockstor will look for (from the converted manifests):
+   #   <zpool>/<metadata.name of each Resource>_<vol %05d>
+   # compare the two sets; every single-replica STORAGE-only volume MUST
+   # already exist on disk under the blockstor name.
+   ```
+
+   If any single-replica volume's computed name is absent from `ondisk-zvols.txt`, STOP — do not cut over until the naming is reconciled (`zfs rename`, or fix the converter).
+
+6. **Rehearse on staging first.** Do a full dry-run adoption of a COPY of the pools (or a representative subset) on a non-production cluster: apply the manifests, confirm every StoragePool registers a provider (no `provider requires … in props` errors in the satellite log), every Resource reaches `UpToDate` with `out-of-sync=0` (adopted, not resynced), and no new empty zvols appear. Only after a clean staging rehearsal proceed to production.
+
 ## Convert
 
 ```bash
@@ -95,3 +110,4 @@ Until CSI is repointed and confirmed, rollback is: scale blockstor to 0, scale `
 | DRBD port not in dump (LINSTOR 1.33) | Adoption reconnects the mesh on a new port if not captured | Capture with the pre-flight command and pass `-drbd-ports` |
 | Unknown flag bits dropped | Cosmetic runtime bookkeeping only | Reported; verified not to carry availability semantics |
 | Placement/data unchanged | The converter never moves data | Rebalance with blockstor after migration if desired |
+| Single-replica zvol name must byte-match on disk | A mismatch presents an empty disk (no DRBD resync fallback) | Pre-flight step 5 cross-check + staging rehearsal (step 6) |
