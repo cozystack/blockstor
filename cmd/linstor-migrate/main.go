@@ -52,8 +52,9 @@ func main() {
 
 func run() int {
 	var (
-		inDir   = flag.String("in", "", "directory with *.internal.linstor.linbit.com.json table dumps (required)")
-		outPath = flag.String("out", "-", "write manifests to this file ('-' = stdout)")
+		inDir     = flag.String("in", "", "directory with *.internal.linstor.linbit.com.json table dumps (required)")
+		outPath   = flag.String("out", "-", "write manifests to this file ('-' = stdout)")
+		portsPath = flag.String("drbd-ports", "", "optional '<rd-name> <port>' file of LIVE DRBD ports (see runbook); preserves the running mesh endpoint so adoption doesn't reconnect")
 	)
 
 	flag.Parse()
@@ -65,6 +66,13 @@ func run() int {
 		return 2
 	}
 
+	opts, err := buildOptions(*portsPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+
+		return 1
+	}
+
 	dump, err := linstormigrate.LoadDump(*inDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -72,7 +80,7 @@ func run() int {
 		return 1
 	}
 
-	result, err := linstormigrate.Convert(dump)
+	result, err := linstormigrate.ConvertWithOptions(dump, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 
@@ -102,6 +110,27 @@ func run() int {
 	}
 
 	return 0
+}
+
+// buildOptions loads the optional live DRBD port map from portsPath
+// (see linstormigrate.ParseDRBDPorts for the format). Empty path
+// yields empty options.
+func buildOptions(portsPath string) (linstormigrate.Options, error) {
+	if portsPath == "" {
+		return linstormigrate.Options{}, nil
+	}
+
+	data, err := os.ReadFile(portsPath)
+	if err != nil {
+		return linstormigrate.Options{}, fmt.Errorf("read %s: %w", portsPath, err)
+	}
+
+	ports, err := linstormigrate.ParseDRBDPorts(string(data))
+	if err != nil {
+		return linstormigrate.Options{}, fmt.Errorf("%s: %w", portsPath, err)
+	}
+
+	return linstormigrate.Options{DRBDPorts: ports}, nil
 }
 
 // openOutput resolves the -out flag: "-" streams to stdout (no-op

@@ -92,9 +92,27 @@ type Result struct {
 	Warnings            []string
 }
 
+// Options tunes a Convert run.
+type Options struct {
+	// DRBDPorts maps a ResourceDefinition name (any case — matched
+	// case-insensitively) to the TCP port its DRBD replication mesh
+	// is CURRENTLY listening on in the running kernel. LINSTOR 1.33
+	// stores port=-1 in its database for most RDs (the port is
+	// assigned at runtime and not persisted), so the dump alone
+	// cannot recover it. Capturing the live ports and feeding them
+	// here makes blockstor render the SAME ports it adopts, so
+	// `drbdadm adjust` is a no-op on the connection endpoint — no
+	// reconnect blip, no transient quorum loss. When a port is
+	// absent here and also absent from the dump, the RD's replicas
+	// get nil DRBDPort and blockstor's allocator picks a fresh port
+	// (a controlled replication blip on adoption — see the runbook).
+	DRBDPorts map[string]int32
+}
+
 // converter carries the indexes built once per Convert call.
 type converter struct {
 	dump  *Dump
+	opts  Options
 	props *PropsIndex
 
 	// display-name lookups: UPPERCASE key → original display case.
@@ -110,7 +128,8 @@ type converter struct {
 	storVol   map[volumeReplicaKey]LayerStorageVolumeRow
 	luksVol   map[volumeReplicaKey]LayerLuksVolumeRow
 
-	warnings []string
+	warnings  []string
+	warnedKey map[string]bool
 }
 
 type volumeKey struct {
@@ -129,10 +148,18 @@ type volumeReplicaKey struct {
 	vlmNr int32
 }
 
-// Convert translates a LINSTOR database dump into blockstor CRDs.
+// Convert translates a LINSTOR database dump into blockstor CRDs with
+// default options.
 func Convert(dump *Dump) (*Result, error) {
+	return ConvertWithOptions(dump, Options{})
+}
+
+// ConvertWithOptions translates a LINSTOR database dump into blockstor
+// CRDs, honouring opts (e.g. a live DRBD port map — see Options).
+func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 	conv := &converter{
 		dump:      dump,
+		opts:      opts,
 		props:     NewPropsIndex(dump.PropsContainers),
 		nodeDsp:   map[string]string{},
 		poolDsp:   map[string]string{},
@@ -143,6 +170,7 @@ func Convert(dump *Dump) (*Result, error) {
 		drbdNode:  map[replicaKey]*int32{},
 		storVol:   map[volumeReplicaKey]LayerStorageVolumeRow{},
 		luksVol:   map[volumeReplicaKey]LayerLuksVolumeRow{},
+		warnedKey: map[string]bool{},
 	}
 
 	conv.buildIndexes()
@@ -503,7 +531,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 		}
 
 		if drbd, ok := c.drbdRD[row.ResourceName]; ok {
-			def.Spec.DRBDPort = drbd.TCPPort
+			def.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, dsp)
 
 			if drbd.Secret != "" {
 				if def.Spec.ExtraProps == nil {
@@ -633,8 +661,10 @@ func (c *converter) convertResources() []crdv1alpha1.Resource {
 		if drbd, ok := c.drbdRD[row.ResourceName]; ok {
 			// LINSTOR allocates one cluster-wide TCP port per RD; every
 			// replica listens on it. blockstor's per-replica allocator
-			// honours a preset value verbatim.
-			resource.Spec.DRBDPort = drbd.TCPPort
+			// honours a preset value verbatim. The live port map (when
+			// supplied) wins over the dump's often-empty tcp_port so the
+			// adopted mesh keeps its current endpoint.
+			resource.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, rdDsp)
 		}
 
 		resources = append(resources, resource)
@@ -704,6 +734,30 @@ func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
 	sortByName(snaps, func(s crdv1alpha1.Snapshot) string { return s.Name })
 
 	return snaps
+}
+
+// resolveDRBDPort picks the DRBD listen port to preset on an RD /
+// replica. The live port map (Options.DRBDPorts, captured from the
+// running kernel) wins over the dump's tcp_port, because LINSTOR 1.33
+// leaves tcp_port empty for most RDs while the mesh really is
+// listening on a concrete port — matching it makes adoption's
+// `drbdadm adjust` a no-op on the connection endpoint. When the port
+// is available in NEITHER source the RD's replicas get nil (blockstor
+// allocates a fresh port → a controlled reconnect blip on adoption),
+// and the gap is reported so the operator can capture the live ports.
+func (c *converter) resolveDRBDPort(rdName string, dumpPort *int32, rdDsp string) *int32 {
+	if live, ok := c.opts.DRBDPorts[strings.ToLower(rdName)]; ok {
+		return ptr(live)
+	}
+
+	if dumpPort != nil && *dumpPort > 0 {
+		return dumpPort
+	}
+
+	c.warnOncef("drbdport:"+rdName,
+		"resource definition %s: no DRBD port in the dump or live map — blockstor will allocate a fresh port; the adopted mesh will reconnect on the new port. Capture live ports (see runbook) to avoid the blip.", rdDsp)
+
+	return nil
 }
 
 // snapshotVolumeRefsFor collects the snapshot's captured volume slots
@@ -800,6 +854,18 @@ func (c *converter) displayRG(name string) string {
 
 func (c *converter) warnf(format string, args ...any) {
 	c.warnings = append(c.warnings, fmt.Sprintf(format, args...))
+}
+
+// warnOncef emits a warning only the first time it sees dedupKey, so a
+// per-RD gap reported from multiple call sites (RD + each replica)
+// surfaces once instead of once per object.
+func (c *converter) warnOncef(dedupKey, format string, args ...any) {
+	if c.warnedKey[dedupKey] {
+		return
+	}
+
+	c.warnedKey[dedupKey] = true
+	c.warnf(format, args...)
 }
 
 // displayName prefers the display-case column, falling back to the

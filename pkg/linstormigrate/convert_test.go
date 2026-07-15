@@ -226,6 +226,96 @@ func TestDRBDIdentityCarriedVerbatim(t *testing.T) {
 	}
 }
 
+// TestLiveDRBDPortWins pins the adoption-critical port behaviour: a
+// live port map (captured from the running kernel) is preset on the RD
+// and every replica, overriding the dump. Without it, an RD whose dump
+// carries no tcp_port (the LINSTOR-1.33 norm) gets nil DRBDPort and a
+// reported gap — because a mismatched port makes adoption's `drbdadm
+// adjust` reconnect the live mesh.
+func TestLiveDRBDPortWins(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	// vol5 carries NO tcp_port in the fixture; vol1 carries 7001.
+	res, err := ConvertWithOptions(dump, Options{
+		DRBDPorts: map[string]int32{"pvc-vol5": 7042, "pvc-vol1": 7099},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	ports := map[string]*int32{}
+	for i := range res.ResourceDefinitions {
+		ports[res.ResourceDefinitions[i].Name] = res.ResourceDefinitions[i].Spec.DRBDPort
+	}
+
+	if ports["pvc-vol5"] == nil || *ports["pvc-vol5"] != 7042 {
+		t.Errorf("vol5 (no dump port) DRBDPort = %v, want live 7042", ports["pvc-vol5"])
+	}
+
+	if ports["pvc-vol1"] == nil || *ports["pvc-vol1"] != 7099 {
+		t.Errorf("vol1 DRBDPort = %v, want live 7099 overriding dump 7001", ports["pvc-vol1"])
+	}
+
+	// replicas of vol5 must carry the same live port.
+	replica := findResource(t, res, "pvc-vol5.node-a")
+	if replica.Spec.DRBDPort == nil || *replica.Spec.DRBDPort != 7042 {
+		t.Errorf("vol5.node-a DRBDPort = %v, want 7042", replica.Spec.DRBDPort)
+	}
+}
+
+// TestMissingDRBDPortReported pins that a DRBD RD with no port in the
+// dump AND no live map yields nil (blockstor allocates) and reports
+// the gap exactly once — the operator MUST see it to decide on the
+// reconnect blip.
+func TestMissingDRBDPortReported(t *testing.T) {
+	res := convertFixture(t) // no port map
+
+	var vol5Port *int32
+
+	for i := range res.ResourceDefinitions {
+		if res.ResourceDefinitions[i].Name == "pvc-vol5" {
+			vol5Port = res.ResourceDefinitions[i].Spec.DRBDPort
+		}
+	}
+
+	if vol5Port != nil {
+		t.Errorf("vol5 DRBDPort = %v, want nil (no dump port, no live map)", vol5Port)
+	}
+
+	count := 0
+
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "pvc-vol5") && strings.Contains(w, "DRBD port") {
+			count++
+		}
+	}
+
+	if count != 1 {
+		t.Errorf("vol5 missing-port warning count = %d, want exactly 1 (deduped across RD + replicas)", count)
+	}
+}
+
+// TestParseDRBDPorts pins the port-file parser incl. rejection.
+func TestParseDRBDPorts(t *testing.T) {
+	ports, err := ParseDRBDPorts("# comment\nPVC-ABC 7001\n\npvc-def   7002\n")
+	if err != nil {
+		t.Fatalf("ParseDRBDPorts: %v", err)
+	}
+
+	if ports["pvc-abc"] != 7001 || ports["pvc-def"] != 7002 {
+		t.Errorf("parsed ports = %v", ports)
+	}
+
+	for _, bad := range []string{"only-one-field", "rd 70000", "rd notaport", "rd 0"} {
+		if _, err := ParseDRBDPorts(bad); err == nil {
+			t.Errorf("ParseDRBDPorts(%q) accepted a malformed line", bad)
+		}
+	}
+}
+
 // TestSkippedRows pins the never-guess policy: DELETE'd RDs and
 // non-SUCCESSFUL snapshots are dropped with a report line instead of
 // being converted into live objects.
