@@ -16,15 +16,29 @@
 },
 {
 "spec": {
-"prop_key": "StorDriver/ZPoolThin",
+"prop_key": "StorDriver/StorPoolName",
 "prop_value": "data",
 "props_instance": "/STOR_POOLS/NODE-A/DATA"
 }
 },
 {
 "spec": {
-"prop_key": "StorDriver/ZPoolThin",
+"prop_key": "StorDriver/internal/AllocationGranularity",
+"prop_value": "16",
+"props_instance": "/STOR_POOLS/NODE-A/DATA"
+}
+},
+{
+"spec": {
+"prop_key": "StorDriver/StorPoolName",
 "prop_value": "data",
+"props_instance": "/STOR_POOLS/NODE-B/DATA"
+}
+},
+{
+"spec": {
+"prop_key": "StorDriver/internal/AllocationGranularity",
+"prop_value": "16",
 "props_instance": "/STOR_POOLS/NODE-B/DATA"
 }
 },

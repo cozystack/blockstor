@@ -55,8 +55,9 @@ spec:
   nodeName: node-a
   poolName: data
   props:
-    StorDriver/ZPoolThin: data
-  providerKind: ZFS_THIN
+    StorDriver/StorPoolName: data
+    StorDriver/internal/AllocationGranularity: "16"
+  providerKind: ZFS
 ---
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
@@ -66,8 +67,9 @@ spec:
   nodeName: node-b
   poolName: data
   props:
-    StorDriver/ZPoolThin: data
-  providerKind: ZFS_THIN
+    StorDriver/StorPoolName: data
+    StorDriver/internal/AllocationGranularity: "16"
+  providerKind: ZFS
 ---
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool

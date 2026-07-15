@@ -28,6 +28,8 @@ import (
 	"testing"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/storage"
 )
 
 // The fixture under testdata/dump is a synthetic LINSTOR k8s-backend
@@ -223,6 +225,46 @@ func TestDRBDIdentityCarriedVerbatim(t *testing.T) {
 		if replica.Spec.DRBDPort == nil || *replica.Spec.DRBDPort != 7001 {
 			t.Errorf("%s drbdPort = %v, want 7001", name, replica.Spec.DRBDPort)
 		}
+	}
+}
+
+// TestConvertedZFSPoolsRegisterProvider pins B1 end-to-end at the
+// migration layer: a real LINSTOR ZFS pool stores its zpool name under
+// StorDriver/StorPoolName (the fixture mirrors the live aenix-infra
+// shape — ZFS thick, StorPoolName=data, no ZPool key). The migrator
+// copies props verbatim, so unless the satellite factory accepts that
+// key, every converted ZFS StoragePool fails to register a provider
+// and NO diskful resource can adopt. Running the converted props
+// through the real satellite.NewProviderFromKind proves the whole
+// chain works; it fails on the pre-fix factory (the B1 blocker).
+func TestConvertedZFSPoolsRegisterProvider(t *testing.T) {
+	res := convertFixture(t)
+
+	zfsPools := 0
+
+	for i := range res.StoragePools {
+		pool := &res.StoragePools[i]
+		if !strings.HasPrefix(pool.Spec.ProviderKind, "ZFS") {
+			continue // DISKLESS pools register no provider by design
+		}
+
+		zfsPools++
+
+		prov, err := satellite.NewProviderFromKind(pool.Spec.ProviderKind, pool.Spec.Props, storage.NewFakeExec())
+		if err != nil {
+			t.Errorf("StoragePool %s (kind %s): provider did not register from migrated props %v: %v",
+				pool.Name, pool.Spec.ProviderKind, pool.Spec.Props, err)
+
+			continue
+		}
+
+		if prov == nil {
+			t.Errorf("StoragePool %s: nil provider from migrated props", pool.Name)
+		}
+	}
+
+	if zfsPools == 0 {
+		t.Fatal("fixture has no ZFS StoragePools — the B1 regression is not being exercised")
 	}
 }
 

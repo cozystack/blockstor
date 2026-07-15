@@ -44,11 +44,12 @@ const (
 // kind. Mirrored verbatim so existing operators / piraeus-operator
 // manifests round-trip.
 const (
-	propLvmVG     = "StorDriver/LvmVg"
-	propThinPool  = "StorDriver/ThinPool"
-	propZPool     = "StorDriver/ZPool"
-	propZPoolThin = "StorDriver/ZPoolThin"
-	propFileDir   = "StorDriver/FileDir"
+	propLvmVG        = "StorDriver/LvmVg"
+	propThinPool     = "StorDriver/ThinPool"
+	propZPool        = "StorDriver/ZPool"
+	propZPoolThin    = "StorDriver/ZPoolThin"
+	propFileDir      = "StorDriver/FileDir"
+	propStorPoolName = "StorDriver/StorPoolName"
 )
 
 // NewProviderFromKind instantiates the matching `storage.Provider`
@@ -118,6 +119,13 @@ func newZFS(props map[string]string, exec storage.Exec, thin bool) (storage.Prov
 	// each kind (kind-specific key wins) to keep CRDs that were
 	// written before the rename and operators who copy-paste from
 	// LVM examples both working.
+	//
+	// A real LINSTOR ≥1.x database (and its k8s-backend dump) stores
+	// the zpool name under the generic `StorDriver/StorPoolName`
+	// instead, leaving both ZPool keys blank — so an adopted ZFS pool
+	// carries ONLY StorPoolName. Accept it as the final fallback,
+	// otherwise a migrated ZFS pool never registers a provider and no
+	// diskful resource on it can be served.
 	primary, secondary := propZPool, propZPoolThin
 	if thin {
 		primary, secondary = propZPoolThin, propZPool
@@ -129,12 +137,16 @@ func newZFS(props map[string]string, exec storage.Exec, thin bool) (storage.Prov
 	}
 
 	if pool == "" {
+		pool = props[propStorPoolName]
+	}
+
+	if pool == "" {
 		kind := ProviderKindZFS
 		if thin {
 			kind = ProviderKindZFSThin
 		}
 
-		return nil, errors.Errorf("%s provider requires %q in props", kind, primary)
+		return nil, errors.Errorf("%s provider requires %q, %q or %q in props", kind, primary, secondary, propStorPoolName)
 	}
 
 	return zfs.NewProvider(zfs.Config{Pool: pool, Thin: thin}, exec), nil

@@ -126,6 +126,51 @@ func TestFactoryZFSFallsBackBetweenKeys(t *testing.T) {
 	assertZFSProviderUsesPool(t, provThin, thinExec, "zthick")
 }
 
+// TestFactoryZFSAdoptsStorPoolNameKey pins B1: a real LINSTOR ≥1.x
+// database stores the zpool name under the generic
+// `StorDriver/StorPoolName` with BOTH ZPool keys blank (verified on
+// the live aenix-infra cluster: sp l shows StorPoolName=data,
+// ZPool/ZPoolThin empty). Before the fallback, NewProviderFromKind
+// errored on these exact props → the pool never registered → NO
+// diskful resource could adopt. This test fails on the pre-fix factory
+// and passes with the StorPoolName fallback.
+func TestFactoryZFSAdoptsStorPoolNameKey(t *testing.T) {
+	t.Parallel()
+
+	prodProps := map[string]string{
+		"StorDriver/StorPoolName":                   "data",
+		"StorDriver/internal/AllocationGranularity": "16",
+		"StorDriver/internal/optIoSize":             "33554432",
+		"StorDriver/internal/minIoSize":             "4096",
+	}
+
+	thickExec := storage.NewFakeExec()
+
+	provThick, err := satellite.NewProviderFromKind(satellite.ProviderKindZFS, prodProps, thickExec)
+	if err != nil {
+		t.Fatalf("NewProviderFromKind(ZFS, StorPoolName only): %v", err)
+	}
+
+	if provThick == nil {
+		t.Fatalf("NewProviderFromKind(ZFS, StorPoolName only) returned nil provider")
+	}
+
+	assertZFSProviderUsesPool(t, provThick, thickExec, "data")
+
+	thinExec := storage.NewFakeExec()
+
+	provThin, err := satellite.NewProviderFromKind(satellite.ProviderKindZFSThin, prodProps, thinExec)
+	if err != nil {
+		t.Fatalf("NewProviderFromKind(ZFS_THIN, StorPoolName only): %v", err)
+	}
+
+	if provThin == nil {
+		t.Fatalf("NewProviderFromKind(ZFS_THIN, StorPoolName only) returned nil provider")
+	}
+
+	assertZFSProviderUsesPool(t, provThin, thinExec, "data")
+}
+
 // TestFactoryZFSMissingBothKeysErrors documents the negative
 // path: when neither key is present the factory must surface a
 // readable error mentioning the canonical (primary) key so
