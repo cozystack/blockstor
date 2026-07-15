@@ -297,15 +297,6 @@ spec:
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata:
-  name: pvc-vol4.node-a
-spec:
-  nodeName: node-a
-  resourceDefinitionName: pvc-vol4
-  skipInitialSync: false
----
-apiVersion: blockstor.cozystack.io/v1alpha1
-kind: Resource
-metadata:
   name: pvc-vol5.node-a
 spec:
   drbdNodeID: 0

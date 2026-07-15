@@ -128,6 +128,12 @@ type converter struct {
 	storVol   map[volumeReplicaKey]LayerStorageVolumeRow
 	luksVol   map[volumeReplicaKey]LayerLuksVolumeRow
 
+	// referential-integrity sets, populated as each kind converts so
+	// later kinds can drop rows that would dangle (a replica of a
+	// skipped/absent RD, a replica on an unknown node, ...).
+	convertedRD   map[string]bool // by resource_name (UPPERCASE key)
+	convertedNode map[string]bool // by node_name (UPPERCASE key)
+
 	warnings  []string
 	warnedKey map[string]bool
 }
@@ -158,19 +164,21 @@ func Convert(dump *Dump) (*Result, error) {
 // CRDs, honouring opts (e.g. a live DRBD port map — see Options).
 func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 	conv := &converter{
-		dump:      dump,
-		opts:      opts,
-		props:     NewPropsIndex(dump.PropsContainers),
-		nodeDsp:   map[string]string{},
-		poolDsp:   map[string]string{},
-		rgDsp:     map[string]string{},
-		rdDsp:     map[string]string{},
-		drbdRD:    map[string]LayerDrbdResourceDefinitionRow{},
-		drbdMinor: map[volumeKey]*int32{},
-		drbdNode:  map[replicaKey]*int32{},
-		storVol:   map[volumeReplicaKey]LayerStorageVolumeRow{},
-		luksVol:   map[volumeReplicaKey]LayerLuksVolumeRow{},
-		warnedKey: map[string]bool{},
+		dump:          dump,
+		opts:          opts,
+		props:         NewPropsIndex(dump.PropsContainers),
+		nodeDsp:       map[string]string{},
+		poolDsp:       map[string]string{},
+		rgDsp:         map[string]string{},
+		rdDsp:         map[string]string{},
+		drbdRD:        map[string]LayerDrbdResourceDefinitionRow{},
+		drbdMinor:     map[volumeKey]*int32{},
+		drbdNode:      map[replicaKey]*int32{},
+		storVol:       map[volumeReplicaKey]LayerStorageVolumeRow{},
+		luksVol:       map[volumeReplicaKey]LayerLuksVolumeRow{},
+		convertedRD:   map[string]bool{},
+		convertedNode: map[string]bool{},
+		warnedKey:     map[string]bool{},
 	}
 
 	conv.buildIndexes()
@@ -379,6 +387,8 @@ func (c *converter) convertNodes() []crdv1alpha1.Node {
 			})
 		}
 
+		c.convertedNode[row.NodeName] = true
+
 		nodes = append(nodes, node)
 	}
 
@@ -557,6 +567,8 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 			c.warnf("resource definition %s: LUKS passphrase NOT migrated (encrypted with the LINSTOR master key) — provision spec.encryption manually before adopting", dsp)
 		}
 
+		c.convertedRD[row.ResourceName] = true
+
 		defs = append(defs, def)
 	}
 
@@ -611,7 +623,8 @@ func (c *converter) volumeDefinitionsFor(rdName, rdDsp string) []crdv1alpha1.Res
 func (c *converter) convertResources() []crdv1alpha1.Resource {
 	resources := make([]crdv1alpha1.Resource, 0, len(c.dump.Resources))
 
-	for _, row := range c.dump.Resources {
+	for i := range c.dump.Resources {
+		row := &c.dump.Resources[i]
 		if row.SnapshotName != "" {
 			continue // snapshot placement rows feed convertSnapshots
 		}
@@ -626,53 +639,74 @@ func (c *converter) convertResources() []crdv1alpha1.Resource {
 			continue
 		}
 
-		storVol, hasStorVol := c.storVol[volumeReplicaKey{node: row.NodeName, rd: row.ResourceName, vlmNr: 0}]
+		// Referential integrity: never emit a replica whose parent RD
+		// or host node did not convert. Such a Resource would dangle
+		// (the CRD's <rd>.<node> name references an object that is not
+		// applied), so drop it loudly rather than adopt an orphan.
+		if !c.convertedRD[row.ResourceName] {
+			c.warnf("resource %s: parent resource definition was not migrated — replica skipped", replicaName)
 
-		flags, rest := decodeResourceFlags(row.ResourceFlags)
-		if rest != 0 {
-			c.warnf("resource %s: unhandled flags bits %d dropped (of %d)", replicaName, rest, row.ResourceFlags)
+			continue
 		}
 
-		typed, residual, extra := k8sstore.SplitProps(c.props.Resource(row.NodeName, row.ResourceName))
+		if !c.convertedNode[row.NodeName] {
+			c.warnf("resource %s: host node %s was not migrated — replica skipped", replicaName, nodeDsp)
 
-		resource := crdv1alpha1.Resource{
-			TypeMeta:   typeMeta("Resource"),
-			ObjectMeta: objectMeta(replicaName),
-			Spec: crdv1alpha1.ResourceSpec{
-				ResourceDefinitionName: rdDsp,
-				NodeName:               nodeDsp,
-				Props:                  residual,
-				DRBDOptions:            typed,
-				ExtraProps:             extra,
-				Flags:                  flags,
-				DRBDNodeID:             c.drbdNode[replicaKey{node: row.NodeName, rd: row.ResourceName}],
-				// Adopted replicas carry real data (or are the witness of
-				// a data-bearing set): never allow the day0 skip.
-				SkipInitialSync: ptr(false),
-			},
+			continue
 		}
 
-		if hasStorVol {
-			resource.Spec.StoragePool = displayName(c.poolDsp[storVol.StorPoolName], storVol.StorPoolName)
-		} else if sp := resource.Spec.Props["StorPoolName"]; sp != "" {
-			resource.Spec.StoragePool = sp
-		}
-
-		if drbd, ok := c.drbdRD[row.ResourceName]; ok {
-			// LINSTOR allocates one cluster-wide TCP port per RD; every
-			// replica listens on it. blockstor's per-replica allocator
-			// honours a preset value verbatim. The live port map (when
-			// supplied) wins over the dump's often-empty tcp_port so the
-			// adopted mesh keeps its current endpoint.
-			resource.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, rdDsp)
-		}
-
-		resources = append(resources, resource)
+		resources = append(resources, c.buildResource(row, rdDsp, nodeDsp, replicaName))
 	}
 
 	sortByName(resources, func(r crdv1alpha1.Resource) string { return r.Name })
 
 	return resources
+}
+
+// buildResource assembles one replica CRD from its RESOURCES row (the
+// caller has already applied the DELETE / referential-integrity
+// skips).
+func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName string) crdv1alpha1.Resource {
+	flags, rest := decodeResourceFlags(row.ResourceFlags)
+	if rest != 0 {
+		c.warnf("resource %s: unhandled flags bits %d dropped (of %d)", replicaName, rest, row.ResourceFlags)
+	}
+
+	typed, residual, extra := k8sstore.SplitProps(c.props.Resource(row.NodeName, row.ResourceName))
+
+	resource := crdv1alpha1.Resource{
+		TypeMeta:   typeMeta("Resource"),
+		ObjectMeta: objectMeta(replicaName),
+		Spec: crdv1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdDsp,
+			NodeName:               nodeDsp,
+			Props:                  residual,
+			DRBDOptions:            typed,
+			ExtraProps:             extra,
+			Flags:                  flags,
+			DRBDNodeID:             c.drbdNode[replicaKey{node: row.NodeName, rd: row.ResourceName}],
+			// Adopted replicas carry real data (or are the witness of
+			// a data-bearing set): never allow the day0 skip.
+			SkipInitialSync: ptr(false),
+		},
+	}
+
+	if storVol, ok := c.storVol[volumeReplicaKey{node: row.NodeName, rd: row.ResourceName, vlmNr: 0}]; ok {
+		resource.Spec.StoragePool = displayName(c.poolDsp[storVol.StorPoolName], storVol.StorPoolName)
+	} else if sp := resource.Spec.Props["StorPoolName"]; sp != "" {
+		resource.Spec.StoragePool = sp
+	}
+
+	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
+		// LINSTOR allocates one cluster-wide TCP port per RD; every
+		// replica listens on it. blockstor's per-replica allocator
+		// honours a preset value verbatim. The live port map (when
+		// supplied) wins over the dump's often-empty tcp_port so the
+		// adopted mesh keeps its current endpoint.
+		resource.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, rdDsp)
+	}
+
+	return resource
 }
 
 func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
@@ -695,6 +729,10 @@ func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
 			continue
 		case row.ResourceFlags&snapDfnFlagSuccessful == 0:
 			c.warnf("snapshot %s: not marked SUCCESSFUL (flags %d, take in flight?) — skipped", name, row.ResourceFlags)
+
+			continue
+		case !c.convertedRD[row.ResourceName]:
+			c.warnf("snapshot %s: parent resource definition was not migrated — skipped", name)
 
 			continue
 		}

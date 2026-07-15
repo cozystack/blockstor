@@ -490,6 +490,30 @@ func TestRemoteWarning(t *testing.T) {
 	}
 }
 
+// TestOrphanReplicaSkipped pins referential integrity: vol4's RD is
+// DELETE'd (skipped), so vol4.node-a — a replica whose parent RD did
+// not convert — must NOT be emitted as an orphan Resource (whose
+// <rd>.<node> CRD would reference a non-existent RD), and the drop
+// must be reported. Without the guard the replica converts and the
+// server-side CRD apply would leave a dangling Resource.
+func TestOrphanReplicaSkipped(t *testing.T) {
+	res := convertFixture(t)
+
+	for i := range res.Resources {
+		if res.Resources[i].Name == "pvc-vol4.node-a" {
+			t.Error("replica of a DELETE'd RD (pvc-vol4) must not convert into an orphan Resource")
+		}
+
+		if res.Resources[i].Spec.ResourceDefinitionName == "pvc-vol4" {
+			t.Errorf("Resource %s references un-migrated RD pvc-vol4", res.Resources[i].Name)
+		}
+	}
+
+	if !hasWarning(res, "pvc-vol4.node-a: parent resource definition was not migrated") {
+		t.Errorf("orphan-replica skip not reported; warnings: %v", res.Warnings)
+	}
+}
+
 // TestLuksPassphraseWarning pins the phase-1 LUKS posture: the
 // encrypted volume converts with its layer stack intact, and the
 // non-migratable master-key-encrypted passphrase is loudly reported
