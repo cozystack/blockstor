@@ -271,6 +271,12 @@ linters:
       - linters:
           - tagliatelle
         path: pkg/rest/
+      # pkg/linstormigrate mirrors the on-disk snake_case row schema of
+      # LINSTOR's k8s-backend database CRDs (*.internal.linstor.linbit.com).
+      # The JSON tags MUST match the dump format verbatim.
+      - linters:
+          - tagliatelle
+        path: pkg/linstormigrate/
       # pkg/drbd/drbdsetup_show.go mirrors drbd-utils' on-the-wire JSON
       # shape (`drbdsetup show -j`) which uses snake_case with leading
       # underscores on private-implementation fields. The JSON tags
