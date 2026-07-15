@@ -159,6 +159,7 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 build: manifests generate fmt vet ## Build controller + satellite binaries.
 	go build -o bin/controller ./cmd/controller
 	go build -o bin/satellite  ./cmd/satellite
+	go build -o bin/linstor-migrate ./cmd/linstor-migrate
 
 .PHONY: run
 run: manifests generate fmt vet ## Run the controller from your host.
