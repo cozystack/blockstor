@@ -35,9 +35,9 @@ import (
 // Keeping direct CRD writers on this helper guarantees their objects
 // read back through the store's mergeProps exactly like REST-created
 // ones.
-func SplitProps(props map[string]string) (typed *crdv1alpha1.DRBDOptions, residual, extra map[string]string) {
-	typed, extra = propsToTyped(props)
-	residual = stripDRBDProps(props)
+func SplitProps(props map[string]string) (*crdv1alpha1.DRBDOptions, map[string]string, map[string]string) {
+	typed, extra := propsToTyped(props)
+	residual := stripDRBDProps(props)
 
 	return typed, residual, extra
 }
