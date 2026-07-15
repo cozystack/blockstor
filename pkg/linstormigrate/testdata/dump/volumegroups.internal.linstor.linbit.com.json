@@ -1,0 +1,4 @@
+{"items":[
+{"spec":{"flags":0,"resource_group_name":"SC-REPLICATED","uuid":"50000000-0000-0000-0000-000000000001","vlm_nr":0}},
+{"spec":{"flags":0,"resource_group_name":"SC-ENCRYPTED","uuid":"50000000-0000-0000-0000-000000000002","vlm_nr":0}}
+]}

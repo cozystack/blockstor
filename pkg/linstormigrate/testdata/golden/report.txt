@@ -1,0 +1,6 @@
+converted: 3 nodes, 3 storage pools, 3 resource groups, 4 resource definitions, 9 resources, 1 snapshots
+warning: volume definition pvc-vol1/0: unhandled flags bitmask 32 dropped
+warning: resource definition pvc-vol4: marked DELETE in the source cluster — skipped
+warning: resource pvc-vol1.node-b: unhandled flags bits 128 dropped (of 128)
+warning: resource pvc-vol5.node-b: unhandled flags bits 2048 dropped (of 2048)
+warning: snapshot pvc-vol1.snap-bad: FAILED_DEPLOYMENT in the source cluster — skipped
