@@ -76,6 +76,10 @@ func nodeTypeName(nodeType int32) string {
 // report (warnings about rows the converter skipped or bits it could
 // not represent).
 type Result struct {
+	// ControllerConfig is the cluster-wide DRBD option singleton
+	// distilled from the LINSTOR /CTRL property bag; nil when the
+	// source cluster carries no DrbdOptions/* controller props.
+	ControllerConfig    *crdv1alpha1.ControllerConfig
 	Nodes               []crdv1alpha1.Node
 	StoragePools        []crdv1alpha1.StoragePool
 	ResourceGroups      []crdv1alpha1.ResourceGroup
@@ -141,6 +145,7 @@ func Convert(dump *Dump) (*Result, error) {
 	conv.buildIndexes()
 
 	res := &Result{
+		ControllerConfig:    conv.convertControllerConfig(),
 		Nodes:               conv.convertNodes(),
 		StoragePools:        conv.convertStoragePools(),
 		ResourceGroups:      conv.convertResourceGroups(),
@@ -149,9 +154,60 @@ func Convert(dump *Dump) (*Result, error) {
 		Snapshots:           conv.convertSnapshots(),
 	}
 
+	conv.reportRemotes()
+
 	res.Warnings = conv.warnings
 
 	return res, nil
+}
+
+// convertControllerConfig distills the LINSTOR /CTRL property bag into
+// the blockstor ControllerConfig singleton. Only `DrbdOptions/*` keys
+// carry over — they set cluster-wide DRBD behaviour (auto tiebreaker,
+// verify-alg allow-list, ...) exactly like `linstor controller
+// set-property` would through blockstor's REST. Everything else under
+// /CTRL is LINSTOR runtime plumbing (NetCom connector ports, TLS
+// keystores, Cluster/LocalID, the master-passphrase crypto material)
+// that must NOT leak into blockstor.
+func (c *converter) convertControllerConfig() *crdv1alpha1.ControllerConfig {
+	drbdProps := map[string]string{}
+
+	for key, val := range c.props.Controller {
+		if strings.HasPrefix(key, "DrbdOptions/") {
+			drbdProps[key] = val
+		}
+	}
+
+	if len(drbdProps) == 0 {
+		return nil
+	}
+
+	typed, _, extra := k8sstore.SplitProps(drbdProps)
+
+	return &crdv1alpha1.ControllerConfig{
+		TypeMeta:   typeMeta("ControllerConfig"),
+		ObjectMeta: metav1.ObjectMeta{Name: crdv1alpha1.ControllerConfigName},
+		Spec: crdv1alpha1.ControllerConfigSpec{
+			DRBDOptions: typed,
+			ExtraProps:  extra,
+		},
+	}
+}
+
+// reportRemotes surfaces operator-created backup-shipping remotes,
+// which have no blockstor equivalent. The self-referential
+// `local-remote-generated-by-linstor` entry every LINSTOR ≥1.21
+// creates automatically is noise and is skipped silently.
+func (c *converter) reportRemotes() {
+	for i := range c.dump.LinstorRemotes {
+		remote := &c.dump.LinstorRemotes[i]
+		if strings.HasSuffix(remote.Name, "-GENERATED-BY-LINSTOR") {
+			continue
+		}
+
+		c.warnf("linstor remote %s (%s): backup-shipping remotes have no blockstor equivalent — not migrated",
+			displayName(remote.DspName, remote.Name), remote.URL)
+	}
 }
 
 func (c *converter) buildIndexes() {
@@ -186,9 +242,21 @@ func (c *converter) buildNameIndexes() {
 func (c *converter) buildLayerIndexes() {
 	for i := range c.dump.LayerDrbdResourceDefinitions {
 		row := &c.dump.LayerDrbdResourceDefinitions[i]
-		if row.SnapshotName == "" && row.ResourceNameSuffix == "" {
-			c.drbdRD[row.ResourceName] = *row
+		if row.SnapshotName != "" {
+			continue
 		}
+
+		if row.ResourceNameSuffix != "" {
+			// Suffixed layer instances carry external-metadata /
+			// cache sub-devices; neither production dump exercises
+			// them and blockstor has no equivalent yet. Never drop
+			// one silently.
+			c.warnf("resource definition %s: DRBD layer suffix %q not migrated", row.ResourceName, row.ResourceNameSuffix)
+
+			continue
+		}
+
+		c.drbdRD[row.ResourceName] = *row
 	}
 
 	for i := range c.dump.LayerDrbdVolumeDefinitions {

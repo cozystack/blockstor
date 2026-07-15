@@ -1,0 +1,4 @@
+{"items":[
+{"spec":{"cluster_id":"00000000-1111-2222-3333-444444444444","dsp_name":"local-remote-generated-by-linstor","flags":0,"name":"LOCAL-REMOTE-GENERATED-BY-LINSTOR","url":"http://localhost:3370","uuid":"a0000000-0000-0000-0000-000000000001"}},
+{"spec":{"cluster_id":"","dsp_name":"offsite-dr","flags":0,"name":"OFFSITE-DR","url":"linstor://dr.example.test","uuid":"a0000000-0000-0000-0000-000000000002"}}
+]}

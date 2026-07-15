@@ -1,5 +1,14 @@
 ---
 apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ControllerConfig
+metadata:
+  name: default
+spec:
+  extraProps:
+    DrbdOptions/auto-add-quorum-tiebreaker: "True"
+    DrbdOptions/auto-verify-algo-allowed-list: crct10dif;crc32c;sha256
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Node
 metadata:
   name: node-a
@@ -146,6 +155,9 @@ spec:
       DrbdCurrentGi: F1E2D3C4B5A69788
     sizeKib: 1048576
     volumeNumber: 0
+  - drbdMinor: 1042
+    sizeKib: 307200
+    volumeNumber: 1
 ---
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition

@@ -226,6 +226,18 @@ type LayerLuksVolumeRow struct {
 	EncryptedPassword string `json:"encrypted_password"`
 }
 
+// LinstorRemoteRow is one row of the LINSTOR_REMOTES table (linstor↔
+// linstor backup-shipping targets). Not migratable to blockstor; the
+// converter reports any operator-created entry.
+type LinstorRemoteRow struct {
+	Name      string `json:"name"`
+	DspName   string `json:"dsp_name"`
+	URL       string `json:"url"`
+	ClusterID string `json:"cluster_id,omitempty"`
+	Flags     int64  `json:"flags"`
+	UUID      string `json:"uuid"`
+}
+
 // Dump is the loaded LINSTOR database.
 type Dump struct {
 	Nodes                        []NodeRow
@@ -246,4 +258,5 @@ type Dump struct {
 	LayerDrbdVolumes             []LayerDrbdVolumeRow
 	LayerStorageVolumes          []LayerStorageVolumeRow
 	LayerLuksVolumes             []LayerLuksVolumeRow
+	LinstorRemotes               []LinstorRemoteRow
 }

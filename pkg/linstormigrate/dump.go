@@ -107,6 +107,7 @@ func LoadDump(dir string) (*Dump, error) {
 		loadTable(dir, "layerdrbdvolumes", &dump.LayerDrbdVolumes),
 		loadTable(dir, "layerstoragevolumes", &dump.LayerStorageVolumes),
 		loadTable(dir, "layerluksvolumes", &dump.LayerLuksVolumes),
+		loadTable(dir, "linstorremotes", &dump.LinstorRemotes),
 	)
 	if err != nil {
 		return nil, err

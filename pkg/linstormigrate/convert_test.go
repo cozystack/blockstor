@@ -201,9 +201,9 @@ func TestDRBDIdentityCarriedVerbatim(t *testing.T) {
 		t.Errorf("pvc-vol1 drbdPort = %v, want 7001", vol1.Spec.DRBDPort)
 	}
 
-	if len(vol1.Spec.VolumeDefinitions) != 1 || vol1.Spec.VolumeDefinitions[0].DRBDMinor == nil ||
+	if len(vol1.Spec.VolumeDefinitions) == 0 || vol1.Spec.VolumeDefinitions[0].DRBDMinor == nil ||
 		*vol1.Spec.VolumeDefinitions[0].DRBDMinor != 1001 {
-		t.Errorf("pvc-vol1 volume minor not carried: %+v", vol1.Spec.VolumeDefinitions)
+		t.Errorf("pvc-vol1 volume-0 minor not carried: %+v", vol1.Spec.VolumeDefinitions)
 	}
 
 	if vol1.Spec.ExtraProps[drbdSharedSecretProp] != "fixture-secret-vol1" {
@@ -253,6 +253,135 @@ func TestSkippedRows(t *testing.T) {
 
 	if !hasWarning(res, "snap-bad: FAILED_DEPLOYMENT") {
 		t.Errorf("failed snapshot skip not reported; warnings: %v", res.Warnings)
+	}
+}
+
+// TestMultiVolumeMinorsVerbatim pins the multi-volume case observed in
+// production (two volume slots whose DRBD minors are NOT contiguous):
+// each volume must carry its own minor verbatim — a base+k derivation
+// would corrupt the second volume's device identity.
+func TestMultiVolumeMinorsVerbatim(t *testing.T) {
+	res := convertFixture(t)
+
+	var vol1 *crdv1alpha1.ResourceDefinition
+
+	for i := range res.ResourceDefinitions {
+		if res.ResourceDefinitions[i].Name == "pvc-vol1" {
+			vol1 = &res.ResourceDefinitions[i]
+
+			break
+		}
+	}
+
+	if vol1 == nil {
+		t.Fatal("pvc-vol1 not converted")
+	}
+
+	if len(vol1.Spec.VolumeDefinitions) != 2 {
+		t.Fatalf("pvc-vol1 volumeDefinitions = %d, want 2", len(vol1.Spec.VolumeDefinitions))
+	}
+
+	for i, want := range []struct {
+		number int32
+		minor  int32
+		size   int64
+	}{{0, 1001, 1048576}, {1, 1042, 307200}} {
+		got := vol1.Spec.VolumeDefinitions[i]
+		if got.VolumeNumber != want.number || got.SizeKib != want.size ||
+			got.DRBDMinor == nil || *got.DRBDMinor != want.minor {
+			t.Errorf("volume[%d] = {nr %d, size %d, minor %v}, want {nr %d, size %d, minor %d}",
+				i, got.VolumeNumber, got.SizeKib, got.DRBDMinor, want.number, want.size, want.minor)
+		}
+	}
+}
+
+// TestControllerConfigDistilled pins the /CTRL handling: cluster-wide
+// DrbdOptions/* carry into the ControllerConfig singleton while
+// LINSTOR runtime plumbing (NetCom ports, Cluster/LocalID) and the
+// master-key crypto material MUST NOT leak into blockstor.
+func TestControllerConfigDistilled(t *testing.T) {
+	res := convertFixture(t)
+
+	cc := res.ControllerConfig
+	if cc == nil {
+		t.Fatal("ControllerConfig not emitted despite /CTRL DrbdOptions props")
+	}
+
+	if cc.Name != crdv1alpha1.ControllerConfigName {
+		t.Errorf("ControllerConfig name = %q, want %q", cc.Name, crdv1alpha1.ControllerConfigName)
+	}
+
+	if cc.Spec.ExtraProps["DrbdOptions/auto-add-quorum-tiebreaker"] != "True" {
+		t.Errorf("auto-add-quorum-tiebreaker not carried; extraProps: %v", cc.Spec.ExtraProps)
+	}
+
+	if cc.Spec.ExtraProps["DrbdOptions/auto-verify-algo-allowed-list"] == "" {
+		t.Errorf("auto-verify-algo-allowed-list not carried; extraProps: %v", cc.Spec.ExtraProps)
+	}
+
+	for _, forbidden := range []string{"NetCom/SslConnector/Port", "Cluster/LocalID", "encryptedMasterKey"} {
+		if _, ok := cc.Spec.ExtraProps[forbidden]; ok {
+			t.Errorf("LINSTOR plumbing key %q leaked into ControllerConfig", forbidden)
+		}
+	}
+}
+
+// TestTypedDRBDOptionsRouting pins the props→typed split on the two
+// behaviour-bearing cases from production: replication protocol A on a
+// resource group and dual-primary (RWX) on an RD.
+func TestTypedDRBDOptionsRouting(t *testing.T) {
+	res := convertFixture(t)
+
+	var rg *crdv1alpha1.ResourceGroup
+
+	for i := range res.ResourceGroups {
+		if res.ResourceGroups[i].Name == "sc-replicated" {
+			rg = &res.ResourceGroups[i]
+
+			break
+		}
+	}
+
+	if rg == nil {
+		t.Fatal("sc-replicated not converted")
+	}
+
+	if rg.Spec.DRBDOptions == nil || rg.Spec.DRBDOptions.Net == nil || rg.Spec.DRBDOptions.Net.Protocol != "A" {
+		t.Errorf("sc-replicated protocol not typed: %+v", rg.Spec.DRBDOptions)
+	}
+
+	var vol5 *crdv1alpha1.ResourceDefinition
+
+	for i := range res.ResourceDefinitions {
+		if res.ResourceDefinitions[i].Name == "pvc-vol5" {
+			vol5 = &res.ResourceDefinitions[i]
+
+			break
+		}
+	}
+
+	if vol5 == nil {
+		t.Fatal("pvc-vol5 not converted")
+	}
+
+	if vol5.Spec.DRBDOptions == nil || vol5.Spec.DRBDOptions.Net == nil ||
+		vol5.Spec.DRBDOptions.Net.AllowTwoPrimaries == nil || !*vol5.Spec.DRBDOptions.Net.AllowTwoPrimaries {
+		t.Errorf("pvc-vol5 allow-two-primaries not typed: %+v", vol5.Spec.DRBDOptions)
+	}
+}
+
+// TestRemoteWarning pins the backup-shipping posture: the LINSTOR
+// auto-generated self-remote stays silent, an operator-created remote
+// is reported.
+func TestRemoteWarning(t *testing.T) {
+	res := convertFixture(t)
+
+	if !hasWarning(res, "offsite-dr") {
+		t.Errorf("operator-created linstor remote not reported; warnings: %v", res.Warnings)
+	}
+
+	if hasWarning(res, "local-remote-generated-by-linstor") {
+		t.Errorf("auto-generated self-remote must stay silent; warnings: %v", res.Warnings)
 	}
 }
 

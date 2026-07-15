@@ -33,8 +33,12 @@ import (
 // output is deterministic and diffable between runs.
 func WriteManifests(w io.Writer, res *Result) error {
 	docs := make([]any, 0,
-		len(res.Nodes)+len(res.StoragePools)+len(res.ResourceGroups)+
+		1+len(res.Nodes)+len(res.StoragePools)+len(res.ResourceGroups)+
 			len(res.ResourceDefinitions)+len(res.Resources)+len(res.Snapshots))
+
+	if res.ControllerConfig != nil {
+		docs = append(docs, res.ControllerConfig)
+	}
 
 	for i := range res.Nodes {
 		docs = append(docs, &res.Nodes[i])
