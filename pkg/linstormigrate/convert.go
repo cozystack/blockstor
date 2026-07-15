@@ -44,6 +44,9 @@ const drbdSharedSecretProp = "DrbdOptions/Net/shared-secret"
 // blockstor runs its own control plane.
 const nodeTypeController = "CONTROLLER"
 
+// annotationTrue is the canonical truthy annotation value.
+const annotationTrue = "true"
+
 // NODES.node_type integer values. Calibrated against a production dump
 // whose every node reported type 2 while `linstor n l` showed them all
 // as Satellite; 1/3/4 follow LINSTOR's documented
@@ -677,20 +680,23 @@ func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
 			},
 		}
 
-		for _, vd := range c.dump.VolumeDefinitions {
-			if vd.ResourceName != row.ResourceName || vd.SnapshotName != row.SnapshotName {
-				continue
-			}
-
-			snap.Spec.VolumeDefinitions = append(snap.Spec.VolumeDefinitions, crdv1alpha1.SnapshotVolumeRef{
-				VolumeNumber: vd.VlmNr,
-				SizeKib:      vd.VlmSize,
-			})
+		// The on-disk snapshot ALREADY EXISTS on every listed node —
+		// mark the CRD adopted so the controller backfills the
+		// terminal Ready state instead of running the suspend→take→
+		// resume orchestration (which would freeze production I/O to
+		// re-take an existing snapshot). The original creation time
+		// rides along for `linstor s l` parity.
+		if snap.Annotations == nil {
+			snap.Annotations = map[string]string{}
 		}
 
-		sort.Slice(snap.Spec.VolumeDefinitions, func(i, j int) bool {
-			return snap.Spec.VolumeDefinitions[i].VolumeNumber < snap.Spec.VolumeDefinitions[j].VolumeNumber
-		})
+		snap.Annotations[crdv1alpha1.AnnotationSnapshotAdopted] = annotationTrue
+
+		if ts := c.snapshotCreatedAtFor(row.ResourceName, row.SnapshotName); ts > 0 {
+			snap.Annotations[crdv1alpha1.AnnotationSnapshotAdoptedCreatedAt] = strconv.FormatInt(ts, 10)
+		}
+
+		snap.Spec.VolumeDefinitions = c.snapshotVolumeRefsFor(row.ResourceName, row.SnapshotName)
 
 		snaps = append(snaps, snap)
 	}
@@ -698,6 +704,44 @@ func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
 	sortByName(snaps, func(s crdv1alpha1.Snapshot) string { return s.Name })
 
 	return snaps
+}
+
+// snapshotVolumeRefsFor collects the snapshot's captured volume slots
+// (number + size) from the snapshot-scoped VOLUME_DEFINITIONS rows.
+func (c *converter) snapshotVolumeRefsFor(rdName, snapName string) []crdv1alpha1.SnapshotVolumeRef {
+	var out []crdv1alpha1.SnapshotVolumeRef
+
+	for i := range c.dump.VolumeDefinitions {
+		vd := &c.dump.VolumeDefinitions[i]
+		if vd.ResourceName != rdName || vd.SnapshotName != snapName {
+			continue
+		}
+
+		out = append(out, crdv1alpha1.SnapshotVolumeRef{
+			VolumeNumber: vd.VlmNr,
+			SizeKib:      vd.VlmSize,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].VolumeNumber < out[j].VolumeNumber })
+
+	return out
+}
+
+// snapshotCreatedAtFor returns the newest create_timestamp (ms epoch)
+// across the snapshot's per-node RESOURCES rows — the instant the take
+// completed cluster-wide; 0 when the rows carry no timestamp.
+func (c *converter) snapshotCreatedAtFor(rdName, snapName string) int64 {
+	var newest int64
+
+	for i := range c.dump.Resources {
+		row := &c.dump.Resources[i]
+		if row.ResourceName == rdName && row.SnapshotName == snapName && row.CreateTimestamp > newest {
+			newest = row.CreateTimestamp
+		}
+	}
+
+	return newest
 }
 
 func (c *converter) snapshotNodesFor(rdName, snapName string) []string {

@@ -328,6 +328,9 @@ spec:
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Snapshot
 metadata:
+  annotations:
+    blockstor.io/adopted: "true"
+    blockstor.io/adopted-created-at: "1770000000011"
   name: pvc-vol1.snap-good
 spec:
   nodes:

@@ -251,6 +251,21 @@ func TestSkippedRows(t *testing.T) {
 		t.Errorf("snapshots = %v, want only pvc-vol1.snap-good (snap-bad is FAILED_DEPLOYMENT)", names)
 	}
 
+	// The adopted-snapshot annotations keep the controller from
+	// re-running the suspend→take orchestration against production
+	// I/O; the created-at annotation carries the newest per-node
+	// create_timestamp (node-b's 1770000000011 in the fixture).
+	if len(res.Snapshots) == 1 {
+		ann := res.Snapshots[0].Annotations
+		if ann[crdv1alpha1.AnnotationSnapshotAdopted] != "true" {
+			t.Errorf("migrated snapshot missing %s annotation: %v", crdv1alpha1.AnnotationSnapshotAdopted, ann)
+		}
+
+		if ann[crdv1alpha1.AnnotationSnapshotAdoptedCreatedAt] != "1770000000011" {
+			t.Errorf("adopted-created-at = %q, want 1770000000011", ann[crdv1alpha1.AnnotationSnapshotAdoptedCreatedAt])
+		}
+	}
+
 	if !hasWarning(res, "snap-bad: FAILED_DEPLOYMENT") {
 		t.Errorf("failed snapshot skip not reported; warnings: %v", res.Warnings)
 	}
