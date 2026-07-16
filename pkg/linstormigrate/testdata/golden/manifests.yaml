@@ -213,6 +213,18 @@ spec:
     volumeNumber: 0
 ---
 apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceDefinition
+metadata:
+  name: pvc-vol6
+spec:
+  initialized: true
+  layerStack:
+  - STORAGE
+  volumeDefinitions:
+  - sizeKib: 1048576
+    volumeNumber: 0
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol1.node-a
@@ -315,6 +327,16 @@ spec:
   drbdNodeID: 1
   nodeName: node-b
   resourceDefinitionName: pvc-vol5
+  skipInitialSync: false
+  storagePool: data
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol6.node-a
+spec:
+  nodeName: node-a
+  resourceDefinitionName: pvc-vol6
   skipInitialSync: false
   storagePool: data
 ---

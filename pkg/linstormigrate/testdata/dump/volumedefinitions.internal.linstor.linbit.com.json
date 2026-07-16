@@ -79,6 +79,16 @@
 "vlm_nr": 1,
 "vlm_size": 307200
 }
+},
+{
+"spec": {
+"resource_name": "PVC-VOL6",
+"snapshot_name": "",
+"uuid": "70000000-0000-0000-0000-000000000009",
+"vlm_flags": 0,
+"vlm_nr": 0,
+"vlm_size": 1048576
+}
 }
 ]
 }

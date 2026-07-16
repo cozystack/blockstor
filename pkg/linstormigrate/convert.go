@@ -133,6 +133,7 @@ type converter struct {
 	// skipped/absent RD, a replica on an unknown node, ...).
 	convertedRD   map[string]bool // by resource_name (UPPERCASE key)
 	convertedNode map[string]bool // by node_name (UPPERCASE key)
+	convertedRG   map[string]bool // by resource_group_name (UPPERCASE key)
 
 	warnings  []string
 	warnedKey map[string]bool
@@ -178,6 +179,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		luksVol:       map[volumeReplicaKey]LayerLuksVolumeRow{},
 		convertedRD:   map[string]bool{},
 		convertedNode: map[string]bool{},
+		convertedRG:   map[string]bool{},
 		warnedKey:     map[string]bool{},
 	}
 
@@ -487,6 +489,8 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 			}
 		}
 
+		c.convertedRG[row.ResourceGroupName] = true
+
 		groups = append(groups, group)
 	}
 
@@ -530,13 +534,26 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 			c.warnf("resource definition %s: unhandled flags bitmask %d dropped", dsp, row.ResourceFlags)
 		}
 
+		// Referential integrity: an RD may name a resource group that was
+		// not migrated (an incomplete dump, or an RG the source cluster
+		// deleted). blockstor spawns from an RG but does not require it to
+		// exist for an already-materialised RD, so keep the RD (dropping
+		// it would lose a real volume) but clear the dangling reference
+		// and report it rather than emit an RD pointing at nothing.
+		rgRef := c.displayRG(row.ResourceGroupName)
+		if row.ResourceGroupName != "" && !c.convertedRG[row.ResourceGroupName] {
+			c.warnf("resource definition %s: resource group %q was not migrated — reference cleared", dsp, rgRef)
+
+			rgRef = ""
+		}
+
 		typed, residual, extra := k8sstore.SplitProps(c.props.ResourceDefinition(row.ResourceName))
 
 		def := crdv1alpha1.ResourceDefinition{
 			TypeMeta:   typeMeta("ResourceDefinition"),
 			ObjectMeta: objectMeta(dsp),
 			Spec: crdv1alpha1.ResourceDefinitionSpec{
-				ResourceGroupName: c.displayRG(row.ResourceGroupName),
+				ResourceGroupName: rgRef,
 				Props:             residual,
 				DRBDOptions:       typed,
 				ExtraProps:        extra,
@@ -549,32 +566,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 			},
 		}
 
-		if drbd, ok := c.drbdRD[row.ResourceName]; ok {
-			def.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, dsp)
-
-			if drbd.Secret != "" {
-				if def.Spec.ExtraProps == nil {
-					def.Spec.ExtraProps = map[string]string{}
-				}
-				// Carried so the satellite renders the same `net {
-				// shared-secret }` the source cluster's kernels already
-				// run — adoption then re-applies an identical config
-				// instead of re-keying the mesh.
-				def.Spec.ExtraProps[drbdSharedSecretProp] = drbd.Secret
-			}
-		}
-
-		def.Spec.VolumeDefinitions = c.volumeDefinitionsFor(row.ResourceName, dsp)
-
-		if c.rdHasLuks(row.ResourceName) {
-			// LAYER_LUKS_VOLUMES carries the volume passphrase encrypted
-			// with the LINSTOR master key; decrypting it needs the
-			// operator's master passphrase and LINSTOR's KDF, which this
-			// converter does not implement yet. The layer stack is
-			// preserved, but the volume cannot be opened until the
-			// passphrase is provisioned into blockstor by hand.
-			c.warnf("resource definition %s: LUKS passphrase NOT migrated (encrypted with the LINSTOR master key) — provision spec.encryption manually before adopting", dsp)
-		}
+		c.attachRDLayerFields(&def, row, dsp)
 
 		c.convertedRD[row.ResourceName] = true
 
@@ -584,6 +576,37 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 	sortByName(defs, func(d crdv1alpha1.ResourceDefinition) string { return d.Name })
 
 	return defs
+}
+
+// attachRDLayerFields fills the DRBD (port, shared-secret), volume and
+// LUKS-report bits onto a converted ResourceDefinition.
+func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row *ResourceDefinitionRow, dsp string) {
+	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
+		def.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, dsp)
+
+		if drbd.Secret != "" {
+			if def.Spec.ExtraProps == nil {
+				def.Spec.ExtraProps = map[string]string{}
+			}
+			// Carried so the satellite renders the same `net {
+			// shared-secret }` the source cluster's kernels already
+			// run — adoption then re-applies an identical config
+			// instead of re-keying the mesh.
+			def.Spec.ExtraProps[drbdSharedSecretProp] = drbd.Secret
+		}
+	}
+
+	def.Spec.VolumeDefinitions = c.volumeDefinitionsFor(row.ResourceName, dsp)
+
+	if c.rdHasLuks(row.ResourceName) {
+		// LAYER_LUKS_VOLUMES carries the volume passphrase encrypted
+		// with the LINSTOR master key; decrypting it needs the
+		// operator's master passphrase and LINSTOR's KDF, which this
+		// converter does not implement yet. The layer stack is
+		// preserved, but the volume cannot be opened until the
+		// passphrase is provisioned into blockstor by hand.
+		c.warnf("resource definition %s: LUKS passphrase NOT migrated (encrypted with the LINSTOR master key) — provision spec.encryption manually before adopting", dsp)
+	}
 }
 
 // rdHasLuks reports whether any live replica of the RD carries a LUKS
@@ -746,41 +769,49 @@ func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
 			continue
 		}
 
-		snap := crdv1alpha1.Snapshot{
-			TypeMeta:   typeMeta("Snapshot"),
-			ObjectMeta: objectMeta(name),
-			Spec: crdv1alpha1.SnapshotSpec{
-				ResourceDefinitionName: rdDsp,
-				SnapshotName:           snapDsp,
-				Props:                  c.props.SnapshotDefinition(row.ResourceName, row.SnapshotName),
-				Nodes:                  c.snapshotNodesFor(row.ResourceName, row.SnapshotName),
-			},
+		nodes := c.snapshotNodesFor(row.ResourceName, row.SnapshotName, snapDsp)
+		if len(nodes) == 0 {
+			c.warnf("snapshot %s: no placement on a migrated node — skipped", name)
+
+			continue
 		}
 
-		// The on-disk snapshot ALREADY EXISTS on every listed node —
-		// mark the CRD adopted so the controller backfills the
-		// terminal Ready state instead of running the suspend→take→
-		// resume orchestration (which would freeze production I/O to
-		// re-take an existing snapshot). The original creation time
-		// rides along for `linstor s l` parity.
-		if snap.Annotations == nil {
-			snap.Annotations = map[string]string{}
-		}
-
-		snap.Annotations[crdv1alpha1.AnnotationSnapshotAdopted] = annotationTrue
-
-		if ts := c.snapshotCreatedAtFor(row.ResourceName, row.SnapshotName); ts > 0 {
-			snap.Annotations[crdv1alpha1.AnnotationSnapshotAdoptedCreatedAt] = strconv.FormatInt(ts, 10)
-		}
-
-		snap.Spec.VolumeDefinitions = c.snapshotVolumeRefsFor(row.ResourceName, row.SnapshotName)
-
-		snaps = append(snaps, snap)
+		snaps = append(snaps, c.buildSnapshot(row, rdDsp, snapDsp, name, nodes))
 	}
 
 	sortByName(snaps, func(s crdv1alpha1.Snapshot) string { return s.Name })
 
 	return snaps
+}
+
+// buildSnapshot assembles one adopted Snapshot CRD (the caller has
+// applied the FAILED/SUCCESSFUL/parent/nodes skips).
+func (c *converter) buildSnapshot(row *ResourceDefinitionRow, rdDsp, snapDsp, name string, nodes []string) crdv1alpha1.Snapshot {
+	snap := crdv1alpha1.Snapshot{
+		TypeMeta:   typeMeta("Snapshot"),
+		ObjectMeta: objectMeta(name),
+		Spec: crdv1alpha1.SnapshotSpec{
+			ResourceDefinitionName: rdDsp,
+			SnapshotName:           snapDsp,
+			Props:                  c.props.SnapshotDefinition(row.ResourceName, row.SnapshotName),
+			Nodes:                  nodes,
+		},
+	}
+
+	// The on-disk snapshot ALREADY EXISTS on every listed node — mark the
+	// CRD adopted so the controller backfills the terminal Ready state
+	// instead of running the suspend→take→resume orchestration (which
+	// would freeze production I/O to re-take an existing snapshot). The
+	// original creation time rides along for `linstor s l` parity.
+	snap.Annotations = map[string]string{crdv1alpha1.AnnotationSnapshotAdopted: annotationTrue}
+
+	if ts := c.snapshotCreatedAtFor(row.ResourceName, row.SnapshotName); ts > 0 {
+		snap.Annotations[crdv1alpha1.AnnotationSnapshotAdoptedCreatedAt] = strconv.FormatInt(ts, 10)
+	}
+
+	snap.Spec.VolumeDefinitions = c.snapshotVolumeRefsFor(row.ResourceName, row.SnapshotName)
+
+	return snap
 }
 
 // resolveDRBDPort picks the DRBD listen port to preset on an RD /
@@ -845,13 +876,27 @@ func (c *converter) snapshotCreatedAtFor(rdName, snapName string) int64 {
 	return newest
 }
 
-func (c *converter) snapshotNodesFor(rdName, snapName string) []string {
+// snapshotNodesFor lists the nodes an adopted Snapshot targets, dropping
+// any placement on a node that did not convert (CONTROLLER / unknown /
+// skipped). Keeping such a node would make the adopted Snapshot wait for
+// terminal readiness from a Node object that never exists. snapName is
+// used for the per-exclusion warning.
+func (c *converter) snapshotNodesFor(rdName, snapName, snapDsp string) []string {
 	var out []string
 
-	for _, row := range c.dump.Resources {
-		if row.ResourceName == rdName && row.SnapshotName == snapName {
-			out = append(out, c.displayNode(row.NodeName))
+	for i := range c.dump.Resources {
+		row := &c.dump.Resources[i]
+		if row.ResourceName != rdName || row.SnapshotName != snapName {
+			continue
 		}
+
+		if !c.convertedNode[row.NodeName] {
+			c.warnf("snapshot %s.%s: placement on un-migrated node %s dropped", c.displayRD(rdName), snapDsp, c.displayNode(row.NodeName))
+
+			continue
+		}
+
+		out = append(out, c.displayNode(row.NodeName))
 	}
 
 	sort.Strings(out)

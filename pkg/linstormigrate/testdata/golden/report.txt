@@ -1,9 +1,10 @@
-converted: 3 nodes, 3 storage pools, 3 resource groups, 4 resource definitions, 8 resources, 1 snapshots
+converted: 3 nodes, 3 storage pools, 3 resource groups, 5 resource definitions, 9 resources, 1 snapshots
 warning: volume definition pvc-vol1/0: unhandled flags bitmask 32 dropped
 warning: resource definition pvc-vol3: no DRBD port in the dump or live map — blockstor will allocate a fresh port; the adopted mesh will reconnect on the new port. Capture live ports (see runbook) to avoid the blip.
 warning: resource definition pvc-vol3: LUKS passphrase NOT migrated (encrypted with the LINSTOR master key) — provision spec.encryption manually before adopting
 warning: resource definition pvc-vol4: marked DELETE in the source cluster — skipped
 warning: resource definition pvc-vol5: no DRBD port in the dump or live map — blockstor will allocate a fresh port; the adopted mesh will reconnect on the new port. Capture live ports (see runbook) to avoid the blip.
+warning: resource definition pvc-vol6: resource group "SC-GHOST" was not migrated — reference cleared
 warning: resource pvc-vol1.node-b: unhandled flags bits 128 dropped (of 128)
 warning: resource pvc-vol4.node-a: parent resource definition was not migrated — replica skipped
 warning: resource pvc-vol5.node-b: unhandled flags bits 2048 dropped (of 2048)

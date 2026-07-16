@@ -602,6 +602,109 @@ func TestOrphanReplicaSkipped(t *testing.T) {
 	}
 }
 
+// TestReferencesResolveWithinConvertedSet pins cross-object referential
+// integrity (the class Gemini flagged): every reference a converted
+// object carries must resolve to another converted object's
+// metadata.name — a `Resource` to its `ResourceDefinition` and `Node`, a
+// `Snapshot` to its `ResourceDefinition`, an `RD` to its `ResourceGroup`
+// (or empty). References use the LINSTOR display name and metadata.name
+// is `k8sstore.Name(display)`; for the clean lowercase names blockstor
+// carries on the wire the two are identical, so a converted reference
+// never dangles or points at a differently-cased object.
+func TestReferencesResolveWithinConvertedSet(t *testing.T) {
+	res := convertFixture(t)
+
+	rdNames := map[string]bool{}
+	for i := range res.ResourceDefinitions {
+		rdNames[res.ResourceDefinitions[i].Name] = true
+	}
+
+	nodeNames := map[string]bool{}
+	for i := range res.Nodes {
+		nodeNames[res.Nodes[i].Name] = true
+	}
+
+	rgNames := map[string]bool{}
+	for i := range res.ResourceGroups {
+		rgNames[res.ResourceGroups[i].Name] = true
+	}
+
+	for i := range res.Resources {
+		r := &res.Resources[i]
+		if !rdNames[k8sstore.Name(r.Spec.ResourceDefinitionName)] {
+			t.Errorf("Resource %s references RD %q with no converted object", r.Name, r.Spec.ResourceDefinitionName)
+		}
+
+		if !nodeNames[k8sstore.Name(r.Spec.NodeName)] {
+			t.Errorf("Resource %s references Node %q with no converted object", r.Name, r.Spec.NodeName)
+		}
+	}
+
+	for i := range res.Snapshots {
+		s := &res.Snapshots[i]
+		if !rdNames[k8sstore.Name(s.Spec.ResourceDefinitionName)] {
+			t.Errorf("Snapshot %s references RD %q with no converted object", s.Name, s.Spec.ResourceDefinitionName)
+		}
+	}
+
+	for i := range res.ResourceDefinitions {
+		rd := &res.ResourceDefinitions[i]
+		if rd.Spec.ResourceGroupName != "" && !rgNames[k8sstore.Name(rd.Spec.ResourceGroupName)] {
+			t.Errorf("RD %s references RG %q with no converted object", rd.Name, rd.Spec.ResourceGroupName)
+		}
+	}
+}
+
+// TestDanglingResourceGroupRefCleared pins the referential-integrity
+// guard for RG references (CodeRabbit finding): an RD whose
+// resource_group_name names a group that did not convert must keep the
+// RD (dropping it would lose a real volume) but clear the dangling
+// reference and report it, so the RD never points at a non-existent RG.
+func TestDanglingResourceGroupRefCleared(t *testing.T) {
+	res := convertFixture(t)
+
+	var vol6 *crdv1alpha1.ResourceDefinition
+
+	for i := range res.ResourceDefinitions {
+		if res.ResourceDefinitions[i].Name == "pvc-vol6" {
+			vol6 = &res.ResourceDefinitions[i]
+
+			break
+		}
+	}
+
+	if vol6 == nil {
+		t.Fatal("pvc-vol6 (dangling-RG RD) must still convert, not be dropped")
+	}
+
+	if vol6.Spec.ResourceGroupName != "" {
+		t.Errorf("dangling RG ref = %q, want cleared", vol6.Spec.ResourceGroupName)
+	}
+
+	if !hasWarning(res, "pvc-vol6: resource group") {
+		t.Errorf("dangling RG ref not reported; warnings: %v", res.Warnings)
+	}
+}
+
+// TestSnapshotDropsUnmigratedNodes pins the referential-integrity guard
+// for snapshot placements (CodeRabbit finding): a snapshot node that did
+// not convert is dropped from Spec.Nodes (else the adopted Snapshot
+// waits for Ready from a Node object that never exists). The fixture's
+// snap-good is placed on node-a/node-b (both migrated), so both survive
+// and no diskless/controller node leaks in.
+func TestSnapshotDropsUnmigratedNodes(t *testing.T) {
+	res := convertFixture(t)
+
+	for i := range res.Snapshots {
+		snap := &res.Snapshots[i]
+		for _, node := range snap.Spec.Nodes {
+			if !slices.Contains([]string{"node-a", "node-b", "node-c"}, node) {
+				t.Errorf("snapshot %s targets un-migrated node %q", snap.Name, node)
+			}
+		}
+	}
+}
+
 // TestLuksPassphraseWarning pins the phase-1 LUKS posture: the
 // encrypted volume converts with its layer stack intact, and the
 // non-migratable master-key-encrypted passphrase is loudly reported
