@@ -627,6 +627,32 @@ func TestDivergentPerVolumePoolsSkipped(t *testing.T) {
 	findResource(t, res, "pvc-vol1.node-a")
 }
 
+// TestMultiVolumeSnapshotCoverageReported pins the honest-coverage rule
+// for adopted snapshots: blockstor's ZFS provider addresses a snapshot
+// as `<pool>/<rd>_00000@<snap>` (zfs.go snapshotDataset — volume 0
+// only), so a snapshot that captured several volumes adopts with just
+// its first volume restorable. The extra volume slots must not imply
+// coverage that does not exist on disk.
+func TestMultiVolumeSnapshotCoverageReported(t *testing.T) {
+	res := convertFixture(t)
+
+	var multi bool
+
+	for i := range res.Snapshots {
+		if len(res.Snapshots[i].Spec.VolumeDefinitions) > 1 {
+			multi = true
+		}
+	}
+
+	if !multi {
+		t.Fatal("fixture has no multi-volume snapshot — the coverage warning is not exercised")
+	}
+
+	if !hasWarning(res, "blockstor addresses only volume 0") {
+		t.Errorf("multi-volume snapshot coverage limit not reported; warnings: %v", res.Warnings)
+	}
+}
+
 // TestVolumeAndNodeFlagsReported pins that the two tables previously
 // loaded-but-never-examined now surface their markers: a non-zero
 // VOLUMES.vlm_flags (DELETE/RESIZE and friends) is reported rather than

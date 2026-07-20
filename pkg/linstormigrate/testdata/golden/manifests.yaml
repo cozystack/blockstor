@@ -384,3 +384,5 @@ spec:
   volumeDefinitions:
   - sizeKib: 1048576
     volumeNumber: 0
+  - sizeKib: 307200
+    volumeNumber: 1

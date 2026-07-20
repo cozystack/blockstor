@@ -58,6 +58,13 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 
    If any single-replica volume's computed name is absent from `ondisk-zvols.txt`, STOP — do not cut over until the naming is reconciled (`zfs rename`, or fix the converter).
 
+   **Adopted snapshots are addressed the same way** — `<zpool>/<rd-name-lowercased>_00000@<snapshot-name>` — so run the same cross-check for them, otherwise a name miss only surfaces when someone tries to restore, long after cutover:
+
+   ```bash
+   zfs list -H -o name -t snapshot | sort > /tmp/ondisk-snapshots.txt
+   # every migrated Snapshot's <zpool>/<rd>_00000@<snap> must appear here
+   ```
+
 6. **Rehearse on staging first.** Do a full dry-run adoption of a COPY of the pools (or a representative subset) on a non-production cluster: apply the manifests, confirm every StoragePool registers a provider (no `provider requires … in props` errors in the satellite log), every Resource reaches `UpToDate` with `out-of-sync=0` (adopted, not resynced), and no new empty zvols appear. Only after a clean staging rehearsal proceed to production.
 
 ## Convert
@@ -111,3 +118,6 @@ Until CSI is repointed and confirmed, rollback is: scale blockstor to 0, scale `
 | Unknown flag bits dropped | Cosmetic runtime bookkeeping only | Reported; verified not to carry availability semantics |
 | Placement/data unchanged | The converter never moves data | Rebalance with blockstor after migration if desired |
 | Single-replica zvol name must byte-match on disk | A mismatch presents an empty disk (no DRBD resync fallback) | Pre-flight step 5 cross-check + staging rehearsal (step 6) |
+| Snapshots cover volume 0 only | blockstor addresses a snapshot as `<zpool>/<rd>_00000@<snap>`; a snapshot that captured a multi-volume resource adopts with only its first volume restorable | Reported per snapshot by the converter; re-take those snapshots after migration if the other volumes matter |
+| Undecoded flag bits are reported, not interpreted | A `non-zero vlm_flags` / `node_flags` / `unhandled flags bits` line means the source cluster had a marker this tool refuses to guess at (e.g. a size-semantics or eviction bit) | Look the object up in the source cluster before cutover (`linstor v l` / `n l`) and confirm it should be adopted as-is; the volume's `SizeKib` is carried verbatim either way |
+| Node type mapping is empirically calibrated | Only `node_type=2` (SATELLITE) was confirmed against a live cluster; a CONTROLLER/AUXILIARY ordering error would adopt a controller node as AUXILIARY instead of skipping it | Controller nodes carry no pools or replicas, so impact is bounded — but check the report for unexpected node kinds |

@@ -11,5 +11,6 @@ warning: resource pvc-vol3.node-a volume 0: non-zero vlm_flags 64 (not decoded; 
 warning: resource pvc-vol4.node-a: parent resource definition was not migrated — replica skipped
 warning: resource pvc-vol5.node-b: unhandled flags bits 2048 dropped (of 2048)
 warning: resource pvc-vol7.node-a: volumes span multiple storage pools (data, fast) but blockstor holds one pool per replica — replica skipped
+warning: snapshot pvc-vol1.snap-good: captured 2 volumes but blockstor addresses only volume 0 (<pool>/<rd>_00000@<snap>) — restore/delete of the other volumes will not find a dataset
 warning: snapshot pvc-vol1.snap-bad: FAILED_DEPLOYMENT in the source cluster — skipped
 warning: linstor remote offsite-dr (linstor://dr.example.test): backup-shipping remotes have no blockstor equivalent — not migrated

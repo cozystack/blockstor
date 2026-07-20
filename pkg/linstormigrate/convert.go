@@ -881,6 +881,17 @@ func (c *converter) buildSnapshot(row *ResourceDefinitionRow, rdDsp, snapDsp, na
 
 	snap.Spec.VolumeDefinitions = c.snapshotVolumeRefsFor(row.ResourceName, row.SnapshotName)
 
+	// blockstor's ZFS provider addresses a snapshot as
+	// `<pool>/<resource>_00000@<snap>` — volume 0 only (multi-volume
+	// snapshot support is not implemented). A snapshot that captured
+	// more than one volume therefore adopts with only its first volume
+	// reachable for restore/delete; report it rather than let the extra
+	// volume slots imply coverage that does not exist.
+	if len(snap.Spec.VolumeDefinitions) > 1 {
+		c.warnf("snapshot %s: captured %d volumes but blockstor addresses only volume 0 (<pool>/<rd>_00000@<snap>) — restore/delete of the other volumes will not find a dataset",
+			name, len(snap.Spec.VolumeDefinitions))
+	}
+
 	return snap
 }
 

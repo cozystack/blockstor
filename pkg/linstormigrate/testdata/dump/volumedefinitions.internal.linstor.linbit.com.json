@@ -109,6 +109,16 @@
 "vlm_nr": 1,
 "vlm_size": 524288
 }
+},
+{
+"spec": {
+"resource_name": "PVC-VOL1",
+"snapshot_name": "SNAP-GOOD",
+"uuid": "70000000-0000-0000-0000-00000000000c",
+"vlm_flags": 0,
+"vlm_nr": 1,
+"vlm_size": 307200
+}
 }
 ]
 }
