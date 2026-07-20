@@ -181,6 +181,13 @@
 "prop_value": "fixture-master-crypto-material",
 "props_instance": "/CTRL"
 }
+},
+{
+"spec": {
+"prop_key": "StorDriver/StorPoolName",
+"prop_value": "fast",
+"props_instance": "/STOR_POOLS/NODE-A/FAST"
+}
 }
 ]
 }

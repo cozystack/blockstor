@@ -128,9 +128,10 @@ func TestFactoryZFSFallsBackBetweenKeys(t *testing.T) {
 
 // TestFactoryZFSAdoptsStorPoolNameKey pins B1: a real LINSTOR ≥1.x
 // database stores the zpool name under the generic
-// `StorDriver/StorPoolName` with BOTH ZPool keys blank (verified on
-// the live aenix-infra cluster: sp l shows StorPoolName=data,
-// ZPool/ZPoolThin empty). Before the fallback, NewProviderFromKind
+// `StorDriver/StorPoolName` with BOTH ZPool keys blank (verified
+// against a production ZFS-backed cluster: `sp l` reports
+// StorPoolName=data with ZPool/ZPoolThin empty, and the node's zpool is
+// named `data`). Before the fallback, NewProviderFromKind
 // errored on these exact props → the pool never registered → NO
 // diskful resource could adopt. This test fails on the pre-fix factory
 // and passes with the StorPoolName fallback.
@@ -169,6 +170,56 @@ func TestFactoryZFSAdoptsStorPoolNameKey(t *testing.T) {
 	}
 
 	assertZFSProviderUsesPool(t, provThin, thinExec, "data")
+}
+
+// TestFactoryLVMAdoptsStorPoolNameKey pins the same generic-key gap for
+// LVM and LVM_THIN that the ZFS test pins: LINSTOR records the backing
+// volume group (LVM) or `<vg>/<thinpool>` (LVM_THIN) under the generic
+// `StorDriver/StorPoolName`, leaving `StorDriver/LvmVg` and
+// `StorDriver/ThinPool` blank. Without the fallback an adopted
+// LVM-backed pool never registers a provider — the same total-adoption
+// failure the ZFS fix addressed, and it would only surface at cutover,
+// after the source controller is already stopped.
+func TestFactoryLVMAdoptsStorPoolNameKey(t *testing.T) {
+	t.Parallel()
+
+	thick, err := satellite.NewProviderFromKind(
+		satellite.ProviderKindLVM,
+		map[string]string{"StorDriver/StorPoolName": "vg0"},
+		storage.NewFakeExec(),
+	)
+	if err != nil {
+		t.Fatalf("NewProviderFromKind(LVM, StorPoolName only): %v", err)
+	}
+
+	if thick == nil || thick.Kind() != "LVM" {
+		t.Fatalf("LVM provider not registered from the generic key: %v", thick)
+	}
+
+	// LVM_THIN records both halves in one generic value.
+	thin, err := satellite.NewProviderFromKind(
+		satellite.ProviderKindLVMThin,
+		map[string]string{"StorDriver/StorPoolName": "vg0/thinpool"},
+		storage.NewFakeExec(),
+	)
+	if err != nil {
+		t.Fatalf("NewProviderFromKind(LVM_THIN, StorPoolName only): %v", err)
+	}
+
+	if thin == nil || thin.Kind() != "LVM_THIN" {
+		t.Fatalf("LVM_THIN provider not registered from the generic key: %v", thin)
+	}
+
+	// A generic value carrying only the VG still needs the thin pool:
+	// fail loudly rather than guess a thin-pool name.
+	_, err = satellite.NewProviderFromKind(
+		satellite.ProviderKindLVMThin,
+		map[string]string{"StorDriver/StorPoolName": "vg0"},
+		storage.NewFakeExec(),
+	)
+	if err == nil {
+		t.Error("LVM_THIN with no thin pool in either key must error, not guess")
+	}
 }
 
 // TestFactoryZFSMissingBothKeysErrors documents the negative

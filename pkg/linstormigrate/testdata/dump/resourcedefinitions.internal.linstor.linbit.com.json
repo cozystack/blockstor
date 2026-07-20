@@ -97,6 +97,18 @@
 "snapshot_name": "",
 "uuid": "60000000-0000-0000-0000-000000000009"
 }
+},
+{
+"spec": {
+"layer_stack": "[\"STORAGE\"]",
+"resource_dsp_name": "pvc-vol7",
+"resource_flags": 0,
+"resource_group_name": "DFLTRSCGRP",
+"resource_name": "PVC-VOL7",
+"snapshot_dsp_name": "",
+"snapshot_name": "",
+"uuid": "60000000-0000-0000-0000-00000000000a"
+}
 }
 ]
 }

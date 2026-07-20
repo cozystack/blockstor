@@ -276,7 +276,7 @@ func TestZvolNameAdoptionInvariant(t *testing.T) {
 
 // TestConvertedZFSPoolsRegisterProvider pins B1 end-to-end at the
 // migration layer: a real LINSTOR ZFS pool stores its zpool name under
-// StorDriver/StorPoolName (the fixture mirrors the live aenix-infra
+// StorDriver/StorPoolName (the fixture mirrors a production ZFS-backed
 // shape — ZFS thick, StorPoolName=data, no ZPool key). The migrator
 // copies props verbatim, so unless the satellite factory accepts that
 // key, every converted ZFS StoragePool fails to register a provider
@@ -599,6 +599,44 @@ func TestOrphanReplicaSkipped(t *testing.T) {
 
 	if !hasWarning(res, "pvc-vol4.node-a: parent resource definition was not migrated") {
 		t.Errorf("orphan-replica skip not reported; warnings: %v", res.Warnings)
+	}
+}
+
+// TestDivergentPerVolumePoolsSkipped pins the never-guess rule for the
+// one data-bearing field blockstor cannot represent faithfully:
+// LINSTOR allows a per-VOLUME storage pool, blockstor's Resource holds
+// ONE pool per replica. Collapsing a divergent set to volume 0's pool
+// would send blockstor looking for the other volumes' backing devices
+// in the wrong pool — a fresh empty zvol beside the real data (silent
+// for a single-replica STORAGE-only volume). The replica must be
+// skipped and reported instead.
+func TestDivergentPerVolumePoolsSkipped(t *testing.T) {
+	res := convertFixture(t)
+
+	for i := range res.Resources {
+		if res.Resources[i].Name == "pvc-vol7.node-a" {
+			t.Error("replica whose volumes span two storage pools must be skipped, not collapsed to volume 0's pool")
+		}
+	}
+
+	if !hasWarning(res, "pvc-vol7.node-a: volumes span multiple storage pools") {
+		t.Errorf("divergent per-volume pools not reported; warnings: %v", res.Warnings)
+	}
+
+	// A replica whose volumes share one pool still converts.
+	findResource(t, res, "pvc-vol1.node-a")
+}
+
+// TestVolumeAndNodeFlagsReported pins that the two tables previously
+// loaded-but-never-examined now surface their markers: a non-zero
+// VOLUMES.vlm_flags (DELETE/RESIZE and friends) is reported rather than
+// adopted silently. Bit values are deliberately NOT decoded — that
+// would be a guess — but the operator sees them.
+func TestVolumeAndNodeFlagsReported(t *testing.T) {
+	res := convertFixture(t)
+
+	if !hasWarning(res, "volume 0: non-zero vlm_flags 64") {
+		t.Errorf("non-zero VOLUMES.vlm_flags not reported; warnings: %v", res.Warnings)
 	}
 }
 

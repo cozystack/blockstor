@@ -89,6 +89,26 @@
 "vlm_nr": 0,
 "vlm_size": 1048576
 }
+},
+{
+"spec": {
+"resource_name": "PVC-VOL7",
+"snapshot_name": "",
+"uuid": "70000000-0000-0000-0000-00000000000a",
+"vlm_flags": 0,
+"vlm_nr": 0,
+"vlm_size": 1048576
+}
+},
+{
+"spec": {
+"resource_name": "PVC-VOL7",
+"snapshot_name": "",
+"uuid": "70000000-0000-0000-0000-00000000000b",
+"vlm_flags": 0,
+"vlm_nr": 1,
+"vlm_size": 524288
+}
 }
 ]
 }

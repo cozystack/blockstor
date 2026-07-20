@@ -81,6 +81,17 @@ spec:
   providerKind: DISKLESS
 ---
 apiVersion: blockstor.cozystack.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: fast.node-a
+spec:
+  nodeName: node-a
+  poolName: fast
+  props:
+    StorDriver/StorPoolName: fast
+  providerKind: ZFS
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceGroup
 metadata:
   annotations:
@@ -223,6 +234,21 @@ spec:
   volumeDefinitions:
   - sizeKib: 1048576
     volumeNumber: 0
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceDefinition
+metadata:
+  name: pvc-vol7
+spec:
+  initialized: true
+  layerStack:
+  - STORAGE
+  resourceGroupName: DfltRscGrp
+  volumeDefinitions:
+  - sizeKib: 1048576
+    volumeNumber: 0
+  - sizeKib: 524288
+    volumeNumber: 1
 ---
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource

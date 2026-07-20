@@ -98,6 +98,24 @@
 "stor_pool_name": "DATA",
 "vlm_nr": 0
 }
+},
+{
+"spec": {
+"layer_resource_id": 31,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 31,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "FAST",
+"vlm_nr": 1
+}
 }
 ]
 }

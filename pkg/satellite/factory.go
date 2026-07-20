@@ -19,6 +19,8 @@ limitations under the License.
 package satellite
 
 import (
+	"strings"
+
 	"github.com/cockroachdb/errors"
 
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -90,7 +92,16 @@ func NewProviderFromKind(kind string, props map[string]string, exec storage.Exec
 func newLVMThick(props map[string]string, exec storage.Exec) (storage.Provider, error) {
 	vg := props[propLvmVG]
 	if vg == "" {
-		return nil, errors.Errorf("LVM provider requires %q in props", propLvmVG)
+		// Same generic-key fallback as newZFS: a real LINSTOR database
+		// records the backing volume group under
+		// `StorDriver/StorPoolName` and leaves the kind-specific
+		// `StorDriver/LvmVg` blank, so an adopted LVM pool would
+		// otherwise never register a provider.
+		vg = props[propStorPoolName]
+	}
+
+	if vg == "" {
+		return nil, errors.Errorf("LVM provider requires %q or %q in props", propLvmVG, propStorPoolName)
 	}
 
 	return lvm.NewThick(lvm.ThickConfig{VolumeGroup: vg}, exec), nil
@@ -98,16 +109,53 @@ func newLVMThick(props map[string]string, exec storage.Exec) (storage.Provider, 
 
 func newLVMThin(props map[string]string, exec storage.Exec) (storage.Provider, error) {
 	vg := props[propLvmVG]
+	thinPool := props[propThinPool]
+
+	// Same generic-key fallback as newZFS / newLVMThick. A real LINSTOR
+	// database records an LVM_THIN pool as `<vg>/<thinpool>` in the
+	// single generic `StorDriver/StorPoolName` key and leaves both
+	// kind-specific keys blank; split it so an adopted thin pool
+	// registers instead of failing at cutover.
+	vg, thinPool = fillLVMThinFromGeneric(vg, thinPool, props[propStorPoolName])
+
 	if vg == "" {
-		return nil, errors.Errorf("LVM_THIN provider requires %q in props", propLvmVG)
+		return nil, errors.Errorf("LVM_THIN provider requires %q or %q in props", propLvmVG, propStorPoolName)
 	}
 
-	thinPool := props[propThinPool]
 	if thinPool == "" {
-		return nil, errors.Errorf("LVM_THIN provider requires %q in props", propThinPool)
+		return nil, errors.Errorf("LVM_THIN provider requires %q, or %q as \"<vg>/<thinpool>\"", propThinPool, propStorPoolName)
 	}
 
 	return lvm.NewThin(lvm.ThinConfig{VolumeGroup: vg, ThinPool: thinPool}, exec), nil
+}
+
+// fillLVMThinFromGeneric fills whichever of (vg, thinPool) is still
+// empty from LINSTOR's generic `StorDriver/StorPoolName` value, which
+// an LVM_THIN pool records as `<vg>/<thinpool>` (or just `<vg>` when
+// the thin pool lives under the kind-specific key).
+func fillLVMThinFromGeneric(vg, thinPool, generic string) (string, string) {
+	if generic == "" || (vg != "" && thinPool != "") {
+		return vg, thinPool
+	}
+
+	genericVG, genericThin, hasSeparator := strings.Cut(generic, "/")
+	if !hasSeparator {
+		if vg == "" {
+			vg = generic
+		}
+
+		return vg, thinPool
+	}
+
+	if vg == "" {
+		vg = genericVG
+	}
+
+	if thinPool == "" {
+		thinPool = genericThin
+	}
+
+	return vg, thinPool
 }
 
 func newZFS(props map[string]string, exec storage.Exec, thin bool) (storage.Provider, error) {

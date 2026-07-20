@@ -99,6 +99,16 @@
 "vlm_flags": 0,
 "vlm_nr": 1
 }
+},
+{
+"spec": {
+"node_name": "NODE-A",
+"resource_name": "PVC-VOL2",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-0000000000ff",
+"vlm_flags": 64,
+"vlm_nr": 0
+}
 }
 ]
 }

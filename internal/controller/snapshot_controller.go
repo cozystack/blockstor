@@ -110,8 +110,23 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// them — Phase 1 would freeze production I/O on every diskful
 	// peer just to re-take a snapshot that is already materialised.
 	// Instead backfill the terminal per-node state once and stop.
+	//
+	// SAFETY: the gate is refused on a Snapshot that is already
+	// mid-orchestration (SuspendIO=true). Short-circuiting there would
+	// strand `drbdsetup suspend-io` on every diskful peer forever —
+	// nothing else ever flips SuspendIO back to false — i.e. frozen
+	// production I/O with no error surfaced. The annotation is only
+	// ever stamped at creation by the migration tool, so reaching this
+	// branch means operator misuse; fall through to the normal
+	// orchestration, which drives the in-flight snapshot to its
+	// terminal state (and resumes I/O) instead.
 	if snap.Annotations[blockstoriov1alpha1.AnnotationSnapshotAdopted] == labelTrueValue {
-		return r.backfillAdoptedSnapshot(ctx, logger, &snap)
+		if snap.Spec.SuspendIO {
+			logger.Info("ignoring adopted annotation on an in-flight snapshot; completing normal orchestration so suspended I/O resumes",
+				"suspendIO", true)
+		} else {
+			return r.backfillAdoptedSnapshot(ctx, logger, &snap)
+		}
 	}
 
 	// b353: when Spec.GroupID is non-empty, the Snapshot participates

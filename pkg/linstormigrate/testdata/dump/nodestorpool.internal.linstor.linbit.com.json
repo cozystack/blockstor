@@ -32,6 +32,17 @@
 "pool_name": "DFLTDISKLESSSTORPOOL",
 "uuid": "30000000-0000-0000-0000-00000000000c"
 }
+},
+{
+"spec": {
+"driver_name": "ZFS",
+"external_locking": false,
+"free_space_mgr_dsp_name": "node-a;fast",
+"free_space_mgr_name": "NODE-A;FAST",
+"node_name": "NODE-A",
+"pool_name": "FAST",
+"uuid": "30000000-0000-0000-0000-00000000000f"
+}
 }
 ]
 }

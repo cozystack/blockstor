@@ -371,6 +371,16 @@ func (c *converter) convertNodes() []crdv1alpha1.Node {
 
 		dsp := displayName(row.NodeDspName, row.NodeName)
 
+		// NODES.node_flags carries DELETE / EVICTED markers. The bit
+		// values are not calibrated against a live cluster (no dump
+		// observed a non-zero value), so decoding them would be a guess
+		// — report instead, consistent with every other kind's
+		// never-guess handling, so an operator sees a node the source
+		// cluster had marked for removal or eviction.
+		if row.NodeFlags != 0 {
+			c.warnf("node %s: non-zero node_flags %d (DELETE/EVICTED markers are not decoded) — node migrated as-is, verify it should be adopted", dsp, row.NodeFlags)
+		}
+
 		node := crdv1alpha1.Node{
 			TypeMeta:   typeMeta("Node"),
 			ObjectMeta: objectMeta(dsp),
@@ -687,12 +697,70 @@ func (c *converter) convertResources() []crdv1alpha1.Resource {
 			continue
 		}
 
+		// blockstor's Resource carries ONE storage pool for the whole
+		// replica, while LINSTOR allows a per-volume pool. Collapsing a
+		// divergent set to volume 0's pool would send blockstor looking
+		// for the other volumes' backing devices in the wrong pool — a
+		// fresh empty zvol next to the real data. Never guess: report
+		// and skip the replica.
+		if pools, divergent := c.replicaPoolDivergence(row); divergent {
+			c.warnf("resource %s: volumes span multiple storage pools (%s) but blockstor holds one pool per replica — replica skipped", replicaName, strings.Join(pools, ", "))
+
+			continue
+		}
+
 		resources = append(resources, c.buildResource(row, rdDsp, nodeDsp, replicaName))
 	}
 
 	sortByName(resources, func(r crdv1alpha1.Resource) string { return r.Name })
 
 	return resources
+}
+
+// reportReplicaVolumeFlags surfaces non-zero VOLUMES.vlm_flags on this
+// replica's per-volume rows. blockstor's Resource carries no per-volume
+// flag field, so nothing is decoded; the bits (DELETE, RESIZE, and
+// friends) are reported so a volume the source cluster had marked is
+// never adopted silently.
+func (c *converter) reportReplicaVolumeFlags(row *ResourceRow, replicaName string) {
+	for i := range c.dump.Volumes {
+		vol := &c.dump.Volumes[i]
+		if vol.NodeName != row.NodeName || vol.ResourceName != row.ResourceName ||
+			vol.SnapshotName != "" || vol.VlmFlags == 0 {
+			continue
+		}
+
+		c.warnf("resource %s volume %d: non-zero vlm_flags %d (not decoded; blockstor has no per-volume flag field) — volume adopted as-is",
+			replicaName, vol.VlmNr, vol.VlmFlags)
+	}
+}
+
+// replicaPoolDivergence reports whether this replica's volumes are
+// backed by more than one storage pool (LINSTOR allows a per-volume
+// pool; blockstor's Resource holds a single one). Returns the distinct
+// pool names, sorted, and whether they diverge. A replica with no
+// LAYER_STORAGE_VOLUMES rows at all (diskless) never diverges.
+func (c *converter) replicaPoolDivergence(row *ResourceRow) ([]string, bool) {
+	seen := map[string]bool{}
+
+	for key, storVol := range c.storVol {
+		if key.node == row.NodeName && key.rd == row.ResourceName {
+			seen[displayName(c.poolDsp[storVol.StorPoolName], storVol.StorPoolName)] = true
+		}
+	}
+
+	if len(seen) < 2 {
+		return nil, false
+	}
+
+	pools := make([]string, 0, len(seen))
+	for pool := range seen {
+		pools = append(pools, pool)
+	}
+
+	sort.Strings(pools)
+
+	return pools, true
 }
 
 // buildResource assembles one replica CRD from its RESOURCES row (the
@@ -703,6 +771,8 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 	if rest != 0 {
 		c.warnf("resource %s: unhandled flags bits %d dropped (of %d)", replicaName, rest, row.ResourceFlags)
 	}
+
+	c.reportReplicaVolumeFlags(row, replicaName)
 
 	typed, residual, extra := k8sstore.SplitProps(c.props.Resource(row.NodeName, row.ResourceName))
 

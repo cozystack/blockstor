@@ -129,6 +129,16 @@
 "snapshot_name": "",
 "uuid": "80000000-0000-0000-0000-000000000020"
 }
+},
+{
+"spec": {
+"create_timestamp": 1770000000030,
+"node_name": "NODE-A",
+"resource_flags": 0,
+"resource_name": "PVC-VOL7",
+"snapshot_name": "",
+"uuid": "80000000-0000-0000-0000-000000000030"
+}
 }
 ]
 }

@@ -66,43 +66,7 @@ func run() int {
 		return 2
 	}
 
-	opts, err := buildOptions(*portsPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-
-		return 1
-	}
-
-	dump, err := linstormigrate.LoadDump(*inDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-
-		return 1
-	}
-
-	result, err := linstormigrate.ConvertWithOptions(dump, opts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-
-		return 1
-	}
-
-	out, closeOut, err := openOutput(*outPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-
-		return 1
-	}
-	defer closeOut()
-
-	err = linstormigrate.WriteManifests(out, result)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-
-		return 1
-	}
-
-	err = linstormigrate.WriteReport(os.Stderr, result)
+	err := convertToOutput(*inDir, *outPath, *portsPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 
@@ -110,6 +74,54 @@ func run() int {
 	}
 
 	return 0
+}
+
+// convertToOutput runs the whole load → convert → write pipeline,
+// writing manifests to outPath and the migration report to stderr.
+func convertToOutput(inDir, outPath, portsPath string) error {
+	opts, err := buildOptions(portsPath)
+	if err != nil {
+		return err
+	}
+
+	dump, err := linstormigrate.LoadDump(inDir)
+	if err != nil {
+		return fmt.Errorf("load dump: %w", err)
+	}
+
+	result, err := linstormigrate.ConvertWithOptions(dump, opts)
+	if err != nil {
+		return fmt.Errorf("convert: %w", err)
+	}
+
+	out, closeOut, err := openOutput(outPath)
+	if err != nil {
+		return err
+	}
+
+	err = linstormigrate.WriteManifests(out, result)
+	if err != nil {
+		_ = closeOut()
+
+		return fmt.Errorf("write manifests: %w", err)
+	}
+
+	// Close BEFORE reporting success: a deferred close would run after
+	// the exit code is fixed, so an ENOSPC-style flush failure would
+	// leave a truncated manifest behind while the process still exited
+	// 0 — and a `linstor-migrate … && kubectl apply -f …` pipeline would
+	// apply the truncated stream as if it were complete.
+	err = closeOut()
+	if err != nil {
+		return err
+	}
+
+	err = linstormigrate.WriteReport(os.Stderr, result)
+	if err != nil {
+		return fmt.Errorf("write report: %w", err)
+	}
+
+	return nil
 }
 
 // buildOptions loads the optional live DRBD port map from portsPath
@@ -134,10 +146,12 @@ func buildOptions(portsPath string) (linstormigrate.Options, error) {
 }
 
 // openOutput resolves the -out flag: "-" streams to stdout (no-op
-// closer), anything else creates the file and closes it on exit.
-func openOutput(path string) (io.Writer, func(), error) {
+// closer), anything else creates the file. The returned closer reports
+// its error so the caller can fail the run on a truncated write rather
+// than exiting 0 with a partial manifest on disk.
+func openOutput(path string) (io.Writer, func() error, error) {
 	if path == "-" {
-		return os.Stdout, func() {}, nil
+		return os.Stdout, func() error { return nil }, nil
 	}
 
 	file, err := os.Create(path)
@@ -145,11 +159,13 @@ func openOutput(path string) (io.Writer, func(), error) {
 		return nil, nil, fmt.Errorf("create %s: %w", path, err)
 	}
 
-	closeFile := func() {
+	closeFile := func() error {
 		closeErr := file.Close()
 		if closeErr != nil {
-			fmt.Fprintf(os.Stderr, "error: close %s: %v\n", path, closeErr)
+			return fmt.Errorf("close %s: %w", path, closeErr)
 		}
+
+		return nil
 	}
 
 	return file, closeFile, nil

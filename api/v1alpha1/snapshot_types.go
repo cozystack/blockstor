@@ -169,6 +169,13 @@ type SnapshotVolumeRef struct {
 // exists on the listed nodes; stamping it on a Snapshot with no
 // on-disk backing yields an object that lists as Successful but whose
 // restore will fail with the provider's not-found error.
+//
+// The annotation is meant to be stamped at CREATION. The controller
+// deliberately IGNORES it on a Snapshot that is already mid-flight
+// (Spec.SuspendIO=true) and completes the normal orchestration
+// instead: short-circuiting there would leave every diskful peer
+// holding `drbdsetup suspend-io` with nothing left to resume it —
+// frozen production I/O with no error surfaced.
 const AnnotationSnapshotAdopted = "blockstor.io/adopted"
 
 // AnnotationSnapshotAdoptedCreatedAt optionally carries the original

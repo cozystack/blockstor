@@ -228,6 +228,17 @@
 "resource_name": "PVC-VOL6",
 "snapshot_name": ""
 }
+},
+{
+"spec": {
+"layer_resource_id": 31,
+"layer_resource_kind": "STORAGE",
+"layer_resource_suffix": "",
+"layer_resource_suspended": false,
+"node_name": "NODE-A",
+"resource_name": "PVC-VOL7",
+"snapshot_name": ""
+}
 }
 ]
 }
