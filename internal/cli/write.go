@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -129,33 +130,38 @@ func listProperties(accessor propertyAccessor) handler {
 // plain field on a fetch-mutate-update object. Keeping the shape in
 // one place is what stops the empty-value-deletes rule from drifting
 // between nouns.
+//
+// `args` is how many positionals name the object: one for a node or a
+// definition, two for the composite-keyed kinds (a storage pool is
+// (node, pool), a volume definition is (definition, volume number)).
 func objectProps[T any](
 	kind string,
-	get func(context.Context, store.Store, string) (T, error),
+	args int,
+	get func(context.Context, store.Store, []string) (T, error),
 	bag func(*T) *map[string]string,
 	update func(context.Context, store.Store, *T) error,
 ) propertyAccessor {
 	return propertyAccessor{
-		args: 1,
+		args: args,
 		get: func(ctx context.Context, st store.Store, ident []string) (map[string]string, error) {
-			obj, err := get(ctx, st, ident[0])
+			obj, err := get(ctx, st, ident)
 			if err != nil {
-				return nil, fmt.Errorf("get %s %s: %w", kind, ident[0], err)
+				return nil, fmt.Errorf("get %s %s: %w", kind, strings.Join(ident, "/"), err)
 			}
 
 			return maps.Clone(*bag(&obj)), nil
 		},
 		set: func(ctx context.Context, st store.Store, ident []string, props map[string]string) error {
-			obj, err := get(ctx, st, ident[0])
+			obj, err := get(ctx, st, ident)
 			if err != nil {
-				return fmt.Errorf("get %s %s: %w", kind, ident[0], err)
+				return fmt.Errorf("get %s %s: %w", kind, strings.Join(ident, "/"), err)
 			}
 
 			*bag(&obj) = props
 
 			err = update(ctx, st, &obj)
 			if err != nil {
-				return fmt.Errorf("update %s %s: %w", kind, ident[0], err)
+				return fmt.Errorf("update %s %s: %w", kind, strings.Join(ident, "/"), err)
 			}
 
 			return nil
@@ -166,9 +172,9 @@ func objectProps[T any](
 // rdProps accesses a resource definition's property bag.
 //
 //nolint:gochecknoglobals // static accessor table
-var rdProps = objectProps("resource definition",
-	func(ctx context.Context, st store.Store, name string) (apiv1.ResourceDefinition, error) {
-		return st.ResourceDefinitions().Get(ctx, name)
+var rdProps = objectProps("resource definition", 1,
+	func(ctx context.Context, st store.Store, ident []string) (apiv1.ResourceDefinition, error) {
+		return st.ResourceDefinitions().Get(ctx, ident[0])
 	},
 	func(def *apiv1.ResourceDefinition) *map[string]string { return &def.Props },
 	func(ctx context.Context, st store.Store, def *apiv1.ResourceDefinition) error {
@@ -179,9 +185,9 @@ var rdProps = objectProps("resource definition",
 // nodeProps accesses a node's property bag.
 //
 //nolint:gochecknoglobals // static accessor table
-var nodeProps = objectProps("node",
-	func(ctx context.Context, st store.Store, name string) (apiv1.Node, error) {
-		return st.Nodes().Get(ctx, name)
+var nodeProps = objectProps("node", 1,
+	func(ctx context.Context, st store.Store, ident []string) (apiv1.Node, error) {
+		return st.Nodes().Get(ctx, ident[0])
 	},
 	func(node *apiv1.Node) *map[string]string { return &node.Props },
 	func(ctx context.Context, st store.Store, node *apiv1.Node) error {

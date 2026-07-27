@@ -126,6 +126,7 @@ var registry = []Noun{
 			{Name: verbDelete, Aliases: []string{aliasDelete}},
 			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
 			{Name: verbListProps, Aliases: []string{aliasListProps}},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
 		},
 	},
 	{
@@ -224,6 +225,7 @@ var registry = []Noun{
 			{Name: verbCreate, Aliases: []string{aliasCreate}},
 			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
 			{Name: verbListProps, Aliases: []string{aliasListProps}},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
 		},
 	},
 	{

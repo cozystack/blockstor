@@ -118,14 +118,33 @@ var handlers = map[string]handler{
 	"resource-group modify": resourceGroupModify,
 	"resource-group delete": resourceGroupDelete,
 
-	"resource-definition set-property":    setProperty(rdProps),
-	"resource-definition list-properties": listProperties(rdProps),
-	"node set-property":                   setProperty(nodeProps),
-	"node list-properties":                listProperties(nodeProps),
-	"controller set-property":             setProperty(controllerProps),
-	"controller list-properties":          listProperties(controllerProps),
-
 	"controller version": controllerVersion,
+}
+
+// propertyNouns maps every noun that carries a property bag to its
+// accessor. The three property verbs are registered from this one
+// table so a noun cannot end up with, say, set-property but no
+// delete-property — a gap an operator would only discover mid-runbook.
+//
+//nolint:gochecknoglobals // static dispatch table
+var propertyNouns = map[string]propertyAccessor{
+	"resource-definition": rdProps,
+	"node":                nodeProps,
+	"controller":          controllerProps,
+	"resource":            resourceProps,
+	"storage-pool":        storagePoolProps,
+	"resource-group":      resourceGroupProps,
+	"volume-definition":   volumeDefinitionProps,
+	"volume-group":        volumeGroupProps,
+}
+
+//nolint:gochecknoinits // wires one static table into another
+func init() {
+	for noun, accessor := range propertyNouns {
+		handlers[noun+" set-property"] = setProperty(accessor)
+		handlers[noun+" list-properties"] = listProperties(accessor)
+		handlers[noun+" delete-property"] = deleteProperty(accessor)
+	}
 }
 
 // listing builds a handler for the shared list shape: fetch, filter,

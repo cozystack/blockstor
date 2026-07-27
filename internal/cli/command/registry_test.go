@@ -301,3 +301,22 @@ func TestRegistryCoversExercisedSurface(t *testing.T) {
 		}
 	}
 }
+
+// A noun that accepts set-property must accept list-properties and
+// delete-property too. Half a property surface is worse than none: a
+// runbook sets a key, cannot read it back, and cannot undo it.
+func TestPropertyVerbsComeAsASet(t *testing.T) {
+	t.Parallel()
+
+	for _, noun := range command.Nouns() {
+		if !command.Has(noun.Name, "set-property") {
+			continue
+		}
+
+		for _, verb := range []string{"list-properties", "delete-property"} {
+			if !command.Has(noun.Name, verb) {
+				t.Errorf("%s has set-property but not %s", noun.Name, verb)
+			}
+		}
+	}
+}
