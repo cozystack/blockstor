@@ -120,6 +120,11 @@ var handlers = map[string]handler{
 	"snapshot create": snapshotCreate,
 	"snapshot delete": snapshotDelete,
 
+	"resource-definition auto-place": resourceDefinitionAutoPlace,
+
+	"resource-group spawn-resources": resourceGroupSpawn,
+	"resource-group adjust":          resourceGroupAdjust,
+
 	"resource-group create": resourceGroupCreate,
 	"resource-group modify": resourceGroupModify,
 	"resource-group delete": resourceGroupDelete,

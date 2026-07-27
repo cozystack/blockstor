@@ -264,6 +264,23 @@ func volumeDefinitionSetSize(ctx context.Context, run *runContext) error {
 // node, which is how the upstream grammar places several replicas in a
 // single call.
 func resourceCreate(ctx context.Context, run *runContext) error {
+	// `--auto-place N` (or the `+N` delta) names no nodes: the placer
+	// picks them, so the single positional is the definition.
+	if run.Flags.Values["auto-place"] != "" {
+		if len(run.Flags.Positionals) < 1 {
+			return fmt.Errorf("%w: resource create needs a definition", command.ErrUsage)
+		}
+
+		rdName := run.Flags.Positionals[0]
+
+		filter, err := placementFilter(ctx, run, rdName)
+		if err != nil {
+			return err
+		}
+
+		return autoPlace(ctx, run, rdName, filter)
+	}
+
 	if len(run.Flags.Positionals) < 2 {
 		return fmt.Errorf("%w: resource create needs at least one node and a definition", command.ErrUsage)
 	}
