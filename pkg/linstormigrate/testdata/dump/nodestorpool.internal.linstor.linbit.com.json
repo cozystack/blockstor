@@ -1,0 +1,48 @@
+{
+"items": [
+{
+"spec": {
+"driver_name": "ZFS",
+"external_locking": false,
+"free_space_mgr_dsp_name": "node-a;data",
+"free_space_mgr_name": "NODE-A;DATA",
+"node_name": "NODE-A",
+"pool_name": "DATA",
+"uuid": "30000000-0000-0000-0000-00000000000a"
+}
+},
+{
+"spec": {
+"driver_name": "ZFS",
+"external_locking": false,
+"free_space_mgr_dsp_name": "node-b;data",
+"free_space_mgr_name": "NODE-B;DATA",
+"node_name": "NODE-B",
+"pool_name": "DATA",
+"uuid": "30000000-0000-0000-0000-00000000000b"
+}
+},
+{
+"spec": {
+"driver_name": "DISKLESS",
+"external_locking": false,
+"free_space_mgr_dsp_name": "node-c;DfltDisklessStorPool",
+"free_space_mgr_name": "NODE-C;DFLTDISKLESSSTORPOOL",
+"node_name": "NODE-C",
+"pool_name": "DFLTDISKLESSSTORPOOL",
+"uuid": "30000000-0000-0000-0000-00000000000c"
+}
+},
+{
+"spec": {
+"driver_name": "ZFS",
+"external_locking": false,
+"free_space_mgr_dsp_name": "node-a;fast",
+"free_space_mgr_name": "NODE-A;FAST",
+"node_name": "NODE-A",
+"pool_name": "FAST",
+"uuid": "30000000-0000-0000-0000-00000000000f"
+}
+}
+]
+}

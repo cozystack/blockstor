@@ -1,0 +1,9 @@
+{"items":[
+{"spec":{"al_stripe_size":32,"al_stripes":1,"flags":0,"layer_resource_id":1,"node_id":0,"peer_slots":7}},
+{"spec":{"al_stripe_size":32,"al_stripes":1,"flags":0,"layer_resource_id":3,"node_id":1,"peer_slots":7}},
+{"spec":{"al_stripe_size":32,"al_stripes":1,"flags":0,"layer_resource_id":5,"node_id":2,"peer_slots":7}},
+{"spec":{"al_stripe_size":32,"al_stripes":1,"flags":0,"layer_resource_id":8,"node_id":0,"peer_slots":7}},
+{"spec":{"al_stripe_size":32,"al_stripes":1,"flags":0,"layer_resource_id":11,"node_id":1,"peer_slots":7}},
+{"spec":{"al_stripe_size":32,"al_stripes":1,"flags":0,"layer_resource_id":14,"node_id":0,"peer_slots":7}},
+{"spec":{"al_stripe_size":32,"al_stripes":1,"flags":0,"layer_resource_id":16,"node_id":1,"peer_slots":7}}
+]}

@@ -1,0 +1,25 @@
+{
+"items": [
+{
+"spec": {
+"pool_dsp_name": "DfltDisklessStorPool",
+"pool_name": "DFLTDISKLESSSTORPOOL",
+"uuid": "20000000-0000-0000-0000-000000000001"
+}
+},
+{
+"spec": {
+"pool_dsp_name": "data",
+"pool_name": "DATA",
+"uuid": "20000000-0000-0000-0000-000000000002"
+}
+},
+{
+"spec": {
+"pool_dsp_name": "fast",
+"pool_name": "FAST",
+"uuid": "20000000-0000-0000-0000-000000000003"
+}
+}
+]
+}

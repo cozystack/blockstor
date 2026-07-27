@@ -19,6 +19,8 @@ limitations under the License.
 package satellite
 
 import (
+	"strings"
+
 	"github.com/cockroachdb/errors"
 
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -44,11 +46,12 @@ const (
 // kind. Mirrored verbatim so existing operators / piraeus-operator
 // manifests round-trip.
 const (
-	propLvmVG     = "StorDriver/LvmVg"
-	propThinPool  = "StorDriver/ThinPool"
-	propZPool     = "StorDriver/ZPool"
-	propZPoolThin = "StorDriver/ZPoolThin"
-	propFileDir   = "StorDriver/FileDir"
+	propLvmVG        = "StorDriver/LvmVg"
+	propThinPool     = "StorDriver/ThinPool"
+	propZPool        = "StorDriver/ZPool"
+	propZPoolThin    = "StorDriver/ZPoolThin"
+	propFileDir      = "StorDriver/FileDir"
+	propStorPoolName = "StorDriver/StorPoolName"
 )
 
 // NewProviderFromKind instantiates the matching `storage.Provider`
@@ -89,7 +92,16 @@ func NewProviderFromKind(kind string, props map[string]string, exec storage.Exec
 func newLVMThick(props map[string]string, exec storage.Exec) (storage.Provider, error) {
 	vg := props[propLvmVG]
 	if vg == "" {
-		return nil, errors.Errorf("LVM provider requires %q in props", propLvmVG)
+		// Same generic-key fallback as newZFS: a real LINSTOR database
+		// records the backing volume group under
+		// `StorDriver/StorPoolName` and leaves the kind-specific
+		// `StorDriver/LvmVg` blank, so an adopted LVM pool would
+		// otherwise never register a provider.
+		vg = props[propStorPoolName]
+	}
+
+	if vg == "" {
+		return nil, errors.Errorf("LVM provider requires %q or %q in props", propLvmVG, propStorPoolName)
 	}
 
 	return lvm.NewThick(lvm.ThickConfig{VolumeGroup: vg}, exec), nil
@@ -97,16 +109,53 @@ func newLVMThick(props map[string]string, exec storage.Exec) (storage.Provider, 
 
 func newLVMThin(props map[string]string, exec storage.Exec) (storage.Provider, error) {
 	vg := props[propLvmVG]
+	thinPool := props[propThinPool]
+
+	// Same generic-key fallback as newZFS / newLVMThick. A real LINSTOR
+	// database records an LVM_THIN pool as `<vg>/<thinpool>` in the
+	// single generic `StorDriver/StorPoolName` key and leaves both
+	// kind-specific keys blank; split it so an adopted thin pool
+	// registers instead of failing at cutover.
+	vg, thinPool = fillLVMThinFromGeneric(vg, thinPool, props[propStorPoolName])
+
 	if vg == "" {
-		return nil, errors.Errorf("LVM_THIN provider requires %q in props", propLvmVG)
+		return nil, errors.Errorf("LVM_THIN provider requires %q or %q in props", propLvmVG, propStorPoolName)
 	}
 
-	thinPool := props[propThinPool]
 	if thinPool == "" {
-		return nil, errors.Errorf("LVM_THIN provider requires %q in props", propThinPool)
+		return nil, errors.Errorf("LVM_THIN provider requires %q, or %q as \"<vg>/<thinpool>\"", propThinPool, propStorPoolName)
 	}
 
 	return lvm.NewThin(lvm.ThinConfig{VolumeGroup: vg, ThinPool: thinPool}, exec), nil
+}
+
+// fillLVMThinFromGeneric fills whichever of (vg, thinPool) is still
+// empty from LINSTOR's generic `StorDriver/StorPoolName` value, which
+// an LVM_THIN pool records as `<vg>/<thinpool>` (or just `<vg>` when
+// the thin pool lives under the kind-specific key).
+func fillLVMThinFromGeneric(vg, thinPool, generic string) (string, string) {
+	if generic == "" || (vg != "" && thinPool != "") {
+		return vg, thinPool
+	}
+
+	genericVG, genericThin, hasSeparator := strings.Cut(generic, "/")
+	if !hasSeparator {
+		if vg == "" {
+			vg = generic
+		}
+
+		return vg, thinPool
+	}
+
+	if vg == "" {
+		vg = genericVG
+	}
+
+	if thinPool == "" {
+		thinPool = genericThin
+	}
+
+	return vg, thinPool
 }
 
 func newZFS(props map[string]string, exec storage.Exec, thin bool) (storage.Provider, error) {
@@ -118,6 +167,13 @@ func newZFS(props map[string]string, exec storage.Exec, thin bool) (storage.Prov
 	// each kind (kind-specific key wins) to keep CRDs that were
 	// written before the rename and operators who copy-paste from
 	// LVM examples both working.
+	//
+	// A real LINSTOR ≥1.x database (and its k8s-backend dump) stores
+	// the zpool name under the generic `StorDriver/StorPoolName`
+	// instead, leaving both ZPool keys blank — so an adopted ZFS pool
+	// carries ONLY StorPoolName. Accept it as the final fallback,
+	// otherwise a migrated ZFS pool never registers a provider and no
+	// diskful resource on it can be served.
 	primary, secondary := propZPool, propZPoolThin
 	if thin {
 		primary, secondary = propZPoolThin, propZPool
@@ -129,12 +185,16 @@ func newZFS(props map[string]string, exec storage.Exec, thin bool) (storage.Prov
 	}
 
 	if pool == "" {
+		pool = props[propStorPoolName]
+	}
+
+	if pool == "" {
 		kind := ProviderKindZFS
 		if thin {
 			kind = ProviderKindZFSThin
 		}
 
-		return nil, errors.Errorf("%s provider requires %q in props", kind, primary)
+		return nil, errors.Errorf("%s provider requires %q, %q or %q in props", kind, primary, secondary, propStorPoolName)
 	}
 
 	return zfs.NewProvider(zfs.Config{Pool: pool, Thin: thin}, exec), nil

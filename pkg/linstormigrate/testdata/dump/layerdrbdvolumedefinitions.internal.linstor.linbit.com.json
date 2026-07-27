@@ -1,0 +1,48 @@
+{
+"items": [
+{
+"spec": {
+"resource_name": "PVC-VOL1",
+"resource_name_suffix": "",
+"snapshot_name": "",
+"vlm_minor_nr": 1001,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"resource_name": "PVC-VOL3",
+"resource_name_suffix": "",
+"snapshot_name": "",
+"vlm_minor_nr": 1003,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"resource_name": "PVC-VOL5",
+"resource_name_suffix": "",
+"snapshot_name": "",
+"vlm_minor_nr": 1005,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"resource_name": "PVC-VOL1",
+"resource_name_suffix": "",
+"snapshot_name": "SNAP-GOOD",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"resource_name": "PVC-VOL1",
+"resource_name_suffix": "",
+"snapshot_name": "",
+"vlm_minor_nr": 1042,
+"vlm_nr": 1
+}
+}
+]
+}

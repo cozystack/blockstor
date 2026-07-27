@@ -154,6 +154,38 @@ type SnapshotVolumeRef struct {
 	SizeKib      int64 `json:"sizeKib"`
 }
 
+// AnnotationSnapshotAdopted marks a Snapshot whose on-disk
+// materialisation ALREADY EXISTS on every targeted node — it was
+// created by a previous storage controller (LINSTOR) and imported by
+// a migration tool, not taken by blockstor. The controller-side
+// SnapshotReconciler treats such a Snapshot as terminally complete:
+// it backfills Status.NodeStatus[*].Ready=true for every Spec.Nodes
+// entry and NEVER runs the suspend→take→resume orchestration —
+// re-driving Phase 1 against an adopted Snapshot would freeze
+// production I/O (drbdsetup suspend-io on every diskful peer) just to
+// re-take a snapshot that is already on disk.
+//
+// Set this annotation ONLY when the backing snapshot verifiably
+// exists on the listed nodes; stamping it on a Snapshot with no
+// on-disk backing yields an object that lists as Successful but whose
+// restore will fail with the provider's not-found error.
+//
+// The annotation is meant to be stamped at CREATION. The controller
+// deliberately IGNORES it on a Snapshot that is already mid-flight
+// (Spec.SuspendIO=true) and completes the normal orchestration
+// instead: short-circuiting there would leave every diskful peer
+// holding `drbdsetup suspend-io` with nothing left to resume it —
+// frozen production I/O with no error surfaced.
+const AnnotationSnapshotAdopted = "blockstor.io/adopted"
+
+// AnnotationSnapshotAdoptedCreatedAt optionally carries the original
+// creation time of an adopted snapshot as milliseconds since the Unix
+// epoch (the shape LINSTOR's RESOURCES.create_timestamp column uses).
+// The SnapshotReconciler copies it into the backfilled per-node
+// CreateTimestamp entries so `linstor s l` keeps showing the REAL
+// snapshot age instead of the adoption time.
+const AnnotationSnapshotAdoptedCreatedAt = "blockstor.io/adopted-created-at"
+
 // SnapshotStatusFlagFailed is stamped on Status.Flags by the
 // satellite reconciler when CreateSnapshot returned a terminal
 // error (e.g. parent volume missing, unknown resource, source

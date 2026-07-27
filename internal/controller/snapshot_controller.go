@@ -20,6 +20,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -103,6 +104,31 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	// Adopted snapshots (imported from another storage controller by
+	// a migration tool; see AnnotationSnapshotAdopted) already exist
+	// on disk. NEVER run the suspend→take→resume orchestration for
+	// them — Phase 1 would freeze production I/O on every diskful
+	// peer just to re-take a snapshot that is already materialised.
+	// Instead backfill the terminal per-node state once and stop.
+	//
+	// SAFETY: the gate is refused on a Snapshot that is already
+	// mid-orchestration (SuspendIO=true). Short-circuiting there would
+	// strand `drbdsetup suspend-io` on every diskful peer forever —
+	// nothing else ever flips SuspendIO back to false — i.e. frozen
+	// production I/O with no error surfaced. The annotation is only
+	// ever stamped at creation by the migration tool, so reaching this
+	// branch means operator misuse; fall through to the normal
+	// orchestration, which drives the in-flight snapshot to its
+	// terminal state (and resumes I/O) instead.
+	if snap.Annotations[blockstoriov1alpha1.AnnotationSnapshotAdopted] == labelTrueValue {
+		if snap.Spec.SuspendIO {
+			logger.Info("ignoring adopted annotation on an in-flight snapshot; completing normal orchestration so suspended I/O resumes",
+				"suspendIO", true)
+		} else {
+			return r.backfillAdoptedSnapshot(ctx, logger, &snap)
+		}
+	}
+
 	// b353: when Spec.GroupID is non-empty, the Snapshot participates
 	// in a transactional multi-RD batch — phase advancement gates on
 	// every sibling's per-node state, not just self. Empty GroupID
@@ -141,6 +167,100 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	return r.advancePhase(ctx, logger, &snap, siblings, next)
+}
+
+// backfillAdoptedSnapshot stamps the terminal per-node state onto an
+// adopted Snapshot (see AnnotationSnapshotAdopted): every Spec.Nodes
+// entry gets a Ready=true NodeStatus row, with CreateTimestamp taken
+// from AnnotationSnapshotAdoptedCreatedAt when the annotation carries
+// a parseable ms-epoch value. Idempotent — once every targeted node
+// has its Ready row the reconcile is a no-op, so the adopted object
+// settles into the same terminal shape a successfully-taken snapshot
+// ends in (allSiblingsReady) without any satellite involvement.
+func (r *SnapshotReconciler) backfillAdoptedSnapshot(
+	ctx context.Context, logger logr.Logger, snap *blockstoriov1alpha1.Snapshot,
+) (ctrl.Result, error) {
+	if allNodesReady(snap.Status.NodeStatus, snap.Spec.Nodes) {
+		return ctrl.Result{}, nil
+	}
+
+	createdAt := adoptedCreatedAt(logger, snap)
+
+	key := client.ObjectKeyFromObject(snap)
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var current blockstoriov1alpha1.Snapshot
+
+		getErr := r.Get(ctx, key, &current)
+		if getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				return nil
+			}
+
+			return errors.Wrap(getErr, "get Snapshot for adopted backfill")
+		}
+
+		changed := false
+
+		for _, node := range current.Spec.Nodes {
+			if hasNodeStatusEntry(current.Status.NodeStatus, node) {
+				continue
+			}
+
+			current.Status.NodeStatus = append(current.Status.NodeStatus,
+				blockstoriov1alpha1.SnapshotPerNodeStatus{
+					NodeName:        node,
+					Ready:           true,
+					CreateTimestamp: createdAt,
+				})
+			changed = true
+		}
+
+		if !changed {
+			return nil
+		}
+
+		return r.Status().Update(ctx, &current)
+	})
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "backfill adopted Snapshot status")
+	}
+
+	logger.V(1).Info("backfilled adopted snapshot per-node status", "nodes", len(snap.Spec.Nodes))
+
+	return ctrl.Result{}, nil
+}
+
+// hasNodeStatusEntry reports whether a per-node status row for the
+// given node already exists (regardless of its Ready value — an
+// existing row belongs to the satellite, never overwrite it).
+func hasNodeStatusEntry(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, node string) bool {
+	for i := range entries {
+		if entries[i].NodeName == node {
+			return true
+		}
+	}
+
+	return false
+}
+
+// adoptedCreatedAt parses the optional ms-epoch original-creation-time
+// annotation of an adopted Snapshot; 0 (and a log line) when absent or
+// unparseable.
+func adoptedCreatedAt(logger logr.Logger, snap *blockstoriov1alpha1.Snapshot) int64 {
+	raw := snap.Annotations[blockstoriov1alpha1.AnnotationSnapshotAdoptedCreatedAt]
+	if raw == "" {
+		return 0
+	}
+
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		logger.Info("ignoring unparseable adopted-created-at annotation", "value", raw)
+
+		return 0
+	}
+
+	return parsed
 }
 
 // advancePhase commits the Spec-flag transition nextPhase decided is

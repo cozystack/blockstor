@@ -1,0 +1,5 @@
+{"items":[
+{"spec":{"node_dsp_name":"node-a","node_flags":0,"node_name":"NODE-A","node_type":2,"uuid":"00000000-0000-0000-0000-00000000000a"}},
+{"spec":{"node_dsp_name":"node-b","node_flags":0,"node_name":"NODE-B","node_type":2,"uuid":"00000000-0000-0000-0000-00000000000b"}},
+{"spec":{"node_dsp_name":"node-c","node_flags":0,"node_name":"NODE-C","node_type":2,"uuid":"00000000-0000-0000-0000-00000000000c"}}
+]}

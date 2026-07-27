@@ -1,0 +1,114 @@
+{
+"items": [
+{
+"spec": {
+"node_name": "NODE-A",
+"resource_name": "PVC-VOL1",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-000000000001",
+"vlm_flags": 0,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"node_name": "NODE-B",
+"resource_name": "PVC-VOL1",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-000000000002",
+"vlm_flags": 0,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"node_name": "NODE-C",
+"resource_name": "PVC-VOL1",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-000000000003",
+"vlm_flags": 0,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"node_name": "NODE-A",
+"resource_name": "PVC-VOL2",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-000000000004",
+"vlm_flags": 0,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"node_name": "NODE-A",
+"resource_name": "PVC-VOL3",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-000000000005",
+"vlm_flags": 64,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"node_name": "NODE-B",
+"resource_name": "PVC-VOL3",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-000000000006",
+"vlm_flags": 0,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"node_name": "NODE-A",
+"resource_name": "PVC-VOL5",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-000000000007",
+"vlm_flags": 0,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"node_name": "NODE-B",
+"resource_name": "PVC-VOL5",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-000000000008",
+"vlm_flags": 0,
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"node_name": "NODE-A",
+"resource_name": "PVC-VOL1",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-000000000009",
+"vlm_flags": 0,
+"vlm_nr": 1
+}
+},
+{
+"spec": {
+"node_name": "NODE-B",
+"resource_name": "PVC-VOL1",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-00000000000a",
+"vlm_flags": 0,
+"vlm_nr": 1
+}
+},
+{
+"spec": {
+"node_name": "NODE-A",
+"resource_name": "PVC-VOL2",
+"snapshot_name": "",
+"uuid": "90000000-0000-0000-0000-0000000000ff",
+"vlm_flags": 64,
+"vlm_nr": 0
+}
+}
+]
+}

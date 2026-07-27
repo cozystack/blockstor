@@ -1,0 +1,388 @@
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ControllerConfig
+metadata:
+  name: default
+spec:
+  extraProps:
+    DrbdOptions/auto-add-quorum-tiebreaker: "True"
+    DrbdOptions/auto-verify-algo-allowed-list: crct10dif;crc32c;sha256
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Node
+metadata:
+  name: node-a
+spec:
+  netInterfaces:
+  - address: 10.10.0.1
+    name: default-ipv4
+    satelliteEncryptionType: SSL
+    satellitePort: 3367
+  props:
+    Aux/topology/kubernetes.io/hostname: node-a
+    CurStltConnName: default-ipv4
+  type: SATELLITE
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Node
+metadata:
+  name: node-b
+spec:
+  netInterfaces:
+  - address: 10.10.0.2
+    name: default-ipv4
+    satelliteEncryptionType: SSL
+    satellitePort: 3367
+  type: SATELLITE
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Node
+metadata:
+  name: node-c
+spec:
+  netInterfaces:
+  - address: 10.10.0.3
+    name: default-ipv4
+    satelliteEncryptionType: SSL
+    satellitePort: 3367
+  type: SATELLITE
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: data.node-a
+spec:
+  nodeName: node-a
+  poolName: data
+  props:
+    StorDriver/StorPoolName: data
+    StorDriver/internal/AllocationGranularity: "16"
+  providerKind: ZFS
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: data.node-b
+spec:
+  nodeName: node-b
+  poolName: data
+  props:
+    StorDriver/StorPoolName: data
+    StorDriver/internal/AllocationGranularity: "16"
+  providerKind: ZFS
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: dfltdisklessstorpool.node-c
+spec:
+  nodeName: node-c
+  poolName: DfltDisklessStorPool
+  providerKind: DISKLESS
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: fast.node-a
+spec:
+  nodeName: node-a
+  poolName: fast
+  props:
+    StorDriver/StorPoolName: fast
+  providerKind: ZFS
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceGroup
+metadata:
+  annotations:
+    blockstor.io/linstor-name: DfltRscGrp
+  name: dfltrscgrp
+spec:
+  selectFilter:
+    placeCount: 2
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceGroup
+metadata:
+  name: sc-encrypted
+spec:
+  description: encrypted volumes
+  selectFilter:
+    layerStack:
+    - DRBD
+    - LUKS
+    - STORAGE
+    placeCount: 2
+    storagePoolList:
+    - data
+  volumeGroups:
+  - volumeNumber: 0
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceGroup
+metadata:
+  name: sc-replicated
+spec:
+  drbdOptions:
+    net:
+      protocol: A
+    resource:
+      quorum: majority
+  selectFilter:
+    layerStack:
+    - DRBD
+    - STORAGE
+    placeCount: 2
+    storagePoolList:
+    - data
+  volumeGroups:
+  - volumeNumber: 0
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceDefinition
+metadata:
+  name: pvc-vol1
+spec:
+  drbdOptions:
+    resource:
+      quorum: majority
+  drbdPort: 7001
+  extraProps:
+    Aux/csi.storage.k8s.io/pvc/name: app-data
+    Aux/csi.storage.k8s.io/pvc/namespace: tenant-fixture
+    DrbdOptions/Net/shared-secret: fixture-secret-vol1
+    DrbdOptions/auto-verify-alg: crct10dif
+    FileSystem/Type: ext4
+  initialized: true
+  layerStack:
+  - DRBD
+  - STORAGE
+  props:
+    Aux/csi.storage.k8s.io/pvc/name: app-data
+    Aux/csi.storage.k8s.io/pvc/namespace: tenant-fixture
+    FileSystem/Type: ext4
+  resourceGroupName: sc-replicated
+  volumeDefinitions:
+  - drbdMinor: 1001
+    props:
+      DrbdCurrentGi: F1E2D3C4B5A69788
+    sizeKib: 1048576
+    volumeNumber: 0
+  - drbdMinor: 1042
+    sizeKib: 307200
+    volumeNumber: 1
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceDefinition
+metadata:
+  name: pvc-vol2
+spec:
+  initialized: true
+  layerStack:
+  - STORAGE
+  resourceGroupName: DfltRscGrp
+  volumeDefinitions:
+  - sizeKib: 524288
+    volumeNumber: 0
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceDefinition
+metadata:
+  name: pvc-vol3
+spec:
+  extraProps:
+    DrbdOptions/Net/shared-secret: fixture-secret-vol3
+  initialized: true
+  layerStack:
+  - DRBD
+  - LUKS
+  - STORAGE
+  resourceGroupName: sc-encrypted
+  volumeDefinitions:
+  - drbdMinor: 1003
+    sizeKib: 2097152
+    volumeNumber: 0
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceDefinition
+metadata:
+  name: pvc-vol5
+spec:
+  drbdOptions:
+    net:
+      allowTwoPrimaries: true
+  extraProps:
+    DrbdOptions/Net/shared-secret: fixture-secret-vol5
+  initialized: true
+  layerStack:
+  - DRBD
+  - STORAGE
+  resourceGroupName: sc-replicated
+  volumeDefinitions:
+  - drbdMinor: 1005
+    sizeKib: 1048576
+    volumeNumber: 0
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceDefinition
+metadata:
+  name: pvc-vol6
+spec:
+  initialized: true
+  layerStack:
+  - STORAGE
+  volumeDefinitions:
+  - sizeKib: 1048576
+    volumeNumber: 0
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: ResourceDefinition
+metadata:
+  name: pvc-vol7
+spec:
+  initialized: true
+  layerStack:
+  - STORAGE
+  resourceGroupName: DfltRscGrp
+  volumeDefinitions:
+  - sizeKib: 1048576
+    volumeNumber: 0
+  - sizeKib: 524288
+    volumeNumber: 1
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol1.node-a
+spec:
+  drbdNodeID: 0
+  drbdPort: 7001
+  extraProps:
+    StorPoolName: data
+  nodeName: node-a
+  props:
+    StorPoolName: data
+  resourceDefinitionName: pvc-vol1
+  skipInitialSync: false
+  storagePool: data
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol1.node-b
+spec:
+  drbdNodeID: 1
+  drbdPort: 7001
+  extraProps:
+    StorPoolName: data
+  nodeName: node-b
+  props:
+    StorPoolName: data
+  resourceDefinitionName: pvc-vol1
+  skipInitialSync: false
+  storagePool: data
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol1.node-c
+spec:
+  drbdNodeID: 2
+  drbdPort: 7001
+  extraProps:
+    StorPoolName: DfltDisklessStorPool
+  flags:
+  - DISKLESS
+  - DRBD_DISKLESS
+  - TIE_BREAKER
+  nodeName: node-c
+  props:
+    StorPoolName: DfltDisklessStorPool
+  resourceDefinitionName: pvc-vol1
+  skipInitialSync: false
+  storagePool: DfltDisklessStorPool
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol2.node-a
+spec:
+  nodeName: node-a
+  resourceDefinitionName: pvc-vol2
+  skipInitialSync: false
+  storagePool: data
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol3.node-a
+spec:
+  drbdNodeID: 0
+  nodeName: node-a
+  resourceDefinitionName: pvc-vol3
+  skipInitialSync: false
+  storagePool: data
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol3.node-b
+spec:
+  drbdNodeID: 1
+  nodeName: node-b
+  resourceDefinitionName: pvc-vol3
+  skipInitialSync: false
+  storagePool: data
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol5.node-a
+spec:
+  drbdNodeID: 0
+  nodeName: node-a
+  resourceDefinitionName: pvc-vol5
+  skipInitialSync: false
+  storagePool: data
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol5.node-b
+spec:
+  drbdNodeID: 1
+  nodeName: node-b
+  resourceDefinitionName: pvc-vol5
+  skipInitialSync: false
+  storagePool: data
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: pvc-vol6.node-a
+spec:
+  nodeName: node-a
+  resourceDefinitionName: pvc-vol6
+  skipInitialSync: false
+  storagePool: data
+---
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Snapshot
+metadata:
+  annotations:
+    blockstor.io/adopted: "true"
+    blockstor.io/adopted-created-at: "1770000000011"
+  name: pvc-vol1.snap-good
+spec:
+  nodes:
+  - node-a
+  - node-b
+  props:
+    SequenceNumber: "1"
+  resourceDefinitionName: pvc-vol1
+  snapshotName: snap-good
+  volumeDefinitions:
+  - sizeKib: 1048576
+    volumeNumber: 0
+  - sizeKib: 307200
+    volumeNumber: 1

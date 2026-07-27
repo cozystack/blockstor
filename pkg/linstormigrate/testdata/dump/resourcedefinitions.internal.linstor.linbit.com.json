@@ -1,0 +1,114 @@
+{
+"items": [
+{
+"spec": {
+"layer_stack": "[\"DRBD\",\"STORAGE\"]",
+"resource_dsp_name": "pvc-vol1",
+"resource_flags": 0,
+"resource_group_name": "SC-REPLICATED",
+"resource_name": "PVC-VOL1",
+"snapshot_dsp_name": "",
+"snapshot_name": "",
+"uuid": "60000000-0000-0000-0000-000000000001"
+}
+},
+{
+"spec": {
+"layer_stack": "[\"STORAGE\"]",
+"resource_dsp_name": "pvc-vol2",
+"resource_flags": 0,
+"resource_group_name": "DFLTRSCGRP",
+"resource_name": "PVC-VOL2",
+"snapshot_dsp_name": "",
+"snapshot_name": "",
+"uuid": "60000000-0000-0000-0000-000000000002"
+}
+},
+{
+"spec": {
+"layer_stack": "[\"DRBD\",\"LUKS\",\"STORAGE\"]",
+"resource_dsp_name": "pvc-vol3",
+"resource_flags": 0,
+"resource_group_name": "SC-ENCRYPTED",
+"resource_name": "PVC-VOL3",
+"snapshot_dsp_name": "",
+"snapshot_name": "",
+"uuid": "60000000-0000-0000-0000-000000000003"
+}
+},
+{
+"spec": {
+"layer_stack": "[\"DRBD\",\"STORAGE\"]",
+"resource_dsp_name": "pvc-vol4",
+"resource_flags": 2,
+"resource_group_name": "SC-REPLICATED",
+"resource_name": "PVC-VOL4",
+"snapshot_dsp_name": "",
+"snapshot_name": "",
+"uuid": "60000000-0000-0000-0000-000000000004"
+}
+},
+{
+"spec": {
+"layer_stack": "[\"DRBD\",\"STORAGE\"]",
+"resource_dsp_name": "pvc-vol5",
+"resource_flags": 0,
+"resource_group_name": "SC-REPLICATED",
+"resource_name": "PVC-VOL5",
+"snapshot_dsp_name": "",
+"snapshot_name": "",
+"uuid": "60000000-0000-0000-0000-000000000005"
+}
+},
+{
+"spec": {
+"layer_stack": "[]",
+"parent_uuid": "60000000-0000-0000-0000-000000000001",
+"resource_dsp_name": "pvc-vol1",
+"resource_flags": 1,
+"resource_group_name": "SC-REPLICATED",
+"resource_name": "PVC-VOL1",
+"snapshot_dsp_name": "snap-good",
+"snapshot_name": "SNAP-GOOD",
+"uuid": "60000000-0000-0000-0000-000000000006"
+}
+},
+{
+"spec": {
+"layer_stack": "[]",
+"parent_uuid": "60000000-0000-0000-0000-000000000001",
+"resource_dsp_name": "pvc-vol1",
+"resource_flags": 2,
+"resource_group_name": "SC-REPLICATED",
+"resource_name": "PVC-VOL1",
+"snapshot_dsp_name": "snap-bad",
+"snapshot_name": "SNAP-BAD",
+"uuid": "60000000-0000-0000-0000-000000000007"
+}
+},
+{
+"spec": {
+"layer_stack": "[\"STORAGE\"]",
+"resource_dsp_name": "pvc-vol6",
+"resource_flags": 0,
+"resource_group_name": "SC-GHOST",
+"resource_name": "PVC-VOL6",
+"snapshot_dsp_name": "",
+"snapshot_name": "",
+"uuid": "60000000-0000-0000-0000-000000000009"
+}
+},
+{
+"spec": {
+"layer_stack": "[\"STORAGE\"]",
+"resource_dsp_name": "pvc-vol7",
+"resource_flags": 0,
+"resource_group_name": "DFLTRSCGRP",
+"resource_name": "PVC-VOL7",
+"snapshot_dsp_name": "",
+"snapshot_name": "",
+"uuid": "60000000-0000-0000-0000-00000000000a"
+}
+}
+]
+}

@@ -1,0 +1,121 @@
+{
+"items": [
+{
+"spec": {
+"layer_resource_id": 2,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 4,
+"node_name": "NODE-B",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 7,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 10,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 13,
+"node_name": "NODE-B",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 15,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 17,
+"node_name": "NODE-B",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 18,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 2,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 1
+}
+},
+{
+"spec": {
+"layer_resource_id": 4,
+"node_name": "NODE-B",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 1
+}
+},
+{
+"spec": {
+"layer_resource_id": 30,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 31,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "DATA",
+"vlm_nr": 0
+}
+},
+{
+"spec": {
+"layer_resource_id": 31,
+"node_name": "NODE-A",
+"provider_kind": "ZFS",
+"stor_pool_name": "FAST",
+"vlm_nr": 1
+}
+}
+]
+}

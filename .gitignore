@@ -24,3 +24,4 @@
 # Test side-effects
 .claude/
 pkg/satellite/pvc-dispatch-adjust.res
+linstor-migrate

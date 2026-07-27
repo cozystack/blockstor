@@ -1,0 +1,6 @@
+{"items":[
+{"spec":{"al_stripe_size":32,"al_stripes":1,"peer_slots":7,"resource_name":"PVC-VOL1","resource_name_suffix":"","secret":"fixture-secret-vol1","snapshot_name":"","tcp_port":7001,"transport_type":"IP"}},
+{"spec":{"al_stripe_size":32,"al_stripes":1,"peer_slots":7,"resource_name":"PVC-VOL3","resource_name_suffix":"","secret":"fixture-secret-vol3","snapshot_name":"","transport_type":"IP"}},
+{"spec":{"al_stripe_size":32,"al_stripes":1,"peer_slots":7,"resource_name":"PVC-VOL5","resource_name_suffix":"","secret":"fixture-secret-vol5","snapshot_name":"","transport_type":"IP"}},
+{"spec":{"al_stripe_size":32,"al_stripes":1,"peer_slots":7,"resource_name":"PVC-VOL1","resource_name_suffix":"","snapshot_name":"SNAP-GOOD","transport_type":"IP"}}
+]}

@@ -1,0 +1,5 @@
+{"items":[
+{"spec":{"inet_address":"10.10.0.1","node_name":"NODE-A","node_net_dsp_name":"default-ipv4","node_net_name":"DEFAULT-IPV4","stlt_conn_encr_type":"SSL","stlt_conn_port":3367,"uuid":"10000000-0000-0000-0000-00000000000a"}},
+{"spec":{"inet_address":"10.10.0.2","node_name":"NODE-B","node_net_dsp_name":"default-ipv4","node_net_name":"DEFAULT-IPV4","stlt_conn_encr_type":"SSL","stlt_conn_port":3367,"uuid":"10000000-0000-0000-0000-00000000000b"}},
+{"spec":{"inet_address":"10.10.0.3","node_name":"NODE-C","node_net_dsp_name":"default-ipv4","node_net_name":"DEFAULT-IPV4","stlt_conn_encr_type":"SSL","stlt_conn_port":3367,"uuid":"10000000-0000-0000-0000-00000000000c"}}
+]}
