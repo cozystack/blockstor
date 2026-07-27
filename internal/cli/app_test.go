@@ -57,6 +57,20 @@ func newApp(t *testing.T, seed func(context.Context, store.Store)) (*cli.App, *b
 	return app, &out, &errBuf
 }
 
+// appStore reaches the backend an App was wired with, so a write test
+// can assert on what actually landed rather than on what the CLI
+// printed.
+func appStore(t *testing.T, app *cli.App) store.Store {
+	t.Helper()
+
+	backend, err := app.StoreFor(t.Context())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	return backend
+}
+
 func seedResource(ctx context.Context, backend store.Store) {
 	_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
 	_ = backend.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: "node-1"})

@@ -36,6 +36,9 @@ type flagSet struct {
 	Machine bool
 	// Faulty filters resource listings (--faulty).
 	Faulty bool
+	// Diskless marks a replica as storage-free (--diskless and its
+	// DRBD-specific spelling).
+	Diskless bool
 	// Pastable requests the pipe-free rendering (-p/--pastable).
 	Pastable bool
 	// Color is the --color mode; empty means auto.
@@ -125,6 +128,10 @@ func parseFlags(args []string) (*flagSet, error) {
 			continue
 		case "--faulty":
 			parsed.Faulty = true
+
+			continue
+		case "--diskless", "--drbd-diskless":
+			parsed.Diskless = true
 
 			continue
 		case "-p", "--pastable":

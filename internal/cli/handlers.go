@@ -101,6 +101,23 @@ var handlers = map[string]handler{
 	"resource-definition create": resourceDefinitionCreate,
 	"resource-definition delete": resourceDefinitionDelete,
 
+	"node create": nodeCreate,
+	"node delete": nodeDelete,
+
+	"volume-definition create":   volumeDefinitionCreate,
+	"volume-definition delete":   volumeDefinitionDelete,
+	"volume-definition set-size": volumeDefinitionSetSize,
+
+	"resource create": resourceCreate,
+	"resource delete": resourceDelete,
+
+	"snapshot create": snapshotCreate,
+	"snapshot delete": snapshotDelete,
+
+	"resource-group create": resourceGroupCreate,
+	"resource-group modify": resourceGroupModify,
+	"resource-group delete": resourceGroupDelete,
+
 	"resource-definition set-property":    setProperty(rdProps),
 	"resource-definition list-properties": listProperties(rdProps),
 	"node set-property":                   setProperty(nodeProps),
