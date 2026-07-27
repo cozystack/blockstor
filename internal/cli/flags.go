@@ -42,6 +42,8 @@ type flagSet struct {
 	// Cancel asks for an in-flight conversion to be unwound
 	// (--cancel).
 	Cancel bool
+	// Force overrides a safety refusal (--force).
+	Force bool
 	// Pastable requests the pipe-free rendering (-p/--pastable).
 	Pastable bool
 	// Color is the --color mode; empty means auto.
@@ -160,6 +162,8 @@ func (f *flagSet) setBool(name string) bool {
 		f.Diskless = true
 	case "--cancel":
 		f.Cancel = true
+	case "--force":
+		f.Force = true
 	case "-p", "--pastable":
 		f.Pastable = true
 	case "--no-color":

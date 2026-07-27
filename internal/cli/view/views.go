@@ -21,6 +21,7 @@ package view
 import (
 	"fmt"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -365,4 +366,46 @@ func VolumeGroupRows(group *apiv1.ResourceGroup) []metav1.TableRow {
 	}
 
 	return rows
+}
+
+// NodeInfoColumns is the `node info` header.
+func NodeInfoColumns() []metav1.TableColumnDefinition {
+	return columns("Node", "Kind", "Capability", "Supported")
+}
+
+// NodeInfoRows renders one node's capability matrix, one row per
+// provider and layer. The flat shape is what an operator greps when
+// asking why autoplace skipped a node.
+func NodeInfoRows(info *apiv1.NodeInfo) []metav1.TableRow {
+	rows := make([]metav1.TableRow, 0,
+		len(info.SupportedProviders)+len(info.SupportedLayers)+
+			len(info.UnsupportedProviders)+len(info.UnsupportedLayers))
+
+	rows = append(rows, capabilityRows(info.Name, "Provider", info.SupportedProviders, true)...)
+	rows = append(rows, capabilityRows(info.Name, "Provider", sortedKeys(info.UnsupportedProviders), false)...)
+	rows = append(rows, capabilityRows(info.Name, "Layer", info.SupportedLayers, true)...)
+	rows = append(rows, capabilityRows(info.Name, "Layer", sortedKeys(info.UnsupportedLayers), false)...)
+
+	return rows
+}
+
+func capabilityRows(node, kind string, names []string, supported bool) []metav1.TableRow {
+	rows := make([]metav1.TableRow, 0, len(names))
+
+	for _, name := range names {
+		rows = append(rows, metav1.TableRow{Cells: []any{node, kind, name, boolCell(supported)}})
+	}
+
+	return rows
+}
+
+func sortedKeys(in map[string][]string) []string {
+	out := make([]string, 0, len(in))
+	for key := range in {
+		out = append(out, key)
+	}
+
+	sort.Strings(out)
+
+	return out
 }
