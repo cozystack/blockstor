@@ -117,12 +117,12 @@ func TestResourceCreateAutoPlaceDelta(t *testing.T) {
 	}
 }
 
-// An over-committed request is deferred best-effort placement, not a
-// failure: the rebalance reconciler tops the resource up when capacity
-// appears, and failing here would break every runbook that provisions
-// ahead of the hardware. The shortfall is reported on stderr so the
-// operator still learns about it.
-func TestAutoPlaceShortfallIsReportedNotFailed(t *testing.T) {
+// An explicit placement request FAILS when it cannot seat every
+// replica. The operator asked for three and got one; reporting success
+// would tell them a redundancy they do not have. This is deliberately
+// the opposite of the spawn path below — the two contracts are not
+// interchangeable.
+func TestAutoPlaceShortfallFails(t *testing.T) {
 	t.Parallel()
 
 	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
@@ -132,12 +132,12 @@ func TestAutoPlaceShortfallIsReportedNotFailed(t *testing.T) {
 	})
 
 	argv := []string{"r", "c", "--auto-place", "3", "--storage-pool", "data", "pvc-x"}
-	if got := app.Run(t.Context(), argv); got != 0 {
-		t.Fatalf("over-committed auto-place exit = %d, want 0 (stderr: %s)", got, errBuf.String())
+	if got := app.Run(t.Context(), argv); got == 0 {
+		t.Fatalf("an under-placed auto-place reported success (stderr: %s)", errBuf.String())
 	}
 
-	if !strings.Contains(errBuf.String(), "deferred") {
-		t.Errorf("the shortfall was not reported:\n%s", errBuf.String())
+	if !strings.Contains(errBuf.String(), "of 3") {
+		t.Errorf("the failure does not say how short it fell:\n%s", errBuf.String())
 	}
 }
 
@@ -185,8 +185,10 @@ func TestResourceGroupSpawn(t *testing.T) {
 	}
 }
 
-// Spawning from an over-committed group still succeeds — same
-// deferred-placement contract as auto-place.
+// Spawning from an over-committed group SUCCEEDS, and reports. Here
+// the group's place count is a target the rebalance reconciler keeps
+// working towards, so failing would break provisioning ahead of the
+// hardware.
 func TestResourceGroupSpawnOverCommitted(t *testing.T) {
 	t.Parallel()
 
@@ -200,6 +202,10 @@ func TestResourceGroupSpawnOverCommitted(t *testing.T) {
 
 	if got := app.Run(t.Context(), []string{"rg", "spawn", "grp", "pvc-x", "32M"}); got != 0 {
 		t.Errorf("spawn on an over-committed group exit = %d, want 0 (stderr: %s)", got, errBuf.String())
+	}
+
+	if !strings.Contains(errBuf.String(), "deferred") {
+		t.Errorf("the deferred placement was not reported:\n%s", errBuf.String())
 	}
 }
 

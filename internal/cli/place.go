@@ -20,6 +20,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -32,6 +33,10 @@ import (
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
 
+// errNotEnoughNodes is the shortfall an explicit placement request
+// fails on.
+var errNotEnoughNodes = errors.New("not enough candidate storage pools")
+
 // autoPlace runs the placer for one definition.
 //
 // The placer is the controller's own selection code, driven from the
@@ -39,12 +44,16 @@ import (
 // answers to "where should this replica go?" that drift apart the
 // moment either changes.
 //
-// A shortfall is REPORTED, not failed: blockstor's contract for an
-// over-committed request is deferred best-effort placement, so the
-// rebalance reconciler tops the resource up when capacity appears.
-// Failing here would break every runbook that provisions ahead of the
-// hardware.
-func autoPlace(ctx context.Context, run *runContext, rdName string, filter *apiv1.AutoSelectFilter) error {
+// `bestEffort` decides what a shortfall means, and the two answers are NOT
+// interchangeable. An explicit placement request FAILS when it cannot
+// seat every replica: the operator asked for N and must find out they
+// did not get N. A group spawn or rebalance succeeds and reports,
+// because there the group's policy is a target the rebalance
+// reconciler keeps working towards as capacity appears — failing would
+// break provisioning ahead of the hardware.
+func autoPlace(
+	ctx context.Context, run *runContext, rdName string, filter *apiv1.AutoSelectFilter, bestEffort bool,
+) error {
 	err := resolveAdditionalPlaceCount(ctx, run.Store, rdName, filter)
 	if err != nil {
 		return err
@@ -59,13 +68,19 @@ func autoPlace(ctx context.Context, run *runContext, rdName string, filter *apiv
 		return fmt.Errorf("autoplace %s: %w", rdName, err)
 	}
 
-	if placed < want {
-		_, err = fmt.Fprintf(run.Err,
-			"autoplace deferred: placed %d of %d replica(s) for %s; no candidate storage pool for the rest\n",
-			placed, want, rdName)
-		if err != nil {
-			return fmt.Errorf("report placement shortfall: %w", err)
-		}
+	if placed >= want {
+		return nil
+	}
+
+	if !bestEffort {
+		return fmt.Errorf("%w: placed %d of %d replica(s) for %s", errNotEnoughNodes, placed, want, rdName)
+	}
+
+	_, err = fmt.Fprintf(run.Err,
+		"autoplace deferred: placed %d of %d replica(s) for %s; no candidate storage pool for the rest\n",
+		placed, want, rdName)
+	if err != nil {
+		return fmt.Errorf("report placement shortfall: %w", err)
 	}
 
 	return nil
@@ -210,7 +225,7 @@ func resourceDefinitionAutoPlace(ctx context.Context, run *runContext) error {
 		return err
 	}
 
-	return autoPlace(ctx, run, rdName, filter)
+	return autoPlace(ctx, run, rdName, filter, false)
 }
 
 // resourceGroupSpawn implements `resource-group spawn-resources <rg>
@@ -258,7 +273,7 @@ func resourceGroupSpawn(ctx context.Context, run *runContext) error {
 		return err
 	}
 
-	return autoPlace(ctx, run, rdName, filter)
+	return autoPlace(ctx, run, rdName, filter, true)
 }
 
 // spawnDefinition creates the definition, carrying over the group's
@@ -311,7 +326,7 @@ func resourceGroupAdjust(ctx context.Context, run *runContext) error {
 			return filterErr
 		}
 
-		filterErr = autoPlace(ctx, run, defs[i].Name, filter)
+		filterErr = autoPlace(ctx, run, defs[i].Name, filter, true)
 		if filterErr != nil {
 			return filterErr
 		}

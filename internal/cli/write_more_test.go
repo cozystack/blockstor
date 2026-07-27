@@ -249,3 +249,62 @@ func containsFlag(flags []string, want string) bool {
 
 	return false
 }
+
+// A shrink is refused: nothing here shrinks the filesystem first, so
+// handing the block device a smaller size under a live filesystem
+// truncates it. --force is the operator stating they already shrank
+// the filesystem themselves.
+func TestVolumeDefinitionSetSizeRefusesShrink(t *testing.T) {
+	t.Parallel()
+
+	seed := func(ctx context.Context, backend store.Store) {
+		seedDefinition(ctx, backend)
+		_ = backend.VolumeDefinitions().Create(ctx, "pvc-x", &apiv1.VolumeDefinition{
+			VolumeNumber: 0, SizeKib: 2 << 20, // 2 GiB
+		})
+	}
+
+	app, _, errBuf := newApp(t, seed)
+
+	if got := app.Run(t.Context(), []string{"vd", "s", "pvc-x", "0", "1G"}); got == 0 {
+		t.Fatal("a shrink was accepted")
+	}
+
+	if !strings.Contains(errBuf.String(), "--force") {
+		t.Errorf("the refusal does not say how to proceed deliberately:\n%s", errBuf.String())
+	}
+
+	vds, err := appStore(t, app).VolumeDefinitions().List(t.Context(), "pvc-x")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if vds[0].SizeKib != 2<<20 {
+		t.Errorf("the refused shrink still wrote %d KiB", vds[0].SizeKib)
+	}
+
+	forced, _, forcedErr := newApp(t, seed)
+	if got := forced.Run(t.Context(), []string{"vd", "s", "pvc-x", "0", "1G", "--force"}); got != 0 {
+		t.Errorf("--force did not allow the shrink: exit %d (%s)", got, forcedErr.String())
+	}
+}
+
+// The size bounds hold even under --force. Below DRBD's per-device
+// minimum the satellite loops on `drbdadm create-md` forever rather
+// than failing, so a zero or 1 KiB size must never reach the spec.
+func TestVolumeDefinitionSetSizeBounds(t *testing.T) {
+	t.Parallel()
+
+	for _, size := range []string{"1024", "1M", "17179869184M"} {
+		app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+			seedDefinition(ctx, backend)
+			_ = backend.VolumeDefinitions().Create(ctx, "pvc-x", &apiv1.VolumeDefinition{
+				VolumeNumber: 0, SizeKib: 1 << 20,
+			})
+		})
+
+		if got := app.Run(t.Context(), []string{"vd", "s", "pvc-x", "0", size, "--force"}); got == 0 {
+			t.Errorf("--force let %s past the size bounds", size)
+		}
+	}
+}

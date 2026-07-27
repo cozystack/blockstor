@@ -20,6 +20,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -248,6 +249,11 @@ func volumeDefinitionSetSize(ctx context.Context, run *runContext) error {
 		return fmt.Errorf("get volume definition %s/%d: %w", rdName, number, err)
 	}
 
+	err = checkResize(&vd, sizeKib, run.Flags.Force)
+	if err != nil {
+		return err
+	}
+
 	vd.SizeKib = sizeKib
 
 	err = run.Store.VolumeDefinitions().Update(ctx, rdName, &vd)
@@ -256,6 +262,42 @@ func volumeDefinitionSetSize(ctx context.Context, run *runContext) error {
 	}
 
 	return nil
+}
+
+// The size a volume may be set to. The floor is DRBD's own per-device
+// minimum once metadata is reserved; below it the satellite loops on
+// `drbdadm create-md` forever instead of failing. Both bounds hold
+// even under --force, which only ever waives the shrink refusal.
+const (
+	volumeSizeFloorKib   int64 = 4 * kibPerMib
+	volumeSizeCeilingKib int64 = 16 * kibPerMib * kibPerMib * kibPerMib
+)
+
+var (
+	errSizeOutOfBounds = errors.New("size is outside the supported range of 4 MiB to 16 TiB")
+	errNoAutoShrink    = errors.New(
+		"shrink the filesystem first (resize2fs -s, or xfs dump+restore), unmount the volume, " +
+			"then re-run with --force")
+)
+
+// checkResize refuses a resize that would destroy data or wedge the
+// satellite.
+//
+// A shrink is refused without --force because nothing here shrinks the
+// filesystem: handing the block device a smaller size under a live
+// filesystem truncates it. --force is the operator's statement that
+// they have already shrunk the filesystem themselves.
+func checkResize(vd *apiv1.VolumeDefinition, sizeKib int64, force bool) error {
+	if sizeKib < volumeSizeFloorKib || sizeKib > volumeSizeCeilingKib {
+		return fmt.Errorf("%d KiB: %w", sizeKib, errSizeOutOfBounds)
+	}
+
+	if sizeKib >= vd.SizeKib || force {
+		return nil
+	}
+
+	return fmt.Errorf("cannot shrink volume %d from %d KiB to %d KiB: %w",
+		vd.VolumeNumber, vd.SizeKib, sizeKib, errNoAutoShrink)
 }
 
 // resourceCreate implements `resource create <node...> <rd>`.
@@ -278,7 +320,7 @@ func resourceCreate(ctx context.Context, run *runContext) error {
 			return err
 		}
 
-		return autoPlace(ctx, run, rdName, filter)
+		return autoPlace(ctx, run, rdName, filter, false)
 	}
 
 	if len(run.Flags.Positionals) < 2 {
