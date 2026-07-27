@@ -146,6 +146,9 @@ var handlers = map[string]handler{
 	"volume-group create": volumeGroupCreate,
 	"volume-group list":   volumeGroupList,
 
+	"encryption create-passphrase": encryptionCreatePassphrase,
+	"encryption enter-passphrase":  encryptionEnterPassphrase,
+
 	"error-reports list": errorReportsList,
 
 	"controller version": controllerVersion,

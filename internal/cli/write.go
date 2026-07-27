@@ -282,3 +282,9 @@ var Version = "dev"
 func isNotFound(err error) bool {
 	return apierrors.IsNotFound(err) || errors.Is(err, store.ErrNotFound)
 }
+
+// isAlreadyExists is the create-side counterpart, across both
+// backends.
+func isAlreadyExists(err error) bool {
+	return apierrors.IsAlreadyExists(err) || errors.Is(err, store.ErrAlreadyExists)
+}

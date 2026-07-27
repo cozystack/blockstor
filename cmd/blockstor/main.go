@@ -39,10 +39,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -57,6 +59,7 @@ func main() {
 		Out:      os.Stdout,
 		Err:      os.Stderr,
 		StoreFor: openStore,
+		KubeFor:  openKube,
 	}
 
 	os.Exit(app.Run(context.Background(), os.Args[1:]))
@@ -68,23 +71,64 @@ func main() {
 // The client is deliberately NOT cached: a cache would reintroduce the
 // read-your-writes lag the apiserver has to defend against, and a CLI
 // process that lists once has nothing to gain from an informer.
-func openStore(context.Context) (store.Store, error) {
+func openStore(ctx context.Context) (store.Store, error) {
+	c, _, err := openKube(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return storek8s.New(c), nil
+}
+
+// openKube builds the raw client plus the namespace the controller
+// runs in, for the few commands that reach objects outside the CRD
+// surface (the cluster passphrase lives in a Secret).
+func openKube(context.Context) (ctrlclient.Client, string, error) {
 	cfg, err := config.GetConfig()
 	if err != nil {
-		return nil, fmt.Errorf("load kubeconfig: %w", err)
+		return nil, "", fmt.Errorf("load kubeconfig: %w", err)
 	}
 
 	scheme := runtime.NewScheme()
 
 	err = crdv1alpha1.AddToScheme(scheme)
 	if err != nil {
-		return nil, fmt.Errorf("register scheme: %w", err)
+		return nil, "", fmt.Errorf("register scheme: %w", err)
+	}
+
+	err = corev1.AddToScheme(scheme)
+	if err != nil {
+		return nil, "", fmt.Errorf("register core scheme: %w", err)
 	}
 
 	c, err := ctrlclient.New(cfg, ctrlclient.Options{Scheme: scheme})
 	if err != nil {
-		return nil, fmt.Errorf("connect to the Kubernetes API: %w", err)
+		return nil, "", fmt.Errorf("connect to the Kubernetes API: %w", err)
 	}
 
-	return storek8s.New(c), nil
+	return c, namespace(), nil
 }
+
+// namespace resolves where the controller's own objects live: the
+// in-cluster service-account namespace when running as a pod, the
+// BLOCKSTOR_NAMESPACE override otherwise, and the deployment default
+// last.
+func namespace() string {
+	if ns := os.Getenv("BLOCKSTOR_NAMESPACE"); ns != "" {
+		return ns
+	}
+
+	data, err := os.ReadFile(serviceAccountNamespaceFile)
+	if err == nil && len(data) > 0 {
+		return strings.TrimSpace(string(data))
+	}
+
+	return defaultNamespace
+}
+
+// serviceAccountNamespaceFile is where kubelet projects a pod's own
+// namespace.
+const serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// defaultNamespace matches the deployment manifests.
+const defaultNamespace = "blockstor-system"

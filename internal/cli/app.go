@@ -28,6 +28,8 @@ import (
 	"os"
 	"sort"
 
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/color"
@@ -59,6 +61,13 @@ type App struct {
 	// IsTTY reports whether Out is an interactive terminal; nil means
 	// "detect from Out".
 	IsTTY func() bool
+
+	// KubeFor opens a raw Kubernetes client and the namespace the
+	// controller runs in. Only the handful of commands that touch
+	// objects outside the CRD surface — the cluster passphrase lives
+	// in a Secret — need it, so it may be nil and those commands then
+	// say why they cannot run rather than failing obscurely.
+	KubeFor func(ctx context.Context) (ctrlclient.Client, string, error)
 }
 
 // handler runs one command.
@@ -71,6 +80,10 @@ type runContext struct {
 	Err   io.Writer
 	Flags *flagSet
 	Color color.Writer
+
+	// Kube is nil unless the invocation was wired with cluster
+	// access beyond the CRD surface.
+	Kube func(ctx context.Context) (ctrlclient.Client, string, error)
 }
 
 // Run executes argv and returns the process exit code.
@@ -106,6 +119,7 @@ func (a *App) Run(ctx context.Context, argv []string) int {
 		Err:   a.Err,
 		Flags: flags,
 		Color: color.New(color.EnabledFor(mode, a.tty())),
+		Kube:  a.KubeFor,
 	})
 	if err != nil {
 		return a.fail(err)
