@@ -66,7 +66,7 @@ func nodeAddresses(node *apiv1.Node) string {
 func nodeState(node *apiv1.Node) string {
 	for _, flag := range node.Flags {
 		switch flag {
-		case "EVICTED", "EVACUATING", "DELETE":
+		case "EVICTED", "EVACUATING", flagDelete:
 			return flag
 		}
 	}

@@ -43,6 +43,14 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
+// Well-known state cells shared across views.
+const (
+	stateOk       = "Ok"
+	stateDeleting = "DELETING"
+	stateUnknown  = "Unknown"
+	flagDelete    = "DELETE"
+)
+
 // State cells that are terminal — a converged replica never carries a
 // sync percentage, which a harness asserts by grepping for the absence
 // of `UpToDate(NN%)`.
@@ -177,8 +185,8 @@ func connsCell(res *apiv1.Resource) string {
 // harness greps for that exact token, case included) rather than the
 // Diskless it also technically is.
 func stateCell(res *apiv1.Resource, sizes map[int32]int64) string {
-	if slices.Contains(res.Flags, "DELETE") {
-		return "DELETING"
+	if slices.Contains(res.Flags, flagDelete) {
+		return stateDeleting
 	}
 
 	if slices.Contains(res.Flags, apiv1.ResourceFlagTieBreaker) {
@@ -191,7 +199,7 @@ func stateCell(res *apiv1.Resource, sizes map[int32]int64) string {
 
 	vol := worstVolume(res)
 	if vol == nil || vol.State.DiskState == "" {
-		return "Unknown"
+		return stateUnknown
 	}
 
 	state := vol.State.DiskState
