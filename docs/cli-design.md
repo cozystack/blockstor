@@ -47,15 +47,13 @@ Modifications go through server-side apply with the CLI's own field manager. Tha
 
 `resource-group spawn` is the one verb with real orchestration behind it (autoplace). The placement engine is already a reusable library (`pkg/placer`, constructed from `store.Store`) and placement is additionally driven by the resource-group controllers, so the CLI calls the placer rather than reimplementing placement.
 
-## What Kubernetes does not hold
+## Encryption, and one thing Kubernetes does not hold
 
-One command cannot be served from the CRDs, because the state it acts on does not live there.
+The cluster master key lives in a Secret, so `encryption create-passphrase` writes it there and `enter-passphrase` proves knowledge of it against the same Secret. Both compare in constant time: a byte-by-byte compare leaks where two passphrases first differ, and an attacker who can time enough attempts recovers the key one character at a time. `create-passphrase` refuses to replace an existing passphrase with a different value, because rotating the master key leaves every existing LUKS volume undecryptable; re-running it with the same value stays a success so a script's pre-flight step is idempotent.
 
-`encryption enter-passphrase` flips an in-memory unlocked flag in the controller process. The CLI verifies that the supplied passphrase matches the cluster Secret — the part it can check — and then reports that the unlock itself has to go to the controller's `/v1/encryption/passphrase` endpoint. `create-passphrase`, by contrast, writes the Secret and works normally; it refuses to replace an existing passphrase with a different one, because rotating the master key leaves every existing LUKS volume undecryptable.
+Serving `enter-passphrase` over REST additionally flips an in-memory unlocked flag in the controller process, and this CLI cannot flip that. It matters less than the name suggests. The flag's only reader is `stampSuspendedOnLUKS` (`pkg/rest/resources.go`), which sets `state.suspended` on LUKS resources in the REST view — the Suspended/Available column. It gates nothing: the LUKS create check reads the Secret (`refuseLUKSWithoutPassphrase`), and satellites decrypt from the Secret too. It is also per-process and resets on restart, so across several apiserver replicas it already disagrees with itself. So the CLI does the part that has an effect, succeeds, and says on stderr that the display flag is untouched.
 
-Note what that flag actually gates, because it is narrower than its name suggests: its only reader is `stampSuspendedOnLUKS` (`pkg/rest/resources.go`), which sets `state.suspended` on LUKS resources for the REST view. Provisioning is not gated on it — the LUKS RD-create check reads the Secret (`refuseLUKSWithoutPassphrase`), and satellites decrypt from the Secret too. So an unlocked flag is a display state of one REST process, and this CLI does not read it: it derives State from CRD status.
-
-`error-reports` is deliberately absent from the command surface. The reports are a ring buffer in the controller process's memory; a CLI that speaks to the API server has nothing to list, and there is no reason to grow a subsystem for it.
+`error-reports` is deliberately absent from the command surface. The reports are a ring buffer in the controller process's memory; a client that speaks to the API server has nothing to list, and carrying the verb only to refuse it is worse than not advertising it.
 
 One command is approximate rather than exact. `resource-group query-size-info` / `query-max-volume-size` report the physical bound derived from the free capacity of the pools a replica set would occupy. The controller additionally applies the thin-pool oversubscription policy, which lives inside `pkg/rest` and is not reusable; the CLI's figure is therefore always at least as conservative as the controller's, never more optimistic.
 

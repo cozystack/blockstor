@@ -134,28 +134,27 @@ func TestEncryptionCreatePassphraseDoesNotRotate(t *testing.T) {
 	}
 }
 
-// Unlocking is state inside the controller process, not an object in
-// Kubernetes, so the CLI cannot perform it. It verifies what it can
-// and then says where the unlock has to go — exiting 0 would leave the
-// operator believing the cluster was unlocked when it was not.
-func TestEncryptionEnterPassphraseIsRefusedNotFaked(t *testing.T) {
+// enter-passphrase proves the operator knows the master key, and that
+// is what it checks. A wrong passphrase fails; the right one succeeds
+// and says that the controller's own unlocked flag — which only drives
+// the Suspended/Available column in its REST view, and gates nothing —
+// was not touched.
+func TestEncryptionEnterPassphrase(t *testing.T) {
 	t.Parallel()
 
 	app, _, errBuf := newKubeApp(t)
 
-	if got := app.Run(t.Context(), []string{"encryption", "create-passphrase", "-p", "s3cret"}); got != 0 {
-		t.Fatalf("create exit = %d (stderr: %s)", got, errBuf.String())
-	}
-
+	// Before a passphrase exists there is nothing to prove knowledge
+	// of, so this is a failure rather than a vacuous success.
 	if got := app.Run(t.Context(), []string{"encryption", "enter-passphrase", "-p", "s3cret"}); got == 0 {
-		t.Fatal("enter-passphrase reported success it cannot deliver")
-	}
-
-	if !strings.Contains(errBuf.String(), "/v1/encryption/passphrase") {
-		t.Errorf("the refusal does not say where the unlock has to go:\n%s", errBuf.String())
+		t.Fatal("enter-passphrase succeeded on a cluster with no passphrase")
 	}
 
 	errBuf.Reset()
+
+	if got := app.Run(t.Context(), []string{"encryption", "create-passphrase", "-p", "s3cret"}); got != 0 {
+		t.Fatalf("create exit = %d (stderr: %s)", got, errBuf.String())
+	}
 
 	if got := app.Run(t.Context(), []string{"encryption", "enter-passphrase", "-p", "wrong"}); got == 0 {
 		t.Error("a wrong passphrase was accepted")
@@ -163,6 +162,16 @@ func TestEncryptionEnterPassphraseIsRefusedNotFaked(t *testing.T) {
 
 	if !strings.Contains(errBuf.String(), "does not match") {
 		t.Errorf("a wrong passphrase was not reported as such:\n%s", errBuf.String())
+	}
+
+	errBuf.Reset()
+
+	if got := app.Run(t.Context(), []string{"encryption", "enter-passphrase", "-p", "s3cret"}); got != 0 {
+		t.Fatalf("the right passphrase exit = %d, want 0 (stderr: %s)", got, errBuf.String())
+	}
+
+	if !strings.Contains(errBuf.String(), "verified") {
+		t.Errorf("a successful verification said nothing about what it did:\n%s", errBuf.String())
 	}
 }
 

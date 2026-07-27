@@ -20,6 +20,7 @@ package cli
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 
@@ -35,10 +36,8 @@ import (
 var (
 	errNoKubeAccess = errors.New(
 		"this command needs cluster access beyond the CRD surface; run it against a real cluster")
-	errPassphraseMismatch   = errors.New("the supplied passphrase does not match the cluster's")
-	errUnlockIsProcessState = errors.New(
-		"unlocking is per-controller-process state, not a Kubernetes object; " +
-			"send it to the controller's /v1/encryption/passphrase endpoint")
+	errPassphraseMismatch = errors.New("the supplied passphrase does not match the cluster's")
+	errNoPassphraseSet    = errors.New("this cluster has no passphrase; create one first")
 )
 
 // encryptionPassphrase reads the passphrase an operator supplied.
@@ -102,7 +101,7 @@ func encryptionCreatePassphrase(ctx context.Context, run *runContext) error {
 		return fmt.Errorf("read passphrase secret: %w", err)
 	}
 
-	if current != value {
+	if subtle.ConstantTimeCompare([]byte(current), []byte(value)) != 1 {
 		return fmt.Errorf("passphrase already set: %w", errPassphraseMismatch)
 	}
 
@@ -111,12 +110,23 @@ func encryptionCreatePassphrase(ctx context.Context, run *runContext) error {
 
 // encryptionEnterPassphrase implements `encryption enter-passphrase`.
 //
-// Entering the passphrase unlocks the CONTROLLER PROCESS — it is
-// in-memory state there, not an object in Kubernetes — so a CLI that
-// speaks to the API server cannot perform it. It verifies what it can
-// (that the passphrase matches) and then says where the unlock has to
-// go, rather than exiting 0 and leaving the operator believing the
-// cluster is unlocked.
+// The verb proves the operator knows the cluster master key, and that
+// is exactly what happens here: the supplied value is compared against
+// the Secret, and a wrong one fails.
+//
+// The controller additionally flips an in-memory unlocked flag when it
+// serves this over REST. That flag has one consumer — it sets
+// `state.suspended` on LUKS resources in the REST view — and gates
+// nothing: the LUKS create check reads the Secret, and satellites
+// decrypt from the Secret too. It is also per-process, so with several
+// apiserver replicas it already disagrees with itself. This CLI
+// therefore verifies and succeeds, and says on stderr that the
+// server-side display flag was not touched, rather than refusing a
+// command whose real effect it can deliver in full.
+//
+// The comparison is constant-time. A byte-by-byte compare leaks where
+// two passphrases first differ, and an attacker who can time enough
+// attempts recovers the master key one character at a time.
 func encryptionEnterPassphrase(ctx context.Context, run *runContext) error {
 	value, err := encryptionPassphrase(run)
 	if err != nil {
@@ -133,11 +143,22 @@ func encryptionEnterPassphrase(ctx context.Context, run *runContext) error {
 		return fmt.Errorf("read passphrase secret: %w", err)
 	}
 
-	if current != value {
+	if current == "" {
+		return fmt.Errorf("cannot unlock: %w", errNoPassphraseSet)
+	}
+
+	if subtle.ConstantTimeCompare([]byte(current), []byte(value)) != 1 {
 		return fmt.Errorf("cannot unlock: %w", errPassphraseMismatch)
 	}
 
-	return fmt.Errorf("passphrase verified but not applied: %w", errUnlockIsProcessState)
+	_, err = fmt.Fprintln(run.Err,
+		"passphrase verified; the controller's own unlocked flag (which only drives the "+
+			"Suspended/Available column in its REST view) is untouched")
+	if err != nil {
+		return fmt.Errorf("write notice: %w", err)
+	}
+
+	return nil
 }
 
 // kube opens the raw cluster client, or explains that this invocation
