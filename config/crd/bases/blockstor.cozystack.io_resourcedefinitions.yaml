@@ -14,7 +14,20 @@ spec:
     singular: resourcedefinition
   scope: Cluster
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.resourceGroupName
+      name: Group
+      type: string
+    - jsonPath: .spec.drbdPort
+      name: Port
+      type: integer
+    - jsonPath: .spec.layerStack
+      name: Layers
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: ResourceDefinition is the Schema for the resourcedefinitions

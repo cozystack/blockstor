@@ -112,6 +112,10 @@ type ResourceGroupStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 
+// +kubebuilder:printcolumn:name="Place-Count",type=integer,JSONPath=`.spec.selectFilter.placeCount`
+// +kubebuilder:printcolumn:name="Storage-Pool",type=string,JSONPath=`.spec.selectFilter.storagePool`
+// +kubebuilder:printcolumn:name="Layers",type=string,JSONPath=`.spec.selectFilter.layerStack`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // ResourceGroup is the Schema for the resourcegroups API
 type ResourceGroup struct {
 	metav1.TypeMeta `json:",inline"`
