@@ -29,6 +29,11 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
+// PropertyColumns is the column set every `list-properties` view uses.
+func PropertyColumns() []metav1.TableColumnDefinition {
+	return columns("Key", "Value")
+}
+
 // StoragePoolList builds the `storage-pool list` table.
 //
 // The State cell is the reason this view exists rather than a printer

@@ -1,0 +1,278 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"sort"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
+
+	"github.com/cozystack/blockstor/internal/cli/command"
+	"github.com/cozystack/blockstor/internal/cli/view"
+)
+
+// propertyAccessor reads and writes one object's property bag. Every
+// noun that supports set-property/list-properties plugs into the same
+// two handlers through this, so the empty-value-deletes rule below
+// cannot drift between them.
+type propertyAccessor struct {
+	// args is how many positionals identify the object (1 for a node
+	// or definition, 0 for the controller).
+	args int
+	get  func(context.Context, store.Store, []string) (map[string]string, error)
+	set  func(context.Context, store.Store, []string, map[string]string) error
+}
+
+// setProperty implements `<noun> set-property`.
+//
+// An EMPTY value DELETES the key. That is the upstream behaviour this
+// repo's replay workflows depend on: they restore a cluster's
+// automatic behaviour by setting a property to "" and then assert the
+// key is gone.
+func setProperty(accessor propertyAccessor) handler {
+	return func(ctx context.Context, run *runContext) error {
+		want := accessor.args + 1
+
+		if len(run.Flags.Positionals) < want {
+			return fmt.Errorf("%w: set-property needs %d argument(s) plus a key", command.ErrUsage, accessor.args)
+		}
+
+		ident := run.Flags.Positionals[:accessor.args]
+		key := run.Flags.Positionals[accessor.args]
+
+		value := ""
+		if len(run.Flags.Positionals) > want {
+			value = run.Flags.Positionals[want]
+		}
+
+		props, err := accessor.get(ctx, run.Store, ident)
+		if err != nil {
+			return err
+		}
+
+		if props == nil {
+			props = map[string]string{}
+		}
+
+		if value == "" {
+			delete(props, key)
+		} else {
+			props[key] = value
+		}
+
+		return accessor.set(ctx, run.Store, ident, props)
+	}
+}
+
+// listProperties implements `<noun> list-properties`.
+func listProperties(accessor propertyAccessor) handler {
+	return func(ctx context.Context, run *runContext) error {
+		if len(run.Flags.Positionals) < accessor.args {
+			return fmt.Errorf("%w: list-properties needs %d argument(s)", command.ErrUsage, accessor.args)
+		}
+
+		props, err := accessor.get(ctx, run.Store, run.Flags.Positionals[:accessor.args])
+		if err != nil {
+			return err
+		}
+
+		keys := make([]string, 0, len(props))
+		for key := range props {
+			keys = append(keys, key)
+		}
+
+		sort.Strings(keys)
+
+		if run.Flags.Machine {
+			pairs := make([]map[string]string, 0, len(keys))
+			for _, key := range keys {
+				pairs = append(pairs, map[string]string{"key": key, "value": props[key]})
+			}
+
+			return machineOut(run, pairs)
+		}
+
+		tbl := &metav1.Table{ColumnDefinitions: view.PropertyColumns()}
+		for _, key := range keys {
+			tbl.Rows = append(tbl.Rows, metav1.TableRow{Cells: []any{key, props[key]}})
+		}
+
+		return run.render(tbl)
+	}
+}
+
+// objectProps builds an accessor for any kind whose property bag is a
+// plain field on a fetch-mutate-update object. Keeping the shape in
+// one place is what stops the empty-value-deletes rule from drifting
+// between nouns.
+func objectProps[T any](
+	kind string,
+	get func(context.Context, store.Store, string) (T, error),
+	bag func(*T) *map[string]string,
+	update func(context.Context, store.Store, *T) error,
+) propertyAccessor {
+	return propertyAccessor{
+		args: 1,
+		get: func(ctx context.Context, st store.Store, ident []string) (map[string]string, error) {
+			obj, err := get(ctx, st, ident[0])
+			if err != nil {
+				return nil, fmt.Errorf("get %s %s: %w", kind, ident[0], err)
+			}
+
+			return maps.Clone(*bag(&obj)), nil
+		},
+		set: func(ctx context.Context, st store.Store, ident []string, props map[string]string) error {
+			obj, err := get(ctx, st, ident[0])
+			if err != nil {
+				return fmt.Errorf("get %s %s: %w", kind, ident[0], err)
+			}
+
+			*bag(&obj) = props
+
+			err = update(ctx, st, &obj)
+			if err != nil {
+				return fmt.Errorf("update %s %s: %w", kind, ident[0], err)
+			}
+
+			return nil
+		},
+	}
+}
+
+// rdProps accesses a resource definition's property bag.
+//
+//nolint:gochecknoglobals // static accessor table
+var rdProps = objectProps("resource definition",
+	func(ctx context.Context, st store.Store, name string) (apiv1.ResourceDefinition, error) {
+		return st.ResourceDefinitions().Get(ctx, name)
+	},
+	func(def *apiv1.ResourceDefinition) *map[string]string { return &def.Props },
+	func(ctx context.Context, st store.Store, def *apiv1.ResourceDefinition) error {
+		return st.ResourceDefinitions().Update(ctx, def)
+	},
+)
+
+// nodeProps accesses a node's property bag.
+//
+//nolint:gochecknoglobals // static accessor table
+var nodeProps = objectProps("node",
+	func(ctx context.Context, st store.Store, name string) (apiv1.Node, error) {
+		return st.Nodes().Get(ctx, name)
+	},
+	func(node *apiv1.Node) *map[string]string { return &node.Props },
+	func(ctx context.Context, st store.Store, node *apiv1.Node) error {
+		return st.Nodes().Update(ctx, node)
+	},
+)
+
+// controllerProps accesses the cluster-wide property bag.
+//
+//nolint:gochecknoglobals // static accessor table
+var controllerProps = propertyAccessor{
+	args: 0,
+	get: func(ctx context.Context, st store.Store, _ []string) (map[string]string, error) {
+		props, err := st.ControllerProps().Get(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("get controller properties: %w", err)
+		}
+
+		return props, nil
+	},
+	set: func(ctx context.Context, st store.Store, _ []string, props map[string]string) error {
+		err := st.ControllerProps().Set(ctx, props)
+		if err != nil {
+			return fmt.Errorf("set controller properties: %w", err)
+		}
+
+		return nil
+	},
+}
+
+// resourceDefinitionCreate implements `resource-definition create`.
+func resourceDefinitionCreate(ctx context.Context, run *runContext) error {
+	if len(run.Flags.Positionals) < 1 {
+		return fmt.Errorf("%w: create needs a resource-definition name", command.ErrUsage)
+	}
+
+	def := &apiv1.ResourceDefinition{
+		Name:              run.Flags.Positionals[0],
+		ResourceGroupName: run.Flags.Values["resource-group"],
+	}
+
+	if layers := run.Flags.Values["layer-list"]; layers != "" {
+		def.LayerStack = splitList(layers)
+	}
+
+	err := run.Store.ResourceDefinitions().Create(ctx, def)
+	if err != nil {
+		return fmt.Errorf("create resource definition %s: %w", def.Name, err)
+	}
+
+	return nil
+}
+
+// resourceDefinitionDelete implements `resource-definition delete`.
+//
+// Deleting something that is already gone SUCCEEDS: the upstream
+// behaviour this repo pins is idempotent, and teardown paths rely on
+// it — failing there would break cleanup runs that are otherwise fine.
+func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
+	if len(run.Flags.Positionals) < 1 {
+		return fmt.Errorf("%w: delete needs a resource-definition name", command.ErrUsage)
+	}
+
+	name := run.Flags.Positionals[0]
+
+	err := run.Store.ResourceDefinitions().Delete(ctx, name)
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("delete resource definition %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// controllerVersion implements `controller version`.
+func controllerVersion(_ context.Context, run *runContext) error {
+	_, err := fmt.Fprintf(run.Out, "blockstor %s\n", Version)
+	if err != nil {
+		return fmt.Errorf("write version: %w", err)
+	}
+
+	return nil
+}
+
+// Version is stamped at build time; the default keeps a dev build
+// honest about what it is.
+//
+//nolint:gochecknoglobals // set via -ldflags
+var Version = "dev"
+
+// isNotFound recognises both the Kubernetes NotFound and the store's
+// own sentinel, so idempotent deletes work against either backend.
+func isNotFound(err error) bool {
+	return apierrors.IsNotFound(err) || errors.Is(err, store.ErrNotFound)
+}

@@ -97,6 +97,18 @@ var handlers = map[string]handler{
 	),
 
 	"volume-definition list": volumeDefinitionList,
+
+	"resource-definition create": resourceDefinitionCreate,
+	"resource-definition delete": resourceDefinitionDelete,
+
+	"resource-definition set-property":    setProperty(rdProps),
+	"resource-definition list-properties": listProperties(rdProps),
+	"node set-property":                   setProperty(nodeProps),
+	"node list-properties":                listProperties(nodeProps),
+	"controller set-property":             setProperty(controllerProps),
+	"controller list-properties":          listProperties(controllerProps),
+
+	"controller version": controllerVersion,
 }
 
 // listing builds a handler for the shared list shape: fetch, filter,
