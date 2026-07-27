@@ -233,20 +233,16 @@ func TestColourGating(t *testing.T) {
 	}
 }
 
-// Every command in the registry is dispatchable: a registered command
-// with no handler would fail at runtime for an operator instead of
-// here. Commands still to be implemented must say so explicitly rather
-// than being silently absent.
+// Every command in the registry is dispatchable. A command advertised
+// in the grammar but missing a handler is worse than one that was
+// never advertised: an operator finds it in the help, reaches for it
+// mid-incident, and gets an error instead of an action.
 func TestEveryRegisteredCommandIsReachable(t *testing.T) {
 	t.Parallel()
 
 	app, _, _ := newApp(t, nil)
 
 	for _, missing := range app.UnimplementedCommands() {
-		t.Logf("not yet implemented: %s", missing)
-	}
-
-	if got := len(app.UnimplementedCommands()); got > 0 {
-		t.Logf("%d command(s) remain unimplemented", got)
+		t.Errorf("the grammar advertises %q but nothing implements it", missing)
 	}
 }

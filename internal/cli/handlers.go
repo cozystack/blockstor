@@ -149,6 +149,30 @@ var handlers = map[string]handler{
 	"encryption create-passphrase": encryptionCreatePassphrase,
 	"encryption enter-passphrase":  encryptionEnterPassphrase,
 
+	"resource-definition modify":     resourceDefinitionModify,
+	"resource-definition clone":      resourceDefinitionClone,
+	"resource-group query-size-info": resourceGroupQuerySizeInfo,
+
+	"resource-group query-max-volume-size": resourceGroupQuerySizeInfo,
+
+	"snapshot create-multiple":             snapshotCreateMultiple,
+	"snapshot rollback":                    snapshotRollback,
+	"snapshot resource restore":            snapshotRestoreResource,
+	"snapshot resource-definition restore": snapshotRestoreResource,
+	"snapshot volume-definition restore":   snapshotRestoreVolumeDefinition,
+
+	"physical-storage create-device-pool": physicalStorageCreateDevicePool,
+
+	"physical-storage list": listing("physical devices",
+		func(ctx context.Context, st store.Store) ([]apiv1.PhysicalDevice, error) {
+			return st.PhysicalDevices().List(ctx)
+		},
+		func(device *apiv1.PhysicalDevice, flags *flagSet) bool { return matches(flags.Nodes, device.NodeName) },
+		func(devices []apiv1.PhysicalDevice, _ *runContext) *metav1.Table {
+			return view.PhysicalDeviceList(devices)
+		},
+	),
+
 	"error-reports list": errorReportsList,
 
 	"controller version": controllerVersion,

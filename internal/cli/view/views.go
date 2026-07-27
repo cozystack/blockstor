@@ -409,3 +409,94 @@ func sortedKeys(in map[string][]string) []string {
 
 	return out
 }
+
+// SizeInfoColumns is the `resource-group query-size-info` header.
+func SizeInfoColumns() []metav1.TableColumnDefinition {
+	return columns("ResourceGroup", "MaxVolumeSize", "Node", "StoragePool", "FreeCapacity")
+}
+
+// SizeInfoRows renders the answer plus the pools it was derived from,
+// so an operator can see WHICH pool set the bound rather than just
+// being told a number.
+func SizeInfoRows(group string, maxKib int64, pools []apiv1.StoragePool) []metav1.TableRow {
+	// A blank capacity cell means "not reported"; here zero means the
+	// group cannot be placed at all, which an operator must not read
+	// as missing data.
+	maxCell := "0"
+	if maxKib > 0 {
+		maxCell = capacity(maxKib)
+	}
+
+	if len(pools) == 0 {
+		return []metav1.TableRow{{Cells: []any{group, maxCell, "", "", ""}}}
+	}
+
+	rows := make([]metav1.TableRow, 0, len(pools))
+
+	for i := range pools {
+		pool := &pools[i]
+
+		rows = append(rows, metav1.TableRow{Cells: []any{
+			group,
+			maxCell,
+			pool.NodeName,
+			pool.StoragePoolName,
+			capacity(pool.FreeCapacity),
+		}})
+	}
+
+	return rows
+}
+
+// PhysicalDeviceColumns is the `physical-storage list` header.
+func PhysicalDeviceColumns() []metav1.TableColumnDefinition {
+	return columns("Node", "Device", "Size", "Rotational", "AttachedTo")
+}
+
+// PhysicalDeviceList renders the devices the satellites discovered.
+func PhysicalDeviceList(devices []apiv1.PhysicalDevice) *metav1.Table {
+	tbl := &metav1.Table{ColumnDefinitions: PhysicalDeviceColumns()}
+
+	for i := range devices {
+		device := &devices[i]
+
+		attached := ""
+		if device.AttachTo != nil {
+			attached = device.AttachTo.StoragePoolName
+		}
+
+		tbl.Rows = append(tbl.Rows, metav1.TableRow{Cells: []any{
+			device.NodeName,
+			devicePath(device),
+			capacity(device.SizeBytes / bytesPerKib),
+			boolCellPtr(device.Rotational),
+			attached,
+		}})
+	}
+
+	return tbl
+}
+
+// boolCellPtr renders a tri-state: a device the satellite has not
+// reported on yet shows blank rather than a confident "False".
+func boolCellPtr(value *bool) string {
+	if value == nil {
+		return ""
+	}
+
+	return boolCell(*value)
+}
+
+// bytesPerKib converts the byte-denominated device size to the KiB
+// every other capacity in this CLI is expressed in.
+const bytesPerKib = 1024
+
+// devicePath prefers the stable /dev/disk/by-id symlink; the volatile
+// /dev/sdN name is a fallback because it re-letters across reboots.
+func devicePath(device *apiv1.PhysicalDevice) string {
+	if device.DevicePath != "" {
+		return device.DevicePath
+	}
+
+	return device.CurrentDevPath
+}

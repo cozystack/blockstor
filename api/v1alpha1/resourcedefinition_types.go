@@ -209,11 +209,11 @@ type ResourceDefinitionStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
-
 // +kubebuilder:printcolumn:name="Group",type=string,JSONPath=`.spec.resourceGroupName`
 // +kubebuilder:printcolumn:name="Port",type=integer,JSONPath=`.spec.drbdPort`
 // +kubebuilder:printcolumn:name="Layers",type=string,JSONPath=`.spec.layerStack`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
 // ResourceDefinition is the Schema for the resourcedefinitions API
 type ResourceDefinition struct {
 	metav1.TypeMeta `json:",inline"`

@@ -274,11 +274,11 @@ type SnapshotPerNodeStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.resourceDefinitionName + '.' + self.spec.snapshotName).lowerAscii()",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.snapshotName> (case-insensitive)",optionalOldSelf=true
-
 // +kubebuilder:printcolumn:name="Definition",type=string,JSONPath=`.spec.resourceDefinitionName`
 // +kubebuilder:printcolumn:name="Snapshot",type=string,JSONPath=`.spec.snapshotName`
 // +kubebuilder:printcolumn:name="Nodes",type=string,JSONPath=`.spec.nodes`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
 // Snapshot is the Schema for the snapshots API.
 //
 // The CEL rule above enforces the cluster-wide naming convention every
