@@ -118,6 +118,14 @@ var handlers = map[string]handler{
 	"resource-group modify": resourceGroupModify,
 	"resource-group delete": resourceGroupDelete,
 
+	"storage-pool create": storagePoolCreate,
+	"storage-pool delete": storagePoolDelete,
+
+	"volume-group create": volumeGroupCreate,
+	"volume-group list":   volumeGroupList,
+
+	"error-reports list": errorReportsList,
+
 	"controller version": controllerVersion,
 }
 

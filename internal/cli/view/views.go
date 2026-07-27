@@ -344,3 +344,25 @@ func boolCell(v bool) string {
 
 	return "False"
 }
+
+// VolumeGroupColumns is the `volume-group list` header.
+func VolumeGroupColumns() []metav1.TableColumnDefinition {
+	return columns("ResourceGroup", "VolumeNr", "Flags")
+}
+
+// VolumeGroupRows renders one resource group's per-volume templates.
+func VolumeGroupRows(group *apiv1.ResourceGroup) []metav1.TableRow {
+	rows := make([]metav1.TableRow, 0, len(group.VolumeGroups))
+
+	for i := range group.VolumeGroups {
+		volume := &group.VolumeGroups[i]
+
+		rows = append(rows, metav1.TableRow{Cells: []any{
+			group.Name,
+			strconv.Itoa(int(volume.VolumeNumber)),
+			strings.Join(volume.Flags, ","),
+		}})
+	}
+
+	return rows
+}
