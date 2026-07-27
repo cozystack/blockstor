@@ -28,6 +28,7 @@ import (
 
 	"github.com/cozystack/blockstor/pkg/store"
 
+	"github.com/cozystack/blockstor/internal/cli/command"
 	"github.com/cozystack/blockstor/internal/cli/output"
 	"github.com/cozystack/blockstor/internal/cli/table"
 	"github.com/cozystack/blockstor/internal/cli/view"
@@ -168,6 +169,10 @@ func init() {
 		handlers[noun+" set-property"] = setProperty(accessor)
 		handlers[noun+" list-properties"] = listProperties(accessor)
 		handlers[noun+" delete-property"] = deleteProperty(accessor)
+
+		if command.Has(noun, "drbd-options") {
+			handlers[noun+" drbd-options"] = drbdOptions(accessor)
+		}
 	}
 }
 

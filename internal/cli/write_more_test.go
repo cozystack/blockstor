@@ -31,6 +31,11 @@ func seedDefinition(ctx context.Context, backend store.Store) {
 	_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
 }
 
+func seedVolumeDefinition(ctx context.Context, backend store.Store) {
+	seedDefinition(ctx, backend)
+	_ = backend.VolumeDefinitions().Create(ctx, "pvc-x", &apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024})
+}
+
 // Volume sizes are written the way operators write them — `10G`,
 // `100M`, `2T` — and the scripts in this repo use exactly those
 // spellings. Storing the wrong magnitude here would silently

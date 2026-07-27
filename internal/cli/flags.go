@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cozystack/blockstor/pkg/drbd"
+
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
 
@@ -131,8 +133,15 @@ func parseFlags(args []string) (*flagSet, error) {
 			continue
 		}
 
-		if _, takesValue := valueFlags[name]; !takesValue {
-			return nil, fmt.Errorf("%w: unknown flag %q", command.ErrUsage, arg)
+		takesValue, err := flagTakesValue(name)
+		if err != nil {
+			return nil, err
+		}
+
+		if !takesValue {
+			parsed.Values[strings.TrimLeft(name, "-")] = ""
+
+			continue
 		}
 
 		if !inline {
@@ -148,6 +157,36 @@ func parseFlags(args []string) (*flagSet, error) {
 	}
 
 	return parsed, nil
+}
+
+// flagTakesValue reports whether a flag consumes the next argument,
+// rejecting a name that is neither in the static table nor a DRBD
+// knob.
+//
+// `drbd-options` takes its knobs as flags — `--max-buffers 36864`,
+// `--unset-c-max-rate` — and there are more of those than it would be
+// useful to list by hand, so they are resolved from the DRBD
+// catalogue. An `--unset-` form carries no value.
+func flagTakesValue(name string) (bool, error) {
+	if _, known := valueFlags[name]; known {
+		return true, nil
+	}
+
+	knob := strings.TrimLeft(name, "-")
+
+	if unset, isUnset := strings.CutPrefix(knob, unsetPrefix); isUnset {
+		if _, known := drbd.FlagKey(unset); known {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("%w: unknown DRBD option %q", command.ErrUsage, name)
+	}
+
+	if _, known := drbd.FlagKey(knob); known {
+		return true, nil
+	}
+
+	return false, fmt.Errorf("%w: unknown flag %q", command.ErrUsage, name)
 }
 
 // setBool records a flag that carries no value, reporting whether the
