@@ -39,6 +39,9 @@ type flagSet struct {
 	// Diskless marks a replica as storage-free (--diskless and its
 	// DRBD-specific spelling).
 	Diskless bool
+	// Cancel asks for an in-flight conversion to be unwound
+	// (--cancel).
+	Cancel bool
 	// Pastable requests the pipe-free rendering (-p/--pastable).
 	Pastable bool
 	// Color is the --color mode; empty means auto.
@@ -85,6 +88,7 @@ var valueFlags = map[string]struct{}{ //nolint:gochecknoglobals // static flag t
 	"--limit":          {},
 	"--passphrase":     {},
 	"-p-value":         {},
+	"--migrate-from":   {},
 	"--from-resource":  {},
 	"--from-snapshot":  {},
 	"--to-resource":    {},
@@ -121,26 +125,7 @@ func parseFlags(args []string) (*flagSet, error) {
 
 		name, value, inline := strings.Cut(arg, "=")
 
-		switch name {
-		case "-m", "--machine-readable":
-			parsed.Machine = true
-
-			continue
-		case "--faulty":
-			parsed.Faulty = true
-
-			continue
-		case "--diskless", "--drbd-diskless":
-			parsed.Diskless = true
-
-			continue
-		case "-p", "--pastable":
-			parsed.Pastable = true
-
-			continue
-		case "--no-color":
-			parsed.Color = "never"
-
+		if parsed.setBool(name) {
 			continue
 		}
 
@@ -161,6 +146,29 @@ func parseFlags(args []string) (*flagSet, error) {
 	}
 
 	return parsed, nil
+}
+
+// setBool records a flag that carries no value, reporting whether the
+// name was one.
+func (f *flagSet) setBool(name string) bool {
+	switch name {
+	case "-m", "--machine-readable":
+		f.Machine = true
+	case "--faulty":
+		f.Faulty = true
+	case "--diskless", "--drbd-diskless":
+		f.Diskless = true
+	case "--cancel":
+		f.Cancel = true
+	case "-p", "--pastable":
+		f.Pastable = true
+	case "--no-color":
+		f.Color = "never"
+	default:
+		return false
+	}
+
+	return true
 }
 
 // assign records a flag value, folding the aliases onto one field so

@@ -118,6 +118,17 @@ var handlers = map[string]handler{
 	"resource-group modify": resourceGroupModify,
 	"resource-group delete": resourceGroupDelete,
 
+	"resource toggle-disk": resourceToggleDisk,
+	"resource activate":    resourceActivate,
+	"resource deactivate":  resourceDeactivate,
+
+	"resource list-volumes": listing("resources",
+		fetchResources,
+		keepResource,
+		func(resources []apiv1.Resource, _ *runContext) *metav1.Table { return view.VolumeList(resources) },
+		"State",
+	),
+
 	"storage-pool create": storagePoolCreate,
 	"storage-pool delete": storagePoolDelete,
 
