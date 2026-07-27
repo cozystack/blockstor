@@ -49,13 +49,13 @@ Modifications go through server-side apply with the CLI's own field manager. Tha
 
 ## What Kubernetes does not hold
 
-Two commands cannot be served from the CRDs, because the state they act on does not live there. Both are implemented as explicit refusals that name where the state actually is, rather than as a success the CLI cannot deliver.
+One command cannot be served from the CRDs, because the state it acts on does not live there.
 
-`error-reports list` reads a ring buffer in the controller process's memory (`pkg/rest/error_reports.go`). Rendering an empty table would read as "no errors", which is the opposite of the truth during an incident.
+`encryption enter-passphrase` flips an in-memory unlocked flag in the controller process. The CLI verifies that the supplied passphrase matches the cluster Secret — the part it can check — and then reports that the unlock itself has to go to the controller's `/v1/encryption/passphrase` endpoint. `create-passphrase`, by contrast, writes the Secret and works normally; it refuses to replace an existing passphrase with a different one, because rotating the master key leaves every existing LUKS volume undecryptable.
 
-`encryption enter-passphrase` flips an in-memory unlocked flag in the controller process. The CLI verifies that the supplied passphrase matches the cluster Secret — the part it can check — and then reports that the unlock has to go to the controller's `/v1/encryption/passphrase` endpoint. `create-passphrase`, by contrast, writes the Secret and works normally; it refuses to replace an existing passphrase with a different one, because rotating the master key leaves every existing LUKS volume undecryptable.
+Note what that flag actually gates, because it is narrower than its name suggests: its only reader is `stampSuspendedOnLUKS` (`pkg/rest/resources.go`), which sets `state.suspended` on LUKS resources for the REST view. Provisioning is not gated on it — the LUKS RD-create check reads the Secret (`refuseLUKSWithoutPassphrase`), and satellites decrypt from the Secret too. So an unlocked flag is a display state of one REST process, and this CLI does not read it: it derives State from CRD status.
 
-If the e2e matrix is to run unchanged against this CLI, these two need either a small REST fallback for exactly these verbs, or a change in the cells that use them. That is a decision to take deliberately, not one to paper over with a fake success.
+`error-reports` is deliberately absent from the command surface. The reports are a ring buffer in the controller process's memory; a CLI that speaks to the API server has nothing to list, and there is no reason to grow a subsystem for it.
 
 One command is approximate rather than exact. `resource-group query-size-info` / `query-max-volume-size` report the physical bound derived from the free capacity of the pools a replica set would occupy. The controller additionally applies the thin-pool oversubscription policy, which lives inside `pkg/rest` and is not reusable; the CLI's figure is therefore always at least as conservative as the controller's, never more optimistic.
 

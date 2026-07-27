@@ -48,7 +48,6 @@ func TestResolveAliases(t *testing.T) {
 		{[]string{"s", "l"}, "snapshot", "list"},
 		{[]string{"rg", "l"}, "resource-group", "list"},
 		{[]string{"ps", "l"}, "physical-storage", "list"},
-		{[]string{"err", "l"}, "error-reports", "list"},
 
 		// Long form resolves to itself.
 		{[]string{"node", "list"}, "node", "list"},
@@ -287,10 +286,9 @@ func TestRegistryCoversExercisedSurface(t *testing.T) {
 			"list", "create", "modify", "delete", "spawn-resources",
 			"adjust", "query-size-info", "query-max-volume-size", "set-property", "list-properties",
 		},
-		"volume-group":  {"create", "list"},
-		"controller":    {"version", "list-properties", "set-property", "drbd-options"},
-		"encryption":    {"create-passphrase", "enter-passphrase"},
-		"error-reports": {"list"},
+		"volume-group": {"create", "list"},
+		"controller":   {"version", "list-properties", "set-property", "drbd-options"},
+		"encryption":   {"create-passphrase", "enter-passphrase"},
 	}
 
 	for noun, verbs := range required {

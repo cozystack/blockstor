@@ -245,12 +245,6 @@ var registry = []Noun{
 			{Name: "enter-passphrase"},
 		},
 	},
-	{
-		Name: "error-reports", Aliases: []string{"err"},
-		Verbs: []Verb{
-			{Name: verbList, Aliases: []string{aliasList}},
-		},
-	},
 }
 
 // maxVerbTokens is the longest verb path in the registry (`resource

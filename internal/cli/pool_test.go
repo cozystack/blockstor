@@ -168,25 +168,3 @@ func TestVolumeGroupCreateAndList(t *testing.T) {
 		t.Errorf("second create reused volume number %d", group.VolumeGroups[0].VolumeNumber)
 	}
 }
-
-// Error reports live in the controller process's memory, not in any
-// Kubernetes object, so a CLI that speaks to the API server cannot
-// read them. It says so and fails rather than printing an empty table
-// that would read as "no errors".
-func TestErrorReportsListIsRefusedNotEmpty(t *testing.T) {
-	t.Parallel()
-
-	app, out, errBuf := newApp(t, nil)
-
-	if got := app.Run(t.Context(), []string{"err", "l"}); got == 0 {
-		t.Fatalf("error-reports list exit = 0; an empty listing would read as 'no errors'")
-	}
-
-	if out.Len() != 0 {
-		t.Errorf("a refused listing still wrote to stdout:\n%s", out.String())
-	}
-
-	if !strings.Contains(errBuf.String(), "/v1/error-reports") {
-		t.Errorf("the refusal does not point at where the reports actually are:\n%s", errBuf.String())
-	}
-}

@@ -173,8 +173,6 @@ var handlers = map[string]handler{
 		},
 	),
 
-	"error-reports list": errorReportsList,
-
 	"controller version": controllerVersion,
 }
 

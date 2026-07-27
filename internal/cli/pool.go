@@ -20,7 +20,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -252,21 +251,4 @@ func volumeGroupList(ctx context.Context, run *runContext) error {
 	}
 
 	return run.render(tbl)
-}
-
-// errNoErrorReports explains why this one listing cannot be served
-// from Kubernetes.
-//
-// Error reports are held in the controller process's own memory ring
-// (`pkg/rest/error_reports.go`), not in any API object. Rendering an
-// empty table would read as "no errors", which is the opposite of the
-// truth during an incident — so the command says where the reports
-// actually are and fails.
-var errNoErrorReports = errors.New(
-	"error reports are held in the controller's memory, not in Kubernetes objects; " +
-		"read them from the controller's /v1/error-reports endpoint")
-
-// errorReportsList implements `error-reports list`.
-func errorReportsList(_ context.Context, _ *runContext) error {
-	return errNoErrorReports
 }
