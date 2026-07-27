@@ -246,3 +246,45 @@ func TestEveryRegisteredCommandIsReachable(t *testing.T) {
 		t.Errorf("the grammar advertises %q but nothing implements it", missing)
 	}
 }
+
+// The command tree is generated from the registry, so it cannot
+// advertise something that does not dispatch. Asking for it
+// explicitly is a success and prints to stdout, so `blockstor help |
+// grep` works; naming no command at all is still a malformed
+// invocation, so the tree goes to stderr and the exit code stays the
+// client-side rejection scripts branch on.
+func TestHelp(t *testing.T) {
+	t.Parallel()
+
+	for _, argv := range [][]string{{"help"}, {"--help"}, {"-h"}} {
+		app, out, errBuf := newApp(t, nil)
+
+		if got := app.Run(t.Context(), argv); got != 0 {
+			t.Fatalf("%v: exit = %d, want 0", argv, got)
+		}
+
+		for _, want := range []string{"resource-definition", "toggle-disk", "spawn-resources", "(rd)"} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("%v: help is missing %q:\n%s", argv, want, out.String())
+			}
+		}
+
+		if errBuf.Len() != 0 {
+			t.Errorf("%v: an explicit help wrote to stderr: %s", argv, errBuf.String())
+		}
+	}
+
+	app, out, errBuf := newApp(t, nil)
+
+	if got := app.Run(t.Context(), nil); got != 2 {
+		t.Errorf("no arguments exit = %d, want 2", got)
+	}
+
+	if !strings.Contains(errBuf.String(), "usage:") {
+		t.Errorf("a bare invocation printed no usage:\n%s", errBuf.String())
+	}
+
+	if out.Len() != 0 {
+		t.Errorf("a bare invocation wrote to stdout: %s", out.String())
+	}
+}

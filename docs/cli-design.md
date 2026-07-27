@@ -47,6 +47,18 @@ Modifications go through server-side apply with the CLI's own field manager. Tha
 
 `resource-group spawn` is the one verb with real orchestration behind it (autoplace). The placement engine is already a reusable library (`pkg/placer`, constructed from `store.Store`) and placement is additionally driven by the resource-group controllers, so the CLI calls the placer rather than reimplementing placement.
 
+## What Kubernetes does not hold
+
+Two commands cannot be served from the CRDs, because the state they act on does not live there. Both are implemented as explicit refusals that name where the state actually is, rather than as a success the CLI cannot deliver.
+
+`error-reports list` reads a ring buffer in the controller process's memory (`pkg/rest/error_reports.go`). Rendering an empty table would read as "no errors", which is the opposite of the truth during an incident.
+
+`encryption enter-passphrase` flips an in-memory unlocked flag in the controller process. The CLI verifies that the supplied passphrase matches the cluster Secret — the part it can check — and then reports that the unlock has to go to the controller's `/v1/encryption/passphrase` endpoint. `create-passphrase`, by contrast, writes the Secret and works normally; it refuses to replace an existing passphrase with a different one, because rotating the master key leaves every existing LUKS volume undecryptable.
+
+If the e2e matrix is to run unchanged against this CLI, these two need either a small REST fallback for exactly these verbs, or a change in the cells that use them. That is a decision to take deliberately, not one to paper over with a fake success.
+
+One command is approximate rather than exact. `resource-group query-size-info` / `query-max-volume-size` report the physical bound derived from the free capacity of the pools a replica set would occupy. The controller additionally applies the thin-pool oversubscription policy, which lives inside `pkg/rest` and is not reusable; the CLI's figure is therefore always at least as conservative as the controller's, never more optimistic.
+
 ## Test plan
 
 Tests come first, and each layer answers a different question.

@@ -88,6 +88,30 @@ type runContext struct {
 
 // Run executes argv and returns the process exit code.
 func (a *App) Run(ctx context.Context, argv []string) int {
+	// An operator who types `blockstor` alone wants to know what it
+	// can do, not a bare error — but an invocation that names no
+	// command is still a malformed one, so the tree goes to stderr and
+	// the exit code stays the client-side rejection the replay
+	// workflows assert. Asking for help EXPLICITLY is a success, and
+	// prints to stdout so it can be piped.
+	if len(argv) == 0 {
+		err := writeHelp(a.Err)
+		if err != nil {
+			return a.fail(err)
+		}
+
+		return exitUsage
+	}
+
+	if isHelpRequest(argv) {
+		err := writeHelp(a.Out)
+		if err != nil {
+			return a.fail(err)
+		}
+
+		return exitOK
+	}
+
 	cmd, rest, err := command.Resolve(argv)
 	if err != nil {
 		return a.fail(err)
