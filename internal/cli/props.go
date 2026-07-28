@@ -40,7 +40,16 @@ func deleteProperty(accessor propertyAccessor) handler {
 			return fmt.Errorf("%w: delete-property needs %d argument(s) plus a key", command.ErrUsage, accessor.args)
 		}
 
-		return setProperty(accessor)(ctx, run)
+		// The key is the LAST argument this verb accepts. Passing the
+		// positionals through unchanged would let a stray extra one be
+		// read as a value by the shared setter, turning a delete into a
+		// silent set of the very key the operator wanted gone.
+		trimmed := *run
+		flags := *run.Flags
+		flags.Positionals = run.Flags.Positionals[:accessor.args+1]
+		trimmed.Flags = &flags
+
+		return setProperty(accessor)(ctx, &trimmed)
 	}
 }
 

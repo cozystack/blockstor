@@ -261,6 +261,11 @@ func resourceGroupSpawn(ctx context.Context, run *runContext) error {
 			return sizeErr
 		}
 
+		sizeErr = checkVolumeSize(sizeKib)
+		if sizeErr != nil {
+			return sizeErr
+		}
+
 		_, sizeErr = run.Store.VolumeDefinitions().CreateAutoNumbered(ctx, rdName,
 			&apiv1.VolumeDefinition{SizeKib: sizeKib})
 		if sizeErr != nil {

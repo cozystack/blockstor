@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -218,19 +219,37 @@ func candidatePools(ctx context.Context, run *runContext, group *apiv1.ResourceG
 		return nil, fmt.Errorf("list storage pools: %w", err)
 	}
 
-	wanted := group.SelectFilter.StoragePool
+	wanted := group.SelectFilter.StoragePoolList
+	if group.SelectFilter.StoragePool != "" {
+		wanted = append([]string{group.SelectFilter.StoragePool}, wanted...)
+	}
+
 	pools := make([]apiv1.StoragePool, 0, len(all))
+	// One replica per NODE, not per pool: a node offering three
+	// eligible pools cannot host three replicas of the same volume, so
+	// counting them separately would promise redundancy that cannot be
+	// placed.
+	seen := make(map[string]bool, len(all))
 
 	for i := range all {
-		if all[i].ProviderKind == apiv1.StoragePoolKindDiskless {
+		pool := &all[i]
+
+		switch {
+		case pool.ProviderKind == apiv1.StoragePoolKindDiskless:
+			continue
+		// A pool whose backing storage has disappeared is not a
+		// candidate; the placer drops it too.
+		case pool.PoolMissing:
+			continue
+		case !matchesAny(wanted, pool.StoragePoolName):
+			continue
+		case seen[pool.NodeName]:
 			continue
 		}
 
-		if wanted != "" && all[i].StoragePoolName != wanted {
-			continue
-		}
+		seen[pool.NodeName] = true
 
-		pools = append(pools, all[i])
+		pools = append(pools, *pool)
 	}
 
 	sort.SliceStable(pools, func(a, b int) bool {
@@ -238,6 +257,16 @@ func candidatePools(ctx context.Context, run *runContext, group *apiv1.ResourceG
 	})
 
 	return pools, nil
+}
+
+// matchesAny reports whether a pool name passes the group's pool
+// filter; an empty filter accepts every pool.
+func matchesAny(filter []string, name string) bool {
+	if len(filter) == 0 {
+		return true
+	}
+
+	return slices.Contains(filter, name)
 }
 
 // maxVolumeSizeKib is the smallest free capacity among the pools a

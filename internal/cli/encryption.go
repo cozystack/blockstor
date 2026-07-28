@@ -124,9 +124,11 @@ func encryptionCreatePassphrase(ctx context.Context, run *runContext) error {
 // server-side display flag was not touched, rather than refusing a
 // command whose real effect it can deliver in full.
 //
-// The comparison is constant-time. A byte-by-byte compare leaks where
-// two passphrases first differ, and an attacker who can time enough
-// attempts recovers the master key one character at a time.
+// The comparison is constant-time out of habit rather than necessity:
+// this runs client-side, after the caller's own RBAC already let them
+// read the Secret, so there is no remote attacker to time. (It also
+// still leaks the length, which ConstantTimeCompare does not hide.)
+// The controller's REST path is where the property actually matters.
 func encryptionEnterPassphrase(ctx context.Context, run *runContext) error {
 	value, err := encryptionPassphrase(run)
 	if err != nil {

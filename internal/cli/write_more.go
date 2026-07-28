@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -57,6 +58,20 @@ func parseInt32(text, what string) (int32, error) {
 // explicitly rather than with a permissive library.
 func ParseSize(text string) (int64, error) {
 	trimmed := strings.TrimSpace(text)
+
+	// A trailing `iB`, `i` or `B` is tolerated (`10GiB`, `10Gi`,
+	// `10GB`), because operators paste sizes from documentation as
+	// often as they type them. Trimming happens BEFORE the unit is
+	// read: the unit is the last byte, so `10GiB` would otherwise be
+	// rejected for ending in `B`.
+	for _, suffix := range []string{"iB", "IB", "i", "B", "b"} {
+		if len(trimmed) > 1 && strings.HasSuffix(trimmed, suffix) {
+			trimmed = trimmed[:len(trimmed)-len(suffix)]
+
+			break
+		}
+	}
+
 	if trimmed == "" {
 		return 0, fmt.Errorf("%w: empty size", command.ErrUsage)
 	}
@@ -79,13 +94,17 @@ func ParseSize(text string) (int64, error) {
 		}
 	}
 
-	// A trailing `iB`/`B` is tolerated (`10GiB`), because operators
-	// paste sizes from documentation as often as they type them.
-	digits = strings.TrimSuffix(strings.TrimSuffix(digits, "iB"), "i")
-
 	value, err := strconv.ParseInt(strings.TrimSpace(digits), 10, 64)
 	if err != nil || value <= 0 {
 		return 0, fmt.Errorf("%w: unrecognised size %q", command.ErrUsage, text)
+	}
+
+	// The multiplication is checked, not assumed. `17179869184T`
+	// overflows int64 to exactly zero, and a zero size is the one
+	// value the satellite cannot fail on: it loops on `drbdadm
+	// create-md` forever instead.
+	if value > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("%w: size %q does not fit", command.ErrUsage, text)
 	}
 
 	return value * multiplier, nil
@@ -161,6 +180,11 @@ func volumeDefinitionCreate(ctx context.Context, run *runContext) error {
 	rdName := run.Flags.Positionals[0]
 
 	sizeKib, err := ParseSize(run.Flags.Positionals[1])
+	if err != nil {
+		return err
+	}
+
+	err = checkVolumeSize(sizeKib)
 	if err != nil {
 		return err
 	}
@@ -280,6 +304,19 @@ var (
 			"then re-run with --force")
 )
 
+// checkVolumeSize enforces the bounds on EVERY path that writes a
+// volume size, not just resize. A size below DRBD's per-device
+// minimum makes the satellite loop on `drbdadm create-md` forever
+// rather than fail, and nothing downstream catches it: the CRD has no
+// `minimum`, no CEL rule and no admission webhook.
+func checkVolumeSize(sizeKib int64) error {
+	if sizeKib < volumeSizeFloorKib || sizeKib > volumeSizeCeilingKib {
+		return fmt.Errorf("%d KiB: %w", sizeKib, errSizeOutOfBounds)
+	}
+
+	return nil
+}
+
 // checkResize refuses a resize that would destroy data or wedge the
 // satellite.
 //
@@ -288,8 +325,9 @@ var (
 // filesystem truncates it. --force is the operator's statement that
 // they have already shrunk the filesystem themselves.
 func checkResize(vd *apiv1.VolumeDefinition, sizeKib int64, force bool) error {
-	if sizeKib < volumeSizeFloorKib || sizeKib > volumeSizeCeilingKib {
-		return fmt.Errorf("%d KiB: %w", sizeKib, errSizeOutOfBounds)
+	err := checkVolumeSize(sizeKib)
+	if err != nil {
+		return err
 	}
 
 	if sizeKib >= vd.SizeKib || force {

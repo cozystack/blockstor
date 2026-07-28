@@ -86,7 +86,7 @@ func ResourceList(in ResourceListInput) *metav1.Table {
 	for i := range in.Resources {
 		res := &in.Resources[i]
 
-		if in.FaultyOnly && !isFaulty(res) {
+		if in.FaultyOnly && !IsFaulty(res) {
 			continue
 		}
 
@@ -258,11 +258,20 @@ func syncPercent(vol *apiv1.Volume, sizes map[int32]int64) (int, bool) {
 	return int(done), true
 }
 
-// isFaulty backs `--faulty`: a replica counts as faulty when it has an
-// observed disk state that has not converged. A replica the satellite
-// has not reported on is NOT faulty — absence of data is not evidence
-// of breakage, and reporting it as such would drown a real fault.
-func isFaulty(res *apiv1.Resource) bool {
+// IsFaulty backs `--faulty`: a replica counts as faulty when a volume
+// has an observed disk state that has not converged, or when a peer
+// link is down. A replica the satellite has not reported on is NOT
+// faulty — absence of data is not evidence of breakage, and reporting
+// it as such would drown a real fault.
+func IsFaulty(res *apiv1.Resource) bool {
+	// A replica whose local disk is UpToDate but whose peer link is
+	// StandAlone or failed is exactly the split-brain the
+	// troubleshooting runbooks tell an operator to find with
+	// `--faulty`. Looking only at DiskState hides it.
+	if hasBrokenConnection(res) {
+		return true
+	}
+
 	for i := range res.Volumes {
 		state := strings.ToLower(res.Volumes[i].State.DiskState)
 		if state == "" {
@@ -270,6 +279,22 @@ func isFaulty(res *apiv1.Resource) bool {
 		}
 
 		if _, terminal := terminalStates[state]; !terminal {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasBrokenConnection reports whether any DRBD peer link is in a state
+// other than Connected.
+func hasBrokenConnection(res *apiv1.Resource) bool {
+	if res.LayerObject == nil || res.LayerObject.Drbd == nil {
+		return false
+	}
+
+	for _, conn := range res.LayerObject.Drbd.Connections {
+		if !conn.Connected {
 			return true
 		}
 	}

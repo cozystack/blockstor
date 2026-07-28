@@ -132,6 +132,8 @@ func (a *App) Run(ctx context.Context, argv []string) int {
 		return a.fail(err)
 	}
 
+	a.noteIgnoredFlags(flags)
+
 	mode, err := color.ParseMode(flags.Color)
 	if err != nil {
 		return a.fail(fmt.Errorf("%w: %w", command.ErrUsage, err))
@@ -170,6 +172,17 @@ func (a *App) UnimplementedCommands() []string {
 	sort.Strings(missing)
 
 	return missing
+}
+
+// noteIgnoredFlags warns about a flag this client accepts for
+// compatibility but cannot act on. Staying silent would let
+// `--controllers <other-cluster>` read the kubeconfig's cluster
+// without a word.
+func (a *App) noteIgnoredFlags(flags *flagSet) {
+	if flags.IgnoredControllers {
+		fmt.Fprintln(a.Err,
+			"note: --controllers is ignored; this client reads the cluster named by your kubeconfig")
+	}
 }
 
 // fail reports err and maps it to an exit code: a client-side

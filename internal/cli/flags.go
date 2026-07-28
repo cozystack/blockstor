@@ -20,6 +20,7 @@ package cli
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -46,6 +47,11 @@ type flagSet struct {
 	Cancel bool
 	// Force overrides a safety refusal (--force).
 	Force bool
+	// IgnoredControllers records that --controllers was given; the
+	// target comes from the kubeconfig instead.
+	IgnoredControllers bool
+	// noColor backs --no-color, which folds into Color.
+	noColor bool
 	// Pastable requests the pipe-free rendering (-p/--pastable).
 	Pastable bool
 	// Color is the --color mode; empty means auto.
@@ -69,6 +75,16 @@ const (
 	flagRscLong    = "--resources"
 	flagRscDefs    = "--resource-definitions"
 	flagRscShort   = "-r"
+	flagOutputFmt  = "--output-fmt"
+	flagOutputAbbr = "-o"
+	flagDiskless   = "--diskless"
+	flagDrbdDless  = "--drbd-diskless"
+	flagCancel     = "--cancel"
+	flagForce      = "--force"
+	flagFaulty     = "--faulty"
+	flagNoColor    = "--no-color"
+	flagMachine    = "--machine-readable"
+	flagPastable   = "--pastable"
 )
 
 // valueFlags are the flags that consume the following argument when
@@ -129,7 +145,12 @@ func parseFlags(args []string) (*flagSet, error) {
 
 		name, value, inline := strings.Cut(arg, "=")
 
-		if parsed.setBool(name) {
+		handled, err := parsed.setBool(name, value, inline)
+		if err != nil {
+			return nil, err
+		}
+
+		if handled {
 			continue
 		}
 
@@ -156,7 +177,44 @@ func parseFlags(args []string) (*flagSet, error) {
 		parsed.assign(name, value)
 	}
 
+	err := parsed.resolveOutput()
+	if err != nil {
+		return nil, err
+	}
+
 	return parsed, nil
+}
+
+// resolveOutput folds the output-selection flags into the fields the
+// handlers read, and REJECTS a value it cannot honour.
+//
+// A flag that is parsed and then ignored is worse than one that is
+// refused: `resource list -o json | jq` would otherwise receive a
+// human table with exit 0, and the script would fail somewhere else
+// entirely.
+func (f *flagSet) resolveOutput() error {
+	// `--controllers` names REST endpoints, which this client does not
+	// use. Accepting it keeps existing wrappers working; ignoring it
+	// SILENTLY would not — pointing it at one cluster while the
+	// kubeconfig names another would read the wrong cluster without a
+	// word. The caller surfaces the notice.
+	if f.Values["controllers"] != "" {
+		f.IgnoredControllers = true
+	}
+
+	switch format := f.Values["output-fmt"]; format {
+	case "", "table":
+	case "json":
+		f.Machine = true
+	default:
+		return fmt.Errorf("%w: unsupported output format %q (table, json)", command.ErrUsage, format)
+	}
+
+	if version := f.Values["output-version"]; version != "" && version != "v1" {
+		return fmt.Errorf("%w: unsupported output version %q (v1)", command.ErrUsage, version)
+	}
+
+	return nil
 }
 
 // flagTakesValue reports whether a flag consumes the next argument,
@@ -189,29 +247,63 @@ func flagTakesValue(name string) (bool, error) {
 	return false, fmt.Errorf("%w: unknown flag %q", command.ErrUsage, name)
 }
 
-// setBool records a flag that carries no value, reporting whether the
-// name was one.
-func (f *flagSet) setBool(name string) bool {
-	switch name {
-	case "-m", "--machine-readable":
-		f.Machine = true
-	case "--faulty":
-		f.Faulty = true
-	case "--diskless", "--drbd-diskless":
-		f.Diskless = true
-	case "--cancel":
-		f.Cancel = true
-	case "--force":
-		f.Force = true
-	case "-p", "--pastable":
-		f.Pastable = true
-	case "--no-color":
-		f.Color = "never"
-	default:
-		return false
+// setBool records a value-less flag, reporting whether the name was
+// one of them.
+//
+// An inline value is honoured when it is a boolean (`--force=false`
+// must DISABLE force, not enable it) and rejected otherwise: silently
+// dropping the value of `-p=secret` loses a passphrase, and silently
+// ignoring `--force=false` does the opposite of what was written.
+//
+// The names live in ONE switch. Listing them twice — once to
+// recognise, once to apply — is how a flag ends up recognised but
+// never acted on.
+func (f *flagSet) setBool(name, value string, inline bool) (bool, error) {
+	target := f.boolTarget(name)
+	if target == nil {
+		return false, nil
 	}
 
-	return true
+	enabled := true
+
+	if inline {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return false, fmt.Errorf("%w: flag %q takes no value, got %q", command.ErrUsage, name, value)
+		}
+
+		enabled = parsed
+	}
+
+	*target = enabled
+
+	if name == flagNoColor && enabled {
+		f.Color = "never"
+	}
+
+	return true, nil
+}
+
+// boolTarget maps a value-less flag to the field it sets.
+func (f *flagSet) boolTarget(name string) *bool {
+	switch name {
+	case "-m", flagMachine:
+		return &f.Machine
+	case flagFaulty:
+		return &f.Faulty
+	case flagDiskless, flagDrbdDless:
+		return &f.Diskless
+	case flagCancel:
+		return &f.Cancel
+	case flagForce:
+		return &f.Force
+	case "-p", flagPastable:
+		return &f.Pastable
+	case flagNoColor:
+		return &f.noColor
+	default:
+		return nil
+	}
 }
 
 // assign records a flag value, folding the aliases onto one field so
@@ -224,6 +316,8 @@ func (f *flagSet) assign(name, value string) {
 		f.Nodes = append(f.Nodes, splitList(value)...)
 	case flagRscShort, flagRscLong, flagRscDefs:
 		f.Resources = append(f.Resources, splitList(value)...)
+	case flagOutputAbbr, flagOutputFmt:
+		f.Values["output-fmt"] = value
 	default:
 		f.Values[strings.TrimLeft(name, "-")] = value
 	}

@@ -259,7 +259,10 @@ func selectFilterCell(filter *apiv1.AutoSelectFilter) string {
 		parts = append(parts, "LayerStack: "+strings.Join(filter.LayerStack, ","))
 	}
 
-	return strings.Join(parts, "\n")
+	// Joined with a separator, never a newline: table.go declares the
+	// pipe layout a parsing contract, and a cell containing "\n" splits
+	// the row mid-cell so `awk -F'|'` reads two malformed lines.
+	return strings.Join(parts, "; ")
 }
 
 // VolumeList builds the `volume list` table: one row per replica

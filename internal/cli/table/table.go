@@ -50,6 +50,11 @@ type Options struct {
 	// and should be classified and painted. Matching is exact and
 	// case-sensitive, mirroring the column names the views declare.
 	StateColumns []string
+
+	// Pastable drops the box rules and the pipe separators, leaving
+	// space-aligned columns an operator can paste into a ticket. The
+	// pipe layout is a parsing contract, so this is opt-in only.
+	Pastable bool
 }
 
 // Render writes the table.
@@ -81,15 +86,23 @@ func Render(w io.Writer, tbl *metav1.Table, opts Options) error {
 
 	var buf strings.Builder
 
-	buf.WriteString(rule(widths, '-'))
-	buf.WriteString(line(headers, headers, widths, nil, opts.Color))
-	buf.WriteString(rule(widths, '='))
-
-	for _, row := range rows {
-		buf.WriteString(line(row, headers, widths, painted, opts.Color))
+	if !opts.Pastable {
+		buf.WriteString(rule(widths, '-'))
 	}
 
-	buf.WriteString(rule(widths, '-'))
+	buf.WriteString(opts.line(headers, headers, widths, nil))
+
+	if !opts.Pastable {
+		buf.WriteString(rule(widths, '='))
+	}
+
+	for _, row := range rows {
+		buf.WriteString(opts.line(row, headers, widths, painted))
+	}
+
+	if !opts.Pastable {
+		buf.WriteString(rule(widths, '-'))
+	}
 
 	_, err := io.WriteString(w, buf.String())
 	if err != nil {
@@ -97,6 +110,22 @@ func Render(w io.Writer, tbl *metav1.Table, opts Options) error {
 	}
 
 	return nil
+}
+
+// line renders one row, bordered or bare.
+func (o Options) line(cells, headers []string, widths []int, painted map[string]struct{}) string {
+	rendered := line(cells, headers, widths, painted, o.Color)
+	if !o.Pastable {
+		return rendered
+	}
+
+	// Strip the leading "| " and the pipe separators, leaving the
+	// alignment the widths already produced.
+	bare := strings.TrimPrefix(rendered, "| ")
+	bare = strings.ReplaceAll(bare, " | ", "  ")
+	bare = strings.TrimSuffix(bare, " |\n")
+
+	return strings.TrimRight(bare, " ") + "\n"
 }
 
 // stateColumnSet indexes the columns to paint by name.

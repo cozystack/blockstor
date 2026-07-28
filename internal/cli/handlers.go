@@ -21,6 +21,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -52,7 +53,10 @@ var handlers = map[string]handler{
 		func(ctx context.Context, st store.Store) ([]apiv1.StoragePool, error) {
 			return st.StoragePools().List(ctx)
 		},
-		func(pool *apiv1.StoragePool, flags *flagSet) bool { return matches(flags.Nodes, pool.NodeName) },
+		func(pool *apiv1.StoragePool, flags *flagSet) bool {
+			return matches(flags.Nodes, pool.NodeName) &&
+				matches(splitList(flags.Values["storage-pools"]), pool.StoragePoolName)
+		},
 		func(pools []apiv1.StoragePool, _ *runContext) *metav1.Table { return view.StoragePoolList(pools) },
 		"State",
 	),
@@ -68,7 +72,7 @@ var handlers = map[string]handler{
 
 	"resource list": listing("resources",
 		fetchResources,
-		keepResource,
+		keepFaultyResource,
 		func(resources []apiv1.Resource, run *runContext) *metav1.Table {
 			return view.ResourceList(view.ResourceListInput{Resources: resources, FaultyOnly: run.Flags.Faulty})
 		},
@@ -231,6 +235,8 @@ func listing[T any](
 			}
 		}
 
+		kept = applyLimit(kept, run.Flags)
+
 		if run.Flags.Machine {
 			return machineOut(run, kept)
 		}
@@ -249,6 +255,18 @@ func fetchDefinitions(ctx context.Context, st store.Store) ([]apiv1.ResourceDefi
 
 func keepResource(res *apiv1.Resource, flags *flagSet) bool {
 	return matches(flags.Nodes, res.NodeName) && matches(flags.Resources, res.Name)
+}
+
+// keepFaultyResource applies --faulty as part of the FILTER, not as a
+// rendering decision. Filtering during render would leave `-m` — which
+// skips the renderer — returning every replica for a command whose
+// whole point is to narrow to the broken ones.
+func keepFaultyResource(res *apiv1.Resource, flags *flagSet) bool {
+	if !keepResource(res, flags) {
+		return false
+	}
+
+	return !flags.Faulty || view.IsFaulty(res)
 }
 
 // volumeDefinitionList implements `volume-definition list` (`vd l`).
@@ -300,11 +318,27 @@ func machineOut[T any](run *runContext, items []T) error {
 	return nil
 }
 
+// applyLimit caps a listing at --limit rows.
+func applyLimit[T any](items []T, flags *flagSet) []T {
+	raw := flags.Values["limit"]
+	if raw == "" {
+		return items
+	}
+
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 0 || limit >= len(items) {
+		return items
+	}
+
+	return items[:limit]
+}
+
 // render writes a table, painting the named state columns.
 func (run *runContext) render(tbl *metav1.Table, stateColumns ...string) error {
 	err := table.Render(run.Out, tbl, table.Options{
 		Color:        run.Color,
 		StateColumns: stateColumns,
+		Pastable:     run.Flags.Pastable,
 	})
 	if err != nil {
 		return fmt.Errorf("render table: %w", err)

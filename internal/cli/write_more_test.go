@@ -51,7 +51,11 @@ func TestVolumeDefinitionCreateParsesSizes(t *testing.T) {
 		{"1G", 1 << 20},
 		{"2T", 2 << 30},
 		{"32M", 32768},
-		{"1024K", 1024},
+		{"4096K", 4096},
+		// The suffixes operators paste from documentation.
+		{"10GiB", 10 << 20},
+		{"10Gi", 10 << 20},
+		{"10GB", 10 << 20},
 	}
 
 	for _, tc := range cases {
@@ -306,5 +310,51 @@ func TestVolumeDefinitionSetSizeBounds(t *testing.T) {
 		if got := app.Run(t.Context(), []string{"vd", "s", "pvc-x", "0", size, "--force"}); got == 0 {
 			t.Errorf("--force let %s past the size bounds", size)
 		}
+	}
+}
+
+// A size the bounds reject must be refused on EVERY path that writes
+// one, not just resize. Below DRBD's per-device minimum the satellite
+// loops on `drbdadm create-md` forever instead of failing, and nothing
+// downstream catches it: the CRD carries no minimum, no CEL rule and
+// no admission webhook.
+func TestVolumeDefinitionCreateEnforcesBounds(t *testing.T) {
+	t.Parallel()
+
+	for _, size := range []string{
+		"1024K", // below the 4 MiB floor
+		"1M",
+		"17T", // above the 16 TiB ceiling
+		// Multiplying this out overflows int64 to exactly zero. A
+		// zero size is the one value the satellite cannot fail on.
+		"17179869184T",
+	} {
+		app, _, errBuf := newApp(t, seedDefinition)
+
+		if got := app.Run(t.Context(), []string{"vd", "c", "pvc-x", size}); got == 0 {
+			t.Errorf("create accepted %s", size)
+		}
+
+		vds, err := appStore(t, app).VolumeDefinitions().List(t.Context(), "pvc-x")
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+
+		if len(vds) != 0 {
+			t.Errorf("%s: refused create still wrote %+v (stderr: %s)", size, vds, errBuf.String())
+		}
+	}
+}
+
+// Spawn writes volume sizes too, and reaches the same satellite.
+func TestResourceGroupSpawnEnforcesBounds(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "grp"})
+	})
+
+	if got := app.Run(t.Context(), []string{"rg", "spawn", "grp", "pvc-x", "1024K"}); got == 0 {
+		t.Error("spawn accepted a sub-floor volume size")
 	}
 }
