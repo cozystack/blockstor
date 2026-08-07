@@ -201,14 +201,34 @@ func resourceGroupQuerySizeInfo(ctx context.Context, run *runContext) error {
 		return err
 	}
 
+	maxKib := maxVolumeSizeKib(pools, int(group.SelectFilter.PlaceCount))
+
 	if run.Flags.Machine {
-		return machineOut(run, pools)
+		// The computed size is the whole point of the command, so the
+		// machine envelope carries it alongside the pools it was derived
+		// from. Emitting only the pools left `-m` consumers unable to
+		// obtain the one number the table leads with.
+		return machineOut(run, []sizeInfo{{
+			ResourceGroup:    name,
+			MaxVolumeSizeKib: maxKib,
+			Pools:            pools,
+		}})
 	}
 
 	tbl := &metav1.Table{ColumnDefinitions: view.SizeInfoColumns()}
-	tbl.Rows = view.SizeInfoRows(name, maxVolumeSizeKib(pools, int(group.SelectFilter.PlaceCount)), pools)
+	tbl.Rows = view.SizeInfoRows(name, maxKib, pools)
 
 	return run.render(tbl)
+}
+
+// sizeInfo is the machine-readable answer to a size query: the
+// computed bound plus the candidates it came from.
+//
+//nolint:tagliatelle // the machine envelope mirrors LINSTOR's snake_case wire shape
+type sizeInfo struct {
+	ResourceGroup    string              `json:"resource_group"`
+	MaxVolumeSizeKib int64               `json:"max_volume_size_kib"`
+	Pools            []apiv1.StoragePool `json:"pools,omitempty"`
 }
 
 // candidatePools lists the pools the group's policy would draw from,

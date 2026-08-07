@@ -73,7 +73,19 @@ func snapshotCreateMultiple(ctx context.Context, run *runContext) error {
 		return err
 	}
 
+	// Every definition is checked before the first snapshot is
+	// written. A group whose members are fewer than its declared
+	// GroupSize is one the controller waits on forever, since it opens
+	// the suspend-io barrier only once the whole group has landed.
+	for _, pair := range pairs {
+		_, err = run.Store.ResourceDefinitions().Get(ctx, pair.resource)
+		if err != nil {
+			return fmt.Errorf("get resource definition %s: %w", pair.resource, err)
+		}
+	}
+
 	groupID := uuid.NewString()
+	created := make([]snapshotPair, 0, len(pairs))
 
 	for _, pair := range pairs {
 		snap := &apiv1.Snapshot{
@@ -86,11 +98,33 @@ func snapshotCreateMultiple(ctx context.Context, run *runContext) error {
 
 		err = run.Store.Snapshots().Create(ctx, snap)
 		if err != nil {
+			// Unwind what this call created. Leaving a short group
+			// behind would strand the barrier; these snapshots are
+			// ours and nothing has consumed them yet.
+			rollbackSnapshots(ctx, run, created)
+
 			return fmt.Errorf("create snapshot %s of %s: %w", snap.Name, snap.ResourceName, err)
 		}
+
+		created = append(created, pair)
 	}
 
 	return nil
+}
+
+// rollbackSnapshots removes the members of a batch that did land, so a
+// failed create-multiple leaves no group with fewer members than its
+// declared size. A failure to unwind is reported and otherwise
+// ignored: the caller is already returning the original error, which
+// is the one the operator needs.
+func rollbackSnapshots(ctx context.Context, run *runContext, created []snapshotPair) {
+	for _, pair := range created {
+		err := run.Store.Snapshots().Delete(ctx, pair.resource, pair.snapshot)
+		if err != nil && !isNotFound(err) {
+			fmt.Fprintf(run.Err, "warning: could not roll back snapshot %s of %s: %v\n",
+				pair.snapshot, pair.resource, err)
+		}
+	}
 }
 
 // snapshotPair is one member of a create-multiple batch.

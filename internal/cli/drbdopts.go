@@ -57,7 +57,12 @@ func drbdOptions(accessor propertyAccessor) handler {
 			props = map[string]string{}
 		}
 
-		if !applyDRBDFlags(run.Flags, props) {
+		changed, err := applyDRBDFlags(run.Flags, props)
+		if err != nil {
+			return err
+		}
+
+		if !changed {
 			return fmt.Errorf("%w: drbd-options needs at least one --<option>", command.ErrUsage)
 		}
 
@@ -67,8 +72,24 @@ func drbdOptions(accessor propertyAccessor) handler {
 
 // applyDRBDFlags folds the parsed flags into a property bag, reporting
 // whether anything was actually set or cleared.
-func applyDRBDFlags(flags *flagSet, props map[string]string) bool {
+func applyDRBDFlags(flags *flagSet, props map[string]string) (bool, error) {
 	changed := false
+
+	// A knob that is both set and unset in one invocation is REFUSED.
+	// Values is a map, so resolving it would pick set or delete by
+	// iteration order — the same command line giving different
+	// cluster state on different runs.
+	for name := range flags.Values {
+		knob, isUnset := strings.CutPrefix(name, unsetPrefix)
+		if !isUnset {
+			continue
+		}
+
+		if _, both := flags.Values[knob]; both {
+			return false, fmt.Errorf("%w: --%s and --%s%s contradict each other",
+				command.ErrUsage, knob, unsetPrefix, knob)
+		}
+	}
 
 	for name, value := range flags.Values {
 		knob, isUnset := strings.CutPrefix(name, unsetPrefix)
@@ -90,5 +111,5 @@ func applyDRBDFlags(flags *flagSet, props map[string]string) bool {
 		changed = true
 	}
 
-	return changed
+	return changed, nil
 }

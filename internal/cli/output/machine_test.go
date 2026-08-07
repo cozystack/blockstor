@@ -96,28 +96,6 @@ func TestMachineReadableEmptyListKeepsEnvelope(t *testing.T) {
 // Singleton payloads (an API response envelope, a property bag) are
 // FLAT — `[obj]`, not `[[obj]]`. The harness helper that unwraps
 // repeatedly copes with either, but the CLI must emit what the
-// upstream emits.
-func TestMachineReadableSingletonIsFlat(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-
-	err := output.MachineSingle(&buf, map[string]string{"key": "value"})
-	if err != nil {
-		t.Fatalf("MachineSingle: %v", err)
-	}
-
-	var outer []map[string]string
-
-	err = json.Unmarshal(buf.Bytes(), &outer)
-	if err != nil {
-		t.Fatalf("singleton is not a flat array: %v\n%s", err, buf.String())
-	}
-
-	if len(outer) != 1 || outer[0]["key"] != "value" {
-		t.Errorf("singleton = %v, want [{key:value}]", outer)
-	}
-}
 
 // Machine output must be newline-terminated and free of ANSI, whatever
 // the colour settings are: it is consumed by jq, never by a human.

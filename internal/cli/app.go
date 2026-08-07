@@ -104,17 +104,19 @@ func (a *App) Run(ctx context.Context, argv []string) int {
 	}
 
 	if isHelpRequest(argv) {
-		err := writeHelp(a.Out)
-		if err != nil {
-			return a.fail(err)
-		}
-
-		return exitOK
+		return a.help()
 	}
 
 	cmd, rest, err := command.Resolve(argv)
 	if err != nil {
 		return a.fail(err)
+	}
+
+	// `blockstor r l --help` asks about that command, not for a flag.
+	// Rejecting it as an unknown flag would be the one answer that
+	// helps least.
+	if isHelpRequest(rest) {
+		return a.help()
 	}
 
 	flags, err := parseFlags(rest)
@@ -127,31 +129,7 @@ func (a *App) Run(ctx context.Context, argv []string) int {
 		return a.fail(fmt.Errorf("%w: %s", ErrNotImplemented, cmd))
 	}
 
-	backend, err := a.StoreFor(ctx)
-	if err != nil {
-		return a.fail(err)
-	}
-
-	a.noteIgnoredFlags(flags)
-
-	mode, err := color.ParseMode(flags.Color)
-	if err != nil {
-		return a.fail(fmt.Errorf("%w: %w", command.ErrUsage, err))
-	}
-
-	err = run(ctx, &runContext{
-		Store: backend,
-		Out:   a.Out,
-		Err:   a.Err,
-		Flags: flags,
-		Color: color.New(color.EnabledFor(mode, a.tty())),
-		Kube:  a.KubeFor,
-	})
-	if err != nil {
-		return a.fail(err)
-	}
-
-	return exitOK
+	return a.dispatch(ctx, run, flags)
 }
 
 // UnimplementedCommands lists registered commands with no handler, so
@@ -172,6 +150,52 @@ func (a *App) UnimplementedCommands() []string {
 	sort.Strings(missing)
 
 	return missing
+}
+
+// dispatch resolves the client-side settings, opens the store and runs
+// the command.
+//
+// Colour is parsed BEFORE the cluster is opened. Both are client-side
+// mistakes, and the other order made `--color=bogus` exit 10 on an
+// unreachable cluster and 2 on a reachable one — the same typo
+// classified two different ways — besides opening a connection for an
+// invocation already known to be invalid.
+func (a *App) dispatch(ctx context.Context, run handler, flags *flagSet) int {
+	mode, err := color.ParseMode(flags.Color)
+	if err != nil {
+		return a.fail(fmt.Errorf("%w: %w", command.ErrUsage, err))
+	}
+
+	backend, err := a.StoreFor(ctx)
+	if err != nil {
+		return a.fail(err)
+	}
+
+	a.noteIgnoredFlags(flags)
+
+	err = run(ctx, &runContext{
+		Store: backend,
+		Out:   a.Out,
+		Err:   a.Err,
+		Flags: flags,
+		Color: color.New(color.EnabledFor(mode, a.tty())),
+		Kube:  a.KubeFor,
+	})
+	if err != nil {
+		return a.fail(err)
+	}
+
+	return exitOK
+}
+
+// help writes the command tree to stdout so it can be piped.
+func (a *App) help() int {
+	err := writeHelp(a.Out)
+	if err != nil {
+		return a.fail(err)
+	}
+
+	return exitOK
 }
 
 // noteIgnoredFlags warns about a flag this client accepts for

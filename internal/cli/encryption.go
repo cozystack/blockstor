@@ -50,11 +50,17 @@ func encryptionPassphrase(run *runContext) (string, error) {
 		return value, nil
 	}
 
-	if len(run.Flags.Positionals) > 0 {
+	if len(run.Flags.Positionals) > 0 && run.Flags.Positionals[0] != "" {
 		return run.Flags.Positionals[0], nil
 	}
 
-	return "", fmt.Errorf("%w: no passphrase given", command.ErrUsage)
+	// An empty value is REJECTED, not stored. `passphrase.Read` cannot
+	// tell an empty Secret from a missing one, so an empty master key
+	// wedges the cluster into a state where create reports "already
+	// set" and enter reports "none set" — two contradictory diagnoses
+	// with no way out through this CLI — while encrypting every volume
+	// with nothing.
+	return "", fmt.Errorf("%w: the passphrase may not be empty", command.ErrUsage)
 }
 
 // encryptionCreatePassphrase implements `encryption create-passphrase`.

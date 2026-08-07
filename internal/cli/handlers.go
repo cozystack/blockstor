@@ -21,7 +21,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"strconv"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -70,14 +69,7 @@ var handlers = map[string]handler{
 		"State",
 	),
 
-	"resource list": listing("resources",
-		fetchResources,
-		keepFaultyResource,
-		func(resources []apiv1.Resource, run *runContext) *metav1.Table {
-			return view.ResourceList(view.ResourceListInput{Resources: resources, FaultyOnly: run.Flags.Faulty})
-		},
-		"State", "Conns",
-	),
+	"resource list": resourceList,
 
 	"volume list": listing("resources",
 		fetchResources,
@@ -308,6 +300,73 @@ func volumeDefinitionList(ctx context.Context, run *runContext) error {
 	return run.render(tbl, "State")
 }
 
+// resourceList implements `resource list`.
+//
+// It fetches the volume sizes as well as the replicas, because the
+// State column renders `SyncTarget(NN%)` from them. Without the sizes
+// the percentage silently disappeared during exactly the resync an
+// operator is watching, while the design doc promised it and the
+// colour classifier went to the trouble of stripping it.
+func resourceList(ctx context.Context, run *runContext) error {
+	resources, err := fetchResources(ctx, run.Store)
+	if err != nil {
+		return fmt.Errorf("list resources: %w", err)
+	}
+
+	kept := make([]apiv1.Resource, 0, len(resources))
+
+	for i := range resources {
+		if keepFaultyResource(&resources[i], run.Flags) {
+			kept = append(kept, resources[i])
+		}
+	}
+
+	kept = applyLimit(kept, run.Flags)
+
+	if run.Flags.Machine {
+		return machineOut(run, kept)
+	}
+
+	return run.render(view.ResourceList(view.ResourceListInput{
+		Resources:      kept,
+		VolumeSizesKib: volumeSizesFor(ctx, run, kept),
+		FaultyOnly:     run.Flags.Faulty,
+	}), "State", "Conns")
+}
+
+// volumeSizesFor collects the per-volume sizes of the definitions in a
+// listing, keyed the way the view expects. A definition whose sizes
+// cannot be read is skipped rather than failing the listing: a missing
+// percentage is a cosmetic loss, an unreadable `resource list` during
+// an incident is not.
+func volumeSizesFor(ctx context.Context, run *runContext, resources []apiv1.Resource) map[string]map[int32]int64 {
+	seen := make(map[string]struct{}, len(resources))
+	sizes := make(map[string]map[int32]int64, len(resources))
+
+	for i := range resources {
+		name := resources[i].Name
+		if _, done := seen[name]; done {
+			continue
+		}
+
+		seen[name] = struct{}{}
+
+		vds, err := run.Store.VolumeDefinitions().List(ctx, name)
+		if err != nil {
+			continue
+		}
+
+		perVolume := make(map[int32]int64, len(vds))
+		for j := range vds {
+			perVolume[vds[j].VolumeNumber] = vds[j].SizeKib
+		}
+
+		sizes[name] = perVolume
+	}
+
+	return sizes
+}
+
 // machineOut writes the machine-readable envelope.
 func machineOut[T any](run *runContext, items []T) error {
 	err := output.MachineList(run.Out, items)
@@ -318,19 +377,15 @@ func machineOut[T any](run *runContext, items []T) error {
 	return nil
 }
 
-// applyLimit caps a listing at --limit rows.
+// applyLimit caps a listing at --limit rows; zero is unlimited. The
+// value was validated at parse time, so a malformed one never reaches
+// here.
 func applyLimit[T any](items []T, flags *flagSet) []T {
-	raw := flags.Values["limit"]
-	if raw == "" {
+	if flags.Limit <= 0 || flags.Limit >= len(items) {
 		return items
 	}
 
-	limit, err := strconv.Atoi(raw)
-	if err != nil || limit < 0 || limit >= len(items) {
-		return items
-	}
-
-	return items[:limit]
+	return items[:flags.Limit]
 }
 
 // render writes a table, painting the named state columns.

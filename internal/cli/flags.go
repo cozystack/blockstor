@@ -52,6 +52,8 @@ type flagSet struct {
 	IgnoredControllers bool
 	// noColor backs --no-color, which folds into Color.
 	noColor bool
+	// Limit caps a listing (--limit); zero means unlimited.
+	Limit int
 	// Pastable requests the pipe-free rendering (-p/--pastable).
 	Pastable bool
 	// Color is the --color mode; empty means auto.
@@ -212,6 +214,19 @@ func (f *flagSet) resolveOutput() error {
 
 	if version := f.Values["output-version"]; version != "" && version != "v1" {
 		return fmt.Errorf("%w: unsupported output version %q (v1)", command.ErrUsage, version)
+	}
+
+	// A malformed --limit must not fail open. Returning the full list
+	// for `--limit banana` is how a script that meant to page ends up
+	// processing everything, silently and with exit 0. Zero means
+	// unlimited, the convention the flag's own name implies.
+	if raw := f.Values["limit"]; raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 0 {
+			return fmt.Errorf("%w: --limit %q is not a non-negative number", command.ErrUsage, raw)
+		}
+
+		f.Limit = limit
 	}
 
 	return nil

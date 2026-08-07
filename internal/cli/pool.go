@@ -225,6 +225,16 @@ func volumeGroupNumber(run *runContext, group *apiv1.ResourceGroup) (int32, erro
 	return number, nil
 }
 
+// volumeGroupRow is one machine-readable volume-group row, qualified
+// by the group it belongs to.
+//
+//nolint:tagliatelle // the machine envelope mirrors LINSTOR's snake_case wire shape
+type volumeGroupRow struct {
+	apiv1.VolumeGroup `json:",inline"`
+
+	ResourceGroup string `json:"resource_group"`
+}
+
 // volumeGroupList implements `volume-group list`.
 func volumeGroupList(ctx context.Context, run *runContext) error {
 	groups, err := run.Store.ResourceGroups().List(ctx)
@@ -235,14 +245,24 @@ func volumeGroupList(ctx context.Context, run *runContext) error {
 	wanted := run.Flags.Values["resource-group"]
 
 	tbl := &metav1.Table{ColumnDefinitions: view.VolumeGroupColumns()}
-	rows := make([]apiv1.VolumeGroup, 0)
+	rows := make([]volumeGroupRow, 0)
 
 	for i := range groups {
 		if wanted != "" && !strings.EqualFold(wanted, groups[i].Name) {
 			continue
 		}
 
-		rows = append(rows, groups[i].VolumeGroups...)
+		// The parent group travels with each row. A flat list of
+		// VolumeGroups is ambiguous the moment two groups are listed:
+		// the table has a ResourceGroup column and the JSON must not
+		// be poorer than the thing it is meant to be parsed from.
+		for j := range groups[i].VolumeGroups {
+			rows = append(rows, volumeGroupRow{
+				ResourceGroup: groups[i].Name,
+				VolumeGroup:   groups[i].VolumeGroups[j],
+			})
+		}
+
 		tbl.Rows = append(tbl.Rows, view.VolumeGroupRows(&groups[i])...)
 	}
 

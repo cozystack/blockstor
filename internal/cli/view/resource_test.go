@@ -158,7 +158,7 @@ func TestStateColumnContracts(t *testing.T) {
 
 		got := cellAt(t, view.ResourceList(view.ResourceListInput{
 			Resources:      []apiv1.Resource{res},
-			VolumeSizesKib: map[int32]int64{0: 1024},
+			VolumeSizesKib: map[string]map[int32]int64{res.Name: {0: 1024}},
 		}), 0, "State")
 
 		if got != "SyncTarget(50%)" {

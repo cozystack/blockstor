@@ -43,11 +43,6 @@ func MachineList[T any](w io.Writer, items []T) error {
 	return encode(w, []any{items})
 }
 
-// MachineSingle writes a singleton payload in the flat envelope.
-func MachineSingle(w io.Writer, item any) error {
-	return encode(w, []any{item})
-}
-
 // encode writes compact JSON followed by a newline. Machine output is
 // consumed by jq, so it carries no colour and no indentation.
 func encode(w io.Writer, payload any) error {

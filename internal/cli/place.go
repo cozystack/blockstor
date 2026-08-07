@@ -250,23 +250,24 @@ func resourceGroupSpawn(ctx context.Context, run *runContext) error {
 		return fmt.Errorf("get resource group %s: %w", rgName, err)
 	}
 
+	// EVERY size is parsed and bounds-checked before anything is
+	// written. Validating as we went would leave a typo'd invocation
+	// with the definition already created and some volumes already in
+	// place, and the corrected retry would then fail on "already
+	// exists" — so a size typo would cost a manual delete before the
+	// operator could try again.
+	sizes, err := parseSizes(run.Flags.Positionals[wantArgs:])
+	if err != nil {
+		return err
+	}
+
 	err = spawnDefinition(ctx, run, &group, rdName)
 	if err != nil {
 		return err
 	}
 
-	for _, size := range run.Flags.Positionals[wantArgs:] {
-		sizeKib, sizeErr := ParseSize(size)
-		if sizeErr != nil {
-			return sizeErr
-		}
-
-		sizeErr = checkVolumeSize(sizeKib)
-		if sizeErr != nil {
-			return sizeErr
-		}
-
-		_, sizeErr = run.Store.VolumeDefinitions().CreateAutoNumbered(ctx, rdName,
+	for _, sizeKib := range sizes {
+		_, sizeErr := run.Store.VolumeDefinitions().CreateAutoNumbered(ctx, rdName,
 			&apiv1.VolumeDefinition{SizeKib: sizeKib})
 		if sizeErr != nil {
 			return fmt.Errorf("create volume definition on %s: %w", rdName, sizeErr)
@@ -279,6 +280,28 @@ func resourceGroupSpawn(ctx context.Context, run *runContext) error {
 	}
 
 	return autoPlace(ctx, run, rdName, filter, true)
+}
+
+// parseSizes validates a whole list of sizes up front, so a bad one
+// is caught before the first object is written.
+func parseSizes(raw []string) ([]int64, error) {
+	sizes := make([]int64, 0, len(raw))
+
+	for _, size := range raw {
+		sizeKib, err := ParseSize(size)
+		if err != nil {
+			return nil, err
+		}
+
+		err = checkVolumeSize(sizeKib)
+		if err != nil {
+			return nil, err
+		}
+
+		sizes = append(sizes, sizeKib)
+	}
+
+	return sizes, nil
 }
 
 // spawnDefinition creates the definition, carrying over the group's
