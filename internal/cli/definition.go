@@ -141,27 +141,15 @@ func ensureCloneSnapshot(ctx context.Context, run *runContext, src *apiv1.Resour
 		return fmt.Errorf("get clone snapshot %s: %w", snapName, err)
 	}
 
-	replicas, err := run.Store.Resources().ListByDefinition(ctx, src.Name)
-	if err != nil {
-		return fmt.Errorf("list replicas of %s: %w", src.Name, err)
-	}
-
 	snap := &apiv1.Snapshot{Name: snapName, ResourceName: src.Name}
 
-	for i := range replicas {
-		snap.Nodes = append(snap.Nodes, replicas[i].NodeName)
-	}
-
-	vds, err := run.Store.VolumeDefinitions().List(ctx, src.Name)
+	// Nodes and volumes come from the shared hydration, which picks
+	// DISKFUL replicas only. Snapshotting a diskless witness asks its
+	// satellite to capture a volume it does not have: that node fails,
+	// and a failed node fails the snapshot, which aborts the clone.
+	err = hydrateSnapshot(ctx, run, snap)
 	if err != nil {
-		return fmt.Errorf("list volume definitions of %s: %w", src.Name, err)
-	}
-
-	for i := range vds {
-		snap.VolumeDefinitions = append(snap.VolumeDefinitions, apiv1.SnapshotVolumeDef{
-			VolumeNumber: vds[i].VolumeNumber,
-			SizeKib:      vds[i].SizeKib,
-		})
+		return err
 	}
 
 	err = run.Store.Snapshots().Create(ctx, snap)

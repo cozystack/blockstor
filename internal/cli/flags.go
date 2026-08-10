@@ -87,6 +87,8 @@ const (
 	flagNoColor    = "--no-color"
 	flagMachine    = "--machine-readable"
 	flagPastable   = "--pastable"
+	flagLayerList  = "--layer-list"
+	flagLayerAbbr  = "-l"
 )
 
 // valueFlags are the flags that consume the following argument when
@@ -333,6 +335,11 @@ func (f *flagSet) assign(name, value string) {
 		f.Resources = append(f.Resources, splitList(value)...)
 	case flagOutputAbbr, flagOutputFmt:
 		f.Values["output-fmt"] = value
+	case flagLayerAbbr, flagLayerList:
+		// `-l` consumed its value and then dropped it, so a layer
+		// stack an operator pinned — a LUKS layer, say — was silently
+		// discarded and the volume came up without it.
+		f.Values["layer-list"] = value
 	default:
 		f.Values[strings.TrimLeft(name, "-")] = value
 	}

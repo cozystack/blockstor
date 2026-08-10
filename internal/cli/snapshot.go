@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -52,6 +53,11 @@ var errRollbackUnsupported = errors.New(
 		"--from-resource <rd> --from-snapshot <snap> --to-resource <new>`")
 
 var errVolumeNumberTaken = errors.New("the target already has a volume definition with that number")
+
+// errNothingToCapture guards the phantom-snapshot case: a snapshot
+// with no diskful node behind it captures nothing while reporting
+// success.
+var errNothingToCapture = errors.New("place a diskful replica first")
 
 // snapshotRollback implements `snapshot rollback`.
 func snapshotRollback(_ context.Context, _ *runContext) error {
@@ -94,6 +100,13 @@ func snapshotCreateMultiple(ctx context.Context, run *runContext) error {
 			Nodes:        run.Flags.Nodes,
 			GroupID:      groupID,
 			GroupSize:    int32(len(pairs)), //nolint:gosec // bounded by the argument count
+		}
+
+		err = hydrateSnapshot(ctx, run, snap)
+		if err != nil {
+			rollbackSnapshots(ctx, run, created)
+
+			return err
 		}
 
 		err = run.Store.Snapshots().Create(ctx, snap)
@@ -173,6 +186,95 @@ func explicitPairs(positionals []string) ([]snapshotPair, error) {
 	}
 
 	return pairs, nil
+}
+
+// hydrateSnapshot fills in what makes a snapshot real: the nodes to
+// capture on and the volume layout to capture.
+//
+// This is NOT optional decoration. A Snapshot written with an empty
+// Nodes slice is treated as degenerate by the snapshot controller,
+// which returns without capturing anything — so the command would
+// report success, the listing would render the snapshot as healthy,
+// and there would be no data behind it. An empty VolumeDefinitions
+// slice has the matching effect on the way back out: restoring such a
+// snapshot hydrates zero volumes, also with exit 0.
+//
+// The apiserver does this in `hydrateSnapshotFromRD` before it
+// persists. That hydration is wire-to-CRD translation which lives in
+// the REST layer rather than in the store, so a client that talks to
+// the store directly has to carry it too.
+func hydrateSnapshot(ctx context.Context, run *runContext, snap *apiv1.Snapshot) error {
+	def, err := run.Store.ResourceDefinitions().Get(ctx, snap.ResourceName)
+	if err != nil {
+		return fmt.Errorf("get resource definition %s: %w", snap.ResourceName, err)
+	}
+
+	if len(snap.VolumeDefinitions) == 0 {
+		vds, vdErr := run.Store.VolumeDefinitions().List(ctx, snap.ResourceName)
+		if vdErr != nil {
+			return fmt.Errorf("list volume definitions of %s: %w", snap.ResourceName, vdErr)
+		}
+
+		snap.VolumeDefinitions = make([]apiv1.SnapshotVolumeDef, 0, len(vds))
+		for i := range vds {
+			snap.VolumeDefinitions = append(snap.VolumeDefinitions, apiv1.SnapshotVolumeDef{
+				VolumeNumber:          vds[i].VolumeNumber,
+				SizeKib:               vds[i].SizeKib,
+				VolumeDefinitionProps: vds[i].Props,
+			})
+		}
+	}
+
+	if len(snap.Nodes) == 0 {
+		snap.Nodes, err = diskfulNodesOf(ctx, run, snap.ResourceName)
+		if err != nil {
+			return err
+		}
+	}
+
+	if snap.Props == nil {
+		snap.Props = def.Props
+	}
+
+	if snap.SnapshotDefinitionProps == nil {
+		snap.SnapshotDefinitionProps = snap.Props
+	}
+
+	if snap.ResourceDefinitionProps == nil && len(def.Props) > 0 {
+		snap.ResourceDefinitionProps = def.Props
+	}
+
+	return nil
+}
+
+// diskfulNodesOf lists the nodes that actually hold data for a
+// definition.
+//
+// A diskless replica has no backing volume to snapshot: asking its
+// satellite to capture one fails that node, which fails the whole
+// snapshot. An inactive replica is skipped for the same reason.
+func diskfulNodesOf(ctx context.Context, run *runContext, rdName string) ([]string, error) {
+	replicas, err := run.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return nil, fmt.Errorf("list replicas of %s: %w", rdName, err)
+	}
+
+	nodes := make([]string, 0, len(replicas))
+
+	for i := range replicas {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagDiskless) ||
+			slices.Contains(replicas[i].Flags, apiv1.ResourceFlagInactive) {
+			continue
+		}
+
+		nodes = append(nodes, replicas[i].NodeName)
+	}
+
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("%s has no diskful replica to snapshot: %w", rdName, errNothingToCapture)
+	}
+
+	return nodes, nil
 }
 
 // restoreArgs are the three flags every restore verb takes.

@@ -429,7 +429,12 @@ func snapshotCreate(ctx context.Context, run *runContext) error {
 		Nodes:        run.Flags.Positionals[:count-2],
 	}
 
-	err := run.Store.Snapshots().Create(ctx, snap)
+	err := hydrateSnapshot(ctx, run, snap)
+	if err != nil {
+		return err
+	}
+
+	err = run.Store.Snapshots().Create(ctx, snap)
 	if err != nil {
 		return fmt.Errorf("create snapshot %s of %s: %w", snap.Name, snap.ResourceName, err)
 	}

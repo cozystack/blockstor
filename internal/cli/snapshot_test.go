@@ -223,8 +223,11 @@ func TestSnapshotCreateMultipleSharesOneGroup(t *testing.T) {
 		{"s", "create-multiple", "snap", "-r", "pvc-a", "pvc-b"},
 	} {
 		app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
-			_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-a"})
-			_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-b"})
+			for _, name := range []string{"pvc-a", "pvc-b"} {
+				_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: name})
+				_ = backend.VolumeDefinitions().Create(ctx, name, &apiv1.VolumeDefinition{SizeKib: 1 << 20})
+				_ = backend.Resources().Create(ctx, &apiv1.Resource{Name: name, NodeName: "node-1"})
+			}
 		})
 
 		if got := app.Run(t.Context(), argv); got != 0 {
@@ -260,5 +263,118 @@ func TestSnapshotCreateMultipleRejectsBadPair(t *testing.T) {
 
 	if got := app.Run(t.Context(), []string{"s", "create-multiple", "pvc-a:"}); got != 2 {
 		t.Errorf("exit = %d, want 2", got)
+	}
+}
+
+// A snapshot with no nodes behind it captures NOTHING: the snapshot
+// controller treats an empty Spec.Nodes as degenerate and returns
+// without capturing, while the command exits 0 and the listing renders
+// the snapshot as healthy. An empty VolumeDefinitions slice does the
+// same on the way back out — restoring it hydrates zero volumes, also
+// with exit 0. This is a phantom backup, so the hydration the
+// apiserver does before persisting has to happen here too.
+func TestSnapshotCreateHydratesNodesAndVolumes(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedSnapshotSource)
+
+	if got := app.Run(t.Context(), []string{"s", "c", "pvc-x", "snap-2"}); got != 0 {
+		t.Fatalf("create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	snap, err := appStore(t, app).Snapshots().Get(t.Context(), "pvc-x", "snap-2")
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+
+	if len(snap.Nodes) == 0 {
+		t.Error("the snapshot names no nodes, so nothing would be captured")
+	}
+
+	if len(snap.VolumeDefinitions) == 0 {
+		t.Error("the snapshot records no volumes, so a restore would hydrate nothing")
+	}
+}
+
+// A diskless replica has no backing volume to capture. Including its
+// node fails that node, and a failed node fails the whole snapshot —
+// which is how a clone of a resource with a tiebreaker aborted.
+func TestSnapshotSkipsDisklessReplicas(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedSnapshotSource(ctx, backend)
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-x", NodeName: "node-witness",
+			Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"s", "c", "pvc-x", "snap-2"}); got != 0 {
+		t.Fatalf("create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	snap, err := appStore(t, app).Snapshots().Get(t.Context(), "pvc-x", "snap-2")
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+
+	for _, node := range snap.Nodes {
+		if node == "node-witness" {
+			t.Errorf("the snapshot targets a diskless witness: %v", snap.Nodes)
+		}
+	}
+
+	// The clone path builds its internal snapshot the same way.
+	if got := app.Run(t.Context(), []string{"rd", "clone", "pvc-x", "pvc-clone"}); got != 0 {
+		t.Fatalf("clone exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	clone, err := appStore(t, app).Snapshots().Get(t.Context(), "pvc-x", "clone-pvc-clone")
+	if err != nil {
+		t.Fatalf("get clone snapshot: %v", err)
+	}
+
+	for _, node := range clone.Nodes {
+		if node == "node-witness" {
+			t.Errorf("the clone snapshot targets a diskless witness: %v", clone.Nodes)
+		}
+	}
+}
+
+// A definition with no diskful replica cannot be snapshotted at all,
+// so the attempt is refused rather than recorded as a success with
+// nothing behind it.
+func TestSnapshotRefusesWithNoDiskfulReplica(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, seedDefinition)
+
+	if got := app.Run(t.Context(), []string{"s", "c", "pvc-x", "snap-1"}); got == 0 {
+		t.Error("a snapshot of a definition with no diskful replica reported success")
+	}
+}
+
+// `-l` is the short form of --layer-list. It used to consume its value
+// and drop it, so a pinned layer stack — a LUKS layer, say — was
+// discarded and the volume came up without it, with exit 0.
+func TestShortLayerListFlagReachesTheSameField(t *testing.T) {
+	t.Parallel()
+
+	for _, flag := range []string{"-l", "--layer-list"} {
+		app, _, errBuf := newApp(t, nil)
+
+		if got := app.Run(t.Context(), []string{"rd", "c", "pvc-x", flag, "drbd,luks,storage"}); got != 0 {
+			t.Fatalf("%s: exit = %d (stderr: %s)", flag, got, errBuf.String())
+		}
+
+		def, err := appStore(t, app).ResourceDefinitions().Get(t.Context(), "pvc-x")
+		if err != nil {
+			t.Fatalf("%s: get definition: %v", flag, err)
+		}
+
+		if len(def.LayerStack) != 3 {
+			t.Errorf("%s: layer stack = %v, want three layers", flag, def.LayerStack)
+		}
 	}
 }
