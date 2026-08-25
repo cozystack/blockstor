@@ -559,6 +559,11 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 
 		typed, residual, extra := k8sstore.SplitProps(c.props.ResourceDefinition(row.ResourceName))
 
+		adopted := c.rdHasAdoptedReplica(row.ResourceName)
+		if !adopted {
+			c.warnf("resource definition %s: no replica is being migrated — Initialized left unlatched so blockstor can seed a first sync", dsp)
+		}
+
 		def := crdv1alpha1.ResourceDefinition{
 			TypeMeta:   typeMeta("ResourceDefinition"),
 			ObjectMeta: objectMeta(dsp),
@@ -572,7 +577,14 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 				// cluster: latch Initialized so any replica added AFTER
 				// the migration must SyncTarget the real data instead of
 				// skipping the initial sync against an adopted set.
-				Initialized: ptr(true),
+				//
+				// Only where a replica is actually being adopted. The
+				// latch also suppresses the auto-primary election that
+				// seeds a first sync, so latching it on a definition
+				// whose replicas were all skipped strands the volume:
+				// nothing holds the data, and nothing is allowed to
+				// become the source.
+				Initialized: ptr(adopted),
 			},
 		}
 
@@ -590,6 +602,37 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 
 // attachRDLayerFields fills the DRBD (port, shared-secret), volume and
 // LUKS-report bits onto a converted ResourceDefinition.
+// rdHasAdoptedReplica reports whether any replica of this resource
+// definition survives conversion. It mirrors convertResources' own skip
+// rules for the two cases that can empty a definition out — a replica
+// flagged DELETE in the source cluster, or one whose host node was not
+// migrated — and deliberately ignores the per-replica pool-divergence
+// check: counting a doubtful replica keeps the latch ON, which is the
+// safe direction. Dropping the latch where data does exist would let a
+// blank replica win the auto-primary election and sync itself over the
+// real one.
+func (c *converter) rdHasAdoptedReplica(rdName string) bool {
+	for i := range c.dump.Resources {
+		row := &c.dump.Resources[i]
+
+		if row.ResourceName != rdName || row.SnapshotName != "" {
+			continue
+		}
+
+		if row.ResourceFlags&resourceFlagDelete != 0 {
+			continue
+		}
+
+		if !c.convertedNode[row.NodeName] {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
 func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row *ResourceDefinitionRow, dsp string) {
 	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
 		def.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, dsp)

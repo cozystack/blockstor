@@ -808,3 +808,53 @@ func hasWarning(res *Result, substr string) bool {
 
 	return false
 }
+
+// TestInitializedLatchNeedsAnAdoptedReplica: the Initialized latch tells
+// blockstor the volume already holds committed data, which also
+// suppresses the auto-primary election that seeds a first sync. Latch it
+// on a definition whose every replica was skipped and the volume is
+// stranded — nothing holds the data, and nothing may become the source.
+//
+// Seen on a live migration: a definition whose only LINSTOR replica was
+// a tie-breaker flagged DELETE arrived Initialized, and once the
+// controller placed replicas for it they sat Inconsistent on every node
+// with no way out.
+func TestInitializedLatchNeedsAnAdoptedReplica(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		ResourceDefinitions: []ResourceDefinitionRow{
+			{ResourceName: "PVC-LIVE", ResourceDspName: "pvc-live",
+				LayerStack: "DRBD,STORAGE", UUID: "rd-live"},
+			{ResourceName: "PVC-EMPTY", ResourceDspName: "pvc-empty",
+				LayerStack: "DRBD,STORAGE", UUID: "rd-empty"},
+		},
+		Resources: []ResourceRow{
+			{NodeName: "NODE-A", ResourceName: "PVC-LIVE", UUID: "r-live"},
+			// The only replica of PVC-EMPTY is on its way out.
+			{NodeName: "NODE-A", ResourceName: "PVC-EMPTY",
+				ResourceFlags: 2, UUID: "r-empty"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	latched := map[string]bool{}
+	for i := range res.ResourceDefinitions {
+		rd := &res.ResourceDefinitions[i]
+		latched[rd.Name] = rd.Spec.Initialized != nil && *rd.Spec.Initialized
+	}
+
+	if !latched["pvc-live"] {
+		t.Error("pvc-live has an adopted replica: Initialized must stay latched")
+	}
+
+	if latched["pvc-empty"] {
+		t.Error("pvc-empty has no adopted replica: Initialized must not be latched, " +
+			"or no replica can ever seed the first sync")
+	}
+}
