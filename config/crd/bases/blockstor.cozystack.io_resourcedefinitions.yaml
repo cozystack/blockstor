@@ -405,7 +405,20 @@ spec:
                         type: string
                       type: object
                     sizeKib:
+                      description: |-
+                        sizeKib is the volume size. The bounds are enforced HERE, by the
+                        API server, rather than in whichever client happens to be writing:
+                        the CLI talks to these CRDs directly, so a check that lives in one
+                        client is not a check the data is subject to.
+
+                        The floor is DRBD's own per-device minimum once metadata is
+                        reserved. Below it the satellite does not fail — it loops on
+                        `drbdadm create-md` forever, which is why zero is the one value
+                        that must never reach it, and why an overflowing size parse that
+                        lands on zero has to be refused before it is stored.
                       format: int64
+                      maximum: 17179869184
+                      minimum: 4096
                       type: integer
                     volumeNumber:
                       format: int32

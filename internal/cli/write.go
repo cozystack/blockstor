@@ -45,7 +45,16 @@ type propertyAccessor struct {
 	// or definition, 0 for the controller).
 	args int
 	get  func(context.Context, store.Store, []string) (map[string]string, error)
-	set  func(context.Context, store.Store, []string, map[string]string) error
+	// edit applies `change` to the object's own property map inside
+	// the store's fetch → mutate → patch retry loop.
+	//
+	// It replaced a `set(whole map)` shape, which read the bag, edited
+	// it locally and wrote the result back wholesale: a key another
+	// writer added in between was reverted, silently and with no
+	// error. That is not hypothetical — the satellite and the
+	// migration reconciler both stamp per-replica properties, and a
+	// `resource set-property` racing one of them undid its work.
+	edit func(ctx context.Context, st store.Store, ident []string, change func(map[string]string) error) error
 }
 
 // setProperty implements `<noun> set-property`.
@@ -70,22 +79,15 @@ func setProperty(accessor propertyAccessor) handler {
 			value = run.Flags.Positionals[want]
 		}
 
-		props, err := accessor.get(ctx, run.Store, ident)
-		if err != nil {
-			return err
-		}
+		return accessor.edit(ctx, run.Store, ident, func(props map[string]string) error {
+			if value == "" {
+				delete(props, key)
+			} else {
+				props[key] = value
+			}
 
-		if props == nil {
-			props = map[string]string{}
-		}
-
-		if value == "" {
-			delete(props, key)
-		} else {
-			props[key] = value
-		}
-
-		return accessor.set(ctx, run.Store, ident, props)
+			return nil
+		})
 	}
 }
 
@@ -139,7 +141,7 @@ func objectProps[T any](
 	args int,
 	get func(context.Context, store.Store, []string) (T, error),
 	bag func(*T) *map[string]string,
-	update func(context.Context, store.Store, *T) error,
+	patch func(ctx context.Context, st store.Store, ident []string, mutate func(*T) error) error,
 ) propertyAccessor {
 	return propertyAccessor{
 		args: args,
@@ -151,15 +153,15 @@ func objectProps[T any](
 
 			return maps.Clone(*bag(&obj)), nil
 		},
-		set: func(ctx context.Context, st store.Store, ident []string, props map[string]string) error {
-			obj, err := get(ctx, st, ident)
-			if err != nil {
-				return fmt.Errorf("get %s %s: %w", kind, strings.Join(ident, "/"), err)
-			}
+		edit: func(ctx context.Context, st store.Store, ident []string, change func(map[string]string) error) error {
+			err := patch(ctx, st, ident, func(obj *T) error {
+				props := bag(obj)
+				if *props == nil {
+					*props = map[string]string{}
+				}
 
-			*bag(&obj) = props
-
-			err = update(ctx, st, &obj)
+				return change(*props)
+			})
 			if err != nil {
 				return fmt.Errorf("update %s %s: %w", kind, strings.Join(ident, "/"), err)
 			}
@@ -171,27 +173,27 @@ func objectProps[T any](
 
 // rdProps accesses a resource definition's property bag.
 //
-//nolint:gochecknoglobals // static accessor table
+//nolint:gochecknoglobals,dupl // static accessor table; the parallel shape is the point
 var rdProps = objectProps("resource definition", 1,
 	func(ctx context.Context, st store.Store, ident []string) (apiv1.ResourceDefinition, error) {
 		return st.ResourceDefinitions().Get(ctx, ident[0])
 	},
 	func(def *apiv1.ResourceDefinition) *map[string]string { return &def.Props },
-	func(ctx context.Context, st store.Store, def *apiv1.ResourceDefinition) error {
-		return st.ResourceDefinitions().Update(ctx, def)
+	func(ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.ResourceDefinition) error) error {
+		return st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, ident[0], mutate)
 	},
 )
 
 // nodeProps accesses a node's property bag.
 //
-//nolint:gochecknoglobals // static accessor table
+//nolint:gochecknoglobals,dupl // static accessor table; the parallel shape is the point
 var nodeProps = objectProps("node", 1,
 	func(ctx context.Context, st store.Store, ident []string) (apiv1.Node, error) {
 		return st.Nodes().Get(ctx, ident[0])
 	},
 	func(node *apiv1.Node) *map[string]string { return &node.Props },
-	func(ctx context.Context, st store.Store, node *apiv1.Node) error {
-		return st.Nodes().Update(ctx, node)
+	func(ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.Node) error) error {
+		return st.Nodes().PatchNodeSpec(ctx, ident[0], mutate)
 	},
 )
 
@@ -208,8 +210,8 @@ var controllerProps = propertyAccessor{
 
 		return props, nil
 	},
-	set: func(ctx context.Context, st store.Store, _ []string, props map[string]string) error {
-		err := st.ControllerProps().Set(ctx, props)
+	edit: func(ctx context.Context, st store.Store, _ []string, change func(map[string]string) error) error {
+		err := st.ControllerProps().PatchProps(ctx, change)
 		if err != nil {
 			return fmt.Errorf("set controller properties: %w", err)
 		}

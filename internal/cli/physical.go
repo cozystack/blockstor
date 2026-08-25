@@ -163,9 +163,17 @@ func stampDevices(
 			}
 
 			found = true
-			known[i].AttachTo = attach
 
-			err = run.Store.PhysicalDevices().Update(ctx, &known[i])
+			// The device list was read once, up front. Writing the
+			// whole spec back from that snapshot reverts whatever
+			// else changed on the device since; patch only the field
+			// this command is about.
+			err = run.Store.PhysicalDevices().PatchPhysicalDeviceSpec(ctx, known[i].Name,
+				func(dev *apiv1.PhysicalDevice) error {
+					dev.AttachTo = attach
+
+					return nil
+				})
 			if err != nil {
 				return fmt.Errorf("attach %s on %s: %w", wanted, node, err)
 			}

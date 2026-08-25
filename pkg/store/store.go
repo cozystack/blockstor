@@ -314,6 +314,14 @@ type PhysicalDeviceStore interface {
 	Create(ctx context.Context, dev *apiv1.PhysicalDevice) error
 	Update(ctx context.Context, dev *apiv1.PhysicalDevice) error
 	Delete(ctx context.Context, name string) error
+
+	// PatchPhysicalDeviceSpec runs `mutate` against the freshly-fetched
+	// device and persists the result, re-running it against re-fetched
+	// state on conflict. `Update` replaces the spec from a wire
+	// snapshot the caller read earlier, so a field another writer
+	// changed in between is reverted; the attach CAS guard catches only
+	// the attach half of that.
+	PatchPhysicalDeviceSpec(ctx context.Context, name string, mutate func(*apiv1.PhysicalDevice) error) error
 }
 
 // ControllerPropsStore persists the singleton controller-scope props
@@ -328,11 +336,22 @@ type ControllerPropsStore interface {
 	// returned when no value has been written yet, so callers can do
 	// `props[key]` lookups without nil-checks.
 	Get(ctx context.Context) (map[string]string, error)
-	// Set replaces the entire props map atomically. Callers that want
-	// merge semantics must Get → mutate → Set; the store does no
-	// per-key merging on the assumption that the operator-visible
-	// patch surface (REST) is the right place for partial updates.
+	// Set replaces the entire props map atomically. It is the right
+	// call only when the caller genuinely owns every key — a restore
+	// from backup, say. For editing one key use PatchProps: a
+	// Get → mutate → Set round trip reverts whatever a concurrent
+	// writer added in between, with no error to notice it by.
 	Set(ctx context.Context, props map[string]string) error
+
+	// PatchProps runs `mutate` against the freshly-fetched props map
+	// and persists the mutated map, re-running `mutate` against
+	// re-fetched state on conflict. Disjoint concurrent edits
+	// converge, which the Get → mutate → Set shape cannot do.
+	//
+	// This exists because REST is no longer the only operator-visible
+	// write surface: the CLI talks to the CRDs directly, so per-key
+	// merging has to live in the store where every writer shares it.
+	PatchProps(ctx context.Context, mutate func(map[string]string) error) error
 }
 
 // StoragePoolDefinition is the controller-scope row that registers a

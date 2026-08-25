@@ -63,8 +63,8 @@ var resourceProps = objectProps("resource", 2, // (node, definition)
 		return st.Resources().Get(ctx, ident[1], ident[0])
 	},
 	func(res *apiv1.Resource) *map[string]string { return &res.Props },
-	func(ctx context.Context, st store.Store, res *apiv1.Resource) error {
-		return st.Resources().Update(ctx, res)
+	func(ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.Resource) error) error {
+		return st.Resources().PatchResourceSpec(ctx, ident[1], ident[0], mutate)
 	},
 )
 
@@ -77,21 +77,21 @@ var storagePoolProps = objectProps("storage pool", 2, // (node, pool)
 		return st.StoragePools().Get(ctx, ident[0], ident[1])
 	},
 	func(pool *apiv1.StoragePool) *map[string]string { return &pool.Props },
-	func(ctx context.Context, st store.Store, pool *apiv1.StoragePool) error {
-		return st.StoragePools().Update(ctx, pool)
+	func(ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.StoragePool) error) error {
+		return st.StoragePools().PatchStoragePoolSpec(ctx, ident[0], ident[1], mutate)
 	},
 )
 
 // resourceGroupProps accesses a group's property bag.
 //
-//nolint:gochecknoglobals // static accessor table
+//nolint:gochecknoglobals,dupl // static accessor table; the parallel shape is the point
 var resourceGroupProps = objectProps("resource group", 1,
 	func(ctx context.Context, st store.Store, ident []string) (apiv1.ResourceGroup, error) {
 		return st.ResourceGroups().Get(ctx, ident[0])
 	},
 	func(group *apiv1.ResourceGroup) *map[string]string { return &group.Props },
-	func(ctx context.Context, st store.Store, group *apiv1.ResourceGroup) error {
-		return st.ResourceGroups().Update(ctx, group)
+	func(ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.ResourceGroup) error) error {
+		return st.ResourceGroups().PatchResourceGroup(ctx, ident[0], mutate)
 	},
 )
 
@@ -109,15 +109,20 @@ var volumeDefinitionProps = propertyAccessor{
 
 		return maps.Clone(vd.Props), nil
 	},
-	set: func(ctx context.Context, st store.Store, ident []string, props map[string]string) error {
-		vd, err := getVolumeDefinition(ctx, st, ident)
+	edit: func(ctx context.Context, st store.Store, ident []string, change func(map[string]string) error) error {
+		number, err := parseInt32(ident[1], "volume number")
 		if err != nil {
 			return err
 		}
 
-		vd.Props = props
+		err = st.VolumeDefinitions().PatchVolumeDefinitionSpec(ctx, ident[0], number,
+			func(vd *apiv1.VolumeDefinition) error {
+				if vd.Props == nil {
+					vd.Props = map[string]string{}
+				}
 
-		err = st.VolumeDefinitions().Update(ctx, ident[0], &vd)
+				return change(vd.Props)
+			})
 		if err != nil {
 			return fmt.Errorf("update volume definition %s/%s: %w", ident[0], ident[1], err)
 		}
@@ -160,15 +165,32 @@ var volumeGroupProps = propertyAccessor{
 
 		return maps.Clone(group.VolumeGroups[index].Props), nil
 	},
-	set: func(ctx context.Context, st store.Store, ident []string, props map[string]string) error {
-		group, index, err := findVolumeGroup(ctx, st, ident)
+	edit: func(ctx context.Context, st store.Store, ident []string, change func(map[string]string) error) error {
+		number, err := parseInt32(ident[1], "volume number")
 		if err != nil {
 			return err
 		}
 
-		group.VolumeGroups[index].Props = props
+		// The index lookup lives INSIDE the patch: the templates are a
+		// slice, so a concurrent `volume-group create` shifts them and
+		// an index resolved beforehand would edit the wrong template.
+		err = st.ResourceGroups().PatchResourceGroup(ctx, ident[0],
+			func(group *apiv1.ResourceGroup) error {
+				for i := range group.VolumeGroups {
+					if group.VolumeGroups[i].VolumeNumber != number {
+						continue
+					}
 
-		err = st.ResourceGroups().Update(ctx, &group)
+					if group.VolumeGroups[i].Props == nil {
+						group.VolumeGroups[i].Props = map[string]string{}
+					}
+
+					return change(group.VolumeGroups[i].Props)
+				}
+
+				return fmt.Errorf("resource group %s has no volume group %d: %w",
+					ident[0], number, store.ErrNotFound)
+			})
 		if err != nil {
 			return fmt.Errorf("update volume group %s/%s: %w", ident[0], ident[1], err)
 		}

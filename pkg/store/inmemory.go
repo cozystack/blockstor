@@ -252,6 +252,30 @@ func (s *inMemoryControllerProps) Set(_ context.Context, props map[string]string
 	return nil
 }
 
+// PatchProps applies `mutate` to the live map under the write lock, so
+// the read the mutation is based on and the write it produces cannot be
+// separated by another writer.
+func (s *inMemoryControllerProps) PatchProps(_ context.Context, mutate func(map[string]string) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	next := make(map[string]string, len(s.props))
+	maps.Copy(next, s.props)
+
+	err := mutate(next)
+	if err != nil {
+		return errors.Wrap(err, "patch controller props")
+	}
+
+	s.props = next
+
+	return nil
+}
+
 type inMemoryNodes struct {
 	mu sync.RWMutex
 	m  map[string]apiv1.Node

@@ -46,13 +46,28 @@ func resourceDefinitionModify(ctx context.Context, run *runContext) error {
 
 	name := run.Flags.Positionals[0]
 
-	def, err := run.Store.ResourceDefinitions().Get(ctx, name)
-	if err != nil {
-		return fmt.Errorf("get resource definition %s: %w", name, err)
-	}
-
 	changed := false
 
+	err := run.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, name,
+		func(def *apiv1.ResourceDefinition) error {
+			return modifyDefinition(ctx, run, def, &changed)
+		})
+	if err != nil {
+		return fmt.Errorf("update resource definition %s: %w", name, err)
+	}
+
+	if !changed {
+		return fmt.Errorf("%w: modify needs something to change", command.ErrUsage)
+	}
+
+	return nil
+}
+
+// modifyDefinition applies the named edits to current state. It runs
+// inside the store's patch retry, so the resource-group lookup and the
+// re-parent it authorises cannot be separated by a concurrent delete of
+// that group.
+func modifyDefinition(ctx context.Context, run *runContext, def *apiv1.ResourceDefinition, changed *bool) error {
 	if group := run.Flags.Values["resource-group"]; group != "" {
 		// The group drives placement: how many replicas a spawn makes,
 		// which pools they may land on, the layer stack they inherit.
@@ -61,27 +76,18 @@ func resourceDefinitionModify(ctx context.Context, run *runContext) error {
 		// materialised definition as self-sufficient — so a typo here
 		// would silently leave the definition pointing at nothing and
 		// only surface much later, when someone spawns from it.
-		_, err = run.Store.ResourceGroups().Get(ctx, group)
+		_, err := run.Store.ResourceGroups().Get(ctx, group)
 		if err != nil {
 			return fmt.Errorf("get resource group %s: %w", group, err)
 		}
 
 		def.ResourceGroupName = group
-		changed = true
+		*changed = true
 	}
 
 	if layers := run.Flags.Values["layer-list"]; layers != "" {
 		def.LayerStack = splitList(layers)
-		changed = true
-	}
-
-	if !changed {
-		return fmt.Errorf("%w: modify needs something to change", command.ErrUsage)
-	}
-
-	err = run.Store.ResourceDefinitions().Update(ctx, &def)
-	if err != nil {
-		return fmt.Errorf("update resource definition %s: %w", name, err)
+		*changed = true
 	}
 
 	return nil

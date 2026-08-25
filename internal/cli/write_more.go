@@ -268,19 +268,26 @@ func volumeDefinitionSetSize(ctx context.Context, run *runContext) error {
 		return err
 	}
 
-	vd, err := run.Store.VolumeDefinitions().Get(ctx, rdName, number)
-	if err != nil {
-		return fmt.Errorf("get volume definition %s/%d: %w", rdName, number, err)
-	}
+	// The shrink comparison has to run against the state the write
+	// lands on. Reading the size, deciding, and then writing an
+	// absolute value leaves a window: a concurrent grow (the CSI
+	// resizing a live volume) lands in between, the decision was made
+	// against the smaller pre-grow size, and the absolute write
+	// truncates a volume that is now larger and in use. Deciding
+	// inside the patch closes it — on a conflict the store re-runs
+	// this closure against freshly fetched state, so the check and the
+	// write always see the same size.
+	err = run.Store.VolumeDefinitions().PatchVolumeDefinitionSpec(ctx, rdName, number,
+		func(vd *apiv1.VolumeDefinition) error {
+			resizeErr := checkResize(vd, sizeKib, run.Flags.Force)
+			if resizeErr != nil {
+				return resizeErr
+			}
 
-	err = checkResize(&vd, sizeKib, run.Flags.Force)
-	if err != nil {
-		return err
-	}
+			vd.SizeKib = sizeKib
 
-	vd.SizeKib = sizeKib
-
-	err = run.Store.VolumeDefinitions().Update(ctx, rdName, &vd)
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("resize volume definition %s/%d: %w", rdName, number, err)
 	}
@@ -489,17 +496,14 @@ func resourceGroupModify(ctx context.Context, run *runContext) error {
 
 	name := run.Flags.Positionals[0]
 
-	group, err := run.Store.ResourceGroups().Get(ctx, name)
-	if err != nil {
-		return fmt.Errorf("get resource group %s: %w", name, err)
-	}
-
-	err = applyGroupPolicy(&group, run.Flags)
-	if err != nil {
-		return err
-	}
-
-	err = run.Store.ResourceGroups().Update(ctx, &group)
+	// The policy edit is partial — it touches only the fields the
+	// flags name — so it has to be applied to current state, not to a
+	// snapshot. Otherwise a concurrent `volume-group create` on the
+	// same group is reverted by this write.
+	err := run.Store.ResourceGroups().PatchResourceGroup(ctx, name,
+		func(group *apiv1.ResourceGroup) error {
+			return applyGroupPolicy(group, run.Flags)
+		})
 	if err != nil {
 		return fmt.Errorf("update resource group %s: %w", name, err)
 	}

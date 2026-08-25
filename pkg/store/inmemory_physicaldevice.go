@@ -122,6 +122,34 @@ func (s *inMemoryPhysicalDevices) Update(_ context.Context, dev *apiv1.PhysicalD
 	return nil
 }
 
+// PatchPhysicalDeviceSpec mutates the stored device under the write
+// lock, so the read it is based on and the write it produces cannot be
+// separated by another writer.
+func (s *inMemoryPhysicalDevices) PatchPhysicalDeviceSpec(
+	_ context.Context, name string, mutate func(*apiv1.PhysicalDevice) error,
+) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dev, ok := s.m[name]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "physical device %q", name)
+	}
+
+	err := mutate(&dev)
+	if err != nil {
+		return errors.Wrapf(err, "patch physical device %q", name)
+	}
+
+	s.m[name] = dev
+
+	return nil
+}
+
 func (s *inMemoryPhysicalDevices) Delete(_ context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -209,14 +209,15 @@ func resourcesInUseOn(ctx context.Context, run *runContext, name string) ([]stri
 
 // patchNodeFlags adds or removes one flag on a node.
 func patchNodeFlags(ctx context.Context, run *runContext, name, flag string, want bool) error {
-	node, err := run.Store.Nodes().Get(ctx, name)
-	if err != nil {
-		return fmt.Errorf("get node %s: %w", name, err)
-	}
+	// Flags is a set held as a slice, so the read and the write have
+	// to be one operation. The evacuate loop stamps EVICTED on the
+	// same node this may be clearing DELETE from; whichever wrote
+	// second used to win outright, discarding the other's flag.
+	err := run.Store.Nodes().PatchNodeSpec(ctx, name, func(node *apiv1.Node) error {
+		node.Flags = setFlag(node.Flags, flag, want)
 
-	node.Flags = setFlag(node.Flags, flag, want)
-
-	err = run.Store.Nodes().Update(ctx, &node)
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("update node %s: %w", name, err)
 	}

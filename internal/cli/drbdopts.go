@@ -48,25 +48,18 @@ func drbdOptions(accessor propertyAccessor) handler {
 
 		ident := run.Flags.Positionals[:accessor.args]
 
-		props, err := accessor.get(ctx, run.Store, ident)
-		if err != nil {
-			return err
-		}
+		return accessor.edit(ctx, run.Store, ident, func(props map[string]string) error {
+			changed, applyErr := applyDRBDFlags(run.Flags, props)
+			if applyErr != nil {
+				return applyErr
+			}
 
-		if props == nil {
-			props = map[string]string{}
-		}
+			if !changed {
+				return fmt.Errorf("%w: drbd-options needs at least one --<option>", command.ErrUsage)
+			}
 
-		changed, err := applyDRBDFlags(run.Flags, props)
-		if err != nil {
-			return err
-		}
-
-		if !changed {
-			return fmt.Errorf("%w: drbd-options needs at least one --<option>", command.ErrUsage)
-		}
-
-		return accessor.set(ctx, run.Store, ident, props)
+			return nil
+		})
 	}
 }
 

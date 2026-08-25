@@ -174,21 +174,27 @@ func volumeGroupCreate(ctx context.Context, run *runContext) error {
 
 	name := run.Flags.Positionals[0]
 
-	group, err := run.Store.ResourceGroups().Get(ctx, name)
-	if err != nil {
-		return fmt.Errorf("get resource group %s: %w", name, err)
-	}
+	// Picking the next free number and appending have to happen
+	// together. Read the group, compute "the next number is 1", and
+	// write, and a second create doing the same against the same
+	// snapshot produces two templates numbered 1 — or loses one of
+	// them, depending on which write lands last.
+	var number int32
 
-	number, err := volumeGroupNumber(run, &group)
-	if err != nil {
-		return err
-	}
+	err := run.Store.ResourceGroups().PatchResourceGroup(ctx, name,
+		func(group *apiv1.ResourceGroup) error {
+			picked, pickErr := volumeGroupNumber(run, group)
+			if pickErr != nil {
+				return pickErr
+			}
 
-	group.VolumeGroups = append(group.VolumeGroups, apiv1.VolumeGroup{VolumeNumber: number})
+			number = picked
+			group.VolumeGroups = append(group.VolumeGroups, apiv1.VolumeGroup{VolumeNumber: number})
 
-	err = run.Store.ResourceGroups().Update(ctx, &group)
+			return nil
+		})
 	if err != nil {
-		return fmt.Errorf("create volume group %s/%d: %w", name, number, err)
+		return fmt.Errorf("create volume group %s: %w", name, err)
 	}
 
 	return nil

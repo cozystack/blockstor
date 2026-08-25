@@ -138,7 +138,21 @@ type ResourceDefinitionSpec struct {
 // ResourceDefinitionVolume is one volume slot inside an RD.
 type ResourceDefinitionVolume struct {
 	VolumeNumber int32 `json:"volumeNumber"`
-	SizeKib      int64 `json:"sizeKib"`
+
+	// sizeKib is the volume size. The bounds are enforced HERE, by the
+	// API server, rather than in whichever client happens to be writing:
+	// the CLI talks to these CRDs directly, so a check that lives in one
+	// client is not a check the data is subject to.
+	//
+	// The floor is DRBD's own per-device minimum once metadata is
+	// reserved. Below it the satellite does not fail — it loops on
+	// `drbdadm create-md` forever, which is why zero is the one value
+	// that must never reach it, and why an overflowing size parse that
+	// lands on zero has to be refused before it is stored.
+	//
+	// +kubebuilder:validation:Minimum=4096
+	// +kubebuilder:validation:Maximum=17179869184
+	SizeKib int64 `json:"sizeKib"`
 	// +optional
 	Props map[string]string `json:"props,omitempty"`
 	// +optional
