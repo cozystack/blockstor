@@ -825,8 +825,12 @@ func TestInitializedLatchNeedsAnAdoptedReplica(t *testing.T) {
 			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
 		},
 		ResourceDefinitions: []ResourceDefinitionRow{
-			{ResourceName: "PVC-LIVE", ResourceDspName: "pvc-live", LayerStack: "DRBD,STORAGE", UUID: "rd-live"},
-			{ResourceName: "PVC-EMPTY", ResourceDspName: "pvc-empty", LayerStack: "DRBD,STORAGE", UUID: "rd-empty"},
+			{ResourceName: "PVC-LIVE", ResourceDspName: "pvc-live", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-live"},
+			{ResourceName: "PVC-EMPTY", ResourceDspName: "pvc-empty", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-empty"},
+		},
+		VolumeDefinitions: []VolumeDefinitionRow{
+			{ResourceName: "PVC-LIVE", VlmNr: 0, VlmSize: 1048576, UUID: "vd-live"},
+			{ResourceName: "PVC-EMPTY", VlmNr: 0, VlmSize: 1048576, UUID: "vd-empty"},
 		},
 		Resources: []ResourceRow{
 			{NodeName: "NODE-A", ResourceName: "PVC-LIVE", UUID: "r-live"},
@@ -910,5 +914,69 @@ func TestSparseZfsPoolMigratesAsThin(t *testing.T) {
 
 	if !hasWarning(res, "declared ZFS") {
 		t.Errorf("sparse-pool remap was not reported; warnings: %v", res.Warnings)
+	}
+}
+
+// TestVolumelessDefinitionIsSkipped: a resource definition that owns no
+// volume cannot become a usable volume — no size, no DRBD minor. Migrate
+// one anyway and the controller still places replicas for it from the
+// resource group's placeCount, allocates a port, and the satellite then
+// spins forever on "waiting for controller-side DRBD-ID allocation":
+// no .res file, no backing device, a hot reconcile loop, and replicas the
+// CLI can only report as Unknown.
+//
+// A production dump carried exactly one such definition, with zero
+// volumes and its only replica already flagged DELETE.
+func TestVolumelessDefinitionIsSkipped(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		ResourceDefinitions: []ResourceDefinitionRow{
+			{ResourceName: "PVC-REAL", ResourceDspName: "pvc-real", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-real"},
+			{ResourceName: "PVC-NOVOL", ResourceDspName: "pvc-novol", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-novol"},
+		},
+		VolumeDefinitions: []VolumeDefinitionRow{
+			{ResourceName: "PVC-REAL", VlmNr: 0, VlmSize: 1048576, UUID: "vd-real"},
+		},
+		Resources: []ResourceRow{
+			{NodeName: "NODE-A", ResourceName: "PVC-REAL", UUID: "r-real"},
+			{NodeName: "NODE-A", ResourceName: "PVC-NOVOL", UUID: "r-novol"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	for i := range res.ResourceDefinitions {
+		if res.ResourceDefinitions[i].Name == "pvc-novol" {
+			t.Error("volume-less definition pvc-novol must not convert")
+		}
+	}
+
+	// Its replicas must go with it, or they dangle against an object
+	// that was never applied.
+	for i := range res.Resources {
+		if res.Resources[i].Spec.ResourceDefinitionName == "pvc-novol" {
+			t.Errorf("replica %s outlived its skipped definition", res.Resources[i].Name)
+		}
+	}
+
+	var kept bool
+
+	for i := range res.ResourceDefinitions {
+		if res.ResourceDefinitions[i].Name == "pvc-real" {
+			kept = true
+		}
+	}
+
+	if !kept {
+		t.Error("pvc-real owns a volume and must still convert")
+	}
+
+	if !hasWarning(res, "pvc-novol: no volume definitions") {
+		t.Errorf("volume-less skip was not reported; warnings: %v", res.Warnings)
 	}
 }

@@ -589,14 +589,8 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 
 		dsp := displayName(row.ResourceDspName, row.ResourceName)
 
-		if row.ResourceFlags&resourceFlagDelete != 0 {
-			c.warnf("resource definition %s: marked DELETE in the source cluster — skipped", dsp)
-
+		if !c.rdConvertible(row, dsp) {
 			continue
-		}
-
-		if row.ResourceFlags != 0 {
-			c.warnf("resource definition %s: unhandled flags bitmask %d dropped", dsp, row.ResourceFlags)
 		}
 
 		// Referential integrity: an RD may name a resource group that was
@@ -657,6 +651,65 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 
 // attachRDLayerFields fills the DRBD (port, shared-secret), volume and
 // LUKS-report bits onto a converted ResourceDefinition.
+// rdConvertible reports whether this resource definition should convert
+// at all, and says why whenever it should not. Both rejections are
+// terminal for the definition and for every replica of it, since
+// convertResources drops replicas whose parent did not convert.
+func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
+	if row.ResourceFlags&resourceFlagDelete != 0 {
+		c.warnf("resource definition %s: marked DELETE in the source cluster — skipped", dsp)
+
+		return false
+	}
+
+	if row.ResourceFlags != 0 {
+		c.warnf("resource definition %s: unhandled flags bitmask %d dropped", dsp, row.ResourceFlags)
+	}
+
+	if !c.rdHasVolumeDefinitions(row.ResourceName) {
+		c.warnf("resource definition %s: no volume definitions — skipped; there is no volume to adopt, and migrating it leaves the controller placing replicas the satellite can never bring up", dsp)
+
+		return false
+	}
+
+	return true
+}
+
+// rdHasVolumeDefinitions reports whether this resource definition owns a
+// volume that will convert.
+//
+// A definition with no volumes cannot become a usable volume: there is
+// no size, and no DRBD minor to allocate. Migrating one still gives the
+// controller something to place replicas for, so it allocates a port and
+// three Resources, and the satellite then spins forever on "waiting for
+// controller-side DRBD-ID allocation" — no .res file, no backing device,
+// and a hot reconcile loop. The CLI shows the replicas as `Unknown`
+// because there is no kernel state to report.
+//
+// LINSTOR leaves such definitions behind: a production dump carried one
+// with zero volumes whose only replica was already flagged DELETE. Skip
+// it and say so. An operator who genuinely wanted an empty definition
+// can recreate it in one command; a wedged reconcile loop is the worse
+// outcome. Deliberately checked silently: volumeDefinitionsFor reports
+// each DELETE'd volume itself, and calling it here would double up.
+func (c *converter) rdHasVolumeDefinitions(rdName string) bool {
+	for i := range c.dump.VolumeDefinitions {
+		vd := &c.dump.VolumeDefinitions[i]
+
+		if vd.ResourceName != rdName || vd.SnapshotName != "" {
+			continue
+		}
+
+		if vd.VlmFlags&resourceFlagDelete != 0 {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
 // rdHasAdoptedReplica reports whether any replica of this resource
 // definition survives conversion. It mirrors convertResources' own skip
 // rules for the two cases that can empty a definition out — a replica
