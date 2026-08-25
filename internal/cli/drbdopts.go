@@ -48,17 +48,25 @@ func drbdOptions(accessor propertyAccessor) handler {
 
 		ident := run.Flags.Positionals[:accessor.args]
 
+		// Whether the command names a knob at all, and whether it
+		// contradicts itself, is a property of the command line rather
+		// than of the object: applyDRBDFlags reports `changed` from the
+		// flags alone. Deciding it here, against a scratch bag, keeps a
+		// usage error a usage error — raised from inside the patch it
+		// would come back wrapped in two layers of store context.
+		changed, err := applyDRBDFlags(run.Flags, map[string]string{})
+		if err != nil {
+			return err
+		}
+
+		if !changed {
+			return fmt.Errorf("%w: drbd-options needs at least one --<option>", command.ErrUsage)
+		}
+
 		return accessor.edit(ctx, run.Store, ident, func(props map[string]string) error {
-			changed, applyErr := applyDRBDFlags(run.Flags, props)
-			if applyErr != nil {
-				return applyErr
-			}
+			_, applyErr := applyDRBDFlags(run.Flags, props)
 
-			if !changed {
-				return fmt.Errorf("%w: drbd-options needs at least one --<option>", command.ErrUsage)
-			}
-
-			return nil
+			return applyErr
 		})
 	}
 }
