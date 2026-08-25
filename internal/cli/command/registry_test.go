@@ -57,6 +57,8 @@ func TestResolveAliases(t *testing.T) {
 		{[]string{"rd", "c"}, "resource-definition", "create"},
 		{[]string{"rd", "d"}, "resource-definition", "delete"},
 		{[]string{"rd", "ap"}, "resource-definition", "auto-place"},
+		{[]string{"rd", "m"}, "resource-definition", "modify"},
+		{[]string{"rg", "m"}, "resource-group", "modify"},
 		{[]string{"vd", "s"}, "volume-definition", "set-size"},
 		{[]string{"vd", "c"}, "volume-definition", "create"},
 		{[]string{"r", "td"}, "resource", "toggle-disk"},

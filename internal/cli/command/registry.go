@@ -88,6 +88,7 @@ const (
 	aliasList      = "l"
 	aliasCreate    = "c"
 	aliasDelete    = "d"
+	aliasModify    = "m"
 	aliasSetProp   = "sp"
 	aliasListProps = "lp"
 	aliasDelProp   = "dp"
@@ -143,7 +144,7 @@ var registry = []Noun{
 			{Name: verbCreate, Aliases: []string{aliasCreate}},
 			{Name: verbDelete, Aliases: []string{aliasDelete}},
 			{Name: "clone"},
-			{Name: verbModify},
+			{Name: verbModify, Aliases: []string{aliasModify}},
 			{Name: "auto-place", Aliases: []string{"ap"}},
 			{Name: verbDRBDOptions},
 			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
@@ -204,7 +205,7 @@ var registry = []Noun{
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
 			{Name: verbCreate, Aliases: []string{aliasCreate}},
-			{Name: verbModify},
+			{Name: verbModify, Aliases: []string{aliasModify}},
 			{Name: verbDelete, Aliases: []string{aliasDelete}},
 			// `sp` is deliberately NOT an alias for spawn-resources: it
 			// is set-property on every other noun, and silently meaning

@@ -33,6 +33,10 @@ func TestResourceDefinitionModifyTouchesOnlyWhatWasNamed(t *testing.T) {
 	t.Parallel()
 
 	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		// Both groups have to exist: re-parenting onto a group that
+		// does not is refused, which TestResourceDefinitionModifyRejectsUnknownGroup covers.
+		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "old"})
+		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "new"})
 		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
 			Name: "pvc-x", ResourceGroupName: "old", LayerStack: []string{"DRBD", "STORAGE"},
 		})
@@ -254,5 +258,37 @@ func TestPhysicalStorageList(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("device listing is missing %q:\n%s", want, out.String())
 		}
+	}
+}
+
+// TestResourceDefinitionModifyRejectsUnknownGroup: re-parenting onto a
+// group that does not exist must fail, and must leave the definition
+// alone.
+//
+// Nothing downstream catches it. The controller treats an already
+// materialised definition as self-sufficient, so a typo'd group is
+// accepted, stored, and only surfaces later — when a spawn from that
+// definition finds no placement policy to work from.
+func TestResourceDefinitionModifyRejectsUnknownGroup(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "old"})
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name: "pvc-x", ResourceGroupName: "old", LayerStack: []string{"DRBD", "STORAGE"},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"rd", "modify", "pvc-x", "--resource-group", "nope"}); got == 0 {
+		t.Fatal("modify onto an unknown group exited 0, want a failure")
+	}
+
+	def, err := appStore(t, app).ResourceDefinitions().Get(t.Context(), "pvc-x")
+	if err != nil {
+		t.Fatalf("get definition: %v", err)
+	}
+
+	if def.ResourceGroupName != "old" {
+		t.Errorf("resource group = %q, want it left at old", def.ResourceGroupName)
 	}
 }

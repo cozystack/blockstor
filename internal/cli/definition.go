@@ -54,6 +54,18 @@ func resourceDefinitionModify(ctx context.Context, run *runContext) error {
 	changed := false
 
 	if group := run.Flags.Values["resource-group"]; group != "" {
+		// The group drives placement: how many replicas a spawn makes,
+		// which pools they may land on, the layer stack they inherit.
+		// Nothing downstream rejects a definition that names a group
+		// which does not exist — the controller treats an already
+		// materialised definition as self-sufficient — so a typo here
+		// would silently leave the definition pointing at nothing and
+		// only surface much later, when someone spawns from it.
+		_, err = run.Store.ResourceGroups().Get(ctx, group)
+		if err != nil {
+			return fmt.Errorf("get resource group %s: %w", group, err)
+		}
+
 		def.ResourceGroupName = group
 		changed = true
 	}
