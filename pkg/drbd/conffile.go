@@ -250,6 +250,11 @@ func Build(r Resource) (string, error) {
 	return b.String(), nil
 }
 
+// sharedSecretOption is the drbd net option carrying the peer
+// authentication secret. Unlike every other net option, its value is a
+// quoted string.
+const sharedSecretOption = "shared-secret"
+
 // writeNet emits the `net { … }` block when there is anything to emit
 // (a shared secret or any free-form option). drbd treats an empty `net
 // {}` as legal but noisy, so we skip it entirely when unused.
@@ -261,10 +266,25 @@ func writeNet(b *strings.Builder, n Net) {
 	b.WriteString("  net {\n")
 
 	if n.SharedSecret != "" {
-		fmt.Fprintf(b, "    shared-secret %q;\n", n.SharedSecret)
+		fmt.Fprintf(b, "    %s %q;\n", sharedSecretOption, n.SharedSecret)
 	}
 
 	for _, k := range sortedKeys(n.Options) {
+		// shared-secret is the one net option drbd's grammar spells as
+		// a quoted string; every other value is a bare keyword or a
+		// number and must stay verbatim. LINSTOR generates the secret
+		// in base64, so it routinely carries '+', '/' or '=', which
+		// drbdadm rejects unquoted. The typed field above wins when a
+		// resource carries the secret both ways, so drbdadm never sees
+		// the key twice.
+		if k == sharedSecretOption {
+			if n.SharedSecret == "" {
+				fmt.Fprintf(b, "    %s %q;\n", k, n.Options[k])
+			}
+
+			continue
+		}
+
 		fmt.Fprintf(b, "    %s %s;\n", k, n.Options[k])
 	}
 

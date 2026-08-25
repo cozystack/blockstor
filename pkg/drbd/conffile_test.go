@@ -518,3 +518,48 @@ func TestBuildDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildQuotesSharedSecretFromNetOptions: a shared secret arriving as
+// the plain `DrbdOptions/Net/shared-secret` property must be quoted just
+// like the typed SharedSecret field. That property is the only form
+// LINSTOR knows, so it is what linstor-migrate carries over, and it is
+// also what our own drbd-passphrase endpoint writes. LINSTOR generates
+// base64 secrets, so the value routinely contains '+', '/' or '=', and
+// drbdadm's parser rejects those unquoted:
+//
+//	drbd.d/pvc-1.res:4: Parse error: ';' expected, but got 'k6fjase…'
+func TestBuildQuotesSharedSecretFromNetOptions(t *testing.T) {
+	const secret = "+k6fjaseNGqNIwXdQslm"
+
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Net:  drbd.Net{Options: map[string]string{"shared-secret": secret}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if want := `shared-secret "` + secret + `";`; !strings.Contains(got, want) {
+		t.Errorf("shared-secret not quoted, want %s; got:\n%s", want, got)
+	}
+}
+
+// TestBuildEmitsSharedSecretOnce: a resource carrying the secret both as
+// the typed field and as the property must still emit exactly one
+// shared-secret line — drbdadm rejects a duplicated key outright.
+func TestBuildEmitsSharedSecretOnce(t *testing.T) {
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Net: drbd.Net{
+			SharedSecret: "typed",
+			Options:      map[string]string{"shared-secret": "from-prop"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if n := strings.Count(got, "shared-secret"); n != 1 {
+		t.Errorf("want exactly 1 shared-secret line, got %d:\n%s", n, got)
+	}
+}
