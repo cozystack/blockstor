@@ -416,6 +416,16 @@ spec:
                         `drbdadm create-md` forever, which is why zero is the one value
                         that must never reach it, and why an overflowing size parse that
                         lands on zero has to be refused before it is stored.
+
+                        A bound on an existing field validates on UPDATE as well as on
+                        create, so an object already outside it would become unwritable
+                        — every controller spec write on it rejected, with no way to
+                        edit it back into range. That is why the bound is not merely
+                        added: every path that writes a size enforces it too, including
+                        the REST spawn handler, which deliberately did not. No path can
+                        produce an out-of-range volume, so there is nothing to ratchet
+                        for; had there been, this would need the optionalOldSelf shape
+                        drbdPort uses rather than a plain Minimum/Maximum.
                       format: int64
                       maximum: 17179869184
                       minimum: 4096

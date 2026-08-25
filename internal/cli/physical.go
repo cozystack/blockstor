@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
@@ -170,6 +171,24 @@ func stampDevices(
 			// this command is about.
 			err = run.Store.PhysicalDevices().PatchPhysicalDeviceSpec(ctx, known[i].Name,
 				func(dev *apiv1.PhysicalDevice) error {
+					// Refuse a device some other pool already claimed.
+					// The attach carries Wipe, so overwriting a live
+					// claim does not merely re-point a record — it
+					// wipes the disk backing that pool.
+					//
+					// The check belongs HERE rather than before the
+					// patch, and that is the whole point of it: two
+					// concurrent create-device-pool runs both see
+					// AttachTo=nil when they look, so only a check made
+					// against the state the write lands on can reject
+					// the loser. The store's Update carried an
+					// equivalent guard against a snapshot; this one is
+					// evaluated inside the fetch-mutate-write window.
+					if dev.AttachTo != nil {
+						return fmt.Errorf("%w: device %s on %s is already attached",
+							store.ErrAlreadyExists, wanted, node)
+					}
+
 					dev.AttachTo = attach
 
 					return nil

@@ -107,29 +107,24 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	// as size_kib, matching the `vd c` path (volume_definitions.go,
 	// which reads `size_kib` verbatim).
 	//
-	// We don't apply the full Bug 155 [4096 KiB, 16 TiB] gate here
-	// because the oversub gate already runs against the requested KiB
-	// upstream (see `rejectIfExceedsOversubGate` + `oversub_test.go`),
-	// and unit tests cover small sizes for oversub-policy probes that
-	// we don't want to break. The Bug 155 bound itself still kicks in
-	// if the caller later issues a `vd c` or `vd modify`. Symmetric
-	// with the VD-create body branch's writeVDSizeRejection so the
-	// CLI parity audit row for `rg spawn` matches `vd c` on the
-	// non-positive input class operators actually hit.
+	// The full [4096 KiB, 16 TiB] gate applies here, not just a
+	// non-positive check. It used to be skipped on the grounds that
+	// the bound would kick in later on a `vd c` — but the bound is now
+	// Minimum/Maximum on the CRD field, so a below-floor size no longer
+	// reaches "later": it is rejected by the API server midway through
+	// this handler, after the resource definition has been created and
+	// while its volumes are being added. That leaves the half-built RD
+	// this validate-before-write block exists to prevent, and hands the
+	// caller a raw schema error instead of the rejection envelope.
+	//
+	// validateVDSize emits the identical below-minimum message for `0`
+	// and `-100`, so the wire shape for the non-positive class that
+	// operators actually hit is unchanged.
 	for i, sizeKib := range req.VolumeSizes {
-		if sizeKib > 0 {
+		reason := validateVDSize(sizeKib)
+		if reason == nil {
 			continue
 		}
-
-		// Fabricate the same below-minimum sentinel the VD-create
-		// path uses so the wire shape is byte-identical: `0` and
-		// `-100` both surface as `size_kib=<n> below minimum 4096
-		// KiB` (the effective floor) rather than a separate
-		// "non-positive" envelope that no other handler emits.
-		reason := errors.Wrapf(ErrVolumeSizeBelowMinimum,
-			"size_kib=%d below minimum %d KiB "+
-				"(DRBD reserves ~32 KiB of metadata per peer; backing layers add alignment on top)",
-			sizeKib, minVolumeDefinitionSizeKib)
 
 		writeVDSizeRejection(w, req.ResourceDefinitionName, int32(i), sizeKib, reason)
 

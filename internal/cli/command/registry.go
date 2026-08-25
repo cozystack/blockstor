@@ -86,6 +86,12 @@ const (
 	argRDVolume        = "<rd> <volume-number>"
 	argRG              = "<rg>"
 	argSnapshotRestore = "--from-resource <rd> --from-snapshot <snap> --to-resource <new>"
+
+	// The passphrase arrives as `--passphrase <value>` or as a bare
+	// positional: `-p` means --passphrase on these verbs and --pastable
+	// everywhere else, so the shared parser records it as a positional.
+	// Either way it is required — an empty one is refused.
+	argPassphrase = "<passphrase>"
 )
 
 // Canonical verb names that recur across nouns.
@@ -259,8 +265,8 @@ var registry = []Noun{
 	{
 		Name: "encryption",
 		Verbs: []Verb{
-			{Name: "create-passphrase"},
-			{Name: "enter-passphrase"},
+			{Name: "create-passphrase", Usage: argPassphrase},
+			{Name: "enter-passphrase", Usage: argPassphrase},
 		},
 	},
 }

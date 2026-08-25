@@ -292,3 +292,38 @@ func TestResourceDefinitionModifyRejectsUnknownGroup(t *testing.T) {
 		t.Errorf("resource group = %q, want it left at old", def.ResourceGroupName)
 	}
 }
+
+// TestCreateDevicePoolRefusesAnAlreadyAttachedDevice: the attach carries
+// Wipe, so claiming a device a live pool already owns does not merely
+// re-point a record — it wipes the disk under that pool. A second
+// create-device-pool naming the same device has to be refused.
+//
+// The check runs inside the store patch on purpose: two concurrent runs
+// both observe AttachTo=nil when they look, so only a check made against
+// the state the write lands on can reject the loser.
+func TestCreateDevicePoolRefusesAnAlreadyAttachedDevice(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.PhysicalDevices().Create(ctx, &apiv1.PhysicalDevice{
+			Name: "node-1-sdb", NodeName: "node-1",
+			DevicePath: "/dev/disk/by-id/wwn-0x1", CurrentDevPath: "/dev/sdb",
+			SizeBytes: 1 << 40,
+			AttachTo:  &apiv1.PhysicalDeviceAttachTo{ZPoolName: "tank", Wipe: true},
+		})
+	})
+
+	argv := []string{"ps", "cdp", "zfs", "node-1", "/dev/sdb", "--pool-name", "other"}
+	if got := app.Run(t.Context(), argv); got == 0 {
+		t.Fatal("create-device-pool claimed a device another pool owns; want a refusal")
+	}
+
+	device, err := appStore(t, app).PhysicalDevices().Get(t.Context(), "node-1-sdb")
+	if err != nil {
+		t.Fatalf("get device: %v", err)
+	}
+
+	if device.AttachTo == nil || device.AttachTo.ZPoolName != "tank" {
+		t.Errorf("the live pool's claim was overwritten: %+v", device.AttachTo)
+	}
+}
