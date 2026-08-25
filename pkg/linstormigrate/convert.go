@@ -21,6 +21,7 @@ package linstormigrate
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -423,6 +424,50 @@ func (c *converter) netInterfacesFor(nodeName string) []NodeNetInterfaceRow {
 	return out
 }
 
+const (
+	// providerKindZFS / providerKindZFSThin are the StoragePool
+	// providerKind values for thick and thin ZFS.
+	providerKindZFS     = "ZFS"
+	providerKindZFSThin = "ZFS_THIN"
+
+	// storDriverZfscreateOptions holds extra flags LINSTOR appends to
+	// `zfs create`; zfsSparseFlag is the one that makes a zvol sparse.
+	storDriverZfscreateOptions = "StorDriver/ZfscreateOptions"
+	zfsSparseFlag              = "-s"
+)
+
+// createsSparseZvols reports whether a pool LINSTOR declares as thick
+// ZFS in fact holds sparse volumes.
+//
+// LINSTOR allows the combination: the driver says ZFS, while
+// StorDriver/ZfscreateOptions carries `-s`, so every zvol is created
+// sparse. The pool is thick by declaration and thin in practice, and
+// LINSTOR is content to leave it oversubscribed.
+//
+// blockstor cannot express that. Its thick ZFS provider reserves each
+// volume's full size, and applies the rule to volumes it adopts as
+// readily as to ones it creates, so migrating such a pool as ZFS
+// retroactively converts every volume to thick: the pool fills up
+// during adoption and whatever no longer fits cannot be adopted at all.
+// On the cluster this was found on, one node went from 238G free to
+// 8.63G before a 50G volume finally had nowhere to go.
+//
+// Mapping the pool to ZFS_THIN preserves what the volumes are, which is
+// what the data plane depends on, at the cost of the declared kind
+// changing. The reverse — honouring the declaration — silently changes
+// the capacity model of a running cluster, so this is the safer of the
+// two lies. Only ZFS is affected: LVM's thin provisioning is a separate
+// driver over a thin pool, not a create-time flag.
+func createsSparseZvols(driver string, props map[string]string) bool {
+	if driver != providerKindZFS {
+		return false
+	}
+
+	// A flag, not a substring: `-o something-s` must not match, and
+	// neither must a longer option that merely starts with `-s`.
+	return slices.Contains(strings.Fields(props[storDriverZfscreateOptions]), zfsSparseFlag)
+}
+
 func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 	pools := make([]crdv1alpha1.StoragePool, 0, len(c.dump.NodeStorPools))
 
@@ -439,14 +484,24 @@ func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 			continue
 		}
 
+		props := c.props.StorPool(row.NodeName, row.PoolName)
+
+		kind := row.DriverName
+		if createsSparseZvols(kind, props) {
+			kind = providerKindZFSThin
+
+			c.warnf("storage pool %s.%s: declared %s, but %s makes every zvol sparse — migrated as %s so the adopted volumes keep the provisioning they actually have",
+				poolDsp, nodeDsp, providerKindZFS, storDriverZfscreateOptions, providerKindZFSThin)
+		}
+
 		pool := crdv1alpha1.StoragePool{
 			TypeMeta:   typeMeta("StoragePool"),
 			ObjectMeta: objectMeta(strings.ToLower(poolDsp) + "." + strings.ToLower(nodeDsp)),
 			Spec: crdv1alpha1.StoragePoolSpec{
 				NodeName:     nodeDsp,
 				PoolName:     poolDsp,
-				ProviderKind: row.DriverName,
-				Props:        c.props.StorPool(row.NodeName, row.PoolName),
+				ProviderKind: kind,
+				Props:        props,
 			},
 		}
 

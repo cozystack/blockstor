@@ -269,7 +269,7 @@ func writeNet(b *strings.Builder, n Net) {
 		fmt.Fprintf(b, "    %s %q;\n", sharedSecretOption, n.SharedSecret)
 	}
 
-	for _, k := range sortedKeys(n.Options) {
+	for _, option := range sortedKeys(n.Options) {
 		// shared-secret is the one net option drbd's grammar spells as
 		// a quoted string; every other value is a bare keyword or a
 		// number and must stay verbatim. LINSTOR generates the secret
@@ -277,15 +277,15 @@ func writeNet(b *strings.Builder, n Net) {
 		// drbdadm rejects unquoted. The typed field above wins when a
 		// resource carries the secret both ways, so drbdadm never sees
 		// the key twice.
-		if k == sharedSecretOption {
+		if option == sharedSecretOption {
 			if n.SharedSecret == "" {
-				fmt.Fprintf(b, "    %s %q;\n", k, n.Options[k])
+				fmt.Fprintf(b, "    %s %q;\n", option, n.Options[option])
 			}
 
 			continue
 		}
 
-		fmt.Fprintf(b, "    %s %s;\n", k, n.Options[k])
+		fmt.Fprintf(b, "    %s %s;\n", option, n.Options[option])
 	}
 
 	b.WriteString("  }\n")

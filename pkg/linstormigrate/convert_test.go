@@ -825,16 +825,13 @@ func TestInitializedLatchNeedsAnAdoptedReplica(t *testing.T) {
 			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
 		},
 		ResourceDefinitions: []ResourceDefinitionRow{
-			{ResourceName: "PVC-LIVE", ResourceDspName: "pvc-live",
-				LayerStack: "DRBD,STORAGE", UUID: "rd-live"},
-			{ResourceName: "PVC-EMPTY", ResourceDspName: "pvc-empty",
-				LayerStack: "DRBD,STORAGE", UUID: "rd-empty"},
+			{ResourceName: "PVC-LIVE", ResourceDspName: "pvc-live", LayerStack: "DRBD,STORAGE", UUID: "rd-live"},
+			{ResourceName: "PVC-EMPTY", ResourceDspName: "pvc-empty", LayerStack: "DRBD,STORAGE", UUID: "rd-empty"},
 		},
 		Resources: []ResourceRow{
 			{NodeName: "NODE-A", ResourceName: "PVC-LIVE", UUID: "r-live"},
 			// The only replica of PVC-EMPTY is on its way out.
-			{NodeName: "NODE-A", ResourceName: "PVC-EMPTY",
-				ResourceFlags: 2, UUID: "r-empty"},
+			{NodeName: "NODE-A", ResourceName: "PVC-EMPTY", ResourceFlags: 2, UUID: "r-empty"},
 		},
 	}
 
@@ -856,5 +853,62 @@ func TestInitializedLatchNeedsAnAdoptedReplica(t *testing.T) {
 	if latched["pvc-empty"] {
 		t.Error("pvc-empty has no adopted replica: Initialized must not be latched, " +
 			"or no replica can ever seed the first sync")
+	}
+}
+
+// TestSparseZfsPoolMigratesAsThin: LINSTOR lets a pool be declared thick
+// ZFS while StorDriver/ZfscreateOptions carries `-s`, which makes every
+// zvol sparse. Blockstor's thick provider reserves each volume's full
+// size and applies that to volumes it adopts, so migrating such a pool
+// as ZFS converts a live, deliberately oversubscribed pool to thick
+// during adoption and strands whatever no longer fits. Carry the
+// provisioning the volumes actually have.
+//
+// The `-s` must be matched as a flag: an option that merely contains
+// the letter must not flip the kind.
+func TestSparseZfsPoolMigratesAsThin(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "SPARSE", DriverName: "ZFS", UUID: "sp-1"},
+			{NodeName: "NODE-A", PoolName: "THICK", DriverName: "ZFS", UUID: "sp-2"},
+			{NodeName: "NODE-A", PoolName: "TRAP", DriverName: "ZFS", UUID: "sp-3"},
+			{NodeName: "NODE-A", PoolName: "LVMPOOL", DriverName: "LVM", UUID: "sp-4"},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/SPARSE", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s -o compression=lz4"},
+			{PropsInstance: "/STOR_POOLS/NODE-A/THICK", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-o compression=lz4"},
+			// Contains "-s" as a substring but no sparse flag.
+			{PropsInstance: "/STOR_POOLS/NODE-A/TRAP", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-o volmode=-static"},
+			{PropsInstance: "/STOR_POOLS/NODE-A/LVMPOOL", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	kind := map[string]string{}
+	for i := range res.StoragePools {
+		sp := &res.StoragePools[i]
+		kind[sp.Spec.PoolName] = sp.Spec.ProviderKind
+	}
+
+	for name, want := range map[string]string{
+		"SPARSE":  "ZFS_THIN",
+		"THICK":   "ZFS",
+		"TRAP":    "ZFS",
+		"LVMPOOL": "LVM",
+	} {
+		if got := kind[name]; got != want {
+			t.Errorf("pool %s: providerKind = %q, want %q", name, got, want)
+		}
+	}
+
+	if !hasWarning(res, "declared ZFS") {
+		t.Errorf("sparse-pool remap was not reported; warnings: %v", res.Warnings)
 	}
 }
