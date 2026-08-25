@@ -179,16 +179,13 @@ func volumeGroupCreate(ctx context.Context, run *runContext) error {
 	// write, and a second create doing the same against the same
 	// snapshot produces two templates numbered 1 — or loses one of
 	// them, depending on which write lands last.
-	var number int32
-
 	err := run.Store.ResourceGroups().PatchResourceGroup(ctx, name,
 		func(group *apiv1.ResourceGroup) error {
-			picked, pickErr := volumeGroupNumber(run, group)
+			number, pickErr := volumeGroupNumber(run, group)
 			if pickErr != nil {
 				return pickErr
 			}
 
-			number = picked
 			group.VolumeGroups = append(group.VolumeGroups, apiv1.VolumeGroup{VolumeNumber: number})
 
 			return nil

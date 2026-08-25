@@ -45,19 +45,23 @@ func resourceDefinitionModify(ctx context.Context, run *runContext) error {
 	}
 
 	name := run.Flags.Positionals[0]
+	group := run.Flags.Values["resource-group"]
+	layers := run.Flags.Values["layer-list"]
 
-	changed := false
+	// Which fields this edits is a property of the command line, not of
+	// the object, so an empty modify is refused before anything is
+	// written. Deciding it after the patch would spend a no-op write on
+	// the way to a usage error.
+	if group == "" && layers == "" {
+		return fmt.Errorf("%w: modify needs something to change", command.ErrUsage)
+	}
 
 	err := run.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, name,
 		func(def *apiv1.ResourceDefinition) error {
-			return modifyDefinition(ctx, run, def, &changed)
+			return modifyDefinition(ctx, run, def, group, layers)
 		})
 	if err != nil {
 		return fmt.Errorf("update resource definition %s: %w", name, err)
-	}
-
-	if !changed {
-		return fmt.Errorf("%w: modify needs something to change", command.ErrUsage)
 	}
 
 	return nil
@@ -67,8 +71,10 @@ func resourceDefinitionModify(ctx context.Context, run *runContext) error {
 // inside the store's patch retry, so the resource-group lookup and the
 // re-parent it authorises cannot be separated by a concurrent delete of
 // that group.
-func modifyDefinition(ctx context.Context, run *runContext, def *apiv1.ResourceDefinition, changed *bool) error {
-	if group := run.Flags.Values["resource-group"]; group != "" {
+func modifyDefinition(
+	ctx context.Context, run *runContext, def *apiv1.ResourceDefinition, group, layers string,
+) error {
+	if group != "" {
 		// The group drives placement: how many replicas a spawn makes,
 		// which pools they may land on, the layer stack they inherit.
 		// Nothing downstream rejects a definition that names a group
@@ -82,12 +88,10 @@ func modifyDefinition(ctx context.Context, run *runContext, def *apiv1.ResourceD
 		}
 
 		def.ResourceGroupName = group
-		*changed = true
 	}
 
-	if layers := run.Flags.Values["layer-list"]; layers != "" {
+	if layers != "" {
 		def.LayerStack = splitList(layers)
-		*changed = true
 	}
 
 	return nil
