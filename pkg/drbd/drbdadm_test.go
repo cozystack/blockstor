@@ -1185,3 +1185,29 @@ func TestHasMDReturnsFalseOnNoMetaData(t *testing.T) {
 		t.Errorf("HasMD on missing metadata: got true, want false")
 	}
 }
+
+// errHasMDDumpMdParseError mirrors drbdadm refusing to read a resource
+// whose .res file does not parse. The probe never reaches the disk, so
+// it cannot know whether metadata is there.
+var errHasMDDumpMdParseError = errors.New(
+	"drbdadm dump-md pvc-live/0: drbd.d/pvc-live.res:4: " +
+		"Parse error: ';' expected, but got 'k6fjase' (TK 281): exit status 10")
+
+// TestHasMDFailsClosedOnUnparseableConfig: a config-level failure must
+// surface as an error, never as "no metadata". The caller's next move on
+// a false negative is `create-md --force`, which destroys the metadata of
+// a volume that is full of data — so this probe has to fail closed.
+func TestHasMDFailsClosedOnUnparseableConfig(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md pvc-live/0",
+		storage.FakeResponse{Err: errHasMDDumpMdParseError})
+
+	has, err := drbd.NewAdm(fx).HasMD(t.Context(), "pvc-live/0")
+	if err == nil {
+		t.Fatal("HasMD on unparseable config: want error, got nil")
+	}
+
+	if has {
+		t.Errorf("HasMD on unparseable config: got true, want false")
+	}
+}

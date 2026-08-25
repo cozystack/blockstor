@@ -231,6 +231,24 @@ func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
 		return true, nil
 	}
 
+	// A config-level failure means dump-md never reached the disk,
+	// so its silence says nothing about whether metadata exists.
+	// Answering "no metadata" here sends the caller straight into
+	// `create-md --force` on a volume that may be full of data —
+	// the probe fails OPEN, which is the one direction a safety
+	// probe must never fail. Surface the error so the caller aborts.
+	//
+	// Seen on a LINSTOR->blockstor migration: an unquoted shared
+	// secret made every .res unparseable, and only create-md
+	// tripping over the very same parse error kept the metadata of
+	// 28 live volumes intact.
+	if strings.Contains(errStr, "Parse error") ||
+		strings.Contains(string(out), "Parse error") {
+		return false, errors.Wrapf(err,
+			"dump-md %s: config unparseable, refusing to report "+
+				"metadata as absent", resource)
+	}
+
 	// `No valid meta data found` / drbdmeta "missing image" / etc.
 	// all bubble up as non-zero exit. Treat as "not yet
 	// initialised" — the caller's create-md will either succeed
