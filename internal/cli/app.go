@@ -107,16 +107,25 @@ func (a *App) Run(ctx context.Context, argv []string) int {
 		return a.help()
 	}
 
+	// `blockstor rd --help` names an object without a verb. Resolve
+	// would reject "--help" as an unknown subcommand, so answer it
+	// here, before the grammar gets a chance to be unhelpful.
+	if len(argv) > 1 && isHelpRequest(argv[1:]) {
+		noun, ok := command.Lookup(argv[0])
+		if ok {
+			return a.nounHelp(noun)
+		}
+	}
+
 	cmd, rest, err := command.Resolve(argv)
 	if err != nil {
 		return a.fail(err)
 	}
 
-	// `blockstor r l --help` asks about that command, not for a flag.
-	// Rejecting it as an unknown flag would be the one answer that
-	// helps least.
+	// `blockstor r l --help` asks about THAT command, not for a flag
+	// and not for the whole tree.
 	if isHelpRequest(rest) {
-		return a.help()
+		return a.commandHelp(cmd)
 	}
 
 	flags, err := parseFlags(rest)
@@ -181,6 +190,31 @@ func (a *App) dispatch(ctx context.Context, run handler, flags *flagSet) int {
 		Color: color.New(color.EnabledFor(mode, a.tty())),
 		Kube:  a.KubeFor,
 	})
+	if err != nil {
+		return a.fail(err)
+	}
+
+	return exitOK
+}
+
+// nounHelp writes one object's verbs to stdout.
+func (a *App) nounHelp(noun command.Noun) int {
+	err := writeNounHelp(a.Out, noun)
+	if err != nil {
+		return a.fail(err)
+	}
+
+	return exitOK
+}
+
+// commandHelp writes one command's synopsis to stdout.
+func (a *App) commandHelp(cmd command.Command) int {
+	verb, ok := command.Describe(cmd.Noun, cmd.Verb)
+	if !ok {
+		return a.help()
+	}
+
+	err := writeCommandHelp(a.Out, cmd, verb)
 	if err != nil {
 		return a.fail(err)
 	}

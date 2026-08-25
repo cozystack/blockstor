@@ -288,3 +288,59 @@ func TestHelp(t *testing.T) {
 		t.Errorf("a bare invocation wrote to stdout: %s", out.String())
 	}
 }
+
+// TestNounHelpListsItsVerbs: `blockstor rd --help` used to die in the
+// resolver as an unknown subcommand — the least useful answer possible
+// to a request for help.
+func TestNounHelpListsItsVerbs(t *testing.T) {
+	t.Parallel()
+
+	app, out, errBuf := newApp(t, nil)
+
+	if got := app.Run(t.Context(), []string{"rd", "--help"}); got != 0 {
+		t.Fatalf("rd --help exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	text := out.String()
+
+	for _, want := range []string{
+		"usage: blockstor resource-definition (rd) <action>",
+		"modify (m) <rd>",
+		"clone <src> <target>",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("noun help missing %q; got:\n%s", want, text)
+		}
+	}
+
+	// It answers about THIS object, not every object.
+	if strings.Contains(text, "storage-pool") {
+		t.Errorf("noun help leaked the whole tree:\n%s", text)
+	}
+}
+
+// TestCommandHelpIsAboutThatCommand: `blockstor rd modify --help` used
+// to print the entire command tree, answering a question nobody asked.
+func TestCommandHelpIsAboutThatCommand(t *testing.T) {
+	t.Parallel()
+
+	app, out, errBuf := newApp(t, nil)
+
+	if got := app.Run(t.Context(), []string{"rd", "modify", "--help"}); got != 0 {
+		t.Fatalf("rd modify --help exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	text := out.String()
+
+	if !strings.HasPrefix(text, "usage: blockstor resource-definition modify <rd>") {
+		t.Errorf("command help does not lead with its own usage; got:\n%s", text)
+	}
+
+	if !strings.Contains(text, "also spelled: m") {
+		t.Errorf("command help drops the alias; got:\n%s", text)
+	}
+
+	if strings.Contains(text, "storage-pool") {
+		t.Errorf("command help printed the whole tree:\n%s", text)
+	}
+}

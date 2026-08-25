@@ -320,3 +320,56 @@ func TestPropertyVerbsComeAsASet(t *testing.T) {
 		}
 	}
 }
+
+// noArgumentVerbs are the commands that legitimately take nothing after
+// the verb. Everything else must carry a Usage synopsis, so `--help`
+// cannot quietly go blank when a verb is added.
+//
+//nolint:gochecknoglobals // fixture for the drift guard below
+var noArgumentVerbs = map[string]bool{
+	"node list":                    true,
+	"node info":                    true,
+	"storage-pool list":            true,
+	"physical-storage list":        true,
+	"resource-definition list":     true,
+	"volume-definition list":       true,
+	"resource list":                true,
+	"resource list-volumes":        true,
+	"volume list":                  true,
+	"snapshot list":                true,
+	"snapshot rollback":            true,
+	"resource-group list":          true,
+	"volume-group list":            true,
+	"controller version":           true,
+	"controller list-properties":   true,
+	"encryption create-passphrase": true,
+	"encryption enter-passphrase":  true,
+}
+
+// TestEveryVerbDocumentsItsArguments: per-command help is only useful if
+// it is complete. A verb that takes arguments and carries no synopsis
+// prints a usage line that stops exactly where the operator needs it to
+// continue, so the registry has to stay populated as verbs are added.
+func TestEveryVerbDocumentsItsArguments(t *testing.T) {
+	t.Parallel()
+
+	for _, noun := range command.Nouns() {
+		for _, verb := range noun.Verbs {
+			full := noun.Name + " " + verb.Name
+
+			if noArgumentVerbs[full] {
+				if verb.Usage != "" {
+					t.Errorf("%s is listed as taking no arguments but documents %q",
+						full, verb.Usage)
+				}
+
+				continue
+			}
+
+			if verb.Usage == "" {
+				t.Errorf("%s has no argument synopsis; add one to the registry "+
+					"or list it in noArgumentVerbs", full)
+			}
+		}
+	}
+}

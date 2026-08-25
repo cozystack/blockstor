@@ -51,6 +51,11 @@ var ErrUsage = errors.New("usage")
 type Verb struct {
 	Name    string
 	Aliases []string
+	// Usage is the argument synopsis that follows the verb, e.g.
+	// "<node> <pool>". Empty means the verb takes no arguments.
+	// TestEveryVerbDocumentsItsArguments keeps this populated, so
+	// `--help` can never go stale against what actually dispatches.
+	Usage string
 }
 
 // Noun is one object kind plus the verbs it accepts.
@@ -70,6 +75,18 @@ type Command struct {
 func (c Command) String() string {
 	return c.Noun + " " + c.Verb
 }
+
+// Argument synopses that recur across nouns.
+const (
+	argName            = "<name>"
+	argNode            = "<node>"
+	argNodePool        = "<node> <pool>"
+	argNodeRD          = "<node> <rd>"
+	argRD              = "<rd>"
+	argRDVolume        = "<rd> <volume-number>"
+	argRG              = "<rg>"
+	argSnapshotRestore = "--from-resource <rd> --from-snapshot <snap> --to-resource <new>"
+)
 
 // Canonical verb names that recur across nouns.
 const (
@@ -104,18 +121,18 @@ var registry = []Noun{
 		Name: "node", Aliases: []string{"n"},
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
-			{Name: verbListProps, Aliases: []string{aliasListProps}},
-			{Name: verbCreate, Aliases: []string{aliasCreate}},
-			{Name: verbDelete, Aliases: []string{aliasDelete}},
-			{Name: "lost"},
-			{Name: "evacuate"},
+			{Name: verbListProps, Aliases: []string{aliasListProps}, Usage: argNode},
+			{Name: verbCreate, Aliases: []string{aliasCreate}, Usage: argName + " <address>"},
+			{Name: verbDelete, Aliases: []string{aliasDelete}, Usage: argName},
+			{Name: "lost", Usage: argNode},
+			{Name: "evacuate", Usage: argNode},
 			// `evict` is not a verb the upstream python client has; the
 			// operator harness shims it to a REST call today. Providing
 			// it natively lets that shim go away.
-			{Name: "evict", Aliases: []string{"e"}},
-			{Name: "restore", Aliases: []string{"rst"}},
-			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
-			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
+			{Name: "evict", Aliases: []string{"e"}, Usage: argNode},
+			{Name: "restore", Aliases: []string{"rst"}, Usage: argNode},
+			{Name: verbSetProp, Aliases: []string{aliasSetProp}, Usage: argNode + " <key> <value>"},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}, Usage: argNode + " <key>"},
 			{Name: "info"},
 		},
 	},
@@ -123,46 +140,46 @@ var registry = []Noun{
 		Name: "storage-pool", Aliases: []string{"sp"},
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
-			{Name: verbCreate, Aliases: []string{aliasCreate}},
-			{Name: verbDelete, Aliases: []string{aliasDelete}},
-			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
-			{Name: verbListProps, Aliases: []string{aliasListProps}},
-			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
+			{Name: verbCreate, Aliases: []string{aliasCreate}, Usage: "<provider> <node> <pool> [<backing>]"},
+			{Name: verbDelete, Aliases: []string{aliasDelete}, Usage: argNodePool},
+			{Name: verbSetProp, Aliases: []string{aliasSetProp}, Usage: argNodePool + " <key> <value>"},
+			{Name: verbListProps, Aliases: []string{aliasListProps}, Usage: argNodePool},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}, Usage: argNodePool + " <key>"},
 		},
 	},
 	{
 		Name: "physical-storage", Aliases: []string{"ps"},
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
-			{Name: "create-device-pool", Aliases: []string{"cdp"}},
+			{Name: "create-device-pool", Aliases: []string{"cdp"}, Usage: "<provider> <node> <device>... --pool-name <name>"},
 		},
 	},
 	{
 		Name: "resource-definition", Aliases: []string{"rd"},
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
-			{Name: verbCreate, Aliases: []string{aliasCreate}},
-			{Name: verbDelete, Aliases: []string{aliasDelete}},
-			{Name: "clone"},
-			{Name: verbModify, Aliases: []string{aliasModify}},
-			{Name: "auto-place", Aliases: []string{"ap"}},
-			{Name: verbDRBDOptions},
-			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
-			{Name: verbListProps, Aliases: []string{aliasListProps}},
-			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
+			{Name: verbCreate, Aliases: []string{aliasCreate}, Usage: argName},
+			{Name: verbDelete, Aliases: []string{aliasDelete}, Usage: argName},
+			{Name: "clone", Usage: "<src> <target>"},
+			{Name: verbModify, Aliases: []string{aliasModify}, Usage: argRD + " [--resource-group <rg>] [--layer-list <layers>]"},
+			{Name: "auto-place", Aliases: []string{"ap"}, Usage: argRD},
+			{Name: verbDRBDOptions, Usage: argRD + " --<knob> <value>..."},
+			{Name: verbSetProp, Aliases: []string{aliasSetProp}, Usage: argRD + " <key> <value>"},
+			{Name: verbListProps, Aliases: []string{aliasListProps}, Usage: argRD},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}, Usage: argRD + " <key>"},
 		},
 	},
 	{
 		Name: "volume-definition", Aliases: []string{"vd"},
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
-			{Name: verbCreate, Aliases: []string{aliasCreate}},
-			{Name: verbDelete, Aliases: []string{aliasDelete}},
-			{Name: "set-size", Aliases: []string{"s"}},
-			{Name: verbDRBDOptions},
-			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
-			{Name: verbListProps, Aliases: []string{aliasListProps}},
-			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
+			{Name: verbCreate, Aliases: []string{aliasCreate}, Usage: argRD + " <size>"},
+			{Name: verbDelete, Aliases: []string{aliasDelete}, Usage: argRDVolume},
+			{Name: "set-size", Aliases: []string{"s"}, Usage: argRDVolume + " <size>"},
+			{Name: verbDRBDOptions, Usage: argRDVolume + " --<knob> <value>..."},
+			{Name: verbSetProp, Aliases: []string{aliasSetProp}, Usage: argRDVolume + " <key> <value>"},
+			{Name: verbListProps, Aliases: []string{aliasListProps}, Usage: argRDVolume},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}, Usage: argRDVolume + " <key>"},
 		},
 	},
 	{
@@ -170,14 +187,14 @@ var registry = []Noun{
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
 			{Name: "list-volumes", Aliases: []string{"lv"}},
-			{Name: verbCreate, Aliases: []string{aliasCreate}},
-			{Name: verbDelete, Aliases: []string{aliasDelete}},
-			{Name: "toggle-disk", Aliases: []string{"td"}},
-			{Name: "activate"},
-			{Name: "deactivate", Aliases: []string{"deact"}},
-			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
-			{Name: verbListProps, Aliases: []string{aliasListProps}},
-			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
+			{Name: verbCreate, Aliases: []string{aliasCreate}, Usage: "<node>... <rd>"},
+			{Name: verbDelete, Aliases: []string{aliasDelete}, Usage: argNodeRD},
+			{Name: "toggle-disk", Aliases: []string{"td"}, Usage: argNodeRD},
+			{Name: "activate", Usage: argNodeRD},
+			{Name: "deactivate", Aliases: []string{"deact"}, Usage: argNodeRD},
+			{Name: verbSetProp, Aliases: []string{aliasSetProp}, Usage: argNodeRD + " <key> <value>"},
+			{Name: verbListProps, Aliases: []string{aliasListProps}, Usage: argNodeRD},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}, Usage: argNodeRD + " <key>"},
 		},
 	},
 	{
@@ -190,53 +207,53 @@ var registry = []Noun{
 		Name: "snapshot", Aliases: []string{"s"},
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
-			{Name: verbCreate, Aliases: []string{aliasCreate}},
-			{Name: "create-multiple"},
-			{Name: verbDelete, Aliases: []string{aliasDelete}},
+			{Name: verbCreate, Aliases: []string{aliasCreate}, Usage: "[<node>...] <rd> <snap>"},
+			{Name: "create-multiple", Usage: "<rd>:<snap>... | <snap> <rd>..."},
+			{Name: verbDelete, Aliases: []string{aliasDelete}, Usage: argRD + " <snap>"},
 			{Name: "rollback"},
 			// Three-token verbs: `snapshot resource restore` (`s r rst`).
-			{Name: "resource restore", Aliases: []string{"r rst", "r restore", "resource rst"}},
-			{Name: "resource-definition restore", Aliases: []string{"rd rst", "rd restore", "resource-definition rst"}},
-			{Name: "volume-definition restore", Aliases: []string{"vd rst", "vd restore", "volume-definition rst"}},
+			{Name: "resource restore", Aliases: []string{"r rst", "r restore", "resource rst"}, Usage: argSnapshotRestore},
+			{Name: "resource-definition restore", Aliases: []string{"rd rst", "rd restore", "resource-definition rst"}, Usage: argSnapshotRestore},
+			{Name: "volume-definition restore", Aliases: []string{"vd rst", "vd restore", "volume-definition rst"}, Usage: argSnapshotRestore},
 		},
 	},
 	{
 		Name: "resource-group", Aliases: []string{"rg"},
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
-			{Name: verbCreate, Aliases: []string{aliasCreate}},
-			{Name: verbModify, Aliases: []string{aliasModify}},
-			{Name: verbDelete, Aliases: []string{aliasDelete}},
+			{Name: verbCreate, Aliases: []string{aliasCreate}, Usage: argName},
+			{Name: verbModify, Aliases: []string{aliasModify}, Usage: argName},
+			{Name: verbDelete, Aliases: []string{aliasDelete}, Usage: argName},
 			// `sp` is deliberately NOT an alias for spawn-resources: it
 			// is set-property on every other noun, and silently meaning
 			// two different things would be a footgun in a runbook.
-			{Name: "spawn-resources", Aliases: []string{"spawn"}},
-			{Name: "adjust"},
-			{Name: "query-size-info"},
-			{Name: "query-max-volume-size"},
-			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
-			{Name: verbListProps, Aliases: []string{aliasListProps}},
-			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
+			{Name: "spawn-resources", Aliases: []string{"spawn"}, Usage: argRG + " <rd> <size>..."},
+			{Name: "adjust", Usage: "[<rg>]"},
+			{Name: "query-size-info", Usage: argRG},
+			{Name: "query-max-volume-size", Usage: argRG},
+			{Name: verbSetProp, Aliases: []string{aliasSetProp}, Usage: argRG + " <key> <value>"},
+			{Name: verbListProps, Aliases: []string{aliasListProps}, Usage: argRG},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}, Usage: argRG + " <key>"},
 		},
 	},
 	{
 		Name: "volume-group", Aliases: []string{"vg"},
 		Verbs: []Verb{
 			{Name: verbList, Aliases: []string{aliasList}},
-			{Name: verbCreate, Aliases: []string{aliasCreate}},
-			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
-			{Name: verbListProps, Aliases: []string{aliasListProps}},
-			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
+			{Name: verbCreate, Aliases: []string{aliasCreate}, Usage: "<resource-group>"},
+			{Name: verbSetProp, Aliases: []string{aliasSetProp}, Usage: argRG + " <volume-number> <key> <value>"},
+			{Name: verbListProps, Aliases: []string{aliasListProps}, Usage: argRG + " <volume-number>"},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}, Usage: argRG + " <volume-number> <key>"},
 		},
 	},
 	{
 		Name: "controller", Aliases: []string{"c"},
 		Verbs: []Verb{
 			{Name: "version"},
-			{Name: verbDRBDOptions},
-			{Name: verbSetProp, Aliases: []string{aliasSetProp}},
+			{Name: verbDRBDOptions, Usage: "--<knob> <value>..."},
+			{Name: verbSetProp, Aliases: []string{aliasSetProp}, Usage: "<key> <value>"},
 			{Name: verbListProps, Aliases: []string{aliasListProps}},
-			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}},
+			{Name: verbDeleteProp, Aliases: []string{aliasDelProp}, Usage: "<key>"},
 		},
 	},
 	{
@@ -256,6 +273,36 @@ const maxVerbTokens = 2
 // Nouns returns the registry.
 func Nouns() []Noun {
 	return registry
+}
+
+// Lookup resolves an object token — canonical name or alias — to the
+// noun it names. Help rendering needs the noun before a verb is known,
+// which Resolve cannot give it.
+func Lookup(token string) (Noun, bool) {
+	noun := lookupNoun(token)
+	if noun == nil {
+		return Noun{}, false
+	}
+
+	return *noun, true
+}
+
+// Describe returns the registered verb for a canonical (noun, verb)
+// pair, so help can print the argument synopsis the registry carries.
+func Describe(noun, verb string) (Verb, bool) {
+	for i := range registry {
+		if registry[i].Name != noun {
+			continue
+		}
+
+		for j := range registry[i].Verbs {
+			if registry[i].Verbs[j].Name == verb {
+				return registry[i].Verbs[j], true
+			}
+		}
+	}
+
+	return Verb{}, false
 }
 
 // Has reports whether the canonical (noun, verb) pair is registered.
