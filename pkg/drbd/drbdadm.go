@@ -247,11 +247,15 @@ func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
 	// pressure passes, create-md --force succeeds, and a healthy
 	// replica is wiped.
 	//
-	// The cost of the strict direction is a fresh volume stalling if
-	// drbdmeta ever words "absent" differently: an error an operator
-	// can see and act on, which is the trade a safety probe should
-	// make.
-	if metadataDefinitelyAbsent(errStr, string(out)) {
+	// The cost of the strict direction is a volume stalling whenever
+	// drbdmeta words "nothing usable here" in a way this function does
+	// not know: an error an operator can see and act on, which is the
+	// trade a safety probe should make. That cost is not theoretical —
+	// the unclean-activity-log vocabulary below was found exactly this
+	// way, by every snapshot-derived volume in the e2e suite stalling
+	// at once. Widening the vocabulary is the fix; widening it to
+	// "any non-zero exit" is not.
+	if metadataNotUsable(errStr, string(out)) {
 		return false, nil
 	}
 
@@ -261,8 +265,9 @@ func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
 }
 
 // metadataAbsentMarkers are the drbdmeta / drbdadm messages that state
-// positively that a volume carries no DRBD metadata. Anything outside
-// this set is an inconclusive probe, not an answer.
+// positively that a volume carries no DRBD metadata at all. Anything
+// outside these two vocabularies is an inconclusive probe, not an
+// answer.
 //
 //nolint:gochecknoglobals // a fixed vocabulary, matched in one place
 var metadataAbsentMarkers = []string{
@@ -270,12 +275,39 @@ var metadataAbsentMarkers = []string{
 	"no valid meta data",
 }
 
-// metadataDefinitelyAbsent reports whether the failed probe positively
-// said the volume has no metadata, rather than merely failing.
-func metadataDefinitelyAbsent(errStr, out string) bool {
-	for _, marker := range metadataAbsentMarkers {
-		if strings.Contains(errStr, marker) || strings.Contains(out, marker) {
-			return true
+// metadataUnusableMarkers are the exits that positively state a
+// superblock is there but cannot be read as it stands.
+//
+// A volume materialised from a ZFS snapshot, clone or send/recv
+// carries the source's superblock with an activity log that was never
+// closed, so dump-md refuses it with `Found meta data is "unclean",
+// please apply-al first` instead of reporting the metadata absent.
+// That is a deterministic, fully understood state — not the transient
+// class the strict direction below guards against — and the caller has
+// always answered it by re-initialising the volume, which is what a
+// clone, a restore and a ship each want: the destination is a new
+// resource and needs metadata of its own.
+//
+// Whether a *legitimate* replica returning with a dirty activity log
+// should instead be repaired with `drbdadm apply-al` is a real
+// question, and a separate one: it changes established behaviour on
+// the activation path, so it needs its own change and its own e2e
+// coverage. Deliberately out of scope here.
+//
+//nolint:gochecknoglobals // a fixed vocabulary, matched in one place
+var metadataUnusableMarkers = []string{
+	"please apply-al",
+}
+
+// metadataNotUsable reports whether the failed probe positively said
+// the volume carries no metadata this resource can use, rather than
+// merely failing for a reason nobody classified.
+func metadataNotUsable(errStr, out string) bool {
+	for _, markers := range [][]string{metadataAbsentMarkers, metadataUnusableMarkers} {
+		for _, marker := range markers {
+			if strings.Contains(errStr, marker) || strings.Contains(out, marker) {
+				return true
+			}
 		}
 	}
 

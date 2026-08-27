@@ -1186,6 +1186,38 @@ func TestHasMDReturnsFalseOnNoMetaData(t *testing.T) {
 	}
 }
 
+// errHasMDDumpMdUnclean mirrors the verbatim exit drbdadm returns for a
+// volume whose activity log was never closed. Captured from an e2e run:
+// every lower disk materialised from a ZFS snapshot, clone or send/recv
+// arrives in this state, because the snapshot caught the source's AL
+// mid-flight.
+var errHasMDDumpMdUnclean = errors.New(
+	`drbdadm dump-md ship-restored/0: Found meta data is "unclean", ` +
+		`please apply-al first: exit status 1`)
+
+// TestHasMDReturnsFalseOnUncleanActivityLog: a superblock that cannot be
+// read until the activity log is applied must not surface as an
+// unrecognised failure. Every volume built from a ZFS snapshot carries
+// one, so failing closed here strands the clone, ship and restore paths
+// outright — the resource never attaches and the reconciler toggles the
+// disk until the scenario times out. Re-initialising is what the
+// destination of a clone wants: it is a new resource and needs metadata
+// of its own.
+func TestHasMDReturnsFalseOnUncleanActivityLog(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md ship-restored/0",
+		storage.FakeResponse{Err: errHasMDDumpMdUnclean})
+
+	has, err := drbd.NewAdm(fx).HasMD(t.Context(), "ship-restored/0")
+	if err != nil {
+		t.Fatalf("HasMD on an unclean activity log: %v", err)
+	}
+
+	if has {
+		t.Errorf("HasMD on an unclean activity log: got true, want false")
+	}
+}
+
 // errHasMDDumpMdParseError mirrors drbdadm refusing to read a resource
 // whose .res file does not parse. The probe never reaches the disk, so
 // it cannot know whether metadata is there.
