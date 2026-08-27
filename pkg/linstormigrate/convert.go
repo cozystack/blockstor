@@ -132,9 +132,13 @@ type converter struct {
 	// referential-integrity sets, populated as each kind converts so
 	// later kinds can drop rows that would dangle (a replica of a
 	// skipped/absent RD, a replica on an unknown node, ...).
-	convertedRD   map[string]bool // by resource_name (UPPERCASE key)
-	convertedNode map[string]bool // by node_name (UPPERCASE key)
-	convertedRG   map[string]bool // by resource_group_name (UPPERCASE key)
+	convertedRD map[string]bool // by resource_name (UPPERCASE key)
+	// remappedToThin records that at least one ZFS pool was carried
+	// over as ZFS_THIN, so the resource groups' provider allow-lists
+	// have to learn about the new kind.
+	remappedToThin bool
+	convertedNode  map[string]bool // by node_name (UPPERCASE key)
+	convertedRG    map[string]bool // by resource_group_name (UPPERCASE key)
 
 	warnings  []string
 	warnedKey map[string]bool
@@ -489,6 +493,7 @@ func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 		kind := row.DriverName
 		if createsSparseZvols(kind, props) {
 			kind = providerKindZFSThin
+			c.remappedToThin = true
 
 			c.warnf("storage pool %s.%s: declared %s, but %s makes every zvol sparse — migrated as %s so the adopted volumes keep the provisioning they actually have",
 				poolDsp, nodeDsp, providerKindZFS, storDriverZfscreateOptions, providerKindZFSThin)
@@ -538,7 +543,7 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 					ReplicasOnSame:          c.parseList(row.ReplicasOnSame, "resource group "+dsp+" replicas_on_same"),
 					ReplicasOnDifferent:     c.parseList(row.ReplicasOnDifferent, "resource group "+dsp+" replicas_on_different"),
 					NotPlaceWithRsc:         c.parseList(row.DoNotPlaceWithRsc, "resource group "+dsp+" do_not_place_with_rsc_list"),
-					ProviderList:            c.parseList(row.AllowedProviderList, "resource group "+dsp+" allowed_provider_list"),
+					ProviderList:            c.providerList(row, dsp),
 					LayerStack:              c.parseList(row.LayerStack, "resource group "+dsp+" layer_stack"),
 				},
 			},
@@ -562,6 +567,35 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 	sortByName(groups, func(g crdv1alpha1.ResourceGroup) string { return g.Name })
 
 	return groups
+}
+
+// providerList carries the resource group's provider allow-list over,
+// widened to cover a pool this migration changed the kind of.
+//
+// The placer filters candidate pools on this list with an exact match,
+// so a group pinned to ZFS stops seeing a pool that migrated as
+// ZFS_THIN — and a cluster that deliberately ran thick-declared sparse
+// ZFS is exactly the kind that pins it. The adopted volumes keep
+// working, but nothing new can be placed and a lost replica cannot be
+// healed, silently, until someone edits the group.
+//
+// ZFS_THIN is added rather than substituted: a cluster may hold both a
+// remapped pool and a genuinely thick one, and replacing the entry
+// would evict the second from a policy that legitimately named it.
+func (c *converter) providerList(row *ResourceGroupRow, dsp string) []string {
+	list := c.parseList(row.AllowedProviderList, "resource group "+dsp+" allowed_provider_list")
+
+	if !c.remappedToThin ||
+		!slices.Contains(list, providerKindZFS) ||
+		slices.Contains(list, providerKindZFSThin) {
+		return list
+	}
+
+	c.warnf("resource group %s: allows %s and a pool migrated as %s — %s added to the allow-list, "+
+		"or the placer would stop finding any eligible pool",
+		dsp, providerKindZFS, providerKindZFSThin, providerKindZFSThin)
+
+	return append(list, providerKindZFSThin)
 }
 
 func (c *converter) volumeGroupsFor(rgName string) []VolumeGroupRow {
@@ -608,8 +642,21 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 
 		typed, residual, extra := k8sstore.SplitProps(c.props.ResourceDefinition(row.ResourceName))
 
-		adopted := c.rdHasAdoptedReplica(row.ResourceName)
-		if !adopted {
+		latch := c.rdInitializedLatch(row.ResourceName)
+
+		// A definition none of whose replicas came across is only
+		// "fresh" when they were all being deleted anyway. If any was
+		// held back because its node did not migrate, the data is
+		// still out there and the latch stays on.
+		adopted := latch.adopted || latch.heldByAbsentNode
+
+		switch {
+		case latch.onlyDivergent:
+			c.warnf("resource definition %s: every replica spans multiple storage pools and is skipped, so the definition arrives with no replicas at all — Initialized stays latched because the data exists, but resolve the divergence or replicas placed later sit Inconsistent", dsp)
+		case latch.adopted:
+		case latch.heldByAbsentNode:
+			c.warnf("resource definition %s: every replica lives on a node that was not migrated — Initialized kept latched, because that data still exists; adopt those nodes or the definition stays without replicas", dsp)
+		default:
 			c.warnf("resource definition %s: no replica is being migrated — Initialized left unlatched so blockstor can seed a first sync", dsp)
 		}
 
@@ -666,8 +713,8 @@ func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
 		c.warnf("resource definition %s: unhandled flags bitmask %d dropped", dsp, row.ResourceFlags)
 	}
 
-	if !c.rdHasVolumeDefinitions(row.ResourceName) {
-		c.warnf("resource definition %s: no volume definitions — skipped; there is no volume to adopt, and migrating it leaves the controller placing replicas the satellite can never bring up", dsp)
+	if reason := c.volumelessReason(row.ResourceName); reason != "" {
+		c.warnf("resource definition %s: %s — skipped; there is no volume to adopt, and migrating it leaves the controller placing replicas the satellite can never bring up", dsp, reason)
 
 		return false
 	}
@@ -692,7 +739,9 @@ func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
 // can recreate it in one command; a wedged reconcile loop is the worse
 // outcome. Deliberately checked silently: volumeDefinitionsFor reports
 // each DELETE'd volume itself, and calling it here would double up.
-func (c *converter) rdHasVolumeDefinitions(rdName string) bool {
+func (c *converter) volumelessReason(rdName string) string {
+	sawDeleted := false
+
 	for i := range c.dump.VolumeDefinitions {
 		vd := &c.dump.VolumeDefinitions[i]
 
@@ -701,25 +750,60 @@ func (c *converter) rdHasVolumeDefinitions(rdName string) bool {
 		}
 
 		if vd.VlmFlags&resourceFlagDelete != 0 {
+			sawDeleted = true
+
 			continue
 		}
 
-		return true
+		return ""
 	}
 
-	return false
+	// Diagnostic, but it is the operator's only trail: a definition
+	// rejected here never reaches volumeDefinitionsFor, so the
+	// per-volume "marked DELETE" lines never appear for exactly these.
+	if sawDeleted {
+		return "every volume definition is marked DELETE in the source cluster"
+	}
+
+	return "no volume definitions"
 }
 
-// rdHasAdoptedReplica reports whether any replica of this resource
-// definition survives conversion. It mirrors convertResources' own skip
-// rules for the two cases that can empty a definition out — a replica
-// flagged DELETE in the source cluster, or one whose host node was not
-// migrated — and deliberately ignores the per-replica pool-divergence
-// check: counting a doubtful replica keeps the latch ON, which is the
-// safe direction. Dropping the latch where data does exist would let a
-// blank replica win the auto-primary election and sync itself over the
-// real one.
-func (c *converter) rdHasAdoptedReplica(rdName string) bool {
+// rdLatchState is what rdInitializedLatch found out about a resource
+// definition's replicas.
+type rdLatchState struct {
+	// adopted is true when at least one replica survives conversion.
+	adopted bool
+	// heldByAbsentNode is true when a replica was skipped only because
+	// its host node did not migrate. The data is still on that node's
+	// disk, so the definition is not fresh even though nothing was
+	// adopted from it.
+	heldByAbsentNode bool
+	// onlyDivergent is true when every replica that kept the latch on
+	// spans multiple storage pools. convertResources drops each of
+	// those, so the definition lands latched and with no replicas at
+	// all — the shape that sits Inconsistent forever if the controller
+	// later places fresh ones.
+	onlyDivergent bool
+}
+
+// rdInitializedLatch decides whether Initialized may be dropped.
+//
+// Only one reason to skip a replica means the data is genuinely gone:
+// the source cluster had already flagged it DELETE. A replica skipped
+// because its host node is missing from the dump — an incomplete or
+// staged dump, an unknown node_type, a CONTROLLER node — still exists
+// on disk. Unlatching there is the direction this must never take: the
+// controller would place fresh replicas, elect an auto-primary and seed
+// a blank first sync, and when the operator later brings that node in,
+// its real replica becomes SyncTarget of the blank set and is
+// overwritten.
+//
+// The per-replica pool-divergence skip is deliberately not counted:
+// treating a doubtful replica as adopted keeps the latch ON, the safe
+// direction.
+func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
+	var state rdLatchState
+
 	for i := range c.dump.Resources {
 		row := &c.dump.Resources[i]
 
@@ -732,13 +816,29 @@ func (c *converter) rdHasAdoptedReplica(rdName string) bool {
 		}
 
 		if !c.convertedNode[row.NodeName] {
+			state.heldByAbsentNode = true
+
 			continue
 		}
 
-		return true
+		// A pool-divergent replica still counts: treating a doubtful
+		// one as adopted keeps the latch ON, the safe direction. But
+		// convertResources will drop it, so remember that this is all
+		// that held the latch.
+		if _, divergent := c.replicaPoolDivergence(row); divergent {
+			state.adopted = true
+			state.onlyDivergent = true
+
+			continue
+		}
+
+		state.adopted = true
+		state.onlyDivergent = false
+
+		return state
 	}
 
-	return false
+	return state
 }
 
 func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row *ResourceDefinitionRow, dsp string) {

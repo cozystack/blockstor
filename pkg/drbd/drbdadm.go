@@ -231,29 +231,55 @@ func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
 		return true, nil
 	}
 
-	// A config-level failure means dump-md never reached the disk,
-	// so its silence says nothing about whether metadata exists.
-	// Answering "no metadata" here sends the caller straight into
-	// `create-md --force` on a volume that may be full of data —
-	// the probe fails OPEN, which is the one direction a safety
-	// probe must never fail. Surface the error so the caller aborts.
+	// This probe guards `create-md --force`: on hasMD=false the caller
+	// re-initialises the volume, destroying the GI tuple and dirty
+	// bitmap of whatever is on it. So it reports "no metadata" only
+	// for the exits that say so positively, and surfaces everything
+	// else.
 	//
-	// Seen on a LINSTOR->blockstor migration: an unquoted shared
-	// secret made every .res unparseable, and only create-md
-	// tripping over the very same parse error kept the metadata of
-	// 28 live volumes intact.
-	if strings.Contains(errStr, "Parse error") ||
-		strings.Contains(string(out), "Parse error") {
-		return false, errors.Wrapf(err,
-			"dump-md %s: config unparseable, refusing to report "+
-				"metadata as absent", resource)
+	// The inverse — every non-zero exit means "absent" — routes a
+	// data-bearing volume into a forced re-init whenever dump-md fails
+	// for a reason that has nothing to do with the disk: OOM-killed
+	// under memory pressure, a drbdmeta lock held by a concurrent
+	// call, a transient EIO on the lower device. Those are worse than
+	// the unparseable config this started from, because nothing
+	// downstream trips over the same failure a moment later: the
+	// pressure passes, create-md --force succeeds, and a healthy
+	// replica is wiped.
+	//
+	// The cost of the strict direction is a fresh volume stalling if
+	// drbdmeta ever words "absent" differently: an error an operator
+	// can see and act on, which is the trade a safety probe should
+	// make.
+	if metadataDefinitelyAbsent(errStr, string(out)) {
+		return false, nil
 	}
 
-	// `No valid meta data found` / drbdmeta "missing image" / etc.
-	// all bubble up as non-zero exit. Treat as "not yet
-	// initialised" — the caller's create-md will either succeed
-	// (truly missing) or surface a more specific failure.
-	return false, nil
+	return false, errors.Wrapf(err,
+		"dump-md %s: probe failed for an unrecognised reason, refusing to "+
+			"report metadata as absent", resource)
+}
+
+// metadataAbsentMarkers are the drbdmeta / drbdadm messages that state
+// positively that a volume carries no DRBD metadata. Anything outside
+// this set is an inconclusive probe, not an answer.
+//
+//nolint:gochecknoglobals // a fixed vocabulary, matched in one place
+var metadataAbsentMarkers = []string{
+	"No valid meta data found",
+	"no valid meta data",
+}
+
+// metadataDefinitelyAbsent reports whether the failed probe positively
+// said the volume has no metadata, rather than merely failing.
+func metadataDefinitelyAbsent(errStr, out string) bool {
+	for _, marker := range metadataAbsentMarkers {
+		if strings.Contains(errStr, marker) || strings.Contains(out, marker) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Primary flips the resource to Primary role so it can be opened

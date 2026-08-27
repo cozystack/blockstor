@@ -1211,3 +1211,31 @@ func TestHasMDFailsClosedOnUnparseableConfig(t *testing.T) {
 		t.Errorf("HasMD on unparseable config: got true, want false")
 	}
 }
+
+// errHasMDDumpMdKilled mirrors dump-md dying for a reason that has
+// nothing to do with the disk — OOM-killed under memory pressure here.
+var errHasMDDumpMdKilled = errors.New("drbdadm dump-md pvc-live/0: signal: killed")
+
+// TestHasMDFailsClosedOnUnrecognisedFailure: the probe guards
+// `create-md --force`, so it may answer "no metadata" only for the exits
+// that positively say so. Every other failure has to surface.
+//
+// Treating them all as "absent" is worse than the unparseable-config
+// case that first exposed this: nothing downstream trips over an
+// OOM-kill or a held drbdmeta lock a moment later, so create-md --force
+// goes on to succeed and wipes the GI tuple and dirty bitmap of a
+// healthy replica.
+func TestHasMDFailsClosedOnUnrecognisedFailure(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md pvc-live/0",
+		storage.FakeResponse{Err: errHasMDDumpMdKilled})
+
+	has, err := drbd.NewAdm(fx).HasMD(t.Context(), "pvc-live/0")
+	if err == nil {
+		t.Fatal("HasMD on an unrecognised failure: want error, got nil")
+	}
+
+	if has {
+		t.Errorf("HasMD on an unrecognised failure: got true, want false")
+	}
+}

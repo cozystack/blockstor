@@ -980,3 +980,109 @@ func TestVolumelessDefinitionIsSkipped(t *testing.T) {
 		t.Errorf("volume-less skip was not reported; warnings: %v", res.Warnings)
 	}
 }
+
+// TestInitializedLatchSurvivesAnUnmigratedNode: a replica skipped
+// because its host node is not in the dump is not a replica that is
+// gone — the data is still on that node's disk. Unlatching there is the
+// direction the latch exists to prevent: the controller would place
+// fresh replicas, elect an auto-primary and seed a blank first sync,
+// and the real replica becomes SyncTarget of the blank set the moment
+// the operator brings that node in.
+//
+// Only a DELETE-flagged replica means the data was being discarded.
+func TestInitializedLatchSurvivesAnUnmigratedNode(t *testing.T) {
+	dump := &Dump{
+		// NODE-B is deliberately absent: a staged or incomplete dump.
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		ResourceDefinitions: []ResourceDefinitionRow{
+			{ResourceName: "PVC-ELSEWHERE", ResourceDspName: "pvc-elsewhere", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-e"},
+			{ResourceName: "PVC-DELETED", ResourceDspName: "pvc-deleted", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-d"},
+		},
+		VolumeDefinitions: []VolumeDefinitionRow{
+			{ResourceName: "PVC-ELSEWHERE", VlmNr: 0, VlmSize: 1048576, UUID: "vd-e"},
+			{ResourceName: "PVC-DELETED", VlmNr: 0, VlmSize: 1048576, UUID: "vd-d"},
+		},
+		Resources: []ResourceRow{
+			// Real data, on a node this dump does not carry.
+			{NodeName: "NODE-B", ResourceName: "PVC-ELSEWHERE", UUID: "r-e"},
+			// Genuinely on its way out.
+			{NodeName: "NODE-A", ResourceName: "PVC-DELETED", ResourceFlags: 2, UUID: "r-d"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	latched := map[string]bool{}
+	for i := range res.ResourceDefinitions {
+		rd := &res.ResourceDefinitions[i]
+		latched[rd.Name] = rd.Spec.Initialized != nil && *rd.Spec.Initialized
+	}
+
+	if !latched["pvc-elsewhere"] {
+		t.Error("a replica held back by an unmigrated node still holds data: " +
+			"Initialized must stay latched")
+	}
+
+	if latched["pvc-deleted"] {
+		t.Error("every replica was DELETE-flagged: Initialized must not be latched, " +
+			"or nothing can seed the first sync")
+	}
+
+	if !hasWarning(res, "pvc-elsewhere: every replica lives on a node that was not migrated") {
+		t.Errorf("the operator was not told the definition is incomplete; warnings: %v", res.Warnings)
+	}
+}
+
+// TestSparseRemapWidensTheProviderAllowList: the placer filters
+// candidate pools on the resource group's provider allow-list with an
+// exact match, so remapping a pool from ZFS to ZFS_THIN without telling
+// the group leaves it pinned to a kind no pool has any more. Adoption
+// still succeeds and the volumes keep working, but nothing new can be
+// placed and a lost replica cannot be healed — silently, until someone
+// edits the group.
+//
+// A cluster that deliberately ran thick-declared sparse ZFS is exactly
+// the kind that pins the list this way.
+func TestSparseRemapWidensTheProviderAllowList(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "SPARSE", DriverName: "ZFS", UUID: "sp-1"},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/SPARSE", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{ResourceGroupName: "RG-PINNED", ResourceGroupDspName: "rg-pinned", AllowedProviderList: `["ZFS"]`, UUID: "rg-1"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if len(res.ResourceGroups) != 1 {
+		t.Fatalf("resource groups = %d, want 1", len(res.ResourceGroups))
+	}
+
+	list := res.ResourceGroups[0].Spec.SelectFilter.ProviderList
+
+	if !slices.Contains(list, "ZFS_THIN") {
+		t.Errorf("the pool migrated as ZFS_THIN but the group still allows only %v; "+
+			"the placer would find no eligible pool", list)
+	}
+
+	// Widened, not substituted: a genuinely thick pool elsewhere in the
+	// cluster must stay eligible for a group that named ZFS.
+	if !slices.Contains(list, "ZFS") {
+		t.Errorf("ZFS was dropped from the allow-list: %v", list)
+	}
+}
