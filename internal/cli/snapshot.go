@@ -29,6 +29,7 @@ import (
 	"github.com/google/uuid"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
@@ -345,10 +346,39 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 
 	err = hydrateVolumes(ctx, run, def.Name, &snap)
 	if err != nil {
-		return err
+		return rollbackRestore(ctx, run, def.Name, err)
 	}
 
-	return placeRestored(ctx, run, args.fromResource, def.Name, &snap)
+	err = placeRestored(ctx, run, args.fromResource, def.Name, &snap)
+	if err != nil {
+		return rollbackRestore(ctx, run, def.Name, err)
+	}
+
+	return nil
+}
+
+// rollbackRestore removes the definition a failed restore had already
+// created, and returns the failure that caused it.
+//
+// Without it a restore that dies partway — one volume of several
+// created, a size the API server now refuses, a conflict on the create
+// — leaves the definition and whatever volumes it got behind. The
+// obvious response, running the same command again, then fails on
+// "already exists" and the operator has to delete by hand first. That
+// is the half-restored state this verb goes out of its way to avoid
+// elsewhere, and the sibling snapshot create-multiple already unwinds
+// this way.
+//
+// A rollback that itself fails must not replace the original error:
+// the first one is what the operator needs, the second is a note about
+// what was left behind.
+func rollbackRestore(ctx context.Context, run *runContext, rdName string, cause error) error {
+	err := run.Store.ResourceDefinitions().Delete(ctx, rdName)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("%w (rolling back %s also failed: %w)", cause, rdName, err)
+	}
+
+	return cause
 }
 
 // snapshotRestoreVolumeDefinition implements `snapshot
@@ -444,10 +474,31 @@ func placeRestored(ctx context.Context, run *runContext, srcRD, rdName string, s
 	return nil
 }
 
-// sourcePoolOn reports which pool the source replica uses on a node,
-// falling back to the source's first diskful pool so a restore onto a
-// node the source does not occupy still pins a backend.
+// errNoSourcePool is returned when a restore cannot work out which
+// storage pool the new replica belongs in and the operator did not say.
+var errNoSourcePool = errors.New("no storage pool to restore into")
+
+// sourcePoolOn reports which pool the restored replica should use on a
+// node: `--storage-pool` when the operator named one, otherwise the
+// pool the source uses on that node, otherwise the source's first
+// diskful pool.
+//
+// It REFUSES rather than returning an empty pool. A diskful Resource
+// with no StorPoolName is created happily — nothing in the CRD requires
+// the field — and then the satellite fails every reconcile with
+// `unknown storage pool ""`, which this repository has already been
+// bitten by once (pkg/store/k8s/resources.go). The verb would report
+// success while producing a replica that can never come up.
+//
+// The case is not exotic: it is the disaster-recovery one restore
+// exists for. A snapshot outlives its source, the source degrades to
+// diskless-only or loses its replicas, and there is no pool left to
+// infer. The operator knows where it should land; the code does not.
 func sourcePoolOn(ctx context.Context, run *runContext, srcRD, node string) (string, error) {
+	if chosen := run.Flags.Values["storage-pool"]; chosen != "" {
+		return chosen, nil
+	}
+
 	replicas, err := run.Store.Resources().ListByDefinition(ctx, srcRD)
 	if err != nil {
 		return "", fmt.Errorf("list replicas of %s: %w", srcRD, err)
@@ -468,6 +519,11 @@ func sourcePoolOn(ctx context.Context, run *runContext, srcRD, node string) (str
 		if fallback == "" {
 			fallback = pool
 		}
+	}
+
+	if fallback == "" {
+		return "", fmt.Errorf("%w: %s has no diskful replica to take a storage pool from; "+
+			"name one with --storage-pool", errNoSourcePool, srcRD)
 	}
 
 	return fallback, nil

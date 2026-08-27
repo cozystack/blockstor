@@ -86,6 +86,14 @@ func TestInMemorySnapshotStore(t *testing.T) {
 	})
 }
 
+func TestInMemoryPhysicalDeviceStore(t *testing.T) {
+	storetest.RunPhysicalDeviceStore(t, func(t *testing.T) store.Store {
+		t.Helper()
+
+		return store.NewInMemory()
+	})
+}
+
 func TestInMemoryControllerPropsStore(t *testing.T) {
 	storetest.RunControllerPropsStore(t, func(t *testing.T) store.Store {
 		t.Helper()

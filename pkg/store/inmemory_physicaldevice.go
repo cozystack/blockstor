@@ -140,6 +140,15 @@ func (s *inMemoryPhysicalDevices) PatchPhysicalDeviceSpec(
 		return errors.Wrapf(ErrNotFound, "physical device %q", name)
 	}
 
+	// The struct copy above is shallow: its pointer fields still alias
+	// the stored value, so a mutator editing THROUGH one of them would
+	// reach the store whether or not it goes on to fail. Detach them,
+	// or the rollback below is only apparent.
+	if dev.AttachTo != nil {
+		attach := *dev.AttachTo
+		dev.AttachTo = &attach
+	}
+
 	err := mutate(&dev)
 	if err != nil {
 		return errors.Wrapf(err, "patch physical device %q", name)

@@ -151,14 +151,29 @@ type ResourceDefinitionVolume struct {
 	// lands on zero has to be refused before it is stored.
 	//
 	// A bound on an existing field validates on UPDATE as well as on
-	// create, so an object already outside it would become unwritable
-	// — every controller spec write on it rejected, with no way to
-	// edit it back into range. That is why the bound is not merely
-	// added: every path that writes a size enforces it too, including
-	// the REST spawn handler, which deliberately did not. No path can
-	// produce an out-of-range volume, so there is nothing to ratchet
-	// for; had there been, this would need the optionalOldSelf shape
-	// drbdPort uses rather than a plain Minimum/Maximum.
+	// create, so an object already outside it becomes spec-unwritable:
+	// every controller write rejected, including writes that do not
+	// touch the size. That is reachable on an in-place upgrade — the
+	// REST spawn handler accepted any positive size until the gate was
+	// added alongside this bound, so a cluster upgrading into it can
+	// already hold a definition sized 1..4095 KiB.
+	//
+	// The grandfathering shape drbdPort uses is not available here.
+	// volumeDefinitions is an unkeyed list, so the API server cannot
+	// correlate items across an update and rejects oldSelf outright:
+	// "oldSelf cannot be used on the uncorrelatable portion of the
+	// schema". Making it a listType=map on volumeNumber would allow it,
+	// at the cost of changing merge semantics for every client of a
+	// served API — not something to slip into this change.
+	//
+	// So the assumption is stated instead of hidden: an upgrade is
+	// expected to carry no out-of-range volume. Such a volume was never
+	// functional (it is below DRBD's own per-device floor, where the
+	// satellite loops on create-md rather than failing), Delete never
+	// validates spec so cleanup still works, and Kubernetes >= 1.30
+	// skips validation for fields an update does not change. If an
+	// installed base ever does carry one, the list has to become
+	// correlatable before this can ratchet.
 	//
 	// +kubebuilder:validation:Minimum=4096
 	// +kubebuilder:validation:Maximum=17179869184

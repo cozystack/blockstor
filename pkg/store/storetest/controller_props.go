@@ -19,6 +19,7 @@ limitations under the License.
 package storetest
 
 import (
+	"errors"
 	"sync"
 	"testing"
 )
@@ -41,6 +42,84 @@ func RunControllerPropsStore(t *testing.T, newStore Factory) {
 	// shim writes — pinned under -race so an implementation that hands
 	// out its backing map (or mutates without locking) fails loudly.
 	t.Run("ConcurrentGetSet", func(t *testing.T) { testCtrlPropsConcurrentGetSet(t, newStore) })
+	t.Run("PatchMerges", func(t *testing.T) { testCtrlPropsPatchMerges(t, newStore) })
+	t.Run("PatchErrorLeavesBagAlone", func(t *testing.T) { testCtrlPropsPatchErrorLeavesBagAlone(t, newStore) })
+}
+
+// testCtrlPropsPatchMerges: PatchProps edits one key and leaves the rest
+// of the bag alone. That is the whole reason it exists next to Set — a
+// Get, mutate, Set round trip reverts whatever another writer added in
+// between, with no error to notice it by.
+func testCtrlPropsPatchMerges(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	err := s.ControllerProps().Set(ctx, map[string]string{"Kept": "1", "Replaced": "old"})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	err = s.ControllerProps().PatchProps(ctx, func(props map[string]string) error {
+		props["Replaced"] = "new"
+		props["Added"] = "2"
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("PatchProps: %v", err)
+	}
+
+	got, err := s.ControllerProps().Get(ctx)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	for key, want := range map[string]string{"Kept": "1", "Replaced": "new", "Added": "2"} {
+		if got[key] != want {
+			t.Errorf("props[%q] = %q, want %q (whole bag: %v)", key, got[key], want, got)
+		}
+	}
+}
+
+// testCtrlPropsPatchErrorLeavesBagAlone: a mutator that fails must not
+// half-apply. The caller uses the error to abort, so a partially written
+// bag would be the one state nobody handles.
+func testCtrlPropsPatchErrorLeavesBagAlone(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	err := s.ControllerProps().Set(ctx, map[string]string{"Kept": "1"})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	sentinel := errors.New("mutator said no")
+
+	err = s.ControllerProps().PatchProps(ctx, func(props map[string]string) error {
+		props["Ghost"] = "should not survive"
+
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("PatchProps error = %v, want the mutator's own", err)
+	}
+
+	got, err := s.ControllerProps().Get(ctx)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if _, leaked := got["Ghost"]; leaked {
+		t.Errorf("a failed mutation leaked into the store: %v", got)
+	}
+
+	if got["Kept"] != "1" {
+		t.Errorf("a failed mutation disturbed the bag: %v", got)
+	}
 }
 
 // testCtrlPropsGetEmpty pins the "no value written yet" contract: an

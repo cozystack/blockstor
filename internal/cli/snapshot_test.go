@@ -378,3 +378,98 @@ func TestShortLayerListFlagReachesTheSameField(t *testing.T) {
 		}
 	}
 }
+
+// seedPoollessSnapshotSource is the disaster-recovery shape restore
+// exists for: the snapshot outlived its source's diskful replicas, so
+// there is no pool left to infer one from.
+func seedPoollessSnapshotSource(ctx context.Context, backend store.Store) {
+	_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "grp"})
+	_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "pvc-x", ResourceGroupName: "grp", LayerStack: []string{"DRBD", "STORAGE"},
+	})
+	_ = backend.VolumeDefinitions().Create(ctx, "pvc-x", &apiv1.VolumeDefinition{
+		VolumeNumber: 0, SizeKib: 1 << 20,
+	})
+
+	// Diskless survivors: present, but carrying no StorPoolName.
+	for _, node := range []string{"node-1", "node-2"} {
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: node})
+	}
+
+	_ = backend.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name: "snap-1", ResourceName: "pvc-x",
+		Nodes:             []string{"node-1", "node-2"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 1 << 20}},
+	})
+}
+
+// TestSnapshotRestoreRefusesWithoutAPool: a restore that cannot work out
+// which storage pool the new replica belongs in has to say so, not
+// create a diskful replica with an empty one.
+//
+// Nothing rejects that replica: the CRD does not require the field, the
+// empty-value stamp is a documented no-op, and Create succeeds — so the
+// verb reports success and the satellite then fails every reconcile with
+// `unknown storage pool ""`. This repository has been bitten by that end
+// state once already, from a different cause.
+func TestSnapshotRestoreRefusesWithoutAPool(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, seedPoollessSnapshotSource)
+
+	argv := []string{
+		"s", "resource", "restore",
+		"--from-resource", "pvc-x", "--from-snapshot", "snap-1", "--to-resource", "pvc-y",
+	}
+
+	if got := app.Run(t.Context(), argv); got == 0 {
+		t.Fatal("restore with no pool to infer exited 0; want a refusal")
+	}
+
+	replicas, err := appStore(t, app).Resources().ListByDefinition(t.Context(), "pvc-y")
+	if err == nil && len(replicas) > 0 {
+		t.Errorf("a replica was created with no storage pool: %+v", replicas[0].Props)
+	}
+
+	// The refusal lands after the definition was created, so it also
+	// has to unwind. Left behind, it turns the obvious response —
+	// running the corrected command again — into "already exists",
+	// and the operator has to delete by hand first.
+	if _, err := appStore(t, app).ResourceDefinitions().Get(t.Context(), "pvc-y"); err == nil {
+		t.Error("the failed restore left its resource definition behind")
+	}
+}
+
+// TestSnapshotRestoreTakesTheNamedPool: --storage-pool is the operator's
+// answer when the source cannot supply one.
+func TestSnapshotRestoreTakesTheNamedPool(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedPoollessSnapshotSource)
+
+	argv := []string{
+		"s", "resource", "restore",
+		"--from-resource", "pvc-x", "--from-snapshot", "snap-1", "--to-resource", "pvc-y",
+		"--storage-pool", "rescue",
+	}
+
+	if got := app.Run(t.Context(), argv); got != 0 {
+		t.Fatalf("restore with --storage-pool exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	replicas, err := appStore(t, app).Resources().ListByDefinition(t.Context(), "pvc-y")
+	if err != nil {
+		t.Fatalf("list restored replicas: %v", err)
+	}
+
+	if len(replicas) == 0 {
+		t.Fatal("no replica was restored")
+	}
+
+	for i := range replicas {
+		if replicas[i].Props["StorPoolName"] != "rescue" {
+			t.Errorf("replica on %s got pool %q, want rescue",
+				replicas[i].NodeName, replicas[i].Props["StorPoolName"])
+		}
+	}
+}

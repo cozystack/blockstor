@@ -153,10 +153,44 @@ func resourceDefinitionClone(ctx context.Context, run *runContext) error {
 
 // ensureCloneSnapshot takes the internal snapshot, tolerating one that
 // a previous attempt already left behind.
-func ensureCloneSnapshot(ctx context.Context, run *runContext, src *apiv1.ResourceDefinition, snapName string) error {
-	_, err := run.Store.Snapshots().Get(ctx, src.Name, snapName)
-	if err == nil {
+// errStaleCloneSnapshot is returned when the snapshot a retried clone
+// would reuse no longer describes the source.
+var errStaleCloneSnapshot = errors.New("the clone snapshot predates a change to the source")
+
+// checkCloneSnapshotIsCurrent refuses a snapshot that no longer matches
+// the source's volume layout.
+//
+// The snapshot name is deterministic on purpose, so an interrupted
+// clone can be retried without accreting one snapshot per attempt. But
+// "found" is not the same as "still right": if the first attempt took
+// the snapshot and then failed, and a volume was added to the source
+// before the retry, reusing it produces a target missing that volume —
+// and reports success.
+//
+// Refusing rather than re-taking is deliberate: the existing snapshot
+// may be the only copy of something, and deleting it is the operator's
+// call, not this verb's.
+func checkCloneSnapshotIsCurrent(
+	ctx context.Context, run *runContext, src *apiv1.ResourceDefinition, snap *apiv1.Snapshot,
+) error {
+	current, err := run.Store.VolumeDefinitions().List(ctx, src.Name)
+	if err != nil {
+		return fmt.Errorf("list volumes of %s: %w", src.Name, err)
+	}
+
+	if len(current) == len(snap.VolumeDefinitions) {
 		return nil
+	}
+
+	return fmt.Errorf("%w: %s covers %d volume(s) but %s now has %d; "+
+		"delete the snapshot to retake it",
+		errStaleCloneSnapshot, snap.Name, len(snap.VolumeDefinitions), src.Name, len(current))
+}
+
+func ensureCloneSnapshot(ctx context.Context, run *runContext, src *apiv1.ResourceDefinition, snapName string) error {
+	existing, err := run.Store.Snapshots().Get(ctx, src.Name, snapName)
+	if err == nil {
+		return checkCloneSnapshotIsCurrent(ctx, run, src, &existing)
 	}
 
 	if !isNotFound(err) {
