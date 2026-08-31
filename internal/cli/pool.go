@@ -216,7 +216,7 @@ func volumeGroupNumber(run *runContext, group *apiv1.ResourceGroup) (int32, erro
 		return next, nil
 	}
 
-	number, err := parseInt32(raw, "--vlmnr")
+	number, err := parseVolumeNumber(raw, "--vlmnr")
 	if err != nil {
 		return 0, err
 	}

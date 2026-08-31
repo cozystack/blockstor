@@ -164,17 +164,31 @@ func stampDevices(
 		return fmt.Errorf("list devices on %s: %w", node, err)
 	}
 
+	// Resolve every device before stamping any of them. The attach is
+	// not atomic across devices, so a typo in the fourth of four names
+	// would otherwise leave the first three claimed by a pool that is
+	// never created — and a corrected re-run is then refused, because
+	// those three now look like someone else's claim. The operator is
+	// stuck editing CRs by hand. The REST path validates all targets
+	// before its first write for the same reason, as does this CLI's
+	// own resource-group spawn.
+	names := make([]string, 0, len(devices))
+
 	for _, wanted := range devices {
 		name, resolveErr := resolveDevice(known, wanted, node)
 		if resolveErr != nil {
 			return resolveErr
 		}
 
+		names = append(names, name)
+	}
+
+	for i, wanted := range devices {
 		// The device list was read once, up front. Writing the whole
 		// spec back from that snapshot reverts whatever else changed
 		// on the device since; patch only the field this command is
 		// about, and decide against the freshly fetched state.
-		err = run.Store.PhysicalDevices().PatchPhysicalDeviceSpec(ctx, name,
+		err = run.Store.PhysicalDevices().PatchPhysicalDeviceSpec(ctx, names[i],
 			func(dev *apiv1.PhysicalDevice) error {
 				return claimDevice(dev, wanted, node, attach)
 			})

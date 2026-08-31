@@ -113,6 +113,19 @@ func toggleDiskCancel(ctx context.Context, run *runContext, node, rdName string)
 func setDiskless(ctx context.Context, run *runContext, node, rdName string, diskless bool) error {
 	pool := run.Flags.Values["storage-pool"]
 
+	// Promotion gives a replica storage, so it needs a pool. The flag
+	// flip alone leaves the satellite with `unknown storage pool ""`
+	// and the replica stuck in Provisioning, so an omitted
+	// --storage-pool is resolved the way the REST path resolves it.
+	if !diskless && pool == "" {
+		resolved, err := resolveStorPool(ctx, run, rdName, node)
+		if err != nil {
+			return err
+		}
+
+		pool = resolved
+	}
+
 	return patchResource(ctx, run, node, rdName, func(res *apiv1.Resource) {
 		res.Flags = setFlag(res.Flags, apiv1.ResourceFlagDiskless, diskless)
 
@@ -242,6 +255,20 @@ func migrateDisk(ctx context.Context, run *runContext, dst, rdName string) error
 
 func createMigrationTarget(ctx context.Context, run *runContext, dst, rdName, pool, src string) error {
 	res := &apiv1.Resource{Name: rdName, NodeName: dst}
+
+	// A migration target is diskful by construction, and the satellite
+	// cannot bind one without a pool. stampProp with an empty value is
+	// a no-op, so an omitted --storage-pool would leave the target
+	// wedged in Provisioning; resolve it the way the REST path does.
+	if pool == "" {
+		resolved, err := resolveStorPool(ctx, run, rdName, dst)
+		if err != nil {
+			return err
+		}
+
+		pool = resolved
+	}
+
 	stampProp(res, storPoolNameProp, pool)
 	stampProp(res, migratingFromProp, src)
 

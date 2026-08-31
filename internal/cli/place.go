@@ -177,6 +177,14 @@ func applyPlaceCountFlags(flags *flagSet, filter *apiv1.AutoSelectFilter) error 
 			return err
 		}
 
+		// A count of zero or less places nothing. Left to run, the
+		// autoplace path returns early and reports success, so a
+		// typo'd counter looks exactly like a completed placement and
+		// the operator finds out when the volume has no replicas.
+		if count < 1 {
+			return fmt.Errorf("%w: --%s must be at least 1, got %d", command.ErrUsage, name, count)
+		}
+
 		if delta {
 			filter.AdditionalPlaceCount = apiv1.LaxInt32(count)
 		} else {

@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -49,6 +51,36 @@ func parseInt32(text, what string) (int32, error) {
 	return int32(value), nil
 }
 
+// minVolumeNumber / maxVolumeNumber bound DRBD-9's addressable volume
+// range, matching the REST validator.
+const (
+	minVolumeNumber int32 = 0
+	maxVolumeNumber int32 = 65535
+)
+
+// parseVolumeNumber parses a volume number and holds it inside the
+// range DRBD can actually address.
+//
+// Bare parseInt32 accepts every int32, including negatives. A negative
+// number reaches the CRD, the satellite derives a device node from it,
+// and the replica hangs waiting for a DRBD-ID that can never be
+// allocated — the REST path rejects the same input for exactly that
+// reason. This CLI writes the CRD directly, so the bound has to be
+// repeated here or it is simply absent on this path.
+func parseVolumeNumber(text, what string) (int32, error) {
+	number, err := parseInt32(text, what)
+	if err != nil {
+		return 0, err
+	}
+
+	if number < minVolumeNumber || number > maxVolumeNumber {
+		return 0, fmt.Errorf("%w: %s %d is outside the addressable range [%d, %d]",
+			command.ErrUsage, what, number, minVolumeNumber, maxVolumeNumber)
+	}
+
+	return number, nil
+}
+
 // ParseSize converts the size spellings operators use — `10G`, `100M`,
 // `2T`, or a bare number of KiB — into KiB.
 //
@@ -64,13 +96,10 @@ func ParseSize(text string) (int64, error) {
 	// often as they type them. Trimming happens BEFORE the unit is
 	// read: the unit is the last byte, so `10GiB` would otherwise be
 	// rejected for ending in `B`.
-	for _, suffix := range []string{"iB", "IB", "i", "B", "b"} {
-		if len(trimmed) > 1 && strings.HasSuffix(trimmed, suffix) {
-			trimmed = trimmed[:len(trimmed)-len(suffix)]
-
-			break
-		}
-	}
+	// Matched case-insensitively: an operator who types `16gib` means
+	// the same thing as one who pastes `16GiB`, and rejecting one
+	// spelling of a size is a papercut with no upside.
+	trimmed, inBytes := trimSizeSuffix(trimmed)
 
 	if trimmed == "" {
 		return 0, fmt.Errorf("%w: empty size", command.ErrUsage)
@@ -107,6 +136,18 @@ func ParseSize(text string) (int64, error) {
 		return 0, fmt.Errorf("%w: size %q does not fit", command.ErrUsage, text)
 	}
 
+	// A byte-denominated size with no scale letter is bytes, not KiB.
+	// Read as KiB it comes out 1024x too large — `512B` became half a
+	// megabyte — so convert it, and refuse the ones that are not a
+	// whole number of KiB rather than rounding a size silently.
+	if inBytes && multiplier == 1 {
+		if value%kibPerMib != 0 {
+			return 0, fmt.Errorf("%w: size %q is not a whole number of KiB", command.ErrUsage, text)
+		}
+
+		return value / kibPerMib, nil
+	}
+
 	return value * multiplier, nil
 }
 
@@ -124,10 +165,15 @@ func nodeCreate(ctx context.Context, run *runContext) error {
 	if len(run.Flags.Positionals) > 1 {
 		iface := apiv1.NetInterface{Name: "default", Address: run.Flags.Positionals[1]}
 
+		addrErr := validateNodeAddress(iface.Address)
+		if addrErr != nil {
+			return addrErr
+		}
+
 		if port := run.Flags.Values["port"]; port != "" {
-			parsed, err := strconv.Atoi(port)
+			parsed, err := parseSatellitePort(port)
 			if err != nil {
-				return fmt.Errorf("%w: --port %q is not a number", command.ErrUsage, port)
+				return err
 			}
 
 			iface.SatellitePort = parsed
@@ -195,7 +241,7 @@ func volumeDefinitionCreate(ctx context.Context, run *runContext) error {
 	// the next free one atomically, which is what keeps two concurrent
 	// creates from claiming the same slot.
 	if raw := run.Flags.Values["vlmnr"]; raw != "" {
-		number, convErr := parseInt32(raw, "--vlmnr")
+		number, convErr := parseVolumeNumber(raw, "--vlmnr")
 		if convErr != nil {
 			return convErr
 		}
@@ -383,12 +429,13 @@ func resourceCreate(ctx context.Context, run *runContext) error {
 			Props:    map[string]string{},
 		}
 
-		if pool := run.Flags.Values["storage-pool"]; pool != "" {
-			res.Props["StorPoolName"] = pool
-		}
-
 		if run.Flags.Diskless {
 			res.Flags = append(res.Flags, apiv1.ResourceFlagDiskless)
+		}
+
+		poolErr := stampStorPool(ctx, run, res, rdName)
+		if poolErr != nil {
+			return poolErr
 		}
 
 		err := run.Store.Resources().Create(ctx, res)
@@ -548,4 +595,196 @@ func applyGroupPolicy(group *apiv1.ResourceGroup, flags *flagSet) error {
 	}
 
 	return nil
+}
+
+// stampStorPool records which pool a diskful replica belongs in,
+// resolving an omitted `--storage-pool` the way the REST path does.
+//
+// The satellite binds a diskful replica to Props["StorPoolName"] and
+// fails with `unknown storage pool ""` when it is empty, leaving the
+// replica in Provisioning for good. Nothing downstream fills it in: the
+// store does no defaulting, so a CLI that writes the CRD directly has
+// to carry the resolution itself or reintroduce the wedge the REST side
+// already fixed.
+//
+// The chain matches resolveTakeoverStorPool: an explicit flag wins, then
+// a diskful sibling's pool, then the resource group's SelectFilter —
+// first the single StoragePool, then the first entry of StoragePoolList,
+// which is where linstor-csi lands the storage class's pool name.
+func stampStorPool(ctx context.Context, run *runContext, res *apiv1.Resource, rdName string) error {
+	// A diskless replica has no backing storage by definition, and
+	// stamping a pool on one would contradict the flag the operator
+	// passed.
+	if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) {
+		return nil
+	}
+
+	if pool := run.Flags.Values["storage-pool"]; pool != "" {
+		stampProp(res, storPoolNameProp, pool)
+
+		return nil
+	}
+
+	pool, err := resolveStorPool(ctx, run, rdName, res.NodeName)
+	if err != nil {
+		return err
+	}
+
+	if pool == "" {
+		return nil
+	}
+
+	stampProp(res, storPoolNameProp, pool)
+
+	return nil
+}
+
+// resolveStorPool walks the same fallback chain the REST handler does.
+// An empty result is not an error here: a cluster with no resource
+// group and no sibling has nothing to infer from, and refusing would
+// break the bootstrap shapes that pass the pool explicitly on the
+// storage pool itself.
+func resolveStorPool(ctx context.Context, run *runContext, rdName, node string) (string, error) {
+	siblings, err := run.Store.Resources().ListByDefinition(ctx, rdName)
+	if err == nil {
+		for i := range siblings {
+			if siblings[i].NodeName == node ||
+				slices.Contains(siblings[i].Flags, apiv1.ResourceFlagDiskless) {
+				continue
+			}
+
+			if pool := siblings[i].Props[storPoolNameProp]; pool != "" {
+				return pool, nil
+			}
+		}
+	}
+
+	def, err := run.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		if isNotFound(err) {
+			return "", nil
+		}
+
+		return "", fmt.Errorf("get resource definition %s: %w", rdName, err)
+	}
+
+	if def.ResourceGroupName == "" {
+		return "", nil
+	}
+
+	group, err := run.Store.ResourceGroups().Get(ctx, def.ResourceGroupName)
+	if err != nil {
+		if isNotFound(err) {
+			return "", nil
+		}
+
+		return "", fmt.Errorf("get resource group %s: %w", def.ResourceGroupName, err)
+	}
+
+	if pool := group.SelectFilter.StoragePool; pool != "" {
+		return pool, nil
+	}
+
+	if len(group.SelectFilter.StoragePoolList) > 0 {
+		return group.SelectFilter.StoragePoolList[0], nil
+	}
+
+	return "", nil
+}
+
+// validateNodeAddress refuses an address the satellite could never
+// bind. The field is carried verbatim into the DRBD config and the
+// controller's connection attempts, so a typo surfaces as a node that
+// simply never comes online rather than as a rejected command.
+func validateNodeAddress(address string) error {
+	if address == "" {
+		return fmt.Errorf("%w: node create needs an address", command.ErrUsage)
+	}
+
+	if net.ParseIP(address) != nil {
+		return nil
+	}
+
+	// A hostname is legitimate — the satellite resolves it — but it
+	// still has to look like one.
+	if isPlausibleHostname(address) {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %q is neither an IP address nor a hostname", command.ErrUsage, address)
+}
+
+// isPlausibleHostname accepts the shapes DNS allows, so an operator can
+// name a node by hostname without this rejecting it.
+func isPlausibleHostname(address string) bool {
+	// The DNS limits: 253 bytes for a name, 63 for one label.
+	const (
+		maxHostname = 253
+		maxLabel    = 63
+	)
+
+	if len(address) > maxHostname {
+		return false
+	}
+
+	for label := range strings.SplitSeq(address, ".") {
+		if label == "" || len(label) > maxLabel {
+			return false
+		}
+
+		for i, r := range label {
+			alnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+			if alnum {
+				continue
+			}
+
+			if r == '-' && i != 0 && i != len(label)-1 {
+				continue
+			}
+
+			return false
+		}
+	}
+
+	return true
+}
+
+// parseSatellitePort holds the port inside the range TCP can express.
+//
+// Atoi accepts any int, and the field is an int32 on the wire, so
+// `--port 4294970000` silently truncated to 2704 and the node was
+// created pointing at a port nobody listens on.
+func parseSatellitePort(text string) (int, error) {
+	parsed, err := strconv.Atoi(strings.TrimSpace(text))
+	if err != nil {
+		return 0, fmt.Errorf("%w: --port %q is not a number", command.ErrUsage, text)
+	}
+
+	const maxPort = 65535
+
+	if parsed < 1 || parsed > maxPort {
+		return 0, fmt.Errorf("%w: --port %d is outside [1, %d]", command.ErrUsage, parsed, maxPort)
+	}
+
+	return parsed, nil
+}
+
+// trimSizeSuffix strips the byte-unit suffix and reports whether what
+// remains is denominated in bytes rather than in the scale letter that
+// precedes it.
+//
+// Matched case-insensitively: an operator who types `16gib` means the
+// same thing as one who pastes `16GiB`, and rejecting one spelling of a
+// size is a papercut with no upside.
+func trimSizeSuffix(text string) (string, bool) {
+	for _, suffix := range []string{"ib", "i", "b"} {
+		if len(text) > 1 && strings.HasSuffix(strings.ToLower(text), suffix) {
+			// A bare `b` is the only one that changes the unit: `512B`
+			// is 512 bytes, while `512iB` and `512i` are the binary
+			// marker on whatever letter precedes them.
+			return text[:len(text)-len(suffix)], suffix == "b"
+		}
+	}
+
+	return text, false
 }

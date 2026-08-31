@@ -149,11 +149,63 @@ func formatRow(cells []any, columns int) []string {
 
 	for i := range out {
 		if i < len(cells) {
-			out[i] = formatCell(cells[i])
+			out[i] = sanitizeCell(formatCell(cells[i]))
 		}
 	}
 
 	return out
+}
+
+// asciiEscape starts every ANSI sequence, and asciiDelete is the other
+// control byte outside the C0 block.
+const (
+	asciiEscape = 0x1b
+	asciiDelete = 0x7f
+)
+
+// sanitizeCell makes a value safe to put in a rendered row.
+//
+// Cell values are operator- and satellite-supplied: a property set
+// through `set-property`, a FreeMessage the discovery loop wrote. Three
+// characters break something when they arrive verbatim. A pipe forges a
+// column boundary, which is the documented `awk -F'|'` contract for
+// parsing this output. A newline forges a whole row. And an escape
+// sequence is interpreted by the terminal — even under `--color=never`,
+// where the CLI's own colour is off and the operator has every reason
+// to expect plain text.
+//
+// Rendering them as their escaped form keeps the value visible and
+// inert, which beats dropping it: an operator debugging a device that
+// discovery refused needs to read the message, oddities included.
+func sanitizeCell(value string) string {
+	if !strings.ContainsAny(value, "|\n\r\t\x1b") {
+		return value
+	}
+
+	var b strings.Builder
+
+	b.Grow(len(value))
+
+	for _, r := range value {
+		switch {
+		case r == '|':
+			b.WriteString("\\|")
+		case r == '\n':
+			b.WriteString("\\n")
+		case r == '\r':
+			b.WriteString("\\r")
+		case r == '\t':
+			b.WriteString("\\t")
+		case r == asciiEscape:
+			b.WriteString("\\e")
+		case r < ' ' || r == asciiDelete:
+			fmt.Fprintf(&b, "\\x%02x", r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+
+	return b.String()
 }
 
 // formatCell renders one Table cell. The Kubernetes Table API delivers

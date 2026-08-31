@@ -312,3 +312,213 @@ func TestResourceListVolumes(t *testing.T) {
 		t.Errorf("list-volumes is missing the resource:\n%s", out.String())
 	}
 }
+
+// A diskful replica the satellite can bind needs Props["StorPoolName"];
+// without it the reconciler fails with `unknown storage pool ""` and the
+// replica sits in Provisioning for good. The REST path resolves an
+// omitted pool from the resource group, and this CLI writes the CRD
+// directly, so it has to resolve it too.
+func TestResourceCreateResolvesThePoolFromTheGroup(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+			Name: "rg-1",
+			SelectFilter: apiv1.AutoSelectFilter{
+				// Where linstor-csi lands the storage class's pool.
+				StoragePoolList: []string{"data"},
+			},
+		})
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:              "pvc-x",
+			ResourceGroupName: "rg-1",
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-1", "pvc-x"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	if pool := getResource(t, app, "node-1").Props["StorPoolName"]; pool != "data" {
+		t.Errorf("StorPoolName = %q, want data resolved from the group", pool)
+	}
+}
+
+// A sibling that already has a pool answers before the group does, so a
+// replica added to a live definition lands on the same backend.
+func TestResourceCreateInheritsThePoolFromASibling(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name:     "pvc-x",
+			NodeName: "node-1",
+			Props:    map[string]string{"StorPoolName": "tank"},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-2", "pvc-x"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	if pool := getResource(t, app, "node-2").Props["StorPoolName"]; pool != "tank" {
+		t.Errorf("StorPoolName = %q, want tank inherited from the sibling", pool)
+	}
+}
+
+// --diskless says the replica has no storage on purpose, so nothing
+// should be stamped on it.
+func TestResourceCreateDisklessKeepsNoPool(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+			Name:         "rg-1",
+			SelectFilter: apiv1.AutoSelectFilter{StoragePoolList: []string{"data"}},
+		})
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:              "pvc-x",
+			ResourceGroupName: "rg-1",
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "c", "--diskless", "node-1", "pvc-x"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	if pool := getResource(t, app, "node-1").Props["StorPoolName"]; pool != "" {
+		t.Errorf("StorPoolName = %q on a diskless replica, want empty", pool)
+	}
+}
+
+// Promotion gives a replica storage, so the same resolution applies:
+// flipping the flag without a pool wedges the satellite.
+func TestResourceToggleDiskPromotionResolvesThePool(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+			Name:         "rg-1",
+			SelectFilter: apiv1.AutoSelectFilter{StoragePoolList: []string{"data"}},
+		})
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:              "pvc-x",
+			ResourceGroupName: "rg-1",
+		})
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name:     "pvc-x",
+			NodeName: "node-1",
+			Flags:    []string{apiv1.ResourceFlagDiskless},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "td", "node-1", "pvc-x"}); got != 0 {
+		t.Fatalf("promotion exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	if pool := getResource(t, app, "node-1").Props["StorPoolName"]; pool != "data" {
+		t.Errorf("StorPoolName = %q after promotion, want data", pool)
+	}
+}
+
+// A negative volume number reaches the CRD, the satellite derives a
+// device node from it, and the replica hangs waiting for a DRBD-ID that
+// can never be allocated. REST rejects it; this path has to as well.
+func TestVolumeDefinitionCreateRefusesANegativeNumber(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+	})
+
+	if got := app.Run(t.Context(), []string{"vd", "c", "pvc-x", "1G", "--vlmnr", "-3"}); got == 0 {
+		t.Fatal("a negative volume number was accepted; want a refusal")
+	}
+}
+
+// The upper bound is DRBD-9's addressable range, matching REST.
+func TestVolumeDefinitionCreateRefusesAnOversizeNumber(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+	})
+
+	if got := app.Run(t.Context(), []string{"vd", "c", "pvc-x", "1G", "--vlmnr", "70000"}); got == 0 {
+		t.Fatal("a volume number past the addressable range was accepted; want a refusal")
+	}
+}
+
+// The size spellings an operator actually types. Rejecting one casing
+// of a suffix is a papercut; reading a byte count as KiB is a volume
+// 1024x too large.
+func TestParseSizeSpellings(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+	})
+
+	// 16GiB in every casing the docs and the shell produce.
+	for i, spelling := range []string{"16GiB", "16gib", "16Gib", "16Gi", "16G"} {
+		argv := []string{"vd", "c", "pvc-x", spelling, "--vlmnr", string(rune('0' + i))}
+		if got := app.Run(t.Context(), argv); got != 0 {
+			t.Errorf("%s: exit = %d (stderr: %s)", spelling, got, errBuf.String())
+		}
+	}
+}
+
+// 512 bytes is not a whole KiB, and rounding a size silently is worse
+// than refusing it.
+func TestParseSizeRefusesAPartialKib(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+	})
+
+	if got := app.Run(t.Context(), []string{"vd", "c", "pvc-x", "512B"}); got == 0 {
+		t.Fatal("512B was accepted; it is not a whole number of KiB")
+	}
+}
+
+// A place count of zero or less places nothing, so reporting success
+// hands back a volume with no replicas.
+func TestPlaceCountRefusesZeroOrLess(t *testing.T) {
+	t.Parallel()
+
+	for _, count := range []string{"0", "-2"} {
+		app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+			_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+		})
+
+		if got := app.Run(t.Context(), []string{"rd", "ap", "pvc-x", "--place-count", count}); got == 0 {
+			t.Errorf("--place-count %s was accepted as a no-op; want a refusal", count)
+		}
+	}
+}
+
+// An out-of-range port silently truncated on the int32 cast, so the
+// node was created pointing at a port nobody listens on.
+func TestNodeCreateRefusesAnOutOfRangePort(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, nil)
+
+	argv := []string{"n", "c", "node-1", "10.0.0.1", "--port", "4294970000"}
+	if got := app.Run(t.Context(), argv); got == 0 {
+		t.Fatal("an out-of-range port was accepted")
+	}
+}
+
+// A malformed address leaves a node that never comes online.
+func TestNodeCreateRefusesAMalformedAddress(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, nil)
+
+	if got := app.Run(t.Context(), []string{"n", "c", "node-1", "10.0.0.1 ; rm"}); got == 0 {
+		t.Fatal("a malformed address was accepted")
+	}
+}
