@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 
@@ -95,18 +96,8 @@ func readPassphrase(run *runContext) (string, error) {
 		in = os.Stdin
 	}
 
-	if file, ok := in.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
-		fmt.Fprint(run.Err, "Passphrase: ")
-
-		typed, err := term.ReadPassword(int(file.Fd()))
-
-		fmt.Fprintln(run.Err)
-
-		if err != nil {
-			return "", fmt.Errorf("read passphrase: %w", err)
-		}
-
-		return string(typed), nil
+	if fd, ok := terminalFd(in); ok {
+		return readPassphraseFromTerminal(run, fd)
 	}
 
 	line, err := bufio.NewReader(in).ReadString('\n')
@@ -115,6 +106,47 @@ func readPassphrase(run *runContext) (string, error) {
 	}
 
 	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// terminalFd reports the descriptor to prompt on, when the input is an
+// interactive terminal.
+//
+// os.File spells a descriptor as a uintptr while the terminal package
+// wants an int. The range check is not ceremony for the linter: a value
+// that does not fit is not a descriptor any syscall handed us, and
+// truncating it would ask the terminal package about some unrelated
+// open file. Falling through to the plain-line path is the right answer
+// for input this cannot identify.
+func terminalFd(in io.Reader) (int, bool) {
+	file, ok := in.(*os.File)
+	if !ok {
+		return 0, false
+	}
+
+	raw := file.Fd()
+	if raw > math.MaxInt {
+		return 0, false
+	}
+
+	fd := int(raw)
+
+	return fd, term.IsTerminal(fd)
+}
+
+// readPassphraseFromTerminal prompts without echoing, so the key does
+// not end up on screen or in a scrollback buffer.
+func readPassphraseFromTerminal(run *runContext, fd int) (string, error) {
+	fmt.Fprint(run.Err, "Passphrase: ")
+
+	typed, err := term.ReadPassword(fd)
+
+	fmt.Fprintln(run.Err)
+
+	if err != nil {
+		return "", fmt.Errorf("read passphrase: %w", err)
+	}
+
+	return string(typed), nil
 }
 
 // encryptionCreatePassphrase implements `encryption create-passphrase`.
