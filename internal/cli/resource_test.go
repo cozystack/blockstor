@@ -109,11 +109,20 @@ func TestResourceToggleDiskClearsTieBreaker(t *testing.T) {
 	}
 }
 
-// The bare form flips whatever the replica currently is.
+// seedTwoDiskful gives the definition a second data-bearing replica,
+// so demoting one of them is a legitimate move rather than the
+// last-copy deletion the guard refuses.
+func seedTwoDiskful(ctx context.Context, backend store.Store) {
+	seedDiskful(ctx, backend)
+	_ = backend.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: "node-2"})
+}
+
+// The bare form flips whatever the replica currently is, as long as
+// the definition keeps a copy of the data.
 func TestResourceToggleDiskFlips(t *testing.T) {
 	t.Parallel()
 
-	app, _, errBuf := newApp(t, seedDiskful)
+	app, _, errBuf := newApp(t, seedTwoDiskful)
 
 	if got := app.Run(t.Context(), []string{"r", "td", "node-1", "pvc-x"}); got != 0 {
 		t.Fatalf("toggle exit = %d (stderr: %s)", got, errBuf.String())
@@ -121,6 +130,72 @@ func TestResourceToggleDiskFlips(t *testing.T) {
 
 	if !containsFlag(getResource(t, app, "node-1").Flags, apiv1.ResourceFlagDiskless) {
 		t.Error("a bare toggle on a diskful replica did not demote it")
+	}
+}
+
+// TestResourceToggleDiskRefusesTheLastDiskful: the satellite reconciles
+// DISKLESS by deleting the backing volume, so demoting the only
+// data-bearing replica destroys the data. Upstream LINSTOR refuses the
+// same move; this CLI writes the CRD directly, so the guard has to be
+// here.
+func TestResourceToggleDiskRefusesTheLastDiskful(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedDiskful)
+
+	if got := app.Run(t.Context(), []string{"r", "td", "node-1", "pvc-x"}); got == 0 {
+		t.Fatalf("demoting the last diskful replica exited 0; want a refusal")
+	}
+
+	if msg := errBuf.String(); !strings.Contains(msg, "last diskful replica") {
+		t.Errorf("refusal does not name the reason: %s", msg)
+	}
+
+	if containsFlag(getResource(t, app, "node-1").Flags, apiv1.ResourceFlagDiskless) {
+		t.Error("a refused demotion still flipped the flag")
+	}
+}
+
+// --force is the documented override: an operator who means it can
+// still take the last copy down.
+func TestResourceToggleDiskForceDemotesTheLastDiskful(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedDiskful)
+
+	if got := app.Run(t.Context(), []string{"r", "td", "--force", "node-1", "pvc-x"}); got != 0 {
+		t.Fatalf("forced demotion exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	if !containsFlag(getResource(t, app, "node-1").Flags, apiv1.ResourceFlagDiskless) {
+		t.Error("--force did not demote the replica")
+	}
+}
+
+// A replica a consumer still has open is refused too: demoting it
+// detaches DRBD underneath the mount.
+func TestResourceToggleDiskRefusesAnInUseReplica(t *testing.T) {
+	t.Parallel()
+
+	inUse := true
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedTwoDiskful(ctx, backend)
+		res, err := backend.Resources().Get(ctx, "pvc-x", "node-1")
+		if err != nil {
+			return
+		}
+
+		res.State.InUse = &inUse
+		_ = backend.Resources().Update(ctx, &res)
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "td", "node-1", "pvc-x"}); got == 0 {
+		t.Fatalf("demoting an in-use replica exited 0; want a refusal")
+	}
+
+	if msg := errBuf.String(); !strings.Contains(msg, "in use") {
+		t.Errorf("refusal does not name the reason: %s", msg)
 	}
 }
 

@@ -32,6 +32,15 @@ import (
 
 var errNoSuchDevice = errors.New("no discovered device matches")
 
+// errAmbiguousDevice refuses one operator token that names several
+// devices. The attach carries Wipe, so guessing which disk was meant
+// is not a recoverable mistake.
+var errAmbiguousDevice = errors.New("ambiguous device")
+
+// errDeviceNotFree refuses a device the satellite reported as carrying
+// something, or one that is not in the Available phase.
+var errDeviceNotFree = errors.New("device is not free")
+
 // physicalStorageCreateDevicePool implements `physical-storage
 // create-device-pool <provider> <node> <device>... --pool-name <name>`.
 //
@@ -156,54 +165,111 @@ func stampDevices(
 	}
 
 	for _, wanted := range devices {
-		found := false
-
-		for i := range known {
-			if !deviceMatches(&known[i], wanted) {
-				continue
-			}
-
-			found = true
-
-			// The device list was read once, up front. Writing the
-			// whole spec back from that snapshot reverts whatever
-			// else changed on the device since; patch only the field
-			// this command is about.
-			err = run.Store.PhysicalDevices().PatchPhysicalDeviceSpec(ctx, known[i].Name,
-				func(dev *apiv1.PhysicalDevice) error {
-					// Refuse a device some other pool already claimed.
-					// The attach carries Wipe, so overwriting a live
-					// claim does not merely re-point a record — it
-					// wipes the disk backing that pool.
-					//
-					// The check belongs HERE rather than before the
-					// patch, and that is the whole point of it: two
-					// concurrent create-device-pool runs both see
-					// AttachTo=nil when they look, so only a check made
-					// against the state the write lands on can reject
-					// the loser. The store's Update carried an
-					// equivalent guard against a snapshot; this one is
-					// evaluated inside the fetch-mutate-write window.
-					if dev.AttachTo != nil {
-						return fmt.Errorf("%w: device %s on %s is already attached",
-							store.ErrAlreadyExists, wanted, node)
-					}
-
-					dev.AttachTo = attach
-
-					return nil
-				})
-			if err != nil {
-				return fmt.Errorf("attach %s on %s: %w", wanted, node, err)
-			}
+		name, resolveErr := resolveDevice(known, wanted, node)
+		if resolveErr != nil {
+			return resolveErr
 		}
 
-		if !found {
-			return fmt.Errorf("%s on %s: %w", wanted, node, errNoSuchDevice)
+		// The device list was read once, up front. Writing the whole
+		// spec back from that snapshot reverts whatever else changed
+		// on the device since; patch only the field this command is
+		// about, and decide against the freshly fetched state.
+		err = run.Store.PhysicalDevices().PatchPhysicalDeviceSpec(ctx, name,
+			func(dev *apiv1.PhysicalDevice) error {
+				return claimDevice(dev, wanted, node, attach)
+			})
+		if err != nil {
+			return fmt.Errorf("attach %s on %s: %w", wanted, node, err)
 		}
 	}
 
 	return nil
+}
+
+// resolveDevice picks the single record an operator token names.
+//
+// A token can legitimately match more than one record — two rows share
+// a volatile CurrentDevPath after a /dev/sdX reshuffle, and
+// deviceMatches compares that path — and the attach that follows
+// carries Wipe: true. Stamping every match would wipe several disks
+// from one ambiguous word, so refuse and make the operator name the
+// stable id instead.
+func resolveDevice(known []apiv1.PhysicalDevice, wanted, node string) (string, error) {
+	matched := make([]string, 0, 1)
+
+	for i := range known {
+		if deviceMatches(&known[i], wanted) {
+			matched = append(matched, known[i].Name)
+		}
+	}
+
+	switch len(matched) {
+	case 0:
+		return "", fmt.Errorf("%s on %s: %w", wanted, node, errNoSuchDevice)
+	case 1:
+		return matched[0], nil
+	default:
+		return "", fmt.Errorf("%w: %s on %s names %d devices (%s); name the stable id",
+			errAmbiguousDevice, wanted, node, len(matched), strings.Join(matched, ", "))
+	}
+}
+
+// claimDevice is the attach decision, evaluated against the state the
+// write lands on rather than the list read up front.
+//
+// Every refusal here is a disk that would otherwise be wiped: the
+// attach carries Wipe: true and the satellite acts on that flag with
+// `wipefs --all --force` and no guard of its own. The REST handler for
+// this same verb gates on the same three signals, and this path writes
+// the CRD directly rather than going through it, so the gate has to be
+// repeated here or it is simply absent.
+func claimDevice(
+	dev *apiv1.PhysicalDevice, wanted, node string, attach *apiv1.PhysicalDeviceAttachTo,
+) error {
+	// Refuse a device some other pool already claimed. The check
+	// belongs HERE rather than before the patch, and that is the whole
+	// point of it: two concurrent create-device-pool runs both see
+	// AttachTo=nil when they look, so only a check made against the
+	// state the write lands on can reject the loser.
+	if dev.AttachTo != nil {
+		return fmt.Errorf("%w: device %s on %s is already attached",
+			store.ErrAlreadyExists, wanted, node)
+	}
+
+	if dev.Phase != "" && dev.Phase != apiv1.PhysicalDevicePhaseAvailable {
+		return fmt.Errorf("%w: device %s on %s is in phase %s, not %s",
+			errDeviceNotFree, wanted, node, dev.Phase, apiv1.PhysicalDevicePhaseAvailable)
+	}
+
+	// The satellite-stamped Free condition is the source of truth for
+	// "this disk already carries something". False ⇒ refuse, quoting
+	// the reason discovery gave, which is the same cause `physical-
+	// storage list` filtered the device out on. nil ⇒ no scan has run
+	// yet, so fall through rather than block a bootstrap that has no
+	// discovery data to offer.
+	if dev.Free != nil && !*dev.Free {
+		return fmt.Errorf("%w: device %s on %s (%s)",
+			errDeviceNotFree, wanted, node, freeDetail(dev))
+	}
+
+	dev.AttachTo = attach
+
+	return nil
+}
+
+// freeDetail renders whatever explanation discovery left behind, so the
+// refusal names the signature it found rather than only saying no.
+func freeDetail(dev *apiv1.PhysicalDevice) string {
+	switch {
+	case dev.FreeReason != "" && dev.FreeMessage != "":
+		return dev.FreeReason + ": " + dev.FreeMessage
+	case dev.FreeReason != "":
+		return dev.FreeReason
+	case dev.FreeMessage != "":
+		return dev.FreeMessage
+	default:
+		return "no reason recorded"
+	}
 }
 
 func deviceMatches(device *apiv1.PhysicalDevice, wanted string) bool {

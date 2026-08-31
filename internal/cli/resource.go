@@ -45,6 +45,14 @@ const storPoolNameProp = "StorPoolName"
 var (
 	errNothingToMigrate = errors.New("the source replica is DISKLESS")
 	errSourceInUse      = errors.New("demote the consumer before migrating")
+
+	// errLastDiskfulReplica refuses the demotion that would delete the
+	// only copy of the data. Pass --force to override.
+	errLastDiskfulReplica = errors.New("add a diskful replica first, or pass --force")
+
+	// errReplicaInUse refuses demoting a replica a consumer still has
+	// open. Pass --force to override.
+	errReplicaInUse = errors.New("stop the consumer first, or pass --force")
 )
 
 // resourceToggleDisk implements `resource toggle-disk <node> <rd>`.
@@ -131,10 +139,63 @@ func toggleDiskful(ctx context.Context, run *runContext, node, rdName string) er
 
 	wasDiskless := slices.Contains(res.Flags, apiv1.ResourceFlagDiskless)
 	if !wasDiskless && run.Flags.Values["storage-pool"] == "" {
+		demoteErr := checkDemotable(ctx, run, &res, node, rdName)
+		if demoteErr != nil {
+			return demoteErr
+		}
+
 		return setDiskless(ctx, run, node, rdName, true)
 	}
 
 	return setDiskless(ctx, run, node, rdName, false)
+}
+
+// checkDemotable refuses a demotion that would leave the definition
+// with no data.
+//
+// Demoting is not a metadata edit: the satellite reconciles the
+// DISKLESS flag by detaching DRBD, closing LUKS and then deleting the
+// backing volume, so the last diskful replica takes the only copy of
+// the data with it. Upstream LINSTOR refuses the same move, and this
+// CLI writes the CRD directly, so a guard living anywhere else is
+// simply not on this path.
+//
+// The count is read before the patch rather than inside it, so a
+// replica demoted concurrently elsewhere can still slip through. That
+// window is the controller's to close — the redundancy invariant is
+// its to hold. What this guard is for is the operator who names the
+// wrong node, and for that a pre-check is exactly as good.
+func checkDemotable(
+	ctx context.Context, run *runContext, res *apiv1.Resource, node, rdName string,
+) error {
+	if run.Flags.Force {
+		return nil
+	}
+
+	if res.State.InUse != nil && *res.State.InUse {
+		return fmt.Errorf("refusing to demote %s on %s while it is in use: %w",
+			rdName, node, errReplicaInUse)
+	}
+
+	siblings, err := run.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return fmt.Errorf("list replicas of %s: %w", rdName, err)
+	}
+
+	diskful := 0
+
+	for i := range siblings {
+		if !slices.Contains(siblings[i].Flags, apiv1.ResourceFlagDiskless) {
+			diskful++
+		}
+	}
+
+	if diskful <= 1 {
+		return fmt.Errorf("refusing to demote the last diskful replica of %s (on %s); "+
+			"its backing volume is deleted with it: %w", rdName, node, errLastDiskfulReplica)
+	}
+
+	return nil
 }
 
 // migrateDisk implements `--migrate-from <src>`: strict
