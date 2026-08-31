@@ -169,7 +169,7 @@ var handlers = map[string]handler{
 		},
 	),
 
-	"controller version": controllerVersion,
+	cmdControllerVersion: controllerVersion,
 }
 
 // propertyNouns maps every noun that carries a property bag to its

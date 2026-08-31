@@ -427,6 +427,13 @@ func snapshotRestoreVolumeDefinition(ctx context.Context, run *runContext) error
 // hydrateVolumes recreates the snapshot's volume layout on a
 // definition.
 func hydrateVolumes(ctx context.Context, run *runContext, rdName string, snap *apiv1.Snapshot) error {
+	if len(snap.VolumeDefinitions) == 0 {
+		return fmt.Errorf("%s captured no volumes to restore onto %s: %w",
+			snap.Name, rdName, errNothingToRestore)
+	}
+
+	added := make([]int32, 0, len(snap.VolumeDefinitions))
+
 	for i := range snap.VolumeDefinitions {
 		svd := &snap.VolumeDefinitions[i]
 
@@ -435,11 +442,35 @@ func hydrateVolumes(ctx context.Context, run *runContext, rdName string, snap *a
 			SizeKib:      svd.SizeKib,
 		})
 		if err != nil {
+			// This variant restores onto a definition it does not own,
+			// so there is no RD to drop as a whole. Leaving the volumes
+			// already created behind would hand back a pre-existing
+			// definition carrying an arbitrary subset of the snapshot —
+			// a shape nothing downstream expects. Take back exactly
+			// what this call added.
+			unwindVolumes(ctx, run, rdName, added)
+
 			return fmt.Errorf("restore volume %d onto %s: %w", svd.VolumeNumber, rdName, err)
 		}
+
+		added = append(added, svd.VolumeNumber)
 	}
 
 	return nil
+}
+
+// unwindVolumes removes the volumes a failed restore had already
+// created. A failure here is reported through the original error, not
+// this one: the caller is already on the way out, and the restore
+// error is the one that explains why.
+func unwindVolumes(ctx context.Context, run *runContext, rdName string, added []int32) {
+	for _, number := range added {
+		delErr := run.Store.VolumeDefinitions().Delete(ctx, rdName, number)
+		if delErr != nil {
+			fmt.Fprintf(run.Err, "warning: could not remove volume %d from %s after a failed restore: %v\n",
+				number, rdName, delErr)
+		}
+	}
 }
 
 // placeRestored stamps replicas of the restored definition.
@@ -453,6 +484,16 @@ func placeRestored(ctx context.Context, run *runContext, srcRD, rdName string, s
 	nodes := run.Flags.Nodes
 	if len(nodes) == 0 {
 		nodes = snap.Nodes
+	}
+
+	// Zero nodes would walk the loop zero times and report success,
+	// leaving a definition with no replicas and no data — the same
+	// silent-success the capture side refuses via errNothingToCapture.
+	// A Snapshot CR not written through this CLI can carry an empty
+	// node list, so the restore side needs the matching guard.
+	if len(nodes) == 0 {
+		return fmt.Errorf("%s names no node to restore %s onto: %w",
+			snap.Name, rdName, errNothingToRestore)
 	}
 
 	for _, node := range nodes {
@@ -477,6 +518,11 @@ func placeRestored(ctx context.Context, run *runContext, srcRD, rdName string, s
 // errNoSourcePool is returned when a restore cannot work out which
 // storage pool the new replica belongs in and the operator did not say.
 var errNoSourcePool = errors.New("no storage pool to restore into")
+
+// errNothingToRestore refuses a restore that would report success
+// while materialising no data — no node to place on, or no volume
+// captured. Mirrors errNothingToCapture on the create side.
+var errNothingToRestore = errors.New("the snapshot describes nothing to restore")
 
 // sourcePoolOn reports which pool the restored replica should use on a
 // node: `--storage-pool` when the operator named one, otherwise the

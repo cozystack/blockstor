@@ -178,13 +178,40 @@ func checkCloneSnapshotIsCurrent(
 		return fmt.Errorf("list volumes of %s: %w", src.Name, err)
 	}
 
-	if len(current) == len(snap.VolumeDefinitions) {
-		return nil
+	if len(current) != len(snap.VolumeDefinitions) {
+		return fmt.Errorf("%w: %s covers %d volume(s) but %s now has %d; "+
+			"delete the snapshot to retake it",
+			errStaleCloneSnapshot, snap.Name, len(snap.VolumeDefinitions), src.Name, len(current))
 	}
 
-	return fmt.Errorf("%w: %s covers %d volume(s) but %s now has %d; "+
-		"delete the snapshot to retake it",
-		errStaleCloneSnapshot, snap.Name, len(snap.VolumeDefinitions), src.Name, len(current))
+	// A resize leaves the count alone, so counting volumes answers only
+	// half the question: a snapshot taken before the source grew still
+	// matches on cardinality, and reusing it materialises the target at
+	// the old size while reporting success. Compare the sizes the
+	// snapshot actually captured, keyed by volume number rather than by
+	// position, since neither list promises an order.
+	captured := make(map[int32]int64, len(snap.VolumeDefinitions))
+	for _, vol := range snap.VolumeDefinitions {
+		captured[vol.VolumeNumber] = vol.SizeKib
+	}
+
+	for i := range current {
+		was, ok := captured[current[i].VolumeNumber]
+		if !ok {
+			return fmt.Errorf("%w: %s does not cover volume %d of %s; "+
+				"delete the snapshot to retake it",
+				errStaleCloneSnapshot, snap.Name, current[i].VolumeNumber, src.Name)
+		}
+
+		if was != current[i].SizeKib {
+			return fmt.Errorf("%w: %s captured volume %d at %d KiB but %s is now %d KiB; "+
+				"delete the snapshot to retake it",
+				errStaleCloneSnapshot, snap.Name, current[i].VolumeNumber,
+				was, src.Name, current[i].SizeKib)
+		}
+	}
+
+	return nil
 }
 
 func ensureCloneSnapshot(ctx context.Context, run *runContext, src *apiv1.ResourceDefinition, snapName string) error {

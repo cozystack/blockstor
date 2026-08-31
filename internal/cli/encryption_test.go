@@ -108,6 +108,39 @@ func TestEncryptionCreatePassphrase(t *testing.T) {
 	}
 }
 
+// TestEncryptionPassphraseFromStdin: the master key must not have to
+// be typed on the command line, where it lands in shell history and
+// stays readable in /proc/<pid>/cmdline to every local user for the
+// length of the call. Omitting the value reads it off stdin instead.
+func TestEncryptionPassphraseFromStdin(t *testing.T) {
+	t.Parallel()
+
+	app, client, errBuf := newKubeApp(t)
+	app.In = strings.NewReader("piped-s3cret\n")
+
+	if got := app.Run(t.Context(), []string{"encryption", "create-passphrase"}); got != 0 {
+		t.Fatalf("exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	if got := readPassphrase(t, client); got != "piped-s3cret" {
+		t.Errorf("stored passphrase = %q, want piped-s3cret", got)
+	}
+}
+
+// An empty stdin is still a refusal: `passphrase.Read` cannot tell an
+// empty Secret from a missing one, so storing one wedges the cluster
+// between two contradictory diagnoses.
+func TestEncryptionPassphraseFromEmptyStdin(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newKubeApp(t)
+	app.In = strings.NewReader("\n")
+
+	if got := app.Run(t.Context(), []string{"encryption", "create-passphrase"}); got == 0 {
+		t.Fatal("an empty passphrase on stdin exited 0; want a refusal")
+	}
+}
+
 // Re-running with the same passphrase is a success, so a pre-flight
 // step in a script stays idempotent — but a DIFFERENT one is refused
 // rather than silently rotating the master key, which would leave

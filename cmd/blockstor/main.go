@@ -58,6 +58,7 @@ func main() {
 	app := &cli.App{
 		Out:      os.Stdout,
 		Err:      os.Stderr,
+		In:       os.Stdin,
 		StoreFor: openStore,
 		KubeFor:  openKube,
 	}
@@ -109,9 +110,14 @@ func openKube(context.Context) (ctrlclient.Client, string, error) {
 	return c, namespace(), nil
 }
 
-// namespace resolves where the controller's own objects live: the
-// in-cluster service-account namespace when running as a pod, the
-// BLOCKSTOR_NAMESPACE override otherwise, and the deployment default
+// namespace resolves where the controller's own objects live — the
+// cluster passphrase Secret, today.
+//
+// BLOCKSTOR_NAMESPACE wins wherever it is set, including inside a pod:
+// an operator debugging from a shell in some unrelated pod, or running
+// against a deployment that does not use the default namespace, needs
+// to be able to say so and have it obeyed. The pod's own
+// service-account namespace comes next, and the deployment default
 // last.
 func namespace() string {
 	if ns := os.Getenv("BLOCKSTOR_NAMESPACE"); ns != "" {

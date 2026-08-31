@@ -54,6 +54,10 @@ type App struct {
 	Out io.Writer
 	Err io.Writer
 
+	// In is where a secret is read from when the operator does not
+	// want it on the command line. nil means os.Stdin.
+	In io.Reader
+
 	// StoreFor opens the store. Injected so tests run against the
 	// in-memory store and the real binary against the cluster.
 	StoreFor func(ctx context.Context) (store.Store, error)
@@ -78,6 +82,7 @@ type runContext struct {
 	Store store.Store
 	Out   io.Writer
 	Err   io.Writer
+	In    io.Reader
 	Flags *flagSet
 	Color color.Writer
 
@@ -138,7 +143,7 @@ func (a *App) Run(ctx context.Context, argv []string) int {
 		return a.fail(fmt.Errorf("%w: %s", ErrNotImplemented, cmd))
 	}
 
-	return a.dispatch(ctx, run, flags)
+	return a.dispatch(ctx, cmd, run, flags)
 }
 
 // UnimplementedCommands lists registered commands with no handler, so
@@ -169,15 +174,24 @@ func (a *App) UnimplementedCommands() []string {
 // unreachable cluster and 2 on a reachable one — the same typo
 // classified two different ways — besides opening a connection for an
 // invocation already known to be invalid.
-func (a *App) dispatch(ctx context.Context, run handler, flags *flagSet) int {
+func (a *App) dispatch(ctx context.Context, cmd command.Command, run handler, flags *flagSet) int {
 	mode, err := color.ParseMode(flags.Color)
 	if err != nil {
 		return a.fail(fmt.Errorf("%w: %w", command.ErrUsage, err))
 	}
 
-	backend, err := a.StoreFor(ctx)
-	if err != nil {
-		return a.fail(err)
+	var backend store.Store
+
+	// A command that answers from the binary alone must not need a
+	// cluster to do it. Opening the store unconditionally made
+	// `controller version` exit 10 on a host with no kubeconfig —
+	// which is exactly the sanity check a CI image runs on a freshly
+	// built binary, before any cluster exists.
+	if !localOnly[cmd.String()] {
+		backend, err = a.StoreFor(ctx)
+		if err != nil {
+			return a.fail(err)
+		}
 	}
 
 	a.noteIgnoredFlags(flags)
@@ -186,6 +200,7 @@ func (a *App) dispatch(ctx context.Context, run handler, flags *flagSet) int {
 		Store: backend,
 		Out:   a.Out,
 		Err:   a.Err,
+		In:    a.In,
 		Flags: flags,
 		Color: color.New(color.EnabledFor(mode, a.tty())),
 		Kube:  a.KubeFor,
@@ -195,6 +210,21 @@ func (a *App) dispatch(ctx context.Context, run handler, flags *flagSet) int {
 	}
 
 	return exitOK
+}
+
+// localOnly names the commands that answer without a cluster, and so
+// run with a nil store. Keep it to handlers that genuinely touch
+// nothing: everything else wants the connection error up front rather
+// than a nil dereference halfway through.
+//
+// cmdControllerVersion is the one command that answers from the binary
+// alone, named once so the dispatch exemption and the handler table
+// cannot drift apart.
+const cmdControllerVersion = "controller version"
+
+//nolint:gochecknoglobals // a fixed, tiny set matched in one place
+var localOnly = map[string]bool{
+	cmdControllerVersion: true,
 }
 
 // nounHelp writes one object's verbs to stdout.

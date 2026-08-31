@@ -19,11 +19,16 @@ limitations under the License.
 package cli
 
 import (
+	"bufio"
 	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"strings"
 
+	"golang.org/x/term"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -54,13 +59,62 @@ func encryptionPassphrase(run *runContext) (string, error) {
 		return run.Flags.Positionals[0], nil
 	}
 
+	value, err := readPassphrase(run)
+	if err != nil {
+		return "", err
+	}
+
 	// An empty value is REJECTED, not stored. `passphrase.Read` cannot
 	// tell an empty Secret from a missing one, so an empty master key
 	// wedges the cluster into a state where create reports "already
 	// set" and enter reports "none set" — two contradictory diagnoses
 	// with no way out through this CLI — while encrypting every volume
 	// with nothing.
-	return "", fmt.Errorf("%w: the passphrase may not be empty", command.ErrUsage)
+	if value == "" {
+		return "", fmt.Errorf("%w: the passphrase may not be empty", command.ErrUsage)
+	}
+
+	return value, nil
+}
+
+// readPassphrase takes the cluster master key off stdin, so it does not
+// have to be typed on the command line.
+//
+// On argv the key lands in shell history and stays readable in
+// /proc/<pid>/cmdline to every local user for as long as the call runs.
+// Both spellings still work — scripts depend on them — but this is the
+// one to reach for, and it is what an operator gets by default now that
+// omitting the value prompts instead of failing.
+//
+// An interactive terminal is read without echo; anything else is read
+// as a plain line, so `echo secret | blockstor …` and a redirect from a
+// file both work.
+func readPassphrase(run *runContext) (string, error) {
+	in := run.In
+	if in == nil {
+		in = os.Stdin
+	}
+
+	if file, ok := in.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
+		fmt.Fprint(run.Err, "Passphrase: ")
+
+		typed, err := term.ReadPassword(int(file.Fd()))
+
+		fmt.Fprintln(run.Err)
+
+		if err != nil {
+			return "", fmt.Errorf("read passphrase: %w", err)
+		}
+
+		return string(typed), nil
+	}
+
+	line, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("read passphrase: %w", err)
+	}
+
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
 // encryptionCreatePassphrase implements `encryption create-passphrase`.
