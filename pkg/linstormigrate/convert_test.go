@@ -917,6 +917,222 @@ func TestSparseZfsPoolMigratesAsThin(t *testing.T) {
 	}
 }
 
+// TestSparseFlagAtControllerScopeIsSeen: LINSTOR resolves StorDriver/*
+// through a priority chain — storage pool, then node, then controller —
+// so `linstor controller set-property StorDriver/ZfscreateOptions -s`
+// makes every zvol in the cluster sparse while leaving every per-pool
+// bag empty. Reading only the pool bag reports such a cluster as
+// genuinely thick and walks into the adoption-time pool overflow the
+// remap exists to prevent.
+func TestSparseFlagAtControllerScopeIsSeen(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "CLUSTERWIDE", DriverName: "ZFS", UUID: "sp-1"},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: PropsInstanceController, PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	for i := range res.StoragePools {
+		sp := &res.StoragePools[i]
+		if sp.Spec.PoolName != "CLUSTERWIDE" {
+			continue
+		}
+
+		if sp.Spec.ProviderKind != "ZFS_THIN" {
+			t.Errorf("a controller-scope sparse flag was not seen: providerKind = %q, want ZFS_THIN",
+				sp.Spec.ProviderKind)
+		}
+
+		return
+	}
+
+	t.Fatalf("pool CLUSTERWIDE did not convert")
+}
+
+// TestSparseFlagAtNodeScopeIsSeen: the middle rung of the same chain.
+func TestSparseFlagAtNodeScopeIsSeen(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "PERNODE", DriverName: "ZFS", UUID: "sp-1"},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/NODES/NODE-A", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	for i := range res.StoragePools {
+		if res.StoragePools[i].Spec.PoolName == "PERNODE" &&
+			res.StoragePools[i].Spec.ProviderKind != "ZFS_THIN" {
+			t.Errorf("a node-scope sparse flag was not seen: providerKind = %q, want ZFS_THIN",
+				res.StoragePools[i].Spec.ProviderKind)
+		}
+	}
+}
+
+// TestPoolScopeWinsOverControllerScope: the chain stops at the first bag
+// that carries the key, so a pool that overrides the cluster-wide flag
+// with its own options stays thick.
+func TestPoolScopeWinsOverControllerScope(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "OVERRIDDEN", DriverName: "ZFS", UUID: "sp-1"},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: PropsInstanceController, PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+			{PropsInstance: "/STOR_POOLS/NODE-A/OVERRIDDEN", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-o compression=lz4"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	for i := range res.StoragePools {
+		if res.StoragePools[i].Spec.PoolName == "OVERRIDDEN" &&
+			res.StoragePools[i].Spec.ProviderKind != "ZFS" {
+			t.Errorf("the pool's own options did not win: providerKind = %q, want ZFS",
+				res.StoragePools[i].Spec.ProviderKind)
+		}
+	}
+}
+
+// TestRemapDoesNotAdmitADeliberatelyExcludedThinPool: a cluster can hold
+// a remapped sparse pool and a genuinely thin one at the same time, with
+// a resource group that named [ZFS] precisely to keep its replicas off
+// the thin one. Widening that group's allow-list to ZFS_THIN so the
+// remapped pool stays reachable must not also hand it the pool the
+// operator excluded.
+func TestRemapDoesNotAdmitADeliberatelyExcludedThinPool(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			// Declared thick, sparse in practice — this one remaps.
+			{NodeName: "NODE-A", PoolName: "SPARSE", DriverName: "ZFS", UUID: "sp-1"},
+			// Genuinely thin, and the group was kept away from it.
+			{NodeName: "NODE-A", PoolName: "REALTHIN", DriverName: "ZFS_THIN", UUID: "sp-2"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{
+				ResourceGroupName:    "RG",
+				ResourceGroupDspName: "rg",
+				AllowedProviderList:  `["ZFS"]`,
+				UUID:                 "rg-1",
+			},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/SPARSE", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if len(res.ResourceGroups) != 1 {
+		t.Fatalf("resource groups = %d, want 1", len(res.ResourceGroups))
+	}
+
+	filter := res.ResourceGroups[0].Spec.SelectFilter
+
+	// The remapped pool has to stay reachable, so the kind is widened.
+	if !containsString(filter.ProviderList, "ZFS_THIN") {
+		t.Errorf("allow-list = %v, want ZFS_THIN added so the remapped pool stays reachable",
+			filter.ProviderList)
+	}
+
+	// ... but the pool the group could never place on must not become
+	// placeable as a side effect.
+	if len(filter.StoragePoolList) == 0 {
+		t.Fatalf("group was left unpinned, so widening the kind admits the excluded pool too")
+	}
+
+	if containsString(filter.StoragePoolList, "REALTHIN") {
+		t.Errorf("storage pool list = %v, must not include the deliberately excluded thin pool",
+			filter.StoragePoolList)
+	}
+
+	if !containsString(filter.StoragePoolList, "SPARSE") {
+		t.Errorf("storage pool list = %v, want the remapped pool kept reachable",
+			filter.StoragePoolList)
+	}
+}
+
+// TestRemapLeavesUnrelatedGroupsAlone: a group that cannot place on the
+// remapped pool has no reason to learn about ZFS_THIN, and giving it the
+// kind anyway is how an exclusion quietly disappears.
+func TestRemapLeavesUnrelatedGroupsAlone(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "SPARSE", DriverName: "ZFS", UUID: "sp-1"},
+			{NodeName: "NODE-A", PoolName: "PLAIN", DriverName: "ZFS", UUID: "sp-2"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{
+				ResourceGroupName:    "PINNED",
+				ResourceGroupDspName: "pinned",
+				AllowedProviderList:  `["ZFS"]`,
+				PoolName:             `["PLAIN"]`,
+				UUID:                 "rg-1",
+			},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/SPARSE", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if len(res.ResourceGroups) != 1 {
+		t.Fatalf("resource groups = %d, want 1", len(res.ResourceGroups))
+	}
+
+	got := res.ResourceGroups[0].Spec.SelectFilter.ProviderList
+	if containsString(got, "ZFS_THIN") {
+		t.Errorf("allow-list = %v, want ZFS_THIN NOT added: the group is pinned to a pool that did not remap", got)
+	}
+}
+
+func containsString(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+
+	return false
+}
+
 // TestVolumelessDefinitionIsSkipped: a resource definition that owns no
 // volume cannot become a usable volume — no size, no DRBD minor. Migrate
 // one anyway and the controller still places replicas for it from the

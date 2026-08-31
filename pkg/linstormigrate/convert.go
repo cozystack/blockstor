@@ -133,12 +133,18 @@ type converter struct {
 	// later kinds can drop rows that would dangle (a replica of a
 	// skipped/absent RD, a replica on an unknown node, ...).
 	convertedRD map[string]bool // by resource_name (UPPERCASE key)
-	// remappedToThin records that at least one ZFS pool was carried
-	// over as ZFS_THIN, so the resource groups' provider allow-lists
-	// have to learn about the new kind.
-	remappedToThin bool
-	convertedNode  map[string]bool // by node_name (UPPERCASE key)
-	convertedRG    map[string]bool // by resource_group_name (UPPERCASE key)
+	// remappedPools names the ZFS pools carried over as ZFS_THIN, so
+	// the resource groups that could place on one can learn about the
+	// new kind — and, just as importantly, so the ones that could not
+	// are left alone.
+	remappedPools map[string]bool // by pool_name (UPPERCASE key)
+	// declaredThinPools names the pools the source cluster already
+	// declared ZFS_THIN. Widening an allow-list to cover a remapped
+	// pool would also admit these, which is only harmless when a group
+	// could reach them anyway.
+	declaredThinPools map[string]bool // by pool_name (UPPERCASE key)
+	convertedNode     map[string]bool // by node_name (UPPERCASE key)
+	convertedRG       map[string]bool // by resource_group_name (UPPERCASE key)
 
 	warnings  []string
 	warnedKey map[string]bool
@@ -170,22 +176,24 @@ func Convert(dump *Dump) (*Result, error) {
 // CRDs, honouring opts (e.g. a live DRBD port map — see Options).
 func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 	conv := &converter{
-		dump:          dump,
-		opts:          opts,
-		props:         NewPropsIndex(dump.PropsContainers),
-		nodeDsp:       map[string]string{},
-		poolDsp:       map[string]string{},
-		rgDsp:         map[string]string{},
-		rdDsp:         map[string]string{},
-		drbdRD:        map[string]LayerDrbdResourceDefinitionRow{},
-		drbdMinor:     map[volumeKey]*int32{},
-		drbdNode:      map[replicaKey]*int32{},
-		storVol:       map[volumeReplicaKey]LayerStorageVolumeRow{},
-		luksVol:       map[volumeReplicaKey]LayerLuksVolumeRow{},
-		convertedRD:   map[string]bool{},
-		convertedNode: map[string]bool{},
-		convertedRG:   map[string]bool{},
-		warnedKey:     map[string]bool{},
+		dump:              dump,
+		opts:              opts,
+		props:             NewPropsIndex(dump.PropsContainers),
+		nodeDsp:           map[string]string{},
+		poolDsp:           map[string]string{},
+		rgDsp:             map[string]string{},
+		rdDsp:             map[string]string{},
+		drbdRD:            map[string]LayerDrbdResourceDefinitionRow{},
+		drbdMinor:         map[volumeKey]*int32{},
+		drbdNode:          map[replicaKey]*int32{},
+		storVol:           map[volumeReplicaKey]LayerStorageVolumeRow{},
+		luksVol:           map[volumeReplicaKey]LayerLuksVolumeRow{},
+		convertedRD:       map[string]bool{},
+		convertedNode:     map[string]bool{},
+		convertedRG:       map[string]bool{},
+		remappedPools:     map[string]bool{},
+		declaredThinPools: map[string]bool{},
+		warnedKey:         map[string]bool{},
 	}
 
 	conv.buildIndexes()
@@ -462,14 +470,43 @@ const (
 // the capacity model of a running cluster, so this is the safer of the
 // two lies. Only ZFS is affected: LVM's thin provisioning is a separate
 // driver over a thin pool, not a create-time flag.
-func createsSparseZvols(driver string, props map[string]string) bool {
+func createsSparseZvols(driver, options string) bool {
 	if driver != providerKindZFS {
 		return false
 	}
 
 	// A flag, not a substring: `-o something-s` must not match, and
 	// neither must a longer option that merely starts with `-s`.
-	return slices.Contains(strings.Fields(props[storDriverZfscreateOptions]), zfsSparseFlag)
+	return slices.Contains(strings.Fields(options), zfsSparseFlag)
+}
+
+// zfscreateOptions resolves StorDriver/ZfscreateOptions the way LINSTOR
+// resolves it, rather than reading a single bag.
+//
+// LINSTOR looks StorDriver/* up through a priority chain: the storage
+// pool's own props, then the node's, then the controller's. The value
+// it finds first is what gets appended to `zfs create`. So an operator
+// who made a whole cluster sparse with
+//
+//	linstor controller set-property StorDriver/ZfscreateOptions -s
+//
+// — the natural way to do it, and the way it was done on the cluster
+// this detection came from — leaves the per-pool bags empty. Reading
+// only the pool bag then reports the pool as genuinely thick, migrates
+// it as ZFS, and walks straight into the pool-overflow during adoption
+// that createsSparseZvols exists to prevent.
+func (c *converter) zfscreateOptions(node, pool string) string {
+	for _, bag := range []map[string]string{
+		c.props.StorPool(node, pool),
+		c.props.Node(node),
+		c.props.Controller,
+	} {
+		if value, ok := bag[storDriverZfscreateOptions]; ok {
+			return value
+		}
+	}
+
+	return ""
 }
 
 func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
@@ -491,9 +528,13 @@ func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 		props := c.props.StorPool(row.NodeName, row.PoolName)
 
 		kind := row.DriverName
-		if createsSparseZvols(kind, props) {
+		if kind == providerKindZFSThin {
+			c.declaredThinPools[row.PoolName] = true
+		}
+
+		if createsSparseZvols(kind, c.zfscreateOptions(row.NodeName, row.PoolName)) {
 			kind = providerKindZFSThin
-			c.remappedToThin = true
+			c.remappedPools[row.PoolName] = true
 
 			c.warnf("storage pool %s.%s: declared %s, but %s makes every zvol sparse — migrated as %s so the adopted volumes keep the provisioning they actually have",
 				poolDsp, nodeDsp, providerKindZFS, storDriverZfscreateOptions, providerKindZFSThin)
@@ -527,6 +568,8 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 
 		typed, residual, extra := k8sstore.SplitProps(c.props.ResourceGroup(row.ResourceGroupName))
 
+		poolPins := c.poolList(row, dsp)
+
 		group := crdv1alpha1.ResourceGroup{
 			TypeMeta:   typeMeta("ResourceGroup"),
 			ObjectMeta: objectMeta(dsp),
@@ -537,13 +580,13 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 				ExtraProps:  extra,
 				SelectFilter: crdv1alpha1.ResourceGroupSelectFilter{
 					PlaceCount:              row.ReplicaCount,
-					StoragePoolList:         c.parseList(row.PoolName, "resource group "+dsp+" pool_name"),
+					StoragePoolList:         poolPins,
 					StoragePoolDisklessList: c.parseList(row.PoolNameDiskless, "resource group "+dsp+" pool_name_diskless"),
 					NodeNameList:            c.parseList(row.NodeNameList, "resource group "+dsp+" node_name_list"),
 					ReplicasOnSame:          c.parseList(row.ReplicasOnSame, "resource group "+dsp+" replicas_on_same"),
 					ReplicasOnDifferent:     c.parseList(row.ReplicasOnDifferent, "resource group "+dsp+" replicas_on_different"),
 					NotPlaceWithRsc:         c.parseList(row.DoNotPlaceWithRsc, "resource group "+dsp+" do_not_place_with_rsc_list"),
-					ProviderList:            c.providerList(row, dsp),
+					ProviderList:            c.providerList(row, dsp, poolPins),
 					LayerStack:              c.parseList(row.LayerStack, "resource group "+dsp+" layer_stack"),
 				},
 			},
@@ -582,20 +625,109 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 // ZFS_THIN is added rather than substituted: a cluster may hold both a
 // remapped pool and a genuinely thick one, and replacing the entry
 // would evict the second from a policy that legitimately named it.
-func (c *converter) providerList(row *ResourceGroupRow, dsp string) []string {
+func (c *converter) providerList(row *ResourceGroupRow, dsp string, pinned []string) []string {
 	list := c.parseList(row.AllowedProviderList, "resource group "+dsp+" allowed_provider_list")
 
-	if !c.remappedToThin ||
-		!slices.Contains(list, providerKindZFS) ||
-		slices.Contains(list, providerKindZFSThin) {
+	if !slices.Contains(list, providerKindZFS) || slices.Contains(list, providerKindZFSThin) {
 		return list
 	}
 
-	c.warnf("resource group %s: allows %s and a pool migrated as %s — %s added to the allow-list, "+
+	// Only a group that could actually place on a remapped pool needs
+	// the widening. Applying it whenever ANY pool in the cluster
+	// remapped hands ZFS_THIN to groups that never had it, which is
+	// how a group that named [ZFS] precisely to keep its replicas off
+	// a thin pool ends up allowed onto it.
+	if !c.reaches(pinned, c.remappedPools) {
+		return list
+	}
+
+	c.warnf("resource group %s: allows %s and a pool it can place on migrated as %s — %s added to the allow-list, "+
 		"or the placer would stop finding any eligible pool",
 		dsp, providerKindZFS, providerKindZFSThin, providerKindZFSThin)
 
 	return append(list, providerKindZFSThin)
+}
+
+// poolList carries the group's storage-pool pins over, adding pins
+// where widening the provider list would otherwise hand the group a
+// pool it was deliberately kept away from.
+//
+// The allow-list is expressed in provider kinds, but the exclusion an
+// operator wanted is about a pool. When a group names no pools and the
+// cluster holds a genuinely thin pool alongside a remapped one, adding
+// ZFS_THIN to the kinds admits both. Pinning the group to the pools it
+// could already reach keeps the widening scoped to the pool that
+// changed underneath it.
+func (c *converter) poolList(row *ResourceGroupRow, dsp string) []string {
+	pinned := c.parseList(row.PoolName, "resource group "+dsp+" pool_name")
+
+	providers := c.parseList(row.AllowedProviderList, "resource group "+dsp+" allowed_provider_list")
+	if !slices.Contains(providers, providerKindZFS) || slices.Contains(providers, providerKindZFSThin) {
+		return pinned
+	}
+
+	if !c.reaches(pinned, c.remappedPools) {
+		return pinned
+	}
+
+	// An explicit pin already scopes the widening: the group can only
+	// land on pools it named, so admitting the kind admits nothing new.
+	if len(pinned) > 0 {
+		return pinned
+	}
+
+	// Unpinned, so the widening would also admit every pool the source
+	// cluster declared thin. If there are none, the kind is enough.
+	if len(c.declaredThinPools) == 0 {
+		return pinned
+	}
+
+	scoped := c.poolsExcept(c.declaredThinPools)
+
+	c.warnf("resource group %s: pinned to %d pool(s) — it named none, and widening its allow-list to %s "+
+		"to keep the remapped pool reachable would otherwise also admit the %d pool(s) the source cluster "+
+		"declared thin, which it could not place on before",
+		dsp, len(scoped), providerKindZFSThin, len(c.declaredThinPools))
+
+	return scoped
+}
+
+// reaches reports whether a group pinned to the named pools (or to none
+// at all, meaning any) can place on one of the pools in the set.
+func (c *converter) reaches(pinned []string, set map[string]bool) bool {
+	if len(pinned) == 0 {
+		return len(set) > 0
+	}
+
+	for _, pool := range pinned {
+		if set[strings.ToUpper(pool)] {
+			return true
+		}
+	}
+
+	return false
+}
+
+// poolsExcept lists every converted pool that is not in the excluded
+// set, sorted so the output is stable.
+func (c *converter) poolsExcept(excluded map[string]bool) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(c.dump.NodeStorPools))
+
+	for i := range c.dump.NodeStorPools {
+		row := &c.dump.NodeStorPools[i]
+		if excluded[row.PoolName] || seen[row.PoolName] || !c.convertedNode[row.NodeName] {
+			continue
+		}
+
+		seen[row.PoolName] = true
+
+		out = append(out, displayName(c.poolDsp[row.PoolName], row.PoolName))
+	}
+
+	sort.Strings(out)
+
+	return out
 }
 
 func (c *converter) volumeGroupsFor(rgName string) []VolumeGroupRow {
@@ -818,6 +950,23 @@ func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
 		if !c.convertedNode[row.NodeName] {
 			state.heldByAbsentNode = true
 
+			continue
+		}
+
+		// A replica with no storage cannot be the evidence that data
+		// was adopted — a diskless client or a quorum witness carries
+		// no copy of anything. The latch means "this definition already
+		// holds data, do not re-initialise it", so letting a witness
+		// set it would assert that about a definition whose every
+		// data-bearing replica is gone.
+		//
+		// A consistent dump is not expected to produce that shape: for
+		// the witness to be the only survivor, every diskful row would
+		// have to be DELETE-flagged while it is not, which neither an
+		// auto-tiebreaker nor a whole-resource delete does. The guard
+		// is here so the latch does not rest on that reasoning holding
+		// for every dump anyone ever feeds it.
+		if row.ResourceFlags&(resourceFlagDiskless|resourceFlagTieBreaker) != 0 {
 			continue
 		}
 

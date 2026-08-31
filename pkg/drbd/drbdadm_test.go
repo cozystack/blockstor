@@ -1186,6 +1186,50 @@ func TestHasMDReturnsFalseOnNoMetaData(t *testing.T) {
 	}
 }
 
+// TestHasMDToleratesAbsentWordings: the strict direction fails closed,
+// so a wording this list does not know stalls every new replica on
+// every node rather than one volume. Casing and the hyphenated spelling
+// of the noun are the variations drbd-utils has actually shipped, so
+// pin that they all still read as "absent".
+func TestHasMDToleratesAbsentWordings(t *testing.T) {
+	for _, wording := range errHasMDAbsentWordings {
+		fx := storage.NewFakeExec()
+		fx.Expect("drbdadm dump-md pvc-fresh/0",
+			storage.FakeResponse{Err: wording})
+
+		has, err := drbd.NewAdm(fx).HasMD(t.Context(), "pvc-fresh/0")
+		if err != nil {
+			t.Errorf("%v: HasMD returned an error instead of reading it as absent: %v", wording, err)
+
+			continue
+		}
+
+		if has {
+			t.Errorf("%v: HasMD = true, want false", wording)
+		}
+	}
+}
+
+// The "no metadata" spellings drbd-utils has shipped, verbatim. Named
+// individually so each is a static sentinel, matching how the other
+// wire shapes in this file are written.
+var (
+	errHasMDAbsentTitleCase = errors.New("drbdadm: No valid meta data found")
+	errHasMDAbsentLowerCase = errors.New("drbdadm: no valid meta data found")
+	errHasMDAbsentHyphen    = errors.New("drbdadm: No valid meta-data found")
+	//nolint:staticcheck // verbatim drbdmeta wire shape; the capital is load-bearing
+	errHasMDAbsentShouted = errors.New(
+		"Command 'drbdmeta 0 v09 /dev/loop5 internal dump-md' failed: NO VALID META DATA")
+)
+
+//nolint:gochecknoglobals // verbatim wire shapes, matched in one test
+var errHasMDAbsentWordings = []error{
+	errHasMDAbsentTitleCase,
+	errHasMDAbsentLowerCase,
+	errHasMDAbsentHyphen,
+	errHasMDAbsentShouted,
+}
+
 // errHasMDDumpMdUnclean mirrors the verbatim exit drbdadm returns for a
 // volume whose activity log was never closed. Captured from an e2e run:
 // every lower disk materialised from a ZFS snapshot, clone or send/recv

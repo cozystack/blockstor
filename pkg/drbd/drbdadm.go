@@ -271,8 +271,19 @@ func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
 //
 //nolint:gochecknoglobals // a fixed vocabulary, matched in one place
 var metadataAbsentMarkers = []string{
-	"No valid meta data found",
 	"no valid meta data",
+	// drbd-utils has spelled the noun both ways over time, and the
+	// message is matched case-insensitively below, so this covers
+	// "No valid meta-data found" as well as the current wording. The
+	// coupling is worth naming: because the probe fails closed, a
+	// future reword this list does not know reclassifies a genuinely
+	// fresh volume as an unrecognised failure and stalls every new
+	// replica on every node at once, rather than the one volume. That
+	// is loud and operator-visible rather than silent, which is the
+	// right way round for a probe that guards `create-md --force` —
+	// but it is a version coupling, and the fix for a future reword is
+	// to add the wording here.
+	"no valid meta-data",
 }
 
 // metadataUnusableMarkers are the exits that positively state a
@@ -303,9 +314,14 @@ var metadataUnusableMarkers = []string{
 // the volume carries no metadata this resource can use, rather than
 // merely failing for a reason nobody classified.
 func metadataNotUsable(errStr, out string) bool {
+	// Matched case-insensitively: drbdmeta capitalises the sentence,
+	// drbdadm quotes it mid-line, and a probe that guards data must not
+	// turn a capital letter into "unrecognised failure".
+	haystack := strings.ToLower(errStr + "\n" + out)
+
 	for _, markers := range [][]string{metadataAbsentMarkers, metadataUnusableMarkers} {
 		for _, marker := range markers {
-			if strings.Contains(errStr, marker) || strings.Contains(out, marker) {
+			if strings.Contains(haystack, strings.ToLower(marker)) {
 				return true
 			}
 		}
