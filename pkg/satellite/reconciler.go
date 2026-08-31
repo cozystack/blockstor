@@ -3543,30 +3543,36 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
 
 		// A dirty activity log means the metadata is THERE, unreadable
-		// until it is applied. Whether re-initialising is right depends
-		// entirely on what this call is doing.
+		// until it is applied — and this is where blockstor cannot yet
+		// tell two very different situations apart.
 		//
-		// On a first activation the lower disk was just materialised —
-		// a fresh volume, or one carved from a ZFS clone / snapshot
-		// receive whose superblock belongs to the source resource. That
-		// destination needs metadata of its own, and re-initialising is
-		// the whole point of the step.
+		// A lower disk just materialised carries someone else's
+		// superblock: a ZFS clone or snapshot receive brings the
+		// source's, and a volume carved from a pool that has been used
+		// before brings whatever the previous tenant left. Both need
+		// metadata of their own, and re-initialising is the point of
+		// the step. But an established replica that went down while
+		// Primary and writing leaves an activity log that looks
+		// IDENTICAL to drbdmeta, and create-md --force there destroys
+		// its GI and dirty bitmap.
 		//
-		// Past first activation this is an established replica coming
-		// back: a satellite restart, a cold boot after the machine went
-		// down while it was Primary and writing. Its activity log looks
-		// exactly the same to drbdmeta, and create-md --force there
-		// destroys the GI and dirty bitmap of real data. Refuse, and
-		// let the failure be visible: repairing it with apply-al is a
-		// deliberate act, not something to do behind the operator's
-		// back while it looks like initialisation.
+		// firstActivation does not separate them: it is per RESOURCE,
+		// so adding a volume to a live resource arrives with
+		// firstActivation=false on a lower disk that is nonetheless
+		// brand new. Gating on it stalled exactly that — the e2e suite
+		// caught vol-1 never leaving Diskless while the kernel had it
+		// UpToDate, because the reconcile aborted before stamping
+		// status.
+		//
+		// So the pre-existing behaviour stands for now: treat it as
+		// "no usable metadata" and re-initialise. That is fail-open on
+		// the crash-recovery case, which is a real exposure and is NOT
+		// made better by this comment — it is recorded here because
+		// closing it needs a per-VOLUME record of "we have initialised
+		// this before", which does not exist today. That record, and
+		// the apply-al repair that should replace re-initialisation
+		// once it does, belong in their own change with their own e2e.
 		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
-			if !firstActivation {
-				return errors.Wrapf(probeErr,
-					"%s carries metadata with an unapplied activity log and this is not a first "+
-						"activation; refusing to re-initialise a replica that may hold data", target)
-			}
-
 			hasMD, probeErr = false, nil
 		}
 
@@ -3761,17 +3767,15 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 
 		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
 
-		// This helper only ever runs past first activation — the gate
-		// that reaches it requires MetadataCreated — so an unapplied
-		// activity log here is an established replica coming back, not
-		// a lower disk being initialised. That is the shape a machine
-		// leaves behind when it goes down while Primary and writing,
-		// and create-md --force on it destroys the GI and dirty bitmap
-		// of live data. Surface it instead.
+		// Same open problem as in ensureMetadata, and the same
+		// resolution for now. This helper runs past first activation,
+		// which reads like "established replica" — but the volume it is
+		// stamping can be one just added to a live resource, on a lower
+		// disk carved from a recycled pool extent whose previous tenant
+		// left an unclean superblock behind. Refusing here stalled that
+		// path outright.
 		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
-			return errors.Wrapf(probeErr,
-				"%s carries metadata with an unapplied activity log; refusing to re-initialise an "+
-					"established replica", target)
+			hasMD, probeErr = false, nil
 		}
 
 		if probeErr != nil {

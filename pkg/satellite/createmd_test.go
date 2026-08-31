@@ -600,43 +600,48 @@ func uncleanFixture(
 	return rec, dr, devices, filepath.Join(dir, "pvc-unclean.md-created"), fx
 }
 
-// TestEnsureMetadataRefusesToReinitAnEstablishedReplica: past first
-// activation, an unapplied activity log is a replica coming back after
-// an unclean stop, not a lower disk being initialised. create-md
-// --force there destroys the GI and dirty bitmap of live data, so the
-// step has to fail visibly instead.
-func TestEnsureMetadataRefusesToReinitAnEstablishedReplica(t *testing.T) {
-	rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+// A lower disk carrying an unclean superblock is initialised, on both
+// activation arms.
+//
+// It is worth being explicit about what these two pin, because the
+// obvious reading of the second one is wrong. An unapplied activity log
+// does NOT mean "this volume is established": a volume added to a live
+// resource arrives with firstActivation=false on a lower disk that is
+// brand new, and one carved from a recycled pool extent carries
+// whatever superblock the previous tenant left. Gating re-initialisation
+// on firstActivation stalled exactly that shape — the e2e suite caught
+// vol-1 never leaving Diskless while the kernel had it UpToDate.
+//
+// The cost is that a replica which crashed while Primary and writing
+// looks the same to drbdmeta and gets re-initialised too. Separating
+// them needs a per-volume record of "we have initialised this before",
+// which does not exist yet; these tests pin the behaviour as it stands
+// rather than the behaviour we want.
+func TestEnsureMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
+	for _, firstActivation := range []bool{true, false} {
+		rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
 
-	if err := os.WriteFile(mdMarkerPath, nil, 0o600); err != nil {
-		t.Fatalf("seed .md-created marker: %v", err)
-	}
-
-	err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, false)
-	if err == nil {
-		t.Fatal("ensureMetadata re-initialised an established replica with a dirty activity log")
-	}
-
-	// Asserted on the command actually issued rather than on the error
-	// alone: what matters is that create-md --force never ran over a
-	// superblock that may belong to live data.
-	for _, line := range fx.CommandLines() {
-		if strings.Contains(line, "create-md") {
-			t.Fatalf("create-md ran against an established replica: %q", line)
+		if !firstActivation {
+			if err := os.WriteFile(mdMarkerPath, nil, 0o600); err != nil {
+				t.Fatalf("seed .md-created marker: %v", err)
+			}
 		}
-	}
-}
 
-// On a FIRST activation the lower disk was just materialised — a fresh
-// volume, or one carved from a ZFS clone whose superblock belongs to
-// the source resource. That destination needs metadata of its own, so
-// the same signal must not block it: this is the path the clone, ship
-// and restore e2e scenarios take.
-func TestEnsureMetadataInitialisesAFreshLowerDisk(t *testing.T) {
-	rec, dr, devices, mdMarkerPath, _ := uncleanFixture(t)
+		err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, firstActivation)
+		if err != nil {
+			t.Fatalf("firstActivation=%v: ensureMetadata: %v", firstActivation, err)
+		}
 
-	err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, true)
-	if err != nil {
-		t.Fatalf("ensureMetadata on a first activation: %v", err)
+		created := false
+
+		for _, line := range fx.CommandLines() {
+			if strings.Contains(line, "create-md") {
+				created = true
+			}
+		}
+
+		if !created {
+			t.Errorf("firstActivation=%v: the volume was left without metadata", firstActivation)
+		}
 	}
 }
