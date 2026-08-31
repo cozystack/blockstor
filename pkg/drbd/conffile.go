@@ -277,7 +277,12 @@ func writeNet(b *strings.Builder, n Net) {
 		// drbdadm rejects unquoted. The typed field above wins when a
 		// resource carries the secret both ways, so drbdadm never sees
 		// the key twice.
-		if option == sharedSecretOption {
+		// Compared case-insensitively for the same reason the metadata
+		// probe is: a key that arrives spelled differently must not
+		// slip past the quoting and reach drbdadm bare. Every producer
+		// writes the canonical lowercase today, so this is a guard
+		// against a future one, not a fix for a live bug.
+		if strings.EqualFold(option, sharedSecretOption) {
 			if n.SharedSecret == "" {
 				fmt.Fprintf(b, "    %s %q;\n", option, n.Options[option])
 			}

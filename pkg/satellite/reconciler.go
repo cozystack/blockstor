@@ -3541,6 +3541,35 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
 		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
+
+		// A dirty activity log means the metadata is THERE, unreadable
+		// until it is applied. Whether re-initialising is right depends
+		// entirely on what this call is doing.
+		//
+		// On a first activation the lower disk was just materialised —
+		// a fresh volume, or one carved from a ZFS clone / snapshot
+		// receive whose superblock belongs to the source resource. That
+		// destination needs metadata of its own, and re-initialising is
+		// the whole point of the step.
+		//
+		// Past first activation this is an established replica coming
+		// back: a satellite restart, a cold boot after the machine went
+		// down while it was Primary and writing. Its activity log looks
+		// exactly the same to drbdmeta, and create-md --force there
+		// destroys the GI and dirty bitmap of real data. Refuse, and
+		// let the failure be visible: repairing it with apply-al is a
+		// deliberate act, not something to do behind the operator's
+		// back while it looks like initialisation.
+		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
+			if !firstActivation {
+				return errors.Wrapf(probeErr,
+					"%s carries metadata with an unapplied activity log and this is not a first "+
+						"activation; refusing to re-initialise a replica that may hold data", target)
+			}
+
+			hasMD, probeErr = false, nil
+		}
+
 		if probeErr != nil {
 			return errors.Wrapf(probeErr, "dump-md %s", target)
 		}
@@ -3731,6 +3760,20 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
 		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
+
+		// This helper only ever runs past first activation — the gate
+		// that reaches it requires MetadataCreated — so an unapplied
+		// activity log here is an established replica coming back, not
+		// a lower disk being initialised. That is the shape a machine
+		// leaves behind when it goes down while Primary and writing,
+		// and create-md --force on it destroys the GI and dirty bitmap
+		// of live data. Surface it instead.
+		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
+			return errors.Wrapf(probeErr,
+				"%s carries metadata with an unapplied activity log; refusing to re-initialise an "+
+					"established replica", target)
+		}
+
 		if probeErr != nil {
 			return errors.Wrapf(probeErr, "dump-md %s", target)
 		}

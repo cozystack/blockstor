@@ -819,6 +819,84 @@ func hasWarning(res *Result, substr string) bool {
 // a tie-breaker flagged DELETE arrived Initialized, and once the
 // controller placed replicas for it they sat Inconsistent on every node
 // with no way out.
+// TestLatchHoldsOnADiskfulReplicaWithAStaleTieBreakerBit: production
+// dumps carry TIE_BREAKER (bit 128) stuck on replicas that are diskful,
+// left behind by an auto-diskful toggle. decodeResourceFlags only
+// honours that bit together with the diskless one, and convertResources
+// adopts such a row as an ordinary diskful replica — so the latch has
+// to count it as evidence too.
+//
+// Dropping it instead un-latches a definition whose data was just
+// adopted, which re-enables auto-primary election and lets an empty
+// first sync overwrite that data. The skip must be narrower than the
+// adoption, never wider.
+func TestLatchHoldsOnADiskfulReplicaWithAStaleTieBreakerBit(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		ResourceDefinitions: []ResourceDefinitionRow{
+			{ResourceName: "PVC-STUCK", ResourceDspName: "pvc-stuck", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-stuck"},
+		},
+		VolumeDefinitions: []VolumeDefinitionRow{
+			{ResourceName: "PVC-STUCK", VlmNr: 0, VlmSize: 1048576, UUID: "vd-stuck"},
+		},
+		Resources: []ResourceRow{
+			// Bit 128 with no diskless bit: diskful, carrying data.
+			{NodeName: "NODE-A", ResourceName: "PVC-STUCK", ResourceFlags: 128, UUID: "r-stuck"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if len(res.ResourceDefinitions) != 1 {
+		t.Fatalf("resource definitions = %d, want 1", len(res.ResourceDefinitions))
+	}
+
+	rd := &res.ResourceDefinitions[0]
+	if rd.Spec.Initialized == nil || !*rd.Spec.Initialized {
+		t.Errorf("Initialized = %v, want latched: the replica is diskful and was adopted, "+
+			"so un-latching lets auto-primary overwrite it", rd.Spec.Initialized)
+	}
+}
+
+// A genuine witness carries the diskless bit alongside TIE_BREAKER, and
+// that one must not hold the latch on its own.
+func TestLatchDoesNotHoldOnAWitnessAlone(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		ResourceDefinitions: []ResourceDefinitionRow{
+			{ResourceName: "PVC-WITNESS", ResourceDspName: "pvc-witness", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-w"},
+		},
+		VolumeDefinitions: []VolumeDefinitionRow{
+			{ResourceName: "PVC-WITNESS", VlmNr: 0, VlmSize: 1048576, UUID: "vd-w"},
+		},
+		Resources: []ResourceRow{
+			// DISKLESS (4) + TIE_BREAKER (128): a real quorum witness.
+			{NodeName: "NODE-A", ResourceName: "PVC-WITNESS", ResourceFlags: 132, UUID: "r-w"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if len(res.ResourceDefinitions) != 1 {
+		t.Fatalf("resource definitions = %d, want 1", len(res.ResourceDefinitions))
+	}
+
+	rd := &res.ResourceDefinitions[0]
+	if rd.Spec.Initialized != nil && *rd.Spec.Initialized {
+		t.Error("a storage-free witness held the latch on its own: it carries no copy of anything")
+	}
+}
+
 func TestInitializedLatchNeedsAnAdoptedReplica(t *testing.T) {
 	dump := &Dump{
 		Nodes: []NodeRow{
@@ -1079,6 +1157,104 @@ func TestRemapDoesNotAdmitADeliberatelyExcludedThinPool(t *testing.T) {
 	if !containsString(filter.StoragePoolList, "SPARSE") {
 		t.Errorf("storage pool list = %v, want the remapped pool kept reachable",
 			filter.StoragePoolList)
+	}
+}
+
+// TestSameNameDifferentDriverPerNode: LINSTOR pools are node-scoped, and
+// naming them uniformly across nodes is the common practice — so the
+// same name can be thick-with-`-s` on one node and genuinely thin on
+// another. Keyed on the bare name, the remap bookkeeping collapses the
+// two into one entry and the exclusion breaks.
+//
+// A group's pool list carries no node, so admitting the name admits it
+// on every node. Here the exclusion cannot be expressed at all, and the
+// allow-list must be left alone rather than widened: an empty pin list
+// reads as "no restriction", which would put replicas on exactly the
+// pool the operator kept them off.
+func TestSameNameDifferentDriverPerNode(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+			{NodeName: "NODE-B", NodeDspName: "node-b", NodeType: 2, UUID: "n-b"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			// Thick by declaration, sparse in practice — remaps.
+			{NodeName: "NODE-A", PoolName: "TANK", DriverName: "ZFS", UUID: "sp-1"},
+			// Same name, genuinely thin, and the group was kept off it.
+			{NodeName: "NODE-B", PoolName: "TANK", DriverName: "ZFS_THIN", UUID: "sp-2"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{
+				ResourceGroupName:    "RG",
+				ResourceGroupDspName: "rg",
+				AllowedProviderList:  `["ZFS"]`,
+				UUID:                 "rg-1",
+			},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/TANK", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if len(res.ResourceGroups) != 1 {
+		t.Fatalf("resource groups = %d, want 1", len(res.ResourceGroups))
+	}
+
+	filter := res.ResourceGroups[0].Spec.SelectFilter
+
+	// Widening the kind while the pin list stays empty is the trap: the
+	// placer reads an empty list as "any pool", so the group lands on
+	// the genuinely thin TANK on node-b.
+	if containsString(filter.ProviderList, "ZFS_THIN") && len(filter.StoragePoolList) == 0 {
+		t.Errorf("allow-list widened to %v with no pins: the group can now place on the thin pool it excluded",
+			filter.ProviderList)
+	}
+
+	if !hasWarning(res, "by hand") {
+		t.Errorf("the unresolvable case was not reported to the operator; warnings: %v", res.Warnings)
+	}
+}
+
+// The per-node keying must not make the ordinary case worse: a pool
+// remapped on every node, with no genuinely thin pool anywhere, is still
+// widened plainly.
+func TestRemapWidensWhenNoThinPoolExists(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+			{NodeName: "NODE-B", NodeDspName: "node-b", NodeType: 2, UUID: "n-b"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "TANK", DriverName: "ZFS", UUID: "sp-1"},
+			{NodeName: "NODE-B", PoolName: "TANK", DriverName: "ZFS", UUID: "sp-2"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{
+				ResourceGroupName:    "RG",
+				ResourceGroupDspName: "rg",
+				AllowedProviderList:  `["ZFS"]`,
+				UUID:                 "rg-1",
+			},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: PropsInstanceController, PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	filter := res.ResourceGroups[0].Spec.SelectFilter
+	if !containsString(filter.ProviderList, "ZFS_THIN") {
+		t.Errorf("allow-list = %v, want ZFS_THIN: every pool remapped and none was declared thin",
+			filter.ProviderList)
 	}
 }
 

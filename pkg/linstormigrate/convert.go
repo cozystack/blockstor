@@ -137,17 +137,29 @@ type converter struct {
 	// the resource groups that could place on one can learn about the
 	// new kind — and, just as importantly, so the ones that could not
 	// are left alone.
-	remappedPools map[string]bool // by pool_name (UPPERCASE key)
+	//
+	// Keyed by (node, pool): a LINSTOR pool is node-scoped, and the
+	// same pool name routinely exists on every node with a driver that
+	// differs between them.
+	remappedPools map[poolKey]bool
 	// declaredThinPools names the pools the source cluster already
 	// declared ZFS_THIN. Widening an allow-list to cover a remapped
 	// pool would also admit these, which is only harmless when a group
 	// could reach them anyway.
-	declaredThinPools map[string]bool // by pool_name (UPPERCASE key)
+	declaredThinPools map[poolKey]bool
 	convertedNode     map[string]bool // by node_name (UPPERCASE key)
 	convertedRG       map[string]bool // by resource_group_name (UPPERCASE key)
 
 	warnings  []string
 	warnedKey map[string]bool
+}
+
+// poolKey addresses a storage pool the way LINSTOR does: a pool lives
+// on a node, and the same name on two nodes can carry two different
+// drivers.
+type poolKey struct {
+	node string
+	pool string
 }
 
 type volumeKey struct {
@@ -191,8 +203,8 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		convertedRD:       map[string]bool{},
 		convertedNode:     map[string]bool{},
 		convertedRG:       map[string]bool{},
-		remappedPools:     map[string]bool{},
-		declaredThinPools: map[string]bool{},
+		remappedPools:     map[poolKey]bool{},
+		declaredThinPools: map[poolKey]bool{},
 		warnedKey:         map[string]bool{},
 	}
 
@@ -529,12 +541,12 @@ func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 
 		kind := row.DriverName
 		if kind == providerKindZFSThin {
-			c.declaredThinPools[row.PoolName] = true
+			c.declaredThinPools[poolKey{node: row.NodeName, pool: row.PoolName}] = true
 		}
 
 		if createsSparseZvols(kind, c.zfscreateOptions(row.NodeName, row.PoolName)) {
 			kind = providerKindZFSThin
-			c.remappedPools[row.PoolName] = true
+			c.remappedPools[poolKey{node: row.NodeName, pool: row.PoolName}] = true
 
 			c.warnf("storage pool %s.%s: declared %s, but %s makes every zvol sparse — migrated as %s so the adopted volumes keep the provisioning they actually have",
 				poolDsp, nodeDsp, providerKindZFS, storDriverZfscreateOptions, providerKindZFSThin)
@@ -568,7 +580,7 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 
 		typed, residual, extra := k8sstore.SplitProps(c.props.ResourceGroup(row.ResourceGroupName))
 
-		poolPins := c.poolList(row, dsp)
+		providerPins, poolPins := c.placementLists(row, dsp)
 
 		group := crdv1alpha1.ResourceGroup{
 			TypeMeta:   typeMeta("ResourceGroup"),
@@ -586,7 +598,7 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 					ReplicasOnSame:          c.parseList(row.ReplicasOnSame, "resource group "+dsp+" replicas_on_same"),
 					ReplicasOnDifferent:     c.parseList(row.ReplicasOnDifferent, "resource group "+dsp+" replicas_on_different"),
 					NotPlaceWithRsc:         c.parseList(row.DoNotPlaceWithRsc, "resource group "+dsp+" do_not_place_with_rsc_list"),
-					ProviderList:            c.providerList(row, dsp, poolPins),
+					ProviderList:            providerPins,
 					LayerStack:              c.parseList(row.LayerStack, "resource group "+dsp+" layer_stack"),
 				},
 			},
@@ -612,95 +624,127 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 	return groups
 }
 
-// providerList carries the resource group's provider allow-list over,
-// widened to cover a pool this migration changed the kind of.
+// placementLists carries the resource group's provider allow-list and
+// storage-pool pins over together.
 //
-// The placer filters candidate pools on this list with an exact match,
-// so a group pinned to ZFS stops seeing a pool that migrated as
-// ZFS_THIN — and a cluster that deliberately ran thick-declared sparse
-// ZFS is exactly the kind that pins it. The adopted volumes keep
-// working, but nothing new can be placed and a lost replica cannot be
-// healed, silently, until someone edits the group.
+// They are decided in one place because they answer one question: after
+// this migration, can the group still place exactly where it could
+// before, and nowhere else? The placer filters candidate pools on the
+// provider list with an exact match, so a group pinned to ZFS stops
+// seeing a pool that migrated as ZFS_THIN — and a cluster that
+// deliberately ran thick-declared sparse ZFS is exactly the kind that
+// pins it. Left alone, the adopted volumes keep working but nothing new
+// can be placed and a lost replica cannot be healed, silently, until
+// someone edits the group.
 //
 // ZFS_THIN is added rather than substituted: a cluster may hold both a
 // remapped pool and a genuinely thick one, and replacing the entry
 // would evict the second from a policy that legitimately named it.
-func (c *converter) providerList(row *ResourceGroupRow, dsp string, pinned []string) []string {
-	list := c.parseList(row.AllowedProviderList, "resource group "+dsp+" allowed_provider_list")
+func (c *converter) placementLists(row *ResourceGroupRow, dsp string) ([]string, []string) {
+	providers := c.parseList(row.AllowedProviderList, "resource group "+dsp+" allowed_provider_list")
+	pools := c.parseList(row.PoolName, "resource group "+dsp+" pool_name")
 
-	if !slices.Contains(list, providerKindZFS) || slices.Contains(list, providerKindZFSThin) {
-		return list
+	if !slices.Contains(providers, providerKindZFS) || slices.Contains(providers, providerKindZFSThin) {
+		return providers, pools
 	}
 
 	// Only a group that could actually place on a remapped pool needs
 	// the widening. Applying it whenever ANY pool in the cluster
-	// remapped hands ZFS_THIN to groups that never had it, which is
-	// how a group that named [ZFS] precisely to keep its replicas off
-	// a thin pool ends up allowed onto it.
-	if !c.reaches(pinned, c.remappedPools) {
-		return list
+	// remapped hands ZFS_THIN to groups that never had it, which is how
+	// a group that named [ZFS] precisely to keep its replicas off a thin
+	// pool ends up allowed onto it.
+	if !c.reaches(pools, c.remappedPools) {
+		return providers, pools
 	}
 
-	c.warnf("resource group %s: allows %s and a pool it can place on migrated as %s — %s added to the allow-list, "+
-		"or the placer would stop finding any eligible pool",
-		dsp, providerKindZFS, providerKindZFSThin, providerKindZFSThin)
-
-	return append(list, providerKindZFSThin)
-}
-
-// poolList carries the group's storage-pool pins over, adding pins
-// where widening the provider list would otherwise hand the group a
-// pool it was deliberately kept away from.
-//
-// The allow-list is expressed in provider kinds, but the exclusion an
-// operator wanted is about a pool. When a group names no pools and the
-// cluster holds a genuinely thin pool alongside a remapped one, adding
-// ZFS_THIN to the kinds admits both. Pinning the group to the pools it
-// could already reach keeps the widening scoped to the pool that
-// changed underneath it.
-func (c *converter) poolList(row *ResourceGroupRow, dsp string) []string {
-	pinned := c.parseList(row.PoolName, "resource group "+dsp+" pool_name")
-
-	providers := c.parseList(row.AllowedProviderList, "resource group "+dsp+" allowed_provider_list")
-	if !slices.Contains(providers, providerKindZFS) || slices.Contains(providers, providerKindZFSThin) {
-		return pinned
-	}
-
-	if !c.reaches(pinned, c.remappedPools) {
-		return pinned
-	}
+	widened := append(providers, providerKindZFSThin) //nolint:gocritic // a new list, not an append to the caller's
 
 	// An explicit pin already scopes the widening: the group can only
 	// land on pools it named, so admitting the kind admits nothing new.
-	if len(pinned) > 0 {
-		return pinned
+	if len(pools) > 0 {
+		c.warnPoolRemapWidening(dsp)
+
+		return widened, pools
 	}
 
-	// Unpinned, so the widening would also admit every pool the source
-	// cluster declared thin. If there are none, the kind is enough.
-	if len(c.declaredThinPools) == 0 {
-		return pinned
+	// Unpinned, so the widening also admits every pool the source
+	// cluster declared thin. With none of those, the kind is enough.
+	excluded := c.declaredThinNames()
+	if len(excluded) == 0 {
+		c.warnPoolRemapWidening(dsp)
+
+		return widened, pools
 	}
 
-	scoped := c.poolsExcept(c.declaredThinPools)
+	scoped := c.poolsExcept(excluded)
+
+	// An empty pin list is not a narrow one: the placer reads it as "no
+	// restriction". So when nothing survives the exclusion — the pool
+	// name that remapped on one node is the same name the source
+	// cluster declared thin on another, which is what happens whenever
+	// pools are named uniformly across nodes — the allow-list simply
+	// cannot express the operator's intent any more.
+	//
+	// Refuse to widen rather than pick a wrong side quietly. The group
+	// keeps its original list, so a new placement fails visibly instead
+	// of landing on the pool the operator excluded; the warning says
+	// what to fix by hand.
+	if len(scoped) == 0 {
+		c.warnf("resource group %s: allow-list left as-is — a pool it can place on migrated to %s, but the "+
+			"same pool name is declared thin elsewhere in the cluster, so widening the list would admit a pool "+
+			"this group could not use before. Pin the group to the pools it should use, by hand",
+			dsp, providerKindZFSThin)
+
+		return providers, pools
+	}
 
 	c.warnf("resource group %s: pinned to %d pool(s) — it named none, and widening its allow-list to %s "+
-		"to keep the remapped pool reachable would otherwise also admit the %d pool(s) the source cluster "+
+		"to keep the remapped pool reachable would otherwise also admit the %d pool name(s) the source cluster "+
 		"declared thin, which it could not place on before",
-		dsp, len(scoped), providerKindZFSThin, len(c.declaredThinPools))
+		dsp, len(scoped), providerKindZFSThin, len(excluded))
 
-	return scoped
+	return widened, scoped
+}
+
+// warnPoolRemapWidening reports the plain widening case, where nothing
+// beyond the remapped pool becomes reachable.
+func (c *converter) warnPoolRemapWidening(dsp string) {
+	c.warnf("resource group %s: allows %s and a pool it can place on migrated as %s — %s added to the allow-list, "+
+		"or the placer would stop finding any eligible pool",
+		dsp, providerKindZFS, providerKindZFSThin, providerKindZFSThin)
+}
+
+// declaredThinNames collapses the node-scoped thin pools to the names a
+// resource group can actually name.
+//
+// A group's pool list is by name and carries no node, so a name is
+// admitted on every node at once. One node declaring it thin is
+// therefore enough to make the whole name unusable for a group that was
+// kept away from thin pools.
+func (c *converter) declaredThinNames() map[string]bool {
+	out := make(map[string]bool, len(c.declaredThinPools))
+
+	for key := range c.declaredThinPools {
+		out[key.pool] = true
+	}
+
+	return out
 }
 
 // reaches reports whether a group pinned to the named pools (or to none
 // at all, meaning any) can place on one of the pools in the set.
-func (c *converter) reaches(pinned []string, set map[string]bool) bool {
+func (c *converter) reaches(pinned []string, set map[poolKey]bool) bool {
 	if len(pinned) == 0 {
 		return len(set) > 0
 	}
 
+	wanted := make(map[string]bool, len(pinned))
 	for _, pool := range pinned {
-		if set[strings.ToUpper(pool)] {
+		wanted[strings.ToUpper(pool)] = true
+	}
+
+	for key := range set {
+		if wanted[key.pool] {
 			return true
 		}
 	}
@@ -960,13 +1004,17 @@ func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
 		// set it would assert that about a definition whose every
 		// data-bearing replica is gone.
 		//
-		// A consistent dump is not expected to produce that shape: for
-		// the witness to be the only survivor, every diskful row would
-		// have to be DELETE-flagged while it is not, which neither an
-		// auto-tiebreaker nor a whole-resource delete does. The guard
-		// is here so the latch does not rest on that reasoning holding
-		// for every dump anyone ever feeds it.
-		if row.ResourceFlags&(resourceFlagDiskless|resourceFlagTieBreaker) != 0 {
+		// Keyed on the diskless bit ALONE, matching decodeResourceFlags:
+		// TIE_BREAKER is only meaningful together with diskless, and
+		// production dumps carry the bit stuck on replicas that are
+		// diskful, left behind by an auto-diskful toggle. Testing it on
+		// its own would drop such a replica from the evidence set while
+		// convertResources adopts it as diskful — and a definition whose
+		// only adopted replica was dropped this way un-latches, which
+		// re-enables auto-primary election and lets an empty first sync
+		// overwrite the data that was just adopted. The skip has to be
+		// narrower than the adoption, never wider.
+		if row.ResourceFlags&resourceFlagDiskless != 0 {
 			continue
 		}
 

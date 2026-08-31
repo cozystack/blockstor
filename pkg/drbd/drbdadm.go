@@ -255,8 +255,19 @@ func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
 	// way, by every snapshot-derived volume in the e2e suite stalling
 	// at once. Widening the vocabulary is the fix; widening it to
 	// "any non-zero exit" is not.
-	if metadataNotUsable(errStr, string(out)) {
+	if metadataAbsent(errStr, string(out)) {
 		return false, nil
+	}
+
+	// Metadata IS there, it just cannot be read until the activity log
+	// is applied. Reporting that as "absent" would send the caller to
+	// create-md --force over a superblock that belongs to real data;
+	// reporting it as an unrecognised failure would hide which state
+	// this is. Name it, and let the caller — the only place that knows
+	// whether it is initialising a fresh lower disk or recovering an
+	// established replica — decide.
+	if metadataUnclean(errStr, string(out)) {
+		return false, errors.Wrapf(ErrMetadataUnclean, "dump-md %s", resource)
 	}
 
 	return false, errors.Wrapf(err,
@@ -286,44 +297,50 @@ var metadataAbsentMarkers = []string{
 	"no valid meta-data",
 }
 
-// metadataUnusableMarkers are the exits that positively state a
-// superblock is there but cannot be read as it stands.
+// ErrMetadataUnclean reports a superblock that is present but cannot be
+// read until its activity log is applied.
 //
-// A volume materialised from a ZFS snapshot, clone or send/recv
-// carries the source's superblock with an activity log that was never
-// closed, so dump-md refuses it with `Found meta data is "unclean",
-// please apply-al first` instead of reporting the metadata absent.
-// That is a deterministic, fully understood state — not the transient
-// class the strict direction below guards against — and the caller has
-// always answered it by re-initialising the volume, which is what a
-// clone, a restore and a ship each want: the destination is a new
-// resource and needs metadata of its own.
+// A dirty activity log is not a clone-only shape. It is the normal
+// state of ANY replica whose activity log was open when the copy was
+// taken or the machine went down: a ZFS snapshot of a live volume
+// captures it exactly as an unclean crash of a writing Primary leaves
+// it, and drbdmeta cannot tell those apart — the signal is identical.
 //
-// Whether a *legitimate* replica returning with a dirty activity log
-// should instead be repaired with `drbdadm apply-al` is a real
-// question, and a separate one: it changes established behaviour on
-// the activation path, so it needs its own change and its own e2e
-// coverage. Deliberately out of scope here.
+// So this cannot be answered here. Re-initialising is right for the
+// destination of a clone, a ship or a restore, which needs metadata of
+// its own; it destroys the GI and dirty bitmap of a replica that just
+// crashed with real data on it. Only the caller knows which one it is
+// looking at, so the probe names the state and refuses to guess.
+var ErrMetadataUnclean = errors.New("metadata is present but its activity log needs applying")
+
+// metadataUncleanMarkers are the exits that positively state that.
 //
 //nolint:gochecknoglobals // a fixed vocabulary, matched in one place
-var metadataUnusableMarkers = []string{
+var metadataUncleanMarkers = []string{
 	"please apply-al",
 }
 
-// metadataNotUsable reports whether the failed probe positively said
-// the volume carries no metadata this resource can use, rather than
-// merely failing for a reason nobody classified.
-func metadataNotUsable(errStr, out string) bool {
-	// Matched case-insensitively: drbdmeta capitalises the sentence,
-	// drbdadm quotes it mid-line, and a probe that guards data must not
-	// turn a capital letter into "unrecognised failure".
+// metadataAbsent reports whether the failed probe positively said the
+// volume carries no metadata at all.
+func metadataAbsent(errStr, out string) bool {
+	return matchesAny(errStr, out, metadataAbsentMarkers)
+}
+
+// metadataUnclean reports whether the failed probe positively said the
+// volume carries metadata whose activity log needs applying first.
+func metadataUnclean(errStr, out string) bool {
+	return matchesAny(errStr, out, metadataUncleanMarkers)
+}
+
+// matchesAny compares case-insensitively: drbdmeta capitalises the
+// sentence, drbdadm quotes it mid-line, and a probe that guards data
+// must not turn a capital letter into "unrecognised failure".
+func matchesAny(errStr, out string, markers []string) bool {
 	haystack := strings.ToLower(errStr + "\n" + out)
 
-	for _, markers := range [][]string{metadataAbsentMarkers, metadataUnusableMarkers} {
-		for _, marker := range markers {
-			if strings.Contains(haystack, strings.ToLower(marker)) {
-				return true
-			}
+	for _, marker := range markers {
+		if strings.Contains(haystack, strings.ToLower(marker)) {
+			return true
 		}
 	}
 

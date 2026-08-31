@@ -551,3 +551,92 @@ func (e fakeConfiguredDeviceError) Error() string {
 func fakeConfiguredDeviceErr(minor int32) error { return fakeConfiguredDeviceError{minor: minor} }
 
 func strconvI32(v int32) string { return strconv.FormatInt(int64(v), 10) }
+
+// errDumpMdUnclean is the verbatim exit drbdadm returns for a volume
+// whose activity log was never closed — the shape a machine leaves
+// behind when it goes down while Primary and writing, and the same
+// shape a ZFS snapshot of a live volume carries into a clone.
+var errDumpMdUnclean = errors.New(
+	`drbdadm dump-md pvc-unclean/0: Found meta data is "unclean", ` +
+		`please apply-al first: exit status 1`)
+
+// uncleanFixture wires a single-volume reconciler whose dump-md reports
+// an unapplied activity log.
+func uncleanFixture(
+	t *testing.T,
+) (*Reconciler, *intent.DesiredResource, map[int32]string, string, *storage.FakeExec) {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md pvc-unclean/0", storage.FakeResponse{Err: errDumpMdUnclean})
+	fx.Expect("drbdadm create-md --force --max-peers=15 pvc-unclean/0", storage.FakeResponse{})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := NewReconciler(ReconcilerConfig{
+		Providers:    map[string]storage.Provider{"thin1": thin},
+		Adm:          drbd.NewAdm(fx),
+		StateDir:     dir,
+		NodeName:     "n1",
+		LocalAddress: "10.0.0.1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-unclean",
+		NodeName: "n1",
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
+		},
+	}
+
+	devices := map[int32]string{0: "/dev/vg/pvc-unclean_00000"}
+
+	return rec, dr, devices, filepath.Join(dir, "pvc-unclean.md-created"), fx
+}
+
+// TestEnsureMetadataRefusesToReinitAnEstablishedReplica: past first
+// activation, an unapplied activity log is a replica coming back after
+// an unclean stop, not a lower disk being initialised. create-md
+// --force there destroys the GI and dirty bitmap of live data, so the
+// step has to fail visibly instead.
+func TestEnsureMetadataRefusesToReinitAnEstablishedReplica(t *testing.T) {
+	rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+
+	if err := os.WriteFile(mdMarkerPath, nil, 0o600); err != nil {
+		t.Fatalf("seed .md-created marker: %v", err)
+	}
+
+	err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, false)
+	if err == nil {
+		t.Fatal("ensureMetadata re-initialised an established replica with a dirty activity log")
+	}
+
+	// Asserted on the command actually issued rather than on the error
+	// alone: what matters is that create-md --force never ran over a
+	// superblock that may belong to live data.
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "create-md") {
+			t.Fatalf("create-md ran against an established replica: %q", line)
+		}
+	}
+}
+
+// On a FIRST activation the lower disk was just materialised — a fresh
+// volume, or one carved from a ZFS clone whose superblock belongs to
+// the source resource. That destination needs metadata of its own, so
+// the same signal must not block it: this is the path the clone, ship
+// and restore e2e scenarios take.
+func TestEnsureMetadataInitialisesAFreshLowerDisk(t *testing.T) {
+	rec, dr, devices, mdMarkerPath, _ := uncleanFixture(t)
+
+	err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, true)
+	if err != nil {
+		t.Fatalf("ensureMetadata on a first activation: %v", err)
+	}
+}
