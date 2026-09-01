@@ -78,7 +78,7 @@ func physicalStorageCreateDevicePool(ctx context.Context, run *runContext) error
 		return fmt.Errorf("%w: create-device-pool needs --pool-name", command.ErrUsage)
 	}
 
-	attach := attachRequest(provider, poolName, token)
+	attach := attachRequest(provider, poolName)
 
 	pool := &apiv1.StoragePool{
 		NodeName:        node,
@@ -149,10 +149,15 @@ func checkAdoptablePool(ctx context.Context, run *runContext, wanted *apiv1.Stor
 	return nil
 }
 
-// attachRequest names the backing the satellite has to create. The
-// pool name doubles as the volume-group / zpool name, which is what
-// `--pool-name` means to an operator running this verb.
-func attachRequest(provider storageProvider, poolName, token string) *apiv1.PhysicalDeviceAttachTo {
+// attachRequest names the backing the satellite has to create.
+//
+// The derivation is apiv1.FillAttachToFromPoolName, the same one the REST
+// handler for this verb uses. Written here separately it had diverged: a
+// bare `--pool-name data` on lvmthin wrote `data` into both the volume group
+// and the thin pool, where REST and upstream produce `linstor_data` and
+// `data`, and a `vg/thin` value went into the volume-group field whole,
+// slash included.
+func attachRequest(provider storageProvider, poolName string) *apiv1.PhysicalDeviceAttachTo {
 	attach := &apiv1.PhysicalDeviceAttachTo{
 		StoragePoolName: poolName,
 		ProviderKind:    provider.kind,
@@ -161,18 +166,7 @@ func attachRequest(provider storageProvider, poolName, token string) *apiv1.Phys
 		Wipe: true,
 	}
 
-	switch {
-	case strings.HasPrefix(token, "zfs"):
-		attach.ZPoolName = poolName
-	case strings.HasPrefix(token, "file"):
-		attach.Directory = poolName
-	case strings.HasPrefix(token, "lvm"):
-		attach.VGName = poolName
-
-		if provider.splitThinPool {
-			attach.ThinPoolName = poolName
-		}
-	}
+	apiv1.FillAttachToFromPoolName(attach, provider.kind, poolName)
 
 	return attach
 }
