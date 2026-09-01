@@ -45,8 +45,12 @@ import (
 
 // VD size bounds mirrored from pkg/rest/volume_definitions.go (Bug 155).
 const (
-	vdBoundsMinSizeKib int64 = 4 * 1024                // 4 MiB
-	vdBoundsMaxSizeKib int64 = 16 * 1024 * 1024 * 1024 // 16 TiB
+	vdBoundsMinSizeKib int64 = 4 * 1024 // 4 MiB
+	// DRBD 9's documented per-device ceiling. It was 16 TiB, which is below
+	// what DRBD 9 and upstream LINSTOR handle: linstormigrate copies sizes
+	// verbatim, so a cluster holding a larger volume failed part-way
+	// through its own migration.
+	vdBoundsMaxSizeKib int64 = 1024 * 1024 * 1024 * 1024 // 1 PiB
 )
 
 // vdBoundsPut issues a PUT with a JSON body and returns (status, body).
