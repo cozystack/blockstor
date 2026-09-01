@@ -89,6 +89,8 @@ const (
 	flagPastable   = "--pastable"
 	flagLayerList  = "--layer-list"
 	flagLayerAbbr  = "-l"
+	flagPassphrase = "--passphrase"
+	flagPassValue  = "-p-value"
 )
 
 // valueFlags are the flags that consume the following argument when
@@ -110,8 +112,8 @@ var valueFlags = map[string]struct{}{ //nolint:gochecknoglobals // static flag t
 	"--size":           {},
 	"--vlmnr":          {},
 	"--limit":          {},
-	"--passphrase":     {},
-	"-p-value":         {},
+	flagPassphrase:     {},
+	flagPassValue:      {},
 	"--migrate-from":   {},
 	"--from-resource":  {},
 	"--from-snapshot":  {},
@@ -170,7 +172,9 @@ func parseFlags(args []string) (*flagSet, error) {
 		}
 
 		if !inline {
-			consumed, valueErr := valueAfter(args, i, arg)
+			_, opaque := opaqueValueFlags[name]
+
+			consumed, valueErr := valueAfter(args, i, arg, opaque)
 			if valueErr != nil {
 				return nil, valueErr
 			}
@@ -381,17 +385,32 @@ func matches(filter []string, value string) bool {
 
 // valueAfter returns the argument a value-taking flag consumes.
 //
-// The next argument is only a value if it is not itself a flag.
+// The next argument is only a value if it is not itself a flag, except for
+// the flags in opaqueValueFlags, whose values are not identifiers.
 // `resource list -n --faulty` used to read "--faulty" as the node name, which
 // produced an empty node filter, no results and exit 0 — a filter that looks
 // like it worked and a flag that silently never applied. Refusing names both
 // mistakes at once: the missing value and the swallowed flag.
-func valueAfter(args []string, i int, arg string) (string, error) {
+// opaqueValueFlags are the flags whose value is free-form bytes rather than
+// an identifier, so a leading dash in it is a legitimate value and not a
+// swallowed flag. A passphrase is the case that matters: `--passphrase
+// -s3cret` is an ordinary thing to type, and the workaround that does work,
+// `--passphrase=-s3cret`, is not discoverable from the refusal.
+var opaqueValueFlags = map[string]struct{}{ //nolint:gochecknoglobals // static flag table
+	flagPassphrase: {},
+	flagPassValue:  {},
+}
+
+func valueAfter(args []string, i int, arg string, opaque bool) (string, error) {
 	if i+1 >= len(args) {
 		return "", fmt.Errorf("%w: flag %q needs a value", command.ErrUsage, arg)
 	}
 
 	next := args[i+1]
+	if opaque {
+		return next, nil
+	}
+
 	if strings.HasPrefix(next, "-") && next != "-" {
 		return "", fmt.Errorf("%w: flag %q needs a value, but the next argument is the flag %q",
 			command.ErrUsage, arg, next)
