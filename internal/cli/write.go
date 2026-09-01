@@ -55,6 +55,19 @@ type propertyAccessor struct {
 	// migration reconciler both stamp per-replica properties, and a
 	// `resource set-property` racing one of them undid its work.
 	edit func(ctx context.Context, st store.Store, ident []string, change func(map[string]string) error) error
+	// namedKey judges the key an operator NAMED, before the bag is
+	// touched. The edit guards judge the resulting state, which cannot
+	// see an operator setting an immutable key to the value it already
+	// has — REST refuses that, so this door has to as well.
+	namedKey func(key string) error
+}
+
+// withNamedKeyGuard attaches a named-key guard to an accessor built by
+// objectProps, whose signature carries only the state-comparing guards.
+func withNamedKeyGuard(accessor propertyAccessor, guard func(string) error) propertyAccessor {
+	accessor.namedKey = guard
+
+	return accessor
 }
 
 // setProperty implements `<noun> set-property`.
@@ -73,6 +86,13 @@ func setProperty(accessor propertyAccessor) handler {
 
 		ident := run.Flags.Positionals[:accessor.args]
 		key := run.Flags.Positionals[accessor.args]
+
+		if accessor.namedKey != nil {
+			named := accessor.namedKey(key)
+			if named != nil {
+				return named
+			}
+		}
 
 		value := ""
 		if len(run.Flags.Positionals) > want {

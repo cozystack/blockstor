@@ -51,15 +51,18 @@ const (
 // VolumeSizeKib holds a requested volume size inside the range DRBD can
 // actually serve.
 //
-// This lives here, and not as a CRD bound, on purpose. A bound in the schema
-// looks stronger — it would hold for `kubectl apply` too — but
-// `spec.volumeDefinitions` carries no list-map key, so it is an atomic list
-// and Kubernetes correlates it as a whole for ratcheting. Any update touching
-// the list re-validates every element, including ones written before the
-// bound existed. A cluster carrying a single grandfathered sub-floor volume
-// would then reject every subsequent write to that resource definition —
-// including the controller's own, since it rewrites the list to stamp
-// drbdMinor. The bound belongs where new sizes enter instead.
+// The same bound is on the CRD field, and both are wanted. The schema is what
+// holds for `kubectl apply`, a GitOps controller, and blockstor's own
+// controller rewriting the list; this one names the offending size in the
+// LINSTOR-shaped error the client expects, and runs before the first write
+// rather than part-way through a spawn.
+//
+// The schema bound only works because `spec.volumeDefinitions` is keyed on
+// volumeNumber. On an atomic list Kubernetes correlates the slice as a whole
+// for ratcheting, so one grandfathered sub-floor volume would reject every
+// later write to that resource definition — including the controller's own,
+// since it rewrites the list to stamp drbdMinor. Keyed, an untouched element
+// is not re-validated.
 func VolumeSizeKib(sizeKib int64) error {
 	if sizeKib < MinVolumeSizeKib {
 		return fmt.Errorf(

@@ -21,6 +21,7 @@ package validate
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -54,6 +55,23 @@ func ImmutableStoragePoolProps() []string {
 		PropZPoolThin,
 		PropFileDir,
 	}
+}
+
+// StoragePoolPropNamed refuses an operation that NAMES a backing-identity
+// key, whatever value it carries.
+//
+// StoragePoolPropEdit catches a key whose value moved. It cannot catch an
+// operator setting one to the value it already has, because no state changed
+// — and the REST door refuses exactly that, since it inspects the requested
+// operation rather than the result. Two doors answering the same question
+// differently is the drift this package exists to remove, so the CLI asks
+// both questions: this one about the operation, the other about the result.
+func StoragePoolPropNamed(key string) error {
+	if !slices.Contains(ImmutableStoragePoolProps(), key) {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %s", ErrImmutableProp, key)
 }
 
 // StoragePoolPropEdit compares a property bag before and after an edit and

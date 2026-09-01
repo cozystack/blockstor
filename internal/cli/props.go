@@ -73,7 +73,7 @@ var resourceProps = objectProps("resource", 2, // (node, definition)
 // `<node> <pool>`.
 //
 //nolint:gochecknoglobals // static accessor table
-var storagePoolProps = objectProps("storage pool", 2, // (node, pool)
+var storagePoolProps = withNamedKeyGuard(objectProps("storage pool", 2, // (node, pool)
 	func(ctx context.Context, st store.Store, ident []string) (apiv1.StoragePool, error) {
 		return st.StoragePools().Get(ctx, ident[0], ident[1])
 	},
@@ -88,7 +88,7 @@ var storagePoolProps = objectProps("storage pool", 2, // (node, pool)
 	// The REST path has refused these since it was written; this CLI edits
 	// the same bag directly, so the rule has to hold here too.
 	validate.StoragePoolPropEdit,
-)
+), validate.StoragePoolPropNamed)
 
 // resourceGroupProps accesses a group's property bag.
 //
