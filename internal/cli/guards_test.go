@@ -20,6 +20,7 @@ package cli_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -96,24 +97,39 @@ func TestMigrateDiskRefusesSelfMigration(t *testing.T) {
 func TestRestoreRefusesNodesWithoutTheSnapshot(t *testing.T) {
 	t.Parallel()
 
-	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
-		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src"})
-		_ = backend.Snapshots().Create(ctx, &apiv1.Snapshot{
-			ResourceName: "pvc-src",
-			Name:         "snap1",
-			Nodes:        []string{"node-1"},
-			VolumeDefinitions: []apiv1.SnapshotVolumeDef{
-				{VolumeNumber: 0, SizeKib: 1024 * 1024},
-			},
-		})
-	})
+	// The fixture has to be complete enough that the restore SUCCEEDS when
+	// the named node holds the snapshot. Seeded any thinner, the command
+	// fails for a missing storage pool whether the guard runs or not, and
+	// the refusal proves nothing.
+	restore := func(node string) (int, string) {
+		app, _, errBuf := newApp(t, seedSnapshotSource)
 
-	argv := []string{
-		"s", "rr", "--from-resource", "pvc-src", "--from-snapshot", "snap1",
-		"--to-resource", "pvc-dst", "--node-name", "node-9",
+		argv := []string{
+			"s", "resource", "restore",
+			"--from-resource", "pvc-x", "--from-snapshot", "snap-1",
+			"--to-resource", "pvc-y", "--nodes", node,
+		}
+
+		return app.Run(t.Context(), argv), errBuf.String()
 	}
-	if got := app.Run(t.Context(), argv); got == 0 {
+
+	// Positive control: node-1 holds the snapshot, so everything else the
+	// restore needs is in place.
+	if got, stderr := restore("node-1"); got != 0 {
+		t.Fatalf("restore onto a node that holds the snapshot exit = %d, so this fixture "+
+			"cannot show what the guard refuses (stderr: %s)", got, stderr)
+	}
+
+	got, stderr := restore("node-9")
+	if got == 0 {
 		t.Fatal("a restore onto a node without the snapshot was accepted")
+	}
+
+	// And refused for the right reason: a replica placed there has no data
+	// behind it, the satellite finds no snapshot to receive, and the
+	// command otherwise reports success over an empty volume.
+	if !strings.Contains(stderr, "does not hold this snapshot") {
+		t.Errorf("refused for an unrelated reason: %s", stderr)
 	}
 }
 
@@ -164,10 +180,38 @@ func TestStoragePoolCreateRefusesUnadvertisedBacking(t *testing.T) {
 func TestCloneRefusesOccupiedTargetBeforeWriting(t *testing.T) {
 	t.Parallel()
 
-	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
-		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src"})
+	// A source with replicas, so a clone onto a free name actually gets as
+	// far as taking the internal snapshot. Seeded without them the clone
+	// fails earlier whether the guard runs or not, and the assertion that
+	// no snapshot was left behind holds trivially.
+	seed := func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "grp"})
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name: "pvc-src", ResourceGroupName: "grp", LayerStack: []string{"DRBD", "STORAGE"},
+		})
+		_ = backend.VolumeDefinitions().Create(ctx, "pvc-src", &apiv1.VolumeDefinition{
+			VolumeNumber: 0, SizeKib: 1 << 20,
+		})
+
+		for _, node := range []string{"node-1", "node-2"} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-src", NodeName: node,
+				Props: map[string]string{"StorPoolName": "data"},
+			})
+		}
+
 		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-dst"})
-	})
+	}
+
+	// Positive control: the same clone onto a free name succeeds, so
+	// everything the refusal case needs is in place.
+	control, _, controlErr := newApp(t, seed)
+	if got := control.Run(t.Context(), []string{"rd", "clone", "pvc-src", "pvc-free"}); got != 0 {
+		t.Fatalf("clone onto a free name exit = %d, so this fixture cannot show what the "+
+			"guard refuses (stderr: %s)", got, controlErr.String())
+	}
+
+	app, _, _ := newApp(t, seed)
 
 	if got := app.Run(t.Context(), []string{"rd", "clone", "pvc-src", "pvc-dst"}); got == 0 {
 		t.Fatal("a clone onto an existing definition was accepted")
