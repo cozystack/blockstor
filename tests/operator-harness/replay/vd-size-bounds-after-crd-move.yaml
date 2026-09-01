@@ -1,0 +1,83 @@
+name: vd-size-bounds-after-crd-move
+description: |
+  The volume-size bound moved off the CRD and must still hold.
+
+  It used to be enforced twice: once by the writers and once by the schema, as
+  `+kubebuilder:validation:Minimum` on spec.volumeDefinitions[].sizeKib. The
+  schema copy came off because spec.volumeDefinitions carries no list-map key,
+  so the list is atomic and Kubernetes correlates it whole for ratcheting: any
+  update touching the list re-validates every element, including ones written
+  before the bound existed. A single grandfathered sub-floor volume would then
+  reject every later write to its definition — the controller's own included,
+  since patchRDVolumeMinors rewrites that list to stamp drbdMinor. Verified
+  against a real apiserver: appending a second, in-range volume was rejected
+  naming volume 0, which nobody had touched.
+
+  The cost of that trade is the `kubectl apply` backstop. What is left is the
+  writers, and this codifies the operator sequence that proves they still
+  refuse:
+
+    rd c → vd c 1024KiB (refused) → vd c 2P (refused) → vd c 100M (accepted)
+
+  The ceiling moved up with the rule. It was 16 TiB, below what DRBD 9 and
+  upstream LINSTOR handle, and linstormigrate copies sizes verbatim — so a
+  cluster holding a larger volume failed part-way through its own migration.
+  The last step declares a 20 TiB volume to prove the writer accepts it.
+
+  HONEST SCOPE: this drives the REST path, which is the one reachable from
+  this harness. The native CLI enforces the same rule from pkg/validate, and
+  is covered by the Go tests in internal/cli — the harness bootstraps the
+  python linstor client and has no vehicle for the native binary today.
+
+  If this YAML goes red, the bound has been lost rather than moved, and no
+  change to pkg/validate/size.go or the writers that call it may be claimed
+  safe.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  rd: rd-vd-size-bounds
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+
+  - name: below-floor-refused
+    # 1024 KiB is under DRBD's 4 MiB floor. Accepted, the volume never becomes
+    # functional: the satellite loops on drbdadm create-md rather than failing.
+    cmd: ["volume-definition", "create", "{{rd}}", "1024KiB"]
+    expect_exit: 10
+
+  - name: above-ceiling-refused
+    cmd: ["volume-definition", "create", "{{rd}}", "2P"]
+    expect_exit: 10
+
+  - name: inside-range-accepted
+    # The guard must not have grown into a blanket denial.
+    cmd: ["volume-definition", "create", "{{rd}}", "100M"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 102400
+      timeout_s: 60
+
+  - name: large-but-legal-accepted
+    # 20 TiB was refused by the old 16 TiB ceiling, which is what broke
+    # migrations of clusters holding one.
+    cmd: ["volume-definition", "create", "{{rd}}", "20T", "--vlmnr", "1"]
+    expect_exit: 0
+    await:
+      kind: vd_count
+      rd: "{{rd}}"
+      expected: 2
+      timeout_s: 60
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    ignore_errors: true
