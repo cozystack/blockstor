@@ -305,13 +305,39 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 
 	name := run.Flags.Positionals[0]
 
-	err := run.Store.ResourceDefinitions().Delete(ctx, name)
+	// Snapshots first, and before anything is torn down. Once the cascade
+	// has stamped every replica, a refusal here would leave the cluster
+	// half-dismantled — children gone, parent kept, snapshots pointing at
+	// neither — and no retry reconciles that.
+	snaps, err := run.Store.Snapshots().ListByDefinition(ctx, name)
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("list snapshots of %s: %w", name, err)
+	}
+
+	if len(snaps) > 0 {
+		return fmt.Errorf("%w: %s has %d snapshot(s); delete them first",
+			errDefinitionHasSnapshots, name, len(snaps))
+	}
+
+	// Then the replicas. Dropping the definition alone leaves them with no
+	// parent to stamp a deletion on, so the satellite finalizer never runs
+	// and the DRBD minor, port and peer entries stay live on every node.
+	err = store.CascadeDeleteResources(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("delete replicas of %s: %w", name, err)
+	}
+
+	err = run.Store.ResourceDefinitions().Delete(ctx, name)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete resource definition %s: %w", name, err)
 	}
 
 	return nil
 }
+
+// errDefinitionHasSnapshots refuses a definition delete while snapshots of it
+// remain, matching what the REST door answers on the same input.
+var errDefinitionHasSnapshots = errors.New("resource definition still has snapshots")
 
 // controllerVersion implements `controller version`.
 func controllerVersion(_ context.Context, run *runContext) error {

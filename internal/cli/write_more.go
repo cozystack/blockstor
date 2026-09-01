@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -236,6 +237,29 @@ func nodeDelete(ctx context.Context, run *runContext) error {
 
 	name := run.Flags.Positionals[0]
 
+	// A node still carrying replicas or pools is refused, not silently
+	// emptied: dropping it leaves those objects pointing at a node that no
+	// longer exists, and nothing reaps them afterwards. --force is the
+	// explicit "this node is gone" decision, and it cascades.
+	if run.Flags.Force {
+		cascadeErr := store.CascadeOrphansForLostNode(ctx, run.Store, name)
+		if cascadeErr != nil {
+			return fmt.Errorf("delete objects on %s: %w", name, cascadeErr)
+		}
+	} else {
+		rscRefs, poolRefs, refErr := store.ReferencesOnNode(ctx, run.Store, name)
+		if refErr != nil {
+			return fmt.Errorf("list objects on %s: %w", name, refErr)
+		}
+
+		if len(rscRefs) > 0 || len(poolRefs) > 0 {
+			return fmt.Errorf("%w: %s still carries replicas of [%s] and storage pools [%s]; "+
+				"remove them or pass --force",
+				errNodeStillReferenced, name,
+				strings.Join(rscRefs, ", "), strings.Join(poolRefs, ", "))
+		}
+	}
+
 	err := run.Store.Nodes().Delete(ctx, name)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete node %s: %w", name, err)
@@ -243,6 +267,10 @@ func nodeDelete(ctx context.Context, run *runContext) error {
 
 	return nil
 }
+
+// errNodeStillReferenced refuses a plain node delete while replicas or pools
+// still name the node, matching what the REST door answers on the same input.
+var errNodeStillReferenced = errors.New("node is still referenced")
 
 // volumeDefinitionCreate implements `volume-definition create <rd>
 // <size>`.
