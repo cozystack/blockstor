@@ -107,19 +107,15 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	// as size_kib, matching the `vd c` path (volume_definitions.go,
 	// which reads `size_kib` verbatim).
 	//
-	// The full [4096 KiB, 16 TiB] gate applies here, not just a
-	// non-positive check. It used to be skipped on the grounds that
-	// the bound would kick in later on a `vd c` — but the bound is now
-	// Minimum/Maximum on the CRD field, so a below-floor size no longer
-	// reaches "later": it is rejected by the API server midway through
-	// this handler, after the resource definition has been created and
-	// while its volumes are being added. That leaves the half-built RD
-	// this validate-before-write block exists to prevent, and hands the
-	// caller a raw schema error instead of the rejection envelope.
+	// The full [4096 KiB, 1 PiB] gate applies here, not just a
+	// non-positive check. It used to be skipped on the grounds that the
+	// bound would kick in later on a `vd c`, which left the spawn free to
+	// create the definition first and fail afterwards.
 	//
-	// validateVDSize emits the identical below-minimum message for `0`
-	// and `-100`, so the wire shape for the non-positive class that
-	// operators actually hit is unchanged.
+	// The CRD carries the same bound, so the schema refuses this too. The
+	// check still runs here because it names the offending size in the
+	// LINSTOR-shaped error the client expects, and because it runs before
+	// the first write rather than part-way through the spawn.
 	for i, sizeKib := range req.VolumeSizes {
 		reason := validateVDSize(sizeKib)
 		if reason == nil {

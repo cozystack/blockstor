@@ -418,16 +418,20 @@ func (s *inMemoryNodes) PatchProps(_ context.Context, name string, mutate func(m
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
 
-	if node.Props == nil {
-		node.Props = map[string]string{}
+	// The mutator gets a copy, not the stored map: a mutator that edits
+	// and then refuses must change nothing, and handing it the live map
+	// makes the refusal only apparent.
+	working := cloneForPatch(node)
+	if working.Props == nil {
+		working.Props = map[string]string{}
 	}
 
-	err := mutate(node.Props)
+	err := mutate(working.Props)
 	if err != nil {
 		return errors.Wrapf(err, "patch Props of node %q", name)
 	}
 
-	s.m[name] = node
+	s.m[name] = working
 
 	return nil
 }
@@ -452,10 +456,7 @@ func (s *inMemoryNodes) PatchNodeSpec(_ context.Context, name string, mutate fun
 	// A struct copy is shallow: the maps and slices in it still address
 	// the stored object, so a mutator that fails partway would leave its
 	// edits behind. Hand it a real copy instead.
-	working, cloneErr := cloneForPatch(node)
-	if cloneErr != nil {
-		return cloneErr
-	}
+	working := cloneForPatch(node)
 
 	err := mutate(&working)
 	if err != nil {

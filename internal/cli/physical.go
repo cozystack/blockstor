@@ -41,6 +41,13 @@ var errAmbiguousDevice = errors.New("ambiguous device")
 // something, or one that is not in the Available phase.
 var errDeviceNotFree = errors.New("device is not free")
 
+// errPoolProviderMismatch and errPoolBackingMismatch refuse continuing into
+// an existing pool of the same name that describes a different backing store.
+var (
+	errPoolProviderMismatch = errors.New("a storage pool of that name already exists with another provider")
+	errPoolBackingMismatch  = errors.New("a storage pool of that name already exists with another backing store")
+)
+
 // physicalStorageCreateDevicePool implements `physical-storage
 // create-device-pool <provider> <node> <device>... --pool-name <name>`.
 //
@@ -90,11 +97,56 @@ func physicalStorageCreateDevicePool(ctx context.Context, run *runContext) error
 	// registered pool with fewer devices than intended, which the same
 	// command completes on re-run.
 	err := run.Store.StoragePools().Create(ctx, pool)
-	if err != nil && !isAlreadyExists(err) {
-		return fmt.Errorf("create storage pool %s on %s: %w", poolName, node, err)
+	if err != nil {
+		if !isAlreadyExists(err) {
+			return fmt.Errorf("create storage pool %s on %s: %w", poolName, node, err)
+		}
+
+		// The name is taken. Tolerating that is what makes a re-run
+		// finish an interrupted attempt — but only when the pool that
+		// exists is the one this command is building. A pool of another
+		// provider wearing the same name is somebody else's: continuing
+		// would stamp the device with Wipe: true for the requested
+		// backing while the registered pool keeps pointing at theirs, so
+		// the disk is erased under a pool that never claimed it.
+		existErr := checkAdoptablePool(ctx, run, pool)
+		if existErr != nil {
+			return existErr
+		}
 	}
 
 	return stampDevices(ctx, run, node, devices, attach)
+}
+
+// checkAdoptablePool refuses to continue into a pool this command did not
+// create, and would not have created.
+//
+// Compared on the fields that decide where the data lands. A difference in
+// any of them means the registered pool describes a different backing store,
+// and the devices about to be stamped would be wiped for a backing nothing
+// reconciles them into.
+func checkAdoptablePool(ctx context.Context, run *runContext, wanted *apiv1.StoragePool) error {
+	existing, err := run.Store.StoragePools().Get(ctx, wanted.NodeName, wanted.StoragePoolName)
+	if err != nil {
+		return fmt.Errorf("get storage pool %s on %s: %w",
+			wanted.StoragePoolName, wanted.NodeName, err)
+	}
+
+	if existing.ProviderKind != wanted.ProviderKind {
+		return fmt.Errorf("%w: %s on %s is %s, not %s",
+			errPoolProviderMismatch, wanted.StoragePoolName, wanted.NodeName,
+			existing.ProviderKind, wanted.ProviderKind)
+	}
+
+	for key, want := range wanted.Props {
+		if got := existing.Props[key]; got != want {
+			return fmt.Errorf("%w: %s on %s has %s=%q, not %q",
+				errPoolBackingMismatch, wanted.StoragePoolName, wanted.NodeName,
+				key, got, want)
+		}
+	}
+
+	return nil
 }
 
 // attachRequest names the backing the satellite has to create. The

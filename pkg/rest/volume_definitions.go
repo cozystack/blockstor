@@ -494,8 +494,10 @@ func rawHasNonNullKey(obj map[string]json.RawMessage, key string) bool {
 const minVolumeDefinitionSizeKib int64 = validate.MinVolumeSizeKib
 
 // maxVolumeDefinitionSizeKib is the largest accepted size_kib (Bug
-// 155). 16 TiB is DRBD's hard per-device ceiling — the on-disk
-// activity-log encoding can't address more than 16 TiB of net data.
+// 155). The ceiling is DRBD 9's documented per-device limit, 1 PiB. It
+// was 16 TiB, which is below what DRBD 9 and upstream LINSTOR handle:
+// linstormigrate copies sizes verbatim, so a cluster holding a larger
+// volume failed part-way through its own migration.
 // Requests above that bound will fail at `drbdadm create-md` time
 // regardless of backing storage capacity, so refusing here gets the
 // operator a typed error envelope instead of an opaque satellite
@@ -628,7 +630,7 @@ func writeVDSizeRejection(w http.ResponseWriter, rd string, vn int32, sizeKib in
 			minVolumeDefinitionSizeKib, maxVolumeDefinitionSizeKib,
 		),
 		Correc: fmt.Sprintf(
-			"pick a size between %d KiB (~4 MiB) and %d KiB (~16 TiB) and re-issue `linstor vd c`",
+			"pick a size between %d KiB (~4 MiB) and %d KiB (~1 PiB) and re-issue `linstor vd c`",
 			minVolumeDefinitionSizeKib, maxVolumeDefinitionSizeKib,
 		),
 		ObjRefs: map[string]string{
@@ -822,7 +824,7 @@ func rejectVDPatchSize(
 
 	// Adversarial round 4 (2026-07-03): mirror the CREATE path's Bug 155
 	// bounds gate on the RESIZE path. The create path refuses size_kib
-	// outside [4 MiB, 16 TiB] via validateVDSize so the satellite never
+	// outside [4 MiB, 1 PiB] via validateVDSize so the satellite never
 	// hot-loops on `drbdadm create-md`; `linstor vd set-size` previously
 	// skipped that check, so a below-floor force-shrink or an over-ceiling
 	// grow was stored verbatim and reproduced the Bug 155 hot-loop through

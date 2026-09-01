@@ -595,7 +595,7 @@ func resourceGroupCreate(ctx context.Context, run *runContext) error {
 
 	group := &apiv1.ResourceGroup{Name: run.Flags.Positionals[0]}
 
-	err := applyGroupPolicy(group, run.Flags)
+	err := applyGroupPolicy(ctx, run, group, run.Flags)
 	if err != nil {
 		return err
 	}
@@ -622,7 +622,7 @@ func resourceGroupModify(ctx context.Context, run *runContext) error {
 	// same group is reverted by this write.
 	err := run.Store.ResourceGroups().PatchResourceGroup(ctx, name,
 		func(group *apiv1.ResourceGroup) error {
-			return applyGroupPolicy(group, run.Flags)
+			return applyGroupPolicy(ctx, run, group, run.Flags)
 		})
 	if err != nil {
 		return fmt.Errorf("update resource group %s: %w", name, err)
@@ -649,7 +649,9 @@ func resourceGroupDelete(ctx context.Context, run *runContext) error {
 
 // applyGroupPolicy folds the placement flags onto a group, leaving
 // unset fields alone so `modify` only changes what was asked for.
-func applyGroupPolicy(group *apiv1.ResourceGroup, flags *flagSet) error {
+func applyGroupPolicy(
+	ctx context.Context, run *runContext, group *apiv1.ResourceGroup, flags *flagSet,
+) error {
 	if raw := flags.Values["place-count"]; raw != "" {
 		count, err := parseInt32(raw, "--place-count")
 		if err != nil {
@@ -667,6 +669,14 @@ func applyGroupPolicy(group *apiv1.ResourceGroup, flags *flagSet) error {
 		parsed, err := parseLayerList(layers)
 		if err != nil {
 			return err
+		}
+
+		// A group's stack is inherited by every definition spawned from
+		// it, so an unguarded LUKS here reaches more volumes than an
+		// unguarded one on a single definition.
+		luksErr := checkLUKSPrerequisite(ctx, run, parsed)
+		if luksErr != nil {
+			return luksErr
 		}
 
 		group.SelectFilter.LayerStack = parsed

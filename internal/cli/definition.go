@@ -97,6 +97,15 @@ func modifyDefinition(
 			return err
 		}
 
+		// Same prerequisite as on create: a stack asking for LUKS with
+		// no cluster passphrase brings the replicas up plaintext. The
+		// layer stack reaches the satellite the same way whichever verb
+		// wrote it, so guarding only create leaves the door open.
+		luksErr := checkLUKSPrerequisite(ctx, run, parsed)
+		if luksErr != nil {
+			return luksErr
+		}
+
 		def.LayerStack = parsed
 	}
 
