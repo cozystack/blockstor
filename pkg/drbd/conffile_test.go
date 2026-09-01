@@ -19,6 +19,7 @@ limitations under the License.
 package drbd_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -617,5 +618,86 @@ func TestSharedSecretKeyIsMatchedCaseInsensitively(t *testing.T) {
 
 	if !strings.Contains(out, `"aGVsbG8rL3dvcmxkPQ=="`) {
 		t.Errorf("a differently cased shared-secret key reached drbdadm unquoted:\n%s", out)
+	}
+}
+
+// An empty value has no bare spelling: `key ;` is not valid syntax, so the
+// quoting branch has to cover it. Without it the rendered file fails to
+// parse, and it fails on the node rather than here.
+func TestEmptyOptionValueIsQuoted(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name:    "r0",
+		Options: map[string]string{"on-no-data-accessible": ""},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `on-no-data-accessible "";`) {
+		t.Errorf("an empty value was emitted bare, which drbdadm cannot parse:\n%s", out)
+	}
+}
+
+// '#' opens a comment. Emitted bare, everything after it on the line —
+// including the terminating semicolon — is swallowed, so the block runs on
+// into whatever follows.
+func TestValueCarryingAHashIsQuoted(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name: "r0",
+		// No whitespace, so '#' is the only thing that makes this
+		// unquotable — quoting it for any other reason would not
+		// exercise the class at all.
+		Handlers: map[string]string{"fence-peer": "/usr/bin/fence-peer#1.sh"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `fence-peer "/usr/bin/fence-peer#1.sh";`) {
+		t.Errorf("a value carrying '#' was emitted bare, so the rest of the line is a comment:\n%s", out)
+	}
+}
+
+// The quoting is drbd's, not Go's. drbdadm's lexer decodes no escapes inside
+// a quoted string, so a backslash has to reach it as one character. %q would
+// double it and the handler would run with the wrong path.
+func TestQuotedValueIsNotGoEscaped(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name:     "r0",
+		Handlers: map[string]string{"fence-peer": `/usr/bin/fence --path a\b --tag x`},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if strings.Contains(out, `a\\b`) {
+		t.Errorf("the backslash was Go-escaped; drbdadm decodes no escapes and would read two:\n%s", out)
+	}
+
+	if !strings.Contains(out, `fence-peer "/usr/bin/fence --path a\b --tag x";`) {
+		t.Errorf("the value did not survive quoting literally:\n%s", out)
+	}
+}
+
+// A quote has no representation at all: it ends the string, and there is no
+// escape to fall back on. Refusing names the option at build time instead of
+// shipping a file that parses into something else. Reachable in practice —
+// the passphrase endpoint validates only that its value is non-empty.
+func TestBuildRefusesAValueCarryingAQuote(t *testing.T) {
+	for name, r := range map[string]drbd.Resource{
+		"handler": {Name: "r0", Handlers: map[string]string{"fence-peer": `/bin/f --tag "x"`}},
+		"secret":  {Name: "r0", Net: drbd.Net{SharedSecret: `se"cret`}},
+		"newline": {Name: "r0", Options: map[string]string{"on-no-data-accessible": "a\nb"}},
+	} {
+		out, err := drbd.Build(r)
+		if err == nil {
+			t.Errorf("%s: a value with no drbd.conf spelling was rendered anyway:\n%s", name, out)
+
+			continue
+		}
+
+		if !errors.Is(err, drbd.ErrUnrepresentableValue) {
+			t.Errorf("%s: unexpected error: %v", name, err)
+		}
 	}
 }

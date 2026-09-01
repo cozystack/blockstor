@@ -92,3 +92,41 @@ func TestDRBDPassphraseUnknownRD(t *testing.T) {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
+
+// A passphrase carrying a quote or a newline has no spelling in the drbd.conf
+// string the secret becomes, so it is refused here rather than stored. Accepted,
+// it returns 200 and then strands the resource on the node, where nothing points
+// back at this call.
+func TestDRBDPassphraseUnrepresentable(t *testing.T) {
+	for name, passphrase := range map[string]string{
+		"quote":   `se"cret`,
+		"newline": "se\ncret",
+	} {
+		st := store.NewInMemory()
+		if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		base, stop := startServerWithStore(t, st)
+
+		body, _ := json.Marshal(map[string]string{"passphrase": passphrase})
+
+		resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/encryption-passphrase", body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status: got %d, want 400", name, resp.StatusCode)
+		}
+
+		rd, err := st.ResourceDefinitions().Get(t.Context(), "pvc-1")
+		if err != nil {
+			t.Fatalf("%s: get: %v", name, err)
+		}
+
+		if got := rd.Props[drbdSharedSecretKey]; got != "" {
+			t.Errorf("%s: the refused passphrase was stored anyway: %q", name, got)
+		}
+
+		stop()
+	}
+}

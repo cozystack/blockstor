@@ -220,6 +220,11 @@ func Build(r Resource) (string, error) {
 		return "", errors.New("drbd: resource name is required")
 	}
 
+	err := checkValues(&r)
+	if err != nil {
+		return "", err
+	}
+
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "resource %s {\n", r.Name)
@@ -254,11 +259,12 @@ func Build(r Resource) (string, error) {
 // grammar needs it.
 //
 // Most option values are bare keywords or numbers and must stay unquoted, so
-// this quotes only what would not survive as a bare token: anything carrying
-// whitespace, a quote, a semicolon or a brace. That covers the two shapes
-// that reach here in practice — a handler, which is a command line with
-// arguments, and a secret, which is base64 and routinely carries '+', '/' or
-// '='.
+// this quotes only what would not survive as a bare token: whitespace, a
+// quote, a brace, a semicolon, or a '#', which opens a comment and would
+// swallow the rest of the line. Base64 padding and the '+' and '/' of a
+// secret are NOT in that class — they survive bare, and the secret is quoted
+// by the name-based branch in writeNet because drbd's grammar spells that one
+// option as a string, not because its characters demand it.
 //
 // Emitting such a value verbatim does not fail loudly. drbdadm reads the
 // first token and treats the rest as syntax, so a fence-peer handler with a
@@ -267,12 +273,82 @@ func Build(r Resource) (string, error) {
 // configuration time.
 func writeOption(b *strings.Builder, indent, key, value string) {
 	if needsQuoting(value) {
-		fmt.Fprintf(b, "%s%s %q;\n", indent, key, value)
+		fmt.Fprintf(b, "%s%s %s;\n", indent, key, quoteValue(value))
 
 		return
 	}
 
 	fmt.Fprintf(b, "%s%s %s;\n", indent, key, value)
+}
+
+// quoteValue wraps a value in the quotes drbd's grammar uses.
+//
+// Deliberately not %q. That is Go quoting, and drbdadm's lexer decodes no
+// escapes inside a quoted string: Go renders a backslash as `\\` and drbdadm
+// would read two, and a value carrying a quote comes out as `\"`, which ends
+// the string early and turns the remainder into syntax. Values with no
+// representation at all are refused by checkValue before anything is
+// rendered, so what reaches here is emitted literally between two quotes.
+func quoteValue(value string) string {
+	return `"` + value + `"`
+}
+
+// ErrUnrepresentableValue refuses a value drbd.conf cannot spell. Exported
+// so a caller validating operator input can tell it from a malformed
+// resource and report which value was rejected.
+var ErrUnrepresentableValue = errors.New("drbd: value cannot be represented in drbd.conf")
+
+// ValidateOptionValue refuses a value that has no spelling in a drbd.conf string. The
+// quoted form is delimited by '"' and ends at the line, and there are no
+// escapes to fall back on, so a value carrying either character cannot be
+// written at all.
+//
+// Refusing here makes that an error naming the option, at the moment the
+// config is built. Emitting it anyway produces a file that parses wrong on
+// the node, and it surfaces whenever DRBD next reads it, which for a handler
+// is the moment it needs to fence.
+//
+// Exported so an API handler can refuse operator input at the edge. Build
+// refuses it too, but that happens on the node at reconcile time, by which
+// point the value is stored and the resource simply fails to configure.
+func ValidateOptionValue(block, key, value string) error {
+	i := strings.IndexAny(value, "\"\n\r")
+	if i < 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %s option %q carries %q", ErrUnrepresentableValue, block, key, value[i:i+1])
+}
+
+// checkValues walks every free-form value a resource carries. Blocks are
+// visited in a fixed order so the same resource always names the same option.
+func checkValues(r *Resource) error {
+	err := ValidateOptionValue(SectionNet, sharedSecretOption, r.Net.SharedSecret)
+	if err != nil {
+		return err
+	}
+
+	blocks := []struct {
+		name string
+		opts map[string]string
+	}{
+		{SectionNet, r.Net.Options},
+		{SectionOptions, r.Options},
+		{SectionDisk, r.Disk},
+		{SectionHandlers, r.Handlers},
+		{SectionPeerDevice, r.PeerDevice},
+	}
+
+	for _, block := range blocks {
+		for _, key := range sortedKeys(block.opts) {
+			err := ValidateOptionValue(block.name, key, block.opts[key])
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // needsQuoting reports whether a value would not survive as a bare drbd
@@ -301,7 +377,7 @@ func writeNet(b *strings.Builder, n Net) {
 	b.WriteString("  net {\n")
 
 	if n.SharedSecret != "" {
-		fmt.Fprintf(b, "    %s %q;\n", sharedSecretOption, n.SharedSecret)
+		fmt.Fprintf(b, "    %s %s;\n", sharedSecretOption, quoteValue(n.SharedSecret))
 	}
 
 	for _, option := range sortedKeys(n.Options) {
@@ -319,7 +395,7 @@ func writeNet(b *strings.Builder, n Net) {
 		// against a future one, not a fix for a live bug.
 		if strings.EqualFold(option, sharedSecretOption) {
 			if n.SharedSecret == "" {
-				fmt.Fprintf(b, "    %s %q;\n", option, n.Options[option])
+				fmt.Fprintf(b, "    %s %s;\n", option, quoteValue(n.Options[option]))
 			}
 
 			continue
