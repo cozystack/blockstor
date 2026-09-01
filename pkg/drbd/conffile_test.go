@@ -563,3 +563,59 @@ func TestBuildEmitsSharedSecretOnce(t *testing.T) {
 		t.Errorf("want exactly 1 shared-secret line, got %d:\n%s", n, got)
 	}
 }
+
+// A handler is a command line, and configuring fencing with one that takes an
+// argument is the ordinary case. Emitted verbatim it does not fail loudly:
+// drbdadm reads the first token and treats the rest as syntax, so the parse
+// error surfaces in a file the operator never edited, at the moment DRBD
+// needs to fence.
+//
+// A value that survives as a bare token is left alone, so this changes
+// nothing about configs that already worked.
+func TestHandlerWithArgumentsIsQuoted(t *testing.T) {
+	res := drbd.Resource{
+		Name: "pvc-quote",
+		Handlers: map[string]string{
+			"fence-peer":   "/usr/lib/drbd/crm-fence-peer.9.sh --timeout 60",
+			"after-resync": "/usr/lib/drbd/plain.sh",
+		},
+		Hosts: []drbd.Host{{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0}},
+	}
+
+	out, err := drbd.Build(res)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `fence-peer "/usr/lib/drbd/crm-fence-peer.9.sh --timeout 60";`) {
+		t.Errorf("a handler with arguments was not quoted:\n%s", out)
+	}
+
+	if !strings.Contains(out, "after-resync /usr/lib/drbd/plain.sh;") {
+		t.Errorf("a bare handler path was quoted where it did not need to be:\n%s", out)
+	}
+}
+
+// The shared-secret key is compared case-insensitively so a differently
+// cased spelling cannot slip past the quoting and reach drbdadm bare. Every
+// producer writes the canonical lowercase today, so this pins a guard against
+// a future one rather than a live bug — and without it, replacing EqualFold
+// with == keeps the package green.
+func TestSharedSecretKeyIsMatchedCaseInsensitively(t *testing.T) {
+	res := drbd.Resource{
+		Name: "pvc-secret",
+		Net: drbd.Net{
+			Options: map[string]string{"Shared-Secret": "aGVsbG8rL3dvcmxkPQ=="},
+		},
+		Hosts: []drbd.Host{{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0}},
+	}
+
+	out, err := drbd.Build(res)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `"aGVsbG8rL3dvcmxkPQ=="`) {
+		t.Errorf("a differently cased shared-secret key reached drbdadm unquoted:\n%s", out)
+	}
+}

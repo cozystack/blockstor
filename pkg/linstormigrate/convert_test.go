@@ -1258,6 +1258,127 @@ func TestRemapWidensWhenNoThinPoolExists(t *testing.T) {
 	}
 }
 
+// TestPinnedGroupNamingAThinPoolIsNotWidened: a pin scopes the widening only
+// when none of the pools it names was already thin. Here the group names both
+// the pool that remaps and one the source declared ZFS_THIN — before the
+// migration the provider filter kept it off the second, and widening the kind
+// removes the only thing that did, because pool names and provider kinds are
+// independent filters at the placer.
+//
+// The pins are the operator's and cannot be narrowed here, so the allow-list
+// is left alone and the conflict reported.
+func TestPinnedGroupNamingAThinPoolIsNotWidened(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "SPARSE", DriverName: "ZFS", UUID: "sp-1"},
+			{NodeName: "NODE-A", PoolName: "REALTHIN", DriverName: "ZFS_THIN", UUID: "sp-2"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{
+				ResourceGroupName:    "RG",
+				ResourceGroupDspName: "rg",
+				AllowedProviderList:  `["ZFS"]`,
+				PoolName:             `["SPARSE","REALTHIN"]`,
+				UUID:                 "rg-1",
+			},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/SPARSE", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	filter := res.ResourceGroups[0].Spec.SelectFilter
+	if containsString(filter.ProviderList, "ZFS_THIN") {
+		t.Errorf("allow-list = %v: the group names a pool the source declared thin, "+
+			"so widening the kind hands it that pool", filter.ProviderList)
+	}
+
+	if !hasWarning(res, "by hand") {
+		t.Errorf("the unresolvable case was not reported; warnings: %v", res.Warnings)
+	}
+}
+
+// The same shape with one pool name on two nodes: SPARSE remaps on node-a
+// while the same name is declared thin on node-b. A pin cannot separate them,
+// since a pin carries no node.
+func TestPinnedGroupNamingASplitPoolIsNotWidened(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+			{NodeName: "NODE-B", NodeDspName: "node-b", NodeType: 2, UUID: "n-b"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "TANK", DriverName: "ZFS", UUID: "sp-1"},
+			{NodeName: "NODE-B", PoolName: "TANK", DriverName: "ZFS_THIN", UUID: "sp-2"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{
+				ResourceGroupName:    "RG",
+				ResourceGroupDspName: "rg",
+				AllowedProviderList:  `["ZFS"]`,
+				PoolName:             `["TANK"]`,
+				UUID:                 "rg-1",
+			},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/TANK", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	filter := res.ResourceGroups[0].Spec.SelectFilter
+	if containsString(filter.ProviderList, "ZFS_THIN") {
+		t.Errorf("allow-list = %v: the pinned name is thin on another node", filter.ProviderList)
+	}
+}
+
+// A pinned group whose pools are all thick is the ordinary case and must
+// still be widened, or the remapped pool it names goes unreachable.
+func TestPinnedGroupOnThickPoolsIsWidened(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "SPARSE", DriverName: "ZFS", UUID: "sp-1"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{
+				ResourceGroupName:    "RG",
+				ResourceGroupDspName: "rg",
+				AllowedProviderList:  `["ZFS"]`,
+				PoolName:             `["SPARSE"]`,
+				UUID:                 "rg-1",
+			},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/SPARSE", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	filter := res.ResourceGroups[0].Spec.SelectFilter
+	if !containsString(filter.ProviderList, "ZFS_THIN") {
+		t.Errorf("allow-list = %v, want ZFS_THIN: the group's own pool remapped", filter.ProviderList)
+	}
+}
+
 // TestRemapLeavesUnrelatedGroupsAlone: a group that cannot place on the
 // remapped pool has no reason to learn about ZFS_THIN, and giving it the
 // kind anyway is how an exclusion quietly disappears.

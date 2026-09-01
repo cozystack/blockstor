@@ -133,33 +133,31 @@ type converter struct {
 	// later kinds can drop rows that would dangle (a replica of a
 	// skipped/absent RD, a replica on an unknown node, ...).
 	convertedRD map[string]bool // by resource_name (UPPERCASE key)
-	// remappedPools names the ZFS pools carried over as ZFS_THIN, so
-	// the resource groups that could place on one can learn about the
-	// new kind — and, just as importantly, so the ones that could not
-	// are left alone.
+	// remappedPools names the ZFS pools carried over as ZFS_THIN, so the
+	// resource groups that could place on one can learn about the new
+	// kind — and, just as importantly, so the ones that could not are
+	// left alone.
 	//
-	// Keyed by (node, pool): a LINSTOR pool is node-scoped, and the
-	// same pool name routinely exists on every node with a driver that
-	// differs between them.
-	remappedPools map[poolKey]bool
+	// Keyed by pool NAME, though a LINSTOR pool is node-scoped and the
+	// same name routinely exists on every node with different drivers.
+	// That is deliberate rather than a simplification: the only consumer
+	// is a resource group's placement policy, and a group's pool list
+	// carries no node. A group admitted to "TANK" is admitted to TANK on
+	// every node, so a per-node distinction here could not be expressed
+	// downstream even if it were carried. Where the same name is thick on
+	// one node and thin on another, that ambiguity is the finding, and
+	// placementLists reports it rather than resolving it.
+	remappedPools map[string]bool
 	// declaredThinPools names the pools the source cluster already
-	// declared ZFS_THIN. Widening an allow-list to cover a remapped
-	// pool would also admit these, which is only harmless when a group
-	// could reach them anyway.
-	declaredThinPools map[poolKey]bool
+	// declared ZFS_THIN, by name for the same reason. One node declaring
+	// a name thin is enough to taint the name for a group that was kept
+	// away from thin pools.
+	declaredThinPools map[string]bool
 	convertedNode     map[string]bool // by node_name (UPPERCASE key)
 	convertedRG       map[string]bool // by resource_group_name (UPPERCASE key)
 
 	warnings  []string
 	warnedKey map[string]bool
-}
-
-// poolKey addresses a storage pool the way LINSTOR does: a pool lives
-// on a node, and the same name on two nodes can carry two different
-// drivers.
-type poolKey struct {
-	node string
-	pool string
 }
 
 type volumeKey struct {
@@ -203,8 +201,8 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		convertedRD:       map[string]bool{},
 		convertedNode:     map[string]bool{},
 		convertedRG:       map[string]bool{},
-		remappedPools:     map[poolKey]bool{},
-		declaredThinPools: map[poolKey]bool{},
+		remappedPools:     map[string]bool{},
+		declaredThinPools: map[string]bool{},
 		warnedKey:         map[string]bool{},
 	}
 
@@ -541,12 +539,12 @@ func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 
 		kind := row.DriverName
 		if kind == providerKindZFSThin {
-			c.declaredThinPools[poolKey{node: row.NodeName, pool: row.PoolName}] = true
+			c.declaredThinPools[row.PoolName] = true
 		}
 
 		if createsSparseZvols(kind, c.zfscreateOptions(row.NodeName, row.PoolName)) {
 			kind = providerKindZFSThin
-			c.remappedPools[poolKey{node: row.NodeName, pool: row.PoolName}] = true
+			c.remappedPools[row.PoolName] = true
 
 			c.warnf("storage pool %s.%s: declared %s, but %s makes every zvol sparse — migrated as %s so the adopted volumes keep the provisioning they actually have",
 				poolDsp, nodeDsp, providerKindZFS, storDriverZfscreateOptions, providerKindZFSThin)
@@ -659,9 +657,28 @@ func (c *converter) placementLists(row *ResourceGroupRow, dsp string) ([]string,
 
 	widened := append(providers, providerKindZFSThin) //nolint:gocritic // a new list, not an append to the caller's
 
-	// An explicit pin already scopes the widening: the group can only
-	// land on pools it named, so admitting the kind admits nothing new.
+	excluded := c.declaredThinPools
+
+	// A pin scopes the widening only when none of the pools it names was
+	// already thin in the source. Where one was, the group could reach
+	// that pool by name but the provider filter kept it out, and widening
+	// the kind removes the only thing that did — the two filters are
+	// independent at the placer, so the named pool becomes placeable.
+	//
+	// Nothing can be narrowed here: the pin is the operator's, and
+	// dropping a pool from it would be this migration deciding where
+	// replicas may not go. So the allow-list is left alone and the
+	// conflict is reported, which costs the group new placements on the
+	// remapped pool until someone resolves it by hand. Losing reachability
+	// is visible and recoverable; silently admitting an excluded thin pool
+	// is neither.
 	if len(pools) > 0 {
+		if pinnedNames(pools, excluded) {
+			c.warnPoolRemapUnresolvable(dsp)
+
+			return providers, pools
+		}
+
 		c.warnPoolRemapWidening(dsp)
 
 		return widened, pools
@@ -669,7 +686,6 @@ func (c *converter) placementLists(row *ResourceGroupRow, dsp string) ([]string,
 
 	// Unpinned, so the widening also admits every pool the source
 	// cluster declared thin. With none of those, the kind is enough.
-	excluded := c.declaredThinNames()
 	if len(excluded) == 0 {
 		c.warnPoolRemapWidening(dsp)
 
@@ -706,6 +722,30 @@ func (c *converter) placementLists(row *ResourceGroupRow, dsp string) ([]string,
 	return widened, scoped
 }
 
+// pinnedNames reports whether a group's pool pins name any pool the source
+// cluster declared thin. Compared case-insensitively on the upper-cased key
+// the dump uses, since a pin is written by an operator and the dump's keys
+// are canonical.
+func pinnedNames(pinned []string, excluded map[string]bool) bool {
+	for _, pool := range pinned {
+		if excluded[strings.ToUpper(pool)] {
+			return true
+		}
+	}
+
+	return false
+}
+
+// warnPoolRemapUnresolvable reports the case where the group's own pins
+// already reach a pool the source declared thin, so widening the kind cannot
+// be scoped and the allow-list is left as it was.
+func (c *converter) warnPoolRemapUnresolvable(dsp string) {
+	c.warnf("resource group %s: allow-list left as-is — a pool it can place on migrated to %s, but the "+
+		"group is pinned to a pool the source cluster declared thin, so widening the list would admit a "+
+		"pool this group could not use before. Resolve the pins by hand",
+		dsp, providerKindZFSThin)
+}
+
 // warnPoolRemapWidening reports the plain widening case, where nothing
 // beyond the remapped pool becomes reachable.
 func (c *converter) warnPoolRemapWidening(dsp string) {
@@ -714,37 +754,15 @@ func (c *converter) warnPoolRemapWidening(dsp string) {
 		dsp, providerKindZFS, providerKindZFSThin, providerKindZFSThin)
 }
 
-// declaredThinNames collapses the node-scoped thin pools to the names a
-// resource group can actually name.
-//
-// A group's pool list is by name and carries no node, so a name is
-// admitted on every node at once. One node declaring it thin is
-// therefore enough to make the whole name unusable for a group that was
-// kept away from thin pools.
-func (c *converter) declaredThinNames() map[string]bool {
-	out := make(map[string]bool, len(c.declaredThinPools))
-
-	for key := range c.declaredThinPools {
-		out[key.pool] = true
-	}
-
-	return out
-}
-
 // reaches reports whether a group pinned to the named pools (or to none
 // at all, meaning any) can place on one of the pools in the set.
-func (c *converter) reaches(pinned []string, set map[poolKey]bool) bool {
+func (c *converter) reaches(pinned []string, set map[string]bool) bool {
 	if len(pinned) == 0 {
 		return len(set) > 0
 	}
 
-	wanted := make(map[string]bool, len(pinned))
 	for _, pool := range pinned {
-		wanted[strings.ToUpper(pool)] = true
-	}
-
-	for key := range set {
-		if wanted[key.pool] {
+		if set[strings.ToUpper(pool)] {
 			return true
 		}
 	}

@@ -645,3 +645,28 @@ func TestEnsureMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
 		}
 	}
 }
+
+// ensurePerVolumeMetadata carries its own copy of the unclean mapping, and
+// nothing drove it before: deleting that mapping left the whole suite green
+// while an unclean lower disk stopped being initialised on the path that
+// reaches established resources.
+//
+// The behaviour is the same as its ensureMetadata twin and pinned for the
+// same reason — see TestEnsureMetadataInitialisesAnUncleanLowerDisk for why
+// re-initialising here is what the platform does today, and what it costs.
+func TestEnsurePerVolumeMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
+	rec, dr, devices, _, fx := uncleanFixture(t)
+
+	err := rec.ensurePerVolumeMetadata(context.Background(), dr, devices, false)
+	if err != nil {
+		t.Fatalf("ensurePerVolumeMetadata: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "create-md") {
+			return
+		}
+	}
+
+	t.Error("the volume was left without metadata")
+}

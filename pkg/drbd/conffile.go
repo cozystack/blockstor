@@ -250,6 +250,41 @@ func Build(r Resource) (string, error) {
 	return b.String(), nil
 }
 
+// writeOption emits one `key value;` line, quoting the value when drbdadm's
+// grammar needs it.
+//
+// Most option values are bare keywords or numbers and must stay unquoted, so
+// this quotes only what would not survive as a bare token: anything carrying
+// whitespace, a quote, a semicolon or a brace. That covers the two shapes
+// that reach here in practice — a handler, which is a command line with
+// arguments, and a secret, which is base64 and routinely carries '+', '/' or
+// '='.
+//
+// Emitting such a value verbatim does not fail loudly. drbdadm reads the
+// first token and treats the rest as syntax, so a fence-peer handler with a
+// --timeout argument becomes a parse error in a file the operator never
+// edited, and it surfaces at the moment DRBD needs to fence rather than at
+// configuration time.
+func writeOption(b *strings.Builder, indent, key, value string) {
+	if needsQuoting(value) {
+		fmt.Fprintf(b, "%s%s %q;\n", indent, key, value)
+
+		return
+	}
+
+	fmt.Fprintf(b, "%s%s %s;\n", indent, key, value)
+}
+
+// needsQuoting reports whether a value would not survive as a bare drbd
+// token. An empty value is quoted too: `key ;` is not valid syntax.
+func needsQuoting(value string) bool {
+	if value == "" {
+		return true
+	}
+
+	return strings.ContainsAny(value, " \t\n\r\"'{};#")
+}
+
 // sharedSecretOption is the drbd net option carrying the peer
 // authentication secret. Unlike every other net option, its value is a
 // quoted string.
@@ -290,7 +325,7 @@ func writeNet(b *strings.Builder, n Net) {
 			continue
 		}
 
-		fmt.Fprintf(b, "    %s %s;\n", option, n.Options[option])
+		writeOption(b, "    ", option, n.Options[option])
 	}
 
 	b.WriteString("  }\n")
@@ -306,7 +341,7 @@ func writeOptions(b *strings.Builder, opts map[string]string) {
 	b.WriteString("  options {\n")
 
 	for _, k := range sortedKeys(opts) {
-		fmt.Fprintf(b, "    %s %s;\n", k, opts[k])
+		writeOption(b, "    ", k, opts[k])
 	}
 
 	b.WriteString("  }\n")
@@ -324,8 +359,11 @@ func writeNamedBlock(b *strings.Builder, name string, opts map[string]string) {
 
 	fmt.Fprintf(b, "  %s {\n", name)
 
+	// Quoted only where a bare token would not survive. A handler that is
+	// just a path stays as it was; one carrying arguments — the ordinary
+	// way to configure fencing — gets the quotes it has always needed.
 	for _, k := range sortedKeys(opts) {
-		fmt.Fprintf(b, "    %s %s;\n", k, opts[k])
+		writeOption(b, "    ", k, opts[k])
 	}
 
 	b.WriteString("  }\n")
@@ -440,7 +478,7 @@ func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []Resource
 		b.WriteString("    disk {\n")
 
 		for _, k := range sortedKeys(peerDevice) {
-			fmt.Fprintf(b, "      %s %s;\n", k, peerDevice[k])
+			writeOption(b, "      ", k, peerDevice[k])
 		}
 
 		b.WriteString("    }\n")
