@@ -665,15 +665,30 @@ func (c *converter) placementLists(row *ResourceGroupRow, dsp string) ([]string,
 	// the kind removes the only thing that did — the two filters are
 	// independent at the placer, so the named pool becomes placeable.
 	//
-	// Nothing can be narrowed here: the pin is the operator's, and
-	// dropping a pool from it would be this migration deciding where
-	// replicas may not go. So the allow-list is left alone and the
-	// conflict is reported, which costs the group new placements on the
-	// remapped pool until someone resolves it by hand. Losing reachability
-	// is visible and recoverable; silently admitting an excluded thin pool
-	// is neither.
+	// Where the pins can be scoped, they are. Dropping a pool the group
+	// could not place on anyway takes no reachability away: the provider
+	// filter already excluded it, and the pin list that remains describes
+	// exactly what the group could reach before. Leaving the allow-list
+	// alone instead is not the conservative choice it looks like — every
+	// named pool may have remapped, and then the group's own [ZFS] filter
+	// matches none of them and it has nowhere left to place at all.
 	if len(pools) > 0 {
 		if pinnedNames(pools, excluded) {
+			scoped := pinsExcept(pools, excluded)
+
+			// Scoping answers the shape where the excluded pool has
+			// its own name. It cannot answer one name that is thick
+			// on one node and thin on another: dropping it removes
+			// the remapped pool along with the thin one, which is
+			// why this falls through rather than returning an empty
+			// pin list — an empty list reads as "no restriction" at
+			// the placer and would widen the group to the cluster.
+			if len(scoped) > 0 && c.reaches(scoped, c.remappedPools) {
+				c.warnPoolRemapScoped(dsp, pools, scoped)
+
+				return widened, scoped
+			}
+
 			c.warnPoolRemapUnresolvable(dsp)
 
 			return providers, pools
@@ -734,6 +749,31 @@ func pinnedNames(pinned []string, excluded map[string]bool) bool {
 	}
 
 	return false
+}
+
+// pinsExcept lists the pins that are not in the excluded set, keeping the
+// operator's own casing and order. Compared on the upper-cased key for the
+// same reason pinnedNames is: the dump's pool names are canonical while its
+// resource-group pins carry whatever case the operator typed.
+func pinsExcept(pinned []string, excluded map[string]bool) []string {
+	kept := make([]string, 0, len(pinned))
+
+	for _, pool := range pinned {
+		if !excluded[strings.ToUpper(pool)] {
+			kept = append(kept, pool)
+		}
+	}
+
+	return kept
+}
+
+// warnPoolRemapScoped reports the case where the widening was scoped by
+// dropping pins the group could not place on before.
+func (c *converter) warnPoolRemapScoped(dsp string, before, after []string) {
+	c.warnf("resource group %s: allows %s and a pool it can place on migrated as %s — %s added to the "+
+		"allow-list and the pins narrowed from %v to %v, dropping pools this group's provider filter "+
+		"already kept it off, so it places exactly where it did before",
+		dsp, providerKindZFS, providerKindZFSThin, providerKindZFSThin, before, after)
 }
 
 // warnPoolRemapUnresolvable reports the case where the group's own pins

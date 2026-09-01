@@ -1265,9 +1265,12 @@ func TestRemapWidensWhenNoThinPoolExists(t *testing.T) {
 // removes the only thing that did, because pool names and provider kinds are
 // independent filters at the placer.
 //
-// The pins are the operator's and cannot be narrowed here, so the allow-list
-// is left alone and the conflict reported.
-func TestPinnedGroupNamingAThinPoolIsNotWidened(t *testing.T) {
+// This shape has a scoped answer, and taking it is what keeps the group
+// placeable: REALTHIN is dropped from the pins because the provider filter
+// already kept the group off it, and SPARSE — the pool it actually used —
+// stays. Leaving the allow-list alone instead would strand the group, since
+// its only remaining pool migrated out from under its [ZFS] filter.
+func TestPinnedGroupNamingAThinPoolIsScopedNotWidened(t *testing.T) {
 	dump := &Dump{
 		Nodes: []NodeRow{
 			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
@@ -1281,7 +1284,7 @@ func TestPinnedGroupNamingAThinPoolIsNotWidened(t *testing.T) {
 				ResourceGroupName:    "RG",
 				ResourceGroupDspName: "rg",
 				AllowedProviderList:  `["ZFS"]`,
-				PoolName:             `["SPARSE","REALTHIN"]`,
+				PoolName:             `["sparse","realThin"]`,
 				UUID:                 "rg-1",
 			},
 		},
@@ -1296,13 +1299,27 @@ func TestPinnedGroupNamingAThinPoolIsNotWidened(t *testing.T) {
 	}
 
 	filter := res.ResourceGroups[0].Spec.SelectFilter
-	if containsString(filter.ProviderList, "ZFS_THIN") {
-		t.Errorf("allow-list = %v: the group names a pool the source declared thin, "+
-			"so widening the kind hands it that pool", filter.ProviderList)
+
+	// Widened, because the pool this group actually placed on is ZFS_THIN
+	// now and an unwidened filter matches nothing.
+	if !containsString(filter.ProviderList, "ZFS_THIN") {
+		t.Errorf("allow-list = %v: the pool this group placed on migrated to ZFS_THIN, "+
+			"so an unwidened filter leaves it with nowhere to place", filter.ProviderList)
 	}
 
-	if !hasWarning(res, "by hand") {
-		t.Errorf("the unresolvable case was not reported; warnings: %v", res.Warnings)
+	// Scoped, so the widened kind does not hand it the pool the provider
+	// filter used to keep it off. The pins keep the operator's own casing.
+	if containsString(filter.StoragePoolList, "realThin") {
+		t.Errorf("pins = %v: the group was kept off this pool by the provider filter, "+
+			"and widening the kind must not hand it over", filter.StoragePoolList)
+	}
+
+	if !containsString(filter.StoragePoolList, "sparse") {
+		t.Errorf("pins = %v: the pool this group placed on was dropped", filter.StoragePoolList)
+	}
+
+	if !hasWarning(res, "pins narrowed") {
+		t.Errorf("the scoping was not reported; warnings: %v", res.Warnings)
 	}
 }
 
@@ -1324,7 +1341,7 @@ func TestPinnedGroupNamingASplitPoolIsNotWidened(t *testing.T) {
 				ResourceGroupName:    "RG",
 				ResourceGroupDspName: "rg",
 				AllowedProviderList:  `["ZFS"]`,
-				PoolName:             `["TANK"]`,
+				PoolName:             `["tank"]`,
 				UUID:                 "rg-1",
 			},
 		},
@@ -1359,7 +1376,7 @@ func TestPinnedGroupOnThickPoolsIsWidened(t *testing.T) {
 				ResourceGroupName:    "RG",
 				ResourceGroupDspName: "rg",
 				AllowedProviderList:  `["ZFS"]`,
-				PoolName:             `["SPARSE"]`,
+				PoolName:             `["sparse"]`,
 				UUID:                 "rg-1",
 			},
 		},
@@ -1396,7 +1413,7 @@ func TestRemapLeavesUnrelatedGroupsAlone(t *testing.T) {
 				ResourceGroupName:    "PINNED",
 				ResourceGroupDspName: "pinned",
 				AllowedProviderList:  `["ZFS"]`,
-				PoolName:             `["PLAIN"]`,
+				PoolName:             `["plain"]`,
 				UUID:                 "rg-1",
 			},
 		},
