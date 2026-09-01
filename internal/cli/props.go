@@ -25,6 +25,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/validate"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
@@ -57,7 +58,7 @@ func deleteProperty(accessor propertyAccessor) handler {
 // `<node> <resource-definition>` — the same order `resource create`
 // and `resource delete` use.
 //
-//nolint:gochecknoglobals,dupl // static accessor table; the parallel shape is the point
+//nolint:gochecknoglobals // static accessor table
 var resourceProps = objectProps("resource", 2, // (node, definition)
 	func(ctx context.Context, st store.Store, ident []string) (apiv1.Resource, error) {
 		return st.Resources().Get(ctx, ident[1], ident[0])
@@ -71,7 +72,7 @@ var resourceProps = objectProps("resource", 2, // (node, definition)
 // storagePoolProps accesses a pool's property bag, identified as
 // `<node> <pool>`.
 //
-//nolint:gochecknoglobals,dupl // static accessor table; the parallel shape is the point
+//nolint:gochecknoglobals // static accessor table
 var storagePoolProps = objectProps("storage pool", 2, // (node, pool)
 	func(ctx context.Context, st store.Store, ident []string) (apiv1.StoragePool, error) {
 		return st.StoragePools().Get(ctx, ident[0], ident[1])
@@ -80,6 +81,13 @@ var storagePoolProps = objectProps("storage pool", 2, // (node, pool)
 	func(ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.StoragePool) error) error {
 		return st.StoragePools().PatchStoragePoolSpec(ctx, ident[0], ident[1], mutate)
 	},
+	// The StorDriver keys name where the pool's data physically lives.
+	// Rewriting or deleting one does not migrate anything: the pool keeps
+	// its name and its replicas keep reporting UpToDate while the driver
+	// points at a different backing store, or at one that does not exist.
+	// The REST path has refused these since it was written; this CLI edits
+	// the same bag directly, so the rule has to hold here too.
+	validate.StoragePoolPropEdit,
 )
 
 // resourceGroupProps accesses a group's property bag.

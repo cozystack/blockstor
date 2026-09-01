@@ -91,7 +91,12 @@ func modifyDefinition(
 	}
 
 	if layers != "" {
-		def.LayerStack = splitList(layers)
+		parsed, err := parseLayerList(layers)
+		if err != nil {
+			return err
+		}
+
+		def.LayerStack = parsed
 	}
 
 	return nil

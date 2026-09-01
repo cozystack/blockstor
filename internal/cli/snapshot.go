@@ -30,6 +30,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/validate"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
@@ -482,6 +483,16 @@ func unwindVolumes(ctx context.Context, run *runContext, rdName string, added []
 // Explicit `--node-name` values win when the operator gave them.
 func placeRestored(ctx context.Context, run *runContext, srcRD, rdName string, snap *apiv1.Snapshot) error {
 	nodes := run.Flags.Nodes
+
+	// Named nodes have to actually hold the snapshot. Restoring onto one
+	// that does not produces a replica with nothing behind it: the objects
+	// are created, the satellite finds no snapshot to receive, and the
+	// command reports success over an empty volume.
+	err := validate.RestoreNodesHoldSnapshot(nodes, snap.Nodes)
+	if err != nil {
+		return fmt.Errorf("%w: %w", command.ErrUsage, err)
+	}
+
 	if len(nodes) == 0 {
 		nodes = snap.Nodes
 	}

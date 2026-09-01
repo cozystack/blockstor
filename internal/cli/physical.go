@@ -73,11 +73,6 @@ func physicalStorageCreateDevicePool(ctx context.Context, run *runContext) error
 
 	attach := attachRequest(provider, poolName, token)
 
-	err := stampDevices(ctx, run, node, devices, attach)
-	if err != nil {
-		return err
-	}
-
 	pool := &apiv1.StoragePool{
 		NodeName:        node,
 		StoragePoolName: poolName,
@@ -85,12 +80,21 @@ func physicalStorageCreateDevicePool(ctx context.Context, run *runContext) error
 		Props:           attachProps(provider, attach),
 	}
 
-	err = run.Store.StoragePools().Create(ctx, pool)
+	// The pool is registered BEFORE the devices are stamped, because the
+	// stamp is what points a disk at a pool and the two writes are not
+	// atomic. Stamping first meant a failure partway through — a typo in
+	// the fourth of four device names — left the earlier disks claimed by
+	// a pool that was never created, with nothing to reconcile them and
+	// no way to retry: the corrected re-run met its own half-finished
+	// state. This order leaves the harmless remainder instead, a
+	// registered pool with fewer devices than intended, which the same
+	// command completes on re-run.
+	err := run.Store.StoragePools().Create(ctx, pool)
 	if err != nil && !isAlreadyExists(err) {
 		return fmt.Errorf("create storage pool %s on %s: %w", poolName, node, err)
 	}
 
-	return nil
+	return stampDevices(ctx, run, node, devices, attach)
 }
 
 // attachRequest names the backing the satellite has to create. The
@@ -246,8 +250,16 @@ func claimDevice(
 	// AttachTo=nil when they look, so only a check made against the
 	// state the write lands on can reject the loser.
 	if dev.AttachTo != nil {
-		return fmt.Errorf("%w: device %s on %s is already attached",
-			store.ErrAlreadyExists, wanted, node)
+		// Already pointing at the pool this command is building: that is
+		// the previous attempt's work, not someone else's claim. Treat it
+		// as done so a corrected re-run finishes the job instead of
+		// stalling on its own leftovers.
+		if sameAttach(dev.AttachTo, attach) {
+			return nil
+		}
+
+		return fmt.Errorf("%w: device %s on %s is already attached to pool %s",
+			store.ErrAlreadyExists, wanted, node, dev.AttachTo.StoragePoolName)
 	}
 
 	if dev.Phase != "" && dev.Phase != apiv1.PhysicalDevicePhaseAvailable {
@@ -269,6 +281,23 @@ func claimDevice(
 	dev.AttachTo = attach
 
 	return nil
+}
+
+// sameAttach reports whether an existing claim is the one this command would
+// write. Compared on the fields that decide where the data lands; a claim that
+// differs in any of them belongs to a different pool and must not be
+// overwritten, because the attach carries Wipe.
+func sameAttach(existing, wanted *apiv1.PhysicalDeviceAttachTo) bool {
+	if existing == nil || wanted == nil {
+		return false
+	}
+
+	return existing.StoragePoolName == wanted.StoragePoolName &&
+		existing.ProviderKind == wanted.ProviderKind &&
+		existing.VGName == wanted.VGName &&
+		existing.ThinPoolName == wanted.ThinPoolName &&
+		existing.ZPoolName == wanted.ZPoolName &&
+		existing.Directory == wanted.Directory
 }
 
 // freeDetail renders whatever explanation discovery left behind, so the

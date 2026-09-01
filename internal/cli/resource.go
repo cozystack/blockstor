@@ -53,6 +53,12 @@ var (
 	// errReplicaInUse refuses demoting a replica a consumer still has
 	// open. Pass --force to override.
 	errReplicaInUse = errors.New("stop the consumer first, or pass --force")
+
+	// errMigrateToSelf refuses a migration whose source and destination are
+	// the same node. It has no override: the reconciler prunes the source
+	// once the destination is UpToDate, so on this shape it deletes the
+	// replica it was asked to move.
+	errMigrateToSelf = errors.New("migrate-disk needs two different nodes")
 )
 
 // resourceToggleDisk implements `resource toggle-disk <node> <rd>`.
@@ -221,6 +227,20 @@ func checkDemotable(
 func migrateDisk(ctx context.Context, run *runContext, dst, rdName string) error {
 	src := run.Flags.Values["migrate-from"]
 	pool := run.Flags.Values["storage-pool"]
+
+	// A migration onto its own source is not a no-op, it is destructive.
+	// The reconciler resolves both ends to the same object, waits for the
+	// "destination" volumes to reach UpToDate — which they already are —
+	// and then prunes the source, deleting the replica it was asked to
+	// preserve. If that was the only diskful replica, the data goes with
+	// it, and the reconcile afterwards retries forever against an object
+	// that no longer exists.
+	//
+	// There is no --force path for this: no argument makes deleting the
+	// copy you are migrating the intended outcome.
+	if src == dst {
+		return fmt.Errorf("migrate-disk: source and destination are both %s: %w", dst, errMigrateToSelf)
+	}
 
 	srcRes, err := run.Store.Resources().Get(ctx, rdName, src)
 	if err != nil {

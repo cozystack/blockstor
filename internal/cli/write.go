@@ -142,6 +142,7 @@ func objectProps[T any](
 	get func(context.Context, store.Store, []string) (T, error),
 	bag func(*T) *map[string]string,
 	patch func(ctx context.Context, st store.Store, ident []string, mutate func(*T) error) error,
+	guards ...func(before, after map[string]string) error,
 ) propertyAccessor {
 	return propertyAccessor{
 		args: args,
@@ -160,7 +161,26 @@ func objectProps[T any](
 					*props = map[string]string{}
 				}
 
-				return change(*props)
+				// Snapshot before the caller edits, so a guard can judge
+				// the resulting state rather than the requested operation.
+				// set, delete and delete-namespace reach the bag by
+				// different routes; comparing states catches all of them,
+				// including whichever route is added next.
+				before := maps.Clone(*props)
+
+				changeErr := change(*props)
+				if changeErr != nil {
+					return changeErr
+				}
+
+				for _, guard := range guards {
+					guardErr := guard(before, *props)
+					if guardErr != nil {
+						return guardErr
+					}
+				}
+
+				return nil
 			})
 			if err != nil {
 				return fmt.Errorf("update %s %s: %w", kind, strings.Join(ident, "/"), err)
@@ -232,7 +252,12 @@ func resourceDefinitionCreate(ctx context.Context, run *runContext) error {
 	}
 
 	if layers := run.Flags.Values["layer-list"]; layers != "" {
-		def.LayerStack = splitList(layers)
+		parsed, err := parseLayerList(layers)
+		if err != nil {
+			return err
+		}
+
+		def.LayerStack = parsed
 	}
 
 	err := run.Store.ResourceDefinitions().Create(ctx, def)

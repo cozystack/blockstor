@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/validate"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
@@ -49,6 +50,32 @@ func parseInt32(text, what string) (int32, error) {
 	}
 
 	return int32(value), nil
+}
+
+// parseLayerList splits a --layer-list value and holds it to the layer rules
+// every writer has to obey.
+//
+// The satellite asks whether the stack CONTAINS a layer, so an unrecognised
+// token is not a loud failure downstream — it is a silently absent layer.
+// `DRDB,STORAGE` brings the volume up as a single local copy while the
+// operator believes it is replicated, and `DRBD,LUSK,STORAGE` writes
+// plaintext while the operator believes it is encrypted. One character is the
+// whole distance. The REST path has refused these since it was written; this
+// CLI writes the CRDs directly, and the field carries no enum or CEL rule, so
+// without this check there is no backstop anywhere on this path.
+//
+// The value is stored as the operator typed it, matching what REST persists;
+// the satellite compares case-insensitively, so only the spelling is at issue
+// here, not the case.
+func parseLayerList(raw string) ([]string, error) {
+	layers := splitList(raw)
+
+	err := validate.LayerStack(layers)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", command.ErrUsage, err)
+	}
+
+	return layers, nil
 }
 
 // minVolumeNumber / maxVolumeNumber bound DRBD-9's addressable volume
@@ -458,10 +485,55 @@ func resourceDelete(ctx context.Context, run *runContext) error {
 	rdName := run.Flags.Positionals[last]
 
 	for _, node := range run.Flags.Positionals[:last] {
-		err := run.Store.Resources().Delete(ctx, rdName, node)
+		err := checkDeletable(ctx, run, rdName, node)
+		if err != nil {
+			return err
+		}
+
+		err = run.Store.Resources().Delete(ctx, rdName, node)
 		if err != nil && !isNotFound(err) {
 			return fmt.Errorf("delete resource %s on %s: %w", rdName, node, err)
 		}
+	}
+
+	return nil
+}
+
+// checkDeletable refuses a delete that would strand a peer still resyncing
+// from this replica — upstream U130.
+//
+// Deleting the last complete copy while another diskful replica is mid-sync
+// leaves that replica with no source: it stays Inconsistent forever, the
+// deleting node hangs in Connecting, and if the Primary is diskless there is
+// no current copy of the data anywhere in the cluster. The REST path has
+// answered 409 on this since it was written; the CLI deletes the CRD directly,
+// so the same judgement has to run here.
+//
+// --force overrides, for the case where the operator knows the peer is being
+// discarded anyway. A missing replica is not an error: the delete is
+// idempotent, and there is nothing to strand.
+func checkDeletable(ctx context.Context, run *runContext, rdName, node string) error {
+	if run.Flags.Force {
+		return nil
+	}
+
+	target, err := run.Store.Resources().Get(ctx, rdName, node)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+
+		return fmt.Errorf("get resource %s on %s: %w", rdName, node, err)
+	}
+
+	siblings, err := run.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return fmt.Errorf("list replicas of %s: %w", rdName, err)
+	}
+
+	if validate.MidSyncDeleteRefusal(&target, siblings) {
+		return fmt.Errorf("refusing to delete %s on %s: %w (pass --force to override)",
+			rdName, node, validate.ErrLastSyncSourceDelete)
 	}
 
 	return nil
@@ -591,7 +663,12 @@ func applyGroupPolicy(group *apiv1.ResourceGroup, flags *flagSet) error {
 	}
 
 	if layers := flags.Values["layer-list"]; layers != "" {
-		group.SelectFilter.LayerStack = splitList(layers)
+		parsed, err := parseLayerList(layers)
+		if err != nil {
+			return err
+		}
+
+		group.SelectFilter.LayerStack = parsed
 	}
 
 	return nil
