@@ -72,7 +72,8 @@ func parseLayerList(raw string) ([]string, error) {
 
 	err := validate.LayerStack(layers)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", command.ErrUsage, err)
+		//nolint:wrapcheck // a semantic refusal; see checkVolumeSize
+		return nil, err
 	}
 
 	return layers, nil
@@ -352,6 +353,11 @@ func volumeDefinitionSetSize(ctx context.Context, run *runContext) error {
 	// write always see the same size.
 	err = run.Store.VolumeDefinitions().PatchVolumeDefinitionSpec(ctx, rdName, number,
 		func(vd *apiv1.VolumeDefinition) error {
+			boundErr := checkVolumeSize(sizeKib)
+			if boundErr != nil {
+				return boundErr
+			}
+
 			resizeErr := checkResize(vd, sizeKib, run.Flags.Force)
 			if resizeErr != nil {
 				return resizeErr
@@ -368,33 +374,28 @@ func volumeDefinitionSetSize(ctx context.Context, run *runContext) error {
 	return nil
 }
 
-// The size a volume may be set to. The floor is DRBD's own per-device
-// minimum once metadata is reserved; below it the satellite loops on
-// `drbdadm create-md` forever instead of failing. Both bounds hold
-// even under --force, which only ever waives the shrink refusal.
-const (
-	volumeSizeFloorKib   int64 = 4 * kibPerMib
-	volumeSizeCeilingKib int64 = 16 * kibPerMib * kibPerMib * kibPerMib
-)
-
-var (
-	errSizeOutOfBounds = errors.New("size is outside the supported range of 4 MiB to 16 TiB")
-	errNoAutoShrink    = errors.New(
-		"shrink the filesystem first (resize2fs -s, or xfs dump+restore), unmount the volume, " +
-			"then re-run with --force")
-)
+var errNoAutoShrink = errors.New(
+	"shrink the filesystem first (resize2fs -s, or xfs dump+restore), unmount the volume, " +
+		"then re-run with --force")
 
 // checkVolumeSize enforces the bounds on EVERY path that writes a
 // volume size, not just resize. A size below DRBD's per-device
 // minimum makes the satellite loop on `drbdadm create-md` forever
 // rather than fail, and nothing downstream catches it: the CRD has no
 // `minimum`, no CEL rule and no admission webhook.
+// checkVolumeSize holds a size inside the range DRBD can serve.
+//
+// The rule is shared with the REST path rather than restated here, and it is
+// the only place the bound is enforced now: it used to sit on the CRD as
+// well, but spec.volumeDefinitions is an atomic list, so any update touching
+// it re-validated every element — a single grandfathered sub-floor volume
+// then rejected every later write to that definition, the controller's own
+// included.
 func checkVolumeSize(sizeKib int64) error {
-	if sizeKib < volumeSizeFloorKib || sizeKib > volumeSizeCeilingKib {
-		return fmt.Errorf("%d KiB: %w", sizeKib, errSizeOutOfBounds)
-	}
-
-	return nil
+	//nolint:wrapcheck // a semantic refusal, surfaced verbatim: wrapping it
+	// in ErrUsage would reclassify the exit code from 10 to 2, and the
+	// replay workflows assert on that boundary.
+	return validate.VolumeSizeKib(sizeKib)
 }
 
 // checkResize refuses a resize that would destroy data or wedge the

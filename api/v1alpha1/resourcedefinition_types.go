@@ -166,17 +166,22 @@ type ResourceDefinitionVolume struct {
 	// at the cost of changing merge semantics for every client of a
 	// served API — not something to slip into this change.
 	//
-	// So the assumption is stated instead of hidden: an upgrade is
-	// expected to carry no out-of-range volume. Such a volume was never
-	// functional (it is below DRBD's own per-device floor, where the
-	// satellite loops on create-md rather than failing), Delete never
-	// validates spec so cleanup still works, and Kubernetes >= 1.30
-	// skips validation for fields an update does not change. If an
-	// installed base ever does carry one, the list has to become
-	// correlatable before this can ratchet.
+	// The conclusion drawn from that is that the bound does NOT belong
+	// here. Ratcheting correlates per field, and an atomic list is
+	// compared as a whole, so an update that touches the list at all
+	// re-validates every element — including ones written before the
+	// bound existed. One grandfathered sub-floor volume would therefore
+	// reject every subsequent write to its resource definition, and the
+	// controller itself makes such writes: patchRDVolumeMinors rewrites
+	// this list to stamp drbdMinor. Verified against a real apiserver:
+	// appending a second, in-range volume is rejected naming volume 0,
+	// which the operator never touched.
 	//
-	// +kubebuilder:validation:Minimum=4096
-	// +kubebuilder:validation:Maximum=17179869184
+	// The rule lives in pkg/validate instead, where both writers — the
+	// REST shim and the native CLI — apply it to sizes as they arrive.
+	// That gives up the `kubectl apply` backstop and keeps upgrades and
+	// the controller working, which is the better trade for a bound
+	// whose purpose is to catch operator input.
 	SizeKib int64 `json:"sizeKib"`
 	// +optional
 	Props map[string]string `json:"props,omitempty"`

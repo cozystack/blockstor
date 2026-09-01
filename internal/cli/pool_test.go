@@ -56,7 +56,12 @@ func TestStoragePoolCreateProviderKeys(t *testing.T) {
 		t.Run(tc.provider, func(t *testing.T) {
 			t.Parallel()
 
-			app, _, errBuf := newApp(t, nil)
+			// A pool needs a node that exists: the satellite reconciles
+			// it there, and a pool on a node the cluster does not have
+			// persists looking real with no capacity behind it.
+			app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+				_ = backend.Nodes().Create(ctx, &apiv1.Node{Name: "node-1"})
+			})
 
 			argv := []string{"sp", "c", tc.provider, "node-1", "pool-1"}
 			if tc.backing != "" {

@@ -20,6 +20,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -99,6 +100,11 @@ func storagePoolCreate(ctx context.Context, run *runContext) error {
 		StoragePoolName: run.Flags.Positionals[2],
 		ProviderKind:    provider.kind,
 		Props:           props,
+	}
+
+	err = checkPoolTarget(ctx, run, pool.NodeName, provider, backing)
+	if err != nil {
+		return err
 	}
 
 	err = run.Store.StoragePools().Create(ctx, pool)
@@ -275,3 +281,77 @@ func volumeGroupList(ctx context.Context, run *runContext) error {
 
 	return run.render(tbl)
 }
+
+var (
+	// errNoSuchNode refuses a pool on a node the cluster does not have.
+	errNoSuchNode = errors.New("no such node")
+
+	// errBackingNotAdvertised refuses a pool whose backing store the
+	// satellite does not report.
+	errBackingNotAdvertised = errors.New("node does not advertise this backing store")
+)
+
+// checkPoolTarget refuses a storage pool the satellite could never reconcile.
+//
+// Neither mistake announces itself: a pool on a node that does not exist, and
+// a pool naming a volume group or zpool that is not on the node, both persist
+// happily and list in `sp l` looking real with empty capacity. The failure
+// surfaces later, as a placement that cannot find room, at which point the
+// cause is several steps away. REST answers 404 and a named-backing error at
+// create time; this path writes the CRD directly, so the same two checks
+// belong here.
+//
+// The backing check leans on what the satellite discovered and published on
+// the Node. A node that has not reported yet advertises nothing, and this
+// stands down rather than refusing a pool it cannot judge — bootstrap order
+// should not depend on discovery having run.
+func checkPoolTarget(
+	ctx context.Context, run *runContext, nodeName string, provider storageProvider, backing string,
+) error {
+	node, err := run.Store.Nodes().Get(ctx, nodeName)
+	if err != nil {
+		if isNotFound(err) {
+			return fmt.Errorf("%w: %s", errNoSuchNode, nodeName)
+		}
+
+		return fmt.Errorf("get node %s: %w", nodeName, err)
+	}
+
+	if backing == "" {
+		return nil
+	}
+
+	var prop string
+
+	switch provider.kind {
+	case apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindLVMThin:
+		prop = nodePropDiscoveredVGs
+	case apiv1.StoragePoolKindZFS, apiv1.StoragePoolKindZFSThin:
+		prop = nodePropDiscoveredZPools
+	default:
+		// FILE / DISKLESS advertise nothing to compare against.
+		return nil
+	}
+
+	advertised := node.Props[prop]
+	if advertised == "" {
+		return nil
+	}
+
+	for name := range strings.SplitSeq(advertised, ",") {
+		if strings.TrimSpace(name) == backing {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("%w: no %q on node %s, satellite advertised: %s",
+		errBackingNotAdvertised, backing, nodeName, advertised)
+}
+
+// The satellite publishes what it enumerated on the host under these Node
+// props; the names are duplicated from pkg/satellite/controllers rather than
+// imported so the CLI does not pull the satellite package in.
+const (
+	nodePropDiscoveredVGs    = "Aux/DiscoveredVGs"
+	nodePropDiscoveredZPools = "Aux/DiscoveredZPools"
+)

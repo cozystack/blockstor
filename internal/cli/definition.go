@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -137,6 +138,11 @@ func resourceDefinitionClone(ctx context.Context, run *runContext) error {
 		if flag == apiv1.ResourceFlagDelete || flag == apiv1.ResourceFlagDeleting {
 			return fmt.Errorf("clone of %s refused: %w", srcName, errSourceBeingDeleted)
 		}
+	}
+
+	err = checkClonePreconditions(ctx, run, &src, target)
+	if err != nil {
+		return err
 	}
 
 	snapName := cloneSnapshotName(target)
@@ -384,4 +390,105 @@ func maxVolumeSizeKib(pools []apiv1.StoragePool, placeCount int) int64 {
 	}
 
 	return smallest
+}
+
+var (
+	// errCloneTargetExists refuses a clone onto a name already taken.
+	errCloneTargetExists = errors.New("clone target already exists")
+
+	// errPoolCannotSnapshot refuses a clone whose source sits on a pool
+	// that cannot take one.
+	errPoolCannotSnapshot = errors.New("storage pool does not support snapshots")
+)
+
+// checkClonePreconditions refuses a clone that cannot succeed, BEFORE the
+// first write.
+//
+// Order is the whole point here. A clone takes an internal snapshot of the
+// source and restores the target from it, so a precondition checked after
+// that snapshot is not a precondition: cloning onto an occupied name used to
+// take the snapshot first and fail on the create afterwards, leaving the
+// snapshot behind for someone to find and wonder about. And a source on a
+// thick pool cannot be snapshotted at all, which the data plane discovers far
+// from where the operator typed the command.
+//
+// REST answers 400 on both before it writes anything; this path writes the
+// CRDs directly, so the same two questions have to be asked here.
+func checkClonePreconditions(
+	ctx context.Context, run *runContext, src *apiv1.ResourceDefinition, target string,
+) error {
+	_, err := run.Store.ResourceDefinitions().Get(ctx, target)
+
+	switch {
+	case err == nil:
+		return fmt.Errorf("%w: %s", errCloneTargetExists, target)
+	case !isNotFound(err):
+		return fmt.Errorf("get resource definition %s: %w", target, err)
+	}
+
+	return checkSourcePoolsSnapshot(ctx, run, src.Name)
+}
+
+// checkSourcePoolsSnapshot refuses a clone whose diskful source replicas sit
+// on pools that cannot take a copy-on-write snapshot — thick LVM, plain FILE,
+// diskless. Only diskful, active replicas materialise a volume to snapshot,
+// so the others are not gated on a pool they do not have.
+func checkSourcePoolsSnapshot(ctx context.Context, run *runContext, srcName string) error {
+	replicas, err := run.Store.Resources().ListByDefinition(ctx, srcName)
+	if err != nil {
+		return fmt.Errorf("list replicas of %s: %w", srcName, err)
+	}
+
+	offenders := make([]string, 0, len(replicas))
+	seen := map[string]bool{}
+
+	for i := range replicas {
+		res := &replicas[i]
+		if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) ||
+			slices.Contains(res.Flags, apiv1.ResourceFlagInactive) {
+			continue
+		}
+
+		poolName := res.Props[storPoolNameProp]
+		if poolName == "" {
+			continue
+		}
+
+		key := res.NodeName + "/" + poolName
+		if seen[key] {
+			continue
+		}
+
+		seen[key] = true
+
+		pool, poolErr := run.Store.StoragePools().Get(ctx, res.NodeName, poolName)
+		if poolErr != nil {
+			// A pool the CLI cannot read is not evidence of anything; the
+			// data plane will surface a real problem with it.
+			continue
+		}
+
+		if !poolSupportsSnapshots(pool.ProviderKind) {
+			offenders = append(offenders, key+" ("+pool.ProviderKind+")")
+		}
+	}
+
+	if len(offenders) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %s; place the source on a thin-provisioned pool before cloning",
+		errPoolCannotSnapshot, strings.Join(offenders, ", "))
+}
+
+// poolSupportsSnapshots reports whether a provider can take a
+// copy-on-write snapshot. Thick LVM, plain FILE and DISKLESS cannot.
+func poolSupportsSnapshots(kind string) bool {
+	switch kind {
+	case apiv1.StoragePoolKindLVMThin, apiv1.StoragePoolKindZFS,
+		apiv1.StoragePoolKindZFSThin, apiv1.StoragePoolKindFileThin:
+		return true
+	default:
+		return false
+	}
 }

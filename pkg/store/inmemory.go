@@ -449,12 +449,20 @@ func (s *inMemoryNodes) PatchNodeSpec(_ context.Context, name string, mutate fun
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
 
-	err := mutate(&node)
+	// A struct copy is shallow: the maps and slices in it still address
+	// the stored object, so a mutator that fails partway would leave its
+	// edits behind. Hand it a real copy instead.
+	working, cloneErr := cloneForPatch(node)
+	if cloneErr != nil {
+		return cloneErr
+	}
+
+	err := mutate(&working)
 	if err != nil {
 		return errors.Wrapf(err, "patch Node %q", name)
 	}
 
-	s.m[name] = node
+	s.m[name] = working
 
 	return nil
 }

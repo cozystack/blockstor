@@ -170,12 +170,13 @@ func parseFlags(args []string) (*flagSet, error) {
 		}
 
 		if !inline {
-			if i+1 >= len(args) {
-				return nil, fmt.Errorf("%w: flag %q needs a value", command.ErrUsage, arg)
+			consumed, valueErr := valueAfter(args, i, arg)
+			if valueErr != nil {
+				return nil, valueErr
 			}
 
 			i++
-			value = args[i]
+			value = consumed
 		}
 
 		parsed.assign(name, value)
@@ -376,4 +377,25 @@ func matches(filter []string, value string) bool {
 	}
 
 	return false
+}
+
+// valueAfter returns the argument a value-taking flag consumes.
+//
+// The next argument is only a value if it is not itself a flag.
+// `resource list -n --faulty` used to read "--faulty" as the node name, which
+// produced an empty node filter, no results and exit 0 — a filter that looks
+// like it worked and a flag that silently never applied. Refusing names both
+// mistakes at once: the missing value and the swallowed flag.
+func valueAfter(args []string, i int, arg string) (string, error) {
+	if i+1 >= len(args) {
+		return "", fmt.Errorf("%w: flag %q needs a value", command.ErrUsage, arg)
+	}
+
+	next := args[i+1]
+	if strings.HasPrefix(next, "-") && next != "-" {
+		return "", fmt.Errorf("%w: flag %q needs a value, but the next argument is the flag %q",
+			command.ErrUsage, arg, next)
+	}
+
+	return next, nil
 }

@@ -149,12 +149,20 @@ func (s *inMemoryPhysicalDevices) PatchPhysicalDeviceSpec(
 		dev.AttachTo = &attach
 	}
 
-	err := mutate(&dev)
+	// A struct copy is shallow: the maps and slices in it still address
+	// the stored object, so a mutator that fails partway would leave its
+	// edits behind. Hand it a real copy instead.
+	working, cloneErr := cloneForPatch(dev)
+	if cloneErr != nil {
+		return cloneErr
+	}
+
+	err := mutate(&working)
 	if err != nil {
 		return errors.Wrapf(err, "patch physical device %q", name)
 	}
 
-	s.m[name] = dev
+	s.m[name] = working
 
 	return nil
 }

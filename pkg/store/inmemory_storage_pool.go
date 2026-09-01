@@ -244,12 +244,20 @@ func (s *inMemoryStoragePools) PatchStoragePoolSpec(_ context.Context, node, poo
 		return errors.Wrapf(ErrNotFound, "storage pool %q on node %q", pool, node)
 	}
 
-	err := mutate(&sp)
+	// A struct copy is shallow: the maps and slices in it still address
+	// the stored object, so a mutator that fails partway would leave its
+	// edits behind. Hand it a real copy instead.
+	working, cloneErr := cloneForPatch(sp)
+	if cloneErr != nil {
+		return cloneErr
+	}
+
+	err := mutate(&working)
 	if err != nil {
 		return errors.Wrapf(err, "patch storage pool %q on node %q", pool, node)
 	}
 
-	s.m[key] = sp
+	s.m[key] = working
 
 	return nil
 }

@@ -257,6 +257,11 @@ func resourceDefinitionCreate(ctx context.Context, run *runContext) error {
 			return err
 		}
 
+		luksErr := checkLUKSPrerequisite(ctx, run, parsed)
+		if luksErr != nil {
+			return luksErr
+		}
+
 		def.LayerStack = parsed
 	}
 

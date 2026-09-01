@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -268,4 +269,48 @@ func (run *runContext) kube(ctx context.Context) (ctrlclient.Client, string, err
 	}
 
 	return client, namespace, nil
+}
+
+// errLUKSWithoutPassphrase refuses a LUKS layer on a cluster that has no
+// master key yet.
+var errLUKSWithoutPassphrase = errors.New(
+	"the cluster has no encryption passphrase; run `encryption create-passphrase` first")
+
+// checkLUKSPrerequisite refuses a definition that asks for LUKS before the
+// cluster can encrypt anything.
+//
+// Without a master key the satellite has nothing to derive a volume key from:
+// the resource is created, the volume never opens, and the operator is left
+// reading satellite logs to discover a missing prerequisite the command could
+// have named. REST refuses the same shape up front.
+//
+// Reachability, not correctness, is the reason for the nil checks. The CLI
+// reaches the Secret through the same Kubernetes client the passphrase verbs
+// use, and that client is absent in unit tests and on hosts wired only for
+// the CRD surface. Where the passphrase cannot be read at all, the check
+// stands down rather than refusing a definition it cannot judge.
+func checkLUKSPrerequisite(ctx context.Context, run *runContext, layers []string) error {
+	if !apiv1.LayerInStack(layers, apiv1.LayerKindLUKS) {
+		return nil
+	}
+
+	if run.Kube == nil {
+		return nil
+	}
+
+	client, namespace, err := run.kube(ctx)
+	if err != nil {
+		return nil //nolint:nilerr // no cluster access: nothing to judge against
+	}
+
+	current, err := passphrase.Read(ctx, client, namespace)
+	if err != nil {
+		return nil //nolint:nilerr // cannot read the Secret: see above
+	}
+
+	if current != "" {
+		return nil
+	}
+
+	return fmt.Errorf("layer list includes %s: %w", apiv1.LayerKindLUKS, errLUKSWithoutPassphrase)
 }

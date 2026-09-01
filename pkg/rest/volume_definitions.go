@@ -34,6 +34,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/validate"
 )
 
 // volumeDefinitionModifyBody is the shape upstream golinstor sends on
@@ -490,7 +491,7 @@ func rawHasNonNullKey(obj map[string]json.RawMessage, key string) bool {
 // (LVM-thin, ZFS, LUKS) layer additional alignment on top. Picking
 // 4 MiB as the floor keeps every layered composition viable without
 // having to chase the exact ceiling for each provider.
-const minVolumeDefinitionSizeKib int64 = 4 * 1024
+const minVolumeDefinitionSizeKib int64 = validate.MinVolumeSizeKib
 
 // maxVolumeDefinitionSizeKib is the largest accepted size_kib (Bug
 // 155). 16 TiB is DRBD's hard per-device ceiling — the on-disk
@@ -499,7 +500,7 @@ const minVolumeDefinitionSizeKib int64 = 4 * 1024
 // regardless of backing storage capacity, so refusing here gets the
 // operator a typed error envelope instead of an opaque satellite
 // retry loop.
-const maxVolumeDefinitionSizeKib int64 = 16 * 1024 * 1024 * 1024
+const maxVolumeDefinitionSizeKib int64 = validate.MaxVolumeSizeKib
 
 // minVolumeNumber is the smallest accepted explicit volume_number on
 // `POST /v1/resource-definitions/{rd}/volume-definitions` (Bug 363).

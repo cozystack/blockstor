@@ -117,7 +117,15 @@ func (s *inMemoryResourceGroups) PatchResourceGroup(_ context.Context, name stri
 
 	prevAnnotations := rg.Annotations
 
-	err := mutate(&rg)
+	// A struct copy is shallow: the maps and slices in it still address
+	// the stored object, so a mutator that fails partway would leave its
+	// edits behind. Hand it a real copy instead.
+	working, cloneErr := cloneForPatch(rg)
+	if cloneErr != nil {
+		return cloneErr
+	}
+
+	err := mutate(&working)
 	if err != nil {
 		return errors.Wrapf(err, "patch ResourceGroup %q", name)
 	}
@@ -125,7 +133,7 @@ func (s *inMemoryResourceGroups) PatchResourceGroup(_ context.Context, name stri
 	// Bug-021: same annotation contract as Update — a closure that
 	// nils the map means "untouched", not "clear".
 	rg.Annotations = carryAnnotationsOnNil(rg.Annotations, prevAnnotations)
-	s.m[name] = rg
+	s.m[name] = working
 
 	return nil
 }

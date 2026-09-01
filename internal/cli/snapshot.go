@@ -490,7 +490,8 @@ func placeRestored(ctx context.Context, run *runContext, srcRD, rdName string, s
 	// command reports success over an empty volume.
 	err := validate.RestoreNodesHoldSnapshot(nodes, snap.Nodes)
 	if err != nil {
-		return fmt.Errorf("%w: %w", command.ErrUsage, err)
+		//nolint:wrapcheck // a semantic refusal; see checkVolumeSize
+		return err
 	}
 
 	if len(nodes) == 0 {
