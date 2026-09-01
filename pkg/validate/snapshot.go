@@ -44,6 +44,25 @@ var ErrRestoreNodeLacksSnapshot = errors.New("node does not hold this snapshot")
 //   - A snapshot that records no nodes at all: nothing to check against, so
 //     the caller's own emptiness guard is the one that applies.
 func RestoreNodesHoldSnapshot(named, snapshotNodes []string) error {
+	missing := RestoreNodesMissingSnapshot(named, snapshotNodes)
+	if len(missing) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %s (snapshot is on %s)",
+		ErrRestoreNodeLacksSnapshot,
+		strings.Join(missing, ", "),
+		strings.Join(snapshotNodes, ", "))
+}
+
+// RestoreNodesMissingSnapshot lists the named nodes that do not hold the
+// snapshot, sorted, with duplicates and empty entries dropped. Empty means
+// the restore may proceed.
+//
+// Separate from the error so a caller that shapes its own refusal — the REST
+// door builds a typed envelope naming each node — works off the same decision
+// rather than a second implementation of it.
+func RestoreNodesMissingSnapshot(named, snapshotNodes []string) []string {
 	if len(named) == 0 || len(snapshotNodes) == 0 {
 		return nil
 	}
@@ -72,14 +91,7 @@ func RestoreNodesHoldSnapshot(named, snapshotNodes []string) error {
 		}
 	}
 
-	if len(missing) == 0 {
-		return nil
-	}
-
 	sort.Strings(missing)
 
-	return fmt.Errorf("%w: %s (snapshot is on %s)",
-		ErrRestoreNodeLacksSnapshot,
-		strings.Join(missing, ", "),
-		strings.Join(snapshotNodes, ", "))
+	return missing
 }

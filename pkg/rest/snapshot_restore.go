@@ -28,6 +28,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/validate"
 )
 
 // storPoolPropKey is the LINSTOR-wire property name pinning a Resource
@@ -347,35 +348,10 @@ func validateRestoreNodesHoldSnapshot(w http.ResponseWriter, srcRD, snapName str
 		return true
 	}
 
-	if len(snap.Nodes) == 0 {
-		return true
-	}
-
-	snapNodes := make(map[string]struct{}, len(snap.Nodes))
-	for _, n := range snap.Nodes {
-		snapNodes[n] = struct{}{}
-	}
-
-	var missing []string
-
-	seen := make(map[string]struct{}, len(nodes))
-
-	for _, n := range nodes {
-		if n == "" {
-			continue
-		}
-
-		if _, dup := seen[n]; dup {
-			continue
-		}
-
-		seen[n] = struct{}{}
-
-		if _, ok := snapNodes[n]; !ok {
-			missing = append(missing, n)
-		}
-	}
-
+	// The decision is validate.RestoreNodesMissingSnapshot, shared with the
+	// CLI, which writes the same objects this handler does. Only the
+	// envelope below is this door's own.
+	missing := validate.RestoreNodesMissingSnapshot(nodes, snap.Nodes)
 	if len(missing) == 0 {
 		return true
 	}
