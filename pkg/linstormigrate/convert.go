@@ -153,6 +153,17 @@ type converter struct {
 	// a name thin is enough to taint the name for a group that was kept
 	// away from thin pools.
 	declaredThinPools map[string]bool
+	// declaredZFSPools names the pools the source declared plain ZFS —
+	// the ones a group filtering on [ZFS] could actually place on before
+	// the migration. A name in BOTH this and declaredThinPools is thin on
+	// one node and thick on another, which is the ambiguity a pool list
+	// carrying no node cannot express, so it is reported rather than
+	// resolved.
+	declaredZFSPools map[string]bool
+	// zfsAfterMigration names the pools that still come out ZFS. Used to
+	// tell an operator whether a group left unwidened can place anywhere
+	// at all, which is the fact the refusal otherwise leaves out.
+	zfsAfterMigration map[string]bool
 	convertedNode     map[string]bool // by node_name (UPPERCASE key)
 	convertedRG       map[string]bool // by resource_group_name (UPPERCASE key)
 
@@ -203,6 +214,8 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		convertedRG:       map[string]bool{},
 		remappedPools:     map[string]bool{},
 		declaredThinPools: map[string]bool{},
+		declaredZFSPools:  map[string]bool{},
+		zfsAfterMigration: map[string]bool{},
 		warnedKey:         map[string]bool{},
 	}
 
@@ -542,12 +555,20 @@ func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 			c.declaredThinPools[row.PoolName] = true
 		}
 
+		if kind == providerKindZFS {
+			c.declaredZFSPools[row.PoolName] = true
+		}
+
 		if createsSparseZvols(kind, c.zfscreateOptions(row.NodeName, row.PoolName)) {
 			kind = providerKindZFSThin
 			c.remappedPools[row.PoolName] = true
 
 			c.warnf("storage pool %s.%s: declared %s, but %s makes every zvol sparse — migrated as %s so the adopted volumes keep the provisioning they actually have",
 				poolDsp, nodeDsp, providerKindZFS, storDriverZfscreateOptions, providerKindZFSThin)
+		}
+
+		if kind == providerKindZFS {
+			c.zfsAfterMigration[row.PoolName] = true
 		}
 
 		pool := crdv1alpha1.StoragePool{
@@ -673,30 +694,28 @@ func (c *converter) placementLists(row *ResourceGroupRow, dsp string) ([]string,
 	// named pool may have remapped, and then the group's own [ZFS] filter
 	// matches none of them and it has nowhere left to place at all.
 	if len(pools) > 0 {
-		if pinnedNames(pools, excluded) {
-			scoped := pinsExcept(pools, excluded)
+		scoped, ambiguous := c.scopePins(pools, excluded)
 
-			// Scoping answers the shape where the excluded pool has
-			// its own name. It cannot answer one name that is thick
-			// on one node and thin on another: dropping it removes
-			// the remapped pool along with the thin one, which is
-			// why this falls through rather than returning an empty
-			// pin list — an empty list reads as "no restriction" at
-			// the placer and would widen the group to the cluster.
-			if len(scoped) > 0 && c.reaches(scoped, c.remappedPools) {
-				c.warnPoolRemapScoped(dsp, pools, scoped)
-
-				return widened, scoped
-			}
-
-			c.warnPoolRemapUnresolvable(dsp)
+		switch {
+		case ambiguous:
+			// One name, thick on one node and thin on another. The
+			// pool list carries no node, so neither keeping nor
+			// dropping the name expresses what the group had: keeping
+			// it admits the thin instance, dropping it loses the
+			// thick one. That is the finding, not something to
+			// resolve here.
+			c.warnPoolRemapUnresolvable(dsp, c.canStillPlace(pools))
 
 			return providers, pools
+		case len(scoped) < len(pools):
+			c.warnPoolRemapScoped(dsp, pools, scoped)
+
+			return widened, scoped
+		default:
+			c.warnPoolRemapWidening(dsp)
+
+			return widened, pools
 		}
-
-		c.warnPoolRemapWidening(dsp)
-
-		return widened, pools
 	}
 
 	// Unpinned, so the widening also admits every pool the source
@@ -737,34 +756,48 @@ func (c *converter) placementLists(row *ResourceGroupRow, dsp string) ([]string,
 	return widened, scoped
 }
 
-// pinnedNames reports whether a group's pool pins name any pool the source
-// cluster declared thin. Compared case-insensitively on the upper-cased key
-// the dump uses, since a pin is written by an operator and the dump's keys
-// are canonical.
-func pinnedNames(pinned []string, excluded map[string]bool) bool {
+// scopePins narrows a group's pool pins to the ones that still describe where
+// it could place, and reports the pins it cannot decide by name at all.
+//
+// A pin every one of whose instances the source declared thin is dropped: the
+// provider filter already kept the group off it, so removing the name takes no
+// reachability away and stops the widened kind from handing it over. A pin the
+// source declared thin on one node and plain ZFS on another cannot be decided
+// — the thick instance was reachable and the thin one was not, and one name
+// cannot say both — so it is reported instead.
+//
+// Compared on the upper-cased key: the dump's pool names are canonical while
+// its resource-group pins carry whatever case the operator typed.
+func (c *converter) scopePins(pinned []string, excluded map[string]bool) ([]string, bool) {
+	kept := make([]string, 0, len(pinned))
+
 	for _, pool := range pinned {
-		if excluded[strings.ToUpper(pool)] {
+		key := strings.ToUpper(pool)
+
+		if !excluded[key] {
+			kept = append(kept, pool)
+
+			continue
+		}
+
+		if c.declaredZFSPools[key] {
+			return nil, true
+		}
+	}
+
+	return kept, false
+}
+
+// canStillPlace reports whether a group left on its original provider list has
+// any eligible pool once the migration is done.
+func (c *converter) canStillPlace(pinned []string) bool {
+	for _, pool := range pinned {
+		if c.zfsAfterMigration[strings.ToUpper(pool)] {
 			return true
 		}
 	}
 
 	return false
-}
-
-// pinsExcept lists the pins that are not in the excluded set, keeping the
-// operator's own casing and order. Compared on the upper-cased key for the
-// same reason pinnedNames is: the dump's pool names are canonical while its
-// resource-group pins carry whatever case the operator typed.
-func pinsExcept(pinned []string, excluded map[string]bool) []string {
-	kept := make([]string, 0, len(pinned))
-
-	for _, pool := range pinned {
-		if !excluded[strings.ToUpper(pool)] {
-			kept = append(kept, pool)
-		}
-	}
-
-	return kept
 }
 
 // warnPoolRemapScoped reports the case where the widening was scoped by
@@ -777,13 +810,23 @@ func (c *converter) warnPoolRemapScoped(dsp string, before, after []string) {
 }
 
 // warnPoolRemapUnresolvable reports the case where the group's own pins
-// already reach a pool the source declared thin, so widening the kind cannot
-// be scoped and the allow-list is left as it was.
-func (c *converter) warnPoolRemapUnresolvable(dsp string) {
-	c.warnf("resource group %s: allow-list left as-is — a pool it can place on migrated to %s, but the "+
-		"group is pinned to a pool the source cluster declared thin, so widening the list would admit a "+
-		"pool this group could not use before. Resolve the pins by hand",
-		dsp, providerKindZFSThin)
+// cannot be decided by name, so the allow-list is left as it was.
+//
+// stillPlaceable says whether the group has anywhere to put a replica
+// meanwhile. When it does not, that is the fact the operator needs first: the
+// group is not merely losing new placements on the remapped pool, it cannot
+// place at all until someone edits it.
+func (c *converter) warnPoolRemapUnresolvable(dsp string, stillPlaceable bool) {
+	consequence := "the group keeps placing on its remaining pools, but not on the remapped one"
+	if !stillPlaceable {
+		consequence = "the group has NO eligible pool at all until this is resolved — every pool it names " +
+			"comes out " + providerKindZFSThin + " while its allow-list still says " + providerKindZFS
+	}
+
+	c.warnf("resource group %s: allow-list left as-is — it is pinned to a pool name the source cluster "+
+		"declared %s on one node and %s on another, so neither keeping nor dropping the name says what "+
+		"the group had. Resolve the pins by hand; %s",
+		dsp, providerKindZFSThin, providerKindZFS, consequence)
 }
 
 // warnPoolRemapWidening reports the plain widening case, where nothing
@@ -884,15 +927,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 		// still out there and the latch stays on.
 		adopted := latch.adopted || latch.heldByAbsentNode
 
-		switch {
-		case latch.onlyDivergent:
-			c.warnf("resource definition %s: every replica spans multiple storage pools and is skipped, so the definition arrives with no replicas at all — Initialized stays latched because the data exists, but resolve the divergence or replicas placed later sit Inconsistent", dsp)
-		case latch.adopted:
-		case latch.heldByAbsentNode:
-			c.warnf("resource definition %s: every replica lives on a node that was not migrated — Initialized kept latched, because that data still exists; adopt those nodes or the definition stays without replicas", dsp)
-		default:
-			c.warnf("resource definition %s: no replica is being migrated — Initialized left unlatched so blockstor can seed a first sync", dsp)
-		}
+		c.reportLatch(dsp, latch, adopted)
 
 		def := crdv1alpha1.ResourceDefinition{
 			TypeMeta:   typeMeta("ResourceDefinition"),
@@ -1002,6 +1037,35 @@ func (c *converter) volumelessReason(rdName string) string {
 	return "no volume definitions"
 }
 
+// reportLatch names every reason the definition ended up in the latch state
+// it did.
+//
+// Reported independently rather than as a switch: a definition can be held by
+// an absent node AND pool-divergent at once, and a switch names only whichever
+// branch comes first while the document promises every state is named with the
+// reason that applies.
+func (c *converter) reportLatch(dsp string, latch rdLatchState, adopted bool) {
+	if latch.onlyDivergent {
+		c.warnf("resource definition %s: every replica spans multiple storage pools and is skipped, so the definition arrives with no replicas at all — Initialized stays latched because the data exists, but resolve the divergence or replicas placed later sit Inconsistent", dsp)
+	}
+
+	if latch.heldByAbsentNode {
+		c.warnf("resource definition %s: a replica lives on a node that was not migrated — Initialized kept latched, because that data still exists; adopt those nodes or the definition stays short of replicas", dsp)
+	}
+
+	if adopted {
+		return
+	}
+
+	if latch.onlyDiskless {
+		c.warnf("resource definition %s: replicas are being migrated but every one is diskless — a client or a quorum witness carries no copy, so Initialized is left unlatched and blockstor seeds a first sync when a diskful replica is added", dsp)
+
+		return
+	}
+
+	c.warnf("resource definition %s: no replica is being migrated — Initialized left unlatched so blockstor can seed a first sync", dsp)
+}
+
 // rdLatchState is what rdInitializedLatch found out about a resource
 // definition's replicas.
 type rdLatchState struct {
@@ -1018,6 +1082,12 @@ type rdLatchState struct {
 	// all — the shape that sits Inconsistent forever if the controller
 	// later places fresh ones.
 	onlyDivergent bool
+	// onlyDiskless is true when replicas ARE being migrated but every one
+	// of them is diskless — a client or a quorum witness, carrying no copy
+	// of anything. The definition arrives unlatched with its replicas
+	// emitted, which is neither of the two shapes above and reads nothing
+	// like "no replica is being migrated".
+	onlyDiskless bool
 }
 
 // rdInitializedLatch decides whether Initialized may be dropped.
@@ -1073,6 +1143,8 @@ func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
 		// overwrite the data that was just adopted. The skip has to be
 		// narrower than the adoption, never wider.
 		if row.ResourceFlags&resourceFlagDiskless != 0 {
+			state.onlyDiskless = true
+
 			continue
 		}
 
@@ -1089,6 +1161,7 @@ func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
 
 		state.adopted = true
 		state.onlyDivergent = false
+		state.onlyDiskless = false
 
 		return state
 	}

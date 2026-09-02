@@ -1563,7 +1563,10 @@ func TestInitializedLatchSurvivesAnUnmigratedNode(t *testing.T) {
 			"or nothing can seed the first sync")
 	}
 
-	if !hasWarning(res, "pvc-elsewhere: every replica lives on a node that was not migrated") {
+	// Worded "a replica", not "every replica": the same line is now emitted
+	// for a definition that adopted some replicas and had others held back,
+	// which the old switch reported as nothing at all.
+	if !hasWarning(res, "pvc-elsewhere: a replica lives on a node that was not migrated") {
 		t.Errorf("the operator was not told the definition is incomplete; warnings: %v", res.Warnings)
 	}
 }
@@ -1614,5 +1617,189 @@ func TestSparseRemapWidensTheProviderAllowList(t *testing.T) {
 	// cluster must stay eligible for a group that named ZFS.
 	if !slices.Contains(list, "ZFS") {
 		t.Errorf("ZFS was dropped from the allow-list: %v", list)
+	}
+}
+
+// One name thick on one node and thin on another cannot be decided by a pool
+// list that carries no node: keeping it admits the thin instance the provider
+// filter used to exclude, dropping it loses the thick one the group actually
+// placed on. Scoping by name alone got this wrong and silently dropped MIXED,
+// taking MIXED@node-a with it.
+func TestPinnedGroupNamingASplitNameIsNotScoped(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+			{NodeName: "NODE-B", NodeDspName: "node-b", NodeType: 2, UUID: "n-b"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			// Thick by declaration, sparse in practice — this one remaps.
+			{NodeName: "NODE-A", PoolName: "SPARSE", DriverName: "ZFS", UUID: "sp-1"},
+			// Genuinely thick, and reachable before the migration.
+			{NodeName: "NODE-A", PoolName: "MIXED", DriverName: "ZFS", UUID: "sp-2"},
+			// The same name, declared thin on another node.
+			{NodeName: "NODE-B", PoolName: "MIXED", DriverName: "ZFS_THIN", UUID: "sp-3"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{
+				ResourceGroupName:    "RG",
+				ResourceGroupDspName: "rg",
+				AllowedProviderList:  `["ZFS"]`,
+				PoolName:             `["sparse","mixed"]`,
+				UUID:                 "rg-1",
+			},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/SPARSE", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	filter := res.ResourceGroups[0].Spec.SelectFilter
+
+	if !containsString(filter.StoragePoolList, "mixed") {
+		t.Errorf("pins = %v: the group placed on MIXED@node-a before the migration, and "+
+			"dropping the name takes that away", filter.StoragePoolList)
+	}
+
+	if containsString(filter.ProviderList, "ZFS_THIN") {
+		t.Errorf("allow-list = %v: widening while MIXED is still pinned admits MIXED@node-b, "+
+			"which the provider filter kept the group off", filter.ProviderList)
+	}
+
+	if !hasWarning(res, "by hand") {
+		t.Errorf("the unresolvable case was not reported; warnings: %v", res.Warnings)
+	}
+}
+
+// When every pool a pinned group names comes out ZFS_THIN, the group has
+// nowhere to place at all. The report has to say so: "resolve the pins by
+// hand" reads like lost future placements, not like a group that cannot serve
+// a single new replica right now.
+func TestUnresolvableGroupWithNoEligiblePoolSaysSo(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+			{NodeName: "NODE-B", NodeDspName: "node-b", NodeType: 2, UUID: "n-b"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "TANK", DriverName: "ZFS", UUID: "sp-1"},
+			{NodeName: "NODE-B", PoolName: "TANK", DriverName: "ZFS_THIN", UUID: "sp-2"},
+			{NodeName: "NODE-A", PoolName: "REALTHIN", DriverName: "ZFS_THIN", UUID: "sp-3"},
+		},
+		ResourceGroups: []ResourceGroupRow{
+			{
+				ResourceGroupName:    "RG",
+				ResourceGroupDspName: "rg",
+				AllowedProviderList:  `["ZFS"]`,
+				PoolName:             `["tank","realThin"]`,
+				UUID:                 "rg-1",
+			},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/STOR_POOLS/NODE-A/TANK", PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if !hasWarning(res, "NO eligible pool") {
+		t.Errorf("the group cannot place anywhere and the report does not say so; warnings: %v",
+			res.Warnings)
+	}
+}
+
+// A definition whose replicas are all diskless arrives unlatched WITH its
+// replicas emitted — a client or a witness carries no copy to latch on. The
+// report used to call this "no replica is being migrated", which is false and
+// sends an operator looking for a dump problem that is not there.
+func TestDisklessOnlyDefinitionIsReportedAsSuch(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		ResourceDefinitions: []ResourceDefinitionRow{
+			{ResourceName: "PVC-CLIENTS", ResourceDspName: "pvc-clients", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-c"},
+		},
+		VolumeDefinitions: []VolumeDefinitionRow{
+			{ResourceName: "PVC-CLIENTS", VlmNr: 0, VlmSize: 1048576, UUID: "vd-c"},
+		},
+		Resources: []ResourceRow{
+			// DISKLESS (4), no tie-breaker bit: an ordinary client.
+			{NodeName: "NODE-A", ResourceName: "PVC-CLIENTS", ResourceFlags: 4, UUID: "r-c"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if hasWarning(res, "no replica is being migrated") {
+		t.Error("the report claims no replica is being migrated, but one is — it is diskless")
+	}
+
+	if !hasWarning(res, "every one is diskless") {
+		t.Errorf("the diskless-only shape was not named; warnings: %v", res.Warnings)
+	}
+}
+
+// A definition can be held by an absent node AND pool-divergent at once. The
+// report used to be a switch, so it named only the first branch while the
+// document promises every state is named with the reason that applies.
+func TestBothLatchReasonsAreReported(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "P1", DriverName: "ZFS", UUID: "sp-1"},
+			{NodeName: "NODE-A", PoolName: "P2", DriverName: "ZFS", UUID: "sp-2"},
+		},
+		ResourceDefinitions: []ResourceDefinitionRow{
+			{ResourceName: "PVC-BOTH", ResourceDspName: "pvc-both", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-b"},
+		},
+		VolumeDefinitions: []VolumeDefinitionRow{
+			{ResourceName: "PVC-BOTH", VlmNr: 0, VlmSize: 1048576, UUID: "vd-b"},
+			{ResourceName: "PVC-BOTH", VlmNr: 1, VlmSize: 1048576, UUID: "vd-b1"},
+		},
+		Resources: []ResourceRow{
+			// On the migrated node, its two volumes in different pools.
+			{NodeName: "NODE-A", ResourceName: "PVC-BOTH", UUID: "r-a"},
+			// On a node the dump does not carry.
+			{NodeName: "NODE-GONE", ResourceName: "PVC-BOTH", UUID: "r-g"},
+		},
+		Volumes: []VolumeRow{
+			{NodeName: "NODE-A", ResourceName: "PVC-BOTH", VlmNr: 0, UUID: "v-0"},
+			{NodeName: "NODE-A", ResourceName: "PVC-BOTH", VlmNr: 1, UUID: "v-1"},
+		},
+		LayerResourceIDs: []LayerResourceIDRow{
+			{LayerResourceID: 10, LayerResourceKind: "STORAGE", NodeName: "NODE-A", ResourceName: "PVC-BOTH"},
+		},
+		// The two volumes of the same replica in different pools: the
+		// shape convertResources drops, keeping the latch on.
+		LayerStorageVolumes: []LayerStorageVolumeRow{
+			{LayerResourceID: 10, VlmNr: 0, NodeName: "NODE-A", ProviderKind: "ZFS", StorPoolName: "P1"},
+			{LayerResourceID: 10, VlmNr: 1, NodeName: "NODE-A", ProviderKind: "ZFS", StorPoolName: "P2"},
+		},
+	}
+
+	res, err := Convert(dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if !hasWarning(res, "spans multiple storage pools") {
+		t.Errorf("the divergence was not reported; warnings: %v", res.Warnings)
+	}
+
+	if !hasWarning(res, "a replica lives on a node that was not migrated") {
+		t.Errorf("the unmigrated node was not reported; warnings: %v", res.Warnings)
 	}
 }
