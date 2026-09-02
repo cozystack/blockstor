@@ -313,6 +313,10 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// target is left an empty shell for the operator / linstor-csi to
 	// place (restore-then-scale-out); an explicit node list is still
 	// stamped verbatim inside materializeRestoredRD.
+	if s.restoreTargetPreexists(r.Context(), w, srcRD, snapName, req.ToResource) {
+		return
+	}
+
 	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false, nil)
 	if err != nil {
 		writeStoreError(w, err)
@@ -325,6 +329,55 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		Message: "snapshot restored: " + snapName + " → " + newRDName,
 	}})
 }
+
+// restoreTargetPreexists makes a repeat restore idempotent. True means an
+// answer has been written and the caller must stop.
+//
+// CSI requires CreateVolume to be idempotent: a repeat with the same name and
+// the same parameters has to succeed and return the volume that already
+// exists. external-provisioner has no other way to make progress after a
+// partial failure, so without this the first partial failure was terminal for
+// that volume name — the definition the first attempt created was still
+// there, every retry hit ErrAlreadyExists, and the PVC stayed Pending until
+// someone deleted the leftover by hand.
+//
+// The distinction that makes this safe is the restore marker. A definition
+// carrying `<srcRD>:<snapName>` is the one THIS restore would have produced,
+// so reporting success is accurate. Anything else under that name is a
+// genuine collision and stays a refusal — the same split the clone path
+// already draws.
+func (s *Server) restoreTargetPreexists(ctx context.Context, w http.ResponseWriter, srcRD, snapName, toResource string) bool {
+	existing, err := s.Store.ResourceDefinitions().Get(ctx, toResource)
+	if err != nil {
+		// NotFound, or a read blip: proceed with the create, which
+		// surfaces a real store outage on its own.
+		return false
+	}
+
+	if existing.Props[restoreFromSnapshotKey] == srcRD+":"+snapName {
+		writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "snapshot already restored: " + snapName + " → " + toResource,
+		}})
+
+		return true
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+		Message: "resource definition '" + toResource + "' already exists and is not a restore of '" +
+			snapName + "'",
+		Correc: "restore under a different name, or delete the existing resource definition first",
+	}})
+
+	return true
+}
+
+// restoreFromSnapshotKey marks a definition as produced by a snapshot
+// restore, encoded `<source RD>:<snapshot>`. The satellite reads it to route
+// the storage provider to RestoreVolumeFromSnapshot, and the retry path above
+// reads it to tell its own leftover from somebody else's definition.
+const restoreFromSnapshotKey = "BlockstorRestoreFromSnapshot"
 
 // validateRestoreNodesHoldSnapshot is the Bug 397 input-validation guard
 // for the explicit `--node-name` restore path. It rejects the request when
@@ -469,7 +522,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		newRD.Props = map[string]string{}
 	}
 
-	newRD.Props["BlockstorRestoreFromSnapshot"] = srcRD + ":" + snap.Name
+	newRD.Props[restoreFromSnapshotKey] = srcRD + ":" + snap.Name
 
 	err = s.Store.ResourceDefinitions().Create(ctx, &newRD)
 	if err != nil {
