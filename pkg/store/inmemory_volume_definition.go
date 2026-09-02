@@ -56,6 +56,25 @@ func (s *inMemoryVolumeDefinitions) List(_ context.Context, rdName string) ([]ap
 	return out, nil
 }
 
+// ListAll groups every stored volume by its parent definition, matching what
+// the Kubernetes store reads out of one list of the definitions.
+func (s *inMemoryVolumeDefinitions) ListAll(_ context.Context) (map[string][]apiv1.VolumeDefinition, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string][]apiv1.VolumeDefinition)
+	for k := range s.m {
+		out[k.rd] = append(out[k.rd], s.m[k])
+	}
+
+	for rd := range out {
+		vds := out[rd]
+		sort.Slice(vds, func(i, j int) bool { return vds[i].VolumeNumber < vds[j].VolumeNumber })
+	}
+
+	return out, nil
+}
+
 func (s *inMemoryVolumeDefinitions) Get(_ context.Context, rdName string, volumeNumber int32) (apiv1.VolumeDefinition, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

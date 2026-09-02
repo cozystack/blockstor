@@ -339,20 +339,34 @@ func resourceList(ctx context.Context, run *runContext) error {
 // cannot be read is skipped rather than failing the listing: a missing
 // percentage is a cosmetic loss, an unreadable `resource list` during
 // an incident is not.
+// volumeSizesFor builds the per-volume sizes the sync-percentage column needs.
+//
+// One request, not one per definition. This used to loop over the listing and
+// call VolumeDefinitions().List for every distinct name, and on the Kubernetes
+// store each of those is a GET of one ResourceDefinition against an uncached
+// client — so `resource list` on a cluster with a thousand definitions was one
+// LIST plus a thousand sequential round trips, in the command an operator runs
+// while watching a resync.
+//
+// A read failure leaves the map empty rather than failing the listing: the
+// column degrades to a bare state, which is what the per-definition version
+// did when one of its reads failed.
 func volumeSizesFor(ctx context.Context, run *runContext, resources []apiv1.Resource) map[string]map[int32]int64 {
-	seen := make(map[string]struct{}, len(resources))
+	all, err := run.Store.VolumeDefinitions().ListAll(ctx)
+	if err != nil {
+		return map[string]map[int32]int64{}
+	}
+
 	sizes := make(map[string]map[int32]int64, len(resources))
 
 	for i := range resources {
 		name := resources[i].Name
-		if _, done := seen[name]; done {
+		if _, done := sizes[name]; done {
 			continue
 		}
 
-		seen[name] = struct{}{}
-
-		vds, err := run.Store.VolumeDefinitions().List(ctx, name)
-		if err != nil {
+		vds, ok := all[name]
+		if !ok {
 			continue
 		}
 
