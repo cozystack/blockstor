@@ -281,16 +281,36 @@ func writeOption(b *strings.Builder, indent, key, value string) {
 	fmt.Fprintf(b, "%s%s %s;\n", indent, key, value)
 }
 
-// quoteValue wraps a value in the quotes drbd's grammar uses.
+// quoteValue wraps a value in the quotes drbd's grammar uses, escaping the
+// two bytes its lexer treats specially.
 //
-// Deliberately not %q. That is Go quoting, and drbdadm's lexer decodes no
-// escapes inside a quoted string: Go renders a backslash as `\\` and drbdadm
-// would read two, and a value carrying a quote comes out as `\"`, which ends
-// the string early and turns the remainder into syntax. Values with no
-// representation at all are refused by checkValue before anything is
-// rendered, so what reaches here is emitted literally between two quotes.
+// drbdadm's scanner accepts a backslash followed by any non-newline byte
+// inside a double-quoted string (`DQSTRING` in drbdadm_scanner.fl) and runs
+// `unescape()` over the token, which drops the backslash and copies the next
+// byte verbatim. drbd-utils' own writer, `esc()` in shared_tool.c, therefore
+// escapes `"` and `\` and nothing else. This mirrors it.
+//
+// Emitting the value literally instead is what an earlier revision did, and
+// it corrupts two shapes: `--path a\b` reaches the handler as `--path ab`,
+// and a value ending in a backslash escapes the closing quote, which makes
+// the whole .res a parse error rather than one bad option.
 func quoteValue(value string) string {
-	return `"` + value + `"`
+	var out strings.Builder
+
+	out.Grow(len(value) + 2)
+	out.WriteByte('"')
+
+	for i := range len(value) {
+		if value[i] == '"' || value[i] == '\\' {
+			out.WriteByte('\\')
+		}
+
+		out.WriteByte(value[i])
+	}
+
+	out.WriteByte('"')
+
+	return out.String()
 }
 
 // ErrUnrepresentableValue refuses a value drbd.conf cannot spell. Exported
@@ -298,21 +318,25 @@ func quoteValue(value string) string {
 // resource and report which value was rejected.
 var ErrUnrepresentableValue = errors.New("drbd: value cannot be represented in drbd.conf")
 
-// ValidateOptionValue refuses a value that has no spelling in a drbd.conf string. The
-// quoted form is delimited by '"' and ends at the line, and there are no
-// escapes to fall back on, so a value carrying either character cannot be
-// written at all.
+// ValidateOptionValue refuses a value that has no spelling in a drbd.conf
+// string at all.
 //
-// Refusing here makes that an error naming the option, at the moment the
-// config is built. Emitting it anyway produces a file that parses wrong on
-// the node, and it surfaces whenever DRBD next reads it, which for a handler
-// is the moment it needs to fence.
+// That is a much smaller set than an earlier revision assumed. A quote and a
+// backslash both have one — quoteValue escapes them the way drbd-utils does,
+// and drbdadm reads them back. What is left with no spelling is a newline,
+// which ends the string in the scanner's own grammar; a carriage return,
+// which survives the parse but lands inside the value on the node; and NUL,
+// which the C lexer treats as end-of-string and silently truncates the value
+// there.
+//
+// Refusing here names the option at the moment the config is built, rather
+// than shipping a file that parses into something else.
 //
 // Exported so an API handler can refuse operator input at the edge. Build
 // refuses it too, but that happens on the node at reconcile time, by which
 // point the value is stored and the resource simply fails to configure.
 func ValidateOptionValue(block, key, value string) error {
-	i := strings.IndexAny(value, "\"\n\r")
+	i := strings.IndexAny(value, "\n\r\x00")
 	if i < 0 {
 		return nil
 	}

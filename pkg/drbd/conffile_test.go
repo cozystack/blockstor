@@ -658,36 +658,67 @@ func TestValueCarryingAHashIsQuoted(t *testing.T) {
 	}
 }
 
-// The quoting is drbd's, not Go's. drbdadm's lexer decodes no escapes inside
-// a quoted string, so a backslash has to reach it as one character. %q would
-// double it and the handler would run with the wrong path.
-func TestQuotedValueIsNotGoEscaped(t *testing.T) {
+// drbdadm's scanner accepts a backslash followed by any non-newline byte
+// inside a quoted string and runs unescape() over the token, so a backslash
+// has to be escaped on the way out. Verified against drbdadm 9.22.0: emitted
+// literally, `--path a\b` comes back from `drbdadm dump` as `--path ab`.
+func TestQuotedValueEscapesABackslash(t *testing.T) {
 	out, err := drbd.Build(drbd.Resource{
 		Name:     "r0",
-		Handlers: map[string]string{"fence-peer": `/usr/bin/fence --path a\b --tag x`},
+		Handlers: map[string]string{"fence-peer": `/usr/bin/fence --path a\b`},
 	})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	if strings.Contains(out, `a\\b`) {
-		t.Errorf("the backslash was Go-escaped; drbdadm decodes no escapes and would read two:\n%s", out)
-	}
-
-	if !strings.Contains(out, `fence-peer "/usr/bin/fence --path a\b --tag x";`) {
-		t.Errorf("the value did not survive quoting literally:\n%s", out)
+	if !strings.Contains(out, `fence-peer "/usr/bin/fence --path a\\b";`) {
+		t.Errorf("the backslash was not escaped, so unescape() eats it:\n%s", out)
 	}
 }
 
-// A quote has no representation at all: it ends the string, and there is no
-// escape to fall back on. Refusing names the option at build time instead of
-// shipping a file that parses into something else. Reachable in practice —
-// the passphrase endpoint validates only that its value is non-empty.
-func TestBuildRefusesAValueCarryingAQuote(t *testing.T) {
+// A value ending in a backslash is the sharp end of the same rule: unescaped,
+// it escapes the closing quote and the whole .res becomes a parse error
+// rather than one bad option.
+func TestQuotedValueEndingInABackslashDoesNotEatTheClosingQuote(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name:     "r0",
+		Handlers: map[string]string{"fence-peer": `/bin/fence --dir a\`},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `fence-peer "/bin/fence --dir a\\";`) {
+		t.Errorf("the trailing backslash escaped the closing quote:\n%s", out)
+	}
+}
+
+// A quote HAS a spelling — drbd-utils' own esc() writes it as \" and drbdadm
+// reads it back. An earlier revision refused the value outright, which turned
+// away input drbdadm handles and broke every reconcile on a cluster already
+// carrying one.
+func TestQuotedValueEscapesAQuoteRatherThanRefusingIt(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name:     "r0",
+		Handlers: map[string]string{"fence-peer": `/bin/fence --tag "x"`},
+	})
+	if err != nil {
+		t.Fatalf("a value carrying a quote was refused, but drbdadm round-trips it: %v", err)
+	}
+
+	if !strings.Contains(out, `fence-peer "/bin/fence --tag \"x\"";`) {
+		t.Errorf("the quote was not escaped:\n%s", out)
+	}
+}
+
+// What genuinely has no spelling: a newline ends the string in the scanner's
+// own grammar, a carriage return lands inside the value on the node, and NUL
+// truncates it in the C lexer.
+func TestBuildRefusesAValueWithNoSpelling(t *testing.T) {
 	for name, r := range map[string]drbd.Resource{
-		"handler": {Name: "r0", Handlers: map[string]string{"fence-peer": `/bin/f --tag "x"`}},
-		"secret":  {Name: "r0", Net: drbd.Net{SharedSecret: `se"cret`}},
-		"newline": {Name: "r0", Options: map[string]string{"on-no-data-accessible": "a\nb"}},
+		"newline":         {Name: "r0", Options: map[string]string{"on-no-data-accessible": "a\nb"}},
+		"carriage return": {Name: "r0", Handlers: map[string]string{"fence-peer": "/bin/f\ra"}},
+		"nul":             {Name: "r0", Net: drbd.Net{SharedSecret: "se\x00cret"}},
 	} {
 		out, err := drbd.Build(r)
 		if err == nil {
@@ -699,5 +730,35 @@ func TestBuildRefusesAValueCarryingAQuote(t *testing.T) {
 		if !errors.Is(err, drbd.ErrUnrepresentableValue) {
 			t.Errorf("%s: unexpected error: %v", name, err)
 		}
+	}
+}
+
+// The secret goes out through writeNet's own emitters rather than
+// writeOption, so it needs its own pin: it is quoted by name, and its
+// contents are escaped by the same rule.
+func TestSharedSecretIsEscapedOnBothNetPaths(t *testing.T) {
+	typed, err := drbd.Build(drbd.Resource{
+		Name: "r0",
+		Net:  drbd.Net{SharedSecret: `s3cr3t\with\slash`},
+	})
+	if err != nil {
+		t.Fatalf("Build (typed field): %v", err)
+	}
+
+	if !strings.Contains(typed, `shared-secret "s3cr3t\\with\\slash";`) {
+		t.Errorf("the typed shared secret was not escaped, so the two ends of the "+
+			"mesh authenticate with different strings:\n%s", typed)
+	}
+
+	fromProps, err := drbd.Build(drbd.Resource{
+		Name: "r0",
+		Net:  drbd.Net{Options: map[string]string{"shared-secret": `s3cr3t\with\slash`}},
+	})
+	if err != nil {
+		t.Fatalf("Build (net option): %v", err)
+	}
+
+	if !strings.Contains(fromProps, `shared-secret "s3cr3t\\with\\slash";`) {
+		t.Errorf("the shared secret arriving as a net option was not escaped:\n%s", fromProps)
 	}
 }
