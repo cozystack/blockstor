@@ -134,3 +134,26 @@ func TestNodeDeleteRefusesWhileStillReferenced(t *testing.T) {
 func isNotFoundForTest(err error) bool {
 	return errors.Is(err, store.ErrNotFound)
 }
+
+// REST creates the default diskless pool on every `node create`, so a node
+// registered by piraeus, linstor-csi or the upstream client always carries
+// one. Counting it as a reference makes an idle node undeletable — the
+// refusal names a pool the operator has no way to remove, while `linstor n d`
+// on the same cluster succeeds.
+func TestNodeDeleteIgnoresTheDefaultDisklessPool(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.Nodes().Create(ctx, &apiv1.Node{Name: "node-1"})
+		_ = backend.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        "node-1",
+			StoragePoolName: apiv1.DfltDisklessStorPoolName,
+			ProviderKind:    apiv1.StoragePoolKindDiskless,
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"n", "d", "node-1"}); got != 0 {
+		t.Fatalf("an idle node carrying only the default diskless pool was refused, "+
+			"exit = %d (stderr: %s)", got, errBuf.String())
+	}
+}

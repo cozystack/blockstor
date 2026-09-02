@@ -1,7 +1,7 @@
 name: vd-resize-bounds-rejected
 description: |
   Adversarial round 4 (2026-07-03): `linstor vd set-size` (RESIZE) must
-  enforce the SAME [4 MiB, 16 TiB] size bounds the CREATE path enforces
+  enforce the SAME [4 MiB, 1 PiB] size bounds the CREATE path enforces
   (Bug 155). Pre-fix the resize path skipped validateVDSize, so an
   over-ceiling grow or a below-floor force-shrink was stored verbatim
   and the satellite hot-looped on `drbdadm create-md` — the Bug 155
@@ -9,7 +9,7 @@ description: |
 
   Operator sequence codified here (CLI-driveable contract only — the
   runner drives the operator CLI):
-    - grow to 16 TiB + 1 GiB (over ceiling)   -> MUST be rejected
+    - grow to 1 PiB + 1 TiB (over ceiling)    -> MUST be rejected
     - size unchanged after the rejected grow
     - shrink to 3 MiB (below the 4 MiB floor) -> MUST be rejected
     - size unchanged after the rejected shrink
@@ -71,12 +71,12 @@ steps:
       timeout_s: 600
 
   # ---- Over-ceiling grow MUST be rejected ----
-  # 16385G = 16 TiB + 1 GiB > maxVolumeDefinitionSizeKib (16 TiB).
+  # 1025T = 1 PiB + 1 TiB > maxVolumeDefinitionSizeKib (1 PiB).
   # python-linstor surfaces an API-level rejection as exit 10 and a
   # client/usage failure as exit 1; both mean "rejected", the load-
   # bearing contract (size does NOT change) is pinned below.
   - name: grow-over-ceiling-rejected
-    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "16385G"]
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "1025T"]
     expect_exit: [1, 10]
   - name: size-unchanged-after-ceiling-reject
     cmd: ["volume-definition", "list", "--resource-definitions", "{{rd}}"]

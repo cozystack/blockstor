@@ -24,9 +24,14 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/tests/integration/harness"
@@ -48,25 +53,38 @@ func TestVDSizeBoundRatchetsOnAKeyedList(t *testing.T) {
 	stack := harness.StartStack(t)
 	ctx := context.Background()
 
-	// A definition carrying a volume below the floor, the way an in-place
-	// upgrade leaves one behind. It is written through the store rather than
-	// the REST path, which has its own gate.
+	// A volume BELOW the floor, which is the only value that exercises
+	// ratcheting. Seeded at the floor the object is valid under any schema,
+	// so the test passes on an atomic list and on a keyed one alike, and
+	// proves nothing about either.
+	//
+	// Getting one below the floor means writing it while the bound is not
+	// there, which is exactly how an in-place upgrade produces it: the
+	// cluster ran without the bound, then the new CRD arrives over the top.
+	crds := crdClient(t, stack)
+	withSizeBound(t, ctx, crds, stack.Env.Client, false)
+
 	legacy := &blockstoriov1alpha1.ResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: "ratchet-legacy"},
 		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
 			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
-				{VolumeNumber: 0, SizeKib: vdBoundsMinSizeKib},
+				{VolumeNumber: 0, SizeKib: 1024},
 			},
 		},
 	}
 
 	err := stack.Env.Client.Create(ctx, legacy)
 	if err != nil {
-		t.Fatalf("seed the legacy definition: %v", err)
+		t.Fatalf("seed the pre-upgrade definition: %v", err)
 	}
 
-	// Appending a second, in-range volume is the controller's own shape. On
-	// an atomic list this was rejected naming volume 0.
+	withSizeBound(t, ctx, crds, stack.Env.Client, true)
+
+	// The upgrade has landed. Appending a second, in-range volume is the
+	// controller's own shape — it rewrites this list to stamp drbdMinor. On
+	// an atomic list the API server re-validates every element and rejects
+	// this naming volume 0, which locks the definition against every later
+	// write including the controller's.
 	var fetched blockstoriov1alpha1.ResourceDefinition
 
 	err = stack.Env.Client.Get(ctx, types.NamespacedName{Name: "ratchet-legacy"}, &fetched)
@@ -81,6 +99,16 @@ func TestVDSizeBoundRatchetsOnAKeyedList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("appending an in-range volume was rejected, so the bound poisons "+
 			"writes that do not touch the offending element: %v", err)
+	}
+
+	// And volume 0 is still there, untouched, at its grandfathered size.
+	err = stack.Env.Client.Get(ctx, types.NamespacedName{Name: "ratchet-legacy"}, &fetched)
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+
+	if got := fetched.Spec.VolumeDefinitions[0].SizeKib; got != 1024 {
+		t.Errorf("grandfathered volume = %d KiB, want 1024", got)
 	}
 
 	// The bound still holds for anything new.
@@ -102,6 +130,95 @@ func TestVDSizeBoundRatchetsOnAKeyedList(t *testing.T) {
 		t.Errorf("the refusal does not name the field: %v", err)
 	}
 }
+
+// crdClient talks to the apiextensions group, which the harness scheme does
+// not carry.
+func crdClient(t *testing.T, stack *harness.Stack) client.Client {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("register apiextensions scheme: %v", err)
+	}
+
+	c, err := client.New(stack.Env.Cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatalf("apiextensions client: %v", err)
+	}
+
+	return c
+}
+
+// withSizeBound adds or removes the sizeKib minimum on the live CRD, and
+// waits until the API server actually enforces the new schema — the update
+// returns before the served schema catches up.
+func withSizeBound(
+	t *testing.T, ctx context.Context, crds, objects client.Client, want bool,
+) {
+	t.Helper()
+
+	const crdName = "resourcedefinitions.blockstor.cozystack.io"
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var crd apiextensionsv1.CustomResourceDefinition
+
+		if err := crds.Get(ctx, types.NamespacedName{Name: crdName}, &crd); err != nil {
+			return err
+		}
+
+		for i := range crd.Spec.Versions {
+			props := crd.Spec.Versions[i].Schema.OpenAPIV3Schema.
+				Properties["spec"].Properties["volumeDefinitions"].Items.Schema.Properties["sizeKib"]
+
+			if want {
+				props.Minimum = ptr(float64(vdBoundsMinSizeKib))
+			} else {
+				props.Minimum = nil
+			}
+
+			crd.Spec.Versions[i].Schema.OpenAPIV3Schema.
+				Properties["spec"].Properties["volumeDefinitions"].Items.Schema.Properties["sizeKib"] = props
+		}
+
+		return crds.Update(ctx, &crd)
+	})
+	if err != nil {
+		t.Fatalf("set sizeKib bound to %v: %v", want, err)
+	}
+
+	// Poll the served behaviour rather than the object: the apiserver
+	// rebuilds its validator asynchronously after the CRD write.
+	probe := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "ratchet-probe"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024},
+			},
+		},
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		probeErr := objects.Create(ctx, probe.DeepCopy())
+		refused := probeErr != nil
+
+		if refused == want {
+			if !refused {
+				_ = objects.Delete(ctx, probe)
+			}
+
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("the API server never started enforcing bound=%v", want)
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
 
 // Zero is the value the field's own comment says must never reach the
 // satellite, because it loops on drbdadm create-md rather than failing. With

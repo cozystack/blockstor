@@ -51,7 +51,7 @@ func TestSpawnCreatesRDAndVDs(t *testing.T) {
 		// volume_sizes is KiB (Bug 391): the python client encodes
 		// `2M`/`4M` as [2048, 4096] via parse_volume_size_to_kib.
 		// KiB, a factor of 1024 above the toy sizes this used to
-		// carry: the [4096 KiB, 16 TiB] floor applies on this path.
+		// carry: the [4096 KiB, 1 PiB] floor applies on this path.
 		VolumeSizes: []int64{2048 * 1024, 4096 * 1024},
 	})
 	if err != nil {

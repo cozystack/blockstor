@@ -30,14 +30,14 @@ import (
 )
 
 // VD-resize size-bounds gap (adversarial round 4, 2026-07-03): the VD
-// CREATE path gates size_kib into [4 MiB, 16 TiB] via validateVDSize
+// CREATE path gates size_kib into [4 MiB, 1 PiB] via validateVDSize
 // (Bug 155), so the satellite never hot-loops on `drbdadm create-md`
 // for an unmaterializable size. The RESIZE path
 // (`PUT /v1/resource-definitions/{rd}/volume-definitions/{vn}`, i.e.
 // `linstor vd set-size`) enforced only the Bug 383 non-positive floor
 // and the scenario 4.W13 shrink-vs-force gate — it never called
 // validateVDSize. So a `vd set-size` below the 4 MiB metadata floor
-// (with force to clear the shrink gate) or above the 16 TiB ceiling
+// (with force to clear the shrink gate) or above the 1 PiB ceiling
 // was accepted (200) and stored verbatim, reproducing the exact Bug
 // 155 satellite hot-loop through the resize verb instead of create.
 //
@@ -92,7 +92,7 @@ func TestVDPutBelowFloorWithForceRejected(t *testing.T) {
 	assertVDSize(t, st, "r4-floor-rd", origSize)
 }
 
-// TestVDPutAboveMaxRejected: a grow above the 16 TiB DRBD per-device
+// TestVDPutAboveMaxRejected: a grow above the 1 PiB DRBD per-device
 // ceiling (a pure grow, so only a max-bound gate can stop it) must be
 // refused and must not mutate the stored size.
 func TestVDPutAboveMaxRejected(t *testing.T) {

@@ -5,7 +5,7 @@
 # L6 cli-matrix cell — VD resize size-bounds rejection (adversarial
 # round 4, 2026-07-03).
 #
-# The CREATE path gates size_kib into [4 MiB, 16 TiB] (Bug 155) so the
+# The CREATE path gates size_kib into [4 MiB, 1 PiB] (Bug 155) so the
 # satellite never hot-loops on `drbdadm create-md` for a size DRBD
 # cannot address. `linstor vd set-size` (RESIZE) must enforce the SAME
 # floor/ceiling — otherwise an operator/CSI resize persists an
@@ -23,7 +23,7 @@
 #
 # Steps:
 #   1. rd c + vd c 1G + r c --auto-place=2 -s <pool>; wait UpToDate.
-#   2. over-ceiling GROW via CLI: `vd s <rd> 0 16385G` (16 TiB + 1 GiB)
+#   2. over-ceiling GROW via CLI: `vd s <rd> 0 1025T` (1 PiB + 1 TiB)
 #      MUST exit non-zero, error names the size/maximum, size still 1G.
 #   3. below-floor FORCE-shrink via raw REST PUT (force=true, 3072 KiB
 #      = 3 MiB < 4 MiB floor) MUST return 400 + FAIL_INVLD_VLM_SIZE,
@@ -100,11 +100,11 @@ if (( ${#placed_nodes[@]} < 2 )); then
 fi
 wait_uptodate "$RD" "${placed_nodes[0]}" "${placed_nodes[1]}"
 
-echo ">> over-ceiling grow vd s $RD 0 16385G (16 TiB + 1 GiB — MUST exit non-zero)"
+echo ">> over-ceiling grow vd s $RD 0 1025T (1 PiB + 1 TiB — MUST exit non-zero)"
 err_file=$(mktemp)
-if "${LCTL[@]}" volume-definition set-size "$RD" 0 16385G >"$err_file" 2>&1; then
-    echo "FAIL: over-ceiling grow (16 TiB + 1 GiB) unexpectedly succeeded" >&2
-    echo "   size_kib > 16 TiB is unaddressable by DRBD — REST must reject." >&2
+if "${LCTL[@]}" volume-definition set-size "$RD" 0 1025T >"$err_file" 2>&1; then
+    echo "FAIL: over-ceiling grow (1 PiB + 1 TiB) unexpectedly succeeded" >&2
+    echo "   size_kib > 1 PiB is past DRBD 9's per-device limit — REST must reject." >&2
     cat "$err_file" >&2
     rm -f "$err_file"
     exit 1

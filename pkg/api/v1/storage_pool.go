@@ -112,3 +112,14 @@ const (
 	StoragePoolKindOpenflex   = "OPENFLEX_TARGET" // explicitly out-of-scope (501)
 	StoragePoolKindRemoteSPDK = "REMOTE_SPDK"     // explicitly out-of-scope (501)
 )
+
+// DfltDisklessStorPoolName matches upstream LINSTOR's canonical
+// per-satellite diskless storage pool name. The autoplacer's
+// `disklessOnRemaining` path defaults to this pool when the caller does not
+// pin a specific pool list, and `linstor sp l` shows one row per registered
+// node from this synthesised pool. CSI / piraeus rely on the exact string.
+//
+// It is created on every `node create`, so anything counting "pools on this
+// node" as a reason to refuse a delete has to skip it, or no node registered
+// through that path can ever be deleted.
+const DfltDisklessStorPoolName = "DfltDisklessStorPool"

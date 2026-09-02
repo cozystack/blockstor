@@ -324,7 +324,7 @@ func TestVolumeDefinitionCreateEnforcesBounds(t *testing.T) {
 	for _, size := range []string{
 		"1024K", // below the 4 MiB floor
 		"1M",
-		"2P", // above the 16 TiB ceiling
+		"2P", // no P suffix: the parser stops at T
 		// Multiplying this out overflows int64 to exactly zero. A
 		// zero size is the one value the satellite cannot fail on.
 		"17179869184T",

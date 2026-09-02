@@ -814,7 +814,7 @@ func TestVolumeDefinitionsUpdateShrinkWithForceQueryAccepted(t *testing.T) {
 // (multi-TiB) `size_kib` survives the JSON round-trip without
 // truncation. The wire field is int64 on our side and uint64 in
 // golinstor; a regression that decoded into int32 would clamp anything
-// above ~2 TiB. The guard uses DRBD's 16 TiB per-device ceiling
+// above ~2 TiB. The guard uses DRBD 9's 1 PiB per-device ceiling
 // (maxVolumeDefinitionSizeKib, Bug 155) — the largest accepted size and
 // still 8× above the int32 clamp point, so it exercises the >int32 wire
 // path while remaining a size the resize bounds gate accepts. Petabyte-
@@ -838,7 +838,7 @@ func TestVolumeDefinitionsUpdateLargeSizeKibRoundTrip(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	const largeInBoundsKib = maxVolumeDefinitionSizeKib // 16 TiB, the largest accepted size (~8× int32 max)
+	const largeInBoundsKib = maxVolumeDefinitionSizeKib // 1 PiB, the largest accepted size
 
 	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: largeInBoundsKib})
 

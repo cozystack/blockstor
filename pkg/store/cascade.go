@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // The teardown a delete has to perform, shared by the two write doors.
@@ -156,7 +158,17 @@ func ReferencesOnNode(ctx context.Context, st Store, node string) ([]string, []s
 	}
 
 	poolRefs := make([]string, 0, len(pools))
+
 	for i := range pools {
+		// The default diskless pool is created on every node create, so
+		// counting it makes the refusal fire on a freshly registered idle
+		// node — and it names a pool the operator cannot remove, so the
+		// node becomes undeletable. The REST refusal has always skipped
+		// it; the shared implementation has to as well.
+		if pools[i].StoragePoolName == apiv1.DfltDisklessStorPoolName {
+			continue
+		}
+
 		poolRefs = append(poolRefs, pools[i].StoragePoolName)
 	}
 
