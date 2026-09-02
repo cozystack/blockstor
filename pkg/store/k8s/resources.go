@@ -72,6 +72,36 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 	return out, nil
 }
 
+// ListByNode asks the API server for the node's replicas instead of pulling
+// the whole cluster back and filtering here.
+//
+// The selector is server-side, on the spec.nodeName selectable field the CRD
+// declares. That is deliberately not the label the objects usually carry: a
+// replica applied by hand has no label, and a selector over it would return a
+// partial-but-correct subset — the Bug 038 shape, where the missing replicas
+// were invisible rather than an error.
+//
+// A cluster whose CRD predates the selectable field REJECTS the list rather
+// than answering it partially, which is why falling back is safe: the failure
+// is loud, and the fallback is the exhaustive read this replaced.
+func (s *resources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
+	var crdList crdv1alpha1.ResourceList
+
+	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{"spec.nodeName": node})
+	if err != nil {
+		return s.listByNodeExhaustively(ctx, node)
+	}
+
+	out := make([]apiv1.Resource, 0, len(crdList.Items))
+	for i := range crdList.Items {
+		out = append(out, crdToWireResource(&crdList.Items[i]))
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
+
+	return out, nil
+}
+
 func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
 	// Scan-and-filter on the authoritative Spec.ResourceDefinitionName.
 	//
@@ -996,4 +1026,29 @@ func wireToCRDResourceSpec(in *apiv1.Resource) crdv1alpha1.ResourceSpec {
 		// reconciler watches it and unwinds a partial conversion.
 		ToggleDiskCancel: in.ToggleDiskCancel,
 	}
+}
+
+// listByNodeExhaustively is the pre-selectable-field read, kept for clusters
+// whose CRD does not carry the field yet.
+func (s *resources) listByNodeExhaustively(ctx context.Context, node string) ([]apiv1.Resource, error) {
+	var crdList crdv1alpha1.ResourceList
+
+	err := s.c.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list Resource CRDs for node %q", node)
+	}
+
+	out := make([]apiv1.Resource, 0, len(crdList.Items))
+
+	for i := range crdList.Items {
+		if crdList.Items[i].Spec.NodeName != node {
+			continue
+		}
+
+		out = append(out, crdToWireResource(&crdList.Items[i]))
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
+
+	return out, nil
 }

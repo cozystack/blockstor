@@ -169,9 +169,24 @@ type ResourceDefinitionStore interface {
 // composite key is (resource_definition_name, node_name).
 // Update/Patch follow the annotation contract documented on
 // ResourceGroupStore (nil = untouched, empty = clear).
+// Eleven methods rather than ten because the node-scoped listing earns its
+// place: without it every `node delete` answers a question about one node by
+// listing every Resource in the cluster.
+//
+//nolint:interfacebloat // one read shape per question the callers actually ask
 type ResourceStore interface {
 	List(ctx context.Context) ([]apiv1.Resource, error)
 	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error)
+
+	// ListByNode returns the replicas hosted on one node.
+	//
+	// The node-scoped question is asked on every `node delete`, on the
+	// refusal path as well as under --force, and answering it by listing
+	// every Resource in the cluster and filtering client-side is what the
+	// REST refusal did before it. On the Kubernetes store the filtering can
+	// happen server-side, because the CRD declares spec.nodeName as a
+	// selectable field.
+	ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error)
 	Get(ctx context.Context, rdName, node string) (apiv1.Resource, error)
 	Create(ctx context.Context, r *apiv1.Resource) error
 	Update(ctx context.Context, r *apiv1.Resource) error
@@ -248,6 +263,21 @@ type ResourceStore interface {
 // surface; the implementation stitches it onto the RD CRD.
 type VolumeDefinitionStore interface {
 	List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error)
+
+	// ListAll returns every definition's volumes in ONE request, keyed by
+	// resource-definition name.
+	//
+	// List answers for one definition, and a caller that needs the whole
+	// cluster's volumes has to call it once per name. On the Kubernetes
+	// store each of those is a GET of one ResourceDefinition — and the CLI
+	// client is deliberately uncached, so they are real sequential round
+	// trips. `resource list` did exactly that to fill its
+	// sync-percentage column: one LIST plus one GET per definition, which
+	// is the command an operator runs during an incident.
+	//
+	// The volumes live inline on the definition, so a single list already
+	// carries them.
+	ListAll(ctx context.Context) (map[string][]apiv1.VolumeDefinition, error)
 	Get(ctx context.Context, rdName string, volumeNumber int32) (apiv1.VolumeDefinition, error)
 	Create(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
 
