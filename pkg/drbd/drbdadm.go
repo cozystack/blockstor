@@ -231,11 +231,120 @@ func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
 		return true, nil
 	}
 
-	// `No valid meta data found` / drbdmeta "missing image" / etc.
-	// all bubble up as non-zero exit. Treat as "not yet
-	// initialised" — the caller's create-md will either succeed
-	// (truly missing) or surface a more specific failure.
-	return false, nil
+	// This probe guards `create-md --force`: on hasMD=false the caller
+	// re-initialises the volume, destroying the GI tuple and dirty
+	// bitmap of whatever is on it. So it reports "no metadata" only
+	// for the exits that say so positively, and surfaces everything
+	// else.
+	//
+	// The inverse — every non-zero exit means "absent" — routes a
+	// data-bearing volume into a forced re-init whenever dump-md fails
+	// for a reason that has nothing to do with the disk: OOM-killed
+	// under memory pressure, a drbdmeta lock held by a concurrent
+	// call, a transient EIO on the lower device. Those are worse than
+	// the unparseable config this started from, because nothing
+	// downstream trips over the same failure a moment later: the
+	// pressure passes, create-md --force succeeds, and a healthy
+	// replica is wiped.
+	//
+	// The cost of the strict direction is a volume stalling whenever
+	// drbdmeta words "nothing usable here" in a way this function does
+	// not know: an error an operator can see and act on, which is the
+	// trade a safety probe should make. That cost is not theoretical —
+	// the unclean-activity-log vocabulary below was found exactly this
+	// way, by every snapshot-derived volume in the e2e suite stalling
+	// at once. Widening the vocabulary is the fix; widening it to
+	// "any non-zero exit" is not.
+	if metadataAbsent(errStr, string(out)) {
+		return false, nil
+	}
+
+	// Metadata IS there, it just cannot be read until the activity log
+	// is applied. Reporting that as "absent" would send the caller to
+	// create-md --force over a superblock that belongs to real data;
+	// reporting it as an unrecognised failure would hide which state
+	// this is. Name it, and let the caller — the only place that knows
+	// whether it is initialising a fresh lower disk or recovering an
+	// established replica — decide.
+	if metadataUnclean(errStr, string(out)) {
+		return false, errors.Wrapf(ErrMetadataUnclean, "dump-md %s", resource)
+	}
+
+	return false, errors.Wrapf(err,
+		"dump-md %s: probe failed for an unrecognised reason, refusing to "+
+			"report metadata as absent", resource)
+}
+
+// metadataAbsentMarkers are the drbdmeta / drbdadm messages that state
+// positively that a volume carries no DRBD metadata at all. Anything
+// outside these two vocabularies is an inconclusive probe, not an
+// answer.
+//
+//nolint:gochecknoglobals // a fixed vocabulary, matched in one place
+var metadataAbsentMarkers = []string{
+	"no valid meta data",
+	// drbd-utils has spelled the noun both ways over time, and the
+	// message is matched case-insensitively below, so this covers
+	// "No valid meta-data found" as well as the current wording. The
+	// coupling is worth naming: because the probe fails closed, a
+	// future reword this list does not know reclassifies a genuinely
+	// fresh volume as an unrecognised failure and stalls every new
+	// replica on every node at once, rather than the one volume. That
+	// is loud and operator-visible rather than silent, which is the
+	// right way round for a probe that guards `create-md --force` —
+	// but it is a version coupling, and the fix for a future reword is
+	// to add the wording here.
+	"no valid meta-data",
+}
+
+// ErrMetadataUnclean reports a superblock that is present but cannot be
+// read until its activity log is applied.
+//
+// A dirty activity log is not a clone-only shape. It is the normal
+// state of ANY replica whose activity log was open when the copy was
+// taken or the machine went down: a ZFS snapshot of a live volume
+// captures it exactly as an unclean crash of a writing Primary leaves
+// it, and drbdmeta cannot tell those apart — the signal is identical.
+//
+// So this cannot be answered here. Re-initialising is right for the
+// destination of a clone, a ship or a restore, which needs metadata of
+// its own; it destroys the GI and dirty bitmap of a replica that just
+// crashed with real data on it. Only the caller knows which one it is
+// looking at, so the probe names the state and refuses to guess.
+var ErrMetadataUnclean = errors.New("metadata is present but its activity log needs applying")
+
+// metadataUncleanMarkers are the exits that positively state that.
+//
+//nolint:gochecknoglobals // a fixed vocabulary, matched in one place
+var metadataUncleanMarkers = []string{
+	"please apply-al",
+}
+
+// metadataAbsent reports whether the failed probe positively said the
+// volume carries no metadata at all.
+func metadataAbsent(errStr, out string) bool {
+	return matchesAny(errStr, out, metadataAbsentMarkers)
+}
+
+// metadataUnclean reports whether the failed probe positively said the
+// volume carries metadata whose activity log needs applying first.
+func metadataUnclean(errStr, out string) bool {
+	return matchesAny(errStr, out, metadataUncleanMarkers)
+}
+
+// matchesAny compares case-insensitively: drbdmeta capitalises the
+// sentence, drbdadm quotes it mid-line, and a probe that guards data
+// must not turn a capital letter into "unrecognised failure".
+func matchesAny(errStr, out string, markers []string) bool {
+	haystack := strings.ToLower(errStr + "\n" + out)
+
+	for _, marker := range markers {
+		if strings.Contains(haystack, strings.ToLower(marker)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Primary flips the resource to Primary role so it can be opened

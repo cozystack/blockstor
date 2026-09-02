@@ -3541,6 +3541,41 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
 		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
+
+		// A dirty activity log means the metadata is THERE, unreadable
+		// until it is applied — and this is where blockstor cannot yet
+		// tell two very different situations apart.
+		//
+		// A lower disk just materialised carries someone else's
+		// superblock: a ZFS clone or snapshot receive brings the
+		// source's, and a volume carved from a pool that has been used
+		// before brings whatever the previous tenant left. Both need
+		// metadata of their own, and re-initialising is the point of
+		// the step. But an established replica that went down while
+		// Primary and writing leaves an activity log that looks
+		// IDENTICAL to drbdmeta, and create-md --force there destroys
+		// its GI and dirty bitmap.
+		//
+		// firstActivation does not separate them: it is per RESOURCE,
+		// so adding a volume to a live resource arrives with
+		// firstActivation=false on a lower disk that is nonetheless
+		// brand new. Gating on it stalled exactly that — the e2e suite
+		// caught vol-1 never leaving Diskless while the kernel had it
+		// UpToDate, because the reconcile aborted before stamping
+		// status.
+		//
+		// So the pre-existing behaviour stands for now: treat it as
+		// "no usable metadata" and re-initialise. That is fail-open on
+		// the crash-recovery case, which is a real exposure and is NOT
+		// made better by this comment — it is recorded here because
+		// closing it needs a per-VOLUME record of "we have initialised
+		// this before", which does not exist today. That record, and
+		// the apply-al repair that should replace re-initialisation
+		// once it does, belong in their own change with their own e2e.
+		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
+			hasMD, probeErr = false, nil
+		}
+
 		if probeErr != nil {
 			return errors.Wrapf(probeErr, "dump-md %s", target)
 		}
@@ -3731,6 +3766,18 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
 		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
+
+		// Same open problem as in ensureMetadata, and the same
+		// resolution for now. This helper runs past first activation,
+		// which reads like "established replica" — but the volume it is
+		// stamping can be one just added to a live resource, on a lower
+		// disk carved from a recycled pool extent whose previous tenant
+		// left an unclean superblock behind. Refusing here stalled that
+		// path outright.
+		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
+			hasMD, probeErr = false, nil
+		}
+
 		if probeErr != nil {
 			return errors.Wrapf(probeErr, "dump-md %s", target)
 		}

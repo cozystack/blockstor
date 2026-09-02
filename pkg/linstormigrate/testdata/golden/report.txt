@@ -5,6 +5,7 @@ warning: resource definition pvc-vol3: LUKS passphrase NOT migrated (encrypted w
 warning: resource definition pvc-vol4: marked DELETE in the source cluster — skipped
 warning: resource definition pvc-vol5: no DRBD port in the dump or live map — blockstor will allocate a fresh port; the adopted mesh will reconnect on the new port. Capture live ports (see runbook) to avoid the blip.
 warning: resource definition pvc-vol6: resource group "SC-GHOST" was not migrated — reference cleared
+warning: resource definition pvc-vol7: every replica spans multiple storage pools and is skipped, so the definition arrives with no replicas at all — Initialized stays latched because the data exists, but resolve the divergence or replicas placed later sit Inconsistent
 warning: resource pvc-vol1.node-b: unhandled flags bits 128 dropped (of 128)
 warning: resource pvc-vol2.node-a volume 0: non-zero vlm_flags 64 (not decoded; blockstor has no per-volume flag field) — volume adopted as-is
 warning: resource pvc-vol3.node-a volume 0: non-zero vlm_flags 64 (not decoded; blockstor has no per-volume flag field) — volume adopted as-is

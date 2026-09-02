@@ -1185,3 +1185,137 @@ func TestHasMDReturnsFalseOnNoMetaData(t *testing.T) {
 		t.Errorf("HasMD on missing metadata: got true, want false")
 	}
 }
+
+// TestHasMDToleratesAbsentWordings: the strict direction fails closed,
+// so a wording this list does not know stalls every new replica on
+// every node rather than one volume. Casing and the hyphenated spelling
+// of the noun are the variations drbd-utils has actually shipped, so
+// pin that they all still read as "absent".
+func TestHasMDToleratesAbsentWordings(t *testing.T) {
+	for _, wording := range errHasMDAbsentWordings {
+		fx := storage.NewFakeExec()
+		fx.Expect("drbdadm dump-md pvc-fresh/0",
+			storage.FakeResponse{Err: wording})
+
+		has, err := drbd.NewAdm(fx).HasMD(t.Context(), "pvc-fresh/0")
+		if err != nil {
+			t.Errorf("%v: HasMD returned an error instead of reading it as absent: %v", wording, err)
+
+			continue
+		}
+
+		if has {
+			t.Errorf("%v: HasMD = true, want false", wording)
+		}
+	}
+}
+
+// The "no metadata" spellings drbd-utils has shipped, verbatim. Named
+// individually so each is a static sentinel, matching how the other
+// wire shapes in this file are written.
+var (
+	errHasMDAbsentTitleCase = errors.New("drbdadm: No valid meta data found")
+	errHasMDAbsentLowerCase = errors.New("drbdadm: no valid meta data found")
+	errHasMDAbsentHyphen    = errors.New("drbdadm: No valid meta-data found")
+	//nolint:staticcheck // verbatim drbdmeta wire shape; the capital is load-bearing
+	errHasMDAbsentShouted = errors.New(
+		"Command 'drbdmeta 0 v09 /dev/loop5 internal dump-md' failed: NO VALID META DATA")
+)
+
+//nolint:gochecknoglobals // verbatim wire shapes, matched in one test
+var errHasMDAbsentWordings = []error{
+	errHasMDAbsentTitleCase,
+	errHasMDAbsentLowerCase,
+	errHasMDAbsentHyphen,
+	errHasMDAbsentShouted,
+}
+
+// errHasMDDumpMdUnclean mirrors the verbatim exit drbdadm returns for a
+// volume whose activity log was never closed. Captured from an e2e run:
+// every lower disk materialised from a ZFS snapshot, clone or send/recv
+// arrives in this state, because the snapshot caught the source's AL
+// mid-flight.
+var errHasMDDumpMdUnclean = errors.New(
+	`drbdadm dump-md ship-restored/0: Found meta data is "unclean", ` +
+		`please apply-al first: exit status 1`)
+
+// TestHasMDNamesAnUncleanActivityLog: a superblock that cannot be read
+// until the activity log is applied is neither "absent" nor an
+// unrecognised failure, and the probe must not collapse it into either.
+//
+// Calling it absent sends the caller to create-md --force over real
+// data: a dirty activity log is what an unclean crash of a writing
+// Primary leaves behind, and drbdmeta cannot tell that from the ZFS
+// snapshot of a live volume that a clone starts from. Calling it an
+// unrecognised failure strands the clone, ship and restore paths, which
+// legitimately need to re-initialise. So it gets its own answer and the
+// caller decides.
+func TestHasMDNamesAnUncleanActivityLog(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md ship-restored/0",
+		storage.FakeResponse{Err: errHasMDDumpMdUnclean})
+
+	has, err := drbd.NewAdm(fx).HasMD(t.Context(), "ship-restored/0")
+
+	if !errors.Is(err, drbd.ErrMetadataUnclean) {
+		t.Fatalf("HasMD on an unclean activity log = %v, want ErrMetadataUnclean", err)
+	}
+
+	if has {
+		t.Errorf("HasMD reported metadata usable alongside the unclean signal")
+	}
+}
+
+// errHasMDDumpMdParseError mirrors drbdadm refusing to read a resource
+// whose .res file does not parse. The probe never reaches the disk, so
+// it cannot know whether metadata is there.
+var errHasMDDumpMdParseError = errors.New(
+	"drbdadm dump-md pvc-live/0: drbd.d/pvc-live.res:4: " +
+		"Parse error: ';' expected, but got 'k6fjase' (TK 281): exit status 10")
+
+// TestHasMDFailsClosedOnUnparseableConfig: a config-level failure must
+// surface as an error, never as "no metadata". The caller's next move on
+// a false negative is `create-md --force`, which destroys the metadata of
+// a volume that is full of data — so this probe has to fail closed.
+func TestHasMDFailsClosedOnUnparseableConfig(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md pvc-live/0",
+		storage.FakeResponse{Err: errHasMDDumpMdParseError})
+
+	has, err := drbd.NewAdm(fx).HasMD(t.Context(), "pvc-live/0")
+	if err == nil {
+		t.Fatal("HasMD on unparseable config: want error, got nil")
+	}
+
+	if has {
+		t.Errorf("HasMD on unparseable config: got true, want false")
+	}
+}
+
+// errHasMDDumpMdKilled mirrors dump-md dying for a reason that has
+// nothing to do with the disk — OOM-killed under memory pressure here.
+var errHasMDDumpMdKilled = errors.New("drbdadm dump-md pvc-live/0: signal: killed")
+
+// TestHasMDFailsClosedOnUnrecognisedFailure: the probe guards
+// `create-md --force`, so it may answer "no metadata" only for the exits
+// that positively say so. Every other failure has to surface.
+//
+// Treating them all as "absent" is worse than the unparseable-config
+// case that first exposed this: nothing downstream trips over an
+// OOM-kill or a held drbdmeta lock a moment later, so create-md --force
+// goes on to succeed and wipes the GI tuple and dirty bitmap of a
+// healthy replica.
+func TestHasMDFailsClosedOnUnrecognisedFailure(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md pvc-live/0",
+		storage.FakeResponse{Err: errHasMDDumpMdKilled})
+
+	has, err := drbd.NewAdm(fx).HasMD(t.Context(), "pvc-live/0")
+	if err == nil {
+		t.Fatal("HasMD on an unrecognised failure: want error, got nil")
+	}
+
+	if has {
+		t.Errorf("HasMD on an unrecognised failure: got true, want false")
+	}
+}

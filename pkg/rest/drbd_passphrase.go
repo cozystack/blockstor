@@ -22,7 +22,12 @@ import (
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 )
+
+// sharedSecretOptionName names the drbd net option the passphrase becomes,
+// so the refusal reports the option the operator would see in drbd.conf.
+const sharedSecretOptionName = "shared-secret"
 
 // drbdPassphraseRequest carries the per-RD DRBD shared secret.
 type drbdPassphraseRequest struct {
@@ -51,6 +56,18 @@ func (s *Server) handleDRBDPassphraseSet(w http.ResponseWriter, r *http.Request)
 
 	if req.Passphrase == "" {
 		writeError(w, http.StatusBadRequest, "passphrase is required")
+
+		return
+	}
+
+	// The secret is rendered into drbd.conf as a quoted string, and that
+	// grammar has no escapes: a passphrase carrying a quote or a newline
+	// cannot be written at all. Refusing here keeps it from being stored,
+	// because the alternative is a 200 followed by a resource that will
+	// not configure on the node with nothing pointing back at this call.
+	invalid := drbd.ValidateOptionValue(drbd.SectionNet, sharedSecretOptionName, req.Passphrase)
+	if invalid != nil {
+		writeError(w, http.StatusBadRequest, invalid.Error())
 
 		return
 	}

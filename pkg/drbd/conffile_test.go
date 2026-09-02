@@ -19,6 +19,7 @@ limitations under the License.
 package drbd_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -515,6 +516,311 @@ func TestBuildDeterministic(t *testing.T) {
 
 		if again != first {
 			t.Errorf("non-deterministic output:\nfirst:\n%s\nlater:\n%s", first, again)
+		}
+	}
+}
+
+// TestBuildQuotesSharedSecretFromNetOptions: a shared secret arriving as
+// the plain `DrbdOptions/Net/shared-secret` property must be quoted just
+// like the typed SharedSecret field. That property is the only form
+// LINSTOR knows, so it is what linstor-migrate carries over, and it is
+// also what our own drbd-passphrase endpoint writes. LINSTOR generates
+// base64 secrets, so the value routinely contains '+', '/' or '=', and
+// drbdadm's parser rejects those unquoted:
+//
+//	drbd.d/pvc-1.res:4: Parse error: ';' expected, but got 'k6fjase…'
+func TestBuildQuotesSharedSecretFromNetOptions(t *testing.T) {
+	const secret = "+k6fjaseNGqNIwXdQslm"
+
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Net:  drbd.Net{Options: map[string]string{"shared-secret": secret}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if want := `shared-secret "` + secret + `";`; !strings.Contains(got, want) {
+		t.Errorf("shared-secret not quoted, want %s; got:\n%s", want, got)
+	}
+}
+
+// TestBuildEmitsSharedSecretOnce: a resource carrying the secret both as
+// the typed field and as the property must still emit exactly one
+// shared-secret line — drbdadm rejects a duplicated key outright.
+func TestBuildEmitsSharedSecretOnce(t *testing.T) {
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Net: drbd.Net{
+			SharedSecret: "typed",
+			Options:      map[string]string{"shared-secret": "from-prop"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if n := strings.Count(got, "shared-secret"); n != 1 {
+		t.Errorf("want exactly 1 shared-secret line, got %d:\n%s", n, got)
+	}
+}
+
+// A handler is a command line, and configuring fencing with one that takes an
+// argument is the ordinary case. Emitted verbatim it does not fail loudly:
+// drbdadm reads the first token and treats the rest as syntax, so the parse
+// error surfaces in a file the operator never edited, at the moment DRBD
+// needs to fence.
+//
+// A value that survives as a bare token is left alone, so this changes
+// nothing about configs that already worked.
+func TestHandlerWithArgumentsIsQuoted(t *testing.T) {
+	res := drbd.Resource{
+		Name: "pvc-quote",
+		Handlers: map[string]string{
+			"fence-peer":   "/usr/lib/drbd/crm-fence-peer.9.sh --timeout 60",
+			"after-resync": "/usr/lib/drbd/plain.sh",
+		},
+		Hosts: []drbd.Host{{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0}},
+	}
+
+	out, err := drbd.Build(res)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `fence-peer "/usr/lib/drbd/crm-fence-peer.9.sh --timeout 60";`) {
+		t.Errorf("a handler with arguments was not quoted:\n%s", out)
+	}
+
+	if !strings.Contains(out, "after-resync /usr/lib/drbd/plain.sh;") {
+		t.Errorf("a bare handler path was quoted where it did not need to be:\n%s", out)
+	}
+}
+
+// The shared-secret key is compared case-insensitively so a differently
+// cased spelling cannot slip past the quoting and reach drbdadm bare. Every
+// producer writes the canonical lowercase today, so this pins a guard against
+// a future one rather than a live bug — and without it, replacing EqualFold
+// with == keeps the package green.
+func TestSharedSecretKeyIsMatchedCaseInsensitively(t *testing.T) {
+	res := drbd.Resource{
+		Name: "pvc-secret",
+		Net: drbd.Net{
+			Options: map[string]string{"Shared-Secret": "aGVsbG8rL3dvcmxkPQ=="},
+		},
+		Hosts: []drbd.Host{{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0}},
+	}
+
+	out, err := drbd.Build(res)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `"aGVsbG8rL3dvcmxkPQ=="`) {
+		t.Errorf("a differently cased shared-secret key reached drbdadm unquoted:\n%s", out)
+	}
+}
+
+// An empty value has no bare spelling: `key ;` is not valid syntax, so the
+// quoting branch has to cover it. Without it the rendered file fails to
+// parse, and it fails on the node rather than here.
+func TestEmptyOptionValueIsQuoted(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name:    "r0",
+		Options: map[string]string{"on-no-data-accessible": ""},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `on-no-data-accessible "";`) {
+		t.Errorf("an empty value was emitted bare, which drbdadm cannot parse:\n%s", out)
+	}
+}
+
+// '#' opens a comment. Emitted bare, everything after it on the line —
+// including the terminating semicolon — is swallowed, so the block runs on
+// into whatever follows.
+func TestValueCarryingAHashIsQuoted(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name: "r0",
+		// No whitespace, so '#' is the only thing that makes this
+		// unquotable — quoting it for any other reason would not
+		// exercise the class at all.
+		Handlers: map[string]string{"fence-peer": "/usr/bin/fence-peer#1.sh"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `fence-peer "/usr/bin/fence-peer#1.sh";`) {
+		t.Errorf("a value carrying '#' was emitted bare, so the rest of the line is a comment:\n%s", out)
+	}
+}
+
+// drbdadm's scanner accepts a backslash followed by any non-newline byte
+// inside a quoted string and runs unescape() over the token, so a backslash
+// has to be escaped on the way out. Verified against drbdadm 9.22.0: emitted
+// literally, `--path a\b` comes back from `drbdadm dump` as `--path ab`.
+func TestQuotedValueEscapesABackslash(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name:     "r0",
+		Handlers: map[string]string{"fence-peer": `/usr/bin/fence --path a\b`},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `fence-peer "/usr/bin/fence --path a\\b";`) {
+		t.Errorf("the backslash was not escaped, so unescape() eats it:\n%s", out)
+	}
+}
+
+// A value ending in a backslash is the sharp end of the same rule: unescaped,
+// it escapes the closing quote and the whole .res becomes a parse error
+// rather than one bad option.
+func TestQuotedValueEndingInABackslashDoesNotEatTheClosingQuote(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name:     "r0",
+		Handlers: map[string]string{"fence-peer": `/bin/fence --dir a\`},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(out, `fence-peer "/bin/fence --dir a\\";`) {
+		t.Errorf("the trailing backslash escaped the closing quote:\n%s", out)
+	}
+}
+
+// A quote HAS a spelling — drbd-utils' own esc() writes it as \" and drbdadm
+// reads it back. An earlier revision refused the value outright, which turned
+// away input drbdadm handles and broke every reconcile on a cluster already
+// carrying one.
+func TestQuotedValueEscapesAQuoteRatherThanRefusingIt(t *testing.T) {
+	out, err := drbd.Build(drbd.Resource{
+		Name:     "r0",
+		Handlers: map[string]string{"fence-peer": `/bin/fence --tag "x"`},
+	})
+	if err != nil {
+		t.Fatalf("a value carrying a quote was refused, but drbdadm round-trips it: %v", err)
+	}
+
+	if !strings.Contains(out, `fence-peer "/bin/fence --tag \"x\"";`) {
+		t.Errorf("the quote was not escaped:\n%s", out)
+	}
+}
+
+// What genuinely has no spelling: a newline ends the string in the scanner's
+// own grammar, a carriage return lands inside the value on the node, and NUL
+// truncates it in the C lexer.
+func TestBuildRefusesAValueWithNoSpelling(t *testing.T) {
+	for name, r := range map[string]drbd.Resource{
+		"newline":         {Name: "r0", Options: map[string]string{"on-no-data-accessible": "a\nb"}},
+		"carriage return": {Name: "r0", Handlers: map[string]string{"fence-peer": "/bin/f\ra"}},
+		"nul":             {Name: "r0", Net: drbd.Net{SharedSecret: "se\x00cret"}},
+	} {
+		out, err := drbd.Build(r)
+		if err == nil {
+			t.Errorf("%s: a value with no drbd.conf spelling was rendered anyway:\n%s", name, out)
+
+			continue
+		}
+
+		if !errors.Is(err, drbd.ErrUnrepresentableValue) {
+			t.Errorf("%s: unexpected error: %v", name, err)
+		}
+	}
+}
+
+// The secret goes out through writeNet's own emitters rather than
+// writeOption, so it needs its own pin: it is quoted by name, and its
+// contents are escaped by the same rule.
+func TestSharedSecretIsEscapedOnBothNetPaths(t *testing.T) {
+	typed, err := drbd.Build(drbd.Resource{
+		Name: "r0",
+		Net:  drbd.Net{SharedSecret: `s3cr3t\with\slash`},
+	})
+	if err != nil {
+		t.Fatalf("Build (typed field): %v", err)
+	}
+
+	if !strings.Contains(typed, `shared-secret "s3cr3t\\with\\slash";`) {
+		t.Errorf("the typed shared secret was not escaped, so the two ends of the "+
+			"mesh authenticate with different strings:\n%s", typed)
+	}
+
+	fromProps, err := drbd.Build(drbd.Resource{
+		Name: "r0",
+		Net:  drbd.Net{Options: map[string]string{"shared-secret": `s3cr3t\with\slash`}},
+	})
+	if err != nil {
+		t.Fatalf("Build (net option): %v", err)
+	}
+
+	if !strings.Contains(fromProps, `shared-secret "s3cr3t\\with\\slash";`) {
+		t.Errorf("the shared secret arriving as a net option was not escaped:\n%s", fromProps)
+	}
+}
+
+// drbdadm's bare-token rule is an allow-list — [a-zA-Z0-9/._-], up to 80
+// characters — not a deny-list of dangerous punctuation. An enumerated list
+// of characters to quote looked equivalent and let '+', '=', ',' and '%'
+// through, so a base64-ish handler value went out as
+// `fence-peer abcDEF+/=;` and drbdadm answered "Parse error: ';' expected",
+// which takes down the whole .res on that node at the next reconcile.
+//
+// The values here are the corpus that was fed to drbdadm 9.22.0: the first
+// group failed to parse when emitted bare, the second was read back
+// unquoted and must stay that way.
+func TestNeedsQuotingFollowsTheBareTokenRule(t *testing.T) {
+	quoted := map[string]string{
+		"base64 padding": "abcDEF+/=",
+		"comma":          "a,b",
+		"percent":        "50%",
+		"colon":          "10.0.0.1:7000",
+		"space":          "/usr/bin/fence --tag x",
+		"hash":           "/usr/bin/fence-peer#1.sh",
+		"over 80 chars":  strings.Repeat("a", 81),
+		"empty":          "",
+	}
+
+	for name, value := range quoted {
+		out, err := drbd.Build(drbd.Resource{
+			Name:     "r0",
+			Handlers: map[string]string{"fence-peer": value},
+		})
+		if err != nil {
+			t.Fatalf("%s: Build: %v", name, err)
+		}
+
+		if !strings.Contains(out, `fence-peer "`) {
+			t.Errorf("%s: %q was emitted bare, which drbdadm cannot parse:\n%s", name, value, out)
+		}
+	}
+
+	bare := map[string]string{
+		"keyword":     "detach",
+		"number":      "60",
+		"path":        "/usr/lib/drbd/crm-fence-peer.9.sh",
+		"algorithm":   "sha1",
+		"size suffix": "10240k",
+		"decimal":     "1.5",
+		"negative":    "-1",
+		"exactly 80":  strings.Repeat("a", 80),
+	}
+
+	for name, value := range bare {
+		out, err := drbd.Build(drbd.Resource{
+			Name:     "r0",
+			Handlers: map[string]string{"fence-peer": value},
+		})
+		if err != nil {
+			t.Fatalf("%s: Build: %v", name, err)
+		}
+
+		if !strings.Contains(out, "fence-peer "+value+";") {
+			t.Errorf("%s: %q gained quotes it does not need:\n%s", name, value, out)
 		}
 	}
 }
