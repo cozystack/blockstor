@@ -132,7 +132,9 @@ func TestResourceGroupsUpdate(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	base, stop := startServerWithStore(t, st)
+	// A LUKS layer needs the cluster master key, which this door now
+	// requires: the stack is inherited by every definition spawned here.
+	base, stop := startServerWithPassphrase(t, st)
 	defer stop()
 
 	body, _ := json.Marshal(apiv1.ResourceGroup{
@@ -1239,7 +1241,9 @@ func TestRGCreateWithLayerListDRBDLUKSStorage_W10(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	base, stop := startServerWithStore(t, st)
+	// A LUKS layer needs the cluster master key, which this door now
+	// requires: the stack is inherited by every definition spawned here.
+	base, stop := startServerWithPassphrase(t, st)
 	defer stop()
 
 	// Hand-rolled wire body — the `linstor rg c rg-1 --place-count 3

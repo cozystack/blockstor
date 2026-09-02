@@ -134,6 +134,10 @@ func TestRGCreateRejectsBadLayerStack(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// A LUKS stack needs the cluster master key, which the
+			// handler now requires on this door as well as on rd create
+			// — a group's stack is inherited by every definition
+			// spawned from it.
 			base, stop := startServerWithStore(t, store.NewInMemory())
 			defer stop()
 
@@ -178,7 +182,10 @@ func TestRGCreateAcceptsSupportedLayerStack(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			base, stop := startServerWithStore(t, store.NewInMemory())
+			// A LUKS stack needs the cluster master key, which this door now
+			// requires as well: a group's stack is inherited by every
+			// definition spawned from it.
+			base, stop := startServerWithPassphrase(t, store.NewInMemory())
 			defer stop()
 
 			body, _ := json.Marshal(apiv1.ResourceGroup{
@@ -241,4 +248,57 @@ func TestRDCreateRejectsBadLayerStack(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A group's layer stack is inherited by every definition spawned from it, so
+// a LUKS layer on a passphrase-less cluster brings up plaintext replicas by
+// the group-full. rd create has refused this since Bug 95; the group door
+// accepted it, and patching the stack afterwards was open too.
+func TestRGLUKSRequiresThePassphraseOnBothDoors(t *testing.T) {
+	stack := []string{"DRBD", "LUKS", "STORAGE"}
+
+	t.Run("create", func(t *testing.T) {
+		base, stop := startServerWithStore(t, store.NewInMemory())
+		defer stop()
+
+		body, _ := json.Marshal(apiv1.ResourceGroup{
+			Name:         "rg-luks-create",
+			SelectFilter: apiv1.AutoSelectFilter{LayerStack: stack},
+		})
+
+		resp := httpPost(t, base+"/v1/resource-groups", body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400 — the cluster has no master key", resp.StatusCode)
+		}
+	})
+
+	t.Run("modify", func(t *testing.T) {
+		st := store.NewInMemory()
+
+		base, stop := startServerWithStore(t, st)
+		defer stop()
+
+		create, _ := json.Marshal(apiv1.ResourceGroup{Name: "rg-luks-patch"})
+
+		resp := httpPost(t, base+"/v1/resource-groups", create)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("seed the group: got %d, want 201", resp.StatusCode)
+		}
+
+		patch, _ := json.Marshal(apiv1.ResourceGroup{
+			SelectFilter: apiv1.AutoSelectFilter{LayerStack: stack},
+		})
+
+		put := httpPut(t, base+"/v1/resource-groups/rg-luks-patch", patch)
+		_ = put.Body.Close()
+
+		if put.StatusCode != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400 — guarding create alone leaves the "+
+				"stack patchable afterwards", put.StatusCode)
+		}
+	})
 }

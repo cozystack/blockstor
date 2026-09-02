@@ -303,9 +303,14 @@ func checkLUKSPrerequisite(ctx context.Context, run *runContext, layers []string
 		return nil //nolint:nilerr // no cluster access: nothing to judge against
 	}
 
+	// A read FAILURE is not an absent passphrase. Returning nil here would
+	// let an apiserver blip write a LUKS stack onto a cluster that may have
+	// no key, which is the one direction this guard must not take — REST
+	// answers 400 at the same point.
 	current, err := passphrase.Read(ctx, client, namespace)
 	if err != nil {
-		return nil //nolint:nilerr // cannot read the Secret: see above
+		return fmt.Errorf("read the encryption Secret to check the %s prerequisite: %w",
+			apiv1.LayerKindLUKS, err)
 	}
 
 	if current != "" {
@@ -319,7 +324,8 @@ func checkLUKSPrerequisite(ctx context.Context, run *runContext, layers []string
 	// REST door on the same cluster creates without complaint.
 	props, err := run.Store.ControllerProps().Get(ctx)
 	if err != nil {
-		return nil //nolint:nilerr // cannot read the props: see above
+		return fmt.Errorf("read controller properties to check the %s prerequisite: %w",
+			apiv1.LayerKindLUKS, err)
 	}
 
 	if props[passphrase.PropKeyCanonical] != "" {

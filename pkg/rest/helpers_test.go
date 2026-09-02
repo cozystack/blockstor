@@ -19,14 +19,18 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // testRESTNamespace is the namespace REST-test helpers pin the
@@ -55,4 +59,33 @@ func newFakeRESTClient(t *testing.T) client.Client {
 	}
 
 	return fake.NewClientBuilder().WithScheme(scheme).Build()
+}
+
+// startServerWithPassphrase is startServerWithStore with the cluster master
+// key already set, which is the prerequisite for creating anything carrying a
+// LUKS layer. Without it the handlers answer 400 — correctly, since a LUKS
+// stack on a passphrase-less cluster brings the replicas up plaintext.
+func startServerWithPassphrase(t *testing.T, st store.Store) (string, func()) {
+	t.Helper()
+
+	client := newFakeRESTClient(t)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testRESTNamespace,
+			Name:      passphrase.DefaultSecretName,
+		},
+		Data: map[string][]byte{passphrase.SecretKey: []byte("test-cluster-key")},
+	}
+
+	if err := client.Create(context.Background(), secret); err != nil {
+		t.Fatalf("seed the passphrase Secret: %v", err)
+	}
+
+	return startServerCustom(t, &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    client,
+		Namespace: testRESTNamespace,
+	})
 }

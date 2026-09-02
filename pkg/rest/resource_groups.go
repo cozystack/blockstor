@@ -170,6 +170,18 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A group's stack is inherited by every definition spawned from it, so
+	// a LUKS layer here reaches more volumes than one on a single
+	// definition. handleRDCreate has refused this since Bug 95; leaving the
+	// group unguarded meant the same cluster still produced plaintext
+	// replicas, one level up.
+	luksErr := s.refuseLUKSWithoutPassphrase(r.Context(), rg.SelectFilter.LayerStack)
+	if luksErr != nil {
+		writeError(w, http.StatusBadRequest, luksErr.Error())
+
+		return
+	}
+
 	// Bug 367 / 361: refuse negative or absurdly-large place_count
 	// at the wire boundary. See validateRGSelectFilterPlaceCount —
 	// shared with handleRGUpdate so POST and PUT enforce the same
@@ -225,6 +237,17 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, gateErr.Error())
 
 		return
+	}
+
+	// Guarding create alone leaves the stack patchable afterwards, which is
+	// the same door by another name.
+	if patch.SelectFilter.LayerStack != nil {
+		luksErr := s.refuseLUKSWithoutPassphrase(r.Context(), patch.SelectFilter.LayerStack)
+		if luksErr != nil {
+			writeError(w, http.StatusBadRequest, luksErr.Error())
+
+			return
+		}
 	}
 
 	err := s.Store.ResourceGroups().PatchResourceGroup(r.Context(), name, func(existing *apiv1.ResourceGroup) error {
