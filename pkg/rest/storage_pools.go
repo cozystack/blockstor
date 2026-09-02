@@ -29,6 +29,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/validate"
 )
 
 // registerStoragePools wires endpoints serving golinstor's StoragePool calls.
@@ -787,14 +788,7 @@ const (
 // `gochecknoglobals` budget stays clean; the slice is tiny and the
 // validator is hit once per PUT.
 func immutableSPDriverProps() []string {
-	return []string{
-		propStorPoolName,
-		propLvmVG,
-		propThinPool,
-		propZPool,
-		propZPoolThin,
-		propFileDir,
-	}
+	return validate.ImmutableStoragePoolProps()
 }
 
 // refuseSPDriverPropMutation walks the GenericPropsModify patch and

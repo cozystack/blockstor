@@ -589,35 +589,8 @@ func buildNodeLostRefusalCorrection(hasRefs bool) string {
 // non-NotFound error short-circuits the cascade so the operator
 // sees an actionable signal before the Node row vanishes.
 func (s *Server) cascadeOrphansForLostNode(ctx context.Context, name string) error {
-	resources, err := s.Store.Resources().List(ctx)
-	if err != nil {
-		return err //nolint:wrapcheck // surfaced via writeStoreError
-	}
-
-	for i := range resources {
-		if resources[i].NodeName != name {
-			continue
-		}
-
-		err = s.Store.Resources().Delete(ctx, resources[i].Name, name)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return err //nolint:wrapcheck // surfaced via writeStoreError
-		}
-	}
-
-	pools, err := s.Store.StoragePools().ListByNode(ctx, name)
-	if err != nil {
-		return err //nolint:wrapcheck // surfaced via writeStoreError
-	}
-
-	for i := range pools {
-		err = s.Store.StoragePools().Delete(ctx, name, pools[i].StoragePoolName)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return err //nolint:wrapcheck // surfaced via writeStoreError
-		}
-	}
-
-	return nil
+	//nolint:wrapcheck // surfaced via writeStoreError
+	return store.CascadeOrphansForLostNode(ctx, s.Store, name)
 }
 
 // updateNodeFlags applies each mutator to the Node's flag list and

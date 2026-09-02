@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -169,6 +170,49 @@ func (s *physicalDevices) Update(ctx context.Context, dev *apiv1.PhysicalDevice)
 	}
 
 	return nil
+}
+
+// PatchPhysicalDeviceSpec fetches, mutates and persists under
+// retry-on-conflict, so an edit lands on top of concurrent writes
+// instead of replacing them.
+func (s *physicalDevices) PatchPhysicalDeviceSpec(
+	ctx context.Context, name string, mutate func(*apiv1.PhysicalDevice) error,
+) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
+		var existing crdv1alpha1.PhysicalDevice
+
+		err := s.c.Get(ctx, types.NamespacedName{Name: name}, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "physical device %q", name)
+			}
+
+			return errors.Wrapf(err, "get PhysicalDevice %q", name)
+		}
+
+		wire := crdToWirePhysicalDevice(&existing)
+
+		err = mutate(&wire)
+		if err != nil {
+			return err
+		}
+
+		existing.Spec = wireToCRDPhysicalDeviceSpec(&wire)
+
+		if existing.Labels == nil {
+			existing.Labels = map[string]string{}
+		}
+
+		if wire.NodeName != "" {
+			existing.Labels[crdv1alpha1.PhysicalDeviceLabelNode] = wire.NodeName
+		}
+
+		return s.c.Update(ctx, &existing)
+	}), "patch PhysicalDevice %q", name)
 }
 
 func (s *physicalDevices) Delete(ctx context.Context, name string) error {

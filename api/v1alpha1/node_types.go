@@ -162,6 +162,10 @@ const (
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
+// +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
+// +kubebuilder:printcolumn:name="Address",type=string,JSONPath=`.spec.netInterfaces[0].address`
+// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.connectionStatus`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // Node is the Schema for the nodes API
 type Node struct {

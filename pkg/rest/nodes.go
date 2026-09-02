@@ -889,13 +889,9 @@ func (s *Server) resolveDefaultAddress(ctx context.Context, n *apiv1.Node) (stri
 	return addrs[0], nil
 }
 
-// DfltDisklessStorPoolName matches upstream LINSTOR's canonical
-// per-satellite diskless storage pool name. The autoplacer's
-// `disklessOnRemaining` path defaults to this pool when the caller
-// doesn't pin a specific pool list, and `linstor sp l` shows one
-// row per registered node from this synthesised pool. CSI / piraeus
-// rely on the exact string.
-const DfltDisklessStorPoolName = "DfltDisklessStorPool"
+// DfltDisklessStorPoolName is apiv1's constant, kept under this name because
+// the handlers and their tests read it here.
+const DfltDisklessStorPoolName = apiv1.DfltDisklessStorPoolName
 
 func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
@@ -1249,54 +1245,11 @@ func (s *Server) refuseNodeDeleteIfEvicted(ctx context.Context, w http.ResponseW
 // pre-walk and the post-Delete re-walk byte-identical — drift
 // between the two would let a racing dependent through the gate.
 func (s *Server) referencesOnNode(ctx context.Context, name string) ([]string, []string, error) {
-	resourceRefs, err := s.resourcesOnNode(ctx, name)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	spRefs, err := s.storagePoolsOnNode(ctx, name)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return resourceRefs, spRefs, nil
-}
-
-// storagePoolsOnNode returns the sorted list of StoragePool names
-// hosted on the target node — the SP-side counterpart of
-// resourcesOnNode used by Bug 179. Sorted so the surfaced "cause"
-// line is stable across calls; the K8s backend's iteration order
-// is non-deterministic, and operators rerun `n d` to confirm the
-// refusal message.
-//
-// Bug 179: DfltDisklessStorPool — the per-satellite diskless pool
-// upstreamLINSTOR (and blockstor's handleNodeCreate) auto-provisions
-// at node-register time — is filtered out of the refusal list. It's
-// an internal artefact of the satellite registration, not an
-// operator-managed resource; surfacing it would make every `n d`
-// hit the refusal even on a freshly-created idle node and the
-// operator-facing fix would be "delete the auto-created pool first",
-// which makes no sense. The cascade still drops it (the live
-// satellite is going away with the node anyway).
-func (s *Server) storagePoolsOnNode(ctx context.Context, node string) ([]string, error) {
-	pools, err := s.Store.StoragePools().ListByNode(ctx, node)
-	if err != nil {
-		return nil, fmt.Errorf("list storage pools on node %q: %w", node, err)
-	}
-
-	var refs []string
-
-	for i := range pools {
-		if pools[i].StoragePoolName == DfltDisklessStorPoolName {
-			continue
-		}
-
-		refs = append(refs, pools[i].StoragePoolName)
-	}
-
-	sort.Strings(refs)
-
-	return refs, nil
+	// One implementation with the CLI, which refuses on the same question.
+	// Keeping a second copy here is how the default-diskless-pool carve-out
+	// came to exist on one door only.
+	//nolint:wrapcheck // surfaced via writeStoreError
+	return store.ReferencesOnNode(ctx, s.Store, name)
 }
 
 // buildNodeDeleteRefusal assembles the 409 envelope for the Bug 92

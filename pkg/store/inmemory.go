@@ -252,6 +252,30 @@ func (s *inMemoryControllerProps) Set(_ context.Context, props map[string]string
 	return nil
 }
 
+// PatchProps applies `mutate` to the live map under the write lock, so
+// the read the mutation is based on and the write it produces cannot be
+// separated by another writer.
+func (s *inMemoryControllerProps) PatchProps(_ context.Context, mutate func(map[string]string) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	next := make(map[string]string, len(s.props))
+	maps.Copy(next, s.props)
+
+	err := mutate(next)
+	if err != nil {
+		return errors.Wrap(err, "patch controller props")
+	}
+
+	s.props = next
+
+	return nil
+}
+
 type inMemoryNodes struct {
 	mu sync.RWMutex
 	m  map[string]apiv1.Node
@@ -394,16 +418,20 @@ func (s *inMemoryNodes) PatchProps(_ context.Context, name string, mutate func(m
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
 
-	if node.Props == nil {
-		node.Props = map[string]string{}
+	// The mutator gets a copy, not the stored map: a mutator that edits
+	// and then refuses must change nothing, and handing it the live map
+	// makes the refusal only apparent.
+	working := cloneForPatch(node)
+	if working.Props == nil {
+		working.Props = map[string]string{}
 	}
 
-	err := mutate(node.Props)
+	err := mutate(working.Props)
 	if err != nil {
 		return errors.Wrapf(err, "patch Props of node %q", name)
 	}
 
-	s.m[name] = node
+	s.m[name] = working
 
 	return nil
 }
@@ -425,12 +453,17 @@ func (s *inMemoryNodes) PatchNodeSpec(_ context.Context, name string, mutate fun
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
 
-	err := mutate(&node)
+	// A struct copy is shallow: the maps and slices in it still address
+	// the stored object, so a mutator that fails partway would leave its
+	// edits behind. Hand it a real copy instead.
+	working := cloneForPatch(node)
+
+	err := mutate(&working)
 	if err != nil {
 		return errors.Wrapf(err, "patch Node %q", name)
 	}
 
-	s.m[name] = node
+	s.m[name] = working
 
 	return nil
 }

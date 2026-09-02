@@ -35,7 +35,7 @@ import (
 )
 
 // VD-resize size-bounds regression (adversarial round 4, 2026-07-03).
-// The CREATE path gates size_kib into [4 MiB, 16 TiB] (Bug 155) so the
+// The CREATE path gates size_kib into [4 MiB, 1 PiB] (Bug 155) so the
 // satellite never hot-loops on `drbdadm create-md`. The RESIZE path
 // (`PUT .../volume-definitions/{vn}`, `linstor vd set-size`) did not,
 // so an out-of-range size could be persisted through the resize verb
@@ -45,8 +45,12 @@ import (
 
 // VD size bounds mirrored from pkg/rest/volume_definitions.go (Bug 155).
 const (
-	vdBoundsMinSizeKib int64 = 4 * 1024                // 4 MiB
-	vdBoundsMaxSizeKib int64 = 16 * 1024 * 1024 * 1024 // 16 TiB
+	vdBoundsMinSizeKib int64 = 4 * 1024 // 4 MiB
+	// DRBD 9's documented per-device ceiling. It was 16 TiB, which is below
+	// what DRBD 9 and upstream LINSTOR handle: linstormigrate copies sizes
+	// verbatim, so a cluster holding a larger volume failed part-way
+	// through its own migration.
+	vdBoundsMaxSizeKib int64 = 1024 * 1024 * 1024 * 1024 // 1 PiB
 )
 
 // vdBoundsPut issues a PUT with a JSON body and returns (status, body).
@@ -131,7 +135,7 @@ func TestVDResizeRejectsBelowFloor(t *testing.T) {
 	}
 }
 
-// TestVDResizeRejectsAboveMax: `vd set-size` (PUT) grow above the 16 TiB
+// TestVDResizeRejectsAboveMax: `vd set-size` (PUT) grow above the 1 PiB
 // ceiling (a pure grow, so only a max-bound gate can stop it) must be
 // refused, and the stored size must stay unchanged.
 func TestVDResizeRejectsAboveMax(t *testing.T) {
@@ -145,7 +149,7 @@ func TestVDResizeRejectsAboveMax(t *testing.T) {
 	url := stack.RestURL + "/v1/resource-definitions/" + rd + "/volume-definitions/0"
 
 	status, body := vdBoundsPut(t, url, map[string]any{"size_kib": aboveMax})
-	t.Logf("resize to %d KiB (above 16 TiB max) → status=%d body=%s", aboveMax, status, string(body))
+	t.Logf("resize to %d KiB (above the 1 PiB max) → status=%d body=%s", aboveMax, status, string(body))
 
 	if status >= 200 && status < 300 {
 		t.Fatalf("resize ACCEPTED an over-max size %d KiB > %d KiB max (Bug-155 class via vd set-size)",

@@ -159,6 +159,7 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 build: manifests generate fmt vet ## Build controller + satellite binaries.
 	go build -o bin/controller ./cmd/controller
 	go build -o bin/satellite  ./cmd/satellite
+	go build -o bin/blockstor  ./cmd/blockstor
 	go build -o bin/linstor-migrate ./cmd/linstor-migrate
 
 .PHONY: run
@@ -307,7 +308,7 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 # $2 - package url which can be installed
 # $3 - specific version of package
 define go-install-tool
-@[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
+@[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$$(basename "$(1)-$(3)")" ] || { \
 set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
@@ -315,7 +316,7 @@ rm -f "$(1)" ;\
 GOBIN="$(LOCALBIN)" go install $${package} ;\
 mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
 } ;\
-ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
+ln -sf "$$(basename "$(1)-$(3)")" "$(1)"
 endef
 
 define gomodver

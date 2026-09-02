@@ -508,7 +508,9 @@ func groupDRDListWithVolumeDefinitions(t *testing.T, stack *harness.Stack, cli *
 		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
 			ResourceGroupName: harness.FixtureDefaultRG,
 			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
-				{VolumeNumber: 0, SizeKib: 1024},
+				// 1 GiB: the size floor is enforced by the CRD, so a
+				// toy value is refused by the API server on seed.
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
 			},
 		},
 	}

@@ -523,6 +523,14 @@ type ResourceVolumeStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.resourceDefinitionName + '.' + self.spec.nodeName).lowerAscii()",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.nodeName> (case-insensitive)",optionalOldSelf=true
+// +kubebuilder:printcolumn:name="Definition",type=string,JSONPath=`.spec.resourceDefinitionName`
+// +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.spec.nodeName`
+// +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.storagePool`
+// +kubebuilder:printcolumn:name="Node-ID",type=integer,JSONPath=`.spec.drbdNodeID`
+// +kubebuilder:printcolumn:name="Port",type=integer,JSONPath=`.spec.drbdPort`
+// +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.drbdState`
+// +kubebuilder:printcolumn:name="In-Use",type=boolean,JSONPath=`.status.inUse`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // Resource is the Schema for the resources API.
 //

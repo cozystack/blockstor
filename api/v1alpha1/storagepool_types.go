@@ -112,6 +112,12 @@ type StoragePoolStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.poolName + '.' + self.spec.nodeName).lowerAscii()",message="metadata.name must equal <spec.poolName>.<spec.nodeName> (case-insensitive)",optionalOldSelf=true
+// +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.spec.nodeName`
+// +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.poolName`
+// +kubebuilder:printcolumn:name="Provider",type=string,JSONPath=`.spec.providerKind`
+// +kubebuilder:printcolumn:name="Free-KiB",type=integer,JSONPath=`.status.freeCapacity`
+// +kubebuilder:printcolumn:name="Total-KiB",type=integer,JSONPath=`.status.totalCapacity`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // StoragePool is the Schema for the storagepools API.
 //

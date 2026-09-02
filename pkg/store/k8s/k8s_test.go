@@ -261,6 +261,19 @@ func TestK8sSnapshotStore(t *testing.T) {
 // suite against the CRD-backed store (BUG-022: keeps the k8s
 // implementation behaviourally identical to InMemory — the old
 // process-local map drifted silently).
+func TestK8sPhysicalDeviceStore(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	storetest.RunPhysicalDeviceStore(t, func(t *testing.T) store.Store {
+		t.Helper()
+		t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+		return k8s.New(fixture.client)
+	})
+}
+
 func TestK8sControllerPropsStore(t *testing.T) {
 	if fixture == nil {
 		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
@@ -364,6 +377,10 @@ func wipeAll(t *testing.T, c client.Client) {
 
 	if err := c.DeleteAllOf(ctx, &crdv1alpha1.ResourceGroup{}); err != nil {
 		t.Logf("wipe ResourceGroups: %v", err)
+	}
+
+	if err := c.DeleteAllOf(ctx, &crdv1alpha1.PhysicalDevice{}); err != nil {
+		t.Logf("wipe PhysicalDevices: %v", err)
 	}
 
 	if err := c.DeleteAllOf(ctx, &crdv1alpha1.ResourceDefinition{}); err != nil {

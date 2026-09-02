@@ -45,7 +45,24 @@ type ResourceDefinitionSpec struct {
 	Flags []string `json:"flags,omitempty"`
 
 	// volumeDefinitions are the volume slots inside this RD.
+	//
+	// Keyed on volumeNumber rather than atomic, because that is what makes
+	// the size bound below enforceable. Kubernetes ratcheting correlates
+	// per field, and an atomic list is compared whole: any update touching
+	// it re-validates every element, so one volume written before the bound
+	// existed would reject every later write to this definition — the
+	// controller's own included, since it rewrites this list to stamp
+	// drbdMinor. With the list keyed, an untouched element is not
+	// re-validated and the bound applies to what is actually being written.
+	//
+	// The change was accepted by a running apiserver on the existing CRD, so
+	// it needs no new API version. One shape does become unwritable: an
+	// object carrying two entries with the same volumeNumber, which the
+	// atomic list allowed. Neither writer produces it.
+	//
 	// +optional
+	// +listType=map
+	// +listMapKey=volumeNumber
 	VolumeDefinitions []ResourceDefinitionVolume `json:"volumeDefinitions,omitempty"`
 
 	// layerStack is the LINSTOR layer composition for this RD's
@@ -138,7 +155,46 @@ type ResourceDefinitionSpec struct {
 // ResourceDefinitionVolume is one volume slot inside an RD.
 type ResourceDefinitionVolume struct {
 	VolumeNumber int32 `json:"volumeNumber"`
-	SizeKib      int64 `json:"sizeKib"`
+
+	// sizeKib is the volume size. The bounds are enforced HERE, by the API
+	// server, as well as in pkg/validate: the CLI writes these CRDs
+	// directly and REST has its own path, so a check living in one client
+	// is not a check the data is subject to. The writers give an operator a
+	// readable message; the schema is what holds for kubectl apply, a
+	// GitOps controller, and blockstor's own controller rewriting this
+	// list.
+	//
+	// The floor is DRBD's own per-device minimum once metadata is
+	// reserved. Below it the satellite does not fail — it loops on
+	// `drbdadm create-md` forever, which is why zero is the one value that
+	// must never reach it, and why an overflowing size parse that lands on
+	// zero has to be refused before it is stored.
+	//
+	// The ceiling is DRBD 9's documented per-device limit. It was 16 TiB,
+	// which is below what DRBD 9 and upstream LINSTOR handle: linstormigrate
+	// copies sizes verbatim, so a cluster holding a larger volume failed
+	// part-way through its own migration.
+	//
+	// A bound on an existing field validates on UPDATE as well as on
+	// create, which on an atomic list makes an out-of-range element poison
+	// every later write to the whole object — including writes that never
+	// touch the size, and including the controller's own, since it rewrites
+	// this list to stamp drbdMinor. That is reachable on an in-place
+	// upgrade: the REST spawn handler accepted any positive size until the
+	// gate was added, so a cluster upgrading into this can hold a definition
+	// sized 1..4095 KiB.
+	//
+	// The answer is the list-type marker on VolumeDefinitions rather than
+	// dropping the bound. Keyed on volumeNumber, the API server correlates
+	// elements across an update and ratcheting applies per element: a
+	// grandfathered volume stays writable, and the bound holds for what is
+	// actually being written. Verified against a running apiserver — an
+	// update appending a second, in-range volume is accepted while volume 0
+	// stays at 1024 KiB, and a fresh definition at 1024 KiB is refused.
+	//
+	// +kubebuilder:validation:Minimum=4096
+	// +kubebuilder:validation:Maximum=1099511627776
+	SizeKib int64 `json:"sizeKib"`
 	// +optional
 	Props map[string]string `json:"props,omitempty"`
 	// +optional
@@ -209,6 +265,10 @@ type ResourceDefinitionStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
+// +kubebuilder:printcolumn:name="Group",type=string,JSONPath=`.spec.resourceGroupName`
+// +kubebuilder:printcolumn:name="Port",type=integer,JSONPath=`.spec.drbdPort`
+// +kubebuilder:printcolumn:name="Layers",type=string,JSONPath=`.spec.layerStack`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ResourceDefinition is the Schema for the resourcedefinitions API
 type ResourceDefinition struct {

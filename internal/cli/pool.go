@@ -1,0 +1,357 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+
+	"github.com/cozystack/blockstor/internal/cli/command"
+	"github.com/cozystack/blockstor/internal/cli/view"
+)
+
+// The `StorDriver/*` property keys the satellite's provider factory
+// reads to find a pool's backing storage. A pool registered without
+// the key its kind expects is permanently un-reconcilable — the
+// satellite rejects every attach and capacity is never probed — so the
+// mapping below is pinned by test rather than inferred at runtime.
+const (
+	propLvmVG     = "StorDriver/LvmVg"
+	propThinPool  = "StorDriver/ThinPool"
+	propZPool     = "StorDriver/ZPool"
+	propZPoolThin = "StorDriver/ZPoolThin"
+	propFileDir   = "StorDriver/FileDir"
+)
+
+// storageProvider describes one `storage-pool create` provider token:
+// the kind it registers and where the backing name goes.
+type storageProvider struct {
+	kind string
+	// backingKey is the property the backing name is written to. Empty
+	// means the provider takes no backing name (diskless).
+	backingKey string
+	// splitThinPool marks the providers whose backing name is written
+	// `<volume-group>/<thin-pool>` and has to be taken apart.
+	splitThinPool bool
+}
+
+// storageProviders maps the provider tokens an operator types to what
+// gets persisted.
+var storageProviders = map[string]storageProvider{ //nolint:gochecknoglobals // static provider table
+	"lvm":      {kind: apiv1.StoragePoolKindLVM, backingKey: propLvmVG},
+	"lvmthin":  {kind: apiv1.StoragePoolKindLVMThin, backingKey: propLvmVG, splitThinPool: true},
+	"zfs":      {kind: apiv1.StoragePoolKindZFS, backingKey: propZPool},
+	"zfsthin":  {kind: apiv1.StoragePoolKindZFSThin, backingKey: propZPoolThin},
+	"file":     {kind: apiv1.StoragePoolKindFile, backingKey: propFileDir},
+	"filethin": {kind: apiv1.StoragePoolKindFileThin, backingKey: propFileDir},
+	"diskless": {kind: apiv1.StoragePoolKindDiskless},
+}
+
+// storagePoolCreate implements `storage-pool create <provider> <node>
+// <pool> [<backing>]`.
+func storagePoolCreate(ctx context.Context, run *runContext) error {
+	const wantArgs = 3 // provider, node, pool
+
+	if len(run.Flags.Positionals) < wantArgs {
+		return fmt.Errorf("%w: storage-pool create needs a provider, a node and a pool name", command.ErrUsage)
+	}
+
+	token := strings.ToLower(run.Flags.Positionals[0])
+
+	provider, known := storageProviders[token]
+	if !known {
+		return fmt.Errorf("%w: unknown storage provider %q", command.ErrUsage, run.Flags.Positionals[0])
+	}
+
+	backing := ""
+	if len(run.Flags.Positionals) > wantArgs {
+		backing = run.Flags.Positionals[wantArgs]
+	}
+
+	props, err := poolProps(provider, backing)
+	if err != nil {
+		return err
+	}
+
+	pool := &apiv1.StoragePool{
+		NodeName:        run.Flags.Positionals[1],
+		StoragePoolName: run.Flags.Positionals[2],
+		ProviderKind:    provider.kind,
+		Props:           props,
+	}
+
+	err = checkPoolTarget(ctx, run, pool.NodeName, provider, backing)
+	if err != nil {
+		return err
+	}
+
+	err = run.Store.StoragePools().Create(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("create storage pool %s on %s: %w", pool.StoragePoolName, pool.NodeName, err)
+	}
+
+	return nil
+}
+
+// poolProps places the backing name under the key its provider reads.
+func poolProps(provider storageProvider, backing string) (map[string]string, error) {
+	props := map[string]string{}
+
+	if provider.backingKey == "" || backing == "" {
+		if provider.backingKey != "" {
+			return nil, fmt.Errorf("%w: this provider needs a backing name", command.ErrUsage)
+		}
+
+		return props, nil
+	}
+
+	if !provider.splitThinPool {
+		props[provider.backingKey] = backing
+
+		return props, nil
+	}
+
+	// A thin LVM pool is addressed as `<volume-group>/<thin-pool>`.
+	// Guessing the thin-pool name from the volume group would register
+	// a pool that points at storage which does not exist, so a missing
+	// half is rejected instead.
+	group, thin, split := strings.Cut(backing, "/")
+	if !split || group == "" || thin == "" {
+		return nil, fmt.Errorf("%w: a thin pool is named <volume-group>/<thin-pool>, got %q",
+			command.ErrUsage, backing)
+	}
+
+	props[provider.backingKey] = group
+	props[propThinPool] = thin
+
+	return props, nil
+}
+
+// storagePoolDelete implements `storage-pool delete <node> <pool>`.
+func storagePoolDelete(ctx context.Context, run *runContext) error {
+	const wantArgs = 2
+
+	if len(run.Flags.Positionals) < wantArgs {
+		return fmt.Errorf("%w: storage-pool delete needs a node and a pool name", command.ErrUsage)
+	}
+
+	node, pool := run.Flags.Positionals[0], run.Flags.Positionals[1]
+
+	err := run.Store.StoragePools().Delete(ctx, node, pool)
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("delete storage pool %s on %s: %w", pool, node, err)
+	}
+
+	return nil
+}
+
+// volumeGroupCreate implements `volume-group create <resource-group>`.
+//
+// A volume group is a per-volume template nested inside its resource
+// group, so this appends to the parent. Without an explicit --vlmnr
+// the next free number is taken: reusing an existing one would silently
+// rewrite the template every future resource spawns from.
+func volumeGroupCreate(ctx context.Context, run *runContext) error {
+	if len(run.Flags.Positionals) < 1 {
+		return fmt.Errorf("%w: volume-group create needs a resource group", command.ErrUsage)
+	}
+
+	name := run.Flags.Positionals[0]
+
+	// Picking the next free number and appending have to happen
+	// together. Read the group, compute "the next number is 1", and
+	// write, and a second create doing the same against the same
+	// snapshot produces two templates numbered 1 — or loses one of
+	// them, depending on which write lands last.
+	err := run.Store.ResourceGroups().PatchResourceGroup(ctx, name,
+		func(group *apiv1.ResourceGroup) error {
+			number, pickErr := volumeGroupNumber(run, group)
+			if pickErr != nil {
+				return pickErr
+			}
+
+			group.VolumeGroups = append(group.VolumeGroups, apiv1.VolumeGroup{VolumeNumber: number})
+
+			return nil
+		})
+	if err != nil {
+		return fmt.Errorf("create volume group %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// volumeGroupNumber resolves the requested volume number, rejecting one
+// that is already taken.
+func volumeGroupNumber(run *runContext, group *apiv1.ResourceGroup) (int32, error) {
+	next := int32(0)
+	taken := map[int32]bool{}
+
+	for i := range group.VolumeGroups {
+		taken[group.VolumeGroups[i].VolumeNumber] = true
+
+		if group.VolumeGroups[i].VolumeNumber >= next {
+			next = group.VolumeGroups[i].VolumeNumber + 1
+		}
+	}
+
+	raw := run.Flags.Values["vlmnr"]
+	if raw == "" {
+		return next, nil
+	}
+
+	number, err := parseVolumeNumber(raw, "--vlmnr")
+	if err != nil {
+		return 0, err
+	}
+
+	if taken[number] {
+		return 0, fmt.Errorf("%w: volume group %s/%d already exists", command.ErrUsage, group.Name, number)
+	}
+
+	return number, nil
+}
+
+// volumeGroupRow is one machine-readable volume-group row, qualified
+// by the group it belongs to.
+//
+//nolint:tagliatelle // the machine envelope mirrors LINSTOR's snake_case wire shape
+type volumeGroupRow struct {
+	apiv1.VolumeGroup `json:",inline"`
+
+	ResourceGroup string `json:"resource_group"`
+}
+
+// volumeGroupList implements `volume-group list`.
+func volumeGroupList(ctx context.Context, run *runContext) error {
+	groups, err := run.Store.ResourceGroups().List(ctx)
+	if err != nil {
+		return fmt.Errorf("list resource groups: %w", err)
+	}
+
+	wanted := run.Flags.Values["resource-group"]
+
+	tbl := &metav1.Table{ColumnDefinitions: view.VolumeGroupColumns()}
+	rows := make([]volumeGroupRow, 0)
+
+	for i := range groups {
+		if wanted != "" && !strings.EqualFold(wanted, groups[i].Name) {
+			continue
+		}
+
+		// The parent group travels with each row. A flat list of
+		// VolumeGroups is ambiguous the moment two groups are listed:
+		// the table has a ResourceGroup column and the JSON must not
+		// be poorer than the thing it is meant to be parsed from.
+		for j := range groups[i].VolumeGroups {
+			rows = append(rows, volumeGroupRow{
+				ResourceGroup: groups[i].Name,
+				VolumeGroup:   groups[i].VolumeGroups[j],
+			})
+		}
+
+		tbl.Rows = append(tbl.Rows, view.VolumeGroupRows(&groups[i])...)
+	}
+
+	if run.Flags.Machine {
+		return machineOut(run, rows)
+	}
+
+	return run.render(tbl)
+}
+
+var (
+	// errNoSuchNode refuses a pool on a node the cluster does not have.
+	errNoSuchNode = errors.New("no such node")
+
+	// errBackingNotAdvertised refuses a pool whose backing store the
+	// satellite does not report.
+	errBackingNotAdvertised = errors.New("node does not advertise this backing store")
+)
+
+// checkPoolTarget refuses a storage pool the satellite could never reconcile.
+//
+// Neither mistake announces itself: a pool on a node that does not exist, and
+// a pool naming a volume group or zpool that is not on the node, both persist
+// happily and list in `sp l` looking real with empty capacity. The failure
+// surfaces later, as a placement that cannot find room, at which point the
+// cause is several steps away. REST answers 404 and a named-backing error at
+// create time; this path writes the CRD directly, so the same two checks
+// belong here.
+//
+// The backing check leans on what the satellite discovered and published on
+// the Node. A node that has not reported yet advertises nothing, and this
+// stands down rather than refusing a pool it cannot judge — bootstrap order
+// should not depend on discovery having run.
+func checkPoolTarget(
+	ctx context.Context, run *runContext, nodeName string, provider storageProvider, backing string,
+) error {
+	node, err := run.Store.Nodes().Get(ctx, nodeName)
+	if err != nil {
+		if isNotFound(err) {
+			return fmt.Errorf("%w: %s", errNoSuchNode, nodeName)
+		}
+
+		return fmt.Errorf("get node %s: %w", nodeName, err)
+	}
+
+	if backing == "" {
+		return nil
+	}
+
+	var prop string
+
+	switch provider.kind {
+	case apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindLVMThin:
+		prop = nodePropDiscoveredVGs
+	case apiv1.StoragePoolKindZFS, apiv1.StoragePoolKindZFSThin:
+		prop = nodePropDiscoveredZPools
+	default:
+		// FILE / DISKLESS advertise nothing to compare against.
+		return nil
+	}
+
+	advertised := node.Props[prop]
+	if advertised == "" {
+		return nil
+	}
+
+	for name := range strings.SplitSeq(advertised, ",") {
+		if strings.TrimSpace(name) == backing {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("%w: no %q on node %s, satellite advertised: %s",
+		errBackingNotAdvertised, backing, nodeName, advertised)
+}
+
+// The satellite publishes what it enumerated on the host under these Node
+// props; the names are duplicated from pkg/satellite/controllers rather than
+// imported so the CLI does not pull the satellite package in.
+const (
+	nodePropDiscoveredVGs    = "Aux/DiscoveredVGs"
+	nodePropDiscoveredZPools = "Aux/DiscoveredZPools"
+)

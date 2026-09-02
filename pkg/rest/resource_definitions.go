@@ -1260,30 +1260,7 @@ func (s *Server) sweepOrphanSnapshotsAfterRDDelete(ctx context.Context, rdName s
 // RD. Five passes covers the pathological case of every pass
 // observing one late-landing row while still bounding the worst-
 // case latency.
-const cascadeDeleteMaxPasses = 5
-
 func (s *Server) cascadeDeleteResources(ctx context.Context, rdName string) error {
-	for range cascadeDeleteMaxPasses {
-		children, err := s.Store.Resources().ListByDefinition(ctx, rdName)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				return nil
-			}
-
-			return err //nolint:wrapcheck // surfaced via writeStoreError
-		}
-
-		if len(children) == 0 {
-			return nil
-		}
-
-		for i := range children {
-			err = s.Store.Resources().Delete(ctx, rdName, children[i].NodeName)
-			if err != nil && !errors.Is(err, store.ErrNotFound) {
-				return err //nolint:wrapcheck // surfaced via writeStoreError
-			}
-		}
-	}
-
-	return nil
+	//nolint:wrapcheck // surfaced via writeStoreError
+	return store.CascadeDeleteResources(ctx, s.Store, rdName)
 }

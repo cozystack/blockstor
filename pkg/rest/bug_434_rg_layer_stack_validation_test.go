@@ -121,7 +121,9 @@ func TestBug434RGUpdateValidLayerStackAccepted(t *testing.T) {
 		t.Fatalf("seed RG: %v", err)
 	}
 
-	base, stop := startServerWithStore(t, st)
+	// A LUKS layer needs the cluster master key, which this door now
+	// requires: the stack is inherited by every definition spawned here.
+	base, stop := startServerWithPassphrase(t, st)
 	defer stop()
 
 	body, _ := json.Marshal(map[string]any{

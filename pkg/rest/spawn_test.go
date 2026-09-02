@@ -50,7 +50,9 @@ func TestSpawnCreatesRDAndVDs(t *testing.T) {
 		ResourceDefinitionName: "pvc-1",
 		// volume_sizes is KiB (Bug 391): the python client encodes
 		// `2M`/`4M` as [2048, 4096] via parse_volume_size_to_kib.
-		VolumeSizes: []int64{2048, 4096}, // KiB
+		// KiB, a factor of 1024 above the toy sizes this used to
+		// carry: the [4096 KiB, 1 PiB] floor applies on this path.
+		VolumeSizes: []int64{2048 * 1024, 4096 * 1024},
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -86,9 +88,15 @@ func TestSpawnCreatesRDAndVDs(t *testing.T) {
 	}
 
 	// volume_sizes entries land verbatim as size_kib (Bug 391): the
-	// requested [2048, 4096] KiB must NOT be divided by 1024.
-	if vds[0].SizeKib != 2048 || vds[1].SizeKib != 4096 {
-		t.Errorf("VD sizes: got %d, %d, want 2048, 4096", vds[0].SizeKib, vds[1].SizeKib)
+	// requested KiB must NOT be divided by 1024.
+	const (
+		wantVD0 = 2048 * 1024
+		wantVD1 = 4096 * 1024
+	)
+
+	if vds[0].SizeKib != wantVD0 || vds[1].SizeKib != wantVD1 {
+		t.Errorf("VD sizes: got %d, %d, want %d, %d",
+			vds[0].SizeKib, vds[1].SizeKib, wantVD0, wantVD1)
 	}
 }
 
@@ -317,8 +325,8 @@ func TestSpawnRejectsExceedingFreeCapacityRatio(t *testing.T) {
 			"MaxFreeCapacityOversubscriptionRatio":  "2",
 			"MaxTotalCapacityOversubscriptionRatio": "2",
 		},
-		FreeCapacity:  1024, // KiB
-		TotalCapacity: 4096, // KiB — big enough that the total gate doesn't clamp first
+		FreeCapacity:  1024 * 1024, // KiB
+		TotalCapacity: 4096 * 1024, // KiB — big enough that the total gate doesn't clamp first
 	}); err != nil {
 		t.Fatalf("seed pool: %v", err)
 	}
@@ -328,7 +336,7 @@ func TestSpawnRejectsExceedingFreeCapacityRatio(t *testing.T) {
 
 	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-too-big",
-		VolumeSizes:            []int64{3072}, // 3 MiB = 3072 KiB > 2048 cap
+		VolumeSizes:            []int64{3072 * 1024}, // 3 GiB > the 2 GiB cap
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -394,8 +402,8 @@ func TestSpawnRejectsExceedingTotalCapacityRatio(t *testing.T) {
 			"MaxFreeCapacityOversubscriptionRatio":  "100",
 			"MaxTotalCapacityOversubscriptionRatio": "2",
 		},
-		FreeCapacity:  10,
-		TotalCapacity: 10,
+		FreeCapacity:  10 * 1024,
+		TotalCapacity: 10 * 1024,
 	})
 
 	base, stop := startServerWithStore(t, st)
@@ -403,7 +411,7 @@ func TestSpawnRejectsExceedingTotalCapacityRatio(t *testing.T) {
 
 	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-total-gate",
-		VolumeSizes:            []int64{24}, // 24 KiB > cap=20 (volume_sizes is KiB, Bug 391)
+		VolumeSizes:            []int64{24 * 1024}, // > cap = 20 × 1024 (volume_sizes is KiB, Bug 391)
 	})
 
 	resp := httpPost(t, base+"/v1/resource-groups/rg-total/spawn", body)
@@ -437,8 +445,8 @@ func TestSpawnRejectsExceedingOversubscriptionRatio(t *testing.T) {
 		Props: map[string]string{
 			"MaxOversubscriptionRatio": "3",
 		},
-		FreeCapacity:  10,
-		TotalCapacity: 1000, // wide so the total gate doesn't bite
+		FreeCapacity:  10 * 1024,
+		TotalCapacity: 1000 * 1024, // wide so the total gate doesn't bite
 	})
 
 	base, stop := startServerWithStore(t, st)
@@ -446,7 +454,7 @@ func TestSpawnRejectsExceedingOversubscriptionRatio(t *testing.T) {
 
 	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-umb",
-		VolumeSizes:            []int64{40}, // 40 KiB > 30 cap (volume_sizes is KiB, Bug 391)
+		VolumeSizes:            []int64{40 * 1024}, // > the 30 × 1024 cap (volume_sizes is KiB, Bug 391)
 	})
 
 	resp := httpPost(t, base+"/v1/resource-groups/rg-umb/spawn", body)
@@ -483,8 +491,8 @@ func TestSpawnAcceptsWithinOversubscriptionGate(t *testing.T) {
 		Props: map[string]string{
 			"MaxOversubscriptionRatio": "5",
 		},
-		FreeCapacity:  10, // KiB
-		TotalCapacity: 100,
+		FreeCapacity:  10 * 1024, // KiB
+		TotalCapacity: 100 * 1024,
 	})
 
 	base, stop := startServerWithStore(t, st)
@@ -492,7 +500,7 @@ func TestSpawnAcceptsWithinOversubscriptionGate(t *testing.T) {
 
 	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-fits",
-		VolumeSizes:            []int64{40}, // 40 KiB ≤ 50 cap (volume_sizes is KiB, Bug 391)
+		VolumeSizes:            []int64{40 * 1024}, // ≤ the 50 × 1024 cap (volume_sizes is KiB, Bug 391)
 	})
 
 	resp := httpPost(t, base+"/v1/resource-groups/rg-ok/spawn", body)
@@ -1121,5 +1129,48 @@ func TestSpawnImpossiblePlacementNoPoolsAtAll(t *testing.T) {
 	got, _ := st.Resources().ListByDefinition(ctx, "pvc-ghost")
 	if len(got) != 0 {
 		t.Errorf("placed: got %d, want 0 (no pool named 'pool-ghost')", len(got))
+	}
+}
+
+// TestSpawnRefusesBelowFloorBeforeCreatingAnything: the size floor is a
+// Minimum on the CRD field, so a below-floor size is rejected by the API
+// server. Spawn creates the resource definition first and adds its
+// volumes after, so a size this handler waves through is not caught
+// later — it is caught midway, leaving a half-built definition behind
+// and handing the caller a raw schema error instead of the rejection
+// envelope. Validate before the first write, which is what the rest of
+// this handler already does.
+func TestSpawnRefusesBelowFloorBeforeCreatingAnything(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "rg-1"}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-small",
+		VolumeSizes:            []int64{2048}, // below the 4096 KiB floor
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-1/spawn", body)
+
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusCreated {
+		t.Fatalf("spawn accepted a below-floor size: status %d", resp.StatusCode)
+	}
+
+	// The refusal has to come before the definition exists, or the
+	// corrected retry hits "already exists" and the operator has to
+	// delete by hand first.
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-small"); err == nil {
+		t.Error("spawn left a resource definition behind after refusing")
 	}
 }

@@ -693,54 +693,9 @@ func buildAttachTo(req *physicalStorageCreateRequest) *apiv1.PhysicalDeviceAttac
 	// derive the provider-specific field from it. LVM_THIN parses
 	// `vg/thin` and `bare` per upstream `LvmThinDriverKind.VGName`
 	// / `LVName` — bare names get a `linstor_` VG prefix.
-	fillAttachToFromPoolName(out, req.ProviderKind, req.PoolName)
+	apiv1.FillAttachToFromPoolName(out, req.ProviderKind, req.PoolName)
 
 	return out
-}
-
-// fillAttachToFromPoolName populates the kind-specific AttachTo
-// fields from the operator-passed `--pool-name` value when
-// `with_storage_pool.props` left them empty. Bug 88.
-func fillAttachToFromPoolName(out *apiv1.PhysicalDeviceAttachTo, kind, poolName string) {
-	if poolName == "" {
-		return
-	}
-
-	switch kind {
-	case providerKindLVM:
-		if out.VGName == "" {
-			out.VGName = poolName
-		}
-	case providerKindLVMThin:
-		vgName, thinLV := splitLvmThinPoolName(poolName)
-		if out.VGName == "" {
-			out.VGName = vgName
-		}
-
-		if out.ThinPoolName == "" {
-			out.ThinPoolName = thinLV
-		}
-	case providerKindZFS, providerKindZFSThin:
-		if out.ZPoolName == "" {
-			out.ZPoolName = poolName
-		}
-	case providerKindFile, providerKindFileThin:
-		if out.Directory == "" {
-			out.Directory = poolName
-		}
-	}
-}
-
-// splitLvmThinPoolName mirrors upstream LINSTOR's
-// `LvmThinDriverKind.VGName` / `LVName`: a `vg/thin`-shaped pool
-// name splits on the slash, a bare name gets the `linstor_` VG
-// prefix and uses the bare name as the thin LV. Bug 88.
-func splitLvmThinPoolName(poolName string) (string, string) {
-	if before, after, ok := strings.Cut(poolName, "/"); ok {
-		return before, after
-	}
-
-	return "linstor_" + poolName, poolName
 }
 
 // physicalStorageEntry is the envelope golinstor expects on

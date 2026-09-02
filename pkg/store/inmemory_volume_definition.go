@@ -160,12 +160,17 @@ func (s *inMemoryVolumeDefinitions) PatchVolumeDefinitionSpec(_ context.Context,
 		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
 	}
 
-	err := mutate(&vd)
+	// A struct copy is shallow: the maps and slices in it still address
+	// the stored object, so a mutator that fails partway would leave its
+	// edits behind. Hand it a real copy instead.
+	working := cloneForPatch(vd)
+
+	err := mutate(&working)
 	if err != nil {
 		return errors.Wrapf(err, "patch volume %d on resource definition %q", volumeNumber, rdName)
 	}
 
-	s.m[key] = vd
+	s.m[key] = working
 
 	return nil
 }

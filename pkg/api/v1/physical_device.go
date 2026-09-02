@@ -18,6 +18,11 @@ limitations under the License.
 
 package v1
 
+// PhysicalDevicePhaseAvailable is the only Phase an attach may claim.
+// Mirrors the CRD-side constant; the store copies Status.Phase into the
+// wire field verbatim, so the vocabularies have to agree.
+const PhysicalDevicePhaseAvailable = "Available"
+
 // PhysicalDevice is the wire shape blockstor uses internally for one
 // raw block device discovered on a satellite. Distinct from the CRD
 // (`api/v1alpha1.PhysicalDevice`) — this is the format the

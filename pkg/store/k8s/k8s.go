@@ -158,6 +158,17 @@ func (s *controllerProps) Set(ctx context.Context, props map[string]string) erro
 	})
 }
 
+// PatchProps merges one caller's edit into Spec.ExtraProps without
+// disturbing keys it did not name, inheriting the auto-create and
+// retry-on-conflict semantics of the REST write path.
+func (s *controllerProps) PatchProps(ctx context.Context, mutate func(map[string]string) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return PatchControllerExtraProps(ctx, s.c, mutate)
+}
+
 // Nodes returns the NodeStore view of this store.
 func (s *Store) Nodes() store.NodeStore { return s.nodes }
 

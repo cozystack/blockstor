@@ -199,7 +199,7 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 		seedRD(t, s, "pvc-1")
 
 		ctx := t.Context()
-		vd := apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024}
+		vd := apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}
 		if err := s.VolumeDefinitions().Create(ctx, "pvc-1", &vd); err != nil {
 			t.Fatalf("first: %v", err)
 		}
@@ -233,7 +233,7 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 		seedRD(t, s, "pvc-1")
 
 		ctx := t.Context()
-		if err := s.VolumeDefinitions().Create(ctx, "pvc-1", &apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024}); err != nil {
+		if err := s.VolumeDefinitions().Create(ctx, "pvc-1", &apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
 		if err := s.VolumeDefinitions().Delete(ctx, "pvc-1", 0); err != nil {
@@ -254,7 +254,7 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 		seedRD(t, s, "pvc-1")
 
 		err := s.VolumeDefinitions().Update(t.Context(), "pvc-1",
-			&apiv1.VolumeDefinition{VolumeNumber: 99, SizeKib: 2048})
+			&apiv1.VolumeDefinition{VolumeNumber: 99, SizeKib: 2 * 1024 * 1024})
 		if !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("Update missing: got %v, want ErrNotFound", err)
 		}
@@ -287,7 +287,7 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 		// Insert out of order.
 		for _, vol := range []int32{2, 0, 1} {
 			if err := s.VolumeDefinitions().Create(ctx, "pvc-multi",
-				&apiv1.VolumeDefinition{VolumeNumber: vol, SizeKib: int64(vol+1) * 1024}); err != nil {
+				&apiv1.VolumeDefinition{VolumeNumber: vol, SizeKib: int64(vol+1) * 1024 * 1024}); err != nil {
 				t.Fatalf("Create vol-%d: %v", vol, err)
 			}
 		}
@@ -350,7 +350,7 @@ func runVolumeDefinitionAutoNumberCases(t *testing.T, newStore Factory) {
 
 		for i := range 3 {
 			want := int32(i)
-			vd := apiv1.VolumeDefinition{SizeKib: 1024}
+			vd := apiv1.VolumeDefinition{SizeKib: 1024 * 1024}
 
 			got, err := s.VolumeDefinitions().CreateAutoNumbered(ctx, "pvc-1", &vd)
 			if err != nil {
@@ -370,7 +370,7 @@ func runVolumeDefinitionAutoNumberCases(t *testing.T, newStore Factory) {
 		ctx := t.Context()
 
 		for range 3 {
-			vd := apiv1.VolumeDefinition{SizeKib: 1024}
+			vd := apiv1.VolumeDefinition{SizeKib: 1024 * 1024}
 			if _, err := s.VolumeDefinitions().CreateAutoNumbered(ctx, "pvc-1", &vd); err != nil {
 				t.Fatalf("seed CreateAutoNumbered: %v", err)
 			}
@@ -380,7 +380,7 @@ func runVolumeDefinitionAutoNumberCases(t *testing.T, newStore Factory) {
 			t.Fatalf("Delete: %v", err)
 		}
 
-		vd := apiv1.VolumeDefinition{SizeKib: 1024}
+		vd := apiv1.VolumeDefinition{SizeKib: 1024 * 1024}
 
 		got, err := s.VolumeDefinitions().CreateAutoNumbered(ctx, "pvc-1", &vd)
 		if err != nil {
