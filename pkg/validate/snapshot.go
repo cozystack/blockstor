@@ -21,7 +21,6 @@ package validate
 import (
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -56,8 +55,12 @@ func RestoreNodesHoldSnapshot(named, snapshotNodes []string) error {
 }
 
 // RestoreNodesMissingSnapshot lists the named nodes that do not hold the
-// snapshot, sorted, with duplicates and empty entries dropped. Empty means
-// the restore may proceed.
+// snapshot, with duplicates and empty entries dropped. Empty means the
+// restore may proceed.
+//
+// Reported in the order the operator named them, not sorted. The REST door is
+// an upstream-compatible surface and has always echoed the input order, so
+// sorting here would be a wire-visible change to a message clients may read.
 //
 // Separate from the error so a caller that shapes its own refusal — the REST
 // door builds a typed envelope naming each node — works off the same decision
@@ -90,8 +93,6 @@ func RestoreNodesMissingSnapshot(named, snapshotNodes []string) []string {
 			missing = append(missing, n)
 		}
 	}
-
-	sort.Strings(missing)
 
 	return missing
 }
