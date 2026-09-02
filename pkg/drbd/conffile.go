@@ -259,12 +259,10 @@ func Build(r Resource) (string, error) {
 // grammar needs it.
 //
 // Most option values are bare keywords or numbers and must stay unquoted, so
-// this quotes only what would not survive as a bare token: whitespace, a
-// quote, a brace, a semicolon, or a '#', which opens a comment and would
-// swallow the rest of the line. Base64 padding and the '+' and '/' of a
-// secret are NOT in that class — they survive bare, and the secret is quoted
-// by the name-based branch in writeNet because drbd's grammar spells that one
-// option as a string, not because its characters demand it.
+// this quotes what would not survive as a bare token. That set is much wider
+// than whitespace and punctuation: drbdadm's bare-token rule accepts only
+// [a-zA-Z0-9/._-], so '+', '=', ',' and '%' all end the token early and the
+// file fails to parse. See needsQuoting.
 //
 // Emitting such a value verbatim does not fail loudly. drbdadm reads the
 // first token and treats the rest as syntax, so a fence-peer handler with a
@@ -376,13 +374,50 @@ func checkValues(r *Resource) error {
 }
 
 // needsQuoting reports whether a value would not survive as a bare drbd
-// token. An empty value is quoted too: `key ;` is not valid syntax.
+// token.
+//
+// The rule is drbd-utils' own, from esc() in shared_tool.c: a value is
+// emitted bare only when every byte is in [a-zA-Z0-9/._-] and it is at most
+// 80 characters. Everything else gets quotes.
+//
+// An enumerated list of "dangerous" characters looked equivalent and was not.
+// It covered whitespace, quotes, braces, semicolons and '#', and let through
+// '+', '=', ',' and '%' — so a base64-ish handler value went out as
+// `fence-peer abcDEF+/=;` and drbdadm answered "Parse error: ';' expected".
+// That takes down the whole .res on that node, not one option, at the next
+// reconcile. Allow-listing what is known to be safe cannot fail that way: a
+// character nobody thought about gets quoted, which is always valid.
+//
+// An empty value is quoted too: `key ;` is not valid syntax.
 func needsQuoting(value string) bool {
-	if value == "" {
+	if value == "" || len(value) > bareTokenMaxLen {
 		return true
 	}
 
-	return strings.ContainsAny(value, " \t\n\r\"'{};#")
+	for i := range len(value) {
+		if !isBareTokenByte(value[i]) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// bareTokenMaxLen is the length past which drbd-utils quotes regardless of
+// content.
+const bareTokenMaxLen = 80
+
+// isBareTokenByte reports whether a byte may appear in an unquoted drbd
+// token: [a-zA-Z0-9/._-].
+func isBareTokenByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '/', c == '.', c == '_', c == '-':
+		return true
+	default:
+		return false
+	}
 }
 
 // sharedSecretOption is the drbd net option carrying the peer

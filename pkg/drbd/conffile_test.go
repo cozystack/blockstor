@@ -762,3 +762,65 @@ func TestSharedSecretIsEscapedOnBothNetPaths(t *testing.T) {
 		t.Errorf("the shared secret arriving as a net option was not escaped:\n%s", fromProps)
 	}
 }
+
+// drbdadm's bare-token rule is an allow-list — [a-zA-Z0-9/._-], up to 80
+// characters — not a deny-list of dangerous punctuation. An enumerated list
+// of characters to quote looked equivalent and let '+', '=', ',' and '%'
+// through, so a base64-ish handler value went out as
+// `fence-peer abcDEF+/=;` and drbdadm answered "Parse error: ';' expected",
+// which takes down the whole .res on that node at the next reconcile.
+//
+// The values here are the corpus that was fed to drbdadm 9.22.0: the first
+// group failed to parse when emitted bare, the second was read back
+// unquoted and must stay that way.
+func TestNeedsQuotingFollowsTheBareTokenRule(t *testing.T) {
+	quoted := map[string]string{
+		"base64 padding": "abcDEF+/=",
+		"comma":          "a,b",
+		"percent":        "50%",
+		"colon":          "10.0.0.1:7000",
+		"space":          "/usr/bin/fence --tag x",
+		"hash":           "/usr/bin/fence-peer#1.sh",
+		"over 80 chars":  strings.Repeat("a", 81),
+		"empty":          "",
+	}
+
+	for name, value := range quoted {
+		out, err := drbd.Build(drbd.Resource{
+			Name:     "r0",
+			Handlers: map[string]string{"fence-peer": value},
+		})
+		if err != nil {
+			t.Fatalf("%s: Build: %v", name, err)
+		}
+
+		if !strings.Contains(out, `fence-peer "`) {
+			t.Errorf("%s: %q was emitted bare, which drbdadm cannot parse:\n%s", name, value, out)
+		}
+	}
+
+	bare := map[string]string{
+		"keyword":     "detach",
+		"number":      "60",
+		"path":        "/usr/lib/drbd/crm-fence-peer.9.sh",
+		"algorithm":   "sha1",
+		"size suffix": "10240k",
+		"decimal":     "1.5",
+		"negative":    "-1",
+		"exactly 80":  strings.Repeat("a", 80),
+	}
+
+	for name, value := range bare {
+		out, err := drbd.Build(drbd.Resource{
+			Name:     "r0",
+			Handlers: map[string]string{"fence-peer": value},
+		})
+		if err != nil {
+			t.Fatalf("%s: Build: %v", name, err)
+		}
+
+		if !strings.Contains(out, "fence-peer "+value+";") {
+			t.Errorf("%s: %q gained quotes it does not need:\n%s", name, value, out)
+		}
+	}
+}
