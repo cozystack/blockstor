@@ -702,6 +702,10 @@ func seedAutoQuorumDefaults(rd *apiv1.ResourceDefinition) {
 // ran against an empty `rd.LayerStack`, so any non-python client
 // that posts `{"resource_definition": {"name": "X"}, "layer_list":
 // ["DRBD","LUKS","STORAGE"]}` got an unencrypted RD silently.
+// layerListField is the wire name of the layer stack, used where the value is
+// reported back to the caller rather than decoded.
+const layerListField = "layer_list"
+
 func mergeRDCreateLayerInputs(body *apiv1.ResourceDefinitionCreate, rd *apiv1.ResourceDefinition) error {
 	// `layer_data` only enters the merge after we project it down to
 	// the bare string list; the validator + LUKS gate read a flat
@@ -709,7 +713,7 @@ func mergeRDCreateLayerInputs(body *apiv1.ResourceDefinitionCreate, rd *apiv1.Re
 	fromLayerData := layerStackFromLayerData(rd.LayerData)
 
 	views := []rdLayerInputView{
-		{label: "layer_list", stack: body.LayerList},
+		{label: layerListField, stack: body.LayerList},
 		{label: "resource_definition.layer_stack", stack: rd.LayerStack},
 		{label: "resource_definition.layer_data", stack: fromLayerData},
 	}

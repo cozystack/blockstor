@@ -313,7 +313,7 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// target is left an empty shell for the operator / linstor-csi to
 	// place (restore-then-scale-out); an explicit node list is still
 	// stamped verbatim inside materializeRestoredRD.
-	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false)
+	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false, nil)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -413,7 +413,17 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 //
 // An explicit caller node list is always stamped verbatim, regardless of
 // eagerPlace.
-func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) (string, error) {
+// rdShapeOverrides carries the parts of a definition's shape a caller may
+// choose for itself rather than inherit from the source. Nil means "inherit
+// everything", which is what a snapshot restore does.
+type rdShapeOverrides struct {
+	// LayerStack replaces the source's stack when non-empty.
+	LayerStack []string
+	// ResourceGroupName replaces the source's parent group when non-empty.
+	ResourceGroupName string
+}
+
+func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool, overrides *rdShapeOverrides) (string, error) {
 	srcRDObj, err := s.Store.ResourceDefinitions().Get(ctx, srcRD)
 	if err != nil {
 		return "", err //nolint:wrapcheck // surfaced via writeStoreError
@@ -431,6 +441,17 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		ResourceGroupName: srcRDObj.ResourceGroupName,
 		Props:             maps.Clone(snap.Props),
 		LayerStack:        srcRDObj.LayerStack,
+	}
+
+	// A clone may name its own group and stack; a restore inherits both.
+	if overrides != nil {
+		if len(overrides.LayerStack) > 0 {
+			newRD.LayerStack = overrides.LayerStack
+		}
+
+		if overrides.ResourceGroupName != "" {
+			newRD.ResourceGroupName = overrides.ResourceGroupName
+		}
 	}
 
 	if newRD.Props == nil {
