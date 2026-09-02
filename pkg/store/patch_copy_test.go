@@ -182,3 +182,78 @@ func TestNodePatchPropsRefusalLeavesThePropsAlone(t *testing.T) {
 		t.Errorf("a refused node property patch changed the store: %v", got.Props)
 	}
 }
+
+// The same contract on the other two stores. The code was right in all three,
+// but only the Resources() path was held by a test — reverting either of the
+// other two to the discarded copy left the whole suite green.
+func TestPatchCarriesAnnotationsOnEveryStore(t *testing.T) {
+	t.Parallel()
+
+	t.Run("resource definition", func(t *testing.T) {
+		t.Parallel()
+
+		s := NewInMemory()
+		ctx := t.Context()
+
+		err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:        "pvc-x",
+			Annotations: map[string]string{"blockstor.io/keep": "yes"},
+		})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		err = s.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, "pvc-x",
+			func(def *apiv1.ResourceDefinition) error {
+				def.Annotations = nil
+
+				return nil
+			})
+		if err != nil {
+			t.Fatalf("patch: %v", err)
+		}
+
+		got, err := s.ResourceDefinitions().Get(ctx, "pvc-x")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+
+		if got.Annotations["blockstor.io/keep"] != "yes" {
+			t.Errorf("a patch that nilled Annotations cleared them: %v", got.Annotations)
+		}
+	})
+
+	t.Run("resource group", func(t *testing.T) {
+		t.Parallel()
+
+		s := NewInMemory()
+		ctx := t.Context()
+
+		err := s.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+			Name:        "grp",
+			Annotations: map[string]string{"blockstor.io/keep": "yes"},
+		})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		err = s.ResourceGroups().PatchResourceGroup(ctx, "grp",
+			func(rg *apiv1.ResourceGroup) error {
+				rg.Annotations = nil
+
+				return nil
+			})
+		if err != nil {
+			t.Fatalf("patch: %v", err)
+		}
+
+		got, err := s.ResourceGroups().Get(ctx, "grp")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+
+		if got.Annotations["blockstor.io/keep"] != "yes" {
+			t.Errorf("a patch that nilled Annotations cleared them: %v", got.Annotations)
+		}
+	})
+}

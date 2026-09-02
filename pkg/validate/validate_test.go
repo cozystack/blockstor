@@ -20,6 +20,7 @@ package validate_test
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -188,12 +189,36 @@ func TestStoragePoolPropNamedCatchesTheNoOpEdit(t *testing.T) {
 // Every key that pins where a pool's data physically lives has to be in the
 // set: one left out is a pool that can be pointed at another backing store
 // while its replicas keep reporting UpToDate.
+//
+// The expectation is spelled out rather than derived from the list under
+// test. Iterating the list and asserting each entry is refused passes no
+// matter what the list contains, so dropping a key from it — losing the rule
+// for that backing store — went unnoticed.
 func TestImmutableStoragePoolPropsCoverEveryBackingKey(t *testing.T) {
 	t.Parallel()
 
-	for _, key := range validate.ImmutableStoragePoolProps() {
+	want := []string{
+		"StorDriver/StorPoolName",
+		"StorDriver/LvmVg",
+		"StorDriver/ThinPool",
+		"StorDriver/ZPool",
+		"StorDriver/ZPoolThin",
+		"StorDriver/FileDir",
+	}
+
+	got := validate.ImmutableStoragePoolProps()
+	if len(got) != len(want) {
+		t.Fatalf("immutable set = %v, want %v", got, want)
+	}
+
+	for _, key := range want {
+		if !slices.Contains(got, key) {
+			t.Errorf("%s is not in the immutable set, so a pool can be pointed "+
+				"at another backing store while its replicas report UpToDate", key)
+		}
+
 		if err := validate.StoragePoolPropNamed(key); err == nil {
-			t.Errorf("%s is listed as immutable but is not refused when named", key)
+			t.Errorf("%s is in the set but is not refused when named", key)
 		}
 	}
 }
@@ -303,5 +328,20 @@ func TestResourceIsDiskful(t *testing.T) {
 				t.Errorf("diskful = %v, want %v", got, tc.diskful)
 			}
 		})
+	}
+}
+
+// The refusal echoes the operator's own order. The REST door is an
+// upstream-compatible surface and has always reported the nodes as they were
+// passed, so sorting them here would change a message clients may read.
+func TestRestoreRefusalKeepsTheOperatorsOrder(t *testing.T) {
+	t.Parallel()
+
+	missing := validate.RestoreNodesMissingSnapshot(
+		[]string{"node-9", "node-8", "node-9", ""}, []string{"node-1"})
+
+	want := []string{"node-9", "node-8"}
+	if !slices.Equal(missing, want) {
+		t.Errorf("missing = %v, want %v (input order, deduped, empties dropped)", missing, want)
 	}
 }

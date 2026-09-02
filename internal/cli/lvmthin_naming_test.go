@@ -79,3 +79,66 @@ func TestCreateDevicePoolNamesLvmThinTheWayRESTDoes(t *testing.T) {
 		})
 	}
 }
+
+// Tolerating AlreadyExists is what lets a re-run finish an interrupted
+// attempt, but only when the pool that exists is the one this command is
+// building. A pool of another provider wearing the same name belongs to
+// somebody else: continuing stamps the device Wipe:true for the requested
+// backing while the registered pool still points at theirs, so the disk is
+// erased under a pool that never claimed it — and the command exits 0.
+func TestCreateDevicePoolRefusesAForeignPool(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.PhysicalDevices().Create(ctx, &apiv1.PhysicalDevice{
+			Name: "node-1-sdb", NodeName: "node-1",
+			DevicePath: "/dev/disk/by-id/wwn-0x1", CurrentDevPath: "/dev/sdb",
+			SizeBytes: 1 << 40,
+		})
+		// Somebody else's pool, same name, different provider.
+		_ = backend.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: "node-1", StoragePoolName: "data",
+			ProviderKind: apiv1.StoragePoolKindLVM,
+			Props:        map[string]string{"StorDriver/LvmVg": "someone-elses-vg"},
+		})
+	})
+
+	argv := []string{"ps", "cdp", "zfs", "node-1", "/dev/sdb", "--pool-name", "data"}
+	if got := app.Run(t.Context(), argv); got == 0 {
+		t.Fatal("a pool of another provider was adopted and the device stamped for it")
+	}
+
+	device, err := appStore(t, app).PhysicalDevices().Get(t.Context(), "node-1-sdb")
+	if err != nil {
+		t.Fatalf("get device: %v", err)
+	}
+
+	if device.AttachTo != nil {
+		t.Errorf("the refused run stamped the device anyway: %+v", device.AttachTo)
+	}
+
+	if errBuf.Len() == 0 {
+		t.Error("the refusal said nothing")
+	}
+}
+
+// The named-key guard has to be wired into the verb, not just exist in
+// pkg/validate: re-setting a backing key to the value it already has changes
+// no state, so the before/after guard cannot see it, and REST refuses it.
+func TestSetPropertyRefusesANoOpEditOfABackingKey(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: "node-1", StoragePoolName: "data",
+			ProviderKind: apiv1.StoragePoolKindLVM,
+			Props:        map[string]string{"StorDriver/LvmVg": "vg0"},
+		})
+	})
+
+	argv := []string{"sp", "set-property", "node-1", "data", "StorDriver/LvmVg", "vg0"}
+	if got := app.Run(t.Context(), argv); got == 0 {
+		t.Error("setting an immutable backing key to its current value was accepted, " +
+			"while REST refuses the same command")
+	}
+}
