@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
@@ -313,7 +315,14 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// target is left an empty shell for the operator / linstor-csi to
 	// place (restore-then-scale-out); an explicit node list is still
 	// stamped verbatim inside materializeRestoredRD.
-	if s.restoreTargetPreexists(r.Context(), w, srcRD, snapName, req.ToResource) {
+	// A leftover from an earlier attempt is RESUMED, not reported done.
+	// The marker is stamped with the definition, before its volumes and
+	// replicas exist, so on its own it says a restore started — not that
+	// it finished. Answering success on the marker alone would turn the
+	// terminal failure this fixes into a silent incomplete one: CSI would
+	// see the volume as ready and nothing would ever finish it.
+	resume, stop := s.restoreTargetState(r.Context(), w, srcRD, snapName, req.ToResource)
+	if stop {
 		return
 	}
 
@@ -324,14 +333,27 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeRestoreDone(w, resume, snapName, newRDName)
+}
+
+// writeRestoreDone reports the restore, naming whether it finished a leftover
+// so a retry is legible in the operator's own output rather than looking like
+// a first run.
+func writeRestoreDone(w http.ResponseWriter, resumed bool, snapName, rdName string) {
+	message := "snapshot restored: " + snapName + " → " + rdName
+	if resumed {
+		message = "snapshot restore completed on retry: " + snapName + " → " + rdName
+	}
+
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "snapshot restored: " + snapName + " → " + newRDName,
+		Message: message,
 	}})
 }
 
-// restoreTargetPreexists makes a repeat restore idempotent. True means an
-// answer has been written and the caller must stop.
+// restoreTargetState decides what an existing definition under the target
+// name means. It returns (resume, stop): stop when an answer has already been
+// written, resume when the caller should re-run the restore over the leftover.
 //
 // CSI requires CreateVolume to be idempotent: a repeat with the same name and
 // the same parameters has to succeed and return the volume that already
@@ -341,26 +363,27 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 // there, every retry hit ErrAlreadyExists, and the PVC stayed Pending until
 // someone deleted the leftover by hand.
 //
-// The distinction that makes this safe is the restore marker. A definition
-// carrying `<srcRD>:<snapName>` is the one THIS restore would have produced,
-// so reporting success is accurate. Anything else under that name is a
-// genuine collision and stays a refusal — the same split the clone path
-// already draws.
-func (s *Server) restoreTargetPreexists(ctx context.Context, w http.ResponseWriter, srcRD, snapName, toResource string) bool {
+// The restore marker is what makes a leftover recognisable, and it is NOT
+// evidence that the restore finished: materializeRestoredRD stamps it with
+// the definition and hydrates the volumes and places the replicas afterwards,
+// so a failure in either leaves the marker on an empty shell. That is why
+// this resumes rather than reporting success — the restore steps tolerate
+// objects a previous attempt already created, so re-running them completes
+// what is missing and leaves what is there.
+//
+// Anything else under that name is a genuine collision and stays a refusal: a
+// name holding somebody else's definition must not come back as a restore
+// that never happened.
+func (s *Server) restoreTargetState(ctx context.Context, w http.ResponseWriter, srcRD, snapName, toResource string) (bool, bool) {
 	existing, err := s.Store.ResourceDefinitions().Get(ctx, toResource)
 	if err != nil {
 		// NotFound, or a read blip: proceed with the create, which
 		// surfaces a real store outage on its own.
-		return false
+		return false, false
 	}
 
 	if existing.Props[restoreFromSnapshotKey] == srcRD+":"+snapName {
-		writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
-			RetCode: maskInfo,
-			Message: "snapshot already restored: " + snapName + " → " + toResource,
-		}})
-
-		return true
+		return true, false
 	}
 
 	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
@@ -370,7 +393,7 @@ func (s *Server) restoreTargetPreexists(ctx context.Context, w http.ResponseWrit
 		Correc: "restore under a different name, or delete the existing resource definition first",
 	}})
 
-	return true
+	return false, true
 }
 
 // restoreFromSnapshotKey marks a definition as produced by a snapshot
@@ -524,9 +547,26 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 
 	newRD.Props[restoreFromSnapshotKey] = srcRD + ":" + snap.Name
 
+	// AlreadyExists is tolerated when the definition already there is this
+	// restore's own — the resume path above, or a second restore of the
+	// same snapshot racing this one between the state check and here. The
+	// marker is what tells the two apart from somebody else's definition,
+	// and re-reading is what makes the decision on fresh state rather than
+	// on the read that lost the race.
 	err = s.Store.ResourceDefinitions().Create(ctx, &newRD)
 	if err != nil {
-		return "", err //nolint:wrapcheck // surfaced via writeStoreError
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			return "", err //nolint:wrapcheck // surfaced via writeStoreError
+		}
+
+		existing, getErr := s.Store.ResourceDefinitions().Get(ctx, newRD.Name)
+		if getErr != nil {
+			return "", getErr //nolint:wrapcheck // surfaced via writeStoreError
+		}
+
+		if existing.Props[restoreFromSnapshotKey] != srcRD+":"+snap.Name {
+			return "", err //nolint:wrapcheck // surfaced via writeStoreError
+		}
 	}
 
 	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap)
@@ -658,8 +698,12 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 			res.Props = map[string]string{storPoolPropKey: pool}
 		}
 
+		// Same reasoning as hydrateVolumesFromSnapshot: the replica is
+		// keyed (rd, node) and this loop stamps exactly the nodes the
+		// restore resolved, so an existing one is the replica a previous
+		// attempt already placed.
 		err := s.Store.Resources().Create(ctx, &res)
-		if err != nil {
+		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
 			return err //nolint:wrapcheck // surfaced via writeStoreError
 		}
 	}
@@ -733,8 +777,13 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 			SizeKib:      svd.SizeKib,
 		}
 
+		// AlreadyExists is not a conflict here. The volumes created are
+		// exactly the ones the snapshot records, so one already under
+		// that number IS this volume — left behind by a restore that
+		// got this far and then failed. Tolerating it is what lets a
+		// retry finish an incomplete restore instead of refusing it.
 		err := s.Store.VolumeDefinitions().Create(ctx, rdName, &vd)
-		if err != nil {
+		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
 			return err //nolint:wrapcheck // surfaced via writeStoreError
 		}
 	}

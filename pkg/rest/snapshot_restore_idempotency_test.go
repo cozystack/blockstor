@@ -14,6 +14,9 @@ import (
 
 // seedRestoreSource is a definition with one snapshot of it, the minimum a
 // snapshot-restore needs.
+// drbdRestoreMarkerForTest is the marker key materializeRestoredRD stamps.
+const drbdRestoreMarkerForTest = "BlockstorRestoreFromSnapshot"
+
 func seedRestoreSource(ctx context.Context, t *testing.T, st store.Store) {
 	t.Helper()
 
@@ -117,5 +120,65 @@ func TestSnapshotRestoreStillRefusesAForeignName(t *testing.T) {
 
 	if got.Props["someone"] != "else" {
 		t.Error("the refused restore overwrote the definition that was already there")
+	}
+}
+
+// The marker is stamped with the definition, BEFORE its volumes are hydrated
+// and its replicas placed. So a definition carrying it says a restore
+// started, not that one finished, and a retry that reads the marker as
+// completion turns the terminal failure this endpoint used to have into a
+// silent incomplete one — CSI sees the volume as ready and nothing ever
+// finishes it.
+//
+// The leftover here is exactly that shape: the definition and the marker, no
+// volumes. The retry has to complete it.
+func TestSnapshotRestoreResumesAnIncompleteLeftover(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedRestoreSource(ctx, t, st)
+
+	// What a first attempt leaves behind when it fails after creating the
+	// definition and before hydrating the volumes.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:  "pvc-dst",
+		Props: map[string]string{drbdRestoreMarkerForTest: "pvc-src:snap-1"},
+	}); err != nil {
+		t.Fatalf("seed the leftover: %v", err)
+	}
+
+	vds, err := st.VolumeDefinitions().List(ctx, "pvc-dst")
+	if err != nil {
+		t.Fatalf("list the leftover's volumes: %v", err)
+	}
+
+	if len(vds) != 0 {
+		t.Fatalf("the leftover already has %d volume(s); the test is not modelling "+
+			"an incomplete restore", len(vds))
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(map[string]string{
+		"to_resource":   "pvc-dst",
+		"from_snapshot": "snap-1",
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-src/snapshot-restore-resource", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("retry over an incomplete leftover: got %d, want 201", resp.StatusCode)
+	}
+
+	// The point of the retry: the volumes the first attempt never wrote.
+	vds, err = st.VolumeDefinitions().List(ctx, "pvc-dst")
+	if err != nil {
+		t.Fatalf("list volumes after the retry: %v", err)
+	}
+
+	if len(vds) != 1 {
+		t.Errorf("after the retry the target has %d volume(s), want 1 — the retry "+
+			"reported success over a definition it never finished", len(vds))
 	}
 }

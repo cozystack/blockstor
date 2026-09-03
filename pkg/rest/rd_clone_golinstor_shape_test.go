@@ -33,12 +33,15 @@ func TestRDCloneAcceptsTheFullGolinstorBody(t *testing.T) {
 	resp := httpPost(t, base+"/v1/resource-definitions/pvc-src/clone", body)
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusBadRequest {
+	// Asserted as "created", not merely "not 400". Accepting anything
+	// outside 400 lets a 500 through, and this test is the one that would
+	// have to catch the endpoint accepting the body and then failing on it.
+	if resp.StatusCode != http.StatusCreated {
 		var raw map[string]any
 
 		_ = json.NewDecoder(resp.Body).Decode(&raw)
 
-		t.Fatalf("the clone body was refused as malformed: %+v", raw)
+		t.Fatalf("clone status = %d, want 201: %+v", resp.StatusCode, raw)
 	}
 }
 
