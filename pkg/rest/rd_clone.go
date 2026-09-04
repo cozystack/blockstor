@@ -79,6 +79,22 @@ type rdCloneRequest struct {
 	DeleteProps   []string          `json:"delete_props,omitempty"`
 	SrcSnapName   string            `json:"src_snap_name,omitempty"`
 	UseZfsClone   bool              `json:"use_zfs_clone,omitempty"`
+
+	// The remaining fields golinstor puts on the wire for this
+	// endpoint. They are declared because the body is decoded with
+	// DisallowUnknownFields: a field missing from this struct is a 400
+	// before any of the handler runs, whatever its value.
+	//
+	// That is not theoretical. linstor-csi defaults LayerList to
+	// [drbd, storage] in pkg/volume/parameter.go and never sends it
+	// empty, so every CSI clone-from-volume was refused outright with
+	// `unknown field "layer_list"` — no StorageClass could avoid it,
+	// and on Cozystack the platform-wide `cloneStrategyOverride:
+	// csi-clone` routes every disk clone through here.
+	LayerList         []string `json:"layer_list,omitempty"`
+	ResourceGroup     string   `json:"resource_group,omitempty"`
+	ExternalName      string   `json:"external_name,omitempty"`
+	VolumePassphrases []string `json:"volume_passphrases,omitempty"`
 }
 
 // registerRDClone wires the /v1/resource-definitions/{rd}/clone endpoints.
@@ -93,6 +109,73 @@ func (s *Server) registerRDClone(mux *http.ServeMux) {
 		s.requireStore(s.handleRDClone))
 	mux.HandleFunc("GET /v1/resource-definitions/{rd}/clone/{target}",
 		s.requireStore(s.handleRDCloneStatus))
+}
+
+// cloneRequestIsHonourable refuses the accepted-but-unhonoured fields, and
+// validates the ones the handler does act on. False means a refusal has been
+// written and the caller must stop.
+//
+// Declaring a field so the decoder stops rejecting the body is only half the
+// job. Accepting one and dropping it silently is the shape this endpoint
+// already refuses for src_snap_name, and for the same reason: the caller is
+// told the clone did what it asked, and it did something else.
+//
+//   - external_name gives the definition an identity of its own upstream.
+//     Dropped, the clone comes back under a different name than requested.
+//   - volume_passphrases carries the LUKS keys for the cloned volumes.
+//     Dropped, the clone materialises with keys the caller does not hold.
+//
+// linstor-csi sends neither on this path, so refusing them costs nothing that
+// works today and keeps the endpoint from lying if something starts to.
+func (s *Server) cloneRequestIsHonourable(
+	ctx context.Context, w http.ResponseWriter, srcName string, req *rdCloneRequest,
+) bool {
+	if req.ExternalName != "" {
+		writeCloneRefused(w, http.StatusNotImplemented, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + srcName + "': external_name is not implemented",
+			Cause:   "blockstor names a cloned definition by `name`; honouring external_name would change the identity the caller asked for",
+			Correc:  "omit external_name, or clone under the name you want",
+		})
+
+		return false
+	}
+
+	if len(req.VolumePassphrases) > 0 {
+		writeCloneRefused(w, http.StatusNotImplemented, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + srcName + "': volume_passphrases is not implemented",
+			Cause:   "the clone would materialise with keys the caller does not hold, and report success",
+			Correc:  "omit volume_passphrases; set the cluster passphrase with `linstor encryption create-passphrase` instead",
+		})
+
+		return false
+	}
+
+	// Validated the way rg-modify validates its stack, so an
+	// unmaterialisable layer chain is refused here rather than persisting
+	// onto the clone for a satellite to choke on.
+	err := validateLayerStack(req.LayerList)
+	if err != nil {
+		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + srcName + "': " + err.Error(),
+		})
+
+		return false
+	}
+
+	luksErr := s.refuseLUKSWithoutPassphrase(ctx, req.LayerList)
+	if luksErr != nil {
+		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + srcName + "': " + luksErr.Error(),
+		})
+
+		return false
+	}
+
+	return true
 }
 
 // handleRDClone clones a ResourceDefinition under a new name.
@@ -147,6 +230,10 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 	if req.SrcSnapName != "" {
 		writeSnapshotCloneNotImplemented(w, srcName, req.Name, req.SrcSnapName)
 
+		return
+	}
+
+	if !s.cloneRequestIsHonourable(r.Context(), w, srcName, &req) {
 		return
 	}
 
@@ -230,7 +317,10 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 	// operation with no follow-up autoplace, so the clone replicas must
 	// materialise on the snapshot-holding nodes in the source pool here
 	// (same backend by construction — Bug 038).
-	_, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true)
+	_, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true, &rdShapeOverrides{
+		LayerStack:        req.LayerList,
+		ResourceGroupName: req.ResourceGroup,
+	})
 	if err != nil {
 		writeCloneRefused(w, http.StatusInternalServerError, src.Name, req.Name, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
@@ -510,6 +600,15 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	clone := *src
 	clone.Name = req.Name
 	clone.UUID = ""
+
+	// The caller's own shape wins over the source's, on both clone paths.
+	if len(req.LayerList) > 0 {
+		clone.LayerStack = req.LayerList
+	}
+
+	if req.ResourceGroup != "" {
+		clone.ResourceGroupName = req.ResourceGroup
+	}
 
 	if src.Props != nil || len(req.OverrideProps) > 0 {
 		clone.Props = make(map[string]string, len(src.Props)+len(req.OverrideProps))
