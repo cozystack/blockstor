@@ -70,6 +70,35 @@ func (s *volumeDefinitions) List(ctx context.Context, rdName string) ([]apiv1.Vo
 	return out, nil
 }
 
+// ListAll reads every definition's inline volumes from one list of the
+// ResourceDefinition CRDs, so the request count does not grow with the number
+// of definitions.
+func (s *volumeDefinitions) ListAll(ctx context.Context) (map[string][]apiv1.VolumeDefinition, error) {
+	var crdList crdv1alpha1.ResourceDefinitionList
+
+	err := s.c.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrap(err, "list ResourceDefinition CRDs")
+	}
+
+	out := make(map[string][]apiv1.VolumeDefinition, len(crdList.Items))
+
+	for i := range crdList.Items {
+		rd := &crdList.Items[i]
+
+		vds := make([]apiv1.VolumeDefinition, 0, len(rd.Spec.VolumeDefinitions))
+		for j := range rd.Spec.VolumeDefinitions {
+			vds = append(vds, crdToWireVD(&rd.Spec.VolumeDefinitions[j]))
+		}
+
+		sort.Slice(vds, func(a, b int) bool { return vds[a].VolumeNumber < vds[b].VolumeNumber })
+
+		out[OriginalName(&rd.ObjectMeta)] = vds
+	}
+
+	return out, nil
+}
+
 func (s *volumeDefinitions) Get(ctx context.Context, rdName string, volumeNumber int32) (apiv1.VolumeDefinition, error) {
 	rd, err := s.fetchRD(ctx, rdName)
 	if err == nil {
