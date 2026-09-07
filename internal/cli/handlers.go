@@ -413,7 +413,7 @@ func volumeSizesInOneRequest(ctx context.Context, run *runContext, names []strin
 	sizes := make(map[string]map[int32]int64, len(names))
 
 	for _, name := range names {
-		vds, ok := all[name]
+		vds, ok := all[store.FoldName(name)]
 		if !ok {
 			continue
 		}

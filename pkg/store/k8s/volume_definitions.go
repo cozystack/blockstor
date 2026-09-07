@@ -73,6 +73,10 @@ func (s *volumeDefinitions) List(ctx context.Context, rdName string) ([]apiv1.Vo
 // ListAll reads every definition's inline volumes from one list of the
 // ResourceDefinition CRDs, so the request count does not grow with the number
 // of definitions.
+//
+// Keyed by store.FoldName of the definition's LINSTOR name: the caller holds
+// whatever spelling its own objects carry, which for a replica is
+// Spec.ResourceDefinitionName and need not match the definition's own.
 func (s *volumeDefinitions) ListAll(ctx context.Context) (map[string][]apiv1.VolumeDefinition, error) {
 	var crdList crdv1alpha1.ResourceDefinitionList
 
@@ -93,7 +97,7 @@ func (s *volumeDefinitions) ListAll(ctx context.Context) (map[string][]apiv1.Vol
 
 		sort.Slice(vds, func(a, b int) bool { return vds[a].VolumeNumber < vds[b].VolumeNumber })
 
-		out[OriginalName(&rd.ObjectMeta)] = vds
+		out[store.FoldName(OriginalName(&rd.ObjectMeta))] = vds
 	}
 
 	return out, nil

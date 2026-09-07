@@ -26,6 +26,7 @@ package store
 
 import (
 	"context"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -256,6 +257,16 @@ type ResourceStore interface {
 	PatchResourceSpec(ctx context.Context, rdName, node string, mutate func(*apiv1.Resource) error) error
 }
 
+// FoldName canonicalises a LINSTOR object name for use as a map key, or for
+// comparing two spellings of the same object. LINSTOR identifiers are
+// case-insensitive — `DfltRscGrp` and `dfltrscgrp` address one resource group,
+// which is why the Kubernetes store lowercases them on the way to a CRD name
+// (pkg/store/k8s/crdname.go). Anything that keys objects by name owes its
+// callers the same equality the store itself uses.
+func FoldName(name string) string {
+	return strings.ToLower(name)
+}
+
 // VolumeDefinitionStore persists VolumeDefinition objects. The composite
 // key is (resource_definition_name, volume_number); upstream LINSTOR keeps
 // VolumeDefinitions inline on the ResourceDefinition, and so do we (the CRD
@@ -265,7 +276,15 @@ type VolumeDefinitionStore interface {
 	List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error)
 
 	// ListAll returns every definition's volumes in ONE request, keyed by
-	// resource-definition name.
+	// FoldName of the resource-definition name — look an entry up with
+	// FoldName(name), not with the name as you hold it.
+	//
+	// The fold is not decoration. A replica names its definition in
+	// whatever case it was written with, and the definition itself is
+	// stored in whatever case IT was written with; LINSTOR treats the two
+	// as the same object and a map does not. Keyed raw, a caller holding
+	// the replica's spelling silently misses the entry and renders a
+	// definition as though it had no volumes.
 	//
 	// List answers for one definition, and a caller that needs the whole
 	// cluster's volumes has to call it once per name. On the Kubernetes
