@@ -334,51 +334,104 @@ func resourceList(ctx context.Context, run *runContext) error {
 	}), "State", "Conns")
 }
 
-// volumeSizesFor collects the per-volume sizes of the definitions in a
-// listing, keyed the way the view expects. A definition whose sizes
-// cannot be read is skipped rather than failing the listing: a missing
-// percentage is a cosmetic loss, an unreadable `resource list` during
-// an incident is not.
+// volumeSizesBulkCutoff is where reading the definitions one at a time stops
+// being the cheaper of the two reads. Below it a listing narrowed by `-r`,
+// `-n` or `--limit` pays that many GETs; above it, one request for the lot.
+const volumeSizesBulkCutoff = 16
+
 // volumeSizesFor builds the per-volume sizes the sync-percentage column needs.
 //
-// One request, not one per definition. This used to loop over the listing and
-// call VolumeDefinitions().List for every distinct name, and on the Kubernetes
-// store each of those is a GET of one ResourceDefinition against an uncached
-// client — so `resource list` on a cluster with a thousand definitions was one
-// LIST plus a thousand sequential round trips, in the command an operator runs
-// while watching a resync.
+// Two reads, chosen on how much of the cluster the listing actually covers.
+// Reading them one definition at a time is what this used to do
+// unconditionally, and on the Kubernetes store each of those is a GET of one
+// ResourceDefinition against an uncached client — so `resource list` on a
+// cluster with a thousand definitions was one LIST plus a thousand sequential
+// round trips, in the command an operator runs while watching a resync.
+// Reading them all in one request fixes that and breaks the opposite case:
+// `resource list -r one-volume` asked about one definition and would pull
+// every definition in the cluster back to answer it.
 //
-// A read failure leaves the map empty rather than failing the listing: the
-// column degrades to a bare state, which is what the per-definition version
-// did when one of its reads failed.
+// So the listing picks. Either side of the cutoff the answer is identical;
+// only the number of requests and the size of them differ.
+//
+// A read that fails leaves that definition out rather than failing the
+// listing: the column degrades to a bare state, which is what the
+// per-definition version did when one of its reads failed. A missing
+// percentage is a cosmetic loss; an unreadable `resource list` during an
+// incident is not.
 func volumeSizesFor(ctx context.Context, run *runContext, resources []apiv1.Resource) map[string]map[int32]int64 {
+	names := distinctDefinitionNames(resources)
+
+	if len(names) <= volumeSizesBulkCutoff {
+		return volumeSizesPerDefinition(ctx, run, names)
+	}
+
+	return volumeSizesInOneRequest(ctx, run, names)
+}
+
+// distinctDefinitionNames is the set of definitions a listing covers, in
+// first-seen order — every replica of one definition asks the same question.
+func distinctDefinitionNames(resources []apiv1.Resource) []string {
+	seen := make(map[string]struct{}, len(resources))
+	names := make([]string, 0, len(resources))
+
+	for i := range resources {
+		name := resources[i].Name
+		if _, dup := seen[name]; dup {
+			continue
+		}
+
+		seen[name] = struct{}{}
+
+		names = append(names, name)
+	}
+
+	return names
+}
+
+func volumeSizesPerDefinition(ctx context.Context, run *runContext, names []string) map[string]map[int32]int64 {
+	sizes := make(map[string]map[int32]int64, len(names))
+
+	for _, name := range names {
+		vds, err := run.Store.VolumeDefinitions().List(ctx, name)
+		if err != nil {
+			continue
+		}
+
+		sizes[name] = perVolumeSizes(vds)
+	}
+
+	return sizes
+}
+
+func volumeSizesInOneRequest(ctx context.Context, run *runContext, names []string) map[string]map[int32]int64 {
 	all, err := run.Store.VolumeDefinitions().ListAll(ctx)
 	if err != nil {
 		return map[string]map[int32]int64{}
 	}
 
-	sizes := make(map[string]map[int32]int64, len(resources))
+	sizes := make(map[string]map[int32]int64, len(names))
 
-	for i := range resources {
-		name := resources[i].Name
-		if _, done := sizes[name]; done {
-			continue
-		}
-
+	for _, name := range names {
 		vds, ok := all[name]
 		if !ok {
 			continue
 		}
 
-		perVolume := make(map[int32]int64, len(vds))
-		for j := range vds {
-			perVolume[vds[j].VolumeNumber] = vds[j].SizeKib
-		}
-
-		sizes[name] = perVolume
+		sizes[name] = perVolumeSizes(vds)
 	}
 
 	return sizes
+}
+
+// perVolumeSizes keys one definition's volumes the way the view reads them.
+func perVolumeSizes(vds []apiv1.VolumeDefinition) map[int32]int64 {
+	out := make(map[int32]int64, len(vds))
+	for i := range vds {
+		out[vds[i].VolumeNumber] = vds[i].SizeKib
+	}
+
+	return out
 }
 
 // machineOut writes the machine-readable envelope.
