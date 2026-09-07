@@ -11,6 +11,19 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
+// seedCloneRG puts a resource group in the store. A clone that pins one by
+// name is refused when it is not there, so every test that exercises
+// resource_group has to create it first — the same order an operator works in.
+func seedCloneRG(t *testing.T, st store.Store, names ...string) {
+	t.Helper()
+
+	for _, name := range names {
+		if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{Name: name}); err != nil {
+			t.Fatalf("seed RG %q: %v", name, err)
+		}
+	}
+}
+
 // linstor-csi defaults LayerList to [DRBD, STORAGE] and never sends a clone
 // without it, so a field this endpoint does not declare is a 400 on every
 // clone-from-volume regardless of how the StorageClass is written. The body
@@ -22,6 +35,8 @@ func TestRDCloneAcceptsTheFullGolinstorBody(t *testing.T) {
 		&apiv1.ResourceDefinition{Name: "pvc-src", ResourceGroupName: "grp"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+
+	seedCloneRG(t, st, "grp")
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
@@ -57,6 +72,8 @@ func TestRDCloneHonoursLayerListAndResourceGroup(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+
+	seedCloneRG(t, st, "chosen-grp")
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
@@ -127,6 +144,7 @@ func TestRDCloneHonoursTheCallersShapeOnTheDataPath(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 	seedDeployedCloneSource(t, st, "src-shape")
+	seedCloneRG(t, st, "chosen-grp")
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()

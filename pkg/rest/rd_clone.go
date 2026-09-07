@@ -131,6 +131,14 @@ func (s *Server) registerRDClone(mux *http.ServeMux) {
 func (s *Server) cloneRequestIsHonourable(
 	ctx context.Context, w http.ResponseWriter, srcName string, req *rdCloneRequest,
 ) bool {
+	return cloneRequestDropsNothing(w, srcName, req) &&
+		s.cloneRequestShapeIsUsable(ctx, w, srcName, req)
+}
+
+// cloneRequestDropsNothing refuses the fields blockstor would accept and then
+// not act on. See cloneRequestIsHonourable for why silence is not an option
+// for either of them.
+func cloneRequestDropsNothing(w http.ResponseWriter, srcName string, req *rdCloneRequest) bool {
 	if req.ExternalName != "" {
 		writeCloneRefused(w, http.StatusNotImplemented, srcName, req.Name, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
@@ -153,6 +161,15 @@ func (s *Server) cloneRequestIsHonourable(
 		return false
 	}
 
+	return true
+}
+
+// cloneRequestShapeIsUsable validates the shape the caller picked for the
+// clone: a layer stack that can be materialised at all, the passphrase LUKS
+// needs, and a parent resource group that exists.
+func (s *Server) cloneRequestShapeIsUsable(
+	ctx context.Context, w http.ResponseWriter, srcName string, req *rdCloneRequest,
+) bool {
 	// Validated the way rg-modify validates its stack, so an
 	// unmaterialisable layer chain is refused here rather than persisting
 	// onto the clone for a satellite to choke on.
@@ -171,6 +188,40 @@ func (s *Server) cloneRequestIsHonourable(
 		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
 			Message: "clone of resource definition '" + srcName + "': " + luksErr.Error(),
+		})
+
+		return false
+	}
+
+	return s.cloneResourceGroupExists(ctx, w, srcName, req)
+}
+
+// cloneResourceGroupExists applies the Bug 134 gate to the group a clone pins
+// for itself. `resource_group` lands on the target on both clone paths — the
+// shallow copy stamps it directly, the data-plane path hands it to
+// materializeRestoredRD as a shape override — and neither went past the
+// validator the RD-create path runs, so a typo produced a clone whose parent
+// group does not exist. That RD lists fine and places badly: the placer's
+// Controller→RG→RD prop walk drops the RG tier without a word, taking
+// auto-place, auto-diskful, place_count and rebalance with it.
+func (s *Server) cloneResourceGroupExists(
+	ctx context.Context, w http.ResponseWriter, srcName string, req *rdCloneRequest,
+) bool {
+	found, err := s.lookupPinnedRG(ctx, req.ResourceGroup)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + srcName + "': " + err.Error(),
+		})
+
+		return false
+	}
+
+	if !found {
+		writeCloneRefused(w, http.StatusNotFound, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + srcName + "': " + unknownRGMessage(req.ResourceGroup),
+			Correc:  "create the resource group first, or omit resource_group to inherit the source's",
 		})
 
 		return false

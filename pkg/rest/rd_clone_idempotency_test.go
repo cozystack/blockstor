@@ -148,3 +148,90 @@ func TestRDCloneStillRefusesAForeignTarget(t *testing.T) {
 		t.Error("the refused clone overwrote the definition that was already there")
 	}
 }
+
+// resource_group lands on the target on both clone paths — the shallow copy
+// stamps it, the data path hands it to materializeRestoredRD — and neither
+// went past the validator RD-create runs. A typo produced a clone whose parent
+// group does not exist: it lists fine and places badly, because the placer's
+// Controller→RG→RD prop walk drops the RG tier without a word.
+func TestRDCloneRefusesAnUnknownResourceGroup(t *testing.T) {
+	t.Parallel()
+
+	for name, src := range map[string]func(t *testing.T, st store.Store){
+		"volume-less source": func(t *testing.T, st store.Store) {
+			t.Helper()
+
+			if err := st.ResourceDefinitions().Create(t.Context(),
+				&apiv1.ResourceDefinition{Name: "src-rg"}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+		},
+		"source with volumes": func(t *testing.T, st store.Store) {
+			t.Helper()
+			seedDeployedCloneSource(t, st, "src-rg")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewInMemory()
+			src(t, st)
+
+			base, stop := startServerWithStore(t, st)
+			defer stop()
+
+			resp := postClone(t, base, "src-rg", map[string]any{
+				"name":           "dst-rg",
+				"resource_group": "no-such-group",
+			})
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 — that resource group does not exist",
+					resp.StatusCode)
+			}
+
+			if _, err := st.ResourceDefinitions().Get(t.Context(), "dst-rg"); err == nil {
+				t.Error("the refused clone was created anyway, with a dangling parent group")
+			}
+		})
+	}
+}
+
+// The positive control: the same request with the group actually there.
+func TestRDCloneHonoursAKnownResourceGroup(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(),
+		&apiv1.ResourceDefinition{Name: "src-rg-ok"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := st.ResourceGroups().Create(t.Context(),
+		&apiv1.ResourceGroup{Name: "real-group"}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postClone(t, base, "src-rg-ok", map[string]any{
+		"name":           "dst-rg-ok",
+		"resource_group": "real-group",
+	})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(t.Context(), "dst-rg-ok")
+	if err != nil {
+		t.Fatalf("get the clone: %v", err)
+	}
+
+	if got.ResourceGroupName != "real-group" {
+		t.Errorf("resource group = %q, want the one the caller asked for", got.ResourceGroupName)
+	}
+}

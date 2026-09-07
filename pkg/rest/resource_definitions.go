@@ -482,34 +482,61 @@ func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, bo
 // caller may proceed, false when the HTTP error has already been
 // written.
 func (s *Server) refuseRDCreateOnUnknownRG(w http.ResponseWriter, r *http.Request, rd *apiv1.ResourceDefinition) bool {
-	if rd.ResourceGroupName == "" {
-		return true
-	}
-
-	// CreateVolume hot path: linstor-csi ensures the StorageClass's RG
-	// (POST /v1/resource-groups) and POSTs the RD referencing it
-	// back-to-back; the local informer cache may not have observed the
-	// RG write yet. Retry the NotFound under the standard budget so
-	// the Bug 134 gate doesn't refuse a perfectly valid create — see
-	// pkg/rest/cache_retry.go. A real typo still 404s after the budget.
-	_, err := getRGWithCacheRetry(r.Context(), s.Store, rd.ResourceGroupName)
-	if err == nil {
-		return true
-	}
-
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound,
-			"resource group '"+rd.ResourceGroupName+
-				"' not found: create the resource group first with "+
-				"`linstor rg c <name>` or pass a valid existing "+
-				"resource group name")
+	found, err := s.lookupPinnedRG(r.Context(), rd.ResourceGroupName)
+	if err != nil {
+		writeStoreError(w, err)
 
 		return false
 	}
 
-	writeStoreError(w, err)
+	if !found {
+		writeError(w, http.StatusNotFound, unknownRGMessage(rd.ResourceGroupName))
 
-	return false
+		return false
+	}
+
+	return true
+}
+
+// lookupPinnedRG resolves a resource group a caller pinned by name. found is
+// false with a nil error when the group simply is not there; a non-nil error
+// is a store failure, which is a different answer and deserves a different
+// response.
+//
+// CreateVolume hot path: linstor-csi ensures the StorageClass's RG (POST
+// /v1/resource-groups) and POSTs the RD referencing it back-to-back; the
+// local informer cache may not have observed the RG write yet. Retrying the
+// NotFound under the standard budget keeps the Bug 134 gate from refusing a
+// perfectly valid create — see pkg/rest/cache_retry.go. A real typo still
+// comes back unknown once the budget is spent.
+//
+// The empty name means the caller pinned no group, which is not an error on
+// any of the endpoints that ask.
+func (s *Server) lookupPinnedRG(ctx context.Context, rgName string) (bool, error) {
+	if rgName == "" {
+		return true, nil
+	}
+
+	_, err := getRGWithCacheRetry(ctx, s.Store, rgName)
+	if err == nil {
+		return true, nil
+	}
+
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+
+	return false, err
+}
+
+// unknownRGMessage is the single wording for a pinned group that is not
+// there, so an operator reads the same correction whichever endpoint refused
+// them for it.
+func unknownRGMessage(rgName string) string {
+	return "resource group '" + rgName +
+		"' not found: create the resource group first with " +
+		"`linstor rg c <name>` or pass a valid existing " +
+		"resource group name"
 }
 
 // refuseRDUpdateOnUnknownRG is Bug 372's gate, the symmetric pair to
