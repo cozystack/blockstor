@@ -22,6 +22,7 @@ import (
 	"context"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/LINBIT/golinstor/client"
@@ -292,7 +293,8 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	if s.cloneTargetPreexists(ctx, w, src.Name, req.Name) {
+	resume, stop := s.cloneTargetState(ctx, w, src.Name, req.Name)
+	if stop {
 		return
 	}
 
@@ -345,13 +347,26 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
+	writeCloneDone(w, resume, src.Name, req.Name)
+}
+
+// writeCloneDone reports a finished clone, naming whether it completed a
+// leftover so a retry reads as one in the caller's own output instead of
+// looking like a first run. Mirrors writeRestoreDone, which draws the same
+// distinction on the endpoint this one shares its data plane with.
+func writeCloneDone(w http.ResponseWriter, resumed bool, srcName, cloneName string) {
+	message := "resource definition cloned: " + cloneName
+	if resumed {
+		message = "resource definition clone completed on retry: " + cloneName
+	}
+
 	writeJSON(w, http.StatusCreated, cloneStartedResponse{
-		Location:   "/v1/resource-definitions/" + src.Name + "/clone/" + req.Name,
-		SourceName: src.Name,
-		CloneName:  req.Name,
+		Location:   "/v1/resource-definitions/" + srcName + "/clone/" + cloneName,
+		SourceName: srcName,
+		CloneName:  cloneName,
 		Messages: &[]apiv1.APICallRc{{
 			RetCode: maskInfo,
-			Message: "resource definition cloned: " + req.Name,
+			Message: message,
 		}},
 	})
 }
@@ -420,45 +435,58 @@ func cloneSnapshotName(cloneName string) string {
 	return "clone-" + cloneName
 }
 
-// cloneTargetPreexists handles the clone-target-already-exists edge
-// up front (true = response already written):
+// cloneTargetState decides what a definition already under the clone's target
+// name means. It returns (resume, stop): stop when an answer has already been
+// written, resume when the caller should re-run the clone over the leftover.
 //
-//   - target carrying OUR restore marker for this exact source +
-//     internal snapshot → idempotent retry of a clone that already
-//     materialised (linstor-csi replays CreateVolume until it sees
-//     success); answer 201 + the same CloneStarted envelope.
-//   - any other pre-existing RD under that name → 409 refusal in
-//     CloneStarted shape (a bare store AlreadyExists envelope would
-//     crash python-linstor's clone decode).
-func (s *Server) cloneTargetPreexists(ctx context.Context, w http.ResponseWriter, srcName, cloneName string) bool {
+// The restore marker is what makes a leftover recognisable, and it is NOT
+// evidence that the clone finished. materializeRestoredRD stamps it with the
+// definition, then hydrates the volumes and places the replicas, so a failure
+// in either leaves the marker sitting on an empty shell. Answering 201 on the
+// marker alone — which this did — turns the retry linstor-csi issues after a
+// partial failure into a silent incomplete: CSI sees the volume as ready and
+// nothing ever finishes it. Re-running is safe because every clone step
+// tolerates an object a previous attempt already created, so it completes what
+// is missing and leaves what is there. Same split restoreTargetState draws on
+// the restore path, for the same reason.
+//
+// A leftover mid-tear-down is refused rather than resumed: the deletion is
+// reaping the very objects completing the clone would be writing.
+//
+// Anything else under that name is a genuine collision and stays a refusal, in
+// CloneStarted shape — a bare store AlreadyExists envelope would crash
+// python-linstor's clone decode.
+func (s *Server) cloneTargetState(ctx context.Context, w http.ResponseWriter, srcName, cloneName string) (bool, bool) {
 	existing, err := s.Store.ResourceDefinitions().Get(ctx, cloneName)
 	if err != nil {
 		// NotFound (or any read blip) → proceed with the create;
 		// a real store outage surfaces on the next write anyway.
-		return false
+		return false, false
 	}
 
-	if existing.Props["BlockstorRestoreFromSnapshot"] == srcName+":"+cloneSnapshotName(cloneName) {
-		writeJSON(w, http.StatusCreated, cloneStartedResponse{
-			Location:   "/v1/resource-definitions/" + srcName + "/clone/" + cloneName,
-			SourceName: srcName,
-			CloneName:  cloneName,
-			Messages: &[]apiv1.APICallRc{{
-				RetCode: maskInfo,
-				Message: "resource definition already cloned: " + cloneName,
-			}},
+	if existing.Props[restoreFromSnapshotKey] != restoreMarker(srcName, cloneSnapshotName(cloneName)) {
+		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone target '" + cloneName + "' already exists and is not a clone of '" + srcName + "'",
+			Correc:  "pick a different clone name, or delete the existing resource definition first",
 		})
 
-		return true
+		return false, true
 	}
 
-	writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
-		RetCode: apiCallRcError,
-		Message: "clone target '" + cloneName + "' already exists and is not a clone of '" + srcName + "'",
-		Correc:  "pick a different clone name, or delete the existing resource definition first",
-	})
+	if slices.Contains(existing.Flags, rdFlagDelete) {
+		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone target '" + cloneName + "' is being deleted",
+			Cause: "the leftover from an earlier attempt at this clone carries the DELETE " +
+				"flag; completing it would race the tear-down reaping what it writes",
+			Correc: "wait for the delete to finish, then re-issue the clone",
+		})
 
-	return true
+		return false, true
+	}
+
+	return true, false
 }
 
 // ensureCloneSnapshot takes (or reuses) the internal snapshot backing

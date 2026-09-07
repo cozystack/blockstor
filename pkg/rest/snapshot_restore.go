@@ -321,7 +321,7 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// it finished. Answering success on the marker alone would turn the
 	// terminal failure this fixes into a silent incomplete one: CSI would
 	// see the volume as ready and nothing would ever finish it.
-	resume, stop := s.restoreTargetState(r.Context(), w, srcRD, snapName, req.ToResource)
+	resume, stop := s.restoreTargetState(r.Context(), w, &snap, req.ToResource)
 	if stop {
 		return
 	}
@@ -371,10 +371,20 @@ func writeRestoreDone(w http.ResponseWriter, resumed bool, snapName, rdName stri
 // objects a previous attempt already created, so re-running them completes
 // what is missing and leaves what is there.
 //
+// A leftover mid-tear-down is refused rather than resumed: the deletion is
+// reaping the very objects finishing the restore would be writing.
+//
 // Anything else under that name is a genuine collision and stays a refusal: a
 // name holding somebody else's definition must not come back as a restore
 // that never happened.
-func (s *Server) restoreTargetState(ctx context.Context, w http.ResponseWriter, srcRD, snapName, toResource string) (bool, bool) {
+//
+// The snapshot is taken as the stored object, not as the names the request
+// spelled, because the marker is written off the same object: LINSTOR folds
+// name case, so a retry arriving as `--from-snapshot SNAP` over a marker
+// stamped `snap` would read as somebody else's definition and be refused —
+// which is precisely the terminal-on-first-failure behaviour this resume path
+// exists to end.
+func (s *Server) restoreTargetState(ctx context.Context, w http.ResponseWriter, snap *apiv1.Snapshot, toResource string) (bool, bool) {
 	existing, err := s.Store.ResourceDefinitions().Get(ctx, toResource)
 	if err != nil {
 		// NotFound, or a read blip: proceed with the create, which
@@ -382,18 +392,30 @@ func (s *Server) restoreTargetState(ctx context.Context, w http.ResponseWriter, 
 		return false, false
 	}
 
-	if existing.Props[restoreFromSnapshotKey] == srcRD+":"+snapName {
-		return true, false
+	if existing.Props[restoreFromSnapshotKey] != restoreMarker(snap.ResourceName, snap.Name) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + toResource + "' already exists and is not a restore of '" +
+				snap.Name + "'",
+			Correc: "restore under a different name, or delete the existing resource definition first",
+		}})
+
+		return false, true
 	}
 
-	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-		RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
-		Message: "resource definition '" + toResource + "' already exists and is not a restore of '" +
-			snapName + "'",
-		Correc: "restore under a different name, or delete the existing resource definition first",
-	}})
+	if slices.Contains(existing.Flags, rdFlagDelete) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + toResource + "' is being deleted",
+			Cause: "the leftover from an earlier attempt at this restore carries the DELETE " +
+				"flag; finishing it would race the tear-down reaping what it writes",
+			Correc: "wait for the delete to finish, then re-issue the restore",
+		}})
 
-	return false, true
+		return false, true
+	}
+
+	return true, false
 }
 
 // restoreFromSnapshotKey marks a definition as produced by a snapshot
@@ -401,6 +423,13 @@ func (s *Server) restoreTargetState(ctx context.Context, w http.ResponseWriter, 
 // the storage provider to RestoreVolumeFromSnapshot, and the retry path above
 // reads it to tell its own leftover from somebody else's definition.
 const restoreFromSnapshotKey = "BlockstorRestoreFromSnapshot"
+
+// restoreMarker builds that value. Both halves come off the stored Snapshot
+// rather than off the request, so the marker a retry compares is the marker
+// the first attempt wrote whichever way the caller spelled the names.
+func restoreMarker(srcRD, snapName string) string {
+	return srcRD + ":" + snapName
+}
 
 // validateRestoreNodesHoldSnapshot is the Bug 397 input-validation guard
 // for the explicit `--node-name` restore path. It rejects the request when
@@ -545,7 +574,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		newRD.Props = map[string]string{}
 	}
 
-	newRD.Props[restoreFromSnapshotKey] = srcRD + ":" + snap.Name
+	newRD.Props[restoreFromSnapshotKey] = restoreMarker(snap.ResourceName, snap.Name)
 
 	// AlreadyExists is tolerated when the definition already there is this
 	// restore's own — the resume path above, or a second restore of the
@@ -564,7 +593,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 			return "", getErr //nolint:wrapcheck // surfaced via writeStoreError
 		}
 
-		if existing.Props[restoreFromSnapshotKey] != srcRD+":"+snap.Name {
+		if existing.Props[restoreFromSnapshotKey] != restoreMarker(snap.ResourceName, snap.Name) {
 			return "", err //nolint:wrapcheck // surfaced via writeStoreError
 		}
 	}
