@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -75,73 +76,93 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 // ListByNode asks the API server for the node's replicas instead of pulling
 // the whole cluster back and filtering here.
 //
-// The selector is server-side, on the spec.nodeName selectable field the CRD
-// declares. That is deliberately not the label the objects usually carry: a
-// replica applied by hand has no label, and a selector over it would return a
+// The selector is on the spec.nodeName selectable field the CRD declares. That
+// is deliberately not the label the objects usually carry: a replica applied
+// by hand has no label, and a selector over it would return a
 // partial-but-correct subset — the Bug 038 shape, where the missing replicas
 // were invisible rather than an error.
-//
-// A cluster whose CRD predates the selectable field REJECTS the list rather
-// than answering it partially, which is why falling back is safe: the failure
-// is loud, and the fallback is the exhaustive read this replaced.
 func (s *resources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
-	var crdList crdv1alpha1.ResourceList
-
-	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{"spec.nodeName": node})
+	out, err := s.listScoped(ctx, FieldResourceNodeName, node,
+		func(r *crdv1alpha1.Resource) bool { return r.Spec.NodeName == node })
 	if err != nil {
-		return s.listByNodeExhaustively(ctx, node)
+		return nil, err
 	}
 
-	out := make([]apiv1.Resource, 0, len(crdList.Items))
-	for i := range crdList.Items {
-		out = append(out, crdToWireResource(&crdList.Items[i]))
-	}
-
-	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
+	// Every replica here is on the same node, so the definition is what
+	// distinguishes them.
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 
 	return out, nil
 }
 
-func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
-	// Scan-and-filter on the authoritative Spec.ResourceDefinitionName.
-	//
-	// Bug 038: an earlier "fast path" trusted a label-selector
-	// (`LabelResourceDefinition`) and only fell back to a full scan
-	// when the selector returned ZERO items, on the assumption that a
-	// partial-but-correct subset was impossible because "every REST
-	// writer sets the label". That assumption breaks for MIXED RDs: a
-	// source RD whose diskful replicas were applied via `kubectl apply`
-	// (e2e fixtures, operator-authored manifests — NO label) but whose
-	// auto-tiebreaker witness was stamped by the controller (WITH the
-	// label). The selector then returned only the labeled witness, the
-	// fallback was skipped, and the unlabeled diskful replicas became
-	// invisible. The snapshot-restore / clone handler reads this list
-	// to resolve the SOURCE pool (storPoolsByNodeFromSourceRD); with
-	// the diskful replicas hidden it stamped the clone replicas with an
-	// EMPTY StorPoolName and the satellite failed every reconcile with
-	// `unknown storage pool ""` (clone.sh never converges).
-	//
-	// The List below is served from the controller-runtime informer
-	// cache (no apiserver round-trip), so filtering on the spec field
-	// in-memory costs the same as a cache-side label index but is
-	// correct for labeled and unlabeled replicas alike.
+// listScoped answers a scoped question with a scoped read, and falls back to
+// the exhaustive one when the server cannot serve the selector.
+//
+// The same call has two implementations behind it. Against the uncached
+// client the CLI uses it becomes a fieldSelector on the wire and the API
+// server filters; against a manager's cached client it is served from the
+// index RegisterFieldIndexes installs. Either can be missing — a cluster whose
+// CRD predates the selectable field REJECTS the query, and a manager that
+// never registered the index fails it — and both fail loudly rather than
+// answering partially, which is what makes falling back to the exhaustive read
+// safe rather than a silent downgrade to a wrong answer.
+//
+// The fallback is logged because it is not free: it is the whole-cluster read
+// the scoped one exists to avoid, and an operator wondering why a large
+// cluster crawls deserves to find out from the logs rather than from a
+// profiler.
+func (s *resources) listScoped(
+	ctx context.Context, field, value string, keep func(*crdv1alpha1.Resource) bool,
+) ([]apiv1.Resource, error) {
 	var crdList crdv1alpha1.ResourceList
 
-	err := s.c.List(ctx, &crdList)
-	if err != nil {
-		return nil, errors.Wrapf(err, "list Resource CRDs for RD %q", rdName)
-	}
-
-	out := make([]apiv1.Resource, 0, len(crdList.Items))
-
-	for i := range crdList.Items {
-		if crdList.Items[i].Spec.ResourceDefinitionName != rdName {
-			continue
+	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{field: value})
+	if err == nil {
+		out := make([]apiv1.Resource, 0, len(crdList.Items))
+		for i := range crdList.Items {
+			out = append(out, crdToWireResource(&crdList.Items[i]))
 		}
 
-		out = append(out, crdToWireResource(&crdList.Items[i]))
+		return out, nil
 	}
 
+	log.FromContext(ctx).V(1).Info("scoped Resource read unavailable; reading every replica instead",
+		"field", field, "value", value, "reason", err.Error())
+
+	return s.listExhaustively(ctx, field, value, keep)
+}
+
+func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
+	// Scoped on the authoritative Spec.ResourceDefinitionName, never on a
+	// label.
+	//
+	// Bug 038: an earlier "fast path" trusted a label-selector
+	// (`LabelResourceDefinition`) and only fell back to a full scan when the
+	// selector returned ZERO items, on the assumption that a
+	// partial-but-correct subset was impossible because "every REST writer
+	// sets the label". That assumption breaks for MIXED RDs: a source RD
+	// whose diskful replicas were applied via `kubectl apply` (e2e fixtures,
+	// operator-authored manifests — NO label) but whose auto-tiebreaker
+	// witness was stamped by the controller (WITH the label). The selector
+	// then returned only the labeled witness, the fallback was skipped, and
+	// the unlabeled diskful replicas became invisible. The snapshot-restore /
+	// clone handler reads this list to resolve the SOURCE pool
+	// (storPoolsByNodeFromSourceRD); with the diskful replicas hidden it
+	// stamped the clone replicas with an EMPTY StorPoolName and the satellite
+	// failed every reconcile with `unknown storage pool ""` (clone.sh never
+	// converges).
+	//
+	// A selectable FIELD does not have that failure mode: it selects on the
+	// spec value every replica carries, whoever wrote it, and a server that
+	// cannot serve the selector says so instead of answering short.
+	out, err := s.listScoped(ctx, FieldResourceDefinitionName, rdName,
+		func(r *crdv1alpha1.Resource) bool { return r.Spec.ResourceDefinitionName == rdName })
+	if err != nil {
+		return nil, err
+	}
+
+	// Every replica here belongs to the same definition, so the node is what
+	// distinguishes them.
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
 
 	return out, nil
@@ -1028,27 +1049,28 @@ func wireToCRDResourceSpec(in *apiv1.Resource) crdv1alpha1.ResourceSpec {
 	}
 }
 
-// listByNodeExhaustively is the pre-selectable-field read, kept for clusters
-// whose CRD does not carry the field yet.
-func (s *resources) listByNodeExhaustively(ctx context.Context, node string) ([]apiv1.Resource, error) {
+// listExhaustively is the pre-selectable-field read: every Resource, filtered
+// here. It is what listScoped falls back to, and it stays correct whatever the
+// server can or cannot select on.
+func (s *resources) listExhaustively(
+	ctx context.Context, field, value string, keep func(*crdv1alpha1.Resource) bool,
+) ([]apiv1.Resource, error) {
 	var crdList crdv1alpha1.ResourceList
 
 	err := s.c.List(ctx, &crdList)
 	if err != nil {
-		return nil, errors.Wrapf(err, "list Resource CRDs for node %q", node)
+		return nil, errors.Wrapf(err, "list Resource CRDs for %s=%q", field, value)
 	}
 
 	out := make([]apiv1.Resource, 0, len(crdList.Items))
 
 	for i := range crdList.Items {
-		if crdList.Items[i].Spec.NodeName != node {
+		if !keep(&crdList.Items[i]) {
 			continue
 		}
 
 		out = append(out, crdToWireResource(&crdList.Items[i]))
 	}
-
-	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
 
 	return out, nil
 }

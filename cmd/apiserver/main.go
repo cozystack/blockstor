@@ -264,6 +264,14 @@ func main() {
 	// concurrent `vd c` against one RD both retry against a stale cache,
 	// re-derive the same number, exhaust the retry budget, and silently
 	// drop the second volume.
+	// The store's node- and definition-scoped reads select on fields; a
+	// cached client answers those from an index or not at all, and falling
+	// back means listing every replica in the cluster on every call.
+	if err := storek8s.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
+		setupLog.Error(err, "Failed to register field indexes")
+		os.Exit(1)
+	}
+
 	st := storek8s.NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
 
 	ready := newReadyState()
