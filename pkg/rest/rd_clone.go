@@ -288,6 +288,10 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv1.ResourceDefinition, req *rdCloneRequest) {
 	ctx := r.Context()
 
+	if !cloneLayerStackIsHonourable(w, src, req) {
+		return
+	}
+
 	if s.cloneTargetPreexists(ctx, w, src.Name, req.Name) {
 		return
 	}
@@ -350,6 +354,60 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 			Message: "resource definition cloned: " + req.Name,
 		}},
 	})
+}
+
+// cloneLayerStackIsHonourable refuses a clone whose requested layer stack
+// changes LUKS membership relative to the source. False means a refusal has
+// been written and the caller must stop.
+//
+// The clone data plane restores the source's bytes onto the target and brings
+// the layer stack up over them, in that order: applyStorageIfDiskful writes
+// the data, maybeLUKS runs after it, and luks.Format treats a device carrying
+// no LUKS header as one to format. So a `layer_list` that adds LUKS to a
+// plaintext source does not produce an encrypted copy — it formats the data
+// that was just restored away, and the clone reports COMPLETE over the
+// wreckage. This is the same reason volume_passphrases is refused a few lines
+// up: a clone that quietly does something other than copy the source is worse
+// than one that says it cannot.
+//
+// Dropping LUKS from an encrypted source is refused for the mirror reason: the
+// bytes stay ciphertext while the definition claims they are not, so the
+// target mounts as garbage.
+//
+// Only the data-bearing path calls this. A clone of a VD-less source carries
+// no bytes to lose, and choosing a different stack for the shell is what
+// accepting layer_list is for.
+func cloneLayerStackIsHonourable(w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest) bool {
+	if len(req.LayerList) == 0 {
+		return true
+	}
+
+	wantLUKS := apiv1.LayerInStack(req.LayerList, apiv1.LayerKindLUKS)
+	if wantLUKS == apiv1.LayerInStack(src.LayerStack, apiv1.LayerKindLUKS) {
+		return true
+	}
+
+	refusal := &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone of resource definition '" + src.Name +
+			"': layer_list adds LUKS to a plaintext source",
+		Cause: "the clone restores the source's data first and brings the layer stack up " +
+			"over it, so the LUKS format would run across the bytes it just restored",
+		Correc: "clone with the source's own layer stack; to end up with an encrypted " +
+			"copy, create an encrypted resource definition and copy into it",
+	}
+
+	if !wantLUKS {
+		refusal.Message = "clone of resource definition '" + src.Name +
+			"': layer_list drops LUKS from an encrypted source"
+		refusal.Cause = "the clone would carry the source's still-encrypted bytes under a " +
+			"definition that claims to be plaintext"
+		refusal.Correc = "clone with the source's own layer stack"
+	}
+
+	writeCloneRefused(w, http.StatusBadRequest, src.Name, req.Name, refusal)
+
+	return false
 }
 
 // cloneSnapshotName derives the internal snapshot name backing a
