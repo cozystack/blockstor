@@ -235,3 +235,57 @@ func TestRDCloneHonoursAKnownResourceGroup(t *testing.T) {
 		t.Errorf("resource group = %q, want the one the caller asked for", got.ResourceGroupName)
 	}
 }
+
+// delete_namespaces rides with override_props and delete_props on every
+// upstream props-modify body. Declaring its two neighbours and not it left
+// `linstor rd clone --delete-namespace NS` on the very 400 declaring the other
+// two was meant to end.
+func TestRDCloneHonoursDeleteNamespaces(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{
+		Name: "src-ns",
+		Props: map[string]string{
+			"DrbdOptions":              "bare",
+			"DrbdOptions/Net/protocol": "C",
+			"DrbdOptionsOther":         "keep",
+			"Aux/keep":                 "yes",
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postClone(t, base, "src-ns", map[string]any{
+		"name":              "dst-ns",
+		"delete_namespaces": []string{"DrbdOptions"},
+	})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — delete_namespaces is on every "+
+			"props-modify body upstream sends", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(t.Context(), "dst-ns")
+	if err != nil {
+		t.Fatalf("get the clone: %v", err)
+	}
+
+	for _, key := range []string{"DrbdOptions", "DrbdOptions/Net/protocol"} {
+		if _, present := got.Props[key]; present {
+			t.Errorf("prop %q survived the namespace delete", key)
+		}
+	}
+
+	// The namespace ends at the separator: a key that merely starts like it
+	// is a different key.
+	for _, key := range []string{"DrbdOptionsOther", "Aux/keep"} {
+		if _, present := got.Props[key]; !present {
+			t.Errorf("prop %q was deleted, and it is outside the named namespace", key)
+		}
+	}
+}

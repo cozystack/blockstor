@@ -75,11 +75,18 @@ import (
 //     lands on the same snapshot-clone path — an accepted
 //     divergence documented in docs/cli-parity-known-deltas.md.
 type rdCloneRequest struct {
-	Name          string            `json:"name"`
-	OverrideProps map[string]string `json:"override_props,omitempty"`
-	DeleteProps   []string          `json:"delete_props,omitempty"`
-	SrcSnapName   string            `json:"src_snap_name,omitempty"`
-	UseZfsClone   bool              `json:"use_zfs_clone,omitempty"`
+	// The props-modify triple every upstream endpoint that edits
+	// properties carries — override_props, delete_props,
+	// delete_namespaces. Embedded from golinstor rather than respelled
+	// field by field, because a respelling is how `delete_namespaces`
+	// went missing in the first place: `linstor rd clone
+	// --delete-namespace NS` kept hitting the very 400 that declaring
+	// its two neighbours was meant to end.
+	client.GenericPropsModify
+
+	Name        string `json:"name"`
+	SrcSnapName string `json:"src_snap_name,omitempty"`
+	UseZfsClone bool   `json:"use_zfs_clone,omitempty"`
 
 	// The remaining fields golinstor puts on the wire for this
 	// endpoint. They are declared because the body is decoded with
@@ -673,7 +680,7 @@ func (s *Server) clonePoolsSupportSnapshots(ctx context.Context, w http.Response
 // parity with the empty-shell path, which folds them in during the
 // shallow copy. No-op when the request carries neither.
 func (s *Server) applyClonePropEdits(ctx context.Context, req *rdCloneRequest) error {
-	if len(req.OverrideProps) == 0 && len(req.DeleteProps) == 0 {
+	if len(req.OverrideProps) == 0 && len(req.DeleteProps) == 0 && len(req.DeleteNamespaces) == 0 {
 		return nil
 	}
 
@@ -692,6 +699,8 @@ func (s *Server) applyClonePropEdits(ctx context.Context, req *rdCloneRequest) e
 			for _, k := range req.DeleteProps {
 				delete(rd.Props, k)
 			}
+
+			deletePropNamespaces(rd.Props, req.DeleteNamespaces)
 
 			return nil
 		})
@@ -757,6 +766,8 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	for _, k := range req.DeleteProps {
 		delete(clone.Props, k)
 	}
+
+	deletePropNamespaces(clone.Props, req.DeleteNamespaces)
 
 	err := s.Store.ResourceDefinitions().Create(r.Context(), &clone)
 	if err != nil {
