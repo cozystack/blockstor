@@ -705,6 +705,10 @@ func seedAutoQuorumDefaults(rd *apiv1.ResourceDefinition) {
 	}
 }
 
+// layerListField is the wire name of the layer stack, used where the value is
+// reported back to the caller rather than decoded.
+const layerListField = "layer_list"
+
 // mergeRDCreateLayerInputs reconciles the three wire shapes
 // `POST /v1/resource-definitions` accepts for the layer
 // composition:
@@ -729,10 +733,6 @@ func seedAutoQuorumDefaults(rd *apiv1.ResourceDefinition) {
 // ran against an empty `rd.LayerStack`, so any non-python client
 // that posts `{"resource_definition": {"name": "X"}, "layer_list":
 // ["DRBD","LUKS","STORAGE"]}` got an unencrypted RD silently.
-// layerListField is the wire name of the layer stack, used where the value is
-// reported back to the caller rather than decoded.
-const layerListField = "layer_list"
-
 func mergeRDCreateLayerInputs(body *apiv1.ResourceDefinitionCreate, rd *apiv1.ResourceDefinition) error {
 	// `layer_data` only enters the merge after we project it down to
 	// the bare string list; the validator + LUKS gate read a flat
