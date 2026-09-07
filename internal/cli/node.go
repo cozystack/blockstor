@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 	"github.com/cozystack/blockstor/internal/cli/view"
@@ -153,51 +154,29 @@ func checkNodeLostAllowed(ctx context.Context, run *runContext, name string) err
 
 // cascadeNodeObjects removes the replicas and pools that can never be
 // reconciled again.
+//
+// The same tear-down the REST node-delete runs, through the same function:
+// two spellings of "remove everything pointing at this node" drift, and this
+// one had drifted already — it read every replica in the cluster to find the
+// node's, which is the question ListByNode answers with one scoped read.
 func cascadeNodeObjects(ctx context.Context, run *runContext, name string) error {
-	resources, err := run.Store.Resources().List(ctx)
-	if err != nil {
-		return fmt.Errorf("list resources: %w", err)
-	}
-
-	for i := range resources {
-		if resources[i].NodeName != name {
-			continue
-		}
-
-		err = run.Store.Resources().Delete(ctx, resources[i].Name, name)
-		if err != nil && !isNotFound(err) {
-			return fmt.Errorf("delete resource %s on %s: %w", resources[i].Name, name, err)
-		}
-	}
-
-	pools, err := run.Store.StoragePools().ListByNode(ctx, name)
-	if err != nil {
-		return fmt.Errorf("list storage pools on %s: %w", name, err)
-	}
-
-	for i := range pools {
-		err = run.Store.StoragePools().Delete(ctx, name, pools[i].StoragePoolName)
-		if err != nil && !isNotFound(err) {
-			return fmt.Errorf("delete storage pool %s on %s: %w", pools[i].StoragePoolName, name, err)
-		}
-	}
-
-	return nil
+	//nolint:wrapcheck // the caller names the node and the operation
+	return store.CascadeOrphansForLostNode(ctx, run.Store, name)
 }
 
 // resourcesInUseOn names the replicas a consumer currently holds
 // Primary on the node, sorted so the message is stable.
 func resourcesInUseOn(ctx context.Context, run *runContext, name string) ([]string, error) {
-	resources, err := run.Store.Resources().List(ctx)
+	resources, err := run.Store.Resources().ListByNode(ctx, name)
 	if err != nil {
-		return nil, fmt.Errorf("list resources: %w", err)
+		return nil, fmt.Errorf("list replicas on %s: %w", name, err)
 	}
 
 	var inUse []string
 
 	for i := range resources {
 		res := &resources[i]
-		if res.NodeName == name && res.State.InUse != nil && *res.State.InUse {
+		if res.State.InUse != nil && *res.State.InUse {
 			inUse = append(inUse, res.Name)
 		}
 	}

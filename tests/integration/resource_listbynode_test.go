@@ -72,6 +72,25 @@ func TestResourceNodeFieldSelectorIsServedByTheAPIServer(t *testing.T) {
 			t.Errorf("selector returned a replica on %s", got.Items[i].Spec.NodeName)
 		}
 	}
+
+	// And through the store, which is what the callers actually use: the
+	// selector above proves the API server serves it, not that ListByNode
+	// asks for it. Answering from the fallback would pass the check above
+	// and still be the whole-cluster read.
+	replicas, err := k8sstore.New(stack.Env.Client).Resources().ListByNode(ctx, "node-1")
+	if err != nil {
+		t.Fatalf("ListByNode: %v", err)
+	}
+
+	if len(replicas) != 2 {
+		t.Fatalf("ListByNode returned %d replicas, want the 2 on node-1", len(replicas))
+	}
+
+	for i := range replicas {
+		if replicas[i].NodeName != "node-1" {
+			t.Errorf("ListByNode returned a replica on %s", replicas[i].NodeName)
+		}
+	}
 }
 
 // The store falls back to an exhaustive read when the selector is refused,
