@@ -64,6 +64,7 @@ func (s *inMemoryVolumeDefinitions) ListAll(_ context.Context) (map[string][]api
 	defer s.mu.RUnlock()
 
 	out := make(map[string][]apiv1.VolumeDefinition)
+
 	for k := range s.m {
 		key := FoldName(k.rd)
 		out[key] = append(out[key], s.m[k])

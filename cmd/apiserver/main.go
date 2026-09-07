@@ -267,7 +267,8 @@ func main() {
 	// The store's node- and definition-scoped reads select on fields; a
 	// cached client answers those from an index or not at all, and falling
 	// back means listing every replica in the cluster on every call.
-	if err := storek8s.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
+	err = storek8s.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer())
+	if err != nil {
 		setupLog.Error(err, "Failed to register field indexes")
 		os.Exit(1)
 	}

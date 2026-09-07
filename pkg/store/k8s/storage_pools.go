@@ -133,33 +133,6 @@ func (s *storagePools) ListByNode(ctx context.Context, node string) ([]apiv1.Sto
 	return out, nil
 }
 
-// listByNodeExhaustively filters every pool here, on the authoritative
-// Spec.NodeName.
-func (s *storagePools) listByNodeExhaustively(ctx context.Context, node string) ([]apiv1.StoragePool, error) {
-	var crdList crdv1alpha1.StoragePoolList
-
-	err := s.c.List(ctx, &crdList)
-	if err != nil {
-		return nil, errors.Wrapf(err, "list StoragePool CRDs on node %q", node)
-	}
-
-	out := make([]apiv1.StoragePool, 0, len(crdList.Items))
-
-	for i := range crdList.Items {
-		if crdList.Items[i].Spec.NodeName != node {
-			continue
-		}
-
-		out = append(out, crdToWireStoragePool(&crdList.Items[i]))
-	}
-
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].StoragePoolName < out[j].StoragePoolName
-	})
-
-	return out, nil
-}
-
 // Get returns the named pool on the named node, or ErrNotFound.
 //
 // Resolves the underlying CRD by Spec.NodeName / Spec.PoolName rather
@@ -542,4 +515,31 @@ func wireToCRDStoragePoolSpec(in *apiv1.StoragePool) crdv1alpha1.StoragePoolSpec
 		SharedSpaceID: in.SharedSpaceID,
 		Props:         in.Props,
 	}
+}
+
+// listByNodeExhaustively filters every pool here, on the authoritative
+// Spec.NodeName.
+func (s *storagePools) listByNodeExhaustively(ctx context.Context, node string) ([]apiv1.StoragePool, error) {
+	var crdList crdv1alpha1.StoragePoolList
+
+	err := s.c.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list StoragePool CRDs on node %q", node)
+	}
+
+	out := make([]apiv1.StoragePool, 0, len(crdList.Items))
+
+	for i := range crdList.Items {
+		if crdList.Items[i].Spec.NodeName != node {
+			continue
+		}
+
+		out = append(out, crdToWireStoragePool(&crdList.Items[i]))
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].StoragePoolName < out[j].StoragePoolName
+	})
+
+	return out, nil
 }

@@ -209,52 +209,7 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
 		}
 	})
-	// ListAll answers for the whole cluster in one request, and keys the
-	// answer folded. A caller holds whatever spelling its own objects
-	// carry — for a replica that is Spec.ResourceDefinitionName, which
-	// need not match the definition's own — and LINSTOR treats the two as
-	// one object where a map does not. Keyed raw, the lookup silently
-	// misses and the definition renders as though it had no volumes.
-	t.Run("ListAllKeysFolded", func(t *testing.T) {
-		s := newStore(t)
-		ctx := t.Context()
-
-		seedRD(t, s, "PVC-Mixed")
-		seedRD(t, s, "pvc-plain")
-
-		for _, rd := range []string{"PVC-Mixed", "pvc-plain"} {
-			if err := s.VolumeDefinitions().Create(ctx, rd,
-				&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
-				t.Fatalf("Create under %s: %v", rd, err)
-			}
-		}
-
-		all, err := s.VolumeDefinitions().ListAll(ctx)
-		if err != nil {
-			t.Fatalf("ListAll: %v", err)
-		}
-
-		if len(all) != 2 {
-			t.Errorf("ListAll returned %d definitions, want 2", len(all))
-		}
-
-		// The spelling a replica of that definition carries.
-		vds, ok := all[store.FoldName("pvc-mixed")]
-		if !ok {
-			keys := make([]string, 0, len(all))
-			for k := range all {
-				keys = append(keys, k)
-			}
-
-			slices.Sort(keys)
-
-			t.Fatalf("ListAll keys = %v, want an entry reachable under the folded name", keys)
-		}
-
-		if len(vds) != 1 || vds[0].SizeKib != 1024*1024 {
-			t.Errorf("got %+v, want the one volume that was created", vds)
-		}
-	})
+	runVolumeDefinitionListAllCase(t, newStore)
 	// BUG-048: CreateAutoNumbered allocates the smallest free hole and
 	// the allocation is atomic with the write (the REST handler routes
 	// every number-less `linstor vd c` here).
@@ -381,6 +336,58 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 	})
 	t.Run("CreateNilArg", func(t *testing.T) { testVDCreateNilArg(t, newStore) })
 	t.Run("UpdateNilArg", func(t *testing.T) { testVDUpdateNilArg(t, newStore) })
+}
+
+// runVolumeDefinitionListAllCase pins ListAll's contract.
+//
+// ListAll answers for the whole cluster in one request, and keys the
+// answer folded. A caller holds whatever spelling its own objects
+// carry — for a replica that is Spec.ResourceDefinitionName, which
+// need not match the definition's own — and LINSTOR treats the two as
+// one object where a map does not. Keyed raw, the lookup silently
+// misses and the definition renders as though it had no volumes.
+func runVolumeDefinitionListAllCase(t *testing.T, newStore Factory) {
+	t.Helper()
+	t.Run("ListAllKeysFolded", func(t *testing.T) {
+		s := newStore(t)
+		ctx := t.Context()
+
+		seedRD(t, s, "PVC-Mixed")
+		seedRD(t, s, "pvc-plain")
+
+		for _, rd := range []string{"PVC-Mixed", "pvc-plain"} {
+			if err := s.VolumeDefinitions().Create(ctx, rd,
+				&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+				t.Fatalf("Create under %s: %v", rd, err)
+			}
+		}
+
+		all, err := s.VolumeDefinitions().ListAll(ctx)
+		if err != nil {
+			t.Fatalf("ListAll: %v", err)
+		}
+
+		if len(all) != 2 {
+			t.Errorf("ListAll returned %d definitions, want 2", len(all))
+		}
+
+		// The spelling a replica of that definition carries.
+		vds, ok := all[store.FoldName("pvc-mixed")]
+		if !ok {
+			keys := make([]string, 0, len(all))
+			for k := range all {
+				keys = append(keys, k)
+			}
+
+			slices.Sort(keys)
+
+			t.Fatalf("ListAll keys = %v, want an entry reachable under the folded name", keys)
+		}
+
+		if len(vds) != 1 || vds[0].SizeKib != 1024*1024 {
+			t.Errorf("got %+v, want the one volume that was created", vds)
+		}
+	})
 }
 
 // runVolumeDefinitionAutoNumberCases pins the BUG-048 atomic-allocate

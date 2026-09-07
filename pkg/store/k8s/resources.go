@@ -95,43 +95,6 @@ func (s *resources) ListByNode(ctx context.Context, node string) ([]apiv1.Resour
 	return out, nil
 }
 
-// listScoped answers a scoped question with a scoped read, and falls back to
-// the exhaustive one when the server cannot serve the selector.
-//
-// The same call has two implementations behind it. Against the uncached
-// client the CLI uses it becomes a fieldSelector on the wire and the API
-// server filters; against a manager's cached client it is served from the
-// index RegisterFieldIndexes installs. Either can be missing — a cluster whose
-// CRD predates the selectable field REJECTS the query, and a manager that
-// never registered the index fails it — and both fail loudly rather than
-// answering partially, which is what makes falling back to the exhaustive read
-// safe rather than a silent downgrade to a wrong answer.
-//
-// The fallback is logged because it is not free: it is the whole-cluster read
-// the scoped one exists to avoid, and an operator wondering why a large
-// cluster crawls deserves to find out from the logs rather than from a
-// profiler.
-func (s *resources) listScoped(
-	ctx context.Context, field, value string, keep func(*crdv1alpha1.Resource) bool,
-) ([]apiv1.Resource, error) {
-	var crdList crdv1alpha1.ResourceList
-
-	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{field: value})
-	if err == nil {
-		out := make([]apiv1.Resource, 0, len(crdList.Items))
-		for i := range crdList.Items {
-			out = append(out, crdToWireResource(&crdList.Items[i]))
-		}
-
-		return out, nil
-	}
-
-	log.FromContext(ctx).V(1).Info("scoped Resource read unavailable; reading every replica instead",
-		"field", field, "value", value, "reason", err.Error())
-
-	return s.listExhaustively(ctx, field, value, keep)
-}
-
 func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
 	// Scoped on the authoritative Spec.ResourceDefinitionName, never on a
 	// label.
@@ -1047,6 +1010,43 @@ func wireToCRDResourceSpec(in *apiv1.Resource) crdv1alpha1.ResourceSpec {
 		// reconciler watches it and unwinds a partial conversion.
 		ToggleDiskCancel: in.ToggleDiskCancel,
 	}
+}
+
+// listScoped answers a scoped question with a scoped read, and falls back to
+// the exhaustive one when the server cannot serve the selector.
+//
+// The same call has two implementations behind it. Against the uncached
+// client the CLI uses it becomes a fieldSelector on the wire and the API
+// server filters; against a manager's cached client it is served from the
+// index RegisterFieldIndexes installs. Either can be missing — a cluster whose
+// CRD predates the selectable field REJECTS the query, and a manager that
+// never registered the index fails it — and both fail loudly rather than
+// answering partially, which is what makes falling back to the exhaustive read
+// safe rather than a silent downgrade to a wrong answer.
+//
+// The fallback is logged because it is not free: it is the whole-cluster read
+// the scoped one exists to avoid, and an operator wondering why a large
+// cluster crawls deserves to find out from the logs rather than from a
+// profiler.
+func (s *resources) listScoped(
+	ctx context.Context, field, value string, keep func(*crdv1alpha1.Resource) bool,
+) ([]apiv1.Resource, error) {
+	var crdList crdv1alpha1.ResourceList
+
+	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{field: value})
+	if err == nil {
+		out := make([]apiv1.Resource, 0, len(crdList.Items))
+		for i := range crdList.Items {
+			out = append(out, crdToWireResource(&crdList.Items[i]))
+		}
+
+		return out, nil
+	}
+
+	log.FromContext(ctx).V(1).Info("scoped Resource read unavailable; reading every replica instead",
+		"field", field, "value", value, "reason", err.Error())
+
+	return s.listExhaustively(ctx, field, value, keep)
 }
 
 // listExhaustively is the pre-selectable-field read: every Resource, filtered
