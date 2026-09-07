@@ -8,10 +8,12 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
@@ -213,4 +215,48 @@ func TestScopedReadsOnAnUncachedClient(t *testing.T) {
 	}
 
 	_ = store.FoldName("")
+}
+
+// A label is written by whoever created the object, and piraeus and operators
+// create storage pools with `kubectl apply` and no labels. The node-scoped
+// read selected on that label, so those pools were invisible to it — and this
+// list is what a `node delete` is refused on and what the cascade removes, so
+// an invisible pool is a node deleted with pools still registered against it.
+func TestPoolsAppliedWithoutALabelAreStillOnTheNode(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+	st := k8s.New(fixture.client)
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "node-hand", Type: "SATELLITE"}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	// Written the way an operator writes one: the spec, and nothing else.
+	applied := &crdv1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-hand.node-hand"},
+		Spec: crdv1alpha1.StoragePoolSpec{
+			NodeName:     "node-hand",
+			PoolName:     "pool-hand",
+			ProviderKind: "LVM_THIN",
+		},
+	}
+
+	if err := fixture.client.Create(ctx, applied); err != nil {
+		t.Fatalf("apply the pool: %v", err)
+	}
+
+	pools, err := st.StoragePools().ListByNode(ctx, "node-hand")
+	if err != nil {
+		t.Fatalf("ListByNode: %v", err)
+	}
+
+	if len(pools) != 1 {
+		t.Fatalf("ListByNode returned %d pools, want the one applied by hand — a pool "+
+			"the node-scoped read cannot see is a node deleted out from under it", len(pools))
+	}
 }

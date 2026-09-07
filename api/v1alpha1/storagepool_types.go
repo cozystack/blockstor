@@ -112,6 +112,14 @@ type StoragePoolStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.poolName + '.' + self.spec.nodeName).lowerAscii()",message="metadata.name must equal <spec.poolName>.<spec.nodeName> (case-insensitive)",optionalOldSelf=true
+// spec.nodeName is selectable so a node-scoped read is a node-scoped query.
+// The pools on a node are what a `node delete` is refused on and what the
+// cascade removes, and answering that by listing every pool in the cluster is
+// the read this replaces. A field, not the label the objects usually carry: a
+// pool created by an operator (piraeus writes them with `kubectl apply`) has
+// no label, and a label selector would answer partial-but-correct — which on
+// the refusal path means deleting a node the cluster still has pools on.
+// +kubebuilder:selectablefield:JSONPath=`.spec.nodeName`
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.spec.nodeName`
 // +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.poolName`
 // +kubebuilder:printcolumn:name="Provider",type=string,JSONPath=`.spec.providerKind`
