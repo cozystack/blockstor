@@ -3,7 +3,9 @@
 package rest
 
 import (
+	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -318,6 +320,51 @@ func TestMaterializeRefusesADyingLeftoverItRacedInto(t *testing.T) {
 	vds, listErr := st.VolumeDefinitions().List(ctx, "pvc-raced")
 	if listErr != nil {
 		t.Fatalf("list the leftover's volumes: %v", listErr)
+	}
+
+	if len(vds) != 0 {
+		t.Errorf("hydrated %d volume(s) into a definition being deleted", len(vds))
+	}
+}
+
+// The volume-definition restore fetched the target definition and threw it
+// away. Its siblings refuse a target carrying DELETE because finishing one
+// races the tear-down reaping what it writes, and volumes hydrated here are
+// precisely that.
+func TestSnapshotRestoreVolumeDefinitionRefusesADyingTarget(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedRestoreSource(ctx, t, st)
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:  "pvc-vd-dying",
+		Flags: []string{rdFlagDelete},
+	}); err != nil {
+		t.Fatalf("seed the dying target: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(map[string]string{"to_resource": "pvc-vd-dying"})
+
+	resp := httpPost(t,
+		base+"/v1/resource-definitions/pvc-src/snapshot-restore-volume-definition/snap-1", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 — that definition is being deleted", resp.StatusCode)
+	}
+
+	if msg := decodeRCs(t, resp)[0].Message; !strings.Contains(msg, "being deleted") {
+		t.Errorf("message = %q, want it to name the deletion", msg)
+	}
+
+	vds, err := st.VolumeDefinitions().List(ctx, "pvc-vd-dying")
+	if err != nil {
+		t.Fatalf("list the target's volumes: %v", err)
 	}
 
 	if len(vds) != 0 {

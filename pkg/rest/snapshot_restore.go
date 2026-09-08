@@ -113,9 +113,25 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 		return
 	}
 
-	_, err = s.Store.ResourceDefinitions().Get(r.Context(), req.ToResource)
+	target, err := s.Store.ResourceDefinitions().Get(r.Context(), req.ToResource)
 	if err != nil {
 		writeStoreError(w, err)
+
+		return
+	}
+
+	// The definition this was about to hydrate into was fetched and thrown
+	// away. Its sibling handlers refuse a target carrying DELETE on the
+	// grounds that finishing one races the tear-down reaping what it writes,
+	// and volumes hydrated here are exactly that.
+	if slices.Contains(target.Flags, rdFlagDelete) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + req.ToResource + "' is being deleted",
+			Cause: "the target carries the DELETE flag; the volumes this would hydrate " +
+				"are being reaped as it writes them",
+			Correc: "wait for the delete to finish, then restore into a fresh definition",
+		}})
 
 		return
 	}
