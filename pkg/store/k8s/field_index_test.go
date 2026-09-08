@@ -265,6 +265,51 @@ func TestPoolsAppliedWithoutALabelAreStillOnTheNode(t *testing.T) {
 	}
 }
 
+// A label is written by whoever created the object, and pkg/linstormigrate
+// builds Snapshots adopted from a LINSTOR dump with none. This list is what
+// `rd d` is refused on and what sweeps the leftovers behind it, so a snapshot
+// the read cannot see is a definition deleted with snapshots still on it, and
+// a mop-up that misses them too.
+func TestSnapshotsAppliedWithoutALabelAreStillOnTheDefinition(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+	st := k8s.New(fixture.client)
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx,
+		&apiv1.ResourceDefinition{Name: "pvc-adopted"}); err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	// Written the way the migrator writes one: the spec, and nothing else.
+	adopted := &crdv1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-adopted.snap-adopted"},
+		Spec: crdv1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-adopted",
+			SnapshotName:           "snap-adopted",
+		},
+	}
+
+	if err := fixture.client.Create(ctx, adopted); err != nil {
+		t.Fatalf("apply the snapshot: %v", err)
+	}
+
+	snaps, err := st.Snapshots().ListByDefinition(ctx, "pvc-adopted")
+	if err != nil {
+		t.Fatalf("ListByDefinition: %v", err)
+	}
+
+	if len(snaps) != 1 {
+		t.Fatalf("ListByDefinition returned %d snapshots, want the one applied by hand — "+
+			"a snapshot this read cannot see is a definition deleted out from under it",
+			len(snaps))
+	}
+}
+
 // The two untyped wordings a missing index reaches this store as, verbatim
 // from controller-runtime: the manager cache's, and the fake client's.
 var (

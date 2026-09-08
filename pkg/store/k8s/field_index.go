@@ -107,6 +107,11 @@ const FieldResourceDefinitionName = "spec.resourceDefinitionName"
 // FieldStoragePoolNodeName is the same node field on StoragePool.
 const FieldStoragePoolNodeName = "spec.nodeName"
 
+// FieldSnapshotDefinitionName is the definition field a snapshot listing
+// selects on, for the same reason its Resource sibling does not use a label:
+// a Snapshot adopted from LINSTOR by pkg/linstormigrate carries none.
+const FieldSnapshotDefinitionName = "spec.resourceDefinitionName"
+
 // RegisterFieldIndexes teaches a manager's cache the fields the store selects
 // on. Call it on every manager whose client backs a Store.
 //
@@ -145,6 +150,19 @@ func RegisterFieldIndexes(ctx context.Context, indexer ctrlclient.FieldIndexer) 
 		})
 	if err != nil {
 		return errors.Wrap(err, "index Resource by "+FieldResourceDefinitionName)
+	}
+
+	err = indexer.IndexField(ctx, &crdv1alpha1.Snapshot{}, FieldSnapshotDefinitionName,
+		func(obj ctrlclient.Object) []string {
+			snap, ok := obj.(*crdv1alpha1.Snapshot)
+			if !ok || snap.Spec.ResourceDefinitionName == "" {
+				return nil
+			}
+
+			return []string{snap.Spec.ResourceDefinitionName}
+		})
+	if err != nil {
+		return errors.Wrap(err, "index Snapshot by "+FieldSnapshotDefinitionName)
 	}
 
 	err = indexer.IndexField(ctx, &crdv1alpha1.StoragePool{}, FieldStoragePoolNodeName,
