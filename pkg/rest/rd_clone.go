@@ -80,9 +80,12 @@ type rdCloneRequest struct {
 	// properties carries — override_props, delete_props,
 	// delete_namespaces. Embedded from golinstor rather than respelled
 	// field by field, because a respelling is how `delete_namespaces`
-	// went missing in the first place: `linstor rd clone
-	// --delete-namespace NS` kept hitting the very 400 that declaring
-	// its two neighbours was meant to end.
+	// went missing in the first place: a golinstor client filling the
+	// triple kept hitting the very 400 that declaring its two neighbours
+	// was meant to end. The python CLI's clone verb has no flag for it —
+	// it offers --external-name, --use-zfs-clone, --volume-passphrase,
+	// --layer-list and --resource-group — so this is a wire-level field,
+	// which is exactly why the decoder is the only thing guarding it.
 	client.GenericPropsModify
 
 	Name        string `json:"name"`

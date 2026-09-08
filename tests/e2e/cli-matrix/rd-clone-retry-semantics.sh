@@ -23,9 +23,12 @@
 #      snapshot") cannot be followed, because that snapshot is the
 #      origin the existing clone depends on.
 #
-#   C. `rd clone --delete-namespace` is accepted. The body is decoded
-#      with DisallowUnknownFields, so before the triple was declared
-#      this was a 400 before any of the handler ran.
+#   C. A clone body carrying `delete_namespaces` is accepted. The verb
+#      has no flag for it, so this is driven over raw REST: the field
+#      reaches the endpoint from golinstor's GenericPropsModify. The
+#      body is decoded with DisallowUnknownFields, so before the triple
+#      was declared an undeclared field was a 400 before any of the
+#      handler ran.
 #
 # Contract:
 #   1. first clone: exit 0, target materialises replicas, UpToDate.
@@ -33,7 +36,7 @@
 #      exactly the volume the first one produced (a replay must not
 #      re-shape what it replays).
 #   3. `vd set-size` on the source, then a third clone: exit 0.
-#   4. clone with --delete-namespace: exit 0.
+#   4. clone POST carrying delete_namespaces: HTTP 201.
 #
 # Pool: `stand` (FILE_THIN), the pool the sibling clone cell uses.
 #
@@ -137,12 +140,22 @@ if [[ "$size_after_first" != "$size_after_resize" ]]; then
     exit 1
 fi
 
-echo ">> [C] rd clone --delete-namespace is accepted"
+echo ">> [C] a clone body carrying delete_namespaces is accepted"
+# Driven over raw REST, not through the verb: the clone CLI has no flag for
+# this (1.31.0 offers --external-name, --use-zfs-clone, --volume-passphrase,
+# --layer-list, --resource-group). delete_namespaces reaches the endpoint from
+# golinstor's GenericPropsModify, which is the shape under test — and the body
+# is decoded with DisallowUnknownFields, so before the triple was declared an
+# undeclared field was a 400 before any of the handler ran.
 "${LCTL[@]}" resource-definition set-property "$SRC" DrbdOptions/Net/protocol C >/dev/null 2>&1 || true
-if ! "${LCTL[@]}" resource-definition clone "$SRC" "$DST_NS" \
-        --delete-namespace DrbdOptions >/dev/null 2>&1; then
-    echo "FAIL: rd clone --delete-namespace exited non-zero" >&2
-    echo "  the body is decoded with DisallowUnknownFields, so an undeclared field is a 400" >&2
+http_code=$(curl -sS -m 30 -o /tmp/cli-matrix-retry-ns.json -w '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' \
+    -d "{\"name\":\"${DST_NS}\",\"delete_namespaces\":[\"DrbdOptions\"],\"use_zfs_clone\":true}" \
+    "http://127.0.0.1:${LCTL_PORT}/v1/resource-definitions/${SRC}/clone" \
+    2>/dev/null || echo "000")
+if [[ "$http_code" != "201" ]]; then
+    echo "FAIL: clone with delete_namespaces answered HTTP $http_code, want 201" >&2
+    cat /tmp/cli-matrix-retry-ns.json >&2 2>/dev/null || true
     exit 1
 fi
 

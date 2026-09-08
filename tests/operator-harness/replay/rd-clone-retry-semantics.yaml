@@ -19,12 +19,14 @@ description: |
   Steps:
     1. rd create + vd create + r create --auto-place=2
     2. wait the source UpToDate
-    3. clone; wait the target's replicas and their convergence
+    3. clone; wait the target's replicas to converge
     4. clone AGAIN with the same argv -- the replay, exit 0
     5. vd set-size on the source, then clone a third time -- exit 0
-    6. clone into a second target with --delete-namespace -- exit 0
-       (the body is decoded with DisallowUnknownFields, so an
-       undeclared field is a 400 before any of the handler runs)
+  delete_namespaces is deliberately absent here: the runner executes
+  `linstor` argv, and the clone verb has no flag for it (1.31.0 offers
+  --external-name, --use-zfs-clone, --volume-passphrase, --layer-list and
+  --resource-group). It is a WIRE field, carried by golinstor's
+  GenericPropsModify, so the L6 cell drives it over raw REST instead.
 
   The byte-level data-plane assert lives in the sibling cell
   tests/e2e/cli-matrix/rd-clone-vd-data-plane.sh; this replay pins the
@@ -53,15 +55,15 @@ steps:
     cmd: ["volume-definition", "create", "{{rd}}", "64M"]
     expect_exit: 0
   - name: auto-place-2
+    # all_uptodate rather than replica_count, and no `resource list` step
+    # after it: the awaits poll the API directly, while a CLI list issued in
+    # the first seconds after a replica is stamped crashes the official
+    # python client outright (layer_object reports type DRBD before the drbd
+    # payload is filled, and the client indexes it unguarded). That window is
+    # not this workflow's subject and is not specific to cloning -- a plain
+    # `resource create` shows it too -- so the workflow waits on state
+    # instead of racing a renderer.
     cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
-    expect_exit: 0
-    await:
-      kind: replica_count
-      rd: "{{rd}}"
-      min: 2
-      timeout_s: 120
-  - name: wait-source-uptodate
-    cmd: ["resource", "list", "--resources", "{{rd}}"]
     expect_exit: 0
     await:
       kind: all_uptodate
@@ -69,14 +71,6 @@ steps:
       timeout_s: 240
   - name: clone
     cmd: ["resource-definition", "clone", "{{rd}}", "{{rd}}-c1"]
-    expect_exit: 0
-    await:
-      kind: replica_count
-      rd: "{{rd}}-c1"
-      min: 2
-      timeout_s: 120
-  - name: wait-clone-uptodate
-    cmd: ["resource", "list", "--resources", "{{rd}}-c1"]
     expect_exit: 0
     await:
       kind: all_uptodate
@@ -95,23 +89,12 @@ steps:
     # turn its retry into a refusal.
     cmd: ["resource-definition", "clone", "{{rd}}", "{{rd}}-c1"]
     expect_exit: 0
-  - name: clone-with-delete-namespace
-    # Pre-fix: 400 on the undeclared delete_namespaces field.
-    cmd: ["resource-definition", "clone", "{{rd}}", "{{rd}}-c2", "--delete-namespace", "DrbdOptions"]
-    expect_exit: 0
-    await:
-      kind: replica_count
-      rd: "{{rd}}-c2"
-      min: 2
-      timeout_s: 120
 
 teardown:
   - cmd: ["resource-definition", "delete", "{{rd}}-c1"]
-  - cmd: ["resource-definition", "delete", "{{rd}}-c2"]
   - cmd: ["snapshot", "delete", "{{rd}}", "clone-{{rd}}-c1"]
-  - cmd: ["snapshot", "delete", "{{rd}}", "clone-{{rd}}-c2"]
   - cmd: ["resource-definition", "delete", "{{rd}}"]
 
 invariants:
-  # Prefix-match on vars.rd also covers the "-c1" / "-c2" leftovers.
+  # Prefix-match on vars.rd also covers the "-c1" leftover.
   - no_orphans
