@@ -392,7 +392,7 @@ func (s *Server) restoreTargetState(ctx context.Context, w http.ResponseWriter, 
 		return false, false
 	}
 
-	if existing.Props[restoreFromSnapshotKey] != restoreMarker(snap.ResourceName, snap.Name) {
+	if !restoreMarkerMatches(existing.Props, snap.ResourceName, snap.Name) {
 		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
 			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
 			Message: "resource definition '" + toResource + "' already exists and is not a restore of '" +
@@ -429,6 +429,20 @@ const restoreFromSnapshotKey = "BlockstorRestoreFromSnapshot"
 // the first attempt wrote whichever way the caller spelled the names.
 func restoreMarker(srcRD, snapName string) string {
 	return srcRD + ":" + snapName
+}
+
+// restoreMarkerMatches reports whether a definition was produced by this
+// restore or clone.
+//
+// The comparison is case-insensitive because the two sides reach it from
+// different places: the marker is written from the stored objects, and a
+// caller derives the other side from names it spelled itself. LINSTOR folds
+// name case and pkg/store/k8s/crdname.go lowercases every lookup key, so both
+// spellings address one object — and a byte comparison here would answer that
+// somebody else owns a definition this restore created, which is the
+// terminal-on-first-failure behaviour the resume path exists to end.
+func restoreMarkerMatches(props map[string]string, srcRD, snapName string) bool {
+	return strings.EqualFold(props[restoreFromSnapshotKey], restoreMarker(srcRD, snapName))
 }
 
 // validateRestoreNodesHoldSnapshot is the Bug 397 input-validation guard
@@ -490,6 +504,31 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 	}
 
 	return req.SnapshotName
+}
+
+// leftoverShapeDiffers names the first way a definition already under the
+// target name was built to a different shape than this request asks for, or ""
+// when the two agree.
+//
+// A retry that resumes a leftover keeps the leftover. So a request naming a
+// different resource_group or layer stack than the attempt that created it
+// gets its shape validated and then dropped, while the answer says the clone
+// completed — the accept-and-drop this endpoint refuses external_name and
+// volume_passphrases precisely to avoid. The parent group decides replica
+// count and pool selection, so it is not cosmetic.
+func leftoverShapeDiffers(existing, want *apiv1.ResourceDefinition) string {
+	if !strings.EqualFold(existing.ResourceGroupName, want.ResourceGroupName) {
+		return "resource group '" + existing.ResourceGroupName + "', not '" +
+			want.ResourceGroupName + "'"
+	}
+
+	added, dropped := layerSetDifference(existing.LayerStack, want.LayerStack)
+	if len(added) > 0 || len(dropped) > 0 {
+		return "layer stack " + strings.Join(existing.LayerStack, ",") + ", not " +
+			strings.Join(want.LayerStack, ",")
+	}
+
+	return ""
 }
 
 // materializeRestoredRD creates the target RD inheriting the source
@@ -593,7 +632,17 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 			return "", getErr //nolint:wrapcheck // surfaced via writeStoreError
 		}
 
-		if existing.Props[restoreFromSnapshotKey] != restoreMarker(snap.ResourceName, snap.Name) {
+		// Re-made on fresh state, and all of it: the marker says the
+		// definition is this operation's own, the DELETE flag says whether
+		// it is still there to finish, and the shape says whether it is
+		// the same operation. The window is narrow — another request
+		// completed and the target was deleted between the state check
+		// above and this Create — but it is the exact state the 409 in
+		// restoreTargetState exists to prevent, and hydrating volumes into
+		// a dying definition races the tear-down reaping them.
+		if !restoreMarkerMatches(existing.Props, snap.ResourceName, snap.Name) ||
+			slices.Contains(existing.Flags, rdFlagDelete) ||
+			leftoverShapeDiffers(&existing, &newRD) != "" {
 			return "", err //nolint:wrapcheck // surfaced via writeStoreError
 		}
 	}

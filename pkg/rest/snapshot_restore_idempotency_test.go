@@ -264,16 +264,44 @@ func TestSnapshotRestoreRefusesALeftoverBeingDeleted(t *testing.T) {
 // on that the in-memory one does not: LINSTOR names fold case, so
 // pkg/store/k8s/crdname.go resolves `SNAP-1` and `snap-1` to the same object
 // and hands back whichever spelling was stored.
+//
+// Both kinds fold, because both halves of the marker are names: a definition
+// looked up under one spelling comes back carrying the one it was stored with,
+// and so does a snapshot.
 type caseFoldingStore struct{ store.Store }
 
 func (s caseFoldingStore) Snapshots() store.SnapshotStore {
 	return caseFoldingSnapshots{s.Store.Snapshots()}
 }
 
+func (s caseFoldingStore) ResourceDefinitions() store.ResourceDefinitionStore {
+	return caseFoldingRDs{s.Store.ResourceDefinitions()}
+}
+
+func (s caseFoldingStore) VolumeDefinitions() store.VolumeDefinitionStore {
+	return caseFoldingVDs{s.Store.VolumeDefinitions()}
+}
+
 type caseFoldingSnapshots struct{ store.SnapshotStore }
 
 func (s caseFoldingSnapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
 	return s.SnapshotStore.Get(ctx, strings.ToLower(rdName), strings.ToLower(snapName)) //nolint:wrapcheck // pass-through decorator
+}
+
+type caseFoldingRDs struct{ store.ResourceDefinitionStore }
+
+func (s caseFoldingRDs) Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
+	return s.ResourceDefinitionStore.Get(ctx, strings.ToLower(name)) //nolint:wrapcheck // pass-through decorator
+}
+
+type caseFoldingVDs struct{ store.VolumeDefinitionStore }
+
+func (s caseFoldingVDs) List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error) {
+	return s.VolumeDefinitionStore.List(ctx, strings.ToLower(rdName)) //nolint:wrapcheck // pass-through decorator
+}
+
+func (s caseFoldingVDs) Create(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error {
+	return s.VolumeDefinitionStore.Create(ctx, strings.ToLower(rdName), vd) //nolint:wrapcheck // pass-through decorator
 }
 
 // The retry has to be recognised whichever way the caller spelled the names.

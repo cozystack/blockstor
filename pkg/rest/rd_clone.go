@@ -23,6 +23,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/LINBIT/golinstor/client"
@@ -351,7 +352,7 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	resume, stop := s.cloneTargetState(ctx, w, src.Name, req.Name)
+	resume, stop := s.cloneTargetState(ctx, w, src, req)
 	if stop {
 		return
 	}
@@ -559,7 +560,11 @@ func cloneSnapshotName(cloneName string) string {
 // Anything else under that name is a genuine collision and stays a refusal, in
 // CloneStarted shape — a bare store AlreadyExists envelope would crash
 // python-linstor's clone decode.
-func (s *Server) cloneTargetState(ctx context.Context, w http.ResponseWriter, srcName, cloneName string) (bool, bool) {
+func (s *Server) cloneTargetState(
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest,
+) (bool, bool) {
+	srcName, cloneName := src.Name, req.Name
+
 	existing, err := s.Store.ResourceDefinitions().Get(ctx, cloneName)
 	if err != nil {
 		// NotFound (or any read blip) → proceed with the create;
@@ -567,7 +572,7 @@ func (s *Server) cloneTargetState(ctx context.Context, w http.ResponseWriter, sr
 		return false, false
 	}
 
-	if existing.Props[restoreFromSnapshotKey] != restoreMarker(srcName, cloneSnapshotName(cloneName)) {
+	if !restoreMarkerMatches(existing.Props, srcName, cloneSnapshotName(cloneName)) {
 		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
 			Message: "clone target '" + cloneName + "' already exists and is not a clone of '" + srcName + "'",
@@ -589,7 +594,47 @@ func (s *Server) cloneTargetState(ctx context.Context, w http.ResponseWriter, sr
 		return false, true
 	}
 
+	// A resumed clone keeps the leftover, so a retry asking for a different
+	// shape would have that shape validated and then dropped while the answer
+	// says the clone completed. That is the accept-and-drop external_name and
+	// volume_passphrases are refused for, and the parent group is not
+	// cosmetic: it decides replica count and pool selection.
+	if differs := leftoverShapeDiffers(&existing, cloneTargetShape(src, req)); differs != "" {
+		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone target '" + cloneName + "' was started with " + differs,
+			Cause: "resuming keeps the definition an earlier attempt created, so the shape " +
+				"this request asks for would be validated and then ignored",
+			Correc: "retry with the shape the clone was started with, or delete '" +
+				cloneName + "' and clone again",
+		})
+
+		return false, true
+	}
+
 	return true, false
+}
+
+// cloneTargetShape is the definition a clone request asks for: the caller's
+// choices where it made them, the source's everywhere else. It is what
+// materializeRestoredRD builds, expressed once so the resume check and the
+// create cannot disagree about what was requested.
+func cloneTargetShape(src *apiv1.ResourceDefinition, req *rdCloneRequest) *apiv1.ResourceDefinition {
+	want := &apiv1.ResourceDefinition{
+		Name:              req.Name,
+		ResourceGroupName: src.ResourceGroupName,
+		LayerStack:        src.LayerStack,
+	}
+
+	if req.ResourceGroup != "" {
+		want.ResourceGroupName = req.ResourceGroup
+	}
+
+	if len(req.LayerList) > 0 {
+		want.LayerStack = req.LayerList
+	}
+
+	return want
 }
 
 // ensureCloneSnapshot takes (or reuses) the internal snapshot backing
@@ -607,7 +652,12 @@ func (s *Server) ensureCloneSnapshot(w http.ResponseWriter, r *http.Request, src
 	existing, err := s.Store.Snapshots().Get(ctx, src.Name, snapName)
 	if err == nil {
 		// Interrupted-clone retry: the snapshot landed on a previous
-		// attempt; reuse it so the restore sees the same point-in-time.
+		// attempt; reuse it so the restore sees the same point-in-time —
+		// but only while it still describes the source.
+		if !s.cloneSnapshotIsCurrent(ctx, w, src, &existing, cloneName) {
+			return nil, false
+		}
+
 		return &existing, true
 	}
 
@@ -641,6 +691,86 @@ func (s *Server) ensureCloneSnapshot(w http.ResponseWriter, r *http.Request, src
 	}
 
 	return &snap, true
+}
+
+// cloneSnapshotIsCurrent refuses to resume a clone over a leftover snapshot
+// that no longer describes the source. False means a refusal has been written.
+//
+// "Found" is not "still right". The first attempt takes `clone-<target>` and
+// dies; the source is resized, or gains a volume; the retry hydrates the
+// target from the stale snapshot and answers 201, and the clone-status poll
+// then reports COMPLETE because the volume counts agree. The caller is handed
+// a clone at the old shape with nothing saying so. This only became reachable
+// when the retry started resuming instead of reporting the leftover done.
+//
+// Refusing rather than retaking is the call `blockstor rd clone` already makes
+// (internal/cli/definition.go): the snapshot may be the only copy of
+// something, and deleting it is the operator's decision, not this endpoint's.
+func (s *Server) cloneSnapshotIsCurrent(
+	ctx context.Context, w http.ResponseWriter,
+	src *apiv1.ResourceDefinition, snap *apiv1.Snapshot, cloneName string,
+) bool {
+	current, err := s.Store.VolumeDefinitions().List(ctx, src.Name)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
+		})
+
+		return false
+	}
+
+	divergence := snapshotDivergence(src.Name, snap, current)
+	if divergence == "" {
+		return true
+	}
+
+	writeCloneRefused(w, http.StatusConflict, src.Name, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone of resource definition '" + src.Name + "' refused: " + divergence,
+		Cause: "an earlier attempt at this clone left the snapshot '" + snap.Name +
+			"' behind and the source has changed since; resuming from it would " +
+			"materialise the clone at the old shape and report it complete",
+		Correc: "delete the snapshot '" + snap.Name + "' so the clone retakes it, " +
+			"or clone under a different name",
+	})
+
+	return false
+}
+
+// snapshotDivergence describes how a snapshot has fallen behind the volumes it
+// was taken of, or "" while it still matches.
+//
+// Sizes are compared keyed by volume number, since neither list promises an
+// order — and a resize leaves the count alone, so counting volumes answers
+// only half the question.
+func snapshotDivergence(rdName string, snap *apiv1.Snapshot, current []apiv1.VolumeDefinition) string {
+	if len(current) != len(snap.VolumeDefinitions) {
+		return snap.Name + " covers " + strconv.Itoa(len(snap.VolumeDefinitions)) +
+			" volume(s) but " + rdName + " now has " + strconv.Itoa(len(current))
+	}
+
+	captured := make(map[int32]int64, len(snap.VolumeDefinitions))
+	for _, vol := range snap.VolumeDefinitions {
+		captured[vol.VolumeNumber] = vol.SizeKib
+	}
+
+	for i := range current {
+		was, ok := captured[current[i].VolumeNumber]
+		if !ok {
+			return snap.Name + " does not cover volume " +
+				strconv.FormatInt(int64(current[i].VolumeNumber), 10) + " of " + rdName
+		}
+
+		if was != current[i].SizeKib {
+			return snap.Name + " captured volume " +
+				strconv.FormatInt(int64(current[i].VolumeNumber), 10) + " at " +
+				strconv.FormatInt(was, 10) + " KiB but " + rdName + " is now " +
+				strconv.FormatInt(current[i].SizeKib, 10) + " KiB"
+		}
+	}
+
+	return ""
 }
 
 // cloneSnapshotPreconditionsHold runs the snapshot-feasibility guards
