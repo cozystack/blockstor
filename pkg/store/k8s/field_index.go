@@ -115,6 +115,15 @@ const FieldSnapshotDefinitionName = "spec.resourceDefinitionName"
 // RegisterFieldIndexes teaches a manager's cache the fields the store selects
 // on. Call it on every manager whose client backs a Store.
 //
+// Selectable fields and indexes are two halves of the same capability, and
+// which one answers depends on the reader. An UNCACHED reader — the CLI's
+// client, and the manager's own API reader — sends a fieldSelector to the API
+// server, which answers it from the selectable field the CRD declares. A
+// CACHED reader is served from an index here. The controller binary builds its
+// store on the cached client alone, so its node-scoped reads need these; the
+// apiserver hands the store an API reader as well and its node-scoped reads
+// bypass the cache deliberately (see resources.nodeScopedReader).
+//
 // A field selector has two implementations behind one call. Against an
 // uncached client — the CLI's — it becomes a fieldSelector on the wire and the
 // API server does the filtering, which is why the CRDs declare the fields

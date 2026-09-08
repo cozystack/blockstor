@@ -45,6 +45,12 @@ const (
 // storagePools implements store.StoragePoolStore against the StoragePool CRD.
 type storagePools struct {
 	c ctrlclient.Client
+
+	// apiReader is the manager's direct, uncached reader. The node-scoped
+	// listing uses it for the reason its Resource sibling does: `node
+	// delete` is refused on this answer and cascades away what it names, so
+	// a pool the read misses is one left pointing at a node that is gone.
+	apiReader ctrlclient.Reader
 }
 
 // crdName encodes the (pool, node) composite key into a single CRD name.
@@ -113,7 +119,7 @@ func (s *storagePools) List(ctx context.Context) ([]apiv1.StoragePool, error) {
 func (s *storagePools) ListByNode(ctx context.Context, node string) ([]apiv1.StoragePool, error) {
 	var crdList crdv1alpha1.StoragePoolList
 
-	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{FieldStoragePoolNodeName: node})
+	err := s.nodeScopedReader().List(ctx, &crdList, ctrlclient.MatchingFields{FieldStoragePoolNodeName: node})
 	if err != nil {
 		if !SelectorUnsupported(err) {
 			return nil, errors.Wrapf(err, "list StoragePool CRDs on node %q", node)
@@ -526,7 +532,7 @@ func wireToCRDStoragePoolSpec(in *apiv1.StoragePool) crdv1alpha1.StoragePoolSpec
 func (s *storagePools) listByNodeExhaustively(ctx context.Context, node string) ([]apiv1.StoragePool, error) {
 	var crdList crdv1alpha1.StoragePoolList
 
-	err := s.c.List(ctx, &crdList)
+	err := s.nodeScopedReader().List(ctx, &crdList)
 	if err != nil {
 		return nil, errors.Wrapf(err, "list StoragePool CRDs on node %q", node)
 	}
@@ -546,4 +552,13 @@ func (s *storagePools) listByNodeExhaustively(ctx context.Context, node string) 
 	})
 
 	return out, nil
+}
+
+// nodeScopedReader mirrors the Resource store's; see the comment there.
+func (s *storagePools) nodeScopedReader() ctrlclient.Reader {
+	if s.apiReader != nil {
+		return s.apiReader
+	}
+
+	return s.c
 }

@@ -43,6 +43,11 @@ const (
 
 type resources struct {
 	c ctrlclient.Client
+
+	// apiReader is the manager's direct, uncached reader. ListByNode uses
+	// it when it is there; see nodeScopedReader for why that read in
+	// particular cannot come from a cache.
+	apiReader ctrlclient.Reader
 }
 
 func resourceCRDName(rd, node string) string {
@@ -82,7 +87,7 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 // partial-but-correct subset — the Bug 038 shape, where the missing replicas
 // were invisible rather than an error.
 func (s *resources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
-	out, err := s.listScoped(ctx, FieldResourceNodeName, node,
+	out, err := s.listScoped(ctx, s.nodeScopedReader(), FieldResourceNodeName, node,
 		func(r *crdv1alpha1.Resource) bool { return r.Spec.NodeName == node })
 	if err != nil {
 		return nil, err
@@ -118,7 +123,7 @@ func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv
 	// A selectable FIELD does not have that failure mode: it selects on the
 	// spec value every replica carries, whoever wrote it, and a server that
 	// cannot serve the selector says so instead of answering short.
-	out, err := s.listScoped(ctx, FieldResourceDefinitionName, rdName,
+	out, err := s.listScoped(ctx, s.c, FieldResourceDefinitionName, rdName,
 		func(r *crdv1alpha1.Resource) bool { return r.Spec.ResourceDefinitionName == rdName })
 	if err != nil {
 		return nil, err
@@ -1029,11 +1034,12 @@ func wireToCRDResourceSpec(in *apiv1.Resource) crdv1alpha1.ResourceSpec {
 // cluster crawls deserves to find out from the logs rather than from a
 // profiler.
 func (s *resources) listScoped(
-	ctx context.Context, field, value string, keep func(*crdv1alpha1.Resource) bool,
+	ctx context.Context, reader ctrlclient.Reader, field, value string,
+	keep func(*crdv1alpha1.Resource) bool,
 ) ([]apiv1.Resource, error) {
 	var crdList crdv1alpha1.ResourceList
 
-	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{field: value})
+	err := reader.List(ctx, &crdList, ctrlclient.MatchingFields{field: value})
 	if err == nil {
 		out := make([]apiv1.Resource, 0, len(crdList.Items))
 		for i := range crdList.Items {
@@ -1050,18 +1056,19 @@ func (s *resources) listScoped(
 	log.FromContext(ctx).V(1).Info("scoped Resource read unavailable; reading every replica instead",
 		"field", field, "value", value, "reason", err.Error())
 
-	return s.listExhaustively(ctx, field, value, keep)
+	return s.listExhaustively(ctx, reader, field, value, keep)
 }
 
 // listExhaustively is the pre-selectable-field read: every Resource, filtered
 // here. It is what listScoped falls back to, and it stays correct whatever the
 // server can or cannot select on.
 func (s *resources) listExhaustively(
-	ctx context.Context, field, value string, keep func(*crdv1alpha1.Resource) bool,
+	ctx context.Context, reader ctrlclient.Reader, field, value string,
+	keep func(*crdv1alpha1.Resource) bool,
 ) ([]apiv1.Resource, error) {
 	var crdList crdv1alpha1.ResourceList
 
-	err := s.c.List(ctx, &crdList)
+	err := reader.List(ctx, &crdList)
 	if err != nil {
 		return nil, errors.Wrapf(err, "list Resource CRDs for %s=%q", field, value)
 	}
@@ -1077,4 +1084,31 @@ func (s *resources) listExhaustively(
 	}
 
 	return out, nil
+}
+
+// nodeScopedReader answers the reads a node's fate is decided on.
+//
+// `node delete` refuses while anything still references the node, and
+// `--force` cascades away what does. Both decisions are made on one read and
+// then acted on destructively, so a cached answer that trails the API server
+// by a beat is not a slow answer, it is a wrong one in both directions: a
+// replica the read misses is a node deleted out from under it, and a pool the
+// read misses is left pointing at a node that no longer exists.
+//
+// There is no cache-retry poll behind these the way there is on the REST
+// create paths (get*WithCacheRetry), because there is nothing to converge
+// towards — the caller is about to delete, not to read again.
+//
+// This is not the uncached-Get fallback NewWithAPIReader warns against. That
+// warning is about raw Gets, where a fast cached NotFound is the contract and
+// a store-level bypass short-circuits the REST layer's convergence wait. This
+// is one List on two operator commands that run once per dead node, and the
+// field selector still travels: an uncached client sends it to the API server,
+// which answers it from the selectable field the CRD declares.
+func (s *resources) nodeScopedReader() ctrlclient.Reader {
+	if s.apiReader != nil {
+		return s.apiReader
+	}
+
+	return s.c
 }

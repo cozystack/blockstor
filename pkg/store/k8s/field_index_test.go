@@ -404,3 +404,90 @@ func TestScopedReadsFallBackOnlyWhenTheSelectorIsRefused(t *testing.T) {
 		})
 	}
 }
+
+// countingReads records every List a client is asked for, so a test can say
+// which reader answered.
+type countingReads struct {
+	ctrlclient.Client
+
+	lists atomic.Int64
+}
+
+func (c *countingReads) List(ctx context.Context, list ctrlclient.ObjectList, opts ...ctrlclient.ListOption) error {
+	c.lists.Add(1)
+
+	return c.Client.List(ctx, list, opts...) //nolint:wrapcheck // test decorator
+}
+
+// `node delete` is refused on the node-scoped read and cascades away what it
+// names, so the answer is acted on destructively and immediately. A cached
+// answer that trails the API server by a beat is not slow, it is wrong in both
+// directions: a replica the read misses is a node deleted out from under it,
+// and a pool the read misses is left pointing at a node that is gone.
+//
+// So where the store is given the manager's API reader, that read goes to the
+// API server. The test writes through one client and reads through the store,
+// with no wait in between — which is precisely what the node-lost integration
+// test does, and what a cached read cannot be relied on to answer.
+func TestNodeScopedReadsUseTheDirectReaderWhenThereIsOne(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+	ctx := t.Context()
+	seed := k8s.New(fixture.client)
+
+	if err := seed.Nodes().Create(ctx, &apiv1.Node{Name: "node-fresh", Type: "SATELLITE"}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if err := seed.ResourceDefinitions().Create(ctx,
+		&apiv1.ResourceDefinition{Name: "pvc-fresh"}); err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	// A cache that will never hold the replica: it is not watching anything.
+	stale := &countingReads{Client: startedCachedClient(t)}
+	st := k8s.NewWithAPIReader(stale, fixture.client)
+
+	// Written after the cached client was built, through a different client —
+	// the shape the integration harness produces.
+	if err := seed.Resources().Create(ctx,
+		&apiv1.Resource{Name: "pvc-fresh", NodeName: "node-fresh"}); err != nil {
+		t.Fatalf("seed replica: %v", err)
+	}
+
+	if err := seed.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool-fresh",
+		NodeName:        "node-fresh",
+		ProviderKind:    "LVM_THIN",
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	replicas, err := st.Resources().ListByNode(ctx, "node-fresh")
+	if err != nil {
+		t.Fatalf("ListByNode: %v", err)
+	}
+
+	if len(replicas) != 1 {
+		t.Errorf("ListByNode returned %d replicas, want the one just written — a node "+
+			"delete decided on this answer would have missed it", len(replicas))
+	}
+
+	pools, err := st.StoragePools().ListByNode(ctx, "node-fresh")
+	if err != nil {
+		t.Fatalf("pools ListByNode: %v", err)
+	}
+
+	if len(pools) != 1 {
+		t.Errorf("pools ListByNode returned %d, want the one just written", len(pools))
+	}
+
+	if n := stale.lists.Load(); n != 0 {
+		t.Errorf("%d list(s) went to the cached client; the node-scoped read is supposed "+
+			"to bypass it when an API reader is available", n)
+	}
+}
