@@ -240,6 +240,10 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
+	if !s.cloneParentRGSurvived(ctx, w, src, req.Name) {
+		return
+	}
+
 	err = s.applyClonePropEdits(ctx, req)
 	if err != nil {
 		writeCloneRefused(w, http.StatusInternalServerError, src.Name, req.Name, &apiv1.APICallRc{
@@ -260,6 +264,43 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 			Message: "resource definition cloned: " + req.Name,
 		}},
 	})
+}
+
+// cloneParentRGSurvived is the post-write half of the Bug 174 guard on the
+// clone path: the target inherits the source's resource group, and a `rg d`
+// that lands between the check the create did and the definition this wrote
+// leaves the clone parented to a group that is gone. False means the clone has
+// been rolled back and a refusal written.
+func (s *Server) cloneParentRGSurvived(
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, cloneName string,
+) bool {
+	survived, err := s.parentRGSurvived(ctx, src.ResourceGroupName)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
+		})
+
+		return false
+	}
+
+	if survived {
+		return true
+	}
+
+	s.rollBackMaterialisedRD(ctx, cloneName)
+
+	writeCloneRefused(w, http.StatusNotFound, src.Name, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone of resource definition '" + src.Name + "' rolled back: " +
+			rgDeletedRaceCorrection(src.ResourceGroupName),
+		Cause: "the clone inherits its parent group from the source, and that group was " +
+			"deleted while the clone was being materialised; a definition pointing at a " +
+			"group that is gone lists fine and places badly",
+		Correc: "re-create the resource group, then clone again",
+	})
+
+	return false
 }
 
 // cloneSnapshotName derives the internal snapshot name backing a

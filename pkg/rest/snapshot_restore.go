@@ -320,6 +320,10 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.restoreParentRGSurvived(r.Context(), w, srcRD, newRDName) {
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "snapshot restored: " + snapName + " → " + newRDName,
@@ -385,6 +389,45 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 	}
 
 	return req.SnapshotName
+}
+
+// restoreParentRGSurvived is the post-write half of the Bug 174 guard on the
+// restore path. The restored definition inherits the source's resource group,
+// so a `rg d` landing while it materialises leaves it parented to a group that
+// is gone. False means the restore has been rolled back and a refusal written.
+func (s *Server) restoreParentRGSurvived(
+	ctx context.Context, w http.ResponseWriter, srcRD, newRDName string,
+) bool {
+	srcRDObj, err := s.Store.ResourceDefinitions().Get(ctx, srcRD)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	survived, err := s.parentRGSurvived(ctx, srcRDObj.ResourceGroupName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if survived {
+		return true
+	}
+
+	s.rollBackMaterialisedRD(ctx, newRDName)
+
+	writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: "snapshot restore rolled back: " + rgDeletedRaceCorrection(srcRDObj.ResourceGroupName),
+		Cause: "the restored definition inherits its parent group from the source, and that " +
+			"group was deleted while the restore was being materialised; a definition " +
+			"pointing at a group that is gone lists fine and places badly",
+		Correc: "re-create the resource group, then restore again",
+	}})
+
+	return false
 }
 
 // materializeRestoredRD creates the target RD inheriting the source
