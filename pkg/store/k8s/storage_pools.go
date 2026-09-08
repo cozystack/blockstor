@@ -115,6 +115,10 @@ func (s *storagePools) ListByNode(ctx context.Context, node string) ([]apiv1.Sto
 
 	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{FieldStoragePoolNodeName: node})
 	if err != nil {
+		if !SelectorUnsupported(err) {
+			return nil, errors.Wrapf(err, "list StoragePool CRDs on node %q", node)
+		}
+
 		log.FromContext(ctx).V(1).Info("scoped StoragePool read unavailable; reading every pool instead",
 			"node", node, "reason", err.Error())
 

@@ -166,7 +166,7 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -195,15 +195,6 @@ func main() {
 	// shared placer. CRD-backed is the only supported persistence
 	// layer since Phase 11.x — the apiserver/controller split makes
 	// in-process state pointless across replicas.
-	// The store's node- and definition-scoped reads select on fields; a
-	// cached client answers those from an index or not at all, and falling
-	// back means listing every replica in the cluster on every call.
-	err = storek8s.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer())
-	if err != nil {
-		setupLog.Error(err, "Failed to register field indexes")
-		os.Exit(1)
-	}
-
 	st := storek8s.New(mgr.GetClient())
 
 	if err := (&controller.NodeReconciler{

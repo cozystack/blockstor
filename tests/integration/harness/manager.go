@@ -186,7 +186,10 @@ func buildIntegrationManager(env *Env) (manager.Manager, error) {
 	// is the documented escape hatch for test harnesses
 	// (https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/config).
 	skipNameValidation := true
-	mgr, err := ctrl.NewManager(env.Cfg, ctrl.Options{
+	// storek8s.NewManager, not ctrl.NewManager: the field indexes the store
+	// selects on come with it, so this harness cannot drift into exercising
+	// only the whole-cluster fallback while claiming to mirror the binaries.
+	mgr, err := storek8s.NewManager(env.Cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",

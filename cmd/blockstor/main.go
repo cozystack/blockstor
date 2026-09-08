@@ -41,8 +41,10 @@ import (
 	"os"
 	"strings"
 
+	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -55,6 +57,23 @@ import (
 )
 
 func main() {
+	// The store logs when a scoped read falls back to reading everything, and
+	// this binary is the only consumer that can still reach that branch: the
+	// servers register the indexes, so only a cluster whose CRD predates the
+	// selectable fields takes it, through this uncached client.
+	//
+	// Without a root logger controller-runtime buffers the line, then after
+	// thirty seconds promotes to a null sink and prints its own "SetLogger
+	// was never called" stack trace into operator-facing stderr instead. So
+	// set one: quiet at the default level, and BLOCKSTOR_DEBUG turns the
+	// V(1) lines on for the operator who is asking why a large cluster
+	// crawls.
+	logOpts := zap.Options{
+		Development: os.Getenv("BLOCKSTOR_DEBUG") != "",
+		DestWriter:  os.Stderr,
+	}
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&logOpts)))
+
 	app := &cli.App{
 		Out:      os.Stdout,
 		Err:      os.Stderr,

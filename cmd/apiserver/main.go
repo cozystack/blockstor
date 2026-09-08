@@ -139,7 +139,7 @@ func newScheme() *runtime.Scheme {
 // independently. Caches still warm up so the REST server's
 // cached-client reads are cheap.
 func buildManager(flags *apiserverFlags) (manager.Manager, error) {
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: newScheme(),
 		Metrics: metricsserver.Options{
 			BindAddress:   flags.metricsAddr,
@@ -264,15 +264,6 @@ func main() {
 	// concurrent `vd c` against one RD both retry against a stale cache,
 	// re-derive the same number, exhaust the retry budget, and silently
 	// drop the second volume.
-	// The store's node- and definition-scoped reads select on fields; a
-	// cached client answers those from an index or not at all, and falling
-	// back means listing every replica in the cluster on every call.
-	err = storek8s.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer())
-	if err != nil {
-		setupLog.Error(err, "Failed to register field indexes")
-		os.Exit(1)
-	}
-
 	st := storek8s.NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
 
 	ready := newReadyState()

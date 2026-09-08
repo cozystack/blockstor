@@ -4,9 +4,13 @@ package k8s_test
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -112,17 +116,17 @@ func TestRegisteredFieldIndexesServeTheScopedReads(t *testing.T) {
 func startedCachedClient(t *testing.T) ctrlclient.Client {
 	t.Helper()
 
-	mgr, err := manager.New(fixture.env.Config, manager.Options{
+	// k8s.NewManager, which is what the two binaries and the integration
+	// harness call: registering the indexes separately is how all three came
+	// to be running on the fallback at once, so the constructor is what this
+	// pins.
+	mgr, err := k8s.NewManager(fixture.env.Config, manager.Options{
 		Scheme:                 fixture.client.Scheme(),
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
 	})
 	if err != nil {
 		t.Fatalf("build manager: %v", err)
-	}
-
-	if err := k8s.RegisterFieldIndexes(t.Context(), mgr.GetFieldIndexer()); err != nil {
-		t.Fatalf("register field indexes: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -258,5 +262,100 @@ func TestPoolsAppliedWithoutALabelAreStillOnTheNode(t *testing.T) {
 	if len(pools) != 1 {
 		t.Fatalf("ListByNode returned %d pools, want the one applied by hand — a pool "+
 			"the node-scoped read cannot see is a node deleted out from under it", len(pools))
+	}
+}
+
+// The two untyped wordings a missing index reaches this store as, verbatim
+// from controller-runtime: the manager cache's, and the fake client's.
+var (
+	//nolint:staticcheck // verbatim controller-runtime wording; matching it is the point
+	errCacheHasNoIndex = errors.New("Index with name field:spec.nodeName does not exist")
+
+	errFakeClientHasNoIndex = errors.New("List on GroupVersionKind /v1, Kind=Resource " +
+		"specifies selector on field spec.nodeName, but no index with name spec.nodeName " +
+		"has been registered for GroupVersionKind /v1, Kind=Resource")
+
+	errRBACRefused = errors.New("nope")
+)
+
+// refusingClient answers every scoped list with one chosen error.
+type refusingClient struct {
+	ctrlclient.Client
+
+	err error
+}
+
+func (c refusingClient) List(ctx context.Context, list ctrlclient.ObjectList, opts ...ctrlclient.ListOption) error {
+	if len(opts) > 0 {
+		return c.err
+	}
+
+	return c.Client.List(ctx, list, opts...) //nolint:wrapcheck // test decorator
+}
+
+// Falling back to the whole-cluster read is only safe for the one error that
+// means "this server cannot answer that selector". A timeout, an RBAC refusal
+// or a cancelled context are not statements about the selector: answering them
+// with a larger read against the same exhausted budget, and returning nil,
+// hides the failure and does the expensive thing at the worst moment.
+func TestScopedReadsFallBackOnlyWhenTheSelectorIsRefused(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+	seed := k8s.New(fixture.client)
+	ctx := t.Context()
+
+	if err := seed.Nodes().Create(ctx, &apiv1.Node{Name: "node-err", Type: "SATELLITE"}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		err     error
+		wantErr bool
+	}{
+		"the selector is refused": {
+			err:     apierrors.NewBadRequest(`field label not supported: spec.nodeName`),
+			wantErr: false,
+		},
+		"the cache has no index": {
+			err:     errCacheHasNoIndex,
+			wantErr: false,
+		},
+		// The fake client the unit suites run on words it differently, and
+		// matching only the cache's wording turned every scoped read on such
+		// a store into a 500 instead of the fallback.
+		"the fake client has no index": {
+			err:     errFakeClientHasNoIndex,
+			wantErr: false,
+		},
+		"forbidden":       {err: apierrors.NewForbidden(schema.GroupResource{}, "x", errRBACRefused), wantErr: true},
+		"server timeout":  {err: apierrors.NewTimeoutError("gateway timeout", 1), wantErr: true},
+		"context expired": {err: context.DeadlineExceeded, wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := k8s.New(refusingClient{Client: fixture.client, err: tc.err})
+
+			_, err := st.Resources().ListByNode(ctx, "node-err")
+			if tc.wantErr && err == nil {
+				t.Error("the read failed and the store answered nil; the failure is invisible " +
+					"and the whole-cluster read was issued in its place")
+			}
+
+			if !tc.wantErr && err != nil {
+				t.Errorf("a refused selector must fall back, got %v", err)
+			}
+
+			_, err = st.StoragePools().ListByNode(ctx, "node-err")
+			if tc.wantErr && err == nil {
+				t.Error("pools: the read failed and the store answered nil")
+			}
+
+			if !tc.wantErr && err != nil {
+				t.Errorf("pools: a refused selector must fall back, got %v", err)
+			}
+		})
 	}
 }

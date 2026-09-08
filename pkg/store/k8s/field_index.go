@@ -20,12 +20,76 @@ package k8s
 
 import (
 	"context"
+	"strings"
 
 	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 )
+
+// NewManager builds a manager whose cache can answer the reads this store
+// issues.
+//
+// The two halves are one call because they are one decision. A manager whose
+// client backs a Store, and whose cache has no index for the fields the store
+// selects on, does not fail loudly — it answers every scoped read by listing
+// the whole collection and filtering in process, which is the read the scoped
+// one exists to replace. Registering separately is how that came to be true of
+// both server binaries at once, and of the integration harness that claimed to
+// mirror them.
+//
+//nolint:gocritic // ctrl.Options by value mirrors ctrl.NewManager, which this wraps
+func NewManager(cfg *rest.Config, opts ctrl.Options) (ctrl.Manager, error) {
+	mgr, err := ctrl.NewManager(cfg, opts)
+	if err != nil {
+		return nil, errors.Wrap(err, "new manager")
+	}
+
+	err = RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer())
+	if err != nil {
+		return nil, err
+	}
+
+	return mgr, nil
+}
+
+// SelectorUnsupported reports whether an error means the server cannot answer
+// that selector, as opposed to the read having failed.
+//
+// Only the first is safe to answer by reading everything instead. A timeout,
+// an RBAC refusal or a cancelled context are not statements about the
+// selector, and taking the whole-cluster read for them answers a failure that
+// ran out of time or permission with a larger request against the same
+// exhausted budget — and discards the error that said so.
+//
+// Three producers say it, two of them without a type to check.
+//
+//   - the API server rejects a fieldSelector over an undeclared field with
+//     400 "field label not supported", which is typed;
+//   - a manager's cache answers an unindexed field with `Index with name
+//     field:<f> does not exist`;
+//   - controller-runtime's fake client, which the unit suites run on, words
+//     the same condition as `... no index with name <f> has been registered
+//     for GroupVersionKind ...`.
+//
+// Both untyped wordings name the index, so that is what is matched. Matching
+// either wording exactly is how the fake client's went unrecognised: a store
+// built on it turned every scoped read into a 500 rather than the fallback.
+func SelectorUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if apierrors.IsBadRequest(err) {
+		return true
+	}
+
+	return strings.Contains(strings.ToLower(err.Error()), "index with name")
+}
 
 // FieldResourceNodeName is the field a node-scoped Resource query selects on.
 // The CRD declares it selectable, so an uncached client turns it into a

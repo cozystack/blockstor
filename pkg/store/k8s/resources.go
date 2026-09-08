@@ -1043,6 +1043,10 @@ func (s *resources) listScoped(
 		return out, nil
 	}
 
+	if !SelectorUnsupported(err) {
+		return nil, errors.Wrapf(err, "list Resource CRDs for %s=%q", field, value)
+	}
+
 	log.FromContext(ctx).V(1).Info("scoped Resource read unavailable; reading every replica instead",
 		"field", field, "value", value, "reason", err.Error())
 
