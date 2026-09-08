@@ -429,23 +429,28 @@ func writeCloneDone(w http.ResponseWriter, resumed bool, srcName, cloneName stri
 	})
 }
 
-// cloneLayerStackIsHonourable refuses a clone whose requested layer stack
-// changes LUKS membership relative to the source. False means a refusal has
-// been written and the caller must stop.
+// cloneLayerStackIsHonourable refuses a clone whose requested layer stack is
+// not the source's. False means a refusal has been written and the caller must
+// stop.
 //
 // The clone data plane restores the source's bytes onto the target and brings
-// the layer stack up over them, in that order: applyStorageIfDiskful writes
-// the data, maybeLUKS runs after it, and luks.Format treats a device carrying
-// no LUKS header as one to format. So a `layer_list` that adds LUKS to a
-// plaintext source does not produce an encrypted copy — it formats the data
-// that was just restored away, and the clone reports COMPLETE over the
-// wreckage. This is the same reason volume_passphrases is refused a few lines
-// up: a clone that quietly does something other than copy the source is worse
-// than one that says it cannot.
+// the layer stack up over them, in that order. Every layer's bring-up writes
+// to the device it is given:
 //
-// Dropping LUKS from an encrypted source is refused for the mirror reason: the
-// bytes stay ciphertext while the definition claims they are not, so the
-// target mounts as garbage.
+//   - LUKS: luks.Format treats a device carrying no LUKS header as one to
+//     format, so adding LUKS over a plaintext source formats away the data
+//     that was just restored;
+//   - DRBD: create-md runs with --force (pkg/drbd/drbdadm.go) over
+//     `meta-disk internal` (pkg/drbd/conffile.go), stamping metadata across
+//     the tail of the same bytes. The only gate before it is HasMD, which
+//     looks for DRBD metadata and never for a filesystem signature.
+//
+// Both directions are refused, and the rule is the whole set rather than a
+// list of the layers known to write today: a clone is a copy, so a target of a
+// different shape does not hold the source's data whichever layer differs, and
+// a layer added to LINSTOR later inherits the refusal instead of a gap.
+// Ordering and spelling are not a difference — the stack's order follows from
+// the kinds in it, and LINSTOR folds name case.
 //
 // Only the data-bearing path calls this. A clone of a VD-less source carries
 // no bytes to lose, and choosing a different stack for the shell is what
@@ -455,32 +460,72 @@ func cloneLayerStackIsHonourable(w http.ResponseWriter, src *apiv1.ResourceDefin
 		return true
 	}
 
-	wantLUKS := apiv1.LayerInStack(req.LayerList, apiv1.LayerKindLUKS)
-	if wantLUKS == apiv1.LayerInStack(src.LayerStack, apiv1.LayerKindLUKS) {
+	// An RD stored without an explicit stack is not a definition with no
+	// layers — it is one that never said, and every other reader resolves
+	// that to apiv1.DefaultLayerStack (stampRDLayerDataFromStack does it on
+	// the read path). Resolving it here too is what keeps the gate off the
+	// CSI hot path: linstor-csi sends [DRBD, STORAGE] on every clone, and
+	// against a bare source an unresolved empty stack would read as "adds
+	// DRBD, STORAGE" and refuse the clone this endpoint was just unbroken
+	// for.
+	have := src.LayerStack
+	if len(have) == 0 {
+		have = apiv1.DefaultLayerStack()
+	}
+
+	added, dropped := layerSetDifference(have, req.LayerList)
+	if len(added) == 0 && len(dropped) == 0 {
 		return true
 	}
 
-	refusal := &apiv1.APICallRc{
+	writeCloneRefused(w, http.StatusBadRequest, src.Name, req.Name, &apiv1.APICallRc{
 		RetCode: apiCallRcError,
-		Message: "clone of resource definition '" + src.Name +
-			"': layer_list adds LUKS to a plaintext source",
+		Message: "clone of resource definition '" + src.Name + "': layer_list " +
+			describeLayerDifference(added, dropped),
 		Cause: "the clone restores the source's data first and brings the layer stack up " +
-			"over it, so the LUKS format would run across the bytes it just restored",
-		Correc: "clone with the source's own layer stack; to end up with an encrypted " +
-			"copy, create an encrypted resource definition and copy into it",
-	}
-
-	if !wantLUKS {
-		refusal.Message = "clone of resource definition '" + src.Name +
-			"': layer_list drops LUKS from an encrypted source"
-		refusal.Cause = "the clone would carry the source's still-encrypted bytes under a " +
-			"definition that claims to be plaintext"
-		refusal.Correc = "clone with the source's own layer stack"
-	}
-
-	writeCloneRefused(w, http.StatusBadRequest, src.Name, req.Name, refusal)
+			"over it, so a layer added here writes its own metadata across the bytes it " +
+			"just restored, and one dropped leaves the target reading data the missing " +
+			"layer wrote",
+		Correc: "clone with the source's own layer stack; a definition of a different " +
+			"shape has to be created and copied into",
+	})
 
 	return false
+}
+
+// layerSetDifference reports which layers the requested stack adds to the
+// source's and which it drops. Case-insensitive, because LINSTOR names fold
+// and the two stacks reach here from different writers.
+func layerSetDifference(have, want []string) ([]string, []string) {
+	var added, dropped []string
+
+	for _, layer := range want {
+		if !apiv1.LayerInStack(have, layer) {
+			added = append(added, strings.ToUpper(layer))
+		}
+	}
+
+	for _, layer := range have {
+		if !apiv1.LayerInStack(want, layer) {
+			dropped = append(dropped, strings.ToUpper(layer))
+		}
+	}
+
+	return added, dropped
+}
+
+// describeLayerDifference names what the caller asked to change, so the
+// refusal says which layer rather than only that the stacks differ.
+func describeLayerDifference(added, dropped []string) string {
+	switch {
+	case len(added) > 0 && len(dropped) > 0:
+		return "adds " + strings.Join(added, ", ") + " and drops " +
+			strings.Join(dropped, ", ") + " relative to the source"
+	case len(added) > 0:
+		return "adds " + strings.Join(added, ", ") + " to the source's stack"
+	default:
+		return "drops " + strings.Join(dropped, ", ") + " from the source's stack"
+	}
 }
 
 // cloneSnapshotName derives the internal snapshot name backing a

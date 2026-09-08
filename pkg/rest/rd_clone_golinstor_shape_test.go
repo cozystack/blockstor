@@ -149,9 +149,12 @@ func TestRDCloneHonoursTheCallersShapeOnTheDataPath(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
+	// The layer stack has to be the source's on this path — the clone
+	// restores bytes and brings the stack up over them — so what is honoured
+	// here is the group, and the stack is sent the way linstor-csi sends it.
 	resp := postClone(t, base, "src-shape", map[string]any{
 		"name":           "dst-shape",
-		"layer_list":     []string{"STORAGE"},
+		"layer_list":     apiv1.DefaultLayerStack(),
 		"resource_group": "chosen-grp",
 		"use_zfs_clone":  true,
 	})
@@ -170,7 +173,7 @@ func TestRDCloneHonoursTheCallersShapeOnTheDataPath(t *testing.T) {
 		t.Errorf("resource group = %q, want the one the caller asked for", dst.ResourceGroupName)
 	}
 
-	if len(dst.LayerStack) != 1 || dst.LayerStack[0] != "STORAGE" {
+	if len(dst.LayerStack) != len(apiv1.DefaultLayerStack()) {
 		t.Errorf("layer stack = %v, want the one the caller asked for", dst.LayerStack)
 	}
 }

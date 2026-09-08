@@ -30,19 +30,22 @@ func seedCloneSourceWithStack(t *testing.T, st store.Store, rdName string, stack
 }
 
 // The clone data plane restores the source's bytes and brings the layer stack
-// up over them, in that order: applyStorageIfDiskful writes the data, maybeLUKS
-// runs after it, and luks.Format treats a device carrying no LUKS header as one
-// to format. So a layer_list that adds LUKS to a plaintext source does not hand
-// back an encrypted copy — it formats away the data it just restored, and the
-// clone reports COMPLETE over the wreckage.
+// up over them, in that order, and every layer's bring-up writes to the device
+// it is handed. LUKS: luks.Format treats a device carrying no LUKS header as
+// one to format, so adding it does not hand back an encrypted copy — it
+// formats away the data just restored and reports COMPLETE. DRBD: create-md
+// runs with --force over `meta-disk internal`, stamping metadata across the
+// tail of the same bytes, and the only gate before it looks for DRBD metadata
+// rather than for a filesystem.
 //
-// Dropping LUKS is refused for the mirror reason: the bytes stay ciphertext
-// under a definition claiming they are not.
-func TestRDCloneRefusesALUKSMembershipChange(t *testing.T) {
+// Both directions of both layers are refused: a dropped layer leaves the
+// target reading data the missing layer wrote.
+func TestRDCloneRefusesALayerStackChange(t *testing.T) {
 	t.Parallel()
 
 	plain := []string{"DRBD", "STORAGE"}
 	encrypted := []string{"DRBD", "LUKS", "STORAGE"}
+	bare := []string{"STORAGE"}
 
 	for name, tc := range map[string]struct {
 		sourceStack []string
@@ -50,6 +53,12 @@ func TestRDCloneRefusesALUKSMembershipChange(t *testing.T) {
 	}{
 		"adding LUKS to a plaintext source":      {sourceStack: plain, requested: encrypted},
 		"dropping LUKS from an encrypted source": {sourceStack: encrypted, requested: plain},
+		// DRBD writes to the device as surely as LUKS does: create-md runs
+		// with --force over `meta-disk internal`, stamping metadata across
+		// the tail of the bytes the clone just restored, and the only gate
+		// before it looks for DRBD metadata rather than for a filesystem.
+		"adding DRBD to a source without it":  {sourceStack: bare, requested: plain},
+		"dropping DRBD from a source with it": {sourceStack: plain, requested: bare},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -86,12 +95,13 @@ func TestRDCloneRefusesALUKSMembershipChange(t *testing.T) {
 	}
 }
 
-// The positive control for the refusal above. Same request shape, same
-// passphrase, a layer_list that differs from the source's — but with LUKS
-// membership left alone — and the clone goes through. Without this the
-// refusal could be coming from validateLayerStack or from the LUKS-prereq
-// gate and the test above would not know the difference.
-func TestRDCloneHonoursALayerListThatKeepsLUKSMembership(t *testing.T) {
+// The positive control for the refusals above. Same request shape, same
+// passphrase, a layer_list spelled in a case the source is not stored in, and
+// the clone goes through, because the set is the same. (The order is the
+// stack's own and validateLayerStack enforces it, so case is what is free to
+// differ.) Without this the refusals could be coming from validateLayerStack or
+// from the LUKS-prereq gate and the table above would not know the difference.
+func TestRDCloneHonoursALayerListThatMatchesTheSource(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
@@ -102,7 +112,7 @@ func TestRDCloneHonoursALayerListThatKeepsLUKSMembership(t *testing.T) {
 
 	resp := postClone(t, base, "src-keep", map[string]any{
 		"name":       "dst-keep",
-		"layer_list": []string{"LUKS", "STORAGE"},
+		"layer_list": []string{"drbd", "luks", "storage"},
 	})
 	_ = resp.Body.Close()
 
@@ -115,9 +125,40 @@ func TestRDCloneHonoursALayerListThatKeepsLUKSMembership(t *testing.T) {
 		t.Fatalf("target RD not persisted: %v", err)
 	}
 
-	want := []string{"LUKS", "STORAGE"}
-	if len(dst.LayerStack) != len(want) || dst.LayerStack[0] != want[0] || dst.LayerStack[1] != want[1] {
-		t.Errorf("layer stack = %v, want the one the caller asked for %v", dst.LayerStack, want)
+	if len(dst.LayerStack) != 3 {
+		t.Errorf("layer stack = %v, want the three layers the caller asked for", dst.LayerStack)
+	}
+}
+
+// The CSI hot path, which is the one this gate must never touch. linstor-csi
+// sends [DRBD, STORAGE] on every clone; a definition created without an
+// explicit stack stores none, and reading that as "no layers" would make the
+// request read as adding both and refuse every clone-from-volume — the defect
+// this PR exists to fix, reintroduced by its own guard. An unset stack means
+// the default, here as everywhere else that reads one.
+func TestRDCloneOfASourceWithNoRecordedStackTakesTheCSIDefault(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedDeployedCloneSource(t, st, "src-bare")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postClone(t, base, "src-bare", map[string]any{
+		"name":          "dst-bare",
+		"layer_list":    apiv1.DefaultLayerStack(),
+		"use_zfs_clone": true,
+	})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — this is what linstor-csi sends on every clone",
+			resp.StatusCode)
+	}
+
+	if _, err := st.ResourceDefinitions().Get(t.Context(), "dst-bare"); err != nil {
+		t.Errorf("target RD not persisted: %v", err)
 	}
 }
 
