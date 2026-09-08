@@ -108,7 +108,7 @@ func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv
 		return s.listByDefinitionExhaustively(ctx, rdName)
 	}
 
-	return s.wireSnapshots(ctx, rdName, crdList.Items), nil
+	return s.wireSnapshots(ctx, rdName, crdList.Items)
 }
 
 func (s *snapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
@@ -503,12 +503,25 @@ func (s *snapshots) listByDefinitionExhaustively(ctx context.Context, rdName str
 		}
 	}
 
-	return s.wireSnapshots(ctx, rdName, kept), nil
+	return s.wireSnapshots(ctx, rdName, kept)
 }
 
 // wireSnapshots converts a definition's snapshots, reading the parent once.
-func (s *snapshots) wireSnapshots(ctx context.Context, rdName string, items []crdv1alpha1.Snapshot) []apiv1.Snapshot {
-	parent, _ := s.getParentRD(ctx, rdName)
+//
+// The parent read's error is propagated rather than dropped. A snapshot whose
+// definition is GONE is not an error — getParentRD answers (nil, nil) for both
+// the missing name and the NotFound, because an orphan snapshot is a real
+// shape and must still list. What reaches here is a read that actually failed,
+// and swallowing it returned a successful listing with
+// ResourceDefinitionProps silently absent from every row: the caller cannot
+// tell "this definition has no props" from "nobody could read them".
+func (s *snapshots) wireSnapshots(
+	ctx context.Context, rdName string, items []crdv1alpha1.Snapshot,
+) ([]apiv1.Snapshot, error) {
+	parent, err := s.getParentRD(ctx, rdName)
+	if err != nil {
+		return nil, err
+	}
 
 	out := make([]apiv1.Snapshot, 0, len(items))
 	for i := range items {
@@ -517,5 +530,5 @@ func (s *snapshots) wireSnapshots(ctx context.Context, rdName string, items []cr
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 
-	return out
+	return out, nil
 }

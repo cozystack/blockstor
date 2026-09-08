@@ -491,3 +491,74 @@ func TestNodeScopedReadsUseTheDirectReaderWhenThereIsOne(t *testing.T) {
 			"to bypass it when an API reader is available", n)
 	}
 }
+
+// errRDReadFailed is a read that actually failed, as opposed to a definition
+// that is not there: getParentRD answers (nil, nil) for the missing name and
+// for NotFound, because an orphan snapshot is a real shape that must still
+// list.
+var errRDReadFailed = errors.New("probe: transient failure reading the definition")
+
+type failingRDGet struct {
+	ctrlclient.Client
+}
+
+func (f failingRDGet) Get(ctx context.Context, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption) error {
+	if _, ok := obj.(*crdv1alpha1.ResourceDefinition); ok {
+		return errRDReadFailed
+	}
+
+	return f.Client.Get(ctx, key, obj, opts...) //nolint:wrapcheck // test decorator
+}
+
+// A snapshot listing that cannot read the parent definition used to answer
+// success with ResourceDefinitionProps silently absent from every row, so the
+// caller could not tell "this definition has no props" from "nobody could read
+// them". The orphan case is answered earlier and deliberately, so what is left
+// here is a genuine failure and belongs to the caller.
+func TestSnapshotListByDefinitionSurfacesAFailedParentRead(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+	ctx := t.Context()
+	seed := k8s.New(fixture.client)
+
+	if err := seed.ResourceDefinitions().Create(ctx,
+		&apiv1.ResourceDefinition{Name: "pvc-parent"}); err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	if err := seed.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-parent",
+		ResourceName: "pvc-parent",
+		Nodes:        []string{"n1"},
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	broken := k8s.New(failingRDGet{Client: fixture.client})
+
+	if _, err := broken.Snapshots().ListByDefinition(ctx, "pvc-parent"); err == nil {
+		t.Error("the parent read failed and the listing answered success; the rows come " +
+			"back without the definition's props and nothing says so")
+	}
+
+	// The control: an orphan snapshot, whose definition is genuinely absent,
+	// still lists. That is the case the discarded error was hiding behind.
+	if err := fixture.client.Delete(ctx, &crdv1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-parent"},
+	}); err != nil {
+		t.Fatalf("delete the parent: %v", err)
+	}
+
+	snaps, err := seed.Snapshots().ListByDefinition(ctx, "pvc-parent")
+	if err != nil {
+		t.Fatalf("orphan snapshot listing must still work: %v", err)
+	}
+
+	if len(snaps) != 1 {
+		t.Errorf("orphan listing returned %d snapshots, want 1", len(snaps))
+	}
+}
