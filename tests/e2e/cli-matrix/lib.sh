@@ -557,8 +557,11 @@ cleanup_encryption_state() {
 # block device that holds the LUKS header for (RD, NODE, VOL). For
 # layer stack [LUKS,STORAGE] the header lives directly on the
 # provider's LV/zvol; for [DRBD,LUKS,STORAGE] the header still lives
-# on the LV (DRBD ships ciphertext between peers, see
-# drbd-luks-stack.sh comment). We discover the backing dev by reading
+# on the LV, because DRBD sits ABOVE LUKS and its lower disk is the
+# dm-crypt mapper (the plaintext side). DRBD therefore ships
+# PLAINTEXT between peers and each node encrypts on the way to its
+# own storage — LUKS here is at-rest protection per node, not
+# transport protection. We discover the backing dev by reading
 # the .res file's `disk` line for the LUKS-mapper case, or by
 # `lvs`/`zfs list`-grep for the bare-storage case. Echo empty string
 # on failure so the caller can decide whether to retry or fail.
