@@ -371,8 +371,12 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	snap, ok := s.ensureCloneSnapshot(w, r, src, req.Name)
+	snap, reusedSnapshot, ok := s.ensureCloneSnapshot(w, r, src, req.Name)
 	if !ok {
+		return
+	}
+
+	if !s.cloneMayProceedFromSnapshot(ctx, w, src, req.Name, snap, resume, reusedSnapshot) {
 		return
 	}
 
@@ -645,20 +649,39 @@ func cloneTargetShape(src *apiv1.ResourceDefinition, req *rdCloneRequest) *apiv1
 // online, and every backing pool must be snapshot-capable (thin LVM
 // / ZFS / FILE_THIN) — the clone data plane IS a snapshot restore,
 // so a source that cannot be snapshotted cannot be cloned.
-func (s *Server) ensureCloneSnapshot(w http.ResponseWriter, r *http.Request, src *apiv1.ResourceDefinition, cloneName string) (*apiv1.Snapshot, bool) {
+func (s *Server) ensureCloneSnapshot(
+	w http.ResponseWriter, r *http.Request, src *apiv1.ResourceDefinition, cloneName string,
+) (*apiv1.Snapshot, bool, bool) {
 	ctx := r.Context()
 	snapName := cloneSnapshotName(cloneName)
 
 	existing, err := s.Store.Snapshots().Get(ctx, src.Name, snapName)
 	if err == nil {
 		// Interrupted-clone retry: the snapshot landed on a previous
-		// attempt; reuse it so the restore sees the same point-in-time —
-		// but only while it still describes the source.
-		if !s.cloneSnapshotIsCurrent(ctx, w, src, &existing, cloneName) {
-			return nil, false
+		// attempt; reuse it so the restore sees the same point-in-time.
+		//
+		// Whether it still describes the SOURCE is a question for the
+		// caller, and only when the clone is unfinished — a finished one is
+		// a copy of the point-in-time and owes the source nothing.
+		//
+		// What is checked here is what the create branch checks and this one
+		// used to skip: a snapshot recording no nodes places no replicas, so
+		// the clone would answer 201 over an empty shell, which is the Bug
+		// 114 shape the create branch refuses.
+		if len(existing.Nodes) == 0 {
+			writeCloneRefused(w, http.StatusConflict, src.Name, cloneName, &apiv1.APICallRc{
+				RetCode: apiCallRcError,
+				Message: "clone of resource definition '" + src.Name + "' refused: the leftover snapshot '" +
+					existing.Name + "' records no nodes",
+				Cause: "a snapshot with no nodes places no replicas, so the clone would " +
+					"report success over an empty shell",
+				Correc: "delete the snapshot '" + existing.Name + "' so the clone retakes it",
+			})
+
+			return nil, false, false
 		}
 
-		return &existing, true
+		return &existing, true, true
 	}
 
 	snap := apiv1.Snapshot{Name: snapName, ResourceName: src.Name}
@@ -670,11 +693,11 @@ func (s *Server) ensureCloneSnapshot(w http.ResponseWriter, r *http.Request, src
 			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
 		})
 
-		return nil, false
+		return nil, false, false
 	}
 
 	if !s.cloneSnapshotPreconditionsHold(ctx, w, src, &snap, cloneName) {
-		return nil, false
+		return nil, false, false
 	}
 
 	snap.Snapshots = makeSnapshotPerNode(snapName, snap.Nodes, snap.VolumeDefinitions)
@@ -687,10 +710,102 @@ func (s *Server) ensureCloneSnapshot(w http.ResponseWriter, r *http.Request, src
 				"' failed: internal snapshot create: " + err.Error(),
 		})
 
-		return nil, false
+		return nil, false, false
 	}
 
-	return &snap, true
+	return &snap, false, true
+}
+
+// cloneMayProceedFromSnapshot answers the two questions a leftover raises,
+// in the order that keeps them from contradicting each other. False means an
+// answer has already been written and the caller must stop.
+//
+// First: is the clone already finished? If the target holds the snapshot's
+// volumes, this is a replay and the answer is the idempotent success CSI
+// requires — whatever has happened to the source since.
+//
+// Only then: does a REUSED snapshot still describe the source? That question
+// belongs to a clone about to be materialised, never to one already made, and
+// asking it first is what made an ordinary source resize refuse every later
+// retry of a completed clone, permanently.
+func (s *Server) cloneMayProceedFromSnapshot(
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition,
+	cloneName string, snap *apiv1.Snapshot, resume, reusedSnapshot bool,
+) bool {
+	if resume {
+		finished, halt := s.resumedCloneIsFinished(ctx, w, src, cloneName, snap)
+		if halt {
+			return false
+		}
+
+		if finished {
+			writeCloneDone(w, true, src.Name, cloneName)
+
+			return false
+		}
+	}
+
+	return !reusedSnapshot || s.cloneSnapshotIsCurrent(ctx, w, src, snap, cloneName)
+}
+
+// resumedCloneIsFinished answers what a leftover target is, by comparing it to
+// the snapshot the resume would hydrate from. It returns (finished, stop):
+// stop when a refusal has already been written.
+//
+// Three shapes, and the previous round of this code collapsed them into one.
+//
+//   - The target's volumes match the snapshot: the clone COMPLETED and this is
+//     a replay. linstor-csi replays CreateVolume whenever a response is lost or
+//     external-provisioner restarts, so this has to be the idempotent success
+//     CSI requires. Nothing about the source can change that answer — the clone
+//     is a copy of a point-in-time, and expanding the source afterwards is a
+//     legal, routine act that must not poison every later retry. Comparing
+//     against the live source made it permanent, because the internal snapshot
+//     is deterministic and outlives the clone by design (zfs clone targets stay
+//     dependent on their origin) and the marker survives too, so every repeat
+//     took the same refusal — one whose correction, "delete the snapshot", the
+//     operator cannot follow, since that snapshot is the origin of the clone
+//     they already have.
+//   - The target has no volumes: the first attempt died before hydrating. That
+//     is the resume this path exists for.
+//   - The target has volumes that are NOT the snapshot's: something else is
+//     under that name, or an earlier attempt hydrated from a different
+//     point-in-time. Hydrating skips what is already there, so the retry would
+//     leave the old shape in place and report the clone complete — and the
+//     status poll compares volume counts, not sizes, so it would agree.
+func (s *Server) resumedCloneIsFinished(
+	ctx context.Context, w http.ResponseWriter,
+	src *apiv1.ResourceDefinition, cloneName string, snap *apiv1.Snapshot,
+) (bool, bool) {
+	targetVDs, err := s.Store.VolumeDefinitions().List(ctx, cloneName)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
+		})
+
+		return false, true
+	}
+
+	if len(targetVDs) == 0 {
+		return false, false
+	}
+
+	divergence := snapshotDivergence(cloneName, snap, targetVDs)
+	if divergence == "" {
+		return true, false
+	}
+
+	writeCloneRefused(w, http.StatusConflict, src.Name, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone of resource definition '" + src.Name + "' refused: " + divergence,
+		Cause: "the definition under that name holds volumes that are not the ones this " +
+			"clone would restore, and hydrating skips what is already there, so the " +
+			"retry would leave them and report the clone complete",
+		Correc: "delete '" + cloneName + "' and clone again, or clone under a different name",
+	})
+
+	return false, true
 }
 
 // cloneSnapshotIsCurrent refuses to resume a clone over a leftover snapshot

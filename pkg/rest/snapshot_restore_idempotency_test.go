@@ -288,10 +288,30 @@ func (s caseFoldingSnapshots) Get(ctx context.Context, rdName, snapName string) 
 	return s.SnapshotStore.Get(ctx, strings.ToLower(rdName), strings.ToLower(snapName)) //nolint:wrapcheck // pass-through decorator
 }
 
+func (s caseFoldingSnapshots) Create(ctx context.Context, snap *apiv1.Snapshot) error {
+	folded := *snap
+	folded.Name = strings.ToLower(snap.Name)
+	folded.ResourceName = strings.ToLower(snap.ResourceName)
+
+	return s.SnapshotStore.Create(ctx, &folded) //nolint:wrapcheck // pass-through decorator
+}
+
 type caseFoldingRDs struct{ store.ResourceDefinitionStore }
 
 func (s caseFoldingRDs) Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
 	return s.ResourceDefinitionStore.Get(ctx, strings.ToLower(name)) //nolint:wrapcheck // pass-through decorator
+}
+
+// Create folds too, because the real store folds the metadata.name it writes,
+// so a create under a differently-cased name collides there. A shim that
+// folded only lookups let a retry create a SECOND definition beside the
+// leftover and still satisfy every assertion, which left the tolerance branch
+// these tests exist to pin unreached.
+func (s caseFoldingRDs) Create(ctx context.Context, rd *apiv1.ResourceDefinition) error {
+	folded := *rd
+	folded.Name = strings.ToLower(rd.Name)
+
+	return s.ResourceDefinitionStore.Create(ctx, &folded) //nolint:wrapcheck // pass-through decorator
 }
 
 type caseFoldingVDs struct{ store.VolumeDefinitionStore }
@@ -346,5 +366,67 @@ func TestSnapshotRestoreResumesWhateverCaseTheRetryUses(t *testing.T) {
 
 	if len(vds) != 1 {
 		t.Errorf("after the retry the target has %d volume(s), want 1", len(vds))
+	}
+
+	// Exactly one, which is the assertion that makes the fold load-bearing: a
+	// shim folding only lookups let the retry create a second definition
+	// beside the leftover and pass everything else.
+	all, err := st.ResourceDefinitions().List(ctx)
+	if err != nil {
+		t.Fatalf("list definitions: %v", err)
+	}
+
+	targets := 0
+
+	for i := range all {
+		if strings.EqualFold(all[i].Name, "pvc-dst") {
+			targets++
+		}
+	}
+
+	if targets != 1 {
+		t.Errorf("%d definitions under the target name; the retry created a second one "+
+			"beside the leftover instead of resuming it", targets)
+	}
+}
+
+// The marker's SOURCE half is written from the stored spelling, and nothing
+// held it: every shipped restore test spells the source the way it is stored,
+// and the case-fold resume test varies only the snapshot half. So reverting
+// that half to the request's spelling left the package green, and the fix
+// could regress in silence.
+//
+// The satellite splits this value to find the source, and a retry compares
+// against it, so the spelling written is not cosmetic.
+func TestSnapshotRestoreWritesTheMarkerWithTheStoredSourceSpelling(t *testing.T) {
+	st := caseFoldingStore{store.NewInMemory()}
+	ctx := t.Context()
+	seedRestoreSource(ctx, t, st)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(map[string]string{
+		"to_resource":   "pvc-dst",
+		"from_snapshot": "snap-1",
+	})
+
+	// The source spelled the way an operator might type it, not the way it is
+	// stored.
+	resp := httpPost(t, base+"/v1/resource-definitions/PVC-SRC/snapshot-restore-resource", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("restore spelled PVC-SRC: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "pvc-dst")
+	if err != nil {
+		t.Fatalf("get the restored definition: %v", err)
+	}
+
+	if want := restoreMarker("pvc-src", "snap-1"); got.Props[restoreFromSnapshotKey] != want {
+		t.Errorf("marker = %q, want %q — both halves come off the stored objects, "+
+			"not off the request", got.Props[restoreFromSnapshotKey], want)
 	}
 }

@@ -522,6 +522,16 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 	return req.SnapshotName
 }
 
+// resolvedLayerStack answers what a stored stack means: an empty one is the
+// upstream default, which is what every reader of a stack resolves it to.
+func resolvedLayerStack(stack []string) []string {
+	if len(stack) == 0 {
+		return apiv1.DefaultLayerStack()
+	}
+
+	return stack
+}
+
 // leftoverShapeDiffers names the first way a definition already under the
 // target name was built to a different shape than this request asks for, or ""
 // when the two agree.
@@ -538,7 +548,13 @@ func leftoverShapeDiffers(existing, want *apiv1.ResourceDefinition) string {
 			want.ResourceGroupName + "'"
 	}
 
-	added, dropped := layerSetDifference(existing.LayerStack, want.LayerStack)
+	// An unset stack is a definition that never said, not one with no layers —
+	// the same resolution cloneLayerStackIsHonourable makes, and for the same
+	// reason. Without it a leftover stamped [DRBD, STORAGE] by one client
+	// refuses a retry from another that omits layer_list, and the refusal
+	// renders the empty side as nothing at all.
+	added, dropped := layerSetDifference(
+		resolvedLayerStack(existing.LayerStack), resolvedLayerStack(want.LayerStack))
 	if len(added) > 0 || len(dropped) > 0 {
 		return "layer stack " + strings.Join(existing.LayerStack, ",") + ", not " +
 			strings.Join(want.LayerStack, ",")
@@ -871,13 +887,41 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 			SizeKib:      svd.SizeKib,
 		}
 
-		// AlreadyExists is not a conflict here. The volumes created are
-		// exactly the ones the snapshot records, so one already under
-		// that number IS this volume — left behind by a restore that
-		// got this far and then failed. Tolerating it is what lets a
-		// retry finish an incomplete restore instead of refusing it.
 		err := s.Store.VolumeDefinitions().Create(ctx, rdName, &vd)
-		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+		if err == nil {
+			continue
+		}
+
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			return err //nolint:wrapcheck // surfaced via writeStoreError
+		}
+
+		// AlreadyExists is not a conflict when the volume already there is
+		// the one this would have written — left behind by a restore that
+		// got this far and then failed. Tolerating THAT is what lets a
+		// retry finish an incomplete restore instead of refusing it.
+		//
+		// It is not a licence to tolerate any volume under that number.
+		// This helper is also the second half of the volume-definition
+		// restore's collision guard, whose first half waves a request
+		// through when the target's volume list cannot be read precisely
+		// because "the downstream hydrate Create still guards" — and the
+		// same hole opens with no read error at all, since the pre-check
+		// LISTs and this CREATEs, so a volume appearing between the two
+		// arrives here. Blanket tolerance turns both into a 200 reporting
+		// a layout that was never written.
+		//
+		// The size is what tells the two apart: a volume recorded by this
+		// snapshot at this number has this size, and one that does not is
+		// somebody else's. That also closes the resume-path variant, where
+		// a leftover volume at the wrong size was kept and the restore
+		// reported complete over it.
+		existing, getErr := s.Store.VolumeDefinitions().Get(ctx, rdName, svd.VolumeNumber)
+		if getErr != nil {
+			return err //nolint:wrapcheck // the collision is the answer, not the read
+		}
+
+		if existing.SizeKib != svd.SizeKib {
 			return err //nolint:wrapcheck // surfaced via writeStoreError
 		}
 	}
