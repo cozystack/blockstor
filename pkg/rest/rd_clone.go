@@ -28,6 +28,7 @@ import (
 	"github.com/LINBIT/golinstor/clonestatus"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // rdCloneRequest is the body for `resource-definition clone`. Only the
@@ -230,7 +231,7 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 	// operation with no follow-up autoplace, so the clone replicas must
 	// materialise on the snapshot-holding nodes in the source pool here
 	// (same backend by construction — Bug 038).
-	_, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true)
+	_, stampedRG, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true)
 	if err != nil {
 		writeCloneRefused(w, http.StatusInternalServerError, src.Name, req.Name, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
@@ -240,7 +241,7 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	if !s.cloneParentRGSurvived(ctx, w, src, req.Name) {
+	if !s.cloneParentRGSurvived(ctx, w, src, req.Name, stampedRG) {
 		return
 	}
 
@@ -272,16 +273,17 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 // leaves the clone parented to a group that is gone. False means the clone has
 // been rolled back and a refusal written.
 func (s *Server) cloneParentRGSurvived(
-	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, cloneName string,
+	ctx context.Context, w http.ResponseWriter,
+	src *apiv1.ResourceDefinition, cloneName, stampedRG string,
 ) bool {
-	survived, err := s.parentRGSurvived(ctx, src.ResourceGroupName)
+	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
-		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
-		})
+		// The check failed, not the clone. See restoreParentRGSurvived for
+		// why an inconclusive safety net must not undo work that succeeded.
+		log.FromContext(ctx).Info("could not re-check the clone's parent group",
+			"resourceDefinition", cloneName, "resourceGroup", stampedRG, "reason", err.Error())
 
-		return false
+		return true
 	}
 
 	if survived {
@@ -293,7 +295,7 @@ func (s *Server) cloneParentRGSurvived(
 		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
 			Message: "clone of resource definition '" + src.Name + "': " +
-				rollbackFailedMessage(cloneName, src.ResourceGroupName, rollbackErr),
+				rollbackFailedMessage(cloneName, stampedRG, rollbackErr),
 			Cause: "the replicas could not all be reaped, so the definition was left in " +
 				"place rather than orphaning them",
 			Correc: "delete '" + cloneName + "' by hand once the replicas can be removed",
@@ -305,7 +307,7 @@ func (s *Server) cloneParentRGSurvived(
 	writeCloneRefused(w, http.StatusNotFound, src.Name, cloneName, &apiv1.APICallRc{
 		RetCode: apiCallRcError,
 		Message: "clone of resource definition '" + src.Name + "' rolled back: " +
-			rgDeletedRaceCorrection(src.ResourceGroupName),
+			rgDeletedRaceCorrection(stampedRG),
 		Cause: "the clone inherits its parent group from the source, and that group was " +
 			"deleted while the clone was being materialised; a definition pointing at a " +
 			"group that is gone lists fine and places badly",

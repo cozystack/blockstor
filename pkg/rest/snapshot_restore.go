@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
@@ -313,14 +315,17 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// target is left an empty shell for the operator / linstor-csi to
 	// place (restore-then-scale-out); an explicit node list is still
 	// stamped verbatim inside materializeRestoredRD.
-	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false)
+	newRDName, stampedRG, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	if !s.restoreParentRGSurvived(r.Context(), w, srcRD, newRDName) {
+	// The group validated is the one that was WRITTEN, not the source's read
+	// back a second time: re-reading answers a different question, and the
+	// extra read was itself a way to fail a restore that had already worked.
+	if !s.restoreParentRGSurvived(r.Context(), w, newRDName, stampedRG) {
 		return
 	}
 
@@ -396,20 +401,26 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 // so a `rg d` landing while it materialises leaves it parented to a group that
 // is gone. False means the restore has been rolled back and a refusal written.
 func (s *Server) restoreParentRGSurvived(
-	ctx context.Context, w http.ResponseWriter, srcRD, newRDName string,
+	ctx context.Context, w http.ResponseWriter, newRDName, stampedRG string,
 ) bool {
-	srcRDObj, err := s.Store.ResourceDefinitions().Get(ctx, srcRD)
+	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
-		writeStoreError(w, err)
+		// The CHECK failed, which says nothing about the restore: that
+		// already succeeded, and this is the safety net over it. Undoing a
+		// completed restore because the net could not be inspected trades a
+		// rare dangling group for a certain lost restore — and a much worse
+		// one, since this endpoint has no idempotent-replay gate, so the
+		// definition stays behind and every retry under that name meets
+		// AlreadyExists and answers 409 from then on.
+		//
+		// getRGWithCacheRetry returns immediately on anything that is not
+		// NotFound, so this branch is apiserver unavailability, a timeout, a
+		// decode failure or a cancelled request context — none of them a
+		// statement about the group.
+		log.FromContext(ctx).Info("could not re-check the restored definition's parent group",
+			"resourceDefinition", newRDName, "resourceGroup", stampedRG, "reason", err.Error())
 
-		return false
-	}
-
-	survived, err := s.parentRGSurvived(ctx, srcRDObj.ResourceGroupName)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return false
+		return true
 	}
 
 	if survived {
@@ -421,7 +432,7 @@ func (s *Server) restoreParentRGSurvived(
 		writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
 			RetCode: apiCallRcError,
 			Message: "snapshot restore: " +
-				rollbackFailedMessage(newRDName, srcRDObj.ResourceGroupName, rollbackErr),
+				rollbackFailedMessage(newRDName, stampedRG, rollbackErr),
 			Cause: "the replicas could not all be reaped, so the definition was left in " +
 				"place rather than orphaning them",
 			Correc: "delete '" + newRDName + "' by hand once the replicas can be removed",
@@ -432,7 +443,7 @@ func (s *Server) restoreParentRGSurvived(
 
 	writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
 		RetCode: apiCallRcError,
-		Message: "snapshot restore rolled back: " + rgDeletedRaceCorrection(srcRDObj.ResourceGroupName),
+		Message: "snapshot restore rolled back: " + rgDeletedRaceCorrection(stampedRG),
 		Cause: "the restored definition inherits its parent group from the source, and that " +
 			"group was deleted while the restore was being materialised; a definition " +
 			"pointing at a group that is gone lists fine and places badly",
@@ -468,10 +479,12 @@ func (s *Server) restoreParentRGSurvived(
 //
 // An explicit caller node list is always stamped verbatim, regardless of
 // eagerPlace.
-func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) (string, error) {
+//
+//nolint:nonamedreturns // the second result needs a name to be readable at the call sites
+func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) (name, stampedRG string, err error) {
 	srcRDObj, err := s.Store.ResourceDefinitions().Get(ctx, srcRD)
 	if err != nil {
-		return "", err //nolint:wrapcheck // surfaced via writeStoreError
+		return "", "", err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
 	newRD := apiv1.ResourceDefinition{
@@ -507,12 +520,12 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 
 	err = s.Store.ResourceDefinitions().Create(ctx, &newRD)
 	if err != nil {
-		return "", err //nolint:wrapcheck // surfaced via writeStoreError
+		return "", "", err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
 	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Bug 354: stamp per-node Resource CRDs so satellites have something
@@ -523,10 +536,10 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// empty shell. Mirrors upstream CtrlSnapshotRestoreApiCallHandler.
 	err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap, eagerPlace)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return newRD.Name, nil
+	return newRD.Name, newRD.ResourceGroupName, nil
 }
 
 // placeRestoredResources stamps the Resource CRDs that materialise the

@@ -302,3 +302,91 @@ func TestRDCloneRollbackKeepsTheDefinitionWhenTheCascadeFails(t *testing.T) {
 		t.Errorf("message = %q, want it to name the definition left behind", msg)
 	}
 }
+
+// errRGReadFailed stands in for what a re-check can hit that says nothing
+// about the group: apiserver unavailability, a timeout, a decode failure, a
+// cancelled request context. getRGWithCacheRetry returns immediately on
+// anything that is not NotFound, so all of them arrive here.
+var errRGReadFailed = errors.New("probe: transient failure reading the resource group")
+
+type failingRGReads struct {
+	store.ResourceGroupStore
+}
+
+func (f failingRGReads) Get(context.Context, string) (apiv1.ResourceGroup, error) {
+	return apiv1.ResourceGroup{}, errRGReadFailed
+}
+
+type failingRGReadStore struct {
+	store.Store
+}
+
+func (f failingRGReadStore) ResourceGroups() store.ResourceGroupStore {
+	return failingRGReads{f.Store.ResourceGroups()}
+}
+
+// The post-write check is a safety net over a restore that already succeeded.
+// When the net itself cannot be inspected, undoing the restore trades a rare
+// dangling parent group for a certain lost restore — and a worse one, because
+// this endpoint has no idempotent-replay gate: the definition stays behind and
+// every later attempt under that name meets AlreadyExists and answers 409 from
+// then on. A blip in a check that has nothing to do with whether the restore
+// worked must not be able to do that.
+func TestSnapshotRestoreSurvivesAFailedParentGroupRecheck(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := backend.ResourceGroups().Create(ctx,
+		&apiv1.ResourceGroup{Name: "grp-flaky"}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	if err := backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "flaky-src",
+		ResourceGroupName: "grp-flaky",
+	}); err != nil {
+		t.Fatalf("seed the source: %v", err)
+	}
+
+	if err := backend.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-flaky",
+		ResourceName: "flaky-src",
+		Nodes:        []string{"n1"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed the snapshot: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, failingRGReadStore{backend})
+	defer stop()
+
+	body, _ := json.Marshal(map[string]string{
+		"to_resource":   "flaky-dst",
+		"from_snapshot": "snap-flaky",
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/flaky-src/snapshot-restore-resource", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — the restore succeeded; only the re-check failed",
+			resp.StatusCode)
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(ctx, "flaky-dst"); err != nil {
+		t.Errorf("the restored definition was rolled back over a failed check: %v", err)
+	}
+
+	vds, err := backend.VolumeDefinitions().List(ctx, "flaky-dst")
+	if err != nil {
+		t.Fatalf("list the restored volumes: %v", err)
+	}
+
+	if len(vds) != 1 {
+		t.Errorf("restored definition has %d volume(s), want 1", len(vds))
+	}
+}
