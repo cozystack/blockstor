@@ -416,7 +416,19 @@ func (s *Server) restoreParentRGSurvived(
 		return true
 	}
 
-	s.rollBackMaterialisedRD(ctx, newRDName)
+	rollbackErr := s.rollBackMaterialisedRD(ctx, newRDName)
+	if rollbackErr != nil {
+		writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "snapshot restore: " +
+				rollbackFailedMessage(newRDName, srcRDObj.ResourceGroupName, rollbackErr),
+			Cause: "the replicas could not all be reaped, so the definition was left in " +
+				"place rather than orphaning them",
+			Correc: "delete '" + newRDName + "' by hand once the replicas can be removed",
+		}})
+
+		return false
+	}
 
 	writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
 		RetCode: apiCallRcError,

@@ -77,12 +77,43 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 // the only copy of something, and deleting one is the operator's decision, not
 // this endpoint's — the same stance the clone's snapshot reuse takes.
 //
-// Best-effort, and it says so: if the rollback itself fails the caller still
-// gets the refusal, and the dangling-RG error surfaces on the next access to
-// the definition rather than being swallowed here.
-func (s *Server) rollBackMaterialisedRD(ctx context.Context, rdName string) {
-	_ = store.CascadeDeleteResources(ctx, s.Store, rdName)
-	_ = s.Store.ResourceDefinitions().Delete(ctx, rdName)
+// The order is not merely tidy: the definition goes ONLY if the replicas
+// went. CascadeDeleteResources stops at the first replica it cannot delete and
+// leaves the rest untried, and dropping the parent anyway produces precisely
+// the orphan this rollback exists to avoid — a Resource whose RD vanished
+// never gets a DeletionTimestamp, so the satellite's finalizer never runs,
+// `drbdadm down` never happens, and the DRBD minor, port and peer entries stay
+// live on every satellite until the next create with that name collides with
+// them. On the CSI path the target name is deterministic, so the retry IS that
+// collision. Both other doors that perform this teardown — handleRDDelete and
+// the CLI's `rd d` — refuse to proceed on a failed cascade for the same
+// reason, and a satellite writing status on the very replicas being reaped
+// makes a conflict there an ordinary outcome rather than a rare one.
+//
+// So this returns an error, and a caller that gets one must not report a
+// rollback. What is left behind is a definition parented to a group that is
+// gone, which is the state the operator has to be told about, with its name.
+func (s *Server) rollBackMaterialisedRD(ctx context.Context, rdName string) error {
+	err := store.CascadeDeleteResources(ctx, s.Store, rdName)
+	if err != nil {
+		return errors.Wrapf(err, "cascade the replicas of %q", rdName)
+	}
+
+	err = s.Store.ResourceDefinitions().Delete(ctx, rdName)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return errors.Wrapf(err, "delete %q", rdName)
+	}
+
+	return nil
+}
+
+// rollbackFailedMessage is what the operator is told when the compensation
+// could not complete: naming the definition that is still there matters more
+// than the refusal itself, because nothing else will name it.
+func rollbackFailedMessage(rdName, rgName string, cause error) string {
+	return "resource group '" + rgName + "' was deleted concurrently with the operation " +
+		"(Bug 174) AND rolling '" + rdName + "' back failed: " + cause.Error() +
+		"; '" + rdName + "' is still there, parented to a group that no longer exists"
 }
 
 // rgDeletedRaceCorrection is the one wording for the refusal, so an operator

@@ -288,7 +288,19 @@ func (s *Server) cloneParentRGSurvived(
 		return true
 	}
 
-	s.rollBackMaterialisedRD(ctx, cloneName)
+	rollbackErr := s.rollBackMaterialisedRD(ctx, cloneName)
+	if rollbackErr != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "': " +
+				rollbackFailedMessage(cloneName, src.ResourceGroupName, rollbackErr),
+			Cause: "the replicas could not all be reaped, so the definition was left in " +
+				"place rather than orphaning them",
+			Correc: "delete '" + cloneName + "' by hand once the replicas can be removed",
+		})
+
+		return false
+	}
 
 	writeCloneRefused(w, http.StatusNotFound, src.Name, cloneName, &apiv1.APICallRc{
 		RetCode: apiCallRcError,

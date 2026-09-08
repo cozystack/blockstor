@@ -3,8 +3,11 @@
 package rest
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -211,5 +214,91 @@ func TestSnapshotRestoreKeepsGoingWhenTheParentGroupIsThere(t *testing.T) {
 
 	if _, err := st.ResourceDefinitions().Get(ctx, "restore-dst-ok"); err != nil {
 		t.Errorf("target RD not persisted: %v", err)
+	}
+}
+
+// errReplicaDeleteFailed stands in for what a satellite writing status on the
+// very replicas being reaped produces: a conflict, a timeout, an RBAC gap.
+var errReplicaDeleteFailed = errors.New("probe: replica delete failed")
+
+// failingReplicaDeletes is a store whose replica deletes fail and whose
+// everything else works.
+type failingReplicaDeletes struct {
+	store.ResourceStore
+}
+
+func (f failingReplicaDeletes) Delete(context.Context, string, string) error {
+	return errReplicaDeleteFailed
+}
+
+type failingCascadeStore struct {
+	store.Store
+}
+
+func (f failingCascadeStore) Resources() store.ResourceStore {
+	return failingReplicaDeletes{f.Store.Resources()}
+}
+
+// The rollback drops the definition ONLY if the replicas went with it.
+// CascadeDeleteResources stops at the first replica it cannot delete and
+// leaves the rest untried, so deleting the parent anyway produces the orphan
+// this rollback exists to avoid: a Resource whose RD vanished never gets a
+// DeletionTimestamp, its satellite's finalizer never runs, and the DRBD minor,
+// port and peer entries stay live until the next create with that name
+// collides with them — which on the CSI path is the retry, because the target
+// name is deterministic.
+//
+// Both other doors that perform this teardown refuse to proceed on a failed
+// cascade. This one does too, and says what it left behind.
+func TestRDCloneRollbackKeepsTheDefinitionWhenTheCascadeFails(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+	seedGroupedCloneSource(t, backend, "src-orphan", "grp-orphan-gone", false)
+
+	st := failingCascadeStore{backend}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postClone(t, base, "src-orphan", map[string]any{
+		"name":          "dst-orphan",
+		"use_zfs_clone": true,
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		t.Fatalf("status = 404, the code the successful rollback uses — a failed cascade " +
+			"must not be reported as a rollback")
+	}
+
+	// The definition stays, because its replicas are still there.
+	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-orphan"); err != nil {
+		t.Fatalf("the definition was deleted over replicas that could not be: %v", err)
+	}
+
+	replicas, err := backend.Resources().ListByDefinition(ctx, "dst-orphan")
+	if err != nil {
+		t.Fatalf("list the replicas: %v", err)
+	}
+
+	if len(replicas) == 0 {
+		t.Fatal("the fixture left no replicas, so this test proves nothing")
+	}
+
+	// And the operator is told which definition is now parented to nothing.
+	var envelope cloneStartedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode the envelope: %v", err)
+	}
+
+	if envelope.Messages == nil || len(*envelope.Messages) == 0 {
+		t.Fatal("empty envelope")
+	}
+
+	msg := (*envelope.Messages)[0].Message
+	if !strings.Contains(msg, "dst-orphan") || !strings.Contains(msg, "still there") {
+		t.Errorf("message = %q, want it to name the definition left behind", msg)
 	}
 }
