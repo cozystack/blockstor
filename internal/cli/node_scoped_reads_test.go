@@ -54,6 +54,10 @@ func TestNodeCommandsReadOnlyTheirNode(t *testing.T) {
 	for name, argv := range map[string][]string{
 		"node lost":     {"node", "lost", "node-1"},
 		"node evacuate": {"node", "evacuate", "node-1"},
+		// The command #187 is written about. It reaches the replicas through
+		// ReferencesOnNode on the refusal path and through the cascade under
+		// --force, and both used to list the cluster.
+		"node delete --force": {"node", "delete", "node-1", "--force"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -125,5 +129,38 @@ func seedTwoNodeCluster(t *testing.T) *countingResourceStore {
 	return &countingResourceStore{
 		Store:     backend,
 		resources: &countingResources{ResourceStore: backend.Resources()},
+	}
+}
+
+// The refusal path of the same command, which is the one an operator hits
+// first: `node delete` without --force asks whether anything still references
+// the node, and #187's acceptance is the number of requests that costs.
+func TestNodeDeleteRefusalReadsOnlyItsNode(t *testing.T) {
+	t.Parallel()
+
+	counted := seedTwoNodeCluster(t)
+
+	var out, errBuf bytes.Buffer
+
+	app := &cli.App{
+		Out: &out,
+		Err: &errBuf,
+		StoreFor: func(context.Context) (store.Store, error) {
+			return counted, nil
+		},
+	}
+
+	// Refused, because node-1 still carries replicas and a pool. That is the
+	// answer under test; what it cost to reach it is what is counted.
+	if got := app.Run(t.Context(), []string{"node", "delete", "node-1"}); got == 0 {
+		t.Fatalf("exit = 0, want a refusal — the node still carries replicas")
+	}
+
+	if n := counted.resources.wholeCluster.Load(); n != 0 {
+		t.Errorf("%d whole-cluster reads, want none — the question is about one node", n)
+	}
+
+	if n := counted.resources.byNode.Load(); n == 0 {
+		t.Error("no node-scoped reads at all; the refusal was answered from somewhere else")
 	}
 }

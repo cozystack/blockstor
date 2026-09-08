@@ -407,7 +407,11 @@ func volumeSizesPerDefinition(ctx context.Context, run *runContext, names []stri
 func volumeSizesInOneRequest(ctx context.Context, run *runContext, names []string) map[string]map[int32]int64 {
 	all, err := run.Store.VolumeDefinitions().ListAll(ctx)
 	if err != nil {
-		return map[string]map[int32]int64{}
+		// One read, so one failure costs every row its percentage — where
+		// the per-definition path loses only the definition it could not
+		// read. Fall through to it rather than blank the column, so the
+		// two sides degrade the same way as well as answering the same.
+		return volumeSizesPerDefinition(ctx, run, names)
 	}
 
 	sizes := make(map[string]map[int32]int64, len(names))

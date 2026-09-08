@@ -3,6 +3,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"strconv"
 	"testing"
 
@@ -32,10 +34,14 @@ func TestVolumeSizesFindMixedCaseDefinitionsInTheBulkRead(t *testing.T) {
 	resources := make([]apiv1.Resource, 0, definitions)
 
 	for i := range definitions {
-		// Stored mixed-case; the replica spells it lowercase, which is what
-		// `resource list` holds.
-		stored := "PVC-Mixed-" + strconv.Itoa(i)
-		spelled := store.FoldName(stored)
+		// The definition is stored one way and the replica names it another:
+		// wireToCRDResourceSpec keeps Spec.ResourceDefinitionName verbatim,
+		// so a replica really does carry a spelling its definition is not
+		// stored under. Folding the replica's name here instead would hand
+		// both sides the same key and the lookup-side fold could never be
+		// the discriminator.
+		stored := "pvc-fold-" + strconv.Itoa(i)
+		spelled := "PVC-Fold-" + strconv.Itoa(i)
 
 		if err := st.ResourceDefinitions().Create(ctx,
 			&apiv1.ResourceDefinition{Name: stored}); err != nil {
@@ -62,5 +68,67 @@ func TestVolumeSizesFindMixedCaseDefinitionsInTheBulkRead(t *testing.T) {
 		if perVolume[0] != 4096 {
 			t.Errorf("%q volume 0 = %d KiB, want 4096", resources[i].Name, perVolume[0])
 		}
+	}
+}
+
+// failingListAll is a store whose whole-cluster read is broken and whose
+// per-definition read is not — a partial outage, an RBAC gap on list, a
+// request too large for the apiserver.
+type failingListAll struct {
+	store.VolumeDefinitionStore
+}
+
+// errBulkReadFailed stands in for whatever breaks a whole-cluster read: a
+// partial outage, an RBAC gap on list, a response too large.
+var errBulkReadFailed = errors.New("list every definition failed")
+
+func (f failingListAll) ListAll(context.Context) (map[string][]apiv1.VolumeDefinition, error) {
+	return nil, errBulkReadFailed
+}
+
+type failingListAllStore struct {
+	store.Store
+}
+
+func (f failingListAllStore) VolumeDefinitions() store.VolumeDefinitionStore {
+	return failingListAll{f.Store.VolumeDefinitions()}
+}
+
+// One read means one failure costs every row its percentage, where the
+// per-definition path loses only the definition it could not read. The two
+// sides are supposed to answer the same and degrade the same, and the doc
+// comment says so — so a broken bulk read falls through rather than blanking
+// the column for the whole listing.
+func TestVolumeSizesDegradePerDefinitionWhenTheBulkReadFails(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+	run := &runContext{Store: failingListAllStore{backend}}
+
+	definitions := volumeSizesBulkCutoff + 1
+	resources := make([]apiv1.Resource, 0, definitions)
+
+	for i := range definitions {
+		name := "pvc-degrade-" + strconv.Itoa(i)
+
+		if err := backend.ResourceDefinitions().Create(ctx,
+			&apiv1.ResourceDefinition{Name: name}); err != nil {
+			t.Fatalf("seed definition: %v", err)
+		}
+
+		if err := backend.VolumeDefinitions().Create(ctx, name,
+			&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 4096}); err != nil {
+			t.Fatalf("seed volume: %v", err)
+		}
+
+		resources = append(resources, apiv1.Resource{Name: name, NodeName: "node-1"})
+	}
+
+	sizes := volumeSizesFor(ctx, run, resources)
+
+	if len(sizes) != definitions {
+		t.Fatalf("sizes for %d of %d definitions — one failed read blanked the column "+
+			"for the whole listing", len(sizes), definitions)
 	}
 }
