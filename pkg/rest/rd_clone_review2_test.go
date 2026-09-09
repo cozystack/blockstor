@@ -162,6 +162,29 @@ func TestRDCloneResumesWhateverCaseTheRetryUses(t *testing.T) {
 		t.Errorf("after the retry the target has %d volume(s), want 1", len(vds))
 	}
 
+	// The retry has to have RESUMED the leftover, not created a second
+	// definition beside it. Everything above is satisfied either way, so
+	// without this the test passes over a store whose Create does not fold —
+	// which is what the real one does, and what the shim has to imitate for
+	// the case-fold to be under test at all.
+	rds, err := st.ResourceDefinitions().List(ctx)
+	if err != nil {
+		t.Fatalf("list definitions: %v", err)
+	}
+
+	targets := 0
+
+	for i := range rds {
+		if strings.EqualFold(rds[i].Name, "dst-case") {
+			targets++
+		}
+	}
+
+	if targets != 1 {
+		t.Errorf("%d definitions under the target name; the retry created a second one "+
+			"beside the leftover instead of resuming it", targets)
+	}
+
 	// And the marker the resume wrote is the stored spelling, not the one the
 	// retry typed: the satellite splits this value to find the source, and a
 	// clone made through the CLI has to be recognisable to a REST retry and
