@@ -963,11 +963,17 @@ require_workers() {
     # Counted off the same discovery $WORKER_* came from, so a cluster whose
     # satellites run on control-plane nodes is not reported as having none.
     got=0
-    for _w in "${_BS_WORKERS[@]}"; do
-        if [[ "$(kubectl get node "$_w" --no-headers 2>/dev/null | awk '{print $2}')" == "Ready" ]]; then
-            got=$(( got + 1 ))
-        fi
-    done
+    # The length test guards the expansion: under `set -u` a bash older than
+    # 4.4 treats "${empty[@]}" as an unbound variable and aborts, which would
+    # turn "this cluster has no satellites" into a crash inside the preflight
+    # that exists to report exactly that.
+    if (( ${#_BS_WORKERS[@]} > 0 )); then
+        for _w in "${_BS_WORKERS[@]}"; do
+            if [[ "$(kubectl get node "$_w" --no-headers 2>/dev/null | awk '{print $2}')" == "Ready" ]]; then
+                got=$(( got + 1 ))
+            fi
+        done
+    fi
 
     if (( got < want )); then
         skip "scenario needs $want satellite workers, found $got"
