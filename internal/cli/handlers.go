@@ -22,6 +22,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -366,7 +368,55 @@ func volumeSizesFor(ctx context.Context, run *runContext, resources []apiv1.Reso
 		return volumeSizesPerDefinition(ctx, run, names)
 	}
 
-	return volumeSizesInOneRequest(ctx, run, names)
+	sizes, err := volumeSizesInOneRequest(ctx, run, names)
+	if err == nil {
+		return sizes
+	}
+
+	if !perDefinitionCanAnswer(ctx, err) {
+		warnSyncColumnUnavailable(run, err)
+
+		return nil
+	}
+
+	return volumeSizesPerDefinition(ctx, run, names)
+}
+
+// perDefinitionCanAnswer says whether reading the definitions one at a time
+// can answer what the single read could not.
+//
+// SelectorUnsupported (pkg/store/k8s) draws the same line one layer down, and
+// for the same reason: a fallback is worth taking when the first read failed
+// on its shape, not when it ran out of the budget the second read spends
+// again. A cancelled context and a refusal aimed at the caller rather than at
+// the request repeat identically once per definition, so the retry buys the
+// same answer at N times the cost, in the command an operator is running
+// because something is already wrong.
+//
+// A timeout is deliberately not in that set. One request covering every
+// definition in the cluster is the read most likely to exceed a deadline, and
+// the narrow ones after it are each small enough to land.
+func perDefinitionCanAnswer(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	return !apierrors.IsForbidden(err) && !apierrors.IsUnauthorized(err)
+}
+
+// warnSyncColumnUnavailable tells the operator why the percentages are gone.
+//
+// The listing still prints: an unreadable `resource list` during an incident
+// is worse than one without a percentage. But a column that emptied because
+// every read was refused looks exactly like a cluster with nothing to sync,
+// and that is the one reading an operator must not take away from it. Stderr,
+// so the table on stdout stays the contract `awk -F'|'` parses.
+func warnSyncColumnUnavailable(run *runContext, err error) {
+	if run.Err == nil {
+		return
+	}
+
+	fmt.Fprintf(run.Err, "warning: sync percentages unavailable: %v\n", err)
 }
 
 // distinctDefinitionNames is the set of definitions a listing covers, in
@@ -392,26 +442,41 @@ func distinctDefinitionNames(resources []apiv1.Resource) []string {
 func volumeSizesPerDefinition(ctx context.Context, run *runContext, names []string) map[string]map[int32]int64 {
 	sizes := make(map[string]map[int32]int64, len(names))
 
+	var firstErr error
+
 	for _, name := range names {
 		vds, err := run.Store.VolumeDefinitions().List(ctx, name)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+
 			continue
 		}
 
 		sizes[name] = perVolumeSizes(vds)
 	}
 
+	// One definition that could not be read is the degradation this path is
+	// documented to accept. None of them read is not a degradation, it is a
+	// failure that reached the operator as an empty column.
+	if len(sizes) == 0 && firstErr != nil {
+		warnSyncColumnUnavailable(run, firstErr)
+	}
+
 	return sizes
 }
 
-func volumeSizesInOneRequest(ctx context.Context, run *runContext, names []string) map[string]map[int32]int64 {
+func volumeSizesInOneRequest(
+	ctx context.Context, run *runContext, names []string,
+) (map[string]map[int32]int64, error) {
 	all, err := run.Store.VolumeDefinitions().ListAll(ctx)
 	if err != nil {
 		// One read, so one failure costs every row its percentage — where
 		// the per-definition path loses only the definition it could not
-		// read. Fall through to it rather than blank the column, so the
-		// two sides degrade the same way as well as answering the same.
-		return volumeSizesPerDefinition(ctx, run, names)
+		// read. The caller decides whether that path can do better, since
+		// it cannot for a failure that was never about the read's shape.
+		return nil, errors.Wrap(err, "read every definition's volumes")
 	}
 
 	sizes := make(map[string]map[int32]int64, len(names))
@@ -425,7 +490,7 @@ func volumeSizesInOneRequest(ctx context.Context, run *runContext, names []strin
 		sizes[name] = perVolumeSizes(vds)
 	}
 
-	return sizes
+	return sizes, nil
 }
 
 // perVolumeSizes keys one definition's volumes the way the view reads them.
