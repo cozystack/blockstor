@@ -111,6 +111,12 @@ fi
 wait_uptodate "$DST" "${dst_nodes[0]}" "${dst_nodes[1]}"
 
 size_after_first=$(clone_volume_size "$DST")
+# An empty read compares equal to another empty read, so the size assertions
+# below would pass without ever seeing a size. Refuse to proceed on one.
+if ! [[ "$size_after_first" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: could not read $DST volume 0 size (got '$size_after_first')" >&2
+    exit 1
+fi
 
 echo ">> [A] replay of the finished clone answers the same way"
 if ! "${LCTL[@]}" resource-definition clone "$SRC" "$DST" >/dev/null 2>&1; then
@@ -120,6 +126,10 @@ if ! "${LCTL[@]}" resource-definition clone "$SRC" "$DST" >/dev/null 2>&1; then
 fi
 
 size_after_replay=$(clone_volume_size "$DST")
+if ! [[ "$size_after_replay" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: could not read $DST volume 0 size after the replay (got '$size_after_replay')" >&2
+    exit 1
+fi
 if [[ "$size_after_first" != "$size_after_replay" ]]; then
     echo "FAIL: the replay re-shaped the clone ($size_after_first -> $size_after_replay KiB)" >&2
     exit 1
@@ -135,6 +145,10 @@ if ! "${LCTL[@]}" resource-definition clone "$SRC" "$DST" >/dev/null 2>&1; then
 fi
 
 size_after_resize=$(clone_volume_size "$DST")
+if ! [[ "$size_after_resize" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: could not read $DST volume 0 size after the source resize (got '$size_after_resize')" >&2
+    exit 1
+fi
 if [[ "$size_after_first" != "$size_after_resize" ]]; then
     echo "FAIL: the replay resized the finished clone ($size_after_first -> $size_after_resize KiB)" >&2
     exit 1

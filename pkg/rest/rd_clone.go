@@ -379,7 +379,7 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	if !s.cloneMayProceedFromSnapshot(ctx, w, src, req.Name, snap, resume, reusedSnapshot) {
+	if !s.cloneMayProceedFromSnapshot(ctx, w, src, req, snap, resume, reusedSnapshot) {
 		return
 	}
 
@@ -733,8 +733,10 @@ func (s *Server) ensureCloneSnapshot(
 // retry of a completed clone, permanently.
 func (s *Server) cloneMayProceedFromSnapshot(
 	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition,
-	cloneName string, snap *apiv1.Snapshot, resume, reusedSnapshot bool,
+	req *rdCloneRequest, snap *apiv1.Snapshot, resume, reusedSnapshot bool,
 ) bool {
+	cloneName := req.Name
+
 	if resume {
 		finished, halt := s.resumedCloneIsFinished(ctx, w, src, cloneName, snap)
 		if halt {
@@ -742,6 +744,26 @@ func (s *Server) cloneMayProceedFromSnapshot(
 		}
 
 		if finished {
+			// The prop edits still have to land. A replay carrying
+			// override_props / delete_props / delete_namespaces would
+			// otherwise be answered 201 with them dropped, which is the
+			// accept-and-drop this endpoint refuses external_name and
+			// volume_passphrases to avoid — and it is reachable without any
+			// caller changing their mind, because the first attempt can fail
+			// in applyClonePropEdits AFTER the volumes are already there.
+			// The edits are a patch, so re-applying what already landed is
+			// what makes the replay idempotent rather than a second write.
+			err := s.applyClonePropEdits(ctx, req)
+			if err != nil {
+				writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+					RetCode: apiCallRcError,
+					Message: "clone of resource definition '" + src.Name + "' is complete, but " +
+						"applying override_props/delete_props failed: " + err.Error(),
+				})
+
+				return false
+			}
+
 			writeCloneDone(w, true, src.Name, cloneName)
 
 			return false

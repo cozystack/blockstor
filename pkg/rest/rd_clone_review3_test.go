@@ -361,3 +361,52 @@ type blindVolumeList struct {
 func (b blindVolumeList) List(context.Context, string) ([]apiv1.VolumeDefinition, error) {
 	return nil, nil
 }
+
+// A replay of a finished clone still has to apply the request's property
+// edits. The first attempt can fail in applyClonePropEdits AFTER the volumes
+// are already there, so the retry arrives at a target that looks finished with
+// the edits never applied — and answering 201 then drops them, which is the
+// accept-and-drop this endpoint refuses external_name and volume_passphrases
+// to avoid.
+func TestRDCloneReplayStillAppliesPropEdits(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, "src-props")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// A finished clone, made without any edits.
+	first := postClone(t, base, "src-props", map[string]any{
+		"name":          "dst-props",
+		"use_zfs_clone": true,
+	})
+	_ = first.Body.Close()
+
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first clone: got %d, want 201", first.StatusCode)
+	}
+
+	// The replay carries edits the first attempt never applied.
+	replay := postClone(t, base, "src-props", map[string]any{
+		"name":           "dst-props",
+		"use_zfs_clone":  true,
+		"override_props": map[string]string{"Aux/replay": "landed"},
+	})
+	_ = replay.Body.Close()
+
+	if replay.StatusCode != http.StatusCreated {
+		t.Fatalf("replay: got %d, want 201", replay.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "dst-props")
+	if err != nil {
+		t.Fatalf("get the clone: %v", err)
+	}
+
+	if got.Props["Aux/replay"] != "landed" {
+		t.Errorf("the replay reported success and dropped its override_props: %v", got.Props)
+	}
+}
