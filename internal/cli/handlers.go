@@ -339,6 +339,16 @@ func resourceList(ctx context.Context, run *runContext) error {
 // volumeSizesBulkCutoff is where reading the definitions one at a time stops
 // being the cheaper of the two reads. Below it a listing narrowed by `-r`,
 // `-n` or `--limit` pays that many GETs; above it, one request for the lot.
+//
+// It counts the definitions the LISTING covers, and nothing about how many
+// exist. That is the input it does not have and cannot cheaply get: sizing the
+// cluster first is another request on every `resource list`, on the command
+// whose latency this constant exists to protect. So a narrowing that still
+// covers more than the cutoff — `-n` on a busy node in a large cluster — takes
+// the whole-cluster read to render its handful of rows, and that is the trade
+// being made rather than an oversight. Removing it means making the narrow
+// read concurrent instead of sequential, which is a change to the read path
+// and not to this number.
 const volumeSizesBulkCutoff = 16
 
 // volumeSizesFor builds the per-volume sizes the sync-percentage column needs.
