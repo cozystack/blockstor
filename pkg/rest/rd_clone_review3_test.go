@@ -216,6 +216,69 @@ func TestRDCloneRefusesToResumeWhenTheSourceLostAVolume(t *testing.T) {
 	}
 }
 
+// The third arm, and the one neither of its siblings can reach: the counts
+// agree and every size that is compared agrees, because the volume the source
+// now carries is not in the snapshot at all. A source that dropped one volume
+// and gained another between the attempts lands exactly here — `vd d 0` then
+// `vd c` renumbers rather than refills — and resuming would hydrate the
+// target from a snapshot describing a volume the source no longer has, under
+// a number it never had.
+func TestRDCloneRefusesToResumeWhenTheSourceRenumberedItsVolume(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, "src-renum")
+
+	// The snapshot covers volume 0, at the size the source had it.
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         cloneSnapshotName("dst-renum"),
+		ResourceName: "src-renum",
+		Nodes:        []string{"node-a"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 64 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed the leftover snapshot: %v", err)
+	}
+
+	// The source dropped volume 0 and took volume 1 in its place, so it
+	// still has exactly one volume, of exactly the captured size.
+	if err := st.VolumeDefinitions().Delete(ctx, "src-renum", 0); err != nil {
+		t.Fatalf("drop the source volume: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "src-renum", &apiv1.VolumeDefinition{
+		VolumeNumber: 1,
+		SizeKib:      64 * 1024,
+	}); err != nil {
+		t.Fatalf("add the replacement volume: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postClone(t, base, "src-renum", map[string]any{
+		"name":          "dst-renum",
+		"use_zfs_clone": true,
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 — the snapshot does not cover the volume the source now has",
+			resp.StatusCode)
+	}
+
+	vds, err := st.VolumeDefinitions().List(ctx, "dst-renum")
+	if err != nil {
+		t.Fatalf("list the target's volumes: %v", err)
+	}
+
+	if len(vds) != 0 {
+		t.Errorf("the refused clone hydrated %d volume(s) from the stale snapshot", len(vds))
+	}
+}
+
 // The volume-definition restore's collision guard has two halves: a pre-check
 // that LISTs the target's volumes, and the hydrate that CREATEs them. The
 // pre-check's own comment waves a request through when that list cannot be
