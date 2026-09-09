@@ -89,7 +89,7 @@ func New(c ctrlclient.Client) *Store {
 // cached List still under-reported).
 func NewWithAPIReader(c ctrlclient.Client, apiReader ctrlclient.Reader) *Store {
 	s := &Store{c: c}
-	s.nodes = &nodes{c: c}
+	s.nodes = &nodes{c: c, apiReader: apiReader}
 	s.storagePools = &storagePools{c: c, apiReader: apiReader}
 	s.resourceGroups = &resourceGroups{c: c}
 	s.resourceDefinitions = &resourceDefinitions{c: c, apiReader: apiReader}

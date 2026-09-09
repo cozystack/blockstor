@@ -317,6 +317,11 @@ func (s *inMemoryNodes) Get(_ context.Context, name string) (apiv1.Node, error) 
 	return decorateInMemoryNode(&n), nil
 }
 
+// GetUncached has nothing to bypass here: this store is the API server.
+func (s *inMemoryNodes) GetUncached(ctx context.Context, name string) (apiv1.Node, error) {
+	return s.Get(ctx, name)
+}
+
 // decorateInMemoryNode applies the wire-shape decoration both Get and
 // List run on every read: NetInterface upstream defaults
 // (port=3366 / type=PLAIN / first-iface IsActive=true) plus the F2

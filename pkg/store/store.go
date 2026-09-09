@@ -48,6 +48,26 @@ var (
 type NodeStore interface {
 	List(ctx context.Context) ([]apiv1.Node, error)
 	Get(ctx context.Context, name string) (apiv1.Node, error)
+
+	// GetUncached answers the same question as Get, from the API server
+	// rather than from a cache that may trail it.
+	//
+	// It exists for the one caller that cannot take the fast answer: a
+	// destructive decision made on the node's own status and acted on
+	// immediately. `n lost` refuses while the satellite still reports
+	// ONLINE, and unregisters the node plus cascades away its replicas
+	// when it does not — so a status a beat behind is wrong in both
+	// directions. A stale ONLINE refuses the cleanup a dead node needs;
+	// a stale OFFLINE tears down a node whose satellite is answering.
+	//
+	// The node-scoped listings behind the same decision already read this
+	// way (pkg/store/k8s/resources.go nodeScopedReader); this is the field
+	// the decision turns on, read from the same place.
+	//
+	// Where a store has no direct reader this is Get unchanged: an
+	// in-memory store has nothing to be behind.
+	GetUncached(ctx context.Context, name string) (apiv1.Node, error)
+
 	Create(ctx context.Context, n *apiv1.Node) error
 	Update(ctx context.Context, n *apiv1.Node) error
 	Delete(ctx context.Context, name string) error
