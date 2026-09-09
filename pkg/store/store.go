@@ -288,6 +288,23 @@ type ResourceStore interface {
 // which is why the Kubernetes store lowercases them on the way to a CRD name
 // (pkg/store/k8s/crdname.go). Anything that keys objects by name owes its
 // callers the same equality the store itself uses.
+//
+// That equality is available in process and not on the wire. A CRD's
+// selectableFields declare a path, not a transform, so the API server compares
+// spec.nodeName and spec.resourceDefinitionName verbatim, and the scoped reads
+// built on them compare the same way — including their in-process fallback,
+// deliberately, because a fallback that folded would answer a different
+// question than the selector it stands in for. A replica whose spec spells its
+// definition in a case the definition is not stored under is therefore missed
+// by both, and `rd d`'s refusal and sweep read it that way too.
+//
+// Folding on the write side instead would fold what clients read back:
+// crdToWireResource reports these spec values as the object's names, and
+// crdname.go's annotation exists precisely to keep the stored spelling
+// (DfltRscGrp) rather than the lowercased slug, because linstor-csi and
+// runbooks compare those strings. Closing the gap properly means a folded
+// field beside the display one, selected on and never rendered — a schema
+// change with a migration for adopted objects, not a comparison.
 func FoldName(name string) string {
 	return strings.ToLower(name)
 }
