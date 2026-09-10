@@ -64,8 +64,14 @@ type NodeStore interface {
 	// way (pkg/store/k8s/resources.go nodeScopedReader); this is the field
 	// the decision turns on, read from the same place.
 	//
-	// Where a store has no direct reader this is Get unchanged: an
-	// in-memory store has nothing to be behind.
+	// Where a store has no direct reader this is Get unchanged. That is
+	// the CLI's shape, whose client is uncached to begin with, and the
+	// in-memory store's, which has nothing to be behind. It is NOT a
+	// shape a manager-backed binary may take: a cached client without
+	// its manager's reader answers this from the cache and says nothing
+	// while it does, which is what the controller binary did to its own
+	// `--enable-rest-api` surface. Build those with
+	// pkg/store/k8s.NewFromManager, which is pinned.
 	GetUncached(ctx context.Context, name string) (apiv1.Node, error)
 
 	Create(ctx context.Context, n *apiv1.Node) error

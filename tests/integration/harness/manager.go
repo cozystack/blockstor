@@ -115,7 +115,7 @@ func StartStack(t *testing.T) *Stack {
 	// linstor client re-POST — leaving duplicate auto-numbered VDs
 	// (BUG-048 de-regress). Production never hit this because the apiserver
 	// always wires GetAPIReader(); the harness must match.
-	st := storek8s.NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
+	st := storek8s.NewFromManager(mgr)
 
 	// Wire every reconciler / runnable cmd/controller/main.go
 	// registers. Mirror order exactly so a future split-or-merge

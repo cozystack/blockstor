@@ -264,7 +264,7 @@ func main() {
 	// concurrent `vd c` against one RD both retry against a stale cache,
 	// re-derive the same number, exhaust the retry budget, and silently
 	// drop the second volume.
-	st := storek8s.NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
+	st := storek8s.NewFromManager(mgr)
 
 	ready := newReadyState()
 
