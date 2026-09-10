@@ -23,6 +23,7 @@ import (
 	"net/http"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/passphrase"
@@ -1214,7 +1215,20 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 // caller intent), so the right action is to mop up the orphan.
 func (s *Server) sweepOrphanSnapshotsAfterRDDelete(ctx context.Context, rdName string) {
 	leftovers, err := s.Store.Snapshots().ListByDefinition(ctx, rdName)
-	if err != nil || len(leftovers) == 0 {
+	if err != nil {
+		// The sweep is best-effort, but silence here is not: the read that
+		// failed is the one that finds the orphan, so a transient failure
+		// leaves exactly the row this function exists to clear, and the
+		// operator has already been told the delete succeeded. Whether the
+		// mop-up ran is the one thing that would make them look.
+		log.FromContext(ctx).WithName("rest").
+			Error(err, "orphan-snapshot sweep skipped: a snapshot that raced the delete may survive",
+				"resourceDefinition", rdName)
+
+		return
+	}
+
+	if len(leftovers) == 0 {
 		return
 	}
 
