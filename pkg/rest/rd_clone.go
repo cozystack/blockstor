@@ -351,6 +351,30 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv1.ResourceDefinition, req *rdCloneRequest) {
 	ctx := r.Context()
 
+	// The finished question comes first, and is answered without reading the
+	// live source at all.
+	//
+	// A replay of a clone that already completed has to survive anything that
+	// happened to the source since: it is a copy of a point-in-time and owes
+	// the source nothing. Every question asked ahead of it is a way to refuse
+	// one — the layer stack, the DELETE flag, and the shape comparison, whose
+	// "shape" is derived from the live source, so an ordinary
+	// `rd modify --resource-group` on the source turned every later replay
+	// into a 409 with a correction the caller it is aimed at cannot follow:
+	// linstor-csi sends the same body every time.
+	//
+	// Taking the internal snapshot is worse than a refusal. When
+	// `clone-<dst>` has been deleted, the create branch snapshots the CURRENT
+	// source before anyone asks whether the clone is done, so a pure replay
+	// mutates cluster state and, once the source has grown, leaves a fresh
+	// snapshot that diverges from the finished target — and refuses the
+	// replay from then on, permanently, with a correction that destroys a
+	// clone holding live data.
+	replayed, halt := s.replayOfFinishedClone(ctx, w, src, req)
+	if replayed || halt {
+		return
+	}
+
 	if !cloneLayerStackIsHonourable(w, src, req) {
 		return
 	}
@@ -360,17 +384,7 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	// Mirror the snapshot-create Bug 180 gate: a source RD mid-tear-
-	// down would reap the internal snapshot + clone marker from
-	// under the satellite's restore.
-	if rdHasDeleteFlag(ctx, s, src.Name) {
-		writeCloneRefused(w, http.StatusConflict, src.Name, req.Name, &apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: "clone of resource definition '" + src.Name + "' refused: the source is being deleted",
-			Cause:   "the source RD carries the DELETE flag; its backing data is being torn down",
-			Correc:  "clone before deleting the source, or restore from a snapshot taken earlier",
-		})
-
+	if !s.cloneSourceIsNotBeingDeleted(ctx, w, src, req.Name) {
 		return
 	}
 
@@ -379,7 +393,11 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	if !s.cloneMayProceedFromSnapshot(ctx, w, src, req, snap, resume, reusedSnapshot) {
+	// The only question a leftover still raises: does a REUSED snapshot still
+	// describe the source? It belongs to a clone about to be materialised and
+	// never to one already made, which is why the finished question is asked
+	// at the top rather than here.
+	if reusedSnapshot && !s.cloneSnapshotIsCurrent(ctx, w, src, snap, req.Name) {
 		return
 	}
 
@@ -684,6 +702,10 @@ func (s *Server) ensureCloneSnapshot(
 			return nil, false, false
 		}
 
+		if !s.cloneSnapshotNodesAreUsable(ctx, w, src, &existing, cloneName) {
+			return nil, false, false
+		}
+
 		return &existing, true, true
 	}
 
@@ -719,88 +741,96 @@ func (s *Server) ensureCloneSnapshot(
 	return &snap, false, true
 }
 
-// cloneMayProceedFromSnapshot answers the two questions a leftover raises,
-// in the order that keeps them from contradicting each other. False means an
-// answer has already been written and the caller must stop.
-//
-// First: is the clone already finished? If the target holds the snapshot's
-// volumes, this is a replay and the answer is the idempotent success CSI
-// requires — whatever has happened to the source since.
-//
-// Only then: does a REUSED snapshot still describe the source? That question
-// belongs to a clone about to be materialised, never to one already made, and
-// asking it first is what made an ordinary source resize refuse every later
-// retry of a completed clone, permanently.
-func (s *Server) cloneMayProceedFromSnapshot(
-	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition,
-	req *rdCloneRequest, snap *apiv1.Snapshot, resume, reusedSnapshot bool,
+// cloneSourceIsNotBeingDeleted mirrors the snapshot-create Bug 180 gate: a
+// source RD mid-tear-down would reap the internal snapshot and the clone
+// marker from under the satellite's restore.
+func (s *Server) cloneSourceIsNotBeingDeleted(
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, cloneName string,
 ) bool {
-	cloneName := req.Name
-
-	if resume {
-		finished, halt := s.resumedCloneIsFinished(ctx, w, src, cloneName, snap)
-		if halt {
-			return false
-		}
-
-		if finished {
-			// The prop edits still have to land. A replay carrying
-			// override_props / delete_props / delete_namespaces would
-			// otherwise be answered 201 with them dropped, which is the
-			// accept-and-drop this endpoint refuses external_name and
-			// volume_passphrases to avoid — and it is reachable without any
-			// caller changing their mind, because the first attempt can fail
-			// in applyClonePropEdits AFTER the volumes are already there.
-			// The edits are a patch, so re-applying what already landed is
-			// what makes the replay idempotent rather than a second write.
-			err := s.applyClonePropEdits(ctx, req)
-			if err != nil {
-				writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
-					RetCode: apiCallRcError,
-					Message: "clone of resource definition '" + src.Name + "' is complete, but " +
-						"applying override_props/delete_props failed: " + err.Error(),
-				})
-
-				return false
-			}
-
-			writeCloneDone(w, true, src.Name, cloneName)
-
-			return false
-		}
+	if !rdHasDeleteFlag(ctx, s, src.Name) {
+		return true
 	}
 
-	return !reusedSnapshot || s.cloneSnapshotIsCurrent(ctx, w, src, snap, cloneName)
+	writeCloneRefused(w, http.StatusConflict, src.Name, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone of resource definition '" + src.Name + "' refused: the source is being deleted",
+		Cause:   "the source RD carries the DELETE flag; its backing data is being torn down",
+		Correc:  "clone before deleting the source, or restore from a snapshot taken earlier",
+	})
+
+	return false
 }
 
-// resumedCloneIsFinished answers what a leftover target is, by comparing it to
-// the snapshot the resume would hydrate from. It returns (finished, stop):
-// stop when a refusal has already been written.
+// replayOfFinishedClone answers a retry of a clone that already completed,
+// before anything on this path reads the live source. It returns
+// (replayed, halt): replayed when the success has been written, halt when a
+// refusal has.
 //
-// Three shapes, and the previous round of this code collapsed them into one.
+// The marker and the DELETE flag are read here only to decide whether this is
+// even the right question. A leftover that is somebody else's definition, or
+// one being torn down, is left to cloneTargetState, which owns those refusals
+// and their wording.
+func (s *Server) replayOfFinishedClone(
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest,
+) (bool, bool) {
+	cloneName := req.Name
+
+	existing, err := s.Store.ResourceDefinitions().Get(ctx, cloneName)
+	if err != nil {
+		return false, false
+	}
+
+	if !restoreMarkerMatches(existing.Props, src.Name, cloneSnapshotName(cloneName)) ||
+		slices.Contains(existing.Flags, rdFlagDelete) {
+		return false, false
+	}
+
+	finished, halt := s.cloneLeftoverIsFinished(ctx, w, src, cloneName)
+	if halt || !finished {
+		return false, halt
+	}
+
+	// The prop edits still have to land. A replay carrying override_props /
+	// delete_props / delete_namespaces would otherwise be answered 201 with
+	// them dropped, which is the accept-and-drop this endpoint refuses
+	// external_name and volume_passphrases to avoid — and it is reachable
+	// without any caller changing their mind, because the first attempt can
+	// fail in applyClonePropEdits AFTER the volumes are already there. The
+	// edits are a patch, so re-applying what already landed is what makes the
+	// replay idempotent rather than a second write.
+	err = s.applyClonePropEdits(ctx, req)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' is complete, but " +
+				"applying override_props/delete_props failed: " + err.Error(),
+		})
+
+		return false, true
+	}
+
+	writeCloneDone(w, true, src.Name, cloneName)
+
+	return true, false
+}
+
+// cloneLeftoverIsFinished says whether the definition under the clone's name is
+// the finished clone this request asks for. It returns (finished, stop).
 //
-//   - The target's volumes match the snapshot: the clone COMPLETED and this is
-//     a replay. linstor-csi replays CreateVolume whenever a response is lost or
-//     external-provisioner restarts, so this has to be the idempotent success
-//     CSI requires. Nothing about the source can change that answer — the clone
-//     is a copy of a point-in-time, and expanding the source afterwards is a
-//     legal, routine act that must not poison every later retry. Comparing
-//     against the live source made it permanent, because the internal snapshot
-//     is deterministic and outlives the clone by design (zfs clone targets stay
-//     dependent on their origin) and the marker survives too, so every repeat
-//     took the same refusal — one whose correction, "delete the snapshot", the
-//     operator cannot follow, since that snapshot is the origin of the clone
-//     they already have.
-//   - The target has no volumes: the first attempt died before hydrating. That
-//     is the resume this path exists for.
-//   - The target has volumes that are NOT the snapshot's: something else is
-//     under that name, or an earlier attempt hydrated from a different
-//     point-in-time. Hydrating skips what is already there, so the retry would
-//     leave the old shape in place and report the clone complete — and the
-//     status poll compares volume counts, not sizes, so it would agree.
-func (s *Server) resumedCloneIsFinished(
-	ctx context.Context, w http.ResponseWriter,
-	src *apiv1.ResourceDefinition, cloneName string, snap *apiv1.Snapshot,
+// Volumes alone do not answer it. materializeRestoredRD creates the
+// definition, hydrates the volumes and THEN stamps the replicas, so a leftover
+// read on volumes alone is called finished the instant hydrate returns — the
+// Bug 354 empty shell, certified complete, with the clone-status poll agreeing
+// because it compares volume counts. So a replica has to exist too. A leftover
+// that has volumes and no replicas is not finished and not broken either: the
+// resume re-runs placement, which is idempotent.
+//
+// When the internal snapshot is gone the volumes are taken at face value. It
+// cannot unmake a clone that already has its volumes and its replicas, and
+// re-taking one to answer this question is exactly the write that must not
+// happen on a replay.
+func (s *Server) cloneLeftoverIsFinished(
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, cloneName string,
 ) (bool, bool) {
 	targetVDs, err := s.Store.VolumeDefinitions().List(ctx, cloneName)
 	if err != nil {
@@ -816,21 +846,86 @@ func (s *Server) resumedCloneIsFinished(
 		return false, false
 	}
 
-	divergence := snapshotDivergence(cloneName, snap, targetVDs)
-	if divergence == "" {
-		return true, false
+	// What the volumes are is asked before whether replicas exist: a leftover
+	// holding a volume this clone would not have written is somebody else's
+	// definition whether or not anything was ever placed on it, and hydrating
+	// skips what is already there, so letting it through means reporting a
+	// clone complete over data it never wrote.
+	snap, snapErr := s.Store.Snapshots().Get(ctx, src.Name, cloneSnapshotName(cloneName))
+	if snapErr == nil && leftoverAgainstSnapshot(&snap, targetVDs) == leftoverForeign {
+		writeCloneRefused(w, http.StatusConflict, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' refused: '" + cloneName +
+				"' holds a volume this clone would not have written",
+			Cause: "the definition under that name carries volumes that are not the ones " +
+				"this clone restores, and hydrating skips what is already there, so the " +
+				"retry would leave them and report the clone complete",
+			Correc: "delete '" + cloneName + "' and clone again, or clone under a different name",
+		})
+
+		return false, true
 	}
 
-	writeCloneRefused(w, http.StatusConflict, src.Name, cloneName, &apiv1.APICallRc{
-		RetCode: apiCallRcError,
-		Message: "clone of resource definition '" + src.Name + "' refused: " + divergence,
-		Cause: "the definition under that name holds volumes that are not the ones this " +
-			"clone would restore, and hydrating skips what is already there, so the " +
-			"retry would leave them and report the clone complete",
-		Correc: "delete '" + cloneName + "' and clone again, or clone under a different name",
-	})
+	if snapErr == nil && leftoverAgainstSnapshot(&snap, targetVDs) == leftoverPartial {
+		return false, false
+	}
 
-	return false, true
+	replicas, err := s.Store.Resources().ListByDefinition(ctx, cloneName)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
+		})
+
+		return false, true
+	}
+
+	return len(replicas) > 0, false
+}
+
+// leftoverProgress is how far an earlier attempt at this clone got.
+type leftoverProgress int
+
+const (
+	// leftoverPartial is a strict prefix of what the snapshot holds, every
+	// volume of it matching. A multi-volume clone whose first attempt died
+	// between two VolumeDefinitions().Create calls lands here.
+	leftoverPartial leftoverProgress = iota
+	// leftoverComplete covers every volume the snapshot holds, at its size.
+	leftoverComplete
+	// leftoverForeign carries a volume that is present and differs, which is
+	// the only shape that is somebody else's definition rather than this
+	// clone half-made.
+	leftoverForeign
+)
+
+// leftoverAgainstSnapshot classifies a leftover target by what it holds.
+//
+// Comparing volume COUNTS here would refuse the partial: hydration tolerates a
+// volume already present at the matching size precisely so it can be finished,
+// the restore endpoint sharing this data plane does resume the identical
+// state, and the parity doc promises "a repeat under the same name RESUMES it
+// — every step tolerates an object a previous attempt already created". A
+// volume that is present and differs is the one thing that cannot be finished,
+// and it is the only thing refused.
+func leftoverAgainstSnapshot(snap *apiv1.Snapshot, targetVDs []apiv1.VolumeDefinition) leftoverProgress {
+	captured := make(map[int32]int64, len(snap.VolumeDefinitions))
+	for _, vol := range snap.VolumeDefinitions {
+		captured[vol.VolumeNumber] = vol.SizeKib
+	}
+
+	for i := range targetVDs {
+		was, ok := captured[targetVDs[i].VolumeNumber]
+		if !ok || was != targetVDs[i].SizeKib {
+			return leftoverForeign
+		}
+	}
+
+	if len(targetVDs) < len(snap.VolumeDefinitions) {
+		return leftoverPartial
+	}
+
+	return leftoverComplete
 }
 
 // cloneSnapshotIsCurrent refuses to resume a clone over a leftover snapshot
@@ -938,6 +1033,22 @@ func (s *Server) cloneSnapshotPreconditionsHold(ctx context.Context, w http.Resp
 		return false
 	}
 
+	return s.cloneSnapshotNodesAreUsable(ctx, w, src, snap, cloneName)
+}
+
+// cloneSnapshotNodesAreUsable is the half of the preconditions that a REUSED
+// snapshot has to satisfy as well as a freshly taken one.
+//
+// The nodes recorded on the snapshot are where the restore places the clone's
+// replicas, so an offline node or a pool that cannot hold a snapshot is the
+// same problem whichever attempt took it. Running these only on the branch
+// that creates the snapshot gave one cluster state two answers: the first
+// clone refused with 503, the retry over the leftover snapshot answered 201
+// and stamped a replica on a node whose satellite cannot act on it.
+func (s *Server) cloneSnapshotNodesAreUsable(
+	ctx context.Context, w http.ResponseWriter,
+	src *apiv1.ResourceDefinition, snap *apiv1.Snapshot, cloneName string,
+) bool {
 	if offline := s.offlineTargetNodes(ctx, snap.Nodes); len(offline) > 0 {
 		writeCloneRefused(w, http.StatusServiceUnavailable, src.Name, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,

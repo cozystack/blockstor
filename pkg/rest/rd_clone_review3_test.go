@@ -4,6 +4,7 @@ package rest
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -471,5 +472,319 @@ func TestRDCloneReplayStillAppliesPropEdits(t *testing.T) {
 
 	if got.Props["Aux/replay"] != "landed" {
 		t.Errorf("the replay reported success and dropped its override_props: %v", got.Props)
+	}
+}
+
+// materializeRestoredRD creates the definition, hydrates the volumes and THEN
+// stamps the replicas. A leftover read on volumes alone is called finished the
+// instant hydrate returns — the Bug 354 empty shell, certified complete, with
+// the clone-status poll agreeing because it compares volume counts. An attempt
+// that dies in that window left a target every later retry answered 201 over.
+func TestRDCloneResumesALeftoverThatWasHydratedButNeverPlaced(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, "src-unplaced")
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:              cloneSnapshotName("dst-unplaced"),
+		ResourceName:      "src-unplaced",
+		Nodes:             []string{"node-a"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 64 * 1024}},
+	}); err != nil {
+		t.Fatalf("seed the leftover snapshot: %v", err)
+	}
+
+	seedCloneLeftover(t, st, "src-unplaced", "dst-unplaced")
+
+	// Hydrated, never placed: exactly where an attempt dies between the two.
+	if err := st.VolumeDefinitions().Create(ctx, "dst-unplaced",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 64 * 1024}); err != nil {
+		t.Fatalf("seed the hydrated volume: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postClone(t, base, "src-unplaced", map[string]any{
+		"name":          "dst-unplaced",
+		"use_zfs_clone": true,
+	})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+
+	replicas, err := st.Resources().ListByDefinition(ctx, "dst-unplaced")
+	if err != nil {
+		t.Fatalf("list the target's replicas: %v", err)
+	}
+
+	if len(replicas) == 0 {
+		t.Error("the retry reported the clone complete and placed nothing")
+	}
+}
+
+// A replay of a finished clone is a copy of a point-in-time and owes the source
+// nothing. The shape comparison derives what it compares against from the LIVE
+// source, so an ordinary `rd modify --resource-group` on the source turned
+// every later replay into a 409 — with a correction linstor-csi cannot follow,
+// since it sends the same body every time.
+func TestRDCloneReplayOfAFinishedCloneSurvivesASourceGroupMove(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, "src-rgmove")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	first := postClone(t, base, "src-rgmove", map[string]any{
+		"name":          "dst-rgmove",
+		"use_zfs_clone": true,
+	})
+	_ = first.Body.Close()
+
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first clone = %d, want 201", first.StatusCode)
+	}
+
+	// The operator moves the SOURCE to another group. Nothing about the
+	// finished clone changed.
+	src, err := st.ResourceDefinitions().Get(ctx, "src-rgmove")
+	if err != nil {
+		t.Fatalf("read the source: %v", err)
+	}
+
+	src.ResourceGroupName = "grp-moved"
+	if err := st.ResourceDefinitions().Update(ctx, &src); err != nil {
+		t.Fatalf("move the source: %v", err)
+	}
+
+	replay := postClone(t, base, "src-rgmove", map[string]any{
+		"name":          "dst-rgmove",
+		"use_zfs_clone": true,
+	})
+	_ = replay.Body.Close()
+
+	if replay.StatusCode != http.StatusCreated {
+		t.Fatalf("replay = %d, want 201 — the clone was finished before the source moved",
+			replay.StatusCode)
+	}
+}
+
+// The internal snapshot is deletable: handleSnapshotDelete has no guard for one
+// a clone depends on, and operators do remove stray clone-* snapshots because
+// they block deleting the source. Asking the finished question after taking one
+// meant a pure replay re-snapshotted the LIVE source, and once the source had
+// grown that fresh snapshot diverged from the finished target and refused the
+// replay from then on — with a correction that destroys a clone holding data.
+func TestRDCloneReplayWithTheInternalSnapshotGoneTakesNoNewOne(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, "src-nosnap")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	first := postClone(t, base, "src-nosnap", map[string]any{
+		"name":          "dst-nosnap",
+		"use_zfs_clone": true,
+	})
+	_ = first.Body.Close()
+
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first clone = %d, want 201", first.StatusCode)
+	}
+
+	if err := st.Snapshots().Delete(ctx, "src-nosnap", cloneSnapshotName("dst-nosnap")); err != nil {
+		t.Fatalf("delete the internal snapshot: %v", err)
+	}
+
+	// The source grows, which is what used to poison the replay permanently.
+	vd, err := st.VolumeDefinitions().Get(ctx, "src-nosnap", 0)
+	if err != nil {
+		t.Fatalf("read the source volume: %v", err)
+	}
+
+	vd.SizeKib = 128 * 1024
+	if err := st.VolumeDefinitions().Update(ctx, "src-nosnap", &vd); err != nil {
+		t.Fatalf("grow the source: %v", err)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		replay := postClone(t, base, "src-nosnap", map[string]any{
+			"name":          "dst-nosnap",
+			"use_zfs_clone": true,
+		})
+		_ = replay.Body.Close()
+
+		if replay.StatusCode != http.StatusCreated {
+			t.Fatalf("replay %d = %d, want 201", attempt, replay.StatusCode)
+		}
+	}
+
+	// And the replay took no snapshot of the live source: a pure replay must
+	// not write, least of all an object claiming by its name to be this
+	// clone's origin while recording a different point-in-time.
+	if _, err := st.Snapshots().Get(ctx, "src-nosnap", cloneSnapshotName("dst-nosnap")); err == nil {
+		t.Error("the replay re-snapshotted the live source")
+	}
+}
+
+// hydrateVolumesFromSnapshot tolerates a volume already present at the matching
+// size precisely so a partial hydration can be finished, and the restore
+// endpoint sharing this data plane does resume the identical state. Comparing
+// volume COUNTS classified a strict prefix as somebody else's definition, so a
+// multi-volume clone whose first attempt died between two creates was stranded.
+func TestRDCloneResumesAHalfHydratedMultiVolumeLeftover(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, "src-mv")
+
+	if err := st.VolumeDefinitions().Create(ctx, "src-mv",
+		&apiv1.VolumeDefinition{VolumeNumber: 1, SizeKib: 32 * 1024}); err != nil {
+		t.Fatalf("give the source a second volume: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         cloneSnapshotName("dst-mv"),
+		ResourceName: "src-mv",
+		Nodes:        []string{"node-a"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 64 * 1024},
+			{VolumeNumber: 1, SizeKib: 32 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed the leftover snapshot: %v", err)
+	}
+
+	seedCloneLeftover(t, st, "src-mv", "dst-mv")
+
+	// One of the two volumes landed before the first attempt died.
+	if err := st.VolumeDefinitions().Create(ctx, "dst-mv",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 64 * 1024}); err != nil {
+		t.Fatalf("seed the half hydration: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postClone(t, base, "src-mv", map[string]any{
+		"name":          "dst-mv",
+		"use_zfs_clone": true,
+	})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — the leftover is a prefix of what this clone restores",
+			resp.StatusCode)
+	}
+
+	vds, err := st.VolumeDefinitions().List(ctx, "dst-mv")
+	if err != nil {
+		t.Fatalf("list the target's volumes: %v", err)
+	}
+
+	if len(vds) != 2 {
+		t.Errorf("target has %d volume(s) after the resume, want 2", len(vds))
+	}
+}
+
+// One cluster state, two answers: the create branch refuses a clone whose
+// snapshot would have to be taken on an offline node, and the reuse branch ran
+// none of that. The snapshot's nodes are where the restore places the clone's
+// replicas, so an offline one is the same problem whichever attempt took the
+// snapshot — and the retry stamped a replica on a node whose satellite cannot
+// act on it.
+func TestRDCloneRefusesToResumeOntoAnOfflineNode(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, "src-offline")
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:              cloneSnapshotName("dst-offline"),
+		ResourceName:      "src-offline",
+		Nodes:             []string{"node-a"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 64 * 1024}},
+	}); err != nil {
+		t.Fatalf("seed the leftover snapshot: %v", err)
+	}
+
+	if err := st.Nodes().SetConnectionStatus(ctx, "node-a", apiv1.NodeTypeOffline); err != nil {
+		t.Fatalf("take the node offline: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postClone(t, base, "src-offline", map[string]any{
+		"name":          "dst-offline",
+		"use_zfs_clone": true,
+	})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 — the snapshot's node is offline, the same answer "+
+			"the create branch gives", resp.StatusCode)
+	}
+}
+
+// The modify body declares delete_namespaces and the merge dropped it, so
+// `linstor rd delete-property <rd> --namespace <ns>` answered 200 and changed
+// nothing.
+func TestRDModifyHonoursDeleteNamespaces(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "rd-ns",
+		Props: map[string]string{
+			"DrbdOptions":              "top",
+			"DrbdOptions/Net/protocol": "C",
+			"DrbdOptionsOther":         "keep-me",
+		},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(map[string]any{"delete_namespaces": []string{"DrbdOptions"}})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/rd-ns", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "rd-ns")
+	if err != nil {
+		t.Fatalf("read the RD back: %v", err)
+	}
+
+	for _, key := range []string{"DrbdOptions", "DrbdOptions/Net/protocol"} {
+		if _, present := got.Props[key]; present {
+			t.Errorf("prop %q survived delete_namespaces", key)
+		}
+	}
+
+	// The neighbouring key that merely shares a prefix is not in the
+	// namespace and must stay.
+	if got.Props["DrbdOptionsOther"] != "keep-me" {
+		t.Errorf("DrbdOptionsOther = %q, want keep-me", got.Props["DrbdOptionsOther"])
 	}
 }

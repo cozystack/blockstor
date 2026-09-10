@@ -1092,6 +1092,14 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 		// = delete-property), matching the RG path and the UG9 NOTE.
 		rd.Props = applyPropsModify(rd.Props, patch.OverrideProps, patch.DeleteProps)
 
+		// The body declares delete_namespaces and the merge dropped it, so
+		// `linstor rd delete-property <rd> --namespace <ns>` answered 200 and
+		// changed nothing. Declaring two thirds of a props-modify envelope and
+		// silently discarding the rest tells the operator work happened when
+		// it did not — the same reason the clone paths refuse the fields they
+		// cannot honour instead of accepting them.
+		deletePropNamespaces(rd.Props, patch.DeleteNamespaces)
+
 		if rgChange != "" {
 			rd.ResourceGroupName = rgChange
 		}
