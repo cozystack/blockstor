@@ -1,0 +1,100 @@
+name: rd-clone-retry-semantics
+description: |
+  The clone endpoint's retry contract, at operator-CLI level.
+
+  linstor-csi re-issues CreateVolume whenever a response is lost or
+  external-provisioner restarts, so `rd clone <src> <dst>` run twice has
+  to answer the same way twice. A finished clone is a copy of a
+  point-in-time and owes the source nothing afterwards -- including
+  after the source grows.
+
+  That last part is what this replay exists for. A staleness guard that
+  compared the internal snapshot against the LIVE source turned an
+  ordinary `vd set-size` into a permanent refusal of every later retry:
+  the snapshot is named deterministically and outlives the clone by
+  design (delta row 82), the restore marker survives, and the refusal's
+  own correction -- delete the snapshot -- cannot be followed, because
+  that snapshot is the origin the existing clone depends on.
+
+  Steps:
+    1. rd create + vd create + r create --auto-place=2
+    2. wait the source UpToDate
+    3. clone; wait the target's replicas to converge
+    4. clone AGAIN with the same argv -- the replay, exit 0
+    5. vd set-size on the source, then clone a third time -- exit 0
+  delete_namespaces is deliberately absent here: the runner executes
+  `linstor` argv, and the clone verb has no flag for it (1.31.0 offers
+  --external-name, --use-zfs-clone, --volume-passphrase, --layer-list and
+  --resource-group). It is a WIRE field, carried by golinstor's
+  GenericPropsModify, so the L6 cell drives it over raw REST instead.
+
+  The byte-level data-plane assert lives in the sibling cell
+  tests/e2e/cli-matrix/rd-clone-vd-data-plane.sh; this replay pins the
+  verb and convergence shape the runner can express.
+
+  Teardown order matters: the clones depend on the internal source
+  snapshots `clone-<target>` and `rd delete` on the source is blocked
+  while snapshots exist, so the clone RDs go first, then the snapshots,
+  then the source.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  # Short fixed name: the clone suffixes and the internal snapshot names
+  # clone-{{rd}}-c1 / -c2 must stay under LINSTOR's 48-char ceiling.
+  rd: replay-clretry
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: auto-place-2
+    # all_uptodate rather than replica_count, and no `resource list` step
+    # after it: the awaits poll the API directly, while a CLI list issued in
+    # the first seconds after a replica is stamped crashes the official
+    # python client outright (layer_object reports type DRBD before the drbd
+    # payload is filled, and the client indexes it unguarded). That window is
+    # not this workflow's subject and is not specific to cloning -- a plain
+    # `resource create` shows it too -- so the workflow waits on state
+    # instead of racing a renderer.
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: clone
+    cmd: ["resource-definition", "clone", "{{rd}}", "{{rd}}-c1"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}-c1"
+      timeout_s: 240
+  - name: replay-the-finished-clone
+    # The retry CSI issues when a response is lost. Same argv, same answer.
+    cmd: ["resource-definition", "clone", "{{rd}}", "{{rd}}-c1"]
+    expect_exit: 0
+  - name: grow-the-source
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "128M"]
+    expect_exit: 0
+  - name: replay-after-the-source-grew
+    # The regression this replay is written for: a finished clone is a
+    # copy of a point-in-time, so a later resize of the source cannot
+    # turn its retry into a refusal.
+    cmd: ["resource-definition", "clone", "{{rd}}", "{{rd}}-c1"]
+    expect_exit: 0
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}-c1"]
+  - cmd: ["snapshot", "delete", "{{rd}}", "clone-{{rd}}-c1"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  # Prefix-match on vars.rd also covers the "-c1" leftover.
+  - no_orphans

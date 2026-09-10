@@ -338,7 +338,10 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 		def.Props = map[string]string{}
 	}
 
-	def.Props[restoreFromSnapshotProp] = args.fromResource + ":" + snap.Name
+	// Both halves off the stored objects, never off what the operator typed:
+	// LINSTOR folds name case, and a REST retry over this leftover compares
+	// the marker it finds against one built from the stored snapshot.
+	def.Props[restoreFromSnapshotProp] = snap.ResourceName + ":" + snap.Name
 
 	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if err != nil {
