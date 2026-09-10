@@ -79,6 +79,8 @@ func TestRDCloneRollsBackWhenTheParentGroupIsGone(t *testing.T) {
 		t.Fatalf("list the target's replicas: %v", err)
 	}
 
+	// Non-vacuous because its control, TestRDCloneKeepsGoingWhenTheParentGroupIsThere,
+	// asserts this same fixture places one when the group is there.
 	if len(replicas) != 0 {
 		t.Errorf("%d replica(s) left behind pointing at a definition that was rolled back",
 			len(replicas))
@@ -119,6 +121,18 @@ func TestRDCloneKeepsGoingWhenTheParentGroupIsThere(t *testing.T) {
 
 	if _, err := st.ResourceDefinitions().Get(ctx, "dst-rg-ok"); err != nil {
 		t.Errorf("target RD not persisted: %v", err)
+	}
+
+	// This fixture places a replica, which is what makes the rolled-back
+	// twin's "no replicas left behind" assertion mean something. Without it
+	// that assertion passes over a clone that never placed one.
+	replicas, err := st.Resources().ListByDefinition(ctx, "dst-rg-ok")
+	if err != nil {
+		t.Fatalf("list the target's replicas: %v", err)
+	}
+
+	if len(replicas) == 0 {
+		t.Error("the fixture placed no replicas, so the rollback twin proves nothing")
 	}
 }
 
@@ -388,5 +402,184 @@ func TestSnapshotRestoreSurvivesAFailedParentGroupRecheck(t *testing.T) {
 
 	if len(vds) != 1 {
 		t.Errorf("restored definition has %d volume(s), want 1", len(vds))
+	}
+}
+
+// acceptedButRetainedDeletes is the shape a cluster actually has. Every
+// Resource carries the satellite's finalizer, so an apiserver DELETE on one is
+// ACCEPTED with no error and the object stays until the finalizer clears, and
+// the listing does not filter what is Terminating. The in-memory store deletes
+// synchronously, which is why the suite could not see it.
+//
+// This double accepts the delete and keeps the replica listed, unstamped:
+// the ordinary outcome of a cascade in a cluster, and the one that used to
+// walk straight past "the definition goes only if the replicas went".
+type acceptedButRetainedDeletes struct {
+	store.ResourceStore
+}
+
+func (acceptedButRetainedDeletes) Delete(context.Context, string, string) error {
+	return nil
+}
+
+type acceptedButRetainedStore struct {
+	store.Store
+}
+
+func (f acceptedButRetainedStore) Resources() store.ResourceStore {
+	return acceptedButRetainedDeletes{f.Store.Resources()}
+}
+
+// CascadeDeleteResources answers nil twice over: when every replica went, and
+// when its pass budget ran out with replicas still listed. The rollback read
+// that nil as the first, so on the shape above it dropped the parent over
+// replicas that were never stamped for deletion — the orphan it exists to
+// avoid, since nothing gives a Resource a DeletionTimestamp once its
+// definition is gone.
+func TestRDCloneRollbackKeepsTheDefinitionWhenTheCascadeOnlyAcceptedTheDeletes(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+	seedGroupedCloneSource(t, backend, "src-retained", "grp-retained-gone", false)
+
+	base, stop := startServerWithStore(t, acceptedButRetainedStore{backend})
+	defer stop()
+
+	resp := postClone(t, base, "src-retained", map[string]any{
+		"name":          "dst-retained",
+		"use_zfs_clone": true,
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		t.Fatalf("status = 404, the code a completed rollback uses — the replicas are " +
+			"still there and were never stamped for deletion")
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-retained"); err != nil {
+		t.Fatalf("the definition was dropped over replicas that are still there: %v", err)
+	}
+
+	replicas, err := backend.Resources().ListByDefinition(ctx, "dst-retained")
+	if err != nil {
+		t.Fatalf("list the replicas: %v", err)
+	}
+
+	if len(replicas) == 0 {
+		t.Fatal("the fixture left no replicas, so this test proves nothing")
+	}
+
+	var envelope cloneStartedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode the envelope: %v", err)
+	}
+
+	if envelope.Messages == nil || len(*envelope.Messages) == 0 {
+		t.Fatal("empty envelope")
+	}
+
+	msg := (*envelope.Messages)[0].Message
+	if !strings.Contains(msg, "dst-retained") || !strings.Contains(msg, "still there") {
+		t.Errorf("message = %q, want it to name the definition left behind", msg)
+	}
+}
+
+// The clone twin of TestSnapshotRestoreSurvivesAFailedParentGroupRecheck. The
+// post-write check is a safety net over a clone that already succeeded, so a
+// read failure that says nothing about the group must not undo it.
+func TestRDCloneSurvivesAFailedParentGroupRecheck(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+	seedGroupedCloneSource(t, backend, "src-flaky-rg", "grp-flaky-clone", true)
+
+	base, stop := startServerWithStore(t, failingRGReadStore{backend})
+	defer stop()
+
+	resp := postClone(t, base, "src-flaky-rg", map[string]any{
+		"name":          "dst-flaky-rg",
+		"use_zfs_clone": true,
+	})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — the clone succeeded; only the re-check failed",
+			resp.StatusCode)
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-flaky-rg"); err != nil {
+		t.Errorf("the clone was rolled back over a failed check: %v", err)
+	}
+
+	vds, err := backend.VolumeDefinitions().List(ctx, "dst-flaky-rg")
+	if err != nil {
+		t.Fatalf("list the cloned volumes: %v", err)
+	}
+
+	if len(vds) == 0 {
+		t.Error("the clone was undone: the target has no volumes")
+	}
+}
+
+// The restore twin of TestRDCloneRollbackKeepsTheDefinitionWhenTheCascadeFails.
+// Both endpoints materialise the same way and compensate the same way, so a
+// failed cascade has to leave the same trace on both.
+func TestSnapshotRestoreRollbackKeepsTheDefinitionWhenTheCascadeFails(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+
+	// A deployed source, so the restore places a replica the cascade then has
+	// to fail on. Without one the rollback has nothing to do and answers the
+	// success code whatever the cascade would have done.
+	seedGroupedCloneSource(t, backend, "restore-orphan-src", "grp-restore-orphan-gone", false)
+
+	if err := backend.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-restore-orphan",
+		ResourceName: "restore-orphan-src",
+		Nodes:        []string{"node-a"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 64 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed the snapshot: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, failingCascadeStore{backend})
+	defer stop()
+
+	// node_names, so the restore places the replica whose reaping then fails.
+	body, _ := json.Marshal(map[string]any{
+		"to_resource":   "restore-orphan-dst",
+		"from_snapshot": "snap-restore-orphan",
+		"node_names":    []string{"node-a"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/restore-orphan-src/snapshot-restore-resource", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		t.Fatalf("status = 404, the code a completed rollback uses — the cascade failed")
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(ctx, "restore-orphan-dst"); err != nil {
+		t.Fatalf("the definition was deleted over replicas that could not be: %v", err)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode the envelope: %v", err)
+	}
+
+	if len(rcs) == 0 {
+		t.Fatal("empty envelope")
+	}
+
+	if !strings.Contains(rcs[0].Message, "restore-orphan-dst") ||
+		!strings.Contains(rcs[0].Message, "still there") {
+		t.Errorf("message = %q, want it to name the definition left behind", rcs[0].Message)
 	}
 }

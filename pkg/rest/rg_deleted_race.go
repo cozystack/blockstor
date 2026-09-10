@@ -20,9 +20,12 @@ package rest
 
 import (
 	"context"
+	"slices"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -99,12 +102,63 @@ func (s *Server) rollBackMaterialisedRD(ctx context.Context, rdName string) erro
 		return errors.Wrapf(err, "cascade the replicas of %q", rdName)
 	}
 
+	stranded, err := replicasNotAcceptedForDeletion(ctx, s.Store, rdName)
+	if err != nil {
+		return errors.Wrapf(err, "re-read the replicas of %q", rdName)
+	}
+
+	if len(stranded) > 0 {
+		return errors.Newf("%d replica(s) of %q were not accepted for deletion: %s",
+			len(stranded), rdName, strings.Join(stranded, ", "))
+	}
+
 	err = s.Store.ResourceDefinitions().Delete(ctx, rdName)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return errors.Wrapf(err, "delete %q", rdName)
 	}
 
 	return nil
+}
+
+// replicasNotAcceptedForDeletion names the replicas that are still there and
+// carry no deletion stamp, which is the only shape the parent must not be
+// dropped over.
+//
+// CascadeDeleteResources answers nil in two different situations: every
+// replica went, and its pass budget ran out with replicas still listed. That
+// is the right contract for `rd d`, whose caller asked for the definition to
+// go and who gets a convergence wait behind it. It is the wrong one to build a
+// compensation on, and the difference is not an edge case in a cluster: every
+// Resource carries the satellite's finalizer, an apiserver DELETE on a
+// finalizer-held object is accepted with no error, and the listing does not
+// filter what is Terminating — so the ordinary path through the cascade is
+// "accepted, still listed", five passes, nil.
+//
+// A replica already stamped for deletion is not stranded: the stamp is what
+// makes the satellite's finalizer run, and it runs whether or not the parent
+// outlives it. A replica with no stamp is the orphan this rollback exists to
+// avoid, because nothing will ever give it one once the definition is gone.
+func replicasNotAcceptedForDeletion(ctx context.Context, st store.Store, rdName string) ([]string, error) {
+	replicas, err := st.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil
+		}
+
+		return nil, errors.Wrapf(err, "list replicas of %q", rdName)
+	}
+
+	var stranded []string
+
+	for i := range replicas {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagDelete) {
+			continue
+		}
+
+		stranded = append(stranded, replicas[i].NodeName)
+	}
+
+	return stranded, nil
 }
 
 // rollbackFailedMessage is what the operator is told when the compensation
