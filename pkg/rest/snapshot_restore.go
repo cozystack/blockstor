@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
@@ -313,17 +315,37 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// target is left an empty shell for the operator / linstor-csi to
 	// place (restore-then-scale-out); an explicit node list is still
 	// stamped verbatim inside materializeRestoredRD.
-	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false)
+	newRDName, stampedRG, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	// The group validated is the one that was WRITTEN, not the source's read
+	// back a second time: re-reading answers a different question, and the
+	// extra read was itself a way to fail a restore that had already worked.
+	uncheckedRG, ok := s.restoreParentRGSurvived(r.Context(), w, newRDName, stampedRG)
+	if !ok {
+		return
+	}
+
+	writeRestoreDone(w, "snapshot restored: "+snapName+" → "+newRDName, uncheckedRG)
+}
+
+// writeRestoreDone emits the restore's success envelope, with any warning the
+// post-write checks want to ride back alongside it.
+func writeRestoreDone(w http.ResponseWriter, message string, warn *apiv1.APICallRc) {
+	rcs := []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "snapshot restored: " + snapName + " → " + newRDName,
-	}})
+		Message: message,
+	}}
+
+	if warn != nil {
+		rcs = append(rcs, *warn)
+	}
+
+	writeJSON(w, http.StatusCreated, rcs)
 }
 
 // validateRestoreNodesHoldSnapshot is the Bug 397 input-validation guard
@@ -387,6 +409,78 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 	return req.SnapshotName
 }
 
+// restoreParentRGSurvived is the post-write half of the Bug 174 guard on the
+// restore path. The restored definition inherits the source's resource group,
+// so a `rg d` landing while it materialises leaves it parented to a group that
+// is gone. False means the restore has been rolled back and a refusal written.
+func (s *Server) restoreParentRGSurvived(
+	ctx context.Context, w http.ResponseWriter, newRDName, stampedRG string,
+) (*apiv1.APICallRc, bool) {
+	survived, err := s.parentRGSurvived(ctx, stampedRG)
+	if err != nil {
+		// The CHECK failed, which says nothing about the restore: that
+		// already succeeded, and this is the safety net over it. Undoing a
+		// completed restore because the net could not be inspected trades a
+		// rare dangling group for a certain lost restore — and a much worse
+		// one, since this endpoint has no idempotent-replay gate, so the
+		// definition stays behind and every retry under that name meets
+		// AlreadyExists and answers 409 from then on.
+		//
+		// getRGWithCacheRetry returns immediately on anything that is not
+		// NotFound, so this branch is apiserver unavailability, a timeout, a
+		// decode failure or a cancelled request context — none of them a
+		// statement about the group.
+		log.FromContext(ctx).Info("could not re-check the restored definition's parent group",
+			"resourceDefinition", newRDName, "resourceGroup", stampedRG, "reason", err.Error())
+
+		// And say so to the caller. Proceeding is right; leaving the only
+		// trace in an apiserver log is not. The operator is told the restore
+		// worked and not that the group behind it went unverified, which is
+		// the one piece of information that would make them look.
+		return &apiv1.APICallRc{
+			RetCode: maskWarn,
+			Message: "resource group '" + stampedRG + "' could not be re-checked after the " +
+				"restore: " + err.Error(),
+			Cause: "the restore itself succeeded; only the safety net over it could not be " +
+				"inspected, so a group deleted during the restore would not have been caught",
+			Correc: "confirm resource group '" + stampedRG + "' still exists",
+			ObjRefs: map[string]string{
+				objRefRscDfn: newRDName,
+				objRefRscGrp: stampedRG,
+			},
+		}, true
+	}
+
+	if survived {
+		return nil, true
+	}
+
+	rollbackErr := s.rollBackMaterialisedRD(ctx, newRDName)
+	if rollbackErr != nil {
+		writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "snapshot restore: " +
+				rollbackFailedMessage(newRDName, stampedRG, rollbackErr),
+			Cause: "the replicas could not all be reaped, so the definition was left in " +
+				"place rather than orphaning them",
+			Correc: "delete '" + newRDName + "' by hand once the replicas can be removed",
+		}})
+
+		return nil, false
+	}
+
+	writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: "snapshot restore rolled back: " + rgDeletedRaceCorrection(stampedRG),
+		Cause: "the restored definition inherits its parent group from the source, and that " +
+			"group was deleted while the restore was being materialised; a definition " +
+			"pointing at a group that is gone lists fine and places badly",
+		Correc: "re-create the resource group, then restore again",
+	}})
+
+	return nil, false
+}
+
 // materializeRestoredRD creates the target RD inheriting the source
 // RD's LayerStack + Props (snapshot Props win when set) and hydrates
 // its VolumeDefinitions from the snapshot's recorded volume layout.
@@ -413,10 +507,12 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 //
 // An explicit caller node list is always stamped verbatim, regardless of
 // eagerPlace.
-func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) (string, error) {
+//
+//nolint:nonamedreturns // the second result needs a name to be readable at the call sites
+func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) (name, stampedRG string, err error) {
 	srcRDObj, err := s.Store.ResourceDefinitions().Get(ctx, srcRD)
 	if err != nil {
-		return "", err //nolint:wrapcheck // surfaced via writeStoreError
+		return "", "", err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
 	newRD := apiv1.ResourceDefinition{
@@ -452,12 +548,12 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 
 	err = s.Store.ResourceDefinitions().Create(ctx, &newRD)
 	if err != nil {
-		return "", err //nolint:wrapcheck // surfaced via writeStoreError
+		return "", "", err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
 	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Bug 354: stamp per-node Resource CRDs so satellites have something
@@ -468,10 +564,10 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// empty shell. Mirrors upstream CtrlSnapshotRestoreApiCallHandler.
 	err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap, eagerPlace)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return newRD.Name, nil
+	return newRD.Name, newRD.ResourceGroupName, nil
 }
 
 // placeRestoredResources stamps the Resource CRDs that materialise the
