@@ -57,10 +57,12 @@ import (
 )
 
 func main() {
-	// The store logs when a scoped read falls back to reading everything, and
-	// this binary is the only consumer that can still reach that branch: the
-	// servers register the indexes, so only a cluster whose CRD predates the
-	// selectable fields takes it, through this uncached client.
+	// The store logs when a scoped read falls back to reading everything. Only
+	// a cluster whose CRD predates the selectable fields takes that branch,
+	// and both uncached readers reach it there: this client, and the servers'
+	// node-scoped reads, which go to the manager's API reader and are refused
+	// on the wire by the same API server. What the servers do not reach is the
+	// cache half of it, since they register the indexes.
 	//
 	// Without a root logger controller-runtime buffers the line, then after
 	// thirty seconds promotes to a null sink and prints its own "SetLogger

@@ -304,6 +304,13 @@ type ResourceStore interface {
 // definition in a case the definition is not stored under is therefore missed
 // by both, and `rd d`'s refusal and sweep read it that way too.
 //
+// The same boundary reaches `node delete`. Its refusal and its `--force`
+// cascade are both node-scoped reads on `spec.nodeName`, while Nodes().Get and
+// Delete fold: spell the node in a case its replicas were not written with and
+// the reads see nothing, the refusal passes, and the node goes with replicas
+// still pointing at it. Not introduced here — the comparison was verbatim at
+// the merge base too — but these reads are the whole gate now.
+//
 // Folding on the write side instead would fold what clients read back:
 // crdToWireResource reports these spec values as the object's names, and
 // crdname.go's annotation exists precisely to keep the stored spelling

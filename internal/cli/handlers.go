@@ -403,11 +403,20 @@ func volumeSizesFor(ctx context.Context, run *runContext, resources []apiv1.Reso
 // same answer at N times the cost, in the command an operator is running
 // because something is already wrong.
 //
-// A timeout is deliberately not in that set. One request covering every
+// A server that asked the caller to slow down is the same case as a refusal,
+// by the same rule: 429 and 503 say the budget is the problem, and answering
+// them with one narrow request per definition sends N requests to the server
+// that just asked for fewer.
+//
+// A timeout is deliberately on the other side. One request covering every
 // definition in the cluster is the read most likely to exceed a deadline, and
 // the narrow ones after it are each small enough to land.
 func perDefinitionCanAnswer(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
+		return false
+	}
+
+	if apierrors.IsTooManyRequests(err) || apierrors.IsServiceUnavailable(err) {
 		return false
 	}
 

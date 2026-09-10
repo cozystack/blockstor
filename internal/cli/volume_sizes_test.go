@@ -240,6 +240,48 @@ func TestVolumeSizesDoNotRetryARefusalPerDefinition(t *testing.T) {
 	}
 }
 
+// A server that answered "slow down" is the budget case by the same rule the
+// refusal is. Falling through turns one rejected request into one per
+// definition against the server that just asked for fewer, which is the
+// opposite of what it asked for and arrives while an operator is watching a
+// cluster misbehave.
+func TestVolumeSizesDoNotRetryAThrottledServer(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"tooManyRequests", apierrors.NewTooManyRequests("slow down", 1)},
+		{"serviceUnavailable", apierrors.NewServiceUnavailable("overloaded")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			backend := store.NewInMemory()
+			calls := 0
+			warnings := &bytes.Buffer{}
+			run := &runContext{
+				Store: countingStore{Store: backend, bulkErr: tc.err, calls: &calls},
+				Err:   warnings,
+			}
+
+			resources := seedDefinitionsForSizes(t, backend, "pvc-"+tc.name+"-", volumeSizesBulkCutoff+1)
+
+			volumeSizesFor(t.Context(), run, resources)
+
+			if calls != 0 {
+				t.Errorf("a throttled server got %d more requests", calls)
+			}
+
+			if !strings.Contains(warnings.String(), "sync percentages unavailable") {
+				t.Errorf("nothing told the operator why the column is empty; stderr = %q",
+					warnings.String())
+			}
+		})
+	}
+}
+
 // Same line, drawn on the budget rather than the permission: a cancelled or
 // timed-out invocation has nothing left to spend on a larger retry, and every
 // one of those reads would fail on the same expired context.

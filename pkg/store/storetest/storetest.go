@@ -744,6 +744,13 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("len: got %d, want 2", len(got))
 		}
 	})
+	// ListByNode is the read `node delete` refuses on and `--force`
+	// cascades from, and the one this store answers with a field selector
+	// against the API server and a fallback everywhere else. Both shapes
+	// have to agree, and the shared suite is the only place that asks them
+	// the same question — its sibling ListByDefinition has been here since
+	// the beginning and this one was covered per implementation only.
+	t.Run("ListByNode", func(t *testing.T) { testResourceListByNode(t, newStore) })
 	t.Run("DeleteRemoves", func(t *testing.T) {
 		s := newStore(t).Resources()
 		ctx := t.Context()
@@ -1010,6 +1017,53 @@ func testResourceListSorted(t *testing.T, newStore Factory) {
 			t.Errorf("[%d]: got %s/%s, want %s/%s",
 				i, got[i].Name, got[i].NodeName, w.name, w.node)
 		}
+	}
+}
+
+// testResourceListByNode pins what a node-scoped read answers: every replica
+// on the node asked for, none from anywhere else, and an empty result rather
+// than an error for a node nothing references.
+func testResourceListByNode(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-1", NodeName: "n1"},
+		{Name: "pvc-2", NodeName: "n1"},
+		{Name: "pvc-3", NodeName: "n2"},
+	} {
+		if err := s.Create(ctx, &r); err != nil {
+			t.Fatalf("Create %+v: %v", r, err)
+		}
+	}
+
+	got, err := s.ListByNode(ctx, "n1")
+	if err != nil {
+		t.Fatalf("ListByNode: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("len: got %d, want the 2 replicas on n1", len(got))
+	}
+
+	for i := range got {
+		if got[i].NodeName != "n1" {
+			t.Errorf("ListByNode returned a replica on %q", got[i].NodeName)
+		}
+	}
+
+	// A node nothing references answers empty, not an error: `node delete`
+	// reads this to decide whether to refuse, and an error there is a
+	// refusal the operator cannot clear.
+	none, err := s.ListByNode(ctx, "ghost")
+	if err != nil {
+		t.Fatalf("ListByNode on an unreferenced node: %v", err)
+	}
+
+	if len(none) != 0 {
+		t.Errorf("ListByNode on an unreferenced node returned %d replica(s)", len(none))
 	}
 }
 
