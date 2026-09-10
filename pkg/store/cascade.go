@@ -92,16 +92,12 @@ func CascadeDeleteResources(ctx context.Context, st Store, rdName string) error 
 // that references the named node, which is what makes a forced node delete
 // leave nothing pointing at an object that is gone.
 func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error {
-	resources, err := st.Resources().List(ctx)
+	resources, err := st.Resources().ListByNode(ctx, node)
 	if err != nil {
-		return fmt.Errorf("list replicas: %w", err)
+		return fmt.Errorf("list replicas on %s: %w", node, err)
 	}
 
 	for i := range resources {
-		if resources[i].NodeName != node {
-			continue
-		}
-
 		err = st.Resources().Delete(ctx, resources[i].Name, node)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return fmt.Errorf("delete replica %s on %s: %w", resources[i].Name, node, err)
@@ -130,19 +126,15 @@ func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error
 // This is what a plain node delete is refused on: the operator either clears
 // the references or says explicitly that the node is gone.
 func ReferencesOnNode(ctx context.Context, st Store, node string) ([]string, []string, error) {
-	resources, err := st.Resources().List(ctx)
+	resources, err := st.Resources().ListByNode(ctx, node)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list replicas: %w", err)
+		return nil, nil, fmt.Errorf("list replicas on %s: %w", node, err)
 	}
 
 	seen := map[string]struct{}{}
 	rscRefs := make([]string, 0, len(resources))
 
 	for i := range resources {
-		if resources[i].NodeName != node {
-			continue
-		}
-
 		if _, dup := seen[resources[i].Name]; dup {
 			continue
 		}

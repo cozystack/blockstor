@@ -139,7 +139,7 @@ func newScheme() *runtime.Scheme {
 // independently. Caches still warm up so the REST server's
 // cached-client reads are cheap.
 func buildManager(flags *apiserverFlags) (manager.Manager, error) {
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: newScheme(),
 		Metrics: metricsserver.Options{
 			BindAddress:   flags.metricsAddr,
@@ -264,7 +264,7 @@ func main() {
 	// concurrent `vd c` against one RD both retry against a stale cache,
 	// re-derive the same number, exhaust the retry budget, and silently
 	// drop the second volume.
-	st := storek8s.NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
+	st := storek8s.NewFromManager(mgr)
 
 	ready := newReadyState()
 

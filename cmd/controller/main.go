@@ -166,7 +166,7 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -195,7 +195,7 @@ func main() {
 	// shared placer. CRD-backed is the only supported persistence
 	// layer since Phase 11.x — the apiserver/controller split makes
 	// in-process state pointless across replicas.
-	st := storek8s.New(mgr.GetClient())
+	st := storek8s.NewFromManager(mgr)
 
 	if err := (&controller.NodeReconciler{
 		Client: mgr.GetClient(),

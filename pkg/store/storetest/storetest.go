@@ -23,6 +23,7 @@ limitations under the License.
 package storetest
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -208,6 +209,7 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
 		}
 	})
+	runVolumeDefinitionListAllCase(t, newStore)
 	// BUG-048: CreateAutoNumbered allocates the smallest free hole and
 	// the allocation is atomic with the write (the REST handler routes
 	// every number-less `linstor vd c` here).
@@ -334,6 +336,58 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 	})
 	t.Run("CreateNilArg", func(t *testing.T) { testVDCreateNilArg(t, newStore) })
 	t.Run("UpdateNilArg", func(t *testing.T) { testVDUpdateNilArg(t, newStore) })
+}
+
+// runVolumeDefinitionListAllCase pins ListAll's contract.
+//
+// ListAll answers for the whole cluster in one request, and keys the
+// answer folded. A caller holds whatever spelling its own objects
+// carry — for a replica that is Spec.ResourceDefinitionName, which
+// need not match the definition's own — and LINSTOR treats the two as
+// one object where a map does not. Keyed raw, the lookup silently
+// misses and the definition renders as though it had no volumes.
+func runVolumeDefinitionListAllCase(t *testing.T, newStore Factory) {
+	t.Helper()
+	t.Run("ListAllKeysFolded", func(t *testing.T) {
+		s := newStore(t)
+		ctx := t.Context()
+
+		seedRD(t, s, "PVC-Mixed")
+		seedRD(t, s, "pvc-plain")
+
+		for _, rd := range []string{"PVC-Mixed", "pvc-plain"} {
+			if err := s.VolumeDefinitions().Create(ctx, rd,
+				&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+				t.Fatalf("Create under %s: %v", rd, err)
+			}
+		}
+
+		all, err := s.VolumeDefinitions().ListAll(ctx)
+		if err != nil {
+			t.Fatalf("ListAll: %v", err)
+		}
+
+		if len(all) != 2 {
+			t.Errorf("ListAll returned %d definitions, want 2", len(all))
+		}
+
+		// The spelling a replica of that definition carries.
+		vds, ok := all[store.FoldName("pvc-mixed")]
+		if !ok {
+			keys := make([]string, 0, len(all))
+			for k := range all {
+				keys = append(keys, k)
+			}
+
+			slices.Sort(keys)
+
+			t.Fatalf("ListAll keys = %v, want an entry reachable under the folded name", keys)
+		}
+
+		if len(vds) != 1 || vds[0].SizeKib != 1024*1024 {
+			t.Errorf("got %+v, want the one volume that was created", vds)
+		}
+	})
 }
 
 // runVolumeDefinitionAutoNumberCases pins the BUG-048 atomic-allocate
@@ -658,38 +712,15 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
 	// See annotation_contract.go.
 	t.Run("UpdateAnnotationContract", func(t *testing.T) { testResourceUpdateAnnotationContract(t, newStore) })
-	t.Run("CreateDuplicate", func(t *testing.T) {
-		s := newStore(t).Resources()
-		ctx := t.Context()
-		r := apiv1.Resource{Name: "pvc-1", NodeName: "n1"}
-		if err := s.Create(ctx, &r); err != nil {
-			t.Fatalf("first: %v", err)
-		}
-		err := s.Create(ctx, &r)
-		if !errors.Is(err, store.ErrAlreadyExists) {
-			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
-		}
-	})
-	t.Run("ListByDefinition", func(t *testing.T) {
-		s := newStore(t).Resources()
-		ctx := t.Context()
-		for _, r := range []apiv1.Resource{
-			{Name: "pvc-1", NodeName: "n1"},
-			{Name: "pvc-1", NodeName: "n2"},
-			{Name: "pvc-2", NodeName: "n1"},
-		} {
-			if err := s.Create(ctx, &r); err != nil {
-				t.Fatalf("Create %+v: %v", r, err)
-			}
-		}
-		got, err := s.ListByDefinition(ctx, "pvc-1")
-		if err != nil {
-			t.Fatalf("ListByDefinition: %v", err)
-		}
-		if len(got) != 2 {
-			t.Errorf("len: got %d, want 2", len(got))
-		}
-	})
+	t.Run("CreateDuplicate", func(t *testing.T) { testResourceCreateDuplicate(t, newStore) })
+	t.Run("ListByDefinition", func(t *testing.T) { testResourceListByDefinition(t, newStore) })
+	// ListByNode is the read `node delete` refuses on and `--force`
+	// cascades from, and the one this store answers with a field selector
+	// against the API server and a fallback everywhere else. Both shapes
+	// have to agree, and the shared suite is the only place that asks them
+	// the same question — its sibling ListByDefinition has been here since
+	// the beginning and this one was covered per implementation only.
+	t.Run("ListByNode", func(t *testing.T) { testResourceListByNode(t, newStore) })
 	t.Run("DeleteRemoves", func(t *testing.T) {
 		s := newStore(t).Resources()
 		ctx := t.Context()
@@ -956,6 +987,96 @@ func testResourceListSorted(t *testing.T, newStore Factory) {
 			t.Errorf("[%d]: got %s/%s, want %s/%s",
 				i, got[i].Name, got[i].NodeName, w.name, w.node)
 		}
+	}
+}
+
+// testResourceListByNode pins what a node-scoped read answers: every replica
+// on the node asked for, none from anywhere else, and an empty result rather
+// than an error for a node nothing references.
+func testResourceListByNode(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-1", NodeName: "n1"},
+		{Name: "pvc-2", NodeName: "n1"},
+		{Name: "pvc-3", NodeName: "n2"},
+	} {
+		if err := s.Create(ctx, &r); err != nil {
+			t.Fatalf("Create %+v: %v", r, err)
+		}
+	}
+
+	got, err := s.ListByNode(ctx, "n1")
+	if err != nil {
+		t.Fatalf("ListByNode: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("len: got %d, want the 2 replicas on n1", len(got))
+	}
+
+	for i := range got {
+		if got[i].NodeName != "n1" {
+			t.Errorf("ListByNode returned a replica on %q", got[i].NodeName)
+		}
+	}
+
+	// A node nothing references answers empty, not an error: `node delete`
+	// reads this to decide whether to refuse, and an error there is a
+	// refusal the operator cannot clear.
+	none, err := s.ListByNode(ctx, "ghost")
+	if err != nil {
+		t.Fatalf("ListByNode on an unreferenced node: %v", err)
+	}
+
+	if len(none) != 0 {
+		t.Errorf("ListByNode on an unreferenced node returned %d replica(s)", len(none))
+	}
+}
+
+func testResourceCreateDuplicate(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+	r := apiv1.Resource{Name: "pvc-1", NodeName: "n1"}
+
+	if err := s.Create(ctx, &r); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+
+	err := s.Create(ctx, &r)
+	if !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("dup: got %v, want ErrAlreadyExists", err)
+	}
+}
+
+func testResourceListByDefinition(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-1", NodeName: "n1"},
+		{Name: "pvc-1", NodeName: "n2"},
+		{Name: "pvc-2", NodeName: "n1"},
+	} {
+		if err := s.Create(ctx, &r); err != nil {
+			t.Fatalf("Create %+v: %v", r, err)
+		}
+	}
+
+	got, err := s.ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("ListByDefinition: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Errorf("len: got %d, want 2", len(got))
 	}
 }
 

@@ -781,6 +781,9 @@ spec:
           optionalOldSelf: true
           rule: oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.resourceDefinitionName
             + '.' + self.spec.nodeName).lowerAscii()
+    selectableFields:
+    - jsonPath: .spec.nodeName
+    - jsonPath: .spec.resourceDefinitionName
     served: true
     storage: true
     subresources:

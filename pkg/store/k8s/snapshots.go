@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -82,25 +83,32 @@ func (s *snapshots) List(ctx context.Context) ([]apiv1.Snapshot, error) {
 	return out, nil
 }
 
+// ListByDefinition returns the snapshots of one definition, narrowed on the
+// spec.resourceDefinitionName selectable field.
+//
+// It used to select on the definition LABEL, and a label is written by
+// whoever created the object: pkg/linstormigrate builds adopted Snapshots
+// from a LINSTOR dump with none. This list is what `rd d` is refused on and
+// what sweeps the leftovers behind it, so on an adopted cluster a snapshot the
+// selector could not see was a definition deleted with snapshots still on it,
+// and the mop-up missing them too. Same label blindness the Resource and
+// StoragePool reads were moved off, one kind over and on a delete gate.
 func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
 	var crdList crdv1alpha1.SnapshotList
 
-	err := s.c.List(ctx, &crdList,
-		ctrlclient.MatchingLabels{LabelResourceDefinition: rdName})
+	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: rdName})
 	if err != nil {
-		return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+		if !SelectorUnsupported(err) {
+			return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+		}
+
+		log.FromContext(ctx).V(1).Info("scoped Snapshot read unavailable; reading every snapshot instead",
+			"resourceDefinition", rdName, "reason", err.Error())
+
+		return s.listByDefinitionExhaustively(ctx, rdName)
 	}
 
-	parent, _ := s.getParentRD(ctx, rdName)
-
-	out := make([]apiv1.Snapshot, 0, len(crdList.Items))
-	for i := range crdList.Items {
-		out = append(out, crdToWireSnapshot(&crdList.Items[i], parent))
-	}
-
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-
-	return out, nil
+	return s.wireSnapshots(ctx, rdName, crdList.Items)
 }
 
 func (s *snapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
@@ -475,4 +483,52 @@ func wireToCRDSnapshotSpec(in *apiv1.Snapshot) crdv1alpha1.SnapshotSpec {
 	}
 
 	return spec
+}
+
+// listByDefinitionExhaustively filters every snapshot here, on the
+// authoritative Spec.ResourceDefinitionName.
+func (s *snapshots) listByDefinitionExhaustively(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+	var crdList crdv1alpha1.SnapshotList
+
+	err := s.c.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+	}
+
+	kept := make([]crdv1alpha1.Snapshot, 0, len(crdList.Items))
+
+	for i := range crdList.Items {
+		if crdList.Items[i].Spec.ResourceDefinitionName == rdName {
+			kept = append(kept, crdList.Items[i])
+		}
+	}
+
+	return s.wireSnapshots(ctx, rdName, kept)
+}
+
+// wireSnapshots converts a definition's snapshots, reading the parent once.
+//
+// The parent read's error is propagated rather than dropped. A snapshot whose
+// definition is GONE is not an error — getParentRD answers (nil, nil) for both
+// the missing name and the NotFound, because an orphan snapshot is a real
+// shape and must still list. What reaches here is a read that actually failed,
+// and swallowing it returned a successful listing with
+// ResourceDefinitionProps silently absent from every row: the caller cannot
+// tell "this definition has no props" from "nobody could read them".
+func (s *snapshots) wireSnapshots(
+	ctx context.Context, rdName string, items []crdv1alpha1.Snapshot,
+) ([]apiv1.Snapshot, error) {
+	parent, err := s.getParentRD(ctx, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]apiv1.Snapshot, 0, len(items))
+	for i := range items {
+		out = append(out, crdToWireSnapshot(&items[i], parent))
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
 }

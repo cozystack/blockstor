@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/internal/controller"
 )
 
 const (
@@ -195,10 +196,23 @@ func (s *Satellite) tickOnce(ctx context.Context) {
 	s.reconcileResources(ctx)
 }
 
-// reconcileNodes stamps Conditions[Ready]=True and ConnectionStatus
-// ONLINE on every Node — the steady-state shape a satellite produces
-// after its first heartbeat. Idempotent: only writes when the value
-// actually changes.
+// reconcileNodes stamps Conditions[Ready] and ConnectionStatus on
+// every Node — the steady-state shape a satellite produces after its
+// first heartbeat. Idempotent: only writes when the value actually
+// changes.
+//
+// A node under SimulateNodeOffline gets the whole offline shape, not
+// just the status field: a stale heartbeat and Ready=Unknown, which is
+// what a satellite that stopped reporting leaves behind. Stamping a
+// FRESH heartbeat beside an OFFLINE status is a state the real system
+// cannot produce, and NodeHeartbeatReconciler decides on the timestamp
+// rather than on the status — it would find the beat fresh, write
+// ONLINE straight back, and the two writers would then trade the field
+// between them. A test that takes a node offline, waits for OFFLINE and
+// then acts on it read whichever of the two wrote last: that is what
+// made `n lost` refuse against a node the test had just watched go
+// offline, with a message naming a satellite nothing was pretending was
+// alive.
 func (s *Satellite) reconcileNodes(ctx context.Context) {
 	var nodes blockstoriov1alpha1.NodeList
 
@@ -209,24 +223,34 @@ func (s *Satellite) reconcileNodes(ctx context.Context) {
 
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
+
 		desiredStatus := blockstoriov1alpha1.NodeConnectionStatusOnline
+		desiredReady := metav1.ConditionTrue
+		reason := "SatelliteMockHealthy"
+		message := "harness/satellite.go stamped Ready"
+		heartbeat := ptrNow()
 
 		if s.isNodeOffline(node.Name) {
 			desiredStatus = blockstoriov1alpha1.NodeConnectionStatusOffline
+			desiredReady = metav1.ConditionUnknown
+			reason = "SatelliteMockOffline"
+			message = "harness/satellite.go stopped reporting for this node"
+			heartbeat = ptrStaleHeartbeat()
 		}
 
-		if node.Status.ConnectionStatus == desiredStatus && hasReadyTrue(node.Status.Conditions) {
+		if node.Status.ConnectionStatus == desiredStatus &&
+			hasReadyStatus(node.Status.Conditions, desiredReady) {
 			continue
 		}
 
 		patched := node.DeepCopy()
 		patched.Status.ConnectionStatus = desiredStatus
-		patched.Status.LastHeartbeatTime = ptrNow()
+		patched.Status.LastHeartbeatTime = heartbeat
 		patched.Status.Conditions = upsertCondition(patched.Status.Conditions, &metav1.Condition{
 			Type:               blockstoriov1alpha1.NodeConditionReady,
-			Status:             metav1.ConditionTrue,
-			Reason:             "SatelliteMockHealthy",
-			Message:            "harness/satellite.go stamped Ready",
+			Status:             desiredReady,
+			Reason:             reason,
+			Message:            message,
 			LastTransitionTime: metav1.Now(),
 		})
 
@@ -351,12 +375,12 @@ func (s *Satellite) isNodeOffline(node string) bool {
 	return s.nodeOffline[node]
 }
 
-// hasReadyTrue is a tiny helper kept off the global namespace so
+// hasReadyStatus is a tiny helper kept off the global namespace so
 // internal callers don't accidentally use it as a public assertion.
-func hasReadyTrue(conds []metav1.Condition) bool {
+func hasReadyStatus(conds []metav1.Condition, want metav1.ConditionStatus) bool {
 	for i := range conds {
 		if conds[i].Type == blockstoriov1alpha1.NodeConditionReady {
-			return conds[i].Status == metav1.ConditionTrue
+			return conds[i].Status == want
 		}
 	}
 
@@ -381,6 +405,15 @@ func ptrNow() *metav1.Time {
 	now := metav1.Now()
 
 	return &now
+}
+
+// ptrStaleHeartbeat is a heartbeat old enough that the watchdog reads
+// the node as unreachable. Comfortably past NodeMonitorGracePeriod, so
+// a slow tick or a busy runner cannot land it back inside the window.
+func ptrStaleHeartbeat() *metav1.Time {
+	stale := metav1.NewTime(time.Now().Add(-4 * controller.NodeMonitorGracePeriod))
+
+	return &stale
 }
 
 func providerSupportsSnapshots(kind string) bool {

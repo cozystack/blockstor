@@ -22,6 +22,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -334,37 +336,190 @@ func resourceList(ctx context.Context, run *runContext) error {
 	}), "State", "Conns")
 }
 
-// volumeSizesFor collects the per-volume sizes of the definitions in a
-// listing, keyed the way the view expects. A definition whose sizes
-// cannot be read is skipped rather than failing the listing: a missing
-// percentage is a cosmetic loss, an unreadable `resource list` during
-// an incident is not.
+// volumeSizesBulkCutoff is where reading the definitions one at a time stops
+// being the cheaper of the two reads. Below it a listing narrowed by `-r`,
+// `-n` or `--limit` pays that many GETs; above it, one request for the lot.
+//
+// It counts the definitions the LISTING covers, and nothing about how many
+// exist. That is the input it does not have and cannot cheaply get: sizing the
+// cluster first is another request on every `resource list`, on the command
+// whose latency this constant exists to protect. So a narrowing that still
+// covers more than the cutoff — `-n` on a busy node in a large cluster — takes
+// the whole-cluster read to render its handful of rows, and that is the trade
+// being made rather than an oversight. Removing it means making the narrow
+// read concurrent instead of sequential, which is a change to the read path
+// and not to this number.
+const volumeSizesBulkCutoff = 16
+
+// volumeSizesFor builds the per-volume sizes the sync-percentage column needs.
+//
+// Two reads, chosen on how much of the cluster the listing actually covers.
+// Reading them one definition at a time is what this used to do
+// unconditionally, and on the Kubernetes store each of those is a GET of one
+// ResourceDefinition against an uncached client — so `resource list` on a
+// cluster with a thousand definitions was one LIST plus a thousand sequential
+// round trips, in the command an operator runs while watching a resync.
+// Reading them all in one request fixes that and breaks the opposite case:
+// `resource list -r one-volume` asked about one definition and would pull
+// every definition in the cluster back to answer it.
+//
+// So the listing picks. Either side of the cutoff the answer is identical;
+// only the number of requests and the size of them differ.
+//
+// A read that fails leaves that definition out rather than failing the
+// listing: the column degrades to a bare state, which is what the
+// per-definition version did when one of its reads failed. A missing
+// percentage is a cosmetic loss; an unreadable `resource list` during an
+// incident is not.
 func volumeSizesFor(ctx context.Context, run *runContext, resources []apiv1.Resource) map[string]map[int32]int64 {
+	names := distinctDefinitionNames(resources)
+
+	if len(names) <= volumeSizesBulkCutoff {
+		return volumeSizesPerDefinition(ctx, run, names)
+	}
+
+	sizes, err := volumeSizesInOneRequest(ctx, run, names)
+	if err == nil {
+		return sizes
+	}
+
+	if !perDefinitionCanAnswer(ctx, err) {
+		warnSyncColumnUnavailable(run, err)
+
+		return nil
+	}
+
+	return volumeSizesPerDefinition(ctx, run, names)
+}
+
+// perDefinitionCanAnswer says whether reading the definitions one at a time
+// can answer what the single read could not.
+//
+// SelectorUnsupported (pkg/store/k8s) draws the same line one layer down, and
+// for the same reason: a fallback is worth taking when the first read failed
+// on its shape, not when it ran out of the budget the second read spends
+// again. A cancelled context and a refusal aimed at the caller rather than at
+// the request repeat identically once per definition, so the retry buys the
+// same answer at N times the cost, in the command an operator is running
+// because something is already wrong.
+//
+// A server that asked the caller to slow down is the same case as a refusal,
+// by the same rule: 429 and 503 say the budget is the problem, and answering
+// them with one narrow request per definition sends N requests to the server
+// that just asked for fewer.
+//
+// A timeout is deliberately on the other side. One request covering every
+// definition in the cluster is the read most likely to exceed a deadline, and
+// the narrow ones after it are each small enough to land.
+func perDefinitionCanAnswer(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	if apierrors.IsTooManyRequests(err) || apierrors.IsServiceUnavailable(err) {
+		return false
+	}
+
+	return !apierrors.IsForbidden(err) && !apierrors.IsUnauthorized(err)
+}
+
+// warnSyncColumnUnavailable tells the operator why the percentages are gone.
+//
+// The listing still prints: an unreadable `resource list` during an incident
+// is worse than one without a percentage. But a column that emptied because
+// every read was refused looks exactly like a cluster with nothing to sync,
+// and that is the one reading an operator must not take away from it. Stderr,
+// so the table on stdout stays the contract `awk -F'|'` parses.
+func warnSyncColumnUnavailable(run *runContext, err error) {
+	if run.Err == nil {
+		return
+	}
+
+	fmt.Fprintf(run.Err, "warning: sync percentages unavailable: %v\n", err)
+}
+
+// distinctDefinitionNames is the set of definitions a listing covers, in
+// first-seen order — every replica of one definition asks the same question.
+func distinctDefinitionNames(resources []apiv1.Resource) []string {
 	seen := make(map[string]struct{}, len(resources))
-	sizes := make(map[string]map[int32]int64, len(resources))
+	names := make([]string, 0, len(resources))
 
 	for i := range resources {
 		name := resources[i].Name
-		if _, done := seen[name]; done {
+		if _, dup := seen[name]; dup {
 			continue
 		}
 
 		seen[name] = struct{}{}
 
+		names = append(names, name)
+	}
+
+	return names
+}
+
+func volumeSizesPerDefinition(ctx context.Context, run *runContext, names []string) map[string]map[int32]int64 {
+	sizes := make(map[string]map[int32]int64, len(names))
+
+	var firstErr error
+
+	for _, name := range names {
 		vds, err := run.Store.VolumeDefinitions().List(ctx, name)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+
 			continue
 		}
 
-		perVolume := make(map[int32]int64, len(vds))
-		for j := range vds {
-			perVolume[vds[j].VolumeNumber] = vds[j].SizeKib
-		}
+		sizes[name] = perVolumeSizes(vds)
+	}
 
-		sizes[name] = perVolume
+	// One definition that could not be read is the degradation this path is
+	// documented to accept. None of them read is not a degradation, it is a
+	// failure that reached the operator as an empty column.
+	if len(sizes) == 0 && firstErr != nil {
+		warnSyncColumnUnavailable(run, firstErr)
 	}
 
 	return sizes
+}
+
+func volumeSizesInOneRequest(
+	ctx context.Context, run *runContext, names []string,
+) (map[string]map[int32]int64, error) {
+	all, err := run.Store.VolumeDefinitions().ListAll(ctx)
+	if err != nil {
+		// One read, so one failure costs every row its percentage — where
+		// the per-definition path loses only the definition it could not
+		// read. The caller decides whether that path can do better, since
+		// it cannot for a failure that was never about the read's shape.
+		return nil, errors.Wrap(err, "read every definition's volumes")
+	}
+
+	sizes := make(map[string]map[int32]int64, len(names))
+
+	for _, name := range names {
+		vds, ok := all[store.FoldName(name)]
+		if !ok {
+			continue
+		}
+
+		sizes[name] = perVolumeSizes(vds)
+	}
+
+	return sizes, nil
+}
+
+// perVolumeSizes keys one definition's volumes the way the view reads them.
+func perVolumeSizes(vds []apiv1.VolumeDefinition) map[int32]int64 {
+	out := make(map[int32]int64, len(vds))
+	for i := range vds {
+		out[vds[i].VolumeNumber] = vds[i].SizeKib
+	}
+
+	return out
 }
 
 // machineOut writes the machine-readable envelope.

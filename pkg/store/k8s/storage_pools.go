@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -44,6 +45,12 @@ const (
 // storagePools implements store.StoragePoolStore against the StoragePool CRD.
 type storagePools struct {
 	c ctrlclient.Client
+
+	// apiReader is the manager's direct, uncached reader. The node-scoped
+	// listing uses it for the reason its Resource sibling does: `node
+	// delete` is refused on this answer and cascades away what it names, so
+	// a pool the read misses is one left pointing at a node that is gone.
+	apiReader ctrlclient.Reader
 }
 
 // crdName encodes the (pool, node) composite key into a single CRD name.
@@ -94,15 +101,34 @@ func (s *storagePools) List(ctx context.Context) ([]apiv1.StoragePool, error) {
 	return out, nil
 }
 
-// ListByNode returns pools on the named node. We use a label selector so
-// k8s narrows the list server-side rather than us filtering after the fact.
+// ListByNode returns pools on the named node, narrowed server-side on the
+// spec.nodeName selectable field.
+//
+// It used to select on the node LABEL, and a label is written by whoever
+// created the object. Piraeus and operators create pools with `kubectl apply`
+// and no label, so the selector answered with a partial-but-correct subset —
+// the Bug 038 shape the Resource store was already moved off labels for, and
+// worse here: this list is what `node delete` refuses on and what the cascade
+// removes, so a pool the selector could not see was a node deleted with pools
+// still registered against it, and a pool left behind referencing a node that
+// no longer exists.
+//
+// The fallback is the exhaustive read, for a cluster whose CRD predates the
+// field; see listScoped on the Resource store for why a rejected selector is
+// safe to fall back from and a wrong one would not be.
 func (s *storagePools) ListByNode(ctx context.Context, node string) ([]apiv1.StoragePool, error) {
 	var crdList crdv1alpha1.StoragePoolList
 
-	err := s.c.List(ctx, &crdList,
-		ctrlclient.MatchingLabels{LabelNodeName: node})
+	err := s.nodeScopedReader().List(ctx, &crdList, ctrlclient.MatchingFields{FieldStoragePoolNodeName: node})
 	if err != nil {
-		return nil, errors.Wrapf(err, "list StoragePool CRDs on node %q", node)
+		if !SelectorUnsupported(err) {
+			return nil, errors.Wrapf(err, "list StoragePool CRDs on node %q", node)
+		}
+
+		log.FromContext(ctx).V(1).Info("scoped StoragePool read unavailable; reading every pool instead",
+			"node", node, "reason", err.Error())
+
+		return s.listByNodeExhaustively(ctx, node)
 	}
 
 	out := make([]apiv1.StoragePool, 0, len(crdList.Items))
@@ -499,4 +525,40 @@ func wireToCRDStoragePoolSpec(in *apiv1.StoragePool) crdv1alpha1.StoragePoolSpec
 		SharedSpaceID: in.SharedSpaceID,
 		Props:         in.Props,
 	}
+}
+
+// listByNodeExhaustively filters every pool here, on the authoritative
+// Spec.NodeName.
+func (s *storagePools) listByNodeExhaustively(ctx context.Context, node string) ([]apiv1.StoragePool, error) {
+	var crdList crdv1alpha1.StoragePoolList
+
+	err := s.nodeScopedReader().List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list StoragePool CRDs on node %q", node)
+	}
+
+	out := make([]apiv1.StoragePool, 0, len(crdList.Items))
+
+	for i := range crdList.Items {
+		if crdList.Items[i].Spec.NodeName != node {
+			continue
+		}
+
+		out = append(out, crdToWireStoragePool(&crdList.Items[i]))
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].StoragePoolName < out[j].StoragePoolName
+	})
+
+	return out, nil
+}
+
+// nodeScopedReader mirrors the Resource store's; see the comment there.
+func (s *storagePools) nodeScopedReader() ctrlclient.Reader {
+	if s.apiReader != nil {
+		return s.apiReader
+	}
+
+	return s.c
 }

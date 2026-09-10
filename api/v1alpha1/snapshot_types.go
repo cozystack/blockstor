@@ -274,6 +274,12 @@ type SnapshotPerNodeStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.resourceDefinitionName + '.' + self.spec.snapshotName).lowerAscii()",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.snapshotName> (case-insensitive)",optionalOldSelf=true
+// spec.resourceDefinitionName is selectable so a definition-scoped snapshot
+// read is a definition-scoped query. A field, not the label the objects
+// usually carry: a Snapshot adopted from a LINSTOR dump has no labels, and a
+// label selector would answer partial-but-correct on the read that refuses
+// `rd d` and sweeps the leftovers after it.
+// +kubebuilder:selectablefield:JSONPath=`.spec.resourceDefinitionName`
 // +kubebuilder:printcolumn:name="Definition",type=string,JSONPath=`.spec.resourceDefinitionName`
 // +kubebuilder:printcolumn:name="Snapshot",type=string,JSONPath=`.spec.snapshotName`
 // +kubebuilder:printcolumn:name="Nodes",type=string,JSONPath=`.spec.nodes`

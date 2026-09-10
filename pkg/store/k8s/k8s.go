@@ -31,6 +31,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -62,8 +63,25 @@ type Store struct {
 }
 
 // New wraps a controller-runtime client and returns a store.Store.
+//
+// For a store backed by a manager, use NewFromManager: the manager has a
+// direct reader and the reads that decide a node's fate need it.
 func New(c ctrlclient.Client) *Store {
 	return NewWithAPIReader(c, nil)
+}
+
+// NewFromManager builds the store a manager-backed binary serves from.
+//
+// The cached client and the direct reader are one decision, the way NewManager
+// makes a manager and its field indexes one decision. Taking that decision at
+// each call site is how the controller binary came to serve the LINSTOR
+// surface from a store with no direct reader while the apiserver's had one:
+// the same `n lost` refused on a cached ONLINE in one topology and read the
+// API server in the other, and no test could tell, because the integration
+// harness built its store the apiserver's way on a manager wired like the
+// controller's.
+func NewFromManager(mgr ctrl.Manager) *Store {
+	return NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
 }
 
 // NewWithAPIReader is New plus a direct (uncached) API reader. The
@@ -89,11 +107,11 @@ func New(c ctrlclient.Client) *Store {
 // cached List still under-reported).
 func NewWithAPIReader(c ctrlclient.Client, apiReader ctrlclient.Reader) *Store {
 	s := &Store{c: c}
-	s.nodes = &nodes{c: c}
-	s.storagePools = &storagePools{c: c}
+	s.nodes = &nodes{c: c, apiReader: apiReader}
+	s.storagePools = &storagePools{c: c, apiReader: apiReader}
 	s.resourceGroups = &resourceGroups{c: c}
 	s.resourceDefinitions = &resourceDefinitions{c: c, apiReader: apiReader}
-	s.resources = &resources{c: c}
+	s.resources = &resources{c: c, apiReader: apiReader}
 	s.volumeDefinitions = &volumeDefinitions{c: c, apiReader: apiReader}
 	s.snapshots = &snapshots{c: c}
 	s.physicalDevices = &physicalDevices{c: c}
