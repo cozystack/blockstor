@@ -583,3 +583,151 @@ func TestSnapshotRestoreRollbackKeepsTheDefinitionWhenTheCascadeFails(t *testing
 		t.Errorf("message = %q, want it to name the definition left behind", rcs[0].Message)
 	}
 }
+
+// The CSI target name is deterministic and linstor-csi retries CreateVolume on
+// any error, so the retry after a failed rollback meets the definition that was
+// deliberately left behind, matches its marker and used to be answered 201
+// "already cloned" — for a definition parented to a group that is gone. The
+// 500 telling the operator to delete it never reaches a human, because the
+// machine turns the failure into a success first.
+func TestRDCloneRetryAfterAFailedRollbackIsNotReportedAsDone(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+	seedGroupedCloneSource(t, backend, "src-retry", "grp-retry-gone", false)
+
+	st := failingCascadeStore{backend}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	first := postClone(t, base, "src-retry", map[string]any{
+		"name":          "dst-retry",
+		"use_zfs_clone": true,
+	})
+	_ = first.Body.Close()
+
+	if first.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("first attempt = %d, want 500 — the rollback failed", first.StatusCode)
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-retry"); err != nil {
+		t.Fatalf("the definition was not left behind, so the retry has nothing to meet: %v", err)
+	}
+
+	second := postClone(t, base, "src-retry", map[string]any{
+		"name":          "dst-retry",
+		"use_zfs_clone": true,
+	})
+	defer func() { _ = second.Body.Close() }()
+
+	if second.StatusCode == http.StatusCreated {
+		t.Fatalf("retry = 201 — a definition parented to a group that is gone was " +
+			"reported as an already-finished clone")
+	}
+
+	var envelope cloneStartedResponse
+	if err := json.NewDecoder(second.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode the envelope: %v", err)
+	}
+
+	if envelope.Messages == nil || len(*envelope.Messages) == 0 {
+		t.Fatal("empty envelope")
+	}
+
+	msg := (*envelope.Messages)[0].Message
+	if !strings.Contains(msg, "grp-retry-gone") {
+		t.Errorf("message = %q, want it to name the group that is gone", msg)
+	}
+}
+
+// The control Ivan asked for: with the group alive the same replay is a
+// legitimate idempotent 201, so this is not a complaint about the replay gate
+// in general.
+func TestRDCloneReplayWithALiveGroupIsStillAnIdempotentSuccess(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	seedGroupedCloneSource(t, backend, "src-replay-ok", "grp-replay-ok", true)
+
+	base, stop := startServerWithStore(t, backend)
+	defer stop()
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp := postClone(t, base, "src-replay-ok", map[string]any{
+			"name":          "dst-replay-ok",
+			"use_zfs_clone": true,
+		})
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("attempt %d = %d, want 201", attempt, resp.StatusCode)
+		}
+	}
+}
+
+// handleRDClone splits on the source's volume count, and the branch that copies
+// a bare definition carried the source's resource group over verbatim with no
+// check on either side of its write.
+func TestRDCloneOfAVolumelessSourceRollsBackWhenTheParentGroupIsGone(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "src-shell",
+		ResourceGroupName: "grp-shell-gone",
+	}); err != nil {
+		t.Fatalf("seed the volume-less source: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, backend)
+	defer stop()
+
+	resp := postClone(t, base, "src-shell", map[string]any{"name": "dst-shell"})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode == http.StatusCreated {
+		t.Fatalf("status = 201 — the shell was cloned into a group that does not exist")
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-shell"); err == nil {
+		t.Error("the cloned shell survived, parented to a group that does not exist")
+	}
+}
+
+// Its control: the same volume-less clone with the group where it should be.
+func TestRDCloneOfAVolumelessSourceKeepsGoingWhenTheParentGroupIsThere(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := backend.ResourceGroups().Create(ctx,
+		&apiv1.ResourceGroup{Name: "grp-shell-ok"}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	if err := backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "src-shell-ok",
+		ResourceGroupName: "grp-shell-ok",
+	}); err != nil {
+		t.Fatalf("seed the volume-less source: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, backend)
+	defer stop()
+
+	resp := postClone(t, base, "src-shell-ok", map[string]any{"name": "dst-shell-ok"})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-shell-ok"); err != nil {
+		t.Errorf("the cloned shell was not persisted: %v", err)
+	}
+}

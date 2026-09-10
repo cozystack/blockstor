@@ -346,6 +346,10 @@ func (s *Server) cloneTargetPreexists(ctx context.Context, w http.ResponseWriter
 	}
 
 	if existing.Props["BlockstorRestoreFromSnapshot"] == srcName+":"+cloneSnapshotName(cloneName) {
+		if !s.cloneLeftoverIsUsable(ctx, w, srcName, cloneName, existing.ResourceGroupName) {
+			return true
+		}
+
 		writeJSON(w, http.StatusCreated, cloneStartedResponse{
 			Location:   "/v1/resource-definitions/" + srcName + "/clone/" + cloneName,
 			SourceName: srcName,
@@ -366,6 +370,100 @@ func (s *Server) cloneTargetPreexists(ctx context.Context, w http.ResponseWriter
 	})
 
 	return true
+}
+
+// cloneShellParentRGSurvived is the vol-less half of the same guard.
+//
+// handleRDClone splits on the source's volume count. The branch above copies a
+// bare definition, carrying the source's resource group over verbatim, and had
+// no check on either side of its write — so a `rg d` landing while it runs
+// leaves exactly the definition the guard exists to prevent, on the cheaper of
+// the two branches.
+//
+// The compensation is RD-create's rather than the cascade, and deliberately:
+// what this branch created is a bare definition, with no volumes hydrated and
+// no replicas stamped, so a single Delete undoes all of it. Best-effort, for
+// the reason refuseRDCreateOnRGDeletedRace is: the operator gets the refusal
+// either way, and a definition that outlives a failed delete surfaces on its
+// next access rather than stranding a replica.
+func (s *Server) cloneShellParentRGSurvived(
+	ctx context.Context, w http.ResponseWriter, srcName, cloneName, stampedRG string,
+) bool {
+	if stampedRG == "" {
+		return true
+	}
+
+	survived, err := s.parentRGSurvived(ctx, stampedRG)
+	if err != nil {
+		// The check failed, not the clone. Same stance as the data-plane
+		// half: an inconclusive safety net must not undo work that succeeded.
+		log.FromContext(ctx).Info("could not re-check the cloned shell's parent group",
+			"resourceDefinition", cloneName, "resourceGroup", stampedRG, "reason", err.Error())
+
+		return true
+	}
+
+	if survived {
+		return true
+	}
+
+	_ = s.Store.ResourceDefinitions().Delete(ctx, cloneName)
+
+	writeCloneRefused(w, http.StatusNotFound, srcName, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone of resource definition '" + srcName + "' rolled back: " +
+			rgDeletedRaceCorrection(stampedRG),
+		Cause: "the clone inherits its parent group from the source, and that group was " +
+			"deleted while the clone was being created; a definition pointing at a group " +
+			"that is gone lists fine and places badly",
+		Correc: "re-create the resource group, then clone again",
+	})
+
+	return false
+}
+
+// cloneLeftoverIsUsable decides whether a definition that carries this clone's
+// marker may be answered as an idempotent replay.
+//
+// The marker is stamped at RD-create, before the volumes are hydrated and
+// before any replica exists, so it says "an attempt at this clone got this
+// far" and nothing more. When a rollback fails, the definition is deliberately
+// kept and the operator is told to delete it — but the CSI target name is
+// deterministic and linstor-csi retries CreateVolume on any error, so the very
+// next call meets that leftover, matches the marker and is answered 201
+// "already cloned" for a definition still parented to a group that is gone.
+// The advice in the 500 never reaches a human, because the machine turns the
+// failure into a success first.
+//
+// So a leftover whose parent group no longer resolves is not a replay. An
+// inconclusive read is treated as resolving, for the reason the post-write
+// check treats it that way: a blip in a safety net must not turn a legitimate
+// idempotent replay into a refusal.
+func (s *Server) cloneLeftoverIsUsable(
+	ctx context.Context, w http.ResponseWriter, srcName, cloneName, stampedRG string,
+) bool {
+	if stampedRG == "" {
+		return true
+	}
+
+	survived, err := s.parentRGSurvived(ctx, stampedRG)
+	if err != nil || survived {
+		return true
+	}
+
+	writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone target '" + cloneName + "' exists but is parented to resource group '" +
+			stampedRG + "', which no longer exists",
+		Cause: "an earlier attempt at this clone could not be rolled back after its parent " +
+			"group was deleted, so the definition was left in place rather than orphaning " +
+			"its replicas; answering this retry as an idempotent replay would report a " +
+			"clone that is not usable",
+		Correc: "delete '" + cloneName + "' by hand, re-create resource group '" + stampedRG +
+			"', then clone again",
+	})
+
+	return false
 }
 
 // ensureCloneSnapshot takes (or reuses) the internal snapshot backing
@@ -581,6 +679,10 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		writeStoreError(w, err)
 
+		return
+	}
+
+	if !s.cloneShellParentRGSurvived(r.Context(), w, src.Name, clone.Name, clone.ResourceGroupName) {
 		return
 	}
 
