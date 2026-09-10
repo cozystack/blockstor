@@ -712,38 +712,8 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
 	// See annotation_contract.go.
 	t.Run("UpdateAnnotationContract", func(t *testing.T) { testResourceUpdateAnnotationContract(t, newStore) })
-	t.Run("CreateDuplicate", func(t *testing.T) {
-		s := newStore(t).Resources()
-		ctx := t.Context()
-		r := apiv1.Resource{Name: "pvc-1", NodeName: "n1"}
-		if err := s.Create(ctx, &r); err != nil {
-			t.Fatalf("first: %v", err)
-		}
-		err := s.Create(ctx, &r)
-		if !errors.Is(err, store.ErrAlreadyExists) {
-			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
-		}
-	})
-	t.Run("ListByDefinition", func(t *testing.T) {
-		s := newStore(t).Resources()
-		ctx := t.Context()
-		for _, r := range []apiv1.Resource{
-			{Name: "pvc-1", NodeName: "n1"},
-			{Name: "pvc-1", NodeName: "n2"},
-			{Name: "pvc-2", NodeName: "n1"},
-		} {
-			if err := s.Create(ctx, &r); err != nil {
-				t.Fatalf("Create %+v: %v", r, err)
-			}
-		}
-		got, err := s.ListByDefinition(ctx, "pvc-1")
-		if err != nil {
-			t.Fatalf("ListByDefinition: %v", err)
-		}
-		if len(got) != 2 {
-			t.Errorf("len: got %d, want 2", len(got))
-		}
-	})
+	t.Run("CreateDuplicate", func(t *testing.T) { testResourceCreateDuplicate(t, newStore) })
+	t.Run("ListByDefinition", func(t *testing.T) { testResourceListByDefinition(t, newStore) })
 	// ListByNode is the read `node delete` refuses on and `--force`
 	// cascades from, and the one this store answers with a field selector
 	// against the API server and a fallback everywhere else. Both shapes
@@ -1064,6 +1034,49 @@ func testResourceListByNode(t *testing.T, newStore Factory) {
 
 	if len(none) != 0 {
 		t.Errorf("ListByNode on an unreferenced node returned %d replica(s)", len(none))
+	}
+}
+
+func testResourceCreateDuplicate(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+	r := apiv1.Resource{Name: "pvc-1", NodeName: "n1"}
+
+	if err := s.Create(ctx, &r); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+
+	err := s.Create(ctx, &r)
+	if !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("dup: got %v, want ErrAlreadyExists", err)
+	}
+}
+
+func testResourceListByDefinition(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-1", NodeName: "n1"},
+		{Name: "pvc-1", NodeName: "n2"},
+		{Name: "pvc-2", NodeName: "n1"},
+	} {
+		if err := s.Create(ctx, &r); err != nil {
+			t.Fatalf("Create %+v: %v", r, err)
+		}
+	}
+
+	got, err := s.ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("ListByDefinition: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Errorf("len: got %d, want 2", len(got))
 	}
 }
 

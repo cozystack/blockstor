@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cockroachdb/errors"
 )
 
 // A store built on a manager's cached client without the manager's direct
@@ -110,7 +112,7 @@ func walkGoFiles(t *testing.T, dir string, visit func(string, *ast.File, *token.
 
 		parsed, perr := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
 		if perr != nil {
-			return perr
+			return errors.Wrapf(perr, "parse %s", path)
 		}
 
 		visit(path, parsed, fset)
