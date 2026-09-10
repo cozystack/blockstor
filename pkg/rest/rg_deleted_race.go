@@ -20,6 +20,7 @@ package rest
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 
@@ -40,8 +41,15 @@ import (
 // drops the RG tier without a word, taking auto-place, auto-diskful,
 // place_count observability and rebalance scheduling with it.
 //
-// Clone and snapshot-restore create definitions the same way, inherit the
-// group the same way, and had only the pre-write half.
+// Clone and snapshot-restore create definitions the same way and inherit the
+// group the same way, and had NEITHER half: refuseRDCreateOnRGDeletedRace has
+// exactly one caller, and neither rd_clone.go nor snapshot_restore.go read
+// ResourceGroups() at all.
+//
+// That distinction reaches the operator. A refusal derived from this check
+// that always blames a concurrent delete sends someone whose group never
+// existed — from adoption, or from data that predates Bug 134 — hunting a race
+// that never happened, so the wording covers both.
 //
 // The read carries the standard cache-retry budget for the same reason
 // refuseRDCreateOnRGDeletedRace does: on the CreateVolume hot path the group
@@ -65,6 +73,11 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 
 	return false, err
 }
+
+// errReplicasNotStamped is the rollback's own refusal: replicas that are still
+// there and were never accepted for deletion, which is the one shape the
+// parent must not be dropped over.
+var errReplicasNotStamped = errors.New("replica(s) were not accepted for deletion")
 
 // rollBackMaterialisedRD undoes a clone or restore whose parent group was
 // deleted underneath it.
@@ -108,14 +121,27 @@ func (s *Server) rollBackMaterialisedRD(ctx context.Context, rdName string) erro
 	}
 
 	if len(stranded) > 0 {
-		return errors.Newf("%d replica(s) of %q were not accepted for deletion: %s",
-			len(stranded), rdName, strings.Join(stranded, ", "))
+		return fmt.Errorf("%q: %w: %s", rdName, errReplicasNotStamped, strings.Join(stranded, ", "))
 	}
 
 	err = s.Store.ResourceDefinitions().Delete(ctx, rdName)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return errors.Wrapf(err, "delete %q", rdName)
 	}
+
+	// The same two companions handleRDDelete runs after its own delete, for
+	// the same two reasons.
+	//
+	// The convergence wait, because reads here are informer-cache backed and a
+	// delete lags them: a retry landing inside that window reads the
+	// pre-delete definition, matches the clone marker and is answered 201 for
+	// a definition that is genuinely gone — the same false success as
+	// answering over a leftover, by a different route.
+	//
+	// The sweep, because a snapshot create can land between the walk and the
+	// delete, and the row it leaves has no parent to address it.
+	s.waitForRDDeletionVisible(ctx, rdName)
+	s.sweepOrphanSnapshotsAfterRDDelete(ctx, rdName)
 
 	return nil
 }
@@ -173,6 +199,6 @@ func rollbackFailedMessage(rdName, rgName string, cause error) string {
 // rgDeletedRaceCorrection is the one wording for the refusal, so an operator
 // reads the same correction whichever endpoint lost the race.
 func rgDeletedRaceCorrection(rgName string) string {
-	return "resource group '" + rgName + "' was deleted concurrently with the " +
-		"operation (Bug 174): retry after re-creating the resource group"
+	return "resource group '" + rgName + "' does not exist — it was deleted while the " +
+		"operation ran, or it was never there: retry after creating the resource group"
 }

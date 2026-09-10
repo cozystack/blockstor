@@ -384,11 +384,20 @@ func TestSnapshotRestoreSurvivesAFailedParentGroupRecheck(t *testing.T) {
 	})
 
 	resp := httpPost(t, base+"/v1/resource-definitions/flaky-src/snapshot-restore-resource", body)
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 — the restore succeeded; only the re-check failed",
 			resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode the envelope: %v", err)
+	}
+
+	if !envelopeWarnsAbout(rcs, "grp-flaky") {
+		t.Errorf("nothing in %+v warns that the parent group went unverified", rcs)
 	}
 
 	if _, err := backend.ResourceDefinitions().Get(ctx, "flaky-dst"); err != nil {
@@ -502,11 +511,28 @@ func TestRDCloneSurvivesAFailedParentGroupRecheck(t *testing.T) {
 		"name":          "dst-flaky-rg",
 		"use_zfs_clone": true,
 	})
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 — the clone succeeded; only the re-check failed",
 			resp.StatusCode)
+	}
+
+	// Proceeding is right; being silent about it is not. The caller is told
+	// the clone worked, and has to be told the group behind it went
+	// unverified, which is the one thing that would make them look.
+	var envelope cloneStartedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode the envelope: %v", err)
+	}
+
+	if envelope.Messages == nil {
+		t.Fatal("empty envelope")
+	}
+
+	if !envelopeWarnsAbout(*envelope.Messages, "grp-flaky-clone") {
+		t.Errorf("nothing in %+v warns that the parent group went unverified",
+			*envelope.Messages)
 	}
 
 	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-flaky-rg"); err != nil {
@@ -730,4 +756,17 @@ func TestRDCloneOfAVolumelessSourceKeepsGoingWhenTheParentGroupIsThere(t *testin
 	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-shell-ok"); err != nil {
 		t.Errorf("the cloned shell was not persisted: %v", err)
 	}
+}
+
+// envelopeWarnsAbout reports whether any entry rides back in the warn band and
+// names the group, which is what tells the operator the safety net did not run
+// rather than that it passed.
+func envelopeWarnsAbout(rcs []apiv1.APICallRc, rgName string) bool {
+	for i := range rcs {
+		if rcs[i].RetCode&maskWarn != 0 && strings.Contains(rcs[i].Message, rgName) {
+			return true
+		}
+	}
+
+	return false
 }

@@ -325,14 +325,27 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// The group validated is the one that was WRITTEN, not the source's read
 	// back a second time: re-reading answers a different question, and the
 	// extra read was itself a way to fail a restore that had already worked.
-	if !s.restoreParentRGSurvived(r.Context(), w, newRDName, stampedRG) {
+	uncheckedRG, ok := s.restoreParentRGSurvived(r.Context(), w, newRDName, stampedRG)
+	if !ok {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	writeRestoreDone(w, "snapshot restored: "+snapName+" → "+newRDName, uncheckedRG)
+}
+
+// writeRestoreDone emits the restore's success envelope, with any warning the
+// post-write checks want to ride back alongside it.
+func writeRestoreDone(w http.ResponseWriter, message string, warn *apiv1.APICallRc) {
+	rcs := []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "snapshot restored: " + snapName + " → " + newRDName,
-	}})
+		Message: message,
+	}}
+
+	if warn != nil {
+		rcs = append(rcs, *warn)
+	}
+
+	writeJSON(w, http.StatusCreated, rcs)
 }
 
 // validateRestoreNodesHoldSnapshot is the Bug 397 input-validation guard
@@ -402,7 +415,7 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 // is gone. False means the restore has been rolled back and a refusal written.
 func (s *Server) restoreParentRGSurvived(
 	ctx context.Context, w http.ResponseWriter, newRDName, stampedRG string,
-) bool {
+) (*apiv1.APICallRc, bool) {
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
 		// The CHECK failed, which says nothing about the restore: that
@@ -420,11 +433,26 @@ func (s *Server) restoreParentRGSurvived(
 		log.FromContext(ctx).Info("could not re-check the restored definition's parent group",
 			"resourceDefinition", newRDName, "resourceGroup", stampedRG, "reason", err.Error())
 
-		return true
+		// And say so to the caller. Proceeding is right; leaving the only
+		// trace in an apiserver log is not. The operator is told the restore
+		// worked and not that the group behind it went unverified, which is
+		// the one piece of information that would make them look.
+		return &apiv1.APICallRc{
+			RetCode: maskWarn,
+			Message: "resource group '" + stampedRG + "' could not be re-checked after the " +
+				"restore: " + err.Error(),
+			Cause: "the restore itself succeeded; only the safety net over it could not be " +
+				"inspected, so a group deleted during the restore would not have been caught",
+			Correc: "confirm resource group '" + stampedRG + "' still exists",
+			ObjRefs: map[string]string{
+				objRefRscDfn: newRDName,
+				objRefRscGrp: stampedRG,
+			},
+		}, true
 	}
 
 	if survived {
-		return true
+		return nil, true
 	}
 
 	rollbackErr := s.rollBackMaterialisedRD(ctx, newRDName)
@@ -438,7 +466,7 @@ func (s *Server) restoreParentRGSurvived(
 			Correc: "delete '" + newRDName + "' by hand once the replicas can be removed",
 		}})
 
-		return false
+		return nil, false
 	}
 
 	writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
@@ -450,7 +478,7 @@ func (s *Server) restoreParentRGSurvived(
 		Correc: "re-create the resource group, then restore again",
 	}})
 
-	return false
+	return nil, false
 }
 
 // materializeRestoredRD creates the target RD inheriting the source

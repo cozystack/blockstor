@@ -241,7 +241,8 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	if !s.cloneParentRGSurvived(ctx, w, src, req.Name, stampedRG) {
+	uncheckedRG, ok := s.cloneParentRGSurvived(ctx, w, src, req.Name, stampedRG)
+	if !ok {
 		return
 	}
 
@@ -256,14 +257,30 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
+	writeCloneStarted(w, src.Name, req.Name, "resource definition cloned: "+req.Name, uncheckedRG)
+}
+
+// correcRecreateGroupThenClone is the one wording both rollback doors on this
+// path give the operator.
+const correcRecreateGroupThenClone = "re-create the resource group, then clone again"
+
+// writeCloneStarted emits the envelope golinstor's Clone decoder expects, with
+// any warning the post-write checks want to ride back alongside the result.
+func writeCloneStarted(w http.ResponseWriter, srcName, cloneName, message string, warn *apiv1.APICallRc) {
+	messages := []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: message,
+	}}
+
+	if warn != nil {
+		messages = append(messages, *warn)
+	}
+
 	writeJSON(w, http.StatusCreated, cloneStartedResponse{
-		Location:   "/v1/resource-definitions/" + src.Name + "/clone/" + req.Name,
-		SourceName: src.Name,
-		CloneName:  req.Name,
-		Messages: &[]apiv1.APICallRc{{
-			RetCode: maskInfo,
-			Message: "resource definition cloned: " + req.Name,
-		}},
+		Location:   "/v1/resource-definitions/" + srcName + "/clone/" + cloneName,
+		SourceName: srcName,
+		CloneName:  cloneName,
+		Messages:   &messages,
 	})
 }
 
@@ -275,19 +292,32 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 func (s *Server) cloneParentRGSurvived(
 	ctx context.Context, w http.ResponseWriter,
 	src *apiv1.ResourceDefinition, cloneName, stampedRG string,
-) bool {
+) (*apiv1.APICallRc, bool) {
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
 		// The check failed, not the clone. See restoreParentRGSurvived for
-		// why an inconclusive safety net must not undo work that succeeded.
+		// why an inconclusive safety net must not undo work that succeeded —
+		// and why the caller is told it went unverified rather than left to
+		// find out from an apiserver log.
 		log.FromContext(ctx).Info("could not re-check the clone's parent group",
 			"resourceDefinition", cloneName, "resourceGroup", stampedRG, "reason", err.Error())
 
-		return true
+		return &apiv1.APICallRc{
+			RetCode: maskWarn,
+			Message: "resource group '" + stampedRG + "' could not be re-checked after the " +
+				"clone: " + err.Error(),
+			Cause: "the clone itself succeeded; only the safety net over it could not be " +
+				"inspected, so a group deleted during the clone would not have been caught",
+			Correc: "confirm resource group '" + stampedRG + "' still exists",
+			ObjRefs: map[string]string{
+				objRefRscDfn: cloneName,
+				objRefRscGrp: stampedRG,
+			},
+		}, true
 	}
 
 	if survived {
-		return true
+		return nil, true
 	}
 
 	rollbackErr := s.rollBackMaterialisedRD(ctx, cloneName)
@@ -301,7 +331,7 @@ func (s *Server) cloneParentRGSurvived(
 			Correc: "delete '" + cloneName + "' by hand once the replicas can be removed",
 		})
 
-		return false
+		return nil, false
 	}
 
 	writeCloneRefused(w, http.StatusNotFound, src.Name, cloneName, &apiv1.APICallRc{
@@ -311,10 +341,10 @@ func (s *Server) cloneParentRGSurvived(
 		Cause: "the clone inherits its parent group from the source, and that group was " +
 			"deleted while the clone was being materialised; a definition pointing at a " +
 			"group that is gone lists fine and places badly",
-		Correc: "re-create the resource group, then clone again",
+		Correc: correcRecreateGroupThenClone,
 	})
 
-	return false
+	return nil, false
 }
 
 // cloneSnapshotName derives the internal snapshot name backing a
@@ -416,7 +446,7 @@ func (s *Server) cloneShellParentRGSurvived(
 		Cause: "the clone inherits its parent group from the source, and that group was " +
 			"deleted while the clone was being created; a definition pointing at a group " +
 			"that is gone lists fine and places badly",
-		Correc: "re-create the resource group, then clone again",
+		Correc: correcRecreateGroupThenClone,
 	})
 
 	return false
