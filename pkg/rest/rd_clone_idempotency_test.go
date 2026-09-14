@@ -237,9 +237,9 @@ func TestRDCloneHonoursAKnownResourceGroup(t *testing.T) {
 }
 
 // delete_namespaces rides with override_props and delete_props on every
-// upstream props-modify body. Declaring its two neighbours and not it left
-// `linstor rd clone --delete-namespace NS` on the very 400 declaring the other
-// two was meant to end.
+// upstream props-modify body. Declaring its two neighbours and not it left a
+// clone body carrying delete_namespaces on the very 400 declaring the other two
+// was meant to end.
 func TestRDCloneHonoursDeleteNamespaces(t *testing.T) {
 	t.Parallel()
 

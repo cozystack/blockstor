@@ -739,9 +739,8 @@ func TestRDCloneRefusesToResumeOntoAnOfflineNode(t *testing.T) {
 	}
 }
 
-// The modify body declares delete_namespaces and the merge dropped it, so
-// `linstor rd delete-property <rd> --namespace <ns>` answered 200 and changed
-// nothing.
+// The modify body declares delete_namespaces and the merge dropped it, so a
+// modify carrying it answered 200 and changed nothing.
 func TestRDModifyHonoursDeleteNamespaces(t *testing.T) {
 	t.Parallel()
 
