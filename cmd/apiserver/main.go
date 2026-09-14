@@ -254,7 +254,6 @@ func main() {
 		os.Exit(1)
 	}
 
-
 	ready := newReadyState()
 
 	// Bug 219: `ctrl.SetupSignalHandler` is one-shot — a second call
