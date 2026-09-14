@@ -37,45 +37,13 @@ func (c *countingVDs) ListAll(ctx context.Context) (map[string][]apiv1.VolumeDef
 	return c.VolumeDefinitionStore.ListAll(ctx) //nolint:wrapcheck // test helper
 }
 
-// countingReplicaReads records which replica read answered the listing, so a
-// narrowed `resource list` can be told apart from one that read every replica
-// in the cluster and filtered in process.
-type countingReplicaReads struct {
-	store.ResourceStore
-
-	full         atomic.Int64
-	byNode       atomic.Int64
-	byDefinition atomic.Int64
-}
-
-func (c *countingReplicaReads) List(ctx context.Context) ([]apiv1.Resource, error) {
-	c.full.Add(1)
-
-	return c.ResourceStore.List(ctx) //nolint:wrapcheck // test helper
-}
-
-func (c *countingReplicaReads) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
-	c.byNode.Add(1)
-
-	return c.ResourceStore.ListByNode(ctx, node) //nolint:wrapcheck // test helper
-}
-
-func (c *countingReplicaReads) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
-	c.byDefinition.Add(1)
-
-	return c.ResourceStore.ListByDefinition(ctx, rdName) //nolint:wrapcheck // test helper
-}
-
 type countingStore struct {
 	store.Store
 
 	vds *countingVDs
-	res *countingReplicaReads
 }
 
 func (c *countingStore) VolumeDefinitions() store.VolumeDefinitionStore { return c.vds }
-
-func (c *countingStore) Resources() store.ResourceStore { return c.res }
 
 // seedCountedCluster builds a cluster of `definitions` single-volume
 // definitions, each with one replica, behind counters on the volume reads.
@@ -107,7 +75,6 @@ func seedCountedCluster(t *testing.T, definitions int) *countingStore {
 	return &countingStore{
 		Store: backend,
 		vds:   &countingVDs{VolumeDefinitionStore: backend.VolumeDefinitions()},
-		res:   &countingReplicaReads{ResourceStore: backend.Resources()},
 	}
 }
 
@@ -180,63 +147,66 @@ func TestResourceListNarrowedDoesNotReadTheWholeCluster(t *testing.T) {
 	}
 }
 
-// The volume sizes were only the smaller of the two reads. `-n` and `-r` were
-// still answered by reading every replica in the cluster and filtering in
-// process, with the scoped reads for exactly those questions sitting unused in
-// the same file — on the command this change is named after.
-func TestResourceListNarrowedReadsTheScopedReplicaListing(t *testing.T) {
+// A narrowed listing returns every row the filter matches. The filter compares
+// case-insensitively, as LINSTOR does, while a replica's spec keeps the case its
+// writer used: an adoption run or linstor-csi can store `NODE-1` for a node the
+// operator types as `node-1`. Answering `-n` and `-r` with the scoped reads,
+// which compare the stored spelling, printed an empty table for those replicas
+// and exited zero, during the incident the narrowing is typed for.
+//
+// Both directions are held: stored in upper case and typed in lower, and the
+// mirror.
+func TestResourceListNarrowedFindsEveryStoredSpelling(t *testing.T) {
 	t.Parallel()
 
+	backend := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, rep := range []apiv1.Resource{
+		{Name: "PVC-ADOPTED", NodeName: "NODE-1"},
+		{Name: "pvc-written", NodeName: "node-2"},
+	} {
+		if err := backend.ResourceDefinitions().Create(ctx,
+			&apiv1.ResourceDefinition{Name: rep.Name}); err != nil {
+			t.Fatalf("seed definition: %v", err)
+		}
+
+		if err := backend.Resources().Create(ctx, &rep); err != nil {
+			t.Fatalf("seed replica: %v", err)
+		}
+	}
+
 	for _, tc := range []struct {
-		name   string
-		args   []string
-		scoped func(*countingReplicaReads) int64
+		name string
+		args []string
+		want string
 	}{
-		{"node", []string{"resource", "list", "-n", "node-1"}, func(c *countingReplicaReads) int64 { return c.byNode.Load() }},
-		{"definition", []string{"resource", "list", "-r", "pvc-7"}, func(c *countingReplicaReads) int64 { return c.byDefinition.Load() }},
+		{"node stored upper, typed lower", []string{"-n", "node-1"}, "PVC-ADOPTED"},
+		{"definition stored upper, typed lower", []string{"-r", "pvc-adopted"}, "PVC-ADOPTED"},
+		{"node stored lower, typed upper", []string{"-n", "NODE-2"}, "pvc-written"},
+		{"definition stored lower, typed upper", []string{"-r", "PVC-WRITTEN"}, "pvc-written"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			counted := seedCountedCluster(t, 40)
+			var out, errBuf bytes.Buffer
 
-			runCountedList(t, counted, tc.args...)
-
-			if n := counted.res.full.Load(); n != 0 {
-				t.Errorf("%d whole-cluster replica read(s) for a narrowed listing, want none", n)
+			app := &cli.App{
+				Out: &out,
+				Err: &errBuf,
+				StoreFor: func(context.Context) (store.Store, error) {
+					return backend, nil
+				},
 			}
 
-			if n := tc.scoped(counted.res); n == 0 {
-				t.Error("the narrowed listing never asked the scoped read")
+			args := append([]string{"resource", "list", "-m"}, tc.args...)
+			if got := app.Run(t.Context(), args); got != 0 {
+				t.Fatalf("%v: exit = %d (stderr: %s)", args, got, errBuf.String())
+			}
+
+			if !bytes.Contains(out.Bytes(), []byte(tc.want)) {
+				t.Errorf("%v lost the replica of %s; output = %s", args, tc.want, out.String())
 			}
 		})
-	}
-}
-
-// The filter compares case-insensitively and the scoped reads compare the
-// stored spelling, so asking only as typed would drop a replica the old
-// in-process filter found. Asking in the folded spelling too keeps the common
-// case — a filter typed in a different case than the replica was written in.
-func TestResourceListNarrowedStillFindsAReplicaTypedInAnotherCase(t *testing.T) {
-	t.Parallel()
-
-	counted := seedCountedCluster(t, 3)
-
-	var out, errBuf bytes.Buffer
-
-	app := &cli.App{
-		Out: &out,
-		Err: &errBuf,
-		StoreFor: func(context.Context) (store.Store, error) {
-			return counted, nil
-		},
-	}
-
-	if got := app.Run(t.Context(), []string{"resource", "list", "-n", "NODE-1", "-m"}); got != 0 {
-		t.Fatalf("exit = %d (stderr: %s)", got, errBuf.String())
-	}
-
-	if !bytes.Contains(out.Bytes(), []byte("pvc-0")) {
-		t.Errorf("a listing filtered as NODE-1 lost the replicas on node-1; output = %s", out.String())
 	}
 }

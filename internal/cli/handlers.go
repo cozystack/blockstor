@@ -243,73 +243,6 @@ func fetchResources(ctx context.Context, st store.Store) ([]apiv1.Resource, erro
 	return st.Resources().List(ctx) //nolint:wrapcheck // listing() adds the context
 }
 
-// fetchNarrowedResources answers `resource list` with the read its filters
-// name, instead of every replica in the cluster filtered in process.
-//
-// `-n` and `-r` are the narrowings an operator types during an incident, and
-// the scoped reads for exactly those questions exist in the store for this PR's
-// sake: node-scoped for `-n`, definition-scoped for `-r`. With both given, the
-// node read is the narrower of the two on any real cluster, and the definition
-// filter is applied to its answer. With neither, there is no narrower read than
-// the full one.
-//
-// The in-process filter still runs afterwards and keeps its case-insensitive
-// comparison. The scoped reads compare the stored spelling (see
-// store.FoldName), so each name is asked for as typed and as folded: a filter
-// typed in a different case than the replica was written with is the common
-// shape, and both spellings cover it. A replica written in a third spelling is
-// the boundary FoldName documents, and the listing inherits it.
-func fetchNarrowedResources(ctx context.Context, st store.Store, flags *flagSet) ([]apiv1.Resource, error) {
-	switch {
-	case len(flags.Nodes) > 0:
-		return unionOfScopedReads(ctx, flags.Nodes, st.Resources().ListByNode)
-	case len(flags.Resources) > 0:
-		return unionOfScopedReads(ctx, flags.Resources, st.Resources().ListByDefinition)
-	default:
-		return fetchResources(ctx, st)
-	}
-}
-
-// unionOfScopedReads runs a scoped read for each requested name, in both the
-// typed and the folded spelling, and returns every replica once.
-func unionOfScopedReads(
-	ctx context.Context, names []string,
-	read func(context.Context, string) ([]apiv1.Resource, error),
-) ([]apiv1.Resource, error) {
-	asked := make(map[string]struct{}, len(names)*2)
-	seen := map[string]struct{}{}
-
-	var out []apiv1.Resource
-
-	for _, name := range names {
-		for _, spelling := range []string{name, store.FoldName(name)} {
-			if _, dup := asked[spelling]; dup {
-				continue
-			}
-
-			asked[spelling] = struct{}{}
-
-			replicas, err := read(ctx, spelling)
-			if err != nil {
-				return nil, fmt.Errorf("scoped read for %q: %w", spelling, err)
-			}
-
-			for i := range replicas {
-				key := store.FoldName(replicas[i].Name) + "/" + store.FoldName(replicas[i].NodeName)
-				if _, dup := seen[key]; dup {
-					continue
-				}
-
-				seen[key] = struct{}{}
-
-				out = append(out, replicas[i])
-			}
-		}
-	}
-
-	return out, nil
-}
-
 func fetchDefinitions(ctx context.Context, st store.Store) ([]apiv1.ResourceDefinition, error) {
 	return st.ResourceDefinitions().List(ctx) //nolint:wrapcheck // listing() adds the context
 }
@@ -376,8 +309,18 @@ func volumeDefinitionList(ctx context.Context, run *runContext) error {
 // the percentage silently disappeared during exactly the resync an
 // operator is watching, while the design doc promised it and the
 // colour classifier went to the trouble of stripping it.
+//
+// The replicas are read whole and filtered in process, `-n` and `-r`
+// included. The filter compares the way LINSTOR does, case-insensitively,
+// and a replica's spec keeps whatever case its writer used: an adoption
+// run or linstor-csi can store `NODE-1` for a node the operator types as
+// `node-1`. The node- and definition-scoped reads compare the stored
+// spelling verbatim (see store.FoldName), so answering a narrowed listing
+// with them returned fewer rows than this filter finds, with exit status
+// zero. Narrowing the read without that loss needs the folded selectable
+// field FoldName describes; until it exists, the listing stays whole.
 func resourceList(ctx context.Context, run *runContext) error {
-	resources, err := fetchNarrowedResources(ctx, run.Store, run.Flags)
+	resources, err := fetchResources(ctx, run.Store)
 	if err != nil {
 		return fmt.Errorf("list resources: %w", err)
 	}
@@ -407,17 +350,16 @@ func resourceList(ctx context.Context, run *runContext) error {
 // being the cheaper of the two reads. Below it a listing narrowed by `-r`,
 // `-n` or `--limit` pays that many GETs; above it, one request for the lot.
 //
-// It counts the definitions the listing covers, not the definitions in the
-// cluster, and the two cases differ in whether that matters. An unnarrowed
-// listing already read every replica, so the definitions it covers are every
-// definition that has one, and a single bulk read of them is proportionate. A
-// narrowed listing reads only the replicas its filter names, through the
-// node- or definition-scoped read, so the cluster's size is genuinely not in
-// hand: learning it is another request on the command whose latency this
-// constant protects. There, a narrowing that still covers more than the cutoff
-// — `-n` on a busy node in a large cluster — takes the bulk read to render its
-// rows, and that is the trade rather than an oversight. Removing it means
-// making the per-definition read concurrent rather than sequential.
+// It counts the definitions the rendered rows cover, not the definitions in
+// the cluster. The replica read behind those rows is whole whatever the
+// filter (see resourceList), so this is the one read a narrowing makes
+// cheaper, and the choice is between two costs rather than a guess about
+// the cluster: up to the cutoff, that many sequential GETs; past it, one
+// LIST that carries every definition, those without a replica included.
+// So `-n` on a node holding more definitions than the cutoff takes the
+// LIST to render its rows. That is the trade, not an oversight, and
+// removing it means making the per-definition read concurrent rather than
+// moving this number.
 const volumeSizesBulkCutoff = 16
 
 // volumeSizesFor builds the per-volume sizes the sync-percentage column needs.
