@@ -50,16 +50,6 @@ import (
 //
 //nolint:gocritic // ctrl.Options by value mirrors ctrl.NewManager, which this wraps
 func NewManager(cfg *rest.Config, opts ctrl.Options) (ctrl.Manager, *Store, error) {
-	// The indexes below are registered before Start, and each resolves its
-	// kind's REST mapping; see ownKindsFirst for why that must not need the
-	// API server.
-	provider, err := ownKindsFirst(opts.MapperProvider)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	opts.MapperProvider = provider
-
 	mgr, err := ctrl.NewManager(cfg, opts)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "new manager")
