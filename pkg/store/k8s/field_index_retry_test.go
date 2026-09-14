@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package k8s
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+var (
+	errDiscoveryBlip    = errors.New("failed to get server groups: connection refused")
+	errIndexerConflict  = errors.New("indexer conflict")
+	errNeverRegistering = errors.New("still unreachable")
+)
+
+// flakyIndexer refuses one field once, as a discovery blip does, and refuses a
+// second indexer under a name it already holds, as an informer does.
+type flakyIndexer struct {
+	failOnce   string
+	registered map[string]int
+}
+
+func (f *flakyIndexer) IndexField(_ context.Context, obj ctrlclient.Object, field string, _ ctrlclient.IndexerFunc) error {
+	key := fmt.Sprintf("%T/%s", obj, field)
+
+	if key == f.failOnce {
+		f.failOnce = ""
+
+		return errDiscoveryBlip
+	}
+
+	if f.registered[key] > 0 {
+		return fmt.Errorf("%w: %s", errIndexerConflict, key)
+	}
+
+	f.registered[key]++
+
+	return nil
+}
+
+// A retry after a partial success must ask only for what failed. Retrying the
+// whole set asks the informer for an index it already holds, which it refuses,
+// so the construction that should have recovered spends its budget failing on
+// the part that worked.
+func TestIndexRegistrationRetriesOnlyWhatFailed(t *testing.T) {
+	t.Parallel()
+
+	indexer := &flakyIndexer{
+		failOnce:   fmt.Sprintf("%T/%s", fieldIndexes()[2].object, fieldIndexes()[2].field),
+		registered: map[string]int{},
+	}
+
+	err := registerFieldIndexesWithin(10*time.Second, indexer)
+	if err != nil {
+		t.Fatalf("registration after one blip on the third index: %v", err)
+	}
+
+	for _, index := range fieldIndexes() {
+		key := fmt.Sprintf("%T/%s", index.object, index.field)
+		if indexer.registered[key] != 1 {
+			t.Errorf("%s registered %d time(s), want 1", key, indexer.registered[key])
+		}
+	}
+}
+
+type deadIndexer struct{}
+
+func (deadIndexer) IndexField(context.Context, ctrlclient.Object, string, ctrlclient.IndexerFunc) error {
+	return errNeverRegistering
+}
+
+func TestIndexRegistrationReportsTheLastErrorWhenTheBudgetRunsOut(t *testing.T) {
+	t.Parallel()
+
+	err := registerFieldIndexesWithin(300*time.Millisecond, deadIndexer{})
+	if !errors.Is(err, errNeverRegistering) {
+		t.Fatalf("err = %v, want it to carry the registration error", err)
+	}
+}

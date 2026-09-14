@@ -20,7 +20,9 @@ package k8s
 
 import (
 	"context"
+	"reflect"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -48,19 +50,99 @@ import (
 // there is no second constructor to leave out: the store comes back from the
 // same call that built the manager, from that manager's own client and reader.
 //
+// Registering an index resolves its kind's REST mapping, which asks the API
+// server, so construction waits for one that is briefly unreachable rather
+// than failing on the first refused connection: both binaries exit when this
+// returns an error, and an API server restarting while the pod starts would
+// otherwise be a crash loop. The wait is bounded by indexRegistrationBudget,
+// which stays inside the liveness probe's window, since the health endpoint
+// only comes up once the manager starts.
+//
 //nolint:gocritic // ctrl.Options by value mirrors ctrl.NewManager, which this wraps
 func NewManager(cfg *rest.Config, opts ctrl.Options) (ctrl.Manager, *Store, error) {
-	mgr, err := ctrl.NewManager(cfg, opts)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "new manager")
-	}
-
-	err = RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer())
+	mgr, err := newIndexedManager(cfg, opts, indexRegistrationBudget)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return mgr, NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader()), nil
+}
+
+// indexRegistrationBudget is how long NewManager keeps retrying the index
+// registration before it gives up. config/manager/manager.yaml starts
+// probing liveness after 15s and restarts after three failures 20s apart.
+const indexRegistrationBudget = 60 * time.Second
+
+//nolint:gocritic // ctrl.Options by value mirrors ctrl.NewManager, which this wraps
+func newIndexedManager(cfg *rest.Config, opts ctrl.Options, budget time.Duration) (ctrl.Manager, error) {
+	mgr, err := ctrl.NewManager(cfg, opts)
+	if err != nil {
+		return nil, errors.Wrap(err, "new manager")
+	}
+
+	err = registerFieldIndexesWithin(budget, mgr.GetFieldIndexer())
+	if err != nil {
+		return nil, err
+	}
+
+	return mgr, nil
+}
+
+// registerFieldIndexesWithin registers every index, retrying the ones that
+// failed until the budget runs out. An index that registered is never asked
+// again: the informer refuses a second indexer under the same name, so
+// retrying the whole set after a partial success would fail on the part that
+// worked.
+func registerFieldIndexesWithin(budget time.Duration, indexer ctrlclient.FieldIndexer) error {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	pending := fieldIndexes()
+	delay := indexRetryFirstDelay
+
+	for {
+		var err error
+
+		pending, err = registerPending(ctx, indexer, pending)
+		if err == nil {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return errors.Wrapf(err, "gave up registering the field indexes after %s", budget)
+		case <-time.After(delay):
+		}
+
+		delay = min(delay*2, indexRetryMaxDelay)
+	}
+}
+
+const (
+	indexRetryFirstDelay = 250 * time.Millisecond
+	indexRetryMaxDelay   = 5 * time.Second
+)
+
+// registerPending registers what it can and returns what is still left, with
+// the first error it met.
+func registerPending(ctx context.Context, indexer ctrlclient.FieldIndexer, pending []fieldIndex) ([]fieldIndex, error) {
+	var (
+		left     []fieldIndex
+		firstErr error
+	)
+
+	for _, index := range pending {
+		err := indexer.IndexField(ctx, index.object, index.field, index.extract)
+		if err != nil {
+			left = append(left, index)
+
+			if firstErr == nil {
+				firstErr = errors.Wrapf(err, "index %s by %s", reflect.TypeOf(index.object).Elem().Name(), index.field)
+			}
+		}
+	}
+
+	return left, firstErr
 }
 
 // SelectorUnsupported reports whether an error means the server cannot answer
@@ -141,57 +223,63 @@ const FieldSnapshotDefinitionName = "spec.resourceDefinitionName"
 // object and filtering in process on both server binaries — the exhaustive
 // read they were written to replace, taken silently on every call.
 func RegisterFieldIndexes(ctx context.Context, indexer ctrlclient.FieldIndexer) error {
-	err := indexer.IndexField(ctx, &crdv1alpha1.Resource{}, FieldResourceNodeName,
-		func(obj ctrlclient.Object) []string {
-			res, ok := obj.(*crdv1alpha1.Resource)
-			if !ok || res.Spec.NodeName == "" {
-				return nil
-			}
+	_, err := registerPending(ctx, indexer, fieldIndexes())
 
-			return []string{res.Spec.NodeName}
-		})
-	if err != nil {
-		return errors.Wrap(err, "index Resource by "+FieldResourceNodeName)
+	return err
+}
+
+// fieldIndex is one index RegisterFieldIndexes installs.
+type fieldIndex struct {
+	object  ctrlclient.Object
+	field   string
+	extract ctrlclient.IndexerFunc
+}
+
+func fieldIndexes() []fieldIndex {
+	return []fieldIndex{
+		{
+			object: &crdv1alpha1.Resource{}, field: FieldResourceNodeName,
+			extract: func(obj ctrlclient.Object) []string {
+				res, ok := obj.(*crdv1alpha1.Resource)
+				if !ok || res.Spec.NodeName == "" {
+					return nil
+				}
+
+				return []string{res.Spec.NodeName}
+			},
+		},
+		{
+			object: &crdv1alpha1.Resource{}, field: FieldResourceDefinitionName,
+			extract: func(obj ctrlclient.Object) []string {
+				res, ok := obj.(*crdv1alpha1.Resource)
+				if !ok || res.Spec.ResourceDefinitionName == "" {
+					return nil
+				}
+
+				return []string{res.Spec.ResourceDefinitionName}
+			},
+		},
+		{
+			object: &crdv1alpha1.Snapshot{}, field: FieldSnapshotDefinitionName,
+			extract: func(obj ctrlclient.Object) []string {
+				snap, ok := obj.(*crdv1alpha1.Snapshot)
+				if !ok || snap.Spec.ResourceDefinitionName == "" {
+					return nil
+				}
+
+				return []string{snap.Spec.ResourceDefinitionName}
+			},
+		},
+		{
+			object: &crdv1alpha1.StoragePool{}, field: FieldStoragePoolNodeName,
+			extract: func(obj ctrlclient.Object) []string {
+				pool, ok := obj.(*crdv1alpha1.StoragePool)
+				if !ok || pool.Spec.NodeName == "" {
+					return nil
+				}
+
+				return []string{pool.Spec.NodeName}
+			},
+		},
 	}
-
-	err = indexer.IndexField(ctx, &crdv1alpha1.Resource{}, FieldResourceDefinitionName,
-		func(obj ctrlclient.Object) []string {
-			res, ok := obj.(*crdv1alpha1.Resource)
-			if !ok || res.Spec.ResourceDefinitionName == "" {
-				return nil
-			}
-
-			return []string{res.Spec.ResourceDefinitionName}
-		})
-	if err != nil {
-		return errors.Wrap(err, "index Resource by "+FieldResourceDefinitionName)
-	}
-
-	err = indexer.IndexField(ctx, &crdv1alpha1.Snapshot{}, FieldSnapshotDefinitionName,
-		func(obj ctrlclient.Object) []string {
-			snap, ok := obj.(*crdv1alpha1.Snapshot)
-			if !ok || snap.Spec.ResourceDefinitionName == "" {
-				return nil
-			}
-
-			return []string{snap.Spec.ResourceDefinitionName}
-		})
-	if err != nil {
-		return errors.Wrap(err, "index Snapshot by "+FieldSnapshotDefinitionName)
-	}
-
-	err = indexer.IndexField(ctx, &crdv1alpha1.StoragePool{}, FieldStoragePoolNodeName,
-		func(obj ctrlclient.Object) []string {
-			pool, ok := obj.(*crdv1alpha1.StoragePool)
-			if !ok || pool.Spec.NodeName == "" {
-				return nil
-			}
-
-			return []string{pool.Spec.NodeName}
-		})
-	if err != nil {
-		return errors.Wrap(err, "index StoragePool by "+FieldStoragePoolNodeName)
-	}
-
-	return nil
 }
