@@ -367,7 +367,7 @@ func replicasNotAcceptedForDeletion(ctx context.Context, st store.Store, rdName 
 	var stranded []string
 
 	for i := range replicas {
-		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagDelete) {
+		if replicaAcceptedForDeletion(&replicas[i]) {
 			continue
 		}
 
@@ -375,6 +375,13 @@ func replicasNotAcceptedForDeletion(ctx context.Context, st store.Store, rdName 
 	}
 
 	return stranded, nil
+}
+
+// replicaAcceptedForDeletion is the one reading of the deletion stamp, shared
+// by the rollback, which may drop a parent over a stamped replica, and the
+// replay, which may not answer 201 over one.
+func replicaAcceptedForDeletion(replica *apiv1.Resource) bool {
+	return slices.Contains(replica.Flags, apiv1.ResourceFlagDelete)
 }
 
 // rollbackFailedMessage is what the operator is told when the compensation

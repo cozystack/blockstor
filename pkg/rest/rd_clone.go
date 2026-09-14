@@ -23,6 +23,7 @@ import (
 	"maps"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/LINBIT/golinstor/client"
 	"github.com/LINBIT/golinstor/clonestatus"
@@ -404,24 +405,90 @@ func (s *Server) cloneTargetPreexists(ctx context.Context, w http.ResponseWriter
 	return true
 }
 
-// cloneLeftoverIsWhole reports whether a marker-bearing definition holds both
-// volumes and replicas, the least a replay may answer 201 over.
-func (s *Server) cloneLeftoverIsWhole(ctx context.Context, cloneName string) (bool, error) {
-	vds, err := s.Store.VolumeDefinitions().List(ctx, cloneName)
-	if err != nil {
-		return false, errors.Wrapf(err, "list the volumes of %q", cloneName)
+// cloneLeftover is what a replay found under a marker-bearing definition.
+type cloneLeftover int
+
+const (
+	// cloneLeftoverWhole holds volumes and at least one replica that is not
+	// being deleted: the least a replay may answer 201 over.
+	cloneLeftoverWhole cloneLeftover = iota
+	// cloneLeftoverTearingDown still lists replicas, but every one of them is
+	// already accepted for deletion.
+	cloneLeftoverTearingDown
+	// cloneLeftoverEmpty has neither volumes nor replicas.
+	cloneLeftoverEmpty
+	// cloneLeftoverNoVolumes has replicas and no volumes.
+	cloneLeftoverNoVolumes
+	// cloneLeftoverNoReplicas has volumes and no replica at all.
+	cloneLeftoverNoReplicas
+)
+
+// assessCloneLeftover reads a marker-bearing definition until it is whole or
+// the cache-retry budget the parent-group read carries is spent.
+//
+// Both reads are informer-cache served, and the informer that matched the
+// marker is not the one answering the replica listing, so a definition seen
+// with its replicas not yet seen is the ordinary skew that budget exists for.
+// Deciding on the first read told a complete clone to delete itself. A NotFound
+// counts as "not seen yet" for the same reason; any other read error is
+// returned at once, and the caller refuses on it.
+func (s *Server) assessCloneLeftover(ctx context.Context, cloneName string) (cloneLeftover, error) {
+	var state cloneLeftover
+
+	for attempt := range cacheRetryAttempts {
+		var err error
+
+		state, err = s.readCloneLeftover(ctx, cloneName)
+		if err != nil || state == cloneLeftoverWhole || attempt == cacheRetryAttempts-1 {
+			return state, err
+		}
+
+		select {
+		case <-ctx.Done():
+			return state, errors.Wrapf(ctx.Err(), "re-read the leftover %q", cloneName)
+		case <-time.After(cacheRetryDelay):
+		}
 	}
 
-	if len(vds) == 0 {
-		return false, nil
+	return state, nil
+}
+
+// readCloneLeftover is one read of a marker-bearing definition's volumes and
+// replicas. A replica stamped for deletion is not counted as holding the
+// clone: its satellite finalizer may keep it listed for as long as the owning
+// node is down, and a replay answered 201 over it binds a volume to a clone
+// that is going away.
+func (s *Server) readCloneLeftover(ctx context.Context, cloneName string) (cloneLeftover, error) {
+	vds, err := s.Store.VolumeDefinitions().List(ctx, cloneName)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return cloneLeftoverEmpty, errors.Wrapf(err, "list the volumes of %q", cloneName)
 	}
 
 	replicas, err := s.Store.Resources().ListByDefinition(ctx, cloneName)
-	if err != nil {
-		return false, errors.Wrapf(err, "list the replicas of %q", cloneName)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return cloneLeftoverEmpty, errors.Wrapf(err, "list the replicas of %q", cloneName)
 	}
 
-	return len(replicas) > 0, nil
+	live := 0
+
+	for i := range replicas {
+		if !replicaAcceptedForDeletion(&replicas[i]) {
+			live++
+		}
+	}
+
+	switch {
+	case len(vds) > 0 && live > 0:
+		return cloneLeftoverWhole, nil
+	case len(replicas) > 0 && live == 0:
+		return cloneLeftoverTearingDown, nil
+	case len(vds) == 0 && len(replicas) == 0:
+		return cloneLeftoverEmpty, nil
+	case len(vds) == 0:
+		return cloneLeftoverNoVolumes, nil
+	default:
+		return cloneLeftoverNoReplicas, nil
+	}
 }
 
 // cloneShellParentRGSurvived is the vol-less half of the same guard.
@@ -503,10 +570,11 @@ func (s *Server) cloneShellParentRGSurvived(
 // The advice in the 500 never reaches a human, because the machine turns the
 // failure into a success first.
 //
-// So a leftover whose parent group no longer resolves is not a replay. An
-// inconclusive read is treated as resolving, for the reason the post-write
-// check treats it that way: a blip in a safety net must not turn a legitimate
-// idempotent replay into a refusal.
+// So a replay is answered 201 only over a leftover that is whole and whose
+// parent group still resolves. An inconclusive read of either refuses: unlike
+// the post-write check, which guards a clone this request has just made, this
+// gate would otherwise report a clone nobody verified, and the CSI retry makes
+// a refusal cheap.
 func (s *Server) cloneLeftoverIsUsable(
 	ctx context.Context, w http.ResponseWriter, srcName, cloneName, stampedRG string,
 ) bool {
@@ -515,17 +583,22 @@ func (s *Server) cloneLeftoverIsUsable(
 	// this guard's corrections tell the operator to re-create the group —
 	// so the moment they do, a group-only gate answers 201 for a clone that
 	// exists on no node. The leftover has to be whole.
-	whole, err := s.cloneLeftoverIsWhole(ctx, cloneName)
-	if err != nil || !whole {
-		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
+	state, err := s.assessCloneLeftover(ctx, cloneName)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
-			Message: "clone target '" + cloneName + "' exists but is not a whole clone",
-			Cause: "the definition under that name carries this clone's marker but no " +
-				"volumes or no replicas, which is what a rollback that could not finish " +
-				"leaves behind; answering this retry as an idempotent replay would bind a " +
-				"volume to a clone that exists on no node",
-			Correc: "delete '" + cloneName + "' by hand, then clone again",
+			Message: "clone target '" + cloneName + "' exists, but reading it back failed: " + err.Error(),
+			Cause: "without its volumes and replicas the replay cannot tell a finished clone " +
+				"from an unfinished one, and answering 201 over the second binds a volume to " +
+				"a clone that may exist on no node",
+			Correc: "retry the clone",
 		})
+
+		return false
+	}
+
+	if state != cloneLeftoverWhole {
+		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, cloneLeftoverRefusal(cloneName, state))
 
 		return false
 	}
@@ -555,6 +628,49 @@ func (s *Server) cloneLeftoverIsUsable(
 	})
 
 	return false
+}
+
+// cloneLeftoverRefusal words the refusal for a leftover that is not whole,
+// naming what is missing.
+//
+// None of these states proves the attempt behind it is dead. The marker lands
+// before the volumes and the volumes before the replicas, so a first attempt
+// still running looks exactly like an attempt that stopped, and the correction
+// has to hold for both: an operator reading "delete it" must not be pointed at
+// a clone that is about to finish.
+func cloneLeftoverRefusal(cloneName string, state cloneLeftover) *apiv1.APICallRc {
+	const replayWouldLie = "; answering this retry as an idempotent replay would bind a volume " +
+		"to a clone that exists on no node"
+
+	correcIfStopped := "if no clone under that name is still running, delete '" + cloneName +
+		"' by hand, then clone again"
+
+	refusal := &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone target '" + cloneName + "' exists but is not a whole clone",
+		Correc:  correcIfStopped,
+	}
+
+	switch state {
+	case cloneLeftoverTearingDown:
+		refusal.Message = "clone target '" + cloneName + "' exists but is still being torn down"
+		refusal.Cause = "the definition under that name carries this clone's marker, and every " +
+			"replica of it is already accepted for deletion" + replayWouldLie
+		refusal.Correc = "wait until the replicas of '" + cloneName + "' are gone, then clone again"
+	case cloneLeftoverEmpty:
+		refusal.Cause = "the definition under that name carries this clone's marker but has no " +
+			"volumes and no replicas: an attempt at this clone stopped before creating any " +
+			"volume, or has not reached that step yet" + replayWouldLie
+	case cloneLeftoverNoVolumes:
+		refusal.Cause = "the definition under that name carries this clone's marker and has " +
+			"replicas but no volumes" + replayWouldLie
+	case cloneLeftoverNoReplicas, cloneLeftoverWhole:
+		refusal.Cause = "the definition under that name carries this clone's marker and has " +
+			"volumes but no replicas: an attempt at this clone has not placed any yet, or a " +
+			"rollback removed them and could not remove the definition" + replayWouldLie
+	}
+
+	return refusal
 }
 
 // ensureCloneSnapshot takes (or reuses) the internal snapshot backing
