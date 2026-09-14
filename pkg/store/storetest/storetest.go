@@ -734,6 +734,14 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Run("ReferencesOnNodeUnderAnotherSpelling", func(t *testing.T) {
 		testReferencesOnNodeUnderAnotherSpelling(t, newStore)
 	})
+	// The other direction: the operator types the canonical lowercase name
+	// and the node, with its replicas and pools, was registered in upper
+	// case, which is how adoption from LINSTOR writes it. Asking in the
+	// typed and the folded spelling is one spelling here, and it found
+	// nothing.
+	t.Run("ReferencesOnNodeUnderTheRegisteredSpelling", func(t *testing.T) {
+		testReferencesOnNodeUnderTheRegisteredSpelling(t, newStore)
+	})
 	t.Run("DeleteRemoves", func(t *testing.T) {
 		s := newStore(t).Resources()
 		ctx := t.Context()
@@ -2120,6 +2128,57 @@ func testVolumeDefinitionListFolds(t *testing.T, newStore Factory) {
 
 	if len(got) != 1 {
 		t.Errorf("List under another spelling returned %d volume(s), want 1", len(got))
+	}
+}
+
+func testReferencesOnNodeUnderTheRegisteredSpelling(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.Nodes().Create(ctx, &apiv1.Node{Name: "NODE-REG", Type: "SATELLITE"}); err != nil {
+		t.Fatalf("Create node: %v", err)
+	}
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-reg", NodeName: "NODE-REG"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	if err := s.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool-reg", NodeName: "NODE-REG", ProviderKind: apiv1.StoragePoolKindFile,
+	}); err != nil {
+		t.Fatalf("Create pool: %v", err)
+	}
+
+	replicas, pools, err := store.ReferencesOnNode(ctx, s, "node-reg")
+	if err != nil {
+		t.Fatalf("ReferencesOnNode: %v", err)
+	}
+
+	if len(replicas) != 1 || len(pools) != 1 {
+		t.Errorf("ReferencesOnNode typed lowercase found %d replica(s) and %d pool(s), want 1 "+
+			"and 1: the refusal would pass and the node would go with both on it",
+			len(replicas), len(pools))
+	}
+
+	if err := store.CascadeOrphansForLostNode(ctx, s, "node-reg"); err != nil {
+		t.Fatalf("CascadeOrphansForLostNode: %v", err)
+	}
+
+	left, err := s.Resources().ListByNode(ctx, "NODE-REG")
+	if err != nil {
+		t.Fatalf("ListByNode replicas: %v", err)
+	}
+
+	leftPools, err := s.StoragePools().ListByNode(ctx, "NODE-REG")
+	if err != nil {
+		t.Fatalf("ListByNode pools: %v", err)
+	}
+
+	if len(left) != 0 || len(leftPools) != 0 {
+		t.Errorf("the lost-node cascade typed lowercase left %d replica(s) and %d pool(s) "+
+			"pointing at the node", len(left), len(leftPools))
 	}
 }
 

@@ -167,7 +167,9 @@ func cascadeNodeObjects(ctx context.Context, run *runContext, name string) error
 // resourcesInUseOn names the replicas a consumer currently holds
 // Primary on the node, sorted so the message is stable.
 func resourcesInUseOn(ctx context.Context, run *runContext, name string) ([]string, error) {
-	resources, err := run.Store.Resources().ListByNode(ctx, name)
+	// The evacuate refusal is a node-fate gate like node delete's, so it
+	// asks in every spelling the node's replicas can carry.
+	resources, err := store.ReplicasOnNode(ctx, run.Store, name)
 	if err != nil {
 		return nil, fmt.Errorf("list replicas on %s: %w", name, err)
 	}

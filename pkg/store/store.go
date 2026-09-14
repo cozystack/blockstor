@@ -308,8 +308,11 @@ type ResourceStore interface {
 // cascade are both node-scoped reads on `spec.nodeName`, while Nodes().Get and
 // Delete fold: spell the node in a case its replicas were not written with and
 // the reads see nothing, the refusal passes, and the node goes with replicas
-// still pointing at it. Not introduced here — the comparison was verbatim at
-// the merge base too — but these reads are the whole gate now.
+// still pointing at it. ReplicasOnNode narrows that to one shape by asking in
+// the caller's spelling, the folded one and the node's registered one; a
+// replica written under any other case is still missed. `resource list` does
+// not narrow its read at all for this reason, and filters the whole listing
+// with the case-insensitive comparison instead.
 //
 // Folding on the write side instead would fold what clients read back:
 // crdToWireResource reports these spec values as the object's names, and
