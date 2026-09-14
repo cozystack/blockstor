@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -79,6 +80,66 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 // parent must not be dropped over.
 var errReplicasNotStamped = errors.New("replica(s) were not accepted for deletion")
 
+// errSnapshotsOnTarget refuses to drop a definition that carries snapshots,
+// the refusal handleRDDelete makes before the sweep it shares with this path.
+var errSnapshotsOnTarget = errors.New("snapshot(s) exist on the definition")
+
+// rollbackStep names where the compensation stopped, because the operator is
+// pointed at a different object in each case: a replica that would not go, a
+// read that could not confirm, a snapshot that is somebody's data, or a
+// definition whose own delete failed after everything under it went.
+type rollbackStep int
+
+const (
+	rollbackStepReapReplicas rollbackStep = iota
+	rollbackStepRereadReplicas
+	rollbackStepSnapshots
+	rollbackStepDeleteDefinition
+)
+
+type rollbackStepError struct {
+	step rollbackStep
+	err  error
+}
+
+func (f *rollbackStepError) Error() string { return f.err.Error() }
+
+func (f *rollbackStepError) Unwrap() error { return f.err }
+
+func newRollbackError(step rollbackStep, err error) error {
+	return &rollbackStepError{step: step, err: err}
+}
+
+// rollbackFailureAdvice is the Cause and Correc for a failed compensation,
+// written for the step that failed rather than once for all of them.
+func rollbackFailureAdvice(err error, rdName string) (string, string) {
+	var failure *rollbackStepError
+	if !errors.As(err, &failure) {
+		return "the compensation could not complete", "delete '" + rdName + "' by hand"
+	}
+
+	switch failure.step {
+	case rollbackStepRereadReplicas:
+		return "the replicas were told to go, but reading them back to confirm failed, " +
+				"so the definition was left in place rather than dropped over replicas " +
+				"nobody could see",
+			"check the replicas of '" + rdName + "', then delete it by hand"
+	case rollbackStepSnapshots:
+		return "a snapshot exists on the definition, and the rollback does not destroy " +
+				"a snapshot the way `rd d` refuses to",
+			"delete the snapshot(s) of '" + rdName + "' if they are not needed, then delete '" +
+				rdName + "' by hand"
+	case rollbackStepDeleteDefinition:
+		return "every replica went, but deleting the definition itself failed",
+			"delete '" + rdName + "' by hand"
+	case rollbackStepReapReplicas:
+	}
+
+	return "the replicas could not all be reaped, so the definition was left in place " +
+			"rather than orphaning them",
+		"delete '" + rdName + "' by hand once the replicas can be removed"
+}
+
 // rollBackMaterialisedRD undoes a clone or restore whose parent group was
 // deleted underneath it.
 //
@@ -109,24 +170,61 @@ var errReplicasNotStamped = errors.New("replica(s) were not accepted for deletio
 // So this returns an error, and a caller that gets one must not report a
 // rollback. What is left behind is a definition parented to a group that is
 // gone, which is the state the operator has to be told about, with its name.
-func (s *Server) rollBackMaterialisedRD(ctx context.Context, rdName string) error {
+func (s *Server) rollBackMaterialisedRD(ctx context.Context, rdName string, placed []string) error {
+	// The replicas this request placed are deleted by name first. A write goes
+	// to the API server whatever the cache has seen, so this is the one step
+	// that does not depend on a listing having caught up with the placement
+	// that happened a moment ago. Without it, a cache that has not yet seen
+	// the stamps lists nothing, the cascade deletes nothing, the check below
+	// finds nothing stranded, and the definition goes over live replicas that
+	// will never be stamped — the orphan this rollback exists to prevent.
+	for _, node := range placed {
+		err := s.Store.Resources().Delete(ctx, rdName, node)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return newRollbackError(rollbackStepReapReplicas,
+				errors.Wrapf(err, "delete the replica of %q on %q", rdName, node))
+		}
+	}
+
+	// And the cascade for anything else under the definition: an
+	// auto-tiebreaker the controller stamped in the meantime is not in
+	// `placed`.
 	err := store.CascadeDeleteResources(ctx, s.Store, rdName)
 	if err != nil {
-		return errors.Wrapf(err, "cascade the replicas of %q", rdName)
+		return newRollbackError(rollbackStepReapReplicas,
+			errors.Wrapf(err, "cascade the replicas of %q", rdName))
 	}
 
-	stranded, err := replicasNotAcceptedForDeletion(ctx, s.Store, rdName)
+	err = s.waitForReplicasAcceptedForDeletion(ctx, rdName)
 	if err != nil {
-		return errors.Wrapf(err, "re-read the replicas of %q", rdName)
+		return err
 	}
 
-	if len(stranded) > 0 {
-		return fmt.Errorf("%q: %w: %s", rdName, errReplicasNotStamped, strings.Join(stranded, ", "))
+	// The same refusal handleRDDelete makes before its sweep. The sweep
+	// deletes every Snapshot row under the definition, which is safe there
+	// only because the handler refuses outright when snapshots exist, so
+	// the sweep can only ever see rows that raced in. A snapshot taken on the
+	// target inside the rollback window is somebody's data, not a race.
+	snaps, err := s.Store.Snapshots().ListByDefinition(ctx, rdName)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return newRollbackError(rollbackStepSnapshots,
+			errors.Wrapf(err, "list the snapshots of %q", rdName))
+	}
+
+	if len(snaps) > 0 {
+		names := make([]string, 0, len(snaps))
+		for i := range snaps {
+			names = append(names, snaps[i].Name)
+		}
+
+		return newRollbackError(rollbackStepSnapshots,
+			fmt.Errorf("%q: %w: %s", rdName, errSnapshotsOnTarget, strings.Join(names, ", ")))
 	}
 
 	err = s.Store.ResourceDefinitions().Delete(ctx, rdName)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return errors.Wrapf(err, "delete %q", rdName)
+		return newRollbackError(rollbackStepDeleteDefinition,
+			errors.Wrapf(err, "delete %q", rdName))
 	}
 
 	// The same two companions handleRDDelete runs after its own delete, for
@@ -138,12 +236,51 @@ func (s *Server) rollBackMaterialisedRD(ctx context.Context, rdName string) erro
 	// a definition that is genuinely gone — the same false success as
 	// answering over a leftover, by a different route.
 	//
-	// The sweep, because a snapshot create can land between the walk and the
-	// delete, and the row it leaves has no parent to address it.
+	// The sweep, because a snapshot create can land between the refusal above
+	// and the delete, and the row it leaves has no parent to address it.
 	s.waitForRDDeletionVisible(ctx, rdName)
 	s.sweepOrphanSnapshotsAfterRDDelete(ctx, rdName)
 
 	return nil
+}
+
+// waitForReplicasAcceptedForDeletion decides whether any replica is stranded
+// on a read that has had time to see the deletes this request just issued.
+//
+// One read is wrong in both directions at the exact moment it would run. The
+// resources listing is informer-cache backed and the cascade sleeps nowhere
+// across its passes, so the read outruns the cache by construction: a replica
+// that was deleted still lists, unstamped, and the rollback refuses over
+// replicas that are going, leaving the definition parented to a group that is
+// gone with nothing to retry it. So the decision waits, on the same budget the
+// RD delete's convergence wait uses, and only a replica still unstamped when
+// that budget runs out counts as stranded.
+func (s *Server) waitForReplicasAcceptedForDeletion(ctx context.Context, rdName string) error {
+	deadline := time.Now().Add(cacheConvergeBudget)
+
+	for {
+		stranded, err := replicasNotAcceptedForDeletion(ctx, s.Store, rdName)
+		if err != nil {
+			return newRollbackError(rollbackStepRereadReplicas,
+				errors.Wrapf(err, "re-read the replicas of %q", rdName))
+		}
+
+		if len(stranded) == 0 {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return newRollbackError(rollbackStepReapReplicas,
+				fmt.Errorf("%q: %w: %s", rdName, errReplicasNotStamped, strings.Join(stranded, ", ")))
+		}
+
+		select {
+		case <-ctx.Done():
+			return newRollbackError(rollbackStepRereadReplicas,
+				errors.Wrapf(ctx.Err(), "wait for the replicas of %q", rdName))
+		case <-time.After(cacheConvergePollInterval):
+		}
+	}
 }
 
 // replicasNotAcceptedForDeletion names the replicas that are still there and

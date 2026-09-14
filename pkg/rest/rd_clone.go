@@ -26,6 +26,7 @@ import (
 
 	"github.com/LINBIT/golinstor/client"
 	"github.com/LINBIT/golinstor/clonestatus"
+	"github.com/cockroachdb/errors"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -231,7 +232,7 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 	// operation with no follow-up autoplace, so the clone replicas must
 	// materialise on the snapshot-holding nodes in the source pool here
 	// (same backend by construction — Bug 038).
-	_, stampedRG, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true)
+	_, stampedRG, placed, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true)
 	if err != nil {
 		writeCloneRefused(w, http.StatusInternalServerError, src.Name, req.Name, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
@@ -241,7 +242,7 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	uncheckedRG, ok := s.cloneParentRGSurvived(ctx, w, src, req.Name, stampedRG)
+	uncheckedRG, ok := s.cloneParentRGSurvived(ctx, w, src, req.Name, stampedRG, placed)
 	if !ok {
 		return
 	}
@@ -291,7 +292,7 @@ func writeCloneStarted(w http.ResponseWriter, srcName, cloneName, message string
 // been rolled back and a refusal written.
 func (s *Server) cloneParentRGSurvived(
 	ctx context.Context, w http.ResponseWriter,
-	src *apiv1.ResourceDefinition, cloneName, stampedRG string,
+	src *apiv1.ResourceDefinition, cloneName, stampedRG string, placed []string,
 ) (*apiv1.APICallRc, bool) {
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
@@ -320,15 +321,16 @@ func (s *Server) cloneParentRGSurvived(
 		return nil, true
 	}
 
-	rollbackErr := s.rollBackMaterialisedRD(ctx, cloneName)
+	rollbackErr := s.rollBackMaterialisedRD(ctx, cloneName, placed)
 	if rollbackErr != nil {
+		cause, correc := rollbackFailureAdvice(rollbackErr, cloneName)
+
 		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
 			Message: "clone of resource definition '" + src.Name + "': " +
 				rollbackFailedMessage(cloneName, stampedRG, rollbackErr),
-			Cause: "the replicas could not all be reaped, so the definition was left in " +
-				"place rather than orphaning them",
-			Correc: "delete '" + cloneName + "' by hand once the replicas can be removed",
+			Cause:  cause,
+			Correc: correc,
 		})
 
 		return nil, false
@@ -402,6 +404,26 @@ func (s *Server) cloneTargetPreexists(ctx context.Context, w http.ResponseWriter
 	return true
 }
 
+// cloneLeftoverIsWhole reports whether a marker-bearing definition holds both
+// volumes and replicas, the least a replay may answer 201 over.
+func (s *Server) cloneLeftoverIsWhole(ctx context.Context, cloneName string) (bool, error) {
+	vds, err := s.Store.VolumeDefinitions().List(ctx, cloneName)
+	if err != nil {
+		return false, errors.Wrapf(err, "list the volumes of %q", cloneName)
+	}
+
+	if len(vds) == 0 {
+		return false, nil
+	}
+
+	replicas, err := s.Store.Resources().ListByDefinition(ctx, cloneName)
+	if err != nil {
+		return false, errors.Wrapf(err, "list the replicas of %q", cloneName)
+	}
+
+	return len(replicas) > 0, nil
+}
+
 // cloneShellParentRGSurvived is the vol-less half of the same guard.
 //
 // handleRDClone splits on the source's volume count. The branch above copies a
@@ -437,7 +459,23 @@ func (s *Server) cloneShellParentRGSurvived(
 		return true
 	}
 
-	_ = s.Store.ResourceDefinitions().Delete(ctx, cloneName)
+	// Checked, unlike refuseRDCreateOnRGDeletedRace: the 404 below tells the
+	// caller the clone was rolled back, and a delete that failed leaves the
+	// shell exactly where it was, parented to a group that is gone. The data
+	// path refuses to make that claim over a failed compensation, and the two
+	// halves of one guard should not answer the same question differently.
+	err = s.Store.ResourceDefinitions().Delete(ctx, cloneName)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + srcName + "': " +
+				rollbackFailedMessage(cloneName, stampedRG, err),
+			Cause:  "the parent group is gone and deleting the cloned shell failed",
+			Correc: "delete '" + cloneName + "' by hand",
+		})
+
+		return false
+	}
 
 	writeCloneRefused(w, http.StatusNotFound, srcName, cloneName, &apiv1.APICallRc{
 		RetCode: apiCallRcError,
@@ -472,12 +510,35 @@ func (s *Server) cloneShellParentRGSurvived(
 func (s *Server) cloneLeftoverIsUsable(
 	ctx context.Context, w http.ResponseWriter, srcName, cloneName, stampedRG string,
 ) bool {
+	// The group resolving is not enough on its own. A failed rollback may
+	// have reaped every replica and still kept the definition, and both of
+	// this guard's corrections tell the operator to re-create the group —
+	// so the moment they do, a group-only gate answers 201 for a clone that
+	// exists on no node. The leftover has to be whole.
+	whole, err := s.cloneLeftoverIsWhole(ctx, cloneName)
+	if err != nil || !whole {
+		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone target '" + cloneName + "' exists but is not a whole clone",
+			Cause: "the definition under that name carries this clone's marker but no " +
+				"volumes or no replicas, which is what a rollback that could not finish " +
+				"leaves behind; answering this retry as an idempotent replay would bind a " +
+				"volume to a clone that exists on no node",
+			Correc: "delete '" + cloneName + "' by hand, then clone again",
+		})
+
+		return false
+	}
+
 	if stampedRG == "" {
 		return true
 	}
 
+	// An unreadable group is refused rather than waved through. Refusing
+	// costs nothing here, since the CSI retry is self-healing, while a false
+	// 201 binds a PV to a definition parented to nothing.
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
-	if err != nil || survived {
+	if err == nil && survived {
 		return true
 	}
 

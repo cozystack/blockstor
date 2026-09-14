@@ -315,7 +315,7 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// target is left an empty shell for the operator / linstor-csi to
 	// place (restore-then-scale-out); an explicit node list is still
 	// stamped verbatim inside materializeRestoredRD.
-	newRDName, stampedRG, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false)
+	newRDName, stampedRG, placed, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -325,7 +325,7 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// The group validated is the one that was WRITTEN, not the source's read
 	// back a second time: re-reading answers a different question, and the
 	// extra read was itself a way to fail a restore that had already worked.
-	uncheckedRG, ok := s.restoreParentRGSurvived(r.Context(), w, newRDName, stampedRG)
+	uncheckedRG, ok := s.restoreParentRGSurvived(r.Context(), w, newRDName, stampedRG, placed)
 	if !ok {
 		return
 	}
@@ -414,7 +414,7 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 // so a `rg d` landing while it materialises leaves it parented to a group that
 // is gone. False means the restore has been rolled back and a refusal written.
 func (s *Server) restoreParentRGSurvived(
-	ctx context.Context, w http.ResponseWriter, newRDName, stampedRG string,
+	ctx context.Context, w http.ResponseWriter, newRDName, stampedRG string, placed []string,
 ) (*apiv1.APICallRc, bool) {
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
@@ -455,15 +455,16 @@ func (s *Server) restoreParentRGSurvived(
 		return nil, true
 	}
 
-	rollbackErr := s.rollBackMaterialisedRD(ctx, newRDName)
+	rollbackErr := s.rollBackMaterialisedRD(ctx, newRDName, placed)
 	if rollbackErr != nil {
+		cause, correc := rollbackFailureAdvice(rollbackErr, newRDName)
+
 		writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
 			RetCode: apiCallRcError,
 			Message: "snapshot restore: " +
 				rollbackFailedMessage(newRDName, stampedRG, rollbackErr),
-			Cause: "the replicas could not all be reaped, so the definition was left in " +
-				"place rather than orphaning them",
-			Correc: "delete '" + newRDName + "' by hand once the replicas can be removed",
+			Cause:  cause,
+			Correc: correc,
 		}})
 
 		return nil, false
@@ -509,10 +510,10 @@ func (s *Server) restoreParentRGSurvived(
 // eagerPlace.
 //
 //nolint:nonamedreturns // the second result needs a name to be readable at the call sites
-func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) (name, stampedRG string, err error) {
+func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) (name, stampedRG string, placed []string, err error) {
 	srcRDObj, err := s.Store.ResourceDefinitions().Get(ctx, srcRD)
 	if err != nil {
-		return "", "", err //nolint:wrapcheck // surfaced via writeStoreError
+		return "", "", nil, err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
 	newRD := apiv1.ResourceDefinition{
@@ -548,12 +549,12 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 
 	err = s.Store.ResourceDefinitions().Create(ctx, &newRD)
 	if err != nil {
-		return "", "", err //nolint:wrapcheck // surfaced via writeStoreError
+		return "", "", nil, err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
 	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 
 	// Bug 354: stamp per-node Resource CRDs so satellites have something
@@ -562,12 +563,12 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// observed a Resource for the new RD, so the BlockstorRestoreFromSnapshot
 	// prop marker on the RD was dead code and the restored RD stayed an
 	// empty shell. Mirrors upstream CtrlSnapshotRestoreApiCallHandler.
-	err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap, eagerPlace)
+	placed, err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap, eagerPlace)
 	if err != nil {
-		return "", "", err
+		return "", "", placed, err
 	}
 
-	return newRD.Name, newRD.ResourceGroupName, nil
+	return newRD.Name, newRD.ResourceGroupName, placed, nil
 }
 
 // placeRestoredResources stamps the Resource CRDs that materialise the
@@ -600,7 +601,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 //
 // The Nodes / NodeNames request fields are aliased — callers may use
 // either; we normalise to one canonical list before iterating.
-func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) error {
+func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) ([]string, error) {
 	nodes := canonicalRestoreNodeList(req)
 
 	if len(nodes) == 0 {
@@ -614,7 +615,7 @@ func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, n
 			// snap keeps the signature uniform with the eager branch.
 			_ = snap
 
-			return nil
+			return nil, nil
 		}
 
 		// Clone path (eager): stamp one replica on every snapshot node
@@ -650,10 +651,11 @@ func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, n
 // pool — pool names are cluster-wide in LINSTOR, so the fallback only
 // matters when the source replica on that node is already gone).
 // Idempotent on duplicates in the list (one Create per unique node).
-func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, newRDName string, nodes []string) error {
+func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, newRDName string, nodes []string) ([]string, error) {
 	poolByNode, fallbackPool := storPoolsByNodeFromSourceRD(ctx, s.Store, srcRDName)
 
 	seen := make(map[string]struct{}, len(nodes))
+	placed := make([]string, 0, len(nodes))
 
 	for _, node := range nodes {
 		if node == "" {
@@ -682,11 +684,13 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 
 		err := s.Store.Resources().Create(ctx, &res)
 		if err != nil {
-			return err //nolint:wrapcheck // surfaced via writeStoreError
+			return placed, err //nolint:wrapcheck // surfaced via writeStoreError
 		}
+
+		placed = append(placed, node)
 	}
 
-	return nil
+	return placed, nil
 }
 
 // canonicalRestoreNodeList collapses the request's two node-list
