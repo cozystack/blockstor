@@ -3,12 +3,15 @@
 package rest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -348,6 +351,216 @@ func TestRDCloneRollbackReapsAReplicaThatLandsDuringTheWait(t *testing.T) {
 
 	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-witness"); err == nil {
 		t.Error("the definition survived a rollback that could have finished")
+	}
+}
+
+var errVolumeCreateFailed = errors.New("probe: volume create failed")
+
+// failingTargetVolumeCreates fails hydration of one definition, the failure
+// after the marker-bearing definition already exists.
+type failingTargetVolumeCreates struct {
+	store.VolumeDefinitionStore
+
+	target string
+}
+
+func (f failingTargetVolumeCreates) Create(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error {
+	if rdName == f.target {
+		return errVolumeCreateFailed
+	}
+
+	return errors.Wrap(f.VolumeDefinitionStore.Create(ctx, rdName, vd), "create through the failing double")
+}
+
+type failingTargetVolumeCreateStore struct {
+	store.Store
+
+	target string
+}
+
+func (f failingTargetVolumeCreateStore) VolumeDefinitions() store.VolumeDefinitionStore {
+	return failingTargetVolumeCreates{VolumeDefinitionStore: f.Store.VolumeDefinitions(), target: f.target}
+}
+
+// The marker is stamped at RD-create and the error branch wrote a 500 without
+// undoing anything, so every retry matched the marker, failed wholeness and was
+// told to delete by hand a definition that was provably this clone's own debris.
+func TestRDCloneRollsBackItsOwnPartialWorkWhenHydrationFails(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, backend, "src-hydrate")
+
+	base, stop := startServerWithStore(t, failingTargetVolumeCreateStore{Store: backend, target: "dst-hydrate"})
+	defer stop()
+
+	resp := postClone(t, base, "src-hydrate", map[string]any{"name": "dst-hydrate", "use_zfs_clone": true})
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-hydrate"); err == nil {
+		t.Error("the half-made definition was left for every retry to trip over")
+	}
+
+	if rc := decodeCloneMessage(t, resp); !strings.Contains(rc.Message, "rolled back") {
+		t.Errorf("message = %q, want it to say the partial clone was rolled back", rc.Message)
+	}
+}
+
+// blockingTargetVolumeCreates holds hydration of one definition until the
+// request's context ends, the shape of a CSI caller timing out mid-clone.
+type blockingTargetVolumeCreates struct {
+	store.VolumeDefinitionStore
+
+	target string
+}
+
+func (b blockingTargetVolumeCreates) Create(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error {
+	if rdName == b.target {
+		<-ctx.Done()
+
+		return errors.Wrap(ctx.Err(), "hydrate through the blocking double")
+	}
+
+	return errors.Wrap(b.VolumeDefinitionStore.Create(ctx, rdName, vd), "create through the blocking double")
+}
+
+// contextHonouringRDDeletes refuses a delete on an ended context, as a real
+// API client does; the in-memory store ignores the context altogether.
+type contextHonouringRDDeletes struct {
+	store.ResourceDefinitionStore
+}
+
+func (c contextHonouringRDDeletes) Delete(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return errors.Wrap(err, "delete on an ended context")
+	}
+
+	return errors.Wrap(c.ResourceDefinitionStore.Delete(ctx, name), "delete through the context double")
+}
+
+type abandonedHydrationStore struct {
+	store.Store
+
+	target string
+}
+
+func (a abandonedHydrationStore) VolumeDefinitions() store.VolumeDefinitionStore {
+	return blockingTargetVolumeCreates{VolumeDefinitionStore: a.Store.VolumeDefinitions(), target: a.target}
+}
+
+func (a abandonedHydrationStore) ResourceDefinitions() store.ResourceDefinitionStore {
+	return contextHonouringRDDeletes{a.Store.ResourceDefinitions()}
+}
+
+// The likeliest way hydration fails is the caller going away, and a rollback on
+// the request's own context fails on its first call for the same reason.
+func TestRDCloneRollbackOfPartialWorkOutlivesTheRequest(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	seedDeployedCloneSource(t, backend, "src-abandon")
+
+	base, stop := startServerWithStore(t, abandonedHydrationStore{Store: backend, target: "dst-abandon"})
+	defer stop()
+
+	raw, err := json.Marshal(map[string]any{"name": "dst-abandon", "use_zfs_clone": true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	reqCtx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost,
+		base+"/v1/resource-definitions/src-abandon/clone", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+
+		t.Fatalf("the request finished with %d; the fixture needs it abandoned", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := backend.ResourceDefinitions().Get(t.Context(), "dst-abandon"); errors.Is(err, store.ErrNotFound) {
+			return
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	t.Error("the half-made definition outlived an abandoned request")
+}
+
+var errTargetReadBlip = errors.New("probe: transient failure reading the target")
+
+// blippingTargetRDReads fails the first read of one definition, which the
+// pre-existence check treats as absent and proceeds past.
+type blippingTargetRDReads struct {
+	store.ResourceDefinitionStore
+
+	target string
+	blips  *atomic.Int32
+}
+
+func (b blippingTargetRDReads) Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
+	if name == b.target && b.blips.Add(-1) >= 0 {
+		return apiv1.ResourceDefinition{}, errTargetReadBlip
+	}
+
+	rd, err := b.ResourceDefinitionStore.Get(ctx, name)
+
+	return rd, errors.Wrap(err, "get through the blipping double")
+}
+
+type blippingTargetRDReadStore struct {
+	store.Store
+
+	target string
+	blips  *atomic.Int32
+}
+
+func (b blippingTargetRDReadStore) ResourceDefinitions() store.ResourceDefinitionStore {
+	return blippingTargetRDReads{ResourceDefinitionStore: b.Store.ResourceDefinitions(), target: b.target, blips: b.blips}
+}
+
+// The rollback in the error branch undoes only what this request created. A
+// definition that was there before it, another attempt's still running, must
+// survive a request that failed on its create.
+func TestRDCloneFailureDoesNotRollBackADefinitionItDidNotCreate(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, backend, "src-other")
+	seedCloneLeftover(t, backend, "src-other", "dst-other", false, nil)
+
+	blips := &atomic.Int32{}
+	blips.Store(1)
+
+	base, stop := startServerWithStore(t, blippingTargetRDReadStore{Store: backend, target: "dst-other", blips: blips})
+	defer stop()
+
+	resp := postClone(t, base, "src-other", map[string]any{"name": "dst-other", "use_zfs_clone": true})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode == http.StatusCreated {
+		t.Fatalf("status = 201, but the create under an existing name cannot have succeeded")
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-other"); err != nil {
+		t.Errorf("a definition this request did not create was deleted: %v", err)
 	}
 }
 

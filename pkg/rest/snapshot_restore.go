@@ -554,7 +554,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 
 	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, &materialiseAfterCreateError{err: err}
 	}
 
 	// Bug 354: stamp per-node Resource CRDs so satellites have something
@@ -565,11 +565,23 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// empty shell. Mirrors upstream CtrlSnapshotRestoreApiCallHandler.
 	placed, err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap, eagerPlace)
 	if err != nil {
-		return "", "", placed, err
+		return "", "", placed, &materialiseAfterCreateError{err: err}
 	}
 
 	return newRD.Name, newRD.ResourceGroupName, placed, nil
 }
+
+// materialiseAfterCreateError is a materialisation that failed after this call
+// created the target definition. What stands under the name is then this
+// call's own partial work, and a caller may undo it; any other failure leaves
+// whatever was there before the call, which may be another attempt's.
+type materialiseAfterCreateError struct {
+	err error
+}
+
+func (e *materialiseAfterCreateError) Error() string { return e.err.Error() }
+
+func (e *materialiseAfterCreateError) Unwrap() error { return e.err }
 
 // placeRestoredResources stamps the Resource CRDs that materialise the
 // restored RD on the cluster. Two branches mirror upstream LINSTOR's

@@ -235,10 +235,7 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 	// (same backend by construction — Bug 038).
 	_, stampedRG, placed, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true)
 	if err != nil {
-		writeCloneRefused(w, http.StatusInternalServerError, src.Name, req.Name, &apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
-		})
+		s.writeCloneMaterialiseFailed(ctx, w, src.Name, req.Name, placed, err)
 
 		return
 	}
@@ -260,6 +257,63 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 	}
 
 	writeCloneStarted(w, src.Name, req.Name, "resource definition cloned: "+req.Name, uncheckedRG)
+}
+
+// cloneRollbackBudget bounds a rollback that runs after the request it
+// belongs to has ended.
+const cloneRollbackBudget = 30 * time.Second
+
+// writeCloneMaterialiseFailed answers a clone whose materialisation failed.
+//
+// The marker is stamped at RD-create, so a failure after the create leaves a
+// definition every retry matches and is refused over, and nothing but an
+// operator would ever remove it. When this request created that definition,
+// what stands there is its own partial work, and it is rolled back before the
+// answer goes out. A definition this request did not create is never touched:
+// it may belong to another attempt that is still running.
+//
+// The rollback does not run on the request's context. The likeliest failure
+// here is that context ending, a CSI caller timing out mid-hydration, and a
+// compensation that inherits it fails on its first call and leaves exactly
+// the debris it exists to remove.
+func (s *Server) writeCloneMaterialiseFailed(
+	ctx context.Context, w http.ResponseWriter, srcName, cloneName string, placed []string, err error,
+) {
+	message := "clone of resource definition '" + srcName + "' failed: " + err.Error()
+
+	var partial *materialiseAfterCreateError
+	if !errors.As(err, &partial) {
+		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: message,
+		})
+
+		return
+	}
+
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cloneRollbackBudget)
+	defer cancel()
+
+	rollbackErr := s.rollBackMaterialisedRD(rollbackCtx, cloneName, placed)
+	if rollbackErr != nil {
+		cause, correc := rollbackFailureAdvice(rollbackErr, cloneName)
+
+		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: message + "; rolling the partial clone back failed too: " + rollbackErr.Error() +
+				"; '" + cloneName + "' is still there",
+			Cause:  cause,
+			Correc: correc,
+		})
+
+		return
+	}
+
+	writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: message + "; the partial clone '" + cloneName + "' was rolled back",
+		Correc:  "retry the clone",
+	})
 }
 
 // correcRecreateGroupThenClone is the one wording both rollback doors on this
