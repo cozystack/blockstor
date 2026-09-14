@@ -45,8 +45,14 @@ func (s *inMemoryVolumeDefinitions) List(_ context.Context, rdName string) ([]ap
 
 	out := make([]apiv1.VolumeDefinition, 0)
 
+	// Folded, the way ListAll keys and the Kubernetes store resolves the name
+	// through the RD's folded metadata.name. Compared verbatim, a mixed-case
+	// lookup answered differently depending on which side of the CLI's
+	// bulk-read cutoff it landed on.
+	want := FoldName(rdName)
+
 	for k := range s.m {
-		if k.rd == rdName {
+		if FoldName(k.rd) == want {
 			out = append(out, s.m[k])
 		}
 	}

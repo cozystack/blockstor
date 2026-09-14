@@ -222,7 +222,7 @@ func managerStoreViolations(path string, src []byte) ([]int, error) {
 }
 
 func isStoreConstructor(call *ast.CallExpr, storeLocal string, inStorePackage bool) bool {
-	name := ""
+	var name string
 
 	switch fun := call.Fun.(type) {
 	case *ast.SelectorExpr:

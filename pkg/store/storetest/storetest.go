@@ -210,6 +210,11 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 		}
 	})
 	runVolumeDefinitionListAllCase(t, newStore)
+	// List resolves the definition the way ListAll keys it. The in-memory
+	// store compared verbatim while ListAll folded, so a mixed-case lookup
+	// answered differently depending on which side of the CLI's bulk-read
+	// cutoff it landed on.
+	t.Run("ListFoldsTheDefinitionName", func(t *testing.T) { testVolumeDefinitionListFolds(t, newStore) })
 	// BUG-048: CreateAutoNumbered allocates the smallest free hole and
 	// the allocation is atomic with the write (the REST handler routes
 	// every number-less `linstor vd c` here).
@@ -721,6 +726,14 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	// the same question — its sibling ListByDefinition has been here since
 	// the beginning and this one was covered per implementation only.
 	t.Run("ListByNode", func(t *testing.T) { testResourceListByNode(t, newStore) })
+	// The node-delete gate and its --force cascade. Nodes().Get and Delete
+	// fold the name, so the gate has to find the node's replicas under the
+	// spelling the operator used, or the refusal passes and the node goes
+	// with replicas still pointing at it. Pinned on both implementations so
+	// they cannot drift apart.
+	t.Run("ReferencesOnNodeUnderAnotherSpelling", func(t *testing.T) {
+		testReferencesOnNodeUnderAnotherSpelling(t, newStore)
+	})
 	t.Run("DeleteRemoves", func(t *testing.T) {
 		s := newStore(t).Resources()
 		ctx := t.Context()
@@ -2085,4 +2098,48 @@ func trueBool() *bool {
 	v := true
 
 	return &v
+}
+
+func testVolumeDefinitionListFolds(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	seedRD(t, s, "pvc-fold-list")
+
+	if err := s.VolumeDefinitions().Create(ctx, "pvc-fold-list",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := s.VolumeDefinitions().List(ctx, "PVC-Fold-List")
+	if err != nil {
+		t.Fatalf("List under another spelling: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Errorf("List under another spelling returned %d volume(s), want 1", len(got))
+	}
+}
+
+func testReferencesOnNodeUnderAnotherSpelling(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-ref", NodeName: "node-ref"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	replicas, _, err := store.ReferencesOnNode(ctx, s, "NODE-REF")
+	if err != nil {
+		t.Fatalf("ReferencesOnNode: %v", err)
+	}
+
+	if len(replicas) != 1 {
+		t.Errorf("ReferencesOnNode under another spelling found %d replica(s), want 1 — "+
+			"the refusal would pass and the node would go with a replica on it", len(replicas))
+	}
 }

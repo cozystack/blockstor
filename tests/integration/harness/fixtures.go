@@ -137,9 +137,10 @@ func seedStoragePool(ctx context.Context, t *testing.T, cli client.Client, node,
 		//
 		// The `blockstor.io/node-name` label mirrors what
 		// pkg/store/k8s.(*storagePools).Create stamps on every
-		// store-created pool: the store's ListByNode runs a label
-		// selector, so a fixture pool seeded without it is invisible
-		// to per-node store reads (e.g. the `n lost` SP cascade).
+		// store-created pool, so the fixture looks like a store write.
+		// Per-node store reads no longer depend on it: ListByNode
+		// selects on spec.nodeName, which a pool carries whoever
+		// wrote it.
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   pool + "." + node,
 			Labels: map[string]string{"blockstor.io/node-name": node},

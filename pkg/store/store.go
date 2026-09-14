@@ -396,6 +396,16 @@ type VolumeDefinitionStore interface {
 type SnapshotStore interface {
 	List(ctx context.Context) ([]apiv1.Snapshot, error)
 	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)
+
+	// ListByDefinitionUncached answers the same question from the API server
+	// when the store has a direct reader. It exists for `rd d`: the refusal
+	// over existing snapshots and the sweep for the one that raced the delete
+	// are both acted on at once, and the row most likely to be missing from a
+	// cache at that moment is exactly the one that raced. Every other listing
+	// stays on ListByDefinition, since the snapshot view paginates through it
+	// and an uncached read beside a cached one is the pagination regression
+	// the store's constructor records.
+	ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)
 	Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error)
 	Create(ctx context.Context, snap *apiv1.Snapshot) error
 	Update(ctx context.Context, snap *apiv1.Snapshot) error

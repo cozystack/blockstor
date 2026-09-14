@@ -48,6 +48,10 @@ const LabelSnapshotGroupID = "blockstor.io/snapshot-group-id"
 
 type snapshots struct {
 	c ctrlclient.Client
+
+	// apiReader is the manager's direct reader when the store has one. Only
+	// ListByDefinitionUncached reads through it.
+	apiReader ctrlclient.Reader
 }
 
 func snapshotCRDName(rdName, snapName string) string {
@@ -106,6 +110,29 @@ func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv
 			"resourceDefinition", rdName, "reason", err.Error())
 
 		return s.listByDefinitionExhaustively(ctx, rdName)
+	}
+
+	return s.wireSnapshots(ctx, rdName, crdList.Items)
+}
+
+// ListByDefinitionUncached reads the definition's snapshots from the API server
+// when a direct reader is wired, and through the cache otherwise. The field
+// selector travels either way: the API server answers it from the selectable
+// field the CRD declares.
+func (s *snapshots) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+	if s.apiReader == nil {
+		return s.ListByDefinition(ctx, rdName)
+	}
+
+	var crdList crdv1alpha1.SnapshotList
+
+	err := s.apiReader.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: rdName})
+	if err != nil {
+		if !SelectorUnsupported(err) {
+			return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+		}
+
+		return s.ListByDefinition(ctx, rdName)
 	}
 
 	return s.wireSnapshots(ctx, rdName, crdList.Items)

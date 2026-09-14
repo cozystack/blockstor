@@ -1365,7 +1365,11 @@ func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Reques
 // order on the K8s backend, and operators rerun `n d` to confirm
 // the refusal message after every replica drop).
 func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, error) {
-	resources, err := s.Store.Resources().List(ctx)
+	// The node-scoped read, not the whole cluster filtered here: the
+	// refusal decision already moved to it, and a message helper answering
+	// the same one-node question with a full List was the read this change
+	// exists to remove.
+	resources, err := store.ReplicasOnNode(ctx, s.Store, node)
 	if err != nil {
 		return nil, errors.Wrap(err, "list resources")
 	}
@@ -1373,9 +1377,7 @@ func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, er
 	var refs []string
 
 	for i := range resources {
-		if resources[i].NodeName == node {
-			refs = append(refs, resources[i].Name)
-		}
+		refs = append(refs, resources[i].Name)
 	}
 
 	sort.Strings(refs)

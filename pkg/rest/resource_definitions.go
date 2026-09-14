@@ -1101,7 +1101,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// stamps DeletionTimestamp on every replica, a failed RD-delete
 	// leaves the cluster half-torn-down (children gone, parent
 	// kept, snapshots orphaned) which no retry can reconcile.
-	snaps, err := s.Store.Snapshots().ListByDefinition(r.Context(), name)
+	snaps, err := s.Store.Snapshots().ListByDefinitionUncached(r.Context(), name)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeStoreError(w, err)
 
@@ -1214,7 +1214,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 // primary": there's no RD to restore (rd-d's success was a deliberate
 // caller intent), so the right action is to mop up the orphan.
 func (s *Server) sweepOrphanSnapshotsAfterRDDelete(ctx context.Context, rdName string) {
-	leftovers, err := s.Store.Snapshots().ListByDefinition(ctx, rdName)
+	leftovers, err := s.Store.Snapshots().ListByDefinitionUncached(ctx, rdName)
 	if err != nil {
 		// The sweep is best-effort, but silence here is not: the read that
 		// failed is the one that finds the orphan, so a transient failure

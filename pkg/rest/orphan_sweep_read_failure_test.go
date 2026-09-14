@@ -29,6 +29,11 @@ func (f failingSnapshotList) ListByDefinition(context.Context, string) ([]apiv1.
 	return nil, errSnapshotParentRead
 }
 
+// The sweep reads uncached, so the failure has to be on that read too.
+func (f failingSnapshotList) ListByDefinitionUncached(context.Context, string) ([]apiv1.Snapshot, error) {
+	return nil, errSnapshotParentRead
+}
+
 type failingSnapshotListStore struct {
 	store.Store
 }
