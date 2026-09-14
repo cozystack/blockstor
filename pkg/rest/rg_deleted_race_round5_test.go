@@ -217,6 +217,24 @@ func TestRDCloneRollbackRefusesOverASnapshotOnTheTarget(t *testing.T) {
 		t.Errorf("the definition was dropped over a snapshot: %v", err)
 	}
 
+	// And nothing under it was touched. The refusal's correction is to drop the
+	// snapshots and retry, which only makes sense while the replicas are still
+	// there: refusing after the reap leaves the target half torn down.
+	replicas, err := backend.Resources().ListByDefinition(ctx, "dst-snapwin")
+	if err != nil {
+		t.Fatalf("list the target's replicas: %v", err)
+	}
+
+	if len(replicas) == 0 {
+		t.Error("the replicas were reaped before the snapshot refusal fired")
+	}
+
+	for i := range replicas {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagDelete) {
+			t.Errorf("replica on %s was stamped for deletion before the refusal", replicas[i].NodeName)
+		}
+	}
+
 	if rc := decodeCloneMessage(t, resp); !strings.Contains(strings.ToLower(rc.Cause), "snapshot") {
 		t.Errorf("cause = %q, want it to point at the snapshot", rc.Cause)
 	}
