@@ -37,13 +37,45 @@ func (c *countingVDs) ListAll(ctx context.Context) (map[string][]apiv1.VolumeDef
 	return c.VolumeDefinitionStore.ListAll(ctx) //nolint:wrapcheck // test helper
 }
 
+// countingReplicaReads records which replica read answered the listing, so a
+// narrowed `resource list` can be told apart from one that read every replica
+// in the cluster and filtered in process.
+type countingReplicaReads struct {
+	store.ResourceStore
+
+	full         atomic.Int64
+	byNode       atomic.Int64
+	byDefinition atomic.Int64
+}
+
+func (c *countingReplicaReads) List(ctx context.Context) ([]apiv1.Resource, error) {
+	c.full.Add(1)
+
+	return c.ResourceStore.List(ctx) //nolint:wrapcheck // test helper
+}
+
+func (c *countingReplicaReads) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
+	c.byNode.Add(1)
+
+	return c.ResourceStore.ListByNode(ctx, node) //nolint:wrapcheck // test helper
+}
+
+func (c *countingReplicaReads) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
+	c.byDefinition.Add(1)
+
+	return c.ResourceStore.ListByDefinition(ctx, rdName) //nolint:wrapcheck // test helper
+}
+
 type countingStore struct {
 	store.Store
 
 	vds *countingVDs
+	res *countingReplicaReads
 }
 
 func (c *countingStore) VolumeDefinitions() store.VolumeDefinitionStore { return c.vds }
+
+func (c *countingStore) Resources() store.ResourceStore { return c.res }
 
 // seedCountedCluster builds a cluster of `definitions` single-volume
 // definitions, each with one replica, behind counters on the volume reads.
@@ -75,6 +107,7 @@ func seedCountedCluster(t *testing.T, definitions int) *countingStore {
 	return &countingStore{
 		Store: backend,
 		vds:   &countingVDs{VolumeDefinitionStore: backend.VolumeDefinitions()},
+		res:   &countingReplicaReads{ResourceStore: backend.Resources()},
 	}
 }
 
@@ -144,5 +177,66 @@ func TestResourceListNarrowedDoesNotReadTheWholeCluster(t *testing.T) {
 
 	if n := counted.vds.perDefinition.Load(); n != 1 {
 		t.Errorf("%d per-definition reads, want exactly 1 — the listing covers one definition", n)
+	}
+}
+
+// The volume sizes were only the smaller of the two reads. `-n` and `-r` were
+// still answered by reading every replica in the cluster and filtering in
+// process, with the scoped reads for exactly those questions sitting unused in
+// the same file — on the command this change is named after.
+func TestResourceListNarrowedReadsTheScopedReplicaListing(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		scoped func(*countingReplicaReads) int64
+	}{
+		{"node", []string{"resource", "list", "-n", "node-1"}, func(c *countingReplicaReads) int64 { return c.byNode.Load() }},
+		{"definition", []string{"resource", "list", "-r", "pvc-7"}, func(c *countingReplicaReads) int64 { return c.byDefinition.Load() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			counted := seedCountedCluster(t, 40)
+
+			runCountedList(t, counted, tc.args...)
+
+			if n := counted.res.full.Load(); n != 0 {
+				t.Errorf("%d whole-cluster replica read(s) for a narrowed listing, want none", n)
+			}
+
+			if n := tc.scoped(counted.res); n == 0 {
+				t.Error("the narrowed listing never asked the scoped read")
+			}
+		})
+	}
+}
+
+// The filter compares case-insensitively and the scoped reads compare the
+// stored spelling, so asking only as typed would drop a replica the old
+// in-process filter found. Asking in the folded spelling too keeps the common
+// case — a filter typed in a different case than the replica was written in.
+func TestResourceListNarrowedStillFindsAReplicaTypedInAnotherCase(t *testing.T) {
+	t.Parallel()
+
+	counted := seedCountedCluster(t, 3)
+
+	var out, errBuf bytes.Buffer
+
+	app := &cli.App{
+		Out: &out,
+		Err: &errBuf,
+		StoreFor: func(context.Context) (store.Store, error) {
+			return counted, nil
+		},
+	}
+
+	if got := app.Run(t.Context(), []string{"resource", "list", "-n", "NODE-1", "-m"}); got != 0 {
+		t.Fatalf("exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	if !bytes.Contains(out.Bytes(), []byte("pvc-0")) {
+		t.Errorf("a listing filtered as NODE-1 lost the replicas on node-1; output = %s", out.String())
 	}
 }
