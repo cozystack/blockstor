@@ -770,16 +770,21 @@ func (s *Server) replayOfFinishedClone(
 	// naming a resource group or a layer stack the finished clone does not
 	// have would otherwise be told the clone completed and handed the other
 	// shape — a caller who named LUKS gets plaintext. The comparison is
-	// against the leftover, never the source, so the CSI replay, which names
-	// neither, is untouched.
+	// against the leftover, never the source. linstor-csi names both fields
+	// on every clone, taken from the StorageClass, so its replay names the
+	// shape the first request stamped on the leftover and passes.
+	//
+	// It runs before anything established whether the leftover is finished,
+	// so its wording is the resume's: the leftover was started with a shape,
+	// whether or not it got further.
 	if differs := requestedShapeDiffers(&existing, req.ResourceGroup, req.LayerList); differs != "" {
 		writeCloneRefused(w, http.StatusConflict, src.Name, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
-			Message: "clone target '" + cloneName + "' was made with " + differs,
-			Cause: "the clone under that name is already finished, so the shape this request " +
-				"asks for would be validated and then ignored",
-			Correc: "retry without resource_group / layer_list, or delete '" + cloneName +
-				"' and clone again with the shape you want",
+			Message: "clone target '" + cloneName + "' was started with " + differs,
+			Cause: "a retry keeps the definition an earlier attempt created, so the shape " +
+				"this request asks for would be validated and then ignored",
+			Correc: "retry with the shape the clone was started with, or delete '" +
+				cloneName + "' and clone again",
 		})
 
 		return false, true
@@ -816,17 +821,16 @@ func (s *Server) replayOfFinishedClone(
 
 // cloneProgress is where a target carrying this clone's marker stands. The
 // replay and the status poll both ask it, and they have to get the same
-// answer: a POST told 201 followed by a GET told FAILED for the same clone,
-// one request apart, is a successful CreateVolume and a terminal failure
-// handed to the driver together.
+// answer: a POST told 201 followed by a GET that is not COMPLETE for the same
+// clone, one request apart, is a successful clone the driver then waits on.
 type cloneProgress int
 
 const (
 	// cloneUnfinished is not done and not broken: no volumes yet, a strict
-	// prefix of the snapshot's volumes, or replicas that do not yet cover the
-	// nodes placement resolved. The resume finishes it.
+	// prefix of the snapshot's volumes, or no replica holding them. The resume
+	// finishes it.
 	cloneUnfinished cloneProgress = iota
-	// cloneFinished holds every volume and every replica.
+	// cloneFinished holds every volume and at least one replica.
 	cloneFinished
 	// cloneForeign carries a volume this clone would not have written.
 	cloneForeign
@@ -836,19 +840,30 @@ const (
 // reads and never writes, so the poll can call it as freely as the replay.
 //
 // Volumes alone do not decide it. materializeRestoredRD hydrates the volumes
-// and THEN stamps the replicas, and stampRestoredResourcesOnNodes creates one
-// Resource per snapshot node and returns on the FIRST hard error with the ones
-// before it already made — so an empty shell and a half-placed clone are both
-// ordinary intermediate states, and nothing tops either up afterwards because
-// this path has no follow-up autoplace.
+// and THEN stamps the replicas, so a shell holding every volume and no replica
+// is an ordinary intermediate state, and one whose data exists nowhere but the
+// snapshot.
+//
+// Where the replicas are is not part of the question. A clone that has one
+// replica holds its data, and which nodes carry it afterwards is placement,
+// which ordinary operations change: evacuating a node moves a replica off a
+// node the snapshot recorded, and scaling down removes one. Asking whether
+// every snapshot node still carries a replica read both as unfinished, and the
+// resume then re-stamped a replica on the node the operator had just emptied,
+// restored from the point-in-time while the surviving replica had moved on
+// with live writes: two replicas of one definition with different content. A
+// clone left short of its placement by a first attempt that died between two
+// stamps is the same state seen from outside, and topping it up is the
+// placement reconciliation's job (linstor-csi runs its own right after
+// COMPLETE), not the clone's.
 //
 // Nothing here reads the live source. A finished clone is a copy of a
 // point-in-time, so it is judged against the snapshot it was restored from
 // while that exists, and against itself once it does not: an absent snapshot
-// cannot unmake a clone that has its volumes and its replicas, and re-taking
-// one to answer the question is the write a replay must not make. "Could not
-// read the snapshot" is not "the snapshot is gone", and only the second takes
-// the face-value branch.
+// cannot unmake a clone that has its volumes and a replica, and re-taking one
+// to answer the question is the write a replay must not make. "Could not read
+// the snapshot" is not "the snapshot is gone", and only the second takes the
+// face-value branch.
 func assessMarkedClone(
 	ctx context.Context, st store.Store, srcName, cloneName string,
 ) (cloneProgress, error) {
@@ -862,13 +877,11 @@ func assessMarkedClone(
 	}
 
 	snap, err := st.Snapshots().Get(ctx, srcName, cloneSnapshotName(cloneName))
-
-	snapshotGone := errors.Is(err, store.ErrNotFound)
-	if err != nil && !snapshotGone {
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return cloneUnfinished, errors.Wrapf(err, "read the snapshot behind %q", cloneName)
 	}
 
-	if !snapshotGone {
+	if err == nil {
 		switch leftoverAgainstSnapshot(&snap, targetVDs) {
 		case leftoverForeign:
 			return cloneForeign, nil
@@ -883,7 +896,7 @@ func assessMarkedClone(
 		return cloneUnfinished, errors.Wrapf(err, "list the replicas of %q", cloneName)
 	}
 
-	if len(replicas) == 0 || (!snapshotGone && !replicasCoverNodes(replicas, snap.Nodes)) {
+	if len(replicas) == 0 {
 		return cloneUnfinished, nil
 	}
 
@@ -924,24 +937,6 @@ func (s *Server) cloneLeftoverIsFinished(
 	}
 
 	return false, false
-}
-
-// replicasCoverNodes reports whether every node the snapshot recorded carries a
-// replica of the target. Case-folded, because node names reach the snapshot and
-// the Resource from different writers.
-func replicasCoverNodes(replicas []apiv1.Resource, nodes []string) bool {
-	placed := make(map[string]struct{}, len(replicas))
-	for i := range replicas {
-		placed[strings.ToLower(replicas[i].NodeName)] = struct{}{}
-	}
-
-	for _, node := range nodes {
-		if _, ok := placed[strings.ToLower(node)]; !ok {
-			return false
-		}
-	}
-
-	return true
 }
 
 // leftoverProgress is how far an earlier attempt at this clone got.
@@ -1300,46 +1295,92 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	})
 }
 
-// handleRDCloneStatus answers golinstor's `CloneStatus` poll. The
-// response is grounded in actual store state (Bug 114): we compare
-// the source RD's VolumeDefinition count to the target's. Equal
-// counts → COMPLETE (the clone is structurally consistent with the
-// source). A non-empty source paired with an empty target → FAILED,
-// so linstor-csi surfaces a concrete error rather than spinning on
-// a stale COMPLETE while the data plane never copied anything.
+// handleRDCloneStatus answers golinstor's `CloneStatus` poll, grounded
+// in actual store state (Bug 114). A target carrying this clone's marker
+// is answered by answerMarkedCloneStatus; one without it by
+// computeCloneStatus's volume-count comparison.
 //
 // Path: GET /v1/resource-definitions/{src}/clone/{target}.
-// A 404 on the target signals "clone failed mid-way" — which gives
-// linstor-csi an actionable error rather than an infinite poll loop.
-// A 404 on the source surfaces the same way: it would have been
-// caught at clone-POST time, but a delete-source race shouldn't
-// produce a phantom COMPLETE either.
+// A 404 on the target signals "no finished clone under that name",
+// which linstor-csi acts on by issuing the clone, rather than an
+// infinite poll loop.
 func (s *Server) handleRDCloneStatus(w http.ResponseWriter, r *http.Request) {
 	srcName := r.PathValue("rd")
 	targetName := r.PathValue("target")
 
-	_, err := s.Store.ResourceDefinitions().Get(r.Context(), targetName)
+	target, err := s.Store.ResourceDefinitions().Get(r.Context(), targetName)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	status := computeCloneStatus(r.Context(), s.Store, srcName, targetName)
+	if restoreMarkerMatches(target.Props, srcName, cloneSnapshotName(targetName)) {
+		answerMarkedCloneStatus(r.Context(), w, s.Store, srcName, targetName)
+
+		return
+	}
+
 	writeJSON(w, http.StatusOK, client.ResourceDefinitionCloneStatus{
-		Status: status,
+		Status: computeCloneStatus(r.Context(), s.Store, srcName, targetName),
 	})
 }
 
-// computeCloneStatus resolves COMPLETE vs FAILED for a clone pair.
+// answerMarkedCloneStatus answers the poll for a target that went through the
+// snapshot data plane. It is judged the way the replay judges it, against its
+// own point-in-time and never against the live source: comparing the live
+// source's volume count told FAILED to the poll that follows a 201 replay the
+// moment anyone added a volume to the source, which is legal and routine.
 //
-// A target from the snapshot data plane is judged by assessMarkedClone, the
-// same question the replay asks. What follows is for a target without the
-// marker, a clone made before that data plane existed, and it compares
-// source-vs-target VolumeDefinition counts. Bug 114: an
-// empty target paired with a non-empty source is structurally
-// incomplete — golinstor's poll loop must see FAILED so it stops
-// waiting on data that will never arrive.
+// Only a finished clone is answered with a status. Everything else is answered
+// in the one shape its caller can act on. linstor-csi POSTs the clone only
+// when this GET is a 404, and then polls until COMPLETE with no FAILED branch
+// and no second POST (pkg/client/linstor.go, v1.10.1), so FAILED over a
+// leftover the POST knows how to resume left the driver waiting on it forever,
+// and so did CLONING. A 404 sends it back to the POST, which resumes an
+// unfinished leftover or refuses a foreign one with a cause and a correction
+// that reach the PVC's events. A read failure is a 500 for the same reason:
+// the driver returns it from CreateVolume and retries, where FAILED would bind
+// nothing and end nothing.
+//
+// COMPLETE over a clone whose placement is short of the snapshot's nodes is
+// safe: the driver reconciles placement right after it.
+func answerMarkedCloneStatus(ctx context.Context, w http.ResponseWriter, st store.Store, srcName, targetName string) {
+	progress, err := assessMarkedClone(ctx, st, srcName, targetName)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "clone status of '" + targetName + "' from '" + srcName + "' could not be read: " + err.Error(),
+		}})
+
+		return
+	}
+
+	cause := "an earlier attempt at this clone stopped before it finished"
+
+	switch progress {
+	case cloneFinished:
+		writeJSON(w, http.StatusOK, client.ResourceDefinitionCloneStatus{Status: clonestatus.Complete})
+
+		return
+	case cloneForeign:
+		cause = "the definition under that name holds a volume this clone would not have written"
+	case cloneUnfinished:
+	}
+
+	writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailNotFoundRscDfn,
+		Message: "no finished clone '" + targetName + "' of '" + srcName + "'",
+		Cause:   cause,
+		Correc:  "issue the clone again: it resumes what the earlier attempt left, or says why it cannot",
+	}})
+}
+
+// computeCloneStatus resolves COMPLETE vs FAILED for a clone pair whose target
+// carries no marker, a clone made before the snapshot data plane existed, by
+// comparing source-vs-target VolumeDefinition counts. Bug 114: an empty target
+// paired with a non-empty source is structurally incomplete — golinstor's poll
+// loop must see FAILED so it stops waiting on data that will never arrive.
 //
 // If the source RD itself is gone (race with `rd d <src>` while the
 // poll is in flight), we cannot prove the target is consistent —
@@ -1347,24 +1388,6 @@ func (s *Server) handleRDCloneStatus(w http.ResponseWriter, r *http.Request) {
 // further validation requires the source to compare against. This
 // preserves the legacy behaviour for that edge case.
 func computeCloneStatus(ctx context.Context, st store.Store, srcName, targetName string) clonestatus.CloneStatus {
-	// A target that went through the snapshot data plane carries its marker,
-	// and is judged the way the replay judges it: against its own
-	// point-in-time, never against the live source. Comparing the live
-	// source's volume count told FAILED to the poll that follows a 201 replay
-	// the moment anyone added a volume to the source, which is legal and
-	// routine. On a read failure the answer is FAILED rather than COMPLETE:
-	// the driver retries CreateVolume, the retry is a replay, and a replay is
-	// safe, while COMPLETE binds a PV to a state nobody could read.
-	target, targetErr := st.ResourceDefinitions().Get(ctx, targetName)
-	if targetErr == nil && restoreMarkerMatches(target.Props, srcName, cloneSnapshotName(targetName)) {
-		progress, assessErr := assessMarkedClone(ctx, st, srcName, targetName)
-		if assessErr == nil && progress == cloneFinished {
-			return clonestatus.Complete
-		}
-
-		return clonestatus.Failed
-	}
-
 	srcVDs, err := st.VolumeDefinitions().List(ctx, srcName)
 	if err != nil {
 		return clonestatus.Complete

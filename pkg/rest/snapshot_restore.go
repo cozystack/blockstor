@@ -149,7 +149,7 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 		return
 	}
 
-	err = hydrateVolumesFromSnapshot(r.Context(), s, req.ToResource, &snap)
+	err = hydrateVolumesFromSnapshot(r.Context(), s, req.ToResource, &snap, false)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -567,8 +567,14 @@ func leftoverIsThisRestore(existing *apiv1.ResourceDefinition, snap *apiv1.Snaps
 // `rd modify --resource-group` on the source a permanent 409 on every later
 // retry — on the replay of a finished clone and on the resume of an unfinished
 // one alike — with a correction linstor-csi cannot act on, since it sends the
-// same body every time and names neither field. A retry that names nothing
-// resumes what the first attempt started, whatever the source has become.
+// same body every time. A retry that names nothing resumes what the first
+// attempt started, whatever the source has become, and one that names what the
+// first attempt stamped, which is what linstor-csi's does, resumes it too.
+//
+// The empty-name guard on the group is load-bearing: the leftover carries the
+// group materializeRestoredRD stamped, the source's unless the request named
+// one, so without it a request that names no group is compared as "" against
+// that group and refused.
 func requestedShapeDiffers(existing *apiv1.ResourceDefinition, rgName string, layers []string) string {
 	if rgName != "" && !strings.EqualFold(existing.ResourceGroupName, rgName) {
 		return "resource group '" + existing.ResourceGroupName + "', not '" + rgName + "'"
@@ -707,7 +713,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		}
 	}
 
-	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap)
+	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap, true)
 	if err != nil {
 		return "", err
 	}
@@ -907,7 +913,16 @@ func storPoolsByNodeFromSourceRD(ctx context.Context, st store.Store, srcRDName 
 // autoplace creates empty Resources that never reach UpToDate.
 // linstor-csi's CreateVolume-from-source path relies on this
 // hydration to surface the cloned PVC's block device.
-func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, snap *apiv1.Snapshot) error {
+//
+// ownTarget says the definition carries this restore's or clone's own marker,
+// which materializeRestoredRD has established before it calls this. Only then
+// is a volume LARGER than the snapshot recorded this operation's own: it is
+// the one an earlier attempt hydrated, expanded since like any volume.
+// leftoverAgainstSnapshot classifies that shape as the clone's own, and the
+// resume it admits ends here, so refusing it answered a bare 500 on every
+// retry. The volume-definition restore hydrates into a definition that is
+// not its own and keeps the exact comparison.
+func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, snap *apiv1.Snapshot, ownTarget bool) error {
 	for i := range snap.VolumeDefinitions {
 		svd := &snap.VolumeDefinitions[i]
 		vd := apiv1.VolumeDefinition{
@@ -949,7 +964,8 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 			return err //nolint:wrapcheck // the collision is the answer, not the read
 		}
 
-		if existing.SizeKib != svd.SizeKib {
+		grown := ownTarget && existing.SizeKib > svd.SizeKib
+		if existing.SizeKib != svd.SizeKib && !grown {
 			return err //nolint:wrapcheck // surfaced via writeStoreError
 		}
 	}

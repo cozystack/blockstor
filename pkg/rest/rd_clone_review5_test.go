@@ -97,10 +97,13 @@ func TestRDCloneReplayRefusesANamedShapeTheFinishedCloneDoesNotHave(t *testing.T
 	}
 }
 
-// stampRestoredResourcesOnNodes creates one replica per snapshot node and
-// returns on the first hard error, so 1 of N is an ordinary intermediate state.
-// One replica used to certify it finished, and nothing tops it up afterwards.
-func TestRDCloneReplayDoesNotCertifyAHalfPlacedClone(t *testing.T) {
+// Scaling a clone down is an ordinary operation, and a replay after it must not
+// undo it. Judging the clone by whether every snapshot node still carried a
+// replica read the scaled-down clone as unfinished, and the resume re-stamped
+// the removed replica from the point-in-time while the survivor had moved on.
+// Once the source had also grown, the resume refused the replay permanently,
+// with a correction that deletes a clone holding data.
+func TestRDCloneReplayLeavesAScaledDownCloneAlone(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
@@ -123,24 +126,33 @@ func TestRDCloneReplayDoesNotCertifyAHalfPlacedClone(t *testing.T) {
 		t.Fatalf("a complete clone of a two-node source placed %d replica(s), want 2", len(placed))
 	}
 
-	// Leave the clone half-placed, the way a first attempt that died between
-	// the two stamps does.
 	if err := st.Resources().Delete(ctx, "dst-half", "node-b"); err != nil {
-		t.Fatalf("drop one replica: %v", err)
+		t.Fatalf("scale the clone down: %v", err)
 	}
 
+	growSourceVolume(t, st, "src-half", 128*1024)
+
 	if code := cloneOnce(t, base, "src-half", "dst-half", nil); code != http.StatusCreated {
-		t.Fatalf("retry = %d, want 201", code)
+		t.Fatalf("replay after scaling the clone down and growing the source = %d, want 201", code)
 	}
 
 	after, err := st.Resources().ListByDefinition(ctx, "dst-half")
 	if err != nil {
-		t.Fatalf("list the clone's replicas after the retry: %v", err)
+		t.Fatalf("list the clone's replicas after the replay: %v", err)
 	}
 
-	if len(after) != 2 {
-		t.Errorf("retry left %d replica(s); a half-placed clone was reported finished", len(after))
+	if len(after) != 1 || after[0].NodeName != "node-a" {
+		t.Errorf("replay left replicas %v, want only node-a: it re-stamped the one removed", nodeNamesOf(after))
 	}
+}
+
+func nodeNamesOf(replicas []apiv1.Resource) []string {
+	names := make([]string, 0, len(replicas))
+	for i := range replicas {
+		names = append(names, replicas[i].NodeName)
+	}
+
+	return names
 }
 
 var errSnapshotReadFailed = errors.New("read the clone snapshot failed")
