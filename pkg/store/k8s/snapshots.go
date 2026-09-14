@@ -109,7 +109,7 @@ func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv
 		log.FromContext(ctx).V(1).Info("scoped Snapshot read unavailable; reading every snapshot instead",
 			"resourceDefinition", rdName, "reason", err.Error())
 
-		return s.listByDefinitionExhaustively(ctx, rdName)
+		return s.listByDefinitionExhaustively(ctx, s.c, rdName)
 	}
 
 	return s.wireSnapshots(ctx, rdName, crdList.Items)
@@ -119,6 +119,16 @@ func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv
 // when a direct reader is wired, and through the cache otherwise. The field
 // selector travels either way: the API server answers it from the selectable
 // field the CRD declares.
+//
+// A server that refuses the selector, which is what a cluster whose CRD
+// predates the selectable field does, is answered by the exhaustive read on
+// the same direct reader. Handing it to ListByDefinition instead put the read
+// back on the cache on exactly the cluster the fallback exists for, where the
+// index the binaries register serves it from the informer: a snapshot that
+// raced the delete and had not reached the informer was invisible to the `rd
+// d` refusal and to the sweep, and the definition went over it. The Resource
+// and StoragePool reads pass their reader into the exhaustive path the same
+// way.
 func (s *snapshots) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
 	if s.apiReader == nil {
 		return s.ListByDefinition(ctx, rdName)
@@ -132,7 +142,10 @@ func (s *snapshots) ListByDefinitionUncached(ctx context.Context, rdName string)
 			return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
 		}
 
-		return s.ListByDefinition(ctx, rdName)
+		log.FromContext(ctx).V(1).Info("scoped uncached Snapshot read unavailable; reading every snapshot instead",
+			"resourceDefinition", rdName, "reason", err.Error())
+
+		return s.listByDefinitionExhaustively(ctx, s.apiReader, rdName)
 	}
 
 	return s.wireSnapshots(ctx, rdName, crdList.Items)
@@ -513,11 +526,14 @@ func wireToCRDSnapshotSpec(in *apiv1.Snapshot) crdv1alpha1.SnapshotSpec {
 }
 
 // listByDefinitionExhaustively filters every snapshot here, on the
-// authoritative Spec.ResourceDefinitionName.
-func (s *snapshots) listByDefinitionExhaustively(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+// authoritative Spec.ResourceDefinitionName, read through the reader the
+// scoped attempt used so a fallback never changes which one answers.
+func (s *snapshots) listByDefinitionExhaustively(
+	ctx context.Context, reader ctrlclient.Reader, rdName string,
+) ([]apiv1.Snapshot, error) {
 	var crdList crdv1alpha1.SnapshotList
 
-	err := s.c.List(ctx, &crdList)
+	err := reader.List(ctx, &crdList)
 	if err != nil {
 		return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
 	}

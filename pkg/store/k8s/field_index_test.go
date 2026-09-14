@@ -522,6 +522,80 @@ func TestNodeScopedReadsUseTheDirectReaderWhenThereIsOne(t *testing.T) {
 	}
 }
 
+// `rd d` is refused on the definition's snapshots and sweeps the ones left
+// behind it, reading them with ListByDefinitionUncached, because a snapshot
+// that raced the delete and has not reached the informer is a definition
+// deleted over it. So on a store with a direct reader, neither the scoped read
+// nor its fallback may consult the cache.
+//
+// The refused selector is the case that matters most: it is what a cluster
+// whose CRD predates the selectable field answers, and the fallback that
+// handed the read back to the cached ListByDefinition was served from the
+// informer there. Nothing held either the reader or the fallback before; the
+// sibling substores each redden a named test when their reader is dropped.
+func TestUncachedSnapshotReadNeverConsultsTheCache(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+	ctx := t.Context()
+	seed := k8s.New(fixture.client)
+
+	if err := seed.ResourceDefinitions().Create(ctx,
+		&apiv1.ResourceDefinition{Name: "pvc-raced"}); err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name, snapshot string
+		reader         ctrlclient.Client
+	}{
+		{name: "the selector is served", snapshot: "snap-served", reader: fixture.client},
+		{name: "the selector is refused", snapshot: "snap-refused", reader: refusingClient{
+			Client: fixture.client,
+			err:    apierrors.NewBadRequest("field label not supported: spec.resourceDefinitionName"),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A cache that is not watching snapshots, built before the
+			// snapshot below exists.
+			stale := &countingReads{Client: startedCachedClient(t)}
+			st := k8s.NewWithAPIReader(stale, tc.reader)
+
+			raced := &crdv1alpha1.Snapshot{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-raced." + tc.snapshot},
+				Spec: crdv1alpha1.SnapshotSpec{
+					ResourceDefinitionName: "pvc-raced",
+					SnapshotName:           tc.snapshot,
+				},
+			}
+
+			if err := fixture.client.Create(ctx, raced); err != nil {
+				t.Fatalf("seed snapshot: %v", err)
+			}
+
+			t.Cleanup(func() { _ = fixture.client.Delete(context.Background(), raced) })
+
+			snaps, err := st.Snapshots().ListByDefinitionUncached(ctx, "pvc-raced")
+			if err != nil {
+				t.Fatalf("ListByDefinitionUncached: %v", err)
+			}
+
+			if len(snaps) != 1 {
+				t.Errorf("ListByDefinitionUncached returned %d snapshots, want the one just "+
+					"written: `rd d` decided on this answer deletes the definition over it", len(snaps))
+			}
+
+			if n := stale.lists.Load(); n != 0 {
+				t.Errorf("%d list(s) went to the cached client; the uncached snapshot read must "+
+					"stay on the direct reader, its fallback included", n)
+			}
+		})
+	}
+}
+
 // errRDReadFailed is a read that actually failed, as opposed to a definition
 // that is not there: getParentRD answers (nil, nil) for the missing name and
 // for NotFound, because an orphan snapshot is a real shape that must still
