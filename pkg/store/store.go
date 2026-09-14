@@ -70,8 +70,8 @@ type NodeStore interface {
 	// shape a manager-backed binary may take: a cached client without
 	// its manager's reader answers this from the cache and says nothing
 	// while it does, which is what the controller binary did to its own
-	// `--enable-rest-api` surface. Build those with
-	// pkg/store/k8s.NewFromManager, which is pinned.
+	// `--enable-rest-api` surface. Take the store pkg/store/k8s.NewManager
+	// returns with the manager; nothing else builds one.
 	GetUncached(ctx context.Context, name string) (apiv1.Node, error)
 
 	Create(ctx context.Context, n *apiv1.Node) error

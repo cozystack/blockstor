@@ -120,7 +120,7 @@ func startedCachedClient(t *testing.T) ctrlclient.Client {
 	// harness call: registering the indexes separately is how all three came
 	// to be running on the fallback at once, so the constructor is what this
 	// pins.
-	mgr, err := k8s.NewManager(fixture.env.Config, manager.Options{
+	mgr, _, err := k8s.NewManager(fixture.env.Config, manager.Options{
 		Scheme:                 fixture.client.Scheme(),
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
@@ -405,18 +405,27 @@ func TestScopedReadsFallBackOnlyWhenTheSelectorIsRefused(t *testing.T) {
 	}
 }
 
-// countingReads records every List a client is asked for, so a test can say
-// which reader answered.
+// countingReads records every List and Get a client is asked for, so a test
+// can say which reader answered.
 type countingReads struct {
 	ctrlclient.Client
 
 	lists atomic.Int64
+	gets  atomic.Int64
 }
 
 func (c *countingReads) List(ctx context.Context, list ctrlclient.ObjectList, opts ...ctrlclient.ListOption) error {
 	c.lists.Add(1)
 
 	return c.Client.List(ctx, list, opts...) //nolint:wrapcheck // test decorator
+}
+
+func (c *countingReads) Get(
+	ctx context.Context, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption,
+) error {
+	c.gets.Add(1)
+
+	return c.Client.Get(ctx, key, obj, opts...) //nolint:wrapcheck // test decorator
 }
 
 // `node delete` is refused on the node-scoped read and cascades away what it
@@ -489,6 +498,27 @@ func TestNodeScopedReadsUseTheDirectReaderWhenThereIsOne(t *testing.T) {
 	if n := stale.lists.Load(); n != 0 {
 		t.Errorf("%d list(s) went to the cached client; the node-scoped read is supposed "+
 			"to bypass it when an API reader is available", n)
+	}
+
+	// And the field the node-fate decision turns on. `n lost` refuses on
+	// ConnectionStatus and then acts, so GetUncached has to be what its name
+	// says on a store that has a reader. Nothing held the node substore's
+	// reader before: the read counting above covered listings, and the handler
+	// test only pins that `n lost` asks for GetUncached, against a double.
+	// Dropping the reader from the node substore is the defect the controller
+	// binary had, and it reddens this count.
+	node, err := st.Nodes().GetUncached(ctx, "node-fresh")
+	if err != nil {
+		t.Fatalf("GetUncached: %v", err)
+	}
+
+	if node.Name != "node-fresh" {
+		t.Errorf("GetUncached returned %q, want node-fresh", node.Name)
+	}
+
+	if n := stale.gets.Load(); n != 0 {
+		t.Errorf("%d get(s) went to the cached client; GetUncached is supposed to read "+
+			"the API server when the store has a direct reader", n)
 	}
 }
 

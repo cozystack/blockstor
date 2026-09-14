@@ -138,8 +138,8 @@ func newScheme() *runtime.Scheme {
 // election off — every apiserver replica serves reads
 // independently. Caches still warm up so the REST server's
 // cached-client reads are cheap.
-func buildManager(flags *apiserverFlags) (manager.Manager, error) {
-	mgr, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+func buildManager(flags *apiserverFlags) (manager.Manager, *storek8s.Store, error) {
+	mgr, st, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: newScheme(),
 		Metrics: metricsserver.Options{
 			BindAddress:   flags.metricsAddr,
@@ -150,10 +150,10 @@ func buildManager(flags *apiserverFlags) (manager.Manager, error) {
 		LeaderElection:         false,
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "new manager")
+		return nil, nil, errors.Wrap(err, "new manager")
 	}
 
-	return mgr, nil
+	return mgr, st, nil
 }
 
 // resolveNamespace mirrors the controller's namespace-resolution
@@ -248,23 +248,12 @@ func main() {
 	flags := parseFlags()
 	namespace := resolveNamespace(flags.controllerNamespace)
 
-	mgr, err := buildManager(flags)
+	mgr, st, err := buildManager(flags)
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
 		os.Exit(1)
 	}
 
-	// CRD-backed store is the only supported persistence layer
-	// post-Phase-11 — the apiserver/controller split made
-	// in-process state pointless across replicas.
-	//
-	// BUG-048: pass the manager's direct (uncached) API reader so the
-	// atomic VolumeNumber allocation re-reads live RD state on each
-	// conflict-retry. With only the informer-cached client, two
-	// concurrent `vd c` against one RD both retry against a stale cache,
-	// re-derive the same number, exhaust the retry budget, and silently
-	// drop the second volume.
-	st := storek8s.NewFromManager(mgr)
 
 	ready := newReadyState()
 

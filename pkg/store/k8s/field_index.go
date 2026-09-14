@@ -31,30 +31,36 @@ import (
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 )
 
-// NewManager builds a manager whose cache can answer the reads this store
-// issues.
+// NewManager builds a manager and the store that serves from it, as one call.
 //
-// The two halves are one call because they are one decision. A manager whose
-// client backs a Store, and whose cache has no index for the fields the store
-// selects on, does not fail loudly — it answers every scoped read by listing
-// the whole collection and filtering in process, which is the read the scoped
-// one exists to replace. Registering separately is how that came to be true of
-// both server binaries at once, and of the integration harness that claimed to
-// mirror them.
+// Three things have to hold together for a manager-backed store to answer the
+// reads it issues, and each used to be a separate step a binary could skip.
+// The cache needs the field indexes the store selects on, or every scoped read
+// quietly lists the whole collection and filters in process — the read the
+// scoped one exists to replace, and neither step fails loudly. And the store
+// needs the manager's direct reader, or the reads that decide a node's fate
+// answer from a cache that trails the API server.
+//
+// Registering the indexes separately is how both server binaries and the
+// integration harness came to run on the fallback at once. Threading the
+// reader separately is how the controller binary came to serve the LINSTOR
+// surface from a cache-only store while the apiserver's had the reader. So
+// there is no second constructor to leave out: the store comes back from the
+// same call that built the manager, from that manager's own client and reader.
 //
 //nolint:gocritic // ctrl.Options by value mirrors ctrl.NewManager, which this wraps
-func NewManager(cfg *rest.Config, opts ctrl.Options) (ctrl.Manager, error) {
+func NewManager(cfg *rest.Config, opts ctrl.Options) (ctrl.Manager, *Store, error) {
 	mgr, err := ctrl.NewManager(cfg, opts)
 	if err != nil {
-		return nil, errors.Wrap(err, "new manager")
+		return nil, nil, errors.Wrap(err, "new manager")
 	}
 
 	err = RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return mgr, nil
+	return mgr, NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader()), nil
 }
 
 // SelectorUnsupported reports whether an error means the server cannot answer
