@@ -43,6 +43,13 @@ const storePackagePath = "github.com/cozystack/blockstor/pkg/store/k8s"
 func TestManagerBackedStoresComeFromNewManager(t *testing.T) {
 	t.Parallel()
 
+	// The production call sites outside the store package allowed to build a
+	// store from a client, keyed by module-relative file and enclosing
+	// function, with the reason each one is safe.
+	uncachedStoreConstructions := map[string]string{
+		"cmd/blockstor/main.go:openStore": "the native CLI builds a plain client with no informer behind it",
+	}
+
 	findings, unused, err := storeConstructionFindings(repoRoot(t), uncachedStoreConstructions)
 	if err != nil {
 		t.Fatalf("walk the module: %v", err)
@@ -58,13 +65,6 @@ func TestManagerBackedStoresComeFromNewManager(t *testing.T) {
 		t.Errorf("uncachedStoreConstructions lists %s, which no longer builds a store; "+
 			"drop the entry so it cannot sanction a later call under the same name", site)
 	}
-}
-
-// uncachedStoreConstructions are the production call sites outside the store
-// package allowed to build a store from a client, keyed by module-relative file
-// and enclosing function, with the reason each one is safe.
-var uncachedStoreConstructions = map[string]string{
-	"cmd/blockstor/main.go:openStore": "the native CLI builds a plain client with no informer behind it",
 }
 
 // storeConstructionFindings walks the module under root and returns every

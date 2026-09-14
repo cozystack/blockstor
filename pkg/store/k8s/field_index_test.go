@@ -558,41 +558,47 @@ func TestUncachedSnapshotReadNeverConsultsTheCache(t *testing.T) {
 			err:    apierrors.NewBadRequest("field label not supported: spec.resourceDefinitionName"),
 		}},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// A cache that is not watching snapshots, built before the
-			// snapshot below exists.
-			stale := &countingReads{Client: startedCachedClient(t)}
-			st := k8s.NewWithAPIReader(stale, tc.reader)
+		// A cache that is not watching snapshots, built before the snapshot
+		// below exists. wipeAll removes the snapshots when the test ends.
+		stale := &countingReads{Client: startedCachedClient(t)}
+		st := k8s.NewWithAPIReader(stale, tc.reader)
 
-			raced := &crdv1alpha1.Snapshot{
-				ObjectMeta: metav1.ObjectMeta{Name: "pvc-raced." + tc.snapshot},
-				Spec: crdv1alpha1.SnapshotSpec{
-					ResourceDefinitionName: "pvc-raced",
-					SnapshotName:           tc.snapshot,
-				},
+		raced := &crdv1alpha1.Snapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-raced." + tc.snapshot},
+			Spec: crdv1alpha1.SnapshotSpec{
+				ResourceDefinitionName: "pvc-raced",
+				SnapshotName:           tc.snapshot,
+			},
+		}
+
+		if err := fixture.client.Create(ctx, raced); err != nil {
+			t.Fatalf("%s: seed snapshot: %v", tc.name, err)
+		}
+
+		snaps, err := st.Snapshots().ListByDefinitionUncached(ctx, "pvc-raced")
+		if err != nil {
+			t.Fatalf("%s: ListByDefinitionUncached: %v", tc.name, err)
+		}
+
+		// Both cases' snapshots exist by the second pass, so count only
+		// this case's.
+		found := 0
+
+		for i := range snaps {
+			if snaps[i].Name == tc.snapshot {
+				found++
 			}
+		}
 
-			if err := fixture.client.Create(ctx, raced); err != nil {
-				t.Fatalf("seed snapshot: %v", err)
-			}
+		if found != 1 {
+			t.Errorf("%s: ListByDefinitionUncached did not return the snapshot just written: "+
+				"`rd d` decided on this answer deletes the definition over it", tc.name)
+		}
 
-			t.Cleanup(func() { _ = fixture.client.Delete(context.Background(), raced) })
-
-			snaps, err := st.Snapshots().ListByDefinitionUncached(ctx, "pvc-raced")
-			if err != nil {
-				t.Fatalf("ListByDefinitionUncached: %v", err)
-			}
-
-			if len(snaps) != 1 {
-				t.Errorf("ListByDefinitionUncached returned %d snapshots, want the one just "+
-					"written: `rd d` decided on this answer deletes the definition over it", len(snaps))
-			}
-
-			if n := stale.lists.Load(); n != 0 {
-				t.Errorf("%d list(s) went to the cached client; the uncached snapshot read must "+
-					"stay on the direct reader, its fallback included", n)
-			}
-		})
+		if n := stale.lists.Load(); n != 0 {
+			t.Errorf("%s: %d list(s) went to the cached client; the uncached snapshot read must "+
+				"stay on the direct reader, its fallback included", tc.name, n)
+		}
 	}
 }
 

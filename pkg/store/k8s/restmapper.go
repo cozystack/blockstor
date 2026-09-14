@@ -80,13 +80,13 @@ func ownKindsRESTMapper() (meta.RESTMapper, error) {
 		return nil, errors.Wrap(err, "register blockstor kinds")
 	}
 
-	gv := crdv1alpha1.GroupVersion
-	known := scheme.KnownTypes(gv)
-	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{gv})
+	groupVersion := crdv1alpha1.GroupVersion
+	known := scheme.KnownTypes(groupVersion)
+	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{groupVersion})
 
 	for kind := range known {
 		if _, listed := known[kind+"List"]; listed {
-			mapper.Add(gv.WithKind(kind), meta.RESTScopeRoot)
+			mapper.Add(groupVersion.WithKind(kind), meta.RESTScopeRoot)
 		}
 	}
 
@@ -146,26 +146,26 @@ func (m *groupFirstMapper) ResourcesFor(input schema.GroupVersionResource) ([]sc
 	return m.rest.ResourcesFor(input) //nolint:wrapcheck // typed RESTMapper errors are matched by callers
 }
 
-func (m *groupFirstMapper) RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
-	if gk.Group == m.group {
-		mapping, err := m.own.RESTMapping(gk, versions...)
+func (m *groupFirstMapper) RESTMapping(groupKind schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+	if groupKind.Group == m.group {
+		mapping, err := m.own.RESTMapping(groupKind, versions...)
 		if !meta.IsNoMatchError(err) {
 			return mapping, err //nolint:wrapcheck // typed RESTMapper errors are matched by callers
 		}
 	}
 
-	return m.rest.RESTMapping(gk, versions...) //nolint:wrapcheck // typed RESTMapper errors are matched by callers
+	return m.rest.RESTMapping(groupKind, versions...) //nolint:wrapcheck // typed RESTMapper errors are matched by callers
 }
 
-func (m *groupFirstMapper) RESTMappings(gk schema.GroupKind, versions ...string) ([]*meta.RESTMapping, error) {
-	if gk.Group == m.group {
-		mappings, err := m.own.RESTMappings(gk, versions...)
+func (m *groupFirstMapper) RESTMappings(groupKind schema.GroupKind, versions ...string) ([]*meta.RESTMapping, error) {
+	if groupKind.Group == m.group {
+		mappings, err := m.own.RESTMappings(groupKind, versions...)
 		if !meta.IsNoMatchError(err) {
 			return mappings, err //nolint:wrapcheck // typed RESTMapper errors are matched by callers
 		}
 	}
 
-	return m.rest.RESTMappings(gk, versions...) //nolint:wrapcheck // typed RESTMapper errors are matched by callers
+	return m.rest.RESTMappings(groupKind, versions...) //nolint:wrapcheck // typed RESTMapper errors are matched by callers
 }
 
 func (m *groupFirstMapper) ResourceSingularizer(resource string) (string, error) {
