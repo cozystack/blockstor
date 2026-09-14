@@ -532,20 +532,50 @@ func resolvedLayerStack(stack []string) []string {
 	return stack
 }
 
-// leftoverShapeDiffers names the first way a definition already under the
-// target name was built to a different shape than this request asks for, or ""
-// when the two agree.
+// leftoverIsThisRestore is the AlreadyExists tolerance's whole question: the
+// marker says the definition is this operation's own, the DELETE flag says
+// whether it is still there to finish, and the fields the caller named say
+// whether it is the same operation.
+func leftoverIsThisRestore(existing *apiv1.ResourceDefinition, snap *apiv1.Snapshot, overrides *rdShapeOverrides) bool {
+	var namedRG string
+
+	var namedLayers []string
+
+	if overrides != nil {
+		namedRG, namedLayers = overrides.ResourceGroupName, overrides.LayerStack
+	}
+
+	return restoreMarkerMatches(existing.Props, snap.ResourceName, snap.Name) &&
+		!slices.Contains(existing.Flags, rdFlagDelete) &&
+		requestedShapeDiffers(existing, namedRG, namedLayers) == ""
+}
+
+// requestedShapeDiffers names the first way a definition already under the
+// target name differs from what THIS request asked for, or "" when it asked for
+// nothing the leftover does not already have.
 //
-// A retry that resumes a leftover keeps the leftover. So a request naming a
-// different resource_group or layer stack than the attempt that created it
-// gets its shape validated and then dropped, while the answer says the clone
-// completed — the accept-and-drop this endpoint refuses external_name and
-// volume_passphrases precisely to avoid. The parent group decides replica
-// count and pool selection, so it is not cosmetic.
-func leftoverShapeDiffers(existing, want *apiv1.ResourceDefinition) string {
-	if !strings.EqualFold(existing.ResourceGroupName, want.ResourceGroupName) {
-		return "resource group '" + existing.ResourceGroupName + "', not '" +
-			want.ResourceGroupName + "'"
+// A retry that resumes a leftover keeps the leftover, so a request naming a
+// different resource_group or layer stack would get that shape validated and
+// then dropped while the answer says the operation completed — the
+// accept-and-drop this endpoint refuses external_name and volume_passphrases to
+// avoid. The parent group is not cosmetic: it decides replica count and pool
+// selection.
+//
+// Only the fields the caller NAMED are compared, and only against the
+// leftover. The alternative this replaced built the "wanted" shape from the
+// live source wherever the request was silent, which made an ordinary
+// `rd modify --resource-group` on the source a permanent 409 on every later
+// retry — on the replay of a finished clone and on the resume of an unfinished
+// one alike — with a correction linstor-csi cannot act on, since it sends the
+// same body every time and names neither field. A retry that names nothing
+// resumes what the first attempt started, whatever the source has become.
+func requestedShapeDiffers(existing *apiv1.ResourceDefinition, rgName string, layers []string) string {
+	if rgName != "" && !strings.EqualFold(existing.ResourceGroupName, rgName) {
+		return "resource group '" + existing.ResourceGroupName + "', not '" + rgName + "'"
+	}
+
+	if len(layers) == 0 {
+		return ""
 	}
 
 	// An unset stack is a definition that never said, not one with no layers —
@@ -553,11 +583,11 @@ func leftoverShapeDiffers(existing, want *apiv1.ResourceDefinition) string {
 	// reason. Without it a leftover stamped [DRBD, STORAGE] by one client
 	// refuses a retry from another that omits layer_list, and the refusal
 	// renders the empty side as nothing at all.
-	added, dropped := layerSetDifference(
-		resolvedLayerStack(existing.LayerStack), resolvedLayerStack(want.LayerStack))
+	have := resolvedLayerStack(existing.LayerStack)
+
+	added, dropped := layerSetDifference(have, layers)
 	if len(added) > 0 || len(dropped) > 0 {
-		return "layer stack " + strings.Join(existing.LayerStack, ",") + ", not " +
-			strings.Join(want.LayerStack, ",")
+		return "layer stack " + strings.Join(have, ",") + ", not " + strings.Join(layers, ",")
 	}
 
 	return ""
@@ -672,9 +702,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		// above and this Create — but it is the exact state the 409 in
 		// restoreTargetState exists to prevent, and hydrating volumes into
 		// a dying definition races the tear-down reaping them.
-		if !restoreMarkerMatches(existing.Props, snap.ResourceName, snap.Name) ||
-			slices.Contains(existing.Flags, rdFlagDelete) ||
-			leftoverShapeDiffers(&existing, &newRD) != "" {
+		if !leftoverIsThisRestore(&existing, snap, overrides) {
 			return "", err //nolint:wrapcheck // surfaced via writeStoreError
 		}
 	}
