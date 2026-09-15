@@ -75,6 +75,82 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 	return false, err
 }
 
+// detachedRollbackBudget bounds a rollback that runs after the request it
+// belongs to has ended.
+const detachedRollbackBudget = 30 * time.Second
+
+// rollBackDetached runs rollBackMaterialisedRD on a context the request cannot
+// end, bounded by detachedRollbackBudget.
+//
+// Every compensation on these paths is most likely to be needed when the
+// caller has already gone: a CSI caller times out mid-clone, and the RG-deleted
+// rollback itself waits out two cache-convergence budgets. A compensation that
+// inherits the request's context fails on its first call once that happens and
+// leaves exactly what it exists to remove, a definition every later retry is
+// refused over until an operator deletes it.
+func (s *Server) rollBackDetached(ctx context.Context, rdName string, placed []string) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedRollbackBudget)
+	defer cancel()
+
+	return s.rollBackMaterialisedRD(rollbackCtx, rdName, placed)
+}
+
+// failedMaterialiseRefusal rolls back what a failed materialisation left, when
+// that is this request's own partial work, and words the refusal. noun names
+// the operation for the operator ("clone", "restore").
+//
+// The marker is stamped at RD-create, so a failure after the create leaves a
+// definition every retry matches, and nothing but an operator would ever remove
+// it. Only a failure materializeRestoredRD reports as after its own create is
+// rolled back; any other leaves whatever was there before the call, which may
+// belong to another attempt that is still running, and is never touched.
+func (s *Server) failedMaterialiseRefusal(
+	ctx context.Context, message, noun, rdName string, placed []string, err error,
+) *apiv1.APICallRc {
+	var partial *materialiseAfterCreateError
+	if !errors.As(err, &partial) {
+		return &apiv1.APICallRc{RetCode: apiCallRcError, Message: message}
+	}
+
+	rollbackErr := s.rollBackDetached(ctx, rdName, placed)
+	if rollbackErr != nil {
+		cause, correc := rollbackFailureAdvice(rollbackErr, rdName)
+
+		return &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: message + "; rolling the partial " + noun + " back failed too: " + rollbackErr.Error() +
+				"; '" + rdName + "' is still there",
+			Cause:  cause,
+			Correc: correc,
+		}
+	}
+
+	return &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: message + "; the partial " + noun + " '" + rdName + "' was rolled back",
+		Correc:  "retry the " + noun,
+	}
+}
+
+// adoptedOverDeletedGroupRefusal is the RG-deleted refusal over a definition
+// this request did not create. It is left in place: the leftover belongs to an
+// earlier attempt at the same operation, which may still be running, and
+// reaping it would delete that attempt's work rather than this one's.
+func adoptedOverDeletedGroupRefusal(noun, rdName, rgName, correc string) *apiv1.APICallRc {
+	return &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: noun + " target '" + rdName + "' is parented to resource group '" + rgName +
+			"', which no longer exists",
+		Cause: "the definition was not created by this request, so it is left in place " +
+			"rather than rolled back",
+		Correc: correc,
+	}
+}
+
+// correcRecreateGroupThenRestore is the restore door's twin of
+// correcRecreateGroupThenClone.
+const correcRecreateGroupThenRestore = "re-create the resource group, then restore again"
+
 // errReplicasNotStamped is the rollback's own refusal: replicas that are still
 // there and were never accepted for deletion, which is the one shape the
 // parent must not be dropped over.

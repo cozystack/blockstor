@@ -233,14 +233,16 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 	// operation with no follow-up autoplace, so the clone replicas must
 	// materialise on the snapshot-holding nodes in the source pool here
 	// (same backend by construction — Bug 038).
-	_, stampedRG, placed, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true)
+	made, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true)
 	if err != nil {
-		s.writeCloneMaterialiseFailed(ctx, w, src.Name, req.Name, placed, err)
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, req.Name,
+			s.failedMaterialiseRefusal(ctx, "clone of resource definition '"+src.Name+"' failed: "+err.Error(),
+				"clone", req.Name, made.Placed, err))
 
 		return
 	}
 
-	uncheckedRG, ok := s.cloneParentRGSurvived(ctx, w, src, req.Name, stampedRG, placed)
+	uncheckedRG, ok := s.cloneParentRGSurvived(ctx, w, src, req.Name, made)
 	if !ok {
 		return
 	}
@@ -257,63 +259,6 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 	}
 
 	writeCloneStarted(w, src.Name, req.Name, "resource definition cloned: "+req.Name, uncheckedRG)
-}
-
-// cloneRollbackBudget bounds a rollback that runs after the request it
-// belongs to has ended.
-const cloneRollbackBudget = 30 * time.Second
-
-// writeCloneMaterialiseFailed answers a clone whose materialisation failed.
-//
-// The marker is stamped at RD-create, so a failure after the create leaves a
-// definition every retry matches and is refused over, and nothing but an
-// operator would ever remove it. When this request created that definition,
-// what stands there is its own partial work, and it is rolled back before the
-// answer goes out. A definition this request did not create is never touched:
-// it may belong to another attempt that is still running.
-//
-// The rollback does not run on the request's context. The likeliest failure
-// here is that context ending, a CSI caller timing out mid-hydration, and a
-// compensation that inherits it fails on its first call and leaves exactly
-// the debris it exists to remove.
-func (s *Server) writeCloneMaterialiseFailed(
-	ctx context.Context, w http.ResponseWriter, srcName, cloneName string, placed []string, err error,
-) {
-	message := "clone of resource definition '" + srcName + "' failed: " + err.Error()
-
-	var partial *materialiseAfterCreateError
-	if !errors.As(err, &partial) {
-		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: message,
-		})
-
-		return
-	}
-
-	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cloneRollbackBudget)
-	defer cancel()
-
-	rollbackErr := s.rollBackMaterialisedRD(rollbackCtx, cloneName, placed)
-	if rollbackErr != nil {
-		cause, correc := rollbackFailureAdvice(rollbackErr, cloneName)
-
-		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: message + "; rolling the partial clone back failed too: " + rollbackErr.Error() +
-				"; '" + cloneName + "' is still there",
-			Cause:  cause,
-			Correc: correc,
-		})
-
-		return
-	}
-
-	writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
-		RetCode: apiCallRcError,
-		Message: message + "; the partial clone '" + cloneName + "' was rolled back",
-		Correc:  "retry the clone",
-	})
 }
 
 // correcRecreateGroupThenClone is the one wording both rollback doors on this
@@ -347,8 +292,10 @@ func writeCloneStarted(w http.ResponseWriter, srcName, cloneName, message string
 // been rolled back and a refusal written.
 func (s *Server) cloneParentRGSurvived(
 	ctx context.Context, w http.ResponseWriter,
-	src *apiv1.ResourceDefinition, cloneName, stampedRG string, placed []string,
+	src *apiv1.ResourceDefinition, cloneName string, made materialisedRD,
 ) (*apiv1.APICallRc, bool) {
+	stampedRG := made.StampedRG
+
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
 		// The check failed, not the clone. See restoreParentRGSurvived for
@@ -358,25 +305,21 @@ func (s *Server) cloneParentRGSurvived(
 		log.FromContext(ctx).Info("could not re-check the clone's parent group",
 			"resourceDefinition", cloneName, "resourceGroup", stampedRG, "reason", err.Error())
 
-		return &apiv1.APICallRc{
-			RetCode: maskWarn,
-			Message: "resource group '" + stampedRG + "' could not be re-checked after the " +
-				"clone: " + err.Error(),
-			Cause: "the clone itself succeeded; only the safety net over it could not be " +
-				"inspected, so a group deleted during the clone would not have been caught",
-			Correc: "confirm resource group '" + stampedRG + "' still exists",
-			ObjRefs: map[string]string{
-				objRefRscDfn: cloneName,
-				objRefRscGrp: stampedRG,
-			},
-		}, true
+		return uncheckedCloneGroupWarning(cloneName, stampedRG, err), true
 	}
 
 	if survived {
 		return nil, true
 	}
 
-	rollbackErr := s.rollBackMaterialisedRD(ctx, cloneName, placed)
+	if !made.Created {
+		writeCloneRefused(w, http.StatusConflict, src.Name, cloneName,
+			adoptedOverDeletedGroupRefusal("clone", cloneName, stampedRG, correcRecreateGroupThenClone))
+
+		return nil, false
+	}
+
+	rollbackErr := s.rollBackDetached(ctx, cloneName, made.Placed)
 	if rollbackErr != nil {
 		cause, correc := rollbackFailureAdvice(rollbackErr, cloneName)
 
@@ -402,6 +345,23 @@ func (s *Server) cloneParentRGSurvived(
 	})
 
 	return nil, false
+}
+
+// uncheckedCloneGroupWarning is what both halves of the clone's post-write
+// group check ride back when the check itself could not be made.
+func uncheckedCloneGroupWarning(cloneName, rgName string, err error) *apiv1.APICallRc {
+	return &apiv1.APICallRc{
+		RetCode: maskWarn,
+		Message: "resource group '" + rgName + "' could not be re-checked after the " +
+			"clone: " + err.Error(),
+		Cause: "the clone itself succeeded; only the safety net over it could not be " +
+			"inspected, so a group deleted during the clone would not have been caught",
+		Correc: "confirm resource group '" + rgName + "' still exists",
+		ObjRefs: map[string]string{
+			objRefRscDfn: cloneName,
+			objRefRscGrp: rgName,
+		},
+	}
 }
 
 // cloneSnapshotName derives the internal snapshot name backing a
