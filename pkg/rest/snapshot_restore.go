@@ -337,22 +337,9 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// it finished. Answering success on the marker alone would turn the
 	// terminal failure this fixes into a silent incomplete one: CSI would
 	// see the volume as ready and nothing would ever finish it.
-	resume, stop := s.restoreTargetState(r.Context(), w, &snap, req.ToResource)
+	resume, stop := s.restoreReplayState(r.Context(), w, &snap, &req)
 	if stop {
 		return
-	}
-
-	if resume {
-		finished, halt := s.restoreLeftoverIsFinished(r.Context(), w, &snap, &req)
-		if halt {
-			return
-		}
-
-		if finished {
-			writeRestoreDone(w, true, snapName, req.ToResource)
-
-			return
-		}
 	}
 
 	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false, nil)
@@ -363,6 +350,31 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeRestoreDone(w, resume, snapName, newRDName)
+}
+
+// restoreReplayState is restoreTargetState followed, over a leftover of this
+// restore, by the finished question. It returns (resume, stop): stop when an
+// answer has been written, the replay of a finished restore included.
+func (s *Server) restoreReplayState(
+	ctx context.Context, w http.ResponseWriter, snap *apiv1.Snapshot, req *snapshotRestoreRequest,
+) (bool, bool) {
+	resume, stop := s.restoreTargetState(ctx, w, snap, req.ToResource)
+	if stop || !resume {
+		return resume, stop
+	}
+
+	finished, halt := s.restoreLeftoverIsFinished(ctx, w, snap, req)
+	if halt {
+		return false, true
+	}
+
+	if finished {
+		writeRestoreDone(w, true, snap.Name, req.ToResource)
+
+		return false, true
+	}
+
+	return true, false
 }
 
 // restoreLeftoverIsFinished answers a retry over a leftover of this restore

@@ -197,11 +197,13 @@ func TestRDCloneRefusalsKeepTheCloneStartedEnvelope(t *testing.T) {
 		t.Fatalf("seed the volume-less source: %v", err)
 	}
 
+	// The subtests run in parallel, after this function has returned, so the
+	// servers outlive it through Cleanup rather than defer.
 	base, stop := startServerWithStore(t, st)
-	defer stop()
+	t.Cleanup(stop)
 
 	blind, stopBlind := startServerWithStore(t, failingVolumeListStore{st})
-	defer stopBlind()
+	t.Cleanup(stopBlind)
 
 	if code := cloneOnce(t, base, "src-shell7", "dst-shell7", nil); code != http.StatusCreated {
 		t.Fatalf("first volume-less clone = %d, want 201", code)
@@ -217,6 +219,8 @@ func TestRDCloneRefusalsKeepTheCloneStartedEnvelope(t *testing.T) {
 		{name: "source-volumes-unreadable", base: blind, src: "src-env7", body: map[string]any{"name": "dst-y7"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			resp := postClone(t, tc.base, tc.src, tc.body)
 			defer func() { _ = resp.Body.Close() }()
 
