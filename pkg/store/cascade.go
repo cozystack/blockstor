@@ -99,13 +99,13 @@ func CascadeDeleteResources(ctx context.Context, st Store, rdName string) error 
 // refusal passed, the cascade reaped nothing, the node went, and the replicas
 // still pointed at it.
 //
-// Three spellings are asked, see nodeSpellings. The one that remains out of
+// Three spellings are asked, see NodeSpellings. The one that remains out of
 // reach is a spelling that is neither the caller's, nor the folded one, nor
 // the node's registered one: a replica created by hand under yet another case.
 // That is the boundary FoldName documents. The merge base asked only the
 // caller's spelling, verbatim.
 func ReplicasOnNode(ctx context.Context, st Store, node string) ([]apiv1.Resource, error) {
-	spellings, err := nodeSpellings(ctx, st, node)
+	spellings, err := NodeSpellings(ctx, st, node)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +113,7 @@ func ReplicasOnNode(ctx context.Context, st Store, node string) ([]apiv1.Resourc
 	return replicasUnder(ctx, st, spellings)
 }
 
-// nodeSpellings is the set of spellings a node-scoped read has to be asked in:
+// NodeSpellings is the set of spellings a node-scoped read has to be asked in:
 // the caller's, the folded one, and the one the node is registered under.
 //
 // The registered spelling is the one that matters most and the one the other
@@ -128,7 +128,11 @@ func ReplicasOnNode(ctx context.Context, st Store, node string) ([]apiv1.Resourc
 // slug, the in-memory one does not, and the listing gives both the same
 // answer. A node that is not registered (already gone, or never was)
 // contributes nothing, and the two remaining spellings are still asked.
-func nodeSpellings(ctx context.Context, st Store, node string) ([]string, error) {
+//
+// That makes the answer depend on whether the node row still exists, so a
+// caller that re-asks after deleting the node resolves the spellings before the
+// delete and passes them to ReferencesUnderSpellings for both walks.
+func NodeSpellings(ctx context.Context, st Store, node string) ([]string, error) {
 	spellings := []string{node}
 
 	add := func(spelling string) {
@@ -198,7 +202,7 @@ func inEverySpelling[T any](
 // that references the named node, which is what makes a forced node delete
 // leave nothing pointing at an object that is gone.
 func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error {
-	spellings, err := nodeSpellings(ctx, st, node)
+	spellings, err := NodeSpellings(ctx, st, node)
 	if err != nil {
 		return err
 	}
@@ -237,11 +241,19 @@ func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error
 // This is what a plain node delete is refused on: the operator either clears
 // the references or says explicitly that the node is gone.
 func ReferencesOnNode(ctx context.Context, st Store, node string) ([]string, []string, error) {
-	spellings, err := nodeSpellings(ctx, st, node)
+	spellings, err := NodeSpellings(ctx, st, node)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	return ReferencesUnderSpellings(ctx, st, spellings)
+}
+
+// ReferencesUnderSpellings is ReferencesOnNode over spellings the caller
+// resolved with NodeSpellings. A caller that walks the references again after
+// deleting the node has to use it: by then the node row is gone and a fresh
+// NodeSpellings no longer knows the registered spelling.
+func ReferencesUnderSpellings(ctx context.Context, st Store, spellings []string) ([]string, []string, error) {
 	resources, err := replicasUnder(ctx, st, spellings)
 	if err != nil {
 		return nil, nil, err
