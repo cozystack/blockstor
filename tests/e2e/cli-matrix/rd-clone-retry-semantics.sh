@@ -173,4 +173,4 @@ if [[ "$http_code" != "201" ]]; then
     exit 1
 fi
 
-echo ">> rd-clone-retry-semantics OK (replay is idempotent across a source resize; delete-namespace accepted)"
+echo ">> rd-clone-retry-semantics OK (replay is idempotent across a source resize; delete_namespaces accepted)"
