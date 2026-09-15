@@ -342,6 +342,19 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if resume {
+		finished, halt := s.restoreLeftoverIsFinished(r.Context(), w, &snap, &req)
+		if halt {
+			return
+		}
+
+		if finished {
+			writeRestoreDone(w, true, snapName, req.ToResource)
+
+			return
+		}
+	}
+
 	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false, nil)
 	if err != nil {
 		writeStoreError(w, err)
@@ -350,6 +363,58 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeRestoreDone(w, resume, snapName, newRDName)
+}
+
+// restoreLeftoverIsFinished answers a retry over a leftover of this restore
+// before anything is re-run over it. It returns (finished, stop).
+//
+// Resuming on the marker alone ran placement again, and
+// stampRestoredResourcesOnNodes re-created a replica on every requested node
+// that no longer had one, including a node the operator had emptied since the
+// restore finished: a second replica restored from the point-in-time beside
+// one that had moved on with live writes. A finished restore is judged the way
+// a finished clone is, by its volumes and, when the request placed replicas,
+// by holding at least one; where they are is placement's business.
+func (s *Server) restoreLeftoverIsFinished(
+	ctx context.Context, w http.ResponseWriter, snap *apiv1.Snapshot, req *snapshotRestoreRequest,
+) (bool, bool) {
+	vds, err := s.Store.VolumeDefinitions().List(ctx, req.ToResource)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false, true
+	}
+
+	if len(vds) == 0 {
+		return false, false
+	}
+
+	progress, err := assessLeftover(ctx, s.Store, req.ToResource, vds, snap, len(canonicalRestoreNodeList(req)) > 0)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false, true
+	}
+
+	switch progress {
+	case cloneFinished:
+		return true, false
+	case cloneForeign:
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + req.ToResource + "' holds a volume the restore of '" +
+				snap.Name + "' would not have written",
+			Cause: "the definition under that name carries this restore's marker, but its volumes " +
+				"are not the ones the snapshot recorded, so resuming would report complete a " +
+				"layout nothing restored",
+			Correc: "delete '" + req.ToResource + "' and restore again, or restore under a different name",
+		}})
+
+		return false, true
+	case cloneUnfinished:
+	}
+
+	return false, false
 }
 
 // writeRestoreDone reports the restore, naming whether it finished a leftover

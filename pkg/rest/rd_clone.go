@@ -278,7 +278,10 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
+		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "name is required",
+		})
 
 		return
 	}
@@ -304,7 +307,7 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 
 	src, err := s.Store.ResourceDefinitions().Get(r.Context(), srcName)
 	if err != nil {
-		writeStoreError(w, err)
+		writeCloneStoreError(w, srcName, req.Name, err)
 
 		return
 	}
@@ -314,7 +317,10 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 	// contract Group D pins.
 	srcVDs, err := s.Store.VolumeDefinitions().List(r.Context(), srcName)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeCloneRefused(w, http.StatusInternalServerError, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails(err.Error()),
+		})
 
 		return
 	}
@@ -819,20 +825,21 @@ func (s *Server) replayOfFinishedClone(
 	return true, false
 }
 
-// cloneProgress is where a target carrying this clone's marker stands. The
-// replay and the status poll both ask it, and they have to get the same
-// answer: a POST told 201 followed by a GET that is not COMPLETE for the same
-// clone, one request apart, is a successful clone the driver then waits on.
+// cloneProgress is where a target carrying a clone's or a restore's marker
+// stands. The replay and the status poll both ask it, and they have to get the
+// same answer: a POST told 201 followed by a GET that is not COMPLETE for the
+// same clone, one request apart, is a successful clone the driver then waits
+// on.
 type cloneProgress int
 
 const (
-	// cloneUnfinished is not done and not broken: no volumes yet, a strict
-	// prefix of the snapshot's volumes, or no replica holding them. The resume
+	// cloneUnfinished is not done and not broken: no volumes yet, some of the
+	// snapshot's volumes still missing, or no replica holding them. The resume
 	// finishes it.
 	cloneUnfinished cloneProgress = iota
 	// cloneFinished holds every volume and at least one replica.
 	cloneFinished
-	// cloneForeign carries a volume this clone would not have written.
+	// cloneForeign carries a volume the restore would not have written.
 	cloneForeign
 )
 
@@ -881,26 +888,61 @@ func assessMarkedClone(
 		return cloneUnfinished, errors.Wrapf(err, "read the snapshot behind %q", cloneName)
 	}
 
+	var captured *apiv1.Snapshot
 	if err == nil {
-		switch leftoverAgainstSnapshot(&snap, targetVDs) {
-		case leftoverForeign:
+		captured = &snap
+	}
+
+	return assessLeftover(ctx, st, cloneName, targetVDs, captured, true)
+}
+
+// assessLeftover is the judgement assessMarkedClone and the restore replay
+// share, over a marker-bearing target already known to hold targetVDs. snap is
+// the point-in-time it was restored from, or nil once that is gone. A clone
+// needs a replica to hold its data; a restore needs one only when the request
+// placed replicas at all, since a bare restore leaves an empty shell by design.
+//
+// A volume number the snapshot never recorded is judged by what else the target
+// holds. Beside a missing snapshot volume, or on a target with no replica, it
+// is somebody else's: the resume would hydrate around it and report complete a
+// definition carrying a volume nothing restored. Beside every snapshot volume
+// and a replica it is the target's own, added after the copy finished the way
+// a volume is expanded, and refusing it would tell the operator to delete a
+// working clone.
+func assessLeftover(
+	ctx context.Context, st store.Store, targetName string,
+	targetVDs []apiv1.VolumeDefinition, snap *apiv1.Snapshot, needReplica bool,
+) (cloneProgress, error) {
+	var shape leftoverShape
+
+	if snap != nil {
+		shape = leftoverAgainstSnapshot(snap, targetVDs)
+
+		switch {
+		case shape.smaller, shape.missing && shape.extra:
 			return cloneForeign, nil
-		case leftoverPartial:
+		case shape.missing:
 			return cloneUnfinished, nil
-		case leftoverComplete:
 		}
 	}
 
-	replicas, err := st.Resources().ListByDefinition(ctx, cloneName)
-	if err != nil {
-		return cloneUnfinished, errors.Wrapf(err, "list the replicas of %q", cloneName)
+	if !needReplica {
+		return cloneFinished, nil
 	}
 
-	if len(replicas) == 0 {
+	replicas, err := st.Resources().ListByDefinition(ctx, targetName)
+	if err != nil {
+		return cloneUnfinished, errors.Wrapf(err, "list the replicas of %q", targetName)
+	}
+
+	switch {
+	case len(replicas) > 0:
+		return cloneFinished, nil
+	case shape.extra:
+		return cloneForeign, nil
+	default:
 		return cloneUnfinished, nil
 	}
-
-	return cloneFinished, nil
 }
 
 // cloneLeftoverIsFinished answers assessMarkedClone for the replay, writing the
@@ -939,54 +981,62 @@ func (s *Server) cloneLeftoverIsFinished(
 	return false, false
 }
 
-// leftoverProgress is how far an earlier attempt at this clone got.
-type leftoverProgress int
+// leftoverShape is how a target's volumes compare with the snapshot's.
+type leftoverShape struct {
+	// missing: a volume the snapshot recorded is not on the target yet. A
+	// multi-volume clone whose first attempt died between two
+	// VolumeDefinitions().Create calls has this.
+	missing bool
+	// smaller: a volume is on the target at less than the snapshot captured.
+	smaller bool
+	// extra: the target holds a volume number the snapshot never recorded.
+	extra bool
+}
 
-const (
-	// leftoverPartial is a strict prefix of what the snapshot holds, every
-	// volume of it matching. A multi-volume clone whose first attempt died
-	// between two VolumeDefinitions().Create calls lands here.
-	leftoverPartial leftoverProgress = iota
-	// leftoverComplete covers every volume the snapshot holds, at its size.
-	leftoverComplete
-	// leftoverForeign carries a volume that is present and differs, which is
-	// the only shape that is somebody else's definition rather than this
-	// clone half-made.
-	leftoverForeign
-)
-
-// leftoverAgainstSnapshot classifies a leftover target by what it holds.
+// leftoverAgainstSnapshot compares a leftover target's volumes with the
+// snapshot it would be restored from.
 //
 // Comparing volume COUNTS here would refuse the partial: hydration tolerates a
-// volume already present at the matching size precisely so it can be finished,
-// the restore endpoint sharing this data plane does resume the identical
-// state, and the parity doc promises "a repeat under the same name RESUMES it
-// — every step tolerates an object a previous attempt already created". A
-// volume that is present and differs is the one thing that cannot be finished,
-// and it is the only thing refused.
-func leftoverAgainstSnapshot(snap *apiv1.Snapshot, targetVDs []apiv1.VolumeDefinition) leftoverProgress {
+// volume already present so it can be finished, the restore endpoint sharing
+// this data plane does resume the identical state, and the parity doc promises
+// "a repeat under the same name RESUMES it — every step tolerates an object a
+// previous attempt already created".
+//
+// Larger than captured is still the target's own: a finished clone may be
+// expanded like any volume, and an ordinary ControllerExpandVolume on it must
+// not turn every later replay into a refusal whose correction deletes a clone
+// holding data. Hydration never writes a smaller volume and nothing shrinks
+// one, so smaller is the shape that is somebody else's.
+func leftoverAgainstSnapshot(snap *apiv1.Snapshot, targetVDs []apiv1.VolumeDefinition) leftoverShape {
+	var shape leftoverShape
+
 	captured := make(map[int32]int64, len(snap.VolumeDefinitions))
 	for _, vol := range snap.VolumeDefinitions {
 		captured[vol.VolumeNumber] = vol.SizeKib
 	}
 
-	// Larger than captured is still this clone: a finished clone may be
-	// expanded like any volume, and an ordinary ControllerExpandVolume on it
-	// must not turn every later replay into a refusal whose correction deletes
-	// a clone holding data. Hydration never writes a smaller volume and nothing
-	// shrinks one, so smaller is the shape that is somebody else's.
+	present := make(map[int32]struct{}, len(targetVDs))
+
 	for i := range targetVDs {
+		present[targetVDs[i].VolumeNumber] = struct{}{}
+
 		was, ok := captured[targetVDs[i].VolumeNumber]
-		if !ok || targetVDs[i].SizeKib < was {
-			return leftoverForeign
+
+		switch {
+		case !ok:
+			shape.extra = true
+		case targetVDs[i].SizeKib < was:
+			shape.smaller = true
 		}
 	}
 
-	if len(targetVDs) < len(snap.VolumeDefinitions) {
-		return leftoverPartial
+	for number := range captured {
+		if _, ok := present[number]; !ok {
+			shape.missing = true
+		}
 	}
 
-	return leftoverComplete
+	return shape
 }
 
 // cloneSnapshotIsCurrent refuses to resume a clone over a leftover snapshot
@@ -1227,6 +1277,15 @@ func writeCloneRefused(w http.ResponseWriter, status int, srcName, cloneName str
 	})
 }
 
+// writeCloneStoreError is writeStoreError in the envelope this endpoint
+// answers in. A bare []ApiCallRc crashes python-linstor's clone decode, so a
+// typo in the source name, or a replay of a volume-less clone, lost its message
+// to an AttributeError.
+func writeCloneStoreError(w http.ResponseWriter, srcName, cloneName string, err error) {
+	status, callRc := storeErrorRc(err, storeKindResourceDfn)
+	writeCloneRefused(w, status, srcName, cloneName, &callRc)
+}
+
 // cloneEmptyRDShell materialises the empty-source clone path: shallow-copy
 // of the RD spec (Props, RG ref) under a new name. Group D's integration
 // smoke test pins this branch — a freshly-created vol-less RD must be
@@ -1244,9 +1303,21 @@ func writeCloneRefused(w http.ResponseWriter, status int, srcName, cloneName str
 func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	src *apiv1.ResourceDefinition, req *rdCloneRequest,
 ) {
+	// The same gate the data path has. A volume-less source inside its delete
+	// window has nothing to lose, but the shell below is a copy of it, and a
+	// definition born carrying DELETE is refused by every snapshot, restore and
+	// clone that later names it, each saying to wait for a delete that never
+	// comes.
+	if !s.cloneSourceIsNotBeingDeleted(r.Context(), w, src, req.Name) {
+		return
+	}
+
 	clone := *src
 	clone.Name = req.Name
 	clone.UUID = ""
+	// Flags are the source's lifecycle, not part of its shape: a shell that
+	// inherited them would carry a delete, or any later flag, it never had.
+	clone.Flags = nil
 
 	// The caller's own shape wins over the source's, on both clone paths.
 	if len(req.LayerList) > 0 {
@@ -1272,7 +1343,7 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 
 	err := s.Store.ResourceDefinitions().Create(r.Context(), &clone)
 	if err != nil {
-		writeStoreError(w, err)
+		writeCloneStoreError(w, src.Name, clone.Name, err)
 
 		return
 	}
