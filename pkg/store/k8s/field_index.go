@@ -55,8 +55,7 @@ import (
 // than failing on the first refused connection: both binaries exit when this
 // returns an error, and an API server restarting while the pod starts would
 // otherwise be a crash loop. The wait is bounded by indexRegistrationBudget,
-// which stays inside the liveness probe's window, since the health endpoint
-// only comes up once the manager starts.
+// see there for why the bound is what it is.
 //
 //nolint:gocritic // ctrl.Options by value mirrors ctrl.NewManager, which this wraps
 func NewManager(cfg *rest.Config, opts ctrl.Options) (ctrl.Manager, *Store, error) {
@@ -69,9 +68,24 @@ func NewManager(cfg *rest.Config, opts ctrl.Options) (ctrl.Manager, *Store, erro
 }
 
 // indexRegistrationBudget is how long NewManager keeps retrying the index
-// registration before it gives up. config/manager/manager.yaml starts
-// probing liveness after 15s and restarts after three failures 20s apart.
-const indexRegistrationBudget = 60 * time.Second
+// registration before it gives up.
+//
+// Nothing serves /healthz while it waits: the health endpoint comes up in
+// mgr.Start, after construction returns. So every liveness probe fired during
+// the wait fails, and the wait has to end before the kubelet's kill does, or
+// the outage it rides out ends in a restart with nothing in the log saying
+// why. The kubelet kills at initialDelaySeconds + (failureThreshold-1) *
+// periodSeconds. The two deployments that ship leave the period and the
+// threshold at their defaults of 10 and 3 after a 15s delay, which is 35s;
+// config/manager/manager.yaml sets a 20s period, which is 55s. 20s leaves the
+// earliest of those 15s for the process to start and build the manager before
+// registration begins. TestIndexRegistrationBudgetEndsBeforeLivenessKills
+// holds this against the manifests themselves.
+//
+// The bound is on the wait, not on an attempt: an attempt still in flight when
+// the budget runs out is abandoned rather than awaited, since a connection
+// into a dropped route can take client-go's 30s dial timeout to fail.
+const indexRegistrationBudget = 20 * time.Second
 
 //nolint:gocritic // ctrl.Options by value mirrors ctrl.NewManager, which this wraps
 func newIndexedManager(cfg *rest.Config, opts ctrl.Options, budget time.Duration) (ctrl.Manager, error) {
@@ -100,22 +114,50 @@ func registerFieldIndexesWithin(budget time.Duration, indexer ctrlclient.FieldIn
 	pending := fieldIndexes()
 	delay := indexRetryFirstDelay
 
-	for {
-		var err error
+	var lastErr error
 
-		pending, err = registerPending(ctx, indexer, pending)
-		if err == nil {
-			return nil
+	for {
+		attempt := make(chan registrationAttempt, 1)
+
+		go func(pending []fieldIndex) {
+			left, err := registerPending(ctx, indexer, pending)
+			attempt <- registrationAttempt{left: left, err: err}
+		}(pending)
+
+		select {
+		case <-ctx.Done():
+			return gaveUpRegistering(budget, lastErr, ctx.Err())
+		case got := <-attempt:
+			if got.err == nil {
+				return nil
+			}
+
+			pending, lastErr = got.left, got.err
 		}
 
 		select {
 		case <-ctx.Done():
-			return errors.Wrapf(err, "gave up registering the field indexes after %s", budget)
+			return gaveUpRegistering(budget, lastErr, ctx.Err())
 		case <-time.After(delay):
 		}
 
 		delay = min(delay*2, indexRetryMaxDelay)
 	}
+}
+
+type registrationAttempt struct {
+	left []fieldIndex
+	err  error
+}
+
+// gaveUpRegistering names the budget and the most telling error: the last
+// attempt's when one finished, the deadline's when the first never did.
+func gaveUpRegistering(budget time.Duration, lastErr, deadline error) error {
+	if lastErr == nil {
+		lastErr = deadline
+	}
+
+	return errors.Wrapf(lastErr, "gave up registering the field indexes after %s", budget)
 }
 
 const (

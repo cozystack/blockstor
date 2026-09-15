@@ -82,3 +82,38 @@ func TestIndexRegistrationReportsTheLastErrorWhenTheBudgetRunsOut(t *testing.T) 
 		t.Fatalf("err = %v, want it to carry the registration error", err)
 	}
 }
+
+// hangingIndexer never answers, the way discovery does when its connection
+// goes into a dropped route and waits out the dial timeout.
+type hangingIndexer struct {
+	release chan struct{}
+}
+
+func (h hangingIndexer) IndexField(context.Context, ctrlclient.Object, string, ctrlclient.IndexerFunc) error {
+	<-h.release
+
+	return errNeverRegistering
+}
+
+// The budget bounds the wait, not an attempt. An attempt that hangs has to be
+// abandoned when the budget runs out, or the kill the budget was sized to beat
+// arrives anyway, as long after it as the hung call takes to fail.
+func TestIndexRegistrationAbandonsAnAttemptThatOutlivesTheBudget(t *testing.T) {
+	t.Parallel()
+
+	indexer := hangingIndexer{release: make(chan struct{})}
+	t.Cleanup(func() { close(indexer.release) })
+
+	returned := make(chan error, 1)
+
+	go func() { returned <- registerFieldIndexesWithin(200*time.Millisecond, indexer) }()
+
+	select {
+	case err := <-returned:
+		if err == nil {
+			t.Fatal("registration over an indexer that never answered returned no error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("registration was still waiting on a hung attempt 5s into a 200ms budget")
+	}
+}
