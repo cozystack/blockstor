@@ -50,14 +50,17 @@ func (f *flakyIndexer) IndexField(_ context.Context, obj ctrlclient.Object, fiel
 func TestIndexRegistrationRetriesOnlyWhatFailed(t *testing.T) {
 	t.Parallel()
 
+	indexes := fieldIndexes()
+	last := indexes[len(indexes)-1]
+
 	indexer := &flakyIndexer{
-		failOnce:   fmt.Sprintf("%T/%s", fieldIndexes()[2].object, fieldIndexes()[2].field),
+		failOnce:   fmt.Sprintf("%T/%s", last.object, last.field),
 		registered: map[string]int{},
 	}
 
 	err := registerFieldIndexesWithin(10*time.Second, indexer)
 	if err != nil {
-		t.Fatalf("registration after one blip on the third index: %v", err)
+		t.Fatalf("registration after one blip on the last index: %v", err)
 	}
 
 	for _, index := range fieldIndexes() {

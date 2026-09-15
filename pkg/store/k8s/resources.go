@@ -1020,14 +1020,14 @@ func wireToCRDResourceSpec(in *apiv1.Resource) crdv1alpha1.ResourceSpec {
 // listScoped answers a scoped question with a scoped read, and falls back to
 // the exhaustive one when the server cannot serve the selector.
 //
-// The same call has two implementations behind it. Against the uncached
-// client the CLI uses it becomes a fieldSelector on the wire and the API
-// server filters; against a manager's cached client it is served from the
-// index RegisterFieldIndexes installs. Either can be missing — a cluster whose
-// CRD predates the selectable field REJECTS the query, and a manager that
-// never registered the index fails it — and both fail loudly rather than
-// answering partially, which is what makes falling back to the exhaustive read
-// safe rather than a silent downgrade to a wrong answer.
+// The same call has two implementations behind it. Against an uncached reader
+// it becomes a fieldSelector on the wire and the API server filters; against
+// a manager's cached client it is served from the index NewManager registers
+// (see fieldIndexes). Either can be missing — a cluster whose CRD predates the
+// selectable field REJECTS the query, and a cache with no index for the field
+// fails it — and both fail loudly rather than answering partially, which is
+// what makes falling back to the exhaustive read safe rather than a silent
+// downgrade to a wrong answer.
 //
 // The fallback is logged because it is not free: it is the whole-cluster read
 // the scoped one exists to avoid, and an operator wondering why a large

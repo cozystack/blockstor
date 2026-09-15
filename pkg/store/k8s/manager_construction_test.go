@@ -150,3 +150,25 @@ func TestNewManagerGivesUpWhenTheBudgetIsSpent(t *testing.T) {
 		t.Errorf("the error does not say the API server was unreachable: %v", err)
 	}
 }
+
+// The cache carries no index for spec.nodeName, because the node-scoped reads
+// never reach it: a manager-built store answers them from the API reader. A
+// NewManager that handed back a store without that reader would not fail those
+// reads, it would answer each of them by listing every object in the cache.
+func TestNewManagerStoreReadsNodesPastTheCache(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest not available")
+	}
+
+	t.Parallel()
+
+	_, st, err := k8s.NewManager(fixture.env.Config, managerOptions())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	if !k8s.NodeScopedReadsBypassTheCache(st) {
+		t.Error("the store NewManager returned answers node-scoped reads from the cache, " +
+			"which has no index for them")
+	}
+}

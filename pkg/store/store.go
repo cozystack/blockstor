@@ -212,12 +212,10 @@ type ResourceStore interface {
 	// every Resource in the cluster and filtering client-side is what the
 	// REST refusal did before it.
 	//
-	// On the Kubernetes store the filtering happens outside this process,
-	// two different ways: an uncached client sends a fieldSelector the API
-	// server answers, because the CRD declares spec.nodeName selectable;
-	// a manager's cached client is served from an index, which the manager
-	// must have registered (k8s.RegisterFieldIndexes) or the query fails
-	// and the store falls back to reading everything.
+	// On the Kubernetes store the filtering happens outside this process:
+	// the read goes to an uncached reader, the CLI's client or a manager's
+	// API reader, which sends a fieldSelector the API server answers because
+	// the CRD declares spec.nodeName selectable.
 	ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error)
 	Get(ctx context.Context, rdName, node string) (apiv1.Resource, error)
 	Create(ctx context.Context, r *apiv1.Resource) error

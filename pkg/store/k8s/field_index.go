@@ -222,9 +222,10 @@ func SelectorUnsupported(err error) bool {
 }
 
 // FieldResourceNodeName is the field a node-scoped Resource query selects on.
-// The CRD declares it selectable, so an uncached client turns it into a
-// fieldSelector the API server answers; a cached client needs the matching
-// index registered below, or the same query comes back as an error.
+// The CRD declares it selectable, and the query only ever reaches an uncached
+// reader: the CLI's client, or the API reader every manager-built store has
+// (see resources.nodeScopedReader). Both turn it into a fieldSelector the API
+// server answers, so the cache carries no index for it.
 const FieldResourceNodeName = "spec.nodeName"
 
 // FieldResourceDefinitionName is the field a definition-scoped Resource query
@@ -234,7 +235,8 @@ const FieldResourceNodeName = "spec.nodeName"
 // unlabelled replicas were invisible rather than an error.
 const FieldResourceDefinitionName = "spec.resourceDefinitionName"
 
-// FieldStoragePoolNodeName is the same node field on StoragePool.
+// FieldStoragePoolNodeName is the same node field on StoragePool, read the same
+// way and likewise not indexed.
 const FieldStoragePoolNodeName = "spec.nodeName"
 
 // FieldSnapshotDefinitionName is the definition field a snapshot listing
@@ -242,54 +244,26 @@ const FieldStoragePoolNodeName = "spec.nodeName"
 // a Snapshot adopted from LINSTOR by pkg/linstormigrate carries none.
 const FieldSnapshotDefinitionName = "spec.resourceDefinitionName"
 
-// RegisterFieldIndexes teaches a manager's cache the fields the store selects
-// on. Call it on every manager whose client backs a Store.
-//
-// Selectable fields and indexes are two halves of the same capability, and
-// which one answers depends on the reader. An UNCACHED reader — the CLI's
-// client, and the manager's own API reader — sends a fieldSelector to the API
-// server, which answers it from the selectable field the CRD declares. A
-// CACHED reader is served from an index here. The controller binary builds its
-// store on the cached client alone, so its node-scoped reads need these; the
-// apiserver hands the store an API reader as well and its node-scoped reads
-// bypass the cache deliberately (see resources.nodeScopedReader).
-//
-// A field selector has two implementations behind one call. Against an
-// uncached client — the CLI's — it becomes a fieldSelector on the wire and the
-// API server does the filtering, which is why the CRDs declare the fields
-// selectable. Against a manager's cached client it is served from a local
-// index, and a field with no index registered is not a slow query but a failed
-// one: "Index with name field:spec.nodeName does not exist".
-//
-// So without this the store's node-scoped reads fell back to listing every
-// object and filtering in process on both server binaries — the exhaustive
-// read they were written to replace, taken silently on every call.
-func RegisterFieldIndexes(ctx context.Context, indexer ctrlclient.FieldIndexer) error {
-	_, err := registerPending(ctx, indexer, fieldIndexes())
-
-	return err
-}
-
-// fieldIndex is one index RegisterFieldIndexes installs.
+// fieldIndex is one index NewManager registers on the cache.
 type fieldIndex struct {
 	object  ctrlclient.Object
 	field   string
 	extract ctrlclient.IndexerFunc
 }
 
+// fieldIndexes are the fields the store selects on through a manager's cached
+// client, which answers a field selector from a local index or not at all: an
+// unindexed field is not a slow query but a failed one, "Index with name
+// field:spec.resourceDefinitionName does not exist", and the store then falls
+// back to listing every object, silently, on every call.
+//
+// Only the definition-scoped reads go through the cache (resources and
+// snapshots ListByDefinition). The node-scoped ones go to the API reader,
+// which sends the selector to the API server, so an index for spec.nodeName
+// would be maintained over every Resource and StoragePool in the cache and
+// read by nothing.
 func fieldIndexes() []fieldIndex {
 	return []fieldIndex{
-		{
-			object: &crdv1alpha1.Resource{}, field: FieldResourceNodeName,
-			extract: func(obj ctrlclient.Object) []string {
-				res, ok := obj.(*crdv1alpha1.Resource)
-				if !ok || res.Spec.NodeName == "" {
-					return nil
-				}
-
-				return []string{res.Spec.NodeName}
-			},
-		},
 		{
 			object: &crdv1alpha1.Resource{}, field: FieldResourceDefinitionName,
 			extract: func(obj ctrlclient.Object) []string {
@@ -310,17 +284,6 @@ func fieldIndexes() []fieldIndex {
 				}
 
 				return []string{snap.Spec.ResourceDefinitionName}
-			},
-		},
-		{
-			object: &crdv1alpha1.StoragePool{}, field: FieldStoragePoolNodeName,
-			extract: func(obj ctrlclient.Object) []string {
-				pool, ok := obj.(*crdv1alpha1.StoragePool)
-				if !ok || pool.Spec.NodeName == "" {
-					return nil
-				}
-
-				return []string{pool.Spec.NodeName}
 			},
 		},
 	}

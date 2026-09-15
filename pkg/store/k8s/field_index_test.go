@@ -46,8 +46,12 @@ func (c *countingClient) List(ctx context.Context, list ctrlclient.ObjectList, o
 // whole-cluster read the scoped one exists to replace — taken silently, on
 // every call, on both server binaries.
 //
-// So the acceptance is not that the answer is right. A fallback answers right
-// too. It is that the scoped read was actually served.
+// The reads that reach the cache are the definition-scoped ones; the
+// node-scoped reads go to the API reader, and
+// TestNodeScopedReadsUseTheDirectReaderWhenThereIsOne holds that. So the
+// acceptance here is not that the answer is right, since a fallback answers
+// right too, but that each definition-scoped read was actually served from an
+// index.
 func TestRegisteredFieldIndexesServeTheScopedReads(t *testing.T) {
 	if fixture == nil {
 		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
@@ -71,14 +75,16 @@ func TestRegisteredFieldIndexesServeTheScopedReads(t *testing.T) {
 			&apiv1.Resource{Name: "pvc-idx", NodeName: node}); err != nil {
 			t.Fatalf("seed replica on %s: %v", node, err)
 		}
+	}
 
-		if err := seed.StoragePools().Create(ctx, &apiv1.StoragePool{
-			StoragePoolName: "pool-1",
-			NodeName:        node,
-			ProviderKind:    "LVM_THIN",
-		}); err != nil {
-			t.Fatalf("seed pool on %s: %v", node, err)
-		}
+	if err := fixture.client.Create(ctx, &crdv1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-idx.snap-idx"},
+		Spec: crdv1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-idx",
+			SnapshotName:           "snap-idx",
+		},
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
 	}
 
 	counted := &countingClient{Client: startedCachedClient(t)}
@@ -88,22 +94,16 @@ func TestRegisteredFieldIndexesServeTheScopedReads(t *testing.T) {
 	// has caught up. Every one of them is scoped: a fallback would show up in
 	// the counter whichever attempt took it.
 	waitFor(t, func() bool {
-		replicas, err := cached.Resources().ListByNode(t.Context(), "node-a")
-
-		return err == nil && len(replicas) == 1
-	}, "the node's replica")
-
-	waitFor(t, func() bool {
-		pools, err := cached.StoragePools().ListByNode(t.Context(), "node-a")
-
-		return err == nil && len(pools) == 1
-	}, "the node's pool")
-
-	waitFor(t, func() bool {
 		replicas, err := cached.Resources().ListByDefinition(t.Context(), "pvc-idx")
 
 		return err == nil && len(replicas) == 2
 	}, "the definition's replicas")
+
+	waitFor(t, func() bool {
+		snaps, err := cached.Snapshots().ListByDefinition(t.Context(), "pvc-idx")
+
+		return err == nil && len(snaps) == 1
+	}, "the definition's snapshot")
 
 	if n := counted.exhaustive.Load(); n != 0 {
 		t.Errorf("%d whole-collection reads, want none — a scoped read fell back, "+
