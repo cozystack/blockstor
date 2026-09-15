@@ -2108,26 +2108,36 @@ func trueBool() *bool {
 	return &v
 }
 
+// testVolumeDefinitionListFolds asks for a definition's volumes under a
+// spelling it is not stored under, in both directions. The lookup side is
+// folded either way, so only a definition stored in mixed case and asked for in
+// the canonical spelling tells whether the stored side folds too: that is the
+// replica naming a definition `pvc-mixed` whose object was written `PVC-Mixed`.
 func testVolumeDefinitionListFolds(t *testing.T, newStore Factory) {
 	t.Helper()
 
-	s := newStore(t)
-	ctx := t.Context()
+	for _, tc := range []struct{ stored, asked string }{
+		{stored: "PVC-Fold-Stored", asked: "pvc-fold-stored"},
+		{stored: "pvc-fold-asked", asked: "PVC-Fold-Asked"},
+	} {
+		s := newStore(t)
+		ctx := t.Context()
 
-	seedRD(t, s, "pvc-fold-list")
+		seedRD(t, s, tc.stored)
 
-	if err := s.VolumeDefinitions().Create(ctx, "pvc-fold-list",
-		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+		if err := s.VolumeDefinitions().Create(ctx, tc.stored,
+			&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+			t.Fatalf("Create under %q: %v", tc.stored, err)
+		}
 
-	got, err := s.VolumeDefinitions().List(ctx, "PVC-Fold-List")
-	if err != nil {
-		t.Fatalf("List under another spelling: %v", err)
-	}
+		got, err := s.VolumeDefinitions().List(ctx, tc.asked)
+		if err != nil {
+			t.Fatalf("List %q stored as %q: %v", tc.asked, tc.stored, err)
+		}
 
-	if len(got) != 1 {
-		t.Errorf("List under another spelling returned %d volume(s), want 1", len(got))
+		if len(got) != 1 {
+			t.Errorf("List %q stored as %q returned %d volume(s), want 1", tc.asked, tc.stored, len(got))
+		}
 	}
 }
 

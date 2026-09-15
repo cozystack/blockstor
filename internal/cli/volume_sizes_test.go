@@ -209,34 +209,44 @@ func seedDefinitionsForSizes(t *testing.T, backend store.Store, prefix string, n
 func TestVolumeSizesDoNotRetryARefusalPerDefinition(t *testing.T) {
 	t.Parallel()
 
-	backend := store.NewInMemory()
-	calls := 0
-	warnings := &bytes.Buffer{}
-	run := &runContext{
-		Store: countingStore{
-			Store: backend,
-			bulkErr: apierrors.NewForbidden(
-				schema.GroupResource{Group: "blockstor.cozystack.io", Resource: "resourcedefinitions"},
-				"", errors.New("no list permission")),
-			calls: &calls,
-		},
-		Err: warnings,
-	}
+	definitions := schema.GroupResource{Group: "blockstor.cozystack.io", Resource: "resourcedefinitions"}
 
-	resources := seedDefinitionsForSizes(t, backend, "pvc-forbidden-", volumeSizesBulkCutoff+1)
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"forbidden", apierrors.NewForbidden(definitions, "", errors.New("no list permission"))},
+		// An expired token on a CLI invocation: refused as surely as a
+		// missing permission, and just as identically on every retry.
+		{"unauthorized", apierrors.NewUnauthorized("token expired")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	sizes := volumeSizesFor(t.Context(), run, resources)
+			backend := store.NewInMemory()
+			calls := 0
+			warnings := &bytes.Buffer{}
+			run := &runContext{
+				Store: countingStore{Store: backend, bulkErr: tc.err, calls: &calls},
+				Err:   warnings,
+			}
 
-	if calls != 0 {
-		t.Errorf("the refused bulk read was retried as %d per-definition reads", calls)
-	}
+			resources := seedDefinitionsForSizes(t, backend, "pvc-"+tc.name+"-", volumeSizesBulkCutoff+1)
 
-	if len(sizes) != 0 {
-		t.Errorf("sizes for %d definitions after a refusal that reached no data", len(sizes))
-	}
+			sizes := volumeSizesFor(t.Context(), run, resources)
 
-	if !strings.Contains(warnings.String(), "sync percentages unavailable") {
-		t.Errorf("nothing told the operator why the column is empty; stderr = %q", warnings.String())
+			if calls != 0 {
+				t.Errorf("the refused bulk read was retried as %d per-definition reads", calls)
+			}
+
+			if len(sizes) != 0 {
+				t.Errorf("sizes for %d definitions after a refusal that reached no data", len(sizes))
+			}
+
+			if !strings.Contains(warnings.String(), "sync percentages unavailable") {
+				t.Errorf("nothing told the operator why the column is empty; stderr = %q", warnings.String())
+			}
+		})
 	}
 }
 
@@ -336,5 +346,50 @@ func TestVolumeSizesStillFallThroughOnAnOrdinaryBulkFailure(t *testing.T) {
 
 	if warnings.Len() != 0 {
 		t.Errorf("warned about a column it went on to fill: %q", warnings.String())
+	}
+}
+
+// failingLists refuses every per-definition read, the way a listing under the
+// bulk cutoff meets an API server that is refusing reads altogether.
+type failingLists struct {
+	store.VolumeDefinitionStore
+}
+
+var errPerDefinitionReadFailed = errors.New("read one definition failed")
+
+func (failingLists) List(context.Context, string) ([]apiv1.VolumeDefinition, error) {
+	return nil, errPerDefinitionReadFailed
+}
+
+type failingListsStore struct {
+	store.Store
+}
+
+func (f failingListsStore) VolumeDefinitions() store.VolumeDefinitionStore {
+	return failingLists{f.Store.VolumeDefinitions()}
+}
+
+// Under the cutoff the listing never takes the bulk read, so the warning the
+// bulk path gives is not the one that fires. One definition that could not be
+// read is the degradation the per-definition path accepts; none of them read
+// is a failure, and without its own warning it reaches the operator as a
+// column that looks like a cluster with nothing to sync.
+func TestVolumeSizesWarnWhenNoDefinitionCouldBeReadOneAtATime(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	warnings := &bytes.Buffer{}
+	run := &runContext{Store: failingListsStore{backend}, Err: warnings}
+
+	resources := seedDefinitionsForSizes(t, backend, "pvc-unreadable-", volumeSizesBulkCutoff-1)
+
+	sizes := volumeSizesFor(t.Context(), run, resources)
+
+	if len(sizes) != 0 {
+		t.Errorf("sizes for %d definitions that could not be read", len(sizes))
+	}
+
+	if !strings.Contains(warnings.String(), "sync percentages unavailable") {
+		t.Errorf("every per-definition read failed and nothing said so; stderr = %q", warnings.String())
 	}
 }
