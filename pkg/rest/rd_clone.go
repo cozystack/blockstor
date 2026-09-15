@@ -521,23 +521,25 @@ func (s *Server) readCloneLeftover(ctx context.Context, cloneName string) (clone
 // next access rather than stranding a replica.
 func (s *Server) cloneShellParentRGSurvived(
 	ctx context.Context, w http.ResponseWriter, srcName, cloneName, stampedRG string,
-) bool {
+) (*apiv1.APICallRc, bool) {
 	if stampedRG == "" {
-		return true
+		return nil, true
 	}
 
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
 		// The check failed, not the clone. Same stance as the data-plane
-		// half: an inconclusive safety net must not undo work that succeeded.
+		// half, and the same report: an inconclusive safety net must not
+		// undo work that succeeded, and the caller is told it went
+		// unverified rather than left to find out from an apiserver log.
 		log.FromContext(ctx).Info("could not re-check the cloned shell's parent group",
 			"resourceDefinition", cloneName, "resourceGroup", stampedRG, "reason", err.Error())
 
-		return true
+		return uncheckedCloneGroupWarning(cloneName, stampedRG, err), true
 	}
 
 	if survived {
-		return true
+		return nil, true
 	}
 
 	// Checked, unlike refuseRDCreateOnRGDeletedRace: the 404 below tells the
@@ -555,7 +557,7 @@ func (s *Server) cloneShellParentRGSurvived(
 			Correc: "delete '" + cloneName + "' by hand",
 		})
 
-		return false
+		return nil, false
 	}
 
 	writeCloneRefused(w, http.StatusNotFound, srcName, cloneName, &apiv1.APICallRc{
@@ -568,7 +570,7 @@ func (s *Server) cloneShellParentRGSurvived(
 		Correc: correcRecreateGroupThenClone,
 	})
 
-	return false
+	return nil, false
 }
 
 // cloneLeftoverIsUsable decides whether a definition that carries this clone's
@@ -921,7 +923,8 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	if !s.cloneShellParentRGSurvived(r.Context(), w, src.Name, clone.Name, clone.ResourceGroupName) {
+	uncheckedRG, ok := s.cloneShellParentRGSurvived(r.Context(), w, src.Name, clone.Name, clone.ResourceGroupName)
+	if !ok {
 		return
 	}
 
@@ -932,15 +935,7 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	// client.ResourceDefinitionCloneStarted" — surfaced as a
 	// CSI CreateVolume-from-source failure in csi-sanity. Emit the
 	// envelope shape upstream specifies.
-	writeJSON(w, http.StatusCreated, cloneStartedResponse{
-		Location:   "/v1/resource-definitions/" + src.Name + "/clone/" + clone.Name,
-		SourceName: src.Name,
-		CloneName:  clone.Name,
-		Messages: &[]apiv1.APICallRc{{
-			RetCode: maskInfo,
-			Message: "resource definition cloned: " + clone.Name,
-		}},
-	})
+	writeCloneStarted(w, src.Name, clone.Name, "resource definition cloned: "+clone.Name, uncheckedRG)
 }
 
 // handleRDCloneStatus answers golinstor's `CloneStatus` poll. The

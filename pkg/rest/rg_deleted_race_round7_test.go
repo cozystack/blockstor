@@ -369,3 +369,57 @@ func TestSnapshotRestoreRetrySucceedsAfterAHydrateFailure(t *testing.T) {
 		t.Errorf("retry after one transient hydrate failure = %d, want 201", retry.StatusCode)
 	}
 }
+
+// Both halves of the clone's post-write group check proceed on an inconclusive
+// read. The data half told the caller; the volume-less half left it in a log.
+func TestRDCloneOfAVolumelessSourceWarnsWhenTheGroupCannotBeRechecked(t *testing.T) {
+	t.Parallel()
+
+	for _, unreadable := range []bool{true, false} {
+		name := map[bool]string{true: "unreadable", false: "readable"}[unreadable]
+
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			backend := store.NewInMemory()
+			ctx := t.Context()
+			src, dst, rg := "shell-warn-src-"+name, "shell-warn-dst-"+name, "grp-shell-warn-"+name
+
+			if err := backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: rg}); err != nil {
+				t.Fatalf("seed RG: %v", err)
+			}
+
+			if err := backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+				Name: src, ResourceGroupName: rg,
+			}); err != nil {
+				t.Fatalf("seed the volume-less source: %v", err)
+			}
+
+			var served store.Store = backend
+			if unreadable {
+				served = failingRGReadStore{backend}
+			}
+
+			base, stop := startServerWithStore(t, served)
+			defer stop()
+
+			resp := postClone(t, base, src, map[string]any{"name": dst})
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("status = %d, want 201", resp.StatusCode)
+			}
+
+			var envelope cloneStartedResponse
+			if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil || envelope.Messages == nil {
+				t.Fatalf("decode the envelope: %v", err)
+			}
+
+			warned := envelopeWarnsAbout(*envelope.Messages, rg)
+			if warned != unreadable {
+				t.Errorf("warned about the unverified group = %v, want %v; messages %+v",
+					warned, unreadable, *envelope.Messages)
+			}
+		})
+	}
+}
