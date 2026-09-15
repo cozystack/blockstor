@@ -299,10 +299,29 @@ func TestRDCloneReplayRefusesWhenTheParentGroupCannotBeRead(t *testing.T) {
 	defer stop2()
 
 	replay := postClone(t, base2, "src-rgread", map[string]any{"name": "dst-rgread", "use_zfs_clone": true})
-	_ = replay.Body.Close()
+	defer func() { _ = replay.Body.Close() }()
 
-	if replay.StatusCode == http.StatusCreated {
-		t.Error("replay answered 201 with the parent group unreadable")
+	if replay.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("replay with the parent group unreadable = %d, want 500", replay.StatusCode)
+	}
+
+	// Refused as unreadable, not as deleted: the deleted wording tells the
+	// operator to delete a working clone over a read that failed.
+	rc := decodeCloneMessage(t, replay)
+	said := rc.Message + " " + rc.Cause + " " + rc.Correc
+
+	if !strings.Contains(rc.Message, "could not be read") {
+		t.Errorf("message = %q, want it to say the group could not be read", rc.Message)
+	}
+
+	if rc.Correc != "retry the clone" {
+		t.Errorf("correction = %q, want %q", rc.Correc, "retry the clone")
+	}
+
+	for _, wrong := range []string{"no longer exists", "delete"} {
+		if strings.Contains(said, wrong) {
+			t.Errorf("refusal over an unreadable group says %q: %q", wrong, said)
+		}
 	}
 }
 

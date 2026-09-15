@@ -624,8 +624,26 @@ func (s *Server) cloneLeftoverIsUsable(
 	// An unreadable group is refused rather than waved through. Refusing
 	// costs nothing here, since the CSI retry is self-healing, while a false
 	// 201 binds a PV to a definition parented to nothing.
+	//
+	// But it is refused as unreadable, not as deleted. The two readings send
+	// the operator to opposite actions: "the group is gone, delete the clone"
+	// over an apiserver blip destroys a working volume for a reason that is
+	// not true, where the honest answer is to try again.
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
-	if err == nil && survived {
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone target '" + cloneName + "' exists, but its parent resource group '" +
+				stampedRG + "' could not be read: " + err.Error(),
+			Cause: "the replay only answers for a clone whose parent group resolves, and this " +
+				"read failed rather than saying the group is gone",
+			Correc: "retry the clone",
+		})
+
+		return false
+	}
+
+	if survived {
 		return true
 	}
 
