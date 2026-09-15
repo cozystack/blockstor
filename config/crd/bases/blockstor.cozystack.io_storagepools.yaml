@@ -223,6 +223,8 @@ spec:
           optionalOldSelf: true
           rule: oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.poolName
             + '.' + self.spec.nodeName).lowerAscii()
+    selectableFields:
+    - jsonPath: .spec.nodeName
     served: true
     storage: true
     subresources:

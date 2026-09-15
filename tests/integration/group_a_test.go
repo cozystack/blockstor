@@ -374,7 +374,8 @@ func TestGroupANodeLostCascadesOrphans(t *testing.T) {
 	}
 
 	cli := &harness.CLI{URL: stack.RestURL}
-	cli.JSON(t, "node", "lost", harness.NodeWorker1)
+	harness.AssertNotRefused(t, "node lost "+harness.NodeWorker1,
+		cli.JSON(t, "node", "lost", harness.NodeWorker1))
 
 	// worker-1 replica must be gone (handler-driven cascade — not
 	// finalizer-driven, see node_lifecycle.go cascadeOrphansForLostNode).
