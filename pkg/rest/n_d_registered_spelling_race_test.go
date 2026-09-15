@@ -23,21 +23,6 @@ type foldingNodes struct {
 	onDelete func(ctx context.Context, registered string) error
 }
 
-func (f foldingNodes) registered(ctx context.Context, name string) (string, error) {
-	all, err := f.List(ctx)
-	if err != nil {
-		return "", errors.Wrap(err, "list nodes")
-	}
-
-	for i := range all {
-		if store.FoldName(all[i].Name) == store.FoldName(name) {
-			return all[i].Name, nil
-		}
-	}
-
-	return name, nil
-}
-
 func (f foldingNodes) Get(ctx context.Context, name string) (apiv1.Node, error) {
 	registered, err := f.registered(ctx, name)
 	if err != nil {
@@ -59,6 +44,21 @@ func (f foldingNodes) Delete(ctx context.Context, name string) error {
 	}
 
 	return f.onDelete(ctx, registered)
+}
+
+func (f foldingNodes) registered(ctx context.Context, name string) (string, error) {
+	all, err := f.List(ctx)
+	if err != nil {
+		return "", errors.Wrap(err, "list nodes")
+	}
+
+	for i := range all {
+		if store.FoldName(all[i].Name) == store.FoldName(name) {
+			return all[i].Name, nil
+		}
+	}
+
+	return name, nil
 }
 
 type foldingNodeStore struct {
@@ -93,7 +93,7 @@ func TestNodeDeleteRollsBackARaceUnderTheRegisteredSpelling(t *testing.T) {
 		nodes: foldingNodes{
 			NodeStore: inner.Nodes(),
 			onDelete: func(ctx context.Context, registered string) error {
-				return inner.Resources().Create(ctx, &apiv1.Resource{Name: "rd-race", NodeName: registered}) //nolint:wrapcheck // test double
+				return inner.Resources().Create(ctx, &apiv1.Resource{Name: "rd-race", NodeName: registered})
 			},
 		},
 	}

@@ -1125,21 +1125,9 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The spellings the two reference walks ask in are resolved once, here,
-	// while the node row still exists: the post-Delete re-walk runs after it
-	// is gone, and re-deriving them then loses the registered spelling, which
-	// is the one a racing replica written under it is found by.
-	var spellings []string
-
-	if !force {
-		var err error
-
-		spellings, err = store.NodeSpellings(ctx, s.Store, name)
-		if err != nil {
-			writeStoreError(w, err)
-
-			return
-		}
+	spellings, ok := s.nodeDeleteSpellings(ctx, w, name, force)
+	if !ok {
+		return
 	}
 
 	(&deleteWithRollback[apiv1.Node]{
@@ -1176,6 +1164,27 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 			}})
 		},
 	}).run(w)
+}
+
+// nodeDeleteSpellings resolves, once and while the node row still exists, the
+// spellings both reference walks of a plain node delete ask in. The post-Delete
+// re-walk runs after the row is gone, and re-deriving them then loses the
+// registered spelling, which is the one a racing replica written under it is
+// found by. A forced delete walks nothing and needs none. False means an error
+// has been written.
+func (s *Server) nodeDeleteSpellings(ctx context.Context, w http.ResponseWriter, name string, force bool) ([]string, bool) {
+	if force {
+		return nil, true
+	}
+
+	spellings, err := store.NodeSpellings(ctx, s.Store, name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return nil, false
+	}
+
+	return spellings, true
 }
 
 // refuseNodeDeleteIfReferenced runs the pre-Delete Bug 92 / Bug 179
