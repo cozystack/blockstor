@@ -1125,13 +1125,18 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	spellings, ok := s.nodeDeleteSpellings(ctx, w, name, force)
+	if !ok {
+		return
+	}
+
 	(&deleteWithRollback[apiv1.Node]{
 		refuseIfReferenced: func() bool {
 			if force {
 				return false
 			}
 
-			return s.refuseNodeDeleteIfReferenced(w, r, name)
+			return s.refuseNodeDeleteIfReferenced(w, r, name, spellings)
 		},
 		capture: func() (apiv1.Node, bool) {
 			return s.captureNode(ctx, name)
@@ -1144,7 +1149,7 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 				return false
 			}
 
-			return s.rollbackNodeDeleteIfRaced(w, r, name, &captured)
+			return s.rollbackNodeDeleteIfRaced(w, r, name, spellings, &captured)
 		},
 		writeWarn: func() {
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
@@ -1161,6 +1166,27 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	}).run(w)
 }
 
+// nodeDeleteSpellings resolves, once and while the node row still exists, the
+// spellings both reference walks of a plain node delete ask in. The post-Delete
+// re-walk runs after the row is gone, and re-deriving them then loses the
+// registered spelling, which is the one a racing replica written under it is
+// found by. A forced delete walks nothing and needs none. False means an error
+// has been written.
+func (s *Server) nodeDeleteSpellings(ctx context.Context, w http.ResponseWriter, name string, force bool) ([]string, bool) {
+	if force {
+		return nil, true
+	}
+
+	spellings, err := store.NodeSpellings(ctx, s.Store, name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return nil, false
+	}
+
+	return spellings, true
+}
+
 // refuseNodeDeleteIfReferenced runs the pre-Delete Bug 92 / Bug 179
 // walk. Returns true when the HTTP error has already been written
 // (the caller must stop processing) and false when the delete may
@@ -1175,8 +1201,8 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 // autoplacer's free-space ranking then crashed on the nil-Node
 // lookup. Mirrors `n lost`'s cascadeOrphansForLostNode which
 // already walks both stores in lock-step.
-func (s *Server) refuseNodeDeleteIfReferenced(w http.ResponseWriter, r *http.Request, name string) bool {
-	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), name)
+func (s *Server) refuseNodeDeleteIfReferenced(w http.ResponseWriter, r *http.Request, name string, spellings []string) bool {
+	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), spellings)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -1241,15 +1267,16 @@ func (s *Server) refuseNodeDeleteIfEvicted(ctx context.Context, w http.ResponseW
 
 // referencesOnNode bundles the two reference walks the Bug 92 /
 // Bug 179 gates run in lock-step (Resources + StoragePools on the
-// target node). Returning both lists in one call keeps the
-// pre-walk and the post-Delete re-walk byte-identical — drift
-// between the two would let a racing dependent through the gate.
-func (s *Server) referencesOnNode(ctx context.Context, name string) ([]string, []string, error) {
+// target node). Returning both lists in one call, over spellings
+// handleNodeDelete resolved once before the Delete, keeps the
+// pre-walk and the post-Delete re-walk asking the same question —
+// drift between the two would let a racing dependent through the gate.
+func (s *Server) referencesOnNode(ctx context.Context, spellings []string) ([]string, []string, error) {
 	// One implementation with the CLI, which refuses on the same question.
 	// Keeping a second copy here is how the default-diskless-pool carve-out
 	// came to exist on one door only.
 	//nolint:wrapcheck // surfaced via writeStoreError
-	return store.ReferencesOnNode(ctx, s.Store, name)
+	return store.ReferencesUnderSpellings(ctx, s.Store, spellings)
 }
 
 // buildNodeDeleteRefusal assembles the 409 envelope for the Bug 92
@@ -1324,8 +1351,10 @@ func (s *Server) captureNode(ctx context.Context, name string) (apiv1.Node, bool
 // re-walk to ALSO catch a racing `sp c <node>` so an SP CRD
 // persisted during the TOCTOU window can't orphan into a deleted
 // Node either.
-func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Request, name string, captured *apiv1.Node) bool {
-	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), name)
+func (s *Server) rollbackNodeDeleteIfRaced(
+	w http.ResponseWriter, r *http.Request, name string, spellings []string, captured *apiv1.Node,
+) bool {
+	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), spellings)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -1365,7 +1394,11 @@ func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Reques
 // order on the K8s backend, and operators rerun `n d` to confirm
 // the refusal message after every replica drop).
 func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, error) {
-	resources, err := s.Store.Resources().List(ctx)
+	// The node-scoped read, not the whole cluster filtered here: the
+	// refusal decision already moved to it, and a message helper answering
+	// the same one-node question with a full List was the read this change
+	// exists to remove.
+	resources, err := store.ReplicasOnNode(ctx, s.Store, node)
 	if err != nil {
 		return nil, errors.Wrap(err, "list resources")
 	}
@@ -1373,9 +1406,7 @@ func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, er
 	var refs []string
 
 	for i := range resources {
-		if resources[i].NodeName == node {
-			refs = append(refs, resources[i].Name)
-		}
+		refs = append(refs, resources[i].Name)
 	}
 
 	sort.Strings(refs)

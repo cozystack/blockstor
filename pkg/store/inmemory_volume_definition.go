@@ -45,13 +45,41 @@ func (s *inMemoryVolumeDefinitions) List(_ context.Context, rdName string) ([]ap
 
 	out := make([]apiv1.VolumeDefinition, 0)
 
+	// Folded, the way ListAll keys and the Kubernetes store resolves the name
+	// through the RD's folded metadata.name. Compared verbatim, a mixed-case
+	// lookup answered differently depending on which side of the CLI's
+	// bulk-read cutoff it landed on.
+	want := FoldName(rdName)
+
 	for k := range s.m {
-		if k.rd == rdName {
+		if FoldName(k.rd) == want {
 			out = append(out, s.m[k])
 		}
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].VolumeNumber < out[j].VolumeNumber })
+
+	return out, nil
+}
+
+// ListAll groups every stored volume by its parent definition, keyed the way
+// the Kubernetes store keys it: folded, because LINSTOR names are
+// case-insensitive and the caller's spelling need not be the stored one.
+func (s *inMemoryVolumeDefinitions) ListAll(_ context.Context) (map[string][]apiv1.VolumeDefinition, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string][]apiv1.VolumeDefinition)
+
+	for k := range s.m {
+		key := FoldName(k.rd)
+		out[key] = append(out[key], s.m[k])
+	}
+
+	for rd := range out {
+		vds := out[rd]
+		sort.Slice(vds, func(i, j int) bool { return vds[i].VolumeNumber < vds[j].VolumeNumber })
+	}
 
 	return out, nil
 }

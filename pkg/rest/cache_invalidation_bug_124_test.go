@@ -81,6 +81,10 @@ func (l *laggingResources) ListByDefinition(ctx context.Context, rdName string) 
 	return l.inner.ListByDefinition(ctx, rdName) //nolint:wrapcheck // test helper
 }
 
+func (l *laggingResources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
+	return l.inner.ListByNode(ctx, node) //nolint:wrapcheck // test helper
+}
+
 func (l *laggingResources) Get(ctx context.Context, rdName, node string) (apiv1.Resource, error) {
 	return l.inner.Get(ctx, rdName, node) //nolint:wrapcheck // test helper
 }

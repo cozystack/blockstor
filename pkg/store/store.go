@@ -26,6 +26,7 @@ package store
 
 import (
 	"context"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -47,6 +48,32 @@ var (
 type NodeStore interface {
 	List(ctx context.Context) ([]apiv1.Node, error)
 	Get(ctx context.Context, name string) (apiv1.Node, error)
+
+	// GetUncached answers the same question as Get, from the API server
+	// rather than from a cache that may trail it.
+	//
+	// It exists for the one caller that cannot take the fast answer: a
+	// destructive decision made on the node's own status and acted on
+	// immediately. `n lost` refuses while the satellite still reports
+	// ONLINE, and unregisters the node plus cascades away its replicas
+	// when it does not — so a status a beat behind is wrong in both
+	// directions. A stale ONLINE refuses the cleanup a dead node needs;
+	// a stale OFFLINE tears down a node whose satellite is answering.
+	//
+	// The node-scoped listings behind the same decision already read this
+	// way (pkg/store/k8s/resources.go nodeScopedReader); this is the field
+	// the decision turns on, read from the same place.
+	//
+	// Where a store has no direct reader this is Get unchanged. That is
+	// the CLI's shape, whose client is uncached to begin with, and the
+	// in-memory store's, which has nothing to be behind. It is NOT a
+	// shape a manager-backed binary may take: a cached client without
+	// its manager's reader answers this from the cache and says nothing
+	// while it does, which is what the controller binary did to its own
+	// `--enable-rest-api` surface. Take the store pkg/store/k8s.NewManager
+	// returns with the manager; nothing else builds one.
+	GetUncached(ctx context.Context, name string) (apiv1.Node, error)
+
 	Create(ctx context.Context, n *apiv1.Node) error
 	Update(ctx context.Context, n *apiv1.Node) error
 	Delete(ctx context.Context, name string) error
@@ -169,9 +196,27 @@ type ResourceDefinitionStore interface {
 // composite key is (resource_definition_name, node_name).
 // Update/Patch follow the annotation contract documented on
 // ResourceGroupStore (nil = untouched, empty = clear).
+// Eleven methods rather than ten because the node-scoped listing earns its
+// place: without it every `node delete` answers a question about one node by
+// listing every Resource in the cluster.
+//
+//nolint:interfacebloat // one read shape per question the callers actually ask
 type ResourceStore interface {
 	List(ctx context.Context) ([]apiv1.Resource, error)
 	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error)
+
+	// ListByNode returns the replicas hosted on one node.
+	//
+	// The node-scoped question is asked on every `node delete`, on the
+	// refusal path as well as under --force, and answering it by listing
+	// every Resource in the cluster and filtering client-side is what the
+	// REST refusal did before it.
+	//
+	// On the Kubernetes store the filtering happens outside this process:
+	// the read goes to an uncached reader, the CLI's client or a manager's
+	// API reader, which sends a fieldSelector the API server answers because
+	// the CRD declares spec.nodeName selectable.
+	ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error)
 	Get(ctx context.Context, rdName, node string) (apiv1.Resource, error)
 	Create(ctx context.Context, r *apiv1.Resource) error
 	Update(ctx context.Context, r *apiv1.Resource) error
@@ -241,6 +286,43 @@ type ResourceStore interface {
 	PatchResourceSpec(ctx context.Context, rdName, node string, mutate func(*apiv1.Resource) error) error
 }
 
+// FoldName canonicalises a LINSTOR object name for use as a map key, or for
+// comparing two spellings of the same object. LINSTOR identifiers are
+// case-insensitive — `DfltRscGrp` and `dfltrscgrp` address one resource group,
+// which is why the Kubernetes store lowercases them on the way to a CRD name
+// (pkg/store/k8s/crdname.go). Anything that keys objects by name owes its
+// callers the same equality the store itself uses.
+//
+// That equality is available in process and not on the wire. A CRD's
+// selectableFields declare a path, not a transform, so the API server compares
+// spec.nodeName and spec.resourceDefinitionName verbatim, and the scoped reads
+// built on them compare the same way — including their in-process fallback,
+// deliberately, because a fallback that folded would answer a different
+// question than the selector it stands in for. A replica whose spec spells its
+// definition in a case the definition is not stored under is therefore missed
+// by both, and `rd d`'s refusal and sweep read it that way too.
+//
+// The same boundary reaches `node delete`. Its refusal and its `--force`
+// cascade are both node-scoped reads on `spec.nodeName`, while Nodes().Get and
+// Delete fold: spell the node in a case its replicas were not written with and
+// the reads see nothing, the refusal passes, and the node goes with replicas
+// still pointing at it. ReplicasOnNode narrows that to one shape by asking in
+// the caller's spelling, the folded one and the node's registered one; a
+// replica written under any other case is still missed. `resource list` does
+// not narrow its read at all for this reason, and filters the whole listing
+// with the case-insensitive comparison instead.
+//
+// Folding on the write side instead would fold what clients read back:
+// crdToWireResource reports these spec values as the object's names, and
+// crdname.go's annotation exists precisely to keep the stored spelling
+// (DfltRscGrp) rather than the lowercased slug, because linstor-csi and
+// runbooks compare those strings. Closing the gap properly means a folded
+// field beside the display one, selected on and never rendered — a schema
+// change with a migration for adopted objects, not a comparison.
+func FoldName(name string) string {
+	return strings.ToLower(name)
+}
+
 // VolumeDefinitionStore persists VolumeDefinition objects. The composite
 // key is (resource_definition_name, volume_number); upstream LINSTOR keeps
 // VolumeDefinitions inline on the ResourceDefinition, and so do we (the CRD
@@ -248,6 +330,29 @@ type ResourceStore interface {
 // surface; the implementation stitches it onto the RD CRD.
 type VolumeDefinitionStore interface {
 	List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error)
+
+	// ListAll returns every definition's volumes in ONE request, keyed by
+	// FoldName of the resource-definition name — look an entry up with
+	// FoldName(name), not with the name as you hold it.
+	//
+	// The fold is not decoration. A replica names its definition in
+	// whatever case it was written with, and the definition itself is
+	// stored in whatever case IT was written with; LINSTOR treats the two
+	// as the same object and a map does not. Keyed raw, a caller holding
+	// the replica's spelling silently misses the entry and renders a
+	// definition as though it had no volumes.
+	//
+	// List answers for one definition, and a caller that needs the whole
+	// cluster's volumes has to call it once per name. On the Kubernetes
+	// store each of those is a GET of one ResourceDefinition — and the CLI
+	// client is deliberately uncached, so they are real sequential round
+	// trips. `resource list` did exactly that to fill its
+	// sync-percentage column: one LIST plus one GET per definition, which
+	// is the command an operator runs during an incident.
+	//
+	// The volumes live inline on the definition, so a single list already
+	// carries them.
+	ListAll(ctx context.Context) (map[string][]apiv1.VolumeDefinition, error)
 	Get(ctx context.Context, rdName string, volumeNumber int32) (apiv1.VolumeDefinition, error)
 	Create(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
 
@@ -292,6 +397,16 @@ type VolumeDefinitionStore interface {
 type SnapshotStore interface {
 	List(ctx context.Context) ([]apiv1.Snapshot, error)
 	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)
+
+	// ListByDefinitionUncached answers the same question from the API server
+	// when the store has a direct reader. It exists for `rd d`: the refusal
+	// over existing snapshots and the sweep for the one that raced the delete
+	// are both acted on at once, and the row most likely to be missing from a
+	// cache at that moment is exactly the one that raced. Every other listing
+	// stays on ListByDefinition, since the snapshot view paginates through it
+	// and an uncached read beside a cached one is the pagination regression
+	// the store's constructor records.
+	ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)
 	Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error)
 	Create(ctx context.Context, snap *apiv1.Snapshot) error
 	Update(ctx context.Context, snap *apiv1.Snapshot) error

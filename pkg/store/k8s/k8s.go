@@ -62,6 +62,10 @@ type Store struct {
 }
 
 // New wraps a controller-runtime client and returns a store.Store.
+//
+// Not for a store backed by a manager: NewManager returns that one, built from
+// the manager's own client and direct reader, and a manager's cached client
+// handed to New answers the reads that decide a node's fate from a cache.
 func New(c ctrlclient.Client) *Store {
 	return NewWithAPIReader(c, nil)
 }
@@ -89,13 +93,13 @@ func New(c ctrlclient.Client) *Store {
 // cached List still under-reported).
 func NewWithAPIReader(c ctrlclient.Client, apiReader ctrlclient.Reader) *Store {
 	s := &Store{c: c}
-	s.nodes = &nodes{c: c}
-	s.storagePools = &storagePools{c: c}
+	s.nodes = &nodes{c: c, apiReader: apiReader}
+	s.storagePools = &storagePools{c: c, apiReader: apiReader}
 	s.resourceGroups = &resourceGroups{c: c}
 	s.resourceDefinitions = &resourceDefinitions{c: c, apiReader: apiReader}
-	s.resources = &resources{c: c}
+	s.resources = &resources{c: c, apiReader: apiReader}
 	s.volumeDefinitions = &volumeDefinitions{c: c, apiReader: apiReader}
-	s.snapshots = &snapshots{c: c}
+	s.snapshots = &snapshots{c: c, apiReader: apiReader}
 	s.physicalDevices = &physicalDevices{c: c}
 	s.controllerProps = &controllerProps{c: c}
 	s.storagePoolDefinitions = &storagePoolDefinitions{m: map[string]store.StoragePoolDefinition{}}
