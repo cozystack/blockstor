@@ -480,7 +480,7 @@ func (s *Server) restoreParentRGSurvived(
 		return nil, true
 	}
 
-	if !made.Created {
+	if !made.createdHere() {
 		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{
 			*adoptedOverDeletedGroupRefusal("restore", newRDName, stampedRG, correcRecreateGroupThenRestore),
 		})
@@ -583,7 +583,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		return materialisedRD{}, err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
-	made := materialisedRD{Name: newRD.Name, StampedRG: newRD.ResourceGroupName, Created: true}
+	made := createdRD(newRD.Name, newRD.ResourceGroupName)
 
 	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap)
 	if err != nil {
@@ -604,16 +604,22 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	return made, nil
 }
 
-// materialisedRD is what materializeRestoredRD wrote, and whether the
-// definition under that name is this call's to undo.
+// materialisedRD is what a materialisation wrote, and whether the definition
+// under that name is this call's to undo.
 //
-// Created is the line every compensation on these paths draws. A definition
-// this call created is its own work, and a rollback may take it with everything
-// under it. A definition that was already there, adopted as the leftover of
-// an earlier attempt at the same operation, is not: that attempt may still be
-// running, and reaping it deletes someone else's clone. Every materialisation
-// on this branch creates, so the field only ever says true here; it exists so
-// the guard over it does not depend on which door tolerates a leftover.
+// Created-or-adopted is the line every compensation on these paths draws. A
+// definition this call created is its own work, and a rollback may take it with
+// everything under it. A definition that was already there, adopted as the
+// leftover of an earlier attempt at the same operation, is not: that attempt
+// may still be running, and reaping it deletes someone else's clone.
+//
+// So the answer is not a field a producer can forget. It is carried in an
+// unexported origin whose zero value says nothing, and the two constructors are
+// the only way to state it; a literal that skips them leaves the origin
+// unstated, and createdHere answers false for it, which is the safe side of the
+// line. Every materialisation on this branch creates, so only createdRD is
+// called here; the shape exists so a door that starts tolerating a leftover
+// cannot hand a compensation someone else's definition by omission.
 type materialisedRD struct {
 	// Name is the target definition.
 	Name string
@@ -621,8 +627,35 @@ type materialisedRD struct {
 	StampedRG string
 	// Placed are the nodes this call stamped a replica on.
 	Placed []string
-	// Created is set once this call's own create of the definition succeeded.
-	Created bool
+
+	origin rdOrigin
+}
+
+// rdOrigin says who the definition under the target name belongs to.
+type rdOrigin uint8
+
+const (
+	// rdOriginUnstated is the zero value, and never a claim of ownership.
+	rdOriginUnstated rdOrigin = iota
+	// rdOriginCreated is this call's own create of the definition.
+	rdOriginCreated
+	// rdOriginAdopted is a definition that was already there.
+	rdOriginAdopted
+)
+
+// createdRD records a definition this call created.
+func createdRD(name, stampedRG string) materialisedRD {
+	return materialisedRD{Name: name, StampedRG: stampedRG, origin: rdOriginCreated}
+}
+
+// adoptedRD records a definition that was already there when this call ran.
+func adoptedRD(name, stampedRG string) materialisedRD {
+	return materialisedRD{Name: name, StampedRG: stampedRG, origin: rdOriginAdopted}
+}
+
+// createdHere reports whether a compensation may reap this definition.
+func (m materialisedRD) createdHere() bool {
+	return m.origin == rdOriginCreated
 }
 
 // materialiseAfterCreateError is a materialisation that failed after this call
@@ -750,7 +783,7 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 
 		err := s.Store.Resources().Create(ctx, &res)
 		if err != nil {
-			return placed, err //nolint:wrapcheck // surfaced via writeStoreError
+			return placed, err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
 		}
 
 		placed = append(placed, node)
@@ -827,7 +860,7 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 
 		err := s.Store.VolumeDefinitions().Create(ctx, rdName, &vd)
 		if err != nil {
-			return err //nolint:wrapcheck // surfaced via writeStoreError
+			return err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
 		}
 	}
 
