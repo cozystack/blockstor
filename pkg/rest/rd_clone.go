@@ -273,16 +273,19 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 
 	var req rdCloneRequest
 
-	if !decodeJSON(w, r, &req) {
+	// Decoded without the shared answer: a malformed body, an unknown field or
+	// one over the size cap reaches python-linstor's clone decode too, and it
+	// reads `messages` off whatever comes back, so the array crashes it before
+	// the operator sees why their body was refused.
+	decodeErr := decodeJSONBody(r, &req)
+	if decodeErr != nil {
+		status, callRc := decodeErrorRc(decodeErr)
+		writeCloneRefused(w, status, srcName, req.Name, &callRc)
+
 		return
 	}
 
-	if req.Name == "" {
-		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: "name is required",
-		})
-
+	if !cloneTargetNameIsUsable(w, srcName, &req) {
 		return
 	}
 
@@ -332,6 +335,43 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.cloneEmptyRDShell(w, r, &src, &req)
+}
+
+// cloneTargetNameIsUsable holds the clone door to the identifier rules every
+// other door that creates a definition runs: `rd create`, `spawn` and the
+// restore all validate the name they are handed, and a clone that skipped them
+// could create a definition `rd create` answers 400 for, which
+// tests/e2e/rd-name-validation-bulk.sh treats as a contract.
+//
+// The internal snapshot's name is checked with it. It is derived by prefixing
+// the target, so a target just inside the identifier ceiling would take the
+// clone through a snapshot create the store refuses, after the definition is
+// already there.
+func cloneTargetNameIsUsable(w http.ResponseWriter, srcName string, req *rdCloneRequest) bool {
+	if req.Name == "" {
+		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "name is required",
+		})
+
+		return false
+	}
+
+	nameErr := validateLinstorName("resource definition", req.Name)
+	if nameErr == nil {
+		nameErr = validateLinstorName("snapshot", cloneSnapshotName(req.Name))
+	}
+
+	if nameErr != nil {
+		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + srcName + "': " + nameErr.Error(),
+		})
+
+		return false
+	}
+
+	return true
 }
 
 // cloneWithData materialises a clone of a VD-bearing source RD by
