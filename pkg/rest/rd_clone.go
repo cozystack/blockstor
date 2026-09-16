@@ -312,7 +312,7 @@ func (s *Server) cloneParentRGSurvived(
 		return nil, true
 	}
 
-	if !made.Created {
+	if !made.createdHere() {
 		writeCloneRefused(w, http.StatusConflict, src.Name, cloneName,
 			adoptedOverDeletedGroupRefusal("clone", cloneName, stampedRG, correcRecreateGroupThenClone))
 
@@ -513,12 +513,14 @@ func (s *Server) readCloneLeftover(ctx context.Context, cloneName string) (clone
 // leaves exactly the definition the guard exists to prevent, on the cheaper of
 // the two branches.
 //
-// The compensation is RD-create's rather than the cascade, and deliberately:
-// what this branch created is a bare definition, with no volumes hydrated and
-// no replicas stamped, so a single Delete undoes all of it. Best-effort, for
-// the reason refuseRDCreateOnRGDeletedRace is: the operator gets the refusal
-// either way, and a definition that outlives a failed delete surfaces on its
-// next access rather than stranding a replica.
+// The compensation is the one both other post-write doors run, on the same
+// detached context. What this branch created is a bare definition, with no
+// volumes hydrated and no replicas stamped, so a single Delete would undo what
+// it wrote — but the rollback is needed exactly when the caller is already
+// gone, and a Delete on the request's own context fails on its first call
+// then. The shared rollback earns its other steps by not assuming the
+// definition is bare, which is what an auto-tiebreaker stamped underneath it
+// in the meantime would make false.
 func (s *Server) cloneShellParentRGSurvived(
 	ctx context.Context, w http.ResponseWriter, srcName, cloneName, stampedRG string,
 ) (*apiv1.APICallRc, bool) {
@@ -547,8 +549,8 @@ func (s *Server) cloneShellParentRGSurvived(
 	// shell exactly where it was, parented to a group that is gone. The data
 	// path refuses to make that claim over a failed compensation, and the two
 	// halves of one guard should not answer the same question differently.
-	err = s.Store.ResourceDefinitions().Delete(ctx, cloneName)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	err = s.rollBackDetached(ctx, cloneName, nil)
+	if err != nil {
 		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
 			Message: "clone of resource definition '" + srcName + "': " +

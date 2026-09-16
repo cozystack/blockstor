@@ -78,6 +78,14 @@ func newRollbackGateStore(backend store.Store, target string) rollbackGateStore 
 func abandonAtTheRollback(t *testing.T, url string, body any, gated rollbackGateStore) {
 	t.Helper()
 
+	abandonAtTheGate(t, url, body, gated.gate.reached, gated.gate.release)
+}
+
+// abandonAtTheGate is the same, over whichever step of a rollback the fixture
+// gated: it waits for reached, abandons the request, and closes release.
+func abandonAtTheGate(t *testing.T, url string, body any, reached, release chan struct{}) {
+	t.Helper()
+
 	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -105,7 +113,7 @@ func abandonAtTheRollback(t *testing.T, url string, body any, gated rollbackGate
 	}()
 
 	select {
-	case <-gated.gate.reached:
+	case <-reached:
 	case err := <-done:
 		t.Fatalf("the request finished (err=%v) before the rollback started; the fixture needs it abandoned", err)
 	case <-time.After(20 * time.Second):
@@ -118,7 +126,7 @@ func abandonAtTheRollback(t *testing.T, url string, body any, gated rollbackGate
 		t.Fatal("the request finished; the fixture needs it abandoned")
 	}
 
-	close(gated.gate.release)
+	close(release)
 }
 
 func waitForDefinitionGone(t *testing.T, backend store.Store, name string) {
@@ -249,9 +257,13 @@ func TestPostWriteGroupCheckLeavesAnAdoptedDefinitionInPlace(t *testing.T) {
 				seedAdoptedTarget(t, st, "adopt-dst", "grp-adopt-gone")
 
 				rec := httptest.NewRecorder()
-				made := materialisedRD{
-					Name: "adopt-dst", StampedRG: "grp-adopt-gone", Placed: []string{"node-a"}, Created: created,
+
+				made := adoptedRD("adopt-dst", "grp-adopt-gone")
+				if created {
+					made = createdRD("adopt-dst", "grp-adopt-gone")
 				}
+
+				made.Placed = []string{"node-a"}
 
 				if check(&Server{Store: st}, rec, made) {
 					t.Fatal("the check passed over a parent group that does not exist")
