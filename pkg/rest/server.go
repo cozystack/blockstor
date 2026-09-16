@@ -366,6 +366,13 @@ func isSSEPath(p string) bool {
 	return p == "/v1/events/drbd/promotion" || p == "/v1/events/nodes"
 }
 
+// gracefulShutdownWindow is how long Shutdown waits for handlers that are
+// still running. It is derived from detachedRollbackBudget, which is the
+// longest thing a handler can still be doing after its own caller has gone:
+// see that constant for the whole chain, down to the termination grace the
+// manifests give the pod.
+const gracefulShutdownWindow = detachedRollbackBudget + shutdownMargin
+
 // waitAndShutdown blocks until ctx is cancelled or any listener
 // reports a fatal error, then gracefully shuts down every server.
 func waitAndShutdown(ctx context.Context, servers []*http.Server, errCh <-chan error) error {
@@ -383,7 +390,7 @@ func waitAndShutdown(ctx context.Context, servers []*http.Server, errCh <-chan e
 	// one of them reported a fatal serve error — otherwise the surviving
 	// server's goroutine leaks and keeps its port bound, blocking a clean
 	// restart.
-	shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gracefulShutdownWindow)
 	defer cancel()
 
 	var shutErr error
