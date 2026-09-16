@@ -77,7 +77,29 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 
 // detachedRollbackBudget bounds a rollback that runs after the request it
 // belongs to has ended.
-const detachedRollbackBudget = 30 * time.Second
+//
+// It is the first term of one chain, and every term below it is derived so the
+// process outlives a rollback it started:
+//
+//	detachedRollbackBudget  12s  two cacheConvergeBudget waits plus its writes
+//	+ shutdownMargin         3s  the rest of a graceful shutdown
+//	= gracefulShutdownWindow 15s how long Shutdown waits for in-flight handlers
+//	+ terminationGraceMargin 5s
+//	<= terminationGracePeriodSeconds in every manifest that serves REST
+//
+// The rollback runs inside the handler on a context Shutdown cannot cancel, so
+// a window shorter than the budget means a SIGTERM during a rolling restart
+// cuts a cascade in half and kills the connection that would have said so,
+// which is the state WithoutCancel was added to prevent one failure mode over.
+// Cutting the budget instead is not the trade: its two waits are what keep the
+// definition from going over replicas that were never stamped.
+//
+// TestRollbackBudgetFitsTheShutdownWindow holds the chain, manifests included.
+const (
+	detachedRollbackBudget = 12 * time.Second
+	shutdownMargin         = 3 * time.Second
+	terminationGraceMargin = 5 * time.Second
+)
 
 // rollBackDetached runs rollBackMaterialisedRD on a context the request cannot
 // end, bounded by detachedRollbackBudget.
