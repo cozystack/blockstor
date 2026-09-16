@@ -21,8 +21,10 @@ package rest
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/passphrase"
@@ -1174,6 +1176,11 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// existing `blockstor.cozystack.io/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
+	// Read before the delete, used after it: the definition's own props
+	// are the only record of the internal snapshot a clone left on its
+	// source.
+	internalSnap := s.internalCloneSnapshotBehind(r.Context(), name)
+
 	err = s.cascadeDeleteResources(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
@@ -1220,6 +1227,14 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// close: either ordering yields a clean cluster.
 	s.sweepOrphanSnapshotsAfterRDDelete(r.Context(), name)
 
+	// And the internal snapshot the clone of this definition took on its
+	// SOURCE. Nothing else reaps it: the operator-facing snapshot doors
+	// and the auto-snapshot reaper are all driven by a name or a label
+	// this one never carries, so it outlived the target it was taken for
+	// and left the source undeletable through this very handler, which
+	// refuses a definition that has snapshots.
+	s.reapInternalCloneSnapshot(r.Context(), internalSnap)
+
 	// Bug 124: block the response until the local informer cache has
 	// observed the RD + child Resource deletions. Without this gate,
 	// `linstor rd d <rd>` returns SUCCESS and the very next
@@ -1231,6 +1246,51 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
 	}})
+}
+
+// internalCloneSnapshot addresses the snapshot a clone left on its source.
+type internalCloneSnapshot struct {
+	source string
+	name   string
+}
+
+// internalCloneSnapshotBehind reads the definition's marker and answers with
+// the snapshot to reap once it is gone, or the zero value when there is none.
+//
+// The marker is `<source>:<snapshot>` on both paths that write it, and the
+// snapshot half is what says which one this is. A clone derives it from the
+// target, so it names an object nobody else uses; a restore carries the
+// operator's own snapshot there, which is somebody's data and is never reaped.
+func (s *Server) internalCloneSnapshotBehind(ctx context.Context, rdName string) internalCloneSnapshot {
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return internalCloneSnapshot{}
+	}
+
+	source, snapName, found := strings.Cut(rd.Props[restoreFromSnapshotKey], ":")
+	if !found || !strings.EqualFold(snapName, cloneSnapshotName(rdName)) {
+		return internalCloneSnapshot{}
+	}
+
+	return internalCloneSnapshot{source: source, name: snapName}
+}
+
+// reapInternalCloneSnapshot drops that snapshot from the source once the
+// target it backs is gone.
+//
+// Best-effort, like the sweep below: the delete has already succeeded and the
+// operator has been told so, and a snapshot that survives is visible in
+// `linstor s l` for them to drop by hand.
+func (s *Server) reapInternalCloneSnapshot(ctx context.Context, snap internalCloneSnapshot) {
+	if snap.source == "" || snap.name == "" {
+		return
+	}
+
+	err := s.Store.Snapshots().Delete(ctx, snap.source, snap.name)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		log.FromContext(ctx).V(1).Info("internal clone snapshot could not be reaped",
+			"source", snap.source, "snapshot", snap.name, "reason", err.Error())
+	}
 }
 
 // sweepOrphanSnapshotsAfterRDDelete drops any Snapshot rows that
