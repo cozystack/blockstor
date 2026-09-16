@@ -188,8 +188,6 @@ func (f failingVolumeListStore) VolumeDefinitions() store.VolumeDefinitionStore 
 // messages, so a bare []ApiCallRc loses the operator's error to an
 // AttributeError. Every refusal on the POST has to be the object.
 func TestRDCloneRefusalsKeepTheCloneStartedEnvelope(t *testing.T) {
-	t.Parallel()
-
 	st := store.NewInMemory()
 	seedDeployedCloneSource(t, st, "src-env7")
 
@@ -197,13 +195,11 @@ func TestRDCloneRefusalsKeepTheCloneStartedEnvelope(t *testing.T) {
 		t.Fatalf("seed the volume-less source: %v", err)
 	}
 
-	// The subtests run in parallel, after this function has returned, so the
-	// servers outlive it through Cleanup rather than defer.
 	base, stop := startServerWithStore(t, st)
-	t.Cleanup(stop)
+	defer stop()
 
 	blind, stopBlind := startServerWithStore(t, failingVolumeListStore{st})
-	t.Cleanup(stopBlind)
+	defer stopBlind()
 
 	if code := cloneOnce(t, base, "src-shell7", "dst-shell7", nil); code != http.StatusCreated {
 		t.Fatalf("first volume-less clone = %d, want 201", code)
@@ -219,8 +215,6 @@ func TestRDCloneRefusalsKeepTheCloneStartedEnvelope(t *testing.T) {
 		{name: "source-volumes-unreadable", base: blind, src: "src-env7", body: map[string]any{"name": "dst-y7"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			resp := postClone(t, tc.base, tc.src, tc.body)
 			defer func() { _ = resp.Body.Close() }()
 

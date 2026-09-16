@@ -370,10 +370,10 @@ func TestRDCloneResumesWhenTheLeftoverStackIsTheResolvedDefault(t *testing.T) {
 		t.Fatalf("seed the leftover snapshot: %v", err)
 	}
 
-	// The leftover an earlier client left, carrying the stack it resolved.
+	// The leftover materializeRestoredRD writes off a source that records no
+	// stack: it records none either.
 	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name:       "dst-defstack",
-		LayerStack: apiv1.DefaultLayerStack(),
+		Name: "dst-defstack",
 		Props: map[string]string{
 			restoreFromSnapshotKey: restoreMarker("src-defstack", cloneSnapshotName("dst-defstack")),
 		},
@@ -384,16 +384,17 @@ func TestRDCloneResumesWhenTheLeftoverStackIsTheResolvedDefault(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	// The retry omits layer_list, so the shape it asks for is the source's,
-	// which stores none.
+	// The retry names the stack linstor-csi names on every clone, which is
+	// what an unset stack resolves to.
 	resp := postClone(t, base, "src-defstack", map[string]any{
 		"name":          "dst-defstack",
 		"use_zfs_clone": true,
+		"layer_list":    apiv1.DefaultLayerStack(),
 	})
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("status = %d, want 201 — an unset stack means the default, so the leftover "+
+		t.Fatalf("status = %d, want 201: an unset stack means the default, so the leftover "+
 			"and the request describe the same shape", resp.StatusCode)
 	}
 

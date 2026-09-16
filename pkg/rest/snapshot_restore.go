@@ -661,11 +661,12 @@ func requestedShapeDiffers(existing *apiv1.ResourceDefinition, rgName string, la
 		return ""
 	}
 
-	// An unset stack is a definition that never said, not one with no layers —
-	// the same resolution cloneLayerStackIsHonourable makes, and for the same
-	// reason. Without it a leftover stamped [DRBD, STORAGE] by one client
-	// refuses a retry from another that omits layer_list, and the refusal
-	// renders the empty side as nothing at all.
+	// An unset stack is a definition that never said, which is what
+	// materializeRestoredRD copies off a source that never said either, and
+	// not a definition with no layers. Unresolved, that leftover compared
+	// against a retry naming [DRBD, STORAGE], which is every linstor-csi
+	// retry, reads as adding both layers and refuses the resume. A retry that
+	// names nothing returns four lines above and never reaches this.
 	have := resolvedLayerStack(existing.LayerStack)
 
 	added, dropped := layerSetDifference(have, layers)
