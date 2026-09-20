@@ -12,7 +12,8 @@
 #
 # Three cases:
 #   1. invalid order `luks,drbd,storage`  — LUKS must sit below DRBD,
-#      not above it (DRBD must replicate ciphertext). CLI sends it;
+#      not above it (upstream LINSTOR's ordering; the accepted stack
+#      encrypts at rest per node and replicates plaintext). CLI sends it;
 #      controller rejects.
 #   2. duplicate layer `drbd,drbd,storage` — CLI sends it; controller
 #      rejects, naming the duplicate.

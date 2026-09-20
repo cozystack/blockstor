@@ -167,15 +167,29 @@ type DRBDResourceOptions struct {
 	AutoTieBreaker *bool `json:"autoTieBreaker,omitempty"`
 }
 
-// EncryptionConfig configures LUKS encryption for a ResourceDefinition.
-// Replaces the `Props["DrbdOptions/Encryption/passphrase"]` plaintext-
-// in-spec antipattern with a Secret reference. Cluster-wide encryption
-// (single passphrase per cluster) is configured via ControllerConfig.
+// EncryptionConfig is the per-ResourceDefinition encryption block.
+//
+// NOT IMPLEMENTED. It was intended to replace the
+// `Props["DrbdOptions/Encryption/passphrase"]` plaintext-in-spec
+// antipattern with a Secret reference, but no code path consumes it.
+// blockstor derives every LUKS key from the single cluster passphrase
+// configured via ControllerConfig. See docs/byok-design.md.
 type EncryptionConfig struct {
-	// passphraseSecretRef references the Secret carrying the LUKS
-	// passphrase under the key `passphrase`. The satellite reads it
-	// via the apiserver during reconcile; the passphrase never lands
-	// on Spec in plaintext.
+	// passphraseSecretRef names a Secret carrying a LUKS passphrase
+	// under the key `passphrase`.
+	//
+	// NOT IMPLEMENTED — setting this does NOT encrypt the volume with
+	// the referenced Secret. blockstor uses the cluster passphrase for
+	// every LUKS volume, so a resource definition that sets this field
+	// is encrypted with the CLUSTER key and the referenced Secret opens
+	// nothing.
+	//
+	// The field is kept, rather than removed, because it is the right
+	// shape for the per-volume key work in docs/byok-design.md and
+	// removing it would prune the reference out of stored objects.
+	// While it does nothing, a LUKS-layered resource definition that
+	// sets it gets an `EncryptionKeyIgnored` Condition on each of its
+	// Resources saying so.
 	// +optional
 	PassphraseSecretRef *corev1.LocalObjectReference `json:"passphraseSecretRef,omitempty"`
 }

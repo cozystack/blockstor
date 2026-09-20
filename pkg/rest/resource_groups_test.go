@@ -1351,8 +1351,9 @@ func TestSpawnInheritsLayerListDRBDLUKSStorage_W10(t *testing.T) {
 	}
 
 	// The LUKS slot must sit BETWEEN DRBD and STORAGE — DRBD-above-
-	// LUKS means DRBD replicates ciphertext (the whole point of the
-	// allowed ordering), and STORAGE-terminal anchors the disk
+	// LUKS is the arrangement where each node encrypts its own storage
+	// independently (DRBD's lower disk is the mapper, so the wire
+	// carries plaintext), and STORAGE-terminal anchors the disk
 	// backend at the bottom of the chain.
 	drbdIdx := -1
 	luksIdx := -1

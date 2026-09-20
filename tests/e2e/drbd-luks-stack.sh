@@ -4,7 +4,11 @@
 #
 # Phase 9: layer stack ["DRBD","LUKS","STORAGE"] — encrypted
 # at-rest + replicated over DRBD. Each peer holds an independent
-# LUKS-encrypted copy; DRBD ships ciphertext between peers.
+# LUKS-encrypted copy. DRBD sits ABOVE LUKS and its lower disk is the
+# dm-crypt mapper (step 6 below asserts exactly that), so what travels
+# between peers is PLAINTEXT and each node encrypts on the way to its
+# own LV. LUKS in this stack is at-rest protection per node, not
+# transport protection.
 #
 # Setup:
 #   - 2-replica RD on workers 1+2 with LayerStack=["DRBD","LUKS","STORAGE"]
@@ -99,4 +103,4 @@ if [[ "$md5_pre" != "$md5_failover" ]]; then
     exit 1
 fi
 
-echo ">> DRBD-LUKS-STACK OK (replicated ciphertext, plaintext stable across failover)"
+echo ">> DRBD-LUKS-STACK OK (per-node at-rest ciphertext, plaintext stable across failover)"

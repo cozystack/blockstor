@@ -24,21 +24,38 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-
-	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
-// vdPassphrasePropKey is the upstream-compatible per-VD LUKS
-// passphrase property name. Stored on the VD's props bag so the
-// satellite-side reconciler (once the cluster-side `cryptsetup
-// luksChangeKey` orchestration lands in Phase 12) can pick it up
-// via the same drbd_options channel ApplyResources already
-// serialises. Mirrors upstream LINSTOR's
-// `DrbdOptions/Encrypt/Passphrase` namespace so existing tooling and
-// golinstor clients can read it back without translation.
+// Historical note — the per-VD passphrase property.
 //
-//nolint:gosec // this is a property-name constant, not the secret value itself
-const vdPassphrasePropKey = "DrbdOptions/Encrypt/Passphrase"
+// This handler used to stamp the operator-supplied key onto the
+// volume definition's props bag under upstream LINSTOR's
+// `DrbdOptions/Encrypt/Passphrase` name and answer `200 VD passphrase
+// stored; cluster-side LUKS rotation pending Phase 12`. Two things
+// were wrong with that, and neither was visible to the caller:
+//
+//  1. Nothing ever read the key back. The dispatcher lifts exactly
+//     two spellings onto the `LuksPassphrase` wire prop —
+//     `DrbdOptions/EncryptPassphrase` and
+//     `DrbdOptions/Encryption/passphrase` (pkg/dispatcher) — and this
+//     was neither. The volume kept the cluster passphrase while the
+//     CLI reported success.
+//  2. Volume definitions are inline in
+//     `ResourceDefinition.spec.volumeDefinitions`, so the key landed
+//     in cleartext in etcd, reachable by anyone holding `get
+//     resourcedefinitions`. That is a materially wider RBAC surface
+//     than Secret access, and in blockstor the CRDs ARE the store —
+//     `kubectl get -o yaml` reads it straight out. The REST read path
+//     does redact it (the `encrypt` needle in
+//     sensitivePropSubstrings covers the key, and VD props are
+//     scrubbed in volume_definitions.go), so this was an at-rest
+//     disclosure through the Kubernetes door rather than a REST leak.
+//
+// Storing a secret in cleartext to power a feature that does not
+// exist is all cost. The handler now refuses with a structured 501
+// and persists nothing. Restoring the verb is part of the per-volume
+// data-key work in docs/byok-design.md §4, which is also what makes
+// the value meaningful.
 
 // vdPassphraseRotateBody mirrors upstream Java's
 // `JsonGenTypes.VolumeDefinitionModifyPassphrase` — a single
@@ -66,30 +83,25 @@ func (b vdPassphraseRotateBody) proofOfKnowledge() string {
 	return b.Passphrase
 }
 
-// handleVDPassphraseRotate serves Bug 233. Validates the parent RD +
-// VD exist (404 otherwise), then accepts a `{"new_passphrase":"…"}`
-// wrapped object, a `{"passphrase":"…"}` alias, OR a bare JSON
-// string `"…"` (the upstream `PassPhraseEnter` spec shape) and
-// stamps the value onto the VD's props bag under the
-// upstream-compatible `DrbdOptions/Encrypt/Passphrase` key.
+// handleVDPassphraseRotate serves Bug 233's wire shape for
+// `linstor vd set-passphrase`. It validates the parent RD + VD exist
+// and that the body is well-formed, then refuses: blockstor has no
+// per-volume key to set (see the historical note above).
 //
-// The actual satellite-side LUKS-header re-encryption (the
-// `cryptsetup luksChangeKey` orchestration) is pending Phase 12; the
-// wire-shape registration here is what unblocks
-// `linstor vd set-passphrase`. Once the cluster-side rotation
-// reconciler lands, this handler will additionally enqueue a
-// rotation task — for now the persisted prop is the source-of-truth
-// for the next reconcile pass.
+// The route stays registered and the body decoding stays intact so
+// golinstor and python-linstor keep parsing the exchange normally and
+// the operator gets a specific ERROR line rather than a 404 that
+// reads like a version mismatch.
 //
 // Status surface:
 //   - missing parent RD or VD → 404 (writeStoreError)
-//   - empty `new_passphrase` (any shape) → 400 + envelope (data-loss
-//     guard mirroring the Bug 172 cluster-passphrase contract — an
-//     empty rotation would erase the VD's LUKS key)
+//   - empty `new_passphrase` (any shape) → 400 + envelope. Retained
+//     ahead of the 501 so the precedence callers already observe
+//     (missing object → malformed request → unimplemented feature)
+//     does not shift.
 //   - malformed body → 400 + envelope (Bug 158/161 typed-error path)
-//   - happy path → 200 + MASK_INFO envelope ("VD passphrase queued
-//     for rotation, cluster-side orchestration pending Phase 12"),
-//     so python-linstor's success line renders without confusion.
+//   - well-formed request → 501 + envelope naming the gap and
+//     stating explicitly that the supplied key was not stored.
 func (s *Server) handleVDPassphraseRotate(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	vlmNrRaw := r.PathValue("vlmNr")
@@ -139,30 +151,23 @@ func (s *Server) handleVDPassphraseRotate(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Bug 204b shape: typed-Patch with retry-on-conflict so a
-	// reconciler write on the parent RD between the read and the
-	// write re-applies the rotation onto fresh state instead of
-	// surfacing a 409 to the operator.
-	err = s.Store.VolumeDefinitions().PatchVolumeDefinitionSpec(r.Context(), rdName, int32(vlmNr),
-		func(live *apiv1.VolumeDefinition) error {
-			if live.Props == nil {
-				live.Props = map[string]string{}
-			}
-
-			live.Props[vdPassphrasePropKey] = want
-
-			return nil
-		})
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
-	}
-
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "VD passphrase stored; cluster-side LUKS rotation pending Phase 12",
-	}})
+	// The value is deliberately NOT persisted. See the historical note
+	// at the top of this file: storing it put the operator's key in
+	// cleartext into the RD CRD while no code path ever read it back,
+	// so the volume kept the cluster key and the operator was told
+	// otherwise. Refuse the verb until per-volume keys exist.
+	//
+	// `want` is validated above and then deliberately discarded — the
+	// empty-body 400 stays ahead of this 501 so the wire contract
+	// (404 → 400 → 501) does not shift under callers that already
+	// distinguish "no such volume" from "malformed request".
+	writeError(w, http.StatusNotImplemented,
+		"per-volume LUKS passphrases are not implemented: blockstor derives every LUKS key "+
+			"from the single cluster passphrase, so a per-volume key cannot take effect. "+
+			"The supplied value was NOT stored — persisting it would have put your key in "+
+			"cleartext on the ResourceDefinition while the volume kept the cluster key. "+
+			"Keys written by earlier releases are still on disk and this refusal does not "+
+			"remove them; docs/layer-stack.md has the purge recipe. See docs/byok-design.md.")
 }
 
 // decodeVDPassphraseBody accepts BOTH the wrapped object shape
