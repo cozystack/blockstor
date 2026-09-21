@@ -367,10 +367,12 @@ func isSSEPath(p string) bool {
 }
 
 // gracefulShutdownWindow is how long Shutdown waits for handlers that are
-// still running. It is derived from detachedRollbackBudget, which is the
-// longest thing a handler can still be doing after its own caller has gone:
-// see that constant for the whole chain, down to the termination grace the
-// manifests give the pod.
+// still running. It is derived from detachedRollbackBudget, which bounds every
+// context a handler detaches from its caller (detachedCompensation: the
+// post-write group re-read, the rollbacks, rollbackSpawn), so it is the
+// longest a handler can still be working after its caller has gone. See that
+// constant for the whole chain, down to the termination grace the manifests
+// give the pod.
 const gracefulShutdownWindow = detachedRollbackBudget + shutdownMargin
 
 // waitAndShutdown blocks until ctx is cancelled or any listener

@@ -75,34 +75,56 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 	return false, err
 }
 
-// detachedRollbackBudget bounds a rollback that runs after the request it
-// belongs to has ended.
+// detachedRollbackBudget bounds the compensation a post-write door runs after
+// the request it belongs to may have ended: the re-read of the parent group
+// that decides whether to roll back, and the rollback itself.
 //
 // It is the first term of one chain, and every term below it is derived so the
-// process outlives a rollback it started:
+// process outlives a compensation it started:
 //
-//	detachedRollbackBudget  12s  two cacheConvergeBudget waits plus its writes
-//	+ shutdownMargin         3s  the rest of a graceful shutdown
-//	= gracefulShutdownWindow 15s how long Shutdown waits for in-flight handlers
-//	+ terminationGraceMargin 5s
+//	groupRecheckBudget        0.6s  parentRGSurvived's cache-retry
+//	+ 2 * cacheConvergeBudget 10s   the rollback's two convergence waits
+//	+ rollbackWriteBudget     2s    the rollback's own writes
+//	= detachedRollbackBudget  12.6s
+//	+ shutdownMargin          2s    the rest of a graceful shutdown
+//	= gracefulShutdownWindow  14.6s how long Shutdown waits for in-flight handlers
+//	+ terminationGraceMargin  5s
 //	<= terminationGracePeriodSeconds in every manifest that serves REST
 //
-// The rollback runs inside the handler on a context Shutdown cannot cancel, so
-// a window shorter than the budget means a SIGTERM during a rolling restart
-// cuts a cascade in half and kills the connection that would have said so,
-// which is the state WithoutCancel was added to prevent one failure mode over.
-// Cutting the budget instead is not the trade: its two waits are what keep the
-// definition from going over replicas that were never stamped.
+// The compensation runs inside the handler on a context Shutdown cannot
+// cancel, so a window shorter than the budget means a SIGTERM during a rolling
+// restart cuts a cascade in half and kills the connection that would have said
+// so, which is the state WithoutCancel was added to prevent one failure mode
+// over. Cutting the budget instead is not the trade: its two waits are what
+// keep the definition from going over replicas that were never stamped.
 //
 // TestRollbackBudgetFitsTheShutdownWindow holds the chain, manifests included.
 const (
-	detachedRollbackBudget = 12 * time.Second
-	shutdownMargin         = 3 * time.Second
+	groupRecheckBudget     = cacheRetryAttempts * cacheRetryDelay
+	rollbackWriteBudget    = 2 * time.Second
+	detachedRollbackBudget = groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget
+	shutdownMargin         = 2 * time.Second
 	terminationGraceMargin = 5 * time.Second
 )
 
+// detachedCompensation is the context a compensation runs on: the request
+// cannot end it, and detachedRollbackBudget bounds it.
+//
+// A post-write door takes one for the group re-read as well as for the
+// rollback, because the read is what decides whether to roll back. On the
+// request's context a caller that has gone, or a SIGTERM (the server hands
+// every request the runnable's own context as its base), turns that read into
+// a cancelled one, which parentRGSurvived can only report as "could not
+// check", and the door then answers success over a group that is gone. A
+// cancelled caller is not an inconclusive answer about the group.
+func detachedCompensation(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), detachedRollbackBudget)
+}
+
 // rollBackDetached runs rollBackMaterialisedRD on a context the request cannot
-// end, bounded by detachedRollbackBudget.
+// end, bounded by detachedRollbackBudget. A door that already holds a
+// detachedCompensation context passes it in, and the rollback gets whatever of
+// that budget the group re-read left.
 //
 // Every compensation on these paths is most likely to be needed when the
 // caller has already gone: a CSI caller times out mid-clone, and the RG-deleted
@@ -111,7 +133,7 @@ const (
 // leaves exactly what it exists to remove, a definition every later retry is
 // refused over until an operator deletes it.
 func (s *Server) rollBackDetached(ctx context.Context, rdName string, placed []string) error {
-	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedRollbackBudget)
+	rollbackCtx, cancel := detachedCompensation(ctx)
 	defer cancel()
 
 	return s.rollBackMaterialisedRD(rollbackCtx, rdName, placed)

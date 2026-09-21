@@ -296,6 +296,9 @@ func (s *Server) cloneParentRGSurvived(
 ) (*apiv1.APICallRc, bool) {
 	stampedRG := made.StampedRG
 
+	ctx, cancel := detachedCompensation(ctx)
+	defer cancel()
+
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
 		// The check failed, not the clone. See restoreParentRGSurvived for
@@ -527,6 +530,9 @@ func (s *Server) cloneShellParentRGSurvived(
 	if stampedRG == "" {
 		return nil, true
 	}
+
+	ctx, cancel := detachedCompensation(ctx)
+	defer cancel()
 
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {

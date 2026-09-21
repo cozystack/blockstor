@@ -441,6 +441,9 @@ func (s *Server) restoreParentRGSurvived(
 ) (*apiv1.APICallRc, bool) {
 	newRDName, stampedRG := made.Name, made.StampedRG
 
+	ctx, cancel := detachedCompensation(ctx)
+	defer cancel()
+
 	survived, err := s.parentRGSurvived(ctx, stampedRG)
 	if err != nil {
 		// The CHECK failed, which says nothing about the restore: that
@@ -452,9 +455,11 @@ func (s *Server) restoreParentRGSurvived(
 		// AlreadyExists and answers 409 from then on.
 		//
 		// getRGWithCacheRetry returns immediately on anything that is not
-		// NotFound, so this branch is apiserver unavailability, a timeout, a
-		// decode failure or a cancelled request context — none of them a
-		// statement about the group.
+		// NotFound, so this branch is apiserver unavailability, a timeout or
+		// a decode failure, none of them a statement about the group. A
+		// cancelled request is not among them: the read runs on the detached
+		// context above, so a caller that has gone does not get its restore
+		// waved through over a group that is gone.
 		log.FromContext(ctx).Info("could not re-check the restored definition's parent group",
 			"resourceDefinition", newRDName, "resourceGroup", stampedRG, "reason", err.Error())
 

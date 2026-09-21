@@ -304,8 +304,13 @@ func copyVolumeGroupProps(vgs []apiv1.VolumeGroup, volNumber int32) map[string]s
 // rollbackSpawn best-effort cleans up a half-spawned RD. Errors are
 // swallowed because we are already on an error path; the controller's
 // reconciler will sweep stale RDs on next pass.
+//
+// Detached like every other compensation, and bounded by the same budget, so
+// the graceful-shutdown window derived from that budget covers it too: an
+// unbounded delete against an apiserver that stopped answering would outlive
+// the window and be cut off by the kill instead.
 func rollbackSpawn(ctx context.Context, st store.Store, rdName string) {
-	deleteCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	deleteCtx, cancel := detachedCompensation(ctx)
 	defer cancel()
 
 	err := st.ResourceDefinitions().Delete(deleteCtx, rdName)
