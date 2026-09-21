@@ -557,12 +557,17 @@ func (s *Server) cloneShellParentRGSurvived(
 	// halves of one guard should not answer the same question differently.
 	err = s.rollBackDetached(ctx, cloneName, nil)
 	if err != nil {
+		// The advice the shared rollback's other doors give, for the step
+		// that failed: a snapshot on the shell makes "delete it by hand" a
+		// dead end, since `rd d` refuses a definition that has snapshots.
+		cause, correc := rollbackFailureAdvice(err, cloneName)
+
 		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
 			Message: "clone of resource definition '" + srcName + "': " +
 				rollbackFailedMessage(cloneName, stampedRG, err),
-			Cause:  "the parent group is gone and deleting the cloned shell failed",
-			Correc: "delete '" + cloneName + "' by hand",
+			Cause:  cause,
+			Correc: correc,
 		})
 
 		return nil, false

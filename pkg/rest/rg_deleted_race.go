@@ -507,10 +507,15 @@ func replicaAcceptedForDeletion(replica *apiv1.Resource) bool {
 // rollbackFailedMessage is what the operator is told when the compensation
 // could not complete: naming the definition that is still there matters more
 // than the refusal itself, because nothing else will name it.
+//
+// It offers both readings the success path offers. parentRGSurvived cannot
+// tell a group deleted while the operation ran from one that was never there,
+// which adoption and data predating Bug 134 both produce, and asserting the
+// race sends the operator hunting one that may never have happened.
 func rollbackFailedMessage(rdName, rgName string, cause error) string {
-	return "resource group '" + rgName + "' was deleted concurrently with the operation " +
-		"(Bug 174) AND rolling '" + rdName + "' back failed: " + cause.Error() +
-		"; '" + rdName + "' is still there, parented to a group that no longer exists"
+	return "resource group '" + rgName + "' does not exist (it was deleted while the " +
+		"operation ran, or it was never there) AND rolling '" + rdName + "' back failed: " +
+		cause.Error() + "; '" + rdName + "' is still there, parented to a group that does not exist"
 }
 
 // rgDeletedRaceCorrection is the one wording for the refusal, so an operator

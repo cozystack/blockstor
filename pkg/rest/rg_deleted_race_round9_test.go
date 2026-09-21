@@ -4,7 +4,9 @@ package rest
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -221,5 +223,80 @@ func TestRollbackBudgetCoversTheGroupRecheck(t *testing.T) {
 
 	if groupRecheckBudget < cacheRetryAttempts*cacheRetryDelay {
 		t.Errorf("group re-read budget %s is under the cache retry it has to cover", groupRecheckBudget)
+	}
+}
+
+// The volume-less door kept one hardcoded cause and "delete it by hand" after
+// it gained the shared four-step rollback. With a snapshot on the shell that
+// advice is a dead end, because `rd d` refuses a definition that has
+// snapshots; the step-correct advice names the snapshot.
+func TestRDCloneOfAVolumelessSourceAdvisesForTheStepThatFailed(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "src-shell-snap",
+		ResourceGroupName: "grp-shell-snap-gone",
+	}); err != nil {
+		t.Fatalf("seed the volume-less source: %v", err)
+	}
+
+	// A snapshot row under the target name, which is what the rollback's
+	// snapshot refusal finds on the shell.
+	if err := backend.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name: "snap-on-shell", ResourceName: "dst-shell-snap",
+	}); err != nil {
+		t.Fatalf("seed the snapshot on the target: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, backend)
+	defer stop()
+
+	resp := postClone(t, base, "src-shell-snap", map[string]any{"name": "dst-shell-snap"})
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500: the rollback refuses over a snapshot", resp.StatusCode)
+	}
+
+	rc := decodeCloneMessage(t, resp)
+	if !strings.Contains(rc.Correc, "snapshot") {
+		t.Errorf("correction %q does not name the snapshot that stopped the rollback", rc.Correc)
+	}
+
+	if !strings.Contains(rc.Message, "or it was never there") {
+		t.Errorf("message %q asserts a concurrent delete without the other reading", rc.Message)
+	}
+}
+
+// Every door's failed-rollback message offers both readings of a group that
+// does not exist, as the success path does: deleted while the operation ran,
+// or never there. The fixture here never created the group at all.
+func TestRDCloneFailedRollbackDoesNotAssertARace(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	seedGroupedCloneSource(t, backend, "src-noracs", "grp-never-there", false)
+
+	base, stop := startServerWithStore(t, failingRDDeleteStore{backend})
+	defer stop()
+
+	resp := postClone(t, base, "src-noracs", map[string]any{"name": "dst-noracs", "use_zfs_clone": true})
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+
+	rc := decodeCloneMessage(t, resp)
+
+	if strings.Contains(rc.Message, "deleted concurrently") {
+		t.Errorf("message %q asserts a concurrent delete", rc.Message)
+	}
+
+	if !strings.Contains(rc.Message, "or it was never there") {
+		t.Errorf("message %q does not offer the never-existed reading", rc.Message)
 	}
 }
