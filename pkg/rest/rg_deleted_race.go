@@ -48,6 +48,14 @@ import (
 // exactly one caller, and neither rd_clone.go nor snapshot_restore.go read
 // ResourceGroups() at all.
 //
+// They are not the whole class. `rg spawn` (spawnCreate) also creates a
+// definition parented to a group, on the path linstor-csi takes for every
+// ordinary CreateVolume, and has neither half either. It is left out of this
+// change on purpose: the doors here are the ones this fix set out to close,
+// and spawn's compensation is a different shape (it rolls back through
+// rollbackSpawn, not rollBackMaterialisedRD), so it needs its own change
+// rather than a line added here.
+//
 // That distinction reaches the operator. A refusal derived from this check
 // that always blames a concurrent delete sends someone whose group never
 // existed — from adoption, or from data that predates Bug 134 — hunting a race
