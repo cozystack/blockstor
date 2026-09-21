@@ -65,3 +65,19 @@ func applyPropsModify(props, override map[string]string, del []string) map[strin
 
 	return props
 }
+
+// deletePropNamespaces strips every property under the named namespaces, the
+// `delete_namespaces` half of upstream's props-modify envelope. A namespace
+// covers the key that spells it exactly and every key below it — `DrbdOptions`
+// takes `DrbdOptions` and `DrbdOptions/Net/protocol` with it, and leaves
+// `DrbdOptionsOther` alone, because the separator has to be there for a key to
+// be inside the namespace rather than merely to start like it.
+func deletePropNamespaces(props map[string]string, namespaces []string) {
+	for _, ns := range namespaces {
+		for key := range props {
+			if key == ns || (len(key) > len(ns) && key[:len(ns)] == ns && key[len(ns)] == '/') {
+				delete(props, key)
+			}
+		}
+	}
+}

@@ -1080,6 +1080,21 @@ func writeUnsupportedMediaTypeEnvelope(w http.ResponseWriter, r *http.Request, g
 // python-linstor's `[]ApiCallRc` decoder no longer crashes on the
 // plain-text leak. The Go-side type name is never on the wire.
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	err := decodeJSONBody(r, target)
+	if err != nil {
+		writeDecodeError(w, err)
+
+		return false
+	}
+
+	return true
+}
+
+// decodeJSONBody is decodeJSON without the answer, for a door whose refusals
+// are not the bare []ApiCallRc array: the clone POST answers in CloneStarted,
+// which python-linstor decodes whatever the status, so a malformed body has to
+// reach it in that shape too.
+func decodeJSONBody(r *http.Request, target any) error {
 	dec := json.NewDecoder(r.Body)
 	// Bug 161: refuse unknown top-level (and recursively, nested)
 	// fields so a stray `{"props":…}` at the wrong nesting level
@@ -1091,9 +1106,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 
 	err := dec.Decode(target)
 	if err != nil {
-		writeDecodeError(w, err)
-
-		return false
+		return err //nolint:wrapcheck // the decoder's own error is what the callers branch on
 	}
 
 	// Bug 203: refuse residual bytes after the primary JSON value.
@@ -1109,12 +1122,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	// first place; every caller of this helper expects exactly one
 	// top-level value.
 	if dec.More() {
-		writeDecodeError(w, errTrailingJSONData)
-
-		return false
+		return errTrailingJSONData
 	}
 
-	return true
+	return nil
 }
 
 // errTrailingJSONData signals the Bug 203 decode-failure mode (residual
@@ -1153,6 +1164,14 @@ var errTrailingJSONData = errors.New("trailing JSON data after the request body"
 //     strings are stripped before they
 //     hit the wire).
 func writeDecodeError(w http.ResponseWriter, err error) {
+	status, callRc := decodeErrorRc(err)
+	writeJSON(w, status, []apiv1.APICallRc{callRc})
+}
+
+// decodeErrorRc is writeDecodeError's mapping without the envelope, so a door
+// that answers in another shape keeps these messages rather than inventing its
+// own.
+func decodeErrorRc(err error) (int, apiv1.APICallRc) {
 	// Bug 168: mint the decode-failure metric BEFORE the per-shape
 	// branches so a regression in the message-formatting code (a
 	// reordering, an early return) can't lose the observation.
@@ -1160,14 +1179,12 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 
 	var maxErr *http.MaxBytesError
 	if errors.As(err, &maxErr) {
-		writeError(w, http.StatusRequestEntityTooLarge,
-			"request body too large (limit "+formatBytes(maxErr.Limit)+")")
-
-		return
+		return http.StatusRequestEntityTooLarge,
+			decodeRc("request body too large (limit " + formatBytes(maxErr.Limit) + ")")
 	}
 
-	if writeDecodeBodyShapeError(w, err) {
-		return
+	if callRc, ok := decodeBodyShapeRc(err); ok {
+		return http.StatusBadRequest, callRc
 	}
 
 	// Unknown field (Bug 161). DisallowUnknownFields emits a plain
@@ -1176,11 +1193,9 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 	// field name is operator-actionable — it tells the caller exactly
 	// which key to remove (or move to the right nesting level).
 	if name, ok := unknownFieldName(err); ok {
-		writeError(w, http.StatusBadRequest,
-			`unknown field "`+name+`" in request body: this endpoint does not `+
-				`accept that key; check the LINSTOR REST API documentation`)
-
-		return
+		return http.StatusBadRequest, decodeRc(`unknown field "` + name +
+			`" in request body: this endpoint does not accept that key; ` +
+			`check the LINSTOR REST API documentation`)
 	}
 
 	// Wrong JSON shape. UnmarshalTypeError carries the Go-side type
@@ -1195,9 +1210,7 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 			msg = `wrong JSON shape: field "` + typeErr.Field + `" has the wrong type`
 		}
 
-		writeError(w, http.StatusBadRequest, msg)
-
-		return
+		return http.StatusBadRequest, decodeRc(msg)
 	}
 
 	// Malformed JSON — bad bytes, gzip body, unterminated string, etc.
@@ -1206,60 +1219,45 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 	// case, the magic-byte fingerprint of the wrong content encoding.
 	var syntaxErr *json.SyntaxError
 	if errors.As(err, &syntaxErr) {
-		writeError(w, http.StatusBadRequest,
-			"request body is not valid JSON: send `application/json` "+
-				"content; verify the body parses with `jq .`")
-
-		return
+		return http.StatusBadRequest, decodeRc("request body is not valid JSON: send " +
+			"`application/json` content; verify the body parses with `jq .`")
 	}
 
-	writeError(w, http.StatusBadRequest, scrubImplDetails(err.Error()))
+	return http.StatusBadRequest, decodeRc(err.Error())
 }
 
-// writeDecodeBodyShapeError handles the body-shape-level decode
-// failure modes that don't depend on JSON-internal types: empty body
-// (io.EOF), truncated body (io.ErrUnexpectedEOF), and trailing data
-// after the primary value (Bug 203 sentinel). Pulled out of
-// writeDecodeError so the parent function stays under the linter's
-// funlen budget while still emitting per-shape operator-facing cues.
-// Returns true when the branch fired (caller must stop); false
-// otherwise (caller continues to the JSON-typed branches).
-func writeDecodeBodyShapeError(w http.ResponseWriter, err error) bool {
+// decodeRc words one decode refusal, scrubbed the way writeError scrubs.
+func decodeRc(msg string) apiv1.APICallRc {
+	return apiv1.APICallRc{RetCode: apiCallRcError, Message: scrubImplDetails(msg)}
+}
+
+func decodeBodyShapeRc(err error) (apiv1.APICallRc, bool) {
 	// Empty body. The std-lib decoder returns io.EOF when called on a
 	// zero-byte stream; the message is literally "EOF" — operators
 	// see a wire reply of `[{"message":"EOF"}]`, python-linstor's
 	// CLI surfaces "ERROR: EOF" with no hint that the body was empty.
 	if errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest,
-			"request body is empty: send the JSON payload this endpoint expects")
-
-		return true
+		return decodeRc("request body is empty: send the JSON payload this endpoint expects"), true
 	}
 
 	// Truncated body — the decoder consumed something but ran out of
 	// bytes mid-structure. Same operator-facing shape as empty body.
 	if errors.Is(err, io.ErrUnexpectedEOF) {
-		writeError(w, http.StatusBadRequest,
-			"request body is truncated: re-send the complete JSON payload")
-
-		return true
+		return decodeRc("request body is truncated: re-send the complete JSON payload"), true
 	}
 
 	// Bug 203: trailing bytes after the primary JSON value. The
 	// std-lib decoder is happy after one complete value, so
 	// `{"valid":"json"}garbage` decoded cleanly and the handler ran
-	// with the partial value. `decodeJSON` now checks `dec.More()`
+	// with the partial value. `decodeJSONBody` now checks `dec.More()`
 	// after the primary Decode and routes that case through this
 	// branch with the operator-actionable cue "trailing JSON data".
 	if errors.Is(err, errTrailingJSONData) {
-		writeError(w, http.StatusBadRequest,
-			"trailing JSON data after the request body: send exactly one "+
-				"top-level JSON value per request")
-
-		return true
+		return decodeRc("trailing JSON data after the request body: send exactly one " +
+			"top-level JSON value per request"), true
 	}
 
-	return false
+	return apiv1.APICallRc{}, false
 }
 
 // unknownFieldName extracts the offending key from Go's

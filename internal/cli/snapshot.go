@@ -40,7 +40,7 @@ import (
 // `<source-definition>:<snapshot>`; the satellite splits on the colon.
 // It is stamped on the definition rather than per replica because
 // every replica of a restored definition clones from the same source.
-const restoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
+const restoreFromSnapshotProp = store.RestoreFromSnapshotProp
 
 // errRollbackUnsupported explains a deliberate omission.
 //
@@ -338,7 +338,21 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 		def.Props = map[string]string{}
 	}
 
-	def.Props[restoreFromSnapshotProp] = args.fromResource + ":" + snap.Name
+	// Both halves off the stored objects, never off what the operator typed:
+	// LINSTOR folds name case, and a REST retry over this leftover compares
+	// the marker it finds against one built from the stored snapshot, while
+	// the placer looks the source half up as a store key.
+	//
+	// No test can hold this yet. The in-memory store the CLI suite runs on
+	// keys snapshots by the spelling they were written with, so a fixture
+	// where the stored and the typed spelling differ cannot be read back at
+	// all, and the two expressions are equal for every fixture that can. The
+	// fold boundary that makes them differ is the one FoldName's own comment
+	// describes as a schema change.
+	def.Props[restoreFromSnapshotProp] = snap.ResourceName + ":" + snap.Name
+
+	// The owner prop belongs to the snapshot; see store.CloneSnapshotOwnerProp.
+	delete(def.Props, store.CloneSnapshotOwnerProp)
 
 	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if err != nil {

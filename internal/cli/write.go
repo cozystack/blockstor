@@ -315,9 +315,22 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 	}
 
 	if len(snaps) > 0 {
+		// A snapshot a clone took for itself outlives the clone when its
+		// reap was skipped or failed; nothing else names it now.
+		if orphans := store.OrphanedCloneSnapshots(ctx, run.Store, snaps); len(orphans) > 0 {
+			return fmt.Errorf("%w: %s has %d snapshot(s), among them internal clone snapshot(s) %s "+
+				"left by a clone that no longer exists; check nothing was restored from them, "+
+				"delete them, then delete %s again",
+				errDefinitionHasSnapshots, name, len(snaps), strings.Join(orphans, ", "), name)
+		}
+
 		return fmt.Errorf("%w: %s has %d snapshot(s); delete them first",
 			errDefinitionHasSnapshots, name, len(snaps))
 	}
+
+	// Read before the delete: the definition's own props are the only record
+	// of the internal snapshot a clone took on its source.
+	clonedFrom := store.OwnedCloneSnapshot(ctx, run.Store, name)
 
 	// Then the replicas. Dropping the definition alone leaves them with no
 	// parent to stamp a deletion on, so the satellite finalizer never runs
@@ -330,6 +343,15 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 	err = run.Store.ResourceDefinitions().Delete(ctx, name)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete resource definition %s: %w", name, err)
+	}
+
+	// The internal snapshot the clone took on its source goes with it, the
+	// way the REST door reaps it, or the source could never be deleted again.
+	// Not fatal: the definition is gone, and a kept snapshot is named by the
+	// refusal a later delete of the source meets.
+	reapErr := store.ReapClonedSnapshot(ctx, run.Store, clonedFrom)
+	if reapErr != nil {
+		_, _ = fmt.Fprintf(run.Err, "warning: internal clone snapshot kept: %v\n", reapErr)
 	}
 
 	return nil
