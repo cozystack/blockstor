@@ -300,3 +300,56 @@ func TestRDCloneFailedRollbackDoesNotAssertARace(t *testing.T) {
 		t.Errorf("message %q does not offer the never-existed reading", rc.Message)
 	}
 }
+
+// racingSnapshots lets the rollback's snapshot refusal see an empty listing and
+// then lands a snapshot on the target, the snapshot create that slips between
+// the refusal and the definition delete.
+type racingSnapshots struct {
+	store.SnapshotStore
+
+	target string
+	once   *sync.Once
+}
+
+func (r racingSnapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+	snaps, err := r.SnapshotStore.ListByDefinition(ctx, rdName)
+
+	if rdName == r.target {
+		r.once.Do(func() {
+			_ = r.SnapshotStore.Create(ctx, &apiv1.Snapshot{Name: "snap-raced", ResourceName: r.target})
+		})
+	}
+
+	return snaps, err //nolint:wrapcheck // pass-through in a fixture
+}
+
+type racingSnapshotStore struct {
+	store.Store
+
+	target string
+	once   *sync.Once
+}
+
+func (s racingSnapshotStore) Snapshots() store.SnapshotStore {
+	return racingSnapshots{SnapshotStore: s.Store.Snapshots(), target: s.target, once: s.once}
+}
+
+// The sweep after the rollback's own definition delete is what mops up a
+// snapshot row that raced in behind the refusal, and nothing held it: deleting
+// the sweep alone left the whole package green.
+func TestRollbackSweepsASnapshotThatRacedInBehindTheRefusal(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	seedAdoptedTarget(t, backend, "sweep-dst", "grp-sweep")
+
+	st := racingSnapshotStore{Store: backend, target: "sweep-dst", once: &sync.Once{}}
+
+	if err := (&Server{Store: st}).rollBackMaterialisedRD(t.Context(), "sweep-dst", []string{"node-a"}); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	if _, err := backend.Snapshots().Get(t.Context(), "sweep-dst", "snap-raced"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the snapshot that raced in outlived the rollback, parented to nothing: %v", err)
+	}
+}
