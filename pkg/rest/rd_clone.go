@@ -343,10 +343,9 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 // could create a definition `rd create` answers 400 for, which
 // tests/e2e/rd-name-validation-bulk.sh treats as a contract.
 //
-// The internal snapshot's name is checked with it. It is derived by prefixing
-// the target, so a target just inside the identifier ceiling would take the
-// clone through a snapshot create the store refuses, after the definition is
-// already there.
+// The internal snapshot's name is not checked here: only the data path takes
+// one, and a volume-less clone under a name `rd create` accepts has to stay
+// possible. cloneSnapshotNameIsUsable checks it on that path.
 func cloneTargetNameIsUsable(w http.ResponseWriter, srcName string, req *rdCloneRequest) bool {
 	if req.Name == "" {
 		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
@@ -358,10 +357,6 @@ func cloneTargetNameIsUsable(w http.ResponseWriter, srcName string, req *rdClone
 	}
 
 	nameErr := validateLinstorName("resource definition", req.Name)
-	if nameErr == nil {
-		nameErr = validateLinstorName("snapshot", cloneSnapshotName(req.Name))
-	}
-
 	if nameErr != nil {
 		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
@@ -372,6 +367,28 @@ func cloneTargetNameIsUsable(w http.ResponseWriter, srcName string, req *rdClone
 	}
 
 	return true
+}
+
+// cloneSnapshotNameIsUsable refuses a target whose internal snapshot name
+// would pass the identifier ceiling. The name is derived by prefixing the
+// target, so a target just inside the ceiling would take the clone through a
+// snapshot create the store refuses, and it is checked before anything is
+// written.
+func cloneSnapshotNameIsUsable(w http.ResponseWriter, srcName, cloneName string) bool {
+	nameErr := validateLinstorName("snapshot", cloneSnapshotName(cloneName))
+	if nameErr == nil {
+		return true
+	}
+
+	writeCloneRefused(w, http.StatusBadRequest, srcName, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone of resource definition '" + srcName + "' into '" + cloneName +
+			"': the internal snapshot this clone takes would be named '" +
+			cloneSnapshotName(cloneName) + "': " + nameErr.Error(),
+		Correc: "pick a shorter target name",
+	})
+
+	return false
 }
 
 // cloneWithData materialises a clone of a VD-bearing source RD by
@@ -398,6 +415,10 @@ func cloneTargetNameIsUsable(w http.ResponseWriter, srcName string, req *rdClone
 // (see writeSnapshotCloneNotImplemented's wire-shape note).
 func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv1.ResourceDefinition, req *rdCloneRequest) {
 	ctx := r.Context()
+
+	if !cloneSnapshotNameIsUsable(w, src.Name, req.Name) {
+		return
+	}
 
 	// The finished question comes first, and is answered without reading the
 	// live source at all.
@@ -667,24 +688,10 @@ func (s *Server) cloneTargetState(
 		return false, true
 	}
 
-	// A resumed clone keeps the leftover, so a retry asking for a different
-	// shape would have that shape validated and then dropped while the answer
-	// says the clone completed. That is the accept-and-drop external_name and
-	// volume_passphrases are refused for, and the parent group is not
-	// cosmetic: it decides replica count and pool selection.
-	if differs := requestedShapeDiffers(&existing, req.ResourceGroup, req.LayerList); differs != "" {
-		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: "clone target '" + cloneName + "' was started with " + differs,
-			Cause: "resuming keeps the definition an earlier attempt created, so the shape " +
-				"this request asks for would be validated and then ignored",
-			Correc: "retry with the shape the clone was started with, or delete '" +
-				cloneName + "' and clone again",
-		})
-
-		return false, true
-	}
-
+	// The requested shape is not compared here. replayOfFinishedClone runs
+	// first on the same leftover and the same fields and refuses a shape the
+	// leftover was not started with, finished or not, so a second comparison
+	// could only repeat its answer.
 	return true, false
 }
 
@@ -751,6 +758,8 @@ func (s *Server) ensureCloneSnapshot(
 		return nil, false, false
 	}
 
+	stampCloneSnapshotOwner(&snap, cloneName)
+
 	snap.Snapshots = makeSnapshotPerNode(snapName, snap.Nodes, snap.VolumeDefinitions)
 
 	err = s.Store.Snapshots().Create(ctx, &snap)
@@ -765,6 +774,20 @@ func (s *Server) ensureCloneSnapshot(
 	}
 
 	return &snap, false, true
+}
+
+// stampCloneSnapshotOwner marks the snapshot as the clone's own, so deleting
+// the clone may reap it. A name cannot carry that: an operator can call a
+// snapshot `clone-<target>` and restore it under that target, and the marker a
+// restore writes is the one a clone writes. The map is copied first, since the
+// hydration hands over the source definition's own.
+func stampCloneSnapshotOwner(snap *apiv1.Snapshot, cloneName string) {
+	snap.Props = maps.Clone(snap.Props)
+	if snap.Props == nil {
+		snap.Props = map[string]string{}
+	}
+
+	snap.Props[store.CloneSnapshotOwnerProp] = cloneName
 }
 
 // cloneSourceIsNotBeingDeleted mirrors the snapshot-create Bug 180 gate: a
@@ -901,8 +924,9 @@ const (
 // with live writes: two replicas of one definition with different content. A
 // clone left short of its placement by a first attempt that died between two
 // stamps is the same state seen from outside, and topping it up is the
-// placement reconciliation's job (linstor-csi runs its own right after
-// COMPLETE), not the clone's.
+// placement reconciliation's job, not the clone's: linstor-csi v1.10.1 calls
+// reconcileResourcePlacement right after its COMPLETE loop in
+// pkg/client/linstor.go.
 //
 // Nothing here reads the live source. A finished clone is a copy of a
 // point-in-time, so it is judged against the snapshot it was restored from

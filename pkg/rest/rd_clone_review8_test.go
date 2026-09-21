@@ -45,6 +45,12 @@ func TestRDDeleteReapsTheInternalCloneSnapshotFromTheSource(t *testing.T) {
 		t.Fatalf("fixture: the clone took no internal snapshot: %v", err)
 	}
 
+	if clone, err := st.ResourceDefinitions().Get(ctx, "dst-reap8"); err != nil {
+		t.Fatalf("read the clone: %v", err)
+	} else if owner, ok := clone.Props[store.CloneSnapshotOwnerProp]; ok {
+		t.Errorf("the clone carries the snapshot's owner prop %q", owner)
+	}
+
 	if code := deleteRD(t, base, "dst-reap8"); code != http.StatusOK {
 		t.Fatalf("delete of the clone = %d, want 200", code)
 	}

@@ -40,7 +40,7 @@ import (
 // `<source-definition>:<snapshot>`; the satellite splits on the colon.
 // It is stamped on the definition rather than per replica because
 // every replica of a restored definition clones from the same source.
-const restoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
+const restoreFromSnapshotProp = store.RestoreFromSnapshotProp
 
 // errRollbackUnsupported explains a deliberate omission.
 //
@@ -350,6 +350,9 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 	// fold boundary that makes them differ is the one FoldName's own comment
 	// describes as a schema change.
 	def.Props[restoreFromSnapshotProp] = snap.ResourceName + ":" + snap.Name
+
+	// The owner prop belongs to the snapshot; see store.CloneSnapshotOwnerProp.
+	delete(def.Props, store.CloneSnapshotOwnerProp)
 
 	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if err != nil {

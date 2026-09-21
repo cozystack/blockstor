@@ -515,7 +515,7 @@ func (s *Server) restoreTargetState(ctx context.Context, w http.ResponseWriter, 
 // restore, encoded `<source RD>:<snapshot>`. The satellite reads it to route
 // the storage provider to RestoreVolumeFromSnapshot, and the retry path above
 // reads it to tell its own leftover from somebody else's definition.
-const restoreFromSnapshotKey = "BlockstorRestoreFromSnapshot"
+const restoreFromSnapshotKey = store.RestoreFromSnapshotProp
 
 // restoreMarker builds that value. Both halves come off the stored Snapshot
 // rather than off the request, so the marker a retry compares is the marker
@@ -760,6 +760,11 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	}
 
 	newRD.Props[restoreFromSnapshotKey] = restoreMarker(snap.ResourceName, snap.Name)
+
+	// The owner prop is the snapshot's, not the definition's: copied onward,
+	// every snapshot later taken of this definition would inherit a claim of
+	// ownership it was never given.
+	delete(newRD.Props, store.CloneSnapshotOwnerProp)
 
 	// AlreadyExists is tolerated when the definition already there is this
 	// restore's own — the resume path above, or a second restore of the

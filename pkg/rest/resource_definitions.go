@@ -1140,24 +1140,14 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// stamps DeletionTimestamp on every replica, a failed RD-delete
 	// leaves the cluster half-torn-down (children gone, parent
 	// kept, snapshots orphaned) which no retry can reconcile.
-	snaps, err := s.Store.Snapshots().ListByDefinition(r.Context(), name)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		writeStoreError(w, err)
-
+	if !s.rdHasNoSnapshots(w, r, name) {
 		return
 	}
 
-	if len(snaps) > 0 {
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | apiCallRcFailExistsSnapshotDfn,
-			Message: "Cannot delete resource definition '" + name + "' because it has snapshots.",
-			ObjRefs: map[string]string{
-				objRefRscDfn: name,
-			},
-		}})
-
-		return
-	}
+	// Read before the delete, used after it: the definition's own props
+	// are the only record of the internal snapshot a clone left on its
+	// source.
+	clonedFrom := store.OwnedCloneSnapshot(r.Context(), s.Store, name)
 
 	// Cascade the delete to all child Resource replicas BEFORE
 	// dropping the RD itself. Without this, child Resources are
@@ -1176,12 +1166,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// existing `blockstor.cozystack.io/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
-	// Read before the delete, used after it: the definition's own props
-	// are the only record of the internal snapshot a clone left on its
-	// source.
-	internalSnap := s.internalCloneSnapshotBehind(r.Context(), name)
-
-	err = s.cascadeDeleteResources(r.Context(), name)
+	err := s.cascadeDeleteResources(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -1233,7 +1218,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// this one never carries, so it outlived the target it was taken for
 	// and left the source undeletable through this very handler, which
 	// refuses a definition that has snapshots.
-	s.reapInternalCloneSnapshot(r.Context(), internalSnap)
+	reapClonedSnapshot(r.Context(), s.Store, clonedFrom)
 
 	// Bug 124: block the response until the local informer cache has
 	// observed the RD + child Resource deletions. Without this gate,
@@ -1248,48 +1233,56 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
-// internalCloneSnapshot addresses the snapshot a clone left on its source.
-type internalCloneSnapshot struct {
-	source string
-	name   string
-}
+// rdHasNoSnapshots is handleRDDelete's pre-walk: it refuses, and answers
+// false, while any Snapshot still hangs off the definition.
+func (s *Server) rdHasNoSnapshots(w http.ResponseWriter, r *http.Request, name string) bool {
+	snaps, err := s.Store.Snapshots().ListByDefinition(r.Context(), name)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeStoreError(w, err)
 
-// internalCloneSnapshotBehind reads the definition's marker and answers with
-// the snapshot to reap once it is gone, or the zero value when there is none.
-//
-// The marker is `<source>:<snapshot>` on both paths that write it, and the
-// snapshot half is what says which one this is. A clone derives it from the
-// target, so it names an object nobody else uses; a restore carries the
-// operator's own snapshot there, which is somebody's data and is never reaped.
-func (s *Server) internalCloneSnapshotBehind(ctx context.Context, rdName string) internalCloneSnapshot {
-	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
-	if err != nil {
-		return internalCloneSnapshot{}
+		return false
 	}
 
-	source, snapName, found := strings.Cut(rd.Props[restoreFromSnapshotKey], ":")
-	if !found || !strings.EqualFold(snapName, cloneSnapshotName(rdName)) {
-		return internalCloneSnapshot{}
+	if len(snaps) > 0 {
+		refusal := apiv1.APICallRc{
+			RetCode: apiCallRcError | apiCallRcFailExistsSnapshotDfn,
+			Message: "Cannot delete resource definition '" + name + "' because it has snapshots.",
+			ObjRefs: map[string]string{
+				objRefRscDfn: name,
+			},
+		}
+
+		// A snapshot a clone took for itself outlives the clone when its
+		// reap was skipped or failed, and a repeated delete of the clone
+		// cannot re-run it: the clone is already gone. This refusal is the
+		// one place that still sees it, so it names it.
+		if orphans := store.OrphanedCloneSnapshots(r.Context(), s.Store, snaps); len(orphans) > 0 {
+			refusal.Cause = "internal clone snapshot(s) " + strings.Join(orphans, ", ") +
+				" outlived the clone they were taken for"
+			refusal.Correc = "check `linstor s l` that nothing was restored from them, delete them, " +
+				"then delete '" + name + "' again"
+		}
+
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{refusal})
+
+		return false
 	}
 
-	return internalCloneSnapshot{source: source, name: snapName}
+	return true
 }
 
-// reapInternalCloneSnapshot drops that snapshot from the source once the
-// target it backs is gone.
+// reapClonedSnapshot drops the internal snapshot the deleted definition was
+// cloned from, when the clone path stamped it as that definition's own; see
+// store.ReapClonedSnapshot.
 //
 // Best-effort, like the sweep below: the delete has already succeeded and the
-// operator has been told so, and a snapshot that survives is visible in
-// `linstor s l` for them to drop by hand.
-func (s *Server) reapInternalCloneSnapshot(ctx context.Context, snap internalCloneSnapshot) {
-	if snap.source == "" || snap.name == "" {
-		return
-	}
-
-	err := s.Store.Snapshots().Delete(ctx, snap.source, snap.name)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		log.FromContext(ctx).V(1).Info("internal clone snapshot could not be reaped",
-			"source", snap.source, "snapshot", snap.name, "reason", err.Error())
+// operator has been told so. A snapshot kept because another definition was
+// restored from it, or one whose delete failed, stays visible in `linstor s l`,
+// and the refusal a later delete of the source meets names it.
+func reapClonedSnapshot(ctx context.Context, st store.Store, ref store.ClonedSnapshotRef) {
+	err := store.ReapClonedSnapshot(ctx, st, ref)
+	if err != nil {
+		log.FromContext(ctx).V(1).Info("internal clone snapshot kept", "reason", err.Error())
 	}
 }
 
