@@ -502,10 +502,16 @@ func (s *Server) handleNodeLost(w http.ResponseWriter, r *http.Request) {
 // idempotent contract (TestNodeLostUnknownIsIdempotent) stays
 // intact — the parent handler's cascade and Delete are both
 // NotFound-tolerant.
+//
+// The status is read uncached, for the same reason the node-scoped
+// listings below it are: this decision is acted on immediately and
+// nothing converges behind it. A cached ONLINE the satellite has
+// already stopped sending refuses the cleanup a dead node needs, and
+// a cached OFFLINE tears down a node that is answering.
 func (s *Server) checkNodeLostAllowed(w http.ResponseWriter, r *http.Request, name string) bool {
 	ctx := r.Context()
 
-	node, err := s.Store.Nodes().Get(ctx, name)
+	node, err := s.Store.Nodes().GetUncached(ctx, name)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return true

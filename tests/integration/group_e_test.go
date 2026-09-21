@@ -643,4 +643,3 @@ func stampOnePool(
 	t.Fatalf("status update StoragePool %s: gave up after %d conflict retries",
 		poolName, maxAttempts)
 }
-

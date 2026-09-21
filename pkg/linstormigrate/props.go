@@ -50,6 +50,12 @@ type PropsIndex struct {
 	byInstance map[string]map[string]string
 }
 
+// PropsInstanceController is the props_instance of the cluster-wide
+// bag. LINSTOR resolves StorDriver/* and DrbdOptions/* through it as
+// the last rung of the priority chain, so a value set here applies to
+// every pool that does not override it.
+const PropsInstanceController = "/CTRL"
+
 // NewPropsIndex builds the lookup from the raw table rows.
 func NewPropsIndex(rows []PropsContainerRow) *PropsIndex {
 	idx := &PropsIndex{
@@ -58,7 +64,7 @@ func NewPropsIndex(rows []PropsContainerRow) *PropsIndex {
 	}
 
 	for _, row := range rows {
-		if row.PropsInstance == "/CTRL" {
+		if row.PropsInstance == PropsInstanceController {
 			idx.Controller[row.PropKey] = row.PropValue
 
 			continue

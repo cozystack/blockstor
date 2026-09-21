@@ -21,6 +21,7 @@ package linstormigrate
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,9 +132,40 @@ type converter struct {
 	// referential-integrity sets, populated as each kind converts so
 	// later kinds can drop rows that would dangle (a replica of a
 	// skipped/absent RD, a replica on an unknown node, ...).
-	convertedRD   map[string]bool // by resource_name (UPPERCASE key)
-	convertedNode map[string]bool // by node_name (UPPERCASE key)
-	convertedRG   map[string]bool // by resource_group_name (UPPERCASE key)
+	convertedRD map[string]bool // by resource_name (UPPERCASE key)
+	// remappedPools names the ZFS pools carried over as ZFS_THIN, so the
+	// resource groups that could place on one can learn about the new
+	// kind — and, just as importantly, so the ones that could not are
+	// left alone.
+	//
+	// Keyed by pool NAME, though a LINSTOR pool is node-scoped and the
+	// same name routinely exists on every node with different drivers.
+	// That is deliberate rather than a simplification: the only consumer
+	// is a resource group's placement policy, and a group's pool list
+	// carries no node. A group admitted to "TANK" is admitted to TANK on
+	// every node, so a per-node distinction here could not be expressed
+	// downstream even if it were carried. Where the same name is thick on
+	// one node and thin on another, that ambiguity is the finding, and
+	// placementLists reports it rather than resolving it.
+	remappedPools map[string]bool
+	// declaredThinPools names the pools the source cluster already
+	// declared ZFS_THIN, by name for the same reason. One node declaring
+	// a name thin is enough to taint the name for a group that was kept
+	// away from thin pools.
+	declaredThinPools map[string]bool
+	// declaredZFSPools names the pools the source declared plain ZFS —
+	// the ones a group filtering on [ZFS] could actually place on before
+	// the migration. A name in BOTH this and declaredThinPools is thin on
+	// one node and thick on another, which is the ambiguity a pool list
+	// carrying no node cannot express, so it is reported rather than
+	// resolved.
+	declaredZFSPools map[string]bool
+	// zfsAfterMigration names the pools that still come out ZFS. Used to
+	// tell an operator whether a group left unwidened can place anywhere
+	// at all, which is the fact the refusal otherwise leaves out.
+	zfsAfterMigration map[string]bool
+	convertedNode     map[string]bool // by node_name (UPPERCASE key)
+	convertedRG       map[string]bool // by resource_group_name (UPPERCASE key)
 
 	warnings  []string
 	warnedKey map[string]bool
@@ -165,22 +197,26 @@ func Convert(dump *Dump) (*Result, error) {
 // CRDs, honouring opts (e.g. a live DRBD port map — see Options).
 func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 	conv := &converter{
-		dump:          dump,
-		opts:          opts,
-		props:         NewPropsIndex(dump.PropsContainers),
-		nodeDsp:       map[string]string{},
-		poolDsp:       map[string]string{},
-		rgDsp:         map[string]string{},
-		rdDsp:         map[string]string{},
-		drbdRD:        map[string]LayerDrbdResourceDefinitionRow{},
-		drbdMinor:     map[volumeKey]*int32{},
-		drbdNode:      map[replicaKey]*int32{},
-		storVol:       map[volumeReplicaKey]LayerStorageVolumeRow{},
-		luksVol:       map[volumeReplicaKey]LayerLuksVolumeRow{},
-		convertedRD:   map[string]bool{},
-		convertedNode: map[string]bool{},
-		convertedRG:   map[string]bool{},
-		warnedKey:     map[string]bool{},
+		dump:              dump,
+		opts:              opts,
+		props:             NewPropsIndex(dump.PropsContainers),
+		nodeDsp:           map[string]string{},
+		poolDsp:           map[string]string{},
+		rgDsp:             map[string]string{},
+		rdDsp:             map[string]string{},
+		drbdRD:            map[string]LayerDrbdResourceDefinitionRow{},
+		drbdMinor:         map[volumeKey]*int32{},
+		drbdNode:          map[replicaKey]*int32{},
+		storVol:           map[volumeReplicaKey]LayerStorageVolumeRow{},
+		luksVol:           map[volumeReplicaKey]LayerLuksVolumeRow{},
+		convertedRD:       map[string]bool{},
+		convertedNode:     map[string]bool{},
+		convertedRG:       map[string]bool{},
+		remappedPools:     map[string]bool{},
+		declaredThinPools: map[string]bool{},
+		declaredZFSPools:  map[string]bool{},
+		zfsAfterMigration: map[string]bool{},
+		warnedKey:         map[string]bool{},
 	}
 
 	conv.buildIndexes()
@@ -423,6 +459,79 @@ func (c *converter) netInterfacesFor(nodeName string) []NodeNetInterfaceRow {
 	return out
 }
 
+const (
+	// providerKindZFS / providerKindZFSThin are the StoragePool
+	// providerKind values for thick and thin ZFS.
+	providerKindZFS     = "ZFS"
+	providerKindZFSThin = "ZFS_THIN"
+
+	// storDriverZfscreateOptions holds extra flags LINSTOR appends to
+	// `zfs create`; zfsSparseFlag is the one that makes a zvol sparse.
+	storDriverZfscreateOptions = "StorDriver/ZfscreateOptions"
+	zfsSparseFlag              = "-s"
+)
+
+// createsSparseZvols reports whether a pool LINSTOR declares as thick
+// ZFS in fact holds sparse volumes.
+//
+// LINSTOR allows the combination: the driver says ZFS, while
+// StorDriver/ZfscreateOptions carries `-s`, so every zvol is created
+// sparse. The pool is thick by declaration and thin in practice, and
+// LINSTOR is content to leave it oversubscribed.
+//
+// blockstor cannot express that. Its thick ZFS provider reserves each
+// volume's full size, and applies the rule to volumes it adopts as
+// readily as to ones it creates, so migrating such a pool as ZFS
+// retroactively converts every volume to thick: the pool fills up
+// during adoption and whatever no longer fits cannot be adopted at all.
+// On the cluster this was found on, one node went from 238G free to
+// 8.63G before a 50G volume finally had nowhere to go.
+//
+// Mapping the pool to ZFS_THIN preserves what the volumes are, which is
+// what the data plane depends on, at the cost of the declared kind
+// changing. The reverse — honouring the declaration — silently changes
+// the capacity model of a running cluster, so this is the safer of the
+// two lies. Only ZFS is affected: LVM's thin provisioning is a separate
+// driver over a thin pool, not a create-time flag.
+func createsSparseZvols(driver, options string) bool {
+	if driver != providerKindZFS {
+		return false
+	}
+
+	// A flag, not a substring: `-o something-s` must not match, and
+	// neither must a longer option that merely starts with `-s`.
+	return slices.Contains(strings.Fields(options), zfsSparseFlag)
+}
+
+// zfscreateOptions resolves StorDriver/ZfscreateOptions the way LINSTOR
+// resolves it, rather than reading a single bag.
+//
+// LINSTOR looks StorDriver/* up through a priority chain: the storage
+// pool's own props, then the node's, then the controller's. The value
+// it finds first is what gets appended to `zfs create`. So an operator
+// who made a whole cluster sparse with
+//
+//	linstor controller set-property StorDriver/ZfscreateOptions -s
+//
+// — the natural way to do it, and the way it was done on the cluster
+// this detection came from — leaves the per-pool bags empty. Reading
+// only the pool bag then reports the pool as genuinely thick, migrates
+// it as ZFS, and walks straight into the pool-overflow during adoption
+// that createsSparseZvols exists to prevent.
+func (c *converter) zfscreateOptions(node, pool string) string {
+	for _, bag := range []map[string]string{
+		c.props.StorPool(node, pool),
+		c.props.Node(node),
+		c.props.Controller,
+	} {
+		if value, ok := bag[storDriverZfscreateOptions]; ok {
+			return value
+		}
+	}
+
+	return ""
+}
+
 func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 	pools := make([]crdv1alpha1.StoragePool, 0, len(c.dump.NodeStorPools))
 
@@ -439,14 +548,37 @@ func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 			continue
 		}
 
+		props := c.props.StorPool(row.NodeName, row.PoolName)
+
+		kind := row.DriverName
+		if kind == providerKindZFSThin {
+			c.declaredThinPools[row.PoolName] = true
+		}
+
+		if kind == providerKindZFS {
+			c.declaredZFSPools[row.PoolName] = true
+		}
+
+		if createsSparseZvols(kind, c.zfscreateOptions(row.NodeName, row.PoolName)) {
+			kind = providerKindZFSThin
+			c.remappedPools[row.PoolName] = true
+
+			c.warnf("storage pool %s.%s: declared %s, but %s makes every zvol sparse — migrated as %s so the adopted volumes keep the provisioning they actually have",
+				poolDsp, nodeDsp, providerKindZFS, storDriverZfscreateOptions, providerKindZFSThin)
+		}
+
+		if kind == providerKindZFS {
+			c.zfsAfterMigration[row.PoolName] = true
+		}
+
 		pool := crdv1alpha1.StoragePool{
 			TypeMeta:   typeMeta("StoragePool"),
 			ObjectMeta: objectMeta(strings.ToLower(poolDsp) + "." + strings.ToLower(nodeDsp)),
 			Spec: crdv1alpha1.StoragePoolSpec{
 				NodeName:     nodeDsp,
 				PoolName:     poolDsp,
-				ProviderKind: row.DriverName,
-				Props:        c.props.StorPool(row.NodeName, row.PoolName),
+				ProviderKind: kind,
+				Props:        props,
 			},
 		}
 
@@ -467,6 +599,8 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 
 		typed, residual, extra := k8sstore.SplitProps(c.props.ResourceGroup(row.ResourceGroupName))
 
+		providerPins, poolPins := c.placementLists(row, dsp)
+
 		group := crdv1alpha1.ResourceGroup{
 			TypeMeta:   typeMeta("ResourceGroup"),
 			ObjectMeta: objectMeta(dsp),
@@ -477,13 +611,13 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 				ExtraProps:  extra,
 				SelectFilter: crdv1alpha1.ResourceGroupSelectFilter{
 					PlaceCount:              row.ReplicaCount,
-					StoragePoolList:         c.parseList(row.PoolName, "resource group "+dsp+" pool_name"),
+					StoragePoolList:         poolPins,
 					StoragePoolDisklessList: c.parseList(row.PoolNameDiskless, "resource group "+dsp+" pool_name_diskless"),
 					NodeNameList:            c.parseList(row.NodeNameList, "resource group "+dsp+" node_name_list"),
 					ReplicasOnSame:          c.parseList(row.ReplicasOnSame, "resource group "+dsp+" replicas_on_same"),
 					ReplicasOnDifferent:     c.parseList(row.ReplicasOnDifferent, "resource group "+dsp+" replicas_on_different"),
 					NotPlaceWithRsc:         c.parseList(row.DoNotPlaceWithRsc, "resource group "+dsp+" do_not_place_with_rsc_list"),
-					ProviderList:            c.parseList(row.AllowedProviderList, "resource group "+dsp+" allowed_provider_list"),
+					ProviderList:            providerPins,
 					LayerStack:              c.parseList(row.LayerStack, "resource group "+dsp+" layer_stack"),
 				},
 			},
@@ -507,6 +641,238 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 	sortByName(groups, func(g crdv1alpha1.ResourceGroup) string { return g.Name })
 
 	return groups
+}
+
+// placementLists carries the resource group's provider allow-list and
+// storage-pool pins over together.
+//
+// They are decided in one place because they answer one question: after
+// this migration, can the group still place exactly where it could
+// before, and nowhere else? The placer filters candidate pools on the
+// provider list with an exact match, so a group pinned to ZFS stops
+// seeing a pool that migrated as ZFS_THIN — and a cluster that
+// deliberately ran thick-declared sparse ZFS is exactly the kind that
+// pins it. Left alone, the adopted volumes keep working but nothing new
+// can be placed and a lost replica cannot be healed, silently, until
+// someone edits the group.
+//
+// ZFS_THIN is added rather than substituted: a cluster may hold both a
+// remapped pool and a genuinely thick one, and replacing the entry
+// would evict the second from a policy that legitimately named it.
+func (c *converter) placementLists(row *ResourceGroupRow, dsp string) ([]string, []string) {
+	providers := c.parseList(row.AllowedProviderList, "resource group "+dsp+" allowed_provider_list")
+	pools := c.parseList(row.PoolName, "resource group "+dsp+" pool_name")
+
+	if !slices.Contains(providers, providerKindZFS) || slices.Contains(providers, providerKindZFSThin) {
+		return providers, pools
+	}
+
+	// Only a group that could actually place on a remapped pool needs
+	// the widening. Applying it whenever ANY pool in the cluster
+	// remapped hands ZFS_THIN to groups that never had it, which is how
+	// a group that named [ZFS] precisely to keep its replicas off a thin
+	// pool ends up allowed onto it.
+	if !c.reaches(pools, c.remappedPools) {
+		return providers, pools
+	}
+
+	widened := append(providers, providerKindZFSThin) //nolint:gocritic // a new list, not an append to the caller's
+
+	excluded := c.declaredThinPools
+
+	// A pin scopes the widening only when none of the pools it names was
+	// already thin in the source. Where one was, the group could reach
+	// that pool by name but the provider filter kept it out, and widening
+	// the kind removes the only thing that did — the two filters are
+	// independent at the placer, so the named pool becomes placeable.
+	//
+	// Where the pins can be scoped, they are. Dropping a pool the group
+	// could not place on anyway takes no reachability away: the provider
+	// filter already excluded it, and the pin list that remains describes
+	// exactly what the group could reach before. Leaving the allow-list
+	// alone instead is not the conservative choice it looks like — every
+	// named pool may have remapped, and then the group's own [ZFS] filter
+	// matches none of them and it has nowhere left to place at all.
+	if len(pools) > 0 {
+		scoped, ambiguous := c.scopePins(pools, excluded)
+
+		switch {
+		case ambiguous:
+			// One name, thick on one node and thin on another. The
+			// pool list carries no node, so neither keeping nor
+			// dropping the name expresses what the group had: keeping
+			// it admits the thin instance, dropping it loses the
+			// thick one. That is the finding, not something to
+			// resolve here.
+			c.warnPoolRemapUnresolvable(dsp, c.canStillPlace(pools))
+
+			return providers, pools
+		case len(scoped) < len(pools):
+			c.warnPoolRemapScoped(dsp, pools, scoped)
+
+			return widened, scoped
+		default:
+			c.warnPoolRemapWidening(dsp)
+
+			return widened, pools
+		}
+	}
+
+	// Unpinned, so the widening also admits every pool the source
+	// cluster declared thin. With none of those, the kind is enough.
+	if len(excluded) == 0 {
+		c.warnPoolRemapWidening(dsp)
+
+		return widened, pools
+	}
+
+	scoped := c.poolsExcept(excluded)
+
+	// An empty pin list is not a narrow one: the placer reads it as "no
+	// restriction". So when nothing survives the exclusion — the pool
+	// name that remapped on one node is the same name the source
+	// cluster declared thin on another, which is what happens whenever
+	// pools are named uniformly across nodes — the allow-list simply
+	// cannot express the operator's intent any more.
+	//
+	// Refuse to widen rather than pick a wrong side quietly. The group
+	// keeps its original list, so a new placement fails visibly instead
+	// of landing on the pool the operator excluded; the warning says
+	// what to fix by hand.
+	if len(scoped) == 0 {
+		c.warnf("resource group %s: allow-list left as-is — a pool it can place on migrated to %s, but the "+
+			"same pool name is declared thin elsewhere in the cluster, so widening the list would admit a pool "+
+			"this group could not use before. Pin the group to the pools it should use, by hand",
+			dsp, providerKindZFSThin)
+
+		return providers, pools
+	}
+
+	c.warnf("resource group %s: pinned to %d pool(s) — it named none, and widening its allow-list to %s "+
+		"to keep the remapped pool reachable would otherwise also admit the %d pool name(s) the source cluster "+
+		"declared thin, which it could not place on before",
+		dsp, len(scoped), providerKindZFSThin, len(excluded))
+
+	return widened, scoped
+}
+
+// scopePins narrows a group's pool pins to the ones that still describe where
+// it could place, and reports the pins it cannot decide by name at all.
+//
+// A pin every one of whose instances the source declared thin is dropped: the
+// provider filter already kept the group off it, so removing the name takes no
+// reachability away and stops the widened kind from handing it over. A pin the
+// source declared thin on one node and plain ZFS on another cannot be decided
+// — the thick instance was reachable and the thin one was not, and one name
+// cannot say both — so it is reported instead.
+//
+// Compared on the upper-cased key: the dump's pool names are canonical while
+// its resource-group pins carry whatever case the operator typed.
+func (c *converter) scopePins(pinned []string, excluded map[string]bool) ([]string, bool) {
+	kept := make([]string, 0, len(pinned))
+
+	for _, pool := range pinned {
+		key := strings.ToUpper(pool)
+
+		if !excluded[key] {
+			kept = append(kept, pool)
+
+			continue
+		}
+
+		if c.declaredZFSPools[key] {
+			return nil, true
+		}
+	}
+
+	return kept, false
+}
+
+// canStillPlace reports whether a group left on its original provider list has
+// any eligible pool once the migration is done.
+func (c *converter) canStillPlace(pinned []string) bool {
+	for _, pool := range pinned {
+		if c.zfsAfterMigration[strings.ToUpper(pool)] {
+			return true
+		}
+	}
+
+	return false
+}
+
+// warnPoolRemapScoped reports the case where the widening was scoped by
+// dropping pins the group could not place on before.
+func (c *converter) warnPoolRemapScoped(dsp string, before, after []string) {
+	c.warnf("resource group %s: allows %s and a pool it can place on migrated as %s — %s added to the "+
+		"allow-list and the pins narrowed from %v to %v, dropping pools this group's provider filter "+
+		"already kept it off, so it places exactly where it did before",
+		dsp, providerKindZFS, providerKindZFSThin, providerKindZFSThin, before, after)
+}
+
+// warnPoolRemapUnresolvable reports the case where the group's own pins
+// cannot be decided by name, so the allow-list is left as it was.
+//
+// stillPlaceable says whether the group has anywhere to put a replica
+// meanwhile. When it does not, that is the fact the operator needs first: the
+// group is not merely losing new placements on the remapped pool, it cannot
+// place at all until someone edits it.
+func (c *converter) warnPoolRemapUnresolvable(dsp string, stillPlaceable bool) {
+	consequence := "the group keeps placing on its remaining pools, but not on the remapped one"
+	if !stillPlaceable {
+		consequence = "the group has NO eligible pool at all until this is resolved — every pool it names " +
+			"comes out " + providerKindZFSThin + " while its allow-list still says " + providerKindZFS
+	}
+
+	c.warnf("resource group %s: allow-list left as-is — it is pinned to a pool name the source cluster "+
+		"declared %s on one node and %s on another, so neither keeping nor dropping the name says what "+
+		"the group had. Resolve the pins by hand; %s",
+		dsp, providerKindZFSThin, providerKindZFS, consequence)
+}
+
+// warnPoolRemapWidening reports the plain widening case, where nothing
+// beyond the remapped pool becomes reachable.
+func (c *converter) warnPoolRemapWidening(dsp string) {
+	c.warnf("resource group %s: allows %s and a pool it can place on migrated as %s — %s added to the allow-list, "+
+		"or the placer would stop finding any eligible pool",
+		dsp, providerKindZFS, providerKindZFSThin, providerKindZFSThin)
+}
+
+// reaches reports whether a group pinned to the named pools (or to none
+// at all, meaning any) can place on one of the pools in the set.
+func (c *converter) reaches(pinned []string, set map[string]bool) bool {
+	if len(pinned) == 0 {
+		return len(set) > 0
+	}
+
+	for _, pool := range pinned {
+		if set[strings.ToUpper(pool)] {
+			return true
+		}
+	}
+
+	return false
+}
+
+// poolsExcept lists every converted pool that is not in the excluded
+// set, sorted so the output is stable.
+func (c *converter) poolsExcept(excluded map[string]bool) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(c.dump.NodeStorPools))
+
+	for i := range c.dump.NodeStorPools {
+		row := &c.dump.NodeStorPools[i]
+		if excluded[row.PoolName] || seen[row.PoolName] || !c.convertedNode[row.NodeName] {
+			continue
+		}
+
+		seen[row.PoolName] = true
+
+		out = append(out, displayName(c.poolDsp[row.PoolName], row.PoolName))
+	}
+
+	sort.Strings(out)
+
+	return out
 }
 
 func (c *converter) volumeGroupsFor(rgName string) []VolumeGroupRow {
@@ -534,14 +900,8 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 
 		dsp := displayName(row.ResourceDspName, row.ResourceName)
 
-		if row.ResourceFlags&resourceFlagDelete != 0 {
-			c.warnf("resource definition %s: marked DELETE in the source cluster — skipped", dsp)
-
+		if !c.rdConvertible(row, dsp) {
 			continue
-		}
-
-		if row.ResourceFlags != 0 {
-			c.warnf("resource definition %s: unhandled flags bitmask %d dropped", dsp, row.ResourceFlags)
 		}
 
 		// Referential integrity: an RD may name a resource group that was
@@ -559,6 +919,16 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 
 		typed, residual, extra := k8sstore.SplitProps(c.props.ResourceDefinition(row.ResourceName))
 
+		latch := c.rdInitializedLatch(row.ResourceName)
+
+		// A definition none of whose replicas came across is only
+		// "fresh" when they were all being deleted anyway. If any was
+		// held back because its node did not migrate, the data is
+		// still out there and the latch stays on.
+		adopted := latch.adopted || latch.heldByAbsentNode
+
+		c.reportLatch(dsp, latch, adopted)
+
 		def := crdv1alpha1.ResourceDefinition{
 			TypeMeta:   typeMeta("ResourceDefinition"),
 			ObjectMeta: objectMeta(dsp),
@@ -572,7 +942,14 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 				// cluster: latch Initialized so any replica added AFTER
 				// the migration must SyncTarget the real data instead of
 				// skipping the initial sync against an adopted set.
-				Initialized: ptr(true),
+				//
+				// Only where a replica is actually being adopted. The
+				// latch also suppresses the auto-primary election that
+				// seeds a first sync, so latching it on a definition
+				// whose replicas were all skipped strands the volume:
+				// nothing holds the data, and nothing is allowed to
+				// become the source.
+				Initialized: ptr(adopted),
 			},
 		}
 
@@ -590,6 +967,208 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 
 // attachRDLayerFields fills the DRBD (port, shared-secret), volume and
 // LUKS-report bits onto a converted ResourceDefinition.
+// rdConvertible reports whether this resource definition should convert
+// at all, and says why whenever it should not. Both rejections are
+// terminal for the definition and for every replica of it, since
+// convertResources drops replicas whose parent did not convert.
+func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
+	if row.ResourceFlags&resourceFlagDelete != 0 {
+		c.warnf("resource definition %s: marked DELETE in the source cluster — skipped", dsp)
+
+		return false
+	}
+
+	if row.ResourceFlags != 0 {
+		c.warnf("resource definition %s: unhandled flags bitmask %d dropped", dsp, row.ResourceFlags)
+	}
+
+	if reason := c.volumelessReason(row.ResourceName); reason != "" {
+		c.warnf("resource definition %s: %s — skipped; there is no volume to adopt, and migrating it leaves the controller placing replicas the satellite can never bring up", dsp, reason)
+
+		return false
+	}
+
+	return true
+}
+
+// rdHasVolumeDefinitions reports whether this resource definition owns a
+// volume that will convert.
+//
+// A definition with no volumes cannot become a usable volume: there is
+// no size, and no DRBD minor to allocate. Migrating one still gives the
+// controller something to place replicas for, so it allocates a port and
+// three Resources, and the satellite then spins forever on "waiting for
+// controller-side DRBD-ID allocation" — no .res file, no backing device,
+// and a hot reconcile loop. The CLI shows the replicas as `Unknown`
+// because there is no kernel state to report.
+//
+// LINSTOR leaves such definitions behind: a production dump carried one
+// with zero volumes whose only replica was already flagged DELETE. Skip
+// it and say so. An operator who genuinely wanted an empty definition
+// can recreate it in one command; a wedged reconcile loop is the worse
+// outcome. Deliberately checked silently: volumeDefinitionsFor reports
+// each DELETE'd volume itself, and calling it here would double up.
+func (c *converter) volumelessReason(rdName string) string {
+	sawDeleted := false
+
+	for i := range c.dump.VolumeDefinitions {
+		vd := &c.dump.VolumeDefinitions[i]
+
+		if vd.ResourceName != rdName || vd.SnapshotName != "" {
+			continue
+		}
+
+		if vd.VlmFlags&resourceFlagDelete != 0 {
+			sawDeleted = true
+
+			continue
+		}
+
+		return ""
+	}
+
+	// Diagnostic, but it is the operator's only trail: a definition
+	// rejected here never reaches volumeDefinitionsFor, so the
+	// per-volume "marked DELETE" lines never appear for exactly these.
+	if sawDeleted {
+		return "every volume definition is marked DELETE in the source cluster"
+	}
+
+	return "no volume definitions"
+}
+
+// reportLatch names every reason the definition ended up in the latch state
+// it did.
+//
+// Reported independently rather than as a switch: a definition can be held by
+// an absent node AND pool-divergent at once, and a switch names only whichever
+// branch comes first while the document promises every state is named with the
+// reason that applies.
+func (c *converter) reportLatch(dsp string, latch rdLatchState, adopted bool) {
+	if latch.onlyDivergent {
+		c.warnf("resource definition %s: every replica spans multiple storage pools and is skipped, so the definition arrives with no replicas at all — Initialized stays latched because the data exists, but resolve the divergence or replicas placed later sit Inconsistent", dsp)
+	}
+
+	if latch.heldByAbsentNode {
+		c.warnf("resource definition %s: a replica lives on a node that was not migrated — Initialized kept latched, because that data still exists; adopt those nodes or the definition stays short of replicas", dsp)
+	}
+
+	if adopted {
+		return
+	}
+
+	if latch.onlyDiskless {
+		c.warnf("resource definition %s: replicas are being migrated but every one is diskless — a client or a quorum witness carries no copy, so Initialized is left unlatched and blockstor seeds a first sync when a diskful replica is added", dsp)
+
+		return
+	}
+
+	c.warnf("resource definition %s: no replica is being migrated — Initialized left unlatched so blockstor can seed a first sync", dsp)
+}
+
+// rdLatchState is what rdInitializedLatch found out about a resource
+// definition's replicas.
+type rdLatchState struct {
+	// adopted is true when at least one replica survives conversion.
+	adopted bool
+	// heldByAbsentNode is true when a replica was skipped only because
+	// its host node did not migrate. The data is still on that node's
+	// disk, so the definition is not fresh even though nothing was
+	// adopted from it.
+	heldByAbsentNode bool
+	// onlyDivergent is true when every replica that kept the latch on
+	// spans multiple storage pools. convertResources drops each of
+	// those, so the definition lands latched and with no replicas at
+	// all — the shape that sits Inconsistent forever if the controller
+	// later places fresh ones.
+	onlyDivergent bool
+	// onlyDiskless is true when replicas ARE being migrated but every one
+	// of them is diskless — a client or a quorum witness, carrying no copy
+	// of anything. The definition arrives unlatched with its replicas
+	// emitted, which is neither of the two shapes above and reads nothing
+	// like "no replica is being migrated".
+	onlyDiskless bool
+}
+
+// rdInitializedLatch decides whether Initialized may be dropped.
+//
+// Only one reason to skip a replica means the data is genuinely gone:
+// the source cluster had already flagged it DELETE. A replica skipped
+// because its host node is missing from the dump — an incomplete or
+// staged dump, an unknown node_type, a CONTROLLER node — still exists
+// on disk. Unlatching there is the direction this must never take: the
+// controller would place fresh replicas, elect an auto-primary and seed
+// a blank first sync, and when the operator later brings that node in,
+// its real replica becomes SyncTarget of the blank set and is
+// overwritten.
+//
+// The per-replica pool-divergence skip is deliberately not counted:
+// treating a doubtful replica as adopted keeps the latch ON, the safe
+// direction.
+func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
+	var state rdLatchState
+
+	for i := range c.dump.Resources {
+		row := &c.dump.Resources[i]
+
+		if row.ResourceName != rdName || row.SnapshotName != "" {
+			continue
+		}
+
+		if row.ResourceFlags&resourceFlagDelete != 0 {
+			continue
+		}
+
+		if !c.convertedNode[row.NodeName] {
+			state.heldByAbsentNode = true
+
+			continue
+		}
+
+		// A replica with no storage cannot be the evidence that data
+		// was adopted — a diskless client or a quorum witness carries
+		// no copy of anything. The latch means "this definition already
+		// holds data, do not re-initialise it", so letting a witness
+		// set it would assert that about a definition whose every
+		// data-bearing replica is gone.
+		//
+		// Keyed on the diskless bit ALONE, matching decodeResourceFlags:
+		// TIE_BREAKER is only meaningful together with diskless, and
+		// production dumps carry the bit stuck on replicas that are
+		// diskful, left behind by an auto-diskful toggle. Testing it on
+		// its own would drop such a replica from the evidence set while
+		// convertResources adopts it as diskful — and a definition whose
+		// only adopted replica was dropped this way un-latches, which
+		// re-enables auto-primary election and lets an empty first sync
+		// overwrite the data that was just adopted. The skip has to be
+		// narrower than the adoption, never wider.
+		if row.ResourceFlags&resourceFlagDiskless != 0 {
+			state.onlyDiskless = true
+
+			continue
+		}
+
+		// A pool-divergent replica still counts: treating a doubtful
+		// one as adopted keeps the latch ON, the safe direction. But
+		// convertResources will drop it, so remember that this is all
+		// that held the latch.
+		if _, divergent := c.replicaPoolDivergence(row); divergent {
+			state.adopted = true
+			state.onlyDivergent = true
+
+			continue
+		}
+
+		state.adopted = true
+		state.onlyDivergent = false
+		state.onlyDiskless = false
+
+		return state
+	}
+
+	return state
+}
+
 func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row *ResourceDefinitionRow, dsp string) {
 	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
 		def.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, dsp)

@@ -438,22 +438,16 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 // handleNodeStoragePoolsList serves GET /v1/nodes/{node}/storage-pools.
 //
 // Implementation note: we deliberately go through the same List()+filter
-// pipeline that /v1/view/storage-pools uses (rather than the store's
-// ListByNode shortcut) for two reasons:
+// pipeline that /v1/view/storage-pools uses rather than the store's
+// ListByNode shortcut. Java LINSTOR matches node names case-insensitively on
+// both paths, and ListByNode compares the stored spelling (see
+// store.FoldName), so routing the per-node handler through the same
+// matchAnyFold filter is what keeps the two endpoints in lockstep — a parity
+// invariant the storage_pools_test.go MatchesViewFiltering test pins.
 //
-//  1. The k8s backend's ListByNode relies on a label selector that is only
-//     populated when the CRD was created through our Create() path. Pools
-//     that land in the cluster via operator `kubectl apply -f` or a
-//     migration won't carry the label and would silently disappear from
-//     the per-node listing — but they show up correctly in the view.
-//     linstor-csi's autoplace probes /v1/nodes/{node}/storage-pools per
-//     node, so an empty per-node response means "no candidate nodes",
-//     leading to ResourceExhausted and stuck-Pending PVCs even though
-//     the pools are visible in the aggregate view.
-//  2. Java LINSTOR matches node names case-insensitively in both paths.
-//     Routing the per-node handler through the same matchAnyFold filter
-//     keeps the two endpoints in lockstep — a parity invariant the
-//     storage_pools_test.go MatchesViewFiltering test pins.
+// This used to give a second reason, that ListByNode ran a label selector a
+// hand-applied pool would not match. It selects on spec.nodeName now, which
+// every pool carries whoever wrote it, so that reason no longer holds.
 func (s *Server) handleNodeStoragePoolsList(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 

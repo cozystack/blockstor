@@ -75,6 +75,12 @@ func (s *inMemorySnapshots) ListByDefinition(_ context.Context, rdName string) (
 	return out, nil
 }
 
+// ListByDefinitionUncached has nothing to bypass here: this store is the API
+// server.
+func (s *inMemorySnapshots) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+	return s.ListByDefinition(ctx, rdName)
+}
+
 func (s *inMemorySnapshots) Get(_ context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

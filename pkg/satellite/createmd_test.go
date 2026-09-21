@@ -551,3 +551,122 @@ func (e fakeConfiguredDeviceError) Error() string {
 func fakeConfiguredDeviceErr(minor int32) error { return fakeConfiguredDeviceError{minor: minor} }
 
 func strconvI32(v int32) string { return strconv.FormatInt(int64(v), 10) }
+
+// errDumpMdUnclean is the verbatim exit drbdadm returns for a volume
+// whose activity log was never closed — the shape a machine leaves
+// behind when it goes down while Primary and writing, and the same
+// shape a ZFS snapshot of a live volume carries into a clone.
+var errDumpMdUnclean = errors.New(
+	`drbdadm dump-md pvc-unclean/0: Found meta data is "unclean", ` +
+		`please apply-al first: exit status 1`)
+
+// uncleanFixture wires a single-volume reconciler whose dump-md reports
+// an unapplied activity log.
+func uncleanFixture(
+	t *testing.T,
+) (*Reconciler, *intent.DesiredResource, map[int32]string, string, *storage.FakeExec) {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md pvc-unclean/0", storage.FakeResponse{Err: errDumpMdUnclean})
+	fx.Expect("drbdadm create-md --force --max-peers=15 pvc-unclean/0", storage.FakeResponse{})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := NewReconciler(ReconcilerConfig{
+		Providers:    map[string]storage.Provider{"thin1": thin},
+		Adm:          drbd.NewAdm(fx),
+		StateDir:     dir,
+		NodeName:     "n1",
+		LocalAddress: "10.0.0.1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-unclean",
+		NodeName: "n1",
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
+		},
+	}
+
+	devices := map[int32]string{0: "/dev/vg/pvc-unclean_00000"}
+
+	return rec, dr, devices, filepath.Join(dir, "pvc-unclean.md-created"), fx
+}
+
+// A lower disk carrying an unclean superblock is initialised, on both
+// activation arms.
+//
+// It is worth being explicit about what these two pin, because the
+// obvious reading of the second one is wrong. An unapplied activity log
+// does NOT mean "this volume is established": a volume added to a live
+// resource arrives with firstActivation=false on a lower disk that is
+// brand new, and one carved from a recycled pool extent carries
+// whatever superblock the previous tenant left. Gating re-initialisation
+// on firstActivation stalled exactly that shape — the e2e suite caught
+// vol-1 never leaving Diskless while the kernel had it UpToDate.
+//
+// The cost is that a replica which crashed while Primary and writing
+// looks the same to drbdmeta and gets re-initialised too. Separating
+// them needs a per-volume record of "we have initialised this before",
+// which does not exist yet; these tests pin the behaviour as it stands
+// rather than the behaviour we want.
+func TestEnsureMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
+	for _, firstActivation := range []bool{true, false} {
+		rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+
+		if !firstActivation {
+			if err := os.WriteFile(mdMarkerPath, nil, 0o600); err != nil {
+				t.Fatalf("seed .md-created marker: %v", err)
+			}
+		}
+
+		err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, firstActivation)
+		if err != nil {
+			t.Fatalf("firstActivation=%v: ensureMetadata: %v", firstActivation, err)
+		}
+
+		created := false
+
+		for _, line := range fx.CommandLines() {
+			if strings.Contains(line, "create-md") {
+				created = true
+			}
+		}
+
+		if !created {
+			t.Errorf("firstActivation=%v: the volume was left without metadata", firstActivation)
+		}
+	}
+}
+
+// ensurePerVolumeMetadata carries its own copy of the unclean mapping, and
+// nothing drove it before: deleting that mapping left the whole suite green
+// while an unclean lower disk stopped being initialised on the path that
+// reaches established resources.
+//
+// The behaviour is the same as its ensureMetadata twin and pinned for the
+// same reason — see TestEnsureMetadataInitialisesAnUncleanLowerDisk for why
+// re-initialising here is what the platform does today, and what it costs.
+func TestEnsurePerVolumeMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
+	rec, dr, devices, _, fx := uncleanFixture(t)
+
+	err := rec.ensurePerVolumeMetadata(context.Background(), dr, devices, false)
+	if err != nil {
+		t.Fatalf("ensurePerVolumeMetadata: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "create-md") {
+			return
+		}
+	}
+
+	t.Error("the volume was left without metadata")
+}

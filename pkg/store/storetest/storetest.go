@@ -23,6 +23,7 @@ limitations under the License.
 package storetest
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -208,6 +209,12 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
 		}
 	})
+	runVolumeDefinitionListAllCase(t, newStore)
+	// List resolves the definition the way ListAll keys it. The in-memory
+	// store compared verbatim while ListAll folded, so a mixed-case lookup
+	// answered differently depending on which side of the CLI's bulk-read
+	// cutoff it landed on.
+	t.Run("ListFoldsTheDefinitionName", func(t *testing.T) { testVolumeDefinitionListFolds(t, newStore) })
 	// BUG-048: CreateAutoNumbered allocates the smallest free hole and
 	// the allocation is atomic with the write (the REST handler routes
 	// every number-less `linstor vd c` here).
@@ -334,6 +341,58 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 	})
 	t.Run("CreateNilArg", func(t *testing.T) { testVDCreateNilArg(t, newStore) })
 	t.Run("UpdateNilArg", func(t *testing.T) { testVDUpdateNilArg(t, newStore) })
+}
+
+// runVolumeDefinitionListAllCase pins ListAll's contract.
+//
+// ListAll answers for the whole cluster in one request, and keys the
+// answer folded. A caller holds whatever spelling its own objects
+// carry — for a replica that is Spec.ResourceDefinitionName, which
+// need not match the definition's own — and LINSTOR treats the two as
+// one object where a map does not. Keyed raw, the lookup silently
+// misses and the definition renders as though it had no volumes.
+func runVolumeDefinitionListAllCase(t *testing.T, newStore Factory) {
+	t.Helper()
+	t.Run("ListAllKeysFolded", func(t *testing.T) {
+		s := newStore(t)
+		ctx := t.Context()
+
+		seedRD(t, s, "PVC-Mixed")
+		seedRD(t, s, "pvc-plain")
+
+		for _, rd := range []string{"PVC-Mixed", "pvc-plain"} {
+			if err := s.VolumeDefinitions().Create(ctx, rd,
+				&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+				t.Fatalf("Create under %s: %v", rd, err)
+			}
+		}
+
+		all, err := s.VolumeDefinitions().ListAll(ctx)
+		if err != nil {
+			t.Fatalf("ListAll: %v", err)
+		}
+
+		if len(all) != 2 {
+			t.Errorf("ListAll returned %d definitions, want 2", len(all))
+		}
+
+		// The spelling a replica of that definition carries.
+		vds, ok := all[store.FoldName("pvc-mixed")]
+		if !ok {
+			keys := make([]string, 0, len(all))
+			for k := range all {
+				keys = append(keys, k)
+			}
+
+			slices.Sort(keys)
+
+			t.Fatalf("ListAll keys = %v, want an entry reachable under the folded name", keys)
+		}
+
+		if len(vds) != 1 || vds[0].SizeKib != 1024*1024 {
+			t.Errorf("got %+v, want the one volume that was created", vds)
+		}
+	})
 }
 
 // runVolumeDefinitionAutoNumberCases pins the BUG-048 atomic-allocate
@@ -658,37 +717,30 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
 	// See annotation_contract.go.
 	t.Run("UpdateAnnotationContract", func(t *testing.T) { testResourceUpdateAnnotationContract(t, newStore) })
-	t.Run("CreateDuplicate", func(t *testing.T) {
-		s := newStore(t).Resources()
-		ctx := t.Context()
-		r := apiv1.Resource{Name: "pvc-1", NodeName: "n1"}
-		if err := s.Create(ctx, &r); err != nil {
-			t.Fatalf("first: %v", err)
-		}
-		err := s.Create(ctx, &r)
-		if !errors.Is(err, store.ErrAlreadyExists) {
-			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
-		}
+	t.Run("CreateDuplicate", func(t *testing.T) { testResourceCreateDuplicate(t, newStore) })
+	t.Run("ListByDefinition", func(t *testing.T) { testResourceListByDefinition(t, newStore) })
+	// ListByNode is the read `node delete` refuses on and `--force`
+	// cascades from, and the one this store answers with a field selector
+	// against the API server and a fallback everywhere else. Both shapes
+	// have to agree, and the shared suite is the only place that asks them
+	// the same question — its sibling ListByDefinition has been here since
+	// the beginning and this one was covered per implementation only.
+	t.Run("ListByNode", func(t *testing.T) { testResourceListByNode(t, newStore) })
+	// The node-delete gate and its --force cascade. Nodes().Get and Delete
+	// fold the name, so the gate has to find the node's replicas under the
+	// spelling the operator used, or the refusal passes and the node goes
+	// with replicas still pointing at it. Pinned on both implementations so
+	// they cannot drift apart.
+	t.Run("ReferencesOnNodeUnderAnotherSpelling", func(t *testing.T) {
+		testReferencesOnNodeUnderAnotherSpelling(t, newStore)
 	})
-	t.Run("ListByDefinition", func(t *testing.T) {
-		s := newStore(t).Resources()
-		ctx := t.Context()
-		for _, r := range []apiv1.Resource{
-			{Name: "pvc-1", NodeName: "n1"},
-			{Name: "pvc-1", NodeName: "n2"},
-			{Name: "pvc-2", NodeName: "n1"},
-		} {
-			if err := s.Create(ctx, &r); err != nil {
-				t.Fatalf("Create %+v: %v", r, err)
-			}
-		}
-		got, err := s.ListByDefinition(ctx, "pvc-1")
-		if err != nil {
-			t.Fatalf("ListByDefinition: %v", err)
-		}
-		if len(got) != 2 {
-			t.Errorf("len: got %d, want 2", len(got))
-		}
+	// The other direction: the operator types the canonical lowercase name
+	// and the node, with its replicas and pools, was registered in upper
+	// case, which is how adoption from LINSTOR writes it. Asking in the
+	// typed and the folded spelling is one spelling here, and it found
+	// nothing.
+	t.Run("ReferencesOnNodeUnderTheRegisteredSpelling", func(t *testing.T) {
+		testReferencesOnNodeUnderTheRegisteredSpelling(t, newStore)
 	})
 	t.Run("DeleteRemoves", func(t *testing.T) {
 		s := newStore(t).Resources()
@@ -956,6 +1008,96 @@ func testResourceListSorted(t *testing.T, newStore Factory) {
 			t.Errorf("[%d]: got %s/%s, want %s/%s",
 				i, got[i].Name, got[i].NodeName, w.name, w.node)
 		}
+	}
+}
+
+// testResourceListByNode pins what a node-scoped read answers: every replica
+// on the node asked for, none from anywhere else, and an empty result rather
+// than an error for a node nothing references.
+func testResourceListByNode(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-1", NodeName: "n1"},
+		{Name: "pvc-2", NodeName: "n1"},
+		{Name: "pvc-3", NodeName: "n2"},
+	} {
+		if err := s.Create(ctx, &r); err != nil {
+			t.Fatalf("Create %+v: %v", r, err)
+		}
+	}
+
+	got, err := s.ListByNode(ctx, "n1")
+	if err != nil {
+		t.Fatalf("ListByNode: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("len: got %d, want the 2 replicas on n1", len(got))
+	}
+
+	for i := range got {
+		if got[i].NodeName != "n1" {
+			t.Errorf("ListByNode returned a replica on %q", got[i].NodeName)
+		}
+	}
+
+	// A node nothing references answers empty, not an error: `node delete`
+	// reads this to decide whether to refuse, and an error there is a
+	// refusal the operator cannot clear.
+	none, err := s.ListByNode(ctx, "ghost")
+	if err != nil {
+		t.Fatalf("ListByNode on an unreferenced node: %v", err)
+	}
+
+	if len(none) != 0 {
+		t.Errorf("ListByNode on an unreferenced node returned %d replica(s)", len(none))
+	}
+}
+
+func testResourceCreateDuplicate(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+	r := apiv1.Resource{Name: "pvc-1", NodeName: "n1"}
+
+	if err := s.Create(ctx, &r); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+
+	err := s.Create(ctx, &r)
+	if !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("dup: got %v, want ErrAlreadyExists", err)
+	}
+}
+
+func testResourceListByDefinition(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-1", NodeName: "n1"},
+		{Name: "pvc-1", NodeName: "n2"},
+		{Name: "pvc-2", NodeName: "n1"},
+	} {
+		if err := s.Create(ctx, &r); err != nil {
+			t.Fatalf("Create %+v: %v", r, err)
+		}
+	}
+
+	got, err := s.ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("ListByDefinition: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Errorf("len: got %d, want 2", len(got))
 	}
 }
 
@@ -1964,4 +2106,109 @@ func trueBool() *bool {
 	v := true
 
 	return &v
+}
+
+// testVolumeDefinitionListFolds asks for a definition's volumes under a
+// spelling it is not stored under, in both directions. The lookup side is
+// folded either way, so only a definition stored in mixed case and asked for in
+// the canonical spelling tells whether the stored side folds too: that is the
+// replica naming a definition `pvc-mixed` whose object was written `PVC-Mixed`.
+func testVolumeDefinitionListFolds(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	for _, tc := range []struct{ stored, asked string }{
+		{stored: "PVC-Fold-Stored", asked: "pvc-fold-stored"},
+		{stored: "pvc-fold-asked", asked: "PVC-Fold-Asked"},
+	} {
+		s := newStore(t)
+		ctx := t.Context()
+
+		seedRD(t, s, tc.stored)
+
+		if err := s.VolumeDefinitions().Create(ctx, tc.stored,
+			&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+			t.Fatalf("Create under %q: %v", tc.stored, err)
+		}
+
+		got, err := s.VolumeDefinitions().List(ctx, tc.asked)
+		if err != nil {
+			t.Fatalf("List %q stored as %q: %v", tc.asked, tc.stored, err)
+		}
+
+		if len(got) != 1 {
+			t.Errorf("List %q stored as %q returned %d volume(s), want 1", tc.asked, tc.stored, len(got))
+		}
+	}
+}
+
+func testReferencesOnNodeUnderTheRegisteredSpelling(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.Nodes().Create(ctx, &apiv1.Node{Name: "NODE-REG", Type: "SATELLITE"}); err != nil {
+		t.Fatalf("Create node: %v", err)
+	}
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-reg", NodeName: "NODE-REG"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	if err := s.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool-reg", NodeName: "NODE-REG", ProviderKind: apiv1.StoragePoolKindFile,
+	}); err != nil {
+		t.Fatalf("Create pool: %v", err)
+	}
+
+	replicas, pools, err := store.ReferencesOnNode(ctx, s, "node-reg")
+	if err != nil {
+		t.Fatalf("ReferencesOnNode: %v", err)
+	}
+
+	if len(replicas) != 1 || len(pools) != 1 {
+		t.Errorf("ReferencesOnNode typed lowercase found %d replica(s) and %d pool(s), want 1 "+
+			"and 1: the refusal would pass and the node would go with both on it",
+			len(replicas), len(pools))
+	}
+
+	if err := store.CascadeOrphansForLostNode(ctx, s, "node-reg"); err != nil {
+		t.Fatalf("CascadeOrphansForLostNode: %v", err)
+	}
+
+	left, err := s.Resources().ListByNode(ctx, "NODE-REG")
+	if err != nil {
+		t.Fatalf("ListByNode replicas: %v", err)
+	}
+
+	leftPools, err := s.StoragePools().ListByNode(ctx, "NODE-REG")
+	if err != nil {
+		t.Fatalf("ListByNode pools: %v", err)
+	}
+
+	if len(left) != 0 || len(leftPools) != 0 {
+		t.Errorf("the lost-node cascade typed lowercase left %d replica(s) and %d pool(s) "+
+			"pointing at the node", len(left), len(leftPools))
+	}
+}
+
+func testReferencesOnNodeUnderAnotherSpelling(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-ref", NodeName: "node-ref"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	replicas, _, err := store.ReferencesOnNode(ctx, s, "NODE-REF")
+	if err != nil {
+		t.Fatalf("ReferencesOnNode: %v", err)
+	}
+
+	if len(replicas) != 1 {
+		t.Errorf("ReferencesOnNode under another spelling found %d replica(s), want 1 — "+
+			"the refusal would pass and the node would go with a replica on it", len(replicas))
+	}
 }

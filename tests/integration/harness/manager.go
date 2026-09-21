@@ -100,22 +100,15 @@ func StartStack(t *testing.T) *Stack {
 	// `metadata.name == poolName.nodeName`). envtest already
 	// applied them when Start returned. Nothing extra to do.
 
-	mgr, err := buildIntegrationManager(env)
+	mgr, st, err := buildIntegrationManager(env)
 	if err != nil {
 		t.Fatalf("build manager: %v", err)
 	}
 
-	// Mirror cmd/apiserver/main.go: the REST-serving store is built
-	// with the manager's direct (uncached) API reader. CreateAutoNumbered's
-	// retry loop reads the parent RD through this reader so a conflict-
-	// retry observes the just-committed VolumeDefinition rather than a
-	// stale informer-cache revision. Without it (the plain New) the
-	// cache-lag re-read re-derives the same hole, 409-storms against the
-	// RD reconciler's concurrent writes, and the slow create makes the
-	// linstor client re-POST — leaving duplicate auto-numbered VDs
-	// (BUG-048 de-regress). Production never hit this because the apiserver
-	// always wires GetAPIReader(); the harness must match.
-	st := storek8s.NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
+	// The REST-serving store comes back from storek8s.NewManager with the
+	// manager, built on its direct (uncached) API reader, which is what
+	// CreateAutoNumbered's retry loop reads the parent RD through so a
+	// conflict-retry observes the just-committed VolumeDefinition (BUG-048).
 
 	// Wire every reconciler / runnable cmd/controller/main.go
 	// registers. Mirror order exactly so a future split-or-merge
@@ -173,7 +166,7 @@ func StartStack(t *testing.T) *Stack {
 // the test stack drives. LeaderElection off (every replica is
 // authoritative in tests), metrics disabled (no need for a Prometheus
 // listener in unit-of-integration tests).
-func buildIntegrationManager(env *Env) (manager.Manager, error) {
+func buildIntegrationManager(env *Env) (manager.Manager, *storek8s.Store, error) {
 	scheme := clientgoscheme.Scheme
 	utilruntime.Must(blockstoriov1alpha1.AddToScheme(scheme))
 
@@ -186,7 +179,10 @@ func buildIntegrationManager(env *Env) (manager.Manager, error) {
 	// is the documented escape hatch for test harnesses
 	// (https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/config).
 	skipNameValidation := true
-	mgr, err := ctrl.NewManager(env.Cfg, ctrl.Options{
+	// storek8s.NewManager, not ctrl.NewManager: the field indexes the store
+	// selects on come with it, so this harness cannot drift into exercising
+	// only the whole-cluster fallback while claiming to mirror the binaries.
+	mgr, st, err := storek8s.NewManager(env.Cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
@@ -196,20 +192,20 @@ func buildIntegrationManager(env *Env) (manager.Manager, error) {
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("new manager: %w", err)
+		return nil, nil, fmt.Errorf("new manager: %w", err)
 	}
 
 	err = mgr.AddHealthzCheck("healthz", healthz.Ping)
 	if err != nil {
-		return nil, fmt.Errorf("add healthz: %w", err)
+		return nil, nil, fmt.Errorf("add healthz: %w", err)
 	}
 
 	err = mgr.AddReadyzCheck("readyz", healthz.Ping)
 	if err != nil {
-		return nil, fmt.Errorf("add readyz: %w", err)
+		return nil, nil, fmt.Errorf("add readyz: %w", err)
 	}
 
-	return mgr, nil
+	return mgr, st, nil
 }
 
 // wireReconcilers attaches every reconciler / runnable

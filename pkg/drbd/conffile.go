@@ -220,6 +220,11 @@ func Build(r Resource) (string, error) {
 		return "", errors.New("drbd: resource name is required")
 	}
 
+	err := checkValues(&r)
+	if err != nil {
+		return "", err
+	}
+
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "resource %s {\n", r.Name)
@@ -250,6 +255,176 @@ func Build(r Resource) (string, error) {
 	return b.String(), nil
 }
 
+// writeOption emits one `key value;` line, quoting the value when drbdadm's
+// grammar needs it.
+//
+// Most option values are bare keywords or numbers and must stay unquoted, so
+// this quotes what would not survive as a bare token. That set is much wider
+// than whitespace and punctuation: drbdadm's bare-token rule accepts only
+// [a-zA-Z0-9/._-], so '+', '=', ',' and '%' all end the token early and the
+// file fails to parse. See needsQuoting.
+//
+// Emitting such a value verbatim does not fail loudly. drbdadm reads the
+// first token and treats the rest as syntax, so a fence-peer handler with a
+// --timeout argument becomes a parse error in a file the operator never
+// edited, and it surfaces at the moment DRBD needs to fence rather than at
+// configuration time.
+func writeOption(b *strings.Builder, indent, key, value string) {
+	if needsQuoting(value) {
+		fmt.Fprintf(b, "%s%s %s;\n", indent, key, quoteValue(value))
+
+		return
+	}
+
+	fmt.Fprintf(b, "%s%s %s;\n", indent, key, value)
+}
+
+// quoteValue wraps a value in the quotes drbd's grammar uses, escaping the
+// two bytes its lexer treats specially.
+//
+// drbdadm's scanner accepts a backslash followed by any non-newline byte
+// inside a double-quoted string (`DQSTRING` in drbdadm_scanner.fl) and runs
+// `unescape()` over the token, which drops the backslash and copies the next
+// byte verbatim. drbd-utils' own writer, `esc()` in shared_tool.c, therefore
+// escapes `"` and `\` and nothing else. This mirrors it.
+//
+// Emitting the value literally instead is what an earlier revision did, and
+// it corrupts two shapes: `--path a\b` reaches the handler as `--path ab`,
+// and a value ending in a backslash escapes the closing quote, which makes
+// the whole .res a parse error rather than one bad option.
+func quoteValue(value string) string {
+	var out strings.Builder
+
+	out.Grow(len(value) + 2)
+	out.WriteByte('"')
+
+	for i := range len(value) {
+		if value[i] == '"' || value[i] == '\\' {
+			out.WriteByte('\\')
+		}
+
+		out.WriteByte(value[i])
+	}
+
+	out.WriteByte('"')
+
+	return out.String()
+}
+
+// ErrUnrepresentableValue refuses a value drbd.conf cannot spell. Exported
+// so a caller validating operator input can tell it from a malformed
+// resource and report which value was rejected.
+var ErrUnrepresentableValue = errors.New("drbd: value cannot be represented in drbd.conf")
+
+// ValidateOptionValue refuses a value that has no spelling in a drbd.conf
+// string at all.
+//
+// That is a much smaller set than an earlier revision assumed. A quote and a
+// backslash both have one — quoteValue escapes them the way drbd-utils does,
+// and drbdadm reads them back. What is left with no spelling is a newline,
+// which ends the string in the scanner's own grammar; a carriage return,
+// which survives the parse but lands inside the value on the node; and NUL,
+// which the C lexer treats as end-of-string and silently truncates the value
+// there.
+//
+// Refusing here names the option at the moment the config is built, rather
+// than shipping a file that parses into something else.
+//
+// Exported so an API handler can refuse operator input at the edge. Build
+// refuses it too, but that happens on the node at reconcile time, by which
+// point the value is stored and the resource simply fails to configure.
+func ValidateOptionValue(block, key, value string) error {
+	i := strings.IndexAny(value, "\n\r\x00")
+	if i < 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %s option %q carries %q", ErrUnrepresentableValue, block, key, value[i:i+1])
+}
+
+// checkValues walks every free-form value a resource carries. Blocks are
+// visited in a fixed order so the same resource always names the same option.
+func checkValues(r *Resource) error {
+	err := ValidateOptionValue(SectionNet, sharedSecretOption, r.Net.SharedSecret)
+	if err != nil {
+		return err
+	}
+
+	blocks := []struct {
+		name string
+		opts map[string]string
+	}{
+		{SectionNet, r.Net.Options},
+		{SectionOptions, r.Options},
+		{SectionDisk, r.Disk},
+		{SectionHandlers, r.Handlers},
+		{SectionPeerDevice, r.PeerDevice},
+	}
+
+	for _, block := range blocks {
+		for _, key := range sortedKeys(block.opts) {
+			err := ValidateOptionValue(block.name, key, block.opts[key])
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// needsQuoting reports whether a value would not survive as a bare drbd
+// token.
+//
+// The rule is drbd-utils' own, from esc() in shared_tool.c: a value is
+// emitted bare only when every byte is in [a-zA-Z0-9/._-] and it is at most
+// 80 characters. Everything else gets quotes.
+//
+// An enumerated list of "dangerous" characters looked equivalent and was not.
+// It covered whitespace, quotes, braces, semicolons and '#', and let through
+// '+', '=', ',' and '%' — so a base64-ish handler value went out as
+// `fence-peer abcDEF+/=;` and drbdadm answered "Parse error: ';' expected".
+// That takes down the whole .res on that node, not one option, at the next
+// reconcile. Allow-listing what is known to be safe cannot fail that way: a
+// character nobody thought about gets quoted, which is always valid.
+//
+// An empty value is quoted too: `key ;` is not valid syntax.
+func needsQuoting(value string) bool {
+	if value == "" || len(value) > bareTokenMaxLen {
+		return true
+	}
+
+	for i := range len(value) {
+		if !isBareTokenByte(value[i]) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// bareTokenMaxLen is the length past which drbd-utils quotes regardless of
+// content.
+const bareTokenMaxLen = 80
+
+// isBareTokenByte reports whether a byte may appear in an unquoted drbd
+// token: [a-zA-Z0-9/._-].
+func isBareTokenByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '/', c == '.', c == '_', c == '-':
+		return true
+	default:
+		return false
+	}
+}
+
+// sharedSecretOption is the drbd net option carrying the peer
+// authentication secret. Unlike every other net option, its value is a
+// quoted string.
+const sharedSecretOption = "shared-secret"
+
 // writeNet emits the `net { … }` block when there is anything to emit
 // (a shared secret or any free-form option). drbd treats an empty `net
 // {}` as legal but noisy, so we skip it entirely when unused.
@@ -261,11 +436,31 @@ func writeNet(b *strings.Builder, n Net) {
 	b.WriteString("  net {\n")
 
 	if n.SharedSecret != "" {
-		fmt.Fprintf(b, "    shared-secret %q;\n", n.SharedSecret)
+		fmt.Fprintf(b, "    %s %s;\n", sharedSecretOption, quoteValue(n.SharedSecret))
 	}
 
-	for _, k := range sortedKeys(n.Options) {
-		fmt.Fprintf(b, "    %s %s;\n", k, n.Options[k])
+	for _, option := range sortedKeys(n.Options) {
+		// shared-secret is the one net option drbd's grammar spells as
+		// a quoted string; every other value is a bare keyword or a
+		// number and must stay verbatim. LINSTOR generates the secret
+		// in base64, so it routinely carries '+', '/' or '=', which
+		// drbdadm rejects unquoted. The typed field above wins when a
+		// resource carries the secret both ways, so drbdadm never sees
+		// the key twice.
+		// Compared case-insensitively for the same reason the metadata
+		// probe is: a key that arrives spelled differently must not
+		// slip past the quoting and reach drbdadm bare. Every producer
+		// writes the canonical lowercase today, so this is a guard
+		// against a future one, not a fix for a live bug.
+		if strings.EqualFold(option, sharedSecretOption) {
+			if n.SharedSecret == "" {
+				fmt.Fprintf(b, "    %s %s;\n", option, quoteValue(n.Options[option]))
+			}
+
+			continue
+		}
+
+		writeOption(b, "    ", option, n.Options[option])
 	}
 
 	b.WriteString("  }\n")
@@ -281,7 +476,7 @@ func writeOptions(b *strings.Builder, opts map[string]string) {
 	b.WriteString("  options {\n")
 
 	for _, k := range sortedKeys(opts) {
-		fmt.Fprintf(b, "    %s %s;\n", k, opts[k])
+		writeOption(b, "    ", k, opts[k])
 	}
 
 	b.WriteString("  }\n")
@@ -299,8 +494,11 @@ func writeNamedBlock(b *strings.Builder, name string, opts map[string]string) {
 
 	fmt.Fprintf(b, "  %s {\n", name)
 
+	// Quoted only where a bare token would not survive. A handler that is
+	// just a path stays as it was; one carrying arguments — the ordinary
+	// way to configure fencing — gets the quotes it has always needed.
 	for _, k := range sortedKeys(opts) {
-		fmt.Fprintf(b, "    %s %s;\n", k, opts[k])
+		writeOption(b, "    ", k, opts[k])
 	}
 
 	b.WriteString("  }\n")
@@ -415,7 +613,7 @@ func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []Resource
 		b.WriteString("    disk {\n")
 
 		for _, k := range sortedKeys(peerDevice) {
-			fmt.Fprintf(b, "      %s %s;\n", k, peerDevice[k])
+			writeOption(b, "      ", k, peerDevice[k])
 		}
 
 		b.WriteString("    }\n")
