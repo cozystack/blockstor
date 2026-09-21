@@ -316,7 +316,7 @@ func (r racingSnapshots) ListByDefinition(ctx context.Context, rdName string) ([
 
 	if rdName == r.target {
 		r.once.Do(func() {
-			_ = r.SnapshotStore.Create(ctx, &apiv1.Snapshot{Name: "snap-raced", ResourceName: r.target})
+			_ = r.Create(ctx, &apiv1.Snapshot{Name: "snap-raced", ResourceName: r.target})
 		})
 	}
 

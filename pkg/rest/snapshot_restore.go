@@ -432,6 +432,24 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 	return req.SnapshotName
 }
 
+// uncheckedRestoreGroupWarning tells the caller the restore worked and that
+// the group behind it went unverified, which is the one piece of information
+// that would make them look.
+func uncheckedRestoreGroupWarning(rdName, rgName string, err error) *apiv1.APICallRc {
+	return &apiv1.APICallRc{
+		RetCode: maskWarn,
+		Message: "resource group '" + rgName + "' could not be re-checked after the " +
+			"restore: " + err.Error(),
+		Cause: "the restore itself succeeded; only the safety net over it could not be " +
+			"inspected, so a group deleted during the restore would not have been caught",
+		Correc: "confirm resource group '" + rgName + "' still exists",
+		ObjRefs: map[string]string{
+			objRefRscDfn: rdName,
+			objRefRscGrp: rgName,
+		},
+	}
+}
+
 // restoreParentRGSurvived is the post-write half of the Bug 174 guard on the
 // restore path. The restored definition inherits the source's resource group,
 // so a `rg d` landing while it materialises leaves it parented to a group that
@@ -464,21 +482,8 @@ func (s *Server) restoreParentRGSurvived(
 			"resourceDefinition", newRDName, "resourceGroup", stampedRG, "reason", err.Error())
 
 		// And say so to the caller. Proceeding is right; leaving the only
-		// trace in an apiserver log is not. The operator is told the restore
-		// worked and not that the group behind it went unverified, which is
-		// the one piece of information that would make them look.
-		return &apiv1.APICallRc{
-			RetCode: maskWarn,
-			Message: "resource group '" + stampedRG + "' could not be re-checked after the " +
-				"restore: " + err.Error(),
-			Cause: "the restore itself succeeded; only the safety net over it could not be " +
-				"inspected, so a group deleted during the restore would not have been caught",
-			Correc: "confirm resource group '" + stampedRG + "' still exists",
-			ObjRefs: map[string]string{
-				objRefRscDfn: newRDName,
-				objRefRscGrp: stampedRG,
-			},
-		}, true
+		// trace in an apiserver log is not.
+		return uncheckedRestoreGroupWarning(newRDName, stampedRG, err), true
 	}
 
 	if survived {
