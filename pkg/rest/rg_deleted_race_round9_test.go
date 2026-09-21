@@ -353,3 +353,107 @@ func TestRollbackSweepsASnapshotThatRacedInBehindTheRefusal(t *testing.T) {
 		t.Errorf("the snapshot that raced in outlived the rollback, parented to nothing: %v", err)
 	}
 }
+
+// seedTwoNodeSource is seedDeployedCloneSource with a second diskful replica,
+// so a clone places two and "placed on one, failed on the other" can happen.
+func seedTwoNodeSource(t *testing.T, st store.Store, rdName string) {
+	t.Helper()
+
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, rdName)
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "node-b", ConnectionStatus: "ONLINE"}); err != nil {
+		t.Fatalf("seed node-b: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "zfs-thin", NodeName: "node-b", ProviderKind: "ZFS_THIN", SupportsSnapshot: true,
+	}); err != nil {
+		t.Fatalf("seed the pool on node-b: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: rdName, NodeName: "node-b", Props: map[string]string{"StorPoolName": "zfs-thin"},
+	}); err != nil {
+		t.Fatalf("seed the replica on node-b: %v", err)
+	}
+}
+
+var (
+	errPlacementFailed = errors.New("place the replica failed")
+	errReapConflict    = errors.New("the object has been modified")
+)
+
+// halfPlacingResources places the clone on node-a, fails it on node-b, and
+// then refuses to reap node-a: the satellite conflict the rollback treats as
+// an ordinary outcome.
+type halfPlacingResources struct {
+	store.ResourceStore
+
+	target string
+}
+
+func (h halfPlacingResources) Create(ctx context.Context, r *apiv1.Resource) error {
+	if r.Name == h.target && r.NodeName == "node-b" {
+		return errPlacementFailed
+	}
+
+	return h.ResourceStore.Create(ctx, r) //nolint:wrapcheck // pass-through in a fixture
+}
+
+func (h halfPlacingResources) Delete(ctx context.Context, rdName, node string) error {
+	if rdName == h.target {
+		return errReapConflict
+	}
+
+	return h.ResourceStore.Delete(ctx, rdName, node) //nolint:wrapcheck // pass-through in a fixture
+}
+
+type halfPlacingStore struct {
+	store.Store
+
+	target string
+}
+
+func (s halfPlacingStore) Resources() store.ResourceStore {
+	return halfPlacingResources{ResourceStore: s.Store.Resources(), target: s.target}
+}
+
+// Placement succeeds on one node and fails on the other, the rollback gives up
+// on a conflict, and linstor-csi retries under the same name long before
+// anyone reads the 500. The leftover has its volumes and a live replica, so
+// the wholeness gate answered 201 "already cloned" over a clone with fewer
+// replicas than intended. The rollback records that it gave up, and the replay
+// refuses on that record.
+func TestRDCloneReplayRefusesALeftoverWhoseRollbackGaveUp(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	seedTwoNodeSource(t, backend, "src-half9")
+
+	base, stop := startServerWithStore(t, halfPlacingStore{Store: backend, target: "dst-half9"})
+	defer stop()
+
+	first := postClone(t, base, "src-half9", map[string]any{"name": "dst-half9", "use_zfs_clone": true})
+	_ = first.Body.Close()
+
+	if first.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("first attempt = %d, want 500: placement failed and the rollback gave up", first.StatusCode)
+	}
+
+	replicas, err := backend.Resources().ListByDefinition(t.Context(), "dst-half9")
+	if err != nil || len(replicas) != 1 {
+		t.Fatalf("fixture: want the half-placed leftover with one replica, got %d (err=%v)", len(replicas), err)
+	}
+
+	retry := postClone(t, base, "src-half9", map[string]any{"name": "dst-half9", "use_zfs_clone": true})
+	defer func() { _ = retry.Body.Close() }()
+
+	if retry.StatusCode == http.StatusCreated {
+		t.Fatal("the retry answered 201 over a leftover whose rollback gave up half-placed")
+	}
+
+	if rc := decodeCloneMessage(t, retry); !strings.Contains(rc.Message, "rollback gave up") {
+		t.Errorf("refusal %q does not say an earlier rollback gave up", rc.Message)
+	}
+}

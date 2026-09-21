@@ -396,7 +396,7 @@ func (s *Server) cloneTargetPreexists(ctx context.Context, w http.ResponseWriter
 	}
 
 	if existing.Props["BlockstorRestoreFromSnapshot"] == srcName+":"+cloneSnapshotName(cloneName) {
-		if !s.cloneLeftoverIsUsable(ctx, w, srcName, cloneName, existing.ResourceGroupName) {
+		if !s.cloneLeftoverIsUsable(ctx, w, srcName, cloneName, &existing) {
 			return true
 		}
 
@@ -605,8 +605,9 @@ func (s *Server) cloneShellParentRGSurvived(
 // gate would otherwise report a clone nobody verified, and the CSI retry makes
 // a refusal cheap.
 func (s *Server) cloneLeftoverIsUsable(
-	ctx context.Context, w http.ResponseWriter, srcName, cloneName, stampedRG string,
+	ctx context.Context, w http.ResponseWriter, srcName, cloneName string, existing *apiv1.ResourceDefinition,
 ) bool {
+	stampedRG := existing.ResourceGroupName
 	// The group resolving is not enough on its own. A failed rollback may
 	// have reaped every replica and still kept the definition, and both of
 	// this guard's corrections tell the operator to re-create the group —
@@ -633,7 +634,7 @@ func (s *Server) cloneLeftoverIsUsable(
 	}
 
 	if stampedRG == "" {
-		return true
+		return !cloneRollbackWasAbandoned(w, srcName, cloneName, existing)
 	}
 
 	// An unreadable group is refused rather than waved through. Refusing
@@ -659,7 +660,7 @@ func (s *Server) cloneLeftoverIsUsable(
 	}
 
 	if survived {
-		return true
+		return !cloneRollbackWasAbandoned(w, srcName, cloneName, existing)
 	}
 
 	writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
@@ -675,6 +676,39 @@ func (s *Server) cloneLeftoverIsUsable(
 	})
 
 	return false
+}
+
+// cloneRollbackWasAbandoned refuses, as the last word before a replay would
+// answer 201, a leftover whose rollback gave up. True means the refusal has
+// been written.
+//
+// It comes last on purpose. Every earlier refusal is more precise about the
+// same leftover (still being torn down, parented to a group that is gone), and
+// this one only has to catch what they all let through: a leftover that looks
+// whole because the placement the rollback stopped in the middle of left a
+// live replica and the volumes, when the clone intended more replicas than
+// that. The rollback is the one party that knows; see rollbackAbandonedKey.
+func cloneRollbackWasAbandoned(
+	w http.ResponseWriter, srcName, cloneName string, existing *apiv1.ResourceDefinition,
+) bool {
+	spelled := existing.Props[rollbackAbandonedKey]
+	if spelled == "" {
+		return false
+	}
+
+	step, known := rollbackStepByName(spelled)
+	cause, correc := rollbackStepAdvice(step, known, cloneName)
+
+	writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone target '" + cloneName + "' is what an earlier attempt left when its " +
+			"rollback gave up (" + spelled + ")",
+		Cause: "an earlier attempt at this clone failed and could not be rolled back, so the " +
+			"definition may hold less than the clone intended; " + cause,
+		Correc: correc,
+	})
+
+	return true
 }
 
 // cloneLeftoverRefusal words the refusal for a leftover that is not whole,

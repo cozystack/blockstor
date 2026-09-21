@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -136,7 +137,48 @@ func (s *Server) rollBackDetached(ctx context.Context, rdName string, placed []s
 	rollbackCtx, cancel := detachedCompensation(ctx)
 	defer cancel()
 
-	return s.rollBackMaterialisedRD(rollbackCtx, rdName, placed)
+	err := s.rollBackMaterialisedRD(rollbackCtx, rdName, placed)
+	if err != nil {
+		s.markRollbackAbandoned(rollbackCtx, rdName, err)
+	}
+
+	return err
+}
+
+// rollbackAbandonedKey marks a definition whose compensation gave up, with
+// the step it stopped at.
+//
+// The replay gate needs it. A rollback that stops after placement succeeded
+// on one node and failed on another leaves a definition holding fewer
+// replicas than the operation intended, and the 500 advising a manual delete
+// goes to a caller that retries under the same deterministic name long before
+// anyone reads it: the retry finds volumes and a live replica and would answer
+// 201 over it. Comparing the replicas with the snapshot's nodes cannot tell
+// that apart from a finished clone that was evacuated or scaled down since,
+// and the rollback is the one party that knows it gave up.
+const rollbackAbandonedKey = "BlockstorRollbackAbandoned"
+
+// markRollbackAbandoned records on the definition that its rollback stopped,
+// and where. Best-effort: it runs on what is left of the compensation's
+// budget, and a mark that does not land leaves the replay gate where it was
+// before the mark existed.
+func (s *Server) markRollbackAbandoned(ctx context.Context, rdName string, cause error) {
+	step := rollbackStepName(cause)
+
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
+		func(rd *apiv1.ResourceDefinition) error {
+			if rd.Props == nil {
+				rd.Props = map[string]string{}
+			}
+
+			rd.Props[rollbackAbandonedKey] = step
+
+			return nil
+		})
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		log.FromContext(ctx).Info("could not mark an abandoned rollback on its definition",
+			"resourceDefinition", rdName, "step", step, "reason", err.Error())
+	}
 }
 
 // failedMaterialiseRefusal rolls back what a failed materialisation left, when
@@ -230,15 +272,54 @@ func newRollbackError(step rollbackStep, err error) error {
 	return &rollbackStepError{step: step, err: err}
 }
 
+// rollbackStepNames spells each step for the abandoned-rollback mark.
+var rollbackStepNames = map[rollbackStep]string{ //nolint:gochecknoglobals // a fixed table, read-only
+	rollbackStepReapReplicas:     "reap-replicas",
+	rollbackStepRereadReplicas:   "reread-replicas",
+	rollbackStepSnapshots:        "snapshots",
+	rollbackStepDeleteDefinition: "delete-definition",
+}
+
+// rollbackStepName spells the step a compensation stopped at, or "unknown".
+func rollbackStepName(err error) string {
+	var failure *rollbackStepError
+	if errors.As(err, &failure) {
+		return rollbackStepNames[failure.step]
+	}
+
+	return "unknown"
+}
+
+// rollbackStepByName reads a step back from its spelling.
+func rollbackStepByName(name string) (rollbackStep, bool) {
+	for step, spelled := range rollbackStepNames {
+		if spelled == name {
+			return step, true
+		}
+	}
+
+	return rollbackStepReapReplicas, false
+}
+
 // rollbackFailureAdvice is the Cause and Correc for a failed compensation,
 // written for the step that failed rather than once for all of them.
 func rollbackFailureAdvice(err error, rdName string) (string, string) {
 	var failure *rollbackStepError
 	if !errors.As(err, &failure) {
+		return rollbackStepAdvice(rollbackStepReapReplicas, false, rdName)
+	}
+
+	return rollbackStepAdvice(failure.step, true, rdName)
+}
+
+// rollbackStepAdvice is rollbackFailureAdvice for a step already known, which
+// is what the replay gate has when it reads an abandoned-rollback mark.
+func rollbackStepAdvice(step rollbackStep, known bool, rdName string) (string, string) {
+	if !known {
 		return "the compensation could not complete", "delete '" + rdName + "' by hand"
 	}
 
-	switch failure.step {
+	switch step {
 	case rollbackStepRereadReplicas:
 		return "the replicas were told to go, but reading them back to confirm failed, " +
 				"so the definition was left in place rather than dropped over replicas " +
