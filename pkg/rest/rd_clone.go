@@ -196,9 +196,18 @@ func (s *Server) cloneRequestShapeIsUsable(
 		return false
 	}
 
+	// Only the missing passphrase is the caller's to fix. A Secret or the
+	// controller props that could not be read is a failure of this side, and
+	// a 400 for it reads to linstor-csi as a permanent client error on a body
+	// it resends unchanged.
 	luksErr := s.refuseLUKSWithoutPassphrase(ctx, req.LayerList)
 	if luksErr != nil {
-		writeCloneRefused(w, http.StatusBadRequest, srcName, req.Name, &apiv1.APICallRc{
+		status := http.StatusInternalServerError
+		if errors.Is(luksErr, ErrLUKSRequiresPassphrase) {
+			status = http.StatusBadRequest
+		}
+
+		writeCloneRefused(w, status, srcName, req.Name, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
 			Message: "clone of resource definition '" + srcName + "': " + luksErr.Error(),
 		})

@@ -177,6 +177,13 @@ type ResourceGroupStore interface {
 // ResourceGroupStore (nil = untouched, empty = clear).
 type ResourceDefinitionStore interface {
 	List(ctx context.Context) ([]apiv1.ResourceDefinition, error)
+
+	// ListUncached answers the same question from the API server when the
+	// store has a direct reader, bypassing a cache that can trail a create.
+	// For a decision that destroys something when the answer comes back
+	// short, like reaping a snapshot no definition seems to use.
+	ListUncached(ctx context.Context) ([]apiv1.ResourceDefinition, error)
+
 	Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error)
 	Create(ctx context.Context, rd *apiv1.ResourceDefinition) error
 	Update(ctx context.Context, rd *apiv1.ResourceDefinition) error

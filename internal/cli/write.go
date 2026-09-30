@@ -316,12 +316,14 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 
 	if len(snaps) > 0 {
 		// A snapshot a clone took for itself outlives the clone when its
-		// reap was skipped or failed; nothing else names it now.
-		if orphans := store.OrphanedCloneSnapshots(ctx, run.Store, snaps); len(orphans) > 0 {
-			return fmt.Errorf("%w: %s has %d snapshot(s), among them internal clone snapshot(s) %s "+
-				"left by a clone that no longer exists; check nothing was restored from them, "+
-				"delete them, then delete %s again",
-				errDefinitionHasSnapshots, name, len(snaps), strings.Join(orphans, ", "), name)
+		// reap was skipped, failed or kept it for a restore; nothing else
+		// names it now.
+		left, leftErr := store.CloneSnapshotsLeftBehind(ctx, run.Store, snaps)
+		if leftErr == nil && !left.Empty() {
+			cause, correction := left.Explain(name)
+
+			return fmt.Errorf("%w: %s has %d snapshot(s): %s; %s",
+				errDefinitionHasSnapshots, name, len(snaps), cause, correction)
 		}
 
 		return fmt.Errorf("%w: %s has %d snapshot(s); delete them first",

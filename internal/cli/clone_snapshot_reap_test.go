@@ -142,3 +142,25 @@ func TestSnapshotResourceRestoreMarkerTakesTheStoredSpelling(t *testing.T) {
 		t.Errorf("restore marker = %q, want pvc-x:snap-1, the spelling the snapshot is stored under", got)
 	}
 }
+
+// The CLI refusal over a source still carrying a snapshot its clone left had no
+// case that reached it: every fixture's list came back empty.
+func TestResourceDefinitionDeleteNamesACloneSnapshotLeftBehind(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-left"})
+		_ = backend.Snapshots().Create(ctx, &apiv1.Snapshot{
+			Name: "clone-pvc-gone", ResourceName: "pvc-left",
+			Props: map[string]string{store.CloneSnapshotOwnerProp: "pvc-gone"},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"rd", "d", "pvc-left"}); got == 0 {
+		t.Fatal("delete of a source still carrying a snapshot succeeded")
+	}
+
+	if !strings.Contains(errBuf.String(), "clone-pvc-gone") {
+		t.Errorf("refusal %q does not name the snapshot the clone left", errBuf.String())
+	}
+}

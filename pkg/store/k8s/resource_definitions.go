@@ -51,21 +51,17 @@ type resourceDefinitions struct {
 }
 
 func (s *resourceDefinitions) List(ctx context.Context) ([]apiv1.ResourceDefinition, error) {
-	var crdList crdv1alpha1.ResourceDefinitionList
+	return s.listThrough(ctx, s.c)
+}
 
-	err := s.c.List(ctx, &crdList)
-	if err != nil {
-		return nil, errors.Wrap(err, "list ResourceDefinition CRDs")
+// ListUncached lists through the direct reader when one is wired, and through
+// the cache otherwise, where the cache is all there is.
+func (s *resourceDefinitions) ListUncached(ctx context.Context) ([]apiv1.ResourceDefinition, error) {
+	if s.apiReader == nil {
+		return s.listThrough(ctx, s.c)
 	}
 
-	out := make([]apiv1.ResourceDefinition, 0, len(crdList.Items))
-	for i := range crdList.Items {
-		out = append(out, crdToWireRD(&crdList.Items[i]))
-	}
-
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-
-	return out, nil
+	return s.listThrough(ctx, s.apiReader)
 }
 
 func (s *resourceDefinitions) Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
@@ -301,6 +297,24 @@ func (s *resourceDefinitions) Delete(ctx context.Context, name string) error {
 	}
 
 	return nil
+}
+
+func (s *resourceDefinitions) listThrough(ctx context.Context, reader ctrlclient.Reader) ([]apiv1.ResourceDefinition, error) {
+	var crdList crdv1alpha1.ResourceDefinitionList
+
+	err := reader.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrap(err, "list ResourceDefinition CRDs")
+	}
+
+	out := make([]apiv1.ResourceDefinition, 0, len(crdList.Items))
+	for i := range crdList.Items {
+		out = append(out, crdToWireRD(&crdList.Items[i]))
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
 }
 
 // getUncached resolves a cache-miss RD Get against the direct API reader.

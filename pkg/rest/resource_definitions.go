@@ -21,7 +21,6 @@ package rest
 import (
 	"context"
 	"net/http"
-	"strings"
 
 	"github.com/cockroachdb/errors"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -1258,11 +1257,9 @@ func (s *Server) rdHasNoSnapshots(w http.ResponseWriter, r *http.Request, name s
 		// reap was skipped or failed, and a repeated delete of the clone
 		// cannot re-run it: the clone is already gone. This refusal is the
 		// one place that still sees it, so it names it.
-		if orphans := store.OrphanedCloneSnapshots(r.Context(), s.Store, snaps); len(orphans) > 0 {
-			refusal.Cause = "internal clone snapshot(s) " + strings.Join(orphans, ", ") +
-				" outlived the clone they were taken for"
-			refusal.Correc = "check `linstor s l` that nothing was restored from them, delete them, " +
-				"then delete '" + name + "' again"
+		left, leftErr := store.CloneSnapshotsLeftBehind(r.Context(), s.Store, snaps)
+		if leftErr == nil && !left.Empty() {
+			refusal.Cause, refusal.Correc = left.Explain(name)
 		}
 
 		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{refusal})

@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -87,28 +88,24 @@ var ErrCloneSnapshotInUse = errors.New("internal clone snapshot is still a resto
 // a restore, and that definition keeps reading it through its own marker: the
 // placer pins new replicas to the snapshot's nodes and the satellite restores
 // a replica from it by name. Such a snapshot is kept, and the error says why.
+//
+// That question is asked of the API server, not of a cache: a restore that has
+// not reached the informer yet is exactly the dependent a cached scan misses,
+// and the snapshot would go from under it. When the answer cannot be had, the
+// snapshot is kept; the refusal a later delete of the source meets names it.
 func ReapClonedSnapshot(ctx context.Context, st Store, ref ClonedSnapshotRef) error {
 	if ref.Source == "" || ref.Snapshot == "" {
 		return nil
 	}
 
-	definitions, err := st.ResourceDefinitions().List(ctx)
+	dependents, err := restoredFrom(ctx, st, ref.Source, ref.Snapshot, ref.Clone)
 	if err != nil {
-		return fmt.Errorf("list definitions restored from %s/%s: %w", ref.Source, ref.Snapshot, err)
+		return err
 	}
 
-	marker := ref.Source + ":" + ref.Snapshot
-
-	for i := range definitions {
-		// The clone itself carries the marker too, and a cache that has not
-		// seen its delete yet still lists it.
-		if strings.EqualFold(definitions[i].Name, ref.Clone) {
-			continue
-		}
-
-		if strings.EqualFold(definitions[i].Props[RestoreFromSnapshotProp], marker) {
-			return fmt.Errorf("%w: %s was restored from %s", ErrCloneSnapshotInUse, definitions[i].Name, marker)
-		}
+	if len(dependents) > 0 {
+		return fmt.Errorf("%w: %s was restored from %s:%s",
+			ErrCloneSnapshotInUse, dependents[0], ref.Source, ref.Snapshot)
 	}
 
 	err = st.Snapshots().Delete(ctx, ref.Source, ref.Snapshot)
@@ -119,24 +116,135 @@ func ReapClonedSnapshot(ctx context.Context, st Store, ref ClonedSnapshotRef) er
 	return nil
 }
 
-// OrphanedCloneSnapshots names the snapshots in the list that a clone took for
-// itself and whose clone no longer exists. A delete that reaped nothing, or a
-// reap that failed, leaves these behind, and they are what keeps the source
-// from being deleted, so a refusal over them should name them.
-func OrphanedCloneSnapshots(ctx context.Context, st Store, snaps []apiv1.Snapshot) []string {
-	var orphans []string
+// restoredFrom names the definitions, other than the clone itself, whose
+// marker says they were restored from source:snapshot. The clone is skipped
+// because it carries the marker too, and it may still be listed right after
+// its own delete.
+func restoredFrom(ctx context.Context, st Store, source, snapshot, clone string) ([]string, error) {
+	definitions, err := st.ResourceDefinitions().ListUncached(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list definitions restored from %s/%s: %w", source, snapshot, err)
+	}
 
-	for i := range snaps {
-		owner := snaps[i].Props[CloneSnapshotOwnerProp]
-		if owner == "" {
+	marker := source + ":" + snapshot
+
+	var names []string
+
+	for i := range definitions {
+		if clone != "" && strings.EqualFold(definitions[i].Name, clone) {
 			continue
 		}
 
-		_, err := st.ResourceDefinitions().Get(ctx, owner)
-		if errors.Is(err, ErrNotFound) {
-			orphans = append(orphans, snaps[i].Name)
+		if strings.EqualFold(definitions[i].Props[RestoreFromSnapshotProp], marker) {
+			names = append(names, definitions[i].Name)
 		}
 	}
 
-	return orphans
+	return names, nil
+}
+
+// LeftCloneSnapshots is what the snapshots a source still carries say about
+// clones that are gone.
+type LeftCloneSnapshots struct {
+	// Deletable were taken by a clone that no longer exists, and no
+	// definition was restored from them.
+	Deletable []string
+	// Unowned look like a clone's internal snapshot, `clone-<name>` for a
+	// definition that no longer exists, but carry no owner prop: a version
+	// before the prop existed took them, or an operator named one that way.
+	// Nothing here reaps them; they are named so the operator knows why the
+	// source is still refused.
+	Unowned []string
+	// InUse were taken by a clone that is gone but still have a definition
+	// restored from them, keyed by snapshot.
+	InUse map[string]string
+}
+
+// Empty reports whether there is nothing to tell the operator.
+func (l LeftCloneSnapshots) Empty() bool {
+	return len(l.Deletable) == 0 && len(l.Unowned) == 0 && len(l.InUse) == 0
+}
+
+// CloneSnapshotsLeftBehind sorts a source's snapshots that outlived the clone
+// they belong to. A delete that reaped nothing, a reap that failed, and a reap
+// that kept a snapshot another definition was restored from all leave one,
+// and a repeated delete of the clone cannot revisit them: the clone is gone.
+// The refusal a delete of the source meets is the one place that still sees
+// them, so it names them, and never calls a snapshot deletable while a
+// definition still restores from it.
+func CloneSnapshotsLeftBehind(ctx context.Context, st Store, snaps []apiv1.Snapshot) (LeftCloneSnapshots, error) {
+	out := LeftCloneSnapshots{InUse: map[string]string{}}
+
+	for i := range snaps {
+		owner := snaps[i].Props[CloneSnapshotOwnerProp]
+		legacy := owner == ""
+
+		if legacy {
+			var found bool
+
+			owner, found = strings.CutPrefix(snaps[i].Name, "clone-")
+			if !found || owner == "" {
+				continue
+			}
+		}
+
+		_, err := st.ResourceDefinitions().Get(ctx, owner)
+		if !errors.Is(err, ErrNotFound) {
+			continue
+		}
+
+		dependents, err := restoredFrom(ctx, st, snaps[i].ResourceName, snaps[i].Name, owner)
+		if err != nil {
+			return LeftCloneSnapshots{}, err
+		}
+
+		switch {
+		case len(dependents) > 0:
+			out.InUse[snaps[i].Name] = dependents[0]
+		case legacy:
+			out.Unowned = append(out.Unowned, snaps[i].Name)
+		default:
+			out.Deletable = append(out.Deletable, snaps[i].Name)
+		}
+	}
+
+	return out, nil
+}
+
+// Explain words the report for the refusal both delete doors give, so the two
+// cannot drift. The correction deletes only what is safe to delete, and names
+// the definition that has to go first for a snapshot still restored from.
+func (l LeftCloneSnapshots) Explain(source string) (string, string) {
+	var causes, corrections []string
+
+	if len(l.Deletable) > 0 {
+		causes = append(causes, "internal clone snapshot(s) "+strings.Join(l.Deletable, ", ")+
+			" outlived the clone they were taken for, and nothing was restored from them")
+		corrections = append(corrections, "delete "+strings.Join(l.Deletable, ", ")+
+			" with `linstor s d "+source+" <snapshot>`")
+	}
+
+	if len(l.Unowned) > 0 {
+		causes = append(causes, "snapshot(s) "+strings.Join(l.Unowned, ", ")+
+			" look like a clone's internal snapshot for a clone that no longer exists, "+
+			"but were not stamped as one, so they are never reaped")
+		corrections = append(corrections, "delete "+strings.Join(l.Unowned, ", ")+
+			" by hand if nothing of yours depends on them")
+	}
+
+	kept := make([]string, 0, len(l.InUse))
+	for snapshot := range l.InUse {
+		kept = append(kept, snapshot)
+	}
+
+	sort.Strings(kept)
+
+	for _, snapshot := range kept {
+		causes = append(causes, "internal clone snapshot "+snapshot+" is kept because "+
+			l.InUse[snapshot]+" was restored from it")
+		corrections = append(corrections, "delete "+l.InUse[snapshot]+" first; "+snapshot+
+			" can go once nothing restores from it")
+	}
+
+	return strings.Join(causes, "; "), strings.Join(corrections, "; ") + ", then delete " + source + " again"
 }
