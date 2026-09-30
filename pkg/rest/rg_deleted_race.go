@@ -164,7 +164,7 @@ func (s *Server) rollBackDetached(ctx context.Context, rdName string, placed []s
 // 201 over it. Comparing the replicas with the snapshot's nodes cannot tell
 // that apart from a finished clone that was evacuated or scaled down since,
 // and the rollback is the one party that knows it gave up.
-const rollbackAbandonedKey = "BlockstorRollbackAbandoned"
+const rollbackAbandonedKey = store.RollbackAbandonedProp
 
 // markRollbackAbandoned records on the definition that its rollback stopped,
 // and where. Best-effort: it runs on what is left of the compensation's

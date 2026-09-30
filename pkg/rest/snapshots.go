@@ -951,7 +951,7 @@ func (s *Server) hydrateSnapshotFromRD(ctx context.Context, snap *apiv1.Snapshot
 	}
 
 	if snap.Props == nil {
-		snap.Props = srcRD.Props
+		snap.Props = store.TravellingProps(srcRD.Props)
 	}
 
 	if len(snap.Nodes) == 0 {

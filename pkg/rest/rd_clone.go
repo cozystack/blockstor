@@ -954,7 +954,7 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 
 	if src.Props != nil || len(req.OverrideProps) > 0 {
 		clone.Props = make(map[string]string, len(src.Props)+len(req.OverrideProps))
-		maps.Copy(clone.Props, src.Props)
+		maps.Copy(clone.Props, store.TravellingProps(src.Props))
 	}
 
 	maps.Copy(clone.Props, req.OverrideProps)

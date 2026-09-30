@@ -20,7 +20,6 @@ package rest
 
 import (
 	"context"
-	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -567,12 +566,12 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		// LINSTOR ties together (the parent RG drives subsequent
 		// auto-placement and prop inheritance).
 		ResourceGroupName: srcRDObj.ResourceGroupName,
-		Props:             maps.Clone(snap.Props),
+		Props:             store.TravellingProps(snap.Props),
 		LayerStack:        srcRDObj.LayerStack,
 	}
 
 	if newRD.Props == nil {
-		newRD.Props = maps.Clone(srcRDObj.Props)
+		newRD.Props = store.TravellingProps(srcRDObj.Props)
 	}
 
 	// Stamp the clone-source so the dispatcher's buildVolumes (called
