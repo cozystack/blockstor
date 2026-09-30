@@ -98,6 +98,30 @@ func TestNodeEvacuateRefusesInUse(t *testing.T) {
 	}
 }
 
+// The refusal is a node-fate gate, so it asks in every spelling the node's
+// replicas carry. A node registered in upper case, which is how adoption from
+// LINSTOR writes it, holds its replicas under that spelling, and asking only
+// as typed let `n evacuate node-1` past a mounted volume.
+func TestNodeEvacuateRefusesInUseUnderTheRegisteredSpelling(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.Nodes().Create(ctx, &apiv1.Node{Name: "NODE-1"})
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-x", NodeName: "NODE-1",
+			State: apiv1.ResourceState{InUse: boolPtr(true)},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"n", "evacuate", "node-1"}); got == 0 {
+		t.Fatal("evacuating a node with an in-use resource succeeded")
+	}
+
+	if !strings.Contains(errBuf.String(), "in use") || !strings.Contains(errBuf.String(), "pvc-x") {
+		t.Errorf("the refusal does not name the blocking resource:\n%s", errBuf.String())
+	}
+}
+
 // A replica whose satellite has not reported yet has in_use unset.
 // That is "unknown", not "in use" — refusing there would block an
 // operator draining a node that never came up.

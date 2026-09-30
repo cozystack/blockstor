@@ -73,6 +73,10 @@ func (s *stuckSnapshots) ListByDefinition(ctx context.Context, rdName string) ([
 	return s.inner.ListByDefinition(ctx, rdName) //nolint:wrapcheck // test helper
 }
 
+func (s *stuckSnapshots) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+	return s.inner.ListByDefinitionUncached(ctx, rdName) //nolint:wrapcheck // test helper
+}
+
 func (s *stuckSnapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
 	return s.inner.Get(ctx, rdName, snapName) //nolint:wrapcheck // test helper
 }

@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -88,33 +89,143 @@ func CascadeDeleteResources(ctx context.Context, st Store, rdName string) error 
 	return nil
 }
 
+// ReplicasOnNode is the node-scoped replica read a node's fate is decided on,
+// asked in every spelling the node's objects can carry. ReferencesOnNode and
+// CascadeOrphansForLostNode ask the storage pools the same way.
+//
+// Nodes().Get and Delete fold the name, while spec.nodeName is stored
+// verbatim, so a node addressed in a different case than its replicas were
+// written with resolved for the delete and returned nothing for the gate: the
+// refusal passed, the cascade reaped nothing, the node went, and the replicas
+// still pointed at it.
+//
+// Three spellings are asked, see NodeSpellings. The one that remains out of
+// reach is a spelling that is neither the caller's, nor the folded one, nor
+// the node's registered one: a replica created by hand under yet another case.
+// That is the boundary FoldName documents. The merge base asked only the
+// caller's spelling, verbatim.
+func ReplicasOnNode(ctx context.Context, st Store, node string) ([]apiv1.Resource, error) {
+	spellings, err := NodeSpellings(ctx, st, node)
+	if err != nil {
+		return nil, err
+	}
+
+	return replicasUnder(ctx, st, spellings)
+}
+
+// NodeSpellings is the set of spellings a node-scoped read has to be asked in:
+// the caller's, the folded one, and the one the node is registered under.
+//
+// The registered spelling is the one that matters most and the one the other
+// two missed. Adoption from LINSTOR and linstor-csi write a replica's node
+// under the name the node was registered with, so a node registered as
+// `NODE-1` carries replicas on `NODE-1`, and an operator typing the canonical
+// `node-1` asked in one spelling, since that one is already folded, and found
+// nothing.
+//
+// It is read from the node listing and compared with FoldName, rather than
+// taken from Nodes().Get: the Kubernetes store's Get folds through the CRD
+// slug, the in-memory one does not, and the listing gives both the same
+// answer. A node that is not registered (already gone, or never was)
+// contributes nothing, and the two remaining spellings are still asked.
+//
+// That makes the answer depend on whether the node row still exists, so a
+// caller that re-asks after deleting the node resolves the spellings before the
+// delete and passes them to ReferencesUnderSpellings for both walks.
+func NodeSpellings(ctx context.Context, st Store, node string) ([]string, error) {
+	spellings := []string{node}
+
+	add := func(spelling string) {
+		if !slices.Contains(spellings, spelling) {
+			spellings = append(spellings, spelling)
+		}
+	}
+
+	add(FoldName(node))
+
+	nodes, err := st.Nodes().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list nodes to resolve %s: %w", node, err)
+	}
+
+	for i := range nodes {
+		if FoldName(nodes[i].Name) == FoldName(node) {
+			add(nodes[i].Name)
+		}
+	}
+
+	return spellings, nil
+}
+
+func replicasUnder(ctx context.Context, st Store, spellings []string) ([]apiv1.Resource, error) {
+	return inEverySpelling(ctx, spellings, "replicas", st.Resources().ListByNode,
+		func(r *apiv1.Resource) string { return r.Name })
+}
+
+func poolsUnder(ctx context.Context, st Store, spellings []string) ([]apiv1.StoragePool, error) {
+	return inEverySpelling(ctx, spellings, "storage pools", st.StoragePools().ListByNode,
+		func(p *apiv1.StoragePool) string { return p.StoragePoolName })
+}
+
+// inEverySpelling runs a node-scoped read under each spelling, and returns
+// every object once.
+func inEverySpelling[T any](
+	ctx context.Context, spellings []string, what string,
+	read func(context.Context, string) ([]T, error), name func(*T) string,
+) ([]T, error) {
+	var out []T
+
+	seen := map[string]struct{}{}
+
+	for _, spelling := range spellings {
+		found, err := read(ctx, spelling)
+		if err != nil {
+			return nil, fmt.Errorf("list %s on %s: %w", what, spelling, err)
+		}
+
+		for i := range found {
+			key := FoldName(name(&found[i]))
+			if _, dup := seen[key]; dup {
+				continue
+			}
+
+			seen[key] = struct{}{}
+
+			out = append(out, found[i])
+		}
+	}
+
+	return out, nil
+}
+
 // CascadeOrphansForLostNode deletes every Resource replica and StoragePool
 // that references the named node, which is what makes a forced node delete
 // leave nothing pointing at an object that is gone.
 func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error {
-	resources, err := st.Resources().List(ctx)
+	spellings, err := NodeSpellings(ctx, st, node)
 	if err != nil {
-		return fmt.Errorf("list replicas: %w", err)
+		return err
+	}
+
+	resources, err := replicasUnder(ctx, st, spellings)
+	if err != nil {
+		return err
 	}
 
 	for i := range resources {
-		if resources[i].NodeName != node {
-			continue
-		}
-
-		err = st.Resources().Delete(ctx, resources[i].Name, node)
+		err = st.Resources().Delete(ctx, resources[i].Name, resources[i].NodeName)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return fmt.Errorf("delete replica %s on %s: %w", resources[i].Name, node, err)
 		}
 	}
 
-	pools, err := st.StoragePools().ListByNode(ctx, node)
+	pools, err := poolsUnder(ctx, st, spellings)
 	if err != nil {
-		return fmt.Errorf("list storage pools on %s: %w", node, err)
+		return err
 	}
 
 	for i := range pools {
-		err = st.StoragePools().Delete(ctx, node, pools[i].StoragePoolName)
+		err = st.StoragePools().Delete(ctx, pools[i].NodeName, pools[i].StoragePoolName)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return fmt.Errorf("delete storage pool %s on %s: %w", pools[i].StoragePoolName, node, err)
 		}
@@ -130,19 +241,28 @@ func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error
 // This is what a plain node delete is refused on: the operator either clears
 // the references or says explicitly that the node is gone.
 func ReferencesOnNode(ctx context.Context, st Store, node string) ([]string, []string, error) {
-	resources, err := st.Resources().List(ctx)
+	spellings, err := NodeSpellings(ctx, st, node)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list replicas: %w", err)
+		return nil, nil, err
+	}
+
+	return ReferencesUnderSpellings(ctx, st, spellings)
+}
+
+// ReferencesUnderSpellings is ReferencesOnNode over spellings the caller
+// resolved with NodeSpellings. A caller that walks the references again after
+// deleting the node has to use it: by then the node row is gone and a fresh
+// NodeSpellings no longer knows the registered spelling.
+func ReferencesUnderSpellings(ctx context.Context, st Store, spellings []string) ([]string, []string, error) {
+	resources, err := replicasUnder(ctx, st, spellings)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	seen := map[string]struct{}{}
 	rscRefs := make([]string, 0, len(resources))
 
 	for i := range resources {
-		if resources[i].NodeName != node {
-			continue
-		}
-
 		if _, dup := seen[resources[i].Name]; dup {
 			continue
 		}
@@ -152,9 +272,9 @@ func ReferencesOnNode(ctx context.Context, st Store, node string) ([]string, []s
 		rscRefs = append(rscRefs, resources[i].Name)
 	}
 
-	pools, err := st.StoragePools().ListByNode(ctx, node)
+	pools, err := poolsUnder(ctx, st, spellings)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list storage pools on %s: %w", node, err)
+		return nil, nil, err
 	}
 
 	poolRefs := make([]string, 0, len(pools))

@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -47,6 +48,10 @@ const LabelSnapshotGroupID = "blockstor.io/snapshot-group-id"
 
 type snapshots struct {
 	c ctrlclient.Client
+
+	// apiReader is the manager's direct reader when the store has one. Only
+	// ListByDefinitionUncached reads through it.
+	apiReader ctrlclient.Reader
 }
 
 func snapshotCRDName(rdName, snapName string) string {
@@ -82,25 +87,68 @@ func (s *snapshots) List(ctx context.Context) ([]apiv1.Snapshot, error) {
 	return out, nil
 }
 
+// ListByDefinition returns the snapshots of one definition, narrowed on the
+// spec.resourceDefinitionName selectable field.
+//
+// It used to select on the definition LABEL, and a label is written by
+// whoever created the object: pkg/linstormigrate builds adopted Snapshots
+// from a LINSTOR dump with none. This list is what `rd d` is refused on and
+// what sweeps the leftovers behind it, so on an adopted cluster a snapshot the
+// selector could not see was a definition deleted with snapshots still on it,
+// and the mop-up missing them too. Same label blindness the Resource and
+// StoragePool reads were moved off, one kind over and on a delete gate.
 func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
 	var crdList crdv1alpha1.SnapshotList
 
-	err := s.c.List(ctx, &crdList,
-		ctrlclient.MatchingLabels{LabelResourceDefinition: rdName})
+	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: rdName})
 	if err != nil {
-		return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+		if !SelectorUnsupported(err) {
+			return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+		}
+
+		log.FromContext(ctx).V(1).Info("scoped Snapshot read unavailable; reading every snapshot instead",
+			"resourceDefinition", rdName, "reason", err.Error())
+
+		return s.listByDefinitionExhaustively(ctx, s.c, rdName)
 	}
 
-	parent, _ := s.getParentRD(ctx, rdName)
+	return s.wireSnapshots(ctx, rdName, crdList.Items)
+}
 
-	out := make([]apiv1.Snapshot, 0, len(crdList.Items))
-	for i := range crdList.Items {
-		out = append(out, crdToWireSnapshot(&crdList.Items[i], parent))
+// ListByDefinitionUncached reads the definition's snapshots from the API server
+// when a direct reader is wired, and through the cache otherwise. The field
+// selector travels either way: the API server answers it from the selectable
+// field the CRD declares.
+//
+// A server that refuses the selector, which is what a cluster whose CRD
+// predates the selectable field does, is answered by the exhaustive read on
+// the same direct reader. Handing it to ListByDefinition instead put the read
+// back on the cache on exactly the cluster the fallback exists for, where the
+// index the binaries register serves it from the informer: a snapshot that
+// raced the delete and had not reached the informer was invisible to the `rd
+// d` refusal and to the sweep, and the definition went over it. The Resource
+// and StoragePool reads pass their reader into the exhaustive path the same
+// way.
+func (s *snapshots) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+	if s.apiReader == nil {
+		return s.ListByDefinition(ctx, rdName)
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	var crdList crdv1alpha1.SnapshotList
 
-	return out, nil
+	err := s.apiReader.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: rdName})
+	if err != nil {
+		if !SelectorUnsupported(err) {
+			return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+		}
+
+		log.FromContext(ctx).V(1).Info("scoped uncached Snapshot read unavailable; reading every snapshot instead",
+			"resourceDefinition", rdName, "reason", err.Error())
+
+		return s.listByDefinitionExhaustively(ctx, s.apiReader, rdName)
+	}
+
+	return s.wireSnapshots(ctx, rdName, crdList.Items)
 }
 
 func (s *snapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
@@ -475,4 +523,55 @@ func wireToCRDSnapshotSpec(in *apiv1.Snapshot) crdv1alpha1.SnapshotSpec {
 	}
 
 	return spec
+}
+
+// listByDefinitionExhaustively filters every snapshot here, on the
+// authoritative Spec.ResourceDefinitionName, read through the reader the
+// scoped attempt used so a fallback never changes which one answers.
+func (s *snapshots) listByDefinitionExhaustively(
+	ctx context.Context, reader ctrlclient.Reader, rdName string,
+) ([]apiv1.Snapshot, error) {
+	var crdList crdv1alpha1.SnapshotList
+
+	err := reader.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+	}
+
+	kept := make([]crdv1alpha1.Snapshot, 0, len(crdList.Items))
+
+	for i := range crdList.Items {
+		if crdList.Items[i].Spec.ResourceDefinitionName == rdName {
+			kept = append(kept, crdList.Items[i])
+		}
+	}
+
+	return s.wireSnapshots(ctx, rdName, kept)
+}
+
+// wireSnapshots converts a definition's snapshots, reading the parent once.
+//
+// The parent read's error is propagated rather than dropped. A snapshot whose
+// definition is GONE is not an error — getParentRD answers (nil, nil) for both
+// the missing name and the NotFound, because an orphan snapshot is a real
+// shape and must still list. What reaches here is a read that actually failed,
+// and swallowing it returned a successful listing with
+// ResourceDefinitionProps silently absent from every row: the caller cannot
+// tell "this definition has no props" from "nobody could read them".
+func (s *snapshots) wireSnapshots(
+	ctx context.Context, rdName string, items []crdv1alpha1.Snapshot,
+) ([]apiv1.Snapshot, error) {
+	parent, err := s.getParentRD(ctx, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]apiv1.Snapshot, 0, len(items))
+	for i := range items {
+		out = append(out, crdToWireSnapshot(&items[i], parent))
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
 }

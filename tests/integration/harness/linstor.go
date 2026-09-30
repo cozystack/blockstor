@@ -199,3 +199,32 @@ func truncateForLog(buf []byte, limit int) string {
 
 	return string(buf[:limit]) + "...[truncated]"
 }
+
+// AssertNotRefused fails the test when a LINSTOR envelope carries an error,
+// naming the message the server actually returned.
+//
+// The machine-readable CLI exits 0 on refusal envelopes as readily as on
+// success, so a caller that ignores the answer cannot tell a performed
+// operation from a refused one. The cost is not a missing assertion: the next
+// assertion in the test — usually a convergence wait on what the refused
+// operation was supposed to do — then times out and blames the wrong thing.
+// `node lost` refused for a still-ONLINE satellite spent three CI rounds
+// looking like a broken cascade.
+//
+// LINSTOR marks failure in the ret_code mask's sign bit, so any negative
+// ret_code is an error whatever else it carries.
+func AssertNotRefused(t *testing.T, what string, envelope []map[string]any) {
+	t.Helper()
+
+	for _, rc := range envelope {
+		code, ok := rc["ret_code"].(float64)
+		if !ok || code >= 0 {
+			continue
+		}
+
+		msg, _ := rc["message"].(string)
+		cause, _ := rc["cause"].(string)
+
+		t.Fatalf("%s was refused, not performed: %s (cause: %s)", what, msg, cause)
+	}
+}

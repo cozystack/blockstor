@@ -62,6 +62,23 @@ func (s *inMemoryResources) List(_ context.Context) ([]apiv1.Resource, error) {
 	return out, nil
 }
 
+func (s *inMemoryResources) ListByNode(_ context.Context, node string) ([]apiv1.Resource, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]apiv1.Resource, 0)
+
+	for k := range s.m {
+		if s.m[k].NodeName == node {
+			out = append(out, s.m[k])
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
+}
+
 func (s *inMemoryResources) ListByDefinition(_ context.Context, rdName string) ([]apiv1.Resource, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

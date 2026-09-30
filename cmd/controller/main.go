@@ -166,7 +166,7 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, st, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -190,12 +190,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Construct the store before reconciler wiring so the
-	// NodeReconciler can drive eviction-triggered migration via the
-	// shared placer. CRD-backed is the only supported persistence
-	// layer since Phase 11.x — the apiserver/controller split makes
-	// in-process state pointless across replicas.
-	st := storek8s.New(mgr.GetClient())
+	// The store came back with the manager, before reconciler wiring, so the
+	// NodeReconciler can drive eviction-triggered migration via the shared
+	// placer. CRD-backed is the only supported persistence layer since Phase
+	// 11.x — the apiserver/controller split makes in-process state pointless
+	// across replicas.
 
 	if err := (&controller.NodeReconciler{
 		Client: mgr.GetClient(),

@@ -361,3 +361,7 @@ func TestBug200SnapshotMultiPreservesLiteralMessages(t *testing.T) {
 		})
 	}
 }
+
+func (s *errInjectingSnapshots) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+	return s.ListByDefinition(ctx, rdName)
+}
