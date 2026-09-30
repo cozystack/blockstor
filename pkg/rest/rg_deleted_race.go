@@ -130,10 +130,12 @@ func detachedCompensation(ctx context.Context) (context.Context, context.CancelF
 	return context.WithTimeout(context.WithoutCancel(ctx), detachedRollbackBudget)
 }
 
-// rollBackDetached runs rollBackMaterialisedRD on a context the request cannot
-// end, bounded by detachedRollbackBudget. A door that already holds a
-// detachedCompensation context passes it in, and the rollback gets whatever of
-// that budget the group re-read left.
+// rollBackCompensating runs rollBackMaterialisedRD on ctx, which has to be a
+// detachedCompensation context already: every door detaches exactly once and
+// hands the rollback what is left of that one budget. Detaching again here
+// would restart it, because WithoutCancel drops the deadline along with the
+// cancellation, and the chain the manifests' termination grace is derived
+// from would then be the re-read plus a whole second budget.
 //
 // Every compensation on these paths is most likely to be needed when the
 // caller has already gone: a CSI caller times out mid-clone, and the RG-deleted
@@ -141,17 +143,28 @@ func detachedCompensation(ctx context.Context) (context.Context, context.CancelF
 // inherits the request's context fails on its first call once that happens and
 // leaves exactly what it exists to remove, a definition every later retry is
 // refused over until an operator deletes it.
-func (s *Server) rollBackDetached(ctx context.Context, rdName string, placed []string) error {
-	rollbackCtx, cancel := detachedCompensation(ctx)
-	defer cancel()
+//
+// The abandoned-rollback mark is written before anything is touched, and a
+// rollback that completes takes it away with the definition. Written after a
+// failure instead, it could not land in the two cases that leave a genuinely
+// half-torn leftover: the budget running out mid-cascade leaves no context to
+// write it on, and a killed process runs nothing at all. A failure then only
+// refines the mark to the step it stopped at, best-effort.
+func (s *Server) rollBackCompensating(ctx context.Context, rdName string, placed []string) error {
+	s.markRollbackAbandoned(ctx, rdName, rollbackInProgress)
 
-	err := s.rollBackMaterialisedRD(rollbackCtx, rdName, placed)
+	err := s.rollBackMaterialisedRD(ctx, rdName, placed)
 	if err != nil {
-		s.markRollbackAbandoned(rollbackCtx, rdName, err)
+		s.markRollbackAbandoned(ctx, rdName, rollbackStepName(err))
 	}
 
 	return err
 }
+
+// rollbackInProgress is the mark a rollback carries until it either completes,
+// taking the definition and the mark with it, or names the step it stopped at.
+// Read back, it is a rollback that never reported how it ended.
+const rollbackInProgress = "in-progress"
 
 // rollbackAbandonedKey marks a definition whose compensation gave up, with
 // the step it stopped at.
@@ -166,13 +179,10 @@ func (s *Server) rollBackDetached(ctx context.Context, rdName string, placed []s
 // and the rollback is the one party that knows it gave up.
 const rollbackAbandonedKey = store.RollbackAbandonedProp
 
-// markRollbackAbandoned records on the definition that its rollback stopped,
-// and where. Best-effort: it runs on what is left of the compensation's
-// budget, and a mark that does not land leaves the replay gate where it was
-// before the mark existed.
-func (s *Server) markRollbackAbandoned(ctx context.Context, rdName string, cause error) {
-	step := rollbackStepName(cause)
-
+// markRollbackAbandoned records on the definition that its rollback started,
+// or where it stopped. Best-effort: a mark that does not land leaves the
+// replay gate where it was before the mark existed.
+func (s *Server) markRollbackAbandoned(ctx context.Context, rdName, step string) {
 	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
 		func(rd *apiv1.ResourceDefinition) error {
 			if rd.Props == nil {
@@ -206,7 +216,10 @@ func (s *Server) failedMaterialiseRefusal(
 		return &apiv1.APICallRc{RetCode: apiCallRcError, Message: message}
 	}
 
-	rollbackErr := s.rollBackDetached(ctx, rdName, placed)
+	rollbackCtx, cancel := detachedCompensation(ctx)
+	defer cancel()
+
+	rollbackErr := s.rollBackCompensating(rollbackCtx, rdName, placed)
 	if rollbackErr != nil {
 		cause, correc := rollbackFailureAdvice(rollbackErr, rdName)
 

@@ -497,7 +497,7 @@ func (s *Server) restoreParentRGSurvived(
 		return nil, false
 	}
 
-	rollbackErr := s.rollBackDetached(ctx, newRDName, made.Placed)
+	rollbackErr := s.rollBackCompensating(ctx, newRDName, made.Placed)
 	if rollbackErr != nil {
 		cause, correc := rollbackFailureAdvice(rollbackErr, newRDName)
 

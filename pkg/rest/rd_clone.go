@@ -322,7 +322,7 @@ func (s *Server) cloneParentRGSurvived(
 		return nil, false
 	}
 
-	rollbackErr := s.rollBackDetached(ctx, cloneName, made.Placed)
+	rollbackErr := s.rollBackCompensating(ctx, cloneName, made.Placed)
 	if rollbackErr != nil {
 		cause, correc := rollbackFailureAdvice(rollbackErr, cloneName)
 
@@ -555,7 +555,7 @@ func (s *Server) cloneShellParentRGSurvived(
 	// shell exactly where it was, parented to a group that is gone. The data
 	// path refuses to make that claim over a failed compensation, and the two
 	// halves of one guard should not answer the same question differently.
-	err = s.rollBackDetached(ctx, cloneName, nil)
+	err = s.rollBackCompensating(ctx, cloneName, nil)
 	if err != nil {
 		// The advice the shared rollback's other doors give, for the step
 		// that failed: a snapshot on the shell makes "delete it by hand" a

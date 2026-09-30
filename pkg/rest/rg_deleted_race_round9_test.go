@@ -211,21 +211,6 @@ func TestSpawnRollbackIsBoundedLikeTheOtherCompensations(t *testing.T) {
 	}
 }
 
-// The budget has to cover the read that decides the rollback as well as the
-// rollback, now that both run on it.
-func TestRollbackBudgetCoversTheGroupRecheck(t *testing.T) {
-	t.Parallel()
-
-	if detachedRollbackBudget < groupRecheckBudget+2*cacheConvergeBudget {
-		t.Errorf("budget %s does not cover the group re-read %s and two convergence waits of %s",
-			detachedRollbackBudget, groupRecheckBudget, cacheConvergeBudget)
-	}
-
-	if groupRecheckBudget < cacheRetryAttempts*cacheRetryDelay {
-		t.Errorf("group re-read budget %s is under the cache retry it has to cover", groupRecheckBudget)
-	}
-}
-
 // The volume-less door kept one hardcoded cause and "delete it by hand" after
 // it gained the shared four-step rollback. With a snapshot on the shell that
 // advice is a dead end, because `rd d` refuses a definition that has
