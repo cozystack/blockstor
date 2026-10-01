@@ -1258,7 +1258,12 @@ func (s *Server) rdHasNoSnapshots(w http.ResponseWriter, r *http.Request, name s
 		// cannot re-run it: the clone is already gone. This refusal is the
 		// one place that still sees it, so it names it.
 		left, leftErr := store.CloneSnapshotsLeftBehind(r.Context(), s.Store, snaps)
-		if leftErr == nil && !left.Empty() {
+		if leftErr != nil {
+			log.FromContext(r.Context()).V(1).Info("could not tell which snapshots clones left behind",
+				"resourceDefinition", name, "error", leftErr.Error())
+		}
+
+		if !left.Empty() {
 			refusal.Cause, refusal.Correc = left.Explain(name)
 		}
 

@@ -353,10 +353,18 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 
 	// The owner prop belongs to the snapshot; see store.CloneSnapshotOwnerProp.
 	delete(def.Props, store.CloneSnapshotOwnerProp)
+	delete(def.Props, store.CloneSnapshotReapingProp)
 
 	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if err != nil {
 		return fmt.Errorf("create resource definition %s: %w", def.Name, err)
+	}
+
+	// The snapshot was read before the definition existed; see
+	// store.ReapClonedSnapshot.
+	err = store.RestoreSourceWithdrawn(ctx, run.Store, snap.ResourceName, snap.Name)
+	if err != nil {
+		return rollbackRestore(ctx, run, def.Name, err)
 	}
 
 	err = hydrateVolumes(ctx, run, def.Name, &snap)

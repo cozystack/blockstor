@@ -47,12 +47,11 @@ func TestRDDeleteRefusalNamesTheDefinitionThatKeepsACloneSnapshot(t *testing.T) 
 	}
 
 	rc := rcs[0]
-	if !strings.Contains(rc.Correc, "delete third-use10 first") {
-		t.Errorf("correction %q does not name the definition restoring from the snapshot", rc.Correc)
-	}
 
-	if strings.Contains(rc.Correc, "delete "+cloneSnapshotName("dst-use10")+" with") {
-		t.Errorf("correction %q tells the operator to delete a snapshot still in use", rc.Correc)
+	want := "delete third-use10 if it is no longer needed, then `linstor s d src-use10 " +
+		cloneSnapshotName("dst-use10") + "`"
+	if !strings.Contains(rc.Correc, want) {
+		t.Errorf("correction %q does not put the definition restoring from the snapshot first", rc.Correc)
 	}
 }
 

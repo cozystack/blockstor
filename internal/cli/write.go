@@ -319,7 +319,11 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 		// reap was skipped, failed or kept it for a restore; nothing else
 		// names it now.
 		left, leftErr := store.CloneSnapshotsLeftBehind(ctx, run.Store, snaps)
-		if leftErr == nil && !left.Empty() {
+		if leftErr != nil {
+			_, _ = fmt.Fprintf(run.Err, "warning: could not tell which snapshots clones left behind: %v\n", leftErr)
+		}
+
+		if !left.Empty() {
 			cause, correction := left.Explain(name)
 
 			return fmt.Errorf("%w: %s has %d snapshot(s): %s; %s",

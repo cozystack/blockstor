@@ -76,9 +76,19 @@ func OwnedCloneSnapshot(ctx context.Context, st Store, rdName string) ClonedSnap
 	return ClonedSnapshotRef{Source: source, Snapshot: snapName, Clone: rdName}
 }
 
+// CloneSnapshotReapingProp marks an internal clone snapshot the reap has
+// started on. A restore that created its definition from the snapshot reads
+// it back past the cache and withdraws when it finds this prop or no snapshot
+// at all; see ReapClonedSnapshot for why both sides are needed.
+const CloneSnapshotReapingProp = "Blockstor/CloneSnapshotReaping"
+
 // ErrCloneSnapshotInUse reports an internal clone snapshot another definition
 // was restored from, which is therefore kept.
 var ErrCloneSnapshotInUse = errors.New("internal clone snapshot is still a restore source")
+
+// ErrRestoreSourceWithdrawn reports a snapshot that was deleted, or is being
+// reaped, while a definition was being restored from it.
+var ErrRestoreSourceWithdrawn = errors.New("snapshot was withdrawn while a definition was restored from it")
 
 // ReapClonedSnapshot drops the internal snapshot once the clone it was taken
 // for is gone, which is what lets the source be deleted again: both doors
@@ -89,43 +99,123 @@ var ErrCloneSnapshotInUse = errors.New("internal clone snapshot is still a resto
 // placer pins new replicas to the snapshot's nodes and the satellite restores
 // a replica from it by name. Such a snapshot is kept, and the error says why.
 //
-// That question is asked of the API server, not of a cache: a restore that has
-// not reached the informer yet is exactly the dependent a cached scan misses,
-// and the snapshot would go from under it. When the answer cannot be had, the
-// snapshot is kept; the refusal a later delete of the source meets names it.
+// A dependent appears in two steps, the snapshot read and the definition
+// create, so no list taken here alone can see one that is between them. The
+// reap therefore marks the snapshot first, then asks the API server for
+// dependents, and only then deletes; a restore creates its definition first,
+// then reads the snapshot back past the cache and withdraws on the mark or on
+// a snapshot that is gone (RestoreSourceWithdrawn). Whichever of the list and
+// the create comes second sees the other: a create before the list is a
+// dependent the list finds, and a create after it is followed by a read that
+// finds the mark.
+//
+// When the dependents cannot be listed the snapshot is kept and the mark
+// taken off again; the refusal a later delete of the source meets names it.
 func ReapClonedSnapshot(ctx context.Context, st Store, ref ClonedSnapshotRef) error {
 	if ref.Source == "" || ref.Snapshot == "" {
 		return nil
 	}
 
-	dependents, err := restoredFrom(ctx, st, ref.Source, ref.Snapshot, ref.Clone)
-	if err != nil {
-		return err
+	err := setReapingMark(ctx, st, ref.Source, ref.Snapshot, ref.Clone)
+	if errors.Is(err, ErrNotFound) {
+		return nil
 	}
 
+	if err != nil {
+		return fmt.Errorf("mark internal clone snapshot %s/%s for reaping: %w", ref.Source, ref.Snapshot, err)
+	}
+
+	definitions, err := st.ResourceDefinitions().ListUncached(ctx)
+	if err != nil {
+		return keepCloneSnapshot(ctx, st, ref,
+			fmt.Errorf("list definitions restored from %s/%s: %w", ref.Source, ref.Snapshot, err))
+	}
+
+	dependents := restoredFrom(definitions, ref.Source, ref.Snapshot, ref.Clone)
 	if len(dependents) > 0 {
-		return fmt.Errorf("%w: %s was restored from %s:%s",
-			ErrCloneSnapshotInUse, dependents[0], ref.Source, ref.Snapshot)
+		return keepCloneSnapshot(ctx, st, ref, fmt.Errorf("%w: %s was restored from %s:%s",
+			ErrCloneSnapshotInUse, dependents[0], ref.Source, ref.Snapshot))
 	}
 
 	err = st.Snapshots().Delete(ctx, ref.Source, ref.Snapshot)
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return fmt.Errorf("delete internal clone snapshot %s/%s: %w", ref.Source, ref.Snapshot, err)
+		return keepCloneSnapshot(ctx, st, ref,
+			fmt.Errorf("delete internal clone snapshot %s/%s: %w", ref.Source, ref.Snapshot, err))
 	}
 
 	return nil
+}
+
+// keepCloneSnapshot takes the reaping mark back off a snapshot the reap
+// decided to keep, so restores from it are not refused, and returns why it
+// was kept.
+func keepCloneSnapshot(ctx context.Context, st Store, ref ClonedSnapshotRef, why error) error {
+	err := setReapingMark(ctx, st, ref.Source, ref.Snapshot, "")
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("%w; the reaping mark stayed on it, so restores from it are refused "+
+			"until `linstor s sp %s %s %s` clears it: %w",
+			why, ref.Source, ref.Snapshot, CloneSnapshotReapingProp, err)
+	}
+
+	return why
+}
+
+// setReapingMark writes the reaping mark naming clone, or removes it when
+// clone is empty.
+func setReapingMark(ctx context.Context, st Store, source, snapshot, clone string) error {
+	snap, err := st.Snapshots().Get(ctx, source, snapshot)
+	if err != nil {
+		return err //nolint:wrapcheck // callers wrap with the snapshot they name
+	}
+
+	if clone == "" {
+		if _, marked := snap.Props[CloneSnapshotReapingProp]; !marked {
+			return nil
+		}
+
+		delete(snap.Props, CloneSnapshotReapingProp)
+	} else {
+		if snap.Props == nil {
+			snap.Props = map[string]string{}
+		}
+
+		snap.Props[CloneSnapshotReapingProp] = clone
+	}
+
+	return st.Snapshots().Update(ctx, &snap) //nolint:wrapcheck // callers wrap with the snapshot they name
+}
+
+// RestoreSourceWithdrawn is the restore's half of the protocol described on
+// ReapClonedSnapshot: called after the restored definition was created, it
+// reads the snapshot back past the cache and reports ErrRestoreSourceWithdrawn
+// when it is gone or a reap has started on it. Any other error means the
+// answer could not be had, and the caller withdraws as well.
+func RestoreSourceWithdrawn(ctx context.Context, st Store, source, snapshot string) error {
+	snaps, err := st.Snapshots().ListByDefinitionUncached(ctx, source)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("read back snapshot %s/%s: %w", source, snapshot, err)
+	}
+
+	for i := range snaps {
+		if !strings.EqualFold(snaps[i].Name, snapshot) {
+			continue
+		}
+
+		if _, reaping := snaps[i].Props[CloneSnapshotReapingProp]; reaping {
+			return fmt.Errorf("%w: %s/%s is being deleted", ErrRestoreSourceWithdrawn, source, snapshot)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("%w: %s/%s was deleted", ErrRestoreSourceWithdrawn, source, snapshot)
 }
 
 // restoredFrom names the definitions, other than the clone itself, whose
 // marker says they were restored from source:snapshot. The clone is skipped
 // because it carries the marker too, and it may still be listed right after
 // its own delete.
-func restoredFrom(ctx context.Context, st Store, source, snapshot, clone string) ([]string, error) {
-	definitions, err := st.ResourceDefinitions().ListUncached(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list definitions restored from %s/%s: %w", source, snapshot, err)
-	}
-
+func restoredFrom(definitions []apiv1.ResourceDefinition, source, snapshot, clone string) []string {
 	marker := source + ":" + snapshot
 
 	var names []string
@@ -140,7 +230,7 @@ func restoredFrom(ctx context.Context, st Store, source, snapshot, clone string)
 		}
 	}
 
-	return names, nil
+	return names
 }
 
 // LeftCloneSnapshots is what the snapshots a source still carries say about
@@ -172,8 +262,12 @@ func (l LeftCloneSnapshots) Empty() bool {
 // The refusal a delete of the source meets is the one place that still sees
 // them, so it names them, and never calls a snapshot deletable while a
 // definition still restores from it.
+//
+// On an error the snapshots sorted before it are returned with it.
 func CloneSnapshotsLeftBehind(ctx context.Context, st Store, snaps []apiv1.Snapshot) (LeftCloneSnapshots, error) {
 	out := LeftCloneSnapshots{InUse: map[string]string{}}
+
+	var definitions []apiv1.ResourceDefinition
 
 	for i := range snaps {
 		owner := snaps[i].Props[CloneSnapshotOwnerProp]
@@ -193,10 +287,15 @@ func CloneSnapshotsLeftBehind(ctx context.Context, st Store, snaps []apiv1.Snaps
 			continue
 		}
 
-		dependents, err := restoredFrom(ctx, st, snaps[i].ResourceName, snaps[i].Name, owner)
-		if err != nil {
-			return LeftCloneSnapshots{}, err
+		// One list answers every snapshot, taken only once one needs it.
+		if definitions == nil {
+			definitions, err = st.ResourceDefinitions().ListUncached(ctx)
+			if err != nil {
+				return out, fmt.Errorf("list definitions restored from %s: %w", snaps[i].ResourceName, err)
+			}
 		}
+
+		dependents := restoredFrom(definitions, snaps[i].ResourceName, snaps[i].Name, owner)
 
 		switch {
 		case len(dependents) > 0:
@@ -212,24 +311,28 @@ func CloneSnapshotsLeftBehind(ctx context.Context, st Store, snaps []apiv1.Snaps
 }
 
 // Explain words the report for the refusal both delete doors give, so the two
-// cannot drift. The correction deletes only what is safe to delete, and names
-// the definition that has to go first for a snapshot still restored from.
+// cannot drift. Every command it prints names the snapshot it acts on, and the
+// steps come in the order they have to run: what can go now, then each
+// definition that holds a snapshot and that snapshot after it, then the source.
 func (l LeftCloneSnapshots) Explain(source string) (string, string) {
-	var causes, corrections []string
+	size := len(l.Deletable) + len(l.Unowned) + len(l.InUse)
+	causes := make([]string, 0, size)
+	steps := make([]string, 0, size+1)
 
-	if len(l.Deletable) > 0 {
-		causes = append(causes, "internal clone snapshot(s) "+strings.Join(l.Deletable, ", ")+
-			" outlived the clone they were taken for, and nothing was restored from them")
-		corrections = append(corrections, "delete "+strings.Join(l.Deletable, ", ")+
-			" with `linstor s d "+source+" <snapshot>`")
+	deleteCmd := func(snapshot string) string {
+		return "`linstor s d " + source + " " + snapshot + "`"
 	}
 
-	if len(l.Unowned) > 0 {
-		causes = append(causes, "snapshot(s) "+strings.Join(l.Unowned, ", ")+
-			" look like a clone's internal snapshot for a clone that no longer exists, "+
-			"but were not stamped as one, so they are never reaped")
-		corrections = append(corrections, "delete "+strings.Join(l.Unowned, ", ")+
-			" by hand if nothing of yours depends on them")
+	for _, snapshot := range l.Deletable {
+		causes = append(causes, "internal clone snapshot "+snapshot+
+			" outlived the clone it was taken for, and nothing was restored from it")
+		steps = append(steps, deleteCmd(snapshot))
+	}
+
+	for _, snapshot := range l.Unowned {
+		causes = append(causes, "snapshot "+snapshot+" looks like the internal snapshot of a clone "+
+			"that no longer exists, but was not stamped as one, so it is never reaped")
+		steps = append(steps, "if nothing of yours depends on "+snapshot+", "+deleteCmd(snapshot))
 	}
 
 	kept := make([]string, 0, len(l.InUse))
@@ -242,9 +345,10 @@ func (l LeftCloneSnapshots) Explain(source string) (string, string) {
 	for _, snapshot := range kept {
 		causes = append(causes, "internal clone snapshot "+snapshot+" is kept because "+
 			l.InUse[snapshot]+" was restored from it")
-		corrections = append(corrections, "delete "+l.InUse[snapshot]+" first; "+snapshot+
-			" can go once nothing restores from it")
+		steps = append(steps, "delete "+l.InUse[snapshot]+" if it is no longer needed, then "+deleteCmd(snapshot))
 	}
 
-	return strings.Join(causes, "; "), strings.Join(corrections, "; ") + ", then delete " + source + " again"
+	steps = append(steps, "then delete "+source+" again")
+
+	return strings.Join(causes, "; "), strings.Join(steps, "; ")
 }

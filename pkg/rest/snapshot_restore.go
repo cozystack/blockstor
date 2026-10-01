@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -765,35 +766,19 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// every snapshot later taken of this definition would inherit a claim of
 	// ownership it was never given.
 	delete(newRD.Props, store.CloneSnapshotOwnerProp)
+	delete(newRD.Props, store.CloneSnapshotReapingProp)
 
-	// AlreadyExists is tolerated when the definition already there is this
-	// restore's own — the resume path above, or a second restore of the
-	// same snapshot racing this one between the state check and here. The
-	// marker is what tells the two apart from somebody else's definition,
-	// and re-reading is what makes the decision on fresh state rather than
-	// on the read that lost the race.
-	err = s.Store.ResourceDefinitions().Create(ctx, &newRD)
+	created, err := s.createOrAdoptRestoredRD(ctx, &newRD, snap, overrides)
 	if err != nil {
-		if !errors.Is(err, store.ErrAlreadyExists) {
-			return "", err //nolint:wrapcheck // surfaced via writeStoreError
-		}
+		return "", err
+	}
 
-		existing, getErr := s.Store.ResourceDefinitions().Get(ctx, newRD.Name)
-		if getErr != nil {
-			return "", getErr //nolint:wrapcheck // surfaced via writeStoreError
-		}
-
-		// Re-made on fresh state, and all of it: the marker says the
-		// definition is this operation's own, the DELETE flag says whether
-		// it is still there to finish, and the shape says whether it is
-		// the same operation. The window is narrow — another request
-		// completed and the target was deleted between the state check
-		// above and this Create — but it is the exact state the 409 in
-		// restoreTargetState exists to prevent, and hydrating volumes into
-		// a dying definition races the tear-down reaping them.
-		if !leftoverIsThisRestore(&existing, snap, overrides) {
-			return "", err //nolint:wrapcheck // surfaced via writeStoreError
-		}
+	// The snapshot was read before the definition existed, and a reap that
+	// listed dependents in between could not see this one. Read it back now
+	// the definition is there; see store.ReapClonedSnapshot.
+	err = store.RestoreSourceWithdrawn(ctx, s.Store, snap.ResourceName, snap.Name)
+	if err != nil {
+		return "", s.withdrawRestoredRD(ctx, newRD.Name, created, err)
 	}
 
 	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap, true)
@@ -813,6 +798,64 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	}
 
 	return newRD.Name, nil
+}
+
+// createOrAdoptRestoredRD creates the restored definition, and reports whether
+// this request created it.
+//
+// AlreadyExists is tolerated when the definition already there is this
+// restore's own — the resume path above, or a second restore of the same
+// snapshot racing this one between the state check and here. The marker is
+// what tells the two apart from somebody else's definition, and re-reading is
+// what makes the decision on fresh state rather than on the read that lost the
+// race.
+func (s *Server) createOrAdoptRestoredRD(ctx context.Context, newRD *apiv1.ResourceDefinition, snap *apiv1.Snapshot, overrides *rdShapeOverrides) (bool, error) {
+	err := s.Store.ResourceDefinitions().Create(ctx, newRD)
+	if err == nil {
+		return true, nil
+	}
+
+	if !errors.Is(err, store.ErrAlreadyExists) {
+		return false, err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	existing, getErr := s.Store.ResourceDefinitions().Get(ctx, newRD.Name)
+	if getErr != nil {
+		return false, getErr //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	// Re-made on fresh state, and all of it: the marker says the definition
+	// is this operation's own, the DELETE flag says whether it is still there
+	// to finish, and the shape says whether it is the same operation. The
+	// window is narrow — another request completed and the target was deleted
+	// between the state check above and this Create — but it is the exact
+	// state the 409 in restoreTargetState exists to prevent, and hydrating
+	// volumes into a dying definition races the tear-down reaping them.
+	if !leftoverIsThisRestore(&existing, snap, overrides) {
+		return false, err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	return false, nil
+}
+
+// withdrawRestoredRD takes back a definition this request created from a
+// snapshot that went away under it, before anything was hydrated into it, and
+// answers as for a snapshot that does not exist. A definition an earlier
+// attempt left is not this request's to delete.
+func (s *Server) withdrawRestoredRD(ctx context.Context, rdName string, created bool, cause error) error {
+	if created {
+		err := s.Store.ResourceDefinitions().Delete(ctx, rdName)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			log.FromContext(ctx).Info("could not withdraw a definition whose snapshot went away",
+				"resourceDefinition", rdName, "error", err.Error())
+		}
+	}
+
+	if errors.Is(cause, store.ErrRestoreSourceWithdrawn) {
+		return errors.Wrap(store.ErrNotFound, cause.Error())
+	}
+
+	return cause
 }
 
 // placeRestoredResources stamps the Resource CRDs that materialise the
