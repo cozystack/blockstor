@@ -116,6 +116,13 @@ func TestRollbackBudgetFitsTheShutdownWindow(t *testing.T) {
 			detachedRollbackBudget, shutdownMargin, gracefulShutdownWindow)
 	}
 
+	// The two mark writes are budgeted on top of everything the cascade is,
+	// not carved out of its waits.
+	if cascade := groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget; detachedRollbackBudget < cascade+2*markWriteBudget {
+		t.Errorf("rollback budget %s leaves the two abandoned-rollback marks (%s each) nothing on top "+
+			"of the cascade's %s", detachedRollbackBudget, markWriteBudget, cascade)
+	}
+
 	// Both convergence waits the rollback can spend in full, back to back.
 	if detachedRollbackBudget < 2*cacheConvergeBudget {
 		t.Errorf("rollback budget %s is under its own two waits of %s; a rollback would be "+

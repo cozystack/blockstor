@@ -94,9 +94,10 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 //	groupRecheckBudget        0.6s  parentRGSurvived's cache-retry
 //	+ 2 * cacheConvergeBudget 10s   the rollback's two convergence waits
 //	+ rollbackWriteBudget     2s    the rollback's own writes
-//	= detachedRollbackBudget  12.6s
+//	+ 2 * markWriteBudget     0.4s  the abandoned-rollback mark, before and after
+//	= detachedRollbackBudget  13s
 //	+ shutdownMargin          2s    the rest of a graceful shutdown
-//	= gracefulShutdownWindow  14.6s how long Shutdown waits for in-flight handlers
+//	= gracefulShutdownWindow  15s   how long Shutdown waits for in-flight handlers
 //	+ terminationGraceMargin  5s
 //	<= terminationGracePeriodSeconds in every manifest that serves REST
 //
@@ -111,7 +112,8 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 const (
 	groupRecheckBudget     = cacheRetryAttempts * cacheRetryDelay
 	rollbackWriteBudget    = 2 * time.Second
-	detachedRollbackBudget = groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget
+	markWriteBudget        = 200 * time.Millisecond
+	detachedRollbackBudget = groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget + 2*markWriteBudget
 	shutdownMargin         = 2 * time.Second
 	terminationGraceMargin = 5 * time.Second
 )
@@ -182,17 +184,40 @@ const rollbackAbandonedKey = store.RollbackAbandonedProp
 // markRollbackAbandoned records on the definition that its rollback started,
 // or where it stopped. Best-effort: a mark that does not land leaves the
 // replay gate where it was before the mark existed.
+//
+// Each write gets markWriteBudget of its own and is not waited on past it.
+// The patch retries on conflict with a backoff that sleeps without a context,
+// sized for heavy contention, so under a reconciler bumping the definition's
+// resourceVersion a mark could otherwise spend the convergence waits the
+// cascade after it is budgeted for. A write abandoned at its deadline cannot
+// land later: every call it would still make runs on the expired context.
 func (s *Server) markRollbackAbandoned(ctx context.Context, rdName, step string) {
-	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
-		func(rd *apiv1.ResourceDefinition) error {
-			if rd.Props == nil {
-				rd.Props = map[string]string{}
-			}
+	markCtx, cancel := context.WithTimeout(ctx, markWriteBudget)
+	defer cancel()
 
-			rd.Props[rollbackAbandonedKey] = step
+	done := make(chan error, 1)
 
-			return nil
-		})
+	go func() {
+		done <- s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(markCtx, rdName,
+			func(rd *apiv1.ResourceDefinition) error {
+				if rd.Props == nil {
+					rd.Props = map[string]string{}
+				}
+
+				rd.Props[rollbackAbandonedKey] = step
+
+				return nil
+			})
+	}()
+
+	var err error
+
+	select {
+	case err = <-done:
+	case <-markCtx.Done():
+		err = markCtx.Err()
+	}
+
 	switch {
 	case err == nil:
 	case errors.Is(err, store.ErrNotFound):
