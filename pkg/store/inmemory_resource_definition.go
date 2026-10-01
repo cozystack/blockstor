@@ -59,6 +59,11 @@ func (s *inMemoryResourceDefinitions) Get(_ context.Context, name string) (apiv1
 	return rd, nil
 }
 
+// GetUncached is Get: the in-memory store has no cache to trail.
+func (s *inMemoryResourceDefinitions) GetUncached(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
+	return s.Get(ctx, name)
+}
+
 func (s *inMemoryResourceDefinitions) Create(_ context.Context, rd *apiv1.ResourceDefinition) error {
 	if rd == nil {
 		return errors.New("nil ResourceDefinition")
