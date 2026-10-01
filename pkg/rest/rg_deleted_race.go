@@ -94,11 +94,11 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 //	groupRecheckBudget        0.6s  parentRGSurvived's cache-retry
 //	+ 2 * cacheConvergeBudget 10s   the rollback's two convergence waits
 //	+ rollbackWriteBudget     2s    the rollback's own writes
-//	+ 2 * markWriteBudget     0.4s  the abandoned-rollback mark, before and after
-//	= detachedRollbackBudget  13s
+//	+ 2 * markWriteBudget     2s    the abandoned-rollback mark, before and after
+//	= detachedRollbackBudget  14.6s
 //	+ shutdownMargin          2s    the rest of a graceful shutdown
-//	= gracefulShutdownWindow  15s   how long Shutdown waits for in-flight handlers
-//	+ terminationGraceMargin  5s
+//	= gracefulShutdownWindow  16.6s how long Shutdown waits for in-flight handlers
+//	+ terminationGraceMargin  3s
 //	<= terminationGracePeriodSeconds in every manifest that serves REST
 //
 // The compensation runs inside the handler on a context Shutdown cannot
@@ -112,10 +112,10 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 const (
 	groupRecheckBudget     = cacheRetryAttempts * cacheRetryDelay
 	rollbackWriteBudget    = 2 * time.Second
-	markWriteBudget        = 200 * time.Millisecond
+	markWriteBudget        = time.Second
 	detachedRollbackBudget = groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget + 2*markWriteBudget
 	shutdownMargin         = 2 * time.Second
-	terminationGraceMargin = 5 * time.Second
+	terminationGraceMargin = 3 * time.Second
 )
 
 // detachedCompensation is the context a compensation runs on: the request
@@ -185,7 +185,10 @@ const rollbackAbandonedKey = store.RollbackAbandonedProp
 // or where it stopped. Best-effort: a mark that does not land leaves the
 // replay gate where it was before the mark existed.
 //
-// Each write gets markWriteBudget of its own and is not waited on past it.
+// Each write gets markWriteBudget of its own and is not waited on past it: a
+// second covers a get and a patch against a loaded API server, where a fraction
+// of one would leave the first mark missing exactly when the cascade after it
+// is cut short.
 // The patch retries on conflict with a backoff that sleeps without a context,
 // sized for heavy contention, so under a reconciler bumping the definition's
 // resourceVersion a mark could otherwise spend the convergence waits the
