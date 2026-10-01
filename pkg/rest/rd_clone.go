@@ -634,7 +634,7 @@ func (s *Server) cloneLeftoverIsUsable(
 	}
 
 	if stampedRG == "" {
-		return !cloneRollbackWasAbandoned(w, srcName, cloneName, existing)
+		return !s.cloneRollbackWasAbandoned(ctx, w, srcName, cloneName)
 	}
 
 	// An unreadable group is refused rather than waved through. Refusing
@@ -660,7 +660,7 @@ func (s *Server) cloneLeftoverIsUsable(
 	}
 
 	if survived {
-		return !cloneRollbackWasAbandoned(w, srcName, cloneName, existing)
+		return !s.cloneRollbackWasAbandoned(ctx, w, srcName, cloneName)
 	}
 
 	writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
@@ -688,9 +688,30 @@ func (s *Server) cloneLeftoverIsUsable(
 // whole because the placement the rollback stopped in the middle of left a
 // live replica and the volumes, when the clone intended more replicas than
 // that. The rollback is the one party that knows; see rollbackAbandonedKey.
-func cloneRollbackWasAbandoned(
-	w http.ResponseWriter, srcName, cloneName string, existing *apiv1.ResourceDefinition,
+//
+// The definition is read again here, from the API server. The props the gate
+// started from are one cache-served read taken before the two gates ahead of
+// this one waited out their own cache lag, and the mark is written through the
+// API server by a rollback that may have given up moments before this replay
+// arrived, which is exactly when the cache has not caught up with it. A read
+// that fails refuses: the replay cannot vouch for a clone it could not check.
+func (s *Server) cloneRollbackWasAbandoned(
+	ctx context.Context, w http.ResponseWriter, srcName, cloneName string,
 ) bool {
+	existing, err := s.Store.ResourceDefinitions().GetUncached(ctx, cloneName)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, srcName, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone target '" + cloneName + "' exists, but reading it back to check " +
+				"for an abandoned rollback failed: " + err.Error(),
+			Cause: "an earlier attempt whose rollback gave up leaves a definition that looks " +
+				"whole, and only the mark it carries tells the two apart",
+			Correc: "retry the clone",
+		})
+
+		return true
+	}
+
 	spelled := existing.Props[rollbackAbandonedKey]
 	if spelled == "" {
 		return false

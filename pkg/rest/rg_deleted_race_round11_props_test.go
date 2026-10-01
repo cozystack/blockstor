@@ -3,7 +3,10 @@
 package rest
 
 import (
+	"context"
+	"maps"
 	"net/http"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -50,5 +53,60 @@ func TestRDCloneOfAVolumeLessRestoredDefinitionDropsItsMarker(t *testing.T) {
 
 	if clone.Props["Aux/keep"] != "1" {
 		t.Errorf("the shell lost the source's ordinary props: %v", clone.Props)
+	}
+}
+
+// markCacheTrails serves Get from a cache that has not seen the abandoned-
+// rollback mark yet; GetUncached reads the backend.
+type markCacheTrails struct{ store.ResourceDefinitionStore }
+
+func (m markCacheTrails) Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
+	rd, err := m.ResourceDefinitionStore.Get(ctx, name)
+	if err == nil {
+		rd.Props = maps.Clone(rd.Props)
+		delete(rd.Props, rollbackAbandonedKey)
+	}
+
+	return rd, err //nolint:wrapcheck // pass-through test double
+}
+
+type markCacheTrailsStore struct{ store.Store }
+
+func (m markCacheTrailsStore) ResourceDefinitions() store.ResourceDefinitionStore {
+	return markCacheTrails{m.Store.ResourceDefinitions()}
+}
+
+// The mark is written through the API server by a rollback that gave up
+// moments before linstor-csi's retry arrives, so the props the replay gate
+// started from, one cache-served read taken before two other gates waited, did
+// not carry it yet, and the replay answered 201 over a leftover the rollback
+// had abandoned.
+func TestRDCloneReplaySeesAnAbandonedRollbackTheCacheHasNotCaughtUpWith(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewInMemory()
+	seedDeployedCloneSource(t, backend, "src-lag11")
+
+	base, stop := startServerWithStore(t, markCacheTrailsStore{backend})
+	defer stop()
+
+	first := postClone(t, base, "src-lag11", map[string]any{"name": "dst-lag11", "use_zfs_clone": true})
+	_ = first.Body.Close()
+
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("fixture: first attempt = %d, want 201", first.StatusCode)
+	}
+
+	markDefinition(t, backend, "dst-lag11", "placement")
+
+	retry := postClone(t, base, "src-lag11", map[string]any{"name": "dst-lag11", "use_zfs_clone": true})
+	defer func() { _ = retry.Body.Close() }()
+
+	if retry.StatusCode == http.StatusCreated {
+		t.Fatal("the replay answered 201 over a leftover whose rollback gave up, read through a cache that trailed the mark")
+	}
+
+	if rc := decodeCloneMessage(t, retry); !strings.Contains(rc.Message, "rollback gave up") {
+		t.Errorf("refusal %q does not say an earlier rollback gave up", rc.Message)
 	}
 }

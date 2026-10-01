@@ -129,7 +129,7 @@ func TestAnAbandonedRollbackIsMarkedEvenWhenItsBudgetRunsOut(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	if !cloneRollbackWasAbandoned(w, "src", "dst-budget10", &leftover) {
+	if !(&Server{Store: backend}).cloneRollbackWasAbandoned(ctx, w, "src", "dst-budget10") {
 		t.Error("the replay gate did not refuse over the mark")
 	}
 }

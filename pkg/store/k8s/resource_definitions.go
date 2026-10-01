@@ -86,6 +86,16 @@ func (s *resourceDefinitions) Get(ctx context.Context, name string) (apiv1.Resou
 	return s.getUncached(ctx, name)
 }
 
+// GetUncached reads the definition from the API server when the store has a
+// direct reader, and through the client otherwise.
+func (s *resourceDefinitions) GetUncached(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
+	if s.apiReader == nil {
+		return s.Get(ctx, name)
+	}
+
+	return s.getUncached(ctx, name)
+}
+
 func (s *resourceDefinitions) Create(ctx context.Context, in *apiv1.ResourceDefinition) error {
 	if in == nil {
 		return errors.New("nil ResourceDefinition")

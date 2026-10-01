@@ -74,3 +74,53 @@ func TestResourceDefinitionPatchLandsOnADefinitionTheCacheHasNotSeen(t *testing.
 		t.Errorf("the patch did not land: props %v", got.Props)
 	}
 }
+
+// definitionCacheIsStale holds every definition as it was before its props
+// were written.
+type definitionCacheIsStale struct{ ctrlclient.Client }
+
+func (d definitionCacheIsStale) Get(
+	ctx context.Context, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption,
+) error {
+	err := d.Client.Get(ctx, key, obj, opts...)
+	if rd, ok := obj.(*crdv1alpha1.ResourceDefinition); ok && err == nil {
+		rd.Spec = crdv1alpha1.ResourceDefinitionSpec{}
+		rd.Annotations = nil
+	}
+
+	return err //nolint:wrapcheck // pass-through test double
+}
+
+// GetUncached exists for the decision a cache that holds the object stale gets
+// wrong: Get falls back to the API server only when the cache has nothing.
+func TestResourceDefinitionGetUncachedReadsPastAStaleCache(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	ctx := t.Context()
+	seed := k8s.New(fixture.client)
+
+	if err := seed.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "pvc-stale-cache", Props: map[string]string{"Aux/fresh": "yes"},
+	}); err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	t.Cleanup(func() { _ = seed.ResourceDefinitions().Delete(context.Background(), "pvc-stale-cache") })
+
+	st := k8s.NewWithAPIReader(definitionCacheIsStale{fixture.client}, fixture.client)
+
+	if cached, err := st.ResourceDefinitions().Get(ctx, "pvc-stale-cache"); err != nil || cached.Props["Aux/fresh"] != "" {
+		t.Fatalf("fixture: the cached read was supposed to be stale: %v %v", cached.Props, err)
+	}
+
+	live, err := st.ResourceDefinitions().GetUncached(ctx, "pvc-stale-cache")
+	if err != nil {
+		t.Fatalf("GetUncached: %v", err)
+	}
+
+	if live.Props["Aux/fresh"] != "yes" {
+		t.Errorf("GetUncached answered from the stale cache: props %v", live.Props)
+	}
+}

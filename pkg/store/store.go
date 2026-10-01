@@ -182,6 +182,12 @@ type ResourceDefinitionStore interface {
 	Update(ctx context.Context, rd *apiv1.ResourceDefinition) error
 	Delete(ctx context.Context, name string) error
 
+	// GetUncached answers the same question as Get from the API server when
+	// the store has a direct reader. Get falls back to it only on a cache
+	// NotFound, so a definition the cache holds stale comes back as is; a
+	// decision made on a prop another request has just written needs this.
+	GetUncached(ctx context.Context, name string) (apiv1.ResourceDefinition, error)
+
 	// PatchResourceDefinitionSpec runs `mutate` against the freshly-fetched
 	// ResourceDefinition wire value and persists the result. On 409 the
 	// fetch+mutate+patch cycle re-runs against fresh state — so disjoint
