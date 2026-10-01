@@ -286,6 +286,7 @@ const (
 	rollbackStepRereadReplicas
 	rollbackStepSnapshots
 	rollbackStepDeleteDefinition
+	rollbackStepReadSnapshots
 )
 
 type rollbackStepError struct {
@@ -307,6 +308,7 @@ var rollbackStepNames = map[rollbackStep]string{ //nolint:gochecknoglobals // a 
 	rollbackStepRereadReplicas:   "reread-replicas",
 	rollbackStepSnapshots:        "snapshots",
 	rollbackStepDeleteDefinition: "delete-definition",
+	rollbackStepReadSnapshots:    "read-snapshots",
 }
 
 // rollbackStepName spells the step a compensation stopped at, or "unknown".
@@ -359,6 +361,11 @@ func rollbackStepAdvice(step rollbackStep, known bool, rdName string) (string, s
 				"a snapshot the way `rd d` refuses to",
 			"delete the snapshot(s) of '" + rdName + "' if they are not needed, then delete '" +
 				rdName + "' by hand"
+	case rollbackStepReadSnapshots:
+		return "the snapshots of the definition could not be read, and the rollback does " +
+				"not delete a definition it cannot show has none",
+			"check whether '" + rdName + "' has snapshots (`linstor s l`), delete any that are " +
+				"not needed, then delete '" + rdName + "' by hand"
 	case rollbackStepDeleteDefinition:
 		return "every replica went, but deleting the definition itself failed",
 			"delete '" + rdName + "' by hand"
@@ -471,9 +478,12 @@ func (s *Server) rollBackMaterialisedRD(ctx context.Context, rdName string, plac
 // that raced in. A snapshot taken on the target inside the rollback window is
 // somebody's data, not a race.
 func (s *Server) refuseRollbackOverSnapshots(ctx context.Context, rdName string) error {
+	// A listing that failed is not a snapshot that exists: the operator is
+	// told which of the two it was, since only one of them points at an
+	// object to delete.
 	snaps, err := s.Store.Snapshots().ListByDefinition(ctx, rdName)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return newRollbackError(rollbackStepSnapshots,
+		return newRollbackError(rollbackStepReadSnapshots,
 			errors.Wrapf(err, "list the snapshots of %q", rdName))
 	}
 
