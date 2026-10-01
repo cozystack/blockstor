@@ -242,22 +242,16 @@ func (s *resourceDefinitions) PatchResourceDefinitionSpec(ctx context.Context, n
 	}
 
 	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
-		var existing crdv1alpha1.ResourceDefinition
-
-		err := s.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &existing)
+		existing, err := s.getForPatch(ctx, name)
 		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return errors.Wrapf(store.ErrNotFound, "resource definition %q", name)
-			}
-
-			return errors.Wrapf(err, "get ResourceDefinition %q", name)
+			return err
 		}
 
 		base := existing.DeepCopy()
 
 		// Surface as wire shape so the closure runs in the same
 		// vocabulary as REST handlers.
-		wire := crdToWireRD(&existing)
+		wire := crdToWireRD(existing)
 
 		err = mutate(&wire)
 		if err != nil {
@@ -284,7 +278,7 @@ func (s *resourceDefinitions) PatchResourceDefinitionSpec(ctx context.Context, n
 
 		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations)
 
-		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
+		return s.c.Patch(ctx, existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
 	}), "patch ResourceDefinition %q", name)
 }
 
@@ -301,6 +295,40 @@ func (s *resourceDefinitions) Delete(ctx context.Context, name string) error {
 	}
 
 	return nil
+}
+
+// getForPatch reads the object a patch starts from. A cache NotFound is
+// re-read live, the way Get does: a caller that patches a definition it has
+// just created reads it at the peak of the informer's lag, and taking the
+// cache's word there drops the write as if the definition were gone. A stale
+// object the cache does hold costs nothing, since the optimistic lock refuses
+// the patch and the retry reads again.
+func (s *resourceDefinitions) getForPatch(ctx context.Context, name string) (*crdv1alpha1.ResourceDefinition, error) {
+	var existing crdv1alpha1.ResourceDefinition
+
+	err := s.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &existing)
+	if err == nil {
+		return &existing, nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return nil, errors.Wrapf(err, "get ResourceDefinition %q", name)
+	}
+
+	if s.apiReader == nil {
+		return nil, errors.Wrapf(store.ErrNotFound, "resource definition %q", name)
+	}
+
+	err = s.apiReader.Get(ctx, types.NamespacedName{Name: Name(name)}, &existing)
+	if err == nil {
+		return &existing, nil
+	}
+
+	if apierrors.IsNotFound(err) {
+		return nil, errors.Wrapf(store.ErrNotFound, "resource definition %q", name)
+	}
+
+	return nil, errors.Wrapf(err, "get ResourceDefinition %q live", name)
 }
 
 // getUncached resolves a cache-miss RD Get against the direct API reader.

@@ -193,7 +193,15 @@ func (s *Server) markRollbackAbandoned(ctx context.Context, rdName, step string)
 
 			return nil
 		})
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrNotFound):
+		// The definition is gone, so there is nothing left to mark. Kept
+		// at V(1) so a mark that did not land can still be told apart
+		// from one that was never needed.
+		log.FromContext(ctx).V(1).Info("no definition to mark an abandoned rollback on",
+			"resourceDefinition", rdName, "step", step)
+	default:
 		log.FromContext(ctx).Info("could not mark an abandoned rollback on its definition",
 			"resourceDefinition", rdName, "step", step, "reason", err.Error())
 	}
