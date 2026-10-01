@@ -151,6 +151,10 @@ func (l *laggingRDs) List(ctx context.Context) ([]apiv1.ResourceDefinition, erro
 	return l.inner.List(ctx) //nolint:wrapcheck // test helper
 }
 
+func (l *laggingRDs) ListUncached(ctx context.Context) ([]apiv1.ResourceDefinition, error) {
+	return l.inner.ListUncached(ctx) //nolint:wrapcheck // test helper
+}
+
 func (l *laggingRDs) Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
 	return l.inner.Get(ctx, name) //nolint:wrapcheck // test helper
 }

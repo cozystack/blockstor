@@ -78,10 +78,33 @@ lctl_idempotent() {
 # them as $WORKER_1, $WORKER_2, $WORKER_3 instead of hardcoding a
 # specific cluster prefix (parallel stands name workers `<NAME>-worker-N`).
 # Sorted alphabetically so $WORKER_1 == worker-1, etc.
-mapfile -t _BS_WORKERS < <(
-    kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
-        -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | sort
-)
+#
+# What the cells actually need is nodes RUNNING A SATELLITE, and on the
+# project's own stands "not a control-plane node" answers that. It does not
+# answer it everywhere: a Cozystack cluster of three control-plane nodes runs
+# satellites on all three and has no node without the label, so the selector
+# returns nothing and every cell skips itself as unexercisable.
+#
+# So the satellite DaemonSet answers when the label selector cannot. It is the
+# authority on the question being asked, and it costs one extra call only on
+# the clusters where the first answer was empty. BS_WORKERS overrides both, for
+# a stand whose shape neither rule fits.
+if [[ -n "${BS_WORKERS:-}" ]]; then
+    mapfile -t _BS_WORKERS < <(printf '%s\n' $BS_WORKERS | sort)
+else
+    mapfile -t _BS_WORKERS < <(
+        kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
+            -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | sort
+    )
+
+    if (( ${#_BS_WORKERS[@]} == 0 )); then
+        mapfile -t _BS_WORKERS < <(
+            kubectl get pods -A -l app=blockstor-satellite \
+                -o jsonpath='{.items[*].spec.nodeName}' 2>/dev/null \
+                | tr ' ' '\n' | grep -v '^$' | sort -u
+        )
+    fi
+fi
 WORKER_1="${_BS_WORKERS[0]:-}"
 WORKER_2="${_BS_WORKERS[1]:-}"
 WORKER_3="${_BS_WORKERS[2]:-}"
@@ -937,8 +960,20 @@ skip() {
 require_workers() {
     local want=$1
     local got
-    got=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' --no-headers 2>/dev/null \
-        | awk '$2 == "Ready"' | wc -l)
+    # Counted off the same discovery $WORKER_* came from, so a cluster whose
+    # satellites run on control-plane nodes is not reported as having none.
+    got=0
+    # The length test guards the expansion: under `set -u` a bash older than
+    # 4.4 treats "${empty[@]}" as an unbound variable and aborts, which would
+    # turn "this cluster has no satellites" into a crash inside the preflight
+    # that exists to report exactly that.
+    if (( ${#_BS_WORKERS[@]} > 0 )); then
+        for _w in "${_BS_WORKERS[@]}"; do
+            if [[ "$(kubectl get node "$_w" --no-headers 2>/dev/null | awk '{print $2}')" == "Ready" ]]; then
+                got=$(( got + 1 ))
+            fi
+        done
+    fi
 
     if (( got < want )); then
         skip "scenario needs $want satellite workers, found $got"

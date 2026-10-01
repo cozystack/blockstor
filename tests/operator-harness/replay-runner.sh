@@ -177,10 +177,27 @@ source "$HARNESS_DIR/lib.sh"
 # Discover worker nodes for {{node1..3}} substitution. The runner is happy
 # with 2 or 3 nodes; workflows that need more declare it via prerequisites
 # and the runner skips with a clear message.
-mapfile -t WORKERS < <(
-    kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
-        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | sort
-)
+# Same discovery the cli-matrix lib does, and for the same reason: the
+# question is "which nodes run a satellite", and "not a control-plane node"
+# only answers it on stands shaped like the project's own. A Cozystack cluster
+# of three control-plane nodes runs satellites on all three, and the selector
+# returns nothing there — so every workflow skipped itself as unexercisable.
+if [[ -n "${BS_WORKERS:-}" ]]; then
+    mapfile -t WORKERS < <(printf '%s\n' $BS_WORKERS | sort)
+else
+    mapfile -t WORKERS < <(
+        kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
+            -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | sort
+    )
+
+    if (( ${#WORKERS[@]} == 0 )); then
+        mapfile -t WORKERS < <(
+            kubectl get pods -A -l app=blockstor-satellite \
+                -o jsonpath='{.items[*].spec.nodeName}' 2>/dev/null \
+                | tr ' ' '\n' | grep -v '^$' | sort -u
+        )
+    fi
+fi
 NODE1="${WORKERS[0]:-}"
 NODE2="${WORKERS[1]:-}"
 NODE3="${WORKERS[2]:-}"
@@ -201,6 +218,12 @@ RD=$(yaml_get "$WORKFLOW" "vars.rd")
 RD=${RD:-$DEFAULT_RD}
 SP=$(yaml_get "$WORKFLOW" "vars.sp")
 SP=${SP:-stand}
+# BS_SP overrides the workflow's pool. The pool NAME is a property of the
+# stand, not of the workflow: the project's own stands call it `stand`, a
+# Cozystack cluster calls it whatever its LinstorCluster declares. Without this
+# every workflow is pinned to one stand's naming and cannot be replayed
+# anywhere else, which is the difference between a harness and a fixture.
+SP=${BS_SP:-$SP}
 # {{rg}} resolves from vars.rg (resource-group workflows). No synthetic
 # default — a workflow that references {{rg}} without declaring vars.rg
 # would otherwise substitute an empty string and create an unnamed group.
