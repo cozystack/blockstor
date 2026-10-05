@@ -22,7 +22,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 
@@ -235,7 +234,7 @@ func hydrateSnapshot(ctx context.Context, run *runContext, snap *apiv1.Snapshot)
 	}
 
 	if snap.Props == nil {
-		snap.Props = def.Props
+		snap.Props = store.TravellingProps(def.Props)
 	}
 
 	if snap.SnapshotDefinitionProps == nil {
@@ -327,11 +326,11 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 		// group breaks the restore-then-list workflow.
 		ResourceGroupName: src.ResourceGroupName,
 		LayerStack:        src.LayerStack,
-		Props:             maps.Clone(snap.Props),
+		Props:             store.TravellingProps(snap.Props),
 	}
 
 	if def.Props == nil {
-		def.Props = maps.Clone(src.Props)
+		def.Props = store.TravellingProps(src.Props)
 	}
 
 	if def.Props == nil {

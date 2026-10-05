@@ -104,4 +104,7 @@ spec:
         volumeMounts: []
       volumes: []
       serviceAccountName: controller-manager
-      terminationGracePeriodSeconds: 10
+      # The REST server's graceful-shutdown window is derived from the
+      # detached rollback budget (pkg/rest/rg_deleted_race.go); this has to
+      # outlive it, or a SIGTERM kills a compensation mid-cascade.
+      terminationGracePeriodSeconds: 20
