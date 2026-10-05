@@ -67,8 +67,11 @@ var (
 //   - Allowed layers: DRBD, LUKS, STORAGE. Input is matched
 //     case-insensitively, as upstream LINSTOR accepts mixed case.
 //   - Ordering, top to bottom: DRBD first if present, STORAGE last, LUKS
-//     between them. LUKS above DRBD is refused — DRBD must replicate
-//     ciphertext, not plaintext.
+//     between them. LUKS above DRBD is refused, matching upstream LINSTOR.
+//     Note what the accepted order actually gives you: DRBD's lower disk is
+//     the dm-crypt mapper, so DRBD ships PLAINTEXT to its peers and each
+//     node encrypts on the way to its own storage. LUKS is at-rest
+//     protection per node, not transport protection.
 func LayerStack(layers []string) error {
 	if len(layers) == 0 {
 		return nil
@@ -147,8 +150,26 @@ func layerStackOrder(normalized []string) error {
 
 	if luksIdx >= 0 && drbdIdx >= 0 && luksIdx < drbdIdx {
 		// Unreachable with the current rule set (DRBD must be index 0), but
-		// pinned explicitly so the intent survives a refactor: LUKS above
-		// DRBD means DRBD replicates plaintext.
+		// pinned explicitly so the intent survives a refactor.
+		//
+		// The stack is ordered top-down, so `luksIdx < drbdIdx` puts LUKS
+		// ABOVE DRBD: the consumer would write into the crypt device and
+		// cryptsetup would push ciphertext into /dev/drbdN. That is the
+		// arrangement in which DRBD replicates CIPHERTEXT.
+		//
+		// The accepted order (DRBD first) is the opposite: the satellite
+		// hands DRBD the dm-crypt mapper as its lower disk (maybeLUKS
+		// rewrites the device map before applyDRBD, pkg/satellite/
+		// reconciler.go), so the pod writes plaintext into /dev/drbdN,
+		// DRBD ships PLAINTEXT to its peers, and each node encrypts
+		// independently on the way to its own storage. LUKS here is
+		// at-rest protection per node, not transport protection — see
+		// docs/layer-stack.md.
+		//
+		// The rule matches upstream LINSTOR's ordering and is not being
+		// changed; only this rationale is, because it previously claimed
+		// the inverse and anyone deriving the threat model from it would
+		// conclude replication traffic is encrypted. It is not.
 		return fmt.Errorf("%w: LUKS must be a child of DRBD, not parent; got %s",
 			ErrInvalidLayerOrder, joined)
 	}

@@ -60,7 +60,16 @@ func newPassphraseTestReconciler(t *testing.T, objs ...client.Object) *ResourceR
 		t.Fatalf("blockstor to scheme: %v", err)
 	}
 
-	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	// WithStatusSubresource mirrors the real CRD
+	// (config/crd/bases/...resources.yaml declares `subresources.status`).
+	// Without it the fake client answers a Status().Patch with
+	// "not found" even though a plain Get returns the object, which
+	// silently defeats any test that asserts a stamped Condition.
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		WithObjects(objs...).
+		Build()
 
 	return &ResourceReconciler{
 		Client: cli,

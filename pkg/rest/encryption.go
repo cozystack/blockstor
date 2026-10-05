@@ -76,6 +76,40 @@ type passphraseRequest struct {
 	Passphrase    string `json:"passphrase,omitempty"`
 }
 
+// passphraseModifyRequest is the PUT-only body. It carries `force` in
+// addition to the shared fields.
+//
+// Separate type on purpose. Putting Force on passphraseRequest made
+// POST and PATCH quietly accept a `force` key too: those handlers
+// decode with DisallowUnknownFields, so before the field existed a
+// stray `force` was a 400, and afterwards it was silently swallowed.
+// That is a wire-contract change nobody asked for, on two verbs where
+// the flag means nothing. `vd s` keeps its own `force` on the
+// PUT-scoped volumeDefinitionModifyBody for the same reason.
+type passphraseModifyRequest struct {
+	NewPassphrase string `json:"new_passphrase,omitempty"`
+	OldPassphrase string `json:"old_passphrase,omitempty"`
+	Passphrase    string `json:"passphrase,omitempty"`
+
+	// Force opts out of the rotation guard
+	// (encryption_rotation_guard.go): blockstor uses the cluster
+	// passphrase verbatim as the LUKS key, so rotating it while
+	// LUKS-layered RDs exist strands them. `?force=true` is accepted
+	// as an equivalent spelling, mirroring the `vd s` shrink override.
+	Force bool `json:"force,omitempty"`
+}
+
+// proofOfKnowledge mirrors passphraseRequest's dual-key resolution so
+// the PUT body honours `new_passphrase` and its `passphrase` alias
+// identically to POST and PATCH.
+func (r passphraseModifyRequest) proofOfKnowledge() string {
+	if r.NewPassphrase != "" {
+		return r.NewPassphrase
+	}
+
+	return r.Passphrase
+}
+
 // proofOfKnowledge returns the operator-supplied passphrase from the
 // request body, honouring the dual-key wire surface above. Used by
 // POST/PATCH/PUT alike so every encryption verb sees the same field
@@ -490,6 +524,42 @@ func firstJSONToken(body []byte) (byte, bool) {
 	return 0, false
 }
 
+// authenticateRotation is the read-and-verify half of
+// handlePassphraseModify, split out to keep that handler inside the
+// funlen budget once the rotation guard landed. Returns the currently
+// stored passphrase and whether the caller may proceed; on a refusal
+// the response has already been written.
+//
+// Both failure branches are load-bearing:
+//   - no stored passphrase → 412, so `modify` on a fresh cluster tells
+//     the operator to POST first rather than inventing a master key.
+//   - Bug 176: the old-value compare is constant-time. The PUT
+//     rotation path is the highest-value timing target — an attacker
+//     who recovers the old passphrase by byte-by-byte latency probing
+//     can rotate the cluster master out from under the operator.
+func (s *Server) authenticateRotation(ctx context.Context, w http.ResponseWriter, req passphraseModifyRequest) (string, bool) {
+	have, err := s.readPassphrase(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return "", false
+	}
+
+	if have == "" {
+		writeError(w, http.StatusPreconditionFailed, "no cluster passphrase set")
+
+		return "", false
+	}
+
+	if subtle.ConstantTimeCompare([]byte(have), []byte(req.OldPassphrase)) != 1 {
+		writeError(w, http.StatusUnauthorized, "old passphrase mismatch")
+
+		return "", false
+	}
+
+	return have, true
+}
+
 // handlePassphraseModify rotates the cluster master passphrase
 // (scenario 6.W14). PUT `/v1/encryption/passphrase` with body
 // `{"old_passphrase":"…","new_passphrase":"…"}` swaps the sealed
@@ -507,6 +577,11 @@ func firstJSONToken(body []byte) (byte, bool) {
 //     caller after a single wrong-old guess.
 //   - new == old (and old verified) → 200 OK + MASK_INFO envelope,
 //     no Secret write. Idempotent no-op for a retried CLI call.
+//   - value would CHANGE while LUKS-layered RDs exist → 409 Conflict
+//     naming them, unless the caller forced it. blockstor uses the
+//     cluster passphrase verbatim as the cryptsetup key, so the
+//     rotation would leave their headers locked with the old value.
+//     See encryption_rotation_guard.go.
 //   - happy rotation → 200 OK + MASK_INFO envelope with an
 //     operator-facing "modified" line, sealed Secret updated, and
 //     s.passphraseUnlocked flipped to true atomic with the
@@ -519,7 +594,7 @@ func firstJSONToken(body []byte) (byte, bool) {
 // matches every other write-side endpoint in the apiserver so
 // python-linstor's CLI loop renders the success line uniformly.
 func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) {
-	var req passphraseRequest
+	var req passphraseModifyRequest
 
 	if !decodeJSON(w, r, &req) {
 		return
@@ -546,29 +621,8 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
 
-	have, err := s.readPassphrase(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
-	}
-
-	if have == "" {
-		writeError(w, http.StatusPreconditionFailed, "no cluster passphrase set")
-
-		return
-	}
-
-	// Bug 176: constant-time to avoid timing oracle on the master
-	// passphrase. The PUT rotation path is the highest-value timing
-	// target — a remote attacker who learns the old passphrase via
-	// byte-by-byte latency probing here can then rotate the
-	// cluster master out from under the operator. ConstantTimeCompare
-	// keeps the auth path's response time independent of where
-	// `have` and `req.OldPassphrase` diverge.
-	if subtle.ConstantTimeCompare([]byte(have), []byte(req.OldPassphrase)) != 1 {
-		writeError(w, http.StatusUnauthorized, "old passphrase mismatch")
-
+	have, ok := s.authenticateRotation(ctx, w, req)
+	if !ok {
 		return
 	}
 
@@ -597,7 +651,18 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err = s.writePassphrase(ctx, want)
+	// The value is about to actually CHANGE. Because blockstor uses
+	// the cluster passphrase verbatim as the cryptsetup key, every
+	// LUKS header already on disk keeps the old value and stops
+	// opening. Refuse while such volumes exist unless the caller
+	// forced it. Placed AFTER the idempotent same-value branch above:
+	// re-stamping the current value changes no key and must stay a
+	// clean 200 even on a cluster full of encrypted volumes.
+	if !s.guardPassphraseRotation(ctx, w, r, req) {
+		return
+	}
+
+	err := s.writePassphrase(ctx, want)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 

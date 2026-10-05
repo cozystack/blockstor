@@ -1,7 +1,7 @@
 converted: 3 nodes, 4 storage pools, 3 resource groups, 6 resource definitions, 9 resources, 1 snapshots
 warning: volume definition pvc-vol1/0: unhandled flags bitmask 32 dropped
 warning: resource definition pvc-vol3: no DRBD port in the dump or live map — blockstor will allocate a fresh port; the adopted mesh will reconnect on the new port. Capture live ports (see runbook) to avoid the blip.
-warning: resource definition pvc-vol3: LUKS passphrase NOT migrated (encrypted with the LINSTOR master key) — provision spec.encryption manually before adopting
+warning: resource definition pvc-vol3: LUKS passphrase NOT migrated — LINSTOR stores a distinct per-volume key wrapped with its master key, and blockstor currently has a single cluster-wide key with no way to express per-volume keys. These volumes will NOT open after adoption and there is no manual provisioning step that fixes it. See docs/byok-design.md
 warning: resource definition pvc-vol4: marked DELETE in the source cluster — skipped
 warning: resource definition pvc-vol5: no DRBD port in the dump or live map — blockstor will allocate a fresh port; the adopted mesh will reconnect on the new port. Capture live ports (see runbook) to avoid the blip.
 warning: resource definition pvc-vol6: resource group "SC-GHOST" was not migrated — reference cleared

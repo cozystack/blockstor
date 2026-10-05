@@ -1191,10 +1191,25 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 		// LAYER_LUKS_VOLUMES carries the volume passphrase encrypted
 		// with the LINSTOR master key; decrypting it needs the
 		// operator's master passphrase and LINSTOR's KDF, which this
-		// converter does not implement yet. The layer stack is
-		// preserved, but the volume cannot be opened until the
-		// passphrase is provisioned into blockstor by hand.
-		c.warnf("resource definition %s: LUKS passphrase NOT migrated (encrypted with the LINSTOR master key) — provision spec.encryption manually before adopting", dsp)
+		// converter does not implement. The layer stack is preserved,
+		// but the volume cannot be opened after adoption.
+		//
+		// The warning used to end "provision spec.encryption manually
+		// before adopting". That advice does not work and following it
+		// is worse than doing nothing: `spec.encryption.passphrase
+		// SecretRef` is not implemented (see
+		// pkg/satellite/controllers/luks_passphrase.go), and blockstor
+		// holds exactly ONE cluster-wide key while LINSTOR's keys are
+		// per volume — so there is no hand-provisioning step that can
+		// express N distinct volume keys. Adopting a live encrypted
+		// LINSTOR cluster needs the per-volume data keys of
+		// docs/byok-design.md §4; say so rather than sending the
+		// operator down a path that ends in an unopenable volume.
+		c.warnf("resource definition %s: LUKS passphrase NOT migrated — LINSTOR stores a distinct "+
+			"per-volume key wrapped with its master key, and blockstor currently has a single "+
+			"cluster-wide key with no way to express per-volume keys. These volumes will NOT open "+
+			"after adoption and there is no manual provisioning step that fixes it. See "+
+			"docs/byok-design.md", dsp)
 	}
 }
 

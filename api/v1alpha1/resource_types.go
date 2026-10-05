@@ -79,6 +79,25 @@ const ConditionFilesystemFormatted = "FilesystemFormatted"
 // kernel-direct probe (drbdsetup status / drbdmeta dump-md).
 const ConditionKernelLoaded = "KernelLoaded"
 
+// ConditionEncryptionKeyIgnored is stamped True when the parent
+// ResourceDefinition pins its own LUKS key through
+// `spec.encryption.passphraseSecretRef` — a field blockstor declares
+// but does not implement (docs/byok-design.md §3.2). The volume is
+// encrypted with the CLUSTER passphrase instead, so the operator holds
+// a Secret that opens nothing.
+//
+// It is a Condition rather than a refusal on purpose. Refusing the
+// apply would wedge resource definitions that reconcile correctly
+// today — the field has always been inert, so a cluster may well carry
+// RDs that set it and run fine on the cluster key. Moving a working
+// volume to a failing one to punish a misleading field is the wrong
+// trade in a storage system. The volume keeps working; the object now
+// says why the operator's key is not the one in use.
+//
+// Cleared (False) when the reference is removed, so the Condition
+// tracks the live spec rather than latching on the first sighting.
+const ConditionEncryptionKeyIgnored = "EncryptionKeyIgnored"
+
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the
 // satellite reconciler stamps on a Resource CRD after every successful
 // apply pass. The value is a comma-separated list of int32 volume

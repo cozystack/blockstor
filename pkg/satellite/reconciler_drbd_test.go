@@ -1088,9 +1088,11 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 
 // TestApplyDRBDLUKSStorageStack pins `[DRBD,LUKS,STORAGE]`: the .res
 // file's `disk` line must point at /dev/mapper/<rd>-<vol>-luks (the
-// LUKS mapper), NOT the raw LV path. That's what makes DRBD replicate
-// ciphertext between peers — each peer encrypts independently, but the
-// data DRBD ships over the wire is post-LUKS.
+// LUKS mapper), NOT the raw LV path. Pointing DRBD at the mapper is
+// what makes each peer encrypt its OWN storage independently: the
+// mapper is the plaintext side, so what DRBD ships over the wire is
+// pre-LUKS and only the underlying LV holds ciphertext. Encryption
+// here is at-rest per node, not on the replication link.
 func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()

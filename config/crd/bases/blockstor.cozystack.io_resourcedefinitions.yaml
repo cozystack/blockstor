@@ -251,10 +251,21 @@ spec:
                 properties:
                   passphraseSecretRef:
                     description: |-
-                      passphraseSecretRef references the Secret carrying the LUKS
-                      passphrase under the key `passphrase`. The satellite reads it
-                      via the apiserver during reconcile; the passphrase never lands
-                      on Spec in plaintext.
+                      passphraseSecretRef names a Secret carrying a LUKS passphrase
+                      under the key `passphrase`.
+
+                      NOT IMPLEMENTED — setting this does NOT encrypt the volume with
+                      the referenced Secret. blockstor uses the cluster passphrase for
+                      every LUKS volume, so a resource definition that sets this field
+                      is encrypted with the CLUSTER key and the referenced Secret opens
+                      nothing.
+
+                      The field is kept, rather than removed, because it is the right
+                      shape for the per-volume key work in docs/byok-design.md and
+                      removing it would prune the reference out of stored objects.
+                      While it does nothing, a LUKS-layered resource definition that
+                      sets it gets an `EncryptionKeyIgnored` Condition on each of its
+                      Resources saying so.
                     properties:
                       name:
                         default: ""
