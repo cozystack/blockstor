@@ -351,6 +351,14 @@ func crdToWireSnapshot(
 		copy(out.Flags, crd.Status.Flags)
 	}
 
+	// A delete only stamps a DeletionTimestamp while a satellite finalizer
+	// holds the snapshot, and that lasts until the on-disk delete succeeds.
+	// Served as a plain snapshot, a restore read it as live and was restored
+	// from data being destroyed. Same flag resources carry for the same state,
+	// and like theirs it outranks every other State: the REST view stamps no
+	// SUCCESSFUL beside it.
+	out.Flags = withDeletingFlag(out.Flags, crd.DeletionTimestamp != nil)
+
 	if len(crd.Spec.VolumeDefinitions) > 0 {
 		out.VolumeDefinitions = wireVolumeDefinitions(crd.Spec.VolumeDefinitions, vdPropsByNumber)
 	}

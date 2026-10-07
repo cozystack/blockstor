@@ -33,6 +33,11 @@ type inMemoryResourceDefinitions struct {
 	m  map[string]apiv1.ResourceDefinition
 }
 
+// ListUncached has nothing to bypass here: this store is the API server.
+func (s *inMemoryResourceDefinitions) ListUncached(ctx context.Context) ([]apiv1.ResourceDefinition, error) {
+	return s.List(ctx)
+}
+
 func (s *inMemoryResourceDefinitions) List(_ context.Context) ([]apiv1.ResourceDefinition, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
