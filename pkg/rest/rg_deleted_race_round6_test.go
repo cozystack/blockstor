@@ -22,7 +22,7 @@ import (
 // seedCloneLeftover writes a definition carrying the clone marker of
 // src→dst straight into the store, with a volume when withVolume is set and
 // one replica on node-a when replicaFlags is non-nil.
-func seedCloneLeftover(t *testing.T, st store.Store, src, dst string, withVolume bool, replicaFlags []string) {
+func seedShapedCloneLeftover(t *testing.T, st store.Store, src, dst string, withVolume bool, replicaFlags []string) {
 	t.Helper()
 
 	ctx := t.Context()
@@ -125,7 +125,7 @@ func TestRDCloneReplayOverASeededLeftoverTurnsOnTheDeletionStamp(t *testing.T) {
 
 			st := store.NewInMemory()
 			seedDeployedCloneSource(t, st, "src-seed")
-			seedCloneLeftover(t, st, "src-seed", tc.dstName, true, tc.flags)
+			seedShapedCloneLeftover(t, st, "src-seed", tc.dstName, true, tc.flags)
 
 			base, stop := startServerWithStore(t, st)
 			defer stop()
@@ -140,57 +140,78 @@ func TestRDCloneReplayOverASeededLeftoverTurnsOnTheDeletionStamp(t *testing.T) {
 	}
 }
 
+// assertCloneWhole fails unless the clone holds a volume and a replica that is
+// not being deleted: the least a 201 may be answered over.
+func assertCloneWhole(t *testing.T, st store.Store, cloneName string) {
+	t.Helper()
+
+	vds, err := st.VolumeDefinitions().List(t.Context(), cloneName)
+	if err != nil || len(vds) == 0 {
+		t.Errorf("201 over a clone with no volumes (%v)", err)
+	}
+
+	replicas, err := st.Resources().ListByDefinition(t.Context(), cloneName)
+	if err != nil {
+		t.Fatalf("list the clone's replicas: %v", err)
+	}
+
+	for i := range replicas {
+		if !replicaAcceptedForDeletion(&replicas[i]) {
+			return
+		}
+	}
+
+	t.Errorf("201 over a clone with no live replica")
+}
+
 // Only the replicas term of the wholeness check had a fixture. A leftover with
-// a replica and no volume isolates the volumes term.
-func TestRDCloneReplayRefusesALeftoverWithReplicasButNoVolumes(t *testing.T) {
+// a replica and no volume isolates the volumes term. A retry resumes it rather
+// than refusing it, and the 201 it then answers is over a clone the resume made
+// whole.
+func TestRDCloneRetryMakesWholeALeftoverWithReplicasButNoVolumes(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
 	seedDeployedCloneSource(t, st, "src-novol")
-	seedCloneLeftover(t, st, "src-novol", "dst-novol", false, []string{})
+	seedShapedCloneLeftover(t, st, "src-novol", "dst-novol", false, []string{})
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
 	resp := postClone(t, base, "src-novol", map[string]any{"name": "dst-novol", "use_zfs_clone": true})
-	defer func() { _ = resp.Body.Close() }()
+	_ = resp.Body.Close()
 
-	if resp.StatusCode == http.StatusCreated {
-		t.Fatal("replay = 201 over a leftover with no volumes")
+	// A live replica is what tells this leftover from one being torn down,
+	// and the resume has to finish it: a refusal here strands the CSI target
+	// name for good, since nobody is deleting the replica it waits for.
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("retry over a volume-less leftover with a live replica = %d, want 201", resp.StatusCode)
 	}
 
-	if rc := decodeCloneMessage(t, resp); !strings.Contains(rc.Cause, "no volumes") {
-		t.Errorf("cause = %q, want it to name the missing volumes", rc.Cause)
-	}
+	assertCloneWhole(t, st, "dst-novol")
 }
 
-// A leftover that stopped before creating any volume is not rollback debris,
-// and the refusal must not tell a first attempt still running to delete itself.
-func TestRDCloneReplayWordsAMarkerOnlyLeftoverForBothWaysItArises(t *testing.T) {
+// A leftover that stopped before creating any volume is not rollback debris:
+// it is an attempt that got as far as the marker, and a retry finishes it. The
+// 201 is answered only over what the resume made whole.
+func TestRDCloneRetryFinishesAMarkerOnlyLeftover(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
 	seedDeployedCloneSource(t, st, "src-bare")
-	seedCloneLeftover(t, st, "src-bare", "dst-bare", false, nil)
+	seedShapedCloneLeftover(t, st, "src-bare", "dst-bare", false, nil)
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
 	resp := postClone(t, base, "src-bare", map[string]any{"name": "dst-bare", "use_zfs_clone": true})
-	defer func() { _ = resp.Body.Close() }()
+	_ = resp.Body.Close()
 
-	if resp.StatusCode == http.StatusCreated {
-		t.Fatal("replay = 201 over a definition with no volumes and no replicas")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("retry over a marker-only leftover = %d, want the resume's 201", resp.StatusCode)
 	}
 
-	rc := decodeCloneMessage(t, resp)
-	if strings.Contains(rc.Cause, "rollback") {
-		t.Errorf("cause = %q, which blames a rollback that never ran", rc.Cause)
-	}
-
-	if !strings.Contains(rc.Correc, "still running") {
-		t.Errorf("correc = %q, want it conditioned on no attempt still running", rc.Correc)
-	}
+	assertCloneWhole(t, st, "dst-bare")
 }
 
 // trailingReplicaListing hides the target's replicas from the first few
@@ -544,7 +565,7 @@ func TestRDCloneFailureDoesNotRollBackADefinitionItDidNotCreate(t *testing.T) {
 	backend := store.NewInMemory()
 	ctx := t.Context()
 	seedDeployedCloneSource(t, backend, "src-other")
-	seedCloneLeftover(t, backend, "src-other", "dst-other", false, nil)
+	seedShapedCloneLeftover(t, backend, "src-other", "dst-other", false, nil)
 
 	blips := &atomic.Int32{}
 	blips.Store(1)
@@ -555,10 +576,9 @@ func TestRDCloneFailureDoesNotRollBackADefinitionItDidNotCreate(t *testing.T) {
 	resp := postClone(t, base, "src-other", map[string]any{"name": "dst-other", "use_zfs_clone": true})
 	_ = resp.Body.Close()
 
-	if resp.StatusCode == http.StatusCreated {
-		t.Fatalf("status = 201, but the create under an existing name cannot have succeeded")
-	}
-
+	// The leftover carries this clone's marker, so the create's AlreadyExists
+	// is the resume's to adopt, and a 201 may follow. What must not follow is
+	// a rollback of it.
 	if _, err := backend.ResourceDefinitions().Get(ctx, "dst-other"); err != nil {
 		t.Errorf("a definition this request did not create was deleted: %v", err)
 	}

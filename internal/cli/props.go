@@ -88,7 +88,7 @@ var storagePoolProps = withNamedKeyGuard(objectProps("storage pool", 2, // (node
 	// The REST path has refused these since it was written; this CLI edits
 	// the same bag directly, so the rule has to hold here too.
 	validate.StoragePoolPropEdit,
-), validate.StoragePoolPropNamed)
+), func(key string, _ bool) error { return validate.StoragePoolPropNamed(key) })
 
 // resourceGroupProps accesses a group's property bag.
 //

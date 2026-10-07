@@ -21,7 +21,6 @@ package rest
 import (
 	"fmt"
 	"net/http"
-	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
@@ -224,11 +223,5 @@ func mergeVolumePropsPatch(vol *apiv1.Volume, patch *apiv1.GenericPropsModify) {
 	// I1: empty override value deletes the key (set-property KEY "").
 	applyPropsModify(vol.Props, patch.OverrideProps, patch.DeleteProps)
 
-	for _, ns := range patch.DeleteNamespace {
-		for k := range vol.Props {
-			if k == ns || strings.HasPrefix(k, ns+"/") {
-				delete(vol.Props, k)
-			}
-		}
-	}
+	deletePropNamespaces(vol.Props, patch.DeleteNamespace)
 }

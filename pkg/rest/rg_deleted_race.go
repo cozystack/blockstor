@@ -21,6 +21,7 @@ package rest
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
@@ -94,10 +95,12 @@ func (s *Server) parentRGSurvived(ctx context.Context, rgName string) (bool, err
 //	groupRecheckBudget        0.6s  parentRGSurvived's cache-retry
 //	+ 2 * cacheConvergeBudget 10s   the rollback's two convergence waits
 //	+ rollbackWriteBudget     2s    the rollback's own writes
-//	+ 2 * markWriteBudget     2s    the abandoned-rollback mark, before and after
-//	= detachedRollbackBudget  14.6s
+//	+ 3 * markWriteBudget     3s    the abandoned-rollback mark: in progress, the
+//	                                step it takes apart before the first delete,
+//	                                and the step it stopped at
+//	= detachedRollbackBudget  15.6s
 //	+ shutdownMargin          2s    the rest of a graceful shutdown
-//	= gracefulShutdownWindow  16.6s how long Shutdown waits for in-flight handlers
+//	= gracefulShutdownWindow  17.6s how long Shutdown waits for in-flight handlers
 //	+ terminationGraceMargin  3s
 //	<= terminationGracePeriodSeconds in every manifest that serves REST
 //
@@ -113,7 +116,7 @@ const (
 	groupRecheckBudget     = cacheRetryAttempts * cacheRetryDelay
 	rollbackWriteBudget    = 2 * time.Second
 	markWriteBudget        = time.Second
-	detachedRollbackBudget = groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget + 2*markWriteBudget
+	detachedRollbackBudget = groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget + 3*markWriteBudget
 	shutdownMargin         = 2 * time.Second
 	terminationGraceMargin = 3 * time.Second
 )
@@ -152,33 +155,301 @@ func detachedCompensation(ctx context.Context) (context.Context, context.CancelF
 // half-torn leftover: the budget running out mid-cascade leaves no context to
 // write it on, and a killed process runs nothing at all. A failure then only
 // refines the mark to the step it stopped at, best-effort.
-func (s *Server) rollBackCompensating(ctx context.Context, rdName string, placed []string) error {
-	s.markRollbackAbandoned(ctx, rdName, rollbackInProgress)
+//
+// The handshake with an adopting retry fails closed. Without the in-progress
+// mark an adopter cannot see that the definition is being taken away, and
+// without the read of the adoption mark the rollback cannot see that a retry
+// answered for it; in either case deleting could take a definition somebody
+// was just told is theirs, so nothing is deleted and the definition is left
+// for the replay gate and the operator, named in the error.
+//
+// scope says whether a definition that already reads as finished is spared;
+// see rollbackScope.
+func (s *Server) rollBackCompensating(
+	ctx context.Context, rdName string, placed []string, scope rollbackScope,
+) error {
+	err := s.markRollbackAbandoned(ctx, rdName, rollbackInProgress)
+	if errors.Is(err, store.ErrNotFound) {
+		// The definition this rollback was for is gone, so there is nothing of
+		// it left to remove. Deleting by name past this point would take
+		// whatever stands under the name by the time the cascade runs, and a
+		// retry recreating the deterministic name inside that window comes in
+		// as a creator, invisible to the handshake below.
+		return nil
+	}
 
-	err := s.rollBackMaterialisedRD(ctx, rdName, placed)
 	if err != nil {
-		s.markRollbackAbandoned(ctx, rdName, rollbackStepName(err))
+		// A write that failed at its deadline may still have landed; nothing
+		// is deleted either way, so the mark must not outlive this answer.
+		_ = s.clearRollbackMark(ctx, rdName) // the step's own error is the answer
+
+		return newRollbackError(rollbackStepMark, err)
+	}
+
+	// The creating half of the handshake claimAdoptedLeftover describes: a
+	// retry that adopted the definition, and may already have answered for
+	// it, owns it now.
+	adopted, err := s.adoptedElsewhere(ctx, rdName)
+	if err != nil {
+		// Nothing was taken away, so the definition is no more than an
+		// unfinished leftover, which a retry resumes. A mark naming this step
+		// would instead refuse every retry while the advice says to retry;
+		// the in-progress mark comes off for the same reason.
+		_ = s.clearRollbackMark(ctx, rdName) // the step's own error is the answer
+
+		return newRollbackError(rollbackStepReadAdoption, err)
+	}
+
+	if adopted {
+		return s.leftWhole(ctx, rdName, errRollbackYielded)
+	}
+
+	if scope != rollbackEvenIfFinished {
+		finished, err := store.ReadsAsFinished(ctx, s.Store, rdName, scope == rollbackUnlessPlaced)
+		if err != nil {
+			_ = s.clearRollbackMark(ctx, rdName) // the step's own error is the answer
+
+			return newRollbackError(rollbackStepReadFinished, err)
+		}
+
+		if finished {
+			return s.leftWhole(ctx, rdName, errRollbackAnswered)
+		}
+	}
+
+	// Nothing is touched until the snapshot refusal has run, for the reason
+	// handleRDDelete gives for its own: once the replicas are reaped, a
+	// refused definition delete leaves the target half torn down, with its
+	// children going and its parent kept, which no retry reconciles. A refusal
+	// whose correction is "drop the snapshots and retry" has to arrive while
+	// there is still something to retry over.
+	err = s.refuseRollbackOverSnapshots(ctx, rdName)
+	if err != nil {
+		_ = s.markRollbackAbandoned(ctx, rdName, rollbackStepName(err))
+
+		return err
+	}
+
+	gone, err := s.enterDestructiveRollback(ctx, rdName)
+	if gone || err != nil {
+		return err
+	}
+
+	err = s.rollBackMaterialisedRD(ctx, rdName, placed)
+	if err != nil {
+		_ = s.markRollbackAbandoned(ctx, rdName, rollbackStepName(err))
 	}
 
 	return err
 }
 
+// errRollbackMarkNotOurs is a definition that no longer carries the
+// in-progress mark this rollback wrote: an operator cleared it, or the
+// definition under the name is not the one the mark went on.
+var errRollbackMarkNotOurs = errors.New("the rollback mark this rollback wrote is no longer on the definition")
+
+// enterDestructiveRollback replaces the in-progress mark with the first step
+// that takes the definition apart, before that step runs. The in-progress
+// mark is then only ever over a definition left whole, which is what lets an
+// operator clear it (store.RollbackMarkClearRefusal): written after a failure
+// instead, the step name could not land in the cases that tear the definition
+// halfway, the budget running out mid-cascade or the process being killed, and
+// in-progress would stand over half-reaped replicas. A process killed between
+// this write and the first delete leaves a step name over a whole definition;
+// that fails closed, to a delete by hand.
+//
+// The write checks the definition still carries this rollback's own mark,
+// which is the identity check deleting by name needs: a definition recreated
+// under the name since carries none. gone means there is nothing left to roll
+// back. An error means nothing was deleted, and the in-progress mark is taken
+// off unless it was not ours to begin with.
+func (s *Server) enterDestructiveRollback(ctx context.Context, rdName string) (bool, error) {
+	markCtx, cancel := context.WithTimeout(ctx, markWriteBudget)
+	defer cancel()
+
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(markCtx, rdName,
+		func(rd *apiv1.ResourceDefinition) error {
+			if rd.Props[rollbackAbandonedKey] != rollbackInProgress {
+				return errRollbackMarkNotOurs
+			}
+
+			rd.Props[rollbackAbandonedKey] = rollbackStepNames[rollbackStepReapReplicas]
+
+			return nil
+		})
+
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, store.ErrNotFound):
+		return true, nil
+	case errors.Is(err, errRollbackMarkNotOurs):
+		return false, newRollbackError(rollbackStepMark, fmt.Errorf("%q: %w", rdName, err))
+	default:
+		_ = s.clearRollbackMark(ctx, rdName) // the step's own error is the answer
+
+		return false, newRollbackError(rollbackStepMark, errors.Wrapf(err, "mark %q as being taken apart", rdName))
+	}
+}
+
+// finishedLeftoverRefusal takes the adoption mark on a finished leftover a
+// replay is about to answer for. A replay writes nothing else, and a creator
+// whose rollback judges "finished" by a replica a bare replay did not need
+// would otherwise delete the definition after the 201. Nil means the replay may
+// answer; a creator already rolling back is refused the way the gate refuses
+// it, and a mark that cannot be written is a retryable 500.
+func (s *Server) finishedLeftoverRefusal(ctx context.Context, door, rdName string) (int, *apiv1.APICallRc) {
+	err := s.claimAdoptedLeftover(ctx, rdName, nil)
+	if err == nil {
+		return 0, nil
+	}
+
+	if errors.Is(err, errAdoptedLeftoverRollingBack) {
+		if status, refusal := s.abandonedRollbackRefusal(ctx, door, rdName); refusal != nil {
+			return status, refusal
+		}
+
+		return http.StatusConflict, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "'" + rdName + "' is being rolled back by the attempt that created it",
+			Correc:  "retry once the rollback has finished",
+		}
+	}
+
+	return http.StatusInternalServerError, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "'" + rdName + "' is finished, but it could not be marked as answered for: " +
+			scrubImplDetails(err.Error()),
+		Correc: "retry the " + door,
+	}
+}
+
+// errRollbackYielded reports a rollback that left the definition in place
+// because a retry marked it adopted. That retry may have finished it, or may
+// itself have seen this rollback's mark and refused: when both marks land
+// before either side reads the other's, both sides stand down and nothing is
+// deleted, and the next retry resumes the leftover.
+var errRollbackYielded = errors.New("a retry marked the definition adopted, so it was left in place")
+
+// errRollbackAnswered reports a rollback that left the definition in place
+// because it already reads as finished: the clone status poll answers such a
+// definition without adopting it, so it may already have told the caller the
+// operation completed.
+var errRollbackAnswered = errors.New("the definition already reads as finished, so it was left in place")
+
+// rollbackScope is which definitions a rollback spares besides an adopted one.
+//
+// A failed materialisation spares one that already reads as finished
+// (store.ReadsAsFinished): the clone status poll answers it as done the moment
+// it is, without writing anything, which can be while the attempt that created it is still
+// stamping its last replica, and deleting it afterwards takes a volume the
+// driver was told exists. The RG-deleted rollback spares nothing: a finished
+// definition parented to a group that is gone is what it exists to remove.
+type rollbackScope int
+
+const (
+	// rollbackEvenIfFinished deletes a finished definition too.
+	rollbackEvenIfFinished rollbackScope = iota
+	// rollbackUnlessPlaced spares one holding every volume and a replica: a
+	// clone, or a restore that was asked to place replicas.
+	rollbackUnlessPlaced
+	// rollbackUnlessHydrated spares one holding every volume: a bare restore,
+	// which places nothing and is finished without a replica.
+	rollbackUnlessHydrated
+)
+
+// adoptedElsewhere reads, past the cache, whether a retry has adopted the
+// definition. A definition that is gone was adopted by nobody.
+func (s *Server) adoptedElsewhere(ctx context.Context, rdName string) (bool, error) {
+	return store.AdoptedElsewhere(ctx, s.Store, rdName) //nolint:wrapcheck // names the definition already
+}
+
+// clearRollbackMark takes back the in-progress mark of a rollback that deleted
+// nothing, so a retry is not refused over a definition that was left whole.
+//
+// It is tried more than once: a mark that stays is read by the replay gate as
+// a rollback that never reported how it ended, which it has to refuse, since a
+// process killed mid-cascade leaves exactly that. Each attempt has the mark's
+// own budget. If every attempt fails the mark stays and the error is
+// returned, so a definition left whole says so (leftWhole); the gate's
+// refusal over the mark names clearing it as the way out.
+func (s *Server) clearRollbackMark(ctx context.Context, rdName string) error {
+	const attempts = 3
+
+	var err error
+
+	for range attempts {
+		err = s.patchRollbackMarkAway(ctx, rdName)
+		if err == nil || errors.Is(err, store.ErrNotFound) || ctx.Err() != nil {
+			break
+		}
+	}
+
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		log.FromContext(ctx).Info("could not clear the mark of a rollback that deleted nothing",
+			"resourceDefinition", rdName, "error", err.Error())
+
+		return err
+	}
+
+	return nil
+}
+
+// leftWhole takes the mark off a definition the rollback left whole for why,
+// a yield to an adopter or a definition that already reads as finished. One
+// whose mark stays is refused by every retry over a definition somebody was
+// told is theirs, so the answer says so and names the command that clears it.
+func (s *Server) leftWhole(ctx context.Context, rdName string, why error) error {
+	err := s.clearRollbackMark(ctx, rdName)
+	if err != nil {
+		return &rollbackMarkStuckError{why: why, err: err}
+	}
+
+	return why
+}
+
+// rollbackMarkStuckError is a rollback that left the definition whole, for
+// why, and could not take its in-progress mark back off.
+type rollbackMarkStuckError struct {
+	why, err error
+}
+
+func (e *rollbackMarkStuckError) Error() string {
+	return e.why.Error() + ", but its rollback mark could not be taken off: " + e.err.Error()
+}
+
+func (e *rollbackMarkStuckError) Unwrap() []error { return []error{e.why, e.err} }
+
+func (s *Server) patchRollbackMarkAway(ctx context.Context, rdName string) error {
+	markCtx, cancel := context.WithTimeout(ctx, markWriteBudget)
+	defer cancel()
+
+	return s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(markCtx, rdName, //nolint:wrapcheck // logged by the caller
+		func(rd *apiv1.ResourceDefinition) error {
+			delete(rd.Props, rollbackAbandonedKey)
+
+			return nil
+		})
+}
+
 // rollbackInProgress is the mark a rollback carries until it either completes,
 // taking the definition and the mark with it, or names the step it stopped at.
 // Read back, it is a rollback that never reported how it ended.
-const rollbackInProgress = "in-progress"
+const rollbackInProgress = store.RollbackInProgress
 
 // rollbackAbandonedKey marks a definition whose compensation gave up, with
 // the step it stopped at.
 //
-// The replay gate needs it. A rollback that stops after placement succeeded
-// on one node and failed on another leaves a definition holding fewer
-// replicas than the operation intended, and the 500 advising a manual delete
-// goes to a caller that retries under the same deterministic name long before
-// anyone reads it: the retry finds volumes and a live replica and would answer
-// 201 over it. Comparing the replicas with the snapshot's nodes cannot tell
-// that apart from a finished clone that was evacuated or scaled down since,
-// and the rollback is the one party that knows it gave up.
+// The replay gate needs it. A rollback runs over a definition that may
+// already hold volumes and a live replica: the RG-deleted rollback deletes a
+// finished one by design, and a failed materialisation's rollback deletes one
+// that does not read as finished yet. Cut short mid-cascade (its budget runs
+// out, the process is killed, a replica or a snapshot cannot be reaped), it
+// leaves a definition the 500 says to delete by hand, and that 500 goes to a
+// caller that retries under the same deterministic name long before anyone
+// reads it. The retry can find volumes and a live replica and would answer 201
+// over a definition the rollback was taking apart; the rollback is the one
+// party that knows it gave up.
 const rollbackAbandonedKey = store.RollbackAbandonedProp
 
 // markRollbackAbandoned records on the definition that its rollback started,
@@ -194,7 +465,7 @@ const rollbackAbandonedKey = store.RollbackAbandonedProp
 // resourceVersion a mark could otherwise spend the convergence waits the
 // cascade after it is budgeted for. A write abandoned at its deadline cannot
 // land later: every call it would still make runs on the expired context.
-func (s *Server) markRollbackAbandoned(ctx context.Context, rdName, step string) {
+func (s *Server) markRollbackAbandoned(ctx context.Context, rdName, step string) error {
 	markCtx, cancel := context.WithTimeout(ctx, markWriteBudget)
 	defer cancel()
 
@@ -218,7 +489,7 @@ func (s *Server) markRollbackAbandoned(ctx context.Context, rdName, step string)
 	select {
 	case err = <-done:
 	case <-markCtx.Done():
-		err = markCtx.Err()
+		err = errors.Wrapf(markCtx.Err(), "mark %q", rdName)
 	}
 
 	switch {
@@ -233,6 +504,8 @@ func (s *Server) markRollbackAbandoned(ctx context.Context, rdName, step string)
 		log.FromContext(ctx).Info("could not mark an abandoned rollback on its definition",
 			"resourceDefinition", rdName, "step", step, "reason", err.Error())
 	}
+
+	return err
 }
 
 // failedMaterialiseRefusal rolls back what a failed materialisation left, when
@@ -244,9 +517,18 @@ func (s *Server) markRollbackAbandoned(ctx context.Context, rdName, step string)
 // it. Only a failure materializeRestoredRD reports as after its own create is
 // rolled back; any other leaves whatever was there before the call, which may
 // belong to another attempt that is still running, and is never touched.
+//
+// wanted names the nodes the request asked for replicas on, when the caller
+// places them itself: a definition left because it already reads as finished
+// is not re-placed by a retry, so the replicas it never got are named with the
+// command that places them. A clone passes none, since linstor-csi reconciles
+// a clone's placement right after it reports complete.
 func (s *Server) failedMaterialiseRefusal(
-	ctx context.Context, message, noun, rdName string, placed []string, err error,
+	ctx context.Context, message, noun, rdName string, placed []string, scope rollbackScope,
+	wanted []string, err error,
 ) *apiv1.APICallRc {
+	message = scrubImplDetails(message)
+
 	var partial *materialiseAfterCreateError
 	if !errors.As(err, &partial) {
 		return &apiv1.APICallRc{RetCode: apiCallRcError, Message: message}
@@ -255,7 +537,38 @@ func (s *Server) failedMaterialiseRefusal(
 	rollbackCtx, cancel := detachedCompensation(ctx)
 	defer cancel()
 
-	rollbackErr := s.rollBackCompensating(rollbackCtx, rdName, placed)
+	rollbackErr := s.rollBackCompensating(rollbackCtx, rdName, placed, scope)
+	if errors.Is(rollbackErr, errRollbackAnswered) {
+		cause, correc := rollbackFailureAdvice(rollbackErr, rdName)
+
+		// A stuck mark's way out comes first; the replicas the request never
+		// got are still named after it, since the retry it leads to will
+		// not place them either.
+		var stuck *rollbackMarkStuckError
+		if short := s.answeredLeftShortCorrection(rollbackCtx, rdName, wanted, ""); short != "" {
+			if errors.As(rollbackErr, &stuck) {
+				correc += "; " + short
+			} else {
+				correc = short
+			}
+		}
+
+		return &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: message + "; '" + rdName + "' already reads as finished, so it was left in place",
+			Cause:   cause,
+			Correc:  correc,
+		}
+	}
+
+	if errors.Is(rollbackErr, errRollbackYielded) {
+		cause, correc := rollbackFailureAdvice(rollbackErr, rdName)
+		left := "; '" + rdName + "' was left in place, because a retry of this " + noun +
+			" marked it adopted and may have answered for it"
+
+		return &apiv1.APICallRc{RetCode: apiCallRcError, Message: message + left, Cause: cause, Correc: correc}
+	}
+
 	if rollbackErr != nil {
 		cause, correc := rollbackFailureAdvice(rollbackErr, rdName)
 
@@ -272,6 +585,30 @@ func (s *Server) failedMaterialiseRefusal(
 		RetCode: apiCallRcError,
 		Message: message + "; the partial " + noun + " '" + rdName + "' was rolled back",
 		Correc:  "retry the " + noun,
+	}
+}
+
+// answeredLeftShortCorrection is the correction for a definition the rollback
+// left because it already reads as finished, when the request asked for
+// replicas on wanted: a retry judges it finished too and places nothing, so a
+// replica that never landed is named with the command that places it. correc
+// is the answer when every one of them landed.
+func (s *Server) answeredLeftShortCorrection(ctx context.Context, rdName string, wanted []string, correc string) string {
+	if len(wanted) == 0 {
+		return correc
+	}
+
+	missing, err := store.MissingReplicas(ctx, s.Store, rdName, wanted)
+
+	switch {
+	case err != nil:
+		return "check which of the requested replicas of '" + rdName + "' exist, and place the rest " +
+			"with `linstor resource create <node> " + rdName + "`"
+	case len(missing) > 0:
+		return "'" + rdName + "' has no replica on " + strings.Join(missing, ", ") +
+			", which a retry will not place: run `linstor resource create <node> " + rdName + "` for each"
+	default:
+		return correc
 	}
 }
 
@@ -315,6 +652,9 @@ const (
 	rollbackStepSnapshots
 	rollbackStepDeleteDefinition
 	rollbackStepReadSnapshots
+	rollbackStepMark
+	rollbackStepReadAdoption
+	rollbackStepReadFinished
 )
 
 type rollbackStepError struct {
@@ -332,11 +672,14 @@ func newRollbackError(step rollbackStep, err error) error {
 
 // rollbackStepNames spells each step for the abandoned-rollback mark.
 var rollbackStepNames = map[rollbackStep]string{ //nolint:gochecknoglobals // a fixed table, read-only
-	rollbackStepReapReplicas:     "reap-replicas",
+	rollbackStepReapReplicas:     store.RollbackStepReapReplicas,
 	rollbackStepRereadReplicas:   "reread-replicas",
-	rollbackStepSnapshots:        "snapshots",
-	rollbackStepDeleteDefinition: "delete-definition",
-	rollbackStepReadSnapshots:    "read-snapshots",
+	rollbackStepSnapshots:        store.RollbackStepSnapshots,
+	rollbackStepDeleteDefinition: store.RollbackStepDeleteDefinition,
+	rollbackStepReadSnapshots:    store.RollbackStepReadSnapshots,
+	rollbackStepMark:             "mark",
+	rollbackStepReadAdoption:     "read-adoption",
+	rollbackStepReadFinished:     "read-finished",
 }
 
 // rollbackStepName spells the step a compensation stopped at, or "unknown".
@@ -360,9 +703,81 @@ func rollbackStepByName(name string) (rollbackStep, bool) {
 	return rollbackStepReapReplicas, false
 }
 
+// retryOrDeleteByHand is the correction for a rollback that deleted nothing.
+// The retry resumes the definition; the way out is named as well, since a mark
+// the rollback could not take back makes the replay gate refuse that retry.
+func retryOrDeleteByHand(rdName string) string {
+	return "retry: the retry resumes '" + rdName + "' or reports it finished; if the retry is " +
+		"refused over an abandoned rollback, delete '" + rdName + "' by hand"
+}
+
+// rollbackLeftNothingDeleted reports a rollback that, by design, deleted
+// nothing: it yielded to an adopting retry or could not hold the handshake.
+func rollbackLeftNothingDeleted(err error) bool {
+	if errors.Is(err, errRollbackYielded) || errors.Is(err, errRollbackAnswered) {
+		return true
+	}
+
+	var failure *rollbackStepError
+
+	return errors.As(err, &failure) &&
+		(failure.step == rollbackStepMark || failure.step == rollbackStepReadAdoption ||
+			failure.step == rollbackStepReadFinished)
+}
+
+// rollbackFailureAdviceOverDeletedGroup is rollbackFailureAdvice for the
+// doors whose rollback runs because the definition's group was deleted. A
+// rollback that deleted nothing there leaves a definition parented to a group
+// that is gone, and a plain retry meets the group refusal rather than a
+// resume, so the correction starts with the group.
+func rollbackFailureAdviceOverDeletedGroup(err error, rdName, rgName string) (string, string) {
+	cause, correc := rollbackFailureAdvice(err, rdName)
+	if !rollbackLeftNothingDeleted(err) {
+		return cause, correc
+	}
+
+	// The mark it could not take off refuses the retry the group's return
+	// would otherwise let through, so clearing it comes between the two.
+	var stuck *rollbackMarkStuckError
+	if errors.As(err, &stuck) {
+		return cause, "re-create resource group '" + rgName + "', " + clearRollbackMarkCommand(rdName) +
+			", then retry, which resumes '" + rdName + "'"
+	}
+
+	return cause, "re-create resource group '" + rgName + "' and retry, which resumes '" + rdName +
+		"'; or delete '" + rdName + "' by hand"
+}
+
 // rollbackFailureAdvice is the Cause and Correc for a failed compensation,
 // written for the step that failed rather than once for all of them.
 func rollbackFailureAdvice(err error, rdName string) (string, string) {
+	var stuck *rollbackMarkStuckError
+	if errors.As(err, &stuck) {
+		return "'" + rdName + "' was left in place, but the mark saying it is being rolled back " +
+				"could not be taken off, so every retry is refused over it",
+			clearRollbackMarkCommand(rdName) + ", then retry"
+	}
+
+	if errors.Is(err, errRollbackAnswered) {
+		return "'" + rdName + "' already held everything a retry or a status poll reads as " +
+				"finished when this attempt failed, so one of them may already have reported it " +
+				"complete, and it was left in place",
+			"retry, which answers for '" + rdName + "' as it stands"
+	}
+
+	if errors.Is(err, errRollbackMarkNotOurs) {
+		return "the rollback's mark on '" + rdName + "' was cleared or replaced before it took " +
+				"anything apart, so it may no longer be the definition the rollback set out to " +
+				"remove, and it was left in place",
+			retryOrDeleteByHand(rdName)
+	}
+
+	if errors.Is(err, errRollbackYielded) {
+		return "a retry of the same operation marked '" + rdName + "' adopted while this attempt " +
+				"failed, and may already have answered for it, so it was left in place",
+			retryOrDeleteByHand(rdName)
+	}
+
 	var failure *rollbackStepError
 	if !errors.As(err, &failure) {
 		return rollbackStepAdvice(rollbackStepReapReplicas, false, rdName)
@@ -388,15 +803,32 @@ func rollbackStepAdvice(step rollbackStep, known bool, rdName string) (string, s
 		return "a snapshot exists on the definition, and the rollback does not destroy " +
 				"a snapshot the way `rd d` refuses to",
 			"delete the snapshot(s) of '" + rdName + "' if they are not needed, then delete '" +
-				rdName + "' by hand"
+				rdName + "' by hand; or, since the rollback touched nothing, " +
+				clearRollbackMarkCommand(rdName) + " to keep it as it stands"
 	case rollbackStepReadSnapshots:
 		return "the snapshots of the definition could not be read, and the rollback does " +
 				"not delete a definition it cannot show has none",
 			"check whether '" + rdName + "' has snapshots (`linstor s l`), delete any that are " +
-				"not needed, then delete '" + rdName + "' by hand"
+				"not needed, then delete '" + rdName + "' by hand; or, since the rollback touched " +
+				"nothing, " + clearRollbackMarkCommand(rdName) + " to keep it as it stands"
 	case rollbackStepDeleteDefinition:
 		return "every replica went, but deleting the definition itself failed",
 			"delete '" + rdName + "' by hand"
+	case rollbackStepMark:
+		return "the rollback could not record that it started, so a retry of the same " +
+				"operation could not have seen it, and the definition was left in place " +
+				"rather than taken from under a retry that may have answered for it",
+			retryOrDeleteByHand(rdName)
+	case rollbackStepReadAdoption:
+		return "the rollback could not read whether a retry had adopted the definition, " +
+				"so it was left in place rather than taken from under one that may have " +
+				"answered for it",
+			retryOrDeleteByHand(rdName)
+	case rollbackStepReadFinished:
+		return "the rollback could not read the volumes and replicas of the definition to tell " +
+				"whether a retry or a status poll had already been told it is complete, so it was " +
+				"left in place rather than taken from under one that may have answered for it",
+			retryOrDeleteByHand(rdName)
 	case rollbackStepReapReplicas:
 	}
 
@@ -435,17 +867,11 @@ func rollbackStepAdvice(step rollbackStep, known bool, rdName string) (string, s
 // So this returns an error, and a caller that gets one must not report a
 // rollback. What is left behind is a definition parented to a group that is
 // gone, which is the state the operator has to be told about, with its name.
+//
+// The caller has already run the snapshot refusal and marked the definition
+// as being taken apart (enterDestructiveRollback); everything here deletes.
 func (s *Server) rollBackMaterialisedRD(ctx context.Context, rdName string, placed []string) error {
-	// Nothing is touched until the snapshot refusal has run, for the reason
-	// handleRDDelete gives for its own: once the replicas are reaped, a
-	// refused definition delete leaves the target half torn down, with its
-	// children going and its parent kept, which no retry reconciles. A refusal
-	// whose correction is "drop the snapshots and retry" has to arrive while
-	// there is still something to retry over.
-	err := s.refuseRollbackOverSnapshots(ctx, rdName)
-	if err != nil {
-		return err
-	}
+	var err error
 
 	// The replicas this request placed are deleted by name first. A write goes
 	// to the API server whatever the cache has seen, so this is the one step

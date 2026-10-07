@@ -404,13 +404,14 @@ func (s halfPlacingStore) Resources() store.ResourceStore {
 	return halfPlacingResources{ResourceStore: s.Store.Resources(), target: s.target}
 }
 
-// Placement succeeds on one node and fails on the other, the rollback gives up
-// on a conflict, and linstor-csi retries under the same name long before
-// anyone reads the 500. The leftover has its volumes and a live replica, so
-// the wholeness gate answered 201 "already cloned" over a clone with fewer
-// replicas than intended. The rollback records that it gave up, and the replay
-// refuses on that record.
-func TestRDCloneReplayRefusesALeftoverWhoseRollbackGaveUp(t *testing.T) {
+// Placement succeeds on one node and fails on the other, and linstor-csi
+// retries under the same name long before anyone reads the 500. The leftover
+// has its volumes and a live replica, which is what the replay and the status
+// poll answer as finished, and either may already have, while the second stamp
+// was still in flight. So the first attempt leaves it rather than rolling back
+// a clone somebody was told exists, leaves no mark that would refuse the
+// retry, and topping up the placement is the reconciliation's job.
+func TestRDCloneHalfPlacedByAFailedAttemptIsLeftForTheReplay(t *testing.T) {
 	t.Parallel()
 
 	backend := store.NewInMemory()
@@ -423,22 +424,36 @@ func TestRDCloneReplayRefusesALeftoverWhoseRollbackGaveUp(t *testing.T) {
 	_ = first.Body.Close()
 
 	if first.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("first attempt = %d, want 500: placement failed and the rollback gave up", first.StatusCode)
+		t.Fatalf("first attempt = %d, want 500: placement failed on node-b", first.StatusCode)
 	}
 
-	replicas, err := backend.Resources().ListByDefinition(t.Context(), "dst-half9")
+	assertHalfPlacedCloneLeftForTheReplay(t, backend, base, "src-half9", "dst-half9")
+}
+
+// assertHalfPlacedCloneLeftForTheReplay checks a clone whose second stamp
+// failed is still there with its one replica and no rollback mark, and that
+// the replay answers it finished.
+func assertHalfPlacedCloneLeftForTheReplay(t *testing.T, backend store.Store, base, src, dst string) {
+	t.Helper()
+
+	rd, err := backend.ResourceDefinitions().Get(t.Context(), dst)
+	if err != nil {
+		t.Fatalf("the half-placed clone was rolled back: %v", err)
+	}
+
+	if mark := rd.Props[store.RollbackAbandonedProp]; mark != "" {
+		t.Errorf("the half-placed clone carries rollback mark %q, which refuses every retry", mark)
+	}
+
+	replicas, err := backend.Resources().ListByDefinition(t.Context(), dst)
 	if err != nil || len(replicas) != 1 {
-		t.Fatalf("fixture: want the half-placed leftover with one replica, got %d (err=%v)", len(replicas), err)
+		t.Fatalf("want the one replica the first attempt placed, got %d (err=%v)", len(replicas), err)
 	}
 
-	retry := postClone(t, base, "src-half9", map[string]any{"name": "dst-half9", "use_zfs_clone": true})
+	retry := postClone(t, base, src, map[string]any{"name": dst, "use_zfs_clone": true})
 	defer func() { _ = retry.Body.Close() }()
 
-	if retry.StatusCode == http.StatusCreated {
-		t.Fatal("the retry answered 201 over a leftover whose rollback gave up half-placed")
-	}
-
-	if rc := decodeCloneMessage(t, retry); !strings.Contains(rc.Message, "rollback gave up") {
-		t.Errorf("refusal %q does not say an earlier rollback gave up", rc.Message)
+	if retry.StatusCode != http.StatusCreated {
+		t.Errorf("replay of the half-placed clone = %d, want 201", retry.StatusCode)
 	}
 }

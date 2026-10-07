@@ -238,9 +238,14 @@ func buildSpawnedRD(req *apiv1.ResourceGroupSpawn, rgName string, rg *apiv1.Reso
 		ResourceGroupName: rgName,
 	}
 
+	// The group's props come through laundered: the props blockstor reads
+	// back off a definition must not be inherited, or a group carrying one,
+	// which linstor-csi fills from StorageClass parameters verbatim, would
+	// mark every definition it spawns as restoring from another resource's
+	// snapshot.
 	if len(rg.Props) > 0 {
 		rd.Props = make(map[string]string, len(rg.Props))
-		maps.Copy(rd.Props, rg.Props)
+		maps.Copy(rd.Props, store.TravellingProps(rg.Props))
 	}
 
 	// Sticky LayerStack inheritance (Bug 54). Mirrors handleRDCreate's
