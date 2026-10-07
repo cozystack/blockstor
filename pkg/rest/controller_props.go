@@ -322,4 +322,5 @@ func applyControllerProps(ctx context.Context, c client.Client, modify *apiv1.Ge
 func applyControllerPropsModify(props map[string]string, modify *apiv1.GenericPropsModify) {
 	// I1: empty override value deletes the key (set-property KEY "").
 	applyPropsModify(props, modify.OverrideProps, modify.DeleteProps)
+	deletePropNamespaces(props, modify.DeleteNamespace)
 }

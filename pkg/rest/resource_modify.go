@@ -84,6 +84,9 @@ func (s *Server) handleResourceModify(w http.ResponseWriter, r *http.Request) {
 		// handleControllerPropsModify / handleNodeUpdate behaviour.
 		// I1: empty override value deletes the key (set-property KEY "").
 		applyPropsModify(res.Props, patch.OverrideProps, patch.DeleteProps)
+		// The body declares delete_namespaces; merging only the first two
+		// halves of the envelope answered 200 and changed nothing.
+		deletePropNamespaces(res.Props, patch.DeleteNamespace)
 
 		return nil
 	})

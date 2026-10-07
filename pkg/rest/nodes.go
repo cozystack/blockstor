@@ -945,11 +945,14 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0 {
+	// delete_namespaces alone is a props edit too: gated on the first two
+	// halves only, a namespaces-only body never reached the patch.
+	if len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0 || len(patch.DeleteNamespace) > 0 {
 		err = s.Store.Nodes().PatchProps(r.Context(), name, func(props map[string]string) error {
 			// I1: route through the shared core so an empty
 			// override value deletes the key (set-property KEY "").
 			applyPropsModify(props, patch.OverrideProps, patch.DeleteProps)
+			deletePropNamespaces(props, patch.DeleteNamespace)
 
 			return nil
 		})
