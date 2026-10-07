@@ -1433,6 +1433,18 @@ func (s *Server) abandonedRollbackRefusal(
 	}
 }
 
+// knownOrReadCloneSnapshot answers what the caller already read about the
+// internal snapshot, or reads it. ok is false when a refusal was written.
+func (s *Server) knownOrReadCloneSnapshot(
+	w http.ResponseWriter, r *http.Request, srcName, cloneName string, known *cloneSnapshotRead,
+) (apiv1.Snapshot, bool, bool) {
+	if known != nil {
+		return known.snap, known.found, true
+	}
+
+	return readCloneSnapshot(r.Context(), w, s.Store, srcName, cloneName)
+}
+
 // ensureCloneSnapshot takes (or reuses) the internal snapshot backing
 // a data-plane clone. Returns (snap, true) when the caller may
 // proceed; (nil, false) when a refusal envelope was already written.
@@ -1449,20 +1461,9 @@ func (s *Server) ensureCloneSnapshot(
 	ctx := r.Context()
 	snapName := cloneSnapshotName(cloneName)
 
-	var (
-		existing apiv1.Snapshot
-		found    bool
-	)
-
-	if known != nil {
-		existing, found = known.snap, known.found
-	} else {
-		var ok bool
-
-		existing, found, ok = readCloneSnapshot(ctx, w, s.Store, src.Name, cloneName)
-		if !ok {
-			return nil, false, false
-		}
+	existing, found, ok := s.knownOrReadCloneSnapshot(w, r, src.Name, cloneName, known)
+	if !ok {
+		return nil, false, false
 	}
 
 	if found {
@@ -1489,6 +1490,8 @@ func (s *Server) ensureCloneSnapshot(
 		return nil, false, false
 	}
 
+	stampCloneSnapshotOwner(&snap, cloneName)
+
 	snap.Snapshots = makeSnapshotPerNode(snapName, snap.Nodes, snap.VolumeDefinitions)
 
 	err = s.Store.Snapshots().Create(ctx, &snap)
@@ -1503,6 +1506,19 @@ func (s *Server) ensureCloneSnapshot(
 	}
 
 	return &snap, false, true
+}
+
+// stampCloneSnapshotOwner marks the snapshot as the clone's own, so deleting
+// the clone may reap it. A name cannot carry that: an operator can call a
+// snapshot `clone-<target>` and restore it under that target, and the marker a
+// restore writes is the one a clone writes. The hydration gives the snapshot
+// a copy of the source's props, so the stamp lands on the snapshot alone.
+func stampCloneSnapshotOwner(snap *apiv1.Snapshot, cloneName string) {
+	if snap.Props == nil {
+		snap.Props = map[string]string{}
+	}
+
+	snap.Props[store.CloneSnapshotOwnerProp] = cloneName
 }
 
 // cloneSourceIsNotBeingDeleted mirrors the snapshot-create Bug 180 gate: a
