@@ -21,10 +21,12 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"syscall"
 	"testing"
 	"time"
 
@@ -72,26 +74,55 @@ func startServerCustom(t *testing.T, srv *Server) (string, func()) {
 		})
 	}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Start(ctx) }()
+	// Readiness is this server's own OnReady, not a dial: the address comes
+	// from pickFreeAddr, which closes its probe listener before Start binds,
+	// and a parallel test can take the port in between. A dial then reaches
+	// that test's server, this one has already failed to bind, and every
+	// request is answered by a store that never heard of the fixture, which
+	// read as a 404 from the handler under test. A bind that loses the race
+	// is retried on a fresh port.
+	ownReady := srv.OnReady
 
-	dialer := &net.Dialer{Timeout: 200 * time.Millisecond}
-	deadline := time.Now().Add(5 * time.Second)
+	var (
+		cancel context.CancelFunc
+		errCh  chan error
+	)
 
-	for {
-		c, dErr := dialer.DialContext(ctx, "tcp", srv.Addr)
-		if dErr == nil {
-			_ = c.Close()
-			break
+	for attempt := 0; ; attempt++ {
+		ready := make(chan struct{})
+		srv.OnReady = func() {
+			if ownReady != nil {
+				ownReady()
+			}
+
+			close(ready)
 		}
 
-		if time.Now().After(deadline) {
+		var ctx context.Context
+
+		ctx, cancel = context.WithCancel(t.Context())
+		errCh = make(chan error, 1)
+
+		go func(ch chan<- error, ctx context.Context) { ch <- srv.Start(ctx) }(errCh, ctx)
+
+		select {
+		case <-ready:
+		case err := <-errCh:
 			cancel()
-			t.Fatalf("server never became reachable: %v", dErr)
+
+			if attempt < 5 && errors.Is(err, syscall.EADDRINUSE) {
+				srv.Addr = pickFreeAddr(t)
+
+				continue
+			}
+
+			t.Fatalf("server did not start: %v", err)
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatalf("server never became ready on %s", srv.Addr)
 		}
 
-		time.Sleep(50 * time.Millisecond)
+		break
 	}
 
 	stop := func() {
