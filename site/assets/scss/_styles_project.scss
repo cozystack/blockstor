@@ -88,3 +88,23 @@
   max-width: 36rem;
   height: auto;
 }
+
+// Docsy sets data-bs-theme on <html>; the white CNCF logo replaces the colour
+// one on the dark background.
+.cncf-logo--light {
+  display: block;
+}
+
+.cncf-logo--dark {
+  display: none;
+}
+
+[data-bs-theme="dark"] {
+  .cncf-logo--light {
+    display: none;
+  }
+
+  .cncf-logo--dark {
+    display: block;
+  }
+}
