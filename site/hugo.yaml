@@ -45,9 +45,7 @@ menu:
 
 params:
   description: A Kubernetes control plane for LVM and ZFS storage with DRBD replication.
-  copyright:
-    authors: The Blockstor Authors
-    from_year: 2026
+  copyright: Cozystack a Series of LF Projects, LLC
   github_repo: https://github.com/cozystack/blockstor
   github_subdir: site
   github_branch: main
