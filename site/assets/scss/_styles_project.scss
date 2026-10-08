@@ -1,0 +1,113 @@
+// The logo is the full wordmark, so the site name next to it is dropped.
+.navbar-brand__name {
+  display: none;
+}
+
+.navbar-brand__logo svg {
+  height: 1.75rem;
+  width: auto;
+}
+
+// The replication figure on the cover. It sits on the primary background, so
+// it is drawn in light strokes in both themes.
+.replicas {
+  margin: 1rem auto 2rem;
+  max-width: 30rem;
+
+  svg {
+    display: block;
+    width: 100%;
+    font-family: $font-family-monospace;
+  }
+
+  text {
+    fill: #fff;
+    font-size: 13px;
+  }
+
+  .sub {
+    fill: rgba(255, 255, 255, 0.7);
+    font-size: 12px;
+  }
+
+  .crd rect {
+    fill: rgba(255, 255, 255, 0.08);
+    stroke: #fff;
+    stroke-width: 1.5;
+  }
+
+  .node > rect:first-child {
+    fill: rgba(255, 255, 255, 0.06);
+    stroke: rgba(255, 255, 255, 0.35);
+    stroke-width: 1.5;
+  }
+
+  .blk {
+    fill: #93a4ff;
+  }
+
+  .links path {
+    fill: none;
+    stroke: rgba(255, 255, 255, 0.6);
+    stroke-width: 1.5;
+  }
+
+  .sync path {
+    fill: none;
+    stroke: #93a4ff;
+    stroke-width: 2;
+    stroke-dasharray: 4 4;
+  }
+
+  figcaption {
+    margin-top: 1rem;
+    color: rgba(255, 255, 255, 0.75);
+    font-size: 0.95rem;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .replicas .sync path {
+    animation: replicas-sync 1.6s linear infinite;
+  }
+}
+
+@keyframes replicas-sync {
+  to {
+    stroke-dashoffset: -16;
+  }
+}
+
+.cncf-block .container {
+  padding-top: 4rem;
+  padding-bottom: 3rem;
+}
+
+.cncf-logo {
+  width: 50%;
+  max-width: 36rem;
+  height: auto;
+}
+
+// Docsy sets data-bs-theme on <html>; the white CNCF logo replaces the colour
+// one on the dark background.
+.cncf-logo--light {
+  display: block;
+}
+
+.cncf-logo--dark {
+  display: none;
+}
+
+[data-bs-theme="dark"] {
+  .cncf-logo--light {
+    display: none;
+  }
+
+  .cncf-logo--dark {
+    display: block;
+  }
+}
+
+// Code blocks follow the light and dark theme (needs highlight.noClasses: false).
+@import "td/code-dark";
