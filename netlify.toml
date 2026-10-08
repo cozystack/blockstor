@@ -1,0 +1,21 @@
+# Netlify builds deploy previews of the blockstor.org site for pull
+# requests. Production is GitHub Pages (.github/workflows/pages.yml).
+#
+# The site is plain static files under site/, so there is no build command:
+# Netlify publishes the directory as it is.
+
+[build]
+  base = "site"
+  publish = "."
+  # Skip the preview when nothing under site/ or this file changed. The
+  # command runs from the base directory and exit 0 skips the build, so a
+  # missing or identical cached ref forces one.
+  ignore = '''
+    if [ -z "$CACHED_COMMIT_REF" ] || [ "$CACHED_COMMIT_REF" = "$COMMIT_REF" ]; then exit 1; fi
+    git diff --quiet "$CACHED_COMMIT_REF" "$COMMIT_REF" -- . ../netlify.toml
+  '''
+
+[[redirects]]
+  from = "/*"
+  to = "/404.html"
+  status = 404
