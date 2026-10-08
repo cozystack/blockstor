@@ -1,0 +1,9 @@
+// The logo is the full wordmark, so the site name next to it is dropped.
+.navbar-brand__name {
+  display: none;
+}
+
+.navbar-brand__logo svg {
+  height: 1.75rem;
+  width: auto;
+}
