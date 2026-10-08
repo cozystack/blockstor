@@ -1,118 +1,78 @@
 ---
 title: "Layer stack"
+linkTitle: "Layer stack"
 weight: 50
-description: "DRBD, LUKS and STORAGE compositions."
+description: "Combine replication, encryption and plain local storage."
 ---
 
-<!-- Copied from docs/layer-stack.md in the repository; keep the two in sync until it moves here. -->
+Each volume is built from layers. The bottom layer allocates space on the node, and each layer above adds something on top of the one below. The topmost layer is the device the pod uses.
 
-blockstor mirrors LINSTOR's `layer_list` model: a `ResourceDefinition`
-declares an ordered chain of layers, each adding capabilities on top
-of the layer below. The satellite walks the chain bottom-up when
-provisioning and top-down when tearing down.
+| Layer | What it does |
+|---|---|
+| `STORAGE` | Allocates the block device: an LVM or LVM-thin logical volume, a ZFS zvol, or a file. Every stack ends with it. |
+| `LUKS` | Encrypts the device below it with `cryptsetup`. |
+| `DRBD` | Replicates the device to the other nodes over the network. |
 
-## Layers
+## Supported stacks
 
-| Layer     | What it does                                                          |
-|-----------|-----------------------------------------------------------------------|
-| `STORAGE` | Allocates the raw block device (LVM-thin LV, ZFS volume, loopfile, …) |
-| `LUKS`    | `cryptsetup luksFormat` + `luksOpen` over the storage device          |
-| `DRBD`    | Renders `.res` and runs `drbdadm` to replicate over the network       |
+| Stack | Use it for |
+|---|---|
+| `DRBD`, `STORAGE` | Replicated volumes. This is the default. |
+| `DRBD`, `LUKS`, `STORAGE` | Replicated and encrypted at rest. Each replica encrypts its own copy. |
+| `LUKS`, `STORAGE` | Encrypted volume with a single replica and no DRBD. |
+| `STORAGE` | Plain local volume with a single replica, for caches and scratch space. |
 
-The first entry in `layerStack` is the topmost layer the consumer Pod
-mounts. The last entry is always `STORAGE` (the storage layer is
-required — every replica needs a backing device, even diskless ones
-where it's the network leg).
+These four are the only orders blockstor accepts. Other orders, such as LUKS on top of DRBD, are refused when the definition is created.
 
-## Common compositions
+## Choosing the stack
 
-| Stack                       | Use case                                                            |
-|-----------------------------|---------------------------------------------------------------------|
-| `["DRBD","STORAGE"]`        | Default. Replicated PVC, the cozystack production case.             |
-| `["LUKS","STORAGE"]`        | Single-replica encrypted PVC. No DRBD overhead.                     |
-| `["DRBD","LUKS","STORAGE"]` | Encrypted at-rest + replicated. Per-volume cipher.                  |
-| `["STORAGE"]`               | Single-replica local mode. Ephemeral cache, scratch, ZFS dataset.   |
+A definition takes its stack from its own `layerStack`, then from its resource group's `selectFilter.layerStack`. If neither is set, it gets `DRBD`, `STORAGE`.
 
-The default is `["DRBD","STORAGE"]` — when `RD.Spec.LayerStack` is
-empty the controller inherits from the parent
-`ResourceGroup.Spec.SelectFilter.LayerStack`, and when both are empty
-the dispatcher falls through to the satellite's default-DRBD path.
+Set it on a group, so every volume spawned from it gets the same stack:
 
-## Setting the stack
-
-### Per-RD via REST
-
-```bash
-curl -XPOST http://controller:3370/v1/resource-definitions \
-  -H 'Content-Type: application/json' \
-  -d '{"resource_definition":{"name":"pvc-1","layer_stack":["LUKS","STORAGE"]}}'
+```sh
+blockstor resource-group create local --place-count 1 --storage-pool data --layer-list storage
+blockstor volume-group create local
+blockstor resource-group spawn local scratch-1 20G
 ```
 
-### Per-RG via spawn template
-
-```bash
-linstor rg create encrypted-rg
-linstor rg sp encrypted-rg DrbdOptions/Encryption/passphrase '<32-byte-secret>'
-linstor rg c --place-count 2 encrypted-rg
-linstor rg spawn encrypted-rg pvc-2 1G --layer-list LUKS DRBD
-```
-
-(blockstor accepts `linstor`'s `--layer-list` flag verbatim because
-the REST shape mirrors upstream LINSTOR.)
-
-### Per-RD via kubectl
+Or on one definition, in YAML:
 
 ```yaml
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
-metadata: {name: pvc-encrypted}
+metadata:
+  name: scratch-1
 spec:
-  layerStack: ["LUKS", "STORAGE"]
-  props:
-    DrbdOptions/Encryption/passphrase: "32-byte-secret"
+  layerStack: ["STORAGE"]
   volumeDefinitions:
-    - {volumeNumber: 0, sizeKib: 1048576}
+    - volumeNumber: 0
+      sizeKib: 20971520
 ```
 
-## LUKS specifics
+Treat the stack as fixed once a volume has replicas. Changing `layerStack` later does not encrypt or decrypt data that is already there.
 
-- Passphrase is per-RD via `DrbdOptions/Encryption/passphrase`. The
-  upstream `linstor rd set-property` key.
-- The dispatcher folds the resolver-resolved passphrase onto the wire
-  as `DesiredResource.Props["LuksPassphrase"]`; the satellite reads it
-  from there.
-- Empty passphrase with `LUKS` in the stack fails the apply rather
-  than silently producing an unencrypted volume.
-- Mapper name: `<rd>-<vol>-luks` → `/dev/mapper/<rd>-<vol>-luks`. Stable
-  across reconciles so reopen on satellite restart re-uses it.
-- Volume grow: the satellite runs `cryptsetup resize` on the mapper
-  after the storage layer has resized the underlying LV, before DRBD
-  resizes the replicated device.
+## Encryption
 
-## What blockstor doesn't yet support
+LUKS volumes are opened with the cluster passphrase, which lives in a Secret in `blockstor-system`. Create it once, before the first encrypted volume:
 
-- **Pluggable layer ordering**: the stack must be one of the four
-  rows in the table above. Arbitrary orderings (e.g. `["LUKS","DRBD","STORAGE"]`
-  with LUKS-over-DRBD instead of DRBD-over-LUKS) aren't yet validated
-  or rendered.
-- **Per-volume LUKS keys**: every volume on a 2-volume RD currently
-  uses the same RD-level passphrase. Per-volume keys (with master-key
-  wrapping in the controller's KV store) is a follow-up.
-- **Mid-stack changes**: editing `layerStack` after a Resource is
-  active doesn't re-encrypt or unwrap existing data. Treat it as
-  set-once-per-RD until migration support lands.
-- **Cluster-passphrase rotation**: the cluster passphrase
-  (`POST /v1/encryption/passphrase`) wraps RD passphrases in the
-  controller's KV store; rotating it doesn't re-encrypt LUKS headers.
-  Rotating the per-RD passphrase requires `cryptsetup luksChangeKey`
-  which isn't wired yet — operators should drop the RD and recreate.
+```sh
+blockstor encryption create-passphrase '<passphrase>'
+```
 
-## Testing
+Keep a copy of the passphrase somewhere safe. Without it, encrypted volumes cannot be opened. Running the command again with the same passphrase is a no-op, and blockstor refuses to replace it with a different one, because that would lock every existing encrypted volume. A definition with `LUKS` in its stack and no passphrase available is refused rather than created unencrypted.
 
-- `pkg/api/v1/layer_stack_test.go` — RD → RG → default resolution.
-- `pkg/satellite/reconciler_drbd_test.go::TestApplySkipsDRBDWhenLayerStackOmits`
-  — `["STORAGE"]` produces no `.res` and no drbdadm.
-- `pkg/satellite/reconciler_drbd_test.go::TestApplyLayersLUKS` — pin
-  cryptsetup luksFormat + luksOpen run on first activation.
-- `pkg/satellite/reconciler_drbd_test.go::TestApplyLUKSFailsWithoutPassphrase`
-  — pin the explicit-error path.
+Then create volumes with LUKS in the stack:
+
+```sh
+blockstor resource-group create secure --place-count 2 --storage-pool data --layer-list drbd,luks,storage
+blockstor volume-group create secure
+blockstor resource-group spawn secure secret-volume 10G
+```
+
+Growing an encrypted volume resizes every layer in order: the storage below, then LUKS, then DRBD.
+
+Limits today:
+
+- All volumes of a definition share one key.
+- Changing the passphrase of existing volumes is not supported. To re-key a volume, create a new one and move the data.
