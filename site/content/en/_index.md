@@ -2,10 +2,18 @@
 title: Blockstor
 ---
 
-{{< blocks/cover title="Blockstor" image_anchor="top" height="med" color="primary" >}}
-<p class="lead mt-4">A Kubernetes control plane for LVM and ZFS storage with DRBD replication.</p>
+{{< blocks/cover image_anchor="top" height="auto" color="primary" >}}
+<div class="row align-items-center text-start cover-hero">
+<div class="col-lg-6">
+<h1 class="display-1 mt-0 mt-md-5 pb-4">Blockstor</h1>
+<p class="lead">A Kubernetes control plane for LVM and ZFS storage with DRBD replication.</p>
 <a class="btn btn-lg btn-light me-3 mb-4" href="docs/getting-started/">Get started <i class="fa-solid fa-arrow-right ms-2"></i></a>
 <a class="btn btn-lg btn-outline-light me-3 mb-4" href="https://github.com/cozystack/blockstor">GitHub <i class="fa-brands fa-github ms-2"></i></a>
+</div>
+<div class="col-lg-6">
+{{< replicas >}}
+</div>
+</div>
 {{< /blocks/cover >}}
 
 {{% blocks/lead color="white" %}}
