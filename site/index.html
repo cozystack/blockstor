@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blockstor: Kubernetes-native block storage with DRBD replication</title>
+<meta name="description" content="Blockstor is a Kubernetes control plane for LVM and ZFS storage with DRBD replication. It speaks a LINSTOR-compatible REST API, so linstor-csi, piraeus-operator and the linstor CLI keep working unchanged.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="img/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="./" aria-label="Blockstor home">
+      <img class="logo logo-light" src="img/blockstor-logo-black.svg" alt="Blockstor" width="160" height="30">
+      <img class="logo logo-dark" src="img/blockstor-logo-white.svg" alt="Blockstor" width="160" height="30">
+    </a>
+    <nav aria-label="Primary">
+      <a href="#why">Why</a>
+      <a href="#status">Status</a>
+      <a href="#start">Get started</a>
+      <a href="https://github.com/cozystack/blockstor">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <h1>A Kubernetes control plane for LVM and ZFS storage with DRBD replication.</h1>
+        <p class="lede">Blockstor speaks a LINSTOR-compatible REST API, so the clients you already use keep working unchanged: <code>linstor-csi</code>, <code>piraeus-operator</code>, <code>ha-controller</code>, <code>golinstor</code> and the <code>linstor</code> CLI.</p>
+        <p>The difference is underneath. Desired state lives in CRDs, and a set of <code>controller-runtime</code> reconcilers drive the cluster toward it. There is no external database to back up, no in-memory state to lose on restart, and no controller-to-node polling to fall behind.</p>
+        <div class="actions">
+          <a class="btn btn-primary" href="#start">Get started</a>
+          <a class="btn" href="https://github.com/cozystack/blockstor">View on GitHub</a>
+        </div>
+      </div>
+
+      <figure class="replicas" aria-labelledby="replicas-caption">
+        <svg viewBox="0 0 360 300" role="img" aria-labelledby="replicas-title">
+          <title id="replicas-title">One resource definition in the Kubernetes API, reconciled into three DRBD replicas on three nodes</title>
+          <g class="crd">
+            <rect x="96" y="8" width="168" height="44" rx="4"/>
+            <text x="180" y="35" text-anchor="middle">ResourceDefinition</text>
+          </g>
+          <g class="links">
+            <path d="M180 52 V80 H60 V108"/>
+            <path d="M180 52 V108"/>
+            <path d="M180 80 H300 V108"/>
+          </g>
+          <g class="node">
+            <rect x="12" y="108" width="96" height="176" rx="4"/>
+            <text x="60" y="130" text-anchor="middle">node-1</text>
+            <rect class="blk" x="28" y="144" width="64" height="28"/>
+            <rect class="blk" x="28" y="178" width="64" height="28"/>
+            <rect class="blk" x="28" y="212" width="64" height="28"/>
+            <text class="sub" x="60" y="268" text-anchor="middle">satellite</text>
+          </g>
+          <g class="node">
+            <rect x="132" y="108" width="96" height="176" rx="4"/>
+            <text x="180" y="130" text-anchor="middle">node-2</text>
+            <rect class="blk" x="148" y="144" width="64" height="28"/>
+            <rect class="blk" x="148" y="178" width="64" height="28"/>
+            <rect class="blk" x="148" y="212" width="64" height="28"/>
+            <text class="sub" x="180" y="268" text-anchor="middle">satellite</text>
+          </g>
+          <g class="node">
+            <rect x="252" y="108" width="96" height="176" rx="4"/>
+            <text x="300" y="130" text-anchor="middle">node-3</text>
+            <rect class="blk" x="268" y="144" width="64" height="28"/>
+            <rect class="blk" x="268" y="178" width="64" height="28"/>
+            <rect class="blk" x="268" y="212" width="64" height="28"/>
+            <text class="sub" x="300" y="268" text-anchor="middle">satellite</text>
+          </g>
+          <g class="sync">
+            <path d="M92 192 H148"/>
+            <path d="M212 192 H268"/>
+          </g>
+        </svg>
+        <figcaption id="replicas-caption">Each satellite watches its own slice of the CRDs and writes what it observes back through Status, while DRBD keeps the replicas in sync.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="why" class="band">
+    <div class="wrap">
+      <h2>Why blockstor</h2>
+      <div class="why-grid">
+        <article>
+          <h3>Kubernetes-native architecture</h3>
+          <dl>
+            <dt>Reconciliation control plane</dt>
+            <dd>The state of truth lives in Kubernetes CRDs. The controller and the satellites are <code>controller-runtime</code> managers with watch-based informers, declarative reconcile loops and Status written by Server-Side Apply. Desired and observed state converge on their own.</dd>
+            <dt>First-class CRDs</dt>
+            <dd><code>Resource</code>, <code>ResourceDefinition</code>, <code>ResourceGroup</code>, <code>StoragePool</code>, <code>Snapshot</code>, <code>Node</code> and <code>PhysicalDevice</code> are meant to be read, and where it makes sense written, by other operators: tenant operators, GitOps tooling, monitoring and admission webhooks.</dd>
+            <dt>Per-node satellite as a controller</dt>
+            <dd>Each satellite watches the CRDs for its own node and reports what it observes through Status. There is no gRPC dispatch from a central controller.</dd>
+          </dl>
+        </article>
+        <article>
+          <h3>Ecosystem fit</h3>
+          <dl>
+            <dt>Built in Go</dt>
+            <dd>Go is what the apiserver, the kubelet, etcd, most CSI drivers and <code>controller-runtime</code> are written in, so blockstor shares their tooling, libraries and contributors.</dd>
+          </dl>
+        </article>
+        <article>
+          <h3>Small footprint</h3>
+          <dl>
+            <dt>No runtime to ship</dt>
+            <dd>The controller, the apiserver and the satellite are statically linked Go binaries, with no JVM, and DRBD is a Linux kernel module rather than a userspace daemon. The images are multi-arch, <code>linux/amd64</code> and <code>linux/arm64</code>, so blockstor fits on edge and small ARM nodes.</dd>
+          </dl>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section id="status">
+    <div class="wrap">
+      <h2>Status</h2>
+      <div class="status-grid">
+        <div class="status works">
+          <h3>Works today</h3>
+          <ul>
+            <li>Replicated volumes over DRBD, on LVM, LVM-thin, ZFS, ZFS-thin or file backends</li>
+            <li>Running without DRBD: plain local storage, single-replica diskful or diskless</li>
+            <li>LUKS encryption: volume-level encryption at rest</li>
+            <li>Autoplacement with constraints: zones, node properties, replicas on different nodes</li>
+            <li>TieBreaker and quorum policies</li>
+            <li>Snapshots: create, restore as a new resource, roll back, and clone</li>
+            <li>Intra-cluster snapshot shipping (<code>zfs send</code>/<code>recv</code>, <code>thin-send-recv</code>) for clone and add-replica</li>
+            <li>Online volume resize</li>
+            <li>Device-pool creation from physical disks (<code>physical-storage create-device-pool</code>)</li>
+            <li>A LINSTOR-compatible REST API for the whole client ecosystem, served over mTLS</li>
+          </ul>
+        </div>
+        <div class="status missing">
+          <h3>Not implemented</h3>
+          <p class="note">The API answers these with <code>501 Not Implemented</code>.</p>
+          <ul>
+            <li>Cross-cluster snapshot shipping (disaster recovery)</li>
+            <li>Backup create, restore, ship and abort, and the backup queue</li>
+            <li>Schedules (cron-driven backups)</li>
+            <li>Remote backends: S3, LINSTOR remotes</li>
+            <li>Extra storage providers: SPDK, NVMe-oF, OpenFlex, Exos</li>
+          </ul>
+        </div>
+        <div class="status planned">
+          <h3>On the roadmap</h3>
+          <ul>
+            <li>Bring-your-own-key encryption: operator-managed Secret references in the spec, instead of a controller-owned passphrase bag</li>
+            <li>A migration tool from LINSTOR that adopts an existing LINSTOR cluster's resources into blockstor in place</li>
+            <li><a href="https://github.com/oVirt/vdsm/blob/master/doc/thin-provisioning.md">Shared-LUN provisioning</a>: thick LVM plus thin qcow2-on-LVM, no filesystem layer</li>
+            <li><a href="https://blog.deckhouse.io/lvm-qcow-csi-driver-shared-san-kubernetes-81455201590e">VDUSE backend</a> via <code>qemu-storage-daemon</code>, for shared-SAN Kubernetes</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="start" class="band">
+    <div class="wrap start-grid">
+      <div>
+        <h2>Get started</h2>
+        <p>Blockstor installs onto an existing cluster and is driven with the standard <code>linstor</code> client and piraeus <code>linstor-csi</code>. The usage guide walks through installing the control plane, registering nodes and pools, and wiring up CSI.</p>
+        <p><a class="btn btn-primary" href="https://github.com/cozystack/blockstor/blob/main/docs/usage.md">Read the usage guide</a></p>
+      </div>
+      <div>
+        <h3>Images</h3>
+        <p>The three images are published to GHCR on every release.</p>
+        <ul class="images">
+          <li><code>ghcr.io/cozystack/blockstor-controller</code><span>the reconcilers</span></li>
+          <li><code>ghcr.io/cozystack/blockstor-apiserver</code><span>the LINSTOR-compatible REST API, over mTLS</span></li>
+          <li><code>ghcr.io/cozystack/blockstor-satellite</code><span>the per-node DRBD and storage agent</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="docs">
+    <div class="wrap">
+      <h2>Documentation</h2>
+      <ul class="docs">
+        <li><a href="https://github.com/cozystack/blockstor/blob/main/docs/usage.md">Usage</a><span>Install and operate blockstor with the <code>linstor</code> client and piraeus <code>linstor-csi</code>.</span></li>
+        <li><a href="https://github.com/cozystack/blockstor/blob/main/docs/architecture.md">Architecture</a><span>The load-bearing design decisions.</span></li>
+        <li><a href="https://github.com/cozystack/blockstor/blob/main/docs/layer-stack.md">Layer stack</a><span>DRBD, LUKS and STORAGE compositions.</span></li>
+        <li><a href="https://github.com/cozystack/blockstor/blob/main/AGENTS.md">Contributing</a><span>Repository layout and the local Talos and QEMU dev stand.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="thanks" class="band">
+    <div class="wrap narrow">
+      <h2>Acknowledgements</h2>
+      <p>Blockstor was inspired by LINBIT's <a href="https://linbit.com/linstor/">LINSTOR</a>, and it operates <a href="https://linbit.com/drbd/">DRBD</a> to provide block-level replication. It deliberately speaks LINSTOR's API so that the ecosystem the LINSTOR community has built keeps working unchanged. Heartfelt thanks to LINBIT and to the wider DRBD, LINSTOR and Piraeus community.</p>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <p>Blockstor is licensed under <a href="https://github.com/cozystack/blockstor/blob/main/LICENSE">Apache 2.0</a>. The code is provided as-is with no warranties. Third-party Go modules and their licenses are listed in <a href="https://github.com/cozystack/blockstor/blob/main/THIRD_PARTY_LICENSES.md">THIRD_PARTY_LICENSES.md</a>.</p>
+    <p>LINSTOR, LINBIT and DRBD are trademarks or registered trademarks of LINBIT. Blockstor is an independent project and is not affiliated with, endorsed by, or sponsored by LINBIT.</p>
+  </div>
+</footer>
+</body>
+</html>
