@@ -108,3 +108,6 @@
     display: block;
   }
 }
+
+// Code blocks follow the light and dark theme (needs highlight.noClasses: false).
+@import "td/code-dark";

@@ -34,7 +34,9 @@ markup:
     renderer:
       unsafe: true
   highlight:
-    style: friendly
+    # Classes instead of inline colours, so the stylesheet can switch the
+    # palette with the light and dark theme.
+    noClasses: false
 
 menu:
   main:
