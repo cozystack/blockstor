@@ -38,40 +38,6 @@ The controller, the apiserver and the satellite are statically linked Go binarie
 
 {{% /blocks/section %}}
 
-{{% blocks/section color="white" type="row" %}}
-
-{{% blocks/feature icon="fa-solid fa-check" title="Works today" %}}
-- Replicated volumes over DRBD, on LVM, LVM-thin, ZFS, ZFS-thin or file backends
-- Running without DRBD: plain local storage, single-replica diskful or diskless
-- LUKS encryption: volume-level encryption at rest
-- Autoplacement with constraints: zones, node properties, replicas on different nodes
-- TieBreaker and quorum policies
-- Snapshots: create, restore as a new resource, roll back, and clone
-- Intra-cluster snapshot shipping (`zfs send`/`recv`, `thin-send-recv`) for clone and add-replica
-- Online volume resize
-- Device-pool creation from physical disks (`physical-storage create-device-pool`)
-- A LINSTOR-compatible REST API for the whole client ecosystem, served over mTLS
-{{% /blocks/feature %}}
-
-{{% blocks/feature icon="fa-solid fa-xmark" title="Not implemented" %}}
-The API answers these with `501 Not Implemented`.
-
-- Cross-cluster snapshot shipping (disaster recovery)
-- Backup create, restore, ship and abort, and the backup queue
-- Schedules (cron-driven backups)
-- Remote backends: S3, LINSTOR remotes
-- Extra storage providers: SPDK, NVMe-oF, OpenFlex, Exos
-{{% /blocks/feature %}}
-
-{{% blocks/feature icon="fa-solid fa-road" title="On the roadmap" %}}
-- Bring-your-own-key encryption: operator-managed Secret references in the spec, instead of a controller-owned passphrase bag
-- A migration tool from LINSTOR that adopts an existing LINSTOR cluster's resources into blockstor in place
-- [Shared-LUN provisioning](https://github.com/oVirt/vdsm/blob/master/doc/thin-provisioning.md): thick LVM plus thin qcow2-on-LVM, no filesystem layer
-- [VDUSE backend](https://blog.deckhouse.io/lvm-qcow-csi-driver-shared-san-kubernetes-81455201590e) via `qemu-storage-daemon`, for shared-SAN Kubernetes
-{{% /blocks/feature %}}
-
-{{% /blocks/section %}}
-
 {{< cncf >}}
 
 {{% blocks/section color="light" %}}
