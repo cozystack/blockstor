@@ -1,12 +1,13 @@
 # Netlify builds deploy previews of the blockstor.org site for pull
 # requests. Production is GitHub Pages (.github/workflows/pages.yml).
 #
-# The site is plain static files under site/, so there is no build command:
-# Netlify publishes the directory as it is.
+# The site is Hugo with the Docsy theme under site/; base moves the build
+# there, so every path below is relative to site/.
 
 [build]
   base = "site"
-  publish = "."
+  publish = "public"
+  command = "npm install && hugo --gc --minify"
   # Skip the preview when nothing under site/ or this file changed. The
   # command runs from the base directory and exit 0 skips the build, so a
   # missing or identical cached ref forces one.
@@ -14,6 +15,21 @@
     if [ -z "$CACHED_COMMIT_REF" ] || [ "$CACHED_COMMIT_REF" = "$COMMIT_REF" ]; then exit 1; fi
     git diff --quiet "$CACHED_COMMIT_REF" "$COMMIT_REF" -- . ../netlify.toml
   '''
+
+[build.environment]
+  HUGO_VERSION = "0.164.0"
+  HUGO_EXTENDED = "true"
+  NODE_VERSION = "22"
+  GO_VERSION = "1.23"
+
+[context.production.environment]
+  HUGO_ENV = "production"
+
+[context.deploy-preview]
+  command = "npm install && hugo --gc --minify -b $DEPLOY_PRIME_URL"
+
+[context.branch-deploy]
+  command = "npm install && hugo --gc --minify -b $DEPLOY_PRIME_URL"
 
 [[redirects]]
   from = "/*"
