@@ -52,6 +52,10 @@ params:
   github_subdir: site
   github_branch: main
   offlineSearch: true
+  # Diagrams on the docs pages. Pinned so a new Mermaid release cannot
+  # change how they render without a review.
+  mermaid:
+    version: 11.4.1
   prism_syntax_highlighting: false
   ui:
     navbar_logo: true

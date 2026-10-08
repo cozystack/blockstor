@@ -1,209 +1,144 @@
 ---
 title: "Architecture"
-weight: 40
-description: "The load-bearing design decisions."
+linkTitle: "Architecture"
+weight: 30
+description: "How blockstor turns a volume request into replicas on disk."
 ---
 
-<!-- Copied from docs/architecture.md in the repository; keep the two in sync until it moves here. -->
+Blockstor is built like a Kubernetes operator. The desired state of every node, pool and volume is a custom resource, and controllers keep working until the cluster matches it. Nothing important lives only in a process's memory, so any blockstor pod can restart without losing state.
 
-This document captures load-bearing invariants the codebase relies
-on. It is NOT a tour of the code — for that, follow the call graph
-from `cmd/controller/main.go` and `cmd/satellite/main.go`
-(satellite). The pieces below are the rules whose violation would
-quietly corrupt cluster state.
+## Components
 
-## Spec / Status discipline
+```mermaid
+flowchart TB
+    subgraph clients["Clients"]
+        csi["linstor-csi"]
+        other["piraeus-operator, ha-controller, golinstor"]
+        cli["blockstor CLI"]
+    end
 
-A blockstor CRD has two halves:
+    subgraph k8s["Kubernetes API"]
+        crds[("blockstor custom resources")]
+    end
 
-* **Spec** is _desired state_. Operators, REST handlers, and the
-  controller's own placement logic write here. The satellite
-  **never writes Spec**.
-* **Status** is _observed state_. The satellite (and the
-  controller's allocators that derive values from Spec) write here.
-  The user-facing REST API never writes Status — it returns it
-  read-only.
+    subgraph cp["blockstor-system"]
+        api["blockstor-apiserver<br/>LINSTOR-compatible REST, mTLS"]
+        ctrl["blockstor-controller<br/>placement and allocation"]
+    end
 
-The rule:
+    subgraph nodes["Storage nodes"]
+        sat1["satellite on node 1"]
+        sat2["satellite on node 2"]
+        sat3["satellite on node 3"]
+    end
 
-> Anything the satellite reads from the kernel (`drbdsetup events2`,
-> `drbdadm status`, `lvs`, …) lives on **Status**. Anything the
-> operator or controller asks the satellite to do lives on **Spec**.
-
-A naive whole-object `Update` is unsafe whenever both halves are
-written by different actors — a Spec mutation in flight would
-clobber a concurrent Status write and vice versa. Status writes
-**must** go through the Status subresource (`Status().Update()`);
-Spec writes use the regular `Update()` path.
-
-This rule is enforced by code review for now; with Phase 10.2
-landed, the satellite-side reconciler's writes naturally route
-through Status only, making the invariant mechanical.
-
-### Field placement cheatsheet
-
-| Field | Half | Rationale |
-|---|---|---|
-| `Resource.Spec.NodeName` | Spec | Operator-chosen placement target. |
-| `Resource.Spec.Flags` | Spec | DISKLESS / TIE_BREAKER are operator-controlled. |
-| `Resource.Spec.StoragePool` | Spec | Allocator output written by controller. |
-| `Resource.Spec.Volumes[i].SeedFromGi` | Spec | Controller-picked DRBD GI to stamp on first activation. |
-| `Resource.Status.InUse` | Status | Reflects `drbdsetup status` role. |
-| `Resource.Status.DrbdState` | Status | Reflects `events2` connection state. |
-| `Resource.Status.DRBDPort` / `DRBDMinor` / `DRBDNodeID` | Status | Allocator-derived; immutable per replica once set. |
-| `Resource.Status.Volumes[i].DiskState` | Status | Per-volume kernel state. |
-| `Resource.Status.Volumes[i].CurrentGi` | Status | DRBD generation identifier observed by the satellite. |
-| `Node.Status.ConnectionStatus` | Status | Set on Hello — reflects whether the satellite has dialled in. |
-
-A field that fits neither half (rare — typically a transient
-debounce hint) lives in an annotation, not Spec or Status.
-
-### Multi-writer Status (server-side apply)
-
-Some Status fields are written by **both** the controller (e.g.
-allocator output → `DRBDPort`) and the satellite (e.g.
-`DiskState`, `CurrentGi`). A regular `.Status().Update()` from
-either side rewrites the **whole** Status subresource, which can
-clobber the other side's writes that landed between Get and
-Update.
-
-Phase 10.2 routed those writes through Kubernetes Server-Side
-Apply with distinct field managers (`blockstor-controller`,
-`blockstor-satellite`) so each side only touches the fields it
-owns. See `pkg/store/k8s/resources.go` `SetState` for the
-satellite-side writer; the controller-side writer lives in
-`internal/controller`.
-
-## Hierarchy resolver
-
-DRBD configuration follows an upstream-LINSTOR-shaped override
-chain:
-
-```
-Controller → ResourceGroup → ResourceDefinition → Resource
-   (broadest)                                      (narrowest)
+    csi -->|REST| api
+    other -->|REST| api
+    cli -->|kubeconfig| crds
+    api <--> crds
+    ctrl <--> crds
+    crds <--> sat1
+    crds <--> sat2
+    crds <--> sat3
 ```
 
-Lower scopes override higher scopes per non-nil field. The typed
-implementation lives in `pkg/drbd/typed_resolver.go`
-(`ResolveDRBDOptions`); the legacy string-keyed implementation
-(`ResolveOptions`) is still used as a fallback for any
-`Spec.Props` data not yet migrated to the typed `DRBDOptions`
-struct. See `internal/controller/resource_controller.go`'s
-`resolveEffectiveProps` for the merge.
+- **blockstor-apiserver** serves the LINSTOR REST API over mutual TLS. It does not keep state of its own: every request becomes a read or a write of custom resources. It runs as several replicas behind one Service.
+- **blockstor-controller** watches the custom resources and fills in what users do not choose: which nodes get replicas, the DRBD port, minor numbers and node IDs, and tiebreakers and quorum settings.
+- **blockstor-satellite** runs on every storage node. It creates the logical volumes or zvols, sets up LUKS and DRBD, and reports what it sees back into the custom resources.
+- **The `blockstor` CLI** reads and writes the custom resources directly with your kubeconfig, without going through the REST API.
 
-`*int32` and `*bool` use nil-vs-set discipline:
+There is no direct connection between the controller and the satellites. Everything goes through the Kubernetes API.
 
-* `nil` means "not overridden at this scope, inherit from parent".
-* Any non-nil value (including the zero value) means "explicitly
-  set, do not inherit".
+## Custom resources are the source of truth
 
-A regression that did `if *src.X { out.X = src.X }` would silently
-drop explicit-`false` overrides, e.g. an RD that intentionally
-sets `AllowTwoPrimaries=false` would inherit a parent RG's `true`.
-The pinning tests for this are in `pkg/drbd/typed_resolver_test.go`.
+Every object you know from LINSTOR is a cluster-scoped custom resource in the `blockstor.cozystack.io` group:
 
-## Wire format vs CRD storage
+```mermaid
+flowchart LR
+    RG["ResourceGroup<br/>policy: place count, pool, layers"]
+    RD["ResourceDefinition<br/>one volume set, its size and layers"]
+    R1["Resource<br/>replica on node 1"]
+    R2["Resource<br/>replica on node 2"]
+    R3["Resource<br/>tiebreaker on node 3"]
+    SP["StoragePool<br/>per node"]
+    N["Node"]
+    S["Snapshot"]
 
-Two shapes coexist in the codebase:
+    RG --> RD
+    RD --> R1
+    RD --> R2
+    RD --> R3
+    R1 -. lives in .-> SP
+    SP -. on .-> N
+    RD --> S
+```
 
-1. **Wire shape** — `pkg/api/v1` types, identical to upstream
-   LINSTOR's REST API. golinstor and external callers see this
-   verbatim. Property bags live as `props map[string]string`.
-2. **CRD shape** — `api/v1alpha1` types, the typed structures
-   blockstor persists in Kubernetes. DRBD configuration lives in
-   `Spec.DRBDOptions` (typed) + `Spec.ExtraProps` (forward-compat
-   for keys we haven't typed yet).
+Each resource has two halves:
 
-The k8s store (`pkg/store/k8s/`) is the boundary. Its
-`drbd_transcode.go` parses the wire `props` bag into typed CRD
-fields on Create/Update; the inverse direction re-emits typed
-fields back into `props` on GET so golinstor sees the unchanged
-shape. Unknown DrbdOptions/* keys round-trip through ExtraProps
-without loss.
+- **spec** is what you, the controller or the API asked for.
+- **status** is what the satellites observed: disk states, connection states, free capacity.
 
-## DRBD initial-sync skip
+A satellite never changes a spec, and the API never writes a status. Because the state is ordinary Kubernetes objects, you can read it with `kubectl get resources`, back it up with your usual tools, and drive it from GitOps.
 
-Adding a third replica to a 2-replica resource without
-intervention would trigger a full resync of the entire backing
-device — hours on multi-TiB volumes. The skip pipeline (Phase
-8.1):
+## How a volume is created
 
-1. Satellite's `events2` observer parses `current-uuid` from
-   each device frame and surfaces it in Status as
-   `Resource.Status.Volumes[i].CurrentGi`.
-2. Controller's `ensureSeedFromGi` picks the lowest-named
-   UpToDate peer's CurrentGi when allocating a new replica and
-   stamps it on the new replica's `Spec.Volumes[i].SeedFromGi`.
-3. Dispatcher threads SeedFromGi through the satellite gRPC
-   contract (`DesiredVolume.seed_from_gi`).
-4. Satellite reconciler's `applyDRBD` runs
+This is the path from a PersistentVolumeClaim to replicas on disk:
 
-   ```
-   drbdmeta --force <res>/<vol> v09 <device> internal set-gi <gi>:<gi>:0:0
-   ```
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PVC as PVC
+    participant CSI as linstor-csi
+    participant API as blockstor-apiserver
+    participant K as Kubernetes API
+    participant C as blockstor-controller
+    participant S as satellites
 
-   between `drbdadm create-md` and `drbdadm adjust` on first
-   activation. With matching `current_uuid`+`bitmap_uuid` the
-   GI handshake on first connect sees the new peer as
-   already-in-sync and skips the full sync.
+    PVC->>CSI: provision a volume
+    CSI->>API: create the resource definition and place it
+    API->>K: write ResourceDefinition and Resources
+    K-->>C: change seen
+    C->>K: pick nodes, allocate DRBD port, minors and node IDs, add a tiebreaker
+    K-->>S: each satellite sees the Resources for its node
+    S->>S: create LV or zvol, set up LUKS and DRBD
+    S->>K: report disk and connection state
+    API-->>CSI: volume is ready
+    CSI-->>PVC: bound, device /dev/drbdN
+```
 
-The pipeline is end-to-end gated by
-`tests/e2e/replica-add-no-resync.sh`.
+## Each satellite watches only its own node
 
-## Controllers and reconcilers
+A satellite reacts only to the resources assigned to its node: replicas and pools whose node name is its own. Adding nodes adds satellites, and none of them has to talk to a central process.
 
-Controller-side reconcilers (`internal/controller/`) — primary
-CRD owners:
+```mermaid
+flowchart LR
+    subgraph K["Kubernetes API"]
+        r1["Resource pvc-1 on node-1"]
+        r2["Resource pvc-1 on node-2"]
+        r3["Resource pvc-2 on node-1"]
+    end
+    s1["satellite node-1"]
+    s2["satellite node-2"]
+    r1 --> s1
+    r3 --> s1
+    r2 --> s2
+```
 
-* `ResourceReconciler` (`resource_controller.go`, ~1245 LOC) —
-  Resource CRDs. Allocates DRBD node-id / port / minor; picks
-  SeedFromGi; promotes DISKLESS to diskful when actively used;
-  writes desired-state to the CRD for the satellite to pick up.
-* `ResourceDefinitionReconciler`
-  (`resourcedefinition_controller.go`, ~917 LOC) — RD CRDs.
-  Auto-creates `DISKLESS+TIE_BREAKER` witnesses when an RD has
-  even diskful replicas; sets the resource-level quorum policy.
-* `NodeReconciler` (`node_controller.go`, ~239 LOC) — Node
-  CRDs. Owns the Node bookkeeping that the heartbeat watchdog
-  (Phase 10.6) relies on.
-* `ResourceGroupReconciler` (`resourcegroup_controller.go`,
-  ~132 LOC), `StoragePoolReconciler`
-  (`storagepool_controller.go`, ~68 LOC),
-  `SnapshotReconciler` (`snapshot_controller.go`, ~60 LOC) —
-  smaller reconcilers that own CRD-level invariants for their
-  kind. The bulk of placement / capacity / snapshot-ship logic
-  lives in the dispatcher + satellite controllers below.
+## Layers on a node
 
-Sibling controllers in the same package handle cross-cutting
-concerns:
+Every replica is a stack of layers. The satellite builds it from the bottom up when it creates a replica and takes it apart from the top down when it removes one.
 
-* `node_heartbeat_controller.go` (~243 LOC) — Phase 10.6
-  heartbeat watchdog; flips Node `ConnectionStatus` to OFFLINE
-  when satellites stop refreshing their lease.
-* `node_label_sync_controller.go` (~326 LOC) — propagates
-  selected k8s Node labels to the blockstor Node CRD.
-* `auto_diskful_controller.go` (~493 LOC) — DISKLESS → diskful
-  promotion when a resource is actively used.
-* `auto_evict_controller.go` (~452 LOC) — evicts replicas from
-  unhealthy / drained nodes.
-* `autosnapshot_controller.go` (~536 LOC) — periodic snapshot
-  scheduling per RG/RD policy.
-* `rg_rebalance_controller.go` (~539 LOC) — rebalances RG
-  membership / spawns shortfall replicas.
-* `resource_migration_controller.go` (~217 LOC) — migrates a
-  Resource between nodes.
+```mermaid
+flowchart TB
+    pod["Pod sees /dev/drbdN"]
+    drbd["DRBD: replication to the other nodes"]
+    luks["LUKS: encryption at rest, optional"]
+    storage["STORAGE: LVM LV, LVM-thin LV, zvol or file"]
+    pod --> drbd --> luks --> storage
+```
 
-Satellite-side reconcilers live in `pkg/satellite/controllers/`
-and watch the apiserver directly via controller-runtime (Phase
-10.1). They drive DRBD / LUKS / STORAGE layers and write
-observed state back via Status SSA.
+The default stack is DRBD on top of STORAGE. See [Layer stack](../layer-stack/) for the other combinations.
 
-Phase 10.1 lifted the satellite's gRPC-driven reconciler logic
-into those `pkg/satellite/controllers/` reconcilers. That
-change retired `pkg/satellitecontroller/`, but `pkg/dispatcher/`
-is still live: it provides the CRD → DesiredResource translator
-(resolves layer_stack, options, passphrases) and is imported by
-the satellite-side reconciler at
-`pkg/satellite/controllers/resource.go` (and exercised by
-`pkg/dispatcher/dispatcher_test.go`).
+## Replicas, tiebreakers and quorum
+
+With an even number of data replicas, the controller adds a diskless tiebreaker on another node, so DRBD always has a majority to decide which side keeps writing after a network split. A replica without a disk can also serve I/O over the network to a pod on a node that holds no copy of the data.
