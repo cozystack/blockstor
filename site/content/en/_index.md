@@ -72,6 +72,8 @@ The API answers these with `501 Not Implemented`.
 
 {{% /blocks/section %}}
 
+{{< cncf >}}
+
 {{% blocks/section color="light" %}}
 ## Acknowledgements {.text-center}
 
