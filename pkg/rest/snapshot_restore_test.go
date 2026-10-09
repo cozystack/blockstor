@@ -19,6 +19,7 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -1104,5 +1105,141 @@ func TestSnapshotRestoreVolumeDefinitionConflict_G3b(t *testing.T) {
 
 	if got.SizeKib != 2048*1024 {
 		t.Errorf("target VD 0 size: got %d, want untouched 2048 MiB", got.SizeKib)
+	}
+}
+
+// volumeListLags hides the target's volumes from List, the way a pre-check's
+// list taken a moment before a concurrent restore wrote them does.
+type volumeListLags struct {
+	store.VolumeDefinitionStore
+
+	target string
+}
+
+func (v volumeListLags) List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error) {
+	if rdName == v.target {
+		return nil, nil
+	}
+
+	return v.VolumeDefinitionStore.List(ctx, rdName) //nolint:wrapcheck // pass-through test double
+}
+
+type volumeListLagsStore struct {
+	store.Store
+
+	target string
+}
+
+func (s volumeListLagsStore) VolumeDefinitions() store.VolumeDefinitionStore {
+	return volumeListLags{VolumeDefinitionStore: s.Store.VolumeDefinitions(), target: s.target}
+}
+
+// A volume that appeared between the volume-definition restore's collision
+// check and its create is refused even at the snapshot's size, as on main. A
+// concurrent CLI restore of the same snapshot that wrote it can still fail on
+// a later volume and unwind it, so a 200 over it reports a layout about to go.
+func TestSnapshotRestoreVolumeDefinitionRefusesAVolumeThatAppearedAtTheSnapshotsSize(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src-race"}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name: "snap-race", ResourceName: "pvc-src-race",
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 1024 * 1024}},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-tgt-race"}); err != nil {
+		t.Fatalf("seed target RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-tgt-race",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+		t.Fatalf("seed the volume the concurrent restore wrote: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, volumeListLagsStore{Store: st, target: "pvc-tgt-race"})
+	defer stop()
+
+	body, _ := json.Marshal(snapshotRestoreRequest{ToResource: "pvc-tgt-race"})
+
+	resp := httpPost(t,
+		base+"/v1/resource-definitions/pvc-src-race/snapshot-restore-volume-definition/snap-race", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil || len(rcs) == 0 {
+		t.Fatalf("decode the answer (status %d): %v", resp.StatusCode, err)
+	}
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("volume-definition restore over a volume another restore wrote = %d, want 409", resp.StatusCode)
+	}
+
+	for _, rc := range rcs {
+		if rc.RetCode&apiCallRcFailExistsVlmDfn == apiCallRcFailExistsVlmDfn {
+			t.Errorf("refusal ret_code %#x carries the FAIL_EXISTS_VLM_DFN band, which reads as already restored", rc.RetCode)
+		}
+	}
+}
+
+// The volume-definition restore refuses a definition another restore has
+// marked as its own, before writing anything: that restore's rollback would
+// take the definition with the volumes this answered 200 for.
+func TestSnapshotRestoreVolumeDefinitionRefusesATargetUnderARestoreMarker(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src-mk"}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name: "snap-mk", ResourceName: "pvc-src-mk",
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 1024 * 1024}},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "pvc-tgt-mk", Props: map[string]string{restoreFromSnapshotKey: restoreMarker("pvc-src-mk", "snap-mk")},
+	}); err != nil {
+		t.Fatalf("seed the marked target: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(snapshotRestoreRequest{ToResource: "pvc-tgt-mk"})
+
+	resp := httpPost(t,
+		base+"/v1/resource-definitions/pvc-src-mk/snapshot-restore-volume-definition/snap-mk", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil || len(rcs) == 0 {
+		t.Fatalf("decode the answer (status %d): %v", resp.StatusCode, err)
+	}
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("volume-definition restore into a marked target = %d, want 409", resp.StatusCode)
+	}
+
+	for _, rc := range rcs {
+		if rc.RetCode&(apiCallRcFailExistsRscDfn|apiCallRcFailExistsVlmDfn) != 0 {
+			t.Errorf("refusal ret_code %#x carries a FAIL_EXISTS band", rc.RetCode)
+		}
+	}
+
+	if vds, _ := st.VolumeDefinitions().List(ctx, "pvc-tgt-mk"); len(vds) != 0 {
+		t.Errorf("the refused restore wrote %d volume(s)", len(vds))
 	}
 }

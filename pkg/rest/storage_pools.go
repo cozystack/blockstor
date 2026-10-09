@@ -119,15 +119,7 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 		// behaviour — the namespace separator is '/' and the prefix
 		// is matched literally (no glob). An entry "Aux" drops every
 		// "Aux/..." key.
-		for _, ns := range patch.DeleteNamespace {
-			prefix := ns + "/"
-
-			for k := range sp.Props {
-				if strings.HasPrefix(k, prefix) {
-					delete(sp.Props, k)
-				}
-			}
-		}
+		deletePropNamespaces(sp.Props, patch.DeleteNamespace)
 
 		return nil
 	})

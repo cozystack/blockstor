@@ -5,8 +5,6 @@ package rest
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,10 +13,9 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// Every door stamps a group, so the grouped branch of the abandoned-rollback
-// gate is the mainline one, and the round-9 fixture reached only the
-// ungrouped branch.
-func TestRDCloneReplayRefusesAGroupedLeftoverWhoseRollbackGaveUp(t *testing.T) {
+// Every door stamps a group, so the grouped leftover is the mainline one, and
+// the round-9 fixture reached only the ungrouped branch.
+func TestRDCloneGroupedHalfPlacedByAFailedAttemptIsLeftForTheReplay(t *testing.T) {
 	t.Parallel()
 
 	backend := store.NewInMemory()
@@ -45,24 +42,15 @@ func TestRDCloneReplayRefusesAGroupedLeftoverWhoseRollbackGaveUp(t *testing.T) {
 	_ = first.Body.Close()
 
 	if first.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("first attempt = %d, want 500: placement failed and the rollback gave up", first.StatusCode)
+		t.Fatalf("first attempt = %d, want 500: placement failed on node-b", first.StatusCode)
 	}
 
 	leftover, err := backend.ResourceDefinitions().Get(t.Context(), "dst-half10")
 	if err != nil || leftover.ResourceGroupName != "grp-half10" {
-		t.Fatalf("fixture: want a grouped leftover, got group %q (err=%v)", leftover.ResourceGroupName, err)
+		t.Fatalf("want the grouped leftover left in place, got group %q (err=%v)", leftover.ResourceGroupName, err)
 	}
 
-	retry := postClone(t, base, "src-half10", map[string]any{"name": "dst-half10", "use_zfs_clone": true})
-	defer func() { _ = retry.Body.Close() }()
-
-	if retry.StatusCode == http.StatusCreated {
-		t.Fatal("the retry answered 201 over a grouped leftover whose rollback gave up half-placed")
-	}
-
-	if rc := decodeCloneMessage(t, retry); !strings.Contains(rc.Message, "rollback gave up") {
-		t.Errorf("refusal %q does not say an earlier rollback gave up", rc.Message)
-	}
+	assertHalfPlacedCloneLeftForTheReplay(t, backend, base, "src-half10", "dst-half10")
 }
 
 // deadlineResources blocks a replica delete until its context ends, the way a
@@ -115,7 +103,7 @@ func TestAnAbandonedRollbackIsMarkedEvenWhenItsBudgetRunsOut(t *testing.T) {
 	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 300*time.Millisecond)
 	defer cancel()
 
-	if err := s.rollBackCompensating(rollbackCtx, "dst-budget10", []string{"node-a"}); err == nil {
+	if err := s.rollBackCompensating(rollbackCtx, "dst-budget10", []string{"node-a"}, rollbackEvenIfFinished); err == nil {
 		t.Fatal("fixture: the rollback was supposed to run out of budget")
 	}
 
@@ -128,8 +116,7 @@ func TestAnAbandonedRollbackIsMarkedEvenWhenItsBudgetRunsOut(t *testing.T) {
 		t.Fatal("a rollback that ran out of budget mid-cascade left no mark, so the replay would answer 201 over it")
 	}
 
-	w := httptest.NewRecorder()
-	if !(&Server{Store: backend}).cloneRollbackWasAbandoned(ctx, w, "src", "dst-budget10") {
+	if _, refusal := (&Server{Store: backend}).abandonedRollbackRefusal(ctx, "clone", "dst-budget10"); refusal == nil {
 		t.Error("the replay gate did not refuse over the mark")
 	}
 }
@@ -188,7 +175,7 @@ func TestTheRollbackRunsOnWhatIsLeftOfTheDoorsBudget(t *testing.T) {
 
 	doorDeadline, _ := doorCtx.Deadline()
 
-	_ = s.rollBackCompensating(doorCtx, "dst-chain10", nil)
+	_ = s.rollBackCompensating(doorCtx, "dst-chain10", nil, rollbackEvenIfFinished)
 
 	if seen.IsZero() {
 		t.Fatal("fixture: the rollback's context carried no deadline at all")

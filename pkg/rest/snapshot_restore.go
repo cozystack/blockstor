@@ -20,6 +20,7 @@ package rest
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -113,10 +114,28 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 		return
 	}
 
-	_, err = s.Store.ResourceDefinitions().Get(r.Context(), req.ToResource)
+	target, err := s.Store.ResourceDefinitions().Get(r.Context(), req.ToResource)
 	if err != nil {
 		writeStoreError(w, err)
 
+		return
+	}
+
+	// A target carrying DELETE is refused, as on the sibling handlers:
+	// hydrating volumes into it races the tear-down reaping what it writes.
+	if slices.Contains(target.Flags, rdFlagDelete) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + req.ToResource + "' is being deleted",
+			Cause: "the target carries the DELETE flag; the volumes this would hydrate " +
+				"are being reaped as it writes them",
+			Correc: "wait for the delete to finish, then restore into a fresh definition",
+		}})
+
+		return
+	}
+
+	if !s.refuseVolumeRestoreIntoMarkedTarget(r.Context(), w, req.ToResource) {
 		return
 	}
 
@@ -133,7 +152,7 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 		return
 	}
 
-	err = hydrateVolumesFromSnapshot(r.Context(), s, req.ToResource, &snap)
+	err = hydrateVolumesFromSnapshot(r.Context(), s, req.ToResource, &snap, false)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -145,6 +164,35 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 		Message: "snapshot volume definitions restored: " +
 			snapName + " → " + req.ToResource,
 	}})
+}
+
+// refuseVolumeRestoreIntoMarkedTarget refuses a volume-definition restore into
+// a definition another restore or clone has marked as its own, as the CLI
+// does: that operation hydrates the volumes itself, and its rollback, if it
+// fails, takes the definition with whatever this answered 200 for. The marker
+// goes on with the definition, and is read past the cache. False means a
+// refusal has been written.
+func (s *Server) refuseVolumeRestoreIntoMarkedTarget(ctx context.Context, w http.ResponseWriter, toResource string) bool {
+	live, err := s.Store.ResourceDefinitions().GetUncached(ctx, toResource)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	marker := live.Props[restoreFromSnapshotKey]
+	if marker == "" {
+		return true
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: "resource definition '" + toResource + "' is the target of a restore or clone",
+		Cause:   "it carries the restore marker '" + marker + "', and that operation writes its volumes itself",
+		Correc:  "restore it with `linstor snapshot resource restore` instead",
+	}})
+
+	return false
 }
 
 // refuseRestoreOnVolumeConflict is the G3b pre-mutation guard for the
@@ -255,6 +303,10 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.rebindRestoreTarget(r.Context(), w, &req) {
+		return
+	}
+
 	snapName := resolveSnapshotName(r, &req)
 	if snapName == "" {
 		writeError(w, http.StatusBadRequest, "snapshot name required (URL path, from_snapshot, or snapshot_name)")
@@ -266,10 +318,8 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// snapshot POSTs the restore right after the snapshot create;
 	// absorb informer-cache lag on the source-snapshot read instead
 	// of 404-ing the restore.
-	snap, err := getSnapshotWithCacheRetry(r.Context(), s.Store, srcRD, snapName)
-	if err != nil {
-		writeStoreError(w, err)
-
+	snap, ok := s.restoreSnapshotOrReplay(r.Context(), w, srcRD, snapName, &req)
+	if !ok {
 		return
 	}
 
@@ -315,9 +365,186 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// target is left an empty shell for the operator / linstor-csi to
 	// place (restore-then-scale-out); an explicit node list is still
 	// stamped verbatim inside materializeRestoredRD.
-	made, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false)
+	// A leftover from an earlier attempt is resumed, not reported done:
+	// the marker is stamped with the definition, before its volumes and
+	// replicas exist, so on its own it says a restore started, not that it
+	// finished.
+	prepared, stop := s.adoptPreparedRestoreTarget(r.Context(), w, &snap, req.ToResource)
+	if stop {
+		return
+	}
+
+	resume, stop := s.restoreReplayState(r.Context(), w, &snap, &req, prepared)
+	if stop {
+		return
+	}
+
+	// A target the caller prepared is this restore's first run, not a retry.
+	s.materializeRestore(r.Context(), w, srcRD, &req, &snap, resume && !prepared)
+}
+
+// rebindRestoreTarget names the restore's target as it is stored; see
+// storedDefinitionName. False means a refusal has been written.
+func (s *Server) rebindRestoreTarget(ctx context.Context, w http.ResponseWriter, req *snapshotRestoreRequest) bool {
+	stored, err := s.storedDefinitionName(ctx, req.ToResource)
 	if err != nil {
-		s.writeRestoreMaterialiseFailed(r.Context(), w, snapName, req.ToResource, made, err)
+		writeRestoreTargetUnreadable(w, req.ToResource, err)
+
+		return false
+	}
+
+	req.ToResource = stored
+
+	return true
+}
+
+// writeRestoreTargetUnreadable refuses a restore whose target could not be
+// read. Read as absent, the create that follows collides with what is there
+// and is adopted past every judgement of a leftover (finished, torn down,
+// parented to a group that is gone), so a replay of a finished restore
+// re-placed it on a node the operator had emptied; the retry this answer asks
+// for gets the judgement.
+func writeRestoreTargetUnreadable(w http.ResponseWriter, toResource string, err error) {
+	writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: "restore target '" + toResource + "' could not be read: " + scrubImplDetails(err.Error()),
+		Correc:  "retry the restore",
+	}})
+}
+
+// adoptPreparedRestoreTarget takes a definition the caller prepared for this
+// restore as its target: created empty, its volume definitions restored from
+// this snapshot, no replica yet. That is how LINSTOR's own restore sequence
+// runs, and how linstor-csi restores every volume from a snapshot; see
+// store.PreparedRestoreTarget. The marker is stamped on it here, so from then
+// on the target reads as this restore's own, its first run and every retry
+// alike. It returns (adopted, stop).
+func (s *Server) adoptPreparedRestoreTarget(
+	ctx context.Context, w http.ResponseWriter, snap *apiv1.Snapshot, toResource string,
+) (bool, bool) {
+	// Past the cache, like every read this path decides on: the caller
+	// created this definition one call earlier, possibly through another
+	// apiserver replica, and a cache that holds an older copy under the name
+	// (deleted and recreated, or patched since) answers the marker wrong.
+	existing, err := s.Store.ResourceDefinitions().GetUncached(ctx, toResource)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, false
+	}
+
+	if err != nil {
+		writeRestoreTargetUnreadable(w, toResource, err)
+
+		return false, true
+	}
+
+	prepared, err := store.PreparedRestoreTarget(ctx, s.Store, &existing, snap)
+	if err != nil {
+		writePreparedTargetRefusal(w, existing.Name, snap, err)
+
+		return false, true
+	}
+
+	if !prepared {
+		return false, false
+	}
+
+	// Everything that can still refuse this target runs before the marker
+	// goes on it: the definition is the caller's, and a refusal after the
+	// stamp would leave it looking like a restore that started.
+	if !s.restoreTargetGroupSurvived(ctx, w, &existing) {
+		return false, true
+	}
+
+	adopted, err := store.AdoptPreparedRestoreTarget(ctx, s.Store, existing.Name, snap)
+	if errors.Is(err, store.ErrRestoreTargetTaken) {
+		// Another restore marked it first; restoreTargetState refuses it
+		// as somebody else's, with the wording that already says why.
+		return false, false
+	}
+
+	if err != nil {
+		writePreparedTargetRefusal(w, existing.Name, snap, err)
+
+		return false, true
+	}
+
+	// Not adopted with no error: another request for this same restore
+	// marked it first, so it is that request's leftover, judged by the
+	// replay gate like any other.
+	return adopted, false
+}
+
+// writePreparedTargetRefusal answers a target that is prepared in every
+// respect but one that makes restoring into it wrong; see
+// store.PreparedRestoreTarget. Anything else is the store error it is.
+func writePreparedTargetRefusal(w http.ResponseWriter, rdName string, snap *apiv1.Snapshot, err error) {
+	switch {
+	case errors.Is(err, store.ErrRestoreTargetLayers):
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + rdName + "' cannot take the restore of '" +
+				snap.Name + "': " + scrubImplDetails(err.Error()),
+			Cause: "the restore puts the source's data under the target's layer stack, so a " +
+				"layer the source did not have writes its own metadata across it, and one it " +
+				"had is missing on read",
+			Correc: "create '" + rdName + "' with the layer stack of '" + snap.ResourceName +
+				"' (for linstor-csi, a StorageClass with the same layer list), or restore under " +
+				"a name that does not exist yet",
+		}})
+	case errors.Is(err, store.ErrRestoreTargetTearingDown):
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + rdName + "' still has replicas being deleted",
+			Cause:   "placing the restore over them would race the tear-down reaping them",
+			Correc:  "wait for the replicas of '" + rdName + "' to go, then re-issue the restore",
+		}})
+	default:
+		writeStoreError(w, err)
+	}
+}
+
+// restoreTargetGroupSurvived refuses an existing target parented to a group
+// that is gone, before the restore writes anything into it: a prepared target
+// before it is marked, a leftover before it is resumed. The post-write guard
+// would otherwise refuse the same target after the write, and it does not
+// roll back a definition this request did not create.
+func (s *Server) restoreTargetGroupSurvived(
+	ctx context.Context, w http.ResponseWriter, existing *apiv1.ResourceDefinition,
+) bool {
+	survived, err := s.parentRGSurvived(ctx, existing.ResourceGroupName)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "resource definition '" + existing.Name + "' exists, but its resource group '" +
+				existing.ResourceGroupName + "' could not be read: " + scrubImplDetails(err.Error()),
+			Correc: "retry the restore",
+		}})
+
+		return false
+	}
+
+	if survived {
+		return true
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{
+		*adoptedOverDeletedGroupRefusal("restore", existing.Name, existing.ResourceGroupName,
+			correcRecreateGroupThenRestore),
+	})
+
+	return false
+}
+
+// materializeRestore restores the target, guards the group it was written
+// with and answers. resume says whether this request is finishing a leftover,
+// which only the wording sees.
+func (s *Server) materializeRestore(
+	ctx context.Context, w http.ResponseWriter, srcRD string, req *snapshotRestoreRequest,
+	snap *apiv1.Snapshot, resume bool,
+) {
+	made, err := s.materializeRestoredRD(ctx, srcRD, req, snap, false, nil)
+	if err != nil {
+		s.writeRestoreMaterialiseFailed(ctx, w, snap.Name, req, made, err)
 
 		return
 	}
@@ -325,34 +552,346 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// The group validated is the one that was WRITTEN, not the source's read
 	// back a second time: re-reading answers a different question, and the
 	// extra read was itself a way to fail a restore that had already worked.
-	uncheckedRG, ok := s.restoreParentRGSurvived(r.Context(), w, made)
+	uncheckedRG, ok := s.restoreParentRGSurvived(ctx, w, made)
 	if !ok {
 		return
 	}
 
-	writeRestoreDone(w, "snapshot restored: "+snapName+" → "+made.Name, uncheckedRG)
+	writeRestoreDone(w, restoreDoneMessage(resume, snap.Name, made.Name), uncheckedRG)
 }
 
 // writeRestoreMaterialiseFailed answers a restore whose materialisation failed.
 //
-// A failure after the create is this request's own partial work, and this
-// endpoint has no idempotent-replay gate: left in place, the marker-bearing
-// definition turns every retry under the deterministic CSI target name into
-// AlreadyExists, for good. So that work is rolled back before the answer goes
-// out. Anything else is answered as the store error it is.
+// A failure after this request's own create is its own partial work, and it
+// is rolled back before the answer goes out: the retry under the
+// deterministic CSI target name then starts clean rather than resuming over
+// half of a definition. A leftover this request adopted is never wrapped as
+// that, so it stays for the replay gate to judge. Anything else is answered as
+// the store error it is.
 func (s *Server) writeRestoreMaterialiseFailed(
-	ctx context.Context, w http.ResponseWriter, snapName, rdName string, made materialisedRD, err error,
+	ctx context.Context, w http.ResponseWriter, snapName string, req *snapshotRestoreRequest,
+	made materialisedRD, err error,
 ) {
-	var partial *materialiseAfterCreateError
-	if !errors.As(err, &partial) {
-		writeStoreError(w, err)
+	rdName := req.ToResource
+
+	// Spared on the terms the replay judges a finished restore by: with a
+	// replica when this request placed some, by its volumes alone when not.
+	wanted := canonicalRestoreNodeList(req)
+
+	scope := rollbackUnlessHydrated
+	if len(wanted) > 0 {
+		scope = rollbackUnlessPlaced
+	}
+
+	if kind, refused := materialiseRefusalKind(err); refused {
+		writeStoreErrorTyped(w, err, kind)
 
 		return
 	}
 
 	writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{*s.failedMaterialiseRefusal(ctx,
 		"snapshot restore of '"+snapName+"' into '"+rdName+"' failed: "+err.Error(),
-		"restore", rdName, made.Placed, err)})
+		"restore", rdName, made.Placed, scope, wanted, err)})
+}
+
+// materialiseRefusalKind sorts a failed materialisation that is not this
+// request's own partial work: an answer about what was already there (a
+// replica still being deleted, a creator already rolling back), which both
+// doors give in the same typed shape. It reports false for partial work, which
+// the caller undoes.
+//
+// A replica still being deleted, or one holding no data, carries no
+// FAIL_EXISTS band: the replica it names is not one that exists for the
+// caller to use, and the 409 is the retryable failure it is.
+func materialiseRefusalKind(err error) (storeResourceKind, bool) {
+	var partial *materialiseAfterCreateError
+	if errors.As(err, &partial) {
+		return storeKindUnknown, false
+	}
+
+	switch {
+	case errors.Is(err, errReplicaStillDeleting):
+		return storeKindUnknown, true
+	case errors.Is(err, errAdoptedLeftoverRollingBack):
+		return storeKindResourceDfn, true
+	default:
+		return storeKindUnknown, true
+	}
+}
+
+// restoreReplayState is restoreTargetState followed, over a leftover of this
+// restore, by the finished question. It returns (resume, stop): stop when an
+// answer has been written, the replay of a finished restore included.
+//
+// prepared says the target is one the caller prepared and this request just
+// marked: its first run, not a retry, which only the wording sees.
+//
+// The gates over an unfinished leftover run before the resume writes into it,
+// in the order the clone door runs them: tear-down, then the group, then the
+// abandoned-rollback mark. A resume over a definition whose group is gone
+// would hydrate and place into it and only then be refused by the group guard
+// after the write, which does not roll back what it adopted.
+func (s *Server) restoreReplayState(
+	ctx context.Context, w http.ResponseWriter, snap *apiv1.Snapshot, req *snapshotRestoreRequest, prepared bool,
+) (bool, bool) {
+	resume, stop := s.restoreTargetState(ctx, w, snap, req.ToResource)
+	if stop || !resume {
+		return resume, stop
+	}
+
+	finished, halt := s.restoreLeftoverIsFinished(ctx, w, snap, snap.Name, req)
+	if halt {
+		return false, true
+	}
+
+	if finished {
+		s.writeFinishedRestoreReplay(ctx, w, snap.Name, req.ToResource, !prepared)
+
+		return false, true
+	}
+
+	existing, err := s.Store.ResourceDefinitions().Get(ctx, req.ToResource)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false, true
+	}
+
+	if !s.restoreTargetGroupSurvived(ctx, w, &existing) {
+		return false, true
+	}
+
+	if s.restoreRollbackWasAbandoned(ctx, w, req.ToResource) {
+		return false, true
+	}
+
+	return true, false
+}
+
+// writeFinishedRestoreReplay answers the replay of a restore that finished.
+// The leftover is adopted, not this request's, so the group guard over it
+// refuses rather than rolls back when its group is gone, the same answer the
+// resume of an unfinished one gets.
+func (s *Server) writeFinishedRestoreReplay(
+	ctx context.Context, w http.ResponseWriter, snapName, rdName string, resumed bool,
+) {
+	existing, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	// The pre-write gate, not the post-write one: the replay answers for a
+	// definition nobody verified, so a group it cannot read refuses, as the
+	// clone's replay and the CLI restore refuse it, rather than answering 201
+	// with a warning that binds a PV to a definition parented to nothing.
+	if !s.restoreTargetGroupSurvived(ctx, w, &existing) {
+		return
+	}
+
+	if s.restoreRollbackWasAbandoned(ctx, w, existing.Name) {
+		return
+	}
+
+	if status, refusal := s.finishedLeftoverRefusal(ctx, "restore", existing.Name); refusal != nil {
+		if status == http.StatusConflict {
+			refusal.RetCode |= apiCallRcFailExistsRscDfn
+		}
+
+		writeJSON(w, status, []apiv1.APICallRc{*refusal})
+
+		return
+	}
+
+	writeRestoreDone(w, restoreDoneMessage(resumed, snapName, rdName), nil)
+}
+
+// restoreLeftoverIsFinished answers a retry over a leftover of this restore
+// before anything is re-run over it. It returns (finished, stop).
+//
+// A finished restore is not placed again: re-placing it would put a replica on
+// every requested node that no longer has one, including a node the operator
+// emptied since, restored from the point-in-time beside a replica that has
+// moved on with live writes. It is judged the way a finished clone is, by its
+// volumes and, when the request placed replicas, by holding at least one;
+// where they are is placement's business.
+//
+// snap is nil once the snapshot is gone; the leftover is then judged against
+// the volumes the definition recorded when it was restored, the way a clone
+// whose internal snapshot is gone is. A bare restore is finished without a
+// replica only while the snapshot its later placement restores from exists:
+// once that is gone too, a shell with no replica holds its data nowhere, and
+// it is judged as the CLI judges it, needing a replica.
+func (s *Server) restoreLeftoverIsFinished(
+	ctx context.Context, w http.ResponseWriter, snap *apiv1.Snapshot, snapName string, req *snapshotRestoreRequest,
+) (bool, bool) {
+	vds, err := store.LiveVolumes(ctx, s.Store, req.ToResource)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false, true
+	}
+
+	needReplica := len(canonicalRestoreNodeList(req)) > 0 || snap == nil
+
+	progress, err := assessLeftover(ctx, s.Store, req.ToResource, vds, snap, needReplica)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false, true
+	}
+
+	switch progress {
+	case cloneFinished:
+		return true, false
+	case cloneForeign:
+		// Once the snapshot is gone, restoring again after the delete meets
+		// nothing to restore from, the tear-down's wording below.
+		correc := "delete '" + req.ToResource + "' and restore again, or restore under a different name"
+		if snap == nil {
+			correc = "delete '" + req.ToResource + "' and restore it from another snapshot, or restore " +
+				"another snapshot under a different name"
+		}
+
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + req.ToResource + "' holds a volume the restore of '" +
+				snapName + "' would not have written",
+			Cause: "the definition under that name carries this restore's marker, but its volumes " +
+				"are not the ones the snapshot recorded, so resuming would report complete a " +
+				"layout nothing restored",
+			Correc: correc,
+		}})
+
+		return false, true
+	case cloneTearingDown:
+		// Once the snapshot is gone, restoring again after the tear-down
+		// meets a target with nothing to restore from.
+		correc := "wait until the replicas of '" + req.ToResource + "' are gone, then restore again"
+		if snap == nil {
+			correc = "wait until the replicas of '" + req.ToResource + "' are gone, then delete '" +
+				req.ToResource + "' and restore it from another snapshot"
+		}
+
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + req.ToResource + "' is still being torn down",
+			Cause: "the definition under that name carries this restore's marker, and every " +
+				"replica of it is already accepted for deletion; resuming would race the " +
+				"tear-down reaping what it writes",
+			Correc: correc,
+		}})
+
+		return false, true
+	case cloneUnfinished:
+	}
+
+	return false, false
+}
+
+// restoreSnapshotOrReplay reads the snapshot a restore is taken from. One
+// that is gone hands the request to replayWithoutSnapshot, which answers it.
+func (s *Server) restoreSnapshotOrReplay(
+	ctx context.Context, w http.ResponseWriter, srcRD, snapName string, req *snapshotRestoreRequest,
+) (apiv1.Snapshot, bool) {
+	snap, err := getSnapshotWithCacheRetry(ctx, s.Store, srcRD, snapName)
+	if errors.Is(err, store.ErrNotFound) {
+		s.replayWithoutSnapshot(ctx, w, srcRD, snapName, req, err)
+
+		return snap, false
+	}
+
+	if err != nil {
+		writeStoreError(w, err)
+
+		return snap, false
+	}
+
+	return snap, true
+}
+
+// replayWithoutSnapshot answers a restore whose snapshot is gone. Deleting
+// the snapshot once the restore finished is ordinary cleanup, and a retry
+// after it is still a replay: an absent snapshot cannot unmake a finished
+// target, so a target carrying this restore's marker and the record of the
+// volumes the snapshot held is judged against that record, the way a clone
+// whose internal snapshot is gone is. A finished one answers as the replay it
+// is; an unfinished one cannot be finished from a snapshot that is gone, and
+// the refusal says so. Anything else, a legacy target without the record
+// included, is the 404 it was.
+func (s *Server) replayWithoutSnapshot(
+	ctx context.Context, w http.ResponseWriter, srcRD, snapName string, req *snapshotRestoreRequest, notFound error,
+) {
+	existing, err := s.Store.ResourceDefinitions().GetUncached(ctx, req.ToResource)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		// Whether the target is a finished replay or an unfinished leftover
+		// is not known, so the snapshot's 404 would turn a failed read into
+		// a refusal that reads as permanent.
+		writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "snapshot '" + snapName + "' of '" + srcRD + "' is gone, and '" + req.ToResource +
+				"' could not be read to tell whether the restore into it finished: " + scrubImplDetails(err.Error()),
+			Correc: "retry the restore",
+		}})
+
+		return
+	}
+
+	if err != nil || !restoreMarkerMatches(existing.Props, srcRD, snapName) {
+		writeStoreError(w, notFound)
+
+		return
+	}
+
+	if _, recorded := store.RecordedRestoreVolumes(existing.Props); !recorded {
+		writeStoreError(w, notFound)
+
+		return
+	}
+
+	if slices.Contains(existing.Flags, rdFlagDelete) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + req.ToResource + "' is being deleted",
+			Cause: "the leftover from an earlier attempt at this restore carries the DELETE " +
+				"flag; finishing it would race the tear-down reaping what it writes",
+			Correc: "wait for the delete to finish, then re-issue the restore",
+		}})
+
+		return
+	}
+
+	finished, halt := s.restoreLeftoverIsFinished(ctx, w, nil, snapName, req)
+	if halt {
+		return
+	}
+
+	if finished {
+		s.writeFinishedRestoreReplay(ctx, w, snapName, req.ToResource, true)
+
+		return
+	}
+
+	writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: "snapshot '" + snapName + "' of '" + srcRD + "' is gone, and the restore into '" +
+			req.ToResource + "' never finished",
+		Cause: "the definition carries this restore's marker, but not every volume the snapshot " +
+			"held, and what is missing can only come from the snapshot",
+		Correc: "delete '" + req.ToResource + "' and restore it from another snapshot",
+	}})
+}
+
+// restoreDoneMessage names whether the restore finished a leftover, so a
+// retry is legible in the operator's own output rather than looking like a
+// first run.
+func restoreDoneMessage(resumed bool, snapName, rdName string) string {
+	if resumed {
+		return "snapshot restore completed on retry: " + snapName + " → " + rdName
+	}
+
+	return "snapshot restored: " + snapName + " → " + rdName
 }
 
 // writeRestoreDone emits the restore's success envelope, with any warning the
@@ -368,6 +907,127 @@ func writeRestoreDone(w http.ResponseWriter, message string, warn *apiv1.APICall
 	}
 
 	writeJSON(w, http.StatusCreated, rcs)
+}
+
+// restoreTargetState decides what an existing definition under the target
+// name means. It returns (resume, stop): stop when an answer has already been
+// written, resume when the caller should re-run the restore over the leftover.
+//
+// CSI requires CreateVolume to be idempotent: a repeat with the same name and
+// the same parameters has to succeed and return the volume that already
+// exists. external-provisioner has no other way to make progress after a
+// partial failure, so a leftover of this restore is resumed rather than
+// refused as already existing.
+//
+// The restore marker is what makes a leftover recognisable, and it is NOT
+// evidence that the restore finished: materializeRestoredRD stamps it with
+// the definition and hydrates the volumes and places the replicas afterwards,
+// so a failure in either leaves the marker on an empty shell. That is why
+// this resumes rather than reporting success — the restore steps tolerate
+// objects a previous attempt already created, so re-running them completes
+// what is missing and leaves what is there.
+//
+// A leftover mid-tear-down is refused rather than resumed: the deletion is
+// reaping the very objects finishing the restore would be writing.
+//
+// Anything else under that name is a genuine collision and stays a refusal: a
+// name holding somebody else's definition must not come back as a restore
+// that never happened.
+//
+// The snapshot is taken as the stored object, not as the names the request
+// spelled, because the marker is written off the same object: LINSTOR folds
+// name case, and a retry arriving as `--from-snapshot SNAP` over a marker
+// stamped `snap` must still read as this restore's own.
+//
+// The target is read from the API server, as is the re-read after a create
+// meets AlreadyExists: both decide on the marker, which
+// adoptPreparedRestoreTarget may have just stamped through the API server, and
+// a cache that has not seen that write serves the definition unmarked.
+func (s *Server) restoreTargetState(ctx context.Context, w http.ResponseWriter, snap *apiv1.Snapshot, toResource string) (bool, bool) {
+	existing, err := s.Store.ResourceDefinitions().GetUncached(ctx, toResource)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, false
+	}
+
+	if err != nil {
+		writeRestoreTargetUnreadable(w, toResource, err)
+
+		return false, true
+	}
+
+	if !restoreMarkerMatches(existing.Props, snap.ResourceName, snap.Name) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + toResource + "' already exists and is not a restore of '" +
+				snap.Name + "'",
+			Correc: "restore under a different name, or delete the existing resource definition first",
+		}})
+
+		return false, true
+	}
+
+	if slices.Contains(existing.Flags, rdFlagDelete) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: "resource definition '" + toResource + "' is being deleted",
+			Cause: "the leftover from an earlier attempt at this restore carries the DELETE " +
+				"flag; finishing it would race the tear-down reaping what it writes",
+			Correc: "wait for the delete to finish, then re-issue the restore",
+		}})
+
+		return false, true
+	}
+
+	return true, false
+}
+
+// restoreRollbackWasAbandoned is the abandoned-rollback gate on the restore
+// door. The restore writes the mark through the same failed materialisation
+// the clone does, so it reads it back the same way and in the same place: after
+// the tear-down and group refusals, which are more precise about the same
+// leftover. See abandonedRollbackRefusal.
+func (s *Server) restoreRollbackWasAbandoned(ctx context.Context, w http.ResponseWriter, rdName string) bool {
+	status, refusal := s.abandonedRollbackRefusal(ctx, "restore", rdName)
+	if refusal == nil {
+		return false
+	}
+
+	// The exists band says what stands under the name; a read that failed
+	// says nothing about it.
+	if status == http.StatusConflict {
+		refusal.RetCode |= apiCallRcFailExistsRscDfn
+	}
+
+	writeJSON(w, status, []apiv1.APICallRc{*refusal})
+
+	return true
+}
+
+// restoreFromSnapshotKey marks a definition as produced by a snapshot
+// restore, encoded `<source RD>:<snapshot>`. The satellite reads it to route
+// the storage provider to RestoreVolumeFromSnapshot, and the retry path above
+// reads it to tell its own leftover from somebody else's definition.
+const restoreFromSnapshotKey = store.RestoreFromSnapshotProp
+
+// restoreMarker builds that value. Both halves come off the stored Snapshot
+// rather than off the request, so the marker a retry compares is the marker
+// the first attempt wrote whichever way the caller spelled the names.
+func restoreMarker(srcRD, snapName string) string {
+	return srcRD + ":" + snapName
+}
+
+// restoreMarkerMatches reports whether a definition was produced by this
+// restore or clone.
+//
+// The comparison is case-insensitive because the two sides reach it from
+// different places: the marker is written from the stored objects, and a
+// caller derives the other side from names it spelled itself. LINSTOR folds
+// name case and pkg/store/k8s/crdname.go lowercases every lookup key, so both
+// spellings address one object — and a byte comparison here would answer that
+// somebody else owns a definition this restore created, which is the
+// terminal-on-first-failure behaviour the resume path exists to end.
+func restoreMarkerMatches(props map[string]string, srcRD, snapName string) bool {
+	return strings.EqualFold(props[restoreFromSnapshotKey], restoreMarker(srcRD, snapName))
 }
 
 // validateRestoreNodesHoldSnapshot is the Bug 397 input-validation guard
@@ -431,6 +1091,73 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 	return req.SnapshotName
 }
 
+// leftoverIsThisRestore is the AlreadyExists tolerance's whole question: the
+// marker says the definition is this operation's own, the DELETE flag says
+// whether it is still there to finish, and the fields the caller named say
+// whether it is the same operation.
+func leftoverIsThisRestore(existing *apiv1.ResourceDefinition, snap *apiv1.Snapshot, overrides *rdShapeOverrides) bool {
+	var namedRG string
+
+	var namedLayers []string
+
+	if overrides != nil {
+		namedRG, namedLayers = overrides.ResourceGroupName, overrides.LayerStack
+	}
+
+	return restoreMarkerMatches(existing.Props, snap.ResourceName, snap.Name) &&
+		!slices.Contains(existing.Flags, rdFlagDelete) &&
+		requestedShapeDiffers(existing, namedRG, namedLayers) == ""
+}
+
+// requestedShapeDiffers names the first way a definition already under the
+// target name differs from what THIS request asked for, or "" when it asked for
+// nothing the leftover does not already have.
+//
+// A retry that resumes a leftover keeps the leftover, so a request naming a
+// different resource_group or layer stack would get that shape validated and
+// then dropped while the answer says the operation completed — the
+// accept-and-drop this endpoint refuses external_name and volume_passphrases to
+// avoid. The parent group is not cosmetic: it decides replica count and pool
+// selection.
+//
+// Only the fields the caller NAMED are compared, and only against the
+// leftover, never against the live source: the source can change between
+// attempts (an ordinary `rd modify --resource-group`), and comparing against
+// it would turn every later retry into a permanent 409 with a correction
+// linstor-csi cannot act on, since it sends the same body every time. A retry
+// that names nothing resumes what the first attempt started, whatever the
+// source has become, and one that names what the first attempt stamped, which
+// is what linstor-csi's does, resumes it too.
+//
+// The empty-name guard on the group is load-bearing: the leftover carries the
+// group materializeRestoredRD stamped, the source's unless the request named
+// one, so without it a request that names no group is compared as "" against
+// that group and refused.
+func requestedShapeDiffers(existing *apiv1.ResourceDefinition, rgName string, layers []string) string {
+	if rgName != "" && !strings.EqualFold(existing.ResourceGroupName, rgName) {
+		return "resource group '" + existing.ResourceGroupName + "', not '" + rgName + "'"
+	}
+
+	if len(layers) == 0 {
+		return ""
+	}
+
+	// An unset stack is a definition that never said, which is what
+	// materializeRestoredRD copies off a source that never said either, and
+	// not a definition with no layers. Unresolved, that leftover compared
+	// against a retry naming [DRBD, STORAGE], which is every linstor-csi
+	// retry, reads as adding both layers and refuses the resume. A retry that
+	// names no stack is not compared at all.
+	have := store.EffectiveLayerStack(existing.LayerStack)
+
+	added, dropped := layerSetDifference(have, layers)
+	if len(added) > 0 || len(dropped) > 0 {
+		return "layer stack " + strings.Join(have, ",") + ", not " + strings.Join(layers, ",")
+	}
+
+	return ""
+}
+
 // uncheckedRestoreGroupWarning tells the caller the restore worked and that
 // the group behind it went unverified, which is the one piece of information
 // that would make them look.
@@ -438,7 +1165,7 @@ func uncheckedRestoreGroupWarning(rdName, rgName string, err error) *apiv1.APICa
 	return &apiv1.APICallRc{
 		RetCode: maskWarn,
 		Message: "resource group '" + rgName + "' could not be re-checked after the " +
-			"restore: " + err.Error(),
+			"restore: " + scrubImplDetails(err.Error()),
 		Cause: "the restore itself succeeded; only the safety net over it could not be " +
 			"inspected, so a group deleted during the restore would not have been caught",
 		Correc: "confirm resource group '" + rgName + "' still exists",
@@ -466,10 +1193,7 @@ func (s *Server) restoreParentRGSurvived(
 		// The CHECK failed, which says nothing about the restore: that
 		// already succeeded, and this is the safety net over it. Undoing a
 		// completed restore because the net could not be inspected trades a
-		// rare dangling group for a certain lost restore — and a much worse
-		// one, since this endpoint has no idempotent-replay gate, so the
-		// definition stays behind and every retry under that name meets
-		// AlreadyExists and answers 409 from then on.
+		// rare dangling group for a certain lost restore.
 		//
 		// getRGWithCacheRetry returns immediately on anything that is not
 		// NotFound, so this branch is apiserver unavailability, a timeout or
@@ -497,9 +1221,9 @@ func (s *Server) restoreParentRGSurvived(
 		return nil, false
 	}
 
-	rollbackErr := s.rollBackCompensating(ctx, newRDName, made.Placed)
+	rollbackErr := s.rollBackCompensating(ctx, newRDName, made.Placed, rollbackEvenIfFinished)
 	if rollbackErr != nil {
-		cause, correc := rollbackFailureAdvice(rollbackErr, newRDName)
+		cause, correc := rollbackFailureAdviceOverDeletedGroup(rollbackErr, newRDName, stampedRG)
 
 		writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
 			RetCode: apiCallRcError,
@@ -550,7 +1274,56 @@ func (s *Server) restoreParentRGSurvived(
 //
 // An explicit caller node list is always stamped verbatim, regardless of
 // eagerPlace.
-func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) (materialisedRD, error) {
+// rdShapeOverrides carries the parts of a definition's shape a caller may
+// choose for itself rather than inherit from the source. Nil means "inherit
+// everything", which is what a snapshot restore does.
+type rdShapeOverrides struct {
+	// LayerStack replaces the source's stack when non-empty.
+	LayerStack []string
+	// ResourceGroupName replaces the source's parent group when non-empty.
+	ResourceGroupName string
+	// OverrideProps, DeleteProps and DeleteNamespaces are the clone's prop
+	// edits, folded in before the definition is created. Applied only once
+	// the clone finished, every leftover a failed one kept carried what the
+	// caller asked to remove: linstor-csi deletes the source's
+	// Aux/csi-provisioning-completed-by on every clone, and its CreateVolume
+	// takes a definition that carries it, with volumes of the right size,
+	// as one already provisioned, so its retry never reaches the clone that
+	// would resume it.
+	OverrideProps    map[string]string
+	DeleteProps      []string
+	DeleteNamespaces []string
+}
+
+// applyTo puts a clone's own group, stack and prop edits on the definition it
+// is about to create; a restore passes none and inherits the source's.
+func (o *rdShapeOverrides) applyTo(rd *apiv1.ResourceDefinition) {
+	if o == nil {
+		return
+	}
+
+	if len(o.LayerStack) > 0 {
+		rd.LayerStack = o.LayerStack
+	}
+
+	if o.ResourceGroupName != "" {
+		rd.ResourceGroupName = o.ResourceGroupName
+	}
+
+	if rd.Props == nil {
+		rd.Props = make(map[string]string, len(o.OverrideProps))
+	}
+
+	maps.Copy(rd.Props, o.OverrideProps)
+
+	for _, k := range o.DeleteProps {
+		delete(rd.Props, k)
+	}
+
+	deletePropNamespaces(rd.Props, o.DeleteNamespaces)
+}
+
+func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool, overrides *rdShapeOverrides) (materialisedRD, error) {
 	srcRDObj, err := s.Store.ResourceDefinitions().Get(ctx, srcRD)
 	if err != nil {
 		return materialisedRD{}, err //nolint:wrapcheck // surfaced via writeStoreError
@@ -574,6 +1347,14 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		newRD.Props = store.TravellingProps(srcRDObj.Props)
 	}
 
+	overrides.applyTo(&newRD)
+
+	// The stack the restored bytes are brought up under is the source's as
+	// the data plane resolves it. Left empty, a group named for the target
+	// whose stack differs would have the control plane judge the definition
+	// by that group's stack while the satellite brings it up as the source's.
+	newRD.LayerStack = store.EffectiveLayerStack(newRD.LayerStack)
+
 	// Stamp the clone-source so the dispatcher's buildVolumes (called
 	// at every satellite-reconcile of placed Resources) emits
 	// DesiredVolume.SourceSnapshot, which routes the storage provider
@@ -581,22 +1362,24 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// `<srcRD>:<snapName>` is the agreed encoding — satellite splits
 	// on the colon. We persist on the RD (not per-Resource) because
 	// every replica of the new RD clones from the same source.
-	if newRD.Props == nil {
-		newRD.Props = map[string]string{}
+	newRD.Props = store.WithRestoreMarker(newRD.Props, snap)
+
+	created, adoptedRG, err := s.createOrAdoptRestoredRD(ctx, &newRD, snap, overrides)
+	if err != nil {
+		return materialisedRD{}, err
 	}
 
-	newRD.Props["BlockstorRestoreFromSnapshot"] = srcRD + ":" + snap.Name
-
-	err = s.Store.ResourceDefinitions().Create(ctx, &newRD)
-	if err != nil {
-		return materialisedRD{}, err //nolint:wrapcheck // surfaced via writeStoreError
+	// An adopted leftover is checked against the group it was written with,
+	// which is the one it carries, not the one this request would have
+	// stamped: the source may have moved since the first attempt.
+	made := adoptedRD(newRD.Name, adoptedRG)
+	if created {
+		made = createdRD(newRD.Name, newRD.ResourceGroupName)
 	}
 
-	made := createdRD(newRD.Name, newRD.ResourceGroupName)
-
-	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap)
+	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap, true)
 	if err != nil {
-		return made, &materialiseAfterCreateError{err: err}
+		return made, made.failedAfterWrite(err)
 	}
 
 	// Bug 354: stamp per-node Resource CRDs so satellites have something
@@ -607,10 +1390,90 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// empty shell. Mirrors upstream CtrlSnapshotRestoreApiCallHandler.
 	made.Placed, err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap, eagerPlace)
 	if err != nil {
-		return made, &materialiseAfterCreateError{err: err}
+		return made, made.failedAfterWrite(err)
 	}
 
 	return made, nil
+}
+
+// createOrAdoptRestoredRD creates the restored definition, and reports whether
+// this request created it and, when it adopted one instead, the group that
+// leftover carries.
+//
+// AlreadyExists is tolerated when the definition already there is this
+// restore's own — the resume path above, or a second restore of the same
+// snapshot racing this one between the state check and here. The marker is
+// what tells the two apart from somebody else's definition, and re-reading is
+// what makes the decision on fresh state rather than on the read that lost the
+// race.
+func (s *Server) createOrAdoptRestoredRD(ctx context.Context, newRD *apiv1.ResourceDefinition, snap *apiv1.Snapshot, overrides *rdShapeOverrides) (bool, string, error) {
+	err := s.Store.ResourceDefinitions().Create(ctx, newRD)
+	if err == nil {
+		return true, "", nil
+	}
+
+	if !errors.Is(err, store.ErrAlreadyExists) {
+		return false, "", err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	// The definition that answered AlreadyExists is read from the API server:
+	// the decision below is whether it is this restore's, and a cache that
+	// has not seen the marker answers that wrong.
+	existing, getErr := s.Store.ResourceDefinitions().GetUncached(ctx, newRD.Name)
+	if getErr != nil {
+		return false, "", getErr //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	// Re-made on fresh state, and all of it: the marker says the definition
+	// is this operation's own, the DELETE flag says whether it is still there
+	// to finish, and the shape says whether it is the same operation. The
+	// window is narrow — another request completed and the target was deleted
+	// between the state check above and this Create — but it is the exact
+	// state the 409 in restoreTargetState exists to prevent, and hydrating
+	// volumes into a dying definition races the tear-down reaping them.
+	if !leftoverIsThisRestore(&existing, snap, overrides) {
+		return false, "", err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	err = s.claimAdoptedLeftover(ctx, existing.Name, snap)
+	if err != nil {
+		return false, "", err
+	}
+
+	// Hydrated and placed under the name it is stored with: replicas are
+	// selected by that name exactly, and one stamped under another spelling
+	// is invisible to the definition's own cascade.
+	newRD.Name = existing.Name
+
+	return false, existing.ResourceGroupName, nil
+}
+
+// errAdoptedLeftoverRollingBack refuses to adopt a leftover whose creator has
+// started rolling it back.
+var errAdoptedLeftoverRollingBack = store.ErrAdoptedLeftoverRollingBack
+
+// claimAdoptedLeftover is the adopting half of a handshake with the attempt
+// that created the definition, which "may still be running".
+//
+// That attempt can fail after this one answered for the definition, and its
+// rollback cascades a delete over everything under the name: the caller would
+// hold a 201 for a volume that no longer exists. So before writing anything
+// into the definition this one marks it as adopted, through the API server,
+// and then reads back, past the cache, whether a rollback has already started
+// on it. The creator does the mirror image: it marks its rollback in progress
+// and then reads back the adoption (see rollBackCompensating). Whichever writes
+// second sees the other's mark. A rollback that sees the adoption yields and
+// leaves the definition; an adoption that sees the rollback refuses. When both
+// marks land before either read, both sides stand down: nothing is deleted,
+// and the next retry resumes the leftover.
+func (s *Server) claimAdoptedLeftover(ctx context.Context, rdName string, snap *apiv1.Snapshot) error {
+	err := store.ClaimAdoptedLeftover(ctx, s.Store, rdName, snap)
+	if errors.Is(err, store.ErrAdoptedLeftoverRollingBack) {
+		return errors.Mark(errors.Wrapf(store.ErrAlreadyExists, //nolint:wrapcheck // the mark is the wrap
+			"'%s' cannot be adopted: %v", rdName, errAdoptedLeftoverRollingBack), errAdoptedLeftoverRollingBack)
+	}
+
+	return err //nolint:wrapcheck // store names the definition
 }
 
 // materialisedRD is what a materialisation wrote, and whether the definition
@@ -626,9 +1489,8 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 // unexported origin whose zero value says nothing, and the two constructors are
 // the only way to state it; a literal that skips them leaves the origin
 // unstated, and createdHere answers false for it, which is the safe side of the
-// line. Every materialisation on this branch creates, so only createdRD is
-// called here; the shape exists so a door that starts tolerating a leftover
-// cannot hand a compensation someone else's definition by omission.
+// line. materializeRestoredRD tolerates this restore's own leftover, so both
+// constructors are called there, off what createOrAdoptRestoredRD reports.
 type materialisedRD struct {
 	// Name is the target definition.
 	Name string
@@ -673,6 +1535,18 @@ func (m materialisedRD) createdHere() bool {
 // whatever was there before the call, which may be another attempt's.
 type materialiseAfterCreateError struct {
 	err error
+}
+
+// failedAfterWrite is how a materialisation reports a failure after the
+// definition stood: as this call's own partial work, which a caller may undo,
+// only when this call created it. A leftover it adopted belongs to the attempt
+// that left it, and the failure is answered as the store error it is.
+func (m materialisedRD) failedAfterWrite(err error) error {
+	if m.createdHere() {
+		return &materialiseAfterCreateError{err: err}
+	}
+
+	return err
 }
 
 func (e *materialiseAfterCreateError) Error() string { return e.err.Error() }
@@ -790,15 +1664,142 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 			res.Props = map[string]string{storPoolPropKey: pool}
 		}
 
-		err := s.Store.Resources().Create(ctx, &res)
+		created, err := s.stampRestoredReplica(ctx, &res)
 		if err != nil {
-			return placed, err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+			return placed, err
+		}
+
+		if !created {
+			// Neither created nor promoted by this call, so not in what a
+			// rollback may take.
+			continue
 		}
 
 		placed = append(placed, node)
 	}
 
 	return placed, nil
+}
+
+// errReplicaStillDeleting marks a stamp refused because the replica already
+// under that (definition, node) is going away. It wraps ErrAlreadyExists, but
+// is answered with no FAIL_EXISTS band; see materialiseRefusalKind.
+var errReplicaStillDeleting = errors.New("the replica under that name is still being deleted")
+
+// stampRestoredReplica creates one replica of a restore, and reports whether
+// this call created it, or promoted the controller's witness into it.
+//
+// Same reasoning as hydrateVolumesFromSnapshot: the replica is keyed
+// (definition, node) and the caller stamps exactly the nodes the restore
+// resolved, so an existing one is the replica a previous attempt already
+// placed. Unless it is going away: a Create over a replica still held by its
+// satellite finalizer answers AlreadyExists too, and counting that one as
+// placed reports a definition with no live replica as done. Nor when it is
+// diskless: it holds no copy of the data. A tie-breaker is the witness the
+// controller places once two replicas with a disk exist, so on a node the
+// restore also places onto it is promoted, the way autoplace promotes one,
+// and its volumes are restored from the snapshot like any other replica of a
+// marked target; an operator's diskless replica is refused.
+//
+// The existing replica is read from the API server, not the cache: right after
+// a delete began a cache still serves the replica without its DELETE flag, and
+// would have it counted as placed. A NotFound on that read is the replica
+// having gone between the Create and the read, so the Create is tried again;
+// one that keeps colliding with a replica the API server says is not there is
+// reported, not taken as placed.
+//
+// That report cannot come from a store whose read trails its own create.
+// Every store this runs against answers both from the same source: the servers
+// build theirs with the manager's direct reader (storek8s.NewManager), the CLI
+// with an uncached client, and the in-memory store has no cache. A store built
+// with a cached client and no direct reader would read past nothing here, and
+// is not a configuration any binary ships.
+func (s *Server) stampRestoredReplica(ctx context.Context, res *apiv1.Resource) (bool, error) {
+	const attempts = 3
+
+	for attempt := 1; ; attempt++ {
+		err := s.Store.Resources().Create(ctx, res)
+		if err == nil {
+			return true, nil
+		}
+
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			return false, err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+		}
+
+		existing, getErr := getResourceUncached(ctx, s.Store, res.Name, res.NodeName)
+		if errors.Is(getErr, store.ErrNotFound) {
+			if attempt < attempts {
+				continue
+			}
+
+			return false, errors.Wrapf(store.ErrAlreadyExists,
+				"the replica of %q on node %q keeps colliding with one the API server does not have",
+				res.Name, res.NodeName)
+		}
+
+		if getErr != nil {
+			return false, getErr
+		}
+
+		if replicaAcceptedForDeletion(&existing) {
+			return false, errors.Mark(errors.Wrapf(store.ErrAlreadyExists, //nolint:wrapcheck // the mark is the wrap
+				"the replica of %q on node %q is still being deleted", res.Name, res.NodeName),
+				errReplicaStillDeleting)
+		}
+
+		// A promoted witness is this request's replica now, and counts as
+		// placed: a rollback deletes it by name like any replica it made.
+		promotedHere := false
+
+		if slices.Contains(existing.Flags, apiv1.ResourceFlagTieBreaker) {
+			promoted, promoteErr := s.promoteRestoreWitness(ctx, res)
+			if promoteErr != nil {
+				return false, promoteErr
+			}
+
+			existing, promotedHere = *promoted, true
+		}
+
+		if !store.HoldsData(&existing) {
+			return false, errors.Wrapf(store.ErrAlreadyExists,
+				"the replica of %q on node %q is diskless and holds no copy of the data; "+
+					"delete it, then retry", res.Name, res.NodeName)
+		}
+
+		return promotedHere, nil
+	}
+}
+
+// promoteRestoreWitness promotes the controller's witness on a node the restore
+// places onto. The pool is settled before anything is written: a promotion
+// that found none would strip the witness's TIE_BREAKER flag and leave it
+// looking like an operator's diskless replica, refused on every retry. With no
+// pool the witness is left untouched and the stamp is refused.
+func (s *Server) promoteRestoreWitness(ctx context.Context, res *apiv1.Resource) (*apiv1.Resource, error) {
+	target := *res
+	if target.Props["StorPoolName"] == "" {
+		pool, err := s.resolveTakeoverStorPool(ctx, res.Name, res.NodeName)
+		if err != nil {
+			return nil, err
+		}
+
+		if pool == "" {
+			return nil, errors.Wrapf(store.ErrAlreadyExists,
+				"the witness of %q on node %q has no storage pool to take a disk in; give it one with "+
+					"`linstor resource create --storage-pool <pool> %s %s`, then retry", res.Name, res.NodeName,
+				res.NodeName, res.Name)
+		}
+
+		target.Props = maps.Clone(res.Props)
+		if target.Props == nil {
+			target.Props = map[string]string{}
+		}
+
+		target.Props["StorPoolName"] = pool
+	}
+
+	return s.promoteDisklessReplica(ctx, &target)
 }
 
 // canonicalRestoreNodeList collapses the request's two node-list
@@ -859,7 +1860,16 @@ func storPoolsByNodeFromSourceRD(ctx context.Context, st store.Store, srcRDName 
 // autoplace creates empty Resources that never reach UpToDate.
 // linstor-csi's CreateVolume-from-source path relies on this
 // hydration to surface the cloned PVC's block device.
-func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, snap *apiv1.Snapshot) error {
+//
+// ownTarget says the definition carries this restore's or clone's own marker,
+// which materializeRestoredRD has established before it calls this. Only then
+// is a volume LARGER than the snapshot recorded this operation's own: it is
+// the one an earlier attempt hydrated, expanded since like any volume.
+// leftoverAgainstSnapshot classifies that shape as the clone's own, and the
+// resume it admits ends here, so refusing it answered a bare 500 on every
+// retry. The volume-definition restore hydrates into a definition that is
+// not its own and accepts no existing volume at all.
+func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, snap *apiv1.Snapshot, ownTarget bool) error {
 	for i := range snap.VolumeDefinitions {
 		svd := &snap.VolumeDefinitions[i]
 		vd := apiv1.VolumeDefinition{
@@ -868,7 +1878,32 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 		}
 
 		err := s.Store.VolumeDefinitions().Create(ctx, rdName, &vd)
-		if err != nil {
+		if err == nil {
+			continue
+		}
+
+		// The volume-definition restore writes into a definition that is not
+		// its own, and every collision there is a refusal, as on main: it is
+		// the second half of that restore's collision guard, and a volume
+		// that appeared between the guard's list and this create was written
+		// by somebody else. A concurrent CLI restore of the same snapshot can
+		// fail on a later volume and unwind this one, so a 200 over it would
+		// report a layout that is about to go.
+		if !errors.Is(err, store.ErrAlreadyExists) || !ownTarget {
+			return err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+		}
+
+		// On this operation's own target, under its marker and the adoption
+		// handshake, AlreadyExists is the volume an earlier attempt hydrated,
+		// and tolerating it is what lets a retry finish an incomplete restore.
+		// The size still tells it apart: one at the snapshot's size, or grown
+		// since, is the restore's own; a smaller one is somebody else's.
+		existing, getErr := s.Store.VolumeDefinitions().Get(ctx, rdName, svd.VolumeNumber)
+		if getErr != nil {
+			return err //nolint:wrapcheck // the collision is the answer, not the read
+		}
+
+		if existing.SizeKib < svd.SizeKib {
 			return err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
 		}
 	}

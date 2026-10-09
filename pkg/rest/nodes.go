@@ -945,11 +945,14 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0 {
+	// delete_namespaces alone is a props edit too: gated on the first two
+	// halves only, a namespaces-only body never reached the patch.
+	if len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0 || len(patch.DeleteNamespace) > 0 {
 		err = s.Store.Nodes().PatchProps(r.Context(), name, func(props map[string]string) error {
 			// I1: route through the shared core so an empty
 			// override value deletes the key (set-property KEY "").
 			applyPropsModify(props, patch.OverrideProps, patch.DeleteProps)
+			deletePropNamespaces(props, patch.DeleteNamespace)
 
 			return nil
 		})
@@ -1503,67 +1506,50 @@ const (
 // IsAlreadyExists branches map to 409 with a generic message — the
 // raw apimachinery string is dropped to avoid the Bug 162 leak.
 func writeStoreErrorTyped(w http.ResponseWriter, err error, kind storeResourceKind) {
+	status, callRc := storeErrorRc(err, kind)
+	writeJSON(w, status, []apiv1.APICallRc{callRc})
+}
+
+// storeErrorRc is writeStoreErrorTyped's mapping without the envelope, for a
+// door whose wire shape is not the bare []ApiCallRc array: the clone POST
+// answers in CloneStarted, which python-linstor decodes whatever the status.
+func storeErrorRc(err error, kind storeResourceKind) (int, apiv1.APICallRc) {
 	switch {
 	case errors.Is(err, store.ErrAlreadyExists):
-		sub := existsSubCodeForKind(kind)
-		if sub == 0 {
-			writeError(w, http.StatusConflict, err.Error())
-
-			return
-		}
-
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | sub,
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError | existsSubCodeForKind(kind),
 			Message: scrubImplDetails(err.Error()),
-		}})
+		}
 	case errors.Is(err, store.ErrNotFound):
-		sub := notFoundSubCodeForKind(kind)
-		if sub == 0 {
-			writeError(w, http.StatusNotFound, err.Error())
-
-			return
-		}
-
-		writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | sub,
+		return http.StatusNotFound, apiv1.APICallRc{
+			RetCode: apiCallRcError | notFoundSubCodeForKind(kind),
 			Message: scrubImplDetails(err.Error()),
-		}})
+		}
 	case apierrors.IsConflict(err):
 		// Optimistic-lock conflict. Generic message — the apimachinery
 		// error embeds the GroupResource string which leaks the CRD
 		// plural and API group. CSI retries on 409.
-		writeError(w, http.StatusConflict,
-			"conflict: store object was modified, retry the request")
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "conflict: store object was modified, retry the request",
+		}
 	case apierrors.IsAlreadyExists(err):
-		sub := existsSubCodeForKind(kind)
-		if sub == 0 {
-			writeError(w, http.StatusConflict,
-				"conflict: store object already exists")
-
-			return
-		}
-
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | sub,
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError | existsSubCodeForKind(kind),
 			Message: "conflict: store object already exists",
-		}})
-	case apierrors.IsNotFound(err):
-		sub := notFoundSubCodeForKind(kind)
-		if sub == 0 {
-			// Same shape as the local sentinel — keep the wire status
-			// uniform so CSI's 404-handling path fires the same way.
-			writeError(w, http.StatusNotFound, scrubbedNotFoundMessage)
-
-			return
 		}
-
-		writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | sub,
+	case apierrors.IsNotFound(err):
+		// Same shape as the local sentinel — keep the wire status
+		// uniform so CSI's 404-handling path fires the same way.
+		return http.StatusNotFound, apiv1.APICallRc{
+			RetCode: apiCallRcError | notFoundSubCodeForKind(kind),
 			Message: scrubbedNotFoundMessage,
-		}})
+		}
 	default:
-		writeError(w, http.StatusInternalServerError,
-			"store error: "+scrubImplDetails(err.Error()))
+		return http.StatusInternalServerError, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails("store error: " + scrubImplDetails(err.Error())),
+		}
 	}
 }
 

@@ -116,10 +116,16 @@ func TestRollbackBudgetFitsTheShutdownWindow(t *testing.T) {
 			detachedRollbackBudget, shutdownMargin, gracefulShutdownWindow)
 	}
 
-	// The two mark writes are budgeted on top of everything the cascade is,
+	// A refused claim's release is detached from its request as well.
+	if store.ReleaseAdoptionBudget+shutdownMargin > gracefulShutdownWindow {
+		t.Errorf("adoption release budget %s plus margin %s does not fit the shutdown window %s",
+			store.ReleaseAdoptionBudget, shutdownMargin, gracefulShutdownWindow)
+	}
+
+	// The three mark writes are budgeted on top of everything the cascade is,
 	// not carved out of its waits.
-	if cascade := groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget; detachedRollbackBudget < cascade+2*markWriteBudget {
-		t.Errorf("rollback budget %s leaves the two abandoned-rollback marks (%s each) nothing on top "+
+	if cascade := groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget; detachedRollbackBudget < cascade+3*markWriteBudget {
+		t.Errorf("rollback budget %s leaves the three abandoned-rollback marks (%s each) nothing on top "+
 			"of the cascade's %s", detachedRollbackBudget, markWriteBudget, cascade)
 	}
 

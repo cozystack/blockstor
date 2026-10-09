@@ -18,6 +18,8 @@ limitations under the License.
 
 package rest
 
+import "strings"
+
 // applyPropsModify is the shared property-bag merge core. Every
 // LINSTOR object that accepts a `GenericPropsModify` envelope
 // (override_props + delete_props) applies the same semantic, and
@@ -64,4 +66,26 @@ func applyPropsModify(props, override map[string]string, del []string) map[strin
 	}
 
 	return props
+}
+
+// deletePropNamespaces strips every property under the named namespaces, the
+// `delete_namespaces` half of upstream's props-modify envelope, and is the one
+// implementation every door uses. A namespace covers the keys below it and not
+// a key that spells it exactly: `DrbdOptions` takes `DrbdOptions/Net/protocol`
+// and leaves both `DrbdOptions` and `DrbdOptionsOther` alone. That is
+// upstream's reading: its PropsContainer keeps a key and the namespace of the
+// same name apart, and removeNamespace clears only the namespace.
+func deletePropNamespaces(props map[string]string, namespaces []string) {
+	for _, ns := range namespaces {
+		prefix := strings.TrimSuffix(ns, "/") + "/"
+		if prefix == "/" {
+			continue
+		}
+
+		for key := range props {
+			if strings.HasPrefix(key, prefix) {
+				delete(props, key)
+			}
+		}
+	}
 }

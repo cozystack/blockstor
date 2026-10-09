@@ -243,7 +243,7 @@ func TestRDCloneRollbackRefusesOverASnapshotOnTheTarget(t *testing.T) {
 // A failed rollback may reap every replica and still keep the definition, and
 // both corrections tell the operator to re-create the group. The moment they
 // do, a gate asking only about the group answered 201 for a clone on no node.
-func TestRDCloneReplayRefusesALeftoverWhoseReplicasWereReaped(t *testing.T) {
+func TestRDCloneRetryOverAReapedLeftoverAnswersOnlyAWholeClone(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
@@ -271,9 +271,14 @@ func TestRDCloneReplayRefusesALeftoverWhoseReplicasWereReaped(t *testing.T) {
 	resp := postClone(t, base, "src-reaped", map[string]any{"name": "dst-reaped", "use_zfs_clone": true})
 	_ = resp.Body.Close()
 
-	if resp.StatusCode == http.StatusCreated {
-		t.Error("replay answered 201 for a clone whose replicas were all reaped")
+	// With no abandoned-rollback mark on it, the leftover is an unfinished
+	// clone and the retry resumes it. A 201 is fine; one over a clone that
+	// still exists on no node is not.
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("retry over an unmarked, reaped leftover = %d, want 201 over a resumed clone", resp.StatusCode)
 	}
+
+	assertCloneWhole(t, st, "dst-reaped")
 }
 
 // Refusing on an unreadable group costs nothing, since the CSI retry heals

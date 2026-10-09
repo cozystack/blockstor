@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -277,9 +279,13 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// golinstor's VolumeGroupModify, whole: a field left undeclared is a 400
+	// from the strict decoder to any caller that sets it.
 	var in struct {
-		OverrideProps map[string]string `json:"override_props,omitempty"`
-		DeleteProps   []string          `json:"delete_props,omitempty"`
+		OverrideProps    map[string]string `json:"override_props,omitempty"`
+		Flags            []string          `json:"flags,omitempty"`
+		DeleteProps      []string          `json:"delete_props,omitempty"`
+		DeleteNamespaces []string          `json:"delete_namespaces,omitempty"`
 	}
 
 	if !decodeJSON(w, r, &in) {
@@ -295,6 +301,8 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 			for i := range rg.VolumeGroups {
 				if rg.VolumeGroups[i].VolumeNumber == vlmNr {
 					mergeVGProps(&rg.VolumeGroups[i], in.OverrideProps, in.DeleteProps)
+					deletePropNamespaces(rg.VolumeGroups[i].Props, in.DeleteNamespaces)
+					rg.VolumeGroups[i].Flags = editVGFlags(rg.VolumeGroups[i].Flags, in.Flags)
 
 					return nil
 				}
@@ -562,6 +570,24 @@ func mergeVGProps(vg *apiv1.VolumeGroup, override map[string]string, deletes []s
 
 	// I1: empty override value deletes the key (set-property KEY "").
 	applyPropsModify(vg.Props, override, deletes)
+}
+
+// editVGFlags applies upstream's flag edit: a flag named adds it, one prefixed
+// with '-' removes it.
+func editVGFlags(flags, edits []string) []string {
+	for _, edit := range edits {
+		if name, remove := strings.CutPrefix(edit, "-"); remove {
+			flags = slices.DeleteFunc(flags, func(f string) bool { return f == name })
+
+			continue
+		}
+
+		if !slices.Contains(flags, edit) {
+			flags = append(flags, edit)
+		}
+	}
+
+	return flags
 }
 
 func parseVolumeNumber(w http.ResponseWriter, raw string) (int32, bool) {

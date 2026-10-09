@@ -60,6 +60,24 @@ func (s *volumeDefinitions) List(ctx context.Context, rdName string) ([]apiv1.Vo
 		return nil, err
 	}
 
+	return wireVDsOf(rd), nil
+}
+
+// ListUncached answers what List answers from the API server when the store
+// has a direct reader. A volume restore served by one replica of this server
+// and the resource restore after it served by another is linstor-csi's normal
+// sequence, and the second must not judge the first's volumes off a cache that
+// has not seen them.
+func (s *volumeDefinitions) ListUncached(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error) {
+	rd, err := s.fetchRDLive(ctx, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	return wireVDsOf(rd), nil
+}
+
+func wireVDsOf(rd *crdv1alpha1.ResourceDefinition) []apiv1.VolumeDefinition {
 	out := make([]apiv1.VolumeDefinition, 0, len(rd.Spec.VolumeDefinitions))
 	for i := range rd.Spec.VolumeDefinitions {
 		out = append(out, crdToWireVD(&rd.Spec.VolumeDefinitions[i]))
@@ -67,7 +85,7 @@ func (s *volumeDefinitions) List(ctx context.Context, rdName string) ([]apiv1.Vo
 
 	sort.Slice(out, func(i, j int) bool { return out[i].VolumeNumber < out[j].VolumeNumber })
 
-	return out, nil
+	return out
 }
 
 // ListAll reads every definition's inline volumes from one list of the

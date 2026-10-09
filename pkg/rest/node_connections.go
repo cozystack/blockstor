@@ -458,18 +458,7 @@ func mergeNodeConnectionPropsInto(
 	// I1: empty override value deletes the key (set-property KEY "").
 	applyPropsModify(props, modify.OverrideProps, modify.DeleteProps)
 
-	// Namespace-prefix delete (e.g. `delete_namespaces: ["DrbdOptions/Net"]`)
-	// removes every key under the given prefix. Matches upstream
-	// LINSTOR's `GenericPropsModify.delete_namespaces` semantic.
-	for _, ns := range modify.DeleteNamespace {
-		prefix := strings.TrimSuffix(ns, "/") + "/"
-
-		for k := range props {
-			if strings.HasPrefix(k, prefix) || k == ns {
-				delete(props, k)
-			}
-		}
-	}
+	deletePropNamespaces(props, modify.DeleteNamespace)
 
 	if len(props) == 0 {
 		delete(conn, key)

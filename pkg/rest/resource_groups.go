@@ -170,6 +170,10 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if refuseServerOwnedGroupProps(w, rg.Name, rg.Props, rg.OverrideProps) {
+		return
+	}
+
 	// A group's stack is inherited by every definition spawned from it, so
 	// a LUKS layer here reaches more volumes than one on a single
 	// definition. handleRDCreate has refused this since Bug 95; leaving the
@@ -232,22 +236,8 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	// it to PatchResourceGroup. See rgUpdateWireGate — keeps the
 	// wire-validation rules out of the store error path and the handler
 	// under the funlen budget.
-	gateErr := rgUpdateWireGate(raw, &patch)
-	if gateErr != nil {
-		writeError(w, http.StatusBadRequest, gateErr.Error())
-
+	if s.refuseRGUpdate(w, r, name, raw, &patch) {
 		return
-	}
-
-	// Guarding create alone leaves the stack patchable afterwards, which is
-	// the same door by another name.
-	if patch.SelectFilter.LayerStack != nil {
-		luksErr := s.refuseLUKSWithoutPassphrase(r.Context(), patch.SelectFilter.LayerStack)
-		if luksErr != nil {
-			writeError(w, http.StatusBadRequest, luksErr.Error())
-
-			return
-		}
 	}
 
 	err := s.Store.ResourceGroups().PatchResourceGroup(r.Context(), name, func(existing *apiv1.ResourceGroup) error {
@@ -624,6 +614,79 @@ func rgSelectFilterClearTable() map[string]func(*apiv1.AutoSelectFilter) {
 	}
 }
 
+// refuseRGUpdate runs every refusal an `rg modify` body meets before it is
+// merged. True means the refusal has been written.
+func (s *Server) refuseRGUpdate(
+	w http.ResponseWriter, r *http.Request, name string, raw []byte, patch *apiv1.ResourceGroup,
+) bool {
+	gateErr := rgUpdateWireGate(raw, patch)
+	if gateErr != nil {
+		writeError(w, http.StatusBadRequest, gateErr.Error())
+
+		return true
+	}
+
+	if refuseServerOwnedGroupProps(w, name, patch.Props, patch.OverrideProps) {
+		return true
+	}
+
+	// Guarding create alone leaves the stack patchable afterwards, which is
+	// the same door by another name.
+	if patch.SelectFilter.LayerStack != nil {
+		luksErr := s.refuseLUKSWithoutPassphrase(r.Context(), patch.SelectFilter.LayerStack)
+		if luksErr != nil {
+			writeError(w, http.StatusBadRequest, luksErr.Error())
+
+			return true
+		}
+	}
+
+	return false
+}
+
+// refuseServerOwnedGroupProps answers a group create or modify that would set
+// one of the props blockstor reads back off a definition. Spawn no longer
+// copies them, but a group is where linstor-csi lands StorageClass
+// parameters, so refusing them here keeps the group from holding a value
+// that means something on a definition. Removing one stays allowed: that is
+// how an operator cleans a group written before this check, so an override to
+// an empty value, the upstream spelling of a delete (`set-property KEY ""`),
+// is let through with delete_props and delete_namespaces. True means the
+// refusal has been written.
+func refuseServerOwnedGroupProps(w http.ResponseWriter, name string, props, overrideProps map[string]string) bool {
+	key := store.ServerOwnedPropEdit(props, nil, nil)
+	if key == "" {
+		key = store.ServerOwnedPropEdit(settingOverrides(overrideProps), nil, nil)
+	}
+
+	if key == "" {
+		return false
+	}
+
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: "resource group '" + name + "': props carry " + key + ", which blockstor sets itself",
+		Cause:   key + " records what blockstor did to a resource definition, and is read back to decide what to do next",
+		Correc:  "drop " + key + " from the group's props",
+	}})
+
+	return true
+}
+
+// settingOverrides drops the overrides that delete a key, an empty value,
+// leaving the ones that set one.
+func settingOverrides(overrideProps map[string]string) map[string]string {
+	setting := make(map[string]string, len(overrideProps))
+
+	for key, value := range overrideProps {
+		if value != "" {
+			setting[key] = value
+		}
+	}
+
+	return setting
+}
+
 // mergeRGProps applies the OverrideProps / DeleteProps merge
 // semantic LINSTOR uses for any property-bag-bearing object:
 // override entries land first, then delete entries strip their keys.
@@ -632,8 +695,14 @@ func rgSelectFilterClearTable() map[string]func(*apiv1.AutoSelectFilter) {
 // so an override entry with an empty value DELETES the key — the
 // `linstor rg set-property g DrbdOptions/Resource/on-no-quorum`
 // (no value) = delete-property semantic the upstream UG9 NOTE pins.
+//
+// delete_namespaces is the third half of the same envelope, and the body
+// declares it: merging only the first two answered a modify carrying
+// delete_namespaces with 200 and changed nothing. The resource-definition
+// modify had the same gap one file over.
 func mergeRGProps(existing, patch *apiv1.ResourceGroup) {
 	existing.Props = applyPropsModify(existing.Props, patch.OverrideProps, patch.DeleteProps)
+	deletePropNamespaces(existing.Props, patch.DeleteNamespace)
 }
 
 // handleRGDelete drops a ResourceGroup.

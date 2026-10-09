@@ -123,17 +123,15 @@ func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv
 	// A selectable FIELD does not have that failure mode: it selects on the
 	// spec value every replica carries, whoever wrote it, and a server that
 	// cannot serve the selector says so instead of answering short.
-	out, err := s.listScoped(ctx, s.c, FieldResourceDefinitionName, rdName,
-		func(r *crdv1alpha1.Resource) bool { return r.Spec.ResourceDefinitionName == rdName })
-	if err != nil {
-		return nil, err
-	}
+	return s.listByDefinitionThrough(ctx, s.c, rdName)
+}
 
-	// Every replica here belongs to the same definition, so the node is what
-	// distinguishes them.
-	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
-
-	return out, nil
+// ListByDefinitionUncached answers what ListByDefinition answers from the API
+// server when the store has a direct reader, for a decision that cannot take a
+// cache's word: whether a definition another replica of this server just
+// prepared holds a live replica.
+func (s *resources) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
+	return s.listByDefinitionThrough(ctx, s.nodeScopedReader(), rdName)
 }
 
 func (s *resources) Get(ctx context.Context, rdName, node string) (apiv1.Resource, error) {
@@ -146,6 +144,28 @@ func (s *resources) Get(ctx context.Context, rdName, node string) (apiv1.Resourc
 		}
 
 		return apiv1.Resource{}, errors.Wrapf(err, "get Resource %s/%s", rdName, node)
+	}
+
+	return crdToWireResource(&crd), nil
+}
+
+// GetUncached answers what Get answers from the API server when the store has
+// a direct reader, for a decision that cannot take a cache's word: whether a
+// replica a Create collided with is still there, and whether it is going.
+func (s *resources) GetUncached(ctx context.Context, rdName, node string) (apiv1.Resource, error) {
+	if s.apiReader == nil {
+		return s.Get(ctx, rdName, node)
+	}
+
+	var crd crdv1alpha1.Resource
+
+	err := s.apiReader.Get(ctx, types.NamespacedName{Name: resourceCRDName(rdName, node)}, &crd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return apiv1.Resource{}, errors.Wrapf(store.ErrNotFound, "resource %q on node %q", rdName, node)
+		}
+
+		return apiv1.Resource{}, errors.Wrapf(err, "get Resource %s/%s live", rdName, node)
 	}
 
 	return crdToWireResource(&crd), nil
@@ -520,6 +540,22 @@ func (s *resources) ClearDRBDPort(ctx context.Context, rdName, node string) erro
 	}
 
 	return nil
+}
+
+func (s *resources) listByDefinitionThrough(
+	ctx context.Context, reader ctrlclient.Reader, rdName string,
+) ([]apiv1.Resource, error) {
+	out, err := s.listScoped(ctx, reader, FieldResourceDefinitionName, rdName,
+		func(r *crdv1alpha1.Resource) bool { return r.Spec.ResourceDefinitionName == rdName })
+	if err != nil {
+		return nil, err
+	}
+
+	// Every replica here belongs to the same definition, so the node is what
+	// distinguishes them.
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
+
+	return out, nil
 }
 
 // buildVolumeStatusForApply turns a slice of per-volume
