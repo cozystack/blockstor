@@ -396,9 +396,13 @@ const legacySnapshotFlagFailed = "FAILED"
 
 // isTerminalSnapshotFlag reports whether a flag value already pins the
 // snapshot to a non-Incomplete State that outranks `SUCCESSFUL`.
-// Mirrors the python CLI's elif-chain order in snapshot_cmds.show.
+// Mirrors the python CLI's elif-chain order in snapshot_cmds.show, where
+// DELETE comes first: a snapshot whose delete is in flight is Deleting, and
+// stamping SUCCESSFUL beside it hands a client that reads the flags in any
+// other order a snapshot being destroyed as a usable one.
 func isTerminalSnapshotFlag(flag string) bool {
-	return flag == apiv1.SnapshotFlagFailedDeployment ||
+	return flag == apiv1.SnapshotFlagDelete ||
+		flag == apiv1.SnapshotFlagFailedDeployment ||
 		flag == apiv1.SnapshotFlagFailedDisconnect ||
 		flag == apiv1.SnapshotFlagSuccessful ||
 		flag == legacySnapshotFlagFailed

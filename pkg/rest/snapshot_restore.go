@@ -1364,6 +1364,12 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// every replica of the new RD clones from the same source.
 	newRD.Props = store.WithRestoreMarker(newRD.Props, snap)
 
+	// The owner prop is the snapshot's, not the definition's: copied onward,
+	// every snapshot later taken of this definition would inherit a claim of
+	// ownership it was never given.
+	delete(newRD.Props, store.CloneSnapshotOwnerProp)
+	delete(newRD.Props, store.CloneSnapshotReapingProp)
+
 	created, adoptedRG, err := s.createOrAdoptRestoredRD(ctx, &newRD, snap, overrides)
 	if err != nil {
 		return materialisedRD{}, err
@@ -1375,6 +1381,16 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	made := adoptedRD(newRD.Name, adoptedRG)
 	if created {
 		made = createdRD(newRD.Name, newRD.ResourceGroupName)
+	}
+
+	// The snapshot was read before the definition existed, and a reap that
+	// listed dependents in between could not see this one. Read it back now
+	// the definition is there; see store.ReapClonedSnapshot. The withdraw has
+	// already taken back what this request created, so its error is not one
+	// to roll back over.
+	err = store.RestoreSourceWithdrawn(ctx, s.Store, snap.ResourceName, snap.Name)
+	if err != nil {
+		return materialisedRD{}, s.withdrawRestoredRD(ctx, newRD.Name, created, err)
 	}
 
 	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap, true)
@@ -1474,6 +1490,35 @@ func (s *Server) claimAdoptedLeftover(ctx context.Context, rdName string, snap *
 	}
 
 	return err //nolint:wrapcheck // store names the definition
+}
+
+// withdrawRestoredRD takes back a definition this request created from a
+// snapshot that went away under it, before anything was hydrated into it, and
+// answers as for a snapshot that does not exist.
+//
+// A definition an earlier attempt left is not this request's to delete: it
+// may hold what that attempt hydrated. It cannot be finished without the
+// snapshot either, so the answer names it and the way out, rather than a 404
+// every retry repeats with nothing pointing at the leftover.
+func (s *Server) withdrawRestoredRD(ctx context.Context, rdName string, created bool, cause error) error {
+	if created {
+		err := s.Store.ResourceDefinitions().Delete(ctx, rdName)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			log.FromContext(ctx).Info("could not withdraw a definition whose snapshot went away",
+				"resourceDefinition", rdName, "error", err.Error())
+		}
+	}
+
+	if !errors.Is(cause, store.ErrRestoreSourceWithdrawn) {
+		return cause
+	}
+
+	if created {
+		return errors.Wrap(store.ErrNotFound, cause.Error())
+	}
+
+	return errors.Wrapf(store.ErrNotFound, "%s; '%s', left by an earlier attempt at this restore, "+
+		"cannot be finished without it: delete it with `linstor rd d %s`", cause.Error(), rdName, rdName)
 }
 
 // materialisedRD is what a materialisation wrote, and whether the definition
