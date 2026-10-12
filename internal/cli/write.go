@@ -59,12 +59,12 @@ type propertyAccessor struct {
 	// touched. The edit guards judge the resulting state, which cannot
 	// see an operator setting an immutable key to the value it already
 	// has — REST refuses that, so this door has to as well.
-	namedKey func(key string) error
+	namedKey func(key string, deleting bool) error
 }
 
 // withNamedKeyGuard attaches a named-key guard to an accessor built by
 // objectProps, whose signature carries only the state-comparing guards.
-func withNamedKeyGuard(accessor propertyAccessor, guard func(string) error) propertyAccessor {
+func withNamedKeyGuard(accessor propertyAccessor, guard func(string, bool) error) propertyAccessor {
 	accessor.namedKey = guard
 
 	return accessor
@@ -87,16 +87,16 @@ func setProperty(accessor propertyAccessor) handler {
 		ident := run.Flags.Positionals[:accessor.args]
 		key := run.Flags.Positionals[accessor.args]
 
-		if accessor.namedKey != nil {
-			named := accessor.namedKey(key)
-			if named != nil {
-				return named
-			}
-		}
-
 		value := ""
 		if len(run.Flags.Positionals) > want {
 			value = run.Flags.Positionals[want]
+		}
+
+		if accessor.namedKey != nil {
+			named := accessor.namedKey(key, value == "")
+			if named != nil {
+				return named
+			}
 		}
 
 		return accessor.edit(ctx, run.Store, ident, func(props map[string]string) error {
@@ -211,10 +211,11 @@ func objectProps[T any](
 	}
 }
 
-// rdProps accesses a resource definition's property bag.
+// rdProps accesses a resource definition's property bag. The props blockstor
+// writes to record what a definition is are refused here as on the REST door.
 //
-//nolint:gochecknoglobals,dupl // static accessor table; the parallel shape is the point
-var rdProps = objectProps("resource definition", 1,
+//nolint:gochecknoglobals // static accessor table
+var rdProps = withNamedKeyGuard(objectProps("resource definition", 1,
 	func(ctx context.Context, st store.Store, ident []string) (apiv1.ResourceDefinition, error) {
 		return st.ResourceDefinitions().Get(ctx, ident[0])
 	},
@@ -222,7 +223,31 @@ var rdProps = objectProps("resource definition", 1,
 	func(ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.ResourceDefinition) error) error {
 		return st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, ident[0], mutate)
 	},
-)
+	store.RollbackMarkClearRefusal,
+), refuseServerOwnedDefinitionProp)
+
+// errServerOwnedProp refuses an operator's edit of a prop blockstor sets on a
+// definition itself.
+var errServerOwnedProp = errors.New("blockstor sets this property itself")
+
+// refuseServerOwnedDefinitionProp is the named-key guard for rdProps. A
+// delete of the rollback mark goes through; see
+// store.ServerOwnedPropEditByOperator.
+func refuseServerOwnedDefinitionProp(key string, deleting bool) error {
+	// The value is not judged, only that one is set; an empty override is
+	// read as a delete, so a set is spelled with a value.
+	var overrides map[string]string
+	if !deleting {
+		overrides = map[string]string{key: "set"}
+	}
+
+	if store.ServerOwnedPropEditByOperator(overrides, []string{key}, nil) != "" {
+		return fmt.Errorf("%w: %s records what blockstor did to this definition and is read back "+
+			"to decide what to do next", errServerOwnedProp, key)
+	}
+
+	return nil
+}
 
 // nodeProps accesses a node's property bag.
 //

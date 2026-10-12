@@ -277,12 +277,28 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// golinstor's VolumeGroupModify, whole: a field left undeclared is a 400
+	// from the strict decoder to any caller that sets it.
 	var in struct {
-		OverrideProps map[string]string `json:"override_props,omitempty"`
-		DeleteProps   []string          `json:"delete_props,omitempty"`
+		OverrideProps    map[string]string `json:"override_props,omitempty"`
+		Flags            []string          `json:"flags,omitempty"`
+		DeleteProps      []string          `json:"delete_props,omitempty"`
+		DeleteNamespaces []string          `json:"delete_namespaces,omitempty"`
 	}
 
 	if !decodeJSON(w, r, &in) {
+		return
+	}
+
+	// The one volume-group flag upstream has is GROSS_SIZE, and nothing here
+	// sizes a spawned volume gross, so taking a flag would answer 200 for a
+	// request that changes nothing. Refused before any write, so a body that
+	// also edits props does not land half of itself.
+	if len(in.Flags) > 0 {
+		writeError(w, http.StatusNotImplemented,
+			"volume-group flags are not implemented: spawned volumes are sized net, so "+
+				"GROSS_SIZE would change nothing; see docs/cli-parity-known-deltas.md")
+
 		return
 	}
 
@@ -295,6 +311,7 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 			for i := range rg.VolumeGroups {
 				if rg.VolumeGroups[i].VolumeNumber == vlmNr {
 					mergeVGProps(&rg.VolumeGroups[i], in.OverrideProps, in.DeleteProps)
+					deletePropNamespaces(rg.VolumeGroups[i].Props, in.DeleteNamespaces)
 
 					return nil
 				}

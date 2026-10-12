@@ -111,15 +111,10 @@ func TestRDCloneShellRollbackOutlivesTheRequest(t *testing.T) {
 func TestRollbackBudgetFitsTheShutdownWindow(t *testing.T) {
 	t.Parallel()
 
-	if detachedRollbackBudget+shutdownMargin > gracefulShutdownWindow {
-		t.Errorf("rollback budget %s plus margin %s does not fit the shutdown window %s",
-			detachedRollbackBudget, shutdownMargin, gracefulShutdownWindow)
-	}
-
-	// The two mark writes are budgeted on top of everything the cascade is,
+	// The three mark writes are budgeted on top of everything the cascade is,
 	// not carved out of its waits.
-	if cascade := groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget; detachedRollbackBudget < cascade+2*markWriteBudget {
-		t.Errorf("rollback budget %s leaves the two abandoned-rollback marks (%s each) nothing on top "+
+	if cascade := groupRecheckBudget + 2*cacheConvergeBudget + rollbackWriteBudget; detachedRollbackBudget < cascade+3*markWriteBudget {
+		t.Errorf("rollback budget %s leaves the three abandoned-rollback marks (%s each) nothing on top "+
 			"of the cascade's %s", detachedRollbackBudget, markWriteBudget, cascade)
 	}
 
@@ -142,6 +137,19 @@ func TestRollbackBudgetFitsTheShutdownWindow(t *testing.T) {
 		if gracefulShutdownWindow+terminationGraceMargin > grace {
 			t.Errorf("%s gives the pod %s; the shutdown window %s plus margin %s needs more",
 				manifest, grace, gracefulShutdownWindow, terminationGraceMargin)
+		}
+
+		// The detached budget against the pod's grace on its own, so it is
+		// not held only by the window that is derived from it.
+		if detachedRollbackBudget+shutdownMargin+terminationGraceMargin > grace {
+			t.Errorf("%s gives the pod %s; the rollback budget %s plus margins %s and %s needs more",
+				manifest, grace, detachedRollbackBudget, shutdownMargin, terminationGraceMargin)
+		}
+
+		// A claim's detached read-back also runs past its request.
+		if store.ClaimReadBackBudget+shutdownMargin+terminationGraceMargin > grace {
+			t.Errorf("%s gives the pod %s; the claim read-back %s plus margins needs more",
+				manifest, grace, store.ClaimReadBackBudget)
 		}
 	}
 }

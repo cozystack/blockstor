@@ -157,11 +157,12 @@ func handleKVModify(w http.ResponseWriter, r *http.Request) {
 		kvBag[name] = bag
 	}
 
-	maps.Copy(bag, patch.OverrideProps)
-
-	for _, key := range patch.DeleteProps {
-		delete(bag, key)
-	}
+	// The same envelope every other props door takes, applied the same way:
+	// an empty override value deletes the key, and a namespace takes the
+	// keys below it.
+	bag = applyPropsModify(bag, patch.OverrideProps, patch.DeleteProps)
+	deletePropNamespaces(bag, patch.DeleteNamespace)
+	kvBag[name] = bag
 
 	kvBagMu.Unlock()
 
