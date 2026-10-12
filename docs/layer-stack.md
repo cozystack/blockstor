@@ -27,10 +27,24 @@ where it's the network leg).
 | `["DRBD","LUKS","STORAGE"]` | Encrypted at-rest + replicated. Per-volume cipher.                  |
 | `["STORAGE"]`               | Single-replica local mode. Ephemeral cache, scratch, ZFS dataset.   |
 
-The default is `["DRBD","STORAGE"]` — when `RD.Spec.LayerStack` is
-empty the controller inherits from the parent
-`ResourceGroup.Spec.SelectFilter.LayerStack`, and when both are empty
-the dispatcher falls through to the satellite's default-DRBD path.
+The default is `["DRBD","STORAGE"]`, used when neither the RD nor its resource group sets a stack.
+
+An RD's stack is fixed once and then read only from `RD.Spec.LayerStack`. The REST create and `rg spawn` paths copy the group's stack onto the RD when it is created. An RD that ends up with an empty stack in a group that sets one (created with `kubectl apply` or GitOps, or moved by `rd modify --resource-group`) is pinned by the controller, and the satellite builds nothing for it until then:
+
+- An RD that holds no data yet gets the group's stack.
+- An RD that already holds data (a replica reported DRBD metadata or a device, or `spec.initialized` is set) keeps `["DRBD","STORAGE"]`, the stack its storage was built with. The group's stack is recorded in the `blockstor.io/unapplied-group-layer-stack` annotation and a `LayerStackNotInherited` warning Event is emitted on the RD. Such a volume is not what its group promises (for example, a plaintext volume in a LUKS group); move its data to a new volume to get the group's stack.
+
+Changing a group's stack later never reshapes RDs that already carry one, as in upstream LINSTOR, where the stack is decided when a resource is created.
+
+As a last guard, the LUKS layer refuses to `luksFormat` a device that already carries a signature `blkid -p` recognises (DRBD metadata, a filesystem, a partition table). The replica's apply fails with `luks: device already holds data` and names what it found. On a fresh thick LV that reuses extents of an earlier volume the signature can be stale; clear it with `wipefs -a <device>` once you have checked it holds nothing you need.
+
+Find the RDs that kept the default stack:
+
+```bash
+kubectl get resourcedefinitions.blockstor.cozystack.io \
+  -o custom-columns='NAME:.metadata.name,GROUP_STACK:.metadata.annotations.blockstor\.io/unapplied-group-layer-stack' \
+  | awk '$2 != "<none>"'
+```
 
 ## Setting the stack
 
