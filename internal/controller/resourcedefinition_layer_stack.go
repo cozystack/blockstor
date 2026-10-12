@@ -82,14 +82,9 @@ func (r *ResourceDefinitionReconciler) pinLayerStack(ctx context.Context, rd *bl
 		return nil
 	}
 
-	holdsData, err := r.rdHoldsData(ctx, rd.Name)
+	stack, err := r.stackToPin(ctx, rd, groupStack)
 	if err != nil {
 		return err
-	}
-
-	stack := groupStack
-	if holdsData {
-		stack = apiv1.DefaultLayerStack()
 	}
 
 	base := rd.DeepCopy()
@@ -121,10 +116,33 @@ func (r *ResourceDefinitionReconciler) pinLayerStack(ctx context.Context, rd *bl
 	return nil
 }
 
+// stackToPin is the group's stack for an RD with nothing on disk, and
+// the default stack, the one an empty stack was built as, for an RD
+// that already holds data.
+func (r *ResourceDefinitionReconciler) stackToPin(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, groupStack []string) ([]string, error) {
+	if rdInitialized(rd) {
+		return apiv1.DefaultLayerStack(), nil
+	}
+
+	holdsData, err := r.rdHoldsData(ctx, rd.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	if holdsData {
+		return apiv1.DefaultLayerStack(), nil
+	}
+
+	return groupStack, nil
+}
+
 // rdHoldsData reports whether any replica of the RD has gone to disk:
 // DRBD metadata created, or a volume the satellite reported a device
 // for. Either means the storage under it was built with the stack the
-// RD carried then.
+// RD carried then. The caller checks the Initialized latch first, which
+// covers the case no replica has reported yet: an RD adopted by
+// linstor-migrate, or one whose data was written before its replicas'
+// status was.
 func (r *ResourceDefinitionReconciler) rdHoldsData(ctx context.Context, rdName string) (bool, error) {
 	var list blockstoriov1alpha1.ResourceList
 
