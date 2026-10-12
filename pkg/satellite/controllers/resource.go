@@ -476,6 +476,17 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// election relies on (Bug 80).
 	adoptAuthoritativeFlags(res, peers)
 
+	err = r.checkLayerStackPinned(ctx, &rd)
+	if errors.Is(err, errLayerStackNotPinned) {
+		logger.Info("waiting for the controller to pin the layer stack", "rd", rd.Name)
+
+		return ctrl.Result{RequeueAfter: layerStackPinRequeue}, nil
+	}
+
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// The DRBD-ID allocation gate only matters when the RD actually
 	// uses DRBD. A LayerStack=["STORAGE"] (or ["LUKS","STORAGE"]) RD
 	// renders no .res and the kernel never sees a node-id, so waiting
@@ -1063,9 +1074,16 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 // same work the controller's dispatcher did, just on the
 // satellite side. Phase 10.1.
 func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, peers []blockstoriov1alpha1.Resource) (*intent.DesiredResource, error) {
+	// Checked again here, not only in runApply: no intent is ever built
+	// from a stack the definition does not carry yet.
+	err := r.checkLayerStackPinned(ctx, rd)
+	if err != nil {
+		return nil, err
+	}
+
 	var nodeList blockstoriov1alpha1.NodeList
 
-	err := r.List(ctx, &nodeList)
+	err = r.List(ctx, &nodeList)
 	if err != nil {
 		return nil, errors.Wrap(err, "list Nodes")
 	}
