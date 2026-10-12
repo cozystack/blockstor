@@ -341,3 +341,22 @@ func TestPinLayerStackDoesNotOverwriteARacingWriter(t *testing.T) {
 		t.Fatalf("stack %v, want the racing writer's", got.rd.Spec.LayerStack)
 	}
 }
+
+// The Initialized latch is data too, before any replica has reported:
+// an RD adopted by linstor-migrate carries it from the start.
+func TestPinLayerStackTreatsTheInitializedLatchAsData(t *testing.T) {
+	t.Parallel()
+
+	initialized := true
+	rd := pinRD("rg-pin")
+	rd.Spec.Initialized = &initialized
+
+	got := reconcilePin(t, pinClient(t, pinGroup(luksStack...), rd, pinReplica("pvc-pin", "n1")))
+	if got.err != nil {
+		t.Fatalf("reconcile: %v", got.err)
+	}
+
+	if !slices.Equal(got.rd.Spec.LayerStack, apiv1.DefaultLayerStack()) {
+		t.Fatalf("stack %v, want the applied default", got.rd.Spec.LayerStack)
+	}
+}
