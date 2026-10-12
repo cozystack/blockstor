@@ -36,6 +36,8 @@ func TestFormatRunsLuksFormat(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("cryptsetup isLuks /dev/sda",
 		storage.FakeResponse{Err: errFakeNotLuks})
+	fx.Expect("blkid -p -o export /dev/sda",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	c := luks.NewCryptsetup(fx)
 
