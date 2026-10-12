@@ -49,6 +49,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/luks"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -508,7 +509,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
-	anyFailed := r.recordPerResourceFailures(results, logger)
+	anyFailed := r.recordPerResourceFailures(res, results, logger)
 
 	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
@@ -590,19 +591,36 @@ func (r *ResourceReconciler) prepareDRBDApply(
 // recordPerResourceFailures logs each per-resource Apply failure and
 // returns whether any of the results came back not-Ok. Extracted from
 // runApply so the orchestration stays under the funlen budget.
-func (r *ResourceReconciler) recordPerResourceFailures(results []*intent.ResourceApplyResult, logger logr.Logger) bool {
+//
+// A LUKS layer that refused to format a device holding data also gets a
+// Warning Event on the Resource: the volume never comes up, and an Info
+// line in this log is not where an operator looks for why.
+func (r *ResourceReconciler) recordPerResourceFailures(
+	res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult, logger logr.Logger,
+) bool {
 	var anyFailed bool
 
 	for _, ar := range results {
-		if !ar.GetOk() {
-			anyFailed = true
+		if ar.GetOk() {
+			continue
+		}
 
-			logger.Info("Apply per-resource failure", "name", ar.GetName(), "message", ar.GetMessage())
+		anyFailed = true
+
+		logger.Info("Apply per-resource failure", "name", ar.GetName(), "message", ar.GetMessage())
+
+		if r.Config.Recorder != nil && strings.Contains(ar.GetMessage(), luks.ErrDeviceHoldsData.Error()) {
+			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, deviceHoldsDataReason, "Apply",
+				"the LUKS layer refused to format a device that already holds data: %s", ar.GetMessage())
 		}
 	}
 
 	return anyFailed
 }
+
+// deviceHoldsDataReason is the Event reason for a LUKS format refused over
+// a device that carries a signature.
+const deviceHoldsDataReason = "LUKSDeviceHoldsData"
 
 // stampPostApply runs the four best-effort post-apply stamps:
 // Status.Volumes (per-volume DevicePath), the stale-Status.Volumes

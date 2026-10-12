@@ -117,6 +117,13 @@ var (
 // expects the day0 skip / winner set-gi seed must mark its fixture
 // SkipInitialSync=true (the controller decided this is a genuinely-fresh
 // RD), exactly as the real controller stamps it on the initial set.
+
+// anyBlockDevice takes every path for a block device, since the LUKS
+// devices these tests format exist only in the fake Exec.
+func anyBlockDevice() luks.Option {
+	return luks.WithBlockDeviceCheck(func(string) (bool, error) { return true, nil })
+}
+
 func skipInitTrue() *bool  { v := true; return &v }
 func skipInitFalse() *bool { v := false; return &v }
 
@@ -907,6 +914,8 @@ func TestApplyLayersLUKS(t *testing.T) {
 	// cryptsetup isLuks fails on a fresh device → format runs.
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-luks_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -914,7 +923,7 @@ func TestApplyLayersLUKS(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
@@ -966,7 +975,7 @@ func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
 
 	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
@@ -1011,6 +1020,8 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 	// First reconcile: not yet a LUKS device → luksFormat will run.
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-only_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-luks-only_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -1018,7 +1029,7 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
 
 	dr := []*intent.DesiredResource{
@@ -1100,6 +1111,8 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-stack_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-stack_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-stack_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -1107,7 +1120,7 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
@@ -1609,7 +1622,7 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
@@ -1706,7 +1719,7 @@ func TestApplyLUKSConvergeResizeAfterCrashRecovery(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 		Exec:       fx,
 	})
 
@@ -1803,7 +1816,7 @@ func TestApplyLUKSConvergeNoOpWhenMapperMatches(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 		Exec:       fx,
 	})
 
@@ -2329,7 +2342,7 @@ func TestDeleteResourceClosesLUKSMapper(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
 
 	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{
@@ -2599,6 +2612,8 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-format_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-format_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-luks-format_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 	// luksFormat fails: simulate the device being busy. Post-Issue
 	// 175 the cryptsetup invocation is direct, so the Expect key is
 	// the cryptsetup argv verbatim with no shell pipeline wrapping.
@@ -2611,7 +2626,7 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
 
 	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
@@ -2635,6 +2650,10 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 
 	if results[0].GetOk() {
 		t.Errorf("Ok: got true, want false on luksFormat failure")
+	}
+
+	if !strings.Contains(results[0].GetMessage(), errLUKSFormatBusy.Error()) {
+		t.Errorf("message %q is not the luksFormat failure", results[0].GetMessage())
 	}
 
 	if !strings.Contains(results[0].GetMessage(), "luks format") {
