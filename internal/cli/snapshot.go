@@ -347,6 +347,13 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 		return fmt.Errorf("create resource definition %s: %w", def.Name, err)
 	}
 
+	// The snapshot was read before the definition existed; see
+	// store.ReapClonedSnapshot.
+	err = store.RestoreSourceWithdrawn(ctx, run.Store, snap.ResourceName, snap.Name)
+	if err != nil {
+		return rollbackRestore(ctx, run, def.Name, planned, err)
+	}
+
 	// The definition is this command's own, but a concurrent run may already
 	// have adopted it and be hydrating the same volumes. A volume that is
 	// already there at the snapshot's size is the restore's, not a collision
@@ -386,6 +393,10 @@ func newRestoredDefinition(rdName string, src *apiv1.ResourceDefinition, snap *a
 	// the marker it finds against one built from the stored snapshot, while
 	// the placer looks the source half up as a store key.
 	def.Props = store.WithRestoreMarker(def.Props, snap)
+
+	// The owner prop belongs to the snapshot; see store.CloneSnapshotOwnerProp.
+	delete(def.Props, store.CloneSnapshotOwnerProp)
+	delete(def.Props, store.CloneSnapshotReapingProp)
 
 	return def
 }
@@ -467,6 +478,21 @@ func restoreIntoExistingTarget(
 	// way the REST door does, rather than placed over with this run's nodes.
 	if !adopted {
 		return finishConcurrentRestore(ctx, run, args, existing.Name, snap, createErr)
+	}
+
+	return placeOverMarkedTarget(ctx, run, existing.Name, snap, planned)
+}
+
+// placeOverMarkedTarget places the planned replicas on a target that carries
+// this restore's marker. The snapshot was read before the marker went on, or
+// before this run found it there, so it is read back first; see
+// store.ReapClonedSnapshot.
+func placeOverMarkedTarget(
+	ctx context.Context, run *runContext, rdName string, snap *apiv1.Snapshot, planned []apiv1.Resource,
+) error {
+	err := store.RestoreSourceWithdrawn(ctx, run.Store, snap.ResourceName, snap.Name)
+	if err != nil {
+		return fmt.Errorf("restore into %s: %w", rdName, err)
 	}
 
 	return placeOverExisting(ctx, run, planned)
@@ -630,7 +656,7 @@ func finishRestoreLeftover(
 		return err
 	}
 
-	return placeOverExisting(ctx, run, planned)
+	return placeOverMarkedTarget(ctx, run, rdName, snap, planned)
 }
 
 // answerFinishedLeftover reports a finished leftover of this restore as

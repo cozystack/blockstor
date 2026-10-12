@@ -1474,6 +1474,8 @@ func (s *Server) ensureCloneSnapshot(
 		return nil, false, false
 	}
 
+	stampCloneSnapshotOwner(&snap, cloneName)
+
 	snap.Snapshots = makeSnapshotPerNode(snapName, snap.Nodes, snap.VolumeDefinitions)
 
 	err = s.Store.Snapshots().Create(ctx, &snap)
@@ -1488,6 +1490,20 @@ func (s *Server) ensureCloneSnapshot(
 	}
 
 	return &snap, false, true
+}
+
+// stampCloneSnapshotOwner marks the snapshot as the clone's own, so deleting
+// the clone may reap it. A name cannot carry that: an operator can call a
+// snapshot `clone-<target>` and restore it under that target, and the marker a
+// restore writes is the one a clone writes. The map is copied first, since the
+// hydration hands over the source definition's own.
+func stampCloneSnapshotOwner(snap *apiv1.Snapshot, cloneName string) {
+	snap.Props = maps.Clone(snap.Props)
+	if snap.Props == nil {
+		snap.Props = map[string]string{}
+	}
+
+	snap.Props[store.CloneSnapshotOwnerProp] = cloneName
 }
 
 // cloneSourceIsNotBeingDeleted mirrors the snapshot-create Bug 180 gate: a
