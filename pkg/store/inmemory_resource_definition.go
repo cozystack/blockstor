@@ -95,6 +95,11 @@ func (s *inMemoryResourceDefinitions) Update(_ context.Context, rd *apiv1.Resour
 	}
 
 	next := *rd
+	// A decided layer stack is never emptied by a write-back of an older
+	// copy, as on the k8s store.
+	if len(next.LayerStack) == 0 {
+		next.LayerStack = prev.LayerStack
+	}
 	// Bug-021: nil wire annotations = "untouched"; empty = "clear".
 	// Mirrors the k8s store's mergeUserAnnotationsInto contract.
 	next.Annotations = carryAnnotationsOnNil(next.Annotations, prev.Annotations)

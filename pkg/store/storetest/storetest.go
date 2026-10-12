@@ -1282,6 +1282,7 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
 	// See annotation_contract.go.
 	t.Run("UpdateAnnotationContract", func(t *testing.T) { testRDUpdateAnnotationContract(t, newStore) })
+	t.Run("UpdateKeepsADecidedLayerStack", func(t *testing.T) { testRDUpdateKeepsADecidedLayerStack(t, newStore) })
 	t.Run("UpdateChangesProps", func(t *testing.T) {
 		s := newStore(t).ResourceDefinitions()
 		ctx := t.Context()
@@ -1307,6 +1308,54 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("LayerStack: got %v, want [DRBD STORAGE]", got.LayerStack)
 		}
 	})
+}
+
+// testRDUpdateKeepsADecidedLayerStack: a write-back of a copy read
+// before the layer stack was pinned carries no stack. It must leave
+// the pin in place, or the RD reconcile would decide again over a
+// volume that may already hold data. Replacing a pinned stack with
+// another non-empty one still goes through.
+func testRDUpdateKeepsADecidedLayerStack(t *testing.T, newStore Factory) {
+	t.Helper()
+	s := newStore(t).ResourceDefinitions()
+	ctx := t.Context()
+	if err := s.Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-pin"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	stale, err := s.Get(ctx, "pvc-pin")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	pinned := stale
+	pinned.LayerStack = []string{"DRBD", "LUKS", "STORAGE"}
+	if err := s.Update(ctx, &pinned); err != nil {
+		t.Fatalf("Update (pin): %v", err)
+	}
+	stale.Props = map[string]string{"k": "v"}
+	if err := s.Update(ctx, &stale); err != nil {
+		t.Fatalf("Update (stale write-back): %v", err)
+	}
+	got, err := s.Get(ctx, "pvc-pin")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !slices.Equal(got.LayerStack, []string{"DRBD", "LUKS", "STORAGE"}) {
+		t.Errorf("LayerStack after a stale write-back: got %v, want [DRBD LUKS STORAGE]", got.LayerStack)
+	}
+	if got.Props["k"] != "v" {
+		t.Errorf("Props: got %v, want the write-back's k=v", got.Props)
+	}
+	got.LayerStack = []string{"DRBD", "STORAGE"}
+	if err := s.Update(ctx, &got); err != nil {
+		t.Fatalf("Update (replace): %v", err)
+	}
+	got, err = s.Get(ctx, "pvc-pin")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !slices.Equal(got.LayerStack, []string{"DRBD", "STORAGE"}) {
+		t.Errorf("LayerStack after a replace: got %v, want [DRBD STORAGE]", got.LayerStack)
+	}
 }
 
 // RunResourceGroupStore exercises every branch of store.ResourceGroupStore.
