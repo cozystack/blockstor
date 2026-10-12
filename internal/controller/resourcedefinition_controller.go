@@ -30,6 +30,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -86,6 +87,11 @@ type ResourceDefinitionReconciler struct {
 	// reconciler directly and skip this — the field is nil-safe
 	// and falls back to the cached client below.
 	APIReader client.Reader
+
+	// Recorder emits the warning Event for an RD that kept the default
+	// layer stack because it already held data. Nil in tests that do
+	// not assert on Events.
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
@@ -118,6 +124,13 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	if !rd.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
+	}
+
+	err = r.pinLayerStack(ctx, &rd)
+	if err != nil {
+		log.Error(err, "pin layer stack", "rd", rd.Name)
+
+		return ctrl.Result{}, err
 	}
 
 	err = r.ensureTiebreaker(ctx, &rd)
@@ -941,10 +954,10 @@ func (r *ResourceDefinitionReconciler) rollbackWitnessIfRDGone(ctx context.Conte
 }
 
 // resolveRDLayerStack returns the effective layer composition for
-// the RD by walking RD → RG → default. Mirrors the (unexported)
-// ResourceReconciler.resolveLayerStack but lives on the RD
-// reconciler so the witness gate (Bug 334) doesn't have to depend on
-// the resource-reconciler instance.
+// the RD by walking RD → RG → default, for the witness gate (Bug 334).
+// It runs before pinLayerStack has written the group's stack onto a
+// fresh RD, so it reads the group itself; it decides only whether a
+// witness is placed, never what goes to disk.
 //
 // Read order:
 //
