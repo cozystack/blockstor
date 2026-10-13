@@ -1102,7 +1102,9 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 // marker says the definition is this operation's own, the DELETE flag says
 // whether it is still there to finish, and the fields the caller named say
 // whether it is the same operation.
-func leftoverIsThisRestore(existing *apiv1.ResourceDefinition, snap *apiv1.Snapshot, overrides *rdShapeOverrides) bool {
+func (s *Server) leftoverIsThisRestore(
+	ctx context.Context, existing *apiv1.ResourceDefinition, snap *apiv1.Snapshot, overrides *rdShapeOverrides,
+) (bool, error) {
 	var namedRG string
 
 	var namedLayers []string
@@ -1111,9 +1113,14 @@ func leftoverIsThisRestore(existing *apiv1.ResourceDefinition, snap *apiv1.Snaps
 		namedRG, namedLayers = overrides.ResourceGroupName, overrides.LayerStack
 	}
 
-	return restoreMarkerMatches(existing.Props, snap.ResourceName, snap.Name) &&
-		!slices.Contains(existing.Flags, rdFlagDelete) &&
-		requestedShapeDiffers(existing, namedRG, namedLayers) == ""
+	if !restoreMarkerMatches(existing.Props, snap.ResourceName, snap.Name) ||
+		slices.Contains(existing.Flags, rdFlagDelete) {
+		return false, nil
+	}
+
+	differs, err := s.requestedShapeDiffers(ctx, existing, namedRG, namedLayers)
+
+	return differs == "" && err == nil, err
 }
 
 // requestedShapeDiffers names the first way a definition already under the
@@ -1140,29 +1147,36 @@ func leftoverIsThisRestore(existing *apiv1.ResourceDefinition, snap *apiv1.Snaps
 // group materializeRestoredRD stamped, the source's unless the request named
 // one, so without it a request that names no group is compared as "" against
 // that group and refused.
-func requestedShapeDiffers(existing *apiv1.ResourceDefinition, rgName string, layers []string) string {
+func (s *Server) requestedShapeDiffers(
+	ctx context.Context, existing *apiv1.ResourceDefinition, rgName string, layers []string,
+) (string, error) {
 	if rgName != "" && !strings.EqualFold(existing.ResourceGroupName, rgName) {
-		return "resource group '" + existing.ResourceGroupName + "', not '" + rgName + "'"
+		return "resource group '" + existing.ResourceGroupName + "', not '" + rgName + "'", nil
 	}
 
 	if len(layers) == 0 {
-		return ""
+		return "", nil
 	}
 
-	// An unset stack is a definition that never said, which is what
-	// materializeRestoredRD copies off a source that never said either, and
-	// not a definition with no layers. Unresolved, that leftover compared
-	// against a retry naming [DRBD, STORAGE], which is every linstor-csi
-	// retry, reads as adding both layers and refuses the resume. A retry that
-	// names no stack is not compared at all.
-	have := store.EffectiveLayerStack(existing.LayerStack)
+	// The leftover's stack as its volumes are laid down, not the raw field. A
+	// leftover materializeRestoredRD wrote carries its stack explicitly; one
+	// left empty by an older controller is resolved through its group, and
+	// is undecided until the controller pins it, which a retry outlasts.
+	// Unresolved, an empty stack compared against a retry naming
+	// [DRBD, STORAGE], which is every linstor-csi retry, reads as adding both
+	// layers and refuses the resume. A retry that names no stack is not
+	// compared at all.
+	have, err := store.EffectiveLayerStack(ctx, s.Store, existing)
+	if err != nil {
+		return "", errors.Wrapf(err, "the layer stack of %q", existing.Name)
+	}
 
 	added, dropped := layerSetDifference(have, layers)
 	if len(added) > 0 || len(dropped) > 0 {
-		return "layer stack " + strings.Join(have, ",") + ", not " + strings.Join(layers, ",")
+		return "layer stack " + strings.Join(have, ",") + ", not " + strings.Join(layers, ","), nil
 	}
 
-	return ""
+	return "", nil
 }
 
 // uncheckedRestoreGroupWarning tells the caller the restore worked and that
@@ -1336,6 +1350,15 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		return materialisedRD{}, err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
+	// The restored bytes were laid down under the source's stack, so that is
+	// the target's, unless a clone names its own (which its gate holds to the
+	// same set). A source whose group has yet to decide it is refused until
+	// the controller does, rather than guessed.
+	stack, err := store.EffectiveLayerStack(ctx, s.Store, &srcRDObj)
+	if err != nil {
+		return materialisedRD{}, err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
 	newRD := apiv1.ResourceDefinition{
 		Name: req.ToResource,
 		// Bug 151: carry over the source's ResourceGroupName so the
@@ -1347,7 +1370,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		// auto-placement and prop inheritance).
 		ResourceGroupName: srcRDObj.ResourceGroupName,
 		Props:             store.TravellingProps(snap.Props),
-		LayerStack:        srcRDObj.LayerStack,
+		LayerStack:        stack,
 	}
 
 	if newRD.Props == nil {
@@ -1356,11 +1379,21 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 
 	overrides.applyTo(&newRD)
 
-	// The stack the restored bytes are brought up under is the source's as
-	// the data plane resolves it. Left empty, a group named for the target
-	// whose stack differs would have the control plane judge the definition
-	// by that group's stack while the satellite brings it up as the source's.
-	newRD.LayerStack = store.EffectiveLayerStack(newRD.LayerStack)
+	// A copy short of what its group asks for, a plaintext one in a LUKS
+	// group, is flagged the way the controller flags a definition it pinned
+	// over data; see store.UnappliedGroupStack.
+	unapplied, err := store.UnappliedGroupStack(ctx, s.Store, newRD.ResourceGroupName, newRD.LayerStack)
+	if err != nil {
+		return materialisedRD{}, err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	if unapplied != "" {
+		if newRD.Annotations == nil {
+			newRD.Annotations = map[string]string{}
+		}
+
+		newRD.Annotations[apiv1.UnappliedGroupLayerStackAnnotation] = unapplied
+	}
 
 	// Stamp the clone-source so the dispatcher's buildVolumes (called
 	// at every satellite-reconcile of placed Resources) emits
@@ -1438,7 +1471,12 @@ func (s *Server) createOrAdoptRestoredRD(ctx context.Context, newRD *apiv1.Resou
 	// between the state check above and this Create — but it is the exact
 	// state the 409 in restoreTargetState exists to prevent, and hydrating
 	// volumes into a dying definition races the tear-down reaping them.
-	if !leftoverIsThisRestore(&existing, snap, overrides) {
+	own, ownErr := s.leftoverIsThisRestore(ctx, &existing, snap, overrides)
+	if ownErr != nil {
+		return false, "", ownErr
+	}
+
+	if !own {
 		return false, "", err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
