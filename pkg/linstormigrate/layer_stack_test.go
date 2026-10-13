@@ -124,6 +124,35 @@ func TestSnapshotAndSuffixedLayersDoNotShapeTheStack(t *testing.T) {
 	}
 }
 
+// A diskless replica (a client or a tiebreaker) is built as DRBD over
+// STORAGE whatever its definition's stack, so it neither shapes the stack
+// nor makes the diskful replicas look divergent.
+func TestADisklessReplicaDoesNotShapeTheStack(t *testing.T) {
+	t.Parallel()
+
+	for name, rdStack := range map[string]string{"empty": "[]", "named": `["DRBD","LUKS","STORAGE"]`} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dump := stackDump(rdStack,
+				layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE"))
+			dump.Resources = []ResourceRow{
+				{NodeName: "NODE-A", ResourceName: "PVC-S", UUID: "r-a"},
+				{NodeName: "NODE-B", ResourceName: "PVC-S", ResourceFlags: resourceFlagDiskless, UUID: "r-b"},
+			}
+
+			got, res := convertedStack(t, dump)
+			if !slices.Equal(got, []string{"DRBD", "LUKS", "STORAGE"}) {
+				t.Fatalf("stack %v; warnings %v", got, res.Warnings)
+			}
+
+			if hasWarning(res, "built as") {
+				t.Errorf("a diskless replica was reported as divergent; warnings %v", res.Warnings)
+			}
+		})
+	}
+}
+
 // Replicas built two ways leave nothing to read: the stack stays unset
 // and the operator is told which ways.
 func TestReplicasThatDisagreeLeaveTheStackUnset(t *testing.T) {
