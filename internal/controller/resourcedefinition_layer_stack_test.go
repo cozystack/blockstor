@@ -237,6 +237,23 @@ func TestPinLayerStackDataUnderTheGroupsOwnStackIsNoConflict(t *testing.T) {
 	}
 }
 
+// The group's stack is a set: a group spelling it in another order or case
+// asks for the same layers, and the data under them is no conflict.
+func TestPinLayerStackReadsTheGroupsStackAsASet(t *testing.T) {
+	t.Parallel()
+
+	for _, groupStack := range [][]string{{"drbd", "storage"}, {"STORAGE", "DRBD"}} {
+		got := reconcilePin(t, pinClient(t, pinGroup(groupStack...), pinRD("rg-pin"), withMetadata(pinReplica("pvc-pin", "n1"))))
+		if got.err != nil {
+			t.Fatalf("reconcile under %v: %v", groupStack, got.err)
+		}
+
+		if _, ok := got.rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation]; ok || len(got.events) != 0 {
+			t.Errorf("group %v: annotations %v, events %v, want neither", groupStack, got.rd.Annotations, got.events)
+		}
+	}
+}
+
 // Data on another RD's replica says nothing about this one.
 func TestPinLayerStackLooksOnlyAtItsOwnReplicas(t *testing.T) {
 	t.Parallel()
