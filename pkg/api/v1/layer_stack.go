@@ -52,6 +52,20 @@ func LayerInStack(stack []string, kind string) bool {
 	return false
 }
 
+// LacksLayerOf reports whether stack is missing a layer group names, read as
+// sets. A stack with layers of its own beyond the group's is not short of it:
+// an encrypted volume in a plaintext group is not what an operator looking for
+// a missing layer is after.
+func LacksLayerOf(stack, group []string) bool {
+	for _, layer := range group {
+		if !LayerInStack(stack, layer) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // SameLayerSet compares two stacks as sets. Order follows from the kinds in a
 // stack and LINSTOR folds name case, so neither is a difference.
 func SameLayerSet(have, want []string) bool {

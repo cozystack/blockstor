@@ -40,7 +40,7 @@ Changing a group's stack later never reshapes RDs that already carry one, as in 
 
 As a last guard, the LUKS layer refuses to `luksFormat` a device that already carries a signature `blkid -p` recognises (DRBD metadata, a filesystem, a partition table). The replica's apply fails with `luks: device already holds data` and names what it found. On a fresh thick LV that reuses extents of an earlier volume the signature can be stale; clear it with `wipefs -a <device>` once you have checked it holds nothing you need.
 
-Find the RDs that kept the default stack:
+Find the RDs short of a layer their group asks for:
 
 ```bash
 kubectl get resourcedefinitions.blockstor.cozystack.io \

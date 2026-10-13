@@ -254,6 +254,21 @@ func TestPinLayerStackReadsTheGroupsStackAsASet(t *testing.T) {
 	}
 }
 
+// Data under more layers than the group asks for is not short of it, and is
+// not flagged.
+func TestPinLayerStackFlagsOnlyAStackShortOfTheGroup(t *testing.T) {
+	t.Parallel()
+
+	got := reconcilePin(t, pinClient(t, pinGroup("STORAGE"), pinRD("rg-pin"), withMetadata(pinReplica("pvc-pin", "n1"))))
+	if got.err != nil {
+		t.Fatalf("reconcile: %v", got.err)
+	}
+
+	if _, ok := got.rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation]; ok || len(got.events) != 0 {
+		t.Errorf("annotations %v, events %v, want neither", got.rd.Annotations, got.events)
+	}
+}
+
 // Data on another RD's replica says nothing about this one.
 func TestPinLayerStackLooksOnlyAtItsOwnReplicas(t *testing.T) {
 	t.Parallel()
