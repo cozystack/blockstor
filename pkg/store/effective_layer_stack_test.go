@@ -36,6 +36,7 @@ func seedGroups(t *testing.T, st store.Store) {
 	for _, rg := range []apiv1.ResourceGroup{
 		{Name: "grp-luks", SelectFilter: apiv1.AutoSelectFilter{LayerStack: []string{"DRBD", "LUKS", "STORAGE"}}},
 		{Name: "grp-plain"},
+		{Name: "grp-drbd", SelectFilter: apiv1.AutoSelectFilter{LayerStack: []string{"DRBD", "STORAGE"}}},
 	} {
 		if err := st.ResourceGroups().Create(t.Context(), &rg); err != nil {
 			t.Fatalf("seed group %q: %v", rg.Name, err)
@@ -111,6 +112,8 @@ func TestUnappliedGroupStack(t *testing.T) {
 		{"grp-luks", []string{"DRBD", "STORAGE"}, "DRBD,LUKS,STORAGE"},
 		{"grp-luks", []string{"storage", "luks", "drbd"}, ""},
 		{"grp-plain", []string{"DRBD", "STORAGE"}, ""},
+		// More layers than the group asks for is not short of it.
+		{"grp-drbd", []string{"DRBD", "LUKS", "STORAGE"}, ""},
 		{"", []string{"DRBD", "STORAGE"}, ""},
 	} {
 		got, err := store.UnappliedGroupStack(t.Context(), st, tc.group, tc.stack)
