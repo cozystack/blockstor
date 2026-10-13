@@ -102,7 +102,7 @@ func (r *ResourceDefinitionReconciler) pinLayerStack(ctx context.Context, rd *bl
 	}
 
 	logf.FromContext(ctx).Info("pinned layer stack", "rd", rd.Name, "stack", stack, "group", rg.Name,
-		"groupStack", groupStack, "groupStackApplied", !unapplied)
+		"groupStack", groupStack, "shortOfGroup", unapplied)
 
 	if unapplied && r.Recorder != nil {
 		r.Recorder.Eventf(rd, nil, corev1.EventTypeWarning, layerStackNotInheritedReason, layerStackPinAction,
