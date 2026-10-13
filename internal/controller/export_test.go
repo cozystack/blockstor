@@ -22,6 +22,7 @@ import (
 	"context"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -52,6 +53,17 @@ func (r *ResourceDefinitionReconciler) EnqueueRDForResource(ctx context.Context,
 // collapsed tiebreaker after `linstor n rst`.
 func (r *ResourceDefinitionReconciler) EnqueueRDsForNode(ctx context.Context, obj client.Object) []reconcile.Request {
 	return r.enqueueRDsForNode(ctx, obj)
+}
+
+// EnqueueRDsLeftToGroupStack exposes the resource-group watch fan-out for
+// tests.
+func (r *ResourceDefinitionReconciler) EnqueueRDsLeftToGroupStack(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.enqueueRDsLeftToGroupStack(ctx, obj)
+}
+
+// GroupLayerStackSet exposes the resource-group watch predicate for tests.
+func GroupLayerStackSet() predicate.Predicate {
+	return groupLayerStackSet()
 }
 
 // NodeHasDrainFlag exposes the EVICTED/LOST flag-set probe the Bug-386
