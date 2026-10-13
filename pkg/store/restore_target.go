@@ -179,7 +179,7 @@ func PreparedRestoreTarget(ctx context.Context, st Store, cached *apiv1.Resource
 		return false, fmt.Errorf("the layer stack of %q: %w", rd.Name, err)
 	}
 
-	if !sameLayerSet(have, want) {
+	if !apiv1.SameLayerSet(have, want) {
 		return false, fmt.Errorf("%w: %q has %s, the source %q has %s", ErrRestoreTargetLayers,
 			rd.Name, strings.Join(want, ","), source.Name, strings.Join(have, ","))
 	}
@@ -268,29 +268,11 @@ func UnappliedGroupStack(ctx context.Context, st Store, rgName string, stack []s
 		return "", err
 	}
 
-	if len(groupStack) == 0 || sameLayerSet(stack, groupStack) {
+	if len(groupStack) == 0 || apiv1.SameLayerSet(stack, groupStack) {
 		return "", nil
 	}
 
 	return strings.Join(groupStack, ","), nil
-}
-
-// sameLayerSet compares two stacks as sets. Order follows from the kinds in a
-// stack and LINSTOR folds name case, so neither is a difference.
-func sameLayerSet(have, want []string) bool {
-	for _, layer := range have {
-		if !apiv1.LayerInStack(want, layer) {
-			return false
-		}
-	}
-
-	for _, layer := range want {
-		if !apiv1.LayerInStack(have, layer) {
-			return false
-		}
-	}
-
-	return true
 }
 
 // sameVolumes reports whether a definition's volumes are exactly the ones the
