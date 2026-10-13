@@ -400,10 +400,21 @@ func (c *converter) buildLayerInstanceIndexes() {
 // then each base-suffix child down to STORAGE. The RD row's own
 // layer_stack is only what was asked for at creation, and is often
 // empty, LINSTOR having resolved the stack per resource; this chain is
-// what is on disk.
+// what is on disk. A diskless replica is left out: LINSTOR builds it as
+// DRBD over STORAGE whatever the definition's stack, so it says nothing
+// about how the data was written.
 func (c *converter) indexDiskStacks() {
 	rows := c.dump.LayerResourceIDs
 	children := map[int32]LayerResourceIDRow{}
+
+	diskless := map[replicaKey]bool{}
+
+	for i := range c.dump.Resources {
+		res := &c.dump.Resources[i]
+		if res.SnapshotName == "" && res.ResourceFlags&resourceFlagDiskless != 0 {
+			diskless[replicaKey{node: res.NodeName, rd: res.ResourceName}] = true
+		}
+	}
 
 	for i := range rows {
 		if rows[i].LayerResourceParentID != nil && rows[i].LayerResourceSuffix == "" {
@@ -414,6 +425,10 @@ func (c *converter) indexDiskStacks() {
 	for i := range rows {
 		row := rows[i]
 		if row.LayerResourceParentID != nil || row.SnapshotName != "" || row.LayerResourceSuffix != "" {
+			continue
+		}
+
+		if diskless[replicaKey{node: row.NodeName, rd: row.ResourceName}] {
 			continue
 		}
 
