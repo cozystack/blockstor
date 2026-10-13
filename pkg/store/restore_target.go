@@ -257,7 +257,7 @@ func layerStackUnder(rdName string, own []string, rgName string, groupStack []st
 
 // UnappliedGroupStack is the value of apiv1.UnappliedGroupLayerStackAnnotation
 // for a definition that holds data under stack in the named group: the group's
-// stack when the group sets one with other layers, "" otherwise. A clone or
+// stack when stack is missing one of its layers, "" otherwise. A clone or
 // restore target carries its source's bytes, so its stack is the source's and
 // not a choice; when that leaves it short of what its group asks for (a
 // plaintext copy in a LUKS group), it is flagged the way the controller flags
@@ -268,7 +268,7 @@ func UnappliedGroupStack(ctx context.Context, st Store, rgName string, stack []s
 		return "", err
 	}
 
-	if len(groupStack) == 0 || apiv1.SameLayerSet(stack, groupStack) {
+	if !apiv1.LacksLayerOf(stack, groupStack) {
 		return "", nil
 	}
 

@@ -87,7 +87,7 @@ func (r *ResourceDefinitionReconciler) pinLayerStack(ctx context.Context, rd *bl
 	base := rd.DeepCopy()
 	rd.Spec.LayerStack = slices.Clone(stack)
 
-	unapplied := !apiv1.SameLayerSet(stack, groupStack)
+	unapplied := apiv1.LacksLayerOf(stack, groupStack)
 	if unapplied {
 		if rd.Annotations == nil {
 			rd.Annotations = map[string]string{}
