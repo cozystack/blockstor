@@ -339,6 +339,36 @@ func (f failingRGReadStore) ResourceGroups() store.ResourceGroupStore {
 	return failingRGReads{f.Store.ResourceGroups()}
 }
 
+// failingRGRecheckStore fails the group reads that come after the target
+// definition exists, which is the post-write re-check. The reads before the
+// write, the one that resolves the source's layer stack among them, decide
+// what gets written, so a failure there refuses before anything lands and is
+// not what these tests are about.
+type failingRGRecheckStore struct {
+	store.Store
+
+	target string
+}
+
+func (f failingRGRecheckStore) ResourceGroups() store.ResourceGroupStore {
+	return failingRGRecheckReads{ResourceGroupStore: f.Store.ResourceGroups(), backend: f.Store, target: f.target}
+}
+
+type failingRGRecheckReads struct {
+	store.ResourceGroupStore
+
+	backend store.Store
+	target  string
+}
+
+func (f failingRGRecheckReads) Get(ctx context.Context, name string) (apiv1.ResourceGroup, error) {
+	if _, err := f.backend.ResourceDefinitions().Get(ctx, f.target); err == nil {
+		return apiv1.ResourceGroup{}, errRGReadFailed
+	}
+
+	return f.ResourceGroupStore.Get(ctx, name) //nolint:wrapcheck // test double
+}
+
 // The post-write check is a safety net over a restore that already succeeded.
 // When the net itself cannot be inspected, undoing the restore trades a rare
 // dangling parent group for a certain lost restore — and a worse one, because
@@ -375,7 +405,7 @@ func TestSnapshotRestoreSurvivesAFailedParentGroupRecheck(t *testing.T) {
 		t.Fatalf("seed the snapshot: %v", err)
 	}
 
-	base, stop := startServerWithStore(t, failingRGReadStore{backend})
+	base, stop := startServerWithStore(t, failingRGRecheckStore{Store: backend, target: "flaky-dst"})
 	defer stop()
 
 	body, _ := json.Marshal(map[string]string{
@@ -504,7 +534,7 @@ func TestRDCloneSurvivesAFailedParentGroupRecheck(t *testing.T) {
 	ctx := t.Context()
 	seedGroupedCloneSource(t, backend, "src-flaky-rg", "grp-flaky-clone", true)
 
-	base, stop := startServerWithStore(t, failingRGReadStore{backend})
+	base, stop := startServerWithStore(t, failingRGRecheckStore{Store: backend, target: "dst-flaky-rg"})
 	defer stop()
 
 	resp := postClone(t, base, "src-flaky-rg", map[string]any{

@@ -21,29 +21,67 @@ func seedLayeredGroup(t *testing.T, st store.Store, name string, stack []string)
 	}
 }
 
-func assertDataPlaneStack(t *testing.T, st store.Store, rdName string) {
+func luksStack() []string { return []string{"DRBD", "LUKS", "STORAGE"} }
+
+func readRD(t *testing.T, st store.Store, name string) apiv1.ResourceDefinition {
 	t.Helper()
 
-	rd, err := st.ResourceDefinitions().Get(t.Context(), rdName)
+	rd, err := st.ResourceDefinitions().Get(t.Context(), name)
 	if err != nil {
-		t.Fatalf("read %q: %v", rdName, err)
+		t.Fatalf("read %q: %v", name, err)
 	}
 
-	if !slices.Equal(rd.LayerStack, apiv1.DefaultLayerStack()) {
-		t.Errorf("%q stack = %v, want the source's %v stamped: left empty, the control plane "+
-			"would judge it by its group's stack while the satellite brings it up as the source's",
-			rdName, rd.LayerStack, apiv1.DefaultLayerStack())
+	return rd
+}
+
+// reshapeRD sets a definition's group, stack and annotations the way the
+// controller pin or an operator edit would.
+func reshapeRD(t *testing.T, st store.Store, name, group string, stack []string, annotations map[string]string) {
+	t.Helper()
+
+	rd := readRD(t, st, name)
+	rd.ResourceGroupName = group
+	rd.LayerStack = stack
+	rd.Annotations = annotations
+
+	if err := st.ResourceDefinitions().Update(t.Context(), &rd); err != nil {
+		t.Fatalf("reshape %q: %v", name, err)
+	}
+}
+
+func assertRDAbsent(t *testing.T, st store.Store, name string) {
+	t.Helper()
+
+	if _, err := st.ResourceDefinitions().Get(t.Context(), name); err == nil {
+		t.Errorf("%q exists after a refusal that should have written nothing", name)
+	}
+}
+
+func assertStack(t *testing.T, st store.Store, name string, want []string) {
+	t.Helper()
+
+	if got := readRD(t, st, name).LayerStack; !slices.Equal(got, want) {
+		t.Errorf("%q stack = %v, want %v", name, got, want)
+	}
+}
+
+func assertUnapplied(t *testing.T, st store.Store, name, want string) {
+	t.Helper()
+
+	if got := readRD(t, st, name).Annotations[apiv1.UnappliedGroupLayerStackAnnotation]; got != want {
+		t.Errorf("%q unapplied-group annotation = %q, want %q", name, got, want)
 	}
 }
 
 // A clone named into a group whose stack differs keeps the stack the source's
-// bytes were written under, stamped, so the group's stack cannot reach it.
+// bytes were written under, stamped, so the group's stack cannot reach it, and
+// it is flagged as short of what its group asks for.
 func TestRDCloneIntoAGroupOfAnotherStackKeepsTheSourcesStack(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
 	seedDeployedCloneSource(t, st, "src-grp")
-	seedLayeredGroup(t, st, "grp-luks", []string{"DRBD", "LUKS", "STORAGE"})
+	seedLayeredGroup(t, st, "grp-luks", luksStack())
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
@@ -52,32 +90,184 @@ func TestRDCloneIntoAGroupOfAnotherStackKeepsTheSourcesStack(t *testing.T) {
 		t.Fatalf("clone into a group of another stack = %d, want 201", code)
 	}
 
-	assertDataPlaneStack(t, st, "dst-grp")
+	assertStack(t, st, "dst-grp", apiv1.DefaultLayerStack())
+	assertUnapplied(t, st, "dst-grp", "DRBD,LUKS,STORAGE")
 }
 
-// A volume-less source is cloned as a shell, and the shell is stamped with the
-// source's data-plane stack the same way the data path stamps its target: left
-// empty under a group of another stack, volumes added to it later would be
-// brought up as the default while the control plane judged them by the group.
-func TestRDCloneShellIntoAGroupOfAnotherStackKeepsTheSourcesStack(t *testing.T) {
+// A clone of a source whose stack its group has yet to decide waits for the
+// decision: 503, nothing written. Once the controller pins the source (here
+// over data, so to the default stack), the same request clones it with that
+// stack.
+func TestRDCloneOfAnUndecidedSourceWaitsForTheStack(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
-	seedLayeredGroup(t, st, "grp-shell-luks", []string{"DRBD", "LUKS", "STORAGE"})
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, "src-und")
+	seedLayeredGroup(t, st, "grp-und", luksStack())
+	reshapeRD(t, st, "src-und", "grp-und", nil, nil)
 
-	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "src-shell"}); err != nil {
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	for _, extra := range []map[string]any{nil, {"layer_list": []string{"DRBD", "STORAGE"}}} {
+		if code := cloneOnce(t, base, "src-und", "dst-und", extra); code != http.StatusServiceUnavailable {
+			t.Errorf("clone of an undecided source (%v) = %d, want 503", extra, code)
+		}
+	}
+
+	assertRDAbsent(t, st, "dst-und")
+
+	if _, err := st.Snapshots().Get(ctx, "src-und", cloneSnapshotName("dst-und")); err == nil {
+		t.Error("the refused clone took its internal snapshot of the source")
+	}
+
+	reshapeRD(t, st, "src-und", "grp-und", apiv1.DefaultLayerStack(),
+		map[string]string{apiv1.UnappliedGroupLayerStackAnnotation: "DRBD,LUKS,STORAGE"})
+
+	if code := cloneOnce(t, base, "src-und", "dst-und", nil); code != http.StatusCreated {
+		t.Fatalf("clone once the source is pinned = %d, want 201", code)
+	}
+
+	assertStack(t, st, "dst-und", apiv1.DefaultLayerStack())
+	assertUnapplied(t, st, "dst-und", "DRBD,LUKS,STORAGE")
+}
+
+// A finished clone is answered before the source is read, so a source that
+// became undecided since (moved under a group with a stack) does not fail its
+// replay.
+func TestRDCloneReplayDoesNotReadTheSourcesStack(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedDeployedCloneSource(t, st, "src-rep")
+	seedLayeredGroup(t, st, "grp-rep", luksStack())
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	if code := cloneOnce(t, base, "src-rep", "dst-rep", nil); code != http.StatusCreated {
+		t.Fatalf("first clone = %d, want 201", code)
+	}
+
+	reshapeRD(t, st, "src-rep", "grp-rep", nil, nil)
+
+	if code := cloneOnce(t, base, "src-rep", "dst-rep", nil); code != http.StatusCreated {
+		t.Errorf("replay over a source that became undecided = %d, want 201", code)
+	}
+
+	if code := cloneOnce(t, base, "src-rep", "dst-rep",
+		map[string]any{"layer_list": []string{"DRBD", "STORAGE"}}); code != http.StatusCreated {
+		t.Errorf("replay naming the stack the clone has = %d, want 201", code)
+	}
+}
+
+// A finished clone left with an empty stack, as an older controller wrote
+// them, is compared against a named stack once its group decides it: 503
+// until the controller pins it, the usual answer after.
+func TestRDCloneReplayOfAnUndecidedLeftoverWaitsForTheStack(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedDeployedCloneSource(t, st, "src-old")
+	seedLayeredGroup(t, st, "grp-old", luksStack())
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	if code := cloneOnce(t, base, "src-old", "dst-old", nil); code != http.StatusCreated {
+		t.Fatalf("first clone = %d, want 201", code)
+	}
+
+	dst := readRD(t, st, "dst-old")
+	reshapeRD(t, st, "dst-old", "grp-old", nil, dst.Annotations)
+
+	named := map[string]any{"layer_list": []string{"DRBD", "STORAGE"}}
+	if code := cloneOnce(t, base, "src-old", "dst-old", named); code != http.StatusServiceUnavailable {
+		t.Errorf("replay over an undecided leftover = %d, want 503", code)
+	}
+
+	reshapeRD(t, st, "dst-old", "grp-old", apiv1.DefaultLayerStack(), dst.Annotations)
+
+	if code := cloneOnce(t, base, "src-old", "dst-old", named); code != http.StatusCreated {
+		t.Errorf("replay once the leftover is pinned = %d, want 201", code)
+	}
+}
+
+// A volume-less source that never said what stack it has passes that on: the
+// shell holds no bytes, so its own group decides through the controller pin,
+// as for any definition created empty.
+func TestRDCloneShellOfASourceThatNeverSaidLeavesTheStackToItsGroup(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedLayeredGroup(t, st, "grp-shell-luks", luksStack())
+
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{
+		Name: "src-shell", ResourceGroupName: "grp-shell-luks",
+	}); err != nil {
 		t.Fatalf("seed the volume-less source: %v", err)
 	}
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	if code := cloneOnce(t, base, "src-shell", "dst-shell",
-		map[string]any{"resource_group": "grp-shell-luks"}); code != http.StatusCreated {
-		t.Fatalf("shell clone into a group of another stack = %d, want 201", code)
+	if code := cloneOnce(t, base, "src-shell", "dst-shell", nil); code != http.StatusCreated {
+		t.Fatalf("shell clone = %d, want 201", code)
 	}
 
-	assertDataPlaneStack(t, st, "dst-shell")
+	assertStack(t, st, "dst-shell", nil)
+	assertUnapplied(t, st, "dst-shell", "")
+}
+
+// A stack the controller pinned over data that was already there is the data's,
+// not a choice: a shell, which holds none, does not take it or its flag.
+func TestRDCloneShellDoesNotInheritAStackPinnedOverData(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedLayeredGroup(t, st, "grp-pinned", luksStack())
+
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{
+		Name: "src-pinned", ResourceGroupName: "grp-pinned", LayerStack: apiv1.DefaultLayerStack(),
+		Annotations: map[string]string{apiv1.UnappliedGroupLayerStackAnnotation: "DRBD,LUKS,STORAGE"},
+	}); err != nil {
+		t.Fatalf("seed the volume-less source: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	if code := cloneOnce(t, base, "src-pinned", "dst-pinned", nil); code != http.StatusCreated {
+		t.Fatalf("shell clone = %d, want 201", code)
+	}
+
+	assertStack(t, st, "dst-pinned", nil)
+	assertUnapplied(t, st, "dst-pinned", "")
+	assertUnapplied(t, st, "src-pinned", "DRBD,LUKS,STORAGE")
+}
+
+// A stack the source chose is copied onto its shell.
+func TestRDCloneShellKeepsAStackTheSourceChose(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedLayeredGroup(t, st, "grp-chose", luksStack())
+
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{
+		Name: "src-chose", ResourceGroupName: "grp-chose", LayerStack: apiv1.DefaultLayerStack(),
+	}); err != nil {
+		t.Fatalf("seed the volume-less source: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	if code := cloneOnce(t, base, "src-chose", "dst-chose", nil); code != http.StatusCreated {
+		t.Fatalf("shell clone = %d, want 201", code)
+	}
+
+	assertStack(t, st, "dst-chose", apiv1.DefaultLayerStack())
 }
 
 // The shell clone stores the stack the caller named in canonical case too.
@@ -97,85 +287,127 @@ func TestRDCloneShellStoresALowercaseLayerListCanonically(t *testing.T) {
 		t.Fatalf("shell clone with a lowercase layer_list = %d, want 201", code)
 	}
 
-	dst, err := st.ResourceDefinitions().Get(t.Context(), "dst-case")
-	if err != nil {
-		t.Fatalf("read the clone: %v", err)
-	}
-
-	if !slices.Equal(dst.LayerStack, []string{"DRBD", "STORAGE"}) {
-		t.Errorf("layer stack = %v, want [DRBD STORAGE]", dst.LayerStack)
-	}
+	assertStack(t, st, "dst-case", []string{"DRBD", "STORAGE"})
 }
 
-// A restore inherits the source's group, whose stack may since differ from
-// the one the source was created with.
-func TestSnapshotRestoreStampsTheSourcesDataPlaneStack(t *testing.T) {
+// A restore of a source whose stack its group has yet to decide waits for the
+// decision: 503, nothing written. Once the controller pins the source over its
+// data, the restore stamps that stack on the new definition and flags it as
+// short of its group's.
+func TestSnapshotRestoreWaitsForTheSourcesStackToBeDecided(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
-	ctx := t.Context()
 	seedDeployedCloneSource(t, st, "src-rst")
-	seedLayeredGroup(t, st, "grp-changed", []string{"DRBD", "LUKS", "STORAGE"})
-
-	src, err := st.ResourceDefinitions().Get(ctx, "src-rst")
-	if err != nil {
-		t.Fatalf("read the source: %v", err)
-	}
-
-	src.ResourceGroupName = "grp-changed"
-	if err := st.ResourceDefinitions().Update(ctx, &src); err != nil {
-		t.Fatalf("move the source under the changed group: %v", err)
-	}
-
+	seedLayeredGroup(t, st, "grp-changed", luksStack())
+	reshapeRD(t, st, "src-rst", "grp-changed", nil, nil)
 	seedRestoreSnapshot(t, st, "src-rst", "snap-rst", []string{"node-a"})
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	if code := restoreOnce(t, base, "src-rst", "snap-rst", map[string]any{"to_resource": "dst-rst"}); code != http.StatusCreated {
-		t.Fatalf("restore = %d, want 201", code)
+	if code := restoreOnce(t, base, "src-rst", "snap-rst", map[string]any{"to_resource": "dst-rst"}); code != http.StatusServiceUnavailable {
+		t.Fatalf("restore of an undecided source = %d, want 503", code)
 	}
 
-	assertDataPlaneStack(t, st, "dst-rst")
+	assertRDAbsent(t, st, "dst-rst")
+
+	reshapeRD(t, st, "src-rst", "grp-changed", apiv1.DefaultLayerStack(), nil)
+
+	if code := restoreOnce(t, base, "src-rst", "snap-rst", map[string]any{"to_resource": "dst-rst"}); code != http.StatusCreated {
+		t.Fatalf("restore once the source is pinned = %d, want 201", code)
+	}
+
+	assertStack(t, st, "dst-rst", apiv1.DefaultLayerStack())
+	assertUnapplied(t, st, "dst-rst", "DRBD,LUKS,STORAGE")
 }
 
-// A prepared target stored without a stack is brought up with the default,
-// whatever its group says, and is judged and stamped by that.
-func TestSnapshotRestoreIntoAPreparedTargetStampsItsDataPlaneStack(t *testing.T) {
+// A group that cannot be read leaves the source's stack unknown, and the
+// restore refuses with a retryable answer before it writes anything.
+func TestSnapshotRestoreRefusesWhenTheSourcesGroupCannotBeRead(t *testing.T) {
 	t.Parallel()
 
-	st := store.NewInMemory()
-	ctx := t.Context()
-	seedDeployedCloneSource(t, st, "src-prep")
-	seedRestoreSnapshot(t, st, "src-prep", "snap-prep", []string{"node-a"})
-	seedLayeredGroup(t, st, "grp-sc", []string{"DRBD", "LUKS", "STORAGE"})
+	backend := store.NewInMemory()
+	seedDeployedCloneSource(t, backend, "src-unread")
+	seedLayeredGroup(t, backend, "grp-unread", luksStack())
+	reshapeRD(t, backend, "src-unread", "grp-unread", nil, nil)
+	seedRestoreSnapshot(t, backend, "src-unread", "snap-unread", []string{"node-a"})
 
-	snap, err := st.Snapshots().Get(ctx, "src-prep", "snap-prep")
+	base, stop := startServerWithStore(t, failingRGReadStore{backend})
+	defer stop()
+
+	code := restoreOnce(t, base, "src-unread", "snap-unread", map[string]any{"to_resource": "dst-unread"})
+	if code != http.StatusInternalServerError {
+		t.Errorf("restore over an unreadable group = %d, want 500", code)
+	}
+
+	assertRDAbsent(t, backend, "dst-unread")
+}
+
+func seedPreparedTarget(t *testing.T, st store.Store, srcName, snapName, rdName, group string, stack []string) {
+	t.Helper()
+
+	ctx := t.Context()
+
+	snap, err := st.Snapshots().Get(ctx, srcName, snapName)
 	if err != nil {
 		t.Fatalf("read the snapshot: %v", err)
 	}
 
 	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name: "pvc-prep", ResourceGroupName: "grp-sc",
+		Name: rdName, ResourceGroupName: group, LayerStack: stack,
 	}); err != nil {
 		t.Fatalf("seed the prepared target: %v", err)
 	}
 
 	for _, svd := range snap.VolumeDefinitions {
-		if err := st.VolumeDefinitions().Create(ctx, "pvc-prep",
+		if err := st.VolumeDefinitions().Create(ctx, rdName,
 			&apiv1.VolumeDefinition{VolumeNumber: svd.VolumeNumber, SizeKib: svd.SizeKib}); err != nil {
 			t.Fatalf("seed the prepared volume: %v", err)
 		}
 	}
+}
+
+// A prepared target stored without a stack under a group that sets one waits
+// for the controller to decide it: 503, and no marker goes on. Pinned to the
+// group's LUKS stack, as a target with nothing on it is, it is refused against
+// a plaintext source; one the operator gave the source's stack is restored
+// into and keeps it.
+func TestSnapshotRestoreIntoAnUndecidedPreparedTargetWaits(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedDeployedCloneSource(t, st, "src-prep")
+	seedRestoreSnapshot(t, st, "src-prep", "snap-prep", []string{"node-a"})
+	seedLayeredGroup(t, st, "grp-sc", luksStack())
+	seedPreparedTarget(t, st, "src-prep", "snap-prep", "pvc-prep", "grp-sc", nil)
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	if code := restoreOnce(t, base, "src-prep", "snap-prep", map[string]any{
-		"to_resource": "pvc-prep", "nodes": []string{"node-a"},
-	}); code != http.StatusCreated {
-		t.Fatalf("restore into the prepared target = %d, want 201", code)
+	body := map[string]any{"to_resource": "pvc-prep", "nodes": []string{"node-a"}}
+
+	if code := restoreOnce(t, base, "src-prep", "snap-prep", body); code != http.StatusServiceUnavailable {
+		t.Fatalf("restore into an undecided prepared target = %d, want 503", code)
 	}
 
-	assertDataPlaneStack(t, st, "pvc-prep")
+	if marker := readRD(t, st, "pvc-prep").Props[store.RestoreFromSnapshotProp]; marker != "" {
+		t.Errorf("the refused restore left marker %q on the target", marker)
+	}
+
+	assertStack(t, st, "pvc-prep", nil)
+
+	reshapeRD(t, st, "pvc-prep", "grp-sc", luksStack(), nil)
+
+	if code := restoreOnce(t, base, "src-prep", "snap-prep", body); code != http.StatusConflict {
+		t.Errorf("restore of a plaintext source into a LUKS target = %d, want 409", code)
+	}
+
+	reshapeRD(t, st, "pvc-prep", "grp-sc", apiv1.DefaultLayerStack(), nil)
+
+	if code := restoreOnce(t, base, "src-prep", "snap-prep", body); code != http.StatusCreated {
+		t.Fatalf("restore into a target of the source's stack = %d, want 201", code)
+	}
+
+	assertStack(t, st, "pvc-prep", apiv1.DefaultLayerStack())
 }
