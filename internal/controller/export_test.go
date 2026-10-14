@@ -22,6 +22,7 @@ import (
 	"context"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -54,6 +55,17 @@ func (r *ResourceDefinitionReconciler) EnqueueRDsForNode(ctx context.Context, ob
 	return r.enqueueRDsForNode(ctx, obj)
 }
 
+// EnqueueRDsLeftToGroupStack exposes the resource-group watch fan-out for
+// tests.
+func (r *ResourceDefinitionReconciler) EnqueueRDsLeftToGroupStack(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.enqueueRDsLeftToGroupStack(ctx, obj)
+}
+
+// GroupLayerStackSet exposes the resource-group watch predicate for tests.
+func GroupLayerStackSet() predicate.Predicate {
+	return groupLayerStackSet()
+}
+
 // NodeHasDrainFlag exposes the EVICTED/LOST flag-set probe the Bug-386
 // Node-watch predicate uses to decide whether a Node event is a drain
 // transition worth re-enqueueing RDs for.
@@ -66,14 +78,6 @@ func NodeHasDrainFlag(n *blockstoriov1alpha1.Node) bool {
 // races. Tests pin both the positive and the false-positive paths.
 func AlreadyExists(err error) bool {
 	return alreadyExists(err)
-}
-
-// ResolveLayerStack exposes the four-tier layer-stack resolver:
-// RD spec → RG spec → nil (dispatcher default). Tests pin each
-// tier so a refactor that swapped precedence (RG over RD, say)
-// would surface immediately.
-func (r *ResourceReconciler) ResolveLayerStack(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) []string {
-	return r.resolveLayerStack(ctx, rd)
 }
 
 // ResolveEffectiveProps exposes the four-tier prop resolver: cluster

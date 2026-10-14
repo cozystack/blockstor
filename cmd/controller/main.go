@@ -241,9 +241,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ResourceDefinitionReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Store:  st,
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Store:    st,
+		Recorder: mgr.GetEventRecorder("blockstor-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resourcedefinition")
 		os.Exit(1)

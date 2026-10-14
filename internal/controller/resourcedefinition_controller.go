@@ -30,6 +30,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -86,6 +87,11 @@ type ResourceDefinitionReconciler struct {
 	// reconciler directly and skip this — the field is nil-safe
 	// and falls back to the cached client below.
 	APIReader client.Reader
+
+	// Recorder emits the warning Event for an RD that kept the default
+	// layer stack because it already held data. Nil in tests that do
+	// not assert on Events.
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
@@ -118,6 +124,13 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	if !rd.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
+	}
+
+	err = r.pinLayerStack(ctx, &rd)
+	if err != nil {
+		log.Error(err, "pin layer stack", "rd", rd.Name)
+
+		return ctrl.Result{}, err
 	}
 
 	err = r.ensureTiebreaker(ctx, &rd)
@@ -941,10 +954,10 @@ func (r *ResourceDefinitionReconciler) rollbackWitnessIfRDGone(ctx context.Conte
 }
 
 // resolveRDLayerStack returns the effective layer composition for
-// the RD by walking RD → RG → default. Mirrors the (unexported)
-// ResourceReconciler.resolveLayerStack but lives on the RD
-// reconciler so the witness gate (Bug 334) doesn't have to depend on
-// the resource-reconciler instance.
+// the RD by walking RD → RG → default, for the witness gate (Bug 334).
+// It runs before pinLayerStack has written the group's stack onto a
+// fresh RD, so it reads the group itself; it decides only whether a
+// witness is placed, never what goes to disk.
 //
 // Read order:
 //
@@ -1781,6 +1794,14 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Watches(&blockstoriov1alpha1.Node{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsForNode),
 			builder.WithPredicates(nodeDrainFlagChanged())).
+		// A group that gains a layer stack leaves every definition under it
+		// that has none of its own undecided: the satellite builds nothing
+		// for them and clones and restores of them answer 503 until the
+		// stack is pinned. Nothing else enqueues them, so without this the
+		// pin waited for the periodic re-sync.
+		Watches(&blockstoriov1alpha1.ResourceGroup{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsLeftToGroupStack),
+			builder.WithPredicates(groupLayerStackSet())).
 		Named("resourcedefinition").
 		Complete(r)
 }
@@ -1890,6 +1911,53 @@ func (r *ResourceDefinitionReconciler) enqueueRDsForNode(ctx context.Context, _ 
 		out = append(out, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: rdList.Items[i].Name},
 		})
+	}
+
+	return out
+}
+
+// groupLayerStackSet fires when a resource group comes to set a layer stack
+// it did not set before: on create (which a controller restart replays), and
+// on an update that changes a non-empty stack.
+func groupLayerStackSet() predicate.Predicate {
+	stackOf := func(obj client.Object) []string {
+		rg, ok := obj.(*blockstoriov1alpha1.ResourceGroup)
+		if !ok {
+			return nil
+		}
+
+		return rg.Spec.SelectFilter.LayerStack
+	}
+
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { return len(stackOf(e.Object)) > 0 },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			now := stackOf(e.ObjectNew)
+
+			return len(now) > 0 && !slices.Equal(stackOf(e.ObjectOld), now)
+		},
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
+// enqueueRDsLeftToGroupStack maps a resource group to the definitions under
+// it that leave their stack to it, the ones pinLayerStack has to decide.
+func (r *ResourceDefinitionReconciler) enqueueRDsLeftToGroupStack(ctx context.Context, obj client.Object) []reconcile.Request {
+	var rdList blockstoriov1alpha1.ResourceDefinitionList
+
+	err := r.List(ctx, &rdList)
+	if err != nil {
+		return nil
+	}
+
+	var out []reconcile.Request
+
+	for i := range rdList.Items {
+		rd := &rdList.Items[i]
+		if rd.Spec.ResourceGroupName == obj.GetName() && len(rd.Spec.LayerStack) == 0 {
+			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Name: rd.Name}})
+		}
 	}
 
 	return out

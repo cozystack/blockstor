@@ -169,8 +169,17 @@ func PreparedRestoreTarget(ctx context.Context, st Store, cached *apiv1.Resource
 		return false, fmt.Errorf("read the source %q of snapshot %q: %w", snap.ResourceName, snap.Name, err)
 	}
 
-	have, want := EffectiveLayerStack(source.LayerStack), EffectiveLayerStack(rd.LayerStack)
-	if !sameLayerSet(have, want) {
+	have, err := EffectiveLayerStack(ctx, st, &source)
+	if err != nil {
+		return false, fmt.Errorf("the layer stack of the source %q: %w", source.Name, err)
+	}
+
+	want, err := EffectiveLayerStack(ctx, st, rd)
+	if err != nil {
+		return false, fmt.Errorf("the layer stack of %q: %w", rd.Name, err)
+	}
+
+	if !apiv1.SameLayerSet(have, want) {
 		return false, fmt.Errorf("%w: %q has %s, the source %q has %s", ErrRestoreTargetLayers,
 			rd.Name, strings.Join(want, ","), source.Name, strings.Join(have, ","))
 	}
@@ -178,40 +187,92 @@ func PreparedRestoreTarget(ctx context.Context, st Store, cached *apiv1.Resource
 	return true, nil
 }
 
-// EffectiveLayerStack resolves a stored stack the way the data plane does: the
-// dispatcher hands the satellite the definition's own stack and nothing else,
-// and the satellite brings up DRBD over STORAGE for an empty one. A parent
-// group's stack is not part of it: it is copied onto a definition only when
-// the definition is created through `rd c`. It returns a copy.
+// ErrLayerStackUndecided reports a definition that leaves its layer stack to
+// a resource group that sets one, which the controller has not yet written
+// onto it. The satellite brings nothing up for it until then
+// (checkLayerStackPinned), so the stack its volumes will have is not known:
+// a clone or restore that took one now would be guessing. It clears on its
+// own, once the controller pins the stack, so a retry is the answer.
+var ErrLayerStackUndecided = errors.New("the resource definition's layer stack comes from its group and is not pinned yet")
+
+// EffectiveLayerStack is the stack the data plane brings rd's volumes up
+// under. It returns a copy.
 //
-// The control plane reads the group's stack for a definition stored without
-// one (the quorum witness, the autoplace gate), so a restored or cloned
-// definition left empty under a group with another stack is brought up as one
-// shape and judged as another. Stamping this onto it keeps the two in step.
-func EffectiveLayerStack(stack []string) []string {
-	if len(stack) == 0 {
-		return apiv1.DefaultLayerStack()
+//   - A definition's own stack is that stack.
+//   - An empty stack under no group, a group that is gone, or a group that
+//     sets no stack is the default stack, which is what the satellite builds.
+//   - An empty stack under a group that sets one is ErrLayerStackUndecided:
+//     the controller pins it once, to the group's stack when nothing is on
+//     disk yet and to the default stack when data is already there, and
+//     until then nothing is built.
+//
+// Clones and restores write this onto the definition that receives the
+// source's bytes, because those bytes were laid down under it and a
+// different stack over them either formats them away or reads them wrong.
+// A group that cannot be read is an error, never a guess.
+func EffectiveLayerStack(ctx context.Context, st Store, rd *apiv1.ResourceDefinition) ([]string, error) {
+	if len(rd.LayerStack) > 0 {
+		return slices.Clone(rd.LayerStack), nil
 	}
 
-	return append([]string(nil), stack...)
+	groupStack, err := GroupLayerStack(ctx, st, rd.ResourceGroupName)
+	if err != nil {
+		return nil, err
+	}
+
+	return layerStackUnder(rd.Name, rd.LayerStack, rd.ResourceGroupName, groupStack)
 }
 
-// sameLayerSet compares two stacks as sets. Order follows from the kinds in a
-// stack and LINSTOR folds name case, so neither is a difference.
-func sameLayerSet(have, want []string) bool {
-	for _, layer := range have {
-		if !apiv1.LayerInStack(want, layer) {
-			return false
-		}
+// GroupLayerStack is the layer stack the named group sets, nil for no group,
+// a group that is gone, or one that sets none.
+func GroupLayerStack(ctx context.Context, st Store, rgName string) ([]string, error) {
+	if rgName == "" {
+		return nil, nil
 	}
 
-	for _, layer := range want {
-		if !apiv1.LayerInStack(have, layer) {
-			return false
-		}
+	rg, err := st.ResourceGroups().Get(ctx, rgName)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
 	}
 
-	return true
+	if err != nil {
+		return nil, fmt.Errorf("read resource group %q for its layer stack: %w", rgName, err)
+	}
+
+	return rg.SelectFilter.LayerStack, nil
+}
+
+// layerStackUnder is EffectiveLayerStack once the group's stack is known.
+func layerStackUnder(rdName string, own []string, rgName string, groupStack []string) ([]string, error) {
+	if len(own) > 0 {
+		return slices.Clone(own), nil
+	}
+
+	if len(groupStack) == 0 {
+		return apiv1.DefaultLayerStack(), nil
+	}
+
+	return nil, fmt.Errorf("%w: %q in group %q", ErrLayerStackUndecided, rdName, rgName)
+}
+
+// UnappliedGroupStack is the value of apiv1.UnappliedGroupLayerStackAnnotation
+// for a definition that holds data under stack in the named group: the group's
+// stack when stack is missing one of its layers, "" otherwise. A clone or
+// restore target carries its source's bytes, so its stack is the source's and
+// not a choice; when that leaves it short of what its group asks for (a
+// plaintext copy in a LUKS group), it is flagged the way the controller flags
+// a definition it pinned over data.
+func UnappliedGroupStack(ctx context.Context, st Store, rgName string, stack []string) (string, error) {
+	groupStack, err := GroupLayerStack(ctx, st, rgName)
+	if err != nil {
+		return "", err
+	}
+
+	if !apiv1.LacksLayerOf(stack, groupStack) {
+		return "", nil
+	}
+
+	return strings.Join(groupStack, ","), nil
 }
 
 // sameVolumes reports whether a definition's volumes are exactly the ones the
@@ -244,9 +305,22 @@ func sameVolumes(vds []apiv1.VolumeDefinition, recorded []apiv1.SnapshotVolumeDe
 func stampRestoreMarker(ctx context.Context, st Store, rdName string, snap *apiv1.Snapshot) (bool, error) {
 	marker := snap.ResourceName + ":" + snap.Name
 
+	// The stack is resolved inside the patch, against the state it applies
+	// to, so the group it is resolved under is read first; a definition that
+	// moved to another group in between is answered as undecided and retried.
+	target, err := st.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return false, fmt.Errorf("read %q before stamping the restore marker: %w", rdName, err)
+	}
+
+	groupStack, err := GroupLayerStack(ctx, st, target.ResourceGroupName)
+	if err != nil {
+		return false, err
+	}
+
 	var wrote bool
 
-	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
+	err = st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
 		current := rd.Props[RestoreFromSnapshotProp]
 		if current != "" && !strings.EqualFold(current, marker) {
 			return fmt.Errorf("%w: %q carries %q", ErrRestoreTargetTaken, rdName, current)
@@ -256,8 +330,17 @@ func stampRestoreMarker(ctx context.Context, st Store, rdName string, snap *apiv
 		// run's, against the state the patch actually applied to.
 		wrote = current == ""
 
+		if len(rd.LayerStack) == 0 && !strings.EqualFold(rd.ResourceGroupName, target.ResourceGroupName) {
+			return fmt.Errorf("%w: %q moved to group %q", ErrLayerStackUndecided, rdName, rd.ResourceGroupName)
+		}
+
+		stack, err := layerStackUnder(rdName, rd.LayerStack, rd.ResourceGroupName, groupStack)
+		if err != nil {
+			return err
+		}
+
 		rd.Props = WithRestoreMarker(rd.Props, snap)
-		rd.LayerStack = EffectiveLayerStack(rd.LayerStack)
+		rd.LayerStack = stack
 
 		return nil
 	})

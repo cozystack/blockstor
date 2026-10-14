@@ -907,6 +907,8 @@ func TestApplyLayersLUKS(t *testing.T) {
 	// cryptsetup isLuks fails on a fresh device → format runs.
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-luks_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -1011,6 +1013,8 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 	// First reconcile: not yet a LUKS device → luksFormat will run.
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-only_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-luks-only_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -1100,6 +1104,8 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-stack_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-stack_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-stack_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -2599,6 +2605,8 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-format_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-format_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-luks-format_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 	// luksFormat fails: simulate the device being busy. Post-Issue
 	// 175 the cryptsetup invocation is direct, so the Expect key is
 	// the cryptsetup argv verbatim with no shell pipeline wrapping.
@@ -2635,6 +2643,10 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 
 	if results[0].GetOk() {
 		t.Errorf("Ok: got true, want false on luksFormat failure")
+	}
+
+	if !strings.Contains(results[0].GetMessage(), errLUKSFormatBusy.Error()) {
+		t.Errorf("message %q is not the luksFormat failure", results[0].GetMessage())
 	}
 
 	if !strings.Contains(results[0].GetMessage(), "luks format") {
