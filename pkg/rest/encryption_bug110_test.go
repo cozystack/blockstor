@@ -42,6 +42,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -227,12 +228,13 @@ func TestBug110_ModifyFailsFastOnForbiddenSecret(t *testing.T) {
 	assertFastEnvelope(t, resp, elapsed)
 }
 
-// TestBug110_RBACGrantsSecretsToApiserver pins the deployment RBAC:
-// the apiserver ClusterRole MUST include `secrets` so the in-cluster
-// passphrase Get/Create/Update path never falls into the Bug 110
-// Forbidden branch in production. Parsed from
-// stand/blockstor-apiserver-deploy.yaml because that's the file the
-// `make iter` deploy loop applies.
+// TestBug110_RBACGrantsSecretsToApiserver pins the deployment RBAC: the
+// apiserver's namespaced Role MUST grant `secrets` so the in-cluster
+// passphrase Get/Create/Update path never falls into the Bug 110 Forbidden
+// branch in production, and its ClusterRole grants none, since the
+// passphrase is read past the cache and no informer watches Secrets
+// cluster-wide. Parsed from stand/blockstor-apiserver-deploy.yaml because
+// that's the file the `make iter` deploy loop applies.
 func TestBug110_RBACGrantsSecretsToApiserver(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -247,10 +249,11 @@ func TestBug110_RBACGrantsSecretsToApiserver(t *testing.T) {
 		t.Fatalf("read %s: %v", deployPath, err)
 	}
 
-	// Walk every YAML document in the multi-doc file; find the
-	// ClusterRole named blockstor-apiserver; assert the rule set
-	// includes the empty-apiGroup `secrets` resource with at least
-	// the verbs needed by the passphrase handler.
+	// Walk every YAML document in the multi-doc file; find the Role
+	// named blockstor-apiserver-secrets; assert the rule set includes
+	// the empty-apiGroup `secrets` resource with at least the verbs
+	// needed by the passphrase handler, and that the ClusterRole has
+	// none.
 	docs := strings.Split(string(raw), "\n---")
 
 	var (
@@ -278,7 +281,15 @@ func TestBug110_RBACGrantsSecretsToApiserver(t *testing.T) {
 			continue
 		}
 
-		if obj.Kind != "ClusterRole" || obj.Metadata.Name != "blockstor-apiserver" {
+		if obj.Kind == "ClusterRole" && obj.Metadata.Name == "blockstor-apiserver" {
+			for _, rule := range obj.Rules {
+				if slices.Contains(rule.APIGroups, "") && slices.Contains(rule.Resources, "secrets") {
+					t.Errorf("ClusterRole blockstor-apiserver grants secrets cluster-wide: %v", rule.Verbs)
+				}
+			}
+		}
+
+		if obj.Kind != "Role" || obj.Metadata.Name != "blockstor-apiserver-secrets" {
 			continue
 		}
 
@@ -324,16 +335,16 @@ func TestBug110_RBACGrantsSecretsToApiserver(t *testing.T) {
 	}
 
 	if !foundRole {
-		t.Fatalf("ClusterRole blockstor-apiserver not found in %s", deployPath)
+		t.Fatalf("Role blockstor-apiserver-secrets not found in %s", deployPath)
 	}
 
 	if !foundSecretsRule {
-		t.Fatalf("ClusterRole blockstor-apiserver: no rule grants `secrets` (Bug 110)")
+		t.Fatalf("Role blockstor-apiserver-secrets: no rule grants `secrets` (Bug 110)")
 	}
 
 	for verb, ok := range foundRequiredVerb {
 		if !ok {
-			t.Errorf("ClusterRole blockstor-apiserver: missing verb %q on `secrets` (Bug 110)", verb)
+			t.Errorf("Role blockstor-apiserver-secrets: missing verb %q on `secrets` (Bug 110)", verb)
 		}
 	}
 }

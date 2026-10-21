@@ -79,6 +79,13 @@ type Server struct {
 	Client    client.Client // controller-runtime client for native-object endpoints
 	Namespace string        // namespace where blockstor's own Secrets/ConfigMaps live
 
+	// SecretReader reads the passphrase Secret past the cache. Read through
+	// Client, the first Get starts an informer over every Secret in the
+	// cluster, which needs cluster-wide list and watch on Secrets and holds
+	// all of them in memory, for the one Secret this server reads. Nil
+	// falls back to Client, which tests rely on.
+	SecretReader client.Reader
+
 	// TLS, when non-nil, makes Start also bring up a mutual-TLS
 	// listener on TLSAddr alongside the plain-HTTP debug listener on
 	// Addr. The in-cluster Service exposes ONLY TLSAddr; the plain
