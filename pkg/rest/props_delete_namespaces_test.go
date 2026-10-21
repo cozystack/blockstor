@@ -11,6 +11,64 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
+// delete_namespaces is honoured on the path CSI actually takes, not only on
+// the volume-less shortcut the first test for it exercised.
+func TestRDCloneHonoursDeleteNamespacesOnTheDataPath(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+	seedDeployedCloneSource(t, st, "src-ns")
+
+	src, err := st.ResourceDefinitions().Get(ctx, "src-ns")
+	if err != nil {
+		t.Fatalf("read the seeded source: %v", err)
+	}
+
+	src.Props = map[string]string{
+		"DrbdOptions":              "bare",
+		"DrbdOptions/Net/protocol": "C",
+		"DrbdOptionsOther":         "keep",
+	}
+
+	if err := st.ResourceDefinitions().Update(ctx, &src); err != nil {
+		t.Fatalf("put props on the source: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postClone(t, base, "src-ns", map[string]any{
+		"name":              "dst-ns",
+		"delete_namespaces": []string{"DrbdOptions"},
+		"use_zfs_clone":     true,
+	})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "dst-ns")
+	if err != nil {
+		t.Fatalf("get the clone: %v", err)
+	}
+
+	for _, key := range []string{"DrbdOptions/Net/protocol"} {
+		if _, present := got.Props[key]; present {
+			t.Errorf("prop %q survived the namespace delete on the data path", key)
+		}
+	}
+
+	// A namespace covers the keys below it; the key spelled as it and one
+	// that merely starts like it are outside, as upstream deletes them.
+	for _, key := range []string{"DrbdOptions", "DrbdOptionsOther"} {
+		if _, present := got.Props[key]; !present {
+			t.Errorf("prop %q outside the named namespace was deleted", key)
+		}
+	}
+}
+
 // The modify body declares delete_namespaces and the merge dropped it, so a
 // modify carrying it answered 200 and changed nothing.
 func TestRDModifyHonoursDeleteNamespaces(t *testing.T) {

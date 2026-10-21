@@ -45,3 +45,21 @@ func TestNamespaceCovers(t *testing.T) {
 		}
 	}
 }
+
+// The server-owned guard reads a namespace the way the deleter does: it
+// refuses one the key lives in, in every spelling, and lets through a key
+// spelled as a namespace, which the deleter leaves alone.
+func TestServerOwnedPropEditReadsNamespacesAsTheDeleterDoes(t *testing.T) {
+	t.Parallel()
+
+	for _, ns := range []string{"Blockstor", "Blockstor/", "Blockstor//"} {
+		if got := store.ServerOwnedPropEdit(nil, nil, []string{ns}); got == "" {
+			t.Errorf("delete_namespaces=[%q] over the server-owned props was let through", ns)
+		}
+	}
+
+	if got := store.ServerOwnedPropEdit(nil, nil, []string{store.RestoreFromSnapshotProp}); got != "" {
+		t.Errorf("a namespace spelled as the key %q was refused as %q; the deleter does not remove it",
+			store.RestoreFromSnapshotProp, got)
+	}
+}
