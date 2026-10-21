@@ -35,11 +35,14 @@ limitations under the License.
 // front this with a NetworkPolicy or mTLS. No auth on the wire yet.
 package stream
 
-// Port is the satellite-to-satellite stream port. Chosen outside the
-// DRBD-9 default range (7000-7999) and outside any LINSTOR
-// satellite port (3366/3367). The DaemonSet binds it on hostNetwork
-// so the address is each node's host IP.
-const Port = 9100
+// Port is the satellite-to-satellite stream port. The DaemonSet binds it
+// on hostNetwork, so it is a port of the node itself and has to be free
+// there: outside the DRBD-9 default range (7000-7999), off every LINSTOR
+// port (satellite 3366/3367, controller 3370/3371) and off 9100, where
+// node-exporter listens on the host. The satellite only logs a failed
+// bind, so a collision does not stop it; cross-node snapshot restore and
+// clone break with nothing saying why.
+const Port = 3372
 
 // PathPrefix is the URL prefix for the snapshot-stream endpoint. The
 // satellite mux registers GET {PathPrefix}/{rd}/{snap}/{vol}.

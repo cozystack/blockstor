@@ -198,14 +198,15 @@ spec:
             # open peers see ECONNREFUSED and cross-node clone falls
             # back to DRBD initial-sync. hostNetwork=true means this
             # is the node's real port — must stay outside the DRBD
-            # range (7000-7999) and any LINSTOR controller port.
+            # range (7000-7999), every LINSTOR port and node-exporter's
+            # 9100 (see stream.Port).
             - name: snap-stream
-              containerPort: 9100
-              hostPort: 9100
+              containerPort: 3372
+              hostPort: 3372
               protocol: TCP
             # Bug 207: kubelet health probe surface. hostNetwork=true
             # exposes this on the node, so the port must be unique
-            # across the host (snap-stream:9100, healthz:9101).
+            # across the host (snap-stream:3372, healthz:9101).
             - name: healthz
               containerPort: 9101
               hostPort: 9101
