@@ -153,6 +153,16 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A volume group's flags are refused on every door that takes one, so
+	// none reaches the store to be listed and do nothing.
+	for i := range rg.VolumeGroups {
+		if len(rg.VolumeGroups[i].Flags) > 0 {
+			writeVGFlagsNotImplemented(w)
+
+			return
+		}
+	}
+
 	// Bug 97: see pkg/rest/input_validation.go — RFC-1123 subdomain
 	// validation at the REST boundary, before pkg/store/k8s.Name()
 	// mangles the input.

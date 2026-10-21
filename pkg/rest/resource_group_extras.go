@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -231,6 +233,14 @@ func (s *Server) handleVGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A flag the create stored would be listed by `rg vg l` and do nothing,
+	// and the modify door refuses setting one, so it is refused here too.
+	if len(in.Flags) > 0 {
+		writeVGFlagsNotImplemented(w)
+
+		return
+	}
+
 	// Bug 204b shape: typed-Patch with retry-on-conflict — the
 	// duplicate check and the append both re-run against the live
 	// RG on every retry, so a concurrent reconciler / sibling write
@@ -269,6 +279,29 @@ func (s *Server) handleVGCreate(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
+// vgFlagRemovals splits a volume-group modify's flags into the flags it
+// removes, spelled `-<FLAG>` as upstream does, and whether it sets any.
+func vgFlagRemovals(flags []string) ([]string, bool) {
+	removed := make([]string, 0, len(flags))
+
+	for _, flag := range flags {
+		name, removes := strings.CutPrefix(flag, "-")
+		if !removes || name == "" {
+			return nil, true
+		}
+
+		removed = append(removed, name)
+	}
+
+	return removed, false
+}
+
+func writeVGFlagsNotImplemented(w http.ResponseWriter) {
+	writeError(w, http.StatusNotImplemented,
+		"volume-group flags are not implemented: spawned volumes are sized net, so "+
+			"GROSS_SIZE would change nothing; see docs/cli-parity-known-deltas.md")
+}
+
 func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 	rgName := r.PathValue("rg")
 
@@ -277,12 +310,29 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// golinstor's VolumeGroupModify, whole: a field left undeclared is a 400
+	// from the strict decoder to any caller that sets it.
 	var in struct {
-		OverrideProps map[string]string `json:"override_props,omitempty"`
-		DeleteProps   []string          `json:"delete_props,omitempty"`
+		OverrideProps    map[string]string `json:"override_props,omitempty"`
+		Flags            []string          `json:"flags,omitempty"`
+		DeleteProps      []string          `json:"delete_props,omitempty"`
+		DeleteNamespaces []string          `json:"delete_namespaces,omitempty"`
 	}
 
 	if !decodeJSON(w, r, &in) {
+		return
+	}
+
+	// The one volume-group flag upstream has is GROSS_SIZE, and nothing here
+	// sizes a spawned volume gross, so setting a flag would answer 200 for a
+	// request that changes nothing. Refused before any write, so a body that
+	// also edits props does not land half of itself. Removing one, which
+	// upstream spells with a leading '-', is honoured: it is the only way to
+	// clear a flag a volume group already carries.
+	removeFlags, setsFlag := vgFlagRemovals(in.Flags)
+	if setsFlag {
+		writeVGFlagsNotImplemented(w)
+
 		return
 	}
 
@@ -295,6 +345,9 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 			for i := range rg.VolumeGroups {
 				if rg.VolumeGroups[i].VolumeNumber == vlmNr {
 					mergeVGProps(&rg.VolumeGroups[i], in.OverrideProps, in.DeleteProps)
+					deletePropNamespaces(rg.VolumeGroups[i].Props, in.DeleteNamespaces)
+					rg.VolumeGroups[i].Flags = slices.DeleteFunc(rg.VolumeGroups[i].Flags,
+						func(flag string) bool { return slices.Contains(removeFlags, flag) })
 
 					return nil
 				}
