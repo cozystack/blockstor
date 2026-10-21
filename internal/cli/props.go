@@ -90,10 +90,13 @@ var storagePoolProps = withNamedKeyGuard(objectProps("storage pool", 2, // (node
 	validate.StoragePoolPropEdit,
 ), func(key string, _ bool) error { return validate.StoragePoolPropNamed(key) })
 
-// resourceGroupProps accesses a group's property bag.
+// resourceGroupProps accesses a group's property bag. A group's props are
+// copied onto every definition spawned from it, so the props blockstor reads
+// back off a definition are refused here as on the REST door; deleting one
+// stays allowed, which is how a group written before the refusal is cleaned.
 //
 //nolint:gochecknoglobals,dupl // static accessor table; the parallel shape is the point
-var resourceGroupProps = objectProps("resource group", 1,
+var resourceGroupProps = withNamedKeyGuard(objectProps("resource group", 1,
 	func(ctx context.Context, st store.Store, ident []string) (apiv1.ResourceGroup, error) {
 		return st.ResourceGroups().Get(ctx, ident[0])
 	},
@@ -101,7 +104,26 @@ var resourceGroupProps = objectProps("resource group", 1,
 	func(ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.ResourceGroup) error) error {
 		return st.ResourceGroups().PatchResourceGroup(ctx, ident[0], mutate)
 	},
-)
+), refuseServerOwnedGroupProp)
+
+// aSetValue stands for the value of a named-key edit that sets a key: the
+// server-owned checks judge only that a value is set, and an empty one is read
+// as a delete.
+const aSetValue = "set"
+
+// refuseServerOwnedGroupProp is the named-key guard for resourceGroupProps.
+func refuseServerOwnedGroupProp(key string, deleting bool) error {
+	if deleting {
+		return nil
+	}
+
+	if store.ServerOwnedPropEdit(map[string]string{key: aSetValue}, nil, nil) != "" {
+		return fmt.Errorf("%w: %s records what blockstor did to a resource definition, and a group's "+
+			"props are copied onto every definition spawned from it", errServerOwnedProp, key)
+	}
+
+	return nil
+}
 
 // volumeDefinitionProps accesses a volume definition's property bag,
 // identified as `<resource-definition> <volume-number>`.

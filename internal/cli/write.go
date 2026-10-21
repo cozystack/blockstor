@@ -260,7 +260,7 @@ func refuseServerOwnedDefinitionProp(key string, deleting bool) error {
 	// read as a delete, so a set is spelled with a value.
 	var overrides map[string]string
 	if !deleting {
-		overrides = map[string]string{key: "set"}
+		overrides = map[string]string{key: aSetValue}
 	}
 
 	if store.ServerOwnedPropEditByOperator(overrides, []string{key}, nil) != "" {
