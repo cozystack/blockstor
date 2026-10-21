@@ -1062,6 +1062,12 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 		// = delete-property), matching the RG path and the UG9 NOTE.
 		rd.Props = applyPropsModify(rd.Props, patch.OverrideProps, patch.DeleteProps)
 
+		// The body declares delete_namespaces and the merge dropped it, so a
+		// modify carrying it answered 200 and changed nothing. Declaring two
+		// thirds of a props-modify envelope and silently discarding the rest
+		// tells the operator work happened when it did not.
+		deletePropNamespaces(rd.Props, patch.DeleteNamespaces)
+
 		if rgChange != "" {
 			rd.ResourceGroupName = rgChange
 		}

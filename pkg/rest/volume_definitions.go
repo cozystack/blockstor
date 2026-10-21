@@ -999,13 +999,7 @@ func mergeVolumeDefinitionPatch(existing *apiv1.VolumeDefinition, patch *volumeD
 		delete(existing.Props, k)
 	}
 
-	for _, ns := range patch.DeleteNamespaces {
-		for k := range existing.Props {
-			if k == ns || (len(k) > len(ns) && k[:len(ns)] == ns && k[len(ns)] == '/') {
-				delete(existing.Props, k)
-			}
-		}
-	}
+	deletePropNamespaces(existing.Props, patch.DeleteNamespaces)
 }
 
 // handleVDDelete drops a VolumeDefinition under an RD.

@@ -119,15 +119,7 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 		// behaviour — the namespace separator is '/' and the prefix
 		// is matched literally (no glob). An entry "Aux" drops every
 		// "Aux/..." key.
-		for _, ns := range patch.DeleteNamespace {
-			prefix := ns + "/"
-
-			for k := range sp.Props {
-				if strings.HasPrefix(k, prefix) {
-					delete(sp.Props, k)
-				}
-			}
-		}
+		deletePropNamespaces(sp.Props, patch.DeleteNamespace)
 
 		return nil
 	})
@@ -791,10 +783,11 @@ func immutableSPDriverProps() []string {
 //
 //   - override_props: an explicit value for any immutable key.
 //   - delete_props: an explicit key in the immutable set.
-//   - delete_namespaces: a prefix that, with the '/' separator
-//     appended, would catch any immutable key. The shared "StorDriver"
-//     prefix means deleting the namespace would wipe the pool's
-//     backing identity wholesale, so refuse that too.
+//   - delete_namespaces: a namespace that covers any immutable key, read
+//     the way the delete reads it (store.NamespaceCovers), so every
+//     spelling the delete honours is refused here too. The shared
+//     "StorDriver" namespace would wipe the pool's backing identity
+//     wholesale.
 //
 // Returns ("", false) when the patch is clean (no immutable keys
 // touched). The caller writes the typed-envelope error on refuse.
@@ -823,10 +816,8 @@ func refuseSPDriverPropMutation(patch *apiv1.GenericPropsModify) (string, bool) 
 	// would otherwise nuke the backing identity wholesale. Flag the
 	// whole namespace so the operator sees the actionable name.
 	for _, ns := range patch.DeleteNamespace {
-		prefix := ns + "/"
-
 		for _, key := range keys {
-			if strings.HasPrefix(key, prefix) {
+			if store.NamespaceCovers(ns, key) {
 				hit = append(hit, "delete_namespaces:"+ns)
 
 				break

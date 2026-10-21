@@ -632,8 +632,13 @@ func rgSelectFilterClearTable() map[string]func(*apiv1.AutoSelectFilter) {
 // so an override entry with an empty value DELETES the key — the
 // `linstor rg set-property g DrbdOptions/Resource/on-no-quorum`
 // (no value) = delete-property semantic the upstream UG9 NOTE pins.
+//
+// delete_namespaces is the third half of the same envelope, and the body
+// declares it, so it is honoured: a field the body accepts and then drops
+// answers 200 for an edit that did not happen.
 func mergeRGProps(existing, patch *apiv1.ResourceGroup) {
 	existing.Props = applyPropsModify(existing.Props, patch.OverrideProps, patch.DeleteProps)
+	deletePropNamespaces(existing.Props, patch.DeleteNamespace)
 }
 
 // handleRGDelete drops a ResourceGroup.

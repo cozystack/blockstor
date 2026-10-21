@@ -18,7 +18,10 @@ limitations under the License.
 
 package store
 
-import "maps"
+import (
+	"maps"
+	"strings"
+)
 
 // RollbackAbandonedProp marks a resource definition whose compensation started
 // and did not report finishing, with the step it stopped at. The replay gate of
@@ -53,4 +56,17 @@ func TravellingProps(props map[string]string) map[string]string {
 	delete(out, restoreFromSnapshotMarker)
 
 	return out
+}
+
+// NamespaceCovers reports whether deleting namespace ns removes key. It is the
+// one reading of a `delete_namespaces` entry, shared by the deleter and every
+// guard in front of it: a guard that spelled the namespace another way would
+// let through a delete it means to refuse, and then refuse putting the key
+// back. A namespace covers the keys below it and not a key spelled as it, as
+// upstream's PropsContainer.removeNamespace does; trailing slashes are the
+// same namespace, and one that is nothing but slashes names none.
+func NamespaceCovers(ns, key string) bool {
+	ns = strings.TrimRight(ns, "/")
+
+	return ns != "" && strings.HasPrefix(key, ns+"/")
 }
