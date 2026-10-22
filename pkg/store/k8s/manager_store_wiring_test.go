@@ -47,7 +47,8 @@ func TestManagerBackedStoresComeFromNewManager(t *testing.T) {
 	// store from a client, keyed by module-relative file and enclosing
 	// function, with the reason each one is safe.
 	uncachedStoreConstructions := map[string]string{
-		"cmd/blockstor/main.go:openStore": "the native CLI builds a plain client with no informer behind it",
+		"cmd/blockstor/main.go:openStore":              "the native CLI builds a plain client with no informer behind it",
+		"cmd/satellite/coldstart_owned.go:ownedOnNode": "the satellite reads its own replicas at startup with a plain client, before any manager or cache exists",
 	}
 
 	findings, unused, err := storeConstructionFindings(repoRoot(t), uncachedStoreConstructions)
