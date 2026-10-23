@@ -20,6 +20,7 @@ package rest
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"testing"
 
@@ -216,5 +217,46 @@ func TestKVPutDeletePersistInProcessLocalBag(t *testing.T) {
 
 	if len(third[0].Props) != 0 {
 		t.Errorf("post-delete Props: got %+v, want empty", third[0].Props)
+	}
+}
+
+// The key-value-store door takes the whole props envelope: delete_namespaces
+// takes the keys below a namespace and leaves a key spelled as it, and, as
+// upstream's key-value store does, an empty override value is stored rather
+// than read as a delete.
+func TestKVModifyHonoursTheWholeEnvelope(t *testing.T) {
+	kvBagMu.Lock()
+	kvBag["kv-envelope"] = map[string]string{"Aux": "x", "Aux/a": "y", "empty": "z", "keep": "k"}
+	kvBagMu.Unlock()
+
+	// The bag is process-wide, so the instance this test seeds goes with it.
+	t.Cleanup(func() {
+		kvBagMu.Lock()
+		delete(kvBag, "kv-envelope")
+		kvBagMu.Unlock()
+	})
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	put, _ := json.Marshal(apiv1.GenericPropsModify{
+		OverrideProps:   map[string]string{"empty": ""},
+		DeleteNamespace: []string{"Aux"},
+	})
+
+	resp := httpPut(t, base+"/v1/key-value-store/kv-envelope", put)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status: got %d, want 200", resp.StatusCode)
+	}
+
+	kvBagMu.Lock()
+	got := maps.Clone(kvBag["kv-envelope"])
+	kvBagMu.Unlock()
+
+	want := map[string]string{"Aux": "x", "empty": "", "keep": "k"}
+	if !maps.Equal(got, want) {
+		t.Errorf("bag after the modify = %v, want %v", got, want)
 	}
 }

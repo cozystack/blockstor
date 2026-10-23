@@ -1,0 +1,97 @@
+name: snap-restore-retry-semantics
+description: |
+  The resource restore's retry contract, at operator-CLI level
+  (cozystack/blockstor#186).
+
+  linstor-csi restores a VolumeSnapshot into a PVC the way LINSTOR
+  documents it: `rd c <target>`, `s vd restore` into it, then
+  `s rsc restore`. The definition it made carries no restore marker,
+  and the resource restore has to take it as its own target. linstor-csi
+  also re-issues CreateVolume whenever a response is lost, so the
+  resource restore has to answer the same way when it is run again over
+  the target it already filled.
+
+  Steps:
+    1. source: rd create + vd create + one diskful replica, UpToDate
+    2. snapshot create
+    3. rd create <target>, s vd restore into it, s rsc restore onto
+       node1: exit 0, the restored replica UpToDate
+    4. s rsc restore again with the same argv, the retry: exit 0, still
+       one diskful replica, the volume at the size it was restored at
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: replay-rstretry
+
+steps:
+  - name: create-src-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-src-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: snapshot-create
+    cmd: ["snapshot", "create", "{{rd}}", "rstretry"]
+    expect_exit: 0
+  # ---- the sequence linstor-csi's VolFromSnap issues ----
+  - name: prepare-the-target
+    cmd: ["resource-definition", "create", "{{rd}}-t"]
+    expect_exit: 0
+  - name: vd-restore-into-the-target
+    cmd: ["snapshot", "volume-definition", "restore",
+          "--from-resource", "{{rd}}", "--from-snapshot", "rstretry",
+          "--to-resource", "{{rd}}-t"]
+    expect_exit: 0
+  - name: resource-restore
+    # The target carries no marker yet: it is taken as this restore's own
+    # because its volumes are the snapshot's and it has no live replica.
+    cmd: ["snapshot", "resource", "restore",
+          "--from-resource", "{{rd}}", "--from-snapshot", "rstretry",
+          "--to-resource", "{{rd}}-t", "{{node1}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}-t"
+      timeout_s: 240
+  - name: retry-the-resource-restore
+    # The retry CSI issues when a response is lost. Same argv, same
+    # answer, and nothing re-placed.
+    cmd: ["snapshot", "resource", "restore",
+          "--from-resource", "{{rd}}", "--from-snapshot", "rstretry",
+          "--to-resource", "{{rd}}-t", "{{node1}}"]
+    expect_exit: 0
+    tolerate_resend_409: false
+    await:
+      kind: replica_count_max
+      rd: "{{rd}}-t"
+      max: 1
+      hold_s: 15
+  - name: the-retry-kept-the-volume
+    cmd: ["volume-definition", "list", "--resource-definitions", "{{rd}}-t"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}-t"
+      vol: 0
+      expected_kib: 65536
+      timeout_s: 60
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}-t"]
+  - cmd: ["snapshot", "delete", "{{rd}}", "rstretry"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  # Prefix-match on vars.rd also covers the "-t" target.
+  - no_orphans
