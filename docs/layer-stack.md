@@ -38,7 +38,7 @@ Clones and restores copy bytes, so the RD they create takes the stack those byte
 
 Changing a group's stack later never reshapes RDs that already carry one, as in upstream LINSTOR, where the stack is decided when a resource is created.
 
-As a last guard, the LUKS layer refuses to `luksFormat` a device that already carries a signature `blkid -p` recognises (DRBD metadata, a filesystem, a partition table). The replica's apply fails with `luks: device already holds data` and names what it found. On a fresh thick LV that reuses extents of an earlier volume the signature can be stale; clear it with `wipefs -a <device>` once you have checked it holds nothing you need.
+As a last guard, the LUKS layer refuses to `luksFormat` a device that already carries a signature `blkid -p` recognises (DRBD metadata, a filesystem, a partition table). The replica's apply fails with `luks: device already holds data` and names what it found. The satellite wipes a thick LV it creates before the volume takes its name, so a fresh volume never inherits a signature from extents an earlier volume used; one created outside blockstor may, so clear it with `wipefs -a <device>` once you have checked it holds nothing you need.
 
 Find the RDs short of a layer their group asks for:
 
