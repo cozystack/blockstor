@@ -194,8 +194,22 @@ func TestTieBreakerStillSpawnedForDRBDStackRD(t *testing.T) {
 // production code path where the RD itself carries no LayerStack and
 // the effective stack is inherited from a parent RG. When the parent
 // RG specifies a STORAGE-only stack the witness must still be skipped.
+//
+// The RD may name its group in another case than the CR's folded name, as
+// LINSTOR names are case-insensitive; the group is found either way.
 func TestNoTieBreakerSpawnedForEmptyLayerStackInheritsRG(t *testing.T) {
 	t.Parallel()
+
+	for _, group := range []string{"rg-storage", "RG-Storage"} {
+		t.Run(group, func(t *testing.T) {
+			t.Parallel()
+			noTieBreakerUnderAStorageOnlyGroup(t, group)
+		})
+	}
+}
+
+func noTieBreakerUnderAStorageOnlyGroup(t *testing.T, group string) {
+	t.Helper()
 
 	scheme := newScheme(t)
 	st := store.NewInMemory()
@@ -229,7 +243,7 @@ func TestNoTieBreakerSpawnedForEmptyLayerStackInheritsRG(t *testing.T) {
 	rd := &blockstoriov1alpha1.ResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: "rd-inherit"},
 		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
-			ResourceGroupName: "rg-storage",
+			ResourceGroupName: group,
 		},
 	}
 
