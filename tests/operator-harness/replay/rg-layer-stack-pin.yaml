@@ -1,0 +1,139 @@
+name: rg-layer-stack-pin
+description: |
+  A definition's layer stack is decided once, from its resource group,
+  and never reshapes a volume that already exists.
+
+  The controller writes the group's stack onto a definition that leaves
+  it empty. One that holds no data takes the group's stack; one that
+  already went to disk under the default stack keeps it and is flagged
+  with the blockstor.io/unapplied-group-layer-stack annotation, so a
+  LUKS group added over a plaintext volume never has the satellite
+  luksFormat it.
+
+  Steps:
+    1. rg c {{rg}} (no stack) and rg c {{rg}}-luks --layer-list
+       drbd,luks,storage; rd c {{rd}}-f in {{rg}} stays without a stack;
+       rd modify --resource-group {{rg}}-luks -> spec.layerStack
+       DRBD,LUKS,STORAGE. The REST create copies a group's stack itself,
+       so only a move into the group shows the controller's pin.
+    2. rd c + vd c + r c --auto-place=2 in {{rg}}
+    3. rg modify {{rg}} --layer-list drbd,luks,storage over that data
+    4. rd clone of the data RD straight after: refused (exit 10, "not
+       pinned yet") while the controller has yet to pin the stack, or
+       done if it already has; the clone run again succeeds either way
+    5. the data RD stays DRBD,STORAGE, held, with the annotation naming
+       the group's stack; the clone carries DRBD,STORAGE as well
+
+  The LayerStackNotInherited Event and the byte-level check that the
+  data reads back unchanged live in the L6 cell
+  tests/e2e/cli-matrix/rg-layer-stack-pin.sh: the runner executes only
+  `linstor` argv and CRD reads.
+
+  The clone's internal snapshot clone-{{rd}}-c outlives the clone, so it
+  is deleted before the source in teardown.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  rd: replay-lspin
+  sp: stand
+
+steps:
+  - name: create-passphrase
+    # Any Secret-backed passphrase satisfies the LUKS gate; a shared stand
+    # may already have one (exit 10).
+    cmd: ["encryption", "create-passphrase", "-p", "replay-lspin-do-not-rely-on"]
+    expect_exit: [0, 10]
+  - name: create-plain-group
+    cmd: ["resource-group", "create", "{{rg}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: create-luks-group
+    cmd: ["resource-group", "create", "{{rg}}-luks", "--layer-list", "drbd,luks,storage", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: rd-in-a-group-without-a-stack-has-none
+    cmd: ["resource-definition", "create", "--resource-group", "{{rg}}", "{{rd}}-f"]
+    expect_exit: 0
+    await:
+      kind: rd_layer_stack
+      rd: "{{rd}}-f"
+      expected: ""
+      hold_s: 10
+      timeout_s: 30
+  - name: rd-moved-into-luks-group-takes-its-stack
+    # Nothing on the REST side copies the stack on a modify: the
+    # controller's pin does.
+    cmd: ["resource-definition", "modify", "--resource-group", "{{rg}}-luks", "{{rd}}-f"]
+    expect_exit: 0
+    await:
+      kind: rd_layer_stack
+      rd: "{{rd}}-f"
+      expected: "DRBD,LUKS,STORAGE"
+      timeout_s: 60
+
+  - name: create-rd-with-data
+    cmd: ["resource-definition", "create", "--resource-group", "{{rg}}", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+  - name: group-gains-luks-over-data
+    cmd: ["resource-group", "modify", "{{rg}}", "--layer-list", "drbd,luks,storage"]
+    expect_exit: 0
+  - name: clone-while-the-stack-may-be-undecided
+    # 503 "not pinned yet" (exit 10) inside the window before the
+    # controller's pin, 0 once it has pinned. The resend tolerance is off:
+    # an "already exists" here would be another fault.
+    cmd: ["resource-definition", "clone", "{{rd}}", "{{rd}}-c"]
+    expect_exit: [0, 10]
+    tolerate_resend_409: false
+  - name: data-rd-keeps-the-stack-its-data-has
+    cmd: ["resource-definition", "list", "--resource-definitions", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_layer_stack
+      rd: "{{rd}}"
+      expected: "DRBD,STORAGE"
+      hold_s: 15
+      timeout_s: 60
+  - name: data-rd-is-flagged-short-of-its-group
+    cmd: ["resource-definition", "list", "--resource-definitions", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_annotation
+      rd: "{{rd}}"
+      key: blockstor.io/unapplied-group-layer-stack
+      expected: "DRBD,LUKS,STORAGE"
+      timeout_s: 30
+  - name: clone-after-the-pin
+    # Either the clone of the step before finished and this is its replay,
+    # or it was refused as undecided and this is the clone itself.
+    cmd: ["resource-definition", "clone", "{{rd}}", "{{rd}}-c"]
+    expect_exit: 0
+    tolerate_resend_409: false
+    await:
+      kind: rd_layer_stack
+      rd: "{{rd}}-c"
+      expected: "DRBD,STORAGE"
+      timeout_s: 60
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}-c"]
+  - cmd: ["snapshot", "delete", "{{rd}}", "clone-{{rd}}-c"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}-f"]
+  - cmd: ["resource-group", "delete", "{{rg}}"]
+  - cmd: ["resource-group", "delete", "{{rg}}-luks"]
+
+invariants:
+  # Prefix-match on vars.rd also covers the "-c" and "-f" definitions.
+  - no_orphans
