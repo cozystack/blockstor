@@ -43,6 +43,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // Bug148ResizePendingAnnotationPrefix is the per-volume annotation
@@ -991,7 +992,7 @@ func (r *ResourceDefinitionReconciler) resolveRDLayerStack(ctx context.Context, 
 	reader := r.directOrCached()
 
 	var rg blockstoriov1alpha1.ResourceGroup
-	if err := reader.Get(ctx, client.ObjectKey{Name: rd.Spec.ResourceGroupName}, &rg); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Name: k8s.Name(rd.Spec.ResourceGroupName)}, &rg); err != nil {
 		return apiv1.DefaultLayerStack()
 	}
 
