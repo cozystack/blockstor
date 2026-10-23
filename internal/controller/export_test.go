@@ -68,14 +68,6 @@ func AlreadyExists(err error) bool {
 	return alreadyExists(err)
 }
 
-// ResolveLayerStack exposes the four-tier layer-stack resolver:
-// RD spec → RG spec → nil (dispatcher default). Tests pin each
-// tier so a refactor that swapped precedence (RG over RD, say)
-// would surface immediately.
-func (r *ResourceReconciler) ResolveLayerStack(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) []string {
-	return r.resolveLayerStack(ctx, rd)
-}
-
 // ResolveEffectiveProps exposes the four-tier prop resolver: cluster
 // ControllerProps → RG → RD → Resource. Tests pin each tier and the
 // soft-fail-on-missing-RG path.
@@ -248,3 +240,6 @@ const AutoTiebreakerSuppressedUntilAnnotation = apiv1.AutoTiebreakerSuppressedUn
 // annotation key for tests. Same compile-time-rename guard as the
 // suppression key above.
 const KeepTiebreakerUntilAnnotation = apiv1.KeepTiebreakerUntilAnnotation
+
+// RDReconcileRequeue exposes the RD reconciler's periodic requeue.
+const RDReconcileRequeue = rdReconcileRequeue

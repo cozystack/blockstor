@@ -43,7 +43,7 @@ func TestThickKind(t *testing.T) {
 // /dev symlinks.
 func TestThickCreateVolumeIssuesLvcreate(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -59,7 +59,7 @@ func TestThickCreateVolumeIssuesLvcreate(t *testing.T) {
 
 	// Bug 305: device filter + udev-less activation ride in ONE
 	// `--config` string (LVM rejects a repeated `--config`).
-	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 1024MiB --name pvc-1_00000 -Wn -Zn vg"
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 1024MiB --name pvc-1_00000.bsnew -Wn -Zn vg"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -68,7 +68,7 @@ func TestThickCreateVolumeIssuesLvcreate(t *testing.T) {
 // TestThickCreateVolumeIdempotent: existing LV → no lvcreate.
 func TestThickCreateVolumeIdempotent(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg",
 		storage.FakeResponse{Stdout: []byte("pvc-1_00000\n")})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)

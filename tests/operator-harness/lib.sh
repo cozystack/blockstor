@@ -632,6 +632,38 @@ except Exception:
     print('')" "$vol" 2>/dev/null || echo "")
             [[ "$actual" == "$expected" ]]
             ;;
+        rd_layer_stack)
+            # The layer stack the RD's CRD carries (spec.layerStack), as an
+            # upper-cased comma list, equals `expected`. "" means no stack:
+            # one the controller has yet to decide. Pair with hold_s to prove
+            # a decided stack is not rewritten (a group change over data).
+            local rd expected actual
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected','').upper())" "$spec")
+            actual=$(kubectl get resourcedefinition "$rd" -o json 2>/dev/null \
+                | python3 -c "import json,sys
+try:
+    print(','.join(json.load(sys.stdin).get('spec', {}).get('layerStack') or []).upper())
+except Exception:
+    print('<unreadable>')" 2>/dev/null || echo "<unreadable>")
+            [[ "$actual" == "$expected" ]]
+            ;;
+        rd_annotation)
+            # An annotation on the RD's CRD equals `expected`; "" means the
+            # key is absent. The CLI shows no annotations, so this reads the
+            # CRD (blockstor.io/unapplied-group-layer-stack and the like).
+            local rd key expected actual
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            key=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('key',''))" "$spec")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")
+            actual=$(kubectl get resourcedefinition "$rd" -o json 2>/dev/null \
+                | python3 -c "import json,sys
+try:
+    print((json.load(sys.stdin).get('metadata', {}).get('annotations') or {}).get(sys.argv[1], ''))
+except Exception:
+    print('<unreadable>')" "$key" 2>/dev/null || echo "<unreadable>")
+            [[ "$actual" == "$expected" ]]
+            ;;
         vd_count)
             # BUG-048: assert the RD carries EXACTLY `expected`
             # VolumeDefinitions. A concurrent-auto-assign lost-update

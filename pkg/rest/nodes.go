@@ -1525,6 +1525,18 @@ func storeErrorRc(err error, kind storeResourceKind) (int, apiv1.APICallRc) {
 			RetCode: apiCallRcError | notFoundSubCodeForKind(kind),
 			Message: scrubImplDetails(err.Error()),
 		}
+	case errors.Is(err, store.ErrLayerStackUndecided):
+		// Not the caller's to fix and not permanent: the controller pins the
+		// stack on its next pass over the definition, and linstor-csi retries
+		// a 503 with the same body.
+		return http.StatusServiceUnavailable, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails(err.Error()),
+			Cause: "the definition's volumes are laid down under its group's layer stack or the " +
+				"default one depending on whether it already holds data, and the controller " +
+				"has not decided that yet",
+			Correc: "retry shortly; the controller writes the layer stack onto the definition",
+		}
 	case apierrors.IsConflict(err):
 		// Optimistic-lock conflict. Generic message — the apimachinery
 		// error embeds the GroupResource string which leaks the CRD

@@ -648,17 +648,18 @@ func (s *Server) ensureDefaultRGAssignment(ctx context.Context, rd *apiv1.Resour
 
 // inheritLayerStackFromRG copies the parent RG's SelectFilter.LayerStack
 // onto the RD when the RD itself didn't carry one. Caller-supplied
-// rd.LayerStack wins (explicit > inherited), matching the same precedence
-// rule v1.ResolveLayerStack applies at the dispatch read-side. The result
-// is stamped onto the stored RD so a later `linstor rg modify` that flips
-// the parent's LayerStack does NOT retroactively re-layer existing RDs —
-// "sticky at create time", just like upstream LINSTOR's behaviour.
+// rd.LayerStack wins (explicit > inherited). The result is stamped onto
+// the stored RD so a later `linstor rg modify` that flips the parent's
+// LayerStack does NOT retroactively re-layer existing RDs — "sticky at
+// create time", just like upstream LINSTOR's behaviour. The satellite
+// reads only the stamped value and never resolves through the group.
 //
 // NotFound on the parent RG is swallowed: the lazily-created DfltRscGrp
 // in ensureDefaultRGAssignment may race with this lookup on a sibling
-// apiserver replica, and the default RG carries no SelectFilter anyway,
-// so silently falling through leaves rd.LayerStack empty (= the legacy
-// DRBD+STORAGE default, applied downstream).
+// apiserver replica, and the default RG carries no SelectFilter anyway.
+// An RD left empty here, or created outside REST, is pinned by the
+// controller (ResourceDefinitionReconciler.pinLayerStack) before the
+// satellite builds anything for it.
 func (s *Server) inheritLayerStackFromRG(ctx context.Context, rd *apiv1.ResourceDefinition) error {
 	if len(rd.LayerStack) > 0 {
 		return nil

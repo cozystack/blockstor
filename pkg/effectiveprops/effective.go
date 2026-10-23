@@ -43,6 +43,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // Resolve walks the four scopes and returns the merged Props
@@ -214,7 +215,9 @@ func scopeInputs(ctx context.Context, c client.Reader, rd *blockstoriov1alpha1.R
 
 	var rgObj blockstoriov1alpha1.ResourceGroup
 
-	getErr := c.Get(ctx, client.ObjectKey{Name: rd.Spec.ResourceGroupName}, &rgObj)
+	// The RD keeps the group's name as the operator spelled it; the CR is
+	// stored under the folded one.
+	getErr := c.Get(ctx, client.ObjectKey{Name: k8s.Name(rd.Spec.ResourceGroupName)}, &rgObj)
 	switch {
 	case getErr == nil:
 		rgInfo = scopeInfo{
