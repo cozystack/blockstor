@@ -237,7 +237,7 @@ func wireReconcilers(mgr manager.Manager, store *storek8s.Store) error {
 		return err
 	}
 
-	return wireBackgroundRunnables(mgr)
+	return wireBackgroundRunnables(mgr, store)
 }
 
 func wireNodeReconcilers(mgr manager.Manager, store *storek8s.Store) error {
@@ -338,8 +338,8 @@ func wireResourceReconcilers(mgr manager.Manager, store *storek8s.Store) error {
 	return nil
 }
 
-func wireBackgroundRunnables(mgr manager.Manager) error {
-	err := (&controller.AutoSnapshotRunnable{Client: mgr.GetClient()}).RegisterWithManager(mgr)
+func wireBackgroundRunnables(mgr manager.Manager, store *storek8s.Store) error {
+	err := (&controller.AutoSnapshotRunnable{Client: mgr.GetClient(), Store: store}).RegisterWithManager(mgr)
 	if err != nil {
 		return fmt.Errorf("auto-snapshot: %w", err)
 	}
