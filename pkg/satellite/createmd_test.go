@@ -707,7 +707,7 @@ func dumpV09(current, peerBitmap, history string) []byte {
 		"    bitmap-dagtag 0x0000000000000000;\n    flags 0x00000005;\n}\n" +
 		"history-uuids {\n        0x" + history + "; 0x0000000000000000; 0x0000000000000000; 0x0000000000000000;\n}\n" +
 		"la-size-sect 2097152;\nbm-byte-per-bit 4096;\ndevice-uuid 0x5A5A5A5A5A5A5A5A;\n" +
-		"bm {\n   # at 0kB\n    64 times 0x0000000000000000;\n}\n")
+		"bitmap[0] {\n   # at 0kB\n    64 times 0x0000000000000000;\n}\n")
 }
 
 func runMetadataPath(t *testing.T, path string, rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, marker string) error {

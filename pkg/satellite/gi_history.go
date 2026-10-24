@@ -142,8 +142,10 @@ func (r *Reconciler) writeGIHistory(rdName string, history map[int32][]string) e
 // forgetGIHistory drops the record of rdName and its cached last GIs, so a
 // replica created again under the name starts with no record and its first
 // GI is written rather than taken for one already on file. It holds the
-// lock RecordObservedGI writes under, so an observation in flight cannot
-// put the file back behind it.
+// lock RecordObservedGI writes under, so a write already under way finishes
+// first. An observation of the old replica processed after this one would
+// still write a fresh file; by then the device is down and the observer has
+// no GI left to read, so the window is an event already in its queue.
 func (r *Reconciler) forgetGIHistory(rdName string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -176,7 +178,7 @@ func writeFileDurably(path string, data []byte) error {
 
 	err = os.Rename(tmp, path)
 	if err != nil {
-		return err //nolint:wrapcheck // best-effort record; the caller drops the error
+		return errors.Join(err, os.Remove(tmp))
 	}
 
 	dir, err := os.Open(filepath.Dir(path))

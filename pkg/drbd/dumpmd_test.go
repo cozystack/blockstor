@@ -50,12 +50,12 @@ la-peer-max-bio-size 1048576;
 al-stripes 1;
 al-stripe-size-4k 8;
 # bm-bytes 327680;
-bm {
+bitmap[0] {
    # at 0kB
     5120 times 0x0000000000000000;
    0xDEADBEEFDEADBEEF; 0x0000000000000000; 0x0000000000000000; 0x0000000000000000;
 }
-# bits-set 64;
+# bits-set[0] 64;
 `
 
 const dumpV08 = `version "v08";
