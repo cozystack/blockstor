@@ -605,7 +605,13 @@ func snapshotDelete(ctx context.Context, run *runContext) error {
 
 	rdName, snapName := run.Flags.Positionals[0], run.Flags.Positionals[1]
 
-	err := run.Store.Snapshots().Delete(ctx, rdName, snapName)
+	// The same release the REST door runs: see store.ReleaseRestoreSource.
+	err := store.ReleaseRestoreSource(ctx, run.Store, rdName, snapName)
+	if err != nil {
+		return fmt.Errorf("delete snapshot %s of %s: %w", snapName, rdName, err)
+	}
+
+	err = run.Store.Snapshots().Delete(ctx, rdName, snapName)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete snapshot %s of %s: %w", snapName, rdName, err)
 	}
