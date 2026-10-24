@@ -61,15 +61,15 @@ const RestoreAdoptedProp = "Blockstor/RestoreAdopted"
 // the snapshot it was restored from held, as `<number>=<size KiB>` pairs.
 //
 // The snapshot is the reference a retry judges a leftover against, and it does
-// not always outlive the leftover: an operator can delete it. Judged without
-// it, a definition with one volume and one live replica read as finished
-// whatever the snapshot held, so a clone that had restored only some of its
-// volumes before the snapshot went was reported complete. The record is
-// written with the marker, and it is the reference whenever the caller does
-// not hand the snapshot in, whether or not the snapshot still exists: every
-// rollback's spare-or-delete judgement (ReadsAsFinished) reads it. A leftover
-// written before the record existed carries none and is judged as before, on
-// its own volumes alone.
+// not always outlive the leftover: an operator can delete it, and a clone's
+// internal one is reaped. Judged without it, a definition with one volume and
+// one live replica read as finished whatever the snapshot held, so a clone
+// that had restored only some of its volumes before the snapshot went was
+// reported complete. The record is written with the marker, and it is the
+// reference whenever the caller does not hand the snapshot in, whether or not
+// the snapshot still exists: every rollback's spare-or-delete judgement
+// (ReadsAsFinished) reads it. A leftover written before the record existed
+// carries none and is judged as before, on its own volumes alone.
 const RestoreVolumesProp = "Blockstor/RestoreVolumes"
 
 // WithRestoreMarker stamps a definition being restored from snap with the
