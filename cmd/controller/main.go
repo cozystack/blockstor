@@ -280,6 +280,7 @@ func main() {
 	}
 	if err := (&controller.AutoSnapshotRunnable{
 		Client: mgr.GetClient(),
+		Store:  st,
 	}).RegisterWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to register runnable", "runnable", "auto-snapshot")
 		os.Exit(1)
