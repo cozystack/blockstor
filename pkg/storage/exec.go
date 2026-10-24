@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -147,6 +148,19 @@ type FakeResponse struct {
 	Stdout []byte
 	Err    error
 }
+
+// FakeExitError is a canned non-zero exit for FakeResponse.Err. It
+// carries the status the way *exec.ExitError does, so code that reads
+// a command's exit status (blkid's "nothing found" is 2) can be driven
+// without running the command.
+type FakeExitError struct {
+	Code int
+}
+
+func (e FakeExitError) Error() string { return "exit status " + strconv.Itoa(e.Code) }
+
+// ExitCode returns the canned status, as (*exec.ExitError).ExitCode does.
+func (e FakeExitError) ExitCode() int { return e.Code }
 
 // NewFakeExec returns a FakeExec ready for use.
 func NewFakeExec() *FakeExec {

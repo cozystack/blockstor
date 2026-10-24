@@ -103,6 +103,15 @@ rules:
   verbs:
   - create
   - patch
+# The same events through events.k8s.io, which the manager's recorder
+# writes (the LUKS format refused over data, see resource.go).
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 # corev1.Node — read-only access for Bug 283 .res rendering: the
 # dispatcher's peer-address lookup needs each node's routable
 # InternalIP to overcome piraeus-operator's pod-CIDR overwrite of

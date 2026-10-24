@@ -159,7 +159,17 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 		// naïve rebuild would wipe it and a later replica added to this
 		// established RD would wrongly skip the initial sync.
 		prevInitialized := existing.Spec.Initialized
+		// The layer stack is decided once and then only replaced, never
+		// emptied: a caller writing back a copy read before the pin would
+		// otherwise undo it, and the RD reconcile would then judge the
+		// volume built under the default and re-pin that over LUKS data.
+		prevLayerStack := existing.Spec.LayerStack
 		existing.Spec = wireToCRDRDSpec(in)
+
+		if len(existing.Spec.LayerStack) == 0 {
+			existing.Spec.LayerStack = prevLayerStack
+		}
+
 		existing.Spec.VolumeDefinitions = prevVDs
 		existing.Spec.Encryption = prevEncryption
 		// Identity-to-spec: preserve the optional controller/operator

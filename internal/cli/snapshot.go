@@ -336,7 +336,10 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 		return err
 	}
 
-	def := newRestoredDefinition(args.toResource, &src, &snap)
+	def, err := newRestoredDefinition(ctx, run.Store, args.toResource, &src, &snap)
+	if err != nil {
+		return fmt.Errorf("restore %s onto %s: %w", snap.Name, args.toResource, err)
+	}
 
 	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if errors.Is(err, store.ErrAlreadyExists) {
@@ -372,16 +375,37 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 }
 
 // newRestoredDefinition is the definition a restore creates: the source's
-// group and stack, the snapshot's props, and this restore's marker.
-func newRestoredDefinition(rdName string, src *apiv1.ResourceDefinition, snap *apiv1.Snapshot) *apiv1.ResourceDefinition {
+// group and stack, the snapshot's props, and this restore's marker. The stack
+// is the one the source's bytes were laid down under
+// (store.EffectiveLayerStack); a source whose group has yet to decide it is an
+// error the operator retries once the controller pins it. A copy short of what
+// its group asks for is flagged the way the controller flags a definition it
+// pinned over data.
+func newRestoredDefinition(
+	ctx context.Context, st store.Store, rdName string, src *apiv1.ResourceDefinition, snap *apiv1.Snapshot,
+) (*apiv1.ResourceDefinition, error) {
+	stack, err := store.EffectiveLayerStack(ctx, st, src)
+	if err != nil {
+		return nil, fmt.Errorf("the layer stack of the source %s: %w", src.Name, err)
+	}
+
+	unapplied, err := store.UnappliedGroupStack(ctx, st, src.ResourceGroupName, stack)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // names the group itself
+	}
+
 	def := &apiv1.ResourceDefinition{
 		Name: rdName,
 		// The parent group carries over: it drives later placement and
 		// property inheritance, and a restored definition with a blank
 		// group breaks the restore-then-list workflow.
 		ResourceGroupName: src.ResourceGroupName,
-		LayerStack:        store.EffectiveLayerStack(src.LayerStack),
+		LayerStack:        stack,
 		Props:             store.TravellingProps(snap.Props),
+	}
+
+	if unapplied != "" {
+		def.Annotations = map[string]string{apiv1.UnappliedGroupLayerStackAnnotation: unapplied}
 	}
 
 	if def.Props == nil {
@@ -398,7 +422,7 @@ func newRestoredDefinition(rdName string, src *apiv1.ResourceDefinition, snap *a
 	delete(def.Props, store.CloneSnapshotOwnerProp)
 	delete(def.Props, store.CloneSnapshotReapingProp)
 
-	return def
+	return def, nil
 }
 
 // restoreIntoExistingTarget finishes a restore over a definition that is

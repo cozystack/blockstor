@@ -1184,20 +1184,54 @@ func TestSnapshotRestorePromotesATieBreakerOnARequestedNode(t *testing.T) {
 	}
 }
 
-// A source stored without a stack is brought up with the default whatever its
-// group says now; the restored definition carries that stack, stamped.
-func TestSnapshotRestoreStampsTheSourcesDataPlaneStack(t *testing.T) {
+func seedUndecidedSnapshotSource(ctx context.Context, backend store.Store) {
+	seedSnapshotSource(ctx, backend)
+	_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "grp-luks", SelectFilter: apiv1.AutoSelectFilter{LayerStack: []string{"DRBD", "LUKS", "STORAGE"}},
+	})
+
+	// Patched rather than updated: Update keeps a decided stack, and the
+	// source stands for one stored without a stack.
+	_ = backend.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, "pvc-x", func(src *apiv1.ResourceDefinition) error {
+		src.LayerStack = nil
+		src.ResourceGroupName = "grp-luks"
+
+		return nil
+	})
+}
+
+// A source stored without a stack under a group that sets one has its stack
+// decided by the controller, which has not done it yet: the restore refuses,
+// saying so, and creates nothing.
+func TestSnapshotRestoreRefusesAnUndecidedSourceStack(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedUndecidedSnapshotSource)
+
+	if got := app.Run(t.Context(), restoreResourceArgv("pvc-stack")); got == 0 {
+		t.Fatal("restore of an undecided source exited 0")
+	}
+
+	if !strings.Contains(errBuf.String(), "not pinned yet") {
+		t.Errorf("stderr = %q, want it to say the stack is not pinned yet", errBuf.String())
+	}
+
+	if _, err := appStore(t, app).ResourceDefinitions().Get(t.Context(), "pvc-stack"); err == nil {
+		t.Error("the refused restore created the target")
+	}
+}
+
+// Once the controller pins the source over its data to the default stack, the
+// restored definition carries that stack and is flagged as short of its
+// group's.
+func TestSnapshotRestoreStampsTheSourcesPinnedStack(t *testing.T) {
 	t.Parallel()
 
 	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
-		seedSnapshotSource(ctx, backend)
-		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
-			Name: "grp-luks", SelectFilter: apiv1.AutoSelectFilter{LayerStack: []string{"DRBD", "LUKS", "STORAGE"}},
-		})
+		seedUndecidedSnapshotSource(ctx, backend)
 
 		src, _ := backend.ResourceDefinitions().Get(ctx, "pvc-x")
-		src.LayerStack = nil
-		src.ResourceGroupName = "grp-luks"
+		src.LayerStack = apiv1.DefaultLayerStack()
 		_ = backend.ResourceDefinitions().Update(ctx, &src)
 	})
 
@@ -1211,7 +1245,11 @@ func TestSnapshotRestoreStampsTheSourcesDataPlaneStack(t *testing.T) {
 	}
 
 	if !slices.Equal(rd.LayerStack, apiv1.DefaultLayerStack()) {
-		t.Errorf("restored stack = %v, want the source's data-plane %v", rd.LayerStack, apiv1.DefaultLayerStack())
+		t.Errorf("restored stack = %v, want the source's %v", rd.LayerStack, apiv1.DefaultLayerStack())
+	}
+
+	if got := rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation]; got != "DRBD,LUKS,STORAGE" {
+		t.Errorf("unapplied-group annotation = %q, want DRBD,LUKS,STORAGE", got)
 	}
 }
 

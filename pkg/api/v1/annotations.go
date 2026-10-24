@@ -140,3 +140,12 @@ const PeerChangedAnnotation = "blockstor.io/peer-changed"
 // truth without either package importing the other — pkg/api/v1 is
 // the neutral, dependency-free shared layer both already import.
 const RDSpawnShortfallAnnotation = "blockstor.io/spawn-shortfall"
+
+// UnappliedGroupLayerStackAnnotation is stamped on a ResourceDefinition
+// whose data was written under a stack missing a layer its resource group
+// asks for: one the controller pinned over data it found under the default
+// stack, or a clone or restore of such bytes. It records, comma-separated,
+// the group's stack, so an operator can find every volume that is short of
+// what its group promises (for example a plaintext volume in a LUKS group)
+// and migrate it.
+const UnappliedGroupLayerStackAnnotation = "blockstor.io/unapplied-group-layer-stack"
