@@ -109,10 +109,10 @@ spec:
           image: __REGISTRY__/blockstor-apiserver:dev
           imagePullPolicy: Always
           args:
-            # Plain-HTTP debug listener. NOT exposed by the Service —
-            # reachable only via `kubectl port-forward` to this pod for
-            # local debugging / the `linstor` CLI during development.
-            - --rest-bind-address=:3370
+            # Plain-HTTP debug listener with no authentication. Bound to
+            # loopback, so only `kubectl port-forward` to this pod reaches
+            # it (local debugging, the `linstor` CLI); other pods cannot.
+            - --rest-bind-address=127.0.0.1:3370
             # Mutual-TLS listener. The ONLY port the Service exposes.
             # Requires + verifies client certs against the mounted CA;
             # hot-reloads cert/key/CA on cert-manager rotation without a
@@ -129,8 +129,6 @@ spec:
           ports:
             # rest-tls is the in-cluster endpoint (Service-exposed).
             - {name: rest-tls, containerPort: 3371}
-            # rest-debug stays pod-local (port-forward only).
-            - {name: rest-debug, containerPort: 3370}
             - {name: health, containerPort: 8081}
           volumeMounts:
             # cert-manager-issued serving material (tls.crt/tls.key/

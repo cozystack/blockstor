@@ -74,7 +74,7 @@ const maxRequestBodyBytes int64 = 1 << 20
 // reach the apiserver directly. Both may be nil/empty in tests that
 // only exercise the legacy KV-backed path.
 type Server struct {
-	Addr      string // e.g. ":3370" — plain-HTTP debug port (NOT exposed by the in-cluster Service; reachable only via kubectl port-forward)
+	Addr      string // e.g. "127.0.0.1:3370" — plain-HTTP debug port with no authentication; keep it on loopback so only kubectl port-forward reaches it
 	Store     store.Store
 	Client    client.Client // controller-runtime client for native-object endpoints
 	Namespace string        // namespace where blockstor's own Secrets/ConfigMaps live
