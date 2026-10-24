@@ -404,8 +404,8 @@ func (s *Server) refuseRDCreateOnRGDeletedRace(w http.ResponseWriter, r *http.Re
 
 		writeError(w, http.StatusNotFound,
 			"resource group '"+rd.ResourceGroupName+"' was deleted "+
-				"concurrently with the resource-definition create "+
-				"(Bug 174): retry after re-creating the resource group, "+
+				"concurrently with the resource-definition create: "+
+				"retry after re-creating the resource group, "+
 				"or pick a different resource group")
 
 		return false
@@ -428,6 +428,10 @@ func (s *Server) refuseRDCreateOnRGDeletedRace(w http.ResponseWriter, r *http.Re
 // 60-line cap and so each new wire-boundary refusal lives in one
 // canonical spot rather than as another diff inside the parent.
 func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, body *apiv1.ResourceDefinitionCreate, rd *apiv1.ResourceDefinition) bool {
+	if refusePropsModifyOnCreate(w, "resource definition create", body.OverrideProps, body.DeleteProps, body.DeleteNamespace) {
+		return false
+	}
+
 	// Bug 97: refuse whitespace-only / RFC-1123-illegal names at the
 	// REST wire boundary, BEFORE pkg/store/k8s.Name() slugifies +
 	// hash-prefixes the input. Without this gate `linstor rd c "  "`

@@ -528,7 +528,7 @@ func (r *PhysicalDeviceReconciler) clearStaleAttachTo(ctx context.Context, dev *
 		return ctrl.Result{}, errors.Wrap(err, "reset Phase to Available after stale AttachTo clear")
 	}
 
-	logger.Info("cleared stale AttachTo; target StoragePool gone (Bug 340 self-heal)",
+	logger.Info("cleared stale AttachTo: the target StoragePool is gone",
 		"missing-pool", missingPool)
 
 	return ctrl.Result{}, nil
