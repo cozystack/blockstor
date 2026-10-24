@@ -1371,6 +1371,11 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// every replica of the new RD clones from the same source.
 	newRD.Props = store.WithRestoreMarker(newRD.Props, snap)
 
+	err = s.refuseReplicasWithoutDefinition(ctx, newRD.Name)
+	if err != nil {
+		return materialisedRD{}, err
+	}
+
 	created, adoptedRG, err := s.createOrAdoptRestoredRD(ctx, &newRD, snap, overrides)
 	if err != nil {
 		return materialisedRD{}, err
@@ -1685,6 +1690,61 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 	}
 
 	return placed, nil
+}
+
+// errReplicasWithoutDefinition refuses a restore or clone into a name that has
+// no definition but already has replicas holding no data under it.
+var errReplicasWithoutDefinition = errors.New("replicas already exist under that name with no definition over them")
+
+// refuseReplicasWithoutDefinition refuses materialising a new definition over
+// replicas holding no data that are already there with none over them: an
+// operator's diskless replica or a witness left by a cascade that did not
+// finish, or applied by hand.
+//
+// Created over them, the definition adopted them, the stamp on their node
+// failed because a replica with no data is not one a restore can use, and the
+// rollback of the definition it had created cascaded over every replica under
+// the name, taking those with it although this request had not made them.
+// Refusing before anything is written leaves them where they were and names
+// them.
+//
+// A replica that holds data is not refused here: the stamp takes it as placed
+// (see stampRestoredReplica), and it is this restore's to keep or roll back. A
+// replica already being deleted is no obstacle either: it is going whatever
+// the restore does.
+//
+// Read past the cache on both sides: a definition the cache has not seen yet
+// would make its own replicas read as orphans.
+func (s *Server) refuseReplicasWithoutDefinition(ctx context.Context, rdName string) error {
+	_, err := s.Store.ResourceDefinitions().GetUncached(ctx, rdName)
+	if err == nil {
+		return nil
+	}
+
+	if !errors.Is(err, store.ErrNotFound) {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	replicas, err := store.LiveReplicas(ctx, s.Store, rdName)
+	if err != nil {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	var live []string
+
+	for i := range replicas {
+		if !slices.Contains(replicas[i].Flags, apiv1.ResourceFlagDelete) && !store.HoldsData(&replicas[i]) {
+			live = append(live, replicas[i].NodeName)
+		}
+	}
+
+	if len(live) == 0 {
+		return nil
+	}
+
+	return errors.Mark(errors.Wrapf(store.ErrAlreadyExists, //nolint:wrapcheck // the mark is the wrap
+		"'%s' has replicas holding no data on %s but no resource definition: %v; delete those "+
+			"Resource objects, then retry", rdName, strings.Join(live, ", "), errReplicasWithoutDefinition), errReplicasWithoutDefinition)
 }
 
 // errReplicaStillDeleting marks a stamp refused because the replica already
