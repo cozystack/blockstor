@@ -86,8 +86,9 @@ type apiserverFlags struct {
 func parseFlags() *apiserverFlags {
 	flags := &apiserverFlags{}
 
-	flag.StringVar(&flags.restAddr, "rest-bind-address", ":3370",
-		"Plain-HTTP debug bind address. NOT exposed by the in-cluster Service — reachable only via `kubectl port-forward` for local debugging.")
+	flag.StringVar(&flags.restAddr, "rest-bind-address", defaultPlainBindAddress,
+		"Plain-HTTP debug bind address. It serves the full API without authentication, so the default is loopback: "+
+			"`kubectl port-forward` still reaches it, other pods do not.")
 	flag.StringVar(&flags.tlsAddr, "tls-bind-address", ":3371",
 		"Mutual-TLS bind address (upstream LINSTOR HTTPS port). The in-cluster Service exposes ONLY this port. Requires --tls-cert-file/--tls-key-file/--tls-client-ca-file; empty disables the TLS listener.")
 	flag.StringVar(&flags.tlsCertFile, "tls-cert-file", "",
