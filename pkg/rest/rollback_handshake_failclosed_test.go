@@ -409,7 +409,8 @@ func TestTheInProgressRefusalNamesTheClearAndWhenItIsSafe(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"set-property dst-inprog " + store.RollbackAbandonedProp, "a minute after the failure", "stops that rollback before it deletes anything",
+		"set-property dst-inprog " + store.RollbackAbandonedProp, "takes over a mark nobody has touched for two minutes",
+		"stops that rollback before it deletes anything",
 	} {
 		if !strings.Contains(refusal.Correc, want) {
 			t.Errorf("correction %q does not say %q", refusal.Correc, want)
