@@ -23,7 +23,7 @@ import (
 )
 
 // TestFoldTopologyLabelsAddsAuxProp pins the migration shim: a Node
-// with `topology.blockstor.io/zone=us-east-1a` set as a native
+// with `topology.blockstor.org/zone=us-east-1a` set as a native
 // Kubernetes label MUST surface as `Props["Aux/zone"]` on the wire
 // so the autoplacer's existing replicas_on_same / replicas_on_different
 // filters keep working without changes. Phase 10.3.
@@ -32,8 +32,8 @@ func TestFoldTopologyLabelsAddsAuxProp(t *testing.T) {
 
 	props := map[string]string{}
 	labels := map[string]string{
-		"topology.blockstor.io/zone": "us-east-1a",
-		"topology.blockstor.io/rack": "r5",
+		"topology.blockstor.org/zone": "us-east-1a",
+		"topology.blockstor.org/rack": "r5",
 		"unrelated":                  "ignored",
 	}
 
@@ -65,7 +65,7 @@ func TestFoldTopologyLabelsPropsWinOnConflict(t *testing.T) {
 		"Aux/zone": "explicit-from-props",
 	}
 	labels := map[string]string{
-		"topology.blockstor.io/zone": "from-label-should-lose",
+		"topology.blockstor.org/zone": "from-label-should-lose",
 	}
 
 	foldTopologyLabels(props, labels)
@@ -82,7 +82,7 @@ func TestFoldTopologyLabelsPropsWinOnConflict(t *testing.T) {
 func TestHasTopologyLabelsTrue(t *testing.T) {
 	t.Parallel()
 
-	if !hasTopologyLabels(map[string]string{"topology.blockstor.io/zone": "us-east-1a"}) {
+	if !hasTopologyLabels(map[string]string{"topology.blockstor.org/zone": "us-east-1a"}) {
 		t.Errorf("expected true for prefixed label")
 	}
 }

@@ -98,16 +98,16 @@ POOL=${STORPOOL:-stand}
 # without touching anything else. Cleanup path puts the label back
 # on every worker and drops the nodeSelector so the DaemonSet's
 # default placement returns.
-PIN_LABEL=blockstor.io/test-5-13=keep
+PIN_LABEL=blockstor.org/test-5-13=keep
 
 restore_daemonset_and_label() {
     # Best-effort rollback in EXIT trap. Don't fail the trap if these
     # error — we still want delete_rd to run.
     kubectl -n "$NS" patch daemonset blockstor-satellite \
-        --type=json -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/blockstor.io~1test-5-13"}]' \
+        --type=json -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/blockstor.org~1test-5-13"}]' \
         2>/dev/null || true
     for n in "$N1" "$N2" "$N3"; do
-        kubectl label node "$n" "blockstor.io/test-5-13-" --overwrite 2>/dev/null || true
+        kubectl label node "$n" "blockstor.org/test-5-13-" --overwrite 2>/dev/null || true
     done
     kubectl -n "$NS" rollout status daemonset blockstor-satellite --timeout=60s 2>/dev/null || true
 }
@@ -250,13 +250,13 @@ echo "   all 3 peers UpToDate"
 echo ">> stop satellite on ${N3} via DaemonSet nodeSelector pin"
 kubectl label node "$N1" "$PIN_LABEL" --overwrite >/dev/null
 kubectl label node "$N2" "$PIN_LABEL" --overwrite >/dev/null
-kubectl label node "$N3" blockstor.io/test-5-13- --overwrite 2>/dev/null || true
+kubectl label node "$N3" blockstor.org/test-5-13- --overwrite 2>/dev/null || true
 kubectl -n "$NS" patch daemonset blockstor-satellite --type=merge -p '
 spec:
   template:
     spec:
       nodeSelector:
-        blockstor.io/test-5-13: keep
+        blockstor.org/test-5-13: keep
 '
 
 # Wait for worker-3's satellite pod to actually be gone — DS reconcile
@@ -378,7 +378,7 @@ assert_uptodate_12 "after toggle-disk"
 
 echo ">> restore satellite on ${N3} (un-pin DaemonSet)"
 kubectl -n "$NS" patch daemonset blockstor-satellite \
-    --type=json -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/blockstor.io~1test-5-13"}]'
+    --type=json -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/blockstor.org~1test-5-13"}]'
 
 # Wait for the new pod to come Ready. 90 s is generous for QEMU image
 # pull-cache on the stand; bumping to 120 s if the cluster is cold.

@@ -32,9 +32,9 @@ The default is `["DRBD","STORAGE"]`, used when neither the RD nor its resource g
 An RD's stack is fixed once and then read only from `RD.Spec.LayerStack`. The REST create and `rg spawn` paths copy the group's stack onto the RD when it is created. An RD that ends up with an empty stack in a group that sets one (created with `kubectl apply` or GitOps, or moved by `rd modify --resource-group`) is pinned by the controller, and the satellite builds nothing for it until then:
 
 - An RD that holds no data yet gets the group's stack.
-- An RD that already holds data (a replica reported DRBD metadata or a device, or `spec.initialized` is set) keeps `["DRBD","STORAGE"]`, the stack its storage was built with. When that is missing a layer the group asks for, the group's stack is recorded in the `blockstor.io/unapplied-group-layer-stack` annotation and a `LayerStackNotInherited` warning Event is emitted on the RD. Such a volume is not what its group promises (for example, a plaintext volume in a LUKS group); move its data to a new volume to get the group's stack.
+- An RD that already holds data (a replica reported DRBD metadata or a device, or `spec.initialized` is set) keeps `["DRBD","STORAGE"]`, the stack its storage was built with. When that is missing a layer the group asks for, the group's stack is recorded in the `blockstor.org/unapplied-group-layer-stack` annotation and a `LayerStackNotInherited` warning Event is emitted on the RD. Such a volume is not what its group promises (for example, a plaintext volume in a LUKS group); move its data to a new volume to get the group's stack.
 
-Clones and restores copy bytes, so the RD they create takes the stack those bytes were written under: the source's own, or the default when neither the source nor its group sets one. A source still waiting for the controller to pin its stack is answered 503 (the CLI exits with an error) until it is pinned, and a prepared restore target in the same state is refused the same way before anything is written to it. A copy whose stack is short of what its own group asks for carries the `blockstor.io/unapplied-group-layer-stack` annotation. A clone of a volume-less RD copies no bytes: it takes the source's stack only when the source set one by choice, and otherwise is left for the controller to pin from its own group.
+Clones and restores copy bytes, so the RD they create takes the stack those bytes were written under: the source's own, or the default when neither the source nor its group sets one. A source still waiting for the controller to pin its stack is answered 503 (the CLI exits with an error) until it is pinned, and a prepared restore target in the same state is refused the same way before anything is written to it. A copy whose stack is short of what its own group asks for carries the `blockstor.org/unapplied-group-layer-stack` annotation. A clone of a volume-less RD copies no bytes: it takes the source's stack only when the source set one by choice, and otherwise is left for the controller to pin from its own group.
 
 Changing a group's stack later never reshapes RDs that already carry one, as in upstream LINSTOR, where the stack is decided when a resource is created.
 
@@ -44,7 +44,7 @@ Find the RDs short of a layer their group asks for:
 
 ```bash
 kubectl get resourcedefinitions.blockstor.org \
-  -o custom-columns='NAME:.metadata.name,GROUP_STACK:.metadata.annotations.blockstor\.io/unapplied-group-layer-stack' \
+  -o custom-columns='NAME:.metadata.name,GROUP_STACK:.metadata.annotations.blockstor\.org/unapplied-group-layer-stack' \
   | awk '$2 != "<none>"'
 ```
 

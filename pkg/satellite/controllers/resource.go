@@ -946,7 +946,7 @@ func buildVolumeStatusPurgePatch(stale []staleVolumeStatus) ([]byte, error) {
 
 // stampVolumeNumbersAnnotation writes the parent RD's volume-number
 // set onto the Resource's metadata.annotations under
-// `blockstor.io/volume-numbers`. The value is a comma-separated list
+// `blockstor.org/volume-numbers`. The value is a comma-separated list
 // of int32 (e.g. "0,1,2"). This is the Bug-107 fallback record:
 // when `linstor rd delete <X>` cascade-deletes the parent RD CRD via
 // owner refs, the satellite's `handleDelete` runs AFTER the RD is
@@ -987,7 +987,7 @@ func (r *ResourceReconciler) stampVolumeNumbersAnnotation(ctx context.Context, r
 
 	err := r.Patch(ctx, res, client.RawPatch(types.MergePatchType, body))
 	if err != nil {
-		return errors.Wrap(err, "merge-patch annotation blockstor.io/volume-numbers")
+		return errors.Wrap(err, "merge-patch annotation blockstor.org/volume-numbers")
 	}
 
 	return nil
@@ -1548,7 +1548,7 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 //
 //  1. The parent RD's VolumeDefinitions (the source of truth while
 //     the RD CRD still exists).
-//  2. The `blockstor.io/volume-numbers` annotation that
+//  2. The `blockstor.org/volume-numbers` annotation that
 //     `stampVolumeNumbersAnnotation` writes on every successful apply
 //     (Bug 107: `linstor rd delete` cascade-deletes the parent RD via
 //     owner refs, so by the time `handleDelete` runs the RD Get

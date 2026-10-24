@@ -80,7 +80,7 @@ func listAutoSnapshotsByRD(t *testing.T, cli client.Client, rdName string) []blo
 	var snaps blockstoriov1alpha1.SnapshotList
 
 	err := cli.List(context.Background(), &snaps, client.MatchingLabels{
-		"blockstor.io/resource-definition": rdName,
+		"blockstor.org/resource-definition": rdName,
 		controllerpkg.LabelAutoSnapshot:    "true",
 	})
 	if err != nil {
@@ -282,8 +282,8 @@ func TestAutoSnapshotManualSnapshotsNotPruned(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "pvc-w05-manual." + suffix,
 				Labels: map[string]string{
-					"blockstor.io/resource-definition": "pvc-w05-manual",
-					"blockstor.io/snapshot-name":       suffix,
+					"blockstor.org/resource-definition": "pvc-w05-manual",
+					"blockstor.org/snapshot-name":       suffix,
 					// Intentionally NO LabelAutoSnapshot.
 				},
 			},
@@ -319,7 +319,7 @@ func TestAutoSnapshotManualSnapshotsNotPruned(t *testing.T) {
 	// their distinct snapshot-name label.
 	var allSnaps blockstoriov1alpha1.SnapshotList
 	if err := cli.List(context.Background(), &allSnaps, client.MatchingLabels{
-		"blockstor.io/resource-definition": "pvc-w05-manual",
+		"blockstor.org/resource-definition": "pvc-w05-manual",
 	}); err != nil {
 		t.Fatalf("list all snaps: %v", err)
 	}

@@ -1740,7 +1740,7 @@ func typeMeta(kind string) metav1.TypeMeta {
 // objectMeta builds the CRD metadata for a LINSTOR object name:
 // metadata.name via the store's normalization (lowercase, slugged when
 // not RFC-1123-clean) and the original spelling preserved in the
-// blockstor.io/linstor-name annotation when it differs.
+// blockstor.org/linstor-name annotation when it differs.
 func objectMeta(original string) metav1.ObjectMeta {
 	meta := metav1.ObjectMeta{Name: k8sstore.Name(original)}
 	k8sstore.SetOriginalName(&meta, original)

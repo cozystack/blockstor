@@ -34,7 +34,7 @@ import (
 // CRD's metadata.name is the lowercased rfc1123-clean slug
 // `dfltrscgrp` (so `kubectl get resourcegroup dfltrscgrp` works),
 // but a subsequent Get/List must surface the canonical CamelCase
-// spelling on the wire — via the `blockstor.io/linstor-name`
+// spelling on the wire — via the `blockstor.org/linstor-name`
 // annotation set by SetOriginalName.
 func TestResourceGroupCanonicalCamelCaseRoundTrip(t *testing.T) {
 	t.Parallel()

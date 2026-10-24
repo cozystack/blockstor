@@ -37,7 +37,7 @@ import (
 )
 
 // LabelSnapshot is the label that lets us List snapshots by parent RD.
-const LabelSnapshot = "blockstor.io/snapshot-name"
+const LabelSnapshot = "blockstor.org/snapshot-name"
 
 // LabelSnapshotGroupID is the label that lets the controller-side
 // SnapshotReconciler List sibling Snapshots in the same transactional
@@ -45,7 +45,7 @@ const LabelSnapshot = "blockstor.io/snapshot-name"
 // wire DTO carries a non-empty Spec.GroupID — empty GroupID means
 // "single-snap path" and the label is omitted entirely so the
 // b351 single-Snapshot orchestrator path stays unchanged.
-const LabelSnapshotGroupID = "blockstor.io/snapshot-group-id"
+const LabelSnapshotGroupID = "blockstor.org/snapshot-group-id"
 
 type snapshots struct {
 	c ctrlclient.Client

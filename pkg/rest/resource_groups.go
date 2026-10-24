@@ -260,7 +260,7 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		// filter. Phase 11.x split pushed reconcilers into a
 		// separate process, so the REST handler can't walk RDs
 		// inline — instead it stamps the
-		// `blockstor.io/rebalance-pending` annotation and the
+		// `blockstor.org/rebalance-pending` annotation and the
 		// RGRebalanceReconciler picks it up. Scale-DOWN
 		// intentionally does NOT trigger anything.
 		rebalanceScheduled = rgNeedsRebalance(&prevFilter, &existing.SelectFilter)

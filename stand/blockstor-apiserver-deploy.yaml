@@ -19,7 +19,7 @@ metadata:
 #   - emit Events (no reconcile-trigger writes from REST).
 #   - need leases (leader election is off — every apiserver
 #     replica serves independently).
-# What's left is plain CRUD on the blockstor.io CRDs themselves,
+# What's left is plain CRUD on the blockstor.org CRDs themselves,
 # plus the passphrase Secret in this namespace (the Role below).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

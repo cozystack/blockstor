@@ -255,7 +255,7 @@ if [[ "$l2_ok" != "true" ]]; then
     exit 1
 fi
 ANN=$(kubectl get resourcedefinitions.blockstor.org "$RD" \
-    -o jsonpath='{.metadata.annotations.blockstor\.io/auto-tiebreaker-suppressed-until}' \
+    -o jsonpath='{.metadata.annotations.blockstor\.org/auto-tiebreaker-suppressed-until}' \
     2>/dev/null || true)
 if [[ -z "$ANN" ]]; then
     echo "FAIL: Bug-4 suppression annotation missing on RD $RD"

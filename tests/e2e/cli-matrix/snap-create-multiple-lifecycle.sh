@@ -219,19 +219,19 @@ fi
 # Phase 3b: Bug 353 GroupID contract. Every Snapshot CRD in the
 # batch must share the same Spec.GroupID (or equivalent batch-
 # identity field — accept .spec.groupId / .spec.groupID /
-# annotation `blockstor.io/group-id`). If the field is absent on
+# annotation `blockstor.org/group-id`). If the field is absent on
 # all three OR differs between them, the batch is not transactional
 # and the test FAILs with the explicit shape.
 echo ">> Phase 3b: every snap in the batch shares Spec.GroupID (Bug 353)"
 gid_a=$(snap_json "$RD_A" | jq -r '
     .spec.groupId // .spec.groupID // .spec.group_id //
-    (.metadata.annotations["blockstor.io/group-id"] // "")' 2>/dev/null)
+    (.metadata.annotations["blockstor.org/group-id"] // "")' 2>/dev/null)
 gid_b=$(snap_json "$RD_B" | jq -r '
     .spec.groupId // .spec.groupID // .spec.group_id //
-    (.metadata.annotations["blockstor.io/group-id"] // "")' 2>/dev/null)
+    (.metadata.annotations["blockstor.org/group-id"] // "")' 2>/dev/null)
 gid_c=$(snap_json "$RD_C" | jq -r '
     .spec.groupId // .spec.groupID // .spec.group_id //
-    (.metadata.annotations["blockstor.io/group-id"] // "")' 2>/dev/null)
+    (.metadata.annotations["blockstor.org/group-id"] // "")' 2>/dev/null)
 echo "   $RD_A.groupID = ${gid_a:-<empty>}"
 echo "   $RD_B.groupID = ${gid_b:-<empty>}"
 echo "   $RD_C.groupID = ${gid_c:-<empty>}"

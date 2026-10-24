@@ -6,7 +6,7 @@ description: |
   The controller writes the group's stack onto a definition that leaves
   it empty. One that holds no data takes the group's stack; one that
   already went to disk under the default stack keeps it and is flagged
-  with the blockstor.io/unapplied-group-layer-stack annotation, so a
+  with the blockstor.org/unapplied-group-layer-stack annotation, so a
   LUKS group added over a plaintext volume never has the satellite
   luksFormat it.
 
@@ -111,7 +111,7 @@ steps:
     await:
       kind: rd_annotation
       rd: "{{rd}}"
-      key: blockstor.io/unapplied-group-layer-stack
+      key: blockstor.org/unapplied-group-layer-stack
       expected: "DRBD,LUKS,STORAGE"
       timeout_s: 30
   - name: clone-after-the-pin

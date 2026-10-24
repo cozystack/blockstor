@@ -271,7 +271,7 @@ kubectl patch resourcedefinition "$RD" --type=merge \
 # deterministic kick that matches the operator-CLI muscle-memory of
 # `kubectl annotate ... reconcile=now` to force-flush a stuck loop.
 kubectl annotate --overwrite "resource.blockstor.org/${RD}.${N1}" \
-    blockstor.io/reconcile-kick="$(date +%s)" >/dev/null
+    blockstor.org/reconcile-kick="$(date +%s)" >/dev/null
 
 # The satellite renders .res from the RD prop set on every reconcile.
 # Within 90s the .res on $N1 must contain `quorum off;` — anything
@@ -292,7 +292,7 @@ while (( $(date +%s) < deadline )); do
     # before the controller propagated the new RD spec to the
     # satellite's cache.
     kubectl annotate --overwrite "resource.blockstor.org/${RD}.${N1}" \
-        blockstor.io/reconcile-kick="$(date +%s)" >/dev/null 2>&1 || true
+        blockstor.org/reconcile-kick="$(date +%s)" >/dev/null 2>&1 || true
     sleep 3
 done
 if [[ "$saw_off" != "true" ]]; then

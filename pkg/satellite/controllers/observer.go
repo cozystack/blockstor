@@ -1475,7 +1475,7 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 // re-emit.
 //
 // The reconciler stamps the live RD volume set onto the Resource CRD's
-// `blockstor.io/volume-numbers` annotation on every successful apply
+// `blockstor.org/volume-numbers` annotation on every successful apply
 // pass, so it is the authoritative desired set for both diskful and
 // diskless replicas. Prune the cache against it: drop every cached
 // volume whose number is absent from the annotation.
@@ -1763,7 +1763,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		// evicted by the event path and the observer re-emits a
 		// phantom Status.Volumes[n] on every tick (a permanent flap).
 		// The reconciler stamps the authoritative live volume set on
-		// `blockstor.io/volume-numbers`; prune the cache against it so
+		// `blockstor.org/volume-numbers`; prune the cache against it so
 		// the diskless replica's Status.Volumes converges to exactly
 		// the surviving set without waiting for a destroy event that
 		// never comes. Idempotent: rebuilds ev.Volumes only when the

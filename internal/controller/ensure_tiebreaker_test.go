@@ -177,7 +177,7 @@ func TestEnsureTiebreakerOffOnSingleReplica(t *testing.T) {
 
 // TestEnsureTiebreakerHonoursSuppressionAnnotation pins Bug 4:
 // when the RD carries a fresh
-// `blockstor.io/auto-tiebreaker-suppressed-until` annotation, the
+// `blockstor.org/auto-tiebreaker-suppressed-until` annotation, the
 // reconciler must NOT auto-stamp a witness. Models the operator
 // workflow `linstor r d <tiebreaker-node> <rd>`: the REST handler
 // stamps the annotation BEFORE deleting the replica; the next

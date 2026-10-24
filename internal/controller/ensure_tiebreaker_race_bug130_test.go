@@ -317,7 +317,7 @@ func TestBug130RDDeleteRacesEnsureTiebreakerCreate(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "phantom130b",
 			DeletionTimestamp: &now,
-			Finalizers:        []string{"blockstor.io/cleanup"},
+			Finalizers:        []string{"blockstor.org/cleanup"},
 		},
 	}
 

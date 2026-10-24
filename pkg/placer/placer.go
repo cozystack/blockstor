@@ -1151,7 +1151,7 @@ func (p *Placer) resourcesPerNode(ctx context.Context) (map[string]int, error) {
 // strategy scored as:
 //   - MaxFreeSpace:     FreeCapacity / TotalCapacity, or 0 when total=0
 //   - MinReservedSpace: 1 - reservedKib/totalKib (reserved from
-//     pool.Props[Aux/blockstor.io/reserved-kib], 0 if absent)
+//     pool.Props[Aux/blockstor.org/reserved-kib], 0 if absent)
 //   - MinRscCount:      1 / (1 + numResourcesOnNode(pool.NodeName))
 //   - MaxThroughput:    throughput / maxThroughputInSet (0 when nobody
 //     advertises a hint, or when this pool's hint is 0)
@@ -1210,7 +1210,7 @@ func composite(pool *apiv1.StoragePool, w weights, rscPerNode map[string]int, ma
 	return score
 }
 
-// reservedKib reads the optional `Aux/blockstor.io/reserved-kib` pool
+// reservedKib reads the optional `Aux/blockstor.org/reserved-kib` pool
 // prop. Missing/unparseable values score 0 — the MinReservedSpace
 // strategy degrades to "no reservation reported", same as a literal 0.
 func reservedKib(pool *apiv1.StoragePool) int64 {

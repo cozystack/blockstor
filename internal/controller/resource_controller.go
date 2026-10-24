@@ -269,7 +269,7 @@ const satelliteResourceFinalizer = "blockstor.org/satellite-resource"
 // Production-state gate: the orphan path only fires for Resources
 // that have been successfully applied at least once — either they
 // carry the satellite finalizer (`SatelliteResourceFinalizer`) or
-// the Bug 107 `blockstor.io/volume-numbers` annotation. Fresh
+// the Bug 107 `blockstor.org/volume-numbers` annotation. Fresh
 // scaffolded Resources that have never reached a satellite (e.g.
 // envtest scenarios that mint a Resource without an RD as a stub)
 // are left alone — there's nothing for the satellite to tear down,

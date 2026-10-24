@@ -161,7 +161,7 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
 	// from every snapshot. The reconcilers stamp the same
-	// `blockstor.io/*` + `bug<N>.blockstor.org/*` keys on
+	// `blockstor.org/*` + `bug<N>.blockstor.org/*` keys on
 	// Snapshot CRDs as on Resource / RD / RG; the wire shape must not
 	// carry them.
 	stripInternalAnnotationsFromSnapshots(snaps)

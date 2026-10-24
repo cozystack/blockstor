@@ -57,7 +57,7 @@
 #     5. No orphan CRDs / kernel slots / .res files after delete_rd.
 #
 # Underlying fix chain (kept for cross-reference):
-#   - Bug 67 / 263: REST bumps `blockstor.io/peer-changed` annotation
+#   - Bug 67 / 263: REST bumps `blockstor.org/peer-changed` annotation
 #     on every survivor after r d AND r c so the satellite watch fires
 #     even though kube-apiserver dedupes resourceVersion bumps.
 #   - Bug 284: seedPerPeerGi stamps the LOCAL node-id slot too, not

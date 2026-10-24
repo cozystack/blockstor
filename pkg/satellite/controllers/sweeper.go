@@ -140,7 +140,7 @@ const SweeperRDGrace = 60 * time.Second
 // preserved). Without this opt-out, an operator who deleted the
 // CRD as part of recovery would race the sweeper and lose the
 // kernel-state evidence they wanted to preserve.
-const SweeperSkipAnnotation = "blockstor.io/skip-orphan-sweeper"
+const SweeperSkipAnnotation = "blockstor.org/skip-orphan-sweeper"
 
 // sweeperSkipValue is the annotation value that turns the skip
 // switch on. Kept as a named constant rather than the bare
