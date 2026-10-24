@@ -147,14 +147,19 @@ func closeQuietly(c io.Closer) {
 	_ = c.Close()
 }
 
-// ListenAndServe binds an HTTP server on addr serving the snapshot
-// stream endpoint. Caller is responsible for cancelling ctx to stop
+// ListenAndServe binds an HTTPS server on addr serving the snapshot
+// stream endpoint, with mutual TLS from files: a peer without a certificate
+// signed by the cluster's CA is refused at the handshake. Caller is responsible for cancelling ctx to stop
 // the server. The Server type doesn't manage its own goroutine —
 // this helper is the canonical wiring for cmd/satellite.
 //
 // Returns http.ErrServerClosed on a clean ctx-cancel shutdown so
 // callers can distinguish that from a real bind error.
-func ListenAndServe(ctx context.Context, addr string, s *Server) error {
+func ListenAndServe(ctx context.Context, addr string, s *Server, files TLSFiles) error {
+	if !files.Configured() {
+		return ErrTLSIncomplete
+	}
+
 	mux := http.NewServeMux()
 	s.Register(mux)
 
@@ -162,6 +167,7 @@ func ListenAndServe(ctx context.Context, addr string, s *Server) error {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: readHeaderTimeout, // CWE-400: bound the slowloris window
+		TLSConfig:         files.serverConfig(),
 	}
 
 	var (
@@ -170,7 +176,8 @@ func ListenAndServe(ctx context.Context, addr string, s *Server) error {
 	)
 
 	wg.Go(func() {
-		serveErr = srv.ListenAndServe()
+		// The certificate comes from TLSConfig, read per handshake.
+		serveErr = srv.ListenAndServeTLS("", "")
 	})
 
 	<-ctx.Done()

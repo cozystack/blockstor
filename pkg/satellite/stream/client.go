@@ -31,21 +31,21 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
-// Client fetches a snapshot stream from a peer satellite. One Client
-// instance is reused across requests — it just wraps an http.Client.
+// ErrStreamDisabled is a fetch from a satellite whose stream TLS is not
+// configured. It wraps storage.ErrNotFound, so the caller falls back to a
+// blank volume and a DRBD resync, as it does when no peer has the snapshot.
+var ErrStreamDisabled = errors.Wrap(storage.ErrNotFound, "the snapshot stream is disabled: no stream TLS configured")
+
+// Client fetches a snapshot stream from a peer satellite over mutual TLS.
 type Client struct {
-	http *http.Client
+	files TLSFiles
 }
 
-// NewClient constructs a Client. Passing nil for http defaults to
-// http.DefaultClient with no timeout — fine for the cross-node clone
-// path where snapshot transfers can take minutes.
-func NewClient(c *http.Client) *Client {
-	if c == nil {
-		c = &http.Client{}
-	}
-
-	return &Client{http: c}
+// NewClient builds a Client that presents and verifies certificates from
+// files. With files not configured every Fetch answers ErrStreamDisabled: the
+// stream carries raw volume data, and it is not sent in the clear.
+func NewClient(files TLSFiles) *Client {
+	return &Client{files: files}
 }
 
 // Fetch opens a snapshot stream from peerAddr (host:port form) for
@@ -60,8 +60,21 @@ func NewClient(c *http.Client) *Client {
 // snapshot doesn't live on that satellite — caller should try
 // another peer from snap.Nodes).
 func (c *Client) Fetch(ctx context.Context, peerAddr, rd, snap string, vol int32) (io.ReadCloser, error) {
+	if c == nil || !c.files.Configured() {
+		return nil, ErrStreamDisabled
+	}
+
+	tlsConfig, err := c.files.clientConfig()
+	if err != nil {
+		return nil, errors.Wrap(err, "snapshot-fetch")
+	}
+
+	// A transport per fetch, so the certificate and CA are the ones on
+	// disk now. Fetches are rare and each moves a whole volume.
+	httpClient := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}}
+
 	endpoint := url.URL{
-		Scheme: "http",
+		Scheme: "https",
 		Host:   peerAddr,
 		Path:   PathPrefix + "/" + url.PathEscape(rd) + "/" + url.PathEscape(snap) + "/" + strconv.Itoa(int(vol)),
 	}
@@ -71,7 +84,7 @@ func (c *Client) Fetch(ctx context.Context, peerAddr, rd, snap string, vol int32
 		return nil, errors.Wrap(err, "build snapshot-fetch request")
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, errors.Wrapf(err, "GET %s", endpoint.String())
 	}
