@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LINBIT/golinstor/client"
 	"github.com/LINBIT/golinstor/clonestatus"
@@ -1400,6 +1401,22 @@ func (s *Server) abandonedRollbackRefusal(
 	spelled := existing.Props[rollbackAbandonedKey]
 	if spelled == "" {
 		return 0, nil
+	}
+
+	if spelled == rollbackInProgress {
+		took, takeErr := store.TakeOverStaleRollback(ctx, s.Store, rdName, time.Now())
+		if takeErr != nil {
+			return http.StatusInternalServerError, &apiv1.APICallRc{
+				RetCode: apiCallRcError,
+				Message: operation + " target '" + rdName + "' carries a rollback mark that could not be " +
+					"checked for staleness: " + scrubImplDetails(takeErr.Error()),
+				Correc: "retry the " + operation,
+			}
+		}
+
+		if took {
+			return 0, nil
+		}
 	}
 
 	// A rollback that has not reported a step is one still running, or one

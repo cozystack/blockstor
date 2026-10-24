@@ -376,7 +376,19 @@ func JudgeRestoreLeftoverOf(
 		return progress, true, err
 	}
 
-	err = rollbackMarkRefusal(rd.Name, rd.Props[RollbackAbandonedProp], snap)
+	mark := rd.Props[RollbackAbandonedProp]
+	if mark == RollbackInProgress {
+		took, takeErr := TakeOverStaleRollback(ctx, st, rd.Name, time.Now())
+		if takeErr != nil {
+			return progress, true, takeErr
+		}
+
+		if took {
+			mark = ""
+		}
+	}
+
+	err = rollbackMarkRefusal(rd.Name, mark, snap)
 	if err != nil {
 		return progress, true, err
 	}
@@ -765,7 +777,7 @@ func EnterDestructiveRollback(ctx context.Context, st Store, rdName, step string
 				return errRollbackMarkNotOurs
 			}
 
-			rd.Props[RollbackAbandonedProp] = step
+			rd.Props = MarkRollback(rd.Props, step, time.Now())
 
 			return nil
 		})
@@ -850,7 +862,7 @@ func releaseInProgress(ctx context.Context, st Store, rdName string) error {
 	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
 		func(rd *apiv1.ResourceDefinition) error {
 			if rd.Props[RollbackAbandonedProp] == RollbackInProgress {
-				delete(rd.Props, RollbackAbandonedProp)
+				UnmarkRollback(rd.Props)
 			}
 
 			return nil
@@ -862,21 +874,53 @@ func releaseInProgress(ctx context.Context, st Store, rdName string) error {
 	return nil
 }
 
+// TakeOverStaleRollback takes an in-progress mark off a definition when it is
+// older than StaleRollbackAfter, and reports whether it did. A retry calls it
+// before refusing over the mark.
+//
+// The in-progress mark only ever stands over a definition left whole: a
+// rollback swaps it for the step it is about to run before it deletes
+// anything (EnterDestructiveRollback). A stale one is a rollback whose process
+// stopped before either, so taking it off hands the retry an unfinished
+// leftover, which it resumes. Should that rollback still be alive past its
+// budget, its swap finds the mark gone and it stands down without deleting.
+//
+// The check runs again on the object the patch writes, so a mark a newer
+// rollback wrote in between is left alone.
+func TakeOverStaleRollback(ctx context.Context, st Store, rdName string, now time.Time) (bool, error) {
+	took := false
+
+	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
+		func(rd *apiv1.ResourceDefinition) error {
+			took = rollbackMarkStale(rd.Props, now)
+			if took {
+				UnmarkRollback(rd.Props)
+			}
+
+			return nil
+		})
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, fmt.Errorf("take over the stale rollback mark on %q: %w", rdName, err)
+	}
+
+	return took, nil
+}
+
 // setRollbackMark writes the rollback mark, or removes it when step is empty.
 func setRollbackMark(ctx context.Context, st Store, rdName, step string) error {
 	return st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, //nolint:wrapcheck // callers wrap with the definition they name
 		func(rd *apiv1.ResourceDefinition) error {
 			if step == "" {
-				delete(rd.Props, RollbackAbandonedProp)
+				UnmarkRollback(rd.Props)
 
 				return nil
 			}
 
-			if rd.Props == nil {
-				rd.Props = map[string]string{}
-			}
-
-			rd.Props[RollbackAbandonedProp] = step
+			rd.Props = MarkRollback(rd.Props, step, time.Now())
 
 			return nil
 		})
