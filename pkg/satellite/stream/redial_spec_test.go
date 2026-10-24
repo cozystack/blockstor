@@ -158,7 +158,12 @@ func TestSatelliteFlagsLackControllerBindAddress(t *testing.T) {
 	// kube-apiserver, the satellite's one and only wire); it carries
 	// no controller ADDRESS and does not re-open the Outcome A
 	// controller-wire question this spec guards.
-	want := []string{"node-name", "state-dir", "health-probe-bind-address", "controller-namespace"}
+	// The stream-tls-* files are the mutual TLS of the snapshot stream
+	// between satellites; they carry no controller address either.
+	want := []string{
+		"node-name", "state-dir", "health-probe-bind-address", "controller-namespace",
+		"stream-tls-cert-file", "stream-tls-key-file", "stream-tls-ca-file",
+	}
 	if !equalStringSlices(flags, want) {
 		t.Fatalf("satellite flag set drifted: got %v, want %v. "+
 			"If this is intentional, update the want list AND update tests/scenarios/03-networking.md §3.10 "+

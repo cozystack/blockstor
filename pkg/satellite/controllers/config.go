@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/satellite/stream"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -106,4 +107,9 @@ type Config struct {
 	// pin the burst-debounce / reacts-within-deadline behaviour
 	// without opening a real netlink socket.
 	UeventListener UeventNotifier
+
+	// StreamTLS is the mutual TLS the cross-node snapshot fetcher dials
+	// peer satellites with. Not configured, nothing is fetched and a
+	// restore on this node falls back to a DRBD resync.
+	StreamTLS stream.TLSFiles
 }
