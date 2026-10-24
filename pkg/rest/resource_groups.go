@@ -173,7 +173,7 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := validateLayerStack(rg.SelectFilter.LayerStack)
+	err := canonicalizeLayerStack(&rg.SelectFilter.LayerStack)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -1037,7 +1037,7 @@ func rgUpdateWireGate(raw []byte, patch *apiv1.ResourceGroup) error {
 	// nil); a nil/empty stack is the legitimate "clear to default" and
 	// validateLayerStack accepts it.
 	if patch.SelectFilter.LayerStack != nil {
-		err := validateLayerStack(patch.SelectFilter.LayerStack)
+		err := canonicalizeLayerStack(&patch.SelectFilter.LayerStack)
 		if err != nil {
 			return err
 		}

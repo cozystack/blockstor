@@ -55,3 +55,24 @@ var (
 func validateLayerStack(layers []string) error {
 	return validate.LayerStack(layers)
 }
+
+// canonicalizeLayerStack validates *layers like validateLayerStack and, when
+// the stack is non-empty, replaces it with its canonical-case spelling, which
+// is what the write paths store. Some readers compare the stored value
+// exactly, so a lowercase stack stored verbatim read as "no DRBD" to them.
+//
+//nolint:wrapcheck // see validateLayerStack
+func canonicalizeLayerStack(layers *[]string) error {
+	if len(*layers) == 0 {
+		return nil
+	}
+
+	canonical, err := validate.CanonicalLayerStack(*layers)
+	if err != nil {
+		return err
+	}
+
+	*layers = canonical
+
+	return nil
+}
