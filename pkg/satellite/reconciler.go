@@ -889,7 +889,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		// sweeper's ownership marker — must be removed AFTER the
 		// kernel slot is gone so a concurrent sweeper tick sees a
 		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", giHistorySuffix} {
+		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned"} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{
@@ -897,6 +897,12 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 					Message: err.Error(),
 				}, nil
 			}
+		}
+
+		err := r.forgetGIHistory(req.GetName())
+		if err != nil {
+			//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
+			return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
 		}
 	}
 
@@ -3551,7 +3557,7 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		// this replica's own crash is told apart from a superblock that
 		// is not its own.
 		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
-			hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol, devices[vol.GetVolumeNumber()])
+			hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol)
 		}
 
 		if probeErr != nil {
@@ -3708,10 +3714,10 @@ func isInitialUpToDateWinner(dr *intent.DesiredResource, firstActivation bool) b
 // initialised after all. A repair or a check that fails is an error, not a
 // re-initialisation: the record proves there was data-bearing metadata here.
 //
-// External metadata is repaired and kept on the record alone: the probe
-// below reads the internal-metadata layout.
+// External metadata takes the same check: dump-md finds the meta disk from
+// the rendered .res, wherever it lives.
 func (r *Reconciler) repairUncleanMetadata(
-	ctx context.Context, rdName string, vol *intent.DesiredVolume, _ string,
+	ctx context.Context, rdName string, vol *intent.DesiredVolume,
 ) (bool, error) {
 	target := fmt.Sprintf("%s/%d", rdName, vol.GetVolumeNumber())
 	logger := log.FromContext(ctx).WithValues("volume", target)
@@ -3730,12 +3736,6 @@ func (r *Reconciler) repairUncleanMetadata(
 	err := r.cfg.Adm.ApplyAL(ctx, target)
 	if err != nil {
 		return false, errors.Wrapf(err, "apply the activity log of %s, which this replica held established metadata on", target)
-	}
-
-	if vol.GetMetaPool() != "" {
-		logger.Info("applied the activity log of a volume with external metadata", "recordedGIs", len(known))
-
-		return true, nil
 	}
 
 	onDisk, err := r.cfg.Adm.MetadataUUIDs(ctx, target)
@@ -3833,7 +3833,7 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 		// a live resource has no reported GI and is initialised, an
 		// established one that crashed is repaired.
 		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
-			hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol, devices[vol.GetVolumeNumber()])
+			hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol)
 		}
 
 		if probeErr != nil {

@@ -41,8 +41,10 @@ func (a *Adm) MetadataUUIDs(ctx context.Context, target string) ([]string, error
 	return ParseMetadataUUIDs(out), nil
 }
 
-// dump-md prints the bitmap as long lines; the scanner buffer starts small
-// and may grow to dumpLineMax.
+// The dump carries the whole bitmap, one line per run or per few words, so
+// the lines are short; the buffer still grows to dumpLineMax for a dump whose
+// format changes. The output as a whole is held in memory: for a large,
+// heavily dirty volume that is tens of megabytes, once per check.
 const (
 	dumpLineBuffer = 64 << 10
 	dumpLineMax    = 16 << 20
@@ -50,8 +52,28 @@ const (
 
 // ParseMetadataUUIDs extracts the generation UUIDs from a dump-md listing,
 // upper-cased and without the 0x prefix; zero UUIDs are left out.
+//
+// drbdmeta prints them as statements and blocks (print_dump_gi in
+// drbd-utils' drbdmeta.c). In the v09 format the current UUID and each peer
+// slot's bitmap UUID are single statements, and the history is a block of
+// several UUIDs to a line:
+//
+//	current-uuid 0x9F00AA11BB22CC33;
+//	peer[1] {
+//	    bitmap-uuid 0x6E3A5D0B2C1F4A96;
+//	}
+//	history-uuids {
+//	        0x1234567890ABCDEF; 0x0000000000000000; ...
+//	}
+//
+// The v08 format has a single block of four UUIDs, current, bitmap and two
+// of history, then the flags. Nothing else is read: the bitmap words and the
+// device UUID are not generation identifiers.
 func ParseMetadataUUIDs(dump []byte) []string {
-	var out []string
+	var (
+		out   []string
+		block bool
+	)
 
 	scanner := bufio.NewScanner(bytes.NewReader(dump))
 	scanner.Buffer(make([]byte, 0, dumpLineBuffer), dumpLineMax)
@@ -59,24 +81,64 @@ func ParseMetadataUUIDs(dump []byte) []string {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
-		for _, key := range []string{"current-uuid", "bitmap-uuid", "history-uuids"} {
-			rest, found := strings.CutPrefix(line, key)
-			if !found {
+		if block {
+			body, _, closed := strings.Cut(line, "}")
+			out = appendUUIDStatements(out, body)
+			block = !closed
+
+			continue
+		}
+
+		key, rest, _ := strings.Cut(line, " ")
+
+		switch key {
+		case "current-uuid", "bitmap-uuid":
+			out = appendUUIDStatements(out, rest)
+		case "history-uuids", "uuid":
+			body, opens := strings.CutPrefix(strings.TrimSpace(rest), "{")
+			if !opens {
+				out = appendUUIDStatements(out, rest)
+
 				continue
 			}
 
-			rest, _, _ = strings.Cut(rest, ";")
-
-			for field := range strings.FieldsSeq(rest) {
-				uuid := strings.ToUpper(strings.TrimPrefix(strings.TrimPrefix(field, "0x"), "0X"))
-				if strings.Trim(uuid, "0") != "" {
-					out = append(out, uuid)
-				}
-			}
+			body, _, closed := strings.Cut(body, "}")
+			out = appendUUIDStatements(out, body)
+			block = !closed
 		}
 	}
 
 	return out
+}
+
+// appendUUIDStatements adds every statement of text that is a bare non-zero
+// hex UUID, such as `0x6E3A5D0B2C1F4A96;`. A keyed statement, such as v08's
+// `flags 0x00000011;` inside the uuid block, is not one.
+func appendUUIDStatements(out []string, text string) []string {
+	for statement := range strings.SplitSeq(text, ";") {
+		digits, ok := strings.CutPrefix(strings.TrimSpace(statement), "0x")
+		if !ok || !isHex(digits) || strings.Trim(digits, "0") == "" {
+			continue
+		}
+
+		out = append(out, strings.ToUpper(digits))
+	}
+
+	return out
+}
+
+func isHex(digits string) bool {
+	if digits == "" {
+		return false
+	}
+
+	for _, c := range strings.ToLower(digits) {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // SameGeneration compares two generation UUIDs the way DRBD does: the

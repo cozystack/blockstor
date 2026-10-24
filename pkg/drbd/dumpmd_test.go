@@ -5,27 +5,105 @@ import (
 	"testing"
 )
 
+// The shape drbdmeta prints for a v09 volume (print_dump_gi in drbd-utils'
+// drbdmeta.c): one statement per line for the current and the bitmap UUIDs,
+// the history as a block of four to a line, then the sizes and the bitmap.
+const dumpV09 = `# DRBD meta data dump
+# 2026-10-24 12:00:00 +0000 [1792800000]
+# node-1> drbdmeta 1000 v09 /dev/vg/pvc-r_00000 internal dump-md
+#
+
+version "v09";
+
+max-peers 2;
+# md_size_sect 2048
+# md_offset 10737414144
+# al_offset 10737385472
+# bm_offset 10737057792
+
+node-id 0;
+current-uuid 0x9F00AA11BB22CC33;
+flags 0x00000011;
+members 0x0000000000000003;
+features 0x0000000000000000;
+peer[0] {
+    bitmap-index -1;
+    bitmap-uuid 0x0000000000000000;
+    bitmap-dagtag 0x0000000000000000;
+    flags 0x00000000;
+}
+peer[1] {
+    bitmap-index 0;
+    bitmap-uuid 0x6e3a5d0b2c1f4a96;
+    bitmap-dagtag 0x0000000000000000;
+    flags 0x00000005; # PEER_CONNECTED | PEER_HAVE_DATA
+}
+history-uuids {
+        0x1234567890ABCDEF; 0x0000000000000000; 0x0000000000000000; 0x0000000000000000;
+        0x0000000000000000; 0x0000000000000000; 0x0000000000000000; 0x00000000000000A0;
+}
+# al-extents 1237;
+la-size-sect 20971520;
+bm-byte-per-bit 4096;
+device-uuid 0x5A5A5A5A5A5A5A5A;
+la-peer-max-bio-size 1048576;
+al-stripes 1;
+al-stripe-size-4k 8;
+# bm-bytes 327680;
+bm {
+   # at 0kB
+    5120 times 0x0000000000000000;
+   0xDEADBEEFDEADBEEF; 0x0000000000000000; 0x0000000000000000; 0x0000000000000000;
+}
+# bits-set 64;
+`
+
+const dumpV08 = `version "v08";
+
+# md_size_sect 262144
+uuid {
+    0x9F00AA11BB22CC33; 0x6E3A5D0B2C1F4A96; 0x1234567890ABCDEF; 0x0000000000000000;
+    flags 0x00000011;
+}
+la-size-sect 20971520;
+bm {
+   0xDEADBEEFDEADBEEF;
+}
+`
+
 func TestParseMetadataUUIDsReadsEverySlot(t *testing.T) {
 	t.Parallel()
 
-	dump := []byte(`# DRBD meta data dump
-version "v09";
-node-id 0;
-current-uuid 0x9F00AA11BB22CC33; flags 0x00000011;
-peer[0] {
-    bitmap-uuid 0x0000000000000000;
-}
-peer[1] {
-    bitmap-uuid 0x6e3a5d0b2c1f4a96;
-}
-history-uuids 0x1234567890ABCDEF 0x0000000000000000;
-`)
+	for _, tc := range []struct {
+		name string
+		dump string
+		want []string
+	}{
+		{
+			name: "v09",
+			dump: dumpV09,
+			want: []string{"9F00AA11BB22CC33", "6E3A5D0B2C1F4A96", "1234567890ABCDEF", "00000000000000A0"},
+		},
+		{
+			name: "v08",
+			dump: dumpV08,
+			want: []string{"9F00AA11BB22CC33", "6E3A5D0B2C1F4A96", "1234567890ABCDEF"},
+		},
+		{
+			name: "history on one line",
+			dump: "current-uuid 0x9F00AA11BB22CC33;\nhistory-uuids { 0x1234567890ABCDEF; }\n" +
+				"bm {\n   0xDEADBEEFDEADBEEF;\n}\n",
+			want: []string{"9F00AA11BB22CC33", "1234567890ABCDEF"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	got := ParseMetadataUUIDs(dump)
-	want := []string{"9F00AA11BB22CC33", "6E3A5D0B2C1F4A96", "1234567890ABCDEF"}
-
-	if !slices.Equal(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
+			got := ParseMetadataUUIDs([]byte(tc.dump))
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -21,6 +21,7 @@ package satellite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -682,15 +683,31 @@ func ranCommand(fx *storage.FakeExec, fragment string) bool {
 	return false
 }
 
-// dumpWithPeerBitmap is dump-md output for local node-id 0 whose current
-// UUID moved on after it lost peer 1: the reported GI sits only in peer 1's
-// bitmap slot, which `get-gi --node-id 0` never shows.
+// dumpWithPeerBitmap is dump-md output, in the shape drbdmeta prints for
+// v09, for local node-id 0 whose current UUID moved on after it lost peer 1:
+// the reported GI sits only in peer 1's bitmap slot, which
+// `get-gi --node-id 0` never shows.
 func dumpWithPeerBitmap(current, peerBitmap string) []byte {
-	return []byte("# DRBD meta data dump\nversion \"v09\";\nmax-peers 7;\nnode-id 0;\n" +
-		"current-uuid 0x" + current + "; flags 0x00000011;\n" +
-		"peer[0] {\n    bitmap-uuid 0x0000000000000000;\n}\n" +
-		"peer[1] {\n    bitmap-uuid 0x" + peerBitmap + ";\n}\n" +
-		"history-uuids 0x0000000000000000 0x0000000000000000;\n")
+	return dumpV09(current, peerBitmap, "0000000000000000")
+}
+
+// dumpWithHistory is the same after a resync moved the GI out of the bitmap
+// slot and into the history block.
+func dumpWithHistory(current, history string) []byte {
+	return dumpV09(current, "0000000000000000", history)
+}
+
+func dumpV09(current, peerBitmap, history string) []byte {
+	return []byte("# DRBD meta data dump\nversion \"v09\";\n\nmax-peers 7;\n" +
+		"node-id 0;\ncurrent-uuid 0x" + current + ";\nflags 0x00000011;\n" +
+		"members 0x0000000000000003;\nfeatures 0x0000000000000000;\n" +
+		"peer[0] {\n    bitmap-index -1;\n    bitmap-uuid 0x0000000000000000;\n" +
+		"    bitmap-dagtag 0x0000000000000000;\n    flags 0x00000000;\n}\n" +
+		"peer[1] {\n    bitmap-index 0;\n    bitmap-uuid 0x" + peerBitmap + ";\n" +
+		"    bitmap-dagtag 0x0000000000000000;\n    flags 0x00000005;\n}\n" +
+		"history-uuids {\n        0x" + history + "; 0x0000000000000000; 0x0000000000000000; 0x0000000000000000;\n}\n" +
+		"la-size-sect 2097152;\nbm-byte-per-bit 4096;\ndevice-uuid 0x5A5A5A5A5A5A5A5A;\n" +
+		"bm {\n   # at 0kB\n    64 times 0x0000000000000000;\n}\n")
 }
 
 func runMetadataPath(t *testing.T, path string, rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, marker string) error {
@@ -712,20 +729,33 @@ func runMetadataPath(t *testing.T, path string, rec *Reconciler, dr *intent.Desi
 // is not part of its identity.
 func TestEnsureMetadataRepairsTheCrashOfAReplicaWithAKnownGI(t *testing.T) {
 	for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
+		for slot, dump := range map[string][]byte{
+			"peer bitmap": dumpWithPeerBitmap("9F00AA11BB22CC33", uncleanReportedGI),
+			"history":     dumpWithHistory("9F00AA11BB22CC33", uncleanReportedGI),
+		} {
+			testRepairsTheCrash(t, path, slot, dump)
+		}
+	}
+}
+
+func testRepairsTheCrash(t *testing.T, path, slot string, dump []byte) {
+	t.Helper()
+
+	{
 		for name, record := range map[string]func(*Reconciler, *intent.DesiredResource){
 			"status": func(_ *Reconciler, dr *intent.DesiredResource) { dr.Volumes[0].ObservedGI = uncleanReportedGI },
 			"history": func(rec *Reconciler, _ *intent.DesiredResource) {
 				rec.RecordObservedGI("pvc-unclean", 0, "6E3A5D0B2C1F4A97")
 			},
 		} {
-			t.Run(path+"/"+name, func(t *testing.T) {
+			t.Run(path+"/"+slot+"/"+name, func(t *testing.T) {
 				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
 				record(rec, dr)
 
 				fx.Expect(uncleanApplyAL, storage.FakeResponse{})
 				fx.ExpectSequence(uncleanDumpMD,
 					storage.FakeResponse{Err: errDumpMdUnclean},
-					storage.FakeResponse{Stdout: dumpWithPeerBitmap("9F00AA11BB22CC33", uncleanReportedGI)})
+					storage.FakeResponse{Stdout: dump})
 
 				if err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath); err != nil {
 					t.Fatalf("%s: %v", path, err)
@@ -812,20 +842,98 @@ func TestEnsureMetadataFailsClosedWhenTheRepairFails(t *testing.T) {
 	}
 }
 
-// External metadata is repaired and kept on the record alone.
-func TestEnsureMetadataKeepsRepairedExternalMetadata(t *testing.T) {
-	rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
-	dr.Volumes[0].ObservedGI = uncleanReportedGI
-	dr.Volumes[0].MetaPool = "meta"
+// External metadata takes the same check as internal: dump-md reads the
+// meta disk from the .res wherever it lives, so a repaired volume is kept
+// when its superblock names a known GI and initialised when it does not.
+func TestEnsureMetadataChecksRepairedExternalMetadata(t *testing.T) {
+	for name, tc := range map[string]struct {
+		dump []byte
+		keep bool
+	}{
+		"its own":   {dump: dumpWithPeerBitmap("9F00AA11BB22CC33", uncleanReportedGI), keep: true},
+		"a foreign": {dump: dumpWithPeerBitmap("1111111111111111", "2222222222222222")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+			dr.Volumes[0].ObservedGI = uncleanReportedGI
+			dr.Volumes[0].MetaPool = "meta"
 
-	fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+			fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+			fx.ExpectSequence(uncleanDumpMD,
+				storage.FakeResponse{Err: errDumpMdUnclean},
+				storage.FakeResponse{Stdout: tc.dump})
 
-	if err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, false); err != nil {
-		t.Fatalf("ensureMetadata: %v", err)
+			if err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, false); err != nil {
+				t.Fatalf("ensureMetadata: %v", err)
+			}
+
+			if ranCommand(fx, "create-md") == tc.keep {
+				t.Errorf("create-md ran = %v over %s superblock under external metadata", !tc.keep, name)
+			}
+		})
+	}
+}
+
+// Deleting a resource takes its GI record with it, file and cache, so a
+// replica created again under the name starts with no record and records
+// its first GI even when it is the one the old replica last had.
+func TestDeleteResourceForgetsTheGIRecord(t *testing.T) {
+	rec := uncleanReconciler(t)
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+	resp, err := rec.DeleteResource(context.Background(), &intent.DeleteResourceRequest{Name: "pvc-unclean"})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteResource: %v, %+v", err, resp)
 	}
 
-	if ranCommand(fx, "create-md") {
-		t.Error("create-md ran over repaired external metadata")
+	if got := rec.recordedGIs("pvc-unclean", 0); len(got) != 0 {
+		t.Fatalf("the deleted resource kept its GI record: %v", got)
+	}
+
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+	if got := rec.recordedGIs("pvc-unclean", 0); len(got) != 1 {
+		t.Fatalf("the re-created replica's first GI was not recorded: %v", got)
+	}
+}
+
+// The record keeps the newest generations of a volume: a crash leaves the
+// last few in the metadata, and those are the ones a check needs.
+func TestRecordedGIsKeepTheNewest(t *testing.T) {
+	rec := uncleanReconciler(t)
+
+	for i := range giHistoryPerVolume + 8 {
+		rec.RecordObservedGI("pvc-unclean", 0, fmt.Sprintf("%016X", i+1))
+	}
+
+	got := rec.recordedGIs("pvc-unclean", 0)
+	if len(got) != giHistoryPerVolume {
+		t.Fatalf("kept %d GIs, want %d", len(got), giHistoryPerVolume)
+	}
+
+	if want := fmt.Sprintf("%016X", 9); got[0] != want {
+		t.Errorf("oldest kept = %s, want %s", got[0], want)
+	}
+
+	if want := fmt.Sprintf("%016X", giHistoryPerVolume+8); got[len(got)-1] != want {
+		t.Errorf("newest kept = %s, want %s", got[len(got)-1], want)
+	}
+}
+
+// The observer reports the same GI on every event; a repeat of the last one
+// is answered from memory and does not rewrite the file.
+func TestRecordObservedGISkipsARepeat(t *testing.T) {
+	rec := uncleanReconciler(t)
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+	if err := os.Remove(rec.giHistoryPath("pvc-unclean")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+	if _, err := os.Stat(rec.giHistoryPath("pvc-unclean")); !os.IsNotExist(err) {
+		t.Errorf("a repeated GI rewrote the record: %v", err)
 	}
 }
 

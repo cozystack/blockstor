@@ -657,6 +657,24 @@ const (
 	drbdQuorumYes = "yes"
 )
 
+// newObserverRunnableFromConfig builds the observer the manager runs, so the
+// wiring from cfg (the GI record above all, which nothing else would notice
+// missing) lives where a unit test can drive it. Production caller:
+// manager.go addBackgroundRunnables.
+func newObserverRunnableFromConfig(cli client.Client, cfg *Config) *ObserverRunnable {
+	return &ObserverRunnable{
+		Client:   cli,
+		Exec:     cfg.Exec,
+		NodeName: cfg.NodeName,
+		RecordGI: cfg.Apply.RecordObservedGI,
+		// Phase 11.7: producer end of the observer-trigger channel.
+		// Fires on kernel-state changes (resource lifecycle, role,
+		// disk, conn, repl) so the ResourceReconciler wakes even
+		// when no apiserver write bumps Generation.
+		ReconcileTrigger: cfg.ReconcileTrigger,
+	}
+}
+
 // ObserverRunnable tails `drbdsetup events2` and writes the parsed
 // observations onto matching Resource CRDs' Status subresource
 // via SSA. Phase 10.6: replaces the retired gRPC

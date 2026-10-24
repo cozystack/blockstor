@@ -2,9 +2,12 @@ package controllers
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -36,5 +39,27 @@ func TestObserverRecordsTheGIOfDataBearingVolumes(t *testing.T) {
 
 	if _, ok := recorded[2]; ok {
 		t.Error("a volume without data had its GI recorded")
+	}
+}
+
+// The observer the manager runs feeds the reconciler's GI record. Without
+// that wiring the record stays empty and every crashed replica is
+// initialised again, with no test or log line to say so.
+func TestManagerObserverRecordsIntoTheReconciler(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := &Config{Apply: satellite.NewReconciler(satellite.ReconcilerConfig{StateDir: dir})}
+
+	o := newObserverRunnableFromConfig(nil, cfg)
+	if o.RecordGI == nil {
+		t.Fatal("the observer records no GIs")
+	}
+
+	o.RecordGI("pvc-w", 0, "6e3a5d0b2c1f4a96")
+
+	data, err := os.ReadFile(filepath.Join(dir, "pvc-w.gi-history"))
+	if err != nil || string(data) != "0 6E3A5D0B2C1F4A96\n" {
+		t.Fatalf("record = %q, %v; want the GI in the reconciler's history", data, err)
 	}
 }

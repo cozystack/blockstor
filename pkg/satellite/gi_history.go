@@ -136,13 +136,64 @@ func (r *Reconciler) writeGIHistory(rdName string, history map[int32][]string) e
 		}
 	}
 
-	path := r.giHistoryPath(rdName)
+	return writeFileDurably(r.giHistoryPath(rdName), buf.Bytes())
+}
+
+// forgetGIHistory drops the record of rdName and its cached last GIs, so a
+// replica created again under the name starts with no record and its first
+// GI is written rather than taken for one already on file. It holds the
+// lock RecordObservedGI writes under, so an observation in flight cannot
+// put the file back behind it.
+func (r *Reconciler) forgetGIHistory(rdName string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	prefix := rdName + "/"
+	for key := range r.lastRecordedGI {
+		if strings.HasPrefix(key, prefix) {
+			delete(r.lastRecordedGI, key)
+		}
+	}
+
+	err := os.Remove(r.giHistoryPath(rdName))
+	if err != nil && !os.IsNotExist(err) {
+		return err //nolint:wrapcheck // the path is in the error
+	}
+
+	return nil
+}
+
+// writeFileDurably replaces path with data so that a power loss leaves
+// either the old content or the new: the record exists for a node that went
+// down hard, and the GI it most needs is the one written just before.
+func writeFileDurably(path string, data []byte) error {
 	tmp := path + ".tmp"
 
-	err := os.WriteFile(tmp, buf.Bytes(), resFilePerm)
+	err := writeAndSync(tmp, data)
 	if err != nil {
 		return errors.Join(err, os.Remove(tmp))
 	}
 
-	return os.Rename(tmp, path) //nolint:wrapcheck // best-effort record; the caller drops the error
+	err = os.Rename(tmp, path)
+	if err != nil {
+		return err //nolint:wrapcheck // best-effort record; the caller drops the error
+	}
+
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err //nolint:wrapcheck // best-effort record; the caller drops the error
+	}
+
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
+func writeAndSync(path string, data []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, resFilePerm)
+	if err != nil {
+		return err //nolint:wrapcheck // best-effort record; the caller drops the error
+	}
+
+	_, err = file.Write(data)
+
+	return errors.Join(err, file.Sync(), file.Close())
 }
