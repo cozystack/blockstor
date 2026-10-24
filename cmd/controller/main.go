@@ -71,7 +71,7 @@ func main() {
 	var controllerNamespace string
 	var tlsOpts []func(*tls.Config)
 	flag.BoolVar(&enableRestAPI, "enable-rest-api", false,
-		"Mount the LINSTOR-compatible REST API alongside the reconcilers. Default is OFF — the apiserver runs as a separate Deployment (cmd/apiserver) since Phase 11.x. Set to true only for the legacy single-binary deployment.")
+		"Mount the LINSTOR-compatible REST API alongside the reconcilers. Default is off: the REST API runs as the separate apiserver Deployment (cmd/apiserver). Set it only for a single-binary deployment.")
 	flag.StringVar(&restAddr, "rest-bind-address", ":3370",
 		"The address the LINSTOR-compatible REST API binds to (upstream LINSTOR plain-text port is 3370). Ignored when --enable-rest-api=false.")
 	flag.StringVar(&controllerNamespace, "controller-namespace", "",
