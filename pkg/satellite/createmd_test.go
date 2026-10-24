@@ -600,23 +600,17 @@ func uncleanFixture(
 	return rec, dr, devices, filepath.Join(dir, "pvc-unclean.md-created"), fx
 }
 
-// A lower disk carrying an unclean superblock is initialised, on both
-// activation arms.
+// A lower disk carrying an unclean superblock and no reported GI is
+// initialised, on both activation arms.
 //
-// It is worth being explicit about what these two pin, because the
-// obvious reading of the second one is wrong. An unapplied activity log
-// does NOT mean "this volume is established": a volume added to a live
-// resource arrives with firstActivation=false on a lower disk that is
-// brand new, and one carved from a recycled pool extent carries
-// whatever superblock the previous tenant left. Gating re-initialisation
-// on firstActivation stalled exactly that shape — the e2e suite caught
-// vol-1 never leaving Diskless while the kernel had it UpToDate.
-//
-// The cost is that a replica which crashed while Primary and writing
-// looks the same to drbdmeta and gets re-initialised too. Separating
-// them needs a per-volume record of "we have initialised this before",
-// which does not exist yet; these tests pin the behaviour as it stands
-// rather than the behaviour we want.
+// An unapplied activity log does NOT mean "this volume is established": a
+// volume added to a live resource arrives with firstActivation=false on a
+// lower disk that is brand new, and one carved from a recycled pool extent
+// carries whatever superblock the previous tenant left. Gating
+// re-initialisation on firstActivation stalled exactly that shape — the e2e
+// suite caught vol-1 never leaving Diskless while the kernel had it UpToDate.
+// What tells an established replica apart is a GI it reported, see
+// TestEnsureMetadataRepairsTheCrashOfAReplicaWithAReportedGI.
 func TestEnsureMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
 	for _, firstActivation := range []bool{true, false} {
 		rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
@@ -652,8 +646,7 @@ func TestEnsureMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
 // reaches established resources.
 //
 // The behaviour is the same as its ensureMetadata twin and pinned for the
-// same reason — see TestEnsureMetadataInitialisesAnUncleanLowerDisk for why
-// re-initialising here is what the platform does today, and what it costs.
+// same reason — see TestEnsureMetadataInitialisesAnUncleanLowerDisk.
 func TestEnsurePerVolumeMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
 	rec, dr, devices, _, fx := uncleanFixture(t)
 
@@ -669,4 +662,97 @@ func TestEnsurePerVolumeMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
 	}
 
 	t.Error("the volume was left without metadata")
+}
+
+const (
+	uncleanReportedGI = "6E3A5D0B2C1F4A97"
+	uncleanGetGI      = "drbdmeta --force pvc-unclean/0 v09 /dev/vg/pvc-unclean_00000 internal get-gi --node-id 0"
+	uncleanApplyAL    = "drbdadm apply-al pvc-unclean/0"
+)
+
+var errApplyALFailed = errors.New("drbdadm apply-al: exit status 10")
+
+func ranCommand(fx *storage.FakeExec, fragment string) bool {
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, fragment) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// A replica that went down while Primary and writing leaves its activity log
+// open. With create-md --force over it, its GI and dirty bitmap were gone,
+// and with them the only up-to-date copy when it was the last one. A volume
+// that reported a GI is repaired with apply-al instead, on both paths that
+// stamp metadata.
+func TestEnsureMetadataRepairsTheCrashOfAReplicaWithAReportedGI(t *testing.T) {
+	for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
+		t.Run(path, func(t *testing.T) {
+			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+			dr.Volumes[0].ObservedGI = uncleanReportedGI
+
+			fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+			// The replica ran on after its last report: the reported GI
+			// is in the bitmap slot now.
+			fx.Expect(uncleanGetGI, storage.FakeResponse{Stdout: []byte("9F00AA11BB22CC33:" + uncleanReportedGI + ":0:0\n")})
+
+			var err error
+			if path == "ensureMetadata" {
+				err = rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, false)
+			} else {
+				err = rec.ensurePerVolumeMetadata(context.Background(), dr, devices, false)
+			}
+
+			if err != nil {
+				t.Fatalf("%s: %v", path, err)
+			}
+
+			if !ranCommand(fx, "apply-al") {
+				t.Error("the activity log was not applied")
+			}
+
+			if ranCommand(fx, "create-md") {
+				t.Error("create-md ran over a replica that reported a GI; its GI and bitmap are gone")
+			}
+		})
+	}
+}
+
+// A reported GI is not enough on its own: the superblock under the dirty log
+// has to name it, or it is not this replica's and gets metadata of its own.
+func TestEnsureMetadataInitialisesAForeignSuperblockDespiteAReportedGI(t *testing.T) {
+	rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+	dr.Volumes[0].ObservedGI = uncleanReportedGI
+
+	fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+	fx.Expect(uncleanGetGI, storage.FakeResponse{Stdout: []byte("1111111111111111:2222222222222222:0:0\n")})
+
+	err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, false)
+	if err != nil {
+		t.Fatalf("ensureMetadata: %v", err)
+	}
+
+	if !ranCommand(fx, "create-md") {
+		t.Error("a superblock that does not name the reported GI was kept")
+	}
+}
+
+// A repair that fails is not a licence to re-initialise: the reported GI
+// proves the volume carried data-bearing metadata.
+func TestEnsureMetadataFailsClosedWhenApplyALFails(t *testing.T) {
+	rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+	dr.Volumes[0].ObservedGI = uncleanReportedGI
+
+	fx.Expect(uncleanApplyAL, storage.FakeResponse{Err: errApplyALFailed})
+
+	err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, false)
+	if err == nil {
+		t.Fatal("a failed apply-al was answered with success")
+	}
+
+	if ranCommand(fx, "create-md") {
+		t.Error("create-md ran after apply-al failed on a replica that reported a GI")
+	}
 }
