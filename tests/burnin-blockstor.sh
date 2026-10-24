@@ -86,9 +86,9 @@ on_node() {
 
 cleanup_iter() {
     local rd=$1
-    kubectl delete --wait=true --timeout=30s "resource.blockstor.cozystack.io/${rd}.${PRIMARY}" 2>/dev/null || true
-    kubectl delete --wait=true --timeout=30s "resource.blockstor.cozystack.io/${rd}.${PEER}"    2>/dev/null || true
-    kubectl delete --wait=true --timeout=30s "resourcedefinition.blockstor.cozystack.io/${rd}"  2>/dev/null || true
+    kubectl delete --wait=true --timeout=30s "resource.blockstor.org/${rd}.${PRIMARY}" 2>/dev/null || true
+    kubectl delete --wait=true --timeout=30s "resource.blockstor.org/${rd}.${PEER}"    2>/dev/null || true
+    kubectl delete --wait=true --timeout=30s "resourcedefinition.blockstor.org/${rd}"  2>/dev/null || true
 }
 
 while [[ $(date +%s) -lt $DEADLINE ]]; do
@@ -96,19 +96,19 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
     RD="burnin-${ITER}"
 
     cat <<EOF | kubectl apply -f - >/dev/null
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_KIB}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${PRIMARY}}
 spec: {resourceDefinitionName: ${RD}, nodeName: ${PRIMARY}, props: {StorPoolName: ${POOL}}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${PEER}}
 spec: {resourceDefinitionName: ${RD}, nodeName: ${PEER}, props: {StorPoolName: ${POOL}}}

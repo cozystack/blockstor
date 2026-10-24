@@ -107,17 +107,17 @@ converged_rd() {
     local name flags ds diskful=0 up=0
     while read -r name; do
         [[ -z "$name" ]] && continue
-        flags=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+        flags=$(kubectl get "resources.blockstor.org/${name}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         # Skip diskless witnesses / tiebreakers.
         if [[ "$flags" == *"DISKLESS"* || "$flags" == *"TIE_BREAKER"* ]]; then
             continue
         fi
         diskful=$((diskful+1))
-        ds=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+        ds=$(kubectl get "resources.blockstor.org/${name}" \
             -o jsonpath='{.status.volumes[0].diskState}' 2>/dev/null || echo "")
         [[ "$ds" == "UpToDate" ]] && up=$((up+1))
-    done < <(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    done < <(kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}')
     if (( diskful >= 2 && up == diskful )); then
         echo "yes"
@@ -174,7 +174,7 @@ while (( $(date +%s) < deadline )); do
                 elapsed=$(( now - ${last_min_ts[$rd]:-now} ))
                 if (( elapsed > STUCK_S )); then
                     echo "FAIL (U268): $rd has an Inconsistent diskful replica stuck at done=${minpct}% for ${elapsed}s (>${STUCK_S}s) — wedged initial sync under bulk burst" >&2
-                    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+                    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
                         | awk -v rd="${rd}." '$1 ~ "^"rd' | sed 's/^/    /' >&2 || true
                     for node in $(linstor_diskful_nodes "$rd"); do
                         on_node "$node" drbdsetup status "$rd" 2>/dev/null | sed "s/^/    ${node}: /" >&2 || true
@@ -206,7 +206,7 @@ if [[ "$all_done" != "true" ]]; then
     for rd in "${RDS[@]}"; do
         if [[ "$(converged_rd "$rd")" != "yes" ]]; then
             echo "    $rd:" >&2
-            kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+            kubectl get resources.blockstor.org --no-headers 2>/dev/null \
                 | awk -v rd="${rd}." '$1 ~ "^"rd' | sed 's/^/      /' >&2 || true
         fi
     done

@@ -112,7 +112,7 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Bug-hunt v0.1.3 Finding 2: scrub controller-internal
-	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` annotations
+	// `blockstor.io/*` + `bug<N>.blockstor.org/*` annotations
 	// from every entry before the JSON encode. The reconcilers stamp
 	// these onto the in-process Resource for their own bookkeeping
 	// (peer-changed timestamps, resize-pending size deltas, ...); the

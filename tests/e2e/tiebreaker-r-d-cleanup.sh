@@ -76,12 +76,12 @@ PF_PID=$!
 dump_diag() {
     echo "---- dump: linstor r l -r $RD ----"
     "${LCTL[@]}" r l -r "$RD" 2>&1 || true
-    echo "---- dump: kubectl get resources.blockstor.cozystack.io -A ----"
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    echo "---- dump: kubectl get resources.blockstor.org -A ----"
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd' || true
     echo "---- dump: Resource flags ----"
     for n in "$N1" "$N2" "$N3"; do
-        kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
+        kubectl get "resources.blockstor.org/${RD}.${n}" \
             -o jsonpath='{.metadata.name}{" flags="}{.spec.flags}{"\n"}' \
             2>/dev/null || true
     done
@@ -125,10 +125,10 @@ delete_rd "$RD" 2>/dev/null || true
 # joins on Spec.Flags too).
 tb_witness_count() {
     local rd=$1
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}' \
         | while read -r name; do
-            kubectl get "resources.blockstor.cozystack.io/${name}" \
+            kubectl get "resources.blockstor.org/${name}" \
                 -o jsonpath='{.spec.flags}' 2>/dev/null
             echo
         done \
@@ -143,12 +143,12 @@ tb_witness_nodes() {
     local out=()
     while read -r name; do
         local flags
-        flags=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+        flags=$(kubectl get "resources.blockstor.org/${name}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null)
         if [[ "$flags" == *"TIE_BREAKER"* ]]; then
             out+=("${name#${rd}.}")
         fi
-    done < <(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    done < <(kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}')
     (IFS=,; echo "${out[*]}")
 }
@@ -160,12 +160,12 @@ diskful_count() {
     local n=0
     while read -r name; do
         local flags
-        flags=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+        flags=$(kubectl get "resources.blockstor.org/${name}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null)
         if [[ "$flags" != *"DISKLESS"* ]]; then
             n=$((n + 1))
         fi
-    done < <(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    done < <(kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}')
     echo "$n"
 }
@@ -238,7 +238,7 @@ fi
 # replica that the satellite hasn't yet observed (post-create races)
 # could otherwise sneak past tb_witness_count above; pin the shape.
 witness_node=$(tb_witness_nodes "$RD")
-witness_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${witness_node}" \
+witness_flags=$(kubectl get "resources.blockstor.org/${RD}.${witness_node}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null)
 if [[ "$witness_flags" != *"DISKLESS"* ]]; then
     echo "ASSERT 1 FAILED: TIE_BREAKER on ${witness_node} missing DISKLESS flag (got: ${witness_flags})"

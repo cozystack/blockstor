@@ -1415,7 +1415,7 @@ func parseVolNum(raw string) (int32, error) {
 // in `enqueueResourcesForRD` already re-applies on any RD-spec
 // change), but it gives a steady-state breadcrumb that explains
 // why the satellite re-rendered and what the target size is.
-const resizePendingAnnotationPrefix = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-"
+const resizePendingAnnotationPrefix = "bug136.blockstor.org/resize-pending-size-kib-vol-"
 
 // stampResizePendingOnResources walks every Resource of the named
 // RD and stamps the per-volume "resize pending" annotation with the

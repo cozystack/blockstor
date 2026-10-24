@@ -90,7 +90,7 @@ snap_ready() {
     local rd=$1 snap=$2
     local deadline; deadline=$(( $(date +%s) + 60 ))
     while (( $(date +%s) < deadline )); do
-        local j; j=$(kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
+        local j; j=$(kubectl get snapshots.blockstor.org -o json 2>/dev/null \
             | jq -c --arg rd "$rd" --arg s "$snap" '
                 [.items[]?
                  | select(.spec.resourceDefinitionName==$rd)

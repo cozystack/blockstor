@@ -84,8 +84,8 @@ fi
 echo ">> sanity: Node CRDs present for every worker"
 for w in "$WORKER_1" "$WORKER_2" "$WORKER_3"; do
     [[ -z "$w" ]] && continue
-    if ! kubectl get node.blockstor.cozystack.io "$w" >/dev/null 2>&1; then
-        echo "FAIL: Node CRD blockstor.cozystack.io/$w missing"
+    if ! kubectl get node.blockstor.org "$w" >/dev/null 2>&1; then
+        echo "FAIL: Node CRD blockstor.org/$w missing"
         exit 1
     fi
 done
@@ -114,7 +114,7 @@ echo ">> apply 2-replica RD $RD (autoplace=2, AutoAddQuorumTiebreaker=false)"
 # does NOT stamp a 3rd diskless witness Resource — we want a clean
 # 2-node mesh so the connection-state view is unambiguous.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -123,7 +123,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_KIB}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${WORKER_1}}
 spec:
@@ -131,7 +131,7 @@ spec:
   nodeName: ${WORKER_1}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${WORKER_2}}
 spec:

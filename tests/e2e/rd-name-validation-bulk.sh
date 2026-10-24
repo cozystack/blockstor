@@ -64,7 +64,7 @@ trap cleanup EXIT
 
 echo ">> seed RG $RG"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceGroup
 metadata: {name: ${RG}}
 spec:
@@ -74,7 +74,7 @@ EOF
 
 echo ">> seed source RD $SRC + 1 VD"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${SRC}}
 spec:

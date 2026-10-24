@@ -43,7 +43,7 @@ As a last guard, the LUKS layer refuses to `luksFormat` a device that already ca
 Find the RDs short of a layer their group asks for:
 
 ```bash
-kubectl get resourcedefinitions.blockstor.cozystack.io \
+kubectl get resourcedefinitions.blockstor.org \
   -o custom-columns='NAME:.metadata.name,GROUP_STACK:.metadata.annotations.blockstor\.io/unapplied-group-layer-stack' \
   | awk '$2 != "<none>"'
 ```
@@ -73,7 +73,7 @@ the REST shape mirrors upstream LINSTOR.)
 ### Per-RD via kubectl
 
 ```yaml
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: pvc-encrypted}
 spec:

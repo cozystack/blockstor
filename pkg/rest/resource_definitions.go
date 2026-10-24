@@ -120,7 +120,7 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal
-	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` annotations
+	// `blockstor.io/*` + `bug<N>.blockstor.org/*` annotations
 	// from every RD before the JSON encode. See
 	// pkg/rest/internal_annotations.go.
 	stripInternalAnnotationsFromRDs(rds)
@@ -1267,7 +1267,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// DELETE on each. The satellite drives the teardown from
 	// there. Our equivalent is: per-child Resources().Delete()
 	// stamps DeletionTimestamp on the CRD; the satellite's
-	// existing `blockstor.cozystack.io/satellite-resource`
+	// existing `blockstor.org/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
 	err := s.cascadeDeleteResources(r.Context(), name)

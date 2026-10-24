@@ -119,11 +119,11 @@ fi
 
 # The upgrade must have happened on the SAME node that held the witness
 # (the cluster has only 3 workers, so slot 3 can only be the TB node).
-if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${TB_NODE}" >/dev/null 2>&1; then
+if ! kubectl get "resources.blockstor.org/${RD}.${TB_NODE}" >/dev/null 2>&1; then
     echo "FAIL (D2b): witness node '$TB_NODE' has no Resource CRD after upgrade" >&2
     exit 1
 fi
-upgraded_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${TB_NODE}" \
+upgraded_flags=$(kubectl get "resources.blockstor.org/${RD}.${TB_NODE}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
 if [[ "$upgraded_flags" == *"DISKLESS"* ]] || [[ "$upgraded_flags" == *"TIE_BREAKER"* ]]; then
     echo "FAIL (D2b): replica on ex-witness node '$TB_NODE' still carries diskless/TB flags: $upgraded_flags" >&2

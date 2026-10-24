@@ -114,7 +114,7 @@ const passphraseSecretKey = passphrase.SecretKey
 // in-memory-store tests and pre-migration clusters keep working.
 //
 // +kubebuilder:rbac:groups="",namespace=blockstor-system,resources=secrets,verbs=get;create;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=controllerconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=controllerconfigs,verbs=get;list;watch
 func (s *Server) registerEncryption(mux *http.ServeMux) {
 	// Bug 196: GET reports whether the cluster has a passphrase
 	// set + whether this controller process has unlocked it.

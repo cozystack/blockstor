@@ -188,7 +188,7 @@ fi
 # Helper: grab one batch entry's Snapshot CRD as compact JSON.
 snap_json() {
     local rd=$1
-    kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
+    kubectl get snapshots.blockstor.org -o json 2>/dev/null \
         | jq -c --arg rd "$rd" --arg s "$SNAP" '
             [.items[]?
              | select(.spec.resourceDefinitionName==$rd)
@@ -212,7 +212,7 @@ while (( $(date +%s) < deadline )); do
 done
 if ! $all_exist; then
     echo "FAIL (Bug 353): not every entry of create-multiple produced a Snapshot CRD within 30s" >&2
-    kubectl get snapshots.blockstor.cozystack.io -o yaml 2>&1 | head -120 >&2
+    kubectl get snapshots.blockstor.org -o yaml 2>&1 | head -120 >&2
     exit 1
 fi
 
@@ -335,7 +335,7 @@ while (( $(date +%s) < deadline )); do
 done
 if ! $all_ready; then
     echo "FAIL (Bug 353): not every batched snapshot reached Ready=true within 90s" >&2
-    kubectl get snapshots.blockstor.cozystack.io -o yaml 2>&1 | head -160 >&2
+    kubectl get snapshots.blockstor.org -o yaml 2>&1 | head -160 >&2
     exit 1
 fi
 
@@ -457,7 +457,7 @@ echo ">> Phase 5: partial-failure path — entry with non-existent RD"
 # Silent partial success (one snap created, no error reported) is a
 # FAIL — that's the regression we're catching.
 BAD_SNAP=snap-partial-fail
-pre_count=$(kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null \
+pre_count=$(kubectl get snapshots.blockstor.org --no-headers 2>/dev/null \
     | awk -v s="$BAD_SNAP" '$1 ~ s {n++} END {print n+0}')
 
 partial_out=""
@@ -498,7 +498,7 @@ if (( partial_rc == 0 )); then
     # bad entry) — even though the good-side snap was created. The
     # FAIL we guard against is SILENT partial success: one snap created
     # with NO error reported anywhere. So inspect the body first.
-    post_count=$(kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null \
+    post_count=$(kubectl get snapshots.blockstor.org --no-headers 2>/dev/null \
         | awk -v s="$BAD_SNAP" '$1 ~ s {n++} END {print n+0}')
     named_bad=false
     if grep -qE "(${RD_MISSING}|not.found|object not found|no.such|missing|does.not.exist)" <<<"$partial_out"; then
@@ -531,7 +531,7 @@ else
     # Check no orphan good-side snap was left behind. Fail-fast is
     # the preferred shape; partial-then-rollback also acceptable as
     # long as the orphan is cleaned up by the time the call returns.
-    post_count=$(kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null \
+    post_count=$(kubectl get snapshots.blockstor.org --no-headers 2>/dev/null \
         | awk -v s="$BAD_SNAP" '$1 ~ s {n++} END {print n+0}')
     if (( post_count > 0 )); then
         echo "   note: partial-fail rejected with $post_count orphan CRD(s); cleanup will reap them"

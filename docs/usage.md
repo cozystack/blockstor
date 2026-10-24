@@ -37,7 +37,7 @@ The reference manifests live under `config/crd/bases/` (CRDs) and `stand/` (the 
 2. **Node CRs** — one cluster-scoped `Node` per storage node, with `metadata.name` equal to the Kubernetes node name. These can be created up front (the satellites also reconcile against them) or registered later through the `linstor` client (see below). A minimal Node CR:
 
    ```yaml
-   apiVersion: blockstor.cozystack.io/v1alpha1
+   apiVersion: blockstor.org/v1alpha1
    kind: Node
    metadata:
      name: worker-1

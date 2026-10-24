@@ -100,7 +100,7 @@ _out=$("${LCTL[@]}" snapshot create "$SRC" "$SNAP" 2>&1) \
 # Wait snapshot Successful on its two nodes.
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
-    ok=$(kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
+    ok=$(kubectl get snapshots.blockstor.org -o json 2>/dev/null \
         | jq -r --arg rd "$SRC" --arg s "$SNAP" '
             [.items[]?
              | select(.spec.resourceDefinitionName==$rd)
@@ -163,7 +163,7 @@ deadline=$(( $(date +%s) + 90 ))
 placed_nodes=()
 while (( $(date +%s) < deadline )); do
     mapfile -t placed_nodes < <(
-        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+        kubectl get resources.blockstor.org --no-headers 2>/dev/null \
             | awk -v rd="${TGT_OK}." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
     )
     if (( ${#placed_nodes[@]} >= 2 )); then break; fi

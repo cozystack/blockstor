@@ -34,15 +34,15 @@ import (
 const internalAnnotationPrefix = "blockstor.io/"
 
 // internalAnnotationSuffix matches the per-bug controller scratch
-// namespace pattern `bug<NNN>.blockstor.cozystack.io/<key>`. The
+// namespace pattern `bug<NNN>.blockstor.org/<key>`. The
 // reconciler uses this scheme to scope bug-specific state to a single
 // Reconcile loop without polluting the top-level
 // `blockstor.io/` namespace. Bug-hunt v0.1.3 Finding 2: this pattern
-// (e.g. `bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-0`)
+// (e.g. `bug136.blockstor.org/resize-pending-size-kib-vol-0`)
 // was leaking onto the wire alongside the canonical prefix; the
 // suffix check covers every existing and future `bug<N>` namespace
 // without enumerating each prefix individually.
-const internalAnnotationSuffix = ".blockstor.cozystack.io/"
+const internalAnnotationSuffix = ".blockstor.org/"
 
 // isInternalAnnotationKey returns true when `key` belongs to a
 // blockstor-controller-private annotation namespace and must NOT
@@ -50,7 +50,7 @@ const internalAnnotationSuffix = ".blockstor.cozystack.io/"
 // per-const docs above) are:
 //
 //   - prefix `blockstor.io/`                — canonical controller namespace
-//   - any prefix ending in `.blockstor.cozystack.io/` — per-bug scratch
+//   - any prefix ending in `.blockstor.org/` — per-bug scratch
 //
 // Anything else (e.g. operator-set `kubectl.kubernetes.io/last-applied-
 // configuration`, third-party tooling annotations) is passed through

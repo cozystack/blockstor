@@ -299,7 +299,7 @@ func TestPhysicalDeviceReconcileStripsFinalizerOnDelete(t *testing.T) {
 //     forever. PhysicalDevice is stuck in Attaching, invisible to
 //     `linstor ps l` (which filters Available only).
 //  5. Operator cannot re-use the device until manually
-//     `kubectl edit physicaldevices.blockstor.cozystack.io <name>` clears
+//     `kubectl edit physicaldevices.blockstor.org <name>` clears
 //     AttachTo.
 //
 // Fix: when satellite reconciler sees AttachTo set AND

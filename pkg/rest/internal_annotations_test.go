@@ -32,14 +32,14 @@ import (
 // Finding 2: the REST list / get handlers for Resource,
 // ResourceDefinition, ResourceGroup, and Snapshot must NOT leak
 // controller-internal `blockstor.io/*` and
-// `bug<N>.blockstor.cozystack.io/*` annotations. The reconcilers stamp
+// `bug<N>.blockstor.org/*` annotations. The reconcilers stamp
 // these onto the in-process structs for their own bookkeeping (the
 // struct field must stay so reconcilers can keep reading), but the
 // wire boundary scrubs them.
 //
 // The test seeds one CRD of each type, each carrying:
 //   - one internal `blockstor.io/...` annotation,
-//   - one per-bug `bugNNN.blockstor.cozystack.io/...` annotation,
+//   - one per-bug `bugNNN.blockstor.org/...` annotation,
 //   - one third-party / operator-set annotation that MUST pass through.
 //
 // then exercises every list / get path mentioned in the bug-hunt
@@ -50,7 +50,7 @@ import (
 func TestInternalAnnotationsStrippedOnWireBoundary(t *testing.T) {
 	const (
 		canonicalInternalKey = "blockstor.io/peer-changed"
-		bugScopedInternalKey = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-0"
+		bugScopedInternalKey = "bug136.blockstor.org/resize-pending-size-kib-vol-0"
 		thirdPartyKey        = "operator.example.com/owner"
 		thirdPartyValue      = "cozystack-team"
 	)
@@ -317,8 +317,8 @@ func TestStripInternalAnnotationsHelper(t *testing.T) {
 	}{
 		{name: "canonical internal", key: "blockstor.io/volume-numbers", dropped: true},
 		{name: "canonical internal nested", key: "blockstor.io/auto-tiebreaker-suppressed-until", dropped: true},
-		{name: "bug-scoped internal", key: "bug136.blockstor.cozystack.io/resize-pending", dropped: true},
-		{name: "bug-scoped variant", key: "bug342.blockstor.cozystack.io/uid", dropped: true},
+		{name: "bug-scoped internal", key: "bug136.blockstor.org/resize-pending", dropped: true},
+		{name: "bug-scoped variant", key: "bug342.blockstor.org/uid", dropped: true},
 		{name: "k8s last-applied passthrough", key: "kubectl.kubernetes.io/last-applied-configuration", dropped: false},
 		{name: "operator passthrough", key: "operator.example.com/owner", dropped: false},
 		// Empty key is non-sensitive — defensive guard, never appears

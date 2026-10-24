@@ -93,11 +93,11 @@ type RGRebalanceReconciler struct {
 	nodeOfflineSince   map[string]time.Time
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=controllerconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=controllerconfigs,verbs=get;list;watch
 
 // Reconcile is the explicit + periodic rebalance pass. See the type
 // comment for the five-step lifecycle. Returns `RequeueAfter =

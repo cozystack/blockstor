@@ -46,7 +46,7 @@ import (
 //
 // Mirrors the per-satellite finalizer scheme used by
 // `SatelliteResourceFinalizer` and `StoragePoolFinalizer`.
-const SatelliteSnapshotFinalizer = "blockstor.cozystack.io/satellite-snapshot"
+const SatelliteSnapshotFinalizer = "blockstor.org/satellite-snapshot"
 
 // snapshotFinalizerRequeue is the short back-off between
 // stamping the finalizer and the next Reconcile pass that

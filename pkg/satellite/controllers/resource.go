@@ -117,10 +117,10 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 // SatelliteResourceFinalizer is the per-satellite-instance
 // finalizer key the satellite reconciler stamps on every
 // Resource it owns. The controller-side reconciler uses a
-// distinct key (`blockstor.cozystack.io/resource`) so the
+// distinct key (`blockstor.org/resource`) so the
 // two paths coexist during the Phase 10.6 cutover without
 // stepping on each other.
-const SatelliteResourceFinalizer = "blockstor.cozystack.io/satellite-resource"
+const SatelliteResourceFinalizer = "blockstor.org/satellite-resource"
 
 // resourceKind is the apiserver Kind for the blockstor Resource
 // CRD. Defined once so SSA Patch payloads in this package share
@@ -1436,7 +1436,7 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //  1. The Resource passed in came from the cached client at the
 //     top of Reconcile, so its `Finalizers` slice may already be
 //     stale by the time we get here (the controller-side path
-//     force-strips its own `blockstor.cozystack.io/resource`
+//     force-strips its own `blockstor.org/resource`
 //     finalizer concurrently). Operate on the slice as-is for
 //     the gating short-circuit only.
 //  2. Run the provider tear-down (Apply.DeleteResource: drbdadm
@@ -1458,7 +1458,7 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //
 // Phase 10.1. Once Phase 10.6 retires the gRPC contract,
 // `internal/controller.ResourceReconciler.runDelete` and its
-// finalizer (`blockstor.cozystack.io/resource`) go away —
+// finalizer (`blockstor.org/resource`) go away —
 // satellite-side teardown becomes the only finalizer path.
 func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
 	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {

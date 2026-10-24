@@ -111,7 +111,7 @@ while (( $(date +%s) < deadline )); do
     # drop-then-add (Option A) regression — fail fast.
     if (( dc < 2 )); then
         echo "FAIL (H2): diskful count dropped to $dc during migration (sync-then-remove violated)" >&2
-        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+        kubectl get resources.blockstor.org --no-headers 2>/dev/null \
             | awk -v rd="${RD}." '$1 ~ "^"rd' >&2 || true
         exit 1
     fi
@@ -143,7 +143,7 @@ while (( $(date +%s) < deadline )); do
     # legitimately re-land on the just-vacated src node, re-creating the
     # `<rd>.<src>` CRD as a diskless witness. That witness is NOT the
     # migrate source, so gate on diskful-absence, not CRD-absence.
-    if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${SRC}" >/dev/null 2>&1; then
+    if ! kubectl get "resources.blockstor.org/${RD}.${SRC}" >/dev/null 2>&1; then
         src_gone=1
     elif ! linstor_diskful_nodes "$RD" | grep -qx "$SRC"; then
         src_gone=1
@@ -162,7 +162,7 @@ fi
 
 if (( src_gone != 1 )); then
     echo "FAIL (H2): migrate source $SRC still hosts a diskful replica after dst synced (sync-then-remove incomplete)" >&2
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd' >&2 || true
     exit 1
 fi

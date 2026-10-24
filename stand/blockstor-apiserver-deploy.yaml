@@ -26,7 +26,7 @@ kind: ClusterRole
 metadata:
   name: blockstor-apiserver
 rules:
-  - apiGroups: [blockstor.cozystack.io]
+  - apiGroups: [blockstor.org]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
 ---
