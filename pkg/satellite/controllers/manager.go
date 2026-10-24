@@ -215,10 +215,16 @@ func ensureWiredDefaults(cfg *Config) {
 // budget — Scenario 5.34 added the third runnable and the
 // inline chain tipped over the limit.
 func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
+	var recordGI func(string, int32, string)
+	if cfg.Apply != nil {
+		recordGI = cfg.Apply.RecordObservedGI
+	}
+
 	err := mgr.Add(&ObserverRunnable{
 		Client:   mgr.GetClient(),
 		Exec:     cfg.Exec,
 		NodeName: cfg.NodeName,
+		RecordGI: recordGI,
 		// Phase 11.7: producer end of the observer-trigger channel.
 		// Fires on kernel-state changes (resource lifecycle, role,
 		// disk, conn, repl) so the ResourceReconciler wakes even

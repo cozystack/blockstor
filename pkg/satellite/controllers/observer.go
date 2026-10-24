@@ -677,6 +677,11 @@ type ObserverRunnable struct {
 	// uses to route observations to the right CRD.
 	NodeName string
 
+	// RecordGI keeps the GI of every data-bearing volume it is called
+	// with in the satellite's own record, which outlives the status
+	// field (satellite.Reconciler.RecordObservedGI). Nil records nothing.
+	RecordGI func(rdName string, vol int32, gi string)
+
 	// connCache holds the latest observed per-peer connection state
 	// keyed by `<resource>/<peer>`. We apply the full snapshot per
 	// resource on every connection event because SSA with the same
@@ -1146,20 +1151,20 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 	for i := range ev.Volumes {
 		vol := &ev.Volumes[i]
 
-		if vol.CurrentUUID != "" || vol.BackingDev == "" {
-			continue
-		}
-
 		if !isDataBearingDiskState(drbd.DiskState(vol.DiskState)) {
 			continue
 		}
 
-		current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
-		if err != nil || current == "" {
-			continue
+		if vol.CurrentUUID == "" && vol.BackingDev != "" {
+			current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
+			if err == nil {
+				vol.CurrentUUID = current
+			}
 		}
 
-		vol.CurrentUUID = current
+		if vol.CurrentUUID != "" && o.RecordGI != nil {
+			o.RecordGI(ev.ResourceName, vol.VolumeNumber, vol.CurrentUUID)
+		}
 	}
 }
 
