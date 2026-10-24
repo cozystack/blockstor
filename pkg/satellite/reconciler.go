@@ -1266,12 +1266,12 @@ func (r *Reconciler) applyInactive(ctx context.Context, dr *intent.DesiredResour
 	switch r.cfg.Adm.EvaluateDownVeto(ctx, dr.GetName()) {
 	case drbd.DownVetoResync:
 		res.Ok = false
-		res.Message = "deferring drbdadm down: resync in flight (Bug 350 veto)"
+		res.Message = "deferring drbdadm down: resync in flight"
 
 		return
 	case drbd.DownVetoInconclusive:
 		res.Ok = false
-		res.Message = "deferring drbdadm down: kernel probe inconclusive, cannot confirm idle (Bug 350 fail-closed veto)"
+		res.Message = "deferring drbdadm down: kernel probe inconclusive, cannot confirm the resource is idle"
 
 		return
 	case drbd.DownAllowed:
@@ -2427,14 +2427,14 @@ func (r *Reconciler) reconcileKernelMyNodeID(ctx context.Context, dr *intent.Des
 		return nil
 	}
 
-	log.FromContext(ctx).Info("Bug 360 self-heal: kernel my-node-id mismatch, recreating slot",
+	log.FromContext(ctx).Info("kernel node-id differs from the allocated one, recreating the DRBD slot",
 		"resource", dr.GetName(),
 		"kernelMyNodeID", kernelID,
 		"desiredNodeID", desiredID)
 
 	err = r.cfg.Adm.Down(ctx, dr.GetName())
 	if err != nil {
-		return errors.Wrapf(err, "Bug 360 self-heal: drbdadm down %s (kernel my-id %d != desired %d)",
+		return errors.Wrapf(err, "recreate DRBD slot: drbdadm down %s (kernel node-id %d, allocated %d)",
 			dr.GetName(), kernelID, desiredID)
 	}
 
@@ -2834,7 +2834,7 @@ func (r *Reconciler) maybeRecoveryPromote(ctx context.Context, dr *intent.Desire
 		return nil
 	}
 
-	log.FromContext(ctx).Info("Bug 366 recovery-promote: re-arming auto-primary to unstick wedged initial sync",
+	log.FromContext(ctx).Info("re-arming auto-primary to unstick a stalled initial sync",
 		"resource", dr.GetName())
 
 	return r.runAutoPromote(ctx, dr)
@@ -5239,7 +5239,7 @@ func refuseUnresolvedSkipInitialSync(dr *intent.DesiredResource, freshActivation
 func (r *Reconciler) gateBringUpReadiness(ctx context.Context, dr *intent.DesiredResource, diskless bool, mdMarkerPath string) error {
 	err := refuseUnresolvedLocalNodeID(dr)
 	if err != nil {
-		log.FromContext(ctx).Info("Bug 360: deferring DRBD bring-up until controller allocates local node-id",
+		log.FromContext(ctx).Info("deferring DRBD bring-up until the controller allocates this node's node-id",
 			"resource", dr.GetName())
 
 		return err

@@ -53,6 +53,10 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if refusePropsModifyOnCreate(w, "resource group spawn", req.OverrideProps, req.DeleteProps, req.DeleteNamespace) {
+		return
+	}
+
 	// CreateVolume hot path — the just-created RG may not yet be visible
 	// on this apiserver replica's informer cache; retry on NotFound.
 	// See pkg/rest/cache_retry.go.
@@ -64,7 +68,9 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.ResourceDefinitionName == "" {
-		writeError(w, http.StatusBadRequest, "resource_definition_name is required (auto-naming Phase 6)")
+		writeError(w, http.StatusBadRequest,
+			"resource_definition_name is required: blockstor does not generate names, "+
+				"so a spawn by external name alone is refused; pass a resource definition name")
 
 		return
 	}
@@ -170,6 +176,17 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 	// separate `r c --auto-place=N`. The CSI flow follows the same
 	// contract (linstor-csi calls /spawn, then expects to find
 	// resources in /v1/view/resources on the next reconcile).
+	// definitions_only asks for the definition and its volumes without a
+	// placement (`linstor rg spawn --definitions-only`).
+	if req.DefinitionsOnly {
+		writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "resource definition spawned without placement (definitions_only): " + rd.Name,
+		}})
+
+		return
+	}
+
 	placeErr := spawnAutoplace(r.Context(), s, rd.Name, rg, req)
 	if placeErr != nil {
 		log.FromContext(r.Context()).WithName("rest").
