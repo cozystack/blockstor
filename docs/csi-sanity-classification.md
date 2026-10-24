@@ -10,7 +10,7 @@ Fix (this PR): relax the apiserver validator to mirror upstream, AND make the Re
 
 The residual failures are unchanged from the table below (all class (a) Node/satellite-convergence + class (b) apiserver scale-out cache race + Bug 33 satellite-snapshot finalizer drain in AfterEach teardown — the latter affects lowercase snapshots too).
 
-Prior baseline (pre-audit): **56/74 specs pass** (74 ran; 17 skipped; 1 pending) after seven wire-shape gaps and three concurrency races were closed. The same job-config is used here. The audit collected 9 hard failures during the first 16 seconds of the run before the harness wedged on a snapshot-data-plane test (`sanity-controller-source-vol-*`) waiting for a satellite-side reconcile that never converged on the e2e-lc1 stand (Bug 33 territory — see `docs/known-issues.md`). Wire-shape and routing observations cover all 18 expected failures from the prior baseline.
+Prior baseline (pre-audit): **56/74 specs pass** (74 ran; 17 skipped; 1 pending) after seven wire-shape gaps and three concurrency races were closed. The same job-config is used here. The audit collected 9 hard failures during the first 16 seconds of the run before the harness wedged on a snapshot-data-plane test (`sanity-controller-source-vol-*`) waiting for a satellite-side reconcile that never converged on the e2e-lc1 stand (Bug 33 territory, since closed by the orphan DRBD sweeper). Wire-shape and routing observations cover all 18 expected failures from the prior baseline.
 
 ## Failure-class legend
 
@@ -60,6 +60,6 @@ So the **post-fix expected pass rate stays at 56/74**. The new finding from this
 2. **CreateSnapshot empty-name validation** (c, #12-#13) — single check, flips two FAILs to PASS. Surfaces a real bug-class (silent slug-of-empty).
 3. **DeleteSnapshot folds unknown-RD into success** (b, #14) — one-liner, flips one FAIL to PASS, closes a CSI idempotence corner.
 4. **ListSnapshots empty-result envelope + exact-fit pagination** (c, #15-#16) — small handler tweaks, flips two FAILs to PASS.
-5. **Bug 33 satellite-finalizer storm** — not a csi-sanity gap per se, but the audit blocker for re-running the suite cleanly. Already tracked in `docs/known-issues.md` (Bug 33 — closed by 5.34 sweeper; the storm seen on this run was a residual from the controller crashloop before Bug 41 RBAC was applied to the live stand).
+5. **Bug 33 satellite-finalizer storm** — not a csi-sanity gap per se, but the audit blocker for re-running the suite cleanly. Tracked as Bug 33 (closed by 5.34 sweeper; the storm seen on this run was a residual from the controller crashloop before Bug 41 RBAC was applied to the live stand).
 
 After (1)–(4) the expected pass rate is **64/74**. The remaining 10 failures are all (a) (kernel-mount Node Service + satellite-convergence snapshot/clone tests) and are out of scope for the single-pod csi-sanity harness; running them needs a real piraeus-operator deployment with a CSI Node sidecar per worker and a stand with reliable satellite reconcile.

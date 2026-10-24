@@ -26,6 +26,10 @@ name: Pull Request
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # The site under site/ is published on its own and has no tests.
+    paths-ignore:
+      - 'site/**'
+      - 'netlify.toml'
 
 # Cancel in-flight runs for the same PR when a new push arrives — saves
 # runner minutes on rapid force-push iterations.

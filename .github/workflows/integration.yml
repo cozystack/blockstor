@@ -16,6 +16,10 @@ on:
   # merges still exercise the envtest harness.
   push:
     branches: [main]
+    # The site under site/ is published on its own and has no tests.
+    paths-ignore:
+      - 'site/**'
+      - 'netlify.toml'
 
 permissions: {}
 

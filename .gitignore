@@ -25,3 +25,9 @@
 .claude/
 pkg/satellite/pvc-dispatch-adjust.res
 linstor-migrate
+
+# blockstor.org site build output
+site/public/
+site/resources/
+site/node_modules/
+site/.hugo_build.lock
