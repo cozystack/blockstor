@@ -1049,13 +1049,21 @@ func unwindVolumes(ctx context.Context, run *runContext, rdName string, added []
 func planRestoredReplicas(
 	ctx context.Context, run *runContext, srcRD, rdName string, snap *apiv1.Snapshot,
 ) ([]apiv1.Resource, error) {
+	// The same refusal the REST door makes, before anything is written: see
+	// store.RefuseReplicasWithoutDefinition. A target that already has its
+	// definition passes it.
+	err := store.RefuseReplicasWithoutDefinition(ctx, run.Store, rdName)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // names the definition and the replicas itself
+	}
+
 	nodes := run.Flags.Nodes
 
 	// Named nodes have to actually hold the snapshot. Restoring onto one
 	// that does not produces a replica with nothing behind it: the objects
 	// are created, the satellite finds no snapshot to receive, and the
 	// command reports success over an empty volume.
-	err := validate.RestoreNodesHoldSnapshot(nodes, snap.Nodes)
+	err = validate.RestoreNodesHoldSnapshot(nodes, snap.Nodes)
 	if err != nil {
 		//nolint:wrapcheck // a semantic refusal; see checkVolumeSize
 		return nil, err

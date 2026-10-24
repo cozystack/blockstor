@@ -107,3 +107,66 @@ func releaseRestoreMarker(ctx context.Context, st Store, rdName, marker string) 
 
 	return nil
 }
+
+// ErrReplicasWithoutDefinition refuses a restore or clone into a name that
+// has no definition but already has diskless replicas under it.
+var ErrReplicasWithoutDefinition = errors.New("replicas already exist under that name with no definition over them")
+
+// RefuseReplicasWithoutDefinition refuses materialising a new definition over
+// diskless replicas that are already there with none over them: an
+// operator's diskless replica left by a cascade that did not finish, or
+// applied by hand. Both restore doors, REST and CLI, run it before they
+// create the definition.
+//
+// Created over them, the definition adopted them, the stamp on their node
+// failed because a replica with no data is not one a restore can use, and the
+// rollback of the definition it had created cascaded over every replica under
+// the name, taking those with it although the request had not made them.
+// Refusing before anything is written leaves them where they were and names
+// them.
+//
+// A replica that holds data is not refused here: the stamp takes it as
+// placed, and it is the restore's to keep or roll back. Nor is the
+// controller's tie-breaker witness, which the stamp promotes into the replica
+// the restore asked for. A replica already being deleted is no obstacle
+// either: it is going whatever the restore does.
+//
+// Read past the cache on both sides: a definition the cache has not seen yet
+// would make its own replicas read as orphans. The answer wraps
+// ErrAlreadyExists, so the doors answer it with 409.
+func RefuseReplicasWithoutDefinition(ctx context.Context, st Store, rdName string) error {
+	_, err := st.ResourceDefinitions().GetUncached(ctx, rdName)
+	if err == nil {
+		return nil
+	}
+
+	if !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("read %q to check for replicas without it: %w", rdName, err)
+	}
+
+	replicas, err := LiveReplicas(ctx, st, rdName)
+	if err != nil {
+		return fmt.Errorf("list the replicas under %q: %w", rdName, err)
+	}
+
+	var orphans []string
+
+	for i := range replicas {
+		flags := replicas[i].Flags
+		if slices.Contains(flags, apiv1.ResourceFlagDelete) || slices.Contains(flags, apiv1.ResourceFlagTieBreaker) {
+			continue
+		}
+
+		if slices.Contains(flags, apiv1.ResourceFlagDiskless) {
+			orphans = append(orphans, replicas[i].NodeName)
+		}
+	}
+
+	if len(orphans) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %q has diskless replicas on %s but no resource definition: %w; "+
+		"delete those Resource objects, then retry", ErrAlreadyExists, rdName, strings.Join(orphans, ", "),
+		ErrReplicasWithoutDefinition)
+}

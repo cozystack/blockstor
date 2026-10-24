@@ -1414,7 +1414,12 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 // what makes the decision on fresh state rather than on the read that lost the
 // race.
 func (s *Server) createOrAdoptRestoredRD(ctx context.Context, newRD *apiv1.ResourceDefinition, snap *apiv1.Snapshot, overrides *rdShapeOverrides) (bool, string, error) {
-	err := s.Store.ResourceDefinitions().Create(ctx, newRD)
+	err := s.refuseReplicasWithoutDefinition(ctx, newRD.Name)
+	if err != nil {
+		return false, "", err
+	}
+
+	err = s.Store.ResourceDefinitions().Create(ctx, newRD)
 	if err == nil {
 		return true, "", nil
 	}
@@ -1685,6 +1690,12 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 	}
 
 	return placed, nil
+}
+
+// refuseReplicasWithoutDefinition is store.RefuseReplicasWithoutDefinition
+// on this server's store, run before the restored definition is created.
+func (s *Server) refuseReplicasWithoutDefinition(ctx context.Context, rdName string) error {
+	return store.RefuseReplicasWithoutDefinition(ctx, s.Store, rdName) //nolint:wrapcheck // surfaced via writeStoreError
 }
 
 // errReplicaStillDeleting marks a stamp refused because the replica already
