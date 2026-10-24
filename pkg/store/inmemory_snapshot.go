@@ -65,7 +65,7 @@ func (s *inMemorySnapshots) ListByDefinition(_ context.Context, rdName string) (
 	out := make([]apiv1.Snapshot, 0)
 
 	for k := range s.m {
-		if s.m[k].ResourceName == rdName {
+		if FoldName(s.m[k].ResourceName) == FoldName(rdName) {
 			out = append(out, s.m[k])
 		}
 	}
