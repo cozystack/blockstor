@@ -10,6 +10,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -54,4 +55,42 @@ func TestAutoSnapshotPruneKeepsTheSourceOfARestore(t *testing.T) {
 	if !kept {
 		t.Fatal("the prune deleted the auto-snapshot a definition was restored from")
 	}
+}
+
+// The production prune judges the restore through the store
+// (store.ReleaseRestoreSource): a restore that is not finished keeps its
+// auto-snapshot.
+func TestAutoSnapshotPruneWithAStoreKeepsTheSourceOfAnUnfinishedRestore(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	rd := makeRDWithAutoSnapshot(t, "pvc-keep-st", 15, "2")
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(context.Background(), &apiv1.ResourceDefinition{
+		Name:  "pvc-restored-st",
+		Props: map[string]string{store.RestoreFromSnapshotProp: "pvc-keep-st:auto-snap-00001"},
+	}); err != nil {
+		t.Fatalf("seed restored definition: %v", err)
+	}
+
+	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
+	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk, Store: st}
+
+	for i := range 4 {
+		if err := r.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick #%d: %v", i, err)
+		}
+
+		clk.advance(15*time.Minute + time.Second)
+	}
+
+	for _, snap := range listAutoSnapshotsByRD(t, cli, "pvc-keep-st") {
+		if snap.Spec.SnapshotName == "auto-snap-00001" {
+			return
+		}
+	}
+
+	t.Fatal("the prune deleted the auto-snapshot an unfinished restore reads from")
 }

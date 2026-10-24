@@ -53,11 +53,19 @@ const RollbackInProgress = "in-progress"
 const RollbackSinceProp = "Blockstor/RollbackSince"
 
 // StaleRollbackAfter is how long an in-progress mark may stand before a retry
-// takes it over. A rollback runs on a detached budget of about 21 seconds and
-// every write it makes after that lands on an expired context, so a mark
-// older than this has nobody behind it. The margin covers clock skew between
-// the API server replicas that wrote and read it.
+// takes it over. Every rollback runs on a budget, the REST door's detached one
+// or CLIRollbackBudget, and every write it makes after that lands on an
+// expired context, so a mark older than this has nobody behind it. The margin
+// covers clock skew between the machines that wrote and read the mark: the
+// API server replicas, and the operator's machine for a CLI rollback. Should a
+// skewed clock let a retry take over early, a rollback still running finds
+// the mark gone at its next step and stands down without deleting.
 const StaleRollbackAfter = 2 * time.Minute
+
+// CLIRollbackBudget bounds a CLI rollback the way the REST door's detached
+// budget bounds its own, so every rollback that writes an in-progress mark
+// is over well before StaleRollbackAfter lets a retry take the mark over.
+const CLIRollbackBudget = time.Minute
 
 // MarkRollback writes the rollback mark into props: the in-progress mark with
 // the time it was written, or a step, which stands until an operator acts and

@@ -1197,6 +1197,32 @@ func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, erro
 	return out, nil
 }
 
+// refuseSnapshotDeleteUnderRestore runs store.ReleaseRestoreSource before a
+// snapshot delete: a definition restored from the snapshot reads from it
+// until its restore is done. True means the answer has been written.
+func (s *Server) refuseSnapshotDeleteUnderRestore(w http.ResponseWriter, r *http.Request, rd, snapName string) bool {
+	err := store.ReleaseRestoreSource(r.Context(), s.Store, rd, snapName)
+	if errors.Is(err, store.ErrRestoreSourceInUse) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "snapshot '" + snapName + "' of '" + rd + "' cannot be deleted yet: " + err.Error(),
+			Cause:   "a restore from this snapshot has not brought up a replica with every volume UpToDate",
+			Correc:  "retry the delete once that restore has finished",
+			ObjRefs: map[string]string{objRefRscDfn: rd, objRefSnapshotDfn: snapName},
+		}})
+
+		return true
+	}
+
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	return false
+}
+
 // handleSnapshotDelete answers `DELETE /v1/resource-definitions/{rd}/snapshots/{snap}`
 // with an idempotent 200 + ApiCallRc envelope. CSI spec §DeleteSnapshot
 // mandates idempotence: the driver retries until it sees success, so
@@ -1229,32 +1255,6 @@ func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, erro
 // surface 504 + an actionable envelope citing the stuck-state if
 // the budget runs out. The success path (snapshot reaped within
 // budget) keeps the existing 200 + maskInfo wire shape.
-// refuseSnapshotDeleteUnderRestore runs store.ReleaseRestoreSource before a
-// snapshot delete: a definition restored from the snapshot reads from it
-// until its restore is done. True means the answer has been written.
-func (s *Server) refuseSnapshotDeleteUnderRestore(w http.ResponseWriter, r *http.Request, rd, snapName string) bool {
-	err := store.ReleaseRestoreSource(r.Context(), s.Store, rd, snapName)
-	if errors.Is(err, store.ErrRestoreSourceInUse) {
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError,
-			Message: "snapshot '" + snapName + "' of '" + rd + "' cannot be deleted yet: " + err.Error(),
-			Cause:   "a restore from this snapshot has not brought up a replica with every volume UpToDate",
-			Correc:  "retry the delete once that restore has finished",
-			ObjRefs: map[string]string{objRefRscDfn: rd, objRefSnapshotDfn: snapName},
-		}})
-
-		return true
-	}
-
-	if err != nil {
-		writeStoreError(w, err)
-
-		return true
-	}
-
-	return false
-}
-
 func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")

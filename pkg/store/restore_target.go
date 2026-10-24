@@ -906,7 +906,9 @@ func TakeOverStaleRollback(ctx context.Context, st Store, rdName string, now tim
 
 	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
 		func(rd *apiv1.ResourceDefinition) error {
-			took = rollbackMarkStale(rd.Props, now)
+			// A mark another retry already took off counts as taken: there
+			// is no rollback left to refuse over.
+			took = rd.Props[RollbackAbandonedProp] == "" || rollbackMarkStale(rd.Props, now)
 			if took {
 				UnmarkRollback(rd.Props)
 			}
