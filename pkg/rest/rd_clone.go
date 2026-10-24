@@ -1979,7 +1979,7 @@ func (s *Server) cloneSnapshotPreconditionsHold(ctx context.Context, w http.Resp
 				"' refused: the source has no active diskful replicas to clone from",
 			Cause: "the clone data plane snapshots the source and restores the target " +
 				"from it; with no deployed diskful replica there is nothing to snapshot " +
-				"and the result would be an empty shell (Bug 114)",
+				"and the result would be an empty shell",
 			Correc: "deploy the source first (`linstor rd ap " + src.Name + "`), " +
 				"or clone before removing its replicas",
 		})
@@ -2169,9 +2169,8 @@ func writeCloneStoreError(w http.ResponseWriter, srcName, cloneName string, err 
 // are dropped before the Create lands. python-linstor 1.27.0 sends
 // these via `linstor resource-definition clone --override-prop K=V`
 // / `--delete-prop K`; wiring them through here keeps the operator's
-// intent honoured for the empty-VD path. `req.SrcSnapName` is
-// accepted-and-no-op (see rdCloneRequest docstring) — the snapshot-
-// based clone data plane lands separately.
+// intent honoured for the empty-VD path. A non-empty `req.SrcSnapName`
+// never gets here: it is refused with 501 before either clone path runs.
 func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	src *apiv1.ResourceDefinition, req *rdCloneRequest,
 ) {
@@ -2401,11 +2400,9 @@ func computeCloneStatus(ctx context.Context, st store.Store, srcName, targetName
 func writeSnapshotCloneNotImplemented(w http.ResponseWriter, srcName, cloneName, srcSnapName string) {
 	writeCloneRefused(w, http.StatusNotImplemented, srcName, cloneName, &apiv1.APICallRc{
 		RetCode: apiCallRcError,
-		Message: "snapshot-based clone not implemented in this release (pending Phase 12)",
-		Cause: "the apiserver accepts `src_snap_name` on the wire for python-linstor 1.27.0 " +
-			"compatibility (Bug 232 + 237) but the satellite-side snapshot-clone data plane is " +
-			"not yet wired; silently falling back to a live-RD shell copy would discard the " +
-			"snapshot intent and produce a clone with the wrong contents",
+		Message: "cloning from a named snapshot (src_snap_name) is not supported",
+		Cause: "blockstor clones from the live source only; cloning from the live source " +
+			"instead would give a clone with different contents than the snapshot holds",
 		Correc: "use the snapshot-then-restore workflow which IS wired today: " +
 			"`linstor s create " + srcName + " " + srcSnapName + "` (if the snapshot " +
 			"doesn't already exist) then " +
