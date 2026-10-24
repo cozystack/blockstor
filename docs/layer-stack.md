@@ -37,7 +37,9 @@ the dispatcher falls through to the satellite's default-DRBD path.
 ### Per-RD via REST
 
 ```bash
-curl -XPOST http://controller:3370/v1/resource-definitions \
+# the plain port listens on the pod's loopback; reach it through a port-forward:
+# kubectl -n blockstor-system port-forward deploy/blockstor-apiserver 3370:3370
+curl -XPOST http://localhost:3370/v1/resource-definitions \
   -H 'Content-Type: application/json' \
   -d '{"resource_definition":{"name":"pvc-1","layer_stack":["LUKS","STORAGE"]}}'
 ```
