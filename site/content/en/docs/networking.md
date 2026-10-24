@@ -12,15 +12,14 @@ Blockstor's components do not talk to each other directly. They read and write t
 | Component | Port | Protocol | Who connects | Reachable from |
 |---|---|---|---|---|
 | blockstor-apiserver | 3371 | HTTPS with mutual TLS | `linstor-csi`, piraeus-operator, `ha-controller`, the `linstor` client | The Services `blockstor-apiserver` and `blockstor-controller` in `blockstor-system` |
-| blockstor-apiserver | 3370 | Plain HTTP, no authentication | `kubectl port-forward` for debugging | The pod only. Not in any Service. |
+| blockstor-apiserver | 3370 | Plain HTTP, no authentication | `kubectl port-forward` for debugging | Loopback inside the pod only |
 | blockstor-apiserver | 8081 | HTTP `/healthz`, `/readyz` | kubelet | The pod |
 | blockstor-controller | 8081 | HTTP `/healthz`, `/readyz` | kubelet | The pod |
-| blockstor-satellite | 9100 | Plain HTTP, no authentication | Other satellites, to fetch a snapshot stream | The node's own address |
+| blockstor-satellite | 3372 | HTTPS with mutual TLS | Other satellites, to fetch a snapshot stream | The node's own address |
 | blockstor-satellite | 9101 | HTTP `/healthz`, `/readyz` | kubelet | The node's own address |
-| blockstor-satellite | 8080 | HTTP metrics (controller-runtime default) | Nothing in blockstor | The node's own address |
 | DRBD (kernel) | 20000 to 20999 | DRBD replication, TCP | The other replicas of the same volume | The node's own address |
 
-The satellite runs with host networking, so its ports are open on the node itself, not on a pod IP. The manifests set `hostPort` 9100 and 9101 to make this explicit. The satellite does not set a metrics address, so controller-runtime opens its default metrics listener on port 8080 of the node. Nothing in blockstor reads it. Block it or scrape it, but do not leave it open to networks you do not trust.
+The satellite runs with host networking, so its ports are open on the node itself, not on a pod IP. The manifests set `hostPort` 3372 and 9101 to make this explicit. The satellite opens no metrics listener.
 
 The controller has no REST listener. The manifests start it with `--enable-rest-api=false`, and the REST API is served by the separate `blockstor-apiserver` Deployment. Both the controller and the API server are started with `--metrics-bind-address=0`, so they open no metrics port.
 
@@ -30,7 +29,7 @@ Satellites do not dial the controller, and the controller does not dial satellit
 
 Port 3371 requires a client certificate and verifies it against the CA bundle given by `--tls-client-ca-file`. The manifests create that CA with cert-manager as the `blockstor-api-ca` Issuer, and issue one client certificate into the Secret `blockstor-apiserver-client-tls`. The serving certificate covers both Service names, `blockstor-apiserver` and `blockstor-controller`, with and without the `.blockstor-system.svc.cluster.local` suffix. The API server reloads certificates on rotation without a restart.
 
-Port 3370 serves the same API without TLS and without authentication. It exists for debugging, and it is not exposed by any Service. Reach it with a port-forward when you need it, for example for the `linstor` client. See [Compatibility with LINSTOR](../compatibility/#using-the-linstor-client).
+Port 3370 serves the same API without TLS and without authentication. It exists for debugging, so it listens on `127.0.0.1` inside the pod and no other pod can reach it. A port-forward connects inside the pod, so that is the way in, for example for the `linstor` client. See [Compatibility with LINSTOR](../compatibility/#using-the-linstor-client).
 
 ## DRBD replication
 
@@ -55,16 +54,18 @@ The satellite also publishes the Kubernetes node's `InternalIP` as an interface 
 
 ## Snapshot stream between satellites
 
-When a clone or a snapshot restore needs data from a snapshot on another node, the receiving satellite fetches the raw snapshot stream from the satellite that holds it, with an HTTP `GET` on port 9100. The stream has no authentication and no encryption. Keep that port reachable only between storage nodes, with a NetworkPolicy or a host firewall. If the port is blocked, the clone falls back to a DRBD initial sync, which is slower but works.
+When a clone or a snapshot restore needs data from a snapshot on another node, the receiving satellite fetches the raw snapshot stream from the satellite that holds it, with an HTTPS `GET` on port 3372.
 
-In the next release the stream moves from port 9100 to port 3372, and the satellite stops opening the metrics listener on port 8080. Open the new port between storage nodes before you upgrade the satellites.
+The stream carries raw volume data, so it runs over mutual TLS only. Every satellite presents the certificate from the Secret `blockstor-satellite-stream-tls`, issued for the name `blockstor-satellite` by its own CA, `blockstor-stream-ca`, and each side checks the other against that CA. The stream CA is kept apart from `blockstor-api-ca` on purpose: a stream certificate is also a client certificate, and the API server accepts any client certificate from its own CA. The certificate is read again on every connection, so a rotation needs no restart.
+
+The satellite takes the files with `--stream-tls-cert-file`, `--stream-tls-key-file` and `--stream-tls-ca-file`. Started without them, it neither serves nor fetches the stream, and a cross-node clone or restore falls back to a DRBD initial sync, which is slower but works. The same happens when the port is blocked.
 
 ## What a firewall must allow
 
 Between storage nodes, in both directions:
 
 - The DRBD port range, 20000 to 20999 by default.
-- Port 9100 for the snapshot stream.
+- Port 3372 for the snapshot stream.
 
 Inside the cluster:
 
@@ -75,12 +76,8 @@ On each node, for kubelet:
 - Port 9101 on the node for the satellite's probes.
 - Port 8081 inside the controller and API server pods for theirs.
 
-Nothing needs to reach port 3370 or the satellite's port 8080.
+Nothing needs to reach port 3370.
 
 ## Ports without authentication
 
-- 3370 on the API server. Full read and write access to the API. Not exposed by a Service.
-- 9100 on every storage node. Reads raw snapshot data.
-- 8080 on every storage node. Metrics only.
-
-Port 3371 is the only API entry point meant for clients.
+Only 3370 on the API server, with full read and write access to the API, and it listens on loopback inside the pod. Port 3371 is the only API entry point meant for clients.

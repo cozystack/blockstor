@@ -39,7 +39,7 @@ blockstor resource-group spawn local scratch-1 20G
 Or on one definition, in YAML:
 
 ```yaml
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata:
   name: scratch-1
