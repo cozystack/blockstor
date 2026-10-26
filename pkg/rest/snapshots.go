@@ -575,7 +575,7 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict,
 			"resource definition '"+rd+"' is being deleted "+
 				"(DELETE flag set): retry against a different RD or "+
-				"wait for the tear-down to complete (Bug 180)")
+				"wait for the tear-down to complete")
 
 		return
 	}
@@ -794,7 +794,7 @@ func (s *Server) refuseSnapshotCreateOnRDDeletedRace(w http.ResponseWriter, r *h
 
 		writeError(w, http.StatusConflict,
 			"resource definition '"+snap.ResourceName+"' "+reason+
-				" concurrently with the snapshot create (Bug 180): "+
+				" concurrently with the snapshot create: "+
 				"retry after re-creating the resource definition, or "+
 				"pick a different RD")
 
@@ -1045,7 +1045,7 @@ func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.
 			"can take copy-on-write snapshots",
 		Correc: "place the resource on a thin-provisioned snapshot-capable " +
 			"pool (LVM_THIN / ZFS_THIN / FILE_THIN); `linstor rd clone` also " +
-			"relies on snapshots (Bug-020) so it is no workaround on a thick pool",
+			"relies on snapshots, so it is no workaround on a thick pool",
 	}})
 
 	return false

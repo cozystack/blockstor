@@ -1,0 +1,61 @@
+name: rg-spawn-definitions-only
+description: |
+  `linstor rg spawn-resources --definition-only <rg> <rd> <size>` asks for
+  the definition and its volumes and no placement. The spawn handler
+  ignored `definitions_only` and placed replicas from the group's
+  place-count anyway. Fixed in cozystack/blockstor#216 (#210).
+
+  Operator sequence:
+    rg create --place-count 1 -> spawn-resources --definition-only <rd> 32M
+
+  CLI-side contract:
+    - the definition and its 32 MiB volume exist (vd_size_kib)
+    - no replica is placed, and none appears over a hold window
+      (replica_count_max with max 0)
+
+  Unit pin: pkg/rest/create_doors_props_modify_test.go
+  (TestSpawnDefinitionsOnlyPlacesNothing).
+  L6 cell: tests/e2e/cli-matrix/rg-spawn-definitions-only.sh.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  rg: rg-spawn-defs-only
+  sp: stand
+
+steps:
+  - name: create-rg
+    cmd: ["resource-group", "create", "{{rg}}", "--place-count", "1", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: spawn-definitions-only
+    cmd: ["resource-group", "spawn-resources", "--definition-only", "{{rg}}", "{{rd}}", "32M"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 32768
+      timeout_s: 60
+  - name: no-replica-placed
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count_max
+      rd: "{{rd}}"
+      max: 0
+      hold_s: 15
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+  - cmd: ["resource-group", "delete", "{{rg}}"]
+    expect_exit: 0
+
+invariants:
+  - no_orphans

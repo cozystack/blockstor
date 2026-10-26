@@ -99,8 +99,9 @@ type AutoSelectFilter struct {
 
 // ResourceGroupSpawn is the payload for POST /resource-groups/{rg}/spawn —
 // the call linstor-csi uses to actually create a Resource from a group.
-// Upstream LINSTOR reuses GenericPropsModify here too, so we accept the
-// override_props / delete_props fields even though we don't consume them.
+// The props-modify fields are declared so the decoder can name them, and a
+// non-empty one is refused: a spawn creates the definition, there are no
+// props on it to modify yet.
 type ResourceGroupSpawn struct {
 	ResourceDefinitionName     string            `json:"resource_definition_name,omitempty"`
 	ResourceDefinitionExternal string            `json:"resource_definition_external_name,omitempty"`

@@ -137,7 +137,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	if a.cfg.RESTConfig == nil || a.cfg.ManagerFactory == nil {
-		return errors.New("RESTConfig + ManagerFactory are required (Phase 10.6 retired the gRPC path)")
+		return errors.New("RESTConfig and ManagerFactory are required")
 	}
 
 	a.logger.Info("agent starting",
