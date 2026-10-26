@@ -20,7 +20,7 @@ Blockstor is a Kubernetes control plane for LVM and ZFS storage with DRBD replic
 <div class="bs-card">
 <div class="bs-card__icon"><i class="fa-solid fa-download"></i></div>
 <h3><a href="installation/">Setting up a cluster</a></h3>
-<p><strong>Installation</strong> covers requirements, the chart, nodes and pools. <a href="csi/">CSI</a> connects it to StorageClasses, <a href="networking/">Networking</a> lists the ports.</p>
+<p><strong>Installation</strong> covers requirements, the manifests, nodes and pools. <a href="csi/">CSI</a> connects it to StorageClasses, <a href="networking/">Networking</a> lists the ports.</p>
 <a class="bs-card__more" href="installation/">Installation <i class="fa-solid fa-arrow-right ms-1"></i></a>
 </div>
 <div class="bs-card">

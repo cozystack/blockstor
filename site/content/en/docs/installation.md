@@ -85,7 +85,7 @@ kubectl -n blockstor-system rollout status daemonset/blockstor-satellite
 
 Each storage node is a cluster-scoped `Node` resource named after the Kubernetes node, and each pool on a node is a `StoragePool`. You can create them as YAML (see [Resources](../resources/)) or with the CLI.
 
-Install the CLI from the release tag. It needs Go and reads your kubeconfig, so it talks to the cluster the same way `kubectl` does:
+Install the CLI from the release tag. It needs Go and reads your kubeconfig, so it talks to the cluster the same way `kubectl` does. No release up to v0.1.17 has it; with those, create the objects as YAML:
 
 ```sh
 go install github.com/cozystack/blockstor/cmd/blockstor@v<VERSION>

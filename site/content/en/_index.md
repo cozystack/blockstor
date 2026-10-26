@@ -118,7 +118,7 @@ title: Blockstor
 <a class="bs-card" href="docs/installation/">
 <div class="bs-card__icon"><i class="fa-solid fa-download"></i></div>
 <h3>Installation</h3>
-<p>Requirements, the Helm chart, registering nodes and storage pools.</p>
+<p>Requirements, the manifests, registering nodes and storage pools.</p>
 <span class="bs-card__more">Install <i class="fa-solid fa-arrow-right ms-1"></i></span>
 </a>
 <a class="bs-card" href="docs/architecture/">

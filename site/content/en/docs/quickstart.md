@@ -9,6 +9,8 @@ This page is the shortest path from a Kubernetes cluster with DRBD-capable nodes
 
 ## Before you start
 
+The `blockstor` CLI this page uses is in no release up to v0.1.17. It ships in the release after that, so pick that one or a newer one for `<VERSION>`.
+
 You need:
 
 - Three or more worker nodes with the DRBD 9 kernel module loaded, and the ZFS module if you want ZFS pools. On Talos Linux both come from the `siderolabs/drbd` and `siderolabs/zfs` system extensions.
@@ -68,7 +70,7 @@ blockstor node create worker-2 10.0.0.12
 blockstor node create worker-3 10.0.0.13
 ```
 
-Turn the spare disk on each node into a pool called `data`. This creates the ZFS pool and registers it in one step:
+Turn the spare disk on each node into a pool called `data`. This wipes the disk, creates the ZFS pool and registers it in one step:
 
 ```sh
 blockstor physical-storage create-device-pool zfs worker-1 /dev/sdb --pool-name data

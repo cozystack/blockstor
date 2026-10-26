@@ -25,7 +25,7 @@ kubectl get nodes.blockstor.cozystack.io -o wide
 
 A peer stuck in `Connecting` cannot reach the other replica's address and port. The two causes are a wrong address and a blocked port.
 
-The `Address` column is the first entry of `spec.netInterfaces`. It must be the node's own IP, reachable from the other nodes. A pod IP there means something rewrote it, most often piraeus-operator managing the same nodes. Blockstor works around that by preferring an interface named `k8s-internal`, which the satellite fills from the Kubernetes node's `InternalIP`. If that entry is missing, check that the satellite's ClusterRole lets it read `nodes`. Fix the first interface anyway:
+The `Address` column is the first entry of `spec.netInterfaces`. It must be the node's own IP, reachable from the other nodes. A pod IP there means something rewrote it, most often piraeus-operator managing the same nodes. Blockstor works around that by preferring the Kubernetes node's `InternalIP` when it renders the DRBD configuration. That address is added in memory and never shows up on the `Node` object, and it needs the satellite's ClusterRole to read `nodes`. Fix the first interface anyway:
 
 ```sh
 kubectl patch nodes.blockstor.cozystack.io <node> --type merge \
@@ -43,7 +43,7 @@ blockstor resource list --faulty
 kubectl get resource <definition>.<node> -o jsonpath='{range .status.connections[*]}{.peerNodeName}={.message} {end}'
 ```
 
-`StandAlone` on both sides of a connection after a network partition, with the satellite log or `drbdadm status` saying `Split-Brain detected`, means both replicas were written while apart. DRBD refuses to pick a side. This can only happen to a volume without a working tiebreaker, so check the tiebreaker first for volumes with an even number of replicas.
+`StandAlone` on both sides of a connection after a network partition, with `Split-Brain detected` in the node's kernel log (`dmesg`), means both replicas were written while apart. DRBD refuses to pick a side. This can only happen to a volume without a working tiebreaker, so check the tiebreaker first for volumes with an even number of replicas.
 
 Decide which replica keeps its data, the survivor, and which one discards its writes, the victim. On the victim's node:
 
@@ -60,7 +60,7 @@ drbdadm disconnect <definition>
 drbdadm connect <definition>
 ```
 
-The victim resyncs from the survivor. The satellite does not re-render or re-adjust the resource while you do this. The victim's independent writes are lost, so if you are not sure which side is right, stop and copy the data off first.
+The victim resyncs from the survivor. While the slot is `StandAlone` the satellite still adjusts it, but with `--skip-net`, so it leaves the connection to you. The victim's independent writes are lost, so if you are not sure which side is right, stop and copy the data off first.
 
 ## Inconsistent or SyncTarget that never finishes
 

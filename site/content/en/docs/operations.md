@@ -63,7 +63,7 @@ kubectl -n blockstor-system logs $POD -c satellite
    blockstor node create worker-4 10.0.0.14
    ```
 
-3. Give it a pool, from a raw disk or from an existing volume group or ZFS pool:
+3. Give it a pool, from a raw disk or from an existing volume group or ZFS pool. `create-device-pool` wipes the device it is given:
 
    ```sh
    blockstor physical-storage create-device-pool zfs worker-4 /dev/sdb --pool-name data
@@ -134,7 +134,7 @@ For a volume you manage directly:
 blockstor volume-definition set-size my-volume 0 20G
 ```
 
-Shrinking is refused. If you really need to, shrink the filesystem first, unmount the volume, and run the command with `--force`.
+Shrinking is refused. `--force` lowers the size in the definition only: the satellite grows devices and never shrinks them, so the backing devices and DRBD keep their size.
 
 ## Moving a replica
 
@@ -153,7 +153,7 @@ blockstor resource toggle-disk worker-3 my-volume --storage-pool data   # give i
 blockstor resource toggle-disk worker-3 my-volume --diskless            # make it diskless
 ```
 
-Demoting the last replica with data, or one that is in use, is refused without `--force`. A conversion that is stuck can be unwound with `--cancel`.
+`--diskless` does not check what is left: it demotes the replica even when it is the last one with data. Before you run it, make sure another replica of the volume is `UpToDate`. A conversion that is stuck can be unwound with `--cancel`.
 
 ## Snapshots as an in-cluster backup
 
@@ -164,7 +164,7 @@ blockstor snapshot create my-volume before-upgrade
 blockstor snapshot list
 ```
 
-Restore into a new volume. The original is not touched, and the new one gets its replicas placed like any other volume:
+Restore into a new volume. The original is not touched. The new volume gets its replicas on the nodes that hold the snapshot, in the same pool, not through the autoplacer:
 
 ```sh
 blockstor snapshot resource restore \
@@ -197,8 +197,9 @@ Upgrade in the same order as the installation. Update the manifests to the new t
 
 1. The CRDs, `kubectl apply -f config/crd/bases/`. New fields arrive before the code that writes them.
 2. The controller, `rendered/blockstor-deploy.yaml`.
-3. The API server, `rendered/blockstor-apiserver-deploy.yaml`. It runs three replicas, so clients keep working through the rollout.
-4. The satellites, `rendered/blockstor-satellite-daemonset.yaml`.
+3. The API server certificates, `rendered/blockstor-apiserver-tls.yaml`.
+4. The API server, `rendered/blockstor-apiserver-deploy.yaml`. It runs three replicas, so clients keep working through the rollout.
+5. The satellites, `rendered/blockstor-satellite-daemonset.yaml`.
 
 Rolling the satellites does not interrupt I/O. The DRBD state lives in the kernel and survives the pod, the rendered DRBD configuration lives on the host under `/var/lib/blockstor-drbd.d`, and the pod is given 10 seconds to stop and does not try to disconnect DRBD on the way out. When the new satellite starts, it looks at every DRBD resource the kernel holds and tears down only the ones with no usable local disk and no live peer connection. Everything else is left for the reconciler to adjust. A replica in the middle of a sync keeps syncing.
 
