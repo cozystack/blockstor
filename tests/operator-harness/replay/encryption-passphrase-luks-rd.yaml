@@ -18,6 +18,10 @@ description: |
        the LuksPassphrase wire prop (a gate-only patch would pass step
        3 but loop on "LUKS in layer stack but Props.LuksPassphrase
        empty" and never converge)
+    4a. vd modify-passphrase is REFUSED (exit 10): no per-volume keys,
+       and nothing lands in the volume definition's properties
+    4b. encryption modify-passphrase is REFUSED (exit 10) while the
+       LUKS definition exists: nothing re-keys its volume
     5. legacy prop STILL absent after provisioning
 
   replay/luks-encrypted-rd.yaml runs the same refusal ahead of a
@@ -78,6 +82,24 @@ steps:
   - name: create-vd
     cmd: ["volume-definition", "create", "{{rd}}", "32M"]
     expect_exit: 0
+  - name: vd-passphrase-refused
+    # No per-volume keys: every LUKS volume uses the cluster passphrase,
+    # and the door used to store this value in plaintext in the volume
+    # definition's properties. It answers 400 (exit 10) and stores
+    # nothing.
+    cmd: ["volume-definition", "modify-passphrase", "{{rd}}", "0", "replay-pp023-vd-decoy"]
+    # The runner's prop_value reads no volume definitions; the L1 test
+    # pkg/rest/vd_passphrase_bug_233_test.go pins that nothing is stored.
+    expect_exit: 10
+  - name: cluster-passphrase-rotation-refused
+    # The cluster passphrase is the key this LUKS volume was formatted
+    # with and nothing re-keys it, so a rotation is refused while the
+    # definition exists: 409, exit 10. On a shared stand whose
+    # passphrase predates this workflow the old value does not match
+    # and the answer is 401, also exit 10; either way nothing rotates.
+    cmd: ["encryption", "modify-passphrase", "--old-passphrase", "replay-pp023-do-not-rely-on",
+          "--new-passphrase", "replay-pp023-rotated"]
+    expect_exit: 10
   - name: auto-place-2-encrypted
     cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
     expect_exit: 0
