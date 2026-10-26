@@ -157,11 +157,17 @@ func handleKVModify(w http.ResponseWriter, r *http.Request) {
 		kvBag[name] = bag
 	}
 
+	// An empty override value is stored, not read as a delete: upstream's
+	// key-value store sets every override it is given (only a null is
+	// refused), unlike the object props doors. A namespace takes the keys
+	// below it, read as every other door reads it.
 	maps.Copy(bag, patch.OverrideProps)
 
 	for _, key := range patch.DeleteProps {
 		delete(bag, key)
 	}
+
+	deletePropNamespaces(bag, patch.DeleteNamespace)
 
 	kvBagMu.Unlock()
 

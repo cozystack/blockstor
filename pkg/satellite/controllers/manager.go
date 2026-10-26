@@ -29,6 +29,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -101,23 +102,7 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	// stuck-state pattern from `memory/blockstor_drbd_stuck_state.md`.
 	gracefulShutdownTimeout := 10 * time.Second
 
-	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
-		Scheme: scheme,
-		// Satellite is per-node; leader election would require
-		// a cluster-wide Lease the satellite has no business
-		// holding. Skip it; the DaemonSet enforces
-		// one-pod-per-node already.
-		LeaderElection: false,
-		// HealthProbeBindAddress wires the manager's /healthz +
-		// /readyz HTTP endpoints. cmd/satellite/main.go sets this
-		// from --health-probe-bind-address so the DaemonSet's
-		// kubelet probes have something to talk to; an empty
-		// string disables the probe server entirely (the
-		// controller-runtime default), which is what tests rely on
-		// to avoid port-binding races between parallel runs.
-		HealthProbeBindAddress:  cfg.HealthProbeBindAddress,
-		GracefulShutdownTimeout: &gracefulShutdownTimeout,
-	})
+	mgr, err := ctrl.NewManager(restCfg, managerOptions(cfg, &gracefulShutdownTimeout))
 	if err != nil {
 		return nil, errors.Wrap(err, "create manager")
 	}
@@ -365,4 +350,30 @@ func wireSkipDiskClearer(mgr manager.Manager, cfg *Config) {
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
 	})
+}
+
+// managerOptions is the satellite manager's configuration.
+func managerOptions(cfg *Config, gracefulShutdownTimeout *time.Duration) ctrl.Options {
+	return ctrl.Options{
+		Scheme: scheme,
+		// Satellite is per-node; leader election would require
+		// a cluster-wide Lease the satellite has no business
+		// holding. Skip it; the DaemonSet enforces
+		// one-pod-per-node already.
+		LeaderElection: false,
+		// HealthProbeBindAddress wires the manager's /healthz +
+		// /readyz HTTP endpoints. cmd/satellite/main.go sets this
+		// from --health-probe-bind-address so the DaemonSet's
+		// kubelet probes have something to talk to; an empty
+		// string disables the probe server entirely (the
+		// controller-runtime default), which is what tests rely on
+		// to avoid port-binding races between parallel runs.
+		HealthProbeBindAddress:  cfg.HealthProbeBindAddress,
+		GracefulShutdownTimeout: gracefulShutdownTimeout,
+		// No metrics listener: nothing scrapes the satellite, and on host
+		// networking controller-runtime's default, every address on
+		// :8080, is a port of the node itself, unauthenticated and free to
+		// collide with anything else the node runs there.
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	}
 }

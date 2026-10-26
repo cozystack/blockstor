@@ -52,7 +52,7 @@ func NewClient(c *http.Client) *Client {
 // (rd, snap, vol). The returned ReadCloser is the response body —
 // caller MUST Close it to release the underlying TCP connection.
 //
-// peerAddr is "host:port", e.g. "10.0.0.5:9100". Resolution from a
+// peerAddr is "host:port", e.g. "10.0.0.5:3372". Resolution from a
 // node name to an IP is the caller's concern (Node CRD's
 // NetInterfaces[].Address).
 //

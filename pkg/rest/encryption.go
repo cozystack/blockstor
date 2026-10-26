@@ -113,7 +113,7 @@ const passphraseSecretKey = passphrase.SecretKey
 // Without a Client we fall back to the legacy KV path so
 // in-memory-store tests and pre-migration clusters keep working.
 //
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",namespace=blockstor-system,resources=secrets,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=controllerconfigs,verbs=get;list;watch
 func (s *Server) registerEncryption(mux *http.ServeMux) {
 	// Bug 196: GET reports whether the cluster has a passphrase
@@ -646,7 +646,17 @@ func (s *Server) writePassphrase(ctx context.Context, value string) error {
 // pkg/passphrase reader (Bug 023) so the LUKS RD-create gate and the
 // satellite-side dispatch resolve the exact same Secret.
 func (s *Server) readPassphraseSecret(ctx context.Context) (string, error) {
-	return passphrase.Read(ctx, s.Client, s.Namespace) //nolint:wrapcheck // pkg/passphrase wraps with context already
+	return passphrase.Read(ctx, s.secretReader(), s.Namespace) //nolint:wrapcheck // pkg/passphrase wraps with context already
+}
+
+// secretReader is the reader the passphrase Secret is read through; see
+// Server.SecretReader.
+func (s *Server) secretReader() client.Reader {
+	if s.SecretReader != nil {
+		return s.SecretReader
+	}
+
+	return s.Client
 }
 
 // writePassphraseSecret create-or-updates the Secret. The Secret is
@@ -654,14 +664,14 @@ func (s *Server) readPassphraseSecret(ctx context.Context) (string, error) {
 // key added rather than the whole data map replaced so operators
 // can carry extra annotations / data fields out-of-band.
 func (s *Server) writePassphraseSecret(ctx context.Context, value string) error {
-	name, err := passphrase.SecretName(ctx, s.Client)
+	name, err := passphrase.SecretName(ctx, s.secretReader())
 	if err != nil {
 		return err //nolint:wrapcheck // pkg/passphrase wraps with context already
 	}
 
 	var sec corev1.Secret
 
-	err = s.Client.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: name}, &sec)
+	err = s.secretReader().Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: name}, &sec)
 	if apierrors.IsNotFound(err) {
 		sec = corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace},

@@ -20,10 +20,7 @@ metadata:
 #   - need leases (leader election is off — every apiserver
 #     replica serves independently).
 # What's left is plain CRUD on the blockstor.io CRDs themselves,
-# plus Secrets for the encryption-passphrase code path (Bug 110:
-# without `secrets` verbs the controller-runtime cache informer
-# stalls on a Forbidden list/watch and `PATCH /v1/encryption/
-# passphrase` hangs ~6s before dropping the connection).
+# plus the passphrase Secret in this namespace (the Role below).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -32,16 +29,37 @@ rules:
   - apiGroups: [blockstor.cozystack.io]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
-  # Secrets — the cluster passphrase (sealed in
-  # `blockstor-cluster-passphrase` by default; override via
-  # ControllerConfig.Spec.PassphraseSecretRef) is read on every
-  # `linstor encryption enter-passphrase`, written on
-  # `create-passphrase` / `modify-passphrase`. Cluster-scoped
-  # because the cache informer needs cluster-wide list/watch to
-  # warm up; per-namespace Role is not enough.
+---
+# The cluster passphrase (`blockstor-cluster-passphrase` by default;
+# override via ControllerConfig.Spec.PassphraseSecretRef) is read on
+# every `linstor encryption enter-passphrase` and written on
+# `create-passphrase` / `modify-passphrase`. It is read past the
+# controller-runtime cache (rest.Server.SecretReader), so no informer
+# lists or watches Secrets and a get in this namespace is all the read
+# needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blockstor-apiserver-secrets
+  namespace: blockstor-system
+rules:
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, list, watch, create, update, patch]
+    verbs: [get, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blockstor-apiserver-secrets
+  namespace: blockstor-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blockstor-apiserver-secrets
+subjects:
+  - kind: ServiceAccount
+    name: blockstor-apiserver
+    namespace: blockstor-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -77,7 +95,7 @@ spec:
       # The REST server's graceful-shutdown window is derived from the
       # detached rollback budget (pkg/rest/rg_deleted_race.go); this has to
       # outlive it, or a SIGTERM kills a compensation mid-cascade.
-      terminationGracePeriodSeconds: 20
+      terminationGracePeriodSeconds: 21
       # Spread replicas across nodes when possible so a single
       # node loss doesn't take all apiserver pods at once.
       topologySpreadConstraints:
