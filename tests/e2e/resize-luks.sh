@@ -35,6 +35,8 @@ SIZE_GROWN_KIB=131072     # 128 MiB
 
 trap 'delete_rd "$RD"' EXIT
 
+ensure_passphrase_secret 'this-is-a-32-byte-test-passphrase!!'
+
 echo ">> apply LUKS-encrypted RD ($SIZE_INITIAL_KIB KiB)"
 cat <<EOF | kubectl apply -f -
 apiVersion: blockstor.cozystack.io/v1alpha1
@@ -42,8 +44,6 @@ kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
   layerStack: ["DRBD", "LUKS", "STORAGE"]
-  props:
-    DrbdOptions/Encryption/passphrase: "this-is-a-32-byte-test-passphrase!!"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_INITIAL_KIB}}
 EOF

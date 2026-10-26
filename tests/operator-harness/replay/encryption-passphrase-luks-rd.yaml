@@ -1,10 +1,14 @@
 name: encryption-passphrase-luks-rd
 description: |
   Bug-023 catcher (fix: encryption create-passphrase unlocks LUKS
-  provisioning). Pins the upstream-parity Secret-only flow:
+  provisioning). Pins the Secret-only flow; the Secret is the only
+  place blockstor reads the master passphrase from:
     1. clear the legacy DrbdOptions/EncryptPassphrase controller prop
-       (empty value = delete) and assert it is ABSENT
+       (empty value = delete, still allowed) and assert it is ABSENT
     2. encryption create-passphrase (master passphrase → Secret)
+    2a. controller set-property DrbdOptions/EncryptPassphrase <pp> is
+       REFUSED (exit 10): REST never stores the passphrase in a
+       plaintext property; the prop stays absent
     3. rd create -l drbd,luks,storage  -- pre-fix this step is
        rejected with "LUKS layer requires DrbdOptions/EncryptPassphrase
        to be set first" (exit 10); post-fix the Secret satisfies the
@@ -16,9 +20,8 @@ description: |
        empty" and never converge)
     5. legacy prop STILL absent after provisioning
 
-  Contrast with replay/luks-encrypted-rd.yaml, which sets the legacy
-  controller prop and keeps covering the deprecated path; this
-  workflow proves the prop is no longer required.
+  replay/luks-encrypted-rd.yaml runs the same refusal ahead of a
+  LUKS lifecycle with snapshots.
 
   NOTE: the runner only executes `linstor` argv, so the kernel-level
   asserts (cryptsetup luksDump / --test-passphrase on each replica's
@@ -54,6 +57,19 @@ steps:
     # satisfies the post-fix LUKS gate.
     cmd: ["encryption", "create-passphrase", "-p", "replay-pp023-do-not-rely-on"]
     expect_exit: [0, 10]
+  - name: set-legacy-prop-refused
+    # The passphrase never goes into a property: the controller answers
+    # 400 ("refusing to store the LUKS master passphrase in property
+    # ...; run `linstor encryption create-passphrase`"), which the CLI
+    # surfaces as exit 10, and nothing is stored. A decoy value, so a
+    # regression leaves nothing worth having on the ControllerConfig.
+    cmd: ["controller", "set-property", "DrbdOptions/EncryptPassphrase", "replay-pp023-decoy"]
+    expect_exit: 10
+    await:
+      kind: prop_value
+      obj: controller
+      key: DrbdOptions/EncryptPassphrase
+      timeout_s: 10
   - name: create-rd-luks-no-legacy-prop
     # THE Bug-023 step: pre-fix exit 10 ("LUKS layer requires
     # DrbdOptions/EncryptPassphrase to be set first"), post-fix 0.
