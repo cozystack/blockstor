@@ -61,3 +61,18 @@ func TestLUKSReplicaWirePropNeverReachesTheWire(t *testing.T) {
 		}
 	})
 }
+
+// With no resolved props the wire props start as the replica's own map;
+// dropping the passphrase key from the wire must leave the replica, an
+// object out of the caller's cache, as it was.
+func TestLUKSWirePropDropLeavesTheReplicaAlone(t *testing.T) {
+	const name = "pvc-luks-replica-untouched"
+
+	target := luksTestTarget(name, map[string]string{passphrase.WirePropKey: "from-a-replica-prop", "Aux/keep": "yes"})
+
+	_ = dispatcher.BuildDesired(target, nil, nil, nil, luksTestRD(name), nil)
+
+	if target.Spec.Props[passphrase.WirePropKey] != "from-a-replica-prop" || target.Spec.Props["Aux/keep"] != "yes" {
+		t.Errorf("the replica's props were edited: %v", target.Spec.Props)
+	}
+}
