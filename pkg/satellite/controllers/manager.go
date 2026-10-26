@@ -33,6 +33,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/satellite/stream"
 )
 
 // reconcileTriggerBuffer bounds the observer → reconciler trigger
@@ -317,6 +318,7 @@ func wireCrossNodeFetcher(mgr manager.Manager, cfg *Config) {
 	cfg.Apply.SetCrossNodeFetcher(&SnapshotFetcher{
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
+		Stream:   stream.NewClient(cfg.StreamTLS),
 	})
 }
 

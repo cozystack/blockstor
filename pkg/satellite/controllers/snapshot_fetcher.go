@@ -51,8 +51,8 @@ type SnapshotFetcher struct {
 	NodeName string
 
 	// Stream is the HTTP client that talks to peer satellites'
-	// snapshot-stream endpoints. Nil → NewClient(nil) is used at
-	// first Fetch call.
+	// snapshot-stream endpoints over mutual TLS. Nil fetches nothing
+	// (stream.ErrStreamDisabled), and the caller falls back to a resync.
 	Stream *stream.Client
 }
 
@@ -68,7 +68,7 @@ type SnapshotFetcher struct {
 //     through to a blank CreateVolume + DRBD resync.
 func (f *SnapshotFetcher) Fetch(ctx context.Context, srcRD, snapName string, vol int32) (io.ReadCloser, string, error) {
 	if f.Stream == nil {
-		f.Stream = stream.NewClient(nil)
+		f.Stream = stream.NewClient(stream.TLSFiles{})
 	}
 
 	var snap blockstoriov1alpha1.Snapshot

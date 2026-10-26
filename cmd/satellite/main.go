@@ -45,6 +45,7 @@ import (
 
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/satellite/controllers"
+	"github.com/cozystack/blockstor/pkg/satellite/stream"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/uevent"
 )
@@ -62,6 +63,7 @@ func run() int {
 		stateDir            string
 		probeAddr           string
 		controllerNamespace string
+		streamTLS           stream.TLSFiles
 	)
 
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"),
@@ -72,6 +74,14 @@ func run() int {
 		"The address the /healthz and /readyz probe endpoints bind to.")
 	flag.StringVar(&controllerNamespace, "controller-namespace", "",
 		"Namespace where the controller's Secrets (cluster master passphrase) live (default: $POD_NAMESPACE, then 'blockstor-system').")
+
+	flag.StringVar(&streamTLS.CertFile, "stream-tls-cert-file", "",
+		"PEM certificate this satellite presents on the snapshot stream, for both server and client auth (cert-manager tls.crt).")
+	flag.StringVar(&streamTLS.KeyFile, "stream-tls-key-file", "",
+		"PEM key for --stream-tls-cert-file (cert-manager tls.key).")
+	flag.StringVar(&streamTLS.CAFile, "stream-tls-ca-file", "",
+		"PEM CA bundle every peer satellite's stream certificate is verified against (cert-manager ca.crt). "+
+			"With none of the three set the snapshot stream is off and cross-node clone and restore fall back to a DRBD resync.")
 
 	flag.Parse()
 
@@ -87,6 +97,13 @@ func run() int {
 	// goroutine dump prints once on startup and reconciler errors
 	// disappear).
 	ctrl.SetLogger(logr.FromSlogHandler(logger.Handler()))
+
+	err := streamTLS.Validate()
+	if err != nil {
+		logger.Error("invalid snapshot stream TLS flags", "err", err)
+
+		return 1
+	}
 
 	if nodeName == "" {
 		logger.Error("node-name is required (pass --node-name or set NODE_NAME)")
@@ -210,8 +227,9 @@ func run() int {
 		LocalAddress:           localAddress,
 		Logger:                 logger,
 		RESTConfig:             restCfg,
-		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace),
+		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace, streamTLS),
 		HealthProbeBindAddress: probeAddr,
+		StreamTLS:              streamTLS,
 		OnCacheSynced: func() {
 			logger.Info("satellite cache sync complete, marking ready")
 			ready.MarkReady()
@@ -257,7 +275,10 @@ func loadRESTConfig() (*rest.Config, error) {
 // The factory shape lets the agent stay ignorant of the readyState
 // + logger plumbing — it only sees the standard
 // satellite.ManagerFactory signature.
-func mgrFactory(ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier, controllerNamespace string) satellite.ManagerFactory {
+func mgrFactory(
+	ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier,
+	controllerNamespace string, streamTLS stream.TLSFiles,
+) satellite.ManagerFactory {
 	return func(restCfg *rest.Config, nodeName, probeAddr string, rec *satellite.Reconciler) (manager.Manager, error) {
 		mgr, err := controllers.NewManager(restCfg, &controllers.Config{
 			NodeName:               nodeName,
@@ -273,6 +294,7 @@ func mgrFactory(ready *readyState, logger *slog.Logger, ueventListener controlle
 			// PhysicalDeviceDiscoveryRunnable falls back to pure-
 			// polling discovery.
 			UeventListener: ueventListener,
+			StreamTLS:      streamTLS,
 		})
 		if err != nil {
 			return nil, err //nolint:wrapcheck // controllers.NewManager already wraps
