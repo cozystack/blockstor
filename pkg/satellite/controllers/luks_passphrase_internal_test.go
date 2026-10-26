@@ -164,6 +164,52 @@ func TestBug023SecretReplacesEveryPassphraseProp(t *testing.T) {
 	}
 }
 
+// TestBug023PropAloneYieldsNoPassphrase: with no Secret, a passphrase
+// in a property, under any key or spelling, does not become one. It
+// is dropped from the bag, so BuildDesired stamps no wire key and the
+// LUKS layer fails the apply with its actionable missing-key message
+// instead of formatting or opening a volume with a plaintext key. A
+// definition without LUKS gets the property dropped too, so the value
+// never rides along in the wire props.
+func TestBug023PropAloneYieldsNoPassphrase(t *testing.T) {
+	t.Parallel()
+
+	r := newPassphraseTestReconciler(t)
+
+	plainRD := luksRD()
+	plainRD.Spec.LayerStack = []string{"DRBD", "STORAGE"}
+
+	for _, rd := range []*blockstoriov1alpha1.ResourceDefinition{luksRD(), plainRD} {
+		for _, key := range []string{
+			passphrase.PropKeyCanonical, passphrase.PropKeyLegacy, passphrase.WirePropKey,
+			"drbdoptions/ENCRYPTPASSPHRASE",
+		} {
+			effectiveProps := map[string]string{key: "prop-value", "Aux/keep": "yes"}
+
+			r.injectLUKSMasterPassphrase(t.Context(), rd, effectiveProps)
+
+			if len(effectiveProps) != 1 || effectiveProps["Aux/keep"] != "yes" {
+				t.Errorf("stack %v, prop %q: props after injection = %v, want only Aux/keep",
+					rd.Spec.LayerStack, key, effectiveProps)
+			}
+
+			target := &blockstoriov1alpha1.Resource{
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rd.Name,
+					NodeName:               "node-a",
+					StoragePool:            "pool-a",
+				},
+			}
+
+			desired := dispatcher.BuildDesired(target, nil, nil, nil, rd, effectiveProps)
+			if pass, ok := desired.Props[passphrase.WirePropKey]; ok {
+				t.Errorf("stack %v, prop %q: wire key stamped with %q from a property",
+					rd.Spec.LayerStack, key, pass)
+			}
+		}
+	}
+}
+
 // TestBug023InjectionSkipsNonLUKS: non-LUKS RDs must not trigger a
 // Secret round-trip nor carry the passphrase.
 func TestBug023InjectionSkipsNonLUKS(t *testing.T) {
