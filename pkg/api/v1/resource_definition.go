@@ -23,7 +23,7 @@ package v1
 //
 // Phase 10.4: `Annotations` carries the K8s-native metadata.annotations
 // of the underlying CRD. Used by the REST KV-store rewrite to surface
-// `blockstor.io/csi-volume-data` (linstor-csi per-PVC JSON metadata)
+// `blockstor.org/csi-volume-data` (linstor-csi per-PVC JSON metadata)
 // without going through the deprecated KVEntry CRD. Not part of
 // upstream LINSTOR's wire shape — golinstor ignores unknown JSON
 // fields, so the new key flows through transparently.
@@ -224,9 +224,9 @@ type ResourceDefinitionCreate struct {
 	// bypasses the LUKS-prereq gate.
 	LayerList []string `json:"layer_list,omitempty"`
 
-	// OverrideProps mirrors GenericPropsModify — golinstor stuffs RG
-	// spawn defaults into this when creating an RD via spawn, so the
-	// REST handler must accept it even if we don't yet diff the values.
+	// The props-modify fields are declared so the decoder can name them;
+	// a non-empty one is refused, since a create has no props to modify.
+	// Props for a new definition go in resource_definition.props.
 	OverrideProps   map[string]string `json:"override_props,omitempty"`
 	DeleteProps     []string          `json:"delete_props,omitempty"`
 	DeleteNamespace []string          `json:"delete_namespaces,omitempty"`

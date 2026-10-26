@@ -161,7 +161,7 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
 	// from every snapshot. The reconcilers stamp the same
-	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` keys on
+	// `blockstor.org/*` + `bug<N>.blockstor.org/*` keys on
 	// Snapshot CRDs as on Resource / RD / RG; the wire shape must not
 	// carry them.
 	stripInternalAnnotationsFromSnapshots(snaps)
@@ -396,9 +396,13 @@ const legacySnapshotFlagFailed = "FAILED"
 
 // isTerminalSnapshotFlag reports whether a flag value already pins the
 // snapshot to a non-Incomplete State that outranks `SUCCESSFUL`.
-// Mirrors the python CLI's elif-chain order in snapshot_cmds.show.
+// Mirrors the python CLI's elif-chain order in snapshot_cmds.show, where
+// DELETE comes first: a snapshot whose delete is in flight is Deleting, and
+// stamping SUCCESSFUL beside it hands a client that reads the flags in any
+// other order a snapshot being destroyed as a usable one.
 func isTerminalSnapshotFlag(flag string) bool {
-	return flag == apiv1.SnapshotFlagFailedDeployment ||
+	return flag == apiv1.SnapshotFlagDelete ||
+		flag == apiv1.SnapshotFlagFailedDeployment ||
 		flag == apiv1.SnapshotFlagFailedDisconnect ||
 		flag == apiv1.SnapshotFlagSuccessful ||
 		flag == legacySnapshotFlagFailed
@@ -571,7 +575,7 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict,
 			"resource definition '"+rd+"' is being deleted "+
 				"(DELETE flag set): retry against a different RD or "+
-				"wait for the tear-down to complete (Bug 180)")
+				"wait for the tear-down to complete")
 
 		return
 	}
@@ -790,7 +794,7 @@ func (s *Server) refuseSnapshotCreateOnRDDeletedRace(w http.ResponseWriter, r *h
 
 		writeError(w, http.StatusConflict,
 			"resource definition '"+snap.ResourceName+"' "+reason+
-				" concurrently with the snapshot create (Bug 180): "+
+				" concurrently with the snapshot create: "+
 				"retry after re-creating the resource definition, or "+
 				"pick a different RD")
 
@@ -1041,7 +1045,7 @@ func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.
 			"can take copy-on-write snapshots",
 		Correc: "place the resource on a thin-provisioned snapshot-capable " +
 			"pool (LVM_THIN / ZFS_THIN / FILE_THIN); `linstor rd clone` also " +
-			"relies on snapshots (Bug-020) so it is no workaround on a thick pool",
+			"relies on snapshots, so it is no workaround on a thick pool",
 	}})
 
 	return false
@@ -1197,6 +1201,32 @@ func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, erro
 	return out, nil
 }
 
+// refuseSnapshotDeleteUnderRestore runs store.ReleaseRestoreSource before a
+// snapshot delete: a definition restored from the snapshot reads from it
+// until its restore is done. True means the answer has been written.
+func (s *Server) refuseSnapshotDeleteUnderRestore(w http.ResponseWriter, r *http.Request, rd, snapName string) bool {
+	err := store.ReleaseRestoreSource(r.Context(), s.Store, rd, snapName)
+	if errors.Is(err, store.ErrRestoreSourceInUse) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "snapshot '" + snapName + "' of '" + rd + "' cannot be deleted yet: " + err.Error(),
+			Cause:   "a restore from this snapshot has not brought up a replica with every volume UpToDate",
+			Correc:  "retry the delete once that restore has finished",
+			ObjRefs: map[string]string{objRefRscDfn: rd, objRefSnapshotDfn: snapName},
+		}})
+
+		return true
+	}
+
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	return false
+}
+
 // handleSnapshotDelete answers `DELETE /v1/resource-definitions/{rd}/snapshots/{snap}`
 // with an idempotent 200 + ApiCallRc envelope. CSI spec §DeleteSnapshot
 // mandates idempotence: the driver retries until it sees success, so
@@ -1233,6 +1263,10 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")
 
+	if s.refuseSnapshotDeleteUnderRestore(w, r, rd, snapName) {
+		return
+	}
+
 	err := s.Store.Snapshots().Delete(r.Context(), rd, snapName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1265,7 +1299,7 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 			Message: "snapshot delete acked but satellite finalizer " +
 				"not removed within timeout: " + snapName,
 			Cause: "the satellite-side finalizer " +
-				"(blockstor.cozystack.io/satellite-snapshot) did " +
+				"(blockstor.org/satellite-snapshot) did " +
 				"not drain within the wait budget; the snapshot may " +
 				"still be present on disk and the Snapshot CRD will " +
 				"remain visible until the satellite reconciler runs",

@@ -57,7 +57,7 @@
 #     5. No orphan CRDs / kernel slots / .res files after delete_rd.
 #
 # Underlying fix chain (kept for cross-reference):
-#   - Bug 67 / 263: REST bumps `blockstor.io/peer-changed` annotation
+#   - Bug 67 / 263: REST bumps `blockstor.org/peer-changed` annotation
 #     on every survivor after r d AND r c so the satellite watch fires
 #     even though kube-apiserver dedupes resourceVersion bumps.
 #   - Bug 284: seedPerPeerGi stamps the LOCAL node-id slot too, not
@@ -191,7 +191,7 @@ ok_recreate=false
 last_flags=""
 last_disk=""
 while (( $(date +%s) < deadline )); do
-    last_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N_REC}" \
+    last_flags=$(kubectl get "resources.blockstor.org/${RD}.${N_REC}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     last_disk=$(status_disk_state "$RD" "$N_REC" 0)
     if [[ "$last_flags" != *"DISKLESS"* ]] && [[ "$last_disk" == "UpToDate" ]]; then

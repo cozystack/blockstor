@@ -174,7 +174,7 @@ echo ">> apply 3-replica RD $RD (${SIZE_KIB} KiB) on $N1 + $N2 + $N3"
 # so a DISKLESS witness would only pollute the peer list and
 # the satellite-log "adjust" search later.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -185,7 +185,7 @@ spec:
 EOF
 for n in "$N1" "$N2" "$N3"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:

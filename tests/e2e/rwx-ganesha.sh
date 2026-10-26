@@ -113,16 +113,16 @@ dump_diag() {
     # found in \$PATH". The blockstor CRDs carry the same RD/Resource
     # state without needing any in-pod binary or a port-forward.
     echo "----- diag ($label): blockstor RD + Resource CRDs -----" >&2
-    kubectl get resourcedefinitions.blockstor.cozystack.io 2>&1 >&2 || true
+    kubectl get resourcedefinitions.blockstor.org 2>&1 >&2 || true
     if [[ -n "${PV:-}" ]]; then
-        kubectl get "resourcedefinitions.blockstor.cozystack.io/$PV" \
+        kubectl get "resourcedefinitions.blockstor.org/$PV" \
             -o yaml 2>&1 >&2 || true
-        for res in $(kubectl get resources.blockstor.cozystack.io \
+        for res in $(kubectl get resources.blockstor.org \
                 -o name 2>/dev/null | grep -F "$PV" || true); do
             kubectl get "$res" -o yaml 2>&1 >&2 || true
         done
     else
-        kubectl get resources.blockstor.cozystack.io 2>&1 >&2 || true
+        kubectl get resources.blockstor.org 2>&1 >&2 || true
     fi
 }
 
@@ -193,9 +193,9 @@ deadline=$(( $(date +%s) + 60 ))
 rd_seen=""
 diskful=0
 while (( $(date +%s) < deadline )); do
-    if kubectl get "resourcedefinitions.blockstor.cozystack.io/$PV" >/dev/null 2>&1; then
+    if kubectl get "resourcedefinitions.blockstor.org/$PV" >/dev/null 2>&1; then
         rd_seen=yes
-        diskful=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+        diskful=$(kubectl get resources.blockstor.org --no-headers 2>/dev/null \
             | awk -v pv="$PV" '$1 ~ "^"pv"\\." {print $1}' | wc -l | tr -d ' ')
         if (( diskful >= 2 )); then
             break
@@ -205,12 +205,12 @@ while (( $(date +%s) < deadline )); do
 done
 if [[ "$rd_seen" != "yes" ]]; then
     echo "FAIL: blockstor never created RD/$PV after PVC bound" >&2
-    kubectl get resourcedefinitions.blockstor.cozystack.io 2>&1 >&2 | tail -20 || true
+    kubectl get resourcedefinitions.blockstor.org 2>&1 >&2 | tail -20 || true
     exit 1
 fi
 if (( diskful < 2 )); then
     echo "FAIL: expected >=2 Resources for RD=$PV, got $diskful" >&2
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>&1 >&2 \
+    kubectl get resources.blockstor.org --no-headers 2>&1 >&2 \
         | awk -v pv="$PV" '$1 ~ "^"pv"\\." {print}' >&2 || true
     exit 1
 fi

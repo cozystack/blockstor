@@ -657,6 +657,24 @@ const (
 	drbdQuorumYes = "yes"
 )
 
+// newObserverRunnableFromConfig builds the observer the manager runs, so the
+// wiring from cfg (the GI record above all, which nothing else would notice
+// missing) lives where a unit test can drive it. Production caller:
+// manager.go addBackgroundRunnables.
+func newObserverRunnableFromConfig(cli client.Client, cfg *Config) *ObserverRunnable {
+	return &ObserverRunnable{
+		Client:   cli,
+		Exec:     cfg.Exec,
+		NodeName: cfg.NodeName,
+		RecordGI: cfg.Apply.RecordObservedGI,
+		// Phase 11.7: producer end of the observer-trigger channel.
+		// Fires on kernel-state changes (resource lifecycle, role,
+		// disk, conn, repl) so the ResourceReconciler wakes even
+		// when no apiserver write bumps Generation.
+		ReconcileTrigger: cfg.ReconcileTrigger,
+	}
+}
+
 // ObserverRunnable tails `drbdsetup events2` and writes the parsed
 // observations onto matching Resource CRDs' Status subresource
 // via SSA. Phase 10.6: replaces the retired gRPC
@@ -676,6 +694,11 @@ type ObserverRunnable struct {
 	// onto Resource.Status as the host signal the controller
 	// uses to route observations to the right CRD.
 	NodeName string
+
+	// RecordGI keeps the GI of every data-bearing volume it is called
+	// with in the satellite's own record, which outlives the status
+	// field (satellite.Reconciler.RecordObservedGI). Nil records nothing.
+	RecordGI func(rdName string, vol int32, gi string)
 
 	// connCache holds the latest observed per-peer connection state
 	// keyed by `<resource>/<peer>`. We apply the full snapshot per
@@ -1146,20 +1169,20 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 	for i := range ev.Volumes {
 		vol := &ev.Volumes[i]
 
-		if vol.CurrentUUID != "" || vol.BackingDev == "" {
-			continue
-		}
-
 		if !isDataBearingDiskState(drbd.DiskState(vol.DiskState)) {
 			continue
 		}
 
-		current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
-		if err != nil || current == "" {
-			continue
+		if vol.CurrentUUID == "" && vol.BackingDev != "" {
+			current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
+			if err == nil {
+				vol.CurrentUUID = current
+			}
 		}
 
-		vol.CurrentUUID = current
+		if vol.CurrentUUID != "" && o.RecordGI != nil {
+			o.RecordGI(ev.ResourceName, vol.VolumeNumber, vol.CurrentUUID)
+		}
 	}
 }
 
@@ -1475,7 +1498,7 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 // re-emit.
 //
 // The reconciler stamps the live RD volume set onto the Resource CRD's
-// `blockstor.io/volume-numbers` annotation on every successful apply
+// `blockstor.org/volume-numbers` annotation on every successful apply
 // pass, so it is the authoritative desired set for both diskful and
 // diskless replicas. Prune the cache against it: drop every cached
 // volume whose number is absent from the annotation.
@@ -1763,7 +1786,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		// evicted by the event path and the observer re-emits a
 		// phantom Status.Volumes[n] on every tick (a permanent flap).
 		// The reconciler stamps the authoritative live volume set on
-		// `blockstor.io/volume-numbers`; prune the cache against it so
+		// `blockstor.org/volume-numbers`; prune the cache against it so
 		// the diskless replica's Status.Volumes converges to exactly
 		// the surviving set without waiting for a destroy event that
 		// never comes. Idempotent: rebuilds ev.Volumes only when the

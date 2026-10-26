@@ -9,10 +9,10 @@
 #
 # Setup:
 #   - 1-replica RD on worker-1 with LayerStack=["LUKS","STORAGE"]
-#   - DrbdOptions/Encryption/passphrase set on the RD
+#   - the cluster passphrase Secret (ensure_passphrase_secret)
 #   - write urandom + capture md5
 # Steps:
-#   1. apply RD with explicit layerStack + passphrase prop
+#   1. ensure the passphrase Secret, apply RD with explicit layerStack
 #   2. apply Resource on N1
 #   3. wait for satellite to: provision LV → luksFormat → luksOpen
 #   4. write 4 MiB pattern, read back — md5 must match
@@ -44,21 +44,21 @@ STORPOOL=${STORPOOL:-stand}
 
 trap 'delete_rd "$RD"' EXIT
 
+ensure_passphrase_secret "$PASSPHRASE"
+
 echo ">> apply ${RD} with LayerStack=[LUKS,STORAGE]"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
   layerStack: ["LUKS", "STORAGE"]
-  props:
-    DrbdOptions/Encryption/passphrase: "${PASSPHRASE}"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_KIB}}
 EOF
 
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:

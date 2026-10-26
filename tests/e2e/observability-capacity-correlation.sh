@@ -211,7 +211,7 @@ spawn_fill_rd() {
     SPAWNED_RDS+=("$rd")
 
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${rd}}
 spec:
@@ -219,7 +219,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${size_kib}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${rd}.${FILL_NODE}}
 spec:

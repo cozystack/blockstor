@@ -417,7 +417,7 @@ except: print(0)")
             local rd min count
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
             min=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('min',2))" "$spec")
-            count=$(kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
+            count=$(kubectl get resources.blockstor.org -o json 2>/dev/null \
                 | python3 -c "import json,sys
 d=json.load(sys.stdin)
 rd='$rd'
@@ -442,7 +442,7 @@ print(n)")
         all_uptodate)
             local rd bad
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            bad=$(kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
+            bad=$(kubectl get resources.blockstor.org -o json 2>/dev/null \
                 | python3 -c "import json,sys
 d=json.load(sys.stdin)
 rd='$rd'
@@ -630,6 +630,38 @@ try:
     print('')
 except Exception:
     print('')" "$vol" 2>/dev/null || echo "")
+            [[ "$actual" == "$expected" ]]
+            ;;
+        rd_layer_stack)
+            # The layer stack the RD's CRD carries (spec.layerStack), as an
+            # upper-cased comma list, equals `expected`. "" means no stack:
+            # one the controller has yet to decide. Pair with hold_s to prove
+            # a decided stack is not rewritten (a group change over data).
+            local rd expected actual
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected','').upper())" "$spec")
+            actual=$(kubectl get resourcedefinition "$rd" -o json 2>/dev/null \
+                | python3 -c "import json,sys
+try:
+    print(','.join(json.load(sys.stdin).get('spec', {}).get('layerStack') or []).upper())
+except Exception:
+    print('<unreadable>')" 2>/dev/null || echo "<unreadable>")
+            [[ "$actual" == "$expected" ]]
+            ;;
+        rd_annotation)
+            # An annotation on the RD's CRD equals `expected`; "" means the
+            # key is absent. The CLI shows no annotations, so this reads the
+            # CRD (blockstor.org/unapplied-group-layer-stack and the like).
+            local rd key expected actual
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            key=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('key',''))" "$spec")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")
+            actual=$(kubectl get resourcedefinition "$rd" -o json 2>/dev/null \
+                | python3 -c "import json,sys
+try:
+    print((json.load(sys.stdin).get('metadata', {}).get('annotations') or {}).get(sys.argv[1], ''))
+except Exception:
+    print('<unreadable>')" "$key" 2>/dev/null || echo "<unreadable>")
             [[ "$actual" == "$expected" ]]
             ;;
         vd_count)
@@ -875,7 +907,7 @@ except Exception:
 # revision per GET, which climbs on every unrelated write.
 volumes_settled_snapshot() {
     local rd=$1 expected=$2
-    kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
+    kubectl get resources.blockstor.org -o json 2>/dev/null \
         | EXPECTED="$expected" RD="$rd" python3 -c "import json,sys,os
 d=json.load(sys.stdin)
 rd=os.environ['RD']
@@ -1028,7 +1060,7 @@ print(json.dumps(s) if s else '')" "$step")
 
 # wait_settle <rd> [timeout_s]
 #
-# Polls `kubectl get resources.blockstor.cozystack.io -o json` filtered by
+# Polls `kubectl get resources.blockstor.org -o json` filtered by
 # spec.resourceDefinitionName == rd. Considers the cluster "settled" once two
 # consecutive snapshots return identical {diskState, inUse, connections}
 # tuples across all replicas.
@@ -1046,7 +1078,7 @@ wait_settle() {
 
     while (( $(date +%s) < deadline )); do
         local cur
-        cur=$(kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
+        cur=$(kubectl get resources.blockstor.org -o json 2>/dev/null \
             | python3 -c "import json,sys
 d=json.load(sys.stdin)
 rd='$rd'
@@ -1096,14 +1128,14 @@ assert_no_orphans() {
     local deadline=$(( $(date +%s) + settle_s ))
     local leftover
     while :; do
-        leftover=$(kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null \
+        leftover=$(kubectl get resources.blockstor.org -o name 2>/dev/null \
             | grep -c "$prefix" || true)
         [[ "$leftover" -eq 0 ]] && return 0
         (( $(date +%s) >= deadline )) && break
         sleep 2
     done
     echo "  INVARIANT FAIL: $leftover Resource CRD(s) for $prefix still present after ${settle_s}s" >&2
-    kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null | grep "$prefix" >&2 || true
+    kubectl get resources.blockstor.org -o name 2>/dev/null | grep "$prefix" >&2 || true
     return 1
 }
 

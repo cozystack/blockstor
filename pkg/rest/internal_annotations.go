@@ -27,30 +27,30 @@ import (
 // internalAnnotationPrefix is the canonical blockstor controller
 // namespace for annotations the reconcilers stamp onto Resource /
 // ResourceDefinition / ResourceGroup / Snapshot CRDs for their own
-// bookkeeping (e.g. `blockstor.io/volume-numbers`,
-// `blockstor.io/peer-changed`). The reconciler MUST keep reading
+// bookkeeping (e.g. `blockstor.org/volume-numbers`,
+// `blockstor.org/peer-changed`). The reconciler MUST keep reading
 // these from the in-process struct, so the struct field stays — only
 // the wire boundary strips them.
-const internalAnnotationPrefix = "blockstor.io/"
+const internalAnnotationPrefix = "blockstor.org/"
 
 // internalAnnotationSuffix matches the per-bug controller scratch
-// namespace pattern `bug<NNN>.blockstor.cozystack.io/<key>`. The
+// namespace pattern `bug<NNN>.blockstor.org/<key>`. The
 // reconciler uses this scheme to scope bug-specific state to a single
 // Reconcile loop without polluting the top-level
-// `blockstor.io/` namespace. Bug-hunt v0.1.3 Finding 2: this pattern
-// (e.g. `bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-0`)
+// `blockstor.org/` namespace. Bug-hunt v0.1.3 Finding 2: this pattern
+// (e.g. `bug136.blockstor.org/resize-pending-size-kib-vol-0`)
 // was leaking onto the wire alongside the canonical prefix; the
 // suffix check covers every existing and future `bug<N>` namespace
 // without enumerating each prefix individually.
-const internalAnnotationSuffix = ".blockstor.cozystack.io/"
+const internalAnnotationSuffix = ".blockstor.org/"
 
 // isInternalAnnotationKey returns true when `key` belongs to a
 // blockstor-controller-private annotation namespace and must NOT
 // leak onto the REST wire. The two patterns covered (see the
 // per-const docs above) are:
 //
-//   - prefix `blockstor.io/`                — canonical controller namespace
-//   - any prefix ending in `.blockstor.cozystack.io/` — per-bug scratch
+//   - prefix `blockstor.org/`                — canonical controller namespace
+//   - any prefix ending in `.blockstor.org/` — per-bug scratch
 //
 // Anything else (e.g. operator-set `kubectl.kubernetes.io/last-applied-
 // configuration`, third-party tooling annotations) is passed through

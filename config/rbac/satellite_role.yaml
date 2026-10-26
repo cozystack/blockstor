@@ -21,7 +21,7 @@ metadata:
   name: satellite-role
 rules:
 - apiGroups:
-  - blockstor.cozystack.io
+  - blockstor.org
   resources:
   - resourcegroups
   - resourcedefinitions
@@ -33,7 +33,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - blockstor.cozystack.io
+  - blockstor.org
   resources:
   - resources
   verbs:
@@ -43,13 +43,13 @@ rules:
   - update
   - patch
 - apiGroups:
-  - blockstor.cozystack.io
+  - blockstor.org
   resources:
   - resources/finalizers
   verbs:
   - update
 - apiGroups:
-  - blockstor.cozystack.io
+  - blockstor.org
   resources:
   - resources/status
   - storagepools/status
@@ -61,7 +61,7 @@ rules:
   - update
   - patch
 - apiGroups:
-  - blockstor.cozystack.io
+  - blockstor.org
   resources:
   - storagepools
   verbs:
@@ -71,7 +71,7 @@ rules:
   - update
   - patch
 - apiGroups:
-  - blockstor.cozystack.io
+  - blockstor.org
   resources:
   - physicaldevices
   verbs:
@@ -98,6 +98,15 @@ rules:
 # describe` to debug a stuck reconcile.
 - apiGroups:
   - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+# The same events through events.k8s.io, which the manager's recorder
+# writes (the LUKS format refused over data, see resource.go).
+- apiGroups:
+  - events.k8s.io
   resources:
   - events
   verbs:

@@ -35,7 +35,7 @@ trap 'delete_rd "$RD"' EXIT
 
 echo ">> apply RD with allow-two-primaries"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -49,7 +49,7 @@ spec:
 EOF
 for n in "$N1" "$N2"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:

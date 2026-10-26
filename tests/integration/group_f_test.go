@@ -909,7 +909,7 @@ func assertExactlyOneAutoPrimary(t *testing.T, stack *harness.Stack, rd string, 
 // stripResourceFinalizers removes all finalizers from every child
 // Resource of rd so envtest can complete deletion without the
 // satellite-side finalizer running. The production code path stamps
-// `blockstor.io/satellite-resource`; in-process tests don't run that
+// `blockstor.org/satellite-resource`; in-process tests don't run that
 // reconciler, so a literal CRD delete would block on the finalizer
 // forever.
 func stripResourceFinalizers(t *testing.T, stack *harness.Stack, rd string) {

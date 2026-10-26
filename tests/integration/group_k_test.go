@@ -644,7 +644,7 @@ func TestGroupKWFSpawnAndDependentReAutoplace(t *testing.T) {
 	waitForDiskfulReplicaCount(t, stack, "wf-realloc", 2)
 
 	// Raise PlaceCount to 3 on the parent RG. The REST handler
-	// stamps blockstor.io/rebalance-pending on the RG; the
+	// stamps blockstor.org/rebalance-pending on the RG; the
 	// RGRebalanceReconciler picks it up and runs the additive placer.
 	cli.Run(t, "resource-group", "modify", rgName, "--place-count", "3")
 
@@ -665,7 +665,7 @@ func TestGroupKWFSpawnAndDependentReAutoplace(t *testing.T) {
 			return false
 		}
 
-		_, has := rg.Annotations["blockstor.io/rebalance-pending"]
+		_, has := rg.Annotations["blockstor.org/rebalance-pending"]
 
 		return !has
 	}, "rebalance-pending annotation not stripped after rebalance pass")

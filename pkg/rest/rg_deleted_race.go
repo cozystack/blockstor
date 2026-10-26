@@ -267,7 +267,7 @@ func (s *Server) enterDestructiveRollback(ctx context.Context, rdName string) (b
 				return errRollbackMarkNotOurs
 			}
 
-			rd.Props[rollbackAbandonedKey] = rollbackStepNames[rollbackStepReapReplicas]
+			rd.Props = store.MarkRollback(rd.Props, rollbackStepNames[rollbackStepReapReplicas], time.Now())
 
 			return nil
 		})
@@ -465,7 +465,7 @@ func (s *Server) patchRollbackMarkAway(ctx context.Context, rdName string) error
 	return s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(markCtx, rdName, //nolint:wrapcheck // logged by the caller
 		func(rd *apiv1.ResourceDefinition) error {
 			if rd.Props[rollbackAbandonedKey] == rollbackInProgress {
-				delete(rd.Props, rollbackAbandonedKey)
+				store.UnmarkRollback(rd.Props)
 			}
 
 			return nil
@@ -514,11 +514,7 @@ func (s *Server) markRollbackAbandoned(ctx context.Context, rdName, step string)
 	go func() {
 		done <- s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(markCtx, rdName,
 			func(rd *apiv1.ResourceDefinition) error {
-				if rd.Props == nil {
-					rd.Props = map[string]string{}
-				}
-
-				rd.Props[rollbackAbandonedKey] = step
+				rd.Props = store.MarkRollback(rd.Props, step, time.Now())
 
 				return nil
 			})

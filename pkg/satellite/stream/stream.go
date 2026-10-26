@@ -30,9 +30,11 @@ limitations under the License.
 //	→ 404 when this satellite doesn't host the snapshot
 //	→ 501 when the resolved provider has no SnapshotShipper capability
 //
-// Security: cluster-internal traffic only. The daemonset binds to
-// hostPort outside the DRBD range; production deployments should
-// front this with a NetworkPolicy or mTLS. No auth on the wire yet.
+// Security: the stream carries raw volume data, so it runs over mutual
+// TLS only (see TLSFiles). Each satellite presents a certificate for
+// ServerName signed by the cluster's CA, and each side verifies the other.
+// A satellite with no stream TLS configured serves nothing and fetches
+// nothing; a clone or restore then falls back to a DRBD resync.
 package stream
 
 // Port is the satellite-to-satellite stream port. The DaemonSet binds it

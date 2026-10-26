@@ -121,7 +121,7 @@ fi
 rm -f "$err_file"
 
 # No orphan snapshot CRD may survive the rejected create.
-if kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
+if kubectl get snapshots.blockstor.org -o json 2>/dev/null \
         | jq -e --arg rd "$RD" --arg s "$SNAP" \
             '[.items[]? | select(.spec.resourceDefinitionName==$rd) | select(.spec.snapshotName==$s)] | length > 0' \
         >/dev/null 2>&1; then

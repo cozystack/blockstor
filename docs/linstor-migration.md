@@ -6,11 +6,11 @@
 
 ## What the converter does and does not migrate
 
-Migrated: nodes, storage pools, resource groups, resource definitions (+ volume definitions), resources (replicas), and SUCCESSFUL snapshots. Controller-wide `DrbdOptions/*` become a `ControllerConfig`. DRBD minors, per-replica node-ids, the shared-secret and (when captured) TCP ports are preserved verbatim. An RD is stamped `Initialized=true` whenever its data still exists somewhere, and every replica gets `skipInitialSync=false`, so any replica added **after** migration performs a real sync instead of falsely coming up UpToDate. The latch is conditional, and it errs towards staying on: it is dropped only where no data-bearing replica is being adopted. That covers two shapes — every replica already DELETE-flagged, so nothing is migrating at all, and every replica diskless, so replicas are migrating but a client or quorum witness carries no copy to latch on. A definition whose replicas were held back because their nodes did not migrate keeps the latch, because that data is still on those nodes; so does one whose replicas were skipped for pool divergence. Unlatching in either of those would let the controller seed an empty first sync over data that exists. The report on stderr names every definition in these states, and names each reason that applies rather than only the first, so do not clear a latch by hand on the strength of a definition arriving without replicas. Snapshots are stamped `blockstor.io/adopted` so the controller records them as complete without re-taking them.
+Migrated: nodes, storage pools, resource groups, resource definitions (+ volume definitions), resources (replicas), and SUCCESSFUL snapshots. Controller-wide `DrbdOptions/*` become a `ControllerConfig`. DRBD minors, per-replica node-ids, the shared-secret and (when captured) TCP ports are preserved verbatim. An RD is stamped `Initialized=true` whenever its data still exists somewhere, and every replica gets `skipInitialSync=false`, so any replica added **after** migration performs a real sync instead of falsely coming up UpToDate. The latch is conditional, and it errs towards staying on: it is dropped only where no data-bearing replica is being adopted. That covers two shapes — every replica already DELETE-flagged, so nothing is migrating at all, and every replica diskless, so replicas are migrating but a client or quorum witness carries no copy to latch on. A definition whose replicas were held back because their nodes did not migrate keeps the latch, because that data is still on those nodes; so does one whose replicas were skipped for pool divergence. Unlatching in either of those would let the controller seed an empty first sync over data that exists. The report on stderr names every definition in these states, and names each reason that applies rather than only the first, so do not clear a latch by hand on the strength of a definition arriving without replicas. Snapshots are stamped `blockstor.org/adopted` so the controller records them as complete without re-taking them.
 
 **NOT migrated — read the report on stderr for the exact list per cluster:**
 
-- **LUKS passphrases.** LUKS-encrypted volumes convert with their layer stack intact, but the per-volume passphrase (encrypted with the LINSTOR master key) is not decrypted. You must provision `spec.encryption` for those RDs by hand before the encrypted volumes can be opened. Each affected RD is reported.
+- **LUKS passphrases.** LUKS-encrypted volumes convert with their layer stack intact (an RD whose `layer_stack` column is empty takes the stack its replicas were built with, read from `LAYER_RESOURCE_IDS`), but the per-volume key (encrypted with the LINSTOR master key) is not decrypted. blockstor opens every LUKS volume with the cluster passphrase kept in its Secret, so add that passphrase to each such volume as a key slot (`cryptsetup luksAddKey`) before adopting it. Each affected RD is reported.
 - **Backup-shipping remotes**, unknown/runtime flag bits, and DELETE'd / FAILED_DEPLOYMENT rows are skipped and reported. None affect live data availability.
 - **DRBD TCP ports** are absent from most LINSTOR 1.33 dumps — see "Capture live DRBD ports" below.
 
@@ -73,7 +73,7 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifests.yaml
 ```
 
-Read the report on stderr end to end. Every `warning:` line is a thing the converter refused to guess — decide per line whether it matters for your data before continuing. In particular resolve every `LUKS passphrase NOT migrated` and every `no DRBD port` line (the latter should be empty if the port capture was complete).
+Read the report on stderr end to end. Every `warning:` line is a thing the converter refused to guess — decide per line whether it matters for your data before continuing. In particular resolve every `LUKS key NOT migrated` and every `no DRBD port` line (the latter should be empty if the port capture was complete).
 
 ## Cutover
 
@@ -103,7 +103,7 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 - Spot-check ≥5 RDs: size, per-volume `/dev/drbd<minor>`, per-replica node-id and port match the pre-migration values. A changed minor or node-id is a stop-the-line defect.
 - Every diskful replica is `UpToDate`; no replica is unexpectedly `SyncTarget`.
 - Adopted snapshots list as present without any suspend-io having fired on the parent RDs (check the satellites did not log `suspend-io`).
-- For LUKS RDs: their volumes stay closed until you provision `spec.encryption`; confirm consumers of those volumes are quiesced until then.
+- For LUKS RDs: their volumes stay closed until the cluster passphrase is added to them as a key slot; confirm consumers of those volumes are quiesced until then.
 
 ## Rollback
 
@@ -113,7 +113,7 @@ Until CSI is repointed and confirmed, rollback is: scale blockstor to 0, scale `
 
 | Item | Impact | Mitigation |
 | --- | --- | --- |
-| LUKS passphrases not migrated | Encrypted volumes cannot be opened until `spec.encryption` is provisioned | Provision by hand; keep those consumers quiesced during migration |
+| LUKS keys not migrated | Encrypted volumes cannot be opened until the cluster passphrase is a key slot on them | Add it with `cryptsetup luksAddKey`; keep those consumers quiesced during migration |
 | DRBD port not in dump (LINSTOR 1.33) | Adoption reconnects the mesh on a new port if not captured | Capture with the pre-flight command and pass `-drbd-ports` |
 | Unknown flag bits dropped | Cosmetic runtime bookkeeping only | Reported; verified not to carry availability semantics |
 | Placement/data unchanged | The converter never moves data | Rebalance with blockstor after migration if desired |

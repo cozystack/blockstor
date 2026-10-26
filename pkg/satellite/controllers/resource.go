@@ -49,6 +49,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/luks"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -116,10 +117,10 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 // SatelliteResourceFinalizer is the per-satellite-instance
 // finalizer key the satellite reconciler stamps on every
 // Resource it owns. The controller-side reconciler uses a
-// distinct key (`blockstor.cozystack.io/resource`) so the
+// distinct key (`blockstor.org/resource`) so the
 // two paths coexist during the Phase 10.6 cutover without
 // stepping on each other.
-const SatelliteResourceFinalizer = "blockstor.cozystack.io/satellite-resource"
+const SatelliteResourceFinalizer = "blockstor.org/satellite-resource"
 
 // resourceKind is the apiserver Kind for the blockstor Resource
 // CRD. Defined once so SSA Patch payloads in this package share
@@ -476,6 +477,17 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// election relies on (Bug 80).
 	adoptAuthoritativeFlags(res, peers)
 
+	err = r.checkLayerStackPinned(ctx, &rd)
+	if errors.Is(err, errLayerStackNotPinned) {
+		logger.Info("waiting for the controller to pin the layer stack", "rd", rd.Name)
+
+		return ctrl.Result{RequeueAfter: layerStackPinRequeue}, nil
+	}
+
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// The DRBD-ID allocation gate only matters when the RD actually
 	// uses DRBD. A LayerStack=["STORAGE"] (or ["LUKS","STORAGE"]) RD
 	// renders no .res and the kernel never sees a node-id, so waiting
@@ -497,7 +509,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
-	anyFailed := r.recordPerResourceFailures(results, logger)
+	anyFailed := r.recordPerResourceFailures(res, results, logger)
 
 	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
@@ -579,19 +591,36 @@ func (r *ResourceReconciler) prepareDRBDApply(
 // recordPerResourceFailures logs each per-resource Apply failure and
 // returns whether any of the results came back not-Ok. Extracted from
 // runApply so the orchestration stays under the funlen budget.
-func (r *ResourceReconciler) recordPerResourceFailures(results []*intent.ResourceApplyResult, logger logr.Logger) bool {
+//
+// A LUKS layer that refused to format a device holding data also gets a
+// Warning Event on the Resource: the volume never comes up, and an Info
+// line in this log is not where an operator looks for why.
+func (r *ResourceReconciler) recordPerResourceFailures(
+	res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult, logger logr.Logger,
+) bool {
 	var anyFailed bool
 
-	for _, ar := range results {
-		if !ar.GetOk() {
-			anyFailed = true
+	for _, result := range results {
+		if result.GetOk() {
+			continue
+		}
 
-			logger.Info("Apply per-resource failure", "name", ar.GetName(), "message", ar.GetMessage())
+		anyFailed = true
+
+		logger.Info("Apply per-resource failure", "name", result.GetName(), "message", result.GetMessage())
+
+		if r.Config.Recorder != nil && strings.Contains(result.GetMessage(), luks.ErrDeviceHoldsData.Error()) {
+			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, deviceHoldsDataReason, "Apply",
+				"the LUKS layer refused to format a device that already holds data: %s", result.GetMessage())
 		}
 	}
 
 	return anyFailed
 }
+
+// deviceHoldsDataReason is the Event reason for a LUKS format refused over
+// a device that carries a signature.
+const deviceHoldsDataReason = "LUKSDeviceHoldsData"
 
 // stampPostApply runs the four best-effort post-apply stamps:
 // Status.Volumes (per-volume DevicePath), the stale-Status.Volumes
@@ -917,7 +946,7 @@ func buildVolumeStatusPurgePatch(stale []staleVolumeStatus) ([]byte, error) {
 
 // stampVolumeNumbersAnnotation writes the parent RD's volume-number
 // set onto the Resource's metadata.annotations under
-// `blockstor.io/volume-numbers`. The value is a comma-separated list
+// `blockstor.org/volume-numbers`. The value is a comma-separated list
 // of int32 (e.g. "0,1,2"). This is the Bug-107 fallback record:
 // when `linstor rd delete <X>` cascade-deletes the parent RD CRD via
 // owner refs, the satellite's `handleDelete` runs AFTER the RD is
@@ -958,7 +987,7 @@ func (r *ResourceReconciler) stampVolumeNumbersAnnotation(ctx context.Context, r
 
 	err := r.Patch(ctx, res, client.RawPatch(types.MergePatchType, body))
 	if err != nil {
-		return errors.Wrap(err, "merge-patch annotation blockstor.io/volume-numbers")
+		return errors.Wrap(err, "merge-patch annotation blockstor.org/volume-numbers")
 	}
 
 	return nil
@@ -1063,9 +1092,16 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 // same work the controller's dispatcher did, just on the
 // satellite side. Phase 10.1.
 func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, peers []blockstoriov1alpha1.Resource) (*intent.DesiredResource, error) {
+	// Checked again here, not only in runApply: no intent is ever built
+	// from a stack the definition does not carry yet.
+	err := r.checkLayerStackPinned(ctx, rd)
+	if err != nil {
+		return nil, err
+	}
+
 	var nodeList blockstoriov1alpha1.NodeList
 
-	err := r.List(ctx, &nodeList)
+	err = r.List(ctx, &nodeList)
 	if err != nil {
 		return nil, errors.Wrap(err, "list Nodes")
 	}
@@ -1100,12 +1136,12 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 		return nil, errors.Wrap(err, "resolve effective props")
 	}
 
-	// Bug 023: when the master passphrase lives ONLY in the
-	// encryption Secret (`linstor encryption create-passphrase`),
-	// fold it into the props bag under the canonical
-	// DrbdOptions/EncryptPassphrase key so BuildDesired lifts it
-	// onto the `LuksPassphrase` wire prop exactly like the legacy
-	// controller-prop path. See luks_passphrase.go.
+	// Bug 023: the master passphrase lives only in the encryption
+	// Secret (`linstor encryption create-passphrase`). Drop any
+	// passphrase property from the bag and fold the Secret's value in
+	// under the canonical DrbdOptions/EncryptPassphrase key, so
+	// BuildDesired lifts it onto the `LuksPassphrase` wire prop. See
+	// luks_passphrase.go.
 	r.injectLUKSMasterPassphrase(ctx, rd, effectiveProps)
 
 	desired := dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps)
@@ -1209,7 +1245,7 @@ func rdNeedsDRBD(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 		return true
 	}
 
-	return slices.Contains(stack, "DRBD")
+	return apiv1.LayerInStack(stack, apiv1.LayerKindDRBD)
 }
 
 // expectedPeerNamesFor returns the peer-node-name set the Bug 342 v3
@@ -1400,7 +1436,7 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //  1. The Resource passed in came from the cached client at the
 //     top of Reconcile, so its `Finalizers` slice may already be
 //     stale by the time we get here (the controller-side path
-//     force-strips its own `blockstor.cozystack.io/resource`
+//     force-strips its own `blockstor.org/resource`
 //     finalizer concurrently). Operate on the slice as-is for
 //     the gating short-circuit only.
 //  2. Run the provider tear-down (Apply.DeleteResource: drbdadm
@@ -1422,7 +1458,7 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //
 // Phase 10.1. Once Phase 10.6 retires the gRPC contract,
 // `internal/controller.ResourceReconciler.runDelete` and its
-// finalizer (`blockstor.cozystack.io/resource`) go away —
+// finalizer (`blockstor.org/resource`) go away —
 // satellite-side teardown becomes the only finalizer path.
 func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
 	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
@@ -1512,7 +1548,7 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 //
 //  1. The parent RD's VolumeDefinitions (the source of truth while
 //     the RD CRD still exists).
-//  2. The `blockstor.io/volume-numbers` annotation that
+//  2. The `blockstor.org/volume-numbers` annotation that
 //     `stampVolumeNumbersAnnotation` writes on every successful apply
 //     (Bug 107: `linstor rd delete` cascade-deletes the parent RD via
 //     owner refs, so by the time `handleDelete` runs the RD Get

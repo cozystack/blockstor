@@ -48,7 +48,7 @@ const evictionRequeue = 30 * time.Second
 // grep this annotation to find RDs that need manual intervention
 // (attach an RG, then re-trigger the node eviction) rather than
 // silently leaving replicas pinned to a draining node.
-const AnnotationMigrationBlocked = "blockstor.io/migration-blocked"
+const AnnotationMigrationBlocked = "blockstor.org/migration-blocked"
 
 // MigrationBlockedReasonNoRG is the value the NodeReconciler writes to
 // AnnotationMigrationBlocked when the parent RD has no
@@ -74,12 +74,12 @@ type NodeReconciler struct {
 	Store store.Store
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=nodes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=nodes/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch
 
 // Reconcile drives the eviction migration. On every Node change we
 // look for EVICTED; if set, every Resource on that node gets a
@@ -453,7 +453,7 @@ func resourceCRDName(rd, node string) string {
 }
 
 // annotateMigrationBlocked stamps the parent RD with the
-// `blockstor.io/migration-blocked` annotation and the given reason so
+// `blockstor.org/migration-blocked` annotation and the given reason so
 // an operator (`kubectl get rd -o ...`) can surface every RD whose
 // eviction migration refused to run. Idempotent: re-stamping with the
 // same reason is a no-op write.

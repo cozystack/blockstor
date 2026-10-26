@@ -98,6 +98,11 @@ type Config struct {
 	// port-binding races between parallel runs.
 	HealthProbeBindAddress string
 
+	// StreamTLS is the mutual TLS of the satellite-to-satellite snapshot
+	// stream. Not configured, the stream server does not start and fetches
+	// answer stream.ErrStreamDisabled.
+	StreamTLS stream.TLSFiles
+
 	// OnCacheSynced fires once the controller-runtime manager's
 	// caches have completed their initial sync. cmd/satellite uses
 	// it to flip /readyz from 503 to 200 so kubelet only routes
@@ -137,7 +142,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	if a.cfg.RESTConfig == nil || a.cfg.ManagerFactory == nil {
-		return errors.New("RESTConfig + ManagerFactory are required (Phase 10.6 retired the gRPC path)")
+		return errors.New("RESTConfig and ManagerFactory are required")
 	}
 
 	a.logger.Info("agent starting",
@@ -206,19 +211,26 @@ func (a poolResolverAdapter) ProviderForResource(name string) (storage.Provider,
 }
 
 // startStreamServer launches the satellite-to-satellite snapshot
-// stream HTTP server in a goroutine. Bound to 0.0.0.0:stream.Port
+// stream HTTPS server in a goroutine, with mutual TLS. Bound to 0.0.0.0:stream.Port
 // — the DaemonSet runs on hostNetwork so this is the node's IP.
 //
-// A bind failure logs but does not abort the agent — without the
-// stream server, cross-node snapshot-restore on this satellite
-// falls back to "peer has no snapshot here" and the receiving
-// satellite tries other peers. Same-node clone keeps working.
+// A bind failure logs but does not abort the agent. A peer fetching from
+// this satellite then gets a connection error, tries the other nodes that
+// hold the snapshot, and retries the restore when none answers.
+// Same-node clone keeps working.
 func (a *Agent) startStreamServer(ctx context.Context, rec *Reconciler) {
+	if !a.cfg.StreamTLS.Configured() {
+		a.logger.Info("snapshot stream disabled: no stream TLS configured; " +
+			"cross-node clone and restore fall back to a DRBD resync")
+
+		return
+	}
+
 	addr := fmt.Sprintf("0.0.0.0:%d", stream.Port)
 	srv := stream.NewServer(poolResolverAdapter{rec: rec})
 
 	go func() {
-		err := stream.ListenAndServe(ctx, addr, srv)
+		err := stream.ListenAndServe(ctx, addr, srv, a.cfg.StreamTLS)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			a.logger.Error("snapshot stream server exited", "addr", addr, "err", err)
 		}

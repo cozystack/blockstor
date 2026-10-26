@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -90,6 +91,10 @@ func setProperty(accessor propertyAccessor) handler {
 		value := ""
 		if len(run.Flags.Positionals) > want {
 			value = run.Flags.Positionals[want]
+		}
+
+		if value != "" && passphrase.IsPlaintextPropKey(key) {
+			return fmt.Errorf("%w: %s", errPlaintextPassphraseProp, key)
 		}
 
 		if accessor.namedKey != nil {
@@ -252,6 +257,13 @@ func patchDefinitionProps(
 // definition itself.
 var errServerOwnedProp = errors.New("blockstor sets this property itself")
 
+// errPlaintextPassphraseProp refuses a set-property that would store the
+// LUKS master passphrase in a property. A property is kept in plaintext on
+// its CR and blockstor never reads the passphrase from one; REST refuses the
+// same write. Deleting such a property stays allowed.
+var errPlaintextPassphraseProp = errors.New("refusing to store the LUKS master passphrase in a property, " +
+	"which is kept in plaintext on its resource; run `encryption create-passphrase`, which keeps it in a Secret")
+
 // refuseServerOwnedDefinitionProp is the named-key guard for rdProps. A
 // delete of the rollback mark goes through; see
 // store.ServerOwnedPropEditByOperator.
@@ -362,9 +374,26 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 	}
 
 	if len(snaps) > 0 {
+		// A snapshot a clone took for itself outlives the clone when its
+		// reap was skipped, failed or kept it for a restore; nothing else
+		// names it now.
+		left, leftErr := store.CloneSnapshotsLeftBehind(ctx, run.Store, snaps)
+		if leftErr != nil {
+			_, _ = fmt.Fprintf(run.Err, "warning: could not tell which snapshots clones left behind: %v\n", leftErr)
+		} else if !left.Empty() {
+			cause, correction := left.Explain(name)
+
+			return fmt.Errorf("%w: %s has %d snapshot(s): %s; %s",
+				errDefinitionHasSnapshots, name, len(snaps), cause, correction)
+		}
+
 		return fmt.Errorf("%w: %s has %d snapshot(s); delete them first",
 			errDefinitionHasSnapshots, name, len(snaps))
 	}
+
+	// Read before the delete: the definition's own props are the only record
+	// of the internal snapshot a clone took on its source.
+	clonedFrom := store.OwnedCloneSnapshot(ctx, run.Store, name)
 
 	// Then the replicas. Dropping the definition alone leaves them with no
 	// parent to stamp a deletion on, so the satellite finalizer never runs
@@ -377,6 +406,15 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 	err = run.Store.ResourceDefinitions().Delete(ctx, name)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete resource definition %s: %w", name, err)
+	}
+
+	// The internal snapshot the clone took on its source goes with it, the
+	// way the REST door reaps it, or the source could never be deleted again.
+	// Not fatal: the definition is gone, and a kept snapshot is named by the
+	// refusal a later delete of the source meets.
+	reapErr := store.ReapClonedSnapshot(ctx, run.Store, clonedFrom)
+	if reapErr != nil {
+		_, _ = fmt.Fprintf(run.Err, "warning: internal clone snapshot kept: %v\n", reapErr)
 	}
 
 	return nil

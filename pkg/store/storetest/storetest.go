@@ -734,6 +734,17 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Run("ReferencesOnNodeUnderAnotherSpelling", func(t *testing.T) {
 		testReferencesOnNodeUnderAnotherSpelling(t, newStore)
 	})
+	// A definition's replicas and snapshots are found whatever spelling the
+	// definition is asked in. `rd d PVC-X` over `pvc-x` passed the snapshot
+	// gate on zero rows and cascaded nothing, then the folded Delete took the
+	// definition and left its replicas and snapshots behind.
+	t.Run("ChildrenOfDefinitionUnderAnySpelling", func(t *testing.T) {
+		testChildrenOfDefinitionUnderAnySpelling(t, newStore)
+	})
+	// The node-scoped listing folds the node name the same way.
+	t.Run("ListByNodeUnderAnySpelling", func(t *testing.T) {
+		testListByNodeUnderAnySpelling(t, newStore)
+	})
 	// The other direction: the operator types the canonical lowercase name
 	// and the node, with its replicas and pools, was registered in upper
 	// case, which is how adoption from LINSTOR writes it. Asking in the
@@ -1282,6 +1293,7 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
 	// See annotation_contract.go.
 	t.Run("UpdateAnnotationContract", func(t *testing.T) { testRDUpdateAnnotationContract(t, newStore) })
+	t.Run("UpdateKeepsADecidedLayerStack", func(t *testing.T) { testRDUpdateKeepsADecidedLayerStack(t, newStore) })
 	t.Run("UpdateChangesProps", func(t *testing.T) {
 		s := newStore(t).ResourceDefinitions()
 		ctx := t.Context()
@@ -1307,6 +1319,54 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("LayerStack: got %v, want [DRBD STORAGE]", got.LayerStack)
 		}
 	})
+}
+
+// testRDUpdateKeepsADecidedLayerStack: a write-back of a copy read
+// before the layer stack was pinned carries no stack. It must leave
+// the pin in place, or the RD reconcile would decide again over a
+// volume that may already hold data. Replacing a pinned stack with
+// another non-empty one still goes through.
+func testRDUpdateKeepsADecidedLayerStack(t *testing.T, newStore Factory) {
+	t.Helper()
+	s := newStore(t).ResourceDefinitions()
+	ctx := t.Context()
+	if err := s.Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-pin"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	stale, err := s.Get(ctx, "pvc-pin")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	pinned := stale
+	pinned.LayerStack = []string{"DRBD", "LUKS", "STORAGE"}
+	if err := s.Update(ctx, &pinned); err != nil {
+		t.Fatalf("Update (pin): %v", err)
+	}
+	stale.Props = map[string]string{"k": "v"}
+	if err := s.Update(ctx, &stale); err != nil {
+		t.Fatalf("Update (stale write-back): %v", err)
+	}
+	got, err := s.Get(ctx, "pvc-pin")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !slices.Equal(got.LayerStack, []string{"DRBD", "LUKS", "STORAGE"}) {
+		t.Errorf("LayerStack after a stale write-back: got %v, want [DRBD LUKS STORAGE]", got.LayerStack)
+	}
+	if got.Props["k"] != "v" {
+		t.Errorf("Props: got %v, want the write-back's k=v", got.Props)
+	}
+	got.LayerStack = []string{"DRBD", "STORAGE"}
+	if err := s.Update(ctx, &got); err != nil {
+		t.Fatalf("Update (replace): %v", err)
+	}
+	got, err = s.Get(ctx, "pvc-pin")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !slices.Equal(got.LayerStack, []string{"DRBD", "STORAGE"}) {
+		t.Errorf("LayerStack after a replace: got %v, want [DRBD STORAGE]", got.LayerStack)
+	}
 }
 
 // RunResourceGroupStore exercises every branch of store.ResourceGroupStore.
@@ -2210,5 +2270,74 @@ func testReferencesOnNodeUnderAnotherSpelling(t *testing.T, newStore Factory) {
 	if len(replicas) != 1 {
 		t.Errorf("ReferencesOnNode under another spelling found %d replica(s), want 1 — "+
 			"the refusal would pass and the node would go with a replica on it", len(replicas))
+	}
+}
+
+func testChildrenOfDefinitionUnderAnySpelling(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "Pvc-Mix"}); err != nil {
+		t.Fatalf("Create definition: %v", err)
+	}
+
+	// Written in a spelling other than the definition's own.
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "PVC-MIX", NodeName: "n1"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	if err := s.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name: "snap-mix", ResourceName: "PVC-MIX", Nodes: []string{"n1"},
+	}); err != nil {
+		t.Fatalf("Create snapshot: %v", err)
+	}
+
+	for _, asked := range []string{"Pvc-Mix", "pvc-mix", "PVC-MIX"} {
+		replicas, err := s.Resources().ListByDefinition(ctx, asked)
+		if err != nil {
+			t.Fatalf("ListByDefinition %q: %v", asked, err)
+		}
+
+		if len(replicas) != 1 {
+			t.Errorf("ListByDefinition %q found %d replica(s), want 1", asked, len(replicas))
+		}
+
+		snaps, err := s.Snapshots().ListByDefinition(ctx, asked)
+		if err != nil {
+			t.Fatalf("Snapshots ListByDefinition %q: %v", asked, err)
+		}
+
+		if len(snaps) != 1 {
+			t.Errorf("Snapshots ListByDefinition %q found %d snapshot(s), want 1", asked, len(snaps))
+		}
+	}
+}
+
+func testListByNodeUnderAnySpelling(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.Nodes().Create(ctx, &apiv1.Node{Name: "Node-Mix", Type: "SATELLITE"}); err != nil {
+		t.Fatalf("Create node: %v", err)
+	}
+
+	// Written in a spelling other than the node's own.
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-node-mix", NodeName: "NODE-MIX"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	for _, asked := range []string{"Node-Mix", "node-mix", "NODE-MIX"} {
+		got, err := s.Resources().ListByNode(ctx, asked)
+		if err != nil {
+			t.Fatalf("ListByNode %q: %v", asked, err)
+		}
+
+		if len(got) != 1 {
+			t.Errorf("ListByNode %q found %d replica(s), want 1", asked, len(got))
+		}
 	}
 }

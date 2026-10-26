@@ -74,7 +74,7 @@ const maxRequestBodyBytes int64 = 1 << 20
 // reach the apiserver directly. Both may be nil/empty in tests that
 // only exercise the legacy KV-backed path.
 type Server struct {
-	Addr      string // e.g. ":3370" — plain-HTTP debug port (NOT exposed by the in-cluster Service; reachable only via kubectl port-forward)
+	Addr      string // e.g. "127.0.0.1:3370" — plain-HTTP debug port with no authentication; keep it on loopback so only kubectl port-forward reaches it
 	Store     store.Store
 	Client    client.Client // controller-runtime client for native-object endpoints
 	Namespace string        // namespace where blockstor's own Secrets/ConfigMaps live
@@ -337,10 +337,12 @@ func (s *Server) startTLS(ctx context.Context, handler http.Handler, errCh chan<
 //	                       oversized POST trips a 413 envelope at
 //	                       the wire edge instead of leaking the
 //	                       etcd/k8s rejection string in a 500.
+//	withPlaintextPassphraseRefusal — refuses a body that would store
+//	                       the LUKS master passphrase in a property.
 func (s *Server) handler() http.Handler {
 	mux := s.buildMux()
 
-	wrapped := withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux))))))
+	wrapped := withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, withPlaintextPassphraseRefusal(mux)))))))
 
 	// SSE bypass: the event-stream endpoints push frames over a long-
 	// lived connection, which is fundamentally incompatible with the
@@ -1338,25 +1340,25 @@ func scrubImplDetails(msg string) string {
 	out := strings.NewReplacer(replacements...).Replace(msg)
 
 	// Bug 162: apimachinery's status messages embed the
-	// GroupResource — e.g. "controllerconfigs.blockstor.cozystack.io"
+	// GroupResource — e.g. "controllerconfigs.blockstor.org"
 	// (resource name suffixed with group, then printed as
 	// <resource>.<group>). The CRD plural names ARE the persistence
 	// backend's identity from the operator's perspective — the wire
 	// surface speaks LINSTOR, not K8s. Strip them with a regex that
-	// matches the `<word>.blockstor.cozystack.io` shape.
+	// matches the `<word>.blockstor.org` shape.
 	return blockstorGroupRefRE.ReplaceAllString(out, opaque)
 }
 
 // blockstorGroupRefRE matches an apimachinery-style group/resource
 // reference rooted at our project's API group, e.g.
 //
-//	controllerconfigs.blockstor.cozystack.io
+//	controllerconfigs.blockstor.org
 //
 // which is the GroupResource.String() output that apimachinery embeds
 // in status messages. We collapse it to a single opaque <backend>
 // token so the K8s persistence identity never leaks onto the LINSTOR
 // wire.
-var blockstorGroupRefRE = regexp.MustCompile(`[a-zA-Z0-9-]+\.blockstor\.cozystack\.io`)
+var blockstorGroupRefRE = regexp.MustCompile(`[a-zA-Z0-9-]+\.blockstor\.org`)
 
 // formatBytes renders n as a short human-readable size string for
 // operator-facing error messages. Stays in MiB/KiB granularity so

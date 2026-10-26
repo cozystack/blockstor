@@ -104,7 +104,7 @@ func (s *Server) registerVolumeDefinitions(mux *http.ServeMux) {
 	// (`{"new_passphrase":"…"}`). We also accept the bare-string
 	// `PassPhraseEnter` shape symmetric with the Bug 173 dual-form
 	// cluster-passphrase PATCH. Pre-fix this 404'd, breaking
-	// `linstor vd set-passphrase` entirely. Path uses `{vlmNr}` to
+	// `linstor vd modify-passphrase` entirely. Path uses `{vlmNr}` to
 	// match the upstream OpenAPI spec.
 	mux.HandleFunc(
 		"PUT /v1/resource-definitions/{rd}/volume-definitions/{vlmNr}/encryption-passphrase",
@@ -1415,7 +1415,7 @@ func parseVolNum(raw string) (int32, error) {
 // in `enqueueResourcesForRD` already re-applies on any RD-spec
 // change), but it gives a steady-state breadcrumb that explains
 // why the satellite re-rendered and what the target size is.
-const resizePendingAnnotationPrefix = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-"
+const resizePendingAnnotationPrefix = "bug136.blockstor.org/resize-pending-size-kib-vol-"
 
 // stampResizePendingOnResources walks every Resource of the named
 // RD and stamps the per-volume "resize pending" annotation with the

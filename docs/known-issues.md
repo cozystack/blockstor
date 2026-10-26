@@ -234,7 +234,7 @@ Severity legend:
 **Surfaced by**: scenario audit (UG9 §"Managing network interface cards", lines 2167-2169)
 **Reproduction steps**:
 
-1. `kubectl edit node.blockstor.io/<worker>` and re-order the entries under `spec.netInterfaces` (or change the first entry's `address`).
+1. `kubectl edit node.blockstor.org/<worker>` and re-order the entries under `spec.netInterfaces` (or change the first entry's `address`).
 2. Observe the running satellite Pod on that worker — it does not re-dial anything, does not re-render its DRBD `on <node>` block, and continues talking to the kube-apiserver via the same Service VIP.
 3. Restart the satellite Pod (`kubectl delete pod -l app=blockstor-satellite,kubernetes.io/hostname=<worker>`) — only on restart does the new `Spec.NetInterfaces[0].Address` flow into `LocalAddress` (via `$POD_IP`) and from there into the next reconcile-rendered .res file.
 
@@ -281,7 +281,7 @@ Safety belts on the new path:
 - Wildcard-owned protection: a Resource CRD whose RD has been cascade-deleted out of order still counts as "owned" (volume number wildcard) so the sweeper never races `handleDelete`.
 - Per-cycle delete bound (`StorageSweeperMaxDeletePerCycle = 3`) so a pathological upstream producer of orphans surfaces in logs without being silently cleaned in one tick.
 - Storage-resource prefix allowlist (`pvc-`, `bs-`) so operator-created datasets that happen to share the pool are immune to the sweep.
-- Per-Node opt-out annotation `blockstor.io/skip-orphan-storage-sweeper` for forensic-mode operators.
+- Per-Node opt-out annotation `blockstor.org/skip-orphan-storage-sweeper` for forensic-mode operators.
 - `ListVolumeNames` skips ZFS deferred-delete markers (`__DELETED__`) and LVM snapshot LVs via the lv_attr column so the sweeper never confuses cleanup artefacts for orphans.
 
 Idempotency of `provider.DeleteVolume` was already guaranteed by Bug 33's contract; the sweeper relies on that — racing the satellite's own `handleDelete` is harmless because the second call returns nil.

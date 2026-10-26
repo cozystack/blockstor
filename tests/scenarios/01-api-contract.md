@@ -162,7 +162,7 @@ Typed list returns bare array; only `/v1/remotes` (untyped) returns envelope. Fi
 
 - **Priority:** P1  **Target:** unit  **Complexity:** L
 
-`needs/slugify` → `<8hex>-needs-slugify` so CRD apply doesn't fail validation. Annotation `blockstor.io/original-name` preserves the original for round-trip.
+`needs/slugify` → `<8hex>-needs-slugify` so CRD apply doesn't fail validation. Annotation `blockstor.org/original-name` preserves the original for round-trip.
 
 ---
 

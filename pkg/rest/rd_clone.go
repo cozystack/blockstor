@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LINBIT/golinstor/client"
 	"github.com/LINBIT/golinstor/clonestatus"
@@ -291,19 +292,87 @@ func (s *Server) cloneRequestShapeIsUsable(
 }
 
 // clonedStackHasItsPassphrase refuses a clone whose stack carries LUKS while
-// the cluster passphrase is missing: the stack it names, or the source's when
-// it names none. It runs after the replay of a finished clone, which writes
-// no new LUKS volume, so a passphrase that went missing or could not be read
-// does not fail the retry of a clone that is already done.
+// the cluster passphrase is missing: the stack it names, or else the one the
+// clone takes from the source, which on the data path is the stack the
+// source's bytes were laid down under. It runs after the replay of a finished
+// clone, which writes no new LUKS volume, so a passphrase that went missing or
+// could not be read does not fail the retry of a clone that is already done.
 func (s *Server) clonedStackHasItsPassphrase(
-	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest,
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest, withData bool,
 ) bool {
-	stack := req.LayerList
-	if len(stack) == 0 {
-		stack = store.EffectiveLayerStack(src.LayerStack)
+	stack := cloneShellLayerStack(src, req)
+
+	if withData && len(req.LayerList) == 0 {
+		var ok bool
+
+		stack, ok = s.cloneSourceLayerStack(ctx, w, src, req.Name)
+		if !ok {
+			return false
+		}
 	}
 
 	return s.clonePassphraseHolds(ctx, w, src.Name, req.Name, stack)
+}
+
+// cloneSourceLayerStack is the stack the source's volumes are laid down
+// under (store.EffectiveLayerStack), which a clone carrying its bytes has to
+// have. False means a refusal has been written: a source whose stack its
+// group has yet to decide answers 503, and a clone waits for the decision
+// rather than guess one and copy plaintext into a stack that says LUKS, or
+// LUKS into one that says plaintext.
+func (s *Server) cloneSourceLayerStack(
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, cloneName string,
+) ([]string, bool) {
+	stack, err := store.EffectiveLayerStack(ctx, s.Store, src)
+	if err != nil {
+		status, callRc := storeErrorRc(err, storeKindResourceDfn)
+		callRc.Message = "clone of resource definition '" + src.Name + "': " + callRc.Message
+		writeCloneRefused(w, status, src.Name, cloneName, &callRc)
+
+		return nil, false
+	}
+
+	return stack, true
+}
+
+// withoutUnappliedGroupStack is a copy of annotations without the flag the
+// controller puts on a definition pinned over data. A copy, because the map
+// the store hands back can be the stored object's own.
+func withoutUnappliedGroupStack(annotations map[string]string) map[string]string {
+	out := maps.Clone(annotations)
+	delete(out, apiv1.UnappliedGroupLayerStackAnnotation)
+
+	return out
+}
+
+// cloneShellLayerStack is the stack a volume-less clone is created with: the
+// caller's, or else the source's as stored. A shell holds no bytes, so nothing
+// forces a stack on it the way the data path is forced; left empty, it takes
+// its own group's stack from the controller, which pins it once
+// (pinLayerStack), exactly like a definition created empty.
+//
+// A source whose stack the controller pinned over data that was already
+// there passes that stack on to no shell: it was the data's, not a choice.
+// The unapplied-group annotation alone does not say that, since it also
+// marks a stack set by hand that lacks a layer of the group; but a stack
+// pinned over data is always the default one. So only a flagged source
+// with the default stack hands the shell nothing, and a flagged stack of
+// the operator's own, LUKS,STORAGE in a DRBD,STORAGE group say, is copied.
+func cloneShellLayerStack(src *apiv1.ResourceDefinition, req *rdCloneRequest) []string {
+	if len(req.LayerList) > 0 {
+		return req.LayerList
+	}
+
+	if src.Annotations[apiv1.UnappliedGroupLayerStackAnnotation] != "" && isDefaultLayerStack(src.LayerStack) {
+		return nil
+	}
+
+	return slices.Clone(src.LayerStack)
+}
+
+// isDefaultLayerStack reports whether stack is the default one, in any case.
+func isDefaultLayerStack(stack []string) bool {
+	return slices.EqualFunc(stack, apiv1.DefaultLayerStack(), strings.EqualFold)
 }
 
 // clonePassphraseHolds refuses a clone whose stack carries LUKS while the
@@ -439,10 +508,6 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.clonedStackHasItsPassphrase(r.Context(), w, &src, &req) {
-		return
-	}
-
 	// VD-bearing sources take the snapshot-based data-plane path
 	// (Bug-020); vol-less sources keep the legacy shallow-copy
 	// contract Group D pins.
@@ -453,6 +518,10 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 			Message: scrubImplDetails(err.Error()),
 		})
 
+		return
+	}
+
+	if !s.clonedStackHasItsPassphrase(r.Context(), w, &src, &req, len(srcVDs) > 0) {
 		return
 	}
 
@@ -548,7 +617,12 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	if !cloneLayerStackIsHonourable(w, src, req) {
+	have, ok := s.cloneSourceLayerStack(ctx, w, src, req.Name)
+	if !ok {
+		return
+	}
+
+	if !cloneLayerStackIsHonourable(w, src, req, have) {
 		return
 	}
 
@@ -1013,21 +1087,18 @@ func uncheckedCloneGroupWarning(cloneName, rgName string, err error) *apiv1.APIC
 // Only the data-bearing path calls this. A clone of a VD-less source carries
 // no bytes to lose, and choosing a different stack for the shell is what
 // accepting layer_list is for.
-func cloneLayerStackIsHonourable(w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest) bool {
+func cloneLayerStackIsHonourable(
+	w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest, have []string,
+) bool {
 	if len(req.LayerList) == 0 {
 		return true
 	}
 
-	// An RD stored without an explicit stack is not a definition with no
-	// layers — it is one that never said, and every other reader resolves
-	// that to apiv1.DefaultLayerStack (stampRDLayerDataFromStack does it on
-	// the read path). Resolving it here too is what keeps the gate off the
-	// CSI hot path: linstor-csi sends [DRBD, STORAGE] on every clone, and
-	// against a bare source an unresolved empty stack would read as "adds
-	// DRBD, STORAGE" and refuse the clone this endpoint was just unbroken
-	// for.
-	have := store.EffectiveLayerStack(src.LayerStack)
-
+	// have is the source's stack as its volumes are laid down
+	// (store.EffectiveLayerStack), never the raw field: an empty one there is
+	// a definition that never said, and read unresolved against the
+	// [DRBD, STORAGE] linstor-csi sends on every clone it would read as
+	// "adds DRBD, STORAGE" and refuse the clone this endpoint exists for.
 	added, dropped := layerSetDifference(have, req.LayerList)
 	if len(added) == 0 && len(dropped) == 0 {
 		return true
@@ -1402,22 +1473,8 @@ func (s *Server) abandonedRollbackRefusal(
 		return 0, nil
 	}
 
-	// A rollback that has not reported a step is one still running, or one
-	// whose process stopped mid-way. Both are refused, but the first ends on
-	// its own, so the advice says so before it says to delete by hand; the
-	// CLI door words it the same way (store.JudgeRestoreLeftover).
 	if spelled == rollbackInProgress {
-		return http.StatusConflict, &apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: operation + " target '" + rdName + "' is being rolled back by the attempt " +
-				"that created it",
-			Cause: "an earlier attempt at this " + operation + " started rolling the definition " +
-				"back and has not reported how it ended: it is still running, or it stopped mid-way",
-			Correc: "retry the " + operation + " once that rollback has finished, which takes under a " +
-				"minute; if the mark is still there a minute after the failure, " + clearRollbackMarkCommand(rdName) +
-				" to keep '" + rdName + "' as it stands, or delete it by hand. Cleared while the rollback " +
-				"still runs, it stops that rollback before it deletes anything",
-		}
+		return s.inProgressRollbackRefusal(ctx, operation, rdName)
 	}
 
 	step, known := rollbackStepByName(spelled)
@@ -1431,6 +1488,66 @@ func (s *Server) abandonedRollbackRefusal(
 			"so the definition may hold less than the " + operation + " intended; " + cause,
 		Correc: correc,
 	}
+}
+
+// inProgressRollbackRefusal answers a retry over an in-progress rollback mark.
+// A rollback that has not reported a step is one still running, or one whose
+// process stopped mid-way. A mark older than store.StaleRollbackAfter has
+// nobody behind it and is taken over, and the retry resumes; a younger one is
+// refused, with the advice that it ends on its own. The CLI door does the same
+// (store.JudgeRestoreLeftover).
+func (s *Server) inProgressRollbackRefusal(ctx context.Context, operation, rdName string) (int, *apiv1.APICallRc) {
+	took, status, rc := s.takeOverStaleRollbackMark(ctx, operation, rdName)
+	if rc != nil {
+		return status, rc
+	}
+
+	if took {
+		return 0, nil
+	}
+
+	return http.StatusConflict, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: operation + " target '" + rdName + "' is being rolled back by the attempt " +
+			"that created it",
+		Cause: "an earlier attempt at this " + operation + " started rolling the definition " +
+			"back and has not reported how it ended: it is still running, or it stopped mid-way",
+		Correc: "retry the " + operation + " once that rollback has finished, which takes under a " +
+			"minute; a retry takes over a mark nobody has touched for two minutes. To keep '" + rdName +
+			"' as it stands sooner, " + clearRollbackMarkCommand(rdName) + ", or delete it by hand. Cleared " +
+			"while the rollback still runs, it stops that rollback before it deletes anything",
+	}
+}
+
+// takeOverStaleRollbackMark takes over an in-progress rollback mark older than
+// store.StaleRollbackAfter, whose writer is gone, so the retry can resume the
+// leftover. A non-nil rc is the answer when the check itself failed.
+func (s *Server) takeOverStaleRollbackMark(
+	ctx context.Context, operation, rdName string,
+) (bool, int, *apiv1.APICallRc) {
+	took, err := store.TakeOverStaleRollback(ctx, s.Store, rdName, time.Now())
+	if err != nil {
+		return false, http.StatusInternalServerError, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: operation + " target '" + rdName + "' carries a rollback mark that could not be " +
+				"checked for staleness: " + scrubImplDetails(err.Error()),
+			Correc: "retry the " + operation,
+		}
+	}
+
+	return took, 0, nil
+}
+
+// knownOrReadCloneSnapshot answers what the caller already read about the
+// internal snapshot, or reads it. ok is false when a refusal was written.
+func (s *Server) knownOrReadCloneSnapshot(
+	w http.ResponseWriter, r *http.Request, srcName, cloneName string, known *cloneSnapshotRead,
+) (apiv1.Snapshot, bool, bool) {
+	if known != nil {
+		return known.snap, known.found, true
+	}
+
+	return readCloneSnapshot(r.Context(), w, s.Store, srcName, cloneName)
 }
 
 // ensureCloneSnapshot takes (or reuses) the internal snapshot backing
@@ -1449,20 +1566,9 @@ func (s *Server) ensureCloneSnapshot(
 	ctx := r.Context()
 	snapName := cloneSnapshotName(cloneName)
 
-	var (
-		existing apiv1.Snapshot
-		found    bool
-	)
-
-	if known != nil {
-		existing, found = known.snap, known.found
-	} else {
-		var ok bool
-
-		existing, found, ok = readCloneSnapshot(ctx, w, s.Store, src.Name, cloneName)
-		if !ok {
-			return nil, false, false
-		}
+	existing, found, ok := s.knownOrReadCloneSnapshot(w, r, src.Name, cloneName, known)
+	if !ok {
+		return nil, false, false
 	}
 
 	if found {
@@ -1489,6 +1595,8 @@ func (s *Server) ensureCloneSnapshot(
 		return nil, false, false
 	}
 
+	stampCloneSnapshotOwner(&snap, cloneName)
+
 	snap.Snapshots = makeSnapshotPerNode(snapName, snap.Nodes, snap.VolumeDefinitions)
 
 	err = s.Store.Snapshots().Create(ctx, &snap)
@@ -1503,6 +1611,19 @@ func (s *Server) ensureCloneSnapshot(
 	}
 
 	return &snap, false, true
+}
+
+// stampCloneSnapshotOwner marks the snapshot as the clone's own, so deleting
+// the clone may reap it. A name cannot carry that: an operator can call a
+// snapshot `clone-<target>` and restore it under that target, and the marker a
+// restore writes is the one a clone writes. The hydration gives the snapshot
+// a copy of the source's props, so the stamp lands on the snapshot alone.
+func stampCloneSnapshotOwner(snap *apiv1.Snapshot, cloneName string) {
+	if snap.Props == nil {
+		snap.Props = map[string]string{}
+	}
+
+	snap.Props[store.CloneSnapshotOwnerProp] = cloneName
 }
 
 // cloneSourceIsNotBeingDeleted mirrors the snapshot-create Bug 180 gate: a
@@ -1584,7 +1705,14 @@ func (s *Server) replayOfFinishedClone(
 	// It runs before anything established whether the leftover is finished,
 	// so its wording is the resume's: the leftover was started with a shape,
 	// whether or not it got further.
-	if differs := requestedShapeDiffers(&existing, req.ResourceGroup, req.LayerList); differs != "" {
+	differs, err := s.requestedShapeDiffers(ctx, &existing, req.ResourceGroup, req.LayerList)
+	if err != nil {
+		writeCloneStoreError(w, srcName, cloneName, err)
+
+		return false, true
+	}
+
+	if differs != "" {
 		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
 			Message: "clone target '" + cloneName + "' was started with " + differs,
@@ -1897,7 +2025,7 @@ func (s *Server) cloneSnapshotPreconditionsHold(ctx context.Context, w http.Resp
 				"' refused: the source has no active diskful replicas to clone from",
 			Cause: "the clone data plane snapshots the source and restores the target " +
 				"from it; with no deployed diskful replica there is nothing to snapshot " +
-				"and the result would be an empty shell (Bug 114)",
+				"and the result would be an empty shell",
 			Correc: "deploy the source first (`linstor rd ap " + src.Name + "`), " +
 				"or clone before removing its replicas",
 		})
@@ -2087,9 +2215,8 @@ func writeCloneStoreError(w http.ResponseWriter, srcName, cloneName string, err 
 // are dropped before the Create lands. python-linstor 1.27.0 sends
 // these via `linstor resource-definition clone --override-prop K=V`
 // / `--delete-prop K`; wiring them through here keeps the operator's
-// intent honoured for the empty-VD path. `req.SrcSnapName` is
-// accepted-and-no-op (see rdCloneRequest docstring) — the snapshot-
-// based clone data plane lands separately.
+// intent honoured for the empty-VD path. A non-empty `req.SrcSnapName`
+// never gets here: it is refused with 501 before either clone path runs.
 func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	src *apiv1.ResourceDefinition, req *rdCloneRequest,
 ) {
@@ -2109,15 +2236,11 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	// inherited them would carry a delete, or any later flag, it never had.
 	clone.Flags = nil
 
-	// The caller's own shape wins over the source's, on both clone paths.
-	// Without one the shell is stamped with the source's data-plane stack, as
-	// the data path stamps its target: left empty under a target group of
-	// another stack, the control plane would judge it by that group while the
-	// satellite brings it up as the default, once volumes are added.
-	clone.LayerStack = store.EffectiveLayerStack(src.LayerStack)
-	if len(req.LayerList) > 0 {
-		clone.LayerStack = req.LayerList
-	}
+	// The caller's own shape wins over the source's, on both clone paths;
+	// see cloneShellLayerStack for the rest. The flag the controller puts on a
+	// definition pinned over data stays with that data: the shell has none.
+	clone.LayerStack = cloneShellLayerStack(src, req)
+	clone.Annotations = withoutUnappliedGroupStack(src.Annotations)
 
 	if req.ResourceGroup != "" {
 		clone.ResourceGroupName = req.ResourceGroup
@@ -2323,11 +2446,9 @@ func computeCloneStatus(ctx context.Context, st store.Store, srcName, targetName
 func writeSnapshotCloneNotImplemented(w http.ResponseWriter, srcName, cloneName, srcSnapName string) {
 	writeCloneRefused(w, http.StatusNotImplemented, srcName, cloneName, &apiv1.APICallRc{
 		RetCode: apiCallRcError,
-		Message: "snapshot-based clone not implemented in this release (pending Phase 12)",
-		Cause: "the apiserver accepts `src_snap_name` on the wire for python-linstor 1.27.0 " +
-			"compatibility (Bug 232 + 237) but the satellite-side snapshot-clone data plane is " +
-			"not yet wired; silently falling back to a live-RD shell copy would discard the " +
-			"snapshot intent and produce a clone with the wrong contents",
+		Message: "cloning from a named snapshot (src_snap_name) is not supported",
+		Cause: "blockstor clones from the live source only; cloning from the live source " +
+			"instead would give a clone with different contents than the snapshot holds",
 		Correc: "use the snapshot-then-restore workflow which IS wired today: " +
 			"`linstor s create " + srcName + " " + srcSnapName + "` (if the snapshot " +
 			"doesn't already exist) then " +

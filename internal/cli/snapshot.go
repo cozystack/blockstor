@@ -336,7 +336,10 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 		return err
 	}
 
-	def := newRestoredDefinition(args.toResource, &src, &snap)
+	def, err := newRestoredDefinition(ctx, run.Store, args.toResource, &src, &snap)
+	if err != nil {
+		return fmt.Errorf("restore %s onto %s: %w", snap.Name, args.toResource, err)
+	}
 
 	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if errors.Is(err, store.ErrAlreadyExists) {
@@ -345,6 +348,13 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 
 	if err != nil {
 		return fmt.Errorf("create resource definition %s: %w", def.Name, err)
+	}
+
+	// The snapshot was read before the definition existed; see
+	// store.ReapClonedSnapshot.
+	err = store.RestoreSourceWithdrawn(ctx, run.Store, snap.ResourceName, snap.Name)
+	if err != nil {
+		return rollbackRestore(ctx, run, def.Name, planned, err)
 	}
 
 	// The definition is this command's own, but a concurrent run may already
@@ -365,16 +375,37 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 }
 
 // newRestoredDefinition is the definition a restore creates: the source's
-// group and stack, the snapshot's props, and this restore's marker.
-func newRestoredDefinition(rdName string, src *apiv1.ResourceDefinition, snap *apiv1.Snapshot) *apiv1.ResourceDefinition {
+// group and stack, the snapshot's props, and this restore's marker. The stack
+// is the one the source's bytes were laid down under
+// (store.EffectiveLayerStack); a source whose group has yet to decide it is an
+// error the operator retries once the controller pins it. A copy short of what
+// its group asks for is flagged the way the controller flags a definition it
+// pinned over data.
+func newRestoredDefinition(
+	ctx context.Context, st store.Store, rdName string, src *apiv1.ResourceDefinition, snap *apiv1.Snapshot,
+) (*apiv1.ResourceDefinition, error) {
+	stack, err := store.EffectiveLayerStack(ctx, st, src)
+	if err != nil {
+		return nil, fmt.Errorf("the layer stack of the source %s: %w", src.Name, err)
+	}
+
+	unapplied, err := store.UnappliedGroupStack(ctx, st, src.ResourceGroupName, stack)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // names the group itself
+	}
+
 	def := &apiv1.ResourceDefinition{
 		Name: rdName,
 		// The parent group carries over: it drives later placement and
 		// property inheritance, and a restored definition with a blank
 		// group breaks the restore-then-list workflow.
 		ResourceGroupName: src.ResourceGroupName,
-		LayerStack:        store.EffectiveLayerStack(src.LayerStack),
+		LayerStack:        stack,
 		Props:             store.TravellingProps(snap.Props),
+	}
+
+	if unapplied != "" {
+		def.Annotations = map[string]string{apiv1.UnappliedGroupLayerStackAnnotation: unapplied}
 	}
 
 	if def.Props == nil {
@@ -387,7 +418,9 @@ func newRestoredDefinition(rdName string, src *apiv1.ResourceDefinition, snap *a
 	// the placer looks the source half up as a store key.
 	def.Props = store.WithRestoreMarker(def.Props, snap)
 
-	return def
+	store.DropCloneSnapshotMarks(def.Props)
+
+	return def, nil
 }
 
 // restoreIntoExistingTarget finishes a restore over a definition that is
@@ -467,6 +500,21 @@ func restoreIntoExistingTarget(
 	// way the REST door does, rather than placed over with this run's nodes.
 	if !adopted {
 		return finishConcurrentRestore(ctx, run, args, existing.Name, snap, createErr)
+	}
+
+	return placeOverMarkedTarget(ctx, run, existing.Name, snap, planned)
+}
+
+// placeOverMarkedTarget places the planned replicas on a target that carries
+// this restore's marker. The snapshot was read before the marker went on, or
+// before this run found it there, so it is read back first; see
+// store.ReapClonedSnapshot.
+func placeOverMarkedTarget(
+	ctx context.Context, run *runContext, rdName string, snap *apiv1.Snapshot, planned []apiv1.Resource,
+) error {
+	err := store.RestoreSourceWithdrawn(ctx, run.Store, snap.ResourceName, snap.Name)
+	if err != nil {
+		return fmt.Errorf("restore into %s: %w", rdName, err)
 	}
 
 	return placeOverExisting(ctx, run, planned)
@@ -630,7 +678,7 @@ func finishRestoreLeftover(
 		return err
 	}
 
-	return placeOverExisting(ctx, run, planned)
+	return placeOverMarkedTarget(ctx, run, rdName, snap, planned)
 }
 
 // answerFinishedLeftover reports a finished leftover of this restore as
@@ -730,6 +778,14 @@ func volumeAlreadyRestored(ctx context.Context, run *runContext, rdName string, 
 func rollbackRestore(
 	ctx context.Context, run *runContext, rdName string, planned []apiv1.Resource, cause error,
 ) error {
+	// The rollback runs on a budget of its own, like the REST door's. A retry
+	// takes over an in-progress mark older than store.StaleRollbackAfter on
+	// the grounds that nobody is behind it; a CLI rollback without a
+	// deadline could still be, and could then take apart a definition the
+	// retry had answered for.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), store.CLIRollbackBudget)
+	defer cancel()
+
 	err := store.HoldRollback(ctx, run.Store, rdName, true)
 	if errors.Is(err, store.ErrRollbackGone) {
 		return cause
@@ -1049,13 +1105,21 @@ func unwindVolumes(ctx context.Context, run *runContext, rdName string, added []
 func planRestoredReplicas(
 	ctx context.Context, run *runContext, srcRD, rdName string, snap *apiv1.Snapshot,
 ) ([]apiv1.Resource, error) {
+	// The same refusal the REST door makes, before anything is written: see
+	// store.RefuseReplicasWithoutDefinition. A target that already has its
+	// definition passes it.
+	err := store.RefuseReplicasWithoutDefinition(ctx, run.Store, rdName)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // names the definition and the replicas itself
+	}
+
 	nodes := run.Flags.Nodes
 
 	// Named nodes have to actually hold the snapshot. Restoring onto one
 	// that does not produces a replica with nothing behind it: the objects
 	// are created, the satellite finds no snapshot to receive, and the
 	// command reports success over an empty volume.
-	err := validate.RestoreNodesHoldSnapshot(nodes, snap.Nodes)
+	err = validate.RestoreNodesHoldSnapshot(nodes, snap.Nodes)
 	if err != nil {
 		//nolint:wrapcheck // a semantic refusal; see checkVolumeSize
 		return nil, err

@@ -38,7 +38,7 @@ import (
 
 // Labels used to index Resource CRDs by their composite key.
 const (
-	LabelResourceDefinition = "blockstor.io/resource-definition"
+	LabelResourceDefinition = "blockstor.org/resource-definition"
 )
 
 type resources struct {
@@ -87,8 +87,10 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 // partial-but-correct subset — the Bug 038 shape, where the missing replicas
 // were invisible rather than an error.
 func (s *resources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
-	out, err := s.listScoped(ctx, s.nodeScopedReader(), FieldResourceNodeName, node,
-		func(r *crdv1alpha1.Resource) bool { return r.Spec.NodeName == node })
+	reader := s.nodeScopedReader()
+
+	out, err := s.listUnderSpellings(ctx, reader, FieldResourceNodeName, nodeSpellings(ctx, reader, node),
+		func(r *crdv1alpha1.Resource, spelling string) bool { return r.Spec.NodeName == spelling })
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +178,13 @@ func (s *resources) Create(ctx context.Context, in *apiv1.Resource) error {
 		return errors.New("nil Resource")
 	}
 
-	crd := wireToCRDResource(in)
+	// The replica is stored under its definition's registered spelling, so
+	// a listing of the definition finds it whatever spelling it is asked in.
+	canonical := *in
+	canonical.Name = canonicalRDName(ctx, s.c, in.Name)
+	canonical.NodeName = canonicalNodeName(ctx, s.c, in.NodeName)
+
+	crd := wireToCRDResource(&canonical)
 
 	err := s.c.Create(ctx, crd)
 	if err != nil {
@@ -238,12 +246,12 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	existing.Spec.SkipInitialSync = prevSkipInit
 
 	// Bug 67: round-trip wire-side Annotations through metadata so the
-	// REST writer's `blockstor.io/peer-changed` bump actually reaches
+	// REST writer's `blockstor.org/peer-changed` bump actually reaches
 	// the CRD ObjectMeta — without this the bump would silently no-op
 	// and the satellite's local-Resource watch would never fire.
 	//
 	// Bug 210: merge rather than wholesale-replace so the satellite-
-	// stamped `blockstor.io/volume-numbers` annotation (Bug 107 cascade-
+	// stamped `blockstor.org/volume-numbers` annotation (Bug 107 cascade-
 	// delete fallback) survives a wire-snapshot that raced the stamp.
 	// Without this, a routine `linstor r <verb>` between Get and Update
 	// wipes the annotation; a concurrent RD cascade-delete that hits
@@ -320,7 +328,7 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		existing.Spec.SkipInitialSync = prevSkipInit
 
 		// Bug 210: merge rather than wholesale-replace so the
-		// satellite-stamped `blockstor.io/volume-numbers` (Bug 107)
+		// satellite-stamped `blockstor.org/volume-numbers` (Bug 107)
 		// survives even if the closure built `wire.Annotations`
 		// from a stale snapshot that pre-dated the satellite stamp.
 		// PatchResourceSpec already has 409-retry via
@@ -545,8 +553,8 @@ func (s *resources) ClearDRBDPort(ctx context.Context, rdName, node string) erro
 func (s *resources) listByDefinitionThrough(
 	ctx context.Context, reader ctrlclient.Reader, rdName string,
 ) ([]apiv1.Resource, error) {
-	out, err := s.listScoped(ctx, reader, FieldResourceDefinitionName, rdName,
-		func(r *crdv1alpha1.Resource) bool { return r.Spec.ResourceDefinitionName == rdName })
+	out, err := s.listUnderSpellings(ctx, reader, FieldResourceDefinitionName, rdSpellings(ctx, reader, rdName),
+		func(r *crdv1alpha1.Resource, spelling string) bool { return r.Spec.ResourceDefinitionName == spelling })
 	if err != nil {
 		return nil, err
 	}
@@ -1093,6 +1101,43 @@ func (s *resources) listScoped(
 		"field", field, "value", value, "reason", err.Error())
 
 	return s.listExhaustively(ctx, reader, field, value, keep)
+}
+
+// listUnderSpellings runs listScoped once per spelling and returns every
+// replica once. The CRD name folds the definition and the node, so two rows
+// with the same folded pair are one object.
+func (s *resources) listUnderSpellings(
+	ctx context.Context, reader ctrlclient.Reader, field string, spellings []string,
+	keep func(*crdv1alpha1.Resource, string) bool,
+) ([]apiv1.Resource, error) {
+	var out []apiv1.Resource
+
+	seen := map[string]struct{}{}
+
+	for _, spelling := range spellings {
+		found, err := s.listScoped(ctx, reader, field, spelling,
+			func(r *crdv1alpha1.Resource) bool { return keep(r, spelling) })
+		if err != nil {
+			return nil, err
+		}
+
+		for i := range found {
+			key := resourceCRDName(found[i].Name, found[i].NodeName)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+
+			seen[key] = struct{}{}
+
+			out = append(out, found[i])
+		}
+	}
+
+	if out == nil {
+		out = []apiv1.Resource{}
+	}
+
+	return out, nil
 }
 
 // listExhaustively is the pre-selectable-field read: every Resource, filtered

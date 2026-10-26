@@ -51,21 +51,17 @@ type resourceDefinitions struct {
 }
 
 func (s *resourceDefinitions) List(ctx context.Context) ([]apiv1.ResourceDefinition, error) {
-	var crdList crdv1alpha1.ResourceDefinitionList
+	return s.listThrough(ctx, s.c)
+}
 
-	err := s.c.List(ctx, &crdList)
-	if err != nil {
-		return nil, errors.Wrap(err, "list ResourceDefinition CRDs")
+// ListUncached lists through the direct reader when one is wired, and through
+// the cache otherwise, where the cache is all there is.
+func (s *resourceDefinitions) ListUncached(ctx context.Context) ([]apiv1.ResourceDefinition, error) {
+	if s.apiReader == nil {
+		return s.listThrough(ctx, s.c)
 	}
 
-	out := make([]apiv1.ResourceDefinition, 0, len(crdList.Items))
-	for i := range crdList.Items {
-		out = append(out, crdToWireRD(&crdList.Items[i]))
-	}
-
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-
-	return out, nil
+	return s.listThrough(ctx, s.apiReader)
 }
 
 func (s *resourceDefinitions) Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
@@ -163,7 +159,17 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 		// naïve rebuild would wipe it and a later replica added to this
 		// established RD would wrongly skip the initial sync.
 		prevInitialized := existing.Spec.Initialized
+		// The layer stack is decided once and then only replaced, never
+		// emptied: a caller writing back a copy read before the pin would
+		// otherwise undo it, and the RD reconcile would then judge the
+		// volume built under the default and re-pin that over LUKS data.
+		prevLayerStack := existing.Spec.LayerStack
 		existing.Spec = wireToCRDRDSpec(in)
+
+		if len(existing.Spec.LayerStack) == 0 {
+			existing.Spec.LayerStack = prevLayerStack
+		}
+
 		existing.Spec.VolumeDefinitions = prevVDs
 		existing.Spec.Encryption = prevEncryption
 		// Identity-to-spec: preserve the optional controller/operator
@@ -180,17 +186,17 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 // mergeUserAnnotationsInto applies the wire-side annotation map
 // onto existing.Annotations. Behavior:
 //   - nil wire input: no-op (preserves whatever the controller-side
-//     reconciler may have stamped under blockstor.io/* keys).
+//     reconciler may have stamped under blockstor.org/* keys).
 //   - non-nil: replaces ALL non-preserved annotations with the wire
 //     set; keys in `preserve` survive (the OriginalName store-internal
 //     marker, satellite-stamped Bug-107 fallback keys, etc.).
 //
 // Phase 10.4: lets the REST KV-store handler write
-// `blockstor.io/csi-volume-data` via Update without losing the
-// store-internal `blockstor.io/original-name`.
+// `blockstor.org/csi-volume-data` via Update without losing the
+// store-internal `blockstor.org/original-name`.
 //
 // Bug 210: the `preserve` slice extends the preservation set per-store
-// — Resources adds `blockstor.io/volume-numbers` (the satellite-stamped
+// — Resources adds `blockstor.org/volume-numbers` (the satellite-stamped
 // fallback used by the RD cascade-delete path) so a wire-snapshot that
 // raced the satellite stamp does not wipe it on the wholesale replace.
 func mergeUserAnnotationsInto(meta *metav1.ObjectMeta, wire map[string]string, preserve ...string) {
@@ -307,6 +313,24 @@ func (s *resourceDefinitions) Delete(ctx context.Context, name string) error {
 	return nil
 }
 
+func (s *resourceDefinitions) listThrough(ctx context.Context, reader ctrlclient.Reader) ([]apiv1.ResourceDefinition, error) {
+	var crdList crdv1alpha1.ResourceDefinitionList
+
+	err := reader.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrap(err, "list ResourceDefinition CRDs")
+	}
+
+	out := make([]apiv1.ResourceDefinition, 0, len(crdList.Items))
+	for i := range crdList.Items {
+		out = append(out, crdToWireRD(&crdList.Items[i]))
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
+}
+
 // getForPatch reads the object a patch starts from. A cache NotFound is
 // re-read live, the way Get does: a caller that patches a definition it has
 // just created reads it at the peak of the informer's lag, and taking the
@@ -384,9 +408,9 @@ func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
 }
 
 // userAnnotations strips the store-internal annotation keys
-// (`blockstor.io/original-name` etc.) from a CRD's metadata.annotations
+// (`blockstor.org/original-name` etc.) from a CRD's metadata.annotations
 // before surfacing it on the wire — only operator/CSI-managed keys
-// (e.g. `blockstor.io/csi-volume-data`) reach the REST layer.
+// (e.g. `blockstor.org/csi-volume-data`) reach the REST layer.
 // Returns nil when no user-facing annotation survives the filter.
 func userAnnotations(in map[string]string) map[string]string {
 	if len(in) == 0 {

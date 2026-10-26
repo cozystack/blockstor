@@ -98,7 +98,7 @@ for n in dev-worker-1 dev-worker-2 dev-worker-3; do
     pod=$(kubectl -n blockstor-system get pod -l app.kubernetes.io/component=satellite \
         --field-selector spec.nodeName="$n" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
     [ -z "$pod" ] && continue
-    for rd in $(kubectl get resources.blockstor.cozystack.io -o jsonpath='{.items[*].spec.resourceDefinitionName}' 2>/dev/null | tr ' ' '\n' | grep '^ccu3-' | sort -u); do
+    for rd in $(kubectl get resources.blockstor.org -o jsonpath='{.items[*].spec.resourceDefinitionName}' 2>/dev/null | tr ' ' '\n' | grep '^ccu3-' | sort -u); do
         kubectl -n blockstor-system exec "$pod" -- drbdadm resume-io "$rd" 2>/dev/null && echo "  resumed $rd on $n" || true
     done
 done

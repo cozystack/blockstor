@@ -22,7 +22,7 @@ metadata:
   name: blockstor-controller
   namespace: blockstor-system
 ---
-# Cluster-wide read on core API + full RW on our blockstor.io CRDs.
+# Cluster-wide read on core API + full RW on our blockstor.org CRDs.
 # We don't watch any non-blockstor objects, so the verb set stays narrow.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -32,16 +32,19 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [blockstor.cozystack.io]
+  - apiGroups: [blockstor.org]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [blockstor.cozystack.io]
+  - apiGroups: [blockstor.org]
     resources: ["*/status", "*/finalizers"]
     verbs: [get, update, patch]
 ---

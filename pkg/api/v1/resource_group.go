@@ -31,7 +31,7 @@ package v1
 // synchronously from the REST call. Phase 11.x split moved
 // reconcilers into a separate process, so the REST handler can't
 // walk RDs inline; the annotation is the cross-process trigger.
-const AnnotationRGRebalancePending = "blockstor.io/rebalance-pending"
+const AnnotationRGRebalancePending = "blockstor.org/rebalance-pending"
 
 // ResourceGroup mirrors `ResourceGroup` from upstream LINSTOR. A resource
 // group is a template — linstor-csi creates one per Kubernetes StorageClass
@@ -40,7 +40,7 @@ const AnnotationRGRebalancePending = "blockstor.io/rebalance-pending"
 // `Annotations` carries the K8s-native metadata.annotations of the
 // underlying RG CRD. Mirrors the same field on ResourceDefinition —
 // REST handlers stamp orchestration markers (e.g. the Bug 60
-// `blockstor.io/rebalance-pending` flag) here; controller-side
+// `blockstor.org/rebalance-pending` flag) here; controller-side
 // reconcilers observe the annotation to schedule deferred work.
 // Not part of upstream LINSTOR's wire shape; golinstor ignores
 // unknown JSON fields so the new key passes through transparently.
@@ -99,8 +99,9 @@ type AutoSelectFilter struct {
 
 // ResourceGroupSpawn is the payload for POST /resource-groups/{rg}/spawn —
 // the call linstor-csi uses to actually create a Resource from a group.
-// Upstream LINSTOR reuses GenericPropsModify here too, so we accept the
-// override_props / delete_props fields even though we don't consume them.
+// The props-modify fields are declared so the decoder can name them, and a
+// non-empty one is refused: a spawn creates the definition, there are no
+// props on it to modify yet.
 type ResourceGroupSpawn struct {
 	ResourceDefinitionName     string            `json:"resource_definition_name,omitempty"`
 	ResourceDefinitionExternal string            `json:"resource_definition_external_name,omitempty"`

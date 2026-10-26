@@ -21,7 +21,7 @@ package rest
 // Bug 199 (P2) — `writeError` is the LINSTOR-shaped error envelope
 // emitter. Bug 162 fixed `writeStoreError`'s default branch to route
 // the message through `scrubImplDetails` so etcd / apimachinery /
-// k8s.io / `*.blockstor.cozystack.io` substrings never reach the wire. But Bug
+// k8s.io / `*.blockstor.org` substrings never reach the wire. But Bug
 // 162 only covered the `writeStoreError` dispatcher; 51 other call
 // sites in `pkg/rest/*.go` reach `writeError` directly with the raw
 // `err.Error()` string:
@@ -52,7 +52,7 @@ package rest
 //     with an etcd-shaped message, assert the wire body does not
 //     contain "etcd" / "etcdserver".
 //   - TestBug199WriteErrorScrubsApimachineryMessage: same shape for
-//     "apimachinery" / "k8s.io" / "controllerconfigs.blockstor.cozystack.io".
+//     "apimachinery" / "k8s.io" / "controllerconfigs.blockstor.org".
 //   - TestBug199WriteErrorPreservesLiteralCallerStrings: a literal
 //     caller-supplied message ("remote_name is required") reaches the
 //     wire byte-for-byte — the scrub guard MUST be a noop on operator-
@@ -116,7 +116,7 @@ func TestBug199WriteErrorScrubsEtcdMessage(t *testing.T) {
 
 // TestBug199WriteErrorScrubsApimachineryMessage pins the apimachinery
 // flavor: a NewConflict-shaped string carrying the GroupResource
-// ("controllerconfigs.blockstor.cozystack.io[.blockstor.io]") reaches writeError.
+// ("controllerconfigs.blockstor.org[.blockstor.org]") reaches writeError.
 // All three substrings (apimachinery, k8s.io, the group fingerprint)
 // MUST be scrubbed.
 func TestBug199WriteErrorScrubsApimachineryMessage(t *testing.T) {
@@ -126,7 +126,7 @@ func TestBug199WriteErrorScrubsApimachineryMessage(t *testing.T) {
 	// fulfilled on <resource>.<group>[.<group>] ..." — the resource
 	// itself often carries the group suffix, producing the double-
 	// suffix shape the scrub regex collapses.
-	msg := `Operation cannot be fulfilled on resourcedefinitions.blockstor.cozystack.io "rd-test": ` +
+	msg := `Operation cannot be fulfilled on resourcedefinitions.blockstor.org "rd-test": ` +
 		`the object has been modified; please apply your changes to the latest version and try again ` +
 		`(via apimachinery/k8s.io/api/...)`
 
@@ -140,7 +140,7 @@ func TestBug199WriteErrorScrubsApimachineryMessage(t *testing.T) {
 
 	low := strings.ToLower(string(body))
 	for _, leak := range []string{
-		"resourcedefinitions.blockstor.cozystack.io",
+		"resourcedefinitions.blockstor.org",
 		"apimachinery",
 		"k8s.io",
 		"etcd",
@@ -278,9 +278,9 @@ func TestBug199NoDirectWriteErrorErrorCallSitesRegress(t *testing.T) {
 	}{
 		{"etcd-too-large", "etcdserver: request is too large"},
 		{"etcd-bare", "rpc error: etcd unavailable"},
-		{"apimachinery-conflict", `Operation cannot be fulfilled on snapshots.blockstor.cozystack.io "snap-x": stale`},
+		{"apimachinery-conflict", `Operation cannot be fulfilled on snapshots.blockstor.org "snap-x": stale`},
 		{"k8s-api-prefix", "k8s.io/apimachinery: unexpected EOF decoding response"},
-		{"group-fingerprint", `controllerconfigs.blockstor.cozystack.io "default" not found`},
+		{"group-fingerprint", `controllerconfigs.blockstor.org "default" not found`},
 	}
 
 	for _, tc := range cases {
@@ -298,7 +298,7 @@ func TestBug199NoDirectWriteErrorErrorCallSitesRegress(t *testing.T) {
 			}
 
 			low := strings.ToLower(string(body))
-			for _, leak := range []string{"etcd", "apimachinery", "k8s.io", ".blockstor.cozystack.io"} {
+			for _, leak := range []string{"etcd", "apimachinery", "k8s.io", ".blockstor.org"} {
 				if strings.Contains(low, leak) {
 					t.Errorf("case %q leaks %q on the wire: %s", tc.name, leak, body)
 				}

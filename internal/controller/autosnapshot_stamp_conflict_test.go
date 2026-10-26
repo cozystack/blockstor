@@ -74,7 +74,7 @@ func TestAutoSnapshotStampSurvivesRDUpdateConflict(t *testing.T) {
 					conflicted = true
 
 					return apierrors.NewConflict(
-						schema.GroupResource{Group: "blockstor.cozystack.io", Resource: "resourcedefinitions"},
+						schema.GroupResource{Group: "blockstor.org", Resource: "resourcedefinitions"},
 						obj.GetName(),
 						nil,
 					)

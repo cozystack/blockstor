@@ -54,7 +54,7 @@ import (
 //     SelectFilter. RDs with no RG, no place_count or count >= target
 //     short-circuit to no-op + annotation strip.
 //  3. On first observation of a deficit, stamp the deadline annotation
-//     `blockstor.io/auto-diskful-deadline = now + N minutes` and
+//     `blockstor.org/auto-diskful-deadline = now + N minutes` and
 //     requeue at that time. Subsequent reconciles before the deadline
 //     fire are no-ops (the stamp survives across reconciles via the
 //     CRD annotation).
@@ -84,8 +84,8 @@ type AutoDiskfulReconciler struct {
 	Now func() time.Time
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;update;patch
 
 // Reconcile drives the auto-diskful timer for one ResourceDefinition.
 // The body is intentionally thin: configuration, deficit-evaluation,

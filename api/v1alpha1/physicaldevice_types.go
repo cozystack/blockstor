@@ -26,7 +26,7 @@ import (
 // satellite stamps the owning node name on every PhysicalDevice it
 // publishes. Used by `client.MatchingLabels{LabelNode: nodeName}`
 // for efficient per-node listing.
-const PhysicalDeviceLabelNode = "blockstor.io/node"
+const PhysicalDeviceLabelNode = "blockstor.org/node"
 
 // PhysicalDeviceSpec is the desired state of one raw block device on
 // a satellite node. Phase 10.7: replaces the upstream-LINSTOR
@@ -194,7 +194,7 @@ type PhysicalDevice struct {
 	// other composite-key CRD in the project — Resource,
 	// StoragePool, Snapshot — so operators can grep across
 	// kinds with a single `<node>.` pattern); the metadata.labels
-	// must carry `blockstor.io/node=<nodeName>` so per-node
+	// must carry `blockstor.org/node=<nodeName>` so per-node
 	// filters work via label selectors.
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitzero"`

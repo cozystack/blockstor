@@ -176,7 +176,7 @@ type SnapshotVolumeRef struct {
 // instead: short-circuiting there would leave every diskful peer
 // holding `drbdsetup suspend-io` with nothing left to resume it —
 // frozen production I/O with no error surfaced.
-const AnnotationSnapshotAdopted = "blockstor.io/adopted"
+const AnnotationSnapshotAdopted = "blockstor.org/adopted"
 
 // AnnotationSnapshotAdoptedCreatedAt optionally carries the original
 // creation time of an adopted snapshot as milliseconds since the Unix
@@ -184,7 +184,7 @@ const AnnotationSnapshotAdopted = "blockstor.io/adopted"
 // The SnapshotReconciler copies it into the backfilled per-node
 // CreateTimestamp entries so `linstor s l` keeps showing the REAL
 // snapshot age instead of the adoption time.
-const AnnotationSnapshotAdoptedCreatedAt = "blockstor.io/adopted-created-at"
+const AnnotationSnapshotAdoptedCreatedAt = "blockstor.org/adopted-created-at"
 
 // SnapshotStatusFlagFailed is stamped on Status.Flags by the
 // satellite reconciler when CreateSnapshot returned a terminal

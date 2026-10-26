@@ -794,8 +794,8 @@ func TestLuksPassphraseWarning(t *testing.T) {
 		t.Errorf("pvc-vol3 layerStack = %v, want [DRBD LUKS STORAGE]", vol3.Spec.LayerStack)
 	}
 
-	if !hasWarning(res, "pvc-vol3: LUKS passphrase NOT migrated") {
-		t.Errorf("LUKS passphrase warning missing; warnings: %v", res.Warnings)
+	if !hasWarning(res, "pvc-vol3: LUKS key NOT migrated") || !hasWarning(res, "cryptsetup luksAddKey") {
+		t.Errorf("LUKS key warning missing; warnings: %v", res.Warnings)
 	}
 }
 

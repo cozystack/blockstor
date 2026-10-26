@@ -33,6 +33,11 @@ type inMemoryResourceDefinitions struct {
 	m  map[string]apiv1.ResourceDefinition
 }
 
+// ListUncached has nothing to bypass here: this store is the API server.
+func (s *inMemoryResourceDefinitions) ListUncached(ctx context.Context) ([]apiv1.ResourceDefinition, error) {
+	return s.List(ctx)
+}
+
 func (s *inMemoryResourceDefinitions) List(_ context.Context) ([]apiv1.ResourceDefinition, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -95,6 +100,11 @@ func (s *inMemoryResourceDefinitions) Update(_ context.Context, rd *apiv1.Resour
 	}
 
 	next := *rd
+	// A decided layer stack is never emptied by a write-back of an older
+	// copy, as on the k8s store.
+	if len(next.LayerStack) == 0 {
+		next.LayerStack = prev.LayerStack
+	}
 	// Bug-021: nil wire annotations = "untouched"; empty = "clear".
 	// Mirrors the k8s store's mergeUserAnnotationsInto contract.
 	next.Annotations = carryAnnotationsOnNil(next.Annotations, prev.Annotations)

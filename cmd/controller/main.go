@@ -71,9 +71,10 @@ func main() {
 	var controllerNamespace string
 	var tlsOpts []func(*tls.Config)
 	flag.BoolVar(&enableRestAPI, "enable-rest-api", false,
-		"Mount the LINSTOR-compatible REST API alongside the reconcilers. Default is OFF — the apiserver runs as a separate Deployment (cmd/apiserver) since Phase 11.x. Set to true only for the legacy single-binary deployment.")
-	flag.StringVar(&restAddr, "rest-bind-address", ":3370",
-		"The address the LINSTOR-compatible REST API binds to (upstream LINSTOR plain-text port is 3370). Ignored when --enable-rest-api=false.")
+		"Mount the LINSTOR-compatible REST API alongside the reconcilers. Default is off: the REST API runs as the separate apiserver Deployment (cmd/apiserver). Set it only for a single-binary deployment.")
+	flag.StringVar(&restAddr, "rest-bind-address", defaultPlainBindAddress,
+		"The address the plain-HTTP LINSTOR-compatible REST API binds to. It has no authentication, so the default is loopback, "+
+			"reachable through `kubectl port-forward` only. Ignored when --enable-rest-api=false.")
 	flag.StringVar(&controllerNamespace, "controller-namespace", "",
 		"Namespace where the controller's own Secrets/ConfigMaps live (default: $POD_NAMESPACE, then 'blockstor-system').")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -172,7 +173,7 @@ func main() {
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "a3f89427.cozystack.io",
+		LeaderElectionID:       "a3f89427.blockstor.org",
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -241,9 +242,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ResourceDefinitionReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Store:  st,
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Store:    st,
+		Recorder: mgr.GetEventRecorder("blockstor-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resourcedefinition")
 		os.Exit(1)
@@ -278,6 +280,7 @@ func main() {
 	}
 	if err := (&controller.AutoSnapshotRunnable{
 		Client: mgr.GetClient(),
+		Store:  st,
 	}).RegisterWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to register runnable", "runnable", "auto-snapshot")
 		os.Exit(1)

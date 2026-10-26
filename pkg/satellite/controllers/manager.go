@@ -33,6 +33,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/satellite/stream"
 )
 
 // reconcileTriggerBuffer bounds the observer → reconciler trigger
@@ -113,6 +114,10 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	// left nil — see Config.APIReader.
 	if cfg.APIReader == nil {
 		cfg.APIReader = mgr.GetAPIReader()
+	}
+
+	if cfg.Recorder == nil {
+		cfg.Recorder = mgr.GetEventRecorder("blockstor-satellite")
 	}
 
 	// Phase 11.7: thread the observer-trigger channel through
@@ -215,16 +220,7 @@ func ensureWiredDefaults(cfg *Config) {
 // budget — Scenario 5.34 added the third runnable and the
 // inline chain tipped over the limit.
 func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
-	err := mgr.Add(&ObserverRunnable{
-		Client:   mgr.GetClient(),
-		Exec:     cfg.Exec,
-		NodeName: cfg.NodeName,
-		// Phase 11.7: producer end of the observer-trigger channel.
-		// Fires on kernel-state changes (resource lifecycle, role,
-		// disk, conn, repl) so the ResourceReconciler wakes even
-		// when no apiserver write bumps Generation.
-		ReconcileTrigger: cfg.ReconcileTrigger,
-	})
+	err := mgr.Add(newObserverRunnableFromConfig(mgr.GetClient(), cfg))
 	if err != nil {
 		return errors.Wrap(err, "add ObserverRunnable")
 	}
@@ -313,6 +309,7 @@ func wireCrossNodeFetcher(mgr manager.Manager, cfg *Config) {
 	cfg.Apply.SetCrossNodeFetcher(&SnapshotFetcher{
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
+		Stream:   stream.NewClient(cfg.StreamTLS),
 	})
 }
 

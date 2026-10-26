@@ -137,8 +137,8 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
-	// before the JSON encode. The reconcilers stamp `blockstor.io/*`
-	// and `bug<N>.blockstor.cozystack.io/*` keys for in-process
+	// before the JSON encode. The reconcilers stamp `blockstor.org/*`
+	// and `bug<N>.blockstor.org/*` keys for in-process
 	// bookkeeping; the wire shape must not carry them. See
 	// pkg/rest/internal_annotations.go.
 	stripInternalAnnotationsFromResourcesWithVolumes(out)
@@ -542,7 +542,7 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 		return true
 	}
 
-	rd.LayerStack = append([]string(nil), layerList...)
+	rd.LayerStack = storedLayerStack(layerList)
 
 	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — the
 	// closure mutates a freshly-fetched live RD on every retry, so
@@ -557,7 +557,7 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 			return nil
 		}
 
-		live.LayerStack = append([]string(nil), layerList...)
+		live.LayerStack = storedLayerStack(layerList)
 
 		return nil
 	})
@@ -1540,7 +1540,7 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 		_ = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
 			func(rd *apiv1.ResourceDefinition) error {
 				if len(rd.LayerStack) == 0 {
-					rd.LayerStack = append([]string(nil), env.LayerList...)
+					rd.LayerStack = storedLayerStack(env.LayerList)
 				}
 
 				return nil
@@ -1707,7 +1707,7 @@ func (s *Server) refuseResourceCreateOnSPDeletedRace(w http.ResponseWriter, r *h
 
 		writeError(w, http.StatusNotFound,
 			"storage pool '"+pool+"' was deleted on node '"+res.NodeName+
-				"' concurrently with the resource create (Bug 145): "+
+				"' concurrently with the resource create: "+
 				"retry after re-creating the pool, or pick a different pool")
 
 		return false
@@ -1745,7 +1745,7 @@ func (s *Server) refuseResourceCreateOnNodeDeletedRace(w http.ResponseWriter, r 
 
 		writeError(w, http.StatusNotFound,
 			"node '"+res.NodeName+"' was deleted concurrently with "+
-				"the resource create (Bug 174): retry after re-creating "+
+				"the resource create: retry after re-creating "+
 				"the node, or pick a different node")
 
 		return false
@@ -2507,7 +2507,7 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 		err = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
 			func(live *apiv1.ResourceDefinition) error {
 				if len(live.LayerStack) == 0 {
-					live.LayerStack = append([]string(nil), req.LayerList...)
+					live.LayerStack = storedLayerStack(req.LayerList)
 				}
 
 				return nil

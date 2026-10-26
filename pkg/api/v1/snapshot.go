@@ -23,7 +23,7 @@ package v1
 //
 // Phase 10.4: `Annotations` carries the K8s-native
 // metadata.annotations of the underlying CRD. Used by the REST
-// KV-store rewrite to surface `blockstor.io/csi-shipping-data`
+// KV-store rewrite to surface `blockstor.org/csi-shipping-data`
 // (linstor-csi-snapshot-shipper per-snapshot bookkeeping)
 // without going through the deprecated KVEntry CRD. Not part of
 // upstream LINSTOR's wire shape — golinstor ignores unknown JSON
@@ -129,4 +129,7 @@ const (
 	SnapshotFlagFailedDeployment = "FAILED_DEPLOYMENT"
 	SnapshotFlagFailedDisconnect = "FAILED_DISCONNECT"
 	SnapshotFlagSuccessful       = "SUCCESSFUL"
+	// SnapshotFlagDelete marks a snapshot whose delete was issued and has
+	// not finished: a finalizer still holds it.
+	SnapshotFlagDelete = "DELETE"
 )

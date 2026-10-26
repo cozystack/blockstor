@@ -65,13 +65,11 @@ func parseInt32(text, what string) (int32, error) {
 // CLI writes the CRDs directly, and the field carries no enum or CEL rule, so
 // without this check there is no backstop anywhere on this path.
 //
-// The value is stored as the operator typed it, matching what REST persists;
-// the satellite compares case-insensitively, so only the spelling is at issue
-// here, not the case.
+// The value is stored in canonical case, as the REST doors store it: some
+// readers compare the stored stack exactly, so `drbd,storage` kept as typed
+// read as a stack without DRBD to them.
 func parseLayerList(raw string) ([]string, error) {
-	layers := splitList(raw)
-
-	err := validate.LayerStack(layers)
+	layers, err := validate.CanonicalLayerStack(splitList(raw))
 	if err != nil {
 		//nolint:wrapcheck // a semantic refusal; see checkVolumeSize
 		return nil, err
@@ -607,7 +605,13 @@ func snapshotDelete(ctx context.Context, run *runContext) error {
 
 	rdName, snapName := run.Flags.Positionals[0], run.Flags.Positionals[1]
 
-	err := run.Store.Snapshots().Delete(ctx, rdName, snapName)
+	// The same release the REST door runs: see store.ReleaseRestoreSource.
+	err := store.ReleaseRestoreSource(ctx, run.Store, rdName, snapName)
+	if err != nil {
+		return fmt.Errorf("delete snapshot %s of %s: %w", snapName, rdName, err)
+	}
+
+	err = run.Store.Snapshots().Delete(ctx, rdName, snapName)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete snapshot %s of %s: %w", snapName, rdName, err)
 	}

@@ -1423,7 +1423,7 @@ func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, er
 // Bug 162 (P0): every non-sentinel branch routes the message through
 // scrubImplDetails before emitting. Without scrubbing, an etcd-side
 // rejection ("etcdserver: request is too large") or an apimachinery
-// status error ("controllerconfigs.blockstor.cozystack.io ...")
+// status error ("controllerconfigs.blockstor.org ...")
 // reached the wire verbatim, leaking the persistence backend's
 // identity. Bug 146 already scrubbed the inbound JSON-decode path;
 // this is the matching outbound guard.
@@ -1515,6 +1515,13 @@ func writeStoreErrorTyped(w http.ResponseWriter, err error, kind storeResourceKi
 // answers in CloneStarted, which python-linstor decodes whatever the status.
 func storeErrorRc(err error, kind storeResourceKind) (int, apiv1.APICallRc) {
 	switch {
+	case errors.Is(err, store.ErrRestoreSourceReaping):
+		// Retryable, and no FAIL_EXISTS band: linstor-csi reads that as a
+		// volume already there.
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails(err.Error()),
+		}
 	case errors.Is(err, store.ErrAlreadyExists):
 		return http.StatusConflict, apiv1.APICallRc{
 			RetCode: apiCallRcError | existsSubCodeForKind(kind),
@@ -1524,6 +1531,18 @@ func storeErrorRc(err error, kind storeResourceKind) (int, apiv1.APICallRc) {
 		return http.StatusNotFound, apiv1.APICallRc{
 			RetCode: apiCallRcError | notFoundSubCodeForKind(kind),
 			Message: scrubImplDetails(err.Error()),
+		}
+	case errors.Is(err, store.ErrLayerStackUndecided):
+		// Not the caller's to fix and not permanent: the controller pins the
+		// stack on its next pass over the definition, and linstor-csi retries
+		// a 503 with the same body.
+		return http.StatusServiceUnavailable, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails(err.Error()),
+			Cause: "the definition's volumes are laid down under its group's layer stack or the " +
+				"default one depending on whether it already holds data, and the controller " +
+				"has not decided that yet",
+			Correc: "retry shortly; the controller writes the layer stack onto the definition",
 		}
 	case apierrors.IsConflict(err):
 		// Optimistic-lock conflict. Generic message — the apimachinery
@@ -1607,7 +1626,7 @@ func notFoundSubCodeForKind(kind storeResourceKind) int64 {
 //
 // Bug 199 (P2): every message goes through `scrubImplDetails` before
 // hitting the wire. Bug 162 fixed `writeStoreError`'s default branch
-// to scrub etcd / apimachinery / k8s.io / `*.blockstor.cozystack.io` substrings
+// to scrub etcd / apimachinery / k8s.io / `*.blockstor.org` substrings
 // out of the response body, but 51 other call sites in pkg/rest/
 // reach `writeError` directly with the raw `err.Error()` from the
 // K8s-backed store (controller_props, snapshot_multi, autoplace,
