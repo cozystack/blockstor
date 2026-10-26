@@ -69,6 +69,12 @@ const PropKeyCanonical = "DrbdOptions/EncryptPassphrase"
 // refused and dropped the same way.
 const PropKeyLegacy = "DrbdOptions/Encryption/passphrase"
 
+// PropKeyVolume is upstream LINSTOR's per-volume passphrase property,
+// stamped by `linstor vd set-passphrase`. blockstor has no per-volume
+// keys: every LUKS volume uses the cluster passphrase, so the door that
+// wrote it is refused and the key is refused and dropped like the others.
+const PropKeyVolume = "DrbdOptions/Encrypt/Passphrase"
+
 // WirePropKey is the property the satellite's LUKS layer reads the
 // passphrase from. Only the dispatcher sets it, from the Secret; a
 // property of that name an operator set is refused and dropped too.
@@ -78,7 +84,7 @@ const WirePropKey = "LuksPassphrase"
 // passphrase in a property. Matched without regard to case, so no
 // spelling slips through.
 func IsPlaintextPropKey(key string) bool {
-	for _, k := range []string{PropKeyCanonical, PropKeyLegacy, WirePropKey} {
+	for _, k := range []string{PropKeyCanonical, PropKeyLegacy, PropKeyVolume, WirePropKey} {
 		if strings.EqualFold(key, k) {
 			return true
 		}
