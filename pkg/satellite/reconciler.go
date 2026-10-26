@@ -257,6 +257,10 @@ type Reconciler struct {
 	// recovery by `grace` (default 30s).
 	seenStuckAt map[string]time.Time
 
+	// lastRecordedGI is the last GI RecordObservedGI wrote per
+	// "<resource>/<volume>", so a steady GI is not rewritten every tick.
+	lastRecordedGI map[string]string
+
 	// restoreBlankFallback records, per "<resource>/<volNumber>", that a
 	// snapshot-restore-backed volume could NOT be materialised from the
 	// snapshot on THIS node and fell back to a blank CreateVolume (no local
@@ -893,6 +897,12 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 					Message: err.Error(),
 				}, nil
 			}
+		}
+
+		err := r.forgetGIHistory(req.GetName())
+		if err != nil {
+			//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
+			return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
 		}
 	}
 
@@ -3542,38 +3552,12 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 
 		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
 
-		// A dirty activity log means the metadata is THERE, unreadable
-		// until it is applied — and this is where blockstor cannot yet
-		// tell two very different situations apart.
-		//
-		// A lower disk just materialised carries someone else's
-		// superblock: a ZFS clone or snapshot receive brings the
-		// source's, and a volume carved from a pool that has been used
-		// before brings whatever the previous tenant left. Both need
-		// metadata of their own, and re-initialising is the point of
-		// the step. But an established replica that went down while
-		// Primary and writing leaves an activity log that looks
-		// IDENTICAL to drbdmeta, and create-md --force there destroys
-		// its GI and dirty bitmap.
-		//
-		// firstActivation does not separate them: it is per RESOURCE,
-		// so adding a volume to a live resource arrives with
-		// firstActivation=false on a lower disk that is nonetheless
-		// brand new. Gating on it stalled exactly that — the e2e suite
-		// caught vol-1 never leaving Diskless while the kernel had it
-		// UpToDate, because the reconcile aborted before stamping
-		// status.
-		//
-		// So the pre-existing behaviour stands for now: treat it as
-		// "no usable metadata" and re-initialise. That is fail-open on
-		// the crash-recovery case, which is a real exposure and is NOT
-		// made better by this comment — it is recorded here because
-		// closing it needs a per-VOLUME record of "we have initialised
-		// this before", which does not exist today. That record, and
-		// the apply-al repair that should replace re-initialisation
-		// once it does, belong in their own change with their own e2e.
+		// A dirty activity log means the metadata is there and cannot be
+		// read until it is applied; see repairUncleanMetadata for how
+		// this replica's own crash is told apart from a superblock that
+		// is not its own.
 		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
-			hasMD, probeErr = false, nil
+			hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol)
 		}
 
 		if probeErr != nil {
@@ -3706,6 +3690,84 @@ func isInitialUpToDateWinner(dr *intent.DesiredResource, firstActivation bool) b
 		!dr.GetPeerHasData()
 }
 
+// repairUncleanMetadata answers a metadata probe that found a dirty activity
+// log. It returns whether the volume now carries usable metadata of its own
+// (true: keep it), or false for "initialise it", which is what the caller
+// did for every dirty log before.
+//
+// drbdmeta words two different situations the same way. A replica that went
+// down while Primary and writing left its own activity log open, and
+// create-md --force over it destroys its generation identifiers and dirty
+// bitmap; if it is the only up-to-date copy, that is the copy. A lower disk
+// just materialised can carry somebody else's superblock: a ZFS clone or a
+// snapshot receive brings the source's, and an extent reused from a pool
+// brings the previous tenant's. That one needs metadata of its own.
+//
+// The record that separates them is the set of GIs this replica's volume was
+// seen to carry: the satellite's own history file (RecordObservedGI), plus the
+// GI in the Resource status. A volume with neither never carried established
+// metadata here, so it is initialised as before: a clone, a receive, a volume
+// added to a live resource, a replica created again. One with a record is
+// repaired with apply-al and then checked: some UUID now in its metadata, the
+// current one, a peer slot's bitmap UUID or a history UUID, has to be one it
+// was seen with, or the superblock is not this replica's and it is
+// initialised after all. A repair or a check that fails is an error, not a
+// re-initialisation: the record proves there was data-bearing metadata here.
+//
+// External metadata takes the same check: dump-md finds the meta disk from
+// the rendered .res, wherever it lives.
+func (r *Reconciler) repairUncleanMetadata(
+	ctx context.Context, rdName string, vol *intent.DesiredVolume,
+) (bool, error) {
+	target := fmt.Sprintf("%s/%d", rdName, vol.GetVolumeNumber())
+	logger := log.FromContext(ctx).WithValues("volume", target)
+
+	known := r.recordedGIs(rdName, vol.GetVolumeNumber())
+	if observed := vol.GetObservedGI(); observed != "" {
+		known = append(known, observed)
+	}
+
+	if len(known) == 0 {
+		logger.Info("dirty activity log on a volume with no recorded GI; initialising its metadata")
+
+		return false, nil
+	}
+
+	err := r.cfg.Adm.ApplyAL(ctx, target)
+	if err != nil {
+		return false, errors.Wrapf(err, "apply the activity log of %s, which this replica held established metadata on", target)
+	}
+
+	onDisk, err := r.cfg.Adm.MetadataUUIDs(ctx, target)
+	if err != nil {
+		return false, errors.Wrapf(err, "read the metadata of %s after apply-al", target)
+	}
+
+	if !anySameGeneration(onDisk, known) {
+		logger.Info("the superblock under a dirty activity log is not this replica's; initialising its metadata",
+			"recordedGIs", known, "onDisk", onDisk)
+
+		return false, nil
+	}
+
+	logger.Info("repaired the activity log left by an unclean shutdown")
+
+	return true, nil
+}
+
+// anySameGeneration reports whether some UUID in onDisk is one of known.
+func anySameGeneration(onDisk, known []string) bool {
+	for _, a := range onDisk {
+		for _, b := range known {
+			if drbd.SameGeneration(a, b) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // ensurePerVolumeMetadata stamps DRBD-9 metadata on every diskful
 // volume of `dr` that lacks it. Mirrors upstream LINSTOR's
 // DrbdLayer.adjustResource (satellite/.../DrbdLayer.java L702-723):
@@ -3767,15 +3829,11 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 
 		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
 
-		// Same open problem as in ensureMetadata, and the same
-		// resolution for now. This helper runs past first activation,
-		// which reads like "established replica" — but the volume it is
-		// stamping can be one just added to a live resource, on a lower
-		// disk carved from a recycled pool extent whose previous tenant
-		// left an unclean superblock behind. Refusing here stalled that
-		// path outright.
+		// The same repair as in ensureMetadata: a volume just added to
+		// a live resource has no reported GI and is initialised, an
+		// established one that crashed is repaired.
 		if errors.Is(probeErr, drbd.ErrMetadataUnclean) {
-			hasMD, probeErr = false, nil
+			hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol)
 		}
 
 		if probeErr != nil {
