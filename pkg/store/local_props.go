@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
@@ -42,6 +43,70 @@ const RollbackAbandonedProp = "BlockstorRollbackAbandoned"
 // RollbackInProgress is the value RollbackAbandonedProp carries while a
 // rollback is running, before it reports the step it stopped at.
 const RollbackInProgress = "in-progress"
+
+// RollbackSinceProp records when the in-progress mark was written, in RFC
+// 3339. A rollback that is still running holds the mark for less than its
+// budget; one whose process was killed between writing the mark and taking it
+// off leaves it for good, and every retry over it answered 409 until somebody
+// cleared it by hand. With the time on it, a retry takes over a mark older
+// than StaleRollbackAfter (TakeOverStaleRollback).
+const RollbackSinceProp = "Blockstor/RollbackSince"
+
+// StaleRollbackAfter is how long an in-progress mark may stand before a retry
+// takes it over. Every rollback runs on a budget, the REST door's detached one
+// or CLIRollbackBudget, and every write it makes after that lands on an
+// expired context, so a mark older than this has nobody behind it. The margin
+// covers clock skew between the machines that wrote and read the mark: the
+// API server replicas, and the operator's machine for a CLI rollback. Should a
+// skewed clock let a retry take over early, a rollback still running finds
+// the mark gone at its next step and stands down without deleting.
+const StaleRollbackAfter = 2 * time.Minute
+
+// CLIRollbackBudget bounds a CLI rollback the way the REST door's detached
+// budget bounds its own, so every rollback that writes an in-progress mark
+// is over well before StaleRollbackAfter lets a retry take the mark over.
+const CLIRollbackBudget = time.Minute
+
+// MarkRollback writes the rollback mark into props: the in-progress mark with
+// the time it was written, or a step, which stands until an operator acts and
+// carries no time.
+func MarkRollback(props map[string]string, step string, now time.Time) map[string]string {
+	if props == nil {
+		props = map[string]string{}
+	}
+
+	props[RollbackAbandonedProp] = step
+
+	if step == RollbackInProgress {
+		props[RollbackSinceProp] = now.UTC().Format(time.RFC3339)
+	} else {
+		delete(props, RollbackSinceProp)
+	}
+
+	return props
+}
+
+// UnmarkRollback removes the rollback mark and its time.
+func UnmarkRollback(props map[string]string) {
+	delete(props, RollbackAbandonedProp)
+	delete(props, RollbackSinceProp)
+}
+
+// rollbackMarkStale reports whether props carry an in-progress mark written
+// more than StaleRollbackAfter before now. A mark with no readable time is
+// never stale: it is taken off by hand, as before.
+func rollbackMarkStale(props map[string]string, now time.Time) bool {
+	if props[RollbackAbandonedProp] != RollbackInProgress {
+		return false
+	}
+
+	since, err := time.Parse(time.RFC3339, props[RollbackSinceProp])
+	if err != nil {
+		return false
+	}
+
+	return now.Sub(since) > StaleRollbackAfter
+}
 
 // RestoreAdoptedProp marks a definition that a retry adopted as the leftover of
 // an earlier attempt at the same clone or restore, before it wrote anything
@@ -157,6 +222,7 @@ func RecordedRestoreVolumes(props map[string]string) ([]apiv1.SnapshotVolumeDef,
 func TravellingProps(props map[string]string) map[string]string {
 	out := maps.Clone(props)
 	delete(out, RollbackAbandonedProp)
+	delete(out, RollbackSinceProp)
 	delete(out, RestoreAdoptedProp)
 	delete(out, RestoreFromSnapshotProp)
 	delete(out, RestoreVolumesProp)
@@ -176,6 +242,7 @@ func TravellingProps(props map[string]string) map[string]string {
 var serverOwnedDefinitionProps = []string{ //nolint:gochecknoglobals // a fixed list, read only
 	RestoreFromSnapshotProp,
 	RollbackAbandonedProp,
+	RollbackSinceProp,
 	RestoreAdoptedProp,
 	RestoreVolumesProp,
 	CloneSnapshotOwnerProp,
@@ -254,7 +321,7 @@ func RollbackMarkClearRefusal(before, after map[string]string) error {
 // same delete (`set-property KEY ""`), and is read as one.
 func ServerOwnedPropEditByOperator(overrideProps map[string]string, deleteProps, deleteNamespaces []string) string {
 	clearable := func(k string) bool {
-		return k == RollbackAbandonedProp || k == RestoreAdoptedProp || k == RestoreFromSnapshotProp
+		return k == RollbackAbandonedProp || k == RollbackSinceProp || k == RestoreAdoptedProp || k == RestoreFromSnapshotProp
 	}
 	kept := slices.DeleteFunc(slices.Clone(deleteProps), clearable)
 
