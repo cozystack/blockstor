@@ -77,9 +77,10 @@ func TestThickCreateVolumeLeavesAnLVUnderTheVolumesNameAlone(t *testing.T) {
 }
 
 // A crash between the create and the rename leaves the temporary LV. It was
-// never exposed under the volume's name, so the next call wipes it and
-// renames it rather than creating another.
-func TestThickCreateVolumeFinishesATemporaryLVACrashLeft(t *testing.T) {
+// never exposed under the volume's name, so the next call removes it and
+// creates the LV again at the volume's current size, which the leftover
+// need not have.
+func TestThickCreateVolumeReplacesATemporaryLVACrashLeft(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect(lvsVG, storage.FakeResponse{Stdout: []byte("  pvc-1_00000.bsnew\n")})
 
@@ -88,13 +89,11 @@ func TestThickCreateVolumeFinishesATemporaryLVACrashLeft(t *testing.T) {
 	}
 
 	lines := fx.CommandLines()
-	if slices.Contains(lines, lvcreateLV) {
-		t.Errorf("created a second LV over the leftover: %v", lines)
-	}
+	rm := slices.Index(lines, "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_00000.bsnew")
+	c, w, r := slices.Index(lines, lvcreateLV), slices.Index(lines, wipeFresh), slices.Index(lines, renameLV)
 
-	w, r := slices.Index(lines, wipeFresh), slices.Index(lines, renameLV)
-	if w < 0 || r < 0 || w >= r {
-		t.Errorf("want the leftover wiped, then renamed; got %v", lines)
+	if rm < 0 || c < rm || w < c || r < w {
+		t.Errorf("want the leftover removed, then a new LV created, wiped and renamed; got %v", lines)
 	}
 }
 

@@ -73,8 +73,9 @@ func (*Thick) ResizeZeroFills() bool { return false }
 // created under a temporary name (freshLVName), wiped there, and only
 // then renamed to the volume's name: nothing ever finds an unwiped LV
 // under a name it treats as a volume, this satellite after a crash or an
-// older one after a rollback. A temporary LV left by a crash is wiped
-// and renamed by the next call; it was never exposed.
+// older one after a rollback. A temporary LV left by a crash was never
+// exposed, so the next call removes it and creates the LV again, at the
+// size the volume has now rather than whatever the crashed call asked.
 func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	final := volumeLVName(vol)
 	fresh := freshLVName(final)
@@ -88,24 +89,29 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 		return nil
 	}
 
-	if !names[fresh] {
-		sizeMiB := max(vol.SizeKib/mibPerKib, 1)
-
-		// Skip the optional zero-on-create step (-Wn -Zn) — the satellite
-		// container has no udev daemon, and the wipe trips on the missing
-		// /dev/<vg>/<lv> symlink. Same trick as install-pools.sh. Bug 305:
-		// the udev-less activation section rides in the SAME single
-		// `--config` as the device filter (ArgsUdevless) — a separate
-		// `--config activation{…}` would be a repeated `--config`, which
-		// the LVM CLI rejects.
-		_, err = t.exec.Run(ctx, "lvcreate",
-			ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
-				"--name", fresh,
-				"-Wn", "-Zn",
-				t.cfg.VolumeGroup)...)
+	if names[fresh] {
+		_, err = t.exec.Run(ctx, "lvremove", Args("--force", t.cfg.VolumeGroup+"/"+fresh)...)
 		if err != nil {
-			return errors.Wrapf(err, "lvcreate %s", fresh)
+			return errors.Wrapf(err, "lvremove the leftover %s", fresh)
 		}
+	}
+
+	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+
+	// Skip the optional zero-on-create step (-Wn -Zn) — the satellite
+	// container has no udev daemon, and the wipe trips on the missing
+	// /dev/<vg>/<lv> symlink. Same trick as install-pools.sh. Bug 305:
+	// the udev-less activation section rides in the SAME single
+	// `--config` as the device filter (ArgsUdevless) — a separate
+	// `--config activation{…}` would be a repeated `--config`, which
+	// the LVM CLI rejects.
+	_, err = t.exec.Run(ctx, "lvcreate",
+		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+			"--name", fresh,
+			"-Wn", "-Zn",
+			t.cfg.VolumeGroup)...)
+	if err != nil {
+		return errors.Wrapf(err, "lvcreate %s", fresh)
 	}
 
 	device := "/dev/" + t.cfg.VolumeGroup + "/" + fresh
