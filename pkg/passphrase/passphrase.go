@@ -70,7 +70,7 @@ const PropKeyCanonical = "DrbdOptions/EncryptPassphrase"
 const PropKeyLegacy = "DrbdOptions/Encryption/passphrase"
 
 // PropKeyVolume is upstream LINSTOR's per-volume passphrase property,
-// stamped by `linstor vd set-passphrase`. blockstor has no per-volume
+// stamped by `linstor vd modify-passphrase`. blockstor has no per-volume
 // keys: every LUKS volume uses the cluster passphrase, so the door that
 // wrote it is refused and the key is refused and dropped like the others.
 const PropKeyVolume = "DrbdOptions/Encrypt/Passphrase"

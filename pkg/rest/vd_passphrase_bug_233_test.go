@@ -29,7 +29,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// `linstor vd set-passphrase` (PUT .../volume-definitions/{vlmNr}/
+// `linstor vd modify-passphrase` (PUT .../volume-definitions/{vlmNr}/
 // encryption-passphrase) is refused. blockstor has no per-volume LUKS
 // keys: every LUKS volume uses the cluster passphrase in the Secret. The
 // door used to store the value in the volume definition's properties, in

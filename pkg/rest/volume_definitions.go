@@ -104,7 +104,7 @@ func (s *Server) registerVolumeDefinitions(mux *http.ServeMux) {
 	// (`{"new_passphrase":"…"}`). We also accept the bare-string
 	// `PassPhraseEnter` shape symmetric with the Bug 173 dual-form
 	// cluster-passphrase PATCH. Pre-fix this 404'd, breaking
-	// `linstor vd set-passphrase` entirely. Path uses `{vlmNr}` to
+	// `linstor vd modify-passphrase` entirely. Path uses `{vlmNr}` to
 	// match the upstream OpenAPI spec.
 	mux.HandleFunc(
 		"PUT /v1/resource-definitions/{rd}/volume-definitions/{vlmNr}/encryption-passphrase",

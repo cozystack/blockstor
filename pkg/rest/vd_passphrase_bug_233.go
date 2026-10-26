@@ -23,7 +23,7 @@ import (
 	"strconv"
 )
 
-// handleVDPassphraseRotate serves `linstor vd set-passphrase` (PUT
+// handleVDPassphraseRotate serves `linstor vd modify-passphrase` (PUT
 // .../volume-definitions/{vlmNr}/encryption-passphrase) and refuses it.
 // blockstor has no per-volume LUKS keys: every LUKS volume is formatted
 // and opened with the cluster passphrase in the Secret. The door used to

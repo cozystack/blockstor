@@ -212,4 +212,22 @@ for node in "$N1" "$N2"; do
     fi
 done
 
+echo ">> [Bug 023] vd modify-passphrase is REFUSED (no per-volume keys)"
+if "${LCTL[@]}" volume-definition modify-passphrase "$RD" 0 'cli-matrix-023-vd-decoy' >/dev/null 2>&1; then
+    echo "FAIL (Bug 023): vd modify-passphrase was accepted; it stored a plaintext per-volume key nothing reads" >&2
+    exit 1
+fi
+
+echo ">> [Bug 023] encryption modify-passphrase is REFUSED while the LUKS volume exists"
+if "${LCTL[@]}" encryption modify-passphrase --old-passphrase "$PASSPHRASE" \
+        --new-passphrase 'cli-matrix-023-rotated' >/dev/null 2>&1; then
+    echo "FAIL (Bug 023): the cluster passphrase rotated under a LUKS volume nothing re-keys" >&2
+    exit 1
+fi
+backing=$(luks_backing_device "$RD" "$N1" 0)
+if ! assert_luks_passphrase_opens "$N1" "$backing" "$PASSPHRASE"; then
+    echo "FAIL (Bug 023): the passphrase no longer opens $N1:$backing after the refused rotation" >&2
+    exit 1
+fi
+
 echo ">> encryption-passphrase-luks-rd OK (Bug 023: Secret-only passphrase provisions LUKS end-to-end, no legacy prop)"
