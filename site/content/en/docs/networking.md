@@ -12,7 +12,7 @@ Blockstor's components do not talk to each other directly. They read and write t
 | Component | Port | Protocol | Who connects | Reachable from |
 |---|---|---|---|---|
 | blockstor-apiserver | 3371 | HTTPS with mutual TLS | `linstor-csi`, piraeus-operator, `ha-controller`, the `linstor` client | The Services `blockstor-apiserver` and `blockstor-controller` in `blockstor-system` |
-| blockstor-apiserver | 3370 | Plain HTTP, no authentication | `kubectl port-forward` for debugging | The pod only. Not in any Service. |
+| blockstor-apiserver | 3370 | Plain HTTP, no authentication | `kubectl port-forward` for debugging | Every pod that can reach the API server's pod IP, unless a NetworkPolicy blocks it. Not in any Service. |
 | blockstor-apiserver | 8081 | HTTP `/healthz`, `/readyz` | kubelet | The pod |
 | blockstor-controller | 8081 | HTTP `/healthz`, `/readyz` | kubelet | The pod |
 | blockstor-satellite | 9100 | Plain HTTP, no authentication | Other satellites, to fetch a snapshot stream | The node's own address |
@@ -30,7 +30,28 @@ Satellites do not dial the controller, and the controller does not dial satellit
 
 Port 3371 requires a client certificate and verifies it against the CA bundle given by `--tls-client-ca-file`. The manifests create that CA with cert-manager as the `blockstor-api-ca` Issuer, and issue one client certificate into the Secret `blockstor-apiserver-client-tls`. The serving certificate covers both Service names, `blockstor-apiserver` and `blockstor-controller`, with and without the `.blockstor-system.svc.cluster.local` suffix. The API server reloads certificates on rotation without a restart.
 
-Port 3370 serves the same API without TLS and without authentication. It exists for debugging, and it is not exposed by any Service. Reach it with a port-forward when you need it, for example for the `linstor` client. See [Compatibility with LINSTOR](../compatibility/#using-the-linstor-client).
+Port 3370 serves the same API without TLS and without authentication. It exists for debugging. The manifests start the API server with `--rest-bind-address=:3370`, which listens on every address of the pod, and they ship no NetworkPolicy. Leaving the port out of the Service only means it has no stable name: any pod that can reach an API server pod's IP gets full read and write access to the API on that port, without a certificate.
+
+Fence it with a NetworkPolicy. This one admits only the TLS port and the probe port to the API server pods, so port 3370 is refused from other pods:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: blockstor-apiserver
+  namespace: blockstor-system
+spec:
+  podSelector:
+    matchLabels:
+      app: blockstor-apiserver
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - {protocol: TCP, port: 3371}
+        - {protocol: TCP, port: 8081}
+```
+
+A NetworkPolicy only takes effect if your CNI enforces it. `kubectl port-forward` still works with this policy in place, because it connects from inside the pod's network namespace. That is the way to reach port 3370 when you need it, for example for the `linstor` client. See [Compatibility with LINSTOR](../compatibility/#using-the-linstor-client).
 
 ## DRBD replication
 
@@ -49,15 +70,22 @@ A firewall between storage nodes must allow the whole port range you use, in bot
 
 ## Which address replication uses
 
-Each blockstor `Node` lists its addresses in `spec.netInterfaces`. `blockstor node create <name> <address>` writes one interface named `default`. DRBD peers connect to that address, so it has to be the node's own IP as seen by the other nodes. A pod IP does not work, because it is only routable inside the CNI.
+Each blockstor `Node` lists its addresses in `spec.netInterfaces`. `blockstor node create <name> <address>` writes one interface named `default`. DRBD peers connect to that address when nothing earlier in the order below applies, so it has to be the node's own IP as seen by the other nodes. A pod IP does not work, because it is only routable inside the CNI.
 
-The satellite also publishes the Kubernetes node's `InternalIP` as an interface named `k8s-internal`, and the controller prefers it when it writes peer addresses: `k8s-internal` first, then `default`, then the first interface with an address. This is what keeps replication working when another tool, such as piraeus-operator, overwrites the first interface with a pod IP. It needs the satellite's permission to read Kubernetes `nodes`, which the manifests grant.
+Each satellite renders the DRBD configuration of its own node, peer addresses included. Before it renders, it adds the Kubernetes node's `InternalIP` to every node's interface list as an interface named `k8s-internal`. That interface exists only in the satellite's memory and never shows up on the `Node` object. It needs the satellite's permission to read Kubernetes `nodes`, which the manifests grant.
+
+The address of a peer is picked in this order:
+
+1. `spec.satelliteEndpoint` on the blockstor `Node`, if set.
+2. The interface named `k8s-internal`.
+3. The interface named `default`.
+4. The first interface with an address.
+
+This order is what keeps replication working when another tool, such as piraeus-operator, overwrites the first interface with a pod IP.
 
 ## Snapshot stream between satellites
 
 When a clone or a snapshot restore needs data from a snapshot on another node, the receiving satellite fetches the raw snapshot stream from the satellite that holds it, with an HTTP `GET` on port 9100. The stream has no authentication and no encryption. Keep that port reachable only between storage nodes, with a NetworkPolicy or a host firewall. If the port is blocked, the clone falls back to a DRBD initial sync, which is slower but works.
-
-In the next release the stream moves from port 9100 to port 3372, and the satellite stops opening the metrics listener on port 8080. Open the new port between storage nodes before you upgrade the satellites.
 
 ## What a firewall must allow
 
@@ -75,11 +103,11 @@ On each node, for kubelet:
 - Port 9101 on the node for the satellite's probes.
 - Port 8081 inside the controller and API server pods for theirs.
 
-Nothing needs to reach port 3370 or the satellite's port 8080.
+Nothing needs to reach port 3370 or the satellite's port 8080. Block port 3370 with the NetworkPolicy shown [above](#the-api-server), and port 8080 with a host firewall.
 
 ## Ports without authentication
 
-- 3370 on the API server. Full read and write access to the API. Not exposed by a Service.
+- 3370 on the API server. Full read and write access to the API from any pod that can reach the API server's pod IP. Not exposed by a Service, but not fenced either; add the NetworkPolicy above.
 - 9100 on every storage node. Reads raw snapshot data.
 - 8080 on every storage node. Metrics only.
 

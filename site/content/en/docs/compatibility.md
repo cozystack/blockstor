@@ -23,7 +23,7 @@ Blockstor implements the LINSTOR REST API, so `linstor-csi`, `piraeus-operator`,
 
 | Area | LINSTOR | Blockstor |
 |---|---|---|
-| Active network interface | `linstor node interface modify --active` switches the satellite's connection to another interface. | Has no effect. The first interface of a node is always the active one; to make another interface active, put it first. A change of address reaches DRBD after the node's satellite pod restarts. |
+| Active network interface | `linstor node interface modify --active` switches the satellite's connection to another interface. | Has no effect. DRBD uses the address picked in the order described in [Networking and ports](../networking/#which-address-replication-uses), not an active flag. A change of address reaches DRBD after the node's satellite pod restarts. |
 | Default action on lost quorum | `on-no-quorum io-error` | `on-no-quorum suspend-io`: I/O blocks until quorum returns and then resumes, so a replica that was cut off does not get stuck after the network heals. |
 | Shrinking a volume | Allowed for stacks that support it. | Refused unless you pass `--force`. |
 | DRBD ports and minors | Ports from 7000, minors from 1000. | Ports from 20000 to 20999, minors from 20000. Blockstor can run on the same nodes as LINSTOR without collisions. Change the port range per node with the `DrbdOptions/TcpPortRange` property. |
@@ -37,7 +37,7 @@ Blockstor implements the LINSTOR REST API, so `linstor-csi`, `piraeus-operator`,
 
 ## Using the `linstor` client
 
-The `linstor` client works against blockstor's API server. Port-forward the plain HTTP port, which is reachable only from inside the pod, and point the client at it:
+The `linstor` client works against blockstor's API server. Port-forward the plain HTTP port and point the client at it. That port has no authentication and, unless you fence it with a NetworkPolicy, any pod that can reach the API server's pod IP can use it; see [Networking and ports](../networking/#the-api-server).
 
 ```sh
 kubectl -n blockstor-system port-forward deploy/blockstor-apiserver 3370:3370

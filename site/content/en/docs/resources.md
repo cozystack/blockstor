@@ -24,7 +24,7 @@ Most objects have a `spec` you write and a `status` that blockstor writes. The e
 
 ## Node
 
-A node that runs the satellite. The address of the first network interface is the one DRBD uses for replication.
+A node that runs the satellite. DRBD replication uses one of its addresses: `spec.satelliteEndpoint` if set, then the Kubernetes node's `InternalIP` that the satellite adds as `k8s-internal`, then the interface named `default`, then the first interface with an address. See [Networking and ports](../networking/#which-address-replication-uses).
 
 ```yaml
 apiVersion: blockstor.cozystack.io/v1alpha1
