@@ -27,7 +27,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -888,26 +887,9 @@ func layerStackFromLayerData(data []apiv1.ResourceLayer) []string {
 	return out
 }
 
-// drbdEncryptPassphraseKey is the upstream LINSTOR controller-scope
-// property the operator sets via `linstor controller set-property
-// DrbdOptions/EncryptPassphrase <passphrase>` to seed the cluster's
-// LUKS master key material. Bug 95 requires SOME master passphrase
-// as a hard prerequisite for accepting an RD whose LayerStack
-// carries LUKS — without it, the satellite's `cryptsetup luksFormat`
-// has no key to format the volume with and the layer chain silently
-// fell back to plaintext-on-DRBD before this gate landed.
-//
-// Bug 023: this prop is the LEGACY mechanism — it stores the
-// passphrase in PLAINTEXT on the ControllerConfig CRD. The primary
-// (upstream-parity) mechanism is the encryption Secret stamped by
-// `linstor encryption create-passphrase`; the prop stays accepted
-// for clusters that provisioned before the Secret path existed.
-const drbdEncryptPassphraseKey = passphrase.PropKeyCanonical
-
 // ErrLUKSRequiresPassphrase is the static sentinel surfaced as a 400
 // when an RD-create body asks for a LUKS layer but the cluster has
-// no master passphrase — neither the encryption Secret (primary)
-// nor the legacy `DrbdOptions/EncryptPassphrase` controller prop.
+// no master passphrase in the encryption Secret.
 // Sentinel-shaped to match the layer-validation style; the handler
 // wraps it with the human-readable remediation hint.
 var ErrLUKSRequiresPassphrase = errors.New(
@@ -921,20 +903,9 @@ var ErrLUKSRequiresPassphrase = errors.New(
 // prerequisite immediately instead of waiting for replicas to come
 // up plaintext.
 //
-// Two accepted sources, checked in order (Bug 023):
-//
-//  1. The encryption Secret written by `linstor encryption
-//     create-passphrase` (POST /v1/encryption/passphrase) — the
-//     upstream-standard flow and the PRIMARY mechanism. Pre-fix the
-//     gate ignored it entirely, so the documented create-passphrase
-//     → LUKS-RD-create sequence 400'd and the hint told operators
-//     to stamp a PLAINTEXT passphrase into a controller prop.
-//  2. The legacy `DrbdOptions/EncryptPassphrase` controller prop —
-//     deprecated (plaintext on the CRD) but kept for backward
-//     compatibility with clusters provisioned before the Secret
-//     path existed. The satellite-facing dispatch keeps honouring
-//     it with unchanged precedence (props win over the Secret) so
-//     existing LUKS volumes keep unlocking with the same key.
+// The only source is the encryption Secret written by `linstor
+// encryption create-passphrase` (POST /v1/encryption/passphrase). A
+// passphrase in a property is never read (pkg/passphrase).
 //
 // Falls through (nil) when the controller client is unconfigured —
 // the test-only code paths that build a Server without a Client
@@ -959,21 +930,8 @@ func (s *Server) refuseLUKSWithoutPassphrase(ctx context.Context, layers []strin
 		return nil
 	}
 
-	ctrl, err := controllerScopeProps(ctx, s.Client)
-	if err != nil {
-		return errors.Wrap(err, "read controller props for LUKS prereq check")
-	}
-
-	if ctrl[drbdEncryptPassphraseKey] != "" {
-		return nil
-	}
-
-	return errors.Wrapf(ErrLUKSRequiresPassphrase,
-		"run `linstor encryption create-passphrase` "+
-			"before creating a LUKS-layered RD (legacy alternative: "+
-			"`linstor controller set-property %s <passphrase>`, "+
-			"deprecated — stores the passphrase in plaintext)",
-		drbdEncryptPassphraseKey)
+	return errors.Wrap(ErrLUKSRequiresPassphrase,
+		"run `linstor encryption create-passphrase` before creating a LUKS-layered RD")
 }
 
 // resourceDefinitionModifyBody is the shape upstream golinstor sends
