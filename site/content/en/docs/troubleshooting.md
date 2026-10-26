@@ -92,15 +92,91 @@ The symptom is a replica that was the only copy, and after a node reboot comes b
 kubectl -n blockstor-system logs $POD -c satellite | grep -i -E 'create-md|apply-al|dump-md'
 ```
 
-Before it creates DRBD metadata, the satellite probes the device with `drbdmeta dump-md`. If the probe answers that metadata is present but its activity log needs applying, which is what an unclean shutdown of a writing `Primary` leaves behind, the current release treats that as missing metadata, creates it afresh and syncs the replica from its peers. That is fine when another replica holds the data. It is not fine when this replica is the only `UpToDate` copy, because recreating the metadata discards the generation identifiers and the dirty bitmap.
+Before it creates DRBD metadata, the satellite probes the device with `drbdadm dump-md`. If the probe answers that metadata is present but its activity log needs applying, which is what an unclean shutdown of a writing `Primary` leaves behind, the current release treats that as missing metadata, creates it afresh and syncs the replica from its peers. That is fine when another replica holds the data. It is not fine when this replica is the only `UpToDate` copy, because recreating the metadata discards the generation identifiers and the dirty bitmap.
 
-The probe runs when the satellite brings the resource up, which is at satellite start for a resource the kernel does not hold yet, for example after a node reboot. If the replica is the only copy you have, do not let the satellite get there. Keep the satellite pod off that node, and apply the activity log yourself from a privileged pod on the node that uses the satellite image and mounts `/dev`:
+### What the satellite cannot do
+
+The satellite cannot protect such a replica after an unplanned reboot. The DaemonSet starts the satellite as soon as the node is back. On start, the satellite removes the rendered `.res` file of every resource the kernel does not hold, and after a reboot the kernel holds none. The reconciler then renders the configuration again, runs the probe and creates the metadata afresh. Nothing in the current release stops that sequence. Keep a second replica with data of any volume you cannot lose.
+
+What you can do is prepare a way to keep the satellite off a node, and use it in the time between the node going down and the node booting again.
+
+### Keeping the satellite off a node
+
+A taint does not work: the DaemonSet tolerates every taint (`tolerations: [{operator: Exists}]`). Its node affinity does work. Add a condition on a label of your own choosing to it, once, ahead of time. The example uses the key `example.com/blockstor-satellite-hold`:
 
 ```sh
-drbdadm apply-al <definition>
+kubectl -n blockstor-system patch daemonset blockstor-satellite --type json -p '[{"op":"add","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/-","value":{"key":"example.com/blockstor-satellite-hold","operator":"DoesNotExist"}}]'
 ```
 
-Then let the satellite start again. The probe now sees clean metadata and skips `create-md`.
+This changes the pod template, so the DaemonSet rolls every satellite once, one node at a time. Re-apply the patch whenever you re-apply the satellite manifest, which overwrites it.
+
+When a node that holds the only copy of a volume goes down unexpectedly, label it before it boots again:
+
+```sh
+kubectl label node <node> example.com/blockstor-satellite-hold=true
+```
+
+The DaemonSet controller then deletes the satellite pod of that node. While the node is down, the pod stays `Terminating`. Force-delete it, so that the kubelet finds no satellite pod for the node when it comes back:
+
+```sh
+kubectl -n blockstor-system delete $POD --force --grace-period=0
+kubectl -n blockstor-system get pod -l app=blockstor-satellite --field-selector spec.nodeName=<node>
+```
+
+The second command must list no pod. Label first and delete second: deleted without the label, the pod is created again for the node at once.
+
+If the node is already back and the satellite has started, it is too late for that replica: the satellite log shows `create-md` for the resource.
+
+### Applying the activity log by hand
+
+With the satellite kept off, the `.res` file from before the reboot is still on the host, in `/var/lib/blockstor-drbd.d/<definition>.res`, because only a starting satellite removes it. Start a privileged pod on the node with the satellite's image, the host's `/dev` and that directory:
+
+```sh
+IMAGE=$(kubectl -n blockstor-system get daemonset blockstor-satellite \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="satellite")].image}')
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: drbd-repair
+  namespace: blockstor-system
+spec:
+  nodeName: <node>
+  restartPolicy: Never
+  tolerations: [{operator: Exists}]
+  containers:
+    - name: repair
+      image: $IMAGE
+      command: [sleep, infinity]
+      securityContext: {privileged: true}
+      volumeMounts:
+        - {name: dev, mountPath: /dev}
+        - {name: drbd-cfg, mountPath: /etc/drbd.d, readOnly: true}
+  volumes:
+    - {name: dev, hostPath: {path: /dev, type: Directory}}
+    - {name: drbd-cfg, hostPath: {path: /var/lib/blockstor-drbd.d, type: Directory}}
+EOF
+kubectl -n blockstor-system exec -it drbd-repair -- cat /etc/drbd.d/<definition>.res
+```
+
+In the `on <node>` block for this node, each `volume` has three lines you need: `device /dev/drbd<minor> minor <minor>;`, `disk <backing-device>;` and `meta-disk internal;`. The minor is also in `spec.volumeDefinitions[].drbdMinor` of the `ResourceDefinition`. These steps cover only `meta-disk internal`. If the `disk` device does not exist on the node after the reboot, for example because it is an encrypted volume's mapping that only the satellite opens, stop here: these steps do not cover bringing it up.
+
+For each volume, run `drbdmeta` directly against the backing device. It needs no configuration file. Give the minor as a plain number, without `--force`, so that `drbdmeta` locks the minor and refuses to touch a device the kernel has attached:
+
+```sh
+kubectl -n blockstor-system exec -it drbd-repair -- drbdmeta <minor> v09 <backing-device> internal dump-md
+kubectl -n blockstor-system exec -it drbd-repair -- drbdmeta <minor> v09 <backing-device> internal apply-al
+kubectl -n blockstor-system exec -it drbd-repair -- drbdmeta <minor> v09 <backing-device> internal dump-md
+```
+
+The first `dump-md` should fail with `Found meta data is "unclean", please apply-al first`. After `apply-al`, the second one prints the metadata. Then delete the repair pod and remove the label:
+
+```sh
+kubectl -n blockstor-system delete pod drbd-repair
+kubectl label node <node> example.com/blockstor-satellite-hold-
+```
+
+The satellite starts on the node again. Its probe now sees clean metadata and skips `create-md`, and the replica comes up with its generation identifiers and bitmap.
 
 ## Resource definitions left behind by CSI
 
@@ -141,7 +217,7 @@ Otherwise the events carry the `CreateVolume` error from the driver. The common 
 
 - The driver cannot reach the API server. See the TLS section below.
 - No pool with that name, or not enough nodes with it. Each replica needs a node that has a pool named as in the StorageClass's `storagePool` parameter, with free capacity. `blockstor storage-pool list` shows what exists. Blockstor places as many replicas as it can and reports the shortfall; it adds the rest when nodes with the pool appear.
-- The nodes are `OFFLINE`. The placer does not use them. Check the satellites.
+- The candidate nodes are excluded. The placer skips nodes that are evicted or lost, nodes with the property `AutoplaceTarget` set to `false`, and nodes without the pool. It does not skip a node only because it is `OFFLINE`: that node stays a candidate until auto-evict flags it, and a replica placed there cannot come up until its satellite runs. Check the satellites.
 
 ## certificate signed by unknown authority
 
