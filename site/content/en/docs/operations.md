@@ -20,13 +20,13 @@ A replica counts as faulty when one of its volumes has a disk state that has not
 The custom resources carry the same information for `kubectl` and for monitoring:
 
 ```sh
-kubectl get nodes.blockstor.org          # Status ONLINE or OFFLINE
+kubectl get nodes.blockstor.cozystack.io          # Status ONLINE or OFFLINE
 kubectl get storagepools                          # free and total KiB per pool
 kubectl get resourcedefinitions                   # group, DRBD port, layers
 kubectl get resources                             # one row per replica: node, pool, port, state, in use
 ```
 
-Use the full name `nodes.blockstor.org`, because plain `nodes` is the Kubernetes kind.
+Use the full name `nodes.blockstor.cozystack.io`, because plain `nodes` is the Kubernetes kind.
 
 A `Node` is `ONLINE` while its satellite stamps a heartbeat every 10 seconds. When the heartbeat is more than 40 seconds old, the controller sets the `Ready` condition to `Unknown` and the status to `OFFLINE`.
 
@@ -171,7 +171,7 @@ blockstor snapshot resource restore \
     --from-resource my-volume --from-snapshot before-upgrade --to-resource my-volume-restored
 ```
 
-In-place rollback is not available on purpose. A definition cannot be deleted while it still has snapshots, so delete them first. A snapshot that a restore or clone is still being brought up from is kept until that restore has a replica with every volume `UpToDate`, and the delete answers 409 until then; retry it. After that the restored volume no longer depends on the snapshot:
+In-place rollback is not available on purpose. A definition cannot be deleted while it still has snapshots, so delete them first:
 
 ```sh
 blockstor snapshot delete my-volume before-upgrade
@@ -182,7 +182,7 @@ blockstor snapshot delete my-volume before-upgrade
 Blockstor keeps all of its state in custom resources, so a backup is a dump of them. Include the `Resource` objects: the DRBD ports, minors and node IDs that the controller allocated live in their spec, and a restore that invents new ones would make every replica reconnect.
 
 ```sh
-for kind in controllerconfigs nodes.blockstor.org storagepools physicaldevices \
+for kind in controllerconfigs nodes.blockstor.cozystack.io storagepools physicaldevices \
             resourcegroups resourcedefinitions resources snapshots; do
   kubectl get "$kind" -o yaml > "blockstor-$kind.yaml"
 done
@@ -209,4 +209,4 @@ kubectl -n blockstor-system rollout status daemonset/blockstor-satellite
 blockstor resource list --faulty
 ```
 
-The snapshot stream between satellites runs on port 3372 with mutual TLS, from the `blockstor-satellite-stream-tls` certificate the TLS manifest issues. Keep that port open between storage nodes. See [Networking and ports](../networking/#snapshot-stream-between-satellites).
+In the next release the snapshot stream between satellites moves from port 9100 to port 3372, so open the new port between storage nodes before step 4, and the API server no longer needs cluster-wide permission to list and watch Secrets.

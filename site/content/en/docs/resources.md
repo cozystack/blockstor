@@ -5,7 +5,7 @@ weight: 40
 description: "The blockstor custom resources, with examples."
 ---
 
-Everything blockstor manages is a cluster-scoped custom resource in the `blockstor.org/v1alpha1` API group. You can create and change them with `kubectl` or GitOps, with the [`blockstor` CLI](../cli/), or through the REST API. All three edit the same objects.
+Everything blockstor manages is a cluster-scoped custom resource in the `blockstor.cozystack.io/v1alpha1` API group. You can create and change them with `kubectl` or GitOps, with the [`blockstor` CLI](../cli/), or through the REST API. All three edit the same objects.
 
 | Kind | What it describes | Name |
 |---|---|---|
@@ -27,7 +27,7 @@ Most objects have a `spec` you write and a `status` that blockstor writes. The e
 A node that runs the satellite. The address of the first network interface is the one DRBD uses for replication.
 
 ```yaml
-apiVersion: blockstor.org/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Node
 metadata:
   name: worker-1
@@ -43,7 +43,7 @@ spec:
 Space for replicas on one node. The provider decides how volumes are allocated, and the properties name the backing volume group, thin pool, ZFS pool or directory.
 
 ```yaml
-apiVersion: blockstor.org/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: data.worker-1
@@ -59,7 +59,7 @@ spec:
 For a ZFS thin pool:
 
 ```yaml
-apiVersion: blockstor.org/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: zfs-data.worker-1
@@ -78,7 +78,7 @@ The providers are `LVM`, `LVM_THIN`, `ZFS`, `ZFS_THIN`, `FILE`, `FILE_THIN` and 
 The satellites report the raw disks they find as `PhysicalDevice` objects, with their size, model and path in `status`. To build a pool from one, set `attachTo`:
 
 ```yaml
-apiVersion: blockstor.org/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: PhysicalDevice
 metadata:
   name: <name the satellite gave it>
@@ -96,7 +96,7 @@ The CLI does the same thing with `blockstor physical-storage create-device-pool`
 A policy that volumes inherit: how many replicas, in which pool, with which layers, and with which DRBD options.
 
 ```yaml
-apiVersion: blockstor.org/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceGroup
 metadata:
   name: replicated
@@ -124,7 +124,7 @@ Placement constraints match node properties. Blockstor copies the Kubernetes nod
 One volume set. Its volumes are listed in `volumeDefinitions`, sized in KiB. Settings it does not carry are inherited from its resource group.
 
 ```yaml
-apiVersion: blockstor.org/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata:
   name: my-volume
@@ -142,7 +142,7 @@ The controller fills in the DRBD port and the per-volume minor numbers. Once set
 One replica of a definition on one node. Usually the controller creates these when it places a volume, but you can also place a replica by hand:
 
 ```yaml
-apiVersion: blockstor.org/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata:
   name: my-volume.worker-3
@@ -159,7 +159,7 @@ A replica with the `DISKLESS` flag holds no data and reaches the volume over the
 A point-in-time snapshot of a definition, taken on the nodes listed in `nodes`, or on every node with a replica if the list is empty:
 
 ```yaml
-apiVersion: blockstor.org/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Snapshot
 metadata:
   name: my-volume.before-upgrade
@@ -175,7 +175,7 @@ Restore it as a new volume with `blockstor snapshot resource-definition restore`
 Cluster-wide settings. Only the object named `default` is read. DRBD options here are the defaults for every group, definition and replica.
 
 ```yaml
-apiVersion: blockstor.org/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ControllerConfig
 metadata:
   name: default

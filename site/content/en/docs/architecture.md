@@ -51,7 +51,7 @@ There is no direct connection between the controller and the satellites. Everyth
 
 ## Custom resources are the source of truth
 
-Every object you know from LINSTOR is a cluster-scoped custom resource in the `blockstor.org` group:
+Every object you know from LINSTOR is a cluster-scoped custom resource in the `blockstor.cozystack.io` group:
 
 ```mermaid
 flowchart LR

@@ -20,7 +20,7 @@ Look at the connection state of the replica, and at the node addresses:
 
 ```sh
 kubectl get resource <definition>.<node> -o jsonpath='{range .status.connections[*]}{.peerNodeName}={.message} {end}'
-kubectl get nodes.blockstor.org -o wide
+kubectl get nodes.blockstor.cozystack.io -o wide
 ```
 
 A peer stuck in `Connecting` cannot reach the other replica's address and port. The two causes are a wrong address and a blocked port.
@@ -28,7 +28,7 @@ A peer stuck in `Connecting` cannot reach the other replica's address and port. 
 The `Address` column is the first entry of `spec.netInterfaces`. It must be the node's own IP, reachable from the other nodes. A pod IP there means something rewrote it, most often piraeus-operator managing the same nodes. Blockstor works around that by preferring an interface named `k8s-internal`, which the satellite fills from the Kubernetes node's `InternalIP`. If that entry is missing, check that the satellite's ClusterRole lets it read `nodes`. Fix the first interface anyway:
 
 ```sh
-kubectl patch nodes.blockstor.org <node> --type merge \
+kubectl patch nodes.blockstor.cozystack.io <node> --type merge \
   -p '{"spec":{"netInterfaces":[{"name":"default","address":"10.0.0.11"}]}}'
 ```
 
@@ -84,19 +84,23 @@ Two different situations look alike:
 
 Never delete the last replica that is `UpToDate`. `blockstor resource delete` refuses that while a peer is still syncing from it, unless you pass `--force`.
 
-## A replica crashed while Primary
+## Metadata re-created after an unclean shutdown
 
-A node that went down while a replica on it was `Primary` and writing leaves the replica's DRBD activity log open. When the satellite brings the resource up again, its metadata probe answers that the metadata is there but the activity log needs applying. Look at the satellite log on that node:
+The symptom is a replica that was the only copy, and after a node reboot comes back empty and starts a full sync from a peer, or has nothing to sync from. Look at the satellite log on that node:
 
 ```sh
-kubectl -n blockstor-system logs $POD -c satellite | grep -i -E 'activity log|apply-al|dump-md'
+kubectl -n blockstor-system logs $POD -c satellite | grep -i -E 'create-md|apply-al|dump-md'
 ```
 
-The satellite tells its own crashed replica from a superblock that is not its own by the generation identifier (GI) it last reported for the volume:
+Before it creates DRBD metadata, the satellite probes the device with `drbdmeta dump-md`. If the probe answers that metadata is present but its activity log needs applying, which is what an unclean shutdown of a writing `Primary` leaves behind, the current release treats that as missing metadata, creates it afresh and syncs the replica from its peers. That is fine when another replica holds the data. It is not fine when this replica is the only `UpToDate` copy, because recreating the metadata discards the generation identifiers and the dirty bitmap.
 
-- With a reported GI, it runs `drbdadm apply-al`, checks that the metadata on disk names that GI, and keeps it. The log line is `repaired the activity log left by an unclean shutdown`. The replica keeps its GI and dirty bitmap, so it resyncs only what changed.
-- With no reported GI, which is a clone, a restore, a volume just added, or a replica created again, it initialises the metadata, as for any new volume.
-- If `apply-al` fails on a volume with a reported GI, the satellite stops and reports the error instead of initialising over it. Fix what `drbdadm apply-al <definition>` complains about, run from the satellite pod, and the next reconcile picks the volume up.
+The probe runs when the satellite brings the resource up, which is at satellite start for a resource the kernel does not hold yet, for example after a node reboot. If the replica is the only copy you have, do not let the satellite get there. Keep the satellite pod off that node, and apply the activity log yourself from a privileged pod on the node that uses the satellite image and mounts `/dev`:
+
+```sh
+drbdadm apply-al <definition>
+```
+
+Then let the satellite start again. The probe now sees clean metadata and skips `create-md`.
 
 ## Resource definitions left behind by CSI
 
@@ -158,7 +162,7 @@ Look at:
 ```sh
 kubectl -n blockstor-system get pod -l app=blockstor-satellite -o wide
 kubectl -n blockstor-system logs $POD -c satellite --tail=100
-kubectl get nodes.blockstor.org
+kubectl get nodes.blockstor.cozystack.io
 ```
 
 The readiness probe answers `/readyz` only after the satellite has started and synced its caches. A pod that never becomes ready, or that restarts, usually says why in the first lines of its log.
