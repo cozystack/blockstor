@@ -176,9 +176,10 @@ func TestPlaintextPassphrasePropIsRefusedOnEveryDoor(t *testing.T) {
 	}
 }
 
-// Deleting a passphrase property stays allowed: the key named in a delete
-// list is a string, not an object key, and removing one put there with
-// kubectl is exactly what an operator moving to the Secret has to do.
+// Deleting a passphrase property stays allowed, through a delete list or
+// through an override to the empty string (the set-property delete):
+// removing one put there with kubectl is exactly what an operator moving to
+// the Secret has to do.
 func TestPlaintextPassphrasePropDeleteIsAllowed(t *testing.T) {
 	t.Parallel()
 
@@ -187,29 +188,40 @@ func TestPlaintextPassphrasePropDeleteIsAllowed(t *testing.T) {
 		Spec: blockstoriov1alpha1.ControllerConfigSpec{
 			ExtraProps: map[string]string{
 				passphrase.PropKeyCanonical: guardCanary,
+				passphrase.PropKeyLegacy:    guardCanary,
 				"Aux/keep":                  "yes",
 			},
 		},
 	})
 	defer stop()
 
-	resp := sendGuardRequest(t, http.MethodPost, base+"/v1/controller/properties",
-		`{"delete_props":["DrbdOptions/EncryptPassphrase"]}`)
-	body, _ := readAllBody(resp)
-	_ = resp.Body.Close()
+	for _, tc := range []struct{ name, key, body string }{
+		{
+			name: "delete list", key: passphrase.PropKeyCanonical,
+			body: `{"delete_props":["DrbdOptions/EncryptPassphrase"]}`,
+		},
+		{
+			name: "empty override", key: passphrase.PropKeyLegacy,
+			body: `{"override_props":{"DrbdOptions/Encryption/passphrase":""}}`,
+		},
+	} {
+		resp := sendGuardRequest(t, http.MethodPost, base+"/v1/controller/properties", tc.body)
+		body, _ := readAllBody(resp)
+		_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("delete_props naming the passphrase key: status = %d, want 201; body: %s",
-			resp.StatusCode, body)
-	}
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("%s naming the passphrase key: status = %d, want 201; body: %s",
+				tc.name, resp.StatusCode, body)
+		}
 
-	props := controllerExtraProps(t, cli)
-	if _, still := props[passphrase.PropKeyCanonical]; still {
-		t.Errorf("the property survived its delete: %v", props)
-	}
+		props := controllerExtraProps(t, cli)
+		if _, still := props[tc.key]; still {
+			t.Errorf("%s: the property survived its delete: %v", tc.name, props)
+		}
 
-	if props["Aux/keep"] != "yes" {
-		t.Errorf("the delete took a sibling with it: %v", props)
+		if props["Aux/keep"] != "yes" {
+			t.Errorf("%s: the delete took a sibling with it: %v", tc.name, props)
+		}
 	}
 }
 
