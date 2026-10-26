@@ -21,6 +21,8 @@ package linstormigrate
 import (
 	"maps"
 	"strings"
+
+	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
 // PropsIndex groups the flat PROPS_CONTAINERS rows by owner object.
@@ -56,7 +58,10 @@ type PropsIndex struct {
 // every pool that does not override it.
 const PropsInstanceController = "/CTRL"
 
-// NewPropsIndex builds the lookup from the raw table rows.
+// NewPropsIndex builds the lookup from the raw table rows. A row that would
+// carry a LUKS passphrase in a property is left out: blockstor never reads
+// one, and the generated YAML is applied with kubectl, past the REST guard,
+// so the value would otherwise land in plaintext on a CR.
 func NewPropsIndex(rows []PropsContainerRow) *PropsIndex {
 	idx := &PropsIndex{
 		Controller: map[string]string{},
@@ -64,6 +69,10 @@ func NewPropsIndex(rows []PropsContainerRow) *PropsIndex {
 	}
 
 	for _, row := range rows {
+		if passphrase.IsPlaintextPropKey(row.PropKey) {
+			continue
+		}
+
 		if row.PropsInstance == PropsInstanceController {
 			idx.Controller[row.PropKey] = row.PropValue
 
