@@ -58,23 +58,17 @@ const layerStackPinAction = "PinLayerStack"
 // actually has, the group's stack is recorded in an annotation, and a
 // warning Event names it, so the volume reads as what it is.
 func (r *ResourceDefinitionReconciler) pinLayerStack(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
-	if len(rd.Spec.LayerStack) > 0 || rd.Spec.ResourceGroupName == "" {
+	if len(rd.Spec.LayerStack) > 0 {
+		return r.refreshUnappliedGroupStack(ctx, rd)
+	}
+
+	if rd.Spec.ResourceGroupName == "" {
 		return nil
 	}
 
-	reader := r.directOrCached()
-
-	var rg blockstoriov1alpha1.ResourceGroup
-
-	// The RD keeps the group's name as the operator spelled it; the CR is
-	// stored under the folded one.
-	err := reader.Get(ctx, client.ObjectKey{Name: k8s.Name(rd.Spec.ResourceGroupName)}, &rg)
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
-
-	if err != nil {
-		return errors.Wrapf(err, "read resource group %q", rd.Spec.ResourceGroupName)
+	rg, err := r.readGroup(ctx, rd)
+	if err != nil || rg == nil {
+		return err
 	}
 
 	groupStack := rg.Spec.SelectFilter.LayerStack
@@ -111,6 +105,71 @@ func (r *ResourceDefinitionReconciler) pinLayerStack(ctx context.Context, rd *bl
 		r.Recorder.Eventf(rd, nil, corev1.EventTypeWarning, layerStackNotInheritedReason, layerStackPinAction,
 			"already holds data under layer stack %s, so the stack %s of resource group %s was not applied; migrate the data to a new volume to take it",
 			strings.Join(stack, ","), strings.Join(groupStack, ","), rg.Name)
+	}
+
+	return nil
+}
+
+// readGroup reads the RD's resource group, nil when it does not exist. The
+// RD keeps the group's name as the operator spelled it; the CR is stored
+// under the folded one.
+func (r *ResourceDefinitionReconciler) readGroup(
+	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
+) (*blockstoriov1alpha1.ResourceGroup, error) {
+	var rg blockstoriov1alpha1.ResourceGroup
+
+	err := r.directOrCached().Get(ctx, client.ObjectKey{Name: k8s.Name(rd.Spec.ResourceGroupName)}, &rg)
+	if apierrors.IsNotFound(err) {
+		return nil, nil //nolint:nilnil // no group is an answer, not an error
+	}
+
+	if err != nil {
+		return nil, errors.Wrapf(err, "read resource group %q", rd.Spec.ResourceGroupName)
+	}
+
+	return &rg, nil
+}
+
+// refreshUnappliedGroupStack keeps the annotation on a pinned RD true to its
+// group as the group is now: the layers the group asks for while the RD's
+// stack lacks one of them, and no annotation once it no longer does or the
+// group is gone. An RD without the annotation is left alone; it was never
+// short of its group when its stack was decided.
+func (r *ResourceDefinitionReconciler) refreshUnappliedGroupStack(
+	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
+) error {
+	recorded, flagged := rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation]
+	if !flagged {
+		return nil
+	}
+
+	want := ""
+
+	if rd.Spec.ResourceGroupName != "" {
+		rg, err := r.readGroup(ctx, rd)
+		if err != nil {
+			return err
+		}
+
+		if rg != nil && apiv1.LacksLayerOf(rd.Spec.LayerStack, rg.Spec.SelectFilter.LayerStack) {
+			want = strings.Join(rg.Spec.SelectFilter.LayerStack, ",")
+		}
+	}
+
+	if want == recorded {
+		return nil
+	}
+
+	base := rd.DeepCopy()
+	if want == "" {
+		delete(rd.Annotations, apiv1.UnappliedGroupLayerStackAnnotation)
+	} else {
+		rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation] = want
+	}
+
+	err := r.Patch(ctx, rd, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	if err != nil {
+		return errors.Wrapf(err, "refresh the unapplied group stack of %q", rd.Name)
 	}
 
 	return nil

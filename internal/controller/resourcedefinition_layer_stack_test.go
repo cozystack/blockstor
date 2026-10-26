@@ -425,3 +425,47 @@ func TestPinLayerStackTreatsTheInitializedLatchAsData(t *testing.T) {
 		t.Fatalf("stack %v, want the applied default", got.rd.Spec.LayerStack)
 	}
 }
+
+// The annotation on a pinned RD follows its group: it goes once the group
+// no longer asks for a layer the RD lacks, or the group is gone, and names
+// the group's current stack while the RD is still short of it. An RD that
+// was never flagged is left alone.
+func TestPinnedRDsUnappliedGroupStackFollowsTheGroup(t *testing.T) {
+	t.Parallel()
+
+	flagged := func(value string) *blockstoriov1alpha1.ResourceDefinition {
+		rd := pinRD("rg-pin", "DRBD", "STORAGE")
+		rd.Annotations = map[string]string{apiv1.UnappliedGroupLayerStackAnnotation: value}
+
+		return rd
+	}
+
+	for name, tc := range map[string]struct {
+		objs []client.Object
+		want string
+	}{
+		"group dropped the layer": {objs: []client.Object{pinGroup("DRBD", "STORAGE"), flagged("DRBD,LUKS,STORAGE")}},
+		"group gone":              {objs: []client.Object{flagged("DRBD,LUKS,STORAGE")}},
+		"group still asks":        {objs: []client.Object{pinGroup(luksStack...), flagged("DRBD,LUKS,STORAGE")}, want: "DRBD,LUKS,STORAGE"},
+		"group changed its ask":   {objs: []client.Object{pinGroup("LUKS", "STORAGE"), flagged("DRBD,LUKS,STORAGE")}, want: "LUKS,STORAGE"},
+		"never flagged":           {objs: []client.Object{pinGroup(luksStack...), pinRD("rg-pin", "DRBD", "STORAGE")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := reconcilePin(t, pinClient(t, tc.objs...))
+			if got.err != nil {
+				t.Fatalf("reconcile: %v", got.err)
+			}
+
+			a, ok := got.rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation]
+			if a != tc.want || ok != (tc.want != "") {
+				t.Errorf("annotation %q (present %v), want %q", a, ok, tc.want)
+			}
+
+			if !slices.Equal(got.rd.Spec.LayerStack, []string{"DRBD", "STORAGE"}) {
+				t.Errorf("the pinned stack changed to %v", got.rd.Spec.LayerStack)
+			}
+		})
+	}
+}
