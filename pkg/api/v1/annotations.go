@@ -142,10 +142,12 @@ const PeerChangedAnnotation = "blockstor.io/peer-changed"
 const RDSpawnShortfallAnnotation = "blockstor.io/spawn-shortfall"
 
 // UnappliedGroupLayerStackAnnotation is stamped on a ResourceDefinition
-// whose data was written under a stack missing a layer its resource group
-// asks for: one the controller pinned over data it found under the default
-// stack, or a clone or restore of such bytes. It records, comma-separated,
-// the group's stack, so an operator can find every volume that is short of
-// what its group promises (for example a plaintext volume in a LUKS group)
-// and migrate it.
+// whose decided stack lacks a layer its resource group asks for now: one the
+// controller pinned to the default stack over data it found there, a clone
+// or restore of such bytes, a stack the operator set by hand, or a stack the
+// group outgrew after it was decided. The controller keeps it true to the
+// group's current stack on every reconcile and clears it once nothing is
+// missing. It records, comma-separated, the group's stack, so an operator
+// can find every volume that is short of what its group promises (for
+// example a plaintext volume in a LUKS group).
 const UnappliedGroupLayerStackAnnotation = "blockstor.io/unapplied-group-layer-stack"

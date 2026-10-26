@@ -348,20 +348,30 @@ func withoutUnappliedGroupStack(annotations map[string]string) map[string]string
 // caller's, or else the source's as stored. A shell holds no bytes, so nothing
 // forces a stack on it the way the data path is forced; left empty, it takes
 // its own group's stack from the controller, which pins it once
-// (pinLayerStack), exactly like a definition created empty. A source whose
-// stack was pinned over data that was already there, which the
-// unapplied-group annotation marks, passes that stack on to no shell: it was
-// the data's, not a choice.
+// (pinLayerStack), exactly like a definition created empty.
+//
+// A source whose stack the controller pinned over data that was already
+// there passes that stack on to no shell: it was the data's, not a choice.
+// The unapplied-group annotation alone does not say that, since it also
+// marks a stack set by hand that lacks a layer of the group; but a stack
+// pinned over data is always the default one. So only a flagged source
+// with the default stack hands the shell nothing, and a flagged stack of
+// the operator's own, LUKS,STORAGE in a DRBD,STORAGE group say, is copied.
 func cloneShellLayerStack(src *apiv1.ResourceDefinition, req *rdCloneRequest) []string {
 	if len(req.LayerList) > 0 {
 		return req.LayerList
 	}
 
-	if src.Annotations[apiv1.UnappliedGroupLayerStackAnnotation] != "" {
+	if src.Annotations[apiv1.UnappliedGroupLayerStackAnnotation] != "" && isDefaultLayerStack(src.LayerStack) {
 		return nil
 	}
 
 	return slices.Clone(src.LayerStack)
+}
+
+// isDefaultLayerStack reports whether stack is the default one, in any case.
+func isDefaultLayerStack(stack []string) bool {
+	return slices.EqualFunc(stack, apiv1.DefaultLayerStack(), strings.EqualFold)
 }
 
 // clonePassphraseHolds refuses a clone whose stack carries LUKS while the

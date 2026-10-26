@@ -252,6 +252,33 @@ func TestRDCloneShellDoesNotInheritAStackPinnedOverData(t *testing.T) {
 	assertUnapplied(t, st, "src-pinned", "DRBD,LUKS,STORAGE")
 }
 
+// A stack the operator set by hand is copied onto the shell even when the
+// controller flagged it as short of the group: a flag on anything but the
+// default stack cannot be a pin over data, so the clone keeps its LUKS.
+func TestRDCloneShellKeepsAFlaggedStackTheSourceChose(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedLayeredGroup(t, st, "grp-plain", apiv1.DefaultLayerStack())
+
+	chosen := []string{apiv1.LayerKindLUKS, apiv1.LayerKindStorage}
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{
+		Name: "src-own", ResourceGroupName: "grp-plain", LayerStack: chosen,
+		Annotations: map[string]string{apiv1.UnappliedGroupLayerStackAnnotation: "DRBD,STORAGE"},
+	}); err != nil {
+		t.Fatalf("seed the volume-less source: %v", err)
+	}
+
+	base, stop := startServerWithPassphrase(t, st)
+	defer stop()
+
+	if code := cloneOnce(t, base, "src-own", "dst-own", nil); code != http.StatusCreated {
+		t.Fatalf("shell clone = %d, want 201", code)
+	}
+
+	assertStack(t, st, "dst-own", chosen)
+}
+
 // A stack the source chose is copied onto its shell.
 func TestRDCloneShellKeepsAStackTheSourceChose(t *testing.T) {
 	t.Parallel()
