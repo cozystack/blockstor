@@ -128,7 +128,7 @@ spec:
   with LUKS-over-DRBD instead of DRBD-over-LUKS) aren't yet validated
   or rendered.
 - **Per-volume LUKS keys**: every LUKS volume in the cluster uses the
-  cluster master passphrase. `linstor vd set-passphrase` answers 400:
+  cluster master passphrase. `linstor vd modify-passphrase` answers 400:
   it used to store the value in the volume definition's properties,
   in plaintext, where nothing read it. Per-volume keys (with master-key
   wrapping) are a follow-up.
