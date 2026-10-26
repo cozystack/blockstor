@@ -300,3 +300,55 @@ func sendGuardRequest(t *testing.T, method, url, body string) *http.Response {
 
 	return resp
 }
+
+// Bytes after the JSON value do not hide the key: the handlers decode the
+// first value and ignore or tolerate what follows, so the guard reads the
+// same first value.
+func TestPlaintextPassphraseGuardSeesPastTrailingBytes(t *testing.T) {
+	t.Parallel()
+
+	for _, tail := range []string{"}", "]", "garbage", ` {"x":1}`} {
+		for name, door := range map[string]struct{ method, path, body string }{
+			"controller props": {
+				http.MethodPost, "/v1/controller/properties",
+				`{"override_props":{"DrbdOptions/EncryptPassphrase":"` + guardCanary + `"}}`,
+			},
+			"rg modify": {
+				http.MethodPut, "/v1/resource-groups/rg-guard",
+				`{"override_props":{"DrbdOptions/EncryptPassphrase":"` + guardCanary + `"}}`,
+			},
+		} {
+			t.Run(name+" tail "+tail, func(t *testing.T) {
+				t.Parallel()
+
+				base, st, cli, stop := startGuardServer(t)
+				defer stop()
+
+				if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{Name: "rg-guard"}); err != nil {
+					t.Fatalf("seed RG: %v", err)
+				}
+
+				resp := sendGuardRequest(t, door.method, base+door.path, door.body+tail)
+				body, _ := readAllBody(resp)
+				_ = resp.Body.Close()
+
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, body)
+				}
+
+				if controllerExtraProps(t, cli)[passphrase.PropKeyCanonical] != "" {
+					t.Error("the controller props carry the passphrase")
+				}
+
+				rg, err := st.ResourceGroups().Get(t.Context(), "rg-guard")
+				if err != nil {
+					t.Fatalf("get RG: %v", err)
+				}
+
+				if rg.Props[passphrase.PropKeyCanonical] != "" {
+					t.Error("the group props carry the passphrase")
+				}
+			})
+		}
+	}
+}
