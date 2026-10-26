@@ -42,9 +42,10 @@ Host requirements:
 - about 8 GB of free RAM and 20 GB of disk per cluster.
 
 ```sh
+make build-images       # build the images and push them to the local registry
 make up                 # create the cluster (default name "blockstor")
-make piraeus            # linstor-csi in external-controller mode
-make blockstor          # build and install blockstor
+make blockstor          # install the CRDs, controller, API server and satellites
+make piraeus            # linstor-csi in external-controller mode, after blockstor
 make smoke-blockstor    # quick end-to-end check
 make down
 ```
@@ -52,9 +53,10 @@ make down
 Real-disk pools on extra disks:
 
 ```sh
-make pools
-STORPOOL=zfs-thin make smoke-blockstor
+make pools TYPE=zfs     # TYPE is zfs, lvm or both (the default)
 ```
+
+`make smoke-blockstor` always uses the stand's own `stand` pool. `make burnin-blockstor` takes the pool to churn as `POOL=<pool>`.
 
 Several clusters can run side by side, each with its own `10.<slot>.0.0/24` network. Their configuration lands in `.work/<NAME>/`:
 
