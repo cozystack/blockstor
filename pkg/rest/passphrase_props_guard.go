@@ -68,16 +68,25 @@ func isWriteMethod(method string) bool {
 }
 
 // plaintextPassphraseKeyIn finds an object key, at any depth of a JSON body,
-// that would carry the master passphrase. A body that is not JSON has none;
-// the handler answers it as before.
+// that would carry the master passphrase. It reads the body the way the
+// handlers do, value by value with a json.Decoder, so bytes after the first
+// value cannot hide it: a handler that decodes one value and ignores the
+// rest still sees the same first value here. A body that is not JSON has
+// none; the handler answers it as before.
 func plaintextPassphraseKeyIn(body []byte) (string, bool) {
-	var doc any
+	dec := json.NewDecoder(bytes.NewReader(body))
 
-	if json.Unmarshal(body, &doc) != nil {
-		return "", false
+	for {
+		var doc any
+
+		if dec.Decode(&doc) != nil {
+			return "", false
+		}
+
+		if key, found := findPlaintextPassphraseKey(doc); found {
+			return key, true
+		}
 	}
-
-	return findPlaintextPassphraseKey(doc)
 }
 
 func findPlaintextPassphraseKey(node any) (string, bool) {
