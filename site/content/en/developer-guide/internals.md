@@ -11,8 +11,8 @@ This page is about the invariants whose violation would quietly corrupt cluster 
 
 Every blockstor CRD has two halves:
 
-- **Spec** is desired state. Users, REST handlers and the controller's placement write it. The satellite never writes Spec.
-- **Status** is observed state. The satellite writes what it reads from the kernel (`drbdsetup events2`, `drbdadm status`, `lvs`), and the controller's allocators write values derived from Spec. The REST API never writes Status.
+- **Spec** is desired state. Users, REST handlers and the controller's placement write it. The satellite writes Spec in two places: `Resource.Spec.Flags` (and `ToggleDiskCancel`) while it carries out a toggle-disk, and the discovered volume groups and ZFS pools in `Node.Spec.Props`.
+- **Status** is observed state. The satellite writes what it reads from the kernel (`drbdsetup events2`, `drbdadm status`, `lvs`), and the controller's allocators write values derived from Spec. The REST API writes Status in one place: the resource activate endpoint with `?reallocate-port=true` clears `Resource.Status.DRBDPort` through a Status patch, so the allocator picks a new port.
 
 A whole-object `Update` is unsafe whenever both halves have different writers: a Spec write in flight would overwrite a concurrent Status write, and the other way round. Status goes through the Status subresource. Fields with more than one writer, such as `Resource.Status.DRBDPort` from the controller next to `DiskState` and `CurrentGi` from the satellite, go through Server-Side Apply with separate field managers, `blockstor-controller` and `blockstor-satellite`, so each side owns only its own fields.
 

@@ -78,7 +78,7 @@ Each resource has two halves:
 - **spec** is what you, the controller or the API asked for.
 - **status** is what the satellites observed: disk states, connection states, free capacity.
 
-A satellite never changes a spec, and the API never writes a status. Because the state is ordinary Kubernetes objects, you can read it with `kubectl get resources`, back it up with your usual tools, and drive it from GitOps.
+The split is a rule of thumb with a few exceptions: a satellite writes a replica's `spec.flags` while it toggles a disk and records the storage it discovered in the node's `spec.props`, and the API clears a replica's DRBD port in `status` when you ask it to reallocate the port. Because the state is ordinary Kubernetes objects, you can read it with `kubectl get resources`, back it up with your usual tools, and drive it from GitOps.
 
 ## How a volume is created
 

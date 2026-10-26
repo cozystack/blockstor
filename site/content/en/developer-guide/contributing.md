@@ -13,7 +13,7 @@ Hard rules:
 
 - No GPL-licensed spec files in the tree. LINSTOR's `rest_v1_openapi.yaml` declares GPLv3, and code generated from it is a derivative work.
 - No code generated from a GPL source by any tool.
-- No Go dependency under GPL, AGPL, LGPL or SSPL. CI allows only Apache-2.0, BSD-2-Clause, BSD-3-Clause, MIT, MPL-2.0 and ISC, through [`license-check.yml`](https://github.com/cozystack/blockstor/blob/main/.github/workflows/license-check.yml).
+- No Go dependency under GPL, AGPL, LGPL or SSPL. CI enforces this through [`license-check.yml`](https://github.com/cozystack/blockstor/blob/main/.github/workflows/license-check.yml), which runs `go-licenses check --disallowed_types=forbidden,restricted` over `./cmd/...`. That is a denylist: it fails on licenses `go-licenses` classifies as forbidden or restricted, and lets everything else through, so check a new dependency's license yourself.
 - Every Go source file carries an `SPDX-License-Identifier: Apache-2.0` header.
 
 Apache-2.0 projects that are safe to study and depend on: [`golinstor`](https://github.com/LINBIT/golinstor), the authoritative description of the REST wire shape; [`piraeus-operator`](https://github.com/piraeusdatastore/piraeus-operator); [`linstor-csi`](https://github.com/piraeusdatastore/linstor-csi); [`drbd-reactor`](https://github.com/LINBIT/drbd-reactor); and the public DRBD 9 documentation and man pages.
