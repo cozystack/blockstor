@@ -20,6 +20,7 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"slices"
@@ -64,7 +65,10 @@ func OwnedCloneSnapshot(ctx context.Context, st Store, rdName string) ClonedSnap
 		return ClonedSnapshotRef{}
 	}
 
-	snap, err := st.Snapshots().Get(ctx, source, snapName)
+	// Past the cache: a clone deleted right after it was created can be
+	// served by a replica whose informer has not seen the snapshot yet, and
+	// a cached miss would skip the reap with nothing to say so.
+	snap, err := uncachedSnapshot(ctx, st, source, snapName)
 	if err != nil || !strings.EqualFold(snap.Props[CloneSnapshotOwnerProp], rdName) {
 		return ClonedSnapshotRef{}
 	}
@@ -73,7 +77,10 @@ func OwnedCloneSnapshot(ctx context.Context, st Store, rdName string) ClonedSnap
 }
 
 // CloneSnapshotReapingProp marks an internal clone snapshot the reap has
-// started on, as `<clone>@<RFC 3339 time>`. A restore that created its
+// started on, as `<clone>#<token>@<RFC 3339 time>`. The token is random per
+// reap, so two reaps of one clone started in the same second, which the CLI
+// can run since it reaps after a delete that found nothing, never take each
+// other's mark for their own. A restore that created its
 // definition from the snapshot reads it back past the cache and withdraws when
 // it finds a live mark or no snapshot at all; see ReapClonedSnapshot for why
 // both sides are needed.
@@ -144,7 +151,7 @@ func ReapClonedSnapshot(ctx context.Context, st Store, ref ClonedSnapshotRef) er
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cloneSnapshotReapBudget)
 	defer cancel()
 
-	mark := ref.Clone + "@" + time.Now().UTC().Format(time.RFC3339)
+	mark := newReapingMark(ref.Clone, time.Now())
 
 	err := setReapingMark(ctx, st, ref.Source, ref.Snapshot, mark)
 	if errors.Is(err, ErrNotFound) {
@@ -174,6 +181,12 @@ func ReapClonedSnapshot(ctx context.Context, st Store, ref ClonedSnapshotRef) er
 	}
 
 	return nil
+}
+
+// newReapingMark is the mark one reap writes: the clone, a token no other
+// reap shares, and the time the TTL is read from.
+func newReapingMark(clone string, now time.Time) string {
+	return clone + "#" + rand.Text() + "@" + now.UTC().Format(time.RFC3339)
 }
 
 // keepCloneSnapshot takes the reaping mark back off a snapshot the reap
