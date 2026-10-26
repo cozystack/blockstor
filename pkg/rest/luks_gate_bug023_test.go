@@ -21,10 +21,8 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -44,9 +42,9 @@ import (
 //
 // failed with 400, and the error hint told operators to put a
 // PLAINTEXT passphrase into a controller prop. These tests pin the
-// fixed gate: the Secret (primary) unlocks LUKS RD creation, the
-// legacy prop keeps working, and the no-passphrase refusal hints at
-// `encryption create-passphrase` first.
+// fixed gate: the Secret is the only thing that unlocks LUKS RD
+// creation, a passphrase property never does, and the refusal sends
+// the operator to `encryption create-passphrase` alone.
 
 // startLUKSGateServer boots a server over an in-memory store + fake
 // controller-runtime client seeded with objs.
@@ -134,15 +132,7 @@ func TestBug023CreatePassphraseThenLUKSRDCreate(t *testing.T) {
 func TestBug023SecretSeededDirectlyUnlocksGate(t *testing.T) {
 	t.Parallel()
 
-	sec := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      passphrase.DefaultSecretName,
-			Namespace: testRESTNamespace,
-		},
-		Data: map[string][]byte{passphrase.SecretKey: []byte("gitops-passphrase")},
-	}
-
-	base, _, stop := startLUKSGateServer(t, sec)
+	base, _, stop := startLUKSGateServer(t, testPassphraseSecret("gitops-passphrase"))
 	defer stop()
 
 	resp := postLUKSRD(t, base, "wf-luks-gitops")
@@ -155,11 +145,12 @@ func TestBug023SecretSeededDirectlyUnlocksGate(t *testing.T) {
 	}
 }
 
-// TestBug023LegacyControllerPropStillUnlocksGate: backward compat —
-// clusters provisioned via `linstor controller set-property
-// DrbdOptions/EncryptPassphrase ...` (plaintext on ControllerConfig.
-// ExtraProps, deprecated) must keep creating LUKS RDs.
-func TestBug023LegacyControllerPropStillUnlocksGate(t *testing.T) {
+// TestBug023ControllerPropDoesNotUnlockGate: a passphrase that sits in
+// a controller property (plaintext on ControllerConfig.ExtraProps, put
+// there with kubectl since REST refuses to store it) is never read, so
+// it does not satisfy the gate; the refusal names the Secret flow, not
+// the property.
+func TestBug023ControllerPropDoesNotUnlockGate(t *testing.T) {
 	t.Parallel()
 
 	cfg := &blockstoriov1alpha1.ControllerConfig{
@@ -177,11 +168,13 @@ func TestBug023LegacyControllerPropStillUnlocksGate(t *testing.T) {
 	resp := postLUKSRD(t, base, "wf-luks-legacy")
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusCreated {
-		bodyBytes, _ := readAllBody(resp)
-		t.Fatalf("LUKS RD create with legacy prop: status got %d, want 201. Body: %s",
+	bodyBytes, _ := readAllBody(resp)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("LUKS RD create with only a controller prop: status got %d, want 400. Body: %s",
 			resp.StatusCode, bodyBytes)
 	}
+
+	assertLUKSRefusalHint(t, bodyBytes)
 }
 
 // TestBug023RefusalHintsAtCreatePassphrase: with NO passphrase
@@ -203,9 +196,7 @@ func TestBug023RefusalHintsAtCreatePassphrase(t *testing.T) {
 	}
 
 	bodyBytes, _ := readAllBody(resp)
-	if !strings.Contains(string(bodyBytes), "encryption create-passphrase") {
-		t.Errorf("refusal must hint at `linstor encryption create-passphrase`; body: %s", bodyBytes)
-	}
+	assertLUKSRefusalHint(t, bodyBytes)
 
 	// The RD must not be persisted on the refusal path.
 	if _, err := st.ResourceDefinitions().Get(t.Context(), "wf-luks-refused"); err == nil {
