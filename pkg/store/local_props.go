@@ -160,6 +160,11 @@ func TravellingProps(props map[string]string) map[string]string {
 	delete(out, RestoreAdoptedProp)
 	delete(out, RestoreFromSnapshotProp)
 	delete(out, RestoreVolumesProp)
+	// The clone path's own marks on its internal snapshot: copied off a
+	// definition onto a snapshot an operator takes, they would make that
+	// snapshot claim the clone path took it.
+	delete(out, CloneSnapshotOwnerProp)
+	delete(out, CloneSnapshotReapingProp)
 
 	return out
 }
@@ -173,6 +178,8 @@ var serverOwnedDefinitionProps = []string{ //nolint:gochecknoglobals // a fixed 
 	RollbackAbandonedProp,
 	RestoreAdoptedProp,
 	RestoreVolumesProp,
+	CloneSnapshotOwnerProp,
+	CloneSnapshotReapingProp,
 }
 
 // The steps a rollback gives up at before it touches anything: it found a
