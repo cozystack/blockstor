@@ -28,6 +28,7 @@ package dispatcher
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -228,6 +229,9 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 	// in the .res options. A wire key that came in with the replica's
 	// own properties is dropped first, so nothing but the Secret reaches
 	// the LUKS layer.
+	// mergeEffectiveProps hands back the replica's own map when there is
+	// no resolved bag; clone it so the drop never edits the caller's CR.
+	wireProps = maps.Clone(wireProps)
 	passphrase.DropPlaintextProps(wireProps)
 
 	if pass := pickLUKSPassphrase(drbdOpts); pass != "" {
