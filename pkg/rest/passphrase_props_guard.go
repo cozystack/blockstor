@@ -35,7 +35,9 @@ import (
 // for a backup would carry the key to every LUKS volume; the passphrase
 // lives in the Secret `encryption create-passphrase` writes, and blockstor
 // reads it from nowhere else. Deleting such a property stays allowed: a key
-// named in a delete list is a string, not an object key.
+// named in a delete list is a string, not an object key, and an override
+// that maps the key to an empty string is the documented set-property
+// delete (applyPropsModify), which stores nothing.
 func withPlaintextPassphraseRefusal(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body == nil || !isWriteMethod(r.Method) {
@@ -82,7 +84,7 @@ func findPlaintextPassphraseKey(node any) (string, bool) {
 	switch typed := node.(type) {
 	case map[string]any:
 		for key, value := range typed {
-			if passphrase.IsPlaintextPropKey(key) {
+			if passphrase.IsPlaintextPropKey(key) && value != "" {
 				return key, true
 			}
 
