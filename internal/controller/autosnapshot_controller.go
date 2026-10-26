@@ -86,18 +86,18 @@ const (
 	// freshly-created Snapshot CRD's metadata.creationTimestamp
 	// (which lags by the kube-apiserver's stamp time and would
 	// require a fresh GET each pass).
-	AnnotationAutoSnapshotLastAt = "blockstor.io/auto-snapshot-last-at"
+	AnnotationAutoSnapshotLastAt = "blockstor.org/auto-snapshot-last-at"
 
 	// LabelAutoSnapshot is the marker the runnable stamps on every
 	// Snapshot CRD it creates so the prune step can distinguish
 	// auto-created snapshots from operator-created ones. The
 	// scenario doc is explicit: manual snapshots are NOT counted
 	// against the Keep budget.
-	LabelAutoSnapshot = "blockstor.io/auto-snapshot"
+	LabelAutoSnapshot = "blockstor.org/auto-snapshot"
 
 	// labelResourceDefinition tags the Snapshot CRD with the parent RD
 	// name so the prune step can match by RD without a full Spec walk.
-	labelResourceDefinition = "blockstor.io/resource-definition"
+	labelResourceDefinition = "blockstor.org/resource-definition"
 
 	// labelTrueValue is the Kubernetes-canonical truthy string used for
 	// boolean labels (Kubernetes labels are strings).
@@ -296,9 +296,9 @@ func (r *AutoSnapshotRunnable) createAutoSnapshot(
 		ObjectMeta: metav1.ObjectMeta{
 			Name: rd.Name + "." + snapName,
 			Labels: map[string]string{
-				labelResourceDefinition:      rd.Name,
-				"blockstor.io/snapshot-name": snapName,
-				LabelAutoSnapshot:            labelTrueValue,
+				labelResourceDefinition:       rd.Name,
+				"blockstor.org/snapshot-name": snapName,
+				LabelAutoSnapshot:             labelTrueValue,
 			},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{

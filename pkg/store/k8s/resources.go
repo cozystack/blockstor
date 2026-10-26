@@ -38,7 +38,7 @@ import (
 
 // Labels used to index Resource CRDs by their composite key.
 const (
-	LabelResourceDefinition = "blockstor.io/resource-definition"
+	LabelResourceDefinition = "blockstor.org/resource-definition"
 )
 
 type resources struct {
@@ -246,12 +246,12 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	existing.Spec.SkipInitialSync = prevSkipInit
 
 	// Bug 67: round-trip wire-side Annotations through metadata so the
-	// REST writer's `blockstor.io/peer-changed` bump actually reaches
+	// REST writer's `blockstor.org/peer-changed` bump actually reaches
 	// the CRD ObjectMeta — without this the bump would silently no-op
 	// and the satellite's local-Resource watch would never fire.
 	//
 	// Bug 210: merge rather than wholesale-replace so the satellite-
-	// stamped `blockstor.io/volume-numbers` annotation (Bug 107 cascade-
+	// stamped `blockstor.org/volume-numbers` annotation (Bug 107 cascade-
 	// delete fallback) survives a wire-snapshot that raced the stamp.
 	// Without this, a routine `linstor r <verb>` between Get and Update
 	// wipes the annotation; a concurrent RD cascade-delete that hits
@@ -328,7 +328,7 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		existing.Spec.SkipInitialSync = prevSkipInit
 
 		// Bug 210: merge rather than wholesale-replace so the
-		// satellite-stamped `blockstor.io/volume-numbers` (Bug 107)
+		// satellite-stamped `blockstor.org/volume-numbers` (Bug 107)
 		// survives even if the closure built `wire.Annotations`
 		// from a stale snapshot that pre-dated the satellite stamp.
 		// PatchResourceSpec already has 409-retry via

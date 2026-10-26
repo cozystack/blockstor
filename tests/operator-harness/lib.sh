@@ -651,7 +651,7 @@ except Exception:
         rd_annotation)
             # An annotation on the RD's CRD equals `expected`; "" means the
             # key is absent. The CLI shows no annotations, so this reads the
-            # CRD (blockstor.io/unapplied-group-layer-stack and the like).
+            # CRD (blockstor.org/unapplied-group-layer-stack and the like).
             local rd key expected actual
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
             key=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('key',''))" "$spec")

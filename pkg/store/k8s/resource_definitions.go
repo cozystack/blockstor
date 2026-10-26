@@ -186,17 +186,17 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 // mergeUserAnnotationsInto applies the wire-side annotation map
 // onto existing.Annotations. Behavior:
 //   - nil wire input: no-op (preserves whatever the controller-side
-//     reconciler may have stamped under blockstor.io/* keys).
+//     reconciler may have stamped under blockstor.org/* keys).
 //   - non-nil: replaces ALL non-preserved annotations with the wire
 //     set; keys in `preserve` survive (the OriginalName store-internal
 //     marker, satellite-stamped Bug-107 fallback keys, etc.).
 //
 // Phase 10.4: lets the REST KV-store handler write
-// `blockstor.io/csi-volume-data` via Update without losing the
-// store-internal `blockstor.io/original-name`.
+// `blockstor.org/csi-volume-data` via Update without losing the
+// store-internal `blockstor.org/original-name`.
 //
 // Bug 210: the `preserve` slice extends the preservation set per-store
-// — Resources adds `blockstor.io/volume-numbers` (the satellite-stamped
+// — Resources adds `blockstor.org/volume-numbers` (the satellite-stamped
 // fallback used by the RD cascade-delete path) so a wire-snapshot that
 // raced the satellite stamp does not wipe it on the wholesale replace.
 func mergeUserAnnotationsInto(meta *metav1.ObjectMeta, wire map[string]string, preserve ...string) {
@@ -408,9 +408,9 @@ func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
 }
 
 // userAnnotations strips the store-internal annotation keys
-// (`blockstor.io/original-name` etc.) from a CRD's metadata.annotations
+// (`blockstor.org/original-name` etc.) from a CRD's metadata.annotations
 // before surfacing it on the wire — only operator/CSI-managed keys
-// (e.g. `blockstor.io/csi-volume-data`) reach the REST layer.
+// (e.g. `blockstor.org/csi-volume-data`) reach the REST layer.
 // Returns nil when no user-facing annotation survives the filter.
 func userAnnotations(in map[string]string) map[string]string {
 	if len(in) == 0 {

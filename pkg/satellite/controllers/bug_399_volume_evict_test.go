@@ -194,7 +194,7 @@ func TestMergeVolumesDestroyUnknownVolumeNoop(t *testing.T) {
 // append-only volCache kept the stale entry forever and the observer
 // re-emitted a phantom Status.Volumes[n] on every resync tick. The fix:
 // converge the cache to the RD's live volume set (the
-// `blockstor.io/volume-numbers` annotation the reconciler stamps), which
+// `blockstor.org/volume-numbers` annotation the reconciler stamps), which
 // is destroy-event-independent. These tests pin that convergence.
 
 // TestPruneVolumeCacheToDesiredEvictsDisklessOrphan is the diskless
@@ -269,7 +269,7 @@ func TestPruneVolumeCacheToDesiredEvictsDisklessOrphan(t *testing.T) {
 
 // TestPruneVolumeCacheToDesiredNoAnnotationNoop pins the safety guard:
 // when the desired set is unknown (no / empty / unparseable
-// `blockstor.io/volume-numbers` annotation) the prune must NOT touch the
+// `blockstor.org/volume-numbers` annotation) the prune must NOT touch the
 // cache. Blanking a replica's volumes on a missing record would be far
 // worse than a transient stale entry (early convergence before the first
 // stamp lands).

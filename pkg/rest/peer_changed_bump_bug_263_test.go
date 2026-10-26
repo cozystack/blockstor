@@ -42,7 +42,7 @@ import (
 // `drbdadm adjust` to add it.
 //
 // Root cause: the REST `handleResourceCreate` path persisted the new
-// Resource CRD but never bumped `blockstor.io/peer-changed` on the
+// Resource CRD but never bumped `blockstor.org/peer-changed` on the
 // surviving siblings. Bug 67's delete-side bump was the only existing
 // caller of `bumpPeerChangedOnSiblings`. Without a wake-up event on
 // the surviving replicas, their satellite reconcilers relied on the

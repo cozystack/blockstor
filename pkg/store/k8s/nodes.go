@@ -415,7 +415,7 @@ func (n *nodes) get(ctx context.Context, reader ctrlclient.Reader, name string) 
 // Phase 10.3: re-emits typed `Spec.SatelliteEndpoint` back into the
 // wire `Props["SatelliteEndpoint"]` so golinstor + the dispatcher's
 // fallback path keep seeing the same shape on GET. Native
-// `topology.blockstor.io/<key>` labels on the Node CRD ALSO get
+// `topology.blockstor.org/<key>` labels on the Node CRD ALSO get
 // folded back into `Props["Aux/<key>"]` so the autoplacer's
 // existing replicas_on_same / replicas_on_different filters keep
 // working unchanged across the labels migration.
@@ -535,7 +535,7 @@ func wireToCRDNodeSpec(in *apiv1.Node) crdv1alpha1.NodeSpec {
 // Replaces upstream LINSTOR's `Props["Aux/<key>"]` shape so that
 // the autoplacer can use `client.MatchingLabels` selectors and the
 // keys feed into `topologySpreadConstraints` for free. Phase 10.3.
-const TopologyLabelPrefix = "topology.blockstor.io/"
+const TopologyLabelPrefix = "topology.blockstor.org/"
 
 // hasTopologyLabels reports whether any of the Node's metadata
 // labels lives under the blockstor topology prefix. Cheap pre-
@@ -551,7 +551,7 @@ func hasTopologyLabels(labels map[string]string) bool {
 	return false
 }
 
-// foldTopologyLabels copies every `topology.blockstor.io/<key>`
+// foldTopologyLabels copies every `topology.blockstor.org/<key>`
 // label into `props["Aux/<key>"]` so existing readers (autoplacer
 // auxKey lookups, golinstor over the wire) see the topology
 // information without any changes. Mutates props in place.

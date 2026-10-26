@@ -22,7 +22,7 @@
 #      only).
 #   5. Operator cannot re-use the device for another `ps cdp`
 #      without manually `kubectl edit physicaldevices.
-#      blockstor.io <name>` to clear AttachTo.
+#      blockstor.org <name>` to clear AttachTo.
 #
 # Fix (Bug 340): when the satellite reconciler sees AttachTo
 # set + Status.Phase=Attaching (i.e. the SP was observed at
@@ -121,7 +121,7 @@ while (( $(date +%s) < deadline )); do
     # name is derived from a stable id (wwn / scsi-SATA / nvme / by-path)
     # so we can't predict it exactly; filter by node label + lsblk path.
     pd_name=$(kubectl get physicaldevices.blockstor.org \
-        -l "blockstor.io/node=${NODE}" \
+        -l "blockstor.org/node=${NODE}" \
         -o json 2>/dev/null \
         | jq -r '.items[] | select(.status.currentDevPath=="/dev/sdb" or .status.devicePath=="/dev/sdb" or (.status.currentDevPath|endswith("/sdb"))) | .metadata.name' \
         | head -1)

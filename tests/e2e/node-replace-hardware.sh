@@ -55,7 +55,7 @@ RD=test-replace-hw
 # a NoSchedule taint cannot keep the satellite Pod off $WORKER_3. Use a
 # label-based eviction the way state-offline-unknown.sh does: patch the
 # DS to require absence of $EVICT_LABEL, then label the node.
-EVICT_LABEL=blockstor.io/replace-hw-test
+EVICT_LABEL=blockstor.org/replace-hw-test
 POOL_NAME=stand
 
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')

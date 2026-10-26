@@ -122,7 +122,7 @@ func TestPatchCarriesAnnotationsWhenTheMutatorLeavesThemNil(t *testing.T) {
 	err := s.Resources().Create(ctx, &apiv1.Resource{
 		Name:        "pvc-x",
 		NodeName:    "node-1",
-		Annotations: map[string]string{"blockstor.io/keep": "yes"},
+		Annotations: map[string]string{"blockstor.org/keep": "yes"},
 	})
 	if err != nil {
 		t.Fatalf("seed: %v", err)
@@ -143,7 +143,7 @@ func TestPatchCarriesAnnotationsWhenTheMutatorLeavesThemNil(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 
-	if got.Annotations["blockstor.io/keep"] != "yes" {
+	if got.Annotations["blockstor.org/keep"] != "yes" {
 		t.Errorf("a patch that nilled Annotations cleared them: %v", got.Annotations)
 	}
 }
@@ -197,7 +197,7 @@ func TestPatchCarriesAnnotationsOnEveryStore(t *testing.T) {
 
 		err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
 			Name:        "pvc-x",
-			Annotations: map[string]string{"blockstor.io/keep": "yes"},
+			Annotations: map[string]string{"blockstor.org/keep": "yes"},
 		})
 		if err != nil {
 			t.Fatalf("seed: %v", err)
@@ -218,7 +218,7 @@ func TestPatchCarriesAnnotationsOnEveryStore(t *testing.T) {
 			t.Fatalf("get: %v", err)
 		}
 
-		if got.Annotations["blockstor.io/keep"] != "yes" {
+		if got.Annotations["blockstor.org/keep"] != "yes" {
 			t.Errorf("a patch that nilled Annotations cleared them: %v", got.Annotations)
 		}
 	})
@@ -231,7 +231,7 @@ func TestPatchCarriesAnnotationsOnEveryStore(t *testing.T) {
 
 		err := s.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
 			Name:        "grp",
-			Annotations: map[string]string{"blockstor.io/keep": "yes"},
+			Annotations: map[string]string{"blockstor.org/keep": "yes"},
 		})
 		if err != nil {
 			t.Fatalf("seed: %v", err)
@@ -252,7 +252,7 @@ func TestPatchCarriesAnnotationsOnEveryStore(t *testing.T) {
 			t.Fatalf("get: %v", err)
 		}
 
-		if got.Annotations["blockstor.io/keep"] != "yes" {
+		if got.Annotations["blockstor.org/keep"] != "yes" {
 			t.Errorf("a patch that nilled Annotations cleared them: %v", got.Annotations)
 		}
 	})

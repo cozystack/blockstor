@@ -34,21 +34,21 @@ import (
 
 // Bug 210: Resources.Update and Resources.PatchResourceSpec wholesale-
 // replace ObjectMeta.Annotations, wiping the satellite-stamped
-// `blockstor.io/volume-numbers` key (Bug 107) on every routine REST
+// `blockstor.org/volume-numbers` key (Bug 107) on every routine REST
 // modify. A concurrent RD cascade-delete that hits `lookupVolumeNumbers`
 // during the harm window leaks the backing LV/zvol.
 //
 // The race: REST handler Get returns a snapshot without the annotation,
-// satellite stamps `blockstor.io/volume-numbers`, REST Update wipes it
+// satellite stamps `blockstor.org/volume-numbers`, REST Update wipes it
 // via the wholesale write. Self-healing within ≤5s (observerResyncInterval)
 // but the harm window is real and uniquely exposed via the cascade-delete
 // path that depends on the annotation as a fallback record.
 //
 // Asymmetry vs RD/RG/Snapshot stores: they all use
-// `mergeUserAnnotationsInto` which preserves internal `blockstor.io/*`
+// `mergeUserAnnotationsInto` which preserves internal `blockstor.org/*`
 // keys. Resources is the lone holdout using wholesale replace.
 
-const resourceVolumeNumbersAnnotation = "blockstor.io/volume-numbers"
+const resourceVolumeNumbersAnnotation = "blockstor.org/volume-numbers"
 
 func TestBug210_UpdatePreservesVolumeNumbersWhenOperatorOmits(t *testing.T) {
 	t.Parallel()
@@ -87,9 +87,9 @@ func TestBug210_UpdatePreservesVolumeNumbersWhenOperatorOmits(t *testing.T) {
 	s := k8s.New(cli)
 
 	// Simulate the race: REST handler did Get BEFORE the satellite
-	// stamped `blockstor.io/volume-numbers`, so the wire snapshot
+	// stamped `blockstor.org/volume-numbers`, so the wire snapshot
 	// carries a non-nil but stale annotation set (e.g. the
-	// `blockstor.io/peer-changed` bump from Bug 67). The satellite
+	// `blockstor.org/peer-changed` bump from Bug 67). The satellite
 	// then stamps `volume-numbers` between Get and Update. The
 	// REST handler's Update with the stale snapshot must NOT wipe
 	// the satellite-stamped key.
@@ -97,7 +97,7 @@ func TestBug210_UpdatePreservesVolumeNumbersWhenOperatorOmits(t *testing.T) {
 		Name:     "rd-x",
 		NodeName: "node-a",
 		Annotations: map[string]string{
-			"blockstor.io/peer-changed": "2026-05-16T12:00:00Z",
+			"blockstor.org/peer-changed": "2026-05-16T12:00:00Z",
 		},
 	}
 
@@ -111,7 +111,7 @@ func TestBug210_UpdatePreservesVolumeNumbersWhenOperatorOmits(t *testing.T) {
 	}
 
 	if got.Annotations[resourceVolumeNumbersAnnotation] != "0,1" {
-		t.Fatalf("Bug 210: `blockstor.io/volume-numbers` annotation was WIPED by Resources.Update; "+
+		t.Fatalf("Bug 210: `blockstor.org/volume-numbers` annotation was WIPED by Resources.Update; "+
 			"got %q want %q. RD cascade-delete fallback (Bug 107) now leaks the backing LV/zvol.",
 			got.Annotations[resourceVolumeNumbersAnnotation], "0,1")
 	}
@@ -150,7 +150,7 @@ func TestBug210_UpdateMergesOperatorAnnotationsPreservingInternal(t *testing.T) 
 	s := k8s.New(cli)
 
 	// Operator pushes a user-facing annotation. The internal
-	// `blockstor.io/volume-numbers` key must NOT be in the wire
+	// `blockstor.org/volume-numbers` key must NOT be in the wire
 	// payload (REST handlers only know about user-managed keys);
 	// the store-side merge must preserve it.
 	in := apiv1.Resource{
@@ -175,7 +175,7 @@ func TestBug210_UpdateMergesOperatorAnnotationsPreservingInternal(t *testing.T) 
 			got.Annotations["myorg.com/team"], "storage")
 	}
 	if got.Annotations[resourceVolumeNumbersAnnotation] != "0,1" {
-		t.Fatalf("Bug 210: internal `blockstor.io/volume-numbers` WIPED on user-annotation merge; "+
+		t.Fatalf("Bug 210: internal `blockstor.org/volume-numbers` WIPED on user-annotation merge; "+
 			"got %q want %q",
 			got.Annotations[resourceVolumeNumbersAnnotation], "0,1")
 	}
@@ -216,7 +216,7 @@ func TestBug210_PatchResourceSpecPreservesVolumeNumbersWhenClosureOmits(t *testi
 	// Closure mutates an unrelated wire field and explicitly clears
 	// the annotations the wire saw (simulating an operator action
 	// that drops all user annotations). The internal
-	// `blockstor.io/volume-numbers` key must survive — it lives on
+	// `blockstor.org/volume-numbers` key must survive — it lives on
 	// the CRD, not the wire surface that the closure operates on.
 	err := s.Resources().PatchResourceSpec(context.Background(), "rd-z", "node-a", func(live *apiv1.Resource) error {
 		live.Annotations = nil
@@ -233,7 +233,7 @@ func TestBug210_PatchResourceSpecPreservesVolumeNumbersWhenClosureOmits(t *testi
 	}
 
 	if got.Annotations[resourceVolumeNumbersAnnotation] != "0,1" {
-		t.Fatalf("Bug 210: `blockstor.io/volume-numbers` annotation was WIPED by Resources.PatchResourceSpec; "+
+		t.Fatalf("Bug 210: `blockstor.org/volume-numbers` annotation was WIPED by Resources.PatchResourceSpec; "+
 			"got %q want %q",
 			got.Annotations[resourceVolumeNumbersAnnotation], "0,1")
 	}
@@ -297,7 +297,7 @@ func TestBug210_PatchResourceSpecMergesOperatorAnnotationsPreservingInternal(t *
 			got.Annotations["myorg.com/team"], "storage")
 	}
 	if got.Annotations[resourceVolumeNumbersAnnotation] != "0,1" {
-		t.Fatalf("Bug 210: internal `blockstor.io/volume-numbers` WIPED by Resources.PatchResourceSpec; "+
+		t.Fatalf("Bug 210: internal `blockstor.org/volume-numbers` WIPED by Resources.PatchResourceSpec; "+
 			"got %q want %q",
 			got.Annotations[resourceVolumeNumbersAnnotation], "0,1")
 	}

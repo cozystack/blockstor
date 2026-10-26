@@ -48,7 +48,7 @@ var peerDeletePollInterval = 250 * time.Millisecond
 
 // peerForgetAckAnnotationPrefix names the per-peer ACK key the
 // satellite stamps after completing ActionForgetPeer for a given peer
-// name. Full key shape: `blockstor.io/peer-forget-acked.<peerNode>`
+// name. Full key shape: `blockstor.org/peer-forget-acked.<peerNode>`
 // with an RFC3339Nano timestamp as the value. The REST handler's
 // waitForPeerDeletionAcks polls the key for presence as the implicit
 // confirmation that del-peer + forget-peer have completed against
@@ -58,7 +58,7 @@ var peerDeletePollInterval = 250 * time.Millisecond
 // round-tripped through Store and already serve as the channel for
 // cross-satellite signals (Bug 67 PeerChangedAnnotation), so reusing
 // the same transport keeps the fix additive — no Store schema change.
-const peerForgetAckAnnotationPrefix = "blockstor.io/peer-forget-acked."
+const peerForgetAckAnnotationPrefix = "blockstor.org/peer-forget-acked."
 
 // waitForPeerDeletionAcks blocks until every online sibling Resource
 // of `rdName` has stamped a peer-forget ACK annotation for

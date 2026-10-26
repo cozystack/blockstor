@@ -657,7 +657,7 @@ func TestSweeperGraceWindowDefersRecentlyDeletedRD(t *testing.T) {
 			Name:              "pvc-deleting",
 			CreationTimestamp: metav1.NewTime(frozenNow.Add(-time.Hour)),
 			DeletionTimestamp: &delTS,
-			Finalizers:        []string{"blockstor.io/test"},
+			Finalizers:        []string{"blockstor.org/test"},
 		},
 	}
 

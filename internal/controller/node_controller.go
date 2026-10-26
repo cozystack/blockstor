@@ -48,7 +48,7 @@ const evictionRequeue = 30 * time.Second
 // grep this annotation to find RDs that need manual intervention
 // (attach an RG, then re-trigger the node eviction) rather than
 // silently leaving replicas pinned to a draining node.
-const AnnotationMigrationBlocked = "blockstor.io/migration-blocked"
+const AnnotationMigrationBlocked = "blockstor.org/migration-blocked"
 
 // MigrationBlockedReasonNoRG is the value the NodeReconciler writes to
 // AnnotationMigrationBlocked when the parent RD has no
@@ -453,7 +453,7 @@ func resourceCRDName(rd, node string) string {
 }
 
 // annotateMigrationBlocked stamps the parent RD with the
-// `blockstor.io/migration-blocked` annotation and the given reason so
+// `blockstor.org/migration-blocked` annotation and the given reason so
 // an operator (`kubectl get rd -o ...`) can surface every RD whose
 // eviction migration refused to run. Idempotent: re-stamping with the
 // same reason is a no-op write.

@@ -30,7 +30,7 @@ import (
 // AnnotationLinstorName preserves the original LINSTOR-side name when
 // it had to be slugified to satisfy DNS-1123 metadata.Name rules.
 // Pass-through names are not annotated.
-const AnnotationLinstorName = "blockstor.io/linstor-name"
+const AnnotationLinstorName = "blockstor.org/linstor-name"
 
 // SetOriginalName tags meta with the original LINSTOR name when the
 // slugifier rewrote it in any way — including case-only differences
@@ -87,7 +87,7 @@ func OriginalName(meta *metav1.ObjectMeta) string {
 // the single normalization point: every store Get/Update/Delete
 // routes through Name(), so the same input lands on the same CRD
 // regardless of case. The canonical CamelCase spelling (when the
-// caller supplied one) round-trips via the `blockstor.io/linstor-name`
+// caller supplied one) round-trips via the `blockstor.org/linstor-name`
 // annotation — see SetOriginalName / OriginalName.
 func Name(in string) string {
 	lower := strings.ToLower(in)

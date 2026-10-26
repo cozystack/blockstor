@@ -40,7 +40,7 @@ import (
 // REST-driven trigger and a periodic background tick:
 //
 //  1. REST `linstor rg modify` stamps the
-//     `blockstor.io/rebalance-pending` annotation on the RG CRD when
+//     `blockstor.org/rebalance-pending` annotation on the RG CRD when
 //     PlaceCount strictly increases or a placement-affecting
 //     SelectFilter changes (see pkg/rest/resource_groups.go).
 //  2. The controller-runtime watch on RG CRDs delivers a reconcile
@@ -61,7 +61,7 @@ import (
 //     its behalf. The annotation-driven path is NOT gated — an
 //     operator-driven REST modify still flows through.
 //  5. Scenario 2.20: every Reconcile also scans for RDs stamped with
-//     `blockstor.io/spawn-shortfall=<RFC3339>` by the 9.W05
+//     `blockstor.org/spawn-shortfall=<RFC3339>` by the 9.W05
 //     partial-fail spawn path; once GracePeriod has elapsed since the
 //     stamp, the placer re-runs against that RD and the annotation is
 //     stripped on success.
@@ -210,7 +210,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // surface that breakage on their own paths.)
 //
 // `shortfallGrace` is the per-RD scenario-2.20 window: an RD whose
-// `blockstor.io/spawn-shortfall` stamp is younger than this duration
+// `blockstor.org/spawn-shortfall` stamp is younger than this duration
 // is skipped (the dedicated replay path owns the retry, gated by the
 // same window). Pass 0 to disable the gate — the annotation-driven
 // path does this so an operator's `linstor rg modify` acts on every
@@ -276,7 +276,7 @@ func (r *RGRebalanceReconciler) shortfallWithinGrace(rd *apiv1.ResourceDefinitio
 }
 
 // replaySpawnShortfalls handles scenario 2.20. Walks every RD in the
-// parent RG, looks for the `blockstor.io/spawn-shortfall` annotation,
+// parent RG, looks for the `blockstor.org/spawn-shortfall` annotation,
 // and once the stamped wall-clock + grace window has elapsed re-runs
 // the additive placer. The annotation is stripped on success so a
 // subsequent tick is a clean no-op; on continued failure the marker

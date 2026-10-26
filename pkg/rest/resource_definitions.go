@@ -119,7 +119,7 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal
-	// `blockstor.io/*` + `bug<N>.blockstor.org/*` annotations
+	// `blockstor.org/*` + `bug<N>.blockstor.org/*` annotations
 	// from every RD before the JSON encode. See
 	// pkg/rest/internal_annotations.go.
 	stripInternalAnnotationsFromRDs(rds)

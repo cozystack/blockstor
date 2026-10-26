@@ -1498,7 +1498,7 @@ func (r *ResourceDefinitionReconciler) confirmGhostReplicas(
 // snapshot_controller.go) to avoid a controller→store/k8s dependency.
 // Node CRDs whose LINSTOR name needed slugifying carry the original
 // wire name here; probeNodeDirect matches against both spellings.
-const linstorNameAnnotation = "blockstor.io/linstor-name"
+const linstorNameAnnotation = "blockstor.org/linstor-name"
 
 // nodeProbe is the answer probeNodeDirect returns about a node's
 // authoritative state.

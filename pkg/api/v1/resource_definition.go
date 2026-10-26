@@ -23,7 +23,7 @@ package v1
 //
 // Phase 10.4: `Annotations` carries the K8s-native metadata.annotations
 // of the underlying CRD. Used by the REST KV-store rewrite to surface
-// `blockstor.io/csi-volume-data` (linstor-csi per-PVC JSON metadata)
+// `blockstor.org/csi-volume-data` (linstor-csi per-PVC JSON metadata)
 // without going through the deprecated KVEntry CRD. Not part of
 // upstream LINSTOR's wire shape — golinstor ignores unknown JSON
 // fields, so the new key flows through transparently.

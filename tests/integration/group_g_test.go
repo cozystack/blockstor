@@ -76,7 +76,7 @@ const groupGRDPrefix = "rd-g-"
 // imported) because the constant lives in an internal helper
 // package and pulling it would invite a wider dependency surface
 // than this test file needs.
-const snapshotCRDLabelRD = "blockstor.io/resource-definition"
+const snapshotCRDLabelRD = "blockstor.org/resource-definition"
 
 // satelliteSnapshotFinalizer mirrors
 // pkg/satellite/controllers.SatelliteSnapshotFinalizer. Stamped on

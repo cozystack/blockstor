@@ -50,7 +50,7 @@ data:
 ---
 # The satellite runs c-r reconcilers for ResourceDefinitions /
 # Resources / Snapshots / StoragePools and writes node-scoped Status
-# back via SSA — it needs full CRUD on blockstor.io CRDs and access
+# back via SSA — it needs full CRUD on blockstor.org CRDs and access
 # to Status / Finalizers subresources, same as the controller. Events
 # permission is for `EventRecorder` traces from reconcile loops.
 apiVersion: rbac.authorization.k8s.io/v1

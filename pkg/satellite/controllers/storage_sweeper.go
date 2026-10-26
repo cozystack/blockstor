@@ -62,7 +62,7 @@ const StorageSweeperMaxDeletePerCycle = 3
 // the satellite reap it. Distinct from SweeperSkipAnnotation so an
 // operator can pause storage GC without also pausing kernel-DRBD GC
 // (and vice versa).
-const StorageSweeperSkipAnnotation = "blockstor.io/skip-orphan-storage-sweeper"
+const StorageSweeperSkipAnnotation = "blockstor.org/skip-orphan-storage-sweeper"
 
 // storageResourcePrefix is the name prefix the sweeper requires before
 // it will consider a volume for deletion. blockstor's RD names always

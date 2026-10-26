@@ -116,7 +116,7 @@ func TestBug199WriteErrorScrubsEtcdMessage(t *testing.T) {
 
 // TestBug199WriteErrorScrubsApimachineryMessage pins the apimachinery
 // flavor: a NewConflict-shaped string carrying the GroupResource
-// ("controllerconfigs.blockstor.org[.blockstor.io]") reaches writeError.
+// ("controllerconfigs.blockstor.org[.blockstor.org]") reaches writeError.
 // All three substrings (apimachinery, k8s.io, the group fingerprint)
 // MUST be scrubbed.
 func TestBug199WriteErrorScrubsApimachineryMessage(t *testing.T) {

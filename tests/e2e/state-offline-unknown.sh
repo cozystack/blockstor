@@ -62,7 +62,7 @@ if ! command -v linstor >/dev/null 2>&1; then
 fi
 
 RD=e2e-5-5-offline-unknown
-EVICT_LABEL=blockstor.io/offline-unknown-test
+EVICT_LABEL=blockstor.org/offline-unknown-test
 OFFLINE_TIMEOUT=75    # 40 s grace + watchdog requeue period (5 s) +
                       # apiserver/SSA-apply slack on a busy QEMU stand
 HEAL_TIMEOUT=180      # satellite startup + heartbeat (max 40 s for the

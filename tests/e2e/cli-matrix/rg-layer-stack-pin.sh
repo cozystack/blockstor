@@ -9,7 +9,7 @@
 # it empty (internal/controller/resourcedefinition_layer_stack.go). A
 # definition that holds no data takes the group's stack; one that already
 # went to disk under the default stack keeps it, carries the
-# blockstor.io/unapplied-group-layer-stack annotation and gets a
+# blockstor.org/unapplied-group-layer-stack annotation and gets a
 # LayerStackNotInherited warning Event, so a LUKS group added over a
 # plaintext volume never has the satellite luksFormat that volume.
 #
@@ -49,7 +49,7 @@ RD_DATA=cli-matrix-ls-data
 RD_CLONE=cli-matrix-ls-clone
 POOL=${POOL:-lvm-thin}
 PASSPHRASE='cli-matrix-ls-pp!'
-ANNOTATION=blockstor.io/unapplied-group-layer-stack
+ANNOTATION=blockstor.org/unapplied-group-layer-stack
 
 cleanup() {
     delete_rd "$RD_CLONE"
