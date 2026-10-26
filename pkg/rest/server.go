@@ -337,10 +337,12 @@ func (s *Server) startTLS(ctx context.Context, handler http.Handler, errCh chan<
 //	                       oversized POST trips a 413 envelope at
 //	                       the wire edge instead of leaking the
 //	                       etcd/k8s rejection string in a 500.
+//	withPlaintextPassphraseRefusal — refuses a body that would store
+//	                       the LUKS master passphrase in a property.
 func (s *Server) handler() http.Handler {
 	mux := s.buildMux()
 
-	wrapped := withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux))))))
+	wrapped := withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, withPlaintextPassphraseRefusal(mux)))))))
 
 	// SSE bypass: the event-stream endpoints push frames over a long-
 	// lived connection, which is fundamentally incompatible with the

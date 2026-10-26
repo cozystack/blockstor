@@ -35,6 +35,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -219,44 +220,25 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 
 	wireProps := mergeEffectiveProps(target.Spec.Props, effectiveProps, drbdOpts)
 
-	// LUKS passphrase: lift the operator-set master passphrase onto
-	// the stable `LuksPassphrase` prop the satellite's LUKS layer
-	// reads. Two source keys are accepted, in order:
-	//
-	//  1. `DrbdOptions/EncryptPassphrase` — upstream LINSTOR's
-	//     canonical cluster-scope master-key name, stamped via
-	//     `linstor controller set-property DrbdOptions/
-	//     EncryptPassphrase <pass>`. Bug 95 enforces its presence
-	//     as a hard prerequisite for any LUKS-layered RD; this is
-	//     the key the REST layer surfaces through
-	//     effectiveprops.Resolve (it copies ControllerConfig.
-	//     ExtraProps onto the output map verbatim).
-	//
-	//  2. `DrbdOptions/Encryption/passphrase` — legacy per-RD shape
-	//     the early-Phase-9 dispatcher introduced (Bug 265 root cause:
-	//     this was the ONLY key the dispatcher read, while the
-	//     controller wrote the cluster master under the upstream
-	//     name in #1 → the operator-set master key never reached
-	//     the satellite and every LUKS RD looped on `Props.
-	//     LuksPassphrase empty`). Kept as a backwards-compat alias.
-	//
-	// The first non-empty wins; both keys are dropped from drbdOpts
-	// after lifting so splitDRBDOptions on the satellite side
-	// doesn't render either as a `passphrase` line in the .res file's
-	// options block (drbdadm create-md rejects unknown options with
-	// `expected: cpu-mask | ... but got 'passphrase'`). The
-	// passphrase reaches the LUKS layer via wireProps, not the .res
-	// file.
+	// LUKS passphrase: the satellite puts the Secret's value under the
+	// upstream master-key name in effectiveProps, after dropping any
+	// property that carried one (passphrase.DropPlaintextProps). It is
+	// lifted onto the wire key the satellite's LUKS layer reads and
+	// dropped from drbdOpts, so it never renders as a `passphrase` line
+	// in the .res options. A wire key that came in with the replica's
+	// own properties is dropped first, so nothing but the Secret reaches
+	// the LUKS layer.
+	passphrase.DropPlaintextProps(wireProps)
+
 	if pass := pickLUKSPassphrase(drbdOpts); pass != "" {
 		if wireProps == nil {
 			wireProps = map[string]string{}
 		}
 
-		wireProps["LuksPassphrase"] = pass
+		wireProps[passphrase.WirePropKey] = pass
 	}
 
-	delete(drbdOpts, drbdEncryptionPassphraseKey)
-	delete(drbdOpts, drbdEncryptPassphraseKey)
+	passphrase.DropPlaintextProps(drbdOpts)
 
 	var layerStack []string
 	if rd != nil {
@@ -343,39 +325,12 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 	return out
 }
 
-// drbdEncryptionPassphraseKey is the legacy per-RD shape the
-// early-Phase-9 dispatcher introduced. Kept as a backwards-compat
-// alias source key — operators on older clusters who set the
-// passphrase via the inner-namespace form should keep working
-// without re-stamping. Bug 265 root cause: the dispatcher used to
-// read ONLY this key, never the upstream master-key one below.
-//
-//nolint:gosec // not a credential value, the string is a prop key name
-const drbdEncryptionPassphraseKey = "DrbdOptions/Encryption/passphrase"
-
-// drbdEncryptPassphraseKey is upstream LINSTOR's canonical cluster-
-// scope master-key name. Operators set it via `linstor controller
-// set-property DrbdOptions/EncryptPassphrase <pass>`; Bug 95 enforces
-// its presence as a hard prerequisite for any LUKS-layered RD. The
-// REST/effectiveprops layer surfaces it under this exact key, so the
-// dispatcher MUST read it to receive the operator-set master key.
-//
-//nolint:gosec // not a credential value, the string is a prop key name
-const drbdEncryptPassphraseKey = "DrbdOptions/EncryptPassphrase"
-
-// pickLUKSPassphrase returns the LUKS passphrase from the resolved
-// options bag, preferring the upstream-canonical master-key shape
-// over the legacy per-RD alias. Empty when neither is set; the
-// caller suppresses the wire-prop stamp in that case so the
-// satellite surfaces the missing-passphrase failure at the LUKS
-// layer (the apply-time failure point that produces actionable
-// error messages on the resource Status.Conditions).
+// pickLUKSPassphrase returns the passphrase the satellite put in the
+// resolved options from the Secret, empty when there is none; the
+// caller then leaves the wire key unset and the LUKS layer fails the
+// apply with an actionable message.
 func pickLUKSPassphrase(opts map[string]string) string {
-	if v := opts[drbdEncryptPassphraseKey]; v != "" {
-		return v
-	}
-
-	return opts[drbdEncryptionPassphraseKey]
+	return opts[passphrase.PropKeyCanonical]
 }
 
 // mergeEffectiveProps splits the resolver's output into:

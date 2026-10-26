@@ -49,9 +49,9 @@ import (
 // `DrbdOptions/EncryptPassphrase` key in effectiveProps, so
 // BuildDesired's pickLUKSPassphrase lifts it onto `LuksPassphrase`
 // and strips it from the rendered .res options exactly as before.
-// Precedence is unchanged — an operator-set controller prop (either
-// spelling) wins over the Secret, so existing LUKS volumes keep
-// unlocking with the key they were formatted with.
+// The Secret is the only source. A passphrase an operator put in a
+// property, under the upstream key, the early per-RD alias or the wire
+// key itself, is dropped first: it sits in plaintext on its CR.
 //
 // Failure posture: a Secret read error is logged and swallowed —
 // the apply chain then surfaces the established, actionable
@@ -61,16 +61,15 @@ import (
 // No-ops when:
 //   - the RD has no LUKS layer (the overwhelmingly common path —
 //     zero Secret round-trips);
-//   - either passphrase prop key is already present (legacy path);
 //   - Config.Namespace is empty (unit-test rigs without a
 //     controller namespace).
 func (r *ResourceReconciler) injectLUKSMasterPassphrase(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) {
-	if rd == nil || effectiveProps == nil || !layerStackHasLUKS(rd.Spec.LayerStack) {
-		return
-	}
+	// A passphrase in a property never counts: whatever an operator put
+	// there under any of its keys goes, so only the Secret's value can
+	// reach the LUKS layer.
+	passphrase.DropPlaintextProps(effectiveProps)
 
-	if effectiveProps[passphrase.PropKeyCanonical] != "" ||
-		effectiveProps[passphrase.PropKeyLegacy] != "" {
+	if rd == nil || effectiveProps == nil || !layerStackHasLUKS(rd.Spec.LayerStack) {
 		return
 	}
 
