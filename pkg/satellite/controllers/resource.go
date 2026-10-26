@@ -1100,12 +1100,12 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 		return nil, errors.Wrap(err, "resolve effective props")
 	}
 
-	// Bug 023: when the master passphrase lives ONLY in the
-	// encryption Secret (`linstor encryption create-passphrase`),
-	// fold it into the props bag under the canonical
-	// DrbdOptions/EncryptPassphrase key so BuildDesired lifts it
-	// onto the `LuksPassphrase` wire prop exactly like the legacy
-	// controller-prop path. See luks_passphrase.go.
+	// Bug 023: the master passphrase lives only in the encryption
+	// Secret (`linstor encryption create-passphrase`). Drop any
+	// passphrase property from the bag and fold the Secret's value in
+	// under the canonical DrbdOptions/EncryptPassphrase key, so
+	// BuildDesired lifts it onto the `LuksPassphrase` wire prop. See
+	// luks_passphrase.go.
 	r.injectLUKSMasterPassphrase(ctx, rd, effectiveProps)
 
 	desired := dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps)
