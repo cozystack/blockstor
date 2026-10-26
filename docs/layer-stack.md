@@ -105,6 +105,39 @@ spec:
   after the storage layer has resized the underlying LV, before DRBD
   resizes the replicated device.
 
+### Upgrading a cluster that kept the passphrase in a property
+
+Before this release a passphrase property won over the Secret: `DrbdOptions/EncryptPassphrase` on the controller, or `DrbdOptions/Encryption/passphrase` on a group or a definition. LUKS volumes created while one was set were formatted with its value. From this release on the satellite opens them with the Secret's value only, and logs `ignoring LUKS passphrase properties` with the keys it dropped. Do this before the upgrade.
+
+1. Find the properties. Their values are redacted on the REST API, so read the CRs:
+
+   ```sh
+   kubectl get controllerconfigs.blockstor.cozystack.io -o jsonpath='{.items[*].spec.extraProps}'
+   kubectl get resourcegroups.blockstor.cozystack.io,resourcedefinitions.blockstor.cozystack.io -o json \
+     | jq -r '.items[] | select(.spec.props // {} | keys | any(test("passphrase|Passphrase"))) | .metadata.name'
+   ```
+
+2. Make the Secret open every LUKS volume:
+   - **A controller property and no Secret**: run `linstor encryption create-passphrase` with the property's exact value.
+   - **A controller property set from the start, and a Secret with another value**: no LUKS volume was formatted with the Secret's value, so overwrite the Secret with the property's value. The API refuses this (create answers 409 because a passphrase exists, modify answers 409 because LUKS volumes exist), so do it with kubectl:
+
+     ```sh
+     kubectl -n blockstor-system create secret generic blockstor-cluster-passphrase \
+       --from-literal=passphrase='<the property value>' --dry-run=client -o yaml | kubectl apply -f -
+     ```
+
+   - **Per-definition or per-group values, or a Secret that some volumes were formatted with**: the volumes use different keys, so no single Secret value opens them all. Add the Secret's value to each LUKS device that was formatted with another key, on every node with a replica, with `cryptsetup luksAddKey <device>`; it asks for the key the device has now.
+
+3. Delete the properties, so the plaintext value leaves the CRs and the next backup:
+
+   ```sh
+   linstor controller set-property DrbdOptions/EncryptPassphrase ""
+   linstor resource-group set-property <group> DrbdOptions/Encryption/passphrase ""
+   linstor resource-definition set-property <definition> DrbdOptions/Encryption/passphrase ""
+   ```
+
+A volume missed in step 2 fails to open on the next satellite restart or mapper close; the satellite log line names the property it was formatted with.
+
 ## What blockstor doesn't yet support
 
 - **Pluggable layer ordering**: the stack must be one of the four
