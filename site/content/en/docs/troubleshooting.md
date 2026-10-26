@@ -149,7 +149,7 @@ This error from the CSI driver, the `linstor` client or any other API client mea
 
 Check that:
 
-- The client's certificate was issued by the `blockstor-api-ca` Issuer. The Secret `blockstor-apiserver-client-tls` in `blockstor-system` carries a working `tls.crt`, `tls.key` and `ca.crt`. A client in another namespace needs its own Certificate from the same Issuer.
+- The client's certificate was signed by the `blockstor-api-ca` CA. The Secret `blockstor-apiserver-client-tls` in `blockstor-system` carries a working `tls.crt`, `tls.key` and `ca.crt`. `blockstor-api-ca` is a namespaced Issuer, so a Certificate in another namespace that names it is never issued: such a Certificate stays not `Ready`. Mirror the CA or copy a client Secret into that namespace, as in [Client certificates in another namespace](../csi/#client-certificates-in-another-namespace).
 - The client trusts the `ca.crt` from that Secret as its root CA. With `linstor-csi` that is `LS_ROOT_CA`.
 - The client connects to a name on the serving certificate: `blockstor-apiserver` or `blockstor-controller`, with or without the `.blockstor-system.svc` suffix. An IP address or a port-forward to `localhost` on port 3371 does not match.
 

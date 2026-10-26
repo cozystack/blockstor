@@ -20,7 +20,7 @@ Piraeus normally ships a whole LINSTOR distribution. With blockstor you take onl
 
 ## Point the driver at blockstor
 
-The API server listens with mutual TLS on port 3371 of the `blockstor-apiserver` Service in `blockstor-system`. The installation created a client certificate for in-cluster clients: the Secret `blockstor-apiserver-client-tls` carries `tls.crt`, `tls.key` and `ca.crt`. Mount it into both the CSI controller and the CSI node plugin, and set the endpoint and certificate paths:
+The API server listens with mutual TLS on port 3371 of the `blockstor-apiserver` Service in `blockstor-system`. The installation created a client certificate for in-cluster clients: the Secret `blockstor-apiserver-client-tls` carries `tls.crt`, `tls.key` and `ca.crt`. A pod in `blockstor-system` can mount that Secret directly; for a driver in another namespace, see [Client certificates in another namespace](#client-certificates-in-another-namespace) first. Mount the Secret into both the CSI controller and the CSI node plugin, and set the endpoint and certificate paths:
 
 ```yaml
 env:
@@ -44,11 +44,55 @@ volumes:
 
 The node plugin's `--node` argument must match the name of a blockstor `Node`, which is the Kubernetes node name.
 
-If you install `linstor-csi` with the piraeus operator, set `LinstorCluster.spec.externalController.url` to `https://blockstor-apiserver.blockstor-system.svc:3371`. That turns off the operator's own LINSTOR controller and points the CSI driver at blockstor. Point `spec.apiTLS.certManager` at the `blockstor-api-ca` Issuer, so the operator issues the client certificate for the CSI pods.
+## Client certificates in another namespace
 
-The Secret lives in `blockstor-system`. If the CSI driver runs in another namespace, issue a second client certificate into that namespace from the same `blockstor-api-ca` Issuer.
+The Secret `blockstor-apiserver-client-tls` and the `blockstor-api-ca` Issuer both live in `blockstor-system`, and `blockstor-api-ca` is a namespaced `Issuer`. cert-manager looks up an `Issuer` in the Certificate's own namespace, so a Certificate in any other namespace that names `blockstor-api-ca` is never issued. A pod can only mount a Secret from its own namespace. A CSI driver that runs outside `blockstor-system`, which is the usual case, needs the client material brought into its namespace. There are two ways to do that.
 
-cert-manager renews the certificates in place, and the API server picks up a new certificate without a restart.
+**Mirror the CA into the client's namespace.** Copy the CA Secret `blockstor-api-ca` into the client's namespace and create a CA `Issuer` over it there. Certificates in that namespace are then issued and renewed by cert-manager like any other. This is what blockstor's own test installation does for piraeus-operator, in the namespace `piraeus-datastore`:
+
+```sh
+kubectl -n blockstor-system get secret blockstor-api-ca -o json \
+  | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.annotations, .metadata.labels)' \
+  | kubectl -n piraeus-datastore apply -f -
+kubectl apply -f - <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: blockstor-api-ca
+  namespace: piraeus-datastore
+spec:
+  ca:
+    secretName: blockstor-api-ca
+EOF
+```
+
+The copy carries the CA's private key. Anyone who can read Secrets in that namespace can sign a client certificate, and a client certificate is full access to the API. Mirror it only into a namespace you trust as much as `blockstor-system`.
+
+**Copy a client certificate.** Issue the client Certificate in `blockstor-system`, from the `blockstor-api-ca` Issuer, and copy the Secret it produces, with `tls.crt`, `tls.key` and `ca.crt`, into the client's namespace. The CA key stays in `blockstor-system`. The copy is not renewed: the installation's client certificate lasts 90 days and is renewed 15 days before it expires, and you have to copy the Secret again after each renewal, or the client fails once the old certificate expires.
+
+## With piraeus-operator
+
+If you install `linstor-csi` with the piraeus operator, set `LinstorCluster.spec.externalController.url` to `https://blockstor-apiserver.blockstor-system.svc:3371`. That turns off the operator's own LINSTOR controller and points the CSI driver at blockstor.
+
+For the client certificate, mirror the CA into the operator's namespace as shown above, and point `spec.apiTLS.certManager` at the `Issuer` you created there. The operator then creates the Certificates for the CSI pods in its own namespace, from that Issuer:
+
+```yaml
+apiVersion: piraeus.io/v1
+kind: LinstorCluster
+metadata:
+  name: linstorcluster
+spec:
+  externalController:
+    url: https://blockstor-apiserver.blockstor-system.svc:3371
+  apiTLS:
+    certManager:
+      name: blockstor-api-ca
+      kind: Issuer
+```
+
+To use copied Secrets instead, leave out `certManager` and name the copies in `spec.apiTLS.csiControllerSecretName` and `spec.apiTLS.csiNodeSecretName`. Each Secret must carry `tls.crt`, `tls.key` and `ca.crt`, and you copy them again after each renewal.
+
+cert-manager renews the certificates it issues in place, and the API server picks up a new certificate without a restart.
 
 ## StorageClass
 
@@ -71,9 +115,9 @@ allowVolumeExpansion: true
 
 - `storagePool` is the pool that holds the replicas with data.
 - `placementCount` is the number of replicas with data. Blockstor adds a tiebreaker when that number is even.
-- `resourceGroup` uses a [resource group](../resources/#resourcegroup) as the policy. Without it, volumes go into the default group, `DfltRscGrp`.
+- `resourceGroup` uses a [resource group](../resources/#resourcegroup) as the policy. Without it, `linstor-csi` does not use `DfltRscGrp`: it creates a resource group named `sc-<uuid>` from the StorageClass parameters and puts the volumes there.
 
-`storagePool`, `placementCount` and `resourceGroup` are covered by blockstor's own tests. Other `linstor.csi.linbit.com/*` parameters are passed through to the API unchanged; test the ones you rely on in your cluster first.
+`storagePool` and `placementCount` are covered by blockstor's own tests. `resourceGroup` and the other `linstor.csi.linbit.com/*` parameters are passed through to the API unchanged; test the ones you rely on in your cluster first.
 
 ## A first PVC
 
