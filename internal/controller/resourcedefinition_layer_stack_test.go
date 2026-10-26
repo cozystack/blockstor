@@ -283,12 +283,14 @@ func TestPinLayerStackLooksOnlyAtItsOwnReplicas(t *testing.T) {
 	}
 }
 
-// Every shape that has nothing to inherit is left exactly as it is.
+// Every shape that has nothing to inherit is left exactly as it is. An RD
+// that set its own stack short of its group is flagged instead, see
+// TestPinnedRDsUnappliedGroupStackFollowsTheGroup.
 func TestPinLayerStackLeavesRDsWithNothingToInherit(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string][]client.Object{
-		"RD sets its own stack": {pinGroup(luksStack...), pinRD("rg-pin", "DRBD", "STORAGE")},
+		"RD sets its own stack": {pinGroup(luksStack...), pinRD("rg-pin", luksStack...)},
 		"RD in no group":        {pinGroup(luksStack...), pinRD("")},
 		"group gone":            {pinRD("rg-pin")},
 		"group sets no stack":   {pinGroup(), pinRD("rg-pin")},
@@ -426,10 +428,10 @@ func TestPinLayerStackTreatsTheInitializedLatchAsData(t *testing.T) {
 	}
 }
 
-// The annotation on a pinned RD follows its group: it goes once the group
-// no longer asks for a layer the RD lacks, or the group is gone, and names
-// the group's current stack while the RD is still short of it. An RD that
-// was never flagged is left alone.
+// The annotation on a pinned RD follows its group both ways: it goes once
+// the group no longer asks for a layer the RD lacks, or the group is gone,
+// and names the group's current stack while the RD is short of it, whether
+// or not it was flagged before.
 func TestPinnedRDsUnappliedGroupStackFollowsTheGroup(t *testing.T) {
 	t.Parallel()
 
@@ -448,7 +450,8 @@ func TestPinnedRDsUnappliedGroupStackFollowsTheGroup(t *testing.T) {
 		"group gone":              {objs: []client.Object{flagged("DRBD,LUKS,STORAGE")}},
 		"group still asks":        {objs: []client.Object{pinGroup(luksStack...), flagged("DRBD,LUKS,STORAGE")}, want: "DRBD,LUKS,STORAGE"},
 		"group changed its ask":   {objs: []client.Object{pinGroup("LUKS", "STORAGE"), flagged("DRBD,LUKS,STORAGE")}, want: "LUKS,STORAGE"},
-		"never flagged":           {objs: []client.Object{pinGroup(luksStack...), pinRD("rg-pin", "DRBD", "STORAGE")}},
+		"group gained a layer":    {objs: []client.Object{pinGroup(luksStack...), pinRD("rg-pin", "DRBD", "STORAGE")}, want: "DRBD,LUKS,STORAGE"},
+		"never short":             {objs: []client.Object{pinGroup("DRBD", "STORAGE"), pinRD("rg-pin", "DRBD", "STORAGE")}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -467,5 +470,47 @@ func TestPinnedRDsUnappliedGroupStackFollowsTheGroup(t *testing.T) {
 				t.Errorf("the pinned stack changed to %v", got.rd.Spec.LayerStack)
 			}
 		})
+	}
+}
+
+// A group that drops a layer and takes it back flags its RD again, with a
+// warning Event: the mark is not lost to the flap.
+func TestUnappliedGroupStackSurvivesAGroupFlap(t *testing.T) {
+	t.Parallel()
+
+	rd := pinRD("rg-pin", "DRBD", "STORAGE")
+	rd.Annotations = map[string]string{apiv1.UnappliedGroupLayerStackAnnotation: "DRBD,LUKS,STORAGE"}
+	group := pinGroup(luksStack...)
+	cli := pinClient(t, group, rd)
+
+	setGroupStack := func(stack ...string) {
+		t.Helper()
+
+		var live blockstoriov1alpha1.ResourceGroup
+		if err := cli.Get(context.Background(), client.ObjectKey{Name: "rg-pin"}, &live); err != nil {
+			t.Fatalf("get group: %v", err)
+		}
+
+		live.Spec.SelectFilter.LayerStack = stack
+		if err := cli.Update(context.Background(), &live); err != nil {
+			t.Fatalf("update group: %v", err)
+		}
+	}
+
+	setGroupStack("DRBD", "STORAGE")
+
+	if got := reconcilePin(t, cli); got.rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation] != "" {
+		t.Fatalf("still flagged after the group dropped LUKS: %v", got.rd.Annotations)
+	}
+
+	setGroupStack(luksStack...)
+
+	got := reconcilePin(t, cli)
+	if a := got.rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation]; a != "DRBD,LUKS,STORAGE" {
+		t.Fatalf("annotation %q after the group took LUKS back, want the group's stack", a)
+	}
+
+	if len(got.events) != 1 || !strings.HasPrefix(got.events[0], "Warning LayerStackNotInherited") {
+		t.Errorf("events %v, want one LayerStackNotInherited warning", got.events)
 	}
 }

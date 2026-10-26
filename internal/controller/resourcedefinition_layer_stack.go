@@ -130,19 +130,17 @@ func (r *ResourceDefinitionReconciler) readGroup(
 	return &rg, nil
 }
 
-// refreshUnappliedGroupStack keeps the annotation on a pinned RD true to its
-// group as the group is now: the layers the group asks for while the RD's
-// stack lacks one of them, and no annotation once it no longer does or the
-// group is gone. An RD without the annotation is left alone; it was never
-// short of its group when its stack was decided.
+// refreshUnappliedGroupStack keeps the annotation on an RD with a decided
+// stack true to its group as the group is now, both ways: it names the
+// group's stack while the RD's stack lacks a layer of it, and is gone once
+// it no longer does or the group is deleted. So an RD whose group gains a
+// layer after the pin, or a copy whose group asks for more than its source
+// had, is flagged too, and a group that drops a layer and takes it back
+// flags the RD again. The group is read from the controller's cache.
 func (r *ResourceDefinitionReconciler) refreshUnappliedGroupStack(
 	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
 ) error {
-	recorded, flagged := rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation]
-	if !flagged {
-		return nil
-	}
-
+	recorded := rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation]
 	want := ""
 
 	if rd.Spec.ResourceGroupName != "" {
@@ -161,15 +159,25 @@ func (r *ResourceDefinitionReconciler) refreshUnappliedGroupStack(
 	}
 
 	base := rd.DeepCopy()
-	if want == "" {
+
+	switch {
+	case want == "":
 		delete(rd.Annotations, apiv1.UnappliedGroupLayerStackAnnotation)
-	} else {
+	case rd.Annotations == nil:
+		rd.Annotations = map[string]string{apiv1.UnappliedGroupLayerStackAnnotation: want}
+	default:
 		rd.Annotations[apiv1.UnappliedGroupLayerStackAnnotation] = want
 	}
 
 	err := r.Patch(ctx, rd, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 	if err != nil {
 		return errors.Wrapf(err, "refresh the unapplied group stack of %q", rd.Name)
+	}
+
+	if recorded == "" && r.Recorder != nil {
+		r.Recorder.Eventf(rd, nil, corev1.EventTypeWarning, layerStackNotInheritedReason, layerStackPinAction,
+			"layer stack %s lacks a layer of the stack %s its resource group %s now asks for; migrate the data to a new volume to take it",
+			strings.Join(rd.Spec.LayerStack, ","), want, rd.Spec.ResourceGroupName)
 	}
 
 	return nil
