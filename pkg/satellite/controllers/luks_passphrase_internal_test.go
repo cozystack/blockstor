@@ -41,8 +41,8 @@ import (
 // Props.LuksPassphrase empty`. These tests pin
 // injectLUKSMasterPassphrase: the Secret value must enter the
 // effective-props bag under the canonical key (so BuildDesired's
-// existing lift to the `LuksPassphrase` wire prop fires), with the
-// legacy prop paths keeping precedence.
+// existing lift to the `LuksPassphrase` wire prop fires), and no
+// passphrase property may ever stand in for it.
 
 const testControllerNS = "blockstor-system"
 
@@ -137,27 +137,74 @@ func TestBug023SecretPassphraseReachesWireProps(t *testing.T) {
 	}
 }
 
-// TestBug023LegacyPropKeepsPrecedence: an operator-set controller
-// prop must win over the Secret so existing LUKS volumes keep
-// unlocking with the key they were formatted with.
-func TestBug023LegacyPropKeepsPrecedence(t *testing.T) {
+// TestBug023SecretReplacesEveryPassphraseProp: a passphrase in a
+// property, under any of its keys, never wins over the Secret. The
+// property sits in plaintext on its CR; the Secret is the only source,
+// so the injected canonical value is the Secret's and every property
+// that carried one is gone.
+func TestBug023SecretReplacesEveryPassphraseProp(t *testing.T) {
 	t.Parallel()
 
 	r := newPassphraseTestReconciler(t, passphraseSecret("secret-value"))
 
-	for _, key := range []string{passphrase.PropKeyCanonical, passphrase.PropKeyLegacy} {
+	for _, key := range []string{passphrase.PropKeyCanonical, passphrase.PropKeyLegacy, passphrase.WirePropKey} {
 		effectiveProps := map[string]string{key: "prop-value"}
 
 		r.injectLUKSMasterPassphrase(t.Context(), luksRD(), effectiveProps)
 
-		if got := effectiveProps[key]; got != "prop-value" {
-			t.Errorf("legacy prop %q overwritten: got %q, want prop-value", key, got)
+		if got := effectiveProps[passphrase.PropKeyCanonical]; got != "secret-value" {
+			t.Errorf("with prop %q set: canonical key got %q, want the Secret value", key, got)
 		}
 
-		if key == passphrase.PropKeyLegacy {
-			if _, added := effectiveProps[passphrase.PropKeyCanonical]; added {
-				t.Errorf("canonical key injected despite legacy prop present — " +
-					"pickLUKSPassphrase would switch keys under existing volumes")
+		for k, v := range effectiveProps {
+			if v == "prop-value" {
+				t.Errorf("with prop %q set: %q still carries the property's value", key, k)
+			}
+		}
+	}
+}
+
+// TestBug023PropAloneYieldsNoPassphrase: with no Secret, a passphrase
+// in a property, under any key or spelling, does not become one. It
+// is dropped from the bag, so BuildDesired stamps no wire key and the
+// LUKS layer fails the apply with its actionable missing-key message
+// instead of formatting or opening a volume with a plaintext key. A
+// definition without LUKS gets the property dropped too, so the value
+// never rides along in the wire props.
+func TestBug023PropAloneYieldsNoPassphrase(t *testing.T) {
+	t.Parallel()
+
+	r := newPassphraseTestReconciler(t)
+
+	plainRD := luksRD()
+	plainRD.Spec.LayerStack = []string{"DRBD", "STORAGE"}
+
+	for _, rd := range []*blockstoriov1alpha1.ResourceDefinition{luksRD(), plainRD} {
+		for _, key := range []string{
+			passphrase.PropKeyCanonical, passphrase.PropKeyLegacy, passphrase.WirePropKey,
+			"drbdoptions/ENCRYPTPASSPHRASE",
+		} {
+			effectiveProps := map[string]string{key: "prop-value", "Aux/keep": "yes"}
+
+			r.injectLUKSMasterPassphrase(t.Context(), rd, effectiveProps)
+
+			if len(effectiveProps) != 1 || effectiveProps["Aux/keep"] != "yes" {
+				t.Errorf("stack %v, prop %q: props after injection = %v, want only Aux/keep",
+					rd.Spec.LayerStack, key, effectiveProps)
+			}
+
+			target := &blockstoriov1alpha1.Resource{
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rd.Name,
+					NodeName:               "node-a",
+					StoragePool:            "pool-a",
+				},
+			}
+
+			desired := dispatcher.BuildDesired(target, nil, nil, nil, rd, effectiveProps)
+			if pass, ok := desired.Props[passphrase.WirePropKey]; ok {
+				t.Errorf("stack %v, prop %q: wire key stamped with %q from a property",
+					rd.Spec.LayerStack, key, pass)
 			}
 		}
 	}

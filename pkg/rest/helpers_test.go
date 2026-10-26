@@ -20,6 +20,7 @@ package rest
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -61,6 +62,20 @@ func newFakeRESTClient(t *testing.T) client.Client {
 	return fake.NewClientBuilder().WithScheme(scheme).Build()
 }
 
+// testPassphraseSecret is the Secret `linstor encryption create-passphrase`
+// writes, holding value, in the namespace the REST-test helpers pin the
+// server to. It is the only place the LUKS master passphrase is read from;
+// tests that need the cluster master key seed this, never a property.
+func testPassphraseSecret(value string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testRESTNamespace,
+			Name:      passphrase.DefaultSecretName,
+		},
+		Data: map[string][]byte{passphrase.SecretKey: []byte(value)},
+	}
+}
+
 // startServerWithPassphrase is startServerWithStore with the cluster master
 // key already set, which is the prerequisite for creating anything carrying a
 // LUKS layer. Without it the handlers answer 400 — correctly, since a LUKS
@@ -70,15 +85,7 @@ func startServerWithPassphrase(t *testing.T, st store.Store) (string, func()) {
 
 	client := newFakeRESTClient(t)
 
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: testRESTNamespace,
-			Name:      passphrase.DefaultSecretName,
-		},
-		Data: map[string][]byte{passphrase.SecretKey: []byte("test-cluster-key")},
-	}
-
-	if err := client.Create(context.Background(), secret); err != nil {
+	if err := client.Create(context.Background(), testPassphraseSecret("test-cluster-key")); err != nil {
 		t.Fatalf("seed the passphrase Secret: %v", err)
 	}
 
@@ -88,4 +95,21 @@ func startServerWithPassphrase(t *testing.T, st store.Store) (string, func()) {
 		Client:    client,
 		Namespace: testRESTNamespace,
 	})
+}
+
+// assertLUKSRefusalHint checks the body of a LUKS prerequisite refusal: it
+// must send the operator to `encryption create-passphrase` and must not name
+// a passphrase property, which blockstor never reads.
+func assertLUKSRefusalHint(t *testing.T, body []byte) {
+	t.Helper()
+
+	if !strings.Contains(string(body), "encryption create-passphrase") {
+		t.Errorf("refusal must hint at `linstor encryption create-passphrase`; body: %s", body)
+	}
+
+	for _, key := range []string{passphrase.PropKeyCanonical, passphrase.PropKeyLegacy, passphrase.WirePropKey} {
+		if strings.Contains(string(body), key) {
+			t.Errorf("refusal names the property %q, which is never read; body: %s", key, body)
+		}
+	}
 }
