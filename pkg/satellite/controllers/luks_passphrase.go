@@ -67,10 +67,18 @@ func (r *ResourceReconciler) injectLUKSMasterPassphrase(ctx context.Context, rd 
 	// A passphrase in a property never counts: whatever an operator put
 	// there under any of its keys goes, so only the Secret's value can
 	// reach the LUKS layer.
-	passphrase.DropPlaintextProps(effectiveProps)
+	ignored := passphrase.DropPlaintextProps(effectiveProps)
 
 	if rd == nil || effectiveProps == nil || !layerStackHasLUKS(rd.Spec.LayerStack) {
 		return
+	}
+
+	if len(ignored) > 0 {
+		// Key names only, never the values. A volume formatted with one of
+		// these keys fails to open with the Secret's value; this line is
+		// what names the property it was formatted with.
+		log.FromContext(ctx).Info("ignoring LUKS passphrase properties; the passphrase Secret is the only source",
+			"resourceDefinition", rd.Name, "properties", ignored)
 	}
 
 	if r.Config.Namespace == "" {

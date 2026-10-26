@@ -35,6 +35,7 @@ package passphrase
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -94,13 +95,24 @@ func IsPlaintextPropKey(key string) bool {
 }
 
 // DropPlaintextProps removes every property that would carry the
-// master passphrase from props.
-func DropPlaintextProps(props map[string]string) {
-	for key := range props {
+// master passphrase from props, and returns the keys it removed that
+// held a value, sorted, for the caller to name in a log line.
+func DropPlaintextProps(props map[string]string) []string {
+	var dropped []string
+
+	for key, value := range props {
 		if IsPlaintextPropKey(key) {
 			delete(props, key)
+
+			if value != "" {
+				dropped = append(dropped, key)
+			}
 		}
 	}
+
+	slices.Sort(dropped)
+
+	return dropped
 }
 
 // SecretName resolves the passphrase Secret's name from the
