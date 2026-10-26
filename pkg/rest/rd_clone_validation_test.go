@@ -9,9 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -227,12 +224,7 @@ func TestRDCloneReplayOfAFinishedLUKSCloneDoesNotNeedThePassphrase(t *testing.T)
 	body := map[string]any{"layer_list": []string{"DRBD", "LUKS", "STORAGE"}}
 
 	withPass := newFakeRESTClient(t)
-	if err := withPass.Create(t.Context(), &blockstoriov1alpha1.ControllerConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
-		Spec: blockstoriov1alpha1.ControllerConfigSpec{
-			ExtraProps: map[string]string{"DrbdOptions/EncryptPassphrase": "blockstorpass"},
-		},
-	}); err != nil {
+	if err := withPass.Create(t.Context(), testPassphraseSecret("blockstorpass")); err != nil {
 		t.Fatalf("seed the passphrase: %v", err)
 	}
 
