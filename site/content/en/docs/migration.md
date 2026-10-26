@@ -68,7 +68,7 @@ Not converted, and listed in the tool's report:
 
 ## Convert
 
-Build the tool from the blockstor release you are installing and run it on the dump:
+`cmd/linstor-migrate` is in no release up to v0.1.17. It ships in the release after that, so pick that one or a newer one for `<VERSION>`. Build the tool from the blockstor release you are installing and run it on the dump:
 
 ```sh
 go install github.com/cozystack/blockstor/cmd/linstor-migrate@v<VERSION>
