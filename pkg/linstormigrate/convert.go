@@ -1292,9 +1292,13 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 		// operator's master passphrase and LINSTOR's KDF, which this
 		// converter does not implement yet. The layer stack carries
 		// LUKS (rdLayerStack reads it off the replicas when the RD
-		// row leaves it empty), but the volume cannot be opened until
-		// the passphrase is provisioned into blockstor by hand.
-		c.warnf("resource definition %s: LUKS passphrase NOT migrated (encrypted with the LINSTOR master key) — provision spec.encryption manually before adopting", dsp)
+		// row leaves it empty), but blockstor opens every LUKS volume with the
+		// cluster passphrase in its Secret, which is not this volume's
+		// key, so the volume cannot be opened until that passphrase is
+		// added to it as a key slot.
+		c.warnf("resource definition %s: LUKS key NOT migrated (encrypted with the LINSTOR master key); "+
+			"blockstor opens LUKS volumes with the cluster passphrase, so add it to each volume with "+
+			"`cryptsetup luksAddKey` before adopting", dsp)
 	}
 }
 
