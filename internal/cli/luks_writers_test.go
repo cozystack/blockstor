@@ -5,6 +5,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -90,29 +91,41 @@ func TestLUKSPrerequisiteHoldsOnEveryLayerListWriter(t *testing.T) {
 	}
 }
 
-// The Secret is the primary mechanism, but a cluster provisioned before it
-// existed carries the passphrase in the legacy controller prop and the
-// satellite still unlocks with it. REST accepts both sources; a CLI that
-// reads only the Secret refuses on such a cluster what the REST door on the
-// same cluster accepts.
-func TestLUKSPrerequisiteAcceptsTheLegacyControllerProp(t *testing.T) {
+// The passphrase lives only in the Secret `encryption create-passphrase`
+// writes; nothing reads it from a property. A controller prop that carries
+// one (put there with kubectl, since REST refuses to store it) must not
+// satisfy the prerequisite, and the refusal must point at the Secret flow,
+// not at the property.
+func TestLUKSPrerequisiteIgnoresTheControllerProp(t *testing.T) {
 	t.Parallel()
 
 	app, backend, errBuf := newKubeAppWithStore(t)
 
 	err := backend.ControllerProps().PatchProps(t.Context(), func(props map[string]string) error {
-		props[passphrase.PropKeyCanonical] = "from-a-pre-Secret-cluster"
+		props[passphrase.PropKeyCanonical] = "plaintext-in-a-prop"
 
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("seed the legacy prop: %v", err)
+		t.Fatalf("seed the controller prop: %v", err)
 	}
 
 	stack := apiv1.LayerKindDRBD + "," + apiv1.LayerKindLUKS + "," + apiv1.LayerKindStorage
 
-	if got := app.Run(t.Context(), []string{"rd", "c", "pvc-x", "--layer-list", stack}); got != 0 {
-		t.Errorf("exit = %d: the cluster has a passphrase in the legacy prop, which REST "+
-			"accepts (stderr: %s)", got, errBuf.String())
+	if got := app.Run(t.Context(), []string{"rd", "c", "pvc-x", "--layer-list", stack}); got == 0 {
+		t.Fatalf("exit 0: a passphrase in a controller prop satisfied the LUKS prerequisite "+
+			"(stderr: %s)", errBuf.String())
+	}
+
+	if !strings.Contains(errBuf.String(), "encryption create-passphrase") {
+		t.Errorf("the refusal does not point at `encryption create-passphrase`: %s", errBuf.String())
+	}
+
+	if strings.Contains(errBuf.String(), passphrase.PropKeyCanonical) {
+		t.Errorf("the refusal names the property, which is never read: %s", errBuf.String())
+	}
+
+	if _, err := backend.ResourceDefinitions().Get(t.Context(), "pvc-x"); err == nil {
+		t.Error("the refused create wrote the definition")
 	}
 }
