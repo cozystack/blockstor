@@ -1795,6 +1795,11 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Watches(&blockstoriov1alpha1.Node{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsForNode),
 			builder.WithPredicates(nodeDrainFlagChanged())).
+		// A group that gains or drops a layer re-checks its RDs'
+		// unapplied-group annotation now, not at the next resync.
+		Watches(&blockstoriov1alpha1.ResourceGroup{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsInGroup),
+			builder.WithPredicates(groupLayerStackChanged())).
 		Named("resourcedefinition").
 		Complete(r)
 }

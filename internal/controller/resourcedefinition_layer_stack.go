@@ -27,8 +27,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -136,7 +140,8 @@ func (r *ResourceDefinitionReconciler) readGroup(
 // it no longer does or the group is deleted. So an RD whose group gains a
 // layer after the pin, or a copy whose group asks for more than its source
 // had, is flagged too, and a group that drops a layer and takes it back
-// flags the RD again. The group is read from the controller's cache.
+// flags the RD again. The group is read with the reconciler's reader, a
+// direct GET when the manager wires the APIReader, as it does in production.
 func (r *ResourceDefinitionReconciler) refreshUnappliedGroupStack(
 	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
 ) error {
@@ -176,7 +181,7 @@ func (r *ResourceDefinitionReconciler) refreshUnappliedGroupStack(
 
 	if recorded == "" && r.Recorder != nil {
 		r.Recorder.Eventf(rd, nil, corev1.EventTypeWarning, layerStackNotInheritedReason, layerStackPinAction,
-			"layer stack %s lacks a layer of the stack %s its resource group %s now asks for; migrate the data to a new volume to take it",
+			"layer stack %s lacks a layer of the stack %s its resource group %s asks for",
 			strings.Join(rd.Spec.LayerStack, ","), want, rd.Spec.ResourceGroupName)
 	}
 
@@ -236,4 +241,45 @@ func (r *ResourceDefinitionReconciler) rdHoldsData(ctx context.Context, rdName s
 	}
 
 	return false, nil
+}
+
+// groupLayerStackChanged fires on a group update that changes its layer
+// stack, the only group edit the unapplied-group annotation depends on.
+// Creates and deletes are left to the RD's own reconcile: a new group has
+// no pinned RDs yet, and a deleted one is read as gone there.
+func groupLayerStackChanged() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldGroup, okOld := e.ObjectOld.(*blockstoriov1alpha1.ResourceGroup)
+			newGroup, okNew := e.ObjectNew.(*blockstoriov1alpha1.ResourceGroup)
+
+			return okOld && okNew &&
+				!slices.Equal(oldGroup.Spec.SelectFilter.LayerStack, newGroup.Spec.SelectFilter.LayerStack)
+		},
+	}
+}
+
+// enqueueRDsInGroup maps a group event to the RDs that name it, under any
+// spelling of the name the store folds to the group's.
+func (r *ResourceDefinitionReconciler) enqueueRDsInGroup(ctx context.Context, obj client.Object) []reconcile.Request {
+	var rdList blockstoriov1alpha1.ResourceDefinitionList
+
+	err := r.List(ctx, &rdList)
+	if err != nil {
+		return nil
+	}
+
+	var out []reconcile.Request
+
+	for i := range rdList.Items {
+		group := rdList.Items[i].Spec.ResourceGroupName
+		if group != "" && k8s.Name(group) == obj.GetName() {
+			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Name: rdList.Items[i].Name}})
+		}
+	}
+
+	return out
 }
