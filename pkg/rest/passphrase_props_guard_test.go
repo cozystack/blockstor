@@ -53,6 +53,12 @@ func startGuardServer(t *testing.T, objs ...client.Object) (string, store.Store,
 		t.Fatalf("seed RD: %v", err)
 	}
 
+	if err := st.VolumeDefinitions().Create(t.Context(), "rd-guard", &apiv1.VolumeDefinition{
+		VolumeNumber: 0, SizeKib: 1024,
+	}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
 	cli := newFakeRESTClient(t)
 	for _, obj := range objs {
 		if err := cli.Create(t.Context(), obj); err != nil {
@@ -88,7 +94,8 @@ func controllerExtraProps(t *testing.T, cli client.Client) map[string]string {
 // Every door that would store the master passphrase in a property answers
 // 400 and stores nothing: the controller set-property, a definition create
 // carrying the early per-RD alias, a definition modify carrying the wire key,
-// and a spelling that differs only in case.
+// a volume definition modify carrying upstream's per-volume key, and a
+// spelling that differs only in case.
 func TestPlaintextPassphrasePropIsRefusedOnEveryDoor(t *testing.T) {
 	t.Parallel()
 
@@ -129,6 +136,21 @@ func TestPlaintextPassphrasePropIsRefusedOnEveryDoor(t *testing.T) {
 				}
 
 				return rd.Props[passphrase.WirePropKey] != ""
+			},
+		},
+		{
+			name: "vd modify with the per-volume key", method: http.MethodPut,
+			path: "/v1/resource-definitions/rd-guard/volume-definitions/0",
+			body: `{"override_props":{"DrbdOptions/Encrypt/Passphrase":"` + guardCanary + `"}}`,
+			stored: func(t *testing.T, st store.Store, _ client.Client) bool {
+				t.Helper()
+
+				vd, err := st.VolumeDefinitions().Get(t.Context(), "rd-guard", 0)
+				if err != nil {
+					t.Fatalf("get VD: %v", err)
+				}
+
+				return vd.Props[passphrase.PropKeyVolume] != ""
 			},
 		},
 		{
