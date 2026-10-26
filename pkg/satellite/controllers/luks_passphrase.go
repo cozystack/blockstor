@@ -44,11 +44,11 @@ import (
 // gate but every replica apply looped on `LUKS in layer stack but
 // Props.LuksPassphrase empty`.
 //
-// The injection deliberately reuses the EXACT downstream channel the
-// legacy prop travels: the value lands under the canonical
+// The injection reuses the downstream channel the controller prop
+// used to travel: the value lands under the canonical
 // `DrbdOptions/EncryptPassphrase` key in effectiveProps, so
 // BuildDesired's pickLUKSPassphrase lifts it onto `LuksPassphrase`
-// and strips it from the rendered .res options exactly as before.
+// and strips it from the rendered .res options.
 // The Secret is the only source. A passphrase an operator put in a
 // property, under the upstream key, the early per-RD alias or the wire
 // key itself, is dropped first: it sits in plaintext on its CR.

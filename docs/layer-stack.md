@@ -61,8 +61,8 @@ curl -XPOST http://controller:3370/v1/resource-definitions \
 ### Per-RG via spawn template
 
 ```bash
+linstor encryption create-passphrase --passphrase '<32-byte-secret>'
 linstor rg create encrypted-rg
-linstor rg sp encrypted-rg DrbdOptions/Encryption/passphrase '<32-byte-secret>'
 linstor rg c --place-count 2 encrypted-rg
 linstor rg spawn encrypted-rg pvc-2 1G --layer-list LUKS DRBD
 ```
@@ -72,27 +72,49 @@ the REST shape mirrors upstream LINSTOR.)
 
 ### Per-RD via kubectl
 
+The cluster passphrase Secret has to exist first; `linstor encryption
+create-passphrase` writes it, or apply it yourself (GitOps):
+
 ```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: blockstor-cluster-passphrase   # or ControllerConfig spec.passphraseSecretRef.name
+  namespace: blockstor-system          # the controller's namespace
+type: Opaque
+stringData:
+  passphrase: "32-byte-secret"
+---
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: pvc-encrypted}
 spec:
   layerStack: ["LUKS", "STORAGE"]
-  props:
-    DrbdOptions/Encryption/passphrase: "32-byte-secret"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 1048576}
 ```
 
 ## LUKS specifics
 
-- Passphrase is per-RD via `DrbdOptions/Encryption/passphrase`. The
-  upstream `linstor rd set-property` key.
-- The dispatcher folds the resolver-resolved passphrase onto the wire
-  as `DesiredResource.Props["LuksPassphrase"]`; the satellite reads it
-  from there.
-- Empty passphrase with `LUKS` in the stack fails the apply rather
-  than silently producing an unencrypted volume.
+- The passphrase is the cluster master passphrase, and it lives only in
+  the Secret `linstor encryption create-passphrase` writes
+  (`blockstor-cluster-passphrase` in the controller's namespace, unless
+  ControllerConfig `spec.passphraseSecretRef` names another). Creating
+  an RD with `LUKS` in its stack is refused until that Secret exists.
+- A passphrase is never read from a property. The REST API answers 400
+  to any write that would store `DrbdOptions/EncryptPassphrase`,
+  `DrbdOptions/Encryption/passphrase` or `LuksPassphrase` (any case, on
+  any object), and so does the bundled CLI's `set-property`: a property
+  sits in plaintext on its CR, so any dump of the CRs would carry the
+  key to every LUKS volume. Deleting such a property is still allowed.
+  This differs from upstream LINSTOR, where `linstor controller
+  set-property DrbdOptions/EncryptPassphrase` is accepted.
+- The satellite reads the Secret, drops any passphrase property that
+  reached a definition's props (one put there with kubectl, say), and
+  hands the Secret's value to the dispatcher, which puts it on the wire
+  as `DesiredResource.Props["LuksPassphrase"]` for the LUKS layer.
+- No passphrase with `LUKS` in the stack fails the apply rather than
+  silently producing an unencrypted volume.
 - Mapper name: `<rd>-<vol>-luks` → `/dev/mapper/<rd>-<vol>-luks`. Stable
   across reconciles so reopen on satellite restart re-uses it.
 - Volume grow: the satellite runs `cryptsetup resize` on the mapper
@@ -105,17 +127,19 @@ spec:
   rows in the table above. Arbitrary orderings (e.g. `["LUKS","DRBD","STORAGE"]`
   with LUKS-over-DRBD instead of DRBD-over-LUKS) aren't yet validated
   or rendered.
-- **Per-volume LUKS keys**: every volume on a 2-volume RD currently
-  uses the same RD-level passphrase. Per-volume keys (with master-key
+- **Per-volume LUKS keys**: every LUKS volume in the cluster currently
+  uses the cluster master passphrase. Per-volume keys (with master-key
   wrapping in the controller's KV store) is a follow-up.
 - **Mid-stack changes**: editing `layerStack` after a Resource is
   active doesn't re-encrypt or unwrap existing data. Treat it as
   set-once-per-RD until migration support lands.
-- **Cluster-passphrase rotation**: the cluster passphrase
-  (`POST /v1/encryption/passphrase`) wraps RD passphrases in the
-  controller's KV store; rotating it doesn't re-encrypt LUKS headers.
-  Rotating the per-RD passphrase requires `cryptsetup luksChangeKey`
-  which isn't wired yet — operators should drop the RD and recreate.
+- **Cluster-passphrase rotation**: the cluster passphrase is the LUKS
+  key itself, not a wrapping key. `linstor encryption
+  modify-passphrase` (`PUT /v1/encryption/passphrase`) rewrites the
+  Secret, but nothing runs `cryptsetup luksChangeKey` on the existing
+  headers, so volumes formatted with the old value stop opening the
+  next time the satellite opens them. Do not rotate while LUKS volumes
+  exist; drop and recreate them instead.
 
 ## Testing
 

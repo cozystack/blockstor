@@ -1049,8 +1049,9 @@ func needsLUKS(stack []string) bool {
 // out of cryptsetup luksFormat's geometry so the probe is skipped.
 //
 // Passphrase source for this slice: dr.Props["LuksPassphrase"]. The
-// controller folds it in from the RD's `DrbdOptions/Encryption/passphrase`
-// prop via the resolver. Empty passphrase fails the apply — explicit
+// dispatcher stamps it from the cluster passphrase Secret alone
+// (pkg/satellite/controllers/luks_passphrase.go); a passphrase in a
+// property is never read. Empty passphrase fails the apply — explicit
 // rather than silently creating an unencrypted volume.
 func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, resized bool) (map[int32]string, bool, error) {
 	if r.cfg.Cryptsetup == nil {
