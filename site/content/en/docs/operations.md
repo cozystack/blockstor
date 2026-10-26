@@ -191,6 +191,8 @@ kubectl -n blockstor-system get secret blockstor-cluster-passphrase -o yaml > bl
 
 The last line applies only if you use encrypted volumes. The Secret holds the cluster passphrase, and the volumes cannot be opened without it. Its name can be changed through `spec.passphraseSecretRef` on the `ControllerConfig`. Store the backup like any other secret material.
 
+Up to v0.1.17 the passphrase can also be set as a property, `DrbdOptions/EncryptPassphrase` on the controller or `DrbdOptions/Encryption/passphrase` on a definition, and a property set there wins over the Secret. A property is stored in plaintext on its resource, so the YAML dump above then carries the key to every encrypted volume. Keep the passphrase in the Secret only, and treat the dump as secret material if such a property was ever set.
+
 ## Upgrading
 
 Upgrade in the same order as the installation. Update the manifests to the new tag with the same `sed` as in [Installation](../installation/#get-the-manifests), then apply:
