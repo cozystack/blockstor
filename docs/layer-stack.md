@@ -111,19 +111,21 @@ spec:
   rows in the table above. Arbitrary orderings (e.g. `["LUKS","DRBD","STORAGE"]`
   with LUKS-over-DRBD instead of DRBD-over-LUKS) aren't yet validated
   or rendered.
-- **Per-volume LUKS keys**: every LUKS volume in the cluster currently
-  uses the cluster master passphrase. Per-volume keys (with master-key
-  wrapping in the controller's KV store) is a follow-up.
+- **Per-volume LUKS keys**: every LUKS volume in the cluster uses the
+  cluster master passphrase. `linstor vd set-passphrase` answers 400:
+  it used to store the value in the volume definition's properties,
+  in plaintext, where nothing read it. Per-volume keys (with master-key
+  wrapping) are a follow-up.
 - **Mid-stack changes**: editing `layerStack` after a Resource is
   active doesn't re-encrypt or unwrap existing data. Treat it as
   set-once-per-RD until migration support lands.
 - **Cluster-passphrase rotation**: the cluster passphrase is the LUKS
   key itself, not a wrapping key. `linstor encryption
   modify-passphrase` (`PUT /v1/encryption/passphrase`) rewrites the
-  Secret, but nothing runs `cryptsetup luksChangeKey` on the existing
-  headers, so volumes formatted with the old value stop opening the
-  next time the satellite opens them. Do not rotate while LUKS volumes
-  exist; drop and recreate them instead.
+  Secret, and nothing runs `cryptsetup luksChangeKey` on the existing
+  headers, so volumes formatted with the old value would stop opening.
+  It answers 409 while any definition has LUKS in its stack, naming
+  one of them; rotate only once there are none.
 
 ## Testing
 
