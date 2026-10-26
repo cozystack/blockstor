@@ -71,13 +71,6 @@ if ! "${LCTL[@]}" encryption create-passphrase --passphrase "$PASSPHRASE" >/dev/
     exit 1
 fi
 
-# A LUKS-layered RD additionally requires the controller property
-# DrbdOptions/EncryptPassphrase (the LUKS layer reads the per-volume
-# key material from it); the cluster passphrase alone is not enough —
-# rd-create is rejected with "LUKS layer requires
-# DrbdOptions/EncryptPassphrase to be set first".
-"${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase "$PASSPHRASE" >/dev/null 2>&1 || true
-
 echo ">> [Bug 333] linstor rd c $RD -l drbd,luks,storage"
 err_file=$(mktemp)
 if ! "${LCTL[@]}" resource-definition create "$RD" \
