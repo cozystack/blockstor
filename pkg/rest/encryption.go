@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -597,10 +598,7 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err = s.writePassphrase(ctx, want)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
+	if !s.rotatePassphrase(ctx, w, want) {
 		return
 	}
 
@@ -616,6 +614,51 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		RetCode: maskInfo,
 		Message: "Master passphrase modified",
 	}})
+}
+
+// rotatePassphrase writes the new cluster passphrase unless LUKS volumes
+// would lose their key to it, answering the error itself; false means the
+// handler stops.
+func (s *Server) rotatePassphrase(ctx context.Context, w http.ResponseWriter, want string) bool {
+	if !s.refuseRotationOverLUKSVolumes(ctx, w) {
+		return false
+	}
+
+	err := s.writePassphrase(ctx, want)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return false
+	}
+
+	return true
+}
+
+// refuseRotationOverLUKSVolumes answers 409 and returns false while any
+// definition has LUKS in its stack. The cluster passphrase is the key
+// every LUKS volume was formatted with, and nothing re-keys a volume yet
+// (no `cryptsetup luksChangeKey`), so a new value in the Secret would
+// leave every existing LUKS volume unable to open on its next start.
+func (s *Server) refuseRotationOverLUKSVolumes(ctx context.Context, w http.ResponseWriter) bool {
+	rds, err := s.Store.ResourceDefinitions().List(ctx)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	for i := range rds {
+		if apiv1.LayerInStack(rds[i].LayerStack, apiv1.LayerKindLUKS) {
+			writeError(w, http.StatusConflict, fmt.Sprintf(
+				"refusing to change the cluster passphrase while LUKS volumes exist (%s among them): "+
+					"it is the key they were formatted with, and they are not re-keyed, so they would no longer open",
+				rds[i].Name))
+
+			return false
+		}
+	}
+
+	return true
 }
 
 // readPassphrase reads the current cluster passphrase. Empty
