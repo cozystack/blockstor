@@ -179,19 +179,19 @@ blockstor snapshot delete my-volume before-upgrade
 
 ## Backing up the control plane
 
-Blockstor keeps all of its state in custom resources, so a backup is a dump of them. Include the `Resource` objects: the DRBD ports, minors and node IDs that the controller allocated live in their spec, and a restore that invents new ones would make every replica reconnect.
+Blockstor keeps all of its state in custom resources, so a backup is a dump of them. Include the `ResourceDefinition` and `Resource` objects. The controller allocates DRBD minors into the definitions, in `spec.volumeDefinitions[].drbdMinor`, and DRBD ports and node IDs into the spec of each `Resource`. A restore that invents new ones would make every replica reconnect.
 
 ```sh
-for kind in controllerconfigs nodes.blockstor.cozystack.io storagepools physicaldevices \
+for kind in controllerconfigs nodes storagepools physicaldevices \
             resourcegroups resourcedefinitions resources snapshots; do
-  kubectl get "$kind" -o yaml > "blockstor-$kind.yaml"
+  kubectl get "$kind.blockstor.cozystack.io" -o yaml > "blockstor-$kind.yaml"
 done
 kubectl -n blockstor-system get secret blockstor-cluster-passphrase -o yaml > blockstor-passphrase.yaml
 ```
 
-The last line applies only if you use encrypted volumes. The Secret holds the cluster passphrase, and the volumes cannot be opened without it. Its name can be changed through `spec.passphraseSecretRef` on the `ControllerConfig`. Store the backup like any other secret material.
+The full names, such as `resources.blockstor.cozystack.io`, keep `kubectl` from picking another product's resource with the same plural. The last line applies only if you use encrypted volumes. The Secret holds the cluster passphrase, and the volumes cannot be opened without it. Its name can be changed through `spec.passphraseSecretRef` on the `ControllerConfig`. Store the backup like any other secret material.
 
-Up to v0.1.17 the passphrase can also be set as a property, `DrbdOptions/EncryptPassphrase` on the controller or `DrbdOptions/Encryption/passphrase` on a definition, and a property set there wins over the Secret. A property is stored in plaintext on its resource, so the YAML dump above then carries the key to every encrypted volume. Keep the passphrase in the Secret only, and treat the dump as secret material if such a property was ever set.
+The passphrase can also be set as a property, `DrbdOptions/EncryptPassphrase` on the controller or `DrbdOptions/Encryption/passphrase` on a definition, and a property set there wins over the Secret. A property is stored in plaintext on its resource, so the YAML dump above then carries the key to every encrypted volume. Keep the passphrase in the Secret only, and treat the dump as secret material if such a property was ever set.
 
 ## Upgrading
 
@@ -211,5 +211,3 @@ Watch the rollout and the result:
 kubectl -n blockstor-system rollout status daemonset/blockstor-satellite
 blockstor resource list --faulty
 ```
-
-In the next release the snapshot stream between satellites moves from port 9100 to port 3372, so open the new port between storage nodes before step 4, and the API server no longer needs cluster-wide permission to list and watch Secrets.
