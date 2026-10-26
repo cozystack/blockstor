@@ -90,7 +90,7 @@ func (c *Cryptsetup) Format(ctx context.Context, device string, key []byte) erro
 
 	if len(signatures) > 0 {
 		return errors.Wrapf(ErrDeviceHoldsData,
-			"%s carries %s; refusing luksFormat. If the volume is new and the signature is left over from an earlier one on the same extents, clear it with wipefs",
+			"%s carries %s; refusing luksFormat. Only if nothing was ever written to this volume and the signature is left over from an earlier one on the same extents, clear it with wipefs; DRBD metadata on a volume already in use is its own",
 			device, strings.Join(signatures, ", "))
 	}
 
