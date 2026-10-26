@@ -209,7 +209,7 @@ func seedDefinitionsForSizes(t *testing.T, backend store.Store, prefix string, n
 func TestVolumeSizesDoNotRetryARefusalPerDefinition(t *testing.T) {
 	t.Parallel()
 
-	definitions := schema.GroupResource{Group: "blockstor.cozystack.io", Resource: "resourcedefinitions"}
+	definitions := schema.GroupResource{Group: "blockstor.org", Resource: "resourcedefinitions"}
 
 	for _, tc := range []struct {
 		name string

@@ -107,7 +107,7 @@ echo ">> apply 3-replica RD '$RD' via autoplace"
 # disk and reconnect differently). Keep this test focused on the
 # diskful-only path, which is the one cases 10-11 actually describe.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -158,7 +158,7 @@ fi
 echo ">> snapshot Status.DRBDNodeID for surviving replicas"
 declare -A node_id_before
 for w in "$WORKER_1" "$WORKER_2" "$WORKER_3"; do
-    id=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${w}" \
+    id=$(kubectl get "resources.blockstor.org/${RD}.${w}" \
         -o jsonpath='{.status.drbdNodeID}' 2>/dev/null || true)
     if [[ -z "$id" ]]; then
         echo "FAIL: Status.DRBDNodeID empty for $w"
@@ -378,12 +378,12 @@ echo ">> SKILL recipe: linstor r d $WORKER_3 $RD (physical delete)"
 # has to walk satellite-side teardown.
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${WORKER_3}" >/dev/null 2>&1; then
+    if ! kubectl get "resources.blockstor.org/${RD}.${WORKER_3}" >/dev/null 2>&1; then
         break
     fi
     sleep 2
 done
-if kubectl get "resources.blockstor.cozystack.io/${RD}.${WORKER_3}" >/dev/null 2>&1; then
+if kubectl get "resources.blockstor.org/${RD}.${WORKER_3}" >/dev/null 2>&1; then
     echo "FAIL: ${RD}.${WORKER_3} survived 60s after linstor r d"
     exit 1
 fi
@@ -439,7 +439,7 @@ echo "   all 3 replicas UpToDate post-recovery"
 echo ">> assert Phase 8.1 invariant: surviving replicas' drbdNodeId unchanged"
 phase81_ok=true
 for w in "$WORKER_1" "$WORKER_2"; do
-    id_after=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${w}" \
+    id_after=$(kubectl get "resources.blockstor.org/${RD}.${w}" \
         -o jsonpath='{.status.drbdNodeID}' 2>/dev/null || true)
     if [[ "$id_after" != "${node_id_before[$w]}" ]]; then
         echo "   FAIL invariant: $w drbdNodeId drifted: before=${node_id_before[$w]} after=${id_after}"
@@ -450,7 +450,7 @@ for w in "$WORKER_1" "$WORKER_2"; do
 done
 # Worker-3 may have been re-placed elsewhere; whichever replica
 # replaced it just needs a stamped, allocator-consistent id.
-id_w3_after=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${WORKER_3}" \
+id_w3_after=$(kubectl get "resources.blockstor.org/${RD}.${WORKER_3}" \
     -o jsonpath='{.status.drbdNodeID}' 2>/dev/null || true)
 if [[ -z "$id_w3_after" ]]; then
     echo "FAIL: worker-3 replacement has no Status.DRBDNodeID stamped"

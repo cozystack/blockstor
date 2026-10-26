@@ -57,7 +57,7 @@ import (
 //
 // Per-volume key suffix so multi-volume RDs (rare today but on the
 // roadmap) keep concurrent grow-shrink decisions distinguishable.
-const Bug148ResizePendingAnnotationPrefix = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-"
+const Bug148ResizePendingAnnotationPrefix = "bug136.blockstor.org/resize-pending-size-kib-vol-"
 
 // ResourceDefinitionReconciler watches RD CRDs and maintains the
 // tiebreaker invariant: an RD with exactly 2 diskful replicas in a
@@ -95,10 +95,10 @@ type ResourceDefinitionReconciler struct {
 	Recorder events.EventRecorder
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile ensures the tiebreaker for a 2-replica RD. Idempotent:
 // re-running on an RD that already has its tiebreaker is a no-op.

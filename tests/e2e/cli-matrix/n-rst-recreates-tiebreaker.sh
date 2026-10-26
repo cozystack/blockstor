@@ -83,7 +83,7 @@ while (( $(date +%s) < deadline )); do
     pair=()
     tb=""
     for n in "$N1" "$N2" "$N3"; do
-        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
+        flags=$(kubectl get "resources.blockstor.org/${RD}.${n}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" == *"TIE_BREAKER"* ]]; then
             tb=$n
@@ -121,7 +121,7 @@ echo ">> wait up to 60s for the witness on $tb_node to collapse"
 deadline=$(( $(date +%s) + 60 ))
 collapsed=false
 while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${tb_node}" \
+    flags=$(kubectl get "resources.blockstor.org/${RD}.${tb_node}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "ABSENT")
     if [[ "$flags" == "ABSENT" ]] || { [[ "$flags" != *"TIE_BREAKER"* ]]; }; then
         collapsed=true
@@ -151,13 +151,13 @@ last_rows=""
 while (( $(date +%s) < deadline )); do
     tb=""
     for n in "$N1" "$N2" "$N3"; do
-        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
+        flags=$(kubectl get "resources.blockstor.org/${RD}.${n}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" == *"TIE_BREAKER"* ]]; then
             tb=$n
         fi
     done
-    last_rows=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    last_rows=$(kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}' || true)
     if [[ -n "$tb" ]]; then
         recreated=true

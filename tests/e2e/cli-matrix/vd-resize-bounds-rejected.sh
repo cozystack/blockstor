@@ -82,7 +82,7 @@ deadline=$(( $(date +%s) + 90 ))
 placed_nodes=()
 while (( $(date +%s) < deadline )); do
     mapfile -t placed_nodes < <(
-        kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
+        kubectl get resources.blockstor.org -o json 2>/dev/null \
             | jq -r --arg rd "$RD" '
                 .items[]?
                 | select(.spec.resourceDefinitionName==$rd)

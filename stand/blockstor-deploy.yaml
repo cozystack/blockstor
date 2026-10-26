@@ -41,10 +41,10 @@ rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [blockstor.cozystack.io]
+  - apiGroups: [blockstor.org]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [blockstor.cozystack.io]
+  - apiGroups: [blockstor.org]
     resources: ["*/status", "*/finalizers"]
     verbs: [get, update, patch]
 ---

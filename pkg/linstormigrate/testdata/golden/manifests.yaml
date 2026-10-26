@@ -1,5 +1,5 @@
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ControllerConfig
 metadata:
   name: default
@@ -8,7 +8,7 @@ spec:
     DrbdOptions/auto-add-quorum-tiebreaker: "True"
     DrbdOptions/auto-verify-algo-allowed-list: crct10dif;crc32c;sha256
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Node
 metadata:
   name: node-a
@@ -23,7 +23,7 @@ spec:
     CurStltConnName: default-ipv4
   type: SATELLITE
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Node
 metadata:
   name: node-b
@@ -35,7 +35,7 @@ spec:
     satellitePort: 3367
   type: SATELLITE
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Node
 metadata:
   name: node-c
@@ -47,7 +47,7 @@ spec:
     satellitePort: 3367
   type: SATELLITE
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: StoragePool
 metadata:
   name: data.node-a
@@ -59,7 +59,7 @@ spec:
     StorDriver/internal/AllocationGranularity: "16"
   providerKind: ZFS
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: StoragePool
 metadata:
   name: data.node-b
@@ -71,7 +71,7 @@ spec:
     StorDriver/internal/AllocationGranularity: "16"
   providerKind: ZFS
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: StoragePool
 metadata:
   name: dfltdisklessstorpool.node-c
@@ -80,7 +80,7 @@ spec:
   poolName: DfltDisklessStorPool
   providerKind: DISKLESS
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: StoragePool
 metadata:
   name: fast.node-a
@@ -91,7 +91,7 @@ spec:
     StorDriver/StorPoolName: fast
   providerKind: ZFS
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceGroup
 metadata:
   annotations:
@@ -101,7 +101,7 @@ spec:
   selectFilter:
     placeCount: 2
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceGroup
 metadata:
   name: sc-encrypted
@@ -118,7 +118,7 @@ spec:
   volumeGroups:
   - volumeNumber: 0
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceGroup
 metadata:
   name: sc-replicated
@@ -138,7 +138,7 @@ spec:
   volumeGroups:
   - volumeNumber: 0
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata:
   name: pvc-vol1
@@ -172,7 +172,7 @@ spec:
     sizeKib: 307200
     volumeNumber: 1
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata:
   name: pvc-vol2
@@ -185,7 +185,7 @@ spec:
   - sizeKib: 524288
     volumeNumber: 0
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata:
   name: pvc-vol3
@@ -203,7 +203,7 @@ spec:
     sizeKib: 2097152
     volumeNumber: 0
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata:
   name: pvc-vol5
@@ -223,7 +223,7 @@ spec:
     sizeKib: 1048576
     volumeNumber: 0
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata:
   name: pvc-vol6
@@ -235,7 +235,7 @@ spec:
   - sizeKib: 1048576
     volumeNumber: 0
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata:
   name: pvc-vol7
@@ -250,7 +250,7 @@ spec:
   - sizeKib: 524288
     volumeNumber: 1
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol1.node-a
@@ -266,7 +266,7 @@ spec:
   skipInitialSync: false
   storagePool: data
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol1.node-b
@@ -282,7 +282,7 @@ spec:
   skipInitialSync: false
   storagePool: data
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol1.node-c
@@ -302,7 +302,7 @@ spec:
   skipInitialSync: false
   storagePool: DfltDisklessStorPool
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol2.node-a
@@ -312,7 +312,7 @@ spec:
   skipInitialSync: false
   storagePool: data
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol3.node-a
@@ -323,7 +323,7 @@ spec:
   skipInitialSync: false
   storagePool: data
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol3.node-b
@@ -334,7 +334,7 @@ spec:
   skipInitialSync: false
   storagePool: data
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol5.node-a
@@ -345,7 +345,7 @@ spec:
   skipInitialSync: false
   storagePool: data
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol5.node-b
@@ -356,7 +356,7 @@ spec:
   skipInitialSync: false
   storagePool: data
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: pvc-vol6.node-a
@@ -366,7 +366,7 @@ spec:
   skipInitialSync: false
   storagePool: data
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Snapshot
 metadata:
   annotations:

@@ -92,7 +92,7 @@ stamp_skipdisk() {
     local node=$1
     kubectl apply --server-side --force-conflicts \
         --field-manager=blockstor-satellite-skipdisk -f - <<EOF >/dev/null
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata:
   name: ${RD}.${node}
@@ -108,7 +108,7 @@ EOF
 # (RD, NODE).Spec.Props ("True" or empty).
 skipdisk_prop() {
     local node=$1
-    kubectl get "resources.blockstor.cozystack.io/${RD}.${node}" \
+    kubectl get "resources.blockstor.org/${RD}.${node}" \
         -o jsonpath='{.spec.props.DrbdOptions/SkipDisk}' 2>/dev/null || echo ""
 }
 
@@ -149,7 +149,7 @@ for _ in $(seq 1 8); do
 done
 if [[ "$persist_ok" != "true" ]]; then
     echo "FAIL (Bug 278/A regression): SkipDisk was cleared on the Diskless $N3 — the clearer is over-eager (must only clear on a HEALTHY slot)" >&2
-    kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
+    kubectl get "resources.blockstor.org/${RD}.${N3}" \
         -o json 2>/dev/null | jq '{props: .spec.props, status: .status}' >&2 || true
     exit 1
 fi
@@ -209,7 +209,7 @@ done
 
 if [[ "$cleared" != "true" ]]; then
     echo "FAIL (Bug 278): SkipDisk did NOT auto-clear on the HEALTHY $N2 within 60s after satellite restart" >&2
-    kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
+    kubectl get "resources.blockstor.org/${RD}.${N2}" \
         -o json 2>/dev/null | jq '{props: .spec.props, status: .status}' >&2 || true
     exit 1
 fi
@@ -217,7 +217,7 @@ fi
 echo ">> [Bug 278/B] confirm $N2 disk state is UpToDate (stayed attached after clear)"
 if ! wait_status_state "$RD" "$N2" "UpToDate" 60 0; then
     echo "FAIL (Bug 278 deep): SkipDisk cleared but $N2 did not hold UpToDate within 60s" >&2
-    kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
+    kubectl get "resources.blockstor.org/${RD}.${N2}" \
         -o json 2>/dev/null | jq '{props: .spec.props, status: .status}' >&2 || true
     exit 1
 fi

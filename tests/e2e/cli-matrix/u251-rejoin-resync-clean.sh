@@ -184,18 +184,18 @@ echo "   pre-isolation: every RD UpToDate on $ISO + peer"
 echo ">> deriving DRBD ports from Resource CRDs on $ISO (NOT upstream 7000s)"
 declare -A port_seen=()
 for rd in "${RDS[@]}"; do
-    port=$(kubectl get "resources.blockstor.cozystack.io/${rd}.${ISO}" \
+    port=$(kubectl get "resources.blockstor.org/${rd}.${ISO}" \
         -o jsonpath='{.spec.drbdPort}' 2>/dev/null || echo "")
     if [[ -z "$port" ]]; then
-        port=$(kubectl get "resources.blockstor.cozystack.io/${rd}.${ISO}" \
+        port=$(kubectl get "resources.blockstor.org/${rd}.${ISO}" \
             -o jsonpath='{.status.drbdPort}' 2>/dev/null || echo "")
     fi
     if [[ -z "$port" ]]; then
         # RD-wide port: pull it from any replica of the RD.
-        port=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+        port=$(kubectl get resources.blockstor.org --no-headers 2>/dev/null \
             | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}' \
             | while read -r name; do
-                p=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+                p=$(kubectl get "resources.blockstor.org/${name}" \
                     -o jsonpath='{.spec.drbdPort}' 2>/dev/null || echo "")
                 [[ -n "$p" ]] && { echo "$p"; break; }
               done)
@@ -292,10 +292,10 @@ for rd in "${RDS[@]}"; do
         [[ "$n" != "$ISO" ]] && survivor="$n" && break
     done
     [[ -z "$survivor" ]] && continue
-    dev=$(kubectl get "resources.blockstor.cozystack.io/${rd}.${survivor}" \
+    dev=$(kubectl get "resources.blockstor.org/${rd}.${survivor}" \
         -o jsonpath='{.status.volumes[0].devicePath}' 2>/dev/null || echo "")
     if [[ -z "$dev" ]]; then
-        minor=$(kubectl get "resources.blockstor.cozystack.io/${rd}.${survivor}" \
+        minor=$(kubectl get "resources.blockstor.org/${rd}.${survivor}" \
             -o jsonpath='{.status.drbdMinor}' 2>/dev/null || echo "")
         [[ -n "$minor" ]] && dev="/dev/drbd${minor}"
     fi

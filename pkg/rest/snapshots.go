@@ -161,7 +161,7 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
 	// from every snapshot. The reconcilers stamp the same
-	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` keys on
+	// `blockstor.io/*` + `bug<N>.blockstor.org/*` keys on
 	// Snapshot CRDs as on Resource / RD / RG; the wire shape must not
 	// carry them.
 	stripInternalAnnotationsFromSnapshots(snaps)
@@ -1299,7 +1299,7 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 			Message: "snapshot delete acked but satellite finalizer " +
 				"not removed within timeout: " + snapName,
 			Cause: "the satellite-side finalizer " +
-				"(blockstor.cozystack.io/satellite-snapshot) did " +
+				"(blockstor.org/satellite-snapshot) did " +
 				"not drain within the wait budget; the snapshot may " +
 				"still be present on disk and the Snapshot CRD will " +
 				"remain visible until the satellite reconciler runs",

@@ -142,14 +142,14 @@ if (( ok != 1 )); then
     echo "FAIL (Bug 390 regression): deficit behind the EVICTED node was not repaired" >&2
     echo "  evacuated node: $D2" >&2
     echo "  diskful nodes:  $(linstor_diskful_nodes "$RD" | tr '\n' ' ')" >&2
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd' >&2 || true
     exit 1
 fi
 
 # Defensive double-check (Bug 390 #4): the surviving diskful pair is
 # d1 + spare, and the original healthy diskful was never demoted.
-flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${D1}" \
+flags=$(kubectl get "resources.blockstor.org/${RD}.${D1}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "__absent__")
 if [[ "$flags" == "__absent__" || "$flags" == *"DISKLESS"* ]]; then
     echo "FAIL (Bug 390): healthy diskful on $D1 was lost/demoted during the repair; flags=$flags" >&2

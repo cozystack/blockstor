@@ -72,10 +72,10 @@ type SnapshotReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=snapshots,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=snapshots/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=snapshots/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=snapshots,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=snapshots/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=snapshots/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch
 
 // Reconcile drives the Spec.SuspendIO / Spec.TakeSnapshot
 // transitions. Bug 351 (single-Snapshot orchestration) + Bug 353

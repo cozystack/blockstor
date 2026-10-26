@@ -84,7 +84,7 @@ const snapshotCRDLabelRD = "blockstor.io/resource-definition"
 // waits for the satellite-side DeleteSnapshot before reaping —
 // Bug 64 fix. Mirrored (not imported) to keep this test file off
 // the satellite controllers package.
-const satelliteSnapshotFinalizer = "blockstor.cozystack.io/satellite-snapshot"
+const satelliteSnapshotFinalizer = "blockstor.org/satellite-snapshot"
 
 // groupGRDName builds a per-subtest RD name from a suffix slug.
 func groupGRDName(suffix string) string { return groupGRDPrefix + suffix }

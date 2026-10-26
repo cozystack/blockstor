@@ -43,7 +43,7 @@ As a last guard, the LUKS layer refuses to `luksFormat` a device that already ca
 Find the RDs short of a layer their group asks for:
 
 ```bash
-kubectl get resourcedefinitions.blockstor.cozystack.io \
+kubectl get resourcedefinitions.blockstor.org \
   -o custom-columns='NAME:.metadata.name,GROUP_STACK:.metadata.annotations.blockstor\.io/unapplied-group-layer-stack' \
   | awk '$2 != "<none>"'
 ```
@@ -87,7 +87,7 @@ type: Opaque
 stringData:
   passphrase: "32-byte-secret"
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: pvc-encrypted}
 spec:
@@ -130,8 +130,8 @@ Before this release a passphrase property won over the Secret: `DrbdOptions/Encr
 1. Find the properties. Their values are redacted on the REST API, so read the CRs:
 
    ```sh
-   kubectl get controllerconfigs.blockstor.cozystack.io -o jsonpath='{.items[*].spec.extraProps}'
-   kubectl get resourcegroups.blockstor.cozystack.io,resourcedefinitions.blockstor.cozystack.io -o json \
+   kubectl get controllerconfigs.blockstor.org -o jsonpath='{.items[*].spec.extraProps}'
+   kubectl get resourcegroups.blockstor.org,resourcedefinitions.blockstor.org -o json \
      | jq -r '.items[] | select(.spec.props // {} | keys | any(test("passphrase|Passphrase"))) | .metadata.name'
    ```
 

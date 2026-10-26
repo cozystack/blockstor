@@ -81,7 +81,7 @@ echo ">> apply 3-replica RD ${RD} on ${POOL}"
 # AutoAddQuorumTiebreaker=false: with 3 diskful replicas on a 3-node
 # cluster, the auto-tiebreaker has nowhere to land and would log-spam.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -92,7 +92,7 @@ spec:
 EOF
 for n in "$N1" "$N2" "$N3"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:
@@ -376,12 +376,12 @@ fi
 echo ">> wait up to 90s for Resource ${RD}.${N3} CRD to vanish"
 deadline=$(( $(date +%s) + 90 ))
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" >/dev/null 2>&1; then
+    if ! kubectl get "resources.blockstor.org/${RD}.${N3}" >/dev/null 2>&1; then
         break
     fi
     sleep 2
 done
-if kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" >/dev/null 2>&1; then
+if kubectl get "resources.blockstor.org/${RD}.${N3}" >/dev/null 2>&1; then
     echo "FAIL: ${RD}.${N3} still present after linstor r d (Bug 1: cascade did not clean up)"
     exit 1
 fi

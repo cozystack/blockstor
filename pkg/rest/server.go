@@ -1340,25 +1340,25 @@ func scrubImplDetails(msg string) string {
 	out := strings.NewReplacer(replacements...).Replace(msg)
 
 	// Bug 162: apimachinery's status messages embed the
-	// GroupResource — e.g. "controllerconfigs.blockstor.cozystack.io"
+	// GroupResource — e.g. "controllerconfigs.blockstor.org"
 	// (resource name suffixed with group, then printed as
 	// <resource>.<group>). The CRD plural names ARE the persistence
 	// backend's identity from the operator's perspective — the wire
 	// surface speaks LINSTOR, not K8s. Strip them with a regex that
-	// matches the `<word>.blockstor.cozystack.io` shape.
+	// matches the `<word>.blockstor.org` shape.
 	return blockstorGroupRefRE.ReplaceAllString(out, opaque)
 }
 
 // blockstorGroupRefRE matches an apimachinery-style group/resource
 // reference rooted at our project's API group, e.g.
 //
-//	controllerconfigs.blockstor.cozystack.io
+//	controllerconfigs.blockstor.org
 //
 // which is the GroupResource.String() output that apimachinery embeds
 // in status messages. We collapse it to a single opaque <backend>
 // token so the K8s persistence identity never leaks onto the LINSTOR
 // wire.
-var blockstorGroupRefRE = regexp.MustCompile(`[a-zA-Z0-9-]+\.blockstor\.cozystack\.io`)
+var blockstorGroupRefRE = regexp.MustCompile(`[a-zA-Z0-9-]+\.blockstor\.org`)
 
 // formatBytes renders n as a short human-readable size string for
 // operator-facing error messages. Stays in MiB/KiB granularity so

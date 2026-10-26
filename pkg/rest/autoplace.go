@@ -138,7 +138,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
 	// before the JSON encode. The reconcilers stamp `blockstor.io/*`
-	// and `bug<N>.blockstor.cozystack.io/*` keys for in-process
+	// and `bug<N>.blockstor.org/*` keys for in-process
 	// bookkeeping; the wire shape must not carry them. See
 	// pkg/rest/internal_annotations.go.
 	stripInternalAnnotationsFromResourcesWithVolumes(out)

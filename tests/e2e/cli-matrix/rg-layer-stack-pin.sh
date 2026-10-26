@@ -68,7 +68,7 @@ cleanup_encryption_state
 
 # rd_layer_stack RD — the stack the CRD carries, comma-joined.
 rd_layer_stack() {
-    kubectl get "resourcedefinitions.blockstor.cozystack.io/$1" \
+    kubectl get "resourcedefinitions.blockstor.org/$1" \
         -o jsonpath='{.spec.layerStack}' 2>/dev/null \
         | jq -r 'join(",") | ascii_upcase' 2>/dev/null || echo ""
 }
@@ -164,7 +164,7 @@ echo "   clone refused as undecided before the pin: $refused"
 echo ">> e) the data RD keeps the stack its data has"
 wait_layer_stack "$RD_DATA" "DRBD,STORAGE"
 
-annotation=$(kubectl get "resourcedefinitions.blockstor.cozystack.io/$RD_DATA" -o json 2>/dev/null \
+annotation=$(kubectl get "resourcedefinitions.blockstor.org/$RD_DATA" -o json 2>/dev/null \
     | jq -r --arg k "$ANNOTATION" '.metadata.annotations[$k] // ""')
 if [[ "${annotation^^}" != "DRBD,LUKS,STORAGE" ]]; then
     echo "FAIL: $RD_DATA annotation $ANNOTATION = '$annotation', want DRBD,LUKS,STORAGE" >&2

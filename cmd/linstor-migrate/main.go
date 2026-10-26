@@ -27,7 +27,7 @@ limitations under the License.
 //	  xargs -I{} sh -c "kubectl get {} -ojson > {}.json"
 //
 // Output is a multi-document YAML stream of blockstor
-// `blockstor.cozystack.io/v1alpha1` objects in apply order (nodes,
+// `blockstor.org/v1alpha1` objects in apply order (nodes,
 // storage pools, resource groups, resource definitions, resources,
 // snapshots) on stdout (or -out <file>), with the migration report —
 // row counts plus every skipped row / dropped flag bit — on stderr.

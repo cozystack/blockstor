@@ -3,7 +3,7 @@
 # and allow the plugins properly work.
 # More info: https://book.kubebuilder.io/reference/project-config.html
 cliVersion: 4.14.0
-domain: cozystack.io
+domain: org
 layout:
 - go.kubebuilder.io/v4
 projectName: blockstor
@@ -12,7 +12,7 @@ resources:
 - api:
     crdVersion: v1
   controller: true
-  domain: cozystack.io
+  domain: org
   group: blockstor
   kind: Node
   path: github.com/cozystack/blockstor/api/v1alpha1
@@ -20,7 +20,7 @@ resources:
 - api:
     crdVersion: v1
   controller: true
-  domain: cozystack.io
+  domain: org
   group: blockstor
   kind: StoragePool
   path: github.com/cozystack/blockstor/api/v1alpha1
@@ -28,7 +28,7 @@ resources:
 - api:
     crdVersion: v1
   controller: true
-  domain: cozystack.io
+  domain: org
   group: blockstor
   kind: ResourceGroup
   path: github.com/cozystack/blockstor/api/v1alpha1
@@ -36,7 +36,7 @@ resources:
 - api:
     crdVersion: v1
   controller: true
-  domain: cozystack.io
+  domain: org
   group: blockstor
   kind: ResourceDefinition
   path: github.com/cozystack/blockstor/api/v1alpha1
@@ -44,7 +44,7 @@ resources:
 - api:
     crdVersion: v1
   controller: true
-  domain: cozystack.io
+  domain: org
   group: blockstor
   kind: Resource
   path: github.com/cozystack/blockstor/api/v1alpha1
@@ -52,14 +52,14 @@ resources:
 - api:
     crdVersion: v1
   controller: true
-  domain: cozystack.io
+  domain: org
   group: blockstor
   kind: Snapshot
   path: github.com/cozystack/blockstor/api/v1alpha1
   version: v1alpha1
 - api:
     crdVersion: v1
-  domain: cozystack.io
+  domain: org
   group: blockstor
   kind: KVEntry
   path: github.com/cozystack/blockstor/api/v1alpha1

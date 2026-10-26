@@ -78,7 +78,7 @@ echo ">> [F6] node evacuate $EVAC_NODE (enters EVICTED)"
 # Give the controller a moment to stamp the EVICTED flag on the Node CRD.
 deadline=$(( $(date +%s) + 30 ))
 while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get node.blockstor.cozystack.io "$EVAC_NODE" -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
+    flags=$(kubectl get node.blockstor.org "$EVAC_NODE" -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     if [[ "$flags" == *EVICTED* ]]; then
         break
     fi
@@ -106,7 +106,7 @@ echo ">> [F6] node restore $EVAC_NODE clears EVICTED"
 "${LCTL[@]}" node restore "$EVAC_NODE" >/dev/null
 deadline=$(( $(date +%s) + 30 ))
 while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get node.blockstor.cozystack.io "$EVAC_NODE" -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
+    flags=$(kubectl get node.blockstor.org "$EVAC_NODE" -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     if [[ "$flags" != *EVICTED* ]]; then
         break
     fi
