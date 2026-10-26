@@ -95,7 +95,7 @@ blockstor volume list              # sizes and device paths
 
 A healthy replicated volume shows `UpToDate` on every replica with data, and a `TieBreaker` when there is an even number of them.
 
-Grow a volume online. Shrinking is refused unless you add `--force`, because it cuts off whatever data lives at the end of the device:
+Grow a volume online. Shrinking is refused. `--force` lowers the size in the definition only: the satellite never shrinks a backing device or DRBD, so they keep their size. See [Growing a volume](../operations/#growing-a-volume).
 
 ```sh
 blockstor volume-definition set-size my-volume 0 20G
@@ -138,7 +138,7 @@ blockstor snapshot delete my-volume before-upgrade
 
 ## Properties and DRBD options
 
-Every object has `set-property`, `list-properties` and `delete-property`, and groups, definitions and the controller have `drbd-options`. Settings resolve from the controller to the group to the definition to the replica, and the narrowest one wins. See [Resources](../resources/#how-settings-are-inherited).
+Nodes, storage pools, resource groups, volume groups, resource definitions, volume definitions, resources and the controller have `set-property`, `list-properties` and `delete-property`. Volumes, snapshots, physical storage and encryption have no property verbs. Resource definitions, volume definitions and the controller also have `drbd-options`; for a resource group, set DRBD options as `DrbdOptions/...` properties. Settings resolve from the controller to the group to the definition to the replica, and the narrowest one wins. See [Resources](../resources/#how-settings-are-inherited).
 
 ```sh
 blockstor resource-group set-property replicated DrbdOptions/Resource/on-no-quorum suspend-io

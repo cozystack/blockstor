@@ -25,14 +25,14 @@ Blockstor implements the LINSTOR REST API, so `linstor-csi`, `piraeus-operator`,
 |---|---|---|
 | Active network interface | `linstor node interface modify --active` switches the satellite's connection to another interface. | Has no effect. DRBD uses the address picked in the order described in [Networking and ports](../networking/#which-address-replication-uses), not an active flag. A change of address reaches DRBD after the node's satellite pod restarts. |
 | Default action on lost quorum | `on-no-quorum io-error` | `on-no-quorum suspend-io`: I/O blocks until quorum returns and then resumes, so a replica that was cut off does not get stuck after the network heals. |
-| Shrinking a volume | Allowed for stacks that support it. | Refused unless you pass `--force`. |
+| Shrinking a volume | Allowed for stacks that support it. | Refused. `--force` lowers the size in the definition only; the backing devices and DRBD keep their size. |
 | DRBD ports and minors | Ports from 7000, minors from 1000. | Ports from 20000 to 20999, minors from 20000. Blockstor can run on the same nodes as LINSTOR without collisions. Change the port range per node with the `DrbdOptions/TcpPortRange` property. |
 | Spawning more replicas than there are nodes | Fails and places nothing. | Places as many replicas as it can, reports the shortfall, and adds the rest when more nodes join. |
 | Turning a tiebreaker into a replica with data | Can skip the initial sync. | Runs a full sync, to avoid a DRBD split where both sides refuse to connect. |
 | Removing a replica below quorum | Removes the quorum options from the definition and prints a note. | Sets `quorum off` explicitly, with the same effect on DRBD. |
 | DRBD option values | Validated against the DRBD schema. | Not validated: a wrong value is stored and fails later on the node. Check values before you set them. |
 | Autoplacer weights | `MaxFreeSpace` is 1, the other weights 0. | All four weights default to 1. |
-| `controller version` | Reports a git commit hash. | Reports `git=blockstor`. Do not parse a commit hash from it. |
+| `controller version` | Reports a git commit hash. | Through the REST API, release images report the commit they were built from. A development build that was not given one reports a placeholder instead. |
 | `node info` | Shows OS, CPU and memory. | These fields are empty. |
 
 ## Using the `linstor` client

@@ -116,10 +116,12 @@ The providers are `lvm`, `lvmthin`, `zfs`, `zfsthin`, `file`, `filethin` and `di
 ## Check the installation
 
 ```sh
-blockstor controller version
+kubectl -n blockstor-system get pods
 blockstor node list
 blockstor storage-pool list
 ```
+
+The controller, the API server replicas and one satellite per storage node should be `Running` and ready. `blockstor controller version` is no check of the installation: it prints the CLI's own version, `blockstor dev` after a plain `go install`, and does not contact the cluster.
 
 Every node should show as online, and every pool should report its free and total capacity once its satellite has seen it.
 
