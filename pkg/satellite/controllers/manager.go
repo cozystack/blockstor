@@ -115,6 +115,10 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 		cfg.APIReader = mgr.GetAPIReader()
 	}
 
+	if cfg.Recorder == nil {
+		cfg.Recorder = mgr.GetEventRecorder("blockstor-satellite")
+	}
+
 	// Phase 11.7: thread the observer-trigger channel through
 	// Config so the ObserverRunnable (producer) and the
 	// ResourceReconciler (consumer via WatchesRawSource) share

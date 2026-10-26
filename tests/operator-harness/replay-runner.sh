@@ -76,6 +76,11 @@
 #                          `expected` — the /dev/drbd<N> device identity is
 #                          stable across a VD-scoped modify (Bug 433); pair
 #                          with hold_s (an unset minor reads as "")
+#   - rd_layer_stack       RD.Spec.LayerStack, as an upper-cased comma list,
+#                          equals `expected` ("" = not decided yet); pair
+#                          with hold_s to prove a decided stack holds
+#   - rd_annotation        an annotation on the RD CRD equals `expected`
+#                          ("" = absent)
 #   - vd_count             RD carries EXACTLY `expected` VolumeDefinitions
 #                          (BUG-048 concurrent-add lost-update catcher)
 #   - pvc_capacity         PVC.Status.Capacity.storage matches expected

@@ -291,19 +291,87 @@ func (s *Server) cloneRequestShapeIsUsable(
 }
 
 // clonedStackHasItsPassphrase refuses a clone whose stack carries LUKS while
-// the cluster passphrase is missing: the stack it names, or the source's when
-// it names none. It runs after the replay of a finished clone, which writes
-// no new LUKS volume, so a passphrase that went missing or could not be read
-// does not fail the retry of a clone that is already done.
+// the cluster passphrase is missing: the stack it names, or else the one the
+// clone takes from the source, which on the data path is the stack the
+// source's bytes were laid down under. It runs after the replay of a finished
+// clone, which writes no new LUKS volume, so a passphrase that went missing or
+// could not be read does not fail the retry of a clone that is already done.
 func (s *Server) clonedStackHasItsPassphrase(
-	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest,
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest, withData bool,
 ) bool {
-	stack := req.LayerList
-	if len(stack) == 0 {
-		stack = store.EffectiveLayerStack(src.LayerStack)
+	stack := cloneShellLayerStack(src, req)
+
+	if withData && len(req.LayerList) == 0 {
+		var ok bool
+
+		stack, ok = s.cloneSourceLayerStack(ctx, w, src, req.Name)
+		if !ok {
+			return false
+		}
 	}
 
 	return s.clonePassphraseHolds(ctx, w, src.Name, req.Name, stack)
+}
+
+// cloneSourceLayerStack is the stack the source's volumes are laid down
+// under (store.EffectiveLayerStack), which a clone carrying its bytes has to
+// have. False means a refusal has been written: a source whose stack its
+// group has yet to decide answers 503, and a clone waits for the decision
+// rather than guess one and copy plaintext into a stack that says LUKS, or
+// LUKS into one that says plaintext.
+func (s *Server) cloneSourceLayerStack(
+	ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, cloneName string,
+) ([]string, bool) {
+	stack, err := store.EffectiveLayerStack(ctx, s.Store, src)
+	if err != nil {
+		status, callRc := storeErrorRc(err, storeKindResourceDfn)
+		callRc.Message = "clone of resource definition '" + src.Name + "': " + callRc.Message
+		writeCloneRefused(w, status, src.Name, cloneName, &callRc)
+
+		return nil, false
+	}
+
+	return stack, true
+}
+
+// withoutUnappliedGroupStack is a copy of annotations without the flag the
+// controller puts on a definition pinned over data. A copy, because the map
+// the store hands back can be the stored object's own.
+func withoutUnappliedGroupStack(annotations map[string]string) map[string]string {
+	out := maps.Clone(annotations)
+	delete(out, apiv1.UnappliedGroupLayerStackAnnotation)
+
+	return out
+}
+
+// cloneShellLayerStack is the stack a volume-less clone is created with: the
+// caller's, or else the source's as stored. A shell holds no bytes, so nothing
+// forces a stack on it the way the data path is forced; left empty, it takes
+// its own group's stack from the controller, which pins it once
+// (pinLayerStack), exactly like a definition created empty.
+//
+// A source whose stack the controller pinned over data that was already
+// there passes that stack on to no shell: it was the data's, not a choice.
+// The unapplied-group annotation alone does not say that, since it also
+// marks a stack set by hand that lacks a layer of the group; but a stack
+// pinned over data is always the default one. So only a flagged source
+// with the default stack hands the shell nothing, and a flagged stack of
+// the operator's own, LUKS,STORAGE in a DRBD,STORAGE group say, is copied.
+func cloneShellLayerStack(src *apiv1.ResourceDefinition, req *rdCloneRequest) []string {
+	if len(req.LayerList) > 0 {
+		return req.LayerList
+	}
+
+	if src.Annotations[apiv1.UnappliedGroupLayerStackAnnotation] != "" && isDefaultLayerStack(src.LayerStack) {
+		return nil
+	}
+
+	return slices.Clone(src.LayerStack)
+}
+
+// isDefaultLayerStack reports whether stack is the default one, in any case.
+func isDefaultLayerStack(stack []string) bool {
+	return slices.EqualFunc(stack, apiv1.DefaultLayerStack(), strings.EqualFold)
 }
 
 // clonePassphraseHolds refuses a clone whose stack carries LUKS while the
@@ -439,10 +507,6 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.clonedStackHasItsPassphrase(r.Context(), w, &src, &req) {
-		return
-	}
-
 	// VD-bearing sources take the snapshot-based data-plane path
 	// (Bug-020); vol-less sources keep the legacy shallow-copy
 	// contract Group D pins.
@@ -453,6 +517,10 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 			Message: scrubImplDetails(err.Error()),
 		})
 
+		return
+	}
+
+	if !s.clonedStackHasItsPassphrase(r.Context(), w, &src, &req, len(srcVDs) > 0) {
 		return
 	}
 
@@ -548,7 +616,12 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 		return
 	}
 
-	if !cloneLayerStackIsHonourable(w, src, req) {
+	have, ok := s.cloneSourceLayerStack(ctx, w, src, req.Name)
+	if !ok {
+		return
+	}
+
+	if !cloneLayerStackIsHonourable(w, src, req, have) {
 		return
 	}
 
@@ -1013,21 +1086,18 @@ func uncheckedCloneGroupWarning(cloneName, rgName string, err error) *apiv1.APIC
 // Only the data-bearing path calls this. A clone of a VD-less source carries
 // no bytes to lose, and choosing a different stack for the shell is what
 // accepting layer_list is for.
-func cloneLayerStackIsHonourable(w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest) bool {
+func cloneLayerStackIsHonourable(
+	w http.ResponseWriter, src *apiv1.ResourceDefinition, req *rdCloneRequest, have []string,
+) bool {
 	if len(req.LayerList) == 0 {
 		return true
 	}
 
-	// An RD stored without an explicit stack is not a definition with no
-	// layers — it is one that never said, and every other reader resolves
-	// that to apiv1.DefaultLayerStack (stampRDLayerDataFromStack does it on
-	// the read path). Resolving it here too is what keeps the gate off the
-	// CSI hot path: linstor-csi sends [DRBD, STORAGE] on every clone, and
-	// against a bare source an unresolved empty stack would read as "adds
-	// DRBD, STORAGE" and refuse the clone this endpoint was just unbroken
-	// for.
-	have := store.EffectiveLayerStack(src.LayerStack)
-
+	// have is the source's stack as its volumes are laid down
+	// (store.EffectiveLayerStack), never the raw field: an empty one there is
+	// a definition that never said, and read unresolved against the
+	// [DRBD, STORAGE] linstor-csi sends on every clone it would read as
+	// "adds DRBD, STORAGE" and refuse the clone this endpoint exists for.
 	added, dropped := layerSetDifference(have, req.LayerList)
 	if len(added) == 0 && len(dropped) == 0 {
 		return true
@@ -1600,7 +1670,14 @@ func (s *Server) replayOfFinishedClone(
 	// It runs before anything established whether the leftover is finished,
 	// so its wording is the resume's: the leftover was started with a shape,
 	// whether or not it got further.
-	if differs := requestedShapeDiffers(&existing, req.ResourceGroup, req.LayerList); differs != "" {
+	differs, err := s.requestedShapeDiffers(ctx, &existing, req.ResourceGroup, req.LayerList)
+	if err != nil {
+		writeCloneStoreError(w, srcName, cloneName, err)
+
+		return false, true
+	}
+
+	if differs != "" {
 		writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
 			RetCode: apiCallRcError,
 			Message: "clone target '" + cloneName + "' was started with " + differs,
@@ -2125,15 +2202,11 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	// inherited them would carry a delete, or any later flag, it never had.
 	clone.Flags = nil
 
-	// The caller's own shape wins over the source's, on both clone paths.
-	// Without one the shell is stamped with the source's data-plane stack, as
-	// the data path stamps its target: left empty under a target group of
-	// another stack, the control plane would judge it by that group while the
-	// satellite brings it up as the default, once volumes are added.
-	clone.LayerStack = store.EffectiveLayerStack(src.LayerStack)
-	if len(req.LayerList) > 0 {
-		clone.LayerStack = req.LayerList
-	}
+	// The caller's own shape wins over the source's, on both clone paths;
+	// see cloneShellLayerStack for the rest. The flag the controller puts on a
+	// definition pinned over data stays with that data: the shell has none.
+	clone.LayerStack = cloneShellLayerStack(src, req)
+	clone.Annotations = withoutUnappliedGroupStack(src.Annotations)
 
 	if req.ResourceGroup != "" {
 		clone.ResourceGroupName = req.ResourceGroup
