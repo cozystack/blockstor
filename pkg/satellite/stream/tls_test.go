@@ -440,3 +440,18 @@ func TestStreamTLSValidateLoadsTheFiles(t *testing.T) {
 		}
 	}
 }
+
+// The server checks the name on the client certificate as well as its CA:
+// a certificate the stream CA issued for anything but ServerName is not a
+// satellite's.
+func TestStreamServerRefusesAClientCertificateForAnotherName(t *testing.T) {
+	t.Parallel()
+
+	ca := newTestCA(t)
+	addr := serve(t, ca.issue(t, ServerName))
+
+	_, err := NewClient(ca.issue(t, "not-a-satellite")).Fetch(t.Context(), addr, "rd", "snap", 0)
+	if err == nil || strings.Contains(err.Error(), "has no snapshot") {
+		t.Fatalf("a client certificate for another name reached the handler: %v", err)
+	}
+}

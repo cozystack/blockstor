@@ -36,6 +36,9 @@ const ServerName = "blockstor-satellite"
 // certificate but no CA would serve without checking who asks.
 var ErrTLSIncomplete = errors.New("stream TLS needs a certificate, a key and a CA bundle")
 
+// ErrNoClientCertificate is a stream handshake with no client certificate.
+var ErrNoClientCertificate = errors.New("no client certificate on the stream handshake")
+
 // ErrNoCACertificate is a CA bundle with no certificate in it.
 var ErrNoCACertificate = errors.New("no certificate in the stream CA bundle")
 
@@ -108,13 +111,32 @@ func (f TLSFiles) serverConfig() *tls.Config {
 			}
 
 			return &tls.Config{
-				MinVersion:   tls.VersionTLS12,
-				Certificates: []tls.Certificate{cert},
-				ClientCAs:    pool,
-				ClientAuth:   tls.RequireAndVerifyClientCert,
+				MinVersion:       tls.VersionTLS12,
+				Certificates:     []tls.Certificate{cert},
+				ClientCAs:        pool,
+				ClientAuth:       tls.RequireAndVerifyClientCert,
+				VerifyConnection: verifyClientName,
 			}, nil
 		},
 	}
+}
+
+// verifyClientName refuses a client certificate that chains to the CA but
+// is not issued for ServerName. The stream CA issues one certificate today;
+// this keeps "a satellite of this cluster" true if it ever issues more.
+//
+//nolint:gocritic // hugeParam: tls.Config.VerifyConnection fixes the signature.
+func verifyClientName(cs tls.ConnectionState) error {
+	if len(cs.PeerCertificates) == 0 {
+		return ErrNoClientCertificate
+	}
+
+	err := cs.PeerCertificates[0].VerifyHostname(ServerName)
+	if err != nil {
+		return errors.Wrap(err, "stream client certificate")
+	}
+
+	return nil
 }
 
 // clientConfig presents this satellite's certificate and verifies the peer's
