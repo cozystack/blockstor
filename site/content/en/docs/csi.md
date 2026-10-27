@@ -74,7 +74,7 @@ The copy carries the CA's private key. Anyone who can read Secrets in that names
 
 If you install `linstor-csi` with the piraeus operator, set `LinstorCluster.spec.externalController.url` to `https://blockstor-apiserver.blockstor-system.svc:3371`. That turns off the operator's own LINSTOR controller and points the CSI driver at blockstor.
 
-For the client certificate, mirror the CA into the operator's namespace as shown above, and point `spec.apiTLS.certManager` at the `Issuer` you created there. The operator then creates the Certificates for the CSI pods in its own namespace, from that Issuer:
+For the client certificate, mirror the CA into the operator's namespace as shown above, and point `spec.apiTLS.certManager` at the `Issuer` you created there. The operator then creates, in its own namespace and from that Issuer, the client Certificates for itself, for the CSI pods and for its other components:
 
 ```yaml
 apiVersion: piraeus.io/v1
@@ -90,7 +90,17 @@ spec:
       kind: Issuer
 ```
 
-To use copied Secrets instead, leave out `certManager` and name the copies in `spec.apiTLS.csiControllerSecretName` and `spec.apiTLS.csiNodeSecretName`. Each Secret must carry `tls.crt`, `tls.key` and `ca.crt`, and you copy them again after each renewal.
+To use copied Secrets instead, leave out `certManager` and provide a client Secret for every component the operator runs, not only for the CSI driver. The operator itself connects to the API server to configure the cluster, and the LinstorCluster does not become available without its Secret:
+
+| Field in `spec.apiTLS` | Default name | Used by |
+|---|---|---|
+| `clientSecretName` | `linstor-client-tls` | The operator itself |
+| `csiControllerSecretName` | `linstor-csi-controller-tls` | The CSI controller |
+| `csiNodeSecretName` | `linstor-csi-node-tls` | The CSI node plugin |
+| `affinityControllerSecretName` | `linstor-affinity-controller-tls` | The affinity controller |
+| `nfsServerSecretName` | `linstor-csi-nfs-server-tls` | The NFS server, if you enable it |
+
+Copy a client certificate into the operator's namespace under each default name, or set the fields to the names you used. Each Secret must carry `tls.crt`, `tls.key` and `ca.crt`, and you copy them again after each renewal. The mirrored CA with `certManager` avoids all of this, which is why blockstor's own test installation uses it.
 
 cert-manager renews the certificates it issues in place, and the API server picks up a new certificate without a restart.
 
