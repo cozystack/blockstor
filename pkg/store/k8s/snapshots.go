@@ -20,6 +20,7 @@ package k8s
 
 import (
 	"context"
+	"maps"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -248,6 +249,56 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 	}), "update Snapshot %s/%s", in.ResourceName, in.Name)
 }
 
+// PatchSnapshotProps reads the snapshot from the API server, runs mutate on
+// its props and updates it under the resourceVersion it read, so a write
+// that came in between makes the update conflict and mutate run again on
+// the fresh object instead of being written over.
+func (s *snapshots) PatchSnapshotProps(
+	ctx context.Context, rdName, snapName string, mutate func(map[string]string) error,
+) error {
+	reader := ctrlclient.Reader(s.c)
+	if s.apiReader != nil {
+		reader = s.apiReader
+	}
+
+	key := types.NamespacedName{Name: snapshotCRDName(rdName, snapName)}
+
+	var mutateErr error
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var crd crdv1alpha1.Snapshot
+
+		getErr := reader.Get(ctx, key, &crd)
+		if apierrors.IsNotFound(getErr) {
+			return errors.Wrapf(store.ErrNotFound, "snapshot %q on RD %q", snapName, rdName)
+		}
+
+		if getErr != nil {
+			return errors.Wrapf(getErr, "get Snapshot %s/%s", rdName, snapName)
+		}
+
+		props := maps.Clone(crd.Spec.Props)
+		if props == nil {
+			props = map[string]string{}
+		}
+
+		mutateErr = mutate(props)
+		if mutateErr != nil {
+			return nil //nolint:nilerr // mutate's refusal is returned below, not retried
+		}
+
+		crd.Spec.Props = props
+
+		return s.c.Update(ctx, &crd)
+	})
+
+	if mutateErr != nil {
+		return mutateErr
+	}
+
+	return errors.Wrapf(err, "patch the props of Snapshot %s/%s", rdName, snapName)
+}
+
 func (s *snapshots) Delete(ctx context.Context, rdName, snapName string) error {
 	crd := &crdv1alpha1.Snapshot{ObjectMeta: metav1.ObjectMeta{Name: snapshotCRDName(rdName, snapName)}}
 
@@ -350,6 +401,14 @@ func crdToWireSnapshot(
 		out.Flags = make([]string, len(crd.Status.Flags))
 		copy(out.Flags, crd.Status.Flags)
 	}
+
+	// A delete only stamps a DeletionTimestamp while a satellite finalizer
+	// holds the snapshot, and that lasts until the on-disk delete succeeds.
+	// Served as a plain snapshot, a restore read it as live and was restored
+	// from data being destroyed. Same flag resources carry for the same state,
+	// and like theirs it outranks every other State: the REST view stamps no
+	// SUCCESSFUL beside it.
+	out.Flags = withDeletingFlag(out.Flags, crd.DeletionTimestamp != nil)
 
 	if len(crd.Spec.VolumeDefinitions) > 0 {
 		out.VolumeDefinitions = wireVolumeDefinitions(crd.Spec.VolumeDefinitions, vdPropsByNumber)

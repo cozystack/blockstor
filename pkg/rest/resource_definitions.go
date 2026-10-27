@@ -1240,21 +1240,16 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// stamps DeletionTimestamp on every replica, a failed RD-delete
 	// leaves the cluster half-torn-down (children gone, parent
 	// kept, snapshots orphaned) which no retry can reconcile.
-	snaps, err := s.Store.Snapshots().ListByDefinitionUncached(r.Context(), name)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		writeStoreError(w, err)
-
+	if !s.rdHasNoSnapshots(w, r, name) {
 		return
 	}
 
-	if len(snaps) > 0 {
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | apiCallRcFailExistsSnapshotDfn,
-			Message: "Cannot delete resource definition '" + name + "' because it has snapshots.",
-			ObjRefs: map[string]string{
-				objRefRscDfn: name,
-			},
-		}})
+	// Read before the delete, used after it: the definition's own props
+	// are the only record of the internal snapshot a clone left on its
+	// source.
+	clonedFrom, err := store.OwnedCloneSnapshot(r.Context(), s.Store, name)
+	if err != nil {
+		writeStoreError(w, err)
 
 		return
 	}
@@ -1322,6 +1317,14 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// close: either ordering yields a clean cluster.
 	s.sweepOrphanSnapshotsAfterRDDelete(r.Context(), name)
 
+	// And the internal snapshot the clone of this definition took on its
+	// SOURCE. Nothing else reaps it: the operator-facing snapshot doors
+	// and the auto-snapshot reaper are all driven by a name or a label
+	// this one never carries, so it outlived the target it was taken for
+	// and left the source undeletable through this very handler, which
+	// refuses a definition that has snapshots.
+	reaped := reapClonedSnapshot(r.Context(), s.Store, name, clonedFrom)
+
 	// Bug 124: block the response until the local informer cache has
 	// observed the RD + child Resource deletions. Without this gate,
 	// `linstor rd d <rd>` returns SUCCESS and the very next
@@ -1329,10 +1332,83 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// catches up on its watch stream. See pkg/rest/cache_invalidation.go.
 	s.waitForRDDeletionVisible(r.Context(), name)
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
-	}})
+	}}
+	if reaped != nil {
+		answer = append(answer, *reaped)
+	}
+
+	writeJSON(w, http.StatusOK, answer)
+}
+
+// rdHasNoSnapshots is handleRDDelete's pre-walk: it refuses, and answers
+// false, while any Snapshot still hangs off the definition.
+func (s *Server) rdHasNoSnapshots(w http.ResponseWriter, r *http.Request, name string) bool {
+	// Uncached: a snapshot that raced the delete and has not reached the
+	// informer is exactly the one this refusal exists for.
+	snaps, err := s.Store.Snapshots().ListByDefinitionUncached(r.Context(), name)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if len(snaps) > 0 {
+		refusal := apiv1.APICallRc{
+			RetCode: apiCallRcError | apiCallRcFailExistsSnapshotDfn,
+			Message: "Cannot delete resource definition '" + name + "' because it has snapshots.",
+			ObjRefs: map[string]string{
+				objRefRscDfn: name,
+			},
+		}
+
+		// A snapshot a clone took for itself outlives the clone when its
+		// reap was skipped or failed, and a repeated delete of the clone
+		// cannot re-run it: the clone is already gone. This refusal is the
+		// one place that still sees it, so it names it.
+		left, leftErr := store.CloneSnapshotsLeftBehind(r.Context(), s.Store, snaps)
+		if leftErr != nil {
+			log.FromContext(r.Context()).V(1).Info("could not tell which snapshots clones left behind",
+				"resourceDefinition", name, "error", leftErr.Error())
+		} else if !left.Empty() {
+			refusal.Cause, refusal.Correc = left.Explain(name)
+		}
+
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{refusal})
+
+		return false
+	}
+
+	return true
+}
+
+// reapClonedSnapshot drops the internal snapshot the deleted definition was
+// cloned from, when the clone path stamped it as that definition's own; see
+// store.ReapClonedSnapshot. It runs after the definition is deleted and
+// before the answer goes out, bounded by the reap's own 30s budget.
+//
+// The delete stands whatever the reap does. A snapshot kept because another
+// definition was restored from it, or one whose delete failed, stays visible
+// in `linstor s l`, and the refusal a later delete of the source meets names
+// it; the answer to this delete carries it as a warning, which is returned
+// here, so the operator learns of it now rather than at that refusal.
+func reapClonedSnapshot(ctx context.Context, st store.Store, rdName string, ref store.ClonedSnapshotRef) *apiv1.APICallRc {
+	err := store.ReapClonedSnapshot(ctx, st, ref)
+	if err == nil {
+		return nil
+	}
+
+	log.FromContext(ctx).Info("internal clone snapshot kept",
+		"resourceDefinition", rdName, "source", ref.Source, "snapshot", ref.Snapshot, "reason", err.Error())
+
+	return &apiv1.APICallRc{
+		RetCode: maskWarn,
+		Message: "internal clone snapshot " + ref.Snapshot + " of " + ref.Source + " was kept: " +
+			scrubImplDetails(err.Error()),
+		Correc: "a later delete of " + ref.Source + " names what is still to be done about it",
+	}
 }
 
 // sweepOrphanSnapshotsAfterRDDelete drops any Snapshot rows that

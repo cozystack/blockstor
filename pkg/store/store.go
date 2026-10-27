@@ -177,6 +177,13 @@ type ResourceGroupStore interface {
 // ResourceGroupStore (nil = untouched, empty = clear).
 type ResourceDefinitionStore interface {
 	List(ctx context.Context) ([]apiv1.ResourceDefinition, error)
+
+	// ListUncached answers the same question from the API server when the
+	// store has a direct reader, bypassing a cache that can trail a create.
+	// For a decision that destroys something when the answer comes back
+	// short, like reaping a snapshot no definition seems to use.
+	ListUncached(ctx context.Context) ([]apiv1.ResourceDefinition, error)
+
 	Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error)
 	Create(ctx context.Context, rd *apiv1.ResourceDefinition) error
 	Update(ctx context.Context, rd *apiv1.ResourceDefinition) error
@@ -417,6 +424,14 @@ type SnapshotStore interface {
 	Create(ctx context.Context, snap *apiv1.Snapshot) error
 	Update(ctx context.Context, snap *apiv1.Snapshot) error
 	Delete(ctx context.Context, rdName, snapName string) error
+
+	// PatchSnapshotProps runs mutate on the props of the snapshot as the
+	// API server holds it now and writes them back only if nobody changed
+	// the snapshot in between, re-running mutate on a fresh read when
+	// somebody did. Update is last writer wins on props; a read-decide-write
+	// of a prop another writer races, a reap's mark say, needs this. An
+	// error from mutate aborts with nothing written and is returned as is.
+	PatchSnapshotProps(ctx context.Context, rdName, snapName string, mutate func(props map[string]string) error) error
 }
 
 // PhysicalDeviceStore persists PhysicalDevice objects (Phase 10.7).

@@ -401,3 +401,9 @@ func mustContainAny(t *testing.T, field, haystack string, needles ...string) {
 	t.Errorf("envelope %s does not mention any of %v: %q",
 		field, needles, haystack)
 }
+
+func (s *stuckSnapshots) PatchSnapshotProps(
+	ctx context.Context, rdName, snapName string, mutate func(map[string]string) error,
+) error {
+	return s.inner.PatchSnapshotProps(ctx, rdName, snapName, mutate) //nolint:wrapcheck // test helper
+}
