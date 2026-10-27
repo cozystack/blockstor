@@ -808,7 +808,7 @@ func (p *PhysicalDeviceDiscoveryRunnable) attachedKNamesForNode(ctx context.Cont
 
 	for i := range pools.Items {
 		pool := &pools.Items[i]
-		if pool.Spec.NodeName != p.NodeName {
+		if !isNode(pool.Spec.NodeName, p.NodeName) {
 			continue
 		}
 

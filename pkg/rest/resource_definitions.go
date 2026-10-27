@@ -318,7 +318,7 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 	// rg-modify validation gate) would reach the store unchecked. Re-validate
 	// the resolved (possibly inherited) stack here, mirroring the create
 	// path's 400, so an unmaterialisable layer chain never persists onto an RD.
-	lsErr := validateLayerStack(rd.LayerStack)
+	lsErr := canonicalizeLayerStack(&rd.LayerStack)
 	if lsErr != nil {
 		writeError(w, http.StatusBadRequest, lsErr.Error())
 
@@ -848,7 +848,7 @@ func (s *Server) validateRDLayerStackOnCreate(ctx context.Context, body *apiv1.R
 		return err
 	}
 
-	err = validateLayerStack(rd.LayerStack)
+	err = canonicalizeLayerStack(&rd.LayerStack)
 	if err != nil {
 		return err
 	}

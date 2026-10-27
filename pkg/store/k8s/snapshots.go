@@ -20,6 +20,7 @@ package k8s
 
 import (
 	"context"
+	"slices"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -98,21 +99,7 @@ func (s *snapshots) List(ctx context.Context) ([]apiv1.Snapshot, error) {
 // and the mop-up missing them too. Same label blindness the Resource and
 // StoragePool reads were moved off, one kind over and on a delete gate.
 func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
-	var crdList crdv1alpha1.SnapshotList
-
-	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: rdName})
-	if err != nil {
-		if !SelectorUnsupported(err) {
-			return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
-		}
-
-		log.FromContext(ctx).V(1).Info("scoped Snapshot read unavailable; reading every snapshot instead",
-			"resourceDefinition", rdName, "reason", err.Error())
-
-		return s.listByDefinitionExhaustively(ctx, s.c, rdName)
-	}
-
-	return s.wireSnapshots(ctx, rdName, crdList.Items)
+	return s.listByDefinitionThrough(ctx, s.c, rdName)
 }
 
 // ListByDefinitionUncached reads the definition's snapshots from the API server
@@ -134,21 +121,7 @@ func (s *snapshots) ListByDefinitionUncached(ctx context.Context, rdName string)
 		return s.ListByDefinition(ctx, rdName)
 	}
 
-	var crdList crdv1alpha1.SnapshotList
-
-	err := s.apiReader.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: rdName})
-	if err != nil {
-		if !SelectorUnsupported(err) {
-			return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
-		}
-
-		log.FromContext(ctx).V(1).Info("scoped uncached Snapshot read unavailable; reading every snapshot instead",
-			"resourceDefinition", rdName, "reason", err.Error())
-
-		return s.listByDefinitionExhaustively(ctx, s.apiReader, rdName)
-	}
-
-	return s.wireSnapshots(ctx, rdName, crdList.Items)
+	return s.listByDefinitionThrough(ctx, s.apiReader, rdName)
 }
 
 func (s *snapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
@@ -173,7 +146,11 @@ func (s *snapshots) Create(ctx context.Context, in *apiv1.Snapshot) error {
 		return errors.New("nil Snapshot")
 	}
 
-	crd := wireToCRDSnapshot(in)
+	// Stored under the definition's registered spelling; see spellings.go.
+	canonical := *in
+	canonical.ResourceName = canonicalRDName(ctx, s.c, in.ResourceName)
+
+	crd := wireToCRDSnapshot(&canonical)
 
 	err := s.c.Create(ctx, crd)
 	if err != nil {
@@ -261,6 +238,47 @@ func (s *snapshots) Delete(ctx context.Context, rdName, snapName string) error {
 	}
 
 	return nil
+}
+
+// listByDefinitionThrough lists the definition's snapshots under every
+// spelling of its name (see spellings.go), through one reader, and falls back
+// to the exhaustive read on that same reader when the server cannot select.
+func (s *snapshots) listByDefinitionThrough(
+	ctx context.Context, reader ctrlclient.Reader, rdName string,
+) ([]apiv1.Snapshot, error) {
+	spellings := rdSpellings(ctx, reader, rdName)
+
+	var kept []crdv1alpha1.Snapshot
+
+	seen := map[string]struct{}{}
+
+	for _, spelling := range spellings {
+		var crdList crdv1alpha1.SnapshotList
+
+		err := reader.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: spelling})
+		if err != nil {
+			if !SelectorUnsupported(err) {
+				return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", spelling)
+			}
+
+			log.FromContext(ctx).V(1).Info("scoped Snapshot read unavailable; reading every snapshot instead",
+				"resourceDefinition", rdName, "reason", err.Error())
+
+			return s.listByDefinitionExhaustively(ctx, reader, rdName, spellings)
+		}
+
+		for i := range crdList.Items {
+			if _, dup := seen[crdList.Items[i].Name]; dup {
+				continue
+			}
+
+			seen[crdList.Items[i].Name] = struct{}{}
+
+			kept = append(kept, crdList.Items[i])
+		}
+	}
+
+	return s.wireSnapshots(ctx, rdName, kept)
 }
 
 // getParentRD fetches the parent ResourceDefinition for a Snapshot,
@@ -529,7 +547,7 @@ func wireToCRDSnapshotSpec(in *apiv1.Snapshot) crdv1alpha1.SnapshotSpec {
 // authoritative Spec.ResourceDefinitionName, read through the reader the
 // scoped attempt used so a fallback never changes which one answers.
 func (s *snapshots) listByDefinitionExhaustively(
-	ctx context.Context, reader ctrlclient.Reader, rdName string,
+	ctx context.Context, reader ctrlclient.Reader, rdName string, spellings []string,
 ) ([]apiv1.Snapshot, error) {
 	var crdList crdv1alpha1.SnapshotList
 
@@ -541,7 +559,7 @@ func (s *snapshots) listByDefinitionExhaustively(
 	kept := make([]crdv1alpha1.Snapshot, 0, len(crdList.Items))
 
 	for i := range crdList.Items {
-		if crdList.Items[i].Spec.ResourceDefinitionName == rdName {
+		if slices.Contains(spellings, crdList.Items[i].Spec.ResourceDefinitionName) {
 			kept = append(kept, crdList.Items[i])
 		}
 	}

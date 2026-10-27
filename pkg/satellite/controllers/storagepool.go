@@ -80,7 +80,7 @@ func (r *StoragePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, errors.Wrap(err, "get StoragePool")
 	}
 
-	if pool.Spec.NodeName != r.Config.NodeName {
+	if !isNode(pool.Spec.NodeName, r.Config.NodeName) {
 		return ctrl.Result{}, nil
 	}
 
