@@ -226,6 +226,7 @@ func TravellingProps(props map[string]string) map[string]string {
 	delete(out, RestoreAdoptedProp)
 	delete(out, RestoreFromSnapshotProp)
 	delete(out, RestoreVolumesProp)
+	delete(out, SnapshotDeletingProp)
 
 	return out
 }

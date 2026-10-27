@@ -1384,6 +1384,16 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		made = createdRD(newRD.Name, newRD.ResourceGroupName)
 	}
 
+	// The snapshot was read before the marked definition existed, and a
+	// snapshot delete that listed dependents in between could not see this
+	// one. Read it back now the definition is there; see store.DeleteSnapshot.
+	// The withdraw has already taken back what this request created, so its
+	// error is not one to roll back over.
+	err = store.RestoreSourceWithdrawn(ctx, s.Store, snap.ResourceName, snap.Name)
+	if err != nil {
+		return materialisedRD{}, s.withdrawRestoredRD(ctx, newRD.Name, created, restoreRollbackScope(req, eagerPlace), err)
+	}
+
 	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap, true)
 	if err != nil {
 		return made, made.failedAfterWrite(err)
@@ -1485,6 +1495,54 @@ func (s *Server) claimAdoptedLeftover(ctx context.Context, rdName string, snap *
 	}
 
 	return err //nolint:wrapcheck // store names the definition
+}
+
+// withdrawRestoredRD takes back a definition this request created from a
+// snapshot that went away under it, before anything was hydrated into it. It
+// answers as for a snapshot that does not exist or, when only a delete's mark
+// is on the snapshot, with a retryable 409: the delete may still keep it.
+//
+// The take-back goes through the rollback and its handshake, not a bare
+// delete: between this request's create and its read of the snapshot, a
+// retry of the same restore can have adopted the definition and answered for
+// it, and such a definition is left to that retry. scope is the one the
+// request's own rollback would use.
+//
+// A definition an earlier attempt left is not this request's to delete: it
+// may hold what that attempt hydrated. It cannot be finished without the
+// snapshot either, so the answer names it and the way out, rather than a 404
+// every retry repeats with nothing pointing at the leftover.
+func (s *Server) withdrawRestoredRD(
+	ctx context.Context, rdName string, created bool, scope rollbackScope, cause error,
+) error {
+	if created {
+		rollbackCtx, cancel := detachedCompensation(ctx)
+		err := s.rollBackCompensating(rollbackCtx, rdName, nil, scope)
+
+		cancel()
+
+		if err != nil {
+			log.FromContext(ctx).Info("did not withdraw a definition whose snapshot went away",
+				"resourceDefinition", rdName, "reason", err.Error())
+		}
+	}
+
+	if created || !errors.Is(cause, store.ErrNotFound) {
+		return cause
+	}
+
+	return errors.Wrapf(cause, "'%s', left by an earlier attempt at this restore, "+
+		"cannot be finished without it: delete it with `linstor rd d %s`", rdName, rdName)
+}
+
+// restoreRollbackScope is the rollback scope of a materialisation: a clone, or
+// a restore asked to place replicas, is finished only with one.
+func restoreRollbackScope(req *snapshotRestoreRequest, eagerPlace bool) rollbackScope {
+	if eagerPlace || len(canonicalRestoreNodeList(req)) > 0 {
+		return rollbackUnlessPlaced
+	}
+
+	return rollbackUnlessHydrated
 }
 
 // materialisedRD is what a materialisation wrote, and whether the definition

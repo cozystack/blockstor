@@ -1197,30 +1197,23 @@ func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, erro
 	return out, nil
 }
 
-// refuseSnapshotDeleteUnderRestore runs store.ReleaseRestoreSource before a
-// snapshot delete: a definition restored from the snapshot reads from it
-// until its restore is done. True means the answer has been written.
-func (s *Server) refuseSnapshotDeleteUnderRestore(w http.ResponseWriter, r *http.Request, rd, snapName string) bool {
-	err := store.ReleaseRestoreSource(r.Context(), s.Store, rd, snapName)
+// writeSnapshotDeleteRefusal answers a snapshot delete that store.DeleteSnapshot
+// refused: a definition restored from the snapshot reads from it until its
+// restore is done.
+func writeSnapshotDeleteRefusal(w http.ResponseWriter, rd, snapName string, err error) {
 	if errors.Is(err, store.ErrRestoreSourceInUse) {
 		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
 			RetCode: apiCallRcError,
-			Message: "snapshot '" + snapName + "' of '" + rd + "' cannot be deleted yet: " + err.Error(),
+			Message: "snapshot '" + snapName + "' of '" + rd + "' cannot be deleted yet: " + scrubImplDetails(err.Error()),
 			Cause:   "a restore from this snapshot has not brought up a replica with every volume UpToDate",
 			Correc:  "retry the delete once that restore has finished",
 			ObjRefs: map[string]string{objRefRscDfn: rd, objRefSnapshotDfn: snapName},
 		}})
 
-		return true
+		return
 	}
 
-	if err != nil {
-		writeStoreError(w, err)
-
-		return true
-	}
-
-	return false
+	writeStoreError(w, err)
 }
 
 // handleSnapshotDelete answers `DELETE /v1/resource-definitions/{rd}/snapshots/{snap}`
@@ -1259,11 +1252,9 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")
 
-	if s.refuseSnapshotDeleteUnderRestore(w, r, rd, snapName) {
-		return
-	}
-
-	err := s.Store.Snapshots().Delete(r.Context(), rd, snapName)
+	// A missing snapshot is answered before any restore is judged: there is
+	// nothing to hold, and the idempotent 200 is what a CSI retry needs.
+	err := store.DeleteSnapshot(r.Context(), s.Store, rd, snapName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
@@ -1278,7 +1269,7 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		writeStoreError(w, err)
+		writeSnapshotDeleteRefusal(w, rd, snapName, err)
 
 		return
 	}

@@ -28,8 +28,8 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
-	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // The prune deleted by age alone. A definition restored from an
@@ -75,28 +75,28 @@ func TestAutoSnapshotPruneKeepsTheSourceOfARestore(t *testing.T) {
 	}
 }
 
-// The production prune judges the restore through the store
-// (store.ReleaseRestoreSource): a restore that is not finished keeps its
-// auto-snapshot.
+// The production prune deletes through the store (store.DeleteSnapshot),
+// over the same API server the cron writes to: a restore that is not finished
+// keeps its auto-snapshot, and the ones nothing was restored from go.
 func TestAutoSnapshotPruneWithAStoreKeepsTheSourceOfAnUnfinishedRestore(t *testing.T) {
 	t.Parallel()
 
 	scheme := newScheme(t)
 	rd := makeRDWithAutoSnapshot(t, "pvc-keep-st", 15, "2")
-	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
 
-	st := store.NewInMemory()
-	if err := st.ResourceDefinitions().Create(context.Background(), &apiv1.ResourceDefinition{
-		Name:  "pvc-restored-st",
-		Props: map[string]string{store.RestoreFromSnapshotProp: "pvc-keep-st:auto-snap-00001"},
-	}); err != nil {
-		t.Fatalf("seed restored definition: %v", err)
+	restored := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-restored-st"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{store.RestoreFromSnapshotProp: "pvc-keep-st:auto-snap-00001"},
+		},
 	}
 
-	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
-	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk, Store: st}
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd, restored).Build()
 
-	for i := range 4 {
+	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
+	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk, Store: storek8s.New(cli)}
+
+	for i := range 5 {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
@@ -104,11 +104,19 @@ func TestAutoSnapshotPruneWithAStoreKeepsTheSourceOfAnUnfinishedRestore(t *testi
 		clk.advance(15*time.Minute + time.Second)
 	}
 
+	names := map[string]bool{}
 	for _, snap := range listAutoSnapshotsByRD(t, cli, "pvc-keep-st") {
-		if snap.Spec.SnapshotName == "auto-snap-00001" {
-			return
-		}
+		names[snap.Spec.SnapshotName] = true
 	}
 
-	t.Fatal("the prune deleted the auto-snapshot an unfinished restore reads from")
+	if !names["auto-snap-00001"] {
+		t.Fatal("the prune deleted the auto-snapshot an unfinished restore reads from")
+	}
+
+	// Without the second check a prune that deleted nothing at all would
+	// pass the first: the store path has to delete what nothing restores
+	// from.
+	if names["auto-snap-00002"] {
+		t.Fatalf("the prune kept auto-snap-00002, which nothing was restored from: %v", names)
+	}
 }
