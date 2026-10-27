@@ -1763,7 +1763,7 @@ func TestBothLatchReasonsAreReported(t *testing.T) {
 			{NodeName: "NODE-A", PoolName: "P2", DriverName: "ZFS", UUID: "sp-2"},
 		},
 		ResourceDefinitions: []ResourceDefinitionRow{
-			{ResourceName: "PVC-BOTH", ResourceDspName: "pvc-both", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-b"},
+			{ResourceName: "PVC-BOTH", ResourceDspName: "pvc-both", LayerStack: `["STORAGE"]`, UUID: "rd-b"},
 		},
 		VolumeDefinitions: []VolumeDefinitionRow{
 			{ResourceName: "PVC-BOTH", VlmNr: 0, VlmSize: 1048576, UUID: "vd-b"},

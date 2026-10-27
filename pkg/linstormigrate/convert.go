@@ -447,13 +447,48 @@ func (c *converter) indexDiskStacks() {
 	}
 }
 
+// stackDisagreement says why the RD's replicas cannot be adopted under one
+// stack, or "" when they can: replicas built under different stacks when
+// the RD row names none, or a replica built under another stack than the
+// one the row names. It reads the row's stack without reporting a parse
+// failure; rdLayerStack reports that once.
+func (c *converter) stackDisagreement(row *ResourceDefinitionRow) string {
+	var stack []string
+	if !emptyList(row.LayerStack) {
+		_ = json.Unmarshal([]byte(row.LayerStack), &stack)
+	}
+
+	keys := make([]string, 0, len(c.diskStacks[row.ResourceName]))
+	for key := range c.diskStacks[row.ResourceName] {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	if len(stack) == 0 {
+		if len(keys) > 1 {
+			return "no layer stack of its own, and its replicas were built as " + strings.Join(keys, " and ")
+		}
+
+		return ""
+	}
+
+	for _, key := range keys {
+		if key != strings.Join(stack, ",") {
+			return "layer stack " + strings.Join(stack, ",") + ", but a replica was built as " + key
+		}
+	}
+
+	return ""
+}
+
 // rdLayerStack is the layer stack a converted RD carries. An RD row
 // that names one keeps it; an empty one takes the stack its replicas
 // were built with, so the satellite adopts each volume as it is rather
 // than as the default, and the group's stack, which blockstor would
-// otherwise pin, is never laid over data built without it. Replicas
-// that disagree, or a stack the replicas were not built with, are
-// reported for the operator to settle before adopting.
+// otherwise pin, is never laid over data built without it. An RD whose
+// replicas disagree, or whose stack its replicas were not built with,
+// never gets here: rdConvertible skips it (stackDisagreement).
 func (c *converter) rdLayerStack(row *ResourceDefinitionRow, dsp string) []string {
 	stack := c.parseList(row.LayerStack, "resource definition "+dsp+" layer_stack")
 	onDisk := c.diskStacks[row.ResourceName]
@@ -466,25 +501,14 @@ func (c *converter) rdLayerStack(row *ResourceDefinitionRow, dsp string) []strin
 	slices.Sort(keys)
 
 	if len(stack) > 0 {
-		for _, key := range keys {
-			if key != strings.Join(stack, ",") {
-				c.warnf("resource definition %s: layer stack %s, but a replica was built as %s — that replica will not come up as it is", dsp, strings.Join(stack, ","), key)
-			}
-		}
-
 		return stack
 	}
 
-	switch len(keys) {
-	case 0:
-		return nil
-	case 1:
+	if len(keys) == 1 {
 		return slices.Clone(onDisk[keys[0]])
-	default:
-		c.warnf("resource definition %s: no layer stack of its own, and its replicas were built as %s — left unset; set spec.layerStack before adopting", dsp, strings.Join(keys, " and "))
-
-		return nil
 	}
+
+	return nil
 }
 
 func (c *converter) convertNodes() []crdv1alpha1.Node {
@@ -1081,6 +1105,14 @@ func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
 		c.warnf("resource definition %s: unhandled flags bitmask %d dropped", dsp, row.ResourceFlags)
 	}
 
+	if reason := c.stackDisagreement(row); reason != "" {
+		c.warnf("resource definition %s: %s — skipped with its replicas; adopted as it is, a replica would be "+
+			"brought up under a stack it was not built with, DRBD metadata written over a LUKS volume's "+
+			"ciphertext say; settle the stack in LINSTOR and convert again", dsp, reason)
+
+		return false
+	}
+
 	if reason := c.volumelessReason(row.ResourceName); reason != "" {
 		c.warnf("resource definition %s: %s — skipped; there is no volume to adopt, and migrating it leaves the controller placing replicas the satellite can never bring up", dsp, reason)
 
@@ -1668,7 +1700,7 @@ func (c *converter) snapshotNodesFor(rdName, snapName, snapDsp string) []string 
 // (`"[\"DRBD\",\"STORAGE\"]"`). Empty input, `[]` and `null` all yield
 // nil; a malformed value is reported and yields nil.
 func (c *converter) parseList(raw, context string) []string {
-	if raw == "" || raw == "[]" || raw == "null" {
+	if emptyList(raw) {
 		return nil
 	}
 
@@ -1686,6 +1718,11 @@ func (c *converter) parseList(raw, context string) []string {
 	}
 
 	return out
+}
+
+// emptyList reports a list column that holds no list: empty, `[]` or `null`.
+func emptyList(raw string) bool {
+	return raw == "" || raw == "[]" || raw == "null"
 }
 
 func (c *converter) displayNode(name string) string {
