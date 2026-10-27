@@ -23,9 +23,6 @@ import (
 	"strings"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -52,8 +49,7 @@ func TestBug116RawLayerStackLUKSRefusedWithoutPassphrase(t *testing.T) {
 
 	// Raw POST body: layer_stack carried inside resource_definition
 	// (matches the OpenAPI ResourceDefinition.layer_stack field
-	// blockstor's apiv1 surface accepts). NO passphrase on the
-	// controller scope.
+	// blockstor's apiv1 surface accepts). NO passphrase Secret.
 	body := []byte(`{"resource_definition":{"name":"bug116-stack",` +
 		`"layer_stack":["DRBD","LUKS","STORAGE"]}}`)
 
@@ -67,9 +63,7 @@ func TestBug116RawLayerStackLUKSRefusedWithoutPassphrase(t *testing.T) {
 	}
 
 	bodyBytes, _ := readAllBody(resp)
-	if !strings.Contains(string(bodyBytes), "DrbdOptions/EncryptPassphrase") {
-		t.Errorf("response body missing prop name: %s", bodyBytes)
-	}
+	assertLUKSRefusalHint(t, bodyBytes)
 
 	_, err := st.ResourceDefinitions().Get(t.Context(), "bug116-stack")
 	if err == nil {
@@ -115,9 +109,7 @@ func TestBug116RawTopLevelLayerListLUKSRefusedWithoutPassphrase(t *testing.T) {
 	}
 
 	bodyBytes, _ := readAllBody(resp)
-	if !strings.Contains(string(bodyBytes), "DrbdOptions/EncryptPassphrase") {
-		t.Errorf("response body missing prop name: %s", bodyBytes)
-	}
+	assertLUKSRefusalHint(t, bodyBytes)
 
 	_, err := st.ResourceDefinitions().Get(t.Context(), "bug116-toplevel")
 	if err == nil {
@@ -138,15 +130,8 @@ func TestBug116RawTopLevelLayerListPersistsOnCRD(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
-		Spec: blockstoriov1alpha1.ControllerConfigSpec{
-			ExtraProps: map[string]string{
-				"DrbdOptions/EncryptPassphrase": "bug116pass",
-			},
-		},
-	}); err != nil {
-		t.Fatalf("seed ControllerConfig: %v", err)
+	if err := cli.Create(ctx, testPassphraseSecret("bug116pass")); err != nil {
+		t.Fatalf("seed the passphrase Secret: %v", err)
 	}
 
 	base, stop := startServerCustom(t, &Server{
@@ -226,8 +211,7 @@ func TestBug116RawLayerDataLUKSRefusedWithoutPassphrase(t *testing.T) {
 }
 
 // TestBug116RawLayerStackLUKSAcceptedWithPassphrase is the happy-
-// path counterpart: with `DrbdOptions/EncryptPassphrase` set on
-// the controller scope, the raw `layer_stack` shape must land 201
+// path counterpart: with the passphrase Secret seeded, the raw `layer_stack` shape must land 201
 // + LUKS in the persisted CRD spec.
 func TestBug116RawLayerStackLUKSAcceptedWithPassphrase(t *testing.T) {
 	t.Parallel()
@@ -236,15 +220,8 @@ func TestBug116RawLayerStackLUKSAcceptedWithPassphrase(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
-		Spec: blockstoriov1alpha1.ControllerConfigSpec{
-			ExtraProps: map[string]string{
-				"DrbdOptions/EncryptPassphrase": "bug116pass",
-			},
-		},
-	}); err != nil {
-		t.Fatalf("seed ControllerConfig: %v", err)
+	if err := cli.Create(ctx, testPassphraseSecret("bug116pass")); err != nil {
+		t.Fatalf("seed the passphrase Secret: %v", err)
 	}
 
 	base, stop := startServerCustom(t, &Server{
@@ -299,15 +276,8 @@ func TestBug116BothFieldsConsistent(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
-		Spec: blockstoriov1alpha1.ControllerConfigSpec{
-			ExtraProps: map[string]string{
-				"DrbdOptions/EncryptPassphrase": "bug116pass",
-			},
-		},
-	}); err != nil {
-		t.Fatalf("seed ControllerConfig: %v", err)
+	if err := cli.Create(ctx, testPassphraseSecret("bug116pass")); err != nil {
+		t.Fatalf("seed the passphrase Secret: %v", err)
 	}
 
 	base, stop := startServerCustom(t, &Server{
@@ -358,15 +328,8 @@ func TestBug116BothFieldsAgreeing(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
-		Spec: blockstoriov1alpha1.ControllerConfigSpec{
-			ExtraProps: map[string]string{
-				"DrbdOptions/EncryptPassphrase": "bug116pass",
-			},
-		},
-	}); err != nil {
-		t.Fatalf("seed ControllerConfig: %v", err)
+	if err := cli.Create(ctx, testPassphraseSecret("bug116pass")); err != nil {
+		t.Fatalf("seed the passphrase Secret: %v", err)
 	}
 
 	base, stop := startServerCustom(t, &Server{

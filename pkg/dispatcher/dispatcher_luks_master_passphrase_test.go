@@ -25,37 +25,21 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
+	"github.com/cozystack/blockstor/pkg/passphrase"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
 // Bug 265 (HIGH): the LUKS passphrase key namespace mismatched
-// between the controller and the dispatcher.
+// between the controller and the dispatcher: the dispatcher looked for
+// `DrbdOptions/Encryption/passphrase` while the master key arrived
+// under upstream LINSTOR's `DrbdOptions/EncryptPassphrase`, so it
+// never reached the satellite and every LUKS RD looped on
+// `Props.LuksPassphrase empty`.
 //
-// The operator sets the cluster-scope master passphrase via
-// `linstor controller set-property DrbdOptions/EncryptPassphrase
-// <passphrase>` — same shape upstream LINSTOR uses (Bug 95 enforces
-// its presence as a hard prerequisite for any LUKS-layered RD).
-// The REST/effectiveprops layer surfaces it under that EXACT key:
-// `DrbdOptions/EncryptPassphrase`.
-//
-// The dispatcher, however, only looked for
-// `DrbdOptions/Encryption/passphrase` (note the inner namespace +
-// lower-case `passphrase`) and lifted just that key onto the
-// satellite-facing `LuksPassphrase` wire prop. Result: the cluster
-// master key set by the operator NEVER reached the satellite, the
-// satellite reconciler tripped on `LUKS in layer stack but
-// Props.LuksPassphrase empty`, and every LUKS RD looped forever in
-// "Props.LuksPassphrase empty" failures.
-//
-// Fix: dispatcher must read the SAME key the controller writes —
-// `DrbdOptions/EncryptPassphrase`. The legacy
-// `DrbdOptions/Encryption/passphrase` shape stays accepted for
-// backwards-compat (alias-read) but the canonical key is the upstream
-// one.
-//
-// This test pins the contract: cluster-scope `DrbdOptions/
-// EncryptPassphrase` in effectiveProps MUST propagate to the wire
-// as `LuksPassphrase`. Without the fix the dispatcher drops the
-// master key on the floor.
+// Today the satellite puts the passphrase Secret's value into
+// effectiveProps under `DrbdOptions/EncryptPassphrase`, after dropping
+// any property that carried a passphrase (pkg/passphrase). This test
+// pins that the injected value reaches the wire as `LuksPassphrase`.
 func TestBug265LUKSMasterPassphraseReachesSatellite(t *testing.T) {
 	rd := &blockstoriov1alpha1.ResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bug265-luks"},
@@ -75,12 +59,8 @@ func TestBug265LUKSMasterPassphraseReachesSatellite(t *testing.T) {
 		},
 	}
 
-	// Effective props as the resolver would produce after merging the
-	// ControllerConfig.Spec.ExtraProps where the operator stamped
-	// `DrbdOptions/EncryptPassphrase` via `linstor controller set-
-	// property`. This is the EXACT shape pkg/effectiveprops.Resolve
-	// returns (the resolver copies ControllerConfig.ExtraProps onto
-	// the output via maps.Copy).
+	// Effective props as the satellite hands them over once it has
+	// injected the Secret's value (luks_passphrase.go).
 	effectiveProps := map[string]string{
 		"DrbdOptions/EncryptPassphrase": "topsecret",
 	}
@@ -92,11 +72,10 @@ func TestBug265LUKSMasterPassphraseReachesSatellite(t *testing.T) {
 
 	pass, ok := got.Props["LuksPassphrase"]
 	if !ok || pass == "" {
-		t.Errorf("LuksPassphrase not propagated to wire after operator set "+
+		t.Errorf("LuksPassphrase not propagated to wire from the injected "+
 			"DrbdOptions/EncryptPassphrase; got props=%v. "+
-			"The dispatcher must alias-read the cluster-scope master key "+
-			"under upstream-LINSTOR's canonical name, not just the inner "+
-			"DrbdOptions/Encryption/passphrase namespace. (Bug 265)",
+			"The dispatcher must lift the injected master key from "+
+			"upstream-LINSTOR's canonical name. (Bug 265)",
 			got.Props)
 	}
 
@@ -105,14 +84,11 @@ func TestBug265LUKSMasterPassphraseReachesSatellite(t *testing.T) {
 	}
 }
 
-// TestBug265LUKSLegacyEncryptionPassphraseStillWorks pins the
-// backwards-compat half: any caller that still emits the legacy
-// `DrbdOptions/Encryption/passphrase` shape (the pre-fix dispatcher
-// surface) MUST keep working, so a half-upgraded cluster where one
-// of the prop tiers writes the legacy form doesn't break.
-func TestBug265LUKSLegacyEncryptionPassphraseStillWorks(t *testing.T) {
-	rd := &blockstoriov1alpha1.ResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bug265-legacy"},
+// luksTestRD and luksTestTarget are a LUKS-layered definition and one
+// diskful replica of it, for the passphrase tests below.
+func luksTestRD(name string) *blockstoriov1alpha1.ResourceDefinition {
+	return &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
 			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
 			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
@@ -120,17 +96,47 @@ func TestBug265LUKSLegacyEncryptionPassphraseStillWorks(t *testing.T) {
 			},
 		},
 	}
+}
 
-	target := &blockstoriov1alpha1.Resource{
+func luksTestTarget(name string, props map[string]string) *blockstoriov1alpha1.Resource {
+	return &blockstoriov1alpha1.Resource{
 		Spec: blockstoriov1alpha1.ResourceSpec{
-			ResourceDefinitionName: "pvc-bug265-legacy",
+			ResourceDefinitionName: name,
 			NodeName:               "n1",
 			StoragePool:            "data-hdd",
+			Props:                  props,
 		},
 	}
+}
+
+// assertNoPassphraseOnWire fails when any key that would carry the
+// master passphrase made it into the wire props or the DRBD options.
+func assertNoPassphraseOnWire(t *testing.T, got *intent.DesiredResource) {
+	t.Helper()
+
+	for key, value := range got.Props {
+		if passphrase.IsPlaintextPropKey(key) {
+			t.Errorf("wire props carry %s=%q; only the Secret may reach the LUKS layer", key, value)
+		}
+	}
+
+	for key, value := range got.DrbdOptions {
+		if passphrase.IsPlaintextPropKey(key) {
+			t.Errorf("DRBD options carry %s=%q", key, value)
+		}
+	}
+}
+
+// The early per-RD alias `DrbdOptions/Encryption/passphrase` is a
+// property, kept in plaintext on its CR, and is never read: when it is
+// all there is, no passphrase reaches the satellite and the LUKS layer
+// fails the apply with its actionable message.
+func TestBug265LUKSLegacyEncryptionPassphraseIsIgnored(t *testing.T) {
+	rd := luksTestRD("pvc-bug265-legacy")
+	target := luksTestTarget("pvc-bug265-legacy", nil)
 
 	effectiveProps := map[string]string{
-		"DrbdOptions/Encryption/passphrase": "legacy-shape",
+		passphrase.PropKeyLegacy: "legacy-shape",
 	}
 
 	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, effectiveProps)
@@ -138,10 +144,5 @@ func TestBug265LUKSLegacyEncryptionPassphraseStillWorks(t *testing.T) {
 		t.Fatalf("BuildDesired returned nil")
 	}
 
-	pass, ok := got.Props["LuksPassphrase"]
-	if !ok || pass != "legacy-shape" {
-		t.Errorf("legacy DrbdOptions/Encryption/passphrase no longer propagates; "+
-			"got props=%v. Backwards-compat alias must keep working.",
-			got.Props)
-	}
+	assertNoPassphraseOnWire(t, got)
 }

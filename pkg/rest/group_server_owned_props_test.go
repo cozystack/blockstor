@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -70,6 +71,54 @@ func TestSpawnDoesNotInheritServerOwnedGroupProps(t *testing.T) {
 	for _, key := range []string{store.RestoreFromSnapshotProp, store.RollbackAbandonedProp} {
 		if v, ok := rd.Props[key]; ok {
 			t.Errorf("spawned definition inherited %s=%q from its group", key, v)
+		}
+	}
+
+	if rd.Props["DrbdOptions/Net/protocol"] != "C" {
+		t.Errorf("spawned definition lost an ordinary group prop: %v", rd.Props)
+	}
+}
+
+// A passphrase property a group kept from before the Secret was the only
+// source is not copied into what it spawns: nothing reads it, and the copy
+// would put the plaintext key into every new definition and its backups.
+func TestSpawnDoesNotCopyAGroupPassphraseProp(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{
+		Name: "rg-pass",
+		Props: map[string]string{
+			passphrase.PropKeyLegacy:   "left-over-plaintext",
+			"DrbdOptions/Net/protocol": "C",
+		},
+	}); err != nil {
+		t.Fatalf("seed the group: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{ResourceDefinitionName: "pvc-pass"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-pass/spawn", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("spawn = %d, want 201", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(t.Context(), "pvc-pass")
+	if err != nil {
+		t.Fatalf("read the spawned definition: %v", err)
+	}
+
+	for key := range rd.Props {
+		if passphrase.IsPlaintextPropKey(key) {
+			t.Errorf("spawned definition carries %s from its group", key)
 		}
 	}
 

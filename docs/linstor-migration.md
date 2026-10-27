@@ -10,7 +10,7 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 
 **NOT migrated — read the report on stderr for the exact list per cluster:**
 
-- **LUKS passphrases.** LUKS-encrypted volumes convert with their layer stack intact (an RD whose `layer_stack` column is empty takes the stack its replicas were built with, read from `LAYER_RESOURCE_IDS`), but the per-volume passphrase (encrypted with the LINSTOR master key) is not decrypted. You must provision `spec.encryption` for those RDs by hand before the encrypted volumes can be opened. Each affected RD is reported.
+- **LUKS passphrases.** LUKS-encrypted volumes convert with their layer stack intact (an RD whose `layer_stack` column is empty takes the stack its replicas were built with, read from `LAYER_RESOURCE_IDS`), but the per-volume key (encrypted with the LINSTOR master key) is not decrypted. blockstor opens every LUKS volume with the cluster passphrase kept in its Secret, so add that passphrase to each such volume as a key slot before adopting it: pre-flight step 7 says how. Each affected RD is reported.
 - **Backup-shipping remotes**, unknown/runtime flag bits, and DELETE'd / FAILED_DEPLOYMENT rows are skipped and reported. None affect live data availability.
 - **DRBD TCP ports** are absent from most LINSTOR 1.33 dumps — see "Capture live DRBD ports" below.
 
@@ -67,13 +67,32 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 
 6. **Rehearse on staging first.** Do a full dry-run adoption of a COPY of the pools (or a representative subset) on a non-production cluster: apply the manifests, confirm every StoragePool registers a provider (no `provider requires … in props` errors in the satellite log), every Resource reaches `UpToDate` with `out-of-sync=0` (adopted, not resynced), and no new empty zvols appear. Only after a clean staging rehearsal proceed to production.
 
+7. **Give every LUKS volume the blockstor cluster passphrase, while LINSTOR still has it open.** LINSTOR formats each LUKS volume with a key of its own, kept in its database encrypted with the master passphrase, and the converter does not decrypt it. blockstor opens every LUKS volume with the cluster passphrase in its Secret, so that passphrase has to be a key slot on each volume before adoption. Choose the cluster passphrase now, and put that exact value into blockstor's passphrase Secret before adoption (`linstor encryption create-passphrase` against blockstor, or the Secret by hand). Then, on a node where LINSTOR has the volume open:
+
+   ```bash
+   dmsetup ls --target crypt                    # find the mapper of the volume
+   dmsetup table --showkeys <mapper>            # field 5 is the volume key
+   ```
+
+   If field 5 is a hex string, it is the volume key itself. Write it as binary to a file on tmpfs and add the cluster passphrase with it; `luksAddKey` asks for the new passphrase:
+
+   ```bash
+   dmsetup table --showkeys <mapper> | awk '{print $5}' | xxd -r -p > /run/vk.bin
+   cryptsetup luksAddKey --volume-key-file /run/vk.bin <backing device>
+   shred -u /run/vk.bin
+   ```
+
+   The key slot lives in the LUKS header on that replica's backing device, so do this on every node with a diskful replica of the volume. Then check it, for each replica: `cryptsetup open --test-passphrase <backing device>` with the cluster passphrase.
+
+   If field 5 starts with `:` (`:64:logon:cryptsetup:...`), the volume was opened through the kernel keyring, which cryptsetup 2 does for LUKS2 by default, and the key cannot be read back from userspace. Such a volume cannot be given the passphrase this way: copy its data to a new volume created under blockstor instead, or keep it on LINSTOR. The volume key is the secret that decrypts the volume, so treat the file and the shell history like the passphrase itself.
+
 ## Convert
 
 ```bash
 linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifests.yaml
 ```
 
-Read the report on stderr end to end. Every `warning:` line is a thing the converter refused to guess — decide per line whether it matters for your data before continuing. In particular resolve every `LUKS passphrase NOT migrated` and every `no DRBD port` line (the latter should be empty if the port capture was complete).
+Read the report on stderr end to end. Every `warning:` line is a thing the converter refused to guess — decide per line whether it matters for your data before continuing. In particular resolve every `LUKS key NOT migrated` and every `no DRBD port` line (the latter should be empty if the port capture was complete).
 
 ## Cutover
 
@@ -103,7 +122,7 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 - Spot-check ≥5 RDs: size, per-volume `/dev/drbd<minor>`, per-replica node-id and port match the pre-migration values. A changed minor or node-id is a stop-the-line defect.
 - Every diskful replica is `UpToDate`; no replica is unexpectedly `SyncTarget`.
 - Adopted snapshots list as present without any suspend-io having fired on the parent RDs (check the satellites did not log `suspend-io`).
-- For LUKS RDs: their volumes stay closed until you provision `spec.encryption`; confirm consumers of those volumes are quiesced until then.
+- For LUKS RDs: their volumes stay closed until the cluster passphrase is added to them as a key slot; confirm consumers of those volumes are quiesced until then.
 
 ## Rollback
 
@@ -113,7 +132,7 @@ Until CSI is repointed and confirmed, rollback is: scale blockstor to 0, scale `
 
 | Item | Impact | Mitigation |
 | --- | --- | --- |
-| LUKS passphrases not migrated | Encrypted volumes cannot be opened until `spec.encryption` is provisioned | Provision by hand; keep those consumers quiesced during migration |
+| LUKS keys not migrated | Encrypted volumes cannot be opened until the cluster passphrase is a key slot on them | Add it with `cryptsetup luksAddKey`; keep those consumers quiesced during migration |
 | DRBD port not in dump (LINSTOR 1.33) | Adoption reconnects the mesh on a new port if not captured | Capture with the pre-flight command and pass `-drbd-ports` |
 | Unknown flag bits dropped | Cosmetic runtime bookkeeping only | Reported; verified not to carry availability semantics |
 | Placement/data unchanged | The converter never moves data | Rebalance with blockstor after migration if desired |

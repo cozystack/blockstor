@@ -83,7 +83,8 @@ type Server struct {
 	// Client, the first Get starts an informer over every Secret in the
 	// cluster, which needs cluster-wide list and watch on Secrets and holds
 	// all of them in memory, for the one Secret this server reads. Nil
-	// falls back to Client, which tests rely on.
+	// falls back to Client, which tests rely on. It is the manager's direct
+	// reader, so the passphrase rotation also lists definitions through it.
 	SecretReader client.Reader
 
 	// TLS, when non-nil, makes Start also bring up a mutual-TLS
@@ -337,10 +338,12 @@ func (s *Server) startTLS(ctx context.Context, handler http.Handler, errCh chan<
 //	                       oversized POST trips a 413 envelope at
 //	                       the wire edge instead of leaking the
 //	                       etcd/k8s rejection string in a 500.
+//	withPlaintextPassphraseRefusal — refuses a body that would store
+//	                       the LUKS master passphrase in a property.
 func (s *Server) handler() http.Handler {
 	mux := s.buildMux()
 
-	wrapped := withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux))))))
+	wrapped := withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, withPlaintextPassphraseRefusal(mux)))))))
 
 	// SSE bypass: the event-stream endpoints push frames over a long-
 	// lived connection, which is fundamentally incompatible with the

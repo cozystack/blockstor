@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
 // RestoreFromSnapshotProp is the marker a restored or cloned definition
@@ -160,6 +161,11 @@ func TravellingProps(props map[string]string) map[string]string {
 	delete(out, RestoreAdoptedProp)
 	delete(out, RestoreFromSnapshotProp)
 	delete(out, RestoreVolumesProp)
+	// A passphrase property left on a group or a definition from before the
+	// Secret was the only source is never read, and copying it would put the
+	// plaintext key into every definition a clone, a spawn, a snapshot or a
+	// restore creates, and into every backup of those.
+	passphrase.DropPlaintextProps(out)
 
 	return out
 }

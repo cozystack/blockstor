@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -90,6 +91,10 @@ func setProperty(accessor propertyAccessor) handler {
 		value := ""
 		if len(run.Flags.Positionals) > want {
 			value = run.Flags.Positionals[want]
+		}
+
+		if value != "" && passphrase.IsPlaintextPropKey(key) {
+			return fmt.Errorf("%w: %s", errPlaintextPassphraseProp, key)
 		}
 
 		if accessor.namedKey != nil {
@@ -251,6 +256,13 @@ func patchDefinitionProps(
 // errServerOwnedProp refuses an operator's edit of a prop blockstor sets on a
 // definition itself.
 var errServerOwnedProp = errors.New("blockstor sets this property itself")
+
+// errPlaintextPassphraseProp refuses a set-property that would store the
+// LUKS master passphrase in a property. A property is kept in plaintext on
+// its CR and blockstor never reads the passphrase from one; REST refuses the
+// same write. Deleting such a property stays allowed.
+var errPlaintextPassphraseProp = errors.New("refusing to store the LUKS master passphrase in a property, " +
+	"which is kept in plaintext on its resource; run `encryption create-passphrase`, which keeps it in a Secret")
 
 // refuseServerOwnedDefinitionProp is the named-key guard for rdProps. A
 // delete of the rollback mark goes through; see
