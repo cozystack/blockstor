@@ -36,8 +36,10 @@ func TestFormatRunsLuksFormat(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("cryptsetup isLuks /dev/sda",
 		storage.FakeResponse{Err: errFakeNotLuks})
+	fx.Expect("blkid -p -o export /dev/sda",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Format(t.Context(), "/dev/sda", []byte("supersecret"))
 	if err != nil {
@@ -61,7 +63,7 @@ func TestFormatIdempotent(t *testing.T) {
 	fx.Expect("cryptsetup isLuks /dev/sda",
 		storage.FakeResponse{Stdout: []byte("")})
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Format(t.Context(), "/dev/sda", []byte("supersecret"))
 	if err != nil {
@@ -79,7 +81,7 @@ func TestFormatIdempotent(t *testing.T) {
 func TestOpenRunsLuksOpen(t *testing.T) {
 	fx := storage.NewFakeExec()
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Open(t.Context(), "/dev/sda", "pvc-1-crypt", []byte("supersecret"))
 	if err != nil {
@@ -101,7 +103,7 @@ func TestOpenRunsLuksOpen(t *testing.T) {
 func TestCloseRunsLuksClose(t *testing.T) {
 	fx := storage.NewFakeExec()
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Close(t.Context(), "pvc-1-crypt")
 	if err != nil {
@@ -138,7 +140,7 @@ func TestDevicePath(t *testing.T) {
 // cryptsetup's audit logs and (worse) into procfs.
 func TestResizeRunsCryptsetupResize(t *testing.T) {
 	fx := storage.NewFakeExec()
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Resize(t.Context(), "pvc-grow-0-luks", []byte("supersecret"))
 	if err != nil {
@@ -187,7 +189,7 @@ func TestOpenErrorWraps(t *testing.T) {
 	fx.Expect("cryptsetup luksOpen /dev/sda pvc-1 --key-file -",
 		storage.FakeResponse{Err: errLuksFailed})
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Open(t.Context(), "/dev/sda", "pvc-1", []byte("k"))
 	if err == nil {
@@ -205,7 +207,7 @@ func TestCloseErrorWraps(t *testing.T) {
 	fx.Expect("cryptsetup luksClose pvc-1",
 		storage.FakeResponse{Err: errLuksFailed})
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Close(t.Context(), "pvc-1")
 	if err == nil {
@@ -229,7 +231,7 @@ func TestResizeErrorWraps(t *testing.T) {
 	fx.Expect("cryptsetup resize pvc-1 --key-file -",
 		storage.FakeResponse{Err: errLuksFailed})
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Resize(t.Context(), "pvc-1", []byte("k"))
 	if err == nil {

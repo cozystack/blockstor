@@ -2075,32 +2075,6 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 	return effectiveprops.Resolve(ctx, r.Client, target, rdPtr)
 }
 
-// resolveLayerStack walks the RD → RG hierarchy and returns the
-// effective layer composition. Returns nil for the dispatcher's
-// default-fall-through behaviour when nothing is set anywhere — the
-// dispatcher then defaults to whatever rd.Spec.LayerStack contains
-// (also possibly nil → satellite-side default ["DRBD","STORAGE"]).
-func (r *ResourceReconciler) resolveLayerStack(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) []string {
-	if rd == nil {
-		return nil
-	}
-
-	if len(rd.Spec.LayerStack) > 0 {
-		return rd.Spec.LayerStack
-	}
-
-	if rd.Spec.ResourceGroupName == "" {
-		return nil
-	}
-
-	var rg blockstoriov1alpha1.ResourceGroup
-	if err := r.Get(ctx, client.ObjectKey{Name: rd.Spec.ResourceGroupName}, &rg); err != nil {
-		return nil
-	}
-
-	return rg.Spec.SelectFilter.LayerStack
-}
-
 // EnsureDRBDIDsForTest is an exported alias for ensureDRBDIDs. The
 // allocator is package-private because it's an internal reconciler
 // step, but the property tests live in package controller_test and

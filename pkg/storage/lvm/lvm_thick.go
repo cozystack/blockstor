@@ -61,10 +61,39 @@ func (*Thick) Kind() string { return "LVM" }
 // integrity). See storage.ResizeZeroFiller.
 func (*Thick) ResizeZeroFills() bool { return false }
 
-// CreateVolume allocates a thick LV. Idempotent: existing LV is a no-op.
+// CreateVolume allocates a thick LV with nothing on it. Idempotent: an LV
+// already under the volume's name is the volume and is left alone.
+//
+// A thick LV is allocated without zeroing (-Wn -Zn, below), so it starts
+// with whatever the extents held: the filesystem, DRBD metadata or LUKS
+// header of a volume deleted earlier. Left there, a LUKS header is opened
+// with the cluster passphrase every volume shares and hands the new
+// volume the old one's contents, and any other signature makes the LUKS
+// layer refuse to format a volume that holds nothing. So the LV is
+// created under a temporary name (freshLVName), wiped there, and only
+// then renamed to the volume's name: nothing ever finds an unwiped LV
+// under a name it treats as a volume, this satellite after a crash or an
+// older one after a rollback. A temporary LV left by a crash was never
+// exposed, so the next call removes it and creates the LV again, at the
+// size the volume has now rather than whatever the crashed call asked.
 func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
-	if t.lvExists(ctx, volumeLVName(vol)) {
+	final := volumeLVName(vol)
+	fresh := freshLVName(final)
+
+	names, err := t.lvNames(ctx)
+	if err != nil {
+		return err
+	}
+
+	if names[final] {
 		return nil
+	}
+
+	if names[fresh] {
+		_, err = t.exec.Run(ctx, "lvremove", Args("--force", t.cfg.VolumeGroup+"/"+fresh)...)
+		if err != nil {
+			return errors.Wrapf(err, "lvremove the leftover %s", fresh)
+		}
 	}
 
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
@@ -76,16 +105,37 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	// `--config` as the device filter (ArgsUdevless) — a separate
 	// `--config activation{…}` would be a repeated `--config`, which
 	// the LVM CLI rejects.
-	_, err := t.exec.Run(ctx, "lvcreate",
+	_, err = t.exec.Run(ctx, "lvcreate",
 		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
-			"--name", volumeLVName(vol),
+			"--name", fresh,
 			"-Wn", "-Zn",
 			t.cfg.VolumeGroup)...)
 	if err != nil {
-		return errors.Wrapf(err, "lvcreate %s", volumeLVName(vol))
+		return errors.Wrapf(err, "lvcreate %s", fresh)
+	}
+
+	device := "/dev/" + t.cfg.VolumeGroup + "/" + fresh
+
+	_, err = t.exec.Run(ctx, "wipefs", "--all", "--force", device)
+	if err != nil {
+		return errors.Wrapf(err, "wipefs %s", device)
+	}
+
+	_, err = t.exec.Run(ctx, "lvrename",
+		ArgsUdevless(t.cfg.VolumeGroup, fresh, final)...)
+	if err != nil {
+		return errors.Wrapf(err, "lvrename %s to %s", fresh, final)
 	}
 
 	return nil
+}
+
+// freshLVName is where CreateVolume allocates and wipes an LV before it
+// takes the volume's name. The suffix after the last underscore is not
+// the five-digit volume number, so neither the orphan sweeper's
+// listing nor a lookup of the volume's own name ever matches it.
+func freshLVName(final string) string {
+	return final + ".bsnew"
 }
 
 // ResizeVolume grows the LV to vol.SizeKib. Bug 269 (P1): inherits
@@ -112,17 +162,22 @@ func (t *Thick) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	return nil
 }
 
-// DeleteVolume idempotently removes the LV.
+// DeleteVolume idempotently removes the LV, and a temporary LV a crashed
+// CreateVolume left for it. Nothing is wiped here: an LV that lvremove
+// refuses, because it is still open, keeps its data, and the next
+// CreateVolume over these extents wipes them anyway.
 func (t *Thick) DeleteVolume(ctx context.Context, vol storage.Volume) error {
-	if !t.lvExists(ctx, volumeLVName(vol)) {
-		return nil
-	}
+	for _, name := range []string{volumeLVName(vol), freshLVName(volumeLVName(vol))} {
+		if !t.lvExists(ctx, name) {
+			continue
+		}
 
-	_, err := t.exec.Run(ctx, "lvremove",
-		Args("--force",
-			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
-	if err != nil {
-		return errors.Wrapf(err, "lvremove %s", volumeLVName(vol))
+		_, err := t.exec.Run(ctx, "lvremove",
+			Args("--force",
+				t.cfg.VolumeGroup+"/"+name)...)
+		if err != nil {
+			return errors.Wrapf(err, "lvremove %s", name)
+		}
 	}
 
 	return nil
@@ -347,6 +402,32 @@ func (t *Thick) copyAndClearSentinel(ctx context.Context, srcName, tgtName strin
 	}
 
 	return nil
+}
+
+// lvNames lists every LV in the VG. Unlike lvExists it does not fold an
+// error into "absent": CreateVolume decides from it whether an LV is a
+// volume it must leave alone.
+func (t *Thick) lvNames(ctx context.Context) (map[string]bool, error) {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
+	out, err := t.exec.Run(ctx, "lvs",
+		Args("--noheadings",
+			"-o", "lv_name",
+			t.cfg.VolumeGroup)...)
+	if err != nil {
+		return nil, errors.Wrapf(err, "lvs %s", t.cfg.VolumeGroup)
+	}
+
+	names := make(map[string]bool)
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			names[name] = true
+		}
+	}
+
+	return names, nil
 }
 
 // lvExists is the same idempotency primitive Thin uses. Bug 270:

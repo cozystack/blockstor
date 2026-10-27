@@ -176,6 +176,44 @@ func TestRDCloneOfALUKSSourceNeedsThePassphraseWithoutALayerList(t *testing.T) {
 	}
 }
 
+// A LUKS source flagged as short of its group's stack passes its stack on
+// to no volume-less shell, but a clone of its volumes carries its encrypted
+// bytes and takes that stack all the same. Without the passphrase that is
+// refused, not written as a LUKS volume the satellite cannot open.
+func TestRDCloneOfAFlaggedLUKSSourceWithDataNeedsThePassphrase(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedCloneSourceWithStack(t, st, "src-flagged", []string{"DRBD", "LUKS", "STORAGE"})
+
+	src, err := st.ResourceDefinitions().Get(t.Context(), "src-flagged")
+	if err != nil {
+		t.Fatalf("read the seeded source: %v", err)
+	}
+
+	src.Annotations = map[string]string{apiv1.UnappliedGroupLayerStackAnnotation: "DRBD,LUKS,CACHE,STORAGE"}
+
+	if err := st.ResourceDefinitions().Update(t.Context(), &src); err != nil {
+		t.Fatalf("flag the source: %v", err)
+	}
+
+	base, stop := startServerCustom(t, &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    newFakeRESTClient(t),
+		Namespace: testRESTNamespace,
+	})
+	defer stop()
+
+	if code := cloneOnce(t, base, "src-flagged", "dst-flagged", nil); code != http.StatusBadRequest {
+		t.Errorf("clone with data of a flagged LUKS source and no passphrase = %d, want 400", code)
+	}
+
+	if _, err := st.ResourceDefinitions().Get(t.Context(), "dst-flagged"); err == nil {
+		t.Error("the refused clone wrote its target")
+	}
+}
+
 // The replay of a finished LUKS clone writes no new LUKS volume, so a
 // passphrase Secret that cannot be read at that moment does not fail it: a
 // driver that lost the first answer would otherwise be refused a clone that

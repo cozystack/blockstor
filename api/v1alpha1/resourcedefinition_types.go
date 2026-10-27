@@ -25,6 +25,8 @@ import (
 // ResourceDefinitionSpec is the desired state of a LINSTOR
 // ResourceDefinition — the named entity from which Resource (replica)
 // instances are spawned. linstor-csi creates one per PVC.
+//
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.layerStack) || size(oldSelf.layerStack) == 0 || (has(self.layerStack) && size(self.layerStack) > 0)",message="layerStack is decided once: it may be set or replaced, never emptied"
 type ResourceDefinitionSpec struct {
 	// externalName is the user-facing name surfaced by csi (CSI volume id).
 	// Empty means the same as metadata.name.
@@ -73,8 +75,10 @@ type ResourceDefinitionSpec struct {
 	// Order is top-down: the first layer's device is what the
 	// consumer Pod mounts, the last is the raw block device the
 	// storage provider creates.
-	// Empty = inherits from the parent ResourceGroup; both empty =
-	// `["DRBD","STORAGE"]`.
+	// Empty means not decided yet: the controller fixes it once, from
+	// the parent ResourceGroup's stack for a definition that holds no
+	// data, and the satellite builds nothing until it is set. Once set it
+	// is never emptied. See docs/layer-stack.md.
 	// +optional
 	LayerStack []string `json:"layerStack,omitempty"`
 

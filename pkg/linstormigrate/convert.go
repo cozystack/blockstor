@@ -128,6 +128,10 @@ type converter struct {
 	drbdNode  map[replicaKey]*int32                     // node-id by (node, rd)
 	storVol   map[volumeReplicaKey]LayerStorageVolumeRow
 	luksVol   map[volumeReplicaKey]LayerLuksVolumeRow
+	// diskStacks is the layer stack each live replica of an RD was
+	// actually built with, read off its LAYER_RESOURCE_IDS chain: by
+	// resource_name, then by the joined stack, to the stack itself.
+	diskStacks map[string]map[string][]string
 
 	// referential-integrity sets, populated as each kind converts so
 	// later kinds can drop rows that would dangle (a replica of a
@@ -209,6 +213,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		drbdNode:          map[replicaKey]*int32{},
 		storVol:           map[volumeReplicaKey]LayerStorageVolumeRow{},
 		luksVol:           map[volumeReplicaKey]LayerLuksVolumeRow{},
+		diskStacks:        map[string]map[string][]string{},
 		convertedRD:       map[string]bool{},
 		convertedNode:     map[string]bool{},
 		convertedRG:       map[string]bool{},
@@ -366,6 +371,8 @@ func (c *converter) buildLayerInstanceIndexes() {
 		return lri, true
 	}
 
+	c.indexDiskStacks()
+
 	for i := range c.dump.LayerDrbdResources {
 		row := &c.dump.LayerDrbdResources[i]
 		if lri, ok := baseLayer(row.LayerResourceID); ok {
@@ -385,6 +392,98 @@ func (c *converter) buildLayerInstanceIndexes() {
 		if lri, ok := baseLayer(row.LayerResourceID); ok {
 			c.luksVol[volumeReplicaKey{node: lri.NodeName, rd: lri.ResourceName, vlmNr: row.VlmNr}] = *row
 		}
+	}
+}
+
+// indexDiskStacks reads the layer stack every live replica was built
+// with off LAYER_RESOURCE_IDS: the replica's root layer (no parent),
+// then each base-suffix child down to STORAGE. The RD row's own
+// layer_stack is only what was asked for at creation, and is often
+// empty, LINSTOR having resolved the stack per resource; this chain is
+// what is on disk. A diskless replica is left out: LINSTOR builds it as
+// DRBD over STORAGE whatever the definition's stack, so it says nothing
+// about how the data was written.
+func (c *converter) indexDiskStacks() {
+	rows := c.dump.LayerResourceIDs
+	children := map[int32]LayerResourceIDRow{}
+
+	diskless := map[replicaKey]bool{}
+
+	for i := range c.dump.Resources {
+		res := &c.dump.Resources[i]
+		if res.SnapshotName == "" && res.ResourceFlags&resourceFlagDiskless != 0 {
+			diskless[replicaKey{node: res.NodeName, rd: res.ResourceName}] = true
+		}
+	}
+
+	for i := range rows {
+		if rows[i].LayerResourceParentID != nil && rows[i].LayerResourceSuffix == "" {
+			children[*rows[i].LayerResourceParentID] = rows[i]
+		}
+	}
+
+	for i := range rows {
+		row := rows[i]
+		if row.LayerResourceParentID != nil || row.SnapshotName != "" || row.LayerResourceSuffix != "" {
+			continue
+		}
+
+		if diskless[replicaKey{node: row.NodeName, rd: row.ResourceName}] {
+			continue
+		}
+
+		var stack []string
+
+		// Bounded by the row count, so a corrupt chain that loops ends.
+		for cur, ok := row, true; ok && len(stack) <= len(rows); cur, ok = children[cur.LayerResourceID] {
+			stack = append(stack, cur.LayerResourceKind)
+		}
+
+		if c.diskStacks[row.ResourceName] == nil {
+			c.diskStacks[row.ResourceName] = map[string][]string{}
+		}
+
+		c.diskStacks[row.ResourceName][strings.Join(stack, ",")] = stack
+	}
+}
+
+// rdLayerStack is the layer stack a converted RD carries. An RD row
+// that names one keeps it; an empty one takes the stack its replicas
+// were built with, so the satellite adopts each volume as it is rather
+// than as the default, and the group's stack, which blockstor would
+// otherwise pin, is never laid over data built without it. Replicas
+// that disagree, or a stack the replicas were not built with, are
+// reported for the operator to settle before adopting.
+func (c *converter) rdLayerStack(row *ResourceDefinitionRow, dsp string) []string {
+	stack := c.parseList(row.LayerStack, "resource definition "+dsp+" layer_stack")
+	onDisk := c.diskStacks[row.ResourceName]
+
+	keys := make([]string, 0, len(onDisk))
+	for key := range onDisk {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	if len(stack) > 0 {
+		for _, key := range keys {
+			if key != strings.Join(stack, ",") {
+				c.warnf("resource definition %s: layer stack %s, but a replica was built as %s — that replica will not come up as it is", dsp, strings.Join(stack, ","), key)
+			}
+		}
+
+		return stack
+	}
+
+	switch len(keys) {
+	case 0:
+		return nil
+	case 1:
+		return slices.Clone(onDisk[keys[0]])
+	default:
+		c.warnf("resource definition %s: no layer stack of its own, and its replicas were built as %s — left unset; set spec.layerStack before adopting", dsp, strings.Join(keys, " and "))
+
+		return nil
 	}
 }
 
@@ -937,7 +1036,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 				Props:             residual,
 				DRBDOptions:       typed,
 				ExtraProps:        extra,
-				LayerStack:        c.parseList(row.LayerStack, "resource definition "+dsp+" layer_stack"),
+				LayerStack:        c.rdLayerStack(row, dsp),
 				// The volumes already hold committed data in the source
 				// cluster: latch Initialized so any replica added AFTER
 				// the migration must SyncTarget the real data instead of
@@ -1191,9 +1290,10 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 		// LAYER_LUKS_VOLUMES carries the volume passphrase encrypted
 		// with the LINSTOR master key; decrypting it needs the
 		// operator's master passphrase and LINSTOR's KDF, which this
-		// converter does not implement yet. The layer stack is
-		// preserved, but the volume cannot be opened until the
-		// passphrase is provisioned into blockstor by hand.
+		// converter does not implement yet. The layer stack carries
+		// LUKS (rdLayerStack reads it off the replicas when the RD
+		// row leaves it empty), but the volume cannot be opened until
+		// the passphrase is provisioned into blockstor by hand.
 		c.warnf("resource definition %s: LUKS passphrase NOT migrated (encrypted with the LINSTOR master key) — provision spec.encryption manually before adopting", dsp)
 	}
 }
