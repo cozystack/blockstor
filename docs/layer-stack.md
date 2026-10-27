@@ -125,12 +125,12 @@ spec:
 
 Before this release a passphrase property won over the Secret: `DrbdOptions/EncryptPassphrase` on the controller, or `DrbdOptions/Encryption/passphrase` on a group or a definition. LUKS volumes created while one was set were formatted with its value. From this release on the satellite opens them with the Secret's value only, and logs `ignoring LUKS passphrase properties` with the keys it dropped. Do this before the upgrade.
 
-1. Find the properties. Their values are redacted on the REST API, so read the CRs:
+1. Find the properties. Their values are redacted on the REST API, so read the CRs. The store keeps a `DrbdOptions/*` key in `spec.extraProps`, not in `spec.props`, so read both maps, on groups, definitions and replicas, and the controller's own:
 
    ```sh
    kubectl get controllerconfigs.blockstor.cozystack.io -o jsonpath='{.items[*].spec.extraProps}'
-   kubectl get resourcegroups.blockstor.cozystack.io,resourcedefinitions.blockstor.cozystack.io -o json \
-     | jq -r '.items[] | select(.spec.props // {} | keys | any(test("passphrase|Passphrase"))) | .metadata.name'
+   kubectl get resourcegroups.blockstor.cozystack.io,resourcedefinitions.blockstor.cozystack.io,resources.blockstor.cozystack.io -o json \
+     | jq -r '.items[] | select((.spec.props // {}) + (.spec.extraProps // {}) | keys | any(test("passphrase"; "i"))) | "\(.kind)/\(.metadata.name)"'
    ```
 
 2. Make the Secret open every LUKS volume:
@@ -142,15 +142,19 @@ Before this release a passphrase property won over the Secret: `DrbdOptions/Encr
        --from-literal=passphrase='<the property value>' --dry-run=client -o yaml | kubectl apply -f -
      ```
 
-   - **Per-definition or per-group values, or a Secret that some volumes were formatted with**: the volumes use different keys, so no single Secret value opens them all. Add the Secret's value to each LUKS device that was formatted with another key, on every node with a replica, with `cryptsetup luksAddKey <device>`; it asks for the key the device has now.
+   - **Per-group, per-definition or per-replica values, or a Secret that some volumes were formatted with**: the volumes use different keys, so no single Secret value opens them all. Add the Secret's value to each LUKS device that was formatted with another key, on every node with a replica, with `cryptsetup luksAddKey <device>`; it asks for the key the device has now.
 
-3. Delete the properties, so the plaintext value leaves the CRs and the next backup:
+3. Delete every key step 1 found, on the object it was found on, so the plaintext value leaves the CRs and the next backup. The controller can hold the canonical key and the alias both:
 
    ```sh
    linstor controller set-property DrbdOptions/EncryptPassphrase ""
-   linstor resource-group set-property <group> DrbdOptions/Encryption/passphrase ""
-   linstor resource-definition set-property <definition> DrbdOptions/Encryption/passphrase ""
+   linstor controller set-property DrbdOptions/Encryption/passphrase ""
+   linstor resource-group set-property <group> <key> ""
+   linstor resource-definition set-property <definition> <key> ""
+   linstor resource set-property <node> <resource> <key> ""
    ```
+
+   Groups and definitions no longer pass such a key on to what is cloned, spawned, snapshotted or restored from them, but the copies made before the upgrade carry it, so step 1 finds those too.
 
 A volume missed in step 2 fails to open on the next satellite restart or mapper close; the satellite log line names the property it was formatted with.
 
