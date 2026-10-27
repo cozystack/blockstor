@@ -153,39 +153,46 @@ func TestADisklessReplicaDoesNotShapeTheStack(t *testing.T) {
 	}
 }
 
-// Replicas built two ways leave nothing to read: the stack stays unset
-// and the operator is told which ways.
-func TestReplicasThatDisagreeLeaveTheStackUnset(t *testing.T) {
+// A definition whose replicas cannot be adopted under one stack is not
+// converted, nor are its replicas: adopted as it is, a replica would come up
+// under a stack it was not built with, DRBD metadata over a LUKS volume's
+// ciphertext among them. Both shapes are refused and named: replicas built
+// two ways under a row with no stack, and a replica built otherwise than the
+// stack the row names.
+func TestADefinitionWhoseReplicasDisagreeOnTheStackIsNotConverted(t *testing.T) {
 	t.Parallel()
 
-	got, res := convertedStack(t, stackDump("[]",
-		layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")))
-	if len(got) != 0 {
-		t.Fatalf("stack %v, want unset", got)
-	}
+	for name, tc := range map[string]struct {
+		rowStack, reason string
+	}{
+		"replicas built two ways": {rowStack: "[]", reason: "built as DRBD,LUKS,STORAGE and DRBD,STORAGE"},
+		"a replica built otherwise": {
+			rowStack: `["DRBD","LUKS","STORAGE"]`, reason: "a replica was built as DRBD,STORAGE",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	if !hasWarning(res, "built as DRBD,LUKS,STORAGE and DRBD,STORAGE") {
-		t.Errorf("disagreement not reported; warnings %v", res.Warnings)
-	}
-}
+			res, err := Convert(stackDump(tc.rowStack,
+				layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")))
+			if err != nil {
+				t.Fatalf("Convert: %v", err)
+			}
 
-// A stack the RD row names is kept, and a replica built otherwise is
-// reported: the satellite would try to rebuild it.
-func TestAReplicaBuiltOtherwiseThanItsRDIsReported(t *testing.T) {
-	t.Parallel()
+			for i := range res.ResourceDefinitions {
+				if res.ResourceDefinitions[i].Name == "pvc-s" {
+					t.Fatalf("pvc-s converted with stack %v", res.ResourceDefinitions[i].Spec.LayerStack)
+				}
+			}
 
-	got, res := convertedStack(t, stackDump(`["DRBD","LUKS","STORAGE"]`,
-		layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")))
-	if !slices.Equal(got, []string{"DRBD", "LUKS", "STORAGE"}) {
-		t.Fatalf("stack %v, want the RD row's", got)
-	}
+			if len(res.Resources) != 0 {
+				t.Errorf("%d replicas of a skipped definition converted", len(res.Resources))
+			}
 
-	if !hasWarning(res, "a replica was built as DRBD,STORAGE") {
-		t.Errorf("mismatch not reported; warnings %v", res.Warnings)
-	}
-
-	if hasWarning(res, "a replica was built as DRBD,LUKS,STORAGE") {
-		t.Errorf("a matching replica was reported; warnings %v", res.Warnings)
+			if !hasWarning(res, tc.reason) || !hasWarning(res, "skipped with its replicas") {
+				t.Errorf("the refusal does not name %q; warnings %v", tc.reason, res.Warnings)
+			}
+		})
 	}
 }
 

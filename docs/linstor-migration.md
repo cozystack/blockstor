@@ -11,6 +11,7 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 **NOT migrated — read the report on stderr for the exact list per cluster:**
 
 - **LUKS passphrases.** LUKS-encrypted volumes convert with their layer stack intact (an RD whose `layer_stack` column is empty takes the stack its replicas were built with, read from `LAYER_RESOURCE_IDS`), but the per-volume passphrase (encrypted with the LINSTOR master key) is not decrypted. You must provision `spec.encryption` for those RDs by hand before the encrypted volumes can be opened. Each affected RD is reported.
+- **Definitions whose replicas disagree on the layer stack** are skipped with their replicas and reported: replicas built two ways under a definition with no stack of its own, or a replica built otherwise than the stack the definition names. Adopted as they are, such a replica would be brought up under a stack it was not built with, DRBD metadata over a LUKS volume's ciphertext for one. Settle the stack in LINSTOR and convert again.
 - **Backup-shipping remotes**, unknown/runtime flag bits, and DELETE'd / FAILED_DEPLOYMENT rows are skipped and reported. None affect live data availability.
 - **DRBD TCP ports** are absent from most LINSTOR 1.33 dumps — see "Capture live DRBD ports" below.
 
