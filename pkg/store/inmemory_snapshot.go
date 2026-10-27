@@ -20,6 +20,7 @@ package store
 
 import (
 	"context"
+	"maps"
 	"sort"
 	"sync"
 
@@ -131,6 +132,37 @@ func (s *inMemorySnapshots) Update(_ context.Context, snap *apiv1.Snapshot) erro
 	// Mirrors the k8s store's mergeUserAnnotationsInto contract.
 	next.Annotations = carryAnnotationsOnNil(next.Annotations, prev.Annotations)
 	s.m[key] = next
+
+	return nil
+}
+
+// PatchSnapshotProps runs mutate under the store's lock, so no other writer
+// can come between the read it decides on and the write.
+func (s *inMemorySnapshots) PatchSnapshotProps(
+	_ context.Context, rdName, snapName string, mutate func(map[string]string) error,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := snapKey{rdName, snapName}
+
+	snap, ok := s.m[key]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "snapshot %q on resource definition %q", snapName, rdName)
+	}
+
+	props := maps.Clone(snap.Props)
+	if props == nil {
+		props = map[string]string{}
+	}
+
+	err := mutate(props)
+	if err != nil {
+		return err
+	}
+
+	snap.Props = props
+	s.m[key] = snap
 
 	return nil
 }
