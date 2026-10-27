@@ -19,8 +19,11 @@ limitations under the License.
 package controllers
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -274,5 +277,29 @@ func TestBug023InjectionHonoursSecretRef(t *testing.T) {
 
 	if got := effectiveProps[passphrase.PropKeyCanonical]; got != "custom-secret" {
 		t.Errorf("SecretRef lookup: got %q, want custom-secret", got)
+	}
+}
+
+// The operator docs send someone whose LUKS volume no longer opens to the
+// satellite log, so the line naming the ignored properties has to be there,
+// with the keys and never the value.
+func TestBug023IgnoredPassphrasePropsAreLogged(t *testing.T) {
+	t.Parallel()
+
+	var lines []string
+
+	logger := funcr.New(func(prefix, args string) { lines = append(lines, args) }, funcr.Options{})
+	ctx := logr.NewContext(t.Context(), logger)
+
+	r := newPassphraseTestReconciler(t)
+	r.injectLUKSMasterPassphrase(ctx, luksRD(), map[string]string{passphrase.PropKeyLegacy: "plaintext-canary"})
+
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "ignoring LUKS passphrase properties") || !strings.Contains(joined, passphrase.PropKeyLegacy) {
+		t.Errorf("log %q does not name the ignored property", joined)
+	}
+
+	if strings.Contains(joined, "plaintext-canary") {
+		t.Errorf("log %q carries the passphrase value", joined)
 	}
 }
