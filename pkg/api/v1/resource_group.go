@@ -97,8 +97,9 @@ type AutoSelectFilter struct {
 	OverrideVlmID           string           `json:"override_vlm_id,omitempty"`
 }
 
-// ResourceGroupSpawn is the payload for POST /resource-groups/{rg}/spawn —
-// the call linstor-csi uses to actually create a Resource from a group.
+// ResourceGroupSpawn is the payload for POST /resource-groups/{rg}/spawn,
+// behind `linstor rg spawn`: it creates a definition, its volumes and,
+// unless definitions_only is set, its replicas from a group.
 // The props-modify fields are declared so the decoder can name them, and a
 // non-empty one is refused: a spawn creates the definition, there are no
 // props on it to modify yet.
