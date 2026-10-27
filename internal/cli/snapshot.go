@@ -730,6 +730,14 @@ func volumeAlreadyRestored(ctx context.Context, run *runContext, rdName string, 
 func rollbackRestore(
 	ctx context.Context, run *runContext, rdName string, planned []apiv1.Resource, cause error,
 ) error {
+	// The rollback runs on a budget of its own, like the REST door's. A retry
+	// takes over an in-progress mark older than store.StaleRollbackAfter on
+	// the grounds that nobody is behind it; a CLI rollback without a
+	// deadline could still be, and could then take apart a definition the
+	// retry had answered for.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), store.CLIRollbackBudget)
+	defer cancel()
+
 	err := store.HoldRollback(ctx, run.Store, rdName, true)
 	if errors.Is(err, store.ErrRollbackGone) {
 		return cause
