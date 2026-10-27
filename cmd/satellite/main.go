@@ -58,34 +58,13 @@ func main() {
 // only ever calls os.Exit(run()) so there are no defers in the same frame
 // as the os.Exit call.
 func run() int {
-	var (
-		nodeName            string
-		stateDir            string
-		probeAddr           string
-		controllerNamespace string
-		streamTLS           stream.TLSFiles
-	)
+	opts, err := parseFlags(flag.CommandLine, os.Args[1:])
 
-	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"),
-		"name this satellite registers under (defaults to NODE_NAME env)")
-	flag.StringVar(&stateDir, "state-dir", "/var/lib/blockstor-satellite",
-		"directory the satellite uses to persist DRBD .res files and per-resource state")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
-		"The address the /healthz and /readyz probe endpoints bind to.")
-	flag.StringVar(&controllerNamespace, "controller-namespace", "",
-		"Namespace where the controller's Secrets (cluster master passphrase) live (default: $POD_NAMESPACE, then 'blockstor-system').")
-
-	flag.StringVar(&streamTLS.CertFile, "stream-tls-cert-file", "",
-		"PEM certificate this satellite presents on the snapshot stream, for both server and client auth (cert-manager tls.crt).")
-	flag.StringVar(&streamTLS.KeyFile, "stream-tls-key-file", "",
-		"PEM key for --stream-tls-cert-file (cert-manager tls.key).")
-	flag.StringVar(&streamTLS.CAFile, "stream-tls-ca-file", "",
-		"PEM CA bundle every peer satellite's stream certificate is verified against (cert-manager ca.crt). "+
-			"With none of the three set the snapshot stream is off and cross-node clone and restore fall back to a DRBD resync.")
-
-	flag.Parse()
-
-	controllerNamespace = resolveControllerNamespace(controllerNamespace)
+	nodeName := opts.nodeName
+	stateDir := opts.stateDir
+	probeAddr := opts.probeAddr
+	controllerNamespace := resolveControllerNamespace(opts.controllerNamespace)
+	streamTLS := opts.streamTLS
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -98,9 +77,8 @@ func run() int {
 	// disappear).
 	ctrl.SetLogger(logr.FromSlogHandler(logger.Handler()))
 
-	err := streamTLS.Validate()
 	if err != nil {
-		logger.Error("invalid snapshot stream TLS flags", "err", err)
+		logger.Error("invalid flags", "err", err)
 
 		return 1
 	}
