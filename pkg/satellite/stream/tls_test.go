@@ -32,6 +32,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -383,5 +384,26 @@ func TestStreamClientPicksUpARotatedCertificate(t *testing.T) {
 	_, err := client.Fetch(t.Context(), addr, "rd", "snap", 0)
 	if !strings.Contains(fmt.Sprint(err), "has no snapshot") {
 		t.Fatalf("the rotated client certificate was not presented: %v", err)
+	}
+}
+
+// During a rolling upgrade a new satellite fetches from an old one that
+// still serves the stream in plain HTTP. The old server would answer 404
+// for a snapshot it does not hold, and a 404 read as storage.ErrNotFound
+// sends the restore to a blank volume. The fetch has to fail on the
+// handshake instead, so the restore retries until the peer is upgraded.
+func TestStreamFetchFromAPlainServerIsNotANotFound(t *testing.T) {
+	t.Parallel()
+
+	old := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(old.Close)
+
+	addr := strings.TrimPrefix(old.URL, "http://")
+
+	ca := newTestCA(t)
+
+	_, err := NewClient(ca.issue(t, ServerName)).Fetch(t.Context(), addr, "rd", "snap", 0)
+	if err == nil || errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("fetch from a plain HTTP server = %v, want an error that is not storage.ErrNotFound", err)
 	}
 }
