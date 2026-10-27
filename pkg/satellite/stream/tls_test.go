@@ -407,3 +407,36 @@ func TestStreamFetchFromAPlainServerIsNotANotFound(t *testing.T) {
 		t.Fatalf("fetch from a plain HTTP server = %v, want an error that is not storage.ErrNotFound", err)
 	}
 }
+
+// A full set of files that does not load refuses to start, as the
+// apiserver does on bad TLS material, instead of failing every cross-node
+// restore on the node later.
+func TestStreamTLSValidateLoadsTheFiles(t *testing.T) {
+	t.Parallel()
+
+	ca := newTestCA(t)
+
+	good := ca.issue(t, ServerName)
+	if err := good.Validate(); err != nil {
+		t.Fatalf("a valid set = %v, want nil", err)
+	}
+
+	mismatched := good
+	mismatched.KeyFile = ca.issue(t, ServerName).KeyFile
+
+	missing := good
+	missing.CAFile = filepath.Join(t.TempDir(), "ca.crt")
+
+	emptyCA := ca.issue(t, ServerName)
+	writeFile(t, emptyCA.CAFile, []byte("no certificate here\n"))
+
+	for name, files := range map[string]TLSFiles{
+		"a key for another certificate": mismatched,
+		"a missing CA bundle":           missing,
+		"a CA bundle with no cert":      emptyCA,
+	} {
+		if err := files.Validate(); err == nil {
+			t.Errorf("%s: Validate = nil, want an error", name)
+		}
+	}
+}

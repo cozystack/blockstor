@@ -58,7 +58,11 @@ func (f TLSFiles) Configured() bool {
 	return f.CertFile != "" && f.KeyFile != "" && f.CAFile != ""
 }
 
-// Validate refuses a configuration with some of the files set and not all.
+// Validate refuses a configuration with some of the files set and not all,
+// and a full set whose files do not load: an unreadable file or a key that
+// does not match the certificate would otherwise start fine and fail every
+// cross-node restore on the node. The files are still read again on every
+// handshake; this is a check at startup only.
 func (f TLSFiles) Validate() error {
 	if f.CertFile == "" && f.KeyFile == "" && f.CAFile == "" {
 		return nil
@@ -68,7 +72,9 @@ func (f TLSFiles) Validate() error {
 		return ErrTLSIncomplete
 	}
 
-	return nil
+	_, _, err := f.load()
+
+	return err
 }
 
 func (f TLSFiles) load() (tls.Certificate, *x509.CertPool, error) {
