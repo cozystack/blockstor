@@ -308,6 +308,18 @@ func main() {
 	}
 
 	if enableRestAPI {
+		exposed, err := checkPlainBindAddress(restAddr)
+		if err != nil {
+			setupLog.Error(err, "Invalid plain-HTTP listener address")
+			os.Exit(1)
+		}
+
+		if exposed {
+			setupLog.Info("WARNING: the plain-HTTP listener serves the whole API without a client "+
+				"certificate and is bound off loopback; any pod that can reach this address can use it",
+				"address", restAddr)
+		}
+
 		ready.ArmREST()
 
 		if err := mgr.Add(&rest.Server{

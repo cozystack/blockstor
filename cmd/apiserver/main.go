@@ -193,6 +193,17 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 		return errors.Wrap(err, "add readyz check")
 	}
 
+	exposed, err := checkPlainBindAddress(flags.restAddr)
+	if err != nil {
+		return err
+	}
+
+	if exposed {
+		ctrl.Log.WithName("setup").Info("WARNING: the plain-HTTP listener serves the whole API without a "+
+			"client certificate and is bound off loopback; any pod that can reach this address can use it",
+			"address", flags.restAddr)
+	}
+
 	err = mgr.Add(&rest.Server{
 		Addr:      flags.restAddr,
 		TLS:       tlsOptions(flags),
