@@ -348,7 +348,7 @@ func (r *PhysicalDeviceReconciler) recordAttachedKName(ctx context.Context, dev 
 
 	for i := range pools.Items {
 		p := &pools.Items[i]
-		if p.Spec.PoolName == poolName && p.Spec.NodeName == r.Config.NodeName {
+		if p.Spec.PoolName == poolName && isNode(p.Spec.NodeName, r.Config.NodeName) {
 			target = p
 
 			break
@@ -636,7 +636,7 @@ func (r *PhysicalDeviceReconciler) targetPoolExists(ctx context.Context, poolNam
 
 	for i := range poolList.Items {
 		if poolList.Items[i].Spec.PoolName == poolName &&
-			poolList.Items[i].Spec.NodeName == r.Config.NodeName {
+			isNode(poolList.Items[i].Spec.NodeName, r.Config.NodeName) {
 			return true, nil
 		}
 	}

@@ -336,7 +336,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+		if sameDefinition(resList.Items[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			peers = append(peers, resList.Items[i])
 		}
 	}
@@ -1761,7 +1761,7 @@ func (r *ResourceReconciler) hostingNodesForRD(ctx context.Context, rdName strin
 	out := make([]string, 0, len(list.Items))
 
 	for i := range list.Items {
-		if list.Items[i].Spec.ResourceDefinitionName != rdName {
+		if !isReplicaOf(&list.Items[i], rdName) {
 			continue
 		}
 
@@ -2241,7 +2241,7 @@ func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *bl
 			continue
 		}
 
-		if res.Spec.ResourceDefinitionName != target.Spec.ResourceDefinitionName {
+		if !sameDefinition(res.Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			continue
 		}
 
@@ -2310,7 +2310,7 @@ func (r *ResourceReconciler) requestsForRD(ctx context.Context, rdName, excludeN
 	out := make([]reconcile.Request, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName != rdName {
+		if !sameDefinition(resList.Items[i].Spec.ResourceDefinitionName, rdName) {
 			continue
 		}
 

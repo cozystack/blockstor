@@ -161,7 +161,7 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Wrap(err, "get Resource")
 	}
 
-	if res.Spec.NodeName != r.Config.NodeName {
+	if !isNode(res.Spec.NodeName, r.Config.NodeName) {
 		// Predicate should have filtered this out — defensive
 		// check in case the watch cache is mid-resync.
 		return ctrl.Result{}, nil
@@ -420,7 +420,7 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 	for i := range localList.Items {
 		local := &localList.Items[i]
 		if local.Spec.ResourceDefinitionName == rd.Name &&
-			local.Spec.NodeName == r.Config.NodeName {
+			isNode(local.Spec.NodeName, r.Config.NodeName) {
 			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
 		}
 	}
@@ -1025,7 +1025,7 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 
 	// Ignore events for the local Resource itself — `For` already
 	// drives that path through nodeNamePredicate.
-	if res.Spec.NodeName == r.Config.NodeName {
+	if isNode(res.Spec.NodeName, r.Config.NodeName) {
 		return nil
 	}
 
@@ -1039,7 +1039,7 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 	for i := range localList.Items {
 		local := &localList.Items[i]
 		if local.Spec.ResourceDefinitionName == res.Spec.ResourceDefinitionName &&
-			local.Spec.NodeName == r.Config.NodeName {
+			isNode(local.Spec.NodeName, r.Config.NodeName) {
 			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
 		}
 	}
@@ -1598,11 +1598,11 @@ func volumeNumbersFromStatus(res *blockstoriov1alpha1.Resource) []int32 {
 func nodeNamePredicate(nodeName string) predicate.Predicate {
 	matches := func(obj client.Object) bool {
 		if r, ok := obj.(*blockstoriov1alpha1.Resource); ok {
-			return r.Spec.NodeName == nodeName
+			return isNode(r.Spec.NodeName, nodeName)
 		}
 
 		if sp, ok := obj.(*blockstoriov1alpha1.StoragePool); ok {
-			return sp.Spec.NodeName == nodeName
+			return isNode(sp.Spec.NodeName, nodeName)
 		}
 
 		return false

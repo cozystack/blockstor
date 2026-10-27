@@ -42,6 +42,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // Bug148ResizePendingAnnotationPrefix is the per-volume annotation
@@ -683,7 +684,7 @@ func (r *ResourceDefinitionReconciler) listReplicasDirect(ctx context.Context, r
 	out := make([]apiv1.Resource, 0, len(crdList.Items))
 
 	for i := range crdList.Items {
-		if crdList.Items[i].Spec.ResourceDefinitionName != rdName {
+		if !isReplicaOf(&crdList.Items[i], rdName) {
 			continue
 		}
 
@@ -1655,7 +1656,7 @@ func (r *ResourceDefinitionReconciler) stampResizePending(ctx context.Context, r
 	}
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName != rd.Name {
+		if !isReplicaOf(&resList.Items[i], rd.Name) {
 			continue
 		}
 
@@ -1904,6 +1905,8 @@ func (r *ResourceDefinitionReconciler) enqueueRDForResource(_ context.Context, o
 	}
 
 	return []reconcile.Request{
-		{NamespacedName: types.NamespacedName{Name: res.Spec.ResourceDefinitionName}},
+		// The RD CR lives under the folded name; the replica keeps the
+		// spelling it was written with.
+		{NamespacedName: types.NamespacedName{Name: k8s.Name(res.Spec.ResourceDefinitionName)}},
 	}
 }
