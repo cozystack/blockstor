@@ -204,11 +204,13 @@ spec:
             # Satellite-to-satellite snapshot stream (cross-node clone),
             # HTTPS with mutual TLS. The receiving satellite GETs the
             # raw byte stream from a peer that hosts the snapshot
-            # locally; without this port open peers see ECONNREFUSED
-            # and cross-node clone falls back to DRBD initial-sync. hostNetwork=true means this
-            # is the node's real port — must stay outside the DRBD
-            # range (7000-7999), every LINSTOR port and node-exporter's
-            # 9100 (see stream.Port).
+            # locally. With this port closed a peer gets a connection
+            # error, tries the other nodes that hold the snapshot and
+            # retries the restore when none answers; only a satellite
+            # with no stream TLS falls back to a DRBD initial sync.
+            # hostNetwork=true means this is the node's real port, so it
+            # must stay outside the DRBD range (7000-7999), every LINSTOR
+            # port and node-exporter's 9100 (see stream.Port).
             - name: snap-stream
               containerPort: 3372
               hostPort: 3372
