@@ -25,6 +25,9 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -66,5 +69,43 @@ func TestPassphraseModifyIsRefusedWhileLUKSVolumesExist(t *testing.T) {
 
 	if oldResp.StatusCode != http.StatusOK {
 		t.Errorf("the old passphrase no longer unlocks after a refused rotation: %d", oldResp.StatusCode)
+	}
+}
+
+// The guard asks the API server, not the cache: a LUKS definition the
+// cache has not seen yet still stops the rotation.
+func TestPassphraseModifyAsksTheAPIServerForLUKSVolumes(t *testing.T) {
+	cli := newFakeRESTClient(t)
+	ctx := t.Context()
+
+	if err := cli.Create(ctx, testPassphraseSecret("old-secret")); err != nil {
+		t.Fatalf("seed the Secret: %v", err)
+	}
+
+	if err := cli.Create(ctx, &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-new-luks"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			LayerStack: []string{apiv1.LayerKindDRBD, apiv1.LayerKindLUKS, apiv1.LayerKindStorage},
+		},
+	}); err != nil {
+		t.Fatalf("seed the definition: %v", err)
+	}
+
+	base, stop := startServerCustom(t, &Server{
+		Addr:         pickFreeAddr(t),
+		Store:        store.NewInMemory(),
+		Client:       cli,
+		SecretReader: cli,
+		Namespace:    testRESTNamespace,
+	})
+	defer stop()
+
+	body, _ := json.Marshal(map[string]string{"old_passphrase": "old-secret", "new_passphrase": "new-secret"})
+	resp := httpPut(t, base+"/v1/encryption/passphrase", body)
+	got, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(got), "pvc-new-luks") {
+		t.Fatalf("modify: got %d %s, want 409 naming the definition the cache has not seen", resp.StatusCode, got)
 	}
 }
