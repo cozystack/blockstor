@@ -86,10 +86,11 @@ Never delete the last replica that is `UpToDate`. `blockstor resource delete` re
 
 ## Metadata re-created after an unclean shutdown
 
-The symptom is a replica that was the only copy, and after a node reboot comes back empty and starts a full sync from a peer, or has nothing to sync from. Look at the satellite log on that node:
+The symptom is a replica that was the only copy, and after a node reboot comes back without its generation identifiers and bitmap: it starts a full sync from a peer, or has nothing to sync from. The satellite log does not show the cause. The satellite does not log the `drbdadm` and `drbdmeta` commands it runs, and re-creating the metadata succeeds without a message; only a failed `dump-md` or `create-md` shows up, inside an error. What tells you whether it can have happened is whether a satellite pod started on the node after the node came back:
 
 ```sh
-kubectl -n blockstor-system logs $POD -c satellite | grep -i -E 'create-md|apply-al|dump-md'
+kubectl -n blockstor-system get $POD -o jsonpath='{.status.startTime}{"\n"}'
+kubectl get node <node> -o jsonpath='{.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}'
 ```
 
 Before it creates DRBD metadata, the satellite probes the device with `drbdadm dump-md`. If the probe answers that metadata is present but its activity log needs applying, which is what an unclean shutdown of a writing `Primary` leaves behind, the current release treats that as missing metadata, creates it afresh and syncs the replica from its peers. That is fine when another replica holds the data. It is not fine when this replica is the only `UpToDate` copy, because recreating the metadata discards the generation identifiers and the dirty bitmap.
@@ -125,7 +126,7 @@ kubectl -n blockstor-system get pod -l app=blockstor-satellite --field-selector 
 
 The second command must list no pod. Label first and delete second: deleted without the label, the pod is created again for the node at once.
 
-If the node is already back and the satellite has started, it is too late for that replica: the satellite log shows `create-md` for the resource.
+If the node is already back and a satellite pod has started on it, it is too late for that replica. Do not wait for a log line to confirm it: re-creating the metadata leaves none. Assume the metadata was re-created once the satellite has run on the node after the reboot.
 
 ### Applying the activity log by hand
 
