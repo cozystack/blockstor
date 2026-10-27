@@ -129,4 +129,7 @@ const (
 	SnapshotFlagFailedDeployment = "FAILED_DEPLOYMENT"
 	SnapshotFlagFailedDisconnect = "FAILED_DISCONNECT"
 	SnapshotFlagSuccessful       = "SUCCESSFUL"
+	// SnapshotFlagDelete marks a snapshot whose delete was issued and has
+	// not finished: a finalizer still holds it.
+	SnapshotFlagDelete = "DELETE"
 )

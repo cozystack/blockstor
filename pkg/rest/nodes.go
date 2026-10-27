@@ -1515,6 +1515,13 @@ func writeStoreErrorTyped(w http.ResponseWriter, err error, kind storeResourceKi
 // answers in CloneStarted, which python-linstor decodes whatever the status.
 func storeErrorRc(err error, kind storeResourceKind) (int, apiv1.APICallRc) {
 	switch {
+	case errors.Is(err, store.ErrRestoreSourceReaping):
+		// Retryable, and no FAIL_EXISTS band: linstor-csi reads that as a
+		// volume already there.
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails(err.Error()),
+		}
 	case errors.Is(err, store.ErrAlreadyExists):
 		return http.StatusConflict, apiv1.APICallRc{
 			RetCode: apiCallRcError | existsSubCodeForKind(kind),
