@@ -15,12 +15,13 @@ Blockstor's components do not talk to each other directly. They read and write t
 | blockstor-apiserver | 3370 | Plain HTTP, no authentication | `kubectl port-forward` for debugging | Every pod that can reach the API server's pod IP, unless a NetworkPolicy blocks it. Not in any Service. |
 | blockstor-apiserver | 8081 | HTTP `/healthz`, `/readyz` | kubelet | The pod |
 | blockstor-controller | 8081 | HTTP `/healthz`, `/readyz` | kubelet | The pod |
-| blockstor-satellite | 9100 | Plain HTTP, no authentication | Other satellites, to fetch a snapshot stream | The node's own address |
+| blockstor-satellite | 3372 | Plain HTTP, no authentication | Other satellites, to fetch a snapshot stream | The node's own address |
 | blockstor-satellite | 9101 | HTTP `/healthz`, `/readyz` | kubelet | The node's own address |
-| blockstor-satellite | 8080 | HTTP metrics (controller-runtime default) | Nothing in blockstor | The node's own address |
 | DRBD (kernel) | 20000 to 20999 | DRBD replication, TCP | The other replicas of the same volume | The node's own address |
 
-The satellite runs with host networking, so its ports are open on the node itself, not on a pod IP. The manifests set `hostPort` 9100 and 9101 to make this explicit. The satellite does not set a metrics address, so controller-runtime opens its default metrics listener on port 8080 of the node. Nothing in blockstor reads it. Block it or scrape it, but do not leave it open to networks you do not trust.
+The satellite runs with host networking, so its ports are open on the node itself, not on a pod IP. The manifests set `hostPort` 3372 and 9101 to make this explicit. Both have to be free on every storage node. Port 3372 is outside the DRBD port range and clear of the LINSTOR ports and of port 9100, where node-exporter usually listens on the host.
+
+The satellite opens no metrics listener. Its code turns off controller-runtime's metrics server, which would otherwise listen on port 8080 of the node.
 
 The controller has no REST listener. The manifests start it with `--enable-rest-api=false`, and the REST API is served by the separate `blockstor-apiserver` Deployment. Both the controller and the API server are started with `--metrics-bind-address=0`, so they open no metrics port.
 
@@ -85,14 +86,20 @@ This order is what keeps replication working when another tool, such as piraeus-
 
 ## Snapshot stream between satellites
 
-When a clone or a snapshot restore needs data from a snapshot on another node, the receiving satellite fetches the raw snapshot stream from the satellite that holds it, with an HTTP `GET` on port 9100. The stream has no authentication and no encryption. Keep that port reachable only between storage nodes, with a NetworkPolicy or a host firewall. If the port is blocked, the clone falls back to a DRBD initial sync, which is slower but works.
+When a clone or a snapshot restore places a replica on a node that does not hold the snapshot, the receiving satellite fetches the raw snapshot stream from a satellite that does, with an HTTP `GET` on port 3372. The stream has no authentication and no encryption. Keep that port reachable only between storage nodes, with a NetworkPolicy or a host firewall.
+
+The receiving satellite dials the address of the peer's interface named `default`, or the first interface with an address if there is no `default`. It does not use `spec.satelliteEndpoint` or the `k8s-internal` interface, so the `default` address must be the node's own IP and reachable on port 3372 from the other storage nodes. A pod IP written there by another tool breaks the stream even when DRBD still connects.
+
+The satellite tries every node that holds the snapshot. A peer that answers that it has no such snapshot is skipped, and if no peer has it, the replica is created empty and DRBD fills it with a full sync. A peer that cannot be reached is different: if no other peer delivers the stream, the volume is not created, the satellite fails the reconcile with a `cross-node fetch` error that names the peer's address, and retries, and the replica does not come up until the port is reachable.
+
+The satellite keeps running if it cannot bind port 3372, for example because another program on the node holds it. It logs `snapshot stream server exited` with the address, and other nodes can no longer fetch snapshots from it.
 
 ## What a firewall must allow
 
 Between storage nodes, in both directions:
 
 - The DRBD port range, 20000 to 20999 by default.
-- Port 9100 for the snapshot stream.
+- Port 3372 for the snapshot stream.
 
 Inside the cluster:
 
@@ -103,12 +110,11 @@ On each node, for kubelet:
 - Port 9101 on the node for the satellite's probes.
 - Port 8081 inside the controller and API server pods for theirs.
 
-Nothing needs to reach port 3370 or the satellite's port 8080. Block port 3370 with the NetworkPolicy shown [above](#the-api-server), and port 8080 with a host firewall.
+Nothing needs to reach port 3370. Block it with the NetworkPolicy shown [above](#the-api-server).
 
 ## Ports without authentication
 
 - 3370 on the API server. Full read and write access to the API from any pod that can reach the API server's pod IP. Not exposed by a Service, but not fenced either; add the NetworkPolicy above.
-- 9100 on every storage node. Reads raw snapshot data.
-- 8080 on every storage node. Metrics only.
+- 3372 on every storage node. Reads raw snapshot data.
 
 Port 3371 is the only API entry point meant for clients.

@@ -195,7 +195,7 @@ The passphrase can also be set as a property, `DrbdOptions/EncryptPassphrase` on
 
 ## Upgrading
 
-Upgrade in the same order as the installation. Update the manifests to the new tag with the same `sed` as in [Installation](../installation/#get-the-manifests), then apply:
+Upgrade in the same order as the installation. Update the manifests to the new tag with the same `sed` as in [Installation](../installation/#get-the-manifests), then apply. Coming from v0.1.17 or earlier, read [the note below](#upgrading-from-v0117-or-earlier) first.
 
 1. The CRDs, `kubectl apply -f config/crd/bases/`. New fields arrive before the code that writes them.
 2. The controller, `rendered/blockstor-deploy.yaml`.
@@ -211,3 +211,9 @@ Watch the rollout and the result:
 kubectl -n blockstor-system rollout status daemonset/blockstor-satellite
 blockstor resource list --faulty
 ```
+
+### Upgrading from v0.1.17 or earlier
+
+The snapshot stream between satellites moved from port 9100 to port 3372. Open port 3372 between storage nodes before step 5; see [Networking and ports](../networking/#snapshot-stream-between-satellites). While the satellites roll, old ones listen on 9100 and new ones dial 3372, and the other way round. A clone or a snapshot restore that needs a snapshot from a satellite of the other version cannot fetch it. Its replica does not fall back to a full sync: the volume is not created, and the satellite retries until both sides run the new version. Avoid clones and restores across nodes until the rollout is done. Port 9100 can be closed afterwards.
+
+The API server no longer lists or watches Secrets across the cluster. It reads and writes the passphrase Secret through a Role in `blockstor-system`, which step 4 creates.
