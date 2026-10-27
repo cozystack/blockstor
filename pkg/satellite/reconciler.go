@@ -2533,7 +2533,7 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 			return nil
 		}
 
-		log.FromContext(ctx).Info("BUG-028: force-promote veto bypassed — every connected peer is a day0-empty sibling, proceeding to first-activation mkfs",
+		log.FromContext(ctx).Info("force-promote veto bypassed — every connected peer is a day0-empty sibling, proceeding to first-activation mkfs",
 			"resource", dr.GetName())
 	}
 
@@ -2888,7 +2888,7 @@ func (r *Reconciler) maybeLateAddPromote(ctx context.Context, dr *intent.Desired
 		return nil
 	}
 
-	log.FromContext(ctx).Info("BUG-048 late-add-promote: mint UpToDate source (disconnect + new-current-uuid --clear-bitmap + reconnect) for a late-added volume wedged Inconsistent on every replica",
+	log.FromContext(ctx).Info("late-add-promote: mint UpToDate source (disconnect + new-current-uuid --clear-bitmap + reconnect) for a late-added volume wedged Inconsistent on every replica",
 		"resource", dr.GetName())
 
 	minors, err := r.cfg.Adm.MintLateAddSource(ctx, dr.GetName())
@@ -2896,7 +2896,7 @@ func (r *Reconciler) maybeLateAddPromote(ctx context.Context, dr *intent.Desired
 		return errors.Wrapf(err, "late-add-promote mint source %s", dr.GetName())
 	}
 
-	log.FromContext(ctx).Info("BUG-048 late-add-promote: minted UpToDate source",
+	log.FromContext(ctx).Info("late-add-promote: minted UpToDate source",
 		"resource", dr.GetName(), "minors", minors)
 
 	return nil
@@ -2981,7 +2981,7 @@ func (r *Reconciler) maybeKickLateAddResync(ctx context.Context, dr *intent.Desi
 	// the kernel device scan.
 	vol := volumes[0]
 
-	log.FromContext(ctx).Info("BUG-048 late-add resync-kick: invalidate locally to re-pull a stalled late-added volume from its UpToDate peer",
+	log.FromContext(ctx).Info("late-add resync-kick: invalidate locally to re-pull a stalled late-added volume from its UpToDate peer",
 		"resource", dr.GetName(), "volume", vol)
 
 	return errors.Wrapf(r.cfg.Adm.InvalidateVolume(ctx, dr.GetName(), vol),
@@ -3331,7 +3331,7 @@ func (r *Reconciler) latchFreeMkfsRetryAllowed(ctx context.Context, dr *intent.D
 		return false
 	}
 
-	log.FromContext(ctx).Info("BUG-028: latch-free mkfs retry — no auto-primary election but a volume provably lacks its filesystem, re-entering promote+mkfs+demote",
+	log.FromContext(ctx).Info("latch-free mkfs retry — no auto-primary election but a volume provably lacks its filesystem, re-entering promote+mkfs+demote",
 		"resource", dr.GetName())
 
 	return true

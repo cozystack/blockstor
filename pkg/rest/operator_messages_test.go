@@ -1,3 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package rest
 
 import (
@@ -13,11 +31,11 @@ import (
 	"testing"
 )
 
-// internalTrackerRef matches the project's internal tracker spellings,
-// "Bug 174", "Bug-020" and "Phase 12". They mean nothing to an operator
+// internalTrackerRef matches the project's internal tracker spellings in
+// any case, "Bug 174", "Bug-020", "BUG-048" and "Phase 12". They mean nothing to an operator
 // reading an error, an event or a log line, so no string literal in the
 // shipped code carries one; comments may.
-var internalTrackerRef = regexp.MustCompile(`\bBug[- ][0-9]|\bPhase [0-9]`)
+var internalTrackerRef = regexp.MustCompile(`(?i)\bBug[- ][0-9]|\bPhase [0-9]`)
 
 func TestShippedStringsCarryNoInternalTrackerNumbers(t *testing.T) {
 	t.Parallel()
