@@ -83,7 +83,8 @@ type Server struct {
 	// Client, the first Get starts an informer over every Secret in the
 	// cluster, which needs cluster-wide list and watch on Secrets and holds
 	// all of them in memory, for the one Secret this server reads. Nil
-	// falls back to Client, which tests rely on.
+	// falls back to Client, which tests rely on. It is the manager's direct
+	// reader, so the passphrase rotation also lists definitions through it.
 	SecretReader client.Reader
 
 	// TLS, when non-nil, makes Start also bring up a mutual-TLS
