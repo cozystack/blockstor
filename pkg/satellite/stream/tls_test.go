@@ -255,6 +255,12 @@ func TestStreamWithoutTLSIsOff(t *testing.T) {
 		t.Fatalf("fetch with no TLS = %v, want ErrStreamDisabled", err)
 	}
 
+	// The caller falls back to a blank volume and a DRBD resync only on
+	// storage.ErrNotFound; any other error requeues the restore forever.
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("fetch with no TLS = %v, want it to match storage.ErrNotFound", err)
+	}
+
 	if err := ListenAndServe(t.Context(), "127.0.0.1:0", NewServer(noSnapshots{}), TLSFiles{}); !errors.Is(err, ErrTLSIncomplete) {
 		t.Fatalf("server with no TLS = %v, want ErrTLSIncomplete", err)
 	}
