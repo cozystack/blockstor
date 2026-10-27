@@ -1,3 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package rest
 
 import (
@@ -189,5 +207,21 @@ func TestCSILayerListIsStoredInCanonicalCase(t *testing.T) {
 				t.Fatalf("stored stack %v, want %v", rd.LayerStack, wantCanonicalStack())
 			}
 		})
+	}
+}
+
+// A group stored with a lowercase stack before writes were canonicalised is
+// not rebalanced when a modify resends the same stack in canonical case.
+func TestRGNeedsRebalanceIgnoresTheStackCase(t *testing.T) {
+	t.Parallel()
+
+	prev := &apiv1.AutoSelectFilter{LayerStack: []string{"drbd", "storage"}}
+
+	if rgNeedsRebalance(prev, &apiv1.AutoSelectFilter{LayerStack: wantCanonicalStack()}) {
+		t.Error("the same stack in another case asked for a rebalance")
+	}
+
+	if !rgNeedsRebalance(prev, &apiv1.AutoSelectFilter{LayerStack: []string{"DRBD", "LUKS", "STORAGE"}}) {
+		t.Error("a different stack asked for no rebalance")
 	}
 }

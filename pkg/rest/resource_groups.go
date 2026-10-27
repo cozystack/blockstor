@@ -27,6 +27,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -413,7 +414,10 @@ func rgNeedsRebalance(prev, next *apiv1.AutoSelectFilter) bool {
 		return true
 	}
 
-	if !slices.Equal(prev.LayerStack, next.LayerStack) {
+	// Case-blind: a stack stored as drbd,storage before writes were
+	// canonicalised is the same stack as DRBD,STORAGE, and a modify that
+	// resends it must not rebalance every child.
+	if !slices.EqualFunc(prev.LayerStack, next.LayerStack, strings.EqualFold) {
 		return true
 	}
 
