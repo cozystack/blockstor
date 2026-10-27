@@ -20,10 +20,12 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
@@ -32,7 +34,33 @@ import (
 // not finished yet still reads from.
 var ErrRestoreSourceInUse = errors.New("a restore from this snapshot is not finished")
 
-// ReleaseRestoreSource gets snapshot srcRD:snapName ready to be deleted.
+// ErrRestoreSourceDeleting is the withdrawal a live deleting mark alone
+// causes: the delete may still keep the snapshot, for a restore it found
+// unfinished, so the same restore retried once the delete is over can go
+// through.
+var ErrRestoreSourceDeleting = errors.New("a delete of the snapshot is under way; retry once it finishes")
+
+// SnapshotDeletingProp marks a snapshot a delete has started on, as
+// `<token>@<RFC 3339 time>`. The token is random per delete, so a delete
+// only ever takes its own mark back off. See DeleteSnapshot.
+const SnapshotDeletingProp = "Blockstor/SnapshotDeleting"
+
+// snapshotDeleteBudget bounds a delete from its mark to its last write: no
+// call it makes can land after it.
+const snapshotDeleteBudget = 30 * time.Second
+
+// snapshotDeletingMarkTTL is how long a deleting mark refuses restores. A
+// mark older than this belongs to a delete that can no longer issue one,
+// since snapshotDeleteBudget is far shorter, so a mark a dead process left
+// on a snapshot it never deleted stops refusing restores from it. The gap
+// between the two also absorbs clock skew between the replicas that write
+// and read the mark.
+const snapshotDeletingMarkTTL = 5 * time.Minute
+
+// DeleteSnapshot deletes snapshot srcRD:snapName for an operator-facing door,
+// the REST delete, the CLI and the auto-snapshot prune, once no restore needs
+// it. A snapshot that does not exist answers ErrNotFound, before any
+// definition is looked at: there is nothing to hold.
 //
 // A restored or cloned definition keeps its restore marker after the restore
 // is done, and while the marker is there every new replica is brought up from
@@ -41,17 +69,70 @@ var ErrRestoreSourceInUse = errors.New("a restore from this snapshot is not fini
 // `rd ap`, a toggle back to diskful), which then came up blank and never
 // reached UpToDate.
 //
-// So a delete first ends the dependency: every definition whose marker names
-// the snapshot and whose restore is finished (RestoreMarkerClearRefusal, the
-// rule an operator's own delete of the marker passes) has the marker taken
+// So the delete first ends the dependency: every definition whose marker
+// names the snapshot and whose restore is finished (RestoreMarkerClearRefusal,
+// the rule an operator's own delete of the marker passes) has the marker taken
 // off, and its later replicas sync from their peers. A definition whose
 // restore is still running keeps it, and the delete is refused with
 // ErrRestoreSourceInUse; that is retryable, and lasts as long as the restore.
 // A definition being deleted is not waited for.
-func ReleaseRestoreSource(ctx context.Context, st Store, srcRD, snapName string) error {
+//
+// A restore makes its dependent in two steps, the snapshot read and the
+// definition create, so no list taken here alone can see one that is between
+// them. The delete therefore marks the snapshot first, then lists the
+// definitions past the cache, and only then deletes; a restore creates its
+// definition first, then reads the snapshot back past the cache and withdraws
+// on a live mark or on a snapshot that is gone (RestoreSourceWithdrawn).
+// Whichever of the list and the create comes second sees the other. The mark
+// stays on a snapshot whose delete was issued, and is taken back off one the
+// delete keeps.
+//
+// The delete runs on a context the caller cannot cancel, bounded by
+// snapshotDeleteBudget, so a caller that goes away between the mark and its
+// clean-up does not leave the mark behind; one a dead process leaves expires
+// (snapshotDeletingMarkTTL).
+func DeleteSnapshot(ctx context.Context, st Store, srcRD, snapName string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotDeleteBudget)
+	defer cancel()
+
+	snap, err := uncachedSnapshot(ctx, st, srcRD, snapName)
+	if err != nil {
+		return err
+	}
+
+	mark := rand.Text() + "@" + time.Now().UTC().Format(time.RFC3339)
+
+	err = setDeletingMark(ctx, st, &snap, mark)
+	if err != nil {
+		return fmt.Errorf("mark snapshot %s of %s as being deleted: %w", snapName, srcRD, err)
+	}
+
+	// The stored names from here on: LINSTOR folds name case, and a marker
+	// is written from the stored snapshot.
+	srcRD, snapName = snap.ResourceName, snap.Name
+
+	err = releaseRestoreSource(ctx, st, srcRD, snapName)
+	if err != nil {
+		return keepSnapshot(ctx, st, srcRD, snapName, mark, err)
+	}
+
+	err = st.Snapshots().Delete(ctx, srcRD, snapName)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return keepSnapshot(ctx, st, srcRD, snapName, mark,
+			fmt.Errorf("delete snapshot %s of %s: %w", snapName, srcRD, err))
+	}
+
+	return nil
+}
+
+// releaseRestoreSource ends the dependency of every definition restored from
+// srcRD:snapName, or refuses with ErrRestoreSourceInUse; see DeleteSnapshot.
+// The definitions are listed past the cache: one created a moment ago is
+// exactly the one a cache misses.
+func releaseRestoreSource(ctx context.Context, st Store, srcRD, snapName string) error {
 	marker := srcRD + ":" + snapName
 
-	rds, err := st.ResourceDefinitions().List(ctx)
+	rds, err := st.ResourceDefinitions().ListUncached(ctx)
 	if err != nil {
 		return fmt.Errorf("list the definitions restored from %s: %w", marker, err)
 	}
@@ -72,6 +153,70 @@ func ReleaseRestoreSource(ctx context.Context, st Store, srcRD, snapName string)
 	}
 
 	return nil
+}
+
+// keepSnapshot takes this delete's mark back off a snapshot it decided to
+// keep, so restores from it are not refused, and returns why it was kept.
+func keepSnapshot(ctx context.Context, st Store, srcRD, snapName, mark string, why error) error {
+	err := dropDeletingMark(ctx, st, srcRD, snapName, mark)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("%w; the deleting mark stayed on it, so restores from it are refused "+
+			"for up to %s: %w", why, snapshotDeletingMarkTTL, err)
+	}
+
+	return why
+}
+
+// setDeletingMark writes mark as the deleting mark on snap. The write is a
+// patch of the props the API server holds, so a mark another writer put on
+// the snapshot after the caller read it, a reap's say, is kept.
+func setDeletingMark(ctx context.Context, st Store, snap *apiv1.Snapshot, mark string) error {
+	//nolint:wrapcheck // the caller wraps with the snapshot it names
+	return st.Snapshots().PatchSnapshotProps(ctx, snap.ResourceName, snap.Name, func(props map[string]string) error {
+		props[SnapshotDeletingProp] = mark
+
+		return nil
+	})
+}
+
+// errDeletingMarkNotMine stops a removal that finds a mark other than its own.
+var errDeletingMarkNotMine = errors.New("the deleting mark is not this delete's")
+
+// dropDeletingMark removes the deleting mark when it is still mark, deciding
+// and writing in one patch. A snapshot that had no props before the mark
+// gets none back: a restore falls back to the source's props only for a
+// snapshot without any.
+func dropDeletingMark(ctx context.Context, st Store, srcRD, snapName, mark string) error {
+	err := st.Snapshots().PatchSnapshotProps(ctx, srcRD, snapName, func(props map[string]string) error {
+		if props[SnapshotDeletingProp] != mark {
+			return errDeletingMarkNotMine
+		}
+
+		delete(props, SnapshotDeletingProp)
+
+		return nil
+	})
+	if errors.Is(err, errDeletingMarkNotMine) {
+		return nil
+	}
+
+	return err //nolint:wrapcheck // the caller wraps with the snapshot it names
+}
+
+// deletingMarkIsLive reports whether a deleting mark belongs to a delete that
+// can still issue one. A mark whose time cannot be read is not.
+func deletingMarkIsLive(mark string, now time.Time) bool {
+	at := strings.LastIndex(mark, "@")
+	if at < 0 {
+		return false
+	}
+
+	written, err := time.Parse(time.RFC3339, mark[at+1:])
+	if err != nil {
+		return false
+	}
+
+	return now.Sub(written) < snapshotDeletingMarkTTL
 }
 
 func releaseRestoreMarker(ctx context.Context, st Store, rdName, marker string) error {

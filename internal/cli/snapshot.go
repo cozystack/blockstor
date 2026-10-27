@@ -351,7 +351,7 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 	}
 
 	// The snapshot was read before the definition existed; see
-	// store.ReapClonedSnapshot.
+	// store.ReapClonedSnapshot and store.DeleteSnapshot.
 	err = store.RestoreSourceWithdrawn(ctx, run.Store, snap.ResourceName, snap.Name)
 	if err != nil {
 		return rollbackRestore(ctx, run, def.Name, planned, err)
@@ -508,7 +508,7 @@ func restoreIntoExistingTarget(
 // placeOverMarkedTarget places the planned replicas on a target that carries
 // this restore's marker. The snapshot was read before the marker went on, or
 // before this run found it there, so it is read back first; see
-// store.ReapClonedSnapshot.
+// store.ReapClonedSnapshot and store.DeleteSnapshot.
 func placeOverMarkedTarget(
 	ctx context.Context, run *runContext, rdName string, snap *apiv1.Snapshot, planned []apiv1.Resource,
 ) error {

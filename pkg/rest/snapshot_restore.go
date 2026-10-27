@@ -1411,9 +1411,10 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		made = createdRD(newRD.Name, newRD.ResourceGroupName)
 	}
 
-	// The snapshot was read before the definition existed, and a reap that
-	// listed dependents in between could not see this one. Read it back now
-	// the definition is there; see store.ReapClonedSnapshot. The withdraw has
+	// The snapshot was read before the marked definition existed, and a reap
+	// or a snapshot delete that listed dependents in between could not see
+	// this one. Read it back now the definition is there; see
+	// store.ReapClonedSnapshot and store.DeleteSnapshot. The withdraw has
 	// already taken back what this request created, so its error is not one
 	// to roll back over.
 	err = store.RestoreSourceWithdrawn(ctx, s.Store, snap.ResourceName, snap.Name)
@@ -1552,9 +1553,9 @@ func (s *Server) claimAdoptedLeftover(ctx context.Context, rdName string, snap *
 
 // withdrawRestoredRD takes back a definition this request created from a
 // snapshot that went away under it, before anything was hydrated into it, and
-// answers as for a snapshot that does not exist, or, when only a reap's mark
-// is on the snapshot and no delete was issued, with a retryable 409: the reap
-// may still keep the snapshot.
+// answers as for a snapshot that does not exist, or, when only a reap's or a
+// delete's mark is on the snapshot, with a retryable 409: the reap or the
+// delete may still keep the snapshot.
 //
 // The take-back goes through the rollback and its handshake, not a bare
 // delete: between this request's create and its read of the snapshot, a
@@ -1581,7 +1582,8 @@ func (s *Server) withdrawRestoredRD(
 		}
 	}
 
-	if !errors.Is(cause, store.ErrRestoreSourceWithdrawn) || errors.Is(cause, store.ErrRestoreSourceReaping) {
+	if !errors.Is(cause, store.ErrRestoreSourceWithdrawn) ||
+		errors.Is(cause, store.ErrRestoreSourceReaping) || errors.Is(cause, store.ErrRestoreSourceDeleting) {
 		return cause
 	}
 

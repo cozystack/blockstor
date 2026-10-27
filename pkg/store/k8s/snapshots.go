@@ -50,8 +50,9 @@ const LabelSnapshotGroupID = "blockstor.io/snapshot-group-id"
 type snapshots struct {
 	c ctrlclient.Client
 
-	// apiReader is the manager's direct reader when the store has one. Only
-	// ListByDefinitionUncached reads through it.
+	// apiReader is the manager's direct reader when the store has one.
+	// ListByDefinitionUncached and PatchSnapshotProps read through it, so a
+	// prop write never starts from a copy the cache has not caught up with.
 	apiReader ctrlclient.Reader
 }
 
