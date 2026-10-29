@@ -31,6 +31,14 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
+// drbdmetaNoMinor is the device drbdmeta is given for a backing device
+// addressed directly, without a DRBD minor: drbdmeta skips the minor's lock
+// and its in-use check for `-`. These calls used to pass `<resource>/<vol>`,
+// which drbd-utils 9.22 read as no minor and newer releases refuse with
+// "Cannot determine minor device number", so the calls would stop working
+// on an upgrade of the image's drbd-utils.
+const drbdmetaNoMinor = "-"
+
 // Adm is a thin wrapper around the `drbdadm` CLI. It exists so the
 // satellite reconciler can be unit-tested without a real DRBD kernel
 // module present: production injects storage.RealExec, tests inject
@@ -495,7 +503,7 @@ func (a *Adm) SetGIString(ctx context.Context, resource string, volume int32, de
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	_, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
+		"drbdmeta", "--force", drbdmetaNoMinor, "v09", device, "internal",
 		"set-gi", "--node-id", strconv.Itoa(int(peerNodeID)), gi)
 	if err != nil {
 		return errors.Wrapf(err, "drbdmeta set-gi %s --node-id %d", target, peerNodeID)
@@ -531,8 +539,8 @@ func (a *Adm) ForgetPeer(ctx context.Context, resource string, volume int32, dev
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	_, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
-		"forget-peer", strconv.Itoa(int(peerNodeID)))
+		"drbdmeta", "--force", drbdmetaNoMinor, "v09", device, "internal",
+		"forget-peer", "--node-id", strconv.Itoa(int(peerNodeID)))
 	if err != nil {
 		return errors.Wrapf(err, "drbdmeta forget-peer %s --node-id %d", target, peerNodeID)
 	}
@@ -814,7 +822,7 @@ func (a *Adm) WipeMd(ctx context.Context, resource string, volume int32, device 
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	_, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
+		"drbdmeta", "--force", drbdmetaNoMinor, "v09", device, "internal",
 		"wipe-md")
 	if err != nil {
 		return errors.Wrapf(err, "drbdmeta wipe-md %s", target)
@@ -845,7 +853,7 @@ func (a *Adm) ShowGI(ctx context.Context, resource string, volume int32, device 
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	out, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
+		"drbdmeta", "--force", drbdmetaNoMinor, "v09", device, "internal",
 		"show-gi")
 	if err != nil {
 		return nil, errors.Wrapf(err, "drbdmeta show-gi %s", target)
@@ -866,7 +874,7 @@ func (a *Adm) GetGI(ctx context.Context, resource string, volume int32, device s
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	out, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
+		"drbdmeta", "--force", drbdmetaNoMinor, "v09", device, "internal",
 		"get-gi", "--node-id", "0")
 	if err != nil {
 		return "", errors.Wrapf(err, "drbdmeta get-gi %s", target)

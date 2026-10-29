@@ -3279,11 +3279,11 @@ func TestApplyLateAddedVolumeWinnerSeedsUpToDate(t *testing.T) {
 
 	// THE FIX: vol-1's local-slot set-gi MUST carry the winner shape —
 	// current=day0, Consistent(idx4=1)+UpToDate(idx5=1). The set-gi
-	// target is `<rd>/1` (vol-1 only); vol-0 is never re-seeded.
+	// goes to vol-1's backing device only; vol-0 is never re-seeded.
 	var vol1LocalSlot string
 
 	for _, line := range calls {
-		if strings.Contains(line, "pvc-late-win/1 ") && strings.Contains(line, "set-gi --node-id 0 ") {
+		if strings.Contains(line, "pvc-late-win_00001 ") && strings.Contains(line, "set-gi --node-id 0 ") {
 			vol1LocalSlot = line
 		}
 	}
@@ -3316,7 +3316,7 @@ func TestApplyLateAddedVolumeWinnerSeedsUpToDate(t *testing.T) {
 	// HasMD=true, so it never joins the fresh-seed set. A set-gi against
 	// `<rd>/0` would wipe vol-0's live GI + bitmap state.
 	for _, line := range calls {
-		if strings.Contains(line, "pvc-late-win/0 ") && strings.Contains(line, "set-gi") {
+		if strings.Contains(line, "pvc-late-win_00000 ") && strings.Contains(line, "set-gi") {
 			t.Errorf("late-add seed re-stamped vol-0 GI (would wipe its live metadata): %s", line)
 		}
 	}
@@ -3411,7 +3411,7 @@ func TestApplyLateAddedVolumeNonWinnerTakesSkipInitSync(t *testing.T) {
 	var vol1LocalSlot string
 
 	for _, line := range calls {
-		if strings.Contains(line, "pvc-late-lose/1 ") && strings.Contains(line, "set-gi --node-id 2 ") {
+		if strings.Contains(line, "pvc-late-lose_00001 ") && strings.Contains(line, "set-gi --node-id 2 ") {
 			vol1LocalSlot = line
 		}
 	}
@@ -3554,7 +3554,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 	calls := fx.CommandLines()
 
 	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-seed", drbd.MaxPeers-1))
-	setGI := indexOfPrefix(calls, "drbdmeta --force pvc-seed/0 v09 ")
+	setGI := indexOfPrefix(calls, "drbdmeta --force - v09 ")
 	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-seed")
 
 	if createMD < 0 {
@@ -3578,7 +3578,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 	// current_uuid in BOTH current_uuid and bitmap_uuid slots,
 	// stamped via `set-gi --node-id <peer>` (DRBD 9.2+ per-peer
 	// slot layout).
-	wantSetGI := "drbdmeta --force pvc-seed/0 v09 /dev/vg/pvc-seed_00000 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	wantSetGI := "drbdmeta --force - v09 /dev/vg/pvc-seed_00000 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
 	if !slices.Contains(calls, wantSetGI) {
 		t.Errorf("missing exact set-gi command %q in calls: %v", wantSetGI, calls)
 	}
@@ -4047,7 +4047,7 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 			calls := fx.CommandLines()
 
 			createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-zskip", drbd.MaxPeers-1))
-			setGI := indexOfPrefix(calls, "drbdmeta --force pvc-zskip/0 v09 ")
+			setGI := indexOfPrefix(calls, "drbdmeta --force - v09 ")
 			adjust := indexOfPrefix(calls, "drbdadm adjust pvc-zskip")
 
 			if createMD < 0 {
@@ -4077,7 +4077,7 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 			// the expected value in sync with
 			// pkg/satellite/providerkind.go's day0GiFor().
 			day0 := satellite.Day0GiForTest("pvc-zskip", 0)
-			wantSetGI := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi --node-id 1 %s:0:0:0:0:1",
+			wantSetGI := fmt.Sprintf("drbdmeta --force - v09 %s internal set-gi --node-id 1 %s:0:0:0:0:1",
 				tc.wantDevice, day0)
 			if !slices.Contains(calls, wantSetGI) {
 				t.Errorf("missing exact day0 set-gi command %q in calls: %v", wantSetGI, calls)
@@ -4157,8 +4157,8 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 	// emitted call sequence MUST follow GetPeers() iteration
 	// (n2 → n3) so both satellites visit slots in the same order
 	// (eliminates an FS-write ordering source of divergence).
-	wantN2 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 1 %s:0:0:0:0:1", day0)
-	wantN3 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 2 %s:0:0:0:0:1", day0)
+	wantN2 := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 1 %s:0:0:0:0:1", day0)
+	wantN3 := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 2 %s:0:0:0:0:1", day0)
 
 	if !slices.Contains(calls, wantN2) {
 		t.Errorf("missing per-peer set-gi for n2 (node-id 1): want %q in calls: %v", wantN2, calls)
@@ -4269,7 +4269,7 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	// including slot 2 (n3, whose node-id was NOT allocated) and slots
 	// 16..31 that no peer occupies.
 	for nodeID := 0; nodeID <= drbd.NodeIDMax; nodeID++ {
-		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0:0:1",
+		want := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0:0:1",
 			nodeID, day0)
 		if !slices.Contains(calls, want) {
 			t.Errorf("missing blanket set-gi for node-id %d: want %q in calls", nodeID, want)
@@ -4280,7 +4280,7 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	// fewer (no out-of-range node-id 32+, no skipped slot).
 	var setGiCount int
 	for _, c := range calls {
-		if strings.HasPrefix(c, "drbdmeta") && strings.Contains(c, "set-gi") && strings.Contains(c, "pvc-blanket/0") {
+		if strings.HasPrefix(c, "drbdmeta") && strings.Contains(c, "set-gi") && strings.Contains(c, "pvc-blanket_00000 ") {
 			setGiCount++
 		}
 	}
@@ -4311,7 +4311,7 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	}
 
 	for nodeID := 0; nodeID <= drbd.NodeIDMax; nodeID++ {
-		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0:0:1",
+		want := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0:0:1",
 			nodeID, day0)
 
 		idx := slices.Index(calls, want)
@@ -4397,7 +4397,7 @@ func TestApplyFirstActivationSeedsLocalSlotBug284(t *testing.T) {
 	// Without this call the local current_uuid stays at the random
 	// value drbdadm create-md generated → permanent unrelated-data on
 	// every future handshake against a later-joining peer.
-	wantLocal := fmt.Sprintf("drbdmeta --force pvc-b284/0 v09 /dev/vg/pvc-b284_00000 internal set-gi --node-id 0 %s:0:0:0:0:1",
+	wantLocal := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-b284_00000 internal set-gi --node-id 0 %s:0:0:0:0:1",
 		day0)
 	if !slices.Contains(calls, wantLocal) {
 		t.Errorf("missing local-slot set-gi (Bug 284 fix): want %q in calls: %v", wantLocal, calls)
