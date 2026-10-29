@@ -124,6 +124,8 @@ After `node interface modify ... --active`, satellite re-dials the controller vi
 
 Note on `--controller-namespace` (Bug 023): the satellite binary grew this flag to name the NAMESPACE the cluster master passphrase Secret (`linstor encryption create-passphrase`) lives in — defaulting to `$POD_NAMESPACE` then `blockstor-system`. It is read through the kube-apiserver like every other satellite input; it carries no controller ADDRESS and does not change the Outcome B posture above.
 
+Note on `--stream-tls-cert-file`, `--stream-tls-key-file` and `--stream-tls-ca-file`: the PEM files of the mutual TLS on the satellite-to-satellite snapshot stream. They name local files, carry no controller ADDRESS, and do not change the Outcome B posture either.
+
 ---
 
 ## End-to-end on dedicated replication network
