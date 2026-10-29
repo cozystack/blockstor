@@ -80,7 +80,7 @@ Release-gate hardening release. A full independent acceptance gate (default NO-G
 
 ### Known issues
 
-- **Concurrent rapid late `vd c` (BUG-048; "Bug 50" in `docs/known-issues.md`)** — two back-to-back manual `volume-definition create` calls on an existing multi-replica RD can intermittently drop or wedge the second volume. Operator-only (NOT reachable via CSI, which creates exactly one volume-definition per resource-definition), availability-only (no data loss, no node-reboot deadlock), recoverable by deleting and re-adding the volume-definition sequentially. A code fix is in progress.
+- **Concurrent rapid late `vd c` (BUG-048; "Bug 50" in `docs/known-issues.md`, since removed)** — two back-to-back manual `volume-definition create` calls on an existing multi-replica RD can intermittently drop or wedge the second volume. Operator-only (NOT reachable via CSI, which creates exactly one volume-definition per resource-definition), availability-only (no data loss, no node-reboot deadlock), recoverable by deleting and re-adding the volume-definition sequentially. A code fix is in progress.
 
 ### Testing & infrastructure
 
