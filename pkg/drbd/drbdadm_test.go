@@ -254,15 +254,14 @@ func TestAdmSetGIInvokesDrbdmeta(t *testing.T) {
 		t.Fatalf("SetGI: %v", err)
 	}
 
-	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	want := "drbdmeta --force - v09 /dev/dm-3 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
 }
 
-// TestAdmForgetPeerInvokesDrbdmeta pins the on-disk slot
-// reclaim command shape: `drbdmeta --force <res>/<vol> v09
-// <device> internal forget-peer <peer-node-id>`.
+// TestAdmForgetPeerInvokesDrbdmeta pins the on-disk slot reclaim command
+// shape: `drbdmeta --force - v09 <device> internal forget-peer --node-id <N>`.
 //
 // Without forget-peer, `drbdadm del-peer` only severs the kernel
 // connection; the metadata block still records the departed
@@ -271,13 +270,14 @@ func TestAdmSetGIInvokesDrbdmeta(t *testing.T) {
 // `--max-peers=MaxPeers-1` slot pool and the next replica add
 // fails with drbdmeta refusing to allocate.
 //
-// Two invariants pinned:
+// Three invariants pinned:
 //
-//   - `<peer-node-id>` MUST be passed as the trailing positional
-//     argument (not `--node-id`). The forget-peer subcommand
-//     takes the node-id positionally; a regression that copied
-//     SetGI's `--node-id <N>` shape would surface as drbdmeta
-//     refusing the call with a usage error.
+//   - The peer goes in `--node-id`. drbdmeta's usage is
+//     `forget-peer --node-id {val}` (drbd-utils 9.22 and 9.35 alike); a
+//     positional node-id is refused with "The forget-peer command
+//     requires the --node-id option", which is what this call sent before.
+//   - The device is `-`: the backing device is addressed directly,
+//     with no DRBD minor (drbdmetaNoMinor).
 //   - The `--force` flag MUST be present so drbdmeta accepts the
 //     mutation against in-use metadata (the resource is still
 //     loaded when forget-peer runs).
@@ -290,7 +290,7 @@ func TestAdmForgetPeerInvokesDrbdmeta(t *testing.T) {
 		t.Fatalf("ForgetPeer: %v", err)
 	}
 
-	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal forget-peer 2"
+	want := "drbdmeta --force - v09 /dev/dm-3 internal forget-peer --node-id 2"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
