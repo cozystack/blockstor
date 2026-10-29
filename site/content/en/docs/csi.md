@@ -46,7 +46,9 @@ The node plugin's `--node` argument must match the name of a blockstor `Node`, w
 
 ## Client certificates in another namespace
 
-The Secret `blockstor-apiserver-client-tls` and the `blockstor-api-ca` Issuer both live in `blockstor-system`, and `blockstor-api-ca` is a namespaced `Issuer`. cert-manager looks up an `Issuer` in the Certificate's own namespace, so a Certificate in any other namespace that names `blockstor-api-ca` is never issued. A pod can only mount a Secret from its own namespace. A CSI driver that runs outside `blockstor-system`, which is the usual case, needs the client material brought into its namespace. There are two ways to do that.
+The supported layout runs the CSI driver in `blockstor-system`, next to blockstor: install piraeus-operator into that namespace, and its components take their client certificates from `blockstor-api-ca` directly, with nothing to copy. The rest of this section is for a driver that has to run elsewhere.
+
+The Secret `blockstor-apiserver-client-tls` and the `blockstor-api-ca` Issuer both live in `blockstor-system`, and `blockstor-api-ca` is a namespaced `Issuer`. cert-manager looks up an `Issuer` in the Certificate's own namespace, so a Certificate in any other namespace that names `blockstor-api-ca` is never issued. A pod can only mount a Secret from its own namespace. A CSI driver that runs outside `blockstor-system` needs the client material brought into its namespace. There are two ways to do that.
 
 **Mirror the CA into the client's namespace.** Copy the CA Secret `blockstor-api-ca` into the client's namespace and create a CA `Issuer` over it there. Certificates in that namespace are then issued and renewed by cert-manager like any other. This is what blockstor's own test installation does for piraeus-operator, in the namespace `piraeus-datastore`:
 
@@ -74,7 +76,7 @@ The copy carries the CA's private key. Anyone who can read Secrets in that names
 
 If you install `linstor-csi` with the piraeus operator, set `LinstorCluster.spec.externalController.url` to `https://blockstor-apiserver.blockstor-system.svc:3371`. That turns off the operator's own LINSTOR controller and points the CSI driver at blockstor.
 
-For the client certificate, mirror the CA into the operator's namespace as shown above, and point `spec.apiTLS.certManager` at the `Issuer` you created there. The operator then creates, in its own namespace and from that Issuer, the client Certificates for itself, for the CSI pods and for its other components:
+For the client certificate, point `spec.apiTLS.certManager` at the `blockstor-api-ca` Issuer when the operator runs in `blockstor-system`. In any other namespace, mirror the CA into it as shown above and point `spec.apiTLS.certManager` at the `Issuer` you created there. The operator then creates, in its own namespace and from that Issuer, the client Certificates for itself, for the CSI pods and for its other components:
 
 ```yaml
 apiVersion: piraeus.io/v1
