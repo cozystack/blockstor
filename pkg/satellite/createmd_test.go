@@ -21,6 +21,7 @@ package satellite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -600,23 +601,17 @@ func uncleanFixture(
 	return rec, dr, devices, filepath.Join(dir, "pvc-unclean.md-created"), fx
 }
 
-// A lower disk carrying an unclean superblock is initialised, on both
-// activation arms.
+// A lower disk carrying an unclean superblock and no reported GI is
+// initialised, on both activation arms.
 //
-// It is worth being explicit about what these two pin, because the
-// obvious reading of the second one is wrong. An unapplied activity log
-// does NOT mean "this volume is established": a volume added to a live
-// resource arrives with firstActivation=false on a lower disk that is
-// brand new, and one carved from a recycled pool extent carries
-// whatever superblock the previous tenant left. Gating re-initialisation
-// on firstActivation stalled exactly that shape — the e2e suite caught
-// vol-1 never leaving Diskless while the kernel had it UpToDate.
-//
-// The cost is that a replica which crashed while Primary and writing
-// looks the same to drbdmeta and gets re-initialised too. Separating
-// them needs a per-volume record of "we have initialised this before",
-// which does not exist yet; these tests pin the behaviour as it stands
-// rather than the behaviour we want.
+// An unapplied activity log does NOT mean "this volume is established": a
+// volume added to a live resource arrives with firstActivation=false on a
+// lower disk that is brand new, and one carved from a recycled pool extent
+// carries whatever superblock the previous tenant left. Gating
+// re-initialisation on firstActivation stalled exactly that shape — the e2e
+// suite caught vol-1 never leaving Diskless while the kernel had it UpToDate.
+// What tells an established replica apart is a GI it reported, see
+// TestEnsureMetadataRepairsTheCrashOfAReplicaWithAReportedGI.
 func TestEnsureMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
 	for _, firstActivation := range []bool{true, false} {
 		rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
@@ -652,8 +647,7 @@ func TestEnsureMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
 // reaches established resources.
 //
 // The behaviour is the same as its ensureMetadata twin and pinned for the
-// same reason — see TestEnsureMetadataInitialisesAnUncleanLowerDisk for why
-// re-initialising here is what the platform does today, and what it costs.
+// same reason — see TestEnsureMetadataInitialisesAnUncleanLowerDisk.
 func TestEnsurePerVolumeMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
 	rec, dr, devices, _, fx := uncleanFixture(t)
 
@@ -669,4 +663,359 @@ func TestEnsurePerVolumeMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
 	}
 
 	t.Error("the volume was left without metadata")
+}
+
+const (
+	uncleanReportedGI = "6E3A5D0B2C1F4A96"
+	uncleanDumpMD     = "drbdadm dump-md pvc-unclean/0"
+	uncleanApplyAL    = "drbdadm apply-al pvc-unclean/0"
+)
+
+var errApplyALFailed = errors.New("drbdadm apply-al: exit status 10")
+
+func ranCommand(fx *storage.FakeExec, fragment string) bool {
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, fragment) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// dumpWithPeerBitmap is dump-md output, in the shape drbdmeta prints for
+// v09, for local node-id 0 whose current UUID moved on after it lost peer 1:
+// the reported GI sits only in peer 1's bitmap slot, which
+// `get-gi --node-id 0` never shows.
+func dumpWithPeerBitmap(current, peerBitmap string) []byte {
+	return dumpV09(current, peerBitmap, "0000000000000000")
+}
+
+// dumpWithHistory is the same after a resync moved the GI out of the bitmap
+// slot and into the history block.
+func dumpWithHistory(current, history string) []byte {
+	return dumpV09(current, "0000000000000000", history)
+}
+
+func dumpV09(current, peerBitmap, history string) []byte {
+	return []byte("# DRBD meta data dump\nversion \"v09\";\n\nmax-peers 7;\n" +
+		"node-id 0;\ncurrent-uuid 0x" + current + ";\nflags 0x00000011;\n" +
+		"members 0x0000000000000003;\nfeatures 0x0000000000000000;\n" +
+		"peer[0] {\n    bitmap-index -1;\n    bitmap-uuid 0x0000000000000000;\n" +
+		"    bitmap-dagtag 0x0000000000000000;\n    flags 0x00000000;\n}\n" +
+		"peer[1] {\n    bitmap-index 0;\n    bitmap-uuid 0x" + peerBitmap + ";\n" +
+		"    bitmap-dagtag 0x0000000000000000;\n    flags 0x00000005;\n}\n" +
+		"history-uuids {\n        0x" + history + "; 0x0000000000000000; 0x0000000000000000; 0x0000000000000000;\n}\n" +
+		"la-size-sect 2097152;\nbm-byte-per-bit 4096;\ndevice-uuid 0x5A5A5A5A5A5A5A5A;\n" +
+		"bitmap[0] {\n   # at 0kB\n    64 times 0x0000000000000000;\n}\n")
+}
+
+func runMetadataPath(t *testing.T, path string, rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, marker string) error {
+	t.Helper()
+
+	if path == "ensureMetadata" {
+		return rec.ensureMetadata(context.Background(), dr, devices, marker, false)
+	}
+
+	return rec.ensurePerVolumeMetadata(context.Background(), dr, devices, false)
+}
+
+// A replica that went down while Primary and writing leaves its activity log
+// open. With create-md --force over it, its GI and dirty bitmap were gone,
+// and with them the only up-to-date copy when it was the last one. A volume
+// with a known GI is repaired with apply-al instead, on both paths, and the
+// GI is looked for in every slot: a Primary that lost a peer keeps its old
+// current UUID only in that peer's bitmap slot, and the Primary bit of a UUID
+// is not part of its identity.
+func TestEnsureMetadataRepairsTheCrashOfAReplicaWithAKnownGI(t *testing.T) {
+	for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
+		for slot, dump := range map[string][]byte{
+			"peer bitmap": dumpWithPeerBitmap("9F00AA11BB22CC33", uncleanReportedGI),
+			"history":     dumpWithHistory("9F00AA11BB22CC33", uncleanReportedGI),
+		} {
+			testRepairsTheCrash(t, path, slot, dump)
+		}
+	}
+}
+
+func testRepairsTheCrash(t *testing.T, path, slot string, dump []byte) {
+	t.Helper()
+
+	{
+		for name, record := range map[string]func(*Reconciler, *intent.DesiredResource){
+			"status": func(_ *Reconciler, dr *intent.DesiredResource) { dr.Volumes[0].ObservedGI = uncleanReportedGI },
+			"history": func(rec *Reconciler, _ *intent.DesiredResource) {
+				rec.RecordObservedGI("pvc-unclean", 0, "6E3A5D0B2C1F4A97")
+			},
+		} {
+			t.Run(path+"/"+slot+"/"+name, func(t *testing.T) {
+				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+				record(rec, dr)
+
+				fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+				fx.ExpectSequence(uncleanDumpMD,
+					storage.FakeResponse{Err: errDumpMdUnclean},
+					storage.FakeResponse{Stdout: dump})
+
+				if err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath); err != nil {
+					t.Fatalf("%s: %v", path, err)
+				}
+
+				if !ranCommand(fx, "apply-al") {
+					t.Error("the activity log was not applied")
+				}
+
+				if ranCommand(fx, "create-md") {
+					t.Error("create-md ran over a replica with a known GI; its GI and bitmap are gone")
+				}
+			})
+		}
+	}
+}
+
+// The status field is not the record: it is dropped whenever the volume
+// leaves a data-bearing disk state. The satellite's own history survives
+// that, and survives a restart.
+func TestRecordedGIsSurviveARestart(t *testing.T) {
+	rec := uncleanReconciler(t)
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+	again := NewReconciler(ReconcilerConfig{StateDir: rec.cfg.StateDir})
+	if got := mustRecordedGIs(t, again, "pvc-unclean", 0); len(got) != 1 || got[0] != uncleanReportedGI {
+		t.Fatalf("recorded GIs after a restart = %v, want [%s]", got, uncleanReportedGI)
+	}
+}
+
+// A known GI is not enough on its own: the superblock under the dirty log
+// has to name it, or it is not this replica's and gets metadata of its own.
+func TestEnsureMetadataInitialisesAForeignSuperblockDespiteAKnownGI(t *testing.T) {
+	for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
+		t.Run(path, func(t *testing.T) {
+			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+			dr.Volumes[0].ObservedGI = uncleanReportedGI
+
+			fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+			fx.ExpectSequence(uncleanDumpMD,
+				storage.FakeResponse{Err: errDumpMdUnclean},
+				storage.FakeResponse{Stdout: dumpWithPeerBitmap("1111111111111111", "2222222222222222")})
+
+			if err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath); err != nil {
+				t.Fatalf("%s: %v", path, err)
+			}
+
+			if !ranCommand(fx, "create-md") {
+				t.Error("a superblock that does not name the known GI was kept")
+			}
+		})
+	}
+}
+
+// A repair or a check that fails is not a licence to re-initialise, and
+// not a licence to keep either: the known GI proves the volume carried
+// data-bearing metadata, and a superblock that could not be read is not
+// proven to be it. A dump the parser cannot read, empty or with a renamed
+// keyword, is such a failure, not a foreign superblock. Both metadata paths
+// answer the same, the per-volume one being what a rebooted node takes.
+func TestEnsureMetadataFailsClosedWhenTheRepairFails(t *testing.T) {
+	afterApply := func(second storage.FakeResponse) func(*storage.FakeExec) {
+		return func(fx *storage.FakeExec) {
+			fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+			fx.ExpectSequence(uncleanDumpMD, storage.FakeResponse{Err: errDumpMdUnclean}, second)
+		}
+	}
+
+	for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
+		for name, setup := range map[string]func(*storage.FakeExec){
+			"apply-al": func(fx *storage.FakeExec) {
+				fx.Expect(uncleanApplyAL, storage.FakeResponse{Err: errApplyALFailed})
+			},
+			"dump-md":         afterApply(storage.FakeResponse{Err: errApplyALFailed}),
+			"empty dump":      afterApply(storage.FakeResponse{Stdout: []byte("")}),
+			"renamed keyword": afterApply(storage.FakeResponse{Stdout: []byte("version \"v09\";\ncurrent-gi 0x" + uncleanReportedGI + ";\n")}),
+		} {
+			t.Run(path+"/"+name, func(t *testing.T) {
+				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+				dr.Volumes[0].ObservedGI = uncleanReportedGI
+				setup(fx)
+
+				if err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath); err == nil {
+					t.Fatalf("a failed %s was answered with success", name)
+				}
+
+				if ranCommand(fx, "create-md") {
+					t.Errorf("create-md ran after %s failed on a replica with a known GI", name)
+				}
+			})
+		}
+	}
+}
+
+// External metadata takes the same check as internal: dump-md reads the
+// meta disk from the .res wherever it lives, so a repaired volume is kept
+// when its superblock names a known GI and initialised when it does not.
+func TestEnsureMetadataChecksRepairedExternalMetadata(t *testing.T) {
+	for name, tc := range map[string]struct {
+		dump []byte
+		keep bool
+	}{
+		"its own":   {dump: dumpWithPeerBitmap("9F00AA11BB22CC33", uncleanReportedGI), keep: true},
+		"a foreign": {dump: dumpWithPeerBitmap("1111111111111111", "2222222222222222")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+			dr.Volumes[0].ObservedGI = uncleanReportedGI
+			dr.Volumes[0].MetaPool = "meta"
+
+			fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+			fx.ExpectSequence(uncleanDumpMD,
+				storage.FakeResponse{Err: errDumpMdUnclean},
+				storage.FakeResponse{Stdout: tc.dump})
+
+			if err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, false); err != nil {
+				t.Fatalf("ensureMetadata: %v", err)
+			}
+
+			if ranCommand(fx, "create-md") == tc.keep {
+				t.Errorf("create-md ran = %v over %s superblock under external metadata", !tc.keep, name)
+			}
+		})
+	}
+}
+
+// Deleting a resource takes its GI record with it, file and cache, so a
+// replica created again under the name starts with no record and records
+// its first GI even when it is the one the old replica last had.
+func TestDeleteResourceForgetsTheGIRecord(t *testing.T) {
+	rec := uncleanReconciler(t)
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+	resp, err := rec.DeleteResource(context.Background(), &intent.DeleteResourceRequest{Name: "pvc-unclean"})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteResource: %v, %+v", err, resp)
+	}
+
+	if got := mustRecordedGIs(t, rec, "pvc-unclean", 0); len(got) != 0 {
+		t.Fatalf("the deleted resource kept its GI record: %v", got)
+	}
+
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+	if got := mustRecordedGIs(t, rec, "pvc-unclean", 0); len(got) != 1 {
+		t.Fatalf("the re-created replica's first GI was not recorded: %v", got)
+	}
+}
+
+// The record keeps the newest generations of a volume: a crash leaves the
+// last few in the metadata, and those are the ones a check needs.
+func TestRecordedGIsKeepTheNewest(t *testing.T) {
+	rec := uncleanReconciler(t)
+
+	for i := range giHistoryPerVolume + 8 {
+		rec.RecordObservedGI("pvc-unclean", 0, fmt.Sprintf("%016X", i+1))
+	}
+
+	got := mustRecordedGIs(t, rec, "pvc-unclean", 0)
+	if len(got) != giHistoryPerVolume {
+		t.Fatalf("kept %d GIs, want %d", len(got), giHistoryPerVolume)
+	}
+
+	if want := fmt.Sprintf("%016X", 9); got[0] != want {
+		t.Errorf("oldest kept = %s, want %s", got[0], want)
+	}
+
+	if want := fmt.Sprintf("%016X", giHistoryPerVolume+8); got[len(got)-1] != want {
+		t.Errorf("newest kept = %s, want %s", got[len(got)-1], want)
+	}
+}
+
+// The observer reports the same GI on every event; a repeat of the last one
+// is answered from memory and does not rewrite the file.
+func TestRecordObservedGISkipsARepeat(t *testing.T) {
+	rec := uncleanReconciler(t)
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+	if err := os.Remove(rec.giHistoryPath("pvc-unclean")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+	if _, err := os.Stat(rec.giHistoryPath("pvc-unclean")); !os.IsNotExist(err) {
+		t.Errorf("a repeated GI rewrote the record: %v", err)
+	}
+}
+
+func uncleanReconciler(t *testing.T) *Reconciler {
+	t.Helper()
+
+	rec, _, _, _, _ := uncleanFixture(t) //nolint:dogsled // only the reconciler is needed here
+
+	return rec
+}
+
+// A volume removed from the definition takes its recorded generations
+// with it, so one added again under the same number starts with no record;
+// the volumes that stay keep theirs.
+func TestRemovedVolumeLosesItsGIRecord(t *testing.T) {
+	rec := uncleanReconciler(t)
+	rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+	rec.RecordObservedGI("pvc-unclean", 1, "1111111111111110")
+
+	rec.keepGIHistoryOf("pvc-unclean", []int32{0})
+
+	if got := mustRecordedGIs(t, rec, "pvc-unclean", 1); len(got) != 0 {
+		t.Errorf("removed volume 1 kept its record: %v", got)
+	}
+
+	if got := mustRecordedGIs(t, rec, "pvc-unclean", 0); len(got) != 1 {
+		t.Errorf("volume 0 lost its record: %v", got)
+	}
+
+	rec.RecordObservedGI("pvc-unclean", 1, "1111111111111110")
+
+	if got := mustRecordedGIs(t, rec, "pvc-unclean", 1); len(got) != 1 {
+		t.Errorf("the re-added volume's first GI was not recorded: %v", got)
+	}
+}
+
+func mustRecordedGIs(t *testing.T, rec *Reconciler, rdName string, vol int32) []string {
+	t.Helper()
+
+	got, err := rec.recordedGIs(rdName, vol)
+	if err != nil {
+		t.Fatalf("read the record: %v", err)
+	}
+
+	return got
+}
+
+// A record that cannot be read is not "no record": the repair fails on it
+// with no create-md, on both paths, and an observation does not write over
+// it with its one GI.
+func TestUnreadableGIRecordFailsClosed(t *testing.T) {
+	for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
+		t.Run(path, func(t *testing.T) {
+			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+
+			// A directory where the file should be: every read of it fails.
+			if err := os.Mkdir(rec.giHistoryPath("pvc-unclean"), 0o700); err != nil {
+				t.Fatalf("make the record unreadable: %v", err)
+			}
+
+			if err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath); err == nil {
+				t.Fatal("a repair over an unreadable record was answered with success")
+			}
+
+			if ranCommand(fx, "create-md") {
+				t.Error("create-md ran over a volume whose record could not be read")
+			}
+
+			rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+			if info, err := os.Stat(rec.giHistoryPath("pvc-unclean")); err != nil || !info.IsDir() {
+				t.Errorf("an observation wrote over the unreadable record: %v", err)
+			}
+		})
+	}
 }
