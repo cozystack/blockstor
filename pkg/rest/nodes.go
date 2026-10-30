@@ -1515,6 +1515,13 @@ func writeStoreErrorTyped(w http.ResponseWriter, err error, kind storeResourceKi
 // answers in CloneStarted, which python-linstor decodes whatever the status.
 func storeErrorRc(err error, kind storeResourceKind) (int, apiv1.APICallRc) {
 	switch {
+	case errors.Is(err, store.ErrRestoreSourceDeleting):
+		// A delete is judging the snapshot right now and may keep it: the
+		// restore retried once it is over can go through.
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails(err.Error()),
+		}
 	case errors.Is(err, store.ErrAlreadyExists):
 		return http.StatusConflict, apiv1.APICallRc{
 			RetCode: apiCallRcError | existsSubCodeForKind(kind),

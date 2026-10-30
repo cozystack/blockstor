@@ -32,6 +32,11 @@ func TestRDModifyRefusesEditsOfServerOwnedProps(t *testing.T) {
 		{name: "set-rollback-mark", body: map[string]any{
 			"override_props": map[string]string{store.RollbackAbandonedProp: store.RollbackInProgress},
 		}},
+		// The time is what a retry takes over a live mark on: set by hand, it
+		// hands a running rollback's definition to the next retry.
+		{name: "set-rollback-since", body: map[string]any{
+			"override_props": map[string]string{store.RollbackSinceProp: "2000-01-01T00:00:00Z"},
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

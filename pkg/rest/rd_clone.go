@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LINBIT/golinstor/client"
 	"github.com/LINBIT/golinstor/clonestatus"
@@ -1472,22 +1473,8 @@ func (s *Server) abandonedRollbackRefusal(
 		return 0, nil
 	}
 
-	// A rollback that has not reported a step is one still running, or one
-	// whose process stopped mid-way. Both are refused, but the first ends on
-	// its own, so the advice says so before it says to delete by hand; the
-	// CLI door words it the same way (store.JudgeRestoreLeftover).
 	if spelled == rollbackInProgress {
-		return http.StatusConflict, &apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: operation + " target '" + rdName + "' is being rolled back by the attempt " +
-				"that created it",
-			Cause: "an earlier attempt at this " + operation + " started rolling the definition " +
-				"back and has not reported how it ended: it is still running, or it stopped mid-way",
-			Correc: "retry the " + operation + " once that rollback has finished, which takes under a " +
-				"minute; if the mark is still there a minute after the failure, " + clearRollbackMarkCommand(rdName) +
-				" to keep '" + rdName + "' as it stands, or delete it by hand. Cleared while the rollback " +
-				"still runs, it stops that rollback before it deletes anything",
-		}
+		return s.inProgressRollbackRefusal(ctx, operation, rdName)
 	}
 
 	step, known := rollbackStepByName(spelled)
@@ -1501,6 +1488,54 @@ func (s *Server) abandonedRollbackRefusal(
 			"so the definition may hold less than the " + operation + " intended; " + cause,
 		Correc: correc,
 	}
+}
+
+// inProgressRollbackRefusal answers a retry over an in-progress rollback mark.
+// A rollback that has not reported a step is one still running, or one whose
+// process stopped mid-way. A mark older than store.StaleRollbackAfter has
+// nobody behind it and is taken over, and the retry resumes; a younger one is
+// refused, with the advice that it ends on its own. The CLI door does the same
+// (store.JudgeRestoreLeftover).
+func (s *Server) inProgressRollbackRefusal(ctx context.Context, operation, rdName string) (int, *apiv1.APICallRc) {
+	took, status, rc := s.takeOverStaleRollbackMark(ctx, operation, rdName)
+	if rc != nil {
+		return status, rc
+	}
+
+	if took {
+		return 0, nil
+	}
+
+	return http.StatusConflict, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: operation + " target '" + rdName + "' is being rolled back by the attempt " +
+			"that created it",
+		Cause: "an earlier attempt at this " + operation + " started rolling the definition " +
+			"back and has not reported how it ended: it is still running, or it stopped mid-way",
+		Correc: "retry the " + operation + " once that rollback has finished, which takes under a " +
+			"minute; a retry takes over a mark nobody has touched for two minutes. To keep '" + rdName +
+			"' as it stands sooner, " + clearRollbackMarkCommand(rdName) + ", or delete it by hand. Cleared " +
+			"while the rollback still runs, it stops that rollback before it deletes anything",
+	}
+}
+
+// takeOverStaleRollbackMark takes over an in-progress rollback mark older than
+// store.StaleRollbackAfter, whose writer is gone, so the retry can resume the
+// leftover. A non-nil rc is the answer when the check itself failed.
+func (s *Server) takeOverStaleRollbackMark(
+	ctx context.Context, operation, rdName string,
+) (bool, int, *apiv1.APICallRc) {
+	took, err := store.TakeOverStaleRollback(ctx, s.Store, rdName, time.Now())
+	if err != nil {
+		return false, http.StatusInternalServerError, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: operation + " target '" + rdName + "' carries a rollback mark that could not be " +
+				"checked for staleness: " + scrubImplDetails(err.Error()),
+			Correc: "retry the " + operation,
+		}
+	}
+
+	return took, 0, nil
 }
 
 // ensureCloneSnapshot takes (or reuses) the internal snapshot backing

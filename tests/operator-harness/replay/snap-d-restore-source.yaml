@@ -1,0 +1,83 @@
+name: snap-d-restore-source
+description: |
+  A snapshot a restore still reads from is kept until the restore is
+  done, and a delete of a snapshot that is gone stays idempotent
+  (cozystack/blockstor#197).
+
+  A restored definition keeps its restore marker, and while the marker
+  is there every new replica is brought up from the snapshot. Deleting
+  the snapshot under an unfinished restore left the next replica blank.
+  Once the restore is done, the delete takes the marker off, and later
+  replicas sync from their peers.
+
+  Steps:
+    1. source: rd create + vd create + one diskful replica, UpToDate
+    2. snapshot create, then a bare s rsc restore: the target has its
+       volumes and no replica, so its restore is not finished
+    3. s d of the snapshot: refused (exit 10), the snapshot stays
+    4. r c the target on node1: the replica restores, UpToDate
+    5. s d of the snapshot: exit 0
+    6. s d again, the CSI retry: exit 0 over a snapshot that is gone
+    7. r c the target on node2: it syncs from node1, UpToDate
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: replay-sdsrc
+
+steps:
+  - name: create-src-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-src-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: snapshot-create
+    cmd: ["snapshot", "create", "{{rd}}", "sdsrc"]
+    expect_exit: 0
+  - name: bare-resource-restore
+    cmd: ["snapshot", "resource", "restore",
+          "--from-resource", "{{rd}}", "--from-snapshot", "sdsrc",
+          "--to-resource", "{{rd}}-t"]
+    expect_exit: 0
+  - name: s-d-refused-while-the-restore-is-unfinished
+    cmd: ["snapshot", "delete", "{{rd}}", "sdsrc"]
+    expect_exit: 10
+  - name: place-the-restored-replica
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}-t", "--storage-pool={{sp}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}-t"
+      timeout_s: 240
+  - name: s-d-once-the-restore-is-done
+    cmd: ["snapshot", "delete", "{{rd}}", "sdsrc"]
+    expect_exit: 0
+  - name: s-d-again-is-idempotent
+    cmd: ["snapshot", "delete", "{{rd}}", "sdsrc"]
+    expect_exit: 0
+  - name: a-later-replica-syncs-from-its-peer
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}-t", "--storage-pool={{sp}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}-t"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}-t"]
+  - cmd: ["snapshot", "delete", "{{rd}}", "sdsrc"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

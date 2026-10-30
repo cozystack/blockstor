@@ -607,7 +607,9 @@ func snapshotDelete(ctx context.Context, run *runContext) error {
 
 	rdName, snapName := run.Flags.Positionals[0], run.Flags.Positionals[1]
 
-	err := run.Store.Snapshots().Delete(ctx, rdName, snapName)
+	// The same delete the REST door runs: see store.DeleteSnapshot. A
+	// snapshot that is not there is the idempotent no-op it always was.
+	err := store.DeleteSnapshot(ctx, run.Store, rdName, snapName)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete snapshot %s of %s: %w", snapName, rdName, err)
 	}
