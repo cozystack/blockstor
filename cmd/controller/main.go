@@ -72,8 +72,9 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	flag.BoolVar(&enableRestAPI, "enable-rest-api", false,
 		"Mount the LINSTOR-compatible REST API alongside the reconcilers. Default is OFF — the apiserver runs as a separate Deployment (cmd/apiserver) since Phase 11.x. Set to true only for the legacy single-binary deployment.")
-	flag.StringVar(&restAddr, "rest-bind-address", ":3370",
-		"The address the LINSTOR-compatible REST API binds to (upstream LINSTOR plain-text port is 3370). Ignored when --enable-rest-api=false.")
+	flag.StringVar(&restAddr, "rest-bind-address", defaultPlainBindAddress,
+		"The address the plain-HTTP LINSTOR-compatible REST API binds to. It has no authentication, so the default is loopback, "+
+			"reachable through `kubectl port-forward` only. Ignored when --enable-rest-api=false.")
 	flag.StringVar(&controllerNamespace, "controller-namespace", "",
 		"Namespace where the controller's own Secrets/ConfigMaps live (default: $POD_NAMESPACE, then 'blockstor-system').")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -308,6 +309,18 @@ func main() {
 	}
 
 	if enableRestAPI {
+		exposed, err := checkPlainBindAddress(restAddr)
+		if err != nil {
+			setupLog.Error(err, "Invalid plain-HTTP listener address")
+			os.Exit(1)
+		}
+
+		if exposed {
+			setupLog.Info("WARNING: the plain-HTTP listener serves the whole API without a client "+
+				"certificate and is bound off loopback; any pod that can reach this address can use it",
+				"address", restAddr)
+		}
+
 		ready.ArmREST()
 
 		if err := mgr.Add(&rest.Server{
