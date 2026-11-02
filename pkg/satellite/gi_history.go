@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cozystack/blockstor/pkg/drbd"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -51,6 +52,18 @@ const giHistoryPerVolume = 32
 // cost a map lookup, not a write.
 func (r *Reconciler) RecordObservedGI(rdName string, vol int32, generation string) {
 	if r.cfg.StateDir == "" || generation == "" {
+		return
+	}
+
+	// A zero GI is DRBD's "none yet" and identifies nothing. Anything else
+	// that is not hex is not a GI at all, and a record of it would later
+	// read as damaged and stop the repair for the whole resource.
+	if !drbd.IsGenerationUUID(generation) {
+		if strings.Trim(generation, "0") != "" {
+			slog.Default().Warn("not recording a generation that is not a hex UUID", "resource", rdName,
+				"volume", vol, "generation", generation)
+		}
+
 		return
 	}
 
@@ -189,7 +202,7 @@ func (r *Reconciler) readGIHistory(rdName string) (map[int32][]string, error) {
 		volField, generation, ok := strings.Cut(line, " ")
 		vol, convErr := strconv.ParseInt(volField, 10, 32)
 
-		if !ok || generation == "" || convErr != nil {
+		if !ok || !drbd.IsGenerationUUID(generation) || convErr != nil {
 			return nil, fmt.Errorf("the generation record of %s: %w: %q", rdName, errDamagedGIRecord, line)
 		}
 

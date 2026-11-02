@@ -994,6 +994,26 @@ func mustRecordedGIs(t *testing.T, rec *Reconciler, rdName string, vol int32) []
 	return got
 }
 
+// Only a GI is recorded: a zero one is DRBD's "none yet", and a value that
+// is not hex would make the whole record read as damaged later.
+func TestOnlyHexGenerationsAreRecorded(t *testing.T) {
+	rec, _, _, _, _ := uncleanFixture(t) //nolint:dogsled // only the reconciler is needed
+
+	for _, generation := range []string{"0000000000000000", "not-a-gi", "0x" + uncleanReportedGI, "6E3A 5D0B"} {
+		rec.RecordObservedGI("pvc-unclean", 0, generation)
+	}
+
+	if got := mustRecordedGIs(t, rec, "pvc-unclean", 0); len(got) != 0 {
+		t.Fatalf("recorded %v, want nothing", got)
+	}
+
+	rec.RecordObservedGI("pvc-unclean", 0, strings.ToLower(uncleanReportedGI))
+
+	if got := mustRecordedGIs(t, rec, "pvc-unclean", 0); !slices.Equal(got, []string{uncleanReportedGI}) {
+		t.Fatalf("recorded %v, want [%s]", got, uncleanReportedGI)
+	}
+}
+
 // A record that cannot be read is not "no record": the repair fails on it
 // with no create-md, on both paths, and an observation does not write over
 // it with its one GI. A damaged line counts as unreadable: skipping it
@@ -1004,6 +1024,8 @@ func TestUnreadableGIRecordFailsClosed(t *testing.T) {
 			"directory":           "",
 			"line with no GI":     "0\n",
 			"volume not a number": "zero " + uncleanReportedGI + "\n",
+			"GI not hex":          "0 not-a-gi\n",
+			"zero GI":             "0 0000000000000000\n",
 		} {
 			t.Run(path+"/"+damage, func(t *testing.T) {
 				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)

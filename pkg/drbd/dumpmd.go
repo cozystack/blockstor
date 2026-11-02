@@ -208,6 +208,13 @@ func firstStatement(text string) (string, bool) {
 	return "", false
 }
 
+// IsGenerationUUID says whether s is a generation UUID as drbdsetup and
+// drbdmeta print it without the 0x prefix: non-empty hex, not all zero.
+// Zero is DRBD's "no generation", which identifies nothing.
+func IsGenerationUUID(s string) bool {
+	return isHex(s) && strings.Trim(s, "0") != ""
+}
+
 func isHex(digits string) bool {
 	if digits == "" {
 		return false
