@@ -955,6 +955,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			SizeKib:        vd.SizeKib,
 			StoragePool:    pool,
 			SeedFromGI:     seedFromGI(target, vd.VolumeNumber),
+			ObservedGI:     observedGI(target, vd.VolumeNumber),
 			SourceSnapshot: srcSnapshot,
 			MetaPool:       metaPool,
 			Minor:          minor,
@@ -1008,6 +1009,18 @@ func seedFromGI(target *blockstoriov1alpha1.Resource, volumeNumber int32) string
 	for i := range target.Spec.Volumes {
 		if target.Spec.Volumes[i].VolumeNumber == volumeNumber {
 			return target.Spec.Volumes[i].SeedFromGI
+		}
+	}
+
+	return ""
+}
+
+// observedGI is the current GI the satellite last reported for the given
+// volume of target, or "" when it never reported one.
+func observedGI(target *blockstoriov1alpha1.Resource, volumeNumber int32) string {
+	for i := range target.Status.Volumes {
+		if target.Status.Volumes[i].VolumeNumber == volumeNumber {
+			return target.Status.Volumes[i].CurrentGI
 		}
 	}
 

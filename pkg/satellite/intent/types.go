@@ -382,6 +382,23 @@ type DesiredVolume struct {
 	// file points at an already-existing block device. The path is
 	// then propagated via the .res renderer's Volume.MetaDisk field.
 	MetaPool string
+
+	// ObservedGI is the current generation identifier the satellite last
+	// reported for this volume on this replica (Resource status), empty
+	// when none was ever reported. It is the per-volume record that this
+	// replica's lower disk carried established metadata: a dirty activity
+	// log on a volume with one is a crash to repair with apply-al, not a
+	// foreign superblock to re-initialise over.
+	ObservedGI string
+}
+
+// GetObservedGI returns the GI last reported for this volume, or "".
+func (x *DesiredVolume) GetObservedGI() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.ObservedGI
 }
 
 // GetVolumeNumber returns the per-RD volume index.
