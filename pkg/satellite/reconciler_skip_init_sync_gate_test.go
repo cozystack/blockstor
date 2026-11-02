@@ -193,7 +193,7 @@ func TestApplyElectsWinnerOnceSkipInitialSyncStampedTrue(t *testing.T) {
 	var sawWinnerSeed bool
 
 	for _, line := range calls {
-		if strings.HasPrefix(line, "drbdmeta --force pvc-skipgate/0 v09 ") &&
+		if strings.HasPrefix(line, "drbdmeta --force - v09 ") &&
 			strings.Contains(line, "set-gi") &&
 			strings.HasSuffix(strings.TrimSpace(line), ":1:1") {
 			sawWinnerSeed = true

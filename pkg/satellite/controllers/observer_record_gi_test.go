@@ -37,7 +37,7 @@ func TestObserverRecordsTheGIOfDataBearingVolumes(t *testing.T) {
 	t.Parallel()
 
 	fx := storage.NewFakeExec()
-	fx.Expect("drbdmeta --force pvc-r/0 v09 /dev/vg/pvc-r_00000 internal get-gi --node-id 0",
+	fx.Expect("drbdmeta --force - v09 /dev/vg/pvc-r_00000 internal get-gi --node-id 0",
 		storage.FakeResponse{Stdout: []byte("6E3A5D0B2C1F4A96:0:0:0\n")})
 
 	recorded := map[int32]string{}
