@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // SnapshotReconciler orchestrates the Bug-351 cross-satellite
@@ -236,7 +237,7 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 // existing row belongs to the satellite, never overwrite it).
 func hasNodeStatusEntry(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, node string) bool {
 	for i := range entries {
-		if entries[i].NodeName == node {
+		if sameNode(entries[i].NodeName, node) {
 			return true
 		}
 	}
@@ -688,13 +689,16 @@ func allTargetsMatch(
 	targets []string,
 	pred func(blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
 ) bool {
+	// A satellite writes its entry under its own node name, and the
+	// snapshot's node list carries the registered spelling: Node-1 and
+	// node-1 are one node.
 	byNode := make(map[string]blockstoriov1alpha1.SnapshotPerNodeStatus, len(entries))
 	for i := range entries {
-		byNode[entries[i].NodeName] = entries[i]
+		byNode[k8s.Name(entries[i].NodeName)] = entries[i]
 	}
 
 	for _, t := range targets {
-		entry, ok := byNode[t]
+		entry, ok := byNode[k8s.Name(t)]
 		if !ok {
 			return false
 		}

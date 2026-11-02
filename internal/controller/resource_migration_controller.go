@@ -122,9 +122,7 @@ func (r *ResourceMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{RequeueAfter: migrationRequeueInterval}, nil
 	}
 
-	srcName := resourceCRDName(dst.Spec.ResourceDefinitionName, srcNode)
-
-	err = r.pruneSrc(ctx, srcName)
+	err = r.pruneSrc(ctx, dst.Spec.ResourceDefinitionName, srcNode)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -135,7 +133,7 @@ func (r *ResourceMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	logger.Info("migration complete: src pruned, dst UpToDate",
-		"resource", dst.Name, "src", srcName)
+		"resource", dst.Name, "src", srcNode)
 
 	return ctrl.Result{}, nil
 }
@@ -144,10 +142,10 @@ func (r *ResourceMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 // swallowed — the operator may have removed it manually, or a
 // previous reconcile pass completed the delete but failed to clear
 // the prop afterwards. Either way, the reconciler is monotonic.
-func (r *ResourceMigrationReconciler) pruneSrc(ctx context.Context, srcName string) error {
+func (r *ResourceMigrationReconciler) pruneSrc(ctx context.Context, rdName, srcNode string) error {
 	var src blockstoriov1alpha1.Resource
 
-	err := r.Get(ctx, client.ObjectKey{Name: srcName}, &src)
+	err := getReplica(ctx, r.Client, rdName, srcNode, &src)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil

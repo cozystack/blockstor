@@ -19,7 +19,11 @@ limitations under the License.
 package controller
 
 import (
-	"strings"
+	"context"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
@@ -48,5 +52,36 @@ func sameDefinition(a, b string) bool {
 // spelling too. Both sides map to the node's CR name, which is how the
 // store addresses it.
 func sameNode(a, b string) bool {
-	return strings.EqualFold(a, b) || k8s.Name(a) == k8s.Name(b)
+	return k8s.SameName(a, b)
+}
+
+// getReplica reads the replica of definition rd on node into out, whichever
+// spellings the caller and the stored row use. The store names the CR from
+// the registered spellings, so the folded composite name finds it for every
+// name inside RFC 1123; a name outside it hashes case-sensitively, and a
+// replica written in another spelling is then found by its spec instead.
+// It answers NotFound when there is no such replica.
+func getReplica(ctx context.Context, c client.Reader, rd, node string, out *blockstoriov1alpha1.Resource) error {
+	err := c.Get(ctx, client.ObjectKey{Name: k8s.Name(rd + "." + node)}, out)
+	if err == nil || !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	var list blockstoriov1alpha1.ResourceList
+
+	err = c.List(ctx, &list)
+	if err != nil {
+		return err
+	}
+
+	for i := range list.Items {
+		item := &list.Items[i]
+		if sameDefinition(item.Spec.ResourceDefinitionName, rd) && sameNode(item.Spec.NodeName, node) {
+			*out = *item
+
+			return nil
+		}
+	}
+
+	return apierrors.NewNotFound(schema.GroupResource{Group: blockstoriov1alpha1.SchemeGroupVersion.Group, Resource: "resources"}, rd+"."+node)
 }

@@ -322,7 +322,7 @@ func (r *NodeReconciler) currentDiskfulTarget(ctx context.Context, rdName, evict
 func (r *NodeReconciler) pruneSource(ctx context.Context, rdName, node string) error {
 	resCRD := &blockstoriov1alpha1.Resource{}
 
-	err := r.Get(ctx, client.ObjectKey{Name: resourceCRDName(rdName, node)}, resCRD)
+	err := getReplica(ctx, r.Client, rdName, node, resCRD)
 	if err != nil {
 		return client.IgnoreNotFound(err)
 	}
@@ -412,7 +412,7 @@ func (r *NodeReconciler) evacuationReplacementReady(ctx context.Context, filter 
 func (r *NodeReconciler) replicaUpToDate(ctx context.Context, rdName, node string) (bool, error) {
 	resCRD := &blockstoriov1alpha1.Resource{}
 
-	err := r.Get(ctx, client.ObjectKey{Name: resourceCRDName(rdName, node)}, resCRD)
+	err := getReplica(ctx, r.Client, rdName, node, resCRD)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
@@ -444,12 +444,6 @@ func (r *NodeReconciler) drainingNodes(ctx context.Context) (map[string]struct{}
 	}
 
 	return out, nil
-}
-
-// resourceCRDName mirrors the encoding used by the k8s store —
-// `<rd>.<node>` is the documented composite key.
-func resourceCRDName(rd, node string) string {
-	return rd + "." + node
 }
 
 // annotateMigrationBlocked stamps the parent RD with the
