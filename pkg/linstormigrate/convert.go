@@ -458,12 +458,17 @@ func (c *converter) indexDiskStacks() {
 // stackDisagreement says why the RD's replicas cannot be adopted under one
 // stack, or "" when they can: replicas built under different stacks when
 // the RD row names none, or a replica built under another stack than the
-// one the row names. It reads the row's stack without reporting a parse
-// failure; rdLayerStack reports that once.
+// one the row names. A row whose stack cannot be read counts as naming
+// none, and the refusal names the value; rdLayerStack reports it when the
+// definition converts, so it is reported once either way.
 func (c *converter) stackDisagreement(row *ResourceDefinitionRow) string {
-	var stack []string
-	if !emptyList(row.LayerStack) {
-		_ = json.Unmarshal([]byte(row.LayerStack), &stack)
+	stack, readable := rowLayerStack(row)
+
+	// An unreadable column is taken as no stack, the replicas settling it,
+	// and a refusal says which it was.
+	ownStack := "no layer stack of its own"
+	if !readable {
+		ownStack = "an unreadable layer_stack " + strconv.Quote(row.LayerStack)
 	}
 
 	// With no stack of its own, the RD takes the one its replicas were
@@ -473,7 +478,7 @@ func (c *converter) stackDisagreement(row *ResourceDefinitionRow) string {
 	// says nothing new.
 	if len(stack) == 0 {
 		if node := c.unchainedReplica(row.ResourceName); node != "" {
-			return "no layer stack of its own, and the replica on " + c.displayNode(node) +
+			return ownStack + ", and the replica on " + c.displayNode(node) +
 				" has no layer chain in the dump, so the stack it was built with is unknown"
 		}
 	}
@@ -487,7 +492,7 @@ func (c *converter) stackDisagreement(row *ResourceDefinitionRow) string {
 
 	if len(stack) == 0 {
 		if len(keys) > 1 {
-			return "no layer stack of its own, and its replicas were built as " + strings.Join(keys, " and ")
+			return ownStack + ", and its replicas were built as " + strings.Join(keys, " and ")
 		}
 
 		return ""
@@ -530,7 +535,7 @@ func (c *converter) unchainedReplica(rdName string) string {
 // replicas disagree, or whose stack its replicas were not built with,
 // never gets here: rdConvertible skips it (stackDisagreement).
 func (c *converter) rdLayerStack(row *ResourceDefinitionRow, dsp string) []string {
-	stack := c.parseList(row.LayerStack, "resource definition "+dsp+" layer_stack")
+	stack, readable := rowLayerStack(row)
 	onDisk := c.diskStacks[row.ResourceName]
 
 	keys := make([]string, 0, len(onDisk))
@@ -545,10 +550,38 @@ func (c *converter) rdLayerStack(row *ResourceDefinitionRow, dsp string) []strin
 	}
 
 	if len(keys) == 1 {
+		if !readable {
+			c.warnf("resource definition %s: unreadable layer_stack %q; took the stack its replicas were built with, %s",
+				dsp, row.LayerStack, keys[0])
+		}
+
 		return slices.Clone(onDisk[keys[0]])
 	}
 
+	if !readable {
+		c.warnf("resource definition %s: unreadable layer_stack %q, and no diskful replica to read one from; left unset",
+			dsp, row.LayerStack)
+	}
+
 	return nil
+}
+
+// rowLayerStack reads the RD row's layer_stack column. readable is false
+// for a value that is not a JSON list; the stack is then nil, as for an
+// empty column, and the caller says so.
+func rowLayerStack(row *ResourceDefinitionRow) ([]string, bool) {
+	if emptyList(row.LayerStack) {
+		return nil, true
+	}
+
+	var stack []string
+
+	err := json.Unmarshal([]byte(row.LayerStack), &stack)
+	if err != nil {
+		return nil, false
+	}
+
+	return stack, true
 }
 
 func (c *converter) convertNodes() []crdv1alpha1.Node {

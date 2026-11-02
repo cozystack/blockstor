@@ -79,8 +79,8 @@ Read the whole report it prints. Each `warning:` line is something the tool refu
 
 - `LUKS passphrase NOT migrated`.
 - `no DRBD port`.
-- `no layer stack of its own, and its replicas were built as ... left unset; set spec.layerStack before adopting`. The definition names no layer stack, and its replicas were built with different stacks. Set `spec.layerStack` on the definition in the converted manifests to the stack its data was built with. The converter sets `spec.initialized` on a definition whose replicas it adopts, so one left without a stack runs as `DRBD`, `STORAGE`, however its replicas were built: if its group sets another stack, the controller pins the default one; see [How the stack is pinned](../layer-stack/#how-the-stack-is-pinned).
-- `but a replica was built as ... that replica will not come up as it is`. The definition's layer stack differs from the one a replica was built with. Settle which stack the data has before you adopt it.
+- `skipped with its replicas`. The definition's replicas cannot be adopted under one layer stack: they were built two ways, a diskful replica has no layer chain in the dump, or a replica was built otherwise than the stack the definition names. The reason in the line says which. An unreadable `layer_stack` column counts as no stack, and the line names its value. Adopted as it is, such a replica would come up under a stack it was not built with, which for a LUKS volume writes DRBD metadata over its ciphertext. Settle the stack in LINSTOR and convert again.
+- `unreadable layer_stack`. The definition's `layer_stack` column is not a list the converter can read. When its replicas agree, it takes the stack they were built with and the line names it; check that this is the stack you expect. With no diskful replica the stack is left unset and the controller pins one; see [How the stack is pinned](../layer-stack/#how-the-stack-is-pinned).
 
 A definition with no layer stack whose replicas all agree takes their stack without a warning.
 
