@@ -1707,7 +1707,7 @@ func (s *Server) refuseResourceCreateOnSPDeletedRace(w http.ResponseWriter, r *h
 
 		writeError(w, http.StatusNotFound,
 			"storage pool '"+pool+"' was deleted on node '"+res.NodeName+
-				"' concurrently with the resource create (Bug 145): "+
+				"' concurrently with the resource create: "+
 				"retry after re-creating the pool, or pick a different pool")
 
 		return false
@@ -1745,7 +1745,7 @@ func (s *Server) refuseResourceCreateOnNodeDeletedRace(w http.ResponseWriter, r 
 
 		writeError(w, http.StatusNotFound,
 			"node '"+res.NodeName+"' was deleted concurrently with "+
-				"the resource create (Bug 174): retry after re-creating "+
+				"the resource create: retry after re-creating "+
 				"the node, or pick a different node")
 
 		return false

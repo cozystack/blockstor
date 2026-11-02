@@ -18,7 +18,11 @@ limitations under the License.
 
 package rest
 
-import "github.com/cozystack/blockstor/pkg/store"
+import (
+	"net/http"
+
+	"github.com/cozystack/blockstor/pkg/store"
+)
 
 // applyPropsModify is the shared property-bag merge core. Every
 // LINSTOR object that accepts a `GenericPropsModify` envelope
@@ -83,4 +87,38 @@ func deletePropNamespaces(props map[string]string, namespaces []string) {
 			}
 		}
 	}
+}
+
+// The wire names of the props-modify envelope's three fields.
+const (
+	fieldOverrideProps    = "override_props"
+	fieldDeleteProps      = "delete_props"
+	fieldDeleteNamespaces = "delete_namespaces"
+)
+
+// refusePropsModifyOnCreate answers a create door that received the
+// props-modify fields. Those fields edit props that already exist, and a
+// create has none yet; neither golinstor nor python-linstor sends them on
+// rd create or rg spawn. Honouring them would invent semantics, and dropping
+// them answers success for an edit that never happened, so they are refused
+// with the field named. Returns true when the request was answered.
+func refusePropsModifyOnCreate(w http.ResponseWriter, door string, override map[string]string, del, namespaces []string) bool {
+	var field string
+
+	switch {
+	case len(override) > 0:
+		field = fieldOverrideProps
+	case len(del) > 0:
+		field = fieldDeleteProps
+	case len(namespaces) > 0:
+		field = fieldDeleteNamespaces
+	default:
+		return false
+	}
+
+	writeError(w, http.StatusBadRequest,
+		door+" does not take "+field+": set the properties on the definition once it exists, "+
+			"with `linstor rd set-property` or a resource-definition modify")
+
+	return true
 }

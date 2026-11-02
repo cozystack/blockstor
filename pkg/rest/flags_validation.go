@@ -156,7 +156,7 @@ func init() {
 
 	for _, p := range pairs {
 		if p.local != p.exported {
-			panic("Bug-167 flag-allowlist desync: local " + p.name + " != apiv1 constant")
+			panic("flag allowlist out of sync with apiv1: local " + p.name + " != apiv1 constant")
 		}
 	}
 }

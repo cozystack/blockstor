@@ -39,17 +39,19 @@ func (s *Server) registerSpawn(mux *http.ServeMux) {
 }
 
 // handleSpawn creates a ResourceDefinition + VolumeDefinitions from a
-// ResourceGroup template. Replica placement (creating Resource objects on
-// satellites) is a separate Phase 3 concern owned by the autoplacer; this
-// handler only materialises the definition side, which is what linstor-csi
-// expects from the Spawn call before it issues separate placement
-// instructions.
+// ResourceGroup template and places replicas by the group's select filter,
+// as upstream `linstor rg spawn` does, unless the caller asks for the
+// definitions only.
 func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	rgName := r.PathValue("rg")
 
 	var req apiv1.ResourceGroupSpawn
 
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if refusePropsModifyOnCreate(w, "resource group spawn", req.OverrideProps, req.DeleteProps, req.DeleteNamespace) {
 		return
 	}
 
@@ -64,7 +66,9 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.ResourceDefinitionName == "" {
-		writeError(w, http.StatusBadRequest, "resource_definition_name is required (auto-naming Phase 6)")
+		writeError(w, http.StatusBadRequest,
+			"resource_definition_name is required: blockstor does not generate names, "+
+				"so a spawn by external name alone is refused; pass a resource definition name")
 
 		return
 	}
@@ -163,13 +167,22 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 		return
 	}
 
+	// definitions_only asks for the definition and its volumes without a
+	// placement (`linstor rg spawn --definition-only`).
+	if req.DefinitionsOnly {
+		writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "resource definition spawned without placement (definitions_only): " + rd.Name,
+		}})
+
+		return
+	}
+
 	// Upstream LINSTOR's `linstor rg spawn` autoplaces according to
 	// the RG's SelectFilter — that's the operator-visible contract:
 	// spawn = create RD + VDs + place replicas. Without this step,
 	// `r l` would be empty after spawn until the operator runs a
-	// separate `r c --auto-place=N`. The CSI flow follows the same
-	// contract (linstor-csi calls /spawn, then expects to find
-	// resources in /v1/view/resources on the next reconcile).
+	// separate `r c --auto-place=N`.
 	placeErr := spawnAutoplace(r.Context(), s, rd.Name, rg, req)
 	if placeErr != nil {
 		log.FromContext(r.Context()).WithName("rest").

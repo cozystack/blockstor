@@ -161,7 +161,7 @@ func (s *Server) handleVDPassphraseRotate(w http.ResponseWriter, r *http.Request
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "VD passphrase stored; cluster-side LUKS rotation pending Phase 12",
+		Message: "VD passphrase stored; it is not applied to existing LUKS devices",
 	}})
 }
 
