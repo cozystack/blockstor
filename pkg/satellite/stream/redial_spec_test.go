@@ -29,8 +29,8 @@ package stream_test
 // Pinned current behaviour (DEFERRED — Outcome B):
 //
 //  1. blockstor's satellite has NO `--controller-bind-address` flag.
-//     The only flags on cmd/satellite/main.go are `--node-name` and
-//     `--state-dir`. Verified in TestSatelliteFlagsLackControllerBindAddress
+//     None of the flags in cmd/satellite/flags.go carries a controller
+//     address. Verified in TestSatelliteFlagsLackControllerBindAddress
 //     below.
 //
 //  2. Phase 10.6 retired every satellite→controller gRPC wire — the
@@ -108,25 +108,25 @@ import (
 func TestSatelliteFlagsLackControllerBindAddress(t *testing.T) {
 	t.Parallel()
 
-	mainPath := satelliteMainPath(t)
+	flagsPath := satelliteFlagsPath(t)
 
 	fset := token.NewFileSet()
 
-	f, err := parser.ParseFile(fset, mainPath, nil, parser.SkipObjectResolution)
+	f, err := parser.ParseFile(fset, flagsPath, nil, parser.SkipObjectResolution)
 	if err != nil {
-		t.Fatalf("parse %s: %v", mainPath, err)
+		t.Fatalf("parse %s: %v", flagsPath, err)
 	}
 
 	flags := collectFlagNames(f)
 
-	// Sanity: we actually parsed flags out of main.go. If main.go
-	// stops using flag.StringVar / flag.BoolVar entirely (e.g.
+	// Sanity: we actually parsed flags out of flags.go. If flags.go
+	// stops using flagSet.StringVar / flagSet.BoolVar entirely (e.g.
 	// migrated to cobra) this slice will be empty and the test
 	// becomes meaningless — fail loudly so a follow-up audit picks
 	// it up.
 	if len(flags) == 0 {
-		t.Fatalf("no flag.*Var calls found in %s — has the binary been ported to a new flag library? "+
-			"Update this spec test to read whichever new mechanism declares CLI flags.", mainPath)
+		t.Fatalf("no flagSet.*Var calls found in %s: has the binary been ported to a new flag library? "+
+			"Update this spec test to read whichever new mechanism declares CLI flags.", flagsPath)
 	}
 
 	// The forbidden-by-current-spec flag names. Any of these
@@ -151,14 +151,19 @@ func TestSatelliteFlagsLackControllerBindAddress(t *testing.T) {
 
 	// Belt-and-braces: pin the exact flag set we expect today, so
 	// any drift (added or removed) trips review. The order matches
-	// the order declared in cmd/satellite/main.go.
+	// the order declared in cmd/satellite/flags.go.
 	// Bug 207 added health-probe-bind-address for kubelet livenessProbe.
 	// Bug 023 added controller-namespace — it names the NAMESPACE the
 	// cluster master passphrase Secret lives in (read via the
 	// kube-apiserver, the satellite's one and only wire); it carries
 	// no controller ADDRESS and does not re-open the Outcome A
 	// controller-wire question this spec guards.
-	want := []string{"node-name", "state-dir", "health-probe-bind-address", "controller-namespace"}
+	// The stream-tls-* files are the mutual TLS of the snapshot stream
+	// between satellites; they carry no controller address either.
+	want := []string{
+		"node-name", "state-dir", "health-probe-bind-address", "controller-namespace",
+		"stream-tls-cert-file", "stream-tls-key-file", "stream-tls-ca-file",
+	}
 	if !equalStringSlices(flags, want) {
 		t.Fatalf("satellite flag set drifted: got %v, want %v. "+
 			"If this is intentional, update the want list AND update tests/scenarios/03-networking.md §3.10 "+
@@ -207,11 +212,11 @@ func TestNodeCRDHasNoActiveField(t *testing.T) {
 	}
 }
 
-// satelliteMainPath resolves cmd/satellite/main.go relative to the
-// running test binary. The test runs under
+// satelliteFlagsPath resolves cmd/satellite/flags.go, where parseFlags
+// declares every satellite flag, relative to the running test binary. The test runs under
 // pkg/satellite/stream/, so we walk two directories up then
 // into cmd/satellite/.
-func satelliteMainPath(t *testing.T) string {
+func satelliteFlagsPath(t *testing.T) string {
 	t.Helper()
 
 	// runtime.Caller returns the path of this test file inside the
@@ -219,21 +224,21 @@ func satelliteMainPath(t *testing.T) string {
 	// os.Getwd which would be the per-test temp dir.
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
-		t.Fatal("runtime.Caller(0) failed — cannot locate cmd/satellite/main.go")
+		t.Fatal("runtime.Caller(0) failed: cannot locate cmd/satellite/flags.go")
 	}
 
 	// thisFile = .../pkg/satellite/stream/redial_spec_test.go
 	// Walk up to the module root (4 levels: stream → satellite → pkg → root).
 	root := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(thisFile))))
 
-	return filepath.Join(root, "cmd", "satellite", "main.go")
+	return filepath.Join(root, "cmd", "satellite", "flags.go")
 }
 
-// collectFlagNames walks the parsed AST of cmd/satellite/main.go and
-// returns every flag name passed to flag.StringVar / flag.BoolVar /
-// flag.IntVar / flag.Float64Var / flag.DurationVar in declaration
-// order. Pure AST inspection — does NOT execute main(), which would
-// register the flags into flag.CommandLine and pollute other tests.
+// collectFlagNames walks the parsed AST of cmd/satellite/flags.go and
+// returns every flag name passed to flagSet.StringVar / flagSet.BoolVar /
+// flagSet.IntVar / flagSet.Float64Var / flagSet.DurationVar (or the same on the flag
+// package) in declaration order. Pure AST inspection, it does NOT
+// execute main().
 func collectFlagNames(f *ast.File) []string {
 	var names []string
 
@@ -249,11 +254,11 @@ func collectFlagNames(f *ast.File) []string {
 		}
 
 		pkg, ok := sel.X.(*ast.Ident)
-		if !ok || pkg.Name != "flag" {
+		if !ok || (pkg.Name != "flag" && pkg.Name != "flagSet") {
 			return true
 		}
 
-		// Match Var-style flag declarations only (the form main.go
+		// Match Var-style flag declarations only (the form flags.go
 		// actually uses). Bare flag.String / flag.Bool return a
 		// pointer and aren't used here; if a future change moves to
 		// them, expand this list.
