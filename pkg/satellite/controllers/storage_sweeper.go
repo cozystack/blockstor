@@ -379,7 +379,7 @@ func (s *StorageOrphanSweeperRunnable) listOwnedVolumeRefs(ctx context.Context) 
 
 	for i := range resList.Items {
 		r := &resList.Items[i]
-		if r.Spec.NodeName != s.NodeName {
+		if !isNode(r.Spec.NodeName, s.NodeName) {
 			continue
 		}
 

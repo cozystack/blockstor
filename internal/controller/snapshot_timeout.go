@@ -332,7 +332,7 @@ func (r *SnapshotReconciler) siblingReplicasUpToDate(
 	for i := range resList.Items {
 		res := &resList.Items[i]
 
-		if res.Spec.ResourceDefinitionName != snap.Spec.ResourceDefinitionName {
+		if !sameDefinition(res.Spec.ResourceDefinitionName, snap.Spec.ResourceDefinitionName) {
 			continue
 		}
 

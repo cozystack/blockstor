@@ -601,7 +601,7 @@ func (s *OrphanSweeperRunnable) listOwnedResourceNames(ctx context.Context) (map
 
 	for i := range list.Items {
 		r := &list.Items[i]
-		if r.Spec.NodeName != s.NodeName {
+		if !isNode(r.Spec.NodeName, s.NodeName) {
 			continue
 		}
 

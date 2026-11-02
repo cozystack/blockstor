@@ -140,7 +140,7 @@ func (b *MetadataCreatedBackfillRunnable) RegisterWithManager(mgr manager.Manage
 // (caller bumps the counter). Pulled out so Start stays under the
 // funlen budget.
 func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) bool {
-	if res.Spec.NodeName != b.NodeName {
+	if !isNode(res.Spec.NodeName, b.NodeName) {
 		return false
 	}
 
