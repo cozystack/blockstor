@@ -225,7 +225,7 @@ func (r *ResourceDefinitionReconciler) rdHoldsData(ctx context.Context, rdName s
 
 	for i := range list.Items {
 		res := &list.Items[i]
-		if res.Spec.ResourceDefinitionName != rdName {
+		if !isReplicaOf(res, rdName) {
 			continue
 		}
 
