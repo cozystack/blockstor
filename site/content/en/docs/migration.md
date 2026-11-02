@@ -62,7 +62,7 @@ Not converted, and listed in the tool's report:
    zfs list -H -o name -t snapshot | sort
    ```
 
-   Snapshots are found as `<pool>/<definition>_00000@<snapshot>`. Do not continue while any single-replica volume is missing under its expected name.
+   Snapshots are found as `<pool>/<definition CR name>_00000@<snapshot>`. Do not continue while any single-replica volume is missing under its expected name.
 
 6. **Rehearse on staging.** Run the whole procedure on a copy of the pools. Check that every pool registers, every replica reaches `UpToDate` without a resync, and no new empty volumes appear.
 
