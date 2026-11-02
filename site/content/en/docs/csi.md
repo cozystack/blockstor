@@ -46,7 +46,35 @@ The node plugin's `--node` argument must match the name of a blockstor `Node`, w
 
 ## Client certificates in another namespace
 
-The supported layout runs the CSI driver in `blockstor-system`, next to blockstor: install piraeus-operator into that namespace, and its components take their client certificates from `blockstor-api-ca` directly, with nothing to copy. The rest of this section is for a driver that has to run elsewhere.
+The supported layout runs the CSI driver in `blockstor-system`, next to blockstor: install piraeus-operator into that namespace, and its components take their client certificates from `blockstor-api-ca` directly, with nothing to copy.
+
+piraeus-operator's `config/default` kustomization installs into `piraeus-datastore`. Override the namespace with a kustomization of your own. The patch drops the operator's `Namespace` object, which would otherwise be renamed to `blockstor-system`; blockstor's manifests already create that namespace, and a later `kubectl delete -k` would delete it with everything in it:
+
+```sh
+mkdir piraeus-operator
+cat > piraeus-operator/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: blockstor-system
+resources:
+  - https://github.com/piraeusdatastore/piraeus-operator//config/default?ref=v2.10.0
+patches:
+  - target:
+      kind: Namespace
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: unused
+EOF
+kubectl apply --server-side -k piraeus-operator
+kubectl -n blockstor-system wait deploy/piraeus-operator-controller-manager --for=condition=Available --timeout=5m
+```
+
+Then create the `LinstorCluster` as in [With piraeus-operator](#with-piraeus-operator), with the `blockstor-api-ca` Issuer of `blockstor-system`. blockstor's own test installation keeps the operator in `piraeus-datastore` instead, with the mirrored CA described below.
+
+The rest of this section is for a driver that has to run elsewhere.
 
 The Secret `blockstor-apiserver-client-tls` and the `blockstor-api-ca` Issuer both live in `blockstor-system`, and `blockstor-api-ca` is a namespaced `Issuer`. cert-manager looks up an `Issuer` in the Certificate's own namespace, so a Certificate in any other namespace that names `blockstor-api-ca` is never issued. A pod can only mount a Secret from its own namespace. A CSI driver that runs outside `blockstor-system` needs the client material brought into its namespace. There are two ways to do that.
 
