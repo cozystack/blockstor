@@ -996,31 +996,54 @@ func mustRecordedGIs(t *testing.T, rec *Reconciler, rdName string, vol int32) []
 
 // A record that cannot be read is not "no record": the repair fails on it
 // with no create-md, on both paths, and an observation does not write over
-// it with its one GI.
+// it with its one GI. A damaged line counts as unreadable: skipping it
+// could leave the volume with no record.
 func TestUnreadableGIRecordFailsClosed(t *testing.T) {
 	for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
-		t.Run(path, func(t *testing.T) {
-			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+		for damage, content := range map[string]string{
+			"directory":           "",
+			"line with no GI":     "0\n",
+			"volume not a number": "zero " + uncleanReportedGI + "\n",
+		} {
+			t.Run(path+"/"+damage, func(t *testing.T) {
+				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+				record := rec.giHistoryPath("pvc-unclean")
 
-			// A directory where the file should be: every read of it fails.
-			if err := os.Mkdir(rec.giHistoryPath("pvc-unclean"), 0o700); err != nil {
-				t.Fatalf("make the record unreadable: %v", err)
-			}
+				var err error
+				if damage == "directory" {
+					// A directory where the file should be: every read of it fails.
+					err = os.Mkdir(record, 0o700)
+				} else {
+					err = os.WriteFile(record, []byte(content), 0o600)
+				}
 
-			if err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath); err == nil {
-				t.Fatal("a repair over an unreadable record was answered with success")
-			}
+				if err != nil {
+					t.Fatalf("damage the record: %v", err)
+				}
 
-			if ranCommand(fx, "create-md") {
-				t.Error("create-md ran over a volume whose record could not be read")
-			}
+				if err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath); err == nil {
+					t.Fatal("a repair over an unreadable record was answered with success")
+				}
 
-			rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+				if ranCommand(fx, "create-md") {
+					t.Error("create-md ran over a volume whose record could not be read")
+				}
 
-			if info, err := os.Stat(rec.giHistoryPath("pvc-unclean")); err != nil || !info.IsDir() {
-				t.Errorf("an observation wrote over the unreadable record: %v", err)
-			}
-		})
+				rec.RecordObservedGI("pvc-unclean", 0, uncleanReportedGI)
+
+				if damage == "directory" {
+					if info, err := os.Stat(record); err != nil || !info.IsDir() {
+						t.Errorf("an observation wrote over the unreadable record: %v", err)
+					}
+
+					return
+				}
+
+				if got, _ := os.ReadFile(record); string(got) != content {
+					t.Errorf("an observation wrote over the damaged record: %q", got)
+				}
+			})
+		}
 	}
 }
 

@@ -161,6 +161,10 @@ func (r *Reconciler) giHistoryPath(rdName string) string {
 // leaves the volume to be initialised as before; one that cannot be read is
 // an error, never an empty history, since an empty one is what lets the
 // repair re-initialise a volume that has a record.
+// errDamagedGIRecord reports a generation record line this code did not
+// write.
+var errDamagedGIRecord = errors.New("damaged line")
+
 func (r *Reconciler) readGIHistory(rdName string) (map[int32][]string, error) {
 	out := map[int32][]string{}
 
@@ -173,19 +177,28 @@ func (r *Reconciler) readGIHistory(rdName string) (map[int32][]string, error) {
 		return nil, fmt.Errorf("read the generation record of %s: %w", rdName, err)
 	}
 
+	// A line this code did not write means the file is damaged, and
+	// skipping it could leave a volume with no record: that fails too.
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
-		volField, generation, ok := strings.Cut(strings.TrimSpace(scanner.Text()), " ")
-		if !ok || generation == "" {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
 			continue
 		}
 
+		volField, generation, ok := strings.Cut(line, " ")
 		vol, convErr := strconv.ParseInt(volField, 10, 32)
-		if convErr != nil {
-			continue
+
+		if !ok || generation == "" || convErr != nil {
+			return nil, fmt.Errorf("the generation record of %s: %w: %q", rdName, errDamagedGIRecord, line)
 		}
 
 		out[int32(vol)] = append(out[int32(vol)], generation)
+	}
+
+	err = scanner.Err()
+	if err != nil {
+		return nil, fmt.Errorf("read the generation record of %s: %w", rdName, err)
 	}
 
 	return out, nil

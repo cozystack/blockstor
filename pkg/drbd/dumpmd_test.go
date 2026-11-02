@@ -114,6 +114,11 @@ func TestParseMetadataUUIDsReadsEverySlot(t *testing.T) {
 				"bm {\n   0xDEADBEEFDEADBEEF;\n}\n",
 			want: []string{"9F00AA11BB22CC33", "1234567890ABCDEF"},
 		},
+		{
+			name: "v08 block on one line",
+			dump: "version \"v08\";\nuuid { 0x9F00AA11BB22CC33; 0x6E3A5D0B2C1F4A96; flags 0x00000011; }\n",
+			want: []string{"9F00AA11BB22CC33", "6E3A5D0B2C1F4A96"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -141,6 +146,11 @@ func TestParseMetadataUUIDsRefusesWhatItCannotRead(t *testing.T) {
 		"zero current":       "version \"v09\";\ncurrent-uuid 0x0000000000000000;\n",
 		"unreadable current next to a bitmap UUID": "version \"v09\";\ncurrent-uuid 6E3A5D0B2C1F4A96;\n" +
 			"peer[1] {\n    bitmap-uuid 0x1234567890ABCDEF;\n}\n",
+		"v08 zero current next to a bitmap UUID": "version \"v08\";\nuuid {\n" +
+			"    0x0000000000000000; 0x6E3A5D0B2C1F4A96; 0x1234567890ABCDEF; 0x0000000000000000;\n    flags 0x00000011;\n}\n",
+		"v08 current without 0x": "version \"v08\";\nuuid {\n" +
+			"    9F00AA11BB22CC33; 0x6E3A5D0B2C1F4A96; 0x1234567890ABCDEF; 0x0000000000000000;\n    flags 0x00000011;\n}\n",
+		"v08 block on one line with a zero current": "version \"v08\";\nuuid { 0x0000000000000000; 0x6E3A5D0B2C1F4A96; }\n",
 		"renamed keyword": "version \"v09\";\ncurrent-gi 0x9F00AA11BB22CC33;\npeer[1] {\n    bitmap-uuid 0x6E3A5D0B2C1F4A96;\n}\n",
 		"line too long":   "current-uuid 0x9F00AA11BB22CC33;\n" + strings.Repeat("x", dumpLineMax+1) + "\n",
 	} {

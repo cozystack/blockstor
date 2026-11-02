@@ -76,55 +76,20 @@ const (
 // device UUID are not generation identifiers.
 //
 // A dump that names no current UUID, a v09 `current-uuid` statement that
-// gives one or a v08 `uuid` block, or that yields no UUID at all, is not one
+// gives one or a v08 `uuid` block that leads with one, or that yields no
+// UUID at all, is not one
 // this parser can read: empty output, a keyword
 // drbdmeta renamed, or a line the scanner gave up on. That is an error, never
 // an empty answer, since the caller would read an empty answer as "this
 // superblock holds none of our generations" and re-initialise it.
 func ParseMetadataUUIDs(dump []byte) ([]string, error) {
-	var (
-		out     []string
-		block   bool
-		current bool
-	)
+	var parsed uuidDump
 
 	scanner := bufio.NewScanner(bytes.NewReader(dump))
 	scanner.Buffer(make([]byte, 0, dumpLineBuffer), dumpLineMax)
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-
-		if block {
-			body, _, closed := strings.Cut(line, "}")
-			out = appendUUIDStatements(out, body)
-			block = !closed
-
-			continue
-		}
-
-		key, rest, _ := strings.Cut(line, " ")
-
-		switch key {
-		case dumpKeyCurrent, "bitmap-uuid":
-			before := len(out)
-			out = appendUUIDStatements(out, rest)
-			// A current statement counts only when it gave a UUID: one
-			// without the 0x prefix, not hex, or zero is unreadable too.
-			current = current || (key == dumpKeyCurrent && len(out) > before)
-		case "history-uuids", dumpKeyV08:
-			current = current || key == dumpKeyV08
-
-			body, opens := strings.CutPrefix(strings.TrimSpace(rest), "{")
-			if !opens {
-				out = appendUUIDStatements(out, rest)
-
-				continue
-			}
-
-			body, _, closed := strings.Cut(body, "}")
-			out = appendUUIDStatements(out, body)
-			block = !closed
-		}
+		parsed.line(strings.TrimSpace(scanner.Text()))
 	}
 
 	err := scanner.Err()
@@ -132,11 +97,68 @@ func ParseMetadataUUIDs(dump []byte) ([]string, error) {
 		return nil, errors.Wrap(err, "read the dump-md output")
 	}
 
-	if !current || len(out) == 0 {
+	if !parsed.current || len(parsed.out) == 0 {
 		return nil, ErrUnreadableMetadataDump
 	}
 
-	return out, nil
+	return parsed.out, nil
+}
+
+// uuidDump is what ParseMetadataUUIDs has read so far.
+type uuidDump struct {
+	out     []string
+	block   bool
+	current bool
+	// v08Lead is set while the v08 block has not yet given its first
+	// statement, which is the current UUID.
+	v08Lead bool
+}
+
+func (d *uuidDump) line(line string) {
+	if d.block {
+		body, _, closed := strings.Cut(line, "}")
+		d.blockText(body, closed)
+
+		return
+	}
+
+	key, rest, _ := strings.Cut(line, " ")
+
+	switch key {
+	case dumpKeyCurrent, "bitmap-uuid":
+		before := len(d.out)
+		d.out = appendUUIDStatements(d.out, rest)
+		// A current statement counts only when it gave a UUID: one
+		// without the 0x prefix, not hex, or zero is unreadable too.
+		d.current = d.current || (key == dumpKeyCurrent && len(d.out) > before)
+	case "history-uuids", dumpKeyV08:
+		d.v08Lead = key == dumpKeyV08
+
+		body, opens := strings.CutPrefix(strings.TrimSpace(rest), "{")
+		if !opens {
+			d.blockText(rest, true)
+
+			return
+		}
+
+		body, _, closed := strings.Cut(body, "}")
+		d.blockText(body, closed)
+	}
+}
+
+// blockText reads text of an open block, which closed ends. In the v08
+// block the first statement must be a readable UUID for the dump to name a
+// current one.
+func (d *uuidDump) blockText(text string, closed bool) {
+	if first, ok := firstStatement(text); ok && d.v08Lead {
+		_, readable := uuidStatement(first)
+		d.current = d.current || readable
+		d.v08Lead = false
+	}
+
+	d.out = appendUUIDStatements(d.out, text)
+	d.block = !closed
+	d.v08Lead = d.v08Lead && d.block
 }
 
 // The statements that name a current UUID: v09's own one, and v08's block
@@ -155,15 +177,35 @@ var ErrUnreadableMetadataDump = errors.New("dump-md printed no current UUID this
 // `flags 0x00000011;` inside the uuid block, is not one.
 func appendUUIDStatements(out []string, text string) []string {
 	for statement := range strings.SplitSeq(text, ";") {
-		digits, ok := strings.CutPrefix(strings.TrimSpace(statement), "0x")
-		if !ok || !isHex(digits) || strings.Trim(digits, "0") == "" {
-			continue
+		if uuid, ok := uuidStatement(statement); ok {
+			out = append(out, uuid)
 		}
-
-		out = append(out, strings.ToUpper(digits))
 	}
 
 	return out
+}
+
+// uuidStatement answers the UUID a statement is, when it is a bare non-zero
+// hex UUID.
+func uuidStatement(statement string) (string, bool) {
+	digits, ok := strings.CutPrefix(strings.TrimSpace(statement), "0x")
+	if !ok || !isHex(digits) || strings.Trim(digits, "0") == "" {
+		return "", false
+	}
+
+	return strings.ToUpper(digits), true
+}
+
+// firstStatement answers the first non-empty statement of text, if it has
+// one.
+func firstStatement(text string) (string, bool) {
+	for statement := range strings.SplitSeq(text, ";") {
+		if trimmed := strings.TrimSpace(statement); trimmed != "" {
+			return trimmed, true
+		}
+	}
+
+	return "", false
 }
 
 func isHex(digits string) bool {
