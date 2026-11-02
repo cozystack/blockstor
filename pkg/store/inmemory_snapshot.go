@@ -161,6 +161,12 @@ func (s *inMemorySnapshots) PatchSnapshotProps(
 		return err
 	}
 
+	// Empty props read back as none, the way the API server drops an empty
+	// map.
+	if len(props) == 0 {
+		props = nil
+	}
+
 	snap.Props = props
 	s.m[key] = snap
 

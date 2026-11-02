@@ -132,6 +132,8 @@ blockstor snapshot resource restore \
 
 In-place rollback is not available on purpose: it destroys every snapshot newer than the one you roll back to. Restore into a new volume instead.
 
+A snapshot that a restore reads from cannot be deleted until that restore has a replica with every volume `UpToDate`: until then `blockstor snapshot delete` fails with `a restore from this snapshot is not finished` (`linstor snapshot delete` gets a 409), and you retry it later.
+
 ```sh
 blockstor snapshot delete my-volume before-upgrade
 ```

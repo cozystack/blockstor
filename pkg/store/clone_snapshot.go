@@ -120,8 +120,9 @@ const cloneSnapshotReapingMarkTTL = 5 * time.Minute
 // was restored from, which is therefore kept.
 var ErrCloneSnapshotInUse = errors.New("internal clone snapshot is still a restore source")
 
-// ErrRestoreSourceWithdrawn reports a snapshot that was deleted, or is being
-// reaped, while a definition was being restored from it.
+// ErrRestoreSourceWithdrawn reports a snapshot that was deleted, or that a
+// reap or a delete has started on, while a definition was being restored
+// from it.
 var ErrRestoreSourceWithdrawn = errors.New("snapshot was withdrawn while a definition was restored from it")
 
 // ErrRestoreSourceReaping is the withdrawal a live reaping mark alone causes:
@@ -263,20 +264,30 @@ func dropReapingMark(ctx context.Context, st Store, source, snapshot, mark strin
 	return err //nolint:wrapcheck // callers wrap with the snapshot they name
 }
 
-// uncachedSnapshot reads one snapshot from the API server.
-func uncachedSnapshot(ctx context.Context, st Store, source, snapshot string) (apiv1.Snapshot, error) {
-	snaps, err := st.Snapshots().ListByDefinitionUncached(ctx, source)
+// uncachedSnapshot reads one snapshot from the API server, both names
+// compared the way LINSTOR compares names. The scoped read compares the
+// definition name verbatim, so it asks under the spelling the definition is
+// stored with; a snapshot whose definition is gone is asked for as named.
+func uncachedSnapshot(ctx context.Context, st Store, srcRD, snapName string) (apiv1.Snapshot, error) {
+	rd, err := st.ResourceDefinitions().GetUncached(ctx, srcRD)
+	if err == nil {
+		srcRD = rd.Name
+	} else if !errors.Is(err, ErrNotFound) {
+		return apiv1.Snapshot{}, fmt.Errorf("read %q to find snapshot %s on it: %w", srcRD, snapName, err)
+	}
+
+	snaps, err := st.Snapshots().ListByDefinitionUncached(ctx, srcRD)
 	if err != nil {
-		return apiv1.Snapshot{}, fmt.Errorf("read snapshot %s/%s: %w", source, snapshot, err)
+		return apiv1.Snapshot{}, fmt.Errorf("read snapshot %s of %s: %w", snapName, srcRD, err)
 	}
 
 	for i := range snaps {
-		if strings.EqualFold(snaps[i].Name, snapshot) {
+		if strings.EqualFold(snaps[i].Name, snapName) {
 			return snaps[i], nil
 		}
 	}
 
-	return apiv1.Snapshot{}, fmt.Errorf("snapshot %s/%s: %w", source, snapshot, ErrNotFound)
+	return apiv1.Snapshot{}, fmt.Errorf("snapshot %s of %s: %w", snapName, srcRD, ErrNotFound)
 }
 
 // reapingMarkIsLive reports whether a reaping mark belongs to a reap that can
@@ -295,15 +306,18 @@ func reapingMarkIsLive(mark string, now time.Time) bool {
 	return now.Sub(written) < cloneSnapshotReapingMarkTTL
 }
 
-// RestoreSourceWithdrawn is the restore's half of the protocol described on
-// ReapClonedSnapshot: called after the restored definition was created, it
-// reads the snapshot back past the cache and reports ErrRestoreSourceWithdrawn
-// when it is gone or a reap that is still live has started on it. Any other
-// error means the answer could not be had, and the caller withdraws as well.
+// RestoreSourceWithdrawn is the restore's half of the protocols described on
+// ReapClonedSnapshot and DeleteSnapshot: called once the restored definition
+// carries its marker, it reads the snapshot back past the cache and reports
+// ErrRestoreSourceWithdrawn when it is gone, wrapping ErrNotFound, when a
+// delete was issued on it, or when a reap or a delete that is still live has
+// started on it, wrapping ErrRestoreSourceReaping or ErrRestoreSourceDeleting.
+// Any other error means the answer could not be had, and the caller
+// withdraws as well.
 func RestoreSourceWithdrawn(ctx context.Context, st Store, source, snapshot string) error {
 	snap, err := uncachedSnapshot(ctx, st, source, snapshot)
 	if errors.Is(err, ErrNotFound) {
-		return fmt.Errorf("%w: %s/%s was deleted", ErrRestoreSourceWithdrawn, source, snapshot)
+		return fmt.Errorf("%w: %s/%s was deleted: %w", ErrRestoreSourceWithdrawn, source, snapshot, err)
 	}
 
 	if err != nil {
@@ -314,8 +328,14 @@ func RestoreSourceWithdrawn(ctx context.Context, st Store, source, snapshot stri
 		return fmt.Errorf("%w: %s/%s is being deleted", ErrRestoreSourceWithdrawn, source, snapshot)
 	}
 
-	if reapingMarkIsLive(snap.Props[CloneSnapshotReapingProp], time.Now()) {
+	now := time.Now()
+
+	if reapingMarkIsLive(snap.Props[CloneSnapshotReapingProp], now) {
 		return fmt.Errorf("%w: %s/%s: %w", ErrRestoreSourceWithdrawn, source, snapshot, ErrRestoreSourceReaping)
+	}
+
+	if deletingMarkIsLive(snap.Props[SnapshotDeletingProp], now) {
+		return fmt.Errorf("%w: %s/%s: %w", ErrRestoreSourceWithdrawn, source, snapshot, ErrRestoreSourceDeleting)
 	}
 
 	return nil

@@ -351,7 +351,7 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 	}
 
 	// The snapshot was read before the definition existed; see
-	// store.ReapClonedSnapshot.
+	// store.ReapClonedSnapshot and store.DeleteSnapshot.
 	err = store.RestoreSourceWithdrawn(ctx, run.Store, snap.ResourceName, snap.Name)
 	if err != nil {
 		return rollbackRestore(ctx, run, def.Name, planned, err)
@@ -508,7 +508,7 @@ func restoreIntoExistingTarget(
 // placeOverMarkedTarget places the planned replicas on a target that carries
 // this restore's marker. The snapshot was read before the marker went on, or
 // before this run found it there, so it is read back first; see
-// store.ReapClonedSnapshot.
+// store.ReapClonedSnapshot and store.DeleteSnapshot.
 func placeOverMarkedTarget(
 	ctx context.Context, run *runContext, rdName string, snap *apiv1.Snapshot, planned []apiv1.Resource,
 ) error {
@@ -778,6 +778,14 @@ func volumeAlreadyRestored(ctx context.Context, run *runContext, rdName string, 
 func rollbackRestore(
 	ctx context.Context, run *runContext, rdName string, planned []apiv1.Resource, cause error,
 ) error {
+	// The rollback runs on a budget of its own, like the REST door's. A retry
+	// takes over an in-progress mark older than store.StaleRollbackAfter on
+	// the grounds that nobody is behind it; a CLI rollback without a
+	// deadline could still be, and could then take apart a definition the
+	// retry had answered for.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), store.CLIRollbackBudget)
+	defer cancel()
+
 	err := store.HoldRollback(ctx, run.Store, rdName, true)
 	if errors.Is(err, store.ErrRollbackGone) {
 		return cause
@@ -1097,13 +1105,21 @@ func unwindVolumes(ctx context.Context, run *runContext, rdName string, added []
 func planRestoredReplicas(
 	ctx context.Context, run *runContext, srcRD, rdName string, snap *apiv1.Snapshot,
 ) ([]apiv1.Resource, error) {
+	// The same refusal the REST door makes, before anything is written: see
+	// store.RefuseReplicasWithoutDefinition. A target that already has its
+	// definition passes it.
+	err := store.RefuseReplicasWithoutDefinition(ctx, run.Store, rdName)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // names the definition and the replicas itself
+	}
+
 	nodes := run.Flags.Nodes
 
 	// Named nodes have to actually hold the snapshot. Restoring onto one
 	// that does not produces a replica with nothing behind it: the objects
 	// are created, the satellite finds no snapshot to receive, and the
 	// command reports success over an empty volume.
-	err := validate.RestoreNodesHoldSnapshot(nodes, snap.Nodes)
+	err = validate.RestoreNodesHoldSnapshot(nodes, snap.Nodes)
 	if err != nil {
 		//nolint:wrapcheck // a semantic refusal; see checkVolumeSize
 		return nil, err

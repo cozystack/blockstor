@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // AutoSnapshot prop keys mirror upstream LINSTOR's namespaced keys
@@ -148,6 +150,11 @@ type AutoSnapshotRunnable struct {
 	// Period overrides AutoSnapshotPeriod (test-only). A zero
 	// Period falls back to the default.
 	Period time.Duration
+
+	// Store deletes an auto-snapshot through store.DeleteSnapshot, which
+	// judges whether a restore from it is finished. Nil keeps every
+	// auto-snapshot a definition was restored from.
+	Store store.Store
 }
 
 // NeedLeaderElection returns true: the cron writes Snapshot CRDs
@@ -454,13 +461,64 @@ func (r *AutoSnapshotRunnable) pruneOldAutoSnapshots(
 			continue
 		}
 
-		err := r.Client.Delete(ctx, snap)
-		if err != nil && !apierrors.IsNotFound(err) {
-			return errors.Wrapf(err, "delete auto-snapshot %q", snap.Name)
+		err := r.pruneAutoSnapshot(ctx, rd.Name, snap)
+		if err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+// pruneAutoSnapshot deletes one auto-snapshot past the keep budget, unless a
+// definition restored from it still needs it; it is then kept for this pass
+// and pruned once that restore is finished. With a store the delete is
+// store.DeleteSnapshot, the one every snapshot delete door runs, which takes
+// a finished restore's marker off and holds off a restore racing the delete.
+func (r *AutoSnapshotRunnable) pruneAutoSnapshot(
+	ctx context.Context, rdName string, snap *blockstoriov1alpha1.Snapshot,
+) error {
+	if r.Store != nil {
+		err := store.DeleteSnapshot(ctx, r.Store, rdName, snap.Spec.SnapshotName)
+		if errors.Is(err, store.ErrRestoreSourceInUse) || errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+
+		return errors.Wrapf(err, "delete auto-snapshot %q", snap.Name)
+	}
+
+	inUse, err := r.restoreReadsFrom(ctx, rdName, snap.Spec.SnapshotName)
+	if err != nil || inUse {
+		return err
+	}
+
+	err = r.Client.Delete(ctx, snap)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return errors.Wrapf(err, "delete auto-snapshot %q", snap.Name)
+	}
+
+	return nil
+}
+
+// restoreReadsFrom reports, for a runnable with no store, whether any
+// definition was restored from rdName:snapName. Without a store a finished
+// restore cannot be told from an unfinished one, so every such snapshot is
+// kept.
+func (r *AutoSnapshotRunnable) restoreReadsFrom(ctx context.Context, rdName, snapName string) (bool, error) {
+	var rds blockstoriov1alpha1.ResourceDefinitionList
+
+	err := r.Client.List(ctx, &rds)
+	if err != nil {
+		return false, errors.Wrap(err, "list definitions restored from an auto-snapshot")
+	}
+
+	for i := range rds.Items {
+		if strings.EqualFold(rds.Items[i].Spec.Props[store.RestoreFromSnapshotProp], rdName+":"+snapName) {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // RegisterWithManager wires the runnable into the controller-runtime
