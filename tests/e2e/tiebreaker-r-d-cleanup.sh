@@ -64,7 +64,7 @@ N3=$WORKER_3
 # so 60s is comfortable on the QEMU stand.
 CONVERGE=${CONVERGE:-60}
 
-# blockstor's REST/apiserver is exposed inside the cluster on :3370
+# blockstor's plain REST port :3370 listens on the pod's loopback only
 # (LinstorPlain). Use port-forward + a host-side `linstor` CLI so the
 # scenario can drive the same REST endpoints the user reaches by
 # `kubectl exec`-ing into the satellite — no satellite-pod coupling.

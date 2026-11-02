@@ -64,7 +64,7 @@ kubectl -n blockstor-system rollout status daemonset/blockstor-satellite
 
 ## Point the `linstor` client at the apiserver
 
-Install the client (`apt install linstor-client`, or `pip install python-linstor`). The apiserver Service exposes a mutual-TLS listener on port **3371**; a plain-HTTP debug port **3370** is bound pod-local only. The simplest way to reach it from a workstation is a port-forward to the plain-HTTP port:
+Install the client (`apt install linstor-client`, or `pip install python-linstor`). The apiserver Service exposes a mutual-TLS listener on port **3371**; a plain-HTTP debug port **3370** is bound to the pod's loopback, with no authentication, so only a port-forward reaches it. The simplest way to reach it from a workstation is a port-forward to the plain-HTTP port:
 
 ```sh
 kubectl -n blockstor-system port-forward deploy/blockstor-apiserver 3370:3370
