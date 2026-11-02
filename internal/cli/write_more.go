@@ -33,6 +33,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/validate"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // kibPerMib is the binary step between adjacent size suffixes. The
@@ -764,7 +765,7 @@ func resolveStorPool(ctx context.Context, run *runContext, rdName, node string) 
 	siblings, err := run.Store.Resources().ListByDefinition(ctx, rdName)
 	if err == nil {
 		for i := range siblings {
-			if siblings[i].NodeName == node ||
+			if k8s.SameName(siblings[i].NodeName, node) ||
 				slices.Contains(siblings[i].Flags, apiv1.ResourceFlagDiskless) {
 				continue
 			}

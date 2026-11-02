@@ -31,6 +31,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // registerNodeLifecycle wires the eviction / restore / lost endpoints.
@@ -134,7 +135,7 @@ func (s *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
 
 		for i := range resources {
 			res := &resources[i]
-			if res.NodeName != name {
+			if !k8s.SameName(res.NodeName, name) {
 				continue
 			}
 
@@ -283,11 +284,13 @@ func queryFlag(r *http.Request, name string) bool {
 
 // evacuatingSet folds the variadic node list into a lookup map.
 // Kept separate from the handler body so the pre-check helpers
-// share the same shape without re-allocating per call.
+// share the same shape without re-allocating per call. It is keyed
+// by CR name, like isEvacuating reads it, so node-1 in the request
+// and Node-1 on the wire are one node.
 func evacuatingSet(names []string) map[string]bool {
 	out := make(map[string]bool, len(names))
 	for _, name := range names {
-		out[name] = true
+		out[k8s.Name(name)] = true
 	}
 
 	return out
@@ -328,7 +331,7 @@ func (s *Server) checkEvacuateCandidate(ctx context.Context, w http.ResponseWrit
 
 	for i := range allNodes {
 		n := &allNodes[i]
-		if evacuating[n.Name] {
+		if evacuating[k8s.Name(n.Name)] {
 			continue
 		}
 
@@ -364,7 +367,7 @@ func (s *Server) checkEvacuateInUse(ctx context.Context, w http.ResponseWriter, 
 
 	for i := range resources {
 		res := &resources[i]
-		if !evacuating[res.NodeName] {
+		if !evacuating[k8s.Name(res.NodeName)] {
 			continue
 		}
 
@@ -655,4 +658,12 @@ func removeFlag(flag string) func([]string) []string {
 
 		return out
 	}
+}
+
+// nodeKey is the key a node takes in a set built from wire rows. A replica
+// shows its node as it was registered, Node-1, while a satellite reports
+// itself and a pool keeps the spelling it was created with, node-1: LINSTOR
+// names are case-insensitive, so the two are one node.
+func nodeKey(name string) string {
+	return strings.ToLower(name)
 }

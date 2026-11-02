@@ -32,6 +32,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/validate"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // errRollbackUnsupported explains a deliberate omission.
@@ -1317,7 +1318,7 @@ func sourcePoolOn(ctx context.Context, run *runContext, srcRD, node string) (str
 			continue
 		}
 
-		if replicas[i].NodeName == node {
+		if k8s.SameName(replicas[i].NodeName, node) {
 			return pool, nil
 		}
 

@@ -29,6 +29,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
 
@@ -369,7 +370,7 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 	var refs []string
 
 	for i := range all {
-		if all[i].NodeName != node {
+		if !k8s.SameName(all[i].NodeName, node) {
 			continue
 		}
 

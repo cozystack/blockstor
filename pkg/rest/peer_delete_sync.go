@@ -25,6 +25,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // peerDeleteAckTimeout bounds how long handleResourceDelete waits for
@@ -105,7 +106,7 @@ func (s *Server) waitForPeerDeletionAcks(ctx context.Context, rdName, removedNod
 
 	for i := range siblings {
 		sib := &siblings[i]
-		if sib.NodeName == removedNode {
+		if k8s.SameName(sib.NodeName, removedNode) {
 			continue
 		}
 

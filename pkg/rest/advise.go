@@ -23,6 +23,7 @@ import (
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // registerAdvise wires `linstor advise resource` and the cluster-wide
@@ -146,7 +147,7 @@ func pickAdvicePools(pools []apiv1.StoragePool, filter *apiv1.AutoSelectFilter, 
 			continue
 		}
 
-		if _, off := disabled[pool.NodeName]; off {
+		if _, off := disabled[k8s.Name(pool.NodeName)]; off {
 			continue
 		}
 

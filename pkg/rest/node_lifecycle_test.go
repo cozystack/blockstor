@@ -1350,3 +1350,33 @@ func TestNodeEvacuateSingleInUseWireCompatibleWithMulti(t *testing.T) {
 		t.Errorf("n1 stamped EVICTED despite refusal from both forms: %v", got.Flags)
 	}
 }
+
+// The in-use guard reads replicas as the wire spells their node, Node-1,
+// while the evacuate names the node in any spelling: a Primary on Node-1
+// still refuses `n evacuate node-1`.
+func TestNodeEvacuateRefusedWhenInUseInAnotherSpelling(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "Node-1"}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "rd-busy",
+		NodeName: "Node-1",
+		State:    apiv1.ResourceState{InUse: boolPtr(true)},
+	}); err != nil {
+		t.Fatalf("seed busy resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/node-1/evacuate", nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409 for a Primary on Node-1", resp.StatusCode)
+	}
+}

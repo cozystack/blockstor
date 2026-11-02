@@ -29,6 +29,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // registerSnapshots wires snapshot endpoints. Three different paths land
@@ -446,7 +447,7 @@ func isSnapshotSuccessful(snap *apiv1.Snapshot, diskful map[string]struct{}) boo
 			continue
 		}
 
-		reported[entry.NodeName] = struct{}{}
+		reported[nodeKey(entry.NodeName)] = struct{}{}
 	}
 
 	for node := range denominator {
@@ -470,8 +471,8 @@ func successDenominator(snap *apiv1.Snapshot, diskful map[string]struct{}) map[s
 	out := make(map[string]struct{}, len(snap.Nodes))
 
 	for _, node := range snap.Nodes {
-		if _, ok := diskful[node]; ok {
-			out[node] = struct{}{}
+		if _, ok := diskful[nodeKey(node)]; ok {
+			out[nodeKey(node)] = struct{}{}
 		}
 	}
 
@@ -516,7 +517,7 @@ func (s *Server) diskfulPeerSet(ctx context.Context, rdName string) (map[string]
 			continue
 		}
 
-		out[resList[i].NodeName] = struct{}{}
+		out[nodeKey(resList[i].NodeName)] = struct{}{}
 	}
 
 	return out, nil
@@ -1065,9 +1066,11 @@ func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.
 // mixed-provider RD is not falsely refused. An empty targetNodes means
 // "all diskful replicas" (the un-pinned default-fan-out case).
 func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.Resource, targetNodes []string) []string {
+	// Keyed by CR name: snap.Nodes lists a node as registered, and a
+	// replica written before the store stored CR names may spell it so too.
 	want := make(map[string]struct{}, len(targetNodes))
 	for _, n := range targetNodes {
-		want[n] = struct{}{}
+		want[k8s.Name(n)] = struct{}{}
 	}
 
 	var offenders []poolOffender
@@ -1079,7 +1082,7 @@ func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.R
 
 		// Scope to the resolved target set when the caller pinned one.
 		if len(want) > 0 {
-			if _, ok := want[res.NodeName]; !ok {
+			if _, ok := want[k8s.Name(res.NodeName)]; !ok {
 				continue
 			}
 		}

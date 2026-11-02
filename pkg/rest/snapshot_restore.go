@@ -1784,7 +1784,7 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 			NodeName: node,
 		}
 
-		pool := poolByNode[node]
+		pool := poolByNode[nodeKey(node)]
 		if pool == "" {
 			pool = fallbackPool
 		}
@@ -1979,7 +1979,7 @@ func storPoolsByNodeFromSourceRD(ctx context.Context, st store.Store, srcRDName 
 			continue
 		}
 
-		byNode[resList[i].NodeName] = pool
+		byNode[nodeKey(resList[i].NodeName)] = pool
 
 		if fallback == "" {
 			fallback = pool
