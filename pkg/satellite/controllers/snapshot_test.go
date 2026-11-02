@@ -848,3 +848,45 @@ func TestSnapshotReconcileNodeStatusIdempotentRestamp(t *testing.T) {
 			got.Status.NodeStatus[0].CreateTimestamp, seedTimestamp)
 	}
 }
+
+// A snapshot lists its node in the registered spelling, Node-1, and the
+// satellite started as node-1 takes it: the reconcile stamps its finalizer
+// rather than passing the snapshot by as another node's.
+func TestSnapshotReconcileTakesItsNodeInAnotherSpelling(t *testing.T) {
+	t.Parallel()
+
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.snap-1"},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-1",
+			SnapshotName:           "snap-1",
+			Nodes:                  []string{"Node-1"},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(newSnapshotScheme(t)).WithObjects(snap).Build()
+
+	reconciler := &controllers.SnapshotReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "node-1",
+			Apply:    satellite.NewReconciler(satellite.ReconcilerConfig{Providers: map[string]storage.Provider{}}),
+			Exec:     storage.NewFakeExec(),
+		},
+	}
+
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-1.snap-1"},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got blockstoriov1alpha1.Snapshot
+	if err := cli.Get(context.Background(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if !slices.Contains(got.Finalizers, controllers.SatelliteSnapshotFinalizer) {
+		t.Errorf("node-1 passed by a snapshot listing Node-1: finalizers %v", got.Finalizers)
+	}
+}

@@ -51,6 +51,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/luks"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // kubeInternalNICName is the NetInterface name the dispatcher prefers
@@ -420,7 +421,7 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 
 	for i := range localList.Items {
 		local := &localList.Items[i]
-		if local.Spec.ResourceDefinitionName == rd.Name &&
+		if k8s.SameName(local.Spec.ResourceDefinitionName, rd.Name) &&
 			isNode(local.Spec.NodeName, r.Config.NodeName) {
 			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
 		}
@@ -438,7 +439,7 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: res.Spec.ResourceDefinitionName}, &rd)
+	err := r.Get(ctx, client.ObjectKey{Name: k8s.Name(res.Spec.ResourceDefinitionName)}, &rd)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
@@ -1067,7 +1068,7 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 
 	for i := range localList.Items {
 		local := &localList.Items[i]
-		if local.Spec.ResourceDefinitionName == res.Spec.ResourceDefinitionName &&
+		if k8s.SameName(local.Spec.ResourceDefinitionName, res.Spec.ResourceDefinitionName) &&
 			isNode(local.Spec.NodeName, r.Config.NodeName) {
 			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
 		}
@@ -1197,7 +1198,7 @@ func (r *ResourceReconciler) listPeerResources(ctx context.Context, target *bloc
 	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+		if k8s.SameName(resList.Items[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			peers = append(peers, resList.Items[i])
 		}
 	}
@@ -1227,8 +1228,8 @@ func (r *ResourceReconciler) peerReader() client.Reader {
 // cached flags then stand, which is the pre-fix behaviour.
 func adoptAuthoritativeFlags(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) {
 	for i := range peers {
-		if peers[i].Spec.NodeName == target.Spec.NodeName &&
-			peers[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+		if k8s.SameName(peers[i].Spec.NodeName, target.Spec.NodeName) &&
+			k8s.SameName(peers[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			target.Spec.Flags = peers[i].Spec.Flags
 
 			return
@@ -1407,7 +1408,7 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 
 	for i := range peers {
 		peer := &peers[i]
-		if peer.Spec.NodeName == target.Spec.NodeName {
+		if k8s.SameName(peer.Spec.NodeName, target.Spec.NodeName) {
 			continue
 		}
 
@@ -1574,7 +1575,7 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 func (r *ResourceReconciler) lookupVolumeNumbers(ctx context.Context, res *blockstoriov1alpha1.Resource) ([]int32, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: res.Spec.ResourceDefinitionName}, &rd)
+	err := r.Get(ctx, client.ObjectKey{Name: k8s.Name(res.Spec.ResourceDefinitionName)}, &rd)
 	if err == nil {
 		out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
 		for i := range rd.Spec.VolumeDefinitions {

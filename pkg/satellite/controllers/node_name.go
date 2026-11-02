@@ -18,7 +18,11 @@ limitations under the License.
 
 package controllers
 
-import "github.com/cozystack/blockstor/pkg/store/k8s"
+import (
+	"slices"
+
+	"github.com/cozystack/blockstor/pkg/store/k8s"
+)
 
 // isNode reports whether name, as a replica or a pool spells its node, is
 // node. The store addresses a Node under its folded name, so a Node
@@ -27,5 +31,11 @@ import "github.com/cozystack/blockstor/pkg/store/k8s"
 // replica written or adopted before the store and linstor-migrate stored
 // the node's CR name may carry Node-1: either is this satellite's.
 func isNode(name, node string) bool {
-	return k8s.Name(name) == k8s.Name(node)
+	return k8s.SameName(name, node)
+}
+
+// listsNode reports whether a snapshot's node list, which carries the
+// registered spellings, names node.
+func listsNode(nodes []string, node string) bool {
+	return slices.ContainsFunc(nodes, func(n string) bool { return isNode(n, node) })
 }

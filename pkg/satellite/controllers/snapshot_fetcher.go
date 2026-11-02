@@ -89,7 +89,7 @@ func (f *SnapshotFetcher) Fetch(ctx context.Context, srcRD, snapName string, vol
 	var lastErr error
 
 	for _, peer := range snap.Spec.Nodes {
-		if peer == f.NodeName {
+		if isNode(peer, f.NodeName) {
 			continue
 		}
 
@@ -126,7 +126,7 @@ func (f *SnapshotFetcher) Fetch(ctx context.Context, srcRD, snapName string, vol
 func (f *SnapshotFetcher) resolvePeerAddr(ctx context.Context, peerNode string) (string, error) {
 	var node blockstoriov1alpha1.Node
 
-	err := f.Client.Get(ctx, client.ObjectKey{Name: peerNode}, &node)
+	err := f.Client.Get(ctx, client.ObjectKey{Name: k8s.Name(peerNode)}, &node)
 	if err != nil {
 		return "", errors.Wrapf(err, "get node CRD %s", peerNode)
 	}
