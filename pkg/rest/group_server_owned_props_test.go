@@ -127,6 +127,59 @@ func TestSpawnDoesNotCopyAGroupPassphraseProp(t *testing.T) {
 	}
 }
 
+// The same holds for a volume group's props, which a spawn copies onto the
+// volume definition it creates for that volume number.
+func TestSpawnDoesNotCopyAVolumeGroupPassphraseProp(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{
+		Name: "rg-vgpass",
+		VolumeGroups: []apiv1.VolumeGroup{{
+			VolumeNumber: 0,
+			Props: map[string]string{
+				passphrase.PropKeyVolume:      "left-over-plaintext",
+				"DrbdOptions/Disk/al-extents": "6007",
+			},
+		}},
+	}); err != nil {
+		t.Fatalf("seed the group: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-vgpass",
+		VolumeSizes:            []int64{4096 * 1024},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-vgpass/spawn", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("spawn = %d, want 201", resp.StatusCode)
+	}
+
+	vd, err := st.VolumeDefinitions().Get(t.Context(), "pvc-vgpass", 0)
+	if err != nil {
+		t.Fatalf("read the spawned volume: %v", err)
+	}
+
+	for key := range vd.Props {
+		if passphrase.IsPlaintextPropKey(key) {
+			t.Errorf("spawned volume carries %s from its volume group", key)
+		}
+	}
+
+	if vd.Props["DrbdOptions/Disk/al-extents"] != "6007" {
+		t.Errorf("spawned volume lost an ordinary volume group prop: %v", vd.Props)
+	}
+}
+
 func TestGroupCreateRefusesServerOwnedProps(t *testing.T) {
 	t.Parallel()
 
