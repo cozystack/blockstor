@@ -75,7 +75,14 @@ go install github.com/cozystack/blockstor/cmd/linstor-migrate@v<VERSION>
 linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifests.yaml
 ```
 
-Read the whole report it prints. Each `warning:` line is something the tool refused to guess. Resolve every `LUKS passphrase NOT migrated` and every `no DRBD port` line before you go on.
+Read the whole report it prints. Each `warning:` line is something the tool refused to guess. Resolve every one of these before you go on:
+
+- `LUKS passphrase NOT migrated`.
+- `no DRBD port`.
+- `no layer stack of its own, and its replicas were built as ... left unset; set spec.layerStack before adopting`. The definition names no layer stack, and its replicas were built with different stacks. Set `spec.layerStack` on the definition in the converted manifests to the stack its data was built with. The converter sets `spec.initialized` on a definition whose replicas it adopts, so one left without a stack runs as `DRBD`, `STORAGE`, however its replicas were built: if its group sets another stack, the controller pins the default one; see [How the stack is pinned](../layer-stack/#how-the-stack-is-pinned).
+- `but a replica was built as ... that replica will not come up as it is`. The definition's layer stack differs from the one a replica was built with. Settle which stack the data has before you adopt it.
+
+A definition with no layer stack whose replicas all agree takes their stack without a warning.
 
 ## Cut over
 
