@@ -1869,35 +1869,36 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 			return errors.Wrapf(err, "del-peer %s from %s", peer, dr.GetName())
 		}
 
-		// forget-peer is per-volume because v09 metadata lives in
-		// the per-volume block. Skip volumes without a device path
-		// (DISKLESS local replica — no metadata to clean) and
-		// peers without a resolvable node-id (.res malformed /
-		// races a brand-new resource being torn down before its
-		// peer ever rendered).
+		// forget-peer reclaims the peer's metadata slot on every
+		// volume at once, through the kernel. Skip a peer without a
+		// resolvable node-id (.res malformed, or a brand-new resource
+		// torn down before its peer ever rendered) and a local replica
+		// with no device at all (DISKLESS: no metadata to clean).
 		peerID, hasID := peerIDs[peer]
-		if !hasID {
+		if !hasID || !anyDevice(devices) {
 			continue
 		}
 
-		for volNum, device := range devices {
-			if device == "" {
-				continue
-			}
-
-			// forget-peer errors are non-fatal: a stale on-disk
-			// slot leaks one of the MaxPeers-1 budget entries but
-			// the resource keeps serving I/O. The next reconcile
-			// retries; if the leak persists, the eventual
-			// create-md exhaustion surfaces a louder error than
-			// any log line here could. del-peer errors still
-			// bubble (above) — those leak a live kernel
-			// connection, a faster correctness issue.
-			_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), volNum, device, peerID)
-		}
+		// forget-peer errors are non-fatal: a stale slot leaks one of
+		// the MaxPeers-1 budget entries but the resource keeps serving
+		// I/O, and the next reconcile retries. del-peer errors still
+		// bubble (above): those leak a live kernel connection.
+		_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), peerID)
 	}
 
 	return nil
+}
+
+// anyDevice reports whether the local replica has a device for at least
+// one volume, so it has metadata a forgotten peer's slot can be cleared in.
+func anyDevice(devices map[int32]string) bool {
+	for _, device := range devices {
+		if device != "" {
+			return true
+		}
+	}
+
+	return false
 }
 
 // computeRemovedPeers diffs the previously-rendered .res file against

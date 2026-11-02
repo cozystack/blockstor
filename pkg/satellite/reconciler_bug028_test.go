@@ -99,7 +99,7 @@ func expectThinBacking(fx *storage.FakeExec, rd string) string {
 }
 
 func expectGetGI(fx *storage.FakeExec, rd, device, currentGI string) {
-	fx.Expect("drbdmeta --force "+rd+"/0 v09 "+device+" internal get-gi --node-id 0",
+	fx.Expect("drbdmeta --force - v09 "+device+" internal get-gi --node-id 0",
 		storage.FakeResponse{Stdout: []byte(currentGI + ":0000000000000000:0:0:1:1:0:0:0:0\n")})
 }
 

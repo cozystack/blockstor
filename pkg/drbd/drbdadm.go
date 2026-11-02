@@ -31,6 +31,17 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
+// drbdmetaNoMinor is the device drbdmeta is given for a backing device
+// addressed directly, without a DRBD minor: `-` is the name drbdmeta itself
+// treats as "no minor", and it then takes no minor lock and skips its
+// attached check. These calls used to pass `<resource>/<vol>`, which is no
+// device name drbdmeta knows. It worked by accident: drbdmeta's minor lookup
+// answers -1, its `minor < 0` refusal never fires because the field is
+// unsigned, and it went on to lock and check minor -1. `-` says what the
+// calls mean. They all run on a backing device the kernel does not hold
+// (set-gi before `up`) or only read it (get-gi, show-gi, dump-md).
+const drbdmetaNoMinor = "-"
+
 // Adm is a thin wrapper around the `drbdadm` CLI. It exists so the
 // satellite reconciler can be unit-tested without a real DRBD kernel
 // module present: production injects storage.RealExec, tests inject
@@ -495,7 +506,7 @@ func (a *Adm) SetGIString(ctx context.Context, resource string, volume int32, de
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	_, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
+		"drbdmeta", "--force", drbdmetaNoMinor, "v09", device, "internal",
 		"set-gi", "--node-id", strconv.Itoa(int(peerNodeID)), gi)
 	if err != nil {
 		return errors.Wrapf(err, "drbdmeta set-gi %s --node-id %d", target, peerNodeID)
@@ -504,37 +515,26 @@ func (a *Adm) SetGIString(ctx context.Context, resource string, volume int32, de
 	return nil
 }
 
-// ForgetPeer clears a peer's GI / bitmap slot from this replica's
-// on-disk DRBD metadata via `drbdmeta <res>/<vol> v09 <device>
-// internal forget-peer <peer-node-id>`. Must run AFTER DelPeer
-// (which clears the kernel-side connection slot) on a per-volume
-// basis — DRBD-9 v09 metadata stores per-peer slots in the
-// per-volume metadata block, one slot per peer node-id.
+// ForgetPeer reclaims a removed peer's slot in the metadata of every
+// volume of resource, through the kernel: `drbdsetup forget-peer <res>
+// <peer-node-id>`. Run it after `del-peer`, while the resource is up.
 //
-// Why this matters: DelPeer only severs the kernel connection.
-// The on-disk slot keeps the peer's last-known GI and dirty
-// bitmap forever — eating one of the MaxPeers-1 metadata slots
-// `drbdadm create-md --max-peers=15` carved out at first
-// activation. After enough permanent-node-removal cycles the
-// resource exhausts its slot pool and the next replica add
-// fails with `drbdmeta create-md` running out of room. Calling
-// forget-peer in the per-node-removal path keeps the slot pool
-// recyclable.
+// Without it, `del-peer` only severs the kernel connection; the metadata
+// still records the departed peer's GI and bitmap slot. After enough
+// permanent node removals the v09 layout runs out of its
+// `--max-peers=MaxPeers-1` slots and the next replica add fails.
 //
-// Idempotent on a slot that's already empty: drbdmeta exits zero
-// with a no-op warning. A missing metadata block (resource never
-// fully initialised) bubbles up as an error so the caller can
-// log and continue — the slot leakage we're trying to prevent
-// can't have accumulated on a resource that has no metadata to
-// begin with.
-func (a *Adm) ForgetPeer(ctx context.Context, resource string, volume int32, device string, peerNodeID int32) error {
-	target := fmt.Sprintf("%s/%d", resource, volume)
-
-	_, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
-		"forget-peer", strconv.Itoa(int(peerNodeID)))
+// The kernel clears the slot in memory on every volume and syncs the
+// metadata itself, and refuses while a connection to that node still
+// exists, which is what upstream drbdadm does first too. drbdmeta is not
+// used here: on a disk the kernel has attached it would rewrite the whole
+// superblock under the kernel, whose next metadata write reverts the
+// change, and a kernel write between drbdmeta's read and its write would
+// be lost.
+func (a *Adm) ForgetPeer(ctx context.Context, resource string, peerNodeID int32) error {
+	_, err := a.exec.Run(ctx, "drbdsetup", "forget-peer", resource, strconv.Itoa(int(peerNodeID)))
 	if err != nil {
-		return errors.Wrapf(err, "drbdmeta forget-peer %s --node-id %d", target, peerNodeID)
+		return errors.Wrapf(err, "drbdsetup forget-peer %s %d", resource, peerNodeID)
 	}
 
 	return nil
@@ -797,7 +797,7 @@ func (a *Adm) ApplyAL(ctx context.Context, resource string) error {
 	return a.run(ctx, "apply-al", resource)
 }
 
-// WipeMd runs `drbdmeta --force <res>/<vol> v09 <device> internal
+// WipeMd runs `drbdmeta --force - v09 <device> internal
 // wipe-md` — the deliberate-wipe counterpart to CreateMD. Zeroes
 // the metadata block on the lower disk so a subsequent CreateMD
 // starts from a clean slate. Operator-recovery use case: a
@@ -814,7 +814,7 @@ func (a *Adm) WipeMd(ctx context.Context, resource string, volume int32, device 
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	_, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
+		"drbdmeta", "--force", drbdmetaNoMinor, "v09", device, "internal",
 		"wipe-md")
 	if err != nil {
 		return errors.Wrapf(err, "drbdmeta wipe-md %s", target)
@@ -823,7 +823,7 @@ func (a *Adm) WipeMd(ctx context.Context, resource string, volume int32, device 
 	return nil
 }
 
-// ShowGI runs `drbdmeta --force <res>/<vol> v09 <device> internal
+// ShowGI runs `drbdmeta --force - v09 <device> internal
 // show-gi` and returns the raw stdout — the on-disk generation
 // UUID tuple, peer slot table, and bitmap-UUID per peer. Used
 // for verification (compare against a peer's view to triage
@@ -845,7 +845,7 @@ func (a *Adm) ShowGI(ctx context.Context, resource string, volume int32, device 
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	out, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
+		"drbdmeta", "--force", drbdmetaNoMinor, "v09", device, "internal",
 		"show-gi")
 	if err != nil {
 		return nil, errors.Wrapf(err, "drbdmeta show-gi %s", target)
@@ -866,7 +866,7 @@ func (a *Adm) GetGI(ctx context.Context, resource string, volume int32, device s
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	out, err := a.exec.Run(ctx,
-		"drbdmeta", "--force", target, "v09", device, "internal",
+		"drbdmeta", "--force", drbdmetaNoMinor, "v09", device, "internal",
 		"get-gi", "--node-id", "0")
 	if err != nil {
 		return "", errors.Wrapf(err, "drbdmeta get-gi %s", target)

@@ -76,7 +76,7 @@ func newKernelCleanupReconciler(t *testing.T) (*Reconciler, *storage.FakeExec) {
 // TestPruneStaleKernelSlots_Pass1RemovesUnexpectedPeer: when a kernel
 // slot exists for a peer name K8s no longer expects, Pass 1 must
 // issue `drbdadm del-peer` (correctness — live connection) plus
-// `drbdmeta forget-peer` per volume (slow-leak — metadata slot).
+// `drbdsetup forget-peer` once for the resource (slow leak: metadata slot).
 // The healthy expected peer must NOT be touched.
 func TestPruneStaleKernelSlots_Pass1RemovesUnexpectedPeer(t *testing.T) {
 	r, fx := newKernelCleanupReconciler(t)
@@ -94,7 +94,7 @@ func TestPruneStaleKernelSlots_Pass1RemovesUnexpectedPeer(t *testing.T) {
 
 	// del-peer + forget-peer for worker-2, nothing for worker-1.
 	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
-	mustContain(t, cmds, "drbdmeta --force pvc-1/0 v09 /dev/zvol/pool/pvc-1 internal forget-peer 2")
+	mustContain(t, cmds, "drbdsetup forget-peer pvc-1 2")
 	mustNotContain(t, cmds, "drbdadm del-peer worker-1:pvc-1")
 }
 
@@ -149,7 +149,7 @@ func TestPruneStaleKernelSlots_Pass3DebouncesStuckSlot(t *testing.T) {
 
 	cmds = fx.CommandLines()
 	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
-	mustContain(t, cmds, "drbdmeta --force pvc-1/0 v09 /dev/zvol/pool/pvc-1 internal forget-peer 2")
+	mustContain(t, cmds, "drbdsetup forget-peer pvc-1 2")
 
 	// After successful teardown, the debounce entry must be cleared
 	// so a re-incarnated peer of the same name starts a fresh timer.

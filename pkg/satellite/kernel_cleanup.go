@@ -144,7 +144,7 @@ func (r *Reconciler) PruneStaleKernelSlots(
 		expectedSet[n] = struct{}{}
 	}
 
-	err = r.prunePass1Unexpected(ctx, rdName, slots, expectedSet, vols, devices, logger)
+	err = r.prunePass1Unexpected(ctx, rdName, slots, expectedSet, devices, logger)
 	if err != nil {
 		return err
 	}
@@ -165,7 +165,6 @@ func (r *Reconciler) prunePass1Unexpected(
 	rdName string,
 	slots map[string]drbd.KernelSlot,
 	expectedSet map[string]struct{},
-	vols []int32,
 	devices map[int32]string,
 	logger logr.Logger,
 ) error {
@@ -174,7 +173,7 @@ func (r *Reconciler) prunePass1Unexpected(
 			continue
 		}
 
-		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, vols, devices, logger.WithValues("pass", pruneLogPass1, "peer", name))
+		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, devices, logger.WithValues("pass", pruneLogPass1, "peer", name))
 		if teardownErr != nil {
 			return errors.Wrapf(teardownErr, "PruneStaleKernelSlots pass 1 (unexpected peer %s)", name)
 		}
@@ -227,7 +226,7 @@ func (r *Reconciler) prunePass3Stuck(
 			continue
 		}
 
-		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, vols, devices, logger.WithValues("pass", pruneLogPass3, "peer", name))
+		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, devices, logger.WithValues("pass", pruneLogPass3, "peer", name))
 		if teardownErr != nil {
 			logger.Info("Pass 3: teardown of stuck slot failed; will retry next reconcile",
 				"peer", name,
@@ -243,11 +242,9 @@ func (r *Reconciler) prunePass3Stuck(
 	}
 }
 
-// teardownKernelSlot is the per-slot del-peer + per-volume forget-peer
-// fan-out shared between Pass 1 and Pass 3. del-peer is mandatory;
-// forget-peer is per-volume best-effort because v09 metadata lives
-// in the per-volume block and a missing device path (DISKLESS local
-// replica) means there's no metadata to clean up for that volume.
+// teardownKernelSlot is the per-slot del-peer + forget-peer shared
+// between Pass 1 and Pass 3. del-peer is mandatory; forget-peer, through
+// the kernel and once for the resource, is best-effort.
 //
 // Mirrors tearDownRemovedPeers' del-peer-then-forget-peer ordering
 // without reusing it directly — that function is .res-file-driven and
@@ -256,7 +253,6 @@ func (r *Reconciler) teardownKernelSlot(
 	ctx context.Context,
 	rdName string,
 	slot *drbd.KernelSlot,
-	vols []int32,
 	devices map[int32]string,
 	logger logr.Logger,
 ) error {
@@ -269,26 +265,19 @@ func (r *Reconciler) teardownKernelSlot(
 		return errors.Wrapf(err, "drbdadm del-peer %s:%s", slot.Name, rdName)
 	}
 
-	// forget-peer is per-volume. Skip volumes without a resolved
-	// device path — that's the diskless-local case where no metadata
-	// exists to clean. Errors are non-fatal: a leaked metadata slot
-	// is a slow correctness drag (eats one of MaxPeers-1 budget
-	// entries) that the next reconcile will retry, while del-peer
-	// success above already closed the immediate kernel-connection
-	// leak.
-	for _, vol := range vols {
-		device, ok := devices[vol]
-		if !ok || device == "" {
-			continue
-		}
+	// forget-peer clears the peer's slot on every volume at once,
+	// through the kernel. A local replica with no device at all is
+	// DISKLESS and has no metadata to clean. Errors are non-fatal: a
+	// leaked slot eats one of the MaxPeers-1 budget entries and the next
+	// reconcile retries, while del-peer above already closed the kernel
+	// connection.
+	if !anyDevice(devices) {
+		return nil
+	}
 
-		forgetErr := r.cfg.Adm.ForgetPeer(ctx, rdName, vol, device, slot.NodeID)
-		if forgetErr != nil {
-			logger.Info("PruneStaleKernelSlots: forget-peer failed (non-fatal)",
-				"volume", vol,
-				"device", device,
-				"err", forgetErr.Error())
-		}
+	forgetErr := r.cfg.Adm.ForgetPeer(ctx, rdName, slot.NodeID)
+	if forgetErr != nil {
+		logger.Info("PruneStaleKernelSlots: forget-peer failed (non-fatal)", "err", forgetErr.Error())
 	}
 
 	return nil
