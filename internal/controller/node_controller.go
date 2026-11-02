@@ -120,7 +120,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	for i := range resList {
-		if resList[i].NodeName != node.Name {
+		if !sameNode(resList[i].NodeName, node.Name) {
 			continue
 		}
 

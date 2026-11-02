@@ -324,11 +324,6 @@ func (r *SnapshotReconciler) siblingReplicasUpToDate(
 		return false, "", errors.Wrap(err, "list Resources for UpToDate gate")
 	}
 
-	targets := make(map[string]struct{}, len(snap.Spec.Nodes))
-	for _, n := range snap.Spec.Nodes {
-		targets[n] = struct{}{}
-	}
-
 	for i := range resList.Items {
 		res := &resList.Items[i]
 
@@ -336,7 +331,9 @@ func (r *SnapshotReconciler) siblingReplicasUpToDate(
 			continue
 		}
 
-		if _, targeted := targets[res.Spec.NodeName]; !targeted {
+		// The node list carries the registered spelling, the replica its
+		// node's CR name.
+		if !slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return sameNode(n, res.Spec.NodeName) }) {
 			continue
 		}
 

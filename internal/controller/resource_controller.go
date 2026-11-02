@@ -483,7 +483,7 @@ func (r *ResourceReconciler) firstAvailablePool(ctx context.Context, nodeName st
 	}
 
 	for i := range pools {
-		if pools[i].NodeName != nodeName {
+		if !sameNode(pools[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -1856,7 +1856,7 @@ func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, sel
 
 	for i := range resList.Items {
 		res := &resList.Items[i]
-		if res.Spec.NodeName != nodeName || res.Name == selfName {
+		if !sameNode(res.Spec.NodeName, nodeName) || res.Name == selfName {
 			continue
 		}
 

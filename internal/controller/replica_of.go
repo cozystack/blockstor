@@ -19,6 +19,8 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
+
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -37,4 +39,14 @@ func isReplicaOf(res *blockstoriov1alpha1.Resource, rdName string) bool {
 // definition: the one the store keeps under their common folded name.
 func sameDefinition(a, b string) bool {
 	return k8s.Name(a) == k8s.Name(b)
+}
+
+// sameNode reports whether two spellings of a node's name refer to the same
+// node. A replica stores its node's CR name, while a snapshot's node list,
+// a storage pool and the wire carry the registered spelling, and a replica
+// written or adopted before the store stored CR names may carry that
+// spelling too. Both sides map to the node's CR name, which is how the
+// store addresses it.
+func sameNode(a, b string) bool {
+	return strings.EqualFold(a, b) || k8s.Name(a) == k8s.Name(b)
 }
