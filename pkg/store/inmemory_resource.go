@@ -69,7 +69,7 @@ func (s *inMemoryResources) ListByNode(_ context.Context, node string) ([]apiv1.
 	out := make([]apiv1.Resource, 0)
 
 	for k := range s.m {
-		if s.m[k].NodeName == node {
+		if FoldName(s.m[k].NodeName) == FoldName(node) {
 			out = append(out, s.m[k])
 		}
 	}
@@ -86,7 +86,7 @@ func (s *inMemoryResources) ListByDefinition(_ context.Context, rdName string) (
 	out := make([]apiv1.Resource, 0)
 
 	for k := range s.m {
-		if s.m[k].Name == rdName {
+		if FoldName(s.m[k].Name) == FoldName(rdName) {
 			out = append(out, s.m[k])
 		}
 	}

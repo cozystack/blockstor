@@ -325,13 +325,12 @@ type ResourceStore interface {
 // not narrow its read at all for this reason, and filters the whole listing
 // with the case-insensitive comparison instead.
 //
-// Folding on the write side instead would fold what clients read back:
-// crdToWireResource reports these spec values as the object's names, and
-// crdname.go's annotation exists precisely to keep the stored spelling
-// (DfltRscGrp) rather than the lowercased slug, because linstor-csi and
-// runbooks compare those strings. Closing the gap properly means a folded
-// field beside the display one, selected on and never rendered — a schema
-// change with a migration for adopted objects, not a comparison.
+// The Kubernetes store now writes the folded side: a replica or snapshot it
+// creates stores its parents' CR names in spec and keeps the registered
+// spelling in an annotation that only the wire conversion reads, so clients
+// still see the spelling they compare (pkg/store/k8s/spellings.go). The
+// listings also ask under the registered spelling of a definition, so the
+// shapes left are rows written before that, or adopted, in a fourth case.
 func FoldName(name string) string {
 	return strings.ToLower(name)
 }

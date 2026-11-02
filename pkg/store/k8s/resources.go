@@ -87,8 +87,10 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 // partial-but-correct subset — the Bug 038 shape, where the missing replicas
 // were invisible rather than an error.
 func (s *resources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
-	out, err := s.listScoped(ctx, s.nodeScopedReader(), FieldResourceNodeName, node,
-		func(r *crdv1alpha1.Resource) bool { return r.Spec.NodeName == node })
+	reader := s.nodeScopedReader()
+
+	out, err := s.listUnderSpellings(ctx, reader, FieldResourceNodeName, nodeSpellings(ctx, reader, node),
+		func(r *crdv1alpha1.Resource, spelling string) bool { return r.Spec.NodeName == spelling })
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +178,25 @@ func (s *resources) Create(ctx context.Context, in *apiv1.Resource) error {
 		return errors.New("nil Resource")
 	}
 
-	crd := wireToCRDResource(in)
+	// The spec stores the definition's and the node's CR names, which is
+	// what the controller and the satellite look them up and compare by,
+	// and the registered spellings are kept for display (see spellings.go).
+	// The object itself is named from the registered spellings, the way
+	// Get addresses it.
+	rd := storedRDName(ctx, s.c, in.Name)
+	node := storedNodeName(ctx, s.c, in.NodeName)
+
+	shown := *in
+	shown.Name = rd.display
+	shown.NodeName = node.display
+
+	crd := wireToCRDResource(&shown)
+	crd.Spec.ResourceDefinitionName = rd.crName
+	crd.Spec.NodeName = node.crName
+	crd.Labels[LabelResourceDefinition] = rd.crName
+	crd.Labels[LabelNodeName] = node.crName
+	rd.annotate(&crd.ObjectMeta, AnnotationLinstorRDName)
+	node.annotate(&crd.ObjectMeta, AnnotationLinstorNodeName)
 
 	err := s.c.Create(ctx, crd)
 	if err != nil {
@@ -231,11 +251,15 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// a golinstor REST modify can't strip it and flip the satellite back
 	// to the unsafe day0-skip default (the offline-safety regression).
 	prevSkipInit := existing.Spec.SkipInitialSync
+	// The names in spec are the parents' CR names, fixed at Create; the
+	// wire carries the display spellings (see spellings.go).
+	prevRD, prevNode := existing.Spec.ResourceDefinitionName, existing.Spec.NodeName
 	existing.Spec = wireToCRDResourceSpec(in)
 	existing.Spec.Volumes = prevVolumes
 	existing.Spec.DRBDPort = prevPort
 	existing.Spec.DRBDNodeID = prevNodeID
 	existing.Spec.SkipInitialSync = prevSkipInit
+	existing.Spec.ResourceDefinitionName, existing.Spec.NodeName = prevRD, prevNode
 
 	// Bug 67: round-trip wire-side Annotations through metadata so the
 	// REST writer's `blockstor.io/peer-changed` bump actually reaches
@@ -250,7 +274,7 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// `lookupVolumeNumbers` during the harm window leaks the backing
 	// LV / zvol. Mirrors the RD / RG / Snapshot stores.
 	mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations,
-		crdv1alpha1.ResourceAnnotationVolumeNumbers)
+		crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 	err = s.c.Update(ctx, &existing)
 	if err != nil {
@@ -313,11 +337,14 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// Skip-init-sync hardening: carry SkipInitialSync across — see
 		// the matching carry-across in `Update` above.
 		prevSkipInit := existing.Spec.SkipInitialSync
+		// The CR names in spec: see the matching carry-across in `Update`.
+		prevRD, prevNode := existing.Spec.ResourceDefinitionName, existing.Spec.NodeName
 		existing.Spec = wireToCRDResourceSpec(&wire)
 		existing.Spec.Volumes = prevVolumes
 		existing.Spec.DRBDPort = prevPort
 		existing.Spec.DRBDNodeID = prevNodeID
 		existing.Spec.SkipInitialSync = prevSkipInit
+		existing.Spec.ResourceDefinitionName, existing.Spec.NodeName = prevRD, prevNode
 
 		// Bug 210: merge rather than wholesale-replace so the
 		// satellite-stamped `blockstor.io/volume-numbers` (Bug 107)
@@ -329,7 +356,7 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// path and protects against future closures that explicitly
 		// reset live.Annotations.
 		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations,
-			crdv1alpha1.ResourceAnnotationVolumeNumbers)
+			crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
 	}), "patch Resource %s/%s", rdName, node)
@@ -545,8 +572,8 @@ func (s *resources) ClearDRBDPort(ctx context.Context, rdName, node string) erro
 func (s *resources) listByDefinitionThrough(
 	ctx context.Context, reader ctrlclient.Reader, rdName string,
 ) ([]apiv1.Resource, error) {
-	out, err := s.listScoped(ctx, reader, FieldResourceDefinitionName, rdName,
-		func(r *crdv1alpha1.Resource) bool { return r.Spec.ResourceDefinitionName == rdName })
+	out, err := s.listUnderSpellings(ctx, reader, FieldResourceDefinitionName, rdSpellings(ctx, reader, rdName),
+		func(r *crdv1alpha1.Resource, spelling string) bool { return r.Spec.ResourceDefinitionName == spelling })
 	if err != nil {
 		return nil, err
 	}
@@ -632,8 +659,8 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 	}
 
 	return apiv1.Resource{
-		Name:     crd.Spec.ResourceDefinitionName,
-		NodeName: crd.Spec.NodeName,
+		Name:     shownName(&crd.ObjectMeta, AnnotationLinstorRDName, crd.Spec.ResourceDefinitionName),
+		NodeName: shownName(&crd.ObjectMeta, AnnotationLinstorNodeName, crd.Spec.NodeName),
 		Props:    props,
 		Flags:    withDeletingFlag(crd.Spec.Flags, crd.DeletionTimestamp != nil),
 		// Resource CRD has no LayerStack — that lives on the parent RD.
@@ -654,7 +681,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 			crd.Status.Connections,
 		),
 		UUID:        string(crd.UID),
-		Annotations: cloneAnnotations(crd.Annotations),
+		Annotations: withoutNameAnnotations(cloneAnnotations(crd.Annotations)),
 		// Upstream LINSTOR populates `create_timestamp` (the Python
 		// CLI's `CreatedOn` column). The Resource CRD's
 		// metadata.creationTimestamp is the per-replica creation time
@@ -1093,6 +1120,43 @@ func (s *resources) listScoped(
 		"field", field, "value", value, "reason", err.Error())
 
 	return s.listExhaustively(ctx, reader, field, value, keep)
+}
+
+// listUnderSpellings runs listScoped once per spelling and returns every
+// replica once. The CRD name folds the definition and the node, so two rows
+// with the same folded pair are one object.
+func (s *resources) listUnderSpellings(
+	ctx context.Context, reader ctrlclient.Reader, field string, spellings []string,
+	keep func(*crdv1alpha1.Resource, string) bool,
+) ([]apiv1.Resource, error) {
+	var out []apiv1.Resource
+
+	seen := map[string]struct{}{}
+
+	for _, spelling := range spellings {
+		found, err := s.listScoped(ctx, reader, field, spelling,
+			func(r *crdv1alpha1.Resource) bool { return keep(r, spelling) })
+		if err != nil {
+			return nil, err
+		}
+
+		for i := range found {
+			key := resourceCRDName(found[i].Name, found[i].NodeName)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+
+			seen[key] = struct{}{}
+
+			out = append(out, found[i])
+		}
+	}
+
+	if out == nil {
+		out = []apiv1.Resource{}
+	}
+
+	return out, nil
 }
 
 // listExhaustively is the pre-selectable-field read: every Resource, filtered
