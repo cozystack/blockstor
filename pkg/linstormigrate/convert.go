@@ -21,6 +21,7 @@ package linstormigrate
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -138,6 +139,12 @@ type converter struct {
 	// dump does not show.
 	chained map[replicaKey]bool
 
+	// metaPoolDropped names the definitions whose StorPoolNameDrbdMeta is
+	// left off the converted definition and its replicas: their replicas
+	// keep their metadata on the data device, and the dispatcher would
+	// otherwise read the property and look for a metadata volume.
+	metaPoolDropped map[string]bool
+
 	// referential-integrity sets, populated as each kind converts so
 	// later kinds can drop rows that would dangle (a replica of a
 	// skipped/absent RD, a replica on an unknown node, ...).
@@ -220,6 +227,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		luksVol:           map[volumeReplicaKey]LayerLuksVolumeRow{},
 		diskStacks:        map[string]map[string][]string{},
 		chained:           map[replicaKey]bool{},
+		metaPoolDropped:   map[string]bool{},
 		convertedRD:       map[string]bool{},
 		convertedNode:     map[string]bool{},
 		convertedRG:       map[string]bool{},
@@ -1114,6 +1122,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 		}
 
 		typed, residual, extra := k8sstore.SplitProps(c.props.ResourceDefinition(row.ResourceName))
+		residual = c.withoutDroppedMetaPool(row.ResourceName, residual)
 
 		latch := c.rdInitializedLatch(row.ResourceName)
 
@@ -1186,14 +1195,284 @@ func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
 		return false
 	}
 
+	reason, remedy, internal := c.externalMetadataReason(row)
+	if reason != "" {
+		c.warnf("resource definition %s: %s — skipped with its replicas; %s", dsp, reason, remedy)
+
+		return false
+	}
+
 	if reason := c.volumelessReason(row.ResourceName); reason != "" {
 		c.warnf("resource definition %s: %s — skipped; there is no volume to adopt, and migrating it leaves the controller placing replicas the satellite can never bring up", dsp, reason)
 
 		return false
 	}
 
+	if internal != "" {
+		c.metaPoolDropped[row.ResourceName] = true
+		c.warnf("resource definition %s: %s", dsp, internal)
+	}
+
 	return true
 }
+
+// externalMetadataReason answers why the replicas of row cannot be adopted
+// for where LINSTOR keeps their DRBD metadata, and what the operator does
+// about it, both "" when nothing stands in the way. The third answer is a
+// note for a definition that converts although a meta pool is set for it.
+//
+// LINSTOR builds a replica with external metadata with a ".meta" STORAGE
+// child under its DRBD layer and records the meta pool on each DRBD volume.
+// blockstor cannot adopt that layout: the satellite looks for the metadata
+// under its own volume name and does not provision one, so a replica
+// converted without it comes up with internal metadata and create-md lands
+// on the tail of the data.
+//
+// StorPoolNameDrbdMeta alone is not that evidence: LINSTOR applies it to
+// replicas created after it is set, and decides from the ".meta" child when
+// it loads its database. A replica the dump has a chain for and no ".meta"
+// keeps its metadata on the data device and converts; the property is left
+// off the converted definition and replicas, the two scopes the dispatcher
+// reads it from, and the other scopes convert onto objects nothing reads it
+// from. A replica the dump has no chain for is decided by the property
+// alone, read through every scope LINSTOR takes it from, per volume.
+func (c *converter) externalMetadataReason(row *ResourceDefinitionRow) (string, string, string) {
+	rdName := row.ResourceName
+
+	if node := c.externalMetadataReplica(rdName); node != "" {
+		return "the replica on " + c.displayNode(node) + " keeps its DRBD metadata on a separate volume",
+			"blockstor keeps DRBD metadata on the data device, so adopted as it is the satellite would write " +
+				"new metadata over the end of the volume's data; copy its data to a volume with internal metadata " +
+				"in LINSTOR and convert that one", ""
+	}
+
+	if !c.runsDRBD(row) {
+		return "", "", ""
+	}
+
+	var internal string
+
+	for i := range c.dump.Resources {
+		res := &c.dump.Resources[i]
+		if res.ResourceName != rdName || res.SnapshotName != "" ||
+			res.ResourceFlags&(resourceFlagDiskless|resourceFlagDelete) != 0 {
+			continue
+		}
+
+		pools := c.drbdMetaPools(row, res.NodeName)
+		if len(pools) == 0 {
+			continue
+		}
+
+		if !c.chained[replicaKey{node: res.NodeName, rd: rdName}] {
+			for _, mp := range pools {
+				if isExternalMetaPool(mp.pool) {
+					return "the dump has no layer chain for the replica on " + c.displayNode(res.NodeName) + ", and " +
+							storPoolNameDrbdMeta + " " + mp.pool + " on " + mp.scope +
+							" would put its DRBD metadata on a separate volume",
+						"check in LINSTOR where that replica keeps its metadata: if on a separate volume, copy its data " +
+							"to a volume with internal metadata and convert that one; if on the data device, remove " +
+							"the property and convert again", ""
+				}
+			}
+		}
+
+		if internal == "" {
+			internal = "its replicas keep their DRBD metadata on the data device, though " + storPoolNameDrbdMeta +
+				" " + pools[0].pool + " is set on " + pools[0].scope + "; the property is not carried over to the " +
+				"definition or its replicas, so blockstor does not look for a separate metadata volume"
+		}
+	}
+
+	return "", "", internal
+}
+
+// runsDRBD says whether the replicas of row come up with a DRBD layer, and
+// so whether a meta pool property means anything for them. A stack the row
+// names decides; an empty one is the stack the replicas were built with,
+// which stackDisagreement has already found to be one; with neither, the
+// controller pins DRBD over STORAGE.
+func (c *converter) runsDRBD(row *ResourceDefinitionRow) bool {
+	var stack []string
+	if !emptyList(row.LayerStack) {
+		_ = json.Unmarshal([]byte(row.LayerStack), &stack)
+	}
+
+	if len(stack) == 0 {
+		for _, onDisk := range c.diskStacks[row.ResourceName] {
+			stack = onDisk
+		}
+	}
+
+	return len(stack) == 0 || slices.ContainsFunc(stack, func(kind string) bool { return strings.EqualFold(kind, "DRBD") })
+}
+
+// externalMetadataReplica names the node of a replica of rdName that keeps
+// its DRBD metadata on a separate volume, by its ".meta" layer child or by
+// the meta pool on one of its DRBD volumes, or "" when none does. A replica
+// marked DELETE does not convert, so its layout does not count.
+func (c *converter) externalMetadataReplica(rdName string) string {
+	deleted := map[string]bool{}
+
+	for i := range c.dump.Resources {
+		res := &c.dump.Resources[i]
+		if res.ResourceName == rdName && res.SnapshotName == "" && res.ResourceFlags&resourceFlagDelete != 0 {
+			deleted[res.NodeName] = true
+		}
+	}
+
+	byID := map[int32]*LayerResourceIDRow{}
+
+	for i := range c.dump.LayerResourceIDs {
+		lri := &c.dump.LayerResourceIDs[i]
+		if lri.ResourceName != rdName || lri.SnapshotName != "" || deleted[lri.NodeName] {
+			continue
+		}
+
+		if lri.LayerResourceSuffix == drbdMetaSuffix {
+			return lri.NodeName
+		}
+
+		byID[lri.LayerResourceID] = lri
+	}
+
+	for i := range c.dump.LayerDrbdVolumes {
+		vol := &c.dump.LayerDrbdVolumes[i]
+		if lri, ok := byID[vol.LayerResourceID]; ok && isExternalMetaPool(vol.PoolName) {
+			return lri.NodeName
+		}
+	}
+
+	return ""
+}
+
+// metaPool is the StorPoolNameDrbdMeta one volume resolves to, and the
+// scope it came from.
+type metaPool struct {
+	pool  string
+	scope string
+}
+
+// drbdMetaPools is the StorPoolNameDrbdMeta LINSTOR resolves for each volume
+// of the replica of row on node, for the volumes that resolve one. Each
+// volume is resolved on its own, most specific scope first: volume
+// definition, volume group, resource, resource definition, resource group,
+// node (getExtMetaDataStorPoolName in LINSTOR's RscDrbdLayerHelper).
+func (c *converter) drbdMetaPools(row *ResourceDefinitionRow, node string) []metaPool {
+	rd, rg := row.ResourceName, row.ResourceGroupName
+
+	shared := func() (metaPool, bool) {
+		for _, scope := range []struct {
+			props map[string]string
+			name  string
+		}{
+			{c.props.Resource(node, rd), "the replica on " + c.displayNode(node)},
+			{c.props.ResourceDefinition(rd), "the definition"},
+			{c.resourceGroupProps(rg), "resource group " + rg},
+			{c.props.Node(node), "node " + c.displayNode(node)},
+		} {
+			if v := scope.props[storPoolNameDrbdMeta]; v != "" {
+				return metaPool{pool: v, scope: scope.name}, true
+			}
+		}
+
+		return metaPool{}, false
+	}
+
+	var (
+		out  []metaPool
+		vols int
+	)
+
+	for i := range c.dump.VolumeDefinitions {
+		vd := &c.dump.VolumeDefinitions[i]
+		if vd.ResourceName != rd || vd.SnapshotName != "" {
+			continue
+		}
+
+		vols++
+
+		vlm := strconv.Itoa(int(vd.VlmNr))
+		if v := c.props.VolumeDefinition(rd, vlm)[storPoolNameDrbdMeta]; v != "" {
+			out = append(out, metaPool{pool: v, scope: "volume definition " + c.displayRD(rd) + "/" + vlm})
+
+			continue
+		}
+
+		if v := c.resourceGroupVolumeProps(rg, vlm)[storPoolNameDrbdMeta]; v != "" {
+			out = append(out, metaPool{pool: v, scope: "volume group " + rg + "/" + vlm})
+
+			continue
+		}
+
+		if mp, ok := shared(); ok {
+			out = append(out, mp)
+		}
+	}
+
+	if vols == 0 {
+		if mp, ok := shared(); ok {
+			out = append(out, mp)
+		}
+	}
+
+	return out
+}
+
+func (c *converter) resourceGroupProps(rg string) map[string]string {
+	if rg == "" {
+		return nil
+	}
+
+	return c.props.ResourceGroup(rg)
+}
+
+func (c *converter) resourceGroupVolumeProps(rg, vlm string) map[string]string {
+	if rg == "" {
+		return nil
+	}
+
+	return c.props.VolumeGroup(rg, vlm)
+}
+
+// withoutDroppedMetaPool takes StorPoolNameDrbdMeta out of the props of a
+// definition named in metaPoolDropped, or of one of its replicas.
+func (c *converter) withoutDroppedMetaPool(rdName string, props map[string]string) map[string]string {
+	if !c.metaPoolDropped[rdName] {
+		return props
+	}
+
+	if _, ok := props[storPoolNameDrbdMeta]; !ok {
+		return props
+	}
+
+	out := maps.Clone(props)
+	delete(out, storPoolNameDrbdMeta)
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
+// isExternalMetaPool says whether a meta pool value names a separate pool:
+// set, and not ".internal", read as LINSTOR reads it (trimmed, any case).
+func isExternalMetaPool(pool string) bool {
+	pool = strings.TrimSpace(pool)
+
+	return pool != "" && !strings.EqualFold(pool, drbdMetaInternal)
+}
+
+// The layer suffix and the property LINSTOR marks external DRBD metadata
+// with.
+const (
+	drbdMetaSuffix       = ".meta"
+	storPoolNameDrbdMeta = "StorPoolNameDrbdMeta"
+	// drbdMetaInternal is the StorPoolNameDrbdMeta value that asks for
+	// internal metadata.
+	drbdMetaInternal = ".internal"
+)
 
 // rdHasVolumeDefinitions reports whether this resource definition owns a
 // volume that will convert.
@@ -1563,6 +1842,7 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 	c.reportReplicaVolumeFlags(row, replicaName)
 
 	typed, residual, extra := k8sstore.SplitProps(c.props.Resource(row.NodeName, row.ResourceName))
+	residual = c.withoutDroppedMetaPool(row.ResourceName, residual)
 
 	resource := crdv1alpha1.Resource{
 		TypeMeta:   typeMeta("Resource"),

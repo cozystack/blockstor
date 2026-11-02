@@ -116,6 +116,11 @@ func (idx *PropsIndex) VolumeDefinition(rd, vlmNr string) map[string]string {
 	return idx.get("VLM_DFNS", rd, vlmNr)
 }
 
+// VolumeGroup returns the /VLM_GRPS/<rg>/<vlmNr> props.
+func (idx *PropsIndex) VolumeGroup(rg, vlmNr string) map[string]string {
+	return idx.get("VLM_GRPS", rg, vlmNr)
+}
+
 // Resource returns the /RSCS/<node>/<rd> props.
 func (idx *PropsIndex) Resource(node, rd string) map[string]string {
 	return idx.get("RSCS", node, rd)

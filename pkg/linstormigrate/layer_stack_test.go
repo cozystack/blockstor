@@ -110,15 +110,17 @@ func TestAnEmptyRDStackIsReadOffItsReplicas(t *testing.T) {
 	}
 }
 
-// Snapshot instances and suffixed children (DRBD external metadata)
-// are not the replica's data path and do not shape its stack.
+// Snapshot instances and suffixed children (a cache's sub-devices) are
+// not the replica's data path and do not shape its stack. External DRBD
+// metadata, the ".meta" child, refuses the definition instead
+// (TestADefinitionWithExternalMetadataIsSkipped).
 func TestSnapshotAndSuffixedLayersDoNotShapeTheStack(t *testing.T) {
 	t.Parallel()
 
-	meta := LayerResourceIDRow{LayerResourceID: 20, LayerResourceKind: "STORAGE", LayerResourceParentID: ptr(int32(1)), LayerResourceSuffix: ".meta", NodeName: "NODE-A", ResourceName: "PVC-S"}
+	cache := LayerResourceIDRow{LayerResourceID: 20, LayerResourceKind: "STORAGE", LayerResourceParentID: ptr(int32(1)), LayerResourceSuffix: ".dcache", NodeName: "NODE-A", ResourceName: "PVC-S"}
 	snap := LayerResourceIDRow{LayerResourceID: 21, LayerResourceKind: "STORAGE", NodeName: "NODE-A", ResourceName: "PVC-S", SnapshotName: "SNAP"}
 
-	got, res := convertedStack(t, stackDump("[]", layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE"), []LayerResourceIDRow{meta, snap}))
+	got, res := convertedStack(t, stackDump("[]", layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE"), []LayerResourceIDRow{cache, snap}))
 	if !slices.Equal(got, []string{"DRBD", "LUKS", "STORAGE"}) {
 		t.Fatalf("stack %v; warnings %v", got, res.Warnings)
 	}
