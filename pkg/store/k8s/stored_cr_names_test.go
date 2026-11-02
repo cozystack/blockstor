@@ -99,15 +99,30 @@ func TestReplicaStoresTheCRNamesOfItsParents(t *testing.T) {
 		t.Errorf("wire annotations %v carry the store-internal display spelling", got.Annotations)
 	}
 
+	// A wire that carries any annotation replaces the user keys: the
+	// display spellings are store-internal and must survive it.
 	got.Props = map[string]string{"Aux/k": "v"}
+	got.Annotations = map[string]string{"example.com/user": "u"}
+
 	if err := s.Update(ctx, &got); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 
 	assertSpec("update")
+	assertShown := func(stage string) {
+		t.Helper()
+
+		shown, err := s.Get(ctx, "pvc-mix", "node-1")
+		if err != nil || shown.Name != "Pvc-Mix" || shown.NodeName != "Node-1" {
+			t.Errorf("%s: shown as %q/%q, %v; want Pvc-Mix/Node-1", stage, shown.Name, shown.NodeName, err)
+		}
+	}
+
+	assertShown("update")
 
 	if err := s.PatchResourceSpec(ctx, "Pvc-Mix", "Node-1", func(r *apiv1.Resource) error {
 		r.Props["Aux/k"] = "w"
+		r.Annotations = map[string]string{"example.com/user": "p"}
 
 		return nil
 	}); err != nil {
@@ -115,6 +130,7 @@ func TestReplicaStoresTheCRNamesOfItsParents(t *testing.T) {
 	}
 
 	assertSpec("patch")
+	assertShown("patch")
 
 	again, err := s.Get(ctx, "Pvc-Mix", "Node-1")
 	if err != nil || again.Name != "Pvc-Mix" || again.NodeName != "Node-1" {
@@ -160,9 +176,16 @@ func TestSnapshotStoresTheCRNameOfItsDefinition(t *testing.T) {
 	}
 
 	got.Props = map[string]string{"Aux/k": "v"}
+	got.Annotations = map[string]string{"example.com/user": "u"}
+
 	if err := s.Update(ctx, &got); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 
 	stored("update")
+
+	shown, err := s.Get(ctx, "pvc-mix", "snap-1")
+	if err != nil || shown.ResourceName != "Pvc-Mix" {
+		t.Errorf("after an update carrying an annotation: shown as %q, %v; want Pvc-Mix", shown.ResourceName, err)
+	}
 }
