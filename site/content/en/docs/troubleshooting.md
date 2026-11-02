@@ -86,12 +86,15 @@ Never delete the last replica that is `UpToDate`. `blockstor resource delete` re
 
 ## Metadata re-created after an unclean shutdown
 
-The symptom is a replica that was the only copy, and after a node reboot comes back without its generation identifiers and bitmap: it starts a full sync from a peer, or has nothing to sync from. The satellite log does not show the cause. The satellite does not log the `drbdadm` and `drbdmeta` commands it runs, and re-creating the metadata succeeds without a message; only a failed `dump-md` or `create-md` shows up, inside an error. What tells you whether it can have happened is whether a satellite pod started on the node after the node came back:
+The symptom is a replica that was the only copy, and after a node reboot comes back without its generation identifiers and bitmap: it starts a full sync from a peer, or has nothing to sync from. The satellite log does not show the cause. The satellite does not log the `drbdadm` and `drbdmeta` commands it runs, and re-creating the metadata succeeds without a message; only a failed `dump-md` or `create-md` shows up, inside an error. What tells you whether it can have happened is whether the satellite container started on the node after the node came back:
 
 ```sh
-kubectl -n blockstor-system get $POD -o jsonpath='{.status.startTime}{"\n"}'
-kubectl get node <node> -o jsonpath='{.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}'
+kubectl -n blockstor-system get $POD -o jsonpath='{.status.containerStatuses[?(@.name=="satellite")].state.running.startedAt} restarts={.status.containerStatuses[?(@.name=="satellite")].restartCount}{"\n"}'
 ```
+
+The satellite has run since the reboot if `startedAt` is later than the time the node went down, or if `restartCount` is higher than before the outage. An empty `startedAt` means the container is not running at that moment; `restartCount` still counts every start. Compare the time with the outage, not with the moment the node became `Ready` again: the kubelet can start the satellite, which uses the host network, before the node reports `Ready`.
+
+Do not use the pod's `.status.startTime`. The DaemonSet tolerates every taint, so its pod is not evicted while the node is down, and after the reboot the kubelet starts the containers of the same pod again: the pod keeps its old `startTime`, while the container's `startedAt` is new and its `restartCount` goes up.
 
 Before it creates DRBD metadata, the satellite probes the device with `drbdadm dump-md`. If the probe answers that metadata is present but its activity log needs applying, which is what an unclean shutdown of a writing `Primary` leaves behind, the current release treats that as missing metadata, creates it afresh and syncs the replica from its peers. That is fine when another replica holds the data. It is not fine when this replica is the only `UpToDate` copy, because recreating the metadata discards the generation identifiers and the dirty bitmap.
 
@@ -126,7 +129,7 @@ kubectl -n blockstor-system get pod -l app=blockstor-satellite --field-selector 
 
 The second command must list no pod. Label first and delete second: deleted without the label, the pod is created again for the node at once.
 
-If the node is already back and a satellite pod has started on it, it is too late for that replica. Do not wait for a log line to confirm it: re-creating the metadata leaves none. Assume the metadata was re-created once the satellite has run on the node after the reboot.
+If the node is already back and the satellite container has started on it since the reboot, it is too late for that replica. Do not wait for a log line to confirm it: re-creating the metadata leaves none. Assume the metadata was re-created once the satellite has run on the node after the reboot.
 
 ### Applying the activity log by hand
 
