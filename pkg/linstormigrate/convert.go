@@ -133,6 +133,11 @@ type converter struct {
 	// resource_name, then by the joined stack, to the stack itself.
 	diskStacks map[string]map[string][]string
 
+	// chained is every live replica indexDiskStacks found a layer chain
+	// for. A diskful replica without one was built under a stack the
+	// dump does not show.
+	chained map[replicaKey]bool
+
 	// referential-integrity sets, populated as each kind converts so
 	// later kinds can drop rows that would dangle (a replica of a
 	// skipped/absent RD, a replica on an unknown node, ...).
@@ -214,6 +219,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		storVol:           map[volumeReplicaKey]LayerStorageVolumeRow{},
 		luksVol:           map[volumeReplicaKey]LayerLuksVolumeRow{},
 		diskStacks:        map[string]map[string][]string{},
+		chained:           map[replicaKey]bool{},
 		convertedRD:       map[string]bool{},
 		convertedNode:     map[string]bool{},
 		convertedRG:       map[string]bool{},
@@ -439,6 +445,8 @@ func (c *converter) indexDiskStacks() {
 			stack = append(stack, cur.LayerResourceKind)
 		}
 
+		c.chained[replicaKey{node: row.NodeName, rd: row.ResourceName}] = true
+
 		if c.diskStacks[row.ResourceName] == nil {
 			c.diskStacks[row.ResourceName] = map[string][]string{}
 		}
@@ -456,6 +464,18 @@ func (c *converter) stackDisagreement(row *ResourceDefinitionRow) string {
 	var stack []string
 	if !emptyList(row.LayerStack) {
 		_ = json.Unmarshal([]byte(row.LayerStack), &stack)
+	}
+
+	// With no stack of its own, the RD takes the one its replicas were
+	// built with, so every diskful replica has to show it; one the dump
+	// carries no chain for leaves that stack unknown. A stack the row names
+	// is what LINSTOR built the replicas under, so a missing chain there
+	// says nothing new.
+	if len(stack) == 0 {
+		if node := c.unchainedReplica(row.ResourceName); node != "" {
+			return "no layer stack of its own, and the replica on " + c.displayNode(node) +
+				" has no layer chain in the dump, so the stack it was built with is unknown"
+		}
 	}
 
 	keys := make([]string, 0, len(c.diskStacks[row.ResourceName]))
@@ -476,6 +496,26 @@ func (c *converter) stackDisagreement(row *ResourceDefinitionRow) string {
 	for _, key := range keys {
 		if key != strings.Join(stack, ",") {
 			return "layer stack " + strings.Join(stack, ",") + ", but a replica was built as " + key
+		}
+	}
+
+	return ""
+}
+
+// unchainedReplica names the node of a live diskful replica of rdName that
+// the dump carries no layer chain for, or "" when every one has its chain.
+// Such a replica was built under a stack nobody can read, and taking it as
+// agreeing with the others is how a LUKS volume ends up adopted as plain.
+// The filter is indexDiskStacks's: no snapshot, not diskless.
+func (c *converter) unchainedReplica(rdName string) string {
+	for i := range c.dump.Resources {
+		res := &c.dump.Resources[i]
+		if res.ResourceName != rdName || res.SnapshotName != "" || res.ResourceFlags&resourceFlagDiskless != 0 {
+			continue
+		}
+
+		if !c.chained[replicaKey{node: res.NodeName, rd: res.ResourceName}] {
+			return res.NodeName
 		}
 	}
 
@@ -1107,8 +1147,8 @@ func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
 
 	if reason := c.stackDisagreement(row); reason != "" {
 		c.warnf("resource definition %s: %s — skipped with its replicas; adopted as it is, a replica would be "+
-			"brought up under a stack it was not built with, DRBD metadata written over a LUKS volume's "+
-			"ciphertext say; settle the stack in LINSTOR and convert again", dsp, reason)
+			"brought up under a stack it was not built with, which for a LUKS volume writes DRBD metadata "+
+			"over its ciphertext; settle the stack in LINSTOR and convert again", dsp, reason)
 
 		return false
 	}

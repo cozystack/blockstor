@@ -153,28 +153,56 @@ func TestADisklessReplicaDoesNotShapeTheStack(t *testing.T) {
 	}
 }
 
+// withReplicas adds a diskful replica of PVC-S on both nodes, so a test can
+// see whether the replicas of a refused definition still convert.
+func withReplicas(dump *Dump) *Dump {
+	dump.Resources = append(dump.Resources,
+		ResourceRow{NodeName: "NODE-A", ResourceName: "PVC-S", UUID: "r-a"},
+		ResourceRow{NodeName: "NODE-B", ResourceName: "PVC-S", UUID: "r-b"},
+	)
+
+	return dump
+}
+
 // A definition whose replicas cannot be adopted under one stack is not
 // converted, nor are its replicas: adopted as it is, a replica would come up
 // under a stack it was not built with, DRBD metadata over a LUKS volume's
-// ciphertext among them. Both shapes are refused and named: replicas built
-// two ways under a row with no stack, and a replica built otherwise than the
-// stack the row names.
+// ciphertext among them. Every shape is refused and named: replicas built
+// two ways, or with their layers in another order, under a row with no
+// stack; a replica built otherwise than the stack the row names; and, under
+// a row with no stack, a diskful replica the dump shows no chain for, alone
+// or next to one that has one.
 func TestADefinitionWhoseReplicasDisagreeOnTheStackIsNotConverted(t *testing.T) {
 	t.Parallel()
 
+	luks := layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE")
+
 	for name, tc := range map[string]struct {
 		rowStack, reason string
+		chains           [][]LayerResourceIDRow
 	}{
-		"replicas built two ways": {rowStack: "[]", reason: "built as DRBD,LUKS,STORAGE and DRBD,STORAGE"},
+		"replicas built two ways": {
+			rowStack: "[]", reason: "built as DRBD,LUKS,STORAGE and DRBD,STORAGE",
+			chains: [][]LayerResourceIDRow{luks, layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")},
+		},
+		"layers in another order": {
+			rowStack: "[]", reason: "built as DRBD,LUKS,STORAGE and LUKS,DRBD,STORAGE",
+			chains: [][]LayerResourceIDRow{luks, layerChain(10, "NODE-B", "PVC-S", "LUKS", "DRBD", "STORAGE")},
+		},
 		"a replica built otherwise": {
 			rowStack: `["DRBD","LUKS","STORAGE"]`, reason: "a replica was built as DRBD,STORAGE",
+			chains: [][]LayerResourceIDRow{luks, layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")},
+		},
+		"no chain at all": {rowStack: "[]", reason: "has no layer chain in the dump"},
+		"one chain missing": {
+			rowStack: "[]", reason: "the replica on node-b has no layer chain in the dump",
+			chains: [][]LayerResourceIDRow{luks},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			res, err := Convert(stackDump(tc.rowStack,
-				layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")))
+			res, err := Convert(withReplicas(stackDump(tc.rowStack, tc.chains...)))
 			if err != nil {
 				t.Fatalf("Convert: %v", err)
 			}
@@ -185,8 +213,10 @@ func TestADefinitionWhoseReplicasDisagreeOnTheStackIsNotConverted(t *testing.T) 
 				}
 			}
 
-			if len(res.Resources) != 0 {
-				t.Errorf("%d replicas of a skipped definition converted", len(res.Resources))
+			for i := range res.Resources {
+				if res.Resources[i].Spec.ResourceDefinitionName == "pvc-s" {
+					t.Errorf("replica %s of a skipped definition converted", res.Resources[i].Name)
+				}
 			}
 
 			if !hasWarning(res, tc.reason) || !hasWarning(res, "skipped with its replicas") {
