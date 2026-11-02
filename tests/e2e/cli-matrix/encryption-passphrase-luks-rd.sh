@@ -21,11 +21,11 @@
 #     at apply time.
 #
 # Post-fix contract (pinned here): the Secret set by `encryption
-# create-passphrase` is the PRIMARY, upstream-parity key source — the
-# whole LUKS lifecycle must work WITHOUT the legacy controller prop
-# ever being set. The sibling cells (luks-rd-create-encrypted.sh,
-# luks-clone-encrypted.sh, replay/luks-encrypted-rd.yaml) still set
-# the legacy prop and keep covering the deprecated path.
+# create-passphrase` is the ONLY key source. blockstor never reads the
+# passphrase from a property (a property sits in plaintext on its CR),
+# and the REST API refuses to store one: `controller set-property
+# DrbdOptions/EncryptPassphrase <pw>` answers 400. The whole LUKS
+# lifecycle must work without that prop, and setting it must fail.
 #
 # Flow + assertions:
 #   1. cleanup_encryption_state → known-clean baseline (no Secret, no
@@ -33,7 +33,9 @@
 #   2. linstor encryption create-passphrase --passphrase <pw> → exit 0.
 #   3. legacy prop ABSENT on `controller list-properties` (and stays
 #      absent through the whole cell — provisioning must not depend on
-#      anything writing it behind our back).
+#      anything writing it behind our back); `controller set-property
+#      DrbdOptions/EncryptPassphrase <decoy>` is refused (non-zero exit)
+#      and stores nothing.
 #   4. rd c -l drbd,luks,storage → exit 0 (pre-fix: rejected).
 #   5. vd c + r c --auto-place=2 → both diskful replicas UpToDate.
 #   6. kernel-level proof on EACH replica: backing LV/zvol carries a
@@ -42,6 +44,7 @@
 #      satellite channel to luksFormat, not just past the REST gate.
 #
 # Unit pins: pkg/rest/luks_gate_bug023_test.go,
+# pkg/rest/passphrase_props_guard_test.go,
 # pkg/satellite/controllers/luks_passphrase_internal_test.go. This
 # cell is the stand-side companion: real python-linstor → apiserver →
 # satellite → cryptsetup.
@@ -114,6 +117,22 @@ rm -f "$err_file"
 
 echo ">> [Bug 023] legacy DrbdOptions/EncryptPassphrase prop is ABSENT"
 assert_legacy_prop_absent "after create-passphrase"
+
+echo ">> [Bug 023] controller set-property DrbdOptions/EncryptPassphrase is REFUSED"
+# A decoy, not the real passphrase: if the refusal ever regressed, the
+# value it would leave in plaintext on the ControllerConfig is
+# worthless, and assert_legacy_prop_absent below catches it.
+err_file=$(mktemp)
+if "${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase \
+        'cli-matrix-023-decoy' 2>"$err_file" >/dev/null; then
+    echo "FAIL (Bug 023): controller set-property DrbdOptions/EncryptPassphrase was accepted;" >&2
+    echo "  the passphrase must never be stored in a plaintext property" >&2
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    exit 1
+fi
+rm -f "$err_file"
+assert_legacy_prop_absent "after the refused set-property"
 
 echo ">> [Bug 023] linstor rd c $RD -l drbd,luks,storage (no legacy prop set)"
 err_file=$(mktemp)
@@ -192,5 +211,23 @@ for node in "$N1" "$N2"; do
         exit 1
     fi
 done
+
+echo ">> [Bug 023] vd modify-passphrase is REFUSED (no per-volume keys)"
+if "${LCTL[@]}" volume-definition modify-passphrase "$RD" 0 'cli-matrix-023-vd-decoy' >/dev/null 2>&1; then
+    echo "FAIL (Bug 023): vd modify-passphrase was accepted; it stored a plaintext per-volume key nothing reads" >&2
+    exit 1
+fi
+
+echo ">> [Bug 023] encryption modify-passphrase is REFUSED while the LUKS volume exists"
+if "${LCTL[@]}" encryption modify-passphrase --old-passphrase "$PASSPHRASE" \
+        --new-passphrase 'cli-matrix-023-rotated' >/dev/null 2>&1; then
+    echo "FAIL (Bug 023): the cluster passphrase rotated under a LUKS volume nothing re-keys" >&2
+    exit 1
+fi
+backing=$(luks_backing_device "$RD" "$N1" 0)
+if ! assert_luks_passphrase_opens "$N1" "$backing" "$PASSPHRASE"; then
+    echo "FAIL (Bug 023): the passphrase no longer opens $N1:$backing after the refused rotation" >&2
+    exit 1
+fi
 
 echo ">> encryption-passphrase-luks-rd OK (Bug 023: Secret-only passphrase provisions LUKS end-to-end, no legacy prop)"

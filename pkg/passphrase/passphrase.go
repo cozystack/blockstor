@@ -35,6 +35,8 @@ package passphrase
 
 import (
 	"context"
+	"slices"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -56,15 +58,62 @@ const SecretKey = "passphrase"
 
 // PropKeyCanonical is upstream LINSTOR's cluster-scope master-key
 // property name (`linstor controller set-property
-// DrbdOptions/EncryptPassphrase <pass>`). Bug 023: this LEGACY path
-// stores the passphrase in PLAINTEXT on the ControllerConfig CRD —
-// kept working for backward compatibility, but the Secret written
-// by `encryption create-passphrase` is the primary mechanism.
+// DrbdOptions/EncryptPassphrase <pass>`). blockstor never reads the
+// passphrase from a property: a property is stored in plaintext on its
+// CR, and any dump of the CRs for a backup would carry the key to every
+// LUKS volume. The REST API refuses to store it, and the satellite drops
+// it from a definition's properties before it adds the Secret's value
+// under this key for the dispatcher.
 const PropKeyCanonical = "DrbdOptions/EncryptPassphrase"
 
-// PropKeyLegacy is the early-Phase-9 per-RD alias the dispatcher
-// still alias-reads (Bug 265 history, pkg/dispatcher). Deprecated.
+// PropKeyLegacy is the early per-RD alias of PropKeyCanonical. It is
+// refused and dropped the same way.
 const PropKeyLegacy = "DrbdOptions/Encryption/passphrase"
+
+// PropKeyVolume is upstream LINSTOR's per-volume passphrase property,
+// stamped by `linstor vd modify-passphrase`. blockstor has no per-volume
+// keys: every LUKS volume uses the cluster passphrase, so the door that
+// wrote it is refused and the key is refused and dropped like the others.
+const PropKeyVolume = "DrbdOptions/Encrypt/Passphrase"
+
+// WirePropKey is the property the satellite's LUKS layer reads the
+// passphrase from. Only the dispatcher sets it, from the Secret; a
+// property of that name an operator set is refused and dropped too.
+const WirePropKey = "LuksPassphrase"
+
+// IsPlaintextPropKey reports whether key would carry the master
+// passphrase in a property. Matched without regard to case, so no
+// spelling slips through.
+func IsPlaintextPropKey(key string) bool {
+	for _, k := range []string{PropKeyCanonical, PropKeyLegacy, PropKeyVolume, WirePropKey} {
+		if strings.EqualFold(key, k) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// DropPlaintextProps removes every property that would carry the
+// master passphrase from props, and returns the keys it removed that
+// held a value, sorted, for the caller to name in a log line.
+func DropPlaintextProps(props map[string]string) []string {
+	var dropped []string
+
+	for key, value := range props {
+		if IsPlaintextPropKey(key) {
+			delete(props, key)
+
+			if value != "" {
+				dropped = append(dropped, key)
+			}
+		}
+	}
+
+	slices.Sort(dropped)
+
+	return dropped
+}
 
 // SecretName resolves the passphrase Secret's name from the
 // singleton ControllerConfig, falling back to DefaultSecretName when

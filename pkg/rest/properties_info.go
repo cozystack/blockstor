@@ -145,11 +145,6 @@ func commonPropsInfoEntries() []propsInfoEntry {
 			Name: drbdNetCramHMACAlgKey,
 			Info: "HMAC algorithm for DRBD per-pair authentication.",
 		},
-		{
-			Name: drbdEncryptPassphraseKey,
-			Info: "Cluster-scope DRBD encryption passphrase. Redacted on " +
-				"read; set via `linstor encryption set-passphrase`.",
-		},
 	}
 }
 

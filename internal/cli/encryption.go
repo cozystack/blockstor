@@ -317,20 +317,5 @@ func checkLUKSPrerequisite(ctx context.Context, run *runContext, layers []string
 		return nil
 	}
 
-	// The Secret is the primary mechanism, but a cluster provisioned
-	// before it existed carries the passphrase in the legacy controller
-	// prop, and the satellite still unlocks with it. REST accepts both;
-	// checking only the Secret makes the CLI refuse a stack that the
-	// REST door on the same cluster creates without complaint.
-	props, err := run.Store.ControllerProps().Get(ctx)
-	if err != nil {
-		return fmt.Errorf("read controller properties to check the %s prerequisite: %w",
-			apiv1.LayerKindLUKS, err)
-	}
-
-	if props[passphrase.PropKeyCanonical] != "" {
-		return nil
-	}
-
 	return fmt.Errorf("layer list includes %s: %w", apiv1.LayerKindLUKS, errLUKSWithoutPassphrase)
 }

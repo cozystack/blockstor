@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -75,6 +76,107 @@ func TestSpawnDoesNotInheritServerOwnedGroupProps(t *testing.T) {
 
 	if rd.Props["DrbdOptions/Net/protocol"] != "C" {
 		t.Errorf("spawned definition lost an ordinary group prop: %v", rd.Props)
+	}
+}
+
+// A passphrase property a group kept from before the Secret was the only
+// source is not copied into what it spawns: nothing reads it, and the copy
+// would put the plaintext key into every new definition and its backups.
+func TestSpawnDoesNotCopyAGroupPassphraseProp(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{
+		Name: "rg-pass",
+		Props: map[string]string{
+			passphrase.PropKeyLegacy:   "left-over-plaintext",
+			"DrbdOptions/Net/protocol": "C",
+		},
+	}); err != nil {
+		t.Fatalf("seed the group: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{ResourceDefinitionName: "pvc-pass"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-pass/spawn", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("spawn = %d, want 201", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(t.Context(), "pvc-pass")
+	if err != nil {
+		t.Fatalf("read the spawned definition: %v", err)
+	}
+
+	for key := range rd.Props {
+		if passphrase.IsPlaintextPropKey(key) {
+			t.Errorf("spawned definition carries %s from its group", key)
+		}
+	}
+
+	if rd.Props["DrbdOptions/Net/protocol"] != "C" {
+		t.Errorf("spawned definition lost an ordinary group prop: %v", rd.Props)
+	}
+}
+
+// The same holds for a volume group's props, which a spawn copies onto the
+// volume definition it creates for that volume number.
+func TestSpawnDoesNotCopyAVolumeGroupPassphraseProp(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{
+		Name: "rg-vgpass",
+		VolumeGroups: []apiv1.VolumeGroup{{
+			VolumeNumber: 0,
+			Props: map[string]string{
+				passphrase.PropKeyVolume:      "left-over-plaintext",
+				"DrbdOptions/Disk/al-extents": "6007",
+			},
+		}},
+	}); err != nil {
+		t.Fatalf("seed the group: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-vgpass",
+		VolumeSizes:            []int64{4096 * 1024},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-vgpass/spawn", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("spawn = %d, want 201", resp.StatusCode)
+	}
+
+	vd, err := st.VolumeDefinitions().Get(t.Context(), "pvc-vgpass", 0)
+	if err != nil {
+		t.Fatalf("read the spawned volume: %v", err)
+	}
+
+	for key := range vd.Props {
+		if passphrase.IsPlaintextPropKey(key) {
+			t.Errorf("spawned volume carries %s from its volume group", key)
+		}
+	}
+
+	if vd.Props["DrbdOptions/Disk/al-extents"] != "6007" {
+		t.Errorf("spawned volume lost an ordinary volume group prop: %v", vd.Props)
 	}
 }
 

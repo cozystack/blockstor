@@ -56,11 +56,6 @@ kubectl -n "$NS" port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/luks-toggle-leak-pf.log 2>&1 &
 PF_PID=$!
 
-# Track passphrase state so cleanup doesn't strand
-# DrbdOptions/EncryptPassphrase on a property the next scenario can't
-# observe; harmless on shared stands but tidy.
-SET_PASSPHRASE=0
-
 dump_diag() {
     echo "---- dump: linstor r l -r $RD ----"
     "${LCTL[@]}" r l -r "$RD" 2>&1 || true
@@ -77,9 +72,6 @@ cleanup() {
         dump_diag
     fi
     delete_rd "$RD" 2>/dev/null || true
-    if (( SET_PASSPHRASE == 1 )); then
-        "${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase "" 2>/dev/null || true
-    fi
     kill "$PF_PID" 2>/dev/null || true
     wait "$PF_PID" 2>/dev/null || true
 }
@@ -96,12 +88,11 @@ LCTL=(linstor --controllers "http://localhost:$PF_PORT")
 
 delete_rd "$RD" 2>/dev/null || true
 
-# Stamp the cluster-wide passphrase the LUKS layer needs. Best-effort:
-# a previous scenario may already have it stamped and the second set
-# is harmless on the apiserver but emits a warning on the CLI.
-echo ">> stamping DrbdOptions/EncryptPassphrase via controller set-property"
-"${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase "bug-hunt-v2-luks-passphrase" 2>&1 | tail -5
-SET_PASSPHRASE=1
+# Make sure the cluster passphrase Secret the LUKS layer needs exists.
+# A previous scenario may already have created it; that one is kept,
+# since replacing it would lock out the volumes formatted with it.
+echo ">> ensuring the cluster passphrase Secret"
+ensure_passphrase_secret "bug-hunt-v2-luks-passphrase"
 
 # ---- STEP 1: 2 diskful with LUKS-stacked layer list ----------------
 

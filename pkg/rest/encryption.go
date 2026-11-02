@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -33,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 )
@@ -597,10 +599,7 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err = s.writePassphrase(ctx, want)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
+	if !s.rotatePassphrase(ctx, w, want) {
 		return
 	}
 
@@ -616,6 +615,85 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		RetCode: maskInfo,
 		Message: "Master passphrase modified",
 	}})
+}
+
+// rotatePassphrase writes the new cluster passphrase unless LUKS volumes
+// would lose their key to it, answering the error itself; false means the
+// handler stops.
+func (s *Server) rotatePassphrase(ctx context.Context, w http.ResponseWriter, want string) bool {
+	if !s.refuseRotationOverLUKSVolumes(ctx, w) {
+		return false
+	}
+
+	err := s.writePassphrase(ctx, want)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return false
+	}
+
+	return true
+}
+
+// refuseRotationOverLUKSVolumes answers 409 and returns false while any
+// definition has LUKS in its stack. The cluster passphrase is the key
+// every LUKS volume was formatted with, and nothing re-keys a volume yet
+// (no `cryptsetup luksChangeKey`), so a new value in the Secret would
+// leave every existing LUKS volume unable to open on its next start.
+func (s *Server) refuseRotationOverLUKSVolumes(ctx context.Context, w http.ResponseWriter) bool {
+	name, err := s.aLUKSDefinition(ctx)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if name == "" {
+		return true
+	}
+
+	writeError(w, http.StatusConflict, fmt.Sprintf(
+		"refusing to change the cluster passphrase while LUKS volumes exist (%s among them): "+
+			"it is the key they were formatted with, and they are not re-keyed, so they would no longer open",
+		name))
+
+	return false
+}
+
+// aLUKSDefinition names one definition with LUKS in its stack, or "" when
+// there is none. It reads the API server directly when the server has a
+// direct reader: a definition created a moment ago may not be in the cache
+// yet, and the rotation it would let through cannot be undone.
+func (s *Server) aLUKSDefinition(ctx context.Context) (string, error) {
+	if s.SecretReader != nil {
+		var list blockstoriov1alpha1.ResourceDefinitionList
+
+		err := s.SecretReader.List(ctx, &list)
+		if err != nil {
+			return "", fmt.Errorf("list resource definitions: %w", err)
+		}
+
+		for i := range list.Items {
+			if apiv1.LayerInStack(list.Items[i].Spec.LayerStack, apiv1.LayerKindLUKS) {
+				return list.Items[i].Name, nil
+			}
+		}
+
+		return "", nil
+	}
+
+	rds, err := s.Store.ResourceDefinitions().List(ctx)
+	if err != nil {
+		return "", err //nolint:wrapcheck // the store names what it failed to read
+	}
+
+	for i := range rds {
+		if apiv1.LayerInStack(rds[i].LayerStack, apiv1.LayerKindLUKS) {
+			return rds[i].Name, nil
+		}
+	}
+
+	return "", nil
 }
 
 // readPassphrase reads the current cluster passphrase. Empty

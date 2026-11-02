@@ -22,7 +22,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 
@@ -323,7 +322,7 @@ func spawnDefinition(ctx context.Context, run *runContext, group *apiv1.Resource
 	}
 
 	if len(group.Props) > 0 {
-		def.Props = maps.Clone(group.Props)
+		def.Props = store.TravellingProps(group.Props)
 	}
 
 	err := run.Store.ResourceDefinitions().Create(ctx, def)

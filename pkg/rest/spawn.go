@@ -310,10 +310,10 @@ func copyVolumeGroupProps(vgs []apiv1.VolumeGroup, volNumber int32) map[string]s
 			return nil
 		}
 
-		out := make(map[string]string, len(vgs[i].Props))
-		maps.Copy(out, vgs[i].Props)
-
-		return out
+		// The same filter as the group's own props: a passphrase
+		// property left on a volume group is never read, and copying it
+		// would put the plaintext key on every spawned volume.
+		return store.TravellingProps(vgs[i].Props)
 	}
 
 	return nil

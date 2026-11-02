@@ -25,9 +25,6 @@ import (
 	"strings"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -195,22 +192,19 @@ func describeLayerChain(layer *apiv1.ResourceLayer) string {
 
 // TestBug95LUKSCreateRefusedWithoutPassphrase is the write-side
 // guard: posting an RD-create body with LUKS in the layer stack
-// MUST be rejected with 400 when the controller-scope props don't
-// carry `DrbdOptions/EncryptPassphrase`. Without this gate the RD
-// was accepted and the encryption silently dropped (Bug 95).
+// MUST be rejected with 400 when the cluster has no passphrase
+// Secret. Without this gate the RD was accepted and the encryption
+// silently dropped (Bug 95).
 //
-// The 400 envelope must name the missing prop so the operator
-// knows exactly which `controller set-property` invocation to make
-// before retrying the RD-create.
+// The 400 envelope must send the operator to `encryption
+// create-passphrase`, the only place the passphrase is read from.
 func TestBug95LUKSCreateRefusedWithoutPassphrase(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
 	cli := newFakeRESTClient(t)
 
-	// No ControllerConfig seed — `DrbdOptions/EncryptPassphrase` is
-	// absent. (The fake client treats a missing ControllerConfig
-	// the same way as `controllerScopeProps` does: empty map.)
+	// No passphrase Secret seeded.
 	base, stop := startServerCustom(t, &Server{
 		Addr:      pickFreeAddr(t),
 		Store:     st,
@@ -238,9 +232,7 @@ func TestBug95LUKSCreateRefusedWithoutPassphrase(t *testing.T) {
 	}
 
 	bodyBytes, _ := readAllBody(resp)
-	if !strings.Contains(string(bodyBytes), "DrbdOptions/EncryptPassphrase") {
-		t.Errorf("response body missing prop name: %s", bodyBytes)
-	}
+	assertLUKSRefusalHint(t, bodyBytes)
 
 	// Confirm the RD was NOT persisted — partial commit on a 400 is
 	// the silent-failure mode this gate is preventing.
@@ -251,8 +243,7 @@ func TestBug95LUKSCreateRefusedWithoutPassphrase(t *testing.T) {
 }
 
 // TestBug95LUKSCreateAcceptedWithPassphrase is the happy-path
-// counterpart: once `DrbdOptions/EncryptPassphrase` is set on the
-// controller scope, `rd c --layer-list DRBD,LUKS,STORAGE` is
+// counterpart: once the passphrase Secret exists, `rd c --layer-list DRBD,LUKS,STORAGE` is
 // accepted (201) and the resulting RD persists the requested
 // LayerStack so the dispatcher's read of `rd.Spec.LayerStack`
 // (pkg/dispatcher/dispatcher.go) carries LUKS through to the
@@ -264,15 +255,8 @@ func TestBug95LUKSCreateAcceptedWithPassphrase(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
-		Spec: blockstoriov1alpha1.ControllerConfigSpec{
-			ExtraProps: map[string]string{
-				"DrbdOptions/EncryptPassphrase": "blockstorpass",
-			},
-		},
-	}); err != nil {
-		t.Fatalf("seed ControllerConfig: %v", err)
+	if err := cli.Create(ctx, testPassphraseSecret("blockstorpass")); err != nil {
+		t.Fatalf("seed the passphrase Secret: %v", err)
 	}
 
 	base, stop := startServerCustom(t, &Server{
@@ -363,9 +347,7 @@ func TestBug95LUKSRefusedWhenCLIUsesLayerData(t *testing.T) {
 	}
 
 	bodyBytes, _ := readAllBody(resp)
-	if !strings.Contains(string(bodyBytes), "DrbdOptions/EncryptPassphrase") {
-		t.Errorf("response body missing prop name: %s", bodyBytes)
-	}
+	assertLUKSRefusalHint(t, bodyBytes)
 
 	_, err := st.ResourceDefinitions().Get(t.Context(), "luktest-cli")
 	if err == nil {
@@ -375,7 +357,7 @@ func TestBug95LUKSRefusedWhenCLIUsesLayerData(t *testing.T) {
 
 // TestBug95LUKSAcceptedWhenCLIUsesLayerData is the happy-path
 // counterpart of TestBug95LUKSRefusedWhenCLIUsesLayerData: with the
-// controller-scope passphrase set, the CLI's `layer_data: [...]`
+// passphrase Secret seeded, the CLI's `layer_data: [...]`
 // wire shape must round-trip cleanly to `rd.LayerStack` on the
 // persisted CRD so the dispatcher's `rd.Spec.LayerStack` read
 // surfaces the LUKS layer to the satellite.
@@ -386,15 +368,8 @@ func TestBug95LUKSAcceptedWhenCLIUsesLayerData(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
-		Spec: blockstoriov1alpha1.ControllerConfigSpec{
-			ExtraProps: map[string]string{
-				"DrbdOptions/EncryptPassphrase": "blockstorpass",
-			},
-		},
-	}); err != nil {
-		t.Fatalf("seed ControllerConfig: %v", err)
+	if err := cli.Create(ctx, testPassphraseSecret("blockstorpass")); err != nil {
+		t.Fatalf("seed the passphrase Secret: %v", err)
 	}
 
 	base, stop := startServerCustom(t, &Server{

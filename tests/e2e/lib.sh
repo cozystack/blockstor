@@ -1172,3 +1172,23 @@ unwire_linstor_csi_mtls() {
              {"op":"remove","path":"/spec/apiTLS"}]' \
         2>/dev/null || true
 }
+
+# ensure_passphrase_secret <passphrase> — make sure the cluster LUKS
+# master passphrase Secret exists, the one `linstor encryption
+# create-passphrase` writes. It is the only place blockstor reads the
+# passphrase from: a `DrbdOptions/EncryptPassphrase`,
+# `DrbdOptions/Encryption/passphrase` or `LuksPassphrase` property is
+# never read, and REST refuses to store one. An existing Secret is left
+# alone, since replacing it would lock out every LUKS volume formatted
+# with it; the scenario then runs on that cluster passphrase.
+ensure_passphrase_secret() {
+    local pass=${1:?passphrase required} secret
+    secret=$(kubectl get controllerconfigs.blockstor.cozystack.io \
+        -o jsonpath='{.items[0].spec.passphraseSecretRef.name}' 2>/dev/null || true)
+    [[ -n "$secret" ]] || secret=blockstor-cluster-passphrase
+    if kubectl -n "$NS" get secret "$secret" >/dev/null 2>&1; then
+        return 0
+    fi
+    kubectl -n "$NS" create secret generic "$secret" \
+        --from-literal=passphrase="$pass" >/dev/null
+}

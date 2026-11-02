@@ -8,10 +8,10 @@
 #
 # Setup:
 #   - 2-replica RD on workers 1+2 with LayerStack=["DRBD","LUKS","STORAGE"]
-#   - DrbdOptions/Encryption/passphrase set on the RD
+#   - the cluster passphrase Secret (ensure_passphrase_secret)
 #   - write urandom on primary + capture md5
 # Steps:
-#   1. apply RD with explicit layerStack + passphrase
+#   1. ensure the passphrase Secret, apply RD with explicit layerStack
 #   2. apply Resources on N1, N2
 #   3. wait_uptodate — both peers reach disk:UpToDate over DRBD
 #   4. write 4 MiB on primary's /dev/drbdN, read back — md5 matches
@@ -43,6 +43,8 @@ STORPOOL=${STORPOOL:-stand}
 
 trap 'delete_rd "$RD"' EXIT
 
+ensure_passphrase_secret "$PASSPHRASE"
+
 echo ">> apply ${RD} with LayerStack=[DRBD,LUKS,STORAGE]"
 cat <<EOF | kubectl apply -f -
 apiVersion: blockstor.cozystack.io/v1alpha1
@@ -50,8 +52,6 @@ kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
   layerStack: ["DRBD", "LUKS", "STORAGE"]
-  props:
-    DrbdOptions/Encryption/passphrase: "${PASSPHRASE}"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_KIB}}
 EOF

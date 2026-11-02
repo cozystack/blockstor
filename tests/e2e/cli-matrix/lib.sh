@@ -534,12 +534,14 @@ assert_luks_passphrase_opens() {
 cleanup_encryption_state() {
     # Resolve the passphrase Secret name (custom ref or default).
     local secret
-    secret=$(kubectl -n "$NS" get controllerconfigs.blockstor.cozystack.io \
-        -o jsonpath='{.items[0].spec.passphraseSecretRef}' 2>/dev/null || true)
+    secret=$(kubectl get controllerconfigs.blockstor.cozystack.io \
+        -o jsonpath='{.items[0].spec.passphraseSecretRef.name}' 2>/dev/null || true)
     [[ -n "$secret" ]] || secret=blockstor-cluster-passphrase
     kubectl -n "$NS" delete secret "$secret" --ignore-not-found >/dev/null 2>&1 || true
-    # Clear the LUKS-layer controller property too, so a leftover key
-    # from a prior cell doesn't leak into the next one's RD create.
+    # Clear a passphrase controller property a stand may still carry
+    # from a build that read one. Nothing reads it now and REST refuses
+    # to set it, but it is a plaintext key on the ControllerConfig; an
+    # empty value is the set-property delete, which REST allows.
     if [[ ${#LCTL[@]} -gt 0 ]]; then
         "${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase "" \
             >/dev/null 2>&1 || true
