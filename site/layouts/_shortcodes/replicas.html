@@ -1,0 +1,29 @@
+<figure class="replicas" aria-labelledby="replicas-caption">
+  <svg viewBox="0 0 360 300" role="img" aria-labelledby="replicas-title">
+    <title id="replicas-title">One resource definition in the Kubernetes API, reconciled into three DRBD replicas on three nodes</title>
+    <g class="crd">
+      <rect x="96" y="8" width="168" height="44" rx="4"/>
+      <text x="180" y="35" text-anchor="middle">ResourceDefinition</text>
+    </g>
+    <g class="links">
+      <path d="M180 52 V80 H60 V108"/>
+      <path d="M180 52 V108"/>
+      <path d="M180 80 H300 V108"/>
+    </g>
+    {{- range $i, $x := slice 12 132 252 }}
+    <g class="node">
+      <rect x="{{ $x }}" y="108" width="96" height="176" rx="4"/>
+      <text x="{{ add $x 48 }}" y="130" text-anchor="middle">node-{{ add $i 1 }}</text>
+      <rect class="blk" x="{{ add $x 16 }}" y="144" width="64" height="28"/>
+      <rect class="blk" x="{{ add $x 16 }}" y="178" width="64" height="28"/>
+      <rect class="blk" x="{{ add $x 16 }}" y="212" width="64" height="28"/>
+      <text class="sub" x="{{ add $x 48 }}" y="268" text-anchor="middle">satellite</text>
+    </g>
+    {{- end }}
+    <g class="sync">
+      <path d="M92 192 H148"/>
+      <path d="M212 192 H268"/>
+    </g>
+  </svg>
+  <figcaption id="replicas-caption">Each satellite watches its own slice of the CRDs and writes what it observes back through Status, while DRBD keeps the replicas in sync.</figcaption>
+</figure>

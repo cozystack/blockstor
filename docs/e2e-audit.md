@@ -38,7 +38,7 @@ Each row names the Tier 2 test(s) that exercise the same REST/CRD/reconciler pat
 | `placement-label-sync.sh` | NodeLabelSyncReconciler mirroring k8s labels → `Aux/...` props; envtest IS real k8s API. | Group A `TestGroupANodeAuxLabelSync` |
 | `recovery-false-diskless.sh` | Today asserts 404 on `r mkavail` (handler not wired). Pure wire-shape probe — no kernel-state contract. | Group F wire-shape probes; will move to Tier 4 when the handler lands and the test becomes "adopt existing on-disk state" |
 
-`lc-rd-delete-churn.sh` is **kept** despite touching the same handlers — it runs 10 iterations and watches `dmesg`/`zfs list` for orphan ZVOLs and `node_id of X instead of Y` kernel warnings (cited by `docs/known-issues.md` as the validation source for the storage-sweeper). That assertion needs a live cluster.
+`lc-rd-delete-churn.sh` is **kept** despite touching the same handlers — it runs 10 iterations and watches `dmesg`/`zfs list` for orphan ZVOLs and `node_id of X instead of Y` kernel warnings (the validation source for the storage-sweeper). That assertion needs a live cluster.
 
 ---
 

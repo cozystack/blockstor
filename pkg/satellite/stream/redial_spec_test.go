@@ -69,8 +69,8 @@ package stream_test
 // Tracking:
 //
 //   - tests/scenarios/03-networking.md §3.10
-//   - docs/known-issues.md → "Bug 49: satellite ignores runtime
-//     NetInterface changes (deferred from scenario 3.10)"
+//   - docs/cli-parity-known-deltas.md → row 86, "node interface
+//     modify --active" (formerly Bug 49, deferred from scenario 3.10)
 //
 // Outcome A (active re-dial loop) was considered and rejected: the
 // blockstor architecture does not have a satellite→controller dial

@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-The premise in `known-issues.md` ("satellite pod IPs come from outside the pod CIDR" / "netInterfaces[0].address=<pod-CIDR>") is wrong. On both e2e-iptables and e2e-quorum the stored `Node.spec.netInterfaces[0].address` is the host InternalIP (10.27.0.x / 10.161.0.x). What actually differs between the two stands is **who owns the Node CRD's `spec` once piraeus-operator finishes reconciling**:
+The premise in the Bug 42 entry of `known-issues.md` (since removed) ("satellite pod IPs come from outside the pod CIDR" / "netInterfaces[0].address=<pod-CIDR>") is wrong. On both e2e-iptables and e2e-quorum the stored `Node.spec.netInterfaces[0].address` is the host InternalIP (10.27.0.x / 10.161.0.x). What actually differs between the two stands is **who owns the Node CRD's `spec` once piraeus-operator finishes reconciling**:
 
 - **e2e-quorum** — piraeus runs against its own bundled `linstor-controller` (LinstorCluster `spec: {}`). Piraeus never touches the blockstor Node CRD. Spec stays exactly as `install-blockstor.sh` left it: one interface `default` with the k8s InternalIP, `generation: 1`, no `Aux/piraeus.io/*` props.
 - **e2e-iptables** — `LinstorCluster.spec.externalController.url = http://blockstor-apiserver.blockstor-system.svc:3370` was set (by an `observability-*` e2e scenario, see `tests/e2e/observability-three-way.sh:78-84` and `tests/e2e/observability-capacity-correlation.sh:240-244`). The operator now drives blockstor-apiserver as its LINSTOR backend and rewrites the Node CRD via `PUT /v1/nodes/{node}/net-interfaces/default-ipv4`: interface name changes from `default` to `default-ipv4`, `satellitePort=3366` + `satelliteEncryptionType=PLAIN` are added, and `Aux/piraeus.io/last-applied` / `Aux/piraeus.io/configured-interfaces` props appear in `spec.props`. Generation climbs to 9.
@@ -116,5 +116,5 @@ Both `tests/e2e/observability-three-way.sh:81-84` and `tests/e2e/observability-c
 ## Recommended next steps
 
 1. Apply fix (A) + (B), each as its own commit.
-2. Rewrite `docs/known-issues.md` Bug 42 entry to match what's actually happening (interface-name + props churn from externalController-mode piraeus), drop the unsupported pod-CIDR claim, and adjust severity (P3 — cosmetic / fragility, not a DRBD outage).
+2. Rewrite the Bug 42 entry (the page has since been removed) to match what's actually happening (interface-name + props churn from externalController-mode piraeus), drop the unsupported pod-CIDR claim, and adjust severity (P3 — cosmetic / fragility, not a DRBD outage).
 3. Optional follow-up: add a contract test asserting that `snapshot_fetcher.peerAddr()` resolves correctly when the only NetInterface is named `default-ipv4`. That pins fix (A) and would have caught this earlier.
