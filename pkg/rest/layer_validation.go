@@ -55,3 +55,37 @@ var (
 func validateLayerStack(layers []string) error {
 	return validate.LayerStack(layers)
 }
+
+// canonicalizeLayerStack validates *layers like validateLayerStack and, when
+// the stack is non-empty, replaces it with its canonical-case spelling, which
+// is what the write paths store. Some readers compare the stored value
+// exactly, so a lowercase stack stored verbatim read as "no DRBD" to them.
+//
+//nolint:wrapcheck // see validateLayerStack
+func canonicalizeLayerStack(layers *[]string) error {
+	if len(*layers) == 0 {
+		return nil
+	}
+
+	canonical, err := validate.CanonicalLayerStack(*layers)
+	if err != nil {
+		return err
+	}
+
+	*layers = canonical
+
+	return nil
+}
+
+// storedLayerStack is the stack an autoplace stores on a definition that
+// has none: the canonical spelling of a valid stack, so exact readers see
+// the same value every other write path stores, or a copy of the input as
+// given when it does not validate, which these paths never refused.
+func storedLayerStack(layers []string) []string {
+	canonical, err := validate.CanonicalLayerStack(layers)
+	if err == nil && canonical != nil {
+		return canonical
+	}
+
+	return append([]string(nil), layers...)
+}

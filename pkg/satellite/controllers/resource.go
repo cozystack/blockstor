@@ -1245,7 +1245,7 @@ func rdNeedsDRBD(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 		return true
 	}
 
-	return slices.Contains(stack, "DRBD")
+	return apiv1.LayerInStack(stack, apiv1.LayerKindDRBD)
 }
 
 // expectedPeerNamesFor returns the peer-node-name set the Bug 342 v3

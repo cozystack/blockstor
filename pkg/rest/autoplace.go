@@ -542,7 +542,7 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 		return true
 	}
 
-	rd.LayerStack = append([]string(nil), layerList...)
+	rd.LayerStack = storedLayerStack(layerList)
 
 	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — the
 	// closure mutates a freshly-fetched live RD on every retry, so
@@ -557,7 +557,7 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 			return nil
 		}
 
-		live.LayerStack = append([]string(nil), layerList...)
+		live.LayerStack = storedLayerStack(layerList)
 
 		return nil
 	})
@@ -1540,7 +1540,7 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 		_ = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
 			func(rd *apiv1.ResourceDefinition) error {
 				if len(rd.LayerStack) == 0 {
-					rd.LayerStack = append([]string(nil), env.LayerList...)
+					rd.LayerStack = storedLayerStack(env.LayerList)
 				}
 
 				return nil
@@ -2507,7 +2507,7 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 		err = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
 			func(live *apiv1.ResourceDefinition) error {
 				if len(live.LayerStack) == 0 {
-					live.LayerStack = append([]string(nil), req.LayerList...)
+					live.LayerStack = storedLayerStack(req.LayerList)
 				}
 
 				return nil

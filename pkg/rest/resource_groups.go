@@ -27,6 +27,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -173,7 +174,7 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := validateLayerStack(rg.SelectFilter.LayerStack)
+	err := canonicalizeLayerStack(&rg.SelectFilter.LayerStack)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -413,7 +414,10 @@ func rgNeedsRebalance(prev, next *apiv1.AutoSelectFilter) bool {
 		return true
 	}
 
-	if !slices.Equal(prev.LayerStack, next.LayerStack) {
+	// Case-blind: a stack stored as drbd,storage before writes were
+	// canonicalised is the same stack as DRBD,STORAGE, and a modify that
+	// resends it must not rebalance every child.
+	if !slices.EqualFunc(prev.LayerStack, next.LayerStack, strings.EqualFold) {
 		return true
 	}
 
@@ -1037,7 +1041,7 @@ func rgUpdateWireGate(raw []byte, patch *apiv1.ResourceGroup) error {
 	// nil); a nil/empty stack is the legitimate "clear to default" and
 	// validateLayerStack accepts it.
 	if patch.SelectFilter.LayerStack != nil {
-		err := validateLayerStack(patch.SelectFilter.LayerStack)
+		err := canonicalizeLayerStack(&patch.SelectFilter.LayerStack)
 		if err != nil {
 			return err
 		}
