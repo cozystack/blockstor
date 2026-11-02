@@ -75,6 +75,14 @@ func crdName(node, pool string) string {
 	return Name(pool + "." + node)
 }
 
+// poolIs reports whether crd is pool on node. A pool keeps the node
+// spelling it was created with, and a caller may ask in another one (a
+// replica's spec carries the node's CR name), so the node is compared the
+// way the store addresses it: Node-1 and node-1 are one node.
+func poolIs(crd *crdv1alpha1.StoragePool, node, pool string) bool {
+	return crd.Spec.PoolName == pool && SameName(crd.Spec.NodeName, node)
+}
+
 // List returns every StoragePool CRD as a wire-shape value, sorted by
 // (node, pool).
 func (s *storagePools) List(ctx context.Context) ([]apiv1.StoragePool, error) {
@@ -458,7 +466,7 @@ func (s *storagePools) resolveCRDName(ctx context.Context, node, pool string) (s
 		// CRD that happens to collide with our canonical shape),
 		// fall through to the List+filter pass. Mismatch is rare
 		// enough that the cost is acceptable.
-		if fast.Spec.NodeName == node && fast.Spec.PoolName == pool {
+		if poolIs(&fast, node, pool) {
 			return canonical, nil
 		}
 	} else if !apierrors.IsNotFound(err) {
@@ -479,7 +487,7 @@ func (s *storagePools) resolveCRDName(ctx context.Context, node, pool string) (s
 
 	for i := range crdList.Items {
 		item := &crdList.Items[i]
-		if item.Spec.NodeName == node && item.Spec.PoolName == pool {
+		if poolIs(item, node, pool) {
 			matches = append(matches, item.Name)
 		}
 	}
