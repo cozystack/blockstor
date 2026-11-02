@@ -153,39 +153,76 @@ func TestADisklessReplicaDoesNotShapeTheStack(t *testing.T) {
 	}
 }
 
-// Replicas built two ways leave nothing to read: the stack stays unset
-// and the operator is told which ways.
-func TestReplicasThatDisagreeLeaveTheStackUnset(t *testing.T) {
-	t.Parallel()
+// withReplicas adds a diskful replica of PVC-S on both nodes, so a test can
+// see whether the replicas of a refused definition still convert.
+func withReplicas(dump *Dump) *Dump {
+	dump.Resources = append(dump.Resources,
+		ResourceRow{NodeName: "NODE-A", ResourceName: "PVC-S", UUID: "r-a"},
+		ResourceRow{NodeName: "NODE-B", ResourceName: "PVC-S", UUID: "r-b"},
+	)
 
-	got, res := convertedStack(t, stackDump("[]",
-		layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")))
-	if len(got) != 0 {
-		t.Fatalf("stack %v, want unset", got)
-	}
-
-	if !hasWarning(res, "built as DRBD,LUKS,STORAGE and DRBD,STORAGE") {
-		t.Errorf("disagreement not reported; warnings %v", res.Warnings)
-	}
+	return dump
 }
 
-// A stack the RD row names is kept, and a replica built otherwise is
-// reported: the satellite would try to rebuild it.
-func TestAReplicaBuiltOtherwiseThanItsRDIsReported(t *testing.T) {
+// A definition whose replicas cannot be adopted under one stack is not
+// converted, nor are its replicas: adopted as it is, a replica would come up
+// under a stack it was not built with, DRBD metadata over a LUKS volume's
+// ciphertext among them. Every shape is refused and named: replicas built
+// two ways, or with their layers in another order, under a row with no
+// stack; a replica built otherwise than the stack the row names; and, under
+// a row with no stack, a diskful replica the dump shows no chain for, alone
+// or next to one that has one.
+func TestADefinitionWhoseReplicasDisagreeOnTheStackIsNotConverted(t *testing.T) {
 	t.Parallel()
 
-	got, res := convertedStack(t, stackDump(`["DRBD","LUKS","STORAGE"]`,
-		layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")))
-	if !slices.Equal(got, []string{"DRBD", "LUKS", "STORAGE"}) {
-		t.Fatalf("stack %v, want the RD row's", got)
-	}
+	luks := layerChain(1, "NODE-A", "PVC-S", "DRBD", "LUKS", "STORAGE")
 
-	if !hasWarning(res, "a replica was built as DRBD,STORAGE") {
-		t.Errorf("mismatch not reported; warnings %v", res.Warnings)
-	}
+	for name, tc := range map[string]struct {
+		rowStack, reason string
+		chains           [][]LayerResourceIDRow
+	}{
+		"replicas built two ways": {
+			rowStack: "[]", reason: "built as DRBD,LUKS,STORAGE and DRBD,STORAGE",
+			chains: [][]LayerResourceIDRow{luks, layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")},
+		},
+		"layers in another order": {
+			rowStack: "[]", reason: "built as DRBD,LUKS,STORAGE and LUKS,DRBD,STORAGE",
+			chains: [][]LayerResourceIDRow{luks, layerChain(10, "NODE-B", "PVC-S", "LUKS", "DRBD", "STORAGE")},
+		},
+		"a replica built otherwise": {
+			rowStack: `["DRBD","LUKS","STORAGE"]`, reason: "a replica was built as DRBD,STORAGE",
+			chains: [][]LayerResourceIDRow{luks, layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")},
+		},
+		"no chain at all": {rowStack: "[]", reason: "has no layer chain in the dump"},
+		"one chain missing": {
+			rowStack: "[]", reason: "the replica on node-b has no layer chain in the dump",
+			chains: [][]LayerResourceIDRow{luks},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	if hasWarning(res, "a replica was built as DRBD,LUKS,STORAGE") {
-		t.Errorf("a matching replica was reported; warnings %v", res.Warnings)
+			res, err := Convert(withReplicas(stackDump(tc.rowStack, tc.chains...)))
+			if err != nil {
+				t.Fatalf("Convert: %v", err)
+			}
+
+			for i := range res.ResourceDefinitions {
+				if res.ResourceDefinitions[i].Name == "pvc-s" {
+					t.Fatalf("pvc-s converted with stack %v", res.ResourceDefinitions[i].Spec.LayerStack)
+				}
+			}
+
+			for i := range res.Resources {
+				if res.Resources[i].Spec.ResourceDefinitionName == "pvc-s" {
+					t.Errorf("replica %s of a skipped definition converted", res.Resources[i].Name)
+				}
+			}
+
+			if !hasWarning(res, tc.reason) || !hasWarning(res, "skipped with its replicas") {
+				t.Errorf("the refusal does not name %q; warnings %v", tc.reason, res.Warnings)
+			}
+		})
 	}
 }
 

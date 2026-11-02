@@ -133,6 +133,11 @@ type converter struct {
 	// resource_name, then by the joined stack, to the stack itself.
 	diskStacks map[string]map[string][]string
 
+	// chained is every live replica indexDiskStacks found a layer chain
+	// for. A diskful replica without one was built under a stack the
+	// dump does not show.
+	chained map[replicaKey]bool
+
 	// referential-integrity sets, populated as each kind converts so
 	// later kinds can drop rows that would dangle (a replica of a
 	// skipped/absent RD, a replica on an unknown node, ...).
@@ -214,6 +219,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		storVol:           map[volumeReplicaKey]LayerStorageVolumeRow{},
 		luksVol:           map[volumeReplicaKey]LayerLuksVolumeRow{},
 		diskStacks:        map[string]map[string][]string{},
+		chained:           map[replicaKey]bool{},
 		convertedRD:       map[string]bool{},
 		convertedNode:     map[string]bool{},
 		convertedRG:       map[string]bool{},
@@ -439,6 +445,8 @@ func (c *converter) indexDiskStacks() {
 			stack = append(stack, cur.LayerResourceKind)
 		}
 
+		c.chained[replicaKey{node: row.NodeName, rd: row.ResourceName}] = true
+
 		if c.diskStacks[row.ResourceName] == nil {
 			c.diskStacks[row.ResourceName] = map[string][]string{}
 		}
@@ -447,13 +455,80 @@ func (c *converter) indexDiskStacks() {
 	}
 }
 
+// stackDisagreement says why the RD's replicas cannot be adopted under one
+// stack, or "" when they can: replicas built under different stacks when
+// the RD row names none, or a replica built under another stack than the
+// one the row names. It reads the row's stack without reporting a parse
+// failure; rdLayerStack reports that once.
+func (c *converter) stackDisagreement(row *ResourceDefinitionRow) string {
+	var stack []string
+	if !emptyList(row.LayerStack) {
+		_ = json.Unmarshal([]byte(row.LayerStack), &stack)
+	}
+
+	// With no stack of its own, the RD takes the one its replicas were
+	// built with, so every diskful replica has to show it; one the dump
+	// carries no chain for leaves that stack unknown. A stack the row names
+	// is what LINSTOR built the replicas under, so a missing chain there
+	// says nothing new.
+	if len(stack) == 0 {
+		if node := c.unchainedReplica(row.ResourceName); node != "" {
+			return "no layer stack of its own, and the replica on " + c.displayNode(node) +
+				" has no layer chain in the dump, so the stack it was built with is unknown"
+		}
+	}
+
+	keys := make([]string, 0, len(c.diskStacks[row.ResourceName]))
+	for key := range c.diskStacks[row.ResourceName] {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	if len(stack) == 0 {
+		if len(keys) > 1 {
+			return "no layer stack of its own, and its replicas were built as " + strings.Join(keys, " and ")
+		}
+
+		return ""
+	}
+
+	for _, key := range keys {
+		if key != strings.Join(stack, ",") {
+			return "layer stack " + strings.Join(stack, ",") + ", but a replica was built as " + key
+		}
+	}
+
+	return ""
+}
+
+// unchainedReplica names the node of a live diskful replica of rdName that
+// the dump carries no layer chain for, or "" when every one has its chain.
+// Such a replica was built under a stack nobody can read, and taking it as
+// agreeing with the others is how a LUKS volume ends up adopted as plain.
+// The filter is indexDiskStacks's: no snapshot, not diskless.
+func (c *converter) unchainedReplica(rdName string) string {
+	for i := range c.dump.Resources {
+		res := &c.dump.Resources[i]
+		if res.ResourceName != rdName || res.SnapshotName != "" || res.ResourceFlags&resourceFlagDiskless != 0 {
+			continue
+		}
+
+		if !c.chained[replicaKey{node: res.NodeName, rd: res.ResourceName}] {
+			return res.NodeName
+		}
+	}
+
+	return ""
+}
+
 // rdLayerStack is the layer stack a converted RD carries. An RD row
 // that names one keeps it; an empty one takes the stack its replicas
 // were built with, so the satellite adopts each volume as it is rather
 // than as the default, and the group's stack, which blockstor would
-// otherwise pin, is never laid over data built without it. Replicas
-// that disagree, or a stack the replicas were not built with, are
-// reported for the operator to settle before adopting.
+// otherwise pin, is never laid over data built without it. An RD whose
+// replicas disagree, or whose stack its replicas were not built with,
+// never gets here: rdConvertible skips it (stackDisagreement).
 func (c *converter) rdLayerStack(row *ResourceDefinitionRow, dsp string) []string {
 	stack := c.parseList(row.LayerStack, "resource definition "+dsp+" layer_stack")
 	onDisk := c.diskStacks[row.ResourceName]
@@ -466,25 +541,14 @@ func (c *converter) rdLayerStack(row *ResourceDefinitionRow, dsp string) []strin
 	slices.Sort(keys)
 
 	if len(stack) > 0 {
-		for _, key := range keys {
-			if key != strings.Join(stack, ",") {
-				c.warnf("resource definition %s: layer stack %s, but a replica was built as %s — that replica will not come up as it is", dsp, strings.Join(stack, ","), key)
-			}
-		}
-
 		return stack
 	}
 
-	switch len(keys) {
-	case 0:
-		return nil
-	case 1:
+	if len(keys) == 1 {
 		return slices.Clone(onDisk[keys[0]])
-	default:
-		c.warnf("resource definition %s: no layer stack of its own, and its replicas were built as %s — left unset; set spec.layerStack before adopting", dsp, strings.Join(keys, " and "))
-
-		return nil
 	}
+
+	return nil
 }
 
 func (c *converter) convertNodes() []crdv1alpha1.Node {
@@ -1081,6 +1145,14 @@ func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
 		c.warnf("resource definition %s: unhandled flags bitmask %d dropped", dsp, row.ResourceFlags)
 	}
 
+	if reason := c.stackDisagreement(row); reason != "" {
+		c.warnf("resource definition %s: %s — skipped with its replicas; adopted as it is, a replica would be "+
+			"brought up under a stack it was not built with, which for a LUKS volume writes DRBD metadata "+
+			"over its ciphertext; settle the stack in LINSTOR and convert again", dsp, reason)
+
+		return false
+	}
+
 	if reason := c.volumelessReason(row.ResourceName); reason != "" {
 		c.warnf("resource definition %s: %s — skipped; there is no volume to adopt, and migrating it leaves the controller placing replicas the satellite can never bring up", dsp, reason)
 
@@ -1668,7 +1740,7 @@ func (c *converter) snapshotNodesFor(rdName, snapName, snapDsp string) []string 
 // (`"[\"DRBD\",\"STORAGE\"]"`). Empty input, `[]` and `null` all yield
 // nil; a malformed value is reported and yields nil.
 func (c *converter) parseList(raw, context string) []string {
-	if raw == "" || raw == "[]" || raw == "null" {
+	if emptyList(raw) {
 		return nil
 	}
 
@@ -1686,6 +1758,11 @@ func (c *converter) parseList(raw, context string) []string {
 	}
 
 	return out
+}
+
+// emptyList reports a list column that holds no list: empty, `[]` or `null`.
+func emptyList(raw string) bool {
+	return raw == "" || raw == "[]" || raw == "null"
 }
 
 func (c *converter) displayNode(name string) string {
