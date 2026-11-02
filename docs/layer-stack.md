@@ -127,12 +127,12 @@ spec:
 
 Before this release a passphrase property won over the Secret: `DrbdOptions/EncryptPassphrase` on the controller, or `DrbdOptions/Encryption/passphrase` on a group or a definition. LUKS volumes created while one was set were formatted with its value. From this release on the satellite opens them with the Secret's value only, and logs `ignoring LUKS passphrase properties` with the keys it dropped. Do this before the upgrade.
 
-1. Find the properties. Their values are redacted on the REST API, so read the CRs. The store keeps a `DrbdOptions/*` key in `spec.extraProps`, not in `spec.props`, and a volume's own props, where `vd modify-passphrase` wrote `DrbdOptions/Encrypt/Passphrase`, in `spec.volumeDefinitions[].props` of its definition. Snapshots taken of a definition that carried the alias copied it into their own `spec.props`. So read all three on groups, definitions, replicas and snapshots, and the controller's own:
+1. Find the properties. Their values are redacted on the REST API, so read the CRs. The store keeps a `DrbdOptions/*` key in `spec.extraProps`, not in `spec.props`, and a volume's own props, where `vd modify-passphrase` wrote `DrbdOptions/Encrypt/Passphrase`, in `spec.volumeDefinitions[].props` of its definition, and a volume group's in `spec.volumeGroups[].props` of its group. Snapshots taken of a definition that carried the alias copied it into their own `spec.props`. So read all of them on groups, definitions, replicas and snapshots, and the controller's own:
 
    ```sh
    kubectl get controllerconfigs.blockstor.cozystack.io -o jsonpath='{.items[*].spec.extraProps}'
    kubectl get resourcegroups.blockstor.cozystack.io,resourcedefinitions.blockstor.cozystack.io,resources.blockstor.cozystack.io,snapshots.blockstor.cozystack.io -o json \
-     | jq -r '.items[] | select([(.spec.props // {}), (.spec.extraProps // {}), (.spec.volumeDefinitions // [] | .[].props // {})] | add | keys | any(test("passphrase"; "i"))) | "\(.kind)/\(.metadata.name)"'
+     | jq -r '.items[] | select([(.spec.props // {}), (.spec.extraProps // {}), (.spec.volumeDefinitions // [] | .[].props // {}), (.spec.volumeGroups // [] | .[].props // {})] | add | keys | any(test("passphrase"; "i"))) | "\(.kind)/\(.metadata.name)"'
    ```
 
 2. Make the Secret open every LUKS volume:
@@ -157,6 +157,7 @@ Before this release a passphrase property won over the Secret: `DrbdOptions/Encr
    linstor resource-definition set-property <definition> <key> ""
    linstor resource set-property <node> <resource> <key> ""
    linstor volume-definition set-property <definition> <volume number> <key> ""
+   linstor volume-group set-property <group> <volume number> <key> ""
    ```
 
    A snapshot has no set-property. Remove the key from its CR, with `/` in the key written as `~1`, or delete the snapshot if it is no longer needed:
@@ -166,7 +167,7 @@ Before this release a passphrase property won over the Secret: `DrbdOptions/Encr
      -p '[{"op":"remove","path":"/spec/props/DrbdOptions~1Encryption~1passphrase"}]'
    ```
 
-   Groups and definitions no longer pass such a key on to what is cloned, spawned, snapshotted or restored from them, but the copies made before the upgrade carry it, so step 1 finds those too.
+   Groups, their volume groups and definitions no longer pass such a key on to what is cloned, spawned, snapshotted or restored from them, but the copies made before the upgrade carry it, so step 1 finds those too.
 
 A volume missed in step 2 fails to open on the next satellite restart or mapper close; the satellite log line names the property it was formatted with.
 
