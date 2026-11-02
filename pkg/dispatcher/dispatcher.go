@@ -567,7 +567,7 @@ func peerAddressWithPrefNic(nodeName, poolName string, nodes []blockstoriov1alph
 func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool) string {
 	if poolName != "" {
 		for i := range pools {
-			if pools[i].Spec.NodeName != nodeName {
+			if !sameNodeName(pools[i].Spec.NodeName, nodeName) {
 				continue
 			}
 
@@ -584,7 +584,7 @@ func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, 
 	}
 
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+		if !isNodeCalled(&nodes[i], nodeName) {
 			continue
 		}
 
@@ -600,7 +600,7 @@ func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, 
 // source rather than 500-ing.
 func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+		if !isNodeCalled(&nodes[i], nodeName) {
 			continue
 		}
 
@@ -1020,11 +1020,11 @@ const defaultNICName = "default"
 //     legacy "first non-empty" behaviour so single-NIC clusters keep
 //     working unchanged. (Bug 48)
 //
-// Match is on the original LINSTOR name (annotation when slugified,
-// else metadata.Name) so non-RFC1123 LINSTOR names still resolve.
+// Match is by isNodeCalled, so a replica that stores the node's CR name
+// and one written before in the registered spelling both resolve.
 func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+		if !isNodeCalled(&nodes[i], nodeName) {
 			continue
 		}
 
@@ -1125,4 +1125,18 @@ func deriveMinor(rd string) int {
 	digest := sha256.Sum256([]byte(rd))
 
 	return minorBase + int(binary.BigEndian.Uint16(digest[2:4])%minorRange)
+}
+
+// isNodeCalled reports whether node is the one a replica names as name.
+// A replica stores its node's CR name, and one written before that, or
+// adopted, may carry the registered spelling; both map to the node's CR
+// name, which is how the store addresses it.
+func isNodeCalled(node *blockstoriov1alpha1.Node, name string) bool {
+	return node.Name == k8s.Name(name)
+}
+
+// sameNodeName compares two node names the way the store addresses a
+// node, for rows that store a name rather than the Node itself.
+func sameNodeName(a, b string) bool {
+	return k8s.Name(a) == k8s.Name(b)
 }
