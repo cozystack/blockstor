@@ -93,7 +93,7 @@ The CLI does the same thing with `blockstor physical-storage create-device-pool`
 
 ## ResourceGroup
 
-A policy that volumes inherit: how many replicas, in which pool, with which layers, and with which DRBD options.
+A policy that volumes inherit: how many replicas, in which pool, with which layers, and with which DRBD options. The layer stack is inherited differently: a definition takes the group's stack once, when it gets one, and only if it holds no data yet. A later change to the group's stack does not reshape it; see [How the stack is pinned](../layer-stack/#how-the-stack-is-pinned).
 
 ```yaml
 apiVersion: blockstor.cozystack.io/v1alpha1
@@ -199,3 +199,5 @@ flowchart LR
 ```
 
 A value that is set explicitly counts as set even when it is `false` or zero, so a definition can turn off something its group turns on.
+
+The layer stack is not resolved this way. It is copied onto the definition once, and read only from there; see [How the stack is pinned](../layer-stack/#how-the-stack-is-pinned).
