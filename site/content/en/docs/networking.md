@@ -12,10 +12,10 @@ Blockstor's components do not talk to each other directly. They read and write t
 | Component | Port | Protocol | Who connects | Reachable from |
 |---|---|---|---|---|
 | blockstor-apiserver | 3371 | HTTPS with mutual TLS | `linstor-csi`, piraeus-operator, `ha-controller`, the `linstor` client | The Services `blockstor-apiserver` and `blockstor-controller` in `blockstor-system` |
-| blockstor-apiserver | 3370 | Plain HTTP, no authentication | `kubectl port-forward` for debugging | Every pod that can reach the API server's pod IP, unless a NetworkPolicy blocks it. Not in any Service. |
+| blockstor-apiserver | 3370 | Plain HTTP, no authentication | `kubectl port-forward` for debugging | The pod's loopback address only. Not in any Service. |
 | blockstor-apiserver | 8081 | HTTP `/healthz`, `/readyz` | kubelet | The pod |
 | blockstor-controller | 8081 | HTTP `/healthz`, `/readyz` | kubelet | The pod |
-| blockstor-satellite | 3372 | Plain HTTP, no authentication | Other satellites, to fetch a snapshot stream | The node's own address |
+| blockstor-satellite | 3372 | HTTPS with mutual TLS | Other satellites, to fetch a snapshot stream | The node's own address |
 | blockstor-satellite | 9101 | HTTP `/healthz`, `/readyz` | kubelet | The node's own address |
 | DRBD (kernel) | 20000 to 20999 | DRBD replication, TCP | The other replicas of the same volume | The node's own address |
 
@@ -31,9 +31,9 @@ Satellites do not dial the controller, and the controller does not dial satellit
 
 Port 3371 requires a client certificate and verifies it against the CA bundle given by `--tls-client-ca-file`. The manifests create that CA with cert-manager as the `blockstor-api-ca` Issuer, and issue one client certificate into the Secret `blockstor-apiserver-client-tls`. The serving certificate covers both Service names, `blockstor-apiserver` and `blockstor-controller`, with and without the `.blockstor-system.svc.cluster.local` suffix. The API server reloads certificates on rotation without a restart.
 
-Port 3370 serves the same API without TLS and without authentication. It exists for debugging. The manifests start the API server with `--rest-bind-address=:3370`, which listens on every address of the pod, and they ship no NetworkPolicy. Leaving the port out of the Service only means it has no stable name: any pod that can reach an API server pod's IP gets full read and write access to the API on that port, without a certificate.
+Port 3370 serves the same API without TLS and without authentication. It exists for debugging, and it listens only on the pod's loopback address: `--rest-bind-address` defaults to `127.0.0.1:3370`, and the manifests pass that address. Other pods cannot connect to it. `kubectl port-forward` can, because it connects from inside the pod's network namespace, so whoever may port-forward to the API server pods gets full read and write access to the API through it. That is the way to reach port 3370 when you need it, for example for the `linstor` client. See [Compatibility with LINSTOR](../compatibility/#using-the-linstor-client).
 
-Fence it with a NetworkPolicy. This one admits only the TLS port and the probe port to the API server pods, so port 3370 is refused from other pods:
+An API server started with `--rest-bind-address` set to an address off loopback, such as the `:3370` that the manifests of v0.1.17 and earlier pass, serves the full API without a certificate to every pod that can reach that address. It logs a warning saying so at start. An empty value is refused. If you do bind the port off loopback, fence it with a NetworkPolicy. This one admits only the TLS port and the probe port to the API server pods, so port 3370 is refused from other pods:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -52,7 +52,7 @@ spec:
         - {protocol: TCP, port: 8081}
 ```
 
-A NetworkPolicy only takes effect if your CNI enforces it. `kubectl port-forward` still works with this policy in place, because it connects from inside the pod's network namespace. That is the way to reach port 3370 when you need it, for example for the `linstor` client. See [Compatibility with LINSTOR](../compatibility/#using-the-linstor-client).
+A NetworkPolicy only takes effect if your CNI enforces it. `kubectl port-forward` still works with this policy in place.
 
 ## DRBD replication
 
@@ -86,11 +86,15 @@ This order is what keeps replication working when another tool, such as piraeus-
 
 ## Snapshot stream between satellites
 
-When a clone or a snapshot restore places a replica on a node that does not hold the snapshot, the receiving satellite fetches the raw snapshot stream from a satellite that does, with an HTTP `GET` on port 3372. The stream has no authentication and no encryption. Keep that port reachable only between storage nodes, with a NetworkPolicy or a host firewall.
+When a clone or a snapshot restore places a replica on a node that does not hold the snapshot, the receiving satellite fetches the raw snapshot stream from a satellite that does, with an HTTPS `GET` on port 3372.
+
+The stream runs over mutual TLS. Each satellite presents a certificate, and accepts only a peer whose certificate is signed by the stream CA and issued for the name `blockstor-satellite`. The manifests create that CA with cert-manager, in `blockstor-apiserver-tls.yaml`: the CA Certificate and Issuer `blockstor-stream-ca`, kept apart from `blockstor-api-ca` so that a satellite's certificate is not a client certificate for the API, and one Certificate, `blockstor-satellite-stream`, shared by every satellite and stored in the Secret `blockstor-satellite-stream-tls`. The DaemonSet mounts that Secret at `/etc/blockstor/stream-tls` and passes its files with `--stream-tls-cert-file`, `--stream-tls-key-file` and `--stream-tls-ca-file`. The satellite reads the files on every handshake, so it uses a renewed certificate without a restart.
+
+The Secret is a required volume of the DaemonSet, so a satellite pod does not start until cert-manager has issued it. A satellite with only some of the three flags set, or with files that do not load, exits at start. A satellite with none of them set runs with the stream off: it logs `snapshot stream disabled: no stream TLS configured`, serves nothing on port 3372, and when it needs a snapshot from another node it creates the replica empty, and DRBD fills it with a full sync.
 
 The receiving satellite dials the address of the peer's interface named `default`, or the first interface with an address if there is no `default`. It does not use `spec.satelliteEndpoint` or the `k8s-internal` interface, so the `default` address must be the node's own IP and reachable on port 3372 from the other storage nodes. A pod IP written there by another tool breaks the stream even when DRBD still connects.
 
-The satellite tries every node that holds the snapshot. A peer that answers that it has no such snapshot is skipped, and if no peer has it, the replica is created empty and DRBD fills it with a full sync. A peer that cannot be reached is different: if no other peer delivers the stream, the volume is not created, the satellite fails the reconcile with a `cross-node fetch` error that names the peer's address, and retries, and the replica does not come up until the port is reachable.
+The satellite tries every node that holds the snapshot. A peer that answers that it has no such snapshot is skipped, and if no peer has it, the replica is created empty and DRBD fills it with a full sync. A peer that cannot be reached, or that refuses the TLS handshake, for example because its certificate comes from another CA, is different: if no other peer delivers the stream, the volume is not created, the satellite fails the reconcile with a `cross-node fetch` error that names the peer's address, and retries, and the replica does not come up until the port is reachable.
 
 The satellite keeps running if it cannot bind port 3372, for example because another program on the node holds it. It logs `snapshot stream server exited` with the address, and other nodes can no longer fetch snapshots from it.
 
@@ -110,11 +114,10 @@ On each node, for kubelet:
 - Port 9101 on the node for the satellite's probes.
 - Port 8081 inside the controller and API server pods for theirs.
 
-Nothing needs to reach port 3370. Block it with the NetworkPolicy shown [above](#the-api-server).
+Nothing needs to reach port 3370, and with the default bind address nothing outside the pod can.
 
 ## Ports without authentication
 
-- 3370 on the API server. Full read and write access to the API from any pod that can reach the API server's pod IP. Not exposed by a Service, but not fenced either; add the NetworkPolicy above.
-- 3372 on every storage node. Reads raw snapshot data.
+- 3370 on the API server, on the pod's loopback address. Full read and write access to the API for anyone who can port-forward to an API server pod. Bound off loopback, for any pod that can reach it; see [The API server](#the-api-server).
 
-Port 3371 is the only API entry point meant for clients.
+The snapshot stream on port 3372 requires a certificate from the stream CA. Port 3371 is the only API entry point meant for clients.

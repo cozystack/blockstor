@@ -248,6 +248,8 @@ kubectl get nodes.blockstor.cozystack.io
 The readiness probe answers `/readyz` only after the satellite has started and synced its caches. A pod that never becomes ready, or that restarts, usually says why in the first lines of its log.
 
 - The DRBD kernel module is not loaded on the host. `drbdadm` and `drbdsetup` fail and nothing can be set up. Load it on the host, `modprobe drbd`, or on Talos add the `siderolabs/drbd` extension. The satellite image carries the tools, not the module.
+- The pod stays in `ContainerCreating` with a `FailedMount` event. The Secret `blockstor-satellite-stream-tls` with the snapshot stream's certificate does not exist yet. Check `kubectl -n blockstor-system get certificate blockstor-satellite-stream`; the Certificate comes from `rendered/blockstor-apiserver-tls.yaml`, see [Snapshot stream between satellites](../networking/#snapshot-stream-between-satellites).
+- The satellite exits at start and logs `invalid flags`. Only some of the `--stream-tls-*` flags are set, or their files do not load.
 - The node is not registered. The satellite logs that the `Node` object is missing and that it will not create it. Run `blockstor node create <name> <address>`. This also happens after `node lost`.
 - The pod is running but the node shows `OFFLINE`. The heartbeat is more than 40 seconds old. The satellite may be wedged; the liveness probe restarts it after three failures. If it stays `OFFLINE` for an hour the node gets evacuated automatically unless you turned that off. See [Taking a node out of service](../operations/#taking-a-node-out-of-service).
 

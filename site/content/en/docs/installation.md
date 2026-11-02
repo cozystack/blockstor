@@ -60,7 +60,7 @@ Apply the pieces in this order.
    kubectl apply -f rendered/blockstor-deploy.yaml
    ```
 
-3. The certificate chain for the API. It creates a CA, the API server's serving certificate, and a client certificate for in-cluster clients such as CSI:
+3. The certificate chains. It creates a CA for the API, the API server's serving certificate and a client certificate for in-cluster clients such as CSI, and a separate CA and certificate for the snapshot stream between satellites:
 
    ```sh
    kubectl apply -f rendered/blockstor-apiserver-tls.yaml

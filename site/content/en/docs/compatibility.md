@@ -37,7 +37,7 @@ Blockstor implements the LINSTOR REST API, so `linstor-csi`, `piraeus-operator`,
 
 ## Using the `linstor` client
 
-The `linstor` client works against blockstor's API server. Port-forward the plain HTTP port and point the client at it. That port has no authentication and, unless you fence it with a NetworkPolicy, any pod that can reach the API server's pod IP can use it; see [Networking and ports](../networking/#the-api-server).
+The `linstor` client works against blockstor's API server. Port-forward the plain HTTP port and point the client at it. That port has no authentication. It listens on the pod's loopback address, so a port-forward reaches it and other pods do not; see [Networking and ports](../networking/#the-api-server).
 
 ```sh
 kubectl -n blockstor-system port-forward deploy/blockstor-apiserver 3370:3370

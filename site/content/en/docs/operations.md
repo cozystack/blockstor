@@ -216,4 +216,12 @@ blockstor resource list --faulty
 
 The snapshot stream between satellites moved from port 9100 to port 3372. Open port 3372 between storage nodes before step 5; see [Networking and ports](../networking/#snapshot-stream-between-satellites). While the satellites roll, old ones listen on 9100 and new ones dial 3372, and the other way round. A clone or a snapshot restore that needs a snapshot from a satellite of the other version cannot fetch it. Its replica does not fall back to a full sync: the volume is not created, and the satellite retries until both sides run the new version. Avoid clones and restores across nodes until the rollout is done. Port 9100 can be closed afterwards.
 
+The snapshot stream also runs over mutual TLS now, with its own CA. Step 3 creates the CA and the certificate, and a new satellite pod does not start until cert-manager has issued the Secret `blockstor-satellite-stream-tls`. Check that its Certificate is `Ready` before step 5:
+
+```sh
+kubectl -n blockstor-system get certificate blockstor-satellite-stream
+```
+
+The plain HTTP port 3370 of the API server now listens on the pod's loopback address only. Step 4 applies a manifest that passes `--rest-bind-address=127.0.0.1:3370`. A NetworkPolicy you added to fence that port can stay. Reach the port with `kubectl port-forward`, as before.
+
 The API server no longer lists or watches Secrets across the cluster. It reads and writes the passphrase Secret through a Role in `blockstor-system`, which step 4 creates.
