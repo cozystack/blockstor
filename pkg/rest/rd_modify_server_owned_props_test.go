@@ -29,6 +29,12 @@ func TestRDModifyRefusesEditsOfServerOwnedProps(t *testing.T) {
 		}},
 		{name: "namespace", body: map[string]any{"delete_namespaces": []string{"Blockstor"}}},
 		{name: "volumes", body: map[string]any{"override_props": map[string]string{store.RestoreVolumesProp: "0:1"}}},
+		{name: "set-clone-owner", body: map[string]any{
+			"override_props": map[string]string{store.CloneSnapshotOwnerProp: "rd-owned"},
+		}},
+		{name: "set-reaping-mark", body: map[string]any{
+			"override_props": map[string]string{store.CloneSnapshotReapingProp: "rd-owned#x@2026-10-07T00:00:00Z"},
+		}},
 		{name: "set-rollback-mark", body: map[string]any{
 			"override_props": map[string]string{store.RollbackAbandonedProp: store.RollbackInProgress},
 		}},

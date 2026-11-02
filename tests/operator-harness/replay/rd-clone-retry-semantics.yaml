@@ -34,10 +34,10 @@ description: |
   tests/e2e/cli-matrix/rd-clone-vd-data-plane.sh; this replay pins the
   verb and convergence shape the runner can express.
 
-  Teardown order matters: the clones depend on the internal source
-  snapshots `clone-<target>` and `rd delete` on the source is blocked
-  while snapshots exist, so the clone RDs go first, then the snapshots,
-  then the source.
+  Teardown is three plain deletes, the clones first: deleting a clone
+  reaps the internal snapshot `clone-<target>` it took on the source, so
+  the source's delete, refused while snapshots exist, goes through with
+  no snapshot deleted by hand.
 
 prerequisites:
   min_nodes: 2
@@ -114,10 +114,11 @@ steps:
 
 teardown:
   - cmd: ["resource-definition", "delete", "{{rd}}-c2"]
-  - cmd: ["snapshot", "delete", "{{rd}}", "clone-{{rd}}-c2"]
+    expect_exit: 0
   - cmd: ["resource-definition", "delete", "{{rd}}-c1"]
-  - cmd: ["snapshot", "delete", "{{rd}}", "clone-{{rd}}-c1"]
+    expect_exit: 0
   - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
 
 invariants:
   # Prefix-match on vars.rd also covers the "-c1" and "-c2" leftovers.

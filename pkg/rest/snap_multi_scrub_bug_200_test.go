@@ -365,3 +365,9 @@ func TestBug200SnapshotMultiPreservesLiteralMessages(t *testing.T) {
 func (s *errInjectingSnapshots) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
 	return s.ListByDefinition(ctx, rdName)
 }
+
+func (s *errInjectingSnapshots) PatchSnapshotProps(
+	ctx context.Context, rdName, snapName string, mutate func(map[string]string) error,
+) error {
+	return s.inner.PatchSnapshotProps(ctx, rdName, snapName, mutate) //nolint:wrapcheck // test helper
+}

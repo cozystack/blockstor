@@ -17,8 +17,8 @@
 #   B. Replaying it AFTER the source grows still succeeds. A replay
 #      judged by comparing the internal snapshot against the live source
 #      would turn an ordinary `vd set-size` into a permanent refusal of
-#      every later retry: the snapshot is deterministic and outlives the
-#      clone by design (delta row 82), so no repeat could get past it,
+#      every later retry: the snapshot is deterministic and stays for as
+#      long as the clone does (delta row 82), so no repeat could get past it,
 #      and deleting that snapshot cannot be the way out, because it is
 #      the origin the existing clone depends on.
 #
@@ -35,6 +35,10 @@
 #      re-shape what it replays).
 #   3. `vd set-size` on the source, then a third clone: exit 0.
 #   4. clone POST carrying delete_namespaces: HTTP 201.
+#
+# Teardown is plain `rd d` of the clones, then of the source. Deleting a
+# clone reaps the internal snapshot it took on the source, so no snapshot
+# is deleted by hand and the source's delete is not refused over one.
 #
 # Pool: `stand` (FILE_THIN), the pool the sibling clone cell uses.
 #
