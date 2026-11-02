@@ -171,7 +171,7 @@ blockstor snapshot resource restore \
     --from-resource my-volume --from-snapshot before-upgrade --to-resource my-volume-restored
 ```
 
-In-place rollback is not available on purpose. A definition cannot be deleted while it still has snapshots, so delete them first:
+In-place rollback is not available on purpose. A definition cannot be deleted while it still has snapshots, so delete them first. A snapshot that a restore reads from cannot be deleted until that restore has a replica with every volume `UpToDate`: until then `blockstor snapshot delete` fails with `a restore from this snapshot is not finished` (`linstor snapshot delete` gets a 409), and you retry it later.
 
 ```sh
 blockstor snapshot delete my-volume before-upgrade
