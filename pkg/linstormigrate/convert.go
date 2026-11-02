@@ -1911,8 +1911,8 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 		TypeMeta:   typeMeta("Resource"),
 		ObjectMeta: objectMeta(replicaName),
 		Spec: crdv1alpha1.ResourceSpec{
-			ResourceDefinitionName: rdDsp,
-			NodeName:               nodeDsp,
+			ResourceDefinitionName: k8sstore.Name(rdDsp),
+			NodeName:               k8sstore.Name(nodeDsp),
 			Props:                  residual,
 			DRBDOptions:            typed,
 			ExtraProps:             extra,
@@ -1923,6 +1923,9 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 			SkipInitialSync: ptr(false),
 		},
 	}
+
+	annotateParent(&resource.ObjectMeta, k8sstore.AnnotationLinstorRDName, rdDsp)
+	annotateParent(&resource.ObjectMeta, k8sstore.AnnotationLinstorNodeName, nodeDsp)
 
 	if storVol, ok := c.storVol[volumeReplicaKey{node: row.NodeName, rd: row.ResourceName, vlmNr: 0}]; ok {
 		resource.Spec.StoragePool = displayName(c.poolDsp[storVol.StorPoolName], storVol.StorPoolName)
@@ -1992,7 +1995,7 @@ func (c *converter) buildSnapshot(row *ResourceDefinitionRow, rdDsp, snapDsp, na
 		TypeMeta:   typeMeta("Snapshot"),
 		ObjectMeta: objectMeta(name),
 		Spec: crdv1alpha1.SnapshotSpec{
-			ResourceDefinitionName: rdDsp,
+			ResourceDefinitionName: k8sstore.Name(rdDsp),
 			SnapshotName:           snapDsp,
 			Props:                  c.props.SnapshotDefinition(row.ResourceName, row.SnapshotName),
 			Nodes:                  nodes,
@@ -2005,6 +2008,7 @@ func (c *converter) buildSnapshot(row *ResourceDefinitionRow, rdDsp, snapDsp, na
 	// would freeze production I/O to re-take an existing snapshot). The
 	// original creation time rides along for `linstor s l` parity.
 	snap.Annotations = map[string]string{crdv1alpha1.AnnotationSnapshotAdopted: annotationTrue}
+	annotateParent(&snap.ObjectMeta, k8sstore.AnnotationLinstorRDName, rdDsp)
 
 	if ts := c.snapshotCreatedAtFor(row.ResourceName, row.SnapshotName); ts > 0 {
 		snap.Annotations[crdv1alpha1.AnnotationSnapshotAdoptedCreatedAt] = strconv.FormatInt(ts, 10)
@@ -2203,6 +2207,20 @@ func objectMeta(original string) metav1.ObjectMeta {
 	k8sstore.SetOriginalName(&meta, original)
 
 	return meta
+}
+
+// annotateParent keeps a parent's LINSTOR spelling beside the CR name the
+// spec stores, the way the store does on Create, when the two differ.
+func annotateParent(meta *metav1.ObjectMeta, key, display string) {
+	if display == k8sstore.Name(display) {
+		return
+	}
+
+	if meta.Annotations == nil {
+		meta.Annotations = map[string]string{}
+	}
+
+	meta.Annotations[key] = display
 }
 
 func sortByName[T any](items []T, name func(T) string) {
