@@ -39,6 +39,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/luks"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // ReconcilerConfig parametrises a Reconciler.
@@ -5696,7 +5697,7 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 		Disk:        sections.Disk,
 		Handlers:    sections.Handlers,
 		PeerDevice:  sections.PeerDevice,
-		Connections: buildResConnections(dr),
+		Connections: buildResConnections(dr, hosts),
 	})
 	if err != nil {
 		return "", errors.Wrap(err, "drbd.Build")
@@ -5710,7 +5711,12 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 // renderer's drbd.ResourceConnection shape. Empty input returns nil
 // — the renderer then falls back to the default single-host-pair
 // connection block.
-func buildResConnections(dr *intent.DesiredResource) []drbd.ResourceConnection {
+//
+// A connection names its nodes as the request spelled them, Node-1 say,
+// while the hosts carry the replicas' spec, which stores the node's CR
+// name, node-1. Each node is written in the spelling of the host it names,
+// so the renderer pairs the paths with their hosts.
+func buildResConnections(dr *intent.DesiredResource, hosts []drbd.Host) []drbd.ResourceConnection {
 	src := dr.GetConnections()
 	if len(src) == 0 {
 		return nil
@@ -5730,13 +5736,25 @@ func buildResConnections(dr *intent.DesiredResource) []drbd.ResourceConnection {
 		}
 
 		out = append(out, drbd.ResourceConnection{
-			NodeA: conn.NodeA,
-			NodeB: conn.NodeB,
+			NodeA: hostSpelling(hosts, conn.NodeA),
+			NodeB: hostSpelling(hosts, conn.NodeB),
 			Paths: paths,
 		})
 	}
 
 	return out
+}
+
+// hostSpelling answers the name of the host that node names, or node as it
+// is when no host is that node.
+func hostSpelling(hosts []drbd.Host, node string) string {
+	for i := range hosts {
+		if k8s.SameName(hosts[i].NodeName, node) {
+			return hosts[i].NodeName
+		}
+	}
+
+	return node
 }
 
 // buildResVolumes turns the per-RD DesiredVolumes into the
