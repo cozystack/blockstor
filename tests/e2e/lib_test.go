@@ -28,21 +28,23 @@ import (
 
 // fakeKubectl answers the node and satellite queries the e2e lib makes at
 // source time: no node without the control-plane label, three satellites in
-// blockstor-system, and a matching pod on an earlier-sorted node in another
-// namespace.
+// blockstor-system, a Succeeded one there on an earlier-sorted node, and a
+// matching pod on an earlier-sorted node in another namespace.
 const fakeKubectl = `#!/usr/bin/env bash
 args="$*"
 case "$args" in
   *"get nodes"*) ;;
-  *"-n blockstor-system get pods"*) echo "node-b node-a node-c" ;;
+  *"-n blockstor-system get pods"*"status.phase=Running"*) echo "node-b node-a node-c" ;;
+  *"-n blockstor-system get pods"*) echo "completed-0 node-b node-a node-c" ;;
   *"get pods -A"*) echo "foreign-0 node-b node-a node-c" ;;
   *) echo "unexpected kubectl $args" >&2; exit 1 ;;
 esac
 `
 
-// The satellite fallback picks the workers from the namespace the run works
-// in: on_node looks for the pod there, so a node with a satellite only in
-// another namespace would be a worker no cell can reach.
+// The satellite fallback picks the workers from the Running satellites of the
+// namespace the run works in: on_node looks for a Running pod there, so a node
+// with a satellite only elsewhere, or only a completed one, would be a worker
+// no cell can reach.
 func TestTheSatelliteFallbackStaysInTheRunsNamespace(t *testing.T) {
 	t.Parallel()
 
@@ -60,6 +62,6 @@ func TestTheSatelliteFallbackStaysInTheRunsNamespace(t *testing.T) {
 	}
 
 	if got := strings.TrimSpace(string(out)); got != "node-a node-b node-c" {
-		t.Errorf("workers %q, want the satellites of blockstor-system only", got)
+		t.Errorf("workers %q, want the Running satellites of blockstor-system only", got)
 	}
 }

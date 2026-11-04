@@ -101,6 +101,7 @@ else
     if (( ${#_BS_WORKERS[@]} == 0 )); then
         mapfile -t _BS_WORKERS < <(
             kubectl -n "$NS" get pods -l app=blockstor-satellite \
+                --field-selector status.phase=Running \
                 -o jsonpath='{.items[*].spec.nodeName}' 2>/dev/null \
                 | tr ' ' '\n' | grep -v '^$' | sort -u
         )
