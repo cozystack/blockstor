@@ -39,8 +39,9 @@ import (
 // without naming.Key or naming.Same on the way. It works on types and on
 // where a value comes from, not on what a variable is called.
 //
-// A name enters (a source) as: a name field of a wire, CRD, REST, CLI or
-// store type (sourceFields, and Name on the wire types in namedTypes); a
+// A name enters (a source) as: a name field of a wire, CRD, REST, CLI,
+// store, satellite intent or DRBD configuration type (sourceFields, and Name
+// on the types in namedTypes); a
 // REST path parameter or query list that names objects (pathKeys,
 // multiValueQuery); a CLI flag that names one (flagKeys); the node a
 // satellite controller is configured with; and anything passed to a store
@@ -65,11 +66,13 @@ import (
 // metadata.name are keys, not raw names. Only values that can hold a
 // string are tainted; a struct is followed field by field.
 //
-// It reports (a sink): == and != between two names, one of them raw; a
-// switch on a name with a case of another; strings.HasPrefix, HasSuffix,
+// It reports (a sink): == and != between two names, one of them raw, the
+// other raw or a key (naming.Key's result, a helper that returns one, a CR's
+// metadata.name or GetName()); a switch on a name with a case of another; strings.HasPrefix, HasSuffix,
 // Contains, CutPrefix and CutSuffix, and slices.Contains and Index, between
 // two names; strings.EqualFold, ToLower and ToUpper on a raw name; a map
-// indexed, or a map literal keyed, by a raw name or a key built from one;
+// indexed, a map literal keyed, or a map entry deleted, by a raw name or a
+// key built from one;
 // and a CR addressed by a raw name. One field read off two elements of the
 // same collection, by index or as the two arguments of the comparator a
 // slices sort is given, is one source and not a pair.
@@ -121,23 +124,32 @@ func flagKeys() map[string]bool {
 }
 
 // sourcePackages hold the types whose name fields are sources: the wire API,
-// the CRDs' specs, the REST surface, the CLI's parsed arguments and the
-// store's own types.
+// the CRDs' specs, the REST surface, the CLI's parsed arguments, the
+// store's own types, the intent the dispatcher hands a satellite and the
+// DRBD configuration a satellite renders from it.
 func sourcePackages() map[string]bool {
 	return map[string]bool{
 		module + "/pkg/api/v1": true, module + "/api/v1alpha1": true, module + "/pkg/rest": true,
-		module + "/internal/cli": true, module + "/pkg/store": true,
+		module + "/internal/cli": true, module + "/pkg/store": true, module + "/pkg/satellite/intent": true,
+		module + "/pkg/drbd": true,
 	}
 }
 
-// namedTypes are the wire types whose own Name is an object name, in the
-// spelling it was registered under. A CRD's own Name is its CR name, a key,
-// and so is not a source.
+// namedTypes are the types whose own Name is an object name as some client
+// spelled it: the wire types, in the spelling they were registered under,
+// and an intent's peer, under the spelling its row stores. A CRD's own Name
+// is its CR name, a key, and so is not a source.
 func namedTypes() map[string]bool {
-	return map[string]bool{
-		"Node": true, "ResourceDefinition": true, "ResourceGroup": true, "Resource": true,
-		"ResourceWithVolumes": true, "Snapshot": true, "StoragePool": true, "StoragePoolDefinition": true,
+	out := map[string]bool{module + "/pkg/satellite/intent.DesiredPeer": true}
+
+	for _, t := range []string{
+		"Node", "ResourceDefinition", "ResourceGroup", "Resource", "ResourceWithVolumes", "Snapshot",
+		"StoragePool", "StoragePoolDefinition",
+	} {
+		out[module+"/pkg/api/v1."+t] = true
 	}
+
+	return out
 }
 
 // fn is a body the guard walks: a declared function or method, or a
@@ -158,7 +170,9 @@ type guard struct {
 	keyed   map[types.Object]bool
 	// returns and fns are keyed by *types.Func or *ast.FuncLit.
 	returns map[any]labels
-	fns     map[any]*fn
+	// keyReturns are the functions that return a key.
+	keyReturns map[any]bool
+	fns        map[any]*fn
 	// litOf is the literal a local variable is bound to.
 	litOf map[types.Object]*ast.FuncLit
 	// methods are the concrete methods with a body, by name, for calls
@@ -191,7 +205,7 @@ func newGuard(t *testing.T, dir string, patterns ...string) *guard {
 
 	g := &guard{
 		pkgs: pkgs, tainted: map[types.Object]labels{}, reached: map[types.Object]bool{}, mapKeys: map[types.Object]bool{}, keyed: map[types.Object]bool{},
-		returns: map[any]labels{}, fns: map[any]*fn{}, litOf: map[types.Object]*ast.FuncLit{},
+		returns: map[any]labels{}, keyReturns: map[any]bool{}, fns: map[any]*fn{}, litOf: map[types.Object]*ast.FuncLit{},
 		methods: map[string][]*types.Func{}, siblings: map[types.Object]types.Object{},
 	}
 
@@ -484,7 +498,20 @@ func isFlagSource(info *types.Info, e *ast.IndexExpr) bool {
 func (g *guard) isKey(info *types.Info, e ast.Expr) bool {
 	switch x := ast.Unparen(e).(type) {
 	case *ast.CallExpr:
-		return isKeyCall(info, x)
+		if isKeyCall(info, x) || funcName(calleeOf(info, x)) == "k8s.io/apimachinery/pkg/apis/meta/v1.ObjectMeta.GetName" {
+			return true
+		}
+
+		// A helper that returns naming.Key's result returns a key, unless
+		// it returns a raw name too.
+		callees := g.callees(info, x)
+		for _, c := range callees {
+			if !g.keyReturns[c] {
+				return false
+			}
+		}
+
+		return len(callees) > 0 && !g.isTainted(info, x)
 	case *ast.Ident:
 		obj := info.Uses[x]
 
@@ -539,7 +566,7 @@ func isSourceField(info *types.Info, sel *ast.SelectorExpr) bool {
 
 	name := sel.Sel.Name
 	if name == "Name" {
-		return named.Obj().Pkg().Path() == module+"/pkg/api/v1" && namedTypes()[named.Obj().Name()]
+		return namedTypes()[named.Obj().Pkg().Path()+"."+named.Obj().Name()]
 	}
 
 	return sourceFields()[name]
@@ -869,6 +896,11 @@ func (g *guard) propagate() {
 						changed = g.markExpr(info, s.Key, labels{srcLabel{}: true}) || changed
 					}
 				case *ast.ReturnStmt:
+					if !g.keyReturns[key] && len(s.Results) > 0 && g.isKey(info, s.Results[0]) {
+						g.keyReturns[key] = true
+						changed = true
+					}
+
 					set := g.argLabels(info, s.Results)
 					if len(set) > 0 {
 						before := len(g.returns[key])
@@ -1174,6 +1206,12 @@ func (g *guard) findings(root string) []finding {
 			}
 
 			ast.Inspect(file, func(n ast.Node) bool {
+				if decl, ok := n.(*ast.FuncDecl); ok {
+					if _, skip := excludedFuncs()[rel+":"+funcKey(decl)]; skip {
+						return false
+					}
+				}
+
 				for _, hit := range g.sinks(info, n) {
 					out = append(out, finding{file: rel, line: pkg.Fset.Position(hit.Pos()).Line, code: code(hit)})
 				}
@@ -1255,6 +1293,13 @@ func (g *guard) sinks(info *types.Info, n ast.Node) []ast.Node {
 }
 
 func (g *guard) callSinks(info *types.Info, call *ast.CallExpr) []ast.Node {
+	if id, ok := ast.Unparen(call.Fun).(*ast.Ident); ok {
+		if b, ok := info.Uses[id].(*types.Builtin); ok && b.Name() == "delete" && len(call.Args) == 2 &&
+			isStringMap(info, call.Args[0]) && g.rawKey(info, call.Args[1]) {
+			return []ast.Node{call}
+		}
+	}
+
 	switch funcName(calleeOf(info, call)) {
 	case "slices.Contains", "slices.Index", "strings.HasPrefix", "strings.HasSuffix", "strings.Contains",
 		"strings.CutPrefix", "strings.CutSuffix":
@@ -1303,31 +1348,54 @@ func excludedDirs() map[string]string {
 		"pkg/store/k8s": "the store backend: it resolves a caller's spelling to the CR name, " +
 			"and its scoped reads ask in one given spelling at a time, as the field selector does",
 		"pkg/store/storetest": "the conformance suite, which writes spellings on purpose",
-		"pkg/linstormigrate": "reads one LINSTOR database dump, whose rows name each other in the " +
-			"spelling LINSTOR stored, and compares them only with each other; the names it " +
-			"writes go through k8s.Name",
-		"pkg/drbd":    "kernel side: compares names DRBD reports back with each other",
-		"third_party": "vendored code",
+		"third_party":         "vendored code",
 	}
 }
 
-// excludedFiles are single files out of reach, and why.
-func excludedFiles() map[string]string {
+// excludedFuncs are single functions out of reach, as "path:Func" or
+// "path:Type.Method", and why. The rest of each file is checked.
+func excludedFuncs() map[string]string {
+	device := "the in-memory store backend for physical devices, keyed by the device name and asked " +
+		"for a node in one spelling, as the Kubernetes one is"
+	fake := "the scripted command runner tests drive the storage backends with, keyed by the exact " +
+		"command line a test expects"
+
+	kernel := "names the kernel reports, compared and keyed only with each other"
+
 	return map[string]string{
-		"pkg/satellite/reconciler.go": "works on the intent the dispatcher built and on the kernel; " +
-			"every name in it comes from that one intent",
-		"pkg/store/inmemory_physicaldevice.go": "the in-memory store backend, asked in one spelling as the " +
-			"Kubernetes one is",
-		"pkg/storage/exec.go": "the scripted command runner tests drive the storage backends with, keyed by " +
-			"the exact command line a test expects",
+		"pkg/drbd/drbdadm.go:Adm.Day0SiblingSetConnected":                                      kernel,
+		"pkg/drbd/drbdsetup_show.go:parseShowJSON":                                             kernel,
+		"pkg/store/inmemory_physicaldevice.go:inMemoryPhysicalDevices.List":                    device,
+		"pkg/store/inmemory_physicaldevice.go:inMemoryPhysicalDevices.ListForNode":             device,
+		"pkg/store/inmemory_physicaldevice.go:inMemoryPhysicalDevices.Get":                     device,
+		"pkg/store/inmemory_physicaldevice.go:inMemoryPhysicalDevices.PatchPhysicalDeviceSpec": device,
+		"pkg/store/inmemory_physicaldevice.go:inMemoryPhysicalDevices.Delete":                  device,
+		"pkg/storage/exec.go:FakeExec.RunWithStdin":                                            fake,
 	}
+}
+
+func funcKey(decl *ast.FuncDecl) string {
+	if decl.Recv == nil || len(decl.Recv.List) == 0 {
+		return decl.Name.Name
+	}
+
+	t := decl.Recv.List[0].Type
+	if star, ok := t.(*ast.StarExpr); ok {
+		t = star.X
+	}
+
+	if idx, ok := t.(*ast.IndexExpr); ok {
+		t = idx.X
+	}
+
+	if id, ok := t.(*ast.Ident); ok {
+		return id.Name + "." + decl.Name.Name
+	}
+
+	return decl.Name.Name
 }
 
 func excluded(rel string) bool {
-	if _, ok := excludedFiles()[rel]; ok {
-		return true
-	}
-
 	for dir := range excludedDirs() {
 		if strings.HasPrefix(rel, dir+"/") {
 			return true
@@ -1344,8 +1412,25 @@ func allowed() map[string]string {
 	oneIntent := "option keys the dispatcher writes and the satellite reads back by the intent's own peer " +
 		"names, the one list both sides iterate"
 	shownKeys := "a wire map whose keys are shown, filled from one listing"
+	satIntent := "the satellite's map of one intent's peers, written and read by the intent's own peer names"
+	pools := "the satellite resolves a provider under the pool name the StoragePool registered; a replica " +
+		"naming its pool in another spelling fails loudly as not registered, and keying the map would change " +
+		"the pool names its other readers see"
 
 	return map[string]string{
+		"pkg/rest/node_connections.go: delete(conn, key)": "" +
+			"the key is one storedPairKeys read off the same map",
+		"pkg/rest/resource_connections.go: delete(rd.Props, key)": "" +
+			"pairPropKey finds the pair's stored prop by naming.Same",
+		"pkg/satellite/reconciler.go: opts[\"peer.\"+peer+\".address\"]":  oneIntent,
+		"pkg/satellite/reconciler.go: opts[\"peer.\"+peer+\".diskless\"]": oneIntent,
+		"pkg/satellite/reconciler.go: opts[\"peer.\"+peer+\".node-id\"]":  oneIntent,
+		"pkg/satellite/reconciler.go: opts[\"peer.\"+peer+\".port\"]":     oneIntent,
+		"pkg/satellite/reconciler.go: out[peer]":                          satIntent,
+		"pkg/satellite/reconciler.go: delete(r.cfg.Providers, pool)":      pools,
+		"pkg/satellite/reconciler.go: r.cfg.Providers[pool]":              pools,
+		"pkg/satellite/reconciler.go: r.resourceToPool[name]": "" +
+			"keyed by the resource name the intent carries, the definition's CR name, on write and read",
 		"pkg/dispatcher/dispatcher.go: drbdOpts[\"peer.\"+peer+\".address\"]":  oneIntent,
 		"pkg/dispatcher/dispatcher.go: drbdOpts[\"peer.\"+peer+\".diskless\"]": oneIntent,
 		"pkg/dispatcher/dispatcher.go: drbdOpts[\"peer.\"+peer+\".node-id\"]":  oneIntent,
