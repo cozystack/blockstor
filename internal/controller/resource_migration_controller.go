@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // MigratingFromProp is the per-Resource Spec.Props key the REST
@@ -112,6 +113,18 @@ func (r *ResourceMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, nil
 	}
 
+	// A marker naming the destination's own node, in any spelling, names
+	// the destination itself: pruning the "source" would delete the only
+	// copy the migration made. Nothing writes such a marker now, but one
+	// persisted before cannot be trusted either, so it is dropped and the
+	// replica left alone.
+	if naming.Same(srcNode, dst.Spec.NodeName) {
+		logger.Info("refusing a migration onto its own source; clearing the marker without pruning",
+			"resource", dst.Name, "src", srcNode)
+
+		return ctrl.Result{}, r.clearMigratingFrom(ctx, &dst)
+	}
+
 	if !allVolumesUpToDate(&dst) {
 		// dst still syncing. Keep src alive and check back later.
 		// SetupWithManager also wires a watch on Resource Status
@@ -122,7 +135,7 @@ func (r *ResourceMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{RequeueAfter: migrationRequeueInterval}, nil
 	}
 
-	err = r.pruneSrc(ctx, dst.Spec.ResourceDefinitionName, srcNode)
+	err = r.pruneSrc(ctx, &dst, srcNode)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -142,16 +155,21 @@ func (r *ResourceMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 // swallowed — the operator may have removed it manually, or a
 // previous reconcile pass completed the delete but failed to clear
 // the prop afterwards. Either way, the reconciler is monotonic.
-func (r *ResourceMigrationReconciler) pruneSrc(ctx context.Context, rdName, srcNode string) error {
+func (r *ResourceMigrationReconciler) pruneSrc(ctx context.Context, dst *blockstoriov1alpha1.Resource, srcNode string) error {
 	var src blockstoriov1alpha1.Resource
 
-	err := getReplica(ctx, r.Client, rdName, srcNode, &src)
+	err := getReplica(ctx, r.Client, dst.Spec.ResourceDefinitionName, srcNode, &src)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
 		}
 
 		return err
+	}
+
+	// However the marker spells it, the source is never the destination.
+	if src.UID == dst.UID && src.Name == dst.Name {
+		return nil
 	}
 
 	err = r.Delete(ctx, &src)
