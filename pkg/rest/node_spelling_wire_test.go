@@ -337,3 +337,60 @@ func TestNonSnapshotPoolCheckScopesTheTargetsInAnotherSpelling(t *testing.T) {
 		t.Fatalf("offenders = %v, want the thick pool on node-1", locs)
 	}
 }
+
+// Paths posted for one pair under two spellings of a node land in one
+// entry, read back under either spelling and either order: two entries
+// would hand the satellite two connections between the same two hosts.
+func TestResourceConnectionPathsKeepOneEntryPerPairInAnySpelling(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-mix"}); err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	conn := base + "/v1/resource-definitions/pvc-mix/resource-connections/"
+
+	for _, post := range []struct{ pair, body string }{
+		{"Node-1/beta", `{"name":"p1","node_a_address":"10.0.0.1","node_b_address":"10.0.0.2"}`},
+		{"beta/node-1", `{"name":"p2","node_a_address":"10.0.1.2","node_b_address":"10.0.1.1"}`},
+	} {
+		resp := httpPost(t, conn+post.pair+"/paths", []byte(post.body))
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("POST %s: %d", post.pair, resp.StatusCode)
+		}
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-mix")
+	if err != nil {
+		t.Fatalf("get definition: %v", err)
+	}
+
+	var entries []string
+
+	for key := range rd.Props {
+		if strings.HasPrefix(key, resourceConnectionPathsPropKey) {
+			entries = append(entries, key)
+		}
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("path entries %v; want one for the pair", entries)
+	}
+
+	paths, swap, err := loadPaths(&rd, "node-1", "beta")
+	if swap {
+		paths = swapAll(paths)
+	}
+
+	if err != nil || len(paths) != 2 || paths[0].NodeAAddress != "10.0.0.1" || paths[1].NodeAAddress != "10.0.1.1" {
+		t.Errorf("paths node-1/beta = %+v, %v; want p1 and p2 with node-1's address first", paths, err)
+	}
+}
