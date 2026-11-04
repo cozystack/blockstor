@@ -21,7 +21,6 @@ package controller
 import (
 	"context"
 	stderrors "errors"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -1279,7 +1278,9 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 	hostingReplica map[string]bool,
 ) (string, error) {
 	excluded := make(map[string]bool, len(hostingReplica))
-	maps.Copy(excluded, hostingReplica)
+	for name, hosting := range hostingReplica {
+		excluded[k8s.Name(name)] = hosting
+	}
 
 	if rdName != "" {
 		// Defense-in-depth: re-probe the store for diskful Resources
@@ -1297,7 +1298,7 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 				continue
 			}
 
-			excluded[live[i].NodeName] = true
+			excluded[k8s.Name(live[i].NodeName)] = true
 		}
 	}
 
@@ -1309,7 +1310,7 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 	candidates := make([]string, 0, len(nodes))
 
 	for i := range nodes {
-		if excluded[nodes[i].Name] {
+		if excluded[k8s.Name(nodes[i].Name)] {
 			continue
 		}
 
@@ -1421,9 +1422,11 @@ func (r *ResourceDefinitionReconciler) dropStrandedReplicas(
 	return live, nil
 }
 
-// nodeSets returns (disabled, known): the set of node names flagged
-// EVICTED / LOST and the set of ALL node names the store currently
-// lists. Bug 385: the RD-level witness / quorum decision must treat
+// nodeSets returns (disabled, known): the set of nodes flagged
+// EVICTED / LOST and the set of ALL nodes the store currently lists,
+// both keyed by CR name (k8s.Name). A replica names its node by the
+// CR name or by the spelling it was registered under, and the node
+// list by the registered one, so only the CR name compares them. Bug 385: the RD-level witness / quorum decision must treat
 // replicas on disabled nodes as draining placements, not live ones —
 // mirroring the placer's `disabledNodes` semantic. Bug-024 extends
 // the same idea to nodes that are gone entirely: a replica whose
@@ -1442,10 +1445,10 @@ func (r *ResourceDefinitionReconciler) nodeSets(ctx context.Context) (map[string
 	known := make(map[string]struct{}, len(nodes))
 
 	for i := range nodes {
-		known[nodes[i].Name] = struct{}{}
+		known[k8s.Name(nodes[i].Name)] = struct{}{}
 
 		if isDisabledNode(&nodes[i]) {
-			disabled[nodes[i].Name] = struct{}{}
+			disabled[k8s.Name(nodes[i].Name)] = struct{}{}
 		}
 	}
 
@@ -1468,7 +1471,7 @@ func (r *ResourceDefinitionReconciler) confirmGhostReplicas(
 	var live, ghosts []apiv1.Resource
 
 	for i := range replicas {
-		if _, ok := known[replicas[i].NodeName]; ok {
+		if _, ok := known[k8s.Name(replicas[i].NodeName)]; ok {
 			live = append(live, replicas[i])
 
 			continue
@@ -1522,9 +1525,9 @@ type nodeProbe struct {
 // pinned node against the store right after the write.
 //
 // Production path: APIReader (direct apiserver reads, no cache).
-// LINSTOR node names are matched case-insensitively against both the
-// CRD name and the preserved original-name annotation, the same
-// resolution pkg/store/k8s applies. Unit tests construct the
+// A LINSTOR node name matches the CRD it maps to (k8s.Name), the same
+// resolution pkg/store/k8s applies, so My_Node and my_node stay two
+// nodes. Unit tests construct the
 // reconciler without APIReader — the Store fallback is authoritative
 // there (InMemory has no cache to lag).
 func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wireName string) (nodeProbe, error) {
@@ -1564,17 +1567,18 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 }
 
 // nodeCRDMatchesWireName reports whether a Node CRD addresses the
-// given LINSTOR wire name: either directly via metadata.name or via
-// the preserved original-name annotation (slugified names). LINSTOR
-// identifiers are case-insensitive, so both comparisons fold case.
+// given LINSTOR wire name, the way the store addresses it: by the CR
+// name the wire name maps to, or by the preserved original-name
+// annotation of a CRD named by hand. Folding case instead would read
+// My_Node and my_node, two CRs, as one node.
 func nodeCRDMatchesWireName(node *blockstoriov1alpha1.Node, wireName string) bool {
-	if strings.EqualFold(node.Name, wireName) {
+	if node.Name == k8s.Name(wireName) {
 		return true
 	}
 
 	original, ok := node.Annotations[linstorNameAnnotation]
 
-	return ok && strings.EqualFold(original, wireName)
+	return ok && k8s.SameName(original, wireName)
 }
 
 // splitByDisabledNode partitions replicas into (live, stranded) by the
@@ -1585,7 +1589,7 @@ func splitByDisabledNode(replicas []apiv1.Resource, disabled map[string]struct{}
 	var live, stranded []apiv1.Resource
 
 	for i := range replicas {
-		if _, off := disabled[replicas[i].NodeName]; off {
+		if _, off := disabled[k8s.Name(replicas[i].NodeName)]; off {
 			stranded = append(stranded, replicas[i])
 
 			continue
