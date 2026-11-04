@@ -32,6 +32,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // SweeperPeriod is the default cadence at which the orphan sweeper
@@ -605,7 +606,7 @@ func (s *OrphanSweeperRunnable) listOwnedResourceNames(ctx context.Context) (map
 			continue
 		}
 
-		out[r.Spec.ResourceDefinitionName] = struct{}{}
+		out[k8s.Name(r.Spec.ResourceDefinitionName)] = struct{}{}
 	}
 
 	return out, nil

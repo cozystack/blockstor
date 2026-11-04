@@ -32,6 +32,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // StorageSweeperPeriod is the default cadence of the storage-orphan
@@ -383,14 +384,18 @@ func (s *StorageOrphanSweeperRunnable) listOwnedVolumeRefs(ctx context.Context) 
 			continue
 		}
 
-		vols, ok := rdToVolumes[r.Spec.ResourceDefinitionName]
+		// The volumes are laid down under the definition's CR name,
+		// whatever spelling an older row keeps in spec.
+		rdName := k8s.Name(r.Spec.ResourceDefinitionName)
+
+		vols, ok := rdToVolumes[rdName]
 		if !ok {
-			vols = s.lookupRDVolumes(ctx, r.Spec.ResourceDefinitionName)
-			rdToVolumes[r.Spec.ResourceDefinitionName] = vols
+			vols = s.lookupRDVolumes(ctx, rdName)
+			rdToVolumes[rdName] = vols
 		}
 
 		for _, vn := range vols {
-			out[ownedKey(r.Spec.ResourceDefinitionName, vn)] = struct{}{}
+			out[ownedKey(rdName, vn)] = struct{}{}
 		}
 
 		// Edge case: RD already gone but the Resource CRD is still
@@ -398,7 +403,7 @@ func (s *StorageOrphanSweeperRunnable) listOwnedVolumeRefs(ctx context.Context) 
 		// keyed only by resource name so the sweeper still
 		// recognises the in-flight delete and doesn't race.
 		if len(vols) == 0 {
-			out[ownedKey(r.Spec.ResourceDefinitionName, -1)] = struct{}{}
+			out[ownedKey(rdName, -1)] = struct{}{}
 		}
 	}
 

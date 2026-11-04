@@ -250,7 +250,11 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 	}
 
 	return &intent.DesiredResource{
-		Name:        target.Spec.ResourceDefinitionName,
+		// The definition's CR name, whatever spelling an older row keeps
+		// in spec: the satellite names the DRBD resource, the volumes and
+		// the snapshots by it, and the snapshot and delete paths ask for
+		// it by the same name.
+		Name:        k8s.Name(target.Spec.ResourceDefinitionName),
 		NodeName:    target.Spec.NodeName,
 		Flags:       target.Spec.Flags,
 		Props:       wireProps,
@@ -424,7 +428,7 @@ func readDRBDPort(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1.
 		return int(*target.Status.DRBDPort)
 	}
 
-	return derivePort(target.Spec.ResourceDefinitionName)
+	return derivePort(k8s.Name(target.Spec.ResourceDefinitionName))
 }
 
 // readDRBDMinor returns the BASE minor (volume 0) for the resource,
@@ -449,7 +453,7 @@ func readDRBDMinor(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1
 		return int(*target.Status.DRBDMinor)
 	}
 
-	return deriveMinor(target.Spec.ResourceDefinitionName)
+	return deriveMinor(k8s.Name(target.Spec.ResourceDefinitionName))
 }
 
 // peerPortOf reads the persisted DRBDPort off a peer Resource. The
@@ -669,7 +673,7 @@ func anyDiskfulPeerHasData(peers []blockstoriov1alpha1.Resource) bool {
 			continue
 		}
 
-		rdName := peers[i].Spec.ResourceDefinitionName
+		rdName := k8s.Name(peers[i].Spec.ResourceDefinitionName)
 
 		for j := range peers[i].Status.Volumes {
 			vol := &peers[i].Status.Volumes[j]
@@ -882,7 +886,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 
 	srcSnapshot := ""
 	if rd.Spec.Props != nil {
-		srcSnapshot = rd.Spec.Props[restoreFromKey]
+		srcSnapshot = restoreSourceOnDisk(rd.Spec.Props[restoreFromKey])
 	}
 
 	out := make([]*intent.DesiredVolume, 0, len(rd.Spec.VolumeDefinitions))
@@ -922,6 +926,21 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	}
 
 	return out
+}
+
+// restoreSourceOnDisk names a restore's source definition the way its
+// satellite named it on disk: by its CR name, as buildDesired does.
+// The prop carries the source as the REST request spelled it, and a
+// source registered as Pvc-Src was laid down as pvc-src. Anything that is
+// not <srcRD>:<snap>, such as the cross-cluster form, is left for the
+// satellite to refuse as it is.
+func restoreSourceOnDisk(value string) string {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 || parts[0] == "" {
+		return value
+	}
+
+	return k8s.Name(parts[0]) + ":" + parts[1]
 }
 
 // StorPoolNameDrbdMetaKey is the upstream-LINSTOR prop key that

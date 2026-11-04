@@ -34,6 +34,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // ToggleDiskRetryCap is the soft upper bound the reconciler surfaces
@@ -212,7 +213,7 @@ func (r *ResourceReconciler) handleToggleDiskCancel(ctx context.Context, res *bl
 		}
 
 		req := &intent.DeleteResourceRequest{
-			Name:          res.Spec.ResourceDefinitionName,
+			Name:          k8s.Name(res.Spec.ResourceDefinitionName),
 			StoragePool:   resolveDeleteStoragePool(res),
 			VolumeNumbers: volumeNumbers,
 		}

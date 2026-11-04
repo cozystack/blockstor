@@ -1476,7 +1476,7 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 	}
 
 	req := &intent.DeleteResourceRequest{
-		Name:          res.Spec.ResourceDefinitionName,
+		Name:          k8s.Name(res.Spec.ResourceDefinitionName),
 		StoragePool:   resolveDeleteStoragePool(res),
 		VolumeNumbers: volumeNumbers,
 	}
