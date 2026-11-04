@@ -42,7 +42,9 @@ type fakeMetadataStamper struct {
 	stamps func(string) bool // optional: returns true to fail the call
 }
 
-func (f *fakeMetadataStamper) StampMetadataCreated(_ context.Context, resourceName string) error {
+func (f *fakeMetadataStamper) StampMetadataCreated(_ context.Context, rdName, nodeName string) error {
+	resourceName := rdName + "." + nodeName
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

@@ -49,12 +49,12 @@ import (
 // regression that wedged PR #32's predecessor (`.status.volumes` was
 // reset to null and every e2e lane failed with `volumes":null`).
 func TestFilesystemFormattedAndObservedSharedSSAShape(t *testing.T) {
-	formattedPatch := captureStamperPatch(t, "fs-rd.n1", func(s *FilesystemFormattedStamper, ctx context.Context, name string) error {
-		return s.StampFilesystemFormatted(ctx, name)
+	formattedPatch := captureStamperPatch(t, "fs-rd", func(s *FilesystemFormattedStamper, ctx context.Context, name string) error {
+		return s.StampFilesystemFormatted(ctx, name, "n1")
 	})
 
-	observedPatch := captureStamperPatch(t, "fs-rd.n1", func(s *FilesystemFormattedStamper, ctx context.Context, name string) error {
-		return s.StampFilesystemObserved(ctx, name)
+	observedPatch := captureStamperPatch(t, "fs-rd", func(s *FilesystemFormattedStamper, ctx context.Context, name string) error {
+		return s.StampFilesystemObserved(ctx, name, "n1")
 	})
 
 	if formattedPatch.fieldOwner != observedPatch.fieldOwner {

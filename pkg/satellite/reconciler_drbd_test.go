@@ -7189,7 +7189,9 @@ type fakeFilesystemStamper struct {
 	stamps       func(string) bool // optional: return true to fail the call
 }
 
-func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, resourceName string) error {
+func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, rdName, nodeName string) error {
+	resourceName := rdName + "." + nodeName
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -7202,7 +7204,9 @@ func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, reso
 	return nil
 }
 
-func (f *fakeFilesystemStamper) StampFilesystemObserved(_ context.Context, resourceName string) error {
+func (f *fakeFilesystemStamper) StampFilesystemObserved(_ context.Context, rdName, nodeName string) error {
+	resourceName := rdName + "." + nodeName
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

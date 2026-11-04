@@ -163,7 +163,7 @@ func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *
 		return false
 	}
 
-	stampErr := b.Stamper.StampMetadataCreated(ctx, res.Name)
+	stampErr := b.Stamper.stampOn(ctx, res.Name)
 	if stampErr != nil {
 		logger.Info("stamp MetadataCreated (best-effort)", "err", stampErr.Error())
 

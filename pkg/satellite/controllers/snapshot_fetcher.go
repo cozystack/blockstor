@@ -73,7 +73,12 @@ func (f *SnapshotFetcher) Fetch(ctx context.Context, srcRD, snapName string, vol
 
 	var snap blockstoriov1alpha1.Snapshot
 
-	err := f.Client.Get(ctx, client.ObjectKey{Name: k8s.Name(srcRD + "." + snapName)}, &snap)
+	name, err := snapshotCRName(ctx, f.Client, srcRD, snapName)
+	if err != nil {
+		return nil, "", err
+	}
+
+	err = f.Client.Get(ctx, client.ObjectKey{Name: name}, &snap)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, "", errors.Wrapf(storage.ErrNotFound, "snapshot CRD %s/%s", srcRD, snapName)

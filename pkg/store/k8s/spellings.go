@@ -80,6 +80,20 @@ func SameName(a, b string) bool {
 	return Name(a) == Name(b)
 }
 
+// ResourceCRName is the name the store gives the Resource CR of the replica
+// of rd on node, both as registered. A satellite that knows a resource by
+// its definition's CR name maps back through the registered spellings
+// before calling it; the CR name alone does not hash to the same value.
+func ResourceCRName(rd, node string) string {
+	return resourceCRDName(rd, node)
+}
+
+// SnapshotCRName is the name the store gives the Snapshot CR snap of rd,
+// as registered; see ResourceCRName.
+func SnapshotCRName(rd, snap string) string {
+	return snapshotCRDName(rd, snap)
+}
+
 // storedName is what a child stores for one of its parents: the parent's CR
 // name, for spec, and the spelling to show.
 type storedName struct {
