@@ -394,3 +394,35 @@ func TestResourceConnectionPathsKeepOneEntryPerPairInAnySpelling(t *testing.T) {
 		t.Errorf("paths node-1/beta = %+v, %v; want p1 and p2 with node-1's address first", paths, err)
 	}
 }
+
+// A sibling acknowledges forgetting a peer under the peer's key: the wait
+// for Node-1 finds the acknowledgment stamped for node-1.
+func TestPeerDeleteWaitFindsTheAcknowledgmentUnderTheRemovedNodesKey(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, node := range []string{"Node-1", "node-2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: node}); err != nil {
+			t.Fatalf("seed node %s: %v", node, err)
+		}
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-mix", NodeName: "node-2",
+		Annotations: map[string]string{peerForgetAckAnnotationPrefix + naming.Key("Node-1"): "2026-11-04T00:00:00Z"},
+	}); err != nil {
+		t.Fatalf("seed sibling: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	(&Server{Store: st}).waitForPeerDeletionAcks(waitCtx, "pvc-mix", "Node-1")
+
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("waited %v for an acknowledgment the sibling already stamped", took)
+	}
+}
