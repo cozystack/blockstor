@@ -30,7 +30,6 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // LINSTOR names are case-insensitive, and the store addresses one object
@@ -51,8 +50,10 @@ import (
 //
 // Rows stored, or adopted from LINSTOR, before this may still carry another
 // spelling in spec, so a scoped listing asks under every spelling the name
-// can reasonably have been stored in: the one given, the folded one, and the
-// registered one.
+// can reasonably have been stored in: the one given, its CR name, and the
+// registered one. The lowercase spelling is not one of them on its own: for a
+// name outside RFC 1123 it is a different definition, hashed to another CR
+// name, and for any other name the CR name already is the lowercase one.
 //
 // A parent that cannot be read is an error, never "not there": a listing that
 // went on without its registered spelling would come back short, and on a
@@ -192,7 +193,6 @@ func spellingSet(given string, found storedName, haveFound bool) []string {
 		}
 	}
 
-	add(store.FoldName(given))
 	add(Name(given))
 
 	if haveFound {

@@ -141,3 +141,40 @@ func TestAWriteWhoseParentCannotBeReadFails(t *testing.T) {
 		t.Errorf("snapshot create = %v; want the read failure", err)
 	}
 }
+
+// My_Res and my_res are outside RFC 1123, so they hash to two CR names and
+// are two definitions. A listing of one does not return the other's rows,
+// including rows the other stores under its own lowercase spelling.
+func TestAListingAsksNoOtherDefinitionsSpelling(t *testing.T) {
+	t.Parallel()
+
+	st := k8s.New(fake.NewClientBuilder().WithScheme(spellingScheme(t)).WithObjects(
+		registeredRD("My_Res"), registeredRD("my_res"), registeredNode("node-a"),
+		&crdv1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: "lower-replica"},
+			Spec:       crdv1alpha1.ResourceSpec{ResourceDefinitionName: "my_res", NodeName: "node-a"},
+		},
+		&crdv1alpha1.Snapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "lower-snap"},
+			Spec:       crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "my_res", SnapshotName: "snap-1"},
+		},
+	).Build())
+
+	ctx := context.Background()
+
+	if replicas, err := st.Resources().ListByDefinition(ctx, "My_Res"); err != nil || len(replicas) != 0 {
+		t.Errorf("replicas of My_Res = %v, %v; want none, the row is my_res's", replicas, err)
+	}
+
+	if snaps, err := st.Snapshots().ListByDefinition(ctx, "My_Res"); err != nil || len(snaps) != 0 {
+		t.Errorf("snapshots of My_Res = %v, %v; want none, the row is my_res's", snaps, err)
+	}
+
+	if replicas, err := st.Resources().ListByDefinition(ctx, "my_res"); err != nil || len(replicas) != 1 {
+		t.Errorf("replicas of my_res = %v, %v; want its own row", replicas, err)
+	}
+
+	if snaps, err := st.Snapshots().ListByDefinition(ctx, "my_res"); err != nil || len(snaps) != 1 {
+		t.Errorf("snapshots of my_res = %v, %v; want its own row", snaps, err)
+	}
+}
