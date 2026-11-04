@@ -26,12 +26,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 func mixedCaseReplica(rd, node string) *blockstoriov1alpha1.Resource {
 	return &blockstoriov1alpha1.Resource{
-		ObjectMeta: metav1.ObjectMeta{Name: k8s.Name(rd) + "." + node},
+		ObjectMeta: metav1.ObjectMeta{Name: naming.Key(rd) + "." + node},
 		Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: rd, NodeName: node},
 	}
 }
@@ -50,7 +50,7 @@ func TestControllerSeesReplicasOfAMixedCaseDefinition(t *testing.T) {
 
 	r := &ResourceDefinitionReconciler{Client: cli, APIReader: cli}
 
-	got, err := r.listReplicasDirect(context.Background(), k8s.Name("Pvc-Mix"))
+	got, err := r.listReplicasDirect(context.Background(), naming.Key("Pvc-Mix"))
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestReplicaEventEnqueuesTheFoldedDefinition(t *testing.T) {
 	r := &ResourceDefinitionReconciler{}
 
 	reqs := r.enqueueRDForResource(context.Background(), mixedCaseReplica("Pvc-Mix", "n1"))
-	if len(reqs) != 1 || reqs[0].Name != k8s.Name("Pvc-Mix") {
-		t.Errorf("enqueued %v, want %s", reqs, k8s.Name("Pvc-Mix"))
+	if len(reqs) != 1 || reqs[0].Name != naming.Key("Pvc-Mix") {
+		t.Errorf("enqueued %v, want %s", reqs, naming.Key("Pvc-Mix"))
 	}
 }

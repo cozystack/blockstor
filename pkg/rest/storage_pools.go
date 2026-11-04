@@ -28,8 +28,8 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
 
@@ -370,7 +370,7 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 	var refs []string
 
 	for i := range all {
-		if !k8s.SameName(all[i].NodeName, node) {
+		if !naming.Same(all[i].NodeName, node) {
 			continue
 		}
 

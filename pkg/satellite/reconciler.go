@@ -37,9 +37,9 @@ import (
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
+	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // ReconcilerConfig parametrises a Reconciler.
@@ -5747,7 +5747,7 @@ func buildResConnections(dr *intent.DesiredResource, hosts []drbd.Host) []drbd.R
 // is when no host is that node.
 func hostSpelling(hosts []drbd.Host, node string) string {
 	for i := range hosts {
-		if k8s.SameName(hosts[i].NodeName, node) {
+		if naming.Same(hosts[i].NodeName, node) {
 			return hosts[i].NodeName
 		}
 	}

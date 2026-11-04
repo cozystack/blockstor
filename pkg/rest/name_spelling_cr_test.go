@@ -35,6 +35,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -59,7 +60,7 @@ func TestAFailedParentReadNeverLetsADeletePassItsSnapshots(t *testing.T) {
 	t.Parallel()
 
 	for fail := int32(1); fail <= 8; fail++ {
-		rd := crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("Pvc-Reg")}}
+		rd := crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("Pvc-Reg")}}
 		k8s.SetOriginalName(&rd.ObjectMeta, "Pvc-Reg")
 
 		base := fake.NewClientBuilder().WithScheme(crScheme(t)).WithObjects(&rd, &crdv1alpha1.Snapshot{
@@ -126,7 +127,7 @@ func TestSnapshotSuccessMatchesAnEntryUnderTheCRName(t *testing.T) {
 	diskful := map[string]struct{}{nodeKey("My_Node"): {}}
 	snap := &apiv1.Snapshot{
 		Nodes:     []string{"My_Node"},
-		Snapshots: []apiv1.SnapshotPerNode{{NodeName: k8s.Name("My_Node"), CreateTimestamp: 1}},
+		Snapshots: []apiv1.SnapshotPerNode{{NodeName: naming.Key("My_Node"), CreateTimestamp: 1}},
 	}
 
 	if !isSnapshotSuccessful(snap, diskful) {

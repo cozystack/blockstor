@@ -34,7 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // ResourceStateProjectionFieldOwner is the SSA field-manager identity
@@ -122,7 +122,7 @@ func (r *ResourceStateProjectionReconciler) Reconcile(ctx context.Context, req c
 
 	// The Node CR is named from the folded name; a replica written before
 	// the store stored CR names may still carry the registered spelling.
-	err = r.Get(ctx, types.NamespacedName{Name: k8s.Name(res.Spec.NodeName)}, &node)
+	err = r.Get(ctx, types.NamespacedName{Name: naming.Key(res.Spec.NodeName)}, &node)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil

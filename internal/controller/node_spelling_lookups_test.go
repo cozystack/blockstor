@@ -30,6 +30,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -46,7 +47,7 @@ func TestEvacuationFindsTheReplicaUnderEverySpelling(t *testing.T) {
 	}{
 		"folded name":                          {"Node-1", "NODE-1", "Pvc-Mix", "Node-1"},
 		"CR names":                             {"Node-1", "node-1", "pvc-mix", "node-1"},
-		"CR names outside RFC 1123":            {"my_node", "my_node", "pvc-mix", k8s.Name("my_node")},
+		"CR names outside RFC 1123":            {"my_node", "my_node", "pvc-mix", naming.Key("my_node")},
 		"registered spelling outside RFC 1123": {"my_node", "my_node", "Pvc-Mix", "my_node"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -56,7 +57,7 @@ func TestEvacuationFindsTheReplicaUnderEverySpelling(t *testing.T) {
 			ctx := context.Background()
 
 			if tc.node != "Node-1" {
-				node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name(tc.node)}}
+				node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: naming.Key(tc.node)}}
 				k8s.SetOriginalName(&node.ObjectMeta, tc.node)
 
 				if err := cli.Create(ctx, &node); err != nil {
@@ -184,7 +185,7 @@ func TestMigrationPrunesASourceOnANodeOutsideRFC1123(t *testing.T) {
 	cli := mixedCaseStand(t, interceptor.Funcs{})
 	ctx := context.Background()
 
-	node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("my_node")}}
+	node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("my_node")}}
 	k8s.SetOriginalName(&node.ObjectMeta, "my_node")
 
 	if err := cli.Create(ctx, &node); err != nil {

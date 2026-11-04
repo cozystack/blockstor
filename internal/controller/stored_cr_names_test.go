@@ -32,6 +32,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -42,10 +43,10 @@ import (
 func mixedCaseStand(t *testing.T, funcs interceptor.Funcs, replicas ...[2]string) client.Client {
 	t.Helper()
 
-	rd := blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("Pvc-Mix")}}
+	rd := blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("Pvc-Mix")}}
 	k8s.SetOriginalName(&rd.ObjectMeta, "Pvc-Mix")
 
-	node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("Node-1")}}
+	node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("Node-1")}}
 	k8s.SetOriginalName(&node.ObjectMeta, "Node-1")
 	node.Status.ConnectionStatus = blockstoriov1alpha1.NodeConnectionStatusOffline
 
@@ -246,7 +247,7 @@ func TestFirstAvailablePoolMatchesTheReplicasCRNodeName(t *testing.T) {
 		"resource":     (&ResourceReconciler{Client: cli, Store: st}).firstAvailablePool,
 		"auto-diskful": (&AutoDiskfulReconciler{Client: cli, Store: st}).firstAvailablePool,
 	} {
-		got, err := find(ctx, k8s.Name("Node-1"))
+		got, err := find(ctx, naming.Key("Node-1"))
 		if err != nil {
 			t.Fatalf("%s firstAvailablePool: %v", name, err)
 		}
@@ -330,7 +331,7 @@ func TestProjectionReachesAReplicaStoredInTheRegisteredSpelling(t *testing.T) {
 func TestSameNodeFoldsCase(t *testing.T) {
 	t.Parallel()
 
-	for _, pair := range [][2]string{{"Node-1", "node-1"}, {"Node-1", k8s.Name("Node-1")}, {"my_node", k8s.Name("my_node")}} {
+	for _, pair := range [][2]string{{"Node-1", "node-1"}, {"Node-1", naming.Key("Node-1")}, {"my_node", naming.Key("my_node")}} {
 		if !sameNode(pair[0], pair[1]) {
 			t.Errorf("%s and %s read as two nodes", pair[0], pair[1])
 		}

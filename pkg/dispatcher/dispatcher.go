@@ -36,9 +36,9 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // drbdAddrAny is the placeholder address we put into the .res file
@@ -254,7 +254,7 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		// in spec: the satellite names the DRBD resource, the volumes and
 		// the snapshots by it, and the snapshot and delete paths ask for
 		// it by the same name.
-		Name:        k8s.Name(target.Spec.ResourceDefinitionName),
+		Name:        naming.Key(target.Spec.ResourceDefinitionName),
 		NodeName:    target.Spec.NodeName,
 		Flags:       target.Spec.Flags,
 		Props:       wireProps,
@@ -428,7 +428,7 @@ func readDRBDPort(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1.
 		return int(*target.Status.DRBDPort)
 	}
 
-	return derivePort(k8s.Name(target.Spec.ResourceDefinitionName))
+	return derivePort(naming.Key(target.Spec.ResourceDefinitionName))
 }
 
 // readDRBDMinor returns the BASE minor (volume 0) for the resource,
@@ -453,7 +453,7 @@ func readDRBDMinor(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1
 		return int(*target.Status.DRBDMinor)
 	}
 
-	return deriveMinor(k8s.Name(target.Spec.ResourceDefinitionName))
+	return deriveMinor(naming.Key(target.Spec.ResourceDefinitionName))
 }
 
 // peerPortOf reads the persisted DRBDPort off a peer Resource. The
@@ -673,7 +673,7 @@ func anyDiskfulPeerHasData(peers []blockstoriov1alpha1.Resource) bool {
 			continue
 		}
 
-		rdName := k8s.Name(peers[i].Spec.ResourceDefinitionName)
+		rdName := naming.Key(peers[i].Spec.ResourceDefinitionName)
 
 		for j := range peers[i].Status.Volumes {
 			vol := &peers[i].Status.Volumes[j]
@@ -940,7 +940,7 @@ func restoreSourceOnDisk(value string) string {
 		return value
 	}
 
-	return k8s.Name(parts[0]) + ":" + parts[1]
+	return naming.Key(parts[0]) + ":" + parts[1]
 }
 
 // StorPoolNameDrbdMetaKey is the upstream-LINSTOR prop key that
@@ -1151,11 +1151,11 @@ func deriveMinor(rd string) int {
 // adopted, may carry the registered spelling; both map to the node's CR
 // name, which is how the store addresses it.
 func isNodeCalled(node *blockstoriov1alpha1.Node, name string) bool {
-	return node.Name == k8s.Name(name)
+	return node.Name == naming.Key(name)
 }
 
 // sameNodeName compares two node names the way the store addresses a
 // node, for rows that store a name rather than the Node itself.
 func sameNodeName(a, b string) bool {
-	return k8s.Name(a) == k8s.Name(b)
+	return naming.Key(a) == naming.Key(b)
 }

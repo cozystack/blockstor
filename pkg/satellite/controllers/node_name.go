@@ -21,7 +21,7 @@ package controllers
 import (
 	"slices"
 
-	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // isNode reports whether name, as a replica or a pool spells its node, is
@@ -31,7 +31,7 @@ import (
 // replica written or adopted before the store and linstor-migrate stored
 // the node's CR name may carry Node-1: either is this satellite's.
 func isNode(name, node string) bool {
-	return k8s.SameName(name, node)
+	return naming.Same(name, node)
 }
 
 // listsNode reports whether a snapshot's node list, which carries the

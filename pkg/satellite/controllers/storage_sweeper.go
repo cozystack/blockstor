@@ -31,8 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/storage"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // StorageSweeperPeriod is the default cadence of the storage-orphan
@@ -386,7 +386,7 @@ func (s *StorageOrphanSweeperRunnable) listOwnedVolumeRefs(ctx context.Context) 
 
 		// The volumes are laid down under the definition's CR name,
 		// whatever spelling an older row keeps in spec.
-		rdName := k8s.Name(r.Spec.ResourceDefinitionName)
+		rdName := naming.Key(r.Spec.ResourceDefinitionName)
 
 		vols, ok := rdToVolumes[rdName]
 		if !ok {

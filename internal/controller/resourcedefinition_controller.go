@@ -41,8 +41,8 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // Bug148ResizePendingAnnotationPrefix is the per-volume annotation
@@ -991,7 +991,7 @@ func (r *ResourceDefinitionReconciler) resolveRDLayerStack(ctx context.Context, 
 	reader := r.directOrCached()
 
 	var rg blockstoriov1alpha1.ResourceGroup
-	if err := reader.Get(ctx, client.ObjectKey{Name: k8s.Name(rd.Spec.ResourceGroupName)}, &rg); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Spec.ResourceGroupName)}, &rg); err != nil {
 		return apiv1.DefaultLayerStack()
 	}
 
@@ -1279,7 +1279,7 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 ) (string, error) {
 	excluded := make(map[string]bool, len(hostingReplica))
 	for name, hosting := range hostingReplica {
-		excluded[k8s.Name(name)] = hosting
+		excluded[naming.Key(name)] = hosting
 	}
 
 	if rdName != "" {
@@ -1298,7 +1298,7 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 				continue
 			}
 
-			excluded[k8s.Name(live[i].NodeName)] = true
+			excluded[naming.Key(live[i].NodeName)] = true
 		}
 	}
 
@@ -1310,7 +1310,7 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 	candidates := make([]string, 0, len(nodes))
 
 	for i := range nodes {
-		if excluded[k8s.Name(nodes[i].Name)] {
+		if excluded[naming.Key(nodes[i].Name)] {
 			continue
 		}
 
@@ -1445,10 +1445,10 @@ func (r *ResourceDefinitionReconciler) nodeSets(ctx context.Context) (map[string
 	known := make(map[string]struct{}, len(nodes))
 
 	for i := range nodes {
-		known[k8s.Name(nodes[i].Name)] = struct{}{}
+		known[naming.Key(nodes[i].Name)] = struct{}{}
 
 		if isDisabledNode(&nodes[i]) {
-			disabled[k8s.Name(nodes[i].Name)] = struct{}{}
+			disabled[naming.Key(nodes[i].Name)] = struct{}{}
 		}
 	}
 
@@ -1471,7 +1471,7 @@ func (r *ResourceDefinitionReconciler) confirmGhostReplicas(
 	var live, ghosts []apiv1.Resource
 
 	for i := range replicas {
-		if _, ok := known[k8s.Name(replicas[i].NodeName)]; ok {
+		if _, ok := known[naming.Key(replicas[i].NodeName)]; ok {
 			live = append(live, replicas[i])
 
 			continue
@@ -1572,13 +1572,13 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 // annotation of a CRD named by hand. Folding case instead would read
 // My_Node and my_node, two CRs, as one node.
 func nodeCRDMatchesWireName(node *blockstoriov1alpha1.Node, wireName string) bool {
-	if node.Name == k8s.Name(wireName) {
+	if node.Name == naming.Key(wireName) {
 		return true
 	}
 
 	original, ok := node.Annotations[linstorNameAnnotation]
 
-	return ok && k8s.SameName(original, wireName)
+	return ok && naming.Same(original, wireName)
 }
 
 // splitByDisabledNode partitions replicas into (live, stranded) by the
@@ -1589,7 +1589,7 @@ func splitByDisabledNode(replicas []apiv1.Resource, disabled map[string]struct{}
 	var live, stranded []apiv1.Resource
 
 	for i := range replicas {
-		if _, off := disabled[k8s.Name(replicas[i].NodeName)]; off {
+		if _, off := disabled[naming.Key(replicas[i].NodeName)]; off {
 			stranded = append(stranded, replicas[i])
 
 			continue
@@ -1929,6 +1929,6 @@ func (r *ResourceDefinitionReconciler) enqueueRDForResource(_ context.Context, o
 	return []reconcile.Request{
 		// The RD CR lives under the folded name; the replica keeps the
 		// spelling it was written with.
-		{NamespacedName: types.NamespacedName{Name: k8s.Name(res.Spec.ResourceDefinitionName)}},
+		{NamespacedName: types.NamespacedName{Name: naming.Key(res.Spec.ResourceDefinitionName)}},
 	}
 }

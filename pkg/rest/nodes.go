@@ -474,7 +474,7 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 97: validate at the wire boundary, before pkg/store/k8s.Name()
+	// Bug 97: validate at the wire boundary, before pkg/naming.Key()
 	// slugifies + hash-prefixes the input. Same rationale as
 	// handleRDCreate; see pkg/rest/input_validation.go.
 	nameErr := validateLinstorName("node", n.Name)

@@ -34,9 +34,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 	"github.com/cozystack/blockstor/pkg/uevent"
 )
 
@@ -595,7 +595,7 @@ func (p *PhysicalDeviceDiscoveryRunnable) publishDeviceWithReason(ctx context.Co
 		return "", false
 	}
 
-	name := k8s.Name(p.NodeName + "." + stableID)
+	name := naming.Key(p.NodeName + "." + stableID)
 	// Bug 69: operators type `linstor ps cdp ... /dev/vda` and
 	// match by kernel-name path. The `/dev/disk/by-id/<stableID>`
 	// path is stable across reboots but useless to humans — and

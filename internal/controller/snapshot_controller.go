@@ -33,7 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // SnapshotReconciler orchestrates the Bug-351 cross-satellite
@@ -694,11 +694,11 @@ func allTargetsMatch(
 	// node-1 are one node.
 	byNode := make(map[string]blockstoriov1alpha1.SnapshotPerNodeStatus, len(entries))
 	for i := range entries {
-		byNode[k8s.Name(entries[i].NodeName)] = entries[i]
+		byNode[naming.Key(entries[i].NodeName)] = entries[i]
 	}
 
 	for _, t := range targets {
-		entry, ok := byNode[k8s.Name(t)]
+		entry, ok := byNode[naming.Key(t)]
 		if !ok {
 			return false
 		}

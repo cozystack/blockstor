@@ -25,13 +25,14 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 const peerEndpoint = "192.0.2.2"
 
 func registeredNode(registered string, spec blockstoriov1alpha1.NodeSpec) blockstoriov1alpha1.Node {
-	node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name(registered)}, Spec: spec}
+	node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: naming.Key(registered)}, Spec: spec}
 	k8s.SetOriginalName(&node.ObjectMeta, registered)
 
 	return node
@@ -39,7 +40,7 @@ func registeredNode(registered string, spec blockstoriov1alpha1.NodeSpec) blocks
 
 func replicaOn(node string, id int32) blockstoriov1alpha1.Resource {
 	return blockstoriov1alpha1.Resource{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1." + k8s.Name(node)},
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1." + naming.Key(node)},
 		Spec: blockstoriov1alpha1.ResourceSpec{
 			ResourceDefinitionName: "pvc-1",
 			NodeName:               node,
@@ -61,9 +62,9 @@ func TestPeerAddressResolvesUnderEverySpellingOfItsNode(t *testing.T) {
 		stored     string
 	}{
 		{name: "lowercase", registered: "node-2", stored: "node-2"},
-		{name: "mixed case, CR name stored", registered: "Node-2", stored: k8s.Name("Node-2")},
+		{name: "mixed case, CR name stored", registered: "Node-2", stored: naming.Key("Node-2")},
 		{name: "mixed case, registered spelling stored", registered: "Node-2", stored: "Node-2"},
-		{name: "outside RFC 1123, CR name stored", registered: "my_node", stored: k8s.Name("my_node")},
+		{name: "outside RFC 1123, CR name stored", registered: "my_node", stored: naming.Key("my_node")},
 		{name: "outside RFC 1123, registered spelling stored", registered: "my_node", stored: "my_node"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -114,7 +115,7 @@ func TestPeerPrefNicResolvesUnderTheCRNameOfItsNode(t *testing.T) {
 	const replication = "192.0.2.22"
 
 	target := replicaOn("node-1", 0)
-	peer := replicaOn(k8s.Name("Node-2"), 1)
+	peer := replicaOn(naming.Key("Node-2"), 1)
 	nodes := []blockstoriov1alpha1.Node{
 		registeredNode("node-1", blockstoriov1alpha1.NodeSpec{SatelliteEndpoint: "192.0.2.1"}),
 		registeredNode("Node-2", blockstoriov1alpha1.NodeSpec{

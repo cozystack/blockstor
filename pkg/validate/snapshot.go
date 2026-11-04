@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // ErrRestoreNodeLacksSnapshot refuses a restore onto a node that does not
@@ -76,7 +76,7 @@ func RestoreNodesMissingSnapshot(named, snapshotNodes []string) []string {
 	// its nodes as registered, Node-1, and the operator may name node-1.
 	holds := make(map[string]struct{}, len(snapshotNodes))
 	for _, n := range snapshotNodes {
-		holds[k8s.Name(n)] = struct{}{}
+		holds[naming.Key(n)] = struct{}{}
 	}
 
 	seen := make(map[string]struct{}, len(named))
@@ -87,7 +87,7 @@ func RestoreNodesMissingSnapshot(named, snapshotNodes []string) []string {
 			continue
 		}
 
-		key := k8s.Name(n)
+		key := naming.Key(n)
 		if _, dup := seen[key]; dup {
 			continue
 		}

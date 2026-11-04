@@ -28,8 +28,8 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // registerSnapshots wires snapshot endpoints. Three different paths land
@@ -730,7 +730,7 @@ func validateSnapshotCreateBody(w http.ResponseWriter, r *http.Request, rd strin
 	//
 	// Bug 97: tighten further to the full RFC-1123 subdomain rule so
 	// `linstor s c <rd> "Foo Bar"` is refused with a LINSTOR envelope
-	// before pkg/store/k8s.Name() slugifies the input.
+	// before pkg/naming.Key() slugifies the input.
 	snapNameErr := validateLinstorName("snapshot", strings.TrimSpace(snap.Name))
 	if snapNameErr != nil {
 		writeError(w, http.StatusBadRequest, snapNameErr.Error())
@@ -1070,7 +1070,7 @@ func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.R
 	// replica written before the store stored CR names may spell it so too.
 	want := make(map[string]struct{}, len(targetNodes))
 	for _, n := range targetNodes {
-		want[k8s.Name(n)] = struct{}{}
+		want[naming.Key(n)] = struct{}{}
 	}
 
 	var offenders []poolOffender
@@ -1082,7 +1082,7 @@ func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.R
 
 		// Scope to the resolved target set when the caller pinned one.
 		if len(want) > 0 {
-			if _, ok := want[k8s.Name(res.NodeName)]; !ok {
+			if _, ok := want[naming.Key(res.NodeName)]; !ok {
 				continue
 			}
 		}

@@ -30,6 +30,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -39,12 +40,12 @@ import (
 func TestNodeProbeKeepsTwoNodesOfOneLowercaseApart(t *testing.T) {
 	t.Parallel()
 
-	node := &blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("My_Node")}}
+	node := &blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("My_Node")}}
 	k8s.SetOriginalName(&node.ObjectMeta, "My_Node")
 
 	r := &ResourceDefinitionReconciler{APIReader: fake.NewClientBuilder().WithScheme(bug048Scheme(t)).WithObjects(node).Build()}
 
-	for name, want := range map[string]bool{"My_Node": true, k8s.Name("My_Node"): true, "my_node": false} {
+	for name, want := range map[string]bool{"My_Node": true, naming.Key("My_Node"): true, "my_node": false} {
 		probe, err := r.probeNodeDirect(context.Background(), name)
 		if err != nil || probe.found != want {
 			t.Errorf("probe %q = %+v, %v; want found=%v", name, probe, err, want)

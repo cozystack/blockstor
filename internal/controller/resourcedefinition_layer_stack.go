@@ -36,7 +36,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // layerStackNotInheritedReason is the Event reason for an RD that kept
@@ -122,7 +122,7 @@ func (r *ResourceDefinitionReconciler) readGroup(
 ) (*blockstoriov1alpha1.ResourceGroup, error) {
 	var rg blockstoriov1alpha1.ResourceGroup
 
-	err := r.directOrCached().Get(ctx, client.ObjectKey{Name: k8s.Name(rd.Spec.ResourceGroupName)}, &rg)
+	err := r.directOrCached().Get(ctx, client.ObjectKey{Name: naming.Key(rd.Spec.ResourceGroupName)}, &rg)
 	if apierrors.IsNotFound(err) {
 		return nil, nil //nolint:nilnil // no group is an answer, not an error
 	}
@@ -276,7 +276,7 @@ func (r *ResourceDefinitionReconciler) enqueueRDsInGroup(ctx context.Context, ob
 
 	for i := range rdList.Items {
 		group := rdList.Items[i].Spec.ResourceGroupName
-		if group != "" && k8s.Name(group) == obj.GetName() {
+		if group != "" && naming.Key(group) == obj.GetName() {
 			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Name: rdList.Items[i].Name}})
 		}
 	}

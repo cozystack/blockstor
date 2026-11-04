@@ -40,8 +40,8 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // resourceFinalizer is the legacy controller-side finalizer the
@@ -283,7 +283,7 @@ func (r *ResourceReconciler) handleOrphan(ctx context.Context, target *blockstor
 
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: k8s.Name(target.Spec.ResourceDefinitionName)}, &rd)
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(target.Spec.ResourceDefinitionName)}, &rd)
 	if err == nil {
 		return false, nil
 	}

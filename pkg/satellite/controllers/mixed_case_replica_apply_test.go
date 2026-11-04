@@ -34,6 +34,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -50,10 +51,10 @@ func storedMixedCaseReplica(t *testing.T, funcs interceptor.Funcs) (client.Clien
 		t.Fatalf("AddToScheme: %v", err)
 	}
 
-	rd := blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("Pvc-Mix")}}
+	rd := blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("Pvc-Mix")}}
 	k8s.SetOriginalName(&rd.ObjectMeta, "Pvc-Mix")
 
-	node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("Node-1")}}
+	node := blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("Node-1")}}
 	k8s.SetOriginalName(&node.ObjectMeta, "Node-1")
 
 	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&rd, &node).Build()

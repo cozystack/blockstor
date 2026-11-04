@@ -432,7 +432,7 @@ func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, bo
 	}
 
 	// Bug 97: refuse whitespace-only / RFC-1123-illegal names at the
-	// REST wire boundary, BEFORE pkg/store/k8s.Name() slugifies +
+	// REST wire boundary, BEFORE pkg/naming.Key() slugifies +
 	// hash-prefixes the input. Without this gate `linstor rd c "  "`
 	// leaked the raw apimachinery "metadata.name: Invalid value:
 	// \"<hex>-\"" error and exposed the internal hash-prefix scheme;

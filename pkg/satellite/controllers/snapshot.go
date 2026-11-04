@@ -33,8 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // SatelliteSnapshotFinalizer guards a Snapshot CRD while one of
@@ -212,7 +212,7 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 // suspend stamps the per-node Failed=true so the controller-side
 // orchestrator drains the siblings.
 func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	err := r.Config.Apply.SuspendResource(ctx, k8s.Name(snap.Spec.ResourceDefinitionName))
+	err := r.Config.Apply.SuspendResource(ctx, naming.Key(snap.Spec.ResourceDefinitionName))
 	if err != nil {
 		log.FromContext(ctx).Info("SuspendResource failed",
 			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
@@ -247,7 +247,7 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 // clearing the ack so the orchestrator keeps poking us until
 // the kernel actually accepts the unfreeze.
 func (r *SnapshotReconciler) handleResumePhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	err := r.Config.Apply.ResumeResource(ctx, k8s.Name(snap.Spec.ResourceDefinitionName))
+	err := r.Config.Apply.ResumeResource(ctx, naming.Key(snap.Spec.ResourceDefinitionName))
 	if err != nil {
 		log.FromContext(ctx).Info("ResumeResource failed",
 			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
@@ -272,7 +272,7 @@ func (r *SnapshotReconciler) handleResumePhase(ctx context.Context, snap *blocks
 // step runs.
 func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
 	req := &intent.CreateSnapshotRequest{
-		ResourceName: k8s.Name(snap.Spec.ResourceDefinitionName),
+		ResourceName: naming.Key(snap.Spec.ResourceDefinitionName),
 		SnapshotName: snap.Spec.SnapshotName,
 	}
 
@@ -299,7 +299,7 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 	// flush, and a stripped-down satellite environment (kernel
 	// without BLKFLSBUF, hostpath sandboxing) shouldn't block the
 	// snapshot from running.
-	err := r.Config.Apply.FlushBackingDevices(ctx, k8s.Name(snap.Spec.ResourceDefinitionName), req.VolumeNumbers)
+	err := r.Config.Apply.FlushBackingDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName), req.VolumeNumbers)
 	if err != nil {
 		// FlushBackingDevices itself returns nil on best-effort
 		// per-device failures; a non-nil return signals a hard
@@ -698,7 +698,7 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	}
 
 	req := &intent.DeleteSnapshotRequest{
-		ResourceName: k8s.Name(snap.Spec.ResourceDefinitionName),
+		ResourceName: naming.Key(snap.Spec.ResourceDefinitionName),
 		SnapshotName: snap.Spec.SnapshotName,
 	}
 

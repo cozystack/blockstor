@@ -31,8 +31,8 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // AutoDiskfulReconciler implements the `DrbdOptions/auto-diskful=<minutes>`
@@ -464,7 +464,7 @@ func splitDiskfulAndCandidates(replicas []apiv1.Resource, disabled map[string]st
 	)
 
 	for i := range replicas {
-		if _, off := disabled[k8s.Name(replicas[i].NodeName)]; off {
+		if _, off := disabled[naming.Key(replicas[i].NodeName)]; off {
 			// Replica on an EVICTED/LOST node — treat as absent.
 			continue
 		}
@@ -507,7 +507,7 @@ func (r *AutoDiskfulReconciler) disabledNodeSet(ctx context.Context) (map[string
 
 	for i := range nodes {
 		if isDisabledNode(&nodes[i]) {
-			out[k8s.Name(nodes[i].Name)] = struct{}{}
+			out[naming.Key(nodes[i].Name)] = struct{}{}
 		}
 	}
 

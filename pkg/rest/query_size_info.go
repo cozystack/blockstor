@@ -24,7 +24,7 @@ import (
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // registerQuerySizeInfo wires `linstor query-size-info` and the
@@ -180,7 +180,7 @@ func collectCandidates(pools []apiv1.StoragePool, disabled map[string]struct{}, 
 			continue
 		}
 
-		if _, off := disabled[k8s.Name(pool.NodeName)]; off {
+		if _, off := disabled[naming.Key(pool.NodeName)]; off {
 			continue
 		}
 
@@ -371,7 +371,7 @@ func (s *Server) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 	for i := range nodes {
 		for _, f := range nodes[i].Flags {
 			if f == apiv1.NodeFlagEvicted || f == apiv1.NodeFlagLost {
-				out[k8s.Name(nodes[i].Name)] = struct{}{}
+				out[naming.Key(nodes[i].Name)] = struct{}{}
 
 				break
 			}

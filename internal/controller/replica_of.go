@@ -26,7 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // isReplicaOf reports whether res belongs to the definition stored as
@@ -35,14 +35,14 @@ import (
 // linstor-migrate did that keeps the spelling it was given, Pvc-Mix say, so
 // the two are compared the way the store addresses the definition.
 func isReplicaOf(res *blockstoriov1alpha1.Resource, rdName string) bool {
-	return k8s.Name(res.Spec.ResourceDefinitionName) == rdName
+	return naming.Key(res.Spec.ResourceDefinitionName) == rdName
 }
 
 // sameDefinition reports whether two spellings of a definition's name, as
 // two replicas or a replica and a snapshot carry them, name the same
 // definition: the one the store keeps under their common folded name.
 func sameDefinition(a, b string) bool {
-	return k8s.Name(a) == k8s.Name(b)
+	return naming.Key(a) == naming.Key(b)
 }
 
 // sameNode reports whether two spellings of a node's name refer to the same
@@ -52,7 +52,7 @@ func sameDefinition(a, b string) bool {
 // spelling too. Both sides map to the node's CR name, which is how the
 // store addresses it.
 func sameNode(a, b string) bool {
-	return k8s.SameName(a, b)
+	return naming.Same(a, b)
 }
 
 // getReplica reads the replica of definition rd on node into out, whichever
@@ -62,7 +62,7 @@ func sameNode(a, b string) bool {
 // replica written in another spelling is then found by its spec instead.
 // It answers NotFound when there is no such replica.
 func getReplica(ctx context.Context, c client.Reader, rd, node string, out *blockstoriov1alpha1.Resource) error {
-	err := c.Get(ctx, client.ObjectKey{Name: k8s.Name(rd + "." + node)}, out)
+	err := c.Get(ctx, client.ObjectKey{Name: naming.Key(rd + "." + node)}, out)
 	if err == nil || !apierrors.IsNotFound(err) {
 		return err
 	}

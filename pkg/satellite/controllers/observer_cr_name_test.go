@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -46,7 +47,7 @@ func TestTheObserverWritesOntoTheReplicaTheStoreNamed(t *testing.T) {
 		specRD     string
 		node       string
 	}{
-		{"My_Res", k8s.Name("My_Res"), "Node-1"},
+		{"My_Res", naming.Key("My_Res"), "Node-1"},
 		{"Pvc-Mix", "Pvc-Mix", "Node-1"},
 		{"pvc-0b5d6c1e-4f3a-4e2b-9a1d-7c8e9f0a1b2c", "pvc-0b5d6c1e-4f3a-4e2b-9a1d-7c8e9f0a1b2c", "Node-1"},
 		{"pvc-0b5d6c1e-4f3a-4e2b-9a1d-7c8e9f0a1b2c", "pvc-0b5d6c1e-4f3a-4e2b-9a1d-7c8e9f0a1b2c", "My_Node"},
@@ -59,10 +60,10 @@ func TestTheObserverWritesOntoTheReplicaTheStoreNamed(t *testing.T) {
 				t.Fatalf("scheme: %v", err)
 			}
 
-			rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name(tc.registered)}}
+			rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: naming.Key(tc.registered)}}
 			k8s.SetOriginalName(&rd.ObjectMeta, tc.registered)
 
-			node := &blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name(tc.node)}}
+			node := &blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: naming.Key(tc.node)}}
 			k8s.SetOriginalName(&node.ObjectMeta, tc.node)
 
 			crName := k8s.ResourceCRName(tc.registered, tc.node)
@@ -80,7 +81,7 @@ func TestTheObserverWritesOntoTheReplicaTheStoreNamed(t *testing.T) {
 
 			o := &ObserverRunnable{Client: cli, NodeName: node.Name}
 			ctx := context.Background()
-			kernel := k8s.Name(tc.specRD)
+			kernel := naming.Key(tc.specRD)
 
 			if err := o.writeStatus(ctx, &observation{ResourceName: kernel, DrbdState: "UpToDate", Role: "Secondary"}); err != nil {
 				t.Fatalf("writeStatus: %v", err)
@@ -135,7 +136,7 @@ func crNameScheme(t *testing.T) *runtime.Scheme {
 func TestTheSkipDiskClearerReachesAHashedDefinitionsReplica(t *testing.T) {
 	t.Parallel()
 
-	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("My_Res")}}
+	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("My_Res")}}
 	k8s.SetOriginalName(&rd.ObjectMeta, "My_Res")
 
 	crName := k8s.ResourceCRName("My_Res", "n1")
@@ -178,7 +179,7 @@ func TestTheSkipDiskClearerReachesAHashedDefinitionsReplica(t *testing.T) {
 func TestTheSnapshotFetcherFindsAHashedDefinitionsSnapshot(t *testing.T) {
 	t.Parallel()
 
-	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("My_Res")}}
+	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("My_Res")}}
 	k8s.SetOriginalName(&rd.ObjectMeta, "My_Res")
 
 	snap := &blockstoriov1alpha1.Snapshot{
@@ -199,7 +200,7 @@ func TestTheSnapshotFetcherFindsAHashedDefinitionsSnapshot(t *testing.T) {
 func TestTheObserverWakesAHashedDefinitionsReplica(t *testing.T) {
 	t.Parallel()
 
-	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("My_Res")}}
+	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("My_Res")}}
 	k8s.SetOriginalName(&rd.ObjectMeta, "My_Res")
 
 	trigger := make(chan event.GenericEvent, 1)
@@ -226,10 +227,10 @@ func TestTheObserverWakesAHashedDefinitionsReplica(t *testing.T) {
 func TestTheConditionStampersReachAHashedDefinitionsReplica(t *testing.T) {
 	t.Parallel()
 
-	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("My_Res")}}
+	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("My_Res")}}
 	k8s.SetOriginalName(&rd.ObjectMeta, "My_Res")
 
-	node := &blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("My_Node")}}
+	node := &blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: naming.Key("My_Node")}}
 	k8s.SetOriginalName(&node.ObjectMeta, "My_Node")
 
 	crName := k8s.ResourceCRName("My_Res", "My_Node")

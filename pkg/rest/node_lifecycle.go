@@ -30,8 +30,8 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // registerNodeLifecycle wires the eviction / restore / lost endpoints.
@@ -135,7 +135,7 @@ func (s *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
 
 		for i := range resources {
 			res := &resources[i]
-			if !k8s.SameName(res.NodeName, name) {
+			if !naming.Same(res.NodeName, name) {
 				continue
 			}
 
@@ -290,7 +290,7 @@ func queryFlag(r *http.Request, name string) bool {
 func evacuatingSet(names []string) map[string]bool {
 	out := make(map[string]bool, len(names))
 	for _, name := range names {
-		out[k8s.Name(name)] = true
+		out[naming.Key(name)] = true
 	}
 
 	return out
@@ -331,7 +331,7 @@ func (s *Server) checkEvacuateCandidate(ctx context.Context, w http.ResponseWrit
 
 	for i := range allNodes {
 		n := &allNodes[i]
-		if evacuating[k8s.Name(n.Name)] {
+		if evacuating[naming.Key(n.Name)] {
 			continue
 		}
 
@@ -367,7 +367,7 @@ func (s *Server) checkEvacuateInUse(ctx context.Context, w http.ResponseWriter, 
 
 	for i := range resources {
 		res := &resources[i]
-		if !evacuating[k8s.Name(res.NodeName)] {
+		if !evacuating[naming.Key(res.NodeName)] {
 			continue
 		}
 
@@ -667,5 +667,5 @@ func removeFlag(flag string) func([]string) []string {
 // variants of a name outside RFC 1123, My_Node and my_node, hash to two CR
 // names and stay two nodes.
 func nodeKey(name string) string {
-	return k8s.Name(name)
+	return naming.Key(name)
 }

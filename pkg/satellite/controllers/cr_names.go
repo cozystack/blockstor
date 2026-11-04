@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -46,7 +47,7 @@ func replicaCRName(ctx context.Context, reader client.Reader, rdName, node strin
 
 	var crd blockstoriov1alpha1.Node
 
-	err = reader.Get(ctx, client.ObjectKey{Name: k8s.Name(node)}, &crd)
+	err = reader.Get(ctx, client.ObjectKey{Name: naming.Key(node)}, &crd)
 
 	switch {
 	case err == nil:
@@ -74,7 +75,7 @@ func snapshotCRName(ctx context.Context, reader client.Reader, rdName, snap stri
 func registeredRDName(ctx context.Context, reader client.Reader, rdName string) (string, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := reader.Get(ctx, client.ObjectKey{Name: k8s.Name(rdName)}, &rd)
+	err := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
 	if apierrors.IsNotFound(err) {
 		return rdName, nil
 	}

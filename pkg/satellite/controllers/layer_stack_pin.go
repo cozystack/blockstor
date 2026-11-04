@@ -27,7 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // errLayerStackNotPinned reports an RD that leaves its layer stack to its
@@ -62,7 +62,7 @@ func (r *ResourceReconciler) checkLayerStackPinned(ctx context.Context, rd *bloc
 
 	// The RD keeps the group's name as the operator spelled it; the CR is
 	// stored under the folded one.
-	err := r.Get(ctx, client.ObjectKey{Name: k8s.Name(rd.Spec.ResourceGroupName)}, &rg)
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Spec.ResourceGroupName)}, &rg)
 	if apierrors.IsNotFound(err) {
 		return nil
 	}

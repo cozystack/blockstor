@@ -34,9 +34,9 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // AutoTiebreakerSuppressedUntilAnnotation is re-exported from
@@ -1435,7 +1435,7 @@ func (s *Server) handleResourceCreateOnNode(w http.ResponseWriter, r *http.Reque
 	switch {
 	case env.Resource.NodeName == "":
 		env.Resource.NodeName = node
-	case !k8s.SameName(env.Resource.NodeName, node):
+	case !naming.Same(env.Resource.NodeName, node):
 		writeError(w, http.StatusBadRequest,
 			"single-node resource create: body node '"+env.Resource.NodeName+
 				"' does not match URL path node '"+node+"'")
@@ -2042,7 +2042,7 @@ func (s *Server) resolveTakeoverStorPool(ctx context.Context, rdName, takeoverNo
 	siblings, listErr := s.Store.Resources().ListByDefinition(ctx, rdName)
 	if listErr == nil {
 		for i := range siblings {
-			if k8s.SameName(siblings[i].NodeName, takeoverNode) {
+			if naming.Same(siblings[i].NodeName, takeoverNode) {
 				continue
 			}
 
@@ -2915,7 +2915,7 @@ func (s *Server) bumpPeerChangedOnSiblings(ctx context.Context, rdName, removedN
 
 	for i := range siblings {
 		sib := &siblings[i]
-		if k8s.SameName(sib.NodeName, removedNode) {
+		if naming.Same(sib.NodeName, removedNode) {
 			// Defensive: the deleted Resource should already be
 			// absent from the list, but a racing Create could
 			// surface a fresh replica on the same node — never

@@ -35,8 +35,8 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // CapacityShortfallError reports that no candidate pool has enough
@@ -449,7 +449,7 @@ func (p *Placer) placeDiskful(ctx context.Context, rdName string, state *state, 
 // created with, node-1. Both map to the node's CR name, which is how the
 // store addresses the node, so they are one key.
 func nodeKey(name string) string {
-	return k8s.Name(name)
+	return naming.Key(name)
 }
 
 // placeDisklessOnRemaining ensures every healthy node not already
