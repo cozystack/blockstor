@@ -58,3 +58,25 @@ func TestMinRscCountCountsReplicasInAnySpellingOfThePoolsNode(t *testing.T) {
 		t.Errorf("NODE-1 with two replicas scores %v, an empty node %v; want the loaded node lower", loaded, empty)
 	}
 }
+
+// An existing replica shows its node as Node-1 while the pool listing has
+// it as node-1: the replica's pool is still found, so its shared LUN keeps a
+// new replica off the pool that shares it.
+func TestAnExistingReplicasPoolIsFoundInAnotherNodeSpelling(t *testing.T) {
+	t.Parallel()
+
+	existing := []apiv1.Resource{{
+		Name: "pvc-x", NodeName: "Node-1", Props: map[string]string{storPoolNameProp: "san"},
+	}}
+	pools := []apiv1.StoragePool{
+		{StoragePoolName: "san", NodeName: "node-1", ProviderKind: "LVM", SharedSpaceID: "lun-7"},
+		{StoragePoolName: "san", NodeName: "node-2", ProviderKind: "LVM", SharedSpaceID: "lun-7"},
+	}
+
+	s := newState(&apiv1.AutoSelectFilter{}, existing, map[string]map[string]string{}, pools, false)
+
+	if _, seen := s.sharedSeen["lun-7"]; !seen || s.firstKind != "LVM" {
+		t.Errorf("shared LUNs seen %v, first kind %q; want lun-7 and LVM from the replica on Node-1",
+			s.sharedSeen, s.firstKind)
+	}
+}

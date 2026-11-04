@@ -542,6 +542,8 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 	}
 
 	for i := range existing {
+		replica := &existing[i]
+
 		// corner-D2b: a node whose only replica is a diskless witness
 		// (DISKLESS, typically also TIE_BREAKER) is NOT taken for
 		// diskful placement — it's an UPGRADE candidate. Record it so
@@ -549,13 +551,13 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		// NOT add it to `taken` (which would make candidateNodeProps
 		// reject it the way a real diskful peer is rejected). Diskful
 		// replicas still claim the node via `taken` below.
-		if slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
-			s.upgradeable[naming.Key(existing[i].NodeName)] = existing[i].Props[storPoolNameProp]
+		if slices.Contains(replica.Flags, apiv1.ResourceFlagDiskless) {
+			s.upgradeable[naming.Key(replica.NodeName)] = replica.Props[storPoolNameProp]
 
 			continue
 		}
 
-		s.taken[naming.Key(existing[i].NodeName)] = struct{}{}
+		s.taken[naming.Key(replica.NodeName)] = struct{}{}
 
 		// Seed XReplicasOnDifferentMap buckets from this diskful
 		// replica. DISKLESS witnesses (handled by the continue above)
@@ -563,7 +565,7 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		// attachments and upstream LINSTOR doesn't count them toward
 		// x-replicas either (mirrors place_count's diskful-only
 		// semantic).
-		nodeProps := nodes[naming.Key(existing[i].NodeName)]
+		nodeProps := nodes[naming.Key(replica.NodeName)]
 		for key := range filter.XReplicasOnDifferentMap {
 			s.xBuckets[xBucketKey(key, nodeProps)]++
 		}
@@ -571,12 +573,12 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		// Pre-seed shared-space anti-affinity: if an existing replica
 		// already lives on a shared-LUN pool, no new replica may land
 		// on a pool sharing that LUN identifier.
-		stor := existing[i].Props[storPoolNameProp]
+		stor := replica.Props[storPoolNameProp]
 		if stor == "" {
 			continue
 		}
 
-		pool, ok := s.pools[poolKey(existing[i].NodeName, stor)]
+		pool, ok := s.pools[poolKey(replica.NodeName, stor)]
 		if !ok {
 			continue
 		}
@@ -826,9 +828,11 @@ func (s *state) promoteWitness(ctx context.Context, st store.Store, rdName strin
 }
 
 // poolKey is the composite (node, pool) lookup key used to find a
-// StoragePool from a Resource's StorPoolName + NodeName pair.
+// StoragePool from a Resource's StorPoolName + NodeName pair. The
+// replica and the pool listing each spell the node their own way, so
+// both halves are keys.
 func poolKey(node, pool string) string {
-	return node + "\x1f" + pool
+	return naming.Key(node) + "\x1f" + naming.Key(pool)
 }
 
 func poolsByKey(pools []apiv1.StoragePool) map[string]apiv1.StoragePool {
