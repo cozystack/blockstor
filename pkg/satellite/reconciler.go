@@ -1921,17 +1921,19 @@ func computeRemovedPeers(resPath string, dr *intent.DesiredResource, localNode s
 		return nil
 	}
 
+	// The file names a peer as it was rendered then, the intent as its row
+	// spells it now; a peer whose spelling changed has not left.
 	want := make(map[string]struct{}, len(dr.GetPeers())+1)
-	want[localNode] = struct{}{}
+	want[naming.Key(localNode)] = struct{}{}
 
 	for _, p := range dr.GetPeerNames() {
-		want[p] = struct{}{}
+		want[naming.Key(p)] = struct{}{}
 	}
 
 	var removed []string
 
 	for _, p := range old {
-		if _, keep := want[p]; !keep {
+		if _, keep := want[naming.Key(p)]; !keep {
 			removed = append(removed, p)
 		}
 	}
