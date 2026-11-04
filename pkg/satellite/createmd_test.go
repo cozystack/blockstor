@@ -1002,7 +1002,7 @@ func TestOnlyGenerationUUIDsAreRecorded(t *testing.T) {
 
 	for _, generation := range []string{
 		"0000000000000000", "not-a-gi", "0x" + uncleanReportedGI, "6E3A 5D0B",
-		"ABCD", "1" + uncleanReportedGI, uncleanReportedGI[1:],
+		"ABCD", "1" + uncleanReportedGI, uncleanReportedGI[1:], "6E3A5D0B2C1F4A9G",
 	} {
 		rec.RecordObservedGI("pvc-unclean", 0, generation)
 	}
@@ -1045,6 +1045,7 @@ func TestUnreadableGIRecordFailsClosed(t *testing.T) {
 			"zero GI":             "0 0000000000000000\n",
 			"GI too short":        "0 ABCD\n",
 			"GI too long":         "0 1" + uncleanReportedGI + "\n",
+			"GI of 16 not hex":    "0 6E3A5D0B2C1F4A9G\n",
 		} {
 			t.Run(path+"/"+damage, func(t *testing.T) {
 				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
