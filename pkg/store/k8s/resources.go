@@ -89,7 +89,12 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 func (s *resources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
 	reader := s.nodeScopedReader()
 
-	out, err := s.listUnderSpellings(ctx, reader, FieldResourceNodeName, nodeSpellings(ctx, reader, node),
+	spellings, err := nodeSpellings(ctx, reader, node)
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := s.listUnderSpellings(ctx, reader, FieldResourceNodeName, spellings,
 		func(r *crdv1alpha1.Resource, spelling string) bool { return r.Spec.NodeName == spelling })
 	if err != nil {
 		return nil, err
@@ -183,8 +188,15 @@ func (s *resources) Create(ctx context.Context, in *apiv1.Resource) error {
 	// and the registered spellings are kept for display (see spellings.go).
 	// The object itself is named from the registered spellings, the way
 	// Get addresses it.
-	rd := storedRDName(ctx, s.c, in.Name)
-	node := storedNodeName(ctx, s.c, in.NodeName)
+	rd, err := storedRDName(ctx, s.c, in.Name)
+	if err != nil {
+		return err
+	}
+
+	node, err := storedNodeName(ctx, s.c, in.NodeName)
+	if err != nil {
+		return err
+	}
 
 	shown := *in
 	shown.Name = rd.display
@@ -198,7 +210,7 @@ func (s *resources) Create(ctx context.Context, in *apiv1.Resource) error {
 	rd.annotate(&crd.ObjectMeta, AnnotationLinstorRDName)
 	node.annotate(&crd.ObjectMeta, AnnotationLinstorNodeName)
 
-	err := s.c.Create(ctx, crd)
+	err = s.c.Create(ctx, crd)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return errors.Wrapf(store.ErrAlreadyExists, "resource %q on node %q", in.Name, in.NodeName)
@@ -572,7 +584,12 @@ func (s *resources) ClearDRBDPort(ctx context.Context, rdName, node string) erro
 func (s *resources) listByDefinitionThrough(
 	ctx context.Context, reader ctrlclient.Reader, rdName string,
 ) ([]apiv1.Resource, error) {
-	out, err := s.listUnderSpellings(ctx, reader, FieldResourceDefinitionName, rdSpellings(ctx, reader, rdName),
+	spellings, err := rdSpellings(ctx, reader, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := s.listUnderSpellings(ctx, reader, FieldResourceDefinitionName, spellings,
 		func(r *crdv1alpha1.Resource, spelling string) bool { return r.Spec.ResourceDefinitionName == spelling })
 	if err != nil {
 		return nil, err

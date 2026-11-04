@@ -150,7 +150,10 @@ func (s *snapshots) Create(ctx context.Context, in *apiv1.Snapshot) error {
 
 	// The spec stores the definition's CR name and the registered spelling
 	// is kept for display, as for a replica; see spellings.go.
-	rd := storedRDName(ctx, s.c, in.ResourceName)
+	rd, err := storedRDName(ctx, s.c, in.ResourceName)
+	if err != nil {
+		return err
+	}
 
 	shown := *in
 	shown.ResourceName = rd.display
@@ -160,7 +163,7 @@ func (s *snapshots) Create(ctx context.Context, in *apiv1.Snapshot) error {
 	crd.Labels[LabelResourceDefinition] = rd.crName
 	rd.annotate(&crd.ObjectMeta, AnnotationLinstorRDName)
 
-	err := s.c.Create(ctx, crd)
+	err = s.c.Create(ctx, crd)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return errors.Wrapf(store.ErrAlreadyExists, "snapshot %q on RD %q", in.Name, in.ResourceName)
@@ -308,7 +311,10 @@ func (s *snapshots) Delete(ctx context.Context, rdName, snapName string) error {
 func (s *snapshots) listByDefinitionThrough(
 	ctx context.Context, reader ctrlclient.Reader, rdName string,
 ) ([]apiv1.Snapshot, error) {
-	spellings := rdSpellings(ctx, reader, rdName)
+	spellings, err := rdSpellings(ctx, reader, rdName)
+	if err != nil {
+		return nil, err
+	}
 
 	var kept []crdv1alpha1.Snapshot
 

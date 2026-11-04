@@ -23,6 +23,8 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/pkg/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,6 +53,10 @@ import (
 // spelling in spec, so a scoped listing asks under every spelling the name
 // can reasonably have been stored in: the one given, the folded one, and the
 // registered one.
+//
+// A parent that cannot be read is an error, never "not there": a listing that
+// went on without its registered spelling would come back short, and on a
+// delete the snapshot gate would pass over what it could not see.
 
 const (
 	// AnnotationLinstorRDName keeps the spelling a replica's or snapshot's
@@ -97,23 +103,25 @@ func (n storedName) annotate(meta *metav1.ObjectMeta, key string) {
 // storedRDName answers what a replica or snapshot of rdName stores. A
 // definition that is not there (a caller that skipped the check) is stored
 // under the CR name it would have and shown as given.
-func storedRDName(ctx context.Context, reader ctrlclient.Reader, rdName string) storedName {
-	if found, ok := lookupRD(ctx, reader, rdName); ok {
-		return found
+func storedRDName(ctx context.Context, reader ctrlclient.Reader, rdName string) (storedName, error) {
+	found, ok, err := lookupRD(ctx, reader, rdName)
+	if err != nil || ok {
+		return found, err
 	}
 
-	return storedName{crName: Name(rdName), display: rdName}
+	return storedName{crName: Name(rdName), display: rdName}, nil
 }
 
 // storedNodeName answers what a replica on node stores, the same way.
 // `r c pvc NODE-MIX` over a node registered as `Node-Mix` stores `node-mix`
 // and shows `Node-Mix`.
-func storedNodeName(ctx context.Context, reader ctrlclient.Reader, node string) storedName {
-	if found, ok := lookupNode(ctx, reader, node); ok {
-		return found
+func storedNodeName(ctx context.Context, reader ctrlclient.Reader, node string) (storedName, error) {
+	found, ok, err := lookupNode(ctx, reader, node)
+	if err != nil || ok {
+		return found, err
 	}
 
-	return storedName{crName: Name(node), display: node}
+	return storedName{crName: Name(node), display: node}, nil
 }
 
 // shownName is the spelling to show for a parent a child stores as stored:
@@ -126,41 +134,53 @@ func shownName(meta *metav1.ObjectMeta, key, stored string) string {
 	return stored
 }
 
-func lookupRD(ctx context.Context, reader ctrlclient.Reader, rdName string) (storedName, bool) {
+func lookupRD(ctx context.Context, reader ctrlclient.Reader, rdName string) (storedName, bool, error) {
 	var crd crdv1alpha1.ResourceDefinition
 
 	err := reader.Get(ctx, types.NamespacedName{Name: Name(rdName)}, &crd)
 	if err != nil {
-		return storedName{}, false
+		if apierrors.IsNotFound(err) {
+			return storedName{}, false, nil
+		}
+
+		return storedName{}, false, errors.Wrapf(err, "get ResourceDefinition %q", rdName)
 	}
 
-	return storedName{crName: crd.Name, display: OriginalName(&crd.ObjectMeta)}, true
+	return storedName{crName: crd.Name, display: OriginalName(&crd.ObjectMeta)}, true, nil
 }
 
-func lookupNode(ctx context.Context, reader ctrlclient.Reader, node string) (storedName, bool) {
+func lookupNode(ctx context.Context, reader ctrlclient.Reader, node string) (storedName, bool, error) {
 	var crd crdv1alpha1.Node
 
 	err := reader.Get(ctx, types.NamespacedName{Name: Name(node)}, &crd)
 	if err != nil {
-		return storedName{}, false
+		if apierrors.IsNotFound(err) {
+			return storedName{}, false, nil
+		}
+
+		return storedName{}, false, errors.Wrapf(err, "get Node %q", node)
 	}
 
-	return storedName{crName: crd.Name, display: OriginalName(&crd.ObjectMeta)}, true
+	return storedName{crName: crd.Name, display: OriginalName(&crd.ObjectMeta)}, true, nil
 }
 
-// rdSpellings and nodeSpellings answer the spellings to ask under. A failed
-// lookup of the registered object only drops its spellings: the listing
-// still asks under the given and the folded ones, which is what it did before.
-func rdSpellings(ctx context.Context, reader ctrlclient.Reader, rdName string) []string {
-	found, ok := lookupRD(ctx, reader, rdName)
+// rdSpellings and nodeSpellings answer the spellings to ask under.
+func rdSpellings(ctx context.Context, reader ctrlclient.Reader, rdName string) ([]string, error) {
+	found, ok, err := lookupRD(ctx, reader, rdName)
+	if err != nil {
+		return nil, err
+	}
 
-	return spellingSet(rdName, found, ok)
+	return spellingSet(rdName, found, ok), nil
 }
 
-func nodeSpellings(ctx context.Context, reader ctrlclient.Reader, node string) []string {
-	found, ok := lookupNode(ctx, reader, node)
+func nodeSpellings(ctx context.Context, reader ctrlclient.Reader, node string) ([]string, error) {
+	found, ok, err := lookupNode(ctx, reader, node)
+	if err != nil {
+		return nil, err
+	}
 
-	return spellingSet(node, found, ok)
+	return spellingSet(node, found, ok), nil
 }
 
 func spellingSet(given string, found storedName, haveFound bool) []string {
