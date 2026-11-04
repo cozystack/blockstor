@@ -89,7 +89,7 @@ func (s *inMemoryVolumeDefinitions) Get(_ context.Context, rdName string, volume
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	vd, ok := s.m[vdKey{rdName, volumeNumber}]
+	vd, ok := s.m[vdKey{naming.Key(rdName), volumeNumber}]
 	if !ok {
 		return apiv1.VolumeDefinition{}, errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
 	}
@@ -105,7 +105,7 @@ func (s *inMemoryVolumeDefinitions) Create(_ context.Context, rdName string, vd 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := vdKey{rdName, vd.VolumeNumber}
+	k := vdKey{naming.Key(rdName), vd.VolumeNumber}
 	if _, exists := s.m[k]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
 	}
@@ -137,7 +137,7 @@ func (s *inMemoryVolumeDefinitions) CreateAutoNumbered(_ context.Context, rdName
 	used := make(map[int32]bool)
 
 	for k := range s.m {
-		if k.rd == rdName {
+		if k.rd == naming.Key(rdName) {
 			used[k.vol] = true
 		}
 	}
@@ -147,7 +147,7 @@ func (s *inMemoryVolumeDefinitions) CreateAutoNumbered(_ context.Context, rdName
 	}
 
 	vd.VolumeNumber = assigned
-	s.m[vdKey{rdName, assigned}] = *vd
+	s.m[vdKey{naming.Key(rdName), assigned}] = *vd
 
 	return assigned, nil
 }
@@ -160,7 +160,7 @@ func (s *inMemoryVolumeDefinitions) Update(_ context.Context, rdName string, vd 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := vdKey{rdName, vd.VolumeNumber}
+	k := vdKey{naming.Key(rdName), vd.VolumeNumber}
 	if _, exists := s.m[k]; !exists {
 		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
 	}
@@ -182,7 +182,7 @@ func (s *inMemoryVolumeDefinitions) PatchVolumeDefinitionSpec(_ context.Context,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := vdKey{rdName, volumeNumber}
+	key := vdKey{naming.Key(rdName), volumeNumber}
 
 	vd, ok := s.m[key]
 	if !ok {
@@ -208,7 +208,7 @@ func (s *inMemoryVolumeDefinitions) Delete(_ context.Context, rdName string, vol
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := vdKey{rdName, volumeNumber}
+	k := vdKey{naming.Key(rdName), volumeNumber}
 	if _, exists := s.m[k]; !exists {
 		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
 	}

@@ -101,7 +101,7 @@ func (s *inMemoryResources) Get(_ context.Context, rdName, node string) (apiv1.R
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	r, ok := s.m[rKey{rdName, node}]
+	r, ok := s.m[rKey{naming.Key(rdName), naming.Key(node)}]
 	if !ok {
 		return apiv1.Resource{}, errors.Wrapf(ErrNotFound, "resource %q on node %q", rdName, node)
 	}
@@ -117,7 +117,7 @@ func (s *inMemoryResources) Create(_ context.Context, r *apiv1.Resource) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := rKey{r.Name, r.NodeName}
+	k := rKey{naming.Key(r.Name), naming.Key(r.NodeName)}
 	if _, exists := s.m[k]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "resource %q on node %q", r.Name, r.NodeName)
 	}
@@ -135,7 +135,7 @@ func (s *inMemoryResources) Update(_ context.Context, r *apiv1.Resource) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{r.Name, r.NodeName}
+	key := rKey{naming.Key(r.Name), naming.Key(r.NodeName)}
 
 	prev, exists := s.m[key]
 	if !exists {
@@ -163,7 +163,7 @@ func (s *inMemoryResources) PatchResourceSpec(_ context.Context, rdName, node st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := rKey{naming.Key(rdName), naming.Key(node)}
 
 	r, ok := s.m[key]
 	if !ok {
@@ -194,7 +194,7 @@ func (s *inMemoryResources) Delete(_ context.Context, rdName, node string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := rKey{naming.Key(rdName), naming.Key(node)}
 	if _, exists := s.m[key]; !exists {
 		return errors.Wrapf(ErrNotFound, "resource %q on node %q", rdName, node)
 	}
@@ -217,7 +217,7 @@ func (s *inMemoryResources) DeleteIfTieBreaker(_ context.Context, rdName, node s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := rKey{naming.Key(rdName), naming.Key(node)}
 
 	r, exists := s.m[key]
 	if !exists {
@@ -247,7 +247,7 @@ func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, sta
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := rKey{naming.Key(rdName), naming.Key(node)}
 
 	existing, exists := s.m[key]
 	if !exists {
@@ -285,7 +285,7 @@ func (s *inMemoryResources) ClearDRBDPort(_ context.Context, rdName, node string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := rKey{naming.Key(rdName), naming.Key(node)}
 
 	existing, ok := s.m[key]
 	if !ok {
@@ -314,7 +314,7 @@ func (s *inMemoryResources) VolumeStateForTest(rdName, node string, volumeNumber
 		return apiv1.VolumeState{}, false
 	}
 
-	st, ok := s.volStates[rKey{rdName, node}][volumeNumber]
+	st, ok := s.volStates[rKey{naming.Key(rdName), naming.Key(node)}][volumeNumber]
 
 	return st, ok
 }

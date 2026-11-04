@@ -87,7 +87,7 @@ func (s *inMemorySnapshots) Get(_ context.Context, rdName, snapName string) (api
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	snap, ok := s.m[snapKey{rdName, snapName}]
+	snap, ok := s.m[snapKey{naming.Key(rdName), naming.Key(snapName)}]
 	if !ok {
 		return apiv1.Snapshot{}, errors.Wrapf(ErrNotFound, "snapshot %q on resource definition %q", snapName, rdName)
 	}
@@ -103,7 +103,7 @@ func (s *inMemorySnapshots) Create(_ context.Context, snap *apiv1.Snapshot) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := snapKey{snap.ResourceName, snap.Name}
+	k := snapKey{naming.Key(snap.ResourceName), naming.Key(snap.Name)}
 	if _, exists := s.m[k]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "snapshot %q on resource definition %q", snap.Name, snap.ResourceName)
 	}
@@ -121,7 +121,7 @@ func (s *inMemorySnapshots) Update(_ context.Context, snap *apiv1.Snapshot) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := snapKey{snap.ResourceName, snap.Name}
+	key := snapKey{naming.Key(snap.ResourceName), naming.Key(snap.Name)}
 
 	prev, exists := s.m[key]
 	if !exists {
@@ -145,7 +145,7 @@ func (s *inMemorySnapshots) PatchSnapshotProps(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := snapKey{rdName, snapName}
+	key := snapKey{naming.Key(rdName), naming.Key(snapName)}
 
 	snap, ok := s.m[key]
 	if !ok {
@@ -178,7 +178,7 @@ func (s *inMemorySnapshots) Delete(_ context.Context, rdName, snapName string) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := snapKey{rdName, snapName}
+	k := snapKey{naming.Key(rdName), naming.Key(snapName)}
 	if _, exists := s.m[k]; !exists {
 		return errors.Wrapf(ErrNotFound, "snapshot %q on resource definition %q", snapName, rdName)
 	}

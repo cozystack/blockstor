@@ -42,6 +42,7 @@ func RunNodeStore(t *testing.T, newStore Factory) {
 	t.Helper()
 	t.Run("ListEmpty", func(t *testing.T) { testNodeListEmpty(t, newStore) })
 	t.Run("CreateThenGet", func(t *testing.T) { testNodeCreateThenGet(t, newStore) })
+	t.Run("AnySpellingAddressesOneNode", func(t *testing.T) { testAnySpellingAddressesOneNode(t, newStore) })
 	t.Run("CreateDuplicate", func(t *testing.T) { testNodeCreateDuplicate(t, newStore) })
 	t.Run("GetMissing", func(t *testing.T) { testNodeGetMissing(t, newStore) })
 	t.Run("UpdateMissing", func(t *testing.T) { testNodeUpdateMissing(t, newStore) })
@@ -685,6 +686,7 @@ func testSnapshotUpdateNilArg(t *testing.T, newStore Factory) {
 // RunResourceStore exercises every branch of store.ResourceStore.
 func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Helper()
+	t.Run("AnySpellingAddressesOneReplica", func(t *testing.T) { testAnySpellingAddressesOneReplica(t, newStore) })
 	t.Run("ListEmpty", func(t *testing.T) {
 		got, err := newStore(t).Resources().List(t.Context())
 		if err != nil {
@@ -1196,6 +1198,9 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 
 	t.Run("CaseVariantsOutsideRFC1123AreTwoDefinitions", func(t *testing.T) {
 		testCaseVariantsOutsideRFC1123AreTwoDefinitions(t, newStore)
+	})
+	t.Run("AnySpellingAddressesOneDefinition", func(t *testing.T) {
+		testAnySpellingAddressesOneDefinition(t, newStore)
 	})
 	t.Run("ListEmpty", func(t *testing.T) {
 		got, err := newStore(t).ResourceDefinitions().List(t.Context())
@@ -2275,6 +2280,82 @@ func testReferencesOnNodeUnderAnotherSpelling(t *testing.T, newStore Factory) {
 	if len(replicas) != 1 {
 		t.Errorf("ReferencesOnNode under another spelling found %d replica(s), want 1 — "+
 			"the refusal would pass and the node would go with a replica on it", len(replicas))
+	}
+}
+
+// testAnySpellingAddressesOneNode: a node is addressed by the key of its name.
+func testAnySpellingAddressesOneNode(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.Nodes().Create(ctx, &apiv1.Node{Name: "node-1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("Create node-1: %v", err)
+	}
+
+	if _, err := s.Nodes().Get(ctx, "Node-1"); err != nil {
+		t.Errorf("Get Node-1 after Create node-1: %v", err)
+	}
+
+	if err := s.Nodes().Create(ctx, &apiv1.Node{Name: "Node-1", Type: apiv1.NodeTypeSatellite}); !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("Create Node-1 over node-1 = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// testAnySpellingAddressesOneReplica: a replica is addressed by the keys of
+// its definition's and its node's names.
+func testAnySpellingAddressesOneReplica(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"}); err != nil {
+		t.Fatalf("Create definition: %v", err)
+	}
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: "node-1"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	if _, err := s.Resources().Get(ctx, "Pvc-X", "Node-1"); err != nil {
+		t.Errorf("Get Pvc-X on Node-1 after Create pvc-x on node-1: %v", err)
+	}
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "PVC-X", NodeName: "NODE-1"}); !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("Create PVC-X on NODE-1 over it = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// testAnySpellingAddressesOneDefinition: a definition is addressed by the key
+// of its name (naming.Key), in every store. Created as pvc-x it is found as
+// Pvc-X, updated and deleted as PVC-X, and a create of Pvc-X while it exists
+// conflicts.
+func testAnySpellingAddressesOneDefinition(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"}); err != nil {
+		t.Fatalf("Create pvc-x: %v", err)
+	}
+
+	if _, err := s.ResourceDefinitions().Get(ctx, "Pvc-X"); err != nil {
+		t.Errorf("Get Pvc-X after Create pvc-x: %v", err)
+	}
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "Pvc-X"}); !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("Create Pvc-X over pvc-x = %v, want ErrAlreadyExists", err)
+	}
+
+	if err := s.ResourceDefinitions().Delete(ctx, "PVC-X"); err != nil {
+		t.Fatalf("Delete PVC-X: %v", err)
+	}
+
+	if _, err := s.ResourceDefinitions().Get(ctx, "pvc-x"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get pvc-x after Delete PVC-X = %v, want ErrNotFound", err)
 	}
 }
 
