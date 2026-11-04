@@ -265,11 +265,11 @@ func ReferencesUnderSpellings(ctx context.Context, st Store, spellings []string)
 	rscRefs := make([]string, 0, len(resources))
 
 	for i := range resources {
-		if _, dup := seen[resources[i].Name]; dup {
+		if _, dup := seen[naming.Key(resources[i].Name)]; dup {
 			continue
 		}
 
-		seen[resources[i].Name] = struct{}{}
+		seen[naming.Key(resources[i].Name)] = struct{}{}
 
 		rscRefs = append(rscRefs, resources[i].Name)
 	}

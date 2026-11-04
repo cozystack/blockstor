@@ -43,7 +43,7 @@ var refVar = regexp.MustCompile(`^(node|nodeName|rd|rdName|rgName|pool|poolName|
 
 // objectBase is the leaf of a value whose own Name is a node, definition,
 // group, pool or snapshot name: nodes[i].Name, rd.Name, groups[i].Name.
-var objectBase = regexp.MustCompile(`(?i)^(nodes?|n|node\w*|rds?|def|defs|definitions?|rgs?|groups?|resourcegroups?|pools?|snaps?|snapshots?|peers?)$`)
+var objectBase = regexp.MustCompile(`(?i)^(nodes?|n|node\w*|rds?|def|defs|definitions?|rgs?|groups?|resourcegroups?|pools?|snaps?|snapshots?|peers?|replicas?|resources?|reslist|sibs?|siblings?)$`)
 
 // objectName is any expression that holds a LINSTOR object name, for the
 // fold rule: a reference, or the Name of an object.

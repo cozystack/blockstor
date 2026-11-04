@@ -389,7 +389,7 @@ func matchesAny(filter []string, name string) bool {
 		return true
 	}
 
-	return slices.Contains(filter, name)
+	return slices.ContainsFunc(filter, func(f string) bool { return naming.Same(f, name) })
 }
 
 // maxVolumeSizeKib is the smallest free capacity among the pools a

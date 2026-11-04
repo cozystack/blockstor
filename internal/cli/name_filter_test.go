@@ -40,3 +40,16 @@ func TestListFiltersMatchByKey(t *testing.T) {
 		}
 	}
 }
+
+// A group's pool filter names pools the way the store addresses them.
+func TestPoolFilterMatchesByKey(t *testing.T) {
+	t.Parallel()
+
+	if !matchesAny([]string{"ThinPool"}, "thinpool") {
+		t.Error("filter ThinPool does not admit pool thinpool")
+	}
+
+	if matchesAny([]string{"thin_pool"}, "Thin_Pool") {
+		t.Error("filter thin_pool admits Thin_Pool, another pool")
+	}
+}
