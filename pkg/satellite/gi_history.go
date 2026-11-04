@@ -56,11 +56,12 @@ func (r *Reconciler) RecordObservedGI(rdName string, vol int32, generation strin
 	}
 
 	// A zero GI is DRBD's "none yet" and identifies nothing. Anything else
-	// that is not hex is not a GI at all, and a record of it would later
-	// read as damaged and stop the repair for the whole resource.
+	// that is not a GI as DRBD prints it is not one at all, and a record of
+	// it would later read as damaged and stop the repair for the whole
+	// resource.
 	if !drbd.IsGenerationUUID(generation) {
 		if strings.Trim(generation, "0") != "" {
-			slog.Default().Warn("not recording a generation that is not a hex UUID", "resource", rdName,
+			slog.Default().Warn("not recording a value that is not a generation UUID", "resource", rdName,
 				"volume", vol, "generation", generation)
 		}
 

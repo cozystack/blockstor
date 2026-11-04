@@ -994,9 +994,10 @@ func mustRecordedGIs(t *testing.T, rec *Reconciler, rdName string, vol int32) []
 	return got
 }
 
-// Only a GI is recorded: a zero one is DRBD's "none yet", and a value that
-// is not hex would make the whole record read as damaged later.
-func TestOnlyHexGenerationsAreRecorded(t *testing.T) {
+// Only a GI is recorded: a zero one is DRBD's "none yet", and a value DRBD
+// would not print, not hex or not 16 digits, would make the whole record read
+// as damaged later.
+func TestOnlyGenerationUUIDsAreRecorded(t *testing.T) {
 	rec, _, _, _, _ := uncleanFixture(t) //nolint:dogsled // only the reconciler is needed
 
 	for _, generation := range []string{
