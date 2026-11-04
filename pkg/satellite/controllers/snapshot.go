@@ -528,12 +528,15 @@ func upsertPerNodeStatusInPlace(
 	nodeName string,
 	mutate func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
 ) bool {
-	for i := range *entries {
-		if !naming.Same((*entries)[i].NodeName, nodeName) {
-			continue
+	collapsed, mine, folded := collapseNodeStatus(*entries, nodeName)
+	if mine >= 0 {
+		if !mutate(&collapsed[mine]) && !folded {
+			return false
 		}
 
-		return mutate(&(*entries)[i])
+		*entries = collapsed
+
+		return true
 	}
 
 	fresh := blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: nodeName}
@@ -544,6 +547,41 @@ func upsertPerNodeStatusInPlace(
 	*entries = append(*entries, fresh)
 
 	return true
+}
+
+// collapseNodeStatus folds every entry for one node, in whatever spelling
+// it was written, into the first of them. Entries written before under
+// Node-1 and node-1 are one node's: a writer that updated only the first
+// and a reader that kept only the last would never meet. Returns the
+// entries, the folded entry's index (-1 when the node has none), and
+// whether any alias was folded away.
+func collapseNodeStatus(
+	entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string,
+) ([]blockstoriov1alpha1.SnapshotPerNodeStatus, int, bool) {
+	out := make([]blockstoriov1alpha1.SnapshotPerNodeStatus, 0, len(entries))
+	mine := -1
+	folded := false
+
+	for i := range entries {
+		entry := entries[i]
+
+		switch {
+		case !naming.Same(entry.NodeName, nodeName):
+			out = append(out, entry)
+		case mine < 0:
+			mine = len(out)
+			out = append(out, entry)
+		default:
+			kept := &out[mine]
+			kept.Ready = kept.Ready || entry.Ready
+			kept.SuspendIOAcked = kept.SuspendIOAcked || entry.SuspendIOAcked
+			kept.Failed = kept.Failed || entry.Failed
+			kept.CreateTimestamp = max(kept.CreateTimestamp, entry.CreateTimestamp)
+			folded = true
+		}
+	}
+
+	return out, mine, folded
 }
 
 // stampSnapshotPerNodeReady upserts our node's entry in
@@ -645,33 +683,18 @@ func perNodeStatusReady(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nod
 // (otherwise the controller-side orchestrator would see the ack
 // drop and mis-classify the snapshot as still mid-suspend).
 func upsertPerNodeStatus(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string, createTimestamp int64) []blockstoriov1alpha1.SnapshotPerNodeStatus {
-	out := make([]blockstoriov1alpha1.SnapshotPerNodeStatus, 0, len(entries)+1)
-	replaced := false
-
-	for i := range entries {
-		if naming.Same(entries[i].NodeName, nodeName) {
-			merged := entries[i]
-			merged.NodeName = nodeName
-			merged.Ready = true
-			merged.CreateTimestamp = createTimestamp
-
-			out = append(out, merged)
-
-			replaced = true
-
-			continue
-		}
-
-		out = append(out, entries[i])
-	}
-
-	if !replaced {
-		out = append(out, blockstoriov1alpha1.SnapshotPerNodeStatus{
+	out, mine, _ := collapseNodeStatus(entries, nodeName)
+	if mine < 0 {
+		return append(out, blockstoriov1alpha1.SnapshotPerNodeStatus{
 			NodeName:        nodeName,
 			Ready:           true,
 			CreateTimestamp: createTimestamp,
 		})
 	}
+
+	out[mine].NodeName = nodeName
+	out[mine].Ready = true
+	out[mine].CreateTimestamp = createTimestamp
 
 	return out
 }

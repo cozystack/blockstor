@@ -24,6 +24,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
@@ -81,5 +82,62 @@ func TestFetcherResolvesAPeerListedInTheRegisteredSpelling(t *testing.T) {
 
 	if addr == "" {
 		t.Error("resolvePeerAddr(Node-2) gave no address")
+	}
+}
+
+// Status written before under Node-1 and node-1 holds two entries for one
+// node. The acknowledgment folds them into one, so a reader that keeps any
+// of them, the first or the last, sees it.
+func TestSuspendAckFoldsTheNodesStatusEntries(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "rd.snap"},
+		Spec:       blockstoriov1alpha1.SnapshotSpec{Nodes: []string{"Node-1"}, SuspendIO: true},
+		Status: blockstoriov1alpha1.SnapshotStatus{NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
+			{NodeName: "Node-1"}, {NodeName: "node-2"}, {NodeName: "node-1", CreateTimestamp: 7},
+		}},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).WithObjects(snap).Build()
+	r := &SnapshotReconciler{Client: cli, Config: Config{NodeName: "Node-1"}}
+
+	if err := r.stampSnapshotPerNodeSuspendAcked(t.Context(), snap); err != nil {
+		t.Fatalf("stamp: %v", err)
+	}
+
+	var got blockstoriov1alpha1.Snapshot
+	if err := cli.Get(t.Context(), client.ObjectKeyFromObject(snap), &got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	var mine []blockstoriov1alpha1.SnapshotPerNodeStatus
+
+	for _, e := range got.Status.NodeStatus {
+		if naming.Same(e.NodeName, "node-1") {
+			mine = append(mine, e)
+		}
+	}
+
+	if len(mine) != 1 || !mine[0].SuspendIOAcked || mine[0].CreateTimestamp != 7 || len(got.Status.NodeStatus) != 2 {
+		t.Errorf("status %+v; want one acknowledged entry for node-1 keeping its timestamp, beside node-2's", got.Status.NodeStatus)
+	}
+}
+
+func TestReadyStampFoldsTheNodesStatusEntries(t *testing.T) {
+	t.Parallel()
+
+	got := upsertPerNodeStatus([]blockstoriov1alpha1.SnapshotPerNodeStatus{
+		{NodeName: "Node-1"}, {NodeName: "node-1", SuspendIOAcked: true},
+	}, "node-1", 9)
+
+	if len(got) != 1 || !got[0].Ready || got[0].CreateTimestamp != 9 || !got[0].SuspendIOAcked {
+		t.Errorf("status %+v; want one ready entry for node-1 keeping its acknowledgment", got)
 	}
 }
