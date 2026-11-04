@@ -64,8 +64,8 @@ func (s *inMemoryVolumeDefinitions) List(_ context.Context, rdName string) ([]ap
 }
 
 // ListAll groups every stored volume by its parent definition, keyed the way
-// the Kubernetes store keys it: folded, because LINSTOR names are
-// case-insensitive and the caller's spelling need not be the stored one.
+// the Kubernetes store keys it, by naming.Key: the caller's spelling need not
+// be the stored one.
 func (s *inMemoryVolumeDefinitions) ListAll(_ context.Context) (map[string][]apiv1.VolumeDefinition, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

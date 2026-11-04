@@ -55,7 +55,8 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 	// golinstor as the comma-joined `?resource_definitions=a,b` form.
 	// Without honouring this, `rd l --resource-definitions X` returns
 	// the full RD list and the CLI renders ALL RDs — Bug 61.
-	// Semantics mirror upstream: case-insensitive name match,
+	// Semantics mirror upstream: names match as the store keys them
+	// (naming.Same, case-insensitive inside RFC 1123),
 	// unknown names => empty list (NOT 404); missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_definitions")
 	if len(nameFilter) > 0 {

@@ -51,7 +51,8 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	// `multiValueQuery` accepts both, so `linstor r l -r foo -n bar`
 	// and linstor-csi's existing requests land in the same filter.
 	// Java LINSTOR honours both as case-insensitive set-membership; we
-	// match that so linstor-csi's "is this resource on this node?"
+	// match names as the store keys them (naming.Same), which is that for
+	// every name inside RFC 1123, so linstor-csi's "is this resource on this node?"
 	// poll returns a non-empty list when the answer is yes.
 	nodeFilter := multiValueQuery(r, "nodes")
 	rdFilter := multiValueQuery(r, "resources")

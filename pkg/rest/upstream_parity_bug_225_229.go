@@ -340,8 +340,8 @@ func (s *Server) handleNodeConfigPut(w http.ResponseWriter, r *http.Request) {
 
 // handleStoragePoolDefinitionSingle serves Bug 229. Walks the
 // StoragePool table for entries whose `StoragePoolName` matches the
-// requested name (case-insensitive — matches upstream's
-// `equalsIgnoreCase` filter), dedups by name, and returns the
+// requested name as the store keys it (naming.Same; upstream's
+// `equalsIgnoreCase` for every name inside RFC 1123), dedups by name, and returns the
 // filtered slice in the same wire shape the list endpoint emits.
 // 404 on an unknown name so `linstor sp-definition l <name>` surfaces
 // a typed error instead of an empty-list confusion.

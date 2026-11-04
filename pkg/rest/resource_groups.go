@@ -79,7 +79,7 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 	// Optional filter the upstream LINSTOR CLI sends on
 	// `linstor rg l --resource-groups <name>...` — mirrors the
 	// `resource_definitions` filter on `rd l` (Bug 61) for the RG
-	// list endpoint. Same semantics: case-insensitive name match,
+	// list endpoint. Same semantics: names match as the store keys them,
 	// unknown names => empty list, missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_groups")
 	if len(nameFilter) > 0 {

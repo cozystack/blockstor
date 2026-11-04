@@ -470,7 +470,8 @@ func redactStoragePoolsInPlace(pools []apiv1.StoragePool) {
 }
 
 // listFilteredStoragePools returns the wire-shape pool slice after applying
-// the case-insensitive node / pool filters Java LINSTOR uses. Empty filters
+// the node / pool filters Java LINSTOR uses, matching names as the store keys
+// them (naming.Same). Empty filters
 // mean "no constraint on this dimension". The slice is always non-nil so
 // JSON encoding yields [] instead of null — linstor-csi rejects null bodies.
 func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolFilter []string) ([]apiv1.StoragePool, error) {

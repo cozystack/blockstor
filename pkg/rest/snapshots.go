@@ -168,8 +168,8 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 	stripInternalAnnotationsFromSnapshots(snaps)
 
 	// Optional filters golinstor sends: ?resources=rd1,rd2 &
-	// snapshots=name1,name2 — case-insensitive set membership against
-	// Java LINSTOR's behaviour. Without filtering linstor-csi's "do
+	// snapshots=name1,name2 — set membership by naming.Same, Java
+	// LINSTOR's case-insensitive match for every name inside RFC 1123. Without filtering linstor-csi's "do
 	// any snapshots exist for this volume?" poll has to scan the
 	// whole cluster every cycle.
 	rdFilter := multiValueQuery(r, "resources")

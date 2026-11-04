@@ -188,7 +188,7 @@ func (s *Server) registerErrorReports(mux *http.ServeMux) {
 // Query parameters honoured (upstream `Controller.GetErrorReports`
 // passes the same names):
 //
-//   - `?node=NAME` filters by satellite name (case-insensitive). Repeated
+//   - `?node=NAME` filters by satellite name (naming.Same). Repeated
 //     values aren't supported; the operator hits the endpoint per node.
 //   - `?since=...` returns only entries with `error_time >= since`. We
 //     accept either RFC3339 ("2026-05-14T10:00:00Z") — the form the
