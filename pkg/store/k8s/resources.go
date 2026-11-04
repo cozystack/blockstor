@@ -203,6 +203,7 @@ func (s *resources) Create(ctx context.Context, in *apiv1.Resource) error {
 	shown.NodeName = node.display
 
 	crd := wireToCRDResource(&shown)
+	dropNameAnnotations(crd.Annotations)
 	crd.Spec.ResourceDefinitionName = rd.crName
 	crd.Spec.NodeName = node.crName
 	crd.Labels[LabelResourceDefinition] = rd.crName
@@ -285,7 +286,7 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// wipes the annotation; a concurrent RD cascade-delete that hits
 	// `lookupVolumeNumbers` during the harm window leaks the backing
 	// LV / zvol. Mirrors the RD / RG / Snapshot stores.
-	mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations,
+	mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations),
 		crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 	err = s.c.Update(ctx, &existing)
@@ -367,7 +368,7 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// annotation invariant uniform with the wholesale `Update`
 		// path and protects against future closures that explicitly
 		// reset live.Annotations.
-		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations,
+		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(wire.Annotations),
 			crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))

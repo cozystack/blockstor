@@ -178,3 +178,73 @@ func TestAListingAsksNoOtherDefinitionsSpelling(t *testing.T) {
 		t.Errorf("snapshots of my_res = %v, %v; want its own row", snaps, err)
 	}
 }
+
+// The names a child shows for its parents are the store's to derive. A
+// caller writing the reserved annotations, on create or on update, does not
+// replace them.
+func TestACallerCannotForgeTheShownParentNames(t *testing.T) {
+	t.Parallel()
+
+	forged := map[string]string{
+		k8s.AnnotationLinstorRDName:   "wrong-rd",
+		k8s.AnnotationLinstorNodeName: "wrong-node",
+		"user/kept":                   "yes",
+	}
+
+	st := k8s.New(fake.NewClientBuilder().WithScheme(spellingScheme(t)).WithObjects(
+		registeredRD("lower-rd"), registeredNode("lower-node"),
+	).Build())
+
+	ctx := context.Background()
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "lower-rd", NodeName: "lower-node", Annotations: forged}); err != nil {
+		t.Fatalf("replica create: %v", err)
+	}
+
+	got, err := st.Resources().Get(ctx, "lower-rd", "lower-node")
+	if err != nil || got.Name != "lower-rd" || got.NodeName != "lower-node" || got.Annotations["user/kept"] != "yes" {
+		t.Errorf("replica after create = %+v, %v; want lower-rd/lower-node with the caller's own annotation", got, err)
+	}
+
+	got.Annotations = forged
+	if err := st.Resources().Update(ctx, &got); err != nil {
+		t.Fatalf("replica update: %v", err)
+	}
+
+	got, err = st.Resources().Get(ctx, "lower-rd", "lower-node")
+	if err != nil || got.Name != "lower-rd" || got.NodeName != "lower-node" {
+		t.Errorf("replica after update = %+v, %v; want lower-rd/lower-node", got, err)
+	}
+
+	if err := st.Resources().PatchResourceSpec(ctx, "lower-rd", "lower-node", func(r *apiv1.Resource) error {
+		r.Annotations = forged
+
+		return nil
+	}); err != nil {
+		t.Fatalf("replica patch: %v", err)
+	}
+
+	got, err = st.Resources().Get(ctx, "lower-rd", "lower-node")
+	if err != nil || got.Name != "lower-rd" || got.NodeName != "lower-node" {
+		t.Errorf("replica after patch = %+v, %v; want lower-rd/lower-node", got, err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "snap-1", ResourceName: "lower-rd", Annotations: forged}); err != nil {
+		t.Fatalf("snapshot create: %v", err)
+	}
+
+	snap, err := st.Snapshots().Get(ctx, "lower-rd", "snap-1")
+	if err != nil || snap.ResourceName != "lower-rd" {
+		t.Errorf("snapshot after create = %+v, %v; want it under lower-rd", snap, err)
+	}
+
+	snap.Annotations = forged
+	if err := st.Snapshots().Update(ctx, &snap); err != nil {
+		t.Fatalf("snapshot update: %v", err)
+	}
+
+	snap, err = st.Snapshots().Get(ctx, "lower-rd", "snap-1")
+	if err != nil || snap.ResourceName != "lower-rd" {
+		t.Errorf("snapshot after update = %+v, %v; want it under lower-rd", snap, err)
+	}
+}

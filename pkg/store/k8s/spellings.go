@@ -203,6 +203,28 @@ func spellingSet(given string, found storedName, haveFound bool) []string {
 	return out
 }
 
+// withoutCallerNameAnnotations drops the display-spelling annotations from
+// what a caller writes: the store derives them from the parents it resolves,
+// and one a caller supplied would replace the names a child shows. A nil map
+// stays nil, so "no annotation work" keeps its meaning.
+func withoutCallerNameAnnotations(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+
+	out := maps.Clone(in)
+	dropNameAnnotations(out)
+
+	return out
+}
+
+// dropNameAnnotations deletes the display-spelling annotations from m in
+// place, before a write derives them from the resolved parents.
+func dropNameAnnotations(m map[string]string) {
+	delete(m, AnnotationLinstorRDName)
+	delete(m, AnnotationLinstorNodeName)
+}
+
 // withoutNameAnnotations drops the display-spelling annotations from a wire
 // annotation map: they are store-internal, and the wire carries the spelling
 // itself in its name fields.

@@ -159,6 +159,7 @@ func (s *snapshots) Create(ctx context.Context, in *apiv1.Snapshot) error {
 	shown.ResourceName = rd.display
 
 	crd := wireToCRDSnapshot(&shown)
+	dropNameAnnotations(crd.Annotations)
 	crd.Spec.ResourceDefinitionName = rd.crName
 	crd.Labels[LabelResourceDefinition] = rd.crName
 	rd.annotate(&crd.ObjectMeta, AnnotationLinstorRDName)
@@ -234,7 +235,7 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		existing.Spec.GroupID = preservedGroupID
 		existing.Spec.GroupSize = preservedGroupSize
 		existing.Spec.ResourceDefinitionName = preservedRD
-		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations, AnnotationLinstorRDName)
+		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations), AnnotationLinstorRDName)
 
 		return s.c.Update(ctx, &existing)
 	}), "update Snapshot %s/%s", in.ResourceName, in.Name)
