@@ -23,6 +23,7 @@ package planted
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -125,6 +126,132 @@ func crName(req *http.Request, obj *crd.ResourceDefinition) bool {
 	return obj.Name == req.PathValue("rd") // want
 }
 
+// The shapes a second review planted.
+
+// Two wire rows of two different listings, one field each.
+func twoListings(a apiv1.Resource, b apiv1.Snapshot) bool {
+	return a.Name == b.ResourceName // want
+}
+
+// The same field of two values that are not one collection.
+func twoValues(a, b apiv1.Resource) bool {
+	return a.NodeName == b.NodeName // want
+}
+
+// A key built inline from a raw name.
+func concatKey(r apiv1.Resource, pool string, byPair map[string]int) int {
+	return byPair[r.NodeName+"/"+pool] // want
+}
+
+// A key built with Sprintf.
+func sprintfKey(r apiv1.Resource, byPair map[string]int) int {
+	return byPair[fmt.Sprintf("%s/%s", r.NodeName, r.Name)] // want
+}
+
+type holder struct{ who string }
+
+// A name copied through a field of a local struct.
+func viaField(req *http.Request, r apiv1.Resource) bool {
+	h := holder{who: req.PathValue("node")}
+
+	return h.who == r.NodeName // want
+}
+
+// A switch on one name with a case of another.
+func switched(req *http.Request, r apiv1.Resource) int {
+	switch req.PathValue("node") {
+	case r.NodeName: // want
+		return 1
+	}
+
+	return 0
+}
+
+// A closure bound to a variable.
+func viaClosure(req *http.Request, r apiv1.Resource) bool {
+	eq := func(x, y string) bool {
+		return x == y // want
+	}
+
+	return eq(req.PathValue("node"), r.NodeName)
+}
+
+type namer interface{ Name() string }
+
+type pathNamer struct{ req *http.Request }
+
+func (p pathNamer) Name() string { return p.req.PathValue("rd") }
+
+// A name returned through an interface method.
+func viaInterface(n namer, snap apiv1.Snapshot) bool {
+	return n.Name() == snap.ResourceName // want
+}
+
+var _ namer = pathNamer{}
+
+// A prefix test between two names.
+func prefixed(req *http.Request, r apiv1.Resource) bool {
+	return strings.HasPrefix(r.NodeName, req.PathValue("node")) // want
+}
+
+// A map literal keyed by a raw name.
+func literalKey(req *http.Request) map[string]bool {
+	return map[string]bool{req.PathValue("node"): true} // want
+}
+
+// More shapes.
+
+// A name appended to a list and searched for.
+func appended(req *http.Request, r apiv1.Resource) bool {
+	var list []string
+
+	list = append(list, req.PathValue("node"))
+
+	return slices.Contains(list, r.NodeName) // want
+}
+
+// A name handed to the function a slices.*Func call runs.
+func viaContainsFunc(snap apiv1.Snapshot, req *http.Request) bool {
+	want := req.PathValue("node")
+
+	return slices.ContainsFunc(snap.Nodes, func(n string) bool {
+		return n == want // want
+	})
+}
+
+// A helper that returns what it is given, called with a name.
+func echo(s string) string { return strings.TrimSpace(s) }
+
+func viaEcho(req *http.Request, r apiv1.Resource) bool {
+	return echo(req.PathValue("node")) == r.NodeName // want
+}
+
+// A closure called in place.
+func inPlace(req *http.Request, r apiv1.Resource) bool {
+	return func() string { return req.PathValue("node") }() == r.NodeName // want
+}
+
+// A name joined into a key.
+func joinedKey(snap apiv1.Snapshot, byNodes map[string]int) int {
+	return byNodes[strings.Join(snap.Nodes, ",")] // want
+}
+
+// A name stored as a map key and ranged back out.
+func viaMapKeys(req *http.Request, r apiv1.Resource) bool {
+	props := map[string]string{}
+	props["Paths/"+naming.Key("x")] = "a"
+	props[req.PathValue("node")] = "b" // want
+
+	for k := range props {
+		head, _, _ := strings.Cut(k, "/")
+		if head == r.NodeName { // want
+			return true
+		}
+	}
+
+	return false
+}
+
 // Shapes it leaves alone.
 func fine(req *http.Request, r apiv1.Resource, dev apiv1.PhysicalDevice, byKey map[string]int) bool {
 	a := req.PathValue("node")
@@ -136,4 +263,34 @@ func fine(req *http.Request, r apiv1.Resource, dev apiv1.PhysicalDevice, byKey m
 		a == "" ||
 		dev.DevicePath == a ||
 		req.PathValue("key") == r.NodeName
+}
+
+// One field off two elements of one listing, by index and in a sort's
+// comparator, is one source.
+func oneListing(rows []apiv1.Resource) bool {
+	slices.SortFunc(rows, func(x, y apiv1.Resource) int {
+		if x.NodeName != y.NodeName {
+			return strings.Compare(x.NodeName, y.NodeName)
+		}
+
+		return 0
+	})
+
+	return len(rows) > 1 && rows[0].NodeName == rows[1].NodeName
+}
+
+// Keys built from keys, constant keys and prefixes, a switch over
+// constants, and a helper given no name return nothing raw.
+func keyedShapes(req *http.Request, r apiv1.Resource, byPair map[string]int) bool {
+	k := byPair[naming.Key(r.NodeName)+"/"+naming.Key(r.Name)] +
+		byPair[fmt.Sprintf("%s/%s", naming.Key(r.NodeName), "pool")]
+
+	switch req.PathValue("node") {
+	case "", "all":
+		return false
+	}
+
+	m := map[string]bool{"fixed": true, naming.Key(r.NodeName): true}
+
+	return k > 0 && m["fixed"] && strings.HasPrefix(r.NodeName, "pvc-") && echo("lit") == r.NodeName
 }
