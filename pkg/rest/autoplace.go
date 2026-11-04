@@ -644,7 +644,7 @@ func (s *Server) resolveAdditionalPlaceCount(ctx context.Context, rdName string,
 	diskful := 0
 
 	for i := range existing {
-		if _, off := disabled[existing[i].NodeName]; off {
+		if _, off := disabled[nodeKey(existing[i].NodeName)]; off {
 			continue
 		}
 

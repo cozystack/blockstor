@@ -35,6 +35,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -209,5 +210,73 @@ func TestAnHTTPCreateCannotForgeTheShownParentNames(t *testing.T) {
 	got, err := st.Resources().Get(ctx, "lower-rd", "lower-node")
 	if err != nil || got.Name != "lower-rd" || got.NodeName != "lower-node" {
 		t.Errorf("replica = %s/%s, %v; want lower-rd/lower-node", got.Name, got.NodeName, err)
+	}
+}
+
+// additional_place_count counts the diskful replicas the definition keeps,
+// and a replica on an EVICTED node registered as Node-1 is not one of them.
+func TestAdditionalPlaceCountSkipsAReplicaOnAnEvictedMixedCaseNode(t *testing.T) {
+	t.Parallel()
+
+	st := k8s.New(fake.NewClientBuilder().WithScheme(crScheme(t)).Build())
+	ctx := t.Context()
+
+	for _, n := range []apiv1.Node{
+		{Name: "Node-1", Type: apiv1.NodeTypeSatellite, Flags: []string{apiv1.NodeFlagEvicted}},
+		{Name: "Node-2", Type: apiv1.NodeTypeSatellite},
+	} {
+		if err := st.Nodes().Create(ctx, &n); err != nil {
+			t.Fatalf("seed node %s: %v", n.Name, err)
+		}
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-add"}); err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	for _, n := range []string{"Node-1", "Node-2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-add", NodeName: n}); err != nil {
+			t.Fatalf("seed replica on %s: %v", n, err)
+		}
+	}
+
+	filter := apiv1.AutoSelectFilter{AdditionalPlaceCount: 1}
+	if err := (&Server{Store: st}).resolveAdditionalPlaceCount(ctx, "pvc-add", &filter); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	if filter.PlaceCount != 2 {
+		t.Errorf("place_count = %d, want 2: one live diskful replica plus one", filter.PlaceCount)
+	}
+}
+
+// The error-report node filter matches a node in any spelling that maps to
+// its CR name, and keeps My_Node and my_node apart.
+func TestErrorReportsFilterByNodeCRName(t *testing.T) {
+	srv := &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     store.NewInMemory(),
+		Client:    newFakeRESTClient(t),
+		Namespace: testRESTNamespace,
+	}
+
+	for _, node := range []string{"Node-1", "My_Node", "my_node"} {
+		srv.RecordErrorReport(ErrorReportEntry{Filename: node + ".log", NodeName: node, ErrorTime: 100})
+	}
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	for query, want := range map[string]string{"node-1": "Node-1.log", "my_node": "my_node.log", "My_Node": "My_Node.log"} {
+		resp := httpGet(t, base+"/v1/error-reports?node="+query)
+
+		var got []ErrorReportEntry
+
+		err := json.NewDecoder(resp.Body).Decode(&got)
+		_ = resp.Body.Close()
+
+		if err != nil || len(got) != 1 || got[0].Filename != want {
+			t.Errorf("?node=%s = %v, %v; want only %s", query, got, err, want)
+		}
 	}
 }

@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // errorReportRingCap caps the in-memory buffer at 1000 entries — the
@@ -219,7 +221,7 @@ func (s *Server) handleErrorReportsList(w http.ResponseWriter, r *http.Request) 
 		filtered := entries[:0]
 
 		for i := range entries {
-			if strings.EqualFold(entries[i].NodeName, node) {
+			if k8s.SameName(entries[i].NodeName, node) {
 				filtered = append(filtered, entries[i])
 			}
 		}
