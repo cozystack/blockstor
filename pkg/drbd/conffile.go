@@ -28,6 +28,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
+
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // Resource is the top-level drbd-9 resource definition. It maps 1:1 to
@@ -630,12 +632,15 @@ func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []Resource
 // regardless of which order the operator stored on the
 // ResourceConnection — keeps the rendered `host a address …;`
 // line consistent with the on-block address we'd otherwise emit.
+//
+// A connection and a host may spell one node differently, so they are
+// matched as the store addresses nodes.
 func lookupPaths(conns []ResourceConnection, a, b string) []ResourcePath {
 	for i := range conns {
 		switch {
-		case conns[i].NodeA == a && conns[i].NodeB == b:
+		case naming.Same(conns[i].NodeA, a) && naming.Same(conns[i].NodeB, b):
 			return conns[i].Paths
-		case conns[i].NodeA == b && conns[i].NodeB == a:
+		case naming.Same(conns[i].NodeA, b) && naming.Same(conns[i].NodeB, a):
 			return swapPathSides(conns[i].Paths)
 		}
 	}
