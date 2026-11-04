@@ -511,3 +511,81 @@ func TestADeletedVolumesMetaPoolDoesNotStopTheLiveOnes(t *testing.T) {
 		t.Errorf("volumes %+v, want volume 1 alone", vds)
 	}
 }
+
+// The layout of a volume marked DELETE does not stop its live neighbour
+// either: neither a meta pool on its DRBD volume nor a ".meta" child that
+// holds it alone.
+func TestADeletedVolumesLayoutDoesNotStopTheLiveOnes(t *testing.T) {
+	t.Parallel()
+
+	twoVolumes := func(d *Dump) *Dump {
+		d.VolumeDefinitions[0].VlmFlags = resourceFlagDelete
+		d.VolumeDefinitions = append(d.VolumeDefinitions, VolumeDefinitionRow{ResourceName: "PVC-S", VlmNr: 1, VlmSize: 1048576, UUID: "vd-s1"})
+
+		return d
+	}
+
+	for name, dump := range map[string]*Dump{
+		"meta pool on the deleted volume": func() *Dump {
+			d := twoVolumes(stackDump(`["DRBD","STORAGE"]`,
+				layerChain(1, "NODE-A", "PVC-S", "DRBD", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")))
+			d.LayerDrbdVolumes = []LayerDrbdVolumeRow{
+				{LayerResourceID: 1, VlmNr: 0, NodeName: "NODE-A", PoolName: "meta"},
+				{LayerResourceID: 1, VlmNr: 1},
+				{LayerResourceID: 10, VlmNr: 0, NodeName: "NODE-B", PoolName: "meta"},
+				{LayerResourceID: 10, VlmNr: 1},
+			}
+
+			return d
+		}(),
+		"meta child holding only the deleted volume": func() *Dump {
+			d := twoVolumes(stackDump(`["DRBD","STORAGE"]`,
+				layerChain(1, "NODE-A", "PVC-S", "DRBD", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")))
+			d.LayerResourceIDs = append(d.LayerResourceIDs, LayerResourceIDRow{
+				LayerResourceID: 30, LayerResourceKind: "STORAGE", LayerResourceParentID: ptr(int32(1)),
+				LayerResourceSuffix: ".meta", NodeName: "NODE-A", ResourceName: "PVC-S",
+			})
+			d.LayerStorageVolumes = append(d.LayerStorageVolumes, LayerStorageVolumeRow{LayerResourceID: 30, VlmNr: 0, NodeName: "NODE-A"})
+
+			return d
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			res := convertTwoReplicas(t, dump)
+			if len(res.ResourceDefinitions) != 1 || len(res.Resources) != 2 {
+				t.Fatalf("converted %d definitions and %d replicas, want the definition and both replicas; warnings %v",
+					len(res.ResourceDefinitions), len(res.Resources), res.Warnings)
+			}
+
+			vds := res.ResourceDefinitions[0].Spec.VolumeDefinitions
+			if len(vds) != 1 || vds[0].VolumeNumber != 1 {
+				t.Errorf("volumes %+v, want volume 1 alone", vds)
+			}
+		})
+	}
+}
+
+// A ".meta" child that holds a live volume still stops the definition.
+func TestAMetaChildHoldingALiveVolumeStillSkips(t *testing.T) {
+	t.Parallel()
+
+	d := stackDump(`["DRBD","STORAGE"]`,
+		layerChain(1, "NODE-A", "PVC-S", "DRBD", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE"))
+	d.VolumeDefinitions[0].VlmFlags = resourceFlagDelete
+	d.VolumeDefinitions = append(d.VolumeDefinitions, VolumeDefinitionRow{ResourceName: "PVC-S", VlmNr: 1, VlmSize: 1048576, UUID: "vd-s1"})
+	d.LayerResourceIDs = append(d.LayerResourceIDs, LayerResourceIDRow{
+		LayerResourceID: 30, LayerResourceKind: "STORAGE", LayerResourceParentID: ptr(int32(1)),
+		LayerResourceSuffix: ".meta", NodeName: "NODE-A", ResourceName: "PVC-S",
+	})
+	d.LayerStorageVolumes = append(d.LayerStorageVolumes,
+		LayerStorageVolumeRow{LayerResourceID: 30, VlmNr: 0, NodeName: "NODE-A"},
+		LayerStorageVolumeRow{LayerResourceID: 30, VlmNr: 1, NodeName: "NODE-A"})
+
+	res := convertTwoReplicas(t, d)
+	if len(res.ResourceDefinitions) != 0 {
+		t.Fatalf("converted %d definitions, want none: volume 1 keeps its metadata on a separate volume; warnings %v",
+			len(res.ResourceDefinitions), res.Warnings)
+	}
+}

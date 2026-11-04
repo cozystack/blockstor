@@ -1307,9 +1307,47 @@ func (c *converter) runsDRBD(row *ResourceDefinitionRow) bool {
 
 // externalMetadataReplica names the node of a replica of rdName that keeps
 // its DRBD metadata on a separate volume, by its ".meta" layer child or by
-// the meta pool on one of its DRBD volumes, or "" when none does. A replica
-// marked DELETE does not convert, so its layout does not count.
+// the meta pool on one of its DRBD volumes, or "" when none does. Only what
+// converts counts: a replica marked DELETE, and a volume marked DELETE, do
+// not. A ".meta" child the dump has no storage rows for still counts, since
+// nothing says which volumes it holds.
 func (c *converter) externalMetadataReplica(rdName string) string {
+	deleted, live := c.deletedReplicaNodes(rdName), c.liveVolumes(rdName)
+
+	byID := map[int32]*LayerResourceIDRow{}
+	metaChildren := map[int32]*LayerResourceIDRow{}
+
+	for i := range c.dump.LayerResourceIDs {
+		lri := &c.dump.LayerResourceIDs[i]
+		if lri.ResourceName != rdName || lri.SnapshotName != "" || deleted[lri.NodeName] {
+			continue
+		}
+
+		if lri.LayerResourceSuffix == drbdMetaSuffix {
+			metaChildren[lri.LayerResourceID] = lri
+
+			continue
+		}
+
+		byID[lri.LayerResourceID] = lri
+	}
+
+	if node := c.liveMetaChild(metaChildren, live); node != "" {
+		return node
+	}
+
+	for i := range c.dump.LayerDrbdVolumes {
+		vol := &c.dump.LayerDrbdVolumes[i]
+		if lri, ok := byID[vol.LayerResourceID]; ok && live[vol.VlmNr] && isExternalMetaPool(vol.PoolName) {
+			return lri.NodeName
+		}
+	}
+
+	return ""
+}
+
+// deletedReplicaNodes is the nodes whose replica of rdName is marked DELETE.
+func (c *converter) deletedReplicaNodes(rdName string) map[string]bool {
 	deleted := map[string]bool{}
 
 	for i := range c.dump.Resources {
@@ -1319,25 +1357,49 @@ func (c *converter) externalMetadataReplica(rdName string) string {
 		}
 	}
 
-	byID := map[int32]*LayerResourceIDRow{}
+	return deleted
+}
 
-	for i := range c.dump.LayerResourceIDs {
-		lri := &c.dump.LayerResourceIDs[i]
-		if lri.ResourceName != rdName || lri.SnapshotName != "" || deleted[lri.NodeName] {
-			continue
+// liveVolumes is the volume numbers of rdName that are not marked DELETE.
+func (c *converter) liveVolumes(rdName string) map[int32]bool {
+	live := map[int32]bool{}
+
+	for i := range c.dump.VolumeDefinitions {
+		vd := &c.dump.VolumeDefinitions[i]
+		if vd.ResourceName == rdName && vd.SnapshotName == "" && vd.VlmFlags&resourceFlagDelete == 0 {
+			live[vd.VlmNr] = true
 		}
-
-		if lri.LayerResourceSuffix == drbdMetaSuffix {
-			return lri.NodeName
-		}
-
-		byID[lri.LayerResourceID] = lri
 	}
 
-	for i := range c.dump.LayerDrbdVolumes {
-		vol := &c.dump.LayerDrbdVolumes[i]
-		if lri, ok := byID[vol.LayerResourceID]; ok && isExternalMetaPool(vol.PoolName) {
-			return lri.NodeName
+	return live
+}
+
+// liveMetaChild names the node of a ".meta" child that holds a volume in
+// live, or that the dump shows no volume for.
+func (c *converter) liveMetaChild(children map[int32]*LayerResourceIDRow, live map[int32]bool) string {
+	if len(children) == 0 {
+		return ""
+	}
+
+	vols := map[int32][]int32{}
+
+	for i := range c.dump.LayerStorageVolumes {
+		row := &c.dump.LayerStorageVolumes[i]
+		if _, ok := children[row.LayerResourceID]; ok {
+			vols[row.LayerResourceID] = append(vols[row.LayerResourceID], row.VlmNr)
+		}
+	}
+
+	ids := make([]int32, 0, len(children))
+	for id := range children {
+		ids = append(ids, id)
+	}
+
+	slices.Sort(ids)
+
+	for _, id := range ids {
+		if len(vols[id]) == 0 || slices.ContainsFunc(vols[id], func(nr int32) bool { return live[nr] }) {
+			return children[id].NodeName
 		}
 	}
 
