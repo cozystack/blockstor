@@ -1292,10 +1292,9 @@ func (c *converter) externalMetadataReason(row *ResourceDefinitionRow) (string, 
 // which stackDisagreement has already found to be one; with neither, the
 // controller pins DRBD over STORAGE.
 func (c *converter) runsDRBD(row *ResourceDefinitionRow) bool {
-	var stack []string
-	if !emptyList(row.LayerStack) {
-		_ = json.Unmarshal([]byte(row.LayerStack), &stack)
-	}
+	// An unreadable column counts as no stack, as everywhere else in the
+	// converter: a partial decode of it says nothing about DRBD.
+	stack, _ := rowLayerStack(row)
 
 	if len(stack) == 0 {
 		for _, onDisk := range c.diskStacks[row.ResourceName] {
@@ -1385,7 +1384,9 @@ func (c *converter) drbdMetaPools(row *ResourceDefinitionRow, node string) []met
 
 	for i := range c.dump.VolumeDefinitions {
 		vd := &c.dump.VolumeDefinitions[i]
-		if vd.ResourceName != rd || vd.SnapshotName != "" {
+		// A volume marked DELETE is not converted, so its metadata
+		// setting does not decide anything for the live ones.
+		if vd.ResourceName != rd || vd.SnapshotName != "" || vd.VlmFlags&resourceFlagDelete != 0 {
 			continue
 		}
 

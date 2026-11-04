@@ -463,3 +463,51 @@ func TestAMetaPoolWithoutDRBDMetadataBehindItConverts(t *testing.T) {
 		})
 	}
 }
+
+// An unreadable layer_stack counts as no stack here too, so the replicas'
+// chains decide: DRBD over STORAGE with internal metadata, and the meta pool
+// property is dropped instead of surviving a partial decode of the column.
+func TestAnUnreadableStackStillDropsTheMetaPool(t *testing.T) {
+	t.Parallel()
+
+	res := convertTwoReplicas(t, withProps(stackDump(`["STORAGE",4]`,
+		layerChain(1, "NODE-A", "PVC-S", "DRBD", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE")),
+		PropsContainerRow{PropsInstance: "/RSC_DFNS/PVC-S", PropKey: "StorPoolNameDrbdMeta", PropValue: "meta"}))
+
+	if len(res.ResourceDefinitions) != 1 || len(res.Resources) != 2 {
+		t.Fatalf("converted %d definitions and %d replicas, want the definition and both replicas; warnings %v",
+			len(res.ResourceDefinitions), len(res.Resources), res.Warnings)
+	}
+
+	rd := res.ResourceDefinitions[0]
+	if _, ok := rd.Spec.Props[storPoolNameDrbdMeta]; ok {
+		t.Errorf("the definition's props carry %s", storPoolNameDrbdMeta)
+	}
+
+	if _, ok := rd.Spec.ExtraProps[storPoolNameDrbdMeta]; ok {
+		t.Errorf("the definition's extra props carry %s", storPoolNameDrbdMeta)
+	}
+}
+
+// A volume marked DELETE is not converted, so its meta pool does not stop the
+// live volumes: the definition converts with the live volume alone.
+func TestADeletedVolumesMetaPoolDoesNotStopTheLiveOnes(t *testing.T) {
+	t.Parallel()
+
+	dump := withProps(stackDump(`["DRBD","STORAGE"]`),
+		PropsContainerRow{PropsInstance: "/VLM_DFNS/PVC-S/0", PropKey: "StorPoolNameDrbdMeta", PropValue: "meta"},
+		PropsContainerRow{PropsInstance: "/VLM_DFNS/PVC-S/1", PropKey: "StorPoolNameDrbdMeta", PropValue: ".internal"})
+	dump.VolumeDefinitions[0].VlmFlags = resourceFlagDelete
+	dump.VolumeDefinitions = append(dump.VolumeDefinitions, VolumeDefinitionRow{ResourceName: "PVC-S", VlmNr: 1, VlmSize: 1048576, UUID: "vd-s1"})
+
+	res := convertTwoReplicas(t, dump)
+	if len(res.ResourceDefinitions) != 1 || len(res.Resources) != 2 {
+		t.Fatalf("converted %d definitions and %d replicas, want the definition and both replicas; warnings %v",
+			len(res.ResourceDefinitions), len(res.Resources), res.Warnings)
+	}
+
+	vds := res.ResourceDefinitions[0].Spec.VolumeDefinitions
+	if len(vds) != 1 || vds[0].VolumeNumber != 1 {
+		t.Errorf("volumes %+v, want volume 1 alone", vds)
+	}
+}
