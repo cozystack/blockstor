@@ -1458,12 +1458,11 @@ func (c *converter) withoutDroppedMetaPool(rdName string, props map[string]strin
 	return out
 }
 
-// isExternalMetaPool says whether a meta pool value names a separate pool:
-// set, and not ".internal", read as LINSTOR reads it (trimmed, any case).
+// isExternalMetaPool says whether a meta pool value names a separate pool,
+// read as LINSTOR v1.33.0 reads it: blank is unset, and ".internal" is matched
+// in any case but untrimmed, so a value with spaces around it is a pool name.
 func isExternalMetaPool(pool string) bool {
-	pool = strings.TrimSpace(pool)
-
-	return pool != "" && !strings.EqualFold(pool, drbdMetaInternal)
+	return strings.TrimSpace(pool) != "" && !strings.EqualFold(pool, drbdMetaInternal)
 }
 
 // The layer suffix and the property LINSTOR marks external DRBD metadata

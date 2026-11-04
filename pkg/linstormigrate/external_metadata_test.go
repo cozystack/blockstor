@@ -143,10 +143,10 @@ func TestAMetaPoolOverInternalMetadataConvertsWithoutIt(t *testing.T) {
 	}
 }
 
-// LINSTOR resolves the meta pool per volume, and reads ".internal" trimmed
-// and in any case. A replica without a chain is external when any of its
-// volumes resolves to a separate pool, and internal when every one asks for
-// internal metadata.
+// LINSTOR resolves the meta pool per volume, and matches ".internal" in any
+// case but untrimmed: spaces around it make it a pool name. A replica without
+// a chain is external when any of its volumes resolves to a separate pool,
+// and internal when every one asks for internal metadata.
 func TestAMetaPoolIsResolvedPerVolumeAsLINSTORReadsIt(t *testing.T) {
 	t.Parallel()
 
@@ -174,11 +174,35 @@ func TestAMetaPoolIsResolvedPerVolumeAsLINSTORReadsIt(t *testing.T) {
 		}
 	})
 
-	t.Run("internal in another case and with spaces", func(t *testing.T) {
+	t.Run("internal in another case", func(t *testing.T) {
+		t.Parallel()
+
+		res := convertTwoReplicas(t, twoVolumes(
+			PropsContainerRow{PropsInstance: "/RSC_DFNS/PVC-S", PropKey: "StorPoolNameDrbdMeta", PropValue: ".INTERNAL"}))
+
+		if len(res.ResourceDefinitions) != 1 || len(res.Resources) != 2 {
+			t.Fatalf("converted %d definitions and %d replicas, want the definition and both replicas; warnings %v",
+				len(res.ResourceDefinitions), len(res.Resources), res.Warnings)
+		}
+	})
+
+	t.Run("internal with spaces around it is a pool name", func(t *testing.T) {
 		t.Parallel()
 
 		res := convertTwoReplicas(t, twoVolumes(
 			PropsContainerRow{PropsInstance: "/RSC_DFNS/PVC-S", PropKey: "StorPoolNameDrbdMeta", PropValue: " .INTERNAL "}))
+
+		if len(res.ResourceDefinitions) != 0 {
+			t.Fatalf("converted %d definitions, want none: LINSTOR reads %q as a pool; warnings %v",
+				len(res.ResourceDefinitions), " .INTERNAL ", res.Warnings)
+		}
+	})
+
+	t.Run("a blank value is unset", func(t *testing.T) {
+		t.Parallel()
+
+		res := convertTwoReplicas(t, twoVolumes(
+			PropsContainerRow{PropsInstance: "/RSC_DFNS/PVC-S", PropKey: "StorPoolNameDrbdMeta", PropValue: "  "}))
 
 		if len(res.ResourceDefinitions) != 1 || len(res.Resources) != 2 {
 			t.Fatalf("converted %d definitions and %d replicas, want the definition and both replicas; warnings %v",
