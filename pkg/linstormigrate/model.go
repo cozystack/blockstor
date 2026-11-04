@@ -206,6 +206,11 @@ type LayerDrbdVolumeDefinitionRow struct {
 type LayerDrbdVolumeRow struct {
 	LayerResourceID int32 `json:"layer_resource_id"`
 	VlmNr           int32 `json:"vlm_nr"`
+	// NodeName and PoolName name the storage pool that holds the
+	// volume's external DRBD metadata; both are empty for internal
+	// metadata.
+	NodeName string `json:"node_name,omitempty"`
+	PoolName string `json:"pool_name,omitempty"`
 }
 
 // LayerStorageVolumeRow is one row of LAYER_STORAGE_VOLUMES — which
