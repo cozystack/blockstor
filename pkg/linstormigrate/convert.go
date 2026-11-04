@@ -1121,8 +1121,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 			rgRef = ""
 		}
 
-		typed, residual, extra := k8sstore.SplitProps(c.props.ResourceDefinition(row.ResourceName))
-		residual = c.withoutDroppedMetaPool(row.ResourceName, residual)
+		typed, residual, extra := k8sstore.SplitProps(c.withoutDroppedMetaPool(row.ResourceName, c.props.ResourceDefinition(row.ResourceName)))
 
 		latch := c.rdInitializedLatch(row.ResourceName)
 
@@ -1436,7 +1435,10 @@ func (c *converter) resourceGroupVolumeProps(rg, vlm string) map[string]string {
 }
 
 // withoutDroppedMetaPool takes StorPoolNameDrbdMeta out of the props of a
-// definition named in metaPoolDropped, or of one of its replicas.
+// definition named in metaPoolDropped, or of one of its replicas. It runs
+// before SplitProps, which routes a non-DRBD key to the residual props and to
+// the overflow map both: the store merges the overflow back into the props on
+// every write, so a copy left there returns with the next property update.
 func (c *converter) withoutDroppedMetaPool(rdName string, props map[string]string) map[string]string {
 	if !c.metaPoolDropped[rdName] {
 		return props
@@ -1841,8 +1843,7 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 
 	c.reportReplicaVolumeFlags(row, replicaName)
 
-	typed, residual, extra := k8sstore.SplitProps(c.props.Resource(row.NodeName, row.ResourceName))
-	residual = c.withoutDroppedMetaPool(row.ResourceName, residual)
+	typed, residual, extra := k8sstore.SplitProps(c.withoutDroppedMetaPool(row.ResourceName, c.props.Resource(row.NodeName, row.ResourceName)))
 
 	resource := crdv1alpha1.Resource{
 		TypeMeta:   typeMeta("Resource"),
