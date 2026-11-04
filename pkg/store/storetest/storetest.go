@@ -510,6 +510,7 @@ func RunSnapshotStore(t *testing.T, newStore Factory) {
 	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
 	// See annotation_contract.go.
 	t.Run("UpdateAnnotationContract", func(t *testing.T) { testSnapshotUpdateAnnotationContract(t, newStore) })
+	t.Run("AnySpellingAddressesOneSnapshot", func(t *testing.T) { testAnySpellingAddressesOneSnapshot(t, newStore) })
 	t.Run("CreateThenGet", func(t *testing.T) {
 		s := newStore(t).Snapshots()
 		ctx := t.Context()
@@ -2325,6 +2326,41 @@ func testAnySpellingAddressesOneReplica(t *testing.T, newStore Factory) {
 
 	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "PVC-X", NodeName: "NODE-1"}); !errors.Is(err, store.ErrAlreadyExists) {
 		t.Errorf("Create PVC-X on NODE-1 over it = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// testAnySpellingAddressesOneSnapshot: a snapshot is addressed by the key of
+// its definition's and its own names joined, which is its CR name in the
+// Kubernetes store. Inside RFC 1123 every spelling of either is one snapshot.
+func testAnySpellingAddressesOneSnapshot(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"}); err != nil {
+		t.Fatalf("Create definition: %v", err)
+	}
+
+	if err := s.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "snap-1", ResourceName: "pvc-x", Nodes: []string{"n1"}}); err != nil {
+		t.Fatalf("Create snapshot: %v", err)
+	}
+
+	if _, err := s.Snapshots().Get(ctx, "PVC-X", "Snap-1"); err != nil {
+		t.Errorf("Get PVC-X/Snap-1 after Create pvc-x/snap-1: %v", err)
+	}
+
+	err := s.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "SNAP-1", ResourceName: "Pvc-X", Nodes: []string{"n1"}})
+	if !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("Create Pvc-X/SNAP-1 over it = %v, want ErrAlreadyExists", err)
+	}
+
+	if err := s.Snapshots().Delete(ctx, "pvc-X", "snap-1"); err != nil {
+		t.Fatalf("Delete pvc-X/snap-1: %v", err)
+	}
+
+	if _, err := s.Snapshots().Get(ctx, "pvc-x", "snap-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get pvc-x/snap-1 after the delete = %v, want ErrNotFound", err)
 	}
 }
 

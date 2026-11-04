@@ -19,6 +19,7 @@ limitations under the License.
 package store_test
 
 import (
+	"errors"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -61,5 +62,46 @@ func TestInMemoryListingsKeepCaseVariantsOutsideRFC1123Apart(t *testing.T) {
 
 	if got, err := s.Resources().ListByDefinition(ctx, "my_res"); err != nil || len(got) != 1 {
 		t.Errorf("my_res lists %d replica(s), %v; want its own one", len(got), err)
+	}
+}
+
+// The in-memory store keys a snapshot, and a replica, exactly as the
+// Kubernetes store names its CR: naming.Key of the definition's and the
+// snapshot's (or node's) names joined as given. Outside RFC 1123 that key is
+// a hash of the whole, so Snap_1 and snap_1 of one definition are two
+// snapshots, and pvc-x/Snap_1 is not found as PVC-X/Snap_1. The conformance
+// suite cannot pin this on both stores: the Snapshot and Resource CRDs want
+// their names to be the two names joined, and a hashed name never is, so the
+// Kubernetes store refuses such a child outright.
+func TestInMemoryChildKeyIsTheCRName(t *testing.T) {
+	t.Parallel()
+
+	s := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"}); err != nil {
+		t.Fatalf("Create definition: %v", err)
+	}
+
+	for _, snap := range []string{"Snap_1", "snap_1"} {
+		if err := s.Snapshots().Create(ctx, &apiv1.Snapshot{Name: snap, ResourceName: "pvc-x", Nodes: []string{"n1"}}); err != nil {
+			t.Errorf("Create %s: %v; want two snapshots", snap, err)
+		}
+	}
+
+	if _, err := s.Snapshots().Get(ctx, "PVC-X", "Snap_1"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get PVC-X/Snap_1 = %v; want ErrNotFound, as the CR name PVC-X.Snap_1 hashes apart", err)
+	}
+
+	if _, err := s.Snapshots().Get(ctx, "pvc-x", "Snap_1"); err != nil {
+		t.Errorf("Get pvc-x/Snap_1: %v", err)
+	}
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: "Node_1"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	if _, err := s.Resources().Get(ctx, "PVC-X", "Node_1"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get PVC-X/Node_1 = %v; want ErrNotFound, as the CR name PVC-X.Node_1 hashes apart", err)
 	}
 }
