@@ -126,6 +126,13 @@ func startServerCustom(t *testing.T, srv *Server) (string, func()) {
 	}
 
 	stop := func() {
+		// Shutdown counts a connection no request has arrived on as idle
+		// only five seconds after it was opened, longer than this helper
+		// waits. The tests' shared client leaves such connections behind:
+		// it dials for a request that another connection then serves, and
+		// pools the new one unused. Closing them first lets Shutdown see
+		// only the requests still being served.
+		http.DefaultClient.CloseIdleConnections()
 		cancel()
 		select {
 		case <-errCh:
