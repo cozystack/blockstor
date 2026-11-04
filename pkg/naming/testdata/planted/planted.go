@@ -250,6 +250,34 @@ func viaMapKeys(req *http.Request, r apiv1.Resource) bool {
 	return false
 }
 
+// A map entry deleted by a raw name.
+func deleted(req *http.Request, byNode map[string]int) {
+	delete(byNode, req.PathValue("node")) // want
+}
+
+// A helper that returns a key, compared with a raw name.
+func keyOf(s string) string { return naming.Key(s) }
+
+func viaKeyHelper(req *http.Request, r apiv1.Resource) bool {
+	return keyOf(r.NodeName) == req.PathValue("node") // want
+}
+
+// A CR's name through its accessor, a key, against a raw name.
+func viaGetName(req *http.Request, obj *crd.ResourceDefinition) bool {
+	return obj.GetName() == req.PathValue("rd") // want
+}
+
+// Half a comparison normalized: a raw name against a key.
+func halfNormalized(snap apiv1.Snapshot, r apiv1.Resource) bool {
+	for _, n := range snap.Nodes {
+		if n == naming.Key(r.NodeName) { // want
+			return true
+		}
+	}
+
+	return false
+}
+
 // Shapes it leaves alone.
 func fine(req *http.Request, r apiv1.Resource, dev apiv1.PhysicalDevice, byKey map[string]int) bool {
 	a := req.PathValue("node")
@@ -289,6 +317,9 @@ func keyedShapes(req *http.Request, r apiv1.Resource, byPair map[string]int) boo
 	}
 
 	m := map[string]bool{"fixed": true, naming.Key(r.NodeName): true}
+	delete(m, naming.Key(req.PathValue("node")))
+	delete(m, "fixed")
 
-	return k > 0 && m["fixed"] && strings.HasPrefix(r.NodeName, "pvc-") && echo("lit") == r.NodeName
+	return k > 0 && m["fixed"] && strings.HasPrefix(r.NodeName, "pvc-") && echo("lit") == r.NodeName &&
+		keyOf(r.NodeName) == naming.Key(req.PathValue("node"))
 }
