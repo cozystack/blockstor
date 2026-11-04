@@ -144,6 +144,8 @@ func TestParseMetadataUUIDsRefusesWhatItCannotRead(t *testing.T) {
 		"empty":              "",
 		"current without 0x": "version \"v09\";\ncurrent-uuid 6E3A5D0B2C1F4A96;\n",
 		"zero current":       "version \"v09\";\ncurrent-uuid 0x0000000000000000;\n",
+		"short current":      "version \"v09\";\ncurrent-uuid 0xABCD;\n",
+		"long current":       "version \"v09\";\ncurrent-uuid 0x16E3A5D0B2C1F4A96;\n",
 		"unreadable current next to a bitmap UUID": "version \"v09\";\ncurrent-uuid 6E3A5D0B2C1F4A96;\n" +
 			"peer[1] {\n    bitmap-uuid 0x1234567890ABCDEF;\n}\n",
 		"v08 zero current next to a bitmap UUID": "version \"v08\";\nuuid {\n" +

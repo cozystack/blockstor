@@ -999,7 +999,10 @@ func mustRecordedGIs(t *testing.T, rec *Reconciler, rdName string, vol int32) []
 func TestOnlyHexGenerationsAreRecorded(t *testing.T) {
 	rec, _, _, _, _ := uncleanFixture(t) //nolint:dogsled // only the reconciler is needed
 
-	for _, generation := range []string{"0000000000000000", "not-a-gi", "0x" + uncleanReportedGI, "6E3A 5D0B"} {
+	for _, generation := range []string{
+		"0000000000000000", "not-a-gi", "0x" + uncleanReportedGI, "6E3A 5D0B",
+		"ABCD", "1" + uncleanReportedGI, uncleanReportedGI[1:],
+	} {
 		rec.RecordObservedGI("pvc-unclean", 0, generation)
 	}
 
@@ -1011,6 +1014,19 @@ func TestOnlyHexGenerationsAreRecorded(t *testing.T) {
 
 	if got := mustRecordedGIs(t, rec, "pvc-unclean", 0); !slices.Equal(got, []string{uncleanReportedGI}) {
 		t.Fatalf("recorded %v, want [%s]", got, uncleanReportedGI)
+	}
+}
+
+// DRBD zero-pads a GI to 16 digits, so a leading zero is part of one.
+func TestAZeroPaddedGenerationIsRecorded(t *testing.T) {
+	rec, _, _, _, _ := uncleanFixture(t) //nolint:dogsled // only the reconciler is needed
+
+	const padded = "006E3A5D0B2C1F4A"
+
+	rec.RecordObservedGI("pvc-unclean", 0, padded)
+
+	if got := mustRecordedGIs(t, rec, "pvc-unclean", 0); !slices.Equal(got, []string{padded}) {
+		t.Fatalf("recorded %v, want [%s]", got, padded)
 	}
 }
 
@@ -1026,6 +1042,8 @@ func TestUnreadableGIRecordFailsClosed(t *testing.T) {
 			"volume not a number": "zero " + uncleanReportedGI + "\n",
 			"GI not hex":          "0 not-a-gi\n",
 			"zero GI":             "0 0000000000000000\n",
+			"GI too short":        "0 ABCD\n",
+			"GI too long":         "0 1" + uncleanReportedGI + "\n",
 		} {
 			t.Run(path+"/"+damage, func(t *testing.T) {
 				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)

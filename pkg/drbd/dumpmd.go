@@ -185,11 +185,11 @@ func appendUUIDStatements(out []string, text string) []string {
 	return out
 }
 
-// uuidStatement answers the UUID a statement is, when it is a bare non-zero
-// hex UUID.
+// uuidStatement answers the UUID a statement is, when it is a bare generation
+// UUID (IsGenerationUUID).
 func uuidStatement(statement string) (string, bool) {
 	digits, ok := strings.CutPrefix(strings.TrimSpace(statement), "0x")
-	if !ok || !isHex(digits) || strings.Trim(digits, "0") == "" {
+	if !ok || !IsGenerationUUID(digits) {
 		return "", false
 	}
 
@@ -208,11 +208,16 @@ func firstStatement(text string) (string, bool) {
 	return "", false
 }
 
+// generationUUIDDigits is how many hex digits drbdsetup and drbdmeta print a
+// generation UUID with: a 64-bit value as %016llX, zero-padded.
+const generationUUIDDigits = 16
+
 // IsGenerationUUID says whether s is a generation UUID as drbdsetup and
-// drbdmeta print it without the 0x prefix: non-empty hex, not all zero.
-// Zero is DRBD's "no generation", which identifies nothing.
+// drbdmeta print it without the 0x prefix: 16 hex digits, not all zero.
+// Zero is DRBD's "no generation", which identifies nothing, and a value of
+// another length is not one the tools print, so it is damage, not a GI.
 func IsGenerationUUID(s string) bool {
-	return isHex(s) && strings.Trim(s, "0") != ""
+	return len(s) == generationUUIDDigits && isHex(s) && strings.Trim(s, "0") != ""
 }
 
 func isHex(digits string) bool {
