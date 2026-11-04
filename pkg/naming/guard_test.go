@@ -171,6 +171,22 @@ func sameShape(a, b ast.Expr) bool {
 	return oka && okb && fmt.Sprint(ia.X) == fmt.Sprint(ib.X)
 }
 
+// isCRAddress reports whether a composite literal of typ names a Kubernetes
+// object by its metadata.name.
+func isCRAddress(typ ast.Expr) bool {
+	sel, ok := typ.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+
+	switch sel.Sel.Name {
+	case "ObjectKey", "NamespacedName", "ObjectMeta":
+		return true
+	}
+
+	return false
+}
+
 // isComparatorPair reports whether two names are the parameter pair a sort
 // comparator is written with.
 func isComparatorPair(a, b string) bool {
@@ -277,6 +293,24 @@ func violations(t *testing.T, root string) []string {
 					}
 
 					out = append(out, rel+": "+code(e))
+				case *ast.CompositeLit:
+					// A CR addressed by a reference, as in
+					// client.ObjectKey{Name: res.Spec.NodeName}, is a CR name
+					// taken from a spelling.
+					if !isCRAddress(e.Type) {
+						return true
+					}
+
+					for _, elt := range e.Elts {
+						kv, ok := elt.(*ast.KeyValueExpr)
+						if !ok {
+							continue
+						}
+
+						if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "Name" && isRef(kv.Value) && !isKeyed(kv.Value, keyed) {
+							out = append(out, rel+": "+code(kv))
+						}
+					}
 				case *ast.IndexExpr:
 					// A key built by joining a name with literal text is an
 					// option or a label, written and read the same way.
@@ -361,6 +395,9 @@ func allowed() map[string]string {
 			"keyed by the kernel's peer name, written and read from kernel events",
 		"pkg/satellite/controllers/physicaldevice_discovery.go: existing.Labels[blockstoriov1alpha1.PhysicalDeviceLabelNode] != p.NodeName": "" +
 			"keeps the label's stored spelling in step with the device row it labels",
+		"internal/controller/autosnapshot_controller.go: Name: rd.Name + \".\" + snapName": "" +
+			"the Snapshot CRD's CEL rule wants metadata.name to be spec.resourceDefinitionName + \".\" + " +
+			"spec.snapshotName, and both are stored keys already",
 		"pkg/store/clone_snapshot.go: out.InUse[snaps[i].Name]": "" +
 			"keys are shown in the operator's message; filled and read from one listing",
 	}
@@ -421,6 +458,10 @@ func keyed(m map[string]int, r replica) int { return m[r.ResourceName] }
 
 func contains(nodes []string, r replica) bool { return slices.Contains(nodes, r.NodeName) }
 
+func addressed(r replica) client.ObjectKey { return client.ObjectKey{Name: r.NodeName} }
+
+func wire(r replica) api.Resource { return api.Resource{Name: r.NodeName} }
+
 func fine(m map[string]int, r replica, node string) bool {
 	k := naming.Key(r.NodeName)
 
@@ -435,6 +476,7 @@ func fine(m map[string]int, r replica, node string) bool {
 	got := violations(t, root)
 
 	want := []string{
+		"pkg/planted/planted.go: Name: r.NodeName",
 		"pkg/planted/planted.go: m[r.ResourceName]",
 		"pkg/planted/planted.go: r.NodeName == node",
 		"pkg/planted/planted.go: slices.Contains(nodes, r.NodeName)",

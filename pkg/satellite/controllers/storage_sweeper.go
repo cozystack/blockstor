@@ -342,7 +342,7 @@ func (s *StorageOrphanSweeperRunnable) reapIfOrphan(
 func (s *StorageOrphanSweeperRunnable) shouldSkip(ctx context.Context) (bool, error) {
 	var node blockstoriov1alpha1.Node
 
-	err := s.Client.Get(ctx, client.ObjectKey{Name: s.NodeName}, &node)
+	err := s.Client.Get(ctx, client.ObjectKey{Name: naming.Key(s.NodeName)}, &node)
 	if err != nil {
 		return false, errors.Wrap(err, "get Node")
 	}
@@ -417,7 +417,7 @@ func (s *StorageOrphanSweeperRunnable) listOwnedVolumeRefs(ctx context.Context) 
 func (s *StorageOrphanSweeperRunnable) lookupRDVolumes(ctx context.Context, rdName string) []int32 {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := s.Client.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	err := s.Client.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
 	if err != nil {
 		return nil
 	}

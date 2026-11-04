@@ -526,7 +526,7 @@ func (r *ResourceReconciler) stripLegacyFinalizer(ctx context.Context, target *b
 func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blockstoriov1alpha1.ResourceDefinition, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: name}, &rd)
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(name)}, &rd)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil //nolint:nilnil // intentional: caller treats nil RD as no-volume push
@@ -795,7 +795,7 @@ func (r *ResourceReconciler) allocateResourceSpecFields(ctx context.Context, tar
 func (r *ResourceReconciler) rdInitializedForResource(ctx context.Context, rdName string) (bool, bool, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.apiReader().Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	err := r.apiReader().Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return false, false, nil
@@ -1387,7 +1387,7 @@ func (r *ResourceReconciler) patchRDInitialized(ctx context.Context, rdName stri
 			Kind:       resourceDefinitionKindName,
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
-		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		ObjectMeta: metav1.ObjectMeta{Name: naming.Key(rdName)},
 	}
 
 	body := map[string]any{patchKeySpec: map[string]any{"initialized": true}}
@@ -1466,7 +1466,7 @@ func (r *ResourceReconciler) ensureRDVolumeMinors(ctx context.Context, target *b
 
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := reader.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	err := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// RD absent (unit-test fast path / rd-delete in flight).
@@ -1505,7 +1505,7 @@ func (r *ResourceReconciler) ensureRDVolumeMinors(ctx context.Context, target *b
 			// return whatever it stamped — the next reconcile observes
 			// the committed values uniformly.
 			var fresh blockstoriov1alpha1.ResourceDefinition
-			if gerr := reader.Get(ctx, client.ObjectKey{Name: rdName}, &fresh); gerr == nil {
+			if gerr := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &fresh); gerr == nil {
 				return false, vol0MinorOf(&fresh), nil
 			}
 		}
@@ -1689,7 +1689,7 @@ func (r *ResourceReconciler) patchRDVolumeMinors(ctx context.Context, rd *blocks
 			Kind:       resourceDefinitionKindName,
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
-		ObjectMeta: metav1.ObjectMeta{Name: rd.Name},
+		ObjectMeta: metav1.ObjectMeta{Name: naming.Key(rd.Name)},
 	}
 
 	return r.Patch(ctx, patchTarget, client.RawPatch(types.MergePatchType, patchBytes))
@@ -1728,7 +1728,7 @@ func (r *ResourceReconciler) allocatePortForNode(ctx context.Context, target *bl
 // seed. Returns nil when the RD is absent or sets no preference.
 func (r *ResourceReconciler) rdPreferredPort(ctx context.Context, rdName string) *int32 {
 	var rd blockstoriov1alpha1.ResourceDefinition
-	if err := r.apiReader().Get(ctx, client.ObjectKey{Name: rdName}, &rd); err != nil {
+	if err := r.apiReader().Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd); err != nil {
 		return nil
 	}
 
@@ -1970,7 +1970,7 @@ func (r *ResourceReconciler) nodeRange(
 	defLow, defHigh int32,
 ) (int32, int32, error) {
 	var node blockstoriov1alpha1.Node
-	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: naming.Key(nodeName)}, &node); err != nil {
 		if errors.IsNotFound(err) {
 			return defLow, defHigh, nil
 		}

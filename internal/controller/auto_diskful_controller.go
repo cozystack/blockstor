@@ -376,7 +376,7 @@ func (r *AutoDiskfulReconciler) stampDeadlineViaCRD(ctx context.Context, rdName 
 	}
 
 	var crd blockstoriov1alpha1.ResourceDefinition
-	if err := r.Get(ctx, client.ObjectKey{Name: rdName}, &crd); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &crd); err != nil {
 		return false
 	}
 
@@ -415,7 +415,7 @@ func (r *AutoDiskfulReconciler) stripDeadlineViaCRD(ctx context.Context, rdName 
 	}
 
 	var crd blockstoriov1alpha1.ResourceDefinition
-	if err := r.Get(ctx, client.ObjectKey{Name: rdName}, &crd); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &crd); err != nil {
 		return false
 	}
 

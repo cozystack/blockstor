@@ -572,7 +572,7 @@ func (s *OrphanSweeperRunnable) callSetupDown(ctx context.Context, resource stri
 func (s *OrphanSweeperRunnable) shouldSkip(ctx context.Context) (bool, error) {
 	var node blockstoriov1alpha1.Node
 
-	err := s.Client.Get(ctx, client.ObjectKey{Name: s.NodeName}, &node)
+	err := s.Client.Get(ctx, client.ObjectKey{Name: naming.Key(s.NodeName)}, &node)
 	if err != nil {
 		return false, errors.Wrap(err, "get Node")
 	}

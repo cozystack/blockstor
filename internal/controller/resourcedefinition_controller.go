@@ -940,7 +940,7 @@ func (r *ResourceDefinitionReconciler) rollbackWitnessIfRDGone(ctx context.Conte
 
 	var fresh blockstoriov1alpha1.ResourceDefinition
 
-	err := r.APIReader.Get(ctx, client.ObjectKey{Name: rdName}, &fresh)
+	err := r.APIReader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &fresh)
 	if err == nil && fresh.DeletionTimestamp.IsZero() {
 		// RD is still live and not mid-delete; witness is valid.
 		return
@@ -1110,7 +1110,7 @@ func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blocks
 		}
 
 		// Refetch and retry.
-		err = r.Get(ctx, client.ObjectKey{Name: rd.Name}, rd)
+		err = r.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Name)}, rd)
 		if err != nil {
 			return err
 		}

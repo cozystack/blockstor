@@ -151,3 +151,26 @@ func TestTheDrainTargetSkipsADrainingNodeInAnySpelling(t *testing.T) {
 		t.Errorf("drain target %d, want 2: the evacuated replica and the one on n3, not the one on LOST N2", got)
 	}
 }
+
+// A replica row written before the store kept CR names in spec may name its
+// definition Pvc-Mix; the reconciler still finds the definition, stored as
+// pvc-mix, instead of reading it as missing.
+func TestTheResourceReconcilerFindsADefinitionInAnySpelling(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(&blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix"}}).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+
+	rd, err := rec.LookupRD(context.Background(), "Pvc-Mix")
+	if err != nil {
+		t.Fatalf("LookupRD: %v", err)
+	}
+
+	if rd == nil || rd.Name != "pvc-mix" {
+		t.Errorf("LookupRD(Pvc-Mix) = %v, want the definition pvc-mix", rd)
+	}
+}
