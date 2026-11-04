@@ -32,6 +32,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -80,7 +81,7 @@ func crdName(node, pool string) string {
 // replica's spec carries the node's CR name), so the node is compared the
 // way the store addresses it: Node-1 and node-1 are one node.
 func poolIs(crd *crdv1alpha1.StoragePool, node, pool string) bool {
-	return crd.Spec.PoolName == pool && SameName(crd.Spec.NodeName, node)
+	return crd.Spec.PoolName == pool && naming.Same(crd.Spec.NodeName, node)
 }
 
 // List returns every StoragePool CRD as a wire-shape value, sorted by

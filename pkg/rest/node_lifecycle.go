@@ -659,13 +659,3 @@ func removeFlag(flag string) func([]string) []string {
 		return out
 	}
 }
-
-// nodeKey is the key a node takes in a set built from wire rows: its CR name,
-// the way the store addresses it. A replica shows its node as it was
-// registered, Node-1, a satellite may report itself as node-1 and a status
-// entry may carry the CR name itself; all three are one node. Two case
-// variants of a name outside RFC 1123, My_Node and my_node, hash to two CR
-// names and stay two nodes.
-func nodeKey(name string) string {
-	return naming.Key(name)
-}

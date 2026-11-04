@@ -337,7 +337,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if sameDefinition(resList.Items[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
+		if naming.Same(resList.Items[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			peers = append(peers, resList.Items[i])
 		}
 	}
@@ -484,7 +484,7 @@ func (r *ResourceReconciler) firstAvailablePool(ctx context.Context, nodeName st
 	}
 
 	for i := range pools {
-		if !sameNode(pools[i].NodeName, nodeName) {
+		if !naming.Same(pools[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -1089,7 +1089,7 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 	candidates := make([]blockstoriov1alpha1.Resource, 0, len(peers))
 
 	for i := range peers {
-		if peers[i].Name == targetName {
+		if naming.Same(peers[i].Name, targetName) {
 			continue
 		}
 
@@ -1171,7 +1171,7 @@ func anyProvenDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targe
 
 func scanDataBearingDiskfulPeers(peers []blockstoriov1alpha1.Resource, targetName string, requireObservedGI bool) bool {
 	for i := range peers {
-		if peers[i].Name == targetName {
+		if naming.Same(peers[i].Name, targetName) {
 			continue
 		}
 
@@ -1767,11 +1767,11 @@ func (r *ResourceReconciler) hostingNodesForRD(ctx context.Context, rdName strin
 		}
 
 		node := list.Items[i].Spec.NodeName
-		if seen[node] {
+		if seen[naming.Key(node)] {
 			continue
 		}
 
-		seen[node] = true
+		seen[naming.Key(node)] = true
 		out = append(out, node)
 	}
 
@@ -1857,7 +1857,7 @@ func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, sel
 
 	for i := range resList.Items {
 		res := &resList.Items[i]
-		if !sameNode(res.Spec.NodeName, nodeName) || res.Name == selfName {
+		if !naming.Same(res.Spec.NodeName, nodeName) || res.Name == selfName {
 			continue
 		}
 
@@ -1891,7 +1891,7 @@ func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD stri
 
 	for i := range rdList.Items {
 		rd := &rdList.Items[i]
-		if rd.Name == selfRD {
+		if naming.Same(rd.Name, selfRD) {
 			continue
 		}
 
@@ -2216,7 +2216,7 @@ func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *bl
 			continue
 		}
 
-		if !sameDefinition(res.Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
+		if !naming.Same(res.Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			continue
 		}
 
@@ -2285,7 +2285,7 @@ func (r *ResourceReconciler) requestsForRD(ctx context.Context, rdName, excludeN
 	out := make([]reconcile.Request, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if !sameDefinition(resList.Items[i].Spec.ResourceDefinitionName, rdName) {
+		if !naming.Same(resList.Items[i].Spec.ResourceDefinitionName, rdName) {
 			continue
 		}
 

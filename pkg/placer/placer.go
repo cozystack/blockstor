@@ -403,7 +403,7 @@ func countDiskfulReplicas(existing []apiv1.Resource, disabled map[string]struct{
 	count := 0
 
 	for i := range existing {
-		if _, off := disabled[nodeKey(existing[i].NodeName)]; off {
+		if _, off := disabled[naming.Key(existing[i].NodeName)]; off {
 			continue
 		}
 
@@ -443,15 +443,6 @@ func (p *Placer) placeDiskful(ctx context.Context, rdName string, state *state, 
 	return placed, nil
 }
 
-// nodeKey is the key a node takes in the placer's node sets and maps.
-// Replicas, pools and nodes all come from the wire, and a replica shows its
-// node as it was registered, Node-1, while a pool keeps the spelling it was
-// created with, node-1. Both map to the node's CR name, which is how the
-// store addresses the node, so they are one key.
-func nodeKey(name string) string {
-	return naming.Key(name)
-}
-
 // placeDisklessOnRemaining ensures every healthy node not already
 // hosting a replica gets a DISKLESS one. Upstream LINSTOR uses this
 // for "cluster-wide attachable" volumes — any consumer Pod can mount
@@ -462,7 +453,7 @@ func nodeKey(name string) string {
 // met.
 func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, state *state) error {
 	for nodeName, hostProps := range state.nodes {
-		if _, busy := state.taken[nodeKey(nodeName)]; busy {
+		if _, busy := state.taken[naming.Key(nodeName)]; busy {
 			continue
 		}
 
@@ -479,7 +470,7 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 			return errors.Wrap(err, "create diskless witness")
 		}
 
-		state.taken[nodeKey(nodeName)] = struct{}{}
+		state.taken[naming.Key(nodeName)] = struct{}{}
 	}
 
 	return nil
@@ -559,12 +550,12 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		// reject it the way a real diskful peer is rejected). Diskful
 		// replicas still claim the node via `taken` below.
 		if slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
-			s.upgradeable[nodeKey(existing[i].NodeName)] = existing[i].Props[storPoolNameProp]
+			s.upgradeable[naming.Key(existing[i].NodeName)] = existing[i].Props[storPoolNameProp]
 
 			continue
 		}
 
-		s.taken[nodeKey(existing[i].NodeName)] = struct{}{}
+		s.taken[naming.Key(existing[i].NodeName)] = struct{}{}
 
 		// Seed XReplicasOnDifferentMap buckets from this diskful
 		// replica. DISKLESS witnesses (handled by the continue above)
@@ -572,7 +563,7 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		// attachments and upstream LINSTOR doesn't count them toward
 		// x-replicas either (mirrors place_count's diskful-only
 		// semantic).
-		nodeProps := nodes[nodeKey(existing[i].NodeName)]
+		nodeProps := nodes[naming.Key(existing[i].NodeName)]
 		for key := range filter.XReplicasOnDifferentMap {
 			s.xBuckets[xBucketKey(key, nodeProps)]++
 		}
@@ -616,11 +607,11 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 // Returns (nil, false) on rejection so the caller stays a single
 // if-not-ok-return.
 func (s *state) candidateNodeProps(pool *apiv1.StoragePool) (map[string]string, bool) {
-	if _, busy := s.taken[nodeKey(pool.NodeName)]; busy {
+	if _, busy := s.taken[naming.Key(pool.NodeName)]; busy {
 		return nil, false
 	}
 
-	nodeProps := s.nodes[nodeKey(pool.NodeName)]
+	nodeProps := s.nodes[naming.Key(pool.NodeName)]
 
 	if !matchesTuple(nodeProps, s.filter.ReplicasOnSame, s.sameTuple) {
 		return nil, false
@@ -726,7 +717,7 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 	// the chosen StorPoolName, the exact transition the explicit
 	// `r c <node> --storage-pool` toggle-disk path performs via
 	// pkg/rest.promoteDisklessReplica.
-	if _, isWitness := s.upgradeable[nodeKey(pool.NodeName)]; isWitness {
+	if _, isWitness := s.upgradeable[naming.Key(pool.NodeName)]; isWitness {
 		err := s.promoteWitness(ctx, st, rdName, pool)
 		if err != nil {
 			return false, err
@@ -744,8 +735,8 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		}
 	}
 
-	s.taken[nodeKey(pool.NodeName)] = struct{}{}
-	delete(s.upgradeable, nodeKey(pool.NodeName))
+	s.taken[naming.Key(pool.NodeName)] = struct{}{}
+	delete(s.upgradeable, naming.Key(pool.NodeName))
 
 	if s.sameTuple == nil && len(s.filter.ReplicasOnSame) > 0 {
 		s.sameTuple = lookupKeys(nodeProps, s.filter.ReplicasOnSame)
@@ -884,18 +875,18 @@ func (p *Placer) applyNotPlaceWith(ctx context.Context, rdName string, filter *a
 	for i := range all {
 		// Skip resources of the RD being placed — otherwise the first
 		// replica we land locks every subsequent placement out.
-		if all[i].Name == rdName {
+		if naming.Same(all[i].Name, rdName) {
 			continue
 		}
 
 		if slices.Contains(filter.NotPlaceWithRsc, all[i].Name) {
-			excluded[nodeKey(all[i].NodeName)] = struct{}{}
+			excluded[naming.Key(all[i].NodeName)] = struct{}{}
 
 			continue
 		}
 
 		if pattern != nil && pattern.MatchString(all[i].Name) {
-			excluded[nodeKey(all[i].NodeName)] = struct{}{}
+			excluded[naming.Key(all[i].NodeName)] = struct{}{}
 		}
 	}
 
@@ -906,7 +897,7 @@ func (p *Placer) applyNotPlaceWith(ctx context.Context, rdName string, filter *a
 	out := candidates[:0:0]
 
 	for i := range candidates {
-		if _, blocked := excluded[nodeKey(candidates[i].NodeName)]; blocked {
+		if _, blocked := excluded[naming.Key(candidates[i].NodeName)]; blocked {
 			continue
 		}
 
@@ -1148,7 +1139,7 @@ func (p *Placer) resourcesPerNode(ctx context.Context) (map[string]int, error) {
 
 	out := make(map[string]int, len(all))
 	for i := range all {
-		out[all[i].NodeName]++
+		out[naming.Key(all[i].NodeName)]++
 	}
 
 	return out, nil
@@ -1210,7 +1201,7 @@ func composite(pool *apiv1.StoragePool, w weights, rscPerNode map[string]int, ma
 	}
 
 	if w.minRscCount > 0 {
-		score += w.minRscCount * (1.0 / float64(1+rscPerNode[pool.NodeName]))
+		score += w.minRscCount * (1.0 / float64(1+rscPerNode[naming.Key(pool.NodeName)]))
 	}
 
 	if w.maxThroughput > 0 && maxThroughput > 0 {
@@ -1277,7 +1268,7 @@ func matchesPoolFilter(pool *apiv1.StoragePool, filter *apiv1.AutoSelectFilter, 
 		return false
 	}
 
-	if _, off := disabled[nodeKey(pool.NodeName)]; off {
+	if _, off := disabled[naming.Key(pool.NodeName)]; off {
 		return false
 	}
 
@@ -1290,15 +1281,15 @@ func matchesPoolFilter(pool *apiv1.StoragePool, filter *apiv1.AutoSelectFilter, 
 		return false
 	}
 
-	if filter.StoragePool != "" && pool.StoragePoolName != filter.StoragePool {
+	if filter.StoragePool != "" && !naming.Same(pool.StoragePoolName, filter.StoragePool) {
 		return false
 	}
 
-	if len(filter.StoragePoolList) > 0 && !slices.Contains(filter.StoragePoolList, pool.StoragePoolName) {
+	if len(filter.StoragePoolList) > 0 && !slices.ContainsFunc(filter.StoragePoolList, func(n string) bool { return naming.Same(n, pool.StoragePoolName) }) {
 		return false
 	}
 
-	if len(filter.NodeNameList) > 0 && !slices.ContainsFunc(filter.NodeNameList, func(n string) bool { return nodeKey(n) == nodeKey(pool.NodeName) }) {
+	if len(filter.NodeNameList) > 0 && !slices.ContainsFunc(filter.NodeNameList, func(n string) bool { return naming.Key(n) == naming.Key(pool.NodeName) }) {
 		return false
 	}
 
@@ -1353,7 +1344,7 @@ func (p *Placer) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 	for i := range nodes {
 		for _, f := range nodes[i].Flags {
 			if f == apiv1.NodeFlagEvicted || f == apiv1.NodeFlagLost {
-				out[nodeKey(nodes[i].Name)] = struct{}{}
+				out[naming.Key(nodes[i].Name)] = struct{}{}
 
 				break
 			}
@@ -1396,7 +1387,7 @@ func (p *Placer) autoplaceExcludedNodes(ctx context.Context, disabled map[string
 
 		v, perr := strconv.ParseBool(raw)
 		if perr == nil && !v {
-			out[nodeKey(nodes[i].Name)] = struct{}{}
+			out[naming.Key(nodes[i].Name)] = struct{}{}
 		}
 	}
 
@@ -1411,7 +1402,7 @@ func (p *Placer) nodesByName(ctx context.Context) (map[string]map[string]string,
 
 	out := make(map[string]map[string]string, len(list))
 	for i := range list {
-		out[nodeKey(list[i].Name)] = list[i].Props
+		out[naming.Key(list[i].Name)] = list[i].Props
 	}
 
 	return out, nil
@@ -1424,7 +1415,7 @@ func topologyTuple(existing []apiv1.Resource, nodes map[string]map[string]string
 		return nil
 	}
 
-	return lookupKeys(nodes[nodeKey(existing[0].NodeName)], keys)
+	return lookupKeys(nodes[naming.Key(existing[0].NodeName)], keys)
 }
 
 func topologySeen(existing []apiv1.Resource, nodes map[string]map[string]string, keys []string) map[string]struct{} {
@@ -1441,7 +1432,7 @@ func topologySeen(existing []apiv1.Resource, nodes map[string]map[string]string,
 		k := spec
 
 		for i := range existing {
-			value := nodes[nodeKey(existing[i].NodeName)][auxKey(k)]
+			value := nodes[naming.Key(existing[i].NodeName)][auxKey(k)]
 			out[k+"="+value] = struct{}{}
 		}
 	}
@@ -1579,7 +1570,7 @@ func partitionByExclusion(candidates []apiv1.StoragePool, nodes map[string]map[s
 
 	for i := range candidates {
 		pool := candidates[i]
-		nodeProps := nodes[nodeKey(pool.NodeName)]
+		nodeProps := nodes[naming.Key(pool.NodeName)]
 
 		if matchesAnyExcludedPair(nodeProps, keys) {
 			lastResort = append(lastResort, pool)
@@ -1636,7 +1627,7 @@ func filterSamePinned(candidates []apiv1.StoragePool, nodes map[string]map[strin
 	out := candidates[:0:0]
 
 	for i := range candidates {
-		nodeProps := nodes[nodeKey(candidates[i].NodeName)]
+		nodeProps := nodes[naming.Key(candidates[i].NodeName)]
 
 		if matchesAllSamePins(nodeProps, keys) {
 			out = append(out, candidates[i])
@@ -1689,7 +1680,7 @@ func pickSameGroup(candidates []apiv1.StoragePool, nodes map[string]map[string]s
 
 	for i := range candidates {
 		pool := candidates[i]
-		tuple := lookupKeys(nodes[nodeKey(pool.NodeName)], keys)
+		tuple := lookupKeys(nodes[naming.Key(pool.NodeName)], keys)
 		key := tupleKey(tuple)
 
 		grp, ok := byKey[key]
@@ -1699,7 +1690,7 @@ func pickSameGroup(candidates []apiv1.StoragePool, nodes map[string]map[string]s
 		}
 
 		grp.pools = append(grp.pools, pool)
-		grp.seen[nodeKey(pool.NodeName)] = struct{}{}
+		grp.seen[naming.Key(pool.NodeName)] = struct{}{}
 		grp.free += pool.FreeCapacity
 	}
 

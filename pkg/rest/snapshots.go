@@ -178,11 +178,11 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 	filtered := make([]apiv1.Snapshot, 0, len(snaps))
 
 	for i := range snaps {
-		if !matchAnyFold(rdFilter, snaps[i].ResourceName) {
+		if !matchAnyName(rdFilter, snaps[i].ResourceName) {
 			continue
 		}
 
-		if !matchAnyFold(nameFilter, snaps[i].Name) {
+		if !matchAnyName(nameFilter, snaps[i].Name) {
 			continue
 		}
 
@@ -368,7 +368,7 @@ func (s *Server) stampSnapshotSuccessful(ctx context.Context, snaps []apiv1.Snap
 			continue
 		}
 
-		diskful, ok := diskfulByRD[snap.ResourceName]
+		diskful, ok := diskfulByRD[naming.Key(snap.ResourceName)]
 		if !ok {
 			built, err := s.diskfulPeerSet(ctx, snap.ResourceName)
 			if err != nil {
@@ -376,7 +376,7 @@ func (s *Server) stampSnapshotSuccessful(ctx context.Context, snaps []apiv1.Snap
 			}
 
 			diskful = built
-			diskfulByRD[snap.ResourceName] = diskful
+			diskfulByRD[naming.Key(snap.ResourceName)] = diskful
 		}
 
 		if isSnapshotSuccessful(snap, diskful) {
@@ -447,11 +447,11 @@ func isSnapshotSuccessful(snap *apiv1.Snapshot, diskful map[string]struct{}) boo
 			continue
 		}
 
-		reported[nodeKey(entry.NodeName)] = struct{}{}
+		reported[naming.Key(entry.NodeName)] = struct{}{}
 	}
 
 	for node := range denominator {
-		if _, ok := reported[node]; !ok {
+		if _, ok := reported[naming.Key(node)]; !ok {
 			return false
 		}
 	}
@@ -471,8 +471,8 @@ func successDenominator(snap *apiv1.Snapshot, diskful map[string]struct{}) map[s
 	out := make(map[string]struct{}, len(snap.Nodes))
 
 	for _, node := range snap.Nodes {
-		if _, ok := diskful[nodeKey(node)]; ok {
-			out[nodeKey(node)] = struct{}{}
+		if _, ok := diskful[naming.Key(node)]; ok {
+			out[naming.Key(node)] = struct{}{}
 		}
 	}
 
@@ -517,7 +517,7 @@ func (s *Server) diskfulPeerSet(ctx context.Context, rdName string) (map[string]
 			continue
 		}
 
-		out[nodeKey(resList[i].NodeName)] = struct{}{}
+		out[naming.Key(resList[i].NodeName)] = struct{}{}
 	}
 
 	return out, nil
@@ -730,7 +730,7 @@ func validateSnapshotCreateBody(w http.ResponseWriter, r *http.Request, rd strin
 	//
 	// Bug 97: tighten further to the full RFC-1123 subdomain rule so
 	// `linstor s c <rd> "Foo Bar"` is refused with a LINSTOR envelope
-	// before pkg/naming.Key() slugifies the input.
+	// before pkg/store/naming.Key() slugifies the input.
 	snapNameErr := validateLinstorName("snapshot", strings.TrimSpace(snap.Name))
 	if snapNameErr != nil {
 		writeError(w, http.StatusBadRequest, snapNameErr.Error())

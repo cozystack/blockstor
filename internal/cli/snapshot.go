@@ -589,7 +589,7 @@ func replayOwnRestore(ctx context.Context, run *runContext, args restoreArgs) (b
 		return false, true, fmt.Errorf("get resource definition %s: %w", args.toResource, err)
 	}
 
-	if !strings.EqualFold(existing.Props[store.RestoreFromSnapshotProp], args.fromResource+":"+args.fromSnapshot) {
+	if !store.SameRestoreMarker(existing.Props[store.RestoreFromSnapshotProp], args.fromResource+":"+args.fromSnapshot) {
 		return true, false, nil
 	}
 
@@ -907,7 +907,7 @@ func placeCommands(rdName string, planned []apiv1.Resource, missing []string) st
 		cmd.WriteString("`blockstor resource create " + node + " " + rdName)
 
 		for i := range planned {
-			if planned[i].NodeName == node && planned[i].Props[storPoolNameProp] != "" {
+			if naming.Same(planned[i].NodeName, node) && planned[i].Props[storPoolNameProp] != "" {
 				cmd.WriteString(" --storage-pool " + planned[i].Props[storPoolNameProp])
 
 				break

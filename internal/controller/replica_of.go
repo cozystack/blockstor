@@ -38,23 +38,6 @@ func isReplicaOf(res *blockstoriov1alpha1.Resource, rdName string) bool {
 	return naming.Key(res.Spec.ResourceDefinitionName) == rdName
 }
 
-// sameDefinition reports whether two spellings of a definition's name, as
-// two replicas or a replica and a snapshot carry them, name the same
-// definition: the one the store keeps under their common folded name.
-func sameDefinition(a, b string) bool {
-	return naming.Key(a) == naming.Key(b)
-}
-
-// sameNode reports whether two spellings of a node's name refer to the same
-// node. A replica stores its node's CR name, while a snapshot's node list,
-// a storage pool and the wire carry the registered spelling, and a replica
-// written or adopted before the store stored CR names may carry that
-// spelling too. Both sides map to the node's CR name, which is how the
-// store addresses it.
-func sameNode(a, b string) bool {
-	return naming.Same(a, b)
-}
-
 // getReplica reads the replica of definition rd on node into out, whichever
 // spellings the caller and the stored row use. The store names the CR from
 // the registered spellings, so the folded composite name finds it for every
@@ -76,7 +59,7 @@ func getReplica(ctx context.Context, c client.Reader, rd, node string, out *bloc
 
 	for i := range list.Items {
 		item := &list.Items[i]
-		if sameDefinition(item.Spec.ResourceDefinitionName, rd) && sameNode(item.Spec.NodeName, node) {
+		if naming.Same(item.Spec.ResourceDefinitionName, rd) && naming.Same(item.Spec.NodeName, node) {
 			*out = *item
 
 			return nil

@@ -386,7 +386,7 @@ const (
 // callers that don't plumb StateDir (the legacy unit-test fixture)
 // keep the pre-fix CRD-only behaviour.
 func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]time.Time, now time.Time, grace time.Duration, stateDir string) (sweepDecision, time.Duration) {
-	if _, ok := owned[rsc]; ok {
+	if _, ok := owned[naming.Key(rsc)]; ok {
 		return sweepKeep, 0
 	}
 
@@ -398,7 +398,7 @@ func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]tim
 		return sweepTearDown, 0
 	}
 
-	anchor, ok := rdAges[rsc]
+	anchor, ok := rdAges[naming.Key(rsc)]
 	if !ok {
 		return sweepTearDown, 0
 	}
@@ -602,7 +602,7 @@ func (s *OrphanSweeperRunnable) listOwnedResourceNames(ctx context.Context) (map
 
 	for i := range list.Items {
 		r := &list.Items[i]
-		if !isNode(r.Spec.NodeName, s.NodeName) {
+		if !naming.Same(r.Spec.NodeName, s.NodeName) {
 			continue
 		}
 
@@ -645,7 +645,7 @@ func (s *OrphanSweeperRunnable) listResourceDefinitionAges(ctx context.Context) 
 			anchor = rd.DeletionTimestamp.Time
 		}
 
-		out[rd.Name] = anchor
+		out[naming.Key(rd.Name)] = anchor
 	}
 
 	return out, nil

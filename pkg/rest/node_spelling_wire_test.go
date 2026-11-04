@@ -28,6 +28,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -197,7 +198,7 @@ func TestRestorePoolIsTheSourceReplicasOnAnotherNodeSpelling(t *testing.T) {
 	t.Parallel()
 
 	byNode, _ := storPoolsByNodeFromSourceRD(t.Context(), nodeSpellingStore(t), "pvc-mix")
-	if pool := byNode[nodeKey("node-1")]; pool != "pool-Node-1" {
+	if pool := byNode[naming.Key("node-1")]; pool != "pool-Node-1" {
 		t.Errorf("pool for node-1 = %q, want pool-Node-1", pool)
 	}
 }

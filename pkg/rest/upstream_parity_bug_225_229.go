@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // This file gathers four upstream-parity endpoints blockstor was
@@ -376,7 +377,7 @@ func (s *Server) handleStoragePoolDefinitionSingle(w http.ResponseWriter, r *htt
 	}
 
 	for i := range pools {
-		if !strings.EqualFold(pools[i].StoragePoolName, want) {
+		if !naming.Same(pools[i].StoragePoolName, want) {
 			continue
 		}
 

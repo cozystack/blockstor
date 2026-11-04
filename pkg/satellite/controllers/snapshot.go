@@ -88,7 +88,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Wrap(err, "get Snapshot")
 	}
 
-	if !listsNode(snap.Spec.Nodes, r.Config.NodeName) {
+	if !slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return naming.Same(n, r.Config.NodeName) }) {
 		return ctrl.Result{}, nil
 	}
 
@@ -359,7 +359,7 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 // Status subresource.
 func perNodeStatusSuspendIOAcked(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
 	for i := range entries {
-		if !isNode(entries[i].NodeName, nodeName) {
+		if !naming.Same(entries[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -529,7 +529,7 @@ func upsertPerNodeStatusInPlace(
 	mutate func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
 ) bool {
 	for i := range *entries {
-		if !isNode((*entries)[i].NodeName, nodeName) {
+		if !naming.Same((*entries)[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -626,7 +626,7 @@ const snapshotStatusUpdateRetries = 5
 // non-zero stamp keeps the wire shape correct.
 func perNodeStatusReady(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
 	for i := range entries {
-		if !isNode(entries[i].NodeName, nodeName) {
+		if !naming.Same(entries[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -649,7 +649,7 @@ func upsertPerNodeStatus(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, no
 	replaced := false
 
 	for i := range entries {
-		if isNode(entries[i].NodeName, nodeName) {
+		if naming.Same(entries[i].NodeName, nodeName) {
 			merged := entries[i]
 			merged.NodeName = nodeName
 			merged.Ready = true
@@ -738,7 +738,7 @@ func snapshotNodePredicate(nodeName string) predicate.Predicate {
 			return false
 		}
 
-		return listsNode(snap.Spec.Nodes, nodeName)
+		return slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return naming.Same(n, nodeName) })
 	}
 
 	return predicate.Funcs{

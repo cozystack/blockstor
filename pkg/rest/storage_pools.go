@@ -378,7 +378,7 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 
 		for j := range all[i].Volumes {
 			vol := &all[i].Volumes[j]
-			if vol.StoragePool == pool {
+			if naming.Same(vol.StoragePool, pool) {
 				refs = append(refs,
 					all[i].Name+"/"+strconv.FormatInt(int64(vol.VolumeNumber), 10))
 
@@ -395,7 +395,7 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 		// post-delete re-scan would never see the racing
 		// resource and the SP delete would proceed even though
 		// the spec-only Resource is about to dangle.
-		if !matched && all[i].Props["StorPoolName"] == pool {
+		if !matched && naming.Same(all[i].Props["StorPoolName"], pool) {
 			refs = append(refs, all[i].Name+"/spec")
 		}
 	}
@@ -434,8 +434,8 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 // pipeline that /v1/view/storage-pools uses rather than the store's
 // ListByNode shortcut. Java LINSTOR matches node names case-insensitively on
 // both paths, and ListByNode compares the stored spelling (see
-// store.FoldName), so routing the per-node handler through the same
-// matchAnyFold filter is what keeps the two endpoints in lockstep — a parity
+// pkg/store/k8s/spellings.go), so routing the per-node handler through the same
+// matchAnyName filter is what keeps the two endpoints in lockstep — a parity
 // invariant the storage_pools_test.go MatchesViewFiltering test pins.
 //
 // This used to give a second reason, that ListByNode ran a label selector a
@@ -482,11 +482,11 @@ func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolF
 	out := make([]apiv1.StoragePool, 0, len(pools))
 
 	for i := range pools {
-		if !matchAnyFold(nodeFilter, pools[i].NodeName) {
+		if !matchAnyName(nodeFilter, pools[i].NodeName) {
 			continue
 		}
 
-		if !matchAnyFold(poolFilter, pools[i].StoragePoolName) {
+		if !matchAnyName(poolFilter, pools[i].StoragePoolName) {
 			continue
 		}
 

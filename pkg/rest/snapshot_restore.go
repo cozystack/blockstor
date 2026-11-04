@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
@@ -1026,15 +1027,14 @@ func restoreMarker(srcRD, snapName string) string {
 // restoreMarkerMatches reports whether a definition was produced by this
 // restore or clone.
 //
-// The comparison is case-insensitive because the two sides reach it from
-// different places: the marker is written from the stored objects, and a
-// caller derives the other side from names it spelled itself. LINSTOR folds
-// name case and pkg/store/k8s/crdname.go lowercases every lookup key, so both
-// spellings address one object — and a byte comparison here would answer that
-// somebody else owns a definition this restore created, which is the
-// terminal-on-first-failure behaviour the resume path exists to end.
+// The two sides reach it from different places: the marker is written from the
+// stored objects, and a caller derives the other side from names it spelled
+// itself. Both spellings address one object, and a byte comparison here would
+// answer that somebody else owns a definition this restore created, which is
+// the terminal-on-first-failure behaviour the resume path exists to end; see
+// store.SameRestoreMarker.
 func restoreMarkerMatches(props map[string]string, srcRD, snapName string) bool {
-	return strings.EqualFold(props[restoreFromSnapshotKey], restoreMarker(srcRD, snapName))
+	return store.SameRestoreMarker(props[restoreFromSnapshotKey], restoreMarker(srcRD, snapName))
 }
 
 // validateRestoreNodesHoldSnapshot is the Bug 397 input-validation guard
@@ -1150,7 +1150,7 @@ func (s *Server) leftoverIsThisRestore(
 func (s *Server) requestedShapeDiffers(
 	ctx context.Context, existing *apiv1.ResourceDefinition, rgName string, layers []string,
 ) (string, error) {
-	if rgName != "" && !strings.EqualFold(existing.ResourceGroupName, rgName) {
+	if rgName != "" && !naming.Same(existing.ResourceGroupName, rgName) {
 		return "resource group '" + existing.ResourceGroupName + "', not '" + rgName + "'", nil
 	}
 
@@ -1773,18 +1773,18 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 			continue
 		}
 
-		if _, dup := seen[node]; dup {
+		if _, dup := seen[naming.Key(node)]; dup {
 			continue
 		}
 
-		seen[node] = struct{}{}
+		seen[naming.Key(node)] = struct{}{}
 
 		res := apiv1.Resource{
 			Name:     newRDName,
 			NodeName: node,
 		}
 
-		pool := poolByNode[nodeKey(node)]
+		pool := poolByNode[naming.Key(node)]
 		if pool == "" {
 			pool = fallbackPool
 		}
@@ -1979,7 +1979,7 @@ func storPoolsByNodeFromSourceRD(ctx context.Context, st store.Store, srcRDName 
 			continue
 		}
 
-		byNode[nodeKey(resList[i].NodeName)] = pool
+		byNode[naming.Key(resList[i].NodeName)] = pool
 
 		if fallback == "" {
 			fallback = pool

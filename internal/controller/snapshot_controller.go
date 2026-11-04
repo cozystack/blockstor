@@ -237,7 +237,7 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 // existing row belongs to the satellite, never overwrite it).
 func hasNodeStatusEntry(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, node string) bool {
 	for i := range entries {
-		if sameNode(entries[i].NodeName, node) {
+		if naming.Same(entries[i].NodeName, node) {
 			return true
 		}
 	}
@@ -781,7 +781,7 @@ func (r *SnapshotReconciler) fetchSiblings(
 	selfSeen := false
 
 	for i := range list.Items {
-		if list.Items[i].Name == snap.Name {
+		if naming.Same(list.Items[i].Name, snap.Name) {
 			selfSeen = true
 
 			// Use the freshly-fetched copy for self so the

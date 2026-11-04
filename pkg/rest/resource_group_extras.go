@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -134,7 +135,7 @@ func (s *Server) handleStoragePoolDefinitionList(w http.ResponseWriter, r *http.
 		props := map[string]string{}
 		maps.Copy(props, defs[i].Props)
 
-		seen[defs[i].Name] = len(out)
+		seen[naming.Key(defs[i].Name)] = len(out)
 		out = append(out, storagePoolDefinitionWire{
 			StoragePoolName: defs[i].Name,
 			Props:           props,
@@ -142,11 +143,11 @@ func (s *Server) handleStoragePoolDefinitionList(w http.ResponseWriter, r *http.
 	}
 
 	for i := range pools {
-		if _, dup := seen[pools[i].StoragePoolName]; dup {
+		if _, dup := seen[naming.Key(pools[i].StoragePoolName)]; dup {
 			continue
 		}
 
-		seen[pools[i].StoragePoolName] = len(out)
+		seen[naming.Key(pools[i].StoragePoolName)] = len(out)
 		out = append(out, storagePoolDefinitionWire{
 			StoragePoolName: pools[i].StoragePoolName,
 			Props:           map[string]string{},
@@ -659,11 +660,11 @@ func clusterPoolNames(ctx context.Context, s *Server) []string {
 
 	for i := range pools {
 		name := pools[i].StoragePoolName
-		if _, dup := seen[name]; dup {
+		if _, dup := seen[naming.Key(name)]; dup {
 			continue
 		}
 
-		seen[name] = struct{}{}
+		seen[naming.Key(name)] = struct{}{}
 
 		out = append(out, name)
 	}
@@ -685,16 +686,16 @@ func poolNodeNamesFor(ctx context.Context, s *Server, pool string) []string {
 	out := make([]string, 0, len(pools))
 
 	for i := range pools {
-		if pools[i].StoragePoolName != pool {
+		if !naming.Same(pools[i].StoragePoolName, pool) {
 			continue
 		}
 
 		node := pools[i].NodeName
-		if _, dup := seen[node]; dup {
+		if _, dup := seen[naming.Key(node)]; dup {
 			continue
 		}
 
-		seen[node] = struct{}{}
+		seen[naming.Key(node)] = struct{}{}
 
 		out = append(out, node)
 	}

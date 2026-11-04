@@ -69,17 +69,6 @@ const (
 	AnnotationLinstorNodeName = "blockstor.io/linstor-node-name"
 )
 
-// SameName reports whether two spellings of a LINSTOR name, as a replica's
-// spec, a snapshot's node list, a storage pool, the wire or an operator
-// spell it, address the same object: whether they map to one CR name, the
-// way the store addresses the object. That covers Node-1 against node-1 and
-// a CR name against the spelling it was registered under. Two case variants
-// of a name outside RFC 1123, such as My_Res and my_res, hash to two CR
-// names and are two objects, so they are not the same name here either.
-func SameName(a, b string) bool {
-	return Name(a) == Name(b)
-}
-
 // ResourceCRName is the name the store gives the Resource CR of the replica
 // of rd on node, both as registered. A satellite that knows a resource by
 // its definition's CR name maps back through the registered spellings

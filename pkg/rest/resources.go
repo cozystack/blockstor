@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // registerResources wires the /v1/view/resources aggregate. linstor-csi
@@ -69,19 +70,19 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	vdSizes := vdSizeIndex(r.Context(), s, resList)
 
 	for i := range resList {
-		if !matchAnyFold(nodeFilter, resList[i].NodeName) {
+		if !matchAnyName(nodeFilter, resList[i].NodeName) {
 			continue
 		}
 
-		if !matchAnyFold(rdFilter, resList[i].Name) {
+		if !matchAnyName(rdFilter, resList[i].Name) {
 			continue
 		}
 
-		if faultyOnly && !rdStats[resList[i].Name].faulty {
+		if faultyOnly && !rdStats[naming.Key(resList[i].Name)].faulty {
 			continue
 		}
 
-		rwv, buildErr := s.buildResourceView(r.Context(), &resList[i], vdSizes[resList[i].Name])
+		rwv, buildErr := s.buildResourceView(r.Context(), &resList[i], vdSizes[naming.Key(resList[i].Name)])
 		if buildErr != nil {
 			writeError(w, http.StatusInternalServerError, buildErr.Error())
 
@@ -395,7 +396,7 @@ func aggregateRDStats(resList []apiv1.Resource) map[string]rdFaultyStats {
 	out := map[string]rdFaultyStats{}
 
 	for i := range resList {
-		stats := out[resList[i].Name]
+		stats := out[naming.Key(resList[i].Name)]
 
 		for j := range resList[i].Volumes {
 			disk := resList[i].Volumes[j].State.DiskState
@@ -412,7 +413,7 @@ func aggregateRDStats(resList []apiv1.Resource) map[string]rdFaultyStats {
 			stats.faulty = true
 		}
 
-		out[resList[i].Name] = stats
+		out[naming.Key(resList[i].Name)] = stats
 	}
 
 	return out
@@ -453,8 +454,8 @@ func isUpToDateDiskState(disk string) bool {
 // Returns 0 when both belong to RDs with identical UpToDate counts —
 // the caller falls back to the deterministic Name+NodeName tiebreak.
 func compareResourceFaulty(stats map[string]rdFaultyStats, a, b *apiv1.ResourceWithVolumes) int {
-	au := stats[a.Name].upToDate
-	bu := stats[b.Name].upToDate
+	au := stats[naming.Key(a.Name)].upToDate
+	bu := stats[naming.Key(b.Name)].upToDate
 
 	if au != bu {
 		return au - bu
@@ -520,7 +521,7 @@ func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[s
 	seen := map[string]struct{}{}
 
 	for i := range resList {
-		seen[resList[i].Name] = struct{}{}
+		seen[naming.Key(resList[i].Name)] = struct{}{}
 	}
 
 	for rd := range seen {
@@ -534,7 +535,7 @@ func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[s
 			idx[vds[j].VolumeNumber] = vds[j].SizeKib
 		}
 
-		out[rd] = idx
+		out[naming.Key(rd)] = idx
 	}
 
 	return out
@@ -708,15 +709,15 @@ func splitCSV(value string) []string {
 	return out
 }
 
-// matchAnyFold reports whether candidate matches any of needles
-// case-insensitively. Empty needles means "no filter — accept".
-func matchAnyFold(needles []string, candidate string) bool {
+// matchAnyName reports whether candidate names the same object as any of
+// needles (naming.Same). Empty needles means "no filter — accept".
+func matchAnyName(needles []string, candidate string) bool {
 	if len(needles) == 0 {
 		return true
 	}
 
 	for _, n := range needles {
-		if strings.EqualFold(n, candidate) {
+		if naming.Same(n, candidate) {
 			return true
 		}
 	}

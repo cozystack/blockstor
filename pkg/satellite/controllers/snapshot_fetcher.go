@@ -94,7 +94,7 @@ func (f *SnapshotFetcher) Fetch(ctx context.Context, srcRD, snapName string, vol
 	var lastErr error
 
 	for _, peer := range snap.Spec.Nodes {
-		if isNode(peer, f.NodeName) {
+		if naming.Same(peer, f.NodeName) {
 			continue
 		}
 

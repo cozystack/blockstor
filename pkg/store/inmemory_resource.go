@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // rKey is the composite key (resource definition, node) for the in-memory
@@ -69,7 +70,7 @@ func (s *inMemoryResources) ListByNode(_ context.Context, node string) ([]apiv1.
 	out := make([]apiv1.Resource, 0)
 
 	for k := range s.m {
-		if FoldName(s.m[k].NodeName) == FoldName(node) {
+		if naming.Key(s.m[k].NodeName) == naming.Key(node) {
 			out = append(out, s.m[k])
 		}
 	}
@@ -86,7 +87,7 @@ func (s *inMemoryResources) ListByDefinition(_ context.Context, rdName string) (
 	out := make([]apiv1.Resource, 0)
 
 	for k := range s.m {
-		if FoldName(s.m[k].Name) == FoldName(rdName) {
+		if naming.Key(s.m[k].Name) == naming.Key(rdName) {
 			out = append(out, s.m[k])
 		}
 	}

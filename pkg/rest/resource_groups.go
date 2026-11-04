@@ -31,6 +31,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/pkg/errors"
@@ -85,7 +86,7 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 		filtered := rgs[:0]
 
 		for i := range rgs {
-			if matchAnyFold(nameFilter, rgs[i].Name) {
+			if matchAnyName(nameFilter, rgs[i].Name) {
 				filtered = append(filtered, rgs[i])
 			}
 		}
@@ -374,7 +375,7 @@ func countChildRDs(ctx context.Context, st store.Store, rgName string) int {
 	n := 0
 
 	for i := range rds {
-		if rds[i].ResourceGroupName == rgName {
+		if naming.Same(rds[i].ResourceGroupName, rgName) {
 			n++
 		}
 	}

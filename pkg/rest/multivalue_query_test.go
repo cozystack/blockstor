@@ -158,9 +158,9 @@ func TestMatchAnyFold(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := matchAnyFold(tc.needles, tc.candidate)
+			got := matchAnyName(tc.needles, tc.candidate)
 			if got != tc.want {
-				t.Errorf("matchAnyFold(%v, %q) = %v, want %v",
+				t.Errorf("matchAnyName(%v, %q) = %v, want %v",
 					tc.needles, tc.candidate, got, tc.want)
 			}
 		})

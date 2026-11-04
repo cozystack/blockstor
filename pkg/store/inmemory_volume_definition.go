@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // vdKey is the composite key (resource definition, volume number).
@@ -49,10 +50,10 @@ func (s *inMemoryVolumeDefinitions) List(_ context.Context, rdName string) ([]ap
 	// through the RD's folded metadata.name. Compared verbatim, a mixed-case
 	// lookup answered differently depending on which side of the CLI's
 	// bulk-read cutoff it landed on.
-	want := FoldName(rdName)
+	want := naming.Key(rdName)
 
 	for k := range s.m {
-		if FoldName(k.rd) == want {
+		if naming.Key(k.rd) == want {
 			out = append(out, s.m[k])
 		}
 	}
@@ -72,7 +73,7 @@ func (s *inMemoryVolumeDefinitions) ListAll(_ context.Context) (map[string][]api
 	out := make(map[string][]apiv1.VolumeDefinition)
 
 	for k := range s.m {
-		key := FoldName(k.rd)
+		key := naming.Key(k.rd)
 		out[key] = append(out[key], s.m[k])
 	}
 

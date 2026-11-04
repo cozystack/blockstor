@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -377,7 +378,7 @@ func runVolumeDefinitionListAllCase(t *testing.T, newStore Factory) {
 		}
 
 		// The spelling a replica of that definition carries.
-		vds, ok := all[store.FoldName("pvc-mixed")]
+		vds, ok := all[naming.Key("pvc-mixed")]
 		if !ok {
 			keys := make([]string, 0, len(all))
 			for k := range all {
@@ -1192,6 +1193,10 @@ func testResourceDeleteIfTieBreaker(t *testing.T, newStore Factory) {
 // store.ResourceDefinitionStore.
 func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 	t.Helper()
+
+	t.Run("CaseVariantsOutsideRFC1123AreTwoDefinitions", func(t *testing.T) {
+		testCaseVariantsOutsideRFC1123AreTwoDefinitions(t, newStore)
+	})
 	t.Run("ListEmpty", func(t *testing.T) {
 		got, err := newStore(t).ResourceDefinitions().List(t.Context())
 		if err != nil {
@@ -2270,6 +2275,33 @@ func testReferencesOnNodeUnderAnotherSpelling(t *testing.T, newStore Factory) {
 	if len(replicas) != 1 {
 		t.Errorf("ReferencesOnNode under another spelling found %d replica(s), want 1 — "+
 			"the refusal would pass and the node would go with a replica on it", len(replicas))
+	}
+}
+
+// testCaseVariantsOutsideRFC1123AreTwoDefinitions: a name outside RFC 1123 is
+// keyed by a hash of the name as given (naming.Key), so My_Res and my_res are
+// two definitions in every store.
+func testCaseVariantsOutsideRFC1123AreTwoDefinitions(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	for _, rd := range []string{"My_Res", "my_res"} {
+		if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rd, Props: map[string]string{"Aux/spelling": rd}}); err != nil {
+			t.Fatalf("Create definition %q: %v", rd, err)
+		}
+	}
+
+	for _, rd := range []string{"My_Res", "my_res"} {
+		got, err := s.ResourceDefinitions().Get(ctx, rd)
+		if err != nil {
+			t.Fatalf("Get %q: %v", rd, err)
+		}
+
+		if got.Props["Aux/spelling"] != rd {
+			t.Errorf("Get %q returned the definition created as %q", rd, got.Props["Aux/spelling"])
+		}
 	}
 }
 

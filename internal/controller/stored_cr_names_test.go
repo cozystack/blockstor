@@ -177,18 +177,18 @@ func TestProjectionFollowsTheNodeOfAMixedCaseReplica(t *testing.T) {
 	}
 }
 
-// sameDefinition tells two spellings of one definition from two definitions.
+// naming.Same tells two spellings of one definition from two definitions.
 // The peer list, the node-id allocation, the sibling fan-out and the
 // snapshot's sibling check use it for replicas written or adopted before
 // the store kept CR names in spec, which may carry the display spelling.
 func TestSameDefinitionFoldsCase(t *testing.T) {
 	t.Parallel()
 
-	if !sameDefinition("Pvc-Mix", "pvc-mix") {
+	if !naming.Same("Pvc-Mix", "pvc-mix") {
 		t.Error("Pvc-Mix and pvc-mix read as two definitions")
 	}
 
-	if sameDefinition("pvc-mix", "pvc-other") {
+	if naming.Same("pvc-mix", "pvc-other") {
 		t.Error("pvc-mix and pvc-other read as one definition")
 	}
 }
@@ -325,20 +325,20 @@ func TestProjectionReachesAReplicaStoredInTheRegisteredSpelling(t *testing.T) {
 	}
 }
 
-// sameNode tells two spellings of one node from two nodes, the way the
+// naming.Same tells two spellings of one node from two nodes, the way the
 // store addresses them. A case variant of a name outside RFC 1123 hashes to
 // another CR name, so My_Node and my_node are two nodes.
 func TestSameNodeFoldsCase(t *testing.T) {
 	t.Parallel()
 
 	for _, pair := range [][2]string{{"Node-1", "node-1"}, {"Node-1", naming.Key("Node-1")}, {"my_node", naming.Key("my_node")}} {
-		if !sameNode(pair[0], pair[1]) {
+		if !naming.Same(pair[0], pair[1]) {
 			t.Errorf("%s and %s read as two nodes", pair[0], pair[1])
 		}
 	}
 
 	for _, pair := range [][2]string{{"node-1", "node-2"}, {"My_Node", "my_node"}} {
-		if sameNode(pair[0], pair[1]) {
+		if naming.Same(pair[0], pair[1]) {
 			t.Errorf("%s and %s read as one node", pair[0], pair[1])
 		}
 	}

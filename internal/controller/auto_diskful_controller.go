@@ -327,7 +327,7 @@ func (r *AutoDiskfulReconciler) firstAvailablePool(ctx context.Context, nodeName
 	}
 
 	for i := range pools {
-		if !sameNode(pools[i].NodeName, nodeName) {
+		if !naming.Same(pools[i].NodeName, nodeName) {
 			continue
 		}
 

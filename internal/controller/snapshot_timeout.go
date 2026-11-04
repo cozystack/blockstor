@@ -32,6 +32,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // snapshotSuspendDeadline bounds how long a Snapshot may stay frozen
@@ -327,13 +328,13 @@ func (r *SnapshotReconciler) siblingReplicasUpToDate(
 	for i := range resList.Items {
 		res := &resList.Items[i]
 
-		if !sameDefinition(res.Spec.ResourceDefinitionName, snap.Spec.ResourceDefinitionName) {
+		if !naming.Same(res.Spec.ResourceDefinitionName, snap.Spec.ResourceDefinitionName) {
 			continue
 		}
 
 		// The node list carries the registered spelling, the replica its
 		// node's CR name.
-		if !slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return sameNode(n, res.Spec.NodeName) }) {
+		if !slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return naming.Same(n, res.Spec.NodeName) }) {
 			continue
 		}
 

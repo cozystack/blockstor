@@ -846,7 +846,7 @@ func quorumPolicy(diskful, diskless int) string {
 func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, existing []apiv1.Resource) (bool, error) {
 	hostingReplica := map[string]bool{}
 	for i := range existing {
-		hostingReplica[existing[i].NodeName] = true
+		hostingReplica[naming.Key(existing[i].NodeName)] = true
 	}
 
 	// Bug 261: route through the RD-aware selector so a stale
@@ -1496,13 +1496,6 @@ func (r *ResourceDefinitionReconciler) confirmGhostReplicas(
 	return live, ghosts, nil
 }
 
-// linstorNameAnnotation mirrors pkg/store/k8s.AnnotationLinstorName.
-// The literal is duplicated (same pattern as snapshotGroupIDLabel in
-// snapshot_controller.go) to avoid a controller→store/k8s dependency.
-// Node CRDs whose LINSTOR name needed slugifying carry the original
-// wire name here; probeNodeDirect matches against both spellings.
-const linstorNameAnnotation = "blockstor.io/linstor-name"
-
 // nodeProbe is the answer probeNodeDirect returns about a node's
 // authoritative state.
 type nodeProbe struct {
@@ -1553,7 +1546,7 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 	}
 
 	for i := range list.Items {
-		if !nodeCRDMatchesWireName(&list.Items[i], wireName) {
+		if list.Items[i].Name != naming.Key(wireName) {
 			continue
 		}
 
@@ -1564,21 +1557,6 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 	}
 
 	return nodeProbe{}, nil
-}
-
-// nodeCRDMatchesWireName reports whether a Node CRD addresses the
-// given LINSTOR wire name, the way the store addresses it: by the CR
-// name the wire name maps to, or by the preserved original-name
-// annotation of a CRD named by hand. Folding case instead would read
-// My_Node and my_node, two CRs, as one node.
-func nodeCRDMatchesWireName(node *blockstoriov1alpha1.Node, wireName string) bool {
-	if node.Name == naming.Key(wireName) {
-		return true
-	}
-
-	original, ok := node.Annotations[linstorNameAnnotation]
-
-	return ok && naming.Same(original, wireName)
 }
 
 // splitByDisabledNode partitions replicas into (live, stranded) by the

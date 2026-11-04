@@ -81,7 +81,7 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 	for i := range corev1Nodes {
 		for _, addr := range corev1Nodes[i].Status.Addresses {
 			if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
-				internalIPByName[corev1Nodes[i].Name] = addr.Address
+				internalIPByName[naming.Key(corev1Nodes[i].Name)] = addr.Address
 
 				break
 			}
@@ -89,7 +89,7 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 	}
 
 	for i := range nodes {
-		internalIP, ok := internalIPByName[nodes[i].Name]
+		internalIP, ok := internalIPByName[naming.Key(nodes[i].Name)]
 		if !ok || internalIP == "" {
 			continue
 		}
@@ -163,7 +163,7 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Wrap(err, "get Resource")
 	}
 
-	if !isNode(res.Spec.NodeName, r.Config.NodeName) {
+	if !naming.Same(res.Spec.NodeName, r.Config.NodeName) {
 		// Predicate should have filtered this out — defensive
 		// check in case the watch cache is mid-resync.
 		return ctrl.Result{}, nil
@@ -422,7 +422,7 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 	for i := range localList.Items {
 		local := &localList.Items[i]
 		if naming.Same(local.Spec.ResourceDefinitionName, rd.Name) &&
-			isNode(local.Spec.NodeName, r.Config.NodeName) {
+			naming.Same(local.Spec.NodeName, r.Config.NodeName) {
 			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
 		}
 	}
@@ -1055,7 +1055,7 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 
 	// Ignore events for the local Resource itself — `For` already
 	// drives that path through nodeNamePredicate.
-	if isNode(res.Spec.NodeName, r.Config.NodeName) {
+	if naming.Same(res.Spec.NodeName, r.Config.NodeName) {
 		return nil
 	}
 
@@ -1069,7 +1069,7 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 	for i := range localList.Items {
 		local := &localList.Items[i]
 		if naming.Same(local.Spec.ResourceDefinitionName, res.Spec.ResourceDefinitionName) &&
-			isNode(local.Spec.NodeName, r.Config.NodeName) {
+			naming.Same(local.Spec.NodeName, r.Config.NodeName) {
 			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
 		}
 	}
@@ -1260,7 +1260,7 @@ func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blocksto
 
 	for i := range peers {
 		name := peers[i].Spec.NodeName
-		if name == "" || name == target.Spec.NodeName {
+		if name == "" || naming.Same(name, target.Spec.NodeName) {
 			continue
 		}
 
@@ -1635,11 +1635,11 @@ func volumeNumbersFromStatus(res *blockstoriov1alpha1.Resource) []int32 {
 func nodeNamePredicate(nodeName string) predicate.Predicate {
 	matches := func(obj client.Object) bool {
 		if r, ok := obj.(*blockstoriov1alpha1.Resource); ok {
-			return isNode(r.Spec.NodeName, nodeName)
+			return naming.Same(r.Spec.NodeName, nodeName)
 		}
 
 		if sp, ok := obj.(*blockstoriov1alpha1.StoragePool); ok {
-			return isNode(sp.Spec.NodeName, nodeName)
+			return naming.Same(sp.Spec.NodeName, nodeName)
 		}
 
 		return false

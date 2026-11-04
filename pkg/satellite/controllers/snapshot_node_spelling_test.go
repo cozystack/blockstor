@@ -19,6 +19,7 @@ limitations under the License.
 package controllers
 
 import (
+	"slices"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // A snapshot's node list carries the registered spelling, Node-1, and the
@@ -47,8 +49,8 @@ func TestSatelliteTakesASnapshotListingItsNodeInAnotherSpelling(t *testing.T) {
 			t.Errorf("predicate for Nodes [%s] = %v, want %v", spelling, got, want)
 		}
 
-		if got := listsNode(snap.Spec.Nodes, "node-1"); got != want {
-			t.Errorf("listsNode([%s], node-1) = %v, want %v", spelling, got, want)
+		if got := slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return naming.Same(n, "node-1") }); got != want {
+			t.Errorf("slices.ContainsFunc([%s], func(n string) bool { return naming.Same(n, node-1) }) = %v, want %v", spelling, got, want)
 		}
 	}
 }

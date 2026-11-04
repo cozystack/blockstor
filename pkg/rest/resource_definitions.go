@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -61,7 +62,7 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 		filtered := rds[:0]
 
 		for i := range rds {
-			if matchAnyFold(nameFilter, rds[i].Name) {
+			if matchAnyName(nameFilter, rds[i].Name) {
 				filtered = append(filtered, rds[i])
 			}
 		}
@@ -594,7 +595,7 @@ func (s *Server) refuseRDUpdateOnUnknownRG(w http.ResponseWriter, r *http.Reques
 	}
 
 	current, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
-	if getErr == nil && current.ResourceGroupName == rgChange {
+	if getErr == nil && naming.Same(current.ResourceGroupName, rgChange) {
 		return true
 	}
 

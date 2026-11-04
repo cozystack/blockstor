@@ -184,7 +184,7 @@ func collectCandidates(pools []apiv1.StoragePool, disabled map[string]struct{}, 
 			continue
 		}
 
-		if filter != nil && filter.StoragePool != "" && pool.StoragePoolName != filter.StoragePool {
+		if filter != nil && filter.StoragePool != "" && !naming.Same(pool.StoragePoolName, filter.StoragePool) {
 			continue
 		}
 

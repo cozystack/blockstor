@@ -27,6 +27,8 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
+
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // resFileSuffix is the on-disk suffix the satellite reconciler renders
@@ -98,13 +100,13 @@ func orphanResForRemoval(
 			continue
 		}
 
-		if _, ok := owned[rd]; ok {
+		if _, ok := owned[naming.Key(rd)]; ok {
 			// Live resource this node hosts — never GC its config.
 			continue
 		}
 
 		if grace > 0 {
-			if anchor, ok := rdAges[rd]; ok && now.Sub(anchor) < grace {
+			if anchor, ok := rdAges[naming.Key(rd)]; ok && now.Sub(anchor) < grace {
 				// RD was created/deleted inside the grace window — a
 				// create-fanout or delete-in-progress race, not a
 				// genuine orphan. Defer to a later cycle.

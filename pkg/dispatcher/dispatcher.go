@@ -86,15 +86,20 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// unresolved replicas entirely and emit a real id (incl. 0) only
 	// when one is persisted — mirroring the nodeIDOf()==-1 skip
 	// contract end-to-end.
+	//
+	// idOf is keyed by node (naming.Key), so a peer row and the target that
+	// spell one node differently are one node; spelled keeps the spelling a
+	// peer's row stores, which is the name its DRBD connection carries.
 	idOf := map[string]*int32{}
+	spelled := map[string]string{}
 
 	if id := nodeIDOf(target); id >= 0 {
 		v := id
-		idOf[target.Spec.NodeName] = &v
+		idOf[naming.Key(target.Spec.NodeName)] = &v
 	}
 
 	for i := range peers {
-		if peers[i].Spec.NodeName == target.Spec.NodeName {
+		if naming.Same(peers[i].Spec.NodeName, target.Spec.NodeName) {
 			continue
 		}
 
@@ -112,16 +117,15 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 
 		if id := nodeIDOf(&peers[i]); id >= 0 {
 			v := id
-			idOf[peers[i].Spec.NodeName] = &v
+			idOf[naming.Key(peers[i].Spec.NodeName)] = &v
+			spelled[naming.Key(peers[i].Spec.NodeName)] = peers[i].Spec.NodeName
 		}
 	}
 
-	dropped := make([]string, 0, len(idOf))
+	dropped := make([]string, 0, len(spelled))
 
-	for name := range idOf {
-		if name != target.Spec.NodeName {
-			dropped = append(dropped, name)
-		}
+	for _, name := range spelled {
+		dropped = append(dropped, name)
 	}
 
 	slices.Sort(dropped)
@@ -309,7 +313,7 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 
 	byName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
 	for i := range peers {
-		byName[peers[i].Spec.NodeName] = &peers[i]
+		byName[naming.Key(peers[i].Spec.NodeName)] = &peers[i]
 	}
 
 	out := make([]intent.DesiredPeer, 0, len(dropped))
@@ -317,7 +321,7 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 	for _, name := range dropped {
 		entry := intent.DesiredPeer{Name: name}
 
-		if peerCR, ok := byName[name]; ok {
+		if peerCR, ok := byName[naming.Key(name)]; ok {
 			// Bug 342 C3: store the pointer (nil = unallocated, never
 			// a spurious 0) so a peer legitimately on node-id 0 is
 			// distinguishable from an unallocated peer downstream.
@@ -393,7 +397,7 @@ func nodeIDOf(r *blockstoriov1alpha1.Resource) int32 {
 // wedge on luks-autoplace. Returns (id, true) when present, (0, false)
 // when absent.
 func idLookup(idOf map[string]*int32, name string) (int32, bool) {
-	p, ok := idOf[name]
+	p, ok := idOf[naming.Key(name)]
 	if !ok || p == nil {
 		return 0, false
 	}
@@ -478,7 +482,7 @@ func peerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
 func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool, fallbackPort int, idOf map[string]*int32) {
 	peerByName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
 	for i := range peers {
-		peerByName[peers[i].Spec.NodeName] = &peers[i]
+		peerByName[naming.Key(peers[i].Spec.NodeName)] = &peers[i]
 	}
 
 	for _, peer := range dropped {
@@ -486,7 +490,7 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 
 		peerPool := ""
 
-		if p, ok := peerByName[peer]; ok {
+		if p, ok := peerByName[naming.Key(peer)]; ok {
 			peerPort = peerPortOf(p, fallbackPort)
 			peerPool = targetPoolName(p)
 		}
@@ -501,7 +505,7 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 		// Surface the peer's DISKLESS flag so the satellite's .res
 		// renderer can emit `disk none;` instead of the diskful
 		// placeholder for diskless peers.
-		if p, ok := peerByName[peer]; ok && slices.Contains(p.Spec.Flags, "DISKLESS") {
+		if p, ok := peerByName[naming.Key(peer)]; ok && slices.Contains(p.Spec.Flags, "DISKLESS") {
 			drbdOpts["peer."+peer+".diskless"] = boolPropTrue
 		}
 	}
@@ -571,11 +575,11 @@ func peerAddressWithPrefNic(nodeName, poolName string, nodes []blockstoriov1alph
 func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool) string {
 	if poolName != "" {
 		for i := range pools {
-			if !sameNodeName(pools[i].Spec.NodeName, nodeName) {
+			if !naming.Same(pools[i].Spec.NodeName, nodeName) {
 				continue
 			}
 
-			if pools[i].Spec.PoolName != poolName {
+			if !naming.Same(pools[i].Spec.PoolName, poolName) {
 				continue
 			}
 
@@ -588,7 +592,7 @@ func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, 
 	}
 
 	for i := range nodes {
-		if !isNodeCalled(&nodes[i], nodeName) {
+		if nodes[i].Name != naming.Key(nodeName) {
 			continue
 		}
 
@@ -604,7 +608,7 @@ func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, 
 // source rather than 500-ing.
 func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if !isNodeCalled(&nodes[i], nodeName) {
+		if nodes[i].Name != naming.Key(nodeName) {
 			continue
 		}
 
@@ -1039,11 +1043,11 @@ const defaultNICName = "default"
 //     legacy "first non-empty" behaviour so single-NIC clusters keep
 //     working unchanged. (Bug 48)
 //
-// Match is by isNodeCalled, so a replica that stores the node's CR name
-// and one written before in the registered spelling both resolve.
+// Match is by naming.Key, so a replica that stores the node's CR name and
+// one written before in the registered spelling both resolve.
 func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if !isNodeCalled(&nodes[i], nodeName) {
+		if nodes[i].Name != naming.Key(nodeName) {
 			continue
 		}
 
@@ -1144,18 +1148,4 @@ func deriveMinor(rd string) int {
 	digest := sha256.Sum256([]byte(rd))
 
 	return minorBase + int(binary.BigEndian.Uint16(digest[2:4])%minorRange)
-}
-
-// isNodeCalled reports whether node is the one a replica names as name.
-// A replica stores its node's CR name, and one written before that, or
-// adopted, may carry the registered spelling; both map to the node's CR
-// name, which is how the store addresses it.
-func isNodeCalled(node *blockstoriov1alpha1.Node, name string) bool {
-	return node.Name == naming.Key(name)
-}
-
-// sameNodeName compares two node names the way the store addresses a
-// node, for rows that store a name rather than the Node itself.
-func sameNodeName(a, b string) bool {
-	return naming.Key(a) == naming.Key(b)
 }

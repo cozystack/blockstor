@@ -109,7 +109,7 @@ func TestAFailedParentReadNeverLetsADeletePassItsSnapshots(t *testing.T) {
 func TestSnapshotSuccessKeepsTwoNodesOfOneLowercaseApart(t *testing.T) {
 	t.Parallel()
 
-	diskful := map[string]struct{}{nodeKey("My_Node"): {}, nodeKey("my_node"): {}}
+	diskful := map[string]struct{}{naming.Key("My_Node"): {}, naming.Key("my_node"): {}}
 	snap := &apiv1.Snapshot{
 		Nodes:     []string{"My_Node", "my_node"},
 		Snapshots: []apiv1.SnapshotPerNode{{NodeName: "my_node", CreateTimestamp: 1}},
@@ -124,7 +124,7 @@ func TestSnapshotSuccessKeepsTwoNodesOfOneLowercaseApart(t *testing.T) {
 func TestSnapshotSuccessMatchesAnEntryUnderTheCRName(t *testing.T) {
 	t.Parallel()
 
-	diskful := map[string]struct{}{nodeKey("My_Node"): {}}
+	diskful := map[string]struct{}{naming.Key("My_Node"): {}}
 	snap := &apiv1.Snapshot{
 		Nodes:     []string{"My_Node"},
 		Snapshots: []apiv1.SnapshotPerNode{{NodeName: naming.Key("My_Node"), CreateTimestamp: 1}},
@@ -161,11 +161,11 @@ func TestRestorePoolKeepsTwoNodesOfOneLowercaseApart(t *testing.T) {
 	}
 
 	byNode, _ := storPoolsByNodeFromSourceRD(ctx, st, "pvc-two")
-	if got := byNode[nodeKey("My_Node")]; got != "pool-upper" {
+	if got := byNode[naming.Key("My_Node")]; got != "pool-upper" {
 		t.Errorf("pool for My_Node = %q, want pool-upper", got)
 	}
 
-	if got := byNode[nodeKey("my_node")]; got != "pool-lower" {
+	if got := byNode[naming.Key("my_node")]; got != "pool-lower" {
 		t.Errorf("pool for my_node = %q, want pool-lower", got)
 	}
 }

@@ -30,10 +30,12 @@ import (
 	"github.com/LINBIT/golinstor/client"
 	"github.com/LINBIT/golinstor/clonestatus"
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // rdCloneRequest is the body for `resource-definition clone`. Only the
@@ -867,7 +869,7 @@ func liveCloneSnapshot(ctx context.Context, st store.Store, srcName, snapName st
 	}
 
 	for i := range snaps {
-		if strings.EqualFold(snaps[i].Name, snapName) {
+		if naming.Same(snaps[i].Name, snapName) {
 			return snaps[i], nil
 		}
 	}

@@ -28,6 +28,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -94,7 +95,7 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	for i := range rds {
-		if rds[i].ResourceGroupName != rg.Name {
+		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
 			continue
 		}
 

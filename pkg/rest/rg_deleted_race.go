@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -1050,11 +1051,11 @@ func (s *Server) deleteReplicasNotYetTold(
 	ctx context.Context, rdName string, nodes []string, told map[string]struct{},
 ) error {
 	for _, node := range nodes {
-		if _, done := told[node]; done {
+		if _, done := told[naming.Key(node)]; done {
 			continue
 		}
 
-		told[node] = struct{}{}
+		told[naming.Key(node)] = struct{}{}
 
 		err := s.Store.Resources().Delete(ctx, rdName, node)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {

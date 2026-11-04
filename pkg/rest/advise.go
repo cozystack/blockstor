@@ -151,7 +151,7 @@ func pickAdvicePools(pools []apiv1.StoragePool, filter *apiv1.AutoSelectFilter, 
 			continue
 		}
 
-		if filter.StoragePool != "" && pool.StoragePoolName != filter.StoragePool {
+		if filter.StoragePool != "" && !naming.Same(pool.StoragePoolName, filter.StoragePool) {
 			continue
 		}
 

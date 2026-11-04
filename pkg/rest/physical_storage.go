@@ -443,7 +443,7 @@ func setStoragePoolOwnership(ctx context.Context, c ctrlclient.Client, deviceNam
 func findStoragePoolByName(pools *crdv1alpha1.StoragePoolList, nodeName, poolName string) *crdv1alpha1.StoragePool {
 	for i := range pools.Items {
 		p := &pools.Items[i]
-		if naming.Same(p.Spec.NodeName, nodeName) && p.Spec.PoolName == poolName {
+		if naming.Same(p.Spec.NodeName, nodeName) && naming.Same(p.Spec.PoolName, poolName) {
 			return p
 		}
 	}

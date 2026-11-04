@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -513,7 +512,7 @@ func (r *AutoSnapshotRunnable) restoreReadsFrom(ctx context.Context, rdName, sna
 	}
 
 	for i := range rds.Items {
-		if strings.EqualFold(rds.Items[i].Spec.Props[store.RestoreFromSnapshotProp], rdName+":"+snapName) {
+		if store.SameRestoreMarker(rds.Items[i].Spec.Props[store.RestoreFromSnapshotProp], rdName+":"+snapName) {
 			return true, nil
 		}
 	}

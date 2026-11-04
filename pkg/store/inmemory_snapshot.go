@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 type snapKey struct {
@@ -66,7 +67,7 @@ func (s *inMemorySnapshots) ListByDefinition(_ context.Context, rdName string) (
 	out := make([]apiv1.Snapshot, 0)
 
 	for k := range s.m {
-		if FoldName(s.m[k].ResourceName) == FoldName(rdName) {
+		if naming.Key(s.m[k].ResourceName) == naming.Key(rdName) {
 			out = append(out, s.m[k])
 		}
 	}

@@ -271,7 +271,7 @@ func (r *ResourceStateProjectionReconciler) enqueueResourcesForNode(ctx context.
 	out := make([]reconcile.Request, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if !sameNode(resList.Items[i].Spec.NodeName, node.Name) {
+		if !naming.Same(resList.Items[i].Spec.NodeName, node.Name) {
 			continue
 		}
 
