@@ -60,7 +60,7 @@ func TestKeyIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	for _, in := range []string{
-		"pvc-1", "Node-1", "My_Res", "my_res", "a.b_C",
+		"pvc-1", "Node-1", "My_Res", "my_res", "a.b_C", "_", "--", "",
 		strings.Repeat("ab_", 100),
 		strings.Repeat("a", 243) + "_" + strings.Repeat("b", 20),
 	} {

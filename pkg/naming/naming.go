@@ -87,12 +87,17 @@ func Key(in string) string {
 	slug := strings.Trim(builder.String(), "-")
 
 	digest := sha256.Sum256([]byte(in))
-	out := hex.EncodeToString(digest[:hashPrefixBytes]) + "-" + slug
+	out := hex.EncodeToString(digest[:hashPrefixBytes])
+
+	// A key that ends on a dash, from a name with no letter or digit or from
+	// a cut, is not a name the API server takes, and Key of it would hash it
+	// again. No stored object carries one, so leaving the dash out keeps
+	// Key idempotent on every key it returns and changes no existing name.
+	if slug != "" {
+		out += "-" + slug
+	}
 
 	if len(out) > maxName {
-		// A cut that ends on a dash is not a name the API server takes,
-		// and Key of it would hash it again; trimming keeps Key
-		// idempotent on every key it returns.
 		out = strings.TrimRight(out[:maxName], "-")
 	}
 
