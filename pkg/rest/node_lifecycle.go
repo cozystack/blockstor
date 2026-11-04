@@ -660,10 +660,12 @@ func removeFlag(flag string) func([]string) []string {
 	}
 }
 
-// nodeKey is the key a node takes in a set built from wire rows. A replica
-// shows its node as it was registered, Node-1, while a satellite reports
-// itself and a pool keeps the spelling it was created with, node-1: LINSTOR
-// names are case-insensitive, so the two are one node.
+// nodeKey is the key a node takes in a set built from wire rows: its CR name,
+// the way the store addresses it. A replica shows its node as it was
+// registered, Node-1, a satellite may report itself as node-1 and a status
+// entry may carry the CR name itself; all three are one node. Two case
+// variants of a name outside RFC 1123, My_Node and my_node, hash to two CR
+// names and stay two nodes.
 func nodeKey(name string) string {
-	return strings.ToLower(name)
+	return k8s.Name(name)
 }
