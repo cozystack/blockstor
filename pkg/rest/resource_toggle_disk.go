@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -145,6 +146,16 @@ func (s *Server) migrateDiskCommon(w http.ResponseWriter, r *http.Request, pool 
 	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
 	if err != nil {
 		writeStoreError(w, err)
+
+		return
+	}
+
+	// One node in two spellings is one replica: it cannot be both the
+	// diskful source and the destination, and a marker naming it would
+	// tell the migration controller to prune the copy it just made.
+	if naming.Same(src, dst) {
+		writeError(w, http.StatusBadRequest,
+			"migrate-disk: source '"+src+"' and destination '"+dst+"' are the same node")
 
 		return
 	}

@@ -241,3 +241,45 @@ func TestMigrationReconcilerSrcAlreadyGone(t *testing.T) {
 		t.Errorf("prop not cleared after missing-src reconcile")
 	}
 }
+
+// A marker that names the destination's own node in another spelling names
+// the destination itself. The reconcile drops the marker and leaves the
+// replica, the only copy the migration made, in place.
+func TestMigrationReconcilerRefusesAMarkerNamingTheDestination(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	dst := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc.node-1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc",
+			NodeName:               "node-1",
+			Props:                  map[string]string{controllerpkg.MigratingFromProp: "Node-1"},
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			Volumes: []blockstoriov1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, DiskState: "UpToDate"}},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		WithObjects(dst).
+		Build()
+
+	rec := &controllerpkg.ResourceMigrationReconciler{Client: cli, Scheme: scheme}
+
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc.node-1"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	after := &blockstoriov1alpha1.Resource{}
+	if err := cli.Get(ctx, types.NamespacedName{Name: "pvc.node-1"}, after); err != nil {
+		t.Fatalf("the destination is gone: %v", err)
+	}
+
+	if _, ok := after.Spec.Props[controllerpkg.MigratingFromProp]; ok {
+		t.Error("the marker naming the destination was left set")
+	}
+}

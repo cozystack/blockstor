@@ -426,3 +426,35 @@ func TestPeerDeleteWaitFindsTheAcknowledgmentUnderTheRemovedNodesKey(t *testing.
 		t.Errorf("waited %v for an acknowledgment the sibling already stamped", took)
 	}
 }
+
+// migrate-disk from Node-1 to node-1 names one replica twice; it is refused
+// before anything is stamped.
+func TestMigrateDiskRefusesOneNodeInTwoSpellings(t *testing.T) {
+	t.Parallel()
+
+	st := nodeSpellingStore(t)
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-mix"}); err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-mix/resources/node-1/migrate-disk/Node-1", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("migrate-disk node-1 from Node-1: %d, want 400", resp.StatusCode)
+	}
+
+	res, err := st.Resources().Get(ctx, "pvc-mix", "node-1")
+	if err != nil {
+		t.Fatalf("get the replica: %v", err)
+	}
+
+	if _, stamped := res.Props[MigratingFromProp]; stamped {
+		t.Error("a migration marker naming the replica's own node was stamped")
+	}
+}

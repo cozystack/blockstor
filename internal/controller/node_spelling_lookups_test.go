@@ -198,7 +198,12 @@ func TestMigrationPrunesASourceOnANodeOutsideRFC1123(t *testing.T) {
 
 	res := storedReplicas(t, cli)[0]
 
-	if err := (&ResourceMigrationReconciler{Client: cli}).pruneSrc(ctx, res.Spec.ResourceDefinitionName, res.Spec.NodeName); err != nil {
+	dst := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.elsewhere"},
+		Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: res.Spec.ResourceDefinitionName},
+	}
+
+	if err := (&ResourceMigrationReconciler{Client: cli}).pruneSrc(ctx, dst, res.Spec.NodeName); err != nil {
 		t.Fatalf("pruneSrc: %v", err)
 	}
 
@@ -207,5 +212,32 @@ func TestMigrationPrunesASourceOnANodeOutsideRFC1123(t *testing.T) {
 	err := cli.Get(ctx, types.NamespacedName{Name: res.Name}, &left)
 	if err == nil && left.DeletionTimestamp.IsZero() {
 		t.Errorf("pruneSrc(%s, %s) left the replica %s in place", res.Spec.ResourceDefinitionName, res.Spec.NodeName, res.Name)
+	}
+}
+
+// pruneSrc never deletes the destination itself, whatever the marker that
+// led to it says.
+func TestPruneSrcLeavesTheDestinationItself(t *testing.T) {
+	t.Parallel()
+
+	cli := mixedCaseStand(t, interceptor.Funcs{})
+	ctx := context.Background()
+
+	if err := k8s.New(cli).Resources().Create(ctx, &apiv1.Resource{Name: "pvc-self", NodeName: "node-1"}); err != nil {
+		t.Fatalf("create the replica: %v", err)
+	}
+
+	var dst blockstoriov1alpha1.Resource
+	if err := cli.Get(ctx, types.NamespacedName{Name: "pvc-self.node-1"}, &dst); err != nil {
+		t.Fatalf("get the replica: %v", err)
+	}
+
+	if err := (&ResourceMigrationReconciler{Client: cli}).pruneSrc(ctx, &dst, "Node-1"); err != nil {
+		t.Fatalf("pruneSrc: %v", err)
+	}
+
+	var left blockstoriov1alpha1.Resource
+	if err := cli.Get(ctx, types.NamespacedName{Name: dst.Name}, &left); err != nil || !left.DeletionTimestamp.IsZero() {
+		t.Errorf("pruneSrc deleted the destination it was handed: %v", err)
 	}
 }
