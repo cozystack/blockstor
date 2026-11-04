@@ -29,13 +29,13 @@ import (
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
-// isReplicaOf reports whether res belongs to the definition stored as
-// rdName, the CR name. The store writes a replica with the definition's CR
+// isReplicaOf reports whether res belongs to the definition rdName, in any
+// spelling of it. The store writes a replica with the definition's CR
 // name in spec, but a replica written or adopted before the store and
 // linstor-migrate did that keeps the spelling it was given, Pvc-Mix say, so
 // the two are compared the way the store addresses the definition.
 func isReplicaOf(res *blockstoriov1alpha1.Resource, rdName string) bool {
-	return naming.Key(res.Spec.ResourceDefinitionName) == rdName
+	return naming.Same(res.Spec.ResourceDefinitionName, rdName)
 }
 
 // getReplica reads the replica of definition rd on node into out, whichever
