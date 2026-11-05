@@ -21,6 +21,7 @@ package k8s
 import (
 	"context"
 	"maps"
+	"slices"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -100,21 +101,7 @@ func (s *snapshots) List(ctx context.Context) ([]apiv1.Snapshot, error) {
 // and the mop-up missing them too. Same label blindness the Resource and
 // StoragePool reads were moved off, one kind over and on a delete gate.
 func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
-	var crdList crdv1alpha1.SnapshotList
-
-	err := s.c.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: rdName})
-	if err != nil {
-		if !SelectorUnsupported(err) {
-			return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
-		}
-
-		log.FromContext(ctx).V(1).Info("scoped Snapshot read unavailable; reading every snapshot instead",
-			"resourceDefinition", rdName, "reason", err.Error())
-
-		return s.listByDefinitionExhaustively(ctx, s.c, rdName)
-	}
-
-	return s.wireSnapshots(ctx, rdName, crdList.Items)
+	return s.listByDefinitionThrough(ctx, s.c, rdName)
 }
 
 // ListByDefinitionUncached reads the definition's snapshots from the API server
@@ -136,21 +123,7 @@ func (s *snapshots) ListByDefinitionUncached(ctx context.Context, rdName string)
 		return s.ListByDefinition(ctx, rdName)
 	}
 
-	var crdList crdv1alpha1.SnapshotList
-
-	err := s.apiReader.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: rdName})
-	if err != nil {
-		if !SelectorUnsupported(err) {
-			return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
-		}
-
-		log.FromContext(ctx).V(1).Info("scoped uncached Snapshot read unavailable; reading every snapshot instead",
-			"resourceDefinition", rdName, "reason", err.Error())
-
-		return s.listByDefinitionExhaustively(ctx, s.apiReader, rdName)
-	}
-
-	return s.wireSnapshots(ctx, rdName, crdList.Items)
+	return s.listByDefinitionThrough(ctx, s.apiReader, rdName)
 }
 
 func (s *snapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
@@ -175,9 +148,23 @@ func (s *snapshots) Create(ctx context.Context, in *apiv1.Snapshot) error {
 		return errors.New("nil Snapshot")
 	}
 
-	crd := wireToCRDSnapshot(in)
+	// The spec stores the definition's CR name and the registered spelling
+	// is kept for display, as for a replica; see spellings.go.
+	rd, err := storedRDName(ctx, s.c, in.ResourceName)
+	if err != nil {
+		return err
+	}
 
-	err := s.c.Create(ctx, crd)
+	shown := *in
+	shown.ResourceName = rd.display
+
+	crd := wireToCRDSnapshot(&shown)
+	dropNameAnnotations(crd.Annotations)
+	crd.Spec.ResourceDefinitionName = rd.crName
+	crd.Labels[LabelResourceDefinition] = rd.crName
+	rd.annotate(&crd.ObjectMeta, AnnotationLinstorRDName)
+
+	err = s.c.Create(ctx, crd)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return errors.Wrapf(store.ErrAlreadyExists, "snapshot %q on RD %q", in.Name, in.ResourceName)
@@ -238,13 +225,17 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		// clobber it — a lost GroupSize would let the barrier open early
 		// (or never) and break the cross-RD suspend-window invariant.
 		preservedGroupSize := existing.Spec.GroupSize
+		// The definition's CR name, fixed at Create; the wire carries the
+		// display spelling (see spellings.go).
+		preservedRD := existing.Spec.ResourceDefinitionName
 
 		existing.Spec = wireToCRDSnapshotSpec(in)
 		existing.Spec.SuspendIO = preservedSuspendIO
 		existing.Spec.TakeSnapshot = preservedTakeSnapshot
 		existing.Spec.GroupID = preservedGroupID
 		existing.Spec.GroupSize = preservedGroupSize
-		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
+		existing.Spec.ResourceDefinitionName = preservedRD
+		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations), AnnotationLinstorRDName)
 
 		return s.c.Update(ctx, &existing)
 	}), "update Snapshot %s/%s", in.ResourceName, in.Name)
@@ -315,6 +306,50 @@ func (s *snapshots) Delete(ctx context.Context, rdName, snapName string) error {
 	return nil
 }
 
+// listByDefinitionThrough lists the definition's snapshots under every
+// spelling of its name (see spellings.go), through one reader, and falls back
+// to the exhaustive read on that same reader when the server cannot select.
+func (s *snapshots) listByDefinitionThrough(
+	ctx context.Context, reader ctrlclient.Reader, rdName string,
+) ([]apiv1.Snapshot, error) {
+	spellings, err := rdSpellings(ctx, reader, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	var kept []crdv1alpha1.Snapshot
+
+	seen := map[string]struct{}{}
+
+	for _, spelling := range spellings {
+		var crdList crdv1alpha1.SnapshotList
+
+		err := reader.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: spelling})
+		if err != nil {
+			if !SelectorUnsupported(err) {
+				return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", spelling)
+			}
+
+			log.FromContext(ctx).V(1).Info("scoped Snapshot read unavailable; reading every snapshot instead",
+				"resourceDefinition", rdName, "reason", err.Error())
+
+			return s.listByDefinitionExhaustively(ctx, reader, rdName, spellings)
+		}
+
+		for i := range crdList.Items {
+			if _, dup := seen[crdList.Items[i].Name]; dup {
+				continue
+			}
+
+			seen[crdList.Items[i].Name] = struct{}{}
+
+			kept = append(kept, crdList.Items[i])
+		}
+	}
+
+	return s.wireSnapshots(ctx, rdName, kept)
+}
+
 // getParentRD fetches the parent ResourceDefinition for a Snapshot,
 // returning nil + the not-found error when the parent has already
 // been deleted (orphan Snapshot — the view layer still has to render
@@ -376,10 +411,10 @@ func crdToWireSnapshot(
 ) apiv1.Snapshot {
 	out := apiv1.Snapshot{
 		Name:                    crd.Spec.SnapshotName,
-		ResourceName:            crd.Spec.ResourceDefinitionName,
+		ResourceName:            shownName(&crd.ObjectMeta, AnnotationLinstorRDName, crd.Spec.ResourceDefinitionName),
 		Nodes:                   crd.Spec.Nodes,
 		Props:                   crd.Spec.Props,
-		Annotations:             userAnnotations(crd.Annotations),
+		Annotations:             withoutNameAnnotations(userAnnotations(crd.Annotations)),
 		UUID:                    string(crd.UID),
 		SnapshotDefinitionProps: crd.Spec.Props,
 	}
@@ -589,7 +624,7 @@ func wireToCRDSnapshotSpec(in *apiv1.Snapshot) crdv1alpha1.SnapshotSpec {
 // authoritative Spec.ResourceDefinitionName, read through the reader the
 // scoped attempt used so a fallback never changes which one answers.
 func (s *snapshots) listByDefinitionExhaustively(
-	ctx context.Context, reader ctrlclient.Reader, rdName string,
+	ctx context.Context, reader ctrlclient.Reader, rdName string, spellings []string,
 ) ([]apiv1.Snapshot, error) {
 	var crdList crdv1alpha1.SnapshotList
 
@@ -601,7 +636,7 @@ func (s *snapshots) listByDefinitionExhaustively(
 	kept := make([]crdv1alpha1.Snapshot, 0, len(crdList.Items))
 
 	for i := range crdList.Items {
-		if crdList.Items[i].Spec.ResourceDefinitionName == rdName {
+		if slices.Contains(spellings, crdList.Items[i].Spec.ResourceDefinitionName) {
 			kept = append(kept, crdList.Items[i])
 		}
 	}

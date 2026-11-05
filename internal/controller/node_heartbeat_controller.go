@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // Node-monitor knobs — mirror the kube-controller-manager defaults
@@ -206,7 +207,7 @@ func (r *NodeHeartbeatReconciler) applyState(
 			Kind:       nodeKind,
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
-		ObjectMeta: metav1.ObjectMeta{Name: node.Name},
+		ObjectMeta: metav1.ObjectMeta{Name: naming.Key(node.Name)},
 		Status: blockstoriov1alpha1.NodeStatus{
 			ConnectionStatus: desiredConn,
 			Conditions: []metav1.Condition{

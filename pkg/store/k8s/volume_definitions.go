@@ -31,6 +31,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -92,7 +93,7 @@ func wireVDsOf(rd *crdv1alpha1.ResourceDefinition) []apiv1.VolumeDefinition {
 // ResourceDefinition CRDs, so the request count does not grow with the number
 // of definitions.
 //
-// Keyed by store.FoldName of the definition's LINSTOR name: the caller holds
+// Keyed by naming.Key of the definition's LINSTOR name: the caller holds
 // whatever spelling its own objects carry, which for a replica is
 // Spec.ResourceDefinitionName and need not match the definition's own.
 func (s *volumeDefinitions) ListAll(ctx context.Context) (map[string][]apiv1.VolumeDefinition, error) {
@@ -115,7 +116,7 @@ func (s *volumeDefinitions) ListAll(ctx context.Context) (map[string][]apiv1.Vol
 
 		sort.Slice(vds, func(a, b int) bool { return vds[a].VolumeNumber < vds[b].VolumeNumber })
 
-		out[store.FoldName(OriginalName(&rd.ObjectMeta))] = vds
+		out[naming.Key(OriginalName(&rd.ObjectMeta))] = vds
 	}
 
 	return out, nil

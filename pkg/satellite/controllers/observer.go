@@ -1114,7 +1114,7 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	// doesn't suppress the wake-up — the recovery decision only
 	// needs the kernel-state change to land in the reconcile queue,
 	// not the corresponding Status PATCH to commit.
-	o.emitReconcileTrigger(ev)
+	o.emitReconcileTrigger(ctx, ev)
 
 	// Phase 11.3 Stage 3: stamp the KernelLoaded Condition off the
 	// resource-kind frame lifecycle. Gated on HasKernelLoaded so
@@ -1220,7 +1220,7 @@ func isDataBearingDiskState(s drbd.DiskState) bool {
 // SetupWithManager registers the channel as a raw source whose
 // handler enqueues the named Resource for reconciliation, no
 // per-event field inspection required.
-func (o *ObserverRunnable) emitReconcileTrigger(ev *observation) {
+func (o *ObserverRunnable) emitReconcileTrigger(ctx context.Context, ev *observation) {
 	if o.ReconcileTrigger == nil || ev == nil || ev.ResourceName == "" {
 		return
 	}
@@ -1247,7 +1247,11 @@ func (o *ObserverRunnable) emitReconcileTrigger(ev *observation) {
 	o.lifecycleCache[ev.ResourceName] = want
 	o.lifecycleMu.Unlock()
 
-	name := k8s.Name(ev.ResourceName + "." + o.NodeName)
+	name, err := replicaCRName(ctx, o.Client, ev.ResourceName, o.NodeName)
+	if err != nil {
+		// The 5-second resync re-enqueues every local Resource anyway.
+		return
+	}
 
 	trigger := event.GenericEvent{
 		Object: &blockstoriov1alpha1.Resource{
@@ -1760,7 +1764,10 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		return nil
 	}
 
-	name := k8s.Name(ev.ResourceName + "." + o.NodeName)
+	name, err := replicaCRName(ctx, o.Client, ev.ResourceName, o.NodeName)
+	if err != nil {
+		return err
+	}
 
 	// Best-effort lookup for `Spec.StoragePool` so the observer's
 	// per-volume Status entries carry the pool name on every tick
@@ -1824,7 +1831,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 	// volumes[volumeNumber=0]; ForceOwnership on either side would
 	// kick the other's subfield claims off the listMap entry.
 	// SSA's per-field merge already covers what we need.
-	err := o.Client.Status().Patch(ctx, apply,
+	err = o.Client.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
 		client.FieldOwner(k8s.SatelliteFieldOwner))
 	if err != nil {
@@ -1901,7 +1908,10 @@ func (o *ObserverRunnable) writeSkipDiskProp(ctx context.Context, resourceName s
 		return nil
 	}
 
-	name := k8s.Name(resourceName + "." + o.NodeName)
+	name, err := replicaCRName(ctx, o.Client, resourceName, o.NodeName)
+	if err != nil {
+		return err
+	}
 
 	// Read the existing Resource so the SSA apply object can carry
 	// the immutable required scalars (`resourceDefinitionName`,
@@ -1917,7 +1927,7 @@ func (o *ObserverRunnable) writeSkipDiskProp(ctx context.Context, resourceName s
 	// IsNotFound branch silences the event.
 	var existing blockstoriov1alpha1.Resource
 
-	err := o.Client.Get(ctx, client.ObjectKey{Name: name}, &existing)
+	err = o.Client.Get(ctx, client.ObjectKey{Name: name}, &existing)
 	if err != nil {
 		return errors.Wrapf(err, "get Resource %s", name)
 	}
@@ -1989,7 +1999,10 @@ func (o *ObserverRunnable) stampKernelLoaded(ctx context.Context, resourceName s
 		return nil
 	}
 
-	name := k8s.Name(resourceName + "." + o.NodeName)
+	name, err := replicaCRName(ctx, o.Client, resourceName, o.NodeName)
+	if err != nil {
+		return err
+	}
 
 	status := metav1.ConditionFalse
 	reason := kernelLoadedReasonDestroyed
@@ -2024,7 +2037,7 @@ func (o *ObserverRunnable) stampKernelLoaded(ctx context.Context, resourceName s
 	// writer own only the KernelLoaded entry. The MetadataCreated
 	// and FilesystemFormatted stampers keep their own entries
 	// alive under their own field-managers.
-	err := o.Client.Status().Patch(ctx, apply,
+	err = o.Client.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
 		client.FieldOwner(observerKernelLoadedFieldOwner))
 	if err != nil {

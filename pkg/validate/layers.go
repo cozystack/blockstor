@@ -82,6 +82,28 @@ func LayerStack(layers []string) error {
 	return layerStackOrder(normalized)
 }
 
+// CanonicalLayerStack validates a stack the way LayerStack does and returns
+// it in canonical case, the spelling every reader compares against. An empty
+// stack comes back as nil. Write paths store what this returns, so a stack
+// typed as `drbd,storage` is the same stored value as `DRBD,STORAGE`.
+func CanonicalLayerStack(layers []string) ([]string, error) {
+	if len(layers) == 0 {
+		return nil, nil
+	}
+
+	normalized, err := NormalizeLayerStack(layers)
+	if err != nil {
+		return nil, err
+	}
+
+	err = layerStackOrder(normalized)
+	if err != nil {
+		return nil, err
+	}
+
+	return normalized, nil
+}
+
 // NormalizeLayerStack upper-cases each entry and rejects anything outside the
 // allowlist. The original token is surfaced in the error so an operator can
 // grep their input for the offending entry verbatim.

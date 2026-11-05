@@ -19,12 +19,9 @@ limitations under the License.
 package k8s
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"regexp"
-	"strings"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // AnnotationLinstorName preserves the original LINSTOR-side name when
@@ -72,72 +69,9 @@ func OriginalName(meta *metav1.ObjectMeta) string {
 	return meta.Name
 }
 
-// Name turns a LINSTOR-shaped name (which Java accepts in mixed case
-// and with characters k8s rejects) into something the API server will
-// store without complaining. LINSTOR identifiers are case-insensitive
-// (`DfltRscGrp` and `dfltrscgrp` address the same object), so we
-// lowercase first — if the lowercased form is rfc1123-valid, return
-// it unchanged. Otherwise we replace non-allowed runs with '-' and
-// append a short SHA-256 prefix so distinct LINSTOR names never
-// collide on the same k8s name.
-//
-// linstor-csi names PVCs like `vol-<uuid>` (already lowercase) but
-// upstream LINSTOR's `DfltRscGrp` and csi-sanity's `DeleteSnapshot-
-// volume-1-…` need normalisation. Lowercasing in this function is
-// the single normalization point: every store Get/Update/Delete
-// routes through Name(), so the same input lands on the same CRD
-// regardless of case. The canonical CamelCase spelling (when the
-// caller supplied one) round-trips via the `blockstor.io/linstor-name`
-// annotation — see SetOriginalName / OriginalName.
+// Name is the CR name the store keeps an object under: naming.Key of its
+// LINSTOR name. The registered spelling round-trips through the
+// AnnotationLinstorName annotation; see SetOriginalName and OriginalName.
 func Name(in string) string {
-	lower := strings.ToLower(in)
-
-	if lower != "" && len(lower) <= maxK8sName && rfc1123.MatchString(lower) {
-		return lower
-	}
-
-	var builder strings.Builder
-
-	prevDash := true
-
-	for _, r := range lower {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			builder.WriteRune(r)
-
-			prevDash = false
-		default:
-			if !prevDash {
-				builder.WriteByte('-')
-
-				prevDash = true
-			}
-		}
-	}
-
-	slug := strings.Trim(builder.String(), "-")
-
-	digest := sha256.Sum256([]byte(in))
-	prefix := hex.EncodeToString(digest[:hashPrefixBytes])
-	out := prefix + "-" + slug
-
-	if len(out) > maxK8sName {
-		out = out[:maxK8sName]
-	}
-
-	return out
+	return naming.Key(in)
 }
-
-// rfc1123 covers k8s metadata.Name validation; declared once at
-// package init so the regex compile cost amortises.
-var rfc1123 = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
-
-const (
-	// maxK8sName is the metadata.Name length cap (DNS-1123).
-	maxK8sName = 253
-
-	// hashPrefixBytes drives K8sName's collision-resistant prefix
-	// length. 4 bytes → 8 hex chars → 2^32 distinct slugs, plenty
-	// for storage objects.
-	hashPrefixBytes = 4
-)

@@ -36,9 +36,9 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // drbdAddrAny is the placeholder address we put into the .res file
@@ -86,15 +86,20 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// unresolved replicas entirely and emit a real id (incl. 0) only
 	// when one is persisted — mirroring the nodeIDOf()==-1 skip
 	// contract end-to-end.
+	//
+	// idOf is keyed by node (naming.Key), so a peer row and the target that
+	// spell one node differently are one node; spelled keeps the spelling a
+	// peer's row stores, which is the name its DRBD connection carries.
 	idOf := map[string]*int32{}
+	spelled := map[string]string{}
 
 	if id := nodeIDOf(target); id >= 0 {
 		v := id
-		idOf[target.Spec.NodeName] = &v
+		idOf[naming.Key(target.Spec.NodeName)] = &v
 	}
 
 	for i := range peers {
-		if peers[i].Spec.NodeName == target.Spec.NodeName {
+		if naming.Same(peers[i].Spec.NodeName, target.Spec.NodeName) {
 			continue
 		}
 
@@ -112,16 +117,15 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 
 		if id := nodeIDOf(&peers[i]); id >= 0 {
 			v := id
-			idOf[peers[i].Spec.NodeName] = &v
+			idOf[naming.Key(peers[i].Spec.NodeName)] = &v
+			spelled[naming.Key(peers[i].Spec.NodeName)] = peers[i].Spec.NodeName
 		}
 	}
 
-	dropped := make([]string, 0, len(idOf))
+	dropped := make([]string, 0, len(spelled))
 
-	for name := range idOf {
-		if name != target.Spec.NodeName {
-			dropped = append(dropped, name)
-		}
+	for _, name := range spelled {
+		dropped = append(dropped, name)
 	}
 
 	slices.Sort(dropped)
@@ -250,7 +254,11 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 	}
 
 	return &intent.DesiredResource{
-		Name:        target.Spec.ResourceDefinitionName,
+		// The definition's CR name, whatever spelling an older row keeps
+		// in spec: the satellite names the DRBD resource, the volumes and
+		// the snapshots by it, and the snapshot and delete paths ask for
+		// it by the same name.
+		Name:        naming.Key(target.Spec.ResourceDefinitionName),
 		NodeName:    target.Spec.NodeName,
 		Flags:       target.Spec.Flags,
 		Props:       wireProps,
@@ -305,7 +313,7 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 
 	byName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
 	for i := range peers {
-		byName[peers[i].Spec.NodeName] = &peers[i]
+		byName[naming.Key(peers[i].Spec.NodeName)] = &peers[i]
 	}
 
 	out := make([]intent.DesiredPeer, 0, len(dropped))
@@ -313,7 +321,7 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 	for _, name := range dropped {
 		entry := intent.DesiredPeer{Name: name}
 
-		if peerCR, ok := byName[name]; ok {
+		if peerCR, ok := byName[naming.Key(name)]; ok {
 			// Bug 342 C3: store the pointer (nil = unallocated, never
 			// a spurious 0) so a peer legitimately on node-id 0 is
 			// distinguishable from an unallocated peer downstream.
@@ -389,7 +397,7 @@ func nodeIDOf(r *blockstoriov1alpha1.Resource) int32 {
 // wedge on luks-autoplace. Returns (id, true) when present, (0, false)
 // when absent.
 func idLookup(idOf map[string]*int32, name string) (int32, bool) {
-	p, ok := idOf[name]
+	p, ok := idOf[naming.Key(name)]
 	if !ok || p == nil {
 		return 0, false
 	}
@@ -424,7 +432,7 @@ func readDRBDPort(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1.
 		return int(*target.Status.DRBDPort)
 	}
 
-	return derivePort(target.Spec.ResourceDefinitionName)
+	return derivePort(naming.Key(target.Spec.ResourceDefinitionName))
 }
 
 // readDRBDMinor returns the BASE minor (volume 0) for the resource,
@@ -449,7 +457,7 @@ func readDRBDMinor(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1
 		return int(*target.Status.DRBDMinor)
 	}
 
-	return deriveMinor(target.Spec.ResourceDefinitionName)
+	return deriveMinor(naming.Key(target.Spec.ResourceDefinitionName))
 }
 
 // peerPortOf reads the persisted DRBDPort off a peer Resource. The
@@ -474,7 +482,7 @@ func peerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
 func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool, fallbackPort int, idOf map[string]*int32) {
 	peerByName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
 	for i := range peers {
-		peerByName[peers[i].Spec.NodeName] = &peers[i]
+		peerByName[naming.Key(peers[i].Spec.NodeName)] = &peers[i]
 	}
 
 	for _, peer := range dropped {
@@ -482,7 +490,7 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 
 		peerPool := ""
 
-		if p, ok := peerByName[peer]; ok {
+		if p, ok := peerByName[naming.Key(peer)]; ok {
 			peerPort = peerPortOf(p, fallbackPort)
 			peerPool = targetPoolName(p)
 		}
@@ -497,7 +505,7 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 		// Surface the peer's DISKLESS flag so the satellite's .res
 		// renderer can emit `disk none;` instead of the diskful
 		// placeholder for diskless peers.
-		if p, ok := peerByName[peer]; ok && slices.Contains(p.Spec.Flags, "DISKLESS") {
+		if p, ok := peerByName[naming.Key(peer)]; ok && slices.Contains(p.Spec.Flags, "DISKLESS") {
 			drbdOpts["peer."+peer+".diskless"] = boolPropTrue
 		}
 	}
@@ -567,11 +575,11 @@ func peerAddressWithPrefNic(nodeName, poolName string, nodes []blockstoriov1alph
 func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool) string {
 	if poolName != "" {
 		for i := range pools {
-			if pools[i].Spec.NodeName != nodeName {
+			if !naming.Same(pools[i].Spec.NodeName, nodeName) {
 				continue
 			}
 
-			if pools[i].Spec.PoolName != poolName {
+			if !naming.Same(pools[i].Spec.PoolName, poolName) {
 				continue
 			}
 
@@ -584,7 +592,7 @@ func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, 
 	}
 
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+		if nodes[i].Name != naming.Key(nodeName) {
 			continue
 		}
 
@@ -600,7 +608,7 @@ func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, 
 // source rather than 500-ing.
 func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+		if nodes[i].Name != naming.Key(nodeName) {
 			continue
 		}
 
@@ -669,7 +677,7 @@ func anyDiskfulPeerHasData(peers []blockstoriov1alpha1.Resource) bool {
 			continue
 		}
 
-		rdName := peers[i].Spec.ResourceDefinitionName
+		rdName := naming.Key(peers[i].Spec.ResourceDefinitionName)
 
 		for j := range peers[i].Status.Volumes {
 			vol := &peers[i].Status.Volumes[j]
@@ -882,7 +890,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 
 	srcSnapshot := ""
 	if rd.Spec.Props != nil {
-		srcSnapshot = rd.Spec.Props[restoreFromKey]
+		srcSnapshot = restoreSourceOnDisk(rd.Spec.Props[restoreFromKey])
 	}
 
 	out := make([]*intent.DesiredVolume, 0, len(rd.Spec.VolumeDefinitions))
@@ -922,6 +930,21 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	}
 
 	return out
+}
+
+// restoreSourceOnDisk names a restore's source definition the way its
+// satellite named it on disk: by its CR name, as buildDesired does.
+// The prop carries the source as the REST request spelled it, and a
+// source registered as Pvc-Src was laid down as pvc-src. Anything that is
+// not <srcRD>:<snap>, such as the cross-cluster form, is left for the
+// satellite to refuse as it is.
+func restoreSourceOnDisk(value string) string {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 || parts[0] == "" {
+		return value
+	}
+
+	return naming.Key(parts[0]) + ":" + parts[1]
 }
 
 // StorPoolNameDrbdMetaKey is the upstream-LINSTOR prop key that
@@ -1020,11 +1043,11 @@ const defaultNICName = "default"
 //     legacy "first non-empty" behaviour so single-NIC clusters keep
 //     working unchanged. (Bug 48)
 //
-// Match is on the original LINSTOR name (annotation when slugified,
-// else metadata.Name) so non-RFC1123 LINSTOR names still resolve.
+// Match is by naming.Key, so a replica that stores the node's CR name and
+// one written before in the registered spelling both resolve.
 func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+		if nodes[i].Name != naming.Key(nodeName) {
 			continue
 		}
 

@@ -37,6 +37,7 @@ import (
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
+	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
@@ -166,11 +167,13 @@ type CrossNodeFetcher interface {
 // a controller-runtime client dependency. Phase 11.3 Stage 1.
 type MetadataCreatedStamper interface {
 	// StampMetadataCreated SSA-patches a `MetadataCreated=True`
-	// Condition onto Resource <resourceName>.Status.Conditions.
-	// Idempotent — repeat calls converge on the same Condition
-	// shape (LastTransitionTime moves forward on apiserver-side
-	// transition only, not on every patch).
-	StampMetadataCreated(ctx context.Context, resourceName string) error
+	// Condition onto the Resource CR of the replica of resourceName
+	// on nodeName, both as the apply chain knows them (the
+	// definition's and the node's CR names); the stamper maps them
+	// to the CR the store named. Idempotent — repeat calls converge
+	// on the same Condition shape (LastTransitionTime moves forward
+	// on apiserver-side transition only, not on every patch).
+	StampMetadataCreated(ctx context.Context, resourceName, nodeName string) error
 }
 
 // FilesystemFormattedStamper abstracts the "stamp the
@@ -186,7 +189,7 @@ type FilesystemFormattedStamper interface {
 	// converge on the same Condition shape (LastTransitionTime
 	// moves forward on apiserver-side transition only, not on
 	// every patch).
-	StampFilesystemFormatted(ctx context.Context, resourceName string) error
+	StampFilesystemFormatted(ctx context.Context, resourceName, nodeName string) error
 
 	// StampFilesystemObserved SSA-patches the same
 	// `FilesystemFormatted=True` Condition with a distinct
@@ -199,7 +202,7 @@ type FilesystemFormattedStamper interface {
 	// differ — so the listMap merge on `type=FilesystemFormatted`
 	// keeps both writers cleanly sharing one Condition entry
 	// without disturbing `.status.volumes` ownership.
-	StampFilesystemObserved(ctx context.Context, resourceName string) error
+	StampFilesystemObserved(ctx context.Context, resourceName, nodeName string) error
 }
 
 // SkipDiskClearer abstracts the "release the satellite's SSA claim
@@ -1918,17 +1921,19 @@ func computeRemovedPeers(resPath string, dr *intent.DesiredResource, localNode s
 		return nil
 	}
 
+	// The file names a peer as it was rendered then, the intent as its row
+	// spells it now; a peer whose spelling changed has not left.
 	want := make(map[string]struct{}, len(dr.GetPeers())+1)
-	want[localNode] = struct{}{}
+	want[naming.Key(localNode)] = struct{}{}
 
 	for _, p := range dr.GetPeerNames() {
-		want[p] = struct{}{}
+		want[naming.Key(p)] = struct{}{}
 	}
 
 	var removed []string
 
 	for _, p := range old {
-		if _, keep := want[p]; !keep {
+		if _, keep := want[naming.Key(p)]; !keep {
 			removed = append(removed, p)
 		}
 	}
@@ -3611,12 +3616,10 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		// stamp attempt, polluting ERROR logs since Phase 11.3
 		// Stage 1 (#489). Best-effort tolerated (file marker is the
 		// source of truth) so no functional regression, just noise.
-		resourceCRDName := dr.GetName() + "." + dr.GetNodeName()
-
-		stampErr := r.cfg.MetadataCreatedStamper.StampMetadataCreated(ctx, resourceCRDName)
+		stampErr := r.cfg.MetadataCreatedStamper.StampMetadataCreated(ctx, dr.GetName(), dr.GetNodeName())
 		if stampErr != nil {
 			log.FromContext(ctx).Error(stampErr, "stamp MetadataCreated Condition; will retry next reconcile",
-				"resource", resourceCRDName)
+				"resource", dr.GetName(), "node", dr.GetNodeName())
 		}
 	}
 
@@ -4411,12 +4414,10 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 		// Mirror the Bug 344 fix in maybeStampMetadata's caller.
 		// Best-effort tolerated (file marker is the source of truth)
 		// so no functional regression on a transient apiserver hiccup.
-		resourceCRDName := dr.GetName() + "." + dr.GetNodeName()
-
-		stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemFormatted(ctx, resourceCRDName)
+		stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemFormatted(ctx, dr.GetName(), dr.GetNodeName())
 		if stampErr != nil {
 			log.FromContext(ctx).Error(stampErr, "stamp FilesystemFormatted Condition; will retry next reconcile",
-				"resource", resourceCRDName)
+				"resource", dr.GetName(), "node", dr.GetNodeName())
 		}
 	}
 
@@ -5696,7 +5697,7 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 		Disk:        sections.Disk,
 		Handlers:    sections.Handlers,
 		PeerDevice:  sections.PeerDevice,
-		Connections: buildResConnections(dr),
+		Connections: buildResConnections(dr, hosts),
 	})
 	if err != nil {
 		return "", errors.Wrap(err, "drbd.Build")
@@ -5710,7 +5711,12 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 // renderer's drbd.ResourceConnection shape. Empty input returns nil
 // — the renderer then falls back to the default single-host-pair
 // connection block.
-func buildResConnections(dr *intent.DesiredResource) []drbd.ResourceConnection {
+//
+// A connection names its nodes as the request spelled them, Node-1 say,
+// while the hosts carry the replicas' spec, which stores the node's CR
+// name, node-1. Each node is written in the spelling of the host it names,
+// so the renderer pairs the paths with their hosts.
+func buildResConnections(dr *intent.DesiredResource, hosts []drbd.Host) []drbd.ResourceConnection {
 	src := dr.GetConnections()
 	if len(src) == 0 {
 		return nil
@@ -5730,13 +5736,25 @@ func buildResConnections(dr *intent.DesiredResource) []drbd.ResourceConnection {
 		}
 
 		out = append(out, drbd.ResourceConnection{
-			NodeA: conn.NodeA,
-			NodeB: conn.NodeB,
+			NodeA: hostSpelling(hosts, conn.NodeA),
+			NodeB: hostSpelling(hosts, conn.NodeB),
 			Paths: paths,
 		})
 	}
 
 	return out
+}
+
+// hostSpelling answers the name of the host that node names, or node as it
+// is when no host is that node.
+func hostSpelling(hosts []drbd.Host, node string) string {
+	for i := range hosts {
+		if naming.Same(hosts[i].NodeName, node) {
+			return hosts[i].NodeName
+		}
+	}
+
+	return node
 }
 
 // buildResVolumes turns the per-RD DesiredVolumes into the

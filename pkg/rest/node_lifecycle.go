@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -134,7 +135,7 @@ func (s *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
 
 		for i := range resources {
 			res := &resources[i]
-			if res.NodeName != name {
+			if !naming.Same(res.NodeName, name) {
 				continue
 			}
 
@@ -283,11 +284,13 @@ func queryFlag(r *http.Request, name string) bool {
 
 // evacuatingSet folds the variadic node list into a lookup map.
 // Kept separate from the handler body so the pre-check helpers
-// share the same shape without re-allocating per call.
+// share the same shape without re-allocating per call. It is keyed
+// by CR name, like isEvacuating reads it, so node-1 in the request
+// and Node-1 on the wire are one node.
 func evacuatingSet(names []string) map[string]bool {
 	out := make(map[string]bool, len(names))
 	for _, name := range names {
-		out[name] = true
+		out[naming.Key(name)] = true
 	}
 
 	return out
@@ -328,7 +331,7 @@ func (s *Server) checkEvacuateCandidate(ctx context.Context, w http.ResponseWrit
 
 	for i := range allNodes {
 		n := &allNodes[i]
-		if evacuating[n.Name] {
+		if evacuating[naming.Key(n.Name)] {
 			continue
 		}
 
@@ -364,7 +367,7 @@ func (s *Server) checkEvacuateInUse(ctx context.Context, w http.ResponseWriter, 
 
 	for i := range resources {
 		res := &resources[i]
-		if !evacuating[res.NodeName] {
+		if !evacuating[naming.Key(res.NodeName)] {
 			continue
 		}
 

@@ -50,6 +50,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/luks"
+	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -80,7 +81,7 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 	for i := range corev1Nodes {
 		for _, addr := range corev1Nodes[i].Status.Addresses {
 			if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
-				internalIPByName[corev1Nodes[i].Name] = addr.Address
+				internalIPByName[naming.Key(corev1Nodes[i].Name)] = addr.Address
 
 				break
 			}
@@ -88,7 +89,7 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 	}
 
 	for i := range nodes {
-		internalIP, ok := internalIPByName[nodes[i].Name]
+		internalIP, ok := internalIPByName[naming.Key(nodes[i].Name)]
 		if !ok || internalIP == "" {
 			continue
 		}
@@ -162,7 +163,7 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Wrap(err, "get Resource")
 	}
 
-	if res.Spec.NodeName != r.Config.NodeName {
+	if !naming.Same(res.Spec.NodeName, r.Config.NodeName) {
 		// Predicate should have filtered this out — defensive
 		// check in case the watch cache is mid-resync.
 		return ctrl.Result{}, nil
@@ -420,8 +421,8 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 
 	for i := range localList.Items {
 		local := &localList.Items[i]
-		if local.Spec.ResourceDefinitionName == rd.Name &&
-			local.Spec.NodeName == r.Config.NodeName {
+		if naming.Same(local.Spec.ResourceDefinitionName, rd.Name) &&
+			naming.Same(local.Spec.NodeName, r.Config.NodeName) {
 			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
 		}
 	}
@@ -438,7 +439,7 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: res.Spec.ResourceDefinitionName}, &rd)
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
@@ -1054,7 +1055,7 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 
 	// Ignore events for the local Resource itself — `For` already
 	// drives that path through nodeNamePredicate.
-	if res.Spec.NodeName == r.Config.NodeName {
+	if naming.Same(res.Spec.NodeName, r.Config.NodeName) {
 		return nil
 	}
 
@@ -1067,8 +1068,8 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 
 	for i := range localList.Items {
 		local := &localList.Items[i]
-		if local.Spec.ResourceDefinitionName == res.Spec.ResourceDefinitionName &&
-			local.Spec.NodeName == r.Config.NodeName {
+		if naming.Same(local.Spec.ResourceDefinitionName, res.Spec.ResourceDefinitionName) &&
+			naming.Same(local.Spec.NodeName, r.Config.NodeName) {
 			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
 		}
 	}
@@ -1197,7 +1198,7 @@ func (r *ResourceReconciler) listPeerResources(ctx context.Context, target *bloc
 	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+		if naming.Same(resList.Items[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			peers = append(peers, resList.Items[i])
 		}
 	}
@@ -1227,8 +1228,8 @@ func (r *ResourceReconciler) peerReader() client.Reader {
 // cached flags then stand, which is the pre-fix behaviour.
 func adoptAuthoritativeFlags(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) {
 	for i := range peers {
-		if peers[i].Spec.NodeName == target.Spec.NodeName &&
-			peers[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+		if naming.Same(peers[i].Spec.NodeName, target.Spec.NodeName) &&
+			naming.Same(peers[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			target.Spec.Flags = peers[i].Spec.Flags
 
 			return
@@ -1245,7 +1246,7 @@ func rdNeedsDRBD(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 		return true
 	}
 
-	return slices.Contains(stack, "DRBD")
+	return apiv1.LayerInStack(stack, apiv1.LayerKindDRBD)
 }
 
 // expectedPeerNamesFor returns the peer-node-name set the Bug 342 v3
@@ -1259,7 +1260,7 @@ func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blocksto
 
 	for i := range peers {
 		name := peers[i].Spec.NodeName
-		if name == "" || name == target.Spec.NodeName {
+		if name == "" || naming.Same(name, target.Spec.NodeName) {
 			continue
 		}
 
@@ -1407,7 +1408,7 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 
 	for i := range peers {
 		peer := &peers[i]
-		if peer.Spec.NodeName == target.Spec.NodeName {
+		if naming.Same(peer.Spec.NodeName, target.Spec.NodeName) {
 			continue
 		}
 
@@ -1475,7 +1476,7 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 	}
 
 	req := &intent.DeleteResourceRequest{
-		Name:          res.Spec.ResourceDefinitionName,
+		Name:          naming.Key(res.Spec.ResourceDefinitionName),
 		StoragePool:   resolveDeleteStoragePool(res),
 		VolumeNumbers: volumeNumbers,
 	}
@@ -1574,7 +1575,7 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 func (r *ResourceReconciler) lookupVolumeNumbers(ctx context.Context, res *blockstoriov1alpha1.Resource) ([]int32, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: res.Spec.ResourceDefinitionName}, &rd)
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
 	if err == nil {
 		out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
 		for i := range rd.Spec.VolumeDefinitions {
@@ -1634,11 +1635,11 @@ func volumeNumbersFromStatus(res *blockstoriov1alpha1.Resource) []int32 {
 func nodeNamePredicate(nodeName string) predicate.Predicate {
 	matches := func(obj client.Object) bool {
 		if r, ok := obj.(*blockstoriov1alpha1.Resource); ok {
-			return r.Spec.NodeName == nodeName
+			return naming.Same(r.Spec.NodeName, nodeName)
 		}
 
 		if sp, ok := obj.(*blockstoriov1alpha1.StoragePool); ok {
-			return sp.Spec.NodeName == nodeName
+			return naming.Same(sp.Spec.NodeName, nodeName)
 		}
 
 		return false

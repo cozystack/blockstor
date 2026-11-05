@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -542,7 +543,7 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 		return true
 	}
 
-	rd.LayerStack = append([]string(nil), layerList...)
+	rd.LayerStack = storedLayerStack(layerList)
 
 	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — the
 	// closure mutates a freshly-fetched live RD on every retry, so
@@ -557,7 +558,7 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 			return nil
 		}
 
-		live.LayerStack = append([]string(nil), layerList...)
+		live.LayerStack = storedLayerStack(layerList)
 
 		return nil
 	})
@@ -643,7 +644,7 @@ func (s *Server) resolveAdditionalPlaceCount(ctx context.Context, rdName string,
 	diskful := 0
 
 	for i := range existing {
-		if _, off := disabled[existing[i].NodeName]; off {
+		if _, off := disabled[naming.Key(existing[i].NodeName)]; off {
 			continue
 		}
 
@@ -1434,7 +1435,7 @@ func (s *Server) handleResourceCreateOnNode(w http.ResponseWriter, r *http.Reque
 	switch {
 	case env.Resource.NodeName == "":
 		env.Resource.NodeName = node
-	case env.Resource.NodeName != node:
+	case !naming.Same(env.Resource.NodeName, node):
 		writeError(w, http.StatusBadRequest,
 			"single-node resource create: body node '"+env.Resource.NodeName+
 				"' does not match URL path node '"+node+"'")
@@ -1540,7 +1541,7 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 		_ = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
 			func(rd *apiv1.ResourceDefinition) error {
 				if len(rd.LayerStack) == 0 {
-					rd.LayerStack = append([]string(nil), env.LayerList...)
+					rd.LayerStack = storedLayerStack(env.LayerList)
 				}
 
 				return nil
@@ -2041,7 +2042,7 @@ func (s *Server) resolveTakeoverStorPool(ctx context.Context, rdName, takeoverNo
 	siblings, listErr := s.Store.Resources().ListByDefinition(ctx, rdName)
 	if listErr == nil {
 		for i := range siblings {
-			if siblings[i].NodeName == takeoverNode {
+			if naming.Same(siblings[i].NodeName, takeoverNode) {
 				continue
 			}
 
@@ -2507,7 +2508,7 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 		err = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
 			func(live *apiv1.ResourceDefinition) error {
 				if len(live.LayerStack) == 0 {
-					live.LayerStack = append([]string(nil), req.LayerList...)
+					live.LayerStack = storedLayerStack(req.LayerList)
 				}
 
 				return nil
@@ -2914,7 +2915,7 @@ func (s *Server) bumpPeerChangedOnSiblings(ctx context.Context, rdName, removedN
 
 	for i := range siblings {
 		sib := &siblings[i]
-		if sib.NodeName == removedNode {
+		if naming.Same(sib.NodeName, removedNode) {
 			// Defensive: the deleted Resource should already be
 			// absent from the list, but a racing Create could
 			// surface a fresh replica on the same node — never

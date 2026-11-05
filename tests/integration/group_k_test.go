@@ -430,12 +430,13 @@ func TestGroupKWFPoolDestroyedDropsFromPlacer(t *testing.T) {
 	stack.Satellite.SimulatePoolMissing(deadNode, deadPool)
 
 	// Give the satellite mock a tick or two so PoolMissing actually
-	// lands on the CRD status. Without this the placer reads a clean
-	// SP and the test is racy.
+	// lands on the CRD status, and wait for it where the placer reads
+	// it: the manager's cache. The apiserver has it a moment before the
+	// cache does, and a placement in between lands on the dead pool.
 	harness.Eventually(t, wfEventually, func() bool {
 		var sp blockstoriov1alpha1.StoragePool
 
-		err := stack.Env.Client.Get(context.Background(),
+		err := stack.Manager.GetClient().Get(context.Background(),
 			types.NamespacedName{Name: deadPool + "." + deadNode}, &sp)
 		if err != nil {
 			return false
@@ -450,8 +451,15 @@ func TestGroupKWFPoolDestroyedDropsFromPlacer(t *testing.T) {
 	// `rd create` in the pinned linstor-client 1.27.1 has no
 	// `--storage-pool` flag — the pool constraint rides on the
 	// autoplace call below, exactly like the operator flow.
+	//
+	// The definition sits in a group of its own that carries the same pool
+	// constraint: the group's rebalance pass may place a new definition
+	// before this autoplace does, with the group's filter, and the
+	// assertion is about any placement skipping the missing pool.
 	rdName := "wf-pool-gone"
-	cli.Run(t, "resource-definition", "create", rdName, "--resource-group", wfRG)
+	rgName := "wf-pool-gone-rg"
+	cli.Run(t, "resource-group", "create", rgName, "--place-count", "2", "--storage-pool", deadPool)
+	cli.Run(t, "resource-definition", "create", rdName, "--resource-group", rgName)
 	cli.Run(t, "volume-definition", "create", rdName, "4M")
 	cli.Run(t, "resource", "create", rdName, "--auto-place", "2",
 		"--storage-pool", deadPool)

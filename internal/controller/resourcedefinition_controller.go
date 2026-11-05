@@ -21,7 +21,6 @@ package controller
 import (
 	"context"
 	stderrors "errors"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -42,8 +41,8 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // Bug148ResizePendingAnnotationPrefix is the per-volume annotation
@@ -697,7 +696,7 @@ func (r *ResourceDefinitionReconciler) listReplicasDirect(ctx context.Context, r
 	out := make([]apiv1.Resource, 0, len(crdList.Items))
 
 	for i := range crdList.Items {
-		if crdList.Items[i].Spec.ResourceDefinitionName != rdName {
+		if !isReplicaOf(&crdList.Items[i], rdName) {
 			continue
 		}
 
@@ -847,7 +846,7 @@ func quorumPolicy(diskful, diskless int) string {
 func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, existing []apiv1.Resource) (bool, error) {
 	hostingReplica := map[string]bool{}
 	for i := range existing {
-		hostingReplica[existing[i].NodeName] = true
+		hostingReplica[naming.Key(existing[i].NodeName)] = true
 	}
 
 	// Bug 261: route through the RD-aware selector so a stale
@@ -941,7 +940,7 @@ func (r *ResourceDefinitionReconciler) rollbackWitnessIfRDGone(ctx context.Conte
 
 	var fresh blockstoriov1alpha1.ResourceDefinition
 
-	err := r.APIReader.Get(ctx, client.ObjectKey{Name: rdName}, &fresh)
+	err := r.APIReader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &fresh)
 	if err == nil && fresh.DeletionTimestamp.IsZero() {
 		// RD is still live and not mid-delete; witness is valid.
 		return
@@ -992,7 +991,7 @@ func (r *ResourceDefinitionReconciler) resolveRDLayerStack(ctx context.Context, 
 	reader := r.directOrCached()
 
 	var rg blockstoriov1alpha1.ResourceGroup
-	if err := reader.Get(ctx, client.ObjectKey{Name: k8s.Name(rd.Spec.ResourceGroupName)}, &rg); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Spec.ResourceGroupName)}, &rg); err != nil {
 		return apiv1.DefaultLayerStack()
 	}
 
@@ -1111,7 +1110,7 @@ func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blocks
 		}
 
 		// Refetch and retry.
-		err = r.Get(ctx, client.ObjectKey{Name: rd.Name}, rd)
+		err = r.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Name)}, rd)
 		if err != nil {
 			return err
 		}
@@ -1279,7 +1278,9 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 	hostingReplica map[string]bool,
 ) (string, error) {
 	excluded := make(map[string]bool, len(hostingReplica))
-	maps.Copy(excluded, hostingReplica)
+	for name, hosting := range hostingReplica {
+		excluded[naming.Key(name)] = hosting
+	}
 
 	if rdName != "" {
 		// Defense-in-depth: re-probe the store for diskful Resources
@@ -1297,7 +1298,7 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 				continue
 			}
 
-			excluded[live[i].NodeName] = true
+			excluded[naming.Key(live[i].NodeName)] = true
 		}
 	}
 
@@ -1309,7 +1310,7 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 	candidates := make([]string, 0, len(nodes))
 
 	for i := range nodes {
-		if excluded[nodes[i].Name] {
+		if excluded[naming.Key(nodes[i].Name)] {
 			continue
 		}
 
@@ -1421,9 +1422,11 @@ func (r *ResourceDefinitionReconciler) dropStrandedReplicas(
 	return live, nil
 }
 
-// nodeSets returns (disabled, known): the set of node names flagged
-// EVICTED / LOST and the set of ALL node names the store currently
-// lists. Bug 385: the RD-level witness / quorum decision must treat
+// nodeSets returns (disabled, known): the set of nodes flagged
+// EVICTED / LOST and the set of ALL nodes the store currently lists,
+// both keyed by CR name (k8s.Name). A replica names its node by the
+// CR name or by the spelling it was registered under, and the node
+// list by the registered one, so only the CR name compares them. Bug 385: the RD-level witness / quorum decision must treat
 // replicas on disabled nodes as draining placements, not live ones —
 // mirroring the placer's `disabledNodes` semantic. Bug-024 extends
 // the same idea to nodes that are gone entirely: a replica whose
@@ -1442,10 +1445,10 @@ func (r *ResourceDefinitionReconciler) nodeSets(ctx context.Context) (map[string
 	known := make(map[string]struct{}, len(nodes))
 
 	for i := range nodes {
-		known[nodes[i].Name] = struct{}{}
+		known[naming.Key(nodes[i].Name)] = struct{}{}
 
 		if isDisabledNode(&nodes[i]) {
-			disabled[nodes[i].Name] = struct{}{}
+			disabled[naming.Key(nodes[i].Name)] = struct{}{}
 		}
 	}
 
@@ -1468,7 +1471,7 @@ func (r *ResourceDefinitionReconciler) confirmGhostReplicas(
 	var live, ghosts []apiv1.Resource
 
 	for i := range replicas {
-		if _, ok := known[replicas[i].NodeName]; ok {
+		if _, ok := known[naming.Key(replicas[i].NodeName)]; ok {
 			live = append(live, replicas[i])
 
 			continue
@@ -1493,13 +1496,6 @@ func (r *ResourceDefinitionReconciler) confirmGhostReplicas(
 	return live, ghosts, nil
 }
 
-// linstorNameAnnotation mirrors pkg/store/k8s.AnnotationLinstorName.
-// The literal is duplicated (same pattern as snapshotGroupIDLabel in
-// snapshot_controller.go) to avoid a controller→store/k8s dependency.
-// Node CRDs whose LINSTOR name needed slugifying carry the original
-// wire name here; probeNodeDirect matches against both spellings.
-const linstorNameAnnotation = "blockstor.io/linstor-name"
-
 // nodeProbe is the answer probeNodeDirect returns about a node's
 // authoritative state.
 type nodeProbe struct {
@@ -1522,9 +1518,9 @@ type nodeProbe struct {
 // pinned node against the store right after the write.
 //
 // Production path: APIReader (direct apiserver reads, no cache).
-// LINSTOR node names are matched case-insensitively against both the
-// CRD name and the preserved original-name annotation, the same
-// resolution pkg/store/k8s applies. Unit tests construct the
+// A LINSTOR node name matches the CRD it maps to (k8s.Name), the same
+// resolution pkg/store/k8s applies, so My_Node and my_node stay two
+// nodes. Unit tests construct the
 // reconciler without APIReader — the Store fallback is authoritative
 // there (InMemory has no cache to lag).
 func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wireName string) (nodeProbe, error) {
@@ -1550,7 +1546,7 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 	}
 
 	for i := range list.Items {
-		if !nodeCRDMatchesWireName(&list.Items[i], wireName) {
+		if list.Items[i].Name != naming.Key(wireName) {
 			continue
 		}
 
@@ -1563,20 +1559,6 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 	return nodeProbe{}, nil
 }
 
-// nodeCRDMatchesWireName reports whether a Node CRD addresses the
-// given LINSTOR wire name: either directly via metadata.name or via
-// the preserved original-name annotation (slugified names). LINSTOR
-// identifiers are case-insensitive, so both comparisons fold case.
-func nodeCRDMatchesWireName(node *blockstoriov1alpha1.Node, wireName string) bool {
-	if strings.EqualFold(node.Name, wireName) {
-		return true
-	}
-
-	original, ok := node.Annotations[linstorNameAnnotation]
-
-	return ok && strings.EqualFold(original, wireName)
-}
-
 // splitByDisabledNode partitions replicas into (live, stranded) by the
 // disabled-node set. `live` is hosted on healthy (non-EVICTED/-LOST)
 // nodes and drives the witness / quorum decision; `stranded` sits on a
@@ -1585,7 +1567,7 @@ func splitByDisabledNode(replicas []apiv1.Resource, disabled map[string]struct{}
 	var live, stranded []apiv1.Resource
 
 	for i := range replicas {
-		if _, off := disabled[replicas[i].NodeName]; off {
+		if _, off := disabled[naming.Key(replicas[i].NodeName)]; off {
 			stranded = append(stranded, replicas[i])
 
 			continue
@@ -1669,7 +1651,7 @@ func (r *ResourceDefinitionReconciler) stampResizePending(ctx context.Context, r
 	}
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName != rd.Name {
+		if !isReplicaOf(&resList.Items[i], rd.Name) {
 			continue
 		}
 
@@ -1923,6 +1905,8 @@ func (r *ResourceDefinitionReconciler) enqueueRDForResource(_ context.Context, o
 	}
 
 	return []reconcile.Request{
-		{NamespacedName: types.NamespacedName{Name: res.Spec.ResourceDefinitionName}},
+		// The RD CR lives under the folded name; the replica keeps the
+		// spelling it was written with.
+		{NamespacedName: types.NamespacedName{Name: naming.Key(res.Spec.ResourceDefinitionName)}},
 	}
 }

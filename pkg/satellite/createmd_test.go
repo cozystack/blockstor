@@ -183,7 +183,9 @@ type fakeMetadataStamperInternal struct {
 	calls []string
 }
 
-func (f *fakeMetadataStamperInternal) StampMetadataCreated(_ context.Context, resourceName string) error {
+func (f *fakeMetadataStamperInternal) StampMetadataCreated(_ context.Context, rdName, nodeName string) error {
+	resourceName := rdName + "." + nodeName
+
 	f.calls = append(f.calls, resourceName)
 	return nil
 }

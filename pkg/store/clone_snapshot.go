@@ -29,6 +29,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // CloneSnapshotOwnerProp marks a snapshot the clone path took for itself. Its
@@ -83,7 +84,7 @@ func OwnedCloneSnapshot(ctx context.Context, st Store, rdName string) (ClonedSna
 		return ClonedSnapshotRef{}, fmt.Errorf("check whether %s owns %s/%s: %w", rdName, source, snapName, err)
 	}
 
-	if !strings.EqualFold(snap.Props[CloneSnapshotOwnerProp], rdName) {
+	if !naming.Same(snap.Props[CloneSnapshotOwnerProp], rdName) {
 		return ClonedSnapshotRef{}, nil
 	}
 
@@ -282,7 +283,7 @@ func uncachedSnapshot(ctx context.Context, st Store, srcRD, snapName string) (ap
 	}
 
 	for i := range snaps {
-		if strings.EqualFold(snaps[i].Name, snapName) {
+		if naming.Same(snaps[i].Name, snapName) {
 			return snaps[i], nil
 		}
 	}
@@ -352,7 +353,7 @@ func restoredFrom(definitions []apiv1.ResourceDefinition, source, snapshot strin
 	var names []string
 
 	for i := range definitions {
-		if strings.EqualFold(definitions[i].Props[RestoreFromSnapshotProp], marker) {
+		if SameRestoreMarker(definitions[i].Props[RestoreFromSnapshotProp], marker) {
 			names = append(names, definitions[i].Name)
 		}
 	}

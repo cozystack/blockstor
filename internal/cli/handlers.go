@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 
 	"github.com/cozystack/blockstor/pkg/store"
 
@@ -311,14 +312,13 @@ func volumeDefinitionList(ctx context.Context, run *runContext) error {
 // colour classifier went to the trouble of stripping it.
 //
 // The replicas are read whole and filtered in process, `-n` and `-r`
-// included. The filter compares the way LINSTOR does, case-insensitively,
-// and a replica's spec keeps whatever case its writer used: an adoption
-// run or linstor-csi can store `NODE-1` for a node the operator types as
-// `node-1`. The node- and definition-scoped reads compare the stored
-// spelling verbatim (see store.FoldName), so answering a narrowed listing
-// with them returned fewer rows than this filter finds, with exit status
-// zero. Narrowing the read without that loss needs the folded selectable
-// field FoldName describes; until it exists, the listing stays whole.
+// included. The filter compares names as the store addresses them
+// (naming.Same), and a replica's spec keeps whatever case its writer used:
+// an adoption run or linstor-csi can store `NODE-1` for a node the operator
+// types as `node-1`. The node- and definition-scoped reads compare the stored
+// spelling verbatim, as a field selector does (pkg/store/k8s/spellings.go),
+// so answering a narrowed listing with them returned fewer rows than this
+// filter finds, with exit status zero; the listing stays whole.
 func resourceList(ctx context.Context, run *runContext) error {
 	resources, err := fetchResources(ctx, run.Store)
 	if err != nil {
@@ -512,7 +512,7 @@ func volumeSizesInOneRequest(
 	sizes := make(map[string]map[int32]int64, len(names))
 
 	for _, name := range names {
-		vds, ok := all[store.FoldName(name)]
+		vds, ok := all[naming.Key(name)]
 		if !ok {
 			continue
 		}

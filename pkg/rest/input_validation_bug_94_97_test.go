@@ -40,7 +40,7 @@ import (
 //
 // Bug 97: `linstor rd c "  "` leaks the raw k8s "metadata.name is
 // invalid: <hex>-..." apimachinery error to the operator, exposing
-// pkg/store/k8s.Name()'s internal hash-prefix scheme. Expected: 400 +
+// pkg/naming.Key()'s internal hash-prefix scheme. Expected: 400 +
 // LINSTOR envelope naming the offending input and rule, no CRD
 // persisted, no hash-prefix in the message.
 

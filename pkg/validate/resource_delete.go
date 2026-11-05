@@ -22,6 +22,7 @@ import (
 	"errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // ErrLastSyncSourceDelete refuses removing the only replica a mid-sync peer
@@ -67,7 +68,7 @@ func MidSyncDeleteRefusal(target *apiv1.Resource, siblings []apiv1.Resource) boo
 
 	for i := range siblings {
 		sib := &siblings[i]
-		if sib.NodeName == target.NodeName || !ResourceIsDiskful(sib) {
+		if naming.Same(sib.NodeName, target.NodeName) || !ResourceIsDiskful(sib) {
 			continue
 		}
 

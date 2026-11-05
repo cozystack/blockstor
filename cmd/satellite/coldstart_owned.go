@@ -11,6 +11,7 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -42,7 +43,7 @@ func ownedOnNode(ctx context.Context, c ctrlclient.Client, nodeName string) (map
 
 	owned := make(map[string]struct{}, len(replicas))
 	for i := range replicas {
-		owned[replicas[i].Name] = struct{}{}
+		owned[naming.Key(replicas[i].Name)] = struct{}{}
 	}
 
 	return owned, nil
@@ -60,7 +61,7 @@ func selectOrphans(names []string, healthy, owned map[string]struct{}) ([]string
 			continue
 		}
 
-		if _, ok := owned[name]; !ok {
+		if _, ok := owned[naming.Key(name)]; !ok {
 			foreign = append(foreign, name)
 
 			continue

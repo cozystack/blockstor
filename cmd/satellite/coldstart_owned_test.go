@@ -156,3 +156,36 @@ func TestOwnedOnNodeNamesTheReplicasOfThisNode(t *testing.T) {
 		t.Errorf("owned on srv1 = %v, want [pvc-a pvc-b]", got)
 	}
 }
+
+// A definition registered as PVC-X runs in the kernel under its key, pvc-x,
+// while the store shows its replica under the registered spelling. Cold start
+// still knows that kernel resource for blockstor's, and takes it down when it
+// is not healthy, instead of leaving it as another DRBD user's.
+func TestColdStartOwnsAResourceRegisteredInMixedCase(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(&blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "pvc-x.srv1",
+				Annotations: map[string]string{"blockstor.io/linstor-resource-definition-name": "PVC-X"},
+			},
+			Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-x", NodeName: "srv1"},
+		}).
+		Build()
+
+	owned, err := ownedOnNode(t.Context(), c, "srv1")
+	if err != nil {
+		t.Fatalf("ownedOnNode: %v", err)
+	}
+
+	orphans, foreign := selectOrphans([]string{"pvc-x"}, map[string]struct{}{}, owned)
+	if !slices.Equal(orphans, []string{"pvc-x"}) || len(foreign) != 0 {
+		t.Errorf("orphans %v, foreign %v; want pvc-x taken down as blockstor's", orphans, foreign)
+	}
+}

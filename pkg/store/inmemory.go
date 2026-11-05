@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // InMemory is the Phase 1 store: thread-safe, RAM-backed, lost on restart.
@@ -144,7 +145,7 @@ func (s *inMemoryStoragePoolDefinitions) Get(_ context.Context, name string) (St
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	def, ok := s.m[name]
+	def, ok := s.m[naming.Key(name)]
 	if !ok {
 		return StoragePoolDefinition{}, errors.Wrapf(ErrNotFound, "storage pool definition %q", name)
 	}
@@ -163,11 +164,11 @@ func (s *inMemoryStoragePoolDefinitions) Create(_ context.Context, def *StorageP
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[def.Name]; exists {
+	if _, exists := s.m[naming.Key(def.Name)]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "storage pool definition %q", def.Name)
 	}
 
-	s.m[def.Name] = copyStoragePoolDefinition(*def)
+	s.m[naming.Key(def.Name)] = copyStoragePoolDefinition(*def)
 
 	return nil
 }
@@ -182,11 +183,11 @@ func (s *inMemoryStoragePoolDefinitions) Update(_ context.Context, def *StorageP
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[def.Name]; !exists {
+	if _, exists := s.m[naming.Key(def.Name)]; !exists {
 		return errors.Wrapf(ErrNotFound, "storage pool definition %q", def.Name)
 	}
 
-	s.m[def.Name] = copyStoragePoolDefinition(*def)
+	s.m[naming.Key(def.Name)] = copyStoragePoolDefinition(*def)
 
 	return nil
 }
@@ -197,11 +198,11 @@ func (s *inMemoryStoragePoolDefinitions) Delete(_ context.Context, name string) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[name]; !exists {
+	if _, exists := s.m[naming.Key(name)]; !exists {
 		return errors.Wrapf(ErrNotFound, "storage pool definition %q", name)
 	}
 
-	delete(s.m, name)
+	delete(s.m, naming.Key(name))
 
 	return nil
 }
@@ -309,7 +310,7 @@ func (s *inMemoryNodes) Get(_ context.Context, name string) (apiv1.Node, error) 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	n, ok := s.m[name]
+	n, ok := s.m[naming.Key(name)]
 	if !ok {
 		return apiv1.Node{}, errors.Wrapf(ErrNotFound, "node %q", name)
 	}
@@ -349,11 +350,11 @@ func (s *inMemoryNodes) Create(_ context.Context, n *apiv1.Node) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[n.Name]; exists {
+	if _, exists := s.m[naming.Key(n.Name)]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "node %q", n.Name)
 	}
 
-	s.m[n.Name] = *n
+	s.m[naming.Key(n.Name)] = *n
 
 	return nil
 }
@@ -368,11 +369,11 @@ func (s *inMemoryNodes) Update(_ context.Context, n *apiv1.Node) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[n.Name]; !exists {
+	if _, exists := s.m[naming.Key(n.Name)]; !exists {
 		return errors.Wrapf(ErrNotFound, "node %q", n.Name)
 	}
 
-	s.m[n.Name] = *n
+	s.m[naming.Key(n.Name)] = *n
 
 	return nil
 }
@@ -390,7 +391,7 @@ func (s *inMemoryNodes) PatchNetInterfaces(_ context.Context, name string, mutat
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	node, ok := s.m[name]
+	node, ok := s.m[naming.Key(name)]
 	if !ok {
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
@@ -401,7 +402,7 @@ func (s *inMemoryNodes) PatchNetInterfaces(_ context.Context, name string, mutat
 	}
 
 	node.NetInterfaces = out
-	s.m[name] = node
+	s.m[naming.Key(name)] = node
 
 	return nil
 }
@@ -418,7 +419,7 @@ func (s *inMemoryNodes) PatchProps(_ context.Context, name string, mutate func(m
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	node, ok := s.m[name]
+	node, ok := s.m[naming.Key(name)]
 	if !ok {
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
@@ -436,7 +437,7 @@ func (s *inMemoryNodes) PatchProps(_ context.Context, name string, mutate func(m
 		return errors.Wrapf(err, "patch Props of node %q", name)
 	}
 
-	s.m[name] = working
+	s.m[naming.Key(name)] = working
 
 	return nil
 }
@@ -453,7 +454,7 @@ func (s *inMemoryNodes) PatchNodeSpec(_ context.Context, name string, mutate fun
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	node, ok := s.m[name]
+	node, ok := s.m[naming.Key(name)]
 	if !ok {
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
@@ -468,7 +469,7 @@ func (s *inMemoryNodes) PatchNodeSpec(_ context.Context, name string, mutate fun
 		return errors.Wrapf(err, "patch Node %q", name)
 	}
 
-	s.m[name] = working
+	s.m[naming.Key(name)] = working
 
 	return nil
 }
@@ -478,11 +479,11 @@ func (s *inMemoryNodes) Delete(_ context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[name]; !exists {
+	if _, exists := s.m[naming.Key(name)]; !exists {
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
 
-	delete(s.m, name)
+	delete(s.m, naming.Key(name))
 
 	return nil
 }
@@ -494,13 +495,13 @@ func (s *inMemoryNodes) SetConnectionStatus(_ context.Context, name, status stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	node, ok := s.m[name]
+	node, ok := s.m[naming.Key(name)]
 	if !ok {
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
 
 	node.ConnectionStatus = status
-	s.m[name] = node
+	s.m[naming.Key(name)] = node
 
 	return nil
 }

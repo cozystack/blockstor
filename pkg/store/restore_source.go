@@ -138,7 +138,7 @@ func releaseRestoreSource(ctx context.Context, st Store, srcRD, snapName string)
 	}
 
 	for i := range rds {
-		if !strings.EqualFold(rds[i].Props[RestoreFromSnapshotProp], marker) {
+		if !SameRestoreMarker(rds[i].Props[RestoreFromSnapshotProp], marker) {
 			continue
 		}
 
@@ -236,7 +236,7 @@ func releaseRestoreMarker(ctx context.Context, st Store, rdName, marker string) 
 	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
 		// Re-checked on the object the patch writes: a marker rewritten in
 		// between is somebody else's restore.
-		if strings.EqualFold(rd.Props[RestoreFromSnapshotProp], marker) {
+		if SameRestoreMarker(rd.Props[RestoreFromSnapshotProp], marker) {
 			delete(rd.Props, RestoreFromSnapshotProp)
 		}
 

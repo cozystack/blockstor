@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 type inMemoryResourceDefinitions struct {
@@ -56,7 +57,7 @@ func (s *inMemoryResourceDefinitions) Get(_ context.Context, name string) (apiv1
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rd, ok := s.m[name]
+	rd, ok := s.m[naming.Key(name)]
 	if !ok {
 		return apiv1.ResourceDefinition{}, errors.Wrapf(ErrNotFound, "resource definition %q", name)
 	}
@@ -77,11 +78,11 @@ func (s *inMemoryResourceDefinitions) Create(_ context.Context, rd *apiv1.Resour
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[rd.Name]; exists {
+	if _, exists := s.m[naming.Key(rd.Name)]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "resource definition %q", rd.Name)
 	}
 
-	s.m[rd.Name] = *rd
+	s.m[naming.Key(rd.Name)] = *rd
 
 	return nil
 }
@@ -94,7 +95,7 @@ func (s *inMemoryResourceDefinitions) Update(_ context.Context, rd *apiv1.Resour
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	prev, exists := s.m[rd.Name]
+	prev, exists := s.m[naming.Key(rd.Name)]
 	if !exists {
 		return errors.Wrapf(ErrNotFound, "resource definition %q", rd.Name)
 	}
@@ -108,7 +109,7 @@ func (s *inMemoryResourceDefinitions) Update(_ context.Context, rd *apiv1.Resour
 	// Bug-021: nil wire annotations = "untouched"; empty = "clear".
 	// Mirrors the k8s store's mergeUserAnnotationsInto contract.
 	next.Annotations = carryAnnotationsOnNil(next.Annotations, prev.Annotations)
-	s.m[rd.Name] = next
+	s.m[naming.Key(rd.Name)] = next
 
 	return nil
 }
@@ -125,7 +126,7 @@ func (s *inMemoryResourceDefinitions) PatchResourceDefinitionSpec(_ context.Cont
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rd, ok := s.m[name]
+	rd, ok := s.m[naming.Key(name)]
 	if !ok {
 		return errors.Wrapf(ErrNotFound, "resource definition %q", name)
 	}
@@ -145,7 +146,7 @@ func (s *inMemoryResourceDefinitions) PatchResourceDefinitionSpec(_ context.Cont
 	// Bug-021: same annotation contract as Update — a closure that
 	// nils the map means "untouched", not "clear".
 	working.Annotations = carryAnnotationsOnNil(working.Annotations, prevAnnotations)
-	s.m[name] = working
+	s.m[naming.Key(name)] = working
 
 	return nil
 }
@@ -154,11 +155,11 @@ func (s *inMemoryResourceDefinitions) Delete(_ context.Context, name string) err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[name]; !exists {
+	if _, exists := s.m[naming.Key(name)]; !exists {
 		return errors.Wrapf(ErrNotFound, "resource definition %q", name)
 	}
 
-	delete(s.m, name)
+	delete(s.m, naming.Key(name))
 
 	return nil
 }

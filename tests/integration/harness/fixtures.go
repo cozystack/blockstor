@@ -23,6 +23,7 @@ package harness
 import (
 	"context"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -102,6 +103,36 @@ func SeedThreeNodeCluster(t *testing.T, stack *Stack) {
 	}
 
 	seedDefaultResourceGroup(ctx, t, cli)
+
+	waitForSeededCapacity(t, stack)
+}
+
+// waitForSeededCapacity holds a test until the mock satellite has stamped
+// capacity on every seeded pool and the manager's cache, which the placer
+// reads, has seen it. A placement before that finds no pool with free
+// space, defers itself to the shortfall replay, and a test waiting for its
+// replicas times out.
+func waitForSeededCapacity(t *testing.T, stack *Stack) {
+	t.Helper()
+
+	want := len(FixtureNodes()) * len(FixtureProviders())
+
+	Eventually(t, seedCapacityTimeout, func() bool {
+		var pools blockstoriov1alpha1.StoragePoolList
+		if err := stack.Manager.GetClient().List(context.Background(), &pools); err != nil {
+			return false
+		}
+
+		stamped := 0
+
+		for i := range pools.Items {
+			if pools.Items[i].Status.FreeCapacity > 0 {
+				stamped++
+			}
+		}
+
+		return stamped >= want
+	}, "the mock satellite never stamped capacity on the seeded pools")
 }
 
 func seedNode(ctx context.Context, t *testing.T, cli client.Client, name string) {
@@ -127,6 +158,10 @@ func seedNode(ctx context.Context, t *testing.T, cli client.Client, name string)
 		t.Fatalf("create Node %q: %v", name, err)
 	}
 }
+
+// seedCapacityTimeout bounds the wait for the first capacity stamp; the
+// mock satellite ticks every satelliteTickInterval.
+const seedCapacityTimeout = 10 * time.Second
 
 func seedStoragePool(ctx context.Context, t *testing.T, cli client.Client, node, pool, kind string) {
 	t.Helper()

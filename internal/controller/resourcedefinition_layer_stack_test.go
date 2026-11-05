@@ -193,6 +193,8 @@ func TestPinLayerStackKeepsTheAppliedStackOfAnRDThatHoldsData(t *testing.T) {
 	for name, replica := range map[string]*blockstoriov1alpha1.Resource{
 		"metadata created": withMetadata(pinReplica("pvc-pin", "n1")),
 		"device reported":  withDevice(pinReplica("pvc-pin", "n1")),
+		// A replica written before the store kept CR names in spec.
+		"metadata created, stored in another spelling": withMetadata(pinReplica("Pvc-Pin", "n1")),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

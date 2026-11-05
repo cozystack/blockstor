@@ -31,6 +31,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -120,7 +121,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	for i := range resList {
-		if resList[i].NodeName != node.Name {
+		if !naming.Same(resList[i].NodeName, node.Name) {
 			continue
 		}
 
@@ -274,7 +275,7 @@ func (r *NodeReconciler) currentDiskfulTarget(ctx context.Context, rdName, evict
 	healthyNodes := 0
 
 	for i := range nodes {
-		if _, off := drained[nodes[i].Name]; off {
+		if _, off := drained[naming.Key(nodes[i].Name)]; off {
 			continue
 		}
 
@@ -293,8 +294,8 @@ func (r *NodeReconciler) currentDiskfulTarget(ctx context.Context, rdName, evict
 
 		// Other draining nodes don't count; the evacuated node does (it
 		// is the replica we are replacing).
-		if node != evictedNode {
-			if _, off := drained[node]; off {
+		if !naming.Same(node, evictedNode) {
+			if _, off := drained[naming.Key(node)]; off {
 				continue
 			}
 		}
@@ -322,7 +323,7 @@ func (r *NodeReconciler) currentDiskfulTarget(ctx context.Context, rdName, evict
 func (r *NodeReconciler) pruneSource(ctx context.Context, rdName, node string) error {
 	resCRD := &blockstoriov1alpha1.Resource{}
 
-	err := r.Get(ctx, client.ObjectKey{Name: resourceCRDName(rdName, node)}, resCRD)
+	err := getReplica(ctx, r.Client, rdName, node, resCRD)
 	if err != nil {
 		return client.IgnoreNotFound(err)
 	}
@@ -376,11 +377,11 @@ func (r *NodeReconciler) evacuationReplacementReady(ctx context.Context, filter 
 		// Skip the source on the evacuated node and any replica still
 		// pinned to a draining (EVICTED / LOST) peer — neither counts
 		// toward the post-drain redundancy we must reach first.
-		if node == evictedNode {
+		if naming.Same(node, evictedNode) {
 			continue
 		}
 
-		if _, off := drained[node]; off {
+		if _, off := drained[naming.Key(node)]; off {
 			continue
 		}
 
@@ -412,7 +413,7 @@ func (r *NodeReconciler) evacuationReplacementReady(ctx context.Context, filter 
 func (r *NodeReconciler) replicaUpToDate(ctx context.Context, rdName, node string) (bool, error) {
 	resCRD := &blockstoriov1alpha1.Resource{}
 
-	err := r.Get(ctx, client.ObjectKey{Name: resourceCRDName(rdName, node)}, resCRD)
+	err := getReplica(ctx, r.Client, rdName, node, resCRD)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
@@ -439,17 +440,11 @@ func (r *NodeReconciler) drainingNodes(ctx context.Context) (map[string]struct{}
 	for i := range nodes {
 		if slices.Contains(nodes[i].Flags, apiv1.NodeFlagEvicted) ||
 			slices.Contains(nodes[i].Flags, apiv1.NodeFlagLost) {
-			out[nodes[i].Name] = struct{}{}
+			out[naming.Key(nodes[i].Name)] = struct{}{}
 		}
 	}
 
 	return out, nil
-}
-
-// resourceCRDName mirrors the encoding used by the k8s store —
-// `<rd>.<node>` is the documented composite key.
-func resourceCRDName(rd, node string) string {
-	return rd + "." + node
 }
 
 // annotateMigrationBlocked stamps the parent RD with the

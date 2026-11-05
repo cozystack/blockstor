@@ -32,6 +32,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // SweeperPeriod is the default cadence at which the orphan sweeper
@@ -385,7 +386,7 @@ const (
 // callers that don't plumb StateDir (the legacy unit-test fixture)
 // keep the pre-fix CRD-only behaviour.
 func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]time.Time, now time.Time, grace time.Duration, stateDir string) (sweepDecision, time.Duration) {
-	if _, ok := owned[rsc]; ok {
+	if _, ok := owned[naming.Key(rsc)]; ok {
 		return sweepKeep, 0
 	}
 
@@ -397,7 +398,7 @@ func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]tim
 		return sweepTearDown, 0
 	}
 
-	anchor, ok := rdAges[rsc]
+	anchor, ok := rdAges[naming.Key(rsc)]
 	if !ok {
 		return sweepTearDown, 0
 	}
@@ -571,7 +572,7 @@ func (s *OrphanSweeperRunnable) callSetupDown(ctx context.Context, resource stri
 func (s *OrphanSweeperRunnable) shouldSkip(ctx context.Context) (bool, error) {
 	var node blockstoriov1alpha1.Node
 
-	err := s.Client.Get(ctx, client.ObjectKey{Name: s.NodeName}, &node)
+	err := s.Client.Get(ctx, client.ObjectKey{Name: naming.Key(s.NodeName)}, &node)
 	if err != nil {
 		return false, errors.Wrap(err, "get Node")
 	}
@@ -601,11 +602,11 @@ func (s *OrphanSweeperRunnable) listOwnedResourceNames(ctx context.Context) (map
 
 	for i := range list.Items {
 		r := &list.Items[i]
-		if r.Spec.NodeName != s.NodeName {
+		if !naming.Same(r.Spec.NodeName, s.NodeName) {
 			continue
 		}
 
-		out[r.Spec.ResourceDefinitionName] = struct{}{}
+		out[naming.Key(r.Spec.ResourceDefinitionName)] = struct{}{}
 	}
 
 	return out, nil
@@ -644,7 +645,7 @@ func (s *OrphanSweeperRunnable) listResourceDefinitionAges(ctx context.Context) 
 			anchor = rd.DeletionTimestamp.Time
 		}
 
-		out[rd.Name] = anchor
+		out[naming.Key(rd.Name)] = anchor
 	}
 
 	return out, nil

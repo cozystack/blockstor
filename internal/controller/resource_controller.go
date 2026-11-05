@@ -40,6 +40,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -282,7 +283,7 @@ func (r *ResourceReconciler) handleOrphan(ctx context.Context, target *blockstor
 
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: target.Spec.ResourceDefinitionName}, &rd)
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(target.Spec.ResourceDefinitionName)}, &rd)
 	if err == nil {
 		return false, nil
 	}
@@ -336,7 +337,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+		if naming.Same(resList.Items[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			peers = append(peers, resList.Items[i])
 		}
 	}
@@ -483,7 +484,7 @@ func (r *ResourceReconciler) firstAvailablePool(ctx context.Context, nodeName st
 	}
 
 	for i := range pools {
-		if pools[i].NodeName != nodeName {
+		if !naming.Same(pools[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -525,7 +526,7 @@ func (r *ResourceReconciler) stripLegacyFinalizer(ctx context.Context, target *b
 func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blockstoriov1alpha1.ResourceDefinition, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: name}, &rd)
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(name)}, &rd)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil //nolint:nilnil // intentional: caller treats nil RD as no-volume push
@@ -794,7 +795,7 @@ func (r *ResourceReconciler) allocateResourceSpecFields(ctx context.Context, tar
 func (r *ResourceReconciler) rdInitializedForResource(ctx context.Context, rdName string) (bool, bool, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.apiReader().Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	err := r.apiReader().Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return false, false, nil
@@ -1088,7 +1089,7 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 	candidates := make([]blockstoriov1alpha1.Resource, 0, len(peers))
 
 	for i := range peers {
-		if peers[i].Name == targetName {
+		if naming.Same(peers[i].Name, targetName) {
 			continue
 		}
 
@@ -1170,7 +1171,7 @@ func anyProvenDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targe
 
 func scanDataBearingDiskfulPeers(peers []blockstoriov1alpha1.Resource, targetName string, requireObservedGI bool) bool {
 	for i := range peers {
-		if peers[i].Name == targetName {
+		if naming.Same(peers[i].Name, targetName) {
 			continue
 		}
 
@@ -1386,7 +1387,7 @@ func (r *ResourceReconciler) patchRDInitialized(ctx context.Context, rdName stri
 			Kind:       resourceDefinitionKindName,
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
-		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		ObjectMeta: metav1.ObjectMeta{Name: naming.Key(rdName)},
 	}
 
 	body := map[string]any{patchKeySpec: map[string]any{"initialized": true}}
@@ -1465,7 +1466,7 @@ func (r *ResourceReconciler) ensureRDVolumeMinors(ctx context.Context, target *b
 
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := reader.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	err := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// RD absent (unit-test fast path / rd-delete in flight).
@@ -1504,7 +1505,7 @@ func (r *ResourceReconciler) ensureRDVolumeMinors(ctx context.Context, target *b
 			// return whatever it stamped — the next reconcile observes
 			// the committed values uniformly.
 			var fresh blockstoriov1alpha1.ResourceDefinition
-			if gerr := reader.Get(ctx, client.ObjectKey{Name: rdName}, &fresh); gerr == nil {
+			if gerr := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &fresh); gerr == nil {
 				return false, vol0MinorOf(&fresh), nil
 			}
 		}
@@ -1688,7 +1689,7 @@ func (r *ResourceReconciler) patchRDVolumeMinors(ctx context.Context, rd *blocks
 			Kind:       resourceDefinitionKindName,
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
-		ObjectMeta: metav1.ObjectMeta{Name: rd.Name},
+		ObjectMeta: metav1.ObjectMeta{Name: naming.Key(rd.Name)},
 	}
 
 	return r.Patch(ctx, patchTarget, client.RawPatch(types.MergePatchType, patchBytes))
@@ -1727,7 +1728,7 @@ func (r *ResourceReconciler) allocatePortForNode(ctx context.Context, target *bl
 // seed. Returns nil when the RD is absent or sets no preference.
 func (r *ResourceReconciler) rdPreferredPort(ctx context.Context, rdName string) *int32 {
 	var rd blockstoriov1alpha1.ResourceDefinition
-	if err := r.apiReader().Get(ctx, client.ObjectKey{Name: rdName}, &rd); err != nil {
+	if err := r.apiReader().Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd); err != nil {
 		return nil
 	}
 
@@ -1761,16 +1762,16 @@ func (r *ResourceReconciler) hostingNodesForRD(ctx context.Context, rdName strin
 	out := make([]string, 0, len(list.Items))
 
 	for i := range list.Items {
-		if list.Items[i].Spec.ResourceDefinitionName != rdName {
+		if !isReplicaOf(&list.Items[i], rdName) {
 			continue
 		}
 
 		node := list.Items[i].Spec.NodeName
-		if seen[node] {
+		if seen[naming.Key(node)] {
 			continue
 		}
 
-		seen[node] = true
+		seen[naming.Key(node)] = true
 		out = append(out, node)
 	}
 
@@ -1856,7 +1857,7 @@ func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, sel
 
 	for i := range resList.Items {
 		res := &resList.Items[i]
-		if res.Spec.NodeName != nodeName || res.Name == selfName {
+		if !naming.Same(res.Spec.NodeName, nodeName) || res.Name == selfName {
 			continue
 		}
 
@@ -1890,7 +1891,7 @@ func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD stri
 
 	for i := range rdList.Items {
 		rd := &rdList.Items[i]
-		if rd.Name == selfRD {
+		if naming.Same(rd.Name, selfRD) {
 			continue
 		}
 
@@ -1969,7 +1970,7 @@ func (r *ResourceReconciler) nodeRange(
 	defLow, defHigh int32,
 ) (int32, int32, error) {
 	var node blockstoriov1alpha1.Node
-	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: naming.Key(nodeName)}, &node); err != nil {
 		if errors.IsNotFound(err) {
 			return defLow, defHigh, nil
 		}
@@ -2215,7 +2216,7 @@ func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *bl
 			continue
 		}
 
-		if res.Spec.ResourceDefinitionName != target.Spec.ResourceDefinitionName {
+		if !naming.Same(res.Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			continue
 		}
 
@@ -2284,7 +2285,7 @@ func (r *ResourceReconciler) requestsForRD(ctx context.Context, rdName, excludeN
 	out := make([]reconcile.Request, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName != rdName {
+		if !naming.Same(resList.Items[i].Spec.ResourceDefinitionName, rdName) {
 			continue
 		}
 

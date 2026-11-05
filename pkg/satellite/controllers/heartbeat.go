@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // HeartbeatPeriod is the cadence at which the satellite stamps
@@ -184,7 +185,7 @@ func (h *HeartbeatRunnable) stamp(ctx context.Context, logger logr.Logger) error
 			Kind:       "Node",
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
-		ObjectMeta: metav1.ObjectMeta{Name: h.NodeName},
+		ObjectMeta: metav1.ObjectMeta{Name: naming.Key(h.NodeName)},
 		Status: blockstoriov1alpha1.NodeStatus{
 			LastHeartbeatTime: &now,
 			Conditions: []metav1.Condition{

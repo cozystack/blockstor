@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -167,8 +168,8 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 	stripInternalAnnotationsFromSnapshots(snaps)
 
 	// Optional filters golinstor sends: ?resources=rd1,rd2 &
-	// snapshots=name1,name2 — case-insensitive set membership against
-	// Java LINSTOR's behaviour. Without filtering linstor-csi's "do
+	// snapshots=name1,name2 — set membership by naming.Same, Java
+	// LINSTOR's case-insensitive match for every name inside RFC 1123. Without filtering linstor-csi's "do
 	// any snapshots exist for this volume?" poll has to scan the
 	// whole cluster every cycle.
 	rdFilter := multiValueQuery(r, "resources")
@@ -177,11 +178,11 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 	filtered := make([]apiv1.Snapshot, 0, len(snaps))
 
 	for i := range snaps {
-		if !matchAnyFold(rdFilter, snaps[i].ResourceName) {
+		if !matchAnyName(rdFilter, snaps[i].ResourceName) {
 			continue
 		}
 
-		if !matchAnyFold(nameFilter, snaps[i].Name) {
+		if !matchAnyName(nameFilter, snaps[i].Name) {
 			continue
 		}
 
@@ -367,7 +368,7 @@ func (s *Server) stampSnapshotSuccessful(ctx context.Context, snaps []apiv1.Snap
 			continue
 		}
 
-		diskful, ok := diskfulByRD[snap.ResourceName]
+		diskful, ok := diskfulByRD[naming.Key(snap.ResourceName)]
 		if !ok {
 			built, err := s.diskfulPeerSet(ctx, snap.ResourceName)
 			if err != nil {
@@ -375,7 +376,7 @@ func (s *Server) stampSnapshotSuccessful(ctx context.Context, snaps []apiv1.Snap
 			}
 
 			diskful = built
-			diskfulByRD[snap.ResourceName] = diskful
+			diskfulByRD[naming.Key(snap.ResourceName)] = diskful
 		}
 
 		if isSnapshotSuccessful(snap, diskful) {
@@ -446,11 +447,11 @@ func isSnapshotSuccessful(snap *apiv1.Snapshot, diskful map[string]struct{}) boo
 			continue
 		}
 
-		reported[entry.NodeName] = struct{}{}
+		reported[naming.Key(entry.NodeName)] = struct{}{}
 	}
 
 	for node := range denominator {
-		if _, ok := reported[node]; !ok {
+		if _, ok := reported[naming.Key(node)]; !ok {
 			return false
 		}
 	}
@@ -470,8 +471,8 @@ func successDenominator(snap *apiv1.Snapshot, diskful map[string]struct{}) map[s
 	out := make(map[string]struct{}, len(snap.Nodes))
 
 	for _, node := range snap.Nodes {
-		if _, ok := diskful[node]; ok {
-			out[node] = struct{}{}
+		if _, ok := diskful[naming.Key(node)]; ok {
+			out[naming.Key(node)] = struct{}{}
 		}
 	}
 
@@ -516,7 +517,7 @@ func (s *Server) diskfulPeerSet(ctx context.Context, rdName string) (map[string]
 			continue
 		}
 
-		out[resList[i].NodeName] = struct{}{}
+		out[naming.Key(resList[i].NodeName)] = struct{}{}
 	}
 
 	return out, nil
@@ -729,7 +730,7 @@ func validateSnapshotCreateBody(w http.ResponseWriter, r *http.Request, rd strin
 	//
 	// Bug 97: tighten further to the full RFC-1123 subdomain rule so
 	// `linstor s c <rd> "Foo Bar"` is refused with a LINSTOR envelope
-	// before pkg/store/k8s.Name() slugifies the input.
+	// before pkg/store/naming.Key() slugifies the input.
 	snapNameErr := validateLinstorName("snapshot", strings.TrimSpace(snap.Name))
 	if snapNameErr != nil {
 		writeError(w, http.StatusBadRequest, snapNameErr.Error())
@@ -1065,9 +1066,11 @@ func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.
 // mixed-provider RD is not falsely refused. An empty targetNodes means
 // "all diskful replicas" (the un-pinned default-fan-out case).
 func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.Resource, targetNodes []string) []string {
+	// Keyed by CR name: snap.Nodes lists a node as registered, and a
+	// replica written before the store stored CR names may spell it so too.
 	want := make(map[string]struct{}, len(targetNodes))
 	for _, n := range targetNodes {
-		want[n] = struct{}{}
+		want[naming.Key(n)] = struct{}{}
 	}
 
 	var offenders []poolOffender
@@ -1079,7 +1082,7 @@ func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.R
 
 		// Scope to the resolved target set when the caller pinned one.
 		if len(want) > 0 {
-			if _, ok := want[res.NodeName]; !ok {
+			if _, ok := want[naming.Key(res.NodeName)]; !ok {
 				continue
 			}
 		}

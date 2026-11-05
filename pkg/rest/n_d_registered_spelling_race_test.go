@@ -10,6 +10,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -53,7 +54,7 @@ func (f foldingNodes) registered(ctx context.Context, name string) (string, erro
 	}
 
 	for i := range all {
-		if store.FoldName(all[i].Name) == store.FoldName(name) {
+		if naming.Key(all[i].Name) == naming.Key(name) {
 			return all[i].Name, nil
 		}
 	}
