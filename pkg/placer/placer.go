@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/cockroachdb/errors"
 
@@ -139,6 +140,23 @@ type Placer struct {
 	store store.Store
 }
 
+// placing serializes placement per definition across every Placer in the
+// process. The REST autoplace, the resource-group reconcilers and node
+// replacement all place, each counting the replicas there are and adding
+// the rest; two at once each count the other's replicas as missing and
+// the definition ends up with more than it asked for.
+//
+//nolint:gochecknoglobals // one lock set for every Placer in the process
+var placing sync.Map
+
+func lockDefinition(rdName string) func() {
+	mu, _ := placing.LoadOrStore(naming.Key(rdName), &sync.Mutex{})
+	lock, _ := mu.(*sync.Mutex)
+	lock.Lock()
+
+	return lock.Unlock
+}
+
 // New constructs a Placer over the given store. The store reference
 // is stashed; callers that share state across goroutines should pass
 // the same store.Store the rest of the controller uses.
@@ -160,6 +178,8 @@ func New(st store.Store) *Placer {
 // the migration semantic: even if 2 replicas exist, if one is on an
 // evicted node the placer will create a third on a healthy peer.
 func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
+	defer lockDefinition(rdName)()
+
 	// Bug 038: an RD born from a snapshot restore / clone must never
 	// gain a diskful replica on a foreign backend or a snapshot-less
 	// node — enforce the restore-source constraints HERE so every
@@ -304,7 +324,7 @@ func (p *Placer) buildPlan(ctx context.Context, rdName string, filter *apiv1.Aut
 // assemblePlan finishes off buildPlan once the capacity gate has
 // passed. Split out so buildPlan stays under the gocyclo budget.
 func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, candidates []apiv1.StoragePool, requiredKib int64, gates candidateGates) (*placePlan, error) {
-	existing, err := p.store.Resources().ListByDefinition(ctx, rdName)
+	existing, err := store.LiveReplicas(ctx, p.store, rdName)
 	if err != nil {
 		return nil, errors.Wrap(err, "list resources by definition")
 	}
