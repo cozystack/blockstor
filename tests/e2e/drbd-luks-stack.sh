@@ -47,7 +47,7 @@ ensure_passphrase_secret "$PASSPHRASE"
 
 echo ">> apply ${RD} with LayerStack=[DRBD,LUKS,STORAGE]"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -58,7 +58,7 @@ EOF
 
 for n in "$N1" "$N2"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:

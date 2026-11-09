@@ -164,10 +164,10 @@ assert_clone_marker() {
 # clone (zfs targets stay dependent on their origin snapshot).
 assert_internal_snapshot() {
     local dst=$1
-    if ! kubectl get "snapshots.blockstor.cozystack.io/${SRC}.clone-${dst}" \
+    if ! kubectl get "snapshots.blockstor.org/${SRC}.clone-${dst}" \
             >/dev/null 2>&1; then
         echo "FAIL (Bug 020): internal snapshot ${SRC}.clone-${dst} not found" >&2
-        kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null >&2 || true
+        kubectl get snapshots.blockstor.org --no-headers 2>/dev/null >&2 || true
         return 1
     fi
 }

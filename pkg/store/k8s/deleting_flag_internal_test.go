@@ -113,7 +113,7 @@ func TestCrdToWireRDSurfacesDeletingFlag(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "deleting-rd",
 			DeletionTimestamp: &now,
-			Finalizers:        []string{"blockstor.cozystack.io/satellite-resource"},
+			Finalizers:        []string{"blockstor.org/satellite-resource"},
 		},
 	}
 	SetOriginalName(&crd.ObjectMeta, "deleting-rd")
@@ -146,7 +146,7 @@ func TestCrdToWireResourceSurfacesDeletingFlag(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "deleting-rsc",
 			DeletionTimestamp: &now,
-			Finalizers:        []string{"blockstor.cozystack.io/satellite-resource"},
+			Finalizers:        []string{"blockstor.org/satellite-resource"},
 		},
 		Spec: crdv1alpha1.ResourceSpec{
 			ResourceDefinitionName: "deleting-rd",
@@ -181,7 +181,7 @@ func TestCrdToWireSnapshotSurfacesDeletingFlag(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "src.clone-dst",
 			DeletionTimestamp: &now,
-			Finalizers:        []string{"blockstor.cozystack.io/satellite-snapshot"},
+			Finalizers:        []string{"blockstor.org/satellite-snapshot"},
 		},
 		Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "src", SnapshotName: "clone-dst"},
 	}

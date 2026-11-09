@@ -76,7 +76,7 @@ const groupGRDPrefix = "rd-g-"
 // imported) because the constant lives in an internal helper
 // package and pulling it would invite a wider dependency surface
 // than this test file needs.
-const snapshotCRDLabelRD = "blockstor.io/resource-definition"
+const snapshotCRDLabelRD = "blockstor.org/resource-definition"
 
 // satelliteSnapshotFinalizer mirrors
 // pkg/satellite/controllers.SatelliteSnapshotFinalizer. Stamped on
@@ -84,7 +84,7 @@ const snapshotCRDLabelRD = "blockstor.io/resource-definition"
 // waits for the satellite-side DeleteSnapshot before reaping —
 // Bug 64 fix. Mirrored (not imported) to keep this test file off
 // the satellite controllers package.
-const satelliteSnapshotFinalizer = "blockstor.cozystack.io/satellite-snapshot"
+const satelliteSnapshotFinalizer = "blockstor.org/satellite-snapshot"
 
 // groupGRDName builds a per-subtest RD name from a suffix slug.
 func groupGRDName(suffix string) string { return groupGRDPrefix + suffix }

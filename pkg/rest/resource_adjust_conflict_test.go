@@ -133,7 +133,7 @@ func TestActivateDeactivateRetriesOnStoreConflict(t *testing.T) {
 
 // conflictTouchLabel marks the out-of-band "reconciler" write the
 // interceptor injects between the handler's read and write.
-const conflictTouchLabel = "test.blockstor.io/reconciler-touch"
+const conflictTouchLabel = "test.blockstor.org/reconciler-touch"
 
 // newConflictInjectingResourceClient builds a fake controller-runtime
 // client that simulates a controller reconciler racing the REST

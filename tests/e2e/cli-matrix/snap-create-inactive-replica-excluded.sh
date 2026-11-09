@@ -119,7 +119,7 @@ echo ">>   wait up to 30s for INACTIVE flag on $N3"
 deadline=$(( $(date +%s) + 30 ))
 inactive_seen=false
 while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
+    flags=$(kubectl get "resources.blockstor.org/${RD}.${N3}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     if [[ "$flags" == *"INACTIVE"* ]]; then
         inactive_seen=true
@@ -129,7 +129,7 @@ while (( $(date +%s) < deadline )); do
 done
 if ! $inactive_seen; then
     echo "FAIL: $N3 never got INACTIVE flag within 30s" >&2
-    kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" -o yaml 2>&1 | tail -30 >&2
+    kubectl get "resources.blockstor.org/${RD}.${N3}" -o yaml 2>&1 | tail -30 >&2
     exit 1
 fi
 
@@ -149,7 +149,7 @@ _out=$("${LCTL[@]}" snapshot create "$RD" "$SNAP" 2>&1) \
     || { echo "FAIL (Bug 394): snapshot create returned non-zero — group likely aborted on INACTIVE peer: $_out" >&2; exit 1; }
 
 snap_json() {
-    kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
+    kubectl get snapshots.blockstor.org -o json 2>/dev/null \
         | jq -c --arg rd "$RD" --arg s "$SNAP" '
             [.items[]?
              | select(.spec.resourceDefinitionName==$rd)

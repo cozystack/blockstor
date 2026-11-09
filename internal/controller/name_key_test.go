@@ -80,7 +80,7 @@ func TestEvacuatingANodeRegisteredInMixedCaseKeepsItsLoneSource(t *testing.T) {
 		Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-solo", NodeName: "node-1"},
 	}
 	nodeCRD := &blockstoriov1alpha1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-1", Annotations: map[string]string{"blockstor.io/linstor-name": "Node-1"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1", Annotations: map[string]string{"blockstor.org/linstor-name": "Node-1"}},
 		Spec:       blockstoriov1alpha1.NodeSpec{Type: apiv1.NodeTypeSatellite, Flags: []string{apiv1.NodeFlagEvicted}},
 	}
 

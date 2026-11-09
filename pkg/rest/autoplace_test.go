@@ -1511,7 +1511,7 @@ func TestResourceDeleteWithoutKeepTiebreakerSkipsOverride(t *testing.T) {
 
 // TestResourceDeleteBumpsSiblingPeers pins Bug 67's core invariant:
 // when `linstor r d <node> <rd>` drops one peer, every SURVIVING
-// sibling Resource of the same RD gets `blockstor.io/peer-changed`
+// sibling Resource of the same RD gets `blockstor.org/peer-changed`
 // stamped with a fresh RFC3339-parseable timestamp. The annotation is
 // the trigger the satellite's local-Resource watch sees — without it,
 // the survivor's Reconcile never re-derives the peer set and DRBD
@@ -1589,7 +1589,7 @@ func TestResourceDeleteBumpsSiblingPeers(t *testing.T) {
 // every CSI replay would otherwise churn the satellite reconciler
 // (each replay = a fresh annotation = a fresh Reconcile + drbdadm
 // adjust on every survivor) and pollute audit tools that key off
-// `blockstor.io/peer-changed`.
+// `blockstor.org/peer-changed`.
 //
 // Only a REAL drop (the row left the store on this call) changes
 // the peer set the survivors render, so only a real drop justifies
@@ -1753,7 +1753,7 @@ func TestResourceDeleteBumpsTimestampMonotonic(t *testing.T) {
 // TestResourceDeleteBumpsAllSurvivorsScenario4W19 closes wave2-04
 // scenario 4.W19 (cross-listed wave1 4.3, Bug 67): `linstor r d <node>
 // <rd>` against ONE replica of a multi-replica RD MUST stamp
-// `blockstor.io/peer-changed` on EVERY surviving sibling — not just
+// `blockstor.org/peer-changed` on EVERY surviving sibling — not just
 // the next-in-list, not just the lexicographically-first, not just
 // "the kept one" by any other selection rule. The existing 3-node
 // test (TestResourceDeleteBumpsSiblingPeers) is too small to

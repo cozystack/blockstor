@@ -104,7 +104,7 @@ _out=$("${LCTL[@]}" resource delete "$DROP" "$RD" 2>&1) \
 echo ">> wait $DROP's replica is gone"
 drop_deadline=$(( $(date +%s) + 90 ))
 while (( $(date +%s) < drop_deadline )); do
-    if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${DROP}" >/dev/null 2>&1; then
+    if ! kubectl get "resources.blockstor.org/${RD}.${DROP}" >/dev/null 2>&1; then
         break
     fi
     sleep 2

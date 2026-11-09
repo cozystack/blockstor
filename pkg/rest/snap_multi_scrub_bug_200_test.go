@@ -25,7 +25,7 @@ package rest
 // `scrubImplDetails` — but the multi-create batch path emits
 // per-entry envelopes via `writeJSON`, so the scrub guard is
 // bypassed. A `Snapshots().Create` failure carrying "etcdserver:",
-// "apimachinery", "k8s.io" or "controllerconfigs.blockstor.cozystack.io"
+// "apimachinery", "k8s.io" or "controllerconfigs.blockstor.org"
 // leaks the backend identity through `POST /v1/actions/snapshot/multi`.
 //
 // v12 specifically flagged `snapshot_multi.go:110, 118` as suspect.
@@ -44,7 +44,7 @@ package rest
 //     returning "etcdserver: request is too large" → body envelope's
 //     Message contains `<backend>`, NOT "etcdserver" / "etcd".
 //   - TestBug200SnapshotMultiScrubsAPIMachineryLeak: same shape for
-//     "controllerconfigs.blockstor.cozystack.io" / "apimachinery"
+//     "controllerconfigs.blockstor.org" / "apimachinery"
 //     / "k8s.io".
 //   - TestBug200SnapshotMultiPreservesLiteralMessages: an operator-
 //     friendly literal ("snapshot X already exists") passes through
@@ -75,7 +75,7 @@ var (
 	// "Operation cannot be fulfilled on …" capitalised message so the
 	// scrub test sees the exact byte sequence emitted in production.
 	errBug200APIMachineryConflict = errors.New(
-		`Operation cannot be fulfilled on controllerconfigs.blockstor.cozystack.io ` +
+		`Operation cannot be fulfilled on controllerconfigs.blockstor.org ` +
 			`"default": the object has been modified; please apply your changes to the latest ` +
 			`version and try again (via apimachinery/k8s.io/api/...)`)
 	errBug200LiteralAlreadyExists   = errors.New("snapshot snap-x already exists")
@@ -269,7 +269,7 @@ func TestBug200SnapshotMultiScrubsEtcdLeak(t *testing.T) {
 
 // TestBug200SnapshotMultiScrubsAPIMachineryLeak pins the apimachinery
 // flavour. A Snapshots().Create returning a NewConflict-shaped string
-// carrying "controllerconfigs.blockstor.cozystack.io" /
+// carrying "controllerconfigs.blockstor.org" /
 // "apimachinery" / "k8s.io" must reach the wire scrubbed.
 func TestBug200SnapshotMultiScrubsAPIMachineryLeak(t *testing.T) {
 	t.Parallel()
@@ -290,7 +290,7 @@ func TestBug200SnapshotMultiScrubsAPIMachineryLeak(t *testing.T) {
 
 	low := strings.ToLower(string(body))
 	for _, leak := range []string{
-		"controllerconfigs.blockstor.cozystack.io",
+		"controllerconfigs.blockstor.org",
 		"apimachinery",
 		"k8s.io",
 		"etcd",

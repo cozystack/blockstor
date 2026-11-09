@@ -48,7 +48,7 @@ const (
 	// PropAutoplacerWeightMinReservedSpace scales the
 	// "1 - reservedKib/totalKib" score (less reserved is better).
 	// Reserved is read from the pool's
-	// `Aux/blockstor.io/reserved-kib` prop; missing = 0.
+	// `Aux/blockstor.org/reserved-kib` prop; missing = 0.
 	PropAutoplacerWeightMinReservedSpace = "Autoplacer/Weights/MinReservedSpace"
 	// PropAutoplacerWeightMinRscCount scales the
 	// "1 / (1 + numResourcesOnNode)" score — pools on busier nodes
@@ -63,7 +63,7 @@ const (
 	// PropAuxPoolReservedKib is the optional pool-scope hint for
 	// reserved (non-Free) capacity in KiB. Used by the
 	// MinReservedSpace strategy when present.
-	PropAuxPoolReservedKib = "Aux/blockstor.io/reserved-kib"
+	PropAuxPoolReservedKib = "Aux/blockstor.org/reserved-kib"
 	// PropAutoplacerMaxThroughput is the per-StoragePool advertised
 	// maximum throughput in bytes/sec (scenario 6.W11, mirrors
 	// upstream LINSTOR's `Autoplacer/MaxThroughput`). Consumed by
@@ -144,7 +144,7 @@ type EffectiveProperties map[string]EffectivePropEntry
 //
 // Scenario 2.W02: when this prop resolves to "false" at controller
 // scope, the RGRebalanceReconciler MUST short-circuit even with the
-// `blockstor.io/rebalance-pending` annotation present — operators
+// `blockstor.org/rebalance-pending` annotation present — operators
 // disable the periodic rescheduling for clusters that prefer manual
 // placement decisions, and a stamped annotation from a stale REST
 // modify shouldn't override that choice.

@@ -20,13 +20,13 @@ A replica counts as faulty when one of its volumes has a disk state that has not
 The custom resources carry the same information for `kubectl` and for monitoring:
 
 ```sh
-kubectl get nodes.blockstor.cozystack.io          # Status ONLINE or OFFLINE
+kubectl get nodes.blockstor.org                    # Status ONLINE or OFFLINE
 kubectl get storagepools                          # free and total KiB per pool
 kubectl get resourcedefinitions                   # group, DRBD port, layers
 kubectl get resources                             # one row per replica: node, pool, port, state, in use
 ```
 
-Use the full name `nodes.blockstor.cozystack.io`, because plain `nodes` is the Kubernetes kind.
+Use the full name `nodes.blockstor.org`, because plain `nodes` is the Kubernetes kind.
 
 A `Node` is `ONLINE` while its satellite stamps a heartbeat every 10 seconds. When the heartbeat is more than 40 seconds old, the controller sets the `Ready` condition to `Unknown` and the status to `OFFLINE`.
 
@@ -184,12 +184,12 @@ Blockstor keeps all of its state in custom resources, so a backup is a dump of t
 ```sh
 for kind in controllerconfigs nodes storagepools physicaldevices \
             resourcegroups resourcedefinitions resources snapshots; do
-  kubectl get "$kind.blockstor.cozystack.io" -o yaml > "blockstor-$kind.yaml"
+  kubectl get "$kind.blockstor.org" -o yaml > "blockstor-$kind.yaml"
 done
 kubectl -n blockstor-system get secret blockstor-cluster-passphrase -o yaml > blockstor-passphrase.yaml
 ```
 
-The full names, such as `resources.blockstor.cozystack.io`, keep `kubectl` from picking another product's resource with the same plural. The last line applies only if you use encrypted volumes. The Secret holds the cluster passphrase, and the volumes cannot be opened without it. Its name can be changed through `spec.passphraseSecretRef` on the `ControllerConfig`. Store the backup like any other secret material.
+The full names, such as `resources.blockstor.org`, keep `kubectl` from picking another product's resource with the same plural. The last line applies only if you use encrypted volumes. The Secret holds the cluster passphrase, and the volumes cannot be opened without it. Its name can be changed through `spec.passphraseSecretRef` on the `ControllerConfig`. Store the backup like any other secret material.
 
 The passphrase can also be set as a property, `DrbdOptions/EncryptPassphrase` on the controller or `DrbdOptions/Encryption/passphrase` on a definition, and a property set there wins over the Secret. A property is stored in plaintext on its resource, so the YAML dump above then carries the key to every encrypted volume. Keep the passphrase in the Secret only, and treat the dump as secret material if such a property was ever set.
 

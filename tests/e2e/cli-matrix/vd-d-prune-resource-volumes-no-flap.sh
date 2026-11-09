@@ -153,7 +153,7 @@ echo ">> wait up to 60s for RD.spec.volumeDefinitions to settle to [vol-0]"
 deadline=$(( $(date +%s) + 60 ))
 rd_settled=false
 while (( $(date +%s) < deadline )); do
-    vd_nrs=$(kubectl get resourcedefinitions.blockstor.cozystack.io "$RD" \
+    vd_nrs=$(kubectl get resourcedefinitions.blockstor.org "$RD" \
         -o jsonpath='{.spec.volumeDefinitions[*].volumeNumber}' 2>/dev/null || echo "")
     if [[ "$vd_nrs" == "0" ]]; then
         rd_settled=true
@@ -177,16 +177,16 @@ while (( $(date +%s) < deadline )); do
     bad=0
     while read -r name; do
         [[ -z "$name" ]] && continue
-        spec_nrs=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+        spec_nrs=$(kubectl get "resources.blockstor.org/${name}" \
             -o jsonpath='{.spec.volumes[*].volumeNumber}' 2>/dev/null || echo "ERR")
-        status_nrs=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+        status_nrs=$(kubectl get "resources.blockstor.org/${name}" \
             -o jsonpath='{.status.volumes[*].volumeNumber}' 2>/dev/null || echo "ERR")
         # status.volumes may legitimately be empty on a brand-new
         # diskless/tiebreaker row, but must NEVER contain volume 1.
         if [[ "$spec_nrs" == *"1"* ]] || [[ "$status_nrs" == *"1"* ]]; then
             bad=1
         fi
-    done < <(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    done < <(kubectl get resources.blockstor.org --no-headers 2>/dev/null \
                 | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}')
     if (( bad == 0 )); then
         converged=true
@@ -197,11 +197,11 @@ done
 
 if [[ "$converged" != "true" ]]; then
     echo "FAIL (Bug 399): a Resource still carries volume 1 in spec.volumes or status.volumes 90s after vd d" >&2
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}' \
         | while read -r name; do
             echo "----- $name -----" >&2
-            kubectl get "resources.blockstor.cozystack.io/${name}" \
+            kubectl get "resources.blockstor.org/${name}" \
                 -o jsonpath='spec.volumes={.spec.volumes[*].volumeNumber} status.volumes={.status.volumes[*].volumeNumber}{"\n"}' >&2 || true
         done
     exit 1
@@ -219,13 +219,13 @@ fi
 # comparison is kine-safe and is exactly what catches the real phantom.
 echo ">> [Bug 399] flap check: per-replica status.volumes SET must be stable over a 12s window (5 polls)"
 status_volset_snapshot() {
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}' \
         | sort \
         | while read -r name; do
             [[ -z "$name" ]] && continue
             local st
-            st=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+            st=$(kubectl get "resources.blockstor.org/${name}" \
                 -o jsonpath='{.status.volumes[*].volumeNumber}' 2>/dev/null \
                 | tr ' ' '\n' | sort -n | tr '\n' ',')
             echo "${name}=${st}"

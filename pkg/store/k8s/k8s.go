@@ -41,8 +41,8 @@ import (
 // (node_name, pool_name) composite key does not survive a single
 // metadata.name, so we encode it via labels for fast list queries.
 const (
-	LabelNodeName = "blockstor.io/node-name"
-	LabelPoolName = "blockstor.io/pool-name"
+	LabelNodeName = "blockstor.org/node-name"
+	LabelPoolName = "blockstor.org/pool-name"
 )
 
 // Store is a controller-runtime-client-backed store.

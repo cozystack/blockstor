@@ -32,7 +32,7 @@ import (
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
-// Bug-021 (release-gate, P1) — the `blockstor.io/rebalance-pending`
+// Bug-021 (release-gate, P1) — the `blockstor.org/rebalance-pending`
 // RG annotation could never be removed in production. The strip
 // helpers nil-ed the wire annotation map once it became empty, but
 // the k8s store's mergeUserAnnotationsInto treats a NIL wire map as

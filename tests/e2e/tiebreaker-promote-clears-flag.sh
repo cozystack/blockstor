@@ -52,7 +52,7 @@ dump_diag() {
     "${LCTL[@]}" r l -r "$RD" 2>&1 || true
     echo "---- dump: Resource CRDs (flags) ----"
     for n in "$N1" "$N2" "$N3"; do
-        kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
+        kubectl get "resources.blockstor.org/${RD}.${n}" \
             -o jsonpath='{.metadata.name}{" flags="}{.spec.flags}{"\n"}' \
             2>/dev/null || true
     done
@@ -98,7 +98,7 @@ wait_disk_state "$RD" "$N3" Diskless "$CONVERGE" 0
 # Pin the pre-promote shape: the witness CRD must carry BOTH
 # DISKLESS and TIE_BREAKER (this is the only state the bug
 # applies to — a non-witness diskless would have only DISKLESS).
-tb_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
+tb_flags=$(kubectl get "resources.blockstor.org/${RD}.${N3}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null)
 
 if [[ "$tb_flags" != *"DISKLESS"* || "$tb_flags" != *"TIE_BREAKER"* ]]; then
@@ -130,7 +130,7 @@ deadline=$(( $(date +%s) + CONVERGE ))
 final_flags=""
 
 while (( $(date +%s) < deadline )); do
-    final_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
+    final_flags=$(kubectl get "resources.blockstor.org/${RD}.${N3}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null)
 
     if [[ "$final_flags" != *"DISKLESS"* && "$final_flags" != *"TIE_BREAKER"* ]]; then

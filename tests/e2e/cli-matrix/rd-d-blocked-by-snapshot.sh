@@ -114,11 +114,11 @@ fi
 
 # RD + both replicas must survive the refused delete (cascade must NOT
 # have fired). Probe the CRD layer directly.
-if ! kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" >/dev/null 2>&1; then
+if ! kubectl get "resourcedefinitions.blockstor.org/${RD}" >/dev/null 2>&1; then
     echo "FAIL (E1): RD ${RD} vanished after a REFUSED rd d — cascade fired before the guard" >&2
     exit 1
 fi
-repl_count=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+repl_count=$(kubectl get resources.blockstor.org --no-headers 2>/dev/null \
     | awk -v rd="${RD}." '$1 ~ "^"rd' | wc -l | tr -d ' ')
 if [[ "$repl_count" -lt 2 ]]; then
     echo "FAIL (E1): expected >=2 replicas after refused rd d, got $repl_count" >&2
@@ -180,7 +180,7 @@ fi
 # starts from a clean state.
 deadline=$(( $(date +%s) + 120 ))
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" >/dev/null 2>&1; then
+    if ! kubectl get "resourcedefinitions.blockstor.org/${RD}" >/dev/null 2>&1; then
         break
     fi
     sleep 3

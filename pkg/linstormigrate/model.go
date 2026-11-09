@@ -19,7 +19,7 @@ limitations under the License.
 // Package linstormigrate converts a LINSTOR k8s-backend database dump
 // (the `*.internal.linstor.linbit.com` CRDs LINSTOR uses as its SQL
 // tables when running with the k8s connector) into blockstor
-// `blockstor.cozystack.io/v1alpha1` CRD manifests.
+// `blockstor.org/v1alpha1` CRD manifests.
 //
 // The input is the directory produced by:
 //

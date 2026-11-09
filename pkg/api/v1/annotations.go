@@ -31,7 +31,7 @@ package v1
 // controller reader (`isTiebreakerSuppressed`) share a single source
 // of truth without either package importing the other — pkg/api/v1
 // is the neutral, dependency-free shared layer both already import.
-const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.io/auto-tiebreaker-suppressed-until"
+const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.org/auto-tiebreaker-suppressed-until"
 
 // KeepTiebreakerUntilAnnotation is stamped on an RD when an operator
 // runs `linstor r d --keep-tiebreaker <diskful-node> <rd>`. Upstream
@@ -58,7 +58,7 @@ const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.io/auto-tiebreaker-su
 // the REST writer and controller reader share a single source of
 // truth without either package importing the other — pkg/api/v1 is
 // the neutral, dependency-free shared layer both already import.
-const KeepTiebreakerUntilAnnotation = "blockstor.io/keep-tiebreaker-until"
+const KeepTiebreakerUntilAnnotation = "blockstor.org/keep-tiebreaker-until"
 
 // AutoDiskfulDeadlineAnnotation is stamped on an RD when the
 // AutoDiskfulReconciler first observes a diskful-replica deficit
@@ -78,7 +78,7 @@ const KeepTiebreakerUntilAnnotation = "blockstor.io/keep-tiebreaker-until"
 // 4349-4425). The prop hierarchy is Controller → RG → RD: lower scope
 // wins. AutoDiskfulPropKey + this annotation are defined here so the
 // REST writer and controller reader share a single source of truth.
-const AutoDiskfulDeadlineAnnotation = "blockstor.io/auto-diskful-deadline"
+const AutoDiskfulDeadlineAnnotation = "blockstor.org/auto-diskful-deadline"
 
 // AutoDiskfulPropKey is the upstream-LINSTOR property name for the
 // auto-diskful timer (minutes). Set on ControllerProps for cluster-
@@ -117,7 +117,7 @@ const AutoDiskfulAllowCleanupPropKey = "DrbdOptions/auto-diskful-allow-cleanup"
 // the K8s store, which surfaces it on the CRD's `metadata.annotations`
 // so the controller-runtime watch fires. The annotation is harmless to
 // the dispatcher / Python CLI (they ignore unknown keys).
-const PeerChangedAnnotation = "blockstor.io/peer-changed"
+const PeerChangedAnnotation = "blockstor.org/peer-changed"
 
 // RDSpawnShortfallAnnotation is stamped on a ResourceDefinition when
 // `rg spawn` placed strictly fewer replicas than the parent RG's
@@ -139,7 +139,7 @@ const PeerChangedAnnotation = "blockstor.io/peer-changed"
 // controller reader (RGRebalanceReconciler) share a single source of
 // truth without either package importing the other — pkg/api/v1 is
 // the neutral, dependency-free shared layer both already import.
-const RDSpawnShortfallAnnotation = "blockstor.io/spawn-shortfall"
+const RDSpawnShortfallAnnotation = "blockstor.org/spawn-shortfall"
 
 // UnappliedGroupLayerStackAnnotation is stamped on a ResourceDefinition
 // whose decided stack lacks a layer its resource group asks for now: one the
@@ -150,4 +150,4 @@ const RDSpawnShortfallAnnotation = "blockstor.io/spawn-shortfall"
 // missing. It records, comma-separated, the group's stack, so an operator
 // can find every volume that is short of what its group promises (for
 // example a plaintext volume in a LUKS group).
-const UnappliedGroupLayerStackAnnotation = "blockstor.io/unapplied-group-layer-stack"
+const UnappliedGroupLayerStackAnnotation = "blockstor.org/unapplied-group-layer-stack"

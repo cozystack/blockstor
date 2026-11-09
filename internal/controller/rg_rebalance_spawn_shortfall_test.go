@@ -33,7 +33,7 @@ import (
 )
 
 // TestSpawnShortfallReplaysAfterGracePeriod pins scenario 2.20: an RD
-// stamped with `blockstor.io/spawn-shortfall=<RFC3339>` by 9.W05's
+// stamped with `blockstor.org/spawn-shortfall=<RFC3339>` by 9.W05's
 // partial-fail spawn path gets retried on the rebalance reconciler's
 // next scheduled tick, but only after `BalanceResourcesGracePeriod`
 // has elapsed since the stamp. On a successful retry the annotation

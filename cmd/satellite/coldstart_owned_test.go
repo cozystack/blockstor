@@ -173,7 +173,7 @@ func TestColdStartOwnsAResourceRegisteredInMixedCase(t *testing.T) {
 		WithObjects(&blockstoriov1alpha1.Resource{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        "pvc-x.srv1",
-				Annotations: map[string]string{"blockstor.io/linstor-resource-definition-name": "PVC-X"},
+				Annotations: map[string]string{"blockstor.org/linstor-resource-definition-name": "PVC-X"},
 			},
 			Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-x", NodeName: "srv1"},
 		}).

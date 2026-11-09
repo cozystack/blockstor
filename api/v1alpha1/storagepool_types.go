@@ -34,7 +34,7 @@ import (
 // "candidate" role ends at attach, the annotation makes that contract
 // machine-readable for discovery without parsing `pvs` / `zpool list`
 // output again. Bug 91.
-const StoragePoolAnnotationAttachedKNames = "blockstor.io/attached-knames"
+const StoragePoolAnnotationAttachedKNames = "blockstor.org/attached-knames"
 
 // StoragePoolSpec is the desired state of a LINSTOR storage pool.
 //

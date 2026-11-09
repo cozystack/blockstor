@@ -39,7 +39,7 @@ blockstor resource-group spawn local scratch-1 20G
 Or on one definition, in YAML:
 
 ```yaml
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata:
   name: scratch-1
@@ -57,7 +57,7 @@ Treat the stack as fixed once a volume has replicas. Changing `layerStack` by ha
 `blockstor resource-group spawn`, and a create through the REST API, copy the group's `selectFilter.layerStack` onto the new definition. A definition that ends up with no stack in a group that sets one is pinned by the controller, and the satellite builds nothing for it until then. That happens to a definition applied with `kubectl` or GitOps, created with `blockstor resource-definition create --resource-group`, or moved to another group with `blockstor resource-definition modify --resource-group`:
 
 - A definition that holds no data yet gets the group's stack.
-- A definition that already holds data keeps `DRBD`, `STORAGE`, the stack its storage was built with. It holds data once a replica has reported DRBD metadata or a device, or once `spec.initialized` is set. If the group asks for a layer this stack lacks, the controller writes the group's stack into the annotation `blockstor.io/unapplied-group-layer-stack` and emits a `LayerStackNotInherited` warning Event on the definition. Such a volume is not what its group promises: a volume with data moved into a LUKS group stays unencrypted. Copy its data to a new volume to get the group's stack.
+- A definition that already holds data keeps `DRBD`, `STORAGE`, the stack its storage was built with. It holds data once a replica has reported DRBD metadata or a device, or once `spec.initialized` is set. If the group asks for a layer this stack lacks, the controller writes the group's stack into the annotation `blockstor.org/unapplied-group-layer-stack` and emits a `LayerStackNotInherited` warning Event on the definition. Such a volume is not what its group promises: a volume with data moved into a LUKS group stays unencrypted. Copy its data to a new volume to get the group's stack.
 
 The controller keeps checking: whenever a definition's stack lacks a layer its group asks for, whether the stack was set by hand or pinned, the annotation names the group's current stack, and a newly flagged definition gets the same warning Event. The annotation goes away once the group no longer asks for the missing layer or is deleted. Changing a group's stack later never reshapes a definition that already has one.
 
@@ -68,8 +68,8 @@ As a last guard, the LUKS layer does not format a device that already carries a 
 List the definitions that lack a layer their group asks for:
 
 ```sh
-kubectl get resourcedefinitions.blockstor.cozystack.io \
-  -o custom-columns='NAME:.metadata.name,GROUP_STACK:.metadata.annotations.blockstor\.io/unapplied-group-layer-stack' \
+kubectl get resourcedefinitions.blockstor.org \
+  -o custom-columns='NAME:.metadata.name,GROUP_STACK:.metadata.annotations.blockstor\.org/unapplied-group-layer-stack' \
   | awk '$2 != "<none>"'
 ```
 

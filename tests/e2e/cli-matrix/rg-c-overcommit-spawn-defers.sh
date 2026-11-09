@@ -121,7 +121,7 @@ cat "$out_file"
 rm -f "$out_file"
 
 # The RD must survive (the CSI retry loop converges on it).
-if ! kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" >/dev/null 2>&1; then
+if ! kubectl get "resourcedefinitions.blockstor.org/${RD}" >/dev/null 2>&1; then
     echo "FAIL (D1): deferred spawn did not leave the RD behind — CSI retry loop has nothing to converge on" >&2
     exit 1
 fi
@@ -132,7 +132,7 @@ fi
 nodes=3
 diskful=0
 for _ in $(seq 1 15); do
-    diskful=$(kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
+    diskful=$(kubectl get resources.blockstor.org -o json 2>/dev/null \
         | RD="$RD" python3 -c "import json,sys,os
 d=json.load(sys.stdin)
 rd=os.environ['RD']

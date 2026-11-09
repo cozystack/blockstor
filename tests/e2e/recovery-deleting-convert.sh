@@ -98,16 +98,16 @@ POOL=${STORPOOL:-stand}
 # without touching anything else. Cleanup path puts the label back
 # on every worker and drops the nodeSelector so the DaemonSet's
 # default placement returns.
-PIN_LABEL=blockstor.io/test-5-13=keep
+PIN_LABEL=blockstor.org/test-5-13=keep
 
 restore_daemonset_and_label() {
     # Best-effort rollback in EXIT trap. Don't fail the trap if these
     # error — we still want delete_rd to run.
     kubectl -n "$NS" patch daemonset blockstor-satellite \
-        --type=json -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/blockstor.io~1test-5-13"}]' \
+        --type=json -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/blockstor.org~1test-5-13"}]' \
         2>/dev/null || true
     for n in "$N1" "$N2" "$N3"; do
-        kubectl label node "$n" "blockstor.io/test-5-13-" --overwrite 2>/dev/null || true
+        kubectl label node "$n" "blockstor.org/test-5-13-" --overwrite 2>/dev/null || true
     done
     kubectl -n "$NS" rollout status daemonset blockstor-satellite --timeout=60s 2>/dev/null || true
 }
@@ -192,7 +192,7 @@ assert_uptodate_12() {
 
 echo ">> apply 3-replica RD ${RD} on ${N1}/${N2}/${N3} (autoplace off)"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -203,7 +203,7 @@ spec:
 EOF
 for n in "$N1" "$N2" "$N3"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:
@@ -250,13 +250,13 @@ echo "   all 3 peers UpToDate"
 echo ">> stop satellite on ${N3} via DaemonSet nodeSelector pin"
 kubectl label node "$N1" "$PIN_LABEL" --overwrite >/dev/null
 kubectl label node "$N2" "$PIN_LABEL" --overwrite >/dev/null
-kubectl label node "$N3" blockstor.io/test-5-13- --overwrite 2>/dev/null || true
+kubectl label node "$N3" blockstor.org/test-5-13- --overwrite 2>/dev/null || true
 kubectl -n "$NS" patch daemonset blockstor-satellite --type=merge -p '
 spec:
   template:
     spec:
       nodeSelector:
-        blockstor.io/test-5-13: keep
+        blockstor.org/test-5-13: keep
 '
 
 # Wait for worker-3's satellite pod to actually be gone — DS reconcile
@@ -286,16 +286,16 @@ echo "   satellite on ${N3} is gone"
 echo ">> delete Resource ${RD}.${N3} (will get stuck in 'DELETING')"
 # Don't --wait — the delete will never finish on its own; we'll drive
 # it home with the toggle-disk recipe below.
-kubectl delete --wait=false "resource.blockstor.cozystack.io/${RD}.${N3}"
+kubectl delete --wait=false "resource.blockstor.org/${RD}.${N3}"
 
 # Confirm it landed in the "stuck deleting" state, not "actually
 # gone". A successful immediate delete here would mean blockstor isn't
 # stamping the satellite finalizer at all — that's a separate bug, but
 # either way the scenario can't proceed without a stuck CRD to recover.
 sleep 5
-dt=$(kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" \
+dt=$(kubectl get "resource.blockstor.org/${RD}.${N3}" \
     -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)
-finalizers=$(kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" \
+finalizers=$(kubectl get "resource.blockstor.org/${RD}.${N3}" \
     -o jsonpath='{.metadata.finalizers}' 2>/dev/null || true)
 echo "   N3 replica deletionTimestamp=${dt:-<missing>}  finalizers=${finalizers:-<none>}"
 if [[ -z "$dt" ]]; then
@@ -362,7 +362,7 @@ fi
 # The handler updates Spec.Flags["DISKLESS"]. Verify by reading the
 # CRD — Spec must show the flag, regardless of whether the object is
 # mid-deletion.
-post_flags=$(kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" \
+post_flags=$(kubectl get "resource.blockstor.org/${RD}.${N3}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || true)
 echo "   ${RD}.${N3} spec.flags after toggle-disk = ${post_flags}"
 if [[ "$post_flags" != *"DISKLESS"* ]]; then
@@ -378,7 +378,7 @@ assert_uptodate_12 "after toggle-disk"
 
 echo ">> restore satellite on ${N3} (un-pin DaemonSet)"
 kubectl -n "$NS" patch daemonset blockstor-satellite \
-    --type=json -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/blockstor.io~1test-5-13"}]'
+    --type=json -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/blockstor.org~1test-5-13"}]'
 
 # Wait for the new pod to come Ready. 90 s is generous for QEMU image
 # pull-cache on the stand; bumping to 120 s if the cluster is cold.
@@ -413,7 +413,7 @@ echo ">> wait up to 60s for ${RD}.${N3} CRD to vanish"
 deadline=$(( $(date +%s) + 60 ))
 gone=false
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" >/dev/null 2>&1; then
+    if ! kubectl get "resource.blockstor.org/${RD}.${N3}" >/dev/null 2>&1; then
         gone=true
         break
     fi
@@ -421,7 +421,7 @@ while (( $(date +%s) < deadline )); do
 done
 if [[ "$gone" != "true" ]]; then
     echo "FAIL: ${RD}.${N3} CRD still present after satellite respawn + toggle-disk recipe"
-    kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" -o yaml 2>/dev/null || true
+    kubectl get "resource.blockstor.org/${RD}.${N3}" -o yaml 2>/dev/null || true
     exit 1
 fi
 echo "   ${RD}.${N3} CRD is gone — recipe converged"

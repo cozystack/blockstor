@@ -58,7 +58,7 @@ N2=$WORKER_2
 # The Resource CRD name is "<rd>.<node>" by blockstor's composite-key
 # convention; discover it rather than assume the exact slug.
 rsc_crd_name() {
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${RD}." -v node="$1" '$1 ~ "^"rd && $0 ~ node {print $1; exit}'
 }
 
@@ -69,11 +69,11 @@ remove_test_finalizer() {
         # Drop ONLY our test finalizer; keep any other finalizer the
         # satellite set so the real teardown still runs to completion.
         local kept
-        kept=$(kubectl get "resources.blockstor.cozystack.io/${crd}" \
+        kept=$(kubectl get "resources.blockstor.org/${crd}" \
             -o json 2>/dev/null \
             | jq -c --arg f "$TEST_FINALIZER" \
                 '[(.metadata.finalizers // [])[] | select(. != $f)]' 2>/dev/null || echo 'null')
-        kubectl patch "resources.blockstor.cozystack.io/${crd}" --type=merge \
+        kubectl patch "resources.blockstor.org/${crd}" --type=merge \
             -p "{\"metadata\":{\"finalizers\":${kept}}}" >/dev/null 2>&1 || true
     fi
 }
@@ -103,18 +103,18 @@ echo ">> Phase 2: add a test finalizer to the $N2 Resource CRD (simulate a stuck
 CRD_N2=$(rsc_crd_name "$N2")
 if [[ -z "$CRD_N2" ]]; then
     echo "FAIL: could not resolve Resource CRD name for $RD on $N2" >&2
-    kubectl get resources.blockstor.cozystack.io --no-headers >&2 || true
+    kubectl get resources.blockstor.org --no-headers >&2 || true
     exit 1
 fi
 echo "   $N2 Resource CRD = $CRD_N2"
 # Append our finalizer (merge with whatever the satellite already set).
-existing_fin=$(kubectl get "resources.blockstor.cozystack.io/${CRD_N2}" \
+existing_fin=$(kubectl get "resources.blockstor.org/${CRD_N2}" \
     -o jsonpath='{.metadata.finalizers}' 2>/dev/null || echo '[]')
 echo "   existing finalizers: $existing_fin"
-kubectl patch "resources.blockstor.cozystack.io/${CRD_N2}" --type=json \
+kubectl patch "resources.blockstor.org/${CRD_N2}" --type=json \
     -p "[{\"op\":\"add\",\"path\":\"/metadata/finalizers/-\",\"value\":\"${TEST_FINALIZER}\"}]" \
     >/dev/null 2>&1 \
-    || kubectl patch "resources.blockstor.cozystack.io/${CRD_N2}" --type=merge \
+    || kubectl patch "resources.blockstor.org/${CRD_N2}" --type=merge \
         -p "{\"metadata\":{\"finalizers\":[\"${TEST_FINALIZER}\"]}}" >/dev/null 2>&1 \
     || { echo "FAIL: could not add test finalizer to $CRD_N2" >&2; exit 1; }
 
@@ -161,7 +161,7 @@ echo "   OK: DELETING surface visible while the finalizer blocks finalisation"
 
 # The RD must NOT be fully gone yet — a downed/stuck satellite blocks the
 # final removal (the whole point of the two-phase delete).
-if ! kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" >/dev/null 2>&1; then
+if ! kubectl get "resourcedefinitions.blockstor.org/${RD}" >/dev/null 2>&1; then
     # Acceptable race: if the RD object itself finalised faster than the
     # blocked child, the child Resource CRD must still be observable as
     # DELETING. Re-check the child directly.
@@ -196,7 +196,7 @@ echo "   OK: retried rd d while DELETING is idempotent (exit 0)"
 # The retry must NOT have force-cleared the finalizer-blocked child —
 # the teardown is still genuinely blocked until we release our finalizer.
 if [[ -z "$(rsc_crd_name "$N2")" ]] \
-    && ! kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" >/dev/null 2>&1; then
+    && ! kubectl get "resourcedefinitions.blockstor.org/${RD}" >/dev/null 2>&1; then
     echo "FAIL (U19): retried rd d finalised the object despite a held finalizer" >&2
     exit 1
 fi
@@ -211,7 +211,7 @@ remove_test_finalizer
 deadline=$(( $(date +%s) + 120 ))
 cleared=false
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" >/dev/null 2>&1 \
+    if ! kubectl get "resourcedefinitions.blockstor.org/${RD}" >/dev/null 2>&1 \
         && [[ -z "$(rsc_crd_name "$N2")" ]]; then
         cleared=true
         break
@@ -220,7 +220,7 @@ while (( $(date +%s) < deadline )); do
 done
 if ! $cleared; then
     echo "FAIL (E4): RD/replica did not clear within 120s after releasing the finalizer" >&2
-    kubectl get resources.blockstor.cozystack.io --no-headers | grep "$RD" >&2 || true
+    kubectl get resources.blockstor.org --no-headers | grep "$RD" >&2 || true
     exit 1
 fi
 
