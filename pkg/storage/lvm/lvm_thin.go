@@ -159,28 +159,13 @@ func (t *Thin) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 	ctx, cancel := withProbeTimeout(ctx)
 	defer cancel()
 
-	out, err := t.exec.Run(ctx, "lvs",
-		Args("--noheadings",
-			"--separator", "|",
-			"-o", "lv_size,data_percent",
-			"--units", "k",
-			"--nosuffix",
-			t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)...)
+	line, err := t.poolLine(ctx)
 	if err != nil {
-		return storage.PoolStatus{}, errors.Wrap(err, "lvs (pool)")
+		return storage.PoolStatus{}, err
 	}
 
-	line := strings.TrimSpace(string(out))
-	if line == "" {
-		// Bug 282: tag with ErrPoolGone so writeCapacity flips
-		// PoolMissing=true. Transient lvs errors (timeout, vg locked)
-		// MUST NOT carry this tag.
-		return storage.PoolStatus{}, errors.Wrapf(storage.ErrPoolGone,
-			"thin pool %s/%s not found", t.cfg.VolumeGroup, t.cfg.ThinPool)
-	}
-
-	parts := strings.SplitN(line, "|", lvsCols)
-	if len(parts) != lvsCols {
+	parts := strings.SplitN(line, "|", poolStatusCols)
+	if len(parts) != poolStatusCols {
 		return storage.PoolStatus{}, errors.Errorf("lvs (pool): unexpected line %q", line)
 	}
 
@@ -560,7 +545,96 @@ const (
 	mibPerKib = 1024
 	pctMax    = 100.0
 	lvsCols   = 2
+	// poolStatusCols are the fields PoolStatus reads: lv_size,
+	// data_percent and lv_attr. The attribute is what separates a pool
+	// that is merely inactive, and whose data_percent lvs leaves empty,
+	// from one that is gone.
+	poolStatusCols = 3
+	// lvAttrActive is the position of the state character in lv_attr,
+	// which is 'a' for an active volume. An inactive thin pool reports
+	// no data_percent at all, because the kernel is not carrying it.
+	lvAttrActive = 4
 )
+
+// poolLine reads the thin pool's lvs line, activating the pool first if
+// it is there but not active.
+//
+// A thin pool survives a reboot as metadata, not as a running device:
+// until something activates it, lvs reports its lv_size but leaves
+// data_percent empty, because the kernel is not carrying the pool and
+// has no usage to report. Nothing else in the satellite activates it --
+// pools are created once, and the volume paths assume a pool that is
+// already running -- so a node that reboots comes back with a pool that
+// reports no capacity at all.
+//
+// Left alone, that reads as a destroyed pool: PoolStatus fails to parse
+// the empty data_percent, writeCapacity treats any non-transient error
+// as the operator having removed the backing pool, and zeroes the
+// capacity. The placer then skips every rebooted node, and volume
+// creation fails cluster-wide with "Add more nodes or storage pools",
+// while the StoragePool objects still look present and the nodes are
+// online. The only trace is a per-probe "pool disappeared" log line.
+//
+// Activating here keeps that recovery where the condition is first
+// observed. It is deliberately not a blind `lvchange -ay` on every
+// probe: the attribute says whether the pool is already active, so the
+// steady state stays a single lvs.
+func (t *Thin) poolLine(ctx context.Context) (string, error) {
+	line, err := t.poolProbe(ctx)
+	if err != nil || !poolInactive(line) {
+		return line, err
+	}
+
+	vgLV := t.cfg.VolumeGroup + "/" + t.cfg.ThinPool
+	if _, err := t.exec.Run(ctx, "lvchange", Args("--activate", "y", vgLV)...); err != nil {
+		return "", errors.Wrapf(err, "lvchange --activate y %s", vgLV)
+	}
+
+	// Re-probe once. A pool that still reports nothing after a
+	// successful activation is a real fault rather than a cold one, and
+	// the caller's parse error is the right thing to surface.
+	return t.poolProbe(ctx)
+}
+
+// poolProbe is one lvs call for the pool's size, usage and attributes.
+func (t *Thin) poolProbe(ctx context.Context) (string, error) {
+	out, err := t.exec.Run(ctx, "lvs",
+		Args("--noheadings",
+			"--separator", "|",
+			"-o", "lv_size,data_percent,lv_attr",
+			"--units", "k",
+			"--nosuffix",
+			t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)...)
+	if err != nil {
+		return "", errors.Wrap(err, "lvs (pool)")
+	}
+
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		// Bug 282: tag with ErrPoolGone so writeCapacity flips
+		// PoolMissing=true. Transient lvs errors (timeout, vg locked)
+		// MUST NOT carry this tag.
+		return "", errors.Wrapf(storage.ErrPoolGone,
+			"thin pool %s/%s not found", t.cfg.VolumeGroup, t.cfg.ThinPool)
+	}
+
+	return line, nil
+}
+
+// poolInactive reports whether the line describes a pool that exists but
+// is not active: no usage reported, and lv_attr says so.
+func poolInactive(line string) bool {
+	parts := strings.SplitN(line, "|", poolStatusCols)
+	if len(parts) != poolStatusCols {
+		return false
+	}
+	if strings.TrimSpace(parts[1]) != "" {
+		return false
+	}
+	attr := strings.TrimSpace(parts[2])
+
+	return len(attr) > lvAttrActive && attr[lvAttrActive] != 'a'
+}
 
 // parseFloatToInt64 parses a numeric string LVM emits with `--units k
 // --nosuffix`, which is e.g. "104857600.00".
