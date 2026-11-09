@@ -468,3 +468,69 @@ func TestNodeConnectionDeleteProp(t *testing.T) {
 		t.Errorf("post-delete list: got %d pairs, want 0 (emptied pair must drop out)", len(pairs))
 	}
 }
+
+// A node is one node in every spelling: a pair written for Node-1 is listed
+// when the filter says node-1, and a later write that spells it node-1 lands
+// on the same pair instead of starting a second one.
+func TestNodeConnectionMatchesANodeInAnySpelling(t *testing.T) {
+	base, stop := startServerWithStore(t, seedNodeConnectionEndpoints(t, "Node-1", "beta"))
+	defer stop()
+
+	put := func(path string, props map[string]string) {
+		t.Helper()
+
+		body, err := json.Marshal(nodeConnectionPutBody{OverrideProps: props})
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, base+path, bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do request: %v", err)
+		}
+
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PUT %s: status %d, want 200", path, resp.StatusCode)
+		}
+	}
+
+	list := func(path string) []nodeConnectionWire {
+		t.Helper()
+
+		resp := httpGet(t, base+path)
+		defer func() { _ = resp.Body.Close() }()
+
+		var pairs []nodeConnectionWire
+		if err := json.NewDecoder(resp.Body).Decode(&pairs); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		return pairs
+	}
+
+	put("/v1/node-connections/Node-1/beta", map[string]string{"Sites/Site": "site-x"})
+
+	if got := list("/v1/node-connections/node-1"); len(got) != 1 {
+		t.Errorf("filter node-1 found %d pairs, want the Node-1 pair", len(got))
+	}
+
+	put("/v1/node-connections/node-1/beta", map[string]string{"Sites/Rack": "r1"})
+
+	got := list("/v1/node-connections")
+	if len(got) != 1 {
+		t.Fatalf("two writes to one pair left %d pairs: %+v", len(got), got)
+	}
+
+	if got[0].Props["Sites/Site"] != "site-x" || got[0].Props["Sites/Rack"] != "r1" {
+		t.Errorf("pair props %v, want both writes on one pair", got[0].Props)
+	}
+}

@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
@@ -181,7 +182,7 @@ func (d *DiscoveredStorageRunnable) tick(ctx context.Context, logger logr.Logger
 
 	var node blockstoriov1alpha1.Node
 
-	err := d.Client.Get(ctx, types.NamespacedName{Name: d.NodeName}, &node)
+	err := d.Client.Get(ctx, types.NamespacedName{Name: naming.Key(d.NodeName)}, &node)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Mirrors HeartbeatRunnable's `node lost` carve-out:

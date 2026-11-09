@@ -3634,3 +3634,173 @@ func TestAutoPlaceMatchesProviderKindWithStorPoolName(t *testing.T) {
 
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background
+
+// A replica shows its node as it was registered, N1, while the node's pool
+// keeps the spelling it was created with, n1. The placer reads the two as
+// one node and does not place a second replica on it, though n1 has the
+// biggest pool.
+func TestPlaceRespectsAnExistingReplicaInAnotherNodeSpelling(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seedStore(t, st, []string{"n3", "n2", "n1"})
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-1", NodeName: "N1",
+		Props: map[string]string{"StorPoolName": "pool"},
+	}); err != nil {
+		t.Fatalf("seed existing: %v", err)
+	}
+
+	if _, _, err := placer.New(st).Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{PlaceCount: 2}); err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	for i := range got {
+		if got[i].NodeName == "n1" {
+			t.Fatalf("placed a second replica on n1 next to the one on N1: %+v", got)
+		}
+	}
+
+	if len(got) != 2 {
+		t.Errorf("total: got %d, want 2; %+v", len(got), got)
+	}
+}
+
+// seedMixedSpellings registers nodes N1.. in upper case, with props, and
+// creates their pools in the spelling poolNode gives, which a pool keeps
+// from its create.
+func seedMixedSpellings(t *testing.T, st store.Store, flags map[string][]string, props map[string]map[string]string, poolNode func(string) string) {
+	t.Helper()
+
+	ctx := t.Context()
+
+	for i, name := range []string{"N1", "N2", "N3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite, Flags: flags[name], Props: props[name],
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        poolNode(name),
+			StoragePoolName: "pool",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    int64(i+1) * 100,
+			TotalCapacity:   1000,
+		}); err != nil {
+			t.Fatalf("seed pool on %s: %v", name, err)
+		}
+	}
+}
+
+// The node sets and maps the placer reads by a pool's node find the node
+// registered as N3 for a pool created on n3: an EVICTED node takes no new
+// replica, a node list names it, and its Aux props spread the replicas.
+func TestPlacerReadsAPoolOnAnotherSpellingOfItsNode(t *testing.T) {
+	t.Parallel()
+
+	zones := map[string]map[string]string{
+		"N1": {"Aux/zone": "a", "Aux/rack": "x"},
+		"N2": {"Aux/zone": "b", "Aux/rack": "x"},
+		"N3": {"Aux/zone": "c", "Aux/rack": "y"},
+	}
+
+	for name, tc := range map[string]struct {
+		flags  map[string][]string
+		filter apiv1.AutoSelectFilter
+		check  func(t *testing.T, got []apiv1.Resource)
+	}{
+		"an EVICTED node": {
+			flags:  map[string][]string{"N3": {apiv1.NodeFlagEvicted}},
+			filter: apiv1.AutoSelectFilter{PlaceCount: 1},
+			check: func(t *testing.T, got []apiv1.Resource) {
+				t.Helper()
+
+				if len(got) != 1 || strings.EqualFold(got[0].NodeName, "n3") {
+					t.Errorf("placed %+v, want one replica off the EVICTED N3", got)
+				}
+			},
+		},
+		"a node list": {
+			filter: apiv1.AutoSelectFilter{PlaceCount: 1, NodeNameList: []string{"N3"}},
+			check: func(t *testing.T, got []apiv1.Resource) {
+				t.Helper()
+
+				if len(got) != 1 || !strings.EqualFold(got[0].NodeName, "n3") {
+					t.Errorf("placed %+v, want one replica on N3", got)
+				}
+			},
+		},
+		"replicas on the same zone": {
+			filter: apiv1.AutoSelectFilter{PlaceCount: 2, ReplicasOnSame: []string{"Aux/rack"}},
+			check: func(t *testing.T, got []apiv1.Resource) {
+				t.Helper()
+
+				// N3 is alone on rack y, so two replicas on one rack are N1 and N2.
+				if len(got) != 2 || slices.ContainsFunc(got, func(r apiv1.Resource) bool { return strings.EqualFold(r.NodeName, "n3") }) {
+					t.Errorf("placed %+v, want two replicas on rack x, N1 and N2", got)
+				}
+			},
+		},
+		"a pinned rack": {
+			filter: apiv1.AutoSelectFilter{PlaceCount: 1, ReplicasOnSame: []string{"Aux/rack=y"}},
+			check: func(t *testing.T, got []apiv1.Resource) {
+				t.Helper()
+
+				if len(got) != 1 || !strings.EqualFold(got[0].NodeName, "n3") {
+					t.Errorf("placed %+v, want one replica on rack y, N3", got)
+				}
+			},
+		},
+		"a zone to stay off": {
+			filter: apiv1.AutoSelectFilter{PlaceCount: 1, ReplicasOnDifferent: []string{"Aux/zone=c"}},
+			check: func(t *testing.T, got []apiv1.Resource) {
+				t.Helper()
+
+				// N3, zone c, has the biggest pool; the soft exclusion moves
+				// the replica off it.
+				if len(got) != 1 || strings.EqualFold(got[0].NodeName, "n3") {
+					t.Errorf("placed %+v, want one replica off zone c", got)
+				}
+			},
+		},
+		"replicas on different zones": {
+			filter: apiv1.AutoSelectFilter{PlaceCount: 2, ReplicasOnDifferent: []string{"Aux/zone"}},
+			check: func(t *testing.T, got []apiv1.Resource) {
+				t.Helper()
+
+				if len(got) != 2 {
+					t.Errorf("placed %d replicas, want 2 in different zones: %+v", len(got), got)
+				}
+			},
+		},
+	} {
+		for spelling, poolNode := range map[string]func(string) string{
+			"pool on the CR name":             strings.ToLower,
+			"pool on the registered spelling": func(n string) string { return n },
+		} {
+			t.Run(name+"/"+spelling, func(t *testing.T) {
+				t.Parallel()
+
+				st := store.NewInMemory()
+				ctx := t.Context()
+
+				seedMixedSpellings(t, st, tc.flags, zones, poolNode)
+
+				filter := tc.filter
+				_, _, _ = placer.New(st).Place(ctx, "pvc-1", &filter)
+
+				got, err := st.Resources().ListByDefinition(ctx, "pvc-1")
+				if err != nil {
+					t.Fatalf("list: %v", err)
+				}
+
+				tc.check(t, got)
+			})
+		}
+	}
+}

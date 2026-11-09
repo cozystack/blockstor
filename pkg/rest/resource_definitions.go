@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -54,14 +55,15 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 	// golinstor as the comma-joined `?resource_definitions=a,b` form.
 	// Without honouring this, `rd l --resource-definitions X` returns
 	// the full RD list and the CLI renders ALL RDs — Bug 61.
-	// Semantics mirror upstream: case-insensitive name match,
+	// Semantics mirror upstream: names match as the store keys them
+	// (naming.Same, case-insensitive inside RFC 1123),
 	// unknown names => empty list (NOT 404); missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_definitions")
 	if len(nameFilter) > 0 {
 		filtered := rds[:0]
 
 		for i := range rds {
-			if matchAnyFold(nameFilter, rds[i].Name) {
+			if matchAnyName(nameFilter, rds[i].Name) {
 				filtered = append(filtered, rds[i])
 			}
 		}
@@ -317,7 +319,7 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 	// rg-modify validation gate) would reach the store unchecked. Re-validate
 	// the resolved (possibly inherited) stack here, mirroring the create
 	// path's 400, so an unmaterialisable layer chain never persists onto an RD.
-	lsErr := validateLayerStack(rd.LayerStack)
+	lsErr := canonicalizeLayerStack(&rd.LayerStack)
 	if lsErr != nil {
 		writeError(w, http.StatusBadRequest, lsErr.Error())
 
@@ -432,7 +434,7 @@ func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, bo
 	}
 
 	// Bug 97: refuse whitespace-only / RFC-1123-illegal names at the
-	// REST wire boundary, BEFORE pkg/store/k8s.Name() slugifies +
+	// REST wire boundary, BEFORE pkg/naming.Key() slugifies +
 	// hash-prefixes the input. Without this gate `linstor rd c "  "`
 	// leaked the raw apimachinery "metadata.name: Invalid value:
 	// \"<hex>-\"" error and exposed the internal hash-prefix scheme;
@@ -594,7 +596,7 @@ func (s *Server) refuseRDUpdateOnUnknownRG(w http.ResponseWriter, r *http.Reques
 	}
 
 	current, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
-	if getErr == nil && current.ResourceGroupName == rgChange {
+	if getErr == nil && naming.Same(current.ResourceGroupName, rgChange) {
 		return true
 	}
 
@@ -851,7 +853,7 @@ func (s *Server) validateRDLayerStackOnCreate(ctx context.Context, body *apiv1.R
 		return err
 	}
 
-	err = validateLayerStack(rd.LayerStack)
+	err = canonicalizeLayerStack(&rd.LayerStack)
 	if err != nil {
 		return err
 	}

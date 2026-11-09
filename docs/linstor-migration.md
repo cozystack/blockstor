@@ -48,7 +48,7 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 
 4. **Back up the ZFS/LVM pools' snapshots** (optional but recommended): a `zfs snapshot -r` of each pool gives an instant rollback point that is independent of both control planes.
 
-5. **Verify the zvol names blockstor will adopt match what is on disk.** Adoption is name-based: blockstor addresses each volume as `<zpool>/<rd-name-lowercased>_<volume-number-%05d>` (e.g. `data/pvc-abc…_00000`), and `CreateVolume` is idempotent only when that dataset already exists. A byte mismatch (ZFS names are case-sensitive) makes blockstor create a fresh EMPTY zvol next to the real one. Multi-replica DRBD would self-heal by SyncTarget, but **single-replica `["STORAGE"]` volumes have no resync fallback** — a mismatch there silently presents an empty disk. Cross-check before cutover, read-only, on each satellite:
+5. **Verify the zvol names blockstor will adopt match what is on disk.** Adoption is name-based: blockstor addresses each volume as `<zpool>/<rd-cr-name>_<volume-number-%05d>` (e.g. `data/pvc-abc…_00000`), where `<rd-cr-name>` is the RD's `metadata.name` in the converted manifests: the LINSTOR name lowercased, or, for a name that is not a valid RFC 1123 label once lowercased, a hashed slug such as `35d21682-my-res` for `my_res`. Such a definition never matches the LINSTOR volume on disk, so rename it or the volume before cutover. `CreateVolume` is idempotent only when that dataset already exists. A byte mismatch (ZFS names are case-sensitive) makes blockstor create a fresh EMPTY zvol next to the real one. Multi-replica DRBD would self-heal by SyncTarget, but **single-replica `["STORAGE"]` volumes have no resync fallback** — a mismatch there silently presents an empty disk. Cross-check before cutover, read-only, on each satellite:
 
    ```bash
    # what is on disk:
@@ -61,7 +61,7 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 
    If any single-replica volume's computed name is absent from `ondisk-zvols.txt`, STOP — do not cut over until the naming is reconciled (`zfs rename`, or fix the converter).
 
-   **Adopted snapshots are addressed the same way** — `<zpool>/<rd-name-lowercased>_00000@<snapshot-name>` — so run the same cross-check for them, otherwise a name miss only surfaces when someone tries to restore, long after cutover:
+   **Adopted snapshots are addressed the same way** — `<zpool>/<rd-cr-name>_00000@<snapshot-name>` — so run the same cross-check for them, otherwise a name miss only surfaces when someone tries to restore, long after cutover:
 
    ```bash
    zfs list -H -o name -t snapshot | sort > /tmp/ondisk-snapshots.txt

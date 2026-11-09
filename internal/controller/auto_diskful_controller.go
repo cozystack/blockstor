@@ -31,6 +31,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -326,7 +327,7 @@ func (r *AutoDiskfulReconciler) firstAvailablePool(ctx context.Context, nodeName
 	}
 
 	for i := range pools {
-		if pools[i].NodeName != nodeName {
+		if !naming.Same(pools[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -375,7 +376,7 @@ func (r *AutoDiskfulReconciler) stampDeadlineViaCRD(ctx context.Context, rdName 
 	}
 
 	var crd blockstoriov1alpha1.ResourceDefinition
-	if err := r.Get(ctx, client.ObjectKey{Name: rdName}, &crd); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &crd); err != nil {
 		return false
 	}
 
@@ -414,7 +415,7 @@ func (r *AutoDiskfulReconciler) stripDeadlineViaCRD(ctx context.Context, rdName 
 	}
 
 	var crd blockstoriov1alpha1.ResourceDefinition
-	if err := r.Get(ctx, client.ObjectKey{Name: rdName}, &crd); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &crd); err != nil {
 		return false
 	}
 
@@ -463,7 +464,7 @@ func splitDiskfulAndCandidates(replicas []apiv1.Resource, disabled map[string]st
 	)
 
 	for i := range replicas {
-		if _, off := disabled[replicas[i].NodeName]; off {
+		if _, off := disabled[naming.Key(replicas[i].NodeName)]; off {
 			// Replica on an EVICTED/LOST node — treat as absent.
 			continue
 		}
@@ -490,7 +491,7 @@ func splitDiskfulAndCandidates(replicas []apiv1.Resource, disabled map[string]st
 	return diskful, candidates
 }
 
-// disabledNodeSet returns the EVICTED/LOST node names as a lookup set,
+// disabledNodeSet returns the EVICTED/LOST nodes as a set keyed by CR name,
 // reusing the shared isDisabledNode predicate (defined alongside the
 // RD-controller tiebreaker path) so auto-diskful gates on exactly the
 // same disabled-node definition the placer uses. Eviction is the
@@ -506,7 +507,7 @@ func (r *AutoDiskfulReconciler) disabledNodeSet(ctx context.Context) (map[string
 
 	for i := range nodes {
 		if isDisabledNode(&nodes[i]) {
-			out[nodes[i].Name] = struct{}{}
+			out[naming.Key(nodes[i].Name)] = struct{}{}
 		}
 	}
 

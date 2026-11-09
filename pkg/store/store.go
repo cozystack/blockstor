@@ -26,7 +26,6 @@ package store
 
 import (
 	"context"
-	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -299,43 +298,6 @@ type ResourceStore interface {
 	PatchResourceSpec(ctx context.Context, rdName, node string, mutate func(*apiv1.Resource) error) error
 }
 
-// FoldName canonicalises a LINSTOR object name for use as a map key, or for
-// comparing two spellings of the same object. LINSTOR identifiers are
-// case-insensitive — `DfltRscGrp` and `dfltrscgrp` address one resource group,
-// which is why the Kubernetes store lowercases them on the way to a CRD name
-// (pkg/store/k8s/crdname.go). Anything that keys objects by name owes its
-// callers the same equality the store itself uses.
-//
-// That equality is available in process and not on the wire. A CRD's
-// selectableFields declare a path, not a transform, so the API server compares
-// spec.nodeName and spec.resourceDefinitionName verbatim, and the scoped reads
-// built on them compare the same way — including their in-process fallback,
-// deliberately, because a fallback that folded would answer a different
-// question than the selector it stands in for. A replica whose spec spells its
-// definition in a case the definition is not stored under is therefore missed
-// by both, and `rd d`'s refusal and sweep read it that way too.
-//
-// The same boundary reaches `node delete`. Its refusal and its `--force`
-// cascade are both node-scoped reads on `spec.nodeName`, while Nodes().Get and
-// Delete fold: spell the node in a case its replicas were not written with and
-// the reads see nothing, the refusal passes, and the node goes with replicas
-// still pointing at it. ReplicasOnNode narrows that to one shape by asking in
-// the caller's spelling, the folded one and the node's registered one; a
-// replica written under any other case is still missed. `resource list` does
-// not narrow its read at all for this reason, and filters the whole listing
-// with the case-insensitive comparison instead.
-//
-// Folding on the write side instead would fold what clients read back:
-// crdToWireResource reports these spec values as the object's names, and
-// crdname.go's annotation exists precisely to keep the stored spelling
-// (DfltRscGrp) rather than the lowercased slug, because linstor-csi and
-// runbooks compare those strings. Closing the gap properly means a folded
-// field beside the display one, selected on and never rendered — a schema
-// change with a migration for adopted objects, not a comparison.
-func FoldName(name string) string {
-	return strings.ToLower(name)
-}
-
 // VolumeDefinitionStore persists VolumeDefinition objects. The composite
 // key is (resource_definition_name, volume_number); upstream LINSTOR keeps
 // VolumeDefinitions inline on the ResourceDefinition, and so do we (the CRD
@@ -345,8 +307,8 @@ type VolumeDefinitionStore interface {
 	List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error)
 
 	// ListAll returns every definition's volumes in ONE request, keyed by
-	// FoldName of the resource-definition name — look an entry up with
-	// FoldName(name), not with the name as you hold it.
+	// naming.Key of the resource-definition name — look an entry up with
+	// naming.Key(name), not with the name as you hold it.
 	//
 	// The fold is not decoration. A replica names its definition in
 	// whatever case it was written with, and the definition itself is

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // ErrRestoreTargetTaken reports a definition that carries a restore marker
@@ -335,7 +336,7 @@ func stampRestoreMarker(ctx context.Context, st Store, rdName string, snap *apiv
 
 	err = st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
 		current := rd.Props[RestoreFromSnapshotProp]
-		if current != "" && !strings.EqualFold(current, marker) {
+		if current != "" && !SameRestoreMarker(current, marker) {
 			return fmt.Errorf("%w: %q carries %q", ErrRestoreTargetTaken, rdName, current)
 		}
 
@@ -343,7 +344,7 @@ func stampRestoreMarker(ctx context.Context, st Store, rdName string, snap *apiv
 		// run's, against the state the patch actually applied to.
 		wrote = current == ""
 
-		if len(rd.LayerStack) == 0 && !strings.EqualFold(rd.ResourceGroupName, target.ResourceGroupName) {
+		if len(rd.LayerStack) == 0 && !naming.Same(rd.ResourceGroupName, target.ResourceGroupName) {
 			return fmt.Errorf("%w: %q moved to group %q", ErrLayerStackUndecided, rdName, rd.ResourceGroupName)
 		}
 
@@ -446,7 +447,7 @@ func JudgeRestoreLeftoverOf(
 	}
 
 	marker := srcRD + ":" + snapName
-	if !strings.EqualFold(rd.Props[RestoreFromSnapshotProp], marker) {
+	if !SameRestoreMarker(rd.Props[RestoreFromSnapshotProp], marker) {
 		return LeftoverUnfinished, false, nil
 	}
 

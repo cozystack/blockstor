@@ -55,14 +55,14 @@ Not converted, and listed in the tool's report:
 
 4. **Take pool snapshots.** A recursive `zfs snapshot` of every pool gives you a rollback point that does not depend on either control plane.
 
-5. **Check the volume names on disk.** Blockstor finds existing volumes by name: `<pool>/<definition name, lowercase>_<volume number, five digits>`, for example `data/pvc-1234_00000`. If the name does not match exactly, blockstor creates a new empty volume next to the real one. Replicated volumes would heal from their peers, but a volume with a single replica and no DRBD would come up empty. On every node, compare the list of volumes with the names the converted manifests expect:
+5. **Check the volume names on disk.** Blockstor finds existing volumes by name: `<pool>/<definition CR name>_<volume number, five digits>`, for example `data/pvc-1234_00000`. The CR name is the definition's `metadata.name` in the converted manifests: its LINSTOR name in lowercase, or, for a name that is not a valid Kubernetes name once lowercased, a hashed slug such as `35d21682-my-res` for `my_res`. A volume of such a definition never matches its LINSTOR name on disk, so rename the definition or the volume before you switch over. If the name does not match exactly, blockstor creates a new empty volume next to the real one. Replicated volumes would heal from their peers, but a volume with a single replica and no DRBD would come up empty. On every node, compare the list of volumes with the names the converted manifests expect:
 
    ```sh
    zfs list -H -o name -t volume | sort
    zfs list -H -o name -t snapshot | sort
    ```
 
-   Snapshots are found as `<pool>/<definition>_00000@<snapshot>`. Do not continue while any single-replica volume is missing under its expected name.
+   Snapshots are found as `<pool>/<definition CR name>_00000@<snapshot>`. Do not continue while any single-replica volume is missing under its expected name.
 
 6. **Rehearse on staging.** Run the whole procedure on a copy of the pools. Check that every pool registers, every replica reaches `UpToDate` without a resync, and no new empty volumes appear.
 

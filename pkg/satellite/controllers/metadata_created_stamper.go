@@ -53,12 +53,24 @@ type MetadataCreatedStamper struct {
 }
 
 // StampMetadataCreated SSA-patches a `MetadataCreated=True`
-// Condition onto Resource <resourceName>.Status.Conditions.
+// Condition onto the Resource CR of the replica of resourceName on
+// nodeName, named the way the store named it (see replicaCRName).
+func (s *MetadataCreatedStamper) StampMetadataCreated(ctx context.Context, resourceName, nodeName string) error {
+	name, err := replicaCRName(ctx, s.Client, resourceName, nodeName)
+	if err != nil {
+		return err
+	}
+
+	return s.stampOn(ctx, name)
+}
+
+// stampOn SSA-patches the Condition onto the Resource CR named
+// resourceName.
 // Idempotent — SSA's listMap merging on `type` means a repeat
 // patch with the same fields is a no-op at the apiserver level
 // (LastTransitionTime is preserved because the apiserver only
 // updates it when the Condition's Status actually changes).
-func (s *MetadataCreatedStamper) StampMetadataCreated(ctx context.Context, resourceName string) error {
+func (s *MetadataCreatedStamper) stampOn(ctx context.Context, resourceName string) error {
 	apply := &blockstoriov1alpha1.Resource{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       resourceKind,

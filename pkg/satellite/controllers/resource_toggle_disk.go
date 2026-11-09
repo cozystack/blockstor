@@ -33,6 +33,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -212,7 +213,7 @@ func (r *ResourceReconciler) handleToggleDiskCancel(ctx context.Context, res *bl
 		}
 
 		req := &intent.DeleteResourceRequest{
-			Name:          res.Spec.ResourceDefinitionName,
+			Name:          naming.Key(res.Spec.ResourceDefinitionName),
 			StoragePool:   resolveDeleteStoragePool(res),
 			VolumeNumbers: volumeNumbers,
 		}

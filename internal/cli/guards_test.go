@@ -92,6 +92,38 @@ func TestMigrateDiskRefusesSelfMigration(t *testing.T) {
 	}
 }
 
+// The two ends are compared as the store addresses nodes: Node-1 and node-1
+// are one node, so `r td node-1 pvc-x --migrate-from Node-1` is a migration
+// onto its own source and is refused with nothing written, neither a mark on
+// the source nor a second replica.
+func TestMigrateDiskRefusesSelfMigrationInAnotherSpelling(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.Nodes().Create(ctx, &apiv1.Node{Name: "Node-1"})
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: "Node-1"})
+	})
+
+	argv := []string{"r", "td", "node-1", "pvc-x", "--migrate-from", "Node-1"}
+	if got := app.Run(t.Context(), argv); got == 0 {
+		t.Fatalf("self-migration in another spelling was accepted (stderr: %s)", errBuf.String())
+	}
+
+	replicas, err := appStore(t, app).Resources().ListByDefinition(t.Context(), "pvc-x")
+	if err != nil {
+		t.Fatalf("list replicas: %v", err)
+	}
+
+	if len(replicas) != 1 {
+		t.Fatalf("the refused migration left %d replicas, want the source alone: %+v", len(replicas), replicas)
+	}
+
+	if replicas[0].Props["BlockstorMigratingFrom"] != "" {
+		t.Errorf("the refused migration still stamped the source: %v", replicas[0].Props)
+	}
+}
+
 // A restore onto a node that does not hold the snapshot creates a replica
 // with nothing behind it and reports success.
 func TestRestoreRefusesNodesWithoutTheSnapshot(t *testing.T) {

@@ -243,3 +243,8 @@ const KeepTiebreakerUntilAnnotation = apiv1.KeepTiebreakerUntilAnnotation
 
 // RDReconcileRequeue exposes the RD reconciler's periodic requeue.
 const RDReconcileRequeue = rdReconcileRequeue
+
+// CurrentDiskfulTarget exposes the evacuation drain target for tests.
+func (r *NodeReconciler) CurrentDiskfulTarget(ctx context.Context, rdName, evictedNode string) (int, error) {
+	return r.currentDiskfulTarget(ctx, rdName, evictedNode)
+}

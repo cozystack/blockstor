@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -72,18 +73,31 @@ func (s *physicalDevices) List(ctx context.Context) ([]apiv1.PhysicalDevice, err
 	return out, nil
 }
 
+// ListForNode lists the devices the satellite of nodeName labelled as its
+// own. The satellite labels them with its node's CR name, node-1, while an
+// operator may name the node as registered, Node-1, so the label is asked
+// under the CR name, and under the given spelling too when that is another
+// valid label value.
 func (s *physicalDevices) ListForNode(ctx context.Context, nodeName string) ([]apiv1.PhysicalDevice, error) {
-	var crdList crdv1alpha1.PhysicalDeviceList
-
-	err := s.c.List(ctx, &crdList,
-		ctrlclient.MatchingLabels{crdv1alpha1.PhysicalDeviceLabelNode: nodeName})
-	if err != nil {
-		return nil, errors.Wrapf(err, "list PhysicalDevice CRDs for node %q", nodeName)
+	values := []string{Name(nodeName)}
+	if nodeName != values[0] && len(validation.IsValidLabelValue(nodeName)) == 0 {
+		values = append(values, nodeName)
 	}
 
-	out := make([]apiv1.PhysicalDevice, 0, len(crdList.Items))
-	for i := range crdList.Items {
-		out = append(out, crdToWirePhysicalDevice(&crdList.Items[i]))
+	out := []apiv1.PhysicalDevice{}
+
+	for _, value := range values {
+		var crdList crdv1alpha1.PhysicalDeviceList
+
+		err := s.c.List(ctx, &crdList,
+			ctrlclient.MatchingLabels{crdv1alpha1.PhysicalDeviceLabelNode: value})
+		if err != nil {
+			return nil, errors.Wrapf(err, "list PhysicalDevice CRDs for node %q", nodeName)
+		}
+
+		for i := range crdList.Items {
+			out = append(out, crdToWirePhysicalDevice(&crdList.Items[i]))
+		}
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

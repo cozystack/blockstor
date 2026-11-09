@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 
@@ -352,7 +353,7 @@ func resourceGroupAdjust(ctx context.Context, run *runContext) error {
 			continue
 		}
 
-		if wanted != "" && !strings.EqualFold(wanted, defs[i].ResourceGroupName) {
+		if wanted != "" && !naming.Same(wanted, defs[i].ResourceGroupName) {
 			continue
 		}
 

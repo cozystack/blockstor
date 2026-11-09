@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // errorReportRingCap caps the in-memory buffer at 1000 entries — the
@@ -186,7 +188,7 @@ func (s *Server) registerErrorReports(mux *http.ServeMux) {
 // Query parameters honoured (upstream `Controller.GetErrorReports`
 // passes the same names):
 //
-//   - `?node=NAME` filters by satellite name (case-insensitive). Repeated
+//   - `?node=NAME` filters by satellite name (naming.Same). Repeated
 //     values aren't supported; the operator hits the endpoint per node.
 //   - `?since=...` returns only entries with `error_time >= since`. We
 //     accept either RFC3339 ("2026-05-14T10:00:00Z") — the form the
@@ -219,7 +221,7 @@ func (s *Server) handleErrorReportsList(w http.ResponseWriter, r *http.Request) 
 		filtered := entries[:0]
 
 		for i := range entries {
-			if strings.EqualFold(entries[i].NodeName, node) {
+			if naming.Same(entries[i].NodeName, node) {
 				filtered = append(filtered, entries[i])
 			}
 		}

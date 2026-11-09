@@ -27,6 +27,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
@@ -35,6 +36,26 @@ import (
 // from the snapshot instead of creating a blank volume, and the resume paths
 // read it to recognise their own leftover.
 const RestoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
+
+// SameRestoreMarker reports whether two RestoreFromSnapshotProp values name
+// the same snapshot of the same definition. Each side may spell the names
+// differently, one written from the stored objects and one from a caller's
+// request, so the parts are compared as the store addresses the objects
+// (naming.Same), never by folding the whole string.
+func SameRestoreMarker(a, b string) bool {
+	partsA, partsB := strings.Split(a, ":"), strings.Split(b, ":")
+	if len(partsA) != len(partsB) {
+		return false
+	}
+
+	for i := range partsA {
+		if !naming.Same(partsA[i], partsB[i]) {
+			return false
+		}
+	}
+
+	return true
+}
 
 // RollbackAbandonedProp marks a resource definition whose compensation started
 // and did not report finishing, with the step it stopped at. The replay gate of

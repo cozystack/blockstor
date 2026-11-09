@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // vdKey is the composite key (resource definition, volume number).
@@ -49,10 +50,10 @@ func (s *inMemoryVolumeDefinitions) List(_ context.Context, rdName string) ([]ap
 	// through the RD's folded metadata.name. Compared verbatim, a mixed-case
 	// lookup answered differently depending on which side of the CLI's
 	// bulk-read cutoff it landed on.
-	want := FoldName(rdName)
+	want := naming.Key(rdName)
 
 	for k := range s.m {
-		if FoldName(k.rd) == want {
+		if naming.Key(k.rd) == want {
 			out = append(out, s.m[k])
 		}
 	}
@@ -63,8 +64,8 @@ func (s *inMemoryVolumeDefinitions) List(_ context.Context, rdName string) ([]ap
 }
 
 // ListAll groups every stored volume by its parent definition, keyed the way
-// the Kubernetes store keys it: folded, because LINSTOR names are
-// case-insensitive and the caller's spelling need not be the stored one.
+// the Kubernetes store keys it, by naming.Key: the caller's spelling need not
+// be the stored one.
 func (s *inMemoryVolumeDefinitions) ListAll(_ context.Context) (map[string][]apiv1.VolumeDefinition, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -72,7 +73,7 @@ func (s *inMemoryVolumeDefinitions) ListAll(_ context.Context) (map[string][]api
 	out := make(map[string][]apiv1.VolumeDefinition)
 
 	for k := range s.m {
-		key := FoldName(k.rd)
+		key := naming.Key(k.rd)
 		out[key] = append(out[key], s.m[k])
 	}
 
@@ -88,7 +89,7 @@ func (s *inMemoryVolumeDefinitions) Get(_ context.Context, rdName string, volume
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	vd, ok := s.m[vdKey{rdName, volumeNumber}]
+	vd, ok := s.m[vdKey{naming.Key(rdName), volumeNumber}]
 	if !ok {
 		return apiv1.VolumeDefinition{}, errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
 	}
@@ -104,7 +105,7 @@ func (s *inMemoryVolumeDefinitions) Create(_ context.Context, rdName string, vd 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := vdKey{rdName, vd.VolumeNumber}
+	k := vdKey{naming.Key(rdName), vd.VolumeNumber}
 	if _, exists := s.m[k]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
 	}
@@ -136,7 +137,7 @@ func (s *inMemoryVolumeDefinitions) CreateAutoNumbered(_ context.Context, rdName
 	used := make(map[int32]bool)
 
 	for k := range s.m {
-		if k.rd == rdName {
+		if k.rd == naming.Key(rdName) {
 			used[k.vol] = true
 		}
 	}
@@ -146,7 +147,7 @@ func (s *inMemoryVolumeDefinitions) CreateAutoNumbered(_ context.Context, rdName
 	}
 
 	vd.VolumeNumber = assigned
-	s.m[vdKey{rdName, assigned}] = *vd
+	s.m[vdKey{naming.Key(rdName), assigned}] = *vd
 
 	return assigned, nil
 }
@@ -159,7 +160,7 @@ func (s *inMemoryVolumeDefinitions) Update(_ context.Context, rdName string, vd 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := vdKey{rdName, vd.VolumeNumber}
+	k := vdKey{naming.Key(rdName), vd.VolumeNumber}
 	if _, exists := s.m[k]; !exists {
 		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
 	}
@@ -181,7 +182,7 @@ func (s *inMemoryVolumeDefinitions) PatchVolumeDefinitionSpec(_ context.Context,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := vdKey{rdName, volumeNumber}
+	key := vdKey{naming.Key(rdName), volumeNumber}
 
 	vd, ok := s.m[key]
 	if !ok {
@@ -207,7 +208,7 @@ func (s *inMemoryVolumeDefinitions) Delete(_ context.Context, rdName string, vol
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := vdKey{rdName, volumeNumber}
+	k := vdKey{naming.Key(rdName), volumeNumber}
 	if _, exists := s.m[k]; !exists {
 		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
 	}

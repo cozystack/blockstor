@@ -27,9 +27,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite/stream"
 	"github.com/cozystack/blockstor/pkg/storage"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // SnapshotFetcher implements satellite.CrossNodeFetcher. Looks up
@@ -73,7 +73,12 @@ func (f *SnapshotFetcher) Fetch(ctx context.Context, srcRD, snapName string, vol
 
 	var snap blockstoriov1alpha1.Snapshot
 
-	err := f.Client.Get(ctx, client.ObjectKey{Name: k8s.Name(srcRD + "." + snapName)}, &snap)
+	name, err := snapshotCRName(ctx, f.Client, srcRD, snapName)
+	if err != nil {
+		return nil, "", err
+	}
+
+	err = f.Client.Get(ctx, client.ObjectKey{Name: name}, &snap)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, "", errors.Wrapf(storage.ErrNotFound, "snapshot CRD %s/%s", srcRD, snapName)
@@ -89,7 +94,7 @@ func (f *SnapshotFetcher) Fetch(ctx context.Context, srcRD, snapName string, vol
 	var lastErr error
 
 	for _, peer := range snap.Spec.Nodes {
-		if peer == f.NodeName {
+		if naming.Same(peer, f.NodeName) {
 			continue
 		}
 
@@ -126,7 +131,7 @@ func (f *SnapshotFetcher) Fetch(ctx context.Context, srcRD, snapName string, vol
 func (f *SnapshotFetcher) resolvePeerAddr(ctx context.Context, peerNode string) (string, error) {
 	var node blockstoriov1alpha1.Node
 
-	err := f.Client.Get(ctx, client.ObjectKey{Name: peerNode}, &node)
+	err := f.Client.Get(ctx, client.ObjectKey{Name: naming.Key(peerNode)}, &node)
 	if err != nil {
 		return "", errors.Wrapf(err, "get node CRD %s", peerNode)
 	}

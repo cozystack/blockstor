@@ -30,6 +30,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -228,7 +229,7 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 	now := r.now()
 
 	for i := range rds {
-		if rds[i].ResourceGroupName != rg.Name {
+		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
 			continue
 		}
 
@@ -290,7 +291,7 @@ func (r *RGRebalanceReconciler) replaySpawnShortfalls(ctx context.Context, rg *a
 	p := placer.New(r.Store)
 
 	for i := range rds {
-		if rds[i].ResourceGroupName != rg.Name {
+		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
 			continue
 		}
 
@@ -462,17 +463,17 @@ func (r *RGRebalanceReconciler) refreshOfflineTracker(ctx context.Context) {
 	seen := map[string]bool{}
 
 	for i := range nodes {
-		seen[nodes[i].Name] = true
+		seen[naming.Key(nodes[i].Name)] = true
 
 		offline := nodes[i].ConnectionStatus == apiv1.NodeTypeOffline
 		if !offline {
-			delete(r.nodeOfflineSince, nodes[i].Name)
+			delete(r.nodeOfflineSince, naming.Key(nodes[i].Name))
 
 			continue
 		}
 
-		if _, already := r.nodeOfflineSince[nodes[i].Name]; !already {
-			r.nodeOfflineSince[nodes[i].Name] = now
+		if _, already := r.nodeOfflineSince[naming.Key(nodes[i].Name)]; !already {
+			r.nodeOfflineSince[naming.Key(nodes[i].Name)] = now
 		}
 	}
 

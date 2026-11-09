@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -365,11 +366,11 @@ func candidatePools(ctx context.Context, run *runContext, group *apiv1.ResourceG
 			continue
 		case !matchesAny(wanted, pool.StoragePoolName):
 			continue
-		case seen[pool.NodeName]:
+		case seen[naming.Key(pool.NodeName)]:
 			continue
 		}
 
-		seen[pool.NodeName] = true
+		seen[naming.Key(pool.NodeName)] = true
 
 		pools = append(pools, *pool)
 	}
@@ -388,7 +389,7 @@ func matchesAny(filter []string, name string) bool {
 		return true
 	}
 
-	return slices.Contains(filter, name)
+	return slices.ContainsFunc(filter, func(f string) bool { return naming.Same(f, name) })
 }
 
 // maxVolumeSizeKib is the smallest free capacity among the pools a

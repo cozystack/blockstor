@@ -26,6 +26,7 @@ import (
 	"sort"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // The teardown a delete has to perform, shared by the two write doors.
@@ -102,7 +103,8 @@ func CascadeDeleteResources(ctx context.Context, st Store, rdName string) error 
 // Three spellings are asked, see NodeSpellings. The one that remains out of
 // reach is a spelling that is neither the caller's, nor the folded one, nor
 // the node's registered one: a replica created by hand under yet another case.
-// That is the boundary FoldName documents. The merge base asked only the
+// A field selector compares the stored spelling verbatim, which is the
+// boundary pkg/store/k8s/spellings.go documents. The merge base asked only the
 // caller's spelling, verbatim.
 func ReplicasOnNode(ctx context.Context, st Store, node string) ([]apiv1.Resource, error) {
 	spellings, err := NodeSpellings(ctx, st, node)
@@ -123,7 +125,7 @@ func ReplicasOnNode(ctx context.Context, st Store, node string) ([]apiv1.Resourc
 // `node-1` asked in one spelling, since that one is already folded, and found
 // nothing.
 //
-// It is read from the node listing and compared with FoldName, rather than
+// It is read from the node listing and compared with naming.Key, rather than
 // taken from Nodes().Get: the Kubernetes store's Get folds through the CRD
 // slug, the in-memory one does not, and the listing gives both the same
 // answer. A node that is not registered (already gone, or never was)
@@ -141,7 +143,7 @@ func NodeSpellings(ctx context.Context, st Store, node string) ([]string, error)
 		}
 	}
 
-	add(FoldName(node))
+	add(naming.Key(node))
 
 	nodes, err := st.Nodes().List(ctx)
 	if err != nil {
@@ -149,7 +151,7 @@ func NodeSpellings(ctx context.Context, st Store, node string) ([]string, error)
 	}
 
 	for i := range nodes {
-		if FoldName(nodes[i].Name) == FoldName(node) {
+		if naming.Key(nodes[i].Name) == naming.Key(node) {
 			add(nodes[i].Name)
 		}
 	}
@@ -184,7 +186,7 @@ func inEverySpelling[T any](
 		}
 
 		for i := range found {
-			key := FoldName(name(&found[i]))
+			key := naming.Key(name(&found[i]))
 			if _, dup := seen[key]; dup {
 				continue
 			}
@@ -263,11 +265,11 @@ func ReferencesUnderSpellings(ctx context.Context, st Store, spellings []string)
 	rscRefs := make([]string, 0, len(resources))
 
 	for i := range resources {
-		if _, dup := seen[resources[i].Name]; dup {
+		if _, dup := seen[naming.Key(resources[i].Name)]; dup {
 			continue
 		}
 
-		seen[resources[i].Name] = struct{}{}
+		seen[naming.Key(resources[i].Name)] = struct{}{}
 
 		rscRefs = append(rscRefs, resources[i].Name)
 	}
@@ -285,7 +287,7 @@ func ReferencesUnderSpellings(ctx context.Context, st Store, spellings []string)
 		// node — and it names a pool the operator cannot remove, so the
 		// node becomes undeletable. The REST refusal has always skipped
 		// it; the shared implementation has to as well.
-		if pools[i].StoragePoolName == apiv1.DfltDisklessStorPoolName {
+		if naming.Same(pools[i].StoragePoolName, apiv1.DfltDisklessStorPoolName) {
 			continue
 		}
 

@@ -27,14 +27,14 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
-// rKey is the composite key (resource definition, node) for the in-memory
-// resource index.
-type rKey struct {
-	rd   string
-	node string
-}
+// rKey is the in-memory resource index's key: the name the Kubernetes store
+// gives the replica's CR, so the two stores tell replicas apart alike.
+type rKey string
+
+func resourceKey(rd, node string) rKey { return rKey(naming.Key(rd + "." + node)) }
 
 type inMemoryResources struct {
 	mu        sync.RWMutex
@@ -69,7 +69,7 @@ func (s *inMemoryResources) ListByNode(_ context.Context, node string) ([]apiv1.
 	out := make([]apiv1.Resource, 0)
 
 	for k := range s.m {
-		if s.m[k].NodeName == node {
+		if naming.Key(s.m[k].NodeName) == naming.Key(node) {
 			out = append(out, s.m[k])
 		}
 	}
@@ -86,7 +86,7 @@ func (s *inMemoryResources) ListByDefinition(_ context.Context, rdName string) (
 	out := make([]apiv1.Resource, 0)
 
 	for k := range s.m {
-		if s.m[k].Name == rdName {
+		if naming.Key(s.m[k].Name) == naming.Key(rdName) {
 			out = append(out, s.m[k])
 		}
 	}
@@ -100,7 +100,7 @@ func (s *inMemoryResources) Get(_ context.Context, rdName, node string) (apiv1.R
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	r, ok := s.m[rKey{rdName, node}]
+	r, ok := s.m[resourceKey(rdName, node)]
 	if !ok {
 		return apiv1.Resource{}, errors.Wrapf(ErrNotFound, "resource %q on node %q", rdName, node)
 	}
@@ -116,7 +116,7 @@ func (s *inMemoryResources) Create(_ context.Context, r *apiv1.Resource) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := rKey{r.Name, r.NodeName}
+	k := resourceKey(r.Name, r.NodeName)
 	if _, exists := s.m[k]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "resource %q on node %q", r.Name, r.NodeName)
 	}
@@ -134,7 +134,7 @@ func (s *inMemoryResources) Update(_ context.Context, r *apiv1.Resource) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{r.Name, r.NodeName}
+	key := resourceKey(r.Name, r.NodeName)
 
 	prev, exists := s.m[key]
 	if !exists {
@@ -162,7 +162,7 @@ func (s *inMemoryResources) PatchResourceSpec(_ context.Context, rdName, node st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := resourceKey(rdName, node)
 
 	r, ok := s.m[key]
 	if !ok {
@@ -193,7 +193,7 @@ func (s *inMemoryResources) Delete(_ context.Context, rdName, node string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := resourceKey(rdName, node)
 	if _, exists := s.m[key]; !exists {
 		return errors.Wrapf(ErrNotFound, "resource %q on node %q", rdName, node)
 	}
@@ -216,7 +216,7 @@ func (s *inMemoryResources) DeleteIfTieBreaker(_ context.Context, rdName, node s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := resourceKey(rdName, node)
 
 	r, exists := s.m[key]
 	if !exists {
@@ -246,7 +246,7 @@ func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, sta
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := resourceKey(rdName, node)
 
 	existing, exists := s.m[key]
 	if !exists {
@@ -284,7 +284,7 @@ func (s *inMemoryResources) ClearDRBDPort(_ context.Context, rdName, node string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := rKey{rdName, node}
+	key := resourceKey(rdName, node)
 
 	existing, ok := s.m[key]
 	if !ok {
@@ -313,7 +313,7 @@ func (s *inMemoryResources) VolumeStateForTest(rdName, node string, volumeNumber
 		return apiv1.VolumeState{}, false
 	}
 
-	st, ok := s.volStates[rKey{rdName, node}][volumeNumber]
+	st, ok := s.volStates[resourceKey(rdName, node)][volumeNumber]
 
 	return st, ok
 }

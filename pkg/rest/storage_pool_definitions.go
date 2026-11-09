@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -333,7 +334,7 @@ func (s *Server) refuseSPDfnDeleteIfReferenced(w http.ResponseWriter, r *http.Re
 	var refs []string
 
 	for i := range pools {
-		if pools[i].StoragePoolName != name {
+		if !naming.Same(pools[i].StoragePoolName, name) {
 			continue
 		}
 

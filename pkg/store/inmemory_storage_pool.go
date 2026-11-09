@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // spKey is the composite map key for the in-memory storage-pool index.
@@ -71,7 +72,7 @@ func (s *inMemoryStoragePools) ListByNode(_ context.Context, node string) ([]api
 	out := make([]apiv1.StoragePool, 0)
 
 	for k := range s.m {
-		if s.m[k].NodeName == node {
+		if naming.Same(s.m[k].NodeName, node) {
 			sp := s.m[k]
 			withDerivedState(&sp)
 
@@ -91,7 +92,7 @@ func (s *inMemoryStoragePools) Get(_ context.Context, node, pool string) (apiv1.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	sp, ok := s.m[spKey{node, pool}]
+	sp, ok := s.m[spKey{naming.Key(node), naming.Key(pool)}]
 	if !ok {
 		return apiv1.StoragePool{}, errors.Wrapf(ErrNotFound, "storage pool %q on node %q", pool, node)
 	}
@@ -175,7 +176,7 @@ func (s *inMemoryStoragePools) Create(_ context.Context, sp *apiv1.StoragePool) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := spKey{sp.NodeName, sp.StoragePoolName}
+	k := spKey{naming.Key(sp.NodeName), naming.Key(sp.StoragePoolName)}
 	if _, exists := s.m[k]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "storage pool %q on node %q", sp.StoragePoolName, sp.NodeName)
 	}
@@ -194,7 +195,7 @@ func (s *inMemoryStoragePools) Update(_ context.Context, sp *apiv1.StoragePool) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := spKey{sp.NodeName, sp.StoragePoolName}
+	k := spKey{naming.Key(sp.NodeName), naming.Key(sp.StoragePoolName)}
 	if _, exists := s.m[k]; !exists {
 		return errors.Wrapf(ErrNotFound, "storage pool %q on node %q", sp.StoragePoolName, sp.NodeName)
 	}
@@ -210,7 +211,7 @@ func (s *inMemoryStoragePools) SetCapacity(_ context.Context, node, pool string,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := spKey{node, pool}
+	key := spKey{naming.Key(node), naming.Key(pool)}
 
 	existing, ok := s.m[key]
 	if !ok {
@@ -237,7 +238,7 @@ func (s *inMemoryStoragePools) PatchStoragePoolSpec(_ context.Context, node, poo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := spKey{node, pool}
+	key := spKey{naming.Key(node), naming.Key(pool)}
 
 	sp, ok := s.m[key]
 	if !ok {
@@ -264,7 +265,7 @@ func (s *inMemoryStoragePools) Delete(_ context.Context, node, pool string) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := spKey{node, pool}
+	k := spKey{naming.Key(node), naming.Key(pool)}
 	if _, exists := s.m[k]; !exists {
 		return errors.Wrapf(ErrNotFound, "storage pool %q on node %q", pool, node)
 	}

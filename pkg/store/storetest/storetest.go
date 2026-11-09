@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -41,6 +42,7 @@ func RunNodeStore(t *testing.T, newStore Factory) {
 	t.Helper()
 	t.Run("ListEmpty", func(t *testing.T) { testNodeListEmpty(t, newStore) })
 	t.Run("CreateThenGet", func(t *testing.T) { testNodeCreateThenGet(t, newStore) })
+	t.Run("AnySpellingAddressesOneNode", func(t *testing.T) { testAnySpellingAddressesOneNode(t, newStore) })
 	t.Run("CreateDuplicate", func(t *testing.T) { testNodeCreateDuplicate(t, newStore) })
 	t.Run("GetMissing", func(t *testing.T) { testNodeGetMissing(t, newStore) })
 	t.Run("UpdateMissing", func(t *testing.T) { testNodeUpdateMissing(t, newStore) })
@@ -377,7 +379,7 @@ func runVolumeDefinitionListAllCase(t *testing.T, newStore Factory) {
 		}
 
 		// The spelling a replica of that definition carries.
-		vds, ok := all[store.FoldName("pvc-mixed")]
+		vds, ok := all[naming.Key("pvc-mixed")]
 		if !ok {
 			keys := make([]string, 0, len(all))
 			for k := range all {
@@ -508,6 +510,7 @@ func RunSnapshotStore(t *testing.T, newStore Factory) {
 	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
 	// See annotation_contract.go.
 	t.Run("UpdateAnnotationContract", func(t *testing.T) { testSnapshotUpdateAnnotationContract(t, newStore) })
+	t.Run("AnySpellingAddressesOneSnapshot", func(t *testing.T) { testAnySpellingAddressesOneSnapshot(t, newStore) })
 	t.Run("CreateThenGet", func(t *testing.T) {
 		s := newStore(t).Snapshots()
 		ctx := t.Context()
@@ -684,6 +687,7 @@ func testSnapshotUpdateNilArg(t *testing.T, newStore Factory) {
 // RunResourceStore exercises every branch of store.ResourceStore.
 func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Helper()
+	t.Run("AnySpellingAddressesOneReplica", func(t *testing.T) { testAnySpellingAddressesOneReplica(t, newStore) })
 	t.Run("ListEmpty", func(t *testing.T) {
 		got, err := newStore(t).Resources().List(t.Context())
 		if err != nil {
@@ -733,6 +737,17 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	// they cannot drift apart.
 	t.Run("ReferencesOnNodeUnderAnotherSpelling", func(t *testing.T) {
 		testReferencesOnNodeUnderAnotherSpelling(t, newStore)
+	})
+	// A definition's replicas and snapshots are found whatever spelling the
+	// definition is asked in. `rd d PVC-X` over `pvc-x` passed the snapshot
+	// gate on zero rows and cascaded nothing, then the folded Delete took the
+	// definition and left its replicas and snapshots behind.
+	t.Run("ChildrenOfDefinitionUnderAnySpelling", func(t *testing.T) {
+		testChildrenOfDefinitionUnderAnySpelling(t, newStore)
+	})
+	// The node-scoped listing folds the node name the same way.
+	t.Run("ListByNodeUnderAnySpelling", func(t *testing.T) {
+		testListByNodeUnderAnySpelling(t, newStore)
 	})
 	// The other direction: the operator types the canonical lowercase name
 	// and the node, with its replicas and pools, was registered in upper
@@ -1181,6 +1196,13 @@ func testResourceDeleteIfTieBreaker(t *testing.T, newStore Factory) {
 // store.ResourceDefinitionStore.
 func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 	t.Helper()
+
+	t.Run("CaseVariantsOutsideRFC1123AreTwoDefinitions", func(t *testing.T) {
+		testCaseVariantsOutsideRFC1123AreTwoDefinitions(t, newStore)
+	})
+	t.Run("AnySpellingAddressesOneDefinition", func(t *testing.T) {
+		testAnySpellingAddressesOneDefinition(t, newStore)
+	})
 	t.Run("ListEmpty", func(t *testing.T) {
 		got, err := newStore(t).ResourceDefinitions().List(t.Context())
 		if err != nil {
@@ -2259,5 +2281,212 @@ func testReferencesOnNodeUnderAnotherSpelling(t *testing.T, newStore Factory) {
 	if len(replicas) != 1 {
 		t.Errorf("ReferencesOnNode under another spelling found %d replica(s), want 1 — "+
 			"the refusal would pass and the node would go with a replica on it", len(replicas))
+	}
+}
+
+// testAnySpellingAddressesOneNode: a node is addressed by the key of its name.
+func testAnySpellingAddressesOneNode(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.Nodes().Create(ctx, &apiv1.Node{Name: "node-1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("Create node-1: %v", err)
+	}
+
+	if _, err := s.Nodes().Get(ctx, "Node-1"); err != nil {
+		t.Errorf("Get Node-1 after Create node-1: %v", err)
+	}
+
+	if err := s.Nodes().Create(ctx, &apiv1.Node{Name: "Node-1", Type: apiv1.NodeTypeSatellite}); !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("Create Node-1 over node-1 = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// testAnySpellingAddressesOneReplica: a replica is addressed by the keys of
+// its definition's and its node's names.
+func testAnySpellingAddressesOneReplica(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"}); err != nil {
+		t.Fatalf("Create definition: %v", err)
+	}
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: "node-1"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	if _, err := s.Resources().Get(ctx, "Pvc-X", "Node-1"); err != nil {
+		t.Errorf("Get Pvc-X on Node-1 after Create pvc-x on node-1: %v", err)
+	}
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "PVC-X", NodeName: "NODE-1"}); !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("Create PVC-X on NODE-1 over it = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// testAnySpellingAddressesOneSnapshot: a snapshot is addressed by the key of
+// its definition's and its own names joined, which is its CR name in the
+// Kubernetes store. Inside RFC 1123 every spelling of either is one snapshot.
+func testAnySpellingAddressesOneSnapshot(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"}); err != nil {
+		t.Fatalf("Create definition: %v", err)
+	}
+
+	if err := s.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "snap-1", ResourceName: "pvc-x", Nodes: []string{"n1"}}); err != nil {
+		t.Fatalf("Create snapshot: %v", err)
+	}
+
+	if _, err := s.Snapshots().Get(ctx, "PVC-X", "Snap-1"); err != nil {
+		t.Errorf("Get PVC-X/Snap-1 after Create pvc-x/snap-1: %v", err)
+	}
+
+	err := s.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "SNAP-1", ResourceName: "Pvc-X", Nodes: []string{"n1"}})
+	if !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("Create Pvc-X/SNAP-1 over it = %v, want ErrAlreadyExists", err)
+	}
+
+	if err := s.Snapshots().Delete(ctx, "pvc-X", "snap-1"); err != nil {
+		t.Fatalf("Delete pvc-X/snap-1: %v", err)
+	}
+
+	if _, err := s.Snapshots().Get(ctx, "pvc-x", "snap-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get pvc-x/snap-1 after the delete = %v, want ErrNotFound", err)
+	}
+}
+
+// testAnySpellingAddressesOneDefinition: a definition is addressed by the key
+// of its name (naming.Key), in every store. Created as pvc-x it is found as
+// Pvc-X, updated and deleted as PVC-X, and a create of Pvc-X while it exists
+// conflicts.
+func testAnySpellingAddressesOneDefinition(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"}); err != nil {
+		t.Fatalf("Create pvc-x: %v", err)
+	}
+
+	if _, err := s.ResourceDefinitions().Get(ctx, "Pvc-X"); err != nil {
+		t.Errorf("Get Pvc-X after Create pvc-x: %v", err)
+	}
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "Pvc-X"}); !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("Create Pvc-X over pvc-x = %v, want ErrAlreadyExists", err)
+	}
+
+	if err := s.ResourceDefinitions().Delete(ctx, "PVC-X"); err != nil {
+		t.Fatalf("Delete PVC-X: %v", err)
+	}
+
+	if _, err := s.ResourceDefinitions().Get(ctx, "pvc-x"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get pvc-x after Delete PVC-X = %v, want ErrNotFound", err)
+	}
+}
+
+// testCaseVariantsOutsideRFC1123AreTwoDefinitions: a name outside RFC 1123 is
+// keyed by a hash of the name as given (naming.Key), so My_Res and my_res are
+// two definitions in every store.
+func testCaseVariantsOutsideRFC1123AreTwoDefinitions(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	for _, rd := range []string{"My_Res", "my_res"} {
+		if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rd, Props: map[string]string{"Aux/spelling": rd}}); err != nil {
+			t.Fatalf("Create definition %q: %v", rd, err)
+		}
+	}
+
+	for _, rd := range []string{"My_Res", "my_res"} {
+		got, err := s.ResourceDefinitions().Get(ctx, rd)
+		if err != nil {
+			t.Fatalf("Get %q: %v", rd, err)
+		}
+
+		if got.Props["Aux/spelling"] != rd {
+			t.Errorf("Get %q returned the definition created as %q", rd, got.Props["Aux/spelling"])
+		}
+	}
+}
+
+func testChildrenOfDefinitionUnderAnySpelling(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "Pvc-Mix"}); err != nil {
+		t.Fatalf("Create definition: %v", err)
+	}
+
+	// Written in a spelling other than the definition's own.
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "PVC-MIX", NodeName: "n1"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	if err := s.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name: "snap-mix", ResourceName: "PVC-MIX", Nodes: []string{"n1"},
+	}); err != nil {
+		t.Fatalf("Create snapshot: %v", err)
+	}
+
+	for _, asked := range []string{"Pvc-Mix", "pvc-mix", "PVC-MIX"} {
+		replicas, err := s.Resources().ListByDefinition(ctx, asked)
+		if err != nil {
+			t.Fatalf("ListByDefinition %q: %v", asked, err)
+		}
+
+		if len(replicas) != 1 {
+			t.Errorf("ListByDefinition %q found %d replica(s), want 1", asked, len(replicas))
+		}
+
+		snaps, err := s.Snapshots().ListByDefinition(ctx, asked)
+		if err != nil {
+			t.Fatalf("Snapshots ListByDefinition %q: %v", asked, err)
+		}
+
+		if len(snaps) != 1 {
+			t.Errorf("Snapshots ListByDefinition %q found %d snapshot(s), want 1", asked, len(snaps))
+		}
+	}
+}
+
+func testListByNodeUnderAnySpelling(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.Nodes().Create(ctx, &apiv1.Node{Name: "Node-Mix", Type: "SATELLITE"}); err != nil {
+		t.Fatalf("Create node: %v", err)
+	}
+
+	// Written in a spelling other than the node's own.
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-node-mix", NodeName: "NODE-MIX"}); err != nil {
+		t.Fatalf("Create replica: %v", err)
+	}
+
+	for _, asked := range []string{"Node-Mix", "node-mix", "NODE-MIX"} {
+		got, err := s.Resources().ListByNode(ctx, asked)
+		if err != nil {
+			t.Fatalf("ListByNode %q: %v", asked, err)
+		}
+
+		if len(got) != 1 {
+			t.Errorf("ListByNode %q found %d replica(s), want 1", asked, len(got))
+		}
 	}
 }

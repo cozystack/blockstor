@@ -23,9 +23,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // LeftoverProgress is where a target carrying a clone's or a restore's marker
@@ -235,7 +235,7 @@ func MissingReplicas(ctx context.Context, st Store, rdName string, wanted []stri
 
 	for _, node := range wanted {
 		placed := slices.ContainsFunc(replicas, func(r apiv1.Resource) bool {
-			return strings.EqualFold(r.NodeName, node) && !slices.Contains(r.Flags, apiv1.ResourceFlagDelete) &&
+			return naming.Same(r.NodeName, node) && !slices.Contains(r.Flags, apiv1.ResourceFlagDelete) &&
 				HoldsData(&r)
 		})
 		if !placed {

@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
@@ -943,25 +944,28 @@ func stampVolumeStoragePool(t *testing.T, stack *harness.Stack, rd, node, pool s
 	ctx := context.Background()
 	name := rd + "." + node
 
-	var r blockstoriov1alpha1.Resource
+	// The controller and the satellite mock write the same status, so a
+	// write from a stale read is retried on a fresh one.
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var r blockstoriov1alpha1.Resource
 
-	err := stack.Env.Client.Get(ctx, types.NamespacedName{Name: name}, &r)
-	if err != nil {
-		t.Fatalf("get Resource %s: %v", name, err)
-	}
+		if err := stack.Env.Client.Get(ctx, types.NamespacedName{Name: name}, &r); err != nil {
+			return err
+		}
 
-	if len(r.Status.Volumes) == 0 {
-		r.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{{
-			VolumeNumber: 0,
-			StoragePool:  pool,
-			DiskState:    "UpToDate",
-		}}
-	} else {
-		r.Status.Volumes[0].StoragePool = pool
-		r.Status.Volumes[0].DiskState = "UpToDate"
-	}
+		if len(r.Status.Volumes) == 0 {
+			r.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{{
+				VolumeNumber: 0,
+				StoragePool:  pool,
+				DiskState:    "UpToDate",
+			}}
+		} else {
+			r.Status.Volumes[0].StoragePool = pool
+			r.Status.Volumes[0].DiskState = "UpToDate"
+		}
 
-	err = stack.Env.Client.Status().Update(ctx, &r)
+		return stack.Env.Client.Status().Update(ctx, &r)
+	})
 	if err != nil {
 		t.Fatalf("stamp Status.Volumes on %s: %v", name, err)
 	}

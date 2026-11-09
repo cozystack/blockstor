@@ -27,9 +27,11 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/pkg/errors"
@@ -77,14 +79,14 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 	// Optional filter the upstream LINSTOR CLI sends on
 	// `linstor rg l --resource-groups <name>...` — mirrors the
 	// `resource_definitions` filter on `rd l` (Bug 61) for the RG
-	// list endpoint. Same semantics: case-insensitive name match,
+	// list endpoint. Same semantics: names match as the store keys them,
 	// unknown names => empty list, missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_groups")
 	if len(nameFilter) > 0 {
 		filtered := rgs[:0]
 
 		for i := range rgs {
-			if matchAnyFold(nameFilter, rgs[i].Name) {
+			if matchAnyName(nameFilter, rgs[i].Name) {
 				filtered = append(filtered, rgs[i])
 			}
 		}
@@ -164,7 +166,7 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug 97: see pkg/rest/input_validation.go — RFC-1123 subdomain
-	// validation at the REST boundary, before pkg/store/k8s.Name()
+	// validation at the REST boundary, before pkg/naming.Key()
 	// mangles the input.
 	nameErr := validateLinstorName("resource group", rg.Name)
 	if nameErr != nil {
@@ -173,7 +175,7 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := validateLayerStack(rg.SelectFilter.LayerStack)
+	err := canonicalizeLayerStack(&rg.SelectFilter.LayerStack)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -373,7 +375,7 @@ func countChildRDs(ctx context.Context, st store.Store, rgName string) int {
 	n := 0
 
 	for i := range rds {
-		if rds[i].ResourceGroupName == rgName {
+		if naming.Same(rds[i].ResourceGroupName, rgName) {
 			n++
 		}
 	}
@@ -413,7 +415,10 @@ func rgNeedsRebalance(prev, next *apiv1.AutoSelectFilter) bool {
 		return true
 	}
 
-	if !slices.Equal(prev.LayerStack, next.LayerStack) {
+	// Case-blind: a stack stored as drbd,storage before writes were
+	// canonicalised is the same stack as DRBD,STORAGE, and a modify that
+	// resends it must not rebalance every child.
+	if !slices.EqualFunc(prev.LayerStack, next.LayerStack, strings.EqualFold) {
 		return true
 	}
 
@@ -1037,7 +1042,7 @@ func rgUpdateWireGate(raw []byte, patch *apiv1.ResourceGroup) error {
 	// nil); a nil/empty stack is the legitimate "clear to default" and
 	// validateLayerStack accepts it.
 	if patch.SelectFilter.LayerStack != nil {
-		err := validateLayerStack(patch.SelectFilter.LayerStack)
+		err := canonicalizeLayerStack(&patch.SelectFilter.LayerStack)
 		if err != nil {
 			return err
 		}

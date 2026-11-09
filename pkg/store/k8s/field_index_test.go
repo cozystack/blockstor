@@ -19,7 +19,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -218,7 +218,7 @@ func TestScopedReadsOnAnUncachedClient(t *testing.T) {
 		t.Errorf("ListByDefinition = %v, %v; want both replicas", byDefinition, err)
 	}
 
-	_ = store.FoldName("")
+	_ = naming.Key("")
 }
 
 // A label is written by whoever created the object, and piraeus and operators

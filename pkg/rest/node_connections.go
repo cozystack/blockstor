@@ -22,6 +22,7 @@ import (
 	"context"
 	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 
@@ -31,6 +32,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -88,16 +90,49 @@ const (
 	objRefNodeB = "NodeB"
 )
 
-// nodeConnectionPairKey returns the canonical persistence key for the
-// (a, b) pair: lexicographically lower name first, then `::`, then
-// the higher. The separator can't appear inside a LINSTOR node name
-// (validated to `[A-Za-z0-9_-]+`), so the join is unambiguous.
+// nodeConnectionPairKey returns the persistence key a new (a, b) pair is
+// stored under: the node with the lower naming key first, then `::`, then
+// the other, each in the spelling the caller gave, which the list shows.
+// The separator can't appear inside a LINSTOR node name (validated to
+// `[A-Za-z0-9_-]+`), so the join is unambiguous.
 func nodeConnectionPairKey(a, b string) string {
-	if a > b {
+	if naming.Key(a) > naming.Key(b) {
 		a, b = b, a
 	}
 
 	return a + "::" + b
+}
+
+// storedPairKeys returns the keys conn holds the (a, b) pair under, in any
+// order and spelling of the two nodes, sorted. A pair written as
+// Node-1::node-2 is the pair node-1, node-2 asks for.
+func storedPairKeys(conn map[string]map[string]string, nodeA, nodeB string) []string {
+	var keys []string
+
+	for key := range conn {
+		x, y, ok := strings.Cut(key, "::")
+		if !ok {
+			continue
+		}
+
+		if naming.Same(x, nodeA) && naming.Same(y, nodeB) || naming.Same(x, nodeB) && naming.Same(y, nodeA) {
+			keys = append(keys, key)
+		}
+	}
+
+	slices.Sort(keys)
+
+	return keys
+}
+
+// pairKeyIn is the key conn keeps the (a, b) pair under, or the key a new
+// pair is stored under when it keeps none.
+func pairKeyIn(conn map[string]map[string]string, a, b string) string {
+	if keys := storedPairKeys(conn, a, b); len(keys) > 0 {
+		return keys[0]
+	}
+
+	return nodeConnectionPairKey(a, b)
 }
 
 // handleNodeConnectionList serves `GET /v1/node-connections` and
@@ -118,7 +153,7 @@ func (s *Server) handleNodeConnectionList(w http.ResponseWriter, r *http.Request
 		filtered := pairs[:0]
 
 		for _, p := range pairs {
-			if p.NodeA == filter || p.NodeB == filter {
+			if naming.Same(p.NodeA, filter) || naming.Same(p.NodeB, filter) {
 				filtered = append(filtered, p)
 			}
 		}
@@ -322,9 +357,7 @@ func (s *Server) readNodeConnectionProps(ctx context.Context, src, dst string) (
 		return nil, errors.Wrap(err, "get ControllerConfig")
 	}
 
-	key := nodeConnectionPairKey(src, dst)
-
-	stored := ctrlConfig.Spec.NodeConnections[key]
+	stored := ctrlConfig.Spec.NodeConnections[pairKeyIn(ctrlConfig.Spec.NodeConnections, src, dst)]
 	if stored == nil {
 		return map[string]string{}, nil
 	}
@@ -399,11 +432,9 @@ func (s *Server) readAllNodeConnections(ctx context.Context) ([]nodeConnectionWi
 func (s *Server) applyNodeConnectionProps(
 	ctx context.Context, src, dst string, modify *apiv1.GenericPropsModify,
 ) error {
-	key := nodeConnectionPairKey(src, dst)
-
 	err := k8sstore.PatchControllerNodeConnections(ctx, s.Client,
 		func(conn map[string]map[string]string) error {
-			mergeNodeConnectionPropsInto(conn, key, modify)
+			mergeNodeConnectionPropsInto(conn, pairKeyIn(conn, src, dst), modify)
 
 			return nil
 		})
@@ -420,11 +451,11 @@ func (s *Server) applyNodeConnectionProps(
 // pair has no props after this call", which a missing record
 // already satisfies.
 func (s *Server) dropNodeConnection(ctx context.Context, src, dst string) error {
-	key := nodeConnectionPairKey(src, dst)
-
 	err := k8sstore.PatchControllerNodeConnections(ctx, s.Client,
 		func(conn map[string]map[string]string) error {
-			delete(conn, key)
+			for _, key := range storedPairKeys(conn, src, dst) {
+				delete(conn, key)
+			}
 
 			return nil
 		})

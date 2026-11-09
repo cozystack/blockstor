@@ -26,10 +26,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite/controllers"
 	"github.com/cozystack/blockstor/pkg/satellite/stream"
 	"github.com/cozystack/blockstor/pkg/storage"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // A satellite with no stream TLS configured cannot fetch from a peer. The
@@ -40,7 +40,7 @@ func TestSnapshotFetcherWithTheStreamOffFallsBackToAResync(t *testing.T) {
 	t.Parallel()
 
 	snap := &blockstoriov1alpha1.Snapshot{
-		ObjectMeta: metav1.ObjectMeta{Name: k8s.Name("rd.snap")},
+		ObjectMeta: metav1.ObjectMeta{Name: naming.Key("rd.snap")},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "rd",
 			SnapshotName:           "snap",

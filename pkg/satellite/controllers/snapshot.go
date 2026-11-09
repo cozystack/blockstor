@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -87,7 +88,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Wrap(err, "get Snapshot")
 	}
 
-	if !slices.Contains(snap.Spec.Nodes, r.Config.NodeName) {
+	if !slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return naming.Same(n, r.Config.NodeName) }) {
 		return ctrl.Result{}, nil
 	}
 
@@ -171,6 +172,16 @@ func (r *SnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //     stamp lands, the controller flips Phase 3 once every node
 //     is Ready.
 func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	// Entries for this node under two spellings are folded into one
+	// before any phase reads them: the phase checks look at the first,
+	// the controller at the last, and an acknowledgment on one alias
+	// would otherwise never reach the other.
+	if nodeStatusHasAliases(snap.Status.NodeStatus, r.Config.NodeName) {
+		err := r.upsertPerNodeStatusField(ctx, snap, func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool { return false })
+
+		return ctrl.Result{RequeueAfter: time.Second}, err
+	}
+
 	// Phase 1: parent RD I/O suspend. Per-node ack lives on
 	// Status.NodeStatus[us].SuspendIOAcked. Idempotent — the
 	// helper short-circuits when already acked.
@@ -211,7 +222,7 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 // suspend stamps the per-node Failed=true so the controller-side
 // orchestrator drains the siblings.
 func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	err := r.Config.Apply.SuspendResource(ctx, snap.Spec.ResourceDefinitionName)
+	err := r.Config.Apply.SuspendResource(ctx, naming.Key(snap.Spec.ResourceDefinitionName))
 	if err != nil {
 		log.FromContext(ctx).Info("SuspendResource failed",
 			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
@@ -246,7 +257,7 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 // clearing the ack so the orchestrator keeps poking us until
 // the kernel actually accepts the unfreeze.
 func (r *SnapshotReconciler) handleResumePhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	err := r.Config.Apply.ResumeResource(ctx, snap.Spec.ResourceDefinitionName)
+	err := r.Config.Apply.ResumeResource(ctx, naming.Key(snap.Spec.ResourceDefinitionName))
 	if err != nil {
 		log.FromContext(ctx).Info("ResumeResource failed",
 			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
@@ -271,7 +282,7 @@ func (r *SnapshotReconciler) handleResumePhase(ctx context.Context, snap *blocks
 // step runs.
 func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
 	req := &intent.CreateSnapshotRequest{
-		ResourceName: snap.Spec.ResourceDefinitionName,
+		ResourceName: naming.Key(snap.Spec.ResourceDefinitionName),
 		SnapshotName: snap.Spec.SnapshotName,
 	}
 
@@ -298,7 +309,7 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 	// flush, and a stripped-down satellite environment (kernel
 	// without BLKFLSBUF, hostpath sandboxing) shouldn't block the
 	// snapshot from running.
-	err := r.Config.Apply.FlushBackingDevices(ctx, snap.Spec.ResourceDefinitionName, req.VolumeNumbers)
+	err := r.Config.Apply.FlushBackingDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName), req.VolumeNumbers)
 	if err != nil {
 		// FlushBackingDevices itself returns nil on best-effort
 		// per-device failures; a non-nil return signals a hard
@@ -358,7 +369,7 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 // Status subresource.
 func perNodeStatusSuspendIOAcked(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
 	for i := range entries {
-		if entries[i].NodeName != nodeName {
+		if !naming.Same(entries[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -527,12 +538,15 @@ func upsertPerNodeStatusInPlace(
 	nodeName string,
 	mutate func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
 ) bool {
-	for i := range *entries {
-		if (*entries)[i].NodeName != nodeName {
-			continue
+	collapsed, mine, folded := collapseNodeStatus(*entries, nodeName)
+	if mine >= 0 {
+		if !mutate(&collapsed[mine]) && !folded {
+			return false
 		}
 
-		return mutate(&(*entries)[i])
+		*entries = collapsed
+
+		return true
 	}
 
 	fresh := blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: nodeName}
@@ -543,6 +557,61 @@ func upsertPerNodeStatusInPlace(
 	*entries = append(*entries, fresh)
 
 	return true
+}
+
+// nodeStatusHasAliases reports whether entries hold more than one entry for
+// nodeName, in any spelling.
+func nodeStatusHasAliases(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
+	seen := false
+
+	for i := range entries {
+		if !naming.Same(entries[i].NodeName, nodeName) {
+			continue
+		}
+
+		if seen {
+			return true
+		}
+
+		seen = true
+	}
+
+	return false
+}
+
+// collapseNodeStatus folds every entry for one node, in whatever spelling
+// it was written, into the first of them. Entries written before under
+// Node-1 and node-1 are one node's: a writer that updated only the first
+// and a reader that kept only the last would never meet. Returns the
+// entries, the folded entry's index (-1 when the node has none), and
+// whether any alias was folded away.
+func collapseNodeStatus(
+	entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string,
+) ([]blockstoriov1alpha1.SnapshotPerNodeStatus, int, bool) {
+	out := make([]blockstoriov1alpha1.SnapshotPerNodeStatus, 0, len(entries))
+	mine := -1
+	folded := false
+
+	for i := range entries {
+		entry := entries[i]
+
+		switch {
+		case !naming.Same(entry.NodeName, nodeName):
+			out = append(out, entry)
+		case mine < 0:
+			mine = len(out)
+			out = append(out, entry)
+		default:
+			kept := &out[mine]
+			kept.Ready = kept.Ready || entry.Ready
+			kept.SuspendIOAcked = kept.SuspendIOAcked || entry.SuspendIOAcked
+			kept.Failed = kept.Failed || entry.Failed
+			kept.CreateTimestamp = max(kept.CreateTimestamp, entry.CreateTimestamp)
+			folded = true
+		}
+	}
+
+	return out, mine, folded
 }
 
 // stampSnapshotPerNodeReady upserts our node's entry in
@@ -624,8 +693,13 @@ const snapshotStatusUpdateRetries = 5
 // what the apiserver's success derivation actually reads, so any
 // non-zero stamp keeps the wire shape correct.
 func perNodeStatusReady(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
+	// Aliases still to fold are not stamped yet, whatever the first says.
+	if nodeStatusHasAliases(entries, nodeName) {
+		return false
+	}
+
 	for i := range entries {
-		if entries[i].NodeName != nodeName {
+		if !naming.Same(entries[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -644,33 +718,18 @@ func perNodeStatusReady(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nod
 // (otherwise the controller-side orchestrator would see the ack
 // drop and mis-classify the snapshot as still mid-suspend).
 func upsertPerNodeStatus(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string, createTimestamp int64) []blockstoriov1alpha1.SnapshotPerNodeStatus {
-	out := make([]blockstoriov1alpha1.SnapshotPerNodeStatus, 0, len(entries)+1)
-	replaced := false
-
-	for i := range entries {
-		if entries[i].NodeName == nodeName {
-			merged := entries[i]
-			merged.NodeName = nodeName
-			merged.Ready = true
-			merged.CreateTimestamp = createTimestamp
-
-			out = append(out, merged)
-
-			replaced = true
-
-			continue
-		}
-
-		out = append(out, entries[i])
-	}
-
-	if !replaced {
-		out = append(out, blockstoriov1alpha1.SnapshotPerNodeStatus{
+	out, mine, _ := collapseNodeStatus(entries, nodeName)
+	if mine < 0 {
+		return append(out, blockstoriov1alpha1.SnapshotPerNodeStatus{
 			NodeName:        nodeName,
 			Ready:           true,
 			CreateTimestamp: createTimestamp,
 		})
 	}
+
+	out[mine].NodeName = nodeName
+	out[mine].Ready = true
+	out[mine].CreateTimestamp = createTimestamp
 
 	return out
 }
@@ -697,7 +756,7 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	}
 
 	req := &intent.DeleteSnapshotRequest{
-		ResourceName: snap.Spec.ResourceDefinitionName,
+		ResourceName: naming.Key(snap.Spec.ResourceDefinitionName),
 		SnapshotName: snap.Spec.SnapshotName,
 	}
 
@@ -737,7 +796,7 @@ func snapshotNodePredicate(nodeName string) predicate.Predicate {
 			return false
 		}
 
-		return slices.Contains(snap.Spec.Nodes, nodeName)
+		return slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return naming.Same(n, nodeName) })
 	}
 
 	return predicate.Funcs{

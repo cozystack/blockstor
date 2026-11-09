@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -341,7 +342,7 @@ func (s *StorageOrphanSweeperRunnable) reapIfOrphan(
 func (s *StorageOrphanSweeperRunnable) shouldSkip(ctx context.Context) (bool, error) {
 	var node blockstoriov1alpha1.Node
 
-	err := s.Client.Get(ctx, client.ObjectKey{Name: s.NodeName}, &node)
+	err := s.Client.Get(ctx, client.ObjectKey{Name: naming.Key(s.NodeName)}, &node)
 	if err != nil {
 		return false, errors.Wrap(err, "get Node")
 	}
@@ -379,18 +380,22 @@ func (s *StorageOrphanSweeperRunnable) listOwnedVolumeRefs(ctx context.Context) 
 
 	for i := range resList.Items {
 		r := &resList.Items[i]
-		if r.Spec.NodeName != s.NodeName {
+		if !naming.Same(r.Spec.NodeName, s.NodeName) {
 			continue
 		}
 
-		vols, ok := rdToVolumes[r.Spec.ResourceDefinitionName]
+		// The volumes are laid down under the definition's CR name,
+		// whatever spelling an older row keeps in spec.
+		rdName := naming.Key(r.Spec.ResourceDefinitionName)
+
+		vols, ok := rdToVolumes[rdName]
 		if !ok {
-			vols = s.lookupRDVolumes(ctx, r.Spec.ResourceDefinitionName)
-			rdToVolumes[r.Spec.ResourceDefinitionName] = vols
+			vols = s.lookupRDVolumes(ctx, rdName)
+			rdToVolumes[rdName] = vols
 		}
 
 		for _, vn := range vols {
-			out[ownedKey(r.Spec.ResourceDefinitionName, vn)] = struct{}{}
+			out[ownedKey(rdName, vn)] = struct{}{}
 		}
 
 		// Edge case: RD already gone but the Resource CRD is still
@@ -398,7 +403,7 @@ func (s *StorageOrphanSweeperRunnable) listOwnedVolumeRefs(ctx context.Context) 
 		// keyed only by resource name so the sweeper still
 		// recognises the in-flight delete and doesn't race.
 		if len(vols) == 0 {
-			out[ownedKey(r.Spec.ResourceDefinitionName, -1)] = struct{}{}
+			out[ownedKey(rdName, -1)] = struct{}{}
 		}
 	}
 
@@ -412,7 +417,7 @@ func (s *StorageOrphanSweeperRunnable) listOwnedVolumeRefs(ctx context.Context) 
 func (s *StorageOrphanSweeperRunnable) lookupRDVolumes(ctx context.Context, rdName string) []int32 {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := s.Client.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	err := s.Client.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
 	if err != nil {
 		return nil
 	}

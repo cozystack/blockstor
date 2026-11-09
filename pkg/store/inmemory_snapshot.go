@@ -27,12 +27,16 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
-type snapKey struct {
-	rd   string
-	snap string
-}
+// snapKey is the in-memory snapshot index's key: the name the Kubernetes
+// store gives the snapshot's CR, so the two stores tell snapshots apart
+// alike. When the joined name falls outside RFC 1123 the key hashes it whole,
+// spelling of the definition included.
+type snapKey string
+
+func snapshotKey(rd, snap string) snapKey { return snapKey(naming.Key(rd + "." + snap)) }
 
 type inMemorySnapshots struct {
 	mu sync.RWMutex
@@ -66,7 +70,7 @@ func (s *inMemorySnapshots) ListByDefinition(_ context.Context, rdName string) (
 	out := make([]apiv1.Snapshot, 0)
 
 	for k := range s.m {
-		if s.m[k].ResourceName == rdName {
+		if naming.Key(s.m[k].ResourceName) == naming.Key(rdName) {
 			out = append(out, s.m[k])
 		}
 	}
@@ -86,7 +90,7 @@ func (s *inMemorySnapshots) Get(_ context.Context, rdName, snapName string) (api
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	snap, ok := s.m[snapKey{rdName, snapName}]
+	snap, ok := s.m[snapshotKey(rdName, snapName)]
 	if !ok {
 		return apiv1.Snapshot{}, errors.Wrapf(ErrNotFound, "snapshot %q on resource definition %q", snapName, rdName)
 	}
@@ -102,7 +106,7 @@ func (s *inMemorySnapshots) Create(_ context.Context, snap *apiv1.Snapshot) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := snapKey{snap.ResourceName, snap.Name}
+	k := snapshotKey(snap.ResourceName, snap.Name)
 	if _, exists := s.m[k]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "snapshot %q on resource definition %q", snap.Name, snap.ResourceName)
 	}
@@ -120,7 +124,7 @@ func (s *inMemorySnapshots) Update(_ context.Context, snap *apiv1.Snapshot) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := snapKey{snap.ResourceName, snap.Name}
+	key := snapshotKey(snap.ResourceName, snap.Name)
 
 	prev, exists := s.m[key]
 	if !exists {
@@ -144,7 +148,7 @@ func (s *inMemorySnapshots) PatchSnapshotProps(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := snapKey{rdName, snapName}
+	key := snapshotKey(rdName, snapName)
 
 	snap, ok := s.m[key]
 	if !ok {
@@ -177,7 +181,7 @@ func (s *inMemorySnapshots) Delete(_ context.Context, rdName, snapName string) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := snapKey{rdName, snapName}
+	k := snapshotKey(rdName, snapName)
 	if _, exists := s.m[k]; !exists {
 		return errors.Wrapf(ErrNotFound, "snapshot %q on resource definition %q", snapName, rdName)
 	}

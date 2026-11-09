@@ -57,18 +57,19 @@ type FilesystemFormattedStamper struct {
 }
 
 // StampFilesystemFormatted SSA-patches a `FilesystemFormatted=True`
-// Condition onto Resource <resourceName>.Status.Conditions.
+// Condition onto the Resource CR of the replica of resourceName on
+// nodeName (see replicaCRName).
 // Idempotent — SSA's listMap merging on `type` means a repeat
 // patch with the same fields is a no-op at the apiserver level
 // (LastTransitionTime is preserved because the apiserver only
 // updates it when the Condition's Status actually changes).
-func (s *FilesystemFormattedStamper) StampFilesystemFormatted(ctx context.Context, resourceName string) error {
-	return s.stampFilesystemFormattedCondition(ctx, resourceName,
+func (s *FilesystemFormattedStamper) StampFilesystemFormatted(ctx context.Context, resourceName, nodeName string) error {
+	return s.stampFilesystemFormattedCondition(ctx, resourceName, nodeName,
 		"MkfsSucceeded", "all diskful volumes formatted")
 }
 
 // StampFilesystemObserved SSA-patches a `FilesystemFormatted=True`
-// Condition onto Resource <resourceName>.Status.Conditions with a
+// Condition onto the replica's Resource CR (see replicaCRName) with a
 // distinct `Reason` so the audit trail differentiates satellite-driven
 // mkfs (`Reason=MkfsSucceeded`) from externally-created filesystems
 // observed via blkid (`Reason=FilesystemObserved`).
@@ -84,8 +85,8 @@ func (s *FilesystemFormattedStamper) StampFilesystemFormatted(ctx context.Contex
 // FilesystemFormatted]` — and crucially, NEVER touches
 // `.status.volumes` (a separate listMap keyed on volumeNumber,
 // owned by the volume-status / observer writers).
-func (s *FilesystemFormattedStamper) StampFilesystemObserved(ctx context.Context, resourceName string) error {
-	return s.stampFilesystemFormattedCondition(ctx, resourceName,
+func (s *FilesystemFormattedStamper) StampFilesystemObserved(ctx context.Context, resourceName, nodeName string) error {
+	return s.stampFilesystemFormattedCondition(ctx, resourceName, nodeName,
 		"FilesystemObserved", "filesystem detected on every diskful volume (mkfs not run by satellite)")
 }
 
@@ -94,7 +95,14 @@ func (s *FilesystemFormattedStamper) StampFilesystemObserved(ctx context.Context
 // guarantees byte-level equivalence (modulo Reason/Message) across both
 // callers, which is what makes the listMap merge under
 // filesystemFormattedFieldOwner safe.
-func (s *FilesystemFormattedStamper) stampFilesystemFormattedCondition(ctx context.Context, resourceName, reason, message string) error {
+func (s *FilesystemFormattedStamper) stampFilesystemFormattedCondition(ctx context.Context, rdName, nodeName, reason, message string) error {
+	// The apply chain knows the replica by the definition's and the
+	// node's CR names; the CR is named the way the store named it.
+	resourceName, err := replicaCRName(ctx, s.Client, rdName, nodeName)
+	if err != nil {
+		return err
+	}
+
 	apply := &blockstoriov1alpha1.Resource{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       resourceKind,
@@ -119,7 +127,7 @@ func (s *FilesystemFormattedStamper) stampFilesystemFormattedCondition(ctx conte
 	// entry. The MetadataCreated stamper keeps its own entry, and
 	// future Condition writers (toggle-disk failure, etc.) layer in
 	// alongside without conflict.
-	err := s.Client.Status().Patch(ctx, apply,
+	err = s.Client.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available for our CRDs
 		client.FieldOwner(filesystemFormattedFieldOwner))
 	if err != nil {
