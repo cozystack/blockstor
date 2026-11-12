@@ -4,6 +4,14 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.2.1 — 2026-11-12
+
+Bugfix release.
+
+### Fixed
+
+- **An LVM thin pool left inactive by a reboot is activated (#229).** After a node reboot a thin pool comes back as metadata only, `lvs` reports its size with an empty `data_percent`, and the satellite took that for a destroyed pool: it zeroed the pool's capacity and the placer skipped the node. On a rolling upgrade that left every LVM thin pool without capacity and volume creation failing cluster-wide with `Not enough available nodes`. The satellite now reads `lv_attr` with the capacity, activates an inactive pool once and probes it again. An active pool still costs a single `lvs`, and a pool that reports nothing is still marked missing.
+
 ## v0.2.0 — 2026-11-12
 
 The API group moves to `blockstor.org`, so this release is installed from scratch: an installation of v0.1.17 or earlier is not upgraded in place. It also brings the native CLI, the LINSTOR migration converter and the project site.
