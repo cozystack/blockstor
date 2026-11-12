@@ -254,8 +254,8 @@ func TestThinVolumeStatusMissing(t *testing.T) {
 // TestThinPoolStatusParsesVgsLvs: PoolStatus reports free + total + can-snap.
 func TestThinPoolStatusParsesVgsLvs(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool",
-		storage.FakeResponse{Stdout: []byte("104857600.00|25.00\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent,lv_attr --units k --nosuffix vg/thinpool",
+		storage.FakeResponse{Stdout: []byte("104857600.00|25.00|twi-aotz--\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
 
@@ -295,8 +295,8 @@ func TestThinPoolStatusNearFull(t *testing.T) {
 	fx := storage.NewFakeExec()
 	// 13 GiB thinpool data LV (13631488 KiB) at 99.25% allocated —
 	// the shape `lvs --units k --nosuffix` actually emits.
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool",
-		storage.FakeResponse{Stdout: []byte("13631488.00|99.25\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent,lv_attr --units k --nosuffix vg/thinpool",
+		storage.FakeResponse{Stdout: []byte("13631488.00|99.25|twi-aotz--\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
 
@@ -475,7 +475,7 @@ func TestThinDeleteSnapshot(t *testing.T) {
 // "pool absent" signal that flips Status.PoolMissing=true.
 func TestThinPoolStatusEmptyOutput(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/missing",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent,lv_attr --units k --nosuffix vg/missing",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "missing"}, fx)
@@ -495,7 +495,7 @@ func TestThinPoolStatusEmptyOutput(t *testing.T) {
 // error, not a slice-out-of-bounds panic.
 func TestThinPoolStatusBadColumns(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/tp",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent,lv_attr --units k --nosuffix vg/tp",
 		storage.FakeResponse{Stdout: []byte("only-one-col\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -512,8 +512,8 @@ func TestThinPoolStatusBadColumns(t *testing.T) {
 // panic on float coercion.
 func TestThinPoolStatusBadDataPercent(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/tp",
-		storage.FakeResponse{Stdout: []byte("104857600.00|inactive\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent,lv_attr --units k --nosuffix vg/tp",
+		storage.FakeResponse{Stdout: []byte("104857600.00|inactive|twi-aotz--\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 
@@ -531,8 +531,8 @@ func TestThinPoolStatusBadDataPercent(t *testing.T) {
 // (which previously sat at 75%).
 func TestThinPoolStatusGarbageFromLvs(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool",
-		storage.FakeResponse{Stdout: []byte("not-a-number|25.00\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent,lv_attr --units k --nosuffix vg/thinpool",
+		storage.FakeResponse{Stdout: []byte("not-a-number|25.00|twi-aotz--\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
 
