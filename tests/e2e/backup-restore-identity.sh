@@ -86,7 +86,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # makes the assertions deterministic.
 echo ">> create RD1 ($RD1): 1 volume, 2 diskful on $N1+$N2"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD1}}
 spec:
@@ -97,7 +97,7 @@ EOF
 
 echo ">> create RD2 ($RD2): 2 volumes, 2 diskful on $N1+$N3"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD2}}
 spec:
@@ -109,7 +109,7 @@ EOF
 
 echo ">> create RD3 ($RD3): 1 volume, 3 diskful on $N1+$N2+$N3"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD3}}
 spec:
@@ -121,7 +121,7 @@ EOF
 create_res() {
     local rd=$1 node=$2
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${rd}.${node}}
 spec:
@@ -201,9 +201,9 @@ for k in "${!UUID_BEFORE[@]}"; do echo "  uuid $k = ${UUID_BEFORE[$k]}"; done
 # ---- 3. backup -------------------------------------------------------
 
 echo ">> backup all blockstor CRDs to $BKP"
-kubectl get resourcedefinitions,resources,volumedefinitions.blockstor.cozystack.io,storagepools,nodes.blockstor.cozystack.io,resourcegroups \
+kubectl get resourcedefinitions,resources,volumedefinitions.blockstor.org,storagepools,nodes.blockstor.org,resourcegroups \
     -A -o yaml > "$BKP" 2>/dev/null || \
-kubectl get resourcedefinitions,resources,storagepools,nodes.blockstor.cozystack.io,resourcegroups \
+kubectl get resourcedefinitions,resources,storagepools,nodes.blockstor.org,resourcegroups \
     -A -o yaml > "$BKP"
 echo "  backup size: $(wc -l < "$BKP") lines"
 
@@ -230,7 +230,7 @@ echo ">> delete RD/Resource CRD objects (leave zvols + DRBD metadata intact)"
 # Strip finalizers so deletion completes with satellites down (the
 # satellite finalizer can't run — but we must NOT touch on-disk data).
 for rd in "${ALL_RDS[@]}"; do
-    for r in $(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null | awk -v p="${rd}." '$1 ~ "^"p {print $1}'); do
+    for r in $(kubectl get resources.blockstor.org --no-headers 2>/dev/null | awk -v p="${rd}." '$1 ~ "^"p {print $1}'); do
         kubectl patch resource "$r" --type merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
         kubectl delete resource "$r" --wait=false 2>/dev/null || true
     done

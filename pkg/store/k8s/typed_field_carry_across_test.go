@@ -414,7 +414,7 @@ func TestSpecClassificationsCover(t *testing.T) {
 
 // Bug 210 was: `resources.go::Update` wholesale-assigned
 // `existing.ObjectMeta.Annotations = wireAnnotations`, wiping the
-// satellite-stamped `blockstor.io/volume-numbers` key (Bug 107
+// satellite-stamped `blockstor.org/volume-numbers` key (Bug 107
 // cascade-delete fallback) on every routine REST modify. The fix
 // introduced `mergeUserAnnotationsInto` and migrated every wholesale-
 // replacing store writer onto it. The v17/v18 hand-audit established

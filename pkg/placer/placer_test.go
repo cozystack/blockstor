@@ -3075,7 +3075,7 @@ func TestPlaceWeightedScoringMaxThroughput(t *testing.T) {
 
 // TestPlaceWeightedScoringMinReservedSpace pins the MinReservedSpace
 // strategy in scenario 2.W01. Three pools with identical Free /
-// Total but different `Aux/blockstor.io/reserved-kib` hints (0 / 500
+// Total but different `Aux/blockstor.org/reserved-kib` hints (0 / 500
 // / 900). With Weights/MinReservedSpace=10 and other weights at 0,
 // the pool with zero reservation must win — its `1 - reserved/total`
 // score is 1.0 versus 0.5 / 0.1 for the busier peers.

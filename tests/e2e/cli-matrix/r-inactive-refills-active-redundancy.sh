@@ -62,12 +62,12 @@ fi
 # exactly what place_count must count after Bug 393.
 linstor_active_diskful_count() {
     local rd=$1
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}' \
         | while read -r name; do
             [[ -z "$name" ]] && continue
             local flags
-            flags=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+            flags=$(kubectl get "resources.blockstor.org/${name}" \
                 -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
             if [[ "$flags" != *"DISKLESS"* ]] \
                 && [[ "$flags" != *"TIE_BREAKER"* ]] \
@@ -133,7 +133,7 @@ echo ">> wait up to 30s for INACTIVE flag visible on $DEACT"
 deadline=$(( $(date +%s) + 30 ))
 inactive=false
 while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${DEACT}" \
+    flags=$(kubectl get "resources.blockstor.org/${RD}.${DEACT}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     if [[ "$flags" == *"INACTIVE"* ]]; then
         inactive=true
@@ -180,7 +180,7 @@ fi
 
 # The deactivated node must STILL be INACTIVE — the gap-fill must not
 # have reactivated it; it must have placed a NEW replica elsewhere.
-deact_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${DEACT}" \
+deact_flags=$(kubectl get "resources.blockstor.org/${RD}.${DEACT}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
 if [[ "$deact_flags" != *"INACTIVE"* ]]; then
     echo "FAIL (Bug 393): $DEACT lost its INACTIVE flag (flags=$deact_flags)" >&2
@@ -191,7 +191,7 @@ fi
 # The replacement active diskful must be on a node OUTSIDE the original
 # 3-diskful set — i.e. the 4th worker. Confirm $N4 now carries an
 # active diskful replica.
-n4_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N4}" \
+n4_flags=$(kubectl get "resources.blockstor.org/${RD}.${N4}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "__missing__")
 if [[ "$n4_flags" == "__missing__" ]]; then
     echo "FAIL (Bug 393): no replacement replica on the 4th worker $N4" >&2

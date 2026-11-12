@@ -95,7 +95,7 @@ const physicalDeviceConditionDeviceMissing = "DeviceMissing"
 // stamps the finalizer on first observation of `Spec.AttachTo`,
 // and strips it just before its delete-as-completion call.
 // Phase 10.7 step 5 / 10.8 line 4.
-const PhysicalDeviceAttachFinalizer = "blockstor.cozystack.io/physicaldevice-attach"
+const PhysicalDeviceAttachFinalizer = "blockstor.org/physicaldevice-attach"
 
 // PhysicalDeviceReconciler runs the attach sequence on
 // PhysicalDevice CRDs scoped to this satellite's node. It is
@@ -495,7 +495,7 @@ func (r *PhysicalDeviceReconciler) handleDeviceMissing(ctx context.Context, dev 
 // PhysicalDevice CRD is stuck forever in Phase=Attaching with a
 // dangling Spec.AttachTo, invisible to `linstor ps l` and
 // un-re-usable without a manual `kubectl edit physicaldevices.
-// blockstor.io <name>`.
+// blockstor.org <name>`.
 //
 // We do NOT auto-wipe the device here — the operator may have
 // started writes during the partial attach. Going back to

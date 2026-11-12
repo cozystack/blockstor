@@ -118,10 +118,10 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 // SatelliteResourceFinalizer is the per-satellite-instance
 // finalizer key the satellite reconciler stamps on every
 // Resource it owns. The controller-side reconciler uses a
-// distinct key (`blockstor.cozystack.io/resource`) so the
+// distinct key (`blockstor.org/resource`) so the
 // two paths coexist during the Phase 10.6 cutover without
 // stepping on each other.
-const SatelliteResourceFinalizer = "blockstor.cozystack.io/satellite-resource"
+const SatelliteResourceFinalizer = "blockstor.org/satellite-resource"
 
 // resourceKind is the apiserver Kind for the blockstor Resource
 // CRD. Defined once so SSA Patch payloads in this package share
@@ -947,7 +947,7 @@ func buildVolumeStatusPurgePatch(stale []staleVolumeStatus) ([]byte, error) {
 
 // stampVolumeNumbersAnnotation writes the parent RD's volume-number
 // set onto the Resource's metadata.annotations under
-// `blockstor.io/volume-numbers`. The value is a comma-separated list
+// `blockstor.org/volume-numbers`. The value is a comma-separated list
 // of int32 (e.g. "0,1,2"). This is the Bug-107 fallback record:
 // when `linstor rd delete <X>` cascade-deletes the parent RD CRD via
 // owner refs, the satellite's `handleDelete` runs AFTER the RD is
@@ -988,7 +988,7 @@ func (r *ResourceReconciler) stampVolumeNumbersAnnotation(ctx context.Context, r
 
 	err := r.Patch(ctx, res, client.RawPatch(types.MergePatchType, body))
 	if err != nil {
-		return errors.Wrap(err, "merge-patch annotation blockstor.io/volume-numbers")
+		return errors.Wrap(err, "merge-patch annotation blockstor.org/volume-numbers")
 	}
 
 	return nil
@@ -1437,7 +1437,7 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //  1. The Resource passed in came from the cached client at the
 //     top of Reconcile, so its `Finalizers` slice may already be
 //     stale by the time we get here (the controller-side path
-//     force-strips its own `blockstor.cozystack.io/resource`
+//     force-strips its own `blockstor.org/resource`
 //     finalizer concurrently). Operate on the slice as-is for
 //     the gating short-circuit only.
 //  2. Run the provider tear-down (Apply.DeleteResource: drbdadm
@@ -1459,7 +1459,7 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //
 // Phase 10.1. Once Phase 10.6 retires the gRPC contract,
 // `internal/controller.ResourceReconciler.runDelete` and its
-// finalizer (`blockstor.cozystack.io/resource`) go away —
+// finalizer (`blockstor.org/resource`) go away —
 // satellite-side teardown becomes the only finalizer path.
 func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
 	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
@@ -1549,7 +1549,7 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 //
 //  1. The parent RD's VolumeDefinitions (the source of truth while
 //     the RD CRD still exists).
-//  2. The `blockstor.io/volume-numbers` annotation that
+//  2. The `blockstor.org/volume-numbers` annotation that
 //     `stampVolumeNumbersAnnotation` writes on every successful apply
 //     (Bug 107: `linstor rd delete` cascade-deletes the parent RD via
 //     owner refs, so by the time `handleDelete` runs the RD Get

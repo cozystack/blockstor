@@ -46,12 +46,12 @@ import (
 
 // resourceFinalizer is the legacy controller-side finalizer the
 // reconciler used to manage. Phase 10.6 retires it — the
-// satellite's own `blockstor.cozystack.io/satellite-resource`
+// satellite's own `blockstor.org/satellite-resource`
 // finalizer now owns teardown end-to-end. The constant + cleanup
 // code stay so the controller strips the legacy finalizer off
 // any Resource that still carries it (rolling upgrade case);
 // the controller no longer stamps it on new Resources.
-const resourceFinalizer = "blockstor.cozystack.io/resource"
+const resourceFinalizer = "blockstor.org/resource"
 
 // Raw-merge-patch key/kind literals, factored out so the several
 // raw-merge-patch helpers in this file share one spelling (goconst).
@@ -130,11 +130,11 @@ type ResourceReconciler struct {
 	clusterAllocMu sync.Mutex
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
 
 // Reconcile reads a Resource and pushes the matching DesiredResource
 // to the satellite that hosts it. Per-replica errors land in the
@@ -154,7 +154,7 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Deletion path: strip the legacy controller-side finalizer if
 	// it's still around so the apiserver can finalise. Satellite
 	// teardown runs under its own
-	// `blockstor.cozystack.io/satellite-resource` finalizer.
+	// `blockstor.org/satellite-resource` finalizer.
 	if !target.DeletionTimestamp.IsZero() {
 		return r.stripLegacyFinalizer(ctx, &target)
 	}
@@ -257,7 +257,7 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // is forbidden to avoid a cycle. Duplicating one string is the
 // pragmatic fix; a rename on either side breaks compile here via the
 // related tests, which reference the same literal.
-const satelliteResourceFinalizer = "blockstor.cozystack.io/satellite-resource"
+const satelliteResourceFinalizer = "blockstor.org/satellite-resource"
 
 // handleOrphan checks whether the Resource's parent ResourceDefinition
 // CRD still exists. When the RD is gone — the kubectl-cascade-orphan
@@ -270,7 +270,7 @@ const satelliteResourceFinalizer = "blockstor.cozystack.io/satellite-resource"
 // Production-state gate: the orphan path only fires for Resources
 // that have been successfully applied at least once — either they
 // carry the satellite finalizer (`SatelliteResourceFinalizer`) or
-// the Bug 107 `blockstor.io/volume-numbers` annotation. Fresh
+// the Bug 107 `blockstor.org/volume-numbers` annotation. Fresh
 // scaffolded Resources that have never reached a satellite (e.g.
 // envtest scenarios that mint a Resource without an RD as a stub)
 // are left alone — there's nothing for the satellite to tear down,
@@ -500,7 +500,7 @@ func (r *ResourceReconciler) firstAvailablePool(ctx context.Context, nodeName st
 
 // stripLegacyFinalizer removes the pre-Phase-10.6 controller-
 // side finalizer when a Resource is being deleted. The
-// satellite's own `blockstor.cozystack.io/satellite-resource`
+// satellite's own `blockstor.org/satellite-resource`
 // finalizer owns the teardown chain end-to-end now; this hook
 // only exists to clean up Resources that still carry the old
 // finalizer after a rolling upgrade.

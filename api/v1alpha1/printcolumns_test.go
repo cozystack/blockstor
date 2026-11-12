@@ -40,12 +40,12 @@ func TestCRDsCarryPrinterColumns(t *testing.T) {
 	t.Parallel()
 
 	want := map[string][]string{
-		"blockstor.cozystack.io_nodes.yaml":               {"Type", "Address", "Status", "Age"},
-		"blockstor.cozystack.io_storagepools.yaml":        {"Node", "Pool", "Provider", "Free-KiB", "Total-KiB", "Age"},
-		"blockstor.cozystack.io_resourcedefinitions.yaml": {"Group", "Port", "Layers", "Age"},
-		"blockstor.cozystack.io_resources.yaml":           {"Definition", "Node", "Pool", "Node-ID", "Port", "State", "In-Use", "Age"},
-		"blockstor.cozystack.io_snapshots.yaml":           {"Definition", "Snapshot", "Nodes", "Age"},
-		"blockstor.cozystack.io_resourcegroups.yaml":      {"Place-Count", "Storage-Pool", "Layers", "Age"},
+		"blockstor.org_nodes.yaml":               {"Type", "Address", "Status", "Age"},
+		"blockstor.org_storagepools.yaml":        {"Node", "Pool", "Provider", "Free-KiB", "Total-KiB", "Age"},
+		"blockstor.org_resourcedefinitions.yaml": {"Group", "Port", "Layers", "Age"},
+		"blockstor.org_resources.yaml":           {"Definition", "Node", "Pool", "Node-ID", "Port", "State", "In-Use", "Age"},
+		"blockstor.org_snapshots.yaml":           {"Definition", "Snapshot", "Nodes", "Age"},
+		"blockstor.org_resourcegroups.yaml":      {"Place-Count", "Storage-Pool", "Layers", "Age"},
 	}
 
 	for file, wantCols := range want {

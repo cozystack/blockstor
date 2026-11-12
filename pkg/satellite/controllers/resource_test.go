@@ -443,7 +443,7 @@ func TestHandleDeleteIdempotentOnSecondPass(t *testing.T) {
 // Test shape:
 //   - Real `file.Provider` rooted at t.TempDir() (no mock — the test
 //     needs to observe the actual unlink).
-//   - Resource carries the `blockstor.io/volume-numbers` annotation
+//   - Resource carries the `blockstor.org/volume-numbers` annotation
 //     the satellite's apply-path stamps on every successful pass.
 //   - Parent RD intentionally absent (cascade-delete already
 //     happened) so the lookup is forced through the annotation
@@ -535,7 +535,7 @@ func TestHandleDeleteUnlinksFileImgAfterCascadedRDDelete(t *testing.T) {
 // TestStampVolumeNumbersAnnotationFormatsCommaSeparated pins the
 // Bug-107 stamp half: a successful apply MUST write the parent RD's
 // `spec.volumeDefinitions[].volumeNumber` list onto the Resource's
-// metadata.annotations under `blockstor.io/volume-numbers` as a
+// metadata.annotations under `blockstor.org/volume-numbers` as a
 // comma-separated decimal string. Without the stamp, the future
 // cascade-delete fallback in `lookupVolumeNumbers` has no record to
 // fall back on and the per-volume DeleteVolume loop iterates over
@@ -645,7 +645,7 @@ func TestParseVolumeNumbersTolerantOfMalformedEntries(t *testing.T) {
 
 // TestLookupVolumeNumbersFallsBackToStatusVolumes pins the Tier-3
 // fix: when both the parent RD Get and the
-// `blockstor.io/volume-numbers` annotation miss (the rolling-deploy
+// `blockstor.org/volume-numbers` annotation miss (the rolling-deploy
 // window where a Resource is deleted after the observer stamped
 // Status.Volumes but before the first apply stamped the annotation),
 // `lookupVolumeNumbers` MUST fall back to the observer-recorded

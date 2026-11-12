@@ -20,7 +20,7 @@ Look at the connection state of the replica, and at the node addresses:
 
 ```sh
 kubectl get resource <definition>.<node> -o jsonpath='{range .status.connections[*]}{.peerNodeName}={.message} {end}'
-kubectl get nodes.blockstor.cozystack.io -o wide
+kubectl get nodes.blockstor.org -o wide
 ```
 
 A peer stuck in `Connecting` cannot reach the other replica's address and port. The two causes are a wrong address and a blocked port.
@@ -28,7 +28,7 @@ A peer stuck in `Connecting` cannot reach the other replica's address and port. 
 The `Address` column is the first entry of `spec.netInterfaces`. It must be the node's own IP, reachable from the other nodes. A pod IP there means something rewrote it, most often piraeus-operator managing the same nodes. Blockstor works around that by preferring the Kubernetes node's `InternalIP` when it renders the DRBD configuration. That address is added in memory and never shows up on the `Node` object, and it needs the satellite's ClusterRole to read `nodes`. Fix the first interface anyway:
 
 ```sh
-kubectl patch nodes.blockstor.cozystack.io <node> --type merge \
+kubectl patch nodes.blockstor.org <node> --type merge \
   -p '{"spec":{"netInterfaces":[{"name":"default","address":"10.0.0.11"}]}}'
 ```
 
@@ -242,7 +242,7 @@ Look at:
 ```sh
 kubectl -n blockstor-system get pod -l app=blockstor-satellite -o wide
 kubectl -n blockstor-system logs $POD -c satellite --tail=100
-kubectl get nodes.blockstor.cozystack.io
+kubectl get nodes.blockstor.org
 ```
 
 The readiness probe answers `/readyz` only after the satellite has started and synced its caches. A pod that never becomes ready, or that restarts, usually says why in the first lines of its log.

@@ -63,7 +63,7 @@ API="http://127.0.0.1:${LPORT}"
 
 echo ">> seed RD $RD"
 kubectl apply -f - >/dev/null <<EOF
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec: {}

@@ -99,7 +99,7 @@ const ConditionKernelLoaded = "KernelLoaded"
 // volumes that haven't been materialised yet. Comma-separated rather
 // than JSON so a human operator can `kubectl get resource <r> -o
 // yaml | grep volume-numbers` and read it without parsing.
-const ResourceAnnotationVolumeNumbers = "blockstor.io/volume-numbers"
+const ResourceAnnotationVolumeNumbers = "blockstor.org/volume-numbers"
 
 // ResourceSpec is the desired state of one replica of a ResourceDefinition
 // placed on a node. The composite key is (resourceDefinitionName, nodeName);

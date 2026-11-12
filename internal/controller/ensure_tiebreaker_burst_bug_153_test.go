@@ -251,7 +251,7 @@ func TestBug153BurstFollowsBug130GuardUnderLoad(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              name,
 				DeletionTimestamp: &now,
-				Finalizers:        []string{"blockstor.io/cleanup"},
+				Finalizers:        []string{"blockstor.org/cleanup"},
 			},
 		}
 		rdCRDs = append(rdCRDs, crd)

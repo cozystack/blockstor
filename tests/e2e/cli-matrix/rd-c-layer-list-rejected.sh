@@ -53,7 +53,7 @@ trap cleanup EXIT
 # assert_rd_absent: the rejected create must not leak an RD CRD.
 assert_rd_absent() {
     local rd=$1
-    if kubectl get "resourcedefinitions.blockstor.cozystack.io/${rd}" >/dev/null 2>&1; then
+    if kubectl get "resourcedefinitions.blockstor.org/${rd}" >/dev/null 2>&1; then
         echo "FAIL (D7b): rejected create leaked RD CRD ${rd}" >&2
         return 1
     fi

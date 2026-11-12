@@ -91,7 +91,7 @@ echo ">>   wait up to 60s for the snapshot to reach Ready on $N1 (resume complet
 deadline=$(( $(date +%s) + 60 ))
 ok=false
 while (( $(date +%s) < deadline )); do
-    j=$(kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
+    j=$(kubectl get snapshots.blockstor.org -o json 2>/dev/null \
         | jq -c --arg rd "$SRC" --arg s "$SNAP" '
             [.items[]?
              | select(.spec.resourceDefinitionName==$rd)

@@ -9,7 +9,7 @@
 # it empty (internal/controller/resourcedefinition_layer_stack.go). A
 # definition that holds no data takes the group's stack; one that already
 # went to disk under the default stack keeps it, carries the
-# blockstor.io/unapplied-group-layer-stack annotation and gets a
+# blockstor.org/unapplied-group-layer-stack annotation and gets a
 # LayerStackNotInherited warning Event, so a LUKS group added over a
 # plaintext volume never has the satellite luksFormat that volume.
 #
@@ -49,7 +49,7 @@ RD_DATA=cli-matrix-ls-data
 RD_CLONE=cli-matrix-ls-clone
 POOL=${POOL:-lvm-thin}
 PASSPHRASE='cli-matrix-ls-pp!'
-ANNOTATION=blockstor.io/unapplied-group-layer-stack
+ANNOTATION=blockstor.org/unapplied-group-layer-stack
 
 cleanup() {
     delete_rd "$RD_CLONE"
@@ -68,7 +68,7 @@ cleanup_encryption_state
 
 # rd_layer_stack RD — the stack the CRD carries, comma-joined.
 rd_layer_stack() {
-    kubectl get "resourcedefinitions.blockstor.cozystack.io/$1" \
+    kubectl get "resourcedefinitions.blockstor.org/$1" \
         -o jsonpath='{.spec.layerStack}' 2>/dev/null \
         | jq -r 'join(",") | ascii_upcase' 2>/dev/null || echo ""
 }
@@ -164,7 +164,7 @@ echo "   clone refused as undecided before the pin: $refused"
 echo ">> e) the data RD keeps the stack its data has"
 wait_layer_stack "$RD_DATA" "DRBD,STORAGE"
 
-annotation=$(kubectl get "resourcedefinitions.blockstor.cozystack.io/$RD_DATA" -o json 2>/dev/null \
+annotation=$(kubectl get "resourcedefinitions.blockstor.org/$RD_DATA" -o json 2>/dev/null \
     | jq -r --arg k "$ANNOTATION" '.metadata.annotations[$k] // ""')
 if [[ "${annotation^^}" != "DRBD,LUKS,STORAGE" ]]; then
     echo "FAIL: $RD_DATA annotation $ANNOTATION = '$annotation', want DRBD,LUKS,STORAGE" >&2

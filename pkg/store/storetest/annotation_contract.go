@@ -48,7 +48,7 @@ type annotationOps struct {
 }
 
 const (
-	contractMarkerKey   = "blockstor.io/rebalance-pending"
+	contractMarkerKey   = "blockstor.org/rebalance-pending"
 	contractMarkerValue = "2026-06-12T00:00:00Z"
 	contractUserKey     = "aux/operator-note"
 	contractUserValue   = "keep-me"

@@ -55,7 +55,7 @@ RD=test-replace-hw
 # a NoSchedule taint cannot keep the satellite Pod off $WORKER_3. Use a
 # label-based eviction the way state-offline-unknown.sh does: patch the
 # DS to require absence of $EVICT_LABEL, then label the node.
-EVICT_LABEL=blockstor.io/replace-hw-test
+EVICT_LABEL=blockstor.org/replace-hw-test
 POOL_NAME=stand
 
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
@@ -107,7 +107,7 @@ cleanup() {
     ip=$(kubectl get node "$WORKER_3" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
     if [[ -n "$ip" ]]; then
         cat <<EOF | kubectl apply -f - 2>/dev/null || true
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Node
 metadata: {name: $WORKER_3}
 spec:
@@ -115,7 +115,7 @@ spec:
   netInterfaces:
     - {name: default, address: $ip}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: StoragePool
 metadata: {name: ${POOL_NAME}.${WORKER_3}}
 spec:
@@ -125,7 +125,7 @@ spec:
   props:
     StorDriver/FileDir: /var/lib/blockstor-pool
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: StoragePool
 metadata: {name: lvm-thin.${WORKER_3}}
 spec:
@@ -136,7 +136,7 @@ spec:
     StorDriver/LvmVg: blockstor-lvm
     StorDriver/ThinPool: thin
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: StoragePool
 metadata: {name: zfs-thin.${WORKER_3}}
 spec:
@@ -286,7 +286,7 @@ fi
 # Sanity: the Node CRD must be gone now — the recipe's premise
 # is that step 2 re-creates it from a clean slate, not patches an
 # existing row.
-if kubectl get "nodes.blockstor.cozystack.io/${WORKER_3}" >/dev/null 2>&1; then
+if kubectl get "nodes.blockstor.org/${WORKER_3}" >/dev/null 2>&1; then
     echo "FAIL: Node CRD $WORKER_3 still present after lost"
     exit 1
 fi

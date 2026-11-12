@@ -63,10 +63,10 @@ const (
 	// AnnotationLinstorRDName keeps the spelling a replica's or snapshot's
 	// definition was registered under, when it differs from the CR name the
 	// spec stores. Read back for display only.
-	AnnotationLinstorRDName = "blockstor.io/linstor-resource-definition-name"
+	AnnotationLinstorRDName = "blockstor.org/linstor-resource-definition-name"
 
 	// AnnotationLinstorNodeName does the same for a replica's node.
-	AnnotationLinstorNodeName = "blockstor.io/linstor-node-name"
+	AnnotationLinstorNodeName = "blockstor.org/linstor-node-name"
 )
 
 // ResourceCRName is the name the store gives the Resource CR of the replica

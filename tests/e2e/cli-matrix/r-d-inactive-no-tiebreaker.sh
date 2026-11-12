@@ -112,7 +112,7 @@ echo ">> wait up to 30s for INACTIVE flag visible on $N1"
 deadline=$(( $(date +%s) + 30 ))
 inactive=false
 while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N1}" \
+    flags=$(kubectl get "resources.blockstor.org/${RD}.${N1}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     if [[ "$flags" == *"INACTIVE"* ]]; then
         inactive=true
@@ -168,7 +168,7 @@ if [[ "$n_total" != "2" ]]; then
 fi
 
 # $N1 must still be INACTIVE (and definitely not a witness).
-n1_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N1}" \
+n1_flags=$(kubectl get "resources.blockstor.org/${RD}.${N1}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
 if [[ "$n1_flags" != *"INACTIVE"* ]] || [[ "$n1_flags" == *"TIE_BREAKER"* ]]; then
     echo "FAIL (Bug 387): $N1 flags=$n1_flags, want INACTIVE with no TIE_BREAKER" >&2
@@ -176,7 +176,7 @@ if [[ "$n1_flags" != *"INACTIVE"* ]] || [[ "$n1_flags" == *"TIE_BREAKER"* ]]; th
 fi
 
 # $N3 must be the lone surviving active diskful: no DISKLESS / TIE_BREAKER.
-n3_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
+n3_flags=$(kubectl get "resources.blockstor.org/${RD}.${N3}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
 if [[ "$n3_flags" == *"TIE_BREAKER"* ]] || [[ "$n3_flags" == *"DISKLESS"* ]]; then
     echo "FAIL (Bug 387): $N3 carries unexpected flags=$n3_flags" >&2
@@ -185,7 +185,7 @@ fi
 
 # $N2 (the deleted node) must NOT have come back as a witness — the exact
 # operator-reported symptom (the deleted diskful re-appearing as a TB).
-if kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" >/dev/null 2>&1; then
+if kubectl get "resources.blockstor.org/${RD}.${N2}" >/dev/null 2>&1; then
     echo "FAIL (Bug 387): deleted node $N2 re-appeared — it was converted into a tiebreaker" >&2
     exit 1
 fi

@@ -218,7 +218,9 @@ const (
 // literal string "blockstor.cozystack.io/node"; pinned as a constant
 // so the UUID a given node name produces is stable across processes
 // and store backends. Operators script `linstor n l` output against
-// this — the value MUST NOT change.
+// this — the value MUST NOT change. It is a hash seed, not the API
+// group: it kept the group's old spelling when the group moved to
+// blockstor.org, so no node's UUID changed with it.
 //
 //nolint:gochecknoglobals // immutable namespace UUID — `const` can't hold uuid.UUID
 var nodeNamespaceUUID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("blockstor.cozystack.io/node"))

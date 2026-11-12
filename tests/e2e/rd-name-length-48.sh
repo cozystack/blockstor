@@ -62,7 +62,7 @@ cleanup() {
         local name
         # shellcheck disable=SC2155
         name=$(printf 'a%.0s' $(seq 1 "$n"))
-        kubectl delete resourcedefinition.blockstor.cozystack.io "$name" \
+        kubectl delete resourcedefinition.blockstor.org "$name" \
             --ignore-not-found --timeout=10s 2>/dev/null || true
     done
     set -e
@@ -111,7 +111,7 @@ assert_reject_long() {
 
     # Zombie RD assert: the store must NOT hold a row for this name
     # after the refusal.
-    if kubectl get resourcedefinition.blockstor.cozystack.io "$name" >/dev/null 2>&1; then
+    if kubectl get resourcedefinition.blockstor.org "$name" >/dev/null 2>&1; then
         echo "FAIL: len=$n — zombie RD CRD survived a refused rd-create"
         return 1
     fi
@@ -146,9 +146,9 @@ assert_accept_at_boundary() {
     # dev stand.
     deadline=$(( $(date +%s) + 10 ))
     while (( $(date +%s) < deadline )); do
-        if kubectl get resourcedefinition.blockstor.cozystack.io "$name" >/dev/null 2>&1; then
+        if kubectl get resourcedefinition.blockstor.org "$name" >/dev/null 2>&1; then
             echo "   ok: len=$n accepted at boundary (HTTP $code)"
-            kubectl delete resourcedefinition.blockstor.cozystack.io "$name" \
+            kubectl delete resourcedefinition.blockstor.org "$name" \
                 --ignore-not-found --timeout=10s >/dev/null 2>&1 || true
             return 0
         fi
@@ -173,7 +173,7 @@ echo ">> Bug 360: rg-spawn entry point also refuses long names"
 # Seed a tiny RG so the spawn handler reaches the name-validation gate.
 RG=e2e-bug360-rg
 kubectl apply -f - >/dev/null <<EOF
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceGroup
 metadata: {name: ${RG}}
 spec:
@@ -203,7 +203,7 @@ if ! grep -qE 'exceeds|valid identifier' <<<"$body"; then
     exit 1
 fi
 
-if kubectl get resourcedefinition.blockstor.cozystack.io "$long_spawn_name" >/dev/null 2>&1; then
+if kubectl get resourcedefinition.blockstor.org "$long_spawn_name" >/dev/null 2>&1; then
     echo "FAIL: rg-spawn left a zombie RD CRD behind"
     exit 1
 fi

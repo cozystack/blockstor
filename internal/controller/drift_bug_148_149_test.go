@@ -40,7 +40,7 @@ import (
 // test — the annotation key is the operator-visible contract that
 // Bug 136 stamps and Bug 148 must also stamp on the kubectl-edit
 // path.
-const driftResizePendingPrefix = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-"
+const driftResizePendingPrefix = "bug136.blockstor.org/resize-pending-size-kib-vol-"
 
 // TestBug148ControllerReconcileStampsResizeOnDirectSpecEdit pins
 // the Bug 148 reconciler-side resize-pending stamp.
@@ -57,7 +57,7 @@ const driftResizePendingPrefix = "bug136.blockstor.cozystack.io/resize-pending-s
 // Resources, mutates the RD's `spec.volumeDefinitions[0].sizeKib`
 // to 64 MiB directly via the fake client (simulating
 // kubectl edit), fires Reconcile, and asserts the annotation
-// `bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-0=65536`
+// `bug136.blockstor.org/resize-pending-size-kib-vol-0=65536`
 // lands on every child Resource.
 func TestBug148ControllerReconcileStampsResizeOnDirectSpecEdit(t *testing.T) {
 	t.Parallel()
@@ -264,7 +264,7 @@ func TestBug149OrphanResourceGarbageCollected(t *testing.T) {
 				// orphan-detection path triggers Delete and the
 				// satellite reconciler runs its teardown chain
 				// with the Bug 107 annotation fallback.
-				"blockstor.cozystack.io/satellite-resource",
+				"blockstor.org/satellite-resource",
 			},
 			Annotations: map[string]string{
 				// Bug 107: stamped on the last successful apply
@@ -350,7 +350,7 @@ func TestBug149OrphanResourceWithDeletionTimestampAlsoGCs(t *testing.T) {
 			Name:              resourceName,
 			DeletionTimestamp: &now,
 			Finalizers: []string{
-				"blockstor.cozystack.io/satellite-resource",
+				"blockstor.org/satellite-resource",
 			},
 			Annotations: map[string]string{
 				blockstoriov1alpha1.ResourceAnnotationVolumeNumbers: "0",

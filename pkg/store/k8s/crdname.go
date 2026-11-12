@@ -27,7 +27,7 @@ import (
 // AnnotationLinstorName preserves the original LINSTOR-side name when
 // it had to be slugified to satisfy DNS-1123 metadata.Name rules.
 // Pass-through names are not annotated.
-const AnnotationLinstorName = "blockstor.io/linstor-name"
+const AnnotationLinstorName = "blockstor.org/linstor-name"
 
 // SetOriginalName tags meta with the original LINSTOR name when the
 // slugifier rewrote it in any way — including case-only differences

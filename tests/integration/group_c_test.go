@@ -213,7 +213,7 @@ func TestGroupCRGDeleteRefusesIfHasRDs(t *testing.T) {
 // RG.SelectFilter.PlaceCount via `rg modify` must trigger the
 // deferred-rebalance pipeline. Phase 11.x split the reconciler off
 // from the REST process, so the cross-process signal is the
-// `blockstor.io/rebalance-pending` annotation on the parent RG —
+// `blockstor.org/rebalance-pending` annotation on the parent RG —
 // this is what RGRebalanceReconciler observes to re-run autoplace
 // across every child RD.
 func TestGroupCRGModifyReAutoplaces(t *testing.T) {

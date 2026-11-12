@@ -92,7 +92,7 @@ echo ">> wait up to 60s for RD.Spec.Initialized to latch true after the write"
 init=""
 init_deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < init_deadline )); do
-    init=$(kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" \
+    init=$(kubectl get "resourcedefinitions.blockstor.org/${RD}" \
         -o jsonpath='{.spec.initialized}' 2>/dev/null || echo "")
     [[ "$init" == "true" ]] && break
     sleep 2
@@ -126,7 +126,7 @@ wait_status_state "$RD" "$N1" UpToDate 240 \
     || die "Phase-6 solo flip: ${N1} never reached UpToDate after r td -s $POOL (solo-promote wedge)"
 
 # The DISKLESS flag must be gone (real diskful promote, not a flag no-op).
-post_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N1}" \
+post_flags=$(kubectl get "resources.blockstor.org/${RD}.${N1}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
 [[ "$post_flags" != *"DISKLESS"* ]] \
     || die "solo flip: ${N1} Spec.Flags='$post_flags' still contains DISKLESS after toggle to diskful"

@@ -146,7 +146,7 @@ func stripSelectableFields(t *testing.T, ctx context.Context, stack *harness.Sta
 
 	crds := crdClient(t, stack)
 
-	const crdName = "resources.blockstor.cozystack.io"
+	const crdName = "resources.blockstor.org"
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var crd apiextensionsv1.CustomResourceDefinition

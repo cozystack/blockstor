@@ -20,13 +20,13 @@ A replica counts as faulty when one of its volumes has a disk state that has not
 The custom resources carry the same information for `kubectl` and for monitoring:
 
 ```sh
-kubectl get nodes.blockstor.cozystack.io          # Status ONLINE or OFFLINE
+kubectl get nodes.blockstor.org                    # Status ONLINE or OFFLINE
 kubectl get storagepools                          # free and total KiB per pool
 kubectl get resourcedefinitions                   # group, DRBD port, layers
 kubectl get resources                             # one row per replica: node, pool, port, state, in use
 ```
 
-Use the full name `nodes.blockstor.cozystack.io`, because plain `nodes` is the Kubernetes kind.
+Use the full name `nodes.blockstor.org`, because plain `nodes` is the Kubernetes kind.
 
 A `Node` is `ONLINE` while its satellite stamps a heartbeat every 10 seconds. When the heartbeat is more than 40 seconds old, the controller sets the `Ready` condition to `Unknown` and the status to `OFFLINE`.
 
@@ -184,18 +184,20 @@ Blockstor keeps all of its state in custom resources, so a backup is a dump of t
 ```sh
 for kind in controllerconfigs nodes storagepools physicaldevices \
             resourcegroups resourcedefinitions resources snapshots; do
-  kubectl get "$kind.blockstor.cozystack.io" -o yaml > "blockstor-$kind.yaml"
+  kubectl get "$kind.blockstor.org" -o yaml > "blockstor-$kind.yaml"
 done
 kubectl -n blockstor-system get secret blockstor-cluster-passphrase -o yaml > blockstor-passphrase.yaml
 ```
 
-The full names, such as `resources.blockstor.cozystack.io`, keep `kubectl` from picking another product's resource with the same plural. The last line applies only if you use encrypted volumes. The Secret holds the cluster passphrase, and the volumes cannot be opened without it. Its name can be changed through `spec.passphraseSecretRef` on the `ControllerConfig`. Store the backup like any other secret material.
+The full names, such as `resources.blockstor.org`, keep `kubectl` from picking another product's resource with the same plural. The last line applies only if you use encrypted volumes. The Secret holds the cluster passphrase, and the volumes cannot be opened without it. Its name can be changed through `spec.passphraseSecretRef` on the `ControllerConfig`. Store the backup like any other secret material.
 
 The passphrase can also be set as a property, `DrbdOptions/EncryptPassphrase` on the controller or `DrbdOptions/Encryption/passphrase` on a definition, and a property set there wins over the Secret. A property is stored in plaintext on its resource, so the YAML dump above then carries the key to every encrypted volume. Keep the passphrase in the Secret only, and treat the dump as secret material if such a property was ever set.
 
 ## Upgrading
 
-Upgrade in the same order as the installation. Update the manifests to the new tag with the same `sed` as in [Installation](../installation/#get-the-manifests), then apply. Coming from v0.1.17 or earlier, read [the note below](#upgrading-from-v0117-or-earlier) first.
+Coming from v0.1.17 or earlier, do not follow these steps: the API group changed, and such an installation has to be reinstalled. See [the note below](#upgrading-from-v0117-or-earlier).
+
+Upgrade in the same order as the installation. Update the manifests to the new tag with the same `sed` as in [Installation](../installation/#get-the-manifests), then apply.
 
 1. The CRDs, `kubectl apply -f config/crd/bases/`. New fields arrive before the code that writes them.
 2. The controller, `rendered/blockstor-deploy.yaml`.
@@ -214,14 +216,7 @@ blockstor resource list --faulty
 
 ### Upgrading from v0.1.17 or earlier
 
-The snapshot stream between satellites moved from port 9100 to port 3372. Open port 3372 between storage nodes before step 5; see [Networking and ports](../networking/#snapshot-stream-between-satellites). While the satellites roll, old ones listen on 9100 and new ones dial 3372, and the other way round. A clone or a snapshot restore that needs a snapshot from a satellite of the other version cannot fetch it. Its replica does not fall back to a full sync: the volume is not created, and the satellite retries until both sides run the new version. Avoid clones and restores across nodes until the rollout is done. Port 9100 can be closed afterwards.
+The API group moved from `blockstor.cozystack.io` to `blockstor.org`, and the label and annotation keys from `blockstor.io/` to `blockstor.org/`. The new controller, API server and satellites read neither the old group nor the old keys, and there is no migration: applied over an existing installation, they do not see its resource definitions, replicas or pools.
 
-The snapshot stream also runs over mutual TLS now, with its own CA. Step 3 creates the CA and the certificate, and a new satellite pod does not start until cert-manager has issued the Secret `blockstor-satellite-stream-tls`. Check that its Certificate is `Ready` before step 5:
+So an installation of v0.1.17 or earlier is not upgraded in place. Move the data off its volumes, remove the old installation, and install the new release from scratch as in [Installation](../installation/). The new release also streams snapshots between satellites on port 3372 over mutual TLS; open the port before you install, see [Networking and ports](../networking/#snapshot-stream-between-satellites).
 
-```sh
-kubectl -n blockstor-system get certificate blockstor-satellite-stream
-```
-
-The plain HTTP port 3370 of the API server now listens on the pod's loopback address only. Step 4 applies a manifest that passes `--rest-bind-address=127.0.0.1:3370`. A NetworkPolicy you added to fence that port can stay. Reach the port with `kubectl port-forward`, as before.
-
-The API server no longer lists or watches Secrets across the cluster. It reads and writes the passphrase Secret through a Role in `blockstor-system`, which step 4 creates.
