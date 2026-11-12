@@ -586,7 +586,9 @@ func (t *Thin) poolLine(ctx context.Context) (string, error) {
 	}
 
 	vgLV := t.cfg.VolumeGroup + "/" + t.cfg.ThinPool
-	if _, err := t.exec.Run(ctx, "lvchange", Args("--activate", "y", vgLV)...); err != nil {
+
+	_, err = t.exec.Run(ctx, "lvchange", Args("--activate", "y", vgLV)...)
+	if err != nil {
 		return "", errors.Wrapf(err, "lvchange --activate y %s", vgLV)
 	}
 
@@ -628,9 +630,11 @@ func poolInactive(line string) bool {
 	if len(parts) != poolStatusCols {
 		return false
 	}
+
 	if strings.TrimSpace(parts[1]) != "" {
 		return false
 	}
+
 	attr := strings.TrimSpace(parts[2])
 
 	return len(attr) > lvAttrActive && attr[lvAttrActive] != 'a'
