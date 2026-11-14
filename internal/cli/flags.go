@@ -115,6 +115,8 @@ var valueFlags = map[string]struct{}{ //nolint:gochecknoglobals // static flag t
 	"--limit":               {},
 	flagPassphrase:          {},
 	flagPassValue:           {},
+	"--old-passphrase":      {},
+	"--new-passphrase":      {},
 	"--passphrase-file":     {},
 	"--new-passphrase-file": {},
 	"--old-passphrase-file": {},
@@ -402,8 +404,10 @@ func matches(filter []string, value string) bool {
 // -s3cret` is an ordinary thing to type, and the workaround that does work,
 // `--passphrase=-s3cret`, is not discoverable from the refusal.
 var opaqueValueFlags = map[string]struct{}{ //nolint:gochecknoglobals // static flag table
-	flagPassphrase: {},
-	flagPassValue:  {},
+	flagPassphrase:     {},
+	flagPassValue:      {},
+	"--old-passphrase": {},
+	"--new-passphrase": {},
 }
 
 func valueAfter(args []string, i int, arg string, opaque bool) (string, error) {

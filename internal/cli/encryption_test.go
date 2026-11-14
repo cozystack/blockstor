@@ -280,6 +280,7 @@ func TestEncryptionSlotVerbs(t *testing.T) {
 	}
 
 	run(false, "second\nthird\n", "encryption", "modify-passphrase", "second", "third")
+	run(false, "first\nthird\n", "encryption", "add-passphrase", "--name", "r2", "--new-passphrase", "third")
 	run(true, "", "encryption", "modify-passphrase", "--old-passphrase-file", oldFile, "--new-passphrase-file", newFile)
 
 	if keyringOpens(t, client, "second") || !keyringOpens(t, client, "third") {
@@ -341,5 +342,33 @@ func TestEncryptionEnterOnALockedClusterFails(t *testing.T) {
 
 	if !strings.Contains(errBuf.String(), "stays locked") {
 		t.Errorf("stderr %q does not say the cluster stays locked", errBuf.String())
+	}
+}
+
+// modify-passphrase is LINSTOR's verb, and linstor-client passes
+// --old-passphrase and --new-passphrase on the command line: the bundled
+// CLI takes them too, and warns that they show in the process list.
+func TestEncryptionModifyTakesLinstorsFlags(t *testing.T) {
+	t.Parallel()
+
+	app, client, errBuf := newKubeApp(t)
+
+	if got := app.Run(t.Context(), []string{"encryption", "create-passphrase", "-p", "first"}); got != 0 {
+		t.Fatalf("create: exit %d (%s)", got, errBuf.String())
+	}
+
+	errBuf.Reset()
+
+	argv := []string{"encryption", "modify-passphrase", "--old-passphrase", "first", "--new-passphrase", "-second"}
+	if got := app.Run(t.Context(), argv); got != 0 {
+		t.Fatalf("modify: exit %d (%s)", got, errBuf.String())
+	}
+
+	if !keyringOpens(t, client, "-second") || keyringOpens(t, client, "first") {
+		t.Fatal("modify did not replace the slot")
+	}
+
+	if !strings.Contains(errBuf.String(), "process list") {
+		t.Errorf("no warning about the process list: %q", errBuf.String())
 	}
 }

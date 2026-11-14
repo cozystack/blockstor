@@ -217,9 +217,11 @@ func encryptionEnterPassphrase(ctx context.Context, run *runContext) error {
 	return writeNotice(run, notice)
 }
 
-// encryptionModifyPassphrase implements `encryption modify-passphrase`.
+// encryptionModifyPassphrase implements `encryption modify-passphrase`:
+// linstor-client's --old-passphrase and --new-passphrase, or the file,
+// terminal and stdin forms of the blockstor slot verbs.
 func encryptionModifyPassphrase(ctx context.Context, run *runContext) error {
-	input, err := newSlotPassphrases(run, 0)
+	input, err := newSlotPassphrases(run, 0, true)
 	if err != nil {
 		return err
 	}
@@ -259,7 +261,7 @@ func encryptionAddPassphrase(ctx context.Context, run *runContext) error {
 		return fmt.Errorf("%w: --name is required", command.ErrUsage)
 	}
 
-	input, err := newSlotPassphrases(run, 0)
+	input, err := newSlotPassphrases(run, 0, false)
 	if err != nil {
 		return err
 	}
@@ -293,7 +295,7 @@ func encryptionRemovePassphrase(ctx context.Context, run *runContext) error {
 		return fmt.Errorf("%w: name the slot to remove, and nothing else", command.ErrUsage)
 	}
 
-	input, err := newSlotPassphrases(run, 1)
+	input, err := newSlotPassphrases(run, 1, false)
 	if err != nil {
 		return err
 	}
@@ -361,6 +363,11 @@ func encryptionListPassphrases(ctx context.Context, run *runContext) error {
 type slotPassphrases struct {
 	run   *runContext
 	lines *bufio.Reader
+
+	// argvFlags is set for modify-passphrase, a LINSTOR verb whose
+	// --old-passphrase and --new-passphrase linstor-client passes on
+	// the command line; they are honoured with a warning.
+	argvFlags bool
 }
 
 var errStaysLocked = errors.New("the passphrase is right, but the cluster stays locked")
@@ -368,8 +375,13 @@ var errStaysLocked = errors.New("the passphrase is right, but the cluster stays 
 var errPassphraseOnArgv = errors.New(
 	"passphrases of this command are read from a file, the terminal or stdin, never from the command line")
 
-func newSlotPassphrases(run *runContext, positionals int) (*slotPassphrases, error) {
-	if run.Flags.Values["passphrase"] != "" || run.Flags.Values["p-value"] != "" || len(run.Flags.Positionals) > positionals {
+func newSlotPassphrases(run *runContext, positionals int, argvFlags bool) (*slotPassphrases, error) {
+	onArgv := run.Flags.Values["passphrase"] != "" || run.Flags.Values["p-value"] != "" || len(run.Flags.Positionals) > positionals
+	if !argvFlags {
+		onArgv = onArgv || run.Flags.Values["old-passphrase"] != "" || run.Flags.Values["new-passphrase"] != ""
+	}
+
+	if onArgv {
 		return nil, fmt.Errorf("%w: %w", command.ErrUsage, errPassphraseOnArgv)
 	}
 
@@ -378,7 +390,7 @@ func newSlotPassphrases(run *runContext, positionals int) (*slotPassphrases, err
 		in = os.Stdin
 	}
 
-	return &slotPassphrases{run: run, lines: bufio.NewReader(in)}, nil
+	return &slotPassphrases{run: run, lines: bufio.NewReader(in), argvFlags: argvFlags}, nil
 }
 
 func (p *slotPassphrases) read(name, prompt string) (string, error) {
@@ -388,6 +400,11 @@ func (p *slotPassphrases) read(name, prompt string) (string, error) {
 	)
 
 	switch path := p.run.Flags.Values[name+"-file"]; {
+	case p.argvFlags && p.run.Flags.Values[name] != "":
+		value = p.run.Flags.Values[name]
+
+		fmt.Fprintf(p.run.Err, "warning: --%s is visible in the process list and shell history; "+
+			"--%s-file or stdin keeps it out\n", name, name)
 	case path != "":
 		var data []byte
 
