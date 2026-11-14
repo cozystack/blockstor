@@ -77,7 +77,7 @@ const (
 // already carry wrapped passwords: a fresh keyring would wrap under a new
 // master key and leave every one of them unreadable, so none is created.
 var ErrKeyringLost = errors.New(
-	"the keyring Secret is missing while replicas carry LUKS passwords wrapped under it; " +
+	"the keyring Secret is missing while replicas or snapshots carry LUKS passwords wrapped under it; " +
 		"restore " + KeyringSecretName + " from a backup instead of creating a new one")
 
 // Ref is where the master passphrase is read from.
@@ -333,37 +333,52 @@ func CreateKeyring(ctx context.Context, writer client.Client, namespace string, 
 	return true, nil
 }
 
-// refuseLostKeyring is ErrKeyringLost when a replica carries a wrapped
-// password: with no keyring, the key it is wrapped under is gone, and a
+// refuseLostKeyring is ErrKeyringLost when a replica or a snapshot carries
+// a wrapped password: with no keyring, the key it is wrapped under is gone, and a
 // new master key would leave it unreadable for good.
 func refuseLostKeyring(ctx context.Context, reader client.Reader) error {
-	carried, err := AnyReplicaCarriesLUKSKey(ctx, reader)
+	carrier, err := AnyLUKSKeyCarrier(ctx, reader)
 	if err != nil {
 		return err
 	}
 
-	if carried != "" {
-		return errors.Wrapf(ErrKeyringLost, "replica %s", carried)
+	if carrier != "" {
+		return errors.Wrapf(ErrKeyringLost, "%s", carrier)
 	}
 
 	return nil
 }
 
-// AnyReplicaCarriesLUKSKey names a replica that carries a wrapped LUKS
-// password, or returns "" when none does.
-func AnyReplicaCarriesLUKSKey(ctx context.Context, reader client.Reader) (string, error) {
-	var list blockstoriov1alpha1.ResourceList
+// AnyLUKSKeyCarrier names a replica or a snapshot that carries a wrapped
+// LUKS password, or returns "" when none does. A snapshot counts: its
+// passwords are wrapped under the same master key, and a new key would
+// leave it unrestorable.
+func AnyLUKSKeyCarrier(ctx context.Context, reader client.Reader) (string, error) {
+	var replicas blockstoriov1alpha1.ResourceList
 
-	err := reader.List(ctx, &list)
+	err := reader.List(ctx, &replicas)
 	if err != nil {
 		return "", errors.Wrap(err, "list replicas")
 	}
 
-	for i := range list.Items {
-		for _, vol := range list.Items[i].Spec.Volumes {
+	for i := range replicas.Items {
+		for _, vol := range replicas.Items[i].Spec.Volumes {
 			if vol.LUKSKey != nil {
-				return list.Items[i].Name, nil
+				return "replica " + replicas.Items[i].Name, nil
 			}
+		}
+	}
+
+	var snapshots blockstoriov1alpha1.SnapshotList
+
+	err = reader.List(ctx, &snapshots)
+	if err != nil {
+		return "", errors.Wrap(err, "list snapshots")
+	}
+
+	for i := range snapshots.Items {
+		if len(snapshots.Items[i].Spec.LUKSKeys) > 0 {
+			return "snapshot " + snapshots.Items[i].Name, nil
 		}
 	}
 

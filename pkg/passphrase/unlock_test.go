@@ -643,3 +643,36 @@ func TestRemoveIsAuthorisedByARemainingPassphrase(t *testing.T) {
 		t.Errorf("the generated unlock slot: %v", err)
 	}
 }
+
+// A snapshot's recorded passwords count as much as a replica's: with no
+// keyring, neither the bootstrap nor create-passphrase mints a new master
+// key while a snapshot carries one.
+func TestASnapshotKeyMeansTheKeyringIsLost(t *testing.T) {
+	t.Parallel()
+
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc.snap1"},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc", SnapshotName: "snap1",
+			LUKSKeys: []blockstoriov1alpha1.SnapshotLUKSKey{{
+				NodeName: "n1", VolumeNumber: 0,
+				LUKSKey: blockstoriov1alpha1.LUKSKey{KeyID: "c7324c99567678f7", Wrapped: []byte{1}, Origin: blockstoriov1alpha1.LUKSKeyOriginGenerated},
+			}},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "x"), snap).Build()
+	secrets := passphrase.Secrets{Reader: cli, Namespace: ns}
+
+	created, err := passphrase.Bootstrap(t.Context(), cli, secrets, time.Now())
+	if created || !errors.Is(err, passphrase.ErrKeyringLost) {
+		t.Fatalf("bootstrap: created %v, %v", created, err)
+	}
+
+	gen := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(snap.DeepCopy()).Build()
+
+	_, err = (&passphrase.Ops{Client: gen, Secrets: passphrase.Secrets{Reader: gen, Namespace: ns}}).Create(t.Context(), []byte("x"))
+	if !errors.Is(err, passphrase.ErrKeyringLost) {
+		t.Fatalf("create: %v", err)
+	}
+}
