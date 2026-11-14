@@ -35,7 +35,7 @@ const (
 	keyRD  = "pvc-key"
 	keyDev = "/dev/vg/pvc-key_00000"
 
-	keyFormat = "cryptsetup luksFormat --batch-mode --pbkdf pbkdf2 --pbkdf-force-iterations 1000 " + keyDev + " --key-file -"
+	keyFormat = "cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 " + keyDev + " --key-file -"
 	keyOpen   = "cryptsetup luksOpen " + keyDev + " pvc-key-0-luks --key-file -"
 	keyTest   = "cryptsetup luksOpen --test-passphrase " + keyDev + " --key-file -"
 )

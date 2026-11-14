@@ -94,12 +94,13 @@ func (c *Cryptsetup) Format(ctx context.Context, device string, key []byte) erro
 			device, strings.Join(signatures, ", "))
 	}
 
-	// The key is a 256-bit random password, so the header's own KDF
+	// LUKS2 is named rather than left to the host's default, which is
+	// LUKS1 on older distributions. The key is a 256-bit random password, so the header's own KDF
 	// protects nothing a guess could reach; cryptsetup's default Argon2id
 	// would cost seconds and up to a GiB per open, inside the satellite's
 	// cgroup, for every volume after a node reboot. PBKDF2 at its minimum
 	// keeps opening cheap.
-	err = c.runWithKey(ctx, key, "luksFormat", "--batch-mode",
+	err = c.runWithKey(ctx, key, "luksFormat", "--batch-mode", "--type", "luks2",
 		"--pbkdf", "pbkdf2", "--pbkdf-force-iterations", "1000", device, "--key-file", "-")
 	if err != nil {
 		return errors.Wrapf(err, "luksFormat %s", device)

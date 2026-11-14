@@ -2618,7 +2618,7 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 	// luksFormat fails: simulate the device being busy. Post-Issue
 	// 175 the cryptsetup invocation is direct, so the Expect key is
 	// the cryptsetup argv verbatim with no shell pipeline wrapping.
-	fx.Expect("cryptsetup luksFormat --batch-mode --pbkdf pbkdf2 --pbkdf-force-iterations 1000 /dev/vg/pvc-luks-format_00000 --key-file -",
+	fx.Expect("cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 /dev/vg/pvc-luks-format_00000 --key-file -",
 		storage.FakeResponse{Err: errLUKSFormatBusy})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)

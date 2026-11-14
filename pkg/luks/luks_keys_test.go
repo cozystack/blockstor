@@ -44,7 +44,7 @@ func TestFormatUsesMinimalPBKDF2(t *testing.T) {
 		t.Fatalf("Format: %v", err)
 	}
 
-	want := "cryptsetup luksFormat --batch-mode --pbkdf pbkdf2 --pbkdf-force-iterations 1000 " + keyDev + " --key-file -"
+	want := "cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 " + keyDev + " --key-file -"
 
 	idx := slices.Index(fx.CommandLines(), want)
 	if idx < 0 {
