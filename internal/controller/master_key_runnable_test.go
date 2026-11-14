@@ -105,3 +105,72 @@ func TestMasterKeyRunnableCreatesTheKeyring(t *testing.T) {
 	_ = cli.Get(context.Background(), client.ObjectKey{Namespace: "blockstor-system", Name: passphrase.KeyringSecretName}, &sec)
 	t.Fatal("no keyring after a second of passes")
 }
+
+// After modify-passphrase of the Secret's passphrase, a pass keeps the
+// superseded slot while the Secret still holds the old passphrase and
+// removes it once the Secret holds the new one.
+func TestMasterKeyRunnableRemovesSupersededSlots(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	const ns = "blockstor-system"
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&blockstoriov1alpha1.ControllerConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+			Spec:       blockstoriov1alpha1.ControllerConfigSpec{PassphraseSecretRef: &blockstoriov1alpha1.PassphraseSecretRef{Name: "p"}},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: ns},
+			Data:       map[string][]byte{"MASTER_PASSPHRASE": []byte("old")},
+		},
+	).Build()
+
+	r := &controllerpkg.MasterKeyRunnable{Client: cli, Reader: cli, Namespace: ns}
+	r.Pass(t.Context())
+
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	_, err := ops.Modify(t.Context(), []byte("old"), []byte("new"))
+	if err != nil {
+		t.Fatalf("modify: %v", err)
+	}
+
+	slots := func() int {
+		ring, _, err := ops.Secrets.Keyring(t.Context())
+		if err != nil || ring == nil {
+			t.Fatalf("keyring: %v", err)
+		}
+
+		return len(ring.Slots)
+	}
+
+	r.Pass(t.Context())
+
+	if got := slots(); got != 2 {
+		t.Fatalf("%d slots while the Secret holds the old passphrase, want 2", got)
+	}
+
+	var sec corev1.Secret
+
+	_ = cli.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: "p"}, &sec)
+	sec.Data["MASTER_PASSPHRASE"] = []byte("new")
+
+	if err := cli.Update(t.Context(), &sec); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	r.Pass(t.Context())
+
+	if got := slots(); got != 1 {
+		t.Fatalf("%d slots after the Secret moved, want 1", got)
+	}
+}

@@ -38,13 +38,15 @@ const MasterKeyPeriod = 30 * time.Second
 // MasterKeyRunnable keeps the keyring in step with the passphrase Secret.
 // On a cluster whose ControllerConfig names a passphrase Secret and that
 // has no keyring yet, it creates one, the way LINSTOR creates its master
-// key from MASTER_PASSPHRASE on first start.
+// key from MASTER_PASSPHRASE on first start. Once the Secret opens a slot
+// that is not superseded, it removes the slots modify-passphrase marked
+// superseded.
 //
 // Leader-elected: two controllers would each create a master key, and
 // although only one keyring Secret can be created, there is no reason to
 // race for it.
 //
-// +kubebuilder:rbac:groups="",namespace=blockstor-system,resources=secrets,verbs=get;create
+// +kubebuilder:rbac:groups="",namespace=blockstor-system,resources=secrets,verbs=get;create;update
 type MasterKeyRunnable struct {
 	// Client writes the keyring Secret.
 	Client client.Client
@@ -107,6 +109,19 @@ func (r *MasterKeyRunnable) Pass(ctx context.Context) {
 	if created {
 		logger.Info("created the keyring from the passphrase Secret",
 			"secret", passphrase.KeyringSecretName, "namespace", r.Namespace)
+	}
+
+	ops := &passphrase.Ops{Client: r.Client, Secrets: passphrase.Secrets{Reader: r.Reader, Namespace: r.Namespace}, Now: r.Now}
+
+	removed, err := ops.CleanupSuperseded(ctx)
+	if err != nil {
+		logger.Error(err, "remove superseded keyring slots")
+
+		return
+	}
+
+	if removed {
+		logger.Info("removed the superseded keyring slots: the passphrase Secret opens its new slot")
 	}
 }
 

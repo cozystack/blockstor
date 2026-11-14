@@ -62,7 +62,8 @@ subjects:
     namespace: blockstor-system
 ---
 # The controller creates the keyring from the passphrase Secret on first
-# start; both are in this namespace and read by name past the cache.
+# start, and drops superseded slots once the Secret moves on; both are in
+# this namespace and read by name past the cache.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -71,7 +72,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, create]
+    verbs: [get, create, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

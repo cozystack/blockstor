@@ -132,7 +132,7 @@ func TestBug023CreatePassphraseThenLUKSRDCreate(t *testing.T) {
 func TestBug023SecretSeededDirectlyUnlocksGate(t *testing.T) {
 	t.Parallel()
 
-	base, _, stop := startLUKSGateServer(t, testPassphraseSecret("gitops-passphrase"))
+	base, _, stop := startLUKSGateServer(t, testEncryptionSecrets(t, testPassphrase)...)
 	defer stop()
 
 	resp := postLUKSRD(t, base, "wf-luks-gitops")

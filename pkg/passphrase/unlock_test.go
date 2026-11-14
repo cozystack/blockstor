@@ -409,3 +409,119 @@ func TestCreateKeyringLosingTheRaceIsNotAnError(t *testing.T) {
 		t.Fatalf("created %v, %v", created, err)
 	}
 }
+
+func setSecret(t *testing.T, cli client.Client, name, value string) {
+	t.Helper()
+
+	var sec corev1.Secret
+
+	err := cli.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: name}, &sec)
+	if err != nil {
+		t.Fatalf("get %s: %v", name, err)
+	}
+
+	sec.Data["MASTER_PASSPHRASE"] = []byte(value)
+
+	err = cli.Update(t.Context(), &sec)
+	if err != nil {
+		t.Fatalf("update %s: %v", name, err)
+	}
+}
+
+func stateOf(t *testing.T, ops *passphrase.Ops) passphrase.Status {
+	t.Helper()
+
+	status, err := (&passphrase.Unlocker{Secrets: ops.Secrets}).Unlock(t.Context())
+	if err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+
+	return status
+}
+
+// The documented change of the Secret's passphrase unlocks at every step:
+// add a slot, change the Secret, remove the old slot. And modify-passphrase
+// of the Secret's passphrase keeps the old slot, superseded, until the
+// Secret moves, after which the cleanup removes it.
+func TestChangingTheSecretsPassphraseNeverLocks(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(
+		refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "one")).Build()
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	_, err := passphrase.Bootstrap(t.Context(), cli, ops.Secrets, time.Now())
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	_, err = ops.Add(t.Context(), []byte("one"), []byte("two"), "next")
+	if err != nil || stateOf(t, ops).State != passphrase.StateUnlocked {
+		t.Fatalf("after add: %v, %s", err, stateOf(t, ops).State)
+	}
+
+	setSecret(t, cli, "p", "two")
+
+	if stateOf(t, ops).State != passphrase.StateUnlocked {
+		t.Fatal("locked after the Secret moved to the added passphrase")
+	}
+
+	err = ops.Remove(t.Context(), "next")
+	if !errors.Is(err, passphrase.ErrUnlockSlot) {
+		t.Fatalf("removing the slot the Secret opens: %v, want ErrUnlockSlot", err)
+	}
+
+	err = ops.Remove(t.Context(), passphrase.SlotNameSecret)
+	if err != nil || stateOf(t, ops).State != passphrase.StateUnlocked {
+		t.Fatalf("after removing the old slot: %v", err)
+	}
+
+	result, err := ops.Modify(t.Context(), []byte("two"), []byte("three"))
+	if err != nil || result.SecretToUpdate != "p" {
+		t.Fatalf("modify of the Secret's passphrase: %+v, %v", result, err)
+	}
+
+	removed, err := ops.CleanupSuperseded(t.Context())
+	if err != nil || removed {
+		t.Fatalf("cleanup before the Secret moved: %v, %v; want nothing removed", removed, err)
+	}
+
+	if stateOf(t, ops).State != passphrase.StateUnlocked {
+		t.Fatal("locked after modify, before the Secret moved")
+	}
+
+	setSecret(t, cli, "p", "three")
+
+	removed, err = ops.CleanupSuperseded(t.Context())
+	if err != nil || !removed {
+		t.Fatalf("cleanup after the Secret moved: %v, %v", removed, err)
+	}
+
+	status := stateOf(t, ops)
+	if status.State != passphrase.StateUnlocked || len(status.Ring.Slots) != 1 {
+		t.Fatalf("state %s, slots %+v", status.State, status.Ring.Slots)
+	}
+
+	if _, err := status.Ring.Opens([]byte("two")); err == nil {
+		t.Fatal("the superseded passphrase still opens")
+	}
+}
+
+// Under a named Secret, create-passphrase is refused while there is no
+// keyring, and is a no-op with the Secret's passphrase once there is one.
+func TestCreateUnderANamedSecret(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(refConfig("p", "")).Build()
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	_, err := ops.Create(t.Context(), []byte("x"))
+	if !errors.Is(err, passphrase.ErrSecretManaged) {
+		t.Fatalf("err %v, want ErrSecretManaged", err)
+	}
+
+	var unlock corev1.Secret
+	if cli.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: passphrase.UnlockSecretName}, &unlock) == nil {
+		t.Fatal("an unlock Secret was created under a named passphrase Secret")
+	}
+}

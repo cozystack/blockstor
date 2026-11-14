@@ -267,6 +267,10 @@ var registry = []Noun{
 		Verbs: []Verb{
 			{Name: "create-passphrase", Usage: argPassphrase},
 			{Name: "enter-passphrase", Usage: argPassphrase},
+			{Name: "modify-passphrase", Usage: "<old-passphrase> <new-passphrase>"},
+			{Name: "add-passphrase", Usage: "--name <label> <passphrase> <new-passphrase>"},
+			{Name: "remove-passphrase", Usage: "<slot>"},
+			{Name: "list-passphrases"},
 		},
 	},
 }

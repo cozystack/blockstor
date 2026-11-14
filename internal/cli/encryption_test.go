@@ -26,11 +26,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli"
@@ -73,21 +73,22 @@ func newKubeApp(t *testing.T) (*cli.App, ctrlclient.Client, *bytes.Buffer) {
 	return app, client, &errBuf
 }
 
-func readPassphrase(t *testing.T, client ctrlclient.Client) string {
+// keyringOpens reports whether the cluster's keyring opens with pass.
+func keyringOpens(t *testing.T, client ctrlclient.Client, pass string) bool {
 	t.Helper()
 
-	var secret corev1.Secret
-
-	key := types.NamespacedName{Namespace: testNamespace, Name: "blockstor-cluster-passphrase"}
-	if err := client.Get(t.Context(), key, &secret); err != nil {
-		t.Fatalf("get passphrase secret: %v", err)
+	ring, _, err := passphrase.Secrets{Reader: client, Namespace: testNamespace}.Keyring(t.Context())
+	if err != nil || ring == nil {
+		t.Fatalf("keyring %v, %v", ring, err)
 	}
 
-	return string(secret.Data["passphrase"])
+	_, err = ring.Opens([]byte(pass))
+
+	return err == nil
 }
 
-// The cluster master key lives in a Secret, so create-passphrase
-// writes it where the controller and the satellites read it from.
+// create-passphrase enrols the passphrase in the keyring the controller
+// and the satellites unlock from.
 func TestEncryptionCreatePassphrase(t *testing.T) {
 	t.Parallel()
 
@@ -102,8 +103,8 @@ func TestEncryptionCreatePassphrase(t *testing.T) {
 			t.Fatalf("%v: exit = %d (stderr: %s)", flag, got, errBuf.String())
 		}
 
-		if got := readPassphrase(t, client); got != "s3cret" {
-			t.Errorf("%v: stored passphrase = %q, want s3cret", flag, got)
+		if !keyringOpens(t, client, "s3cret") {
+			t.Errorf("%v: the keyring does not open with s3cret", flag)
 		}
 	}
 }
@@ -122,8 +123,8 @@ func TestEncryptionPassphraseFromStdin(t *testing.T) {
 		t.Fatalf("exit = %d (stderr: %s)", got, errBuf.String())
 	}
 
-	if got := readPassphrase(t, client); got != "piped-s3cret" {
-		t.Errorf("stored passphrase = %q, want piped-s3cret", got)
+	if !keyringOpens(t, client, "piped-s3cret") {
+		t.Errorf("the keyring does not open with piped-s3cret")
 	}
 }
 
@@ -162,8 +163,8 @@ func TestEncryptionCreatePassphraseDoesNotRotate(t *testing.T) {
 		t.Error("a different passphrase silently replaced the cluster master key")
 	}
 
-	if got := readPassphrase(t, client); got != "first" {
-		t.Errorf("stored passphrase = %q, want the original", got)
+	if !keyringOpens(t, client, "first") {
+		t.Errorf("the keyring does not open with first")
 	}
 }
 
@@ -221,5 +222,54 @@ func TestEncryptionWithoutKubeAccess(t *testing.T) {
 
 	if !strings.Contains(errBuf.String(), "cluster access") {
 		t.Errorf("the failure does not explain itself:\n%s", errBuf.String())
+	}
+}
+
+// The slot verbs: add a recovery passphrase, list the slots, change and
+// remove one; each passphrase opens exactly while its slot is there.
+func TestEncryptionSlotVerbs(t *testing.T) {
+	t.Parallel()
+
+	app, client, errBuf := newKubeApp(t)
+
+	run := func(want bool, argv ...string) {
+		t.Helper()
+
+		if got := app.Run(t.Context(), argv) == 0; got != want {
+			t.Fatalf("%v: success %v, want %v (stderr: %s)", argv, got, want, errBuf.String())
+		}
+	}
+
+	run(true, "encryption", "create-passphrase", "-p", "first")
+	run(false, "encryption", "add-passphrase", "--name", "recovery", "wrong", "second")
+	run(false, "encryption", "add-passphrase", "first", "second")
+	run(true, "encryption", "add-passphrase", "--name", "recovery", "first", "second")
+
+	if !keyringOpens(t, client, "second") {
+		t.Fatal("the added passphrase does not open")
+	}
+
+	var out bytes.Buffer
+
+	app.Out = &out
+
+	run(true, "encryption", "list-passphrases")
+
+	listed := out.String()
+	if !strings.Contains(listed, "encryption: unlocked") || !strings.Contains(listed, "recovery") || !strings.Contains(listed, " unlocks") {
+		t.Fatalf("list:\n%s", listed)
+	}
+
+	run(true, "encryption", "modify-passphrase", "--old-passphrase", "second", "--new-passphrase", "third")
+
+	if keyringOpens(t, client, "second") || !keyringOpens(t, client, "third") {
+		t.Fatal("modify did not replace the slot")
+	}
+
+	run(false, "encryption", "remove-passphrase", "generated")
+	run(true, "encryption", "remove-passphrase", "recovery")
+
+	if keyringOpens(t, client, "third") {
+		t.Fatal("the removed passphrase still opens")
 	}
 }

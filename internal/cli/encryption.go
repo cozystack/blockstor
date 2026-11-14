@@ -21,7 +21,6 @@ package cli
 import (
 	"bufio"
 	"context"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -30,11 +29,10 @@ import (
 	"strings"
 
 	"golang.org/x/term"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/keyring"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -150,105 +148,217 @@ func readPassphraseFromTerminal(run *runContext, fd int) (string, error) {
 	return string(typed), nil
 }
 
-// encryptionCreatePassphrase implements `encryption create-passphrase`.
-//
-// The cluster master key lives in a Secret, so this writes it there —
-// the same place the controller and the satellites read it from.
+// encryptionOps opens the passphrase operations against the cluster: the
+// CLI talks to the Kubernetes API directly, and reads Secrets by name.
+func encryptionOps(ctx context.Context, run *runContext) (*passphrase.Ops, error) {
+	client, namespace, err := run.kube(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &passphrase.Ops{Client: client, Secrets: passphrase.Secrets{Reader: client, Namespace: namespace}, Now: nil}, nil
+}
+
+// encryptionCreatePassphrase implements `encryption create-passphrase`:
+// the cluster's first master passphrase, enrolled in a keyring slot; the
+// cluster unlocks from a generated passphrase in a Secret blockstor owns.
+// A repeat with the same passphrase is a no-op.
 func encryptionCreatePassphrase(ctx context.Context, run *runContext) error {
 	value, err := encryptionPassphrase(run)
 	if err != nil {
 		return err
 	}
 
-	client, namespace, err := run.kube(ctx)
+	ops, err := encryptionOps(ctx, run)
 	if err != nil {
 		return err
 	}
 
-	name, err := passphrase.SecretName(ctx, client)
-	if err != nil {
-		return fmt.Errorf("resolve passphrase secret name: %w", err)
-	}
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-		Data:       map[string][]byte{passphrase.SecretKey: []byte(value)},
-	}
-
-	err = client.Create(ctx, secret)
-	if err == nil {
-		return nil
-	}
-
-	if !isAlreadyExists(err) {
-		return fmt.Errorf("create passphrase secret %s/%s: %w", namespace, name, err)
-	}
-
-	// An existing passphrase is not overwritten here: rotating the
-	// master key re-encrypts every LUKS volume key, and silently
-	// replacing it would leave every existing volume undecryptable.
-	// Re-running with the SAME value stays a success so a pre-flight
-	// step in a script is idempotent.
-	current, err := passphrase.Read(ctx, client, namespace)
-	if err != nil {
-		return fmt.Errorf("read passphrase secret: %w", err)
-	}
-
-	if subtle.ConstantTimeCompare([]byte(current), []byte(value)) != 1 {
+	_, err = ops.Create(ctx, []byte(value))
+	if errors.Is(err, passphrase.ErrKeyringExists) {
 		return fmt.Errorf("passphrase already set: %w", errPassphraseMismatch)
+	}
+
+	if err != nil {
+		return fmt.Errorf("create the master passphrase: %w", err)
 	}
 
 	return nil
 }
 
-// encryptionEnterPassphrase implements `encryption enter-passphrase`.
-//
-// The verb proves the operator knows the cluster master key, and that
-// is exactly what happens here: the supplied value is compared against
-// the Secret, and a wrong one fails.
-//
-// The controller additionally flips an in-memory unlocked flag when it
-// serves this over REST. That flag has one consumer — it sets
-// `state.suspended` on LUKS resources in the REST view — and gates
-// nothing: the LUKS create check reads the Secret, and satellites
-// decrypt from the Secret too. It is also per-process, so with several
-// apiserver replicas it already disagrees with itself. This CLI
-// therefore verifies and succeeds, and says on stderr that the
-// server-side display flag was not touched, rather than refusing a
-// command whose real effect it can deliver in full.
-//
-// The comparison is constant-time out of habit rather than necessity:
-// this runs client-side, after the caller's own RBAC already let them
-// read the Secret, so there is no remote attacker to time. (It also
-// still leaks the length, which ConstantTimeCompare does not hide.)
-// The controller's REST path is where the property actually matters.
+// encryptionEnterPassphrase implements `encryption enter-passphrase`: it
+// verifies the passphrase against every slot, and on a cluster locked out
+// of its generated unlock Secret it re-creates that Secret.
 func encryptionEnterPassphrase(ctx context.Context, run *runContext) error {
 	value, err := encryptionPassphrase(run)
 	if err != nil {
 		return err
 	}
 
-	client, namespace, err := run.kube(ctx)
+	ops, err := encryptionOps(ctx, run)
 	if err != nil {
 		return err
 	}
 
-	current, err := passphrase.Read(ctx, client, namespace)
+	result, err := ops.Enter(ctx, []byte(value))
 	if err != nil {
-		return fmt.Errorf("read passphrase secret: %w", err)
+		return passphraseVerbError("cannot unlock", err)
 	}
 
-	if current == "" {
-		return fmt.Errorf("cannot unlock: %w", errNoPassphraseSet)
+	notice := "passphrase verified"
+
+	switch {
+	case result.Repaired:
+		notice = "passphrase verified; re-created the unlock Secret " + passphrase.UnlockSecretName
+	case result.Status.State == passphrase.StateLocked:
+		notice = "passphrase verified, but the cluster stays locked: the passphrase Secret " +
+			result.Status.Ref.Name + " does not open the keyring"
 	}
 
-	if subtle.ConstantTimeCompare([]byte(current), []byte(value)) != 1 {
-		return fmt.Errorf("cannot unlock: %w", errPassphraseMismatch)
+	return writeNotice(run, notice)
+}
+
+// encryptionModifyPassphrase implements `encryption modify-passphrase`.
+func encryptionModifyPassphrase(ctx context.Context, run *runContext) error {
+	oldValue, newValue, err := twoPassphrases(run, "old-passphrase", "new-passphrase")
+	if err != nil {
+		return err
 	}
 
-	_, err = fmt.Fprintln(run.Err,
-		"passphrase verified; the controller's own unlocked flag (which only drives the "+
-			"Suspended/Available column in its REST view) is untouched")
+	ops, err := encryptionOps(ctx, run)
+	if err != nil {
+		return err
+	}
+
+	result, err := ops.Modify(ctx, []byte(oldValue), []byte(newValue))
+	if err != nil {
+		return passphraseVerbError("cannot modify the passphrase", err)
+	}
+
+	if result.SecretToUpdate == "" {
+		return nil
+	}
+
+	return writeNotice(run, "the cluster still unlocks with the old passphrase from Secret "+result.SecretToUpdate+
+		"; put the new one there, and the old one's slot is removed once the Secret opens the new one")
+}
+
+// encryptionAddPassphrase implements `encryption add-passphrase --name`.
+func encryptionAddPassphrase(ctx context.Context, run *runContext) error {
+	name := run.Flags.Values["name"]
+	if name == "" {
+		return fmt.Errorf("%w: --name is required", command.ErrUsage)
+	}
+
+	auth, newValue, err := twoPassphrases(run, "passphrase", "new-passphrase")
+	if err != nil {
+		return err
+	}
+
+	ops, err := encryptionOps(ctx, run)
+	if err != nil {
+		return err
+	}
+
+	slotID, err := ops.Add(ctx, []byte(auth), []byte(newValue), name)
+	if err != nil {
+		return passphraseVerbError("cannot add the passphrase", err)
+	}
+
+	return writeNotice(run, "added passphrase "+name+" as slot "+slotID)
+}
+
+// encryptionRemovePassphrase implements `encryption remove-passphrase`.
+func encryptionRemovePassphrase(ctx context.Context, run *runContext) error {
+	if len(run.Flags.Positionals) == 0 || run.Flags.Positionals[0] == "" {
+		return fmt.Errorf("%w: name the slot to remove", command.ErrUsage)
+	}
+
+	ops, err := encryptionOps(ctx, run)
+	if err != nil {
+		return err
+	}
+
+	err = ops.Remove(ctx, run.Flags.Positionals[0])
+	if err != nil {
+		return passphraseVerbError("cannot remove the passphrase", err)
+	}
+
+	return nil
+}
+
+// encryptionListPassphrases implements `encryption list-passphrases`: one
+// line per slot, no key material, the unlock slot marked.
+func encryptionListPassphrases(ctx context.Context, run *runContext) error {
+	ops, err := encryptionOps(ctx, run)
+	if err != nil {
+		return err
+	}
+
+	slots, status, err := ops.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list the passphrases: %w", err)
+	}
+
+	_, err = fmt.Fprintf(run.Out, "encryption: %s\n", status.State)
+	if err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	for _, slot := range slots {
+		marks := ""
+		if slot.Unlocks {
+			marks += " unlocks"
+		}
+
+		if slot.Superseded {
+			marks += " superseded"
+		}
+
+		_, err = fmt.Fprintf(run.Out, "%s\t%s\t%s\t%s\t%s%s\n",
+			slot.ID, slot.Name, slot.Origin, slot.CreatedAt.Format("2006-01-02T15:04:05Z07:00"), slot.KDF, marks)
+		if err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// twoPassphrases reads two passphrases from their flags, or from the first
+// two positionals.
+func twoPassphrases(run *runContext, firstFlag, secondFlag string) (string, string, error) {
+	first, second := run.Flags.Values[firstFlag], run.Flags.Values[secondFlag]
+
+	positionals := run.Flags.Positionals
+	if first == "" && len(positionals) > 0 {
+		first, positionals = positionals[0], positionals[1:]
+	}
+
+	if second == "" && len(positionals) > 0 {
+		second = positionals[0]
+	}
+
+	if first == "" || second == "" {
+		return "", "", fmt.Errorf("%w: give --%s and --%s", command.ErrUsage, firstFlag, secondFlag)
+	}
+
+	return first, second, nil
+}
+
+func passphraseVerbError(what string, err error) error {
+	switch {
+	case errors.Is(err, keyring.ErrWrongPassphrase):
+		return fmt.Errorf("%s: %w", what, errPassphraseMismatch)
+	case errors.Is(err, passphrase.ErrNoKeyring):
+		return fmt.Errorf("%s: %w", what, errNoPassphraseSet)
+	default:
+		return fmt.Errorf("%s: %w", what, err)
+	}
+}
+
+func writeNotice(run *runContext, notice string) error {
+	_, err := fmt.Fprintln(run.Err, notice)
 	if err != nil {
 		return fmt.Errorf("write notice: %w", err)
 	}
@@ -307,13 +417,12 @@ func checkLUKSPrerequisite(ctx context.Context, run *runContext, layers []string
 	// let an apiserver blip write a LUKS stack onto a cluster that may have
 	// no key, which is the one direction this guard must not take — REST
 	// answers 400 at the same point.
-	current, err := passphrase.Read(ctx, client, namespace)
+	ring, _, err := passphrase.Secrets{Reader: client, Namespace: namespace}.Keyring(ctx)
 	if err != nil {
-		return fmt.Errorf("read the encryption Secret to check the %s prerequisite: %w",
-			apiv1.LayerKindLUKS, err)
+		return fmt.Errorf("read the keyring to check the %s prerequisite: %w", apiv1.LayerKindLUKS, err)
 	}
 
-	if current != "" {
+	if ring != nil {
 		return nil
 	}
 

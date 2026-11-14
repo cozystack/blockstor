@@ -30,13 +30,12 @@ rules:
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
 ---
-# The cluster passphrase (`blockstor-cluster-passphrase` by default;
-# override via ControllerConfig.Spec.PassphraseSecretRef) is read on
-# every `linstor encryption enter-passphrase` and written on
-# `create-passphrase` / `modify-passphrase`. It is read past the
-# controller-runtime cache (rest.Server.SecretReader), so no informer
-# lists or watches Secrets and a get in this namespace is all the read
-# needs.
+# The encryption verbs read the passphrase Secret the ControllerConfig
+# names and the keyring Secret, and write the keyring and the generated
+# unlock Secret; the passphrase Secret itself is never written. All of it
+# is read past the controller-runtime cache (rest.Server.SecretReader), so
+# no informer lists or watches Secrets and a get in this namespace is all
+# the read needs.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -45,7 +44,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, create, update, patch]
+    verbs: [get, create, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

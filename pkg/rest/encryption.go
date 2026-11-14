@@ -21,21 +21,17 @@ package rest
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/keyring"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
@@ -43,12 +39,14 @@ import (
 // handler. Bug 110 root cause: without `secrets` RBAC the controller-
 // runtime cache informer stalls on a never-syncing Forbidden list/
 // watch, and a cached Get blocks until the upstream client hangs up
-// (~10s default). Even with RBAC fixed, an apiserver-side outage
-// would otherwise let a single bad request tie up a worker for the
-// process-default request timeout. Capping at 5s keeps the worst
-// case bounded and matches the operator's tolerance window — the
-// CLI's surrounding retry loop kicks in well before this.
-const passphraseOpTimeout = 5 * time.Second
+// (~10s default). Capping keeps the worst case bounded. Argon2id runs
+// once per slot on a verification, well inside the bound.
+const passphraseOpTimeout = 10 * time.Second
+
+// encryptionStateTTL is how long the encryption state the resource view
+// stamps `suspended` from is reused: the view walks every replica, and
+// each fresh look is three API reads.
+const encryptionStateTTL = 5 * time.Second
 
 // passphraseRequest is the body upstream linstor expects on the
 // encryption/passphrase endpoints.
@@ -91,38 +89,22 @@ func (r passphraseRequest) proofOfKnowledge() string {
 	return r.Passphrase
 }
 
-// defaultPassphraseSecretName is the Secret the controller falls
-// back to when ControllerConfig.Spec.PassphraseSecretRef is unset.
-// Operators override via the ControllerConfig CRD. Canonical home:
-// pkg/passphrase (Bug 023 hoisted the Secret access there so the
-// LUKS RD-create gate and the satellite-side dispatch read the same
-// Secret this file writes); aliased locally for the existing
-// REST-side callers.
-const defaultPassphraseSecretName = passphrase.DefaultSecretName
+// errNoEncryptionClient is a server built without an API server client:
+// the keyring lives in a Secret.
+var errNoEncryptionClient = errors.New("cluster passphrase requires an apiserver client")
 
-// passphraseSecretKey is the data key inside the Secret carrying
-// the cluster passphrase. Matches the upstream-LINSTOR-on-k8s
-// convention so existing Secret YAML manifests continue to work.
-const passphraseSecretKey = passphrase.SecretKey
-
-// registerEncryption wires `linstor encryption *` endpoints. The
-// cluster passphrase is the master key used to encrypt LUKS volume
-// keys at rest.
+// registerEncryption wires `linstor encryption *` endpoints, and the
+// blockstor-only slot verbs under /passphrases.
 //
-// Phase 10.4: when the Server is wired with a controller-runtime
-// `Client` + `Namespace`, the passphrase lives in a native Secret
-// (default `blockstor-cluster-passphrase`, key `passphrase`).
-// Without a Client we fall back to the legacy KV path so
-// in-memory-store tests and pre-migration clusters keep working.
+// The master key that wraps every LUKS volume password lives in the
+// keyring Secret, wrapped under one slot per passphrase; the passphrase
+// the cluster unlocks from lives in the passphrase Secret the
+// ControllerConfig names, or in the unlock Secret blockstor generates.
+// Passphrases given through these endpoints live only in slots.
 //
-// +kubebuilder:rbac:groups="",namespace=blockstor-system,resources=secrets,verbs=get;create;update;patch
+// +kubebuilder:rbac:groups="",namespace=blockstor-system,resources=secrets,verbs=get;create;update
 // +kubebuilder:rbac:groups=blockstor.org,resources=controllerconfigs,verbs=get;list;watch
 func (s *Server) registerEncryption(mux *http.ServeMux) {
-	// Bug 196: GET reports whether the cluster has a passphrase
-	// set + whether this controller process has unlocked it.
-	// Upstream OpenAPI operationId `passphraseStatus`; the state
-	// is fully derivable in-process from s.passphraseUnlocked +
-	// readPassphrase so no Secret round-trip on the hot path.
 	mux.HandleFunc("GET /v1/encryption/passphrase",
 		s.requireStore(s.handlePassphraseStatus))
 	mux.HandleFunc("POST /v1/encryption/passphrase",
@@ -131,96 +113,115 @@ func (s *Server) registerEncryption(mux *http.ServeMux) {
 		s.requireStore(s.handlePassphraseEnter))
 	mux.HandleFunc("PUT /v1/encryption/passphrase",
 		s.requireStore(s.handlePassphraseModify))
+	mux.HandleFunc("GET /v1/encryption/passphrases",
+		s.requireStore(s.handlePassphraseList))
+	mux.HandleFunc("POST /v1/encryption/passphrases",
+		s.requireStore(s.handlePassphraseAdd))
+	mux.HandleFunc("DELETE /v1/encryption/passphrases/{slot}",
+		s.requireStore(s.handlePassphraseRemove))
 }
 
-// passphraseStatus is the upstream `PassphraseStatus` schema
-// (rest_v1_openapi.yaml lines 8357-8367): a single tri-state
-// status field. The wire envelope is an ARRAY of this object —
-// upstream's OpenAPI wraps it in a slice to match every other
-// `[]ApiCallRc`-style REST reply, even though the field is
-// effectively a singleton.
+// passphraseStatus is the upstream `PassphraseStatus` schema: a single
+// tri-state status field, array-wrapped like every other reply.
 type passphraseStatus struct {
 	Status string `json:"status"`
 }
 
-const (
-	passphraseStatusUnset    = "unset"
-	passphraseStatusLocked   = "locked"
-	passphraseStatusUnlocked = "unlocked"
-)
+// encryption holds the server's unlocker, so a status or a view does not
+// pay an Argon2id run per request, and the last state the view stamped.
+type encryption struct {
+	once     sync.Once
+	unlocker *passphrase.Unlocker
 
-// handlePassphraseStatus reports whether the cluster has a master
-// passphrase set + whether the controller has unlocked it.
-//
-// Bug 196 (P2): `linstor encryption status` GETs this path; pre-
-// fix the catch-all returned a 404 envelope, leaving operators no
-// way to discover the controller's encryption state without
-// reading the Secret out-of-band.
-//
-// Resolution order:
-//
-//  1. Secret read via readPassphrase. Errors here surface as 500;
-//     in particular, a controller without an apiserver Client wired
-//     gets `cluster passphrase requires an apiserver client`, which
-//     is operator-actionable.
-//  2. Empty value (Secret missing or key empty) → "unset". Maps
-//     directly onto the "POST to create" workflow.
-//  3. Non-empty + s.passphraseUnlocked == true → "unlocked".
-//     The POST/PUT/PATCH success paths flip this flag explicitly so
-//     a post-restart cluster only lands here once the operator has
-//     re-PATCHed the passphrase.
-//  4. Non-empty + flag == false → "locked". The Bug 173 PATCH
-//     path's "wrong passphrase → flag unchanged" rule is what
-//     keeps this distinct from "unlocked" — a single bad guess
-//     does not bump the flag.
-//
-// Status code is always 200 — the endpoint is a state query, not
-// a verb. Wire shape is `[{"status":"<enum>"}]` (array-wrapped per
-// upstream's `PassphraseStatus` slice schema).
+	mu      sync.Mutex
+	state   passphrase.State
+	stateAt time.Time
+}
+
+func (s *Server) passphraseOps() (*passphrase.Ops, error) {
+	if s.Client == nil {
+		return nil, errNoEncryptionClient
+	}
+
+	return &passphrase.Ops{Client: s.Client, Secrets: s.passphraseSecrets(), Now: nil}, nil
+}
+
+func (s *Server) passphraseSecrets() passphrase.Secrets {
+	reader := s.SecretReader
+	if reader == nil {
+		reader = s.Client
+	}
+
+	return passphrase.Secrets{Reader: reader, Namespace: s.Namespace}
+}
+
+func (s *Server) encryptionStatus(ctx context.Context) (passphrase.Status, error) {
+	if s.Client == nil {
+		return passphrase.Status{}, errNoEncryptionClient
+	}
+
+	s.encryption.once.Do(func() {
+		s.encryption.unlocker = &passphrase.Unlocker{Secrets: s.passphraseSecrets()}
+	})
+
+	return s.encryption.unlocker.Unlock(ctx) //nolint:wrapcheck // pkg/passphrase names the Secret it failed on
+}
+
+// encryptionState is the cluster's encryption state for the resource
+// view, reused for encryptionStateTTL. A state that cannot be read counts
+// as locked: the view then says `Suspended`, which is what an operator
+// should look into.
+func (s *Server) encryptionState(ctx context.Context) passphrase.State {
+	s.encryption.mu.Lock()
+	defer s.encryption.mu.Unlock()
+
+	if !s.encryption.stateAt.IsZero() && time.Since(s.encryption.stateAt) < encryptionStateTTL {
+		return s.encryption.state
+	}
+
+	status, err := s.encryptionStatus(ctx)
+	if err != nil {
+		status.State = passphrase.StateLocked
+	}
+
+	s.encryption.state, s.encryption.stateAt = status.State, time.Now()
+
+	return status.State
+}
+
+// forgetEncryptionState drops the view's cached state after this server
+// changed the keyring or the unlock Secret, so the next view reads them.
+func (s *Server) forgetEncryptionState() {
+	s.encryption.mu.Lock()
+	defer s.encryption.mu.Unlock()
+
+	s.encryption.stateAt = time.Time{}
+}
+
+// handlePassphraseStatus reports `unset` (no keyring), `locked` (the
+// passphrase Secret opens no slot) or `unlocked`, derived from the two
+// Secrets, so every apiserver replica answers the same.
 func (s *Server) handlePassphraseStatus(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
 
-	have, err := s.readPassphrase(ctx)
+	status, err := s.encryptionStatus(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
 		return
 	}
 
-	var state string
-
-	switch {
-	case have == "":
-		state = passphraseStatusUnset
-	case s.passphraseUnlocked.Load():
-		state = passphraseStatusUnlocked
-	default:
-		state = passphraseStatusLocked
-	}
-
-	writeJSON(w, http.StatusOK, []passphraseStatus{{Status: state}})
+	writeJSON(w, http.StatusOK, []passphraseStatus{{Status: string(status.State)}})
 }
 
-// handlePassphraseCreate stamps the cluster-wide master passphrase
-// into the sealed K8s Secret on first call (→ 201 Created). If a
-// passphrase already exists, the body must match it byte-for-byte:
-// same value → 200 OK (idempotent retry, scenario 6.W12), different
-// value → 409 Conflict (rotations must go through PUT/modify with
-// proof-of-knowledge of the old passphrase).
 func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) {
 	var req passphraseRequest
 
-	// Bug 158/161: typed-envelope decode + DisallowUnknownFields.
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 
-	// Bug 165: accept BOTH `new_passphrase` (canonical upstream) and
-	// `passphrase` (alias / W13 CLI shape) here so POST is symmetric
-	// with the PATCH/PUT siblings. Pre-fix, POST checked only
-	// req.NewPassphrase, so `--curl` callers sending `{"passphrase":…}`
-	// got 400 here even though the very same body unlocked on PATCH.
 	want := req.proofOfKnowledge()
 	if want == "" {
 		writeError(w, http.StatusBadRequest, "new_passphrase is required")
@@ -228,157 +229,242 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	ops, err := s.passphraseOps()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
 
-	have, err := s.readPassphrase(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	result, err := ops.Create(ctx, []byte(want))
 
-		return
-	}
+	s.forgetEncryptionState()
 
-	if have != "" {
-		// Bug 176: constant-time to avoid timing oracle on the master
-		// passphrase. A plain `have == want` compare short-circuits at
-		// the first differing byte, leaking the best-match-prefix
-		// length to a probing attacker.
-		if subtle.ConstantTimeCompare([]byte(have), []byte(want)) == 1 {
-			// Idempotent re-create from a caller that
-			// demonstrably knows the value — flip the
-			// in-memory unlock too so a crash-loop-during-
-			// bootstrap retry leaves the controller in the
-			// same usable state as the original create.
-			s.passphraseUnlocked.Store(true)
-
-			// Bug 374: emit a MASK_INFO envelope on the
-			// idempotent-replay branch. The fresh-create
-			// branch below already does this (Bug 129); the
-			// replay path silently regressed back to a bare
-			// 200, which python-linstor still rejects with
-			// the same "Expecting value" trace.
-			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-				RetCode: maskInfo,
-				Message: "Master passphrase already set",
-			}})
-
-			return
-		}
-
+	switch {
+	case errors.Is(err, passphrase.ErrKeyringExists):
 		writeError(w, http.StatusConflict, "cluster passphrase already set; PUT to modify with old passphrase")
-
-		return
-	}
-
-	err = s.writePassphrase(ctx, want)
-	if err != nil {
+	case errors.Is(err, passphrase.ErrSecretManaged):
+		writeError(w, http.StatusConflict, err.Error())
+	case err != nil:
 		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
+	case result.AlreadySet:
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{RetCode: maskInfo, Message: "Master passphrase already set"}})
+	default:
+		writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{RetCode: maskInfo, Message: "Master passphrase created"}})
 	}
-
-	// Fresh-cluster create-passphrase: the operator just stamped
-	// the value, so they implicitly hold the proof-of-knowledge.
-	// Marking the controller unlocked here saves them an
-	// immediately-following PATCH to start provisioning LUKS.
-	s.passphraseUnlocked.Store(true)
-
-	// Bug 129: python-linstor 1.27.1 unconditionally json-decodes
-	// every non-204 2xx response, so a bare `WriteHeader(201)`
-	// with no body crashes the CLI with "Unable to parse REST
-	// json data: Expecting value: line 1 column 1 (char 0)".
-	// Match the MASK_INFO envelope shape every sibling write-side
-	// endpoint (handlePassphraseEnter / handlePassphraseModify,
-	// controller_props create, autoplace create, …) emits so
-	// python-linstor renders a clean operator-visible success line.
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "Master passphrase created",
-	}})
 }
 
-// handlePassphraseEnter unlocks the in-memory crypto context for
-// this controller process. Scenario 6.W13: a controller restart
-// loses the unlock flag, leaving the sealed-Secret passphrase
-// dormant on the apiserver. The operator calls
-// `linstor encryption enter-passphrase`, which PATCHes this endpoint
-// with the master passphrase as proof-of-knowledge:
-//
-//   - missing prior passphrase → 412 (must POST/create first)
-//   - wrong proof → 401 Unauthorized + descriptive error; the unlock
-//     flag MUST stay false, otherwise a single wrong-passphrase
-//     guess would silently grant LUKS provisioning.
-//   - right proof → 200 OK + s.passphraseUnlocked flipped to true,
-//     so the very next /v1/view/resources GET reports every LUKS
-//     replica as Suspended=false (Available).
-//
-// Body shape accepts THREE wire forms (Bug 173):
-//
-//   - bare JSON string `"…"` — the upstream-LINSTOR canonical shape
-//     (`PassPhraseEnter: type: string` in the OpenAPI spec, decoded
-//     via `readValue(jsonData, String.class)` in upstream's Java
-//     handler, and the exact body golinstor's
-//     `EncryptionService.Enter()` puts on the wire).
-//   - `{"new_passphrase":"…"}` — historical wrapped form kept by
-//     pre-Bug-173 clients and the Bug 165 dual-key wire surface.
-//   - `{"passphrase":"…"}` — the W13 CLI / `--curl` wrapped alias.
-//
-// passphraseRequest.proofOfKnowledge centralises the wrapped-form
-// field resolution; the bare-string branch fills in NewPassphrase
-// up-front so the rest of the handler stays dual-key-agnostic.
-//
-// Pre-Bug-173 this method decoded straight into passphraseRequest
-// and a bare string body crashed the decoder with `wrong JSON
-// shape: …has the wrong type` (400). Strict-OpenAPI clients
-// (golinstor 0.55+, terraform-provider-linstor, hand-rolled
-// `curl -d '"…"'`) all hit that — they correctly follow the spec
-// and the apiserver was the diverging side.
 func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 	req, ok := decodePassphraseEnterBody(w, r)
 	if !ok {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
-	defer cancel()
-
-	have, err := s.readPassphrase(ctx)
+	ops, err := s.passphraseOps()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
 		return
 	}
 
-	if have == "" {
-		writeError(w, http.StatusPreconditionFailed, "no cluster passphrase set; POST to create")
+	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
+	defer cancel()
+
+	result, err := ops.Enter(ctx, []byte(req.proofOfKnowledge()))
+
+	s.forgetEncryptionState()
+
+	if writePassphraseError(w, err) {
+		return
+	}
+
+	message := "Master passphrase entered"
+
+	switch {
+	case result.Repaired:
+		message = "Master passphrase entered; the unlock Secret " + passphrase.UnlockSecretName + " was re-created"
+	case result.Status.State == passphrase.StateLocked:
+		message = fmt.Sprintf("Master passphrase verified, but the cluster stays locked: "+
+			"the passphrase Secret %s does not open the keyring", result.Status.Ref.Name)
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{RetCode: maskInfo, Message: message}})
+}
+
+func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) {
+	var req passphraseRequest
+
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	want := req.proofOfKnowledge()
+	if want == "" {
+		writeError(w, http.StatusBadRequest, "new_passphrase is required: modify must specify a non-empty new value")
 
 		return
 	}
 
-	// Bug 176: constant-time to avoid timing oracle on the master
-	// passphrase. A plain `have != req.proofOfKnowledge()` compare
-	// short-circuits at the first differing byte, so a remote
-	// attacker timing many PATCH probes could recover the stored
-	// passphrase character-by-character. ConstantTimeCompare scans
-	// both operands end-to-end regardless of where they diverge.
-	if subtle.ConstantTimeCompare([]byte(have), []byte(req.proofOfKnowledge())) != 1 {
+	ops, err := s.passphraseOps()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
+	defer cancel()
+
+	result, err := ops.Modify(ctx, []byte(req.OldPassphrase), []byte(want))
+
+	s.forgetEncryptionState()
+
+	if writePassphraseError(w, err) {
+		return
+	}
+
+	switch {
+	case result.Unchanged:
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{RetCode: maskInfo, Message: "Master passphrase unchanged (idempotent no-op)"}})
+	case result.SecretToUpdate != "":
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{
+			{RetCode: maskInfo, Message: "Master passphrase modified"},
+			{RetCode: maskWarn, Message: fmt.Sprintf("the cluster still unlocks with the old passphrase from Secret %s; "+
+				"put the new one there, and the old one's slot is removed once the Secret opens the new one", result.SecretToUpdate)},
+		})
+	default:
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{RetCode: maskInfo, Message: "Master passphrase modified"}})
+	}
+}
+
+// passphraseSlot is one slot of `GET /v1/encryption/passphrases`.
+type passphraseSlot struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Origin     string    `json:"origin"`
+	CreatedAt  time.Time `json:"created_at"`
+	Superseded bool      `json:"superseded,omitempty"`
+	KDF        string    `json:"kdf"`
+	Unlocks    bool      `json:"unlocks"`
+}
+
+func (s *Server) handlePassphraseList(w http.ResponseWriter, r *http.Request) {
+	ops, err := s.passphraseOps()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
+	defer cancel()
+
+	slots, _, err := ops.List(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	out := make([]passphraseSlot, 0, len(slots))
+	for _, slot := range slots {
+		out = append(out, passphraseSlot(slot))
+	}
+
+	writeJSON(w, http.StatusOK, out)
+}
+
+// passphraseAddRequest is the body of `POST /v1/encryption/passphrases`:
+// a passphrase that opens an existing slot, the new one, and its name.
+type passphraseAddRequest struct {
+	Passphrase    string `json:"passphrase"`
+	NewPassphrase string `json:"new_passphrase"`
+	Name          string `json:"name"`
+}
+
+func (s *Server) handlePassphraseAdd(w http.ResponseWriter, r *http.Request) {
+	var req passphraseAddRequest
+
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.Passphrase == "" || req.NewPassphrase == "" || req.Name == "" {
+		writeError(w, http.StatusBadRequest, "passphrase, new_passphrase and name are required")
+
+		return
+	}
+
+	ops, err := s.passphraseOps()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
+	defer cancel()
+
+	slotID, err := ops.Add(ctx, []byte(req.Passphrase), []byte(req.NewPassphrase), req.Name)
+	if writePassphraseError(w, err) {
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo, Message: fmt.Sprintf("Passphrase %s added as slot %s", req.Name, slotID),
+	}})
+}
+
+func (s *Server) handlePassphraseRemove(w http.ResponseWriter, r *http.Request) {
+	ops, err := s.passphraseOps()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
+	defer cancel()
+
+	slot := r.PathValue("slot")
+
+	err = ops.Remove(ctx, slot)
+	if writePassphraseError(w, err) {
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{RetCode: maskInfo, Message: "Passphrase slot " + slot + " removed"}})
+}
+
+// writePassphraseError answers err, if there is one, with the status its
+// kind calls for, and reports whether it wrote.
+func writePassphraseError(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+
+	status := http.StatusInternalServerError
+
+	switch {
+	case errors.Is(err, keyring.ErrWrongPassphrase):
 		writeError(w, http.StatusUnauthorized, "passphrase mismatch")
 
-		return
+		return true
+	case errors.Is(err, passphrase.ErrNoKeyring):
+		status = http.StatusPreconditionFailed
+	case errors.Is(err, keyring.ErrSlotNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, passphrase.ErrUnlockSlot), errors.Is(err, keyring.ErrLastSlot),
+		errors.Is(err, keyring.ErrDuplicateName), errors.Is(err, keyring.ErrTooManySlots):
+		status = http.StatusConflict
 	}
 
-	s.passphraseUnlocked.Store(true)
+	writeError(w, status, err.Error())
 
-	// Bug 359: python-linstor / golinstor unconditionally json-decode
-	// every non-204 2xx response, so a bare WriteHeader(200) with no
-	// body crashes `linstor encryption enter-passphrase` with "Unable
-	// to parse REST json data". Emit the same ApiCallRc envelope the
-	// sibling create/modify handlers (and upstream LINSTOR) return so
-	// the CLI renders a clean operator-visible success line.
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "Master passphrase entered",
-	}})
+	return true
 }
 
 // decodePassphraseEnterBody implements the Bug 173 dual-shape decode
@@ -490,295 +576,4 @@ func firstJSONToken(body []byte) (byte, bool) {
 	}
 
 	return 0, false
-}
-
-// handlePassphraseModify rotates the cluster master passphrase
-// (scenario 6.W14). PUT `/v1/encryption/passphrase` with body
-// `{"old_passphrase":"…","new_passphrase":"…"}` swaps the sealed
-// Secret's stored value: old must verify, new replaces it, atomic.
-//
-// Status surface:
-//   - no prior passphrase → 412 Precondition Failed (must POST first)
-//   - wrong old → 401 Unauthorized. Scenario 6.W14 narrows upstream's
-//     historical 403 down to 401 — symmetric with the W13 PATCH
-//     mismatch path so `linstor encryption modify-passphrase` and
-//     `linstor encryption enter-passphrase` share one "wrong
-//     passphrase" CLI string keyed off the status code. The unlock
-//     flag MUST stay at its prior value; a regression that flipped
-//     it on mismatch would silently grant LUKS provisioning to any
-//     caller after a single wrong-old guess.
-//   - new == old (and old verified) → 200 OK + MASK_INFO envelope,
-//     no Secret write. Idempotent no-op for a retried CLI call.
-//   - happy rotation → 200 OK + MASK_INFO envelope with an
-//     operator-facing "modified" line, sealed Secret updated, and
-//     s.passphraseUnlocked flipped to true atomic with the
-//     create-passphrase + enter-passphrase paths (W12/W13). Without
-//     the flip, a post-rotation /v1/view/resources would still
-//     report Suspended on every LUKS replica until the operator
-//     did a follow-up PATCH.
-//
-// The envelope shape (`[]ApiCallRc` with MASK_INFO + message)
-// matches every other write-side endpoint in the apiserver so
-// python-linstor's CLI loop renders the success line uniformly.
-func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) {
-	var req passphraseRequest
-
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-
-	// Bug 165: the NEW value accepts both `new_passphrase` (canonical)
-	// and `passphrase` (alias) symmetric with POST/PATCH. The OLD
-	// value stays on its own `old_passphrase` field — that one has no
-	// alias in either upstream LINSTOR or the W13 CLI shape.
-	want := req.proofOfKnowledge()
-
-	// Bug 172 (P1 security/data-loss): pre-fix, an empty `want`
-	// fell through to `writePassphrase(ctx, "")` after auth passed,
-	// silently wiping the cluster passphrase Secret while returning
-	// 200 + "Master passphrase modified". Sibling
-	// handlePassphraseCreate (line 137) already had this guard;
-	// port verbatim so create/modify share one validation contract.
-	if want == "" {
-		writeError(w, http.StatusBadRequest, "new_passphrase is required: modify must specify a non-empty new value")
-
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
-	defer cancel()
-
-	have, err := s.readPassphrase(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
-	}
-
-	if have == "" {
-		writeError(w, http.StatusPreconditionFailed, "no cluster passphrase set")
-
-		return
-	}
-
-	// Bug 176: constant-time to avoid timing oracle on the master
-	// passphrase. The PUT rotation path is the highest-value timing
-	// target — a remote attacker who learns the old passphrase via
-	// byte-by-byte latency probing here can then rotate the
-	// cluster master out from under the operator. ConstantTimeCompare
-	// keeps the auth path's response time independent of where
-	// `have` and `req.OldPassphrase` diverge.
-	if subtle.ConstantTimeCompare([]byte(have), []byte(req.OldPassphrase)) != 1 {
-		writeError(w, http.StatusUnauthorized, "old passphrase mismatch")
-
-		return
-	}
-
-	// Idempotent no-op: caller proved knowledge of the old
-	// passphrase AND asked us to "rotate" to the same value.
-	// Skip the Secret write entirely so the resourceVersion
-	// stays put (no needless apiserver churn) but still flip
-	// the unlock flag — the caller demonstrably knows the
-	// value, exactly like the W12 same-value POST path.
-	//
-	// Bug 176: constant-time compare for parity with the auth
-	// branches above. Auth has passed by this point so the
-	// timing-oracle surface is narrower, but `have` is still the
-	// stored master passphrase — keeping every passphrase compare
-	// in this file uniform makes future review easier and rules
-	// out a partial-knowledge attacker probing `want` against an
-	// already-trusted operator's body.
-	if subtle.ConstantTimeCompare([]byte(want), []byte(have)) == 1 {
-		s.passphraseUnlocked.Store(true)
-
-		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-			RetCode: maskInfo,
-			Message: "Master passphrase unchanged (idempotent no-op)",
-		}})
-
-		return
-	}
-
-	if !s.rotatePassphrase(ctx, w, want) {
-		return
-	}
-
-	// Successful rotation implies the caller knew the old
-	// passphrase and just stamped the new one — they're unlocked
-	// by definition. Without this flip, a post-rotation
-	// /v1/view/resources would still report Suspended on every
-	// LUKS replica until a follow-up PATCH, which surprises any
-	// operator who thought modify-passphrase was enough.
-	s.passphraseUnlocked.Store(true)
-
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "Master passphrase modified",
-	}})
-}
-
-// rotatePassphrase writes the new cluster passphrase unless LUKS volumes
-// would lose their key to it, answering the error itself; false means the
-// handler stops.
-func (s *Server) rotatePassphrase(ctx context.Context, w http.ResponseWriter, want string) bool {
-	if !s.refuseRotationOverLUKSVolumes(ctx, w) {
-		return false
-	}
-
-	err := s.writePassphrase(ctx, want)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return false
-	}
-
-	return true
-}
-
-// refuseRotationOverLUKSVolumes answers 409 and returns false while any
-// definition has LUKS in its stack. The cluster passphrase is the key
-// every LUKS volume was formatted with, and nothing re-keys a volume yet
-// (no `cryptsetup luksChangeKey`), so a new value in the Secret would
-// leave every existing LUKS volume unable to open on its next start.
-func (s *Server) refuseRotationOverLUKSVolumes(ctx context.Context, w http.ResponseWriter) bool {
-	name, err := s.aLUKSDefinition(ctx)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return false
-	}
-
-	if name == "" {
-		return true
-	}
-
-	writeError(w, http.StatusConflict, fmt.Sprintf(
-		"refusing to change the cluster passphrase while LUKS volumes exist (%s among them): "+
-			"it is the key they were formatted with, and they are not re-keyed, so they would no longer open",
-		name))
-
-	return false
-}
-
-// aLUKSDefinition names one definition with LUKS in its stack, or "" when
-// there is none. It reads the API server directly when the server has a
-// direct reader: a definition created a moment ago may not be in the cache
-// yet, and the rotation it would let through cannot be undone.
-func (s *Server) aLUKSDefinition(ctx context.Context) (string, error) {
-	if s.SecretReader != nil {
-		var list blockstoriov1alpha1.ResourceDefinitionList
-
-		err := s.SecretReader.List(ctx, &list)
-		if err != nil {
-			return "", fmt.Errorf("list resource definitions: %w", err)
-		}
-
-		for i := range list.Items {
-			if apiv1.LayerInStack(list.Items[i].Spec.LayerStack, apiv1.LayerKindLUKS) {
-				return list.Items[i].Name, nil
-			}
-		}
-
-		return "", nil
-	}
-
-	rds, err := s.Store.ResourceDefinitions().List(ctx)
-	if err != nil {
-		return "", err //nolint:wrapcheck // the store names what it failed to read
-	}
-
-	for i := range rds {
-		if apiv1.LayerInStack(rds[i].LayerStack, apiv1.LayerKindLUKS) {
-			return rds[i].Name, nil
-		}
-	}
-
-	return "", nil
-}
-
-// readPassphrase reads the current cluster passphrase. Empty
-// string (not error) means "not yet set". Secret-backed only —
-// the legacy KVEntry fallback was retired in Phase 10.6.
-func (s *Server) readPassphrase(ctx context.Context) (string, error) {
-	if s.Client == nil {
-		return "", errors.New("cluster passphrase requires an apiserver client")
-	}
-
-	return s.readPassphraseSecret(ctx)
-}
-
-// writePassphrase persists the cluster passphrase. Same path
-// selection as readPassphrase.
-func (s *Server) writePassphrase(ctx context.Context, value string) error {
-	if s.Client == nil {
-		return errors.New("cluster passphrase requires an apiserver client")
-	}
-
-	return s.writePassphraseSecret(ctx, value)
-}
-
-// readPassphraseSecret reads the passphrase from a native Secret.
-// Empty string for "Secret missing" is the explicit signal upstream
-// uses for "no passphrase set yet" so the POST→PATCH handshake
-// works the same as on the KV path. Delegates to the shared
-// pkg/passphrase reader (Bug 023) so the LUKS RD-create gate and the
-// satellite-side dispatch resolve the exact same Secret.
-func (s *Server) readPassphraseSecret(ctx context.Context) (string, error) {
-	return passphrase.Read(ctx, s.secretReader(), s.Namespace) //nolint:wrapcheck // pkg/passphrase wraps with context already
-}
-
-// secretReader is the reader the passphrase Secret is read through; see
-// Server.SecretReader.
-func (s *Server) secretReader() client.Reader {
-	if s.SecretReader != nil {
-		return s.SecretReader
-	}
-
-	return s.Client
-}
-
-// writePassphraseSecret create-or-updates the Secret. The Secret is
-// namespaced; pre-existing Secrets without our managed key get the
-// key added rather than the whole data map replaced so operators
-// can carry extra annotations / data fields out-of-band.
-func (s *Server) writePassphraseSecret(ctx context.Context, value string) error {
-	name, err := passphrase.SecretName(ctx, s.secretReader())
-	if err != nil {
-		return err //nolint:wrapcheck // pkg/passphrase wraps with context already
-	}
-
-	var sec corev1.Secret
-
-	err = s.secretReader().Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: name}, &sec)
-	if apierrors.IsNotFound(err) {
-		sec = corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace},
-			Type:       corev1.SecretTypeOpaque,
-			Data:       map[string][]byte{passphraseSecretKey: []byte(value)},
-		}
-
-		createErr := s.Client.Create(ctx, &sec)
-		if createErr != nil {
-			return errors.Wrap(createErr, "create passphrase Secret")
-		}
-
-		return nil
-	}
-
-	if err != nil {
-		return errors.Wrap(err, "get passphrase Secret")
-	}
-
-	if sec.Data == nil {
-		sec.Data = map[string][]byte{}
-	}
-
-	sec.Data[passphraseSecretKey] = []byte(value)
-
-	err = s.Client.Update(ctx, &sec)
-	if err != nil {
-		return errors.Wrap(err, "update passphrase Secret")
-	}
-
-	return nil
 }
