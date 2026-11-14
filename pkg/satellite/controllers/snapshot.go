@@ -21,6 +21,7 @@ package controllers
 import (
 	"context"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -290,6 +291,20 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 		req.VolumeNumbers = append(req.VolumeNumbers, snap.Spec.VolumeDefinitions[i].VolumeNumber)
 	}
 
+	missing, err := r.unrecordedLUKSKey(ctx, snap, req.VolumeNumbers)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if missing != "" {
+		// The snapshot's bytes on this node would be encrypted under a
+		// password it does not record, so they could never be restored.
+		log.FromContext(ctx).Info("refusing to take a snapshot that does not record this replica's LUKS password",
+			"snapshot", snap.Spec.SnapshotName, "volume", missing)
+
+		return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
+	}
+
 	// P0 fix for stale-snapshot bug: `drbdsetup suspend-io` (Phase 1)
 	// quiesces NEW writes at the DRBD layer but does NOT issue a
 	// writeback barrier to the backing zvol / loop / LV. Without an
@@ -309,7 +324,7 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 	// flush, and a stripped-down satellite environment (kernel
 	// without BLKFLSBUF, hostpath sandboxing) shouldn't block the
 	// snapshot from running.
-	err := r.Config.Apply.FlushBackingDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName), req.VolumeNumbers)
+	err = r.Config.Apply.FlushBackingDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName), req.VolumeNumbers)
 	if err != nil {
 		// FlushBackingDevices itself returns nil on best-effort
 		// per-device failures; a non-nil return signals a hard
@@ -807,4 +822,49 @@ func snapshotNodePredicate(nodeName string) predicate.Predicate {
 		DeleteFunc:  func(e event.DeleteEvent) bool { return matches(e.Object) },
 		GenericFunc: func(e event.GenericEvent) bool { return matches(e.Object) },
 	}
+}
+
+// unrecordedLUKSKey names the first of vols whose replica on this node
+// carries a LUKS password the snapshot did not record, or returns "". The
+// snapshot copies the passwords when it is created; a replica formatted
+// after that, before the take, is the gap this closes. The replica is read
+// past the cache, as the store read it for the copy.
+func (r *SnapshotReconciler) unrecordedLUKSKey(ctx context.Context, snap *blockstoriov1alpha1.Snapshot, vols []int32) (string, error) {
+	reader := r.Config.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	name, err := replicaCRName(ctx, reader, snap.Spec.ResourceDefinitionName, r.Config.NodeName)
+	if err != nil {
+		return "", err
+	}
+
+	var res blockstoriov1alpha1.Resource
+
+	err = reader.Get(ctx, client.ObjectKey{Name: name}, &res)
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+
+	if err != nil {
+		return "", errors.Wrapf(err, "get replica %s", name)
+	}
+
+	self := naming.Key(r.Config.NodeName)
+
+	for _, vol := range vols {
+		if luksKeyOf(&res, vol) == nil {
+			continue
+		}
+
+		recorded := slices.ContainsFunc(snap.Spec.LUKSKeys, func(k blockstoriov1alpha1.SnapshotLUKSKey) bool {
+			return k.VolumeNumber == vol && naming.Key(k.NodeName) == self
+		})
+		if !recorded {
+			return name + "/" + strconv.Itoa(int(vol)), nil
+		}
+	}
+
+	return "", nil
 }
