@@ -525,3 +525,31 @@ func TestCreateUnderANamedSecret(t *testing.T) {
 		t.Fatal("an unlock Secret was created under a named passphrase Secret")
 	}
 }
+
+// create-passphrase does not mint a new master key while a replica carries
+// a password wrapped under one that is gone: those volumes would never
+// open again.
+func TestCreateRefusesALostKeyring(t *testing.T) {
+	t.Parallel()
+
+	carrier := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{Volumes: []blockstoriov1alpha1.ResourceVolumeSpec{{
+			VolumeNumber: 0,
+			LUKSKey:      &blockstoriov1alpha1.LUKSKey{KeyID: "c7324c99567678f7", Wrapped: []byte{1}, Origin: blockstoriov1alpha1.LUKSKeyOriginGenerated},
+		}}},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(carrier).Build()
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	_, err := ops.Create(t.Context(), []byte("x"))
+	if !errors.Is(err, passphrase.ErrKeyringLost) {
+		t.Fatalf("err %v, want ErrKeyringLost", err)
+	}
+
+	ring, _, err := ops.Secrets.Keyring(t.Context())
+	if err != nil || ring != nil {
+		t.Fatalf("a keyring was created: %v", err)
+	}
+}

@@ -125,6 +125,11 @@ func (o *Ops) Create(ctx context.Context, pass []byte) (CreateResult, error) {
 			"put the passphrase into Secret %s/%s, key %s", o.Secrets.Namespace, ref.Name, ref.Key)
 	}
 
+	err = refuseLostKeyring(ctx, o.Secrets.Reader)
+	if err != nil {
+		return CreateResult{}, err
+	}
+
 	ring, master, err := keyring.New(pass, SlotNameOperator, keyring.OriginAPI, o.now())
 	if err != nil {
 		return CreateResult{}, errors.Wrap(err, "create the keyring")

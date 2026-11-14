@@ -292,13 +292,9 @@ func Bootstrap(ctx context.Context, writer client.Client, secrets Secrets, now t
 
 	defer clear(pass)
 
-	carried, err := AnyReplicaCarriesLUKSKey(ctx, secrets.Reader)
+	err = refuseLostKeyring(ctx, secrets.Reader)
 	if err != nil {
 		return false, err
-	}
-
-	if carried != "" {
-		return false, errors.Wrapf(ErrKeyringLost, "replica %s", carried)
 	}
 
 	ring, key, err := keyring.New(pass, SlotNameSecret, keyring.OriginSecret, now)
@@ -335,6 +331,22 @@ func CreateKeyring(ctx context.Context, writer client.Client, namespace string, 
 	}
 
 	return true, nil
+}
+
+// refuseLostKeyring is ErrKeyringLost when a replica carries a wrapped
+// password: with no keyring, the key it is wrapped under is gone, and a
+// new master key would leave it unreadable for good.
+func refuseLostKeyring(ctx context.Context, reader client.Reader) error {
+	carried, err := AnyReplicaCarriesLUKSKey(ctx, reader)
+	if err != nil {
+		return err
+	}
+
+	if carried != "" {
+		return errors.Wrapf(ErrKeyringLost, "replica %s", carried)
+	}
+
+	return nil
 }
 
 // AnyReplicaCarriesLUKSKey names a replica that carries a wrapped LUKS

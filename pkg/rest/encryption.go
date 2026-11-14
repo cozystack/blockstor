@@ -246,7 +246,7 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 	switch {
 	case errors.Is(err, passphrase.ErrKeyringExists):
 		writeError(w, http.StatusConflict, "cluster passphrase already set; PUT to modify with old passphrase")
-	case errors.Is(err, passphrase.ErrSecretManaged):
+	case errors.Is(err, passphrase.ErrSecretManaged), errors.Is(err, passphrase.ErrKeyringLost):
 		writeError(w, http.StatusConflict, err.Error())
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, err.Error())
