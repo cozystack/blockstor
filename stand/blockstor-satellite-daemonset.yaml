@@ -97,8 +97,13 @@ subjects:
     namespace: blockstor-system
 ---
 # The master passphrase and the keyring are the only Secrets the
-# satellite reads, both here, by name and past the cache, so a namespaced
-# get is all it is granted.
+# satellite reads, both here, by name and past the cache, so a get on
+# those names is all it is granted.
+# resourceNames: the keyring, the unlock Secret blockstor generates when no
+# passphrase Secret is named, and the passphrase Secret under piraeus's
+# name, linstor-passphrase. A ControllerConfig that names another
+# passphrase Secret needs that name added here. Nothing else in the
+# namespace is readable: under Cozystack it is shared with piraeus.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -107,6 +112,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [secrets]
+    resourceNames: [blockstor-master-key, blockstor-unlock, linstor-passphrase]
     verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

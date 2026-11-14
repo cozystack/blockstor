@@ -1225,7 +1225,7 @@ ensure_passphrase_secret() {
     secret=$(kubectl get controllerconfigs.blockstor.org default \
         -o jsonpath='{.spec.passphraseSecretRef.name}' 2>/dev/null || true)
     if [[ -z "$secret" ]]; then
-        secret=blockstor-e2e-passphrase
+        secret=linstor-passphrase
         if ! kubectl get controllerconfigs.blockstor.org default >/dev/null 2>&1; then
             printf '%s\n' 'apiVersion: blockstor.org/v1alpha1' 'kind: ControllerConfig' \
                 'metadata: {name: default}' | kubectl apply -f - >/dev/null

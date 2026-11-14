@@ -64,6 +64,11 @@ subjects:
 # The controller creates the keyring from the passphrase Secret on first
 # start, and drops superseded slots once the Secret moves on; both are in
 # this namespace and read by name past the cache.
+# resourceNames: the keyring, the unlock Secret blockstor generates when no
+# passphrase Secret is named, and the passphrase Secret under piraeus's
+# name, linstor-passphrase. A ControllerConfig that names another
+# passphrase Secret needs that name added here. Nothing else in the
+# namespace is readable: under Cozystack it is shared with piraeus.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -72,7 +77,12 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, create, update]
+    resourceNames: [blockstor-master-key, blockstor-unlock, linstor-passphrase]
+    verbs: [get, update]
+  # A create cannot be limited by name.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

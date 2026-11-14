@@ -156,10 +156,13 @@ roleRef:
   kind: ClusterRole
   name: satellite-role
 ---
-# The satellite reads exactly two Secrets, the master passphrase and the
-# keyring, both in blockstor's namespace, by name and past the cache. A
-# namespaced get is all that needs; a cluster-wide list would hand every
-# node every Secret of the cluster.
+# The satellite reads the master passphrase and the keyring, both in
+# blockstor's namespace, by name and past the cache.
+# resourceNames: the keyring, the unlock Secret blockstor generates when no
+# passphrase Secret is named, and the passphrase Secret under piraeus's
+# name, linstor-passphrase. A ControllerConfig that names another
+# passphrase Secret needs that name added here. Nothing else in the
+# namespace is readable: under Cozystack it is shared with piraeus.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -170,5 +173,23 @@ rules:
   - ""
   resources:
   - secrets
+  resourceNames:
+  - blockstor-master-key
+  - blockstor-unlock
+  - linstor-passphrase
   verbs:
   - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: satellite-secrets
+  namespace: system
+subjects:
+- kind: ServiceAccount
+  name: blockstor-satellite
+  namespace: system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: satellite-secrets
