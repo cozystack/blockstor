@@ -676,3 +676,157 @@ func TestASnapshotKeyMeansTheKeyringIsLost(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 }
+
+// The review's probe: on a cluster locked out of its generated unlock
+// Secret, modify of the generated passphrase succeeded, and the next
+// enter-passphrase repair dropped that slot, so the new passphrase opened
+// nothing. Modify is refused on a locked cluster.
+func TestModifyIsRefusedOnALockedCluster(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).Build()
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	_, err := ops.Create(t.Context(), []byte("operator-pass"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var unlock corev1.Secret
+
+	err = cli.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: passphrase.UnlockSecretName}, &unlock)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	generated := bytes.Clone(unlock.Data[passphrase.DefaultPassphraseKey])
+
+	err = cli.Delete(t.Context(), &unlock)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	_, err = ops.Modify(t.Context(), generated, []byte("mine"))
+	if !errors.Is(err, passphrase.ErrLocked) {
+		t.Fatalf("modify on a locked cluster: %v, want ErrLocked", err)
+	}
+
+	_, err = ops.Modify(t.Context(), []byte("operator-pass"), []byte("mine"))
+	if !errors.Is(err, passphrase.ErrLocked) {
+		t.Fatalf("modify of the operator's passphrase on a locked cluster: %v, want ErrLocked", err)
+	}
+}
+
+// Remove protects the slot the passphrase Secret opens when the keyring is
+// written, not when the state was read: a Secret moved to another slot in
+// between keeps that slot.
+func TestRemoveProtectsTheSlotTheSecretOpensNow(t *testing.T) {
+	t.Parallel()
+
+	base := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(
+		refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "one")).Build()
+	setup := &passphrase.Ops{Client: base, Secrets: passphrase.Secrets{Reader: base, Namespace: ns}}
+
+	_, err := passphrase.Bootstrap(t.Context(), base, setup.Secrets, time.Now())
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	_, err = setup.Add(t.Context(), []byte("one"), []byte("two"), "next")
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	keyringGets := 0
+
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == passphrase.KeyringSecretName {
+				keyringGets++
+				// The second read is the one inside the write; the
+				// operator moves the Secret to "two" just before it.
+				if keyringGets == 2 {
+					flipSecret(ctx, t, c, "p", "two")
+				}
+			}
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	err = ops.Remove(t.Context(), []byte("one"), "next")
+	if !errors.Is(err, passphrase.ErrUnlockSlot) {
+		t.Fatalf("remove of the slot the Secret moved to: %v, want ErrUnlockSlot", err)
+	}
+
+	if stateOf(t, setup).State != passphrase.StateUnlocked {
+		t.Fatal("the cluster is locked")
+	}
+}
+
+// Modify decides whether the old passphrase is the Secret's from the
+// keyring it writes: a Secret moved to another slot in between makes the
+// old slot an ordinary one, replaced outright rather than superseded.
+func TestModifyReadsTheSlotTheSecretOpensNow(t *testing.T) {
+	t.Parallel()
+
+	base := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(
+		refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "one")).Build()
+	setup := &passphrase.Ops{Client: base, Secrets: passphrase.Secrets{Reader: base, Namespace: ns}}
+
+	_, err := passphrase.Bootstrap(t.Context(), base, setup.Secrets, time.Now())
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	_, err = setup.Add(t.Context(), []byte("one"), []byte("two"), "next")
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	keyringGets := 0
+
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == passphrase.KeyringSecretName {
+				keyringGets++
+				if keyringGets == 2 {
+					flipSecret(ctx, t, c, "p", "two")
+				}
+			}
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	result, err := ops.Modify(t.Context(), []byte("one"), []byte("three"))
+	if err != nil || result.SecretToUpdate != "" {
+		t.Fatalf("modify: %+v, %v; want a plain replace", result, err)
+	}
+
+	status := stateOf(t, setup)
+	if _, err := status.Ring.Opens([]byte("one")); err == nil {
+		t.Fatal("the replaced passphrase still opens")
+	}
+}
+
+// flipSecret is setSecret on ctx, for a change made inside a client call.
+func flipSecret(ctx context.Context, t *testing.T, cli client.Client, name, value string) {
+	t.Helper()
+
+	var sec corev1.Secret
+
+	err := cli.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &sec)
+	if err != nil {
+		t.Fatalf("get %s: %v", name, err)
+	}
+
+	sec.Data["MASTER_PASSPHRASE"] = []byte(value)
+
+	err = cli.Update(ctx, &sec)
+	if err != nil {
+		t.Fatalf("update %s: %v", name, err)
+	}
+}

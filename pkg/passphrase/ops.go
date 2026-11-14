@@ -287,6 +287,17 @@ func (o *Ops) Modify(ctx context.Context, oldPass, newPass []byte) (ModifyResult
 	var result ModifyResult
 
 	err = o.mutate(ctx, func(ring *keyring.Keyring) error {
+		// A locked cluster is refused: on the generated Secret the next
+		// enter-passphrase drops every generated slot, and a passphrase
+		// modify put in one would open nothing afterwards. The slot the
+		// Secret opens is read in the keyring about to be written.
+		unlockID, unlockErr := o.unlockSlotIn(ctx, ring, status.Ref)
+		if unlockErr != nil {
+			return unlockErr
+		}
+
+		status.SlotID = unlockID
+
 		master, slotID, unlockErr := ring.Unlock(oldPass)
 		if unlockErr != nil {
 			return unlockErr //nolint:wrapcheck // keyring.ErrWrongPassphrase, said as it is
@@ -295,7 +306,7 @@ func (o *Ops) Modify(ctx context.Context, oldPass, newPass []byte) (ModifyResult
 		defer master.Destroy()
 
 		old := ring.Slots[ring.SlotIndex(slotID)]
-		isUnlock := status.State == StateUnlocked && slotID == status.SlotID
+		isUnlock := slotID == status.SlotID
 
 		switch {
 		case isUnlock && status.Ref.Generated:
@@ -312,19 +323,10 @@ func (o *Ops) Modify(ctx context.Context, oldPass, newPass []byte) (ModifyResult
 
 			return addErr //nolint:wrapcheck // keyring errors name the slot
 		default:
+			// Not the unlock slot, so never the last one.
 			removeErr := ring.RemoveSlot(slotID, "")
-			if removeErr != nil && !errors.Is(removeErr, keyring.ErrLastSlot) {
-				return removeErr //nolint:wrapcheck // keyring errors name the slot
-			}
-
 			if removeErr != nil {
-				// The only slot: add the new one first, then drop it.
-				_, addErr := ring.AddSlot(master, newPass, freshName(ring, old.Name), old.Origin, o.now())
-				if addErr != nil {
-					return addErr //nolint:wrapcheck // keyring errors name the slot
-				}
-
-				return ring.RemoveSlot(slotID, "")
+				return removeErr //nolint:wrapcheck // keyring errors name the slot
 			}
 
 			_, addErr := ring.AddSlot(master, newPass, old.Name, old.Origin, o.now())
@@ -398,7 +400,15 @@ func (o *Ops) Remove(ctx context.Context, auth []byte, ref string) error {
 			return errors.Wrapf(ErrLastHumanSlot, "%q", ref)
 		}
 
-		err = ring.RemoveSlot(target.ID, status.SlotID)
+		// The Secret may have changed since the state was read; the slot
+		// it opens now, in the keyring about to be written, is the one to
+		// keep.
+		unlockID, err := o.unlockSlotIn(ctx, ring, status.Ref)
+		if err != nil {
+			return err
+		}
+
+		err = ring.RemoveSlot(target.ID, unlockID)
 		if errors.Is(err, keyring.ErrProtectedSlot) {
 			return errors.Wrapf(ErrUnlockSlot, "%q is opened by the passphrase Secret %s", ref, status.Ref.Name)
 		}
@@ -482,6 +492,25 @@ func (o *Ops) CleanupSuperseded(ctx context.Context) (bool, error) {
 }
 
 var errNothingToWrite = errors.New("nothing to write")
+
+// unlockSlotIn is the slot of ring the passphrase Secret ref opens now, or
+// ErrLocked when it opens none.
+func (o *Ops) unlockSlotIn(ctx context.Context, ring *keyring.Keyring, ref Ref) (string, error) {
+	pass, _, err := o.Secrets.Passphrase(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+
+	defer clear(pass)
+
+	// A missing Secret is a nil passphrase, which opens no slot either.
+	slotID, err := ring.Opens(pass)
+	if err != nil {
+		return "", errors.Wrapf(ErrLocked, "the passphrase Secret %s opens no slot", ref.Name)
+	}
+
+	return slotID, nil
+}
 
 // verify reports the slot pass opens.
 func (o *Ops) verify(ctx context.Context, pass []byte) (string, error) {
