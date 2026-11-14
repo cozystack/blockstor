@@ -20,6 +20,7 @@ package linstormigrate
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
@@ -388,19 +389,104 @@ func TestMissingDRBDPortReported(t *testing.T) {
 
 // TestParseDRBDPorts pins the port-file parser incl. rejection.
 func TestParseDRBDPorts(t *testing.T) {
-	ports, err := ParseDRBDPorts("# comment\nPVC-ABC 7001\n\npvc-def   7002\n")
+	ports, err := ParseDRBDPorts("# comment\nPVC-ABC 7001\n\npvc-def   7002\nPVC-GHI Node-A 7003\npvc-ghi node-b 7004\npvc-abc 7001\n")
 	if err != nil {
 		t.Fatalf("ParseDRBDPorts: %v", err)
 	}
 
-	if ports["pvc-abc"] != 7001 || ports["pvc-def"] != 7002 {
-		t.Errorf("parsed ports = %v", ports)
+	if ports.ByDefinition["pvc-abc"] != 7001 || ports.ByDefinition["pvc-def"] != 7002 {
+		t.Errorf("definition ports = %v", ports.ByDefinition)
 	}
 
-	for _, bad := range []string{"only-one-field", "rd 70000", "rd notaport", "rd 0"} {
-		if _, err := ParseDRBDPorts(bad); err == nil {
-			t.Errorf("ParseDRBDPorts(%q) accepted a malformed line", bad)
+	if ports.ByReplica["pvc-ghi"]["node-a"] != 7003 || ports.ByReplica["pvc-ghi"]["node-b"] != 7004 {
+		t.Errorf("replica ports = %v", ports.ByReplica)
+	}
+
+	for _, bad := range []string{"only-one-field", "rd 70000", "rd notaport", "rd 0", "rd node 0", "rd a b c"} {
+		if _, err := ParseDRBDPorts(bad); !errors.Is(err, ErrBadPortLine) {
+			t.Errorf("ParseDRBDPorts(%q) = %v, want ErrBadPortLine", bad, err)
 		}
+	}
+}
+
+// A definition-wide map that gives one definition two ports is what
+// concatenating the nodes' lists produces on a cluster whose nodes use
+// different ports for it. Keeping one of the values would give a
+// replica another node's port, so it is refused, and so is one replica
+// given two ports or a definition given in both forms.
+func TestParseDRBDPortsRefusesConflictingPorts(t *testing.T) {
+	for name, content := range map[string]string{
+		"one definition, two ports":     "pvc-x 7001\npvc-x 7002\n",
+		"one replica, two ports":        "pvc-x node-a 7001\npvc-x node-a 7002\n",
+		"definition-wide then per-node": "pvc-x 7001\npvc-x node-a 7001\n",
+		"per-node then definition-wide": "pvc-x node-a 7001\npvc-x 7001\n",
+	} {
+		if _, err := ParseDRBDPorts(content); !errors.Is(err, ErrConflictingPort) {
+			t.Errorf("%s: ParseDRBDPorts = %v, want ErrConflictingPort", name, err)
+		}
+	}
+}
+
+// Each replica gets the port of its own node when the map has one per
+// replica, and the definition carries a preferred port only when every
+// replica shares it.
+func TestEachReplicaKeepsItsOwnNodesPort(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		ReplicaDRBDPorts: map[string]map[string]int32{
+			"pvc-vol5": {"node-a": 7042, "node-b": 7051},
+			"pvc-vol1": {"node-a": 7099, "node-b": 7099},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	for name, want := range map[string]int32{"pvc-vol5.node-a": 7042, "pvc-vol5.node-b": 7051} {
+		if got := findResource(t, res, name).Spec.DRBDPort; got == nil || *got != want {
+			t.Errorf("%s DRBDPort = %v, want %d", name, got, want)
+		}
+	}
+
+	ports := map[string]*int32{}
+	for i := range res.ResourceDefinitions {
+		ports[res.ResourceDefinitions[i].Name] = res.ResourceDefinitions[i].Spec.DRBDPort
+	}
+
+	if ports["pvc-vol5"] != nil {
+		t.Errorf("pvc-vol5 DRBDPort = %v, want none: its replicas listen on different ports", *ports["pvc-vol5"])
+	}
+
+	if ports["pvc-vol1"] == nil || *ports["pvc-vol1"] != 7099 {
+		t.Errorf("pvc-vol1 DRBDPort = %v, want the shared 7099", ports["pvc-vol1"])
+	}
+}
+
+// A replica the per-replica map leaves out, while its peers are in it,
+// gets no preset port and is reported once.
+func TestAReplicaMissingFromThePerReplicaMapIsReported(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		ReplicaDRBDPorts: map[string]map[string]int32{"pvc-vol5": {"node-a": 7042}},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if got := findResource(t, res, "pvc-vol5.node-b").Spec.DRBDPort; got != nil {
+		t.Errorf("pvc-vol5.node-b DRBDPort = %d, want none", *got)
+	}
+
+	if !hasWarning(res, "pvc-vol5.node-b: the live map has ports for the other replicas") {
+		t.Errorf("missing replica port not reported; warnings %v", res.Warnings)
 	}
 }
 

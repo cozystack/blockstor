@@ -30,21 +30,19 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
    cd ..
    ```
 
-3. **Capture the live DRBD ports.** LINSTOR 1.33 does not persist the port in its database, so the dump alone cannot preserve it. If blockstor adopts with a different port, `drbdadm adjust` moves the connection endpoint under live I/O (a reconnect blip, and on a marginal quorum a transient quorum loss). Capture the running ports from every satellite and union them:
+3. **Capture the live DRBD ports.** LINSTOR 1.33 does not persist the port in its database, so the dump alone cannot preserve it, and it can give each node its own port for one definition. If blockstor adopts a replica with a port other than the one its node listens on, `drbdadm adjust` moves the connection endpoint under live I/O (a reconnect blip, and on a marginal quorum a transient quorum loss). Capture the port every replica listens on, from the kernel on every satellite:
 
    ```bash
    for pod in $(kubectl -n cozy-linstor get pods -l app.kubernetes.io/component=linstor-satellite \
                   -o jsonpath='{.items[*].metadata.name}'); do
-     kubectl -n cozy-linstor exec "$pod" -- sh -c '
-       for f in /var/lib/linstor.d/*.res; do
-         rd=$(basename "$f" .res)
-         port=$(grep -oE "address[^;]*:[0-9]+" "$f" | grep -oE "[0-9]+$" | head -1)
-         [ -n "$port" ] && echo "$rd $port"
-       done'
+     node=$(kubectl -n cozy-linstor get pod "$pod" -o jsonpath='{.spec.nodeName}')
+     kubectl -n cozy-linstor exec "$pod" -- drbdsetup show | awk -v node="$node" '
+       /^resource / { rd = $2; gsub(/"/, "", rd) }
+       /_this_host ipv4/ && rd != "" { n = split($3, a, ":"); port = a[n]; sub(/;$/, "", port); print rd, node, port; rd = "" }'
    done | sort -u > drbd-ports.txt
    ```
 
-   Every replica of an RD shares one port, so duplicates across nodes are expected; `sort -u` collapses them. If an RD appears with two different ports, stop and investigate before proceeding.
+   Each line is `<rd> <node> <port>`, so replicas of one definition on different ports keep their own. The node is the Kubernetes node the satellite runs on; if your LINSTOR node names differ from the Kubernetes ones, put the LINSTOR name there. The converter refuses a map that gives one replica two ports, and reports a replica it has no port for while it has its peers'. The older `<rd> <port>` form still works for a cluster where every replica of a definition shares one port, and is refused when one definition shows two ports.
 
 4. **Back up the ZFS/LVM pools' snapshots** (optional but recommended): a `zfs snapshot -r` of each pool gives an instant rollback point that is independent of both control planes.
 
