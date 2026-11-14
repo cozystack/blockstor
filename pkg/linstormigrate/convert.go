@@ -109,6 +109,12 @@ type Options struct {
 	// get nil DRBDPort and blockstor's allocator picks a fresh port
 	// (a controlled replication blip on adoption — see the runbook).
 	DRBDPorts map[string]int32
+	// ReplicaDRBDPorts maps a ResourceDefinition name and a node name
+	// (both lowercased) to the port that one replica listens on.
+	// LINSTOR 1.33 can give each node its own port for one
+	// definition; a definition here gives every one of its replicas
+	// the port of its own node, and takes precedence over DRBDPorts.
+	ReplicaDRBDPorts map[string]map[string]int32
 }
 
 // converter carries the indexes built once per Convert call.
@@ -1718,7 +1724,7 @@ func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
 
 func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row *ResourceDefinitionRow, dsp string) {
 	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
-		def.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, dsp)
+		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, drbd.TCPPort, dsp)
 
 		if drbd.Secret != "" {
 			if def.Spec.ExtraProps == nil {
@@ -1934,12 +1940,12 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 	}
 
 	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
-		// LINSTOR allocates one cluster-wide TCP port per RD; every
-		// replica listens on it. blockstor's per-replica allocator
-		// honours a preset value verbatim. The live port map (when
-		// supplied) wins over the dump's often-empty tcp_port so the
-		// adopted mesh keeps its current endpoint.
-		resource.Spec.DRBDPort = c.resolveDRBDPort(row.ResourceName, drbd.TCPPort, rdDsp)
+		// blockstor's per-replica allocator honours a preset value
+		// verbatim. The live port map (when supplied) wins over the
+		// dump's often-empty tcp_port so the adopted mesh keeps its
+		// current endpoint, and a per-replica entry gives each replica
+		// its own node's port.
+		resource.Spec.DRBDPort = c.resolveReplicaDRBDPort(row, drbd.TCPPort, rdDsp, nodeDsp)
 	}
 
 	return resource
@@ -2050,6 +2056,53 @@ func (c *converter) resolveDRBDPort(rdName string, dumpPort *int32, rdDsp string
 
 	c.warnOncef("drbdport:"+rdName,
 		"resource definition %s: no DRBD port in the dump or live map — blockstor will allocate a fresh port; the adopted mesh will reconnect on the new port. Capture live ports (see runbook) to avoid the blip.", rdDsp)
+
+	return nil
+}
+
+// resolveDefinitionDRBDPort is the preferred port preset on the
+// definition itself. With per-replica ports it is their port only when
+// every replica shares one; otherwise the definition gets none, and
+// each replica carries its own.
+func (c *converter) resolveDefinitionDRBDPort(rdName string, dumpPort *int32, rdDsp string) *int32 {
+	perReplica := c.opts.ReplicaDRBDPorts[strings.ToLower(rdName)]
+	if len(perReplica) == 0 {
+		return c.resolveDRBDPort(rdName, dumpPort, rdDsp)
+	}
+
+	var shared int32
+
+	for _, port := range perReplica {
+		if shared != 0 && port != shared {
+			return nil
+		}
+
+		shared = port
+	}
+
+	return ptr(shared)
+}
+
+// resolveReplicaDRBDPort picks the port one replica listens on: its own
+// line in the per-replica map when the definition has one, and the
+// definition-wide sources otherwise. A replica missing from a
+// definition the map does cover is reported: its peers keep their
+// ports, and it gets a fresh one and reconnects on adoption.
+func (c *converter) resolveReplicaDRBDPort(row *ResourceRow, dumpPort *int32, rdDsp, nodeDsp string) *int32 {
+	perReplica := c.opts.ReplicaDRBDPorts[strings.ToLower(row.ResourceName)]
+	if len(perReplica) == 0 {
+		return c.resolveDRBDPort(row.ResourceName, dumpPort, rdDsp)
+	}
+
+	for _, node := range []string{row.NodeName, nodeDsp} {
+		if port, ok := perReplica[strings.ToLower(node)]; ok {
+			return ptr(port)
+		}
+	}
+
+	c.warnOncef("drbdport:"+row.ResourceName+":"+row.NodeName,
+		"resource %s.%s: the live map has ports for the other replicas of %s but none for this one — blockstor will allocate a fresh port for it, and this replica will reconnect on adoption",
+		rdDsp, nodeDsp, rdDsp)
 
 	return nil
 }
