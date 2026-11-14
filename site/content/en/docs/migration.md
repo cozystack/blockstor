@@ -20,7 +20,6 @@ Converted:
 
 Not converted, and listed in the tool's report:
 
-- **LUKS passphrases.** Encrypted volumes convert with their layers intact, but blockstor cannot open them until you set up the passphrase by hand.
 - Backup shipping remotes, and replicas or snapshots that LINSTOR marked as deleted or failed.
 - Snapshots of definitions with more than one volume are adopted with their first volume only.
 
@@ -72,12 +71,14 @@ Not converted, and listed in the tool's report:
 
 ```sh
 go install github.com/cozystack/blockstor/cmd/linstor-migrate@v<VERSION>
-linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifests.yaml
+linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifests.yaml \
+  -linstor-passphrase-file /run/linstor-pass -keyring-out ./blockstor-keyring.yaml
 ```
+
+The last two flags are for a cluster with LUKS volumes. `/run/linstor-pass` holds the LINSTOR master passphrase byte for byte, the `MASTER_PASSPHRASE` of the Secret piraeus reads. The tool decrypts every volume's password the way LINSTOR does and wraps it under a new blockstor master key, written to `./blockstor-keyring.yaml` with the LINSTOR passphrase as its one slot. Keep the Secret: point `ControllerConfig.spec.passphraseSecretRef` at it and blockstor unlocks from it as LINSTOR did. A wrong passphrase stops the run before anything is written, and without it a dump with LUKS volumes is refused.
 
 Read the whole report it prints. Each `warning:` line is something the tool refused to guess. Resolve every one of these before you go on:
 
-- `LUKS passphrase NOT migrated`.
 - `keeps its DRBD metadata on a separate volume`, or `would put its DRBD metadata on a separate volume` for a replica the dump has no layer chain for. The definition is skipped with its replicas: blockstor keeps DRBD metadata on the data device, and adopted as it is the replica would get new metadata over the end of its data. Changing the property does not move existing metadata. For a replica without a chain, check in LINSTOR where its metadata is first. If it is on the data device, remove the property and convert again. Otherwise, copy the data to a volume with internal metadata in LINSTOR and convert that one.
 - `keep their DRBD metadata on the data device, though StorPoolNameDrbdMeta ... is set`. Nothing to do: the metadata is internal, because LINSTOR applies the property only to replicas created after it was set, and `.internal` asks for internal metadata. The definition converts, and the property is not carried over to the definition or its replicas, so blockstor does not look for a separate metadata volume.
 - `no DRBD port`.

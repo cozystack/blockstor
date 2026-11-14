@@ -69,7 +69,7 @@ func stackDump(rdStack string, chains ...[]LayerResourceIDRow) *Dump {
 func convertedStack(t *testing.T, dump *Dump) ([]string, *Result) {
 	t.Helper()
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}

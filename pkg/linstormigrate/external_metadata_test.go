@@ -377,7 +377,7 @@ func TestExternalMetadataSkipsOnlyItsOwnDefinition(t *testing.T) {
 				{NodeName: "NODE-A", ResourceName: "PVC-T", UUID: "r-t"},
 			}
 
-			res, err := Convert(dump)
+			res, err := convertForTest(t, dump)
 			if err != nil {
 				t.Fatalf("Convert: %v", err)
 			}
@@ -400,7 +400,7 @@ func convertTwoReplicas(t *testing.T, dump *Dump) *Result {
 		{NodeName: "NODE-B", ResourceName: "PVC-S", UUID: "r-b"},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}

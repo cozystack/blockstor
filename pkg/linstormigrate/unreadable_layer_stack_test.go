@@ -77,7 +77,7 @@ func TestAnUnreadableRDStackIsReportedOnce(t *testing.T) {
 				dump = withReplicas(dump)
 			}
 
-			res, err := Convert(dump)
+			res, err := convertForTest(t, dump)
 			if err != nil {
 				t.Fatalf("Convert: %v", err)
 			}
