@@ -220,7 +220,17 @@ func encryptionEnterPassphrase(ctx context.Context, run *runContext) error {
 
 // encryptionModifyPassphrase implements `encryption modify-passphrase`.
 func encryptionModifyPassphrase(ctx context.Context, run *runContext) error {
-	oldValue, newValue, err := twoPassphrases(run, "old-passphrase", "new-passphrase")
+	input, err := newSlotPassphrases(run, 0)
+	if err != nil {
+		return err
+	}
+
+	oldValue, err := input.read("old-passphrase", "Old passphrase: ")
+	if err != nil {
+		return err
+	}
+
+	newValue, err := input.read("new-passphrase", "New passphrase: ")
 	if err != nil {
 		return err
 	}
@@ -250,7 +260,17 @@ func encryptionAddPassphrase(ctx context.Context, run *runContext) error {
 		return fmt.Errorf("%w: --name is required", command.ErrUsage)
 	}
 
-	auth, newValue, err := twoPassphrases(run, "passphrase", "new-passphrase")
+	input, err := newSlotPassphrases(run, 0)
+	if err != nil {
+		return err
+	}
+
+	auth, err := input.read("passphrase", "Passphrase: ")
+	if err != nil {
+		return err
+	}
+
+	newValue, err := input.read("new-passphrase", "New passphrase: ")
 	if err != nil {
 		return err
 	}
@@ -270,8 +290,18 @@ func encryptionAddPassphrase(ctx context.Context, run *runContext) error {
 
 // encryptionRemovePassphrase implements `encryption remove-passphrase`.
 func encryptionRemovePassphrase(ctx context.Context, run *runContext) error {
-	if len(run.Flags.Positionals) == 0 || run.Flags.Positionals[0] == "" {
-		return fmt.Errorf("%w: name the slot to remove", command.ErrUsage)
+	if len(run.Flags.Positionals) != 1 || run.Flags.Positionals[0] == "" {
+		return fmt.Errorf("%w: name the slot to remove, and nothing else", command.ErrUsage)
+	}
+
+	input, err := newSlotPassphrases(run, 1)
+	if err != nil {
+		return err
+	}
+
+	auth, err := input.read("passphrase", "Passphrase of a slot that stays: ")
+	if err != nil {
+		return err
 	}
 
 	ops, err := encryptionOps(ctx, run)
@@ -279,7 +309,7 @@ func encryptionRemovePassphrase(ctx context.Context, run *runContext) error {
 		return err
 	}
 
-	err = ops.Remove(ctx, run.Flags.Positionals[0])
+	err = ops.Remove(ctx, []byte(auth), run.Flags.Positionals[0])
 	if err != nil {
 		return passphraseVerbError("cannot remove the passphrase", err)
 	}
@@ -325,25 +355,87 @@ func encryptionListPassphrases(ctx context.Context, run *runContext) error {
 	return nil
 }
 
-// twoPassphrases reads two passphrases from their flags, or from the first
-// two positionals.
-func twoPassphrases(run *runContext, firstFlag, secondFlag string) (string, string, error) {
-	first, second := run.Flags.Values[firstFlag], run.Flags.Values[secondFlag]
+// slotPassphrases reads the passphrases of the blockstor-only slot verbs:
+// from `--<name>-file`, or else from the terminal, or else one per line
+// from stdin. Never from argv, where they would land in shell history and
+// in /proc/<pid>/cmdline.
+type slotPassphrases struct {
+	run   *runContext
+	lines *bufio.Reader
+}
 
-	positionals := run.Flags.Positionals
-	if first == "" && len(positionals) > 0 {
-		first, positionals = positionals[0], positionals[1:]
+var errPassphraseOnArgv = errors.New(
+	"passphrases of this command are read from a file, the terminal or stdin, never from the command line")
+
+func newSlotPassphrases(run *runContext, positionals int) (*slotPassphrases, error) {
+	if run.Flags.Values["passphrase"] != "" || run.Flags.Values["p-value"] != "" || len(run.Flags.Positionals) > positionals {
+		return nil, fmt.Errorf("%w: %w", command.ErrUsage, errPassphraseOnArgv)
 	}
 
-	if second == "" && len(positionals) > 0 {
-		second = positionals[0]
+	in := run.In
+	if in == nil {
+		in = os.Stdin
 	}
 
-	if first == "" || second == "" {
-		return "", "", fmt.Errorf("%w: give --%s and --%s", command.ErrUsage, firstFlag, secondFlag)
+	return &slotPassphrases{run: run, lines: bufio.NewReader(in)}, nil
+}
+
+func (p *slotPassphrases) read(name, prompt string) (string, error) {
+	var (
+		value string
+		err   error
+	)
+
+	switch path := p.run.Flags.Values[name+"-file"]; {
+	case path != "":
+		var data []byte
+
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read --%s-file: %w", name, err)
+		}
+
+		value = strings.TrimRight(string(data), "\r\n")
+	default:
+		value, err = p.prompt(prompt)
+		if err != nil {
+			return "", err
+		}
 	}
 
-	return first, second, nil
+	if value == "" {
+		return "", fmt.Errorf("%w: the %s may not be empty", command.ErrUsage, strings.ReplaceAll(name, "-", " "))
+	}
+
+	return value, nil
+}
+
+func (p *slotPassphrases) prompt(prompt string) (string, error) {
+	in := p.run.In
+	if in == nil {
+		in = os.Stdin
+	}
+
+	if fd, ok := terminalFd(in); ok {
+		fmt.Fprint(p.run.Err, prompt)
+
+		typed, err := term.ReadPassword(fd)
+
+		fmt.Fprintln(p.run.Err)
+
+		if err != nil {
+			return "", fmt.Errorf("read passphrase: %w", err)
+		}
+
+		return string(typed), nil
+	}
+
+	line, err := p.lines.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("read passphrase: %w", err)
+	}
+
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
 func passphraseVerbError(what string, err error) error {

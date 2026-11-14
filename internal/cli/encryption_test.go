@@ -21,6 +21,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -225,25 +226,30 @@ func TestEncryptionWithoutKubeAccess(t *testing.T) {
 	}
 }
 
-// The slot verbs: add a recovery passphrase, list the slots, change and
-// remove one; each passphrase opens exactly while its slot is there.
+// The slot verbs read their passphrases from stdin or a file, never argv:
+// add a recovery passphrase, list the slots, change and remove one; each
+// passphrase opens exactly while its slot is there.
 func TestEncryptionSlotVerbs(t *testing.T) {
 	t.Parallel()
 
 	app, client, errBuf := newKubeApp(t)
 
-	run := func(want bool, argv ...string) {
+	run := func(want bool, stdin string, argv ...string) {
 		t.Helper()
+
+		app.In = strings.NewReader(stdin)
 
 		if got := app.Run(t.Context(), argv) == 0; got != want {
 			t.Fatalf("%v: success %v, want %v (stderr: %s)", argv, got, want, errBuf.String())
 		}
 	}
 
-	run(true, "encryption", "create-passphrase", "-p", "first")
-	run(false, "encryption", "add-passphrase", "--name", "recovery", "wrong", "second")
-	run(false, "encryption", "add-passphrase", "first", "second")
-	run(true, "encryption", "add-passphrase", "--name", "recovery", "first", "second")
+	run(true, "", "encryption", "create-passphrase", "-p", "first")
+	run(false, "wrong\nsecond\n", "encryption", "add-passphrase", "--name", "recovery")
+	run(false, "first\nsecond\n", "encryption", "add-passphrase")
+	run(false, "first\nsecond\n", "encryption", "add-passphrase", "--name", "recovery", "first", "second")
+	run(false, "first\nsecond\n", "encryption", "add-passphrase", "--name", "recovery", "--passphrase", "first")
+	run(true, "first\nsecond\n", "encryption", "add-passphrase", "--name", "recovery")
 
 	if !keyringOpens(t, client, "second") {
 		t.Fatal("the added passphrase does not open")
@@ -253,21 +259,34 @@ func TestEncryptionSlotVerbs(t *testing.T) {
 
 	app.Out = &out
 
-	run(true, "encryption", "list-passphrases")
+	run(true, "", "encryption", "list-passphrases")
 
 	listed := out.String()
 	if !strings.Contains(listed, "encryption: unlocked") || !strings.Contains(listed, "recovery") || !strings.Contains(listed, " unlocks") {
 		t.Fatalf("list:\n%s", listed)
 	}
 
-	run(true, "encryption", "modify-passphrase", "--old-passphrase", "second", "--new-passphrase", "third")
+	dir := t.TempDir()
+	oldFile, newFile := dir+"/old", dir+"/new"
+
+	if err := os.WriteFile(oldFile, []byte("second\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := os.WriteFile(newFile, []byte("third"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	run(false, "second\nthird\n", "encryption", "modify-passphrase", "second", "third")
+	run(true, "", "encryption", "modify-passphrase", "--old-passphrase-file", oldFile, "--new-passphrase-file", newFile)
 
 	if keyringOpens(t, client, "second") || !keyringOpens(t, client, "third") {
 		t.Fatal("modify did not replace the slot")
 	}
 
-	run(false, "encryption", "remove-passphrase", "generated")
-	run(true, "encryption", "remove-passphrase", "recovery")
+	run(false, "first\n", "encryption", "remove-passphrase", "generated")
+	run(false, "third\n", "encryption", "remove-passphrase", "recovery")
+	run(true, "first\n", "encryption", "remove-passphrase", "recovery")
 
 	if keyringOpens(t, client, "third") {
 		t.Fatal("the removed passphrase still opens")

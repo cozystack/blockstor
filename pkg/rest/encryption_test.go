@@ -732,15 +732,29 @@ func TestPassphraseSlotVerbs(t *testing.T) {
 		t.Fatalf("no slot marked as the unlock slot: %s", raw)
 	}
 
-	if got := callEncryption(t, http.MethodDelete, url+"/"+unlock, nil); got != http.StatusConflict {
+	auth := map[string]string{"passphrase": "v1"}
+
+	if got := callEncryption(t, http.MethodDelete, url+"/"+unlock, auth); got != http.StatusConflict {
 		t.Errorf("remove the unlock slot: %d, want 409", got)
 	}
 
-	if got := callEncryption(t, http.MethodDelete, url+"/nope", nil); got != http.StatusNotFound {
+	if got := callEncryption(t, http.MethodDelete, url+"/nope", auth); got != http.StatusNotFound {
 		t.Errorf("remove a slot that is not there: %d, want 404", got)
 	}
 
-	if got := callEncryption(t, http.MethodDelete, url+"/recovery", nil); got != http.StatusOK {
+	if got := callEncryption(t, http.MethodDelete, url+"/recovery", map[string]string{}); got != http.StatusBadRequest {
+		t.Errorf("remove without a passphrase: %d, want 400", got)
+	}
+
+	if got := callEncryption(t, http.MethodDelete, url+"/recovery", map[string]string{"passphrase": "wrong"}); got != http.StatusUnauthorized {
+		t.Errorf("remove with a wrong passphrase: %d, want 401", got)
+	}
+
+	if got := callEncryption(t, http.MethodDelete, url+"/recovery", map[string]string{"passphrase": "r"}); got != http.StatusConflict {
+		t.Errorf("remove authorised by the slot itself: %d, want 409", got)
+	}
+
+	if got := callEncryption(t, http.MethodDelete, url+"/recovery", auth); got != http.StatusOK {
 		t.Errorf("remove by name: %d, want 200", got)
 	}
 

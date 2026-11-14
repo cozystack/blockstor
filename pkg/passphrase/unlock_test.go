@@ -19,6 +19,7 @@ limitations under the License.
 package passphrase_test
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -466,12 +467,12 @@ func TestChangingTheSecretsPassphraseNeverLocks(t *testing.T) {
 		t.Fatal("locked after the Secret moved to the added passphrase")
 	}
 
-	err = ops.Remove(t.Context(), "next")
+	err = ops.Remove(t.Context(), []byte("one"), "next")
 	if !errors.Is(err, passphrase.ErrUnlockSlot) {
 		t.Fatalf("removing the slot the Secret opens: %v, want ErrUnlockSlot", err)
 	}
 
-	err = ops.Remove(t.Context(), passphrase.SlotNameSecret)
+	err = ops.Remove(t.Context(), []byte("two"), passphrase.SlotNameSecret)
 	if err != nil || stateOf(t, ops).State != passphrase.StateUnlocked {
 		t.Fatalf("after removing the old slot: %v", err)
 	}
@@ -551,5 +552,94 @@ func TestCreateRefusesALostKeyring(t *testing.T) {
 	ring, _, err := ops.Secrets.Keyring(t.Context())
 	if err != nil || ring != nil {
 		t.Fatalf("a keyring was created: %v", err)
+	}
+}
+
+// The review's reproducer: on a cluster locked out of its generated
+// unlock Secret, removing the operator's slot would leave only the
+// generated one, which nothing opens any more. Remove refuses on a locked
+// cluster, refuses the last slot a human holds even when unlocked, and
+// needs a passphrase that stays.
+func TestRemoveNeverStrandsTheMasterKey(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).Build()
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	_, err := ops.Create(t.Context(), []byte("operator-pass"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var unlock corev1.Secret
+
+	err = cli.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: passphrase.UnlockSecretName}, &unlock)
+	if err != nil {
+		t.Fatalf("get the unlock Secret: %v", err)
+	}
+
+	generated := bytes.Clone(unlock.Data[passphrase.DefaultPassphraseKey])
+
+	err = ops.Remove(t.Context(), generated, passphrase.SlotNameOperator)
+	if !errors.Is(err, passphrase.ErrLastHumanSlot) {
+		t.Fatalf("unlocked, removing the only human slot: %v, want ErrLastHumanSlot", err)
+	}
+
+	err = cli.Delete(t.Context(), &unlock)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	err = ops.Remove(t.Context(), generated, passphrase.SlotNameOperator)
+	if !errors.Is(err, passphrase.ErrLocked) {
+		t.Fatalf("locked: %v, want ErrLocked", err)
+	}
+
+	if _, err := ops.Enter(t.Context(), []byte("operator-pass")); err != nil {
+		t.Fatalf("the operator's passphrase no longer opens: %v", err)
+	}
+}
+
+// Remove needs a passphrase of a slot that stays: not a wrong one, not
+// the one being removed.
+func TestRemoveIsAuthorisedByARemainingPassphrase(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).Build()
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	_, err := ops.Create(t.Context(), []byte("operator-pass"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	_, err = ops.Add(t.Context(), []byte("operator-pass"), []byte("recovery-pass"), "recovery")
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	err = ops.Remove(t.Context(), []byte("wrong"), "recovery")
+	if !errors.Is(err, keyring.ErrWrongPassphrase) {
+		t.Errorf("wrong passphrase: %v", err)
+	}
+
+	err = ops.Remove(t.Context(), []byte("recovery-pass"), "recovery")
+	if !errors.Is(err, passphrase.ErrRemoveSelf) {
+		t.Errorf("authorised by itself: %v", err)
+	}
+
+	err = ops.Remove(t.Context(), []byte("operator-pass"), "nope")
+	if !errors.Is(err, keyring.ErrSlotNotFound) {
+		t.Errorf("unknown slot: %v", err)
+	}
+
+	err = ops.Remove(t.Context(), []byte("operator-pass"), "recovery")
+	if err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	err = ops.Remove(t.Context(), []byte("operator-pass"), passphrase.SlotNameGenerated)
+	if !errors.Is(err, passphrase.ErrUnlockSlot) {
+		t.Errorf("the generated unlock slot: %v", err)
 	}
 }

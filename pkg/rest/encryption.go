@@ -418,6 +418,12 @@ func (s *Server) handlePassphraseAdd(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
+// passphraseRemoveRequest is the body of `DELETE
+// /v1/encryption/passphrases/{slot}`: a passphrase of another slot.
+type passphraseRemoveRequest struct {
+	Passphrase string `json:"passphrase"`
+}
+
 func (s *Server) handlePassphraseRemove(w http.ResponseWriter, r *http.Request) {
 	ops, err := s.passphraseOps()
 	if err != nil {
@@ -429,9 +435,21 @@ func (s *Server) handlePassphraseRemove(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
 
+	var req passphraseRemoveRequest
+
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.Passphrase == "" {
+		writeError(w, http.StatusBadRequest, "passphrase is required: a passphrase that stays authorises the removal")
+
+		return
+	}
+
 	slot := r.PathValue("slot")
 
-	err = ops.Remove(ctx, slot)
+	err = ops.Remove(ctx, []byte(req.Passphrase), slot)
 	if writePassphraseError(w, err) {
 		return
 	}
@@ -458,6 +476,7 @@ func writePassphraseError(w http.ResponseWriter, err error) bool {
 	case errors.Is(err, keyring.ErrSlotNotFound):
 		status = http.StatusNotFound
 	case errors.Is(err, passphrase.ErrUnlockSlot), errors.Is(err, keyring.ErrLastSlot),
+		errors.Is(err, passphrase.ErrLocked), errors.Is(err, passphrase.ErrLastHumanSlot), errors.Is(err, passphrase.ErrRemoveSelf),
 		errors.Is(err, keyring.ErrDuplicateName), errors.Is(err, keyring.ErrTooManySlots):
 		status = http.StatusConflict
 	}

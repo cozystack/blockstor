@@ -70,6 +70,18 @@ var (
 	// ErrUnlockSlot is a change that would leave the cluster unable to
 	// unlock from its passphrase Secret.
 	ErrUnlockSlot = errors.New("the slot is the one the cluster unlocks with")
+
+	// ErrLocked is a slot removal on a cluster whose passphrase Secret
+	// opens no slot.
+	ErrLocked = errors.New("the cluster is locked")
+
+	// ErrLastHumanSlot is a removal that would leave only the generated
+	// slot, whose passphrase nobody holds outside its Secret.
+	ErrLastHumanSlot = errors.New("refusing to remove the last passphrase that did not come from blockstor")
+
+	// ErrRemoveSelf is a removal authorised by the passphrase being
+	// removed.
+	ErrRemoveSelf = errors.New("authorise the removal with a passphrase that stays")
 )
 
 // Ops runs the passphrase operations of `linstor encryption` and
@@ -345,26 +357,68 @@ func (o *Ops) Add(ctx context.Context, auth, newPass []byte, name string) (strin
 	return slotID, err
 }
 
-// Remove removes the slot ref names, by ID or name. It refuses the last
-// slot and the slot the cluster unlocks with.
-func (o *Ops) Remove(ctx context.Context, ref string) error {
+// Remove removes the slot ref names, by ID or name, authorised by auth,
+// which must open one of the slots that stay. It refuses on a cluster that
+// is not unlocked, where it cannot tell which slot the cluster depends on;
+// it refuses the slot the cluster unlocks with, and the last slot whose
+// passphrase came from outside blockstor: the generated slot alone is one
+// deleted Secret away from losing every volume.
+func (o *Ops) Remove(ctx context.Context, auth []byte, ref string) error {
 	status, err := (&Unlocker{Secrets: o.Secrets}).Unlock(ctx)
 	if err != nil {
 		return err
 	}
 
-	if status.State == StateUnset {
+	switch status.State {
+	case StateUnset:
 		return ErrNoKeyring
+	case StateLocked:
+		return errors.Wrapf(ErrLocked, "the passphrase Secret %s opens no slot; fix it before removing one", status.Ref.Name)
+	case StateUnlocked:
 	}
 
 	return o.mutate(ctx, func(ring *keyring.Keyring) error {
-		err := ring.RemoveSlot(ref, status.SlotID)
+		idx := ring.SlotIndex(ref)
+		if idx < 0 {
+			return errors.Wrapf(keyring.ErrSlotNotFound, "%q", ref)
+		}
+
+		target := ring.Slots[idx]
+
+		authSlot, err := ring.Opens(auth)
+		if err != nil {
+			return err //nolint:wrapcheck // keyring.ErrWrongPassphrase, said as it is
+		}
+
+		if authSlot == target.ID {
+			return errors.Wrapf(ErrRemoveSelf, "%q", ref)
+		}
+
+		if target.Origin != keyring.OriginGenerated && countHumanSlots(ring) == 1 {
+			return errors.Wrapf(ErrLastHumanSlot, "%q", ref)
+		}
+
+		err = ring.RemoveSlot(target.ID, status.SlotID)
 		if errors.Is(err, keyring.ErrProtectedSlot) {
 			return errors.Wrapf(ErrUnlockSlot, "%q is opened by the passphrase Secret %s", ref, status.Ref.Name)
 		}
 
 		return err //nolint:wrapcheck // keyring errors name the slot
 	})
+}
+
+// countHumanSlots counts the slots whose passphrase came from outside
+// blockstor: the Secret's and those given through the API.
+func countHumanSlots(ring *keyring.Keyring) int {
+	n := 0
+
+	for i := range ring.Slots {
+		if ring.Slots[i].Origin != keyring.OriginGenerated {
+			n++
+		}
+	}
+
+	return n
 }
 
 // SlotInfo describes one slot, without key material.
