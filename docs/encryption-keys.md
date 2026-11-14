@@ -483,3 +483,23 @@ Between PR 3 and PR 4, `create-passphrase` over REST answers 409 under a referen
 | D9 | LUKS header KDF for generated passwords | PBKDF2 at minimal cost; can be deferred |
 | D10 | Clone password | Same as the source in stage 1 |
 | D11 | PR #192 | Keep its comment fixes and Condition, drop its guard, replace its design note |
+
+### Implementation notes
+
+Found while implementing stage 1; each is either a place the design was underspecified or a choice the code makes that the sections above do not.
+
+- **Restore copies the password on the satellite, not in the REST handlers (section 10).** A restore target is placed from several doors (the eager stamp, autoplace for a bare restore, a CSI-prepared target, clone), and the bytes on a node may come from that node's snapshot or, through the snapshot stream, from a peer's. Only the satellite knows which. A replica with no `luksKey` and a LUKS header, restored from `<rd>:<snap>`, tries every password the snapshot recorded for that volume, its own node's first, with `cryptsetup luksOpen --test-passphrase`, stores the one that opens, and then opens. A blank restore target (no header) gets a fresh password like any new volume.
+- **`luksKey` is set-once, not only "not removable" (section 4.3).** The CEL rule refuses a change as well as a removal: an overwritten password loses the data as surely as a removed one. The optional re-key (PR 6) has to relax the rule for its own two-phase write.
+- **The snapshot copy happens at Snapshot create, in the store.** A replica formatted between the Snapshot CR's create and the take is not covered; its restore fails closed with `LUKSKeyMissing`. `luksKeys` entries also carry `origin`, so a restored replica keeps it.
+- **Refusals are Warning Events on the Resource, not conditions (sections 6.1 and 8).** The satellite has no apply-failure condition to extend; it already reports `LUKSDeviceHoldsData` as an Event. `LUKSKeyMissing`, `LUKSKeyMismatch`, `MasterKeyMismatch` and `MasterKeyLocked` follow it. The controller only logs a failed bootstrap (`ErrKeyringLost`); there is no ControllerConfig condition yet.
+- **Argon2id bounds.** A slot below the parameters blockstor writes (3, 64 MiB, 4) or above the ceilings (16, 1 GiB, 16) is refused as malformed before Argon2id runs. Raising the defaults later is a slot-by-slot change; lowering them needs a format version.
+- **Unlock stops at the first slot that opens.** The time of a successful unlock tells the caller the slot's position, not anything about the passphrase; every failure is the same error after trying every slot.
+- **The cached master key is dropped, not cleared, when either Secret changes.** A reconcile may still hold the previous key; it is garbage once nothing references it.
+- **`remove-passphrase` takes no passphrase.** The REST API is behind mutual TLS and the CLI already has write access to the keyring Secret; the last slot and the unlock slot are refused either way.
+- **`create-passphrase` under a named Secret with no keyring yet answers 409** and says which Secret and key to fill: the controller creates the keyring from it. With a keyring that the given passphrase opens it answers 200, as upstream does for a repeat.
+- **The LUKS create gate refuses only `unset`.** A locked keyring lets the definition be created; its replicas wait, as under LINSTOR.
+- **`enter-passphrase` repairs a cluster on the generated unlock Secret** by dropping every `generated` slot and adding a fresh one with a new Secret.
+- **`-keyring-in` takes the raw `keyring.json`**, the data key of the `blockstor-master-key` Secret, not the Secret manifest.
+- **The cozystack chart is not in this repository.** It has to follow the RBAC here: the satellite's Secret access becomes a namespaced `get`, the controller needs `get`, `create`, `update` on Secrets in its namespace, the apiserver `get`, `create`, `update`, and the chart value for the passphrase Secret's name renders into `ControllerConfig.spec.passphraseSecretRef`.
+- **`ResourceDefinition.spec.encryption.passphraseSecretRef`'s field comment still says key `passphrase`.** The field is unwired and reserved for stage 2; the comment is left to that change.
+- **Not exercised here:** the root-only cryptsetup compatibility test (a LINSTOR-formatted header opened with `--key-file -`), the e2e cases of section 14, a vector from a live LINSTOR controller (non-ASCII passphrase, `/CTRLCFG` dump, CFB segment size), and the #192 triage.
