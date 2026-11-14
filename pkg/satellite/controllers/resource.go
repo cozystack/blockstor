@@ -610,9 +610,17 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 
 		logger.Info("Apply per-resource failure", "name", result.GetName(), "message", result.GetMessage())
 
-		if r.Config.Recorder != nil && strings.Contains(result.GetMessage(), luks.ErrDeviceHoldsData.Error()) {
-			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, deviceHoldsDataReason, "Apply",
-				"the LUKS layer refused to format a device that already holds data: %s", result.GetMessage())
+		if r.Config.Recorder == nil {
+			continue
+		}
+
+		for _, refusal := range luksRefusals() {
+			if strings.Contains(result.GetMessage(), refusal.err.Error()) {
+				r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, refusal.reason, "Apply",
+					"%s: %s", refusal.what, result.GetMessage())
+
+				break
+			}
 		}
 	}
 
@@ -622,6 +630,26 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 // deviceHoldsDataReason is the Event reason for a LUKS format refused over
 // a device that carries a signature.
 const deviceHoldsDataReason = "LUKSDeviceHoldsData"
+
+// luksRefusal is a LUKS layer refusal an operator must act on, and the
+// Warning Event reason it is reported under.
+type luksRefusal struct {
+	err          error
+	reason, what string
+}
+
+// luksRefusals lists the refusals the LUKS layer reports through the apply
+// message. Each leaves the volume down, and an Info line in this log is
+// not where an operator looks for why.
+func luksRefusals() []luksRefusal {
+	return []luksRefusal{
+		{luks.ErrDeviceHoldsData, deviceHoldsDataReason, "the LUKS layer refused to format a device that already holds data"},
+		{luks.ErrLUKSKeyMissing, "LUKSKeyMissing", "the device has a LUKS header but the replica carries no password for it"},
+		{luks.ErrLUKSKeyMismatch, "LUKSKeyMismatch", "the replica's password does not open the device's LUKS header"},
+		{luks.ErrMasterKeyMismatch, "MasterKeyMismatch", "the replica's password is wrapped under another master key"},
+		{luks.ErrMasterKeyLocked, "MasterKeyLocked", "the master key is locked"},
+	}
+}
 
 // stampPostApply runs the four best-effort post-apply stamps:
 // Status.Volumes (per-volume DevicePath), the stale-Status.Volumes
@@ -1137,13 +1165,9 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 		return nil, errors.Wrap(err, "resolve effective props")
 	}
 
-	// Bug 023: the master passphrase lives only in the encryption
-	// Secret (`linstor encryption create-passphrase`). Drop any
-	// passphrase property from the bag and fold the Secret's value in
-	// under the canonical DrbdOptions/EncryptPassphrase key, so
-	// BuildDesired lifts it onto the `LuksPassphrase` wire prop. See
-	// luks_passphrase.go.
-	r.injectLUKSMasterPassphrase(ctx, rd, effectiveProps)
+	// A passphrase property never reaches the apply chain: each LUKS
+	// volume's password is its own (luks_keys.go).
+	dropPlaintextPassphraseProps(ctx, rd, effectiveProps)
 
 	desired := dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps)
 

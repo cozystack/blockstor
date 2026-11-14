@@ -1,0 +1,411 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package passphrase_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/keyring"
+	"github.com/cozystack/blockstor/pkg/passphrase"
+)
+
+const ns = "blockstor-system"
+
+func scheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+
+	s := runtime.NewScheme()
+
+	err := corev1.AddToScheme(s)
+	if err == nil {
+		err = blockstoriov1alpha1.AddToScheme(s)
+	}
+
+	if err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	return s
+}
+
+func refConfig(name, key string) *blockstoriov1alpha1.ControllerConfig {
+	return &blockstoriov1alpha1.ControllerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+		Spec: blockstoriov1alpha1.ControllerConfigSpec{
+			PassphraseSecretRef: &blockstoriov1alpha1.PassphraseSecretRef{Name: name, Key: key},
+		},
+	}
+}
+
+func passSecret(name, key, value string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Data:       map[string][]byte{key: []byte(value)},
+	}
+}
+
+func keyringSecret(t *testing.T, ring *keyring.Keyring) *corev1.Secret {
+	t.Helper()
+
+	data, err := ring.Marshal()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: passphrase.KeyringSecretName, Namespace: ns},
+		Type:       passphrase.KeyringSecretType,
+		Data:       map[string][]byte{passphrase.KeyringDataKey: data},
+	}
+}
+
+func newRing(t *testing.T, pass string) (*keyring.Keyring, *keyring.MasterKey) {
+	t.Helper()
+
+	ring, key, err := keyring.New([]byte(pass), passphrase.SlotNameSecret, keyring.OriginSecret, time.Now())
+	if err != nil {
+		t.Fatalf("keyring.New: %v", err)
+	}
+
+	return ring, key
+}
+
+func TestResolveRef(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		objs []client.Object
+		want passphrase.Ref
+	}{
+		"no config": {want: passphrase.Ref{Name: passphrase.UnlockSecretName, Key: "MASTER_PASSPHRASE", Generated: true}},
+		"no ref": {
+			objs: []client.Object{&blockstoriov1alpha1.ControllerConfig{ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName}}},
+			want: passphrase.Ref{Name: passphrase.UnlockSecretName, Key: "MASTER_PASSPHRASE", Generated: true},
+		},
+		"default key": {
+			objs: []client.Object{refConfig("linstor-passphrase", "")},
+			want: passphrase.Ref{Name: "linstor-passphrase", Key: "MASTER_PASSPHRASE"},
+		},
+		"own key": {
+			objs: []client.Object{refConfig("linstor-passphrase", "pass")},
+			want: passphrase.Ref{Name: "linstor-passphrase", Key: "pass"},
+		},
+	}
+
+	for name, tc := range cases {
+		cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.objs...).Build()
+
+		got, err := passphrase.ResolveRef(t.Context(), cli)
+		if err != nil || got != tc.want {
+			t.Errorf("%s: %+v, %v; want %+v", name, got, err, tc.want)
+		}
+	}
+}
+
+// The Secret's bytes are the passphrase verbatim: a trailing newline is
+// part of it, as it is for LINSTOR.
+func TestPassphraseIsVerbatim(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(passSecret("p", "MASTER_PASSPHRASE", "hunter2\n")).Build()
+	secrets := passphrase.Secrets{Reader: cli, Namespace: ns}
+
+	got, _, err := secrets.Passphrase(t.Context(), passphrase.Ref{Name: "p", Key: "MASTER_PASSPHRASE"})
+	if err != nil || string(got) != "hunter2\n" {
+		t.Fatalf("%q, %v", got, err)
+	}
+
+	for _, ref := range []passphrase.Ref{{Name: "absent", Key: "MASTER_PASSPHRASE"}, {Name: "p", Key: "other"}} {
+		got, _, err = secrets.Passphrase(t.Context(), ref)
+		if err != nil || got != nil {
+			t.Errorf("%+v: %q, %v; want nothing", ref, got, err)
+		}
+	}
+}
+
+// No keyring is unset; a keyring the Secret does not open, or no Secret,
+// is locked; the Secret's passphrase opens it.
+func TestUnlockStates(t *testing.T) {
+	t.Parallel()
+
+	ring, master := newRing(t, "right")
+
+	cases := map[string]struct {
+		objs  []client.Object
+		state passphrase.State
+	}{
+		"no keyring": {objs: []client.Object{refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "right")}, state: passphrase.StateUnset},
+		"no secret":  {objs: []client.Object{refConfig("p", ""), keyringSecret(t, ring)}, state: passphrase.StateLocked},
+		"wrong": {
+			objs:  []client.Object{refConfig("p", ""), keyringSecret(t, ring), passSecret("p", "MASTER_PASSPHRASE", "wrong")},
+			state: passphrase.StateLocked,
+		},
+		"newline": {
+			objs:  []client.Object{refConfig("p", ""), keyringSecret(t, ring), passSecret("p", "MASTER_PASSPHRASE", "right\n")},
+			state: passphrase.StateLocked,
+		},
+		"right": {
+			objs:  []client.Object{refConfig("p", ""), keyringSecret(t, ring), passSecret("p", "MASTER_PASSPHRASE", "right")},
+			state: passphrase.StateUnlocked,
+		},
+		"generated": {
+			objs:  []client.Object{keyringSecret(t, ring), passSecret(passphrase.UnlockSecretName, "MASTER_PASSPHRASE", "right")},
+			state: passphrase.StateUnlocked,
+		},
+	}
+
+	for name, tc := range cases {
+		cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.objs...).Build()
+		unlocker := &passphrase.Unlocker{Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+		status, err := unlocker.Unlock(t.Context())
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+
+		if status.State != tc.state {
+			t.Errorf("%s: state %s, want %s", name, status.State, tc.state)
+		}
+
+		if (status.Key != nil) != (tc.state == passphrase.StateUnlocked) {
+			t.Errorf("%s: key %v in state %s", name, status.Key != nil, status.State)
+		}
+
+		if status.Key != nil && status.Key.KeyID() != master.KeyID() {
+			t.Errorf("%s: unlocked another key", name)
+		}
+	}
+}
+
+// A keyring that does not parse is an error, not a locked cluster.
+func TestUnlockReportsAMalformedKeyring(t *testing.T) {
+	t.Parallel()
+
+	bad := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: passphrase.KeyringSecretName, Namespace: ns},
+		Data:       map[string][]byte{passphrase.KeyringDataKey: []byte(`{"version":1}`)},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(bad, passSecret(passphrase.UnlockSecretName, "MASTER_PASSPHRASE", "x")).Build()
+
+	_, err := (&passphrase.Unlocker{Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}).Unlock(t.Context())
+	if !errors.Is(err, keyring.ErrMalformed) {
+		t.Fatalf("err %v, want ErrMalformed", err)
+	}
+}
+
+// The outcome is remembered while neither Secret changes, a failed one
+// too, so reconciles do not run Argon2id each time; a changed Secret is
+// looked at again.
+func TestUnlockIsCachedPerSecretVersion(t *testing.T) {
+	t.Parallel()
+
+	ring, _ := newRing(t, "right")
+	pass := passSecret("p", "MASTER_PASSPHRASE", "wrong")
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(refConfig("p", ""), keyringSecret(t, ring), pass).Build()
+	unlocker := &passphrase.Unlocker{Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	for range 3 {
+		status, err := unlocker.Unlock(t.Context())
+		if err != nil || status.State != passphrase.StateLocked {
+			t.Fatalf("%s, %v", status.State, err)
+		}
+	}
+
+	if got := passphrase.UnlockAttempts(unlocker); got != 1 {
+		t.Fatalf("%d attempts for one pair of Secret versions, want 1", got)
+	}
+
+	first, _ := unlocker.Unlock(t.Context())
+
+	var cur corev1.Secret
+
+	err := cli.Get(t.Context(), client.ObjectKeyFromObject(pass), &cur)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	cur.Data["MASTER_PASSPHRASE"] = []byte("right")
+
+	err = cli.Update(t.Context(), &cur)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	second, err := unlocker.Unlock(t.Context())
+	if err != nil || first.State != passphrase.StateLocked || second.State != passphrase.StateUnlocked {
+		t.Fatalf("before %s, after %s, %v; want locked then unlocked", first.State, second.State, err)
+	}
+
+	third, err := unlocker.Unlock(t.Context())
+	if err != nil || third.Key != second.Key || passphrase.UnlockAttempts(unlocker) != 2 {
+		t.Fatal("an unchanged pair of Secrets unlocked again")
+	}
+}
+
+// countingKeyringCreates fails the test on any write to a Secret but the
+// keyring, and counts the keyring creates.
+func countingKeyringCreates(t *testing.T, creates *int, objs ...client.Object) client.Client {
+	t.Helper()
+
+	refuse := func(obj client.Object) error {
+		if _, ok := obj.(*corev1.Secret); ok && obj.GetName() != passphrase.KeyringSecretName {
+			t.Errorf("wrote Secret %s", obj.GetName())
+		}
+
+		return nil
+	}
+
+	return fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).WithInterceptorFuncs(interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			_ = refuse(obj)
+
+			if obj.GetName() == passphrase.KeyringSecretName {
+				*creates++
+			}
+
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			_ = refuse(obj)
+
+			return c.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			_ = refuse(obj)
+
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			_ = refuse(obj)
+
+			return c.Delete(ctx, obj, opts...)
+		},
+	}).Build()
+}
+
+// The first start with a piraeus-shaped Secret and no keyring creates one
+// whose only slot, `secret`, the Secret's passphrase opens. The passphrase
+// Secret is never written.
+func TestBootstrapCreatesTheKeyringFromTheSecret(t *testing.T) {
+	t.Parallel()
+
+	var creates int
+
+	cli := countingKeyringCreates(t, &creates, refConfig("linstor-passphrase", ""), passSecret("linstor-passphrase", "MASTER_PASSPHRASE", "piraeus"))
+	secrets := passphrase.Secrets{Reader: cli, Namespace: ns}
+
+	created, err := passphrase.Bootstrap(t.Context(), cli, secrets, time.Now())
+	if err != nil || !created || creates != 1 {
+		t.Fatalf("created %v, %v, %d creates", created, err, creates)
+	}
+
+	ring, _, err := secrets.Keyring(t.Context())
+	if err != nil || ring == nil {
+		t.Fatalf("keyring %v, %v", ring, err)
+	}
+
+	if len(ring.Slots) != 1 || ring.Slots[0].Name != passphrase.SlotNameSecret || ring.Slots[0].Origin != keyring.OriginSecret {
+		t.Fatalf("slots %+v", ring.Slots)
+	}
+
+	if _, err := ring.Opens([]byte("piraeus")); err != nil {
+		t.Fatalf("the Secret's passphrase does not open the new keyring: %v", err)
+	}
+
+	var sec corev1.Secret
+
+	err = cli.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: passphrase.KeyringSecretName}, &sec)
+	if err != nil || sec.Type != passphrase.KeyringSecretType {
+		t.Fatalf("keyring Secret type %q, %v", sec.Type, err)
+	}
+
+	created, err = passphrase.Bootstrap(t.Context(), cli, secrets, time.Now())
+	if err != nil || created || creates != 1 {
+		t.Fatalf("second pass: created %v, %v, %d creates", created, err, creates)
+	}
+}
+
+// Nothing is created without a named Secret, with an empty one, or when a
+// keyring exists; and none is created while a replica carries a password
+// wrapped under a keyring that is gone.
+func TestBootstrapLeavesWhatItMustNotTouch(t *testing.T) {
+	t.Parallel()
+
+	ring, _ := newRing(t, "x")
+	carrier := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{Volumes: []blockstoriov1alpha1.ResourceVolumeSpec{{
+			VolumeNumber: 0,
+			LUKSKey:      &blockstoriov1alpha1.LUKSKey{KeyID: "c7324c99567678f7", Wrapped: []byte{1}, Origin: blockstoriov1alpha1.LUKSKeyOriginGenerated},
+		}}},
+	}
+
+	cases := map[string]struct {
+		objs []client.Object
+		err  error
+	}{
+		"generated ref": {objs: []client.Object{passSecret(passphrase.UnlockSecretName, "MASTER_PASSPHRASE", "x")}},
+		"no secret":     {objs: []client.Object{refConfig("p", "")}},
+		"empty secret":  {objs: []client.Object{refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "")}},
+		"keyring there": {objs: []client.Object{refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "y"), keyringSecret(t, ring)}},
+		"keyring lost": {
+			objs: []client.Object{refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "y"), carrier},
+			err:  passphrase.ErrKeyringLost,
+		},
+	}
+
+	for name, tc := range cases {
+		var creates int
+
+		cli := countingKeyringCreates(t, &creates, tc.objs...)
+
+		created, err := passphrase.Bootstrap(t.Context(), cli, passphrase.Secrets{Reader: cli, Namespace: ns}, time.Now())
+		if created || creates != 0 {
+			t.Errorf("%s: created %v, %d creates", name, created, creates)
+		}
+
+		if (tc.err == nil && err != nil) || (tc.err != nil && !errors.Is(err, tc.err)) {
+			t.Errorf("%s: err %v, want %v", name, err, tc.err)
+		}
+	}
+}
+
+// Two controllers racing: the one that loses the create is not in error.
+func TestCreateKeyringLosingTheRaceIsNotAnError(t *testing.T) {
+	t.Parallel()
+
+	ring, _ := newRing(t, "x")
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(keyringSecret(t, ring)).Build()
+
+	created, err := passphrase.CreateKeyring(t.Context(), cli, ns, ring)
+	if err != nil || created {
+		t.Fatalf("created %v, %v", created, err)
+	}
+}

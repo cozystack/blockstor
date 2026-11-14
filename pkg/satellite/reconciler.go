@@ -91,6 +91,11 @@ type ReconcilerConfig struct {
 	// FakeExec.
 	Cryptsetup *luks.Cryptsetup
 
+	// LUKSKeys provides each LUKS volume's password. nil → LUKS in the
+	// layer stack is rejected. The agent injects it post-manager
+	// construction via SetLUKSKeys: it needs the manager's clients.
+	LUKSKeys LUKSKeys
+
 	// CrossNodeFetcher pulls a snapshot from a peer satellite when
 	// the local node doesn't host it. nil → no cross-node fallback,
 	// materializeVolume falls through to a blank CreateVolume (the
@@ -157,6 +162,45 @@ type CrossNodeFetcher interface {
 	// snapshot locally — the caller must decide whether to fall
 	// through to a blank create or surface the error.
 	Fetch(ctx context.Context, srcRD, snap string, vol int32) (io.ReadCloser, string, error)
+}
+
+// LUKSVolume names one volume of this node's replica to the LUKS key
+// provider: the definition's and the node's CR names, the volume number,
+// and the snapshot the volume was restored from, `<rd>:<snap>`, if any.
+type LUKSVolume struct {
+	Resource       string
+	Node           string
+	Volume         int32
+	SourceSnapshot string
+}
+
+// LUKSCandidate is a password a restored volume may have been encrypted
+// under: the one a snapshot recorded for the source replica on Node. Adopt
+// stores it on this node's replica.
+type LUKSCandidate struct {
+	Node     string
+	Password []byte
+	Adopt    func(ctx context.Context) error
+}
+
+// LUKSKeys hands the LUKS layer each volume's password. The passwords are
+// stored wrapped on the replica's Resource; the implementation, in
+// pkg/satellite/controllers, unwraps them with the cluster master key.
+type LUKSKeys interface {
+	// Stored returns the volume's password, luks.ErrNoLUKSKey when the
+	// replica carries none, luks.ErrMasterKeyLocked when the master key
+	// is not unlocked, luks.ErrMasterKeyMismatch when the password is
+	// wrapped under another master key.
+	Stored(ctx context.Context, vol LUKSVolume) ([]byte, error)
+
+	// Generate makes a new password for the volume and returns it only
+	// once the replica carries it, so no device is ever formatted with a
+	// password that is not stored.
+	Generate(ctx context.Context, vol LUKSVolume) ([]byte, error)
+
+	// SnapshotCandidates returns the passwords the volume's source
+	// snapshot recorded for it, this node's first.
+	SnapshotCandidates(ctx context.Context, vol LUKSVolume) ([]LUKSCandidate, error)
 }
 
 // MetadataCreatedStamper abstracts the "stamp the
@@ -436,6 +480,12 @@ func (r *Reconciler) SnapshotProviders() map[string]storage.Provider {
 // "set once, then read many" semantics.
 func (r *Reconciler) SetCrossNodeFetcher(f CrossNodeFetcher) {
 	r.cfg.CrossNodeFetcher = f
+}
+
+// SetLUKSKeys injects the LUKS key provider post-construction, like
+// SetCrossNodeFetcher. Safe to call before the first Apply.
+func (r *Reconciler) SetLUKSKeys(k LUKSKeys) {
+	r.cfg.LUKSKeys = k
 }
 
 // SetMetadataCreatedStamper injects the MetadataCreated stamper
@@ -1063,83 +1113,184 @@ func needsLUKS(stack []string) bool {
 // (Format-then-Open path) always lines up with the underlying size
 // out of cryptsetup luksFormat's geometry so the probe is skipped.
 //
-// Passphrase source for this slice: dr.Props["LuksPassphrase"]. The
-// dispatcher stamps it from the cluster passphrase Secret alone
-// (pkg/satellite/controllers/luks_passphrase.go); a passphrase in a
-// property is never read. Empty passphrase fails the apply — explicit
-// rather than silently creating an unencrypted volume.
+// Each volume's password is its own, stored wrapped on the replica (see
+// luksPassword); a device is formatted only after its password is stored.
 func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, resized bool) (map[int32]string, bool, error) {
 	if r.cfg.Cryptsetup == nil {
 		return nil, false, errors.New("LUKS in layer stack but no cryptsetup wrapper configured")
 	}
 
-	pass := dr.GetProps()["LuksPassphrase"]
-	if pass == "" {
-		return nil, false, errors.New("LUKS in layer stack but Props.LuksPassphrase empty")
+	if r.cfg.LUKSKeys == nil {
+		return nil, false, errors.New("LUKS in layer stack but no LUKS key provider configured")
+	}
+
+	sources := make(map[int32]string, len(dr.GetVolumes()))
+	for _, vol := range dr.GetVolumes() {
+		sources[vol.GetVolumeNumber()] = vol.GetSourceSnapshot()
 	}
 
 	out := make(map[int32]string, len(devices))
-	key := []byte(pass)
 	mapperGrew := false
 
 	for vol, dev := range devices {
-		dmName := luksMapperName(dr.GetName(), vol)
-
-		err := r.cfg.Cryptsetup.Format(ctx, dev, key)
+		key, err := r.luksPassword(ctx, LUKSVolume{
+			Resource: dr.GetName(), Node: dr.GetNodeName(), Volume: vol, SourceSnapshot: sources[vol],
+		}, dev)
 		if err != nil {
-			return nil, false, errors.Wrapf(err, "luks format %s", dev)
+			return nil, false, errors.Wrapf(err, "luks volume %d", vol)
 		}
 
-		openErr := r.cfg.Cryptsetup.Open(ctx, dev, dmName, key)
-		alreadyOpen := errors.Is(openErr, luks.ErrAlreadyOpen)
+		mapperPath, grew, err := r.openLUKS(ctx, luksMapperName(dr.GetName(), vol), dev, key, resized)
 
-		if openErr != nil && !alreadyOpen {
-			// Non-EEXIST open failure: bubble. EEXIST is the every-
-			// reconcile-after-first idempotent path — classified via
-			// the typed luks.ErrAlreadyOpen sentinel so we are immune
-			// to cryptsetup output locale (Bug 215): the prior
-			// English-only substring match silently missed de_DE /
-			// fr_FR / ru_RU satellites and would have triggered a
-			// luksFormat retry against an already-formatted device.
-			return nil, false, errors.Wrapf(openErr, "luks open %s -> %s", dev, dmName)
+		clear(key)
+
+		if err != nil {
+			return nil, false, err
 		}
 
-		mapperPath := luks.DevicePath(dmName)
-
-		// Decide whether to invoke cryptsetup resize. Two triggers:
-		//
-		//  1. resized=true from applyStorage — the LV/zvol/file just
-		//     grew this reconcile. The mapper must catch up before
-		//     DRBD's own resize fires.
-		//
-		//  2. The mapper carried over from a previous Apply
-		//     (alreadyOpen=true) AND the underlying device is now
-		//     larger than the mapper. Covers the crash-recovery path
-		//     and any other reason applyStorage's grow predicate
-		//     skipped this reconcile while the mapper still lags.
-		//
-		// On a fresh Open (no EEXIST) the dm-crypt geometry matches
-		// the underlying device by definition — luksOpen sizes the
-		// mapper from the device on every fresh attach — so we skip
-		// the probe + resize to keep steady-state reconciles cheap.
-		needResize := resized
-		if !needResize && alreadyOpen && r.luksMapperBehindUnderlying(ctx, dev, mapperPath) {
-			needResize = true
-		}
-
-		if needResize {
-			err = r.cfg.Cryptsetup.Resize(ctx, dmName, key)
-			if err != nil {
-				return nil, false, errors.Wrapf(err, "luks resize %s", dmName)
-			}
-
-			mapperGrew = true
-		}
-
+		mapperGrew = mapperGrew || grew
 		out[vol] = mapperPath
 	}
 
 	return out, mapperGrew, nil
+}
+
+// luksPassword returns the password dev opens with, formatting dev first
+// when it has no header yet:
+//
+//   - stored password, header: the password, to open with; a mismatch
+//     surfaces at open as luks.ErrLUKSKeyMismatch and is never
+//     re-formatted;
+//   - stored password, no header: format with it (Format refuses a device
+//     that holds data);
+//   - no password, header: a restored volume adopts the snapshot's
+//     password that opens the header; anything else is
+//     luks.ErrLUKSKeyMissing, neither opened nor formatted;
+//   - no password, no header: on a device blkid finds empty, generate a
+//     password, store it, and only then format.
+func (r *Reconciler) luksPassword(ctx context.Context, vol LUKSVolume, dev string) ([]byte, error) {
+	header := r.cfg.Cryptsetup.IsLUKS(ctx, dev)
+
+	key, err := r.cfg.LUKSKeys.Stored(ctx, vol)
+	if err == nil {
+		if header {
+			return key, nil
+		}
+
+		return key, r.formatLUKS(ctx, dev, key)
+	}
+
+	if !errors.Is(err, luks.ErrNoLUKSKey) {
+		return nil, err //nolint:wrapcheck // the provider names the replica and the reason
+	}
+
+	if header {
+		return r.adoptSnapshotPassword(ctx, vol, dev)
+	}
+
+	err = r.cfg.Cryptsetup.EnsureEmpty(ctx, dev)
+	if err != nil {
+		return nil, errors.Wrapf(err, "refusing to format %s", dev)
+	}
+
+	key, err = r.cfg.LUKSKeys.Generate(ctx, vol)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // the provider names the replica and the reason
+	}
+
+	return key, r.formatLUKS(ctx, dev, key)
+}
+
+func (r *Reconciler) formatLUKS(ctx context.Context, dev string, key []byte) error {
+	err := r.cfg.Cryptsetup.Format(ctx, dev, key)
+	if err != nil {
+		clear(key)
+
+		return errors.Wrapf(err, "luks format %s", dev)
+	}
+
+	return nil
+}
+
+// adoptSnapshotPassword finds, among the passwords the source snapshot
+// recorded, the one that opens dev's header, and stores it on the replica
+// before returning it. A volume restored from a peer's snapshot carries
+// that peer's header, so every recorded node is tried, this one first.
+func (r *Reconciler) adoptSnapshotPassword(ctx context.Context, vol LUKSVolume, dev string) ([]byte, error) {
+	if vol.SourceSnapshot == "" {
+		return nil, errors.Wrapf(luks.ErrLUKSKeyMissing, "%s", dev)
+	}
+
+	candidates, err := r.cfg.LUKSKeys.SnapshotCandidates(ctx, vol)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // the provider names the snapshot and the reason
+	}
+
+	var found []byte
+
+	for i := range candidates {
+		if found == nil {
+			found, err = r.tryLUKSCandidate(ctx, dev, &candidates[i], err)
+		}
+
+		clear(candidates[i].Password)
+	}
+
+	if found != nil {
+		return found, nil
+	}
+
+	return nil, errors.Wrapf(errors.WithSecondaryError(luks.ErrLUKSKeyMissing, err),
+		"%s: no password recorded by snapshot %s opens it", dev, vol.SourceSnapshot)
+}
+
+// tryLUKSCandidate returns a copy of the candidate's password when it opens
+// dev and is stored on the replica, nil otherwise; failures to test or to
+// store join errs, for the report when no candidate fits.
+func (r *Reconciler) tryLUKSCandidate(ctx context.Context, dev string, candidate *LUKSCandidate, errs error) ([]byte, error) {
+	ok, err := r.cfg.Cryptsetup.TestKey(ctx, dev, candidate.Password)
+	if err != nil || !ok {
+		return nil, errors.CombineErrors(errs, err) //nolint:wrapcheck // accumulated; the caller wraps the report
+	}
+
+	err = candidate.Adopt(ctx)
+	if err != nil {
+		return nil, errors.CombineErrors(errs, err) //nolint:wrapcheck // accumulated; the caller wraps the report
+	}
+
+	return bytes.Clone(candidate.Password), errs
+}
+
+// openLUKS opens dev under dmName and grows the mapper on the two resize
+// triggers applyLUKS describes.
+func (r *Reconciler) openLUKS(ctx context.Context, dmName, dev string, key []byte, resized bool) (string, bool, error) {
+	openErr := r.cfg.Cryptsetup.Open(ctx, dev, dmName, key)
+	alreadyOpen := errors.Is(openErr, luks.ErrAlreadyOpen)
+
+	if openErr != nil && !alreadyOpen {
+		// EEXIST is the every-reconcile-after-first idempotent path —
+		// classified via the typed luks.ErrAlreadyOpen sentinel so we are
+		// immune to cryptsetup output locale (Bug 215).
+		return "", false, errors.Wrapf(openErr, "luks open %s -> %s", dev, dmName)
+	}
+
+	mapperPath := luks.DevicePath(dmName)
+
+	needResize := resized
+	if !needResize && alreadyOpen && r.luksMapperBehindUnderlying(ctx, dev, mapperPath) {
+		needResize = true
+	}
+
+	if !needResize {
+		return mapperPath, false, nil
+	}
+
+	err := r.cfg.Cryptsetup.Resize(ctx, dmName, key)
+	if err != nil {
+		return "", false, errors.Wrapf(err, "luks resize %s", dmName)
+	}
+
+	return mapperPath, true, nil
 }
 
 // luksMapperBehindUnderlying reports whether the dm-crypt mapper at

@@ -28,7 +28,7 @@ import (
 // A `LuksPassphrase` property set on the replica is the satellite's
 // wire key itself; it must never reach the wire, whether it arrives
 // through the resolved props or straight from the replica (no resolved
-// props at all), and it must not override the Secret's value.
+// props at all), nor may any other passphrase property stand in for it.
 func TestLUKSReplicaWirePropNeverReachesTheWire(t *testing.T) {
 	const name = "pvc-luks-replica-prop"
 
@@ -49,16 +49,14 @@ func TestLUKSReplicaWirePropNeverReachesTheWire(t *testing.T) {
 		assertNoPassphraseOnWire(t, got)
 	})
 
-	t.Run("the Secret wins", func(t *testing.T) {
+	t.Run("with the master-key property", func(t *testing.T) {
 		got := dispatcher.BuildDesired(luksTestTarget(name, replicaProps), nil, nil, nil,
 			luksTestRD(name), map[string]string{
 				passphrase.WirePropKey:      "from-a-replica-prop",
-				passphrase.PropKeyCanonical: "from-the-secret",
+				passphrase.PropKeyCanonical: "from-a-controller-prop",
 			})
 
-		if pass := got.Props[passphrase.WirePropKey]; pass != "from-the-secret" {
-			t.Errorf("LuksPassphrase = %q, want the Secret's value", pass)
-		}
+		assertNoPassphraseOnWire(t, got)
 	})
 }
 

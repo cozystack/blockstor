@@ -925,6 +925,7 @@ func TestApplyLayersLUKS(t *testing.T) {
 		NodeName:   "n1",
 		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -934,7 +935,6 @@ func TestApplyLayersLUKS(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {
@@ -960,10 +960,10 @@ func TestApplyLayersLUKS(t *testing.T) {
 	}
 }
 
-// TestApplyLUKSFailsWithoutPassphrase: explicit LUKS in stack but no
-// passphrase prop → apply fails fast rather than silently producing
-// an unencrypted volume.
-func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
+// TestApplyLUKSFailsUnderALockedMasterKey: explicit LUKS in stack but
+// the master key is locked → apply fails fast rather than silently
+// producing an unencrypted volume.
+func TestApplyLUKSFailsUnderALockedMasterKey(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-empty_00000",
@@ -977,6 +977,7 @@ func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
 		NodeName:   "n1",
 		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(&fakeLUKSKeys{err: luks.ErrMasterKeyLocked})
 
 	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -997,11 +998,11 @@ func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
 	}
 
 	if results[0].GetOk() {
-		t.Errorf("expected LUKS-without-passphrase to fail")
+		t.Errorf("expected LUKS under a locked master key to fail")
 	}
 
-	if !strings.Contains(strings.ToLower(results[0].GetMessage()), "passphrase") {
-		t.Errorf("error message should mention passphrase; got %q", results[0].GetMessage())
+	if !strings.Contains(results[0].GetMessage(), luks.ErrMasterKeyLocked.Error()) {
+		t.Errorf("error message should say the master key is locked; got %q", results[0].GetMessage())
 	}
 }
 
@@ -1031,6 +1032,7 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 		NodeName:   "n1",
 		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	dr := []*intent.DesiredResource{
 		{
@@ -1040,7 +1042,6 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	}
 
@@ -1122,6 +1123,7 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 		NodeName:   "n1",
 		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -1131,7 +1133,6 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack:      []string{"DRBD", "LUKS", "STORAGE"},
-			Props:           map[string]string{"LuksPassphrase": "topsecret"},
 			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
@@ -1571,7 +1572,6 @@ func TestApplyLUKSWithoutCryptsetupWrapper(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {
@@ -1624,6 +1624,7 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 		NodeName:   "n1",
 		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -1633,7 +1634,6 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {
@@ -1722,6 +1722,7 @@ func TestApplyLUKSConvergeResizeAfterCrashRecovery(t *testing.T) {
 		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 		Exec:       fx,
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -1731,7 +1732,6 @@ func TestApplyLUKSConvergeResizeAfterCrashRecovery(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 			// Bug 360: an already-converged resource (this is a
 			// crash-recovery convergence pass) always carries the
 			// controller-allocated local node-id — the dispatcher
@@ -1819,6 +1819,7 @@ func TestApplyLUKSConvergeNoOpWhenMapperMatches(t *testing.T) {
 		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 		Exec:       fx,
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -1828,7 +1829,6 @@ func TestApplyLUKSConvergeNoOpWhenMapperMatches(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {
@@ -2344,6 +2344,7 @@ func TestDeleteResourceClosesLUKSMapper(t *testing.T) {
 		NodeName:   "n1",
 		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{
 		Name:          "pvc-luks-del",
@@ -2617,7 +2618,7 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 	// luksFormat fails: simulate the device being busy. Post-Issue
 	// 175 the cryptsetup invocation is direct, so the Expect key is
 	// the cryptsetup argv verbatim with no shell pipeline wrapping.
-	fx.Expect("cryptsetup luksFormat --batch-mode /dev/vg/pvc-luks-format_00000 --key-file -",
+	fx.Expect("cryptsetup luksFormat --batch-mode --pbkdf pbkdf2 --pbkdf-force-iterations 1000 /dev/vg/pvc-luks-format_00000 --key-file -",
 		storage.FakeResponse{Err: errLUKSFormatBusy})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -2628,6 +2629,7 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 		NodeName:   "n1",
 		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -2637,7 +2639,6 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {

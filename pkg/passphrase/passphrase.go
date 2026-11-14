@@ -76,9 +76,9 @@ const PropKeyLegacy = "DrbdOptions/Encryption/passphrase"
 // wrote it is refused and the key is refused and dropped like the others.
 const PropKeyVolume = "DrbdOptions/Encrypt/Passphrase"
 
-// WirePropKey is the property the satellite's LUKS layer reads the
-// passphrase from. Only the dispatcher sets it, from the Secret; a
-// property of that name an operator set is refused and dropped too.
+// WirePropKey is the property the satellite's LUKS layer once read the
+// cluster passphrase from. Nothing reads it now that every volume has its
+// own password; a property of that name is still refused and dropped.
 const WirePropKey = "LuksPassphrase"
 
 // IsPlaintextPropKey reports whether key would carry the master
