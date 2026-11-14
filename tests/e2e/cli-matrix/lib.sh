@@ -488,69 +488,55 @@ wait_luks_header_present() {
     return 1
 }
 
-# assert_luks_passphrase_opens <node> <device> <passphrase> — verify
-# PASSPHRASE actually unlocks the LUKS header on DEVICE without
-# activating a mapper (`--test-passphrase`, idempotent). Run on every
-# replica of an encrypted RD so a Bug-175-class wire-injection / Bug-
-# 233-class wrong-passphrase regression is caught at the kernel level
-# rather than just at the REST envelope. Non-zero exit on failure.
-#
-# BUG-039: MUST go through on_node_stdin — plain on_node drops stdin
-# (kubectl exec without -i), so cryptsetup read an empty key-file and
-# this assert failed on every stand while the satellite had in fact
-# formatted with the correct master passphrase. The old 2>/dev/null
-# also swallowed cryptsetup's "Nothing to read on input." tell, so we
-# now keep stderr and print it on the failure path for triage.
-assert_luks_passphrase_opens() {
-    local node=$1 dev=$2 passphrase=$3
-    # Passphrase on stdin avoids leaking it via `ps -ef` argv and
-    # also avoids re-quoting headaches if the passphrase contains shell
-    # metachars (the e2e default has `!!` in it, which would trigger
-    # bash history expansion inside `bash -c` without the heredoc).
-    local err
-    if ! err=$(printf '%s' "$passphrase" | on_node_stdin "$node" \
-            cryptsetup luksOpen --test-passphrase --key-file=- "$dev" 2>&1); then
-        echo "assert_luks_passphrase_opens: passphrase does NOT open ${node}:${dev}" >&2
-        echo "  cryptsetup said: $err" >&2
+# assert_luks_volume_keyed <node> <device> <passphrase> — verify the
+# LUKS header on <device> holds exactly one key slot, the volume's own
+# random password, and that the cluster's master passphrase does NOT open
+# it: the passphrase only unlocks the master key the volume passwords are
+# wrapped under. Fails with the cryptsetup output otherwise.
+assert_luks_volume_keyed() {
+    local node=$1 dev=$2 passphrase=$3 slots
+    # Passphrase on stdin keeps it out of `ps -ef` argv and away from
+    # re-quoting the `!!` the e2e default carries.
+    if printf '%s' "$passphrase" | on_node_stdin "$node" \
+            cryptsetup luksOpen --test-passphrase --key-file=- "$dev" >/dev/null 2>&1; then
+        echo "assert_luks_volume_keyed: the master passphrase opens ${node}:${dev} directly" >&2
+        return 1
+    fi
+    slots=$(on_node "$node" cryptsetup luksDump "$dev" 2>/dev/null | grep -cE '^ +[0-9]+: luks2$' || true)
+    if [[ "$slots" != 1 ]]; then
+        echo "assert_luks_volume_keyed: ${node}:${dev} has ${slots:-no} key slots, want 1" >&2
+        on_node "$node" cryptsetup luksDump "$dev" >&2 || true
         return 1
     fi
     return 0
 }
 
-# cleanup_encryption_state — reset the cluster passphrase to "unset"
+# cleanup_encryption_state — reset the cluster's encryption to "unset"
 # so the next cell starts from a known-clean baseline. Called from EXIT
-# traps of cells that mutate the passphrase state.
+# traps of cells that mutate the passphrase state, after their LUKS
+# definitions are gone.
 #
-# The passphrase is Secret-backed (pkg/rest/encryption.go: the
-# controller stores it in the `blockstor-cluster-passphrase` Secret,
-# or the one named by ControllerConfig.Spec.PassphraseSecretRef) and
-# the apiserver exposes ONLY GET/POST/PATCH/PUT on
-# /v1/encryption/passphrase — there is no DELETE route, and the python
-# linstor-client has no `delete-passphrase` subcommand. So the old
-# REST-DELETE / CLI-delete attempts were both no-ops (405 / unknown
-# subcommand): the first luks cell set the passphrase and every later
-# `create-passphrase` then failed with "passphrase already set". The
-# reliable, route-independent reset is to delete the backing Secret.
+# There is no REST verb that drops the master key, and the python
+# linstor-client has no `delete-passphrase` subcommand; the reset is to
+# delete the keyring Secret, the generated unlock Secret, and the
+# passphrase Secret a kubectl-driven scenario named, and to clear that
+# reference so `create-passphrase` takes the generated path again.
 cleanup_encryption_state() {
-    # Resolve the passphrase Secret name (custom ref or default).
     local secret
-    secret=$(kubectl get controllerconfigs.blockstor.org \
-        -o jsonpath='{.items[0].spec.passphraseSecretRef.name}' 2>/dev/null || true)
-    [[ -n "$secret" ]] || secret=blockstor-cluster-passphrase
-    kubectl -n "$NS" delete secret "$secret" --ignore-not-found >/dev/null 2>&1 || true
+    secret=$(kubectl get controllerconfigs.blockstor.org default \
+        -o jsonpath='{.spec.passphraseSecretRef.name}' 2>/dev/null || true)
+    if [[ -n "$secret" ]]; then
+        kubectl -n "$NS" delete secret "$secret" --ignore-not-found >/dev/null 2>&1 || true
+        kubectl patch controllerconfigs.blockstor.org default --type=json \
+            -p='[{"op":"remove","path":"/spec/passphraseSecretRef"}]' >/dev/null 2>&1 || true
+    fi
+    kubectl -n "$NS" delete secret blockstor-master-key blockstor-unlock --ignore-not-found >/dev/null 2>&1 || true
     # Clear a passphrase controller property a stand may still carry
     # from a build that read one. Nothing reads it now and REST refuses
     # to set it, but it is a plaintext key on the ControllerConfig; an
     # empty value is the set-property delete, which REST allows.
     if [[ ${#LCTL[@]} -gt 0 ]]; then
         "${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase "" \
-            >/dev/null 2>&1 || true
-    fi
-    # Best-effort REST attempt kept for stands that DO ship a delete
-    # path; a harmless 405/404 no-op otherwise.
-    if [[ -n "${LCTL_PORT:-}" ]]; then
-        curl -fsS -m 5 -X DELETE \
-            "http://127.0.0.1:${LCTL_PORT}/v1/encryption/passphrase" \
             >/dev/null 2>&1 || true
     fi
 }

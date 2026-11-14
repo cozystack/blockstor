@@ -1210,22 +1210,41 @@ unwire_linstor_csi_mtls() {
         2>/dev/null || true
 }
 
-# ensure_passphrase_secret <passphrase> — make sure the cluster LUKS
-# master passphrase Secret exists, the one `linstor encryption
-# create-passphrase` writes. It is the only place blockstor reads the
-# passphrase from: a `DrbdOptions/EncryptPassphrase`,
-# `DrbdOptions/Encryption/passphrase` or `LuksPassphrase` property is
-# never read, and REST refuses to store one. An existing Secret is left
-# alone, since replacing it would lock out every LUKS volume formatted
-# with it; the scenario then runs on that cluster passphrase.
+# ensure_passphrase_secret <passphrase> — make sure the cluster has a
+# master key that unlocks unattended, the way piraeus sets LINSTOR up: a
+# passphrase Secret with the key MASTER_PASSPHRASE, named by
+# ControllerConfig.spec.passphraseSecretRef, and the keyring the
+# controller creates from it on its next pass. A cluster that already
+# has a keyring is left alone: a new master key would leave every LUKS
+# volume wrapped under the old one unreadable.
 ensure_passphrase_secret() {
-    local pass=${1:?passphrase required} secret
-    secret=$(kubectl get controllerconfigs.blockstor.org \
-        -o jsonpath='{.items[0].spec.passphraseSecretRef.name}' 2>/dev/null || true)
-    [[ -n "$secret" ]] || secret=blockstor-cluster-passphrase
-    if kubectl -n "$NS" get secret "$secret" >/dev/null 2>&1; then
+    local pass=${1:?passphrase required} secret deadline
+    if kubectl -n "$NS" get secret blockstor-master-key >/dev/null 2>&1; then
         return 0
     fi
-    kubectl -n "$NS" create secret generic "$secret" \
-        --from-literal=passphrase="$pass" >/dev/null
+    secret=$(kubectl get controllerconfigs.blockstor.org default \
+        -o jsonpath='{.spec.passphraseSecretRef.name}' 2>/dev/null || true)
+    if [[ -z "$secret" ]]; then
+        secret=blockstor-e2e-passphrase
+        if ! kubectl get controllerconfigs.blockstor.org default >/dev/null 2>&1; then
+            printf '%s\n' 'apiVersion: blockstor.org/v1alpha1' 'kind: ControllerConfig' \
+                'metadata: {name: default}' | kubectl apply -f - >/dev/null
+        fi
+        kubectl patch controllerconfigs.blockstor.org default --type=merge \
+            -p "{\"spec\":{\"passphraseSecretRef\":{\"name\":\"$secret\"}}}" >/dev/null
+    fi
+    if ! kubectl -n "$NS" get secret "$secret" >/dev/null 2>&1; then
+        kubectl -n "$NS" create secret generic "$secret" \
+            --from-literal=MASTER_PASSPHRASE="$pass" >/dev/null
+    fi
+    # The controller looks at the Secrets every 30s.
+    deadline=$((SECONDS + 90))
+    until kubectl -n "$NS" get secret blockstor-master-key >/dev/null 2>&1; do
+        if ((SECONDS >= deadline)); then
+            echo "FAIL: no keyring 90s after Secret $secret was named; controller log:" >&2
+            kubectl -n "$NS" logs deploy/blockstor-controller --tail=50 2>&1 | grep -i 'keyring\|master-key' >&2 || true
+            return 1
+        fi
+        sleep 2
+    done
 }
