@@ -149,6 +149,12 @@ type encryption struct {
 
 // passphraseTurn waits for one of the maxPassphraseAttempts turns and
 // returns its release, or answers 503 when ctx ends first.
+//
+// The turns are not handed out in arrival order: a client flooding wrong
+// passphrases can keep a legitimate enter waiting into its 503. Only a
+// client with a certificate reaches this, and the satellites and the
+// controller unlock without it, so volumes keep opening; a fair queue is
+// not worth its code here.
 func (s *Server) passphraseTurn(ctx context.Context, w http.ResponseWriter) (func(), bool) {
 	s.encryption.attemptsOnce.Do(func() {
 		s.encryption.attempts = make(chan struct{}, maxPassphraseAttempts)

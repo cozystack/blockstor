@@ -79,7 +79,8 @@ rules:
     resources: [secrets]
     resourceNames: [blockstor-master-key, blockstor-unlock, linstor-passphrase]
     verbs: [get, update]
-  # A create cannot be limited by name.
+  # A create cannot be limited by name; see docs/encryption-keys.md for
+  # what that leaves open and how to close it.
   - apiGroups: [""]
     resources: [secrets]
     verbs: [create]
