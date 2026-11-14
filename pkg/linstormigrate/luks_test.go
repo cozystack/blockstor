@@ -35,10 +35,8 @@ import (
 // 128-bit segment, IV first, LINSTOR's length padding to 32 bytes. The
 // master key is 10 11 .. 1f. They match the fixture dump.
 //
-// Two JDK details are taken from the source, not from a running LINSTOR,
-// and need a vector from a live controller before a migration relies on
-// them: how a non-ASCII passphrase reaches PBKDF2 (javaPassphraseBytes),
-// and that `AES/CFB/NoPadding` means a 128-bit segment.
+// TestLinstorJDKVectors checks the two JDK details against vectors made by
+// a real JDK, from testdata/jdk/Vec.java.
 const (
 	katLinstorSalt       = "QEFCQ0RFRkdISUpLTE1OTw=="
 	katLinstorMasterKey  = "YGFiY2RlZmdoaWprbG1ub5bVilcKH4i0OIPhTpxwW8Nd2jaxBs/yYutifx5pjM8E"
@@ -150,8 +148,7 @@ func TestLinstorUnpad(t *testing.T) {
 }
 
 // ASCII reaches PBKDF2 unchanged; a byte above 0x7f is sign-extended to a
-// char and UTF-8 encoded, as LINSTOR and the JDK do per the source. The
-// second half needs a live-controller vector (see the constants above).
+// char and UTF-8 encoded, as LINSTOR and the JDK do.
 func TestJavaPassphraseBytes(t *testing.T) {
 	t.Parallel()
 
@@ -320,5 +317,49 @@ func TestConvertImportsTheSnapshotPasswords(t *testing.T) {
 
 	if strings.Contains(res.Warnings[0], "fixtureSnapshotPassword") {
 		t.Fatal("the snapshot password reached the report")
+	}
+}
+
+// Vectors made by JDK 22 (SunJCE) running LINSTOR's own steps:
+// JclSymmetricKeyCipher.getInstanceWithPassword (each passphrase byte cast
+// to a char, PBKDF2WithHmacSHA1, 5000 iterations, 128 bits),
+// AES/CFB/NoPadding with the IV first, LengthPaddingImpl's 2-byte length
+// and fill to 32, and SHA-512 of the padded master key block. The second
+// passphrase is Cyrillic with a check mark and an accent, so every byte
+// above 0x7f goes through the JDK's sign extension and UTF-8 encoding. The
+// generator is testdata/jdk/Vec.java.
+func TestLinstorJDKVectors(t *testing.T) {
+	t.Parallel()
+
+	const (
+		salt   = "QEFCQ0RFRkdISUpLTE1OTw=="
+		hash   = "qshMTUH0xqSrUKtaVAGxbntuAssqTECV8qJsXvngjVHIU7szigyLshQFcH8HND2QpuV5MQKkjdYwsHPiYISh6A=="
+		volume = "cHFyc3R1dnd4eXp7fH1+fy81ADZ0GlpQAYYGrHPSrbi527tB02AGKZHAqrVB2kmt"
+	)
+
+	for pass, masterKey := range map[string]string{
+		"jdk-ascii-passphrase": "YGFiY2RlZmdoaWprbG1ub5o2fVoMmVatM4UrxBWQ644lNy2C+fMMwlL7rgvH6cp3",
+		"пароль ключ✓ é":       "YGFiY2RlZmdoaWprbG1ub8IprxpI0plt10ur+9T8roYPvP4EHNynAqjQ5aMAJf1C",
+	} {
+		props := []PropsContainerRow{
+			{PropsInstance: "/CTRL", PropKey: linstorMasterKeyProp, PropValue: masterKey},
+			{PropsInstance: "/CTRL", PropKey: linstorSaltProp, PropValue: salt},
+			{PropsInstance: "/CTRL", PropKey: linstorHashProp, PropValue: hash},
+		}
+
+		master, err := LinstorMasterKey(props, []byte(pass))
+		if err != nil || !bytes.Equal(master, seq(0x10, 16)) {
+			t.Fatalf("%q: master %x, %v", pass, master, err)
+		}
+
+		got, err := LinstorVolumePassword(master, volume)
+		if err != nil || string(got) != "jdkVolumePassword0123456789A=" {
+			t.Fatalf("%q: volume password %q, %v", pass, got, err)
+		}
+
+		_, err = LinstorMasterKey(props, []byte(pass+"x"))
+		if !errors.Is(err, ErrLinstorWrongPassphrase) {
+			t.Fatalf("%q: a wrong passphrase: %v", pass, err)
+		}
 	}
 }

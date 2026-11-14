@@ -213,9 +213,8 @@ func linstorUnpad(padded []byte) ([]byte, error) {
 // javaPassphraseBytes is what the JDK hands PBKDF2 for LINSTOR's
 // passphrase: LINSTOR turns each byte into a char by sign extension
 // (JclSymmetricKeyCipher.java:150-154), and the JDK's PBKDF2 encodes those
-// chars as UTF-8. ASCII passes through unchanged. For a byte above 0x7f
-// this is read off the source, not from a running JDK: a non-ASCII
-// passphrase needs a vector from a live controller before it is trusted.
+// chars as UTF-8. ASCII passes through unchanged; TestLinstorJDKVectors
+// pins a non-ASCII passphrase against a real JDK.
 func javaPassphraseBytes(passphrase []byte) []byte {
 	out := make([]byte, 0, len(passphrase))
 
