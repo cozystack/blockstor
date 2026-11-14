@@ -151,6 +151,10 @@ blockstor resource-definition list-properties my-volume
 
 ```sh
 blockstor encryption create-passphrase '<passphrase>'
+blockstor encryption add-passphrase --name recovery '<passphrase>' '<recovery passphrase>'
+blockstor encryption list-passphrases
+blockstor encryption modify-passphrase '<old>' '<new>'
+blockstor encryption remove-passphrase recovery
 ```
 
 See [Layer stack](../layer-stack/#encryption) before you use it.

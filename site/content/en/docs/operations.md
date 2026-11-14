@@ -186,12 +186,10 @@ for kind in controllerconfigs nodes storagepools physicaldevices \
             resourcegroups resourcedefinitions resources snapshots; do
   kubectl get "$kind.blockstor.org" -o yaml > "blockstor-$kind.yaml"
 done
-kubectl -n blockstor-system get secret blockstor-cluster-passphrase -o yaml > blockstor-passphrase.yaml
+kubectl -n blockstor-system get secret blockstor-master-key -o yaml > blockstor-keyring.yaml
 ```
 
-The full names, such as `resources.blockstor.org`, keep `kubectl` from picking another product's resource with the same plural. The last line applies only if you use encrypted volumes. The Secret holds the cluster passphrase, and the volumes cannot be opened without it. Its name can be changed through `spec.passphraseSecretRef` on the `ControllerConfig`. Store the backup like any other secret material.
-
-The passphrase can also be set as a property, `DrbdOptions/EncryptPassphrase` on the controller or `DrbdOptions/Encryption/passphrase` on a definition, and a property set there wins over the Secret. A property is stored in plaintext on its resource, so the YAML dump above then carries the key to every encrypted volume. Keep the passphrase in the Secret only, and treat the dump as secret material if such a property was ever set.
+The full names, such as `resources.blockstor.org`, keep `kubectl` from picking another product's resource with the same plural. The last line applies only if you use encrypted volumes. Each volume's password is stored in its `Resource`, wrapped under the master key, and the keyring Secret holds that key wrapped under the master passphrases: without both, and without a passphrase that opens the keyring, the volumes cannot be opened. Keep the passphrase itself apart from the dump. The dump holds no key in the clear, but the keyring is what a passphrase guess is tried against, so store it like any other secret material.
 
 ## Upgrading
 
