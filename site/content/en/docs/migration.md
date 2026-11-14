@@ -37,21 +37,19 @@ Not converted, and listed in the tool's report:
    cd ..
    ```
 
-3. **Capture the DRBD ports.** LINSTOR 1.33 does not store them in its database. Without them, blockstor would assign new ports, and every replica would reconnect under load. Collect them from the satellites:
+3. **Capture the DRBD ports.** LINSTOR 1.33 does not store them in its database, and it can give each node its own port for one volume. Without them, blockstor would assign new ports, and every replica would reconnect under load. Collect the port each replica listens on, from the kernel on every satellite:
 
    ```sh
    for pod in $(kubectl -n cozy-linstor get pods -l app.kubernetes.io/component=linstor-satellite \
                   -o jsonpath='{.items[*].metadata.name}'); do
-     kubectl -n cozy-linstor exec "$pod" -- sh -c '
-       for f in /var/lib/linstor.d/*.res; do
-         rd=$(basename "$f" .res)
-         port=$(grep -oE "address[^;]*:[0-9]+" "$f" | grep -oE "[0-9]+$" | head -1)
-         [ -n "$port" ] && echo "$rd $port"
-       done'
+     node=$(kubectl -n cozy-linstor get pod "$pod" -o jsonpath='{.spec.nodeName}')
+     kubectl -n cozy-linstor exec "$pod" -- drbdsetup show | awk -v node="$node" '
+       /^resource / { rd = $2; gsub(/"/, "", rd) }
+       /_this_host ipv4/ && rd != "" { n = split($3, a, ":"); port = a[n]; sub(/;$/, "", port); print rd, node, port; rd = "" }'
    done | sort -u > drbd-ports.txt
    ```
 
-   Change the namespace and label to match your installation. Every replica of a volume shares one port. If one volume shows two different ports, stop and find out why.
+   Change the namespace and label to match your installation. Each line is `<volume> <node> <port>`, so replicas of one volume on different ports keep their own. If your LINSTOR node names differ from the Kubernetes ones, put the LINSTOR name in the second column. The converter refuses a map that gives one replica two ports, and reports a replica it has no port for while it has its peers'.
 
 4. **Take pool snapshots.** A recursive `zfs snapshot` of every pool gives you a rollback point that does not depend on either control plane.
 
