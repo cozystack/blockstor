@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -796,5 +797,74 @@ func TestPassphraseEnterRepairsALostUnlockSecret(t *testing.T) {
 
 	if slots := encryptionKeyring(t, cli).Slots; len(slots) != 2 {
 		t.Fatalf("slots %+v, want the operator's and one generated", slots)
+	}
+}
+
+// Passphrase operations run at most maxPassphraseAttempts at a time; one
+// that cannot get a turn before its request ends answers 503 and runs no
+// Argon2id.
+func TestPassphraseOperationsAreBounded(t *testing.T) {
+	srv := newSecretPathServer(t)
+	seedEncryption(t, srv.Client, testPassphrase)
+
+	for range maxPassphraseAttempts {
+		_, ok := srv.passphraseTurn(t.Context(), httptest.NewRecorder())
+		if !ok {
+			t.Fatal("a free turn was refused")
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodPatch, "/v1/encryption/passphrase",
+		strings.NewReader(`{"passphrase":"`+testPassphrase+`"}`))
+	rec := httptest.NewRecorder()
+
+	srv.handlePassphraseEnter(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("enter with every turn taken: %d, want 503", rec.Code)
+	}
+
+	short, stop := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer stop()
+
+	release, ok := srv.passphraseTurn(short, httptest.NewRecorder())
+	if ok {
+		release()
+		t.Fatal("a third turn was given while two were held")
+	}
+}
+
+// An enter-passphrase that leaves the cluster locked is an error, so the
+// client does not print success over a cluster that cannot open volumes.
+func TestEnterOnALockedNamedSecretIsAnError(t *testing.T) {
+	srv := newSecretPathServer(t)
+	ctx := context.Background()
+
+	err := srv.Client.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+		Spec:       blockstoriov1alpha1.ControllerConfigSpec{PassphraseSecretRef: &blockstoriov1alpha1.PassphraseSecretRef{Name: "p"}},
+	})
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+
+	for _, obj := range testEncryptionSecrets(t, testPassphrase)[:1] {
+		if err := srv.Client.Create(ctx, obj); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	if got := callEncryption(t, http.MethodPatch, base+"/v1/encryption/passphrase", map[string]string{"passphrase": testPassphrase}); got != http.StatusConflict {
+		t.Fatalf("enter with the Secret missing: %d, want 409", got)
+	}
+
+	if got := callEncryption(t, http.MethodPatch, base+"/v1/encryption/passphrase", map[string]string{"passphrase": "wrong"}); got != http.StatusUnauthorized {
+		t.Fatalf("enter a wrong passphrase: %d, want 401", got)
 	}
 }

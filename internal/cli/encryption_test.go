@@ -24,8 +24,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -290,5 +292,54 @@ func TestEncryptionSlotVerbs(t *testing.T) {
 
 	if keyringOpens(t, client, "third") {
 		t.Fatal("the removed passphrase still opens")
+	}
+}
+
+// enter-passphrase that leaves the cluster locked exits non-zero: the
+// passphrase is right, but the named Secret does not open the keyring.
+func TestEncryptionEnterOnALockedClusterFails(t *testing.T) {
+	t.Parallel()
+
+	app, client, errBuf := newKubeApp(t)
+	ctx := t.Context()
+
+	err := client.Create(ctx, &crdv1alpha1.ControllerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: crdv1alpha1.ControllerConfigName},
+		Spec:       crdv1alpha1.ControllerConfigSpec{PassphraseSecretRef: &crdv1alpha1.PassphraseSecretRef{Name: "p"}},
+	})
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: testNamespace},
+		Data:       map[string][]byte{"MASTER_PASSPHRASE": []byte("piraeus")},
+	}
+
+	err = client.Create(ctx, secret)
+	if err != nil {
+		t.Fatalf("secret: %v", err)
+	}
+
+	_, err = passphrase.Bootstrap(ctx, client, passphrase.Secrets{Reader: client, Namespace: testNamespace}, time.Now())
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	if got := app.Run(ctx, []string{"encryption", "enter-passphrase", "--passphrase", "piraeus"}); got != 0 {
+		t.Fatalf("enter on an unlocked cluster: exit %d (%s)", got, errBuf.String())
+	}
+
+	err = client.Delete(ctx, secret)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if got := app.Run(ctx, []string{"encryption", "enter-passphrase", "--passphrase", "piraeus"}); got == 0 {
+		t.Fatal("enter on a locked cluster exited 0")
+	}
+
+	if !strings.Contains(errBuf.String(), "stays locked") {
+		t.Errorf("stderr %q does not say the cluster stays locked", errBuf.String())
 	}
 }

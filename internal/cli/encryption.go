@@ -205,14 +205,13 @@ func encryptionEnterPassphrase(ctx context.Context, run *runContext) error {
 		return passphraseVerbError("cannot unlock", err)
 	}
 
-	notice := "passphrase verified"
+	if result.Status.State == passphrase.StateLocked {
+		return fmt.Errorf("%w: the passphrase Secret %s does not open the keyring", errStaysLocked, result.Status.Ref.Name)
+	}
 
-	switch {
-	case result.Repaired:
+	notice := "passphrase verified"
+	if result.Repaired {
 		notice = "passphrase verified; re-created the unlock Secret " + passphrase.UnlockSecretName
-	case result.Status.State == passphrase.StateLocked:
-		notice = "passphrase verified, but the cluster stays locked: the passphrase Secret " +
-			result.Status.Ref.Name + " does not open the keyring"
 	}
 
 	return writeNotice(run, notice)
@@ -363,6 +362,8 @@ type slotPassphrases struct {
 	run   *runContext
 	lines *bufio.Reader
 }
+
+var errStaysLocked = errors.New("the passphrase is right, but the cluster stays locked")
 
 var errPassphraseOnArgv = errors.New(
 	"passphrases of this command are read from a file, the terminal or stdin, never from the command line")

@@ -43,6 +43,10 @@ import (
 // once per slot on a verification, well inside the bound.
 const passphraseOpTimeout = 10 * time.Second
 
+// maxPassphraseAttempts is how many passphrase operations run at once;
+// the rest wait for a turn until their request times out.
+const maxPassphraseAttempts = 2
+
 // encryptionStateTTL is how long the encryption state the resource view
 // stamps `suspended` from is reused: the view walks every replica, and
 // each fresh look is three API reads.
@@ -133,9 +137,31 @@ type encryption struct {
 	once     sync.Once
 	unlocker *passphrase.Unlocker
 
+	// attempts bounds the passphrase operations in flight: each tries a
+	// passphrase against up to eight slots at 64 MiB of Argon2id apiece.
+	attemptsOnce sync.Once
+	attempts     chan struct{}
+
 	mu      sync.Mutex
 	state   passphrase.State
 	stateAt time.Time
+}
+
+// passphraseTurn waits for one of the maxPassphraseAttempts turns and
+// returns its release, or answers 503 when ctx ends first.
+func (s *Server) passphraseTurn(ctx context.Context, w http.ResponseWriter) (func(), bool) {
+	s.encryption.attemptsOnce.Do(func() {
+		s.encryption.attempts = make(chan struct{}, maxPassphraseAttempts)
+	})
+
+	select {
+	case s.encryption.attempts <- struct{}{}:
+		return func() { <-s.encryption.attempts }, true
+	case <-ctx.Done():
+		writeError(w, http.StatusServiceUnavailable, "too many passphrase operations in flight; retry")
+
+		return nil, false
+	}
 }
 
 func (s *Server) passphraseOps() (*passphrase.Ops, error) {
@@ -239,6 +265,13 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
 
+	release, ok := s.passphraseTurn(ctx, w)
+	if !ok {
+		return
+	}
+
+	defer release()
+
 	result, err := ops.Create(ctx, []byte(want))
 
 	s.forgetEncryptionState()
@@ -273,6 +306,13 @@ func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
 
+	release, ok := s.passphraseTurn(ctx, w)
+	if !ok {
+		return
+	}
+
+	defer release()
+
 	result, err := ops.Enter(ctx, []byte(req.proofOfKnowledge()))
 
 	s.forgetEncryptionState()
@@ -281,14 +321,18 @@ func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	message := "Master passphrase entered"
+	if result.Status.State == passphrase.StateLocked {
+		// The operator asked for an unlocked cluster and did not get one;
+		// the client must say so, not print a success line.
+		writeError(w, http.StatusConflict, fmt.Sprintf("the passphrase is right, but the cluster stays locked: "+
+			"the passphrase Secret %s does not open the keyring; put a passphrase that does into it", result.Status.Ref.Name))
 
-	switch {
-	case result.Repaired:
+		return
+	}
+
+	message := "Master passphrase entered"
+	if result.Repaired {
 		message = "Master passphrase entered; the unlock Secret " + passphrase.UnlockSecretName + " was re-created"
-	case result.Status.State == passphrase.StateLocked:
-		message = fmt.Sprintf("Master passphrase verified, but the cluster stays locked: "+
-			"the passphrase Secret %s does not open the keyring", result.Status.Ref.Name)
 	}
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{RetCode: maskInfo, Message: message}})
@@ -317,6 +361,13 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
+
+	release, ok := s.passphraseTurn(ctx, w)
+	if !ok {
+		return
+	}
+
+	defer release()
 
 	result, err := ops.Modify(ctx, []byte(req.OldPassphrase), []byte(want))
 
@@ -361,6 +412,13 @@ func (s *Server) handlePassphraseList(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
+
+	release, ok := s.passphraseTurn(ctx, w)
+	if !ok {
+		return
+	}
+
+	defer release()
 
 	slots, _, err := ops.List(ctx)
 	if err != nil {
@@ -408,6 +466,13 @@ func (s *Server) handlePassphraseAdd(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
 
+	release, ok := s.passphraseTurn(ctx, w)
+	if !ok {
+		return
+	}
+
+	defer release()
+
 	slotID, err := ops.Add(ctx, []byte(req.Passphrase), []byte(req.NewPassphrase), req.Name)
 	if writePassphraseError(w, err) {
 		return
@@ -434,6 +499,13 @@ func (s *Server) handlePassphraseRemove(w http.ResponseWriter, r *http.Request) 
 
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
+
+	release, ok := s.passphraseTurn(ctx, w)
+	if !ok {
+		return
+	}
+
+	defer release()
 
 	var req passphraseRemoveRequest
 
