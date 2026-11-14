@@ -235,9 +235,14 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 		// preservedTakeSnapshot in snapshots.go::Update) so a
 		// REST prop-patch mid-orchestration doesn't clobber the
 		// in-flight suspend/take state.
+		// LUKSKeys are the source replicas' wrapped LUKS passwords,
+		// copied by the store at Create (snapshots.go::sourceLUKSKeys)
+		// with no wire counterpart; Update carries them across, and the
+		// CRD refuses to change them once set.
 		mustCarryAcross: map[string]bool{
 			"SuspendIO":    true,
 			"TakeSnapshot": true,
+			"LUKSKeys":     true,
 		},
 	},
 	"PhysicalDeviceSpec": {
