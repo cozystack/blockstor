@@ -34,6 +34,9 @@ import (
 	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
+// bootstrapBudget is how long the runnable gets to create the keyring.
+const bootstrapBudget = 30 * time.Second
+
 // On a cluster that names a piraeus-shaped passphrase Secret and has no
 // keyring, the first pass of the master-key runnable creates one that the
 // Secret opens, and the loop keeps running until its context ends.
@@ -68,7 +71,10 @@ func TestMasterKeyRunnableCreatesTheKeyring(t *testing.T) {
 		t.Fatal("two controllers would each bootstrap")
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	// The bootstrap runs Argon2id at 64 MiB; under a full `go test ./...`
+	// every package competes for the CPU, so the budget is generous. The
+	// loop ends as soon as the keyring appears.
+	ctx, cancel := context.WithTimeout(t.Context(), bootstrapBudget)
 	defer cancel()
 
 	done := make(chan error, 1)
@@ -103,7 +109,7 @@ func TestMasterKeyRunnableCreatesTheKeyring(t *testing.T) {
 	var sec corev1.Secret
 
 	_ = cli.Get(context.Background(), client.ObjectKey{Namespace: "blockstor-system", Name: passphrase.KeyringSecretName}, &sec)
-	t.Fatal("no keyring after a second of passes")
+	t.Fatalf("no keyring after %v of passes", bootstrapBudget)
 }
 
 // After modify-passphrase of the Secret's passphrase, a pass keeps the
