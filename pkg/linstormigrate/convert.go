@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -257,6 +258,12 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 	}
 
 	conv.reportRemotes()
+	conv.reportUnmatchedPortNodes()
+
+	err := checkPortCollisions(res.Resources)
+	if err != nil {
+		return nil, err
+	}
 
 	res.Warnings = conv.warnings
 
@@ -2062,8 +2069,8 @@ func (c *converter) resolveDRBDPort(rdName string, dumpPort *int32, rdDsp string
 
 // resolveDefinitionDRBDPort is the preferred port preset on the
 // definition itself. With per-replica ports it is their port only when
-// every replica shares one; otherwise the definition gets none, and
-// each replica carries its own.
+// the map covers every replica and they all share one; otherwise the
+// definition gets none, and each replica carries its own.
 func (c *converter) resolveDefinitionDRBDPort(rdName string, dumpPort *int32, rdDsp string) *int32 {
 	perReplica := c.opts.ReplicaDRBDPorts[strings.ToLower(rdName)]
 	if len(perReplica) == 0 {
@@ -2072,15 +2079,141 @@ func (c *converter) resolveDefinitionDRBDPort(rdName string, dumpPort *int32, rd
 
 	var shared int32
 
-	for _, port := range perReplica {
-		if shared != 0 && port != shared {
+	for _, row := range c.liveReplicas(rdName) {
+		port, ok := c.mappedReplicaPort(perReplica, row.NodeName)
+		if !ok || (shared != 0 && port != shared) {
 			return nil
 		}
 
 		shared = port
 	}
 
+	if shared == 0 {
+		return nil
+	}
+
 	return ptr(shared)
+}
+
+// liveReplicas lists the replica rows of one definition that convert
+// into Resources: no snapshot placements, no rows marked DELETE, and
+// none on a node that did not migrate.
+func (c *converter) liveReplicas(rdName string) []*ResourceRow {
+	var out []*ResourceRow
+
+	for i := range c.dump.Resources {
+		row := &c.dump.Resources[i]
+		if row.ResourceName == rdName && row.SnapshotName == "" &&
+			row.ResourceFlags&resourceFlagDelete == 0 && c.convertedNode[row.NodeName] {
+			out = append(out, row)
+		}
+	}
+
+	return out
+}
+
+// mappedReplicaPort looks a replica up in one definition's per-replica
+// map by its node's key name and by its display name.
+func (c *converter) mappedReplicaPort(perReplica map[string]int32, nodeName string) (int32, bool) {
+	for _, node := range []string{nodeName, c.displayNode(nodeName)} {
+		if port, ok := perReplica[strings.ToLower(node)]; ok {
+			return port, true
+		}
+	}
+
+	return 0, false
+}
+
+// anyReplicaMapped reports whether the per-replica map has a port for
+// at least one replica of the definition.
+func (c *converter) anyReplicaMapped(rdName string, perReplica map[string]int32) bool {
+	for _, row := range c.liveReplicas(rdName) {
+		if _, ok := c.mappedReplicaPort(perReplica, row.NodeName); ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// reportUnmatchedPortNodes reports per-replica map entries that name a
+// node no replica of the definition lives on. When none of a
+// definition's entries match, the node names in the map most likely
+// differ from LINSTOR's, and every replica will reconnect on a fresh
+// port.
+func (c *converter) reportUnmatchedPortNodes() {
+	for i := range c.dump.ResourceDefinitions {
+		row := &c.dump.ResourceDefinitions[i]
+		if row.SnapshotName != "" {
+			continue
+		}
+
+		perReplica := c.opts.ReplicaDRBDPorts[strings.ToLower(row.ResourceName)]
+		if len(perReplica) == 0 {
+			continue
+		}
+
+		known := map[string]bool{}
+		for _, replica := range c.liveReplicas(row.ResourceName) {
+			known[strings.ToLower(replica.NodeName)] = true
+			known[strings.ToLower(c.displayNode(replica.NodeName))] = true
+		}
+
+		var unmatched []string
+
+		for node := range perReplica {
+			if !known[node] {
+				unmatched = append(unmatched, node)
+			}
+		}
+
+		if len(unmatched) == 0 {
+			continue
+		}
+
+		sort.Strings(unmatched)
+
+		rdDsp := c.displayRD(row.ResourceName)
+		if len(unmatched) == len(perReplica) {
+			c.warnf("resource definition %s: no node in the live port map (%s) hosts a replica of it — check that the map uses LINSTOR's node names; every replica will get a fresh port and reconnect on adoption",
+				rdDsp, strings.Join(unmatched, ", "))
+
+			continue
+		}
+
+		c.warnf("resource definition %s: the live port map names nodes without a replica of it (%s) — those entries are ignored; a leftover DRBD resource on them may hold the port",
+			rdDsp, strings.Join(unmatched, ", "))
+	}
+}
+
+// checkPortCollisions refuses two replicas preset to one port on one
+// node. The allocator honours a preset port verbatim and the field is
+// set once, so a collision cannot be fixed after apply, and one of the
+// two DRBD resources would fail to bind on adoption.
+func checkPortCollisions(resources []crdv1alpha1.Resource) error {
+	type nodePort struct {
+		node string
+		port int32
+	}
+
+	owner := map[nodePort]string{}
+
+	for i := range resources {
+		res := &resources[i]
+		if res.Spec.DRBDPort == nil {
+			continue
+		}
+
+		key := nodePort{node: naming.Key(res.Spec.NodeName), port: *res.Spec.DRBDPort}
+		if prev, ok := owner[key]; ok {
+			return fmt.Errorf("%w: %s and %s both listen on port %d on node %s",
+				ErrPortCollision, prev, res.Name, key.port, res.Spec.NodeName)
+		}
+
+		owner[key] = res.Name
+	}
+
+	return nil
 }
 
 // resolveReplicaDRBDPort picks the port one replica listens on: its own
@@ -2094,10 +2227,12 @@ func (c *converter) resolveReplicaDRBDPort(row *ResourceRow, dumpPort *int32, rd
 		return c.resolveDRBDPort(row.ResourceName, dumpPort, rdDsp)
 	}
 
-	for _, node := range []string{row.NodeName, nodeDsp} {
-		if port, ok := perReplica[strings.ToLower(node)]; ok {
-			return ptr(port)
-		}
+	if port, ok := c.mappedReplicaPort(perReplica, row.NodeName); ok {
+		return ptr(port)
+	}
+
+	if !c.anyReplicaMapped(row.ResourceName, perReplica) {
+		return nil // reportUnmatchedPortNodes names the mismatch once per definition
 	}
 
 	c.warnOncef("drbdport:"+row.ResourceName+":"+row.NodeName,

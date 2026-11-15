@@ -131,6 +131,20 @@ func findResource(t *testing.T, res *Result, name string) *crdv1alpha1.Resource 
 	return nil
 }
 
+func findRD(t *testing.T, res *Result, name string) *crdv1alpha1.ResourceDefinition {
+	t.Helper()
+
+	for i := range res.ResourceDefinitions {
+		if res.ResourceDefinitions[i].Name == name {
+			return &res.ResourceDefinitions[i]
+		}
+	}
+
+	t.Fatalf("converted output has no ResourceDefinition %q", name)
+
+	return nil
+}
+
 // TestTieBreakerFlagsRequireDiskless pins the flag-decode calibration:
 // the diskless witness keeps TIE_BREAKER while the STALE TIE_BREAKER
 // bit on a diskful replica (an auto-diskful leftover observed in
@@ -439,7 +453,7 @@ func TestEachReplicaKeepsItsOwnNodesPort(t *testing.T) {
 	res, err := ConvertWithOptions(dump, Options{
 		ReplicaDRBDPorts: map[string]map[string]int32{
 			"pvc-vol5": {"node-a": 7042, "node-b": 7051},
-			"pvc-vol1": {"node-a": 7099, "node-b": 7099},
+			"pvc-vol1": {"node-a": 7099, "node-b": 7099, "node-c": 7099},
 		},
 	})
 	if err != nil {
@@ -487,6 +501,113 @@ func TestAReplicaMissingFromThePerReplicaMapIsReported(t *testing.T) {
 
 	if !hasWarning(res, "pvc-vol5.node-b: the live map has ports for the other replicas") {
 		t.Errorf("missing replica port not reported; warnings %v", res.Warnings)
+	}
+
+	if got := findRD(t, res, "pvc-vol5").Spec.DRBDPort; got != nil {
+		t.Errorf("pvc-vol5 DRBDPort = %d, want none: the map does not cover node-b", *got)
+	}
+}
+
+// The tiebreaker replica of pvc-vol1 (node-c) keeps its own port like
+// any other replica, and a definition whose map skips it gets no
+// shared port.
+func TestADisklessReplicaKeepsItsOwnPort(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		ReplicaDRBDPorts: map[string]map[string]int32{
+			"pvc-vol1": {"node-a": 7099, "node-b": 7099, "node-c": 7105},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if got := findResource(t, res, "pvc-vol1.node-c").Spec.DRBDPort; got == nil || *got != 7105 {
+		t.Errorf("pvc-vol1.node-c DRBDPort = %v, want 7105", got)
+	}
+
+	if got := findRD(t, res, "pvc-vol1").Spec.DRBDPort; got != nil {
+		t.Errorf("pvc-vol1 DRBDPort = %d, want none: node-c listens on another port", *got)
+	}
+}
+
+// The map may name a node by LINSTOR's key name rather than its
+// display name, in any case.
+func TestThePortMapMatchesTheNodesKeyName(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	for i := range dump.Nodes {
+		if dump.Nodes[i].NodeName == "NODE-B" {
+			dump.Nodes[i].NodeDspName = "Worker-B"
+		}
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		ReplicaDRBDPorts: map[string]map[string]int32{"pvc-vol5": {"node-a": 7042, "node-b": 7051}},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if got := findResource(t, res, "pvc-vol5.worker-b").Spec.DRBDPort; got == nil || *got != 7051 {
+		t.Errorf("pvc-vol5.worker-b DRBDPort = %v, want 7051 found by the key name NODE-B", got)
+	}
+}
+
+// Map entries for nodes without a replica are reported, with their own
+// wording when no entry of the definition matches at all.
+func TestPortMapNodesWithoutAReplicaAreReported(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		ReplicaDRBDPorts: map[string]map[string]int32{
+			"pvc-vol5": {"node-a": 7042, "node-b": 7051, "node-c": 7060},
+			"pvc-vol3": {"k8s-a": 7070, "k8s-b": 7071},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if !hasWarning(res, "pvc-vol5: the live port map names nodes without a replica of it (node-c)") {
+		t.Errorf("stray node entry not reported; warnings %v", res.Warnings)
+	}
+
+	if !hasWarning(res, "pvc-vol3: no node in the live port map (k8s-a, k8s-b) hosts a replica of it") {
+		t.Errorf("fully unmatched map not reported; warnings %v", res.Warnings)
+	}
+
+	if hasWarning(res, "has ports for the other replicas of pvc-vol3") {
+		t.Errorf("fully unmatched map reported as a partial one; warnings %v", res.Warnings)
+	}
+}
+
+// Two replicas on one node preset to one port are refused: the port is
+// set once and one of them could not bind on adoption.
+func TestTwoReplicasOnOneNodePortAreRefused(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	_, err = ConvertWithOptions(dump, Options{
+		ReplicaDRBDPorts: map[string]map[string]int32{
+			"pvc-vol5": {"node-a": 7042, "node-b": 7051},
+			"pvc-vol3": {"node-a": 7042, "node-b": 7052},
+		},
+	})
+	if !errors.Is(err, ErrPortCollision) {
+		t.Fatalf("Convert err = %v, want ErrPortCollision", err)
 	}
 }
 

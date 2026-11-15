@@ -32,6 +32,10 @@ var ErrBadPortLine = errors.New("malformed DRBD port line")
 // definition, or one replica, two different ports.
 var ErrConflictingPort = errors.New("conflicting DRBD port")
 
+// ErrPortCollision is returned when conversion would preset one DRBD
+// port for two replicas on the same node.
+var ErrPortCollision = errors.New("DRBD port collision")
+
 // maxTCPPort is the inclusive upper bound of a valid TCP port.
 const maxTCPPort = 65535
 
@@ -55,11 +59,7 @@ type DRBDPortMap struct {
 // against LINSTOR's uppercase keys.
 //
 // Capture the per-replica form on every storage node, from the
-// kernel's own view (see the migration runbook):
-//
-//	drbdsetup show | awk -v node="$(hostname)" '
-//	  /^resource / { gsub(/"/, "", $2); rd = $2 }
-//	  /_this_host ipv4/ && rd != "" { split($3, a, ":"); sub(/;$/, "", a[2]); print rd, node, a[2]; rd = "" }'
+// kernel's own view, as the migration runbook shows.
 //
 // One definition given two ports, one replica given two ports, or a
 // definition given in both forms is refused: on a cluster whose nodes
