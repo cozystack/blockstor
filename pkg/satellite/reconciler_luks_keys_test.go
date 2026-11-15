@@ -38,16 +38,26 @@ const (
 	keyFormat = "cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 " + keyDev + " --key-file -"
 	keyOpen   = "cryptsetup luksOpen " + keyDev + " pvc-key-0-luks --key-file -"
 	keyTest   = "cryptsetup luksOpen --test-passphrase " + keyDev + " --key-file -"
+	keyStatus = "cryptsetup status pvc-key-0-luks"
+	keyResize = "cryptsetup resize pvc-key-0-luks --key-file -"
 )
+
+// activeMapper is `cryptsetup status` for a mapping that is open.
+func activeMapper() storage.FakeResponse {
+	return storage.FakeResponse{Stdout: []byte("/dev/mapper/pvc-key-0-luks is active and is in use.\n  type:    LUKS2\n")}
+}
 
 // luksRun is one apply of a one-volume [LUKS,STORAGE] replica.
 type luksRun struct {
 	header bool
 	blkid  storage.FakeResponse
 	source string
-	keys   *fakeLUKSKeys
-	expect map[string]storage.FakeResponse
-	seq    map[string][]storage.FakeResponse
+	// sizeKib is the volume's size in the spec; zero is the size the
+	// device already has, a larger one makes the apply grow it.
+	sizeKib int64
+	keys    *fakeLUKSKeys
+	expect  map[string]storage.FakeResponse
+	seq     map[string][]storage.FakeResponse
 
 	fx      *storage.FakeExec
 	message string
@@ -88,11 +98,16 @@ func (run *luksRun) apply(t *testing.T) {
 	})
 	rec.SetLUKSKeys(run.keys)
 
+	size := run.sizeKib
+	if size == 0 {
+		size = 1024 * 1024
+	}
+
 	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{{
 		Name:     keyRD,
 		NodeName: "n1",
 		Volumes: []*intent.DesiredVolume{{
-			VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1", SourceSnapshot: run.source,
+			VolumeNumber: 0, SizeKib: size, StoragePool: "thin1", SourceSnapshot: run.source,
 		}},
 		LayerStack: []string{"LUKS", "STORAGE"},
 	}})
@@ -356,5 +371,88 @@ func TestLUKSLockedMasterKeyTouchesNothing(t *testing.T) {
 		if _, ran := run.stdinOf(cmd); ran {
 			t.Fatalf("%s ran", cmd)
 		}
+	}
+}
+
+// A mapper that is already open and has nothing to grow is left as it is,
+// and its password is not read: on a locked cluster the replica still
+// reconciles, and a steady reconcile costs no API reads for the key.
+func TestLUKSOpenMapperReadsNoPassword(t *testing.T) {
+	t.Parallel()
+
+	run := &luksRun{
+		header: true, blkid: storage.FakeResponse{Stdout: []byte("TYPE=crypto_LUKS\n")},
+		keys:   &fakeLUKSKeys{err: luks.ErrMasterKeyLocked},
+		expect: map[string]storage.FakeResponse{keyStatus: activeMapper()},
+	}
+	run.apply(t)
+
+	if !run.ok {
+		t.Fatalf("apply of an open mapper on a locked cluster failed: %s", run.message)
+	}
+
+	if got := run.keys.log(); len(got) != 0 {
+		t.Fatalf("provider calls %v, want none for an open mapper", got)
+	}
+
+	for _, cmd := range []string{keyFormat, keyOpen, keyResize} {
+		if _, ran := run.stdinOf(cmd); ran {
+			t.Fatalf("%s ran on an open mapper", cmd)
+		}
+	}
+}
+
+// An open mapper whose device grew needs its password to resize, and
+// reads the stored one.
+func TestLUKSOpenMapperGrowsWithItsPassword(t *testing.T) {
+	t.Parallel()
+
+	run := &luksRun{
+		header: true, blkid: storage.FakeResponse{Stdout: []byte("TYPE=crypto_LUKS\n")},
+		sizeKib: 2 * 1024 * 1024,
+		keys:    storedLUKSKey("stored-pw"),
+		expect: map[string]storage.FakeResponse{
+			keyStatus: activeMapper(),
+			keyOpen:   {Err: errLUKSOpenAlready},
+		},
+	}
+	run.apply(t)
+
+	if !run.ok {
+		t.Fatalf("apply failed: %s", run.message)
+	}
+
+	if got := run.keys.log(); !slices.Equal(got, []string{"stored"}) {
+		t.Fatalf("provider calls %v, want the stored password read", got)
+	}
+
+	if key, resized := run.stdinOf(keyResize); !resized || key != "stored-pw" {
+		t.Fatalf("resize %v with %q, want the stored password", resized, key)
+	}
+
+	if _, formatted := run.stdinOf(keyFormat); formatted {
+		t.Fatal("formatted an open mapper")
+	}
+}
+
+// Under a locked master key, an open mapper that has to grow is not
+// resized: the resize is one of the three things a locked cluster blocks.
+func TestLUKSLockedMasterKeyBlocksTheResize(t *testing.T) {
+	t.Parallel()
+
+	run := &luksRun{
+		header: true, blkid: storage.FakeResponse{Stdout: []byte("TYPE=crypto_LUKS\n")},
+		sizeKib: 2 * 1024 * 1024,
+		keys:    &fakeLUKSKeys{err: luks.ErrMasterKeyLocked},
+		expect:  map[string]storage.FakeResponse{keyStatus: activeMapper()},
+	}
+	run.apply(t)
+
+	if run.ok || !strings.Contains(run.message, luks.ErrMasterKeyLocked.Error()) {
+		t.Fatalf("ok %v, message %q; want ErrMasterKeyLocked", run.ok, run.message)
+	}
+
+	if _, resized := run.stdinOf(keyResize); resized {
+		t.Fatal("resized without the password")
 	}
 }

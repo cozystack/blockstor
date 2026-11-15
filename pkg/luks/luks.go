@@ -116,6 +116,18 @@ func (c *Cryptsetup) IsLUKS(ctx context.Context, device string) bool {
 	return c.runProbe(ctx, "isLuks", device) == nil
 }
 
+// IsActive reports whether the dm-crypt mapping dmName is active.
+// `cryptsetup status` exits 0 and describes the mapping when it is, and
+// exits non-zero when it is not. A probe that fails or prints nothing
+// counts as not active: the caller then takes the path that opens the
+// device, which answers ErrAlreadyOpen for a mapping that is active after
+// all, so a wrong "no" costs a password read and never a format.
+func (c *Cryptsetup) IsActive(ctx context.Context, dmName string) bool {
+	out, err := c.exec.Run(ctx, "cryptsetup", "status", dmName)
+
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
 // EnsureEmpty returns nil only for a block device blkid finds no
 // signature on, and ErrDeviceHoldsData for one that carries any. It is
 // the probe Format runs, for a caller that must commit to formatting,

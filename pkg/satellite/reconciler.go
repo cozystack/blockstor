@@ -1115,6 +1115,8 @@ func needsLUKS(stack []string) bool {
 //
 // Each volume's password is its own, stored wrapped on the replica (see
 // luksPassword); a device is formatted only after its password is stored.
+// A mapper that is already open and has nothing to grow is left alone
+// without reading its password (luksMapperSettled).
 func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, resized bool) (map[int32]string, bool, error) {
 	if r.cfg.Cryptsetup == nil {
 		return nil, false, errors.New("LUKS in layer stack but no cryptsetup wrapper configured")
@@ -1133,6 +1135,14 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, 
 	mapperGrew := false
 
 	for vol, dev := range devices {
+		dmName := luksMapperName(dr.GetName(), vol)
+
+		if r.luksMapperSettled(ctx, dmName, dev, resized) {
+			out[vol] = luks.DevicePath(dmName)
+
+			continue
+		}
+
 		key, err := r.luksPassword(ctx, LUKSVolume{
 			Resource: dr.GetName(), Node: dr.GetNodeName(), Volume: vol, SourceSnapshot: sources[vol],
 		}, dev)
@@ -1140,7 +1150,7 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, 
 			return nil, false, errors.Wrapf(err, "luks volume %d", vol)
 		}
 
-		mapperPath, grew, err := r.openLUKS(ctx, luksMapperName(dr.GetName(), vol), dev, key, resized)
+		mapperPath, grew, err := r.openLUKS(ctx, dmName, dev, key, resized)
 
 		clear(key)
 
@@ -1153,6 +1163,20 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, 
 	}
 
 	return out, mapperGrew, nil
+}
+
+// luksMapperSettled reports whether dmName is already open and has nothing
+// to grow, so the reconcile needs no password for it. Only opening,
+// formatting and resizing take the password: reading it costs API reads
+// and, on a cold cache, an Argon2id unlock, and on a locked cluster it
+// fails. An open mapper keeps serving whether or not the master key is
+// unlocked, so its replica reconciles as usual.
+func (r *Reconciler) luksMapperSettled(ctx context.Context, dmName, dev string, resized bool) bool {
+	if resized || !r.cfg.Cryptsetup.IsActive(ctx, dmName) {
+		return false
+	}
+
+	return !r.luksMapperBehindUnderlying(ctx, dev, luks.DevicePath(dmName))
 }
 
 // luksPassword returns the password dev opens with, formatting dev first

@@ -240,9 +240,9 @@ This is the piraeus contract carried over, with one translation: in LINSTOR the 
 
 **Every later start, and whenever either Secret changes (new `resourceVersion`).** The component reads the passphrase Secret and the keyring, tries the slots with Argon2id, and keeps MK and WK in memory, keyed by the two `resourceVersion`s. One derivation per process, not per reconcile.
 
-**Opening a volume.** `applyLUKS` takes the replica's `luksKey` from its own Resource, checks `keyID` against the unlocked key, unwraps and hands the password to `cryptsetup` over stdin as now. The wire prop `LuksPassphrase` and `injectLUKSMasterPassphrase` go away; the password never passes through a props map. Mappers already open survive a satellite restart, as today.
+**Opening a volume.** `applyLUKS` takes the replica's `luksKey` from its own Resource, checks `keyID` against the unlocked key, unwraps and hands the password to `cryptsetup` over stdin as now. The wire prop `LuksPassphrase` and `injectLUKSMasterPassphrase` go away; the password never passes through a props map. Mappers already open survive a satellite restart, as today. Only opening, formatting and resizing need the password: when `cryptsetup status` finds the mapper active and the device has not grown past it, the reconcile reads neither the Resource's `luksKey` nor the Secrets for that volume and does not unlock the master key, so a steady reconcile of an open LUKS replica costs no API reads for its key.
 
-**Locked.** A keyring exists, and the passphrase Secret is missing or opens no slot. Opened mappers keep working. New opens fail with a `MasterKeyLocked` condition on the Resource, and `GET /v1/encryption/passphrase` reports `locked`. The fix is to put a passphrase that opens a slot into the Secret. LINSTOR under piraeus fails the same way, at controller start.
+**Locked.** A keyring exists, and the passphrase Secret is missing or opens no slot. A locked cluster blocks only opening, formatting and resizing a LUKS volume: those fail with a `MasterKeyLocked` Warning Event on the Resource. A replica whose mapper is already open reconciles as usual, since its password is not read, and keeps serving I/O; it cannot grow until the cluster is unlocked again. `GET /v1/encryption/passphrase` reports `locked`. The fix is to put a passphrase that opens a slot into the Secret. LINSTOR under piraeus fails the same way, at controller start.
 
 **A cluster migrated from piraeus.** The Secret stays as it is; only `passphraseSecretRef` has to name it. The keyring written by `linstor-migrate` (section 9) has a slot for the LINSTOR master passphrase, so the first start finds a Secret that opens a slot and is unlocked with no operator step.
 
@@ -386,7 +386,7 @@ A byte-level clone also shares the LUKS volume key inside the header with its so
 
 | Failure | Outcome |
 |---|---|
-| The passphrase Secret is deleted, or changed to a value no slot knows | `locked`. Opened volumes keep running. Restore the value, or enrol the new one with `add-passphrase` authorised by any other slot. |
+| The passphrase Secret is deleted, or changed to a value no slot knows | `locked`. Opened volumes keep running and reconcile; opening, formatting and resizing wait. Restore the value, or enrol the new one with `add-passphrase` authorised by any other slot. |
 | Every passphrase is lost while satellites still run | MK is still in satellite memory, but stage 1 offers no way to add a slot without a passphrase. This is the reason to enrol a recovery passphrase on day one; the docs and the `list-passphrases` output say so while only one slot exists. |
 | Every passphrase is lost and the nodes rebooted | The data is unrecoverable. This is the property that makes it encryption. |
 | The keyring Secret is deleted | Same as losing every passphrase. The keyring is small and contains no plaintext key: the runbook has the operator export it (`kubectl get secret blockstor-master-key -o yaml`) next to the recovery passphrase. The controller does not re-create a keyring while any Resource carries a `luksKey`. |

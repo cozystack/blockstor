@@ -70,6 +70,31 @@ func TestIsLUKS(t *testing.T) {
 	}
 }
 
+// IsActive is true only for a status probe that succeeds and describes the
+// mapping: an inactive mapping, a failed probe and a silent one all send
+// the caller down the path that opens the device.
+func TestIsActive(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("cryptsetup status open", storage.FakeResponse{Stdout: []byte("/dev/mapper/open is active.\n")})
+	fx.Expect("cryptsetup status closed", storage.FakeResponse{
+		Stdout: []byte("/dev/mapper/closed is inactive.\n"), Err: storage.FakeExitError{Code: 4},
+	})
+
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
+
+	if !c.IsActive(t.Context(), "open") {
+		t.Error("an active mapping is reported inactive")
+	}
+
+	for _, name := range []string{"closed", "silent"} {
+		if c.IsActive(t.Context(), name) {
+			t.Errorf("%s is reported active", name)
+		}
+	}
+}
+
 // EnsureEmpty passes only a block device blkid finds nothing on.
 func TestEnsureEmpty(t *testing.T) {
 	t.Parallel()
