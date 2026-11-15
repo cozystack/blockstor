@@ -235,16 +235,34 @@ func TestUnlockRefusesKDFOutOfBounds(t *testing.T) {
 
 		mutate(&ring.Slots[0].KDF)
 
-		start := time.Now()
-		_, _, err := ring.Unlock([]byte(katSlotPass))
+		derived := 0
+		counting := func(passphrase []byte, kdf *KDF) []byte {
+			derived++
+
+			return deriveKEK(passphrase, kdf)
+		}
+
+		_, _, err := ring.unlockWith([]byte(katSlotPass), counting)
 
 		if !errors.Is(err, ErrMalformed) {
 			t.Errorf("%s: err %v, want ErrMalformed", name, err)
 		}
 
-		if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
-			t.Errorf("%s: refused after %v, Argon2id ran", name, elapsed)
+		if derived != 0 {
+			t.Errorf("%s: refused after %d derivations, want none", name, derived)
 		}
+	}
+
+	// The counter sees the derivation of a slot within bounds.
+	derived := 0
+
+	_, _, err := katKeyring(t).unlockWith([]byte(katSlotPass), func(passphrase []byte, kdf *KDF) []byte {
+		derived++
+
+		return deriveKEK(passphrase, kdf)
+	})
+	if err != nil || derived != 1 {
+		t.Fatalf("in bounds: err %v after %d derivations, want one", err, derived)
 	}
 }
 

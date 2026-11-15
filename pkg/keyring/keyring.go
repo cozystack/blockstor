@@ -236,19 +236,7 @@ func (k *Keyring) Validate() error {
 // Every failure to open is ErrWrongPassphrase, whatever the slot and the
 // reason. The caller destroys the returned key when done with it.
 func (k *Keyring) Unlock(passphrase []byte) (*MasterKey, string, error) {
-	err := k.Validate()
-	if err != nil {
-		return nil, "", err
-	}
-
-	for i := range k.Slots {
-		mk, ok := k.openSlot(&k.Slots[i], passphrase)
-		if ok {
-			return mk, k.Slots[i].ID, nil
-		}
-	}
-
-	return nil, "", ErrWrongPassphrase
+	return k.unlockWith(passphrase, deriveKEK)
 }
 
 // Opens reports the ID of the slot passphrase opens, without keeping the key.
@@ -374,6 +362,24 @@ func (k *Keyring) SlotIndex(ref string) int {
 	return k.slotIndexByName(ref)
 }
 
+// unlockWith is Unlock with the slot derivation passed in, so a test can
+// count the derivations a refusal ran.
+func (k *Keyring) unlockWith(passphrase []byte, derive kekDeriver) (*MasterKey, string, error) {
+	err := k.Validate()
+	if err != nil {
+		return nil, "", err
+	}
+
+	for i := range k.Slots {
+		mk, ok := k.openSlot(&k.Slots[i], passphrase, derive)
+		if ok {
+			return mk, k.Slots[i].ID, nil
+		}
+	}
+
+	return nil, "", ErrWrongPassphrase
+}
+
 // freshSlotID draws a random slot ID no slot of k has. Four bytes collide
 // once in billions of adds, so the loop almost never runs twice.
 func (k *Keyring) freshSlotID() (string, error) {
@@ -403,8 +409,8 @@ func (k *Keyring) slotIndexByName(name string) int {
 // openSlot tries passphrase on one validated slot. It reports only whether
 // the slot opened, so no caller can tell a wrong passphrase from a damaged
 // slot.
-func (k *Keyring) openSlot(slot *Slot, passphrase []byte) (*MasterKey, bool) {
-	kek := deriveKEK(passphrase, &slot.KDF)
+func (k *Keyring) openSlot(slot *Slot, passphrase []byte, derive kekDeriver) (*MasterKey, bool) {
+	kek := derive(passphrase, &slot.KDF)
 	defer clear(kek)
 
 	aead, err := newGCM(kek)
@@ -483,6 +489,9 @@ func sealMasterKey(master *MasterKey, passphrase []byte, slot *Slot) ([]byte, er
 
 	return aead.Seal(nil, slot.Nonce, master.key[:], slotAAD(slot.ID)), nil
 }
+
+// kekDeriver turns a passphrase into a slot's key-encryption key.
+type kekDeriver func(passphrase []byte, kdf *KDF) []byte
 
 func deriveKEK(passphrase []byte, kdf *KDF) []byte {
 	return argon2.IDKey(passphrase, kdf.Salt, kdf.Time, kdf.MemoryKiB, kdf.Parallelism, MasterKeySize)
