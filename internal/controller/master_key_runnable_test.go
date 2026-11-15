@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
@@ -178,5 +179,66 @@ func TestMasterKeyRunnableRemovesSupersededSlots(t *testing.T) {
 
 	if got := slots(); got != 1 {
 		t.Fatalf("%d slots after the Secret moved, want 1", got)
+	}
+}
+
+// Once the keyring exists and no slot is superseded, a pass reads no
+// passphrase, so it runs no Argon2id: the steady state costs two Secret
+// reads every period and no derivation.
+func TestMasterKeyRunnableSteadyPassDerivesNothing(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	const ns = "blockstor-system"
+
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&blockstoriov1alpha1.ControllerConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+			Spec:       blockstoriov1alpha1.ControllerConfigSpec{PassphraseSecretRef: &blockstoriov1alpha1.PassphraseSecretRef{Name: "p"}},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: ns},
+			Data:       map[string][]byte{"MASTER_PASSPHRASE": []byte("piraeus")},
+		},
+	).Build()
+
+	passReads := 0
+
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == "p" {
+				passReads++
+			}
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	r := &controllerpkg.MasterKeyRunnable{Client: cli, Reader: cli, Namespace: ns}
+
+	// The first pass creates the keyring, which reads the passphrase.
+	r.Pass(t.Context())
+
+	ring, _, err := passphrase.Secrets{Reader: base, Namespace: ns}.Keyring(t.Context())
+	if err != nil || ring == nil {
+		t.Fatalf("no keyring after the first pass: %v", err)
+	}
+
+	passReads = 0
+
+	for range 3 {
+		r.Pass(t.Context())
+	}
+
+	if passReads != 0 {
+		t.Fatalf("steady passes read the passphrase %d times, want none", passReads)
 	}
 }

@@ -863,6 +863,52 @@ func TestCleanupKeepsTheSlotTheSecretOpensNow(t *testing.T) {
 	}
 }
 
+// The cleanup answers the steady state from the keyring alone, and while a
+// superseded slot waits for the Secret to move, a shared Unlocker tries the
+// Secret's passphrase once, not once per call.
+func TestCleanupDerivesOncePerSecretVersion(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(
+		refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "one")).Build()
+	secrets := passphrase.Secrets{Reader: cli, Namespace: ns}
+
+	_, err := passphrase.Bootstrap(t.Context(), cli, secrets, time.Now())
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	unlocker := &passphrase.Unlocker{Secrets: secrets}
+	cleanup := &passphrase.Ops{Client: cli, Secrets: secrets, Unlocker: unlocker}
+
+	for range 3 {
+		removed, err := cleanup.CleanupSuperseded(t.Context())
+		if err != nil || removed {
+			t.Fatalf("cleanup with no superseded slot: %v, %v", removed, err)
+		}
+	}
+
+	if got := passphrase.UnlockAttempts(unlocker); got != 0 {
+		t.Fatalf("%d passphrases tried with no superseded slot, want none", got)
+	}
+
+	_, err = (&passphrase.Ops{Client: cli, Secrets: secrets}).Modify(t.Context(), []byte("one"), []byte("two"))
+	if err != nil {
+		t.Fatalf("modify: %v", err)
+	}
+
+	for range 3 {
+		removed, err := cleanup.CleanupSuperseded(t.Context())
+		if err != nil || removed {
+			t.Fatalf("cleanup before the Secret moved: %v, %v", removed, err)
+		}
+	}
+
+	if got := passphrase.UnlockAttempts(unlocker); got != 1 {
+		t.Fatalf("%d passphrases tried while the Secret did not change, want one", got)
+	}
+}
+
 // flipSecret is setSecret on ctx, for a change made inside a client call.
 func flipSecret(ctx context.Context, t *testing.T, cli client.Client, name, value string) {
 	t.Helper()

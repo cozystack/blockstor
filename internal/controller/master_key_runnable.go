@@ -63,6 +63,10 @@ type MasterKeyRunnable struct {
 
 	// Now overrides time.Now (tests).
 	Now func() time.Time
+
+	// unlocker is kept across passes: while a superseded slot waits for
+	// the Secret to move, each pass would otherwise run Argon2id again.
+	unlocker *passphrase.Unlocker
 }
 
 // NeedLeaderElection returns true: only one controller writes the keyring.
@@ -98,8 +102,9 @@ func (r *MasterKeyRunnable) Pass(ctx context.Context) {
 		now = r.Now
 	}
 
-	created, err := passphrase.Bootstrap(ctx, r.Client,
-		passphrase.Secrets{Reader: r.Reader, Namespace: r.Namespace}, now())
+	secrets := passphrase.Secrets{Reader: r.Reader, Namespace: r.Namespace}
+
+	created, err := passphrase.Bootstrap(ctx, r.Client, secrets, now())
 	if err != nil {
 		logger.Error(err, "keyring bootstrap")
 
@@ -111,7 +116,11 @@ func (r *MasterKeyRunnable) Pass(ctx context.Context) {
 			"secret", passphrase.KeyringSecretName, "namespace", r.Namespace)
 	}
 
-	ops := &passphrase.Ops{Client: r.Client, Secrets: passphrase.Secrets{Reader: r.Reader, Namespace: r.Namespace}, Now: r.Now}
+	if r.unlocker == nil {
+		r.unlocker = &passphrase.Unlocker{Secrets: secrets}
+	}
+
+	ops := &passphrase.Ops{Client: r.Client, Secrets: secrets, Now: r.Now, Unlocker: r.unlocker}
 
 	removed, err := ops.CleanupSuperseded(ctx)
 	if err != nil {

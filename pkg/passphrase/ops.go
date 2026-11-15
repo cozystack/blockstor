@@ -97,6 +97,12 @@ type Ops struct {
 
 	// Now overrides time.Now (tests).
 	Now func() time.Time
+
+	// Unlocker, when set, is the unlock the operations read the state
+	// through, so a caller that runs them repeatedly, such as the
+	// controller's cleanup loop, derives once per Secret version rather
+	// than once per call. Nil is a fresh one per call.
+	Unlocker *Unlocker
 }
 
 // CreateResult is what Create did.
@@ -195,7 +201,7 @@ type EnterResult struct {
 // unlock Secret. Under a named passphrase Secret it only verifies; the
 // Secret is the operator's to fix.
 func (o *Ops) Enter(ctx context.Context, pass []byte) (EnterResult, error) {
-	status, err := (&Unlocker{Secrets: o.Secrets}).Unlock(ctx)
+	status, err := o.unlocker().Unlock(ctx)
 	if err != nil {
 		return EnterResult{}, err
 	}
@@ -245,7 +251,7 @@ func (o *Ops) Enter(ctx context.Context, pass []byte) (EnterResult, error) {
 		return EnterResult{}, err
 	}
 
-	status, err = (&Unlocker{Secrets: o.Secrets}).Unlock(ctx)
+	status, err = o.unlocker().Unlock(ctx)
 	if err != nil {
 		return EnterResult{}, err
 	}
@@ -275,7 +281,7 @@ func (o *Ops) Modify(ctx context.Context, oldPass, newPass []byte) (ModifyResult
 		return ModifyResult{Unchanged: err == nil}, err
 	}
 
-	status, err := (&Unlocker{Secrets: o.Secrets}).Unlock(ctx)
+	status, err := o.unlocker().Unlock(ctx)
 	if err != nil {
 		return ModifyResult{}, err
 	}
@@ -366,7 +372,7 @@ func (o *Ops) Add(ctx context.Context, auth, newPass []byte, name string) (strin
 // passphrase came from outside blockstor: the generated slot alone is one
 // deleted Secret away from losing every volume.
 func (o *Ops) Remove(ctx context.Context, auth []byte, ref string) error {
-	status, err := (&Unlocker{Secrets: o.Secrets}).Unlock(ctx)
+	status, err := o.unlocker().Unlock(ctx)
 	if err != nil {
 		return err
 	}
@@ -442,7 +448,7 @@ type SlotInfo struct {
 
 // List describes the slots and marks the one the cluster unlocks with.
 func (o *Ops) List(ctx context.Context) ([]SlotInfo, Status, error) {
-	status, err := (&Unlocker{Secrets: o.Secrets}).Unlock(ctx)
+	status, err := o.unlocker().Unlock(ctx)
 	if err != nil || status.State == StateUnset {
 		return nil, status, err
 	}
@@ -468,10 +474,24 @@ func (o *Ops) List(ctx context.Context) ([]SlotInfo, Status, error) {
 // CleanupSuperseded removes the superseded slots other than the one the
 // passphrase Secret opens, and reports whether it removed any: once the
 // Secret holds the new passphrase, the old one's slot goes.
+//
+// A keyring with no superseded slot is the steady state, and is answered
+// from the keyring alone, before any passphrase is tried.
 func (o *Ops) CleanupSuperseded(ctx context.Context) (bool, error) {
-	status, err := (&Unlocker{Secrets: o.Secrets}).Unlock(ctx)
+	ring, _, err := o.Secrets.Keyring(ctx)
+	if err != nil || ring == nil || !supersededBesides(ring, "") {
+		return false, err
+	}
+
+	status, err := o.unlocker().Unlock(ctx)
 	if err != nil || status.State != StateUnlocked {
 		return false, err
+	}
+
+	// The Secret still opens the superseded slot: the operator has not
+	// moved it yet, and there is nothing to remove.
+	if !supersededBesides(status.Ring, status.SlotID) {
+		return false, nil
 	}
 
 	removed := false
@@ -502,6 +522,22 @@ func (o *Ops) CleanupSuperseded(ctx context.Context) (bool, error) {
 }
 
 var errNothingToWrite = errors.New("nothing to write")
+
+// supersededBesides reports whether ring has a superseded slot other than
+// keepID.
+func supersededBesides(ring *keyring.Keyring, keepID string) bool {
+	return slices.ContainsFunc(ring.Slots, func(slot keyring.Slot) bool {
+		return slot.Superseded && slot.ID != keepID
+	})
+}
+
+func (o *Ops) unlocker() *Unlocker {
+	if o.Unlocker != nil {
+		return o.Unlocker
+	}
+
+	return &Unlocker{Secrets: o.Secrets}
+}
 
 // unlockSlotIn is the slot of ring the passphrase Secret ref opens now, or
 // ErrLocked when it opens none.
