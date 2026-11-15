@@ -151,10 +151,12 @@ blockstor resource-definition list-properties my-volume
 
 ```sh
 blockstor encryption create-passphrase '<passphrase>'
-blockstor encryption add-passphrase --name recovery '<passphrase>' '<recovery passphrase>'
+blockstor encryption add-passphrase --name recovery --passphrase-file ./current --new-passphrase-file ./recovery
 blockstor encryption list-passphrases
-blockstor encryption modify-passphrase '<old>' '<new>'
+blockstor encryption modify-passphrase --old-passphrase-file ./old --new-passphrase-file ./new
 blockstor encryption remove-passphrase recovery
 ```
+
+`add-passphrase`, `modify-passphrase` and `remove-passphrase` never take a passphrase as an argument. Without the `--*-passphrase-file` flags they ask on the terminal, or read one passphrase per line from stdin. A file is used byte for byte: a newline it ends with is part of the passphrase, as it is in the passphrase Secret, so write the file with `printf '%s'` rather than `echo` unless the newline is meant.
 
 See [Layer stack](../layer-stack/#encryption) before you use it.

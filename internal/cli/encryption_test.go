@@ -271,7 +271,7 @@ func TestEncryptionSlotVerbs(t *testing.T) {
 	dir := t.TempDir()
 	oldFile, newFile := dir+"/old", dir+"/new"
 
-	if err := os.WriteFile(oldFile, []byte("second\n"), 0o600); err != nil {
+	if err := os.WriteFile(oldFile, []byte("second"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -293,6 +293,39 @@ func TestEncryptionSlotVerbs(t *testing.T) {
 
 	if keyringOpens(t, client, "third") {
 		t.Fatal("the removed passphrase still opens")
+	}
+}
+
+// A passphrase file is read byte for byte, as the passphrase Secret is: a
+// trailing newline is part of the passphrase it enrols, so a file written
+// from the Secret enrols what the Secret opens.
+func TestEncryptionPassphraseFileIsVerbatim(t *testing.T) {
+	t.Parallel()
+
+	app, client, errBuf := newKubeApp(t)
+
+	dir := t.TempDir()
+	authFile, newFile := dir+"/auth", dir+"/new"
+
+	if err := os.WriteFile(authFile, []byte("first"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := os.WriteFile(newFile, []byte("from-secret\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	for _, argv := range [][]string{
+		{"encryption", "create-passphrase", "-p", "first"},
+		{"encryption", "add-passphrase", "--name", "recovery", "--passphrase-file", authFile, "--new-passphrase-file", newFile},
+	} {
+		if got := app.Run(t.Context(), argv); got != 0 {
+			t.Fatalf("%v: exit %d (stderr: %s)", argv, got, errBuf.String())
+		}
+	}
+
+	if !keyringOpens(t, client, "from-secret\n") || keyringOpens(t, client, "from-secret") {
+		t.Fatal("the file's trailing newline was not kept in the enrolled passphrase")
 	}
 }
 

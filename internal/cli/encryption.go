@@ -413,7 +413,11 @@ func (p *slotPassphrases) read(name, prompt string) (string, error) {
 			return "", fmt.Errorf("read --%s-file: %w", name, err)
 		}
 
-		value = strings.TrimRight(string(data), "\r\n")
+		// Byte for byte, as the passphrase Secret and linstor-migrate
+		// take it: a newline the file ends with is part of the
+		// passphrase, so a file written from the Secret enrols the
+		// passphrase the Secret opens.
+		value = string(data)
 	default:
 		value, err = p.prompt(prompt)
 		if err != nil {
