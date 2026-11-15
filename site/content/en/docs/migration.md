@@ -75,7 +75,7 @@ linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifes
   -linstor-passphrase-file /run/linstor-pass -keyring-out ./blockstor-keyring.yaml
 ```
 
-The last two flags are for a cluster with LUKS volumes. `/run/linstor-pass` holds the LINSTOR master passphrase byte for byte, the `MASTER_PASSPHRASE` of the Secret piraeus reads. The tool decrypts every volume's password the way LINSTOR does and wraps it under a new blockstor master key, written to `./blockstor-keyring.yaml` with the LINSTOR passphrase as its one slot. Keep the Secret: point `ControllerConfig.spec.passphraseSecretRef` at it and blockstor unlocks from it as LINSTOR did. A wrong passphrase stops the run before anything is written, and without it a dump with LUKS volumes is refused.
+The last two flags are for a cluster with LUKS volumes. `/run/linstor-pass` holds the LINSTOR master passphrase byte for byte, the `MASTER_PASSPHRASE` of the Secret piraeus reads. The tool decrypts every volume's password the way LINSTOR does and wraps it under a new blockstor master key, written to `./blockstor-keyring.yaml` with the LINSTOR passphrase as its one slot. Keep the Secret: point `ControllerConfig.spec.passphraseSecretRef` at it and blockstor unlocks from it as LINSTOR did. A wrong passphrase stops the run before anything is written, and without it a dump with LUKS volumes is refused. The passphrase is checked even when no volume is encrypted; if LINSTOR never had a master passphrase, there is nothing to check it against and the run is refused, so leave the two flags out.
 
 Read the whole report it prints. Each `warning:` line is something the tool refused to guess. Resolve every one of these before you go on:
 

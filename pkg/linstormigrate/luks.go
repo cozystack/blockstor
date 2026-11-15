@@ -71,6 +71,14 @@ var (
 	// encrypted master key in the controller properties.
 	ErrLinstorNoMasterKey = errors.New("the dump has no LINSTOR master key (encrypted/masterkey)")
 
+	// ErrLinstorPassphraseUnchecked is a LINSTOR passphrase given for a
+	// dump that has neither LUKS volumes nor a LINSTOR master key: there
+	// is nothing to check it against, and a keyring made from it would
+	// hold a passphrase nobody verified.
+	ErrLinstorPassphraseUnchecked = errors.New(
+		"the dump has no LINSTOR master key (encrypted/masterkey) to check the passphrase against; " +
+			"LINSTOR had no master passphrase, so drop -linstor-passphrase-file and the keyring flags")
+
 	// ErrLinstorBadPassword is a volume password that does not decrypt
 	// to a well-formed padded block. CFB has no MAC, so a good-looking
 	// result is no proof; the satellite opening the volume is.

@@ -248,6 +248,45 @@ func TestConvertRefusesLUKSWithoutThePassphrase(t *testing.T) {
 	}
 }
 
+// A given passphrase is checked even when the dump has no LUKS volume: the
+// keyring made from it is what the cluster will unlock with. With no LINSTOR
+// master key to check it against, it is refused rather than trusted.
+func TestConvertChecksThePassphraseWithoutLUKSVolumes(t *testing.T) {
+	t.Parallel()
+
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	dump.LayerLuksVolumes = nil
+
+	res, err := ConvertWithOptions(dump, Options{LUKS: fixtureLUKS(t)})
+	if err != nil || res == nil {
+		t.Fatalf("right passphrase: %v", err)
+	}
+
+	wrong := fixtureLUKS(t)
+	wrong.LinstorPassphrase = []byte("wrong")
+
+	res, err = ConvertWithOptions(dump, Options{LUKS: wrong})
+	if !errors.Is(err, ErrLinstorWrongPassphrase) || res != nil {
+		t.Errorf("wrong passphrase: %v", err)
+	}
+
+	dump.PropsContainers = nil
+
+	res, err = ConvertWithOptions(dump, Options{LUKS: fixtureLUKS(t)})
+	if !errors.Is(err, ErrLinstorPassphraseUnchecked) || res != nil {
+		t.Errorf("nothing to check against: %v", err)
+	}
+
+	res, err = Convert(dump)
+	if err != nil || res == nil {
+		t.Errorf("no passphrase and no LUKS volume: %v", err)
+	}
+}
+
 // A snapshot's LUKS rows become its luksKeys, per node, under the node's
 // CR name.
 func TestConvertImportsTheSnapshotPasswords(t *testing.T) {

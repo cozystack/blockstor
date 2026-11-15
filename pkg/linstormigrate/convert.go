@@ -2262,16 +2262,25 @@ func orZero(v *int32) int32 {
 // importLUKSKeys decrypts every LAYER_LUKS_VOLUMES password, live replicas
 // and snapshots alike, under LINSTOR's master key and wraps it under the
 // blockstor one. No plaintext password outlives this call.
+//
+// A given passphrase is always checked against LINSTOR's master key, LUKS
+// volumes or not: a keyring made from it is the one the cluster unlocks
+// with, and a typo would otherwise surface only once a volume is formatted
+// under it. A passphrase with no master key to check against is refused.
 func (c *converter) importLUKSKeys() error {
-	if len(c.dump.LayerLuksVolumes) == 0 {
-		return nil
-	}
-
 	if c.opts.LUKS == nil || c.opts.LUKS.MasterKey == nil {
+		if len(c.dump.LayerLuksVolumes) == 0 {
+			return nil
+		}
+
 		return ErrLUKSNeedsPassphrase
 	}
 
 	linstorMaster, err := LinstorMasterKey(c.dump.PropsContainers, c.opts.LUKS.LinstorPassphrase)
+	if errors.Is(err, ErrLinstorNoMasterKey) && len(c.dump.LayerLuksVolumes) == 0 {
+		return ErrLinstorPassphraseUnchecked
+	}
+
 	if err != nil {
 		return err
 	}
