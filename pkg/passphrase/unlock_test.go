@@ -812,6 +812,57 @@ func TestModifyReadsTheSlotTheSecretOpensNow(t *testing.T) {
 	}
 }
 
+// The cleanup keeps the slot the passphrase Secret opens when the keyring is
+// written, not when the state was read: a Secret moved back to the
+// superseded passphrase in between keeps that slot, and the cluster stays
+// unlocked.
+func TestCleanupKeepsTheSlotTheSecretOpensNow(t *testing.T) {
+	t.Parallel()
+
+	base := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(
+		refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "one")).Build()
+	setup := &passphrase.Ops{Client: base, Secrets: passphrase.Secrets{Reader: base, Namespace: ns}}
+
+	_, err := passphrase.Bootstrap(t.Context(), base, setup.Secrets, time.Now())
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	result, err := setup.Modify(t.Context(), []byte("one"), []byte("two"))
+	if err != nil || result.SecretToUpdate != "p" {
+		t.Fatalf("modify: %+v, %v", result, err)
+	}
+
+	setSecret(t, base, "p", "two")
+
+	passGets := 0
+
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			// The state is read with the Secret on "two"; right after,
+			// the operator rolls the Secret back to "one".
+			if key.Name == "p" {
+				passGets++
+				if passGets == 1 {
+					defer flipSecret(ctx, t, c, "p", "one")
+				}
+			}
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	removed, err := ops.CleanupSuperseded(t.Context())
+	if err != nil || removed {
+		t.Fatalf("cleanup: %v, %v; want the slot the Secret opens again kept", removed, err)
+	}
+
+	if stateOf(t, setup).State != passphrase.StateUnlocked {
+		t.Fatal("the cluster is locked")
+	}
+}
+
 // flipSecret is setSecret on ctx, for a change made inside a client call.
 func flipSecret(ctx context.Context, t *testing.T, cli client.Client, name, value string) {
 	t.Helper()

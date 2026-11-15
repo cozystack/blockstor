@@ -477,14 +477,24 @@ func (o *Ops) CleanupSuperseded(ctx context.Context) (bool, error) {
 	removed := false
 
 	err = o.mutate(ctx, func(ring *keyring.Keyring) error {
-		removed = ring.RemoveSuperseded(status.SlotID)
+		// The Secret may have moved back to the superseded passphrase
+		// since the state was read; the slot it opens now, in the
+		// keyring about to be written, is the one to keep.
+		unlockID, unlockErr := o.unlockSlotIn(ctx, ring, status.Ref)
+		if unlockErr != nil {
+			return unlockErr
+		}
+
+		removed = ring.RemoveSuperseded(unlockID)
 		if !removed {
 			return errNothingToWrite
 		}
 
 		return nil
 	})
-	if errors.Is(err, errNothingToWrite) {
+	// A Secret that opens no slot now is a locked cluster: nothing is
+	// removed, and the state says so on its own.
+	if errors.Is(err, errNothingToWrite) || errors.Is(err, ErrLocked) {
 		return false, nil
 	}
 
