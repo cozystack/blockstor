@@ -703,6 +703,11 @@ func TestPassphraseSlotVerbs(t *testing.T) {
 		t.Errorf("add under a taken name: %d, want 409", got)
 	}
 
+	// A name that reads as a slot ID would be resolved as one first.
+	if got := callEncryption(t, http.MethodPost, url, map[string]string{"passphrase": "v1", "new_passphrase": "r3", "name": "deadbeef"}); got != http.StatusBadRequest {
+		t.Errorf("add under a name that reads as a slot ID: %d, want 400", got)
+	}
+
 	resp := httpGet(t, url)
 
 	raw, _ := io.ReadAll(resp.Body)

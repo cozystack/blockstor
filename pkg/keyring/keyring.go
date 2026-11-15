@@ -39,6 +39,9 @@ const (
 	// failed unlock costs one Argon2id run per slot.
 	MaxSlots = 8
 
+	// MaxSlotNameLen is the longest slot name.
+	MaxSlotNameLen = 32
+
 	// KDFArgon2id is the only slot KDF implemented.
 	KDFArgon2id = "argon2id"
 
@@ -96,6 +99,11 @@ var (
 
 	// ErrDuplicateName is a slot name already taken in the keyring.
 	ErrDuplicateName = errors.New("a slot with this name already exists")
+
+	// ErrInvalidName is a slot name outside [a-z0-9-]{1,32}, or one that
+	// reads as a slot ID: slots are addressed by ID first, so such a name
+	// could shadow another slot's ID.
+	ErrInvalidName = errors.New("a slot name is 1 to 32 lowercase letters, digits and dashes, and not 8 hex digits")
 
 	// ErrKeyMismatch is a master key that is not the one of this keyring.
 	ErrKeyMismatch = errors.New("the master key does not belong to this keyring")
@@ -255,6 +263,10 @@ func (k *Keyring) Opens(passphrase []byte) (string, error) {
 func (k *Keyring) AddSlot(master *MasterKey, passphrase []byte, name, origin string, now time.Time) (string, error) {
 	if subtle.ConstantTimeCompare([]byte(master.KeyID()), []byte(k.KeyID)) != 1 {
 		return "", ErrKeyMismatch
+	}
+
+	if !ValidSlotName(name) {
+		return "", errors.Wrapf(ErrInvalidName, "%q", name)
 	}
 
 	if len(k.Slots) >= MaxSlots {
@@ -518,8 +530,8 @@ func (s *Slot) validateMeta() error {
 	switch {
 	case !validHex(s.ID, slotIDSize):
 		return errors.Wrapf(ErrMalformed, "slot ID %q", s.ID)
-	case s.Name == "":
-		return errors.Wrapf(ErrMalformed, "slot %q has no name", s.ID)
+	case !ValidSlotName(s.Name):
+		return errors.Wrapf(ErrMalformed, "slot %q: name %q", s.ID, s.Name)
 	case !slices.Contains([]string{OriginSecret, OriginAPI, OriginGenerated}, s.Origin):
 		return errors.Wrapf(ErrMalformed, "slot %q: origin %q", s.ID, s.Origin)
 	case s.AEAD != AEADAES256GCM:
@@ -548,6 +560,23 @@ func (kdf *KDF) validate(slotID string) error {
 	}
 
 	return nil
+}
+
+// ValidSlotName reports whether name may name a slot: 1 to MaxSlotNameLen
+// lowercase letters, digits and dashes, and not eight hex digits, which is
+// what a slot ID looks like and would be resolved as one first.
+func ValidSlotName(name string) bool {
+	if name == "" || len(name) > MaxSlotNameLen {
+		return false
+	}
+
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+
+	return !validHex(name, slotIDSize)
 }
 
 func validHex(s string, size int) bool {

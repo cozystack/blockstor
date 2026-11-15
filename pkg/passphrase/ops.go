@@ -229,16 +229,13 @@ func (o *Ops) Enter(ctx context.Context, pass []byte) (EnterResult, error) {
 	defer clear(generated)
 
 	err = o.mutate(ctx, func(ring *keyring.Keyring) error {
-		for {
-			idx := ring.SlotIndex(SlotNameGenerated)
-			if idx < 0 {
-				break
-			}
+		// By origin, not by name: a slot an operator named "generated"
+		// holds a passphrase someone knows, and stays.
+		ring.Slots = slices.DeleteFunc(ring.Slots, func(slot keyring.Slot) bool {
+			return slot.Origin == keyring.OriginGenerated
+		})
 
-			ring.Slots = slices.Delete(ring.Slots, idx, idx+1)
-		}
-
-		_, addErr := ring.AddSlot(master, generated, SlotNameGenerated, keyring.OriginGenerated, o.now())
+		_, addErr := ring.AddSlot(master, generated, freshName(ring, SlotNameGenerated), keyring.OriginGenerated, o.now())
 
 		return addErr //nolint:wrapcheck // keyring errors name the slot
 	})
@@ -670,12 +667,14 @@ func generateUnlockPassphrase() ([]byte, error) {
 	return out, nil
 }
 
-// freshName is base, or base-2, base-3, ... whichever no slot has.
+// freshName is base, or base-2, base-3, ... whichever no slot has, with
+// base shortened so that the name stays within keyring.MaxSlotNameLen.
 func freshName(ring *keyring.Keyring, base string) string {
 	name := base
 
 	for n := 2; ring.SlotIndex(name) >= 0; n++ {
-		name = base + "-" + strconv.Itoa(n)
+		suffix := "-" + strconv.Itoa(n)
+		name = base[:min(len(base), keyring.MaxSlotNameLen-len(suffix))] + suffix
 	}
 
 	return name

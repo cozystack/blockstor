@@ -146,7 +146,7 @@ A Secret `blockstor-master-key` in the blockstor namespace, type `blockstor.org/
 }
 ```
 
-`origin` is `Secret` (enrolled from the passphrase Secret), `API` (given through REST or the CLI) or `Generated` (section 6.2). One object means every slot operation is one atomic update guarded by `resourceVersion`. At most 8 slots, as in LUKS1; each verification attempt costs one Argon2id run per slot.
+`origin` is `Secret` (enrolled from the passphrase Secret), `API` (given through REST or the CLI) or `Generated` (section 6.2). One object means every slot operation is one atomic update guarded by `resourceVersion`. At most 8 slots, as in LUKS1; each verification attempt costs one Argon2id run per slot. A slot name is 1 to 32 characters from `[a-z0-9-]` and is never eight hex digits: slot references resolve an ID before a name, so such a name could shadow another slot's ID. Code that looks for the generated slot goes by `origin`, never by name.
 
 **Decision (D6): where the keyring lives.** A dedicated Secret (chosen), or a field on `ControllerConfig`, or a new CRD. The slots contain no key, but they are what an attacker needs to guess a weak passphrase offline, so they deserve Secret RBAC and Secret encryption at rest. A CR would also put them into every `kubectl get -o yaml` dump of the blockstor objects.
 

@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -284,6 +285,8 @@ func TestValidateRefusesMalformedKeyrings(t *testing.T) {
 		},
 		"slot ID": func(k *Keyring) { k.Slots[0].ID = "a41c" },
 		"name":    func(k *Keyring) { k.Slots[0].Name = "" },
+		"name ID": func(k *Keyring) { k.Slots[0].Name = "deadbeef" },
+		"name up": func(k *Keyring) { k.Slots[0].Name = "Secret" },
 		"origin":  func(k *Keyring) { k.Slots[0].Origin = "Imported" },
 		"aead":    func(k *Keyring) { k.Slots[0].AEAD = "chacha20-poly1305" },
 		"nonce":   func(k *Keyring) { k.Slots[0].Nonce = k.Slots[0].Nonce[:8] },
@@ -377,6 +380,46 @@ func TestAddSlot(t *testing.T) {
 
 	if len(ring.Slots) != 2 {
 		t.Fatalf("%d slots after refused adds, want 2", len(ring.Slots))
+	}
+}
+
+// Slot names are [a-z0-9-]{1,32} and never read as a slot ID, which slot
+// references resolve first. A refused name is refused before any
+// derivation, and leaves the keyring as it was.
+func TestSlotNames(t *testing.T) {
+	t.Parallel()
+
+	for name, want := range map[string]bool{
+		"recovery":              true,
+		"secret-2":              true,
+		"0":                     true,
+		strings.Repeat("a", 32): true,
+		"deadbeef0":             true,
+		"":                      false,
+		strings.Repeat("a", 33): false,
+		"Recovery":              false,
+		"off_site":              false,
+		"two words":             false,
+		"deadbeef":              false,
+		"0123abcd":              false,
+		"ключ":                  false,
+	} {
+		if got := ValidSlotName(name); got != want {
+			t.Errorf("ValidSlotName(%q) = %v, want %v", name, got, want)
+		}
+	}
+
+	ring := katKeyring(t)
+
+	for _, name := range []string{"", "deadbeef", "Off_Site"} {
+		_, err := ring.AddSlot(katMasterKey(t), []byte("pass"), name, OriginAPI, testNowTime())
+		if !errors.Is(err, ErrInvalidName) {
+			t.Errorf("AddSlot(%q): err %v, want ErrInvalidName", name, err)
+		}
+	}
+
+	if len(ring.Slots) != 1 {
+		t.Fatalf("%d slots after refused adds, want 1", len(ring.Slots))
 	}
 }
 

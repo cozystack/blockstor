@@ -909,6 +909,57 @@ func TestCleanupDerivesOncePerSecretVersion(t *testing.T) {
 	}
 }
 
+// Enter's repair of a locked cluster on the generated unlock Secret drops
+// the generated slots by origin: an operator's slot that happens to be
+// named "generated" holds a passphrase someone knows, and stays.
+func TestEnterDropsGeneratedSlotsByOrigin(t *testing.T) {
+	t.Parallel()
+
+	ring, master, err := keyring.New([]byte("first"), passphrase.SlotNameGenerated, keyring.OriginAPI, time.Now())
+	if err != nil {
+		t.Fatalf("keyring.New: %v", err)
+	}
+
+	defer master.Destroy()
+
+	_, err = ring.AddSlot(master, []byte("lost"), "unlock", keyring.OriginGenerated, time.Now())
+	if err != nil {
+		t.Fatalf("AddSlot: %v", err)
+	}
+
+	// No ControllerConfig, so the cluster runs on the generated unlock
+	// Secret; that Secret is gone, so it is locked.
+	cli := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(keyringSecret(t, ring)).Build()
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	result, err := ops.Enter(t.Context(), []byte("first"))
+	if err != nil || !result.Repaired || result.Status.State != passphrase.StateUnlocked {
+		t.Fatalf("enter: %+v, %v; want a repaired, unlocked cluster", result, err)
+	}
+
+	status := stateOf(t, ops)
+
+	if _, err := status.Ring.Opens([]byte("first")); err != nil {
+		t.Fatalf("the operator's slot named %q was dropped", passphrase.SlotNameGenerated)
+	}
+
+	if _, err := status.Ring.Opens([]byte("lost")); err == nil {
+		t.Fatal("the old generated slot survived the repair")
+	}
+
+	generated := 0
+
+	for _, slot := range status.Ring.Slots {
+		if slot.Origin == keyring.OriginGenerated {
+			generated++
+		}
+	}
+
+	if generated != 1 || len(status.Ring.Slots) != 2 {
+		t.Fatalf("slots %+v; want the operator's and one fresh generated slot", status.Ring.Slots)
+	}
+}
+
 // flipSecret is setSecret on ctx, for a change made inside a client call.
 func flipSecret(ctx context.Context, t *testing.T, cli client.Client, name, value string) {
 	t.Helper()

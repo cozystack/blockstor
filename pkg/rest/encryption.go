@@ -553,6 +553,8 @@ func writePassphraseError(w http.ResponseWriter, err error) bool {
 		status = http.StatusPreconditionFailed
 	case errors.Is(err, keyring.ErrSlotNotFound):
 		status = http.StatusNotFound
+	case errors.Is(err, keyring.ErrInvalidName):
+		status = http.StatusBadRequest
 	case errors.Is(err, passphrase.ErrUnlockSlot), errors.Is(err, keyring.ErrLastSlot),
 		errors.Is(err, passphrase.ErrLocked), errors.Is(err, passphrase.ErrLastHumanSlot), errors.Is(err, passphrase.ErrRemoveSelf),
 		errors.Is(err, keyring.ErrDuplicateName), errors.Is(err, keyring.ErrTooManySlots):
