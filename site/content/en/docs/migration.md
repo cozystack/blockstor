@@ -45,11 +45,11 @@ Not converted, and listed in the tool's report:
      node=$(kubectl -n cozy-linstor get pod "$pod" -o jsonpath='{.spec.nodeName}')
      kubectl -n cozy-linstor exec "$pod" -- drbdsetup show | awk -v node="$node" '
        /^resource / { rd = $2; gsub(/"/, "", rd) }
-       /_this_host ipv4/ && rd != "" { n = split($3, a, ":"); port = a[n]; sub(/;$/, "", port); print rd, node, port; rd = "" }'
+       /_this_host ipv[46]/ && rd != "" { n = split($3, a, ":"); port = a[n]; sub(/;$/, "", port); print rd, node, port; rd = "" }'
    done | sort -u > drbd-ports.txt
    ```
 
-   Change the namespace and label to match your installation. Each line is `<volume> <node> <port>`, so replicas of one volume on different ports keep their own. If your LINSTOR node names differ from the Kubernetes ones, put the LINSTOR name in the second column. The converter refuses a map that gives one replica two ports, and reports a replica it has no port for while it has its peers'.
+   Change the namespace and label to match your installation. Each line is `<volume> <node> <port>`, so replicas of one volume on different ports keep their own. If your LINSTOR node names differ from the Kubernetes ones, put the LINSTOR name in the second column. The converter refuses a map that gives one replica two ports, and refuses manifests that would put two replicas on one port on the same node. It reports a replica it has no port for while it has its peers', and map entries for nodes that host no replica of the definition.
 
 4. **Take pool snapshots.** A recursive `zfs snapshot` of every pool gives you a rollback point that does not depend on either control plane.
 
