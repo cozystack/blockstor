@@ -336,6 +336,16 @@ func encryptionListPassphrases(ctx context.Context, run *runContext) error {
 		return fmt.Errorf("write: %w", err)
 	}
 
+	// The key ID is what every luksKey.keyID names: after a migration it
+	// tells whether the keyring in place is the one the passwords were
+	// wrapped under.
+	if status.Ring != nil {
+		_, err = fmt.Fprintf(run.Out, "key ID: %s\n", status.Ring.KeyID)
+		if err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+	}
+
 	for _, slot := range slots {
 		marks := ""
 		if slot.Unlocks {

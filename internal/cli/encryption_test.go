@@ -268,6 +268,11 @@ func TestEncryptionSlotVerbs(t *testing.T) {
 		t.Fatalf("list:\n%s", listed)
 	}
 
+	ring, _, err := passphrase.Secrets{Reader: client, Namespace: testNamespace}.Keyring(t.Context())
+	if err != nil || ring == nil || !strings.Contains(listed, "key ID: "+ring.KeyID+"\n") {
+		t.Fatalf("list does not name the keyring's key ID (%v):\n%s", err, listed)
+	}
+
 	dir := t.TempDir()
 	oldFile, newFile := dir+"/old", dir+"/new"
 
