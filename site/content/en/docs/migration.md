@@ -91,15 +91,22 @@ A definition with no layer stack whose replicas all agree takes their stack with
 
 1. **Stop new volumes.** Scale the CSI provisioner and attacher to zero.
 2. **Stop the LINSTOR controller.** Scale `deploy/linstor-controller` to zero. Leave the LINSTOR satellites and the DRBD devices running: they keep serving I/O.
-3. **Install blockstor** as described in [Installation](../installation/), with satellites on the same nodes and pools. Check the image versions before you start them.
-4. **Apply the converted manifests.** They are already in dependency order:
+3. **Apply the keyring before blockstor starts**, if you converted with `-keyring-out`. A blockstor controller that finds the passphrase Secret and no keyring makes a keyring of its own, with a new master key, within 30 seconds of starting. Under Cozystack `linstor-passphrase` already exists, so this happens at once. The converted volumes' passwords are wrapped under the master key in `./blockstor-keyring.yaml`, and would not open under that new one. Apply it into blockstor's namespace first:
+
+   ```sh
+   kubectl apply -f ./blockstor-keyring.yaml
+   ```
+
+   If blockstor has already started and made its own keyring, replace it with `kubectl replace -f ./blockstor-keyring.yaml`. That is safe only while no LUKS volume has been formatted under it: no Resource and no Snapshot carries a `luksKey` yet, which holds while provisioning is stopped and the manifests are not applied. Then check that `blockstor encryption list-passphrases` prints the same `key ID` as the `luksKey.keyID` in `./blockstor-manifests.yaml`. Do not go on while they differ.
+4. **Install blockstor** as described in [Installation](../installation/), with satellites on the same nodes and pools. Check the image versions before you start them.
+5. **Apply the converted manifests.** They are already in dependency order:
 
    ```sh
    kubectl apply -f ./blockstor-manifests.yaml
    ```
 
-5. **Wait for adoption.** Every replica should report `UpToDate` without starting a resync, `blockstor resource list --faulty` should be empty, and every pool should report its real free space.
-6. **Point CSI at blockstor**, as in [Provisioning volumes with CSI](../csi/), and scale the provisioner and attacher back up. Create a test PVC, and check that an existing PVC still mounts read-write.
+6. **Wait for adoption.** Every replica should report `UpToDate` without starting a resync, `blockstor resource list --faulty` should be empty, and every pool should report its real free space.
+7. **Point CSI at blockstor**, as in [Provisioning volumes with CSI](../csi/), and scale the provisioner and attacher back up. Create a test PVC, and check that an existing PVC still mounts read-write.
 
 ## Check before you call it done
 

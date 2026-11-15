@@ -244,7 +244,7 @@ This is the piraeus contract carried over, with one translation: in LINSTOR the 
 
 **Locked.** A keyring exists, and the passphrase Secret is missing or opens no slot. A locked cluster blocks only opening, formatting and resizing a LUKS volume: those fail with a `MasterKeyLocked` Warning Event on the Resource. A replica whose mapper is already open reconciles as usual, since its password is not read, and keeps serving I/O; it cannot grow until the cluster is unlocked again. `GET /v1/encryption/passphrase` reports `locked`. The fix is to put a passphrase that opens a slot into the Secret. LINSTOR under piraeus fails the same way, at controller start.
 
-**A cluster migrated from piraeus.** The Secret stays as it is; only `passphraseSecretRef` has to name it. The keyring written by `linstor-migrate` (section 9) has a slot for the LINSTOR master passphrase, so the first start finds a Secret that opens a slot and is unlocked with no operator step.
+**A cluster migrated from piraeus.** The Secret stays as it is; only `passphraseSecretRef` has to name it. The keyring written by `linstor-migrate` (section 9) has a slot for the LINSTOR master passphrase, so the first start finds a Secret that opens a slot and is unlocked with no operator step. That holds only if the converted keyring is in place before the controller first starts: a controller that finds the Secret and no keyring bootstraps one with a new master key on its first pass, and the imported passwords do not open under it. The runbook (`docs/linstor-migration.md`, cutover step 3) applies the keyring first and checks with `list-passphrases` that its key ID is the one the converted Resources name.
 
 ### 6.2 With no passphrase Secret referenced
 

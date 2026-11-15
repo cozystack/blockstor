@@ -87,7 +87,7 @@ linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifes
   -linstor-passphrase-file /run/linstor-pass -keyring-out ./blockstor-keyring.yaml -keyring-namespace <blockstor namespace>
 ```
 
-`-linstor-passphrase-file` and `-keyring-out` are needed only when the dump has LUKS volumes; a wrong passphrase stops the run before anything is written. A passphrase that is given is checked against LINSTOR's master key even when no volume is encrypted, since the keyring made from it is what blockstor will unlock with. If LINSTOR never had a master passphrase (no `encrypted/masterkey` in the dump), there is nothing to check it against, and the run is refused: drop the LUKS flags. `./blockstor-keyring.yaml` is the keyring Secret: it holds the master key wrapped under the LINSTOR passphrase and nothing in the clear, and is applied with the manifests. To convert into a blockstor cluster that already has a keyring, pass `-keyring-in <keyring.json> -blockstor-passphrase-file <file>` instead of `-keyring-out`, where `keyring.json` is the `keyring.json` key of its `blockstor-master-key` Secret.
+`-linstor-passphrase-file` and `-keyring-out` are needed only when the dump has LUKS volumes; a wrong passphrase stops the run before anything is written. A passphrase that is given is checked against LINSTOR's master key even when no volume is encrypted, since the keyring made from it is what blockstor will unlock with. If LINSTOR never had a master passphrase (no `encrypted/masterkey` in the dump), there is nothing to check it against, and the run is refused: drop the LUKS flags. `./blockstor-keyring.yaml` is the keyring Secret: it holds the master key wrapped under the LINSTOR passphrase and nothing in the clear. It is applied before the blockstor controller starts, not with the manifests: see cutover step 3. To convert into a blockstor cluster that already has a keyring, pass `-keyring-in <keyring.json> -blockstor-passphrase-file <file>` instead of `-keyring-out`, where `keyring.json` is the `keyring.json` key of its `blockstor-master-key` Secret.
 
 Read the report on stderr end to end. Every `warning:` line is a thing the converter refused to guess — decide per line whether it matters for your data before continuing. In particular check that every LUKS definition reports its passwords migrated, and resolve every `no DRBD port` line (it should be empty if the port capture was complete).
 
@@ -99,9 +99,33 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 
 2. **Stop the LINSTOR controller.** Scale `deploy/linstor-controller` to 0. The satellites and the running DRBD devices keep serving I/O — only the control plane goes away. Do NOT stop the satellites or unload DRBD.
 
-3. **Deploy blockstor** (apiserver + controller + satellites) pointed at the same nodes and pools. The satellites must land on the same nodes with the same pool backing devices. Do not let blockstor create-md or mkfs — the adoption guards (existing DRBD metadata is not re-created, a populated filesystem is not re-formatted) protect the data, but verify the satellite image is the intended version first.
+3. **Apply the keyring Secret before the blockstor controller starts** (only with `-keyring-out`). A blockstor controller that finds a passphrase Secret and no keyring creates a keyring of its own from that Secret, with a new master key, on its first pass and then every 30 seconds. Under Cozystack the Secret `linstor-passphrase` already exists and `passphraseSecretRef` names it, so this happens as soon as the controller is up. The converted Resources carry passwords wrapped under the master key in `./blockstor-keyring.yaml`, not under that new one, and would never open. Apply the converted keyring first, into blockstor's namespace (it must exist; under Cozystack it is `cozy-linstor`):
 
-4. **Apply the manifests in order.** `WriteManifests` already emits them in dependency order, so a single apply works:
+   ```bash
+   kubectl apply -f ./blockstor-keyring.yaml
+   ```
+
+   If the controller has already started and created its own keyring, replace that keyring with the converted one. This is safe only while no LUKS volume has been formatted under it, that is, while no Resource and no Snapshot carries a LUKS password yet; with provisioning frozen and the manifests not applied, that holds. Check, then replace:
+
+   ```bash
+   kubectl get resources.blockstor.org,snapshots.blockstor.org -o json \
+     | jq '[.items[] | select(([.spec.volumes[]?.luksKey] | any) or ((.spec.luksKeys // []) | length > 0))] | length'
+   # must print 0; otherwise stop and investigate before replacing anything
+   kubectl replace -f ./blockstor-keyring.yaml
+   ```
+
+   Either way, confirm the keyring in place is the converted one before applying the manifests. `blockstor encryption list-passphrases` prints its `key ID`, which must equal the `luksKey.keyID` the converted manifests carry:
+
+   ```bash
+   blockstor encryption list-passphrases | grep '^key ID:'
+   grep -m1 'keyID:' ./blockstor-manifests.yaml
+   ```
+
+   A different key ID means the controller's own keyring is in place: replace it as above before going on.
+
+4. **Deploy blockstor** (apiserver + controller + satellites) pointed at the same nodes and pools. The satellites must land on the same nodes with the same pool backing devices. Do not let blockstor create-md or mkfs — the adoption guards (existing DRBD metadata is not re-created, a populated filesystem is not re-formatted) protect the data, but verify the satellite image is the intended version first.
+
+5. **Apply the manifests in order.** `WriteManifests` already emits them in dependency order, so a single apply works:
 
    ```bash
    kubectl apply -f ./blockstor-manifests.yaml
@@ -109,9 +133,9 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 
    If you prefer staged application, the order is: `ControllerConfig` → `Node` → `StoragePool` → `ResourceGroup` → `ResourceDefinition` → `Resource` → `Snapshot`.
 
-5. **Wait for adoption to converge.** Every `Resource` should report its DRBD device `UpToDate` (adopted, not resynced — watch that `out-of-sync` stays 0, i.e. no unexpected full sync started). `linstor r l --faulty` against the blockstor apiserver is empty. Storage pools report their real free capacity.
+6. **Wait for adoption to converge.** Every `Resource` should report its DRBD device `UpToDate` (adopted, not resynced — watch that `out-of-sync` stays 0, i.e. no unexpected full sync started). `linstor r l --faulty` against the blockstor apiserver is empty. Storage pools report their real free capacity.
 
-6. **Repoint and unfreeze CSI.** Point linstor-csi at the blockstor apiserver, then scale the provisioner/attacher back up. Provision one test PVC and confirm it binds and that an existing PVC still mounts read-write.
+7. **Repoint and unfreeze CSI.** Point linstor-csi at the blockstor apiserver, then scale the provisioner/attacher back up. Provision one test PVC and confirm it binds and that an existing PVC still mounts read-write.
 
 ## Verify (before declaring done)
 
