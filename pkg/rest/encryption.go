@@ -106,7 +106,11 @@ var errNoEncryptionClient = errors.New("cluster passphrase requires an apiserver
 // ControllerConfig names, or in the unlock Secret blockstor generates.
 // Passphrases given through these endpoints live only in slots.
 //
-// +kubebuilder:rbac:groups="",namespace=blockstor-system,resources=secrets,verbs=get;create;update
+// The Secrets are read and written under the hand-written,
+// resourceNames-limited Role in config/rbac/secrets_role.yaml, not a
+// kubebuilder marker: a marker cannot name the Secrets, so it would grant
+// every Secret in the namespace.
+//
 // +kubebuilder:rbac:groups=blockstor.org,resources=controllerconfigs,verbs=get;list;watch
 func (s *Server) registerEncryption(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/encryption/passphrase",

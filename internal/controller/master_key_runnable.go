@@ -46,7 +46,10 @@ const MasterKeyPeriod = 30 * time.Second
 // although only one keyring Secret can be created, there is no reason to
 // race for it.
 //
-// +kubebuilder:rbac:groups="",namespace=blockstor-system,resources=secrets,verbs=get;create;update
+// Its Secret access is the hand-written, resourceNames-limited Role in
+// config/rbac/secrets_role.yaml, not a kubebuilder marker: a marker
+// cannot name the Secrets, so it would grant every Secret in the
+// namespace.
 type MasterKeyRunnable struct {
 	// Client writes the keyring Secret.
 	Client client.Client
