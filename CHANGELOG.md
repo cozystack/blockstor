@@ -4,6 +4,23 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.3.0 — 2026-11-16
+
+Every LUKS volume gets its own password under a cluster master key that several passphrases can open, and the LINSTOR migration keeps each replica's DRBD port.
+
+### Breaking changes
+
+- **LUKS volumes get a password each, wrapped under a master key (#258).** The master key lives in the keyring Secret `blockstor-master-key`, wrapped once per master passphrase, and the passphrase comes from a Secret in piraeus's shape named by `ControllerConfig.spec.passphraseSecretRef` (key `MASTER_PASSPHRASE`). A LUKS volume formatted with the single cluster passphrase of earlier releases is neither opened nor re-formatted: its replica reports `LUKSKeyMissing` and the data stays on disk, so copy such volumes to volumes created after the upgrade. The Secret key `passphrase`, the default Secret `blockstor-cluster-passphrase` and the `LuksPassphrase` property are gone, and the satellite reads only three named Secrets in its namespace.
+
+### Added
+
+- `blockstor encryption add-passphrase`, `remove-passphrase` and `list-passphrases`, and `modify-passphrase` while LUKS volumes exist (#258). Changing a passphrase touches no volume.
+- `linstor-migrate` imports LINSTOR's LUKS volume passwords: it decrypts them with the LINSTOR master passphrase and re-wraps them under a blockstor keyring whose first passphrase is LINSTOR's, so the piraeus Secret keeps opening the cluster (#258, #257).
+
+### Fixed
+
+- **`linstor-migrate` gives each replica its own node's DRBD port (#256).** LINSTOR 1.33 can give each node its own port for one definition, and the converter kept one per definition, so a replica could be adopted on another node's port and reconnect under live I/O. The port map now takes `<rd> <node> <port>` lines, two replicas on one node port are refused, the capture script in the runbook covers IPv6, and every warning that ends in a fresh port says `no DRBD port` (#261).
+
 ## v0.2.1 — 2026-11-12
 
 Bugfix release.
