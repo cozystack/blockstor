@@ -20,7 +20,6 @@ Converted:
 
 Not converted, and listed in the tool's report:
 
-- **LUKS passphrases.** Encrypted volumes convert with their layers intact, but blockstor cannot open them until you set up the passphrase by hand.
 - Backup shipping remotes, and replicas or snapshots that LINSTOR marked as deleted or failed.
 - Snapshots of definitions with more than one volume are adopted with their first volume only.
 
@@ -70,12 +69,14 @@ Not converted, and listed in the tool's report:
 
 ```sh
 go install github.com/cozystack/blockstor/cmd/linstor-migrate@v<VERSION>
-linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifests.yaml
+linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifests.yaml \
+  -linstor-passphrase-file /run/linstor-pass -keyring-out ./blockstor-keyring.yaml
 ```
+
+The last two flags are for a cluster with LUKS volumes. `/run/linstor-pass` holds the LINSTOR master passphrase byte for byte, the `MASTER_PASSPHRASE` of the Secret piraeus reads. The tool decrypts every volume's password the way LINSTOR does and wraps it under a new blockstor master key, written to `./blockstor-keyring.yaml` with the LINSTOR passphrase as its one slot. Keep the Secret: point `ControllerConfig.spec.passphraseSecretRef` at it and blockstor unlocks from it as LINSTOR did. A wrong passphrase stops the run before anything is written, and without it a dump with LUKS volumes is refused. The passphrase is checked even when no volume is encrypted; if LINSTOR never had a master passphrase, there is nothing to check it against and the run is refused, so leave the two flags out.
 
 Read the whole report it prints. Each `warning:` line is something the tool refused to guess. Resolve every one of these before you go on:
 
-- `LUKS passphrase NOT migrated`.
 - `keeps its DRBD metadata on a separate volume`, or `would put its DRBD metadata on a separate volume` for a replica the dump has no layer chain for. The definition is skipped with its replicas: blockstor keeps DRBD metadata on the data device, and adopted as it is the replica would get new metadata over the end of its data. Changing the property does not move existing metadata. For a replica without a chain, check in LINSTOR where its metadata is first. If it is on the data device, remove the property and convert again. Otherwise, copy the data to a volume with internal metadata in LINSTOR and convert that one.
 - `keep their DRBD metadata on the data device, though StorPoolNameDrbdMeta ... is set`. Nothing to do: the metadata is internal, because LINSTOR applies the property only to replicas created after it was set, and `.internal` asks for internal metadata. The definition converts, and the property is not carried over to the definition or its replicas, so blockstor does not look for a separate metadata volume.
 - `no DRBD port`.
@@ -88,15 +89,22 @@ A definition with no layer stack whose replicas all agree takes their stack with
 
 1. **Stop new volumes.** Scale the CSI provisioner and attacher to zero.
 2. **Stop the LINSTOR controller.** Scale `deploy/linstor-controller` to zero. Leave the LINSTOR satellites and the DRBD devices running: they keep serving I/O.
-3. **Install blockstor** as described in [Installation](../installation/), with satellites on the same nodes and pools. Check the image versions before you start them.
-4. **Apply the converted manifests.** They are already in dependency order:
+3. **Apply the keyring before blockstor starts**, if you converted with `-keyring-out`. A blockstor controller that finds the passphrase Secret and no keyring makes a keyring of its own, with a new master key, within 30 seconds of starting. Under Cozystack `linstor-passphrase` already exists, so this happens at once. The converted volumes' passwords are wrapped under the master key in `./blockstor-keyring.yaml`, and would not open under that new one. Apply it into blockstor's namespace first:
+
+   ```sh
+   kubectl apply -f ./blockstor-keyring.yaml
+   ```
+
+   If blockstor has already started and made its own keyring, replace it with `kubectl replace -f ./blockstor-keyring.yaml`. That is safe only while no LUKS volume has been formatted under it: no Resource and no Snapshot carries a `luksKey` yet, which holds while provisioning is stopped and the manifests are not applied. Then check that `blockstor encryption list-passphrases` prints the same `key ID` as the `luksKey.keyID` in `./blockstor-manifests.yaml`. Do not go on while they differ.
+4. **Install blockstor** as described in [Installation](../installation/), with satellites on the same nodes and pools. Check the image versions before you start them.
+5. **Apply the converted manifests.** They are already in dependency order:
 
    ```sh
    kubectl apply -f ./blockstor-manifests.yaml
    ```
 
-5. **Wait for adoption.** Every replica should report `UpToDate` without starting a resync, `blockstor resource list --faulty` should be empty, and every pool should report its real free space.
-6. **Point CSI at blockstor**, as in [Provisioning volumes with CSI](../csi/), and scale the provisioner and attacher back up. Create a test PVC, and check that an existing PVC still mounts read-write.
+6. **Wait for adoption.** Every replica should report `UpToDate` without starting a resync, `blockstor resource list --faulty` should be empty, and every pool should report its real free space.
+7. **Point CSI at blockstor**, as in [Provisioning volumes with CSI](../csi/), and scale the provisioner and attacher back up. Create a test PVC, and check that an existing PVC still mounts read-write.
 
 ## Check before you call it done
 

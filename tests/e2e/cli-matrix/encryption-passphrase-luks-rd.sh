@@ -20,8 +20,9 @@
 #     looped on "LUKS in layer stack but Props.LuksPassphrase empty"
 #     at apply time.
 #
-# Post-fix contract (pinned here): the Secret set by `encryption
-# create-passphrase` is the ONLY key source. blockstor never reads the
+# Contract pinned here: `encryption create-passphrase` sets up the
+# keyring, and each LUKS volume gets its own password wrapped under the
+# master key it unlocks. blockstor never reads the
 # passphrase from a property (a property sits in plaintext on its CR),
 # and the REST API refuses to store one: `controller set-property
 # DrbdOptions/EncryptPassphrase <pw>` answers 400. The whole LUKS
@@ -39,9 +40,10 @@
 #   4. rd c -l drbd,luks,storage → exit 0 (pre-fix: rejected).
 #   5. vd c + r c --auto-place=2 → both diskful replicas UpToDate.
 #   6. kernel-level proof on EACH replica: backing LV/zvol carries a
-#      real LUKS header AND the cluster passphrase opens it
-#      (cryptsetup --test-passphrase) — the Secret value travelled the
-#      satellite channel to luksFormat, not just past the REST gate.
+#      real LUKS header with one key slot, which the master passphrase
+#      does NOT open: the volume's own password is the only key.
+#   7. modify-passphrase succeeds with the volume in place and touches
+#      no header; the new passphrase opens the keyring.
 #
 # Unit pins: pkg/rest/luks_gate_bug023_test.go,
 # pkg/rest/passphrase_props_guard_test.go,
@@ -194,7 +196,7 @@ wait_uptodate "$RD" "$N1" "$N2"
 echo ">> [Bug 023] legacy prop STILL absent after provisioning"
 assert_legacy_prop_absent "after provisioning"
 
-echo ">> [Bug 023] LUKS header present + Secret passphrase opens it on EACH replica"
+echo ">> LUKS header present on EACH replica, keyed by its own password, not the master passphrase"
 for node in "$N1" "$N2"; do
     backing=$(luks_backing_device "$RD" "$node" 0)
     if [[ -z "$backing" ]]; then
@@ -206,8 +208,8 @@ for node in "$N1" "$N2"; do
         echo "FAIL (Bug 023): no LUKS header on $node:$backing" >&2
         exit 1
     fi
-    if ! assert_luks_passphrase_opens "$node" "$backing" "$PASSPHRASE"; then
-        echo "FAIL (Bug 023): Secret-backed passphrase does not unlock $node:$backing" >&2
+    if ! assert_luks_volume_keyed "$node" "$backing" "$PASSPHRASE"; then
+        echo "FAIL: $node:$backing is not keyed by its own password alone" >&2
         exit 1
     fi
 done
@@ -218,15 +220,23 @@ if "${LCTL[@]}" volume-definition modify-passphrase "$RD" 0 'cli-matrix-023-vd-d
     exit 1
 fi
 
-echo ">> [Bug 023] encryption modify-passphrase is REFUSED while the LUKS volume exists"
-if "${LCTL[@]}" encryption modify-passphrase --old-passphrase "$PASSPHRASE" \
-        --new-passphrase 'cli-matrix-023-rotated' >/dev/null 2>&1; then
-    echo "FAIL (Bug 023): the cluster passphrase rotated under a LUKS volume nothing re-keys" >&2
+echo ">> encryption modify-passphrase succeeds while the LUKS volume exists, and touches no volume"
+# The passphrase wraps the master key, not the volumes: changing it
+# re-wraps one key and leaves every header as it was.
+if ! "${LCTL[@]}" encryption modify-passphrase --old-passphrase "$PASSPHRASE" \
+        --new-passphrase 'cli-matrix-023-rotated' >/dev/null; then
+    echo "FAIL: modify-passphrase was refused over a LUKS volume" >&2
     exit 1
 fi
-backing=$(luks_backing_device "$RD" "$N1" 0)
-if ! assert_luks_passphrase_opens "$N1" "$backing" "$PASSPHRASE"; then
-    echo "FAIL (Bug 023): the passphrase no longer opens $N1:$backing after the refused rotation" >&2
+for node in "$N1" "$N2"; do
+    backing=$(luks_backing_device "$RD" "$node" 0)
+    if ! assert_luks_volume_keyed "$node" "$backing" 'cli-matrix-023-rotated'; then
+        echo "FAIL: $node:$backing changed under a passphrase change" >&2
+        exit 1
+    fi
+done
+if ! "${LCTL[@]}" encryption enter-passphrase --passphrase 'cli-matrix-023-rotated' >/dev/null; then
+    echo "FAIL: the new passphrase does not open the keyring" >&2
     exit 1
 fi
 

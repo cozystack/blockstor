@@ -28,6 +28,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -903,22 +904,16 @@ var ErrLUKSRequiresPassphrase = errors.New(
 	"LUKS layer requires the cluster master passphrase to be set first")
 
 // refuseLUKSWithoutPassphrase rejects an RD-create whose LayerStack
-// includes LUKS when the cluster has no master passphrase (Bug 95).
-// Returns nil for the happy path: non-LUKS stack, or LUKS stack with
-// the prerequisite already in place. The caller surfaces the
-// returned error as a 400 so the operator sees the missing
-// prerequisite immediately instead of waiting for replicas to come
-// up plaintext.
-//
-// The only source is the encryption Secret written by `linstor
-// encryption create-passphrase` (POST /v1/encryption/passphrase). A
-// passphrase in a property is never read (pkg/passphrase).
+// includes LUKS when the cluster has no keyring (Bug 95): no replica
+// could get a password, and the operator should see the missing
+// prerequisite at once instead of replicas that never come up. A locked
+// keyring is not refused; replicas wait for it, as they do under
+// LINSTOR.
 //
 // Falls through (nil) when the controller client is unconfigured —
 // the test-only code paths that build a Server without a Client
-// can't read ControllerConfig anyway, and forcing a 400 there would
-// regress every unit-test that creates a LUKS RD against an in-memory
-// store. The k8s-deployed apiserver always has a real client wired.
+// can't read the Secrets anyway. The k8s-deployed apiserver always has
+// a real client wired.
 func (s *Server) refuseLUKSWithoutPassphrase(ctx context.Context, layers []string) error {
 	if !apiv1.LayerInStack(layers, apiv1.LayerKindLUKS) {
 		return nil
@@ -928,17 +923,18 @@ func (s *Server) refuseLUKSWithoutPassphrase(ctx context.Context, layers []strin
 		return nil
 	}
 
-	secretPass, err := s.readPassphrase(ctx)
+	status, err := s.encryptionStatus(ctx)
 	if err != nil {
-		return errors.Wrap(err, "read encryption Secret for LUKS prereq check")
+		return errors.Wrap(err, "read the keyring for the LUKS prerequisite check")
 	}
 
-	if secretPass != "" {
+	if status.State != passphrase.StateUnset {
 		return nil
 	}
 
 	return errors.Wrap(ErrLUKSRequiresPassphrase,
-		"run `linstor encryption create-passphrase` before creating a LUKS-layered RD")
+		"run `linstor encryption create-passphrase`, or name a passphrase Secret in the ControllerConfig, "+
+			"before creating a LUKS-layered RD")
 }
 
 // resourceDefinitionModifyBody is the shape upstream golinstor sends

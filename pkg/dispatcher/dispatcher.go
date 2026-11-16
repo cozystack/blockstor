@@ -225,27 +225,14 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 
 	wireProps := mergeEffectiveProps(target.Spec.Props, effectiveProps, drbdOpts)
 
-	// LUKS passphrase: the satellite puts the Secret's value under the
-	// upstream master-key name in effectiveProps, after dropping any
-	// property that carried one (passphrase.DropPlaintextProps). It is
-	// lifted onto the wire key the satellite's LUKS layer reads and
-	// dropped from drbdOpts, so it never renders as a `passphrase` line
-	// in the .res options. A wire key that came in with the replica's
-	// own properties is dropped first, so nothing but the Secret reaches
-	// the LUKS layer.
+	// A passphrase property never reaches the satellite: each LUKS
+	// volume has its own password, stored wrapped on its replica, and a
+	// property is plaintext on its CR. Dropped from both maps so it never
+	// renders as a `passphrase` line in the .res options either.
 	// mergeEffectiveProps hands back the replica's own map when there is
 	// no resolved bag; clone it so the drop never edits the caller's CR.
 	wireProps = maps.Clone(wireProps)
 	passphrase.DropPlaintextProps(wireProps)
-
-	if pass := pickLUKSPassphrase(drbdOpts); pass != "" {
-		if wireProps == nil {
-			wireProps = map[string]string{}
-		}
-
-		wireProps[passphrase.WirePropKey] = pass
-	}
-
 	passphrase.DropPlaintextProps(drbdOpts)
 
 	var layerStack []string
@@ -335,14 +322,6 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 	}
 
 	return out
-}
-
-// pickLUKSPassphrase returns the passphrase the satellite put in the
-// resolved options from the Secret, empty when there is none; the
-// caller then leaves the wire key unset and the LUKS layer fails the
-// apply with an actionable message.
-func pickLUKSPassphrase(opts map[string]string) string {
-	return opts[passphrase.PropKeyCanonical]
 }
 
 // mergeEffectiveProps splits the resolver's output into:

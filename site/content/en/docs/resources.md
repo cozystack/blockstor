@@ -184,10 +184,10 @@ spec:
     net:
       protocol: C
   passphraseSecretRef:
-    name: blockstor-cluster-passphrase
+    name: linstor-passphrase
 ```
 
-`passphraseSecretRef` names the Secret in `blockstor-system` that holds the cluster passphrase for LUKS under the key `passphrase`. Without a ControllerConfig, blockstor looks for a Secret named `blockstor-cluster-passphrase`.
+`passphraseSecretRef` names the Secret in `blockstor-system` whose value unlocks the master key LUKS volume passwords are wrapped under, by default under the key `MASTER_PASSPHRASE`, the shape piraeus gives LINSTOR; `key` names another. blockstor only reads it. Without a reference, blockstor unlocks from the Secret `blockstor-unlock` that `create-passphrase` generates.
 
 ## How settings are inherited
 

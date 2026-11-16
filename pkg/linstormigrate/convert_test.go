@@ -66,9 +66,20 @@ func convertFixture(t *testing.T) *Result {
 		t.Fatalf("LoadDump: %v", err)
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
+	}
+
+	// The wrapped passwords carry random nonces under a random master
+	// key; luks_test.go checks them, the golden file only that they are
+	// there.
+	for i := range res.Resources {
+		for j := range res.Resources[i].Spec.Volumes {
+			if key := res.Resources[i].Spec.Volumes[j].LUKSKey; key != nil {
+				key.KeyID, key.Wrapped = "0000000000000000", []byte("wrapped")
+			}
+		}
 	}
 
 	return res
@@ -344,6 +355,7 @@ func TestLiveDRBDPortWins(t *testing.T) {
 	// vol5 carries NO tcp_port in the fixture; vol1 carries 7001.
 	res, err := ConvertWithOptions(dump, Options{
 		DRBDPorts: map[string]int32{"pvc-vol5": 7042, "pvc-vol1": 7099},
+		LUKS:      fixtureLUKS(t),
 	})
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
@@ -451,6 +463,7 @@ func TestEachReplicaKeepsItsOwnNodesPort(t *testing.T) {
 	}
 
 	res, err := ConvertWithOptions(dump, Options{
+		LUKS: fixtureLUKS(t),
 		ReplicaDRBDPorts: map[string]map[string]int32{
 			"pvc-vol5": {"node-a": 7042, "node-b": 7051},
 			"pvc-vol1": {"node-a": 7099, "node-b": 7099, "node-c": 7099},
@@ -489,6 +502,7 @@ func TestAReplicaMissingFromThePerReplicaMapIsReported(t *testing.T) {
 	}
 
 	res, err := ConvertWithOptions(dump, Options{
+		LUKS:             fixtureLUKS(t),
 		ReplicaDRBDPorts: map[string]map[string]int32{"pvc-vol5": {"node-a": 7042}},
 	})
 	if err != nil {
@@ -518,6 +532,7 @@ func TestADisklessReplicaKeepsItsOwnPort(t *testing.T) {
 	}
 
 	res, err := ConvertWithOptions(dump, Options{
+		LUKS: fixtureLUKS(t),
 		ReplicaDRBDPorts: map[string]map[string]int32{
 			"pvc-vol1": {"node-a": 7099, "node-b": 7099, "node-c": 7105},
 		},
@@ -550,6 +565,7 @@ func TestThePortMapMatchesTheNodesKeyName(t *testing.T) {
 	}
 
 	res, err := ConvertWithOptions(dump, Options{
+		LUKS:             fixtureLUKS(t),
 		ReplicaDRBDPorts: map[string]map[string]int32{"pvc-vol5": {"node-a": 7042, "node-b": 7051}},
 	})
 	if err != nil {
@@ -570,6 +586,7 @@ func TestPortMapNodesWithoutAReplicaAreReported(t *testing.T) {
 	}
 
 	res, err := ConvertWithOptions(dump, Options{
+		LUKS: fixtureLUKS(t),
 		ReplicaDRBDPorts: map[string]map[string]int32{
 			"pvc-vol5": {"node-a": 7042, "node-b": 7051, "node-c": 7060},
 			"pvc-vol3": {"k8s-a": 7070, "k8s-b": 7071},
@@ -601,6 +618,7 @@ func TestTwoReplicasOnOneNodePortAreRefused(t *testing.T) {
 	}
 
 	_, err = ConvertWithOptions(dump, Options{
+		LUKS: fixtureLUKS(t),
 		ReplicaDRBDPorts: map[string]map[string]int32{
 			"pvc-vol5": {"node-a": 7042, "node-b": 7051},
 			"pvc-vol3": {"node-a": 7042, "node-b": 7052},
@@ -1001,8 +1019,8 @@ func TestLuksPassphraseWarning(t *testing.T) {
 		t.Errorf("pvc-vol3 layerStack = %v, want [DRBD LUKS STORAGE]", vol3.Spec.LayerStack)
 	}
 
-	if !hasWarning(res, "pvc-vol3: LUKS key NOT migrated") || !hasWarning(res, "cryptsetup luksAddKey") {
-		t.Errorf("LUKS key warning missing; warnings: %v", res.Warnings)
+	if !hasWarning(res, "pvc-vol3: 2 LUKS volume passwords migrated") {
+		t.Errorf("LUKS import count missing; warnings: %v", res.Warnings)
 	}
 }
 
@@ -1054,7 +1072,7 @@ func TestLatchHoldsOnADiskfulReplicaWithAStaleTieBreakerBit(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1089,7 +1107,7 @@ func TestLatchDoesNotHoldOnAWitnessAlone(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1124,7 +1142,7 @@ func TestInitializedLatchNeedsAnAdoptedReplica(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1175,7 +1193,7 @@ func TestSparseZfsPoolMigratesAsThin(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1222,7 +1240,7 @@ func TestSparseFlagAtControllerScopeIsSeen(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1258,7 +1276,7 @@ func TestSparseFlagAtNodeScopeIsSeen(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1289,7 +1307,7 @@ func TestPoolScopeWinsOverControllerScope(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1333,7 +1351,7 @@ func TestRemapDoesNotAdmitADeliberatelyExcludedThinPool(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1403,7 +1421,7 @@ func TestSameNameDifferentDriverPerNode(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1453,7 +1471,7 @@ func TestRemapWidensWhenNoThinPoolExists(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1500,7 +1518,7 @@ func TestPinnedGroupNamingAThinPoolIsScopedNotWidened(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1557,7 +1575,7 @@ func TestPinnedGroupNamingASplitPoolIsNotWidened(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1592,7 +1610,7 @@ func TestPinnedGroupOnThickPoolsIsWidened(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1629,7 +1647,7 @@ func TestRemapLeavesUnrelatedGroupsAlone(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1682,7 +1700,7 @@ func TestVolumelessDefinitionIsSkipped(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1749,7 +1767,7 @@ func TestInitializedLatchSurvivesAnUnmigratedNode(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1804,7 +1822,7 @@ func TestSparseRemapWidensTheProviderAllowList(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1860,7 +1878,7 @@ func TestPinnedGroupNamingASplitNameIsNotScoped(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1911,7 +1929,7 @@ func TestUnresolvableGroupWithNoEligiblePoolSaysSo(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1943,7 +1961,7 @@ func TestDisklessOnlyDefinitionIsReportedAsSuch(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1997,7 +2015,7 @@ func TestBothLatchReasonsAreReported(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}

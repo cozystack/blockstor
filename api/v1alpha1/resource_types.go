@@ -255,6 +255,7 @@ type ResourceSpec struct {
 // Distinct from ResourceVolumeStatus: this carries one-shot seeding
 // hints the satellite consumes during first activation, the Status
 // counterpart carries observed runtime state.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.luksKey) || (has(self.luksKey) && self.luksKey == oldSelf.luksKey)",message="luksKey is set once: it may go from unset to a value but not be changed or removed, the replica's data is readable only with it"
 type ResourceVolumeSpec struct {
 	// volumeNumber matches the corresponding ResourceDefinition
 	// VolumeDefinition. +required when this struct is populated.
@@ -272,6 +273,52 @@ type ResourceVolumeSpec struct {
 	// re-stamping).
 	// +optional
 	SeedFromGI string `json:"seedFromGI,omitempty"`
+
+	// luksKey is this replica's LUKS password, wrapped under the cluster
+	// master key. It is the only key in the volume's LUKS header, so it
+	// lives in spec, where backups restore it, and it is set once.
+	// +optional
+	LUKSKey *LUKSKey `json:"luksKey,omitempty"`
+}
+
+// LUKSKeyOrigin says where a volume password came from.
+// +kubebuilder:validation:Enum=Generated;LinstorImport
+type LUKSKeyOrigin string
+
+const (
+	// LUKSKeyOriginGenerated is a password blockstor generated before
+	// formatting the volume.
+	LUKSKeyOriginGenerated LUKSKeyOrigin = "Generated"
+
+	// LUKSKeyOriginLinstorImport is a password linstor-migrate carried
+	// over from LINSTOR's database.
+	LUKSKeyOriginLinstorImport LUKSKeyOrigin = "LinstorImport"
+)
+
+// LUKSKey is one volume password wrapped under a master key.
+type LUKSKey struct {
+	// keyID is the public ID of the master key the password is wrapped
+	// under.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{16}$`
+	// +required
+	KeyID string `json:"keyID"`
+
+	// The schema declares wrapped a plain standard-base64 string, not
+	// format byte: the API server's CEL decodes format byte as URL-safe
+	// base64, so the set-once rules over it would fail on nearly every
+	// real key ('+' or '/') and refuse every write to the object, its
+	// finalizer strip on delete included.
+
+	// wrapped is nonce || AES-256-GCM ciphertext || tag.
+	// +kubebuilder:validation:Format=""
+	// +kubebuilder:validation:Pattern=`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Wrapped []byte `json:"wrapped"`
+
+	// origin says where the password came from.
+	// +required
+	Origin LUKSKeyOrigin `json:"origin"`
 }
 
 // ResourceStatus is the observed state of a placed resource.

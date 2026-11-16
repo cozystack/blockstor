@@ -19,9 +19,12 @@ limitations under the License.
 package rest
 
 import (
+	"bytes"
 	"context"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/keyring"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -62,32 +66,71 @@ func newFakeRESTClient(t *testing.T) client.Client {
 	return fake.NewClientBuilder().WithScheme(scheme).Build()
 }
 
-// testPassphraseSecret is the Secret `linstor encryption create-passphrase`
-// writes, holding value, in the namespace the REST-test helpers pin the
-// server to. It is the only place the LUKS master passphrase is read from;
-// tests that need the cluster master key seed this, never a property.
-func testPassphraseSecret(value string) *corev1.Secret {
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: testRESTNamespace,
-			Name:      passphrase.DefaultSecretName,
+// testPassphrase is the master passphrase of the keyring
+// testEncryptionSecrets seeds.
+const testPassphrase = "test-cluster-key"
+
+// testKeyringData is one keyring, built once: every slot costs an Argon2id
+// run, and the tests that need a keyring need any one.
+//
+//nolint:gochecknoglobals // a test fixture computed once
+var testKeyringData = sync.OnceValues(func() ([]byte, error) {
+	ring, master, err := keyring.New([]byte(testPassphrase), passphrase.SlotNameSecret, keyring.OriginSecret, time.Now())
+	if err != nil {
+		return nil, err //nolint:wrapcheck // a test fixture; the keyring error says it all
+	}
+
+	master.Destroy()
+
+	return ring.Marshal()
+})
+
+// testEncryptionSecrets are the keyring Secret and the generated unlock
+// Secret holding testPassphrase: a cluster that has run `linstor
+// encryption create-passphrase` and unlocks. With unlockPass other than
+// testPassphrase the cluster is locked.
+func testEncryptionSecrets(t *testing.T, unlockPass string) []client.Object {
+	t.Helper()
+
+	data, err := testKeyringData()
+	if err != nil {
+		t.Fatalf("build the test keyring: %v", err)
+	}
+
+	return []client.Object{
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: testRESTNamespace, Name: passphrase.KeyringSecretName},
+			Type:       passphrase.KeyringSecretType,
+			Data:       map[string][]byte{passphrase.KeyringDataKey: bytes.Clone(data)},
 		},
-		Data: map[string][]byte{passphrase.SecretKey: []byte(value)},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: testRESTNamespace, Name: passphrase.UnlockSecretName},
+			Data:       map[string][]byte{passphrase.DefaultPassphraseKey: []byte(unlockPass)},
+		},
 	}
 }
 
-// startServerWithPassphrase is startServerWithStore with the cluster master
-// key already set, which is the prerequisite for creating anything carrying a
+// seedEncryption creates testEncryptionSecrets through cli.
+func seedEncryption(t *testing.T, cli client.Client, unlockPass string) {
+	t.Helper()
+
+	for _, obj := range testEncryptionSecrets(t, unlockPass) {
+		err := cli.Create(context.Background(), obj)
+		if err != nil {
+			t.Fatalf("seed %s: %v", obj.GetName(), err)
+		}
+	}
+}
+
+// startServerWithPassphrase is startServerWithStore with the cluster's
+// keyring already set, which is the prerequisite for creating anything carrying a
 // LUKS layer. Without it the handlers answer 400 — correctly, since a LUKS
 // stack on a passphrase-less cluster brings the replicas up plaintext.
 func startServerWithPassphrase(t *testing.T, st store.Store) (string, func()) {
 	t.Helper()
 
 	client := newFakeRESTClient(t)
-
-	if err := client.Create(context.Background(), testPassphraseSecret("test-cluster-key")); err != nil {
-		t.Fatalf("seed the passphrase Secret: %v", err)
-	}
+	seedEncryption(t, client, testPassphrase)
 
 	return startServerCustom(t, &Server{
 		Addr:      pickFreeAddr(t),

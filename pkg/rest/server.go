@@ -34,7 +34,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -120,31 +119,11 @@ type Server struct {
 	// so a zero-value Server keeps working in tests.
 	errorReports *errorReportRing
 
-	// passphraseUnlocked is the in-memory "controller process has
-	// proof-of-knowledge of the cluster master passphrase" flag
-	// that gates LUKS-layer resource provisioning. Scenario 6.W13.
-	//
-	// Lifecycle: the controller boots zero (false) on every start
-	// — that's the whole point of `linstor encryption
-	// enter-passphrase`: the master key is intentionally NOT
-	// persisted unencrypted, so a controller restart loses the
-	// in-memory unlock and the operator has to PATCH it back. A
-	// successful POST (create-passphrase) on an empty cluster
-	// also flips this on, since the caller demonstrably knows the
-	// value they just stamped. A wrong PATCH leaves it untouched.
-	//
-	// The REST /v1/view/resources handler consults this flag when
-	// it walks each replica's LayerObject — if a LUKS layer is
-	// present and the flag is false, the synthesized state.suspended
-	// is true (rendered `Suspended` by `linstor r l`); when the flag
-	// is true, state.suspended is false (rendered `Available`); for
-	// non-LUKS replicas the field is left absent.
-	//
-	// Atomic for the cheap-read fast path: every entry of the view
-	// handler reads this flag, but writes happen at most once per
-	// `enter-passphrase` PATCH (a low-frequency operator action),
-	// so a mutex would be overkill.
-	passphraseUnlocked atomic.Bool
+	// encryption caches the unlocked master key and the encryption
+	// state the resource view stamps `suspended` from. Both are derived
+	// from the passphrase and keyring Secrets, so every apiserver
+	// replica answers alike.
+	encryption encryption
 
 	// resolveHost is the DNS-lookup seam used by handleNodeCreate
 	// (scenario 4.W01) when the POST body omits a NetInterface

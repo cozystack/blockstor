@@ -145,7 +145,7 @@ for node in "${placed[@]}"; do
         echo "FAIL (Bug 333): missing LUKS header on $node:$backing" >&2
         exit 1
     fi
-    if ! assert_luks_passphrase_opens "$node" "$backing" "$PASSPHRASE"; then
+    if ! assert_luks_volume_keyed "$node" "$backing" "$PASSPHRASE"; then
         echo "FAIL (Bug 333): passphrase does not open $node:$backing" >&2
         exit 1
     fi

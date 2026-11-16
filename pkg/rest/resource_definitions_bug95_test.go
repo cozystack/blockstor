@@ -255,9 +255,7 @@ func TestBug95LUKSCreateAcceptedWithPassphrase(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, testPassphraseSecret("blockstorpass")); err != nil {
-		t.Fatalf("seed the passphrase Secret: %v", err)
-	}
+	seedEncryption(t, cli, testPassphrase)
 
 	base, stop := startServerCustom(t, &Server{
 		Addr:      pickFreeAddr(t),
@@ -368,9 +366,7 @@ func TestBug95LUKSAcceptedWhenCLIUsesLayerData(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, testPassphraseSecret("blockstorpass")); err != nil {
-		t.Fatalf("seed the passphrase Secret: %v", err)
-	}
+	seedEncryption(t, cli, testPassphrase)
 
 	base, stop := startServerCustom(t, &Server{
 		Addr:      pickFreeAddr(t),

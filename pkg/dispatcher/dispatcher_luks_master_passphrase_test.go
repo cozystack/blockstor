@@ -29,59 +29,19 @@ import (
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
-// Bug 265 (HIGH): the LUKS passphrase key namespace mismatched
-// between the controller and the dispatcher: the dispatcher looked for
-// `DrbdOptions/Encryption/passphrase` while the master key arrived
-// under upstream LINSTOR's `DrbdOptions/EncryptPassphrase`, so it
-// never reached the satellite and every LUKS RD looped on
-// `Props.LuksPassphrase empty`.
-//
-// Today the satellite puts the passphrase Secret's value into
-// effectiveProps under `DrbdOptions/EncryptPassphrase`, after dropping
-// any property that carried a passphrase (pkg/passphrase). This test
-// pins that the injected value reaches the wire as `LuksPassphrase`.
-func TestBug265LUKSMasterPassphraseReachesSatellite(t *testing.T) {
-	rd := &blockstoriov1alpha1.ResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bug265-luks"},
-		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
-			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
-			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
-				{VolumeNumber: 0, SizeKib: 1024 * 1024},
-			},
-		},
-	}
-
-	target := &blockstoriov1alpha1.Resource{
-		Spec: blockstoriov1alpha1.ResourceSpec{
-			ResourceDefinitionName: "pvc-bug265-luks",
-			NodeName:               "n1",
-			StoragePool:            "data-hdd",
-		},
-	}
-
-	// Effective props as the satellite hands them over once it has
-	// injected the Secret's value (luks_passphrase.go).
-	effectiveProps := map[string]string{
-		"DrbdOptions/EncryptPassphrase": "topsecret",
-	}
-
-	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, effectiveProps)
+// Bug 265 once had the master passphrase lifted from the resolved
+// props onto the `LuksPassphrase` wire key the satellite read. Every LUKS
+// volume now has its own password, stored wrapped on its replica, so the
+// canonical master-key property is dropped like any other passphrase
+// property and nothing reaches the wire in its place.
+func TestBug265MasterPassphrasePropNeverReachesTheWire(t *testing.T) {
+	got := dispatcher.BuildDesired(luksTestTarget("pvc-bug265-luks", nil), nil, nil, nil,
+		luksTestRD("pvc-bug265-luks"), map[string]string{passphrase.PropKeyCanonical: "topsecret"})
 	if got == nil {
 		t.Fatalf("BuildDesired returned nil")
 	}
 
-	pass, ok := got.Props["LuksPassphrase"]
-	if !ok || pass == "" {
-		t.Errorf("LuksPassphrase not propagated to wire from the injected "+
-			"DrbdOptions/EncryptPassphrase; got props=%v. "+
-			"The dispatcher must lift the injected master key from "+
-			"upstream-LINSTOR's canonical name. (Bug 265)",
-			got.Props)
-	}
-
-	if pass != "topsecret" {
-		t.Errorf("LuksPassphrase mismatched: got %q, want %q", pass, "topsecret")
-	}
+	assertNoPassphraseOnWire(t, got)
 }
 
 // luksTestRD and luksTestTarget are a LUKS-layered definition and one
@@ -116,7 +76,7 @@ func assertNoPassphraseOnWire(t *testing.T, got *intent.DesiredResource) {
 
 	for key, value := range got.Props {
 		if passphrase.IsPlaintextPropKey(key) {
-			t.Errorf("wire props carry %s=%q; only the Secret may reach the LUKS layer", key, value)
+			t.Errorf("wire props carry %s=%q; no passphrase property may reach the LUKS layer", key, value)
 		}
 	}
 

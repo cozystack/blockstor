@@ -28,6 +28,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
 // registerResources wires the /v1/view/resources aggregate. linstor-csi
@@ -132,9 +133,9 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 // hierarchy returns a usable response.
 //
 // Scenario 6.W13: a LUKS-stack replica also gets `state.suspended`
-// stamped here — true while the controller is locked (master
-// passphrase not yet entered in this process), false once unlocked.
-// stampSuspendedOnLUKS centralises the layer-walk + flag-read.
+// stamped here — true while the master key is locked, false once the
+// passphrase Secret opens it. stampSuspendedOnLUKS centralises the
+// layer-walk + state read.
 //
 // Bug 95: the resolved parent RD's LayerStack is re-stamped onto the
 // replica's LayerObject + per-volume LayerDataList here. The k8s
@@ -205,7 +206,7 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 	// sensitive key.
 	redactSensitiveProps(rwv.Props)
 
-	s.stampSuspendedOnLUKS(&rwv)
+	s.stampSuspendedOnLUKS(ctx, &rwv)
 
 	return rwv, nil
 }
@@ -300,17 +301,16 @@ func isDisklessReplica(rsc *apiv1.Resource) bool {
 }
 
 // stampSuspendedOnLUKS sets `state.suspended` on a resource that
-// carries a LUKS layer in its LayerObject chain. true while the
-// controller process is locked (no enter-passphrase yet), false
-// once unlocked. Non-LUKS resources are left with state.suspended
+// carries a LUKS layer in its LayerObject chain. true while the master
+// key is locked or unset, false once the passphrase Secret opens it. Non-LUKS resources are left with state.suspended
 // nil so the field is omitted on the wire — see ResourceState.Suspended
 // for the tri-state contract. Scenario 6.W13.
-func (s *Server) stampSuspendedOnLUKS(rwv *apiv1.ResourceWithVolumes) {
+func (s *Server) stampSuspendedOnLUKS(ctx context.Context, rwv *apiv1.ResourceWithVolumes) {
 	if !hasLUKSLayer(rwv.LayerObject) {
 		return
 	}
 
-	suspended := !s.passphraseUnlocked.Load()
+	suspended := s.encryptionState(ctx) != passphrase.StateUnlocked
 	rwv.State.Suspended = &suspended
 }
 

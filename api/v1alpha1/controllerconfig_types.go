@@ -47,12 +47,12 @@ type ControllerConfigSpec struct {
 	// +optional
 	DRBDOptions *DRBDOptions `json:"drbdOptions,omitempty"`
 
-	// passphraseSecretRef points at the Secret carrying the
-	// cluster-wide LUKS passphrase under the key `passphrase`. The
-	// satellite reads it via the apiserver during reconcile;
-	// passphrase never lands on Spec in plaintext. Replaces
-	// `Props["DrbdOptions/Encryption/passphrase"]` on the legacy
-	// ControllerProps instance.
+	// passphraseSecretRef points at the Secret, in blockstor's own
+	// namespace, whose value unlocks the cluster master key: the shape
+	// piraeus gives LINSTOR (`MASTER_PASSPHRASE`). blockstor only reads
+	// it; every component reads it through the API server, so a changed
+	// Secret takes effect without a restart. Unset, blockstor unlocks
+	// from a passphrase Secret it generates and owns.
 	// +optional
 	PassphraseSecretRef *PassphraseSecretRef `json:"passphraseSecretRef,omitempty"`
 
@@ -83,15 +83,18 @@ type ControllerConfigSpec struct {
 	NodeConnections map[string]map[string]string `json:"nodeConnections,omitempty"`
 }
 
-// PassphraseSecretRef is the cluster-wide passphrase Secret pointer.
-// Wrapper rather than a bare LocalObjectReference so we can attach
-// a Namespace field later without breaking the API (the secret
-// must live in the controller's own namespace today; once Phase 10.6
-// lands and the satellite reads via the apiserver it may move).
+// PassphraseSecretRef names the Secret and the data key that carry the
+// master passphrase.
 type PassphraseSecretRef struct {
 	// name is the Secret name. Required.
 	// +required
 	Name string `json:"name"`
+
+	// key is the data key holding the passphrase. Its bytes are the
+	// passphrase verbatim, a trailing newline included.
+	// +kubebuilder:default=MASTER_PASSPHRASE
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 // ControllerConfigStatus reports observed state.

@@ -161,6 +161,7 @@ func TestToggleToDisklessClosesLUKSMapperBeforeReclaim(t *testing.T) {
 		Providers:  map[string]storage.Provider{"thin1": prov},
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	dr := &intent.DesiredResource{
 		Name:       "pvc-luks-toggle",
@@ -221,6 +222,7 @@ func TestToggleToDisklessSkipsLUKSCloseWithoutLUKSLayer(t *testing.T) {
 		Providers:  map[string]storage.Provider{"thin1": prov},
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	dr := &intent.DesiredResource{
 		Name:       "pvc-noluks-toggle",

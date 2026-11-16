@@ -147,6 +147,10 @@ var handlers = map[string]handler{
 
 	"encryption create-passphrase": encryptionCreatePassphrase,
 	"encryption enter-passphrase":  encryptionEnterPassphrase,
+	"encryption modify-passphrase": encryptionModifyPassphrase,
+	"encryption add-passphrase":    encryptionAddPassphrase,
+	"encryption remove-passphrase": encryptionRemovePassphrase,
+	"encryption list-passphrases":  encryptionListPassphrases,
 
 	"resource-definition modify":     resourceDefinitionModify,
 	"resource-definition clone":      resourceDefinitionClone,

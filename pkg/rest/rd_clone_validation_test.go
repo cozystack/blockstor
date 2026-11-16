@@ -224,9 +224,7 @@ func TestRDCloneReplayOfAFinishedLUKSCloneDoesNotNeedThePassphrase(t *testing.T)
 	body := map[string]any{"layer_list": []string{"DRBD", "LUKS", "STORAGE"}}
 
 	withPass := newFakeRESTClient(t)
-	if err := withPass.Create(t.Context(), testPassphraseSecret("blockstorpass")); err != nil {
-		t.Fatalf("seed the passphrase: %v", err)
-	}
+	seedEncryption(t, withPass, testPassphrase)
 
 	plain, stopPlain := startServerCustom(t, &Server{
 		Addr: pickFreeAddr(t), Store: st, Client: withPass, Namespace: testRESTNamespace,

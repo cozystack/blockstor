@@ -146,7 +146,7 @@ for node in "$M1" "$M2"; do
         echo "FAIL (Bug 333): cloned LV $node:$backing has no LUKS header" >&2
         exit 1
     fi
-    if ! assert_luks_passphrase_opens "$node" "$backing" "$PASSPHRASE"; then
+    if ! assert_luks_volume_keyed "$node" "$backing" "$PASSPHRASE"; then
         echo "FAIL (Bug 333): source passphrase does not open clone at $node:$backing" >&2
         exit 1
     fi

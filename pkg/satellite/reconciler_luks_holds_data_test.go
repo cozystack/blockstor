@@ -53,13 +53,13 @@ func TestApplyLUKSOverAPlaintextVolumeIsRefused(t *testing.T) {
 		NodeName:   "n1",
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{{
 		Name:       "pvc-plain",
 		NodeName:   "n1",
 		Volumes:    []*intent.DesiredVolume{{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"}},
 		LayerStack: []string{"LUKS", "STORAGE"},
-		Props:      map[string]string{"LuksPassphrase": "topsecret"},
 	}})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)

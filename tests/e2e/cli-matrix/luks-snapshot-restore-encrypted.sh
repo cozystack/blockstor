@@ -164,7 +164,7 @@ for node in "$M1" "$M2"; do
         echo "FAIL (Bug 333): restored LV $node:$backing has no LUKS header" >&2
         exit 1
     fi
-    if ! assert_luks_passphrase_opens "$node" "$backing" "$PASSPHRASE"; then
+    if ! assert_luks_volume_keyed "$node" "$backing" "$PASSPHRASE"; then
         echo "FAIL (Bug 333): passphrase does not open restored $node:$backing" >&2
         exit 1
     fi

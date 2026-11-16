@@ -2,6 +2,27 @@
 "items": [
 {
 "spec": {
+"prop_key": "encrypted/masterkey",
+"prop_value": "YGFiY2RlZmdoaWprbG1ub5bVilcKH4i0OIPhTpxwW8Nd2jaxBs/yYutifx5pjM8E",
+"props_instance": "/CTRL"
+}
+},
+{
+"spec": {
+"prop_key": "encrypted/passphrasesalt",
+"prop_value": "QEFCQ0RFRkdISUpLTE1OTw==",
+"props_instance": "/CTRL"
+}
+},
+{
+"spec": {
+"prop_key": "encrypted/masterhash",
+"prop_value": "fUwo1VHOQnfLAHVKzly/Bhr5lBOgsAwojcocYiwNm2eLuLZ+HZsOVctGnaFVzwxjiWqj8nnqfWRcrt9Vf3462Q==",
+"props_instance": "/CTRL"
+}
+},
+{
+"spec": {
 "prop_key": "Aux/topology/kubernetes.io/hostname",
 "prop_value": "node-a",
 "props_instance": "/NODES/NODE-A"
