@@ -26,6 +26,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -354,5 +355,104 @@ func TestPassphraseSecretKeyDefaultsToPiraeus(t *testing.T) {
 
 	if got.Spec.PassphraseSecretRef.Key != "MASTER_PASSPHRASE" {
 		t.Fatalf("key %q, want MASTER_PASSPHRASE", got.Spec.PassphraseSecretRef.Key)
+	}
+}
+
+// testLUKSKeyStdBase64 is a key whose JSON form, standard base64, carries
+// '+' and '/': AES-GCM output does in nearly every real key.
+func testLUKSKeyStdBase64() *crdv1alpha1.LUKSKey {
+	return &crdv1alpha1.LUKSKey{
+		KeyID:   "c7324c99567678f7",
+		Wrapped: bytes.Repeat([]byte{0xfb, 0xff}, (12+64+16)/2),
+		Origin:  crdv1alpha1.LUKSKeyOriginGenerated,
+	}
+}
+
+// A replica and a snapshot carrying a real wrapped password stay writable:
+// the set-once rules must read the password the way it is stored, or every
+// later write to the object, the satellite's finalizer strip on delete
+// among them, is refused and the replica can never be deleted.
+func TestLUKSKeyOfAnyBytesKeepsTheObjectsWritable(t *testing.T) {
+	requireEnvtest(t)
+
+	ctx := t.Context()
+	key := testLUKSKeyStdBase64()
+	res := replicaWithKeys("pvc-bytes", "node-a", map[int32]*crdv1alpha1.LUKSKey{0: key})
+	res.Finalizers = []string{"blockstor.org/test"}
+
+	err := fixture.client.Create(ctx, res)
+	if err != nil {
+		t.Fatalf("create the replica: %v", err)
+	}
+
+	res.Spec.Flags = []string{apiv1.ResourceFlagDiskless}
+
+	err = fixture.client.Update(ctx, res)
+	if err != nil {
+		t.Fatalf("update the replica's flags: %v", err)
+	}
+
+	changed := res.DeepCopy()
+	changed.Spec.Volumes[0].LUKSKey.Wrapped = bytes.Repeat([]byte{0xfb, 0xfe}, (12+64+16)/2)
+
+	err = fixture.client.Update(ctx, changed)
+	if !apierrors.IsInvalid(err) {
+		t.Errorf("changing the replica's password: err %v, want Invalid", err)
+	}
+
+	err = fixture.client.Delete(ctx, res)
+	if err != nil {
+		t.Fatalf("delete the replica: %v", err)
+	}
+
+	err = fixture.client.Get(ctx, client.ObjectKeyFromObject(res), res)
+	if err != nil {
+		t.Fatalf("get the deleting replica: %v", err)
+	}
+
+	res.Finalizers = nil
+
+	err = fixture.client.Update(ctx, res)
+	if err != nil {
+		t.Fatalf("strip the finalizer of the deleting replica: %v", err)
+	}
+
+	malformed := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": crdv1alpha1.GroupVersion.String(),
+		"kind":       "Resource",
+		"metadata":   map[string]any{"name": "pvc-bytes.node-b"},
+		"spec": map[string]any{
+			"resourceDefinitionName": "pvc-bytes",
+			"nodeName":               "node-b",
+			"volumes": []any{map[string]any{"volumeNumber": int64(0), "luksKey": map[string]any{
+				"keyID": key.KeyID, "wrapped": "-_not-std-base64", "origin": string(key.Origin),
+			}}},
+		},
+	}}
+
+	err = fixture.client.Create(ctx, malformed)
+	if !apierrors.IsInvalid(err) {
+		t.Errorf("a password that is not standard base64: err %v, want Invalid", err)
+	}
+
+	snap := &crdv1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bytes.snap", Finalizers: []string{"blockstor.org/test"}},
+		Spec: crdv1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-bytes",
+			SnapshotName:           "snap",
+			LUKSKeys:               []crdv1alpha1.SnapshotLUKSKey{{NodeName: "node-a", VolumeNumber: 0, LUKSKey: *key}},
+		},
+	}
+
+	err = fixture.client.Create(ctx, snap)
+	if err != nil {
+		t.Fatalf("create the snapshot: %v", err)
+	}
+
+	snap.Finalizers = nil
+
+	err = fixture.client.Update(ctx, snap)
+	if err != nil {
+		t.Fatalf("strip the finalizer of the snapshot: %v", err)
 	}
 }

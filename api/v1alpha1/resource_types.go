@@ -303,7 +303,15 @@ type LUKSKey struct {
 	// +required
 	KeyID string `json:"keyID"`
 
+	// The schema declares wrapped a plain standard-base64 string, not
+	// format byte: the API server's CEL decodes format byte as URL-safe
+	// base64, so the set-once rules over it would fail on nearly every
+	// real key ('+' or '/') and refuse every write to the object, its
+	// finalizer strip on delete included.
+
 	// wrapped is nonce || AES-256-GCM ciphertext || tag.
+	// +kubebuilder:validation:Format=""
+	// +kubebuilder:validation:Pattern=`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`
 	// +kubebuilder:validation:MinLength=1
 	// +required
 	Wrapped []byte `json:"wrapped"`
