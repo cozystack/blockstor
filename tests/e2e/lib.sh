@@ -1226,12 +1226,17 @@ ensure_passphrase_secret() {
         -o jsonpath='{.spec.passphraseSecretRef.name}' 2>/dev/null || true)
     if [[ -z "$secret" ]]; then
         secret=linstor-passphrase
-        if ! kubectl get controllerconfigs.blockstor.org default >/dev/null 2>&1; then
+        # The CRD requires spec, so a missing ControllerConfig is
+        # created with the reference in it rather than empty and then
+        # patched.
+        if kubectl get controllerconfigs.blockstor.org default >/dev/null 2>&1; then
+            kubectl patch controllerconfigs.blockstor.org default --type=merge \
+                -p "{\"spec\":{\"passphraseSecretRef\":{\"name\":\"$secret\"}}}" >/dev/null
+        else
             printf '%s\n' 'apiVersion: blockstor.org/v1alpha1' 'kind: ControllerConfig' \
-                'metadata: {name: default}' | kubectl apply -f - >/dev/null
+                'metadata: {name: default}' "spec: {passphraseSecretRef: {name: $secret}}" |
+                kubectl create -f - >/dev/null
         fi
-        kubectl patch controllerconfigs.blockstor.org default --type=merge \
-            -p "{\"spec\":{\"passphraseSecretRef\":{\"name\":\"$secret\"}}}" >/dev/null
     fi
     if ! kubectl -n "$NS" get secret "$secret" >/dev/null 2>&1; then
         kubectl -n "$NS" create secret generic "$secret" \
