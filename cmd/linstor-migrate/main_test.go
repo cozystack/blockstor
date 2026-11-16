@@ -138,3 +138,24 @@ func TestKeyringOutRefusals(t *testing.T) {
 		t.Errorf("a LUKS dump without the passphrase: %v", err)
 	}
 }
+
+// A port file with both line forms reaches the converter options.
+func TestBuildOptionsLoadsBothPortForms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drbd-ports.txt")
+	if err := os.WriteFile(path, []byte("PVC-A node-1 7000\npvc-a node-2 7001\n# comment\npvc-b 7010\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	opts, err := buildOptions(path)
+	if err != nil {
+		t.Fatalf("buildOptions: %v", err)
+	}
+
+	if got := opts.ReplicaDRBDPorts["pvc-a"]; got["node-1"] != 7000 || got["node-2"] != 7001 {
+		t.Errorf("ReplicaDRBDPorts[pvc-a] = %v, want node-1:7000 node-2:7001", got)
+	}
+
+	if got := opts.DRBDPorts["pvc-b"]; got != 7010 {
+		t.Errorf("DRBDPorts[pvc-b] = %d, want 7010", got)
+	}
+}
