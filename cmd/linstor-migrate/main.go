@@ -54,7 +54,7 @@ func run() int {
 	var (
 		inDir     = flag.String("in", "", "directory with *.internal.linstor.linbit.com.json table dumps (required)")
 		outPath   = flag.String("out", "-", "write manifests to this file ('-' = stdout)")
-		portsPath = flag.String("drbd-ports", "", "optional '<rd-name> <port>' file of LIVE DRBD ports (see runbook); preserves the running mesh endpoint so adoption doesn't reconnect")
+		portsPath = flag.String("drbd-ports", "", "optional file of LIVE DRBD ports, '<rd-name> <node> <port>' per replica or '<rd-name> <port>' per definition (see runbook); preserves the running mesh endpoints so adoption doesn't reconnect")
 	)
 
 	flag.Parse()
@@ -142,7 +142,7 @@ func buildOptions(portsPath string) (linstormigrate.Options, error) {
 		return linstormigrate.Options{}, fmt.Errorf("%s: %w", portsPath, err)
 	}
 
-	return linstormigrate.Options{DRBDPorts: ports}, nil
+	return linstormigrate.Options{DRBDPorts: ports.ByDefinition, ReplicaDRBDPorts: ports.ByReplica}, nil
 }
 
 // openOutput resolves the -out flag: "-" streams to stdout (no-op
