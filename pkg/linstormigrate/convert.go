@@ -2173,8 +2173,15 @@ func (c *converter) reportUnmatchedPortNodes() {
 			continue
 		}
 
+		// A definition that did not convert, or has no replica that
+		// does, gets no port at all: nothing for the operator to fix.
+		replicas := c.liveReplicas(row.ResourceName)
+		if !c.convertedRD[row.ResourceName] || len(replicas) == 0 {
+			continue
+		}
+
 		known := map[string]bool{}
-		for _, replica := range c.liveReplicas(row.ResourceName) {
+		for _, replica := range replicas {
 			known[strings.ToLower(replica.NodeName)] = true
 			known[strings.ToLower(c.displayNode(replica.NodeName))] = true
 		}

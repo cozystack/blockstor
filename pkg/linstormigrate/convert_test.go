@@ -590,6 +590,7 @@ func TestPortMapNodesWithoutAReplicaAreReported(t *testing.T) {
 		ReplicaDRBDPorts: map[string]map[string]int32{
 			"pvc-vol5": {"node-a": 7042, "node-b": 7051, "node-c": 7060},
 			"pvc-vol3": {"k8s-a": 7070, "k8s-b": 7071},
+			"pvc-vol4": {"node-b": 7080},
 		},
 	})
 	if err != nil {
@@ -602,6 +603,10 @@ func TestPortMapNodesWithoutAReplicaAreReported(t *testing.T) {
 
 	if !hasWarning(res, "pvc-vol3: no DRBD port for any replica: no node in the live port map (k8s-a, k8s-b) hosts a replica of it") {
 		t.Errorf("fully unmatched map not reported; warnings %v", res.Warnings)
+	}
+
+	if hasWarning(res, "pvc-vol4: no DRBD port") {
+		t.Errorf("a definition that did not convert reported a port to capture; warnings %v", res.Warnings)
 	}
 
 	if hasWarning(res, "has ports for the other replicas of pvc-vol3") {
