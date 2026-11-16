@@ -71,16 +71,12 @@ func TestBug196EncryptionStatusReportsUnset(t *testing.T) {
 	}
 }
 
-// TestBug196EncryptionStatusReportsUnlocked: POST a passphrase →
-// handler flips `passphraseUnlocked` to true → GET status reports
-// "unlocked".
+// TestBug196EncryptionStatusReportsUnlocked: POST a passphrase → the
+// keyring and the generated unlock Secret exist → GET status reports
+// "unlocked", on this server and on any other reading the same Secrets.
 func TestBug196EncryptionStatusReportsUnlocked(t *testing.T) {
-	srv := &Server{
-		Addr:      pickFreeAddr(t),
-		Store:     store.NewInMemory(),
-		Client:    newFakeRESTClient(t),
-		Namespace: testRESTNamespace,
-	}
+	cli := newFakeRESTClient(t)
+	srv := &Server{Addr: pickFreeAddr(t), Store: store.NewInMemory(), Client: cli, Namespace: testRESTNamespace}
 
 	base, stop := startServerCustom(t, srv)
 	defer stop()
@@ -94,50 +90,30 @@ func TestBug196EncryptionStatusReportsUnlocked(t *testing.T) {
 		t.Fatalf("seed POST: got %d, want 201", resp.StatusCode)
 	}
 
-	got := requirePassphraseStatus(t, base)
-	if got != "unlocked" {
+	if got := requirePassphraseStatus(t, base); got != "unlocked" {
 		t.Errorf("status after create: got %q, want %q", got, "unlocked")
+	}
+
+	other, stopOther := startServerCustom(t, &Server{Addr: pickFreeAddr(t), Store: store.NewInMemory(), Client: cli, Namespace: testRESTNamespace})
+	defer stopOther()
+
+	if got := requirePassphraseStatus(t, other); got != "unlocked" {
+		t.Errorf("status on a second apiserver: got %q, want %q", got, "unlocked")
 	}
 }
 
-// TestBug196EncryptionStatusReportsSetButLocked: simulate the
-// post-restart state — the Secret carries a passphrase but the
-// in-memory unlock flag is false. Status MUST be "locked" so the
-// operator knows to run `linstor encryption enter-passphrase`.
-//
-// We retain a direct pointer to the Server so the test can flip the
-// in-memory unlock flag back to false without going through the
-// HTTP wire — the field is the source-of-truth for the "locked vs
-// unlocked" distinction and there's no PATCH verb that lands the
-// flag in `false` (the wrong-passphrase PATCH path leaves the flag
-// at its prior value to avoid leaking auth state).
+// TestBug196EncryptionStatusReportsSetButLocked: a keyring whose unlock
+// Secret opens no slot is "locked", so the operator knows to fix the
+// Secret or run `linstor encryption enter-passphrase`.
 func TestBug196EncryptionStatusReportsSetButLocked(t *testing.T) {
-	srv := &Server{
-		Addr:      pickFreeAddr(t),
-		Store:     store.NewInMemory(),
-		Client:    newFakeRESTClient(t),
-		Namespace: testRESTNamespace,
-	}
+	cli := newFakeRESTClient(t)
+	seedEncryption(t, cli, "not-the-passphrase")
 
-	base, stop := startServerCustom(t, srv)
+	base, stop := startServerCustom(t, &Server{Addr: pickFreeAddr(t), Store: store.NewInMemory(), Client: cli, Namespace: testRESTNamespace})
 	defer stop()
 
-	resp := httpPost(t, base+"/v1/encryption/passphrase",
-		[]byte(`{"new_passphrase":"hunter2-hunter2"}`))
-
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("seed POST: got %d, want 201", resp.StatusCode)
-	}
-
-	// Simulate a controller restart: passphrase Secret survives,
-	// in-memory unlock flag resets to zero (false).
-	srv.passphraseUnlocked.Store(false)
-
-	got := requirePassphraseStatus(t, base)
-	if got != "locked" {
-		t.Errorf("status after simulated restart: got %q, want %q", got, "locked")
+	if got := requirePassphraseStatus(t, base); got != "locked" {
+		t.Errorf("status with an unlock Secret that opens nothing: got %q, want %q", got, "locked")
 	}
 }
 

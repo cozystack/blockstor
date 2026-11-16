@@ -51,7 +51,7 @@ func TestAdoptedChildrenStoreTheirParentsUnderCRNames(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestALowercaseParentGetsNoSpellingAnnotation(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}

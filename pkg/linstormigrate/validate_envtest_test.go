@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/keyring"
 	lm "github.com/cozystack/blockstor/pkg/linstormigrate"
 )
 
@@ -117,7 +118,24 @@ func loadAndConvert(t *testing.T, dir string) *lm.Result {
 		t.Fatalf("LoadDump(%s): %v", dir, err)
 	}
 
-	res, err := lm.Convert(dump)
+	// The synthetic fixture's LUKS passwords were made with this
+	// passphrase; a production dump with LUKS volumes names its own file
+	// in LINSTOR_MIGRATE_PASSPHRASE_FILE.
+	pass := []byte("fixture-linstor-passphrase")
+
+	if path := os.Getenv("LINSTOR_MIGRATE_PASSPHRASE_FILE"); path != "" && dir != filepath.Join("testdata", "dump") {
+		pass, err = os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+	}
+
+	master, err := keyring.NewMasterKey()
+	if err != nil {
+		t.Fatalf("NewMasterKey: %v", err)
+	}
+
+	res, err := lm.ConvertWithOptions(dump, lm.Options{LUKS: &lm.LUKSImport{LinstorPassphrase: pass, MasterKey: master}})
 	if err != nil {
 		t.Fatalf("Convert(%s): %v", dir, err)
 	}

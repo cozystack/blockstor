@@ -75,13 +75,15 @@ kubectl get resourcedefinitions.blockstor.org \
 
 ## Encryption
 
-LUKS volumes are opened with the cluster passphrase, which lives in a Secret in `blockstor-system`. Create it once, before the first encrypted volume:
+Every encrypted volume gets its own random password, stored on its replica wrapped under the cluster master key. A master passphrase unlocks that key; it never opens a disk directly. Set one up once, before the first encrypted volume:
 
 ```sh
 blockstor encryption create-passphrase '<passphrase>'
 ```
 
-Keep a copy of the passphrase somewhere safe. Without it, encrypted volumes cannot be opened. Running the command again with the same passphrase is a no-op, and blockstor refuses to replace it with a different one, because that would lock every existing encrypted volume. A definition with `LUKS` in its stack and no passphrase available is refused rather than created unencrypted.
+Or, the way piraeus sets LINSTOR up, put the passphrase into a Secret in `blockstor-system` under the key `MASTER_PASSPHRASE` and name it in the ControllerConfig's `passphraseSecretRef`; the controller creates the master key from it. Keep a copy of the passphrase somewhere safe: without it and without the keyring Secret `blockstor-master-key`, encrypted volumes cannot be opened. A definition with `LUKS` in its stack is refused while the cluster has no master key.
+
+Passphrases can be changed, added and removed without touching a volume: `blockstor encryption modify-passphrase`, `add-passphrase --name`, `remove-passphrase` and `list-passphrases`.
 
 Then create volumes with LUKS in the stack:
 
@@ -95,5 +97,5 @@ Growing an encrypted volume resizes every layer in order: the storage below, the
 
 Limits today:
 
-- All volumes of a definition share one key.
-- Changing the passphrase of existing volumes is not supported. To re-key a volume, create a new one and move the data.
+- A volume keeps the password it was formatted with; changing it is not supported yet.
+- A volume formatted with the single cluster passphrase of earlier releases is not opened. Copy its data to a new volume.

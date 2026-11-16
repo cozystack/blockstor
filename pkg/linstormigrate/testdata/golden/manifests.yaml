@@ -322,6 +322,12 @@ spec:
   resourceDefinitionName: pvc-vol3
   skipInitialSync: false
   storagePool: data
+  volumes:
+  - luksKey:
+      keyID: "0000000000000000"
+      origin: LinstorImport
+      wrapped: d3JhcHBlZA==
+    volumeNumber: 0
 ---
 apiVersion: blockstor.org/v1alpha1
 kind: Resource
@@ -333,6 +339,12 @@ spec:
   resourceDefinitionName: pvc-vol3
   skipInitialSync: false
   storagePool: data
+  volumes:
+  - luksKey:
+      keyID: "0000000000000000"
+      origin: LinstorImport
+      wrapped: d3JhcHBlZA==
+    volumeNumber: 0
 ---
 apiVersion: blockstor.org/v1alpha1
 kind: Resource

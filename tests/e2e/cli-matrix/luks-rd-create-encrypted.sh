@@ -151,8 +151,8 @@ for node in "$N1" "$N2"; do
         echo "FAIL (Bug 333): no LUKS header on $node:$backing" >&2
         exit 1
     fi
-    if ! assert_luks_passphrase_opens "$node" "$backing" "$PASSPHRASE"; then
-        echo "FAIL (Bug 333): cluster passphrase does not unlock $node:$backing" >&2
+    if ! assert_luks_volume_keyed "$node" "$backing" "$PASSPHRASE"; then
+        echo "FAIL (Bug 333): the header is not keyed by its own password alone on $node:$backing" >&2
         exit 1
     fi
 done

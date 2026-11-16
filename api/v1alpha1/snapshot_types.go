@@ -25,6 +25,7 @@ import (
 // SnapshotSpec is the desired state of a LINSTOR Snapshot. The composite
 // key is (resource definition, snapshot name); metadata.name encodes that
 // as `<rd>.<snap>`.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.luksKeys) || (has(self.luksKeys) && self.luksKeys == oldSelf.luksKeys)",message="luksKeys is set once, when the snapshot is created"
 type SnapshotSpec struct {
 	// resourceDefinitionName is the parent ResourceDefinition.
 	// +required
@@ -146,6 +147,30 @@ type SnapshotSpec struct {
 	// makes progress instead of hanging on a missing denominator.
 	// +optional
 	GroupSize int32 `json:"groupSize,omitempty"`
+
+	// luksKeys are the wrapped LUKS passwords of the source replicas,
+	// copied when the snapshot is created: a snapshot's bytes are
+	// encrypted under the password of the replica they were taken from,
+	// and that replica may be gone by the time the snapshot is restored.
+	// +listType=map
+	// +listMapKey=nodeName
+	// +listMapKey=volumeNumber
+	// +optional
+	LUKSKeys []SnapshotLUKSKey `json:"luksKeys,omitempty"`
+}
+
+// SnapshotLUKSKey is the wrapped password of one source replica's volume.
+type SnapshotLUKSKey struct {
+	// nodeName is the CR name of the node the replica is on.
+	// +required
+	NodeName string `json:"nodeName"`
+
+	// volumeNumber is the volume within the replica.
+	// +required
+	VolumeNumber int32 `json:"volumeNumber"`
+
+	// LUKSKey is the password as the replica carries it.
+	LUKSKey `json:",inline"`
 }
 
 // SnapshotVolumeRef is one volume slot inside a Snapshot.

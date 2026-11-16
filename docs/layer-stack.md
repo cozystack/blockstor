@@ -74,18 +74,22 @@ the REST shape mirrors upstream LINSTOR.)
 
 ### Per-RD via kubectl
 
-The cluster passphrase Secret has to exist first; `linstor encryption
-create-passphrase` writes it, or apply it yourself (GitOps):
+The cluster needs a master key first. `linstor encryption create-passphrase` creates one, or, GitOps style and the way piraeus sets LINSTOR up, apply a passphrase Secret and name it in the ControllerConfig; the controller creates the keyring from it on its next pass:
 
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
-  name: blockstor-cluster-passphrase   # or ControllerConfig spec.passphraseSecretRef.name
-  namespace: blockstor-system          # the controller's namespace
-type: Opaque
+  name: linstor-passphrase
+  namespace: blockstor-system          # blockstor's own namespace
 stringData:
-  passphrase: "32-byte-secret"
+  MASTER_PASSPHRASE: "a long random passphrase"
+---
+apiVersion: blockstor.org/v1alpha1
+kind: ControllerConfig
+metadata: {name: default}
+spec:
+  passphraseSecretRef: {name: linstor-passphrase}   # key defaults to MASTER_PASSPHRASE
 ---
 apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
@@ -98,78 +102,21 @@ spec:
 
 ## LUKS specifics
 
-- The passphrase is the cluster master passphrase, and it lives only in
-  the Secret `linstor encryption create-passphrase` writes
-  (`blockstor-cluster-passphrase` in the controller's namespace, unless
-  ControllerConfig `spec.passphraseSecretRef` names another). Creating
-  an RD with `LUKS` in its stack is refused until that Secret exists.
-- A passphrase is never read from a property. The REST API answers 400
-  to any write that would store `DrbdOptions/EncryptPassphrase`,
-  `DrbdOptions/Encryption/passphrase` or `LuksPassphrase` (any case, on
-  any object), and so does the bundled CLI's `set-property`: a property
-  sits in plaintext on its CR, so any dump of the CRs would carry the
-  key to every LUKS volume. Deleting such a property is still allowed.
-  This differs from upstream LINSTOR, where `linstor controller
-  set-property DrbdOptions/EncryptPassphrase` is accepted.
-- The satellite reads the Secret, drops any passphrase property that
-  reached a definition's props (one put there with kubectl, say), and
-  hands the Secret's value to the dispatcher, which puts it on the wire
-  as `DesiredResource.Props["LuksPassphrase"]` for the LUKS layer.
-- No passphrase with `LUKS` in the stack fails the apply rather than
-  silently producing an unencrypted volume.
-- Mapper name: `<rd>-<vol>-luks` → `/dev/mapper/<rd>-<vol>-luks`. Stable
-  across reconciles so reopen on satellite restart re-uses it.
-- Volume grow: the satellite runs `cryptsetup resize` on the mapper
-  after the storage layer has resized the underlying LV, before DRBD
-  resizes the replicated device.
+The design is [encryption-keys.md](encryption-keys.md).
 
-### Upgrading a cluster that kept the passphrase in a property
+- Every LUKS replica's volume has its own random password, the only key in its LUKS header. The satellite generates it before formatting and stores it on the replica's Resource, `spec.volumes[].luksKey`, wrapped under the cluster master key; a device is formatted only after its password is stored, and only if `blkid -p` finds nothing on it. No master passphrase opens a disk.
+- The master key lives in the keyring Secret `blockstor-master-key`, wrapped under one slot per master passphrase. Each component unlocks it from the passphrase Secret the ControllerConfig names, or, without one, from the Secret `blockstor-unlock` that `create-passphrase` generates; blockstor never writes the operator's passphrase Secret.
+- `linstor encryption status` is `unset` with no keyring, `locked` when the passphrase Secret opens no slot, `unlocked` otherwise. Creating an RD with `LUKS` in its stack is refused while it is `unset`.
+- Passphrases change without touching a volume: `modify-passphrase` replaces a slot, and `blockstor encryption add-passphrase`, `remove-passphrase` and `list-passphrases` manage the others. To change the passphrase the Secret holds: add a slot with the new one, update the Secret, remove the old slot. Every step unlocks.
+- A device with a LUKS header and no stored password is neither opened nor formatted (`LUKSKeyMissing`); a stored password that does not open its header is never re-formatted (`LUKSKeyMismatch`). Both are Warning Events on the Resource. A restored or cloned volume takes the password its snapshot recorded.
+- A passphrase is never read from a property. The REST API answers 400 to any write that would store `DrbdOptions/EncryptPassphrase`, `DrbdOptions/Encryption/passphrase` or `LuksPassphrase` (any case, on any object), and so does the bundled CLI's `set-property`: a property sits in plaintext on its CR. Deleting such a property is still allowed. This differs from upstream LINSTOR, where `linstor controller set-property DrbdOptions/EncryptPassphrase` is accepted.
+- New headers use PBKDF2 at its minimum cost: the password is random, and Argon2id would cost seconds and up to a GiB per open after a reboot.
+- Mapper name: `<rd>-<vol>-luks` → `/dev/mapper/<rd>-<vol>-luks`. Stable across reconciles so reopen on satellite restart re-uses it.
+- Volume grow: the satellite runs `cryptsetup resize` on the mapper after the storage layer has resized the underlying LV, before DRBD resizes the replicated device.
 
-Before this release a passphrase property won over the Secret: `DrbdOptions/EncryptPassphrase` on the controller, or `DrbdOptions/Encryption/passphrase` on a group or a definition. LUKS volumes created while one was set were formatted with its value. From this release on the satellite opens them with the Secret's value only, and logs `ignoring LUKS passphrase properties` with the keys it dropped. Do this before the upgrade.
+### Upgrading a cluster with LUKS volumes from the single cluster passphrase
 
-1. Find the properties. Their values are redacted on the REST API, so read the CRs. The store keeps a `DrbdOptions/*` key in `spec.extraProps`, not in `spec.props`, and a volume's own props, where `vd modify-passphrase` wrote `DrbdOptions/Encrypt/Passphrase`, in `spec.volumeDefinitions[].props` of its definition, and a volume group's in `spec.volumeGroups[].props` of its group. Snapshots taken of a definition that carried the alias copied it into their own `spec.props`. So read all of them on groups, definitions, replicas and snapshots, and the controller's own:
-
-   ```sh
-   kubectl get controllerconfigs.blockstor.org -o jsonpath='{.items[*].spec.extraProps}'
-   kubectl get resourcegroups.blockstor.org,resourcedefinitions.blockstor.org,resources.blockstor.org,snapshots.blockstor.org -o json \
-     | jq -r '.items[] | select([(.spec.props // {}), (.spec.extraProps // {}), (.spec.volumeDefinitions // [] | .[].props // {}), (.spec.volumeGroups // [] | .[].props // {})] | add | keys | any(test("passphrase"; "i"))) | "\(.kind)/\(.metadata.name)"'
-   ```
-
-2. Make the Secret open every LUKS volume:
-   - **A controller property and no Secret**: run `linstor encryption create-passphrase` with the property's exact value.
-   - **A controller property set from the start, and a Secret with another value**: no LUKS volume was formatted with the Secret's value, so overwrite the Secret with the property's value. The API refuses this (create answers 409 because a passphrase exists, modify answers 409 because LUKS volumes exist), so do it with kubectl:
-
-     ```sh
-     kubectl -n blockstor-system create secret generic blockstor-cluster-passphrase \
-       --from-literal=passphrase='<the property value>' --dry-run=client -o yaml | kubectl apply -f -
-     ```
-
-     The Secret is `blockstor-cluster-passphrase` in the controller's namespace unless the ControllerConfig's `spec.passphraseSecretRef` names another; use that name, and the controller's namespace, if you changed either.
-
-   - **Per-group, per-definition or per-replica values, or a Secret that some volumes were formatted with**: the volumes use different keys, so no single Secret value opens them all. Add the Secret's value to each LUKS device that was formatted with another key, on every node with a replica, with `cryptsetup luksAddKey <device>`; it asks for the key the device has now.
-
-3. Delete every key step 1 found, on the object it was found on, so the plaintext value leaves the CRs and the next backup. The controller can hold the canonical key and the alias both:
-
-   ```sh
-   linstor controller set-property DrbdOptions/EncryptPassphrase ""
-   linstor controller set-property DrbdOptions/Encryption/passphrase ""
-   linstor resource-group set-property <group> <key> ""
-   linstor resource-definition set-property <definition> <key> ""
-   linstor resource set-property <node> <resource> <key> ""
-   linstor volume-definition set-property <definition> <volume number> <key> ""
-   linstor volume-group set-property <group> <volume number> <key> ""
-   ```
-
-   A snapshot has no set-property. Remove the key from its CR, with `/` in the key written as `~1`, or delete the snapshot if it is no longer needed:
-
-   ```sh
-   kubectl patch snapshots.blockstor.org <snapshot> --type json \
-     -p '[{"op":"remove","path":"/spec/props/DrbdOptions~1Encryption~1passphrase"}]'
-   ```
-
-   Groups, their volume groups and definitions no longer pass such a key on to what is cloned, spawned, snapshotted or restored from them, but the copies made before the upgrade carry it, so step 1 finds those too.
-
-A volume missed in step 2 fails to open on the next satellite restart or mapper close; the satellite log line names the property it was formatted with.
+Before this release every LUKS volume was formatted with the one cluster passphrase. Such a volume is not opened after the upgrade, and not re-formatted either: its replica carries no stored password, so the satellite reports `LUKSKeyMissing` and leaves the data on disk. Copy the data of every such volume to a volume created after the upgrade, then delete the old one. Remove any passphrase property left on the CRs (`linstor controller set-property DrbdOptions/EncryptPassphrase ""` and the like) so the plaintext value leaves the next backup.
 
 ## What blockstor doesn't yet support
 
@@ -177,21 +124,10 @@ A volume missed in step 2 fails to open on the next satellite restart or mapper 
   rows in the table above. Arbitrary orderings (e.g. `["LUKS","DRBD","STORAGE"]`
   with LUKS-over-DRBD instead of DRBD-over-LUKS) aren't yet validated
   or rendered.
-- **Per-volume LUKS keys**: every LUKS volume in the cluster uses the
-  cluster master passphrase. `linstor vd modify-passphrase` answers 400:
-  it used to store the value in the volume definition's properties,
-  in plaintext, where nothing read it. Per-volume keys (with master-key
-  wrapping) are a follow-up.
+- **Changing a volume's own password**: `linstor vd modify-passphrase` answers 400; a volume keeps the password it was formatted with. Re-keying a header (`luksChangeKey`) is a follow-up.
 - **Mid-stack changes**: editing `layerStack` after a Resource is
   active doesn't re-encrypt or unwrap existing data. Treat it as
   set-once-per-RD until migration support lands.
-- **Cluster-passphrase rotation**: the cluster passphrase is the LUKS
-  key itself, not a wrapping key. `linstor encryption
-  modify-passphrase` (`PUT /v1/encryption/passphrase`) rewrites the
-  Secret, and nothing runs `cryptsetup luksChangeKey` on the existing
-  headers, so volumes formatted with the old value would stop opening.
-  It answers 409 while any definition has LUKS in its stack, naming
-  one of them; rotate only once there are none.
 
 ## Testing
 

@@ -291,6 +291,14 @@ func main() {
 		setupLog.Error(err, "Failed to register runnable", "runnable", "auto-evict")
 		os.Exit(1)
 	}
+	if err := (&controller.MasterKeyRunnable{
+		Client:    mgr.GetClient(),
+		Reader:    mgr.GetAPIReader(),
+		Namespace: controllerNamespace,
+	}).RegisterWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to register runnable", "runnable", "master-key")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

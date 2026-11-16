@@ -54,7 +54,7 @@ const sensitivePropTokenSecret = "secret"
 
 //nolint:gochecknoglobals // immutable allowlist, read-only after init
 var sensitivePropSubstrings = []string{
-	passphraseSecretKey,
+	"passphrase",
 	"password",
 	sensitivePropTokenSecret,
 	"cram-hmac-alg",

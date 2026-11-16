@@ -73,6 +73,7 @@ linters:
           - SuspendIOAcked
           - GroupID
           - SharedSpaceID
+          - KeyID
     dupl:
       threshold: 100
     goconst:

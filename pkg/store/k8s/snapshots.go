@@ -34,6 +34,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -164,6 +165,11 @@ func (s *snapshots) Create(ctx context.Context, in *apiv1.Snapshot) error {
 	crd.Labels[LabelResourceDefinition] = rd.crName
 	rd.annotate(&crd.ObjectMeta, AnnotationLinstorRDName)
 
+	crd.Spec.LUKSKeys, err = s.sourceLUKSKeys(ctx, rd.crName, crd.Spec.Nodes)
+	if err != nil {
+		return err
+	}
+
 	err = s.c.Create(ctx, crd)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
@@ -228,8 +234,12 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		// The definition's CR name, fixed at Create; the wire carries the
 		// display spelling (see spellings.go).
 		preservedRD := existing.Spec.ResourceDefinitionName
+		// The source replicas' wrapped LUKS passwords, copied at Create:
+		// the snapshot's bytes cannot be read without them.
+		preservedLUKSKeys := existing.Spec.LUKSKeys
 
 		existing.Spec = wireToCRDSnapshotSpec(in)
+		existing.Spec.LUKSKeys = preservedLUKSKeys
 		existing.Spec.SuspendIO = preservedSuspendIO
 		existing.Spec.TakeSnapshot = preservedTakeSnapshot
 		existing.Spec.GroupID = preservedGroupID
@@ -667,6 +677,85 @@ func (s *snapshots) wireSnapshots(
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
+}
+
+// sourceLUKSKeys copies the wrapped LUKS password of every volume of the
+// definition's replicas on nodes, or on every node when nodes is empty: the
+// snapshot's bytes on a node are encrypted under that node's replica's
+// password, and the replica may be gone before the snapshot is restored.
+//
+// The replicas are read from the API server when the store has a direct
+// reader: a replica formatted a moment ago may not have reached the cache,
+// and a snapshot that misses its key cannot be restored.
+func (s *snapshots) sourceLUKSKeys(ctx context.Context, rdCRName string, nodes []string) ([]crdv1alpha1.SnapshotLUKSKey, error) {
+	reader := ctrlclient.Reader(s.c)
+	if s.apiReader != nil {
+		reader = s.apiReader
+	}
+
+	replicas, err := resourceCRDsOfDefinition(ctx, reader, rdCRName)
+	if err != nil {
+		return nil, err
+	}
+
+	wanted := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		wanted[naming.Key(node)] = true
+	}
+
+	var out []crdv1alpha1.SnapshotLUKSKey
+
+	for i := range replicas {
+		replica := &replicas[i]
+		if len(wanted) > 0 && !wanted[naming.Key(replica.Spec.NodeName)] {
+			continue
+		}
+
+		for _, vol := range replica.Spec.Volumes {
+			if vol.LUKSKey == nil {
+				continue
+			}
+
+			out = append(out, crdv1alpha1.SnapshotLUKSKey{
+				NodeName:     replica.Spec.NodeName,
+				VolumeNumber: vol.VolumeNumber,
+				LUKSKey:      *vol.LUKSKey.DeepCopy(),
+			})
+		}
+	}
+
+	return out, nil
+}
+
+// resourceCRDsOfDefinition lists the Resource CRs whose spec names the
+// definition rdCRName, scoped by the selectable field where the server serves
+// it and by a full read otherwise.
+func resourceCRDsOfDefinition(ctx context.Context, reader ctrlclient.Reader, rdCRName string) ([]crdv1alpha1.Resource, error) {
+	var list crdv1alpha1.ResourceList
+
+	err := reader.List(ctx, &list, ctrlclient.MatchingFields{FieldResourceDefinitionName: rdCRName})
+	if err == nil {
+		return list.Items, nil
+	}
+
+	if !SelectorUnsupported(err) {
+		return nil, errors.Wrapf(err, "list the replicas of %q", rdCRName)
+	}
+
+	err = reader.List(ctx, &list)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list the replicas of %q", rdCRName)
+	}
+
+	out := list.Items[:0]
+
+	for i := range list.Items {
+		if list.Items[i].Spec.ResourceDefinitionName == rdCRName {
+			out = append(out, list.Items[i])
+		}
+	}
 
 	return out, nil
 }

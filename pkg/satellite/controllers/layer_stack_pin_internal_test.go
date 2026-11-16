@@ -73,20 +73,19 @@ func memberReplica() *blockstoriov1alpha1.Resource {
 }
 
 // An RD that leaves its layer stack to its group must not be built into
-// an intent from its own empty stack: that intent has no LUKS layer and
-// carries no passphrase, so the volume would go to disk unencrypted
-// while everything else reads the group's stack and calls it encrypted.
+// an intent from its own empty stack: that intent has no LUKS layer, so
+// the volume would go to disk unencrypted while everything else reads the
+// group's stack and calls it encrypted.
 func TestAnRDLeftToItsGroupsLUKSStackIsNotBuiltPlaintext(t *testing.T) {
 	t.Parallel()
 
 	rd := groupMemberRD()
-	r := newPassphraseTestReconciler(t, luksGroup(), rd, memberReplica(), passphraseSecret("pass-member"))
+	r := newPassphraseTestReconciler(t, luksGroup(), rd, memberReplica())
 
 	desired, err := r.buildDesiredFromCRD(t.Context(), memberReplica(), rd, nil)
 	if err == nil {
-		if !slices.Contains(desired.GetLayerStack(), "LUKS") || desired.GetProps()["LuksPassphrase"] == "" {
-			t.Fatalf("intent for an RD in a LUKS group: stack %v, passphrase set %v; want LUKS with its passphrase, or no intent",
-				desired.GetLayerStack(), desired.GetProps()["LuksPassphrase"] != "")
+		if !slices.Contains(desired.GetLayerStack(), "LUKS") {
+			t.Fatalf("intent for an RD in a LUKS group: stack %v; want LUKS, or no intent", desired.GetLayerStack())
 		}
 
 		return
@@ -98,12 +97,12 @@ func TestAnRDLeftToItsGroupsLUKSStackIsNotBuiltPlaintext(t *testing.T) {
 }
 
 // Once the controller has written the group's stack onto the RD, the
-// intent carries LUKS and the passphrase.
-func TestAPinnedGroupStackBuildsLUKSWithItsPassphrase(t *testing.T) {
+// intent carries LUKS.
+func TestAPinnedGroupStackBuildsLUKS(t *testing.T) {
 	t.Parallel()
 
 	rd := groupMemberRD("DRBD", "LUKS", "STORAGE")
-	r := newPassphraseTestReconciler(t, luksGroup(), rd, memberReplica(), passphraseSecret("pass-member"))
+	r := newPassphraseTestReconciler(t, luksGroup(), rd, memberReplica())
 
 	desired, err := r.buildDesiredFromCRD(t.Context(), memberReplica(), rd, nil)
 	if err != nil {
@@ -112,10 +111,6 @@ func TestAPinnedGroupStackBuildsLUKSWithItsPassphrase(t *testing.T) {
 
 	if !slices.Contains(desired.GetLayerStack(), "LUKS") {
 		t.Errorf("stack %v, want LUKS", desired.GetLayerStack())
-	}
-
-	if desired.GetProps()["LuksPassphrase"] != "pass-member" {
-		t.Error("the passphrase did not reach the intent")
 	}
 }
 

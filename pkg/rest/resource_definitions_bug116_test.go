@@ -130,9 +130,7 @@ func TestBug116RawTopLevelLayerListPersistsOnCRD(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, testPassphraseSecret("bug116pass")); err != nil {
-		t.Fatalf("seed the passphrase Secret: %v", err)
-	}
+	seedEncryption(t, cli, testPassphrase)
 
 	base, stop := startServerCustom(t, &Server{
 		Addr:      pickFreeAddr(t),
@@ -220,9 +218,7 @@ func TestBug116RawLayerStackLUKSAcceptedWithPassphrase(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, testPassphraseSecret("bug116pass")); err != nil {
-		t.Fatalf("seed the passphrase Secret: %v", err)
-	}
+	seedEncryption(t, cli, testPassphrase)
 
 	base, stop := startServerCustom(t, &Server{
 		Addr:      pickFreeAddr(t),
@@ -276,9 +272,7 @@ func TestBug116BothFieldsConsistent(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, testPassphraseSecret("bug116pass")); err != nil {
-		t.Fatalf("seed the passphrase Secret: %v", err)
-	}
+	seedEncryption(t, cli, testPassphrase)
 
 	base, stop := startServerCustom(t, &Server{
 		Addr:      pickFreeAddr(t),
@@ -328,9 +322,7 @@ func TestBug116BothFieldsAgreeing(t *testing.T) {
 	cli := newFakeRESTClient(t)
 	ctx := t.Context()
 
-	if err := cli.Create(ctx, testPassphraseSecret("bug116pass")); err != nil {
-		t.Fatalf("seed the passphrase Secret: %v", err)
-	}
+	seedEncryption(t, cli, testPassphrase)
 
 	base, stop := startServerCustom(t, &Server{
 		Addr:      pickFreeAddr(t),

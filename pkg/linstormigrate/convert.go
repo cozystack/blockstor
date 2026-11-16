@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -116,6 +117,11 @@ type Options struct {
 	// definition; a definition here gives every one of its replicas
 	// the port of its own node, and takes precedence over DRBDPorts.
 	ReplicaDRBDPorts map[string]map[string]int32
+
+	// LUKS carries the LINSTOR master passphrase and the blockstor
+	// master key, for the import of LUKS volume passwords. A dump with
+	// LUKS volumes is refused without it: the volumes would never open.
+	LUKS *LUKSImport
 }
 
 // converter carries the indexes built once per Convert call.
@@ -136,6 +142,11 @@ type converter struct {
 	drbdNode  map[replicaKey]*int32                     // node-id by (node, rd)
 	storVol   map[volumeReplicaKey]LayerStorageVolumeRow
 	luksVol   map[volumeReplicaKey]LayerLuksVolumeRow
+	// luksKeys are the imported volume passwords, wrapped under the
+	// blockstor master key, by (node, rd, snapshot, vlmNr); luksCount
+	// counts them per RD for the report.
+	luksKeys  map[luksKeyAt]crdv1alpha1.LUKSKey
+	luksCount map[string]int
 	// diskStacks is the layer stack each live replica of an RD was
 	// actually built with, read off its LAYER_RESOURCE_IDS chain: by
 	// resource_name, then by the joined stack, to the stack itself.
@@ -204,6 +215,13 @@ type replicaKey struct {
 	rd   string
 }
 
+// luksKeyAt addresses one volume password: a live replica's when snap is
+// empty, a snapshot's otherwise.
+type luksKeyAt struct {
+	node, rd, snap string
+	vlmNr          int32
+}
+
 type volumeReplicaKey struct {
 	node  string
 	rd    string
@@ -232,6 +250,8 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		drbdNode:          map[replicaKey]*int32{},
 		storVol:           map[volumeReplicaKey]LayerStorageVolumeRow{},
 		luksVol:           map[volumeReplicaKey]LayerLuksVolumeRow{},
+		luksKeys:          map[luksKeyAt]crdv1alpha1.LUKSKey{},
+		luksCount:         map[string]int{},
 		diskStacks:        map[string]map[string][]string{},
 		chained:           map[replicaKey]bool{},
 		metaPoolDropped:   map[string]bool{},
@@ -247,6 +267,13 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 
 	conv.buildIndexes()
 
+	// Before anything is converted: a wrong passphrase or a password that
+	// does not decrypt stops the run with no output.
+	err := conv.importLUKSKeys()
+	if err != nil {
+		return nil, err
+	}
+
 	res := &Result{
 		ControllerConfig:    conv.convertControllerConfig(),
 		Nodes:               conv.convertNodes(),
@@ -260,7 +287,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 	conv.reportRemotes()
 	conv.reportUnmatchedPortNodes()
 
-	err := checkPortCollisions(res.Resources)
+	err = checkPortCollisions(res.Resources)
 	if err != nil {
 		return nil, err
 	}
@@ -1748,18 +1775,8 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 	def.Spec.VolumeDefinitions = c.volumeDefinitionsFor(row.ResourceName, dsp)
 
 	if c.rdHasLuks(row.ResourceName) {
-		// LAYER_LUKS_VOLUMES carries the volume passphrase encrypted
-		// with the LINSTOR master key; decrypting it needs the
-		// operator's master passphrase and LINSTOR's KDF, which this
-		// converter does not implement yet. The layer stack carries
-		// LUKS (rdLayerStack reads it off the replicas when the RD
-		// row leaves it empty), but blockstor opens every LUKS volume with the
-		// cluster passphrase in its Secret, which is not this volume's
-		// key, so the volume cannot be opened until that passphrase is
-		// added to it as a key slot.
-		c.warnf("resource definition %s: LUKS key NOT migrated (encrypted with the LINSTOR master key); "+
-			"blockstor opens LUKS volumes with the cluster passphrase, so add it to each volume with "+
-			"`cryptsetup luksAddKey` before adopting", dsp)
+		c.warnf("resource definition %s: %d LUKS volume passwords migrated, wrapped under the blockstor master key",
+			dsp, c.luksCount[row.ResourceName])
 	}
 }
 
@@ -1940,6 +1957,8 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 	annotateParent(&resource.ObjectMeta, k8sstore.AnnotationLinstorRDName, rdDsp)
 	annotateParent(&resource.ObjectMeta, k8sstore.AnnotationLinstorNodeName, nodeDsp)
 
+	resource.Spec.Volumes = c.importedReplicaKeys(row.NodeName, row.ResourceName)
+
 	if storVol, ok := c.storVol[volumeReplicaKey{node: row.NodeName, rd: row.ResourceName, vlmNr: 0}]; ok {
 		resource.Spec.StoragePool = displayName(c.poolDsp[storVol.StorPoolName], storVol.StorPoolName)
 	} else if sp := resource.Spec.Props["StorPoolName"]; sp != "" {
@@ -2028,6 +2047,7 @@ func (c *converter) buildSnapshot(row *ResourceDefinitionRow, rdDsp, snapDsp, na
 	}
 
 	snap.Spec.VolumeDefinitions = c.snapshotVolumeRefsFor(row.ResourceName, row.SnapshotName)
+	snap.Spec.LUKSKeys = c.importedSnapshotKeys(row.ResourceName, row.SnapshotName)
 
 	// blockstor's ZFS provider addresses a snapshot as
 	// `<pool>/<resource>_00000@<snap>` — volume 0 only (multi-volume
@@ -2425,4 +2445,108 @@ func orZero(v *int32) int32 {
 	}
 
 	return *v
+}
+
+// importLUKSKeys decrypts every LAYER_LUKS_VOLUMES password, live replicas
+// and snapshots alike, under LINSTOR's master key and wraps it under the
+// blockstor one. No plaintext password outlives this call.
+//
+// A given passphrase is always checked against LINSTOR's master key, LUKS
+// volumes or not: a keyring made from it is the one the cluster unlocks
+// with, and a typo would otherwise surface only once a volume is formatted
+// under it. A passphrase with no master key to check against is refused.
+func (c *converter) importLUKSKeys() error {
+	if c.opts.LUKS == nil || c.opts.LUKS.MasterKey == nil {
+		if len(c.dump.LayerLuksVolumes) == 0 {
+			return nil
+		}
+
+		return ErrLUKSNeedsPassphrase
+	}
+
+	linstorMaster, err := LinstorMasterKey(c.dump.PropsContainers, c.opts.LUKS.LinstorPassphrase)
+	if errors.Is(err, ErrLinstorNoMasterKey) && len(c.dump.LayerLuksVolumes) == 0 {
+		return ErrLinstorPassphraseUnchecked
+	}
+
+	if err != nil {
+		return err
+	}
+
+	defer clear(linstorMaster)
+
+	layerByID := map[int32]LayerResourceIDRow{}
+	for i := range c.dump.LayerResourceIDs {
+		layerByID[c.dump.LayerResourceIDs[i].LayerResourceID] = c.dump.LayerResourceIDs[i]
+	}
+
+	for i := range c.dump.LayerLuksVolumes {
+		row := &c.dump.LayerLuksVolumes[i]
+
+		lri, ok := layerByID[row.LayerResourceID]
+		if !ok || lri.LayerResourceSuffix != "" {
+			continue
+		}
+
+		password, err := LinstorVolumePassword(linstorMaster, row.EncryptedPassword)
+		if err != nil {
+			return errors.Wrapf(err, "resource %s on node %s volume %d", lri.ResourceName, lri.NodeName, row.VlmNr)
+		}
+
+		key, err := importedLUKSKey(c.opts.LUKS.MasterKey, password)
+
+		clear(password)
+
+		if err != nil {
+			return err
+		}
+
+		c.luksKeys[luksKeyAt{node: lri.NodeName, rd: lri.ResourceName, snap: lri.SnapshotName, vlmNr: row.VlmNr}] = key
+
+		if lri.SnapshotName == "" {
+			c.luksCount[lri.ResourceName]++
+		}
+	}
+
+	return nil
+}
+
+// importedReplicaKeys is the live replica's volumes with their imported
+// passwords, by volume number.
+func (c *converter) importedReplicaKeys(node, rd string) []crdv1alpha1.ResourceVolumeSpec {
+	var out []crdv1alpha1.ResourceVolumeSpec
+
+	for at, key := range c.luksKeys {
+		if at.node == node && at.rd == rd && at.snap == "" {
+			out = append(out, crdv1alpha1.ResourceVolumeSpec{VolumeNumber: at.vlmNr, LUKSKey: key.DeepCopy()})
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].VolumeNumber < out[j].VolumeNumber })
+
+	return out
+}
+
+// importedSnapshotKeys is the snapshot's recorded passwords, one per
+// source replica's volume, keyed by the node's CR name.
+func (c *converter) importedSnapshotKeys(rd, snap string) []crdv1alpha1.SnapshotLUKSKey {
+	var out []crdv1alpha1.SnapshotLUKSKey
+
+	for at, key := range c.luksKeys {
+		if at.rd == rd && at.snap == snap && snap != "" {
+			out = append(out, crdv1alpha1.SnapshotLUKSKey{
+				NodeName: k8sstore.Name(c.displayNode(at.node)), VolumeNumber: at.vlmNr, LUKSKey: key,
+			})
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].NodeName != out[j].NodeName {
+			return out[i].NodeName < out[j].NodeName
+		}
+
+		return out[i].VolumeNumber < out[j].VolumeNumber
+	})
+
+	return out
 }

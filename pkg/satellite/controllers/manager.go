@@ -33,6 +33,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/satellite/stream"
 )
 
@@ -160,6 +161,7 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	}
 
 	wireCrossNodeFetcher(mgr, cfg)
+	wireLUKSKeys(mgr, cfg)
 	wireConditionStampers(mgr, cfg)
 
 	return mgr, nil
@@ -310,6 +312,22 @@ func wireCrossNodeFetcher(mgr manager.Manager, cfg *Config) {
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
 		Stream:   stream.NewClient(cfg.StreamTLS),
+	})
+}
+
+// wireLUKSKeys injects the LUKS key provider into the Apply chain. It reads
+// the replica, the snapshot and the two Secrets past the cache: Secret
+// RBAC is a namespaced get, and a password stored a moment ago must be
+// the one read back.
+func wireLUKSKeys(mgr manager.Manager, cfg *Config) {
+	reader := cfg.APIReader
+
+	cfg.Apply.SetLUKSKeys(&LUKSKeys{
+		Client: mgr.GetClient(),
+		Reader: reader,
+		Unlocker: &passphrase.Unlocker{
+			Secrets: passphrase.Secrets{Reader: reader, Namespace: cfg.Namespace},
+		},
 	})
 }
 

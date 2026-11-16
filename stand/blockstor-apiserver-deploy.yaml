@@ -30,13 +30,17 @@ rules:
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
 ---
-# The cluster passphrase (`blockstor-cluster-passphrase` by default;
-# override via ControllerConfig.Spec.PassphraseSecretRef) is read on
-# every `linstor encryption enter-passphrase` and written on
-# `create-passphrase` / `modify-passphrase`. It is read past the
-# controller-runtime cache (rest.Server.SecretReader), so no informer
-# lists or watches Secrets and a get in this namespace is all the read
-# needs.
+# The encryption verbs read the passphrase Secret the ControllerConfig
+# names and the keyring Secret, and write the keyring and the generated
+# unlock Secret; the passphrase Secret itself is never written. All of it
+# is read past the controller-runtime cache (rest.Server.SecretReader), so
+# no informer lists or watches Secrets and a get in this namespace is all
+# the read needs.
+# resourceNames: the keyring, the unlock Secret blockstor generates when no
+# passphrase Secret is named, and the passphrase Secret under piraeus's
+# name, linstor-passphrase. A ControllerConfig that names another
+# passphrase Secret needs that name added here. Nothing else in the
+# namespace is readable: under Cozystack it is shared with piraeus.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -45,7 +49,13 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, create, update, patch]
+    resourceNames: [blockstor-master-key, blockstor-unlock, linstor-passphrase]
+    verbs: [get, update]
+  # A create cannot be limited by name; see docs/encryption-keys.md for
+  # what that leaves open and how to close it.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
