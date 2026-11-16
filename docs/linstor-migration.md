@@ -93,7 +93,7 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifests.yaml
 ```
 
-Read the report on stderr end to end. Every `warning:` line is a thing the converter refused to guess — decide per line whether it matters for your data before continuing. In particular resolve every `LUKS key NOT migrated` and every `no DRBD port` line (the latter should be empty if the port capture was complete).
+Read the report on stderr end to end. Every `warning:` line is a thing the converter refused to guess — decide per line whether it matters for your data before continuing. In particular resolve every `LUKS key NOT migrated` and every `no DRBD port` line, whether it names a definition, one replica, or a map whose node names match no replica. The latter should be empty if the port capture was complete: each replica it names gets a fresh port and reconnects on adoption, and `spec.drbdPort` cannot be changed after apply.
 
 ## Cutover
 

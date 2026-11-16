@@ -2175,7 +2175,7 @@ func (c *converter) reportUnmatchedPortNodes() {
 
 		rdDsp := c.displayRD(row.ResourceName)
 		if len(unmatched) == len(perReplica) {
-			c.warnf("resource definition %s: no node in the live port map (%s) hosts a replica of it — check that the map uses LINSTOR's node names; every replica will get a fresh port and reconnect on adoption",
+			c.warnf("resource definition %s: no DRBD port for any replica: no node in the live port map (%s) hosts a replica of it — check that the map uses LINSTOR's node names; every replica will get a fresh port and reconnect on adoption",
 				rdDsp, strings.Join(unmatched, ", "))
 
 			continue
@@ -2236,7 +2236,7 @@ func (c *converter) resolveReplicaDRBDPort(row *ResourceRow, dumpPort *int32, rd
 	}
 
 	c.warnOncef("drbdport:"+row.ResourceName+":"+row.NodeName,
-		"resource %s.%s: the live map has ports for the other replicas of %s but none for this one — blockstor will allocate a fresh port for it, and this replica will reconnect on adoption",
+		"resource %s.%s: no DRBD port for this replica in the live map, which has ports for the other replicas of %s — blockstor will allocate a fresh port for it, and this replica will reconnect on adoption",
 		rdDsp, nodeDsp, rdDsp)
 
 	return nil

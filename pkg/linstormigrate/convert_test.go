@@ -499,7 +499,7 @@ func TestAReplicaMissingFromThePerReplicaMapIsReported(t *testing.T) {
 		t.Errorf("pvc-vol5.node-b DRBDPort = %d, want none", *got)
 	}
 
-	if !hasWarning(res, "pvc-vol5.node-b: the live map has ports for the other replicas") {
+	if !hasWarning(res, "pvc-vol5.node-b: no DRBD port for this replica in the live map") {
 		t.Errorf("missing replica port not reported; warnings %v", res.Warnings)
 	}
 
@@ -583,7 +583,7 @@ func TestPortMapNodesWithoutAReplicaAreReported(t *testing.T) {
 		t.Errorf("stray node entry not reported; warnings %v", res.Warnings)
 	}
 
-	if !hasWarning(res, "pvc-vol3: no node in the live port map (k8s-a, k8s-b) hosts a replica of it") {
+	if !hasWarning(res, "pvc-vol3: no DRBD port for any replica: no node in the live port map (k8s-a, k8s-b) hosts a replica of it") {
 		t.Errorf("fully unmatched map not reported; warnings %v", res.Warnings)
 	}
 
