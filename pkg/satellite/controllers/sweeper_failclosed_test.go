@@ -20,10 +20,12 @@ package controllers
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -264,5 +266,183 @@ func TestSweeperDownsGenuineOrphan(t *testing.T) {
 	_, statErr := os.Stat(stalePath)
 	if !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("stale .res not collected: stat err %v", statErr)
+	}
+}
+
+// TestSweeperDoesNotSweepWithoutStateDir: with no StateDir there is no
+// ownership record, and the sweeper used to fall back to "no CRD means
+// orphan", downing every slot another DRBD manager runs on the node.
+func TestSweeperDoesNotSweepWithoutStateDir(t *testing.T) {
+	t.Parallel()
+
+	sweeper, fx, _ := failClosedSweeper(t, satelliteNode(nil), interceptor.Funcs{})
+	sweeper.StateDir = ""
+
+	err := sweeper.sweepOnce(t.Context(), logr.Discard())
+	if !errors.Is(err, errNoStateDir) {
+		t.Errorf("sweepOnce error = %v; want errNoStateDir", err)
+	}
+
+	if calls := fx.CommandLines(); len(calls) != 0 {
+		t.Errorf("sweeper without StateDir ran kernel commands: %v", calls)
+	}
+}
+
+// TestClassifyOrphanWithoutStateDirIsUnknown pins the same rule one
+// level down, for a caller of classifyOrphan that does not go through
+// sweepOnce's StateDir check.
+func TestClassifyOrphanWithoutStateDirIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	decision, _, reason := classifyOrphan("pvc-orphan", nil, nil, metav1.Now().Time, -1, "", nil)
+	if decision != sweepUnknown || reason == nil {
+		t.Errorf("classifyOrphan without StateDir = (%v, %v); want (sweepUnknown, reason)", decision, reason)
+	}
+}
+
+func pathErr(path string, errno syscall.Errno) error {
+	return &fs.PathError{Op: "lstat", Path: path, Err: errno}
+}
+
+// TestSweeperLeavesSlotAloneWhenMarkerProbeFails: a marker that cannot
+// be probed says nothing about who owns the slot. The sweeper used to
+// read EACCES / EIO as "owned" and down the slot. Positive proof from
+// the other marker still counts: blockstor wrote that one.
+func TestSweeperLeavesSlotAloneWhenMarkerProbeFails(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		errno    map[string]syscall.Errno
+		wantDown bool
+	}{
+		{name: "res EACCES, owned EACCES", errno: map[string]syscall.Errno{".res": syscall.EACCES, ".owned": syscall.EACCES}},
+		{name: "res EIO, owned EIO", errno: map[string]syscall.Errno{".res": syscall.EIO, ".owned": syscall.EIO}},
+		{name: "res EACCES, owned absent", errno: map[string]syscall.Errno{".res": syscall.EACCES, ".owned": syscall.ENOENT}},
+		{name: "res absent, owned EIO", errno: map[string]syscall.Errno{".res": syscall.ENOENT, ".owned": syscall.EIO}},
+		{name: "res EIO, owned present", errno: map[string]syscall.Errno{".res": syscall.EIO}, wantDown: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			sweeper, fx, _ := failClosedSweeper(t, satelliteNode(nil), interceptor.Funcs{})
+			sweeper.lstatFn = func(path string) (os.FileInfo, error) {
+				if !strings.HasPrefix(filepath.Base(path), "pvc-orphan.") {
+					return os.Lstat(path)
+				}
+
+				errno, ok := tc.errno[filepath.Ext(path)]
+				if !ok {
+					return os.Lstat(path)
+				}
+
+				return nil, pathErr(path, errno)
+			}
+
+			err := sweeper.sweepOnce(t.Context(), logr.Discard())
+			if err != nil {
+				t.Fatalf("sweepOnce: %v", err)
+			}
+
+			gotDown := slices.Contains(fx.CommandLines(), "drbdsetup down pvc-orphan")
+			if gotDown != tc.wantDown {
+				t.Errorf("slot torn down = %v; want %v (calls %v)", gotDown, tc.wantDown, fx.CommandLines())
+			}
+
+			// Kept for the right reason: reported as unknown, not
+			// silently classified as foreign.
+			ownership, reason := resFileOwnership(sweeper.lstatFn, sweeper.StateDir, "pvc-orphan")
+			if !tc.wantDown && (ownership != resUnknown || reason == nil) {
+				t.Errorf("resFileOwnership = (%v, %v); want (resUnknown, reason)", ownership, reason)
+			}
+		})
+	}
+}
+
+// TestSweeperLeavesSlotAloneWhenMarkerIsNotRegular: blockstor writes
+// both markers with os.WriteFile, so a symlink or a directory under a
+// marker's name was put there by something else and proves nothing.
+// os.Stat used to follow the link and count it as ownership.
+func TestSweeperLeavesSlotAloneWhenMarkerIsNotRegular(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]func(t *testing.T, path string){
+		"symlink": func(t *testing.T, path string) {
+			t.Helper()
+
+			target := filepath.Join(t.TempDir(), "elsewhere.res")
+
+			err := os.WriteFile(target, nil, 0o600)
+			if err != nil {
+				t.Fatalf("seed symlink target: %v", err)
+			}
+
+			err = os.Symlink(target, path)
+			if err != nil {
+				t.Fatalf("symlink marker: %v", err)
+			}
+		},
+		"directory": func(t *testing.T, path string) {
+			t.Helper()
+
+			err := os.Mkdir(path, 0o700)
+			if err != nil {
+				t.Fatalf("mkdir marker: %v", err)
+			}
+		},
+	}
+
+	for name, seed := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			sweeper, fx, _ := failClosedSweeper(t, satelliteNode(nil), interceptor.Funcs{})
+
+			err := os.Remove(filepath.Join(sweeper.StateDir, "pvc-orphan.owned"))
+			if err != nil {
+				t.Fatalf("drop regular marker: %v", err)
+			}
+
+			seed(t, filepath.Join(sweeper.StateDir, "pvc-orphan.owned"))
+
+			err = sweeper.sweepOnce(t.Context(), logr.Discard())
+			if err != nil {
+				t.Fatalf("sweepOnce: %v", err)
+			}
+
+			if got := downCalls(fx); len(got) != 0 {
+				t.Errorf("slot torn down on a non-regular marker: %v", got)
+			}
+
+			ownership, reason := resFileOwnership(nil, sweeper.StateDir, "pvc-orphan")
+			if ownership != resUnknown || reason == nil {
+				t.Errorf("resFileOwnership = (%v, %v); want (resUnknown, reason)", ownership, reason)
+			}
+		})
+	}
+}
+
+// TestResFileOwnershipRejectsNonPlainNames: a kernel resource name is
+// joined onto StateDir to find its markers, so a name that is not a
+// plain file name would probe somewhere else entirely.
+func TestResFileOwnershipRejectsNonPlainNames(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+
+	outside := filepath.Join(filepath.Dir(stateDir), filepath.Base(stateDir)+"-outside.owned")
+
+	err := os.WriteFile(outside, nil, 0o600)
+	if err != nil {
+		t.Fatalf("seed marker outside StateDir: %v", err)
+	}
+
+	for _, rsc := range []string{"", ".", "..", "../" + filepath.Base(stateDir) + "-outside", `a\b`} {
+		ownership, reason := resFileOwnership(nil, stateDir, rsc)
+		if ownership != resUnknown || reason == nil {
+			t.Errorf("resFileOwnership(%q) = (%v, %v); want (resUnknown, reason)", rsc, ownership, reason)
+		}
 	}
 }
