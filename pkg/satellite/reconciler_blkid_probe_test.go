@@ -318,3 +318,36 @@ func TestApplyStorageOnlyMkfsFormatsOnlyABornEmptyReplica(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyPromotedMkfsDemotesWhenRefused: a mkfs the probe refused (or
+// one that failed) is followed by the demote all the same. Left
+// Primary, the replica would hold the volume against every other node.
+func TestApplyPromotedMkfsDemotesWhenRefused(t *testing.T) {
+	rd := "pvc-dem"
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	device := expectThinBacking(fx, rd)
+	fx.Expect("drbdsetup status "+rd+" --json",
+		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary(rd))})
+	expectDrbdMetaSignature(fx, device)
+	fx.Expect(mkfsTargetProbe("/dev/drbd6840"), storage.FakeResponse{Err: storage.FakeExitError{Code: 8}})
+
+	rec := newThinReconciler(fx, dir)
+
+	results, err := rec.Apply(t.Context(), bug028FalseLatchDR(rd, "6840"))
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+	promote := slices.Index(cmds, "drbdadm primary --force "+rd)
+	demote := slices.Index(cmds, "drbdadm secondary "+rd)
+
+	if promote < 0 || demote < promote {
+		t.Errorf("want primary --force then secondary; got promote=%d demote=%d in %v", promote, demote, cmds)
+	}
+
+	if len(results) != 1 || results[0].GetOk() || !strings.Contains(results[0].GetMessage(), "refusing mkfs") {
+		t.Errorf("the refused mkfs must still fail the apply: %v", results)
+	}
+}

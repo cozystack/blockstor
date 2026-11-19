@@ -4416,12 +4416,20 @@ func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResou
 		return errors.Wrapf(err, "auto-primary %s", dr.GetName())
 	}
 
-	err = r.runAutoMkfs(ctx, dr, drbdDevicesForMkfs(dr))
-	if err != nil {
-		return errors.Wrapf(err, "auto-mkfs %s", dr.GetName())
+	// Demote whatever mkfs did, as LINSTOR's primaryAutoClose does: a
+	// refused or failed mkfs must not leave the replica Primary, where
+	// it blocks every other node from using the volume.
+	mkfsErr := r.runAutoMkfs(ctx, dr, drbdDevicesForMkfs(dr))
+	err = r.cfg.Adm.Secondary(ctx, dr.GetName())
+
+	if mkfsErr != nil {
+		if err != nil {
+			log.FromContext(ctx).Error(err, "auto-secondary after a failed mkfs", "resource", dr.GetName())
+		}
+
+		return errors.Wrapf(mkfsErr, "auto-mkfs %s", dr.GetName())
 	}
 
-	err = r.cfg.Adm.Secondary(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
 	}
