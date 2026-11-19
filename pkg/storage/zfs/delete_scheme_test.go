@@ -760,3 +760,26 @@ func TestRecordedSuffixFallsBackToTheLiveName(t *testing.T) {
 		t.Errorf("pool: %v", got)
 	}
 }
+
+// A failed probe before a receive is not "absent": `zfs recv -F` over an
+// existing dataset, and the cleanup after a failed receive, would destroy it.
+func TestRecvSnapshotProbeFailureTouchesNothing(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-a_00000")
+	p.failList = true
+
+	err := zfs.NewProvider(zfs.Config{Pool: "tank"}, p).RecvSnapshot(t.Context(), vol("pvc-a"), strings.NewReader("stream"))
+	if err == nil {
+		t.Fatalf("RecvSnapshot with a failing probe: got nil, want an error")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, line := range p.calls {
+		if strings.HasPrefix(line, "zfs recv") || strings.HasPrefix(line, "zfs destroy") {
+			t.Errorf("ran %q over a dataset the probe could not see", line)
+		}
+	}
+}
