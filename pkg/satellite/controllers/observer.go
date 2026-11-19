@@ -2080,6 +2080,13 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 		})
 	}
 
+	// Every snapshot is built from a map, and SSA keeps the order of
+	// the list it is sent: unsorted, an unchanged volume set is a real
+	// write whenever the map comes out in a different order.
+	slices.SortFunc(out, func(left, right blockstoriov1alpha1.ResourceVolumeStatus) int {
+		return cmp.Compare(left.VolumeNumber, right.VolumeNumber)
+	})
+
 	return out
 }
 

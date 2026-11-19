@@ -281,6 +281,55 @@ func TestConnectionStatusOrderIsStable(t *testing.T) {
 	}
 }
 
+// TestVolumeStatusOrderIsStable is the Status.Volumes counterpart of
+// TestConnectionStatusOrderIsStable: a multi-volume replica's volumes
+// come out of a map on the frame merge and on the resync alike, and
+// the applied list must not depend on that map's order.
+func TestVolumeStatusOrderIsStable(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	const volumes = 6
+
+	for vn := range int32(volumes) {
+		o.mergeVolumes(&observation{
+			ResourceName: "pvc-1",
+			Volumes:      []volumeObservation{{VolumeNumber: vn, DiskState: "UpToDate"}},
+		})
+	}
+
+	diskState := []string{"Outdated", "UpToDate"}
+
+	paths := map[string]func(pass int) observation{
+		// A frame that changes one volume rebuilds the snapshot from
+		// the whole per-resource cache.
+		"device frame": func(pass int) observation {
+			ev := observation{
+				ResourceName: "pvc-1",
+				Volumes:      []volumeObservation{{VolumeNumber: 3, DiskState: diskState[pass%2]}},
+			}
+			o.mergeVolumes(&ev)
+
+			return ev
+		},
+		"resync": func(int) observation { return o.snapshotFor("pvc-1") },
+	}
+
+	for path, snapshot := range paths {
+		for pass := range 50 {
+			ev := snapshot(pass)
+
+			got := make([]int32, 0, volumes)
+			for _, vol := range buildObserverVolumeStatus(&ev, "") {
+				got = append(got, vol.VolumeNumber)
+			}
+
+			if !slices.IsSorted(got) || len(got) != volumes {
+				t.Fatalf("%s pass %d: applied volume order = %v, want 0..%d", path, pass, got, volumes-1)
+			}
+		}
+	}
+}
+
 // TestMergeConnectionsNoopForNonConnectionEvents — disk/role events
 // arrive without a Connections slice; the merge must leave the
 // observation untouched (we don't want every kernel frame to
