@@ -23,8 +23,10 @@ import (
 
 	lapi "github.com/LINBIT/golinstor/client"
 	"github.com/LINBIT/golinstor/devicelayerkind"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
@@ -37,7 +39,7 @@ import (
 
 const contractRD = "pvc-contract"
 
-var contractNodes = []string{"node-a", "node-b", "node-c"}
+func contractNodeNames() []string { return []string{"node-a", "node-b", "node-c"} }
 
 // seedThreeReplicaRD creates a one-volume RD with a diskful replica on
 // each contract node and no satellite-reported state: the state a new
@@ -47,7 +49,7 @@ func seedThreeReplicaRD(t *testing.T, st store.Store) {
 
 	ctx := t.Context()
 
-	for _, n := range contractNodes {
+	for _, n := range contractNodeNames() {
 		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n}); err != nil {
 			t.Fatalf("seed node %s: %v", n, err)
 		}
@@ -64,7 +66,7 @@ func seedThreeReplicaRD(t *testing.T, st store.Store) {
 		t.Fatalf("seed VD: %v", err)
 	}
 
-	for _, n := range contractNodes {
+	for _, n := range contractNodeNames() {
 		if err := st.Resources().Create(ctx, &apiv1.Resource{
 			Name:     contractRD,
 			NodeName: n,
@@ -85,11 +87,29 @@ func contractResourceView(t *testing.T, base string) []lapi.ResourceWithVolumes 
 		t.Fatalf("GetResourceView: %v", err)
 	}
 
-	if len(view) != len(contractNodes) {
-		t.Fatalf("view: got %d replicas, want %d", len(view), len(contractNodes))
+	if len(view) != len(contractNodeNames()) {
+		t.Fatalf("view: got %d replicas, want %d", len(view), len(contractNodeNames()))
 	}
 
 	return view
+}
+
+func drbdLayer(layer *lapi.ResourceLayer) *lapi.DrbdResource {
+	if layer == nil {
+		return nil
+	}
+
+	if layer.Type == devicelayerkind.Drbd {
+		return layer.Drbd
+	}
+
+	for i := range layer.Children {
+		if drbd := drbdLayer(&layer.Children[i]); drbd != nil {
+			return drbd
+		}
+	}
+
+	return nil
 }
 
 func hasDRBDLayer(layer *lapi.ResourceLayer) bool {
@@ -144,6 +164,91 @@ func TestViewUnbuiltReplicasListEveryVolume(t *testing.T) {
 		// the node rather than offer it.
 		if vol.State.DiskState != "" {
 			t.Errorf("%s: disk_state = %q before any report, want empty", r.NodeName, vol.State.DiskState)
+		}
+	}
+}
+
+// reportHealthyReplicas writes onto every contract replica the Status
+// the satellite observer records for a healthy, connected, UpToDate
+// Secondary.
+func reportHealthyReplicas(t *testing.T, cli ctrlclient.Client) {
+	t.Helper()
+
+	ctx := t.Context()
+	score := int32(10102)
+	mayPromote := true
+
+	for _, n := range contractNodeNames() {
+		var crd crdv1alpha1.Resource
+		if err := cli.Get(ctx, ctrlclient.ObjectKey{Name: k8s.ResourceCRName(contractRD, n)}, &crd); err != nil {
+			t.Fatalf("get replica on %s: %v", n, err)
+		}
+
+		crd.Status.Role = "Secondary"
+		crd.Status.DrbdState = "UpToDate"
+		crd.Status.PromotionScore = &score
+		crd.Status.MayPromote = &mayPromote
+		crd.Status.Volumes = []crdv1alpha1.ResourceVolumeStatus{{
+			VolumeNumber: 0,
+			StoragePool:  "data",
+			DevicePath:   "/dev/drbd1000",
+			DiskState:    "UpToDate",
+		}}
+
+		for _, peer := range contractNodeNames() {
+			if peer != n {
+				crd.Status.Connections = append(crd.Status.Connections, crdv1alpha1.ResourceConnectionStatus{
+					PeerNodeName:     peer,
+					Connected:        true,
+					Message:          "Connected",
+					ReplicationState: "Established",
+				})
+			}
+		}
+
+		if err := cli.Status().Update(ctx, &crd); err != nil {
+			t.Fatalf("report replica on %s: %v", n, err)
+		}
+	}
+}
+
+// TestViewHealthyReplicasPassTheCSIVolumeCondition: linstor-csi's
+// ControllerGetVolume and ListVolumes report a volume abnormal on
+// every replica with no `state` or with a DRBD layer whose
+// `promotion_score` is 0. LINSTOR publishes the kernel's promotion
+// score there; blockstor never did, so every replica of every volume
+// was reported as a node with issues on each health-monitor pass while
+// the same view showed it UpToDate and connected.
+func TestViewHealthyReplicasPassTheCSIVolumeCondition(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(crScheme(t)).
+		WithStatusSubresource(&crdv1alpha1.Resource{}).Build()
+	st := k8s.New(cli)
+	seedThreeReplicaRD(t, st)
+	reportHealthyReplicas(t, cli)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	for _, r := range contractResourceView(t, base) {
+		if r.State == nil {
+			t.Errorf("%s: no state, linstor-csi reports the node as having issues", r.NodeName)
+
+			continue
+		}
+
+		drbd := drbdLayer(r.LayerObject)
+		if drbd == nil {
+			t.Fatalf("%s: no DRBD layer in %+v", r.NodeName, r.LayerObject)
+		}
+
+		if drbd.PromotionScore == 0 {
+			t.Errorf("%s: layer_object.drbd.promotion_score = 0 on a healthy replica, linstor-csi reports the node as having issues", r.NodeName)
+		}
+
+		if !drbd.MayPromote {
+			t.Errorf("%s: layer_object.drbd.may_promote = false, want the observed true", r.NodeName)
 		}
 	}
 }
