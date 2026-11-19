@@ -115,7 +115,9 @@ func TestControllerAndSatelliteDisagreement(t *testing.T) {
 
 // TestSparseFlagAtSatelliteScopeIsSeen: `linstor controller set-property
 // StorDriver/ZfscreateOptions -s` is stored in /STLT, which is the bag the
-// satellite creates zvols from.
+// satellite creates zvols from. The converter reads it there, so the
+// report must not also list it as a prop nothing carries: the runbook
+// treats that line as a stop-the-line check.
 func TestSparseFlagAtSatelliteScopeIsSeen(t *testing.T) {
 	dump := &Dump{
 		Nodes: []NodeRow{
@@ -136,5 +138,38 @@ func TestSparseFlagAtSatelliteScopeIsSeen(t *testing.T) {
 
 	if len(res.StoragePools) != 1 || res.StoragePools[0].Spec.ProviderKind != "ZFS_THIN" {
 		t.Fatalf("a satellite-scope sparse flag was not seen: %+v", res.StoragePools)
+	}
+
+	if hasWarning(res, "not migrated, no blockstor object carries them: StorDriver/ZfscreateOptions") {
+		t.Errorf("the sparse flag the converter used was reported as not migrated; warnings: %v", res.Warnings)
+	}
+}
+
+// TestSparseFlagAtControllerScopeIsNotReportedDropped: the same for a
+// flag that sits in /CTRL.
+func TestSparseFlagAtControllerScopeIsNotReportedDropped(t *testing.T) {
+	dump := &Dump{
+		Nodes: []NodeRow{
+			{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"},
+		},
+		NodeStorPools: []NodeStorPoolRow{
+			{NodeName: "NODE-A", PoolName: "CLUSTERWIDE", DriverName: "ZFS", UUID: "sp-1"},
+		},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: PropsInstanceController, PropKey: "StorDriver/ZfscreateOptions", PropValue: "-s"},
+		},
+	}
+
+	res, err := convertForTest(t, dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if len(res.StoragePools) != 1 || res.StoragePools[0].Spec.ProviderKind != "ZFS_THIN" {
+		t.Fatalf("a controller-scope sparse flag was not seen: %+v", res.StoragePools)
+	}
+
+	if hasWarning(res, "not migrated, no blockstor object carries them: StorDriver/ZfscreateOptions") {
+		t.Errorf("the sparse flag the converter used was reported as not migrated; warnings: %v", res.Warnings)
 	}
 }

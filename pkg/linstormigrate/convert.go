@@ -850,14 +850,25 @@ func createsSparseZvols(driver, options string) bool {
 // only the pool bag then reports the pool as genuinely thick, migrates
 // it as ZFS, and walks straight into the pool-overflow during adoption
 // that createsSparseZvols exists to prevent.
+//
+// A value taken from /STLT or /CTRL is recorded as carried: it decides
+// the pool's provider kind, so the report must not list it among the
+// props nothing reads.
 func (c *converter) zfscreateOptions(node, pool string) string {
-	for _, bag := range []map[string]string{
-		c.props.StorPool(node, pool),
-		c.props.Node(node),
-		c.props.Satellite,
-		c.props.Controller,
+	for _, scope := range []struct {
+		bag      map[string]string
+		instance string
+	}{
+		{c.props.StorPool(node, pool), ""},
+		{c.props.Node(node), ""},
+		{c.props.Satellite, PropsInstanceSatellite},
+		{c.props.Controller, PropsInstanceController},
 	} {
-		if value, ok := bag[storDriverZfscreateOptions]; ok {
+		if value, ok := scope.bag[storDriverZfscreateOptions]; ok {
+			if scope.instance != "" {
+				c.props.carryKey(scope.instance, storDriverZfscreateOptions)
+			}
+
 			return value
 		}
 	}
