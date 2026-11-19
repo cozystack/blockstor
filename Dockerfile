@@ -86,8 +86,13 @@ ARG DRBD_UTILS_VERSION=9.35.0-1
 # zpool/zfs alongside drbd-utils, lvm2, cryptsetup. Note: the kernel
 # module is provided by the host (Talos siderolabs/zfs extension);
 # this image only ships the userspace tools.
+# The keyring is the root of trust for every LINBIT package, so it is
+# pinned by digest rather than trusted on TLS alone: a changed file
+# fails the build instead of installing a key nobody reviewed.
+ARG LINBIT_KEYRING_SHA256=4d5d50224d5e2da0d0afa3ccf56e4ea9c1afa07d690ac458b445481584cd3947
 ADD https://packages.linbit.com/public/linbit-keyring.deb /tmp/linbit-keyring.deb
-RUN sed -i 's|^Components: main$|Components: main contrib|' /etc/apt/sources.list.d/debian.sources && \
+RUN echo "${LINBIT_KEYRING_SHA256}  /tmp/linbit-keyring.deb" | sha256sum -c - && \
+    sed -i 's|^Components: main$|Components: main contrib|' /etc/apt/sources.list.d/debian.sources && \
     apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates && \
     dpkg -i /tmp/linbit-keyring.deb && rm /tmp/linbit-keyring.deb && \
