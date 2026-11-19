@@ -46,12 +46,13 @@ type Config struct {
 type Provider struct {
 	cfg  Config
 	exec storage.Exec
+	now  func() time.Time
 }
 
 // NewProvider constructs a Provider. The Exec is injected so unit tests
 // can drive it without ZFS installed.
 func NewProvider(cfg Config, ex storage.Exec) *Provider {
-	return &Provider{cfg: cfg, exec: ex}
+	return &Provider{cfg: cfg, exec: ex, now: time.Now}
 }
 
 // Kind returns "ZFS" or "ZFS_THIN" depending on Config.Thin.
@@ -155,55 +156,6 @@ func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	err = p.ensureRefreservation(ctx, dataset)
 	if err != nil {
 		return errors.Wrapf(err, "ensure refreservation after resize %s", dataset)
-	}
-
-	return nil
-}
-
-// DeleteVolume `zfs destroy -r`s the zvol (recursive to clean up any
-// dependent snapshots automatically). Missing → no-op.
-//
-// Why: a same-node `zfs clone` (RestoreVolumeFromSnapshot) leaves the
-// clone's `origin` pointing at a snapshot UNDER this dataset. ZFS
-// refuses to `zfs destroy` a snapshot that still has dependent
-// clones, so deleting a clone *source* before its clone wedges with
-// "volume has dependent clones" and the satellite reconciler loops
-// forever. We must NOT `zfs destroy -R` (that would cascade-destroy
-// the surviving clone = data loss). Instead `zfs promote` every
-// dependent clone first — promotion reparents the origin snapshot
-// onto the clone, making the clone independent and freeing this
-// dataset's snapshots for destruction.
-//
-// Before the destroy we also read the volume's `origin` property — if
-// it points at a deferred-delete marker (DeleteSnapshot's
-// `__DELETED__<ts>` rename), drop the marker after the volume is
-// gone. That's the GC half of upstream's deferred-delete pattern:
-// snapshots blocked by clones get renamed; when the last clone goes
-// away the marker becomes destroyable. Best-effort — sweep errors
-// don't bubble because the snapshot is now an internal artefact.
-func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
-	tgtDS := p.volumeDataset(vol)
-	if !p.datasetExists(ctx, tgtDS) {
-		return nil
-	}
-
-	origin := p.volumeOrigin(ctx, tgtDS)
-
-	// Why: detach any surviving clones that depend on this dataset's
-	// snapshots before the destroy, so `zfs destroy -r` doesn't fail
-	// with "has dependent clones". No-op when there are no clones.
-	err := p.promoteDependentClones(ctx, tgtDS)
-	if err != nil {
-		return errors.Wrapf(err, "promote dependent clones of %s", tgtDS)
-	}
-
-	_, err = p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
-	if err != nil {
-		return errors.Wrapf(err, "zfs destroy %s", tgtDS)
-	}
-
-	if origin != "" && strings.Contains(origin, "__DELETED__") {
-		_, _ = p.exec.Run(ctx, "zfs", "destroy", origin)
 	}
 
 	return nil
@@ -329,53 +281,6 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return nil
 }
 
-// DeleteSnapshot removes the snapshot, with upstream LINSTOR's
-// "has dependent clones → rename to deferred-delete marker" fallback.
-//
-// `zfs destroy` fails when a clone still references the snapshot
-// (cross-node clone, snapshot-restore-resource); upstream renames
-// the snapshot to `<dataset>@<orig>__DELETED__<unix-ts>` so it
-// disappears from the LINSTOR view while staying on disk to keep
-// the dependent clone alive. When the last clone is destroyed, the
-// marker is swept by DeleteVolume's origin check.
-//
-// Missing snapshot → no-op so the satellite reconciler can strip
-// the Snapshot CRD's finalizer instead of looping on a "dataset
-// does not exist" surface error.
-func (p *Provider) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
-	src := p.snapshotDataset(snap)
-
-	if !p.datasetExists(ctx, src) {
-		return nil
-	}
-
-	out, err := p.exec.Run(ctx, "zfs", "destroy", src)
-	if err == nil {
-		return nil
-	}
-
-	if !hasDependentClonesError(string(out), err.Error()) {
-		return errors.Wrapf(err, "zfs destroy %s", src)
-	}
-
-	marker := fmt.Sprintf("%s__DELETED__%d", src, time.Now().Unix())
-
-	_, rErr := p.exec.Run(ctx, "zfs", "rename", src, marker)
-	if rErr != nil {
-		return errors.Wrapf(rErr, "zfs rename %s → %s (deferred delete)", src, marker)
-	}
-
-	return nil
-}
-
-// hasDependentClonesError matches zfs destroy's "has dependent
-// clones" error text. ZFS prints it in stdout (combined-output) or
-// stderr depending on the version; both substrings are checked.
-func hasDependentClonesError(stdout, stderr string) bool {
-	return strings.Contains(stdout, "has dependent clones") ||
-		strings.Contains(stderr, "has dependent clones")
-}
-
 // RestoreVolumeFromSnapshot materialises target as a `zfs clone` of
 // the source snapshot. ZFS clones are CoW — instant create, lazy
 // allocation as writes diverge from the snapshot.
@@ -412,12 +317,18 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 		return p.ensureRefreservation(ctx, tgtDS)
 	}
 
-	srcDS := p.snapshotDataset(src)
-	if !p.datasetExists(ctx, srcDS) {
-		return errors.Wrapf(storage.ErrNotFound, "snapshot %s for clone", srcDS)
+	// The snapshot may outlive its replica: a replica delete renames a
+	// zvol that has snapshots, and they stay restorable under the new name.
+	srcDS, err := p.locateSnapshot(ctx, src)
+	if err != nil {
+		return err
 	}
 
-	_, err := p.exec.Run(ctx, "zfs", "clone", srcDS, tgtDS)
+	if srcDS == "" {
+		return errors.Wrapf(storage.ErrNotFound, "snapshot %s for clone", p.snapshotDataset(src))
+	}
+
+	_, err = p.exec.Run(ctx, "zfs", "clone", srcDS, tgtDS)
 	if err != nil {
 		return errors.Wrapf(err, "zfs clone %s → %s", srcDS, tgtDS)
 	}
@@ -547,7 +458,15 @@ func (r *zfsSendReader) Close() error {
 func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
 	tgtDS := p.volumeDataset(target)
 
-	if p.datasetExists(ctx, tgtDS) {
+	// Strict probe: `zfs recv -F` over a dataset that exists, and the
+	// cleanup below, would both destroy it, so a probe that failed must
+	// not read as "absent".
+	present, err := p.datasetPresent(ctx, tgtDS)
+	if err != nil {
+		return err
+	}
+
+	if present {
 		// Bug 254 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the recv'd dataset sparse-thick.
 		return p.ensureRefreservation(ctx, tgtDS)
@@ -556,8 +475,9 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F", tgtDS)
 	if err != nil {
 		// On failure leave nothing behind — `zfs recv -F` may have
-		// partially created the dataset; nuke it so the next
-		// reconcile re-streams cleanly.
+		// partially created the dataset; destroy it so the next
+		// reconcile re-streams cleanly. It did not exist before this
+		// call, so everything under it came from this stream.
 		_, _ = p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
 
 		return errors.Wrapf(err, "zfs recv %s: %s", tgtDS, strings.TrimSpace(string(out)))
@@ -573,85 +493,6 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	}
 
 	return nil
-}
-
-// promoteDependentClones reparents every clone whose `origin` is a
-// snapshot of dataset `ds` onto itself via `zfs promote`, so `ds`'s
-// snapshots are no longer referenced and `ds` can be destroyed.
-//
-// Why: blockstor's same-node clone is `zfs clone <ds>@<snap> <clone>`,
-// so the clone's origin lives under the source dataset. ZFS blocks
-// `zfs destroy` of a snapshot that still has dependent clones; this is
-// the canonical detach (promote, NOT `destroy -R`, which would take
-// the surviving clone with it).
-//
-// Idempotent + safe with no clones: the `zfs list` enumeration finds
-// nothing and we issue zero promotes. Discovery errors don't bubble
-// — they fall through to the destroy, which surfaces the real
-// "has dependent clones" error if a clone truly blocks it.
-func (p *Provider) promoteDependentClones(ctx context.Context, ds string) error {
-	clones := p.dependentClones(ctx, ds)
-	for _, clone := range clones {
-		_, err := p.exec.Run(ctx, "zfs", "promote", clone)
-		if err != nil {
-			return errors.Wrapf(err, "zfs promote %s", clone)
-		}
-	}
-
-	return nil
-}
-
-// dependentClones lists datasets whose `origin` is a snapshot of `ds`
-// (i.e. origin starts with `<ds>@`). These are the clones that must be
-// promoted before `ds` can be destroyed. Best-effort: any enumeration
-// error yields an empty list (the subsequent destroy still reports the
-// true blocking error).
-func (p *Provider) dependentClones(ctx context.Context, dataset string) []string {
-	out, err := p.exec.Run(ctx, "zfs",
-		"list", "-H", "-o", "name,origin", "-t", "filesystem,volume")
-	if err != nil {
-		return nil
-	}
-
-	prefix := dataset + "@"
-
-	var clones []string
-
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-
-		name, originSnap := fields[0], fields[1]
-		if name == dataset {
-			continue
-		}
-
-		if strings.HasPrefix(originSnap, prefix) {
-			clones = append(clones, name)
-		}
-	}
-
-	return clones
-}
-
-// volumeOrigin reads the zvol's `origin` property — the snapshot
-// dataset name when this volume was created via `zfs clone`, or
-// `-` for a standalone dataset. Returns "" on either case + on any
-// error (best-effort lookup for the deferred-delete sweep).
-func (p *Provider) volumeOrigin(ctx context.Context, ds string) string {
-	out, err := p.exec.Run(ctx, "zfs", "get", "-H", "-o", "value", "origin", ds)
-	if err != nil {
-		return ""
-	}
-
-	value := strings.TrimSpace(string(out))
-	if value == "" || value == "-" {
-		return ""
-	}
-
-	return value
 }
 
 // datasetVolsize reads the zvol's `volsize` property in bytes. Used
