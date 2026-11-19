@@ -26,6 +26,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -453,4 +454,17 @@ func baseOf(snapshot string) string {
 // keeps two deletes of the same name from colliding.
 func RenameSuffix(now time.Time) string {
 	return now.Format("2006-01-02T15-04-05") + fmt.Sprintf("-%03d", now.Nanosecond()/int(time.Millisecond))
+}
+
+// RenameSuffixProp is LINSTOR's key for the suffix a ZFS replica delete
+// renames a zvol that still has snapshots with. LINSTOR's controller records
+// it on the Resource and on that node's Snapshots before the delete, so
+// snapshot operations find the snapshots under `_deleted_<name>_<suffix>`.
+const RenameSuffixProp = "Internal/StorDriver/ZfsRenameSuffix"
+
+// SnapshotRenameSuffixProp is RenameSuffixProp on a blockstor Snapshot, per
+// node: one blockstor Snapshot spans the nodes LINSTOR keeps a Snapshot each
+// for.
+func SnapshotRenameSuffixProp(node string) string {
+	return RenameSuffixProp + "/" + naming.Key(node)
 }

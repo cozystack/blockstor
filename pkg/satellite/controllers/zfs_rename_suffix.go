@@ -32,19 +32,13 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage/zfs"
 )
 
-// ZFSRenameSuffixProp is LINSTOR's key for the suffix a ZFS replica delete
-// renames a zvol that still has snapshots with. LINSTOR's controller records
-// it on the Resource and on that node's Snapshots before the delete, so
-// snapshot operations find the snapshots under `_deleted_<name>_<suffix>`.
-// blockstor records it the same way, from the satellite that is about to do
-// the rename, so every path that deletes a replica gets it.
-const ZFSRenameSuffixProp = "Internal/StorDriver/ZfsRenameSuffix"
+// ZFSRenameSuffixProp is zfs.RenameSuffixProp. blockstor records it the
+// way LINSTOR's controller does, from the satellite that is about to do the
+// rename, so every path that deletes a replica gets it.
+const ZFSRenameSuffixProp = zfs.RenameSuffixProp
 
-// snapshotRenameSuffixProp is ZFSRenameSuffixProp on a Snapshot, per node:
-// a blockstor Snapshot spans the nodes LINSTOR keeps one Snapshot each for.
-func snapshotRenameSuffixProp(node string) string {
-	return ZFSRenameSuffixProp + "/" + naming.Key(node)
-}
+// snapshotRenameSuffixProp is zfs.SnapshotRenameSuffixProp.
+func snapshotRenameSuffixProp(node string) string { return zfs.SnapshotRenameSuffixProp(node) }
 
 // recordRenameSuffix returns the replica's rename suffix, recording it first
 // on the Resource and then on this node's Snapshots of the definition that do
