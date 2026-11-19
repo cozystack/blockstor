@@ -20,6 +20,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -174,7 +175,12 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; hasAnnotation {
 		// Operator intent: ignore per-RD shortfall grace and the
 		// per-node offline grace — a REST modify means "act now".
-		count, perr := r.rebalanceChildRDs(ctx, rg, 0)
+		// Only a raised place count is the placement LINSTOR's own
+		// `rg modify` runs; a modify that changed a placement
+		// constraint alone gets the balance checks.
+		_, placeCountRaised := rg.Annotations[apiv1.AnnotationRGRebalancePlaceCount]
+
+		count, perr := r.rebalanceChildRDs(ctx, rg, 0, !placeCountRaised)
 		if perr != nil {
 			return perr
 		}
@@ -191,7 +197,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 		return nil
 	}
 
-	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod)
+	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod, true)
 	if perr != nil {
 		return perr
 	}
@@ -216,12 +222,28 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // same window). Pass 0 to disable the gate — the annotation-driven
 // path does this so an operator's `linstor rg modify` acts on every
 // child RD immediately.
-func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration) (int, error) {
+//
+// `gated` applies the checks LINSTOR's balance task makes before it
+// touches a definition (balanceGate.skipReason). Only an `rg modify`
+// that raised the place count leaves them off: LINSTOR runs the
+// autoplacer for that on every child definition short of the new
+// count, one kept only by its snapshots included. It still skips a
+// definition being deleted, which no placement may grow.
+func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, gated bool) (int, error) {
 	log := logf.FromContext(ctx)
 
 	rds, err := r.Store.ResourceDefinitions().List(ctx)
 	if err != nil {
 		return 0, err
+	}
+
+	var gate *balanceGate
+
+	if gated {
+		gate, err = newBalanceGate(ctx, r.Store)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	p := placer.New(r.Store)
@@ -240,6 +262,10 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 			continue
 		}
 
+		if r.skipRD(ctx, gate, rg, &rds[i]) {
+			continue
+		}
+
 		filter := rg.SelectFilter
 		if filter.PlaceCount == 0 {
 			filter.PlaceCount = 1
@@ -255,6 +281,39 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 	}
 
 	return processed, nil
+}
+
+// skipRD reports whether the pass leaves rd alone. Without a gate
+// (an `rg modify` that raised the place count) only a definition being
+// deleted is skipped. The reason goes to the debug log; a definition
+// whose replicas cannot be read is skipped.
+func (r *RGRebalanceReconciler) skipRD(ctx context.Context, gate *balanceGate, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) bool {
+	log := logf.FromContext(ctx).WithValues("rg", rg.Name, "rd", rd.Name)
+
+	if gate == nil {
+		if slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
+			log.V(1).Info("rebalance skipped", "reason", balanceSkipDeleting)
+
+			return true
+		}
+
+		return false
+	}
+
+	reason, err := gate.skipReason(ctx, rg, rd)
+	if err != nil {
+		log.Error(err, "rebalance skipped: replicas unreadable")
+
+		return true
+	}
+
+	if reason != "" {
+		log.V(1).Info("rebalance skipped", "reason", reason)
+
+		return true
+	}
+
+	return false
 }
 
 // shortfallWithinGrace reports whether an RD carries a still-fresh
@@ -391,6 +450,7 @@ func (r *RGRebalanceReconciler) stripRebalanceAnnotation(ctx context.Context, rg
 	}
 
 	delete(rg.Annotations, apiv1.AnnotationRGRebalancePending)
+	delete(rg.Annotations, apiv1.AnnotationRGRebalancePlaceCount)
 
 	// Keep the now-empty map NON-nil (Bug-021). An earlier revision
 	// nil-ed it "for wire-envelope round-trip stability", but the
@@ -521,11 +581,11 @@ func (r *RGRebalanceReconciler) now() time.Time {
 }
 
 // balanceResourcesDisabled returns true when the controller-scope
-// `BalanceResourcesEnabled` prop is explicitly set to "false". Any
-// other value (including missing, empty, or a typo) keeps the
-// rebalance reconciler armed — matches upstream LINSTOR's "default
-// = enabled" semantics so an unconfigured cluster behaves the same
-// way it did before scenario 2.W02 landed.
+// `BalanceResourcesEnabled` prop is "false" in any letter case, which
+// is how LINSTOR compares it. Any other value (including missing,
+// empty, or a typo) keeps the rebalance reconciler armed — matches
+// upstream LINSTOR's "default = enabled" semantics so an unconfigured
+// cluster behaves the same way it did before scenario 2.W02 landed.
 func balanceResourcesDisabled(ctx context.Context, st store.Store) bool {
 	if st == nil {
 		return false
@@ -540,7 +600,7 @@ func balanceResourcesDisabled(ctx context.Context, st store.Store) bool {
 		return false
 	}
 
-	return props[apiv1.PropBalanceResourcesEnabled] == "false"
+	return balanceDisabled(nil, nil, props)
 }
 
 // SetupWithManager wires the reconciler into the manager. We share

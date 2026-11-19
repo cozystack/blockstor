@@ -33,6 +33,19 @@ package v1
 // walk RDs inline; the annotation is the cross-process trigger.
 const AnnotationRGRebalancePending = "blockstor.org/rebalance-pending"
 
+// AnnotationRGRebalancePlaceCount rides along with
+// AnnotationRGRebalancePending when the `rg modify` behind it raised
+// PlaceCount. That is the only change LINSTOR's own `rg modify` places
+// replicas for, on every child definition short of the new count. A
+// modify that changed only a placement constraint (layer stack,
+// replicas-on-same and the like) has no counterpart upstream, so the
+// rebalance pass gives it the balance task's checks and leaves alone a
+// definition with no UpToDate diskful replica, such as one kept only by
+// its snapshots. The value is the timestamp of the raise. The REST
+// handler only ever sets it, so two modifies that land before one pass
+// keep the raise; the pass strips both keys.
+const AnnotationRGRebalancePlaceCount = "blockstor.org/rebalance-place-count"
+
 // ResourceGroup mirrors `ResourceGroup` from upstream LINSTOR. A resource
 // group is a template — linstor-csi creates one per Kubernetes StorageClass
 // and `Spawn`s individual ResourceDefinitions from it.

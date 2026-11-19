@@ -60,6 +60,8 @@ func seedRebalanceFixture(t *testing.T, ctx context.Context, st store.Store, pla
 		},
 		Annotations: map[string]string{
 			apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
+			// The `rg modify` behind it raised the place count.
+			apiv1.AnnotationRGRebalancePlaceCount: "2026-05-14T00:00:00Z",
 		},
 	}); err != nil {
 		t.Fatalf("seed rg: %v", err)
@@ -247,14 +249,14 @@ func TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled(t *testing.T) {
 }
 
 // TestRGRebalanceReconcilerIgnoresNonFalseValues: 2.W02 contract pin
-// — only the explicit string "false" disables the reconciler. Other
+// — only "false", in any letter case, disables the reconciler. Other
 // values (empty, "true", "0", typo) keep it armed, matching upstream
 // LINSTOR's "default = enabled" semantics so an unconfigured cluster
 // behaves the same way it did before the kill-switch landed.
 func TestRGRebalanceReconcilerIgnoresNonFalseValues(t *testing.T) {
 	t.Parallel()
 
-	for _, val := range []string{"", "true", "True", "0", "FALSE", "no"} {
+	for _, val := range []string{"", "true", "True", "0", "no", "off"} {
 		t.Run("value="+val, func(t *testing.T) {
 			t.Parallel()
 
@@ -327,6 +329,9 @@ func TestRGRebalanceReconcilerNoAnnotationStillFiresScheduledTick(t *testing.T) 
 	_ = st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
 		Name:              "pvc-no-annot",
 		ResourceGroupName: "rg",
+	})
+	_ = st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-no-annot", NodeName: "n1", Volumes: upToDateVolumes(),
 	})
 
 	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
