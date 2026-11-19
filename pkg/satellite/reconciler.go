@@ -762,7 +762,7 @@ func (r *Reconciler) FlushBeforeSuspend(ctx context.Context, resName string, sta
 	}
 
 	if r.cfg.Adm == nil {
-		r.flushStorageDevices(ctx, resName, volumeNumbers)
+		r.FlushStorageDevices(ctx, resName, volumeNumbers)
 
 		return
 	}
@@ -789,6 +789,41 @@ func (r *Reconciler) FlushBeforeSuspend(ctx context.Context, resName string, sta
 
 		log.FromContext(ctx).V(1).Info("flushed before suspend",
 			"resource", resName, "volume", volNum, "device", device)
+	}
+}
+
+// FlushStorageDevices flushes the storage device of each volume, for a
+// resource no DRBD layer sits above, whether or not this satellite runs
+// DRBD for other resources.
+func (r *Reconciler) FlushStorageDevices(ctx context.Context, resName string, volumeNumbers []int32) {
+	if r == nil || r.cfg.Exec == nil {
+		return
+	}
+
+	provider, err := r.providerForResource(resName)
+	if err != nil {
+		return
+	}
+
+	r.mu.Lock()
+	pool := r.resourceToPool[resName]
+	r.mu.Unlock()
+
+	for _, volNum := range volumeNumbers {
+		status, statusErr := provider.VolumeStatus(ctx, storage.Volume{
+			PoolName:     pool,
+			ResourceName: resName,
+			VolumeNumber: volNum,
+		})
+		if statusErr != nil || status.DevicePath == "" {
+			continue
+		}
+
+		_, runErr := r.cfg.Exec.Run(ctx, "blockdev", "--flushbufs", status.DevicePath)
+		if runErr != nil {
+			log.FromContext(ctx).Info("flush before snapshot failed; the snapshot is crash-consistent",
+				"resource", resName, "volume", volNum, "device", status.DevicePath, "error", runErr.Error())
+		}
 	}
 }
 
@@ -6189,33 +6224,3 @@ func buildVolumeResults(dr *intent.DesiredResource, devices map[int32]string, di
 // would (shared-secret is in /etc/drbd.d/global_common.conf, written
 // once at install time).
 const resFilePerm = 0o644
-
-// flushStorageDevices flushes the storage device of each volume when
-// no DRBD layer sits above it.
-func (r *Reconciler) flushStorageDevices(ctx context.Context, resName string, volumeNumbers []int32) {
-	provider, err := r.providerForResource(resName)
-	if err != nil {
-		return
-	}
-
-	r.mu.Lock()
-	pool := r.resourceToPool[resName]
-	r.mu.Unlock()
-
-	for _, volNum := range volumeNumbers {
-		status, statusErr := provider.VolumeStatus(ctx, storage.Volume{
-			PoolName:     pool,
-			ResourceName: resName,
-			VolumeNumber: volNum,
-		})
-		if statusErr != nil || status.DevicePath == "" {
-			continue
-		}
-
-		_, runErr := r.cfg.Exec.Run(ctx, "blockdev", "--flushbufs", status.DevicePath)
-		if runErr != nil {
-			log.FromContext(ctx).Info("flush before snapshot failed; the snapshot is crash-consistent",
-				"resource", resName, "volume", volNum, "device", status.DevicePath, "error", runErr.Error())
-		}
-	}
-}

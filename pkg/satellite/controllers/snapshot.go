@@ -35,7 +35,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
@@ -241,7 +240,12 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 // failed suspend stamps the per-node Failed=true so the
 // controller-side orchestrator drains the siblings.
 func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	if !r.Config.Apply.DRBDEnabled() {
+	needed, err := r.needsWindow(ctx, snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !needed {
 		// Nothing to suspend without DRBD; the take is point-in-time
 		// on its own.
 		return ctrl.Result{}, r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
@@ -259,7 +263,7 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
-	err := r.openWindow(ctx, snap)
+	err = r.openWindow(ctx, snap)
 	if err != nil {
 		log.FromContext(ctx).Info("SuspendResource failed",
 			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
@@ -274,6 +278,31 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 	// Don't fall through: wait for the controller to flip
 	// Spec.TakeSnapshot once every node has acked.
 	return ctrl.Result{}, r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
+}
+
+// needsWindow reports whether snap's resource has a DRBD layer on this
+// satellite to suspend. The answer is per resource, as LINSTOR only
+// suspends layers that support it: a STORAGE or LUKS,STORAGE resource
+// on a node that runs DRBD for others has nothing to suspend, and
+// suspend-io on it would fail the snapshot. An RD that is not found
+// keeps the default stack, which has DRBD.
+func (r *SnapshotReconciler) needsWindow(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (bool, error) {
+	if !r.Config.Apply.DRBDEnabled() {
+		return false, nil
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(snap.Spec.ResourceDefinitionName)}, &rd)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+
+	if err != nil {
+		return false, errors.Wrapf(err, "get ResourceDefinition %s", snap.Spec.ResourceDefinitionName)
+	}
+
+	return rdNeedsDRBD(&rd), nil
 }
 
 // handleResumePhase closes this node's window for the snapshot: the
@@ -322,7 +351,12 @@ func (r *SnapshotReconciler) markerFor(snap *blockstoriov1alpha1.Snapshot) suspe
 // which is what LINSTOR's controller does when a satellite drops out of
 // the take (CtrlSnapshotCrtApiCallHandler abortSnapshotInTransaction).
 func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	if !r.Config.Apply.DRBDEnabled() {
+	needed, err := r.needsWindow(ctx, snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !needed {
 		return r.takeWithoutWindow(ctx, snap)
 	}
 
@@ -349,8 +383,8 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 // sits on. Nothing is suspended, so the storage device is flushed right
 // before the take and the take runs on this pass.
 func (r *SnapshotReconciler) takeWithoutWindow(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	r.Config.Apply.FlushBeforeSuspend(ctx, naming.Key(snap.Spec.ResourceDefinitionName),
-		drbd.SuspendState{}, snapshotVolumeNumbers(snap))
+	r.Config.Apply.FlushStorageDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName),
+		snapshotVolumeNumbers(snap))
 
 	verdict, createdAt, err := r.takeVerdict(ctx, snap)
 	if err != nil {
