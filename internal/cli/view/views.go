@@ -28,6 +28,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
+
+	"github.com/cozystack/blockstor/internal/cli/color"
 )
 
 // PropertyColumns is the column set every `list-properties` view uses.
@@ -267,6 +270,10 @@ func selectFilterCell(filter *apiv1.AutoSelectFilter) string {
 
 // VolumeList builds the `volume list` table: one row per replica
 // volume.
+//
+// A deactivated replica has no volumes to show, so it is left out
+// unless its node was evicted, where the row is what tells an operator
+// the data is still there.
 func VolumeList(resources []apiv1.Resource) *metav1.Table {
 	tbl := &metav1.Table{
 		ColumnDefinitions: columns(
@@ -275,16 +282,32 @@ func VolumeList(resources []apiv1.Resource) *metav1.Table {
 		),
 	}
 
+	primaries := primariesByDefinition(resources)
+
 	for i := range resources {
 		res := &resources[i]
+
+		inactive := slices.Contains(res.Flags, apiv1.ResourceFlagInactive)
+		if inactive && !slices.Contains(res.Flags, flagEvicted) {
+			continue
+		}
+
+		usage := usageCell(res, primaries[naming.Key(res.Name)])
+		linkDown := topLayerIsDRBD(res) && hasBrokenConnection(res)
 
 		for j := range res.Volumes {
 			vol := &res.Volumes[j]
 
-			state := vol.State.DiskState
-			if state == "" {
-				state = stateUnknown
+			state := color.Cell{Text: apiv1.ResourceFlagInactive, Class: color.Transitional}
+			if !inactive {
+				state = volumeState(res, vol, nil)
 			}
+
+			if linkDown {
+				state.Class = color.Broken
+			}
+
+			state = withToggleDisk(state, res.Flags)
 
 			tbl.Rows = append(tbl.Rows, metav1.TableRow{Cells: []any{
 				res.NodeName,
@@ -294,7 +317,7 @@ func VolumeList(resources []apiv1.Resource) *metav1.Table {
 				minorFromDevice(vol.DevicePath),
 				vol.DevicePath,
 				capacity(vol.AllocatedKib),
-				usageCell(res),
+				usage,
 				state,
 			}})
 		}
