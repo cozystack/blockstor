@@ -587,7 +587,51 @@ func (r *ResourceReconciler) prepareDRBDApply(
 		logger.Error(pruneErr, "PruneStaleKernelSlots failed; continuing to allocation gate")
 	}
 
-	return r.waitForControllerAllocation(ctx, res, peers, logger)
+	waitResult, ok := r.waitForControllerAllocation(ctx, res, peers, logger)
+	if !ok {
+		return waitResult, false
+	}
+
+	return r.holdForAdoptedPeers(ctx, res, rd, peers, logger)
+}
+
+// holdForAdoptedPeers keeps the first render of an adopted resource
+// back while its kernel slot is connected to a peer whose Resource has
+// not been observed. That render's `drbdadm adjust` would delete the
+// connection, so a peer applied a moment after this one (a bulk
+// adoption delivers the Resources of a definition in name order) would
+// be disconnected and resynced. The hold is bounded: once it runs out
+// the render goes ahead without the peer and a Warning Event says so,
+// rather than leaving the replica unapplied for good.
+func (r *ResourceReconciler) holdForAdoptedPeers(
+	ctx context.Context,
+	res *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	peers []blockstoriov1alpha1.Resource,
+	logger logr.Logger,
+) (ctrl.Result, bool) {
+	hold := r.Config.Apply.AdoptedPeersWithoutResource(ctx, rd.Name, expectedPeerNamesFor(res, peers), time.Now())
+	if len(hold.Missing) == 0 {
+		return ctrl.Result{}, true
+	}
+
+	if hold.HoldsRender() {
+		logger.Info("holding the first render of an adopted resource until its kernel peers have Resources",
+			"missingPeers", hold.Missing, "since", hold.Since)
+
+		return ctrl.Result{RequeueAfter: peerAllocationRequeue}, false
+	}
+
+	logger.Info("adopted kernel peers still have no Resource; rendering without them",
+		"missingPeers", hold.Missing, "since", hold.Since)
+
+	if r.Config.Recorder != nil {
+		r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, "AdoptedPeerWithoutResource", "Apply",
+			"kernel peers %v have no Resource since %s; rendering without them disconnects them",
+			hold.Missing, hold.Since.Format(time.RFC3339))
+	}
+
+	return ctrl.Result{}, true
 }
 
 // recordPerResourceFailures logs each per-resource Apply failure and
