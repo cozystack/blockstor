@@ -32,7 +32,7 @@ func TestAVolumesDiskOptionsRenderInsideItsVolume(t *testing.T) {
 	dr, devices := renderResFileFixture("pvc-vd")
 	dr.Volumes[0].DiskOptions = map[string]string{"block-size": "4096"}
 
-	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, nil)
+	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, nil, nil)
 	if err != nil {
 		t.Fatalf("buildResFile: %v", err)
 	}

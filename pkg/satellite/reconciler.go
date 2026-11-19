@@ -2265,8 +2265,9 @@ func (r *Reconciler) stampOwnershipMarker(name string) error {
 // LVM-shaped guess.
 func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	autoDisk := r.autoDiskOptionsForResource(ctx, dr, devices)
+	autoVolumeDisk := r.autoDiskOptionsForVolumes(ctx, dr, devices)
 
-	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices, autoDisk)
+	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices, autoDisk, autoVolumeDisk)
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
 	}
@@ -5829,7 +5830,11 @@ func (r *Reconciler) rememberPool(resourceName, pool string) {
 // disk path. Empty / missing → fall back to the LVM/ZFS-shaped
 // `/dev/<pool>/<rd>_<vol>` guess, which is what works for those
 // providers.
-func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string) (string, error) {
+//
+// autoDisk is the satellite-derived resource-scope disk options,
+// autoVolumeDisk the per-volume ones (see autoDiskOptionsForVolumes);
+// either may be nil.
+func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string, autoVolumeDisk map[int32]map[string]string) (string, error) {
 	opts := dr.GetDrbdOptions()
 	port, _ := strconv.Atoi(opts["port"])
 	nodeID, _ := strconv.Atoi(opts["node-id"])
@@ -5862,6 +5867,7 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 
 	sections := splitDRBDOptions(opts)
 	mergeAutoDiskOptions(sections.Disk, autoDisk)
+	mergeAutoVolumeDiskOptions(vols, sections.Disk, autoVolumeDisk)
 
 	out, err := drbd.Build(drbd.Resource{
 		Name:        dr.GetName(),
@@ -6105,6 +6111,37 @@ func mergeAutoDiskOptions(dst, auto map[string]string) {
 		}
 
 		dst[k] = v
+	}
+}
+
+// mergeAutoVolumeDiskOptions folds the per-volume derived disk options
+// into each volume's own disk section. A value the operator set at
+// resource scope wins over the derived one, the same rule
+// mergeAutoDiskOptions keeps; one set for the volume itself cannot
+// collide, since a volume whose definition sets a discard option has
+// nothing derived (definitionDecidesDiscard). The volume's options map
+// is replaced, not edited, since it is the intent's.
+func mergeAutoVolumeDiskOptions(vols []drbd.Volume, resourceDisk map[string]string, auto map[int32]map[string]string) {
+	for i := range vols {
+		derived := auto[int32(vols[i].Number)] //nolint:gosec // a DRBD volume number fits int32
+		if len(derived) == 0 {
+			continue
+		}
+
+		opts := maps.Clone(vols[i].Options)
+		if opts == nil {
+			opts = map[string]string{}
+		}
+
+		for k, v := range derived {
+			if _, set := resourceDisk[k]; set {
+				continue
+			}
+
+			opts[k] = v
+		}
+
+		vols[i].Options = opts
 	}
 }
 
