@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/passphrase"
@@ -278,9 +280,15 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 // and sizes, the per-replica analogue of vdSizeIndex. A definition whose
 // volume definitions cannot be read yields none, so the caller answers
 // with the volumes the satellite reported rather than failing the read.
+// That answer is the one a client of a replica not built yet cannot
+// use (a 404 for volume 0, an empty volume list), so the failed read
+// is logged: nothing else would say why.
 func (s *Server) definitionVolumeSizes(ctx context.Context, rdName string) map[int32]int64 {
 	vds, err := s.Store.VolumeDefinitions().List(ctx, rdName)
 	if err != nil {
+		log.FromContext(ctx).WithName("rest").Error(err,
+			"list volume definitions; answering with the reported volumes only", "resourceDefinition", rdName)
+
 		return nil
 	}
 

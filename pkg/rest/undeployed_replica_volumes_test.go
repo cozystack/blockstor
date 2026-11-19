@@ -19,9 +19,11 @@ limitations under the License.
 package rest
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -219,5 +221,25 @@ func TestUnbuiltReplicaListsEveryDefinedVolume(t *testing.T) {
 
 	if view[0].Volumes[0].DevicePath != "/dev/zvol/data/pvc-new_00000" {
 		t.Errorf("view: reported volume 0 on n1 lost its device path: %+v", view[0].Volumes[0])
+	}
+}
+
+// A failed volume-definition read degrades to the volumes the
+// satellite reported, which for a replica not built yet is the 404 and
+// the empty list this fallback exists to avoid. The failure has to
+// reach the log, or nothing says why.
+func TestDefinitionVolumeReadFailureIsLogged(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+
+	srv := &Server{Store: failingVolumeListStore{store.NewInMemory()}}
+
+	if got := srv.definitionVolumeSizes(sweepCaptureContext(t, &buf), "pvc-new"); got != nil {
+		t.Fatalf("sizes = %v, want none on a failed read", got)
+	}
+
+	if !strings.Contains(buf.String(), "list volume definitions") || !strings.Contains(buf.String(), "pvc-new") {
+		t.Errorf("a failed volume-definition read left no trace; log = %q", buf.String())
 	}
 }
