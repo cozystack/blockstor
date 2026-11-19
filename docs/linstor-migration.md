@@ -131,7 +131,7 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 
    If you prefer staged application, the order is: `ControllerConfig` → `Node` → `StoragePool` → `ResourceGroup` → `ResourceDefinition` → `Resource` → `Snapshot`.
 
-   Apply all Resources of a definition together, in one apply rather than one replica at a time. The apiserver still delivers them in name order, so for a moment a satellite sees its own replica without its peers. It does not tear down the kernel connections it adopted on that account, but once its replica is allocated it renders the resource from the replicas it can see, so a peer applied seconds later can miss the first render.
+   Apply all Resources of a definition together, in one apply. This is required. The apiserver delivers them in name order, so for a moment a satellite sees its own replica without its peers. Until blockstor has rendered a resource on a node, that satellite neither prunes the kernel connections it adopted nor renders the resource while a peer it is connected to has no `Resource` yet: it waits up to 5 minutes for the missing peers (`BSTOR_ADOPTION_PEER_WAIT_S` on the satellite overrides the wait, in seconds). If a peer's `Resource` is still missing when the wait runs out, the satellite renders without it, records an `AdoptedPeerWithoutResource` Warning Event on its `Resource`, and `drbdadm adjust` disconnects that peer's live DRBD connection. The peer then needs a resync once its `Resource` is applied, on a volume that may be in use. If that Event appears during cutover, apply the missing `Resource` at once.
 
 6. **Wait for adoption to converge.** Every `Resource` should report its DRBD device `UpToDate` (adopted, not resynced — watch that `out-of-sync` stays 0, i.e. no unexpected full sync started). `linstor r l --faulty` against the blockstor apiserver is empty. Storage pools report their real free capacity.
 
@@ -142,6 +142,7 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 - Object counts match the source: `linstor n l`, `sp l`, `rg l`, `rd l`, `r l` against blockstor equal the pre-cutover counts (the converter's report prints them).
 - Spot-check ≥5 RDs: size, per-volume `/dev/drbd<minor>`, per-replica node-id and port match the pre-migration values. A changed minor or node-id is a stop-the-line defect.
 - Every diskful replica is `UpToDate`; no replica is unexpectedly `SyncTarget`.
+- No `Resource` carries an `AdoptedPeerWithoutResource` Event: each one is a peer that was disconnected during adoption.
 - Adopted snapshots list as present without any suspend-io having fired on the parent RDs (check the satellites did not log `suspend-io`).
 - For LUKS RDs: `linstor encryption status` against blockstor says `unlocked`, and each LUKS replica opens; a `LUKSKeyMismatch` or `MasterKeyLocked` Event on a Resource is a stop-the-line defect.
 
