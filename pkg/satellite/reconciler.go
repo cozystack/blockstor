@@ -952,9 +952,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 func (r *Reconciler) snapshotProviders(req *intent.DeleteSnapshotRequest) ([]storage.Provider, error) {
 	pools := slices.Clone(req.GetStoragePools())
 
-	r.mu.Lock()
-	own, known := r.resourceToPool[req.GetResourceName()]
-	r.mu.Unlock()
+	own, known := r.poolOf(req.GetResourceName())
 
 	if known && !slices.Contains(pools, own) {
 		if _, ok := r.provider(own); ok {
@@ -5850,10 +5848,7 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 // resource using the in-memory pool map. Returns an error when the
 // resource isn't known or its pool isn't registered.
 func (r *Reconciler) providerForResource(name string) (storage.Provider, error) {
-	r.mu.Lock()
-	pool, ok := r.resourceToPool[name]
-	r.mu.Unlock()
-
+	pool, ok := r.poolOf(name)
 	if !ok {
 		return nil, errors.Errorf("resource %q not known on this satellite", name)
 	}
@@ -5864,6 +5859,16 @@ func (r *Reconciler) providerForResource(name string) (storage.Provider, error) 
 	}
 
 	return provider, nil
+}
+
+// poolOf is the pool an applied replica of the resource was recorded in.
+func (r *Reconciler) poolOf(name string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pool, ok := r.resourceToPool[name]
+
+	return pool, ok
 }
 
 // rememberPool records the pool that backs a resource, so subsequent
