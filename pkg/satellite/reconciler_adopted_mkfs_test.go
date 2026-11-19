@@ -251,6 +251,7 @@ func TestApplyLatchFreeRetryMultiVolume(t *testing.T) {
 			rd := "pvc-mv"
 			dir := t.TempDir()
 			fx := storage.NewFakeExec()
+			expectBlankMkfsTarget(fx, "/dev/drbd6740")
 			dev0 := expectThinBacking(fx, rd)
 			dev1 := expectThinBackingVolume1(fx, rd)
 			fx.Expect("drbdsetup status "+rd+" --json",
@@ -258,8 +259,8 @@ func TestApplyLatchFreeRetryMultiVolume(t *testing.T) {
 			expectDrbdMetaSignature(fx, dev0)
 			fx.Expect(backingProbe(dev1), tc.vol1)
 			// Once promoted, volume 1's replicated device shows what its
-			// backing probe saw; volume 0's stays at the FakeExec default.
-			fx.Expect("blkid -o export /dev/drbd6741", tc.vol1)
+			// backing probe saw; volume 0's is blank.
+			fx.Expect("blkid -p -o export /dev/drbd6741", tc.vol1)
 
 			rec := newThinReconciler(fx, dir)
 

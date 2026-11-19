@@ -4489,10 +4489,11 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 //  1. A per-RD `<rd>.mkfs.done` marker under StateDir (sibling to
 //     `.md-created`) records the durable "we already finished mkfs
 //     for every diskful volume" state. Cheap stat-only fast path.
-//  2. Per-volume `blkid -o export /dev/drbd<minor>` probe (mirroring
-//     upstream LINSTOR's `MkfsUtils.hasFileSystem`). When a volume
-//     already carries a filesystem we skip mkfs on that volume and
-//     adopt the existing fs — exactly upstream's behaviour. This
+//  2. Per-volume `blkid -p -o export /dev/drbd<minor>` probe
+//     (probeMkfsTarget, a fail-closed `MkfsUtils.hasFileSystem`).
+//     When a volume already carries a filesystem we skip mkfs on that
+//     volume and adopt the existing fs — exactly upstream's behaviour;
+//     when the probe cannot tell, nothing is formatted. This
 //     closes Bug 311: a previous reconcile that dropped `.md-created`
 //     but failed to write `.mkfs.done` (e.g. `drbdadm primary
 //     --force` raced the initial-sync handshake and returned a
@@ -4574,7 +4575,8 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 			continue
 		}
 
-		if r.deviceHasFilesystem(ctx, device) {
+		switch r.probeMkfsTarget(ctx, device) {
+		case filesystemPresent:
 			// Volume already carries a filesystem. Two cases land here:
 			// (a) a previous reconcile mkfs'd this volume but crashed
 			// before writing the marker — adopt the fs and continue;
@@ -4583,6 +4585,10 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 			// makeFileSystemOnMarked which short-circuits on a
 			// non-empty hasFileSystem result.
 			continue
+		case filesystemUnknown:
+			// No marker is written, so the next reconcile asks again.
+			return errors.Newf("blkid cannot tell whether %s carries data; refusing mkfs.%s", device, fsType)
+		case filesystemAbsent:
 		}
 
 		cmdArgs := append(slices.Clone(args), device)
@@ -4629,41 +4635,16 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 	return nil
 }
 
-// deviceHasFilesystem reports whether the given DRBD device already
-// carries a recognised filesystem. Wraps `blkid -o export <device>`
-// the same way upstream LINSTOR's MkfsUtils.hasFileSystem does:
-// presence of a `TYPE=` line in the export-format output means the
-// kernel's libblkid detected a known filesystem signature. blkid's
-// exit-2 (no signature found) is folded into the FakeExec /
-// RealExec "non-zero exit → wrapped error" contract; we treat that
-// as "no filesystem" rather than propagating the error because the
-// caller's only sensible response is exactly the same: skip mkfs on
-// a populated volume, run it on an empty one.
-//
-// A real I/O failure (device gone, kernel returned EIO) also lands
-// in the error branch, but the subsequent mkfs.<type> on the same
-// device would fail just as loudly with a more actionable message
-// ("No such file or directory" / "Input/output error"), so the
-// fall-through to mkfs preserves the failure mode operators
-// already expect.
-func (r *Reconciler) deviceHasFilesystem(ctx context.Context, device string) bool {
-	out, err := r.cfg.Exec.Run(ctx, "blkid", "-o", "export", device)
-	if err != nil {
-		// Treat any blkid failure as "no recognised filesystem". The
-		// most common shape is exit-code 2 (no signature) which
-		// RealExec wraps into a generic error — the caller's only
-		// sensible reaction is to run mkfs, which is what the
-		// no-filesystem branch already does.
-		return false
-	}
-
-	for line := range strings.SplitSeq(string(out), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "TYPE=") {
-			return true
-		}
-	}
-
-	return false
+// probeMkfsTarget is the last check before mkfs: a low-level `blkid
+// -p` on the device mkfs would write (`/dev/drbdN` while Primary, or
+// the raw or LUKS device of a storage-only stack), where no DRBD
+// superblock is visible. `-p` reads the device rather than the blkid
+// cache and reports several signatures at once as an error instead of
+// silently naming none. Upstream LINSTOR's MkfsUtils.hasFileSystem
+// reads any non-zero exit as "no filesystem" and formats; here only a
+// read-back "nothing found" does.
+func (r *Reconciler) probeMkfsTarget(ctx context.Context, device string) probedFilesystem {
+	return r.probeFilesystem(ctx, device, "-p")
 }
 
 // probedFilesystem is what a blkid probe could tell about a device.

@@ -202,6 +202,7 @@ func assertNoPromoteNoMkfs(t *testing.T, cmds []string) {
 func TestApplyBug028Day0RaceVetoBypassedMkfsRuns(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6500")
 	device := expectThinBacking(fx, "pvc-b028")
 	// Kernel truth at the winner's finishDRBDApply: the day0 sibling is
 	// already Connected+UpToDate → AnyConnectedPeerHasData vetoes.
@@ -214,7 +215,7 @@ func TestApplyBug028Day0RaceVetoBypassedMkfsRuns(t *testing.T) {
 	// Backing-device blkid answers TYPE=drbd (the real-hardware shape:
 	// libblkid sees the internal DRBD metadata superblock) — the bypass
 	// must read that as "no user filesystem". The post-promote probe on
-	// /dev/drbd6500 returns the FakeExec default (no signature).
+	// /dev/drbd6500 is canned blank (exit 2, no signature).
 	expectDrbdMetaSignature(fx, device)
 
 	rec := newThinReconciler(fx, dir)
@@ -337,6 +338,7 @@ func TestApplyBug028VetoHoldsOnUnconnectedDiskfulPeer(t *testing.T) {
 func TestApplyBug028BypassFiresDespitePeerHasDataLag(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6540")
 	device := expectThinBacking(fx, "pvc-b028g")
 	fx.Expect("drbdsetup status pvc-b028g --json",
 		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028g"))})
@@ -394,13 +396,14 @@ func bug028FalseLatchDR(rd, minor string) []*intent.DesiredResource {
 func TestApplyBug028FalseLatchRetryFiresWithoutAutoPrimary(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6600")
 	device := expectThinBacking(fx, "pvc-b028r")
 	fx.Expect("drbdsetup status pvc-b028r --json",
 		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028r"))})
 	// Backing blkid answers TYPE=drbd (the real-hardware shape — see
 	// expectDrbdMetaSignature): the retry must read it as "no user
-	// filesystem". /dev/drbd6600's post-promote probe stays at the
-	// FakeExec default (no signature) → mkfs runs.
+	// filesystem". /dev/drbd6600's post-promote probe is canned blank
+	// (exit 2, no signature) → mkfs runs.
 	expectDrbdMetaSignature(fx, device)
 
 	rec := newThinReconciler(fx, dir)
@@ -425,6 +428,7 @@ func TestApplyBug028FalseLatchRetryFiresWithoutAutoPrimary(t *testing.T) {
 func TestApplyBug028FalseLatchRetryDefersWhileForeignPrimary(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6610")
 	expectDrbdMetaSignature(fx, expectThinBacking(fx, "pvc-b028w"))
 	fx.Expect("drbdsetup status pvc-b028w --json",
 		storage.FakeResponse{Stdout: []byte(`[{

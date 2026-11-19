@@ -20,9 +20,12 @@ package satellite_test
 
 import (
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -142,5 +145,130 @@ func TestApplyLatchFreeRetryFlushesBackingCacheFirst(t *testing.T) {
 
 	if !slices.Contains(cmds, readBack(device)) {
 		t.Errorf("a nothing-found answer must be read back before it is believed: %v", cmds)
+	}
+}
+
+func mkfsTargetProbe(device string) string {
+	return "blkid -p -o export " + device
+}
+
+// expectBlankMkfsTarget cans what `blkid -p` answers for a device that
+// was never formatted: exit 2 and nothing on stderr. A test that leaves
+// the probe at the FakeExec default (exit 0, no output) gets a probe
+// that named nothing, which refuses mkfs.
+func expectBlankMkfsTarget(fx *storage.FakeExec, devices ...string) {
+	for _, device := range devices {
+		fx.Expect(mkfsTargetProbe(device), storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
+	}
+}
+
+// unknownMkfsTargetAnswers are the answers of the last probe before
+// mkfs that do not prove the device empty. LINSTOR's hasFileSystem, and
+// this probe before the fix, read every one of them as "no filesystem"
+// and formatted.
+func unknownMkfsTargetAnswers(device string) map[string][]storage.FakeResponse {
+	nothing := storage.FakeResponse{Err: storage.FakeExitError{Code: 2}}
+
+	return map[string][]storage.FakeResponse{
+		"partition table only": {{Stdout: []byte("DEVNAME=" + device + "\nPTUUID=4b4b8971\nPTTYPE=dos\n")}},
+		"exit 0, nothing named": {{}},
+		"ambivalent":            {{Err: storage.FakeExitError{Code: 8}}},
+		"cannot open": {{Err: fmt.Errorf("%w: blkid -p -o export %s: blkid: error: %s: Permission denied",
+			storage.FakeExitError{Code: 2}, device, device)}},
+		"nothing found, read-back fails": {nothing, {Err: errors.New("dd: error reading: Input/output error")}},
+	}
+}
+
+func expectMkfsTargetAnswer(fx *storage.FakeExec, device string, answer []storage.FakeResponse) {
+	fx.Expect(mkfsTargetProbe(device), answer[0])
+
+	if len(answer) > 1 {
+		fx.Expect(readBack(device), answer[1])
+	}
+}
+
+func assertNoMkfs(t *testing.T, cmds []string) {
+	t.Helper()
+
+	for _, line := range cmds {
+		if strings.HasPrefix(line, "mkfs.") {
+			t.Errorf("must NOT mkfs: %s", line)
+		}
+	}
+}
+
+// TestApplyPromotedMkfsRefusesUnknownTarget: on a born-empty replica
+// that was promoted for its filesystem, a post-promote probe that
+// cannot prove /dev/drbdN empty formats nothing and writes no marker.
+func TestApplyPromotedMkfsRefusesUnknownTarget(t *testing.T) {
+	for name, answer := range unknownMkfsTargetAnswers("/dev/drbd6830") {
+		t.Run(name, func(t *testing.T) {
+			rd := "pvc-tgt"
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			device := expectThinBacking(fx, rd)
+			fx.Expect("drbdsetup status "+rd+" --json",
+				storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary(rd))})
+			expectDrbdMetaSignature(fx, device)
+			expectMkfsTargetAnswer(fx, "/dev/drbd6830", answer)
+
+			rec := newThinReconciler(fx, dir)
+
+			_, err := rec.Apply(t.Context(), bug028FalseLatchDR(rd, "6830"))
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			assertNoMkfs(t, fx.CommandLines())
+			assertNoMkfsMarker(t, dir, rd)
+		})
+	}
+}
+
+// TestApplyStorageOnlyMkfsRefusesUnknownTarget: the storage-only stack
+// formats the raw device directly, with no promote in between, so this
+// probe is the only thing between mkfs and the data.
+func TestApplyStorageOnlyMkfsRefusesUnknownTarget(t *testing.T) {
+	const device = "/dev/vg/pvc-loc_00000"
+
+	for name, answer := range unknownMkfsTargetAnswers(device) {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			expectThinBacking(fx, "pvc-loc")
+			expectMkfsTargetAnswer(fx, device, answer)
+
+			rec := newThinReconciler(fx, dir)
+
+			results, err := rec.Apply(t.Context(), storageOnlyFilesystemDR("pvc-loc", skipInitTrue()))
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			assertNoMkfs(t, fx.CommandLines())
+			assertNoMkfsMarker(t, dir, "pvc-loc")
+
+			if len(results) != 1 || results[0].GetOk() {
+				t.Errorf("a refused mkfs must fail the apply so it is retried and seen: %v", results)
+			}
+		})
+	}
+}
+
+// storageOnlyFilesystemDR is a linstor-csi "local" volume: STORAGE
+// only, with FileSystem/Type set.
+func storageOnlyFilesystemDR(rd string, skip *bool) []*intent.DesiredResource {
+	return []*intent.DesiredResource{
+		{
+			Name:     rd,
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Props:           map[string]string{"FileSystem/Type": "ext4"},
+			LayerStack:      []string{"STORAGE"},
+			DrbdOptions:     map[string]string{},
+			SkipInitialSync: skip,
+		},
 	}
 }
