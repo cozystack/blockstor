@@ -895,23 +895,10 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		}
 	}
 
-	if pool := req.GetStoragePool(); pool != "" {
-		provider, ok := r.cfg.Providers[pool]
-		if ok {
-			for _, n := range req.GetVolumeNumbers() {
-				err := provider.DeleteVolume(ctx, storage.Volume{
-					ResourceName: req.GetName(),
-					VolumeNumber: n,
-				})
-				if err != nil {
-					//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
-					return &intent.DeleteResourceResponse{
-						Ok:      false,
-						Message: err.Error(),
-					}, nil
-				}
-			}
-		}
+	err := r.deleteVolumes(ctx, req)
+	if err != nil {
+		//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
+		return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
 	}
 
 	if r.cfg.StateDir != "" {
@@ -943,6 +930,47 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	r.forgetPool(req.GetName())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
+}
+
+// deleteVolumes deletes every requested volume through the replica's pool.
+// A diskful replica's pool that is not registered yet (the satellite just
+// started and its StoragePool has not been reconciled) or no longer (the pool
+// was removed) cannot delete anything. Reporting success then would release
+// the finalizer over storage that is still on disk, so the delete stays
+// pending until the pool is back.
+func (r *Reconciler) deleteVolumes(ctx context.Context, req *intent.DeleteResourceRequest) error {
+	pool := req.GetStoragePool()
+	if pool == "" {
+		return nil
+	}
+
+	provider, ok := r.provider(pool)
+	if !ok {
+		return errors.Errorf("storage pool %q is not registered on this satellite; its volumes are not deleted yet", pool)
+	}
+
+	for _, n := range req.GetVolumeNumbers() {
+		err := provider.DeleteVolume(ctx, storage.Volume{
+			ResourceName: req.GetName(),
+			VolumeNumber: n,
+		})
+		if err != nil {
+			return errors.Wrapf(err, "delete volume %s/%d", req.GetName(), n)
+		}
+	}
+
+	return nil
+}
+
+// provider looks the pool up under the lock RegisterProvider takes, so
+// a StoragePool reconciled concurrently cannot tear the read.
+func (r *Reconciler) provider(pool string) (storage.Provider, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	provider, ok := r.cfg.Providers[pool]
+
+	return provider, ok
 }
 
 // forgetPool drops the resource from the resource→pool map so a
@@ -1602,10 +1630,10 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 // volumes, so a re-reconcile after a partial first pass safely
 // finishes the cleanup.
 //
-// An unknown pool is silently skipped — the dispatcher may stamp a
-// historical pool the satellite no longer has registered (e.g.
-// after a pool rename). The orphan-storage sweeper backstops with
-// its own scan in that edge case.
+// An unknown pool is an error, not a skip: nothing else deletes the
+// volume later, so the toggle stays pending until the pool is
+// registered (a satellite that just started has not reconciled its
+// StoragePools yet).
 func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.DesiredResource) error {
 	for _, vol := range dr.GetVolumes() {
 		pool := vol.GetStoragePool()
@@ -1613,9 +1641,10 @@ func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.D
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
-			continue
+			return errors.Errorf("reclaim volume %s/%d on diskless toggle: storage pool %q is not registered on this satellite",
+				dr.GetName(), vol.GetVolumeNumber(), pool)
 		}
 
 		err := provider.DeleteVolume(ctx, storage.Volume{
