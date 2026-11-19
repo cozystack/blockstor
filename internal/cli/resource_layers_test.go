@@ -151,6 +151,17 @@ func TestListingsReadTheDefinitionsLayerStack(t *testing.T) {
 		}
 	}
 
+	// Nothing observes whether a bare storage volume is open, so its
+	// Usage is unknown rather than the Unused the store projects.
+	listing := runLayered(t, st, "resource", "list")
+	for name, want := range map[string]string{"pvc-local": "", "pvc-encrypted": "Unused"} {
+		// `| name | node | port | usage |`: the Usage cell is field 4.
+		fields := strings.Split(rowOf(t, listing, name), "|")
+		if got := strings.TrimSpace(fields[4]); got != want {
+			t.Errorf("%s Usage = %q, want %q", name, got, want)
+		}
+	}
+
 	// The stamp lands on the machine output as well, which carries the
 	// layer data rather than the rendered state.
 	machine := runLayered(t, st, "resource", "list", "-m", "-r", "pvc-local")
