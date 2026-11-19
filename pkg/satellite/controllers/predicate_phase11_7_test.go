@@ -20,6 +20,7 @@ package controllers
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -254,6 +255,120 @@ func TestPrimaryWatchFiresOnAllocatorStamp(t *testing.T) {
 
 	if !pred.Update(event.UpdateEvent{ObjectOld: oldR3, ObjectNew: newR3}) {
 		t.Errorf("allocator stamped DRBDMinor nil→1000 with no Generation bump: predicate dropped it")
+	}
+}
+
+// -----------------------------------------------------------------
+// siblingWatchPredicate tests.
+// -----------------------------------------------------------------
+
+// TestSiblingWatchDropsObserverChurn pins the filter on other nodes'
+// Resources: the writes a peer's observer makes on every kernel frame
+// (connections, role, in-use, out-of-sync, conditions) must not
+// re-queue this node's replica. On a node holding a hundred replicas
+// they kept the queue full and a new Resource waited minutes.
+func TestSiblingWatchDropsObserverChurn(t *testing.T) {
+	t.Parallel()
+
+	pred := siblingWatchPredicate()
+
+	base := func() *blockstoriov1alpha1.Resource {
+		return &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.n2", Generation: 3},
+			Status: blockstoriov1alpha1.ResourceStatus{
+				DRBDNodeID: int32Ptr(1),
+				DRBDPort:   int32Ptr(7000),
+				DRBDMinor:  int32Ptr(1000),
+				Volumes: []blockstoriov1alpha1.ResourceVolumeStatus{
+					{VolumeNumber: 0, DiskState: "UpToDate", CurrentGI: "AB", OutOfSyncKib: 0},
+				},
+				Connections: []blockstoriov1alpha1.ResourceConnectionStatus{
+					{PeerNodeName: "n1", Connected: true, Message: "Connected"},
+					{PeerNodeName: "n3", Connected: true, Message: "Connected"},
+				},
+			},
+		}
+	}
+
+	churn := map[string]func(*blockstoriov1alpha1.Resource){
+		"connections reordered": func(r *blockstoriov1alpha1.Resource) {
+			slices.Reverse(r.Status.Connections)
+		},
+		"connection state": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Connections[0].Connected = false
+			r.Status.Connections[0].Message = "Connecting"
+		},
+		"role and in-use": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Role = "Primary"
+			r.Status.InUse = true
+		},
+		"out-of-sync counter": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Volumes[0].OutOfSyncKib = 4096
+		},
+		"condition": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Conditions = []metav1.Condition{{Type: "MetadataCreated", Status: metav1.ConditionTrue}}
+		},
+	}
+
+	for name, mutate := range churn {
+		newR := base()
+		mutate(newR)
+
+		if pred.Update(event.UpdateEvent{ObjectOld: base(), ObjectNew: newR}) {
+			t.Errorf("%s: predicate re-queued the local replica", name)
+		}
+	}
+}
+
+// TestSiblingWatchPassesWhatTheApplyReads pins the other half: every
+// peer change the local apply derives something from still wakes the
+// local replica.
+func TestSiblingWatchPassesWhatTheApplyReads(t *testing.T) {
+	t.Parallel()
+
+	pred := siblingWatchPredicate()
+
+	base := func() *blockstoriov1alpha1.Resource {
+		return &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.n2", Generation: 3},
+			Status: blockstoriov1alpha1.ResourceStatus{
+				DRBDNodeID: int32Ptr(1),
+				DRBDPort:   int32Ptr(7000),
+				DRBDMinor:  int32Ptr(1000),
+				Volumes: []blockstoriov1alpha1.ResourceVolumeStatus{
+					{VolumeNumber: 0, DiskState: "Inconsistent", CurrentGI: "AB"},
+				},
+			},
+		}
+	}
+
+	now := metav1.Now()
+
+	relevant := map[string]func(*blockstoriov1alpha1.Resource){
+		"spec change":      func(r *blockstoriov1alpha1.Resource) { r.Generation++ },
+		"deletion started": func(r *blockstoriov1alpha1.Resource) { r.DeletionTimestamp = &now },
+		"node id":          func(r *blockstoriov1alpha1.Resource) { r.Status.DRBDNodeID = int32Ptr(2) },
+		"port":             func(r *blockstoriov1alpha1.Resource) { r.Status.DRBDPort = nil },
+		"minor":            func(r *blockstoriov1alpha1.Resource) { r.Status.DRBDMinor = int32Ptr(1001) },
+		"disk state":       func(r *blockstoriov1alpha1.Resource) { r.Status.Volumes[0].DiskState = "UpToDate" },
+		"current gi":       func(r *blockstoriov1alpha1.Resource) { r.Status.Volumes[0].CurrentGI = "CD" },
+		"volume added": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Volumes = append(r.Status.Volumes, blockstoriov1alpha1.ResourceVolumeStatus{VolumeNumber: 1})
+		},
+		"volume renumbered": func(r *blockstoriov1alpha1.Resource) { r.Status.Volumes[0].VolumeNumber = 1 },
+	}
+
+	for name, mutate := range relevant {
+		newR := base()
+		mutate(newR)
+
+		if !pred.Update(event.UpdateEvent{ObjectOld: base(), ObjectNew: newR}) {
+			t.Errorf("%s: predicate dropped a change the local apply reads", name)
+		}
+	}
+
+	if !pred.Create(event.CreateEvent{Object: base()}) || !pred.Delete(event.DeleteEvent{Object: base()}) {
+		t.Errorf("peer create/delete must always wake the local replica")
 	}
 }
 
