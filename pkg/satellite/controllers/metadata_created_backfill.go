@@ -164,7 +164,9 @@ func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *
 		return false
 	}
 
-	stampErr := b.Stamper.stampOn(ctx, res.Name)
+	// The backfill only probes: dump-md found the metadata, nothing
+	// here created it.
+	stampErr := b.Stamper.stampOn(ctx, res.Name, metadataCreatedFound)
 	if stampErr != nil {
 		logger.Info("stamp MetadataCreated (best-effort)", "err", stampErr.Error())
 

@@ -190,6 +190,10 @@ func (f *fakeMetadataStamperInternal) StampMetadataCreated(_ context.Context, rd
 	return nil
 }
 
+func (f *fakeMetadataStamperInternal) StampMetadataFound(ctx context.Context, rdName, nodeName string) error {
+	return f.StampMetadataCreated(ctx, rdName, nodeName)
+}
+
 // sequencedFakeExec wraps storage.FakeExec to deliver a sequence of
 // canned responses for the same command line on successive calls.
 // FakeExec keys responses by cmdline — fine for one-shot stubs but

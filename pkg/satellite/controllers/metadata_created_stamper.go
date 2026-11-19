@@ -56,12 +56,37 @@ type MetadataCreatedStamper struct {
 // Condition onto the Resource CR of the replica of resourceName on
 // nodeName, named the way the store named it (see replicaCRName).
 func (s *MetadataCreatedStamper) StampMetadataCreated(ctx context.Context, resourceName, nodeName string) error {
+	return s.stampReplica(ctx, resourceName, nodeName, metadataCreatedByCreateMd)
+}
+
+// StampMetadataFound stamps the same Condition for a replica whose
+// metadata dump-md found on every volume, with a Reason that says
+// create-md did not run.
+func (s *MetadataCreatedStamper) StampMetadataFound(ctx context.Context, resourceName, nodeName string) error {
+	return s.stampReplica(ctx, resourceName, nodeName, metadataCreatedFound)
+}
+
+// metadataCreatedCause is the Reason and Message of a true
+// MetadataCreated Condition.
+type metadataCreatedCause struct{ reason, message string }
+
+//nolint:gochecknoglobals // immutable Reason/Message pairs
+var (
+	metadataCreatedByCreateMd = metadataCreatedCause{
+		blockstoriov1alpha1.MetadataCreatedReasonCreateMd, "drbdmeta create-md completed",
+	}
+	metadataCreatedFound = metadataCreatedCause{
+		blockstoriov1alpha1.MetadataCreatedReasonFound, "drbdmeta dump-md found existing metadata; create-md not run",
+	}
+)
+
+func (s *MetadataCreatedStamper) stampReplica(ctx context.Context, resourceName, nodeName string, cause metadataCreatedCause) error {
 	name, err := replicaCRName(ctx, s.Client, resourceName, nodeName)
 	if err != nil {
 		return err
 	}
 
-	return s.stampOn(ctx, name)
+	return s.stampOn(ctx, name, cause)
 }
 
 // stampOn SSA-patches the Condition onto the Resource CR named
@@ -70,7 +95,7 @@ func (s *MetadataCreatedStamper) StampMetadataCreated(ctx context.Context, resou
 // patch with the same fields is a no-op at the apiserver level
 // (LastTransitionTime is preserved because the apiserver only
 // updates it when the Condition's Status actually changes).
-func (s *MetadataCreatedStamper) stampOn(ctx context.Context, resourceName string) error {
+func (s *MetadataCreatedStamper) stampOn(ctx context.Context, resourceName string, cause metadataCreatedCause) error {
 	apply := &blockstoriov1alpha1.Resource{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       resourceKind,
@@ -82,8 +107,8 @@ func (s *MetadataCreatedStamper) stampOn(ctx context.Context, resourceName strin
 				{
 					Type:               blockstoriov1alpha1.ConditionMetadataCreated,
 					Status:             metav1.ConditionTrue,
-					Reason:             "CreateMdSucceeded",
-					Message:            "drbdmeta create-md completed",
+					Reason:             cause.reason,
+					Message:            cause.message,
 					LastTransitionTime: metav1.Now(),
 				},
 			},
