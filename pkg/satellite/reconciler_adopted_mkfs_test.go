@@ -60,6 +60,54 @@ func assertNoMkfsMarker(t *testing.T, dir, rd string) {
 	}
 }
 
+// TestApplyAdoptedVolumeNeverPromotedForMkfs: a replica that was not
+// born empty in blockstor (linstor-migrate stamps SkipInitialSync=false
+// on every adopted replica; nil is a replica not yet stamped) is never
+// promoted for mkfs, even when every replica is Secondary and lock-step
+// UpToDate, no marker exists, and the backing probe finds no
+// filesystem it can name. The volume holds data blockstor never wrote.
+func TestApplyAdoptedVolumeNeverPromotedForMkfs(t *testing.T) {
+	cases := map[string]struct {
+		skip   *bool
+		ext4   bool
+		suffix string
+	}{
+		"adopted, ext4 below the DRBD superblock": {skip: skipInitFalse(), ext4: true, suffix: "a"},
+		"adopted, backing probe finds nothing":    {skip: skipInitFalse(), suffix: "b"},
+		"not yet stamped":                         {skip: nil, suffix: "c"},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			rd := "pvc-adopt" + tc.suffix
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			device := expectThinBacking(fx, rd)
+			fx.Expect("drbdsetup status "+rd+" --json",
+				storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary(rd))})
+
+			if tc.ext4 {
+				expectAdoptedExt4Backing(fx, device)
+			} else {
+				expectDrbdMetaSignature(fx, device)
+			}
+
+			rec := newThinReconciler(fx, dir)
+
+			dr := bug028FalseLatchDR(rd, "6700")
+			dr[0].SkipInitialSync = tc.skip
+
+			_, err := rec.Apply(t.Context(), dr)
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			assertNoPromoteNoMkfs(t, fx.CommandLines())
+			assertNoMkfsMarker(t, dir, rd)
+		})
+	}
+}
+
 // TestApplyLatchFreeRetryReadsFilesystemBelowDrbdMetadata is the
 // probe half of #265 on its own: even on a replica born empty, a
 // backing device whose plain blkid answer is TYPE=drbd but which

@@ -3458,6 +3458,18 @@ func (r *Reconciler) allVolumesDay0Empty(ctx context.Context, dr *intent.Desired
 //     in the SAME data generation as the local one, so the promote
 //     mints nothing unrelated and the mkfs writes replicate to peers
 //     that are by construction bit-identical to the local volume.
+//   - This replica was born empty here: its persisted
+//     Spec.SkipInitialSync is true, the controller's offline-safe
+//     record that it was created into a never-initialized RD
+//     generation, so its DRBD metadata and its bytes both started out
+//     as blockstor's own blank. A replica adopted from another storage
+//     controller (linstor-migrate stamps false on every replica),
+//     created into an already-initialized RD (relocate, extra
+//     replica), or not yet stamped (nil) refuses: its volume holds
+//     data blockstor never wrote, formatted or not, and the missing
+//     `.mkfs.done` marker says nothing about it (issue #265). This is
+//     the signal that tells such a volume apart: DRBD metadata on the
+//     backing device does not, since every blockstor volume has it.
 //   - Every local volume's backing device was probed and none is
 //     Unknown, and at least one has NO filesystem at all
 //     (probeBackingFilesystem, a filesystem-only `blkid -p` that sees
@@ -3480,6 +3492,10 @@ func (r *Reconciler) allVolumesDay0Empty(ctx context.Context, dr *intent.Desired
 // that is genuinely missing its filesystem marker — never in steady
 // state.
 func (r *Reconciler) latchFreeMkfsRetryAllowed(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) bool {
+	if !bornEmptyReplica(dr) {
+		return false
+	}
+
 	if !r.isLowestDiskfulNodeID(dr) {
 		return false
 	}
@@ -3507,6 +3523,16 @@ func (r *Reconciler) latchFreeMkfsRetryAllowed(ctx context.Context, dr *intent.D
 		"resource", dr.GetName())
 
 	return true
+}
+
+// bornEmptyReplica reports whether the controller recorded this replica
+// as created into a never-initialized RD generation
+// (Spec.SkipInitialSync=true). See latchFreeMkfsRetryAllowed for why
+// nothing else may be promoted for a filesystem retry.
+func bornEmptyReplica(dr *intent.DesiredResource) bool {
+	skip := dr.GetSkipInitialSync()
+
+	return skip != nil && *skip
 }
 
 // backingProvablyLacksFilesystem is the per-volume half of
