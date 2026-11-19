@@ -243,6 +243,53 @@ func TestDeleteResourceClosesTheAdoptedMapper(t *testing.T) {
 	}
 }
 
+// Toggling the replica to diskless closes LINSTOR's mapper between the
+// detach and the reclaim: left open, it would hold the LV the storage
+// layer removes next, and the replica would keep a disk it no longer
+// has a volume for.
+func TestToggleToDisklessClosesTheAdoptedMapper(t *testing.T) {
+	attached := storage.FakeResponse{Stdout: []byte(keyRD + " role:Secondary\n  disk:UpToDate\n")}
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status "+keyRD, attached)
+	fx.Expect("drbdsetup status --verbose "+keyRD, attached)
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-key_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-key_00000\n")})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)},
+		Adm:        drbd.NewAdm(fx),
+		StateDir:   t.TempDir(),
+		NodeName:   "n1",
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{{
+		Name:       keyRD,
+		NodeName:   "n1",
+		Flags:      []string{"DISKLESS"},
+		LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	calls := fx.CommandLines()
+	detached := slices.Index(calls, "drbdadm detach --force "+keyRD)
+	closed := slices.Index(calls, "cryptsetup luksClose "+linstorMapper)
+	removed := slices.IndexFunc(calls, func(line string) bool { return strings.HasPrefix(line, "lvremove") })
+
+	if detached < 0 || closed < detached || removed < closed {
+		t.Fatalf("want drbdadm detach, then luksClose %s, then lvremove; got %v", linstorMapper, calls)
+	}
+}
+
 // Taking a replica inactive lets go of LINSTOR's mapper once DRBD is down,
 // which is what moves the volume onto blockstor's own mapper when it is
 // activated again. A down that is deferred closes nothing.
