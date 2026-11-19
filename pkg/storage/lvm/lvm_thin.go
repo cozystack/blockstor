@@ -131,13 +131,17 @@ func (t *Thin) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 }
 
 // DeleteVolume idempotently removes the LV. Missing → no-op (reconcile
-// loops re-call this).
+// loops re-call this); a probe that fails is an error, never "missing".
+//
+// Thin snapshots are independent thin LVs, so they survive their origin's
+// removal, as with LINSTOR's LVM_THIN provider.
 func (t *Thin) DeleteVolume(ctx context.Context, vol storage.Volume) error {
-	if !t.lvExists(ctx, volumeLVName(vol)) {
-		return nil
+	present, err := lvPresent(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
+	if err != nil || !present {
+		return err
 	}
 
-	_, err := t.exec.Run(ctx, "lvremove",
+	_, err = t.exec.Run(ctx, "lvremove",
 		Args("--force",
 			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
@@ -220,11 +224,12 @@ func (t *Thin) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error 
 // the Snapshot CRD's finalizer instead of looping forever on a
 // "not found" surface error.
 func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
-	if !t.lvExists(ctx, snapshotLVName(snap)) {
-		return nil
+	present, err := lvPresent(ctx, t.exec, t.cfg.VolumeGroup, snapshotLVName(snap))
+	if err != nil || !present {
+		return err
 	}
 
-	_, err := t.exec.Run(ctx, "lvremove",
+	_, err = t.exec.Run(ctx, "lvremove",
 		Args("--force",
 			t.cfg.VolumeGroup+"/"+snapshotLVName(snap))...)
 	if err != nil {

@@ -166,13 +166,33 @@ func (t *Thick) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 // CreateVolume left for it. Nothing is wiped here: an LV that lvremove
 // refuses, because it is still open, keeps its data, and the next
 // CreateVolume over these extents wipes them anyway.
+//
+// An LV that still has snapshots is refused: thick snapshots are
+// copy-on-write over their origin and `lvremove --force` would remove them
+// with it. LINSTOR does not take snapshots on thick LVM at all, so it never
+// meets this case; the refusal keeps the delete pending until the snapshots
+// are deleted. A probe that fails is an error, never "missing".
 func (t *Thick) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	for _, name := range []string{volumeLVName(vol), freshLVName(volumeLVName(vol))} {
-		if !t.lvExists(ctx, name) {
+		present, err := lvPresent(ctx, t.exec, t.cfg.VolumeGroup, name)
+		if err != nil {
+			return err
+		}
+
+		if !present {
 			continue
 		}
 
-		_, err := t.exec.Run(ctx, "lvremove",
+		snapshots, err := lvSnapshots(ctx, t.exec, t.cfg.VolumeGroup, name)
+		if err != nil {
+			return err
+		}
+
+		if len(snapshots) > 0 {
+			return errors.Wrapf(errOriginHasSnapshots, "%s/%s: %s", t.cfg.VolumeGroup, name, strings.Join(snapshots, ", "))
+		}
+
+		_, err = t.exec.Run(ctx, "lvremove",
 			Args("--force",
 				t.cfg.VolumeGroup+"/"+name)...)
 		if err != nil {
@@ -267,11 +287,12 @@ func (t *Thick) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error
 // short-circuit so the satellite reconciler can strip the Snapshot
 // CRD's finalizer instead of looping on a "not found" surface error.
 func (t *Thick) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
-	if !t.lvExists(ctx, snapshotLVName(snap)) {
-		return nil
+	present, err := lvPresent(ctx, t.exec, t.cfg.VolumeGroup, snapshotLVName(snap))
+	if err != nil || !present {
+		return err
 	}
 
-	_, err := t.exec.Run(ctx, "lvremove",
+	_, err = t.exec.Run(ctx, "lvremove",
 		Args("--force",
 			t.cfg.VolumeGroup+"/"+snapshotLVName(snap))...)
 	if err != nil {
