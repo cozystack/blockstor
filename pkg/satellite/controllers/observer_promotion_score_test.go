@@ -144,3 +144,74 @@ func TestObserverPromotionTokens(t *testing.T) {
 		t.Errorf("frame without the tokens: score %v may_promote %v, want the cached 10102 / true", again.PromotionScore, again.MayPromote)
 	}
 }
+
+// TestObserverClearsPromotionOnDestroy: a `destroy resource` frame
+// carries no promotion tokens, yet the slot that owned the score is
+// gone. Both fields must leave Resource.Status, as LINSTOR drops them
+// on stream close; a cached score would have the view call a
+// torn-down replica promotable and hide it from linstor-csi's health
+// check.
+func TestObserverClearsPromotionOnDestroy(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	const (
+		rdName   = "pvc-gone"
+		nodeName = "node-a"
+	)
+
+	crName := k8s.ResourceCRName(rdName, nodeName)
+	replica := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: crName},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               nodeName,
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(&blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: rdName}},
+			&blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}, replica).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).Build()
+
+	o := &ObserverRunnable{Client: cli, NodeName: nodeName}
+	ctx := context.Background()
+
+	for _, line := range []string{
+		"exists resource name:pvc-gone role:Secondary suspended:no force-io-failures:no may_promote:yes promotion_score:10102",
+		"destroy resource name:pvc-gone",
+	} {
+		ev, err := drbd.ParseEvent(line)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+
+		obs, ok := translateEvent(ev)
+		if !ok {
+			t.Fatalf("translateEvent rejected %q", line)
+		}
+
+		o.mergeResource(&obs)
+
+		if err := o.writeStatus(ctx, &obs); err != nil {
+			t.Fatalf("writeStatus after %q: %v", line, err)
+		}
+	}
+
+	var got blockstoriov1alpha1.Resource
+	if err := cli.Get(ctx, client.ObjectKey{Name: crName}, &got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if got.Status.PromotionScore != nil {
+		t.Errorf("Status.PromotionScore = %d after destroy, want unset", *got.Status.PromotionScore)
+	}
+
+	if got.Status.MayPromote != nil {
+		t.Errorf("Status.MayPromote = %v after destroy, want unset", *got.Status.MayPromote)
+	}
+}

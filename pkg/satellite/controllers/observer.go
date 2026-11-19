@@ -1038,6 +1038,30 @@ func (o *ObserverRunnable) snapshotFor(name string) observation {
 	return out
 }
 
+// mergePromotion folds a resource frame's promotion tokens into the
+// cache. A frame without them keeps the cached values; a `destroy`
+// frame clears both, because the slot that had the score is gone and
+// LINSTOR drops the volatile state on stream close
+// (ResourceStateEventHandler). Keeping them would leave the view
+// calling a torn-down replica promotable, which hides it from
+// linstor-csi's health check.
+func mergePromotion(cur *resourceObservation, ev *observation) {
+	if ev.HasKernelLoaded && !ev.KernelLoaded {
+		cur.PromotionScore = nil
+		cur.MayPromote = nil
+
+		return
+	}
+
+	if ev.PromotionScore != nil {
+		cur.PromotionScore = ev.PromotionScore
+	}
+
+	if ev.MayPromote != nil {
+		cur.MayPromote = ev.MayPromote
+	}
+}
+
 // mergeResource caches the resource-kind observation (InUse,
 // DrbdState) so subsequent connection / peer-device event applies
 // re-emit them. Without this, an event that doesn't carry InUse
@@ -1068,13 +1092,7 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 		cur.Role = ev.Role
 		cur.Suspended = normalizeSuspended(ev.Suspended)
 
-		if ev.PromotionScore != nil {
-			cur.PromotionScore = ev.PromotionScore
-		}
-
-		if ev.MayPromote != nil {
-			cur.MayPromote = ev.MayPromote
-		}
+		mergePromotion(&cur, ev)
 	}
 
 	// DrbdState flows from device-kind events (translateDeviceEvent
