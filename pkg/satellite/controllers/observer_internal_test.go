@@ -225,12 +225,13 @@ func TestMergeConnectionsIsolatesResources(t *testing.T) {
 	}
 }
 
-// TestMergeConnectionsSnapshotOrderIsStable pins the snapshot order:
+// TestConnectionStatusOrderIsStable pins the order of the applied
+// Status.Connections on both paths that write it: the connection-frame
+// merge and the 5 s resync. Both build their snapshot from a map, and
 // SSA stores the applied list in the order sent, so a snapshot in map
-// iteration order reorders Status.Connections on frames that changed
-// nothing, and every sibling satellite is woken by the resulting write.
-// The same peer set must always come out in the same order.
-func TestMergeConnectionsSnapshotOrderIsStable(t *testing.T) {
+// iteration order reorders the peers on writes that changed nothing,
+// and each reorder wakes every informer watching Resources.
+func TestConnectionStatusOrderIsStable(t *testing.T) {
 	o := &ObserverRunnable{}
 
 	peers := []string{"worker-5", "worker-1", "worker-4", "worker-2", "worker-3", "worker-6"}
@@ -246,25 +247,36 @@ func TestMergeConnectionsSnapshotOrderIsStable(t *testing.T) {
 	want := slices.Clone(peers)
 	slices.Sort(want)
 
+	paths := map[string]func() observation{
+		"connection frame": func() observation {
+			ev := observation{
+				ResourceName: "pvc-1",
+				Connections: []connectionObservation{
+					{PeerNodeName: "worker-3", Connected: true, Message: "Connected"},
+				},
+			}
+			o.mergeConnections(&ev)
+
+			return ev
+		},
+		"resync": func() observation { return o.snapshotFor("pvc-1") },
+	}
+
 	// Map iteration order is randomised per range statement; with six
 	// peers a map-ordered snapshot matches the sorted one by chance in
-	// 1 of 720 runs, so a few dozen frames catch it every time.
-	for frame := range 50 {
-		ev := &observation{
-			ResourceName: "pvc-1",
-			Connections: []connectionObservation{
-				{PeerNodeName: "worker-3", Connected: true, Message: "Connected"},
-			},
-		}
-		o.mergeConnections(ev)
+	// 1 of 720 runs, so a few dozen passes catch it every time.
+	for path, snapshot := range paths {
+		for pass := range 50 {
+			ev := snapshot()
 
-		got := make([]string, 0, len(ev.Connections))
-		for _, c := range ev.Connections {
-			got = append(got, c.PeerNodeName)
-		}
+			got := make([]string, 0, len(peers))
+			for _, c := range buildObserverConnectionStatus(&ev) {
+				got = append(got, c.PeerNodeName)
+			}
 
-		if !slices.Equal(got, want) {
-			t.Fatalf("frame %d: snapshot order = %v, want %v", frame, got, want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("%s pass %d: applied order = %v, want %v", path, pass, got, want)
+			}
 		}
 	}
 }
