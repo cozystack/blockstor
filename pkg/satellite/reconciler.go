@@ -3734,22 +3734,12 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 	for _, vol := range dr.GetVolumes() {
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
-		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
-
-		// A dirty activity log means the metadata is there and cannot be
-		// read until it is applied; see repairUncleanMetadata for how
-		// this replica's own crash is told apart from a superblock that
-		// is not its own.
-		unclean := errors.Is(probeErr, drbd.ErrMetadataUnclean)
-		if unclean {
-			hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol)
-		}
-
+		geometry, create, probeErr := r.metadataToCreate(ctx, dr, vol)
 		if probeErr != nil {
-			return errors.Wrapf(probeErr, "dump-md %s", target)
+			return probeErr
 		}
 
-		if hasMD {
+		if !create {
 			continue
 		}
 
@@ -3763,7 +3753,7 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		// resync.
 		metadataFreshlyCreated = true
 
-		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, r.createMDMaxPeers(ctx, target, vol, unclean))
+		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, geometry)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
 		}
@@ -3957,49 +3947,79 @@ func anySameGeneration(onDisk, known []string) bool {
 	return false
 }
 
-// createMDMaxPeers picks the peer-slot count for the metadata about to be
-// created on vol. unclean says the probe found a superblock under an
-// unapplied activity log, which the caller decided to initialise.
+// createMDGeometry picks the layout of the metadata about to be created on
+// vol. unclean says the probe found a superblock under an unapplied
+// activity log, which the caller decided to initialise.
 //
-// A volume restored from a snapshot carries the source's superblock, and
-// its data area was laid out for that superblock's peer slots: the
-// filesystem on it ends where the source's metadata begins. Metadata with
-// more slots is larger, takes room from the end of that filesystem, and
-// drbdmeta refuses it. That is every clone of a volume LINSTOR created,
-// which sizes metadata for 7 slots by default, against the 15 used here.
+// Metadata sits at the end of the lower disk and its size follows its peer
+// slots and activity log, so a disk that already holds a superblock has its
+// data laid out to end where that superblock begins. That is a clone of a
+// snapshot, and every replica adopted from LINSTOR, which sizes metadata
+// for 7 slots by default against the 15 used here. Larger metadata takes
+// room from the end of the data: drbdmeta refuses that for a filesystem it
+// knows, and for anything else, a partition table, a VM disk, a bare block
+// volume, --force answers its question and the end of the data is gone.
 //
-// LINSTOR restores the snapshot's peer slots onto the new resource
-// (RscDrbdLayerHelper.restoreRscData) and creates metadata, when it does,
-// with the resource's slots (DrbdLayer.createMetaData). Re-initialising
-// in the source's slot count is the same rule.
-//
-// Anything else gets the full count: a volume of its own was sized for it.
-// A superblock whose count cannot be read gets it too, and a disk that
-// cannot hold it is refused by drbdmeta with its reason in the error.
-func (r *Reconciler) createMDMaxPeers(ctx context.Context, target string, vol *intent.DesiredVolume, unclean bool) int {
-	full := drbd.MaxPeers - 1
-
-	if !unclean || vol.GetSourceSnapshot() == "" {
-		return full
+// So a superblock that is there is re-initialised in its own layout, with
+// no more slots than blockstor creates, whatever made it: a restore, or an
+// adopted replica with no GI recorded here. LINSTOR does the same: it keeps
+// the snapshot's slots and activity-log layout on the restored resource
+// (RscDrbdLayerHelper.restoreRscData) and creates metadata with them
+// (DrbdLayer.createMetaData). A superblock whose layout cannot be read is
+// an error, so the apply is retried rather than sized blind: only drbdmeta
+// saying there is no metadata at all lets a volume take the full layout.
+func (r *Reconciler) createMDGeometry(ctx context.Context, target string, unclean bool) (drbd.MetadataGeometry, error) {
+	if !unclean {
+		return drbd.DefaultGeometry(), nil
 	}
 
-	logger := log.FromContext(ctx).WithValues("volume", target, "sourceSnapshot", vol.GetSourceSnapshot())
-
-	peers, err := r.cfg.Adm.MetadataMaxPeers(ctx, target)
+	found, err := r.cfg.Adm.MetadataGeometry(ctx, target)
 	if err != nil {
-		logger.Info("cannot read the peer slots of the restored superblock; creating metadata with the full count",
-			"err", err.Error())
-
-		return full
+		return drbd.MetadataGeometry{}, errors.Wrapf(err,
+			"read the layout of the superblock on %s, which the metadata about to be created has to fit", target)
 	}
 
-	if peers >= full {
-		return full
+	geometry := found.Clamped()
+
+	log.FromContext(ctx).Info("re-initialising metadata in the layout of the superblock it replaces",
+		"volume", target, "maxPeers", geometry.MaxPeers, "superblockMaxPeers", found.MaxPeers,
+		"alStripes", geometry.ALStripes, "alStripeSize4k", geometry.ALStripeSize4k)
+
+	return geometry, nil
+}
+
+// metadataToCreate answers the metadata probe of one volume: whether it
+// needs create-md, and the layout to create it in.
+func (r *Reconciler) metadataToCreate(
+	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume,
+) (drbd.MetadataGeometry, bool, error) {
+	target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
+
+	hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
+
+	// A dirty activity log means the metadata is there and cannot be
+	// read until it is applied; see repairUncleanMetadata for how this
+	// replica's own crash is told apart from a superblock that is not
+	// its own.
+	unclean := errors.Is(probeErr, drbd.ErrMetadataUnclean)
+	if unclean {
+		hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol)
 	}
 
-	logger.Info("creating metadata for a restored volume with the peer slots of its source", "maxPeers", peers)
+	if probeErr != nil {
+		return drbd.MetadataGeometry{}, false, errors.Wrapf(probeErr, "dump-md %s", target)
+	}
 
-	return peers
+	if hasMD {
+		return drbd.MetadataGeometry{}, false, nil
+	}
+
+	geometry, err := r.createMDGeometry(ctx, target, unclean)
+	if err != nil {
+		return drbd.MetadataGeometry{}, false, err
+	}
+
+	return geometry, true, nil
 }
 
 // ensurePerVolumeMetadata stamps DRBD-9 metadata on every diskful
@@ -4061,25 +4081,19 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 	for _, vol := range dr.GetVolumes() {
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
-		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
-
-		// The same repair as in ensureMetadata: a volume just added to
-		// a live resource has no reported GI and is initialised, an
+		// The same probe as in ensureMetadata: a volume just added to a
+		// live resource has no reported GI and is initialised, an
 		// established one that crashed is repaired.
-		unclean := errors.Is(probeErr, drbd.ErrMetadataUnclean)
-		if unclean {
-			hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol)
-		}
-
+		geometry, create, probeErr := r.metadataToCreate(ctx, dr, vol)
 		if probeErr != nil {
-			return errors.Wrapf(probeErr, "dump-md %s", target)
+			return probeErr
 		}
 
-		if hasMD {
+		if !create {
 			continue
 		}
 
-		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, r.createMDMaxPeers(ctx, target, vol, unclean))
+		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, geometry)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
 		}
@@ -4244,8 +4258,8 @@ func isLateAddWinner(dr *intent.DesiredResource) bool {
 // would have passed to Adm.CreateMD directly. `selfRD` is the bare
 // parent RD name used by the safety-check above; for a single-volume
 // CreateMD call (`target=="<rd>"`) the two are equal.
-func (r *Reconciler) createMDWithCollisionRecovery(ctx context.Context, selfRD, target string, maxPeers int) error {
-	err := r.cfg.Adm.CreateMDWithMaxPeers(ctx, target, maxPeers)
+func (r *Reconciler) createMDWithCollisionRecovery(ctx context.Context, selfRD, target string, geometry drbd.MetadataGeometry) error {
+	err := r.cfg.Adm.CreateMDWithGeometry(ctx, target, geometry)
 	if err == nil {
 		return nil
 	}
@@ -4287,7 +4301,7 @@ func (r *Reconciler) createMDWithCollisionRecovery(ctx context.Context, selfRD, 
 		return err //nolint:wrapcheck // caller wraps with create-md context
 	}
 
-	return r.cfg.Adm.CreateMDWithMaxPeers(ctx, target, maxPeers) //nolint:wrapcheck // caller wraps with create-md context
+	return r.cfg.Adm.CreateMDWithGeometry(ctx, target, geometry) //nolint:wrapcheck // caller wraps with create-md context
 }
 
 // maybeStampMetadata is the create-md decision branch lifted out of

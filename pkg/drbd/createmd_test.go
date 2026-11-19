@@ -102,37 +102,90 @@ func TestCreateMDWithMaxPeersPassesTheCount(t *testing.T) {
 	}
 }
 
-// The peer-slot count is read with --force, so a superblock whose activity
-// log was never applied, the state every snapshot of an attached volume
-// carries, still answers.
-func TestMetadataMaxPeersReadsAnUncleanSuperblock(t *testing.T) {
-	fx := storage.NewFakeExec()
-	fx.Expect("drbdadm dump-md --force pvc-1/0", storage.FakeResponse{Stdout: []byte(
-		"# DRBD meta data dump\n" +
-			"This_is_an_unclean_meta_data_dump._Don't_trust_the_bitmap.\n" +
-			"# You should \"apply-al\" first, if you plan to restore this.\n\n" +
-			"version \"v09\";\n\nmax-peers 7;\n# md_size_sect 552\nnode-id 2;\n",
-	)})
+// geometryHeader is the header drbdmeta prints for a v09 superblock, here
+// one LINSTOR created for 7 peer slots whose activity log was never
+// applied, with the fields between the ones the layout needs cut out.
+const geometryHeader = "# DRBD meta data dump\n" +
+	"This_is_an_unclean_meta_data_dump._Don't_trust_the_bitmap.\n" +
+	"# You should \"apply-al\" first, if you plan to restore this.\n\n" +
+	"version \"v09\";\n\nmax-peers 7;\n# md_size_sect 520\nnode-id 2;\n" +
+	"current-uuid 0x9F00AA11BB22CC33;\nla-size-sect 2097152;\nbm-byte-per-bit 4096;\n" +
+	"la-peer-max-bio-size 1048576;\nal-stripes 1;\nal-stripe-size-4k 8;\n"
 
-	peers, err := drbd.NewAdm(fx).MetadataMaxPeers(t.Context(), "pvc-1/0")
-	if err != nil || peers != 7 {
-		t.Fatalf("MetadataMaxPeers = %d, %v; want 7", peers, err)
+// The layout is read with --force, so a superblock whose activity log was
+// never applied, the state every snapshot of an attached volume carries,
+// still answers.
+func TestMetadataGeometryReadsAnUncleanSuperblock(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md --force pvc-1/0", storage.FakeResponse{Stdout: []byte(geometryHeader)})
+
+	got, err := drbd.NewAdm(fx).MetadataGeometry(t.Context(), "pvc-1/0")
+	want := drbd.MetadataGeometry{MaxPeers: 7, ALStripes: 1, ALStripeSize4k: 8, NodeID: 2}
+
+	if err != nil || got != want {
+		t.Fatalf("MetadataGeometry = %+v, %v; want %+v", got, err, want)
 	}
 }
 
-func TestParseMetadataMaxPeersRefusesWhatItCannotRead(t *testing.T) {
+// LINSTOR lets a resource have up to 31 peer slots. Such a superblock is
+// read, not reported as unreadable, and clamped to the 15 blockstor
+// creates: smaller metadata fits where larger metadata was.
+func TestMetadataGeometryReadsMoreSlotsThanBlockstorCreates(t *testing.T) {
+	got, err := drbd.ParseMetadataGeometry([]byte(strings.Replace(geometryHeader, "max-peers 7;", "max-peers 31;", 1)))
+	if err != nil || got.MaxPeers != 31 {
+		t.Fatalf("ParseMetadataGeometry = %+v, %v; want 31 peer slots", got, err)
+	}
+
+	if clamped := got.Clamped(); clamped.MaxPeers != drbd.MaxPeers-1 || clamped.ALStripes != 1 {
+		t.Errorf("Clamped = %+v, want 15 peer slots and the layout kept", clamped)
+	}
+}
+
+// Metadata is sized over data with this layout, so every statement it is
+// made of has to be there and in range; a guess is an error.
+func TestParseMetadataGeometryRefusesWhatItCannotRead(t *testing.T) {
 	for name, dump := range map[string]string{
-		"empty":        "",
-		"v08":          "version \"v08\";\nuuid {\n    0x1; 0x0; 0x0; 0x0;\n    flags 0x1;\n}\n",
-		"not a number": "version \"v09\";\nmax-peers seven;\n",
-		"zero":         "version \"v09\";\nmax-peers 0;\n",
-		"out of range": "version \"v09\";\nmax-peers 31;\n",
+		"empty":           "",
+		"v08":             "version \"v08\";\nuuid {\n    0x1; 0x0; 0x0; 0x0;\n    flags 0x1;\n}\n",
+		"not a number":    strings.Replace(geometryHeader, "max-peers 7;", "max-peers seven;", 1),
+		"zero":            strings.Replace(geometryHeader, "max-peers 7;", "max-peers 0;", 1),
+		"out of range":    strings.Replace(geometryHeader, "max-peers 7;", "max-peers 32;", 1),
+		"no peer slots":   strings.Replace(geometryHeader, "max-peers 7;", "", 1),
+		"no al-stripes":   strings.Replace(geometryHeader, "al-stripes 1;", "", 1),
+		"no stripe size":  strings.Replace(geometryHeader, "al-stripe-size-4k 8;", "", 1),
+		"no node id":      strings.Replace(geometryHeader, "node-id 2;", "", 1),
+		"zero al-stripes": strings.Replace(geometryHeader, "al-stripes 1;", "al-stripes 0;", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
-			peers, err := drbd.ParseMetadataMaxPeers([]byte(dump))
-			if !errors.Is(err, drbd.ErrNoMaxPeers) {
-				t.Errorf("ParseMetadataMaxPeers = %d, %v; want ErrNoMaxPeers", peers, err)
+			got, err := drbd.ParseMetadataGeometry([]byte(dump))
+			if !errors.Is(err, drbd.ErrNoGeometry) {
+				t.Errorf("ParseMetadataGeometry = %+v, %v; want ErrNoGeometry", got, err)
 			}
 		})
+	}
+}
+
+// A superblock with another activity-log layout is re-created in it:
+// with the default one its metadata changes size and the data area under
+// it moves. The default layout is left to drbdmeta, so the command of
+// every other volume stays what it was.
+func TestCreateMDWithGeometryPassesTheActivityLogLayout(t *testing.T) {
+	fx := storage.NewFakeExec()
+	geometry := drbd.MetadataGeometry{MaxPeers: 7, ALStripes: 2, ALStripeSize4k: 16, NodeID: -1}
+
+	if err := drbd.NewAdm(fx).CreateMDWithGeometry(t.Context(), "pvc-1/0", geometry); err != nil {
+		t.Fatalf("CreateMDWithGeometry: %v", err)
+	}
+
+	if err := drbd.NewAdm(fx).CreateMDWithGeometry(t.Context(), "pvc-1/0", drbd.DefaultGeometry()); err != nil {
+		t.Fatalf("CreateMDWithGeometry: %v", err)
+	}
+
+	want := []string{
+		"drbdadm create-md --force --max-peers=7 --al-stripes=2 --al-stripe-size-kB=64 pvc-1/0",
+		createMD15,
+	}
+	if got := fx.CommandLines(); !slices.Equal(got, want) {
+		t.Errorf("calls = %q, want %q", got, want)
 	}
 }
