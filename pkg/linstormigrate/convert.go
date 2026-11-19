@@ -1796,13 +1796,13 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 	if layer, ok := c.drbdRD[row.ResourceName]; ok {
 		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, layer.TCPPort, dsp)
 
-		if layer.Secret != "" {
+		if layer.Secret != "" && c.carrySharedSecret(row, dsp) {
 			if def.Spec.ExtraProps == nil {
 				def.Spec.ExtraProps = map[string]string{}
 			}
 			// Carried so the satellite renders the same `net {
-			// shared-secret }` the source cluster's kernels already
-			// run — adoption then re-applies an
+			// cram-hmac-alg; shared-secret }` the source cluster's
+			// kernels already run — adoption then re-applies an
 			// identical config instead of re-keying the mesh.
 			def.Spec.ExtraProps[drbdSharedSecretProp] = layer.Secret
 		}
@@ -1815,6 +1815,78 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 			dsp, c.luksCount[row.ResourceName])
 	}
 }
+
+// carrySharedSecret says whether the definition's DRBD secret goes onto
+// the converted definition, which is whether LINSTOR put it in the .res.
+//
+// LINSTOR v1.33 writes `cram-hmac-alg sha1` and `shared-secret` into the
+// net section only for a replica whose DrbdOptions/auto-verify-alg
+// resolves, through the replica, definition, group, node and satellite
+// bags, to a value other than `windrbd`. Where it does not, the kernels
+// run with no peer authentication. blockstor renders the pair whenever
+// the secret is set, so carrying it there would switch authentication on
+// during adoption, one node at a time, and a connection re-established
+// between a node already adjusted and one not yet would fail the
+// handshake. The secret is left off and the report says how to turn
+// authentication on afterwards.
+//
+// A definition with no live replica has nothing to keep in step with, and
+// keeps its secret; one whose replicas disagree keeps it too, since some
+// of its kernels authenticate already, and is reported.
+func (c *converter) carrySharedSecret(row *ResourceDefinitionRow, dsp string) bool {
+	replicas := c.liveReplicas(row.ResourceName)
+
+	authenticated := 0
+
+	for _, replica := range replicas {
+		if c.linstorRendersAuth(row, replica.NodeName) {
+			authenticated++
+		}
+	}
+
+	switch {
+	case len(replicas) == 0, authenticated == len(replicas):
+		return true
+	case authenticated == 0:
+		c.warnf("resource definition %s: LINSTOR rendered no peer authentication for it (no %s resolves), so the DRBD shared secret is not carried and adoption leaves the connections as they are — set %s after the cutover to authenticate peers",
+			dsp, autoVerifyAlgProp, drbdSharedSecretProp)
+
+		return false
+	default:
+		c.warnf("resource definition %s: LINSTOR authenticated peers on %d of %d replicas (%s resolves on some only) — the shared secret is carried, so every replica authenticates after adoption",
+			dsp, authenticated, len(replicas), autoVerifyAlgProp)
+
+		return true
+	}
+}
+
+// linstorRendersAuth resolves DrbdOptions/auto-verify-alg for one replica
+// the way LINSTOR's satellite does and reports whether it then writes the
+// authentication pair. See carrySharedSecret.
+func (c *converter) linstorRendersAuth(row *ResourceDefinitionRow, node string) bool {
+	for _, bag := range []map[string]string{
+		c.props.Resource(node, row.ResourceName),
+		c.props.ResourceDefinition(row.ResourceName),
+		c.resourceGroupProps(row.ResourceGroupName),
+		c.props.Node(node),
+		c.props.Satellite,
+	} {
+		if value, ok := bag[autoVerifyAlgProp]; ok {
+			return !strings.EqualFold(value, autoVerifyAlgWinDRBD)
+		}
+	}
+
+	return false
+}
+
+const (
+	// autoVerifyAlgProp is the verify algorithm LINSTOR's controller
+	// picks for a definition from what every diskful node supports.
+	autoVerifyAlgProp = drbd.PropPrefix + drbd.AutoVerifyAlgKey
+	// autoVerifyAlgWinDRBD is the value LINSTOR reads as "a Windows peer
+	// is involved", which also turns its peer authentication off.
+	autoVerifyAlgWinDRBD = "windrbd"
+)
 
 // rdHasLuks reports whether any live replica of the RD carries a LUKS
 // layer volume (an encrypted passphrase row).

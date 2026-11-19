@@ -251,6 +251,13 @@
 "prop_value": "00000000-1111-2222-3333-444444444444",
 "props_instance": "/STLT"
 }
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/auto-verify-alg",
+"prop_value": "crc32c",
+"props_instance": "/RSC_DFNS/PVC-VOL3"
+}
 }
 ]
 }
