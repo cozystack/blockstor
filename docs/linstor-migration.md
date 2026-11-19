@@ -85,7 +85,8 @@ Peer authentication is carried as LINSTOR ran it. LINSTOR 1.33 writes `cram-hmac
 8. **Capture the live DRBD configuration** on every satellite, to compare against after adoption. blockstor applies the `.res` it renders with `drbdadm adjust` as soon as a resource is adopted, and does not compare it with the running kernel first, so this is the record that shows whether adoption changed anything:
 
    ```bash
-   for pod in $(kubectl -n cozy-linstor get pods -l app.kubernetes.io/component=linstor-satellite                   -o jsonpath='{.items[*].metadata.name}'); do
+   for pod in $(kubectl -n cozy-linstor get pods -l app.kubernetes.io/component=linstor-satellite \
+                  -o jsonpath='{.items[*].metadata.name}'); do
      node=$(kubectl -n cozy-linstor get pod "$pod" -o jsonpath='{.spec.nodeName}')
      kubectl -n cozy-linstor exec "$pod" -- drbdsetup show > "drbd-before-$node.txt"
    done
