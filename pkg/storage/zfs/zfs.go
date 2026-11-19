@@ -373,14 +373,7 @@ func (p *Provider) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.
 
 	srcDS := argv[len(argv)-1]
 
-	// G204 is a false positive here: SendSnapshotArgs is a closed-form
-	// constructor over an internal `storage.Snapshot` (no user-supplied
-	// strings reach argv), and the previous inline call had the same
-	// shape — extracting it into a helper just makes the test seam
-	// explicit. The original `exec.CommandContext(ctx, "zfs", "send",
-	// srcDS)` form did not trip gosec because the third arg was a plain
-	// string literal-concat; the variadic spread now flags it.
-	cmd := exec.CommandContext(ctx, "zfs", argv...) //nolint:gosec // G204: argv built from internal Snapshot struct
+	cmd := exec.CommandContext(ctx, "zfs", argv...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
