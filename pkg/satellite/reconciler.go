@@ -941,8 +941,10 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		// "No valid meta data found". `.owned` (Bug 432) is the
 		// sweeper's ownership marker — must be removed AFTER the
 		// kernel slot is gone so a concurrent sweeper tick sees a
-		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned"} {
+		// clean post-state (kernel + marker both absent). A
+		// candidate .res a crash left between write and rename goes
+		// too: nothing reads it, but nothing else would remove it.
+		for _, suffix := range []string{".res", ResFileCandidateSuffix, ".md-created", ".mkfs.done", ".owned"} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{
@@ -2300,11 +2302,14 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 	return r.installResFile(ctx, resPath, body)
 }
 
-// resFileCandidateSuffix names the file a new .res body is checked in
+// ResFileCandidateSuffix names the file a new .res body is checked in
 // before it replaces the live one. It must not end in .res: drbd.conf
 // includes drbd.d/*.res, and a candidate that matched would be parsed as
 // a second definition of the resource by every drbdadm call on the node.
-const resFileCandidateSuffix = ".res.tmp"
+// A candidate outlives its render only when the satellite dies between
+// the write and the rename, so the resource's delete and the satellite's
+// startup both remove it.
+const ResFileCandidateSuffix = ".res.tmp"
 
 // installResFile puts body at resPath only once drbdadm accepts it.
 //
@@ -2317,7 +2322,7 @@ const resFileCandidateSuffix = ".res.tmp"
 // and every other resource, as it was. The refusal is this resource's
 // error to report.
 func (r *Reconciler) installResFile(ctx context.Context, resPath, body string) error {
-	candidate := strings.TrimSuffix(resPath, ".res") + resFileCandidateSuffix
+	candidate := strings.TrimSuffix(resPath, ".res") + ResFileCandidateSuffix
 
 	err := os.WriteFile(candidate, []byte(body), resFilePerm)
 	if err != nil {

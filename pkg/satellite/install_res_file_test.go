@@ -28,6 +28,7 @@ import (
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -188,5 +189,33 @@ func TestADiskOptionDrbdUtilsRejectsIsLeftOutOfTheRes(t *testing.T) {
 
 	if len(volumeOptions) != 3 {
 		t.Errorf("the intent's volume options were edited in place: %v", volumeOptions)
+	}
+}
+
+// A candidate a crash left between write and rename is nothing drbdadm
+// reads, but nothing else removes it either: deleting the resource takes
+// it with the rest of the resource's state files.
+func TestDeleteResourceRemovesALeftoverCandidateRes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	rec := NewReconciler(ReconcilerConfig{StateDir: dir, NodeName: "n1"})
+
+	for _, name := range []string{"pvc-gone.res", "pvc-gone" + ResFileCandidateSuffix} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), resFilePerm); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resp, err := rec.DeleteResource(context.Background(), &intent.DeleteResourceRequest{Name: "pvc-gone"})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteResource: %v, %+v", err, resp)
+	}
+
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "pvc-gone.") {
+			t.Errorf("%s outlived the resource's delete", e.Name())
+		}
 	}
 }
