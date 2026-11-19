@@ -136,6 +136,12 @@ func (idx *PropsIndex) SnapshotDefinition(rd, snap string) map[string]string {
 	return idx.get("SNAP_DFNS", rd, snap)
 }
 
+// Snapshot returns the /SNAPS/<node>/<rd>/<snap> props, one node's
+// snapshot.
+func (idx *PropsIndex) Snapshot(node, rd, snap string) map[string]string {
+	return idx.get("SNAPS", node, rd, snap)
+}
+
 // SnapshotRDFrozen returns the /SNAP_DFNS_RSC_DFN/<rd>/<snap> props —
 // the parent RD's property bag frozen at snapshot time.
 func (idx *PropsIndex) SnapshotRDFrozen(rd, snap string) map[string]string {
