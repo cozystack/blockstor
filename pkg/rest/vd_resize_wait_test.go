@@ -86,7 +86,9 @@ func seedGrow(t *testing.T, applied map[string]int64) store.Store {
 		t.Fatalf("seed unreported replica: %v", err)
 	}
 
-	nodes := []string{"diskless", "unreported"}
+	nodes := make([]string, 0, len(applied)+2)
+	nodes = append(nodes, "diskless", "unreported")
+
 	for node := range applied {
 		nodes = append(nodes, node)
 	}
@@ -434,5 +436,66 @@ func TestVDGrowEndsWithSatelliteError(t *testing.T) {
 
 	if !found {
 		t.Fatalf("no error entry carrying the satellite's failure: %+v", rcs)
+	}
+}
+
+// TestVDGrowSkipsReplicaNotOnline: only a satellite the heartbeat
+// reports ONLINE is waited for. An evicted node, one in any other state
+// and one that cannot be read are reported as not connected, as LINSTOR
+// does, instead of holding the resize until the caller gives up.
+func TestVDGrowSkipsReplicaNotOnline(t *testing.T) {
+	st := seedGrow(t, map[string]int64{
+		"a": growOldKib, "evicted": growOldKib, "connecting": growOldKib, "unknown": growOldKib, "missing": growOldKib,
+	})
+	ctx := t.Context()
+
+	err := st.Nodes().SetConnectionStatus(ctx, "connecting", apiv1.NodeTypeConnecting)
+	if err != nil {
+		t.Fatalf("mark node connecting: %v", err)
+	}
+
+	err = st.Nodes().SetConnectionStatus(ctx, "unknown", "")
+	if err != nil {
+		t.Fatalf("clear node status: %v", err)
+	}
+
+	evicted, err := st.Nodes().Get(ctx, "evicted")
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	evicted.Flags = []string{apiv1.NodeFlagEvicted}
+
+	err = st.Nodes().Update(ctx, &evicted)
+	if err != nil {
+		t.Fatalf("evict node: %v", err)
+	}
+
+	err = st.Nodes().Delete(ctx, "missing")
+	if err != nil {
+		t.Fatalf("drop node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	done := putGrow(t, base, growNewKib)
+
+	setApplied(t, st, "a", growNewKib)
+
+	rcs := expectAnswered(t, done)
+
+	warned := map[string]bool{}
+
+	for _, rc := range rcs {
+		if rc.RetCode == warnNotConnected {
+			warned[rc.ObjRefs[objRefNode]] = true
+		}
+	}
+
+	for _, node := range []string{"evicted", "connecting", "unknown", "missing"} {
+		if !warned[node] {
+			t.Errorf("no WARN_NOT_CONNECTED entry for %s: %+v", node, rcs)
+		}
 	}
 }

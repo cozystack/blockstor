@@ -25,9 +25,11 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // resizeWaitPollInterval is how often a resize request re-reads the
@@ -87,6 +89,25 @@ func awaitsResize(rsc *apiv1.Resource, vn int32) (int64, bool) {
 	return 0, false
 }
 
+// isSatelliteConnected reports whether a resize should wait for the
+// satellite on nodeName: only one the heartbeat reports ONLINE, on a node
+// that is not evicted or lost. Any other state, an unknown one or a node
+// that cannot be read included, is one LINSTOR would report as not
+// connected, and waiting for it would hold the resize until the caller
+// gives up.
+func isSatelliteConnected(ctx context.Context, nodes store.NodeStore, nodeName string) bool {
+	node, err := nodes.Get(ctx, nodeName)
+	if err != nil {
+		return false
+	}
+
+	if slices.Contains(node.Flags, apiv1.NodeFlagEvicted) || slices.Contains(node.Flags, apiv1.NodeFlagLost) {
+		return false
+	}
+
+	return strings.EqualFold(node.ConnectionStatus, apiv1.NodeTypeOnline)
+}
+
 // passFailedAt returns the error of the replica's last apply pass when
 // that pass failed while applying volume vn at targetKib or above, the
 // size this grow waits for.
@@ -116,7 +137,7 @@ func (s *Server) classifyResizeReplicas(ctx context.Context, rd string, vn int32
 			continue
 		}
 
-		if !isNodeOnline(ctx, s.Store.Nodes(), rsc.NodeName) {
+		if !isSatelliteConnected(ctx, s.Store.Nodes(), rsc.NodeName) {
 			out.offline = append(out.offline, rsc.NodeName)
 
 			continue
