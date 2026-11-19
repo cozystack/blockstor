@@ -233,6 +233,14 @@ const peerAllocationRequeue = 2 * time.Second
 //     tests poll at 1-2 s and budget ~30 s per assertion).
 const activeDRBDRequeue = 10 * time.Second
 
+// lowPriority is the queue priority of the periodic re-check, the one
+// controller-runtime gives events from the initial list.
+func lowPriority() *int {
+	priority := handler.LowPriority
+
+	return &priority
+}
+
 // resolveDeleteStoragePool picks the pool name the
 // satellite's DeleteVolume should route through. Phase 10.3
 // typed `Spec.StoragePool` wins; legacy `Props["StorPoolName"]`
@@ -612,8 +620,15 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// STORAGE-only RDs have no kernel-state to drift against, so
 	// keeping them quiet preserves the predicate's no-op-on-idle
 	// property.
+	//
+	// The re-check runs at low priority. With one worker every
+	// replica's re-check otherwise competes first-come with new and
+	// changed Resources, and on a node holding a hundred replicas a
+	// new one waits minutes behind re-checks that find nothing to do.
+	// LINSTOR's satellite re-dispatches only resources with a pending
+	// change outside a full sync (DeviceManagerImpl.devMgrLoop).
 	if rdNeedsDRBD(&rd) {
-		return ctrl.Result{RequeueAfter: activeDRBDRequeue}, nil
+		return ctrl.Result{RequeueAfter: activeDRBDRequeue, Priority: lowPriority()}, nil
 	}
 
 	return ctrl.Result{}, nil

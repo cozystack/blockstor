@@ -29,6 +29,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -598,6 +599,12 @@ func TestRunApplyReturnsRequeueAfterForActiveDrbd(t *testing.T) {
 	if result.RequeueAfter != activeDRBDRequeue {
 		t.Errorf("RequeueAfter: got %v, want %v (Phase 11.7 safety net)",
 			result.RequeueAfter, activeDRBDRequeue)
+	}
+
+	// The re-check must not compete with new and changed Resources.
+	if result.Priority == nil || *result.Priority != handler.LowPriority {
+		t.Errorf("Priority: got %v, want %d (the periodic re-check yields to real events)",
+			result.Priority, handler.LowPriority)
 	}
 }
 
