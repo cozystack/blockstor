@@ -46,6 +46,17 @@ type fakeListerProvider struct {
 	deleted []storage.Volume
 	listErr error
 	delErr  error
+
+	// marked names the resources whose volumes carry blockstor's
+	// ownership marker; every other volume is unmarked, as on disk.
+	marked map[string]bool
+	// snapshots maps a resource to the snapshots its volume holds.
+	snapshots map[string][]string
+	// inspectErr fails InspectVolume.
+	inspectErr error
+	// deleteVolumeCalls counts DeleteVolume, which the sweeper must
+	// never use: only ReapVolume refuses to take snapshots along.
+	deleteVolumeCalls int
 }
 
 func (f *fakeListerProvider) Kind() string {
@@ -60,7 +71,33 @@ func (f *fakeListerProvider) CreateVolume(_ context.Context, _ storage.Volume) e
 	return nil
 }
 
-func (f *fakeListerProvider) DeleteVolume(_ context.Context, vol storage.Volume) error {
+func (f *fakeListerProvider) DeleteVolume(_ context.Context, _ storage.Volume) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.deleteVolumeCalls++
+
+	return nil
+}
+
+func (f *fakeListerProvider) InspectVolume(_ context.Context, vol storage.Volume) (storage.VolumeOwnership, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.inspectErr != nil {
+		return storage.VolumeOwnership{}, f.inspectErr
+	}
+
+	return storage.VolumeOwnership{
+		Owned:     f.marked[vol.ResourceName],
+		Snapshots: f.snapshots[vol.ResourceName],
+	}, nil
+}
+
+// ReapVolume records the reap. It deliberately does not re-check the
+// marker or the snapshots, so the sweeper's own decision is what the
+// tests observe.
+func (f *fakeListerProvider) ReapVolume(_ context.Context, vol storage.Volume) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -184,6 +221,7 @@ func TestStorageSweeperLeavesOwnedVolumeAlone(t *testing.T) {
 		volumes: []storage.VolumeRef{
 			{ResourceName: "pvc-aaa", VolumeNumber: 0},
 		},
+		marked: map[string]bool{"pvc-aaa": true},
 	}
 
 	sweeper := storageSweeperFixture(t, "n1", provider,
@@ -211,6 +249,7 @@ func TestStorageSweeperReapsOrphan(t *testing.T) {
 		volumes: []storage.VolumeRef{
 			{ResourceName: "pvc-orphan", VolumeNumber: 0},
 		},
+		marked: map[string]bool{"pvc-orphan": true},
 	}
 
 	sweeper := storageSweeperFixture(t, "n1", provider, nil, nil)
@@ -245,6 +284,7 @@ func TestStorageSweeperLeavesForeignVolumesAlone(t *testing.T) {
 		volumes: []storage.VolumeRef{
 			{ResourceName: "operator-data", VolumeNumber: 0},
 		},
+		marked: map[string]bool{"operator-data": true},
 	}
 
 	sweeper := storageSweeperFixture(t, "n1", provider, nil, nil)
@@ -289,6 +329,7 @@ func TestStorageSweeperOnlyConsidersLocalResources(t *testing.T) {
 		volumes: []storage.VolumeRef{
 			{ResourceName: "pvc-xxx", VolumeNumber: 0},
 		},
+		marked: map[string]bool{"pvc-xxx": true},
 	}
 
 	sweeper := storageSweeperFixture(t, "n1", provider,
@@ -313,14 +354,17 @@ func TestStorageSweeperRespectsRateLimit(t *testing.T) {
 	t.Parallel()
 
 	vols := make([]storage.VolumeRef, 0, 10)
+	marked := map[string]bool{}
+
 	for i := range 10 {
 		vols = append(vols, storage.VolumeRef{
 			ResourceName: "pvc-churn-" + strItoa(i),
 			VolumeNumber: 0,
 		})
+		marked["pvc-churn-"+strItoa(i)] = true
 	}
 
-	provider := &fakeListerProvider{volumes: vols}
+	provider := &fakeListerProvider{volumes: vols, marked: marked}
 
 	sweeper := storageSweeperFixture(t, "n1", provider, nil, nil)
 	sweeper.MaxDeletePerCycle = 2
@@ -362,6 +406,7 @@ func TestStorageSweeperSkipAnnotation(t *testing.T) {
 		volumes: []storage.VolumeRef{
 			{ResourceName: "pvc-orphan", VolumeNumber: 0},
 		},
+		marked: map[string]bool{"pvc-orphan": true},
 	}
 
 	sweeper := &StorageOrphanSweeperRunnable{
@@ -417,6 +462,7 @@ func TestStorageSweeperMidDeleteRaceProtection(t *testing.T) {
 		volumes: []storage.VolumeRef{
 			{ResourceName: "pvc-mid", VolumeNumber: 0},
 		},
+		marked: map[string]bool{"pvc-mid": true},
 	}
 
 	sweeper := storageSweeperFixture(t, "n1", provider,
@@ -453,6 +499,7 @@ func TestStorageSweeperHandlesMissingRD(t *testing.T) {
 		volumes: []storage.VolumeRef{
 			{ResourceName: "pvc-noparent", VolumeNumber: 0},
 		},
+		marked: map[string]bool{"pvc-noparent": true},
 	}
 
 	sweeper := storageSweeperFixture(t, "n1", provider, nil,
