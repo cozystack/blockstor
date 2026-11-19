@@ -20,6 +20,7 @@ package controllers
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"testing"
 
@@ -221,6 +222,50 @@ func TestMergeConnectionsIsolatesResources(t *testing.T) {
 	gotPeers := peerSet(ev.Connections)
 	if !sameSet(gotPeers, []string{"worker-3"}) {
 		t.Errorf("pvc-B leaked pvc-A's peers: got %v, want [worker-3]", gotPeers)
+	}
+}
+
+// TestMergeConnectionsSnapshotOrderIsStable pins the snapshot order:
+// SSA stores the applied list in the order sent, so a snapshot in map
+// iteration order reorders Status.Connections on frames that changed
+// nothing, and every sibling satellite is woken by the resulting write.
+// The same peer set must always come out in the same order.
+func TestMergeConnectionsSnapshotOrderIsStable(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	peers := []string{"worker-5", "worker-1", "worker-4", "worker-2", "worker-3", "worker-6"}
+	for _, peer := range peers {
+		o.mergeConnections(&observation{
+			ResourceName: "pvc-1",
+			Connections: []connectionObservation{
+				{PeerNodeName: peer, Connected: true, Message: "Connected"},
+			},
+		})
+	}
+
+	want := slices.Clone(peers)
+	slices.Sort(want)
+
+	// Map iteration order is randomised per range statement; with six
+	// peers a map-ordered snapshot matches the sorted one by chance in
+	// 1 of 720 runs, so a few dozen frames catch it every time.
+	for frame := range 50 {
+		ev := &observation{
+			ResourceName: "pvc-1",
+			Connections: []connectionObservation{
+				{PeerNodeName: "worker-3", Connected: true, Message: "Connected"},
+			},
+		}
+		o.mergeConnections(ev)
+
+		got := make([]string, 0, len(ev.Connections))
+		for _, c := range ev.Connections {
+			got = append(got, c.PeerNodeName)
+		}
+
+		if !slices.Equal(got, want) {
+			t.Fatalf("frame %d: snapshot order = %v, want %v", frame, got, want)
+		}
 	}
 }
 
