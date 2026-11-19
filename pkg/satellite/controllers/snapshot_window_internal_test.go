@@ -393,8 +393,6 @@ func (*fakeProvider) RestoreVolumeFromSnapshot(context.Context, storage.Volume, 
 	return nil
 }
 
-func (*fakeProvider) ListVolumeNames(context.Context) ([]storage.VolumeRef, error) { return nil, nil }
-
 func (p *fakeProvider) deleteCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
