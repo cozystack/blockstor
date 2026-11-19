@@ -446,3 +446,44 @@ func TestResFileOwnershipRejectsNonPlainNames(t *testing.T) {
 		}
 	}
 }
+
+// TestSweepOrphanResFilesLeavesSymlinkAlone: the .res GC downs a
+// loaded slot before removing its file. A `.res` symlink in StateDir
+// is not one blockstor wrote, so neither the slot nor the link is the
+// GC's to touch.
+func TestSweepOrphanResFilesLeavesSymlinkAlone(t *testing.T) {
+	t.Parallel()
+
+	sweeper, fx := sweeperFixture(t, "n1", "", nil)
+
+	target := filepath.Join(t.TempDir(), "pvc-linked.res")
+
+	err := os.WriteFile(target, []byte("resource pvc-linked { }\n"), 0o600)
+	if err != nil {
+		t.Fatalf("seed link target: %v", err)
+	}
+
+	link := filepath.Join(sweeper.StateDir, "pvc-linked.res")
+
+	err = os.Symlink(target, link)
+	if err != nil {
+		t.Fatalf("symlink .res: %v", err)
+	}
+
+	sweeper.RDGrace = -1
+	sweeper.isLoadedFn = func(_ context.Context, _ string) (bool, error) { return true, nil }
+
+	err = sweeper.sweepOnce(t.Context(), logr.Discard())
+	if err != nil {
+		t.Fatalf("sweepOnce: %v", err)
+	}
+
+	if got := downCalls(fx); len(got) != 0 {
+		t.Errorf(".res GC downed the slot behind a symlinked .res: %v", got)
+	}
+
+	_, statErr := os.Lstat(link)
+	if statErr != nil {
+		t.Errorf(".res GC removed a symlinked .res: lstat err %v", statErr)
+	}
+}
