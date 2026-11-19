@@ -148,19 +148,10 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
 	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
 
-	// Bug 137: diskless / TIE_BREAKER replicas never get a
-	// per-volume Status row written by the satellite (no local
-	// backing device, no usage to report). The CRD-to-wire
-	// projection therefore returns Volumes=nil, the JSON encoder
-	// drops the `volumes` key under `omitempty`, and python-linstor
-	// crashes on `rsc._rest_data['volumes'][0]` with AttributeError
-	// because the key is `None`. Synthesise one placeholder per
-	// parent-RD VolumeDefinition so the wire shape mirrors a
-	// diskful replica — same volume_number, same layer chain — but
-	// with no satellite-observed allocation. Non-diskless replicas
-	// with an empty Volumes slice still get a `[]` (the absent-key
-	// regression strikes them too: e.g. a freshly-created diskful
-	// replica before the satellite has reported usage).
+	// Bug 137: a replica the satellite has not reported on (a
+	// diskless witness, or a diskful replica not built yet) would
+	// otherwise reach the wire without a `volumes` key and crash
+	// python-linstor. ensureVolumesForView documents what fills it.
 	annotated = ensureVolumesForView(annotated, rsc, vdSizes)
 
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
