@@ -4,7 +4,14 @@ kind: ControllerConfig
 metadata:
   name: default
 spec:
+  drbdOptions:
+    net: {}
   extraProps:
+    DrbdOptions/Net/connect-int: "15"
+    DrbdOptions/Net/ping-int: "12"
+    DrbdOptions/Net/ping-timeout: "10"
+    DrbdOptions/Net/timeout: "90"
+    DrbdOptions/Net/verify-alg: crc32c
     DrbdOptions/auto-add-quorum-tiebreaker: "True"
     DrbdOptions/auto-verify-algo-allowed-list: crct10dif;crc32c;sha256
 ---

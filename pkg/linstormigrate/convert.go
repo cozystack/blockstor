@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -297,20 +298,54 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 	return res, nil
 }
 
-// convertControllerConfig distills the LINSTOR /CTRL property bag into
-// the blockstor ControllerConfig singleton. Only `DrbdOptions/*` keys
-// carry over — they set cluster-wide DRBD behaviour (auto tiebreaker,
-// verify-alg allow-list, ...) exactly like `linstor controller
-// set-property` would through blockstor's REST. Everything else under
-// /CTRL is LINSTOR runtime plumbing (NetCom connector ports, TLS
-// keystores, Cluster/LocalID, the master-passphrase crypto material)
-// that must NOT leak into blockstor.
+// convertControllerConfig distills the LINSTOR /CTRL and /STLT property
+// bags into the blockstor ControllerConfig singleton. Only `DrbdOptions/*`
+// keys carry over; everything else in either bag is LINSTOR runtime
+// plumbing (NetCom connector ports, TLS keystores, Cluster/LocalID, the
+// master-passphrase crypto material) and must NOT leak into blockstor.
+//
+// Both bags are what an operator sets with `linstor controller
+// set-property`: LINSTOR keeps the keys its controller acts on (the auto
+// tiebreaker, the verify-alg allow-list, ...) in /CTRL and files every
+// other key, the `.res` knobs among them, under /STLT, which is the bag
+// the satellites render from. It sits below resource, definition, group
+// and node in their lookup, which is the rung ControllerConfig holds in
+// blockstor's (effectiveprops.Resolve), so the values keep their
+// precedence. Node is the one rung blockstor does not resolve.
+//
+// A key present in both bags with different values keeps the one LINSTOR
+// itself acted on: the /STLT value for a key with a section (it is what
+// the .res carried), the /CTRL value for a section-less controller key.
+// The other one is reported.
 func (c *converter) convertControllerConfig() *crdv1alpha1.ControllerConfig {
 	drbdProps := map[string]string{}
 
 	for key, val := range c.props.Controller {
-		if strings.HasPrefix(key, "DrbdOptions/") {
+		if strings.HasPrefix(key, drbd.PropPrefix) {
 			drbdProps[key] = val
+		}
+	}
+
+	for _, key := range slices.Sorted(maps.Keys(c.props.Satellite)) {
+		if !strings.HasPrefix(key, drbd.PropPrefix) {
+			continue
+		}
+
+		val := c.props.Satellite[key]
+
+		ctrlVal, both := drbdProps[key]
+
+		switch {
+		case !both:
+			drbdProps[key] = val
+		case ctrlVal == val:
+		case drbd.SectionLess(key):
+			c.warnf("controller property %s: %s and %s disagree (%q vs %q) — kept the %s value, which LINSTOR's controller acts on",
+				key, PropsInstanceController, PropsInstanceSatellite, ctrlVal, val, PropsInstanceController)
+		default:
+			drbdProps[key] = val
+			c.warnf("controller property %s: %s and %s disagree (%q vs %q) — kept the %s value, which LINSTOR's satellites rendered",
+				key, PropsInstanceController, PropsInstanceSatellite, ctrlVal, val, PropsInstanceSatellite)
 		}
 	}
 
@@ -766,6 +801,7 @@ func (c *converter) zfscreateOptions(node, pool string) string {
 	for _, bag := range []map[string]string{
 		c.props.StorPool(node, pool),
 		c.props.Node(node),
+		c.props.Satellite,
 		c.props.Controller,
 	} {
 		if value, ok := bag[storDriverZfscreateOptions]; ok {
@@ -1757,18 +1793,18 @@ func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
 }
 
 func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row *ResourceDefinitionRow, dsp string) {
-	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
-		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, drbd.TCPPort, dsp)
+	if layer, ok := c.drbdRD[row.ResourceName]; ok {
+		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, layer.TCPPort, dsp)
 
-		if drbd.Secret != "" {
+		if layer.Secret != "" {
 			if def.Spec.ExtraProps == nil {
 				def.Spec.ExtraProps = map[string]string{}
 			}
 			// Carried so the satellite renders the same `net {
 			// shared-secret }` the source cluster's kernels already
-			// run — adoption then re-applies an identical config
-			// instead of re-keying the mesh.
-			def.Spec.ExtraProps[drbdSharedSecretProp] = drbd.Secret
+			// run — adoption then re-applies an
+			// identical config instead of re-keying the mesh.
+			def.Spec.ExtraProps[drbdSharedSecretProp] = layer.Secret
 		}
 	}
 
@@ -1965,13 +2001,13 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 		resource.Spec.StoragePool = sp
 	}
 
-	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
+	if layer, ok := c.drbdRD[row.ResourceName]; ok {
 		// blockstor's per-replica allocator honours a preset value
 		// verbatim. The live port map (when supplied) wins over the
 		// dump's often-empty tcp_port so the adopted mesh keeps its
 		// current endpoint, and a per-replica entry gives each replica
 		// its own node's port.
-		resource.Spec.DRBDPort = c.resolveReplicaDRBDPort(row, drbd.TCPPort, rdDsp, nodeDsp)
+		resource.Spec.DRBDPort = c.resolveReplicaDRBDPort(row, layer.TCPPort, rdDsp, nodeDsp)
 	}
 
 	return resource

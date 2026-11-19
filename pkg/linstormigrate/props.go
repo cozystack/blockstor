@@ -29,6 +29,7 @@ import (
 // LINSTOR keys each property row by an instance path; the shapes are:
 //
 //	/CTRL                                        controller
+//	/STLT                                        satellite (cluster-wide)
 //	/NODES/<node>                                node
 //	/STOR_POOLS/<node>/<pool>                    storage pool
 //	/RSC_GRPS/<rg>                               resource group
@@ -49,6 +50,11 @@ type PropsIndex struct {
 	// Controller is the /CTRL property bag.
 	Controller map[string]string
 
+	// Satellite is the /STLT property bag: the cluster-wide props the
+	// LINSTOR controller ships to every satellite. See
+	// PropsInstanceSatellite.
+	Satellite map[string]string
+
 	byInstance map[string]map[string]string
 }
 
@@ -58,6 +64,15 @@ type PropsIndex struct {
 // every pool that does not override it.
 const PropsInstanceController = "/CTRL"
 
+// PropsInstanceSatellite is the props_instance of the cluster-wide
+// satellite bag. `linstor controller set-property` files every key it
+// has no controller-side handling for here, DrbdOptions/Net/* and the
+// other .res knobs among them, and piraeus-operator's
+// LinstorCluster.spec.properties goes through the same call. The
+// satellites render .res files from this bag, not from /CTRL, as the
+// lowest rung below resource, definition, group and node.
+const PropsInstanceSatellite = "/STLT"
+
 // NewPropsIndex builds the lookup from the raw table rows. A row that would
 // carry a LUKS passphrase in a property is left out: blockstor never reads
 // one, and the generated YAML is applied with kubectl, past the REST guard,
@@ -65,6 +80,7 @@ const PropsInstanceController = "/CTRL"
 func NewPropsIndex(rows []PropsContainerRow) *PropsIndex {
 	idx := &PropsIndex{
 		Controller: map[string]string{},
+		Satellite:  map[string]string{},
 		byInstance: map[string]map[string]string{},
 	}
 
@@ -73,8 +89,13 @@ func NewPropsIndex(rows []PropsContainerRow) *PropsIndex {
 			continue
 		}
 
-		if row.PropsInstance == PropsInstanceController {
+		switch row.PropsInstance {
+		case PropsInstanceController:
 			idx.Controller[row.PropKey] = row.PropValue
+
+			continue
+		case PropsInstanceSatellite:
+			idx.Satellite[row.PropKey] = row.PropValue
 
 			continue
 		}
