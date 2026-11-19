@@ -744,12 +744,16 @@ func (r *Reconciler) ResumeMinors(ctx context.Context, minors []int32) error {
 // snapshot (SuspendManager.manageSuspendIo, DeviceHandlerImpl
 // processResources), which leaves the snapshot crash-consistent. The
 // per-device flush here adds the page cache of a filesystem mounted on
-// the device and nothing more.
+// the device, and only when the Primary is one of the snapshot's nodes:
+// those are the diskful nodes, as in LINSTOR, so a diskless Primary
+// gets no flush and its snapshot stays crash-consistent.
 //
 // With DRBD the flush targets /dev/drbd<minor> and only on the Primary:
 // BLKFLSBUF on a device that carries a mounted filesystem syncs that
 // filesystem, and a Secondary has no writer above it. Without DRBD the
 // storage device is the top of the stack and is flushed instead.
+// BLKFLSBUF also invalidates the device's clean page cache, so a busy
+// Primary rereads what it had cached; that costs time, not data.
 // Failures are logged and ignored: the snapshot is then crash-consistent,
 // which is what LINSTOR gives in every case.
 func (r *Reconciler) FlushBeforeSuspend(ctx context.Context, resName string, state drbd.SuspendState, volumeNumbers []int32) {
