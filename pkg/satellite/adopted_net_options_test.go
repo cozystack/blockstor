@@ -53,7 +53,7 @@ func TestAnAdoptedResourceKeepsItsNetOptions(t *testing.T) {
 		},
 	}
 
-	body, err := buildResFile(dr, "node-1", "10.0.0.1", map[int32]string{0: "/dev/lvm1/pvc-adopted_00000"}, nil)
+	body, err := buildResFile(dr, "node-1", "10.0.0.1", map[int32]string{0: "/dev/lvm1/pvc-adopted_00000"}, nil, nil)
 	if err != nil {
 		t.Fatalf("buildResFile: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestASecretWithoutDigestStaysUnauthenticated(t *testing.T) {
 		},
 	}
 
-	body, err := buildResFile(dr, "node-1", "10.0.0.1", map[int32]string{0: "/dev/lvm1/pvc-plain_00000"}, nil)
+	body, err := buildResFile(dr, "node-1", "10.0.0.1", map[int32]string{0: "/dev/lvm1/pvc-plain_00000"}, nil, nil)
 	if err != nil {
 		t.Fatalf("buildResFile: %v", err)
 	}
