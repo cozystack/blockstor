@@ -1346,7 +1346,7 @@ func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blocksto
 func peerExpectationFor(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) satellite.PeerExpectation {
 	expect := satellite.PeerExpectation{
 		PeerNames: expectedPeerNamesFor(target, peers),
-		Allocated: dispatcher.DiskfulPeersAllocated(target, peers),
+		Allocated: allocationComplete(target, peers),
 	}
 
 	for i := range peers {
@@ -1372,6 +1372,22 @@ func volNumsOf(rd *blockstoriov1alpha1.ResourceDefinition) []int32 {
 	}
 
 	return out
+}
+
+// targetAllocated reports that the controller has stamped the
+// target's own DRBD node-id, port and minor on Status, the half of
+// the allocation gate that reads only the target.
+func targetAllocated(res *blockstoriov1alpha1.Resource) bool {
+	return res.Status.DRBDNodeID != nil && res.Status.DRBDPort != nil && res.Status.DRBDMinor != nil
+}
+
+// allocationComplete is the predicate waitForControllerAllocation
+// waits on: the target's Status allocation and a node-id on every
+// diskful replica. The gate itself also re-reads the target uncached
+// before it gives up; callers of this predicate take the view they
+// hold, which can only make it report false too early, never true.
+func allocationComplete(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) bool {
+	return targetAllocated(target) && dispatcher.DiskfulPeersAllocated(target, peers)
 }
 
 // waitForControllerAllocation gates the apply path on the
@@ -1418,7 +1434,7 @@ func volNumsOf(rd *blockstoriov1alpha1.ResourceDefinition) []int32 {
 // so the caller's downstream `dispatcher.BuildDesired` sees the
 // fresh allocation in the same reconcile.
 func (r *ResourceReconciler) waitForControllerAllocation(ctx context.Context, res *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, bool) {
-	if res.Status.DRBDNodeID == nil || res.Status.DRBDPort == nil || res.Status.DRBDMinor == nil {
+	if !targetAllocated(res) {
 		// APIReader fall-through (Bug 289): when the cached view
 		// reports nil DRBD-IDs, the controller may have already
 		// stamped them — re-fetch uncached before declaring the

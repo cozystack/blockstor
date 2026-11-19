@@ -76,9 +76,10 @@ type PeerExpectation struct {
 	// replica and by every observed peer that has one.
 	AllocatedNodeIDs []int32
 
-	// Allocated reports that the local replica and every observed
-	// diskful peer carry a controller-allocated node-id: the gate
-	// waitForControllerAllocation applies before a .res is rendered.
+	// Allocated reports that the observed set passes the gate
+	// waitForControllerAllocation applies before a .res is rendered:
+	// the local replica's node-id, port and minor are on its Status,
+	// and every observed diskful replica carries a node-id.
 	Allocated bool
 }
 

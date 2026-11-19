@@ -120,10 +120,12 @@ func TestVolNumsOf_EmptyIsEmpty(t *testing.T) {
 }
 
 // TestPeerExpectationFor_PartialAndCompleteSets pins what the prune is
-// told about an RD's peers. A diskful peer without a node-id keeps the
-// set unallocated; a diskless one does not, as in the allocation gate.
-// Every node-id an observed replica holds is reported, so a peer slot
-// still holding one is never taken for stale.
+// told about an RD's peers. Allocated is the allocation gate's own
+// predicate: the target needs its node-id, port and minor on Status
+// (an adopted replica's Spec node-id alone does not do), a diskful
+// peer without a node-id keeps the set unallocated, and a diskless one
+// does not. Every node-id an observed replica holds is reported, so a
+// peer slot still holding one is never taken for stale.
 func TestPeerExpectationFor_PartialAndCompleteSets(t *testing.T) {
 	t.Parallel()
 
@@ -132,6 +134,11 @@ func TestPeerExpectationFor_PartialAndCompleteSets(t *testing.T) {
 	target := blockstoriov1alpha1.Resource{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-worker-0"},
 		Spec:       blockstoriov1alpha1.ResourceSpec{NodeName: "worker-0", DRBDNodeID: id(0)},
+		Status:     blockstoriov1alpha1.ResourceStatus{DRBDNodeID: id(0), DRBDPort: id(7000), DRBDMinor: id(1000)},
+	}
+	unstamped := blockstoriov1alpha1.Resource{
+		ObjectMeta: target.ObjectMeta,
+		Spec:       target.Spec,
 	}
 	allocated := blockstoriov1alpha1.Resource{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-worker-1"},
@@ -149,19 +156,21 @@ func TestPeerExpectationFor_PartialAndCompleteSets(t *testing.T) {
 
 	cases := []struct {
 		name      string
+		target    blockstoriov1alpha1.Resource
 		peers     []blockstoriov1alpha1.Resource
 		allocated bool
 		names     []string
 	}{
-		{"diskful peer pending", []blockstoriov1alpha1.Resource{target, allocated, pending}, false, []string{"worker-1", "worker-2"}},
-		{"only diskless pending", []blockstoriov1alpha1.Resource{target, allocated, pendingDiskless}, true, []string{"worker-1", "worker-3"}},
+		{"diskful peer pending", target, []blockstoriov1alpha1.Resource{target, allocated, pending}, false, []string{"worker-1", "worker-2"}},
+		{"only diskless pending", target, []blockstoriov1alpha1.Resource{target, allocated, pendingDiskless}, true, []string{"worker-1", "worker-3"}},
+		{"target Status pending", unstamped, []blockstoriov1alpha1.Resource{unstamped, allocated}, false, []string{"worker-1"}},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := peerExpectationFor(&target, tc.peers)
+			got := peerExpectationFor(&tc.target, tc.peers)
 
 			if got.Allocated != tc.allocated {
 				t.Errorf("Allocated = %v, want %v", got.Allocated, tc.allocated)
