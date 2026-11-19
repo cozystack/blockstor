@@ -141,3 +141,63 @@ func TestDisklessToggleWithAnUnregisteredPoolFails(t *testing.T) {
 		t.Errorf("Apply results %+v, want one failure naming pool thin1", results)
 	}
 }
+
+const snapLVLookupVG1 = "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg1/pvc-a_s1_00000"
+
+// A replica that moved to another pool on this node left its snapshot in the
+// pool it moved from. The snapshot delete looks in every pool of the node,
+// not only the one the replica is in now, or it would answer Ok over a copy
+// still on disk.
+func TestDeleteSnapshotSearchesEveryPoolOfTheNode(t *testing.T) {
+	t.Parallel()
+
+	fx1 := storage.NewFakeExec()
+	fx1.Expect(snapLVLookupVG1, storage.FakeResponse{Stdout: []byte("pvc-a_s1_00000\n")})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{
+			"thin1": lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg1", ThinPool: "tp"}, fx1),
+			"thin2": lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg2", ThinPool: "tp"}, storage.NewFakeExec()),
+		},
+		NodeName: "n1",
+	})
+	rec.RememberPoolForTest("pvc-a", "thin2")
+
+	resp, err := rec.DeleteSnapshot(t.Context(), &intent.DeleteSnapshotRequest{
+		ResourceName: "pvc-a",
+		SnapshotName: "s1",
+		StoragePools: []string{"thin1", "thin2"},
+	})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteSnapshot: err=%v resp=%+v", err, resp)
+	}
+
+	removed := false
+
+	for _, line := range fx1.CommandLines() {
+		if strings.HasPrefix(line, "lvremove ") && strings.HasSuffix(line, "vg1/pvc-a_s1_00000") {
+			removed = true
+		}
+	}
+
+	if !removed {
+		t.Errorf("the copy in the pool the replica moved from was not deleted: %v", fx1.CommandLines())
+	}
+}
+
+// A node with no diskful pool left has nowhere to hold a copy, so a snapshot
+// delete there is done. Answering not Ok would keep the node's hold on the
+// Snapshot for good once its pool was removed.
+func TestDeleteSnapshotOnANodeWithoutPoolsIsOk(t *testing.T) {
+	t.Parallel()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		NodeName:  "n1",
+	})
+
+	resp, err := rec.DeleteSnapshot(t.Context(), &intent.DeleteSnapshotRequest{ResourceName: "pvc-a", SnapshotName: "s1"})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteSnapshot with no pools: err=%v resp=%+v, want Ok", err, resp)
+	}
+}
