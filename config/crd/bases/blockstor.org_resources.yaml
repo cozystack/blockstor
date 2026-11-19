@@ -479,6 +479,45 @@ spec:
           status:
             description: status defines the observed state of Resource
             properties:
+              applyFailure:
+                description: |-
+                  applyFailure is the error of the satellite's last apply pass on
+                  this replica, with the volume sizes that pass was applying. The
+                  satellite sets it when a pass fails and removes it when one
+                  succeeds. A resize that waits for this replica to grow ends with
+                  this error instead of waiting for a pass that keeps failing, as
+                  LINSTOR returns its satellite's error.
+                properties:
+                  message:
+                    description: message is the error the pass failed with.
+                    type: string
+                  volumes:
+                    description: |-
+                      volumes lists the definition size of each volume the failed pass
+                      was applying.
+                    items:
+                      description: ResourceApplyFailureVolume is the size one volume
+                        had in a failed pass.
+                      properties:
+                        sizeKib:
+                          description: sizeKib is the volume definition size the pass
+                            was applying.
+                          format: int64
+                          type: integer
+                        volumeNumber:
+                          description: volumeNumber is the volume's number in the
+                            definition.
+                          format: int32
+                          type: integer
+                      required:
+                      - sizeKib
+                      - volumeNumber
+                      type: object
+                    type: array
+                required:
+                - message
+                type: object
+                x-kubernetes-map-type: atomic
               conditions:
                 description: conditions represent the current state of the Resource.
                 items:

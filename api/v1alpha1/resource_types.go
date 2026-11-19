@@ -424,6 +424,36 @@ type ResourceStatus struct {
 	// surfaced via a `ToggleDiskFailed` condition once exceeded.
 	// +optional
 	ToggleDiskRetries int32 `json:"toggleDiskRetries,omitempty"`
+
+	// applyFailure is the error of the satellite's last apply pass on
+	// this replica, with the volume sizes that pass was applying. The
+	// satellite sets it when a pass fails and removes it when one
+	// succeeds. A resize that waits for this replica to grow ends with
+	// this error instead of waiting for a pass that keeps failing, as
+	// LINSTOR returns its satellite's error.
+	// +optional
+	ApplyFailure *ResourceApplyFailure `json:"applyFailure,omitempty"`
+}
+
+// ResourceApplyFailure is the error of a failed satellite apply pass.
+// +structType=atomic
+type ResourceApplyFailure struct {
+	// message is the error the pass failed with.
+	Message string `json:"message"`
+
+	// volumes lists the definition size of each volume the failed pass
+	// was applying.
+	// +optional
+	Volumes []ResourceApplyFailureVolume `json:"volumes,omitempty"`
+}
+
+// ResourceApplyFailureVolume is the size one volume had in a failed pass.
+type ResourceApplyFailureVolume struct {
+	// volumeNumber is the volume's number in the definition.
+	VolumeNumber int32 `json:"volumeNumber"`
+
+	// sizeKib is the volume definition size the pass was applying.
+	SizeKib int64 `json:"sizeKib"`
 }
 
 // ResourceConnectionStatus is the state of one DRBD peer connection

@@ -397,3 +397,19 @@ func TestWireToCRDResourceProducesCanonicalName(t *testing.T) {
 			crd.Name, crd.Spec.ResourceDefinitionName+"."+crd.Spec.NodeName)
 	}
 }
+
+// TestApplyFailureFromStatus: the REST layer reads the satellite's last
+// apply error through the wire Resource, keyed by volume number.
+func TestApplyFailureFromStatus(t *testing.T) {
+	if got := applyFailureFromStatus(nil); got != nil {
+		t.Fatalf("no failure: got %+v, want nil", got)
+	}
+
+	got := applyFailureFromStatus(&crdv1alpha1.ResourceApplyFailure{
+		Message: "boom",
+		Volumes: []crdv1alpha1.ResourceApplyFailureVolume{{VolumeNumber: 1, SizeKib: 4096}},
+	})
+	if got == nil || got.Message != "boom" || got.SizesKib[1] != 4096 {
+		t.Fatalf("failure: got %+v", got)
+	}
+}

@@ -96,6 +96,20 @@ type Resource struct {
 	// time, matching upstream's per-resource timestamp. Set only on
 	// the read path (crdToWireResource); ignored on writes.
 	CreateTimestamp int64 `json:"create_timestamp,omitempty"`
+
+	// ApplyFailure is the error of the satellite's last apply pass on
+	// this replica, nil when that pass succeeded (Resource status).
+	// Internal: LINSTOR reports a satellite's error in the answer to
+	// the call that triggered the pass, and this is what lets a
+	// resize do the same.
+	ApplyFailure *ApplyFailure `json:"-"`
+}
+
+// ApplyFailure is the error of a failed satellite apply pass, with the
+// definition size of each volume that pass was applying.
+type ApplyFailure struct {
+	Message  string
+	SizesKib map[int32]int64
 }
 
 // ResourceState is the runtime state surface of a Resource.
