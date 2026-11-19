@@ -25,6 +25,7 @@ import (
 	"math"
 	"net"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -333,14 +334,66 @@ func volumeDefinitionDelete(ctx context.Context, run *runContext) error {
 		return err
 	}
 
+	if !run.Flags.Force {
+		err = checkDefinitionNotInUse(ctx, run, rdName)
+		if err != nil {
+			return err
+		}
+	}
+
 	err = checkZFSDeleteStrategy(ctx, run, rdName)
 	if err != nil {
 		return err
 	}
 
-	err = run.Store.VolumeDefinitions().Delete(ctx, rdName, number)
-	if err != nil && !isNotFound(err) {
+	// LINSTOR's delete, as the REST door runs it: flag the definition, let
+	// every replica's satellite delete its volume, and remove the
+	// definition once they all confirmed. That is immediate for a
+	// definition with no replicas; otherwise the controller finishes it,
+	// and the CLI does not wait.
+	_, _, err = store.MarkVolumeDefinitionDeleted(ctx, run.Store, rdName, number)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+
 		return fmt.Errorf("delete volume definition %s/%d: %w", rdName, number, err)
+	}
+
+	progress, err := store.FinishVolumeDefinitionDelete(ctx, run.Store, rdName, number)
+	if err != nil {
+		return fmt.Errorf("delete volume definition %s/%d: %w", rdName, number, err)
+	}
+
+	if !progress.Removed {
+		fmt.Fprintf(run.Err, "volume %d of %s is marked for deletion; waiting for the satellites of %s to delete their volume\n",
+			number, rdName, strings.Join(progress.Pending, ", "))
+	}
+
+	return nil
+}
+
+// checkDefinitionNotInUse refuses a volume definition delete while a replica
+// of the definition is in use, as LINSTOR does. --force overrides it, as the
+// REST door's `?force=true` does.
+func checkDefinitionNotInUse(ctx context.Context, run *runContext, rdName string) error {
+	replicas, err := run.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("list the replicas of %s: %w", rdName, err)
+	}
+
+	var inUse []string
+
+	for i := range replicas {
+		if replicas[i].State.InUse != nil && *replicas[i].State.InUse {
+			inUse = append(inUse, replicas[i].NodeName)
+		}
+	}
+
+	if len(inUse) > 0 {
+		sort.Strings(inUse)
+
+		return fmt.Errorf("resource %s is in use on %s: %w", rdName, strings.Join(inUse, ", "), errResourcesInUse)
 	}
 
 	return nil
