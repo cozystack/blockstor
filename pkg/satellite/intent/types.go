@@ -596,7 +596,7 @@ type DeleteResourceRequest struct {
 	VolumeNumbers []int32
 
 	// DeletedSuffix is the rename suffix recorded for this replica's
-	// zvols; see storage.Volume.DeletedSuffix.
+	// zvols; see storage.SuffixedDeleter.
 	DeletedSuffix string
 }
 

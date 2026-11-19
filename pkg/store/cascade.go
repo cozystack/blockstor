@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
@@ -329,4 +330,96 @@ func ReferencesUnderSpellings(ctx context.Context, st Store, spellings []string)
 	sort.Strings(poolRefs)
 
 	return rscRefs, poolRefs, nil
+}
+
+// SnapshotsOnNode lists, as `<rd>/<snapshot>` and sorted, the snapshots that
+// keep a copy on a node under any of the spellings. Each such node holds the
+// Snapshot until its satellite has deleted that copy, so the node, and the
+// pool the copy lives in, have to stay until then: with the pool gone the
+// copy cannot be deleted, and with the node gone nothing ever runs there.
+func SnapshotsOnNode(ctx context.Context, st Store, spellings []string) ([]string, error) {
+	snapshots, err := st.Snapshots().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+
+	var refs []string
+
+	for i := range snapshots {
+		onNode := slices.ContainsFunc(snapshots[i].Nodes, func(n string) bool {
+			return slices.ContainsFunc(spellings, func(s string) bool { return naming.Same(n, s) })
+		})
+		if onNode {
+			refs = append(refs, snapshots[i].ResourceName+"/"+snapshots[i].Name)
+		}
+	}
+
+	sort.Strings(refs)
+
+	return refs, nil
+}
+
+// SnapshotsInPool is SnapshotsOnNode for a pool delete: the snapshots a
+// diskful pool of the node may hold. A Snapshot does not record which pool
+// of a node its copy is in, so every snapshot on the node counts, as LINSTOR
+// refuses a pool delete over the snapshot-volumes in it. A diskless pool, or
+// one that does not exist, holds none.
+func SnapshotsInPool(ctx context.Context, st Store, node, pool string) ([]string, error) {
+	sp, err := st.StoragePools().Get(ctx, node, pool)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("get storage pool %s on %s: %w", pool, node, err)
+	}
+
+	if sp.ProviderKind == apiv1.StoragePoolKindDiskless {
+		return nil, nil
+	}
+
+	spellings, err := NodeSpellings(ctx, st, node)
+	if err != nil {
+		return nil, err
+	}
+
+	return SnapshotsOnNode(ctx, st, spellings)
+}
+
+// ReplicasInPool returns the `<rd>/<vol_nr>` keys of every volume on the node
+// whose pool is the one named, and `<rd>/spec` for a replica that has not
+// reported volumes yet but already pins the pool in `StorPoolName`. A pool
+// delete is refused on them: a replica whose pool is gone cannot have its
+// storage deleted, so its delete never finishes.
+func ReplicasInPool(ctx context.Context, st Store, node, pool string) ([]string, error) {
+	all, err := st.Resources().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list resources: %w", err)
+	}
+
+	var refs []string
+
+	for i := range all {
+		if !naming.Same(all[i].NodeName, node) {
+			continue
+		}
+
+		matched := false
+
+		for j := range all[i].Volumes {
+			vol := &all[i].Volumes[j]
+			if naming.Same(vol.StoragePool, pool) {
+				refs = append(refs, all[i].Name+"/"+strconv.FormatInt(int64(vol.VolumeNumber), 10))
+				matched = true
+
+				break
+			}
+		}
+
+		if !matched && naming.Same(all[i].Props["StorPoolName"], pool) {
+			refs = append(refs, all[i].Name+"/spec")
+		}
+	}
+
+	return refs, nil
 }

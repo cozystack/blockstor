@@ -117,7 +117,7 @@ func (s *snapshots) ReleaseSnapshotsOnNode(ctx context.Context, node string) err
 
 		drop := []string{released}
 
-		if othersHoldTheirOwn(snap, node) {
+		if finalizers.OthersHoldTheirOwn(snap.Spec.Nodes, snap.Finalizers, node) {
 			drop = append(drop, finalizers.SharedSatelliteSnapshot)
 		}
 
@@ -128,19 +128,6 @@ func (s *snapshots) ReleaseSnapshotsOnNode(ctx context.Context, node string) err
 	}
 
 	return nil
-}
-
-// othersHoldTheirOwn reports whether every node the Snapshot lists other than
-// the released one holds its own finalizer, so the shared one protects
-// nothing any more.
-func othersHoldTheirOwn(snap *crdv1alpha1.Snapshot, released string) bool {
-	for _, n := range snap.Spec.Nodes {
-		if !naming.Same(n, released) && !slices.Contains(snap.Finalizers, finalizers.SnapshotNode(n)) {
-			return false
-		}
-	}
-
-	return true
 }
 
 // releaseFinalizers removes the named finalizers from the object, re-reading

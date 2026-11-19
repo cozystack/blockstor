@@ -247,22 +247,51 @@ func nodeDelete(ctx context.Context, run *runContext) error {
 			return fmt.Errorf("delete objects on %s: %w", name, cascadeErr)
 		}
 	} else {
-		rscRefs, poolRefs, refErr := store.ReferencesOnNode(ctx, run.Store, name)
+		refErr := refuseNodeDeleteIfReferenced(ctx, run, name)
 		if refErr != nil {
-			return fmt.Errorf("list objects on %s: %w", name, refErr)
-		}
-
-		if len(rscRefs) > 0 || len(poolRefs) > 0 {
-			return fmt.Errorf("%w: %s still carries replicas of [%s] and storage pools [%s]; "+
-				"remove them or pass --force",
-				errNodeStillReferenced, name,
-				strings.Join(rscRefs, ", "), strings.Join(poolRefs, ", "))
+			return refErr
 		}
 	}
 
 	err := run.Store.Nodes().Delete(ctx, name)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete node %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// refuseNodeDeleteIfReferenced refuses a plain node delete while replicas or
+// pools still point at the node, or snapshots still have a copy on it, which
+// the node holds until its satellite has deleted them. The REST door refuses
+// on the same.
+func refuseNodeDeleteIfReferenced(ctx context.Context, run *runContext, name string) error {
+	rscRefs, poolRefs, err := store.ReferencesOnNode(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("list objects on %s: %w", name, err)
+	}
+
+	if len(rscRefs) > 0 || len(poolRefs) > 0 {
+		return fmt.Errorf("%w: %s still carries replicas of [%s] and storage pools [%s]; "+
+			"remove them or pass --force",
+			errNodeStillReferenced, name,
+			strings.Join(rscRefs, ", "), strings.Join(poolRefs, ", "))
+	}
+
+	spellings, err := store.NodeSpellings(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("list objects on %s: %w", name, err)
+	}
+
+	snapRefs, err := store.SnapshotsOnNode(ctx, run.Store, spellings)
+	if err != nil {
+		return fmt.Errorf("list snapshots on %s: %w", name, err)
+	}
+
+	if len(snapRefs) > 0 {
+		return fmt.Errorf("%w: %s still holds copies of snapshots [%s]; "+
+			"delete them, or pass --force if the node is gone",
+			errNodeStillReferenced, name, strings.Join(snapRefs, ", "))
 	}
 
 	return nil

@@ -941,17 +941,23 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
 }
 
-// snapshotProviders is the resource's own pool when the satellite knows it,
-// and otherwise every pool the request names.
+// snapshotProviders is every diskful pool the request names, which is every
+// one this node has, plus the resource's own pool when the satellite knows
+// it. The resource's current pool is not enough: a replica that moved to
+// another pool on this node left the snapshot, under the zvol its delete
+// renamed, in the pool it moved from. A pool that is named but not
+// registered yet (the satellite just started) may hold the snapshot, so the
+// delete waits for it. A node without any diskful pool has nowhere to hold a
+// copy.
 func (r *Reconciler) snapshotProviders(req *intent.DeleteSnapshotRequest) ([]storage.Provider, error) {
-	provider, err := r.providerForResource(req.GetResourceName())
-	if err == nil {
-		return []storage.Provider{provider}, nil
-	}
+	pools := slices.Clone(req.GetStoragePools())
 
-	pools := req.GetStoragePools()
-	if len(pools) == 0 {
-		return nil, err
+	own, known := r.poolOf(req.GetResourceName())
+
+	if known && !slices.Contains(pools, own) {
+		if _, ok := r.provider(own); ok {
+			pools = append(pools, own)
+		}
 	}
 
 	providers := make([]storage.Provider, 0, len(pools))
@@ -5842,10 +5848,7 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 // resource using the in-memory pool map. Returns an error when the
 // resource isn't known or its pool isn't registered.
 func (r *Reconciler) providerForResource(name string) (storage.Provider, error) {
-	r.mu.Lock()
-	pool, ok := r.resourceToPool[name]
-	r.mu.Unlock()
-
+	pool, ok := r.poolOf(name)
 	if !ok {
 		return nil, errors.Errorf("resource %q not known on this satellite", name)
 	}
@@ -5856,6 +5859,16 @@ func (r *Reconciler) providerForResource(name string) (storage.Provider, error) 
 	}
 
 	return provider, nil
+}
+
+// poolOf is the pool an applied replica of the resource was recorded in.
+func (r *Reconciler) poolOf(name string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pool, ok := r.resourceToPool[name]
+
+	return pool, ok
 }
 
 // rememberPool records the pool that backs a resource, so subsequent
