@@ -274,7 +274,10 @@ func selectFilterCell(filter *apiv1.AutoSelectFilter) string {
 // A deactivated replica has no volumes to show, so it is left out
 // unless its node was evicted, where the row is what tells an operator
 // the data is still there.
-func VolumeList(resources []apiv1.Resource) *metav1.Table {
+//
+// definitionProps maps a resource-definition name (naming.Key) to its
+// own properties, which is where a definition-wide SkipDisk is read.
+func VolumeList(resources []apiv1.Resource, definitionProps map[string]map[string]string) *metav1.Table {
 	tbl := &metav1.Table{
 		ColumnDefinitions: columns(
 			"Node", "Resource", "StoragePool", "VolumeNr",
@@ -282,7 +285,7 @@ func VolumeList(resources []apiv1.Resource) *metav1.Table {
 		),
 	}
 
-	primaries := primariesByDefinition(resources)
+	primaries := PrimariesByDefinition(resources)
 
 	for i := range resources {
 		res := &resources[i]
@@ -292,7 +295,8 @@ func VolumeList(resources []apiv1.Resource) *metav1.Table {
 			continue
 		}
 
-		usage := usageCell(res, primaries[naming.Key(res.Name)])
+		key := naming.Key(res.Name)
+		usage := usageCell(res, primaries[key])
 		linkDown := topLayerIsDRBD(res) && hasBrokenConnection(res)
 
 		for j := range res.Volumes {
@@ -307,6 +311,7 @@ func VolumeList(resources []apiv1.Resource) *metav1.Table {
 				state.Class = color.Broken
 			}
 
+			state = withSkipDisk(state, res, definitionProps[key])
 			state = withToggleDisk(state, res.Flags)
 
 			tbl.Rows = append(tbl.Rows, metav1.TableRow{Cells: []any{

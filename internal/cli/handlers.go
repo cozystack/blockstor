@@ -250,7 +250,7 @@ func keepResource(res *apiv1.Resource, flags *flagSet) bool {
 // decision. Filtering during render would leave `-m` — which skips the
 // renderer — returning every replica for a command whose whole point is
 // to narrow to the broken ones.
-func keepFaulty(resources []apiv1.Resource, flags *flagSet) []apiv1.Resource {
+func keepFaulty(resources []apiv1.Resource, defProps map[string]map[string]string, flags *flagSet) []apiv1.Resource {
 	if !flags.Faulty {
 		return resources
 	}
@@ -258,12 +258,28 @@ func keepFaulty(resources []apiv1.Resource, flags *flagSet) []apiv1.Resource {
 	kept := resources[:0]
 
 	for i := range resources {
-		if view.IsFaulty(&resources[i]) {
+		if view.IsFaulty(&resources[i], defProps[naming.Key(resources[i].Name)]) {
 			kept = append(kept, resources[i])
 		}
 	}
 
 	return kept
+}
+
+// explainSkipDisk prints what a SkipDisk marker in the table means, on
+// stderr so the table on stdout stays the contract `awk -F'|'` parses.
+func explainSkipDisk(run *runContext, resources []apiv1.Resource, defProps map[string]map[string]string) {
+	if run.Err == nil {
+		return
+	}
+
+	for i := range resources {
+		if view.SkipDisk(&resources[i], defProps[naming.Key(resources[i].Name)]) {
+			fmt.Fprint(run.Err, view.SkipDiskHelp)
+
+			return
+		}
+	}
 }
 
 // volumeList implements `volume list` and `resource list-volumes`: the
@@ -285,13 +301,18 @@ func volumeList(ctx context.Context, run *runContext) error {
 
 	kept = applyLimit(kept, run.Flags)
 
-	withLayerStacks(ctx, run, kept)
+	defProps := withLayerStacks(ctx, run, kept)
 
 	if run.Flags.Machine {
 		return machineOut(run, kept)
 	}
 
-	return run.render(view.VolumeList(kept), "State")
+	err = run.render(view.VolumeList(kept, defProps), "State")
+	if err == nil {
+		explainSkipDisk(run, kept, defProps)
+	}
+
+	return err
 }
 
 // volumeDefinitionList implements `volume-definition list` (`vd l`).
@@ -365,9 +386,13 @@ func resourceList(ctx context.Context, run *runContext) error {
 
 	// Stamped before --faulty reads them: whether a replica is faulty
 	// depends on which layers it has.
-	withLayerStacks(ctx, run, kept)
+	defProps := withLayerStacks(ctx, run, kept)
 
-	kept = keepFaulty(kept, run.Flags)
+	// Counted before --faulty narrows the rows: a faulty primary whose
+	// second primary is healthy is still one of two.
+	primaries := view.PrimariesByDefinition(kept)
+
+	kept = keepFaulty(kept, defProps, run.Flags)
 
 	kept = applyLimit(kept, run.Flags)
 
@@ -375,11 +400,18 @@ func resourceList(ctx context.Context, run *runContext) error {
 		return machineOut(run, kept)
 	}
 
-	return run.render(view.ResourceList(view.ResourceListInput{
-		Resources:      kept,
-		VolumeSizesKib: volumeSizesFor(ctx, run, kept),
-		FaultyOnly:     run.Flags.Faulty,
+	err = run.render(view.ResourceList(view.ResourceListInput{
+		Resources:       kept,
+		VolumeSizesKib:  volumeSizesFor(ctx, run, kept),
+		DefinitionProps: defProps,
+		Primaries:       primaries,
+		FaultyOnly:      run.Flags.Faulty,
 	}), "State", "Conns")
+	if err == nil {
+		explainSkipDisk(run, kept, defProps)
+	}
+
+	return err
 }
 
 // volumeSizesBulkCutoff is where reading the definitions one at a time stops

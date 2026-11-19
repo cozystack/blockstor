@@ -80,6 +80,12 @@ func reporting(res apiv1.Resource) apiv1.Resource {
 	return res
 }
 
+func withProps(res apiv1.Resource, props map[string]string) apiv1.Resource {
+	res.Props = props
+
+	return res
+}
+
 type cellWant struct {
 	text  string
 	class color.Class
@@ -242,6 +248,27 @@ func TestResourceListStateParity(t *testing.T) {
 				apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker),
 			state: cellWant{"TieBreaker", color.Transitional},
 			usage: cellWant{"Unused", color.Neutral},
+		},
+		{
+			name:  "skip disk on the replica turns a healthy state yellow",
+			res:   withProps(stacked(stackDrbd(), ptrBool(false), "UpToDate"), map[string]string{"DrbdOptions/SkipDisk": "True"}),
+			state: cellWant{"UpToDate, SkipDisk (R)", color.Transitional},
+			usage: cellWant{"Unused", color.Neutral},
+			conns: cellWant{"Ok", color.Healthy},
+		},
+		{
+			name:  "skip disk keeps a red state red",
+			res:   withProps(stacked(stackDrbd(), ptrBool(false), "Diskless"), map[string]string{"DrbdOptions/SkipDisk": "true"}),
+			state: cellWant{"Diskless, SkipDisk (R)", color.Broken},
+			usage: cellWant{"Unused", color.Neutral},
+			conns: cellWant{"Ok", color.Healthy},
+		},
+		{
+			name:  "skip disk set to false is not shown",
+			res:   withProps(stacked(stackDrbd(), ptrBool(false), "UpToDate"), map[string]string{"DrbdOptions/SkipDisk": "False"}),
+			state: cellWant{"UpToDate", color.Healthy},
+			usage: cellWant{"Unused", color.Neutral},
+			conns: cellWant{"Ok", color.Healthy},
 		},
 		{
 			name:  "deleting storage replica reports no usage",
@@ -437,7 +464,7 @@ func TestVolumeListStateParity(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			tbl := view.VolumeList([]apiv1.Resource{tc.res})
+			tbl := view.VolumeList([]apiv1.Resource{tc.res}, nil)
 			if len(tbl.Rows) != tc.rows {
 				t.Fatalf("rows = %d, want %d", len(tbl.Rows), tc.rows)
 			}
@@ -456,5 +483,136 @@ func TestVolumeListStateParity(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A SkipDisk set on the definition reaches every replica of it, and the
+// replica's own value wins over it, naming both scopes.
+func TestResourceListSkipDiskScopes(t *testing.T) {
+	t.Parallel()
+
+	skip := map[string]string{"DrbdOptions/SkipDisk": "True"}
+	keep := map[string]string{"DrbdOptions/SkipDisk": "False"}
+
+	cases := []struct {
+		name     string
+		own      map[string]string
+		def      map[string]string
+		want     string
+		wantSkip bool
+	}{
+		{name: "definition only", def: skip, want: "UpToDate, SkipDisk (RD)", wantSkip: true},
+		{name: "both", own: skip, def: skip, want: "UpToDate, SkipDisk (R, RD)", wantSkip: true},
+		{name: "replica overrides the definition", own: keep, def: skip, want: "UpToDate"},
+		{name: "replica true over a false definition", own: skip, def: keep, want: "UpToDate, SkipDisk (R, RD)", wantSkip: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res := withProps(stacked(stackDrbd(), ptrBool(false), "UpToDate"), tc.own)
+			defs := map[string]map[string]string{"pvc-x": tc.def}
+
+			tbl := view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{res}, DefinitionProps: defs})
+			if got := cellAt(t, tbl, 0, "State"); got != tc.want {
+				t.Errorf("State = %q, want %q", got, tc.want)
+			}
+
+			if got := view.SkipDisk(&res, tc.def); got != tc.wantSkip {
+				t.Errorf("SkipDisk = %v, want %v", got, tc.wantSkip)
+			}
+
+			vols := view.VolumeList([]apiv1.Resource{res}, defs)
+			if got := cellAt(t, vols, 0, "State"); got != tc.want {
+				t.Errorf("volume State = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// `--faulty` lists exactly the rows the table does not paint green, so
+// a replica that lost its disk, or one held off it by SkipDisk, is not
+// filtered out of the one listing meant to find it.
+func TestFaultyMatchesWhatTheTablePaints(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		res    apiv1.Resource
+		faulty bool
+	}{
+		{name: "up to date", res: stacked(stackDrbd(), ptrBool(false), "UpToDate")},
+		{name: "storage only", res: stacked(stackStorage(), nil, "")},
+		{name: "reported diskless", res: withFlags(stacked(stackDrbd(), ptrBool(false), "Diskless"), apiv1.ResourceFlagDiskless)},
+		{
+			name: "reported tiebreaker",
+			res: reporting(withFlags(stacked(stackDrbd(), ptrBool(false)),
+				apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker)),
+		},
+		{name: "evacuating", res: withFlags(stacked(stackDrbd(), ptrBool(false), "UpToDate"), "EVACUATE")},
+		{name: "a diskful replica that lost its disk", res: stacked(stackDrbd(), ptrBool(false), "Diskless"), faulty: true},
+		{name: "inconsistent", res: stacked(stackDrbd(), ptrBool(false), "Inconsistent"), faulty: true},
+		{name: "outdated", res: stacked(stackDrbd(), ptrBool(false), "Outdated"), faulty: true},
+		{name: "deleting", res: withFlags(stacked(stackDrbd(), ptrBool(false), "UpToDate"), "DELETE"), faulty: true},
+		{name: "inactive", res: withFlags(stacked(stackDrbd(), ptrBool(false), "UpToDate"), apiv1.ResourceFlagInactive), faulty: true},
+		{name: "never reported", res: stacked(stackDrbd(), ptrBool(false), ""), faulty: true},
+		{name: "unreported diskless", res: withFlags(stacked(stackDrbd(), ptrBool(false)), apiv1.ResourceFlagDiskless), faulty: true},
+		{name: "adding a disk", res: withFlags(stacked(stackDrbd(), ptrBool(false), "UpToDate"), "DISK_ADDING"), faulty: true},
+		{
+			name:   "skip disk",
+			res:    withProps(stacked(stackDrbd(), ptrBool(false), "UpToDate"), map[string]string{"DrbdOptions/SkipDisk": "True"}),
+			faulty: true,
+		},
+		{
+			name: "a broken peer link",
+			res: withPeers(stacked(stackDrbd(), ptrBool(false), "UpToDate"), map[string]apiv1.DrbdConnection{
+				"node-2": {Connected: false, Message: "StandAlone"},
+			}),
+			faulty: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := view.IsFaulty(&tc.res, nil); got != tc.faulty {
+				t.Errorf("IsFaulty = %v, want %v", got, tc.faulty)
+			}
+
+			rows := len(view.ResourceList(view.ResourceListInput{
+				Resources: []apiv1.Resource{tc.res}, FaultyOnly: true,
+			}).Rows)
+			if want := map[bool]int{false: 0, true: 1}[tc.faulty]; rows != want {
+				t.Errorf("--faulty rows = %d, want %d", rows, want)
+			}
+
+			painted := classAt(t, view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{tc.res}}), 0, "State")
+			if (painted != color.Healthy) != tc.faulty {
+				t.Errorf("State class %v disagrees with IsFaulty = %v", painted, tc.faulty)
+			}
+		})
+	}
+}
+
+// A caller that narrowed the rows passes the primary count from what it
+// read, so a second primary filtered out of the table still turns the
+// remaining one yellow.
+func TestResourceListPrimariesFromTheCaller(t *testing.T) {
+	t.Parallel()
+
+	healthy := stacked(stackDrbd(), ptrBool(true), "UpToDate")
+	faulty := stacked(stackDrbd(), ptrBool(true), "Outdated")
+	faulty.NodeName = "node-2"
+
+	all := []apiv1.Resource{healthy, faulty}
+
+	tbl := view.ResourceList(view.ResourceListInput{
+		Resources: []apiv1.Resource{faulty},
+		Primaries: view.PrimariesByDefinition(all),
+	})
+	if got := classAt(t, tbl, 0, "Usage"); got != color.Transitional {
+		t.Errorf("Usage class = %v, want Transitional: the other primary was only filtered out", got)
 	}
 }

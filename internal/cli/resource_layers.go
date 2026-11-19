@@ -43,15 +43,25 @@ import (
 // cutoff, one listing past it. A definition that cannot be read keeps
 // the default stack, which is how the listing looked before, rather
 // than failing it.
-func withLayerStacks(ctx context.Context, run *runContext, resources []apiv1.Resource) {
+//
+// It returns each definition's own properties, keyed by naming.Key,
+// from the same read: the State column shows a SkipDisk set on the
+// definition, and reading the definitions a second time for it would
+// double the round trips of the listing.
+func withLayerStacks(ctx context.Context, run *runContext, resources []apiv1.Resource) map[string]map[string]string {
 	if len(resources) == 0 {
-		return
+		return nil
 	}
 
-	stacks := layerStacksFor(ctx, run, distinctDefinitionNames(resources))
+	defs := definitionsFor(ctx, run, distinctDefinitionNames(resources))
+
+	props := make(map[string]map[string]string, len(defs))
+	for key := range defs {
+		props[key] = defs[key].props
+	}
 
 	for i := range resources {
-		stack := stacks[naming.Key(resources[i].Name)]
+		stack := defs[naming.Key(resources[i].Name)].stack
 		if len(stack) == 0 {
 			continue
 		}
@@ -63,18 +73,30 @@ func withLayerStacks(ctx context.Context, run *runContext, resources []apiv1.Res
 		apiv1.ApplyLayerStack(&resources[i], stack)
 		apiv1.ApplyLayerStackToVolumes(resources[i].Volumes, stack)
 	}
+
+	return props
 }
 
-// layerStacksFor reads the layer stack of each named definition, keyed
-// by naming.Key.
-func layerStacksFor(ctx context.Context, run *runContext, names []string) map[string][]string {
+// definitionFacts is what a listing reads off a replica's definition.
+type definitionFacts struct {
+	stack []string
+	props map[string]string
+}
+
+func factsOf(def *apiv1.ResourceDefinition) definitionFacts {
+	return definitionFacts{stack: def.LayerStack, props: def.Props}
+}
+
+// definitionsFor reads the layer stack and properties of each named
+// definition, keyed by naming.Key.
+func definitionsFor(ctx context.Context, run *runContext, names []string) map[string]definitionFacts {
 	if len(names) <= volumeSizesBulkCutoff {
-		return layerStacksPerDefinition(ctx, run, names)
+		return definitionsPerName(ctx, run, names)
 	}
 
-	stacks, err := layerStacksInOneRequest(ctx, run)
+	defs, err := definitionsInOneRequest(ctx, run)
 	if err == nil {
-		return stacks
+		return defs
 	}
 
 	if !perDefinitionCanAnswer(ctx, err) {
@@ -83,11 +105,11 @@ func layerStacksFor(ctx context.Context, run *runContext, names []string) map[st
 		return nil
 	}
 
-	return layerStacksPerDefinition(ctx, run, names)
+	return definitionsPerName(ctx, run, names)
 }
 
-func layerStacksPerDefinition(ctx context.Context, run *runContext, names []string) map[string][]string {
-	stacks := make(map[string][]string, len(names))
+func definitionsPerName(ctx context.Context, run *runContext, names []string) map[string]definitionFacts {
+	out := make(map[string]definitionFacts, len(names))
 
 	var firstErr error
 
@@ -101,28 +123,28 @@ func layerStacksPerDefinition(ctx context.Context, run *runContext, names []stri
 			continue
 		}
 
-		stacks[naming.Key(def.Name)] = def.LayerStack
+		out[naming.Key(def.Name)] = factsOf(&def)
 	}
 
-	if len(stacks) == 0 && firstErr != nil {
+	if len(out) == 0 && firstErr != nil {
 		warnLayerStacksUnavailable(run, firstErr)
 	}
 
-	return stacks
+	return out
 }
 
-func layerStacksInOneRequest(ctx context.Context, run *runContext) (map[string][]string, error) {
+func definitionsInOneRequest(ctx context.Context, run *runContext) (map[string]definitionFacts, error) {
 	defs, err := fetchDefinitions(ctx, run.Store)
 	if err != nil {
 		return nil, errors.Wrap(err, "read every resource definition")
 	}
 
-	stacks := make(map[string][]string, len(defs))
+	out := make(map[string]definitionFacts, len(defs))
 	for i := range defs {
-		stacks[naming.Key(defs[i].Name)] = defs[i].LayerStack
+		out[naming.Key(defs[i].Name)] = factsOf(&defs[i])
 	}
 
-	return stacks, nil
+	return out, nil
 }
 
 // warnLayerStacksUnavailable says why every replica reads as DRBD. On

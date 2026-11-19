@@ -68,6 +68,11 @@ const (
 	flagDiskRemoveRequested = "DISK_REMOVE_REQUESTED"
 )
 
+// propSkipDisk is the property the satellite stamps on a replica whose
+// backing disk failed with an I/O error; DRBD keeps that disk detached
+// while it is true.
+const propSkipDisk = "DrbdOptions/SkipDisk"
+
 // State cells that are terminal — a converged replica never carries a
 // sync percentage, which a harness asserts by grepping for the absence
 // of `UpToDate(NN%)`.
@@ -93,8 +98,19 @@ type ResourceListInput struct {
 	// another.
 	VolumeSizesKib map[string]map[int32]int64
 
-	// FaultyOnly keeps only replicas whose observed disk state is
-	// present and not converged (`--faulty`).
+	// DefinitionProps maps a resource-definition name (naming.Key) to
+	// its own properties, so a SkipDisk set on the definition shows on
+	// every replica of it.
+	DefinitionProps map[string]map[string]string
+
+	// Primaries maps a resource-definition name (naming.Key) to how
+	// many of its replicas are in use. Nil counts them from Resources;
+	// a caller that has already narrowed Resources passes the count
+	// from the rows it read, so filtering out a healthy primary does
+	// not hide a second one.
+	Primaries map[string]int
+
+	// FaultyOnly keeps only the rows IsFaulty reports (`--faulty`).
 	FaultyOnly bool
 }
 
@@ -104,16 +120,19 @@ func ResourceList(in ResourceListInput) *metav1.Table {
 		ColumnDefinitions: columns("ResourceName", "Node", "Port", "Usage", "Conns", "State", "CreatedOn"),
 	}
 
-	primaries := primariesByDefinition(in.Resources)
+	primaries := in.Primaries
+	if primaries == nil {
+		primaries = PrimariesByDefinition(in.Resources)
+	}
 
 	for i := range in.Resources {
 		res := &in.Resources[i]
+		key := naming.Key(res.Name)
 
-		if in.FaultyOnly && !IsFaulty(res) {
+		row := describeReplica(res, in.VolumeSizesKib[res.Name], primaries[key], in.DefinitionProps[key])
+		if in.FaultyOnly && row.state.Class == color.Healthy {
 			continue
 		}
-
-		row := describeReplica(res, in.VolumeSizesKib[res.Name], primaries[naming.Key(res.Name)])
 
 		tbl.Rows = append(tbl.Rows, metav1.TableRow{Cells: []any{
 			res.Name,
@@ -151,7 +170,7 @@ type replicaRow struct {
 // a replica being deleted or deactivated reports no usage, Conns stays
 // blank while nothing is known about the replica, and a broken peer
 // link turns the State red whatever the disk says.
-func describeReplica(res *apiv1.Resource, sizes map[int32]int64, primaries int) replicaRow {
+func describeReplica(res *apiv1.Resource, sizes map[int32]int64, primaries int, defProps map[string]string) replicaRow {
 	var row replicaRow
 
 	reported := true
@@ -166,6 +185,7 @@ func describeReplica(res *apiv1.Resource, sizes map[int32]int64, primaries int) 
 		row.state, reported = replicaState(res, sizes)
 	}
 
+	row.state = withSkipDisk(row.state, res, defProps)
 	row.state = withToggleDisk(row.state, res.Flags)
 
 	if !reported || row.state.Text == stateUnknown {
@@ -182,10 +202,11 @@ func describeReplica(res *apiv1.Resource, sizes map[int32]int64, primaries int) 
 	return row
 }
 
-// primariesByDefinition counts the in-use replicas per definition. Two
-// at once is either a live migration or a split brain, so the Usage
-// cell turns yellow instead of claiming a healthy InUse.
-func primariesByDefinition(resources []apiv1.Resource) map[string]int {
+// PrimariesByDefinition counts the in-use replicas per definition,
+// keyed by naming.Key. Two at once is either a live migration or a
+// split brain, so the Usage cell turns yellow instead of claiming a
+// healthy InUse.
+func PrimariesByDefinition(resources []apiv1.Resource) map[string]int {
 	out := make(map[string]int, len(resources))
 
 	for i := range resources {
@@ -488,32 +509,73 @@ func syncPercent(vol *apiv1.Volume, sizes map[int32]int64) (int, bool) {
 	return int(done), true
 }
 
-// IsFaulty backs `--faulty`: a replica counts as faulty when a volume
-// has an observed disk state that has not converged, or when a peer
-// link is down. A replica the satellite has not reported on is NOT
-// faulty — absence of data is not evidence of breakage, and reporting
-// it as such would drown a real fault.
-func IsFaulty(res *apiv1.Resource) bool {
-	// A replica whose local disk is UpToDate but whose peer link is
-	// StandAlone or failed is exactly the split-brain the
-	// troubleshooting runbooks tell an operator to find with
-	// `--faulty`. Looking only at DiskState hides it.
-	if hasBrokenConnection(res) {
-		return true
+// IsFaulty backs `--faulty`: a replica is faulty when its State cell
+// is anything but green, which already covers a broken peer link. So
+// the filter lists exactly the rows the table flags: a diskful replica
+// that lost its disk, one being deleted or deactivated, one nothing
+// has reported on yet, one with SkipDisk set or a toggle-disk in
+// flight. defProps are the properties of the replica's definition.
+func IsFaulty(res *apiv1.Resource, defProps map[string]string) bool {
+	return describeReplica(res, nil, 0, defProps).state.Class != color.Healthy
+}
+
+// SkipDisk reports whether the replica's State carries the SkipDisk
+// marker, so a caller can explain it under the table.
+func SkipDisk(res *apiv1.Resource, defProps map[string]string) bool {
+	return skipDiskSuffix(res, defProps) != ""
+}
+
+// SkipDiskHelp explains the SkipDisk marker. It goes to stderr, under a
+// table that showed one, so the table itself stays parseable.
+const SkipDiskHelp = `SkipDisk: DrbdOptions/SkipDisk is set on at least one replica above.
+  The satellite sets it after an I/O error on the backing disk, and DRBD
+  keeps that disk detached while it stays set. Once the disk is repaired
+  or replaced, remove it with
+  'r sp <node> <resource> DrbdOptions/SkipDisk ""' (or 'rd sp' where the
+  marker reads RD) so the volume is attached, and recreated if needed.
+`
+
+// withSkipDisk marks a replica whose disk is held detached. It is not
+// healthy whatever the volumes say, so a green state turns yellow.
+func withSkipDisk(state color.Cell, res *apiv1.Resource, defProps map[string]string) color.Cell {
+	suffix := skipDiskSuffix(res, defProps)
+	if suffix == "" {
+		return state
 	}
 
-	for i := range res.Volumes {
-		state := strings.ToLower(res.Volumes[i].State.DiskState)
-		if state == "" {
-			continue
-		}
-
-		if _, terminal := terminalStates[state]; !terminal {
-			return true
-		}
+	state.Text += suffix
+	if state.Class == color.Healthy || state.Class == color.Neutral {
+		state.Class = color.Transitional
 	}
 
-	return false
+	return state
+}
+
+// skipDiskSuffix renders `, SkipDisk (R, RD)`: the replica's own value
+// wins over its definition's, as it does for the satellite, and every
+// scope that sets the key is named, the winning one first. Empty when
+// the effective value is not true.
+func skipDiskSuffix(res *apiv1.Resource, defProps map[string]string) string {
+	var scopes []string
+
+	value, set := res.Props[propSkipDisk]
+	if set {
+		scopes = append(scopes, "R")
+	}
+
+	if defValue, ok := defProps[propSkipDisk]; ok {
+		if !set {
+			value = defValue
+		}
+
+		scopes = append(scopes, "RD")
+	}
+
+	if !strings.EqualFold(value, "true") {
+		return ""
+	}
+
+	return ", SkipDisk (" + strings.Join(scopes, ", ") + ")"
 }
 
 // hasBrokenConnection reports whether any DRBD peer link is in a state
