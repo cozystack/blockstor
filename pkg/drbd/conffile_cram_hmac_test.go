@@ -42,11 +42,13 @@ func netBlock(t *testing.T, body string) string {
 	return body[start : start+end]
 }
 
-// DRBD authenticates a peer only when cram-hmac-alg is set; a
-// shared-secret alone is held by the kernel and never checked. LINSTOR
-// writes `cram-hmac-alg sha1` next to every secret it renders, so a
-// resource adopted without it silently stops authenticating its peers.
-func TestASharedSecretComesWithCramHMACAlg(t *testing.T) {
+// A shared secret on its own does not turn authentication on. DRBD
+// authenticates a peer only when cram-hmac-alg is set, so a renderer that
+// added one next to every secret would switch a resource that ran
+// unauthenticated over to authentication on whichever satellite rolled
+// first, and its reconnects to peers not rolled yet would fail the
+// handshake. The digest comes from DrbdOptions/Net/cram-hmac-alg only.
+func TestASharedSecretAloneRendersNoCramHMACAlg(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		net  drbd.Net
@@ -62,12 +64,12 @@ func TestASharedSecretComesWithCramHMACAlg(t *testing.T) {
 
 			net := netBlock(t, got)
 
-			if n := strings.Count(net, "cram-hmac-alg"); n != 1 {
-				t.Fatalf("want exactly one cram-hmac-alg line, got %d:\n%s", n, got)
+			if !strings.Contains(net, "shared-secret") {
+				t.Fatalf("the secret was not rendered:\n%s", got)
 			}
 
-			if !strings.Contains(net, "    cram-hmac-alg "+drbd.DefaultCramHMACAlg+";\n") {
-				t.Errorf("cram-hmac-alg is not the %s default:\n%s", drbd.DefaultCramHMACAlg, got)
+			if strings.Contains(net, "cram-hmac-alg") {
+				t.Errorf("cram-hmac-alg rendered without being asked for:\n%s", got)
 			}
 		})
 	}
@@ -98,38 +100,19 @@ func TestAnExplicitCramHMACAlgWins(t *testing.T) {
 			if !strings.Contains(net, key+" sha256;") {
 				t.Errorf("the explicit digest was not kept:\n%s", got)
 			}
-
-			if strings.Contains(net, drbd.DefaultCramHMACAlg) {
-				t.Errorf("the default was written next to an explicit digest:\n%s", got)
-			}
 		})
 	}
 }
 
-// No secret, no digest: cram-hmac-alg without a shared-secret makes the
-// kernel refuse the connection, and blockstor does not invent secrets.
-func TestNoSecretNoCramHMACAlg(t *testing.T) {
-	got, err := drbd.Build(drbd.Resource{
-		Name: "pvc-1",
-		Net:  drbd.Net{Options: map[string]string{"max-buffers": "8000"}},
-	})
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	if strings.Contains(got, "cram-hmac-alg") {
-		t.Errorf("cram-hmac-alg rendered without a secret:\n%s", got)
-	}
-}
-
 // The full net section of a resource adopted from LINSTOR, byte for byte:
-// the satellite-level timing knobs from ControllerConfig, the definition's
-// secret and the digest that goes with it.
+// the satellite-level timing knobs from ControllerConfig, and the
+// definition's secret with the digest the converter stamps next to it.
 func TestAdoptedNetSectionRendersAsLinstorRanIt(t *testing.T) {
 	got, err := drbd.Build(drbd.Resource{
 		Name: "pvc-1",
 		Net: drbd.Net{ProtocolC: true, Options: map[string]string{
 			"connect-int":   "15",
+			"cram-hmac-alg": drbd.DefaultCramHMACAlg,
 			"ping-int":      "12",
 			"ping-timeout":  "10",
 			"shared-secret": "s3cret",
@@ -142,8 +125,8 @@ func TestAdoptedNetSectionRendersAsLinstorRanIt(t *testing.T) {
 	}
 
 	want := "  net {\n" +
-		"    cram-hmac-alg sha1;\n" +
 		"    connect-int 15;\n" +
+		"    cram-hmac-alg sha1;\n" +
 		"    ping-int 12;\n" +
 		"    ping-timeout 10;\n" +
 		"    shared-secret \"s3cret\";\n" +

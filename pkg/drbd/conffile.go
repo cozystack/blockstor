@@ -427,61 +427,27 @@ func isBareTokenByte(c byte) bool {
 // quoted string.
 const sharedSecretOption = "shared-secret"
 
-// cramHMACAlgOption names the digest DRBD authenticates peers with. DRBD
-// runs the challenge-response only when it is set: a shared-secret on its
-// own is configuration the kernel holds and never checks.
-const cramHMACAlgOption = "cram-hmac-alg"
-
-// DefaultCramHMACAlg is the digest written next to a shared secret when
-// DrbdOptions/Net/cram-hmac-alg does not name one. It is what LINSTOR
-// writes, so a resource adopted from it keeps authenticating its peers
-// the way its kernels already do.
+// DefaultCramHMACAlg is the digest LINSTOR writes next to the shared
+// secret of every resource it authenticates. The renderer never adds it
+// on its own: DRBD authenticates peers only once cram-hmac-alg is set,
+// and a satellite that started doing so for a resource whose peers have
+// not been rolled yet fails every handshake with them. It is written as
+// DrbdOptions/Net/cram-hmac-alg, by the LINSTOR converter for a
+// definition LINSTOR authenticated and by an operator for any other.
 const DefaultCramHMACAlg = "sha1"
-
-// hasSharedSecret reports whether the net section carries a secret,
-// either through the typed field or as an option.
-func hasSharedSecret(n Net) bool {
-	if n.SharedSecret != "" {
-		return true
-	}
-
-	for key, value := range n.Options {
-		if strings.EqualFold(key, sharedSecretOption) && value != "" {
-			return true
-		}
-	}
-
-	return false
-}
-
-// hasNetOption reports whether the net options name key, in any case.
-func hasNetOption(n Net, key string) bool {
-	for option := range n.Options {
-		if strings.EqualFold(option, key) {
-			return true
-		}
-	}
-
-	return false
-}
 
 // writeNet emits the `net { … }` block when there is anything to emit
 // (a shared secret or any free-form option). drbd treats an empty `net
 // {}` as legal but noisy, so we skip it entirely when unused.
 //
-// A shared secret always goes out with a cram-hmac-alg, the operator's
-// DrbdOptions/Net/cram-hmac-alg when set and DefaultCramHMACAlg
-// otherwise: without one DRBD does not authenticate the peer at all.
+// cram-hmac-alg is rendered only as an option like any other, never
+// inferred from a shared secret; see DefaultCramHMACAlg.
 func writeNet(b *strings.Builder, n Net) {
 	if n.SharedSecret == "" && len(n.Options) == 0 {
 		return
 	}
 
 	b.WriteString("  net {\n")
-
-	if hasSharedSecret(n) && !hasNetOption(n, cramHMACAlgOption) {
-		writeOption(b, "    ", cramHMACAlgOption, DefaultCramHMACAlg)
-	}
 
 	if n.SharedSecret != "" {
 		fmt.Fprintf(b, "    %s %s;\n", sharedSecretOption, quoteValue(n.SharedSecret))

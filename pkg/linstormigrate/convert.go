@@ -45,6 +45,12 @@ import (
 //nolint:gosec // this is a property-name constant, not the secret value itself
 const drbdSharedSecretProp = "DrbdOptions/Net/shared-secret"
 
+// drbdCramHMACAlgProp is the RD property that turns DRBD peer
+// authentication on. blockstor renders it only when it is set, so the
+// converter writes it, next to the secret, on exactly the definitions
+// LINSTOR authenticated.
+const drbdCramHMACAlgProp = "DrbdOptions/Net/cram-hmac-alg"
+
 // nodeTypeController is the LINSTOR node type blockstor never adopts —
 // blockstor runs its own control plane.
 const nodeTypeController = "CONTROLLER"
@@ -1845,14 +1851,7 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, layer.TCPPort, dsp)
 
 		if layer.Secret != "" && c.carrySharedSecret(row, dsp) {
-			if def.Spec.ExtraProps == nil {
-				def.Spec.ExtraProps = map[string]string{}
-			}
-			// Carried so the satellite renders the same `net {
-			// cram-hmac-alg; shared-secret }` the source cluster's
-			// kernels already run — adoption then re-applies an
-			// identical config instead of re-keying the mesh.
-			def.Spec.ExtraProps[drbdSharedSecretProp] = layer.Secret
+			c.carryAuthentication(def, row.ResourceName, layer.Secret)
 		}
 	}
 
@@ -1864,6 +1863,24 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 	}
 }
 
+// carryAuthentication writes LINSTOR's authentication pair onto the
+// converted definition, so the satellite renders the same `net {
+// cram-hmac-alg; shared-secret }` the source cluster's kernels already
+// run and adoption re-applies an identical config instead of re-keying
+// the mesh. The digest is LINSTOR's hard-coded one unless the definition
+// names its own, which is then already among the carried props.
+func (c *converter) carryAuthentication(def *crdv1alpha1.ResourceDefinition, rdName, secret string) {
+	if def.Spec.ExtraProps == nil {
+		def.Spec.ExtraProps = map[string]string{}
+	}
+
+	def.Spec.ExtraProps[drbdSharedSecretProp] = secret
+
+	if !hasKeyFold(c.props.ResourceDefinition(rdName), drbdCramHMACAlgProp) {
+		def.Spec.ExtraProps[drbdCramHMACAlgProp] = drbd.DefaultCramHMACAlg
+	}
+}
+
 // carrySharedSecret says whether the definition's DRBD secret goes onto
 // the converted definition, which is whether LINSTOR put it in the .res.
 //
@@ -1871,16 +1888,17 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 // net section only for a replica whose DrbdOptions/auto-verify-alg
 // resolves, through the replica, definition, group, node and satellite
 // bags, to a value other than `windrbd`. Where it does not, the kernels
-// run with no peer authentication. blockstor renders the pair whenever
-// the secret is set, so carrying it there would switch authentication on
-// during adoption, one node at a time, and a connection re-established
-// between a node already adjusted and one not yet would fail the
-// handshake. The secret is left off and the report says how to turn
-// authentication on afterwards.
+// run with no peer authentication. Carrying the pair there would switch
+// authentication on during adoption, one node at a time, and a
+// connection re-established between a node already adjusted and one not
+// yet would fail the handshake. The secret is left off and the report
+// says how to turn authentication on afterwards.
 //
 // A definition with no live replica has nothing to keep in step with, and
 // keeps its secret; one whose replicas disagree keeps it too, since some
-// of its kernels authenticate already, and is reported.
+// of its kernels authenticate already, and is reported: its other
+// replicas start authenticating during adoption, which is that same
+// window for them.
 func (c *converter) carrySharedSecret(row *ResourceDefinitionRow, dsp string) bool {
 	replicas := c.liveReplicas(row.ResourceName)
 
@@ -1896,12 +1914,12 @@ func (c *converter) carrySharedSecret(row *ResourceDefinitionRow, dsp string) bo
 	case len(replicas) == 0, authenticated == len(replicas):
 		return true
 	case authenticated == 0:
-		c.warnf("resource definition %s: LINSTOR rendered no peer authentication for it (no %s resolves), so the DRBD shared secret is not carried and adoption leaves the connections as they are — set %s after the cutover to authenticate peers",
-			dsp, autoVerifyAlgProp, drbdSharedSecretProp)
+		c.warnf("resource definition %s: LINSTOR rendered no peer authentication for it (no %s resolves), so the DRBD shared secret is not carried and adoption leaves the connections as they are — to authenticate peers after the cutover set %s and %s together; each satellite applies them on its own, and a connection that re-establishes before both of its peers have does not come up until they have",
+			dsp, autoVerifyAlgProp, drbdSharedSecretProp, drbdCramHMACAlgProp)
 
 		return false
 	default:
-		c.warnf("resource definition %s: LINSTOR authenticated peers on %d of %d replicas (%s resolves on some only) — the shared secret is carried, so every replica authenticates after adoption",
+		c.warnf("resource definition %s: LINSTOR authenticated peers on %d of %d replicas (%s resolves on some only) — the shared secret is carried, so every replica authenticates after adoption; until every satellite of the definition has adjusted, a connection that re-establishes between a replica that switched and one that did not does not come up",
 			dsp, authenticated, len(replicas), autoVerifyAlgProp)
 
 		return true
@@ -1921,6 +1939,17 @@ func (c *converter) linstorRendersAuth(row *ResourceDefinitionRow, node string) 
 	} {
 		if value, ok := bag[autoVerifyAlgProp]; ok {
 			return !strings.EqualFold(value, autoVerifyAlgWinDRBD)
+		}
+	}
+
+	return false
+}
+
+// hasKeyFold reports whether props has key in any letter case.
+func hasKeyFold(props map[string]string, key string) bool {
+	for name := range props {
+		if strings.EqualFold(name, key) {
+			return true
 		}
 	}
 

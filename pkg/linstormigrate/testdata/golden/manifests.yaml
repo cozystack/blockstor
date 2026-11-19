@@ -159,6 +159,7 @@ spec:
   extraProps:
     Aux/csi.storage.k8s.io/pvc/name: app-data
     Aux/csi.storage.k8s.io/pvc/namespace: tenant-fixture
+    DrbdOptions/Net/cram-hmac-alg: sha1
     DrbdOptions/Net/shared-secret: fixture-secret-vol1
     DrbdOptions/auto-verify-alg: crct10dif
     FileSystem/Type: ext4
@@ -200,6 +201,7 @@ metadata:
   name: pvc-vol3
 spec:
   extraProps:
+    DrbdOptions/Net/cram-hmac-alg: sha1
     DrbdOptions/Net/shared-secret: fixture-secret-vol3
     DrbdOptions/auto-verify-alg: crc32c
   initialized: true

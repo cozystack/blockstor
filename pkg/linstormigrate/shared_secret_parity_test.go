@@ -19,6 +19,7 @@ limitations under the License.
 package linstormigrate
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -53,8 +54,9 @@ func authDump(props ...PropsContainerRow) *Dump {
 // TestSharedSecretFollowsWhatLinstorRendered: LINSTOR writes the
 // cram-hmac-alg / shared-secret pair only for a replica whose
 // auto-verify-alg resolves to something other than windrbd. blockstor
-// writes it whenever the secret is set, so the secret is carried exactly
-// where LINSTOR's kernels authenticate and adoption changes nothing.
+// writes cram-hmac-alg only when it is set, so the converter carries the
+// secret and stamps the digest exactly where LINSTOR's kernels
+// authenticate, and adoption changes nothing.
 func TestSharedSecretFollowsWhatLinstorRendered(t *testing.T) {
 	const avaKey = "DrbdOptions/auto-verify-alg"
 
@@ -121,6 +123,11 @@ func TestSharedSecretFollowsWhatLinstorRendered(t *testing.T) {
 				t.Errorf("shared secret carried = %v, want %v", carried, tc.carried)
 			}
 
+			alg, stamped := rd.Spec.ExtraProps[drbdCramHMACAlgProp]
+			if stamped != tc.carried || (stamped && alg != "sha1") {
+				t.Errorf("cram-hmac-alg = %q (set %v), want sha1 only where the secret is carried", alg, stamped)
+			}
+
 			if tc.warning != "" && !hasWarning(res, tc.warning) {
 				t.Errorf("missing %q; warnings: %v", tc.warning, res.Warnings)
 			}
@@ -129,5 +136,81 @@ func TestSharedSecretFollowsWhatLinstorRendered(t *testing.T) {
 				t.Errorf("unexpected authentication warning; warnings: %v", res.Warnings)
 			}
 		})
+	}
+}
+
+// cramHMACAlgAnywhere lists every converted object that names a
+// cram-hmac-alg, at any scope blockstor resolves DRBD options from.
+func cramHMACAlgAnywhere(res *Result) []string {
+	var found []string
+
+	scan := func(what string, bags ...map[string]string) {
+		for _, bag := range bags {
+			if hasKeyFold(bag, drbdCramHMACAlgProp) {
+				found = append(found, what)
+			}
+		}
+	}
+
+	if res.ControllerConfig != nil {
+		scan("ControllerConfig", res.ControllerConfig.Spec.ExtraProps)
+	}
+
+	for i := range res.ResourceGroups {
+		rg := &res.ResourceGroups[i]
+		scan("ResourceGroup "+rg.Name, rg.Spec.ExtraProps, rg.Spec.Props)
+	}
+
+	for i := range res.ResourceDefinitions {
+		rd := &res.ResourceDefinitions[i]
+		scan("ResourceDefinition "+rd.Name, rd.Spec.ExtraProps, rd.Spec.Props)
+	}
+
+	for i := range res.Resources {
+		r := &res.Resources[i]
+		scan("Resource "+r.Name, r.Spec.ExtraProps, r.Spec.Props)
+	}
+
+	return found
+}
+
+// TestAUserSecretDoesNotTurnAuthenticationOn: LINSTOR lets an operator
+// set DrbdOptions/Net/shared-secret, and where auto-verify-alg does not
+// resolve it renders that key without cram-hmac-alg, so the peers run
+// unauthenticated. The converter carries the prop as it is and must not
+// add the digest, or adoption would switch authentication on one node at
+// a time.
+func TestAUserSecretDoesNotTurnAuthenticationOn(t *testing.T) {
+	for _, instance := range []string{"/RSC_DFNS/PVC-AUTH", "/RSC_GRPS/SC", PropsInstanceSatellite} {
+		t.Run(instance, func(t *testing.T) {
+			res, err := convertForTest(t, authDump(PropsContainerRow{
+				PropsInstance: instance, PropKey: drbdSharedSecretProp, PropValue: "operator-secret",
+			}))
+			if err != nil {
+				t.Fatalf("Convert: %v", err)
+			}
+
+			if found := cramHMACAlgAnywhere(res); len(found) > 0 {
+				t.Errorf("cram-hmac-alg written for a definition LINSTOR did not authenticate: %s", strings.Join(found, ", "))
+			}
+		})
+	}
+}
+
+// TestADefinitionsOwnCramHMACAlgIsKept: a digest the definition names
+// itself is carried with its props and is not replaced by sha1.
+func TestADefinitionsOwnCramHMACAlgIsKept(t *testing.T) {
+	res, err := convertForTest(t, authDump(
+		PropsContainerRow{PropsInstance: "/RSC_DFNS/PVC-AUTH", PropKey: "DrbdOptions/auto-verify-alg", PropValue: "crc32c"},
+		PropsContainerRow{PropsInstance: "/RSC_DFNS/PVC-AUTH", PropKey: drbdCramHMACAlgProp, PropValue: "sha256"},
+	))
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	rd := findRD(t, res, "pvc-auth")
+
+	if got := rd.Spec.ExtraProps[drbdCramHMACAlgProp]; got != "sha256" {
+		t.Errorf("cram-hmac-alg = %q, want the definition's sha256; extraProps: %v", got, rd.Spec.ExtraProps)
 	}
 }
