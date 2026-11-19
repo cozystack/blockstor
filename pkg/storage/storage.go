@@ -55,6 +55,14 @@ var (
 	// is full but reachable" probe must NOT be mis-classified as
 	// "pool gone".
 	ErrPoolGone = errors.New("storage pool not present")
+	// ErrNotOwned — OrphanReaper.ReapVolume refused a volume that does
+	// not carry blockstor's ownership marker. The sweeper reports it
+	// and leaves the volume where it is.
+	ErrNotOwned = errors.New("volume does not carry blockstor's ownership marker")
+	// ErrHasSnapshots — OrphanReaper.ReapVolume refused a volume that
+	// holds snapshots other than blockstor's own deferred-delete
+	// markers, because deleting it would take them along.
+	ErrHasSnapshots = errors.New("volume holds snapshots")
 )
 
 // Volume identifies a block-level volume on a satellite. The triple
@@ -194,6 +202,46 @@ type VolumeRef struct {
 	// today have at most one volume; the field exists so the
 	// sweeper stays correct when multi-volume RDs land.
 	VolumeNumber int32
+}
+
+// OrphanReaper is the capability the orphan-storage sweeper needs
+// before it may delete anything: proof that blockstor provisioned the
+// volume, and a delete that cannot take snapshots along. A provider
+// that implements VolumeLister without it is listed but never reaped.
+//
+// The proof is an ownership marker the provider writes in the same
+// command that creates the volume (a ZFS user property, an LVM tag),
+// and writes again whenever it finds the volume already present while
+// provisioning it for a Resource, which is how volumes created before
+// the marker existed, and volumes adopted from LINSTOR, acquire it.
+// A volume without the marker is one blockstor never took
+// responsibility for: data that was in the pool before blockstor, or
+// a blockstor volume whose Resource was gone before the marker
+// existed. The two cannot be told apart, so neither is ever reaped.
+type OrphanReaper interface {
+	// InspectVolume reports whether the volume carries the marker
+	// and which snapshots it holds.
+	InspectVolume(ctx context.Context, vol Volume) (VolumeOwnership, error)
+
+	// ReapVolume deletes a volume the sweeper classified as a leak.
+	// Unlike DeleteVolume it checks the marker and the snapshots again
+	// at the moment of deletion and never deletes recursively: it
+	// returns ErrNotOwned or ErrHasSnapshots instead of deleting a
+	// volume that has lost the marker or gained a snapshot since the
+	// sweeper inspected it.
+	ReapVolume(ctx context.Context, vol Volume) error
+}
+
+// VolumeOwnership is what InspectVolume found on disk.
+type VolumeOwnership struct {
+	// Owned is true when the volume carries blockstor's ownership
+	// marker, set on the volume itself rather than inherited.
+	Owned bool
+
+	// Snapshots names the snapshots the volume holds, excluding
+	// blockstor's own deferred-delete markers, which exist only to
+	// keep a clone alive and are cleaned up with the volume.
+	Snapshots []string
 }
 
 // SnapshotShipper is the optional cross-node-clone capability — a

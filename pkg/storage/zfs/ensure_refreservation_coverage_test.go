@@ -43,13 +43,13 @@ import (
 // Allow-list functions are explicit and tiny: only test helpers and
 // the helper itself can mutate without re-invoking the helper.
 func TestEnsureRefreservationCoverage(t *testing.T) {
-	const (
-		helperCall = "ensureRefreservation("
-	)
+	// ensureProvisioned runs ensureRefreservation as its last step,
+	// so calling it satisfies the rule.
+	helperCalls := []string{"ensureRefreservation(", "ensureProvisioned("}
 
 	// Markers that indicate a dataset-mutating ZFS operation. Any
 	// function body containing one of these strings MUST also
-	// contain helperCall.
+	// contain one of helperCalls.
 	//
 	// Markers cover both the literal-argv shape (`"zfs", "clone"`,
 	// `"zfs", "recv"`) and the dynamic-argv shape used by CreateVolume
@@ -63,20 +63,80 @@ func TestEnsureRefreservationCoverage(t *testing.T) {
 		`"volsize="`,
 	}
 
-	// Functions exempt from the rule: the helper itself + any test
-	// helpers (none currently).
+	// Functions exempt from the rule: the helpers themselves + any
+	// test helpers (none currently).
 	allow := map[string]bool{
 		"ensureRefreservation": true,
+		"ensureProvisioned":    true,
 	}
 
-	pkgDir := "."
+	for fnName, body := range zfsFuncBodies(t) {
+		if allow[fnName] {
+			continue
+		}
 
-	entries, err := os.ReadDir(pkgDir)
+		hitMarker := firstContained(body, mutationMarkers)
+		if hitMarker == "" {
+			continue
+		}
+
+		if firstContained(body, helperCalls) == "" {
+			t.Errorf("Bug 252+253+254+255 guard: %s contains dataset-mutating "+
+				"marker %q but does NOT call ensureRefreservation — every path that mutates volsize "+
+				"or materialises a new dataset must end on ensureRefreservation so "+
+				"the thick guarantee is preserved",
+				fnName, hitMarker)
+		}
+	}
+}
+
+// TestOwnerMarkerCoverage is the same guard for the ownership marker
+// (issue 264): every function that materialises a zvol, or finds one
+// already there while provisioning it, must leave the marker on it,
+// either in the materialising command itself (ownerAssignment) or
+// through ensureProvisioned. A path that forgets it creates a zvol the
+// orphan sweeper can never reclaim; the guard keeps the next new
+// path from forgetting.
+func TestOwnerMarkerCoverage(t *testing.T) {
+	materialising := []string{`"clone"`, `"recv"`, `"receive"`, `"create"`}
+	markerWriters := []string{"ownerAssignment", "ensureProvisioned("}
+
+	for fnName, body := range zfsFuncBodies(t) {
+		hitMarker := firstContained(body, materialising)
+		if hitMarker == "" {
+			continue
+		}
+
+		if firstContained(body, markerWriters) == "" {
+			t.Errorf("issue 264 guard: %s materialises a dataset (%q) without writing "+
+				"the ownership marker", fnName, hitMarker)
+		}
+	}
+}
+
+// firstContained returns the first of needles found in body, or "".
+func firstContained(body string, needles []string) string {
+	for _, needle := range needles {
+		if strings.Contains(body, needle) {
+			return needle
+		}
+	}
+
+	return ""
+}
+
+// zfsFuncBodies maps every function declared in the package's non-test
+// sources to the source text of its body.
+func zfsFuncBodies(t *testing.T) map[string]string {
+	t.Helper()
+
+	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read dir: %v", err)
 	}
 
 	fset := token.NewFileSet()
+	bodies := map[string]string{}
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -84,7 +144,7 @@ func TestEnsureRefreservationCoverage(t *testing.T) {
 			continue
 		}
 
-		path := filepath.Join(pkgDir, name)
+		path := filepath.Join(".", name)
 
 		src, err := os.ReadFile(path)
 		if err != nil {
@@ -102,12 +162,6 @@ func TestEnsureRefreservationCoverage(t *testing.T) {
 				continue
 			}
 
-			fnName := fn.Name.Name
-			if allow[fnName] {
-				continue
-			}
-
-			// Slice the source range for this function body.
 			bodyStart := fset.Position(fn.Body.Lbrace).Offset
 			bodyEnd := fset.Position(fn.Body.Rbrace).Offset
 
@@ -115,29 +169,9 @@ func TestEnsureRefreservationCoverage(t *testing.T) {
 				continue
 			}
 
-			body := string(src[bodyStart:bodyEnd])
-
-			var hitMarker string
-
-			for _, marker := range mutationMarkers {
-				if strings.Contains(body, marker) {
-					hitMarker = marker
-
-					break
-				}
-			}
-
-			if hitMarker == "" {
-				continue
-			}
-
-			if !strings.Contains(body, helperCall) {
-				t.Errorf("Bug 252+253+254+255 guard: %s contains dataset-mutating "+
-					"marker %q but does NOT call %s — every path that mutates volsize "+
-					"or materialises a new dataset must end on ensureRefreservation so "+
-					"the thick guarantee is preserved",
-					fnName, hitMarker, helperCall)
-			}
+			bodies[fn.Name.Name] = string(src[bodyStart:bodyEnd])
 		}
 	}
+
+	return bodies
 }

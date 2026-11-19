@@ -68,7 +68,7 @@ func TestCreateVolumeThick(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "zfs create -V 1024M tank/pvc-1_00000"
+	want := "zfs create -o blockstor.org:owner=blockstor -V 1024M tank/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -91,7 +91,7 @@ func TestCreateVolumeThin(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "zfs create -s -V 1024M tank/pvc-1_00000"
+	want := "zfs create -s -o blockstor.org:owner=blockstor -V 1024M tank/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
