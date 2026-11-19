@@ -633,9 +633,10 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 // a device that carries a signature.
 const deviceHoldsDataReason = "LUKSDeviceHoldsData"
 
-// luksRefusal is a LUKS layer refusal an operator must act on, and the
-// Warning Event reason it is reported under.
-type luksRefusal struct {
+// applyRefusal is a refusal of the apply an operator must act on, from the
+// LUKS layer or from drbdmeta, and the Warning Event reason it is reported
+// under.
+type applyRefusal struct {
 	err          error
 	reason, what string
 }
@@ -645,8 +646,8 @@ type luksRefusal struct {
 const createMDRefusedReason = "CreateMdRefused"
 
 // applyRefusals lists every refusal reported as a Warning Event.
-func applyRefusals() []luksRefusal {
-	return append(luksRefusals(), luksRefusal{
+func applyRefusals() []applyRefusal {
+	return append(luksRefusals(), applyRefusal{
 		drbd.ErrCreateMDRefused, createMDRefusedReason,
 		"drbdmeta refused to create metadata over the data on the lower disk",
 	})
@@ -674,8 +675,8 @@ func failureRequeue(results []*intent.ResourceApplyResult) time.Duration {
 // luksRefusals lists the refusals the LUKS layer reports through the apply
 // message. Each leaves the volume down, and an Info line in this log is
 // not where an operator looks for why.
-func luksRefusals() []luksRefusal {
-	return []luksRefusal{
+func luksRefusals() []applyRefusal {
+	return []applyRefusal{
 		{luks.ErrDeviceHoldsData, deviceHoldsDataReason, "the LUKS layer refused to format a device that already holds data"},
 		{luks.ErrLUKSKeyMissing, "LUKSKeyMissing", "the device has a LUKS header but the replica carries no password for it"},
 		{luks.ErrLUKSKeyMismatch, "LUKSKeyMismatch", "the replica's password does not open the device's LUKS header"},
