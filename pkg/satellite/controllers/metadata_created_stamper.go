@@ -56,29 +56,29 @@ type MetadataCreatedStamper struct {
 // Condition onto the Resource CR of the replica of resourceName on
 // nodeName, named the way the store named it (see replicaCRName).
 func (s *MetadataCreatedStamper) StampMetadataCreated(ctx context.Context, resourceName, nodeName string) error {
-	return s.stampReplica(ctx, resourceName, nodeName, metadataCreatedByCreateMd)
+	return s.stampReplica(ctx, resourceName, nodeName, metadataCreatedByCreateMd())
 }
 
 // StampMetadataFound stamps the same Condition for a replica whose
 // metadata dump-md found on every volume, with a Reason that says
 // create-md did not run.
 func (s *MetadataCreatedStamper) StampMetadataFound(ctx context.Context, resourceName, nodeName string) error {
-	return s.stampReplica(ctx, resourceName, nodeName, metadataCreatedFound)
+	return s.stampReplica(ctx, resourceName, nodeName, metadataCreatedFound())
 }
 
 // metadataCreatedCause is the Reason and Message of a true
 // MetadataCreated Condition.
 type metadataCreatedCause struct{ reason, message string }
 
-//nolint:gochecknoglobals // immutable Reason/Message pairs
-var (
-	metadataCreatedByCreateMd = metadataCreatedCause{
-		blockstoriov1alpha1.MetadataCreatedReasonCreateMd, "drbdmeta create-md completed",
-	}
-	metadataCreatedFound = metadataCreatedCause{
+func metadataCreatedByCreateMd() metadataCreatedCause {
+	return metadataCreatedCause{blockstoriov1alpha1.MetadataCreatedReasonCreateMd, "drbdmeta create-md completed"}
+}
+
+func metadataCreatedFound() metadataCreatedCause {
+	return metadataCreatedCause{
 		blockstoriov1alpha1.MetadataCreatedReasonFound, "drbdmeta dump-md found existing metadata; create-md not run",
 	}
-)
+}
 
 func (s *MetadataCreatedStamper) stampReplica(ctx context.Context, resourceName, nodeName string, cause metadataCreatedCause) error {
 	name, err := replicaCRName(ctx, s.Client, resourceName, nodeName)
