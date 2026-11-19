@@ -142,7 +142,7 @@ func unknownBackingAnswers(device string) map[string]storage.FakeResponse {
 		"empty success":       {},
 		"ambivalent":          {Err: storage.FakeExitError{Code: 8}},
 		"usage error":         {Err: storage.FakeExitError{Code: 4}},
-		"cannot open": {Err: fmt.Errorf("%w: blkid -p -u filesystem -o export %s: blkid: error: %s: Permission denied",
+		"cannot open": {Err: fmt.Errorf("%w: blkid -p -n nodrbd -o export %s: blkid: error: %s: Permission denied",
 			storage.FakeExitError{Code: 2}, device, device)},
 	}
 }

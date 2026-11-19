@@ -106,16 +106,16 @@ func expectGetGI(fx *storage.FakeExec, rd, device, currentGI string) {
 // backingProbe is the filesystem-only low-level blkid probe the BUG-028
 // gates run on a backing device.
 func backingProbe(device string) string {
-	return "blkid -p -u filesystem -o export " + device
+	return "blkid -p -n nodrbd -o export " + device
 }
 
 // expectDrbdMetaSignature cans the answer real hardware gives for the
 // BACKING device of a never-formatted internal-metadata DRBD volume. A
 // plain blkid reports TYPE=drbd there (libblkid stops at the DRBD meta
 // superblock at the device tail; stand forensics,
-// bug028-fix-validation-20260612-054452/iter2); the filesystem-only
-// probe skips that superblock and finds nothing, exit 2. The BUG-028
-// probes MUST read this as "no filesystem".
+// bug028-fix-validation-20260612-054452/iter2); the probe without the
+// DRBD prober skips that superblock and finds nothing, exit 2. The
+// BUG-028 probes MUST read this as "no filesystem".
 func expectDrbdMetaSignature(fx *storage.FakeExec, device string) {
 	fx.Expect(backingProbe(device), storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 }
