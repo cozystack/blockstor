@@ -1437,8 +1437,6 @@ func allowed() map[string]string {
 		"pkg/dispatcher/dispatcher.go: drbdOpts[\"peer.\"+peer+\".port\"]":     oneIntent,
 		"pkg/rest/snapshots.go: objRefs[\"CreateTimestamp/\"+node.NodeName]":   shownKeys,
 		"pkg/rest/snapshots.go: objRefs[\"SnapshotUuid/\"+node.NodeName]":      shownKeys,
-		"pkg/satellite/kernel_cleanup.go: expectedSet[n]": "" +
-			"the intent's peer names, against kernel peer slots the satellite named from the same intent",
 		"pkg/store/cascade.go: slices.Contains(spellings, spelling)": "" +
 			"the store's own list of the spellings it asks under, which differ on purpose; deduplicated as written",
 		"internal/cli/definition.go: seen[key]": "" +

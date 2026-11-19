@@ -52,6 +52,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/satellite"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -579,7 +580,7 @@ func (r *ResourceReconciler) prepareDRBDApply(
 	pruneErr := r.Config.Apply.PruneStaleKernelSlots(
 		ctx,
 		rd.Name,
-		expectedPeerNamesFor(res, peers),
+		peerExpectationFor(res, peers),
 		volNumsOf(rd),
 		nil, // devices unknown at this layer; forget-peer skipped per-vol
 	)
@@ -587,7 +588,51 @@ func (r *ResourceReconciler) prepareDRBDApply(
 		logger.Error(pruneErr, "PruneStaleKernelSlots failed; continuing to allocation gate")
 	}
 
-	return r.waitForControllerAllocation(ctx, res, peers, logger)
+	waitResult, ok := r.waitForControllerAllocation(ctx, res, peers, logger)
+	if !ok {
+		return waitResult, false
+	}
+
+	return r.holdForAdoptedPeers(ctx, res, rd, peers, logger)
+}
+
+// holdForAdoptedPeers keeps the first render of an adopted resource
+// back while its kernel slot is connected to a peer whose Resource has
+// not been observed. That render's `drbdadm adjust` would delete the
+// connection, so a peer applied a moment after this one (a bulk
+// adoption delivers the Resources of a definition in name order) would
+// be disconnected and resynced. The hold is bounded: once it runs out
+// the render goes ahead without the peer and a Warning Event says so,
+// rather than leaving the replica unapplied for good.
+func (r *ResourceReconciler) holdForAdoptedPeers(
+	ctx context.Context,
+	res *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	peers []blockstoriov1alpha1.Resource,
+	logger logr.Logger,
+) (ctrl.Result, bool) {
+	hold := r.Config.Apply.AdoptedPeersWithoutResource(ctx, rd.Name, expectedPeerNamesFor(res, peers), time.Now())
+	if len(hold.Missing) == 0 {
+		return ctrl.Result{}, true
+	}
+
+	if hold.HoldsRender() {
+		logger.Info("holding the first render of an adopted resource until its kernel peers have Resources",
+			"missingPeers", hold.Missing, "since", hold.Since)
+
+		return ctrl.Result{RequeueAfter: peerAllocationRequeue}, false
+	}
+
+	logger.Info("adopted kernel peers still have no Resource; rendering without them",
+		"missingPeers", hold.Missing, "since", hold.Since)
+
+	if r.Config.Recorder != nil {
+		r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, "AdoptedPeerWithoutResource", "Apply",
+			"kernel peers %v have no Resource since %s; rendering without them disconnects them",
+			hold.Missing, hold.Since.Format(time.RFC3339))
+	}
+
+	return ctrl.Result{}, true
 }
 
 // recordPerResourceFailures logs each per-resource Apply failure and
@@ -1295,6 +1340,25 @@ func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blocksto
 	return out
 }
 
+// peerExpectationFor is what the prune may rely on about the RD's
+// peers: the observed peer names, the node-ids the observed replicas
+// hold, and whether they pass the same allocation gate the apply path
+// waits on. peers comes from listPeerResources and includes the target.
+func peerExpectationFor(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) satellite.PeerExpectation {
+	expect := satellite.PeerExpectation{
+		PeerNames: expectedPeerNamesFor(target, peers),
+		Allocated: allocationComplete(target, peers),
+	}
+
+	for i := range peers {
+		if id, ok := dispatcher.AllocatedNodeID(&peers[i]); ok {
+			expect.AllocatedNodeIDs = append(expect.AllocatedNodeIDs, id)
+		}
+	}
+
+	return expect
+}
+
 // volNumsOf extracts the volume-number set from
 // `rd.Spec.VolumeDefinitions`. The Bug 342 v3 Pass-3 stuck-slot
 // probe needs the set to query the kernel's peer-device
@@ -1309,6 +1373,22 @@ func volNumsOf(rd *blockstoriov1alpha1.ResourceDefinition) []int32 {
 	}
 
 	return out
+}
+
+// targetAllocated reports that the controller has stamped the
+// target's own DRBD node-id, port and minor on Status, the half of
+// the allocation gate that reads only the target.
+func targetAllocated(res *blockstoriov1alpha1.Resource) bool {
+	return res.Status.DRBDNodeID != nil && res.Status.DRBDPort != nil && res.Status.DRBDMinor != nil
+}
+
+// allocationComplete is the predicate waitForControllerAllocation
+// waits on: the target's Status allocation and a node-id on every
+// diskful replica. The gate itself also re-reads the target uncached
+// before it gives up; callers of this predicate take the view they
+// hold, which can only make it report false too early, never true.
+func allocationComplete(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) bool {
+	return targetAllocated(target) && dispatcher.DiskfulPeersAllocated(target, peers)
 }
 
 // waitForControllerAllocation gates the apply path on the
@@ -1355,7 +1435,7 @@ func volNumsOf(rd *blockstoriov1alpha1.ResourceDefinition) []int32 {
 // so the caller's downstream `dispatcher.BuildDesired` sees the
 // fresh allocation in the same reconcile.
 func (r *ResourceReconciler) waitForControllerAllocation(ctx context.Context, res *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, bool) {
-	if res.Status.DRBDNodeID == nil || res.Status.DRBDPort == nil || res.Status.DRBDMinor == nil {
+	if !targetAllocated(res) {
 		// APIReader fall-through (Bug 289): when the cached view
 		// reports nil DRBD-IDs, the controller may have already
 		// stamped them — re-fetch uncached before declaring the
