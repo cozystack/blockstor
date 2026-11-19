@@ -75,6 +75,13 @@ type ResourceGroupReconciler struct {
 // to backfill replicas missing under the new spec. Idempotent: an
 // RG without any change still passes through, the placer's
 // already-placed accounting prevents extra Resources.
+//
+// Any RG event lands here, the initial list on a controller start
+// included, so this is a placement nobody asked for. It leaves alone
+// the definitions LINSTOR's balance task would (balanceSkipReason): one
+// with no UpToDate diskful replica, such as a volume deleted while its
+// snapshots keep the definition, gets no replicas from an RG event. An
+// `rg modify` still reaches them through the rebalance-pending path.
 func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -99,7 +106,20 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			continue
 		}
 
-		err := r.applyRGToRD(ctx, &rg, &rds[i])
+		reason, err := balanceSkipReason(ctx, r.Store, &rds[i])
+		if err != nil {
+			log.Error(err, "apply RG to RD", "rg", rg.Name, "rd", rds[i].Name)
+
+			continue
+		}
+
+		if reason != "" {
+			log.V(1).Info("RG placement skipped", "rg", rg.Name, "rd", rds[i].Name, "reason", reason)
+
+			continue
+		}
+
+		err = r.applyRGToRD(ctx, &rg, &rds[i])
 		if err != nil {
 			log.Error(err, "apply RG to RD",
 				"rg", rg.Name, "rd", rds[i].Name)

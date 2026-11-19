@@ -28,7 +28,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// Reasons the scheduled rebalance tick leaves a definition alone. They
+// Reasons an implicit placement pass leaves a definition alone. They
 // only reach the debug log; the strings name the condition so an
 // operator reading it knows which one held.
 const (
@@ -37,8 +37,9 @@ const (
 	balanceSkipNoUpToDate = "no diskful replica is UpToDate"
 )
 
-// balanceSkipReason reports why the scheduled rebalance tick must not
-// add replicas to rd, or "" when it may.
+// balanceSkipReason reports why a placement pass nobody asked for (the
+// scheduled rebalance tick, an RG watch event) must not add replicas
+// to rd, or "" when it may.
 //
 // LINSTOR's balance task tops a definition up only when it still holds
 // data: a definition being deleted is skipped, and so is one with no

@@ -70,7 +70,7 @@ func TestRGPlaceCountBumpFillsGap(t *testing.T) {
 	}
 
 	for _, n := range []string{"n1", "n2"} {
-		_ = st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-prop", NodeName: n})
+		_ = st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-prop", NodeName: n, Volumes: upToDateVolumes()})
 	}
 
 	// Bump place_count on the RG.
@@ -160,15 +160,14 @@ func TestRGUpdateNoChangeNoOp(t *testing.T) {
 }
 
 // TestRGReconcilePlaceCountZeroDefaultsToOne pins the
-// default-place-count-to-1 branch of applyRGToRD (was 80%).
-// An RG with PlaceCount=0 (operator explicitly omitted, or RG
-// upgraded from a schema that didn't have the field) must
-// produce exactly 1 replica per spawned RD — not zero, which
-// would create RDs with no replicas at all.
+// default-place-count-to-1 branch of applyRGToRD. An RG with
+// PlaceCount=0 (operator explicitly omitted, or RG upgraded from a
+// schema that didn't have the field) tops an RD up to 1 replica.
 //
-// Mirrors upstream LINSTOR's "1 replica until told otherwise"
-// default. A regression that dropped the explicit fallback would
-// silently leave fresh RDs with empty replica sets.
+// An RG event only acts on an RD that has an UpToDate diskful replica
+// (see TestRGEventLeavesEmptiedDefinitionAlone), so the one here sits
+// on an evicted node: it lets the event act and does not count toward
+// the place count, leaving one replica to place on the healthy node.
 func TestRGReconcilePlaceCountZeroDefaultsToOne(t *testing.T) {
 	t.Parallel()
 
@@ -178,7 +177,12 @@ func TestRGReconcilePlaceCountZeroDefaultsToOne(t *testing.T) {
 	st := store.NewInMemory()
 
 	for _, n := range []string{"n1", "n2"} {
-		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite})
+		node := &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}
+		if n == "n1" {
+			node.Flags = []string{apiv1.NodeFlagEvicted}
+		}
+
+		_ = st.Nodes().Create(ctx, node)
 		_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
 			StoragePoolName: "pool",
 			NodeName:        n,
@@ -197,6 +201,7 @@ func TestRGReconcilePlaceCountZeroDefaultsToOne(t *testing.T) {
 		Name:              "pvc-zero",
 		ResourceGroupName: "rg-zero",
 	})
+	_ = st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-zero", NodeName: "n1", Volumes: upToDateVolumes()})
 
 	rec := &controllerpkg.ResourceGroupReconciler{Client: cli, Scheme: scheme, Store: st}
 
@@ -205,7 +210,54 @@ func TestRGReconcilePlaceCountZeroDefaultsToOne(t *testing.T) {
 	}
 
 	got, _ := st.Resources().ListByDefinition(ctx, "pvc-zero")
-	if len(got) != 1 {
-		t.Errorf("replicas: got %d, want 1 (default-place-count-to-1); entries=%v", len(got), got)
+	if len(got) != 2 {
+		t.Errorf("replicas: got %d, want the evicted one plus 1 (default-place-count-to-1); entries=%v", len(got), got)
+	}
+}
+
+// TestRGEventLeavesEmptiedDefinitionAlone: any RG event reaches the RG
+// reconciler, the initial list on every controller start included. A
+// definition whose volume was deleted while a snapshot keeps it has no
+// replicas, and an RG event must not give it a fresh, empty set; nor
+// may it top up a definition that is being deleted.
+func TestRGEventLeavesEmptiedDefinitionAlone(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	st := store.NewInMemory()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite})
+		_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		})
+	}
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 3, StoragePool: "pool"},
+	})
+	_ = st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-emptied", ResourceGroupName: "rg"})
+	_ = st.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "snap", ResourceName: "pvc-emptied", Nodes: []string{"n1", "n2", "n3"}})
+	_ = st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "pvc-deleting", ResourceGroupName: "rg", Flags: []string{apiv1.ResourceFlagDelete},
+	})
+	_ = st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-deleting", NodeName: "n1", Volumes: upToDateVolumes()})
+
+	rec := &controllerpkg.ResourceGroupReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	for rd, want := range map[string]int{"pvc-emptied": 0, "pvc-deleting": 1} {
+		got, _ := st.Resources().ListByDefinition(ctx, rd)
+		if len(got) != want {
+			t.Errorf("%s: got %d replicas after an RG event, want %d; entries=%v", rd, len(got), want, got)
+		}
 	}
 }
