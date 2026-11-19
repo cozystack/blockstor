@@ -147,19 +147,9 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
 	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
 
-	// Bug 137: diskless / TIE_BREAKER replicas never get a
-	// per-volume Status row written by the satellite (no local
-	// backing device, no usage to report). The CRD-to-wire
-	// projection therefore returns Volumes=nil, the JSON encoder
-	// drops the `volumes` key under `omitempty`, and python-linstor
-	// crashes on `rsc._rest_data['volumes'][0]` with AttributeError
-	// because the key is `None`. Synthesise one placeholder per
-	// parent-RD VolumeDefinition so the wire shape mirrors a
-	// diskful replica — same volume_number, same layer chain — but
-	// with no satellite-observed allocation. Non-diskless replicas
-	// with an empty Volumes slice still get a `[]` (the absent-key
-	// regression strikes them too: e.g. a freshly-created diskful
-	// replica before the satellite has reported usage).
+	// Bug 137: a replica the satellite reports no storage for (a
+	// diskless or TIE_BREAKER one, or one not built yet) still lists a
+	// volume per parent-RD VolumeDefinition, as LINSTOR's view does.
 	annotated = ensureVolumesForView(annotated, rsc, vdSizes)
 
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
@@ -224,63 +214,71 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 // crashes the CLI with AttributeError.
 const disklessStorPoolName = "DfltDisklessStorPool"
 
-// ensureVolumesForView returns a non-nil Volume slice for the wire
-// view. Bug 137 follow-up: a nil slice OR a zero-length non-nil slice
-// both serialise as a missing JSON key when the field carries
-// `omitempty` (the initial fix kept the tag and only solved half the
-// case). The wire shape contract is now: `volumes` key always
-// present.
+// ensureVolumesForView returns the replica's volumes with one entry for
+// every volume definition of its parent, as LINSTOR does: the controller
+// creates a replica's Volume objects together with the replica
+// (CtrlRscCrtApiHelper), so its REST answers list them from that moment,
+// with no device path or disk state until the satellite reports.
+// blockstor's volumes come from what the satellite reported, so a replica
+// the satellite has not built yet, or a diskless one it never reports
+// storage for, would otherwise answer with no volumes at all. Clients
+// index into that list: linstor-scheduler-extender reads volumes[0] of
+// every replica in the view and panics on an empty one, linstor-csi's
+// attach gets a 404 for volume 0 instead of an answer without a device
+// path, and python-linstor's `rsc._rest_data['volumes'][0]` raises
+// (Bug 137).
 //
-// We solve the empty-slice case in two tiers:
-//
-//  1. Diskless / TIE_BREAKER replica with no observed Volumes:
-//     synthesise one placeholder per parent-RD VolumeDefinition so
-//     the wire entry has the same volume_number cardinality as a
-//     diskful replica. `storage_pool_name` is stamped with the
-//     upstream-LINSTOR sentinel `DfltDisklessStorPool` (see
-//     disklessStorPoolName) so `linstor n describe` recognises the
-//     row as a diskless witness instead of crashing on
-//     `find_child(...)` returning None.
-//  2. Any other replica that happens to arrive with an empty
-//     Volumes slice (e.g. fresh diskful replica before the
-//     satellite has written Status.Volumes): emit `[]` rather than
-//     omitting the key. Same crash class, just less common.
-//
-// Diskful replicas with already-populated Volumes are passed
-// through verbatim — the placeholder path must not shadow real
-// satellite-observed allocation / disk_state.
+// A volume the satellite reported is passed through verbatim; the
+// placeholders carry only the volume number and the pool. A diskless or
+// TIE_BREAKER replica's placeholder names the upstream sentinel pool
+// `DfltDisklessStorPool` (see disklessStorPoolName), so `linstor n
+// describe` recognises the row as a diskless witness. The result is
+// never nil, so the `volumes` key is always present on the wire.
 func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) []apiv1.Volume {
-	if len(observed) > 0 {
-		return observed
+	out := make([]apiv1.Volume, 0, max(len(observed), len(vdSizes)))
+	out = append(out, observed...)
+
+	pool := rsc.Props["StorPoolName"]
+	if isDisklessReplica(rsc) {
+		pool = disklessStorPoolName
 	}
 
-	if !isDisklessReplica(rsc) {
-		// Empty slice instead of nil so the JSON encoder emits
-		// `[]` not the absent key. Bug 137 wire contract.
-		return []apiv1.Volume{}
-	}
-
-	// Stable iteration over the VD index: map keys are
-	// non-deterministic and the wire order has to be stable across
-	// calls so paginated CLI consumers don't see volume_number
-	// jitter between requests.
-	volNums := make([]int32, 0, len(vdSizes))
 	for vn := range vdSizes {
-		volNums = append(volNums, vn)
-	}
+		if slices.ContainsFunc(observed, func(v apiv1.Volume) bool { return v.VolumeNumber == vn }) {
+			continue
+		}
 
-	slices.Sort(volNums)
-
-	out := make([]apiv1.Volume, 0, len(volNums))
-
-	for _, vn := range volNums {
 		out = append(out, apiv1.Volume{
 			VolumeNumber: vn,
-			StoragePool:  disklessStorPoolName,
+			StoragePool:  pool,
 			// AllocatedKib defaults to 0 (the Bug 112 contract:
-			// always emit the key as an int >= 0). Diskless has
-			// no real allocation, so 0 is the truthful value.
+			// always emit the key as an int >= 0); nothing has been
+			// allocated that the satellite reported.
 		})
+	}
+
+	// Stable order: the VD index is a map, and paginated CLI consumers
+	// must not see volume_number jitter between requests.
+	slices.SortStableFunc(out, func(left, right apiv1.Volume) int {
+		return int(left.VolumeNumber) - int(right.VolumeNumber)
+	})
+
+	return out
+}
+
+// definitionVolumeSizes returns the parent definition's volume numbers
+// and sizes, the per-replica analogue of vdSizeIndex. A definition whose
+// volume definitions cannot be read yields none, so the caller answers
+// with the volumes the satellite reported rather than failing the read.
+func (s *Server) definitionVolumeSizes(ctx context.Context, rdName string) map[int32]int64 {
+	vds, err := s.Store.VolumeDefinitions().List(ctx, rdName)
+	if err != nil {
+		return nil
+	}
+
+	out := make(map[int32]int64, len(vds))
+	for i := range vds {
+		out[vds[i].VolumeNumber] = vds[i].SizeKib
 	}
 
 	return out
