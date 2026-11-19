@@ -58,7 +58,12 @@ func volumeDisk(t *testing.T, target *blockstoriov1alpha1.Resource, rd *blocksto
 
 	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).Build()
 
-	got, err := effectiveprops.VolumeDiskOptions(t.Context(), c, target, rd)
+	effective, err := effectiveprops.Resolve(t.Context(), c, target, rd)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	got, err := effectiveprops.VolumeDiskOptions(t.Context(), c, target, rd, effective)
 	if err != nil {
 		t.Fatalf("VolumeDiskOptions: %v", err)
 	}
@@ -126,5 +131,48 @@ func TestVolumeDiskOptionsFollowLinstorPrecedence(t *testing.T) {
 	}
 	if !maps.EqualFunc(got, want, maps.Equal) {
 		t.Errorf("VolumeDiskOptions = %v, want %v", got, want)
+	}
+}
+
+// LINSTOR's auto rule for rs-discard-granularity: while
+// DrbdOptions/auto-rs-discard-granularity is unset or true, the volume's
+// value is the volume definition's alone. A value on the volume group
+// or the replica does not reach the volume, whether or not the
+// definition sets one; switched off anywhere in the chain, the ordinary
+// precedence applies again.
+func TestRsDiscardGranularityFollowsLinstorsAutoRule(t *testing.T) {
+	t.Parallel()
+
+	rg := &blockstoriov1alpha1.ResourceGroup{
+		ObjectMeta: v1.ObjectMeta{Name: "rg-1"},
+		Spec: blockstoriov1alpha1.ResourceGroupSpec{VolumeGroups: []blockstoriov1alpha1.ResourceGroupVolumeGroup{
+			{VolumeNumber: 1, Props: map[string]string{"DrbdOptions/Disk/rs-discard-granularity": "65536"}},
+		}},
+	}
+
+	target := replica()
+	target.Spec.ExtraProps = map[string]string{"DrbdOptions/Disk/rs-discard-granularity": "4096"}
+
+	got := volumeDisk(t, target, adoptedVolumeRD(), rg)
+
+	if v := got[0]["rs-discard-granularity"]; v != "16384" {
+		t.Errorf("volume 0 rs-discard-granularity = %q, want the definition's 16384", v)
+	}
+
+	if v, ok := got[1]["rs-discard-granularity"]; ok {
+		t.Errorf("volume 1 rs-discard-granularity = %q from the group or replica, want none", v)
+	}
+
+	rd := adoptedVolumeRD()
+	rd.Spec.ExtraProps["DrbdOptions/auto-rs-discard-granularity"] = "false"
+
+	got = volumeDisk(t, target, rd, rg)
+
+	if v := got[0]["rs-discard-granularity"]; v != "4096" {
+		t.Errorf("rule off: volume 0 rs-discard-granularity = %q, want the replica's 4096", v)
+	}
+
+	if v := got[1]["rs-discard-granularity"]; v != "4096" {
+		t.Errorf("rule off: volume 1 rs-discard-granularity = %q, want the replica's 4096 over the group's", v)
 	}
 }

@@ -244,7 +244,16 @@ const diskOptionPrefix = drbd.PropPrefix + "Disk/"
 // only the resource can override it; a key set at none of those two
 // levels is not a volume option and stays in the resource-scope
 // disk section, resolved there by Resolve.
-func VolumeDiskOptions(ctx context.Context, c client.Reader, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (map[int32]map[string]string, error) {
+//
+// rs-discard-granularity is the exception LINSTOR's
+// ConfFileBuilderAutoRules makes: while
+// DrbdOptions/auto-rs-discard-granularity is unset or true, the
+// controller owns the volume's value and keeps it on the volume
+// definition, so the volume definition alone decides it and a value on
+// the volume group or the replica does not reach the volume. effective
+// is what Resolve returned for target, the levels above the volume's
+// own that the switch can be set on.
+func VolumeDiskOptions(ctx context.Context, c client.Reader, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, effective map[string]string) (map[int32]map[string]string, error) {
 	if target == nil || rd == nil || len(rd.Spec.VolumeDefinitions) == 0 {
 		return nil, nil //nolint:nilnil // no volumes, nothing to resolve
 	}
@@ -262,10 +271,11 @@ func VolumeDiskOptions(ctx context.Context, c client.Reader, target *blockstorio
 		vd := &rd.Spec.VolumeDefinitions[i]
 
 		opts := map[string]string{}
+		vgProps := volumeGroupProps(rg, vd.VolumeNumber)
 
 		// Lowest of the per-volume levels first, so a closer one
 		// overwrites it.
-		for _, level := range []map[string]string{volumeGroupProps(rg, vd.VolumeNumber), vd.Props} {
+		for _, level := range []map[string]string{vgProps, vd.Props} {
 			for key, value := range level {
 				name, ok := strings.CutPrefix(key, diskOptionPrefix)
 				if !ok || name == "" {
@@ -282,12 +292,41 @@ func VolumeDiskOptions(ctx context.Context, c client.Reader, target *blockstorio
 			}
 		}
 
+		if autoRsDiscardGranularity(resProps, vd.Props, vgProps, effective) {
+			delete(opts, rsDiscardGranularity)
+
+			if value, ok := vd.Props[diskOptionPrefix+rsDiscardGranularity]; ok {
+				opts[rsDiscardGranularity] = value
+			}
+		}
+
 		if len(opts) > 0 {
 			out[vd.VolumeNumber] = opts
 		}
 	}
 
 	return out, nil
+}
+
+const (
+	// rsDiscardGranularity is the disk option LINSTOR's auto rule owns.
+	rsDiscardGranularity = "rs-discard-granularity"
+
+	// autoRsDiscardGranularityKey switches that rule off when false.
+	autoRsDiscardGranularityKey = drbd.PropPrefix + "auto-rs-discard-granularity"
+)
+
+// autoRsDiscardGranularity resolves DrbdOptions/auto-rs-discard-granularity
+// over a volume's levels, closest first, and reports whether the rule is
+// on: unset and true are both on, as LINSTOR reads it.
+func autoRsDiscardGranularity(levels ...map[string]string) bool {
+	for _, level := range levels {
+		if value, ok := level[autoRsDiscardGranularityKey]; ok {
+			return value == "" || strings.EqualFold(value, "true")
+		}
+	}
+
+	return true
 }
 
 // volumeGroupProps returns the props of the resource group's volume

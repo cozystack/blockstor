@@ -1171,7 +1171,7 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 
 	desired := dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps)
 
-	volumeDisk, err := effectiveprops.VolumeDiskOptions(ctx, r.Client, target, rd)
+	volumeDisk, err := effectiveprops.VolumeDiskOptions(ctx, r.Client, target, rd, effectiveProps)
 	if err != nil {
 		return nil, errors.Wrap(err, "resolve volume disk options")
 	}
