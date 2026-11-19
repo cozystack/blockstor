@@ -72,7 +72,7 @@ func TestThickRestoreSetsRefreservationAfterClone(t *testing.T) {
 		t.Fatalf("RestoreVolumeFromSnapshot: %v", err)
 	}
 
-	cloneCmd := "zfs clone -o blockstor.org:owner=blockstor tank/pvc-1_00000@snap-1 tank/pvc-2_00000"
+	cloneCmd := "zfs clone tank/pvc-1_00000@snap-1 tank/pvc-2_00000"
 	if !slices.Contains(fx.CommandLines(), cloneCmd) {
 		t.Errorf("Bug 246 fix: expected clone cmd %q in calls; got %v",
 			cloneCmd, fx.CommandLines())

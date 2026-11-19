@@ -76,9 +76,7 @@ func TestU290_CloneBuildsDatasetPathOnce(t *testing.T) {
 	}
 
 	// The exact expected single-prefix shape.
-	const cloneVerb = "zfs clone -o blockstor.org:owner=blockstor "
-
-	want := cloneVerb + pool + "/ccu3-u290-src_00000@snap " + pool + "/ccu3-u290-tgt_00000"
+	want := "zfs clone " + pool + "/ccu3-u290-src_00000@snap " + pool + "/ccu3-u290-tgt_00000"
 	if cloneLine != want {
 		t.Errorf("U290: clone command shape mismatch\n got: %q\nwant: %q", cloneLine, want)
 	}
@@ -91,7 +89,7 @@ func TestU290_CloneBuildsDatasetPathOnce(t *testing.T) {
 	}
 
 	// Each dataset operand must carry exactly one pool-prefix token.
-	for _, operand := range strings.Fields(strings.TrimPrefix(cloneLine, cloneVerb)) {
+	for _, operand := range strings.Fields(cloneLine[len("zfs clone "):]) {
 		if n := strings.Count(operand, pool+"/"); n != 1 {
 			t.Errorf("U290: operand %q has %d %q prefixes, want exactly 1",
 				operand, n, pool+"/")

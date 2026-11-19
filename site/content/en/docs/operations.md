@@ -177,31 +177,6 @@ In-place rollback is not available on purpose. A definition cannot be deleted wh
 blockstor snapshot delete my-volume before-upgrade
 ```
 
-## Volumes no replica claims
-
-A volume can outlive its replica: when a `Resource` loses its finalizer before the satellite deleted the volume, the zvol or LV stays in the pool. Every five minutes each satellite looks for such volumes in its own pools and deletes them, at most three per cycle, but only when it can prove the volume is its own. Blockstor marks every volume it creates, clones or receives: a ZFS zvol gets the user property `blockstor.org:owner=blockstor`, an LVM volume the tag `blockstor-owned`. Only a marker set on the volume itself counts, so a value inherited from the pool's root dataset, or carried in by a `zfs recv` of a copy, does not make a volume deletable.
-
-A volume that no replica on the node claims is deleted only when it carries the marker and has no snapshots. The deletion is never recursive, and the satellite checks the marker and the snapshots again right before it deletes. Every other such volume stays where it is and is reported with a Warning Event on the node's `Node` object, once per satellite start, and in the satellite log on every cycle:
-
-- `UnownedStorageVolume`: the volume has no marker. It may be data that was in the pool before blockstor, such as volumes LINSTOR left behind, so blockstor never deletes it.
-- `OrphanStorageVolumeHasSnapshots`: the volume is blockstor's, but deleting it would destroy its snapshots, whether a blockstor `Snapshot` tracks them or someone took them by hand. Once the snapshots are gone, the volume is deleted on the next cycle.
-
-```sh
-kubectl get events --field-selector involvedObject.kind=Node,reason=UnownedStorageVolume
-```
-
-Decide what to do with a reported volume yourself: delete it with `zfs destroy` or `lvremove`, rename it out of the way, or leave it. Volumes whose names do not start with `pvc-` or `bs-` are not looked at at all.
-
-Volumes created before blockstor marked them get the marker the next time the satellite reconciles the replica that claims them, so after an upgrade every volume with a live replica is marked within a reconcile. A volume whose replica was already gone before the upgrade is never marked, and is reported as unowned rather than deleted: blockstor cannot tell it from data it did not create. Downgrading to a release without the marker brings back the old behaviour, which deleted any `pvc-` or `bs-` volume with no replica.
-
-To stop the cleanup on one node, for example to inspect a volume before anything happens to it, annotate the node:
-
-```sh
-kubectl annotate nodes.blockstor.org worker-3 blockstor.org/skip-orphan-storage-sweeper=true
-```
-
-The annotation lives on the blockstor `Node` object. A server-side apply of that object by a field manager that does not carry the annotation removes it, so check it is still there before you rely on it. The satellite also skips the cleanup whenever it cannot read its `Node`, including on a fresh start before the `Node` exists.
-
 ## Backing up the control plane
 
 Blockstor keeps all of its state in custom resources, so a backup is a dump of them. Include the `ResourceDefinition` and `Resource` objects. The controller allocates DRBD minors into the definitions, in `spec.volumeDefinitions[].drbdMinor`, and DRBD ports and node IDs into the spec of each `Resource`. A restore that invents new ones would make every replica reconnect.

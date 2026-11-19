@@ -50,7 +50,7 @@ Not converted, and listed in the tool's report:
 
    Change the namespace and label to match your installation. Each line is `<volume> <node> <port>`, so replicas of one volume on different ports keep their own. If your LINSTOR node names differ from the Kubernetes ones, put the LINSTOR name in the second column. The converter refuses a map that gives one replica two ports, and refuses manifests that would put two replicas on one port on the same node. It reports a replica it has no port for while it has its peers', and map entries for nodes that host no replica of the definition.
 
-4. **Take pool snapshots.** A recursive `zfs snapshot` of every pool gives you a rollback point that does not depend on either control plane. Blockstor does not track these snapshots and never deletes a volume that holds one, so destroy them once you no longer need the rollback point.
+4. **Take pool snapshots.** A recursive `zfs snapshot` of every pool gives you a rollback point that does not depend on either control plane.
 
 5. **Check the volume names on disk.** Blockstor finds existing volumes by name: `<pool>/<definition CR name>_<volume number, five digits>`, for example `data/pvc-1234_00000`. The CR name is the definition's `metadata.name` in the converted manifests: its LINSTOR name in lowercase, or, for a name that is not a valid Kubernetes name once lowercased, a hashed slug such as `35d21682-my-res` for `my_res`. A volume of such a definition never matches its LINSTOR name on disk, so rename the definition or the volume before you switch over. If the name does not match exactly, blockstor creates a new empty volume next to the real one. Replicated volumes would heal from their peers, but a volume with a single replica and no DRBD would come up empty. On every node, compare the list of volumes with the names the converted manifests expect:
 
@@ -60,8 +60,6 @@ Not converted, and listed in the tool's report:
    ```
 
    Snapshots are found as `<pool>/<definition CR name>_00000@<snapshot>`. Do not continue while any single-replica volume is missing under its expected name.
-
-   The same lists, compared the other way round, show the volumes on disk that no converted replica names, usually left over from earlier LINSTOR deletions. `linstor-migrate` cannot report them, because it reads only the dump. Blockstor does not delete them: see [Volumes no replica claims](../operations/#volumes-no-replica-claims). Decide what to do with them yourself.
 
 6. **Rehearse on staging.** Run the whole procedure on a copy of the pools. Check that every pool registers, every replica reaches `UpToDate` without a resync, and no new empty volumes appear.
 
@@ -105,7 +103,7 @@ A definition with no layer stack whose replicas all agree takes their stack with
    kubectl apply -f ./blockstor-manifests.yaml
    ```
 
-6. **Wait for adoption.** Every replica should report `UpToDate` without starting a resync, `blockstor resource list --faulty` should be empty, and every pool should report its real free space. Each adopted volume gets blockstor's ownership marker on its first reconcile. A volume no replica claims never gets it, and its satellite reports it with an `UnownedStorageVolume` Event on the `Node` instead of deleting it, so expect one such Event for every leftover volume from step 5.
+6. **Wait for adoption.** Every replica should report `UpToDate` without starting a resync, `blockstor resource list --faulty` should be empty, and every pool should report its real free space.
 7. **Point CSI at blockstor**, as in [Provisioning volumes with CSI](../csi/), and scale the provisioner and attacher back up. Create a test PVC, and check that an existing PVC still mounts read-write.
 
 ## Check before you call it done

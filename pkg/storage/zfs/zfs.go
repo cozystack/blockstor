@@ -48,30 +48,6 @@ type Provider struct {
 	exec storage.Exec
 }
 
-// OwnerProperty is the ZFS user property that marks a zvol as one
-// blockstor provisioned, and OwnerValue its value. The orphan-storage
-// sweeper deletes only zvols that carry it, set on the zvol itself: a
-// value inherited from a parent dataset or received in a stream does
-// not count, so marking the pool root, or `zfs recv` of a copy taken
-// from a blockstor pool, makes nothing reapable.
-const (
-	OwnerProperty = "blockstor.org:owner"
-	OwnerValue    = "blockstor"
-)
-
-// ownerAssignment is the marker in the `-o prop=value` form zfs create,
-// zfs clone and zfs set take.
-const ownerAssignment = OwnerProperty + "=" + OwnerValue
-
-// propertySourceLocal is the `source` zfs get reports for a property
-// set on the dataset itself.
-const propertySourceLocal = "local"
-
-// deferredDeleteMarker is the substring DeleteSnapshot puts into the
-// name of a snapshot it could not destroy because a clone still
-// depends on it.
-const deferredDeleteMarker = "__DELETED__"
-
 // NewProvider constructs a Provider. The Exec is injected so unit tests
 // can drive it without ZFS installed.
 func NewProvider(cfg Config, ex storage.Exec) *Provider {
@@ -122,7 +98,7 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	if p.datasetExists(ctx, dataset) {
 		// Bug 255 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the dataset sparse-thick.
-		return p.ensureProvisioned(ctx, dataset)
+		return p.ensureRefreservation(ctx, dataset)
 	}
 
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
@@ -132,9 +108,7 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 		args = append(args, "-s")
 	}
 
-	// The ownership marker rides on the create itself, so no zvol of
-	// blockstor's ever exists without it.
-	args = append(args, "-o", ownerAssignment, "-V", strconv.FormatInt(sizeMiB, 10)+"M", dataset)
+	args = append(args, "-V", strconv.FormatInt(sizeMiB, 10)+"M", dataset)
 
 	_, err := p.exec.Run(ctx, "zfs", args...)
 	if err != nil {
@@ -228,7 +202,7 @@ func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 		return errors.Wrapf(err, "zfs destroy %s", tgtDS)
 	}
 
-	if origin != "" && strings.Contains(origin, deferredDeleteMarker) {
+	if origin != "" && strings.Contains(origin, "__DELETED__") {
 		_, _ = p.exec.Run(ctx, "zfs", "destroy", origin)
 	}
 
@@ -384,7 +358,7 @@ func (p *Provider) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) er
 		return errors.Wrapf(err, "zfs destroy %s", src)
 	}
 
-	marker := fmt.Sprintf("%s%s%d", src, deferredDeleteMarker, time.Now().Unix())
+	marker := fmt.Sprintf("%s__DELETED__%d", src, time.Now().Unix())
 
 	_, rErr := p.exec.Run(ctx, "zfs", "rename", src, marker)
 	if rErr != nil {
@@ -435,7 +409,7 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 	if p.datasetExists(ctx, tgtDS) {
 		// Bug 253 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the dataset sparse-thick.
-		return p.ensureProvisioned(ctx, tgtDS)
+		return p.ensureRefreservation(ctx, tgtDS)
 	}
 
 	srcDS := p.snapshotDataset(src)
@@ -443,9 +417,7 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 		return errors.Wrapf(storage.ErrNotFound, "snapshot %s for clone", srcDS)
 	}
 
-	// A clone takes no user properties from its origin, so the marker
-	// is set on the clone itself.
-	_, err := p.exec.Run(ctx, "zfs", "clone", "-o", ownerAssignment, srcDS, tgtDS)
+	_, err := p.exec.Run(ctx, "zfs", "clone", srcDS, tgtDS)
 	if err != nil {
 		return errors.Wrapf(err, "zfs clone %s → %s", srcDS, tgtDS)
 	}
@@ -578,7 +550,7 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	if p.datasetExists(ctx, tgtDS) {
 		// Bug 254 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the recv'd dataset sparse-thick.
-		return p.ensureProvisioned(ctx, tgtDS)
+		return p.ensureRefreservation(ctx, tgtDS)
 	}
 
 	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F", tgtDS)
@@ -594,12 +566,10 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	// THICK mode: restore the space guarantee even if the peer sender
 	// shipped the stream without `-p` (Bug 251 defence-in-depth). Same
 	// pattern as Bug 246's post-clone refreservation re-set. Thin mode
-	// no-ops inside the helper. The marker a `-p` stream carries
-	// arrives as a received property, which InspectVolume does not
-	// accept, so it is set locally here as well.
-	err = p.ensureProvisioned(ctx, tgtDS)
+	// no-ops inside the helper.
+	err = p.ensureRefreservation(ctx, tgtDS)
 	if err != nil {
-		return errors.Wrapf(err, "finish recv'd %s", tgtDS)
+		return errors.Wrapf(err, "ensure refreservation on recv'd %s", tgtDS)
 	}
 
 	return nil
@@ -658,7 +628,7 @@ func (p *Provider) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, er
 		// because the origin dataset is one). Defensive belt-and-
 		// braces — the filter substring catches the rename pattern
 		// even if upstream's naming shifts a character.
-		if strings.Contains(line, deferredDeleteMarker) {
+		if strings.Contains(line, "__DELETED__") {
 			continue
 		}
 
@@ -676,87 +646,6 @@ func (p *Provider) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, er
 	}
 
 	return refs, nil
-}
-
-// InspectVolume implements storage.OrphanReaper. A zvol that is gone
-// is reported as storage.ErrNotFound; any probe that fails is an error,
-// never a guess in either direction.
-func (p *Provider) InspectVolume(ctx context.Context, vol storage.Volume) (storage.VolumeOwnership, error) {
-	dataset := p.volumeDataset(vol)
-	if !p.datasetExists(ctx, dataset) {
-		return storage.VolumeOwnership{}, errors.Wrapf(storage.ErrNotFound, "zvol %s", dataset)
-	}
-
-	owned, err := p.ownerMarked(ctx, dataset)
-	if err != nil {
-		return storage.VolumeOwnership{}, err
-	}
-
-	snaps, err := p.volumeSnapshots(ctx, dataset, false)
-	if err != nil {
-		return storage.VolumeOwnership{}, err
-	}
-
-	return storage.VolumeOwnership{Owned: owned, Snapshots: snaps}, nil
-}
-
-// ReapVolume implements storage.OrphanReaper: it deletes a leaked zvol
-// without `-r`, so nothing but the zvol and blockstor's own
-// deferred-delete markers can go with it. The markers are destroyed
-// one by one after the clones that hold them are promoted, as
-// DeleteVolume does, and the zvol last: if a snapshot was taken after
-// the check, `zfs destroy` refuses the zvol rather than taking it.
-func (p *Provider) ReapVolume(ctx context.Context, vol storage.Volume) error {
-	dataset := p.volumeDataset(vol)
-
-	found, err := p.InspectVolume(ctx, vol)
-	if err != nil {
-		return err
-	}
-
-	if !found.Owned {
-		return errors.Wrapf(storage.ErrNotOwned, "zvol %s", dataset)
-	}
-
-	if len(found.Snapshots) > 0 {
-		return errors.Wrapf(storage.ErrHasSnapshots, "zvol %s: %s", dataset, strings.Join(found.Snapshots, ", "))
-	}
-
-	err = p.promoteDependentClones(ctx, dataset)
-	if err != nil {
-		return errors.Wrapf(err, "promote dependent clones of %s", dataset)
-	}
-
-	markers, err := p.volumeSnapshots(ctx, dataset, true)
-	if err != nil {
-		return err
-	}
-
-	for _, marker := range markers {
-		if !strings.Contains(marker, deferredDeleteMarker) {
-			return errors.Wrapf(storage.ErrHasSnapshots, "zvol %s: %s", dataset, marker)
-		}
-
-		_, err = p.exec.Run(ctx, "zfs", "destroy", dataset+"@"+marker)
-		if err != nil {
-			return errors.Wrapf(err, "zfs destroy %s@%s", dataset, marker)
-		}
-	}
-
-	// Read after the promotion, which can make the zvol a clone of a
-	// marker that now lives under the promoted clone.
-	origin := p.volumeOrigin(ctx, dataset)
-
-	_, err = p.exec.Run(ctx, "zfs", "destroy", dataset)
-	if err != nil {
-		return errors.Wrapf(err, "zfs destroy %s", dataset)
-	}
-
-	if strings.Contains(origin, deferredDeleteMarker) {
-		_, _ = p.exec.Run(ctx, "zfs", "destroy", origin)
-	}
-
-	return nil
 }
 
 // parseVolumeName splits "<resource>_<vol5digits>" into its parts.
@@ -787,89 +676,6 @@ func parseVolumeName(name string) (string, int32, bool) {
 // the per-RD volume index in dataset / LV names. Keep in sync with
 // volumeDataset / volumeLVName.
 const volNumberDigits = 5
-
-// ensureProvisioned is what every provisioning path runs on a dataset
-// that already exists: the ownership marker and, in thick mode, the
-// refreservation. Setting the marker here is how a zvol blockstor
-// created before the marker existed, or adopted from LINSTOR, acquires
-// it: this runs only while a Resource on this node claims the volume,
-// so blockstor has taken responsibility for it by then.
-func (p *Provider) ensureProvisioned(ctx context.Context, dataset string) error {
-	err := p.ensureOwnerMarker(ctx, dataset)
-	if err != nil {
-		return err
-	}
-
-	return p.ensureRefreservation(ctx, dataset)
-}
-
-// ensureOwnerMarker sets the ownership marker on dataset unless it is
-// already set there locally.
-func (p *Provider) ensureOwnerMarker(ctx context.Context, dataset string) error {
-	owned, err := p.ownerMarked(ctx, dataset)
-	if err != nil {
-		return err
-	}
-
-	if owned {
-		return nil
-	}
-
-	_, err = p.exec.Run(ctx, "zfs", "set", ownerAssignment, dataset)
-	if err != nil {
-		return errors.Wrapf(err, "zfs set %s on %s", OwnerProperty, dataset)
-	}
-
-	return nil
-}
-
-// ownerMarked reports whether dataset carries the ownership marker set
-// on itself. `zfs get` prints `-` as the source of an unset user
-// property and `inherited from <parent>` or `received` for the other
-// ways a dataset can show a value it was not given directly.
-func (p *Provider) ownerMarked(ctx context.Context, dataset string) (bool, error) {
-	ctx, cancel := withProbeTimeout(ctx)
-	defer cancel()
-
-	out, err := p.exec.Run(ctx, "zfs", "get", "-H", "-o", "value,source", OwnerProperty, dataset)
-	if err != nil {
-		return false, errors.Wrapf(err, "zfs get %s %s", OwnerProperty, dataset)
-	}
-
-	value, source, _ := strings.Cut(strings.TrimSpace(string(out)), "\t")
-
-	return value == OwnerValue && source == propertySourceLocal, nil
-}
-
-// volumeSnapshots lists the snapshot names (the part after `@`) dataset
-// holds, without blockstor's deferred-delete markers when withMarkers
-// is false.
-func (p *Provider) volumeSnapshots(ctx context.Context, dataset string, withMarkers bool) ([]string, error) {
-	ctx, cancel := withProbeTimeout(ctx)
-	defer cancel()
-
-	out, err := p.exec.Run(ctx, "zfs", "list", "-H", "-o", "name", "-t", "snapshot", "-d", "1", dataset)
-	if err != nil {
-		return nil, errors.Wrapf(err, "zfs list snapshots of %s", dataset)
-	}
-
-	var snaps []string
-
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		_, snap, ok := strings.Cut(strings.TrimSpace(line), "@")
-		if !ok {
-			continue
-		}
-
-		if !withMarkers && strings.Contains(snap, deferredDeleteMarker) {
-			continue
-		}
-
-		snaps = append(snaps, snap)
-	}
-
-	return snaps, nil
-}
 
 // promoteDependentClones reparents every clone whose `origin` is a
 // snapshot of dataset `ds` onto itself via `zfs promote`, so `ds`'s
@@ -1101,11 +907,4 @@ const (
 	bytesPerKib         = 1024
 	zfsListCols         = 3
 	zpoolListCols       = 2
-)
-
-// The sweeper lists and reaps through these; a provider that lists
-// without proving ownership would never be reaped, so pin both.
-var (
-	_ storage.VolumeLister = (*Provider)(nil)
-	_ storage.OrphanReaper = (*Provider)(nil)
 )

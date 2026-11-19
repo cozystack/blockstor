@@ -44,7 +44,7 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 
    Each line is `<rd> <node> <port>`, so replicas of one definition on different ports keep their own. The node is the Kubernetes node the satellite runs on; if your LINSTOR node names differ from the Kubernetes ones, put the LINSTOR name there. The converter refuses a map that gives one replica two ports, and refuses manifests that would put two replicas on one port on the same node. It reports a replica it has no port for while it has its peers', and map entries for nodes that host no replica of the definition. The older `<rd> <port>` form still works for a cluster where every replica of a definition shares one port, and is refused when one definition shows two ports.
 
-4. **Back up the ZFS/LVM pools' snapshots** (optional but recommended): a `zfs snapshot -r` of each pool gives an instant rollback point that is independent of both control planes. Blockstor does not track these snapshots, and the satellite never deletes a volume that holds one (see "Volumes the dump does not reference" below), so destroy them once you no longer need the rollback point.
+4. **Back up the ZFS/LVM pools' snapshots** (optional but recommended): a `zfs snapshot -r` of each pool gives an instant rollback point that is independent of both control planes.
 
 5. **Verify the zvol names blockstor will adopt match what is on disk.** Adoption is name-based: blockstor addresses each volume as `<zpool>/<rd-cr-name>_<volume-number-%05d>` (e.g. `data/pvc-abc…_00000`), where `<rd-cr-name>` is the RD's `metadata.name` in the converted manifests: the LINSTOR name lowercased, or, for a name that is not a valid RFC 1123 label once lowercased, a hashed slug such as `35d21682-my-res` for `my_res`. Such a definition never matches the LINSTOR volume on disk, so rename it or the volume before cutover. `CreateVolume` is idempotent only when that dataset already exists. A byte mismatch (ZFS names are case-sensitive) makes blockstor create a fresh EMPTY zvol next to the real one. Multi-replica DRBD would self-heal by SyncTarget, but **single-replica `["STORAGE"]` volumes have no resync fallback** — a mismatch there silently presents an empty disk. Cross-check before cutover, read-only, on each satellite:
 
@@ -58,8 +58,6 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
    ```
 
    If any single-replica volume's computed name is absent from `ondisk-zvols.txt`, STOP — do not cut over until the naming is reconciled (`zfs rename`, or fix the converter).
-
-   **The same comparison, the other way round, lists the volumes the dump does not reference**: every entry in `ondisk-zvols.txt` that no converted Resource names. These are typically leftovers of earlier LINSTOR deletions. `linstor-migrate` cannot list them itself, because it reads only the dump and never sees the pools. Blockstor leaves them in place (see "Volumes the dump does not reference" below), so this list is for you to decide on before or after cutover.
 
    **Adopted snapshots are addressed the same way** — `<zpool>/<rd-cr-name>_00000@<snapshot-name>` — so run the same cross-check for them, otherwise a name miss only surfaces when someone tries to restore, long after cutover:
 
@@ -135,8 +133,6 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 
 6. **Wait for adoption to converge.** Every `Resource` should report its DRBD device `UpToDate` (adopted, not resynced — watch that `out-of-sync` stays 0, i.e. no unexpected full sync started). `linstor r l --faulty` against the blockstor apiserver is empty. Storage pools report their real free capacity.
 
-   **Volumes the dump does not reference.** Each satellite looks for volumes in its pools that no Resource on its node claims, and deletes only those carrying blockstor's ownership marker (`blockstor.org:owner=blockstor` on a zvol, the tag `blockstor-owned` on an LV) that hold no snapshots. LINSTOR's volumes carry no such marker. An adopted volume gets it on the first reconcile of the Resource that claims it, so from then on it is protected by that Resource and, if the Resource is lost, it is a leak blockstor may reclaim. A volume no Resource claims never gets the marker: the satellite leaves it in place and reports it with an `UnownedStorageVolume` Warning Event on its `Node`. Expect one such Event for every volume step 5 found unreferenced, and none for an adopted volume. The opt-out annotation `blockstor.org/skip-orphan-storage-sweeper: "true"` on a `Node` is no longer what keeps this data safe, but it still stops the cleanup on that node altogether.
-
 7. **Repoint and unfreeze CSI.** Point linstor-csi at the blockstor apiserver, then scale the provisioner/attacher back up. Provision one test PVC and confirm it binds and that an existing PVC still mounts read-write.
 
 ## Verify (before declaring done)
@@ -145,7 +141,6 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 - Spot-check ≥5 RDs: size, per-volume `/dev/drbd<minor>`, per-replica node-id and port match the pre-migration values. A changed minor or node-id is a stop-the-line defect.
 - Every diskful replica is `UpToDate`; no replica is unexpectedly `SyncTarget`.
 - Adopted snapshots list as present without any suspend-io having fired on the parent RDs (check the satellites did not log `suspend-io`).
-- Every adopted volume carries the ownership marker set locally: `zfs get -H -o name,value,source -t volume -r blockstor.org:owner <zpool>` shows `blockstor local` for each volume a Resource names (for LVM, `lvs -o lv_name,lv_tags` shows `blockstor-owned`). A volume without it has not been reconciled yet; one still without it after convergence is one blockstor does not consider its own.
 - For LUKS RDs: `linstor encryption status` against blockstor says `unlocked`, and each LUKS replica opens; a `LUKSKeyMismatch` or `MasterKeyLocked` Event on a Resource is a stop-the-line defect.
 
 ## Rollback
@@ -161,7 +156,6 @@ Until CSI is repointed and confirmed, rollback is: scale blockstor to 0, scale `
 | Unknown flag bits dropped | Cosmetic runtime bookkeeping only | Reported; verified not to carry availability semantics |
 | Placement/data unchanged | The converter never moves data | Rebalance with blockstor after migration if desired |
 | `Initialized` is conditional | Left unlatched only where no data-bearing replica is adopted — every replica DELETE-flagged, or every replica diskless; a definition held back by an unmigrated node or by pool divergence keeps the latch and arrives short of replicas | Read the report, which names every reason that applies. Do not clear a latch by hand because a definition has no replicas — that is what re-enables the auto-primary election this latch exists to suppress |
-| Pool volumes the dump does not reference | `linstor-migrate` reads only the dump and cannot list them | Pre-flight step 5 lists them; blockstor never deletes them and reports each with an `UnownedStorageVolume` Event on its `Node` |
 | Single-replica zvol name must byte-match on disk | A mismatch presents an empty disk (no DRBD resync fallback) | Pre-flight step 5 cross-check + staging rehearsal (step 6) |
 | Snapshots cover volume 0 only | blockstor addresses a snapshot as `<zpool>/<rd>_00000@<snap>`; a snapshot that captured a multi-volume resource adopts with only its first volume restorable | Reported per snapshot by the converter; re-take those snapshots after migration if the other volumes matter |
 | Undecoded flag bits are reported, not interpreted | A `non-zero vlm_flags` / `node_flags` / `unhandled flags bits` line means the source cluster had a marker this tool refuses to guess at (e.g. a size-semantics or eviction bit) | Look the object up in the source cluster before cutover (`linstor v l` / `n l`) and confirm it should be adopted as-is; the volume's `SizeKib` is carried verbatim either way |

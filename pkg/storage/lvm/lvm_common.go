@@ -20,7 +20,6 @@ package lvm
 
 import (
 	"context"
-	"slices"
 	"strings"
 	"time"
 
@@ -152,147 +151,6 @@ func ArgsUdevless(extra ...string) []string {
 // and any surrounding tags.
 const RestoreIncompleteTag = "blockstor-restore-incomplete"
 
-// OwnerTag is the LV tag that marks an LV as one blockstor provisioned.
-// The orphan-storage sweeper removes only LVs that carry it (issue
-// 264): an LV in the volume group without it may be data that was
-// there before blockstor, and is never reaped. A bare name like
-// RestoreIncompleteTag, for the same reason (Bug 259).
-const OwnerTag = "blockstor-owned"
-
-// ensureOwnerTag tags lvName with OwnerTag unless it already carries
-// it. Every provisioning path runs it on an LV it finds already there:
-// that only happens while a Resource on this node claims the volume,
-// so blockstor has taken responsibility for it, and it is how an LV
-// created before the tag existed, or adopted from LINSTOR, acquires it.
-func ensureOwnerTag(ctx context.Context, ex storage.Exec, vg, lvName string) error {
-	if lvHasTag(ctx, ex, vg, lvName, OwnerTag) {
-		return nil
-	}
-
-	_, err := ex.Run(ctx, "lvchange", Args("--addtag", OwnerTag, vg+"/"+lvName)...)
-	if err != nil {
-		return errors.Wrapf(err, "lvchange --addtag %s %s/%s", OwnerTag, vg, lvName)
-	}
-
-	return nil
-}
-
-// lvRow is one line of the `lvs -o lv_name,origin,lv_tags` listing.
-type lvRow struct {
-	name   string
-	origin string
-	tags   []string
-}
-
-// lvRowCols is the number of columns listLVRows asks lvs for.
-const lvRowCols = 3
-
-// listLVRows lists every LV in vg with its origin and tags. Unlike
-// lvHasTag it does not fold an error into "no tag": the sweeper decides
-// from it whether an LV may be removed.
-func listLVRows(ctx context.Context, ex storage.Exec, vg string) ([]lvRow, error) {
-	ctx, cancel := withProbeTimeout(ctx)
-	defer cancel()
-
-	out, err := ex.Run(ctx, "lvs",
-		Args("--noheadings",
-			"--separator", "\t",
-			"-o", "lv_name,origin,lv_tags",
-			vg)...)
-	if err != nil {
-		return nil, errors.Wrapf(err, "lvs %s", vg)
-	}
-
-	var rows []lvRow
-
-	for line := range strings.SplitSeq(string(out), "\n") {
-		// lvs pads the first column, and an empty last column leaves
-		// nothing after its separator, so split before trimming.
-		parts := strings.SplitN(strings.TrimLeft(line, " "), "\t", lvRowCols)
-
-		name := strings.TrimSpace(parts[0])
-		if name == "" {
-			continue
-		}
-
-		row := lvRow{name: name}
-
-		if len(parts) > 1 {
-			row.origin = strings.TrimSpace(parts[1])
-		}
-
-		if len(parts) > 2 {
-			for tag := range strings.SplitSeq(strings.TrimSpace(parts[2]), ",") {
-				if tag = strings.TrimSpace(tag); tag != "" {
-					row.tags = append(row.tags, tag)
-				}
-			}
-		}
-
-		rows = append(rows, row)
-	}
-
-	return rows, nil
-}
-
-// inspectLV implements storage.OrphanReaper.InspectVolume for both LVM
-// kinds: the LV's own OwnerTag, and the LVs whose origin it is.
-func inspectLV(ctx context.Context, ex storage.Exec, vg, lvName string) (storage.VolumeOwnership, error) {
-	rows, err := listLVRows(ctx, ex, vg)
-	if err != nil {
-		return storage.VolumeOwnership{}, err
-	}
-
-	var (
-		found  bool
-		result storage.VolumeOwnership
-	)
-
-	for _, row := range rows {
-		switch {
-		case row.name == lvName:
-			found = true
-			result.Owned = slices.Contains(row.tags, OwnerTag)
-		case row.origin == lvName:
-			result.Snapshots = append(result.Snapshots, row.name)
-		}
-	}
-
-	if !found {
-		return storage.VolumeOwnership{}, errors.Wrapf(storage.ErrNotFound, "LV %s/%s", vg, lvName)
-	}
-
-	return result, nil
-}
-
-// reapLV implements storage.OrphanReaper.ReapVolume for both LVM kinds.
-// It checks the LV again right before removing it: `lvremove --force`
-// takes a classic snapshot of a thick LV along with its origin, and
-// there is no flag that removes an active LV but refuses one with
-// snapshots, so the check is as close to the removal as it can be.
-// Thin snapshots are independent LVs and survive their origin anyway.
-func reapLV(ctx context.Context, exec storage.Exec, vg, lvName string) error {
-	found, err := inspectLV(ctx, exec, vg, lvName)
-	if err != nil {
-		return err
-	}
-
-	if !found.Owned {
-		return errors.Wrapf(storage.ErrNotOwned, "LV %s/%s", vg, lvName)
-	}
-
-	if len(found.Snapshots) > 0 {
-		return errors.Wrapf(storage.ErrHasSnapshots, "LV %s/%s: %s", vg, lvName, strings.Join(found.Snapshots, ", "))
-	}
-
-	_, err = exec.Run(ctx, "lvremove", Args("--force", vg+"/"+lvName)...)
-	if err != nil {
-		return errors.Wrapf(err, "lvremove %s/%s", vg, lvName)
-	}
-
-	return nil
-}
-
 // lvHasRestoreIncompleteTag reports whether the named LV carries the
 // completion sentinel (Bug 257). Used by the idempotent-skip path of
 // Thick.RestoreVolumeFromSnapshot and Thin.RecvSnapshot to decide
@@ -374,12 +232,3 @@ func volumeStatusViaLVS(ctx context.Context, exec storage.Exec, vgLV string) (st
 		State:        stateProvisioned,
 	}, nil
 }
-
-// The sweeper lists and reaps through these; a provider that lists
-// without proving ownership would never be reaped, so pin both.
-var (
-	_ storage.VolumeLister = (*Thin)(nil)
-	_ storage.OrphanReaper = (*Thin)(nil)
-	_ storage.VolumeLister = (*Thick)(nil)
-	_ storage.OrphanReaper = (*Thick)(nil)
-)

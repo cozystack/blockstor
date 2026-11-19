@@ -26,8 +26,6 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -58,21 +56,6 @@ const StorageSweeperPeriod = 5 * time.Minute
 // force-strip event) but won't mask a runaway producer.
 const StorageSweeperMaxDeletePerCycle = 3
 
-// Event reasons the storage sweeper reports a volume it leaves alone
-// under, on the local Node. Each is emitted once per volume and
-// reason for the life of the satellite process; the log repeats it at
-// V(1) every cycle.
-const (
-	// StorageSweeperReasonUnowned: no Resource claims the volume and
-	// it does not carry blockstor's ownership marker, so it may be
-	// data that was in the pool before blockstor (issue 264).
-	StorageSweeperReasonUnowned = "UnownedStorageVolume"
-	// StorageSweeperReasonSnapshots: the volume is blockstor's and no
-	// Resource claims it, but it holds snapshots, which deleting it
-	// would destroy.
-	StorageSweeperReasonSnapshots = "OrphanStorageVolumeHasSnapshots"
-)
-
 // StorageSweeperSkipAnnotation is the per-Node opt-out for the
 // storage sweeper. Setting it to "true" on the local Node CRD makes
 // one cycle a no-op even with orphans present — useful when an
@@ -83,12 +66,12 @@ const (
 const StorageSweeperSkipAnnotation = "blockstor.org/skip-orphan-storage-sweeper"
 
 // storageResourcePrefix is the name prefix the sweeper requires before
-// it will consider a volume at all. blockstor's RD names always start
-// with `pvc-` (CSI-driven) or `bs-` (CLI-driven); datasets / LVs in the
-// same pool that match neither are skipped without a report, so a pool
-// shared with other data does not fill the log. The prefix is not what
-// keeps foreign data safe: LINSTOR names its volumes the same way
-// (issue 264). The ownership marker is (see classifyStorageOrphan).
+// it will consider a volume for deletion. blockstor's RD names always
+// start with `pvc-` (CSI-driven) or `bs-` (CLI-driven); operator-
+// created datasets / LVs in the same pool that don't match either
+// prefix are left alone even if their name parses as `<x>_NNNNN`. A
+// false-positive on this code path would destroy operator data — the
+// prefix gate is the load-bearing safety belt.
 //
 // Kept as a slice not a regex so adding a new convention is one entry
 // without breaking grep-style debugging.
@@ -111,15 +94,6 @@ type StorageOrphanSweeperRunnable struct {
 	Client    client.Client
 	Providers ProvidersSnapshotFunc
 	NodeName  string
-
-	// Recorder receives the Warning Events for volumes the sweeper
-	// leaves alone. Nil reports through the log only.
-	Recorder events.EventRecorder
-
-	// reported holds the volume+reason keys already reported in an
-	// Event, so a volume that stays put does not raise one per cycle.
-	// Touched only from the sweep goroutine.
-	reported map[string]struct{}
 
 	// Period overrides StorageSweeperPeriod (test-only — production
 	// uses the default constant). A zero Period falls back.
@@ -190,8 +164,7 @@ func (s *StorageOrphanSweeperRunnable) RegisterWithManager(mgr manager.Manager) 
 // sweepOnce performs exactly one reconcile cycle.
 //
 // Algorithm:
-//  1. Read the local Node; skip the cycle when it carries the
-//     skip-annotation or cannot be read.
+//  1. Honour the skip-annotation.
 //  2. Build the set of (resource, vol) pairs the local node OWNS via
 //     a Resource CRD list. NOTE: a CRD whose DeletionTimestamp is
 //     non-zero is STILL counted as owned — the satellite's
@@ -200,27 +173,23 @@ func (s *StorageOrphanSweeperRunnable) RegisterWithManager(mgr manager.Manager) 
 //  3. For each registered provider that implements VolumeLister:
 //     list on-disk volumes; subtract the owned set; the remainder
 //     is orphan candidates.
-//  4. Skip candidates outside the storage-resource prefix allowlist.
-//  5. Inspect each candidate: one with blockstor's ownership marker
-//     and no snapshots is reaped, up to the per-cycle bound (the rest
-//     waits for the next tick); any other is reported and kept.
+//  4. Filter orphans by the storage-resource prefix allowlist
+//     (defence in depth — operator-created volumes outside the
+//     blockstor naming convention are left alone even if a future
+//     refactor breaks the parser).
+//  5. DeleteVolume each orphan up to the per-cycle bound; defer
+//     the rest to the next tick.
 //
 // Exposed (lowercase) for unit tests pinning a single tick.
 func (s *StorageOrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logger) error {
-	node, err := s.localNode(ctx)
+	skip, err := s.shouldSkip(ctx)
 	if err != nil {
-		// The sweeper only ever deletes, and nothing is lost by
-		// deleting a cycle later, so a Node it cannot read is one
-		// whose opt-out it must assume is set. That includes a
-		// satellite cold start, which sweeps before its Node exists
-		// (issue 264).
-		logger.Info("storage sweep skipped: cannot read the local Node, so cannot honour its opt-out",
-			"annotation", StorageSweeperSkipAnnotation, "error", err.Error())
-
-		return nil
-	}
-
-	if node.Annotations[StorageSweeperSkipAnnotation] == sweeperSkipValue {
+		// Read failures on the Node CRD shouldn't block the sweep —
+		// fall back to "not skipped" so a transient apiserver blip
+		// doesn't silently disable the safety net. Log so operators
+		// notice if it's persistent.
+		logger.Error(err, "check skip-storage-sweeper annotation; proceeding without skip")
+	} else if skip {
 		logger.V(1).Info("storage sweep skipped by Node annotation",
 			"annotation", StorageSweeperSkipAnnotation)
 
@@ -248,7 +217,7 @@ func (s *StorageOrphanSweeperRunnable) sweepOnce(ctx context.Context, logger log
 	var deleted int
 
 	for poolName, provider := range providers {
-		stop := s.sweepPool(ctx, logger, node, poolName, provider, owned, limit, &deleted)
+		stop := s.sweepPool(ctx, logger, poolName, provider, owned, limit, &deleted)
 		if stop {
 			return nil
 		}
@@ -266,7 +235,6 @@ func (s *StorageOrphanSweeperRunnable) sweepOnce(ctx context.Context, logger log
 func (s *StorageOrphanSweeperRunnable) sweepPool(
 	ctx context.Context,
 	logger logr.Logger,
-	node *blockstoriov1alpha1.Node,
 	poolName string,
 	provider storage.Provider,
 	owned map[string]struct{},
@@ -293,7 +261,7 @@ func (s *StorageOrphanSweeperRunnable) sweepPool(
 	for _, ref := range refs {
 		ref.PoolName = poolName
 
-		stop := s.reapIfOrphan(ctx, logger, node, poolName, provider, owned, limit, deleted, ref)
+		stop := s.reapIfOrphan(ctx, logger, poolName, provider, owned, limit, deleted, ref)
 		if stop {
 			return true
 		}
@@ -303,15 +271,15 @@ func (s *StorageOrphanSweeperRunnable) sweepPool(
 }
 
 // reapIfOrphan classifies a single (pool, resource, volume) row and
-// reaps it when it is a leak of blockstor's own: no local Resource
-// claims it, it carries blockstor's ownership marker, and it holds no
-// snapshots. Any other volume with no Resource is reported and left
-// alone. Returns true when the per-cycle rate-limit budget has been
-// hit and the caller should stop scanning the rest of the pool.
+// runs DeleteVolume when it's a satellite-owned orphan past the
+// allowlist gate. Returns true when the per-cycle rate-limit budget
+// has been hit and the caller should stop scanning the rest of the
+// pool. Pulled out of sweepPool so that loop body stays under the
+// funlen / gocyclo budgets; the classification cascade is identical
+// to the inlined version.
 func (s *StorageOrphanSweeperRunnable) reapIfOrphan(
 	ctx context.Context,
 	logger logr.Logger,
-	node *blockstoriov1alpha1.Node,
 	poolName string,
 	provider storage.Provider,
 	owned map[string]struct{},
@@ -332,9 +300,8 @@ func (s *StorageOrphanSweeperRunnable) reapIfOrphan(
 	}
 
 	if !hasStoragePrefix(ref.ResourceName) {
-		// Not named like anything blockstor creates. Leave it alone
-		// without a word: a pool shared with other datasets would
-		// otherwise report all of them.
+		// Operator-owned volume that happens to share the pool.
+		// Leave it alone — see prefix allowlist rationale.
 		return false
 	}
 
@@ -347,165 +314,45 @@ func (s *StorageOrphanSweeperRunnable) reapIfOrphan(
 		return true
 	}
 
-	vol := storage.Volume{
+	logger.Info("orphan storage volume detected; running DeleteVolume",
+		"pool", poolName, "resource", ref.ResourceName, "volume", ref.VolumeNumber)
+
+	delErr := provider.DeleteVolume(ctx, storage.Volume{
 		PoolName:     poolName,
 		ResourceName: ref.ResourceName,
 		VolumeNumber: ref.VolumeNumber,
-	}
-
-	if s.reapIfOwned(ctx, logger, node, provider, vol) {
-		*deleted++
-	}
-
-	return false
-}
-
-// reapIfOwned inspects one volume no local Resource claims, reaps it
-// when classifyStorageOrphan says so, and reports it otherwise.
-// Returns true only when the volume was deleted. Pulled out of
-// reapIfOrphan for the cyclop budget.
-func (s *StorageOrphanSweeperRunnable) reapIfOwned(
-	ctx context.Context,
-	logger logr.Logger,
-	node *blockstoriov1alpha1.Node,
-	provider storage.Provider,
-	vol storage.Volume,
-) bool {
-	reaper, ok := provider.(storage.OrphanReaper)
-	if !ok {
-		// A provider that cannot show the marker cannot prove the
-		// volume is blockstor's, which is the same as not carrying it.
-		s.report(logger, node, vol, StorageSweeperReasonUnowned, "its provider cannot show an ownership marker")
-
-		return false
-	}
-
-	found, err := reaper.InspectVolume(ctx, vol)
-	if err != nil {
-		if !errors.Is(err, storage.ErrNotFound) {
-			logger.Error(err, "inspect orphan storage volume; leaving it for the next cycle",
-				"pool", vol.PoolName, "resource", vol.ResourceName, "volume", vol.VolumeNumber)
-		}
-
-		return false
-	}
-
-	switch classifyStorageOrphan(found) {
-	case storageKeepUnowned:
-		s.report(logger, node, vol, StorageSweeperReasonUnowned, "it does not carry blockstor's ownership marker")
-
-		return false
-	case storageKeepSnapshots:
-		s.report(logger, node, vol, StorageSweeperReasonSnapshots, "it holds snapshots: "+strings.Join(found.Snapshots, ", "))
-
-		return false
-	case storageReap:
-	}
-
-	logger.Info("orphan storage volume detected; reaping it",
-		"pool", vol.PoolName, "resource", vol.ResourceName, "volume", vol.VolumeNumber)
-
-	err = reaper.ReapVolume(ctx, vol)
-
-	switch {
-	case errors.Is(err, storage.ErrNotOwned):
-		s.report(logger, node, vol, StorageSweeperReasonUnowned, "it lost blockstor's ownership marker before it could be reaped")
-	case errors.Is(err, storage.ErrHasSnapshots):
-		s.report(logger, node, vol, StorageSweeperReasonSnapshots, "it gained a snapshot before it could be reaped")
-	case err != nil:
+	})
+	if delErr != nil {
 		// Per-volume failure shouldn't abort the cycle — next tick
-		// retries, and the rate-limit budget counts successful reaps
-		// only.
-		logger.Error(err, "reap orphan storage volume",
-			"pool", vol.PoolName, "resource", vol.ResourceName, "volume", vol.VolumeNumber)
-	default:
-		return true
+		// retries. We DON'T bump `deleted` so the rate-limit budget
+		// reflects successful reaps only.
+		logger.Error(delErr, "DeleteVolume on orphan",
+			"pool", poolName, "resource", ref.ResourceName, "volume", ref.VolumeNumber)
+
+		return false
 	}
+
+	*deleted++
 
 	return false
 }
 
-// storageOrphanVerdict is what the sweeper does with a volume no local
-// Resource claims.
-type storageOrphanVerdict int
-
-const (
-	// storageReap: blockstor's own leak, delete it.
-	storageReap storageOrphanVerdict = iota
-	// storageKeepUnowned: no ownership marker, report and keep.
-	storageKeepUnowned
-	// storageKeepSnapshots: blockstor's, but deleting it would take
-	// snapshots along; report and keep.
-	storageKeepSnapshots
-)
-
-// classifyStorageOrphan decides from what the provider found on disk.
-//
-// A volume without the marker is never reaped, whatever it is named:
-// it is either data that was in the pool before blockstor (issue 264:
-// LINSTOR leftovers in an adopted pool) or a blockstor volume whose
-// Resource was gone before blockstor wrote markers, and the two cannot
-// be told apart.
-//
-// A volume with snapshots is never reaped either, tracked or not. A
-// snapshot no Snapshot CR tracks may be the operator's rollback point;
-// one a Snapshot CR tracks is still wanted, and its own reconciler
-// deletes it when the CR goes, after which the volume is reaped.
-func classifyStorageOrphan(found storage.VolumeOwnership) storageOrphanVerdict {
-	if !found.Owned {
-		return storageKeepUnowned
-	}
-
-	if len(found.Snapshots) > 0 {
-		return storageKeepSnapshots
-	}
-
-	return storageReap
-}
-
-// report logs a volume the sweeper leaves alone and raises a Warning
-// Event on the local Node, the Event once per volume and reason for
-// the life of the process.
-func (s *StorageOrphanSweeperRunnable) report(
-	logger logr.Logger,
-	node *blockstoriov1alpha1.Node,
-	vol storage.Volume,
-	reason, why string,
-) {
-	note := "volume " + vol.ResourceName + "/" + strconv.Itoa(int(vol.VolumeNumber)) +
-		" in storage pool " + vol.PoolName + " has no Resource on this node and is left in place: " + why
-
-	key := vol.PoolName + "/" + ownedKey(vol.ResourceName, vol.VolumeNumber) + "/" + reason
-	if _, done := s.reported[key]; done {
-		logger.V(1).Info("storage sweep: "+note, "reason", reason)
-
-		return
-	}
-
-	if s.reported == nil {
-		s.reported = map[string]struct{}{}
-	}
-
-	s.reported[key] = struct{}{}
-
-	logger.Info("storage sweep: "+note, "reason", reason)
-
-	if s.Recorder != nil {
-		s.Recorder.Eventf(node, nil, corev1.EventTypeWarning, reason, "SweepOrphanStorage", "%s", note)
-	}
-}
-
-// localNode reads the local Node CRD, whose annotations carry the
-// per-node opt-out and which the sweeper's Events are recorded on.
-func (s *StorageOrphanSweeperRunnable) localNode(ctx context.Context) (*blockstoriov1alpha1.Node, error) {
+// shouldSkip mirrors OrphanSweeperRunnable.shouldSkip — checks the
+// local Node CRD for the per-feature opt-out annotation.
+func (s *StorageOrphanSweeperRunnable) shouldSkip(ctx context.Context) (bool, error) {
 	var node blockstoriov1alpha1.Node
 
 	err := s.Client.Get(ctx, client.ObjectKey{Name: naming.Key(s.NodeName)}, &node)
 	if err != nil {
-		return nil, errors.Wrap(err, "get Node")
+		return false, errors.Wrap(err, "get Node")
 	}
 
-	return &node, nil
+	v, ok := node.Annotations[StorageSweeperSkipAnnotation]
+	if !ok {
+		return false, nil
+	}
+
+	return v == sweeperSkipValue, nil
 }
 
 // listOwnedVolumeRefs returns the set of (resourceName, volumeNumber)

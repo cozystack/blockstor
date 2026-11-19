@@ -81,7 +81,7 @@ func snapshotLVName(snap storage.Snapshot) string {
 // path which Phase 4 introduces.
 func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	if t.lvExists(ctx, volumeLVName(vol)) {
-		return ensureOwnerTag(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
+		return nil
 	}
 
 	// LINSTOR rounds to MiB internally; we follow.
@@ -91,7 +91,6 @@ func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 		Args("--thin",
 			"--virtualsize", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			"--name", volumeLVName(vol),
-			"--addtag", OwnerTag,
 			t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)...)
 	if err != nil {
 		return errors.Wrapf(err, "lvcreate %s", volumeLVName(vol))
@@ -248,7 +247,7 @@ func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error 
 func (t *Thin) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
 	tgtName := volumeLVName(target)
 	if t.lvExists(ctx, tgtName) {
-		return ensureOwnerTag(ctx, t.exec, t.cfg.VolumeGroup, tgtName)
+		return nil
 	}
 
 	srcName := snapshotLVName(src)
@@ -261,7 +260,6 @@ func (t *Thin) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vol
 			"--setactivationskip", "n",
 			"--activate", "y",
 			"--name", tgtName,
-			"--addtag", OwnerTag,
 			t.cfg.VolumeGroup+"/"+srcName)...)
 	if err != nil {
 		return errors.Wrapf(err, "lvcreate -s %s → %s", srcName, tgtName)
@@ -352,11 +350,6 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 	tgtName := volumeLVName(target)
 
 	if t.lvExists(ctx, tgtName) {
-		err := ensureOwnerTag(ctx, t.exec, t.cfg.VolumeGroup, tgtName)
-		if err != nil {
-			return err
-		}
-
 		// Bug 257: idempotent-skip is conditional on the sentinel
 		// being absent. Present → previous run crashed mid-dd; re-run
 		// just the dd + deltag steps (lvcreate is skipped — the LV is
@@ -379,7 +372,6 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 			"--virtualsize", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			"--name", tgtName,
 			"--addtag", RestoreIncompleteTag,
-			"--addtag", OwnerTag,
 			t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)...)
 	if err != nil {
 		return errors.Wrapf(err, "pre-create LV %s for recv", tgtName)
@@ -395,9 +387,10 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 // running.
 //
 // Snapshot LVs (named `<rd>_<snap>_00000` — see snapshotLVName) live
-// in the same VG. A thick snapshot has type 's' in lv_attr and is
-// filtered on it; a thin snapshot has type 'V' like any thin volume,
-// so it is filtered on its origin and name instead (isSnapshotLV).
+// in the same VG; we filter them out via the lv_attr column. Volume
+// LVs have type '-' (thick) or 'V' (thin virtual); snapshot LVs use
+// 's' (regular) or carry origin metadata differentiable through
+// lv_attr.
 // Bug 276 (P1, class-extension of Bug 270): bound the ctx here too.
 // ListVolumeNames runs from the storage orphan-sweeper ticker (every
 // SweeperPeriod) and bypassed the lvExists-level wrap that catches
@@ -408,16 +401,6 @@ func (t *Thin) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error)
 	defer cancel()
 
 	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
-}
-
-// InspectVolume implements storage.OrphanReaper.
-func (t *Thin) InspectVolume(ctx context.Context, vol storage.Volume) (storage.VolumeOwnership, error) {
-	return inspectLV(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
-}
-
-// ReapVolume implements storage.OrphanReaper.
-func (t *Thin) ReapVolume(ctx context.Context, vol storage.Volume) error {
-	return reapLV(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
 }
 
 // ddRecvAndClearSentinel runs the dd byte-copy from src into the
@@ -461,7 +444,7 @@ func (t *Thin) ddRecvAndClearSentinel(ctx context.Context, target storage.Volume
 func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.VolumeRef, error) {
 	out, err := ex.Run(ctx, "lvs",
 		Args("--noheadings",
-			"-o", "lv_name,lv_attr,origin",
+			"-o", "lv_name,lv_attr",
 			"--separator", "\t",
 			vg)...)
 	if err != nil {
@@ -498,10 +481,6 @@ func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.
 			continue
 		}
 
-		if len(parts) > 2 && isSnapshotLV(name, strings.TrimSpace(parts[2])) {
-			continue
-		}
-
 		resource, vol, ok := parseLVName(name)
 		if !ok {
 			continue
@@ -514,22 +493,6 @@ func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.
 	}
 
 	return refs, nil
-}
-
-// isSnapshotLV reports whether the LV named name, whose origin is
-// origin, is a snapshot CreateSnapshot took: `<rd>_<snap>_00000` of
-// `<rd>_00000` (snapshotLVName). A thin snapshot is a thin volume, so
-// lv_attr does not set it apart, and its name parses as volume 0 of a
-// resource `<rd>_<snap>` that no Resource is named after: listed, it
-// would read as a leaked volume. A volume restored from a snapshot has
-// that snapshot as its origin, which never matches this shape.
-func isSnapshotLV(name, origin string) bool {
-	rd, vol, ok := parseLVName(origin)
-	if !ok || vol != 0 || name == origin {
-		return false
-	}
-
-	return strings.HasPrefix(name, rd+"_")
 }
 
 // parseLVName splits `<resource>_<vol5digits>` into (resource, vol).

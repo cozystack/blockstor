@@ -246,7 +246,6 @@ func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
 		Client:    mgr.GetClient(),
 		Providers: cfg.Apply.SnapshotProviders,
 		NodeName:  cfg.NodeName,
-		Recorder:  cfg.Recorder,
 	}).RegisterWithManager(mgr)
 	if err != nil {
 		return errors.Wrap(err, "register StorageOrphanSweeperRunnable")

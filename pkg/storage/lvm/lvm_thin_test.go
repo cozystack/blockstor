@@ -57,7 +57,7 @@ func TestThinCreateVolumeIssuesLvcreate(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 --addtag blockstor-owned vg/thinpool"
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 vg/thinpool"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -115,7 +115,7 @@ func TestThinCreateVolumeGrossSizeRounding(t *testing.T) {
 			}
 
 			want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize " +
-				tc.wantMiB + " --name pvc-1_00000 --addtag blockstor-owned vg/thinpool"
+				tc.wantMiB + " --name pvc-1_00000 vg/thinpool"
 			if !slices.Contains(fx.CommandLines(), want) {
 				t.Errorf("U421: size_kib=%d expected lvcreate %q; got %v",
 					tc.sizeKib, want, fx.CommandLines())
@@ -377,7 +377,7 @@ func TestThinRestoreVolumeFromSnapshotIssuesThinSnapshotLvcreate(t *testing.T) {
 		t.Fatalf("RestoreVolumeFromSnapshot: %v", err)
 	}
 
-	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --setactivationskip n --activate y --name pvc-2_00000 --addtag blockstor-owned vg/pvc-1_snap-1_00000"
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --setactivationskip n --activate y --name pvc-2_00000 vg/pvc-1_snap-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -397,7 +397,7 @@ func TestThinExecError(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")}) // not exists
-	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 --addtag blockstor-owned vg/thinpool",
+	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 vg/thinpool",
 		storage.FakeResponse{Err: errLVCreateFailed})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
