@@ -328,6 +328,9 @@ func TestRGRebalanceReconcilerNoAnnotationStillFiresScheduledTick(t *testing.T) 
 		Name:              "pvc-no-annot",
 		ResourceGroupName: "rg",
 	})
+	_ = st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-no-annot", NodeName: "n1", Volumes: upToDateVolumes(),
+	})
 
 	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
 

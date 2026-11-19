@@ -174,7 +174,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; hasAnnotation {
 		// Operator intent: ignore per-RD shortfall grace and the
 		// per-node offline grace — a REST modify means "act now".
-		count, perr := r.rebalanceChildRDs(ctx, rg, 0)
+		count, perr := r.rebalanceChildRDs(ctx, rg, 0, false)
 		if perr != nil {
 			return perr
 		}
@@ -191,7 +191,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 		return nil
 	}
 
-	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod)
+	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod, true)
 	if perr != nil {
 		return perr
 	}
@@ -216,7 +216,12 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // same window). Pass 0 to disable the gate — the annotation-driven
 // path does this so an operator's `linstor rg modify` acts on every
 // child RD immediately.
-func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration) (int, error) {
+//
+// `scheduled` applies the checks LINSTOR's balance task makes before it
+// touches a definition (see balanceSkipReason). The annotation-driven
+// path leaves them off: it stands for `rg modify`, which LINSTOR runs
+// the autoplacer for on every child definition.
+func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, scheduled bool) (int, error) {
 	log := logf.FromContext(ctx)
 
 	rds, err := r.Store.ResourceDefinitions().List(ctx)
@@ -238,6 +243,23 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 				"rg", rg.Name, "rd", rds[i].Name)
 
 			continue
+		}
+
+		if scheduled {
+			reason, gerr := balanceSkipReason(ctx, r.Store, &rds[i])
+			if gerr != nil {
+				log.Error(gerr, "scheduled rebalance skipped: replicas unreadable",
+					"rg", rg.Name, "rd", rds[i].Name)
+
+				continue
+			}
+
+			if reason != "" {
+				log.V(1).Info("scheduled rebalance skipped",
+					"rg", rg.Name, "rd", rds[i].Name, "reason", reason)
+
+				continue
+			}
 		}
 
 		filter := rg.SelectFilter
