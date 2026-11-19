@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -32,6 +33,7 @@ import (
 // operator reading it knows which one held.
 const (
 	balanceSkipDeleting   = "definition is being deleted"
+	balanceSkipDisabled   = "BalanceResourcesEnabled is false"
 	balanceSkipNoUpToDate = "no diskful replica is UpToDate"
 )
 
@@ -85,4 +87,19 @@ func upToDateDiskful(res *apiv1.Resource) bool {
 	}
 
 	return true
+}
+
+// balanceDisabled resolves BalanceResourcesEnabled the way LINSTOR
+// does: the definition's own value wins over its group's, which wins
+// over the controller's, and "false" in any letter case disables.
+// linstor-csi writes "False" on the definition for the length of a
+// volume delete, so both the scope and the case matter.
+func balanceDisabled(rdProps, rgProps, ctrlProps map[string]string) bool {
+	for _, props := range []map[string]string{rdProps, rgProps, ctrlProps} {
+		if v, ok := props[apiv1.PropBalanceResourcesEnabled]; ok {
+			return strings.EqualFold(v, "false")
+		}
+	}
+
+	return false
 }

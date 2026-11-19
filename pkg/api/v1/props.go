@@ -149,10 +149,11 @@ type EffectiveProperties map[string]EffectivePropEntry
 // placement decisions, and a stamped annotation from a stale REST
 // modify shouldn't override that choice.
 //
-// Resolution hierarchy (most-specific wins): RD > RG > controller.
-// The reconciler reads controller scope only for the first cut;
-// RD/RG-scope kill-switches land alongside the placer integration in
-// a follow-up.
+// Resolution hierarchy (most-specific wins): RD > RG > controller,
+// compared case-insensitively. The controller scope switches the whole
+// reconciler off; an RD or RG value only takes that definition out of
+// the scheduled tick, as LINSTOR's balance task does. linstor-csi sets
+// it to "False" on a definition while it deletes the volume.
 const PropBalanceResourcesEnabled = "BalanceResourcesEnabled"
 
 // PropBalanceResourcesInterval is the controller / RG / RD-scope

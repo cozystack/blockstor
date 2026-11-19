@@ -218,15 +218,26 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // child RD immediately.
 //
 // `scheduled` applies the checks LINSTOR's balance task makes before it
-// touches a definition (see balanceSkipReason). The annotation-driven
-// path leaves them off: it stands for `rg modify`, which LINSTOR runs
-// the autoplacer for on every child definition.
+// touches a definition (see balanceSkipReason and balanceDisabled). The
+// annotation-driven path leaves them off: it stands for `rg modify`,
+// which LINSTOR runs the autoplacer for on every child definition.
 func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, scheduled bool) (int, error) {
 	log := logf.FromContext(ctx)
 
 	rds, err := r.Store.ResourceDefinitions().List(ctx)
 	if err != nil {
 		return 0, err
+	}
+
+	var ctrlProps map[string]string
+
+	if scheduled {
+		// Unreadable controller props fail open, as balanceResourcesDisabled
+		// does: the definition and group values still apply.
+		ctrlProps, err = r.Store.ControllerProps().Get(ctx)
+		if err != nil {
+			log.Error(err, "controller props unreadable; scheduled rebalance uses definition and group values only")
+		}
 	}
 
 	p := placer.New(r.Store)
@@ -245,21 +256,8 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 			continue
 		}
 
-		if scheduled {
-			reason, gerr := balanceSkipReason(ctx, r.Store, &rds[i])
-			if gerr != nil {
-				log.Error(gerr, "scheduled rebalance skipped: replicas unreadable",
-					"rg", rg.Name, "rd", rds[i].Name)
-
-				continue
-			}
-
-			if reason != "" {
-				log.V(1).Info("scheduled rebalance skipped",
-					"rg", rg.Name, "rd", rds[i].Name, "reason", reason)
-
-				continue
-			}
+		if scheduled && r.skipScheduled(ctx, rg, &rds[i], ctrlProps) {
+			continue
 		}
 
 		filter := rg.SelectFilter
@@ -277,6 +275,35 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 	}
 
 	return processed, nil
+}
+
+// skipScheduled reports whether the scheduled tick leaves rd alone:
+// balanceSkipReason, plus the per-definition BalanceResourcesEnabled
+// switch, which only the scheduled tick obeys. The reason goes to the
+// debug log; a definition whose replicas cannot be read is skipped.
+func (r *RGRebalanceReconciler) skipScheduled(ctx context.Context, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition, ctrlProps map[string]string) bool {
+	log := logf.FromContext(ctx).WithValues("rg", rg.Name, "rd", rd.Name)
+
+	if balanceDisabled(rd.Props, rg.Props, ctrlProps) {
+		log.V(1).Info("scheduled rebalance skipped", "reason", balanceSkipDisabled)
+
+		return true
+	}
+
+	reason, err := balanceSkipReason(ctx, r.Store, rd)
+	if err != nil {
+		log.Error(err, "scheduled rebalance skipped: replicas unreadable")
+
+		return true
+	}
+
+	if reason != "" {
+		log.V(1).Info("scheduled rebalance skipped", "reason", reason)
+
+		return true
+	}
+
+	return false
 }
 
 // shortfallWithinGrace reports whether an RD carries a still-fresh
@@ -543,11 +570,11 @@ func (r *RGRebalanceReconciler) now() time.Time {
 }
 
 // balanceResourcesDisabled returns true when the controller-scope
-// `BalanceResourcesEnabled` prop is explicitly set to "false". Any
-// other value (including missing, empty, or a typo) keeps the
-// rebalance reconciler armed — matches upstream LINSTOR's "default
-// = enabled" semantics so an unconfigured cluster behaves the same
-// way it did before scenario 2.W02 landed.
+// `BalanceResourcesEnabled` prop is "false" in any letter case, which
+// is how LINSTOR compares it. Any other value (including missing,
+// empty, or a typo) keeps the rebalance reconciler armed — matches
+// upstream LINSTOR's "default = enabled" semantics so an unconfigured
+// cluster behaves the same way it did before scenario 2.W02 landed.
 func balanceResourcesDisabled(ctx context.Context, st store.Store) bool {
 	if st == nil {
 		return false
@@ -562,7 +589,7 @@ func balanceResourcesDisabled(ctx context.Context, st store.Store) bool {
 		return false
 	}
 
-	return props[apiv1.PropBalanceResourcesEnabled] == "false"
+	return balanceDisabled(nil, nil, props)
 }
 
 // SetupWithManager wires the reconciler into the manager. We share

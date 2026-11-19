@@ -206,3 +206,96 @@ func TestRGModifyStillPlacesOnEmptyDefinition(t *testing.T) {
 		t.Fatalf("got %d replicas after rg modify; want 3", n)
 	}
 }
+
+// TestScheduledRebalanceHonoursBalanceResourcesEnabledPerDefinition:
+// linstor-csi sets BalanceResourcesEnabled=False on a definition for
+// the length of a volume delete, so the balance task does not place
+// replicas while it removes them. LINSTOR resolves the switch on the
+// definition, then its group, then the controller, and compares it
+// without regard to case.
+func TestScheduledRebalanceHonoursBalanceResourcesEnabledPerDefinition(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		rdProps  map[string]string
+		rgProps  map[string]string
+		ctrl     map[string]string
+		wantRepl int
+	}{
+		{name: "definition False, as linstor-csi writes it", rdProps: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"}, wantRepl: 1},
+		{name: "group false", rgProps: map[string]string{apiv1.PropBalanceResourcesEnabled: "false"}, wantRepl: 1},
+		{name: "controller FALSE", ctrl: map[string]string{apiv1.PropBalanceResourcesEnabled: "FALSE"}, wantRepl: 1},
+		{
+			name:     "definition true over group false",
+			rdProps:  map[string]string{apiv1.PropBalanceResourcesEnabled: "true"},
+			rgProps:  map[string]string{apiv1.PropBalanceResourcesEnabled: "false"},
+			wantRepl: 3,
+		},
+		{name: "unset everywhere", wantRepl: 3},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := store.NewInMemory()
+
+			seedIntervalFixture(t, ctx, st, 3, []string{"n1"})
+
+			rd, err := st.ResourceDefinitions().Get(ctx, "pvc-interval")
+			if err != nil {
+				t.Fatalf("get rd: %v", err)
+			}
+
+			rd.Props = tc.rdProps
+			if err := st.ResourceDefinitions().Update(ctx, &rd); err != nil {
+				t.Fatalf("set rd props: %v", err)
+			}
+
+			rg, err := st.ResourceGroups().Get(ctx, "rg")
+			if err != nil {
+				t.Fatalf("get rg: %v", err)
+			}
+
+			rg.Props = tc.rgProps
+			if err := st.ResourceGroups().Update(ctx, &rg); err != nil {
+				t.Fatalf("set rg props: %v", err)
+			}
+
+			if tc.ctrl != nil {
+				if err := st.ControllerProps().Set(ctx, tc.ctrl); err != nil {
+					t.Fatalf("set controller props: %v", err)
+				}
+			}
+
+			reconcileRebalance(t, ctx, st)
+
+			if n := replicaCount(t, ctx, st, "pvc-interval"); n != tc.wantRepl {
+				t.Fatalf("got %d replicas; want %d", n, tc.wantRepl)
+			}
+		})
+	}
+}
+
+// TestRebalanceKillSwitchIgnoresCase: the controller-wide switch stops
+// the rg modify path too, and "False" stops it the way "false" does.
+func TestRebalanceKillSwitchIgnoresCase(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewInMemory()
+
+	seedRebalanceFixture(t, ctx, st, 3, []string{"n1"})
+
+	if err := st.ControllerProps().Set(ctx, map[string]string{apiv1.PropBalanceResourcesEnabled: "False"}); err != nil {
+		t.Fatalf("set controller props: %v", err)
+	}
+
+	reconcileRebalance(t, ctx, st)
+
+	if n := replicaCount(t, ctx, st, "pvc-rebalance"); n != 1 {
+		t.Fatalf("got %d replicas with BalanceResourcesEnabled=False; want 1", n)
+	}
+}
