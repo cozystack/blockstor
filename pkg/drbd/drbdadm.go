@@ -2322,6 +2322,27 @@ func (a *Adm) ResourceOwningMinor(ctx context.Context, minor int32) (string, err
 	return "", nil
 }
 
+// RemoveMinor takes one volume out of a loaded resource: `drbdsetup detach`
+// releases the backing device, then `drbdsetup del-minor` drops the DRBD
+// device itself. `drbdadm adjust` does the same for a volume a re-rendered
+// .res no longer lists; this is for the case it is not run, a resource
+// whose last volume goes, which renders no .res at all. The detach is
+// allowed to fail, since a diskless volume has nothing attached; the
+// del-minor is not, and it refuses a device that is still open, which is
+// what keeps a mounted volume from losing its disk underneath.
+func (a *Adm) RemoveMinor(ctx context.Context, minor int32) error {
+	m := strconv.Itoa(int(minor))
+
+	_, _ = a.exec.Run(ctx, "drbdsetup", "detach", m)
+
+	_, err := a.exec.Run(ctx, "drbdsetup", "del-minor", m)
+	if err != nil {
+		return errors.Wrapf(err, "drbdsetup del-minor %s", m)
+	}
+
+	return nil
+}
+
 // run is the single shell-out site so every drbdadm error gets
 // uniform context (subcommand + resource) for log triage.
 func (a *Adm) run(ctx context.Context, args ...string) error {

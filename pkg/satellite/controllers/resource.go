@@ -511,9 +511,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
-	anyFailed := r.recordPerResourceFailures(res, results, logger)
-
-	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
+	anyFailed := r.afterApply(ctx, res, &rd, results, logger)
 
 	// Apply chain surfaces per-resource errors via results (e.g.
 	// drbdadm adjust failing on a stale .res rendered before the
@@ -541,6 +539,35 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// afterApply records the apply's outcome on the Resource and reports
+// whether anything failed. The volumes of definitions flagged DELETE are
+// deleted only after an apply that went through, since that apply is what
+// took them out of DRBD.
+func (r *ResourceReconciler) afterApply(
+	ctx context.Context,
+	res *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	results []*intent.ResourceApplyResult,
+	logger logr.Logger,
+) bool {
+	anyFailed := r.recordPerResourceFailures(res, results, logger)
+
+	r.stampPostApply(ctx, res, rd, results, anyFailed, logger)
+
+	if anyFailed {
+		return true
+	}
+
+	err := r.deleteFlaggedVolumes(ctx, res, rd)
+	if err != nil {
+		logger.Info("volume definition delete not done yet", "error", err.Error())
+
+		return true
+	}
+
+	return false
 }
 
 // prepareDRBDApply runs the DRBD-only pre-apply sequence: stale
@@ -905,10 +932,15 @@ type staleVolumeStatus struct {
 
 // desiredVolumeNumbers returns the set of VolumeNumbers the parent
 // RD's VolumeDefinitions currently declare — i.e. every volume that
-// MUST survive in `Status.Volumes`.
+// MUST survive in `Status.Volumes`. A volume definition flagged DELETE is
+// not one of them: its volume is on its way out of this replica.
 func desiredVolumeNumbers(rd *blockstoriov1alpha1.ResourceDefinition) map[int32]struct{} {
 	out := make(map[int32]struct{}, len(rd.Spec.VolumeDefinitions))
 	for i := range rd.Spec.VolumeDefinitions {
+		if rd.Spec.VolumeDefinitions[i].Deleting() {
+			continue
+		}
+
 		out[rd.Spec.VolumeDefinitions[i].VolumeNumber] = struct{}{}
 	}
 
@@ -1305,6 +1337,10 @@ func volNumsOf(rd *blockstoriov1alpha1.ResourceDefinition) []int32 {
 	out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
 
 	for i := range rd.Spec.VolumeDefinitions {
+		if rd.Spec.VolumeDefinitions[i].Deleting() {
+			continue
+		}
+
 		out = append(out, rd.Spec.VolumeDefinitions[i].VolumeNumber)
 	}
 
