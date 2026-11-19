@@ -1332,7 +1332,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 // terminal for the definition and for every replica of it, since
 // convertResources drops replicas whose parent did not convert.
 func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
-	if row.ResourceFlags&resourceFlagDelete != 0 {
+	if row.ResourceFlags&rscDfnFlagDelete != 0 {
 		c.warnf("resource definition %s: marked DELETE in the source cluster — skipped", dsp)
 
 		return false
@@ -2214,6 +2214,10 @@ func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
 		name := rdDsp + "." + snapDsp
 
 		switch {
+		case row.ResourceFlags&snapDfnFlagDelete != 0:
+			c.warnf("snapshot %s: marked DELETE in the source cluster — skipped", name)
+
+			continue
 		case row.ResourceFlags&snapDfnFlagFailedDeployment != 0:
 			c.warnf("snapshot %s: FAILED_DEPLOYMENT in the source cluster — skipped", name)
 
@@ -2244,7 +2248,7 @@ func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
 }
 
 // buildSnapshot assembles one adopted Snapshot CRD (the caller has
-// applied the FAILED/SUCCESSFUL/parent/nodes skips).
+// applied the DELETE/FAILED/SUCCESSFUL/parent/nodes skips).
 func (c *converter) buildSnapshot(row *ResourceDefinitionRow, rdDsp, snapDsp, name string, nodes []string) crdv1alpha1.Snapshot {
 	snap := crdv1alpha1.Snapshot{
 		TypeMeta:   typeMeta("Snapshot"),
@@ -2534,14 +2538,23 @@ func (c *converter) snapshotCreatedAtFor(rdName, snapName string) int64 {
 // snapshotNodesFor lists the nodes an adopted Snapshot targets, dropping
 // any placement on a node that did not convert (CONTROLLER / unknown /
 // skipped). Keeping such a node would make the adopted Snapshot wait for
-// terminal readiness from a Node object that never exists. snapName is
-// used for the per-exclusion warning.
+// terminal readiness from a Node object that never exists. A placement
+// LINSTOR had marked DELETE is dropped too: its snapshot is on the way
+// out of that node, and adopting it there would bring it back.
+// snapName is used for the per-exclusion warning.
 func (c *converter) snapshotNodesFor(rdName, snapName, snapDsp string) []string {
 	var out []string
 
 	for i := range c.dump.Resources {
 		row := &c.dump.Resources[i]
 		if row.ResourceName != rdName || row.SnapshotName != snapName {
+			continue
+		}
+
+		if row.ResourceFlags&snapFlagDelete != 0 {
+			c.warnf("snapshot %s.%s: placement on node %s marked DELETE in the source cluster — dropped",
+				c.displayRD(rdName), snapDsp, c.displayNode(row.NodeName))
+
 			continue
 		}
 
