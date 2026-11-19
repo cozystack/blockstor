@@ -195,11 +195,7 @@ func (a *Adm) AdjustSkipNetSkipDisk(ctx context.Context, resource string) error 
 // `runFirstActivation` gates the call behind a `HasMD` pre-check so
 // this stays safe across satellite restarts / failed first attempts.
 func (a *Adm) CreateMD(ctx context.Context, resource string) error {
-	return a.run(ctx,
-		"create-md",
-		"--force",
-		fmt.Sprintf("--max-peers=%d", MaxPeers-1),
-		resource)
+	return a.CreateMDWithMaxPeers(ctx, resource, MaxPeers-1)
 }
 
 // HasMD reports whether DRBD-9 metadata already exists for the
