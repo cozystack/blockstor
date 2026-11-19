@@ -103,16 +103,21 @@ func expectGetGI(fx *storage.FakeExec, rd, device, currentGI string) {
 		storage.FakeResponse{Stdout: []byte(currentGI + ":0000000000000000:0:0:1:1:0:0:0:0\n")})
 }
 
-// expectDrbdMetaSignature cans the blkid answer real hardware gives
-// for the BACKING device of an internal-metadata DRBD volume: libblkid
-// recognises the DRBD meta superblock at the device tail and reports
-// TYPE=drbd even on a never-formatted volume (stand forensics,
-// bug028-fix-validation-20260612-054452/iter2). The BUG-028 probes
-// MUST read this as "no user filesystem" — the naive any-TYPE= probe
-// wedged both the bypass and the latch-free retry forever.
+// backingProbe is the filesystem-only low-level blkid probe the BUG-028
+// gates run on a backing device.
+func backingProbe(device string) string {
+	return "blkid -p -u filesystem -o export " + device
+}
+
+// expectDrbdMetaSignature cans the answer real hardware gives for the
+// BACKING device of a never-formatted internal-metadata DRBD volume. A
+// plain blkid reports TYPE=drbd there (libblkid stops at the DRBD meta
+// superblock at the device tail; stand forensics,
+// bug028-fix-validation-20260612-054452/iter2); the filesystem-only
+// probe skips that superblock and finds nothing, exit 2. The BUG-028
+// probes MUST read this as "no filesystem".
 func expectDrbdMetaSignature(fx *storage.FakeExec, device string) {
-	fx.Expect("blkid -o export "+device,
-		storage.FakeResponse{Stdout: []byte("DEVNAME=" + device + "\nUUID=6715da3a6dd3182a\nTYPE=drbd\n")})
+	fx.Expect(backingProbe(device), storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 }
 
 func newThinReconciler(fx *storage.FakeExec, dir string) *satellite.Reconciler {
@@ -265,7 +270,7 @@ func TestApplyBug028VetoHoldsOnFsSignature(t *testing.T) {
 	fx.Expect("drbdsetup status pvc-b028f --json",
 		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028f"))})
 	expectGetGI(fx, "pvc-b028f", device, satellite.Day0GiForTest("pvc-b028f", 0))
-	fx.Expect("blkid -o export "+device,
+	fx.Expect(backingProbe(device),
 		storage.FakeResponse{Stdout: []byte("DEVNAME=" + device + "\nTYPE=ext4\nUSAGE=filesystem\n")})
 
 	rec := newThinReconciler(fx, dir)
@@ -420,7 +425,7 @@ func TestApplyBug028FalseLatchRetryFiresWithoutAutoPrimary(t *testing.T) {
 func TestApplyBug028FalseLatchRetryDefersWhileForeignPrimary(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	expectThinBacking(fx, "pvc-b028w")
+	expectDrbdMetaSignature(fx, expectThinBacking(fx, "pvc-b028w"))
 	fx.Expect("drbdsetup status pvc-b028w --json",
 		storage.FakeResponse{Stdout: []byte(`[{
 		  "name":"pvc-b028w","node-id":0,"role":"Secondary",
@@ -493,7 +498,7 @@ func TestApplyBug028FalseLatchRetryRefusedWhenFsPresent(t *testing.T) {
 	device := expectThinBacking(fx, "pvc-b028s")
 	fx.Expect("drbdsetup status pvc-b028s --json",
 		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028s"))})
-	fx.Expect("blkid -o export "+device,
+	fx.Expect(backingProbe(device),
 		storage.FakeResponse{Stdout: []byte("DEVNAME=" + device + "\nTYPE=ext4\nUSAGE=filesystem\n")})
 
 	rec := newThinReconciler(fx, dir)
