@@ -111,8 +111,12 @@ func (a *Adm) Adjust(ctx context.Context, resource string) error {
 
 // CheckResFile asks drbdadm whether the node's configuration still parses
 // with candidate in place of live: `drbdadm --config-to-test <candidate>
-// --config-to-exclude <live> sh-nop`. The check LINSTOR's satellite runs
-// before it installs a .res (DrbdAdm.checkResFile).
+// --config-to-exclude <live> sh-nop`.
+//
+// LINSTOR's satellite does not run it: its DrbdAdm.checkResFile has no
+// caller, and DrbdResourceFileUtils moves a new body into place
+// unchecked. blockstor checks deliberately, which is stricter, and
+// docs/cli-parity-known-deltas.md lists it as a divergence.
 //
 // It matters beyond the one resource because drbdadm reads every .res
 // on the node for any command. A file it cannot parse stops adjust,
