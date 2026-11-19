@@ -49,6 +49,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
@@ -121,7 +122,7 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 // distinct key (`blockstor.org/resource`) so the
 // two paths coexist during the Phase 10.6 cutover without
 // stepping on each other.
-const SatelliteResourceFinalizer = "blockstor.org/satellite-resource"
+const SatelliteResourceFinalizer = finalizers.SatelliteResource
 
 // resourceKind is the apiserver Kind for the blockstor Resource
 // CRD. Defined once so SSA Patch payloads in this package share
@@ -1499,16 +1500,23 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 		return ctrl.Result{}, err
 	}
 
-	suffix, err := r.recordRenameSuffix(ctx, res)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
 	req := &intent.DeleteResourceRequest{
 		Name:          naming.Key(res.Spec.ResourceDefinitionName),
 		StoragePool:   resolveDeleteStoragePool(res),
 		VolumeNumbers: volumeNumbers,
-		DeletedSuffix: suffix,
+	}
+
+	if res.Annotations[finalizers.StorageAbandoned] != "" {
+		// `node lost` removed this replica because the node is gone;
+		// LINSTOR leaves the storage of a lost node in place, and so
+		// does a satellite that turns out to be running after all: it
+		// tears down DRBD and keeps the volumes.
+		req.StoragePool = ""
+	} else {
+		req.DeletedSuffix, err = r.recordRenameSuffix(ctx, res)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	resp, err := r.Config.Apply.DeleteResource(ctx, req)

@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
@@ -121,5 +122,49 @@ func TestLookupVolumeNumbersJoinsEverySource(t *testing.T) {
 
 	if want := []int32{0, 1, 2}; !slices.Equal(got, want) {
 		t.Errorf("lookupVolumeNumbers = %v, want %v", got, want)
+	}
+}
+
+// A replica `node lost` abandoned keeps its storage even when its satellite
+// is in fact still running: DRBD is torn down, the volumes stay, as LINSTOR
+// leaves a lost node's storage.
+func TestHandleDeleteOfAnAbandonedReplicaKeepsItsStorage(t *testing.T) {
+	t.Parallel()
+
+	const (
+		node   = "n-delete"
+		rdName = "pvc-del"
+	)
+
+	baseCli, rec, provider, _ := newDeleteRaceFixture(t)
+
+	var res blockstoriov1alpha1.Resource
+	if err := baseCli.Get(t.Context(), client.ObjectKey{Name: rdName + "." + node}, &res); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	res.Annotations = map[string]string{finalizers.StorageAbandoned: "node-lost"}
+	if err := baseCli.Update(t.Context(), &res); err != nil {
+		t.Fatalf("mark abandoned: %v", err)
+	}
+
+	reconciler := &ResourceReconciler{Client: baseCli, Config: Config{
+		NodeName: node, Apply: rec, Exec: storage.NewFakeExec(), APIReader: baseCli,
+	}}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: rdName + "." + node}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if got := provider.deletesSnapshot(); len(got) != 0 {
+		t.Errorf("DeleteVolume ran %d times on an abandoned replica", len(got))
+	}
+
+	var after blockstoriov1alpha1.Resource
+
+	err = baseCli.Get(t.Context(), client.ObjectKey{Name: rdName + "." + node}, &after)
+	if err == nil && slices.Contains(after.Finalizers, SatelliteResourceFinalizer) {
+		t.Errorf("finalizer kept on an abandoned replica: %v", after.Finalizers)
 	}
 }

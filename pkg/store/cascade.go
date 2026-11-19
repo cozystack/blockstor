@@ -203,6 +203,12 @@ func inEverySpelling[T any](
 // CascadeOrphansForLostNode deletes every Resource replica and StoragePool
 // that references the named node, which is what makes a forced node delete
 // leave nothing pointing at an object that is gone.
+//
+// The node is gone, so its satellite never deletes anything: as LINSTOR's
+// `node lost`, the objects are removed and the storage stays on the node.
+// A store whose objects carry satellite finalizers releases them here (see
+// ReplicaAbandoner), since nothing else ever would, and drops the node's hold
+// on the Snapshots it is listed on.
 func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error {
 	spellings, err := NodeSpellings(ctx, st, node)
 	if err != nil {
@@ -214,10 +220,27 @@ func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error
 		return err
 	}
 
+	replicas := st.Resources()
+	abandoner, abandons := replicas.(ReplicaAbandoner)
+
 	for i := range resources {
-		err = st.Resources().Delete(ctx, resources[i].Name, resources[i].NodeName)
+		if abandons {
+			err = abandoner.AbandonReplica(ctx, resources[i].Name, resources[i].NodeName)
+		} else {
+			err = replicas.Delete(ctx, resources[i].Name, resources[i].NodeName)
+		}
+
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return fmt.Errorf("delete replica %s on %s: %w", resources[i].Name, node, err)
+		}
+	}
+
+	if releaser, ok := st.Snapshots().(SnapshotNodeReleaser); ok {
+		for _, spelling := range spellings {
+			err = releaser.ReleaseSnapshotsOnNode(ctx, spelling)
+			if err != nil {
+				return fmt.Errorf("release snapshots on %s: %w", node, err)
+			}
 		}
 	}
 
@@ -226,8 +249,16 @@ func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error
 		return err
 	}
 
+	poolStore := st.StoragePools()
+	poolAbandoner, abandonsPools := poolStore.(PoolAbandoner)
+
 	for i := range pools {
-		err = st.StoragePools().Delete(ctx, pools[i].NodeName, pools[i].StoragePoolName)
+		if abandonsPools {
+			err = poolAbandoner.AbandonPool(ctx, pools[i].NodeName, pools[i].StoragePoolName)
+		} else {
+			err = poolStore.Delete(ctx, pools[i].NodeName, pools[i].StoragePoolName)
+		}
+
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return fmt.Errorf("delete storage pool %s on %s: %w", pools[i].StoragePoolName, node, err)
 		}

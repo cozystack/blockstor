@@ -20,8 +20,6 @@ package controllers
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,7 +27,6 @@ import (
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,48 +35,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
-// SatelliteSnapshotFinalizer is the finalizer older satellites shared: every
-// node in a Snapshot's node list stamped the same key, so the first satellite
-// to delete its own copy released the CRD and the others never saw the
-// delete, leaving their copies on disk. It is kept only to migrate Snapshots
-// that still carry it; see snapshotNodeFinalizer.
-const SatelliteSnapshotFinalizer = "blockstor.org/satellite-snapshot"
+// SatelliteSnapshotFinalizer is the finalizer older satellites shared. It is
+// kept only to migrate Snapshots that still carry it; see
+// finalizers.SharedSatelliteSnapshot.
+const SatelliteSnapshotFinalizer = finalizers.SharedSatelliteSnapshot
 
-// snapshotNodeFinalizerPrefix is the qualified-name prefix of the per-node
-// snapshot finalizers.
-const snapshotNodeFinalizerPrefix = "satellite-snapshot.blockstor.org/"
+// snapshotNodeFinalizer is the finalizer this satellite holds on a Snapshot
+// while its own copy may still be on disk; see finalizers.SnapshotNode.
+func snapshotNodeFinalizer(node string) string { return finalizers.SnapshotNode(node) }
 
-// snapshotNodeFinalizerNameMax is the length limit of the name part of a
-// qualified name, which is what a finalizer is.
-const snapshotNodeFinalizerNameMax = 63
-
-// snapshotNodeFinalizer is the finalizer one satellite holds on a Snapshot
-// while its own copy of the snapshot may still be on disk. One key per node
-// is what lets the CRD go only once every node has deleted its copy, as each
-// Resource's own finalizer does for its replica.
-//
-// The node's key is the name part when it fits a qualified name, and a hash
-// of it otherwise, so a long node name still gets a valid, stable key.
-func snapshotNodeFinalizer(node string) string {
-	key := naming.Key(node)
-	if len(key) <= snapshotNodeFinalizerNameMax && len(validation.IsQualifiedName(snapshotNodeFinalizerPrefix+key)) == 0 {
-		return snapshotNodeFinalizerPrefix + key
-	}
-
-	sum := sha256.Sum256([]byte(key))
-
-	return snapshotNodeFinalizerPrefix + "node-" + hex.EncodeToString(sum[:])[:40]
-}
-
-// SnapshotNodeFinalizer is snapshotNodeFinalizer for the callers outside
-// the satellite that must release a node's hold: `node lost` drops the
-// finalizer of a node that will never delete its copy.
-func SnapshotNodeFinalizer(node string) string { return snapshotNodeFinalizer(node) }
+// SnapshotNodeFinalizer is snapshotNodeFinalizer for tests outside the
+// package.
+func SnapshotNodeFinalizer(node string) string { return finalizers.SnapshotNode(node) }
 
 // snapshotFinalizerRequeue is the short back-off between
 // stamping the finalizer and the next Reconcile pass that
