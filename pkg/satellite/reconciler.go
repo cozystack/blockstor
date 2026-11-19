@@ -533,6 +533,10 @@ func (r *Reconciler) SetSkipDiskClearer(c SkipDiskClearer) {
 // the empty default to keep assertions simple; production always
 // passes the real on-disk path from cmd/satellite.
 func (r *Reconciler) StateDir() string {
+	if r == nil {
+		return ""
+	}
+
 	return r.cfg.StateDir
 }
 
@@ -670,186 +674,108 @@ func (r *Reconciler) ResumeResource(ctx context.Context, resName string) error {
 	return nil
 }
 
-// FlushBackingDevices drains the kernel writeback cache from the
-// DRBD layer down to the backing block device for every volume of
-// `resName`. P0 fix for the stale-snapshot bug: `drbdadm suspend-io`
-// quiesces NEW writes at the DRBD layer but per the DRBD docs
-// "inflight requests will still complete" — i.e. suspend-io
-// returns BEFORE the in-flight queue between DRBD and the backing
-// device has fully drained. Without an explicit flush the
-// storage-layer snapshot is captured against a backing device that
-// still has pending DRBD writes queued, so the snap (and any clone
-// / `zfs send | recv` payload derived from it) carries empty /
-// stale content.
-//
-// Empirical (ZFS-switch stand, 2026-05-23): a 256 KiB urandom
-// payload written with `oflag=direct` through /dev/drbdN showed
-// only ~16 KiB `used` on the post-snapshot ZFS zvol. Flushing the
-// backing zvol alone via `blockdev --flushbufs` was insufficient
-// because the writes hadn't even left DRBD's queue yet — DRBD's
-// own writeback path runs asynchronously after the kthread acks
-// the application bio. The fix mirrors upstream LINSTOR's
-// `Controller/.../snapshot/*` barrier sequence: per-volume
-// `blockdev --flushbufs` (drains the device's page cache) AND a
-// global `sync` (drains DRBD's kthread queues that BLKFLSBUF on a
-// single device doesn't reach because DRBD's writeback queue
-// isn't associated with any particular /dev/.. fd's bdi).
-//
-// Per-device flush failures are logged but do NOT abort the whole
-// flush: a missing volume (e.g. diskless peer) is fine — its
-// VolumeStatus returns DevicePath="" and we skip it. Likewise, a
-// non-zero `blockdev --flushbufs` / `sync` exit (kernel without
-// the ioctl, hostpath sandboxing) is best-effort: degraded flush
-// is better than failing the snapshot orchestration.
-//
-// nil Exec (unit tests of the storage path without shell-out
-// wired) returns nil without erroring: the flush is a no-op on a
-// fake-exec satellite, which is the same shape SuspendResource /
-// ResumeResource use for their own nil-Adm short-circuit.
-//
-// volumeNumbers is the per-RD slice of volumes the orchestrator
-// targets; mirrors the same slice
-// `handleTakeSnapshotPhase` builds from `snap.Spec.VolumeDefinitions`
-// so the per-device flush stays scoped to exactly the volumes the
-// snapshot captures (the global sync drains everything regardless,
-// which is unavoidable but acceptable because the satellite is
-// already under a per-resource suspend-io window).
-//
-//nolint:funlen // three-step barrier (per-volume blockdev / global sync / zpool sync) is sequential by design; splitting hurts readability of the orchestration ordering.
-func (r *Reconciler) FlushBackingDevices(ctx context.Context, resName string, volumeNumbers []int32) error {
-	if r.cfg.Exec == nil {
-		return nil
+// DRBDEnabled reports whether this satellite drives a DRBD layer at
+// all. Without one nothing is ever suspended, so a snapshot window has
+// nothing to guard.
+func (r *Reconciler) DRBDEnabled() bool {
+	return r != nil && r.cfg.Adm != nil
+}
+
+// ResourceSuspendState reads the kernel's suspend state for resName.
+// An unloaded resource, or a satellite without DRBD, reports
+// Loaded=false.
+func (r *Reconciler) ResourceSuspendState(ctx context.Context, resName string) (drbd.SuspendState, error) {
+	if r.cfg.Adm == nil {
+		return drbd.SuspendState{}, nil
 	}
 
-	provider, err := r.providerForResource(resName)
+	state, err := r.cfg.Adm.SuspendState(ctx, resName)
 	if err != nil {
-		// Unknown resource on this node — nothing to flush. The
-		// SnapshotReconciler's CreateSnapshot path will surface the
-		// same lookup failure as a terminal error, so we don't
-		// need to duplicate the routing here.
-		//nolint:nilerr // best-effort flush; unknown-resource is handled by the caller.
+		return drbd.SuspendState{}, errors.Wrapf(err, "suspend state %s", resName)
+	}
+
+	return state, nil
+}
+
+// ResumeMinors resumes I/O by kernel minor, for a resource whose .res
+// may be gone. Every minor is tried; the first error is returned.
+func (r *Reconciler) ResumeMinors(ctx context.Context, minors []int32) error {
+	if r.cfg.Adm == nil {
 		return nil
 	}
 
-	r.mu.Lock()
-	pool := r.resourceToPool[resName]
-	r.mu.Unlock()
+	var first error
+
+	for _, minor := range minors {
+		err := r.cfg.Adm.ResumeIOMinor(ctx, minor)
+		if err != nil && first == nil {
+			first = err
+		}
+	}
+
+	return first
+}
+
+// FlushBeforeSuspend writes back what sits above the device a snapshot
+// is about to freeze, so the snapshot holds the data a writer has
+// already handed to the kernel and not only what reached the disk.
+//
+// It runs before suspend-io and never after it. Once a DRBD device is
+// suspended, any writeback that targets it waits for the resume, so a
+// flush issued inside the window waits on the window itself; a global
+// sync(2) does exactly that on the node where the device is Primary and
+// mounted. LINSTOR flushes nothing at all around a snapshot: the
+// satellite suspends the root layer and lets the storage layer take the
+// snapshot (SuspendManager.manageSuspendIo, DeviceHandlerImpl
+// processResources), which leaves the snapshot crash-consistent. The
+// per-device flush here adds the page cache of a filesystem mounted on
+// the device and nothing more.
+//
+// With DRBD the flush targets /dev/drbd<minor> and only on the Primary:
+// BLKFLSBUF on a device that carries a mounted filesystem syncs that
+// filesystem, and a Secondary has no writer above it. Without DRBD the
+// storage device is the top of the stack and is flushed instead.
+// Failures are logged and ignored: the snapshot is then crash-consistent,
+// which is what LINSTOR gives in every case.
+func (r *Reconciler) FlushBeforeSuspend(ctx context.Context, resName string, state drbd.SuspendState, volumeNumbers []int32) {
+	if r == nil || r.cfg.Exec == nil {
+		return
+	}
+
+	if r.cfg.Adm == nil {
+		r.flushStorageDevices(ctx, resName, volumeNumbers)
+
+		return
+	}
+
+	if !state.Loaded || state.Role != drbdRolePrimary {
+		return
+	}
 
 	for _, volNum := range volumeNumbers {
-		vol := storage.Volume{
-			PoolName:     pool,
-			ResourceName: resName,
-			VolumeNumber: volNum,
+		minor, ok := state.Minors[volNum]
+		if !ok {
+			continue
 		}
 
-		status, statusErr := provider.VolumeStatus(ctx, vol)
-		if statusErr != nil {
-			log.FromContext(ctx).Info("flush: VolumeStatus failed; skipping",
-				"resource", resName, "volume", volNum, "error", statusErr.Error())
+		device := "/dev/drbd" + strconv.Itoa(int(minor))
+
+		_, err := r.cfg.Exec.Run(ctx, "blockdev", "--flushbufs", device)
+		if err != nil {
+			log.FromContext(ctx).Info("flush before suspend failed; the snapshot is crash-consistent",
+				"resource", resName, "volume", volNum, "device", device, "error", err.Error())
 
 			continue
 		}
 
-		if status.DevicePath == "" {
-			// Volume not provisioned on this node (e.g. diskless
-			// peer) — nothing to flush.
-			continue
-		}
-
-		// `blockdev --flushbufs` issues a BLKFLSBUF ioctl which
-		// drains the kernel page cache for the device.
-		_, runErr := r.cfg.Exec.Run(ctx, "blockdev", "--flushbufs", status.DevicePath)
-		if runErr != nil {
-			log.FromContext(ctx).Info("flush: blockdev --flushbufs failed; continuing",
-				"resource", resName, "volume", volNum, "device", status.DevicePath,
-				"error", runErr.Error())
-
-			continue
-		}
-
-		log.FromContext(ctx).Info("flush: backing-device page cache drained",
-			"resource", resName, "volume", volNum, "device", status.DevicePath)
+		log.FromContext(ctx).V(1).Info("flushed before suspend",
+			"resource", resName, "volume", volNum, "device", device)
 	}
-
-	// Global `sync` is the host-wide barrier that drains DRBD's
-	// kthread writeback queue. BLKFLSBUF on a single
-	// /dev/zvol/... device doesn't reach DRBD's queue because
-	// DRBD's writeback isn't anchored to any particular bdi fd.
-	_, err = r.cfg.Exec.Run(ctx, "sync")
-	if err != nil {
-		log.FromContext(ctx).Info("flush: global sync failed; continuing",
-			"resource", resName, "error", err.Error())
-	} else {
-		log.FromContext(ctx).Info("flush: global sync drained DRBD writeback queue",
-			"resource", resName)
-	}
-
-	// ZFS-specific final step: `zpool sync <pool>` forces the
-	// kernel ZFS module to commit all in-flight TXGs to disk
-	// blocks. Without this the post-`sync` zvol page cache is
-	// drained but the data may still be sitting in ZFS's
-	// in-memory ARC/dnode tree waiting for the next periodic TXG
-	// (default 5s). `zfs snapshot` is atomic with the next TXG
-	// commit, but in the suspend-io window we want a barrier
-	// that pushes the just-flushed bytes into the snapshotted
-	// state BEFORE the snapshot dataset is created — otherwise
-	// the snap captures an inconsistent point relative to the
-	// caller's "I just wrote X bytes" expectation.
-	//
-	// Provider-agnostic: only fires for the ZFS / ZFS_THIN
-	// kinds. LVM-thin / FILE rely on the prior `sync(1)` step,
-	// which is sufficient for their kernel-page-cache-only
-	// writeback model.
-	kind := provider.Kind()
-	if kind == "ZFS" || kind == "ZFS_THIN" {
-		// The pool name lives behind the provider; extract it
-		// via the optional `Pool() string` accessor (zfs.Provider
-		// implements it). Fall back to the registry name when the
-		// concrete type doesn't expose Pool() — production cmd/satellite
-		// uses the same string for both.
-		zpoolName := zpoolNameForProvider(provider, pool)
-		if zpoolName != "" {
-			_, err = r.cfg.Exec.Run(ctx, "zpool", "sync", zpoolName)
-			if err != nil {
-				log.FromContext(ctx).Info("flush: zpool sync failed; continuing",
-					"resource", resName, "zpool", zpoolName, "error", err.Error())
-			} else {
-				log.FromContext(ctx).Info("flush: zpool sync committed pending TXGs",
-					"resource", resName, "zpool", zpoolName)
-			}
-		}
-	}
-
-	return nil
 }
 
-// flushBackingPerVolume issues `blockdev --flushbufs <devPath>`
-// for every volume of the resource. Best-effort: per-volume
-// VolumeStatus / blockdev failures are logged and skipped so a
-// missing replica or a kernel without BLKFLSBUF doesn't sink the
-// whole snapshot orchestration. Extracted out of
-// FlushBackingDevices to keep that function under the funlen
-// budget (<60 lines).
-// zpoolNameForProvider returns the underlying ZFS pool name for a
-// ZFS / ZFS_THIN provider. The blockstor registry name (`pool`) is
-// the logical pool name in CRDs, but the actual `zpool` is held by
-// the provider's config. There's no public accessor on the
-// storage.Provider interface, so we type-assert against an inline
-// `Pool() string` interface — zfs.Provider implements it.
-func zpoolNameForProvider(provider storage.Provider, registryName string) string {
-	type zpoolNamer interface {
-		Pool() string
-	}
-
-	if pp, ok := provider.(zpoolNamer); ok {
-		return pp.Pool()
-	}
-
-	// Fall back to the registry name. The cmd/satellite wiring
-	// uses the same string for both, so this is a sane default
-	// even though it elides the indirection.
-	return registryName
-}
+// drbdRolePrimary is the role token `drbdsetup status` reports for
+// the node that has the device open for writing.
+const drbdRolePrimary = "Primary"
 
 // DeleteResource tears down a resource: drbdadm down (best-effort —
 // the kernel handles a missing one fine), DeleteVolume on every
@@ -6244,3 +6170,33 @@ func buildVolumeResults(dr *intent.DesiredResource, devices map[int32]string, di
 // would (shared-secret is in /etc/drbd.d/global_common.conf, written
 // once at install time).
 const resFilePerm = 0o644
+
+// flushStorageDevices flushes the storage device of each volume when
+// no DRBD layer sits above it.
+func (r *Reconciler) flushStorageDevices(ctx context.Context, resName string, volumeNumbers []int32) {
+	provider, err := r.providerForResource(resName)
+	if err != nil {
+		return
+	}
+
+	r.mu.Lock()
+	pool := r.resourceToPool[resName]
+	r.mu.Unlock()
+
+	for _, volNum := range volumeNumbers {
+		status, statusErr := provider.VolumeStatus(ctx, storage.Volume{
+			PoolName:     pool,
+			ResourceName: resName,
+			VolumeNumber: volNum,
+		})
+		if statusErr != nil || status.DevicePath == "" {
+			continue
+		}
+
+		_, runErr := r.cfg.Exec.Run(ctx, "blockdev", "--flushbufs", status.DevicePath)
+		if runErr != nil {
+			log.FromContext(ctx).Info("flush before snapshot failed; the snapshot is crash-consistent",
+				"resource", resName, "volume", volNum, "device", status.DevicePath, "error", runErr.Error())
+		}
+	}
+}
