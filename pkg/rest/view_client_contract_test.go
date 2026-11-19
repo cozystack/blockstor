@@ -252,3 +252,25 @@ func TestViewHealthyReplicasPassTheCSIVolumeCondition(t *testing.T) {
 		}
 	}
 }
+
+// TestViewPlaceholderNeedsAPool: a diskful replica with no pool on
+// its spec gets no placeholder volume. A row with an empty
+// `storage_pool_name` is what crashes the Python CLI's `n describe`
+// on a pool lookup returning None (the Bug 137 crash class), so the
+// replica keeps the list the satellite observed.
+func TestViewPlaceholderNeedsAPool(t *testing.T) {
+	t.Parallel()
+
+	rsc := &apiv1.Resource{Name: contractRD, NodeName: "node-a"}
+
+	got := ensureVolumesForView(nil, rsc, map[int32]int64{0: 1024 * 1024})
+	if got == nil {
+		t.Fatal("volumes = nil, want an empty list so the key stays present")
+	}
+
+	for _, v := range got {
+		if v.StoragePool == "" {
+			t.Errorf("volume %d has an empty storage pool, want no placeholder without a pool", v.VolumeNumber)
+		}
+	}
+}

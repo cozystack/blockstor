@@ -277,6 +277,19 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 		pool = disklessStorPoolName
 	}
 
+	// A diskful replica with no pool on its spec (the clone path can
+	// leave one, see the k8s store's ListByDefinition) has nothing
+	// truthful to put in `storage_pool_name`. An empty name is what
+	// makes the Python CLI's `n describe` crash on a pool lookup
+	// returning None, so such a replica keeps the observed list.
+	if pool == "" {
+		if observed == nil {
+			return []apiv1.Volume{}
+		}
+
+		return observed
+	}
+
 	placeholders := make([]apiv1.Volume, 0, len(missing))
 	for _, vn := range missing {
 		// AllocatedKib stays 0 (the Bug 112 contract: always emit
