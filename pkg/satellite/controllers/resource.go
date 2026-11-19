@@ -521,7 +521,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// stop until an external event drove another reconcile;
 	// RequeueAfter ensures the next attempt sees the freshly-
 	// committed peer state.
-	if anyFailed {
+	if anyFailed || growPending(results) {
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
 	}
 
@@ -675,6 +675,19 @@ func applyFailureOf(rd *blockstoriov1alpha1.ResourceDefinition, results []*inten
 	}
 
 	return nil
+}
+
+// growPending reports a pass that left a grow short of its device. The
+// device grows when a peer's resize does, which wakes nothing here, so
+// the pass is repeated to report the size once it shows.
+func growPending(results []*intent.ResourceApplyResult) bool {
+	for _, result := range results {
+		if result.GetGrowPending() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // deviceHoldsDataReason is the Event reason for a LUKS format refused over

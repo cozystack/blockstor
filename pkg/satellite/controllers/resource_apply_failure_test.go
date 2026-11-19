@@ -103,3 +103,17 @@ func TestRecordApplyFailureFollowsThePass(t *testing.T) {
 	}
 }
 
+// TestGrowPendingRequeues: a grow held back by a peer completes when the
+// peer resizes, which wakes nothing on this satellite, so the pass that
+// found it short must be repeated to report the size.
+func TestGrowPendingRequeues(t *testing.T) {
+	t.Parallel()
+
+	if growPending([]*intent.ResourceApplyResult{{Ok: true}}) {
+		t.Error("a pass with nothing pending asked to be repeated")
+	}
+
+	if !growPending([]*intent.ResourceApplyResult{{Ok: true}, {Ok: true, GrowPending: true}}) {
+		t.Error("a pass that left a grow short of its device was not repeated")
+	}
+}

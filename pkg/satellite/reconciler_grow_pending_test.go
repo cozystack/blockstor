@@ -19,7 +19,10 @@ limitations under the License.
 package satellite_test
 
 import (
+	"context"
+	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -36,31 +39,70 @@ const (
 	growPendingNewKib = int64(2 * 1024 * 1024)
 )
 
-// applyAtFullBacking runs one pass of a 2 GiB volume whose LV is already
-// 2 GiB, with appliedKib as the size the replica last reported applied.
-func applyAtFullBacking(t *testing.T, appliedKib int64) (*storage.FakeExec, []*intent.ResourceApplyResult) {
+// errNoDeviceSize is a device whose size cannot be read.
+var errNoDeviceSize = errors.New("no size")
+
+// growGrossKib is the backing a grow to growPendingNewKib extends to:
+// the size plus DRBD's internal metadata, in whole MiB.
+func growGrossKib() int64 {
+	return (satellite.DrbdGrossKibForTest(growPendingNewKib) + 1023) / 1024 * 1024
+}
+
+// growFixture is one replica of a 2 GiB volume whose LV holds lvKib,
+// with appliedKib as the size it last reported applied. deviceKib is
+// what the DRBD device reads after the pass; 0 means it cannot be read.
+type growFixture struct {
+	fx  *storage.FakeExec
+	rec *satellite.Reconciler
+
+	appliedKib int64
+	deviceKib  int64
+}
+
+func newGrowFixture(t *testing.T, lvKib, appliedKib int64) *growFixture {
 	t.Helper()
 
-	fx := storage.NewFakeExec()
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/"+growPendingRD+"_00000",
-		storage.FakeResponse{Stdout: []byte(growPendingRD + "_00000\n")})
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/"+growPendingRD+"_00000",
-		storage.FakeResponse{Stdout: []byte("/dev/vg/" + growPendingRD + "_00000|2097152\n")})
+	gf := &growFixture{fx: storage.NewFakeExec(), appliedKib: appliedKib}
 
-	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
-	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+	gf.fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/"+growPendingRD+"_00000",
+		storage.FakeResponse{Stdout: []byte(growPendingRD + "_00000\n")})
+	gf.fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/"+growPendingRD+"_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/" + growPendingRD + "_00000|" + strconv.FormatInt(lvKib, 10) + "\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, gf.fx)
+	gf.rec = satellite.NewReconciler(satellite.ReconcilerConfig{
 		Providers: map[string]storage.Provider{"thin1": thin},
-		Adm:       drbd.NewAdm(fx),
+		Adm:       drbd.NewAdm(gf.fx),
 		StateDir:  t.TempDir(),
 		NodeName:  "n1",
+		DeviceSizeKib: func(_ context.Context, device string) (int64, error) {
+			if device != "/dev/drbd1000" {
+				t.Errorf("measured %s, want the DRBD device", device)
+			}
+
+			if gf.deviceKib == 0 {
+				return 0, errNoDeviceSize
+			}
+
+			return gf.deviceKib, nil
+		},
 	})
 
-	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+	return gf
+}
+
+// pass runs one apply pass and returns the commands it ran and its result.
+func (gf *growFixture) pass(t *testing.T) ([]string, *intent.ResourceApplyResult) {
+	t.Helper()
+
+	before := len(gf.fx.CommandLines())
+
+	results, err := gf.rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     growPendingRD,
 			NodeName: "n1",
 			Volumes: []*intent.DesiredVolume{
-				{VolumeNumber: 0, SizeKib: growPendingNewKib, StoragePool: "thin1", AppliedSizeKib: appliedKib},
+				{VolumeNumber: 0, SizeKib: growPendingNewKib, StoragePool: "thin1", AppliedSizeKib: gf.appliedKib},
 			},
 			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
@@ -72,14 +114,18 @@ func applyAtFullBacking(t *testing.T, appliedKib int64) (*storage.FakeExec, []*i
 		t.Fatalf("Apply: %v", err)
 	}
 
-	return fx, results
+	if len(results) != 1 || !results[0].GetOk() || len(results[0].GetVolumes()) != 1 {
+		t.Fatalf("unexpected results: %+v", results)
+	}
+
+	return gf.fx.CommandLines()[before:], results[0]
 }
 
-func resizeLines(fx *storage.FakeExec) []string {
+func linesWithPrefix(lines []string, prefix string) []string {
 	var out []string
 
-	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "drbdadm resize") {
+	for _, line := range lines {
+		if strings.HasPrefix(line, prefix) {
 			out = append(out, line)
 		}
 	}
@@ -88,49 +134,114 @@ func resizeLines(fx *storage.FakeExec) []string {
 }
 
 // TestApplyResizesDRBDWhileGrowPending: a replica whose backing grew on
-// an earlier pass, but which never finished the grow (its drbdadm resize
-// failed, or its backing was large enough already), must resize DRBD on
+// an earlier pass, but whose drbdadm resize failed, must resize DRBD on
 // the next pass. Before, the resize ran only on the pass that grew the
 // backing, so a failed one was never retried and the device stayed at
 // the old size.
 func TestApplyResizesDRBDWhileGrowPending(t *testing.T) {
-	fx, _ := applyAtFullBacking(t, growPendingOldKib)
+	gf := newGrowFixture(t, growGrossKib(), growPendingOldKib)
 
-	if got := resizeLines(fx); !slices.Equal(got, []string{"drbdadm resize --assume-clean " + growPendingRD}) {
+	lines, _ := gf.pass(t)
+
+	if got := linesWithPrefix(lines, "drbdadm resize"); !slices.Equal(got, []string{"drbdadm resize --assume-clean " + growPendingRD}) {
 		t.Fatalf("drbdadm resize calls: %v, want one", got)
 	}
 
-	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "lvextend ") {
-			t.Errorf("the backing was at size and still got extended: %s", line)
-		}
+	if got := linesWithPrefix(lines, "lvextend "); len(got) != 0 {
+		t.Errorf("the backing was at size and still got extended: %v", got)
+	}
+}
+
+// TestApplyGrowsBackingThatHeldOnlyTheNetSize: an adopted LINSTOR volume
+// carries DRBD's metadata on top of its definition size, so a new size
+// can fit in the old backing while the device it leaves is still short
+// of it. Comparing the definition size with the backing skipped the
+// lvextend, drbdadm resize had nothing to grow, and resize2fs grew
+// nothing. The backing must reach the size plus the metadata.
+func TestApplyGrowsBackingThatHeldOnlyTheNetSize(t *testing.T) {
+	gf := newGrowFixture(t, growPendingNewKib+512, growPendingOldKib)
+
+	lines, _ := gf.pass(t)
+
+	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size " +
+		strconv.FormatInt(growGrossKib()/1024, 10) + "MiB vg/" + growPendingRD + "_00000"
+	if got := linesWithPrefix(lines, "lvextend "); !slices.Equal(got, []string{want}) {
+		t.Fatalf("lvextend calls: %v, want %q", got, want)
 	}
 }
 
 // TestApplyNoResizeOnceApplied: a replica that applied the size, or one
 // that never reported (every replica right after an upgrade), does not
-// resize DRBD on a pass with nothing to grow.
+// resize DRBD on a pass with nothing to grow, and reports the size.
 func TestApplyNoResizeOnceApplied(t *testing.T) {
 	for _, applied := range []int64{growPendingNewKib, 0} {
-		fx, _ := applyAtFullBacking(t, applied)
+		gf := newGrowFixture(t, growGrossKib(), applied)
 
-		if got := resizeLines(fx); len(got) != 0 {
+		lines, result := gf.pass(t)
+
+		if got := linesWithPrefix(lines, "drbdadm resize"); len(got) != 0 {
 			t.Errorf("applied=%d: unexpected drbdadm resize: %v", applied, got)
+		}
+
+		if got := result.GetVolumes()[0].GetAppliedSizeKib(); got != growPendingNewKib || result.GetGrowPending() {
+			t.Errorf("applied=%d: reported %d (pending %v), want %d", applied, got, result.GetGrowPending(), growPendingNewKib)
 		}
 	}
 }
 
-// TestApplyReportsAppliedSize: a successful pass reports the size it
-// applied, which is what the REST layer waits for before it answers a
-// resize.
-func TestApplyReportsAppliedSize(t *testing.T) {
-	_, results := applyAtFullBacking(t, growPendingOldKib)
+// TestApplyReportsAppliedSizeOnlyOnceTheDeviceGrew: the REST layer
+// answers a resize once every replica reports the new size, so a pass
+// may report it only when the device shows it. Before, any pass that
+// succeeded reported the definition size, whether or not the device had
+// grown, and the resize was acknowledged before resize2fs could grow
+// anything.
+func TestApplyReportsAppliedSizeOnlyOnceTheDeviceGrew(t *testing.T) {
+	gf := newGrowFixture(t, growGrossKib(), growPendingOldKib)
 
-	if len(results) != 1 || !results[0].GetOk() || len(results[0].GetVolumes()) != 1 {
-		t.Fatalf("unexpected results: %+v", results)
+	for _, deviceKib := range []int64{0, growPendingOldKib, growPendingNewKib - 4} {
+		gf.deviceKib = deviceKib
+
+		_, result := gf.pass(t)
+
+		if got := result.GetVolumes()[0].GetAppliedSizeKib(); got != growPendingOldKib || !result.GetGrowPending() {
+			t.Fatalf("device at %d: reported %d (pending %v), want the old size, pending", deviceKib, got, result.GetGrowPending())
+		}
 	}
 
-	if got := results[0].GetVolumes()[0].GetAppliedSizeKib(); got != growPendingNewKib {
-		t.Fatalf("applied size %d, want %d", got, growPendingNewKib)
+	gf.deviceKib = growPendingNewKib
+
+	_, result := gf.pass(t)
+
+	if got := result.GetVolumes()[0].GetAppliedSizeKib(); got != growPendingNewKib || result.GetGrowPending() {
+		t.Fatalf("device grown: reported %d (pending %v), want %d", got, result.GetGrowPending(), growPendingNewKib)
+	}
+}
+
+// TestApplyStopsRetryingAResizeThatDoesNotGrowTheDevice: a device held
+// back by a peer whose backing has not grown does not grow from a local
+// resize, and every pass that resizes keeps the late-add self-heals off.
+// The retries stop after a few, while the size is still measured, so a
+// peer's resize that grows the device is still reported.
+func TestApplyStopsRetryingAResizeThatDoesNotGrowTheDevice(t *testing.T) {
+	gf := newGrowFixture(t, growGrossKib(), growPendingOldKib)
+	gf.deviceKib = growPendingOldKib
+
+	resizes := 0
+
+	for range 6 {
+		lines, _ := gf.pass(t)
+		resizes += len(linesWithPrefix(lines, "drbdadm resize"))
+	}
+
+	if resizes != 3 {
+		t.Fatalf("drbdadm resize ran on %d of 6 passes, want 3", resizes)
+	}
+
+	gf.deviceKib = growPendingNewKib
+
+	_, result := gf.pass(t)
+
+	if got := result.GetVolumes()[0].GetAppliedSizeKib(); got != growPendingNewKib {
+		t.Fatalf("after a peer grew the device: reported %d, want %d", got, growPendingNewKib)
 	}
 }
