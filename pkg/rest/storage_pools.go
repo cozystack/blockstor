@@ -248,8 +248,28 @@ func (s *Server) refuseSPDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 		return true
 	}
 
-	if len(refs) == 0 {
+	// A snapshot's copy on this node can only be deleted through the
+	// node's pool; with the pool gone the node's hold on the Snapshot is
+	// never released.
+	snapRefs, err := store.SnapshotsInPool(r.Context(), s.Store, node, pool)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	if len(refs) == 0 && len(snapRefs) == 0 {
 		return false
+	}
+
+	var details []string
+
+	if len(refs) > 0 {
+		details = append(details, "Volumes that are still using the storage pool: "+strings.Join(refs, ", "))
+	}
+
+	if len(snapRefs) > 0 {
+		details = append(details, "Snapshots with a copy on the node: "+strings.Join(snapRefs, ", "))
 	}
 
 	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
@@ -257,9 +277,8 @@ func (s *Server) refuseSPDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 		Message: "The specified storage pool '" + pool +
 			"' on node '" + node + "' can not be deleted as " +
 			"volumes / snapshot-volumes are still using it.",
-		Details: "Volumes that are still using the storage pool: " +
-			strings.Join(refs, ", "),
-		Correc: "Delete the listed volumes first, or pass " +
+		Details: strings.Join(details, "; "),
+		Correc: "Delete the listed volumes and snapshots first, or pass " +
 			"`?force=true` to bypass the refusal and accept " +
 			"the orphan replicas.",
 		ObjRefs: map[string]string{

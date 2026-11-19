@@ -28,6 +28,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 	"github.com/cozystack/blockstor/internal/cli/view"
@@ -150,6 +151,10 @@ func poolProps(provider storageProvider, backing string) (map[string]string, err
 	return props, nil
 }
 
+// errPoolStillReferenced refuses a pool delete while snapshots may have a
+// copy in it.
+var errPoolStillReferenced = errors.New("storage pool is still referenced")
+
 // storagePoolDelete implements `storage-pool delete <node> <pool>`.
 func storagePoolDelete(ctx context.Context, run *runContext) error {
 	const wantArgs = 2
@@ -159,6 +164,21 @@ func storagePoolDelete(ctx context.Context, run *runContext) error {
 	}
 
 	node, pool := run.Flags.Positionals[0], run.Flags.Positionals[1]
+
+	// A snapshot's copy on the node can only be deleted through the node's
+	// pool; with the pool gone the node's hold on the Snapshot is never
+	// released. The REST door refuses on the same.
+	if !run.Flags.Force {
+		refs, err := store.SnapshotsInPool(ctx, run.Store, node, pool)
+		if err != nil {
+			return fmt.Errorf("list snapshots on %s: %w", node, err)
+		}
+
+		if len(refs) > 0 {
+			return fmt.Errorf("%w: %s on %s may hold copies of snapshots [%s]; delete them or pass --force",
+				errPoolStillReferenced, pool, node, strings.Join(refs, ", "))
+		}
+	}
 
 	err := run.Store.StoragePools().Delete(ctx, node, pool)
 	if err != nil && !isNotFound(err) {

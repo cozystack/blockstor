@@ -330,3 +330,57 @@ func ReferencesUnderSpellings(ctx context.Context, st Store, spellings []string)
 
 	return rscRefs, poolRefs, nil
 }
+
+// SnapshotsOnNode lists, as `<rd>/<snapshot>` and sorted, the snapshots that
+// keep a copy on a node under any of the spellings. Each such node holds the
+// Snapshot until its satellite has deleted that copy, so the node, and the
+// pool the copy lives in, have to stay until then: with the pool gone the
+// copy cannot be deleted, and with the node gone nothing ever runs there.
+func SnapshotsOnNode(ctx context.Context, st Store, spellings []string) ([]string, error) {
+	snapshots, err := st.Snapshots().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+
+	var refs []string
+
+	for i := range snapshots {
+		onNode := slices.ContainsFunc(snapshots[i].Nodes, func(n string) bool {
+			return slices.ContainsFunc(spellings, func(s string) bool { return naming.Same(n, s) })
+		})
+		if onNode {
+			refs = append(refs, snapshots[i].ResourceName+"/"+snapshots[i].Name)
+		}
+	}
+
+	sort.Strings(refs)
+
+	return refs, nil
+}
+
+// SnapshotsInPool is SnapshotsOnNode for a pool delete: the snapshots a
+// diskful pool of the node may hold. A Snapshot does not record which pool
+// of a node its copy is in, so every snapshot on the node counts, as LINSTOR
+// refuses a pool delete over the snapshot-volumes in it. A diskless pool, or
+// one that does not exist, holds none.
+func SnapshotsInPool(ctx context.Context, st Store, node, pool string) ([]string, error) {
+	sp, err := st.StoragePools().Get(ctx, node, pool)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("get storage pool %s on %s: %w", pool, node, err)
+	}
+
+	if sp.ProviderKind == apiv1.StoragePoolKindDiskless {
+		return nil, nil
+	}
+
+	spellings, err := NodeSpellings(ctx, st, node)
+	if err != nil {
+		return nil, err
+	}
+
+	return SnapshotsOnNode(ctx, st, spellings)
+}
