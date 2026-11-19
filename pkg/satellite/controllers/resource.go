@@ -668,16 +668,8 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// stop until an external event drove another reconcile;
 	// RequeueAfter ensures the next attempt sees the freshly-
 	// committed peer state.
-	//
-	// A grow still pending on this replica retries on the short timer
-	// even when the only failure is a refused create-md, which alone
-	// would back off for minutes: the resize answer waits on it.
-	if growPending(results) {
-		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
-	}
-
-	if anyFailed {
-		return ctrl.Result{RequeueAfter: failureRequeue(results)}, nil
+	if requeue := retryAfter(results, anyFailed); requeue > 0 {
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	// Phase 11.7 safety net: schedule a periodic re-eval on
@@ -928,6 +920,22 @@ func applyRefusals() []applyRefusal {
 // satellite's work queue, for nothing that can change by itself. A change
 // to the Resource or its definition still reconciles at once.
 const refusedApplyRequeue = 5 * time.Minute
+
+// retryAfter is the delay before an apply that did not converge is
+// retried, or 0 when it converged. A grow still pending on this replica
+// retries on the short timer even when the only failure is a refused
+// create-md, which alone would back off for minutes: the resize answer
+// waits on it.
+func retryAfter(results []*intent.ResourceApplyResult, anyFailed bool) time.Duration {
+	switch {
+	case growPending(results):
+		return applyFailureRequeue
+	case anyFailed:
+		return failureRequeue(results)
+	default:
+		return 0
+	}
+}
 
 // failureRequeue picks the retry interval of an apply that failed.
 func failureRequeue(results []*intent.ResourceApplyResult) time.Duration {
