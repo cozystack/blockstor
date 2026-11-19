@@ -76,6 +76,12 @@ type Snapshot struct {
 	PoolName     string
 	ResourceName string
 	SnapshotName string
+
+	// DeletedSuffix is the suffix the snapshot's zvol was renamed with
+	// when its replica was deleted (see SuffixedDeleter), recorded so
+	// the snapshot is found under `_deleted_<name>_<suffix>`. Empty means
+	// the zvol is looked for under its own name, and then by search.
+	DeletedSuffix string
 }
 
 // VolumeStatus is the observed state the satellite reports back to the
@@ -144,6 +150,15 @@ type Provider interface {
 	//                       --name <tgt> <pool>/<src-snap>`
 	//   FILE / FILE_THIN: `cp --reflink=auto <src-snap>.img <tgt>.img`
 	RestoreVolumeFromSnapshot(ctx context.Context, target Volume, sourceSnapshot Snapshot) error
+}
+
+// SuffixedDeleter is the optional capability of a provider that cannot
+// always delete a volume at once. ZFS renames a zvol that still has
+// snapshots to `_deleted_<name>_<suffix>` instead; the suffix is recorded
+// before the delete so the snapshots are found under the new name later.
+// An empty suffix lets the provider pick one, as DeleteVolume does.
+type SuffixedDeleter interface {
+	DeleteVolumeWithSuffix(ctx context.Context, vol Volume, deletedSuffix string) error
 }
 
 // SnapshotShipper is the optional cross-node-clone capability — a

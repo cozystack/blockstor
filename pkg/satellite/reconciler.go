@@ -599,8 +599,9 @@ func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *intent.DeleteSnaps
 
 	for _, provider := range providers {
 		err = provider.DeleteSnapshot(ctx, storage.Snapshot{
-			ResourceName: req.GetResourceName(),
-			SnapshotName: req.GetSnapshotName(),
+			ResourceName:  req.GetResourceName(),
+			SnapshotName:  req.GetSnapshotName(),
+			DeletedSuffix: req.GetDeletedSuffix(),
 		})
 		if err != nil {
 			//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
@@ -986,10 +987,16 @@ func (r *Reconciler) deleteVolumes(ctx context.Context, req *intent.DeleteResour
 	}
 
 	for _, n := range req.GetVolumeNumbers() {
-		err := provider.DeleteVolume(ctx, storage.Volume{
-			ResourceName: req.GetName(),
-			VolumeNumber: n,
-		})
+		vol := storage.Volume{ResourceName: req.GetName(), VolumeNumber: n}
+
+		var err error
+
+		if suffixed, ok := provider.(storage.SuffixedDeleter); ok {
+			err = suffixed.DeleteVolumeWithSuffix(ctx, vol, req.GetDeletedSuffix())
+		} else {
+			err = provider.DeleteVolume(ctx, vol)
+		}
+
 		if err != nil {
 			return errors.Wrapf(err, "delete volume %s/%d", req.GetName(), n)
 		}

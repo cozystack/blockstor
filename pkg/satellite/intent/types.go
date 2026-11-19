@@ -567,6 +567,19 @@ type DeleteResourceRequest struct {
 	Name          string
 	StoragePool   string
 	VolumeNumbers []int32
+
+	// DeletedSuffix is the rename suffix recorded for this replica's
+	// zvols; see storage.Volume.DeletedSuffix.
+	DeletedSuffix string
+}
+
+// GetDeletedSuffix returns the recorded rename suffix.
+func (x *DeleteResourceRequest) GetDeletedSuffix() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.DeletedSuffix
 }
 
 // GetName returns the RD name.
@@ -719,6 +732,19 @@ type DeleteSnapshotRequest struct {
 	// satellite does not know the resource's pool: after the replica was
 	// deleted, or after a restart before the replica was applied again.
 	StoragePools []string
+
+	// DeletedSuffix is the rename suffix recorded on the Snapshot for
+	// this node; see storage.Snapshot.DeletedSuffix.
+	DeletedSuffix string
+}
+
+// GetDeletedSuffix returns the recorded rename suffix.
+func (x *DeleteSnapshotRequest) GetDeletedSuffix() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.DeletedSuffix
 }
 
 // GetStoragePools returns the pools to search when the resource's own

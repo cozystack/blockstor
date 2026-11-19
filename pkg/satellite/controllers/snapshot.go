@@ -842,9 +842,10 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	}
 
 	req := &intent.DeleteSnapshotRequest{
-		ResourceName: naming.Key(snap.Spec.ResourceDefinitionName),
-		SnapshotName: snap.Spec.SnapshotName,
-		StoragePools: pools,
+		ResourceName:  naming.Key(snap.Spec.ResourceDefinitionName),
+		SnapshotName:  snap.Spec.SnapshotName,
+		StoragePools:  pools,
+		DeletedSuffix: snap.Spec.Props[snapshotRenameSuffixProp(r.Config.NodeName)],
 	}
 
 	resp, err := r.Config.Apply.DeleteSnapshot(ctx, req)

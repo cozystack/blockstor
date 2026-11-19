@@ -68,6 +68,12 @@ var errAmbiguousSnapshot = errors.New("snapshot found under more than one delete
 // no-op; a probe that fails is an error, never "missing", because the caller
 // reads a nil return as "the storage is gone".
 func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
+	return p.DeleteVolumeWithSuffix(ctx, vol, "")
+}
+
+// DeleteVolumeWithSuffix is DeleteVolume with the rename suffix recorded for
+// the replica, so a zvol with snapshots lands where they will be looked for.
+func (p *Provider) DeleteVolumeWithSuffix(ctx context.Context, vol storage.Volume, suffix string) error {
 	dataset := p.volumeDataset(vol)
 
 	present, err := p.datasetPresent(ctx, dataset)
@@ -75,7 +81,11 @@ func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 		return err
 	}
 
-	return p.deleteVolumeDataset(ctx, dataset)
+	if suffix == "" {
+		suffix = RenameSuffix(p.now())
+	}
+
+	return p.deleteVolumeDataset(ctx, dataset, suffix)
 }
 
 // DeleteSnapshot deletes the snapshot wherever it lives now: under the zvol of
@@ -92,14 +102,14 @@ func (p *Provider) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return p.deleteSnapshotDataset(ctx, dataset)
 }
 
-func (p *Provider) deleteVolumeDataset(ctx context.Context, dataset string) error {
+func (p *Provider) deleteVolumeDataset(ctx context.Context, dataset, suffix string) error {
 	snapshots, err := p.remainingSnapshots(ctx, dataset)
 	if err != nil {
 		return err
 	}
 
 	if len(snapshots) > 0 {
-		return p.markAndRename(ctx, dataset, p.deletedVolumeName(dataset))
+		return p.markAndRename(ctx, dataset, deletedVolumeName(dataset, suffix))
 	}
 
 	origin, err := p.originOf(ctx, dataset)
@@ -122,7 +132,7 @@ func (p *Provider) deleteSnapshotDataset(ctx context.Context, dataset string) er
 	}
 
 	if len(clones) > 0 {
-		return p.markAndRename(ctx, dataset, deletedSnapshotName(dataset, p.renameTime()))
+		return p.markAndRename(ctx, dataset, deletedSnapshotName(dataset, RenameSuffix(p.now())))
 	}
 
 	err = p.destroy(ctx, dataset)
@@ -255,17 +265,28 @@ func (p *Provider) destroy(ctx context.Context, dataset string) error {
 	return nil
 }
 
-// locateSnapshot finds the snapshot under its resource's zvol, or under the
-// zvol a replica delete renamed it with. "" means it exists nowhere.
+// locateSnapshot finds the snapshot under the zvol a replica delete renamed
+// with the recorded suffix, under its resource's zvol, or, for a zvol whose
+// suffix was never recorded (one LINSTOR renamed before a migration), by
+// searching the renamed zvols of the resource. "" means it exists nowhere.
 func (p *Provider) locateSnapshot(ctx context.Context, snap storage.Snapshot) (string, error) {
 	live := p.snapshotDataset(snap)
+
+	if snap.DeletedSuffix != "" {
+		renamed := deletedVolumeName(baseOf(live), snap.DeletedSuffix) + "@" + snap.SnapshotName
+
+		present, err := p.datasetPresent(ctx, renamed)
+		if err != nil || present {
+			return renamed, err
+		}
+	}
 
 	present, err := p.datasetPresent(ctx, live)
 	if err != nil || present {
 		return live, err
 	}
 
-	renamed, err := p.deletedVolumesOf(ctx, live[:strings.LastIndex(live, "@")])
+	renamed, err := p.deletedVolumesOf(ctx, baseOf(live))
 	if err != nil {
 		return "", err
 	}
@@ -408,11 +429,11 @@ func (p *Provider) datasetPresent(ctx context.Context, dataset string) (bool, er
 }
 
 // deletedVolumeName is where a zvol with snapshots goes: LINSTOR's
-// `_deleted_<name>_<time>`, at the zvol's own level of the pool.
-func (p *Provider) deletedVolumeName(dataset string) string {
-	parent, name := dataset[:strings.LastIndex(dataset, "/")], dataset[strings.LastIndex(dataset, "/")+1:]
+// `_deleted_<name>_<suffix>`, at the zvol's own level of the pool.
+func deletedVolumeName(dataset, suffix string) string {
+	slash := strings.LastIndex(dataset, "/")
 
-	return parent + "/" + deletedPrefix + name + "_" + p.renameTime()
+	return dataset[:slash+1] + deletedPrefix + dataset[slash+1:] + "_" + suffix
 }
 
 // deletedSnapshotName is where a snapshot with clones goes: LINSTOR's
@@ -428,10 +449,8 @@ func baseOf(snapshot string) string {
 	return snapshot[:strings.LastIndex(snapshot, "@")]
 }
 
-// renameTime is LINSTOR's rename stamp, yyyy-MM-dd'T'HH-mm-ss-SSS, which
+// RenameSuffix is LINSTOR's rename stamp, yyyy-MM-dd'T'HH-mm-ss-SSS, which
 // keeps two deletes of the same name from colliding.
-func (p *Provider) renameTime() string {
-	now := p.now()
-
+func RenameSuffix(now time.Time) string {
 	return now.Format("2006-01-02T15-04-05") + fmt.Sprintf("-%03d", now.Nanosecond()/int(time.Millisecond))
 }

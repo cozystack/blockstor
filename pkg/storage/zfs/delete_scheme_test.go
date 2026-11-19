@@ -703,3 +703,60 @@ func (c cloningPool) Run(ctx context.Context, name string, args ...string) ([]by
 func (c cloningPool) RunWithStdin(ctx context.Context, _ io.Reader, name string, args ...string) ([]byte, error) {
 	return c.Run(ctx, name, args...)
 }
+
+// The recorded suffix names the renamed zvol, so its snapshots are found by
+// name rather than by search.
+func TestDeleteUsesTheRecordedSuffix(t *testing.T) {
+	t.Parallel()
+
+	const suffix = "2026-03-04T05-06-07-089"
+
+	p := newPool(t, "tank/pvc-a_00000", "tank/pvc-a_00000@s1",
+		"tank/_deleted_pvc-a_00000_2026-01-01T00-00-00-000", "tank/_deleted_pvc-a_00000_2026-01-01T00-00-00-000@s1")
+	p.mark("tank/_deleted_pvc-a_00000_2026-01-01T00-00-00-000")
+
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank"}, p)
+
+	err := prov.DeleteVolumeWithSuffix(t.Context(), storage.Volume{ResourceName: "pvc-a"}, suffix)
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	renamed := "tank/_deleted_pvc-a_00000_" + suffix
+	if !p.has(renamed + "@s1") {
+		t.Fatalf("zvol not renamed with the recorded suffix: %v", p.names())
+	}
+
+	// Two renamed generations now hold an s1; the recorded suffix picks
+	// the right one where a search would refuse.
+	err = prov.DeleteSnapshot(t.Context(), storage.Snapshot{ResourceName: "pvc-a", SnapshotName: "s1", DeletedSuffix: suffix})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	if p.has(renamed) || p.has(renamed+"@s1") {
+		t.Errorf("the recorded generation is still there: %v", p.names())
+	}
+
+	if !p.has("tank/_deleted_pvc-a_00000_2026-01-01T00-00-00-000@s1") {
+		t.Errorf("the other generation's snapshot went too: %v", p.names())
+	}
+}
+
+// A recorded suffix whose rename never happened (a crash between recording
+// it and the delete) still finds the snapshot under the live name.
+func TestRecordedSuffixFallsBackToTheLiveName(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-a_00000", "tank/pvc-a_00000@s1")
+
+	err := zfs.NewProvider(zfs.Config{Pool: "tank"}, p).DeleteSnapshot(t.Context(),
+		storage.Snapshot{ResourceName: "pvc-a", SnapshotName: "s1", DeletedSuffix: "2026-03-04T05-06-07-089"})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	if got := p.names(); !slices.Equal(got, []string{"tank/pvc-a_00000"}) {
+		t.Errorf("pool: %v", got)
+	}
+}

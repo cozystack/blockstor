@@ -1499,10 +1499,16 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 		return ctrl.Result{}, err
 	}
 
+	suffix, err := r.recordRenameSuffix(ctx, res)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	req := &intent.DeleteResourceRequest{
 		Name:          naming.Key(res.Spec.ResourceDefinitionName),
 		StoragePool:   resolveDeleteStoragePool(res),
 		VolumeNumbers: volumeNumbers,
+		DeletedSuffix: suffix,
 	}
 
 	resp, err := r.Config.Apply.DeleteResource(ctx, req)
