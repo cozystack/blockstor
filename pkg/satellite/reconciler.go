@@ -3948,7 +3948,12 @@ func (r *Reconciler) repairUncleanMetadata(
 		return false, nil
 	}
 
-	logger.Info("repaired the activity log left by an unclean shutdown")
+	// Not a sign of a crash on its own: DRBD clears the activity log's
+	// clean flag on every detach, a graceful `drbdsetup down` included
+	// (drbd_state.c, "always require a drbdmeta apply-al run"), and
+	// drbdadm attach applies it before it attaches. The probe merely
+	// meets the log before attach does.
+	logger.Info("applied the activity log the last detach left behind; DRBD asks for that after every detach, a clean one included")
 
 	return true, nil
 }
