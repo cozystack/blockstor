@@ -20,6 +20,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -174,7 +175,12 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; hasAnnotation {
 		// Operator intent: ignore per-RD shortfall grace and the
 		// per-node offline grace — a REST modify means "act now".
-		count, perr := r.rebalanceChildRDs(ctx, rg, 0, false)
+		// Only a raised place count is the placement LINSTOR's own
+		// `rg modify` runs; a modify that changed a placement
+		// constraint alone gets the balance checks.
+		_, placeCountRaised := rg.Annotations[apiv1.AnnotationRGRebalancePlaceCount]
+
+		count, perr := r.rebalanceChildRDs(ctx, rg, 0, !placeCountRaised)
 		if perr != nil {
 			return perr
 		}
@@ -218,9 +224,11 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // child RD immediately.
 //
 // `gated` applies the checks LINSTOR's balance task makes before it
-// touches a definition (balanceGate.skipReason). The annotation-driven
-// path leaves them off: it stands for `rg modify`, which LINSTOR runs
-// the autoplacer for on every child definition.
+// touches a definition (balanceGate.skipReason). Only an `rg modify`
+// that raised the place count leaves them off: LINSTOR runs the
+// autoplacer for that on every child definition short of the new
+// count, one kept only by its snapshots included. It still skips a
+// definition being deleted, which no placement may grow.
 func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, gated bool) (int, error) {
 	log := logf.FromContext(ctx)
 
@@ -276,12 +284,19 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 }
 
 // skipRD reports whether the pass leaves rd alone. Without a gate
-// nothing is skipped. The reason goes to the debug log; a definition
+// (an `rg modify` that raised the place count) only a definition being
+// deleted is skipped. The reason goes to the debug log; a definition
 // whose replicas cannot be read is skipped.
 func (r *RGRebalanceReconciler) skipRD(ctx context.Context, gate *balanceGate, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) bool {
 	log := logf.FromContext(ctx).WithValues("rg", rg.Name, "rd", rd.Name)
 
 	if gate == nil {
+		if slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
+			log.V(1).Info("rebalance skipped", "reason", balanceSkipDeleting)
+
+			return true
+		}
+
 		return false
 	}
 
@@ -435,6 +450,7 @@ func (r *RGRebalanceReconciler) stripRebalanceAnnotation(ctx context.Context, rg
 	}
 
 	delete(rg.Annotations, apiv1.AnnotationRGRebalancePending)
+	delete(rg.Annotations, apiv1.AnnotationRGRebalancePlaceCount)
 
 	// Keep the now-empty map NON-nil (Bug-021). An earlier revision
 	// nil-ed it "for wire-envelope round-trip stability", but the

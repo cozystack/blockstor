@@ -164,6 +164,79 @@ func TestRGEventReadsDiskStateWithoutCase(t *testing.T) {
 	}
 }
 
+// TestRGModifyConstraintOnlyLeavesSnapshotOnlyDefinitionEmpty: an `rg
+// modify` that changes a placement constraint and not the place count
+// still schedules a rebalance, but LINSTOR places nothing for it. A
+// definition kept only by its snapshots must stay at zero replicas.
+func TestRGModifyConstraintOnlyLeavesSnapshotOnlyDefinitionEmpty(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewInMemory()
+
+	seedRebalanceFixture(t, ctx, st, 3, nil)
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name: "snap", ResourceName: "pvc-rebalance", Nodes: []string{"n1", "n2", "n3"},
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	rg, err := st.ResourceGroups().Get(ctx, "rg")
+	if err != nil {
+		t.Fatalf("get rg: %v", err)
+	}
+
+	delete(rg.Annotations, apiv1.AnnotationRGRebalancePlaceCount)
+
+	if err := st.ResourceGroups().Update(ctx, &rg); err != nil {
+		t.Fatalf("drop the place-count marker: %v", err)
+	}
+
+	reconcileRebalance(t, ctx, st)
+
+	if n := replicaCount(t, ctx, st, "pvc-rebalance"); n != 0 {
+		t.Fatalf("a constraint-only rg modify gave a snapshot-only definition %d replicas; want 0", n)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg")
+	if err != nil {
+		t.Fatalf("get rg: %v", err)
+	}
+
+	if _, ok := got.Annotations[apiv1.AnnotationRGRebalancePending]; ok {
+		t.Fatalf("rebalance-pending not stripped: %v", got.Annotations)
+	}
+}
+
+// TestRGModifyPlaceCountRaiseSkipsDeletingDefinition: a raised place
+// count tops every child definition up, as LINSTOR's `rg modify` does,
+// except one being deleted, which no placement may grow.
+func TestRGModifyPlaceCountRaiseSkipsDeletingDefinition(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewInMemory()
+
+	seedRebalanceFixture(t, ctx, st, 3, []string{"n1"})
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-rebalance")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	rd.Flags = []string{apiv1.ResourceFlagDelete}
+	if err := st.ResourceDefinitions().Update(ctx, &rd); err != nil {
+		t.Fatalf("flag rd for deletion: %v", err)
+	}
+
+	reconcileRebalance(t, ctx, st)
+
+	if n := replicaCount(t, ctx, st, "pvc-rebalance"); n != 1 {
+		t.Fatalf("a definition being deleted got %d replicas from rg modify; want 1", n)
+	}
+}
+
 // countingStore counts the replica reads that go past the cache.
 type countingStore struct {
 	store.Store
