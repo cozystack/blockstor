@@ -74,12 +74,7 @@ var handlers = map[string]handler{
 
 	"resource list": resourceList,
 
-	"volume list": listing("resources",
-		fetchResources,
-		keepResource,
-		func(resources []apiv1.Resource, _ *runContext) *metav1.Table { return view.VolumeList(resources) },
-		"State",
-	),
+	"volume list": volumeList,
 
 	"snapshot list": listing("snapshots",
 		func(ctx context.Context, st store.Store) ([]apiv1.Snapshot, error) { return st.Snapshots().List(ctx) },
@@ -132,12 +127,7 @@ var handlers = map[string]handler{
 	"resource activate":    resourceActivate,
 	"resource deactivate":  resourceDeactivate,
 
-	"resource list-volumes": listing("resources",
-		fetchResources,
-		keepResource,
-		func(resources []apiv1.Resource, _ *runContext) *metav1.Table { return view.VolumeList(resources) },
-		"State",
-	),
+	"resource list-volumes": volumeList,
 
 	"storage-pool create": storagePoolCreate,
 	"storage-pool delete": storagePoolDelete,
@@ -256,16 +246,52 @@ func keepResource(res *apiv1.Resource, flags *flagSet) bool {
 	return matches(flags.Nodes, res.NodeName) && matches(flags.Resources, res.Name)
 }
 
-// keepFaultyResource applies --faulty as part of the FILTER, not as a
-// rendering decision. Filtering during render would leave `-m` — which
-// skips the renderer — returning every replica for a command whose
-// whole point is to narrow to the broken ones.
-func keepFaultyResource(res *apiv1.Resource, flags *flagSet) bool {
-	if !keepResource(res, flags) {
-		return false
+// keepFaulty applies --faulty as part of the FILTER, not as a rendering
+// decision. Filtering during render would leave `-m` — which skips the
+// renderer — returning every replica for a command whose whole point is
+// to narrow to the broken ones.
+func keepFaulty(resources []apiv1.Resource, flags *flagSet) []apiv1.Resource {
+	if !flags.Faulty {
+		return resources
 	}
 
-	return !flags.Faulty || view.IsFaulty(res)
+	kept := resources[:0]
+
+	for i := range resources {
+		if view.IsFaulty(&resources[i]) {
+			kept = append(kept, resources[i])
+		}
+	}
+
+	return kept
+}
+
+// volumeList implements `volume list` and `resource list-volumes`: the
+// shared listing shape, with the replicas stamped with their layer
+// stacks before either output reads them.
+func volumeList(ctx context.Context, run *runContext) error {
+	resources, err := fetchResources(ctx, run.Store)
+	if err != nil {
+		return fmt.Errorf("list resources: %w", err)
+	}
+
+	kept := make([]apiv1.Resource, 0, len(resources))
+
+	for i := range resources {
+		if keepResource(&resources[i], run.Flags) {
+			kept = append(kept, resources[i])
+		}
+	}
+
+	kept = applyLimit(kept, run.Flags)
+
+	withLayerStacks(ctx, run, kept)
+
+	if run.Flags.Machine {
+		return machineOut(run, kept)
+	}
+
+	return run.render(view.VolumeList(kept), "State")
 }
 
 // volumeDefinitionList implements `volume-definition list` (`vd l`).
@@ -332,10 +358,16 @@ func resourceList(ctx context.Context, run *runContext) error {
 	kept := make([]apiv1.Resource, 0, len(resources))
 
 	for i := range resources {
-		if keepFaultyResource(&resources[i], run.Flags) {
+		if keepResource(&resources[i], run.Flags) {
 			kept = append(kept, resources[i])
 		}
 	}
+
+	// Stamped before --faulty reads them: whether a replica is faulty
+	// depends on which layers it has.
+	withLayerStacks(ctx, run, kept)
+
+	kept = keepFaulty(kept, run.Flags)
 
 	kept = applyLimit(kept, run.Flags)
 
