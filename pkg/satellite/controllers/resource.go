@@ -149,51 +149,20 @@ type ResourceReconciler struct {
 // Finalizer-aware: stamps `SatelliteResourceFinalizer` on
 // every live Resource so kube-apiserver waits for our tear-down
 // before allowing the object to disappear.
+//
+// Only a converged pass's periodic re-check keeps low priority. Every
+// other retry (a failed apply, an error, a wait on the allocator) is
+// pinned back to normal priority: controller-runtime otherwise keeps
+// the priority the item was dequeued with, so a re-check that found
+// drift would repair it at low priority, behind every other replica's
+// idle re-check.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithValues("resource", req.Name)
-
-	var res blockstoriov1alpha1.Resource
-
-	err := r.Get(ctx, req.NamespacedName, &res)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-
-		return ctrl.Result{}, errors.Wrap(err, "get Resource")
+	result, err := r.reconcileResource(ctx, req)
+	if result.Priority == nil {
+		result.Priority = normalPriority()
 	}
 
-	if !naming.Same(res.Spec.NodeName, r.Config.NodeName) {
-		// Predicate should have filtered this out — defensive
-		// check in case the watch cache is mid-resync.
-		return ctrl.Result{}, nil
-	}
-
-	if !res.DeletionTimestamp.IsZero() {
-		return r.handleDelete(ctx, &res)
-	}
-
-	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
-		res.Finalizers = append(res.Finalizers, SatelliteResourceFinalizer)
-
-		err := r.Update(ctx, &res)
-		if err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "add finalizer")
-		}
-
-		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
-	}
-
-	// Bug 40: REST shim sets Spec.ToggleDiskCancel when the operator
-	// passes `?cancel=true` to PUT toggle-disk. Honour it before
-	// the normal apply path so a cancel issued mid-conversion
-	// unwinds partial state instead of racing the same apply that
-	// caused the cancel.
-	if res.Spec.ToggleDiskCancel {
-		return r.handleToggleDiskCancel(ctx, &res, logger)
-	}
-
-	return r.runApply(ctx, &res, logger)
+	return result, err
 }
 
 // applyFailureRequeue is the backoff between satellite Apply
@@ -237,6 +206,14 @@ const activeDRBDRequeue = 10 * time.Second
 // controller-runtime gives events from the initial list.
 func lowPriority() *int {
 	priority := handler.LowPriority
+
+	return &priority
+}
+
+// normalPriority is the queue priority of a real event, and of every
+// retry of a pass that did not converge.
+func normalPriority() *int {
+	priority := 0
 
 	return &priority
 }
@@ -309,6 +286,55 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// reconcileResource is the body of Reconcile, which only settles the
+// queue priority of the result.
+func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("resource", req.Name)
+
+	var res blockstoriov1alpha1.Resource
+
+	err := r.Get(ctx, req.NamespacedName, &res)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, errors.Wrap(err, "get Resource")
+	}
+
+	if !naming.Same(res.Spec.NodeName, r.Config.NodeName) {
+		// Predicate should have filtered this out — defensive
+		// check in case the watch cache is mid-resync.
+		return ctrl.Result{}, nil
+	}
+
+	if !res.DeletionTimestamp.IsZero() {
+		return r.handleDelete(ctx, &res)
+	}
+
+	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
+		res.Finalizers = append(res.Finalizers, SatelliteResourceFinalizer)
+
+		err := r.Update(ctx, &res)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "add finalizer")
+		}
+
+		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
+	}
+
+	// Bug 40: REST shim sets Spec.ToggleDiskCancel when the operator
+	// passes `?cancel=true` to PUT toggle-disk. Honour it before
+	// the normal apply path so a cancel issued mid-conversion
+	// unwinds partial state instead of racing the same apply that
+	// caused the cancel.
+	if res.Spec.ToggleDiskCancel {
+		return r.handleToggleDiskCancel(ctx, &res, logger)
+	}
+
+	return r.runApply(ctx, &res, logger)
 }
 
 // primaryWatchPredicate filters Resource events on the primary For
