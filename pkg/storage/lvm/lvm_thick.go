@@ -132,8 +132,8 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 
 // freshLVName is where CreateVolume allocates and wipes an LV before it
 // takes the volume's name. The suffix after the last underscore is not
-// the five-digit volume number, so neither the orphan sweeper's
-// listing nor a lookup of the volume's own name ever matches it.
+// the five-digit volume number, so a lookup of the volume's own name
+// never matches it.
 func freshLVName(final string) string {
 	return final + ".bsnew"
 }
@@ -186,13 +186,6 @@ func (t *Thick) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 // VolumeStatus reports observed disk state via lvs.
 func (t *Thick) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.VolumeStatus, error) {
 	return volumeStatusViaLVS(ctx, t.exec, t.cfg.VolumeGroup+"/"+volumeLVName(vol))
-}
-
-// ListVolumeNames enumerates every LV in the configured VG that
-// matches blockstor's `<resource>_<vol5digits>` naming. Used by the
-// orphan-storage sweeper (Bug 43) — see Thin.ListVolumeNames doc.
-func (t *Thick) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
-	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
 }
 
 // PoolStatus reports the VG's free/total capacity. Bug 270: bounded

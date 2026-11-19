@@ -1477,9 +1477,9 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //  4. Storage Provider's DeleteVolume is idempotent on missing
 //     volumes — a second handleDelete pass after a partial first
 //     pass (DeleteResource succeeded, Update failed) re-issues
-//     the storage tear-down safely. Bug 43's storage sweeper is
-//     the wider-scope backstop; this ordering fix is the
-//     per-resource source-of-truth path.
+//     the storage tear-down safely. Nothing else deletes the
+//     storage: the finalizer stays until DeleteResource reports
+//     that every volume is gone.
 //
 // Phase 10.1. Once Phase 10.6 retires the gRPC contract,
 // `internal/controller.ResourceReconciler.runDelete` and its
