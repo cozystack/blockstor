@@ -75,6 +75,16 @@ const (
 	// showing FAILED_DEPLOYMENT for a dump row with resource_flags=2.
 	snapDfnFlagFailedDeployment int64 = 1 << 1
 
+	// snapDfnFlagDelete (1<<3) marks a snapshot definition under
+	// deletion in LINSTOR's SnapshotDefinition.Flags. A delete that
+	// had not finished leaves it set on a row that is still SUCCESSFUL.
+	snapDfnFlagDelete int64 = 1 << 3
+
+	// snapFlagDelete (1<<0) marks one node's snapshot under deletion
+	// in LINSTOR's Snapshot.Flags, which is what a RESOURCES row with
+	// a snapshot_name carries — not Resource.Flags, where 1<<0 is CLEAN.
+	snapFlagDelete int64 = 1 << 0
+
 	// rscDfnFlagDelete (1<<0) marks a resource definition under
 	// deletion in LINSTOR's ResourceDefinition.Flags. 1<<1 there is
 	// RESTORE_TARGET, a definition being restored from a snapshot or

@@ -19,6 +19,7 @@ limitations under the License.
 package linstormigrate
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -27,10 +28,13 @@ import (
 // under test, so a constant that drifts to another table's layout fails
 // here instead of agreeing with itself.
 const (
-	linstorRscFlagClean          int64 = 1 << 0 // Resource.Flags.CLEAN
-	linstorRscDfnFlagDelete      int64 = 1 << 0 // ResourceDefinition.Flags.DELETE
-	linstorRscDfnFlagRestore     int64 = 1 << 1 // ResourceDefinition.Flags.RESTORE_TARGET
-	linstorSnapDfnFlagSuccessful int64 = 1 << 0 // SnapshotDefinition.Flags.SUCCESSFUL
+	linstorRscFlagClean           int64 = 1 << 0 // Resource.Flags.CLEAN
+	linstorRscDfnFlagDelete       int64 = 1 << 0 // ResourceDefinition.Flags.DELETE
+	linstorRscDfnFlagRestore      int64 = 1 << 1 // ResourceDefinition.Flags.RESTORE_TARGET
+	linstorSnapDfnFlagSuccessful  int64 = 1 << 0 // SnapshotDefinition.Flags.SUCCESSFUL
+	linstorSnapDfnFlagDelete      int64 = 1 << 3 // SnapshotDefinition.Flags.DELETE
+	linstorSnapFlagDelete         int64 = 1 << 0 // Snapshot.Flags.DELETE
+	linstorSnapFlagShippingSource int64 = 1 << 1 // Snapshot.Flags.SHIPPING_SOURCE
 )
 
 // flagDump is one two-node definition with a replica on each node and
@@ -122,12 +126,60 @@ func TestReplicaCleanBitIsNotDelete(t *testing.T) {
 	}
 }
 
+// A snapshot definition's DELETE is bit 3, and a delete that had not
+// finished leaves it on a row that still says SUCCESSFUL.
+func TestSnapshotDefinitionDeleteIsSkipped(t *testing.T) {
+	t.Parallel()
+
+	res := convertFlagDump(t, func(d *Dump) {
+		d.ResourceDefinitions[1].ResourceFlags = linstorSnapDfnFlagSuccessful | linstorSnapDfnFlagDelete
+	})
+
+	if len(res.Snapshots) != 0 {
+		t.Errorf("a snapshot definition marked DELETE converted; warnings %v", res.Warnings)
+	}
+
+	if !hasWarning(res, "snapshot pvc-f.snap: marked DELETE") {
+		t.Errorf("DELETE skip not reported; warnings %v", res.Warnings)
+	}
+
+	if len(res.ResourceDefinitions) != 1 {
+		t.Errorf("the parent definition must still convert; warnings %v", res.Warnings)
+	}
+}
+
+// A snapshot placement is a RESOURCES row read with Snapshot.Flags, whose
+// DELETE is bit 0. Only the placement marked DELETE is dropped; another
+// bit, such as SHIPPING_SOURCE, leaves the placement in.
+func TestSnapshotPlacementDeleteIsDropped(t *testing.T) {
+	t.Parallel()
+
+	res := convertFlagDump(t, func(d *Dump) {
+		d.Resources[2].ResourceFlags = linstorSnapFlagShippingSource
+		d.Resources[3].ResourceFlags = linstorSnapFlagDelete
+	})
+
+	if len(res.Snapshots) != 1 {
+		t.Fatalf("converted %d snapshots, want 1; warnings %v", len(res.Snapshots), res.Warnings)
+	}
+
+	if got := res.Snapshots[0].Spec.Nodes; !slices.Equal(got, []string{"node-a"}) {
+		t.Errorf("snapshot nodes = %v, want [node-a]; warnings %v", got, res.Warnings)
+	}
+
+	if !hasWarning(res, "snapshot pvc-f.snap: placement on node node-b marked DELETE") {
+		t.Errorf("placement drop not reported; warnings %v", res.Warnings)
+	}
+}
+
 // The package constants agree with LINSTOR's per-table enums.
 func TestFlagConstantsMatchLinstor(t *testing.T) {
 	t.Parallel()
 
 	for name, pair := range map[string][2]int64{
-		"rscDfnFlagDelete": {rscDfnFlagDelete, linstorRscDfnFlagDelete},
+		"rscDfnFlagDelete":  {rscDfnFlagDelete, linstorRscDfnFlagDelete},
+		"snapDfnFlagDelete": {snapDfnFlagDelete, linstorSnapDfnFlagDelete},
+		"snapFlagDelete":    {snapFlagDelete, linstorSnapFlagDelete},
 	} {
 		if pair[0] != pair[1] {
 			t.Errorf("%s = %d, LINSTOR has %d", name, pair[0], pair[1])
