@@ -83,6 +83,11 @@ type observation struct {
 	// frame does not carry them, so the cached value survives.
 	PromotionScore *int32
 	MayPromote     *bool
+	// PromotionScoreInvalid marks a frame whose `promotion_score:`
+	// token is present but unparsable. LINSTOR drops the score
+	// then (DrbdResource.java), so the cached one is cleared rather
+	// than reported as current.
+	PromotionScoreInvalid bool
 	// HasResource marks observations that carry a fresh resource-
 	// kind frame (role transition → InUse, disk transition →
 	// DrbdState). mergeResource only updates its cache from
@@ -284,35 +289,40 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		return observation{}, false
 	}
 
+	score, scoreInvalid := parsePromotionScore(ev.Fields["promotion_score"])
+
 	return observation{
-		ResourceName:    name,
-		InUse:           ev.Fields["role"] == drbdRolePrimary,
-		Role:            ev.Fields["role"],
-		Suspended:       normalizeSuspended(ev.Fields["suspended"]),
-		PromotionScore:  parsePromotionScore(ev.Fields["promotion_score"]),
-		MayPromote:      parseMayPromote(ev.Fields["may_promote"]),
-		HasResource:     true,
-		KernelLoaded:    normalizeKernelLoaded(ev.Action),
-		HasKernelLoaded: true,
+		ResourceName:          name,
+		InUse:                 ev.Fields["role"] == drbdRolePrimary,
+		Role:                  ev.Fields["role"],
+		Suspended:             normalizeSuspended(ev.Fields["suspended"]),
+		PromotionScore:        score,
+		PromotionScoreInvalid: scoreInvalid,
+		MayPromote:            parseMayPromote(ev.Fields["may_promote"]),
+		HasResource:           true,
+		KernelLoaded:          normalizeKernelLoaded(ev.Action),
+		HasKernelLoaded:       true,
 	}, true
 }
 
 // parsePromotionScore reads the events2 `promotion_score:` token.
-// Absent or unparsable yields nil, which leaves the cached score in
-// place, the way LINSTOR's satellite treats a missing label.
-func parsePromotionScore(raw string) *int32 {
+// An absent token yields (nil, false), which leaves the cached score
+// in place, the way LINSTOR's satellite treats a missing label. A
+// present but unparsable one yields (nil, true): LINSTOR clears the
+// score on it, and so does mergeResource.
+func parsePromotionScore(raw string) (*int32, bool) {
 	if raw == "" {
-		return nil
+		return nil, false
 	}
 
 	score, err := strconv.ParseInt(raw, 10, 32)
 	if err != nil {
-		return nil
+		return nil, true
 	}
 
 	out := int32(score)
 
-	return &out
+	return &out, false
 }
 
 // The two values the kernel writes for `may_promote:`.
@@ -1053,7 +1063,7 @@ func mergePromotion(cur *resourceObservation, ev *observation) {
 		return
 	}
 
-	if ev.PromotionScore != nil {
+	if ev.PromotionScore != nil || ev.PromotionScoreInvalid {
 		cur.PromotionScore = ev.PromotionScore
 	}
 

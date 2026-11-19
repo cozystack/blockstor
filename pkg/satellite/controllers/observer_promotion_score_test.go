@@ -108,13 +108,17 @@ func TestObserverRecordsThePromotionScore(t *testing.T) {
 func TestObserverPromotionTokens(t *testing.T) {
 	t.Parallel()
 
-	if got := parsePromotionScore("0"); got == nil || *got != 0 {
-		t.Errorf("parsePromotionScore(0) = %v, want 0", got)
+	if got, invalid := parsePromotionScore("0"); got == nil || *got != 0 || invalid {
+		t.Errorf("parsePromotionScore(0) = %v, %v, want 0, false", got, invalid)
 	}
 
-	for _, raw := range []string{"", "x", "99999999999"} {
-		if got := parsePromotionScore(raw); got != nil {
-			t.Errorf("parsePromotionScore(%q) = %d, want nil", raw, *got)
+	if got, invalid := parsePromotionScore(""); got != nil || invalid {
+		t.Errorf("parsePromotionScore(\"\") = %v, %v, want nil, false", got, invalid)
+	}
+
+	for _, raw := range []string{"x", "99999999999"} {
+		if got, invalid := parsePromotionScore(raw); got != nil || !invalid {
+			t.Errorf("parsePromotionScore(%q) = %v, %v, want nil, true", raw, got, invalid)
 		}
 	}
 
@@ -132,7 +136,7 @@ func TestObserverPromotionTokens(t *testing.T) {
 		ResourceName:   "pvc-tok",
 		HasResource:    true,
 		Role:           "Secondary",
-		PromotionScore: parsePromotionScore("10102"),
+		PromotionScore: ptrInt32(10102),
 		MayPromote:     parseMayPromote("yes"),
 	}
 	o.mergeResource(&first)
@@ -142,6 +146,41 @@ func TestObserverPromotionTokens(t *testing.T) {
 
 	if again.PromotionScore == nil || *again.PromotionScore != 10102 || again.MayPromote == nil || !*again.MayPromote {
 		t.Errorf("frame without the tokens: score %v may_promote %v, want the cached 10102 / true", again.PromotionScore, again.MayPromote)
+	}
+}
+
+// TestObserverClearsPromotionOnInvalidScore: a frame whose
+// promotion_score token is present but unparsable drops the cached
+// score, the way LINSTOR's DrbdResource nulls it, instead of
+// reporting the previous score as current.
+func TestObserverClearsPromotionOnInvalidScore(t *testing.T) {
+	t.Parallel()
+
+	o := &ObserverRunnable{}
+
+	for _, line := range []string{
+		"exists resource name:pvc-bad role:Secondary may_promote:yes promotion_score:10102",
+		"change resource name:pvc-bad role:Secondary promotion_score:garbage",
+	} {
+		ev, err := drbd.ParseEvent(line)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+
+		obs, ok := translateEvent(ev)
+		if !ok {
+			t.Fatalf("translateEvent rejected %q", line)
+		}
+
+		o.mergeResource(&obs)
+
+		if line[0] == 'c' && obs.PromotionScore != nil {
+			t.Errorf("after an unparsable score: PromotionScore = %d, want nil", *obs.PromotionScore)
+		}
+
+		if line[0] == 'c' && (obs.MayPromote == nil || !*obs.MayPromote) {
+			t.Errorf("after an unparsable score: MayPromote = %v, want the cached true", obs.MayPromote)
+		}
 	}
 }
 
