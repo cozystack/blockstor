@@ -101,7 +101,7 @@ func TestSnapshotDeleteWaitsForATakeWhoseWindowClosed(t *testing.T) {
 		t.Errorf("delete is not retried after the take: %+v", res)
 	}
 
-	if !slices.Contains(rig.snapshot().Finalizers, SatelliteSnapshotFinalizer) {
+	if !slices.Contains(rig.snapshot().Finalizers, snapshotNodeFinalizer("n1")) {
 		t.Errorf("finalizer removed while the take was still running")
 	}
 
