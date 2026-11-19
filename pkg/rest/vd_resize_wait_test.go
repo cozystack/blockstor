@@ -23,8 +23,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
+
+	lapi "github.com/LINBIT/golinstor/client"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -83,7 +86,37 @@ func seedGrow(t *testing.T, applied map[string]int64) store.Store {
 		t.Fatalf("seed unreported replica: %v", err)
 	}
 
+	nodes := []string{"diskless", "unreported"}
+	for node := range applied {
+		nodes = append(nodes, node)
+	}
+
+	for _, node := range nodes {
+		err = st.Nodes().Create(ctx, &apiv1.Node{Name: node, Type: "SATELLITE", ConnectionStatus: apiv1.NodeTypeOnline})
+		if err != nil {
+			t.Fatalf("seed node %s: %v", node, err)
+		}
+	}
+
 	return st
+}
+
+// setFailure records that the satellite on node failed its last pass
+// while applying kib.
+func setFailure(t *testing.T, st store.Store, node string, kib int64, message string) {
+	t.Helper()
+
+	rsc, err := st.Resources().Get(t.Context(), growRD, node)
+	if err != nil {
+		t.Fatalf("get replica %s: %v", node, err)
+	}
+
+	rsc.ApplyFailure = &apiv1.ApplyFailure{Message: message, SizesKib: map[int32]int64{0: kib}}
+
+	err = st.Resources().Update(t.Context(), &rsc)
+	if err != nil {
+		t.Fatalf("update replica %s: %v", node, err)
+	}
 }
 
 // setApplied records that the satellite on node finished applying kib.
@@ -147,15 +180,21 @@ func expectPending(t *testing.T, done <-chan growAnswer, why string) {
 func expectAnswered(t *testing.T, done <-chan growAnswer) []apiv1.APICallRc {
 	t.Helper()
 
+	return expectAnsweredWith(t, done, http.StatusOK)
+}
+
+func expectAnsweredWith(t *testing.T, done <-chan growAnswer, status int) []apiv1.APICallRc {
+	t.Helper()
+
 	select {
 	case answer := <-done:
-		if answer.status != http.StatusOK {
-			t.Fatalf("status %d, want 200", answer.status)
+		if answer.status != status {
+			t.Fatalf("status %d, want %d", answer.status, status)
 		}
 
 		return answer.rcs
 	case <-time.After(growDone):
-		t.Fatal("the resize was not answered after every replica grew")
+		t.Fatal("the resize was not answered")
 	}
 
 	return nil
@@ -280,13 +319,6 @@ func TestVDGrowSkipsOfflineReplica(t *testing.T) {
 	st := seedGrow(t, map[string]int64{"a": growOldKib, "down": growOldKib})
 	ctx := t.Context()
 
-	for _, node := range []string{"a", "down"} {
-		err := st.Nodes().Create(ctx, &apiv1.Node{Name: node, Type: "SATELLITE"})
-		if err != nil {
-			t.Fatalf("seed node %s: %v", node, err)
-		}
-	}
-
 	err := st.Nodes().SetConnectionStatus(ctx, "down", apiv1.NodeTypeOffline)
 	if err != nil {
 		t.Fatalf("mark node offline: %v", err)
@@ -324,19 +356,83 @@ func TestVDGrowCallerGivingUpEndsTheWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
 
-	result := make(chan bool, 1)
+	result := make(chan growOutcome, 1)
 
 	go func() {
-		_, grown := srv.waitForVolumeGrown(ctx, growRD, 0, growNewKib)
-		result <- grown
+		_, outcome := srv.waitForVolumeGrown(ctx, growRD, 0, growNewKib)
+		result <- outcome
 	}()
 
 	select {
-	case grown := <-result:
-		if grown {
-			t.Fatal("the wait reported the volume grown while the replica was at the old size")
+	case outcome := <-result:
+		if outcome != outcomeCancelled {
+			t.Fatalf("outcome %d while the replica was at the old size, want cancelled", outcome)
 		}
 	case <-time.After(growDone):
 		t.Fatal("the wait outlived its caller")
+	}
+}
+
+// TestVDGrowServerShutdownIsNotSuccess: the request context is the
+// server's, so a controller that stops while a grow waits ends the wait
+// with the connection still open. An empty 200 then reached golinstor,
+// which does not decode a PUT's body, so linstor-csi reported the
+// expansion done and kubelet grew the filesystem on the old device.
+func TestVDGrowServerShutdownIsNotSuccess(t *testing.T) {
+	st := seedGrow(t, map[string]int64{"a": growOldKib})
+
+	base, stop := startServerWithStore(t, st)
+
+	result := make(chan error, 1)
+
+	go func() {
+		result <- newClient(t, base).ResourceDefinitions.ModifyVolumeDefinition(
+			t.Context(), growRD, 0, lapi.VolumeDefinitionModify{SizeKib: uint64(growNewKib)})
+	}()
+
+	time.Sleep(growPending)
+	stop()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("golinstor reported the grow done although the server stopped before the replica grew")
+		}
+	case <-time.After(growDone):
+		t.Fatal("the resize was not answered when the server stopped")
+	}
+}
+
+// TestVDGrowEndsWithSatelliteError: a replica whose satellite fails its
+// pass at the new size is not going to grow until someone fixes it, and
+// LINSTOR answers with that satellite's error. A failure left from a pass
+// at the old size is not this grow's and does not end the wait.
+func TestVDGrowEndsWithSatelliteError(t *testing.T) {
+	st := seedGrow(t, map[string]int64{"a": growOldKib, "b": growOldKib})
+	setFailure(t, st, "b", growOldKib, "an earlier failure")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	done := putGrow(t, base, growNewKib)
+
+	expectPending(t, done, "the only failure was from a pass at the old size")
+
+	setApplied(t, st, "a", growNewKib)
+	setFailure(t, st, "b", growNewKib, "lvextend: insufficient free space")
+
+	rcs := expectAnsweredWith(t, done, http.StatusInternalServerError)
+
+	found := false
+
+	for _, rc := range rcs {
+		if rc.RetCode == apiv1.APICallRcMaskError && rc.ObjRefs[objRefNode] == "b" &&
+			strings.Contains(rc.Cause, "insufficient free space") {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatalf("no error entry carrying the satellite's failure: %+v", rcs)
 	}
 }

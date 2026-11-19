@@ -51,9 +51,18 @@ type resizeReplicas struct {
 	// not connected. They catch up when it reconnects, so a resize does
 	// not wait for them, as in LINSTOR.
 	offline []string
+	// failed are the growing replicas whose satellite's last pass, at
+	// the target size or above, failed: the grow is not progressing
+	// there, and LINSTOR answers with the satellite's error.
+	failed []failedReplica
 	// appliedKib is the smallest size an awaited replica reports as
 	// applied, 0 when none reports one.
 	appliedKib int64
+}
+
+// failedReplica is a replica whose last apply pass failed, with its error.
+type failedReplica struct {
+	node, message string
 }
 
 // awaitsResize reports whether a grow has to wait for this replica: a
@@ -76,6 +85,17 @@ func awaitsResize(rsc *apiv1.Resource, vn int32) (int64, bool) {
 	}
 
 	return 0, false
+}
+
+// passFailedAt returns the error of the replica's last apply pass when
+// that pass failed while applying volume vn at targetKib or above, the
+// size this grow waits for.
+func passFailedAt(rsc *apiv1.Resource, vn int32, targetKib int64) (string, bool) {
+	if rsc.ApplyFailure == nil || rsc.ApplyFailure.SizesKib[vn] < targetKib {
+		return "", false
+	}
+
+	return rsc.ApplyFailure.Message, true
 }
 
 // classifyResizeReplicas reads where a grow of volume vn to targetKib
@@ -106,16 +126,37 @@ func (s *Server) classifyResizeReplicas(ctx context.Context, rd string, vn int32
 			out.appliedKib = applied
 		}
 
-		if applied < targetKib {
-			out.growing = append(out.growing, rsc.NodeName)
+		if applied >= targetKib {
+			continue
+		}
+
+		out.growing = append(out.growing, rsc.NodeName)
+
+		if message, failed := passFailedAt(rsc, vn, targetKib); failed {
+			out.failed = append(out.failed, failedReplica{node: rsc.NodeName, message: message})
 		}
 	}
 
 	sort.Strings(out.growing)
 	sort.Strings(out.offline)
+	sort.Slice(out.failed, func(i, j int) bool { return out.failed[i].node < out.failed[j].node })
 
 	return out, nil
 }
+
+// growOutcome is how a wait for a grow ended.
+type growOutcome int
+
+const (
+	// outcomeGrown: every awaited replica has applied the size.
+	outcomeGrown growOutcome = iota
+	// outcomeFailed: an awaited replica's satellite failed its pass at
+	// this size; the entries carry its error.
+	outcomeFailed
+	// outcomeCancelled: the request was cancelled. The caller is gone,
+	// or this server is shutting down.
+	outcomeCancelled
+)
 
 // waitForVolumeGrown blocks a resize request until every awaited
 // replica has applied targetKib, the way LINSTOR answers
@@ -126,21 +167,26 @@ func (s *Server) classifyResizeReplicas(ctx context.Context, rd string, vn int32
 // the PUT does, and kubelet runs resize2fs next.
 //
 // There is no deadline of its own, as in LINSTOR: the wait ends when the
-// replicas have grown or when the caller gives up. It returns false in
-// the second case, and the handler then writes nothing. The caller's
-// retry finds the old size on a GET (see reportAppliedSizes) and asks
-// again, so a resize slower than the CSI timeout is not acknowledged
-// early either.
+// replicas have grown, when one of them reports its pass at this size
+// failed (outcomeFailed, with LINSTOR's answer of the satellite's error),
+// or when the request is cancelled (outcomeCancelled). The caller's retry
+// finds the old size on a GET (see reportAppliedSizes) and asks again,
+// so a resize slower than the CSI timeout is not acknowledged early
+// either.
 //
-// The returned entries are LINSTOR's not-connected warnings for the
-// diskful replicas the wait skipped.
-func (s *Server) waitForVolumeGrown(ctx context.Context, rd string, vn int32, targetKib int64) ([]apiv1.APICallRc, bool) {
+// On outcomeGrown the entries are LINSTOR's not-connected warnings for the
+// diskful replicas the wait skipped; on outcomeFailed they are the errors.
+func (s *Server) waitForVolumeGrown(ctx context.Context, rd string, vn int32, targetKib int64) ([]apiv1.APICallRc, growOutcome) {
 	logged := false
 
 	for {
 		state, err := s.classifyResizeReplicas(ctx, rd, vn, targetKib)
 		if err == nil && len(state.growing) == 0 {
-			return notConnectedWarnings(state.offline, rd, vn), true
+			return notConnectedWarnings(state.offline, rd, vn), outcomeGrown
+		}
+
+		if err == nil && len(state.failed) > 0 {
+			return satelliteFailures(state.failed, rd, vn), outcomeFailed
 		}
 
 		if err == nil && !logged {
@@ -152,10 +198,10 @@ func (s *Server) waitForVolumeGrown(ctx context.Context, rd string, vn int32, ta
 
 		select {
 		case <-ctx.Done():
-			slog.Default().Info("resize caller gave up before the replicas grew; the resize goes on",
+			slog.Default().Info("resize request ended before the replicas grew; the resize goes on",
 				"rd", rd, "volume", vn, "sizeKib", targetKib)
 
-			return nil, false
+			return nil, outcomeCancelled
 		case <-time.After(resizeWaitPollInterval):
 		}
 	}
@@ -168,12 +214,51 @@ func (s *Server) waitForVolumeGrown(ctx context.Context, rd string, vn int32, ta
 // size, or a forced shrink, does not wait.
 func (s *Server) waitForVDPatchGrown(
 	ctx context.Context, rd string, vn int32, sizeKib *int64, previousSizeKib int64,
-) ([]apiv1.APICallRc, bool) {
+) ([]apiv1.APICallRc, growOutcome) {
 	if sizeKib == nil || *sizeKib < previousSizeKib {
-		return nil, true
+		return nil, outcomeGrown
 	}
 
 	return s.waitForVolumeGrown(ctx, rd, vn, *sizeKib)
+}
+
+// satelliteFailures builds one error entry per replica whose satellite
+// failed its pass at the size a resize waits for.
+func satelliteFailures(failed []failedReplica, rd string, vn int32) []apiv1.APICallRc {
+	out := make([]apiv1.APICallRc, 0, len(failed))
+
+	for _, replica := range failed {
+		out = append(out, apiv1.APICallRc{
+			RetCode: apiv1.APICallRcMaskError,
+			Message: fmt.Sprintf("(Node: '%s') Failed to resize volume %d of resource '%s'", replica.node, vn, rd),
+			Cause:   replica.message,
+			Details: "The definition keeps the new size; the satellite retries the resize.",
+			ObjRefs: map[string]string{
+				objRefNode:   replica.node,
+				objRefRscDfn: rd,
+				objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+			},
+		})
+	}
+
+	return out
+}
+
+// shutdownDuringResize is the answer to a resize request this server
+// stopped waiting for because it is shutting down. Without a body the
+// client would read an empty 200 as success: golinstor does not decode
+// the body of a PUT, so linstor-csi would report the expansion done and
+// kubelet would grow the filesystem on a device still at the old size.
+func shutdownDuringResize(rd string, vn int32) []apiv1.APICallRc {
+	return []apiv1.APICallRc{{
+		RetCode: apiv1.APICallRcMaskError,
+		Message: fmt.Sprintf("The controller stopped before volume %d of resource '%s' finished growing", vn, rd),
+		Details: "The definition keeps the new size and the satellites go on growing it; retry the resize.",
+		ObjRefs: map[string]string{
+			objRefRscDfn: rd,
+			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+		},
+	}}
 }
 
 // notConnectedWarnings builds one WARN_NOT_CONNECTED entry per node.
