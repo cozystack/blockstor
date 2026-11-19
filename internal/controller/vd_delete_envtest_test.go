@@ -59,7 +59,7 @@ var _ = Describe("volume definition delete", func() {
 		var rd blockstoriov1alpha1.ResourceDefinition
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rdName}, &rd)).To(Succeed())
 
-		out := []int32{}
+		out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
 		for _, vd := range rd.Spec.VolumeDefinitions {
 			out = append(out, vd.VolumeNumber)
 		}

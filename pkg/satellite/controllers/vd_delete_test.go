@@ -26,6 +26,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -34,6 +35,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -404,5 +406,35 @@ func TestDeleteVolumesRemovesTheMinorBeforeTheStorage(t *testing.T) {
 				t.Errorf("commands %q, want detach and del-minor of minor 1001", lines)
 			}
 		})
+	}
+}
+
+// An apply that failed may have left the volume in DRBD, so its storage is
+// not touched until an apply goes through.
+func TestAfterApplyDeletesNothingWhenTheApplyFailed(t *testing.T) {
+	t.Parallel()
+
+	provider := &recordingProvider{}
+	f := newVDDeleteFixture(t, map[string]storage.Provider{vdDelPool: provider}, nil,
+		func(rd *blockstoriov1alpha1.ResourceDefinition, _ *blockstoriov1alpha1.Resource) {
+			flag(&rd.Spec.VolumeDefinitions[1], vdDelID)
+		})
+
+	failed := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: false, Message: "drbdadm adjust failed"}}
+	if !f.rec.afterApply(t.Context(), f.res, f.rd, failed, logr.Discard()) {
+		t.Error("afterApply reported success for a failed apply")
+	}
+
+	if got := provider.deletedNumbers(); len(got) != 0 {
+		t.Errorf("deleted %v after a failed apply", got)
+	}
+
+	ok := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: true}}
+	if f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()) {
+		t.Error("afterApply reported a failure for an apply that went through")
+	}
+
+	if got := provider.deletedNumbers(); !slices.Equal(got, []int32{1}) {
+		t.Errorf("deleted %v after the apply went through, want volume 1", got)
 	}
 }
