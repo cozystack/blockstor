@@ -35,8 +35,9 @@ import (
 
 // pool is a small model of a ZFS pool: enough of `zfs list`, `zfs get`,
 // `zfs set`, `zfs rename`, `zfs destroy` and `zfs clone` for the delete path
-// to run against, with ZFS's own refusals. A recursive destroy fails the test
-// outright: the provider must never issue one.
+// to run against, with ZFS's own refusals and its property inheritance: a
+// snapshot reads its zvol's marker unless `-s local` is asked. A recursive
+// destroy fails the test outright: the provider must never issue one.
 type pool struct {
 	t *testing.T
 
@@ -44,6 +45,17 @@ type pool struct {
 	datasets map[string]*dataset
 	calls    []string
 	failList bool
+
+	// exported makes the pool itself answer "does not exist", as an
+	// unimported pool does.
+	exported bool
+
+	// failRename makes the next `zfs rename` fail, as a busy zvol does.
+	failRename bool
+
+	// afterSet runs once, right after the next `zfs set`, to model a
+	// command another goroutine ran in between.
+	afterSet func()
 }
 
 type dataset struct {
@@ -58,6 +70,7 @@ var (
 	errRecursive     = errors.New("recursive destroy refused by the test")
 	errHasChildren   = errors.New("cannot destroy: volume has children")
 	errHasDependents = errors.New("cannot destroy: snapshot has dependent clones")
+	errBusy          = errors.New("cannot rename: dataset is busy")
 )
 
 func newPool(t *testing.T, names ...string) *pool {
@@ -197,6 +210,14 @@ func (p *pool) list(args []string) ([]byte, error) {
 		return []byte(strings.Join(out, "\n")), nil
 	}
 
+	if target == "tank" {
+		if p.exported {
+			return nil, errNoDataset
+		}
+
+		return []byte(target + "\n"), nil
+	}
+
 	if _, ok := p.datasets[target]; !ok {
 		return nil, errNoDataset
 	}
@@ -230,6 +251,17 @@ func (p *pool) get(args []string) ([]byte, error) {
 			return []byte("true\n"), nil
 		}
 
+		if slices.Contains(args, "local") {
+			// `-s local` leaves out a property that is only inherited.
+			return nil, nil
+		}
+
+		if at := strings.LastIndex(target, "@"); at >= 0 {
+			if base, ok := p.datasets[target[:at]]; ok && base.marked {
+				return []byte("true\n"), nil
+			}
+		}
+
 		return []byte("-\n"), nil
 	}
 
@@ -248,6 +280,11 @@ func (p *pool) set(args []string) error {
 
 	ds.marked = true
 
+	if hook := p.afterSet; hook != nil {
+		p.afterSet = nil
+		hook()
+	}
+
 	return nil
 }
 
@@ -255,6 +292,12 @@ func (p *pool) rename(from, to string) error {
 	ds, ok := p.datasets[from]
 	if !ok {
 		return errNoDataset
+	}
+
+	if p.failRename {
+		p.failRename = false
+
+		return errBusy
 	}
 
 	moved := map[string]string{from: to}
@@ -781,5 +824,131 @@ func TestRecvSnapshotProbeFailureTouchesNothing(t *testing.T) {
 		if strings.HasPrefix(line, "zfs recv") || strings.HasPrefix(line, "zfs destroy") {
 			t.Errorf("ran %q over a dataset the probe could not see", line)
 		}
+	}
+}
+
+// A snapshot inherits its zvol's marker. Restoring from a snapshot of a
+// renamed zvol and then deleting the restored replica must not read that
+// inherited marker as the snapshot's own and destroy it: its Snapshot still
+// exists and may be restored from again.
+func TestCloneDeleteKeepsASnapshotThatOnlyInheritsTheMarker(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-x_00000", "tank/pvc-x_00000@s1", "tank/pvc-x_00000@s2")
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, cloningPool{p})
+
+	err := prov.DeleteVolume(t.Context(), vol("pvc-x"))
+	if err != nil {
+		t.Fatalf("DeleteVolume pvc-x: %v", err)
+	}
+
+	renamed := deletedName(t, p, "tank/_deleted_pvc-x_00000_")
+
+	err = prov.RestoreVolumeFromSnapshot(t.Context(), vol("pvc-y"), snap("pvc-x", "s1"))
+	if err != nil {
+		t.Fatalf("RestoreVolumeFromSnapshot: %v", err)
+	}
+
+	err = prov.DeleteVolume(t.Context(), vol("pvc-y"))
+	if err != nil {
+		t.Fatalf("DeleteVolume pvc-y: %v", err)
+	}
+
+	for _, s := range []string{"@s1", "@s2"} {
+		if !p.has(renamed + s) {
+			t.Errorf("snapshot %s destroyed by the clone's delete; pool: %v", s, p.names())
+		}
+	}
+}
+
+// A delete that marked the zvol and then failed to rename it is retried. The
+// retry must not read the snapshots' inherited marker as theirs and destroy
+// them before renaming the zvol.
+func TestRetriedDeleteAfterAFailedRenameKeepsTheSnapshots(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-a_00000", "tank/pvc-a_00000@s1", "tank/pvc-a_00000@s2")
+	p.failRename = true
+
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank"}, p)
+
+	err := prov.DeleteVolume(t.Context(), vol("pvc-a"))
+	if err == nil {
+		t.Fatalf("DeleteVolume with a failing rename: got nil, want an error")
+	}
+
+	err = prov.DeleteVolume(t.Context(), vol("pvc-a"))
+	if err != nil {
+		t.Fatalf("retried DeleteVolume: %v", err)
+	}
+
+	if got := p.destroyed(); len(got) != 0 {
+		t.Errorf("destroyed %v, want nothing", got)
+	}
+
+	renamed := deletedName(t, p, "tank/_deleted_pvc-a_00000_")
+
+	for _, s := range []string{"@s1", "@s2"} {
+		if !p.has(renamed + s) {
+			t.Errorf("snapshot %s lost; pool: %v", s, p.names())
+		}
+	}
+}
+
+// A snapshot delete that destroys the zvol's last snapshot between the
+// replica delete's listing and its mark finds nothing marked to finish. The
+// replica delete then finishes the renamed zvol itself, or it would stay on
+// disk with nothing left to delete it.
+func TestReplicaDeleteFinishesAZvolItsLastSnapshotLeftMeanwhile(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-a_00000", "tank/pvc-a_00000@s1")
+	p.afterSet = func() { delete(p.datasets, "tank/pvc-a_00000@s1") }
+
+	err := zfs.NewProvider(zfs.Config{Pool: "tank"}, p).DeleteVolume(t.Context(), vol("pvc-a"))
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	if got := p.names(); len(got) != 0 {
+		t.Errorf("pool: %v, want the renamed zvol finished", got)
+	}
+}
+
+// A zvol under its live name that carries the marker (a delete stopped
+// between the mark and the rename, and the replica was created over it
+// again) is not destroyed when its last snapshot goes.
+func TestCascadeLeavesALiveNamedZvol(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-a_00000", "tank/pvc-a_00000@s1")
+	p.mark("tank/pvc-a_00000")
+
+	err := zfs.NewProvider(zfs.Config{Pool: "tank"}, p).DeleteSnapshot(t.Context(), snap("pvc-a", "s1"))
+	if err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	if got := p.names(); !slices.Equal(got, []string{"tank/pvc-a_00000"}) {
+		t.Errorf("pool: %v, want the live zvol kept", got)
+	}
+}
+
+// A pool that is not imported answers "does not exist" for every dataset in
+// it. A delete must not read that as the volume being gone.
+func TestDeleteOnAnUnimportedPoolIsAnError(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t)
+	p.exported = true
+
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank"}, p)
+
+	if err := prov.DeleteVolume(t.Context(), vol("pvc-a")); err == nil {
+		t.Errorf("DeleteVolume on an unimported pool: got nil, want an error")
+	}
+
+	if err := prov.DeleteSnapshot(t.Context(), snap("pvc-a", "s1")); err == nil {
+		t.Errorf("DeleteSnapshot on an unimported pool: got nil, want an error")
 	}
 }

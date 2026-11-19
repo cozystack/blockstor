@@ -62,6 +62,10 @@ const (
 // renamed zvol: destroying the wrong one would delete data nobody asked for.
 var errAmbiguousSnapshot = errors.New("snapshot found under more than one deleted zvol")
 
+// errPoolMissing refuses to read a dataset as deleted while its pool itself
+// is not there: an unimported pool hides every volume in it.
+var errPoolMissing = errors.New("zfs pool is not imported; its datasets cannot be checked")
+
 // DeleteVolume deletes the zvol of vol. A zvol without snapshots is destroyed,
 // and the snapshot it was cloned from goes with it when that snapshot was
 // itself marked for deletion and this was its last clone. A zvol with
@@ -110,7 +114,18 @@ func (p *Provider) deleteVolumeDataset(ctx context.Context, dataset, suffix stri
 	}
 
 	if len(snapshots) > 0 {
-		return p.markAndRename(ctx, dataset, deletedVolumeName(dataset, suffix))
+		renamed := deletedVolumeName(dataset, suffix)
+
+		err = p.markAndRename(ctx, dataset, renamed)
+		if err != nil {
+			return err
+		}
+
+		// A snapshot delete running beside this one may have destroyed
+		// the last snapshot after the list above and before the mark, and
+		// its cascade then found nothing marked to finish. Nothing would
+		// come back for the renamed zvol, so finish it here.
+		return p.cascadeToBase(ctx, renamed)
 	}
 
 	origin, err := p.originOf(ctx, dataset)
@@ -186,8 +201,17 @@ func (p *Provider) cascadeToOrigin(ctx context.Context, origin string) error {
 }
 
 // cascadeToBase is the step after a snapshot is destroyed: the zvol it
-// belonged to may have been waiting only for it.
+// belonged to may have been waiting only for it. Only a zvol that was renamed
+// out of the way is finished here. One still under its live name may carry
+// the marker from a delete that stopped between the mark and the rename, and
+// a replica created again over it since then (CreateVolume adopts an
+// existing zvol) would be destroyed under its writer; its own delete, when
+// it is retried, finishes it instead.
 func (p *Provider) cascadeToBase(ctx context.Context, dataset string) error {
+	if !isDeletedVolume(dataset) {
+		return nil
+	}
+
 	present, err := p.datasetPresent(ctx, dataset)
 	if err != nil || !present {
 		return err
@@ -383,12 +407,33 @@ func (p *Provider) markedForDeletion(ctx context.Context, dataset string) (bool,
 		return true, nil
 	}
 
-	value, err := p.property(ctx, dataset, markedForDeletionProp)
+	value, err := p.localProperty(ctx, dataset, markedForDeletionProp)
 	if err != nil {
 		return false, err
 	}
 
 	return value == "true", nil
+}
+
+// localProperty reads a property set on the dataset itself, "" when it is
+// only inherited or not set. A snapshot inherits its zvol's user properties,
+// so once a zvol is marked every snapshot of it would read as marked too and
+// be destroyed as released; LINSTOR passes `-s local` for the same reason.
+func (p *Provider) localProperty(ctx context.Context, dataset, name string) (string, error) {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
+	out, err := p.exec.Run(ctx, "zfs", "get", "-H", "-o", "value", "-s", "local", name, dataset)
+	if err != nil {
+		return "", errors.Wrapf(err, "zfs get %s %s", name, dataset)
+	}
+
+	value := strings.TrimSpace(string(out))
+	if value == "-" {
+		return "", nil
+	}
+
+	return value, nil
 }
 
 // property reads one property, with ZFS's "-" for "none" folded into "".
@@ -419,11 +464,27 @@ func (p *Provider) datasetPresent(ctx context.Context, dataset string) (bool, er
 
 	out, err := p.exec.Run(ctx, "zfs", "list", "-H", "-o", "name", dataset)
 	if err != nil {
-		if strings.Contains(err.Error(), "dataset does not exist") {
+		if !strings.Contains(err.Error(), "dataset does not exist") {
+			return false, errors.Wrapf(err, "zfs list %s", dataset)
+		}
+
+		if dataset == p.cfg.Pool {
 			return false, nil
 		}
 
-		return false, errors.Wrapf(err, "zfs list %s", dataset)
+		// A pool that is not imported answers the same for every dataset
+		// in it, and reading that as "deleted" would release the replica
+		// over a volume that comes back with the import.
+		pool, err := p.datasetPresent(ctx, p.cfg.Pool)
+		if err != nil {
+			return false, err
+		}
+
+		if !pool {
+			return false, errors.Wrapf(errPoolMissing, "%s", p.cfg.Pool)
+		}
+
+		return false, nil
 	}
 
 	return strings.TrimSpace(string(out)) != "", nil
@@ -443,6 +504,12 @@ func deletedSnapshotName(snapshot, stamp string) string {
 	at := strings.LastIndex(snapshot, "@")
 
 	return snapshot[:at] + "@" + deletedPrefix + snapshot[at+1:] + "_" + stamp
+}
+
+// isDeletedVolume reports whether the zvol carries the name a delete renamed
+// it to.
+func isDeletedVolume(dataset string) bool {
+	return strings.HasPrefix(dataset[strings.LastIndex(dataset, "/")+1:], deletedPrefix)
 }
 
 // baseOf is the zvol a snapshot belongs to.
