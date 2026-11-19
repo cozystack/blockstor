@@ -29,6 +29,9 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
+// errReadBack is what dd reports for a device whose reads fail.
+var errReadBack = errors.New("dd: error reading: Input/output error")
+
 func readBack(device string) string {
 	return "dd if=" + device + " of=/dev/null bs=1M count=1 iflag=direct status=none"
 }
@@ -50,7 +53,7 @@ func filesystemOnlyProbe(device string) string {
 // the cache flush before the probe can fail too. Neither may read as
 // "no filesystem".
 func TestApplyLatchFreeRetryRefusesNothingFoundItCannotReadBack(t *testing.T) {
-	eio := storage.FakeResponse{Err: errors.New("dd: error reading: Input/output error")}
+	eio := storage.FakeResponse{Err: errReadBack}
 
 	cases := map[string]func(device string) string{
 		"read-back fails": readBack,
@@ -175,7 +178,7 @@ func unknownMkfsTargetAnswers(device string) map[string][]storage.FakeResponse {
 		"ambivalent":            {{Err: storage.FakeExitError{Code: 8}}},
 		"cannot open": {{Err: fmt.Errorf("%w: blkid -p -o export %s: blkid: error: %s: Permission denied",
 			storage.FakeExitError{Code: 2}, device, device)}},
-		"nothing found, read-back fails": {nothing, {Err: errors.New("dd: error reading: Input/output error")}},
+		"nothing found, read-back fails": {nothing, {Err: errReadBack}},
 	}
 }
 
