@@ -383,6 +383,10 @@ func volumeDefinitionDelete(ctx context.Context, run *runContext) error {
 	_, _, err = store.MarkVolumeDefinitionDeleted(ctx, run.Store, rdName, number)
 	if err != nil {
 		if isNotFound(err) {
+			// LINSTOR's answer, as the REST door gives it: a warning,
+			// not an error, so a repeated delete still succeeds.
+			fmt.Fprintf(run.Err, "warning: Resource definition: %s, Volume number: %d not found.\n", rdName, number)
+
 			return nil
 		}
 

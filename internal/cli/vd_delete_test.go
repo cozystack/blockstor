@@ -82,3 +82,19 @@ func TestVolumeDefinitionDeleteRefusesInUse(t *testing.T) {
 		t.Errorf("after a refused delete: %+v %v, want the definition unflagged", vd, err)
 	}
 }
+
+// A delete of a volume that is not there succeeds, as LINSTOR's does, and
+// says so with LINSTOR's not-found text instead of nothing.
+func TestVolumeDefinitionDeleteOfAMissingVolumeWarns(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedVolumeWithReplica(false))
+
+	if got := app.Run(t.Context(), []string{"vd", "d", "pvc-x", "7"}); got != 0 {
+		t.Fatalf("delete exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	if want := "Resource definition: pvc-x, Volume number: 7 not found."; !strings.Contains(errBuf.String(), want) {
+		t.Errorf("stderr %q, want %q", errBuf.String(), want)
+	}
+}
