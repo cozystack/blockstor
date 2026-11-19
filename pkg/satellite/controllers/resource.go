@@ -564,11 +564,24 @@ func (r *ResourceReconciler) afterApply(
 	if err != nil {
 		logger.Info("volume definition delete not done yet", "error", err.Error())
 
+		// The definition stays flagged DELETE until this replica
+		// confirms, so a delete that keeps failing here holds it for
+		// good; the Event is where the operator learns which node and
+		// why.
+		if r.Config.Recorder != nil {
+			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, volumeDeleteFailedReason, "DeleteVolume",
+				"volume definition delete is waiting for this replica: %s", err.Error())
+		}
+
 		return true
 	}
 
 	return false
 }
+
+// volumeDeleteFailedReason is the Event reason for a replica that could not
+// delete the volume of a definition flagged DELETE.
+const volumeDeleteFailedReason = "VolumeDeleteFailed"
 
 // prepareDRBDApply runs the DRBD-only pre-apply sequence: stale
 // kernel slot prune (Bug 342 v3) and the controller-allocation wait

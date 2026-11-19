@@ -28,6 +28,7 @@ import (
 
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -406,6 +407,34 @@ func TestDeleteVolumesRemovesTheMinorBeforeTheStorage(t *testing.T) {
 				t.Errorf("commands %q, want detach and del-minor of minor 1001", lines)
 			}
 		})
+	}
+}
+
+// A replica whose delete keeps failing holds the definition flagged DELETE,
+// so it says why in a Warning Event on the Resource, not only in its log.
+func TestAFailedVolumeDeleteIsAWarningEvent(t *testing.T) {
+	t.Parallel()
+
+	f := newVDDeleteFixture(t, map[string]storage.Provider{}, nil,
+		func(rd *blockstoriov1alpha1.ResourceDefinition, _ *blockstoriov1alpha1.Resource) {
+			flag(&rd.Spec.VolumeDefinitions[1], vdDelID)
+		})
+
+	recorder := events.NewFakeRecorder(4)
+	f.rec.Config.Recorder = recorder
+
+	ok := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: true}}
+	if !f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()) {
+		t.Fatal("afterApply reported success for a delete that failed")
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "Warning "+volumeDeleteFailedReason) || !strings.Contains(ev, vdDelPool) {
+			t.Errorf("Event = %q, want a Warning %s naming the pool", ev, volumeDeleteFailedReason)
+		}
+	default:
+		t.Error("no Event for a volume delete that failed")
 	}
 }
 
