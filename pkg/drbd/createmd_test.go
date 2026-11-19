@@ -21,11 +21,73 @@ package drbd_test
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
+
+// truncationRefusal is what drbdmeta prints on stdout, before it exits 40,
+// when metadata with more peer slots than the lower disk was laid out for
+// would cut into the filesystem on it (check_for_existing_data).
+const truncationRefusal = "md_offset 1073487872\nal_offset 1073455104\nbm_offset 1072963584\n\n" +
+	"Found ext4 filesystem\n     1048576 kB data area apparently used\n" +
+	"     1048304 kB left usable by current configuration\n\n" +
+	"Device size would be truncated, which\nwould corrupt data and result in\n" +
+	"'access beyond end of device' errors.\nYou need to either\n" +
+	"   * use external meta data (recommended)\n   * shrink that filesystem first\n" +
+	"   * zero out the device (destroy the filesystem)\nOperation refused.\n\n"
+
+const createMD15 = "drbdadm create-md --force --max-peers=15 pvc-1/0"
+
+// drbdmeta gives its reason for refusing on stdout and exits with a bare
+// 40, and the exec error carries stderr only. Before, the satellite logged
+// "exit code 40" and nothing an operator could act on. The refusal is now
+// named, so the satellite can tell it from a failure worth retrying, and
+// carries the reason.
+func TestCreateMDNamesARefusalAndItsReason(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect(createMD15, storage.FakeResponse{
+		Stdout: []byte(truncationRefusal),
+		Err:    storage.FakeExitError{Code: 40},
+	})
+
+	err := drbd.NewAdm(fx).CreateMD(t.Context(), "pvc-1/0")
+	if !errors.Is(err, drbd.ErrCreateMDRefused) {
+		t.Fatalf("CreateMD = %v, want ErrCreateMDRefused", err)
+	}
+
+	for _, want := range []string{
+		drbd.ErrCreateMDRefused.Error(),
+		"Found ext4 filesystem",
+		"Device size would be truncated",
+		"Operation refused.",
+		"exit status 40",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("CreateMD error %q does not carry %q", err, want)
+		}
+	}
+
+	if strings.Contains(err.Error(), "md_offset") {
+		t.Errorf("CreateMD error %q carries the offsets drbdmeta prints before its reason", err)
+	}
+}
+
+// Any other failure stays what it was: not a refusal.
+func TestCreateMDOtherFailuresAreNotRefusals(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect(createMD15, storage.FakeResponse{
+		Stdout: []byte("open(/dev/zvol/data/pvc-1_00000) failed: Device or resource busy\n"),
+		Err:    storage.FakeExitError{Code: 20},
+	})
+
+	err := drbd.NewAdm(fx).CreateMD(t.Context(), "pvc-1/0")
+	if err == nil || errors.Is(err, drbd.ErrCreateMDRefused) {
+		t.Fatalf("CreateMD = %v, want a failure that is not a refusal", err)
+	}
+}
 
 func TestCreateMDWithMaxPeersPassesTheCount(t *testing.T) {
 	fx := storage.NewFakeExec()

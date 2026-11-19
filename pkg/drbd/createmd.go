@@ -29,19 +29,65 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// ErrCreateMDRefused reports that drbdmeta refused to write metadata
+// because it would land on data: the data area left by the new metadata
+// is smaller than the filesystem already on the lower disk, or the
+// metadata would overwrite it. drbdmeta refuses this the same way on
+// every attempt, and `--force` does not override it.
+var ErrCreateMDRefused = errors.New("drbdmeta refused to create metadata over the data on the lower disk")
+
+// drbdmetaRefused is the line drbdmeta prints on stdout before it exits
+// 40 out of check_for_existing_data.
+const drbdmetaRefused = "Operation refused."
+
 // CreateMDWithMaxPeers is CreateMD with the peer-slot count given.
 //
 // The size of internal metadata grows with its peer slots, and it sits at
 // the end of the lower disk, so the slot count decides how much of the disk
 // is left for data. A lower disk that already holds data laid out for N
 // slots has room for metadata of N slots; created with more, the data area
-// shrinks under the filesystem and drbdmeta refuses.
+// shrinks under the filesystem and drbdmeta refuses (ErrCreateMDRefused).
+//
+// drbdmeta explains a refusal on stdout and exits with a bare status, so
+// the explanation is carried in the error: without it the log shows only
+// "exit code 40" and the reason is lost.
 func (a *Adm) CreateMDWithMaxPeers(ctx context.Context, resource string, maxPeers int) error {
-	return a.run(ctx,
+	out, err := a.exec.Run(ctx,
+		"drbdadm",
 		"create-md",
 		"--force",
 		fmt.Sprintf("--max-peers=%d", maxPeers),
 		resource)
+	if err == nil {
+		return nil
+	}
+
+	reason, refused := createMDRefusal(out)
+	if !refused {
+		return errors.Wrap(err, "drbdadm create-md")
+	}
+
+	return errors.Wrapf(ErrCreateMDRefused, "drbdadm create-md: %s (%v)", reason, err)
+}
+
+// createMDRefusal extracts drbdmeta's explanation of a refusal: the text
+// from the line naming what it found on the disk up to "Operation
+// refused.", on one line.
+func createMDRefusal(stdout []byte) (string, bool) {
+	text := string(stdout)
+
+	end := strings.Index(text, drbdmetaRefused)
+	if end < 0 {
+		return "", false
+	}
+
+	text = text[:end+len(drbdmetaRefused)]
+
+	if start := strings.LastIndex(text, "\nFound "); start >= 0 {
+		text = text[start+1:]
+	}
+
+	return strings.Join(strings.Fields(text), " "), true
 }
 
 // MetadataMaxPeers reads the peer-slot count of the superblock on the
