@@ -101,3 +101,100 @@ func TestResourcesViewInUseFollowsTheTopLayer(t *testing.T) {
 		}
 	}
 }
+
+// The per-definition endpoints describe a replica the way
+// `/v1/view/resources` does: the same layer chain off the definition,
+// and the same in_use. Upstream builds all three from one projection,
+// so a client reading one replica through two of them saw two shapes.
+func TestResourcesPerDefinitionMatchTheView(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	stacks := map[string][]string{
+		"pvc-local":     {"STORAGE"},
+		"pvc-encrypted": {"DRBD", "LUKS", "STORAGE"},
+	}
+
+	for name, stack := range stacks {
+		if err := st.ResourceDefinitions().Create(ctx,
+			&apiv1.ResourceDefinition{Name: name, LayerStack: stack}); err != nil {
+			t.Fatalf("seed RD: %v", err)
+		}
+
+		unused := false
+
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name:     name,
+			NodeName: "worker-1",
+			State:    apiv1.ResourceState{InUse: &unused},
+			Volumes:  []apiv1.Volume{{VolumeNumber: 0}},
+		}); err != nil {
+			t.Fatalf("seed Resource: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	type shape struct {
+		Name  string         `json:"name"`
+		State map[string]any `json:"state"`
+		Layer struct {
+			Type     string `json:"type"`
+			Children []struct {
+				Type string `json:"type"`
+			} `json:"children"`
+		} `json:"layer_object"`
+		Volumes []struct {
+			Layers []struct {
+				Type string `json:"type"`
+			} `json:"layer_data_list"`
+		} `json:"volumes"`
+	}
+
+	decode := func(t *testing.T, url string, into any) {
+		t.Helper()
+
+		resp := httpGet(t, url)
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status %d", url, resp.StatusCode)
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
+			t.Fatalf("%s: decode: %v", url, err)
+		}
+	}
+
+	for name, stack := range stacks {
+		var listed []shape
+
+		decode(t, base+"/v1/resource-definitions/"+name+"/resources", &listed)
+
+		var single shape
+
+		decode(t, base+"/v1/resource-definitions/"+name+"/resources/worker-1", &single)
+
+		if len(listed) != 1 {
+			t.Fatalf("%s: listed %d replicas, want 1", name, len(listed))
+		}
+
+		for endpoint, got := range map[string]shape{"list": listed[0], "get": single} {
+			if got.Layer.Type != stack[0] {
+				t.Errorf("%s %s: top layer %q, want %q", name, endpoint, got.Layer.Type, stack[0])
+			}
+
+			if len(got.Volumes) != 1 || len(got.Volumes[0].Layers) != len(stack) {
+				t.Errorf("%s %s: volume layers %+v, want %v", name, endpoint, got.Volumes, stack)
+			}
+
+			_, present := got.State["in_use"]
+			if wantPresent := stack[0] != "STORAGE"; present != wantPresent {
+				t.Errorf("%s %s: in_use present = %v, want %v", name, endpoint, present, wantPresent)
+			}
+		}
+	}
+}

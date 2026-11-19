@@ -107,7 +107,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	// ControllerPublishVolume right after the spawn; a sibling
 	// apiserver replica's cache may still trail the spawn write.
 	// See pkg/rest/cache_retry.go.
-	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -123,7 +123,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {
-		out = append(out, wrapResourceWithVolumes(&resList[i]))
+		out = append(out, wrapResourceWithLayers(&resList[i], rd.LayerStack))
 	}
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys (passphrase,
@@ -166,6 +166,29 @@ func wrapResourceWithVolumes(res *apiv1.Resource) apiv1.ResourceWithVolumes {
 	return out
 }
 
+// wrapResourceWithLayers wraps a replica re-stamped with its
+// definition's layer stack. The store hands every replica back as DRBD
+// over STORAGE, and `/v1/view/resources` re-stamps it; without the same
+// step here the two endpoints described one replica two ways, this one
+// with a DRBD layer a STORAGE-only replica does not have and an
+// `in_use: false` nothing observed.
+//
+// The volumes are copied before the re-stamp: a store may hand back a
+// slice it still holds.
+func wrapResourceWithLayers(res *apiv1.Resource, stack []string) apiv1.ResourceWithVolumes {
+	if len(stack) == 0 {
+		return wrapResourceWithVolumes(res)
+	}
+
+	stamped := *res
+	stamped.Volumes = slices.Clone(res.Volumes)
+
+	apiv1.ApplyLayerStack(&stamped, stack)
+	apiv1.ApplyLayerStackToVolumes(stamped.Volumes, stack)
+
+	return wrapResourceWithVolumes(&stamped)
+}
+
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
 // returning the single Resource on that node or 404.
 //
@@ -191,7 +214,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// the replica back immediately; both the RD probe and the replica
 	// read may be served by a cache that still trails those writes —
 	// see pkg/rest/cache_retry.go.
-	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound,
@@ -226,7 +249,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// outer `volumes` JSON key serialises as `[]` instead of `null` when
 	// the Resource carries no Volumes; protects python-linstor's
 	// `rsc._rest_data['volumes']` dereference.
-	writeJSON(w, http.StatusOK, wrapResourceWithVolumes(&res))
+	writeJSON(w, http.StatusOK, wrapResourceWithLayers(&res, rd.LayerStack))
 }
 
 // handleAutoplace selects up to `place_count` nodes that have a storage
