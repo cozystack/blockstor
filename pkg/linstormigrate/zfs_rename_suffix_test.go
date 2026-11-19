@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/storage/zfs"
+	"github.com/cozystack/blockstor/pkg/validate"
 )
 
 // A snapshot whose replica LINSTOR already deleted lives under the zvol LINSTOR
@@ -70,5 +71,62 @@ func TestSnapshotCarriesLinstorsRenameSuffixPerNode(t *testing.T) {
 
 	if got, ok := props[zfs.SnapshotRenameSuffixProp("node-b")]; ok {
 		t.Errorf("node-b got a suffix %q it never had", got)
+	}
+}
+
+// The controller-wide ZFS delete strategy migrates, so a cluster that set
+// DELETE there keeps LINSTOR's refusals; definition and group scopes carry it
+// with the rest of their props.
+func TestControllerZFSDeleteStrategyMigrates(t *testing.T) {
+	t.Parallel()
+
+	dump := &Dump{
+		Nodes: []NodeRow{{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"}},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: PropsInstanceController, PropKey: validate.ZFSDeleteStrategyProp, PropValue: "DELETE"},
+		},
+	}
+
+	res, err := convertForTest(t, dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if res.ControllerConfig == nil {
+		t.Fatalf("no ControllerConfig; warnings %v", res.Warnings)
+	}
+
+	if got := res.ControllerConfig.Spec.ExtraProps[validate.ZFSDeleteStrategyProp]; got != "DELETE" {
+		t.Errorf("controller strategy %q, want DELETE", got)
+	}
+}
+
+func TestDefinitionZFSDeleteStrategyMigrates(t *testing.T) {
+	t.Parallel()
+
+	dump := &Dump{
+		Nodes: []NodeRow{{NodeName: "NODE-A", NodeDspName: "node-a", NodeType: 2, UUID: "n-a"}},
+		ResourceDefinitions: []ResourceDefinitionRow{
+			{ResourceName: "PVC-S", ResourceDspName: "pvc-s", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd"},
+		},
+		VolumeDefinitions: []VolumeDefinitionRow{{ResourceName: "PVC-S", VlmNr: 0, VlmSize: 1048576, UUID: "vd"}},
+		Resources:         []ResourceRow{{NodeName: "NODE-A", ResourceName: "PVC-S", UUID: "r-a"}},
+		PropsContainers: []PropsContainerRow{
+			{PropsInstance: "/RSC_DFNS/PVC-S", PropKey: validate.ZFSDeleteStrategyProp, PropValue: "DELETE"},
+		},
+	}
+
+	res, err := convertForTest(t, dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if len(res.ResourceDefinitions) != 1 {
+		t.Fatalf("definitions %d; warnings %v", len(res.ResourceDefinitions), res.Warnings)
+	}
+
+	spec := res.ResourceDefinitions[0].Spec
+	if spec.Props[validate.ZFSDeleteStrategyProp] != "DELETE" && spec.ExtraProps[validate.ZFSDeleteStrategyProp] != "DELETE" {
+		t.Errorf("definition props %v / %v lost the strategy", spec.Props, spec.ExtraProps)
 	}
 }

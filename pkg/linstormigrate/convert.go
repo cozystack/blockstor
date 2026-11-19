@@ -34,6 +34,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/storage/zfs"
 	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/validate"
 )
 
 // drbdSharedSecretProp is the RD property key blockstor's satellite
@@ -315,11 +316,24 @@ func (c *converter) convertControllerConfig() *crdv1alpha1.ControllerConfig {
 		}
 	}
 
-	if len(drbdProps) == 0 {
+	strategy, hasStrategy := c.props.Controller[validate.ZFSDeleteStrategyProp]
+
+	if len(drbdProps) == 0 && !hasStrategy {
 		return nil
 	}
 
 	typed, _, extra := k8sstore.SplitProps(drbdProps)
+
+	// The controller is the last scope LINSTOR reads the ZFS delete
+	// strategy from, and blockstor reads it from the same props: a
+	// cluster that set DELETE there keeps refusing the deletes it did.
+	if hasStrategy {
+		if extra == nil {
+			extra = map[string]string{}
+		}
+
+		extra[validate.ZFSDeleteStrategyProp] = strategy
+	}
 
 	return &crdv1alpha1.ControllerConfig{
 		TypeMeta:   typeMeta("ControllerConfig"),
