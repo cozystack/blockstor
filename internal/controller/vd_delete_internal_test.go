@@ -45,3 +45,21 @@ func TestDeletedVolumesChangedWakesTheReconciler(t *testing.T) {
 		t.Error("an unrelated status write counted as a confirmation")
 	}
 }
+
+// An auto-snapshot leaves out a volume flagged DELETE, as a REST snapshot
+// does: the replicas that already deleted it would fail it.
+func TestAutoSnapshotLeavesOutAVolumeBeingDeleted(t *testing.T) {
+	t.Parallel()
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+		VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+			{VolumeNumber: 0, SizeKib: 1024},
+			{VolumeNumber: 1, SizeKib: 1024, Flags: []string{blockstoriov1alpha1.VolumeDefinitionFlagDelete}, DeleteID: "d"},
+		},
+	}}
+
+	refs := volumeRefsFromRD(rd)
+	if len(refs) != 1 || refs[0].VolumeNumber != 0 {
+		t.Errorf("auto-snapshot volumes %+v, want only volume 0", refs)
+	}
+}

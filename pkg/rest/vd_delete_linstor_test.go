@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LINBIT/golinstor/clonestatus"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
@@ -396,5 +398,51 @@ func assertRefusedUnflagged(t *testing.T, st store.Store, rd string, code int64)
 
 	if vd.Deleting() {
 		t.Error("a refused delete flagged the volume definition DELETE")
+	}
+}
+
+// A snapshot or clone taken while a volume definition is flagged DELETE
+// leaves that volume out: the replicas that already deleted it would fail
+// the snapshot, and the flag can stay for as long as a replica is offline.
+// A clone of the definition still reads as complete without it.
+func TestSnapshotLeavesOutAVolumeBeingDeleted(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	st := store.NewInMemory()
+	seedVDWithReplicas(t, st, "pvc-snapdel", "node-a")
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-snapdel", &apiv1.VolumeDefinition{VolumeNumber: 1, SizeKib: 32 * 1024}); err != nil {
+		t.Fatalf("seed VD 1: %v", err)
+	}
+
+	if _, _, err := store.MarkVolumeDefinitionDeleted(ctx, st, "pvc-snapdel", 1); err != nil {
+		t.Fatalf("flag VD 1: %v", err)
+	}
+
+	snap := apiv1.Snapshot{Name: "s1", ResourceName: "pvc-snapdel"}
+	if err := (&Server{Store: st}).hydrateSnapshotFromRD(ctx, &snap, "pvc-snapdel"); err != nil {
+		t.Fatalf("hydrateSnapshotFromRD: %v", err)
+	}
+
+	got := make([]int32, 0, len(snap.VolumeDefinitions))
+	for _, vd := range snap.VolumeDefinitions {
+		got = append(got, vd.VolumeNumber)
+	}
+
+	if !slices.Equal(got, []int32{0}) {
+		t.Errorf("snapshot volumes %v, want only volume 0", got)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-snapdel-clone"}); err != nil {
+		t.Fatalf("seed clone RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-snapdel-clone", &apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 32 * 1024}); err != nil {
+		t.Fatalf("seed clone VD: %v", err)
+	}
+
+	if status := computeCloneStatus(ctx, st, "pvc-snapdel", "pvc-snapdel-clone"); status != clonestatus.Complete {
+		t.Errorf("clone status %v, want complete without the flagged volume", status)
 	}
 }

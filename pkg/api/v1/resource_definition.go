@@ -217,6 +217,14 @@ func (vd *VolumeDefinition) Deleting() bool {
 	return vd != nil && slices.Contains(vd.Flags, VolumeDefinitionFlagDelete)
 }
 
+// LiveVolumeDefinitions drops the volume definitions flagged DELETE. A
+// snapshot or clone taken while one is flagged must not ask for its volume:
+// the replicas that already deleted it would fail the snapshot, and the
+// flag can stay for as long as a replica is offline.
+func LiveVolumeDefinitions(vds []VolumeDefinition) []VolumeDefinition {
+	return slices.DeleteFunc(slices.Clone(vds), func(vd VolumeDefinition) bool { return vd.Deleting() })
+}
+
 // VolumeDefinitionCreate is the upstream POST envelope for
 // /v1/resource-definitions/{rd}/volume-definitions. Mirrors golinstor.
 type VolumeDefinitionCreate struct {
