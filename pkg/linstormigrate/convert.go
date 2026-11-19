@@ -2035,13 +2035,36 @@ func (c *converter) volumeDefinitionsFor(rdName, rdDsp string) []crdv1alpha1.Res
 }
 
 // volumeDefinitionProps is the carried bag of one volume definition.
-// LINSTOR renders a volume's own DrbdOptions/Disk/* into its volume
-// block; blockstor does not, which the report says.
+// The satellite renders a volume's own DrbdOptions/Disk/* into its volume
+// block and reads auto-rs-discard-granularity there, as LINSTOR does
+// (effectiveprops.VolumeDiskOptions), so only the other DRBD options of
+// the bag are reported as never reaching a .res.
 func (c *converter) volumeDefinitionProps(rdName, rdDsp string, vlmNr int32) map[string]string {
 	props := c.props.VolumeDefinition(rdName, strconv.Itoa(int(vlmNr)))
-	c.warnUnrenderedDRBDOptions(fmt.Sprintf("volume definition %s/%d", rdDsp, vlmNr), props)
+
+	unrendered := make(map[string]string, len(props))
+
+	for key, value := range props {
+		if !renderedAtVolumeDefinition(key) {
+			unrendered[key] = value
+		}
+	}
+
+	c.warnUnrenderedDRBDOptions(fmt.Sprintf("volume definition %s/%d", rdDsp, vlmNr), unrendered)
 
 	return props
+}
+
+// renderedAtVolumeDefinition says whether the satellite resolves key from
+// a volume definition. It mirrors effectiveprops.VolumeDiskOptions.
+func renderedAtVolumeDefinition(key string) bool {
+	if key == drbd.PropPrefix+"auto-rs-discard-granularity" {
+		return true
+	}
+
+	name, ok := strings.CutPrefix(key, drbd.PropPrefix+"Disk/")
+
+	return ok && name != ""
 }
 
 func (c *converter) convertResources() []crdv1alpha1.Resource {
