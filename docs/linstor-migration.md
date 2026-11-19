@@ -142,6 +142,7 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 - Every diskful replica is `UpToDate`; no replica is unexpectedly `SyncTarget`.
 - Adopted snapshots list as present without any suspend-io having fired on the parent RDs (check the satellites did not log `suspend-io`).
 - For LUKS RDs: `linstor encryption status` against blockstor says `unlocked`, and each LUKS replica opens; a `LUKSKeyMismatch` or `MasterKeyLocked` Event on a Resource is a stop-the-line defect.
+- A LUKS replica LINSTOR had open keeps running on LINSTOR's dm-crypt mapper, `/dev/mapper/Linstor-Crypt-<rd>_<vol, five digits>`: the satellite adopts it once the device-mapper table shows it encrypts that replica's own volume, renders the `.res` with it, and opens nothing beside it, so neither `drbdsetup down` nor `cryptsetup close` is needed on the nodes. The volume moves to blockstor's own mapper the next time blockstor takes the replica down itself (deactivate, toggle to diskless or delete), which closes LINSTOR's. Rolling back to LINSTOR before that finds its mapper where it left it.
 
 ## Rollback
 
