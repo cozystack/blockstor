@@ -137,6 +137,11 @@ type drbdsetupStatusResource struct {
 	// recovery-promote self-heal reads it to confirm the local node
 	// is not already Primary before re-arming the auto-primary seed.
 	Role string `json:"role"`
+	// SuspendedUser is the `suspended-user` flag `drbdsetup
+	// suspend-io` sets and `resume-io` clears. SuspendState reads it
+	// so a snapshot's resume is only reported once the kernel agrees.
+	// Pointer so a drbd-utils that omits the key reads as unknown.
+	SuspendedUser *bool `json:"suspended-user"`
 	// Devices is the local per-volume state. The Bug 366
 	// recovery-promote reads `disk-state` to confirm THIS node is
 	// locally UpToDate (a viable SyncSource) before promoting.
