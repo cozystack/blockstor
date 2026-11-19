@@ -127,3 +127,66 @@ func TestAnAcceptedResBodyIsCheckedThenInstalled(t *testing.T) {
 		t.Errorf("candidate still present after install: %v", err)
 	}
 }
+
+// expectXMLHelp makes fx answer drbdsetup xml-help the way drbd-utils
+// does, from the excerpts pkg/drbd keeps in its testdata.
+func expectXMLHelp(t *testing.T, fx *storage.FakeExec) {
+	t.Helper()
+
+	for _, cmd := range drbd.DiskSectionCommands() {
+		doc, err := os.ReadFile(filepath.Join("..", "drbd", "testdata", "xml-help-"+cmd+".xml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fx.Expect("drbdsetup xml-help "+cmd, storage.FakeResponse{Stdout: doc})
+	}
+}
+
+// An adopted definition can carry a disk option this node's drbd-utils
+// does not know, or a value outside its range. drbdadm would refuse the
+// whole .res over it, and with no .res installed the resource is never
+// adjusted. The option is left out instead, as LINSTOR's satellite does,
+// and the rest of the file lands; the volume's own block-size survives.
+func TestADiskOptionDrbdUtilsRejectsIsLeftOutOfTheRes(t *testing.T) {
+	t.Parallel()
+
+	rec, fx, dir := checkedReconciler(t, "pvc-adopted", nil)
+	expectXMLHelp(t, fx)
+
+	dr, devices := renderResFileFixture("pvc-adopted")
+	dr.DrbdOptions["DrbdOptions/Disk/some-future-option"] = "1"
+	dr.DrbdOptions["DrbdOptions/Disk/al-extents"] = "6007"
+
+	volumeOptions := map[string]string{
+		"block-size":             "4096",
+		"rs-discard-granularity": "8M",
+		"another-future-option":  "yes",
+	}
+	dr.Volumes[0].DiskOptions = volumeOptions
+
+	if err := rec.renderResFile(context.Background(), dr, devices); err != nil {
+		t.Fatalf("renderResFile: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "pvc-adopted.res"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, gone := range []string{"some-future-option", "another-future-option", "rs-discard-granularity"} {
+		if strings.Contains(string(body), gone) {
+			t.Errorf(".res still carries %s, which drbdadm would refuse:\n%s", gone, body)
+		}
+	}
+
+	for _, kept := range []string{"block-size 4096;", "al-extents 6007;"} {
+		if !strings.Contains(string(body), kept) {
+			t.Errorf(".res lost %q, which drbdadm accepts:\n%s", kept, body)
+		}
+	}
+
+	if len(volumeOptions) != 3 {
+		t.Errorf("the intent's volume options were edited in place: %v", volumeOptions)
+	}
+}

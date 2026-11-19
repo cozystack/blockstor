@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/cockroachdb/errors"
 
@@ -48,6 +49,11 @@ const drbdmetaNoMinor = "-"
 // storage.FakeExec and assert the exact command lines.
 type Adm struct {
 	exec storage.Exec
+
+	// schemaMu guards diskSchema, the disk-section schema read once from
+	// this node's drbdsetup (DiskOptionSchema).
+	schemaMu   sync.Mutex
+	diskSchema *OptionSchema
 }
 
 // NewAdm constructs an Adm with the given Exec.
@@ -120,6 +126,48 @@ func (a *Adm) CheckResFile(ctx context.Context, candidate, live string) error {
 	}
 
 	return nil
+}
+
+// DiskOptionSchema returns what this node's drbd-utils accepts inside a
+// `disk { }` section, read from `drbdsetup xml-help` for each of
+// DiskSectionCommands, the way LINSTOR's satellite builds its option
+// whitelist when it starts. The answer is kept for the life of the
+// process: drbd-utils ships in the image, so it cannot change under a
+// running satellite.
+//
+// A failure is not kept, so a drbdsetup that could not answer once is
+// asked again on the next render, and it returns a nil schema, which
+// accepts every option: the render then goes ahead unfiltered, as it did
+// before the schema existed, and CheckResFile still stands between a
+// body drbdadm refuses and the live file.
+func (a *Adm) DiskOptionSchema(ctx context.Context) (*OptionSchema, error) {
+	a.schemaMu.Lock()
+	defer a.schemaMu.Unlock()
+
+	if a.diskSchema != nil {
+		return a.diskSchema, nil
+	}
+
+	commands := DiskSectionCommands()
+	docs := make([][]byte, 0, len(commands))
+
+	for _, cmd := range commands {
+		out, err := a.exec.Run(ctx, "drbdsetup", "xml-help", cmd)
+		if err != nil {
+			return nil, errors.Wrapf(err, "drbdsetup xml-help %s", cmd)
+		}
+
+		docs = append(docs, out)
+	}
+
+	schema, err := ParseOptionSchema(docs...)
+	if err != nil {
+		return nil, err
+	}
+
+	a.diskSchema = schema
+
+	return schema, nil
 }
 
 // InvalidateVolume runs `drbdadm invalidate <resource>/<vol>` — marks the

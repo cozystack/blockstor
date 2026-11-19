@@ -2267,9 +2267,14 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 	autoDisk := r.autoDiskOptionsForResource(ctx, dr, devices)
 	autoVolumeDisk := r.autoDiskOptionsForVolumes(ctx, dr, devices)
 
-	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices, autoDisk, autoVolumeDisk)
+	body, dropped, err := buildResFileChecked(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices, autoDisk, autoVolumeDisk, r.diskOptionSchema(ctx))
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
+	}
+
+	for _, why := range dropped {
+		log.FromContext(ctx).Info("disk option left out of .res: this drbd-utils rejects it",
+			"resource", dr.GetName(), "reason", why)
 	}
 
 	// Bug 432: stamp the ownership marker every time we render
@@ -5871,6 +5876,16 @@ func (r *Reconciler) rememberPool(resourceName, pool string) {
 // autoVolumeDisk the per-volume ones (see autoDiskOptionsForVolumes);
 // either may be nil.
 func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string, autoVolumeDisk map[int32]map[string]string) (string, error) {
+	body, _, err := buildResFileChecked(dr, localNode, localAddr, devices, autoDisk, autoVolumeDisk, nil)
+
+	return body, err
+}
+
+// buildResFileChecked is buildResFile with the disk options held against
+// schema, what this node's drbd-utils accepts (see dropRejectedDiskOptions).
+// It also returns why each option it left out was left out. A nil schema
+// keeps every option.
+func buildResFileChecked(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string, autoVolumeDisk map[int32]map[string]string, schema *drbd.OptionSchema) (string, []string, error) {
 	opts := dr.GetDrbdOptions()
 	port, _ := strconv.Atoi(opts["port"])
 	nodeID, _ := strconv.Atoi(opts["node-id"])
@@ -5904,6 +5919,7 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 	sections := splitDRBDOptions(opts)
 	mergeAutoDiskOptions(sections.Disk, autoDisk)
 	mergeAutoVolumeDiskOptions(vols, sections.Disk, autoVolumeDisk)
+	dropped := dropRejectedDiskOptions(schema, sections.Disk, vols)
 
 	out, err := drbd.Build(drbd.Resource{
 		Name:        dr.GetName(),
@@ -5917,10 +5933,82 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 		Connections: buildResConnections(dr, hosts),
 	})
 	if err != nil {
-		return "", errors.Wrap(err, "drbd.Build")
+		return "", nil, errors.Wrap(err, "drbd.Build")
 	}
 
-	return out, nil
+	return out, dropped, nil
+}
+
+// diskOptionSchema is what this node's drbd-utils accepts in a disk
+// section, nil when drbdsetup could not say. nil accepts everything, so
+// a satellite that cannot ask renders what it rendered before.
+func (r *Reconciler) diskOptionSchema(ctx context.Context) *drbd.OptionSchema {
+	if r.cfg.Adm == nil {
+		return nil
+	}
+
+	schema, err := r.cfg.Adm.DiskOptionSchema(ctx)
+	if err != nil {
+		log.FromContext(ctx).Info("disk options rendered unchecked: drbdsetup did not describe them", "err", err.Error())
+
+		return nil
+	}
+
+	return schema
+}
+
+// dropRejectedDiskOptions removes from the resource-scope disk section
+// and from each volume's own one every option schema says this node's
+// drbd-utils rejects, by name or by value, and returns why each went.
+//
+// drbdadm reads every .res on the node for any command, so one option it
+// cannot parse fails the whole file, and CheckResFile then keeps the
+// resource from ever getting a .res. That is the case for an option a
+// LINSTOR cluster stamped from a newer drbd-utils, or a value outside
+// this one's range, on an adopted definition. LINSTOR's satellite drops
+// such an option with a warning and writes the rest
+// (ConfFileBuilder.checkValidDrbdOption); this does the same. A volume's
+// options map is replaced, not edited, since it is the intent's.
+func dropRejectedDiskOptions(schema *drbd.OptionSchema, resourceDisk map[string]string, vols []drbd.Volume) []string {
+	if schema == nil {
+		return nil
+	}
+
+	var dropped []string
+
+	for _, k := range slices.Sorted(maps.Keys(resourceDisk)) {
+		err := schema.Check(k, resourceDisk[k])
+		if err != nil {
+			delete(resourceDisk, k)
+
+			dropped = append(dropped, err.Error())
+		}
+	}
+
+	for i := range vols {
+		var kept map[string]string
+
+		for _, key := range slices.Sorted(maps.Keys(vols[i].Options)) {
+			err := schema.Check(key, vols[i].Options[key])
+			if err == nil {
+				continue
+			}
+
+			if kept == nil {
+				kept = maps.Clone(vols[i].Options)
+			}
+
+			delete(kept, key)
+
+			dropped = append(dropped, fmt.Sprintf("volume %d: %s", vols[i].Number, err.Error()))
+		}
+
+		if kept != nil {
+			vols[i].Options = kept
+		}
+	}
+
+	return dropped
 }
 
 // buildResConnections translates the DesiredResource's logical
