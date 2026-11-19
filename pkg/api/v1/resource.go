@@ -185,6 +185,13 @@ type Volume struct {
 	// to a literal "Created" regardless of what disk_state we set.
 	// listMapKey type matches upstream's repeated layer_data shape.
 	LayerDataList []VolumeLayerData `json:"layer_data_list,omitempty"`
+
+	// AppliedSizeKib is the volume definition size the satellite has
+	// finished applying on this replica (Resource status), 0 when it
+	// never reported one. Internal: LINSTOR has no such field, it is
+	// what the REST layer reads to answer a resize only once the
+	// device has grown.
+	AppliedSizeKib int64 `json:"-"`
 }
 
 // VolumeLayerData mirrors upstream LINSTOR's per-volume layer

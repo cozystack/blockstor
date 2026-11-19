@@ -522,6 +522,21 @@ type ResourceVolumeStatus struct {
 	// +optional
 	DiskState string `json:"diskState,omitempty"`
 
+	// appliedSizeKib is the volume definition size this replica has
+	// finished applying: the satellite writes it after a pass in which
+	// every layer, the backing volume, LUKS and `drbdadm resize`,
+	// succeeded at that size. A grow is complete once every diskful
+	// replica reports the new size here. The last replica to grow its
+	// backing runs its `drbdadm resize` after all the others have
+	// grown theirs, and DRBD commits a resize on every connected peer
+	// before the command returns, so at that point the device has the
+	// new size wherever it is attached. The REST API answers a resize
+	// only then, as LINSTOR does, and the satellite reruns
+	// `drbdadm resize` while this lags the definition. Unset until
+	// the first such pass.
+	// +optional
+	AppliedSizeKib int64 `json:"appliedSizeKib,omitempty"`
+
 	// currentGi is the DRBD-9 current generation identifier reported
 	// by `drbdsetup events2` for this replica's local volume. The
 	// controller reads it when adding a new replica to skip the full

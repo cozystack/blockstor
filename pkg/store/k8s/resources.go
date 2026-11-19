@@ -774,7 +774,8 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 				CurrentGi:    volStatus.CurrentGI,
 				OutOfSyncKib: volStatus.OutOfSyncKib,
 			},
-			LayerDataList: layerDataList,
+			LayerDataList:  layerDataList,
+			AppliedSizeKib: volStatus.AppliedSizeKib,
 		})
 	}
 

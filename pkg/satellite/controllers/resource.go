@@ -735,9 +735,10 @@ func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockst
 	vols := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(results[0].GetVolumes()))
 	for _, v := range results[0].GetVolumes() {
 		vols = append(vols, blockstoriov1alpha1.ResourceVolumeStatus{
-			VolumeNumber: v.GetVolumeNumber(),
-			StoragePool:  pool,
-			DevicePath:   v.GetDevicePath(),
+			VolumeNumber:   v.GetVolumeNumber(),
+			StoragePool:    pool,
+			DevicePath:     v.GetDevicePath(),
+			AppliedSizeKib: v.GetAppliedSizeKib(),
 		})
 	}
 

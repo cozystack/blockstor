@@ -1707,6 +1707,16 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 			resized = true
 		}
 
+		// A grow this replica has not finished: the backing volume may
+		// have grown on an earlier pass whose `drbdadm resize` failed,
+		// or have been large enough already (a LINSTOR volume carries
+		// its metadata on top of the definition size). Either way the
+		// device still has to be resized, and nothing else would ask
+		// for it again.
+		if applied := vol.GetAppliedSizeKib(); applied > 0 && vol.GetSizeKib() > applied {
+			resized = true
+		}
+
 		devices[vol.GetVolumeNumber()] = status.DevicePath
 
 		// zfs-create/udev race: `zfs create -V` returns before udev has
@@ -6216,8 +6226,9 @@ func buildVolumeResults(dr *intent.DesiredResource, devices map[int32]string, di
 
 		for _, vol := range dr.GetVolumes() {
 			out = append(out, &intent.ResourceApplyVolumeResult{
-				VolumeNumber: vol.GetVolumeNumber(),
-				DevicePath:   fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor)),
+				VolumeNumber:   vol.GetVolumeNumber(),
+				DevicePath:     fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor)),
+				AppliedSizeKib: vol.GetSizeKib(),
 			})
 		}
 
@@ -6231,8 +6242,9 @@ func buildVolumeResults(dr *intent.DesiredResource, devices map[int32]string, di
 		}
 
 		out = append(out, &intent.ResourceApplyVolumeResult{
-			VolumeNumber: vol.GetVolumeNumber(),
-			DevicePath:   dev,
+			VolumeNumber:   vol.GetVolumeNumber(),
+			DevicePath:     dev,
+			AppliedSizeKib: vol.GetSizeKib(),
 		})
 	}
 

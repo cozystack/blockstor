@@ -390,6 +390,23 @@ type DesiredVolume struct {
 	// log on a volume with one is a crash to repair with apply-al, not a
 	// foreign superblock to re-initialise over.
 	ObservedGI string
+
+	// AppliedSizeKib is the size this replica last finished applying
+	// (Resource status), 0 when none was reported. While it is below
+	// SizeKib a grow is still pending here: the satellite runs
+	// `drbdadm resize` again even if the backing volume needs no
+	// growing on this pass, so a resize that failed after the backing
+	// grew is retried rather than forgotten.
+	AppliedSizeKib int64
+}
+
+// GetAppliedSizeKib returns the size last applied on this replica, or 0.
+func (x *DesiredVolume) GetAppliedSizeKib() int64 {
+	if x == nil {
+		return 0
+	}
+
+	return x.AppliedSizeKib
 }
 
 // GetObservedGI returns the GI last reported for this volume, or "".
@@ -494,6 +511,19 @@ type ResourceApplyResult struct {
 type ResourceApplyVolumeResult struct {
 	VolumeNumber int32
 	DevicePath   string
+
+	// AppliedSizeKib is the volume definition size this pass applied
+	// through every layer. Set only on a pass that succeeded.
+	AppliedSizeKib int64
+}
+
+// GetAppliedSizeKib returns the size this pass applied, or 0.
+func (v *ResourceApplyVolumeResult) GetAppliedSizeKib() int64 {
+	if v == nil {
+		return 0
+	}
+
+	return v.AppliedSizeKib
 }
 
 // GetVolumes returns the per-volume slice — nil-safe.

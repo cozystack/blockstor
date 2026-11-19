@@ -47,6 +47,8 @@ func TestVolumesFromStatus(t *testing.T) {
 			UsableKib:    1024,
 			DiskState:    "UpToDate",
 			CurrentGI:    "1234ABCD",
+
+			AppliedSizeKib: 1024,
 		},
 		{
 			VolumeNumber: 1,
@@ -66,6 +68,12 @@ func TestVolumesFromStatus(t *testing.T) {
 
 	if got[0].State.CurrentGi != "1234ABCD" {
 		t.Errorf("vol[0] CurrentGI: got %q, want 1234ABCD", got[0].State.CurrentGi)
+	}
+
+	// The REST layer reads the applied size to answer a resize only
+	// once the replicas have grown.
+	if got[0].AppliedSizeKib != 1024 {
+		t.Errorf("vol[0] AppliedSizeKib: got %d, want 1024", got[0].AppliedSizeKib)
 	}
 
 	if got[1].VolumeNumber != 1 || got[1].State.DiskState != "Inconsistent" {
