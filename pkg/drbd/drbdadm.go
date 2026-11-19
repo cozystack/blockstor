@@ -103,6 +103,25 @@ func (a *Adm) Adjust(ctx context.Context, resource string) error {
 	return a.run(ctx, "adjust", resource)
 }
 
+// CheckResFile asks drbdadm whether the node's configuration still parses
+// with candidate in place of live: `drbdadm --config-to-test <candidate>
+// --config-to-exclude <live> sh-nop`. The check LINSTOR's satellite runs
+// before it installs a .res (DrbdAdm.checkResFile).
+//
+// It matters beyond the one resource because drbdadm reads every .res
+// on the node for any command. A file it cannot parse stops adjust,
+// dump-md and every other drbdadm call for all resources there, not just
+// its own, so it has to be caught before it lands under its real name.
+// live need not exist: a resource's first .res excludes nothing.
+func (a *Adm) CheckResFile(ctx context.Context, candidate, live string) error {
+	_, err := a.exec.Run(ctx, "drbdadm", "--config-to-test", candidate, "--config-to-exclude", live, "sh-nop")
+	if err != nil {
+		return errors.Wrapf(err, "drbdadm refuses %s", candidate)
+	}
+
+	return nil
+}
+
 // InvalidateVolume runs `drbdadm invalidate <resource>/<vol>` — marks the
 // LOCAL copy of ONE volume as out-of-sync and forces a full SyncTarget of
 // that volume from an UpToDate peer. The per-volume target (`<res>/<vol>`)

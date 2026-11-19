@@ -2292,7 +2292,43 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 		return nil
 	}
 
-	return errors.Wrapf(os.WriteFile(resPath, []byte(body), resFilePerm), "write %s", resPath)
+	return r.installResFile(ctx, resPath, body)
+}
+
+// resFileCandidateSuffix names the file a new .res body is checked in
+// before it replaces the live one. It must not end in .res: drbd.conf
+// includes drbd.d/*.res, and a candidate that matched would be parsed as
+// a second definition of the resource by every drbdadm call on the node.
+const resFileCandidateSuffix = ".res.tmp"
+
+// installResFile puts body at resPath only once drbdadm accepts it.
+//
+// drbdadm parses every .res on the node for any command, so a body it
+// cannot read, such as an option this drbd-utils does not know, would
+// stop adjust and dump-md for every resource here the moment it landed,
+// not just for its own. The body is written beside the live file under a
+// name drbdadm does not include, checked with the live file excluded,
+// and renamed into place, so a refused body leaves the previous .res,
+// and every other resource, as it was. The refusal is this resource's
+// error to report.
+func (r *Reconciler) installResFile(ctx context.Context, resPath, body string) error {
+	candidate := strings.TrimSuffix(resPath, ".res") + resFileCandidateSuffix
+
+	err := os.WriteFile(candidate, []byte(body), resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "write %s", candidate)
+	}
+
+	if r.cfg.Adm != nil {
+		err = r.cfg.Adm.CheckResFile(ctx, candidate, resPath)
+		if err != nil {
+			_ = os.Remove(candidate)
+
+			return errors.Wrapf(err, "new .res for %s not installed", filepath.Base(resPath))
+		}
+	}
+
+	return errors.Wrapf(os.Rename(candidate, resPath), "install %s", resPath)
 }
 
 // applyDRBD renders the .res file from dr's metadata and (re)applies
