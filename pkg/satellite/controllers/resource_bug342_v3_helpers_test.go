@@ -118,3 +118,67 @@ func TestVolNumsOf_EmptyIsEmpty(t *testing.T) {
 		t.Errorf("expected empty, got %v", got)
 	}
 }
+
+// TestPeerExpectationFor_PartialAndCompleteSets pins what the prune is
+// told about an RD's peers. A diskful peer without a node-id keeps the
+// set unallocated; a diskless one does not, as in the allocation gate.
+// Every node-id an observed replica holds is reported, so a peer slot
+// still holding one is never taken for stale.
+func TestPeerExpectationFor_PartialAndCompleteSets(t *testing.T) {
+	t.Parallel()
+
+	id := func(v int32) *int32 { return &v }
+
+	target := blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-worker-0"},
+		Spec:       blockstoriov1alpha1.ResourceSpec{NodeName: "worker-0", DRBDNodeID: id(0)},
+	}
+	allocated := blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-worker-1"},
+		Spec:       blockstoriov1alpha1.ResourceSpec{NodeName: "worker-1"},
+		Status:     blockstoriov1alpha1.ResourceStatus{DRBDNodeID: id(1)},
+	}
+	pending := blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-worker-2"},
+		Spec:       blockstoriov1alpha1.ResourceSpec{NodeName: "worker-2"},
+	}
+	pendingDiskless := blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-worker-3"},
+		Spec:       blockstoriov1alpha1.ResourceSpec{NodeName: "worker-3", Flags: []string{"DISKLESS"}},
+	}
+
+	cases := []struct {
+		name      string
+		peers     []blockstoriov1alpha1.Resource
+		allocated bool
+		names     []string
+	}{
+		{"diskful peer pending", []blockstoriov1alpha1.Resource{target, allocated, pending}, false, []string{"worker-1", "worker-2"}},
+		{"only diskless pending", []blockstoriov1alpha1.Resource{target, allocated, pendingDiskless}, true, []string{"worker-1", "worker-3"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := peerExpectationFor(&target, tc.peers)
+
+			if got.Allocated != tc.allocated {
+				t.Errorf("Allocated = %v, want %v", got.Allocated, tc.allocated)
+			}
+
+			names := slices.Clone(got.PeerNames)
+			slices.Sort(names)
+
+			if !slices.Equal(names, tc.names) {
+				t.Errorf("PeerNames = %v, want %v", names, tc.names)
+			}
+
+			for _, want := range []int32{0, 1} {
+				if !slices.Contains(got.AllocatedNodeIDs, want) {
+					t.Errorf("AllocatedNodeIDs = %v, missing %d", got.AllocatedNodeIDs, want)
+				}
+			}
+		})
+	}
+}

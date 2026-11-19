@@ -51,6 +51,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/satellite"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -578,7 +579,7 @@ func (r *ResourceReconciler) prepareDRBDApply(
 	pruneErr := r.Config.Apply.PruneStaleKernelSlots(
 		ctx,
 		rd.Name,
-		expectedPeerNamesFor(res, peers),
+		peerExpectationFor(res, peers),
 		volNumsOf(rd),
 		nil, // devices unknown at this layer; forget-peer skipped per-vol
 	)
@@ -1292,6 +1293,25 @@ func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blocksto
 	}
 
 	return out
+}
+
+// peerExpectationFor is what the prune may rely on about the RD's
+// peers: the observed peer names, the node-ids the observed replicas
+// hold, and whether they pass the same allocation gate the apply path
+// waits on. peers comes from listPeerResources and includes the target.
+func peerExpectationFor(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) satellite.PeerExpectation {
+	expect := satellite.PeerExpectation{
+		PeerNames: expectedPeerNamesFor(target, peers),
+		Allocated: dispatcher.DiskfulPeersAllocated(target, peers),
+	}
+
+	for i := range peers {
+		if id, ok := dispatcher.AllocatedNodeID(&peers[i]); ok {
+			expect.AllocatedNodeIDs = append(expect.AllocatedNodeIDs, id)
+		}
+	}
+
+	return expect
 }
 
 // volNumsOf extracts the volume-number set from
