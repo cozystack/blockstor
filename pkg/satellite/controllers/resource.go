@@ -284,7 +284,8 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				),
 			)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueLocalSiblings))).
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueLocalSiblings)),
+			builder.WithPredicates(siblingWatchPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueResourcesForRD))).
 		Named("satellite-resource").
@@ -389,6 +390,82 @@ func primaryWatchPredicate() predicate.Predicate {
 			return false
 		},
 	}
+}
+
+// siblingWatchPredicate filters the events of other nodes' Resources
+// before enqueueLocalSiblings maps them onto this node's replica of
+// the same definition. It passes only what the local apply reads off
+// a peer: its spec (generation), its deletion, the allocator stamp,
+// and the per-volume disk state and current GI the day0 seed and the
+// auto-primary election consult (dispatcher.anyDiskfulPeerHasData).
+//
+// The peer's connections, role, in-use flag, out-of-sync counters and
+// conditions are dropped. Each peer's observer rewrites them on every
+// kernel frame, and every such write used to re-queue this node's
+// replica at normal priority: on a node holding a hundred replicas the
+// queue never drained, and a newly created Resource waited minutes
+// behind replicas with nothing to do. This node's own kernel view of
+// a peer reaches the reconciler through the observer-trigger channel.
+func siblingWatchPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(_ event.CreateEvent) bool { return true },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
+		GenericFunc: func(_ event.GenericEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldR, ok1 := e.ObjectOld.(*blockstoriov1alpha1.Resource)
+			newR, ok2 := e.ObjectNew.(*blockstoriov1alpha1.Resource)
+
+			if !ok1 || !ok2 {
+				return true
+			}
+
+			return siblingChangeAffectsApply(oldR, newR)
+		},
+	}
+}
+
+// siblingChangeAffectsApply reports whether an update of a peer
+// Resource changes anything the local apply derives from that peer.
+func siblingChangeAffectsApply(oldR, newR *blockstoriov1alpha1.Resource) bool {
+	if oldR.Generation != newR.Generation {
+		return true
+	}
+
+	if (oldR.DeletionTimestamp == nil) != (newR.DeletionTimestamp == nil) {
+		return true
+	}
+
+	if !int32PtrEqual(oldR.Status.DRBDNodeID, newR.Status.DRBDNodeID) ||
+		!int32PtrEqual(oldR.Status.DRBDPort, newR.Status.DRBDPort) ||
+		!int32PtrEqual(oldR.Status.DRBDMinor, newR.Status.DRBDMinor) {
+		return true
+	}
+
+	return !sameVolumeDataState(oldR.Status.Volumes, newR.Status.Volumes)
+}
+
+// sameVolumeDataState compares the per-volume disk state and current
+// GI of two Status.Volumes lists, keyed by volume number.
+func sameVolumeDataState(left, right []blockstoriov1alpha1.ResourceVolumeStatus) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	type dataState struct{ disk, gi string }
+
+	byNumber := make(map[int32]dataState, len(left))
+	for i := range left {
+		byNumber[left[i].VolumeNumber] = dataState{left[i].DiskState, left[i].CurrentGI}
+	}
+
+	for i := range right {
+		prev, ok := byNumber[right[i].VolumeNumber]
+		if !ok || prev != (dataState{right[i].DiskState, right[i].CurrentGI}) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // int32PtrEqual returns true when two *int32 pointers describe the
