@@ -251,20 +251,25 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 		return ctrl.Result{}, r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
 	}
 
-	windows := r.windowsFor()
-	if windows.get(snap.Name) != nil {
+	if r.windowsFor().get(snap.Name) != nil {
 		// Suspended on an earlier pass whose ack stamp did not land.
 		return ctrl.Result{}, r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
 	}
 
-	if windows.resourceBusy(naming.Key(snap.Spec.ResourceDefinitionName), snap.Name) {
-		// Another snapshot of the same resource holds a window; its
-		// resume would end ours. Nothing is suspended for this one yet.
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+	if r.windowEnded(snap.Name) {
+		return r.refuseReopen(ctx, snap)
 	}
 
 	err = r.openWindow(ctx, snap)
-	if err != nil {
+
+	switch {
+	case errors.Is(err, errResourceBusy):
+		// Another suspend holds the resource; its resume would end
+		// ours. Nothing is suspended for this one yet.
+		return ctrl.Result{RequeueAfter: snapshotBusyRetry}, nil
+	case errors.Is(err, errSatelliteStopping):
+		return ctrl.Result{}, err
+	case err != nil:
 		log.FromContext(ctx).Info("SuspendResource failed",
 			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
 
@@ -278,6 +283,32 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 	// Don't fall through: wait for the controller to flip
 	// Spec.TakeSnapshot once every node has acked.
 	return ctrl.Result{}, r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
+}
+
+// refuseReopen answers a suspend request for a snapshot whose window on
+// this node is already over. The Snapshot can still ask for it when the
+// stamp that ended the window did not land, as when the API is cut off
+// at the deadline; suspending again would freeze I/O for another full
+// window, and again after that, for as long as the stamps fail. The
+// node fails the snapshot instead, unless its take already succeeded.
+func (r *SnapshotReconciler) refuseReopen(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
+		return ctrl.Result{}, nil
+	}
+
+	if marker, ok := r.readMarker(snap.Name); ok {
+		err := r.resumeLeftover(ctx, &marker)
+		if err != nil {
+			log.FromContext(ctx).Info("settle an ended suspend window; retrying",
+				"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+
+			return ctrl.Result{RequeueAfter: snapshotResumeRetry}, nil
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
 }
 
 // needsWindow reports whether snap's resource has a DRBD layer on this
@@ -851,13 +882,12 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	}
 
 	// Close this node's window before the snapshot goes: a deleted CR
-	// is the one signal the watchdog cannot read back. A take still
-	// running would recreate the snapshot after the delete, so wait it out.
+	// is the one signal the watchdog cannot read back. The resume does
+	// not wait for the take; the delete does. A take still running,
+	// even one whose window the watchdog already closed, would create
+	// the storage snapshot after the delete, and nothing would remove
+	// it once the finalizer is gone.
 	if w := r.windowsFor().get(snap.Name); w != nil {
-		if r.takeInFlight(snap.Name) {
-			return ctrl.Result{RequeueAfter: snapshotResumeRetry}, nil
-		}
-
 		err := r.closeWindow(ctx, snap.Name, false, "")
 		if err != nil {
 			log.FromContext(ctx).Info("resume before delete not confirmed; the watchdog retries it",
@@ -869,6 +899,10 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 			log.FromContext(ctx).Info("resume before delete not confirmed; the watchdog retries it",
 				"snapshot", snap.Spec.SnapshotName, "error", err.Error())
 		}
+	}
+
+	if r.takeInFlight(snap.Name) {
+		return ctrl.Result{RequeueAfter: snapshotResumeRetry}, nil
 	}
 
 	req := &intent.DeleteSnapshotRequest{

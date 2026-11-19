@@ -22,9 +22,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -53,9 +55,13 @@ const (
 	windowTestMinor    = 1000
 )
 
-var errFakeResume = errors.New("resume-io: device busy")
+var (
+	errFakeResume      = errors.New("resume-io: device busy")
+	errNoSuchResource  = errors.New("No such resource")
+	errNotInYourConfig = errors.New("not defined in your config")
+)
 
-// fakeKernel is a DRBD kernel and a shell in one. It keeps the
+// fakeKernel is a DRBD kernel and a shell in one. It keeps each
 // resource's suspended-user flag the way the kernel does, and it makes
 // every command that writes back to a suspended device wait for the
 // resume, which is what deadlocked a global sync on the Primary. Such a
@@ -63,9 +69,9 @@ var errFakeResume = errors.New("resume-io: device busy")
 type fakeKernel struct {
 	mu sync.Mutex
 
-	calls     []string
-	suspended bool
-	role      string
+	calls []string
+	res   map[string]*fakeKernelResource
+	role  string
 
 	// blockedWhileSuspended counts writeback commands issued while the
 	// device was suspended.
@@ -76,9 +82,26 @@ type fakeKernel struct {
 	resumeIgnored bool
 	// resFileGone makes drbdadm fail as it does once the .res is gone.
 	resFileGone bool
+	// suspendLandsLate makes suspend-io fail at once, as one killed at
+	// its timeout does, and the suspend reach the kernel this much later.
+	suspendLandsLate  time.Duration
+	lateSuspendLanded bool
+	// resumeHang makes resume-io of these resources wait for its context.
+	resumeHang map[string]bool
 }
 
-func newFakeKernel() *fakeKernel { return &fakeKernel{role: "Primary"} }
+type fakeKernelResource struct {
+	suspended bool
+	minors    []int32
+}
+
+func newFakeKernel() *fakeKernel {
+	return &fakeKernel{
+		role:       "Primary",
+		res:        map[string]*fakeKernelResource{windowTestResource: {minors: []int32{windowTestMinor}}},
+		resumeHang: map[string]bool{},
+	}
+}
 
 func (k *fakeKernel) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return k.RunWithStdin(ctx, nil, name, args...)
@@ -89,12 +112,11 @@ func (k *fakeKernel) RunWithStdin(ctx context.Context, _ io.Reader, name string,
 
 	k.mu.Lock()
 	k.calls = append(k.calls, line)
-	suspended := k.suspended
 	k.mu.Unlock()
 
 	switch {
 	case name == "sync" || strings.HasPrefix(line, "blockdev --flushbufs "):
-		if suspended {
+		if k.writebackBlocked(line) {
 			k.mu.Lock()
 			k.blockedWhileSuspended++
 			k.mu.Unlock()
@@ -105,29 +127,155 @@ func (k *fakeKernel) RunWithStdin(ctx context.Context, _ io.Reader, name string,
 		}
 
 		return nil, nil
-	case line == "drbdadm suspend-io "+windowTestResource:
-		k.set(func() { k.suspended = true })
+	case line == "drbdsetup status --json":
+		return k.status(""), nil
+	}
 
-		return nil, nil
-	case line == "drbdadm resume-io "+windowTestResource && k.resFileGone:
-		return nil, errors.New("'pvc-1' not defined in your config")
-	case line == "drbdadm resume-io "+windowTestResource,
-		line == fmt.Sprintf("drbdsetup resume-io %d", windowTestMinor):
-		return nil, k.resume()
-	case line == "drbdsetup status "+windowTestResource+" --json":
-		k.mu.Lock()
-		defer k.mu.Unlock()
+	switch {
+	case len(args) == 2 && name == "drbdadm" && args[0] == "suspend-io":
+		return nil, k.suspend(args[1])
+	case len(args) == 2 && name == "drbdadm" && args[0] == "resume-io":
+		if k.resFileGone {
+			return nil, errors.Wrapf(errNotInYourConfig, "'%s'", args[1])
+		}
 
-		return fmt.Appendf(nil, `[{"name":%q,"role":%q,"suspended-user":%t,"devices":[{"volume":0,"minor":%d}]}]`,
-			windowTestResource, k.role, k.suspended, windowTestMinor), nil
+		return nil, k.resume(ctx, args[1])
+	case len(args) == 2 && name == "drbdsetup" && args[0] == "resume-io":
+		return nil, k.resume(ctx, k.byMinor(args[1]))
+	case len(args) == 3 && name == "drbdsetup" && args[0] == "status" && args[2] == "--json":
+		out := k.status(args[1])
+		if out == nil {
+			return nil, errors.Wrap(errNoSuchResource, args[1])
+		}
+
+		return out, nil
 	}
 
 	return nil, nil
 }
 
-func (k *fakeKernel) resume() error {
+// addResource loads another resource into the kernel.
+func (k *fakeKernel) addResource(name string, minors ...int32) {
+	k.set(func() { k.res[name] = &fakeKernelResource{minors: minors} })
+}
+
+// writebackBlocked reports whether a writeback command targets a
+// suspended device: a global sync targets every device, a flush the
+// one it names.
+func (k *fakeKernel) writebackBlocked(line string) bool {
+	device, isFlush := strings.CutPrefix(line, "blockdev --flushbufs ")
+	owner := ""
+
+	if minor, ok := strings.CutPrefix(device, "/dev/drbd"); ok && isFlush {
+		owner = k.byMinor(minor)
+	}
+
 	k.mu.Lock()
 	defer k.mu.Unlock()
+
+	for name, r := range k.res {
+		if !r.suspended {
+			continue
+		}
+
+		if !isFlush || name == owner || strings.Contains(device, "/"+name+"_") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// status renders `drbdsetup status --json` for one resource, or for
+// every resource when name is empty; nil when name is not loaded.
+func (k *fakeKernel) status(name string) []byte {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	names := slices.Sorted(maps.Keys(k.res))
+	if name != "" {
+		if k.res[name] == nil {
+			return nil
+		}
+
+		names = []string{name}
+	}
+
+	entries := make([]string, 0, len(names))
+
+	for _, n := range names {
+		r := k.res[n]
+
+		devices := make([]string, 0, len(r.minors))
+		for vol, minor := range r.minors {
+			devices = append(devices, fmt.Sprintf(`{"volume":%d,"minor":%d}`, vol, minor))
+		}
+
+		entries = append(entries, fmt.Sprintf(`{"name":%q,"role":%q,"suspended-user":%t,"devices":[%s]}`,
+			n, k.role, r.suspended, strings.Join(devices, ",")))
+	}
+
+	return []byte("[" + strings.Join(entries, ",") + "]")
+}
+
+func (k *fakeKernel) byMinor(minor string) string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	for name, r := range k.res {
+		for _, m := range r.minors {
+			if strconv.Itoa(int(m)) == minor {
+				return name
+			}
+		}
+	}
+
+	return ""
+}
+
+func (k *fakeKernel) suspend(name string) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	r := k.res[name]
+	if r == nil {
+		return errors.Wrap(errNoSuchResource, name)
+	}
+
+	if k.suspendLandsLate > 0 {
+		time.AfterFunc(k.suspendLandsLate, func() {
+			k.set(func() {
+				r.suspended = true
+				k.lateSuspendLanded = true
+			})
+		})
+
+		return errors.New("drbdadm suspend-io: signal: killed")
+	}
+
+	r.suspended = true
+
+	return nil
+}
+
+func (k *fakeKernel) resume(ctx context.Context, name string) error {
+	k.mu.Lock()
+	hang := k.resumeHang[name]
+	k.mu.Unlock()
+
+	if hang {
+		<-ctx.Done()
+
+		return errors.Wrap(ctx.Err(), "resume-io")
+	}
+
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	r := k.res[name]
+	if r == nil {
+		return errors.Wrap(errNoSuchResource, name)
+	}
 
 	if k.resumeFailures > 0 {
 		k.resumeFailures--
@@ -136,7 +284,7 @@ func (k *fakeKernel) resume() error {
 	}
 
 	if !k.resumeIgnored {
-		k.suspended = false
+		r.suspended = false
 	}
 
 	return nil
@@ -149,11 +297,31 @@ func (k *fakeKernel) set(fn func()) {
 	fn()
 }
 
-func (k *fakeKernel) isSuspended() bool {
+func (k *fakeKernel) isSuspended() bool { return k.resourceSuspended(windowTestResource) }
+
+func (k *fakeKernel) resourceSuspended(name string) bool {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 
-	return k.suspended
+	return k.res[name] != nil && k.res[name].suspended
+}
+
+// suspendResource suspends name behind the satellite's back, as an
+// older satellite or an operator would.
+func (k *fakeKernel) suspendResource(name string) {
+	k.set(func() { k.res[name].suspended = true })
+}
+
+func (k *fakeKernel) count(cmd string) int {
+	n := 0
+
+	for _, c := range k.commands() {
+		if c == cmd {
+			n++
+		}
+	}
+
+	return n
 }
 
 func (k *fakeKernel) blocked() int {
@@ -181,6 +349,7 @@ type fakeProvider struct {
 	takeSuspended []bool
 	takeErr       error
 	hang          chan struct{}
+	deletes       int
 }
 
 func (*fakeProvider) Kind() string { return "ZFS_THIN" }
@@ -211,13 +380,27 @@ func (p *fakeProvider) CreateSnapshot(context.Context, storage.Snapshot) error {
 	return err
 }
 
-func (*fakeProvider) DeleteSnapshot(context.Context, storage.Snapshot) error { return nil }
+func (p *fakeProvider) DeleteSnapshot(context.Context, storage.Snapshot) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.deletes++
+
+	return nil
+}
 
 func (*fakeProvider) RestoreVolumeFromSnapshot(context.Context, storage.Volume, storage.Snapshot) error {
 	return nil
 }
 
 func (*fakeProvider) ListVolumeNames(context.Context) ([]storage.VolumeRef, error) { return nil, nil }
+
+func (p *fakeProvider) deleteCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.deletes
+}
 
 func (p *fakeProvider) takeCount() int {
 	p.mu.Lock()
@@ -260,19 +443,9 @@ func newWindowRigIn(t *testing.T, stateDir string, kernel *fakeKernel, cli clien
 			t.Fatal(err)
 		}
 
-		snap := &blockstoriov1alpha1.Snapshot{
-			ObjectMeta: metav1.ObjectMeta{Name: windowTestSnapshot, Finalizers: []string{SatelliteSnapshotFinalizer}},
-			Spec: blockstoriov1alpha1.SnapshotSpec{
-				ResourceDefinitionName: windowTestResource,
-				SnapshotName:           "snap-1",
-				Nodes:                  []string{"n1"},
-				SuspendIO:              true,
-				VolumeDefinitions:      []blockstoriov1alpha1.SnapshotVolumeRef{{VolumeNumber: 0}},
-			},
-		}
-
 		cli = fake.NewClientBuilder().WithScheme(scheme).
-			WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).WithObjects(snap).Build()
+			WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+			WithObjects(windowSnapshot(windowTestSnapshot, windowTestResource)).Build()
 	}
 
 	provider := &fakeProvider{kernel: kernel}
@@ -304,6 +477,7 @@ func newWindowRigIn(t *testing.T, stateDir string, kernel *fakeKernel, cli clien
 				windowDeadline: 2 * time.Second,
 				watchdogTick:   10 * time.Millisecond,
 				commandTimeout: 500 * time.Millisecond,
+				unownedSweep:   20 * time.Millisecond,
 			},
 		},
 		cli:      cli,
@@ -315,13 +489,64 @@ func newWindowRigIn(t *testing.T, stateDir string, kernel *fakeKernel, cli clien
 	}
 }
 
+// windowSnapshot is a Snapshot CR of resource in Phase 1 on n1.
+func windowSnapshot(name, resource string) *blockstoriov1alpha1.Snapshot {
+	return &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Finalizers: []string{SatelliteSnapshotFinalizer}},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: resource,
+			SnapshotName:           strings.TrimPrefix(name, resource+"."),
+			Nodes:                  []string{"n1"},
+			SuspendIO:              true,
+			VolumeDefinitions:      []blockstoriov1alpha1.SnapshotVolumeRef{{VolumeNumber: 0}},
+		},
+	}
+}
+
+// addResource loads another resource on the satellite and in the
+// kernel, and a Snapshot of it named snapshot.
+func (rig *windowRig) addResource(resource string, minor int32, snapshot string) {
+	rig.t.Helper()
+
+	rig.kernel.addResource(resource, minor)
+
+	_, err := rig.apply.Apply(rig.t.Context(), []*intent.DesiredResource{{
+		Name: resource, NodeName: "n1", LayerStack: []string{"STORAGE"},
+		Volumes: []*intent.DesiredVolume{{VolumeNumber: 0, SizeKib: 1024, StoragePool: "pool"}},
+	}})
+	if err != nil {
+		rig.t.Fatalf("seed resource %s: %v", resource, err)
+	}
+
+	if snapshot != "" {
+		rig.create(windowSnapshot(snapshot, resource))
+	}
+}
+
+func (rig *windowRig) create(obj client.Object) {
+	rig.t.Helper()
+
+	err := rig.cli.Create(context.Background(), obj)
+	if err != nil {
+		rig.t.Fatalf("create %s: %v", obj.GetName(), err)
+	}
+}
+
 func (rig *windowRig) reconcile() {
 	rig.t.Helper()
 
-	_, err := rig.r.Reconcile(rig.t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: windowTestSnapshot}})
+	rig.reconcileName(windowTestSnapshot)
+}
+
+func (rig *windowRig) reconcileName(name string) ctrl.Result {
+	rig.t.Helper()
+
+	res, err := rig.r.Reconcile(rig.t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name}})
 	if err != nil {
-		rig.t.Fatalf("Reconcile: %v", err)
+		rig.t.Fatalf("Reconcile %s: %v", name, err)
 	}
+
+	return res
 }
 
 // startWatchdog runs the watchdog until the returned stop is called.
@@ -365,11 +590,23 @@ func (rig *windowRig) snapshot() blockstoriov1alpha1.Snapshot {
 func (rig *windowRig) controllerSets(suspendIO, takeSnapshot bool) {
 	rig.t.Helper()
 
-	snap := rig.snapshot()
+	rig.controllerSetsOn(windowTestSnapshot, suspendIO, takeSnapshot)
+}
+
+func (rig *windowRig) controllerSetsOn(name string, suspendIO, takeSnapshot bool) {
+	rig.t.Helper()
+
+	var snap blockstoriov1alpha1.Snapshot
+
+	err := rig.cli.Get(context.Background(), types.NamespacedName{Name: name}, &snap)
+	if err != nil {
+		rig.t.Fatalf("get snapshot %s: %v", name, err)
+	}
+
 	snap.Spec.SuspendIO = suspendIO
 	snap.Spec.TakeSnapshot = takeSnapshot
 
-	err := rig.cli.Update(context.Background(), &snap)
+	err = rig.cli.Update(context.Background(), &snap)
 	if err != nil {
 		rig.t.Fatalf("update snapshot spec: %v", err)
 	}
