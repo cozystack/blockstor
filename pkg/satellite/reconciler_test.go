@@ -60,7 +60,7 @@ func TestApplyCreatesVolumeViaProvider(t *testing.T) {
 	}
 
 	if !slices.Contains(fx.CommandLines(),
-		"lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 vg/tp") {
+		"lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 --addtag blockstor-owned vg/tp") {
 		t.Errorf("expected lvcreate; got %v", fx.CommandLines())
 	}
 }

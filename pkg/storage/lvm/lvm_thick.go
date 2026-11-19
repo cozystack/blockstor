@@ -86,7 +86,7 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	}
 
 	if names[final] {
-		return nil
+		return ensureOwnerTag(ctx, t.exec, t.cfg.VolumeGroup, final)
 	}
 
 	if names[fresh] {
@@ -105,9 +105,12 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	// `--config` as the device filter (ArgsUdevless) — a separate
 	// `--config activation{…}` would be a repeated `--config`, which
 	// the LVM CLI rejects.
+	// The tag rides on the lvcreate and survives the rename, so no LV
+	// of blockstor's ever exists without it.
 	_, err = t.exec.Run(ctx, "lvcreate",
 		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			"--name", fresh,
+			"--addtag", OwnerTag,
 			"-Wn", "-Zn",
 			t.cfg.VolumeGroup)...)
 	if err != nil {
@@ -193,6 +196,16 @@ func (t *Thick) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.V
 // orphan-storage sweeper (Bug 43) — see Thin.ListVolumeNames doc.
 func (t *Thick) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
 	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
+}
+
+// InspectVolume implements storage.OrphanReaper.
+func (t *Thick) InspectVolume(ctx context.Context, vol storage.Volume) (storage.VolumeOwnership, error) {
+	return inspectLV(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
+}
+
+// ReapVolume implements storage.OrphanReaper.
+func (t *Thick) ReapVolume(ctx context.Context, vol storage.Volume) error {
+	return reapLV(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
 }
 
 // PoolStatus reports the VG's free/total capacity. Bug 270: bounded
@@ -325,6 +338,11 @@ func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vo
 	srcName := snapshotLVName(src)
 
 	if t.lvExists(ctx, tgtName) {
+		err := ensureOwnerTag(ctx, t.exec, t.cfg.VolumeGroup, tgtName)
+		if err != nil {
+			return err
+		}
+
 		// Bug 257: idempotent-skip is conditional on the sentinel
 		// being absent. Present → previous run crashed mid-dd; re-run
 		// just the dd + deltag steps (lvcreate is skipped since the LV
@@ -367,6 +385,7 @@ func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vo
 		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			"--name", tgtName,
 			"--addtag", RestoreIncompleteTag,
+			"--addtag", OwnerTag,
 			"-Wn", "-Zn",
 			t.cfg.VolumeGroup)...)
 	if err != nil {

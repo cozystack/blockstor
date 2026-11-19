@@ -81,7 +81,7 @@ func snapshotLVName(snap storage.Snapshot) string {
 // path which Phase 4 introduces.
 func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	if t.lvExists(ctx, volumeLVName(vol)) {
-		return nil
+		return ensureOwnerTag(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
 	}
 
 	// LINSTOR rounds to MiB internally; we follow.
@@ -91,6 +91,7 @@ func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 		Args("--thin",
 			"--virtualsize", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			"--name", volumeLVName(vol),
+			"--addtag", OwnerTag,
 			t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)...)
 	if err != nil {
 		return errors.Wrapf(err, "lvcreate %s", volumeLVName(vol))
@@ -247,7 +248,7 @@ func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error 
 func (t *Thin) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
 	tgtName := volumeLVName(target)
 	if t.lvExists(ctx, tgtName) {
-		return nil
+		return ensureOwnerTag(ctx, t.exec, t.cfg.VolumeGroup, tgtName)
 	}
 
 	srcName := snapshotLVName(src)
@@ -260,6 +261,7 @@ func (t *Thin) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vol
 			"--setactivationskip", "n",
 			"--activate", "y",
 			"--name", tgtName,
+			"--addtag", OwnerTag,
 			t.cfg.VolumeGroup+"/"+srcName)...)
 	if err != nil {
 		return errors.Wrapf(err, "lvcreate -s %s → %s", srcName, tgtName)
@@ -350,6 +352,11 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 	tgtName := volumeLVName(target)
 
 	if t.lvExists(ctx, tgtName) {
+		err := ensureOwnerTag(ctx, t.exec, t.cfg.VolumeGroup, tgtName)
+		if err != nil {
+			return err
+		}
+
 		// Bug 257: idempotent-skip is conditional on the sentinel
 		// being absent. Present → previous run crashed mid-dd; re-run
 		// just the dd + deltag steps (lvcreate is skipped — the LV is
@@ -372,6 +379,7 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 			"--virtualsize", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			"--name", tgtName,
 			"--addtag", RestoreIncompleteTag,
+			"--addtag", OwnerTag,
 			t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)...)
 	if err != nil {
 		return errors.Wrapf(err, "pre-create LV %s for recv", tgtName)
@@ -401,6 +409,16 @@ func (t *Thin) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error)
 	defer cancel()
 
 	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
+}
+
+// InspectVolume implements storage.OrphanReaper.
+func (t *Thin) InspectVolume(ctx context.Context, vol storage.Volume) (storage.VolumeOwnership, error) {
+	return inspectLV(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
+}
+
+// ReapVolume implements storage.OrphanReaper.
+func (t *Thin) ReapVolume(ctx context.Context, vol storage.Volume) error {
+	return reapLV(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
 }
 
 // ddRecvAndClearSentinel runs the dd byte-copy from src into the
