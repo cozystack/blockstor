@@ -304,6 +304,12 @@ type Reconciler struct {
 	// recovery by `grace` (default 30s).
 	seenStuckAt map[string]time.Time
 
+	// adoptionHeldSince records, per resource name, when this node first
+	// held the first render of an adopted kernel slot because a peer it
+	// is connected to has no Resource yet (AdoptedPeersWithoutResource).
+	// Process memory only: a restart restarts the wait.
+	adoptionHeldSince map[string]time.Time
+
 	// lastRecordedGI is the last GI RecordObservedGI wrote per
 	// "<resource>/<volume>", so a steady GI is not rewritten every tick.
 	lastRecordedGI map[string]string
@@ -420,6 +426,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		cfg:                         cfg,
 		resourceToPool:              map[string]string{},
 		seenStuckAt:                 map[string]time.Time{},
+		adoptionHeldSince:           map[string]time.Time{},
 		restoreBlankFallback:        map[string]bool{},
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
