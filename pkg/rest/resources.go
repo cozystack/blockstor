@@ -19,6 +19,7 @@ limitations under the License.
 package rest
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/http"
@@ -224,64 +225,83 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 // crashes the CLI with AttributeError.
 const disklessStorPoolName = "DfltDisklessStorPool"
 
-// ensureVolumesForView returns a non-nil Volume slice for the wire
-// view. Bug 137 follow-up: a nil slice OR a zero-length non-nil slice
-// both serialise as a missing JSON key when the field carries
-// `omitempty` (the initial fix kept the tag and only solved half the
-// case). The wire shape contract is now: `volumes` key always
-// present.
+// ensureVolumesForView returns the wire `volumes` list for one
+// replica: one entry per VolumeDefinition of the parent RD, in
+// volume-number order, the way upstream LINSTOR's view does. LINSTOR
+// creates a replica's Volume objects together with the replica and
+// builds the list from them (Json.apiToResourceWithVolumes), so the
+// list never depends on whether the satellite has reported; only
+// `state` stays unset until it does.
 //
-// We solve the empty-slice case in two tiers:
+// blockstor sources the list from what the satellite observed, which
+// is nothing for a diskless witness and nothing for a diskful
+// replica the satellite has not built yet. Clients index the list by
+// volume number on the strength of the upstream guarantee:
+// linstor-scheduler-extender reads `volumes[0].state.disk_state` of
+// every DRBD replica and panicked on the empty list while a new
+// volume's replicas were still being built. A volume the satellite
+// has not reported is therefore filled in with what the controller
+// knows: its number, its storage pool (LINSTOR's sentinel
+// `DfltDisklessStorPool` on a diskless replica, see
+// disklessStorPoolName) and an empty state.
 //
-//  1. Diskless / TIE_BREAKER replica with no observed Volumes:
-//     synthesise one placeholder per parent-RD VolumeDefinition so
-//     the wire entry has the same volume_number cardinality as a
-//     diskful replica. `storage_pool_name` is stamped with the
-//     upstream-LINSTOR sentinel `DfltDisklessStorPool` (see
-//     disklessStorPoolName) so `linstor n describe` recognises the
-//     row as a diskless witness instead of crashing on
-//     `find_child(...)` returning None.
-//  2. Any other replica that happens to arrive with an empty
-//     Volumes slice (e.g. fresh diskful replica before the
-//     satellite has written Status.Volumes): emit `[]` rather than
-//     omitting the key. Same crash class, just less common.
-//
-// Diskful replicas with already-populated Volumes are passed
-// through verbatim — the placeholder path must not shadow real
-// satellite-observed allocation / disk_state.
+// Observed volumes are passed through verbatim, so a placeholder
+// never shadows satellite-reported allocation or disk state. The
+// result is never nil: the `volumes` key is always present (Bug 137).
 func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) []apiv1.Volume {
-	if len(observed) > 0 {
+	seen := make(map[int32]struct{}, len(observed))
+	for i := range observed {
+		seen[observed[i].VolumeNumber] = struct{}{}
+	}
+
+	missing := make([]int32, 0, len(vdSizes))
+
+	for vn := range vdSizes {
+		if _, ok := seen[vn]; !ok {
+			missing = append(missing, vn)
+		}
+	}
+
+	if len(missing) == 0 {
+		if observed == nil {
+			return []apiv1.Volume{}
+		}
+
 		return observed
 	}
 
-	if !isDisklessReplica(rsc) {
-		// Empty slice instead of nil so the JSON encoder emits
-		// `[]` not the absent key. Bug 137 wire contract.
-		return []apiv1.Volume{}
+	pool := rsc.Props[storPoolPropKey]
+
+	diskless := isDisklessReplica(rsc)
+	if diskless {
+		pool = disklessStorPoolName
 	}
 
-	// Stable iteration over the VD index: map keys are
-	// non-deterministic and the wire order has to be stable across
-	// calls so paginated CLI consumers don't see volume_number
-	// jitter between requests.
-	volNums := make([]int32, 0, len(vdSizes))
-	for vn := range vdSizes {
-		volNums = append(volNums, vn)
+	placeholders := make([]apiv1.Volume, 0, len(missing))
+	for _, vn := range missing {
+		// AllocatedKib stays 0 (the Bug 112 contract: always emit
+		// the key as an int >= 0); nothing is allocated until the
+		// satellite reports.
+		placeholders = append(placeholders, apiv1.Volume{VolumeNumber: vn, StoragePool: pool})
 	}
 
-	slices.Sort(volNums)
-
-	out := make([]apiv1.Volume, 0, len(volNums))
-
-	for _, vn := range volNums {
-		out = append(out, apiv1.Volume{
-			VolumeNumber: vn,
-			StoragePool:  disklessStorPoolName,
-			// AllocatedKib defaults to 0 (the Bug 112 contract:
-			// always emit the key as an int >= 0). Diskless has
-			// no real allocation, so 0 is the truthful value.
-		})
+	if !diskless {
+		// An observed diskful volume carries the default
+		// DRBD,STORAGE chain (the k8s store's volumesFromStatus);
+		// the RD's own stack replaces it in buildResourceView.
+		apiv1.ApplyLayerStackToVolumes(placeholders, apiv1.DefaultLayerStack())
 	}
+
+	out := make([]apiv1.Volume, 0, len(observed)+len(placeholders))
+	out = append(out, observed...)
+	out = append(out, placeholders...)
+
+	// Stable volume-number order: the VD index is a map, and
+	// paginated CLI consumers must not see volume_number jitter
+	// between requests.
+	slices.SortFunc(out, func(left, right apiv1.Volume) int {
+		return cmp.Compare(left.VolumeNumber, right.VolumeNumber)
+	})
 
 	return out
 }
