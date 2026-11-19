@@ -213,12 +213,24 @@ func TestVDDeleteWaitsForASilentReplica(t *testing.T) {
 	seedVDWithReplicas(t, st, rd, "node-a", "node-down")
 	fakeSatellites(t, st, rd, "node-a")
 
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: "node-down", ConnectionStatus: apiv1.NodeTypeOffline}); err != nil {
+		t.Fatalf("seed node-down: %v", err)
+	}
+
 	base, stop := startServerWithStore(t, st)
 	defer stop()
+
+	start := time.Now()
 
 	code, rcs := deleteVD(t, base, rd, 0)
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %v", code, messages(rcs))
+	}
+
+	// The satellite that has not confirmed is OFFLINE, so there is
+	// nothing to wait the whole budget for.
+	if elapsed := time.Since(start); elapsed > vdDeleteWaitBudget/2 {
+		t.Errorf("answer took %s while the only pending node was OFFLINE", elapsed)
 	}
 
 	last := rcs[len(rcs)-1]
@@ -238,6 +250,47 @@ func TestVDDeleteWaitsForASilentReplica(t *testing.T) {
 
 	if !vd.Deleting() || vd.DeleteID == "" {
 		t.Errorf("volume definition = %+v, want flagged DELETE with a deleteID", vd)
+	}
+}
+
+// A satellite that confirms after a cache convergence would have given up
+// still gets "deleted" back: the chain behind one confirmation (definition
+// update, reconcile, adjust, storage delete, status write) often takes
+// longer than that, and an early "in progress" sends an immediate `vd c` of
+// the same number into a refusal.
+func TestVDDeleteWaitsForASlowSatellite(t *testing.T) {
+	t.Parallel()
+
+	const rd = "pvc-vdd-slow"
+
+	st := store.NewInMemory()
+	seedVDWithReplicas(t, st, rd, "node-a")
+
+	slow := cacheConvergeBudget + time.Second
+
+	go func() {
+		select {
+		case <-t.Context().Done():
+			return
+		case <-time.After(slow):
+		}
+
+		for t.Context().Err() == nil {
+			confirmFlagged(t.Context(), st, rd, []string{"node-a"})
+
+			select {
+			case <-t.Context().Done():
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	code, rcs := deleteVD(t, base, rd, 0)
+	if code != http.StatusOK || !strings.HasSuffix(rcs[len(rcs)-1].Message, " deleted.") {
+		t.Fatalf("status %d answer %q, want deleted after the slow confirmation", code, messages(rcs))
 	}
 }
 

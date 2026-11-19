@@ -1151,12 +1151,32 @@ func vdDeleteAnswer(rd string, vn int32, progress store.VolumeDefinitionDeletePr
 	})
 }
 
-// waitForVDDeleteFinished tries to finish the delete until it holds or the
-// budget a replica delete waits runs out, whichever comes first. The
+// vdDeleteWaitBudget bounds how long `vd d` waits for the replicas to
+// confirm before it answers "in progress". One confirmation is a chain: the
+// definition update reaches the satellite, its reconcile runs `drbdadm
+// adjust`, deletes the storage and writes the status, and the controller
+// wakes on it. That often takes longer than a cache convergence, and an
+// answer given early sends an immediate `vd c` of the same number into a
+// refusal. LINSTOR answers once its satellites have.
+const vdDeleteWaitBudget = 30 * time.Second
+
+// vdDeleteFirstPoll and vdDeleteMaxPoll bound the back-off between the
+// attempts to finish the delete. Each attempt reads the definition, its
+// spellings and its replicas uncached, so a fast confirmation is seen
+// quickly while a slow one costs a few dozen calls rather than hundreds.
+const (
+	vdDeleteFirstPoll = 100 * time.Millisecond
+	vdDeleteMaxPoll   = time.Second
+)
+
+// waitForVDDeleteFinished tries to finish the delete until it holds, the
+// budget runs out, or every replica it still waits for is on a node whose
+// satellite is OFFLINE, which will not confirm before it is back. The
 // controller keeps trying after that; a later answer is not needed for the
 // delete to complete.
 func (s *Server) waitForVDDeleteFinished(ctx context.Context, rd string, vn int32) (store.VolumeDefinitionDeleteProgress, error) {
-	deadline := time.Now().Add(cacheConvergeBudget)
+	deadline := time.Now().Add(vdDeleteWaitBudget)
+	poll := vdDeleteFirstPoll
 
 	for {
 		progress, err := store.FinishVolumeDefinitionDelete(ctx, s.Store, rd, vn)
@@ -1164,16 +1184,35 @@ func (s *Server) waitForVDDeleteFinished(ctx context.Context, rd string, vn int3
 			return progress, fmt.Errorf("finish the delete of volume definition %s/%d: %w", rd, vn, err)
 		}
 
-		if progress.Removed || time.Now().After(deadline) {
+		if progress.Removed || time.Now().After(deadline) || s.allOffline(ctx, progress.Pending) {
 			return progress, nil
 		}
 
 		select {
 		case <-ctx.Done():
 			return progress, nil
-		case <-time.After(cacheConvergePollInterval):
+		case <-time.After(poll):
+		}
+
+		poll = min(2*poll, vdDeleteMaxPoll)
+	}
+}
+
+// allOffline reports whether every named node's satellite is explicitly
+// OFFLINE. A node it cannot read counts as online, so the wait is never cut
+// short on a guess.
+func (s *Server) allOffline(ctx context.Context, nodes []string) bool {
+	if len(nodes) == 0 {
+		return false
+	}
+
+	for _, node := range nodes {
+		if isNodeOnline(ctx, s.Store.Nodes(), node) {
+			return false
 		}
 	}
+
+	return true
 }
 
 // refuseVDDeleteIfReferenced runs the Bug 355 pre-Delete walk:
