@@ -22,6 +22,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -132,9 +133,11 @@ const SweeperRDGrace = 60 * time.Second
 
 // SweeperSkipAnnotation is the annotation key the sweeper honours
 // on the LOCAL Node CRD (NOT the Resource CRD — orphans by
-// definition have no CRD). Setting it to "true" disables the
-// sweeper on this node entirely, which is the documented escape
-// hatch for the Bug 4 scenario where an operator needs the
+// definition have no CRD). Setting it to "true" (or any spelling
+// strconv.ParseBool reads as true) disables the sweeper on this node
+// entirely; a value it cannot parse stops the sweep too, with an
+// error, since it may be a mistyped opt-out. This is the documented
+// escape hatch for the Bug 4 scenario where an operator needs the
 // kernel-side `drbdsetup down` to NOT run while they are doing
 // manual recovery (e.g. exporting GI / bitmap state out of a
 // "stuck" resource that has no CRD but is intentionally being
@@ -143,10 +146,9 @@ const SweeperRDGrace = 60 * time.Second
 // kernel-state evidence they wanted to preserve.
 const SweeperSkipAnnotation = "blockstor.org/skip-orphan-sweeper"
 
-// sweeperSkipValue is the annotation value that turns the skip
-// switch on. Kept as a named constant rather than the bare
-// "true" literal so the test fixture and the production guard
-// share one source of truth (goconst).
+// sweeperSkipValue is the canonical annotation value that turns the
+// skip switch on, kept as a named constant for the tests that set it
+// (goconst).
 const sweeperSkipValue = "true"
 
 // OrphanSweeperRunnable is a controller-runtime Runnable that
@@ -304,14 +306,16 @@ func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logge
 	ctx, cancel := context.WithTimeout(ctx, period)
 	defer cancel()
 
+	// The opt-out lives on the Node, so a Node we cannot read is an
+	// opt-out we cannot see. Sweeping anyway would tear down exactly
+	// what an operator asked us to keep; the cost of skipping is one
+	// cycle of delay on a genuine orphan.
 	skip, err := s.shouldSkip(ctx)
 	if err != nil {
-		// Read failures on the Node CRD shouldn't block the sweep —
-		// fall back to "not skipped" so a transient apiserver blip
-		// doesn't silently disable the safety net. Log so operators
-		// notice if it's persistent.
-		logger.Error(err, "check skip-sweeper annotation; proceeding without skip")
-	} else if skip {
+		return errors.Wrap(err, "skip-sweeper opt-out unknown; skipping sweep cycle")
+	}
+
+	if skip {
 		logger.V(1).Info("sweep skipped by Node annotation", "annotation", SweeperSkipAnnotation)
 
 		return nil
@@ -327,17 +331,13 @@ func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logge
 		return errors.Wrap(err, "list local Resource CRDs")
 	}
 
+	// Without the RD list the grace window cannot be applied, and
+	// a slot inside it is one the controller is still fanning out
+	// or the satellite is still deleting: not an orphan. Skip the
+	// cycle rather than read "unknown" as "past grace".
 	rdAges, err := s.listResourceDefinitionAges(ctx)
 	if err != nil {
-		// RD-read failures shouldn't abort the sweep — fall back to
-		// "no grace window" so a transient apiserver blip doesn't
-		// silently disable the safety net. The pre-grace behaviour
-		// is the safe-side default: at worst the sweeper tears down
-		// a slot that the reconciler then rebuilds, which is a
-		// recoverable loss.
-		logger.Error(err, "list ResourceDefinitions for grace window; proceeding without grace")
-
-		rdAges = nil
+		return errors.Wrap(err, "list ResourceDefinitions for grace window; skipping sweep cycle")
 	}
 
 	// Kernel-slot teardown first: the classified, rate-limited path
@@ -565,10 +565,11 @@ func (s *OrphanSweeperRunnable) callSetupDown(ctx context.Context, resource stri
 }
 
 // shouldSkip checks the local Node CRD for the SweeperSkipAnnotation.
-// Returns false if the Node CRD is missing (operator hasn't bootstrapped
-// it yet) — we sweep by default on unconfigured nodes too, since
-// an unbootstrapped node with kernel-resident DRBD resources is
-// itself a bug-state we want cleaned up.
+// Any failure to read the Node, NotFound included, is returned as an
+// error and the caller skips the cycle: the annotation is the only
+// way an operator can stop the sweeper, and a Node we cannot read may
+// carry it. An annotation value strconv.ParseBool cannot read is an
+// error for the same reason; one it reads as true skips the sweep.
 func (s *OrphanSweeperRunnable) shouldSkip(ctx context.Context) (bool, error) {
 	var node blockstoriov1alpha1.Node
 
@@ -577,12 +578,17 @@ func (s *OrphanSweeperRunnable) shouldSkip(ctx context.Context) (bool, error) {
 		return false, errors.Wrap(err, "get Node")
 	}
 
-	v, ok := node.Annotations[SweeperSkipAnnotation]
+	value, ok := node.Annotations[SweeperSkipAnnotation]
 	if !ok {
 		return false, nil
 	}
 
-	return v == sweeperSkipValue, nil
+	skip, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, errors.Wrapf(err, "parse annotation %s=%q", SweeperSkipAnnotation, value)
+	}
+
+	return skip, nil
 }
 
 // listOwnedResourceNames returns the set of ResourceDefinition

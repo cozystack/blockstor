@@ -83,6 +83,25 @@ func sweeperFixture(t *testing.T, nodeName string, kernelStatusOut string, resou
 	return sweeper, fx
 }
 
+// ownedStateDir returns a fresh StateDir holding the `.owned` marker
+// for every name given, i.e. a StateDir in which blockstor provisioned
+// exactly those kernel slots. `.owned` rather than `.res` keeps the
+// .res GC, which runs in the same sweep cycle, out of these tests.
+func ownedStateDir(t *testing.T, names ...string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	for _, name := range names {
+		err := os.WriteFile(filepath.Join(dir, name+".owned"), nil, 0o600)
+		if err != nil {
+			t.Fatalf("seed .owned marker for %s: %v", name, err)
+		}
+	}
+
+	return dir
+}
+
 // TestSweeperLeavesMatchingResourceAlone pins the core invariant:
 // when the kernel has a resource AND a matching Resource CRD
 // exists on this node, the sweeper MUST NOT issue a down call.
