@@ -1,0 +1,342 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package rest
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"testing"
+	"time"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
+)
+
+const (
+	growRD      = "pvc-grow-ack"
+	growOldKib  = int64(1024 * 1024)
+	growNewKib  = int64(2 * 1024 * 1024)
+	growPending = 600 * time.Millisecond
+	growDone    = 5 * time.Second
+)
+
+// seedGrow builds a definition at growOldKib with diskful replicas on
+// the given nodes, each reporting applied, plus two replicas a grow does
+// not wait for: a diskless one still carrying the size it applied while
+// it was diskful, and a diskful one whose satellite never reported.
+func seedGrow(t *testing.T, applied map[string]int64) store.Store {
+	t.Helper()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: growRD})
+	if err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	err = st.VolumeDefinitions().Create(ctx, growRD, &apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: growOldKib})
+	if err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	for node, kib := range applied {
+		err = st.Resources().Create(ctx, &apiv1.Resource{
+			Name: growRD, NodeName: node,
+			Volumes: []apiv1.Volume{{VolumeNumber: 0, AppliedSizeKib: kib}},
+		})
+		if err != nil {
+			t.Fatalf("seed replica %s: %v", node, err)
+		}
+	}
+
+	err = st.Resources().Create(ctx, &apiv1.Resource{
+		Name: growRD, NodeName: "diskless", Flags: []string{apiv1.ResourceFlagDiskless},
+		Volumes: []apiv1.Volume{{VolumeNumber: 0, AppliedSizeKib: growOldKib}},
+	})
+	if err != nil {
+		t.Fatalf("seed diskless replica: %v", err)
+	}
+
+	err = st.Resources().Create(ctx, &apiv1.Resource{
+		Name: growRD, NodeName: "unreported", Volumes: []apiv1.Volume{{VolumeNumber: 0}},
+	})
+	if err != nil {
+		t.Fatalf("seed unreported replica: %v", err)
+	}
+
+	return st
+}
+
+// setApplied records that the satellite on node finished applying kib.
+func setApplied(t *testing.T, st store.Store, node string, kib int64) {
+	t.Helper()
+
+	rsc, err := st.Resources().Get(t.Context(), growRD, node)
+	if err != nil {
+		t.Fatalf("get replica %s: %v", node, err)
+	}
+
+	rsc.Volumes = []apiv1.Volume{{VolumeNumber: 0, AppliedSizeKib: kib}}
+
+	err = st.Resources().Update(t.Context(), &rsc)
+	if err != nil {
+		t.Fatalf("update replica %s: %v", node, err)
+	}
+}
+
+// growAnswer is what a resize request was answered with.
+type growAnswer struct {
+	status int
+	rcs    []apiv1.APICallRc
+}
+
+// putGrow sends linstor-csi's ControllerExpandVolume body and reports
+// the answer on the returned channel.
+func putGrow(t *testing.T, base string, kib int64) <-chan growAnswer {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]int64{"size_kib": kib})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	done := make(chan growAnswer, 1)
+	url := fmt.Sprintf("%s/v1/resource-definitions/%s/volume-definitions/0", base, growRD)
+
+	go func() {
+		resp := httpPut(t, url, body)
+		defer resp.Body.Close()
+
+		answer := growAnswer{status: resp.StatusCode}
+		_ = json.NewDecoder(resp.Body).Decode(&answer.rcs)
+		done <- answer
+	}()
+
+	return done
+}
+
+func expectPending(t *testing.T, done <-chan growAnswer, why string) {
+	t.Helper()
+
+	select {
+	case answer := <-done:
+		t.Fatalf("the resize was answered (%d) while %s", answer.status, why)
+	case <-time.After(growPending):
+	}
+}
+
+func expectAnswered(t *testing.T, done <-chan growAnswer) []apiv1.APICallRc {
+	t.Helper()
+
+	select {
+	case answer := <-done:
+		if answer.status != http.StatusOK {
+			t.Fatalf("status %d, want 200", answer.status)
+		}
+
+		return answer.rcs
+	case <-time.After(growDone):
+		t.Fatal("the resize was not answered after every replica grew")
+	}
+
+	return nil
+}
+
+// TestVDGrowAnsweredOnlyAfterEveryReplicaGrew is the online-expansion
+// regression: linstor-csi's ControllerExpandVolume returns when the PUT
+// does and kubelet runs resize2fs next, so a PUT answered while one
+// replica still had the old device size left the filesystem at the old
+// size. LINSTOR answers after its satellites resized the backing volume
+// and then DRBD.
+func TestVDGrowAnsweredOnlyAfterEveryReplicaGrew(t *testing.T) {
+	st := seedGrow(t, map[string]int64{"a": growOldKib, "b": growOldKib, "c": growOldKib})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	done := putGrow(t, base, growNewKib)
+
+	expectPending(t, done, "no replica had grown")
+
+	setApplied(t, st, "a", growNewKib)
+	setApplied(t, st, "b", growNewKib)
+
+	expectPending(t, done, "one replica was still at the old size")
+
+	setApplied(t, st, "c", growNewKib)
+
+	expectAnswered(t, done)
+}
+
+// TestVDGrowRetryOfSameSizeWaits covers linstor-csi retrying after the
+// external resizer's timeout cut the first PUT short: the definition
+// already holds the new size, and the retry must still not be answered
+// before the replicas have grown.
+func TestVDGrowRetryOfSameSizeWaits(t *testing.T) {
+	st := seedGrow(t, map[string]int64{"a": growNewKib, "b": growOldKib})
+
+	err := st.VolumeDefinitions().PatchVolumeDefinitionSpec(t.Context(), growRD, 0, func(vd *apiv1.VolumeDefinition) error {
+		vd.SizeKib = growNewKib
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("grow VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	done := putGrow(t, base, growNewKib)
+
+	expectPending(t, done, "a replica was still at the old size")
+
+	setApplied(t, st, "b", growNewKib)
+
+	expectAnswered(t, done)
+}
+
+// TestVDGetReportsAppliedSizeWhileGrowing pins the read side of the
+// same retry: linstor-csi skips the PUT when the definition already
+// has the requested size, so until the replicas have grown the
+// definition reports the size they applied.
+func TestVDGetReportsAppliedSizeWhileGrowing(t *testing.T) {
+	st := seedGrow(t, map[string]int64{"a": growNewKib, "b": growOldKib})
+
+	err := st.VolumeDefinitions().PatchVolumeDefinitionSpec(t.Context(), growRD, 0, func(vd *apiv1.VolumeDefinition) error {
+		vd.SizeKib = growNewKib
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("grow VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	getSizes := func() (int64, int64) {
+		t.Helper()
+
+		var one apiv1.VolumeDefinition
+
+		resp := httpGet(t, fmt.Sprintf("%s/v1/resource-definitions/%s/volume-definitions/0", base, growRD))
+		decodeErr := json.NewDecoder(resp.Body).Decode(&one)
+		_ = resp.Body.Close()
+
+		if decodeErr != nil {
+			t.Fatalf("decode VD: %v", decodeErr)
+		}
+
+		var list []apiv1.VolumeDefinition
+
+		resp = httpGet(t, fmt.Sprintf("%s/v1/resource-definitions/%s/volume-definitions", base, growRD))
+		decodeErr = json.NewDecoder(resp.Body).Decode(&list)
+		_ = resp.Body.Close()
+
+		if decodeErr != nil || len(list) != 1 {
+			t.Fatalf("decode VD list: %v (%d entries)", decodeErr, len(list))
+		}
+
+		return one.SizeKib, list[0].SizeKib
+	}
+
+	one, listed := getSizes()
+	if one != growOldKib || listed != growOldKib {
+		t.Fatalf("while a replica is still at the old size: GET %d, list %d, want %d", one, listed, growOldKib)
+	}
+
+	setApplied(t, st, "b", growNewKib)
+
+	one, listed = getSizes()
+	if one != growNewKib || listed != growNewKib {
+		t.Fatalf("after every replica grew: GET %d, list %d, want %d", one, listed, growNewKib)
+	}
+}
+
+// TestVDGrowSkipsOfflineReplica: as in LINSTOR, a satellite that is not
+// connected catches up when it reconnects; the resize does not wait for
+// it and names it in a WARN_NOT_CONNECTED entry.
+func TestVDGrowSkipsOfflineReplica(t *testing.T) {
+	st := seedGrow(t, map[string]int64{"a": growOldKib, "down": growOldKib})
+	ctx := t.Context()
+
+	for _, node := range []string{"a", "down"} {
+		err := st.Nodes().Create(ctx, &apiv1.Node{Name: node, Type: "SATELLITE"})
+		if err != nil {
+			t.Fatalf("seed node %s: %v", node, err)
+		}
+	}
+
+	err := st.Nodes().SetConnectionStatus(ctx, "down", apiv1.NodeTypeOffline)
+	if err != nil {
+		t.Fatalf("mark node offline: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	done := putGrow(t, base, growNewKib)
+
+	setApplied(t, st, "a", growNewKib)
+
+	rcs := expectAnswered(t, done)
+
+	found := false
+
+	for _, rc := range rcs {
+		if rc.RetCode == warnNotConnected && rc.ObjRefs[objRefNode] == "down" {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatalf("no WARN_NOT_CONNECTED entry for the offline replica: %+v", rcs)
+	}
+}
+
+// TestVDGrowCallerGivingUpEndsTheWait: the wait has no deadline of its
+// own, so a caller that stops waiting must end it.
+func TestVDGrowCallerGivingUpEndsTheWait(t *testing.T) {
+	st := seedGrow(t, map[string]int64{"a": growOldKib})
+
+	srv := &Server{Store: st}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+
+	result := make(chan bool, 1)
+
+	go func() {
+		_, grown := srv.waitForVolumeGrown(ctx, growRD, 0, growNewKib)
+		result <- grown
+	}()
+
+	select {
+	case grown := <-result:
+		if grown {
+			t.Fatal("the wait reported the volume grown while the replica was at the old size")
+		}
+	case <-time.After(growDone):
+		t.Fatal("the wait outlived its caller")
+	}
+}

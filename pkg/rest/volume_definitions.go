@@ -164,6 +164,7 @@ func (s *Server) handleVDView(w http.ResponseWriter, r *http.Request) {
 		rdProps := rds[i].Props
 		redactSensitiveProps(rdProps)
 		redactVolumeDefinitionsInPlace(vds)
+		s.reportAppliedSizes(r.Context(), rds[i].Name, vds)
 
 		out = append(out, rdWithVDs{
 			Name:              rds[i].Name,
@@ -220,6 +221,7 @@ func (s *Server) handleVDList(w http.ResponseWriter, r *http.Request) {
 
 	// Bug 185: scrub sensitive Props on every VD before emit.
 	redactVolumeDefinitionsInPlace(vds)
+	s.reportAppliedSizes(r.Context(), rd, vds)
 
 	writeJSON(w, http.StatusOK, vds)
 }
@@ -262,7 +264,10 @@ func (s *Server) handleVDGet(w http.ResponseWriter, r *http.Request) {
 	// to this response — the store cache stays un-redacted.
 	redactSensitiveProps(vd.Props)
 
-	writeJSON(w, http.StatusOK, vd)
+	one := []apiv1.VolumeDefinition{vd}
+	s.reportAppliedSizes(r.Context(), rd, one)
+
+	writeJSON(w, http.StatusOK, one[0])
 }
 
 // handleVDCreate accepts either the upstream `VolumeDefinitionCreate`
@@ -744,12 +749,18 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		s.stampResizePendingOnResources(r.Context(), rd, vn, *patch.SizeKib)
 	}
 
+	notConnected, grown := s.waitForVDPatchGrown(r.Context(), rd, vn, patch.SizeKib, previousSizeKib)
+	if !grown {
+		return
+	}
+
 	envelope := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "volume definition modified",
 	}}
 
 	envelope = appendForceShrinkAdvisory(envelope, &patch, rd, vn, previousSizeKib)
+	envelope = append(envelope, notConnected...)
 
 	writeJSON(w, http.StatusOK, envelope)
 }
