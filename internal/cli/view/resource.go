@@ -62,7 +62,6 @@ const (
 	flagDrbdDelete          = "DRBD_DELETE"
 	flagEvacuate            = "EVACUATE"
 	flagEvicted             = "EVICTED"
-	flagResize              = "RESIZE"
 	flagDiskAdding          = "DISK_ADDING"
 	flagDiskAddRequested    = "DISK_ADD_REQUESTED"
 	flagDiskRemoving        = "DISK_REMOVING"
@@ -347,14 +346,12 @@ func anyDiskState(res *apiv1.Resource) bool {
 // and once it is listed it reads Created. Reading such a volume's
 // missing disk state as Unknown is what made a healthy local volume
 // look like it was never reported on.
+//
+// There is no `Resizing` marker: nothing in this store flags a volume
+// while it grows, so a branch for one would only ever fire in a test.
 func volumeState(res *apiv1.Resource, vol *apiv1.Volume, sizes map[int32]int64) color.Cell {
-	prefix := ""
-	if slices.Contains(vol.Flags, flagResize) {
-		prefix = "Resizing, "
-	}
-
 	if !volumeTopLayerIsDRBD(res, vol) {
-		return color.Cell{Text: prefix + stateCreated, Class: color.Healthy}
+		return color.Cell{Text: stateCreated, Class: color.Healthy}
 	}
 
 	disk := vol.State.DiskState
@@ -363,7 +360,7 @@ func volumeState(res *apiv1.Resource, vol *apiv1.Volume, sizes map[int32]int64) 
 
 	switch strings.ToLower(disk) {
 	case "", "dunknown":
-		return color.Cell{Text: prefix + stateUnknown, Class: color.Transitional}
+		return color.Cell{Text: stateUnknown, Class: color.Transitional}
 	case "diskless":
 		// Diskless on purpose is healthy; a replica that was given a
 		// disk and reports none has lost it.
@@ -377,7 +374,7 @@ func volumeState(res *apiv1.Resource, vol *apiv1.Volume, sizes map[int32]int64) 
 		class = color.Healthy
 	}
 
-	text := prefix + disk
+	text := disk
 
 	// A converged replica never carries a percentage; a syncing one
 	// does, computed from what the satellite reports as still

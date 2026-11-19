@@ -73,14 +73,6 @@ func withPeers(res apiv1.Resource, conns map[string]apiv1.DrbdConnection) apiv1.
 	return res
 }
 
-func withVolumeFlags(res apiv1.Resource, flags ...string) apiv1.Resource {
-	for i := range res.Volumes {
-		res.Volumes[i].Flags = append(res.Volumes[i].Flags, flags...)
-	}
-
-	return res
-}
-
 type cellWant struct {
 	text  string
 	class color.Class
@@ -245,19 +237,6 @@ func TestResourceListStateParity(t *testing.T) {
 			name:  "inactive storage replica",
 			res:   withFlags(stacked(stackStorage(), nil, ""), apiv1.ResourceFlagInactive),
 			state: cellWant{"INACTIVE", color.Transitional},
-			conns: cellWant{"Ok", color.Healthy},
-		},
-		{
-			name:  "resizing storage volume",
-			res:   withVolumeFlags(stacked(stackStorage(), nil, ""), "RESIZE"),
-			state: cellWant{"Resizing, Created", color.Healthy},
-			conns: cellWant{"Ok", color.Healthy},
-		},
-		{
-			name:  "resizing drbd volume with no disk state keeps its links visible",
-			res:   withVolumeFlags(stacked(stackDrbd(), ptrBool(false), ""), "RESIZE"),
-			state: cellWant{"Resizing, Unknown", color.Transitional},
-			usage: cellWant{"Unused", color.Neutral},
 			conns: cellWant{"Ok", color.Healthy},
 		},
 		{
