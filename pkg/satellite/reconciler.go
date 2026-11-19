@@ -3988,6 +3988,52 @@ func (r *Reconciler) createMDGeometry(ctx context.Context, target string, unclea
 	return geometry, nil
 }
 
+// foreignRestoredSuperblock reports whether the clean superblock on a
+// restored volume was written for another node id, and if so the layout
+// to re-initialise it in.
+//
+// A snapshot of a volume that was detached when it was taken carries a
+// clean superblock, which the probe accepts as this replica's metadata.
+// It carries the source's node id, and the kernel refuses to attach it
+// under another one: `(119) ambiguous node id`, on every retry. LINSTOR
+// avoids this by giving the restored resource the snapshot's node ids;
+// blockstor allocates its own, so the superblock is re-initialised, as an
+// unclean one from a restore is.
+//
+// Only a restored volume with no GI recorded or reported here is checked:
+// metadata this replica established carries its own node id. A layout that
+// cannot be read leaves the superblock as it was, which is what happened
+// before: re-initialising is the step that needs the proof. That includes
+// a volume the kernel holds, which dump-md cannot open.
+func (r *Reconciler) foreignRestoredSuperblock(
+	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, target string,
+) (drbd.MetadataGeometry, bool) {
+	if vol.GetSourceSnapshot() == "" || vol.GetObservedGI() != "" {
+		return drbd.MetadataGeometry{}, false
+	}
+
+	local, ok := localNodeIDFromOpts(dr)
+	if !ok {
+		return drbd.MetadataGeometry{}, false
+	}
+
+	known, err := r.recordedGIs(dr.GetName(), vol.GetVolumeNumber())
+	if err != nil || len(known) > 0 {
+		return drbd.MetadataGeometry{}, false
+	}
+
+	found, err := r.cfg.Adm.MetadataGeometry(ctx, target)
+	if err != nil || found.NodeID < 0 || found.NodeID == int(local) {
+		return drbd.MetadataGeometry{}, false
+	}
+
+	log.FromContext(ctx).Info("the restored superblock was written for another node id; re-initialising it in its layout",
+		"volume", target, "superblockNodeID", found.NodeID, "localNodeID", local,
+		"sourceSnapshot", vol.GetSourceSnapshot())
+
+	return found.Clamped(), true
+}
+
 // metadataToCreate answers the metadata probe of one volume: whether it
 // needs create-md, and the layout to create it in.
 func (r *Reconciler) metadataToCreate(
@@ -4011,7 +4057,13 @@ func (r *Reconciler) metadataToCreate(
 	}
 
 	if hasMD {
-		return drbd.MetadataGeometry{}, false, nil
+		if unclean {
+			return drbd.MetadataGeometry{}, false, nil
+		}
+
+		geometry, foreign := r.foreignRestoredSuperblock(ctx, dr, vol, target)
+
+		return geometry, foreign, nil
 	}
 
 	geometry, err := r.createMDGeometry(ctx, target, unclean)

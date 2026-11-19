@@ -20,6 +20,7 @@ package satellite
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -155,6 +156,57 @@ func TestAnUnreadableSuperblockIsNotSizedBlind(t *testing.T) {
 
 				if got := createMDLines(fx); len(got) != 0 {
 					t.Errorf("create-md ran over a superblock of unknown layout: %q", got)
+				}
+			})
+		}
+	}
+}
+
+// A snapshot of a volume that was detached when it was taken carries a
+// clean superblock, which the probe accepted as this replica's. It carries
+// the source's node id, and the kernel refused to attach it under the one
+// blockstor allocated: `(119) ambiguous node id`, on every retry. A restored
+// volume with no GI of its own whose superblock names another node id is
+// re-initialised in its layout; anything else keeps its metadata.
+func TestARestoredCleanSuperblockOfAnotherNodeIsReinitialised(t *testing.T) {
+	foreign := strings.Replace(string(dumpWithPeerSlots(7)), "node-id 0;", "node-id 3;", 1)
+
+	for name, tc := range map[string]struct {
+		source, observedGI string
+		forced             storage.FakeResponse
+		want               []string
+	}{
+		"restore of another node's superblock": {
+			source: "pvc-source:snap-1", forced: storage.FakeResponse{Stdout: []byte(foreign)},
+			want: []string{"drbdadm create-md --force --max-peers=7 pvc-unclean/0"},
+		},
+		"restore of this node id": {
+			source: "pvc-source:snap-1", forced: storage.FakeResponse{Stdout: dumpWithPeerSlots(7)},
+		},
+		"not a restore": {forced: storage.FakeResponse{Stdout: []byte(foreign)}},
+		"a GI of its own": {
+			source: "pvc-source:snap-1", observedGI: uncleanReportedGI,
+			forced: storage.FakeResponse{Stdout: []byte(foreign)},
+		},
+		"layout unreadable": {
+			source: "pvc-source:snap-1", forced: storage.FakeResponse{Err: storage.FakeExitError{Code: 20}},
+		},
+	} {
+		for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
+			t.Run(name+"/"+path, func(t *testing.T) {
+				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+				dr.Volumes[0].SourceSnapshot = tc.source
+				dr.Volumes[0].ObservedGI = tc.observedGI
+
+				fx.Expect(uncleanDumpMD, storage.FakeResponse{Stdout: dumpWithPeerSlots(7)})
+				fx.Expect(uncleanDumpMDForced, tc.forced)
+
+				if err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath); err != nil {
+					t.Fatalf("%s: %v", path, err)
+				}
+
+				if got := createMDLines(fx); !slices.Equal(got, tc.want) {
+					t.Errorf("create-md = %q, want %q", got, tc.want)
 				}
 			})
 		}
