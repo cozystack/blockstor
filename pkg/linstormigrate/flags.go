@@ -39,11 +39,17 @@ package linstormigrate
 // diskless replicas, 64/2048/262144) are runtime bookkeeping — the
 // converter reports them and deliberately does NOT emit flag strings
 // for them.
+//
+// Every value here has since been checked against the `enum Flags` of
+// each object in the LINSTOR v1.33.1 source. The enums differ per
+// table: a bit that means DELETE on a replica means RESTORE_TARGET on
+// a resource definition and FAILED_DEPLOYMENT on a snapshot
+// definition, so a constant names the table whose column it reads.
 const (
-	// resourceFlagDelete marks an object under deletion (bit 1<<1,
-	// shared by resources, resource definitions, volumes and snapshot
-	// definitions in LINSTOR's schema; for snapshot definitions the
-	// same bit doubles as FAILED_DEPLOYMENT — see snapshot handling).
+	// resourceFlagDelete marks a replica under deletion (1<<1 in
+	// LINSTOR's Resource.Flags). It is a RESOURCES-row bit only: each
+	// table has its own enum, and the same position means something
+	// else elsewhere — see the per-table constants below.
 	resourceFlagDelete int64 = 1 << 1
 
 	// resourceFlagDiskless is the generic diskless bit (1<<2).
@@ -68,6 +74,12 @@ const (
 	// whose take failed — calibrated against a live `linstor s l`
 	// showing FAILED_DEPLOYMENT for a dump row with resource_flags=2.
 	snapDfnFlagFailedDeployment int64 = 1 << 1
+
+	// rscDfnFlagDelete (1<<0) marks a resource definition under
+	// deletion in LINSTOR's ResourceDefinition.Flags. 1<<1 there is
+	// RESTORE_TARGET, a definition being restored from a snapshot or
+	// backup, which is live.
+	rscDfnFlagDelete int64 = 1 << 0
 )
 
 // blockstor flag string vocabulary (matches pkg/rest/flags_validation.go

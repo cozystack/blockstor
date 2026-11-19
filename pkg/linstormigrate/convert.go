@@ -1216,7 +1216,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 // terminal for the definition and for every replica of it, since
 // convertResources drops replicas whose parent did not convert.
 func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
-	if row.ResourceFlags&resourceFlagDelete != 0 {
+	if row.ResourceFlags&rscDfnFlagDelete != 0 {
 		c.warnf("resource definition %s: marked DELETE in the source cluster — skipped", dsp)
 
 		return false
