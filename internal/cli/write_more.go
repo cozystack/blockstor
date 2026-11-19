@@ -333,6 +333,11 @@ func volumeDefinitionDelete(ctx context.Context, run *runContext) error {
 		return err
 	}
 
+	err = checkZFSDeleteStrategy(ctx, run, rdName)
+	if err != nil {
+		return err
+	}
+
 	err = run.Store.VolumeDefinitions().Delete(ctx, rdName, number)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete volume definition %s/%d: %w", rdName, number, err)
@@ -512,6 +517,11 @@ func resourceDelete(ctx context.Context, run *runContext) error {
 	last := len(run.Flags.Positionals) - 1
 	rdName := run.Flags.Positionals[last]
 
+	err := checkZFSDeleteStrategy(ctx, run, rdName)
+	if err != nil {
+		return err
+	}
+
 	for _, node := range run.Flags.Positionals[:last] {
 		err := checkDeletable(ctx, run, rdName, node)
 		if err != nil {
@@ -522,6 +532,22 @@ func resourceDelete(ctx context.Context, run *runContext) error {
 		if err != nil && !isNotFound(err) {
 			return fmt.Errorf("delete resource %s on %s: %w", rdName, node, err)
 		}
+	}
+
+	return nil
+}
+
+// checkZFSDeleteStrategy refuses a replica or volume definition delete the
+// REST door refuses: LINSTOR's `StorDriver/Zfs/DeleteStrategy` DELETE while
+// the definition has snapshots. --force does not override it, as in LINSTOR.
+func checkZFSDeleteStrategy(ctx context.Context, run *runContext, rdName string) error {
+	refused, err := store.ZFSDeleteRefused(ctx, run.Store, rdName)
+	if err != nil {
+		return fmt.Errorf("check the ZFS delete strategy of %s: %w", rdName, err)
+	}
+
+	if refused {
+		return fmt.Errorf("refusing to delete under %s: %w", rdName, validate.ErrZFSDeleteStrategy)
 	}
 
 	return nil

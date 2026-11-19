@@ -2793,7 +2793,8 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// on the witness path, which the guard skips (diskful-only). An
 	// explicit `?force=true` overrides. See
 	// resource_delete_last_uptodate_u130.go.
-	if !s.refuseLastUpToDateDiskfulMidSyncDelete(r.Context(), w, rdName, &existing, queryFlag(r, "force")) {
+	if s.refuseZFSDeleteStrategy(w, r, rdName) ||
+		!s.refuseLastUpToDateDiskfulMidSyncDelete(r.Context(), w, rdName, &existing, queryFlag(r, "force")) {
 		return
 	}
 
