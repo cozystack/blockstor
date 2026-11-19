@@ -114,3 +114,30 @@ func TestDeleteResourceDisklessIsOk(t *testing.T) {
 		t.Fatalf("diskless DeleteResource Ok=false: %s", resp.GetMessage())
 	}
 }
+
+// Turning a replica diskless reclaims its volume through the historical pool.
+// A pool that is not registered cannot reclaim anything, and nothing reclaims
+// the volume later, so the toggle fails and is retried instead of skipping it.
+func TestDisklessToggleWithAnUnregisteredPoolFails(t *testing.T) {
+	t.Parallel()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		StateDir:  t.TempDir(),
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{{
+		Name:     "pvc-a",
+		NodeName: "n1",
+		Flags:    []string{"DISKLESS"},
+		Volumes:  []*intent.DesiredVolume{{VolumeNumber: 0, SizeKib: 1024, StoragePool: "thin1"}},
+	}})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || results[0].GetOk() || !strings.Contains(results[0].GetMessage(), "thin1") {
+		t.Errorf("Apply results %+v, want one failure naming pool thin1", results)
+	}
+}
