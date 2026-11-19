@@ -584,20 +584,28 @@ func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnaps
 
 // DeleteSnapshot mirrors CreateSnapshot. Idempotency lives at the
 // provider layer (lvremove on missing LV is non-fatal there).
+//
+// The snapshot outlives its replica: deleting the replica keeps the
+// snapshots on disk, and the satellite then no longer knows which pool the
+// resource used. The request's pools are searched instead, and every one of
+// them must be registered, so a satellite that has not reconciled its pools
+// yet keeps the Snapshot's finalizer rather than reporting nothing to delete.
 func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *intent.DeleteSnapshotRequest) (*intent.DeleteSnapshotResponse, error) {
-	provider, err := r.providerForResource(req.GetResourceName())
+	providers, err := r.snapshotProviders(req)
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
 		return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
 	}
 
-	err = provider.DeleteSnapshot(ctx, storage.Snapshot{
-		ResourceName: req.GetResourceName(),
-		SnapshotName: req.GetSnapshotName(),
-	})
-	if err != nil {
-		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
-		return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+	for _, provider := range providers {
+		err = provider.DeleteSnapshot(ctx, storage.Snapshot{
+			ResourceName: req.GetResourceName(),
+			SnapshotName: req.GetSnapshotName(),
+		})
+		if err != nil {
+			//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
+			return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+		}
 	}
 
 	return &intent.DeleteSnapshotResponse{Ok: true}, nil
@@ -930,6 +938,34 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	r.forgetPool(req.GetName())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
+}
+
+// snapshotProviders is the resource's own pool when the satellite knows it,
+// and otherwise every pool the request names.
+func (r *Reconciler) snapshotProviders(req *intent.DeleteSnapshotRequest) ([]storage.Provider, error) {
+	provider, err := r.providerForResource(req.GetResourceName())
+	if err == nil {
+		return []storage.Provider{provider}, nil
+	}
+
+	pools := req.GetStoragePools()
+	if len(pools) == 0 {
+		return nil, err
+	}
+
+	providers := make([]storage.Provider, 0, len(pools))
+
+	for _, pool := range pools {
+		provider, ok := r.provider(pool)
+		if !ok {
+			return nil, errors.Errorf("storage pool %q is not registered on this satellite; snapshot %s of %s is not deleted yet",
+				pool, req.GetSnapshotName(), req.GetResourceName())
+		}
+
+		providers = append(providers, provider)
+	}
+
+	return providers, nil
 }
 
 // deleteVolumes deletes every requested volume through the replica's pool.

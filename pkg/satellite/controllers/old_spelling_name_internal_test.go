@@ -76,7 +76,7 @@ func TestAnOldMixedCaseReplicaIsSnapshottedUnderItsCRName(t *testing.T) {
 		}
 
 		snap := &blockstoriov1alpha1.Snapshot{
-			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{SatelliteSnapshotFinalizer}},
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{snapshotNodeFinalizer("node-a")}},
 			Spec: blockstoriov1alpha1.SnapshotSpec{
 				ResourceDefinitionName: snapSpelling,
 				SnapshotName:           "snap-1",
@@ -249,7 +249,7 @@ func TestAnOldMixedCaseSnapshotRowDrivesTheResourceByItsCRName(t *testing.T) {
 		phase.spec(&s)
 
 		snap := &blockstoriov1alpha1.Snapshot{
-			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{SatelliteSnapshotFinalizer}},
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{snapshotNodeFinalizer("node-a")}},
 			Spec:       s,
 			Status:     blockstoriov1alpha1.SnapshotStatus{NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{phase.status}},
 		}

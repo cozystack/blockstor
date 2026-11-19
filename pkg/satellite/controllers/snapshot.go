@@ -20,12 +20,16 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,20 +39,47 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/satellite"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
-// SatelliteSnapshotFinalizer guards a Snapshot CRD while one of
-// its on-disk materialisations still exists on this satellite.
-// Without the finalizer the apiserver removes the Snapshot
-// object as soon as the user issues `kubectl delete`, often
-// before the satellite has observed the DeletionTimestamp
-// event — the on-disk ZFS snapshot / thin-pool LV survives as
-// an orphan because handleDelete never runs (Bug 64).
-//
-// Mirrors the per-satellite finalizer scheme used by
-// `SatelliteResourceFinalizer` and `StoragePoolFinalizer`.
+// SatelliteSnapshotFinalizer is the finalizer older satellites shared: every
+// node in a Snapshot's node list stamped the same key, so the first satellite
+// to delete its own copy released the CRD and the others never saw the
+// delete, leaving their copies on disk. It is kept only to migrate Snapshots
+// that still carry it; see snapshotNodeFinalizer.
 const SatelliteSnapshotFinalizer = "blockstor.org/satellite-snapshot"
+
+// snapshotNodeFinalizerPrefix is the qualified-name prefix of the per-node
+// snapshot finalizers.
+const snapshotNodeFinalizerPrefix = "satellite-snapshot.blockstor.org/"
+
+// snapshotNodeFinalizerNameMax is the length limit of the name part of a
+// qualified name, which is what a finalizer is.
+const snapshotNodeFinalizerNameMax = 63
+
+// snapshotNodeFinalizer is the finalizer one satellite holds on a Snapshot
+// while its own copy of the snapshot may still be on disk. One key per node
+// is what lets the CRD go only once every node has deleted its copy, as each
+// Resource's own finalizer does for its replica.
+//
+// The node's key is the name part when it fits a qualified name, and a hash
+// of it otherwise, so a long node name still gets a valid, stable key.
+func snapshotNodeFinalizer(node string) string {
+	key := naming.Key(node)
+	if len(key) <= snapshotNodeFinalizerNameMax && len(validation.IsQualifiedName(snapshotNodeFinalizerPrefix+key)) == 0 {
+		return snapshotNodeFinalizerPrefix + key
+	}
+
+	sum := sha256.Sum256([]byte(key))
+
+	return snapshotNodeFinalizerPrefix + "node-" + hex.EncodeToString(sum[:])[:40]
+}
+
+// SnapshotNodeFinalizer is snapshotNodeFinalizer for the callers outside
+// the satellite that must release a node's hold: `node lost` drops the
+// finalizer of a node that will never delete its copy.
+func SnapshotNodeFinalizer(node string) string { return snapshotNodeFinalizer(node) }
 
 // snapshotFinalizerRequeue is the short back-off between
 // stamping the finalizer and the next Reconcile pass that
@@ -102,8 +133,9 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.handleDelete(ctx, &snap)
 	}
 
-	if !slices.Contains(snap.Finalizers, SatelliteSnapshotFinalizer) {
-		snap.Finalizers = append(snap.Finalizers, SatelliteSnapshotFinalizer)
+	mine := snapshotNodeFinalizer(r.Config.NodeName)
+	if !slices.Contains(snap.Finalizers, mine) {
+		snap.Finalizers = append(snap.Finalizers, mine)
 
 		err := r.Update(ctx, &snap)
 		if err != nil {
@@ -111,6 +143,11 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 
 		return ctrl.Result{RequeueAfter: snapshotFinalizerRequeue}, nil
+	}
+
+	err = r.dropSharedFinalizer(ctx, &snap)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	return r.handleCreate(ctx, &snap)
@@ -129,6 +166,27 @@ func (r *SnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// dropSharedFinalizer retires the old shared finalizer from a live Snapshot
+// once every node in its list holds its own, so nothing still depends on it.
+// A node that has not stamped its own yet (an older satellite during a
+// rolling upgrade) keeps the shared one in place.
+func (r *SnapshotReconciler) dropSharedFinalizer(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) error {
+	if !slices.Contains(snap.Finalizers, SatelliteSnapshotFinalizer) {
+		return nil
+	}
+
+	for _, node := range snap.Spec.Nodes {
+		if !slices.Contains(snap.Finalizers, snapshotNodeFinalizer(node)) {
+			return nil
+		}
+	}
+
+	snap.Finalizers = slices.DeleteFunc(snap.Finalizers,
+		func(f string) bool { return f == SatelliteSnapshotFinalizer })
+
+	return errors.Wrap(r.Update(ctx, snap), "drop the shared snapshot finalizer")
 }
 
 // handleCreate dispatches the per-node half of the Bug-351
@@ -753,26 +811,40 @@ func upsertPerNodeStatus(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, no
 // case. Drives `Apply.DeleteSnapshot` (which routes to the
 // provider's `DeleteSnapshot` — `zfs destroy …@<snap>` for ZFS,
 // `lvremove` for LVM-thin/thick, `os.Remove` for FILE) before
-// stripping the finalizer so kube-apiserver only finalises the
-// CRD once the on-disk snapshot is gone. Idempotent — a
+// releasing this node's finalizer, so kube-apiserver only finalises the
+// CRD once every node's on-disk copy is gone. Idempotent — a
 // `DeleteSnapshot` on a missing snapshot is a no-op so a re-run
 // after a satellite restart is safe.
 //
 // Bug 64: prior to the finalizer the apiserver removed the
 // Snapshot object before the satellite saw the delete event,
 // leaving the on-disk snapshot as an orphan.
+//
+// A Snapshot that still carries the old shared finalizer and not this
+// node's own was never migrated by this node: this node then releases the
+// shared one after deleting its copy, which is what older satellites did.
 func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	if !slices.Contains(snap.Finalizers, SatelliteSnapshotFinalizer) {
+	mine := snapshotNodeFinalizer(r.Config.NodeName)
+	holdsOwn := slices.Contains(snap.Finalizers, mine)
+	holdsShared := slices.Contains(snap.Finalizers, SatelliteSnapshotFinalizer)
+
+	if !holdsOwn && !holdsShared {
 		// Either we never stamped it (Snapshot created before this
-		// satellite came up) or someone already stripped it.
+		// satellite came up) or it was already released.
 		// Either way, nothing for us to do — let the apiserver
 		// finalise.
 		return ctrl.Result{}, nil
 	}
 
+	pools, err := r.diskfulPools(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	req := &intent.DeleteSnapshotRequest{
 		ResourceName: naming.Key(snap.Spec.ResourceDefinitionName),
 		SnapshotName: snap.Spec.SnapshotName,
+		StoragePools: pools,
 	}
 
 	resp, err := r.Config.Apply.DeleteSnapshot(ctx, req)
@@ -790,8 +862,9 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	snap.Finalizers = slices.DeleteFunc(snap.Finalizers,
-		func(f string) bool { return f == SatelliteSnapshotFinalizer })
+	snap.Finalizers = slices.DeleteFunc(snap.Finalizers, func(f string) bool {
+		return f == mine || (!holdsOwn && f == SatelliteSnapshotFinalizer)
+	})
 
 	err = r.Update(ctx, snap)
 	if err != nil {
@@ -799,6 +872,31 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// diskfulPools names this node's pools that can hold a snapshot, so a
+// snapshot whose replica is gone can still be found and deleted.
+func (r *SnapshotReconciler) diskfulPools(ctx context.Context) ([]string, error) {
+	var list blockstoriov1alpha1.StoragePoolList
+
+	err := r.List(ctx, &list)
+	if err != nil {
+		return nil, errors.Wrap(err, "list storage pools")
+	}
+
+	var pools []string
+
+	for i := range list.Items {
+		pool := &list.Items[i]
+		if naming.Same(pool.Spec.NodeName, r.Config.NodeName) &&
+			!strings.EqualFold(pool.Spec.ProviderKind, satellite.ProviderKindDiskless) {
+			pools = append(pools, pool.Spec.PoolName)
+		}
+	}
+
+	slices.Sort(pools)
+
+	return pools, nil
 }
 
 // snapshotNodePredicate filters Snapshot events to those whose

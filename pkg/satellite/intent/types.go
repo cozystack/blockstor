@@ -714,6 +714,21 @@ func (x *CreateSnapshotResponse) GetMessage() string {
 type DeleteSnapshotRequest struct {
 	ResourceName string
 	SnapshotName string
+
+	// StoragePools are the satellite's diskful pools, asked when the
+	// satellite does not know the resource's pool: after the replica was
+	// deleted, or after a restart before the replica was applied again.
+	StoragePools []string
+}
+
+// GetStoragePools returns the pools to search when the resource's own
+// pool is not known.
+func (x *DeleteSnapshotRequest) GetStoragePools() []string {
+	if x == nil {
+		return nil
+	}
+
+	return x.StoragePools
 }
 
 // GetResourceName returns the source RD name.
