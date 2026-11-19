@@ -697,6 +697,21 @@ func (r *Reconciler) ResourceSuspendState(ctx context.Context, resName string) (
 	return state, nil
 }
 
+// SuspendStates reads the kernel's suspend state for every resource in
+// one call. A satellite without DRBD reports none.
+func (r *Reconciler) SuspendStates(ctx context.Context) (map[string]drbd.SuspendState, error) {
+	if r.cfg.Adm == nil {
+		return map[string]drbd.SuspendState{}, nil
+	}
+
+	states, err := r.cfg.Adm.SuspendStates(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "suspend states")
+	}
+
+	return states, nil
+}
+
 // ResumeMinors resumes I/O by kernel minor, for a resource whose .res
 // may be gone. Every minor is tried; the first error is returned.
 func (r *Reconciler) ResumeMinors(ctx context.Context, minors []int32) error {

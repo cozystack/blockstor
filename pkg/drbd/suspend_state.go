@@ -86,6 +86,51 @@ func (a *Adm) SuspendState(ctx context.Context, resource string) (SuspendState, 
 	return state, nil
 }
 
+// SuspendStates reads `drbdsetup status --json` for every resource the
+// kernel holds, in one call, keyed by resource name. A resource whose
+// entry lacks the suspended-user key is left out rather than reported
+// as not suspended. A kernel with no resources reports none.
+func (a *Adm) SuspendStates(ctx context.Context) (map[string]SuspendState, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--json")
+	if err != nil {
+		if notLoadedErr(string(out), err) {
+			return map[string]SuspendState{}, nil
+		}
+
+		return nil, errors.Wrap(err, "drbdsetup status")
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil {
+		return nil, errors.Wrapf(ErrSuspendStateUnknown, "drbdsetup status: %v", err)
+	}
+
+	states := make(map[string]SuspendState, len(status))
+
+	for _, res := range status {
+		if res.Name == "" || res.SuspendedUser == nil {
+			continue
+		}
+
+		state := SuspendState{
+			Loaded:        true,
+			Role:          res.Role,
+			SuspendedUser: *res.SuspendedUser,
+			Minors:        make(map[int32]int32, len(res.Devices)),
+		}
+
+		for _, dev := range res.Devices {
+			state.Minors[dev.VolumeNumber] = dev.Minor
+		}
+
+		states[res.Name] = state
+	}
+
+	return states, nil
+}
+
 // ResumeIOMinor runs `drbdsetup resume-io <minor>`. It needs no .res
 // file, which is what a restarted satellite has to work with: the
 // startup wipe removes the .res of every resource it does not consider

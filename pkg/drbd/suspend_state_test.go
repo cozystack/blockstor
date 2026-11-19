@@ -78,3 +78,40 @@ func TestSuspendStateOfAnUnloadedResource(t *testing.T) {
 		t.Errorf("state %+v err %v, want unloaded", state, err)
 	}
 }
+
+// One call reads every resource, so the watchdog's sweep for suspends
+// nothing accounts for costs one exec however many resources there are.
+func TestSuspendStatesReadsEveryResource(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --json", storage.FakeResponse{Stdout: []byte(
+		`[{"name":"pvc-1","role":"Primary","suspended-user":true,"devices":[{"volume":0,"minor":1000}]},` +
+			`{"name":"pvc-2","role":"Secondary","suspended-user":false,"devices":[{"volume":0,"minor":1001}]},` +
+			`{"name":"pvc-3","role":"Secondary"}]`)})
+
+	states, err := drbd.NewAdm(fx).SuspendStates(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(states) != 2 || !states["pvc-1"].SuspendedUser || states["pvc-1"].Minors[0] != 1000 ||
+		states["pvc-2"].SuspendedUser {
+		t.Errorf("states %+v", states)
+	}
+}
+
+func TestSuspendStatesWithNoResources(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --json", storage.FakeResponse{
+		Stdout: []byte("# No currently configured DRBD found.\n"),
+		Err:    storage.FakeExitError{Code: 20},
+	})
+
+	states, err := drbd.NewAdm(fx).SuspendStates(t.Context())
+	if err != nil || len(states) != 0 {
+		t.Errorf("states %+v err %v, want none", states, err)
+	}
+}

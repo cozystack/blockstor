@@ -127,6 +127,9 @@ type drbdsetupStatusRoot []drbdsetupStatusResource
 // -j. We model only the fields the v3 prune and the Bug 360 my-node-id
 // self-heal consume.
 type drbdsetupStatusResource struct {
+	// Name is the resource name. A status of every resource, the one
+	// the snapshot watchdog reads, is keyed by it.
+	Name string `json:"name"`
 	// NodeID is the kernel slot's OWN my-node-id, burned in at
 	// `drbdadm up`/`new-resource` time. Bug 360 reads it to detect a
 	// slot whose my-id diverged from the controller-allocated id.
