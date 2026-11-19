@@ -131,6 +131,8 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 
    If you prefer staged application, the order is: `ControllerConfig` → `Node` → `StoragePool` → `ResourceGroup` → `ResourceDefinition` → `Resource` → `Snapshot`.
 
+   Apply all Resources of a definition together, in one apply rather than one replica at a time. The apiserver still delivers them in name order, so for a moment a satellite sees its own replica without its peers. It does not tear down the kernel connections it adopted on that account, but once its replica is allocated it renders the resource from the replicas it can see, so a peer applied seconds later can miss the first render.
+
 6. **Wait for adoption to converge.** Every `Resource` should report its DRBD device `UpToDate` (adopted, not resynced — watch that `out-of-sync` stays 0, i.e. no unexpected full sync started). `linstor r l --faulty` against the blockstor apiserver is empty. Storage pools report their real free capacity.
 
 7. **Repoint and unfreeze CSI.** Point linstor-csi at the blockstor apiserver, then scale the provisioner/attacher back up. Provision one test PVC and confirm it binds and that an existing PVC still mounts read-write.
