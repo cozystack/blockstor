@@ -52,6 +52,10 @@ func TestSatellitePropsReachControllerConfig(t *testing.T) {
 	if _, ok := cc.Spec.ExtraProps["Cluster/LocalID"]; ok {
 		t.Error("/STLT Cluster/LocalID leaked into ControllerConfig")
 	}
+
+	if !hasWarning(res, "LINSTOR props /STLT: not migrated, no blockstor object carries them: Cluster/LocalID") {
+		t.Errorf("the /STLT key left behind was not reported; warnings: %v", res.Warnings)
+	}
 }
 
 // TestControllerAndSatelliteDisagreement: LINSTOR files some keys in both

@@ -20,6 +20,7 @@ package linstormigrate
 
 import (
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/cozystack/blockstor/pkg/passphrase"
@@ -56,6 +57,25 @@ type PropsIndex struct {
 	Satellite map[string]string
 
 	byInstance map[string]map[string]string
+
+	// carried records the keys of a partly carried instance (/CTRL,
+	// /STLT) the converter wrote onto a blockstor object, so whatever is
+	// left can be reported instead of vanishing.
+	carried map[string]map[string]bool
+
+	// withheld are the rows NewPropsIndex keeps out of the index because
+	// they would carry a passphrase, by instance.
+	withheld map[string][]string
+}
+
+// DroppedProps names the keys of one LINSTOR props instance that no
+// blockstor object carries.
+type DroppedProps struct {
+	Instance string
+	Keys     []string
+	// Withheld marks keys left out because they would carry a passphrase
+	// in plaintext, rather than for lack of a blockstor equivalent.
+	Withheld bool
 }
 
 // PropsInstanceController is the props_instance of the cluster-wide
@@ -82,10 +102,14 @@ func NewPropsIndex(rows []PropsContainerRow) *PropsIndex {
 		Controller: map[string]string{},
 		Satellite:  map[string]string{},
 		byInstance: map[string]map[string]string{},
+		carried:    map[string]map[string]bool{},
+		withheld:   map[string][]string{},
 	}
 
 	for _, row := range rows {
 		if passphrase.IsPlaintextPropKey(row.PropKey) {
+			idx.withheld[row.PropsInstance] = append(idx.withheld[row.PropsInstance], row.PropKey)
+
 			continue
 		}
 
@@ -170,11 +194,96 @@ func (idx *PropsIndex) SnapshotVDFrozen(rd, snap, vlmNr string) map[string]strin
 	return idx.get("SNAP_VLM_DFNS_VLM_DFN", rd, snap, vlmNr)
 }
 
+// wholeBagKinds are the instance kinds whose bag the converter writes
+// onto the matching blockstor object as it is: node, storage pool,
+// resource group, definition, volume definition, replica and snapshot
+// definition. An instance of one of them that reaches no object belongs
+// to an object that did not convert, which the report already names
+// with its reason; its props go with it.
+//
+//nolint:gochecknoglobals // immutable lookup table
+var wholeBagKinds = map[string]bool{
+	"NODES":      true,
+	"STOR_POOLS": true,
+	"RSC_GRPS":   true,
+	"RSC_DFNS":   true,
+	"VLM_DFNS":   true,
+	"RSCS":       true,
+	"SNAP_DFNS":  true,
+}
+
+// Dropped lists, by instance, every key no blockstor object carries:
+// instances of a kind the converter does not carry (wholeBagKinds), the
+// keys of /CTRL and /STLT it left behind, and the passphrase rows
+// NewPropsIndex withheld. Sorted by instance, then key, so the report is
+// stable.
+func (idx *PropsIndex) Dropped() []DroppedProps {
+	bags := map[string]map[string]string{
+		PropsInstanceController: idx.Controller,
+		PropsInstanceSatellite:  idx.Satellite,
+	}
+	maps.Copy(bags, idx.byInstance)
+
+	var out []DroppedProps
+
+	for _, instance := range slices.Sorted(maps.Keys(bags)) {
+		if wholeBagKinds[instanceKind(instance)] {
+			continue
+		}
+
+		var keys []string
+
+		for key := range bags[instance] {
+			if !idx.carried[instance][key] {
+				keys = append(keys, key)
+			}
+		}
+
+		if len(keys) > 0 {
+			slices.Sort(keys)
+			out = append(out, DroppedProps{Instance: instance, Keys: keys})
+		}
+	}
+
+	for _, instance := range slices.Sorted(maps.Keys(idx.withheld)) {
+		keys := slices.Clone(idx.withheld[instance])
+		slices.Sort(keys)
+		out = append(out, DroppedProps{Instance: instance, Keys: slices.Compact(keys), Withheld: true})
+	}
+
+	return out
+}
+
+// carryKey records one key of an instance as carried.
+func (idx *PropsIndex) carryKey(instance, key string) {
+	keys := idx.carried[instance]
+	if keys == nil {
+		keys = map[string]bool{}
+		idx.carried[instance] = keys
+	}
+
+	keys[key] = true
+}
+
+// instanceKind is the first segment of a props_instance path: NODES for
+// /NODES/<node>, CTRL for /CTRL.
+func instanceKind(instance string) string {
+	kind, _, _ := strings.Cut(strings.TrimPrefix(instance, "/"), "/")
+
+	return kind
+}
+
+// instancePath joins props_instance segments the way LINSTOR spells
+// the path.
+func instancePath(segments ...string) string {
+	return "/" + strings.Join(segments, "/")
+}
+
 // get returns a copy of the property bag at the given instance path
 // (nil when the object has no props). Copies so converters can mutate
 // (pop consumed keys) without corrupting the index.
 func (idx *PropsIndex) get(segments ...string) map[string]string {
-	bag := idx.byInstance["/"+strings.Join(segments, "/")]
+	bag := idx.byInstance[instancePath(segments...)]
 	if len(bag) == 0 {
 		return nil
 	}

@@ -258,6 +258,13 @@
 "prop_value": "crc32c",
 "props_instance": "/RSC_DFNS/PVC-VOL3"
 }
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/sndbuf-size",
+"prop_value": "1048576",
+"props_instance": "/NODES/NODE-B"
+}
 }
 ]
 }

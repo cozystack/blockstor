@@ -287,6 +287,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 
 	conv.reportRemotes()
 	conv.reportUnmatchedPortNodes()
+	conv.reportDroppedProps()
 
 	err = checkPortCollisions(res.Resources)
 	if err != nil {
@@ -302,7 +303,8 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 // bags into the blockstor ControllerConfig singleton. Only `DrbdOptions/*`
 // keys carry over; everything else in either bag is LINSTOR runtime
 // plumbing (NetCom connector ports, TLS keystores, Cluster/LocalID, the
-// master-passphrase crypto material) and must NOT leak into blockstor.
+// master-passphrase crypto material) and is listed in the report by
+// reportDroppedProps rather than written anywhere.
 //
 // Both bags are what an operator sets with `linstor controller
 // set-property`: LINSTOR keeps the keys its controller acts on (the auto
@@ -311,7 +313,8 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 // the satellites render from. It sits below resource, definition, group
 // and node in their lookup, which is the rung ControllerConfig holds in
 // blockstor's (effectiveprops.Resolve), so the values keep their
-// precedence. Node is the one rung blockstor does not resolve.
+// precedence. Node is the one rung blockstor does not resolve, see
+// warnUnrenderedDRBDOptions.
 //
 // A key present in both bags with different values keeps the one LINSTOR
 // itself acted on: the /STLT value for a key with a section (it is what
@@ -323,6 +326,7 @@ func (c *converter) convertControllerConfig() *crdv1alpha1.ControllerConfig {
 	for key, val := range c.props.Controller {
 		if strings.HasPrefix(key, drbd.PropPrefix) {
 			drbdProps[key] = val
+			c.props.carryKey(PropsInstanceController, key)
 		}
 	}
 
@@ -332,6 +336,7 @@ func (c *converter) convertControllerConfig() *crdv1alpha1.ControllerConfig {
 		}
 
 		val := c.props.Satellite[key]
+		c.props.carryKey(PropsInstanceSatellite, key)
 
 		ctrlVal, both := drbdProps[key]
 
@@ -363,6 +368,45 @@ func (c *converter) convertControllerConfig() *crdv1alpha1.ControllerConfig {
 			ExtraProps:  extra,
 		},
 	}
+}
+
+// reportDroppedProps names every LINSTOR property no blockstor object
+// carries, one line per props instance, keys only: some of these hold
+// key material, and the key is enough to look the value up in LINSTOR.
+func (c *converter) reportDroppedProps() {
+	for _, dropped := range c.props.Dropped() {
+		if dropped.Withheld {
+			c.warnf("LINSTOR props %s: not migrated, would carry a passphrase in plaintext: %s",
+				dropped.Instance, strings.Join(dropped.Keys, ", "))
+
+			continue
+		}
+
+		c.warnf("LINSTOR props %s: not migrated, no blockstor object carries them: %s",
+			dropped.Instance, strings.Join(dropped.Keys, ", "))
+	}
+}
+
+// warnUnrenderedDRBDOptions reports the DrbdOptions/* keys of a bag that
+// is carried onto a blockstor object at a scope blockstor does not
+// resolve DRBD options from, so they reach the object but never a .res.
+func (c *converter) warnUnrenderedDRBDOptions(what string, props map[string]string) {
+	var keys []string
+
+	for key := range props {
+		if strings.HasPrefix(key, drbd.PropPrefix) {
+			keys = append(keys, key)
+		}
+	}
+
+	if len(keys) == 0 {
+		return
+	}
+
+	slices.Sort(keys)
+
+	c.warnf("%s: %s carried onto the object, but blockstor does not resolve DRBD options at this level — the adopted resources render without them; set them on the resource group, definition or controller instead",
+		what, strings.Join(keys, ", "))
 }
 
 // reportRemotes surfaces operator-created backup-shipping remotes,
@@ -696,12 +740,15 @@ func (c *converter) convertNodes() []crdv1alpha1.Node {
 			c.warnf("node %s: non-zero node_flags %d (DELETE/EVICTED markers are not decoded) — node migrated as-is, verify it should be adopted", dsp, row.NodeFlags)
 		}
 
+		props := c.props.Node(row.NodeName)
+		c.warnUnrenderedDRBDOptions("node "+dsp, props)
+
 		node := crdv1alpha1.Node{
 			TypeMeta:   typeMeta("Node"),
 			ObjectMeta: objectMeta(dsp),
 			Spec: crdv1alpha1.NodeSpec{
 				Type:  typeName,
-				Props: c.props.Node(row.NodeName),
+				Props: props,
 			},
 		}
 
@@ -829,6 +876,7 @@ func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 		}
 
 		props := c.props.StorPool(row.NodeName, row.PoolName)
+		c.warnUnrenderedDRBDOptions("storage pool "+poolDsp+"."+nodeDsp, props)
 
 		kind := row.DriverName
 		if kind == providerKindZFSThin {
@@ -1921,7 +1969,7 @@ func (c *converter) volumeDefinitionsFor(rdName, rdDsp string) []crdv1alpha1.Res
 		out = append(out, crdv1alpha1.ResourceDefinitionVolume{
 			VolumeNumber: vd.VlmNr,
 			SizeKib:      vd.VlmSize,
-			Props:        c.props.VolumeDefinition(rdName, strconv.Itoa(int(vd.VlmNr))),
+			Props:        c.volumeDefinitionProps(rdName, rdDsp, vd.VlmNr),
 			DRBDMinor:    c.drbdMinor[volumeKey{rd: rdName, vlmNr: vd.VlmNr}],
 		})
 	}
@@ -1929,6 +1977,16 @@ func (c *converter) volumeDefinitionsFor(rdName, rdDsp string) []crdv1alpha1.Res
 	sort.Slice(out, func(i, j int) bool { return out[i].VolumeNumber < out[j].VolumeNumber })
 
 	return out
+}
+
+// volumeDefinitionProps is the carried bag of one volume definition.
+// LINSTOR renders a volume's own DrbdOptions/Disk/* into its volume
+// block; blockstor does not, which the report says.
+func (c *converter) volumeDefinitionProps(rdName, rdDsp string, vlmNr int32) map[string]string {
+	props := c.props.VolumeDefinition(rdName, strconv.Itoa(int(vlmNr)))
+	c.warnUnrenderedDRBDOptions(fmt.Sprintf("volume definition %s/%d", rdDsp, vlmNr), props)
+
+	return props
 }
 
 func (c *converter) convertResources() []crdv1alpha1.Resource {

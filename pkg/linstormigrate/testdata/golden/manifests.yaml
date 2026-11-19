@@ -40,6 +40,8 @@ spec:
     name: default-ipv4
     satelliteEncryptionType: SSL
     satellitePort: 3367
+  props:
+    DrbdOptions/Net/sndbuf-size: "1048576"
   type: SATELLITE
 ---
 apiVersion: blockstor.org/v1alpha1
