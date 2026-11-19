@@ -217,11 +217,11 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // path does this so an operator's `linstor rg modify` acts on every
 // child RD immediately.
 //
-// `scheduled` applies the checks LINSTOR's balance task makes before it
-// touches a definition (see balanceSkipReason and balanceDisabled). The
-// annotation-driven path leaves them off: it stands for `rg modify`,
-// which LINSTOR runs the autoplacer for on every child definition.
-func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, scheduled bool) (int, error) {
+// `gated` applies the checks LINSTOR's balance task makes before it
+// touches a definition (balanceGate.skipReason). The annotation-driven
+// path leaves them off: it stands for `rg modify`, which LINSTOR runs
+// the autoplacer for on every child definition.
+func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, gated bool) (int, error) {
 	log := logf.FromContext(ctx)
 
 	rds, err := r.Store.ResourceDefinitions().List(ctx)
@@ -229,14 +229,12 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 		return 0, err
 	}
 
-	var ctrlProps map[string]string
+	var gate *balanceGate
 
-	if scheduled {
-		// Unreadable controller props fail open, as balanceResourcesDisabled
-		// does: the definition and group values still apply.
-		ctrlProps, err = r.Store.ControllerProps().Get(ctx)
+	if gated {
+		gate, err = newBalanceGate(ctx, r.Store)
 		if err != nil {
-			log.Error(err, "controller props unreadable; scheduled rebalance uses definition and group values only")
+			return 0, err
 		}
 	}
 
@@ -256,7 +254,7 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 			continue
 		}
 
-		if scheduled && r.skipScheduled(ctx, rg, &rds[i], ctrlProps) {
+		if r.skipRD(ctx, gate, rg, &rds[i]) {
 			continue
 		}
 
@@ -277,28 +275,25 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 	return processed, nil
 }
 
-// skipScheduled reports whether the scheduled tick leaves rd alone:
-// balanceSkipReason, plus the per-definition BalanceResourcesEnabled
-// switch, which only the scheduled tick obeys. The reason goes to the
-// debug log; a definition whose replicas cannot be read is skipped.
-func (r *RGRebalanceReconciler) skipScheduled(ctx context.Context, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition, ctrlProps map[string]string) bool {
+// skipRD reports whether the pass leaves rd alone. Without a gate
+// nothing is skipped. The reason goes to the debug log; a definition
+// whose replicas cannot be read is skipped.
+func (r *RGRebalanceReconciler) skipRD(ctx context.Context, gate *balanceGate, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) bool {
 	log := logf.FromContext(ctx).WithValues("rg", rg.Name, "rd", rd.Name)
 
-	if balanceDisabled(rd.Props, rg.Props, ctrlProps) {
-		log.V(1).Info("scheduled rebalance skipped", "reason", balanceSkipDisabled)
-
-		return true
+	if gate == nil {
+		return false
 	}
 
-	reason, err := balanceSkipReason(ctx, r.Store, rd)
+	reason, err := gate.skipReason(ctx, rg, rd)
 	if err != nil {
-		log.Error(err, "scheduled rebalance skipped: replicas unreadable")
+		log.Error(err, "rebalance skipped: replicas unreadable")
 
 		return true
 	}
 
 	if reason != "" {
-		log.V(1).Info("scheduled rebalance skipped", "reason", reason)
+		log.V(1).Info("rebalance skipped", "reason", reason)
 
 		return true
 	}

@@ -44,7 +44,7 @@ func TestRGPlaceCountBumpFillsGap(t *testing.T) {
 	st := store.NewInMemory()
 
 	for _, n := range []string{"n1", "n2", "n3"} {
-		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite})
+		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite, ConnectionStatus: apiv1.NodeTypeOnline})
 		_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
 			StoragePoolName: "pool",
 			NodeName:        n,
@@ -123,7 +123,7 @@ func TestRGUpdateNoChangeNoOp(t *testing.T) {
 	st := store.NewInMemory()
 
 	for _, n := range []string{"n1", "n2"} {
-		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite})
+		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite, ConnectionStatus: apiv1.NodeTypeOnline})
 		_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
 			StoragePoolName: "pool",
 			NodeName:        n,
@@ -177,7 +177,7 @@ func TestRGReconcilePlaceCountZeroDefaultsToOne(t *testing.T) {
 	st := store.NewInMemory()
 
 	for _, n := range []string{"n1", "n2"} {
-		node := &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}
+		node := &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite, ConnectionStatus: apiv1.NodeTypeOnline}
 		if n == "n1" {
 			node.Flags = []string{apiv1.NodeFlagEvicted}
 		}
@@ -229,7 +229,7 @@ func TestRGEventLeavesEmptiedDefinitionAlone(t *testing.T) {
 	st := store.NewInMemory()
 
 	for _, n := range []string{"n1", "n2", "n3"} {
-		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite})
+		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite, ConnectionStatus: apiv1.NodeTypeOnline})
 		_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
 			StoragePoolName: "pool",
 			NodeName:        n,

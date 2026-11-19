@@ -77,11 +77,14 @@ type ResourceGroupReconciler struct {
 // already-placed accounting prevents extra Resources.
 //
 // Any RG event lands here, the initial list on a controller start
-// included, so this is a placement nobody asked for. It leaves alone
-// the definitions LINSTOR's balance task would (balanceSkipReason): one
-// with no UpToDate diskful replica, such as a volume deleted while its
-// snapshots keep the definition, gets no replicas from an RG event. An
-// `rg modify` still reaches them through the rebalance-pending path.
+// included, so this is a placement nobody asked for; LINSTOR places
+// nothing on an RG event at all. It leaves alone every definition
+// LINSTOR's balance task would (balanceGate.skipReason): one being
+// deleted, one with BalanceResourcesEnabled=false, which linstor-csi
+// sets while it deletes a volume's replicas, and one with no UpToDate
+// diskful replica on an online node, such as a volume deleted while its
+// snapshots keep the definition. An `rg modify` that raises the place
+// count still reaches those through the rebalance-pending path.
 func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -101,14 +104,19 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	gate, err := newBalanceGate(ctx, r.Store)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	for i := range rds {
 		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
 			continue
 		}
 
-		reason, err := balanceSkipReason(ctx, r.Store, &rds[i])
+		reason, err := gate.skipReason(ctx, &rg, &rds[i])
 		if err != nil {
-			log.Error(err, "apply RG to RD", "rg", rg.Name, "rd", rds[i].Name)
+			log.Error(err, "RG placement skipped: replicas unreadable", "rg", rg.Name, "rd", rds[i].Name)
 
 			continue
 		}
