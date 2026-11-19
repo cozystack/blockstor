@@ -395,10 +395,9 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 // running.
 //
 // Snapshot LVs (named `<rd>_<snap>_00000` — see snapshotLVName) live
-// in the same VG; we filter them out via the lv_attr column. Volume
-// LVs have type '-' (thick) or 'V' (thin virtual); snapshot LVs use
-// 's' (regular) or carry origin metadata differentiable through
-// lv_attr.
+// in the same VG. A thick snapshot has type 's' in lv_attr and is
+// filtered on it; a thin snapshot has type 'V' like any thin volume,
+// so it is filtered on its origin and name instead (isSnapshotLV).
 // Bug 276 (P1, class-extension of Bug 270): bound the ctx here too.
 // ListVolumeNames runs from the storage orphan-sweeper ticker (every
 // SweeperPeriod) and bypassed the lvExists-level wrap that catches
@@ -462,7 +461,7 @@ func (t *Thin) ddRecvAndClearSentinel(ctx context.Context, target storage.Volume
 func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.VolumeRef, error) {
 	out, err := ex.Run(ctx, "lvs",
 		Args("--noheadings",
-			"-o", "lv_name,lv_attr",
+			"-o", "lv_name,lv_attr,origin",
 			"--separator", "\t",
 			vg)...)
 	if err != nil {
@@ -499,6 +498,10 @@ func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.
 			continue
 		}
 
+		if len(parts) > 2 && isSnapshotLV(name, strings.TrimSpace(parts[2])) {
+			continue
+		}
+
 		resource, vol, ok := parseLVName(name)
 		if !ok {
 			continue
@@ -511,6 +514,22 @@ func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.
 	}
 
 	return refs, nil
+}
+
+// isSnapshotLV reports whether the LV named name, whose origin is
+// origin, is a snapshot CreateSnapshot took: `<rd>_<snap>_00000` of
+// `<rd>_00000` (snapshotLVName). A thin snapshot is a thin volume, so
+// lv_attr does not set it apart, and its name parses as volume 0 of a
+// resource `<rd>_<snap>` that no Resource is named after: listed, it
+// would read as a leaked volume. A volume restored from a snapshot has
+// that snapshot as its origin, which never matches this shape.
+func isSnapshotLV(name, origin string) bool {
+	rd, vol, ok := parseLVName(origin)
+	if !ok || vol != 0 || name == origin {
+		return false
+	}
+
+	return strings.HasPrefix(name, rd+"_")
 }
 
 // parseLVName splits `<resource>_<vol5digits>` into (resource, vol).
