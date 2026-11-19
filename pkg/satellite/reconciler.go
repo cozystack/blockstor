@@ -3802,10 +3802,18 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 			stamp = r.cfg.MetadataCreatedStamper.StampMetadataCreated
 		}
 
+		// A failed stamp is not retried here: the marker is written, so
+		// the next pass does not come back through create-md. The
+		// startup backfill stamps the Condition on the next satellite
+		// start, and only as MetadataFound, since by then it can see
+		// only that metadata is there. No consumer reads the Reason, so
+		// that loses nothing but the audit trail, and the log line
+		// below keeps that.
 		stampErr := stamp(ctx, dr.GetName(), dr.GetNodeName())
 		if stampErr != nil {
-			log.FromContext(ctx).Error(stampErr, "stamp MetadataCreated Condition; will retry next reconcile",
-				"resource", dr.GetName(), "node", dr.GetNodeName())
+			log.FromContext(ctx).Error(stampErr,
+				"stamp MetadataCreated Condition; the startup backfill stamps it on the next satellite start",
+				"resource", dr.GetName(), "node", dr.GetNodeName(), "createMdRan", metadataFreshlyCreated)
 		}
 	}
 

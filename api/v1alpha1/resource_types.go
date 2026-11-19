@@ -53,7 +53,10 @@ const (
 	MetadataCreatedReasonCreateMd = "CreateMdSucceeded"
 
 	// MetadataCreatedReasonFound: `drbdadm dump-md` found metadata on
-	// every volume, so create-md was not run.
+	// every volume, so create-md was not run on that pass. The startup
+	// backfill also stamps it on a replica whose create-md stamp failed,
+	// since all it can see is that metadata is there; the satellite log
+	// of the create-md pass records which it was.
 	MetadataCreatedReasonFound = "MetadataFound"
 )
 
