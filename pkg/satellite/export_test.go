@@ -51,3 +51,9 @@ func WipeDeviceForTest(ctx context.Context, exec storage.Exec, devicePath string
 func (r *Reconciler) RecoverFromBitmapBothDisksForTest(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
 	return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, skipNet)
 }
+
+// RememberPoolForTest records the pool backing a resource, as an applied
+// replica does.
+func (r *Reconciler) RememberPoolForTest(resourceName, pool string) {
+	r.rememberPool(resourceName, pool)
+}
