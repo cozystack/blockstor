@@ -390,6 +390,22 @@ type DesiredVolume struct {
 	// log on a volume with one is a crash to repair with apply-al, not a
 	// foreign superblock to re-initialise over.
 	ObservedGI string
+
+	// DiskOptions are the volume's own DRBD disk options, keyed by bare
+	// option name (block-size, rs-discard-granularity): those set on its
+	// volume definition or volume group, resolved by
+	// effectiveprops.VolumeDiskOptions. The .res renders them inside the
+	// volume, where they override the resource-scope disk section.
+	DiskOptions map[string]string
+}
+
+// GetDiskOptions returns the volume's own disk options.
+func (x *DesiredVolume) GetDiskOptions() map[string]string {
+	if x == nil {
+		return nil
+	}
+
+	return x.DiskOptions
 }
 
 // GetObservedGI returns the GI last reported for this volume, or "".

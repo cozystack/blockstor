@@ -6300,9 +6300,19 @@ func TestApplyAutoMkfsXfsFiresOnceOnFirstActivation(t *testing.T) {
 		t.Fatalf("Apply (2nd): %v", err)
 	}
 
-	if got := count(fx.CommandLines(), "mkfs."); got != 0 {
+	// Counted by command name: the resource is called pvc-mkfs, so its
+	// .res path also contains "mkfs.".
+	mkfsRuns := 0
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "mkfs.") {
+			mkfsRuns++
+		}
+	}
+
+	if mkfsRuns != 0 {
 		t.Errorf("idempotent reconcile must NOT re-run mkfs; got %d mkfs.* call(s) in %v",
-			got, fx.CommandLines())
+			mkfsRuns, fx.CommandLines())
 	}
 }
 

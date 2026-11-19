@@ -209,6 +209,19 @@ type Volume struct {
 	// local meta-pool layout, breaking the deterministic render
 	// across peers.
 	MetaDisk string
+
+	// Options are the volume's own disk options: what LINSTOR keeps
+	// under DrbdOptions/Disk/* on the volume definition, block-size
+	// above all. They render as a `disk { }` block inside the local
+	// host's `volume N { }`, the place LINSTOR's ConfFileBuilder puts
+	// them, and override the resource-scope `disk { }` for this volume
+	// only. Keys are bare option names, without the DrbdOptions/Disk/
+	// prefix.
+	//
+	// A peer's block does not carry them: drbdadm applies a volume's
+	// options to the local device only, and a peer's volume options are
+	// that peer's to render.
+	Options map[string]string
 }
 
 // Build renders r into a drbd-9 `.res` file body. The output is
@@ -344,6 +357,12 @@ func ValidateOptionValue(block, key, value string) error {
 	return fmt.Errorf("%w: %s option %q carries %q", ErrUnrepresentableValue, block, key, value[i:i+1])
 }
 
+// optionBlock is one named set of options checkValues walks.
+type optionBlock struct {
+	name string
+	opts map[string]string
+}
+
 // checkValues walks every free-form value a resource carries. Blocks are
 // visited in a fixed order so the same resource always names the same option.
 func checkValues(r *Resource) error {
@@ -352,15 +371,16 @@ func checkValues(r *Resource) error {
 		return err
 	}
 
-	blocks := []struct {
-		name string
-		opts map[string]string
-	}{
+	blocks := []optionBlock{
 		{SectionNet, r.Net.Options},
 		{SectionOptions, r.Options},
 		{SectionDisk, r.Disk},
 		{SectionHandlers, r.Handlers},
 		{SectionPeerDevice, r.PeerDevice},
+	}
+
+	for _, vol := range r.Volumes {
+		blocks = append(blocks, optionBlock{fmt.Sprintf("volume %d %s", vol.Number, SectionDisk), vol.Options})
 	}
 
 	for _, block := range blocks {
@@ -542,6 +562,17 @@ func writeOnBlock(b *strings.Builder, host *Host, vols []Volume) {
 		fmt.Fprintf(b, "      device %s minor %d;\n", vol.Device, vol.Minor)
 		fmt.Fprintf(b, "      disk %s;\n", diskField(host, vol))
 		fmt.Fprintf(b, "      meta-disk %s;\n", metaField(host, vol))
+
+		if host.IsLocal && len(vol.Options) > 0 {
+			b.WriteString("      disk {\n")
+
+			for _, k := range sortedKeys(vol.Options) {
+				writeOption(b, "        ", k, vol.Options[k])
+			}
+
+			b.WriteString("      }\n")
+		}
+
 		b.WriteString("    }\n")
 	}
 
