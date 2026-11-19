@@ -21,6 +21,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -122,7 +123,24 @@ func assertDefinitionVolumes(t *testing.T, where string, vols []apiv1.Volume) {
 		if vols[i].StoragePool != "data" {
 			t.Errorf("%s: volume %d pool = %q, want the replica's pool", where, vols[i].VolumeNumber, vols[i].StoragePool)
 		}
+
+		// A placeholder lists the same layers the store gives a
+		// reported volume; a client reading the DRBD entry of
+		// layer_data_list must not tell the two apart.
+		if vols[i].DevicePath == "" && !slices.Equal(layerTypes(vols[i].LayerDataList), apiv1.DefaultLayerStack()) {
+			t.Errorf("%s: placeholder volume %d layers = %v, want %v",
+				where, vols[i].VolumeNumber, layerTypes(vols[i].LayerDataList), apiv1.DefaultLayerStack())
+		}
 	}
+}
+
+func layerTypes(layers []apiv1.VolumeLayerData) []string {
+	out := make([]string, 0, len(layers))
+	for i := range layers {
+		out = append(out, layers[i].Type)
+	}
+
+	return out
 }
 
 func TestUnbuiltVolumeAnswersWithoutDevicePath(t *testing.T) {

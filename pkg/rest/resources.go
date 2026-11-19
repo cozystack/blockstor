@@ -229,7 +229,8 @@ const disklessStorPoolName = "DfltDisklessStorPool"
 // (Bug 137).
 //
 // A volume the satellite reported is passed through verbatim; the
-// placeholders carry only the volume number and the pool. A diskless or
+// placeholders carry only the volume number, the pool and the layer
+// list. A diskless or
 // TIE_BREAKER replica's placeholder names the upstream sentinel pool
 // `DfltDisklessStorPool` (see disklessStorPoolName), so `linstor n
 // describe` recognises the row as a diskless witness. The result is
@@ -256,6 +257,13 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 			// allocated that the satellite reported.
 		})
 	}
+
+	// A placeholder carries the layer list a reported volume gets from
+	// the store, the default stack (the resource view re-stamps both
+	// from the definition's stack). LINSTOR emits layer_data_list for a
+	// volume from its creation, and clients that read the DRBD entry
+	// there would otherwise tell a placeholder from a built volume.
+	apiv1.ApplyLayerStackToVolumes(out[len(observed):], apiv1.DefaultLayerStack())
 
 	// Stable order: the VD index is a map, and paginated CLI consumers
 	// must not see volume_number jitter between requests.
