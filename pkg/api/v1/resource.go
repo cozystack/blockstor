@@ -96,6 +96,20 @@ type Resource struct {
 	// time, matching upstream's per-resource timestamp. Set only on
 	// the read path (crdToWireResource); ignored on writes.
 	CreateTimestamp int64 `json:"create_timestamp,omitempty"`
+
+	// ApplyFailure is the error of the satellite's last apply pass on
+	// this replica, nil when that pass succeeded (Resource status).
+	// Internal: LINSTOR reports a satellite's error in the answer to
+	// the call that triggered the pass, and this is what lets a
+	// resize do the same.
+	ApplyFailure *ApplyFailure `json:"-"`
+}
+
+// ApplyFailure is the error of a failed satellite apply pass, with the
+// definition size of each volume that pass was applying.
+type ApplyFailure struct {
+	Message  string
+	SizesKib map[int32]int64
 }
 
 // ResourceState is the runtime state surface of a Resource.
@@ -185,6 +199,13 @@ type Volume struct {
 	// to a literal "Created" regardless of what disk_state we set.
 	// listMapKey type matches upstream's repeated layer_data shape.
 	LayerDataList []VolumeLayerData `json:"layer_data_list,omitempty"`
+
+	// AppliedSizeKib is the volume definition size the satellite has
+	// finished applying on this replica (Resource status), 0 when it
+	// never reported one. Internal: LINSTOR has no such field, it is
+	// what the REST layer reads to answer a resize only once the
+	// device has grown.
+	AppliedSizeKib int64 `json:"-"`
 }
 
 // VolumeLayerData mirrors upstream LINSTOR's per-volume layer

@@ -28,6 +28,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -520,7 +521,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// stop until an external event drove another reconcile;
 	// RequeueAfter ensures the next attempt sees the freshly-
 	// committed peer state.
-	if anyFailed {
+	if anyFailed || growPending(results) {
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
 	}
 
@@ -627,6 +628,68 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 	return anyFailed
 }
 
+// recordApplyFailure keeps Status.ApplyFailure in step with the pass
+// that just ran: the error and the volume sizes it was applying when it
+// failed, nothing once one succeeds. A resize waiting for this replica
+// reads it, so a pass that keeps failing ends the wait with its error
+// rather than leaving the caller to time out. Only a change is written,
+// so a steady replica costs no extra API call.
+func (r *ResourceReconciler) recordApplyFailure(
+	ctx context.Context, res *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult,
+) error {
+	want := applyFailureOf(rd, results)
+	if equality.Semantic.DeepEqual(want, res.Status.ApplyFailure) {
+		return nil
+	}
+
+	base := res.DeepCopy()
+	res.Status.ApplyFailure = want
+
+	err := r.Status().Patch(ctx, res, client.MergeFrom(base))
+	if err != nil {
+		return errors.Wrap(err, "patch Status.ApplyFailure")
+	}
+
+	return nil
+}
+
+// applyFailureOf is the Status.ApplyFailure a pass leaves: nil when it
+// succeeded, its error and the sizes it was applying otherwise. The
+// pass applied the definition's sizes (buildVolumes).
+func applyFailureOf(rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult) *blockstoriov1alpha1.ResourceApplyFailure {
+	for _, result := range results {
+		if result.GetOk() {
+			continue
+		}
+
+		out := &blockstoriov1alpha1.ResourceApplyFailure{Message: result.GetMessage()}
+		for _, vd := range rd.Spec.VolumeDefinitions {
+			out.Volumes = append(out.Volumes, blockstoriov1alpha1.ResourceApplyFailureVolume{
+				VolumeNumber: vd.VolumeNumber,
+				SizeKib:      vd.SizeKib,
+			})
+		}
+
+		return out
+	}
+
+	return nil
+}
+
+// growPending reports a pass that left a grow short of its device. The
+// device grows when a peer's resize does, which wakes nothing here, so
+// the pass is repeated to report the size once it shows.
+func growPending(results []*intent.ResourceApplyResult) bool {
+	for _, result := range results {
+		if result.GetGrowPending() {
+			return true
+		}
+	}
+
+	return false
+}
+
 // deviceHoldsDataReason is the Event reason for a LUKS format refused over
 // a device that carries a signature.
 const deviceHoldsDataReason = "LUKSDeviceHoldsData"
@@ -709,6 +772,11 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	if err != nil {
 		logger.Error(err, "record toggle-disk outcome")
 	}
+
+	err = r.recordApplyFailure(ctx, res, rd, results)
+	if err != nil {
+		logger.Error(err, "record apply failure")
+	}
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the
@@ -735,9 +803,10 @@ func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockst
 	vols := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(results[0].GetVolumes()))
 	for _, v := range results[0].GetVolumes() {
 		vols = append(vols, blockstoriov1alpha1.ResourceVolumeStatus{
-			VolumeNumber: v.GetVolumeNumber(),
-			StoragePool:  pool,
-			DevicePath:   v.GetDevicePath(),
+			VolumeNumber:   v.GetVolumeNumber(),
+			StoragePool:    pool,
+			DevicePath:     v.GetDevicePath(),
+			AppliedSizeKib: v.GetAppliedSizeKib(),
 		})
 	}
 
