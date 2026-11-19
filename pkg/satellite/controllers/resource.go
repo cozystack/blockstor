@@ -1171,6 +1171,15 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 
 	desired := dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps)
 
+	volumeDisk, err := effectiveprops.VolumeDiskOptions(ctx, r.Client, target, rd)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve volume disk options")
+	}
+
+	for _, vol := range desired.Volumes {
+		vol.DiskOptions = volumeDisk[vol.VolumeNumber]
+	}
+
 	// Phase 11.3 Stage 1: carry the `MetadataCreated=True` Status
 	// Condition from the Resource CRD into the apply chain so the
 	// satellite reconciler's `firstActivation` predicate (and the

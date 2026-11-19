@@ -209,29 +209,123 @@ func scopeInputs(ctx context.Context, c client.Reader, rd *blockstoriov1alpha1.R
 		Extras: rd.Spec.ExtraProps,
 	}
 
-	if rd.Spec.ResourceGroupName == "" {
-		return rgInfo, rdInfo, nil
+	rgObj, err := resourceGroup(ctx, c, rd)
+	if err != nil {
+		return rgInfo, rdInfo, err
 	}
 
-	var rgObj blockstoriov1alpha1.ResourceGroup
-
-	// The RD keeps the group's name as the operator spelled it; the CR is
-	// stored under the folded one.
-	getErr := c.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Spec.ResourceGroupName)}, &rgObj)
-	switch {
-	case getErr == nil:
+	if rgObj != nil {
 		rgInfo = scopeInfo{
 			Props:  rgObj.Spec.Props,
 			Typed:  rgObj.Spec.DRBDOptions,
 			Extras: rgObj.Spec.ExtraProps,
 		}
-	case apierrors.IsNotFound(getErr):
-		// Soft-fail; see package doc.
-	default:
-		return rgInfo, rdInfo, errors.Wrapf(getErr, "get ResourceGroup %q", rd.Spec.ResourceGroupName)
 	}
 
 	return rgInfo, rdInfo, nil
+}
+
+// diskOptionPrefix is the LINSTOR namespace of a DRBD disk section.
+const diskOptionPrefix = drbd.PropPrefix + "Disk/"
+
+// VolumeDiskOptions resolves each volume's own disk options: the
+// DrbdOptions/Disk/* keys set on its volume definition or on the
+// resource group's volume group, which LINSTOR renders into a disk
+// section inside the volume rather than at resource scope. The result
+// maps a volume number to bare option names (block-size, not
+// DrbdOptions/Disk/block-size); a volume with none is absent.
+//
+// Each value follows the precedence LINSTOR's ConfFileBuilder uses for
+// a volume (appendVlmIfPresent): volume, resource, volume definition,
+// volume group, resource definition, resource group, node, controller,
+// closer scope first. blockstor has no per-volume props on a replica,
+// so the resource's own props are the closest. A key set at volume
+// definition or volume group level outranks everything below it, so
+// only the resource can override it; a key set at none of those two
+// levels is not a volume option and stays in the resource-scope
+// disk section, resolved there by Resolve.
+func VolumeDiskOptions(ctx context.Context, c client.Reader, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (map[int32]map[string]string, error) {
+	if target == nil || rd == nil || len(rd.Spec.VolumeDefinitions) == 0 {
+		return nil, nil //nolint:nilnil // no volumes, nothing to resolve
+	}
+
+	rg, err := resourceGroup(ctx, c, rd)
+	if err != nil {
+		return nil, err
+	}
+
+	resProps := mergeScopeProps(emitScopeProps(target.Spec.DRBDOptions, target.Spec.ExtraProps), target.Spec.Props)
+
+	out := map[int32]map[string]string{}
+
+	for i := range rd.Spec.VolumeDefinitions {
+		vd := &rd.Spec.VolumeDefinitions[i]
+
+		opts := map[string]string{}
+
+		// Lowest of the per-volume levels first, so a closer one
+		// overwrites it.
+		for _, level := range []map[string]string{volumeGroupProps(rg, vd.VolumeNumber), vd.Props} {
+			for key, value := range level {
+				name, ok := strings.CutPrefix(key, diskOptionPrefix)
+				if !ok || name == "" {
+					continue
+				}
+
+				opts[name] = value
+			}
+		}
+
+		for name := range opts {
+			if value, ok := resProps[diskOptionPrefix+name]; ok {
+				opts[name] = value
+			}
+		}
+
+		if len(opts) > 0 {
+			out[vd.VolumeNumber] = opts
+		}
+	}
+
+	return out, nil
+}
+
+// volumeGroupProps returns the props of the resource group's volume
+// group for one volume number, nil when there is none.
+func volumeGroupProps(rg *blockstoriov1alpha1.ResourceGroup, volumeNumber int32) map[string]string {
+	if rg == nil {
+		return nil
+	}
+
+	for i := range rg.Spec.VolumeGroups {
+		if rg.Spec.VolumeGroups[i].VolumeNumber == volumeNumber {
+			return rg.Spec.VolumeGroups[i].Props
+		}
+	}
+
+	return nil
+}
+
+// resourceGroup fetches the definition's resource group, nil when it
+// names none or the group is gone (see the package doc).
+func resourceGroup(ctx context.Context, c client.Reader, rd *blockstoriov1alpha1.ResourceDefinition) (*blockstoriov1alpha1.ResourceGroup, error) {
+	if rd.Spec.ResourceGroupName == "" {
+		return nil, nil //nolint:nilnil // a definition without a group
+	}
+
+	var rg blockstoriov1alpha1.ResourceGroup
+
+	// The RD keeps the group's name as the operator spelled it; the CR is
+	// stored under the folded one.
+	err := c.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Spec.ResourceGroupName)}, &rg)
+	switch {
+	case err == nil:
+		return &rg, nil
+	case apierrors.IsNotFound(err):
+		return nil, nil //nolint:nilnil // soft-fail; see package doc
+	default:
+		return nil, errors.Wrapf(err, "get ResourceGroup %q", rd.Spec.ResourceGroupName)
+	}
 }
 
 // controllerConfig fetches the singleton ControllerConfig CRD.

@@ -5993,6 +5993,7 @@ func buildResVolumes(dr *intent.DesiredResource, devices map[int32]string, minor
 			Disk:     disk,
 			MetaDisk: metaDisk,
 			Minor:    volMinor,
+			Options:  vol.GetDiskOptions(),
 		})
 	}
 
