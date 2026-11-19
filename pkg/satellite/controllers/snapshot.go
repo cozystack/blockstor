@@ -795,7 +795,9 @@ func upsertPerNodeStatus(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, no
 //
 // A Snapshot that still carries the old shared finalizer and not this
 // node's own was never migrated by this node: this node then releases the
-// shared one after deleting its copy, which is what older satellites did.
+// shared one after deleting its copy, which is what older satellites did. A
+// node holding both releases them together, once every other listed node
+// holds its own.
 func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
 	mine := snapshotNodeFinalizer(r.Config.NodeName)
 	holdsOwn := slices.Contains(snap.Finalizers, mine)
@@ -836,8 +838,19 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Holding both, this node keeps its own until the shared one is gone,
+	// unless no other node depends on the shared one. Released alone, its
+	// own would leave it holding only the shared one, and its next pass
+	// would read that as a node that never stamped its own and release the
+	// shared one too, before an older satellite in the list had deleted
+	// its copy.
+	if holdsOwn && holdsShared &&
+		!finalizers.OthersHoldTheirOwn(snap.Spec.Nodes, snap.Finalizers, r.Config.NodeName) {
+		return ctrl.Result{}, nil
+	}
+
 	snap.Finalizers = slices.DeleteFunc(snap.Finalizers, func(f string) bool {
-		return f == mine || (!holdsOwn && f == SatelliteSnapshotFinalizer)
+		return f == mine || f == SatelliteSnapshotFinalizer
 	})
 
 	err = r.Update(ctx, snap)

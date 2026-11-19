@@ -236,3 +236,54 @@ func TestSnapshotNodeFinalizerIsAlwaysAQualifiedName(t *testing.T) {
 		t.Errorf("two long node names collided")
 	}
 }
+
+// A node holding both its own finalizer and the old shared one, beside a
+// node that holds nothing of its own (an older satellite in a rolling
+// upgrade), keeps its own after its delete. Released alone, its next pass
+// would take it for a node that never stamped its own and release the shared
+// one too, before the older node had deleted its copy.
+func TestSnapshotDeleteLeavesTheSharedFinalizerToAnOlderNode(t *testing.T) {
+	t.Parallel()
+
+	now := metav1.Now()
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pvc-1.snap-1",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{controllers.SatelliteSnapshotFinalizer, controllers.SnapshotNodeFinalizer("n2")},
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{ResourceDefinitionName: "pvc-1", SnapshotName: "snap-1", Nodes: []string{"n1", "n2"}},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(newSnapshotScheme(t)).WithObjects(snap, thinPool("n2")).Build()
+
+	newer, fx := snapshotSatellite(t, cli, "n2")
+	reconcileSnapshot(t, newer)
+	reconcileSnapshot(t, newer)
+
+	if !lvremoved(fx) {
+		t.Fatalf("n2 did not delete its copy: %v", fx.CommandLines())
+	}
+
+	var got blockstoriov1alpha1.Snapshot
+
+	err := cli.Get(t.Context(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got)
+	if err != nil || !slices.Contains(got.Finalizers, controllers.SatelliteSnapshotFinalizer) {
+		t.Fatalf("the shared finalizer went before the older n1 deleted its copy: err=%v finalizers=%v", err, got.Finalizers)
+	}
+
+	// The older satellite deletes its copy and releases the shared one.
+	got.Finalizers = slices.DeleteFunc(got.Finalizers, func(f string) bool { return f == controllers.SatelliteSnapshotFinalizer })
+
+	err = cli.Update(t.Context(), &got)
+	if err != nil {
+		t.Fatalf("release the shared finalizer: %v", err)
+	}
+
+	reconcileSnapshot(t, newer)
+
+	err = cli.Get(t.Context(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("n2 kept its hold after the shared one went: err=%v finalizers=%v", err, got.Finalizers)
+	}
+}

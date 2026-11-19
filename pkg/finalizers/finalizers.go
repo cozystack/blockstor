@@ -25,6 +25,7 @@ package finalizers
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"slices"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
@@ -78,4 +79,17 @@ func SnapshotNode(node string) string {
 	sum := sha256.Sum256([]byte(key))
 
 	return snapshotNodePrefix + "node-" + hex.EncodeToString(sum[:])[:hashedKeyLen]
+}
+
+// OthersHoldTheirOwn reports whether every node in nodes other than node
+// holds its own Snapshot finalizer in held, so the shared one protects no
+// other node's copy any more.
+func OthersHoldTheirOwn(nodes, held []string, node string) bool {
+	for _, n := range nodes {
+		if !naming.Same(n, node) && !slices.Contains(held, SnapshotNode(n)) {
+			return false
+		}
+	}
+
+	return true
 }
