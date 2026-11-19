@@ -121,7 +121,7 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 
    A different key ID means the controller's own keyring is in place: replace it as above before going on.
 
-4. **Deploy blockstor** (apiserver + controller + satellites) pointed at the same nodes and pools. The satellites must land on the same nodes with the same pool backing devices. Do not let blockstor create-md or mkfs — the adoption guards (existing DRBD metadata is not re-created, a populated filesystem is not re-formatted) protect the data, but verify the satellite image is the intended version first.
+4. **Deploy blockstor** (apiserver + controller + satellites) pointed at the same nodes and pools. The satellites must land on the same nodes with the same pool backing devices. Do not let blockstor create-md or mkfs — the adoption guards (existing DRBD metadata is not re-created, a populated filesystem is not re-formatted) protect the data, but verify the satellite image is the intended version first. An adopted volume of a definition with `FileSystem/Type` set is never formatted by blockstor, whatever its contents: the converter stamps `skipInitialSync: false` on every replica, and the satellite only promotes a volume to give it a missing filesystem when that replica was created empty by blockstor itself. Keep that field as the converter wrote it. Satellite images before this guard promoted and demoted unused adopted volumes in an attempt to format them (stopped only by a second filesystem probe), so run a version that has it, and if one did run, grep its log for `latch-free mkfs retry`.
 
 5. **Apply the manifests in order.** `WriteManifests` already emits them in dependency order, so a single apply works:
 
