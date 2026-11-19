@@ -7806,6 +7806,8 @@ func TestApplyAutoMkfsStorageOnlyFormatsRawDevice(t *testing.T) {
 			},
 			LayerStack:  []string{"STORAGE"},
 			DrbdOptions: map[string]string{},
+			// Created empty by blockstor: only such a replica is formatted.
+			SkipInitialSync: skipInitTrue(),
 		},
 	}
 

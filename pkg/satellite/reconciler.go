@@ -4503,13 +4503,15 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 //     blkid probe makes that retry safe even on a volume that was
 //     partially mkfs'd before the failure.
 //
-// SAFETY: mkfs on a populated filesystem silently destroys data. The
-// blkid probe is what protects an already-formatted volume from
-// double-mkfs when the marker file is absent (manual `rm`, host
-// rebuild that wipes /etc/drbd.d). DeleteResource removes the marker
-// together with `.res` / `.md-created` so a re-created RD with the
-// same name correctly mkfs-s again — the blkid probe sees an empty
-// (freshly-carved) volume and lets mkfs run.
+// SAFETY: mkfs on a populated filesystem silently destroys data. A
+// replica that was not born empty (bornEmptyReplica) is never
+// formatted at all. On one that was, the blkid probe is what protects
+// an already-formatted volume from double-mkfs when the marker file is
+// absent (manual `rm`, host rebuild that wipes /etc/drbd.d).
+// DeleteResource removes the marker together with `.res` /
+// `.md-created` so a re-created RD with the same name correctly
+// mkfs-s again — the blkid probe sees an empty (freshly-carved)
+// volume and lets mkfs run.
 //
 // The devices parameter maps volNumber → device path mkfs should
 // target. DRBD-stacked callers pass `/dev/drbd<minor>` (mkfs MUST go
@@ -4521,6 +4523,17 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	fsType := strings.TrimSpace(dr.GetProps()["FileSystem/Type"])
 	if fsType == "" {
+		return nil
+	}
+
+	// Only a replica blockstor created empty is ever formatted, the way
+	// LINSTOR formats only at the creation of a resource. Every other
+	// replica (adopted from LINSTOR, created into an initialized RD,
+	// not stamped yet) holds bytes blockstor never wrote, and its
+	// missing `.mkfs.done` marker says nothing about them: the solo
+	// and recovery promotes and the storage-only path all reach here
+	// for it, and the probe below would be the only guard left.
+	if !bornEmptyReplica(dr) {
 		return nil
 	}
 

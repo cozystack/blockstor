@@ -170,7 +170,7 @@ func unknownMkfsTargetAnswers(device string) map[string][]storage.FakeResponse {
 	nothing := storage.FakeResponse{Err: storage.FakeExitError{Code: 2}}
 
 	return map[string][]storage.FakeResponse{
-		"partition table only": {{Stdout: []byte("DEVNAME=" + device + "\nPTUUID=4b4b8971\nPTTYPE=dos\n")}},
+		"partition table only":  {{Stdout: []byte("DEVNAME=" + device + "\nPTUUID=4b4b8971\nPTTYPE=dos\n")}},
 		"exit 0, nothing named": {{}},
 		"ambivalent":            {{Err: storage.FakeExitError{Code: 8}}},
 		"cannot open": {{Err: fmt.Errorf("%w: blkid -p -o export %s: blkid: error: %s: Permission denied",
@@ -270,5 +270,51 @@ func storageOnlyFilesystemDR(rd string, skip *bool) []*intent.DesiredResource {
 			DrbdOptions:     map[string]string{},
 			SkipInitialSync: skip,
 		},
+	}
+}
+
+// TestApplyStorageOnlyMkfsFormatsOnlyABornEmptyReplica: a storage-only
+// Filesystem volume reaches mkfs on every reconcile until the marker
+// exists, with no promote and no DRBD in between. An adopted one (the
+// linstor-csi "local" class) has no marker, so it is formatted only if
+// blockstor created it empty, never on what the probe happens to read.
+func TestApplyStorageOnlyMkfsFormatsOnlyABornEmptyReplica(t *testing.T) {
+	const device = "/dev/vg/pvc-loc_00000"
+
+	cases := map[string]struct {
+		skip *bool
+		mkfs bool
+	}{
+		"born empty":      {skip: skipInitTrue(), mkfs: true},
+		"adopted":         {skip: skipInitFalse()},
+		"not yet stamped": {skip: nil},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			expectThinBacking(fx, "pvc-loc")
+			expectBlankMkfsTarget(fx, device)
+
+			rec := newThinReconciler(fx, dir)
+
+			results, err := rec.Apply(t.Context(), storageOnlyFilesystemDR("pvc-loc", tc.skip))
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			if len(results) != 1 || !results[0].GetOk() {
+				t.Fatalf("Apply must succeed: %v", results)
+			}
+
+			if got := slices.Contains(fx.CommandLines(), "mkfs.ext4 "+device); got != tc.mkfs {
+				t.Errorf("mkfs.ext4 ran = %v, want %v: %v", got, tc.mkfs, fx.CommandLines())
+			}
+
+			if !tc.mkfs {
+				assertNoMkfsMarker(t, dir, "pvc-loc")
+			}
+		})
 	}
 }
