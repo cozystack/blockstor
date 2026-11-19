@@ -81,7 +81,11 @@ func TestNewResourceIsNotQueuedBehindIdleReplicas(t *testing.T) {
 		pool    = "lvm-thin"
 		idle    = 30
 		perPass = 500 * time.Millisecond
-		budget  = 4 * perPass
+		// The new Resource may wait for the pass in flight and the one
+		// the queue had already handed out; the budget is counted in
+		// idle passes run before it, not in wall time, so a loaded
+		// runner slows both sides alike.
+		budgetPasses = 3
 	)
 
 	// Idle replicas take idle*perPass to go round, longer than the
@@ -155,7 +159,7 @@ func TestNewResourceIsNotQueuedBehindIdleReplicas(t *testing.T) {
 	}
 
 	// Let every idle replica take its first pass.
-	waitFor(t, time.Duration(idle+5)*perPass, func() bool { return reader.lists.Load() >= idle })
+	waitFor(t, 2*time.Duration(idle+5)*perPass, func() bool { return reader.lists.Load() >= idle })
 
 	// The peers' observers keep writing status, as they do on every
 	// kernel frame.
@@ -179,8 +183,11 @@ func TestNewResourceIsNotQueuedBehindIdleReplicas(t *testing.T) {
 	mustCreate(t, cli, newRes)
 
 	start := time.Now()
+	passesBefore := reader.lists.Load()
 
-	waitFor(t, budget, func() bool {
+	// The deadline only keeps a regression from hanging the run: a
+	// full round of the idle replicas, twice over.
+	waitFor(t, 2*idle*perPass, func() bool {
 		var got blockstoriov1alpha1.Resource
 
 		getErr := cli.Get(ctx, client.ObjectKeyFromObject(newRes), &got)
@@ -188,7 +195,16 @@ func TestNewResourceIsNotQueuedBehindIdleReplicas(t *testing.T) {
 		return getErr == nil && slices.Contains(got.Finalizers, SatelliteResourceFinalizer)
 	})
 
-	t.Logf("new Resource reached in %v with %d idle replicas at %v per pass", time.Since(start), idle, perPass)
+	// The new Resource's first pass adds the finalizer and returns
+	// before the peer read, so every read counted here is an idle
+	// replica's pass that ran ahead of it.
+	ahead := reader.lists.Load() - passesBefore
+	if ahead > budgetPasses {
+		t.Errorf("new Resource waited behind %d idle passes, want at most %d", ahead, budgetPasses)
+	}
+
+	t.Logf("new Resource reached in %v after %d idle passes, %d idle replicas at %v per pass",
+		time.Since(start), ahead, idle, perPass)
 }
 
 func startSatelliteEnvtest(t *testing.T) (client.Client, ctrl.Manager) {
