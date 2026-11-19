@@ -149,10 +149,12 @@ type replicaRow struct {
 // describeReplica derives the Usage, Conns and State cells together,
 // because they depend on each other the way `linstor r l` shows them:
 // a replica being deleted or deactivated reports no usage, Conns stays
-// blank while the state is Unknown, and a broken peer link turns the
-// State red whatever the disk says.
+// blank while nothing is known about the replica, and a broken peer
+// link turns the State red whatever the disk says.
 func describeReplica(res *apiv1.Resource, sizes map[int32]int64, primaries int) replicaRow {
 	var row replicaRow
+
+	reported := true
 
 	switch {
 	case slices.Contains(res.Flags, flagDelete) || slices.Contains(res.Flags, flagDrbdDelete):
@@ -161,14 +163,18 @@ func describeReplica(res *apiv1.Resource, sizes map[int32]int64, primaries int) 
 		row.state = color.Cell{Text: apiv1.ResourceFlagInactive, Class: color.Transitional}
 	default:
 		row.usage = usageCell(res, primaries)
-		row.state = replicaState(res, sizes)
+		row.state, reported = replicaState(res, sizes)
 	}
 
 	row.state = withToggleDisk(row.state, res.Flags)
 
+	if !reported || row.state.Text == stateUnknown {
+		return row
+	}
+
 	var broken bool
 
-	row.conns, broken = connsCell(res, row.state.Text)
+	row.conns, broken = connsCell(res)
 	if broken {
 		row.state.Class = color.Broken
 	}
@@ -228,14 +234,11 @@ func drbdPort(res *apiv1.Resource) string {
 // with them, so a partition is visible in the table instead of hiding
 // behind a healthy-looking summary.
 //
-// A replica with no DRBD layer has no peers to lose and reads `Ok`; a
-// replica whose state is still Unknown says nothing about its links
-// yet, so the cell stays blank. It reports whether any link is broken.
-func connsCell(res *apiv1.Resource, state string) (color.Cell, bool) {
-	if state == stateUnknown {
-		return color.Cell{}, false
-	}
-
+// A replica with no DRBD layer has no peers to lose and reads `Ok`.
+// The caller leaves the cell blank for a replica nothing has reported
+// on, whose links are not known yet. It reports whether any link is
+// broken.
+func connsCell(res *apiv1.Resource) (color.Cell, bool) {
 	allConnected := color.Cell{Text: stateOk, Class: color.Healthy}
 
 	if !topLayerIsDRBD(res) || len(res.LayerObject.Drbd.Connections) == 0 {
@@ -293,23 +296,47 @@ func topLayerIsDRBD(res *apiv1.Resource) bool {
 	return res.LayerObject.Type == "" || strings.EqualFold(res.LayerObject.Type, apiv1.LayerKindDRBD)
 }
 
-// replicaState derives the State column from the replica's volumes.
+// replicaState derives the State column from the replica's volumes,
+// and whether the satellite has said anything about the replica yet.
 //
 // A tie-breaker reads the literal `TieBreaker` (a harness greps for
 // that exact token, case included) rather than the Diskless it also
 // technically is: this table has no Flags column to carry the
-// difference. A diskless replica no volume reports on reads Diskless.
+// difference. A diskless replica no volume reports on, but whose
+// device the satellite has seen, reads Diskless.
+//
+// A diskless replica or tie-breaker the satellite has never reported
+// on is not known to be healthy: its device may never have come up.
+// It reads yellow, as the upstream client shows it, the tie-breaker
+// keeping its token and a plain diskless one reading Unknown.
+//
 // Otherwise the first volume that is not healthy speaks for the row,
 // and the last one when all are.
-func replicaState(res *apiv1.Resource, sizes map[int32]int64) color.Cell {
-	if slices.Contains(res.Flags, apiv1.ResourceFlagTieBreaker) {
-		return color.Cell{Text: "TieBreaker", Class: color.Healthy}
+func replicaState(res *apiv1.Resource, sizes map[int32]int64) (color.Cell, bool) {
+	tieBreaker := slices.Contains(res.Flags, apiv1.ResourceFlagTieBreaker)
+	diskless := slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) && !anyDiskState(res)
+
+	if !tieBreaker && !diskless {
+		return volumesState(res, sizes), true
 	}
 
-	if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) && !anyDiskState(res) {
-		return color.Cell{Text: stateDiskless, Class: color.Healthy}
-	}
+	reported := satelliteReported(res)
 
+	switch {
+	case tieBreaker && reported:
+		return color.Cell{Text: "TieBreaker", Class: color.Healthy}, true
+	case tieBreaker:
+		return color.Cell{Text: "TieBreaker", Class: color.Transitional}, false
+	case reported:
+		return color.Cell{Text: stateDiskless, Class: color.Healthy}, true
+	default:
+		return color.Cell{Text: stateUnknown, Class: color.Transitional}, false
+	}
+}
+
+// volumesState is the state of the first volume that is not healthy,
+// or of the last one when all are.
+func volumesState(res *apiv1.Resource, sizes map[int32]int64) color.Cell {
 	state := color.Cell{Text: stateUnknown, Class: color.Transitional}
 
 	for i := range res.Volumes {
@@ -325,6 +352,17 @@ func replicaState(res *apiv1.Resource, sizes map[int32]int64) color.Cell {
 	}
 
 	return state
+}
+
+// satelliteReported reports whether the satellite has written anything
+// it observed about the replica's device: a role, a volume's disk
+// state or a peer link. The store fills none of these on its own.
+func satelliteReported(res *apiv1.Resource) bool {
+	if res.State.DrbdState != "" || anyDiskState(res) {
+		return true
+	}
+
+	return res.LayerObject != nil && res.LayerObject.Drbd != nil && len(res.LayerObject.Drbd.Connections) > 0
 }
 
 // anyDiskState reports whether any volume of the replica has an

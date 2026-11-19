@@ -73,6 +73,13 @@ func withPeers(res apiv1.Resource, conns map[string]apiv1.DrbdConnection) apiv1.
 	return res
 }
 
+// reporting is a replica the satellite has seen: it wrote the role.
+func reporting(res apiv1.Resource) apiv1.Resource {
+	res.State.DrbdState = "Secondary"
+
+	return res
+}
+
 type cellWant struct {
 	text  string
 	class color.Class
@@ -202,18 +209,39 @@ func TestResourceListStateParity(t *testing.T) {
 			conns: cellWant{"Ok", color.Healthy},
 		},
 		{
-			name:  "a diskless replica no volume reports on",
-			res:   withFlags(stacked(stackDrbd(), ptrBool(false)), apiv1.ResourceFlagDiskless),
+			name:  "a diskless replica the satellite has seen but no volume reports on",
+			res:   reporting(withFlags(stacked(stackDrbd(), ptrBool(false)), apiv1.ResourceFlagDiskless)),
 			state: cellWant{"Diskless", color.Healthy},
 			usage: cellWant{"Unused", color.Neutral},
 			conns: cellWant{"Ok", color.Healthy},
 		},
 		{
-			name:  "tiebreaker",
-			res:   withFlags(stacked(stackDrbd(), ptrBool(false)), apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker),
+			name:  "a diskless replica nothing has reported on is not known to be healthy",
+			res:   withFlags(stacked(stackDrbd(), ptrBool(false)), apiv1.ResourceFlagDiskless),
+			state: cellWant{"Unknown", color.Transitional},
+			usage: cellWant{"Unused", color.Neutral},
+		},
+		{
+			name:  "a diskless replica seen only through its peer links",
+			res:   withPeers(withFlags(stacked(stackDrbd(), ptrBool(false)), apiv1.ResourceFlagDiskless), connected),
+			state: cellWant{"Diskless", color.Healthy},
+			usage: cellWant{"Unused", color.Neutral},
+			conns: cellWant{"Ok", color.Healthy},
+		},
+		{
+			name: "tiebreaker",
+			res: reporting(withFlags(stacked(stackDrbd(), ptrBool(false)),
+				apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker)),
 			state: cellWant{"TieBreaker", color.Healthy},
 			usage: cellWant{"Unused", color.Neutral},
 			conns: cellWant{"Ok", color.Healthy},
+		},
+		{
+			name: "a tiebreaker nothing has reported on keeps its token but turns yellow",
+			res: withFlags(stacked(stackDrbd(), ptrBool(false)),
+				apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker),
+			state: cellWant{"TieBreaker", color.Transitional},
+			usage: cellWant{"Unused", color.Neutral},
 		},
 		{
 			name:  "deleting storage replica reports no usage",
