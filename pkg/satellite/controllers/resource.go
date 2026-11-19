@@ -149,7 +149,148 @@ type ResourceReconciler struct {
 // Finalizer-aware: stamps `SatelliteResourceFinalizer` on
 // every live Resource so kube-apiserver waits for our tear-down
 // before allowing the object to disappear.
+//
+// Only a converged pass's periodic re-check keeps low priority. Every
+// other retry (a failed apply, an error, a wait on the allocator) is
+// pinned back to normal priority: controller-runtime otherwise keeps
+// the priority the item was dequeued with, so a re-check that found
+// drift would repair it at low priority, behind every other replica's
+// idle re-check.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	result, err := r.reconcileResource(ctx, req)
+	if result.Priority == nil {
+		result.Priority = normalPriority()
+	}
+
+	return result, err
+}
+
+// applyFailureRequeue is the backoff between satellite Apply
+// retries when at least one per-resource result reported failure.
+// Short enough that a transient stale-peer .res renders converge
+// within a couple of ticks; long enough that a permanently failing
+// drbdadm command (e.g. missing kernel module) doesn't flood the
+// log.
+const applyFailureRequeue = 5 * time.Second
+
+// peerAllocationRequeue is the short backoff applied when the
+// controller-side allocator is still trailing on one of this RD's
+// diskful peers (peer Resource exists but its Status.DRBDNodeID is
+// nil). The cache-trail typically clears within hundreds of
+// milliseconds — the controller-side reconciler stamps Status as
+// part of its very next pass — so a 2s requeue is comfortably
+// faster than the user-visible auto-place latency budget while
+// still giving the apiserver time to commit the Status patch.
+const peerAllocationRequeue = 2 * time.Second
+
+// activeDRBDRequeue is the periodic self-evaluation requeue applied
+// after a successful Apply on a DRBD-backed resource (Phase 11.7
+// safety net). The primary-watch predicate filters out pure
+// observer Status noise and the observer-trigger channel only fires
+// on lifecycle changes, so the reconciler no longer wakes for every
+// kernel statistics tick. This RequeueAfter is the belt-and-braces
+// re-eval that catches the rare case where the events2 stream missed
+// a frame (drbdsetup restart, kernel events2 stall) — without it the
+// reconciler could go arbitrarily long without re-checking a
+// long-lived active DRBD resource against its desired state.
+//
+// 10s is chosen to be:
+//   - long enough that steady-state idle resources don't generate
+//     pointless apiserver round-trips;
+//   - short enough that any divergence between desired and observed
+//     converges within a single user-visible scenario tick (e2e
+//     tests poll at 1-2 s and budget ~30 s per assertion).
+const activeDRBDRequeue = 10 * time.Second
+
+// lowPriority is the queue priority of the periodic re-check, the one
+// controller-runtime gives events from the initial list.
+func lowPriority() *int {
+	priority := handler.LowPriority
+
+	return &priority
+}
+
+// normalPriority is the queue priority of a real event, and of every
+// retry of a pass that did not converge.
+func normalPriority() *int {
+	priority := 0
+
+	return &priority
+}
+
+// resolveDeleteStoragePool picks the pool name the
+// satellite's DeleteVolume should route through. Phase 10.3
+// typed `Spec.StoragePool` wins; legacy `Props["StorPoolName"]`
+// is the forward-compat fallback (pre-migration Resources may
+// still carry only the prop). DISKLESS replicas have no pool
+// — the satellite reconciler handles the empty case fine.
+func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
+	if slices.Contains(res.Spec.Flags, apiv1.ResourceFlagDiskless) {
+		return ""
+	}
+
+	if res.Spec.StoragePool != "" {
+		return res.Spec.StoragePool
+	}
+
+	return res.Spec.Props["StorPoolName"]
+}
+
+// SetupWithManager wires this reconciler with a node-name
+// predicate so only Resources placed on this satellite trigger
+// reconciles. The predicate also fires on Delete events (the
+// CRD finalizer dance still needs us to clean up local state).
+//
+// We additionally watch sibling Resources (same RD, different
+// node) via Watches — when a peer's Resource is created /
+// updated / deleted on another satellite, this satellite must
+// re-render its .res to add or drop the `on <peer>` block.
+// Without that hook, the initial reconcile saw only the local
+// Resource (peer hadn't been observed yet through the cache),
+// rendered a peer-less .res, and never re-rendered because
+// later peer events get filtered out by nodeNamePredicate
+// before they reach this controller.
+func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	bldr := ctrl.NewControllerManagedBy(mgr).
+		For(&blockstoriov1alpha1.Resource{},
+			builder.WithPredicates(
+				predicate.And(
+					nodeNamePredicate(r.Config.NodeName),
+					primaryWatchPredicate(),
+				),
+			)).
+		Watches(&blockstoriov1alpha1.Resource{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings),
+			builder.WithPredicates(siblingWatchPredicate())).
+		Watches(&blockstoriov1alpha1.ResourceDefinition{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
+		Named("satellite-resource")
+
+	// Phase 11.7 second leg: the observer-trigger channel wakes
+	// this reconciler on kernel-state changes that produce no
+	// apiserver Spec write (peer flapping, role / disk / conn /
+	// repl frames). Each GenericEvent carries the local Resource
+	// object name; the EnqueueRequestForObject handler turns it
+	// straight into a reconcile.Request, no per-event mapping
+	// needed. Nil channel (unit-test path) short-circuits — the
+	// builder skips the raw-source registration entirely.
+	if r.Config.ReconcileTrigger != nil {
+		bldr = bldr.WatchesRawSource(
+			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{}),
+		)
+	}
+
+	err := bldr.Complete(r)
+	if err != nil {
+		return errors.Wrap(err, "register ResourceReconciler")
+	}
+
+	return nil
+}
+
+// reconcileResource is the body of Reconcile, which only settles the
+// queue priority of the result.
+func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("resource", req.Name)
 
 	var res blockstoriov1alpha1.Resource
@@ -194,112 +335,6 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	return r.runApply(ctx, &res, logger)
-}
-
-// applyFailureRequeue is the backoff between satellite Apply
-// retries when at least one per-resource result reported failure.
-// Short enough that a transient stale-peer .res renders converge
-// within a couple of ticks; long enough that a permanently failing
-// drbdadm command (e.g. missing kernel module) doesn't flood the
-// log.
-const applyFailureRequeue = 5 * time.Second
-
-// peerAllocationRequeue is the short backoff applied when the
-// controller-side allocator is still trailing on one of this RD's
-// diskful peers (peer Resource exists but its Status.DRBDNodeID is
-// nil). The cache-trail typically clears within hundreds of
-// milliseconds — the controller-side reconciler stamps Status as
-// part of its very next pass — so a 2s requeue is comfortably
-// faster than the user-visible auto-place latency budget while
-// still giving the apiserver time to commit the Status patch.
-const peerAllocationRequeue = 2 * time.Second
-
-// activeDRBDRequeue is the periodic self-evaluation requeue applied
-// after a successful Apply on a DRBD-backed resource (Phase 11.7
-// safety net). The primary-watch predicate filters out pure
-// observer Status noise and the observer-trigger channel only fires
-// on lifecycle changes, so the reconciler no longer wakes for every
-// kernel statistics tick. This RequeueAfter is the belt-and-braces
-// re-eval that catches the rare case where the events2 stream missed
-// a frame (drbdsetup restart, kernel events2 stall) — without it the
-// reconciler could go arbitrarily long without re-checking a
-// long-lived active DRBD resource against its desired state.
-//
-// 10s is chosen to be:
-//   - long enough that steady-state idle resources don't generate
-//     pointless apiserver round-trips;
-//   - short enough that any divergence between desired and observed
-//     converges within a single user-visible scenario tick (e2e
-//     tests poll at 1-2 s and budget ~30 s per assertion).
-const activeDRBDRequeue = 10 * time.Second
-
-// resolveDeleteStoragePool picks the pool name the
-// satellite's DeleteVolume should route through. Phase 10.3
-// typed `Spec.StoragePool` wins; legacy `Props["StorPoolName"]`
-// is the forward-compat fallback (pre-migration Resources may
-// still carry only the prop). DISKLESS replicas have no pool
-// — the satellite reconciler handles the empty case fine.
-func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
-	if slices.Contains(res.Spec.Flags, apiv1.ResourceFlagDiskless) {
-		return ""
-	}
-
-	if res.Spec.StoragePool != "" {
-		return res.Spec.StoragePool
-	}
-
-	return res.Spec.Props["StorPoolName"]
-}
-
-// SetupWithManager wires this reconciler with a node-name
-// predicate so only Resources placed on this satellite trigger
-// reconciles. The predicate also fires on Delete events (the
-// CRD finalizer dance still needs us to clean up local state).
-//
-// We additionally watch sibling Resources (same RD, different
-// node) via Watches — when a peer's Resource is created /
-// updated / deleted on another satellite, this satellite must
-// re-render its .res to add or drop the `on <peer>` block.
-// Without that hook, the initial reconcile saw only the local
-// Resource (peer hadn't been observed yet through the cache),
-// rendered a peer-less .res, and never re-rendered because
-// later peer events get filtered out by nodeNamePredicate
-// before they reach this controller.
-func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	bldr := ctrl.NewControllerManagedBy(mgr).
-		For(&blockstoriov1alpha1.Resource{},
-			builder.WithPredicates(
-				predicate.And(
-					nodeNamePredicate(r.Config.NodeName),
-					primaryWatchPredicate(),
-				),
-			)).
-		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
-		Watches(&blockstoriov1alpha1.ResourceDefinition{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
-		Named("satellite-resource")
-
-	// Phase 11.7 second leg: the observer-trigger channel wakes
-	// this reconciler on kernel-state changes that produce no
-	// apiserver Spec write (peer flapping, role / disk / conn /
-	// repl frames). Each GenericEvent carries the local Resource
-	// object name; the EnqueueRequestForObject handler turns it
-	// straight into a reconcile.Request, no per-event mapping
-	// needed. Nil channel (unit-test path) short-circuits — the
-	// builder skips the raw-source registration entirely.
-	if r.Config.ReconcileTrigger != nil {
-		bldr = bldr.WatchesRawSource(
-			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{}),
-		)
-	}
-
-	err := bldr.Complete(r)
-	if err != nil {
-		return errors.Wrap(err, "register ResourceReconciler")
-	}
-
-	return nil
 }
 
 // primaryWatchPredicate filters Resource events on the primary For
@@ -378,6 +413,82 @@ func primaryWatchPredicate() predicate.Predicate {
 			return false
 		},
 	}
+}
+
+// siblingWatchPredicate filters the events of other nodes' Resources
+// before enqueueLocalSiblings maps them onto this node's replica of
+// the same definition. It passes only what the local apply reads off
+// a peer: its spec (generation), its deletion, the allocator stamp,
+// and the per-volume disk state and current GI the day0 seed and the
+// auto-primary election consult (dispatcher.anyDiskfulPeerHasData).
+//
+// The peer's connections, role, in-use flag, out-of-sync counters and
+// conditions are dropped. Each peer's observer rewrites them on every
+// kernel frame, and every such write used to re-queue this node's
+// replica at normal priority: on a node holding a hundred replicas the
+// queue never drained, and a newly created Resource waited minutes
+// behind replicas with nothing to do. This node's own kernel view of
+// a peer reaches the reconciler through the observer-trigger channel.
+func siblingWatchPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(_ event.CreateEvent) bool { return true },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
+		GenericFunc: func(_ event.GenericEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldR, ok1 := e.ObjectOld.(*blockstoriov1alpha1.Resource)
+			newR, ok2 := e.ObjectNew.(*blockstoriov1alpha1.Resource)
+
+			if !ok1 || !ok2 {
+				return true
+			}
+
+			return siblingChangeAffectsApply(oldR, newR)
+		},
+	}
+}
+
+// siblingChangeAffectsApply reports whether an update of a peer
+// Resource changes anything the local apply derives from that peer.
+func siblingChangeAffectsApply(oldR, newR *blockstoriov1alpha1.Resource) bool {
+	if oldR.Generation != newR.Generation {
+		return true
+	}
+
+	if (oldR.DeletionTimestamp == nil) != (newR.DeletionTimestamp == nil) {
+		return true
+	}
+
+	if !int32PtrEqual(oldR.Status.DRBDNodeID, newR.Status.DRBDNodeID) ||
+		!int32PtrEqual(oldR.Status.DRBDPort, newR.Status.DRBDPort) ||
+		!int32PtrEqual(oldR.Status.DRBDMinor, newR.Status.DRBDMinor) {
+		return true
+	}
+
+	return !sameVolumeDataState(oldR.Status.Volumes, newR.Status.Volumes)
+}
+
+// sameVolumeDataState compares the per-volume disk state and current
+// GI of two Status.Volumes lists, keyed by volume number.
+func sameVolumeDataState(left, right []blockstoriov1alpha1.ResourceVolumeStatus) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	type dataState struct{ disk, gi string }
+
+	byNumber := make(map[int32]dataState, len(left))
+	for i := range left {
+		byNumber[left[i].VolumeNumber] = dataState{left[i].DiskState, left[i].CurrentGI}
+	}
+
+	for i := range right {
+		prev, ok := byNumber[right[i].VolumeNumber]
+		if !ok || prev != (dataState{right[i].DiskState, right[i].CurrentGI}) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // int32PtrEqual returns true when two *int32 pointers describe the
@@ -535,8 +646,15 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// STORAGE-only RDs have no kernel-state to drift against, so
 	// keeping them quiet preserves the predicate's no-op-on-idle
 	// property.
+	//
+	// The re-check runs at low priority. With one worker every
+	// replica's re-check otherwise competes first-come with new and
+	// changed Resources, and on a node holding a hundred replicas a
+	// new one waits minutes behind re-checks that find nothing to do.
+	// LINSTOR's satellite re-dispatches only resources with a pending
+	// change outside a full sync (DeviceManagerImpl.devMgrLoop).
 	if rdNeedsDRBD(&rd) {
-		return ctrl.Result{RequeueAfter: activeDRBDRequeue}, nil
+		return ctrl.Result{RequeueAfter: activeDRBDRequeue, Priority: lowPriority()}, nil
 	}
 
 	return ctrl.Result{}, nil
