@@ -290,3 +290,52 @@ func findRow(t *testing.T, out, needle string) string {
 
 	return ""
 }
+
+// A cell whose view decided its class is painted with that class, not
+// with what its text would classify as: `Unknown` on a replica not
+// reported yet is yellow, where the text alone reads red, and `Created`
+// is green where the text alone is unknown to the classifier. The
+// plain text, and so the layout, is the same either way.
+func TestPaintsTheClassTheViewDecided(t *testing.T) {
+	t.Parallel()
+
+	tbl := &metav1.Table{
+		ColumnDefinitions: []metav1.TableColumnDefinition{{Name: "Node"}, {Name: "Usage"}, {Name: "State"}},
+		Rows: []metav1.TableRow{
+			{Cells: []any{"node-1", color.Cell{Text: "InUse", Class: color.Healthy}, color.Cell{Text: "Unknown", Class: color.Transitional}}},
+			{Cells: []any{"node-2", color.Cell{}, color.Cell{Text: "Created", Class: color.Healthy}}},
+		},
+	}
+
+	var painted bytes.Buffer
+
+	// Usage is not a state column; a decided cell is painted anyway.
+	if err := table.Render(&painted, tbl, table.Options{Color: color.New(true), StateColumns: []string{"State"}}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	first := findRow(t, painted.String(), "node-1")
+	for _, want := range []string{"\x1b[33mUnknown\x1b[0m", "\x1b[32mInUse\x1b[0m"} {
+		if !strings.Contains(first, want) {
+			t.Errorf("row %q lacks %q", first, want)
+		}
+	}
+
+	if second := findRow(t, painted.String(), "node-2"); !strings.Contains(second, "\x1b[32mCreated\x1b[0m") {
+		t.Errorf("Created not painted green: %q", second)
+	}
+
+	var plain bytes.Buffer
+
+	if err := table.Render(&plain, tbl, table.Options{StateColumns: []string{"State"}}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	if strings.Contains(plain.String(), "\x1b") {
+		t.Errorf("plain render leaked an escape sequence:\n%s", plain.String())
+	}
+
+	if got := ansiRE.ReplaceAllString(painted.String(), ""); got != plain.String() {
+		t.Errorf("painted layout differs from plain:\n%s\nvs\n%s", got, plain.String())
+	}
+}
