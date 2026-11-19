@@ -71,6 +71,7 @@ var (
 	errHasChildren   = errors.New("cannot destroy: volume has children")
 	errHasDependents = errors.New("cannot destroy: snapshot has dependent clones")
 	errBusy          = errors.New("cannot rename: dataset is busy")
+	errExists        = errors.New("cannot rename to target: dataset already exists")
 )
 
 func newPool(t *testing.T, names ...string) *pool {
@@ -298,6 +299,10 @@ func (p *pool) rename(from, to string) error {
 		p.failRename = false
 
 		return errBusy
+	}
+
+	if _, taken := p.datasets[to]; taken {
+		return errExists
 	}
 
 	moved := map[string]string{from: to}
@@ -783,6 +788,59 @@ func TestDeleteUsesTheRecordedSuffix(t *testing.T) {
 
 	if !p.has("tank/_deleted_pvc-a_00000_2026-01-01T00-00-00-000@s1") {
 		t.Errorf("the other generation's snapshot went too: %v", p.names())
+	}
+}
+
+// The recorded suffix stays on the Resource for the replica's life, so a
+// volume deleted, created again and deleted again while snapshots keep the
+// first generation finds its renamed name taken. It goes under a fresh one,
+// and both generations keep their snapshots.
+func TestDeleteVolumeAgainWithTheSameSuffixDoesNotCollide(t *testing.T) {
+	t.Parallel()
+
+	const suffix = "2026-03-04T05-06-07-089"
+
+	first := "tank/_deleted_pvc-a_00000_" + suffix
+
+	p := newPool(t, first, first+"@x", "tank/pvc-a_00000", "tank/pvc-a_00000@y")
+	p.mark(first)
+
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank"}, p)
+
+	err := prov.DeleteVolumeWithSuffix(t.Context(), storage.Volume{ResourceName: "pvc-a"}, suffix)
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	if p.has("tank/pvc-a_00000") {
+		t.Fatalf("the zvol is still under its own name: %v", p.names())
+	}
+
+	if !p.has(first + "@x") {
+		t.Errorf("the first generation lost its snapshot: %v", p.names())
+	}
+
+	var second string
+
+	for _, name := range p.names() {
+		if strings.HasSuffix(name, "@y") {
+			second = strings.TrimSuffix(name, "@y")
+		}
+	}
+
+	if second == "" || second == first || !strings.HasPrefix(second, "tank/_deleted_pvc-a_00000_") || !p.markedFor(second) {
+		t.Fatalf("second generation at %q, want a marked zvol of its own; pool: %v", second, p.names())
+	}
+
+	// Its snapshot carries the recorded suffix, which names the other
+	// generation; it is still found and deleted, and that generation goes.
+	err = prov.DeleteSnapshot(t.Context(), storage.Snapshot{ResourceName: "pvc-a", SnapshotName: "y", DeletedSuffix: suffix})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	if p.has(second) || !p.has(first+"@x") {
+		t.Errorf("pool after the snapshot delete: %v", p.names())
 	}
 }
 
