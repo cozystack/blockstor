@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
@@ -383,4 +384,42 @@ func SnapshotsInPool(ctx context.Context, st Store, node, pool string) ([]string
 	}
 
 	return SnapshotsOnNode(ctx, st, spellings)
+}
+
+// ReplicasInPool returns the `<rd>/<vol_nr>` keys of every volume on the node
+// whose pool is the one named, and `<rd>/spec` for a replica that has not
+// reported volumes yet but already pins the pool in `StorPoolName`. A pool
+// delete is refused on them: a replica whose pool is gone cannot have its
+// storage deleted, so its delete never finishes.
+func ReplicasInPool(ctx context.Context, st Store, node, pool string) ([]string, error) {
+	all, err := st.Resources().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list resources: %w", err)
+	}
+
+	var refs []string
+
+	for i := range all {
+		if !naming.Same(all[i].NodeName, node) {
+			continue
+		}
+
+		matched := false
+
+		for j := range all[i].Volumes {
+			vol := &all[i].Volumes[j]
+			if naming.Same(vol.StoragePool, pool) {
+				refs = append(refs, all[i].Name+"/"+strconv.FormatInt(int64(vol.VolumeNumber), 10))
+				matched = true
+
+				break
+			}
+		}
+
+		if !matched && naming.Same(all[i].Props["StorPoolName"], pool) {
+			refs = append(refs, all[i].Name+"/spec")
+		}
+	}
+
+	return refs, nil
 }

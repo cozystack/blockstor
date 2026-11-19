@@ -151,9 +151,36 @@ func poolProps(provider storageProvider, backing string) (map[string]string, err
 	return props, nil
 }
 
-// errPoolStillReferenced refuses a pool delete while snapshots may have a
-// copy in it.
+// errPoolStillReferenced refuses a pool delete while replicas use it or
+// snapshots may have a copy in it.
 var errPoolStillReferenced = errors.New("storage pool is still referenced")
+
+// refusePoolDeleteIfReferenced is the REST door's pool delete refusal. A
+// replica or a snapshot copy in the pool can only be deleted through it, and
+// with the pool gone that delete never finishes.
+func refusePoolDeleteIfReferenced(ctx context.Context, run *runContext, node, pool string) error {
+	replicas, err := store.ReplicasInPool(ctx, run.Store, node, pool)
+	if err != nil {
+		return fmt.Errorf("list replicas on %s: %w", node, err)
+	}
+
+	if len(replicas) > 0 {
+		return fmt.Errorf("%w: volumes [%s] still use %s on %s; delete them or pass --force",
+			errPoolStillReferenced, strings.Join(replicas, ", "), pool, node)
+	}
+
+	snapshots, err := store.SnapshotsInPool(ctx, run.Store, node, pool)
+	if err != nil {
+		return fmt.Errorf("list snapshots on %s: %w", node, err)
+	}
+
+	if len(snapshots) > 0 {
+		return fmt.Errorf("%w: %s on %s may hold copies of snapshots [%s]; delete them or pass --force",
+			errPoolStillReferenced, pool, node, strings.Join(snapshots, ", "))
+	}
+
+	return nil
+}
 
 // storagePoolDelete implements `storage-pool delete <node> <pool>`.
 func storagePoolDelete(ctx context.Context, run *runContext) error {
@@ -165,18 +192,10 @@ func storagePoolDelete(ctx context.Context, run *runContext) error {
 
 	node, pool := run.Flags.Positionals[0], run.Flags.Positionals[1]
 
-	// A snapshot's copy on the node can only be deleted through the node's
-	// pool; with the pool gone the node's hold on the Snapshot is never
-	// released. The REST door refuses on the same.
 	if !run.Flags.Force {
-		refs, err := store.SnapshotsInPool(ctx, run.Store, node, pool)
+		err := refusePoolDeleteIfReferenced(ctx, run, node, pool)
 		if err != nil {
-			return fmt.Errorf("list snapshots on %s: %w", node, err)
-		}
-
-		if len(refs) > 0 {
-			return fmt.Errorf("%w: %s on %s may hold copies of snapshots [%s]; delete them or pass --force",
-				errPoolStillReferenced, pool, node, strings.Join(refs, ", "))
+			return err
 		}
 	}
 
