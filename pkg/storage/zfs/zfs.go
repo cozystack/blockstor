@@ -366,10 +366,12 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 // re-sets refreservation too (in case the peer sender is an old
 // un-patched binary), see RecvSnapshot.
 func (p *Provider) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.ReadCloser, error) {
-	srcDS := p.snapshotDataset(snap)
-	if !p.datasetExists(ctx, srcDS) {
-		return nil, errors.Wrapf(storage.ErrNotFound, "snapshot %s for send", srcDS)
+	argv, err := p.SendSnapshotArgs(ctx, snap)
+	if err != nil {
+		return nil, err
 	}
+
+	srcDS := argv[len(argv)-1]
 
 	// G204 is a false positive here: SendSnapshotArgs is a closed-form
 	// constructor over an internal `storage.Snapshot` (no user-supplied
@@ -378,7 +380,7 @@ func (p *Provider) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.
 	// explicit. The original `exec.CommandContext(ctx, "zfs", "send",
 	// srcDS)` form did not trip gosec because the third arg was a plain
 	// string literal-concat; the variadic spread now flags it.
-	cmd := exec.CommandContext(ctx, "zfs", p.SendSnapshotArgs(snap)...) //nolint:gosec // G204: argv built from internal Snapshot struct
+	cmd := exec.CommandContext(ctx, "zfs", argv...) //nolint:gosec // G204: argv built from internal Snapshot struct
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -397,9 +399,20 @@ func (p *Provider) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.
 // binary) that SendSnapshot would pass to `exec.CommandContext` for
 // the given snapshot. Exposed so unit tests can assert command-line
 // shape (notably the `-p` flag from Bug 251) without spawning a real
-// `zfs send` process.
-func (p *Provider) SendSnapshotArgs(snap storage.Snapshot) []string {
-	return []string{"send", "-p", p.snapshotDataset(snap)}
+// `zfs send` process. The snapshot is looked up where a replica delete
+// may have left it, under the renamed zvol, the same way a restore and a
+// delete find it.
+func (p *Provider) SendSnapshotArgs(ctx context.Context, snap storage.Snapshot) ([]string, error) {
+	srcDS, err := p.locateSnapshot(ctx, snap)
+	if err != nil {
+		return nil, err
+	}
+
+	if srcDS == "" {
+		return nil, errors.Wrapf(storage.ErrNotFound, "snapshot %s for send", p.snapshotDataset(snap))
+	}
+
+	return []string{"send", "-p", srcDS}, nil
 }
 
 // zfsSendReader bundles the zfs-send process with its stdout pipe

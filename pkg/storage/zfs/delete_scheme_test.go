@@ -952,3 +952,32 @@ func TestDeleteOnAnUnimportedPoolIsAnError(t *testing.T) {
 		t.Errorf("DeleteSnapshot on an unimported pool: got nil, want an error")
 	}
 }
+
+// A snapshot whose replica was deleted on this node, and then created again,
+// lives under the renamed zvol; a send ships it from there.
+func TestSendFindsTheSnapshotOfARenamedZvol(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-a_00000", "tank/pvc-a_00000@s1")
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank"}, p)
+
+	err := prov.DeleteVolume(t.Context(), vol("pvc-a"))
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	p.mu.Lock()
+	p.datasets["tank/pvc-a_00000"] = &dataset{}
+	p.mu.Unlock()
+
+	renamed := deletedName(t, p, "tank/_deleted_pvc-a_00000_")
+
+	argv, err := prov.SendSnapshotArgs(t.Context(), snap("pvc-a", "s1"))
+	if err != nil {
+		t.Fatalf("SendSnapshotArgs: %v", err)
+	}
+
+	if want := []string{"send", "-p", renamed + "@s1"}; !slices.Equal(argv, want) {
+		t.Errorf("argv %v, want %v", argv, want)
+	}
+}
