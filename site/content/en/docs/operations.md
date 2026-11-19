@@ -111,7 +111,7 @@ This deletes the node's replicas and pools, then the `Node`. It is refused while
 
 As in LINSTOR, nothing on the lost node's disks is touched. Its replicas' volumes and its copies of snapshots stay where they are: the replicas are removed without waiting for a satellite that will never run again, and the node's hold on its snapshots is dropped. A satellite that turns out to be running after all, with `--force`, tears down DRBD for those replicas and keeps their volumes. If the disks come back, delete what you do not need on them by hand.
 
-`blockstor node delete` removes only the `Node` object and refuses while replicas or pools still point at it. With `--force` it deletes them too, like `node lost`.
+`blockstor node delete` removes only the `Node` object and refuses while replicas or pools still point at it, or snapshots still have a copy on it. With `--force` it deletes them too, like `node lost`.
 
 ## Replacing a replica with a bad disk
 
@@ -191,7 +191,11 @@ Storage is deleted only by the delete of the object it belongs to, and only by t
 - **LVM thick.** A volume that still has snapshots is not removed, because removing it would remove them: the delete stays pending until the snapshots are deleted.
 - **A volume definition.** `volume-definition delete` removes the volume from the definition and leaves each replica's volume on disk; see [Compatibility](../compatibility/).
 
-A satellite that cannot tell whether a volume is there, because the pool does not answer or the pool is not registered yet after a restart, keeps the object and retries instead of reporting it deleted.
+- **A storage pool.** Deleting a pool never touches the disk. It is refused while a replica uses the pool, and, for a diskful pool, while a snapshot has a copy on the node, since that copy can only be deleted through the node's pools. `--force` overrides both, and a snapshot copy left in a pool removed that way is not deleted.
+
+A satellite that cannot tell whether a volume is there, because the pool does not answer, is not imported, or is not registered yet after a restart, keeps the object and retries instead of reporting it deleted.
+
+Clones that an older blockstor release promoted when their source was deleted own that source's snapshots, and no `Snapshot` points at them any more. Deleting such a clone now renames it to `_deleted_<name>_<time>` with those snapshots and keeps it. After upgrading, look for them with `zfs list -t snapshot -o name`: a snapshot under a replica's zvol that no `Snapshot` names is one of these. Destroy what you no longer need by hand.
 
 ## Backing up the control plane
 
