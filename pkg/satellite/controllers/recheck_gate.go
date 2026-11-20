@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -58,10 +59,25 @@ const (
 	// at most half of the time.
 	recheckCooldown = 1
 
+	// passReportInterval is how often the satellite logs how many
+	// resource passes it ran, by reason.
+	passReportInterval = time.Minute
+
 	// recheckMaxWait bounds how long a re-check gives way to passes an
 	// event asked for, so a node that never goes quiet still gets its
 	// safety net.
 	recheckMaxWait = time.Minute
+)
+
+// The reasons a resource pass runs for, as the gate counts them.
+const (
+	passResource   = "resource"   // the replica's own Resource changed
+	passPeer       = "peer"       // another node's replica of the same definition changed
+	passDefinition = "definition" // the ResourceDefinition changed
+	passKernel     = "kernel"     // the observer saw a kernel state change
+	passRetry      = "retry"      // the previous pass asked to be run again
+	passRecheck    = "recheck"    // the periodic re-check
+	passDeferred   = "deferred"   // a re-check that waited for its turn instead
 )
 
 // recheckGate runs the periodic re-checks of converged replicas one at
@@ -89,7 +105,9 @@ const (
 // and the slot cools down after each re-check for as long as it took.
 //
 // A pass is a re-check when the replica's previous pass scheduled one
-// and no event for the replica came in since. The events are counted
+// and no event for the replica came in since. Otherwise its reason is
+// the source of the last event that came in for it, or a retry the
+// previous pass asked for. The events are counted
 // where they enter the queue (marker and the map functions), which is
 // the only place that tells them apart from a timer.
 type recheckGate struct {
@@ -111,6 +129,9 @@ type recheckGate struct {
 	// the re-check and its cool-down.
 	line  []string
 	cycle time.Duration
+
+	// passes counts the passes since the last report, by reason.
+	passes map[string]uint64
 }
 
 // recheckState is what the gate knows about one replica: how many
@@ -120,6 +141,9 @@ type recheckState struct {
 	events uint64
 	due    bool
 
+	// source is the reason of the last event that came in.
+	source string
+
 	// waiting is when the re-check joined the line, and asked when it
 	// last asked for the slot; both are zero while it is not in line.
 	waiting time.Time
@@ -128,14 +152,15 @@ type recheckState struct {
 
 func newRecheckGate() *recheckGate {
 	return &recheckGate{
-		now:   time.Now,
-		state: map[string]recheckState{},
+		now:    time.Now,
+		state:  map[string]recheckState{},
+		passes: map[string]uint64{},
 	}
 }
 
-// changed records an event for name: its next pass has a reason other
-// than the timer.
-func (g *recheckGate) changed(name string) {
+// changed records an event from source for name: its next pass has a
+// reason other than the timer.
+func (g *recheckGate) changed(name, source string) {
 	if g == nil {
 		return
 	}
@@ -146,26 +171,89 @@ func (g *recheckGate) changed(name string) {
 	s := g.state[name]
 	s.events++
 	s.due = false
+	s.source = source
 	g.leaveLine(name, &s)
 	g.state[name] = s
 }
 
 // begin starts a pass of name. It returns the event count the pass
-// started at, for finish, and whether the pass is a re-check.
-func (g *recheckGate) begin(name string) (uint64, bool) {
+// started at, for finish, and the reason of the pass.
+func (g *recheckGate) begin(name string) (uint64, string) {
 	if g == nil {
-		return 0, false
+		return 0, passRetry
 	}
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	s := g.state[name]
-	recheck := s.due
+
+	reason := passRetry
+
+	switch {
+	case s.due:
+		reason = passRecheck
+	case s.source != "":
+		reason = s.source
+	}
+
 	s.due = false
+	s.source = ""
 	g.state[name] = s
 
-	return s.events, recheck
+	return s.events, reason
+}
+
+// count records a pass for reason.
+func (g *recheckGate) count(reason string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	g.passes[reason]++
+}
+
+// report returns the pass counts since the last report as key/value
+// pairs for the log, with the re-checks waiting in line and how long a
+// turn of the slot takes, and starts the counts over. It returns
+// nothing when no pass ran.
+func (g *recheckGate) report() []any {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if len(g.passes) == 0 {
+		return nil
+	}
+
+	fields := []any{"waiting", len(g.line), "turn", g.cycle.String()}
+
+	for _, reason := range []string{passResource, passPeer, passDefinition, passKernel, passRetry, passRecheck, passDeferred} {
+		fields = append(fields, reason, g.passes[reason])
+	}
+
+	clear(g.passes)
+
+	return fields
+}
+
+// reportEvery logs the pass counts every interval until ctx ends, so
+// the share of re-checks, and of the passes each kind of event causes,
+// can be read off the satellite log.
+func (g *recheckGate) reportEvery(interval time.Duration, logger logr.Logger) func(context.Context) error {
+	return func(ctx context.Context) error {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+				if kv := g.report(); kv != nil {
+					logger.Info("resource passes", kv...)
+				}
+			}
+		}
+	}
 }
 
 // finish ends a pass of name that began at token. When the pass
@@ -335,12 +423,13 @@ func (g *recheckGate) eventPass() func() {
 // holding the worker it was handed to.
 func (g *recheckGate) gate(inner reconcile.Reconciler) reconcile.Reconciler {
 	return reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-		token, recheck := g.begin(req.Name)
+		token, reason := g.begin(req.Name)
 
-		if recheck {
+		if reason == passRecheck {
 			started, wait, ok := g.tryAcquire(req.Name)
 			if !ok {
 				g.finish(req.Name, token, true)
+				g.count(passDeferred)
 
 				return reconcile.Result{RequeueAfter: wait}, nil
 			}
@@ -349,6 +438,8 @@ func (g *recheckGate) gate(inner reconcile.Reconciler) reconcile.Reconciler {
 		} else {
 			defer g.eventPass()()
 		}
+
+		g.count(reason)
 
 		scheduled := false
 
@@ -376,11 +467,12 @@ func schedulePeriodicRecheck(ctx context.Context) reconcile.Result {
 	return reconcile.Result{RequeueAfter: activeDRBDRequeue}
 }
 
-// marker is a predicate that lets every event through and records it.
-// It goes last in a chain, so only events that reach the queue count.
-func (g *recheckGate) marker() predicate.Predicate {
+// marker is a predicate that lets every event through and records it
+// as coming from source. It goes last in a chain, so only events that
+// reach the queue count.
+func (g *recheckGate) marker(source string) predicate.Predicate {
 	record := func(obj client.Object) bool {
-		g.changed(obj.GetName())
+		g.changed(obj.GetName(), source)
 
 		return true
 	}
@@ -393,12 +485,12 @@ func (g *recheckGate) marker() predicate.Predicate {
 	}
 }
 
-// mapFunc records an event for every replica fn enqueues.
-func (g *recheckGate) mapFunc(fn handler.MapFunc) handler.MapFunc {
+// mapFunc records an event from source for every replica fn enqueues.
+func (g *recheckGate) mapFunc(source string, fn handler.MapFunc) handler.MapFunc {
 	return func(ctx context.Context, obj client.Object) []reconcile.Request {
 		reqs := fn(ctx, obj)
 		for _, req := range reqs {
-			g.changed(req.Name)
+			g.changed(req.Name, source)
 		}
 
 		return reqs

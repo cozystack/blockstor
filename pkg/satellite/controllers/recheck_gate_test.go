@@ -31,34 +31,34 @@ import (
 func TestRecheckGateTellsRechecksFromEvents(t *testing.T) {
 	gate := newRecheckGate()
 
-	gate.changed("r")
+	gate.changed("r", passResource)
 
-	token, recheck := gate.begin("r")
-	if recheck {
+	token, reason := gate.begin("r")
+	if reason != passResource {
 		t.Fatalf("a pass an event asked for counted as a re-check")
 	}
 
 	gate.finish("r", token, true)
 
-	token, recheck = gate.begin("r")
-	if !recheck {
+	token, reason = gate.begin("r")
+	if reason != passRecheck {
 		t.Fatalf("the pass the previous one scheduled is not a re-check")
 	}
 
 	// An event while the re-check runs: the pass it causes has a reason
 	// of its own even though the re-check schedules the next one.
-	gate.changed("r")
+	gate.changed("r", passResource)
 	gate.finish("r", token, true)
 
-	if _, recheck = gate.begin("r"); recheck {
+	if _, reason = gate.begin("r"); reason == passRecheck {
 		t.Fatalf("a pass for an event that came in during a re-check counted as a re-check")
 	}
 
 	// An event between the scheduling and the pass.
 	gate.finish("r", gate.events("r"), true)
-	gate.changed("r")
+	gate.changed("r", passResource)
 
-	if _, recheck = gate.begin("r"); recheck {
+	if _, reason = gate.begin("r"); reason == passRecheck {
 		t.Fatalf("a re-check with an event since its scheduling counted as a re-check")
 	}
 
@@ -272,11 +272,72 @@ func TestEventTakesRecheckOutOfLine(t *testing.T) {
 		}
 	}
 
-	gate.changed("changed")
+	gate.changed("changed", passResource)
 	gate.release(started)
 
 	if _, _, ok := gate.tryAcquire("next"); !ok {
 		t.Fatalf("a replica an event took out of the line still holds it")
+	}
+}
+
+// TestPassesAreCountedByReason: the gate counts every pass by why it
+// ran, so the share of re-checks and of each kind of event can be read
+// off the satellite log, and starts the counts over on every report.
+func TestPassesAreCountedByReason(t *testing.T) {
+	gate, _ := newClockedRecheckGate()
+
+	reconciler := gate.gate(reconcile.Func(func(ctx context.Context, _ reconcile.Request) (reconcile.Result, error) {
+		return schedulePeriodicRecheck(ctx), nil
+	}))
+
+	pass := func(name string) {
+		t.Helper()
+
+		_, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if kv := gate.report(); kv != nil {
+		t.Fatalf("a report before any pass: %v", kv)
+	}
+
+	gate.changed("a", passPeer)
+	pass("a") // the peer event
+	pass("a") // its re-check
+
+	gate.changed("b", passKernel)
+	pass("b")
+	pass("c") // nothing asked for it: a retry
+
+	started, _, _ := gate.tryAcquire("holder")
+	pass("a") // the re-check waits for the slot
+	gate.release(started)
+
+	want := map[string]uint64{passPeer: 1, passKernel: 1, passRetry: 1, passRecheck: 1, passDeferred: 1}
+
+	got := map[string]uint64{}
+
+	kv := gate.report()
+	for i := 0; i+1 < len(kv); i += 2 {
+		if n, ok := kv[i+1].(uint64); ok {
+			got[kv[i].(string)] = n
+		}
+	}
+
+	for reason, n := range want {
+		if got[reason] != n {
+			t.Errorf("%s passes = %d, want %d (report %v)", reason, got[reason], n, kv)
+		}
+	}
+
+	if got[passResource] != 0 || got[passDefinition] != 0 {
+		t.Errorf("passes counted for events that did not come in: %v", kv)
+	}
+
+	if kv := gate.report(); kv != nil {
+		t.Errorf("the counts did not start over after a report: %v", kv)
 	}
 }
 
@@ -293,10 +354,10 @@ func newClockedRecheckGate() (*recheckGate, *time.Time) {
 func TestNilRecheckGateGatesNothing(t *testing.T) {
 	var gate *recheckGate
 
-	gate.changed("r")
+	gate.changed("r", passResource)
 	gate.finish("r", 0, true)
 
-	if _, recheck := gate.begin("r"); recheck {
+	if _, reason := gate.begin("r"); reason == passRecheck {
 		t.Fatalf("a reconciler without SetupWithManager gated a pass")
 	}
 }
@@ -321,7 +382,7 @@ func TestRecheckIsWhatThePassSays(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, recheck := gate.begin("r"); recheck {
+	if _, reason := gate.begin("r"); reason == passRecheck {
 		t.Errorf("a pass that only shares the re-check period counted as scheduling a re-check")
 	}
 
@@ -330,9 +391,17 @@ func TestRecheckIsWhatThePassSays(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, recheck := gate.begin("r"); !recheck {
+	if _, reason := gate.begin("r"); reason != passRecheck {
 		t.Errorf("a pass that scheduled the re-check was not followed by one")
 	}
+}
+
+// passCount is how many passes ran for reason since the last report.
+func (g *recheckGate) passCount(reason string) uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.passes[reason]
 }
 
 // events is the event count of name, as a pass starting now would get it.

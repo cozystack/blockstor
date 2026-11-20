@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -278,6 +279,12 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // rendered a peer-less .res, and never re-rendered because
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
+//
+// Every way an event reaches the queue goes through the re-check gate:
+// For and the kernel trigger through r.recheck.marker, every Watches
+// map function through r.recheck.mapFunc. A Watches added without it
+// still works, but the gate takes its passes for re-checks of replicas
+// that have one due and holds them for the re-check slot.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.recheck = newRecheckGate()
 
@@ -287,14 +294,14 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				predicate.And(
 					nodeNamePredicate(r.Config.NodeName),
 					primaryWatchPredicate(),
-					r.recheck.marker(),
+					r.recheck.marker(passResource),
 				),
 			)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueLocalSiblings)),
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passPeer, r.enqueueLocalSiblings)),
 			builder.WithPredicates(siblingWatchPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
-			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueResourcesForRD))).
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passDefinition, r.enqueueResourcesForRD))).
 		Named("satellite-resource").
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.resourceWorkers()})
 
@@ -309,13 +316,19 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Config.ReconcileTrigger != nil {
 		bldr = bldr.WatchesRawSource(
 			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
-				source.WithPredicates[client.Object, reconcile.Request](r.recheck.marker())),
+				source.WithPredicates[client.Object, reconcile.Request](r.recheck.marker(passKernel))),
 		)
 	}
 
 	err := bldr.Complete(r.recheck.gate(r))
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
+	}
+
+	err = mgr.Add(manager.RunnableFunc(r.recheck.reportEvery(passReportInterval,
+		mgr.GetLogger().WithName("satellite-resource"))))
+	if err != nil {
+		return errors.Wrap(err, "register resource pass report")
 	}
 
 	return nil

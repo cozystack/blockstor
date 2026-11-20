@@ -173,3 +173,139 @@ func TestPeriodicRechecksRunOneAtATime(t *testing.T) {
 
 	released.Do(func() { close(reader.release) })
 }
+
+// TestPeerStatusChurnStartsNoPass: each peer's observer rewrites its
+// Resource's status on kernel frames, and on a busy node most of those
+// writes change nothing the local apply reads. They used to start a
+// full local pass each, outside the re-check gate and on every worker
+// at once. Only a peer change the apply reads may start one.
+func TestPeerStatusChurnStartsNoPass(t *testing.T) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		t.Skip("KUBEBUILDER_ASSETS not set; run via `make test` (needs envtest apiserver)")
+	}
+
+	const (
+		local    = "n1"
+		peer     = "n2"
+		pool     = "lvm-thin"
+		replicas = 4
+		churn    = 20
+	)
+
+	cli, mgr := startBringupEnvtest(t)
+
+	for _, node := range []string{local, peer} {
+		bringupCreate(t, cli, &blockstoriov1alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: node},
+			Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+		})
+	}
+
+	bringupCreate(t, cli, &blockstoriov1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{Name: pool + "." + local},
+		Spec:       blockstoriov1alpha1.StoragePoolSpec{NodeName: local, PoolName: pool, ProviderKind: "LVM_THIN"},
+	})
+
+	for i := range replicas {
+		rd := fmt.Sprintf("pvc-churn-%02d", i)
+		bringupDefinition(t, cli, rd)
+		bringupReplica(t, cli, rd, local, pool, int32(i), 0)
+		bringupReplica(t, cli, rd, peer, pool, int32(i), 1)
+	}
+
+	reader := &concurrencyReader{Reader: mgr.GetAPIReader()}
+
+	rec := &ResourceReconciler{
+		Client: mgr.GetClient(),
+		Config: Config{
+			NodeName: local,
+			Apply: satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{pool: &noopProvider{}},
+				NodeName:  local,
+			}),
+			Exec:      storage.NewFakeExec(),
+			APIReader: reader,
+		},
+	}
+
+	err := rec.SetupWithManager(mgr)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		mgrErr := mgr.Start(ctx)
+		if mgrErr != nil {
+			t.Errorf("manager: %v", mgrErr)
+		}
+	})
+
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	bringupWaitFor(t, 30*time.Second, func() bool { return reader.passes.Load() >= replicas })
+
+	writePeerStatus := func(outOfSync int64) {
+		t.Helper()
+
+		for r := range replicas {
+			var res blockstoriov1alpha1.Resource
+
+			key := client.ObjectKey{Name: fmt.Sprintf("pvc-churn-%02d.%s", r, peer)}
+
+			err := cli.Get(t.Context(), key, &res)
+			if err != nil {
+				t.Fatalf("get %s: %v", key.Name, err)
+			}
+
+			res.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{{
+				VolumeNumber: 0, DiskState: "UpToDate", CurrentGI: "1234ABCD", OutOfSyncKib: outOfSync,
+			}}
+
+			err = cli.Status().Update(t.Context(), &res)
+			if err != nil {
+				t.Fatalf("write status of %s: %v", key.Name, err)
+			}
+		}
+	}
+
+	// The peers' creation, allocation and first disk state are peer
+	// events the apply reads; start counting once they have all been
+	// taken.
+	writePeerStatus(0)
+	time.Sleep(2 * time.Second)
+	rec.recheck.report()
+
+	for i := range churn {
+		writePeerStatus(int64(i + 1))
+	}
+
+	time.Sleep(2 * time.Second)
+
+	if n := rec.recheck.passCount(passPeer); n != 0 {
+		t.Errorf("%d local passes for %d peer status writes that change nothing the apply reads", n, churn*replicas)
+	}
+
+	// A peer change the apply does read still reaches the local replica.
+	var res blockstoriov1alpha1.Resource
+
+	err = cli.Get(t.Context(), client.ObjectKey{Name: "pvc-churn-00." + peer}, &res)
+	if err != nil {
+		t.Fatalf("get peer: %v", err)
+	}
+
+	res.Spec.Props = map[string]string{"Aux/test": "changed"}
+
+	err = cli.Update(t.Context(), &res)
+	if err != nil {
+		t.Fatalf("change peer spec: %v", err)
+	}
+
+	bringupWaitFor(t, 10*time.Second, func() bool { return rec.recheck.passCount(passPeer) > 0 })
+}
