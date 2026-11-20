@@ -23,7 +23,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -160,5 +162,86 @@ func TestSnapshotWindowResumesBeforeReadingTheKernel(t *testing.T) {
 
 	if rig.kernel.isSuspended() {
 		t.Errorf("still suspended after the window: %v", after)
+	}
+}
+
+// hangingStatusClient is an API whose status writes hang, deaf to
+// their context, while hang is set, as on an API server that is
+// unreachable or a satellite starved of CPU.
+type hangingStatusClient struct {
+	client.Client
+
+	hang    atomic.Bool
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *hangingStatusClient) Status() client.SubResourceWriter {
+	return &hangingStatusWriter{SubResourceWriter: c.Client.Status(), c: c}
+}
+
+func (c *hangingStatusClient) unblock() {
+	c.once.Do(func() { close(c.release) })
+}
+
+type hangingStatusWriter struct {
+	client.SubResourceWriter
+
+	c *hangingStatusClient
+}
+
+func (w *hangingStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if w.c.hang.Load() {
+		<-w.c.release
+	}
+
+	return w.SubResourceWriter.Update(ctx, obj, opts...) //nolint:wrapcheck // test double
+}
+
+func (w *hangingStatusWriter) Patch(
+	ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption,
+) error {
+	if w.c.hang.Load() {
+		<-w.c.release
+	}
+
+	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...) //nolint:wrapcheck // test double
+}
+
+
+// Between forgetting a window and removing its marker, the close is
+// still settling the Snapshot. The sweep of leftover markers took such
+// a marker for one an earlier process left and failed a snapshot whose
+// take had already stamped Ready.
+func TestSnapshotWindowCloseIsNotTakenForALeftoverMarker(t *testing.T) {
+	t.Parallel()
+
+	rig := newWindowRig(t)
+	api := &hangingStatusClient{Client: rig.cli, release: make(chan struct{})}
+	rig.r.Client = api
+	rig.r.timing.windowDeadline = 300 * time.Millisecond
+	rig.startWatchdog()
+	t.Cleanup(api.unblock)
+
+	rig.reconcile()
+	rig.controllerSets(true, true)
+	rig.reconcile()
+	eventually(t, "Ready", func() bool { return rig.node().Ready })
+
+	api.hang.Store(true)
+
+	eventually(t, "resume at the deadline", func() bool { return !rig.kernel.isSuspended() })
+
+	// Many watchdog ticks while the close's status write hangs.
+	time.Sleep(20 * rig.r.timing.watchdogTick)
+
+	api.hang.Store(false)
+	api.unblock()
+
+	eventually(t, "ack cleared", func() bool { return !rig.node().SuspendIOAcked })
+	eventually(t, "marker removed", func() bool { return !rig.markerExists() })
+
+	if node := rig.node(); node.Failed {
+		t.Errorf("node status %+v, a snapshot stamped Ready was failed as well", node)
 	}
 }

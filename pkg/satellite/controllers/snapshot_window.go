@@ -229,7 +229,8 @@ type snapshotWindows struct {
 	// storage snapshot, and a delete must not run before it returns.
 	takes map[string]*takeRun
 	// resumingMarkers guards resumes of windows left by an earlier
-	// process, which have a marker but no entry in windows.
+	// process, which have a marker but no entry in windows, and the
+	// marker of a closed window until its close has settled it.
 	resumingMarkers map[string]bool
 	// resumingResources guards resumes of suspends that no window or
 	// marker accounts for, by resource.
@@ -797,10 +798,16 @@ func (r *SnapshotReconciler) closeWindow(ctx context.Context, snapshot string, f
 		return err
 	}
 
+	// The marker outlives the window until the Snapshot is settled. It
+	// stays claimed meanwhile, or the sweep would take it for one an
+	// earlier process left and fail a snapshot this close is settling.
 	set.mu.Lock()
 	delete(set.windows, snapshot)
 	delete(set.lastWarn, snapshot)
+	set.resumingMarkers[snapshot] = true
 	set.mu.Unlock()
+
+	defer set.releaseLeftover(snapshot)
 
 	settleErr := r.settleResumed(ctx, snapshot, failOwed)
 	if settleErr != nil {
