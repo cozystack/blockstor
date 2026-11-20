@@ -304,3 +304,52 @@ func TestSnapshotCreateWaitsOutACacheThatTrailsTheCreate(t *testing.T) {
 		t.Errorf("view right after the create: flags %v, want SUCCESSFUL", flags)
 	}
 }
+
+// TestSnapshotCreateMultiAnswersARefusalAtOnce: a batch with a refused
+// entry never assembles its group, so no take starts before the
+// controller's suspend deadline. The refusal is answered at once, not
+// after the wait, which a CSI sidecar gives up on first.
+func TestSnapshotCreateMultiAnswersARefusalAtOnce(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	base := startTakeWaitServer(t, st, 10*time.Second)
+
+	body := []byte(`{"snapshots":[
+		{"resource_name":"pvc-1","name":"snap-1"},
+		{"resource_name":"pvc-missing","name":"snap-1"}
+	]}`)
+
+	ctx, cancel := context.WithTimeout(t.Context(), postDeadline)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+multiCreatePath, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST after %v: %v", time.Since(start), err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("refused batch answered after %v, want at once", elapsed)
+	}
+
+	var rcs []apiv1.APICallRc
+
+	err = json.NewDecoder(resp.Body).Decode(&rcs)
+	if err != nil {
+		t.Fatalf("decode rcs: %v", err)
+	}
+
+	if !slices.ContainsFunc(rcs, func(rc apiv1.APICallRc) bool { return rc.RetCode&apiCallRcError != 0 }) {
+		t.Errorf("want the refusal in the answer, got %+v", rcs)
+	}
+}

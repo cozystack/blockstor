@@ -128,8 +128,14 @@ func (s *Server) handleSnapshotCreateMulti(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Answer once the takes are over, as LINSTOR does: linstor-csi caches
-	// the view it reads right after this call.
-	s.waitSnapshotsSettled(r.Context(), created)
+	// the view it reads right after this call. A batch with a refused
+	// entry is answered at once: its siblings were stamped with the full
+	// GroupSize, so the group never assembles and no take starts until
+	// the controller's suspend deadline aborts it, past the point a
+	// client still waits for the refusal.
+	if len(created) == len(body.Snapshots) {
+		s.waitSnapshotsSettled(r.Context(), created)
+	}
 
 	writeJSON(w, http.StatusCreated, results)
 }
