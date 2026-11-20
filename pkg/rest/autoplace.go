@@ -2538,15 +2538,25 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	ok = s.applyMakeAvailable(w, r, rdName, node, &req)
+	created, ok := s.applyMakeAvailable(w, r, rdName, node, &req)
 	if !ok {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	// A replica make-available created goes through LINSTOR's
+	// createResource and so its deployResources: the answer comes once
+	// the satellite built it. linstor-csi's ControllerPublishVolume
+	// reads the replica's device path right after this call, and a
+	// replica the call only changed was built before.
+	var notReady []apiv1.APICallRc
+	if created {
+		notReady = s.waitDeployedReplicasReady(r.Context(), rdName, []string{node})
+	}
+
+	writeJSON(w, http.StatusOK, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "Resource '" + rdName + "' on node '" + node + "' made available",
-	}})
+	}}, notReady...))
 }
 
 // decodeMakeAvailableBody parses the optional JSON body. Upstream
@@ -2584,25 +2594,29 @@ func decodeMakeAvailableBody(w http.ResponseWriter, r *http.Request) (apiv1.Reso
 }
 
 // applyMakeAvailable dispatches to update-or-create depending on
-// whether a Resource already lives on the target node. Writes the
-// HTTP error response on failure and returns false.
-func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdName, node string, req *apiv1.ResourceMakeAvailable) bool {
+// whether a Resource already lives on the target node, and reports
+// whether it created one. Writes the HTTP error response on failure
+// and returns false.
+func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdName, node string, req *apiv1.ResourceMakeAvailable) (bool, bool) {
 	existing, err := s.Store.Resources().Get(r.Context(), rdName, node)
+
+	created := false
 
 	switch {
 	case err == nil:
 		err = s.makeAvailableUpdate(r.Context(), &existing, req)
 	case errors.Is(err, store.ErrNotFound):
 		err = s.makeAvailableCreate(r.Context(), rdName, node, req)
+		created = err == nil
 	}
 
 	if err != nil {
 		writeStoreError(w, err)
 
-		return false
+		return false, false
 	}
 
-	return true
+	return created, true
 }
 
 // makeAvailableUpdate mutates an existing replica to match the

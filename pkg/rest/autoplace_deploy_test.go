@@ -20,6 +20,8 @@ package rest
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"slices"
 	"testing"
 	"time"
@@ -305,5 +307,39 @@ func TestReplicaBuilt(t *testing.T) {
 				t.Errorf("replicaBuilt: got %v, want %v", got, tc.built)
 			}
 		})
+	}
+}
+
+// TestMakeAvailableAnswersOnceTheDisklessReplicaIsBuilt pins LINSTOR's
+// make-available on a node without a replica: it creates the diskless
+// replica through createResource and so answers after deployResources.
+// linstor-csi's ControllerPublishVolume reads the replica's device path
+// right after this call; an earlier answer failed the remote attach and
+// left it to the attacher's backoff.
+func TestMakeAvailableAnswersOnceTheDisklessReplicaIsBuilt(t *testing.T) {
+	st := store.NewInMemory()
+
+	seedReadyWaitDefinition(t, st, "pvc-remote", "n1", "n2", "n3")
+	seedReplica(t, st, "pvc-remote", "n1", true, []string{"n1", "n2"})
+	seedReplica(t, st, "pvc-remote", "n2", true, []string{"n1", "n2"})
+
+	base := startDeployWaitServer(t, st, 10*time.Second, 10*time.Second)
+	standIn := satelliteStandIn(t.Context(), st, "pvc-remote", 3, []string{"n3"}, false)
+
+	body, err := json.Marshal(apiv1.ResourceMakeAvailable{Diskful: false})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rcs, _ := postForRcs(t, base+"/v1/resource-definitions/pvc-remote/resources/n3/make-available", body, http.StatusOK)
+
+	requireDevicePaths(t, st, "pvc-remote", []string{"n3"})
+
+	if w := warningsFor(rcs); len(w) != 0 {
+		t.Errorf("unexpected warnings for a replica that was built: %v", w)
+	}
+
+	if err := <-standIn; err != nil {
+		t.Fatalf("satellite stand-in: %v", err)
 	}
 }
