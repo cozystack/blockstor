@@ -2306,6 +2306,12 @@ var ErrMinorInUse = errors.New("DRBD device is in use")
 // open device is refused here, and a detach that fails on a volume that has
 // a disk stops the removal before anything else runs.
 func (a *Adm) RemoveMinor(ctx context.Context, minor int32) error {
+	return a.removeMinor(ctx, minor, nil)
+}
+
+// removeMinor is RemoveMinor with a check run after the detach, right
+// before del-minor; an error from it stops the removal there.
+func (a *Adm) removeMinor(ctx context.Context, minor int32, beforeDelMinor func(context.Context) error) error {
 	m := strconv.Itoa(int(minor))
 
 	dev, err := a.minorDevice(ctx, minor)
@@ -2325,6 +2331,13 @@ func (a *Adm) RemoveMinor(ctx context.Context, minor int32) error {
 		_, err = a.exec.Run(ctx, "drbdsetup", "detach", m)
 		if err != nil {
 			return errors.Wrapf(err, "drbdsetup detach %s", m)
+		}
+	}
+
+	if beforeDelMinor != nil {
+		err = beforeDelMinor(ctx)
+		if err != nil {
+			return err
 		}
 	}
 

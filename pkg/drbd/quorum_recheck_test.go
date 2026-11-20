@@ -452,3 +452,87 @@ func TestRemoveMinorsKeepingQuorum(t *testing.T) {
 		})
 	}
 }
+
+// Nothing locks out an opener while a removal runs under io-error, and an
+// open on a remaining volume can auto-promote the resource, whose requests
+// would then fail with EIO instead of being held. So the role and the
+// openers are read again right before each del-minor and after each one
+// another follows, and suspend-io is set back before anything else runs
+// once the resource is Primary or a remaining volume is open.
+func TestRemoveMinorsKeepingQuorumWatchesForAnOpener(t *testing.T) {
+	t.Parallel()
+
+	const (
+		detach56 = "drbdsetup detach 20056"
+		del56    = "drbdsetup del-minor 20056"
+		detach57 = "drbdsetup detach 20057"
+		del57    = "drbdsetup del-minor 20057"
+	)
+
+	three := quorumStatusJSON(quorumSusp{}, "true", "true", "true")
+	secondary := secondaryStatus(three, false)
+
+	for _, tc := range []struct {
+		name    string
+		minors  []int32
+		later   []storage.FakeResponse
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:   "still a secondary with no opener",
+			minors: []int32{20056},
+			later:  []storage.FakeResponse{{Stdout: []byte(secondary)}},
+			want:   []string{toIOError, detach56, del56, toSuspendIO},
+		},
+		{
+			name:   "promoted during the detach",
+			minors: []int32{20056},
+			later:  []storage.FakeResponse{{Stdout: []byte(three)}},
+			want:   []string{toIOError, detach56, toSuspendIO, del56},
+		},
+		{
+			name:   "a remaining volume opened during the detach",
+			minors: []int32{20056},
+			later:  []storage.FakeResponse{{Stdout: []byte(secondaryStatus(three, true))}},
+			want:   []string{toIOError, detach56, toSuspendIO, del56},
+		},
+		{
+			name:   "promoted between two removals",
+			minors: []int32{20056, 20057},
+			later:  []storage.FakeResponse{{Stdout: []byte(secondary)}, {Stdout: []byte(three)}},
+			want:   []string{toIOError, detach56, del56, toSuspendIO, detach57, del57},
+		},
+		{
+			name:    "the status cannot be read again",
+			minors:  []int32{20056},
+			later:   []storage.FakeResponse{{Err: errFakeFailure}},
+			want:    []string{toIOError, detach56, toSuspendIO},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			fx := storage.NewFakeExec()
+			fx.ExpectSequence("drbdsetup status pvc-a --json",
+				append([]storage.FakeResponse{{Stdout: []byte(secondary)}}, tc.later...)...)
+			fx.Expect("drbdsetup status pvc-a --json", storage.FakeResponse{Stdout: []byte(secondary)})
+			fx.Expect("drbdsetup show pvc-a --json", storage.FakeResponse{Stdout: []byte(quorumShowJSON(suspendIOOptions, ""))})
+			fx.Expect("drbdsetup status --verbose", storage.FakeResponse{Stdout: []byte(
+				"pvc-a node-id:2 role:Secondary suspended:no\n" +
+					"  volume:0 minor:20055 disk:UpToDate open:no\n" +
+					"  volume:1 minor:20056 disk:UpToDate open:no\n" +
+					"  volume:2 minor:20057 disk:UpToDate open:no\n")})
+
+			err := drbd.NewAdm(fx).RemoveMinorsKeepingQuorum(t.Context(), "pvc-a", tc.minors)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("RemoveMinorsKeepingQuorum: %v, want error %t", err, tc.wantErr)
+			}
+
+			if got := removalCommands(fx.CommandLines()); !slices.Equal(got, tc.want) {
+				t.Errorf("commands %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

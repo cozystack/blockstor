@@ -66,6 +66,16 @@ const (
 // minors are removed as they are, and RecheckQuorumAfterVolumeRemoval
 // recomputes afterwards. The policy is restored even when a removal fails;
 // should that fail too, the next `drbdadm adjust` sets it from the .res.
+//
+// Nothing locks out an opener while this runs, and an open on a remaining
+// volume can auto-promote the resource. A Primary under io-error would see
+// EIO where suspend-io holds its requests, so the role and the openers are
+// read again after each detach, right before del-minor turns replication
+// off, and after each del-minor that another one follows. Once either
+// shows up, suspend-io is set back before anything else runs, and the
+// removal goes on as it does anywhere else. A promotion that lands inside
+// a del-minor itself, or between the last one and setting suspend-io back,
+// is not caught: that window is two drbdsetup calls wide and is accepted.
 func (a *Adm) RemoveMinorsKeepingQuorum(ctx context.Context, resource string, minors []int32) error {
 	relax, err := a.canRelaxQuorumPolicy(ctx, resource, minors)
 	if err != nil {
@@ -79,23 +89,71 @@ func (a *Adm) RemoveMinorsKeepingQuorum(ctx context.Context, resource string, mi
 		}
 	}
 
+	// keepRelaxed sets suspend-io back as soon as the resource is Primary
+	// or a remaining volume is open.
+	keepRelaxed := func(ctx context.Context) error {
+		if !relax {
+			return nil
+		}
+
+		ok, err := a.stillRelaxable(ctx, resource, minors)
+		if err != nil || ok {
+			return err
+		}
+
+		relax = false
+
+		return a.restoreOnNoQuorum(ctx, resource)
+	}
+
 	var removeErr error
 
-	for _, minor := range minors {
-		removeErr = a.RemoveMinor(ctx, minor)
+	for i, minor := range minors {
+		removeErr = a.removeMinor(ctx, minor, keepRelaxed)
+		if removeErr == nil && i < len(minors)-1 {
+			removeErr = keepRelaxed(ctx)
+		}
+
 		if removeErr != nil {
 			break
 		}
 	}
 
 	if relax {
-		err = a.setOnNoQuorum(ctx, resource, suspendIO)
+		err = a.restoreOnNoQuorum(ctx, resource)
 		if err != nil {
-			return errors.CombineErrors(removeErr, errors.Wrapf(err, "restore on-no-quorum of %s", resource)) //nolint:wrapcheck // both are wrapped
+			return errors.CombineErrors(removeErr, err) //nolint:wrapcheck // both are wrapped
 		}
 	}
 
 	return removeErr
+}
+
+// restoreOnNoQuorum sets the resource's on-no-quorum back to suspend-io.
+func (a *Adm) restoreOnNoQuorum(ctx context.Context, resource string) error {
+	err := a.setOnNoQuorum(ctx, resource, suspendIO)
+	if err != nil {
+		return errors.Wrapf(err, "restore on-no-quorum of %s", resource)
+	}
+
+	return nil
+}
+
+// stillRelaxable reports whether the resource is still Secondary with no
+// opener on a volume that stays, so io-error may stay in force.
+func (a *Adm) stillRelaxable(ctx context.Context, resource string, minors []int32) (bool, error) {
+	res, err := a.quorumStatus(ctx, resource)
+	if err != nil || res == nil || Role(res.Role).IsPrimary() {
+		return false, err
+	}
+
+	for _, dev := range res.Devices {
+		if dev.Open && !slices.Contains(minors, dev.Minor) {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 // canRelaxQuorumPolicy reports whether on-no-quorum may be io-error while
