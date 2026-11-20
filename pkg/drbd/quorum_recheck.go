@@ -216,6 +216,17 @@ func remainingVolumesHoldQuorum(res *drbdsetupStatusResource, minors []int32) bo
 // also lifts a snapshot's, a no-data and a fencing suspension, and on a
 // resource that is not suspended it changes nothing, so DRBD skips the
 // state change and the io-error verdict stays stale.
+//
+// For the two calls' duration the resource runs under the other policy. A
+// Primary held on quorum thus runs under io-error for that moment, and a
+// quorum it really loses inside it fails its requests with EIO instead of
+// holding them. Switching quorum, say from majority to all and back,
+// would force the same recompute without passing through io-error, but it
+// is not used: under all, a resource with one peer down and not yet
+// outdated loses quorum for certain rather than by a race, which suspends
+// it and runs the quorum-lost handler of a Primary, and a quorum only the
+// diskless tiebreaker held need not come back after it, as the tiebreaker
+// keeps a quorum the volume has and never grants one it lost.
 func (a *Adm) RecheckQuorumAfterVolumeRemoval(ctx context.Context, resource string) (QuorumRecheck, error) {
 	res, err := a.quorumStatus(ctx, resource)
 	if err != nil || res == nil || !everyVolumeHasQuorum(res) {
