@@ -42,7 +42,7 @@ const (
 
 // balanceGate holds what one placement pass nobody asked for (the
 // scheduled rebalance tick, an RG watch event, an `rg modify` that did
-// not raise the place count) reads once and applies to every child
+// not name a place count) reads once and applies to every child
 // definition: the controller-scope props and which nodes are online.
 type balanceGate struct {
 	st        store.Store

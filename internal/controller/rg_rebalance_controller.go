@@ -175,12 +175,12 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; hasAnnotation {
 		// Operator intent: ignore per-RD shortfall grace and the
 		// per-node offline grace — a REST modify means "act now".
-		// Only a raised place count is the placement LINSTOR's own
-		// `rg modify` runs; a modify that changed a placement
+		// Only a modify that named a place count is the placement
+		// LINSTOR's own `rg modify` runs; one that changed a placement
 		// constraint alone gets the balance checks.
-		_, placeCountRaised := rg.Annotations[apiv1.AnnotationRGRebalancePlaceCount]
+		_, placeCount := rg.Annotations[apiv1.AnnotationRGRebalancePlaceCount]
 
-		count, perr := r.rebalanceChildRDs(ctx, rg, 0, !placeCountRaised)
+		count, perr := r.rebalanceChildRDs(ctx, rg, 0, !placeCount)
 		if perr != nil {
 			return perr
 		}
