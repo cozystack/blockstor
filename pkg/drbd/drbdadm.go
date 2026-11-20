@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/cockroachdb/errors"
 
@@ -48,6 +49,11 @@ const drbdmetaNoMinor = "-"
 // storage.FakeExec and assert the exact command lines.
 type Adm struct {
 	exec storage.Exec
+
+	// schemaMu guards diskSchema, the disk-section schema read once from
+	// this node's drbdsetup (DiskOptionSchema).
+	schemaMu   sync.Mutex
+	diskSchema *OptionSchema
 }
 
 // NewAdm constructs an Adm with the given Exec.
@@ -101,6 +107,71 @@ func (a *Adm) SetupDown(ctx context.Context, resource string) error {
 // changes (added/removed peers, new options).
 func (a *Adm) Adjust(ctx context.Context, resource string) error {
 	return a.run(ctx, "adjust", resource)
+}
+
+// CheckResFile asks drbdadm whether the node's configuration still parses
+// with candidate in place of live: `drbdadm --config-to-test <candidate>
+// --config-to-exclude <live> sh-nop`.
+//
+// LINSTOR's satellite does not run it: its DrbdAdm.checkResFile has no
+// caller, and DrbdResourceFileUtils moves a new body into place
+// unchecked. blockstor checks deliberately, which is stricter, and
+// docs/cli-parity-known-deltas.md lists it as a divergence.
+//
+// It matters beyond the one resource because drbdadm reads every .res
+// on the node for any command. A file it cannot parse stops adjust,
+// dump-md and every other drbdadm call for all resources there, not just
+// its own, so it has to be caught before it lands under its real name.
+// live need not exist: a resource's first .res excludes nothing.
+func (a *Adm) CheckResFile(ctx context.Context, candidate, live string) error {
+	_, err := a.exec.Run(ctx, "drbdadm", "--config-to-test", candidate, "--config-to-exclude", live, "sh-nop")
+	if err != nil {
+		return errors.Wrapf(err, "drbdadm refuses %s", candidate)
+	}
+
+	return nil
+}
+
+// DiskOptionSchema returns what this node's drbd-utils accepts inside a
+// `disk { }` section, read from `drbdsetup xml-help` for each of
+// DiskSectionCommands, the way LINSTOR's satellite builds its option
+// whitelist when it starts. The answer is kept for the life of the
+// process: drbd-utils ships in the image, so it cannot change under a
+// running satellite.
+//
+// A failure is not kept, so a drbdsetup that could not answer once is
+// asked again on the next render, and it returns a nil schema, which
+// accepts every option: the render then goes ahead unfiltered, as it did
+// before the schema existed, and CheckResFile still stands between a
+// body drbdadm refuses and the live file.
+func (a *Adm) DiskOptionSchema(ctx context.Context) (*OptionSchema, error) {
+	a.schemaMu.Lock()
+	defer a.schemaMu.Unlock()
+
+	if a.diskSchema != nil {
+		return a.diskSchema, nil
+	}
+
+	commands := DiskSectionCommands()
+	docs := make([][]byte, 0, len(commands))
+
+	for _, cmd := range commands {
+		out, err := a.exec.Run(ctx, "drbdsetup", "xml-help", cmd)
+		if err != nil {
+			return nil, errors.Wrapf(err, "drbdsetup xml-help %s", cmd)
+		}
+
+		docs = append(docs, out)
+	}
+
+	schema, err := ParseOptionSchema(docs...)
+	if err != nil {
+		return nil, err
+	}
+
+	a.diskSchema = schema
+
+	return schema, nil
 }
 
 // InvalidateVolume runs `drbdadm invalidate <resource>/<vol>` — marks the

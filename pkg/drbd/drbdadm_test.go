@@ -1301,3 +1301,38 @@ func TestHasMDFailsClosedOnUnrecognisedFailure(t *testing.T) {
 		t.Errorf("HasMD on an unrecognised failure: got true, want false")
 	}
 }
+
+// TestAdmCheckResFileTestsTheCandidateInPlaceOfTheLiveFile: the check
+// parses the node's whole configuration with the candidate standing in
+// for the live file, the way LINSTOR's satellite checks a .res before it
+// installs one. Without the exclusion the two would clash as two
+// definitions of the same resource; without sh-nop it would act.
+func TestAdmCheckResFileTestsTheCandidateInPlaceOfTheLiveFile(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	if err := adm.CheckResFile(t.Context(), "/etc/drbd.d/pvc-1.res.tmp", "/etc/drbd.d/pvc-1.res"); err != nil {
+		t.Fatalf("CheckResFile: %v", err)
+	}
+
+	want := "drbdadm --config-to-test /etc/drbd.d/pvc-1.res.tmp --config-to-exclude /etc/drbd.d/pvc-1.res sh-nop"
+	if got := fx.CommandLines(); !slices.Equal(got, []string{want}) {
+		t.Errorf("calls = %v, want [%s]", got, want)
+	}
+}
+
+// TestAdmCheckResFileReportsARefusal: a parse error is drbdadm's exit
+// status, and it has to reach the caller, which keeps the live file.
+func TestAdmCheckResFileReportsARefusal(t *testing.T) {
+	fx := storage.NewFakeExec()
+	refused := errRefusedRes
+	fx.Expect("drbdadm --config-to-test /s/pvc-1.res.tmp --config-to-exclude /s/pvc-1.res sh-nop",
+		storage.FakeResponse{Err: refused})
+
+	err := drbd.NewAdm(fx).CheckResFile(t.Context(), "/s/pvc-1.res.tmp", "/s/pvc-1.res")
+	if !errors.Is(err, refused) {
+		t.Fatalf("CheckResFile = %v, want the refusal", err)
+	}
+}
+
+var errRefusedRes = errors.New("parse error")

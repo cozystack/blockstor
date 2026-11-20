@@ -21,6 +21,7 @@ package manifests
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -157,4 +158,45 @@ func TestSatellitePreStopHookHasNoUnshippedInterpreter(t *testing.T) {
 	}
 
 	t.Fatal("satellite container with preStop hook not found in daemonset")
+}
+
+// Every file the image build downloads is checked against a pinned
+// sha256 before use. The LINBIT keyring decides which packages apt
+// trusts, so fetching it on TLS alone would let a changed file at that
+// URL install a key nobody reviewed, and the build could not be
+// reproduced.
+func TestDockerfileDownloadsArePinnedByDigest(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join(repoRoot240(t), "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+
+	src := string(body)
+	digest := regexp.MustCompile(`(?m)^ARG (\w+_SHA256)=[0-9a-f]{64}$`)
+
+	for line := range strings.SplitSeq(src, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[0] != "ADD" || !strings.Contains(fields[1], "://") {
+			continue
+		}
+
+		if strings.HasPrefix(fields[1], "--checksum=sha256:") {
+			continue
+		}
+
+		dest := fields[len(fields)-1]
+		verified := false
+
+		for _, m := range digest.FindAllStringSubmatch(src, -1) {
+			if strings.Contains(src, `echo "${`+m[1]+`}  `+dest+`" | sha256sum -c -`) {
+				verified = true
+			}
+		}
+
+		if !verified {
+			t.Errorf("Dockerfile downloads %s into %s without checking it against a pinned sha256", fields[1], dest)
+		}
+	}
 }
