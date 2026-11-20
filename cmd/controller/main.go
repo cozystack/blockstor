@@ -340,7 +340,9 @@ func main() {
 			Namespace: controllerNamespace,
 			// As in cmd/apiserver: the passphrase Secret is read past the cache.
 			SecretReader: mgr.GetAPIReader(),
-			OnReady:      ready.MarkBound,
+			// As in cmd/apiserver: a snapshot create answers once its take is over.
+			SnapshotTakeWait: rest.SnapshotTakeWait,
+			OnReady:          ready.MarkBound,
 		}); err != nil {
 			setupLog.Error(err, "Failed to register REST API server")
 			os.Exit(1)
