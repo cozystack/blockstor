@@ -2550,7 +2550,7 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 	// replica the call only changed was built before.
 	var notReady []apiv1.APICallRc
 	if created {
-		notReady = s.waitDeployedReplicasReady(r.Context(), rdName, []string{node})
+		notReady = s.waitMadeAvailableReplicaReady(r.Context(), rdName, node)
 	}
 
 	writeJSON(w, http.StatusOK, append([]apiv1.APICallRc{{

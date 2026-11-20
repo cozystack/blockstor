@@ -50,7 +50,17 @@ const DefaultResourceReadyWait = 15 * time.Second
 // seconds of that minute for the definition, volume and placement
 // writes, so a slow build is answered with the warning instead of being
 // cut off by the sidecar and retried from scratch.
+//
+// The bound holds for one CreateVolume, not for one request: linstor-csi
+// places a volume in two calls, the replica on the preferred node first
+// and the rest after it, and both used to wait the full bound, two of
+// them already the whole minute. See createBuildDeadline.
 const DefaultResourceDeployWait = 30 * time.Second
+
+// createVolumeWindow is how long one CreateVolume may run: the
+// --timeout=1m of csi-provisioner. A replica of the definition created
+// within it, by an earlier call, belongs to the same create.
+const createVolumeWindow = time.Minute
 
 // resourceReadyPollInterval is how often the wait re-reads the cached
 // replicas. A variable so tests can shorten it.
@@ -74,8 +84,10 @@ const warnNotConnected = maskWarn | int64(1002)
 // such a node is warned once, where LINSTOR may warn it again from
 // waitResourcesReady.
 //
-// First it waits, up to s.ResourceDeployWait, until the satellites
-// have built every replica this call deployed (waitDeployedReplicasBuilt),
+// First it waits, up to s.ResourceDeployWait counted from the start of
+// the create this call belongs to (createBuildDeadline), until the
+// satellites have built every replica this call deployed
+// (waitDeployedReplicasBuilt),
 // as LINSTOR's updateSatellites waits for each satellite to answer the
 // update before anything else. That step applies to every definition,
 // whatever its layers or replica count: a local volume is answered once
@@ -102,6 +114,65 @@ const warnNotConnected = maskWarn | int64(1002)
 // Replicas that are not ready within the bound get the warning LINSTOR
 // gives in that case; the placement itself stands either way.
 func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, deployed []string) []apiv1.APICallRc {
+	return s.waitReplicasReadyBy(ctx, rdName, deployed, s.createBuildDeadline(ctx, rdName, deployed))
+}
+
+// waitMadeAvailableReplicaReady is waitDeployedReplicasReady for the
+// replica make-available created. That call is linstor-csi's
+// ControllerPublishVolume, whose minute is its own, so the build gets
+// the whole bound however recently the volume was created.
+func (s *Server) waitMadeAvailableReplicaReady(ctx context.Context, rdName, node string) []apiv1.APICallRc {
+	return s.waitReplicasReadyBy(ctx, rdName, []string{node}, time.Now().Add(s.ResourceDeployWait))
+}
+
+// createBuildDeadline is when a call that placed replicas of rdName
+// stops waiting for the satellites to build them: s.ResourceDeployWait
+// after the first replica of the same create was placed.
+//
+// linstor-csi's CreateVolume places a volume in two calls, the replica
+// on the preferred node first and the remaining ones after it, inside
+// the one minute csi-provisioner gives it. Each call waiting the whole
+// bound took two bounds plus the ready wait, more than that minute
+// when the satellites were slow: the sidecar cancelled the create and
+// linstor-csi started deleting the volume it had half made. A replica
+// of the definition placed by an earlier call less than
+// createVolumeWindow ago belongs to the same create, so the bound
+// counts from the earliest such replica instead of from this call.
+// The calls of a create may reach different apiserver replicas, so the
+// start is read off the replicas themselves.
+func (s *Server) createBuildDeadline(ctx context.Context, rdName string, deployed []string) time.Time {
+	now := time.Now()
+	deadline := now.Add(s.ResourceDeployWait)
+
+	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return deadline
+	}
+
+	for i := range replicas {
+		rsc := &replicas[i]
+		if rsc.CreateTimestamp == 0 || slices.ContainsFunc(deployed, func(node string) bool {
+			return naming.Same(node, rsc.NodeName)
+		}) {
+			continue
+		}
+
+		created := time.UnixMilli(rsc.CreateTimestamp)
+		if now.Sub(created) >= createVolumeWindow {
+			continue
+		}
+
+		if shared := created.Add(s.ResourceDeployWait); shared.Before(deadline) {
+			deadline = shared
+		}
+	}
+
+	return deadline
+}
+
+// waitReplicasReadyBy is waitDeployedReplicasReady with the build
+// bound ending at buildDeadline.
+func (s *Server) waitReplicasReadyBy(ctx context.Context, rdName string, deployed []string, buildDeadline time.Time) []apiv1.APICallRc {
 	if s.ResourceReadyWait <= 0 || len(deployed) == 0 {
 		return nil
 	}
@@ -113,7 +184,7 @@ func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, d
 		return notConnected
 	}
 
-	unbuilt, done := s.waitDeployedReplicasBuilt(ctx, rdName, deployed, volumes)
+	unbuilt, done := s.waitDeployedReplicasBuilt(ctx, rdName, deployed, volumes, buildDeadline)
 	if !done {
 		return nil
 	}
@@ -150,10 +221,11 @@ func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, d
 	}
 }
 
-// waitDeployedReplicasBuilt waits, up to s.ResourceDeployWait, until the
-// satellites built every replica of rdName this call deployed, and
-// returns the nodes whose replica was not built in time. done is false
-// when the request was cancelled first.
+// waitDeployedReplicasBuilt waits, until deadline, for the satellites to
+// build every replica of rdName this call deployed, and returns the
+// nodes whose replica was not built in time. done is false when the
+// request was cancelled first. It answers as soon as the last of them
+// is reported built.
 //
 // linstor-csi needs this before CreateVolume returns. It reads replicas
 // through a cache of the resource view that it refills after its own
@@ -164,12 +236,12 @@ func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, d
 //
 // A zero s.ResourceDeployWait skips the step, which unit tests that run
 // no satellite rely on; the binaries set DefaultResourceDeployWait.
-func (s *Server) waitDeployedReplicasBuilt(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, bool) {
+func (s *Server) waitDeployedReplicasBuilt(
+	ctx context.Context, rdName string, deployed []string, volumes map[int32]int64, deadline time.Time,
+) ([]string, bool) {
 	if s.ResourceDeployWait <= 0 {
 		return nil, true
 	}
-
-	deadline := time.Now().Add(s.ResourceDeployWait)
 
 	for {
 		unbuilt, err := s.deployedReplicasNotBuilt(ctx, rdName, deployed, volumes)
