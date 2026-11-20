@@ -343,3 +343,45 @@ func TestSecondaryReplicaDoesNotFreeze(t *testing.T) {
 		t.Fatalf("a Secondary replica froze the size: %v", props)
 	}
 }
+
+// TestFirstDecisionCoversEveryWaitingReplica: two replicas created
+// together, one on a 512 pool and one on a 4096 pool. Whichever reconciles
+// first decides for both, as LINSTOR decides every replica of one
+// autoplace before any comes up. Deciding for the first alone wrote 512,
+// gave it its identity, and then refused the second one's raise because
+// a diskful replica already ran.
+func TestFirstDecisionCoversEveryWaitingReplica(t *testing.T) {
+	t.Parallel()
+
+	f := newBSFixture(nil)
+	f.objects = []client.Object{
+		bsStoragePool(bsNode, "512"),
+		bsStoragePool("n2", "4096"),
+		bsReplica("n2"),
+	}
+
+	props := f.reconcile(t, bsReplica(bsNode))
+
+	if got := props[blocksize.PropBlockSize]; got != "4096" {
+		t.Fatalf("block-size = %q, want 4096 for the replica still waiting on the 4096 pool", got)
+	}
+}
+
+// TestRunningPeerIsNotPending: a peer that already has its identity was
+// decided already and does not raise the size for a new replica.
+func TestRunningPeerIsNotPending(t *testing.T) {
+	t.Parallel()
+
+	f := newBSFixture(map[string]string{blocksize.PropBlockSize: "512"})
+	f.objects = []client.Object{
+		bsStoragePool(bsNode, "512"),
+		bsStoragePool("n2", "4096"),
+		running(bsReplica("n2")),
+	}
+
+	props := f.reconcile(t, bsReplica(bsNode))
+
+	if got := props[blocksize.PropBlockSize]; got != "512" {
+		t.Fatalf("block-size = %q, want 512", got)
+	}
+}

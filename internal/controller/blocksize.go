@@ -242,7 +242,7 @@ func (r *ResourceReconciler) blockSizeInputsFor(
 		return nil, blockSizeInputs{}, err
 	}
 
-	replicaSize, err := r.replicaIoSize(ctx, target, rd)
+	replicaSize, err := r.pendingIoSize(ctx, target, peers, rd)
 	if err != nil {
 		return nil, blockSizeInputs{}, err
 	}
@@ -373,23 +373,21 @@ func (r *ResourceReconciler) otherReplicas(ctx context.Context, target *blocksto
 	return out, nil
 }
 
-// replicaIoSize is the size a replica counts as: 4096 when its stack has
-// a layer other than DRBD and STORAGE, the default for a diskless one,
-// and otherwise the largest minimum I/O size among the pools it uses.
-func (r *ResourceReconciler) replicaIoSize(
-	ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition,
+// pendingIoSize is the size the decision for target works with: the
+// largest a replica of the definition still waiting for its identity
+// counts as, target among them. LINSTOR decides every replica of one
+// autoplace before any of them comes up, each raising the size for its
+// pool in turn; here each replica is decided when it reconciles, and the
+// first one to get its identity may already attach, after which a raise
+// for the others is refused. Taking every waiting replica into the first
+// decision gives the definition the size LINSTOR ends up with, whichever
+// replica reconciles first.
+func (r *ResourceReconciler) pendingIoSize(
+	ctx context.Context, target *blockstoriov1alpha1.Resource,
+	peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition,
 ) (int64, error) {
 	if blocksize.HasSpecialLayers(rd.Spec.LayerStack) {
 		return blocksize.SpecialLayerIoSize, nil
-	}
-
-	if replicaDiskless(target) {
-		return blocksize.DefaultIoSize, nil
-	}
-
-	names := replicaPoolNames(target, rd)
-	if len(names) == 0 {
-		return blocksize.DefaultIoSize, nil
 	}
 
 	var pools blockstoriov1alpha1.StoragePoolList
@@ -399,11 +397,37 @@ func (r *ResourceReconciler) replicaIoSize(
 		return 0, cerrors.Wrap(err, "list storage pools")
 	}
 
+	size := replicaIoSize(target, rd, pools.Items)
+
+	for i := range peers {
+		if awaitingIdentity(&peers[i]) && peers[i].DeletionTimestamp.IsZero() {
+			size = max(size, replicaIoSize(&peers[i], rd, pools.Items))
+		}
+	}
+
+	return size, nil
+}
+
+// replicaIoSize is the size one replica counts as outside a special
+// layer: the default for a diskless one, and otherwise the largest
+// minimum I/O size among the pools it uses. LINSTOR takes the last pool
+// it reads, which for a replica whose volumes span pools of different
+// sizes depends on iteration order; the largest is the one every volume
+// fits.
+func replicaIoSize(
+	res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, pools []blockstoriov1alpha1.StoragePool,
+) int64 {
 	size := blocksize.DefaultIoSize
 
-	for i := range pools.Items {
-		pool := &pools.Items[i]
-		if !naming.Same(pool.Spec.NodeName, target.Spec.NodeName) {
+	if replicaDiskless(res) {
+		return size
+	}
+
+	names := replicaPoolNames(res, rd)
+
+	for i := range pools {
+		pool := &pools[i]
+		if !naming.Same(pool.Spec.NodeName, res.Spec.NodeName) {
 			continue
 		}
 
@@ -414,7 +438,7 @@ func (r *ResourceReconciler) replicaIoSize(
 		size = max(size, blocksize.PoolIoSize(pool.Spec.Props))
 	}
 
-	return size, nil
+	return size
 }
 
 // replicaPoolNames lists the pools a diskful replica's volumes land in,
