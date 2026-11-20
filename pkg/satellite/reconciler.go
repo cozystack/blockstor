@@ -6221,10 +6221,15 @@ func isDiskless(flags []string) bool {
 //     ["LUKS","STORAGE"]), the consumer sees the raw storage /
 //     dm-crypt device — that's exactly what `devices` already
 //     holds after applyStorage + maybeLUKS.
-//   - DISKLESS replicas have no consumer-facing device; we emit
-//     no Volumes entries.
+//   - A DISKLESS replica with DRBD gets the same `/dev/drbd<minor>`:
+//     the DRBD device is the consumer-facing one whether the data is
+//     local or reached over the network, and LINSTOR reports it for a
+//     diskless volume too. linstor-csi's ControllerPublishVolume of a
+//     remote (diskless) attach reads exactly that path and fails the
+//     attach without one. A DISKLESS replica without DRBD has no
+//     device at all, so it gets no Volumes entries.
 func buildVolumeResults(dr *intent.DesiredResource, devices map[int32]string, diskless, withDRBD bool) []*intent.ResourceApplyVolumeResult {
-	if diskless {
+	if diskless && !withDRBD {
 		return nil
 	}
 
