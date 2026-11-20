@@ -22,6 +22,7 @@ import (
 	"context"
 	"slices"
 	"sort"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -787,6 +788,11 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 // — it cannot infer per-peer replication from
 // `layer_object.drbd.connections[].replication_state`, even though
 // blockstor stores the data there too.
+//
+// done_percentage comes from the same peer's per-volume `done`, so a
+// two-volume resource reports each volume's own resync. LINSTOR
+// fills it whenever the satellite reported one (Json.apiToVolumeState),
+// whatever the replication state, and so does this.
 func volumesWithReplicationStates(
 	vols []apiv1.Volume,
 	conns []crdv1alpha1.ResourceConnectionStatus,
@@ -795,28 +801,47 @@ func volumesWithReplicationStates(
 		return vols
 	}
 
-	states := make(map[string]apiv1.ReplicationState, len(conns))
-
-	for i := range conns {
-		c := &conns[i]
-		if c.ReplicationState == "" {
-			continue
-		}
-
-		states[c.PeerNodeName] = apiv1.ReplicationState{
-			ReplicationState: c.ReplicationState,
-		}
-	}
-
-	if len(states) == 0 {
-		return vols
-	}
-
 	for i := range vols {
-		vols[i].State.ReplicationStates = states
+		states := make(map[string]apiv1.ReplicationState, len(conns))
+
+		for j := range conns {
+			c := &conns[j]
+			if c.ReplicationState == "" {
+				continue
+			}
+
+			states[c.PeerNodeName] = apiv1.ReplicationState{
+				ReplicationState: c.ReplicationState,
+				DonePercentage:   peerVolumeDone(c.PeerVolumes, vols[i].VolumeNumber),
+			}
+		}
+
+		if len(states) > 0 {
+			vols[i].State.ReplicationStates = states
+		}
 	}
 
 	return vols
+}
+
+// peerVolumeDone parses the `done` token the satellite recorded for
+// one volume on one connection. nil when the volume has none or the
+// token does not parse: no progress is better than a made-up one.
+func peerVolumeDone(peerVolumes []crdv1alpha1.PeerVolumeStatus, volumeNumber int32) *float64 {
+	for i := range peerVolumes {
+		if peerVolumes[i].VolumeNumber != volumeNumber || peerVolumes[i].Done == "" {
+			continue
+		}
+
+		done, err := strconv.ParseFloat(peerVolumes[i].Done, 64)
+		if err != nil {
+			return nil
+		}
+
+		return &done
+	}
+
+	return nil
 }
 
 // volumeLayerDataFromStack mirrors the resource-level layer stack

@@ -155,9 +155,17 @@ type volumeObservation struct {
 // volume under the same listMap key on Status. Distinct from
 // volumeObservation because the data plane is different: this is
 // the PEER's view of our volume, not our local kernel's view.
+//
+// Done is the `done:<percent>` token of the same frame: the progress
+// of the resync running with this peer. It is per peer on purpose. A
+// replica can resync from two peers one after the other, and the
+// volume-wide OutOfSyncKib is whichever peer-device frame came last,
+// so it can show the finished small resync while the large one is
+// half done.
 type peerVolumeObservation struct {
 	VolumeNumber  int32
 	PeerDiskState string
+	Done          string
 }
 
 // connectionObservation carries one per-peer DRBD connection state.
@@ -518,6 +526,7 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 			conn.PeerVolumes = []peerVolumeObservation{{
 				VolumeNumber:  int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
 				PeerDiskState: pd,
+				Done:          ev.Fields["done"],
 			}}
 		}
 
@@ -1581,6 +1590,13 @@ func (o *ObserverRunnable) pruneVolumeCacheToDesired(ev *observation, res *block
 // cached value alone (frame didn't carry the token). A non-empty
 // value updates the cached entry for that VolumeNumber, adding a
 // new entry if this is the first frame for that volume.
+//
+// Done is replaced together with PeerDiskState, absent included.
+// events2 runs with --full, so every peer-device frame carries
+// peer-disk, and drbdsetup prints `done` on it exactly while a
+// resync with that peer runs: a frame without it means the resync
+// is over. LINSTOR's DrbdVolume.update clears its done percentage on
+// such a frame the same way.
 func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolumeObservation {
 	byVol := map[int32]peerVolumeObservation{}
 	for _, peerVol := range cached {
@@ -1595,6 +1611,7 @@ func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolume
 		entry := byVol[peerVol.VolumeNumber]
 		entry.VolumeNumber = peerVol.VolumeNumber
 		entry.PeerDiskState = peerVol.PeerDiskState
+		entry.Done = peerVol.Done
 		byVol[peerVol.VolumeNumber] = entry
 	}
 
@@ -2130,6 +2147,7 @@ func buildPeerVolumeStatus(in []peerVolumeObservation) []blockstoriov1alpha1.Pee
 		out = append(out, blockstoriov1alpha1.PeerVolumeStatus{
 			VolumeNumber:  peerVol.VolumeNumber,
 			PeerDiskState: peerVol.PeerDiskState,
+			Done:          peerVol.Done,
 		})
 	}
 
