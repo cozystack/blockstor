@@ -346,7 +346,7 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 		// Bug 106: stamp Status.NodeStatus[us].Ready so the
 		// apiserver's success denominator can flip the snapshot
 		// from "Incomplete" to "Successful".
-		err = r.stampSnapshotPerNodeReady(ctx, snap, resp.CreateTimestampUnix)
+		err = r.stampSnapshotPerNodeReady(ctx, snap, resp.CreateTimestampUnix, resp.GetStoragePool())
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -652,8 +652,14 @@ func collapseNodeStatus(
 // converges in well under a second on a 3-node stand. After the
 // retry budget the caller's outer reconcile rate-limiter backs off
 // and we try again on the next pass.
+//
+// The same write records pool, the pool the copy was taken in. Written
+// apart from Ready, the record would miss whenever the source replica went
+// between the two writes, which is the usual CSI order (the PVC is deleted
+// as soon as its VolumeSnapshot is ready), and every restore of the copy
+// would then be refused.
 func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
-	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, createTimestamp int64,
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, createTimestamp int64, pool string,
 ) error {
 	key := client.ObjectKeyFromObject(snap)
 
@@ -681,6 +687,7 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
 
 		current.Status.NodeStatus = upsertPerNodeStatus(
 			current.Status.NodeStatus, r.Config.NodeName, createTimestamp)
+		recordPoolOnEntry(current.Status.NodeStatus, r.Config.NodeName, pool)
 
 		err = r.Status().Update(ctx, &current)
 		if err == nil {

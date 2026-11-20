@@ -150,6 +150,16 @@ type Provider interface {
 	RestoreVolumeFromSnapshot(ctx context.Context, target Volume, sourceSnapshot Snapshot) error
 }
 
+// SnapshotProber is the optional "does this pool hold the snapshot"
+// capability. A satellite records which of its pools holds its copy of a
+// snapshot, since a restore has to be placed in that pool after the
+// replica the copy was taken from is gone; for a copy taken before that
+// record existed it asks the pools themselves, because the pool a replica
+// is in now need not be the one an older copy of it was taken in.
+type SnapshotProber interface {
+	HasSnapshot(ctx context.Context, snap Snapshot) (bool, error)
+}
+
 // VolumeLister is the optional "enumerate every volume this provider
 // currently holds on disk" capability. The orphan-storage sweeper
 // (see pkg/satellite/controllers/storage_sweeper.go) uses it to

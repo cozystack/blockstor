@@ -585,7 +585,7 @@ func (r *Reconciler) Apply(ctx context.Context, res []*intent.DesiredResource) (
 //     ⇒ Terminal=true. Same logic.
 //   - any other error ⇒ Terminal=false. Transient lvm/zfs noise.
 func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnapshotRequest) (*intent.CreateSnapshotResponse, error) {
-	provider, err := r.providerForResource(req.GetResourceName())
+	pool, provider, err := r.poolForResource(req.GetResourceName())
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
 		return &intent.CreateSnapshotResponse{Ok: false, Terminal: true, Message: err.Error()}, nil
@@ -610,7 +610,31 @@ func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnaps
 		// by 1000 before formatting. UnixMilli matches; Unix
 		// (seconds) would render the stamp as 1970-01-21.
 		CreateTimestampUnix: time.Now().UnixMilli(),
+		StoragePool:         pool,
 	}, nil
+}
+
+// SnapshotPools lists, sorted, the registered pools that hold the named
+// snapshot of rdName. Pools whose provider cannot tell are left out, and
+// so is one whose probe fails: a pool listed here holds the copy.
+func (r *Reconciler) SnapshotPools(ctx context.Context, rdName, snapName string) []string {
+	providers := r.SnapshotProviders()
+	pools := slices.Sorted(maps.Keys(providers))
+	holding := make([]string, 0, 1)
+
+	for _, pool := range pools {
+		prober, ok := providers[pool].(storage.SnapshotProber)
+		if !ok {
+			continue
+		}
+
+		has, err := prober.HasSnapshot(ctx, storage.Snapshot{ResourceName: rdName, SnapshotName: snapName})
+		if err == nil && has {
+			holding = append(holding, pool)
+		}
+	}
+
+	return holding
 }
 
 // DeleteSnapshot mirrors CreateSnapshot. Idempotency lives at the
@@ -5938,20 +5962,27 @@ func (r *Reconciler) restoredCloneSeed(ctx context.Context, resourceName string,
 // resource using the in-memory pool map. Returns an error when the
 // resource isn't known or its pool isn't registered.
 func (r *Reconciler) providerForResource(name string) (storage.Provider, error) {
+	_, provider, err := r.poolForResource(name)
+
+	return provider, err
+}
+
+// poolForResource is providerForResource that also names the pool.
+func (r *Reconciler) poolForResource(name string) (string, storage.Provider, error) {
 	r.mu.Lock()
 	pool, ok := r.resourceToPool[name]
 	r.mu.Unlock()
 
 	if !ok {
-		return nil, errors.Errorf("resource %q not known on this satellite", name)
+		return "", nil, errors.Errorf("resource %q not known on this satellite", name)
 	}
 
 	provider, ok := r.cfg.Providers[pool]
 	if !ok {
-		return nil, errors.Errorf("storage pool %q not registered", pool)
+		return "", nil, errors.Errorf("storage pool %q not registered", pool)
 	}
 
-	return provider, nil
+	return pool, provider, nil
 }
 
 // rememberPool records the pool that backs a resource, so subsequent

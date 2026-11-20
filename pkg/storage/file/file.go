@@ -318,6 +318,20 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return nil
 }
 
+// HasSnapshot reports whether this pool holds the snapshot's .img copy.
+func (p *Provider) HasSnapshot(_ context.Context, snap storage.Snapshot) (bool, error) {
+	_, err := os.Stat(p.snapshotPath(snap))
+	if err == nil {
+		return true, nil
+	}
+
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+
+	return false, errors.Wrapf(err, "stat %s", p.snapshotPath(snap))
+}
+
 // DeleteSnapshot removes the .img copy. Missing → no-op.
 //
 // The path MUST be resolved through the provider's configured pool
