@@ -269,3 +269,89 @@ func TestPlacementPassTakesBackOnlyItsOwnReplicas(t *testing.T) {
 		t.Fatalf("replicas on %v; want the one the definition had and the one made by hand, [n1 n4]", nodes)
 	}
 }
+
+// groupSwitchStore switches balancing off on the group, or on the
+// controller, once the pass has created its first replica.
+type groupSwitchStore struct {
+	store.Store
+
+	t     *testing.T
+	scope string
+	once  sync.Once
+}
+
+func (s *groupSwitchStore) Resources() store.ResourceStore {
+	return &groupSwitchResources{ResourceStore: s.Store.Resources(), s: s}
+}
+
+type groupSwitchResources struct {
+	store.ResourceStore
+
+	s *groupSwitchStore
+}
+
+func (r *groupSwitchResources) Create(ctx context.Context, res *apiv1.Resource) error {
+	err := r.ResourceStore.Create(ctx, res)
+	if err != nil {
+		return err
+	}
+
+	r.s.once.Do(func() {
+		off := func(props map[string]string) {
+			props[apiv1.PropBalanceResourcesEnabled] = "false"
+		}
+
+		var serr error
+
+		switch r.s.scope {
+		case "group":
+			serr = r.s.Store.ResourceGroups().PatchResourceGroup(ctx, "rg", func(rg *apiv1.ResourceGroup) error {
+				if rg.Props == nil {
+					rg.Props = map[string]string{}
+				}
+
+				off(rg.Props)
+
+				return nil
+			})
+		case "controller":
+			serr = r.s.Store.ControllerProps().PatchProps(ctx, func(props map[string]string) error {
+				off(props)
+
+				return nil
+			})
+		}
+
+		if serr != nil {
+			r.s.t.Errorf("switch balancing off on the %s: %v", r.s.scope, serr)
+		}
+	})
+
+	return nil
+}
+
+// TestPlacementPassHonoursBalancingSwitchedOffAboveTheDefinition: the
+// check after the placer reads the group and the controller props
+// again too, not only the definition. LINSTOR reads all three under
+// its lock; a pass that kept the copies it started with placed on a
+// definition whose group had balancing switched off meanwhile.
+func TestPlacementPassHonoursBalancingSwitchedOffAboveTheDefinition(t *testing.T) {
+	t.Parallel()
+
+	for _, scope := range []string{"group", "controller"} {
+		t.Run(scope, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			inner := store.NewInMemory()
+
+			seedIntervalFixture(t, ctx, inner, 3, []string{"n1"})
+
+			reconcileRebalance(t, ctx, &groupSwitchStore{Store: inner, t: t, scope: scope})
+
+			if n := replicaCount(t, ctx, inner, "pvc-interval"); n != 1 {
+				t.Fatalf("got %d replicas; want only the one the definition had", n)
+			}
+		})
+	}
+}

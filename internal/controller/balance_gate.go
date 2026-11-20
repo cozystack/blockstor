@@ -106,13 +106,14 @@ func newBalanceGate(ctx context.Context, st store.Store) (*balanceGate, error) {
 // right after the last replica went, which a stale cache still shows.
 // That keeps the uncached read to the definitions that get placed on.
 //
-// The definition passed in is the one the pass listed when it started,
-// and a pass over a large group runs for many seconds. linstor-csi
-// switches balancing off on a definition right before it deletes its
-// replicas, and LINSTOR's balance task never misses that, since it
-// reads the definition under the lock the switch is written under. So
-// a definition that passes on the listed copy is read again past the
-// cache (currentSkip), and only that read decides.
+// The definition and group passed in, and the controller props, are
+// the ones the pass read when it started, and a pass over a large group
+// runs for many seconds. linstor-csi switches balancing off on a
+// definition right before it deletes its replicas, and LINSTOR's
+// balance task never misses that, since it reads under the lock the
+// switch is written under. So a definition that passes on those copies
+// is checked again on current ones (currentSkip), and only that check
+// decides.
 func (g *balanceGate) skipReason(ctx context.Context, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) (string, error) {
 	if reason := definitionSkip(rd, rg.Props, g.ctrlProps); reason != "" {
 		return reason, nil
@@ -158,8 +159,18 @@ func definitionSkip(rd *apiv1.ResourceDefinition, rgProps, ctrlProps map[string]
 	return ""
 }
 
-// currentSkip applies definitionSkip to the definition as the API
-// server holds it now.
+// currentSkip applies definitionSkip to current copies: the definition
+// as the API server holds it now, and the group and the controller
+// props as the cache holds them now.
+//
+// Only the definition is read past the cache. It is where linstor-csi
+// writes the switch, right before it lists the replicas to delete, so
+// it is the one read that has to be in order with that list. A switch
+// an operator sets on the group or the controller during a pass is seen
+// as soon as the cache has it, which is all a later read could give: no
+// client lists and deletes replicas right after setting it there. A
+// group that is gone, or controller props that cannot be read, leave
+// the copies the pass started with in place.
 func (g *balanceGate) currentSkip(ctx context.Context, rg *apiv1.ResourceGroup, rdName string) (string, error) {
 	current, err := g.st.ResourceDefinitions().GetUncached(ctx, rdName)
 	if errors.Is(err, store.ErrNotFound) {
@@ -170,7 +181,27 @@ func (g *balanceGate) currentSkip(ctx context.Context, rg *apiv1.ResourceGroup, 
 		return "", fmt.Errorf("read definition %q: %w", rdName, err)
 	}
 
-	return definitionSkip(&current, rg.Props, g.ctrlProps), nil
+	rgProps := rg.Props
+
+	group, err := g.st.ResourceGroups().Get(ctx, rg.Name)
+
+	switch {
+	case err == nil:
+		rgProps = group.Props
+	case !errors.Is(err, store.ErrNotFound):
+		return "", fmt.Errorf("read group %q: %w", rg.Name, err)
+	}
+
+	ctrlProps := g.ctrlProps
+
+	props, err := g.st.ControllerProps().Get(ctx)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "controller props unreadable; using the ones the pass started with")
+	} else {
+		ctrlProps = props
+	}
+
+	return definitionSkip(&current, rgProps, ctrlProps), nil
 }
 
 // place runs the placer on a definition skipReason let through. If it
