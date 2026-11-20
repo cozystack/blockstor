@@ -2037,8 +2037,11 @@ func TestBothLatchReasonsAreReported(t *testing.T) {
 // TestSnapshotCarriesFrozenVolumeDefinitionProps: LINSTOR copies a volume
 // definition's props into the snapshot when it takes it, and its restore
 // copies them back, the block size among them. The adopted snapshot
-// keeps them, so a restore of it comes up at its source's sector size; a
-// volume with none frozen has none.
+// keeps them, so a restore of it comes up at its source's sector size. A
+// volume with none frozen is recorded as an empty map, not as nothing:
+// the store fills a snapshot that recorded nothing with the definition's
+// current props, which may carry a block size the snapshot's data was
+// never written at.
 func TestSnapshotCarriesFrozenVolumeDefinitionProps(t *testing.T) {
 	res := convertFixture(t)
 
@@ -2053,8 +2056,8 @@ func TestSnapshotCarriesFrozenVolumeDefinitionProps(t *testing.T) {
 			t.Errorf("volume 0 props %v, want the frozen block size", vol0)
 		}
 
-		if vol1 := snap.Spec.VolumeDefinitions[1].Props; vol1 != nil {
-			t.Errorf("volume 1 props %v, want none", vol1)
+		if vol1 := snap.Spec.VolumeDefinitions[1].Props; vol1 == nil || len(vol1) != 0 {
+			t.Errorf("volume 1 props %#v, want an empty map", vol1)
 		}
 
 		return

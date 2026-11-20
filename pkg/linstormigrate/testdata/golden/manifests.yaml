@@ -399,6 +399,6 @@ spec:
       Linstor/Drbd/freeze-block-size: "True"
     sizeKib: 1048576
     volumeNumber: 0
-  - props: null
+  - props: {}
     sizeKib: 307200
     volumeNumber: 1

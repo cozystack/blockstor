@@ -2284,10 +2284,19 @@ func (c *converter) snapshotVolumeRefsFor(rdName, snapName string) []crdv1alpha1
 			continue
 		}
 
+		// The dump is the record of what the snapshot held: a volume
+		// definition with no props there had none, and is recorded as
+		// {} so the store does not take it for a snapshot from before
+		// props were kept and fill in the definition's props of today.
+		props := c.props.SnapshotVDFrozen(rdName, snapName, strconv.Itoa(int(vd.VlmNr)))
+		if props == nil {
+			props = map[string]string{}
+		}
+
 		out = append(out, crdv1alpha1.SnapshotVolumeRef{
 			VolumeNumber: vd.VlmNr,
 			SizeKib:      vd.VlmSize,
-			Props:        c.props.SnapshotVDFrozen(rdName, snapName, strconv.Itoa(int(vd.VlmNr))),
+			Props:        props,
 		})
 	}
 
