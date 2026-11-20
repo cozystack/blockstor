@@ -147,7 +147,7 @@ func TestPeriodicRechecksRunOneAtATime(t *testing.T) {
 	// for each replica to have had one.
 	reader.most.Store(0)
 
-	bringupWaitFor(t, activeDRBDRequeue+replicas*(perPass+recheckDeferral)+10*time.Second,
+	bringupWaitFor(t, activeDRBDRequeue+replicas*((1+recheckCooldown)*perPass+recheckPoll)+10*time.Second,
 		func() bool { return reader.passes.Load() >= 2*replicas })
 
 	if most := reader.most.Load(); most > 1 {

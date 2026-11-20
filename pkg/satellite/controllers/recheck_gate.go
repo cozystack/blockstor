@@ -20,6 +20,7 @@ package controllers
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -31,10 +32,24 @@ import (
 )
 
 const (
-	// recheckDeferral is how long a periodic re-check waits for its
-	// turn when it cannot run yet. It costs one map lookup per try, and
-	// no worker is held while it waits.
-	recheckDeferral = time.Second
+	// recheckPoll is how soon the re-check first in line asks for the
+	// slot again while it cannot have it. A try costs a few map
+	// lookups, and no worker is held while it waits.
+	recheckPoll = 100 * time.Millisecond
+
+	// recheckMaxDeferral is the longest a re-check further back in
+	// line waits between tries. It waits about as long as the
+	// re-checks ahead of it should take, so a long line asks rarely.
+	recheckMaxDeferral = 10 * time.Second
+
+	// recheckStale is how long a re-check may go without asking before
+	// it loses its place, so a replica whose deferred pass never comes
+	// back cannot hold the line.
+	recheckStale = 3 * recheckMaxDeferral
+
+	// recheckTurnWeight is how many turns of the slot its average
+	// remembers: each new turn moves it by 1/recheckTurnWeight.
+	recheckTurnWeight = 8
 
 	// recheckCooldown is how many times its own duration the re-check
 	// slot stays closed after a re-check. One re-check stream ran back
@@ -90,6 +105,12 @@ type recheckGate struct {
 
 	// active counts the passes in flight that an event asked for.
 	active int
+
+	// line holds the re-checks waiting for the slot, first come first
+	// served, and cycle is about how long one turn of the slot takes,
+	// the re-check and its cool-down.
+	line  []string
+	cycle time.Duration
 }
 
 // recheckState is what the gate knows about one replica: how many
@@ -99,9 +120,10 @@ type recheckState struct {
 	events uint64
 	due    bool
 
-	// waiting is when the re-check first asked for the slot and did
-	// not get it; zero while it is not waiting.
+	// waiting is when the re-check joined the line, and asked when it
+	// last asked for the slot; both are zero while it is not in line.
 	waiting time.Time
+	asked   time.Time
 }
 
 func newRecheckGate() *recheckGate {
@@ -124,7 +146,7 @@ func (g *recheckGate) changed(name string) {
 	s := g.state[name]
 	s.events++
 	s.due = false
-	s.waiting = time.Time{}
+	g.leaveLine(name, &s)
 	g.state[name] = s
 }
 
@@ -164,6 +186,7 @@ func (g *recheckGate) finish(name string, token uint64, recheckScheduled bool) {
 	}
 
 	if !recheckScheduled {
+		g.leaveLine(name, &s)
 		delete(g.state, name)
 
 		return
@@ -173,35 +196,76 @@ func (g *recheckGate) finish(name string, token uint64, recheckScheduled bool) {
 	g.state[name] = s
 }
 
-// tryAcquire takes the re-check slot for name when it is free, cooled
-// down, and no pass an event asked for is running, or, past
-// recheckMaxWait of waiting, regardless of those passes. The caller
-// releases it with release, passing the time it got it.
-func (g *recheckGate) tryAcquire(name string) (time.Time, bool) {
+// tryAcquire takes the re-check slot for name when name is first in
+// line, the slot is free and cooled down, and no pass an event asked
+// for is running, or, past recheckMaxWait in line, regardless of those
+// passes. The caller releases it with release, passing the time it got
+// it. Otherwise name keeps its place in line and the result says how
+// long to wait before asking again.
+func (g *recheckGate) tryAcquire(name string) (time.Time, time.Duration, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	now := g.now()
 
+	// The caller is asking now: refresh its place before the stale
+	// ones go, so a late deferred pass does not lose its own place.
+	if s := g.state[name]; !s.waiting.IsZero() {
+		s.asked = now
+		g.state[name] = s
+	}
+
+	g.dropStale(now)
+
 	s := g.state[name]
 	if s.waiting.IsZero() {
+		g.line = append(g.line, name)
 		s.waiting = now
 	}
+
+	s.asked = now
+	g.state[name] = s
+
+	pos := slices.Index(g.line, name)
 
 	free := !g.running && !now.Before(g.freeAt)
 	yield := g.active > 0 && now.Sub(s.waiting) < recheckMaxWait
 
-	if !free || yield {
-		g.state[name] = s
-
-		return time.Time{}, false
+	if pos != 0 || !free || yield {
+		return time.Time{}, g.deferral(pos, now), false
 	}
 
-	s.waiting = time.Time{}
+	g.leaveLine(name, &s)
 	g.state[name] = s
 	g.running = true
 
-	return now, true
+	return now, 0, true
+}
+
+// deferral is how long the re-check at pos in line waits before it
+// asks again. The first in line asks when the cool-down ends, or soon
+// when something else holds it; the others wait about as long as the
+// turns ahead of them take.
+func (g *recheckGate) deferral(pos int, now time.Time) time.Duration {
+	if pos == 0 {
+		switch {
+		case g.active > 0:
+			// Passes an event asked for run for seconds; no need to
+			// ask ten times a second.
+			return time.Second
+		case !g.running && now.Before(g.freeAt):
+			return max(g.freeAt.Sub(now), recheckPoll)
+		default:
+			return recheckPoll
+		}
+	}
+
+	cycle := g.cycle
+	if cycle <= 0 {
+		cycle = time.Second
+	}
+
+	return min(max(time.Duration(pos)*cycle, recheckPoll), recheckMaxDeferral)
 }
 
 // release frees the re-check slot taken at started, closing it for
@@ -211,8 +275,45 @@ func (g *recheckGate) release(started time.Time) {
 	defer g.mu.Unlock()
 
 	now := g.now()
+	took := now.Sub(started)
+	turn := (1 + recheckCooldown) * took
+
 	g.running = false
-	g.freeAt = now.Add(recheckCooldown * now.Sub(started))
+	g.freeAt = now.Add(recheckCooldown * took)
+
+	if g.cycle <= 0 {
+		g.cycle = turn
+	} else {
+		g.cycle = ((recheckTurnWeight-1)*g.cycle + turn) / recheckTurnWeight
+	}
+}
+
+// leaveLine takes name, whose state is s, out of the line.
+func (g *recheckGate) leaveLine(name string, s *recheckState) {
+	if s.waiting.IsZero() {
+		return
+	}
+
+	g.line = slices.DeleteFunc(g.line, func(n string) bool { return n == name })
+	s.waiting = time.Time{}
+	s.asked = time.Time{}
+}
+
+// dropStale takes out of the line every re-check that has not asked
+// for the slot in recheckStale.
+func (g *recheckGate) dropStale(now time.Time) {
+	g.line = slices.DeleteFunc(g.line, func(name string) bool {
+		s := g.state[name]
+		if now.Sub(s.asked) < recheckStale {
+			return false
+		}
+
+		s.waiting = time.Time{}
+		s.asked = time.Time{}
+		g.state[name] = s
+
+		return true
+	})
 }
 
 // eventPass counts a pass an event asked for as running, until the
@@ -230,18 +331,18 @@ func (g *recheckGate) eventPass() func() {
 }
 
 // gate wraps inner so that a periodic re-check waits for the re-check
-// slot. While it cannot have the slot the pass is deferred by
-// recheckDeferral, without holding the worker it was handed to.
+// slot. While it cannot have the slot the pass is deferred, without
+// holding the worker it was handed to.
 func (g *recheckGate) gate(inner reconcile.Reconciler) reconcile.Reconciler {
 	return reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 		token, recheck := g.begin(req.Name)
 
 		if recheck {
-			started, ok := g.tryAcquire(req.Name)
+			started, wait, ok := g.tryAcquire(req.Name)
 			if !ok {
 				g.finish(req.Name, token, true)
 
-				return reconcile.Result{RequeueAfter: recheckDeferral}, nil
+				return reconcile.Result{RequeueAfter: wait}, nil
 			}
 
 			defer g.release(started)

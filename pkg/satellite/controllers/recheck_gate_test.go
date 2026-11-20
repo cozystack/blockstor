@@ -73,18 +73,18 @@ func TestRecheckGateTellsRechecksFromEvents(t *testing.T) {
 func TestRecheckGateRunsOneAtATime(t *testing.T) {
 	gate, _ := newClockedRecheckGate()
 
-	started, ok := gate.tryAcquire("a")
+	started, _, ok := gate.tryAcquire("a")
 	if !ok {
 		t.Fatalf("free slot refused")
 	}
 
-	if _, ok := gate.tryAcquire("b"); ok {
+	if _, _, ok := gate.tryAcquire("b"); ok {
 		t.Fatalf("a second re-check got the slot while the first one runs")
 	}
 
 	gate.release(started)
 
-	if _, ok := gate.tryAcquire("b"); !ok {
+	if _, _, ok := gate.tryAcquire("b"); !ok {
 		t.Fatalf("slot not free after a re-check that took no time")
 	}
 }
@@ -97,13 +97,13 @@ func TestRecheckGivesWayToEvents(t *testing.T) {
 
 	done := gate.eventPass()
 
-	if _, ok := gate.tryAcquire("r"); ok {
+	if _, _, ok := gate.tryAcquire("r"); ok {
 		t.Fatalf("a re-check started while an event pass runs")
 	}
 
 	*clock = clock.Add(recheckMaxWait)
 
-	started, ok := gate.tryAcquire("r")
+	started, _, ok := gate.tryAcquire("r")
 	if !ok {
 		t.Fatalf("a re-check waited past recheckMaxWait for event passes")
 	}
@@ -111,7 +111,7 @@ func TestRecheckGivesWayToEvents(t *testing.T) {
 	gate.release(started)
 	done()
 
-	if _, ok := gate.tryAcquire("other"); !ok {
+	if _, _, ok := gate.tryAcquire("other"); !ok {
 		t.Fatalf("slot not free once the event passes ended")
 	}
 }
@@ -170,7 +170,7 @@ func TestGatedRecheckWaitsForEventPass(t *testing.T) {
 func TestRecheckSlotCoolsDown(t *testing.T) {
 	gate, clock := newClockedRecheckGate()
 
-	started, ok := gate.tryAcquire("a")
+	started, _, ok := gate.tryAcquire("a")
 	if !ok {
 		t.Fatalf("free slot refused")
 	}
@@ -182,14 +182,101 @@ func TestRecheckSlotCoolsDown(t *testing.T) {
 
 	*clock = clock.Add(recheckCooldown*took - time.Millisecond)
 
-	if _, ok := gate.tryAcquire("b"); ok {
+	if _, _, ok := gate.tryAcquire("b"); ok {
 		t.Fatalf("the next re-check started before the slot cooled down")
 	}
 
 	*clock = clock.Add(time.Millisecond)
 
-	if _, ok := gate.tryAcquire("b"); !ok {
+	if _, _, ok := gate.tryAcquire("b"); !ok {
 		t.Fatalf("slot still closed after the cool-down")
+	}
+}
+
+// TestRechecksTakeTurnsInOrder: the re-checks waiting for the slot get
+// it in the order they first asked, whichever of them asks first once
+// it is free, and the ones further back are told to wait longer.
+func TestRechecksTakeTurnsInOrder(t *testing.T) {
+	gate, clock := newClockedRecheckGate()
+
+	started, _, ok := gate.tryAcquire("running")
+	if !ok {
+		t.Fatalf("free slot refused")
+	}
+
+	waits := make([]time.Duration, 0, 3)
+
+	for _, name := range []string{"a", "b", "c"} {
+		_, wait, ok := gate.tryAcquire(name)
+		if ok {
+			t.Fatalf("%s got the slot while a re-check runs", name)
+		}
+
+		waits = append(waits, wait)
+	}
+
+	*clock = clock.Add(time.Second)
+	gate.release(started)
+	*clock = clock.Add(recheckCooldown * time.Second)
+
+	if waits[2] <= waits[1] || waits[1] <= waits[0] {
+		t.Errorf("waits %v do not grow with the place in line", waits)
+	}
+
+	for _, name := range []string{"c", "b"} {
+		if _, _, ok := gate.tryAcquire(name); ok {
+			t.Fatalf("%s got the slot ahead of the re-check that asked before it", name)
+		}
+	}
+
+	for _, name := range []string{"a", "b", "c"} {
+		started, _, ok := gate.tryAcquire(name)
+		if !ok {
+			t.Fatalf("%s did not get the slot on its turn", name)
+		}
+
+		gate.release(started)
+	}
+}
+
+// TestStaleRecheckLosesItsPlace: a re-check that stopped asking, its
+// deferred pass lost, does not hold the line.
+func TestStaleRecheckLosesItsPlace(t *testing.T) {
+	gate, clock := newClockedRecheckGate()
+
+	started, _, _ := gate.tryAcquire("running")
+
+	if _, _, ok := gate.tryAcquire("gone"); ok {
+		t.Fatalf("a re-check got the slot while another runs")
+	}
+
+	gate.release(started)
+
+	*clock = clock.Add(recheckStale)
+
+	if _, _, ok := gate.tryAcquire("next"); !ok {
+		t.Fatalf("a re-check that stopped asking still holds the line")
+	}
+}
+
+// TestEventTakesRecheckOutOfLine: an event for a waiting re-check makes
+// its next pass an event pass, which leaves the line.
+func TestEventTakesRecheckOutOfLine(t *testing.T) {
+	gate, _ := newClockedRecheckGate()
+
+	started, _, _ := gate.tryAcquire("running")
+
+	for _, name := range []string{"changed", "next"} {
+		if _, _, ok := gate.tryAcquire(name); ok {
+			t.Fatalf("%s got the slot while a re-check runs", name)
+		}
+	}
+
+	gate.changed("changed")
+	gate.release(started)
+
+	if _, _, ok := gate.tryAcquire("next"); !ok {
+		t.Fatalf("a replica an event took out of the line still holds it")
 	}
 }
 

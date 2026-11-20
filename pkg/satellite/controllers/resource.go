@@ -237,6 +237,13 @@ const peerAllocationRequeue = 2 * time.Second
 //   - short enough that any divergence between desired and observed
 //     converges within a single user-visible scenario tick (e2e
 //     tests poll at 1-2 s and budget ~30 s per assertion).
+//
+// It is the earliest a replica is re-checked, not a promise. The
+// re-check gate runs the re-checks one at a time, cools the slot down
+// after each, and holds them while an event pass runs, so on a node
+// with N replicas whose pass takes T the period is about
+// max(10s, N*(1+recheckCooldown)*T): with a hundred replicas at 0.1 s
+// a pass, about 20 s.
 const activeDRBDRequeue = 10 * time.Second
 
 // resolveDeleteStoragePool picks the pool name the
