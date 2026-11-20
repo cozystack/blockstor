@@ -233,6 +233,13 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 		return r.handleResumePhase(ctx, snap)
 	}
 
+	// The controller recorded how the take ended. A suspend order next
+	// to that record is stale, written by a pass that never saw it, and
+	// a window opened for it would freeze I/O for a take that is over.
+	if snap.Spec.SuspendIO && snapshotTakeEnded(snap) {
+		return r.handleResumePhase(ctx, snap)
+	}
+
 	// Phase 1: parent RD I/O suspend. Per-node ack lives on
 	// Status.NodeStatus[us].SuspendIOAcked.
 	if snap.Spec.SuspendIO && !acked {
@@ -264,6 +271,27 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	}
 
 	return r.handleTakeSnapshotPhase(ctx, snap)
+}
+
+// snapshotTakeEnded reports whether the controller recorded an outcome
+// for snap's take: an abort reason, in the spec or in the annotation an
+// older writer cannot drop, or an outcome flag on the status. The
+// controller never orders a suspend for such a snapshot again.
+func snapshotTakeEnded(snap *blockstoriov1alpha1.Snapshot) bool {
+	if snap.Spec.AbortReason != "" || snap.Annotations[blockstoriov1alpha1.AnnotationSnapshotAbortReason] != "" {
+		return true
+	}
+
+	return slices.ContainsFunc(snap.Status.Flags, func(flag string) bool {
+		switch flag {
+		case blockstoriov1alpha1.SnapshotStatusFlagSuccessful,
+			blockstoriov1alpha1.SnapshotStatusFlagFailed,
+			blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect:
+			return true
+		}
+
+		return false
+	})
 }
 
 // handleSuspendPhase dispatches Phase 1: flush, suspend I/O for the

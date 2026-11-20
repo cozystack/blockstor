@@ -1203,7 +1203,7 @@ func (r *SnapshotReconciler) watchWindow(ctx context.Context, name string) {
 		if expired {
 			closeAsync(true, "suspend window deadline passed")
 		}
-	case !snap.DeletionTimestamp.IsZero() || !snap.Spec.SuspendIO:
+	case !snap.DeletionTimestamp.IsZero() || !snap.Spec.SuspendIO || snapshotTakeEnded(&snap):
 		closeAsync(false, "")
 	case expired:
 		closeAsync(true, "suspend window deadline passed")
