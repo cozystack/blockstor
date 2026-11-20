@@ -158,34 +158,63 @@ func suspendRequeueAfter(snap *blockstoriov1alpha1.Snapshot, now time.Time) time
 func (r *SnapshotReconciler) abortGroupWithReason(
 	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot, reason string,
 ) (ctrl.Result, error) {
+	return r.abortGroupWithFlag(ctx, siblings, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect, reason)
+}
+
+// abortGroupWithFlag is abortGroupWithReason with the failure flag to
+// stamp: a group recovered from a failure a satellite stamped keeps
+// that failure's flag.
+func (r *SnapshotReconciler) abortGroupWithFlag(
+	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot, flag, reason string,
+) (ctrl.Result, error) {
 	// Resume first: clearing Spec.SuspendIO on every sibling is the
 	// outage fix and must happen even if the Status stamps below fail.
-	err := r.abortGroup(ctx, siblings)
+	err := r.abortGroup(ctx, siblings, reason)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	for i := range siblings {
-		stampErr := r.stampSnapshotFailedDisconnect(ctx, &siblings[i], reason)
+		stampErr := r.stampSnapshotFailure(ctx, &siblings[i], flag, reason)
 		if stampErr != nil {
 			return ctrl.Result{}, errors.Wrapf(stampErr,
-				"stamp FAILED_DISCONNECT on sibling %q", siblings[i].Name)
+				"on sibling %q", siblings[i].Name)
 		}
 	}
 
 	return ctrl.Result{}, nil
 }
 
-// stampSnapshotFailedDisconnect records the controller-side abort
-// reason on the Snapshot's Status: the FAILED_DISCONNECT terminal flag
-// (so the wire view / `linstor s l` renders "Satellite disconnected")
-// plus a SnapshotComplete=False Condition carrying the human-readable
-// reason. Idempotent — a re-stamp on a Snapshot that already carries
-// the flag with the same condition message is a no-op. Optimistic-lock
-// retried against a fresh fetch so it converges against concurrent
-// satellite Status writes.
-func (r *SnapshotReconciler) stampSnapshotFailedDisconnect(
-	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, reason string,
+// stampGroupFailed records a per-node failure on every sibling of the
+// batch, not only on the one whose satellite gave up. LINSTOR aborts a
+// multi-snapshot request as a whole and flags every snapshot
+// definition in it FAILED_DEPLOYMENT (blockstor's FAILED), so none of
+// them is ever SUCCESSFUL, not even once the failed one is deleted.
+// Without the record a sibling whose own nodes all took their snapshot
+// would be marked SUCCESSFUL as soon as the failed sibling is gone.
+// Re-run on every pass while a node reports Failed, so a stamp that
+// did not land is retried.
+func (r *SnapshotReconciler) stampGroupFailed(
+	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot, reason string,
+) error {
+	for i := range siblings {
+		err := r.stampSnapshotFailure(ctx, &siblings[i], blockstoriov1alpha1.SnapshotStatusFlagFailed, reason)
+		if err != nil {
+			return errors.Wrapf(err, "on sibling %q", siblings[i].Name)
+		}
+	}
+
+	return nil
+}
+
+// stampSnapshotFailure adds a failure flag and the SnapshotComplete=False
+// Condition carrying reason to the Snapshot's Status. A Snapshot whose
+// status already records an outcome, a failure stamped by a satellite
+// or by an earlier pass, or SUCCESSFUL, is left as it is, reason
+// included. Retried against a fresh read so it converges with the
+// satellites' concurrent status writes.
+func (r *SnapshotReconciler) stampSnapshotFailure(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, flag, reason string,
 ) error {
 	key := client.ObjectKeyFromObject(snap)
 
@@ -198,41 +227,73 @@ func (r *SnapshotReconciler) stampSnapshotFailedDisconnect(
 				return nil
 			}
 
-			return errors.Wrap(getErr, "get Snapshot for FAILED_DISCONNECT stamp")
+			return errors.Wrap(getErr, "get Snapshot for "+flag+" stamp")
 		}
 
-		mutated := false
-
-		if !slices.Contains(current.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect) {
-			current.Status.Flags = append(current.Status.Flags,
-				blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect)
-			mutated = true
-		}
-
-		if upsertSnapshotAbortCondition(&current, reason) {
-			mutated = true
-		}
-
-		if !mutated {
+		if slices.ContainsFunc(current.Status.Flags, isSnapshotOutcomeFlag) {
 			return nil
 		}
+
+		current.Status.Flags = append(current.Status.Flags, flag)
+		upsertSnapshotAbortCondition(&current, reason)
 
 		return r.Status().Update(ctx, &current)
 	})
 	if err != nil {
-		return errors.Wrap(err, "stamp Snapshot Status FAILED_DISCONNECT")
+		return errors.Wrap(err, "stamp Snapshot Status "+flag)
 	}
 
 	return nil
 }
 
+// groupAbortReason reports whether the take of the batch already
+// ended in failure, the reason to record and the failure flag to stamp
+// on the siblings that lack one: an abort a sibling has on record, or
+// a failure stamped on a sibling's status. The latter covers a snapshot
+// aborted before Spec.AbortReason existed, and keeps its flag: a
+// satellite's FAILED is LINSTOR's FAILED_DEPLOYMENT, not a disconnect.
+func groupAbortReason(siblings []blockstoriov1alpha1.Snapshot) (string, string, bool) {
+	for i := range siblings {
+		if reason := recordedAbortReason(&siblings[i]); reason != "" {
+			return reason, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect, true
+		}
+	}
+
+	for i := range siblings {
+		if idx := slices.IndexFunc(siblings[i].Status.Flags, isSnapshotFailureFlag); idx >= 0 {
+			return "snapshot aborted: the take of '" + siblings[i].Spec.SnapshotName +
+				"' failed; resume of I/O requested", siblings[i].Status.Flags[idx], true
+		}
+	}
+
+	return "", "", false
+}
+
+// isSnapshotFailureFlag reports whether a status flag records a failed
+// take.
+func isSnapshotFailureFlag(flag string) bool {
+	return flag == blockstoriov1alpha1.SnapshotStatusFlagFailed ||
+		flag == blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect
+}
+
+// isSnapshotOutcomeFlag reports whether a status flag already records
+// how the take ended.
+func isSnapshotOutcomeFlag(flag string) bool {
+	switch flag {
+	case blockstoriov1alpha1.SnapshotStatusFlagSuccessful,
+		blockstoriov1alpha1.SnapshotStatusFlagFailed,
+		blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect:
+		return true
+	}
+
+	return false
+}
+
 // upsertSnapshotAbortCondition sets (or refreshes) the
-// SnapshotComplete=False Condition carrying the abort reason. Returns
-// true iff it changed the slice (so the caller can skip a no-op
-// Status().Update). Uses meta.SetStatusCondition's idempotence:
-// re-stamping the same Status+Reason+Message leaves LastTransitionTime
-// untouched, so a steady-state re-reconcile doesn't churn the object.
-func upsertSnapshotAbortCondition(snap *blockstoriov1alpha1.Snapshot, reason string) bool {
+// SnapshotComplete=False Condition carrying the abort reason. Uses
+// meta.SetStatusCondition's idempotence: re-stamping the same
+// Status+Reason+Message leaves LastTransitionTime untouched.
+func upsertSnapshotAbortCondition(snap *blockstoriov1alpha1.Snapshot, reason string) {
 	cond := metav1.Condition{
 		Type:    blockstoriov1alpha1.SnapshotStatusConditionType,
 		Status:  metav1.ConditionFalse,
@@ -240,7 +301,7 @@ func upsertSnapshotAbortCondition(snap *blockstoriov1alpha1.Snapshot, reason str
 		Message: reason,
 	}
 
-	return setSnapshotCondition(&snap.Status.Conditions, &cond)
+	setSnapshotCondition(&snap.Status.Conditions, &cond)
 }
 
 // setSnapshotCondition is a minimal SetStatusCondition: upserts cond

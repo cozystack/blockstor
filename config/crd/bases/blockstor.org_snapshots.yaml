@@ -63,6 +63,16 @@ spec:
           spec:
             description: spec defines the desired state of Snapshot
             properties:
+              abortReason:
+                description: |-
+                  abortReason, once set, records that the controller aborted the
+                  take, and why. It is written in the same update that clears
+                  suspendIO and takeSnapshot, so the abort is on record before any
+                  satellite resumes and holds even if the status write that
+                  follows never lands. An aborted take is over: suspendIO is never
+                  set again and the snapshot is never marked SUCCESSFUL, as LINSTOR
+                  keeps an aborted snapshot definition failed for good.
+                type: string
               groupID:
                 description: |-
                   groupID, when non-empty, marks this Snapshot as a member of a
@@ -332,9 +342,10 @@ spec:
                 x-kubernetes-list-type: map
               flags:
                 description: |-
-                  flags carries terminal-state markers. Currently only
-                  "FAILED" is meaningful — stamped by the satellite when
-                  CreateSnapshot returns a non-retryable error class.
+                  flags carries terminal-state markers: "SUCCESSFUL" once the
+                  take completed on every targeted node, "FAILED" when a
+                  satellite's CreateSnapshot returned a non-retryable error, and
+                  "FAILED_DISCONNECT" when the controller aborted a take that hung.
                 items:
                   type: string
                 type: array

@@ -339,7 +339,7 @@ func wireResourceReconcilers(mgr manager.Manager, store *storek8s.Store) error {
 }
 
 func wireBackgroundRunnables(mgr manager.Manager, store *storek8s.Store) error {
-	err := (&controller.AutoSnapshotRunnable{Client: mgr.GetClient(), Store: store}).RegisterWithManager(mgr)
+	err := (&controller.AutoSnapshotRunnable{Client: mgr.GetClient(), Store: store, APIReader: mgr.GetAPIReader()}).RegisterWithManager(mgr)
 	if err != nil {
 		return fmt.Errorf("auto-snapshot: %w", err)
 	}

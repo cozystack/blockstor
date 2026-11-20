@@ -237,6 +237,9 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		// The source replicas' wrapped LUKS passwords, copied at Create:
 		// the snapshot's bytes cannot be read without them.
 		preservedLUKSKeys := existing.Spec.LUKSKeys
+		// The controller's record of an aborted take: lost, the next
+		// pass could freeze I/O again for a take that is over.
+		preservedAbortReason := existing.Spec.AbortReason
 
 		existing.Spec = wireToCRDSnapshotSpec(in)
 		existing.Spec.LUKSKeys = preservedLUKSKeys
@@ -245,6 +248,7 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		existing.Spec.GroupID = preservedGroupID
 		existing.Spec.GroupSize = preservedGroupSize
 		existing.Spec.ResourceDefinitionName = preservedRD
+		existing.Spec.AbortReason = preservedAbortReason
 		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations), AnnotationLinstorRDName)
 
 		return s.c.Update(ctx, &existing)
@@ -438,11 +442,11 @@ func crdToWireSnapshot(
 		vdPropsByNumber = vdPropsMap(parent)
 	}
 
-	// Surface Status.Flags on the wire so the Python CLI's
-	// State column can render "Failed". Defensive copy: the
-	// CRD's slice header gets reused across List calls, sharing
-	// the backing array would let a downstream mutation reach
-	// back into the informer cache.
+	// Surface Status.Flags on the wire: the persisted SUCCESSFUL the
+	// State column and linstor-csi's restore wait read, and the
+	// failure markers. Defensive copy: the CRD's slice header gets
+	// reused across List calls, sharing the backing array would let a
+	// downstream mutation reach back into the informer cache.
 	if len(crd.Status.Flags) > 0 {
 		out.Flags = make([]string, len(crd.Status.Flags))
 		copy(out.Flags, crd.Status.Flags)
@@ -452,9 +456,15 @@ func crdToWireSnapshot(
 	// holds the snapshot, and that lasts until the on-disk delete succeeds.
 	// Served as a plain snapshot, a restore read it as live and was restored
 	// from data being destroyed. Same flag resources carry for the same state,
-	// and like theirs it outranks every other State: the REST view stamps no
-	// SUCCESSFUL beside it.
+	// and like theirs it outranks every other State, so the persisted
+	// SUCCESSFUL is not served beside it: a client that checks for SUCCESSFUL
+	// before DELETE would otherwise restore from it.
 	out.Flags = withDeletingFlag(out.Flags, crd.DeletionTimestamp != nil)
+	if crd.DeletionTimestamp != nil {
+		out.Flags = slices.DeleteFunc(out.Flags, func(flag string) bool {
+			return flag == apiv1.SnapshotFlagSuccessful
+		})
+	}
 
 	if len(crd.Spec.VolumeDefinitions) > 0 {
 		out.VolumeDefinitions = wireVolumeDefinitions(crd.Spec.VolumeDefinitions, vdPropsByNumber)
@@ -717,7 +727,7 @@ func (s *snapshots) sourceLUKSKeys(ctx context.Context, rdCRName string, nodes [
 		reader = s.apiReader
 	}
 
-	replicas, err := resourceCRDsOfDefinition(ctx, reader, rdCRName)
+	replicas, err := ResourceCRDsOfDefinition(ctx, reader, rdCRName)
 	if err != nil {
 		return nil, err
 	}
@@ -751,30 +761,59 @@ func (s *snapshots) sourceLUKSKeys(ctx context.Context, rdCRName string, nodes [
 	return out, nil
 }
 
-// resourceCRDsOfDefinition lists the Resource CRs whose spec names the
-// definition rdCRName, scoped by the selectable field where the server serves
-// it and by a full read otherwise.
-func resourceCRDsOfDefinition(ctx context.Context, reader ctrlclient.Reader, rdCRName string) ([]crdv1alpha1.Resource, error) {
+// ResourceCRDsOfDefinition lists the Resource CRs of the definition rdName,
+// under every spelling a replica may name it by, scoped by the selectable
+// field where the server serves it and by a single full read otherwise. The
+// auto-snapshot runnable shares it with the REST create, so both take a
+// snapshot from, and copy the LUKS passwords of, the same replicas.
+func ResourceCRDsOfDefinition(ctx context.Context, reader ctrlclient.Reader, rdName string) ([]crdv1alpha1.Resource, error) {
+	spellings, err := rdSpellings(ctx, reader, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []crdv1alpha1.Resource
+
+	seen := map[string]bool{}
+
+	for _, spelling := range spellings {
+		var list crdv1alpha1.ResourceList
+
+		err := reader.List(ctx, &list, ctrlclient.MatchingFields{FieldResourceDefinitionName: spelling})
+		if SelectorUnsupported(err) {
+			return resourceCRDsNamedAnyOf(ctx, reader, spellings)
+		}
+
+		if err != nil {
+			return nil, errors.Wrapf(err, "list the replicas of %q", rdName)
+		}
+
+		for i := range list.Items {
+			if !seen[list.Items[i].Name] {
+				seen[list.Items[i].Name] = true
+
+				out = append(out, list.Items[i])
+			}
+		}
+	}
+
+	return out, nil
+}
+
+// resourceCRDsNamedAnyOf is ResourceCRDsOfDefinition for a server that cannot
+// select on the field: one full read, filtered here.
+func resourceCRDsNamedAnyOf(ctx context.Context, reader ctrlclient.Reader, spellings []string) ([]crdv1alpha1.Resource, error) {
 	var list crdv1alpha1.ResourceList
 
-	err := reader.List(ctx, &list, ctrlclient.MatchingFields{FieldResourceDefinitionName: rdCRName})
-	if err == nil {
-		return list.Items, nil
-	}
-
-	if !SelectorUnsupported(err) {
-		return nil, errors.Wrapf(err, "list the replicas of %q", rdCRName)
-	}
-
-	err = reader.List(ctx, &list)
+	err := reader.List(ctx, &list)
 	if err != nil {
-		return nil, errors.Wrapf(err, "list the replicas of %q", rdCRName)
+		return nil, errors.Wrapf(err, "list the replicas of %q", spellings[0])
 	}
 
 	out := list.Items[:0]
 
 	for i := range list.Items {
-		if list.Items[i].Spec.ResourceDefinitionName == rdCRName {
+		if slices.Contains(spellings, list.Items[i].Spec.ResourceDefinitionName) {
 			out = append(out, list.Items[i])
 		}
 	}

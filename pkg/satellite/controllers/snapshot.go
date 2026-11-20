@@ -773,14 +773,10 @@ func collapseNodeStatus(
 
 // stampSnapshotPerNodeReady upserts our node's entry in
 // Status.NodeStatus with Ready=true and the satellite-reported
-// CreateTimestamp. This is the missing half of the Bug 106 fix:
-// the apiserver's `stampSnapshotSuccessful` derivation reads
-// `Snapshots[].CreateTimestamp` to decide whether every diskful
-// peer reported back, and without this write nothing ever populates
-// it (commit 3c593c5f7 shipped the apiserver-side derivation but
-// no code path was writing the stamp). Once every diskful peer has
-// upserted, the apiserver flips the snapshot from "Incomplete" to
-// "Successful" in the wire view.
+// CreateTimestamp. Once every targeted node has upserted, the
+// controller-side SnapshotReconciler resumes I/O and records
+// SUCCESSFUL on the Snapshot's status, which the wire view serves
+// from then on.
 //
 // Concurrent satellites race against each other on the same Status
 // subresource — the optimistic-lock conflict is retried up to
