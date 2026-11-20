@@ -414,6 +414,9 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Same answer point as the multi create, and LINSTOR's.
+	s.waitSnapshotsSettled(r.Context(), []snapshotRef{{rd: rd, name: snap.Name}})
+
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "snapshot created: " + snap.Name,

@@ -86,6 +86,12 @@ type Server struct {
 	// reader, so the passphrase rotation also lists definitions through it.
 	SecretReader client.Reader
 
+	// SnapshotTakeWait bounds how long a snapshot create holds its answer
+	// for the take to settle, as LINSTOR's does; see the constant of the
+	// same name. Zero answers at once, which tests without a controller
+	// rely on.
+	SnapshotTakeWait time.Duration
+
 	// TLS, when non-nil, makes Start also bring up a mutual-TLS
 	// listener on TLSAddr alongside the plain-HTTP debug listener on
 	// Addr. The in-cluster Service exposes ONLY TLSAddr; the plain

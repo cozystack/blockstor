@@ -116,9 +116,20 @@ func (s *Server) handleSnapshotCreateMulti(w http.ResponseWriter, r *http.Reques
 	// controller never sees more siblings than were created).
 	groupSize := clampInt32(len(body.Snapshots))
 
+	created := make([]snapshotRef, 0, len(body.Snapshots))
+
 	for i := range body.Snapshots {
-		results = append(results, s.createOneFromMulti(r.Context(), &body.Snapshots[i], groupID, groupSize))
+		rc := s.createOneFromMulti(r.Context(), &body.Snapshots[i], groupID, groupSize)
+		if rc.RetCode&apiCallRcError == 0 {
+			created = append(created, snapshotRef{rd: body.Snapshots[i].ResourceName, name: body.Snapshots[i].Name})
+		}
+
+		results = append(results, rc)
 	}
+
+	// Answer once the takes are over, as LINSTOR does: linstor-csi caches
+	// the view it reads right after this call.
+	s.waitSnapshotsSettled(r.Context(), created)
 
 	writeJSON(w, http.StatusCreated, results)
 }
