@@ -560,6 +560,15 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 // Status update is rejected by Kube's optimistic concurrency check
 // and the next reconcile picks the next free port.
 func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
+	// Nearly every reconcile lands on a replica allocated long ago.
+	// Its identities are never rewritten once set, so the cached view
+	// is enough to see there is nothing to do; the uncached reads and
+	// the process-wide allocation lock below are for the replicas that
+	// still need a value.
+	if r.identitiesSettled(ctx, target) {
+		return false, nil
+	}
+
 	// Serialise allocation across replicas of the same RD. The
 	// APIReader-direct read alone doesn't fix the race — two
 	// goroutines can both observe taken=[] simultaneously and
@@ -605,6 +614,34 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 	}
 
 	return mutated, nil
+}
+
+// identitiesSettled reports, from the cached client, whether target
+// already carries everything allocateAndApplyDRBDIDs would write: the
+// Spec node id, port and skip-initial-sync decision, their Status
+// mirrors, and a minor for every volume of the parent definition with
+// the volume-0 one mirrored on Status. A value the allocator writes is
+// never changed afterwards, so a cache that shows all of them cannot
+// be hiding a missing one. Anything absent, or a definition the cache
+// cannot return, sends the caller down the uncached allocation path.
+func (r *ResourceReconciler) identitiesSettled(ctx context.Context, target *blockstoriov1alpha1.Resource) bool {
+	spec := &target.Spec
+	if spec.DRBDNodeID == nil || spec.DRBDPort == nil || spec.SkipInitialSync == nil {
+		return false
+	}
+
+	if !ptrEqI32(spec.DRBDNodeID, target.Status.DRBDNodeID) || !ptrEqI32(spec.DRBDPort, target.Status.DRBDPort) {
+		return false
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(spec.ResourceDefinitionName)}, &rd)
+	if err != nil || len(rd.Spec.VolumeDefinitions) == 0 || !rdVolumeMinorsComplete(&rd) {
+		return false
+	}
+
+	return ptrEqI32(vol0MinorOf(&rd), target.Status.DRBDMinor)
 }
 
 // allocateDRBDFields fills in any missing DRBD-{NodeID,Port,Minor}
