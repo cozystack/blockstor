@@ -189,3 +189,26 @@ func TestTheBackfillSkipsReplicasWithoutDRBDMetadata(t *testing.T) {
 		}
 	}
 }
+
+// An empty layer stack is the default DRBD-over-storage stack: the
+// controller leaves it unset when the group names none, as on a
+// definition adopted from LINSTOR in the default group, and the apply
+// chain renders a .res for it. The backfill probes such a replica like
+// any other DRBD one.
+func TestTheBackfillProbesADefinitionWithoutALayerStack(t *testing.T) {
+	t.Parallel()
+
+	f := newBackfillFixture("pvc-5", 0, 1)
+	f.rd.Spec.LayerStack = nil
+	fx := newDumpMdExec("pvc-5/0", "pvc-5/1")
+
+	cond := f.run(t, fx)
+
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != blockstoriov1alpha1.MetadataCreatedReasonFound {
+		t.Errorf("MetadataCreated = %+v, want True/%s", cond, blockstoriov1alpha1.MetadataCreatedReasonFound)
+	}
+
+	if got, want := dumpMdTargets(fx), []string{"pvc-5/0", "pvc-5/1"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("dump-md targets = %v, want %v", got, want)
+	}
+}

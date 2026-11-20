@@ -22,7 +22,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strings"
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
@@ -169,7 +168,7 @@ func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *
 	for _, target := range targets {
 		hasMD, probeErr := b.Adm.HasMD(ctx, target)
 		if probeErr != nil {
-			logger.Info("dump-md probe failed (best-effort)", "err", probeErr.Error())
+			logger.Info("dump-md probe failed (best-effort)", "target", target, "err", probeErr.Error())
 
 			return false
 		}
@@ -212,7 +211,9 @@ func (b *MetadataCreatedBackfillRunnable) probeTargets(ctx context.Context, res 
 		return nil, false
 	}
 
-	if !layerStackHasDRBD(rd.Spec.LayerStack) {
+	// An empty stack is the default DRBD-over-storage one, as the
+	// reconciler reads it.
+	if !rdNeedsDRBD(&rd) {
 		return nil, false
 	}
 
@@ -222,9 +223,4 @@ func (b *MetadataCreatedBackfillRunnable) probeTargets(ctx context.Context, res 
 	}
 
 	return targets, len(targets) > 0
-}
-
-// layerStackHasDRBD reports whether the stack renders a .res file.
-func layerStackHasDRBD(stack []string) bool {
-	return slices.ContainsFunc(stack, func(layer string) bool { return strings.EqualFold(layer, "DRBD") })
 }
