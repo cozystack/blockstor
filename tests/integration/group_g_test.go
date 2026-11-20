@@ -48,6 +48,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -297,6 +298,129 @@ func TestGroupG(t *testing.T) {
 	t.Run("SnapOrphanCleanup", func(t *testing.T) { testGroupGSnapOrphanCleanup(t, stack, cli) })
 	t.Run("SnapDeleteBlockedByLater", func(t *testing.T) { testGroupGSnapDeleteBlockedByLater(t, stack, cli) })
 	t.Run("AutoSnapshotPeriodicTick", func(t *testing.T) { testGroupGAutoSnapshotPeriodicTick(t, stack) })
+	t.Run("SnapSuccessfulOutlivesSource", func(t *testing.T) { testGroupGSnapSuccessfulOutlivesSource(t, stack, cli) })
+}
+
+// testGroupGSnapSuccessfulOutlivesSource drives a snapshot through the
+// controller's suspend, take and resume, standing in for the satellites,
+// then deletes every replica of the source. In LINSTOR the snapshot
+// definition keeps the SUCCESSFUL it got when the take completed, and
+// linstor-csi waits for that flag before restoring from it. Derived from
+// the source's current replicas, it vanished with them, and every restore
+// of a deleted volume timed out.
+func testGroupGSnapSuccessfulOutlivesSource(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
+	rd := seedRDWithVolume(t, stack, "outlives")
+	cli.Run(t, "snapshot", "create", rd, "snap-1")
+	waitForSnapshotCRD(t, stack, rd, "snap-1")
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: rd + ".snap-1"}
+
+	getSnap := func() blockstoriov1alpha1.Snapshot {
+		var snap blockstoriov1alpha1.Snapshot
+		if err := stack.Env.Client.Get(ctx, key, &snap); err != nil {
+			t.Fatalf("get Snapshot: %v", err)
+		}
+
+		return snap
+	}
+
+	// What each targeted satellite writes at a phase of the take.
+	stampNodes := func(acked, ready bool) {
+		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			snap := getSnap()
+			snap.Status.NodeStatus = nil
+
+			var taken int64
+			if ready {
+				taken = time.Now().UnixMilli()
+			}
+
+			for _, node := range snap.Spec.Nodes {
+				snap.Status.NodeStatus = append(snap.Status.NodeStatus, blockstoriov1alpha1.SnapshotPerNodeStatus{
+					NodeName:        node,
+					SuspendIOAcked:  acked,
+					Ready:           ready,
+					CreateTimestamp: taken,
+				})
+			}
+
+			return stack.Env.Client.Status().Update(ctx, &snap)
+		})
+		if err != nil {
+			t.Fatalf("stamp per-node status: %v", err)
+		}
+	}
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnap()
+
+		return snap.Spec.SuspendIO && len(snap.Spec.Nodes) == len(harness.FixtureNodes())
+	}, "snapshot did not enter the suspend phase on every replica's node")
+
+	stampNodes(true, false)
+
+	harness.Eventually(t, groupGTimeout, func() bool { return getSnap().Spec.TakeSnapshot },
+		"controller did not order the take once every node suspended")
+
+	stampNodes(true, true)
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnap()
+
+		return !snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot
+	}, "controller did not resume I/O once every node took the snapshot")
+
+	stampNodes(false, true)
+
+	snapURL := stack.RestURL + "/v1/resource-definitions/" + rd + "/snapshots/snap-1"
+
+	restFlags := func() []string {
+		status, body := httpGetStatus(t, snapURL)
+		if status != http.StatusOK {
+			t.Fatalf("GET snapshot: status %d: %s", status, body)
+		}
+
+		var wire struct {
+			Flags []string `json:"flags"`
+		}
+		if err := json.Unmarshal(body, &wire); err != nil {
+			t.Fatalf("decode snapshot: %v", err)
+		}
+
+		return wire.Flags
+	}
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		return slices.Contains(restFlags(), "SUCCESSFUL")
+	}, "snapshot not served SUCCESSFUL after a completed take")
+
+	// The source volume goes: every replica is deleted, the definition
+	// stays because it has a snapshot.
+	for _, res := range listResourcesByRD(t, stack, rd) {
+		if err := stack.Env.Client.Delete(ctx, &res); err != nil {
+			t.Fatalf("delete Resource %s: %v", res.Name, err)
+		}
+	}
+
+	stripResourceFinalizers(t, stack, rd)
+
+	harness.Eventually(t, groupGTimeout, func() bool { return len(listResourcesByRD(t, stack, rd)) == 0 },
+		"source replicas were not deleted")
+
+	if flags := restFlags(); !slices.Contains(flags, "SUCCESSFUL") {
+		t.Fatalf("snapshot of a deleted volume served with flags %v, want SUCCESSFUL: "+
+			"linstor-csi would never restore from it", flags)
+	}
+
+	got := listSnapshotsViaCLI(t, cli, rd)
+	if len(got) != 1 {
+		t.Fatalf("snapshot list: got %d snapshots, want 1", len(got))
+	}
+
+	if flags, _ := got[0]["flags"].([]any); !slices.Contains(flags, any("SUCCESSFUL")) {
+		t.Fatalf("snapshot list serves flags %v for the snapshot of a deleted volume, want SUCCESSFUL", got[0]["flags"])
+	}
 }
 
 // testGroupGSnapCreateListDelete is the basic CRUD wire-shape pin.
