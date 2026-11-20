@@ -55,6 +55,8 @@ const (
 	stateCreated  = "Created"
 	stateDiskless = "Diskless"
 	flagDelete    = "DELETE"
+
+	replicationStateSyncTarget = "SyncTarget"
 )
 
 // Flags the State column reads beyond the ones apiv1 names.
@@ -89,15 +91,6 @@ type ResourceListInput struct {
 	// the caller passed those flags.
 	Resources []apiv1.Resource
 
-	// VolumeSizesKib maps a resource-definition name to its volume
-	// sizes, used to turn the observed out-of-sync KiB into a progress
-	// percentage. Absent sizes simply omit the percentage.
-	//
-	// Keyed by definition, not by volume number alone: a listing spans
-	// several definitions, and volume 0 of one is not volume 0 of
-	// another.
-	VolumeSizesKib map[string]map[int32]int64
-
 	// DefinitionProps maps a resource-definition name (naming.Key) to
 	// its own properties, so a SkipDisk set on the definition shows on
 	// every replica of it.
@@ -129,7 +122,7 @@ func ResourceList(in ResourceListInput) *metav1.Table {
 		res := &in.Resources[i]
 		key := naming.Key(res.Name)
 
-		row := describeReplica(res, in.VolumeSizesKib[res.Name], primaries[key], in.DefinitionProps[key])
+		row := describeReplica(res, primaries[key], in.DefinitionProps[key])
 		if in.FaultyOnly && row.state.Class == color.Healthy {
 			continue
 		}
@@ -170,7 +163,7 @@ type replicaRow struct {
 // a replica being deleted or deactivated reports no usage, Conns stays
 // blank while nothing is known about the replica, and a broken peer
 // link turns the State red whatever the disk says.
-func describeReplica(res *apiv1.Resource, sizes map[int32]int64, primaries int, defProps map[string]string) replicaRow {
+func describeReplica(res *apiv1.Resource, primaries int, defProps map[string]string) replicaRow {
 	var row replicaRow
 
 	reported := true
@@ -182,7 +175,7 @@ func describeReplica(res *apiv1.Resource, sizes map[int32]int64, primaries int, 
 		row.state = color.Cell{Text: apiv1.ResourceFlagInactive, Class: color.Transitional}
 	default:
 		row.usage = usageCell(res, primaries)
-		row.state, reported = replicaState(res, sizes)
+		row.state, reported = replicaState(res)
 	}
 
 	row.state = withSkipDisk(row.state, res, defProps)
@@ -333,12 +326,12 @@ func topLayerIsDRBD(res *apiv1.Resource) bool {
 //
 // Otherwise the first volume that is not healthy speaks for the row,
 // and the last one when all are.
-func replicaState(res *apiv1.Resource, sizes map[int32]int64) (color.Cell, bool) {
+func replicaState(res *apiv1.Resource) (color.Cell, bool) {
 	tieBreaker := slices.Contains(res.Flags, apiv1.ResourceFlagTieBreaker)
 	diskless := slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) && !anyDiskState(res)
 
 	if !tieBreaker && !diskless {
-		return volumesState(res, sizes), true
+		return volumesState(res), true
 	}
 
 	reported := satelliteReported(res)
@@ -357,11 +350,11 @@ func replicaState(res *apiv1.Resource, sizes map[int32]int64) (color.Cell, bool)
 
 // volumesState is the state of the first volume that is not healthy,
 // or of the last one when all are.
-func volumesState(res *apiv1.Resource, sizes map[int32]int64) color.Cell {
+func volumesState(res *apiv1.Resource) color.Cell {
 	state := color.Cell{Text: stateUnknown, Class: color.Transitional}
 
 	for i := range res.Volumes {
-		state = volumeState(res, &res.Volumes[i], sizes)
+		state = volumeState(res, &res.Volumes[i])
 
 		if slices.Contains(res.Flags, flagEvacuate) {
 			state.Text += ", Evacuating"
@@ -408,7 +401,7 @@ func anyDiskState(res *apiv1.Resource) bool {
 //
 // There is no `Resizing` marker: nothing in this store flags a volume
 // while it grows, so a branch for one would only ever fire in a test.
-func volumeState(res *apiv1.Resource, vol *apiv1.Volume, sizes map[int32]int64) color.Cell {
+func volumeState(res *apiv1.Resource, vol *apiv1.Volume) color.Cell {
 	if !volumeTopLayerIsDRBD(res, vol) {
 		return color.Cell{Text: stateCreated, Class: color.Healthy}
 	}
@@ -433,18 +426,18 @@ func volumeState(res *apiv1.Resource, vol *apiv1.Volume, sizes map[int32]int64) 
 		class = color.Healthy
 	}
 
-	text := disk
-
-	// A converged replica never carries a percentage; a syncing one
-	// does, computed from what the satellite reports as still
-	// out-of-sync.
-	if _, terminal := terminalStates[strings.ToLower(disk)]; !terminal {
-		if pct, ok := syncPercent(vol, sizes); ok {
-			text = fmt.Sprintf("%s(%d%%)", text, pct)
-		}
+	// A volume resyncing from a peer reads `SyncTarget(50.31%)`, DRBD's
+	// own `done` for that resync, which is what `linstor r l` shows
+	// against LINSTOR. No other state carries a percentage. One derived
+	// from the volume size and the out-of-sync count is wrong once a
+	// replica resyncs from more than one peer: the count is the last
+	// peer's, so a replica half way through a full resync read
+	// `Inconsistent(99%)` after a small resync from another peer.
+	if done, ok := vol.State.SyncProgress(replicationStateSyncTarget); ok {
+		return color.Cell{Text: apiv1.SyncProgressState(replicationStateSyncTarget, done), Class: color.Transitional}
 	}
 
-	return color.Cell{Text: text, Class: class}
+	return color.Cell{Text: disk, Class: class}
 }
 
 // volumeTopLayerIsDRBD reads the volume's own layer list first and the
@@ -490,25 +483,6 @@ func withToggleDisk(state color.Cell, flags []string) color.Cell {
 	return state
 }
 
-// syncPercent converts the observed out-of-sync KiB into progress.
-func syncPercent(vol *apiv1.Volume, sizes map[int32]int64) (int, bool) {
-	if vol.State.OutOfSyncKib <= 0 {
-		return 0, false
-	}
-
-	size, ok := sizes[vol.VolumeNumber]
-	if !ok || size <= 0 {
-		return 0, false
-	}
-
-	done := float64(size-vol.State.OutOfSyncKib) / float64(size) * 100
-	if done < 0 {
-		done = 0
-	}
-
-	return int(done), true
-}
-
 // IsFaulty backs `--faulty`: a replica is faulty when its State cell
 // is anything but green, which already covers a broken peer link. So
 // the filter lists exactly the rows the table flags: a diskful replica
@@ -516,7 +490,7 @@ func syncPercent(vol *apiv1.Volume, sizes map[int32]int64) (int, bool) {
 // has reported on yet, one with SkipDisk set or a toggle-disk in
 // flight. defProps are the properties of the replica's definition.
 func IsFaulty(res *apiv1.Resource, defProps map[string]string) bool {
-	return describeReplica(res, nil, 0, defProps).state.Class != color.Healthy
+	return describeReplica(res, 0, defProps).state.Class != color.Healthy
 }
 
 // SkipDisk reports whether the replica's State carries the SkipDisk
