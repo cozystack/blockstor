@@ -22,7 +22,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -40,9 +42,9 @@ import (
 // one thing this must never try. Every step is idempotent, so the retry
 // starts over.
 //
-// Once the volumes are out of DRBD, a quorum suspension that only they held
-// is lifted, so the replica that removes a volume last does not keep the
-// volumes that stay suspended.
+// Once the volumes are out of DRBD, DRBD rechecks the resource's quorum, so
+// the replica that removes a volume last does not keep the volumes that
+// stay suspended, or failing their I/O under on-no-quorum io-error.
 func (r *Reconciler) DeleteVolumes(ctx context.Context, req *intent.DeleteVolumesRequest) error {
 	err := r.removeVolumeMinors(ctx, req)
 	if err != nil {
@@ -83,9 +85,9 @@ func (r *Reconciler) DeleteVolumes(ctx context.Context, req *intent.DeleteVolume
 	return nil
 }
 
-// removeVolumeMinors takes every requested volume out of DRBD, then
-// resumes the resource's I/O if a volume's removal left it suspended on
-// quorum alone.
+// removeVolumeMinors takes every requested volume out of DRBD, then has
+// DRBD recheck the resource's quorum, which a volume's removal can leave
+// stale.
 func (r *Reconciler) removeVolumeMinors(ctx context.Context, req *intent.DeleteVolumesRequest) error {
 	withDRBD := false
 
@@ -102,19 +104,58 @@ func (r *Reconciler) removeVolumeMinors(ctx context.Context, req *intent.DeleteV
 		return nil
 	}
 
-	return r.resumeVolumeQuorumSuspension(ctx, req.Name)
+	return r.recheckQuorum(ctx, req.Name)
 }
 
-// resumeVolumeQuorumSuspension lifts the quorum suspension a removed volume
-// left behind (see drbd.Adm.ResumeQuorumSuspension), holding suspendMu so
-// a snapshot cannot suspend the resource between the check and the resume.
-func (r *Reconciler) resumeVolumeQuorumSuspension(ctx context.Context, name string) error {
+// RecheckQuorumAfterVolumeRemoval rechecks the resource's quorum when a
+// requested volume's minor is already out of the kernel, for an apply that
+// failed after its `drbdadm adjust` removed the minor: DeleteVolumes runs
+// only after an apply that went through, and the remaining volumes must not
+// stay held for as long as the apply keeps failing.
+func (r *Reconciler) RecheckQuorumAfterVolumeRemoval(ctx context.Context, req *intent.DeleteVolumesRequest) error {
+	if r.cfg.Adm == nil {
+		return nil
+	}
+
+	for _, vol := range req.Volumes {
+		if vol.Minor == nil {
+			continue
+		}
+
+		owner, err := r.cfg.Adm.ResourceOwningMinor(ctx, *vol.Minor)
+		if err != nil {
+			return errors.Wrapf(err, "find the owner of DRBD minor %d", *vol.Minor)
+		}
+
+		if !naming.Same(owner, req.Name) {
+			return r.recheckQuorum(ctx, req.Name)
+		}
+	}
+
+	return nil
+}
+
+// recheckQuorum has DRBD recompute the quorum verdict a removed volume left
+// behind (see drbd.Adm.RecheckQuorumAfterVolumeRemoval), holding suspendMu
+// so a snapshot cannot suspend the resource between the check and the
+// resume-io, which would lift that suspension too.
+func (r *Reconciler) recheckQuorum(ctx context.Context, name string) error {
 	r.suspendMu.Lock()
 	defer r.suspendMu.Unlock()
 
-	_, err := r.cfg.Adm.ResumeQuorumSuspension(ctx, name)
+	done, err := r.cfg.Adm.RecheckQuorumAfterVolumeRemoval(ctx, name)
 	if err != nil {
 		return errors.Wrapf(err, "resume the I/O of %s after its volumes were removed", name)
+	}
+
+	switch done {
+	case drbd.QuorumRecheckRan:
+		log.FromContext(ctx).Info("resumed I/O after a volume removal so DRBD rechecks quorum", "resource", name)
+	case drbd.QuorumRecheckUnsafe:
+		log.FromContext(ctx).Info("not resuming I/O after a volume removal: the resource fences peers or "+
+			"suspends on no data, and resume-io would lift such a suspension too; "+
+			"run drbdsetup resume-io if the remaining volumes stay suspended", "resource", name)
+	case drbd.QuorumRecheckNotNeeded:
 	}
 
 	return nil

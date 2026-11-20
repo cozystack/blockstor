@@ -291,8 +291,10 @@ type Reconciler struct {
 	resourceToPool map[string]string
 
 	// suspendMu keeps a snapshot's suspend-io from landing between the
-	// status read and the resume-io of resumeVolumeQuorumSuspension,
-	// whose resume-io would lift the snapshot's suspension too.
+	// status read and the resume-io of recheckQuorum, whose resume-io
+	// would lift the snapshot's suspension too. ResumeResource and the
+	// force-resume before a resource's teardown do not take it: each is
+	// meant to lift whatever suspension the resource has.
 	suspendMu sync.Mutex
 
 	// seenStuckAt is the in-memory debounce table for the Bug 342
