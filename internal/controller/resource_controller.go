@@ -236,15 +236,9 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// resourceVersion stays valid for the downstream Spec writers;
 	// requeue when allocation actually mutated state so the next
 	// pass observes the fresh revision uniformly.
-	allocCopy := target.DeepCopy()
-
-	allocated, err := r.ensureDRBDIDs(ctx, allocCopy, nil)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if allocated {
-		return ctrl.Result{Requeue: true}, nil
+	result, done, err := r.allocateDRBDIDsIfUsed(ctx, &target)
+	if err != nil || done {
+		return result, err
 	}
 
 	return r.runApply(ctx, &target)
