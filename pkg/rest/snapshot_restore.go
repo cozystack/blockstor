@@ -38,7 +38,7 @@ import (
 // storPoolPropKey is the LINSTOR-wire property name pinning a Resource
 // to a specific storage pool. Mirrors upstream LINSTOR (`StorPoolName`
 // — CamelCase per the REST contract).
-const storPoolPropKey = "StorPoolName"
+const storPoolPropKey = apiv1.KeyStorPoolName
 
 // The corrections of restore refusals that clear on their own: the same
 // request sent again, or sent again once a delete in flight has finished.

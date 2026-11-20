@@ -34,9 +34,6 @@ import (
 // it fails on every pass, and its peers wait on it for good.
 var ErrNoRestorePool = errors.New("no storage pool to restore into")
 
-// storPoolNameProp names a replica's pool on the wire.
-const storPoolNameProp = "StorPoolName"
-
 // RestorePools names, per node (keyed by naming.Key), the storage pool a
 // replica restored from snap is created in, or refuses with
 // ErrNoRestorePool before anything is written.
@@ -55,7 +52,7 @@ func RestorePools(ctx context.Context, st Store, snap *apiv1.Snapshot, nodes []s
 		return nil, err
 	}
 
-	fallback := firstPool(snap.Nodes, recorded, live)
+	fallback, fallbackNode := firstPool(snap.Nodes, recorded, live)
 	pools := make(map[string]string, len(nodes))
 
 	for _, node := range nodes {
@@ -69,7 +66,12 @@ func RestorePools(ctx context.Context, st Store, snap *apiv1.Snapshot, nodes []s
 			pool = live[key]
 		}
 
-		if pool == "" {
+		if pool == "" && fallback != "" {
+			err = checkFallbackPool(ctx, st, node, fallbackNode, fallback)
+			if err != nil {
+				return nil, err
+			}
+
 			pool = fallback
 		}
 
@@ -104,7 +106,7 @@ func knownRestorePools(ctx context.Context, st Store, snap *apiv1.Snapshot) (map
 	live := make(map[string]string, len(replicas))
 
 	for i := range replicas {
-		if pool := replicas[i].Props[storPoolNameProp]; pool != "" && HoldsData(&replicas[i]) {
+		if pool := replicas[i].Props[apiv1.KeyStorPoolName]; pool != "" && HoldsData(&replicas[i]) {
 			live[naming.Key(replicas[i].NodeName)] = pool
 		}
 	}
@@ -113,19 +115,41 @@ func knownRestorePools(ctx context.Context, st Store, snap *apiv1.Snapshot) (map
 }
 
 // firstPool is the fallback for a node neither map knows: the pool recorded
-// on the first snapshot node that has one, else the first live replica's.
-func firstPool(nodes []string, recorded, live map[string]string) string {
+// on the first snapshot node that has one, else the first live replica's,
+// with the node (as a key) it was found on.
+func firstPool(nodes []string, recorded, live map[string]string) (string, string) {
 	for _, byNode := range []map[string]string{recorded, live} {
 		for _, node := range nodes {
 			if pool := byNode[naming.Key(node)]; pool != "" {
-				return pool
+				return pool, naming.Key(node)
 			}
 		}
 	}
 
 	if keys := slices.Sorted(maps.Keys(live)); len(keys) > 0 {
-		return live[keys[0]]
+		return live[keys[0]], keys[0]
 	}
 
-	return ""
+	return "", ""
+}
+
+// checkFallbackPool refuses the fallback pool for node unless node has a
+// pool by that name, of the backend the pool has on the node it was read
+// from. Pool names are cluster-wide by convention only: a node without the
+// pool would get a replica its satellite cannot build, the same failure as
+// a replica with no pool at all.
+func checkFallbackPool(ctx context.Context, st Store, node, fromNode, pool string) error {
+	target, err := st.StoragePools().Get(ctx, node, pool)
+	if err != nil {
+		return fmt.Errorf("%w: the snapshot records no pool on %q, and %q has no storage pool %q "+
+			"like the one the snapshot is in on %q", ErrNoRestorePool, node, node, pool, fromNode)
+	}
+
+	source, err := st.StoragePools().Get(ctx, fromNode, pool)
+	if err == nil && source.ProviderKind != "" && target.ProviderKind != source.ProviderKind {
+		return fmt.Errorf("%w: storage pool %q is %s on %q but %s on %q, where the snapshot is",
+			ErrNoRestorePool, pool, target.ProviderKind, node, source.ProviderKind, fromNode)
+	}
+
+	return nil
 }

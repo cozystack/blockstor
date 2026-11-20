@@ -734,6 +734,16 @@ func TestSnapshotRestoreBug354StampsResourcesOnExplicitNodes(t *testing.T) {
 		t.Fatalf("seed source resource: %v", err)
 	}
 
+	// n2 holds a copy but no source replica; it restores into the pool
+	// of the same name, which it has to have.
+	for _, node := range []string{"n1", "n2"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: node, StoragePoolName: "zpool", ProviderKind: apiv1.StoragePoolKindZFSThin,
+		}); err != nil {
+			t.Fatalf("seed pool on %s: %v", node, err)
+		}
+	}
+
 	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
 		Name:         "snap-1",
 		ResourceName: "pvc-src",

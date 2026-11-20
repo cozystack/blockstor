@@ -82,16 +82,64 @@ func TestRestorePoolsFallBackToTheLiveReplicaOnTheNode(t *testing.T) {
 	}
 }
 
+// seedPool registers pool on node with the given backend.
+func seedPool(t *testing.T, st store.Store, node, pool, kind string) {
+	t.Helper()
+
+	if err := st.StoragePools().Create(t.Context(), &apiv1.StoragePool{
+		NodeName: node, StoragePoolName: pool, ProviderKind: kind,
+	}); err != nil {
+		t.Fatalf("seed pool %s on %s: %v", pool, node, err)
+	}
+}
+
 // A node neither the record nor a live replica knows takes the pool recorded
-// on another of the snapshot's nodes: pool names are cluster-wide.
+// on another of the snapshot's nodes, when it has a pool of that name and
+// backend.
 func TestRestorePoolsFallBackToAnotherNodesRecord(t *testing.T) {
 	t.Parallel()
 
 	st := restorePoolStore(t)
+	seedPool(t, st, "n1", "data", apiv1.StoragePoolKindZFSThin)
+	seedPool(t, st, "n2", "data", apiv1.StoragePoolKindZFSThin)
 
 	pools, err := store.RestorePools(t.Context(), st, restorePoolSnapshot(map[string]string{"n1": "data"}), []string{"n2"})
 	if err != nil || pools[naming.Key("n2")] != "data" {
 		t.Errorf("pools = %v, %v; want n2 in the pool recorded on n1", pools, err)
+	}
+}
+
+// The fallback is refused for a node without a pool of that name, or with
+// one of another backend: its satellite could not build the replica, the
+// same failure as a replica with no pool at all.
+func TestRestorePoolsRefuseAFallbackTheNodeLacks(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct{ source, target string }{
+		"no such pool":                 {source: apiv1.StoragePoolKindZFSThin},
+		"no such pool, source unknown": {},
+		"another backend":              {source: apiv1.StoragePoolKindZFSThin, target: apiv1.StoragePoolKindLVMThin},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			st := restorePoolStore(t)
+			if tc.source != "" {
+				seedPool(t, st, "n1", "data", tc.source)
+			}
+
+			kind := tc.target
+
+			if kind != "" {
+				seedPool(t, st, "n2", "data", kind)
+			}
+
+			_, err := store.RestorePools(t.Context(), st,
+				restorePoolSnapshot(map[string]string{"n1": "data"}), []string{"n2"})
+			if !errors.Is(err, store.ErrNoRestorePool) {
+				t.Errorf("err = %v, want ErrNoRestorePool", err)
+			}
+		})
 	}
 }
 

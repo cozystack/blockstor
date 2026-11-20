@@ -132,7 +132,7 @@ func (e *OversubscriptionShortfallError) Error() string {
 // a backing storage pool. Mirrors the literal the REST handlers and the
 // satellite dispatcher key on; centralised here so the placer's
 // create-and-promote paths can't drift on the spelling.
-const storPoolNameProp = "StorPoolName"
+const storPoolNameProp = apiv1.KeyStorPoolName
 
 // Placer adds replicas to satisfy a placement filter. Construct via
 // New; one instance per autoplace call (it does no internal caching).
