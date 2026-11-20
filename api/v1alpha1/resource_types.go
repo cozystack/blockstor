@@ -43,6 +43,23 @@ import (
 // Condition is absent.
 const ConditionMetadataCreated = "MetadataCreated"
 
+// Reasons of a true ConditionMetadataCreated. They tell a replica whose
+// metadata this satellite created apart from one whose metadata was
+// already on the volume, such as a replica adopted from LINSTOR, where
+// create-md never ran.
+const (
+	// MetadataCreatedReasonCreateMd: `drbdadm create-md` ran on at
+	// least one volume of the replica.
+	MetadataCreatedReasonCreateMd = "CreateMdSucceeded"
+
+	// MetadataCreatedReasonFound: `drbdadm dump-md` found metadata on
+	// every volume, so create-md was not run on that pass. The startup
+	// backfill also stamps it on a replica whose create-md stamp failed,
+	// since all it can see is that metadata is there; the satellite log
+	// of the create-md pass records which it was.
+	MetadataCreatedReasonFound = "MetadataFound"
+)
+
 // ConditionFilesystemFormatted is a Status Condition stamped by the
 // satellite after the RG-driven auto-mkfs path (scenario 9.W14)
 // reports every diskful volume of this Resource as carrying a

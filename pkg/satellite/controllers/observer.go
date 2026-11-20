@@ -19,7 +19,9 @@ limitations under the License.
 package controllers
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2078,6 +2080,13 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 		})
 	}
 
+	// Every snapshot is built from a map, and SSA keeps the order of
+	// the list it is sent: unsorted, an unchanged volume set is a real
+	// write whenever the map comes out in a different order.
+	slices.SortFunc(out, func(left, right blockstoriov1alpha1.ResourceVolumeStatus) int {
+		return cmp.Compare(left.VolumeNumber, right.VolumeNumber)
+	})
+
 	return out
 }
 
@@ -2111,6 +2120,15 @@ func buildObserverConnectionStatus(ev *observation) []blockstoriov1alpha1.Resour
 			PeerVolumes:      buildPeerVolumeStatus(c.PeerVolumes),
 		})
 	}
+
+	// Sorted here, where every path to the apply passes (the event
+	// merge and the 5 s resync both snapshot a map): SSA keeps the
+	// order of the list it is sent, so an unchanged peer set in a new
+	// map order is a real write, and it wakes every other informer
+	// watching Resources.
+	slices.SortFunc(out, func(left, right blockstoriov1alpha1.ResourceConnectionStatus) int {
+		return cmp.Compare(left.PeerNodeName, right.PeerNodeName)
+	})
 
 	return out
 }

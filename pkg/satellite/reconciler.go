@@ -218,6 +218,12 @@ type MetadataCreatedStamper interface {
 	// on the same Condition shape (LastTransitionTime moves forward
 	// on apiserver-side transition only, not on every patch).
 	StampMetadataCreated(ctx context.Context, resourceName, nodeName string) error
+
+	// StampMetadataFound stamps the same Condition with a distinct
+	// Reason for a replica whose metadata dump-md found on every
+	// volume, so create-md did not run (an adopted replica, or one
+	// re-probed after its marker was lost).
+	StampMetadataFound(ctx context.Context, resourceName, nodeName string) error
 }
 
 // FilesystemFormattedStamper abstracts the "stamp the
@@ -4007,10 +4013,23 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		// stamp attempt, polluting ERROR logs since Phase 11.3
 		// Stage 1 (#489). Best-effort tolerated (file marker is the
 		// source of truth) so no functional regression, just noise.
-		stampErr := r.cfg.MetadataCreatedStamper.StampMetadataCreated(ctx, dr.GetName(), dr.GetNodeName())
+		stamp := r.cfg.MetadataCreatedStamper.StampMetadataFound
+		if metadataFreshlyCreated {
+			stamp = r.cfg.MetadataCreatedStamper.StampMetadataCreated
+		}
+
+		// A failed stamp is not retried here: the marker is written, so
+		// the next pass does not come back through create-md. The
+		// startup backfill stamps the Condition on the next satellite
+		// start, and only as MetadataFound, since by then it can see
+		// only that metadata is there. No consumer reads the Reason, so
+		// that loses nothing but the audit trail, and the log line
+		// below keeps that.
+		stampErr := stamp(ctx, dr.GetName(), dr.GetNodeName())
 		if stampErr != nil {
-			log.FromContext(ctx).Error(stampErr, "stamp MetadataCreated Condition; will retry next reconcile",
-				"resource", dr.GetName(), "node", dr.GetNodeName())
+			log.FromContext(ctx).Error(stampErr,
+				"stamp MetadataCreated Condition; the startup backfill stamps it on the next satellite start",
+				"resource", dr.GetName(), "node", dr.GetNodeName(), "createMdRan", metadataFreshlyCreated)
 		}
 	}
 
