@@ -157,6 +157,16 @@ type SnapshotSpec struct {
 	// +listMapKey=volumeNumber
 	// +optional
 	LUKSKeys []SnapshotLUKSKey `json:"luksKeys,omitempty"`
+
+	// abortReason, once set, records that the controller aborted the
+	// take, and why. It is written in the same update that clears
+	// suspendIO and takeSnapshot, so the abort is on record before any
+	// satellite resumes and holds even if the status write that
+	// follows never lands. An aborted take is over: suspendIO is never
+	// set again and the snapshot is never marked SUCCESSFUL, as LINSTOR
+	// keeps an aborted snapshot definition failed for good.
+	// +optional
+	AbortReason string `json:"abortReason,omitempty"`
 }
 
 // SnapshotLUKSKey is the wrapped password of one source replica's volume.

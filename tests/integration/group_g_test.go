@@ -299,6 +299,7 @@ func TestGroupG(t *testing.T) {
 	t.Run("SnapDeleteBlockedByLater", func(t *testing.T) { testGroupGSnapDeleteBlockedByLater(t, stack, cli) })
 	t.Run("AutoSnapshotPeriodicTick", func(t *testing.T) { testGroupGAutoSnapshotPeriodicTick(t, stack) })
 	t.Run("SnapSuccessfulOutlivesSource", func(t *testing.T) { testGroupGSnapSuccessfulOutlivesSource(t, stack, cli) })
+	t.Run("SnapAbortedTakeStaysOver", func(t *testing.T) { testGroupGSnapAbortedTakeStaysOver(t, stack, cli) })
 }
 
 // testGroupGSnapSuccessfulOutlivesSource drives a snapshot through the
@@ -316,80 +317,9 @@ func testGroupGSnapSuccessfulOutlivesSource(t *testing.T, stack *harness.Stack, 
 	ctx := context.Background()
 	key := types.NamespacedName{Name: rd + ".snap-1"}
 
-	getSnap := func() blockstoriov1alpha1.Snapshot {
-		var snap blockstoriov1alpha1.Snapshot
-		if err := stack.Env.Client.Get(ctx, key, &snap); err != nil {
-			t.Fatalf("get Snapshot: %v", err)
-		}
+	driveSnapshotTake(t, stack, key)
 
-		return snap
-	}
-
-	// What each targeted satellite writes at a phase of the take.
-	stampNodes := func(acked, ready bool) {
-		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-			snap := getSnap()
-			snap.Status.NodeStatus = nil
-
-			var taken int64
-			if ready {
-				taken = time.Now().UnixMilli()
-			}
-
-			for _, node := range snap.Spec.Nodes {
-				snap.Status.NodeStatus = append(snap.Status.NodeStatus, blockstoriov1alpha1.SnapshotPerNodeStatus{
-					NodeName:        node,
-					SuspendIOAcked:  acked,
-					Ready:           ready,
-					CreateTimestamp: taken,
-				})
-			}
-
-			return stack.Env.Client.Status().Update(ctx, &snap)
-		})
-		if err != nil {
-			t.Fatalf("stamp per-node status: %v", err)
-		}
-	}
-
-	harness.Eventually(t, groupGTimeout, func() bool {
-		snap := getSnap()
-
-		return snap.Spec.SuspendIO && len(snap.Spec.Nodes) == len(harness.FixtureNodes())
-	}, "snapshot did not enter the suspend phase on every replica's node")
-
-	stampNodes(true, false)
-
-	harness.Eventually(t, groupGTimeout, func() bool { return getSnap().Spec.TakeSnapshot },
-		"controller did not order the take once every node suspended")
-
-	stampNodes(true, true)
-
-	harness.Eventually(t, groupGTimeout, func() bool {
-		snap := getSnap()
-
-		return !snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot
-	}, "controller did not resume I/O once every node took the snapshot")
-
-	stampNodes(false, true)
-
-	snapURL := stack.RestURL + "/v1/resource-definitions/" + rd + "/snapshots/snap-1"
-
-	restFlags := func() []string {
-		status, body := httpGetStatus(t, snapURL)
-		if status != http.StatusOK {
-			t.Fatalf("GET snapshot: status %d: %s", status, body)
-		}
-
-		var wire struct {
-			Flags []string `json:"flags"`
-		}
-		if err := json.Unmarshal(body, &wire); err != nil {
-			t.Fatalf("decode snapshot: %v", err)
-		}
-
-		return wire.Flags
-	}
+	restFlags := func() []string { return restSnapshotFlags(t, stack, rd, "snap-1") }
 
 	harness.Eventually(t, groupGTimeout, func() bool {
 		return slices.Contains(restFlags(), "SUCCESSFUL")
@@ -420,6 +350,169 @@ func testGroupGSnapSuccessfulOutlivesSource(t *testing.T, stack *harness.Stack, 
 
 	if flags, _ := got[0]["flags"].([]any); !slices.Contains(flags, any("SUCCESSFUL")) {
 		t.Fatalf("snapshot list serves flags %v for the snapshot of a deleted volume, want SUCCESSFUL", got[0]["flags"])
+	}
+}
+
+// getSnapshotCRD reads a Snapshot CRD straight from the API server.
+func getSnapshotCRD(t *testing.T, stack *harness.Stack, key types.NamespacedName) blockstoriov1alpha1.Snapshot {
+	t.Helper()
+
+	var snap blockstoriov1alpha1.Snapshot
+	if err := stack.Env.Client.Get(context.Background(), key, &snap); err != nil {
+		t.Fatalf("get Snapshot %s: %v", key.Name, err)
+	}
+
+	return snap
+}
+
+// stampSnapshotNodes writes what each targeted satellite reports at a
+// phase of the take: the suspend acknowledged, the snapshot taken.
+func stampSnapshotNodes(t *testing.T, stack *harness.Stack, key types.NamespacedName, acked, ready bool) {
+	t.Helper()
+
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		snap := getSnapshotCRD(t, stack, key)
+		snap.Status.NodeStatus = nil
+
+		var taken int64
+		if ready {
+			taken = time.Now().UnixMilli()
+		}
+
+		for _, node := range snap.Spec.Nodes {
+			snap.Status.NodeStatus = append(snap.Status.NodeStatus, blockstoriov1alpha1.SnapshotPerNodeStatus{
+				NodeName:        node,
+				SuspendIOAcked:  acked,
+				Ready:           ready,
+				CreateTimestamp: taken,
+			})
+		}
+
+		return stack.Env.Client.Status().Update(context.Background(), &snap)
+	})
+	if err != nil {
+		t.Fatalf("stamp per-node status: %v", err)
+	}
+}
+
+// driveSnapshotTake walks a snapshot through the controller's suspend,
+// take and resume, standing in for the satellites of every replica the
+// controller targeted.
+func driveSnapshotTake(t *testing.T, stack *harness.Stack, key types.NamespacedName) {
+	t.Helper()
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnapshotCRD(t, stack, key)
+
+		return snap.Spec.SuspendIO && len(snap.Spec.Nodes) == len(harness.FixtureNodes())
+	}, "snapshot did not enter the suspend phase on every replica's node")
+
+	stampSnapshotNodes(t, stack, key, true, false)
+
+	harness.Eventually(t, groupGTimeout, func() bool { return getSnapshotCRD(t, stack, key).Spec.TakeSnapshot },
+		"controller did not order the take once every node suspended")
+
+	stampSnapshotNodes(t, stack, key, true, true)
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnapshotCRD(t, stack, key)
+
+		return !snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot
+	}, "controller did not resume I/O once every node took the snapshot")
+
+	stampSnapshotNodes(t, stack, key, false, true)
+}
+
+// restSnapshotFlags returns the flags the REST API serves for a snapshot.
+func restSnapshotFlags(t *testing.T, stack *harness.Stack, rd, snapName string) []string {
+	t.Helper()
+
+	status, body := httpGetStatus(t, stack.RestURL+"/v1/resource-definitions/"+rd+"/snapshots/"+snapName)
+	if status != http.StatusOK {
+		t.Fatalf("GET snapshot: status %d: %s", status, body)
+	}
+
+	var wire struct {
+		Flags []string `json:"flags"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+
+	return wire.Flags
+}
+
+// testGroupGSnapAbortedTakeStaysOver aborts a take the way LINSTOR does
+// when a replica is not UpToDate, then lets the satellites catch up
+// late: their suspend acks linger before the resume lands, and the take
+// reports Ready afterwards. LINSTOR flags the definition failed and never
+// takes it again. The controller must not order a new suspend while the
+// acks linger, nor record SUCCESSFUL once every node reports Ready.
+func testGroupGSnapAbortedTakeStaysOver(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
+	ctx := context.Background()
+	rd := seedRDWithVolume(t, stack, "aborted")
+	resKey := types.NamespacedName{Name: rd + "." + harness.NodeWorker1}
+
+	stack.Satellite.SimulateDRBDState(rd, harness.NodeWorker1, "Inconsistent")
+
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var res blockstoriov1alpha1.Resource
+		if gErr := stack.Env.Client.Get(ctx, resKey, &res); gErr != nil {
+			return fmt.Errorf("get Resource: %w", gErr)
+		}
+
+		res.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, DiskState: "Inconsistent"}}
+
+		return stack.Env.Client.Status().Update(ctx, &res)
+	})
+	if err != nil {
+		t.Fatalf("report worker-1 Inconsistent: %v", err)
+	}
+
+	cli.Run(t, "snapshot", "create", rd, "snap-1")
+	waitForSnapshotCRD(t, stack, rd, "snap-1")
+
+	key := types.NamespacedName{Name: rd + ".snap-1"}
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnapshotCRD(t, stack, key)
+
+		return snap.Spec.SuspendIO && len(snap.Spec.Nodes) == len(harness.FixtureNodes())
+	}, "snapshot did not enter the suspend phase on every replica's node")
+
+	stampSnapshotNodes(t, stack, key, true, false)
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnapshotCRD(t, stack, key)
+
+		return !snap.Spec.SuspendIO &&
+			slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect)
+	}, "controller did not abort the take of a replica that is not UpToDate")
+
+	// The acks linger: no satellite confirmed the resume yet.
+	holdsFor(t, 3*time.Second, func() bool { return !getSnapshotCRD(t, stack, key).Spec.SuspendIO },
+		"controller froze I/O again for an aborted take")
+
+	// The take returns late on every node, and every node resumes.
+	stampSnapshotNodes(t, stack, key, false, true)
+
+	holdsFor(t, 3*time.Second, func() bool {
+		return !slices.Contains(restSnapshotFlags(t, stack, rd, "snap-1"), "SUCCESSFUL")
+	}, "an aborted take was served SUCCESSFUL once its nodes reported Ready")
+
+	if flags := restSnapshotFlags(t, stack, rd, "snap-1"); !slices.Contains(flags, "FAILED_DISCONNECT") {
+		t.Errorf("aborted take served with flags %v, want FAILED_DISCONNECT", flags)
+	}
+}
+
+// holdsFor fails the test the first time predicate turns false within d.
+func holdsFor(t *testing.T, d time.Duration, predicate func() bool, msg string) {
+	t.Helper()
+
+	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if !predicate() {
+			t.Fatal(msg)
+		}
 	}
 }
 

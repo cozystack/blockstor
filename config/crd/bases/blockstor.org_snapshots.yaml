@@ -63,6 +63,16 @@ spec:
           spec:
             description: spec defines the desired state of Snapshot
             properties:
+              abortReason:
+                description: |-
+                  abortReason, once set, records that the controller aborted the
+                  take, and why. It is written in the same update that clears
+                  suspendIO and takeSnapshot, so the abort is on record before any
+                  satellite resumes and holds even if the status write that
+                  follows never lands. An aborted take is over: suspendIO is never
+                  set again and the snapshot is never marked SUCCESSFUL, as LINSTOR
+                  keeps an aborted snapshot definition failed for good.
+                type: string
               groupID:
                 description: |-
                   groupID, when non-empty, marks this Snapshot as a member of a

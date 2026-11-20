@@ -237,6 +237,9 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		// The source replicas' wrapped LUKS passwords, copied at Create:
 		// the snapshot's bytes cannot be read without them.
 		preservedLUKSKeys := existing.Spec.LUKSKeys
+		// The controller's record of an aborted take: lost, the next
+		// pass could freeze I/O again for a take that is over.
+		preservedAbortReason := existing.Spec.AbortReason
 
 		existing.Spec = wireToCRDSnapshotSpec(in)
 		existing.Spec.LUKSKeys = preservedLUKSKeys
@@ -245,6 +248,7 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		existing.Spec.GroupID = preservedGroupID
 		existing.Spec.GroupSize = preservedGroupSize
 		existing.Spec.ResourceDefinitionName = preservedRD
+		existing.Spec.AbortReason = preservedAbortReason
 		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations), AnnotationLinstorRDName)
 
 		return s.c.Update(ctx, &existing)
