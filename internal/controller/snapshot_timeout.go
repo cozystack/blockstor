@@ -342,22 +342,16 @@ func setSnapshotCondition(conditions *[]metav1.Condition, cond *metav1.Condition
 	return true
 }
 
-// notUpToDateAbortMark is the part of an abort reason that says the
-// take was refused because a targeted replica was not UpToDate. Every
-// controller that recorded such an abort wrote it, so a record left
-// by an earlier version is recognised as well.
-const notUpToDateAbortMark = "' is not UpToDate; "
-
 // notUpToDateAbortReason is the abort reason for a take refused on
 // node's replica; tail says what became of the I/O.
 func notUpToDateAbortReason(node, tail string) string {
-	return "snapshot aborted: replica on node '" + node + notUpToDateAbortMark + tail
+	return "snapshot aborted: replica on node '" + node + blockstoriov1alpha1.SnapshotAbortNotUpToDateMark + tail
 }
 
 // isNotUpToDateAbort reports whether reason records a take refused
 // because a targeted replica was not UpToDate.
 func isNotUpToDateAbort(reason string) bool {
-	return strings.Contains(reason, notUpToDateAbortMark)
+	return strings.Contains(reason, blockstoriov1alpha1.SnapshotAbortNotUpToDateMark)
 }
 
 // deleteRefusedGroup deletes every snapshot of a group whose take was

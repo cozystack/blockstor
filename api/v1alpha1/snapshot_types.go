@@ -19,6 +19,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"strings"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -268,6 +270,20 @@ const SnapshotStatusFlagFailedDisconnect = "FAILED_DISCONNECT"
 // snapshot whose source volume has been deleted is still restorable,
 // so its success cannot be read off the replicas that are left.
 const SnapshotStatusFlagSuccessful = "SUCCESSFUL"
+
+// SnapshotAbortNotUpToDateMark is the part of an abort reason that
+// says the take was refused because a targeted replica was not
+// UpToDate. Every controller that recorded such an abort wrote it, so
+// a record left by an earlier version is recognised as well. The
+// controller deletes such a snapshot, and the REST create answers it
+// the way LINSTOR answers FAIL_SNAPSHOT_NOT_UPTODATE.
+const SnapshotAbortNotUpToDateMark = "' is not UpToDate; "
+
+// IsSnapshotAbortNotUpToDate reports whether an abort reason records a
+// take refused because a targeted replica was not UpToDate.
+func IsSnapshotAbortNotUpToDate(reason string) bool {
+	return strings.Contains(reason, SnapshotAbortNotUpToDateMark)
+}
 
 // SnapshotStatusConditionType is the well-known Status.Conditions[]
 // type the controller-side SnapshotReconciler stamps to record a
