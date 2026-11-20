@@ -178,6 +178,25 @@ func New(st store.Store) *Placer {
 // the migration semantic: even if 2 replicas exist, if one is on an
 // evicted node the placer will create a third on a healthy peer.
 func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
+	_, placed, want, err := p.PlaceCreating(ctx, rdName, filter)
+
+	return placed, want, err
+}
+
+// PlaceCreating is Place that also names the nodes it created a replica
+// on, for a caller that may have to take back what this call did and
+// nothing else: a replica that was already there, one another writer
+// created meanwhile, and a diskless witness promoted in place are not
+// on the list. It holds whatever was created before an error, too.
+func (p *Placer) PlaceCreating(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) ([]string, int, int, error) {
+	var created []string
+
+	placed, want, err := p.place(ctx, rdName, filter, &created)
+
+	return created, placed, want, err
+}
+
+func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, created *[]string) (int, int, error) {
 	defer lockDefinition(rdName)()
 
 	// Bug 038: an RD born from a snapshot restore / clone must never
@@ -191,6 +210,12 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	if err != nil {
 		return 0, 0, err
 	}
+
+	defer func() {
+		if plan.state != nil {
+			*created = plan.state.created
+		}
+	}()
 
 	if plan.capacityShortfall {
 		// Fail-fast: no pool can host the largest volume. Surface the
@@ -490,6 +515,10 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 			return errors.Wrap(err, "create diskless witness")
 		}
 
+		if err == nil {
+			state.created = append(state.created, nodeName)
+		}
+
 		state.taken[naming.Key(nodeName)] = struct{}{}
 	}
 
@@ -499,6 +528,8 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 // state holds the per-call lookup tables. Pulled out of Placer so a
 // concurrent Placer call doesn't share the mutable bookkeeping.
 type state struct {
+	// created names the nodes this Place call created a replica on.
+	created    []string
 	nodes      map[string]map[string]string
 	taken      map[string]struct{}
 	sameTuple  map[string]string
@@ -754,6 +785,10 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		err := st.Resources().Create(ctx, &res)
 		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
 			return false, errors.Wrap(err, "create resource")
+		}
+
+		if err == nil {
+			s.created = append(s.created, pool.NodeName)
 		}
 	}
 
