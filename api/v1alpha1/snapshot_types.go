@@ -239,6 +239,16 @@ const SnapshotStatusFlagFailed = "FAILED"
 // contract — operators see *why* the snapshot aborted.
 const SnapshotStatusFlagFailedDisconnect = "FAILED_DISCONNECT"
 
+// SnapshotStatusFlagSuccessful is stamped on Status.Flags by the
+// controller-side SnapshotReconciler once the take has completed on
+// every targeted node and I/O has been resumed, and on an adopted
+// Snapshot once its per-node state is backfilled. It is never cleared.
+// Mirrors LINSTOR's SnapshotDefinition SUCCESSFUL flag, which is
+// persisted at the same point and outlives the source resources: a
+// snapshot whose source volume has been deleted is still restorable,
+// so its success cannot be read off the replicas that are left.
+const SnapshotStatusFlagSuccessful = "SUCCESSFUL"
+
 // SnapshotStatusConditionType is the well-known Status.Conditions[]
 // type the controller-side SnapshotReconciler stamps to record a
 // human-readable abort reason (timeout vs non-UpToDate replica vs
@@ -251,9 +261,10 @@ type SnapshotStatus struct {
 	// +optional
 	NodeStatus []SnapshotPerNodeStatus `json:"nodeStatus,omitempty"`
 
-	// flags carries terminal-state markers. Currently only
-	// "FAILED" is meaningful — stamped by the satellite when
-	// CreateSnapshot returns a non-retryable error class.
+	// flags carries terminal-state markers: "SUCCESSFUL" once the
+	// take completed on every targeted node, "FAILED" when a
+	// satellite's CreateSnapshot returned a non-retryable error, and
+	// "FAILED_DISCONNECT" when the controller aborted a take that hung.
 	// +optional
 	Flags []string `json:"flags,omitempty"`
 

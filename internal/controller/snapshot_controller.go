@@ -20,6 +20,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"time"
 
@@ -162,6 +163,14 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	// The take is over on every node and I/O is resumed: record that
+	// on the Snapshot itself, as LINSTOR persists SUCCESSFUL on the
+	// snapshot definition. The record is what every reader trusts
+	// later, when the source replicas it was taken from may be gone.
+	if takeCompleted(siblings) {
+		return ctrl.Result{}, r.markSnapshotSuccessful(ctx, &snap)
+	}
+
 	next := r.nextPhase(&snap, siblings)
 	if !next.Advance {
 		return r.requeueIfSuspended(&snap, siblings), nil
@@ -181,7 +190,8 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 	ctx context.Context, logger logr.Logger, snap *blockstoriov1alpha1.Snapshot,
 ) (ctrl.Result, error) {
-	if allNodesReady(snap.Status.NodeStatus, snap.Spec.Nodes) {
+	if allNodesReady(snap.Status.NodeStatus, snap.Spec.Nodes) &&
+		slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful) {
 		return ctrl.Result{}, nil
 	}
 
@@ -217,6 +227,14 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 			changed = true
 		}
 
+		// Migration only adopts snapshots LINSTOR had marked
+		// SUCCESSFUL, so the adopted copy carries the same record.
+		flags, marked := withSuccessfulFlag(current.Status.Flags)
+		if marked {
+			current.Status.Flags = flags
+			changed = true
+		}
+
 		if !changed {
 			return nil
 		}
@@ -230,6 +248,75 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 	logger.V(1).Info("backfilled adopted snapshot per-node status", "nodes", len(snap.Spec.Nodes))
 
 	return ctrl.Result{}, nil
+}
+
+// takeCompleted reports whether the orchestration of the batch has
+// finished successfully: every sibling's every targeted node took its
+// snapshot and every sibling has resumed I/O. LINSTOR marks the
+// snapshot definitions SUCCESSFUL at the same point, after the resume.
+// A failed node never gets here: the abort path runs first.
+func takeCompleted(siblings []blockstoriov1alpha1.Snapshot) bool {
+	for i := range siblings {
+		if siblings[i].Spec.SuspendIO || siblings[i].Spec.TakeSnapshot {
+			return false
+		}
+	}
+
+	return allSiblingsReady(siblings)
+}
+
+// withSuccessfulFlag adds SUCCESSFUL to a Snapshot's status flags.
+// The second result is false when nothing changed: the flag is
+// already there, or a failure marker is, which a later success
+// stamp must not contradict.
+func withSuccessfulFlag(flags []string) ([]string, bool) {
+	for _, flag := range flags {
+		switch flag {
+		case blockstoriov1alpha1.SnapshotStatusFlagSuccessful,
+			blockstoriov1alpha1.SnapshotStatusFlagFailed,
+			blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect:
+			return flags, false
+		}
+	}
+
+	return append(slices.Clone(flags), blockstoriov1alpha1.SnapshotStatusFlagSuccessful), true
+}
+
+// markSnapshotSuccessful persists SUCCESSFUL on the Snapshot's status.
+// Idempotent, and retried against a fresh read so it converges with
+// the satellites' concurrent per-node status writes.
+func (r *SnapshotReconciler) markSnapshotSuccessful(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot,
+) error {
+	if _, marked := withSuccessfulFlag(snap.Status.Flags); !marked {
+		return nil
+	}
+
+	key := client.ObjectKeyFromObject(snap)
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var current blockstoriov1alpha1.Snapshot
+
+		getErr := r.Get(ctx, key, &current)
+		if getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				return nil
+			}
+
+			return errors.Wrap(getErr, "get Snapshot for SUCCESSFUL stamp")
+		}
+
+		flags, marked := withSuccessfulFlag(current.Status.Flags)
+		if !marked {
+			return nil
+		}
+
+		current.Status.Flags = flags
+
+		return r.Status().Update(ctx, &current)
+	})
+
+	return errors.Wrap(err, "stamp Snapshot Status SUCCESSFUL")
 }
 
 // hasNodeStatusEntry reports whether a per-node status row for the

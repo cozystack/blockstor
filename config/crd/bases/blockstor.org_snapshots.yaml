@@ -318,9 +318,10 @@ spec:
                 x-kubernetes-list-type: map
               flags:
                 description: |-
-                  flags carries terminal-state markers. Currently only
-                  "FAILED" is meaningful — stamped by the satellite when
-                  CreateSnapshot returns a non-retryable error class.
+                  flags carries terminal-state markers: "SUCCESSFUL" once the
+                  take completed on every targeted node, "FAILED" when a
+                  satellite's CreateSnapshot returned a non-retryable error, and
+                  "FAILED_DISCONNECT" when the controller aborted a take that hung.
                 items:
                   type: string
                 type: array
