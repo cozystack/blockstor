@@ -100,22 +100,22 @@ type Result struct {
 type Options struct {
 	// DRBDPorts maps a ResourceDefinition name (any case — matched
 	// case-insensitively) to the TCP port its DRBD replication mesh
-	// is CURRENTLY listening on in the running kernel. LINSTOR 1.33
-	// stores port=-1 in its database for most RDs (the port is
-	// assigned at runtime and not persisted), so the dump alone
-	// cannot recover it. Capturing the live ports and feeding them
-	// here makes blockstor render the SAME ports it adopts, so
-	// `drbdadm adjust` is a no-op on the connection endpoint — no
-	// reconnect blip, no transient quorum loss. When a port is
-	// absent here and also absent from the dump, the RD's replicas
-	// get nil DRBDPort and blockstor's allocator picks a fresh port
-	// (a controlled replication blip on adoption — see the runbook).
+	// is CURRENTLY listening on in the running kernel. LINSTOR keeps
+	// each replica's port in its database (tcp_port_list), and the
+	// converter takes it from there; the live map is the cross-check.
+	// Where the two disagree the kernel's port is kept, so blockstor
+	// renders the port it adopts and `drbdadm adjust` is a no-op on
+	// the connection endpoint, and the disagreement is reported. When
+	// a replica has a port in neither, it gets nil DRBDPort and
+	// blockstor's allocator picks a fresh port (a controlled
+	// replication blip on adoption — see the runbook).
 	DRBDPorts map[string]int32
 	// ReplicaDRBDPorts maps a ResourceDefinition name and a node name
 	// (both lowercased) to the port that one replica listens on.
 	// LINSTOR 1.33 can give each node its own port for one
-	// definition; a definition here gives every one of its replicas
-	// the port of its own node, and takes precedence over DRBDPorts.
+	// definition; a definition here cross-checks each of its replicas
+	// against the port of its own node, and takes precedence over
+	// DRBDPorts.
 	ReplicaDRBDPorts map[string]map[string]int32
 
 	// LUKS carries the LINSTOR master passphrase and the blockstor
@@ -140,8 +140,17 @@ type converter struct {
 	drbdRD    map[string]LayerDrbdResourceDefinitionRow // by resource_name
 	drbdMinor map[volumeKey]*int32                      // by (rd, vlmNr)
 	drbdNode  map[replicaKey]*int32                     // node-id by (node, rd)
-	storVol   map[volumeReplicaKey]LayerStorageVolumeRow
-	luksVol   map[volumeReplicaKey]LayerLuksVolumeRow
+	// dumpPorts is each live DRBD replica's tcp_port_list, by (node,
+	// rd); a replica whose row has no such column is absent, and an
+	// empty or unreadable list holds no port.
+	dumpPorts map[replicaKey][]int32
+	// drbdReplicaRows counts the live DRBD replica rows, and
+	// portlessDRBDRows the ones with no port in either place LINSTOR
+	// keeps it, for checkStorageVersion.
+	drbdReplicaRows  int
+	portlessDRBDRows int
+	storVol          map[volumeReplicaKey]LayerStorageVolumeRow
+	luksVol          map[volumeReplicaKey]LayerLuksVolumeRow
 	// luksKeys are the imported volume passwords, wrapped under the
 	// blockstor master key, by (node, rd, snapshot, vlmNr); luksCount
 	// counts them per RD for the report.
@@ -248,6 +257,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		drbdRD:            map[string]LayerDrbdResourceDefinitionRow{},
 		drbdMinor:         map[volumeKey]*int32{},
 		drbdNode:          map[replicaKey]*int32{},
+		dumpPorts:         map[replicaKey][]int32{},
 		storVol:           map[volumeReplicaKey]LayerStorageVolumeRow{},
 		luksVol:           map[volumeReplicaKey]LayerLuksVolumeRow{},
 		luksKeys:          map[luksKeyAt]crdv1alpha1.LUKSKey{},
@@ -267,9 +277,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 
 	conv.buildIndexes()
 
-	// Before anything is converted: a wrong passphrase or a password that
-	// does not decrypt stops the run with no output.
-	err := conv.importLUKSKeys()
+	err := conv.preflight()
 	if err != nil {
 		return nil, err
 	}
@@ -295,6 +303,19 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 	res.Warnings = conv.warnings
 
 	return res, nil
+}
+
+// preflight refuses a dump before anything is converted. A dump the API
+// server pruned goes first: what it lost cannot be told from the rows
+// that are left. Then a wrong passphrase or a password that does not
+// decrypt stops the run with no output.
+func (c *converter) preflight() error {
+	err := c.checkStorageVersion()
+	if err != nil {
+		return err
+	}
+
+	return c.importLUKSKeys()
 }
 
 // convertControllerConfig distills the LINSTOR /CTRL property bag into
@@ -431,6 +452,7 @@ func (c *converter) buildLayerInstanceIndexes() {
 		row := &c.dump.LayerDrbdResources[i]
 		if lri, ok := baseLayer(row.LayerResourceID); ok {
 			c.drbdNode[replicaKey{node: lri.NodeName, rd: lri.ResourceName}] = ptr(row.NodeID)
+			c.indexDumpPort(&lri, row)
 		}
 	}
 
@@ -1758,7 +1780,7 @@ func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
 
 func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row *ResourceDefinitionRow, dsp string) {
 	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
-		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, drbd.TCPPort, dsp)
+		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, drbd.TCPPort)
 
 		if drbd.Secret != "" {
 			if def.Spec.ExtraProps == nil {
@@ -1967,10 +1989,7 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 
 	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
 		// blockstor's per-replica allocator honours a preset value
-		// verbatim. The live port map (when supplied) wins over the
-		// dump's often-empty tcp_port so the adopted mesh keeps its
-		// current endpoint, and a per-replica entry gives each replica
-		// its own node's port.
+		// verbatim, so each replica gets the port it listens on now.
 		resource.Spec.DRBDPort = c.resolveReplicaDRBDPort(row, drbd.TCPPort, rdDsp, nodeDsp)
 	}
 
@@ -2063,53 +2082,41 @@ func (c *converter) buildSnapshot(row *ResourceDefinitionRow, rdDsp, snapDsp, na
 	return snap
 }
 
-// resolveDRBDPort picks the DRBD listen port to preset on an RD /
-// replica. The live port map (Options.DRBDPorts, captured from the
-// running kernel) wins over the dump's tcp_port, because LINSTOR 1.33
-// leaves tcp_port empty for most RDs while the mesh really is
-// listening on a concrete port — matching it makes adoption's
-// `drbdadm adjust` a no-op on the connection endpoint. When the port
-// is available in NEITHER source the RD's replicas get nil (blockstor
-// allocates a fresh port → a controlled reconnect blip on adoption),
-// and the gap is reported so the operator can capture the live ports.
-func (c *converter) resolveDRBDPort(rdName string, dumpPort *int32, rdDsp string) *int32 {
-	if live, ok := c.opts.DRBDPorts[strings.ToLower(rdName)]; ok {
-		return ptr(live)
-	}
-
-	if dumpPort != nil && *dumpPort > 0 {
-		return dumpPort
-	}
-
+// warnNoPort reports, once per definition, a replica that neither the
+// database nor the live map has a port for.
+func (c *converter) warnNoPort(rdName, rdDsp string) {
 	c.warnOncef("drbdport:"+rdName,
 		"resource definition %s: no DRBD port in the dump or live map — blockstor will allocate a fresh port; the adopted mesh will reconnect on the new port. Capture live ports (see runbook) to avoid the blip.", rdDsp)
-
-	return nil
 }
 
 // resolveDefinitionDRBDPort is the preferred port preset on the
-// definition itself. With per-replica ports it is their port only when
-// the map covers every replica and they all share one; otherwise the
-// definition gets none, and each replica carries its own.
-func (c *converter) resolveDefinitionDRBDPort(rdName string, dumpPort *int32, rdDsp string) *int32 {
-	perReplica := c.opts.ReplicaDRBDPorts[strings.ToLower(rdName)]
-	if len(perReplica) == 0 {
-		return c.resolveDRBDPort(rdName, dumpPort, rdDsp)
+// definition itself: the port every replica it adopts is preset to,
+// when they all share one, and none otherwise, each replica then
+// carrying its own. A definition with no replica to adopt takes the
+// definition-wide sources.
+func (c *converter) resolveDefinitionDRBDPort(rdName string, dumpPort *int32) *int32 {
+	replicas := c.liveReplicas(rdName)
+	if len(replicas) == 0 {
+		if live, ok := c.opts.DRBDPorts[strings.ToLower(rdName)]; ok {
+			return ptr(live)
+		}
+
+		if dumpPort != nil && *dumpPort > 0 {
+			return dumpPort
+		}
+
+		return nil
 	}
 
 	var shared int32
 
-	for _, row := range c.liveReplicas(rdName) {
-		port, ok := c.mappedReplicaPort(perReplica, row.NodeName)
-		if !ok || (shared != 0 && port != shared) {
+	for _, row := range replicas {
+		port := c.replicaPort(row, dumpPort)
+		if port == nil || (shared != 0 && *port != shared) {
 			return nil
 		}
 
-		shared = port
-	}
-
-	if shared == 0 {
-		return nil
+		shared = *port
 	}
 
 	return ptr(shared)
@@ -2202,8 +2209,7 @@ func (c *converter) reportUnmatchedPortNodes() {
 
 		rdDsp := c.displayRD(row.ResourceName)
 		if len(unmatched) == len(perReplica) {
-			c.warnf("resource definition %s: no DRBD port for any replica: no node in the live port map (%s) hosts a replica of it — check that the map uses LINSTOR's node names; every replica will get a fresh port and reconnect on adoption",
-				rdDsp, strings.Join(unmatched, ", "))
+			c.reportUnmatchedMap(row.ResourceName, rdDsp, replicas, unmatched)
 
 			continue
 		}
@@ -2211,6 +2217,35 @@ func (c *converter) reportUnmatchedPortNodes() {
 		c.warnf("resource definition %s: the live port map names nodes without a replica of it (%s) — those entries are ignored; a leftover DRBD resource on them may hold the port",
 			rdDsp, strings.Join(unmatched, ", "))
 	}
+}
+
+// reportUnmatchedMap reports a definition whose live-map entries all
+// name nodes without a replica of it, so its ports were never checked
+// against the kernel. The replicas the database has no port for get a
+// fresh one.
+func (c *converter) reportUnmatchedMap(rdName, rdDsp string, replicas []*ResourceRow, unmatched []string) {
+	portless := 0
+
+	for _, replica := range replicas {
+		if _, ok := c.dumpReplicaPort(replica, c.drbdRD[rdName].TCPPort); !ok {
+			portless++
+		}
+	}
+
+	if portless == 0 {
+		c.warnf("resource definition %s: no node in the live port map (%s) hosts a replica of it — check that the map uses LINSTOR's node names; the database's ports are used, unchecked against the kernel",
+			rdDsp, strings.Join(unmatched, ", "))
+
+		return
+	}
+
+	which := "any replica"
+	if portless < len(replicas) {
+		which = fmt.Sprintf("%d of its %d replicas", portless, len(replicas))
+	}
+
+	c.warnf("resource definition %s: no DRBD port for %s: no node in the live port map (%s) hosts a replica of it, and the database has none — check that the map uses LINSTOR's node names; each such replica will get a fresh port and reconnect on adoption",
+		rdDsp, which, strings.Join(unmatched, ", "))
 }
 
 // checkPortCollisions refuses two replicas preset to one port on one
@@ -2243,19 +2278,34 @@ func checkPortCollisions(resources []crdv1alpha1.Resource) error {
 	return nil
 }
 
-// resolveReplicaDRBDPort picks the port one replica listens on: its own
-// line in the per-replica map when the definition has one, and the
-// definition-wide sources otherwise. A replica missing from a
-// definition the map does cover is reported: its peers keep their
-// ports, and it gets a fresh one and reconnects on adoption.
+// resolveReplicaDRBDPort picks the port one replica listens on. The
+// kernel's, from the live map, is kept, since adopting any other moves
+// the endpoint under I/O; the database's is the source when the map
+// has none, and a cross-check when it does. A replica with no port in
+// either is reported: it gets a fresh one and reconnects on adoption.
 func (c *converter) resolveReplicaDRBDPort(row *ResourceRow, dumpPort *int32, rdDsp, nodeDsp string) *int32 {
-	perReplica := c.opts.ReplicaDRBDPorts[strings.ToLower(row.ResourceName)]
-	if len(perReplica) == 0 {
-		return c.resolveDRBDPort(row.ResourceName, dumpPort, rdDsp)
+	live, hasLive := c.livePort(row)
+	stored, hasStored := c.dumpReplicaPort(row, dumpPort)
+
+	if hasLive {
+		if hasStored && stored != live {
+			c.warnOncef("drbdport-mismatch:"+row.ResourceName+":"+row.NodeName,
+				"resource %s.%s: LINSTOR's database gives DRBD port %d, the kernel listens on %d; the kernel's port is kept. Find out why they differ before cutover",
+				rdDsp, nodeDsp, stored, live)
+		}
+
+		return ptr(live)
 	}
 
-	if port, ok := c.mappedReplicaPort(perReplica, row.NodeName); ok {
-		return ptr(port)
+	if hasStored {
+		return ptr(stored)
+	}
+
+	perReplica := c.opts.ReplicaDRBDPorts[strings.ToLower(row.ResourceName)]
+	if len(perReplica) == 0 {
+		c.warnNoPort(row.ResourceName, rdDsp)
+
+		return nil
 	}
 
 	if !c.anyReplicaMapped(row.ResourceName, perReplica) {
@@ -2263,7 +2313,7 @@ func (c *converter) resolveReplicaDRBDPort(row *ResourceRow, dumpPort *int32, rd
 	}
 
 	c.warnOncef("drbdport:"+row.ResourceName+":"+row.NodeName,
-		"resource %s.%s: no DRBD port for this replica in the live map, which has ports for the other replicas of %s — blockstor will allocate a fresh port for it, and this replica will reconnect on adoption",
+		"resource %s.%s: no DRBD port for this replica in the live map, which has ports for the other replicas of %s, nor in the database — blockstor will allocate a fresh port for it, and this replica will reconnect on adoption",
 		rdDsp, nodeDsp, rdDsp)
 
 	return nil
