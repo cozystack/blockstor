@@ -27,6 +27,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -209,10 +210,15 @@ func wireConditionStampers(mgr manager.Manager, cfg *Config) {
 // queue as the primary For watch. Unit tests that supply their own
 // channel keep it; tests that leave it nil opt both producer and
 // consumer out (the observer no-ops on a nil channel and
-// SetupWithManager skips the raw-source registration).
+// SetupWithManager skips the raw-source registration). It also gives
+// the reconciler and the startup backfill one shared ApplyLocks.
 func ensureWiredDefaults(cfg *Config) {
 	if cfg.ReconcileTrigger == nil {
 		cfg.ReconcileTrigger = make(chan event.GenericEvent, reconcileTriggerBuffer)
+	}
+
+	if cfg.ApplyLocks == nil {
+		cfg.ApplyLocks = &ResourceLocks{}
 	}
 }
 
@@ -288,17 +294,25 @@ func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
 // to keep that function under the funlen budget — the bookkeeping
 // for one more runnable nudges it over the limit.
 func registerMetadataCreatedBackfill(mgr manager.Manager, cfg *Config) error {
-	err := (&MetadataCreatedBackfillRunnable{
-		Client:   mgr.GetClient(),
-		Adm:      drbd.NewAdm(cfg.Exec),
-		Stamper:  &MetadataCreatedStamper{Client: mgr.GetClient()},
-		NodeName: cfg.NodeName,
-	}).RegisterWithManager(mgr)
+	err := newMetadataCreatedBackfillFromConfig(mgr.GetClient(), cfg).RegisterWithManager(mgr)
 	if err != nil {
 		return errors.Wrap(err, "register MetadataCreatedBackfillRunnable")
 	}
 
 	return nil
+}
+
+// newMetadataCreatedBackfillFromConfig builds the backfill on the
+// ApplyLocks the ResourceReconciler holds, so a test can check the
+// two share them: without that the lock guards nothing.
+func newMetadataCreatedBackfillFromConfig(cli client.Client, cfg *Config) *MetadataCreatedBackfillRunnable {
+	return &MetadataCreatedBackfillRunnable{
+		Client:   cli,
+		Adm:      drbd.NewAdm(cfg.Exec),
+		Stamper:  &MetadataCreatedStamper{Client: cli},
+		NodeName: cfg.NodeName,
+		Locks:    cfg.ApplyLocks,
+	}
 }
 
 // wireCrossNodeFetcher injects the SnapshotFetcher into the Apply
