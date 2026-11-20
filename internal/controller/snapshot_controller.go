@@ -516,8 +516,8 @@ func (r *SnapshotReconciler) checkAbortConditions(
 	// may have left undone: the resume on a sibling whose write did not
 	// land, and the status record. Without this the next pass would
 	// see a take that never started and freeze I/O again.
-	if reason, ended := groupAbortReason(siblings); ended {
-		res, err := r.abortGroupWithReason(ctx, siblings, reason)
+	if reason, flag, ended := groupAbortReason(siblings); ended {
+		res, err := r.abortGroupWithFlag(ctx, siblings, flag, reason)
 
 		return true, res, err
 	}

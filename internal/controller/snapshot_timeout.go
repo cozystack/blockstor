@@ -157,6 +157,15 @@ func suspendRequeueAfter(snap *blockstoriov1alpha1.Snapshot, now time.Time) time
 func (r *SnapshotReconciler) abortGroupWithReason(
 	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot, reason string,
 ) (ctrl.Result, error) {
+	return r.abortGroupWithFlag(ctx, siblings, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect, reason)
+}
+
+// abortGroupWithFlag is abortGroupWithReason with the failure flag to
+// stamp: a group recovered from a failure a satellite stamped keeps
+// that failure's flag.
+func (r *SnapshotReconciler) abortGroupWithFlag(
+	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot, flag, reason string,
+) (ctrl.Result, error) {
 	// Resume first: clearing Spec.SuspendIO on every sibling is the
 	// outage fix and must happen even if the Status stamps below fail.
 	err := r.abortGroup(ctx, siblings, reason)
@@ -165,7 +174,7 @@ func (r *SnapshotReconciler) abortGroupWithReason(
 	}
 
 	for i := range siblings {
-		stampErr := r.stampSnapshotFailedDisconnect(ctx, &siblings[i], reason)
+		stampErr := r.stampSnapshotFailure(ctx, &siblings[i], flag, reason)
 		if stampErr != nil {
 			return ctrl.Result{}, errors.Wrapf(stampErr,
 				"on sibling %q", siblings[i].Name)
@@ -173,17 +182,6 @@ func (r *SnapshotReconciler) abortGroupWithReason(
 	}
 
 	return ctrl.Result{}, nil
-}
-
-// stampSnapshotFailedDisconnect records the controller-side abort
-// reason on the Snapshot's Status: the FAILED_DISCONNECT terminal flag
-// (so the wire view / `linstor s l` renders "Satellite disconnected")
-// plus a SnapshotComplete=False Condition carrying the human-readable
-// reason.
-func (r *SnapshotReconciler) stampSnapshotFailedDisconnect(
-	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, reason string,
-) error {
-	return r.stampSnapshotFailure(ctx, snap, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect, reason)
 }
 
 // stampGroupFailed records a per-node failure on every sibling of the
@@ -248,24 +246,26 @@ func (r *SnapshotReconciler) stampSnapshotFailure(
 }
 
 // groupAbortReason reports whether the take of the batch already
-// ended in failure, and the reason to record: an abort a sibling has on
-// record, or a failure stamped on a sibling's status. The latter covers
-// a snapshot aborted before Spec.AbortReason existed.
-func groupAbortReason(siblings []blockstoriov1alpha1.Snapshot) (string, bool) {
+// ended in failure, the reason to record and the failure flag to stamp
+// on the siblings that lack one: an abort a sibling has on record, or
+// a failure stamped on a sibling's status. The latter covers a snapshot
+// aborted before Spec.AbortReason existed, and keeps its flag: a
+// satellite's FAILED is LINSTOR's FAILED_DEPLOYMENT, not a disconnect.
+func groupAbortReason(siblings []blockstoriov1alpha1.Snapshot) (string, string, bool) {
 	for i := range siblings {
 		if reason := recordedAbortReason(&siblings[i]); reason != "" {
-			return reason, true
+			return reason, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect, true
 		}
 	}
 
 	for i := range siblings {
-		if slices.ContainsFunc(siblings[i].Status.Flags, isSnapshotFailureFlag) {
+		if idx := slices.IndexFunc(siblings[i].Status.Flags, isSnapshotFailureFlag); idx >= 0 {
 			return "snapshot aborted: the take of '" + siblings[i].Spec.SnapshotName +
-				"' failed; resume of I/O requested", true
+				"' failed; resume of I/O requested", siblings[i].Status.Flags[idx], true
 		}
 	}
 
-	return "", false
+	return "", "", false
 }
 
 // isSnapshotFailureFlag reports whether a status flag records a failed

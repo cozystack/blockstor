@@ -20,6 +20,7 @@ package controller_test
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -142,5 +143,37 @@ func TestSnapshotNodelessAutoSnapshotIsRecordedFailed(t *testing.T) {
 
 	if got := getSnap(t, cli, other.Name); len(got.Status.Flags) != 0 {
 		t.Errorf("a nodeless snapshot that is not automatic was stamped: flags=%v", got.Status.Flags)
+	}
+}
+
+// A group a satellite failed before the abort was recorded in the spec
+// is finished from the status flag, and the siblings get that flag:
+// LINSTOR flags every snapshot of a failed request FAILED_DEPLOYMENT
+// (blockstor's FAILED), not as disconnected.
+func TestSnapshotGroupRecoveredFromAFailureKeepsItsFlag(t *testing.T) {
+	t.Parallel()
+
+	failed := b353GroupedSnapshot("pvc-a", "snap-1", "g1", []string{"n1"}, false, false, nil)
+	failed.Status.Flags = []string{blockstoriov1alpha1.SnapshotStatusFlagFailed}
+
+	clean := b353GroupedSnapshot("pvc-b", "snap-1", "g1", []string{"n2"}, true, false,
+		[]blockstoriov1alpha1.SnapshotPerNodeStatus{{NodeName: "n2", SuspendIOAcked: true}})
+
+	r, cli := successfulFixture(t, failed, clean)
+
+	reconcileSnapshot(t, r, clean.Name)
+
+	got := getSnap(t, cli, clean.Name)
+	if got.Spec.SuspendIO || got.Spec.TakeSnapshot {
+		t.Fatalf("the clean sibling of a failed group stays suspended: %+v", got.Spec)
+	}
+
+	if !hasFlag(got, blockstoriov1alpha1.SnapshotStatusFlagFailed) ||
+		hasFlag(got, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect) {
+		t.Errorf("flags on the clean sibling = %v, want FAILED", got.Status.Flags)
+	}
+
+	if !strings.Contains(got.Spec.AbortReason, "resume of I/O requested") {
+		t.Errorf("abort reason %q claims more than that the resume was requested", got.Spec.AbortReason)
 	}
 }
