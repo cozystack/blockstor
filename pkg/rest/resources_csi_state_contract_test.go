@@ -32,29 +32,32 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// csiVolumeAbnormal is linstor-csi v1.11.2's ConditionFromResources
+// csiConditionIssues is linstor-csi v1.11.2's ConditionFromResources
 // (pkg/client/linstor.go), which the external health monitor runs on
-// every volume: a replica without a state object, or whose DRBD layer
-// reports promotion_score 0, makes the volume abnormal. It returns the
-// nodes linstor-csi would name in the VolumeConditionAbnormal event.
-func csiVolumeAbnormal(ress []lapi.ResourceWithVolumes) []string {
-	var abnormal []string
+// every volume. A replica without a state object, or whose DRBD layer
+// reports promotion_score 0, makes the volume abnormal. The two causes
+// come back apart, as the nodes linstor-csi would name in the
+// VolumeConditionAbnormal event, because this tree only answers for
+// the first: it does not publish promotion_score yet, so every DRBD
+// replica it serves decodes as score 0.
+func csiConditionIssues(ress []lapi.ResourceWithVolumes) ([]string, []string) {
+	var noState, zeroScore []string
 
 	for i := range ress {
 		res := &ress[i]
 
 		if res.State == nil {
-			abnormal = append(abnormal, res.NodeName)
+			noState = append(noState, res.NodeName)
 
 			continue
 		}
 
 		if drbd := csiDrbdLayer(res.LayerObject); drbd != nil && drbd.PromotionScore == 0 {
-			abnormal = append(abnormal, res.NodeName)
+			zeroScore = append(zeroScore, res.NodeName)
 		}
 	}
 
-	return abnormal
+	return noState, zeroScore
 }
 
 // csiDrbdLayer is linstor-csi v1.11.2's util.GetDrbdLayer.
@@ -89,6 +92,12 @@ func csiInUse(r *lapi.Resource) bool {
 // unknown), so the replica goes out as `"state": {}`. A LUKS-topped
 // one reports in_use false. Sending no state object at all made
 // linstor-csi flag every healthy local volume as abnormal.
+//
+// The DRBD replica carries the layer payload the k8s store builds for
+// an observed DRBD replica, so linstor-csi's DRBD branch runs on it.
+// Only the state half of that check is asserted: promotion_score is
+// not published by this tree, and the score half is tested where it
+// is.
 func TestResourceStateMatchesLinstorCSIContract(t *testing.T) {
 	t.Parallel()
 
@@ -97,6 +106,7 @@ func TestResourceStateMatchesLinstorCSIContract(t *testing.T) {
 
 	type want struct {
 		stack []string
+		layer *apiv1.ResourceLayer
 		// inUse is the in_use key the state object carries; nil means
 		// the key is absent.
 		inUse *bool
@@ -107,7 +117,22 @@ func TestResourceStateMatchesLinstorCSIContract(t *testing.T) {
 	cases := map[string]want{
 		"pvc-local":     {stack: []string{"STORAGE"}},
 		"pvc-encrypted": {stack: []string{"LUKS", "STORAGE"}, inUse: &unused},
-		"pvc-drbd":      {stack: []string{"DRBD", "STORAGE"}, inUse: &unused},
+		"pvc-drbd": {
+			stack: []string{"DRBD", "STORAGE"},
+			layer: &apiv1.ResourceLayer{
+				Type: apiv1.LayerKindDRBD,
+				Drbd: &apiv1.DrbdResourceLayer{
+					TCPPorts: []int32{7000},
+					DrbdVolumes: []apiv1.DrbdVolume{{
+						VolumeNumber: 0,
+						DiskState:    "UpToDate",
+						DevicePath:   "/dev/drbd1000",
+					}},
+				},
+				Children: []apiv1.ResourceLayer{{Type: apiv1.LayerKindStorage}},
+			},
+			inUse: &unused,
+		},
 	}
 
 	for name, c := range cases {
@@ -119,10 +144,11 @@ func TestResourceStateMatchesLinstorCSIContract(t *testing.T) {
 		observed := false
 
 		if err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name:     name,
-			NodeName: "worker-1",
-			State:    apiv1.ResourceState{InUse: &observed},
-			Volumes:  []apiv1.Volume{{VolumeNumber: 0}},
+			Name:        name,
+			NodeName:    "worker-1",
+			LayerObject: c.layer,
+			State:       apiv1.ResourceState{InUse: &observed},
+			Volumes:     []apiv1.Volume{{VolumeNumber: 0}},
 		}); err != nil {
 			t.Fatalf("seed Resource: %v", err)
 		}
@@ -150,7 +176,7 @@ func TestResourceStateMatchesLinstorCSIContract(t *testing.T) {
 
 		client := newClient(t, base)
 
-		for name := range cases {
+		for name, c := range cases {
 			view, err := client.Resources.GetResourceView(t.Context(),
 				&lapi.ListOpts{Resource: []string{name}})
 			if err != nil {
@@ -161,9 +187,13 @@ func TestResourceStateMatchesLinstorCSIContract(t *testing.T) {
 				t.Fatalf("%s: view lists %d replicas, want 1", name, len(view))
 			}
 
-			if nodes := csiVolumeAbnormal(view); len(nodes) > 0 {
+			if noState, _ := csiConditionIssues(view); len(noState) > 0 {
 				t.Errorf("%s: linstor-csi reports Resource with issues on node(s): %s",
-					name, strings.Join(nodes, ","))
+					name, strings.Join(noState, ","))
+			}
+
+			if c.layer != nil && csiDrbdLayer(view[0].LayerObject) == nil {
+				t.Errorf("%s: view carries no DRBD layer for linstor-csi to check", name)
 			}
 
 			ress, err := client.Resources.GetAll(t.Context(), name)
