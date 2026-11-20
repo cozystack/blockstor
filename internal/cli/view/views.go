@@ -28,6 +28,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
+
+	"github.com/cozystack/blockstor/internal/cli/color"
 )
 
 // PropertyColumns is the column set every `list-properties` view uses.
@@ -267,7 +270,14 @@ func selectFilterCell(filter *apiv1.AutoSelectFilter) string {
 
 // VolumeList builds the `volume list` table: one row per replica
 // volume.
-func VolumeList(resources []apiv1.Resource) *metav1.Table {
+//
+// A deactivated replica has no volumes to show, so it is left out
+// unless its node was evicted, where the row is what tells an operator
+// the data is still there.
+//
+// definitionProps maps a resource-definition name (naming.Key) to its
+// own properties, which is where a definition-wide SkipDisk is read.
+func VolumeList(resources []apiv1.Resource, definitionProps map[string]map[string]string) *metav1.Table {
 	tbl := &metav1.Table{
 		ColumnDefinitions: columns(
 			"Node", "Resource", "StoragePool", "VolumeNr",
@@ -275,16 +285,34 @@ func VolumeList(resources []apiv1.Resource) *metav1.Table {
 		),
 	}
 
+	primaries := PrimariesByDefinition(resources)
+
 	for i := range resources {
 		res := &resources[i]
+
+		inactive := slices.Contains(res.Flags, apiv1.ResourceFlagInactive)
+		if inactive && !slices.Contains(res.Flags, flagEvicted) {
+			continue
+		}
+
+		key := naming.Key(res.Name)
+		usage := usageCell(res, primaries[key])
+		linkDown := topLayerIsDRBD(res) && hasBrokenConnection(res)
 
 		for j := range res.Volumes {
 			vol := &res.Volumes[j]
 
-			state := vol.State.DiskState
-			if state == "" {
-				state = stateUnknown
+			state := color.Cell{Text: apiv1.ResourceFlagInactive, Class: color.Transitional}
+			if !inactive {
+				state = volumeState(res, vol, nil)
 			}
+
+			if linkDown {
+				state.Class = color.Broken
+			}
+
+			state = withSkipDisk(state, res, definitionProps[key])
+			state = withToggleDisk(state, res.Flags)
 
 			tbl.Rows = append(tbl.Rows, metav1.TableRow{Cells: []any{
 				res.NodeName,
@@ -294,7 +322,7 @@ func VolumeList(resources []apiv1.Resource) *metav1.Table {
 				minorFromDevice(vol.DevicePath),
 				vol.DevicePath,
 				capacity(vol.AllocatedKib),
-				usageCell(res),
+				usage,
 				state,
 			}})
 		}

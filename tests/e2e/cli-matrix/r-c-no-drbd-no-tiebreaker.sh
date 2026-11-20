@@ -123,18 +123,16 @@ if (( rows != 1 )); then
     exit 1
 fi
 
-# --- U110: State / InUse columns populated for a no-DRBD row ------------
+# --- U110: State / Usage columns for a no-DRBD row ---------------------
 # Upstream-issue U110: a storage-layer-only (no-DRBD) resource still has
-# to report a State and an InUse/Usage value in `linstor r l`. There is
-# no DRBD device, so neither BS nor upstream populates a per-volume
-# `state.disk_state` in the `-m` JSON (oracle 1.33.2 confirmed: vol.state
-# is `None` for STORAGE-only on BOTH). The operator-visible signal is the
-# DERIVED State COLUMN the python CLI renders — `Created` for a healthy
-# storage-only volume (upstream renders exactly `Created`; BS matches) —
-# plus the Usage/InUse column from `rsc.state.in_use`. This pins that
-# surface so a regression that blanked the State column (or dropped
-# in_use) for the no-DRBD stack would fail here.
-echo ">> [U110] assert derived State column non-blank for the no-DRBD row"
+# to report a State in `linstor r l`. There is no DRBD device, so neither
+# BS nor upstream populates a per-volume `state.disk_state` in the `-m`
+# JSON (oracle 1.33.2 confirmed: vol.state is `None` for STORAGE-only on
+# BOTH). The operator-visible signal is the DERIVED State COLUMN the
+# python CLI renders: exactly `Created` for a healthy storage-only
+# volume, on both. This pins that surface so a regression that blanked
+# the State column, or read the volume as Unknown, would fail here.
+echo ">> [U110] assert derived State column reads Created for the no-DRBD row"
 deadline=$(( $(date +%s) + 60 ))
 state_col=""
 while (( $(date +%s) < deadline )); do
@@ -144,33 +142,30 @@ while (( $(date +%s) < deadline )); do
     state_col=$("${LCTL[@]}" resource list --resources "$RD" 2>/dev/null \
         | sed 's/\x1b\[[0-9;]*m//g' \
         | awk -F'|' -v rd="$RD" '$0 ~ rd { gsub(/^[ \t]+|[ \t]+$/,"",$7); print $7; exit }')
-    [[ -n "$state_col" && "$state_col" != "State" ]] && break
+    [[ "$state_col" == "Created" ]] && break
     sleep 3
 done
-if [[ -z "$state_col" || "$state_col" == "State" ]]; then
-    echo "FAIL (U110): no-DRBD resource $RD renders a BLANK State column" >&2
+if [[ "$state_col" != "Created" ]]; then
+    echo "FAIL (U110): no-DRBD resource $RD renders State '$state_col', want 'Created'" >&2
     "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -10 >&2
     exit 1
 fi
-echo ">> [U110] State column populated: '$state_col' (upstream renders 'Created' here)"
+echo ">> [U110] State column: '$state_col' (upstream renders 'Created' here)"
 
-# InUse/Usage: the human `r l` Usage column must render a non-blank
-# token (`Unused` for a freshly-created, unmounted volume). This is the
-# operator-visible InUse signal and is parity-correct: oracle 1.33.2
-# leaves `rsc.state` EMPTY ({}) in the -m JSON for a STORAGE-only
-# resource (no DRBD role to read in_use from), so the -m `state.in_use`
-# field is NOT a reliable cross-impl pin — but the python CLI still
-# renders the Usage column as `Unused` from the (absent) primary role.
-# BS matches: human `r l` shows Usage=Unused. Assert the column, not the
-# flaky -m field.
+# Usage: nothing observes whether a bare storage volume is open. The
+# oracle leaves `rsc.state` EMPTY ({}) for a STORAGE-only resource, so
+# `in_use` is absent and the python CLI renders a BLANK Usage cell; it
+# prints `Unused` only for an observed `in_use: false`. BS used to send
+# that unobserved `false`, which read as an idle volume a pod may in
+# fact be writing to. Pin the blank cell.
 usage_col=$("${LCTL[@]}" resource list --resources "$RD" 2>/dev/null \
     | sed 's/\x1b\[[0-9;]*m//g' \
     | awk -F'|' -v rd="$RD" '$0 ~ rd { gsub(/^[ \t]+|[ \t]+$/,"",$5); print $5; exit }')
-if [[ -z "$usage_col" ]]; then
-    echo "FAIL (U110): no-DRBD resource $RD renders a BLANK Usage column" >&2
+if [[ -n "$usage_col" ]]; then
+    echo "FAIL (U110): no-DRBD resource $RD renders Usage '$usage_col', want blank (in_use unknown)" >&2
     "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -10 >&2
     exit 1
 fi
-echo ">> [U110] Usage column populated: '$usage_col' (upstream renders 'Unused' here)"
+echo ">> [U110] Usage column blank (upstream renders it blank here)"
 
-echo ">> r-c-no-drbd-no-tiebreaker OK (Bug 334 pinned: -l STORAGE auto-place=1 yields 1 replica, no TIE_BREAKER witness; U110: State='$state_col' Usage='$usage_col')"
+echo ">> r-c-no-drbd-no-tiebreaker OK (Bug 334 pinned: -l STORAGE auto-place=1 yields 1 replica, no TIE_BREAKER witness; U110: State='$state_col', Usage blank)"
