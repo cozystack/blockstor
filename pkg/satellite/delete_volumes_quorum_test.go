@@ -220,6 +220,38 @@ func TestDeleteVolumesStopsWhenTheRecheckFails(t *testing.T) {
 	}
 }
 
+// RemoveVolumesFromDRBD, which runs ahead of the apply, takes the volume out
+// the same way and touches no storage.
+func TestRemoveVolumesFromDRBDKeepsTheStorage(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose", storage.FakeResponse{Stdout: []byte("pvc-vd node-id:2 role:Secondary suspended:no\n" +
+		"  volume:0 minor:20055 disk:UpToDate open:no\n  volume:1 minor:20056 disk:UpToDate open:no\n")})
+	fx.Expect("drbdsetup status pvc-vd --json", storage.FakeResponse{Stdout: vdQuorumStatus(false)})
+	fx.Expect("drbdsetup show pvc-vd --json", storage.FakeResponse{Stdout: vdQuorumShow("suspend-io", "")})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: t.TempDir(), NodeName: "n3"})
+
+	minor := int32(20056)
+
+	err := rec.RemoveVolumesFromDRBD(t.Context(), &intent.DeleteVolumesRequest{
+		Name:    "pvc-vd",
+		Volumes: []intent.VolumeToDelete{{VolumeNumber: 1, Minor: &minor, StoragePool: "unregistered"}},
+	})
+	if err != nil {
+		t.Fatalf("RemoveVolumesFromDRBD: %v", err)
+	}
+
+	lines := fx.CommandLines()
+
+	for _, want := range []string{vdToIOError, "drbdsetup del-minor 20056", vdToSuspendIO} {
+		if !slices.Contains(lines, want) {
+			t.Errorf("%q not run; commands %q", want, lines)
+		}
+	}
+}
+
 // A volume with no DRBD minor, on a definition without DRBD, has nothing
 // to recheck.
 func TestDeleteVolumesWithoutAMinorReadsNoQuorum(t *testing.T) {

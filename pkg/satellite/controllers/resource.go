@@ -630,6 +630,8 @@ func (r *ResourceReconciler) prepareDRBDApply(
 		logger.Error(pruneErr, "PruneStaleKernelSlots failed; continuing to allocation gate")
 	}
 
+	r.removeFlaggedVolumesFromDRBD(ctx, res, rd, logger)
+
 	return r.waitForControllerAllocation(ctx, res, peers, logger)
 }
 

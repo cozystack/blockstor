@@ -85,6 +85,15 @@ func (r *Reconciler) DeleteVolumes(ctx context.Context, req *intent.DeleteVolume
 	return nil
 }
 
+// RemoveVolumesFromDRBD takes the requested volumes out of DRBD ahead of
+// the apply that re-renders the .res without them, so they are removed in
+// the order that does not suspend the volumes that stay (see
+// drbd.Adm.RemoveMinorsKeepingQuorum) instead of inside `drbdadm adjust`,
+// which removes them while on-no-quorum suspend-io is in force.
+func (r *Reconciler) RemoveVolumesFromDRBD(ctx context.Context, req *intent.DeleteVolumesRequest) error {
+	return r.removeVolumeMinors(ctx, req)
+}
+
 // removeVolumeMinors takes every requested volume out of DRBD, then has
 // DRBD recheck the resource's quorum, which a removal elsewhere, by
 // `drbdadm adjust` or on a resource the quorum policy is not relaxed on,
