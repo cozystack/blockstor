@@ -78,9 +78,10 @@ func TestRestoredCloneSeedsItselfUpToDateWithoutTheWinner(t *testing.T) {
 	}
 }
 
-// A clone that comes up after a peer already holds data is a copy of the same
-// snapshot under the same day0 GI, not an empty replica owed a full sync.
-func TestRestoredCloneSeedsItselfUpToDateBesideAPeerWithData(t *testing.T) {
+// A clone placed after a peer already holds data is not part of the restore
+// set: the peer may have written since the snapshot, so the clone syncs from
+// it rather than presenting the snapshot's data as up to date.
+func TestRestoredCloneIsNotSeededUpToDateBesideAPeerWithData(t *testing.T) {
 	t.Parallel()
 
 	rec := restoreSeedReconciler(t)
@@ -89,8 +90,34 @@ func TestRestoredCloneSeedsItselfUpToDateBesideAPeerWithData(t *testing.T) {
 	skip := true
 
 	seed, ok := rec.resolveVolumeSeed(t.Context(), "pvc-restored", restoredVolume(), true, false, &skip)
-	if !uptodateSeed(seed, ok) {
-		t.Fatalf("seed of a clone beside a peer with data = %+v, %v; want Consistent+UpToDate", seed, ok)
+	if ok {
+		t.Fatalf("seed of a clone beside a peer with data = %+v; want none, so it syncs from that peer", seed)
+	}
+}
+
+// The kernel veto holds for a clone too: a peer whose connection already
+// shows committed data is one the clone has to sync from, whatever the
+// controller's records say.
+func TestRestoredCloneIsNotSeededUpToDateBesideAConnectedPeerWithData(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-restored --json",
+		storage.FakeResponse{Stdout: []byte(`[{"node-id":1,"connections":[{"peer-node-id":0,` +
+			`"peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]}]`)})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Providers: map[string]storage.Provider{"zfsthin1": &restoreSeedFakeProvider{kind: ProviderKindZFSThin}},
+		Adm:       drbd.NewAdm(fx),
+		NodeName:  "n1",
+	})
+	rec.recordRestoreBlankFallback("pvc-restored", 0, false)
+
+	skip := true
+
+	seed, ok := rec.resolveVolumeSeed(t.Context(), "pvc-restored", restoredVolume(), false, false, &skip)
+	if uptodateSeed(seed, ok) {
+		t.Fatalf("seed of a clone beside a connected peer with data = %+v; want it not UpToDate", seed)
 	}
 }
 

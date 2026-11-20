@@ -5596,12 +5596,12 @@ func (r *Reconciler) gateBringUpReadiness(ctx context.Context, dr *intent.Desire
 // land in Spec in time; the case-A AnyConnectedPeerHasData gate reads
 // live kernel state, immune to the day0 CRD-classification ambiguity.
 func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string, vol *intent.DesiredVolume, peerHasData, isWinner bool, skipInitialSync *bool) (drbd.GISeed, bool) {
-	if seed, ok := r.restoredCloneSeed(resourceName, vol, skipInitialSync); ok {
-		return seed, true
-	}
-
 	if peerHasData {
 		return drbd.GISeed{}, false
+	}
+
+	if seed, ok := r.restoredCloneSeed(ctx, resourceName, vol, skipInitialSync); ok {
+		return seed, true
 	}
 
 	// Skip-init-sync hardening — the AUTHORITATIVE, controller-decided,
@@ -5812,24 +5812,39 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 	return drbd.GISeed{Current: day0, WasUpToDate: true}, true
 }
 
-// restoredCloneSeed is the seed of a replica restored here from the
-// snapshot, which holds the snapshot's data whatever its peers do, so it
-// comes up UpToDate on its own, the way every replica LINSTOR restores keeps
-// the snapshot's up-to-date metadata. Waiting for the elected winner instead
-// leaves it Inconsistent for good when the winner never comes up, and an
-// Inconsistent peer is no source to sync from. A peer that already holds data
-// does not change that: it was restored from the same snapshot under the
-// same day0 GI, so the handshake finds them equal, or syncs exactly the
-// blocks the peer wrote since.
+// restoredCloneSeed is the seed of a replica of the restore set that was
+// cloned or received here from the snapshot: it holds the snapshot's data,
+// so it comes up UpToDate on its own, the way LINSTOR keeps the snapshot's
+// up-to-date metadata on every replica snapshot-restore-resource creates.
+// Waiting for the elected winner instead leaves the clones Inconsistent for
+// good when the winner never comes up (a blank fallback, or a replica that
+// cannot be created), and an Inconsistent peer is no source to sync from.
 //
-// Only on a target the controller still calls fresh (SkipInitialSync), only
-// for a volume this process saw cloned or received, never a blank fallback,
-// and not over a GI the controller copied from a real peer.
-func (r *Reconciler) restoredCloneSeed(resourceName string, vol *intent.DesiredVolume, skipInitialSync *bool) (drbd.GISeed, bool) {
+// The restore set is the replicas created before the restored definition
+// was first used: the controller latches RD.Spec.Initialized the first time
+// a replica of a restored definition is Primary, so every replica created
+// after that is stamped SkipInitialSync=false and syncs from a peer, as a
+// replica LINSTOR autoplaces next to a restored one does. A replica cloned
+// from the old snapshot after the volume was written would otherwise come
+// up UpToDate on stale data, and with the writer still at day0 (a Primary
+// connected to all its peers does not rotate its current UUID) DRBD finds
+// nothing to sync when they meet.
+//
+// The vetoes of resolveVolumeSeed come first: a peer the dispatcher knows
+// holds data (checked by the caller), or one whose connection already shows
+// committed data in the kernel, refuses the seed. So does anything that is
+// not a fresh member of the restore set: SkipInitialSync not true, a GI the
+// controller copied from a real peer, a blank fallback, or a volume this
+// process did not itself clone or receive.
+func (r *Reconciler) restoredCloneSeed(ctx context.Context, resourceName string, vol *intent.DesiredVolume, skipInitialSync *bool) (drbd.GISeed, bool) {
 	restoredHere := skipInitialSync != nil && *skipInitialSync &&
 		vol.GetSourceSnapshot() != "" && vol.GetSeedFromGI() == "" &&
 		r.isRestoredFromSnapshot(resourceName, vol.GetVolumeNumber())
 	if !restoredHere {
+		return drbd.GISeed{}, false
+	}
+
+	if r.cfg.Adm.AnyConnectedPeerHasDataForVolume(ctx, resourceName, vol.GetVolumeNumber()) {
 		return drbd.GISeed{}, false
 	}
 
