@@ -203,25 +203,15 @@ func (s *Server) deployedReplicasNotBuilt(ctx context.Context, rdName string, de
 }
 
 // replicaBuilt reports whether the satellite built every volume of rsc:
-// a diskful volume has the device path the satellite reports once the
-// device is up (and formatted, when a filesystem was asked for), a
-// diskless one has the disk state the satellite reads off the kernel.
+// each has the device path the satellite reports once the device is up
+// (and formatted, when a filesystem was asked for). That holds for a
+// diskless replica too, whose path is its DRBD device: the path is what
+// linstor-csi's ControllerPublishVolume reads, and a disk state alone
+// let make-available answer before the view had one.
 func replicaBuilt(rsc *apiv1.Resource, volumes map[int32]int64) bool {
 	for vn := range volumes {
 		vol := reportedVolume(rsc, vn)
-		if vol == nil {
-			return false
-		}
-
-		if isDisklessReplica(rsc) {
-			if vol.State.DiskState == "" {
-				return false
-			}
-
-			continue
-		}
-
-		if vol.DevicePath == "" {
+		if vol == nil || vol.DevicePath == "" {
 			return false
 		}
 	}
@@ -336,9 +326,11 @@ func onlineDiskfulPeers(replicas []apiv1.Resource, online map[string]bool) []str
 }
 
 // replicaReady is LINSTOR's ResourceState.isReady for rsc against the
-// expected peers. A diskful replica must also report a device path for
-// every volume: LINSTOR knows the path from its layer data the moment
-// the resource exists, blockstor learns it from the satellite.
+// expected peers. The replica must also report a device path for every
+// volume: LINSTOR knows the path from its layer data the moment the
+// resource exists, blockstor learns it from the satellite. After the
+// build step that always holds already; the check matters only when
+// ResourceDeployWait is zero and the build step is skipped.
 func replicaReady(rsc *apiv1.Resource, peers []string, byNode map[string]*apiv1.Resource, volumes map[int32]int64) bool {
 	conns := drbdConnections(rsc)
 
@@ -358,7 +350,7 @@ func replicaReady(rsc *apiv1.Resource, peers []string, byNode map[string]*apiv1.
 			return false
 		}
 
-		if !isDisklessReplica(rsc) && vol.DevicePath == "" {
+		if vol.DevicePath == "" {
 			return false
 		}
 

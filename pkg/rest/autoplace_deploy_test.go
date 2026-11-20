@@ -227,8 +227,9 @@ func TestAutoplaceWarnsWhenReplicaIsNotBuiltInTime(t *testing.T) {
 }
 
 // TestReplicaBuilt pins what counts as built: a device path on every
-// defined volume of a diskful replica, a disk state read off the
-// kernel on every volume of a diskless one.
+// defined volume, for a diskless replica as for a diskful one. A
+// diskless replica's disk state alone is not enough: linstor-csi reads
+// the path right after make-available returned.
 func TestReplicaBuilt(t *testing.T) {
 	volumes := map[int32]int64{0: 1 << 20, 1: 1 << 20}
 
@@ -250,8 +251,12 @@ func TestReplicaBuilt(t *testing.T) {
 		{name: "diskful, every volume has a path", rsc: apiv1.Resource{Volumes: both("/dev/drbd1000", "")}, built: true},
 		{name: "diskless, nothing reported", rsc: apiv1.Resource{Flags: []string{apiv1.ResourceFlagDiskless}}},
 		{
-			name:  "diskless, disk state on every volume",
-			rsc:   apiv1.Resource{Flags: []string{apiv1.ResourceFlagDiskless}, Volumes: both("", "Diskless")},
+			name: "diskless, disk state but no path",
+			rsc:  apiv1.Resource{Flags: []string{apiv1.ResourceFlagDiskless}, Volumes: both("", "Diskless")},
+		},
+		{
+			name:  "diskless, every volume has its DRBD device",
+			rsc:   apiv1.Resource{Flags: []string{apiv1.ResourceFlagDiskless}, Volumes: both("/dev/drbd1000", "Diskless")},
 			built: true,
 		},
 	}
