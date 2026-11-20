@@ -1009,6 +1009,12 @@ func drbdLayerFromStatus(st *crdv1alpha1.ResourceStatus) *apiv1.DrbdResourceLaye
 		}
 	}
 
+	if st.PromotionScore != nil || st.MayPromote != nil {
+		out.PromotionScore = st.PromotionScore
+		out.MayPromote = st.MayPromote
+		hasAny = true
+	}
+
 	if !hasAny {
 		return nil
 	}

@@ -19,6 +19,7 @@ limitations under the License.
 package rest
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/http"
@@ -149,9 +150,10 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
 	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
 
-	// Bug 137: a replica the satellite reports no storage for (a
-	// diskless or TIE_BREAKER one, or one not built yet) still lists a
-	// volume per parent-RD VolumeDefinition, as LINSTOR's view does.
+	// Bug 137: a replica the satellite has not reported on (a
+	// diskless witness, or a diskful replica not built yet) would
+	// otherwise reach the wire without a `volumes` key and crash
+	// python-linstor. ensureVolumesForView documents what fills it.
 	annotated = ensureVolumesForView(annotated, rsc, vdSizes)
 
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
@@ -216,61 +218,95 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 // crashes the CLI with AttributeError.
 const disklessStorPoolName = "DfltDisklessStorPool"
 
-// ensureVolumesForView returns the replica's volumes with one entry for
-// every volume definition of its parent, as LINSTOR does: the controller
-// creates a replica's Volume objects together with the replica
-// (CtrlRscCrtApiHelper), so its REST answers list them from that moment,
-// with no device path or disk state until the satellite reports.
-// blockstor's volumes come from what the satellite reported, so a replica
-// the satellite has not built yet, or a diskless one it never reports
-// storage for, would otherwise answer with no volumes at all. Clients
-// index into that list: linstor-scheduler-extender reads volumes[0] of
-// every replica in the view and panics on an empty one, linstor-csi's
-// attach gets a 404 for volume 0 instead of an answer without a device
-// path, and python-linstor's `rsc._rest_data['volumes'][0]` raises
-// (Bug 137).
+// ensureVolumesForView returns the wire `volumes` list for one
+// replica: one entry per VolumeDefinition of the parent RD, in
+// volume-number order, the way upstream LINSTOR's view does. LINSTOR
+// creates a replica's Volume objects together with the replica and
+// builds the list from them (Json.apiToResourceWithVolumes), so the
+// list never depends on whether the satellite has reported; only
+// `state` stays unset until it does.
 //
-// A volume the satellite reported is passed through verbatim; the
-// placeholders carry only the volume number, the pool and the layer
-// list. A diskless or
-// TIE_BREAKER replica's placeholder names the upstream sentinel pool
-// `DfltDisklessStorPool` (see disklessStorPoolName), so `linstor n
-// describe` recognises the row as a diskless witness. The result is
-// never nil, so the `volumes` key is always present on the wire.
+// blockstor sources the list from what the satellite observed, which
+// is nothing for a diskless witness and nothing for a diskful
+// replica the satellite has not built yet. Clients index the list by
+// volume number on the strength of the upstream guarantee:
+// linstor-scheduler-extender reads `volumes[0].state.disk_state` of
+// every DRBD replica and panicked on the empty list while a new
+// volume's replicas were still being built. A volume the satellite
+// has not reported is therefore filled in with what the controller
+// knows: its number, its storage pool (LINSTOR's sentinel
+// `DfltDisklessStorPool` on a diskless replica, see
+// disklessStorPoolName) and an empty state.
+//
+// Observed volumes are passed through verbatim, so a placeholder
+// never shadows satellite-reported allocation or disk state. The
+// result is never nil: the `volumes` key is always present (Bug 137).
 func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) []apiv1.Volume {
-	out := make([]apiv1.Volume, 0, max(len(observed), len(vdSizes)))
-	out = append(out, observed...)
+	seen := make(map[int32]struct{}, len(observed))
+	for i := range observed {
+		seen[observed[i].VolumeNumber] = struct{}{}
+	}
 
-	pool := rsc.Props["StorPoolName"]
-	if isDisklessReplica(rsc) {
+	missing := make([]int32, 0, len(vdSizes))
+
+	for vn := range vdSizes {
+		if _, ok := seen[vn]; !ok {
+			missing = append(missing, vn)
+		}
+	}
+
+	if len(missing) == 0 {
+		if observed == nil {
+			return []apiv1.Volume{}
+		}
+
+		return observed
+	}
+
+	pool := rsc.Props[storPoolPropKey]
+
+	diskless := isDisklessReplica(rsc)
+	if diskless {
 		pool = disklessStorPoolName
 	}
 
-	for vn := range vdSizes {
-		if slices.ContainsFunc(observed, func(v apiv1.Volume) bool { return v.VolumeNumber == vn }) {
-			continue
+	// A diskful replica with no pool on its spec (the clone path can
+	// leave one, see the k8s store's ListByDefinition) has nothing
+	// truthful to put in `storage_pool_name`. An empty name is what
+	// makes the Python CLI's `n describe` crash on a pool lookup
+	// returning None, so such a replica keeps the observed list.
+	if pool == "" {
+		if observed == nil {
+			return []apiv1.Volume{}
 		}
 
-		out = append(out, apiv1.Volume{
-			VolumeNumber: vn,
-			StoragePool:  pool,
-			// AllocatedKib defaults to 0 (the Bug 112 contract:
-			// always emit the key as an int >= 0); nothing has been
-			// allocated that the satellite reported.
-		})
+		return observed
 	}
 
-	// A placeholder carries the layer list a reported volume gets from
-	// the store, the default stack (the resource view re-stamps both
-	// from the definition's stack). LINSTOR emits layer_data_list for a
-	// volume from its creation, and clients that read the DRBD entry
-	// there would otherwise tell a placeholder from a built volume.
-	apiv1.ApplyLayerStackToVolumes(out[len(observed):], apiv1.DefaultLayerStack())
+	placeholders := make([]apiv1.Volume, 0, len(missing))
+	for _, vn := range missing {
+		// AllocatedKib stays 0 (the Bug 112 contract: always emit
+		// the key as an int >= 0); nothing is allocated until the
+		// satellite reports.
+		placeholders = append(placeholders, apiv1.Volume{VolumeNumber: vn, StoragePool: pool})
+	}
 
-	// Stable order: the VD index is a map, and paginated CLI consumers
-	// must not see volume_number jitter between requests.
-	slices.SortStableFunc(out, func(left, right apiv1.Volume) int {
-		return int(left.VolumeNumber) - int(right.VolumeNumber)
+	if !diskless {
+		// An observed diskful volume carries the default
+		// DRBD,STORAGE chain (the k8s store's volumesFromStatus);
+		// the RD's own stack replaces it in buildResourceView.
+		apiv1.ApplyLayerStackToVolumes(placeholders, apiv1.DefaultLayerStack())
+	}
+
+	out := make([]apiv1.Volume, 0, len(observed)+len(placeholders))
+	out = append(out, observed...)
+	out = append(out, placeholders...)
+
+	// Stable volume-number order: the VD index is a map, and
+	// paginated CLI consumers must not see volume_number jitter
+	// between requests.
+	slices.SortFunc(out, func(left, right apiv1.Volume) int {
+		return cmp.Compare(left.VolumeNumber, right.VolumeNumber)
 	})
 
 	return out
