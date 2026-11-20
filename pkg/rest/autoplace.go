@@ -349,15 +349,19 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Answer once the satellites built the placed replicas, as LINSTOR
+	// does; see waitPlacedReplicasReady.
+	notReady := s.waitPlacedReplicasReady(r.Context(), rdName)
+
 	// Java LINSTOR replies with a `[]ApiCallRc` envelope on success.
 	// golinstor's RD.Autoplace ignores an empty body, but tools that
 	// surface API messages (e.g. the linstor CLI) want a real result
 	// to log. Return MASK_INFO + RC_PLACEMENT_DONE-style entry so the
 	// shape matches the oracle's.
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	writeJSON(w, http.StatusOK, append([]apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRDAutoplaceDone,
 		Message: "Resource definition '" + rdName + "' auto-placed",
-	}})
+	}}, notReady...))
 }
 
 // refuseAutoplaceMultiPlaceWithoutReplication is Bug 335's

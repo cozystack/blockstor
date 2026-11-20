@@ -338,8 +338,9 @@ func main() {
 			Client:    mgr.GetClient(),
 			Namespace: controllerNamespace,
 			// As in cmd/apiserver: the passphrase Secret is read past the cache.
-			SecretReader: mgr.GetAPIReader(),
-			OnReady:      ready.MarkBound,
+			SecretReader:      mgr.GetAPIReader(),
+			OnReady:           ready.MarkBound,
+			ResourceReadyWait: rest.DefaultResourceReadyWait,
 		}); err != nil {
 			setupLog.Error(err, "Failed to register REST API server")
 			os.Exit(1)

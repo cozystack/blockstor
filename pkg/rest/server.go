@@ -147,6 +147,14 @@ type Server struct {
 	// blocking work delays the serve loop entry.
 	OnReady func()
 
+	// ResourceReadyWait bounds how long an autoplace waits for the
+	// replicas it placed to report their device paths before it
+	// answers, as LINSTOR waits for its satellites before it answers
+	// a resource create. Zero answers at once, which unit tests that
+	// run no satellite rely on; the binaries set
+	// DefaultResourceReadyWait.
+	ResourceReadyWait time.Duration
+
 	// eventBrokersInit gates the lazy initialisation of the SSE
 	// brokers below. The two brokers back `/v1/events/drbd/promotion`
 	// and `/v1/events/nodes` respectively — see pkg/rest/events.go.
