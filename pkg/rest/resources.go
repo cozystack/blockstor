@@ -154,7 +154,7 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 	// diskless witness, or a diskful replica not built yet) would
 	// otherwise reach the wire without a `volumes` key and crash
 	// python-linstor. ensureVolumesForView documents what fills it.
-	annotated = ensureVolumesForView(annotated, rsc, vdSizes)
+	annotated = ensureVolumesForView(annotated, rsc, s.placeholderPool(ctx, rsc), vdSizes)
 
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
 	if err != nil {
@@ -241,7 +241,9 @@ const disklessStorPoolName = "DfltDisklessStorPool"
 // Observed volumes are passed through verbatim, so a placeholder
 // never shadows satellite-reported allocation or disk state. The
 // result is never nil: the `volumes` key is always present (Bug 137).
-func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) []apiv1.Volume {
+// poolFor names a placeholder's pool by volume number and is called
+// only for a volume that gets one.
+func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, poolFor func(int32) string, vdSizes map[int32]int64) []apiv1.Volume {
 	seen := make(map[int32]struct{}, len(observed))
 	for i := range observed {
 		seen[observed[i].VolumeNumber] = struct{}{}
@@ -263,35 +265,15 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 		return observed
 	}
 
-	pool := rsc.Props[storPoolPropKey]
-
-	diskless := isDisklessReplica(rsc)
-	if diskless {
-		pool = disklessStorPoolName
-	}
-
-	// A diskful replica with no pool on its spec (the clone path can
-	// leave one, see the k8s store's ListByDefinition) has nothing
-	// truthful to put in `storage_pool_name`. An empty name is what
-	// makes the Python CLI's `n describe` crash on a pool lookup
-	// returning None, so such a replica keeps the observed list.
-	if pool == "" {
-		if observed == nil {
-			return []apiv1.Volume{}
-		}
-
-		return observed
-	}
-
 	placeholders := make([]apiv1.Volume, 0, len(missing))
 	for _, vn := range missing {
 		// AllocatedKib stays 0 (the Bug 112 contract: always emit
 		// the key as an int >= 0); nothing is allocated until the
 		// satellite reports.
-		placeholders = append(placeholders, apiv1.Volume{VolumeNumber: vn, StoragePool: pool})
+		placeholders = append(placeholders, apiv1.Volume{VolumeNumber: vn, StoragePool: poolFor(vn)})
 	}
 
-	if !diskless {
+	if !isDisklessReplica(rsc) {
 		// An observed diskful volume carries the default
 		// DRBD,STORAGE chain (the k8s store's volumesFromStatus);
 		// the RD's own stack replaces it in buildResourceView.
@@ -334,6 +316,26 @@ func (s *Server) definitionVolumeSizes(ctx context.Context, rdName string) map[i
 	}
 
 	return out
+}
+
+// placeholderPool returns the pool a placeholder volume of rsc lists,
+// by volume number: LINSTOR's diskless sentinel on a diskless replica,
+// the pool on the replica's spec on a diskful one, and for a diskful
+// replica with no pool on its spec (a restore that read the pool off a
+// deleted source can leave one) what viewPoolResolver resolves. The
+// resolver only runs for a volume that needs a placeholder.
+func (s *Server) placeholderPool(ctx context.Context, rsc *apiv1.Resource) func(int32) string {
+	if isDisklessReplica(rsc) {
+		return func(int32) string { return disklessStorPoolName }
+	}
+
+	if pool := rsc.Props[storPoolPropKey]; pool != "" {
+		return func(int32) string { return pool }
+	}
+
+	resolver := &viewPoolResolver{s: s, rsc: rsc}
+
+	return func(vn int32) string { return resolver.poolFor(ctx, vn) }
 }
 
 // isDisklessReplica reports whether the replica carries a DISKLESS

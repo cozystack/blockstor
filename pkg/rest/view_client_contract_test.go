@@ -19,6 +19,8 @@ limitations under the License.
 package rest
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
 
 	lapi "github.com/LINBIT/golinstor/client"
@@ -47,6 +49,22 @@ func contractNodeNames() []string { return []string{"node-a", "node-b", "node-c"
 func seedThreeReplicaRD(t *testing.T, st store.Store) {
 	t.Helper()
 
+	seedContractRD(t, st, map[string]string{"node-a": "data", "node-b": "data", "node-c": "data"})
+}
+
+// seedContractRD creates a one-volume RD with a diskful replica on each
+// node of pools, in that node's pool; an empty pool leaves the
+// replica's spec without one.
+func seedContractRD(t *testing.T, st store.Store, pools map[string]string) {
+	t.Helper()
+
+	seedContractRDWith(t, st, apiv1.ResourceDefinition{Name: contractRD}, pools)
+}
+
+// seedContractRDWith is seedContractRD with the definition given.
+func seedContractRDWith(t *testing.T, st store.Store, rd apiv1.ResourceDefinition, pools map[string]string) {
+	t.Helper()
+
 	ctx := t.Context()
 
 	for _, n := range contractNodeNames() {
@@ -55,7 +73,7 @@ func seedThreeReplicaRD(t *testing.T, st store.Store) {
 		}
 	}
 
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: contractRD}); err != nil {
+	if err := st.ResourceDefinitions().Create(ctx, &rd); err != nil {
 		t.Fatalf("seed RD: %v", err)
 	}
 
@@ -67,10 +85,20 @@ func seedThreeReplicaRD(t *testing.T, st store.Store) {
 	}
 
 	for _, n := range contractNodeNames() {
+		pool, ok := pools[n]
+		if !ok {
+			continue
+		}
+
+		props := map[string]string{}
+		if pool != "" {
+			props["StorPoolName"] = pool
+		}
+
 		if err := st.Resources().Create(ctx, &apiv1.Resource{
 			Name:     contractRD,
 			NodeName: n,
-			Props:    map[string]string{"StorPoolName": "data"},
+			Props:    props,
 		}); err != nil {
 			t.Fatalf("seed resource on %s: %v", n, err)
 		}
@@ -85,10 +113,6 @@ func contractResourceView(t *testing.T, base string) []lapi.ResourceWithVolumes 
 	})
 	if err != nil {
 		t.Fatalf("GetResourceView: %v", err)
-	}
-
-	if len(view) != len(contractNodeNames()) {
-		t.Fatalf("view: got %d replicas, want %d", len(view), len(contractNodeNames()))
 	}
 
 	return view
@@ -146,7 +170,12 @@ func TestViewUnbuiltReplicasListEveryVolume(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	for _, r := range contractResourceView(t, base) {
+	view := contractResourceView(t, base)
+	if len(view) != len(contractNodeNames()) {
+		t.Fatalf("view: got %d replicas, want %d", len(view), len(contractNodeNames()))
+	}
+
+	for _, r := range view {
 		if !hasDRBDLayer(r.LayerObject) {
 			t.Fatalf("%s: no DRBD layer in %+v", r.NodeName, r.LayerObject)
 		}
@@ -231,7 +260,12 @@ func TestViewHealthyReplicasPassTheCSIVolumeCondition(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	for _, r := range contractResourceView(t, base) {
+	view := contractResourceView(t, base)
+	if len(view) != len(contractNodeNames()) {
+		t.Fatalf("view: got %d replicas, want %d", len(view), len(contractNodeNames()))
+	}
+
+	for _, r := range view {
 		if r.State == nil {
 			t.Errorf("%s: no state, linstor-csi reports the node as having issues", r.NodeName)
 
@@ -253,24 +287,328 @@ func TestViewHealthyReplicasPassTheCSIVolumeCondition(t *testing.T) {
 	}
 }
 
-// TestViewPlaceholderNeedsAPool: a diskful replica with no pool on
-// its spec gets no placeholder volume. A row with an empty
-// `storage_pool_name` is what crashes the Python CLI's `n describe`
-// on a pool lookup returning None (the Bug 137 crash class), so the
-// replica keeps the list the satellite observed.
-func TestViewPlaceholderNeedsAPool(t *testing.T) {
-	t.Parallel()
+// extenderDataNodes runs the replica loop of
+// linstor-scheduler-extender v0.3.6 InspectVolume
+// (pkg/driver/linstor.go): it reads volumes[0] of every replica with a
+// DRBD layer, unguarded, and keeps the UpToDate diskful nodes. A panic
+// there is what the extender's HTTP server turns into an EOF for the
+// scheduler, so it fails the test instead.
+func extenderDataNodes(t *testing.T, view []lapi.ResourceWithVolumes) []string {
+	t.Helper()
 
-	rsc := &apiv1.Resource{Name: contractRD, NodeName: "node-a"}
+	var nodes []string
 
-	got := ensureVolumesForView(nil, rsc, map[int32]int64{0: 1024 * 1024})
-	if got == nil {
-		t.Fatal("volumes = nil, want an empty list so the key stays present")
+	for _, r := range view {
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Fatalf("extender InspectVolume panics on the replica on %s (volumes %+v): %v", r.NodeName, r.Volumes, p)
+				}
+			}()
+
+			if hasDRBDLayer(r.LayerObject) && r.Volumes[0].State.DiskState != "UpToDate" {
+				return
+			}
+
+			nodes = append(nodes, r.NodeName)
+		}()
 	}
 
-	for _, v := range got {
-		if v.StoragePool == "" {
-			t.Errorf("volume %d has an empty storage pool, want no placeholder without a pool", v.VolumeNumber)
+	return nodes
+}
+
+// reportInconsistent records on the replica on node what the satellite
+// observes for a built volume whose initial sync never finished.
+func reportInconsistent(t *testing.T, cli ctrlclient.Client, node string) {
+	t.Helper()
+
+	var crd crdv1alpha1.Resource
+	if err := cli.Get(t.Context(), ctrlclient.ObjectKey{Name: k8s.ResourceCRName(contractRD, node)}, &crd); err != nil {
+		t.Fatalf("get replica on %s: %v", node, err)
+	}
+
+	crd.Status.Role = "Secondary"
+	crd.Status.DrbdState = "Inconsistent"
+	crd.Status.Volumes = []crdv1alpha1.ResourceVolumeStatus{{
+		VolumeNumber: 0,
+		StoragePool:  "data",
+		DevicePath:   "/dev/drbd1000",
+		DiskState:    "Inconsistent",
+	}}
+
+	if err := cli.Status().Update(t.Context(), &crd); err != nil {
+		t.Fatalf("report replica on %s: %v", node, err)
+	}
+}
+
+// TestViewPoollessReplicaListsItsVolume: a restore can leave a diskful
+// replica with no pool on its spec while its siblings are built from
+// their local clones. LINSTOR cannot hold such a replica: it creates
+// every Volume with a resolved pool, a diskful neighbour's when no
+// StorPoolName is set and that pool exists on the replica's node.
+// blockstor listed it with no volumes, and
+// linstor-scheduler-extender panicked with index out of range on every
+// filter call for the pod of that volume.
+func TestViewPoollessReplicaListsItsVolume(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(crScheme(t)).
+		WithStatusSubresource(&crdv1alpha1.Resource{}).Build()
+	st := k8s.New(cli)
+	seedContractRD(t, st, map[string]string{"node-a": "data", "node-b": "data", "node-c": ""})
+	seedPools(t, st, "data", contractNodeNames()...)
+	reportInconsistent(t, cli, "node-a")
+	reportInconsistent(t, cli, "node-b")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	view := contractResourceView(t, base)
+	if len(view) != len(contractNodeNames()) {
+		t.Fatalf("view: got %d replicas, want %d", len(view), len(contractNodeNames()))
+	}
+
+	if nodes := extenderDataNodes(t, view); len(nodes) != 0 {
+		t.Errorf("extender data nodes = %v, want none while no replica is UpToDate", nodes)
+	}
+
+	for _, r := range view {
+		if len(r.Volumes) != 1 {
+			t.Fatalf("%s: got %d volumes, want 1 per volume definition", r.NodeName, len(r.Volumes))
 		}
+
+		if r.Volumes[0].StoragePoolName != "data" {
+			t.Errorf("%s: storage_pool_name = %q, want the diskful neighbours' %q", r.NodeName, r.Volumes[0].StoragePoolName, "data")
+		}
+	}
+}
+
+// TestViewUnresolvablePoolStillListsTheVolume: with no pool anywhere to
+// resolve, the replica still lists one volume per volume definition.
+// The row then names no pool, which only the Python CLI's `n describe`
+// trips over; an empty list panics the scheduler extender instead.
+func TestViewUnresolvablePoolStillListsTheVolume(t *testing.T) {
+	t.Parallel()
+
+	st := k8s.New(fake.NewClientBuilder().WithScheme(crScheme(t)).Build())
+	seedContractRD(t, st, map[string]string{"node-a": ""})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	view := contractResourceView(t, base)
+	if len(view) != 1 {
+		t.Fatalf("view: got %d replicas, want 1", len(view))
+	}
+
+	extenderDataNodes(t, view)
+
+	if got := len(view[0].Volumes); got != 1 {
+		t.Fatalf("got %d volumes, want 1 per volume definition", got)
+	}
+}
+
+// seedPools creates a pool named pool of a backed kind on each node.
+func seedPools(t *testing.T, st store.Store, pool string, nodes ...string) {
+	t.Helper()
+
+	for _, n := range nodes {
+		if err := st.StoragePools().Create(t.Context(), &apiv1.StoragePool{
+			StoragePoolName: pool,
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindZFSThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s on %s: %v", pool, n, err)
+		}
+	}
+}
+
+func contractVolumePool(t *testing.T, view []lapi.ResourceWithVolumes, node string) string {
+	t.Helper()
+
+	for _, r := range view {
+		if r.NodeName != node {
+			continue
+		}
+
+		if len(r.Volumes) != 1 {
+			t.Fatalf("%s: got %d volumes, want 1 per volume definition", node, len(r.Volumes))
+		}
+
+		return r.Volumes[0].StoragePoolName
+	}
+
+	t.Fatalf("no replica on %s in the view", node)
+
+	return ""
+}
+
+// TestViewPoollessReplicaPoolResolvesLikeLINSTOR: the placeholder of a
+// replica with no pool on its spec names the pool LINSTOR v1.33.1
+// would have created its Volume in (CtrlStorPoolResolveHelper
+// .resolveStorPool). A neighbour's pool counts only when it exists on
+// the replica's own node, DfltStorPool comes after the neighbours, and
+// a StorPoolName set on the definition is the only candidate. Before,
+// the view took a sibling's pool unchecked and listed a pool the
+// replica's node does not have.
+func TestViewPoollessReplicaPoolResolvesLikeLINSTOR(t *testing.T) {
+	t.Parallel()
+
+	pools := map[string]string{"node-a": "data", "node-b": "data", "node-c": ""}
+
+	cases := []struct {
+		name string
+		rd   apiv1.ResourceDefinition
+		seed func(t *testing.T, st store.Store)
+		want string
+	}{{
+		name: "neighbour pool present on the node",
+		rd:   apiv1.ResourceDefinition{Name: contractRD},
+		seed: func(t *testing.T, st store.Store) {
+			t.Helper()
+			seedPools(t, st, "data", contractNodeNames()...)
+		},
+		want: "data",
+	}, {
+		name: "neighbour pool diskless on the node",
+		rd:   apiv1.ResourceDefinition{Name: contractRD},
+		seed: func(t *testing.T, st store.Store) {
+			t.Helper()
+			seedPools(t, st, "data", "node-a", "node-b")
+
+			if err := st.StoragePools().Create(t.Context(), &apiv1.StoragePool{
+				StoragePoolName: "data",
+				NodeName:        "node-c",
+				ProviderKind:    apiv1.StoragePoolKindDiskless,
+			}); err != nil {
+				t.Fatalf("seed diskless pool: %v", err)
+			}
+		},
+		want: "",
+	}, {
+		name: "neighbour pool missing on the node",
+		rd:   apiv1.ResourceDefinition{Name: contractRD},
+		seed: func(t *testing.T, st store.Store) {
+			t.Helper()
+			seedPools(t, st, "data", "node-a", "node-b")
+		},
+		want: "",
+	}, {
+		name: "DfltStorPool after the neighbours",
+		rd:   apiv1.ResourceDefinition{Name: contractRD},
+		seed: func(t *testing.T, st store.Store) {
+			t.Helper()
+			seedPools(t, st, "data", "node-a", "node-b")
+			seedPools(t, st, defaultStorPoolName, "node-c")
+		},
+		want: defaultStorPoolName,
+	}, {
+		name: "definition prop wins over the neighbours",
+		rd:   apiv1.ResourceDefinition{Name: contractRD, Props: map[string]string{storPoolPropKey: "fast"}},
+		seed: func(t *testing.T, st store.Store) {
+			t.Helper()
+			seedPools(t, st, "data", contractNodeNames()...)
+			seedPools(t, st, "fast", "node-c")
+		},
+		want: "fast",
+	}, {
+		name: "definition prop missing on the node is not replaced",
+		rd:   apiv1.ResourceDefinition{Name: contractRD, Props: map[string]string{storPoolPropKey: "fast"}},
+		seed: func(t *testing.T, st store.Store) {
+			t.Helper()
+			seedPools(t, st, "data", contractNodeNames()...)
+		},
+		want: "",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := k8s.New(fake.NewClientBuilder().WithScheme(crScheme(t)).Build())
+			seedContractRDWith(t, st, tc.rd, pools)
+			tc.seed(t, st)
+
+			base, stop := startServerWithStore(t, st)
+			defer stop()
+
+			view := contractResourceView(t, base)
+			extenderDataNodes(t, view)
+
+			if got := contractVolumePool(t, view, "node-c"); got != tc.want {
+				t.Errorf("node-c placeholder storage_pool_name = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestViewPoolLookupFailureKeepsTheView: resolving a placeholder's
+// pool is a read made for display. A failed lookup used to fail the
+// whole /v1/view/resources answer with a 500, so one definition broke
+// every client listing the view; it now lists the volume without a
+// pool.
+func TestViewPoolLookupFailureKeepsTheView(t *testing.T) {
+	t.Parallel()
+
+	backend := k8s.New(fake.NewClientBuilder().WithScheme(crScheme(t)).Build())
+	seedContractRD(t, backend, map[string]string{"node-a": ""})
+
+	// The first read of the definition is the pool lookup's; the view's
+	// own effective-props read after it goes through.
+	st := faultyStore{backend, storeFaults{target: contractRD, rdGetPasses: budgetOf(0)}}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	view := contractResourceView(t, base)
+	if got := contractVolumePool(t, view, "node-a"); got != "" {
+		t.Errorf("storage_pool_name = %q, want empty after a failed lookup", got)
+	}
+}
+
+// countingSiblingLists counts Resources().ListByDefinition calls.
+type countingSiblingLists struct {
+	store.Store
+
+	lists *atomic.Int32
+}
+
+type countingReplicas struct {
+	store.ResourceStore
+
+	lists *atomic.Int32
+}
+
+func (s countingSiblingLists) Resources() store.ResourceStore {
+	return countingReplicas{s.Store.Resources(), s.lists}
+}
+
+func (r countingReplicas) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
+	r.lists.Add(1)
+
+	return r.ResourceStore.ListByDefinition(ctx, rdName) //nolint:wrapcheck // pass-through test double
+}
+
+// TestViewPoolLookupOnlyForAPlaceholder: a replica with no pool on its
+// spec whose volumes the satellite has reported gets no placeholder,
+// so the view must not pay for resolving one on every request.
+func TestViewPoolLookupOnlyForAPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	cli := fake.NewClientBuilder().WithScheme(crScheme(t)).
+		WithStatusSubresource(&crdv1alpha1.Resource{}).Build()
+	backend := k8s.New(cli)
+	seedContractRD(t, backend, map[string]string{"node-a": ""})
+	reportInconsistent(t, cli, "node-a")
+
+	var lists atomic.Int32
+
+	base, stop := startServerWithStore(t, countingSiblingLists{backend, &lists})
+	defer stop()
+
+	contractResourceView(t, base)
+
+	if n := lists.Load(); n != 0 {
+		t.Errorf("sibling replicas listed %d times for a replica with every volume reported, want 0", n)
 	}
 }
