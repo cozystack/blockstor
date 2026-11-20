@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/blocksize"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
@@ -2005,11 +2006,30 @@ func storPoolsByNodeFromSourceRD(ctx context.Context, st store.Store, srcRDName 
 // retry. The volume-definition restore hydrates into a definition that is
 // not its own and accepts no existing volume at all.
 func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, snap *apiv1.Snapshot, ownTarget bool) error {
+	// The resource restore copies each volume definition's props from the
+	// snapshot, as LINSTOR's does for a target with no replica yet; the
+	// volume-definition restore copies none, as LINSTOR's copies only the
+	// GI and the LUKS password, which blockstor keeps elsewhere.
+	copyProps := false
+
+	if ownTarget {
+		placed, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+		if err != nil {
+			return err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+		}
+
+		copyProps = len(placed) == 0
+	}
+
 	for i := range snap.VolumeDefinitions {
 		svd := &snap.VolumeDefinitions[i]
 		vd := apiv1.VolumeDefinition{
 			VolumeNumber: svd.VolumeNumber,
 			SizeKib:      svd.SizeKib,
+		}
+
+		if copyProps {
+			vd.Props = restoredVolumeProps(svd.VolumeDefinitionProps)
 		}
 
 		err := s.Store.VolumeDefinitions().Create(ctx, rdName, &vd)
@@ -2030,9 +2050,10 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 
 		// On this operation's own target, under its marker and the adoption
 		// handshake, AlreadyExists is the volume an earlier attempt hydrated,
-		// and tolerating it is what lets a retry finish an incomplete restore.
-		// The size still tells it apart: one at the snapshot's size, or grown
-		// since, is the restore's own; a smaller one is somebody else's.
+		// or the one linstor-csi's volume-definition restore wrote just
+		// before. The size still tells it apart: one at the snapshot's size,
+		// or grown since, is the restore's own; a smaller one is somebody
+		// else's.
 		existing, getErr := s.Store.VolumeDefinitions().Get(ctx, rdName, svd.VolumeNumber)
 		if getErr != nil {
 			return err //nolint:wrapcheck // the collision is the answer, not the read
@@ -2041,7 +2062,52 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 		if existing.SizeKib < svd.SizeKib {
 			return err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
 		}
+
+		if copyProps {
+			patchErr := copySnapshotVolumeProps(ctx, s, rdName, svd.VolumeNumber, vd.Props)
+			if patchErr != nil {
+				return patchErr
+			}
+		}
 	}
 
 	return nil
+}
+
+// copySnapshotVolumeProps lays a snapshot's volume definition props over
+// an existing volume definition, the snapshot's value winning, as
+// LINSTOR's copy into the restored definition does.
+func copySnapshotVolumeProps(ctx context.Context, s *Server, rdName string, volumeNumber int32, props map[string]string) error {
+	if len(props) == 0 {
+		return nil
+	}
+
+	return s.Store.VolumeDefinitions().PatchVolumeDefinitionSpec(ctx, rdName, volumeNumber, //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+		func(vd *apiv1.VolumeDefinition) error {
+			if vd.Props == nil {
+				vd.Props = map[string]string{}
+			}
+
+			maps.Copy(vd.Props, props)
+
+			return nil
+		})
+}
+
+// restoredVolumeProps is what a restored volume definition starts with:
+// the snapshot's copy of its source's props. A source that carried no
+// block size ran at DRBD's default, and that is written down, so the
+// controller does not give the restored data the pool's size, a sector
+// size it was never written at, while the automatic size is on.
+func restoredVolumeProps(snapshotProps map[string]string) map[string]string {
+	props := store.TravellingProps(snapshotProps)
+	if props == nil {
+		props = map[string]string{}
+	}
+
+	if _, ok := props[blocksize.PropBlockSize]; !ok && blocksize.AutoEnabled(props) {
+		props[blocksize.PropBlockSize] = blocksize.Format(blocksize.DefaultIoSize)
+	}
+
+	return props
 }
