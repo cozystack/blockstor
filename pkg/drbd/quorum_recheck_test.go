@@ -293,3 +293,162 @@ func TestRecheckQuorumAfterVolumeRemoval(t *testing.T) {
 		})
 	}
 }
+
+// secondaryStatus turns quorumStatusJSON's Primary into a Secondary, with
+// the first device open when open is set.
+func secondaryStatus(status string, open bool) string {
+	status = strings.Replace(status, `"role": "Primary"`, `"role": "Secondary"`, 1)
+	if open {
+		status = strings.Replace(status, `"open": false`, `"open": true`, 1)
+	}
+
+	return status
+}
+
+// removalCommands is the commands that change the kernel, in order.
+func removalCommands(lines []string) []string {
+	var out []string
+
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "drbdsetup status ") && !strings.HasPrefix(line, "drbdsetup show ") {
+			out = append(out, line)
+		}
+	}
+
+	return out
+}
+
+// del-minor turns replication to each peer off before it unregisters the
+// device, so the volume going away loses quorum, and DRBD suspends the
+// whole resource under on-no-quorum suspend-io; nothing lifts that once the
+// device is gone. On a Secondary that is not suspended and whose remaining
+// volumes have quorum and no opener, the removal runs under io-error, which
+// never suspends, and suspend-io is set back afterwards, which recomputes
+// the verdict from the volumes left. Everywhere else the policy is left as
+// it is, and it is restored even when the removal fails.
+func TestRemoveMinorsKeepingQuorum(t *testing.T) {
+	t.Parallel()
+
+	const (
+		detach   = "drbdsetup detach 20056"
+		delMinor = "drbdsetup del-minor 20056"
+	)
+
+	relaxed := []string{toIOError, detach, delMinor, toSuspendIO}
+	plain := []string{detach, delMinor}
+	secondary := secondaryStatus(quorumStatusJSON(quorumSusp{}, "true", "true"), false)
+
+	for _, tc := range []struct {
+		name      string
+		status    string
+		statusErr error
+		show      string
+		relaxErr  error
+		delErr    error
+		restErr   error
+		want      []string
+		wantErr   bool
+	}{
+		{name: "secondary with quorum", status: secondary, show: quorumShowJSON(suspendIOOptions, ""), want: relaxed},
+		{name: "default on-no-quorum", status: secondary, show: quorumShowJSON(`"quorum": "majority"`, ""), want: relaxed},
+		{
+			name:   "the departing volume has lost quorum already",
+			status: secondaryStatus(quorumStatusJSON(quorumSusp{}, "true", "false"), false),
+			show:   quorumShowJSON(suspendIOOptions, ""),
+			want:   relaxed,
+		},
+		{name: "io-error never suspends", status: secondary, show: quorumShowJSON(ioErrorOptions, ""), want: plain},
+		{name: "quorum off", status: secondary, show: quorumShowJSON("", ""), want: plain},
+		{name: "primary", status: quorumStatusJSON(quorumSusp{}, "true", "true"), want: plain},
+		{
+			name:   "suspended on quorum",
+			status: secondaryStatus(quorumStatusJSON(quorumSusp{quorum: true}, "true", "true"), false),
+			want:   plain,
+		},
+		{
+			name:   "a snapshot holds it suspended",
+			status: secondaryStatus(quorumStatusJSON(quorumSusp{user: true}, "true", "true"), false),
+			want:   plain,
+		},
+		{
+			name:   "suspended on no data",
+			status: secondaryStatus(quorumStatusJSON(quorumSusp{noData: true}, "true", "true"), false),
+			want:   plain,
+		},
+		{
+			name:   "suspended on fencing",
+			status: secondaryStatus(quorumStatusJSON(quorumSusp{fencing: true}, "true", "true"), false),
+			want:   plain,
+		},
+		{
+			name:   "a remaining volume is open",
+			status: secondaryStatus(quorumStatusJSON(quorumSusp{}, "true", "true"), true),
+			want:   plain,
+		},
+		{
+			name:   "a remaining volume has no quorum",
+			status: secondaryStatus(quorumStatusJSON(quorumSusp{}, "false", "true"), false),
+			want:   plain,
+		},
+		{
+			name:   "no remaining volume",
+			status: strings.Replace(secondaryStatus(quorumStatusJSON(quorumSusp{}, "true"), false), `"minor": 20055`, `"minor": 20056`, 1),
+			want:   plain,
+		},
+		{name: "resource not loaded", statusErr: errNoSuchResource, want: plain},
+		{name: "status fails", statusErr: errFakeFailure, wantErr: true},
+		{
+			name:    "del-minor fails",
+			status:  secondary,
+			show:    quorumShowJSON(suspendIOOptions, ""),
+			delErr:  errFakeFailure,
+			want:    relaxed,
+			wantErr: true,
+		},
+		{
+			name:    "restoring the policy fails",
+			status:  secondary,
+			show:    quorumShowJSON(suspendIOOptions, ""),
+			restErr: errFakeFailure,
+			want:    relaxed,
+			wantErr: true,
+		},
+		{
+			name:     "relaxing the policy fails",
+			status:   secondary,
+			show:     quorumShowJSON(suspendIOOptions, ""),
+			relaxErr: errFakeFailure,
+			want:     []string{toIOError},
+			wantErr:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			show := tc.show
+			if show == "" {
+				show = quorumShowJSON(suspendIOOptions, "")
+			}
+
+			fx := storage.NewFakeExec()
+			fx.Expect("drbdsetup status pvc-a --json", storage.FakeResponse{Stdout: []byte(tc.status), Err: tc.statusErr})
+			fx.Expect("drbdsetup show pvc-a --json", storage.FakeResponse{Stdout: []byte(show)})
+			fx.Expect("drbdsetup status --verbose", storage.FakeResponse{Stdout: []byte(
+				"pvc-a node-id:2 role:Secondary suspended:no\n" +
+					"  volume:0 minor:20055 disk:UpToDate open:no\n" +
+					"  volume:1 minor:20056 disk:UpToDate open:no\n")})
+			fx.Expect(toIOError, storage.FakeResponse{Err: tc.relaxErr})
+			fx.Expect(delMinor, storage.FakeResponse{Err: tc.delErr})
+			fx.Expect(toSuspendIO, storage.FakeResponse{Err: tc.restErr})
+
+			err := drbd.NewAdm(fx).RemoveMinorsKeepingQuorum(t.Context(), "pvc-a", []int32{20056})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("RemoveMinorsKeepingQuorum: %v, want error %t", err, tc.wantErr)
+			}
+
+			if got := removalCommands(fx.CommandLines()); !slices.Equal(got, tc.want) {
+				t.Errorf("commands %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

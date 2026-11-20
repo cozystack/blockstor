@@ -97,9 +97,10 @@ const (
 // with io-error a Primary's requests on volume 0 would fail with EIO while
 // nothing shows suspended.
 //
-// Once the volume is out of DRBD, whether the satellite removed the minor
-// or the apply's `drbdadm adjust` already had, the verdict is recomputed by
-// switching on-no-quorum to the other policy and back, which lifts no other
+// The satellite removes the volume itself under io-error and sets
+// suspend-io back afterwards, so the resource is never suspended. A volume
+// `drbdadm adjust` removed already gets its verdict recomputed by switching
+// on-no-quorum to the other policy and back, which lifts no other
 // suspension and so runs on a resource that suspends on no data or fences
 // peers too, as the replicated StorageClasses of a real cluster do.
 func TestDeleteVolumesRechecksTheQuorumTheRemovedVolumeLeft(t *testing.T) {
@@ -119,8 +120,8 @@ func TestDeleteVolumesRechecksTheQuorumTheRemovedVolumeLeft(t *testing.T) {
 		want       []string
 	}{
 		{
-			name: "last replica to remove the volume", suspended: true, onNoQuorum: "suspend-io",
-			want: []string{detach, delMinor, vdToIOError, vdToSuspendIO},
+			name: "the satellite removes the volume", onNoQuorum: "suspend-io",
+			want: []string{vdToIOError, detach, delMinor, vdToSuspendIO},
 		},
 		{
 			name: "adjust removed the volume and left it suspended", adjusted: true, suspended: true, onNoQuorum: "suspend-io",
@@ -237,5 +238,35 @@ func TestDeleteVolumesWithoutAMinorReadsNoQuorum(t *testing.T) {
 
 	if lines := fx.CommandLines(); len(lines) != 0 {
 		t.Errorf("commands %q, want none", lines)
+	}
+}
+
+// A minor the kernel now gives to another resource is not this volume's
+// any more: it is neither removed nor wrapped in an on-no-quorum change.
+func TestDeleteVolumesLeavesAMinorAnotherResourceHolds(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose", storage.FakeResponse{Stdout: []byte("pvc-other node-id:1 role:Secondary suspended:no\n" +
+		"  volume:0 minor:20056 disk:UpToDate open:no\n")})
+	fx.Expect("drbdsetup status pvc-vd --json", storage.FakeResponse{Stdout: vdQuorumStatus(false)})
+	fx.Expect("drbdsetup show pvc-vd --json", storage.FakeResponse{Stdout: vdQuorumShow("suspend-io", "")})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: t.TempDir(), NodeName: "n3"})
+
+	minor := int32(20056)
+
+	err := rec.DeleteVolumes(t.Context(), &intent.DeleteVolumesRequest{
+		Name:    "pvc-vd",
+		Volumes: []intent.VolumeToDelete{{VolumeNumber: 1, Minor: &minor}},
+	})
+	if err != nil {
+		t.Fatalf("DeleteVolumes: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if !strings.HasPrefix(line, "drbdsetup status ") && !strings.HasPrefix(line, "drbdsetup show ") {
+			t.Errorf("%q run on a minor pvc-other holds", line)
+		}
 	}
 }
