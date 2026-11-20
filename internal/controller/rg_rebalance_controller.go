@@ -399,6 +399,10 @@ func (r *RGRebalanceReconciler) replayOneShortfall(ctx context.Context, p *place
 		return nil
 	}
 
+	// No layer-stack skip here, unlike the scheduled pass: this finishes
+	// a spawn that came up short, it does not top up a definition after
+	// a replica was deleted, so a storage-only definition is exempt on
+	// purpose.
 	filter := rg.SelectFilter
 	if filter.PlaceCount == 0 {
 		filter.PlaceCount = 1
