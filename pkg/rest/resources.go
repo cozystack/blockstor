@@ -19,6 +19,7 @@ limitations under the License.
 package rest
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/http"
@@ -147,20 +148,11 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
 	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
 
-	// Bug 137: diskless / TIE_BREAKER replicas never get a
-	// per-volume Status row written by the satellite (no local
-	// backing device, no usage to report). The CRD-to-wire
-	// projection therefore returns Volumes=nil, the JSON encoder
-	// drops the `volumes` key under `omitempty`, and python-linstor
-	// crashes on `rsc._rest_data['volumes'][0]` with AttributeError
-	// because the key is `None`. Synthesise one placeholder per
-	// parent-RD VolumeDefinition so the wire shape mirrors a
-	// diskful replica — same volume_number, same layer chain — but
-	// with no satellite-observed allocation. Non-diskless replicas
-	// with an empty Volumes slice still get a `[]` (the absent-key
-	// regression strikes them too: e.g. a freshly-created diskful
-	// replica before the satellite has reported usage).
-	annotated = ensureVolumesForView(annotated, rsc, vdSizes)
+	// Bug 137: a replica the satellite has not reported on (a
+	// diskless witness, or a diskful replica not built yet) would
+	// otherwise reach the wire without a `volumes` key and crash
+	// python-linstor. ensureVolumesForView documents what fills it.
+	annotated = ensureVolumesForView(annotated, rsc, s.placeholderPool(ctx, rsc), vdSizes)
 
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
 	if err != nil {
@@ -224,66 +216,100 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 // crashes the CLI with AttributeError.
 const disklessStorPoolName = "DfltDisklessStorPool"
 
-// ensureVolumesForView returns a non-nil Volume slice for the wire
-// view. Bug 137 follow-up: a nil slice OR a zero-length non-nil slice
-// both serialise as a missing JSON key when the field carries
-// `omitempty` (the initial fix kept the tag and only solved half the
-// case). The wire shape contract is now: `volumes` key always
-// present.
+// ensureVolumesForView returns the wire `volumes` list for one
+// replica: one entry per VolumeDefinition of the parent RD, in
+// volume-number order, the way upstream LINSTOR's view does. LINSTOR
+// creates a replica's Volume objects together with the replica and
+// builds the list from them (Json.apiToResourceWithVolumes), so the
+// list never depends on whether the satellite has reported; only
+// `state` stays unset until it does.
 //
-// We solve the empty-slice case in two tiers:
+// blockstor sources the list from what the satellite observed, which
+// is nothing for a diskless witness and nothing for a diskful
+// replica the satellite has not built yet. Clients index the list by
+// volume number on the strength of the upstream guarantee:
+// linstor-scheduler-extender reads `volumes[0].state.disk_state` of
+// every DRBD replica and panicked on the empty list while a new
+// volume's replicas were still being built. A volume the satellite
+// has not reported is therefore filled in with what the controller
+// knows: its number, its storage pool (LINSTOR's sentinel
+// `DfltDisklessStorPool` on a diskless replica, see
+// disklessStorPoolName) and an empty state.
 //
-//  1. Diskless / TIE_BREAKER replica with no observed Volumes:
-//     synthesise one placeholder per parent-RD VolumeDefinition so
-//     the wire entry has the same volume_number cardinality as a
-//     diskful replica. `storage_pool_name` is stamped with the
-//     upstream-LINSTOR sentinel `DfltDisklessStorPool` (see
-//     disklessStorPoolName) so `linstor n describe` recognises the
-//     row as a diskless witness instead of crashing on
-//     `find_child(...)` returning None.
-//  2. Any other replica that happens to arrive with an empty
-//     Volumes slice (e.g. fresh diskful replica before the
-//     satellite has written Status.Volumes): emit `[]` rather than
-//     omitting the key. Same crash class, just less common.
-//
-// Diskful replicas with already-populated Volumes are passed
-// through verbatim — the placeholder path must not shadow real
-// satellite-observed allocation / disk_state.
-func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) []apiv1.Volume {
-	if len(observed) > 0 {
+// Observed volumes are passed through verbatim, so a placeholder
+// never shadows satellite-reported allocation or disk state. The
+// result is never nil: the `volumes` key is always present (Bug 137).
+// poolFor names a placeholder's pool by volume number and is called
+// only for a volume that gets one.
+func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, poolFor func(int32) string, vdSizes map[int32]int64) []apiv1.Volume {
+	seen := make(map[int32]struct{}, len(observed))
+	for i := range observed {
+		seen[observed[i].VolumeNumber] = struct{}{}
+	}
+
+	missing := make([]int32, 0, len(vdSizes))
+
+	for vn := range vdSizes {
+		if _, ok := seen[vn]; !ok {
+			missing = append(missing, vn)
+		}
+	}
+
+	if len(missing) == 0 {
+		if observed == nil {
+			return []apiv1.Volume{}
+		}
+
 		return observed
 	}
 
+	placeholders := make([]apiv1.Volume, 0, len(missing))
+	for _, vn := range missing {
+		// AllocatedKib stays 0 (the Bug 112 contract: always emit
+		// the key as an int >= 0); nothing is allocated until the
+		// satellite reports.
+		placeholders = append(placeholders, apiv1.Volume{VolumeNumber: vn, StoragePool: poolFor(vn)})
+	}
+
 	if !isDisklessReplica(rsc) {
-		// Empty slice instead of nil so the JSON encoder emits
-		// `[]` not the absent key. Bug 137 wire contract.
-		return []apiv1.Volume{}
+		// An observed diskful volume carries the default
+		// DRBD,STORAGE chain (the k8s store's volumesFromStatus);
+		// the RD's own stack replaces it in buildResourceView.
+		apiv1.ApplyLayerStackToVolumes(placeholders, apiv1.DefaultLayerStack())
 	}
 
-	// Stable iteration over the VD index: map keys are
-	// non-deterministic and the wire order has to be stable across
-	// calls so paginated CLI consumers don't see volume_number
-	// jitter between requests.
-	volNums := make([]int32, 0, len(vdSizes))
-	for vn := range vdSizes {
-		volNums = append(volNums, vn)
-	}
+	out := make([]apiv1.Volume, 0, len(observed)+len(placeholders))
+	out = append(out, observed...)
+	out = append(out, placeholders...)
 
-	slices.Sort(volNums)
-
-	out := make([]apiv1.Volume, 0, len(volNums))
-
-	for _, vn := range volNums {
-		out = append(out, apiv1.Volume{
-			VolumeNumber: vn,
-			StoragePool:  disklessStorPoolName,
-			// AllocatedKib defaults to 0 (the Bug 112 contract:
-			// always emit the key as an int >= 0). Diskless has
-			// no real allocation, so 0 is the truthful value.
-		})
-	}
+	// Stable volume-number order: the VD index is a map, and
+	// paginated CLI consumers must not see volume_number jitter
+	// between requests.
+	slices.SortFunc(out, func(left, right apiv1.Volume) int {
+		return cmp.Compare(left.VolumeNumber, right.VolumeNumber)
+	})
 
 	return out
+}
+
+// placeholderPool returns the pool a placeholder volume of rsc lists,
+// by volume number: LINSTOR's diskless sentinel on a diskless replica,
+// the pool on the replica's spec on a diskful one, and for a diskful
+// replica with no pool on its spec (a restore that read the pool off a
+// deleted source can leave one) what viewPoolResolver resolves. The
+// resolver only runs for a volume that needs a placeholder.
+func (s *Server) placeholderPool(ctx context.Context, rsc *apiv1.Resource) func(int32) string {
+	if isDisklessReplica(rsc) {
+		return func(int32) string { return disklessStorPoolName }
+	}
+
+	if pool := rsc.Props[storPoolPropKey]; pool != "" {
+		return func(int32) string { return pool }
+	}
+
+	resolver := &viewPoolResolver{s: s, rsc: rsc}
+
+	return func(vn int32) string { return resolver.poolFor(ctx, vn) }
 }
 
 // isDisklessReplica reports whether the replica carries a DISKLESS

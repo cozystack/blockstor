@@ -78,6 +78,16 @@ type observation struct {
 	// a recoverable quorum suspend (auto-clears when quorum returns)
 	// from a user-issued or fencing-handler suspend.
 	Suspended string
+	// PromotionScore and MayPromote mirror the resource-frame
+	// `promotion_score:` and `may_promote:` fields. nil when the
+	// frame does not carry them, so the cached value survives.
+	PromotionScore *int32
+	MayPromote     *bool
+	// PromotionScoreInvalid marks a frame whose `promotion_score:`
+	// token is present but unparsable. LINSTOR drops the score
+	// then (DrbdResource.java), so the cached one is cleared rather
+	// than reported as current.
+	PromotionScoreInvalid bool
 	// HasResource marks observations that carry a fresh resource-
 	// kind frame (role transition → InUse, disk transition →
 	// DrbdState). mergeResource only updates its cache from
@@ -279,15 +289,63 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		return observation{}, false
 	}
 
+	score, scoreInvalid := parsePromotionScore(ev.Fields["promotion_score"])
+
 	return observation{
-		ResourceName:    name,
-		InUse:           ev.Fields["role"] == drbdRolePrimary,
-		Role:            ev.Fields["role"],
-		Suspended:       normalizeSuspended(ev.Fields["suspended"]),
-		HasResource:     true,
-		KernelLoaded:    normalizeKernelLoaded(ev.Action),
-		HasKernelLoaded: true,
+		ResourceName:          name,
+		InUse:                 ev.Fields["role"] == drbdRolePrimary,
+		Role:                  ev.Fields["role"],
+		Suspended:             normalizeSuspended(ev.Fields["suspended"]),
+		PromotionScore:        score,
+		PromotionScoreInvalid: scoreInvalid,
+		MayPromote:            parseMayPromote(ev.Fields["may_promote"]),
+		HasResource:           true,
+		KernelLoaded:          normalizeKernelLoaded(ev.Action),
+		HasKernelLoaded:       true,
 	}, true
+}
+
+// parsePromotionScore reads the events2 `promotion_score:` token.
+// An absent token yields (nil, false), which leaves the cached score
+// in place, the way LINSTOR's satellite treats a missing label. A
+// present but unparsable one yields (nil, true): LINSTOR clears the
+// score on it, and so does mergeResource.
+func parsePromotionScore(raw string) (*int32, bool) {
+	if raw == "" {
+		return nil, false
+	}
+
+	score, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil {
+		return nil, true
+	}
+
+	out := int32(score)
+
+	return &out, false
+}
+
+// The two values the kernel writes for `may_promote:`.
+const (
+	mayPromoteYes = "yes"
+	mayPromoteNo  = "no"
+)
+
+// parseMayPromote reads the events2 `may_promote:` token. Absent or
+// any other value yields nil.
+func parseMayPromote(raw string) *bool {
+	var out bool
+
+	switch raw {
+	case mayPromoteYes:
+		out = true
+	case mayPromoteNo:
+		out = false
+	default:
+		return nil
+	}
+
+	return &out
 }
 
 // normalizeKernelLoaded maps an events2 resource-kind verb to the
@@ -810,10 +868,12 @@ type connectionLifecycle struct {
 // without caching the next non-resource event would strip f:role /
 // f:suspended off the observer's owner claim.
 type resourceObservation struct {
-	InUse     bool
-	DrbdState string
-	Role      string
-	Suspended string
+	InUse          bool
+	DrbdState      string
+	Role           string
+	Suspended      string
+	PromotionScore *int32
+	MayPromote     *bool
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -980,10 +1040,36 @@ func (o *ObserverRunnable) snapshotFor(name string) observation {
 		out.DrbdState = r.DrbdState
 		out.Role = r.Role
 		out.Suspended = r.Suspended
+		out.PromotionScore = r.PromotionScore
+		out.MayPromote = r.MayPromote
 	}
 	o.resMu.Unlock()
 
 	return out
+}
+
+// mergePromotion folds a resource frame's promotion tokens into the
+// cache. A frame without them keeps the cached values; a `destroy`
+// frame clears both, because the slot that had the score is gone and
+// LINSTOR drops the volatile state on stream close
+// (ResourceStateEventHandler). Keeping them would leave the view
+// calling a torn-down replica promotable, which hides it from
+// linstor-csi's health check.
+func mergePromotion(cur *resourceObservation, ev *observation) {
+	if ev.HasKernelLoaded && !ev.KernelLoaded {
+		cur.PromotionScore = nil
+		cur.MayPromote = nil
+
+		return
+	}
+
+	if ev.PromotionScore != nil || ev.PromotionScoreInvalid {
+		cur.PromotionScore = ev.PromotionScore
+	}
+
+	if ev.MayPromote != nil {
+		cur.MayPromote = ev.MayPromote
+	}
 }
 
 // mergeResource caches the resource-kind observation (InUse,
@@ -1015,6 +1101,8 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 		cur.InUse = ev.InUse
 		cur.Role = ev.Role
 		cur.Suspended = normalizeSuspended(ev.Suspended)
+
+		mergePromotion(&cur, ev)
 	}
 
 	// DrbdState flows from device-kind events (translateDeviceEvent
@@ -1035,6 +1123,8 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 	ev.DrbdState = cur.DrbdState
 	ev.Role = cur.Role
 	ev.Suspended = cur.Suspended
+	ev.PromotionScore = cur.PromotionScore
+	ev.MayPromote = cur.MayPromote
 }
 
 // handleObservation runs the per-event side-effects: the
@@ -1815,12 +1905,14 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		TypeMeta:   metav1.TypeMeta{Kind: resourceKind, APIVersion: blockstoriov1alpha1.GroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Status: blockstoriov1alpha1.ResourceStatus{
-			InUse:       ev.InUse,
-			DrbdState:   ev.DrbdState,
-			Role:        ev.Role,
-			Suspended:   normalizeSuspended(ev.Suspended),
-			Volumes:     buildObserverVolumeStatus(ev, storagePool),
-			Connections: buildObserverConnectionStatus(ev),
+			InUse:          ev.InUse,
+			DrbdState:      ev.DrbdState,
+			Role:           ev.Role,
+			Suspended:      normalizeSuspended(ev.Suspended),
+			PromotionScore: ev.PromotionScore,
+			MayPromote:     ev.MayPromote,
+			Volumes:        buildObserverVolumeStatus(ev, storagePool),
+			Connections:    buildObserverConnectionStatus(ev),
 		},
 	}
 
