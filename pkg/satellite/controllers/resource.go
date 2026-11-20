@@ -653,7 +653,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, err
 	}
 
-	results, err := r.Config.Apply.Apply(ctx, []*intent.DesiredResource{desired})
+	results, err := r.applyLocked(ctx, desired)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
@@ -736,6 +736,16 @@ func (r *ResourceReconciler) afterApply(
 // volumeDeleteFailedReason is the Event reason for a replica that could not
 // delete the volume of a definition flagged DELETE.
 const volumeDeleteFailedReason = "VolumeDeleteFailed"
+
+// applyLocked runs one apply pass under the resource's ApplyLocks
+// entry, so the startup backfill does not probe the lower disks while
+// this pass may be creating their metadata.
+func (r *ResourceReconciler) applyLocked(ctx context.Context, desired *intent.DesiredResource) ([]*intent.ResourceApplyResult, error) {
+	unlock := r.Config.ApplyLocks.Lock(desired.GetName())
+	defer unlock()
+
+	return r.Config.Apply.Apply(ctx, []*intent.DesiredResource{desired}) //nolint:wrapcheck // the caller wraps it
+}
 
 // prepareDRBDApply runs the DRBD-only pre-apply sequence: stale
 // kernel slot prune (Bug 342 v3) and the controller-allocation wait
