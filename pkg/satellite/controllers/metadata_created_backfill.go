@@ -77,6 +77,14 @@ type MetadataCreatedBackfillRunnable struct {
 	// runnable filters the Resource list to those placed on this
 	// node via `Spec.NodeName == NodeName`.
 	NodeName string
+
+	// Locks keeps the probe off a resource while the reconciler
+	// applies it. HasMD reads a lower disk it cannot open
+	// exclusively as carrying metadata, so a probe beside a pass that
+	// is creating it could stamp an empty volume, and the stamp turns
+	// create-md off for that replica. Shared with the
+	// ResourceReconciler; nil locks nothing.
+	Locks *ResourceLocks
 }
 
 // Start implements manager.Runnable. Single-shot startup pass.
@@ -161,6 +169,9 @@ func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *
 	if !ok {
 		return false
 	}
+
+	unlock := b.Locks.Lock(naming.Key(res.Spec.ResourceDefinitionName))
+	defer unlock()
 
 	// Authoritative kernel-side probe. The Resource may be
 	// pre-create-md or post-tear-down; then HasMD returns false
