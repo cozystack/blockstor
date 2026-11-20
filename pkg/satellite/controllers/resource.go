@@ -143,6 +143,11 @@ type ResourceReconciler struct {
 	client.Client
 
 	Config Config
+
+	// recheck runs the periodic re-checks one at a time. SetupWithManager
+	// sets it and gates Reconcile through it; a test calling Reconcile
+	// directly goes around it.
+	recheck *recheckGate
 }
 
 // Reconcile reads a Resource and drives the satellite-side
@@ -267,18 +272,21 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.recheck = newRecheckGate()
+
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
 			builder.WithPredicates(
 				predicate.And(
 					nodeNamePredicate(r.Config.NodeName),
 					primaryWatchPredicate(),
+					r.recheck.marker(),
 				),
 			)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueLocalSiblings))).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueResourcesForRD))).
 		Named("satellite-resource").
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.resourceWorkers()})
 
@@ -292,11 +300,12 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// builder skips the raw-source registration entirely.
 	if r.Config.ReconcileTrigger != nil {
 		bldr = bldr.WatchesRawSource(
-			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{}),
+			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
+				source.WithPredicates[client.Object, reconcile.Request](r.recheck.marker())),
 		)
 	}
 
-	err := bldr.Complete(r)
+	err := bldr.Complete(r.recheck.gate(r))
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
 	}
