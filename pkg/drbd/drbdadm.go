@@ -19,6 +19,7 @@ limitations under the License.
 package drbd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -2334,6 +2335,70 @@ func (a *Adm) RemoveMinor(ctx context.Context, minor int32) error {
 	}
 
 	return nil
+}
+
+// ResumeQuorumSuspension lifts a quorum suspension that only a volume
+// already taken out of the resource still holds, and reports whether it
+// did.
+//
+// DRBD computes the resource's quorum suspension from every device it has,
+// and only when a state change runs. del-minor turns replication to each
+// peer off before it unregisters the device, so the volume going away ends
+// with no peer: with on-no-quorum suspend-io the whole resource is
+// suspended, then the device is unregistered and nothing recomputes. A
+// peer's later state change clears it; the replica that removes the volume
+// last never sees one, and keeps its remaining volumes' I/O suspended
+// although each of them has quorum.
+//
+// resume-io runs that state change. DRBD recomputes the suspension from the
+// volumes that are left, so a resource that has really lost quorum stays
+// suspended. resume-io also clears a suspend-io a snapshot holds, so a
+// suspension that has any reason besides quorum, or a volume without
+// quorum, is left alone.
+func (a *Adm) ResumeQuorumSuspension(ctx context.Context, resource string) (bool, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		if isResourceNotLoadedErr(err, out) {
+			return false, nil
+		}
+
+		return false, errors.Wrapf(err, "drbdsetup status %s --json", resource)
+	}
+
+	if len(bytes.TrimSpace(out)) == 0 {
+		return false, nil
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil {
+		return false, errors.Wrapf(err, "parse drbdsetup status %s --json", resource)
+	}
+
+	if len(status) == 0 {
+		return false, nil
+	}
+
+	res := status[0]
+	if !res.SuspendedQuorum || res.SuspendedUser || res.SuspendedNoData || res.SuspendedFencing || len(res.Devices) == 0 {
+		return false, nil
+	}
+
+	for _, dev := range res.Devices {
+		if dev.Quorum == nil || !*dev.Quorum {
+			return false, nil
+		}
+	}
+
+	m := strconv.Itoa(int(res.Devices[0].Minor))
+
+	_, err = a.exec.Run(ctx, "drbdsetup", "resume-io", m)
+	if err != nil {
+		return false, errors.Wrapf(err, "drbdsetup resume-io %s", m)
+	}
+
+	return true, nil
 }
 
 // minorDevice is what `drbdsetup status --verbose` says about one minor:
