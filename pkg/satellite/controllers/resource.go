@@ -36,6 +36,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -270,7 +271,8 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
 		Watches(&blockstoriov1alpha1.ResourceGroup{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRG)).
-		Named("satellite-resource")
+		Named("satellite-resource").
+		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.resourceWorkers()})
 
 	// Phase 11.7 second leg: the observer-trigger channel wakes
 	// this reconciler on kernel-state changes that produce no

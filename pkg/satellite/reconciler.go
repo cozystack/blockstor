@@ -1828,7 +1828,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	cloned := false
 
 	for _, vol := range dr.GetVolumes() {
-		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+		provider, ok := r.provider(vol.GetStoragePool())
 		if !ok {
 			return nil, false, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
 		}
@@ -2591,7 +2591,8 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 // startup both remove it.
 const ResFileCandidateSuffix = ".res.tmp"
 
-// installResFile puts body at resPath only once drbdadm accepts it.
+// installResFile puts body at resPath only once drbdadm accepts it, and
+// in one rename.
 //
 // drbdadm parses every .res on the node for any command, so a body it
 // cannot read, such as an option this drbd-utils does not know, would
@@ -2600,7 +2601,10 @@ const ResFileCandidateSuffix = ".res.tmp"
 // name drbdadm does not include, checked with the live file excluded,
 // and renamed into place, so a refused body leaves the previous .res,
 // and every other resource, as it was. The refusal is this resource's
-// error to report.
+// error to report. The satellite applies several resources at once, and
+// the rename also means a drbdadm for another resource sees the old body
+// or the new one, never a half-written file, the way LINSTOR moves its
+// .res_tmp over the .res.
 func (r *Reconciler) installResFile(ctx context.Context, resPath, body string) error {
 	candidate := strings.TrimSuffix(resPath, ".res") + ResFileCandidateSuffix
 
@@ -3309,7 +3313,7 @@ func (r *Reconciler) resizeAssumeClean(dr *intent.DesiredResource) bool {
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
 			continue
 		}
@@ -6291,7 +6295,7 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 		}, true
 	}
 
-	provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+	provider, ok := r.provider(vol.GetStoragePool())
 	if !ok || provider == nil {
 		return drbd.GISeed{}, false
 	}
@@ -6447,7 +6451,7 @@ func (r *Reconciler) poolForResource(name string) (string, storage.Provider, err
 		return "", nil, errors.Errorf("resource %q not known on this satellite", name)
 	}
 
-	provider, ok := r.cfg.Providers[pool]
+	provider, ok := r.provider(pool)
 	if !ok {
 		return "", nil, errors.Errorf("storage pool %q not registered", pool)
 	}

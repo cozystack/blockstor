@@ -136,6 +136,38 @@ func run() int {
 	// gRPC `ApplyStoragePools` fallback).
 	providers := map[string]storage.Provider{}
 
+	restCfg, err := loadRESTConfig()
+	if err != nil {
+		logger.Error("no Kubernetes config", "err", err)
+
+		return 1
+	}
+
+	// Until the manager serves /healthz, answer the liveness probe here:
+	// the wait below can outlast the probe's budget on a node whose
+	// network is still coming up.
+	stopLiveness := startColdStartLiveness(logger, probeAddr)
+
+	// The kernel is shared with whatever else runs DRBD on the node, LINSTOR
+	// during a migration among them, so only a resource blockstor has a
+	// replica of here is blockstor's to take down. The read is retried until
+	// the API server answers or refuses for good; without the answer nothing
+	// is taken down.
+	owned, ownedErr := ownedKernelResources(ctx, logger, restCfg, nodeName)
+	if ctx.Err() != nil {
+		stopLiveness()
+		logger.Info("cold-start: shutting down before the satellite started")
+
+		return 0
+	}
+
+	if ownedErr != nil {
+		logger.Warn("cold-start: cannot read which DRBD resources are blockstor's; leaving the kernel as it is",
+			"err", ownedErr.Error())
+
+		owned = nil
+	}
+
 	// Cold-start kernel reconciliation. ORDER MATTERS and the two
 	// steps share one decision: which kernel resources are *healthy*
 	// (carry recoverable local data or a live peer) and must survive
@@ -153,42 +185,11 @@ func run() int {
 	// (no usable local disk AND no healthy connection) and leave every
 	// UpToDate / SyncTarget / SyncSource / Established / Consistent /
 	// Outdated replica for the reconciler to adjust.
-	healthy := healthyKernelResources(ctx, logger)
-
-	restCfg, err := loadRESTConfig()
-	if err != nil {
-		logger.Error("no Kubernetes config", "err", err)
-
-		return 1
-	}
-
-	// The kernel is shared with whatever else runs DRBD on the node, LINSTOR
-	// during a migration among them, so only a resource blockstor has a
-	// replica of here is blockstor's to take down. A read that fails leaves
-	// that unknown, and then nothing is taken down.
-	owned, ownedErr := ownedKernelResources(ctx, restCfg, nodeName)
-	if ownedErr != nil {
-		logger.Info("cold-start: cannot read which DRBD resources are blockstor's; leaving the kernel as it is",
-			"err", ownedErr.Error())
-
-		owned = nil
-	}
-
-	// Tear down only the kernel resources that are NOT in the healthy
-	// set. Without this, a reconcile that re-allocates a node-id
-	// (e.g. the dispatcher picked a different id after a peer joined /
-	// left) would hit "peer node id cannot be my own node id" on a
-	// genuinely orphaned slot — but a live replica's node-id is
-	// reconciled by `drbdadm adjust`, not by a destructive down.
-	cleanKernelState(ctx, logger, healthy, owned)
-
-	// Wipe stale .res files, but PRESERVE the ones backing a healthy
-	// kernel resource. The c-r reconciler re-renders every Resource
-	// CRD on this node shortly after startup, but a surviving kernel
-	// resource needs its .res in place until that first render so an
-	// interim `drbdadm adjust` has something to read. Orphan .res
-	// files (no matching live kernel resource) are still wiped.
-	cleanStateDir(stateDir, healthy, logger)
+	//
+	// Probed after the owned list, which can take a while on a node whose
+	// network is still coming up, so the decision is made on the kernel as
+	// it is now.
+	coldStartCleanup(ctx, logger, stateDir, owned, healthyKernelResources)
 
 	// readyState gates the /readyz probe: not-ready until the
 	// controller-runtime manager's cache has completed its initial
@@ -205,7 +206,7 @@ func run() int {
 		LocalAddress:           localAddress,
 		Logger:                 logger,
 		RESTConfig:             restCfg,
-		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace, streamTLS),
+		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace, streamTLS, opts.resourceWorkers),
 		HealthProbeBindAddress: probeAddr,
 		StreamTLS:              streamTLS,
 		OnCacheSynced: func() {
@@ -219,6 +220,8 @@ func run() int {
 		"state_dir", stateDir,
 		"local_address", localAddress,
 		"health_probe_addr", probeAddr)
+
+	stopLiveness()
 
 	err = agent.Run(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -255,7 +258,7 @@ func loadRESTConfig() (*rest.Config, error) {
 // satellite.ManagerFactory signature.
 func mgrFactory(
 	ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier,
-	controllerNamespace string, streamTLS stream.TLSFiles,
+	controllerNamespace string, streamTLS stream.TLSFiles, resourceWorkers int,
 ) satellite.ManagerFactory {
 	return func(restCfg *rest.Config, nodeName, probeAddr string, rec *satellite.Reconciler) (manager.Manager, error) {
 		mgr, err := controllers.NewManager(restCfg, &controllers.Config{
@@ -271,8 +274,9 @@ func mgrFactory(
 			// Optional: nil when `uevent.New` failed at startup —
 			// PhysicalDeviceDiscoveryRunnable falls back to pure-
 			// polling discovery.
-			UeventListener: ueventListener,
-			StreamTLS:      streamTLS,
+			UeventListener:  ueventListener,
+			StreamTLS:       streamTLS,
+			ResourceWorkers: resourceWorkers,
 		})
 		if err != nil {
 			return nil, err //nolint:wrapcheck // controllers.NewManager already wraps
@@ -534,22 +538,23 @@ func listKernelResources(ctx context.Context) ([]string, error) {
 // because the per-resource probe is a local kernel call that does not
 // fail in practice, and the alternative (assume-healthy-on-error) would
 // let real orphans survive forever, reproducing Bug 285.
-func healthyKernelResources(ctx context.Context, logger *slog.Logger) map[string]struct{} {
+//
+// Failing to list the kernel's resources at all is returned instead: it
+// says nothing about any of them, and the caller then cleans nothing.
+func healthyKernelResources(ctx context.Context, logger *slog.Logger) (map[string]struct{}, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	names, err := listKernelResources(ctx)
 	if err != nil {
-		logger.Info("cold-start health probe: drbdsetup status (best-effort)", "err", err.Error())
-
-		return nil
+		return nil, errors.Wrap(err, "list the kernel's DRBD resources")
 	}
 
 	if len(names) == 0 {
-		return nil
+		return map[string]struct{}{}, nil
 	}
 
-	return classifyKernelResources(ctx, logger, names, resourceIsHealthy)
+	return classifyKernelResources(ctx, logger, names, resourceIsHealthy), nil
 }
 
 // classifyKernelResources runs probe over names and returns the ones to keep.
