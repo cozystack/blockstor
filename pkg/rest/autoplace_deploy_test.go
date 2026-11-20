@@ -226,6 +226,29 @@ func TestAutoplaceWarnsWhenReplicaIsNotBuiltInTime(t *testing.T) {
 	}
 }
 
+// TestBuildBoundKeepsNotConnectedWarnings pins that a build that
+// outlasts its bound still answers every replica LINSTOR's
+// updateSatellites could not reach, deployed by this call or not, next
+// to the not-ready warning for the replica that was not built.
+func TestBuildBoundKeepsNotConnectedWarnings(t *testing.T) {
+	shortenReadyPoll(t)
+
+	st := store.NewInMemory()
+	seedReadyWaitDefinition(t, st, "rd", "n1")
+	seedReadyWaitNode(t, st, "n2", apiv1.NodeTypeOffline)
+	seedReplica(t, st, "rd", "n2", false, nil)
+	seedReplica(t, st, "rd", "n1", false, nil)
+
+	srv := &Server{Store: st, ResourceReadyWait: 10 * time.Second, ResourceDeployWait: 300 * time.Millisecond}
+
+	rcs := srv.waitDeployedReplicasReady(t.Context(), "rd", []string{"n1"})
+
+	w := warningsFor(rcs)
+	if len(w) != 2 || w["n1"] != maskWarn || w["n2"] != warnNotConnected {
+		t.Errorf("want not-ready for n1 and not-connected for n2, got %v (%+v)", w, rcs)
+	}
+}
+
 // TestReplicaBuilt pins what counts as built: a device path on every
 // defined volume, for a diskless replica as for a diskful one. A
 // diskless replica's disk state alone is not enough: linstor-csi reads

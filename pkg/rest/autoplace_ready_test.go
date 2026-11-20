@@ -523,6 +523,28 @@ func TestWaitDeployedReplicasFollowsLinstorPredicate(t *testing.T) {
 			warn: warnNotConnected,
 		},
 		{
+			name: "single replica on a node that is not ONLINE gets the not-connected warning",
+			seed: func(t *testing.T, st store.Store) {
+				t.Helper()
+				seedReadyWaitDefinition(t, st, "rd")
+				seedReadyWaitNode(t, st, "n2", apiv1.NodeTypeOffline)
+				seedReplica(t, st, "rd", "n2", false, nil)
+			},
+			warn: warnNotConnected,
+		},
+		{
+			name: "replica without DRBD on a node that is not ONLINE gets the not-connected warning",
+			seed: func(t *testing.T, st store.Store) {
+				t.Helper()
+				seedReadyWaitDefinition(t, st, "rd", "n1")
+				seedReadyWaitNode(t, st, "n2", apiv1.NodeTypeOffline)
+				setLayerStack(t, st, "rd", apiv1.LayerKindStorage)
+				seedReplica(t, st, "rd", "n1", true, nil)
+				seedReplica(t, st, "rd", "n2", false, nil)
+			},
+			warn: warnNotConnected,
+		},
+		{
 			name: "deployed diskless replica is awaited",
 			seed: func(t *testing.T, st store.Store) {
 				t.Helper()

@@ -57,6 +57,13 @@ const warnNotConnected = maskWarn | int64(1002)
 // LINSTOR v1.33.1's CtrlRscCrtApiHelper.deployResources does, in two
 // steps.
 //
+// Every replica of the definition on a node that is not ONLINE gets
+// LINSTOR's not-connected warning, whatever the layers or the replica
+// count, as updateSatellites gives it for each satellite it cannot
+// reach; neither step waits for such a replica. A deployed replica on
+// such a node is warned once, where LINSTOR may warn it again from
+// waitResourcesReady.
+//
 // First it waits, up to s.ResourceDeployWait, until the satellites
 // have built every replica this call deployed (waitDeployedReplicasBuilt),
 // as LINSTOR's updateSatellites waits for each satellite to answer the
@@ -71,8 +78,7 @@ const warnNotConnected = maskWarn | int64(1002)
 //     has no volume, every replica is diskless, the definition has a
 //     single replica, or its layer stack has no DRBD;
 //   - a deployed replica, diskful or diskless, is awaited unless it is
-//     INACTIVE; one on a node that is not ONLINE is answered with
-//     LINSTOR's not-connected warning instead of being awaited;
+//     INACTIVE or on a node that is not ONLINE;
 //   - ready is ResourceState.isReady: every volume reaches UpToDate
 //     data, locally or through a connected UpToDate peer, and the
 //     replica is connected to every diskful DRBD peer on an ONLINE node.
@@ -90,9 +96,11 @@ func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, d
 		return nil
 	}
 
+	notConnected := notConnectedWarnings(s.replicasNotConnected(ctx, rdName))
+
 	volumes := s.definitionVolumeSizes(ctx, rdName)
 	if len(volumes) == 0 {
-		return nil
+		return notConnected
 	}
 
 	unbuilt, done := s.waitDeployedReplicasBuilt(ctx, rdName, deployed, volumes)
@@ -101,27 +109,27 @@ func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, d
 	}
 
 	if len(unbuilt) > 0 {
-		return notReadyWarnings(unbuilt)
+		return append(notConnected, notReadyWarnings(unbuilt)...)
 	}
 
 	if !s.definitionHasDRBD(ctx, rdName) {
-		return nil
+		return notConnected
 	}
 
 	deadline := time.Now().Add(s.ResourceReadyWait)
 
 	for {
-		notConnected, pending, err := s.deployedReplicasNotReady(ctx, rdName, deployed, volumes)
+		pending, err := s.deployedReplicasNotReady(ctx, rdName, deployed, volumes)
 		if err != nil {
-			return nil
+			return notConnected
 		}
 
 		if len(pending) == 0 {
-			return notConnectedWarnings(notConnected)
+			return notConnected
 		}
 
 		if !time.Now().Before(deadline) {
-			return append(notConnectedWarnings(notConnected), notReadyWarnings(pending)...)
+			return append(notConnected, notReadyWarnings(pending)...)
 		}
 
 		select {
@@ -173,8 +181,8 @@ func (s *Server) waitDeployedReplicasBuilt(ctx context.Context, rdName string, d
 
 // deployedReplicasNotBuilt lists the deployed replicas of rdName whose
 // satellite has not built them yet. A replica on a node that is not
-// ONLINE is left to the ready step, which answers it with LINSTOR's
-// not-connected warning, and an INACTIVE replica is never built.
+// ONLINE has been answered with the not-connected warning instead, and
+// an INACTIVE replica is never built.
 func (s *Server) deployedReplicasNotBuilt(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, error) {
 	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
@@ -231,20 +239,49 @@ func (s *Server) definitionHasDRBD(ctx context.Context, rdName string) bool {
 	return apiv1.LayerInStack(s.resolveAutoplaceLayerStack(ctx, &rd), apiv1.LayerKindDRBD)
 }
 
-// deployedReplicasNotReady splits the deployed replicas of rdName that
-// LINSTOR would wait for into those on a node that is not ONLINE and
-// those that are not ready yet.
-func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, []string, error) {
+// replicasNotConnected lists the nodes, in order, of the replicas of
+// rdName whose satellite is not ONLINE: those LINSTOR's updateSatellites
+// cannot reach and answers with the not-connected warning. A replica on
+// an EVICTED node is left out, as updateSatellites skips it.
+func (s *Server) replicasNotConnected(ctx context.Context, rdName string) []string {
 	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "list replicas")
+		return nil
+	}
+
+	var out []string
+
+	for i := range replicas {
+		node, err := s.Store.Nodes().Get(ctx, replicas[i].NodeName)
+		if err != nil || slices.Contains(node.Flags, apiv1.NodeFlagEvicted) {
+			continue
+		}
+
+		if node.ConnectionStatus != apiv1.NodeTypeOnline {
+			out = append(out, replicas[i].NodeName)
+		}
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// deployedReplicasNotReady lists the deployed replicas of rdName that
+// LINSTOR would wait for and that are not ready yet. A replica on a
+// node that is not ONLINE is not waited for: it has been answered with
+// the not-connected warning.
+func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, error) {
+	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return nil, errors.Wrap(err, "list replicas")
 	}
 
 	if len(replicas) <= 1 || allReplicasDiskless(replicas) {
 		// The first replica has no peer to connect to, and an
 		// all-diskless definition has no data to reach: LINSTOR
 		// does not wait for either.
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	byNode := make(map[string]*apiv1.Resource, len(replicas))
@@ -258,17 +295,11 @@ func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, de
 
 	peers := onlineDiskfulPeers(replicas, online)
 
-	var notConnected, pending []string
+	var pending []string
 
 	for _, node := range deployed {
 		rsc, ok := byNode[naming.Key(node)]
-		if !ok || slices.Contains(rsc.Flags, apiv1.ResourceFlagInactive) {
-			continue
-		}
-
-		if !online[naming.Key(node)] {
-			notConnected = append(notConnected, rsc.NodeName)
-
+		if !ok || slices.Contains(rsc.Flags, apiv1.ResourceFlagInactive) || !online[naming.Key(node)] {
 			continue
 		}
 
@@ -277,7 +308,7 @@ func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, de
 		}
 	}
 
-	return notConnected, pending, nil
+	return pending, nil
 }
 
 // nodeIsOnline reports whether the satellite on nodeName is ONLINE,
