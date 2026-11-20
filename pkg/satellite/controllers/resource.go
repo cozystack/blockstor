@@ -278,6 +278,8 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
+		Watches(&blockstoriov1alpha1.ResourceGroup{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRG)).
 		Named("satellite-resource")
 
 	// Phase 11.7 second leg: the observer-trigger channel wakes
@@ -428,6 +430,37 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 	}
 
 	return nil
+}
+
+// enqueueResourcesForRG maps a ResourceGroup event to the local
+// Resources whose definition is in that group. A group's props and its
+// volume groups' props reach the .res (Resolve, VolumeDiskOptions), so
+// `linstor rg sp` or `linstor vg sp`, block-size on a volume group say,
+// has to re-render the replicas it applies to rather than wait for an
+// unrelated reconcile to pick it up.
+func (r *ResourceReconciler) enqueueResourcesForRG(ctx context.Context, obj client.Object) []reconcile.Request {
+	rg, ok := obj.(*blockstoriov1alpha1.ResourceGroup)
+	if !ok {
+		return nil
+	}
+
+	var rdList blockstoriov1alpha1.ResourceDefinitionList
+
+	err := r.List(ctx, &rdList)
+	if err != nil {
+		return nil
+	}
+
+	var reqs []reconcile.Request
+
+	for i := range rdList.Items {
+		rd := &rdList.Items[i]
+		if rd.Spec.ResourceGroupName != "" && naming.Same(rd.Spec.ResourceGroupName, rg.Name) {
+			reqs = append(reqs, r.enqueueResourcesForRD(ctx, rd)...)
+		}
+	}
+
+	return reqs
 }
 
 // runApply gates on the controller-side allocation, builds the
@@ -1170,6 +1203,15 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 	dropPlaintextPassphraseProps(ctx, rd, effectiveProps)
 
 	desired := dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps)
+
+	volumeDisk, err := effectiveprops.VolumeDiskOptions(ctx, r.Client, target, rd, effectiveProps)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve volume disk options")
+	}
+
+	for _, vol := range desired.Volumes {
+		vol.DiskOptions = volumeDisk[vol.VolumeNumber]
+	}
 
 	// Phase 11.3 Stage 1: carry the `MetadataCreated=True` Status
 	// Condition from the Resource CRD into the apply chain so the

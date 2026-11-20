@@ -320,6 +320,16 @@ func cleanStateDir(dir string, healthy map[string]struct{}, logger *slog.Logger)
 		}
 
 		name := entry.Name()
+
+		// A candidate .res is only ever mid-render, and no render
+		// runs before this, so one still here was left by a crash
+		// between write and rename. No resource needs it.
+		if strings.HasSuffix(name, satellite.ResFileCandidateSuffix) {
+			removeStateFile(filepath.Join(dir, name), logger)
+
+			continue
+		}
+
 		if !strings.HasSuffix(name, ".res") {
 			// Leave global_common.conf and any operator-supplied
 			// non-rendered files alone.
@@ -347,6 +357,15 @@ func cleanStateDir(dir string, healthy map[string]struct{}, logger *slog.Logger)
 
 	if removed > 0 {
 		logger.Info("wiped stale .res files on startup", "dir", dir, "removed", removed)
+	}
+}
+
+// removeStateFile removes one leftover state-dir file, logging a
+// failure rather than stopping the startup over it.
+func removeStateFile(path string, logger *slog.Logger) {
+	err := os.Remove(path)
+	if err != nil {
+		logger.Warn("clean state-dir entry", "path", path, "err", err)
 	}
 }
 
