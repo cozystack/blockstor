@@ -79,3 +79,45 @@ func serveColdStartLiveness(logger *slog.Logger, lis net.Listener) (func(), net.
 
 	return stop, lis.Addr()
 }
+
+// coldStartCleanup takes down blockstor's orphaned kernel resources and the
+// .res files nothing in the kernel uses any more. owned is nil when it is
+// not known which resources are blockstor's; the kernel is then left alone.
+//
+// Both steps work from one probe of which kernel resources are healthy. A
+// probe that did not finish says nothing about them, and reading it as "none
+// is healthy" would delete the .res of every live resource, which a DRBD
+// handler such as before-resync-target needs. So when the probe fails, or a
+// shutdown arrives before the cleanup starts, nothing is cleaned.
+func coldStartCleanup(
+	ctx context.Context, logger *slog.Logger, stateDir string, owned map[string]struct{},
+	probe func(context.Context, *slog.Logger) (map[string]struct{}, error),
+) {
+	healthy, err := probe(ctx, logger)
+	if err != nil {
+		logger.Warn("cold-start: cannot tell which DRBD resources are healthy; leaving the kernel and the .res files as they are",
+			"err", err.Error())
+
+		return
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Tear down only the kernel resources that are NOT in the healthy
+	// set. Without this, a reconcile that re-allocates a node-id
+	// (e.g. the dispatcher picked a different id after a peer joined /
+	// left) would hit "peer node id cannot be my own node id" on a
+	// genuinely orphaned slot — but a live replica's node-id is
+	// reconciled by `drbdadm adjust`, not by a destructive down.
+	cleanKernelState(ctx, logger, healthy, owned)
+
+	// Wipe stale .res files, but PRESERVE the ones backing a healthy
+	// kernel resource. The c-r reconciler re-renders every Resource
+	// CRD on this node shortly after startup, but a surviving kernel
+	// resource needs its .res in place until that first render so an
+	// interim `drbdadm adjust` has something to read. Orphan .res
+	// files (no matching live kernel resource) are still wiped.
+	cleanStateDir(stateDir, healthy, logger)
+}

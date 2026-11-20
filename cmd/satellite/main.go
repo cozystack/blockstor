@@ -154,6 +154,13 @@ func run() int {
 	// the API server answers or refuses for good; without the answer nothing
 	// is taken down.
 	owned, ownedErr := ownedKernelResources(ctx, logger, restCfg, nodeName)
+	if ctx.Err() != nil {
+		stopLiveness()
+		logger.Info("cold-start: shutting down before the satellite started")
+
+		return 0
+	}
+
 	if ownedErr != nil {
 		logger.Warn("cold-start: cannot read which DRBD resources are blockstor's; leaving the kernel as it is",
 			"err", ownedErr.Error())
@@ -180,25 +187,9 @@ func run() int {
 	// Outdated replica for the reconciler to adjust.
 	//
 	// Probed after the owned list, which can take a while on a node whose
-	// network is still coming up, so the decision below is made on the
-	// kernel as it is now.
-	healthy := healthyKernelResources(ctx, logger)
-
-	// Tear down only the kernel resources that are NOT in the healthy
-	// set. Without this, a reconcile that re-allocates a node-id
-	// (e.g. the dispatcher picked a different id after a peer joined /
-	// left) would hit "peer node id cannot be my own node id" on a
-	// genuinely orphaned slot — but a live replica's node-id is
-	// reconciled by `drbdadm adjust`, not by a destructive down.
-	cleanKernelState(ctx, logger, healthy, owned)
-
-	// Wipe stale .res files, but PRESERVE the ones backing a healthy
-	// kernel resource. The c-r reconciler re-renders every Resource
-	// CRD on this node shortly after startup, but a surviving kernel
-	// resource needs its .res in place until that first render so an
-	// interim `drbdadm adjust` has something to read. Orphan .res
-	// files (no matching live kernel resource) are still wiped.
-	cleanStateDir(stateDir, healthy, logger)
+	// network is still coming up, so the decision is made on the kernel as
+	// it is now.
+	coldStartCleanup(ctx, logger, stateDir, owned, healthyKernelResources)
 
 	// readyState gates the /readyz probe: not-ready until the
 	// controller-runtime manager's cache has completed its initial
@@ -528,22 +519,23 @@ func listKernelResources(ctx context.Context) ([]string, error) {
 // because the per-resource probe is a local kernel call that does not
 // fail in practice, and the alternative (assume-healthy-on-error) would
 // let real orphans survive forever, reproducing Bug 285.
-func healthyKernelResources(ctx context.Context, logger *slog.Logger) map[string]struct{} {
+//
+// Failing to list the kernel's resources at all is returned instead: it
+// says nothing about any of them, and the caller then cleans nothing.
+func healthyKernelResources(ctx context.Context, logger *slog.Logger) (map[string]struct{}, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	names, err := listKernelResources(ctx)
 	if err != nil {
-		logger.Info("cold-start health probe: drbdsetup status (best-effort)", "err", err.Error())
-
-		return nil
+		return nil, errors.Wrap(err, "list the kernel's DRBD resources")
 	}
 
 	if len(names) == 0 {
-		return nil
+		return map[string]struct{}{}, nil
 	}
 
-	return classifyKernelResources(ctx, logger, names, resourceIsHealthy)
+	return classifyKernelResources(ctx, logger, names, resourceIsHealthy), nil
 }
 
 // classifyKernelResources runs probe over names and returns the ones to keep.

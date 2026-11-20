@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -144,4 +146,86 @@ func probe(t *testing.T, url string) int {
 	_ = resp.Body.Close()
 
 	return resp.StatusCode
+}
+
+var errStatusFailed = errors.New("drbdsetup status: signal: killed")
+
+// writeRes puts a .res for each name into a fresh state dir.
+func writeRes(t *testing.T, names ...string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(dir, name+".res"), []byte("resource "+name+" {}\n"), 0o600); err != nil {
+			t.Fatalf("write %s.res: %v", name, err)
+		}
+	}
+
+	return dir
+}
+
+func resLeft(dir, name string) bool {
+	_, err := os.Stat(filepath.Join(dir, name+".res"))
+
+	return err == nil
+}
+
+// A health probe that did not finish says nothing about the kernel. Read as
+// "nothing is healthy" it deleted the .res of every live resource, which a
+// DRBD handler needs, and a SIGTERM during the cold start ends the probe
+// exactly that way.
+func TestColdStartCleansNothingWhenTheHealthProbeFails(t *testing.T) {
+	t.Parallel()
+
+	dir := writeRes(t, "pvc-live")
+	failed := func(context.Context, *slog.Logger) (map[string]struct{}, error) {
+		return nil, errStatusFailed
+	}
+
+	coldStartCleanup(t.Context(), slog.New(slog.DiscardHandler), dir, nil, failed)
+
+	if !resLeft(dir, "pvc-live") {
+		t.Error("a failed health probe deleted the .res of a live resource")
+	}
+}
+
+// A shutdown that arrives once the probe has answered stops the cleanup too.
+func TestColdStartCleansNothingOnShutdown(t *testing.T) {
+	t.Parallel()
+
+	dir := writeRes(t, "pvc-live")
+	ctx, cancel := context.WithCancel(t.Context())
+
+	shutDown := func(context.Context, *slog.Logger) (map[string]struct{}, error) {
+		cancel()
+
+		return map[string]struct{}{}, nil
+	}
+
+	coldStartCleanup(ctx, slog.New(slog.DiscardHandler), dir, nil, shutDown)
+
+	if !resLeft(dir, "pvc-live") {
+		t.Error("a shutdown during the cold start deleted the .res of a live resource")
+	}
+}
+
+// The positive control: an empty kernel, as after a reboot, leaves no .res
+// worth keeping, and a healthy resource keeps its own.
+func TestColdStartCleansStaleResFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := writeRes(t, "pvc-live", "pvc-stale")
+	probed := func(context.Context, *slog.Logger) (map[string]struct{}, error) {
+		return map[string]struct{}{"pvc-live": {}}, nil
+	}
+
+	coldStartCleanup(t.Context(), slog.New(slog.DiscardHandler), dir, nil, probed)
+
+	if !resLeft(dir, "pvc-live") {
+		t.Error("the .res of a healthy resource was deleted")
+	}
+
+	if resLeft(dir, "pvc-stale") {
+		t.Error("a stale .res was kept")
+	}
 }
