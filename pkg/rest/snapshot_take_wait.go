@@ -52,6 +52,12 @@ const SnapshotTakeWait = 150 * time.Second
 // The read is served by the informer cache, so it costs no API round trip.
 const snapshotTakePollInterval = 100 * time.Millisecond
 
+// snapshotUnseenConfirmPolls is how many reads in a row may miss a snapshot
+// the cache never showed before the wait asks the API server whether it is
+// there at all. The cache trails a create by far less, so only a snapshot
+// deleted before the cache caught up pays for that read.
+const snapshotUnseenConfirmPolls = 10
+
 // snapshotRef names one snapshot a create wrote.
 type snapshotRef struct {
 	rd   string
@@ -94,7 +100,7 @@ func (s *Server) waitSnapshotsSettled(ctx context.Context, refs []snapshotRef) m
 	defer ticker.Stop()
 
 	pending := slices.Clone(refs)
-	seen := make(map[snapshotRef]bool, len(refs))
+	seen := make(map[snapshotRef]int, len(refs))
 	outcomes := make(map[snapshotRef]takeOutcome, len(refs))
 
 	for {
@@ -124,18 +130,38 @@ func (s *Server) waitSnapshotsSettled(ctx context.Context, refs []snapshotRef) m
 // snapshotTakeOutcome reads how the take of ref ended: SUCCESSFUL, a
 // failure flag, or a delete. A snapshot the read cannot find yet is open
 // until it has been seen once, since the cache may trail the create; gone
-// after that, it was deleted. A failing read leaves it open.
-func (s *Server) snapshotTakeOutcome(ctx context.Context, ref snapshotRef, seen map[snapshotRef]bool) takeOutcome {
+// after that, it was deleted. One the cache keeps missing without ever
+// showing it is looked up on the API server, where the create is already
+// visible: a delete that landed before the cache caught up is otherwise
+// waited on until the bound. A failing read leaves it open.
+//
+// seen counts each ref's misses before its first sighting, and goes
+// negative once the ref has been seen.
+func (s *Server) snapshotTakeOutcome(ctx context.Context, ref snapshotRef, seen map[snapshotRef]int) takeOutcome {
 	snap, err := s.Store.Snapshots().Get(ctx, ref.rd, ref.name)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) && seen[ref] {
+		if !errors.Is(err, store.ErrNotFound) {
+			return takeOutcome{end: takeOpen}
+		}
+
+		if seen[ref] < 0 {
+			return takeOutcome{end: takeDeleted}
+		}
+
+		seen[ref]++
+		if seen[ref]%snapshotUnseenConfirmPolls != 0 {
+			return takeOutcome{end: takeOpen}
+		}
+
+		_, err = store.UncachedSnapshot(ctx, s.Store, ref.rd, ref.name)
+		if errors.Is(err, store.ErrNotFound) {
 			return takeOutcome{end: takeDeleted}
 		}
 
 		return takeOutcome{end: takeOpen}
 	}
 
-	seen[ref] = true
+	seen[ref] = -1
 
 	// SUCCESSFUL first: a take that committed is over even if a failure
 	// marker trails it. The served flags drop SUCCESSFUL once a delete

@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -343,6 +344,15 @@ type trailingCacheSnapshots struct {
 	store.SnapshotStore
 
 	created time.Time
+
+	// uncachedReads counts the reads that went to the API server.
+	uncachedReads atomic.Int32
+}
+
+func (l *trailingCacheSnapshots) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+	l.uncachedReads.Add(1)
+
+	return l.SnapshotStore.ListByDefinitionUncached(ctx, rdName) //nolint:wrapcheck // pass-through test double
 }
 
 func (l *trailingCacheSnapshots) Create(ctx context.Context, snap *apiv1.Snapshot) error {
@@ -374,6 +384,11 @@ func TestSnapshotCreateWaitsOutACacheThatTrailsTheCreate(t *testing.T) {
 	if flags := viewFlags(t, base); !slices.Contains(flags, apiv1.SnapshotFlagSuccessful) {
 		t.Errorf("view right after the create: flags %v, want SUCCESSFUL", flags)
 	}
+
+	// A lag this short is waited out from the cache alone.
+	if reads := st.snaps.uncachedReads.Load(); reads != 0 {
+		t.Errorf("the wait read the API server %d times for a cache that trailed by %v", reads, takeDelay)
+	}
 }
 
 // TestSnapshotCreateMultiAnswersARefusalAtOnce: a batch with a refused
@@ -397,5 +412,44 @@ func TestSnapshotCreateMultiAnswersARefusalAtOnce(t *testing.T) {
 
 	if !hasErrorRc(answer.rcs, "pvc-missing") {
 		t.Errorf("want the refusal in the answer, got %+v", answer.rcs)
+	}
+}
+
+// blindCacheSnapshots never shows a snapshot to Get, a cache that has not
+// caught up with the create when the snapshot is already gone again.
+type blindCacheSnapshots struct {
+	store.SnapshotStore
+}
+
+func (blindCacheSnapshots) Get(context.Context, string, string) (apiv1.Snapshot, error) {
+	return apiv1.Snapshot{}, store.ErrNotFound
+}
+
+type blindCacheStore struct {
+	store.Store
+}
+
+func (b blindCacheStore) Snapshots() store.SnapshotStore {
+	return blindCacheSnapshots{SnapshotStore: b.Store.Snapshots()}
+}
+
+// TestSnapshotCreateEndsTheWaitForASnapshotGoneBeforeTheCacheSawIt: a
+// create and a delete inside the cache's lag leave a snapshot the wait
+// never sees. The API server says it is gone, so the wait ends then
+// rather than at its bound.
+func TestSnapshotCreateEndsTheWaitForASnapshotGoneBeforeTheCacheSawIt(t *testing.T) {
+	t.Parallel()
+
+	inner := store.NewInMemory()
+	base := startTakeWaitServer(t, blindCacheStore{Store: inner}, 10*time.Second)
+	settleAfterTake(t, inner, "")
+
+	answer := postSnap1(t, base, multiCreatePath)
+	if answer.elapsed > 5*time.Second {
+		t.Errorf("create answered after %v, want soon after the delete (~%v)", answer.elapsed, takeDelay)
+	}
+
+	if !hasErrorRc(answer.rcs, "deleted before its take ended") {
+		t.Errorf("want the delete in the answer, got %+v", answer.rcs)
 	}
 }
