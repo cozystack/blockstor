@@ -448,7 +448,7 @@ func (s *Server) adoptPreparedRestoreTarget(
 
 	prepared, err := store.PreparedRestoreTarget(ctx, s.Store, &existing, snap)
 	if err != nil {
-		writePreparedTargetRefusal(w, existing.Name, snap, err)
+		writePreparedTargetRefusal(w, existing.Name, err)
 
 		return false, true
 	}
@@ -472,7 +472,7 @@ func (s *Server) adoptPreparedRestoreTarget(
 	}
 
 	if err != nil {
-		writePreparedTargetRefusal(w, existing.Name, snap, err)
+		writePreparedTargetRefusal(w, existing.Name, err)
 
 		return false, true
 	}
@@ -484,22 +484,10 @@ func (s *Server) adoptPreparedRestoreTarget(
 }
 
 // writePreparedTargetRefusal answers a target that is prepared in every
-// respect but one that makes restoring into it wrong; see
+// respect but its replicas still being deleted; see
 // store.PreparedRestoreTarget. Anything else is the store error it is.
-func writePreparedTargetRefusal(w http.ResponseWriter, rdName string, snap *apiv1.Snapshot, err error) {
+func writePreparedTargetRefusal(w http.ResponseWriter, rdName string, err error) {
 	switch {
-	case errors.Is(err, store.ErrRestoreTargetLayers):
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
-			Message: "resource definition '" + rdName + "' cannot take the restore of '" +
-				snap.Name + "': " + scrubImplDetails(err.Error()),
-			Cause: "the restore puts the source's data under the target's layer stack, so a " +
-				"layer the source did not have writes its own metadata across it, and one it " +
-				"had is missing on read",
-			Correc: "create '" + rdName + "' with the layer stack of '" + snap.ResourceName +
-				"' (for linstor-csi, a StorageClass with the same layer list), or restore under " +
-				"a name that does not exist yet",
-		}})
 	case errors.Is(err, store.ErrRestoreTargetTearingDown):
 		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
 			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,

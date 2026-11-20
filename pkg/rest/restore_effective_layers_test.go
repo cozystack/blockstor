@@ -400,46 +400,54 @@ func seedPreparedTarget(t *testing.T, st store.Store, srcName, snapName, rdName,
 	}
 }
 
-// A prepared target stored without a stack under a group that sets one waits
-// for the controller to decide it: 503, and no marker goes on. Pinned to the
-// group's LUKS stack, as a target with nothing on it is, it is refused against
-// a plaintext source; one the operator gave the source's stack is restored
-// into and keeps it.
-func TestSnapshotRestoreIntoAnUndecidedPreparedTargetWaits(t *testing.T) {
+// linstor-csi restores a VolumeSnapshot into a PVC of another StorageClass by
+// creating the definition in that class's group, restoring the volume
+// definitions and then the resource onto one snapshot node; Velero's data
+// mover does exactly that, into a storage-only class, for every backup of a
+// replicated volume. LINSTOR builds the restored resource from the snapshot's
+// layer data, so the copy comes up under the source's stack whatever the
+// class asks for, and the same request is accepted here: the target is given
+// the source's stack and its replica placed, never refused over the stack it
+// was created with.
+func TestSnapshotRestoreIntoAPreparedTargetOfAnotherStack(t *testing.T) {
 	t.Parallel()
 
-	st := store.NewInMemory()
-	seedDeployedCloneSource(t, st, "src-prep")
-	seedRestoreSnapshot(t, st, "src-prep", "snap-prep", []string{"node-a"})
-	seedLayeredGroup(t, st, "grp-sc", luksStack())
-	seedPreparedTarget(t, st, "src-prep", "snap-prep", "pvc-prep", "grp-sc", nil)
+	for _, tc := range []struct {
+		name  string
+		group []string
+		stack []string
+	}{
+		{"storage-only class", []string{"STORAGE"}, []string{"STORAGE"}},
+		{"LUKS class", luksStack(), luksStack()},
+		{"undecided stack", luksStack(), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	base, stop := startServerWithStore(t, st)
-	defer stop()
+			st := store.NewInMemory()
+			seedDeployedCloneSource(t, st, "src-prep")
+			seedRestoreSnapshot(t, st, "src-prep", "snap-prep", []string{"node-a"})
+			seedLayeredGroup(t, st, "grp-sc", tc.group)
+			seedPreparedTarget(t, st, "src-prep", "snap-prep", "pvc-prep", "grp-sc", tc.stack)
 
-	body := map[string]any{"to_resource": "pvc-prep", "nodes": []string{"node-a"}}
+			base, stop := startServerWithStore(t, st)
+			defer stop()
 
-	if code := restoreOnce(t, base, "src-prep", "snap-prep", body); code != http.StatusServiceUnavailable {
-		t.Fatalf("restore into an undecided prepared target = %d, want 503", code)
+			body := map[string]any{"to_resource": "pvc-prep", "nodes": []string{"node-a"}}
+
+			if code := restoreOnce(t, base, "src-prep", "snap-prep", body); code != http.StatusCreated {
+				t.Fatalf("restore into a prepared target of another stack = %d, want 201", code)
+			}
+
+			assertStack(t, st, "pvc-prep", apiv1.DefaultLayerStack())
+
+			if _, err := st.Resources().Get(t.Context(), "pvc-prep", "node-a"); err != nil {
+				t.Errorf("the restored replica on node-a: %v", err)
+			}
+
+			if marker := readRD(t, st, "pvc-prep").Props[store.RestoreFromSnapshotProp]; marker == "" {
+				t.Error("the restored target carries no restore marker")
+			}
+		})
 	}
-
-	if marker := readRD(t, st, "pvc-prep").Props[store.RestoreFromSnapshotProp]; marker != "" {
-		t.Errorf("the refused restore left marker %q on the target", marker)
-	}
-
-	assertStack(t, st, "pvc-prep", nil)
-
-	reshapeRD(t, st, "pvc-prep", "grp-sc", luksStack(), nil)
-
-	if code := restoreOnce(t, base, "src-prep", "snap-prep", body); code != http.StatusConflict {
-		t.Errorf("restore of a plaintext source into a LUKS target = %d, want 409", code)
-	}
-
-	reshapeRD(t, st, "pvc-prep", "grp-sc", apiv1.DefaultLayerStack(), nil)
-
-	if code := restoreOnce(t, base, "src-prep", "snap-prep", body); code != http.StatusCreated {
-		t.Fatalf("restore into a target of the source's stack = %d, want 201", code)
-	}
-
-	assertStack(t, st, "pvc-prep", apiv1.DefaultLayerStack())
 }
