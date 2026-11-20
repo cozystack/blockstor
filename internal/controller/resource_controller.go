@@ -26,14 +26,18 @@ import (
 	"sync"
 
 	cerrors "github.com/cockroachdb/errors"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -2109,13 +2113,65 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&blockstoriov1alpha1.Resource{}).
+		For(&blockstoriov1alpha1.Resource{},
+			builder.WithPredicates(resourceChangedPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings)).
+			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings),
+			builder.WithPredicates(resourceChangedPredicate())).
 		Named("resource").
 		Complete(r)
+}
+
+// resourceChangedPredicate drops a Resource update that changed
+// nothing but the write bookkeeping: the resource version and the
+// managed-fields entries.
+//
+// Satellites apply their status with server-side apply, and an apply
+// that leaves every value as it was can still move a field manager's
+// entry and so produce a write. On an idle cluster with a hundred or
+// so replicas per node that is several writes a second, and each one
+// reached this single-worker reconciler three times over: once
+// through For and once per sibling. A new Resource then waited behind
+// the whole set of replicas before it got its DRBD identities, which
+// the satellites need before they can build it.
+//
+// Only an update whose objects are otherwise equal is dropped; any
+// change to spec, status, labels, annotations, finalizers or the
+// deletion timestamp still passes.
+func resourceChangedPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return resourceUpdateCarriesChange(e.ObjectOld, e.ObjectNew)
+		},
+	}
+}
+
+// resourceUpdateCarriesChange reports whether the new object differs
+// from the old one in anything besides the resource version and the
+// managed fields. An object of an unexpected type counts as changed,
+// and so does the informer's periodic resync, which delivers the same
+// revision twice and is meant to reach the reconciler.
+func resourceUpdateCarriesChange(oldObj, newObj client.Object) bool {
+	oldRes, okOld := oldObj.(*blockstoriov1alpha1.Resource)
+	newRes, okNew := newObj.(*blockstoriov1alpha1.Resource)
+
+	if !okOld || !okNew || oldRes == nil || newRes == nil {
+		return true
+	}
+
+	if oldRes.ResourceVersion == newRes.ResourceVersion {
+		return true
+	}
+
+	left := oldRes.DeepCopy()
+	right := newRes.DeepCopy()
+
+	left.ResourceVersion, right.ResourceVersion = "", ""
+	left.ManagedFields, right.ManagedFields = nil, nil
+
+	return !equality.Semantic.DeepEqual(left, right)
 }
 
 // rdAllocMu returns the per-RD allocation mutex, lazily creating
