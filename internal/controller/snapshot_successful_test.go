@@ -148,10 +148,60 @@ func TestSnapshotControllerRecordsSuccessfulAfterTheResume(t *testing.T) {
 		t.Fatalf("SUCCESSFUL recorded while I/O was still suspended")
 	}
 
+	clearSuspendAcks(t, cli, snap.Name)
 	reconcileSnapshot(t, r, snap.Name)
 
 	if !isMarkedSuccessful(t, cli, snap.Name) {
 		t.Errorf("SUCCESSFUL not recorded once I/O resumed")
+	}
+}
+
+// LINSTOR sets SUCCESSFUL only after every satellite answered the resume.
+// The controller clearing Spec.SuspendIO is the order to resume, not the
+// resume: a satellite whose resume-io fails keeps its acknowledgment and
+// retries, its volume still frozen, and the snapshot is not SUCCESSFUL
+// until that node confirms.
+func TestSnapshotControllerWaitsForEveryNodeToConfirmTheResume(t *testing.T) {
+	t.Parallel()
+
+	snap := completedSnapshot("snap-1", []string{"n1", "n2"},
+		blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "n1", Ready: true, CreateTimestamp: 1},
+		blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "n2", Ready: true, CreateTimestamp: 2, SuspendIOAcked: true},
+	)
+
+	r, cli := successfulFixture(t, snap)
+
+	reconcileSnapshot(t, r, snap.Name)
+
+	if isMarkedSuccessful(t, cli, snap.Name) {
+		t.Fatalf("SUCCESSFUL recorded while n2 had not confirmed the resume")
+	}
+
+	got := getSnap(t, cli, snap.Name)
+	if got.Spec.SuspendIO || got.Spec.TakeSnapshot {
+		t.Fatalf("waiting for the resume restarted the orchestration: %+v", got.Spec)
+	}
+
+	clearSuspendAcks(t, cli, snap.Name)
+	reconcileSnapshot(t, r, snap.Name)
+
+	if !isMarkedSuccessful(t, cli, snap.Name) {
+		t.Errorf("SUCCESSFUL not recorded once every node confirmed the resume")
+	}
+}
+
+// clearSuspendAcks writes what each satellite writes once its resume-io
+// succeeded.
+func clearSuspendAcks(t *testing.T, cli client.Client, name string) {
+	t.Helper()
+
+	snap := getSnap(t, cli, name)
+	for i := range snap.Status.NodeStatus {
+		snap.Status.NodeStatus[i].SuspendIOAcked = false
+	}
+
+	if err := cli.Status().Update(context.Background(), snap); err != nil {
+		t.Fatalf("clear suspend acks on %s: %v", name, err)
 	}
 }
 

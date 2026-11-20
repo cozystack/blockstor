@@ -163,7 +163,8 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
-	// The take is over on every node and I/O is resumed: record that
+	// The take is over on every node and every node confirmed the
+	// resume: record that
 	// on the Snapshot itself, as LINSTOR persists SUCCESSFUL on the
 	// snapshot definition. The record is what every reader trusts
 	// later, when the source replicas it was taken from may be gone.
@@ -252,8 +253,10 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 
 // takeCompleted reports whether the orchestration of the batch has
 // finished successfully: every sibling's every targeted node took its
-// snapshot and every sibling has resumed I/O. LINSTOR marks the
-// snapshot definitions SUCCESSFUL at the same point, after the resume.
+// snapshot and has confirmed the resume. LINSTOR marks the snapshot
+// definitions SUCCESSFUL only once every satellite answered the
+// resume update; clearing Spec.SuspendIO is only the order, and a
+// node whose resume-io keeps failing is still frozen.
 // A failed node never gets here: the abort path runs first.
 func takeCompleted(siblings []blockstoriov1alpha1.Snapshot) bool {
 	for i := range siblings {
@@ -262,7 +265,7 @@ func takeCompleted(siblings []blockstoriov1alpha1.Snapshot) bool {
 		}
 	}
 
-	return allSiblingsReady(siblings)
+	return allSiblingsReady(siblings) && allSiblingsSuspendCleared(siblings)
 }
 
 // withSuccessfulFlag adds SUCCESSFUL to a Snapshot's status flags.
