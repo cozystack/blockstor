@@ -39,13 +39,17 @@ import (
 // after a failed step runs, since deleting storage DRBD still holds is the
 // one thing this must never try. Every step is idempotent, so the retry
 // starts over.
+//
+// Once the volumes are out of DRBD, a quorum suspension that only they held
+// is lifted, so the replica that removes a volume last does not keep the
+// volumes that stay suspended.
 func (r *Reconciler) DeleteVolumes(ctx context.Context, req *intent.DeleteVolumesRequest) error {
-	for _, vol := range req.Volumes {
-		err := r.removeVolumeMinor(ctx, req.Name, vol)
-		if err != nil {
-			return err
-		}
+	err := r.removeVolumeMinors(ctx, req)
+	if err != nil {
+		return err
+	}
 
+	for _, vol := range req.Volumes {
 		if r.cfg.Cryptsetup != nil {
 			// Best effort, as in DeleteResource: a mapper that was never
 			// opened is the common case, and one that is still open makes
@@ -74,6 +78,43 @@ func (r *Reconciler) DeleteVolumes(ctx context.Context, req *intent.DeleteVolume
 		if err != nil {
 			return errors.Wrapf(err, "delete volume %s/%d", req.Name, vol.VolumeNumber)
 		}
+	}
+
+	return nil
+}
+
+// removeVolumeMinors takes every requested volume out of DRBD, then
+// resumes the resource's I/O if a volume's removal left it suspended on
+// quorum alone.
+func (r *Reconciler) removeVolumeMinors(ctx context.Context, req *intent.DeleteVolumesRequest) error {
+	withDRBD := false
+
+	for _, vol := range req.Volumes {
+		err := r.removeVolumeMinor(ctx, req.Name, vol)
+		if err != nil {
+			return err
+		}
+
+		withDRBD = withDRBD || vol.Minor != nil
+	}
+
+	if r.cfg.Adm == nil || !withDRBD {
+		return nil
+	}
+
+	return r.resumeVolumeQuorumSuspension(ctx, req.Name)
+}
+
+// resumeVolumeQuorumSuspension lifts the quorum suspension a removed volume
+// left behind (see drbd.Adm.ResumeQuorumSuspension), holding suspendMu so
+// a snapshot cannot suspend the resource between the check and the resume.
+func (r *Reconciler) resumeVolumeQuorumSuspension(ctx context.Context, name string) error {
+	r.suspendMu.Lock()
+	defer r.suspendMu.Unlock()
+
+	_, err := r.cfg.Adm.ResumeQuorumSuspension(ctx, name)
+	if err != nil {
+		return errors.Wrapf(err, "resume the I/O of %s after its volumes were removed", name)
 	}
 
 	return nil

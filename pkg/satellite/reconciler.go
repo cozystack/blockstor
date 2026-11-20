@@ -290,6 +290,11 @@ type Reconciler struct {
 	mu             sync.Mutex
 	resourceToPool map[string]string
 
+	// suspendMu keeps a snapshot's suspend-io from landing between the
+	// status read and the resume-io of resumeVolumeQuorumSuspension,
+	// whose resume-io would lift the snapshot's suspension too.
+	suspendMu sync.Mutex
+
 	// seenStuckAt is the in-memory debounce table for the Bug 342
 	// v3 proactive kernel cleanup (Pass 3 stuck-slot probe). Keyed
 	// by "<rd>/<peerName>"; value is the first wall-clock time the
@@ -628,6 +633,9 @@ func (r *Reconciler) SuspendResource(ctx context.Context, resName string) error 
 	if r.cfg.Adm == nil {
 		return nil
 	}
+
+	r.suspendMu.Lock()
+	defer r.suspendMu.Unlock()
 
 	err := r.cfg.Adm.SuspendIO(ctx, resName)
 	if err != nil {
