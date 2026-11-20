@@ -1159,4 +1159,19 @@ func testGroupGAutoSnapshotPeriodicTick(t *testing.T, stack *harness.Stack) {
 	if updated.Annotations[controller.AnnotationAutoSnapshotLastAt] == "" {
 		t.Errorf("AnnotationAutoSnapshotLastAt unset after first tick; runnable would re-fire on next pass")
 	}
+
+	// LINSTOR takes an auto-snapshot through the same suspend, take and
+	// resume as any other, on every diskful replica, and marks it
+	// SUCCESSFUL, which linstor-csi waits for before restoring from it.
+	key := types.NamespacedName{Name: rdName + "." + wantFirstSnapName}
+
+	if nodes := getSnapshotCRD(t, stack, key).Spec.Nodes; len(nodes) != len(harness.FixtureNodes()) {
+		t.Fatalf("auto-snapshot targets nodes %v, want every replica's node %v", nodes, harness.FixtureNodes())
+	}
+
+	driveSnapshotTake(t, stack, key)
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		return slices.Contains(restSnapshotFlags(t, stack, rdName, wantFirstSnapName), "SUCCESSFUL")
+	}, "auto-snapshot not served SUCCESSFUL after a completed take")
 }

@@ -21,8 +21,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -34,6 +36,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -260,9 +264,22 @@ func (r *AutoSnapshotRunnable) processRD(
 		return errors.Wrap(err, "parse NextAutoId")
 	}
 
+	nodes, skip, err := r.autoSnapshotNodes(ctx, rd)
+	if err != nil {
+		return err
+	}
+
+	if skip != "" {
+		// Nothing is booked, so the next tick tries again.
+		log.FromContext(ctx).WithName("auto-snapshot").Info("skipping auto-snapshot",
+			"rd", rd.Name, "reason", skip)
+
+		return r.pruneOldAutoSnapshots(ctx, rd)
+	}
+
 	snapName := formatAutoSnapshotName(id)
 
-	err = r.createAutoSnapshot(ctx, rd, snapName)
+	err = r.createAutoSnapshot(ctx, rd, snapName, nodes)
 	if err != nil {
 		return errors.Wrapf(err, "create auto-snapshot %q", snapName)
 	}
@@ -281,6 +298,84 @@ func (r *AutoSnapshotRunnable) processRD(
 	return r.pruneOldAutoSnapshots(ctx, rd)
 }
 
+// autoSnapshotNodes returns the nodes an auto-snapshot of rd is taken
+// on: every node with an active diskful replica, the set a REST create
+// defaults an empty node list to. The orchestration targets exactly
+// these nodes and records SUCCESSFUL once each took its snapshot;
+// with no node listed it never starts, and linstor-csi waits on the
+// snapshot forever.
+//
+// skip is non-empty when no auto-snapshot should be taken this tick,
+// as in LINSTOR's createAutoSnapshotInTransaction: a node of a replica
+// is offline, where a take could only freeze I/O on the reachable
+// replicas until the deadline aborts it, or no replica can take one.
+func (r *AutoSnapshotRunnable) autoSnapshotNodes(
+	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
+) ([]string, string, error) {
+	var resList blockstoriov1alpha1.ResourceList
+
+	err := r.Client.List(ctx, &resList)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "list Resources")
+	}
+
+	var nodes, offline []string
+
+	for i := range resList.Items {
+		res := &resList.Items[i]
+		if !naming.Same(res.Spec.ResourceDefinitionName, rd.Name) {
+			continue
+		}
+
+		down, nodeErr := r.nodeOffline(ctx, res.Spec.NodeName)
+		if nodeErr != nil {
+			return nil, "", nodeErr
+		}
+
+		if down {
+			offline = append(offline, res.Spec.NodeName)
+		}
+
+		if slices.Contains(res.Spec.Flags, apiv1.ResourceFlagDiskless) ||
+			slices.Contains(res.Spec.Flags, apiv1.ResourceFlagInactive) {
+			continue
+		}
+
+		nodes = append(nodes, res.Spec.NodeName)
+	}
+
+	switch {
+	case len(offline) > 0:
+		sort.Strings(offline)
+
+		return nil, "node(s) " + strings.Join(offline, ", ") + " offline", nil
+	case len(nodes) == 0:
+		return nil, "no active diskful replica", nil
+	}
+
+	sort.Strings(nodes)
+
+	return nodes, "", nil
+}
+
+// nodeOffline reports whether the heartbeat watchdog marked the node
+// OFFLINE. A node with no record is not taken for offline, the same
+// call the REST create makes.
+func (r *AutoSnapshotRunnable) nodeOffline(ctx context.Context, name string) (bool, error) {
+	var node blockstoriov1alpha1.Node
+
+	err := r.Client.Get(ctx, client.ObjectKey{Name: naming.Key(name)}, &node)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, errors.Wrapf(err, "get Node %q", name)
+	}
+
+	return isNodeOffline(&node), nil
+}
+
 // createAutoSnapshot constructs the Snapshot CRD with the
 // `LabelAutoSnapshot=true` marker so the prune step can find it.
 // Idempotent: an `IsAlreadyExists` from kube-apiserver is treated as
@@ -290,6 +385,7 @@ func (r *AutoSnapshotRunnable) createAutoSnapshot(
 	ctx context.Context,
 	rd *blockstoriov1alpha1.ResourceDefinition,
 	snapName string,
+	nodes []string,
 ) error {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
@@ -303,21 +399,11 @@ func (r *AutoSnapshotRunnable) createAutoSnapshot(
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: rd.Name,
 			SnapshotName:           snapName,
-			// Nodes intentionally empty: the REST shim's
-			// hydrateSnapshotFromRD path defaults this to "every
-			// diskful replica" — but we go through a direct CRD
-			// create here (no REST round-trip), so the satellite
-			// reconciler needs an explicit node list. Leave the
-			// resolution to the satellite-side fan-out via the
-			// SnapshotReconciler's intent dispatch — see
-			// pkg/satellite/controllers/snapshot.go. If Spec.Nodes
-			// is empty the per-node predicate filters everyone out
-			// and the snapshot stays Incomplete; auto-snapshot's
-			// invariant is "best-effort on diskful replicas", and a
-			// later iteration may inline the listDiskfulNodes
-			// query, but for the W05 cycle pin we leave the
-			// semantic minimal — the e2e suite (out of scope here)
-			// verifies the diskful-replica selection.
+			Nodes:                  nodes,
+			// Created suspended, as the REST create stamps a
+			// single snapshot: the take starts at once and the
+			// suspend deadline runs from creation.
+			SuspendIO:         true,
 			VolumeDefinitions: volumeRefsFromRD(rd),
 		},
 	}
