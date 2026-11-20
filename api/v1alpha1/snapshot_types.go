@@ -221,6 +221,13 @@ const AnnotationSnapshotAdopted = "blockstor.org/adopted"
 // snapshot age instead of the adoption time.
 const AnnotationSnapshotAdoptedCreatedAt = "blockstor.org/adopted-created-at"
 
+// AnnotationSnapshotAbortReason carries the same record as
+// Spec.AbortReason, written by the same update. A writer that predates
+// the field drops it from the spec it writes back, and an API server
+// still serving the older CRD prunes it, but both keep metadata
+// annotations; the controller trusts either copy.
+const AnnotationSnapshotAbortReason = "blockstor.org/abort-reason"
+
 // SnapshotStatusFlagFailed is stamped on Status.Flags by the
 // satellite reconciler when CreateSnapshot returned a terminal
 // error (e.g. parent volume missing, unknown resource, source

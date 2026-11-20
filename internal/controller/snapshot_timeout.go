@@ -253,8 +253,8 @@ func (r *SnapshotReconciler) stampSnapshotFailure(
 // a snapshot aborted before Spec.AbortReason existed.
 func groupAbortReason(siblings []blockstoriov1alpha1.Snapshot) (string, bool) {
 	for i := range siblings {
-		if siblings[i].Spec.AbortReason != "" {
-			return siblings[i].Spec.AbortReason, true
+		if reason := recordedAbortReason(&siblings[i]); reason != "" {
+			return reason, true
 		}
 	}
 

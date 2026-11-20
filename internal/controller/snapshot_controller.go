@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -306,8 +307,8 @@ func (r *SnapshotReconciler) markSnapshotSuccessful(
 		}
 
 		// The pass may have decided on an older view of the snapshot
-		// than the abort that is now on record.
-		if current.Spec.AbortReason != "" {
+		// than the abort that is now on record, in any of its copies.
+		if abortRecorded(&current) {
 			return nil
 		}
 
@@ -798,6 +799,12 @@ func (r *SnapshotReconciler) writeSpecFlags(
 
 		if record {
 			current.Spec.AbortReason = abortReason
+
+			if current.Annotations == nil {
+				current.Annotations = map[string]string{}
+			}
+
+			current.Annotations[blockstoriov1alpha1.AnnotationSnapshotAbortReason] = abortReason
 		}
 
 		return r.Update(ctx, &current)
@@ -811,16 +818,50 @@ func (r *SnapshotReconciler) writeSpecFlags(
 
 // needsAbortRecord reports whether an abort with the given reason
 // still has to be recorded on snap: there is a reason, no abort is on
-// record yet, and the take did not already succeed.
+// record yet in either copy, and the take did not already succeed. One
+// copy is enough: rewriting the spec copy an older CRD keeps pruning
+// would loop an Update on every pass.
 func needsAbortRecord(snap *blockstoriov1alpha1.Snapshot, abortReason string) bool {
-	return abortReason != "" && snap.Spec.AbortReason == "" &&
+	return abortReason != "" && !abortRecorded(snap) &&
 		!slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful)
+}
+
+// recordedAbortReason is the abort on record for snap: Spec.AbortReason,
+// the annotation copy that survives a writer or CRD that drops the
+// field, or the SnapshotComplete=False condition the status stamp of an
+// abort sets, which no spec write touches.
+func recordedAbortReason(snap *blockstoriov1alpha1.Snapshot) string {
+	if snap.Spec.AbortReason != "" {
+		return snap.Spec.AbortReason
+	}
+
+	if reason := snap.Annotations[blockstoriov1alpha1.AnnotationSnapshotAbortReason]; reason != "" {
+		return reason
+	}
+
+	for i := range snap.Status.Conditions {
+		cond := &snap.Status.Conditions[i]
+		if cond.Type == blockstoriov1alpha1.SnapshotStatusConditionType && cond.Status == metav1.ConditionFalse {
+			if cond.Message != "" {
+				return cond.Message
+			}
+
+			return "snapshot aborted"
+		}
+	}
+
+	return ""
+}
+
+// abortRecorded reports whether an abort of snap is on record.
+func abortRecorded(snap *blockstoriov1alpha1.Snapshot) bool {
+	return recordedAbortReason(snap) != ""
 }
 
 // takeEnded reports whether a Snapshot's take is over for good: the
 // controller recorded an abort, or its status carries an outcome.
 func takeEnded(snap *blockstoriov1alpha1.Snapshot) bool {
-	return snap.Spec.AbortReason != "" || slices.ContainsFunc(snap.Status.Flags, isSnapshotOutcomeFlag)
+	return abortRecorded(snap) || slices.ContainsFunc(snap.Status.Flags, isSnapshotOutcomeFlag)
 }
 
 // allNodesSuspendAcked reports whether every targeted node has
