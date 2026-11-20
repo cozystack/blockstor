@@ -2024,12 +2024,7 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 	}
 
 	if copyProps {
-		var err error
-
-		scope, err = loadRestoreScope(ctx, s.Store, rdName)
-		if err != nil {
-			return err
-		}
+		scope = loadRestoreScope(ctx, s.Store, rdName)
 	}
 
 	for i := range snap.VolumeDefinitions {
@@ -2136,13 +2131,23 @@ type restoreScope struct {
 	ctrlProps map[string]string
 }
 
-func loadRestoreScope(ctx context.Context, st store.Store, rdName string) (*restoreScope, error) {
+// loadRestoreScope reads the levels above the restored volumes. It is
+// best effort: a level that cannot be read is left out, which can only
+// make the restore write the 512 it wrote before the switch was read
+// there, and a hiccup in a read that decides that much must not undo a
+// restore that otherwise worked.
+func loadRestoreScope(ctx context.Context, st store.Store, rdName string) *restoreScope {
+	logger := log.FromContext(ctx)
+	scope := &restoreScope{}
+
 	rd, err := st.ResourceDefinitions().Get(ctx, rdName)
 	if err != nil {
-		return nil, err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+		logger.Info("restore: target definition unreadable for auto-block-size; leaving it out", "rd", rdName, "err", err.Error())
+
+		return scope
 	}
 
-	scope := &restoreScope{rdProps: rd.Props}
+	scope.rdProps = rd.Props
 
 	if rd.ResourceGroupName != "" {
 		rg, rgErr := st.ResourceGroups().Get(ctx, rd.ResourceGroupName)
@@ -2151,16 +2156,17 @@ func loadRestoreScope(ctx context.Context, st store.Store, rdName string) (*rest
 		case rgErr == nil:
 			scope.rg = &rg
 		case !errors.Is(rgErr, store.ErrNotFound):
-			return nil, rgErr //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+			logger.Info("restore: resource group unreadable for auto-block-size; leaving it out",
+				"rd", rdName, "rg", rd.ResourceGroupName, "err", rgErr.Error())
 		}
 	}
 
 	scope.ctrlProps, err = st.ControllerProps().Get(ctx)
 	if err != nil {
-		return nil, err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+		logger.Info("restore: controller props unreadable for auto-block-size; leaving them out", "rd", rdName, "err", err.Error())
 	}
 
-	return scope, nil
+	return scope
 }
 
 // levels lists the scope's levels for one volume, closest first, in
