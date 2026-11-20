@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -59,7 +61,8 @@ func ownedKernelResources(ctx context.Context, logger *slog.Logger, cfg *rest.Co
 	return waitOwnedOnNode(ctx, logger, c, nodeName, defaultOwnedRetry())
 }
 
-// waitOwnedOnNode reads the owned list until a read succeeds or ctx ends.
+// waitOwnedOnNode reads the owned list until a read succeeds, the API server
+// refuses it for good, or ctx ends.
 //
 // A satellite that starts with the node often runs before the node can reach
 // the API server's service address. Giving up on the first failure left the
@@ -86,6 +89,10 @@ func waitOwnedOnNode(
 			return owned, nil
 		}
 
+		if permanentAPIError(err) {
+			return nil, errors.Wrap(err, "read the owned list")
+		}
+
 		logger.Warn("cold-start: cannot read which DRBD resources are blockstor's yet; retrying",
 			"attempt", attempt, "retry_in", pause.String(), "err", err.Error())
 
@@ -97,6 +104,15 @@ func waitOwnedOnNode(
 
 		pause = min(2*pause, retry.longest)
 	}
+}
+
+// permanentAPIError reports an answer from the API server that waiting will
+// not change: the satellite is not allowed to list Resources, which an RBAC
+// rule behind an upgrade causes, or the Resource kind is not installed. The
+// satellite then starts without the owned list, as it did before it waited,
+// rather than never starting.
+func permanentAPIError(err error) bool {
+	return apierrors.IsForbidden(err) || apierrors.IsNotFound(err) || meta.IsNoMatchError(err)
 }
 
 // ownedOnNode is ownedKernelResources over a given client.

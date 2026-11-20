@@ -143,14 +143,19 @@ func run() int {
 		return 1
 	}
 
+	// Until the manager serves /healthz, answer the liveness probe here:
+	// the wait below can outlast the probe's budget on a node whose
+	// network is still coming up.
+	stopLiveness := startColdStartLiveness(logger, probeAddr)
+
 	// The kernel is shared with whatever else runs DRBD on the node, LINSTOR
 	// during a migration among them, so only a resource blockstor has a
 	// replica of here is blockstor's to take down. The read is retried until
-	// the API server answers; only a shutdown in the meantime leaves that
-	// unknown, and then nothing is taken down.
+	// the API server answers or refuses for good; without the answer nothing
+	// is taken down.
 	owned, ownedErr := ownedKernelResources(ctx, logger, restCfg, nodeName)
 	if ownedErr != nil {
-		logger.Info("cold-start: cannot read which DRBD resources are blockstor's; leaving the kernel as it is",
+		logger.Warn("cold-start: cannot read which DRBD resources are blockstor's; leaving the kernel as it is",
 			"err", ownedErr.Error())
 
 		owned = nil
@@ -224,6 +229,8 @@ func run() int {
 		"state_dir", stateDir,
 		"local_address", localAddress,
 		"health_probe_addr", probeAddr)
+
+	stopLiveness()
 
 	err = agent.Run(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) {
