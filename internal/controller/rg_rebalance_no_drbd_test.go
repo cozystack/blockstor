@@ -223,14 +223,12 @@ func TestRGEventSkipsDefinitionWithoutDRBD(t *testing.T) {
 	}
 }
 
-// TestRGModifyWithBalancingOffPlacesChildWithoutDRBD: an `rg modify`
-// that raised the place count still places on a storage-only child with
-// `BalanceResourcesEnabled` off, since neither the balance task nor the
-// RG event path ever places on one, so the rebalance reconciler must
-// place it before it strips the annotation, in whichever order the two
-// run. The DRBD child stays with the RG event path, which honours the
-// switch, so the kill switch keeps holding for it.
-func TestRGModifyWithBalancingOffPlacesChildWithoutDRBD(t *testing.T) {
+// TestRGModifyPlacesEveryChildWithBalancingOff: `BalanceResourcesEnabled`
+// switches off LINSTOR's balance task, not an explicit `rg modify`,
+// which autoplaces every child whatever its stack. Each child ends up
+// with its replica, in whichever order the RG event and the rebalance
+// reconciler run.
+func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
 	t.Parallel()
 
 	type reconciler interface {
@@ -281,7 +279,7 @@ func TestRGModifyWithBalancingOffPlacesChildWithoutDRBD(t *testing.T) {
 				}
 			}
 
-			for rd, want := range map[string]int{"pvc-local": 1, "pvc-drbd": 0} {
+			for rd, want := range map[string]int{"pvc-local": 1, "pvc-drbd": 1} {
 				if n := replicasOf(t, ctx, st, rd); n != want {
 					t.Errorf("rg modify with balancing off placed %d replicas on %q, want %d", n, rd, want)
 				}
@@ -299,11 +297,12 @@ func TestRGModifyWithBalancingOffPlacesChildWithoutDRBD(t *testing.T) {
 	}
 }
 
-// TestRGRebalanceDisabledLeavesDRBDChildToRGEvent pins the split: with
-// balancing off the rebalance reconciler places only the children the
-// RG event path leaves out, so the kill switch still holds for the
-// balance task on a DRBD definition.
-func TestRGRebalanceDisabledLeavesDRBDChildToRGEvent(t *testing.T) {
+// TestRGRebalanceDisabledPlacesDRBDChildItself: with balancing off the
+// rebalance reconciler places the explicit modify on a DRBD child too,
+// without the RG event path. Leaving that child to the RG event path
+// made the placement depend on a path LINSTOR does not place from, and
+// that path may make the balance checks and skip it.
+func TestRGRebalanceDisabledPlacesDRBDChildItself(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -312,7 +311,8 @@ func TestRGRebalanceDisabledLeavesDRBDChildToRGEvent(t *testing.T) {
 	st := store.NewInMemory()
 
 	seedNoDRBDRebalance(t, ctx, st, nil, nil, map[string]string{
-		apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
+		apiv1.AnnotationRGRebalancePending:    "2026-05-14T00:00:00Z",
+		apiv1.AnnotationRGRebalancePlaceCount: "2026-05-14T00:00:00Z",
 	})
 
 	if err := st.ControllerProps().Set(ctx, map[string]string{
@@ -327,7 +327,7 @@ func TestRGRebalanceDisabledLeavesDRBDChildToRGEvent(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	if n := replicasOf(t, ctx, st, "pvc-local"); n != 0 {
-		t.Errorf("disabled rebalance placed %d replicas on a DRBD definition, want 0", n)
+	if n := replicasOf(t, ctx, st, "pvc-local"); n != 1 {
+		t.Errorf("rg modify with balancing off placed %d replicas on a DRBD definition, want 1", n)
 	}
 }
