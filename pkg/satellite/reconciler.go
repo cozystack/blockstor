@@ -941,8 +941,9 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		// "No valid meta data found". `.owned` (Bug 432) is the
 		// sweeper's ownership marker — must be removed AFTER the
 		// kernel slot is gone so a concurrent sweeper tick sees a
-		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned"} {
+		// clean post-state (kernel + marker both absent). The .res
+		// candidate is there only when a crash cut a write short.
+		for _, suffix := range []string{".res", ResFileCandidateSuffix, ".md-created", ".mkfs.done", ".owned"} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{

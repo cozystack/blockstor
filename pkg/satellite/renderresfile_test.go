@@ -194,3 +194,24 @@ func TestRenderResFileReplacesTheFileWhole(t *testing.T) {
 		t.Errorf("candidate left behind: %v", leftovers)
 	}
 }
+
+// A crash between writing the candidate and renaming it leaves the
+// candidate behind. Deleting the resource takes it along with the .res, so
+// nothing of a deleted resource stays in the state dir.
+func TestDeleteResourceRemovesALeftoverCandidate(t *testing.T) {
+	rec := uncleanReconciler(t)
+
+	candidate := filepath.Join(rec.cfg.StateDir, "pvc-unclean"+ResFileCandidateSuffix)
+	if err := os.WriteFile(candidate, []byte("resource pvc-unclean {}\n"), 0o600); err != nil {
+		t.Fatalf("write the candidate: %v", err)
+	}
+
+	resp, err := rec.DeleteResource(context.Background(), &intent.DeleteResourceRequest{Name: "pvc-unclean"})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteResource: %v, %+v", err, resp)
+	}
+
+	if _, err := os.Stat(candidate); !os.IsNotExist(err) {
+		t.Errorf("the deleted resource left %s behind (stat: %v)", filepath.Base(candidate), err)
+	}
+}
