@@ -180,3 +180,55 @@ func TestFreezeAndRelease(t *testing.T) {
 		t.Fatalf("Release left %v", props)
 	}
 }
+
+// TestCanChange pins LINSTOR's canChangeMinIoSize.
+func TestCanChange(t *testing.T) {
+	t.Parallel()
+
+	frozen := []map[string]string{{blocksize.PropFreeze: "True"}}
+
+	for _, tc := range []struct {
+		name                  string
+		placed, auto, primary bool
+		vds                   []map[string]string
+		want                  bool
+	}{
+		{name: "unplaced", auto: false, primary: true, vds: frozen, want: true},
+		{name: "placed-auto", placed: true, auto: true, want: true},
+		{name: "placed-auto-off", placed: true},
+		{name: "placed-primary", placed: true, auto: true, primary: true},
+		{name: "placed-frozen", placed: true, auto: true, vds: frozen},
+	} {
+		if got := blocksize.CanChange(tc.placed, tc.auto, tc.primary, tc.vds); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestFloor pins LINSTOR's getFloorVolumesMinIoSize.
+func TestFloor(t *testing.T) {
+	t.Parallel()
+
+	sized := func(v string) map[string]string { return map[string]string{blocksize.PropBlockSize: v} }
+
+	for _, tc := range []struct {
+		name                  string
+		placed, special, auto bool
+		vds                   []map[string]string
+		want                  int64
+		has                   bool
+	}{
+		{name: "unplaced", auto: true, vds: []map[string]string{sized("4096")}},
+		{name: "special", placed: true, special: true, want: 4096, has: true},
+		{name: "auto-lowest", placed: true, auto: true, vds: []map[string]string{sized("4096"), sized("512")}, want: 512, has: true},
+		{name: "auto-unset-is-default", placed: true, auto: true, vds: []map[string]string{sized("4096"), nil}, want: 512, has: true},
+		{name: "auto-all-4096", placed: true, auto: true, vds: []map[string]string{sized("4096")}, want: 4096, has: true},
+		{name: "auto-off-only-set", placed: true, vds: []map[string]string{sized("4096"), nil}, want: 4096, has: true},
+		{name: "auto-off-none-set", placed: true, vds: []map[string]string{nil}},
+	} {
+		got, has := blocksize.Floor(tc.placed, tc.special, tc.auto, tc.vds)
+		if got != tc.want || has != tc.has {
+			t.Errorf("%s: (%d, %v), want (%d, %v)", tc.name, got, has, tc.want, tc.has)
+		}
+	}
+}

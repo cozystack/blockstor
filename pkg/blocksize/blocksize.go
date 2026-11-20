@@ -238,3 +238,73 @@ func Decide(in Input) Decision {
 
 	return Decision{Verdict: Set, Size: in.ReplicaSize}
 }
+
+// CanChange is LINSTOR's CtrlRscStateHelper.canChangeMinIoSize, which the
+// autoplacer asks: a definition without replicas may take any size; one
+// with replicas only while every volume definition has the automatic size
+// on, no replica is Primary, and no volume definition is frozen.
+func CanChange(placed, auto, primary bool, vdProps []map[string]string) bool {
+	if !placed {
+		return true
+	}
+
+	if !auto || primary {
+		return false
+	}
+
+	for _, props := range vdProps {
+		if Frozen(props) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// Floor is LINSTOR's ResourceDefinition.getFloorVolumesMinIoSize: the
+// smallest block size a placed definition's volumes run at, which a pool
+// must not exceed once the size may no longer change. A definition with
+// no replica has none; one with a special layer runs at
+// SpecialLayerIoSize. With the automatic size on, a volume without a size
+// counts as DefaultIoSize; with it off only sizes set count, and none set
+// means no floor.
+func Floor(placed, special, auto bool, vdProps []map[string]string) (int64, bool) {
+	if !placed {
+		return 0, false
+	}
+
+	if special {
+		return SpecialLayerIoSize, true
+	}
+
+	floor, has := MaxIoSize, auto
+
+	for _, props := range vdProps {
+		size, ok := Parse(props[PropBlockSize])
+		if !ok {
+			if !auto {
+				continue
+			}
+
+			size = DefaultIoSize
+		}
+
+		if !has || size < floor {
+			floor, has = size, true
+		}
+	}
+
+	if !has {
+		return 0, false
+	}
+
+	return floor, true
+}
+
+// PoolFits is LINSTOR's autoplacer filter on block size
+// (StorPoolFilter.filter, SelectionManager.isValid): while the size may
+// no longer change, a pool whose minimum I/O size exceeds the
+// definition's floor is not a candidate.
+func PoolFits(poolSize int64, canChange bool, floor int64, hasFloor bool) bool {
+	return canChange || !hasFloor || poolSize <= floor
+}
