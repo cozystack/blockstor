@@ -20,7 +20,9 @@ package controllers
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -69,21 +71,136 @@ func TestRecheckGateTellsRechecksFromEvents(t *testing.T) {
 }
 
 func TestRecheckGateRunsOneAtATime(t *testing.T) {
-	gate := newRecheckGate()
+	gate, _ := newClockedRecheckGate()
 
-	if !gate.tryAcquire() {
+	started, ok := gate.tryAcquire("a")
+	if !ok {
 		t.Fatalf("free slot refused")
 	}
 
-	if gate.tryAcquire() {
+	if _, ok := gate.tryAcquire("b"); ok {
 		t.Fatalf("a second re-check got the slot while the first one runs")
 	}
 
-	gate.release()
+	gate.release(started)
 
-	if !gate.tryAcquire() {
-		t.Fatalf("slot not free after release")
+	if _, ok := gate.tryAcquire("b"); !ok {
+		t.Fatalf("slot not free after a re-check that took no time")
 	}
+}
+
+// TestRecheckGivesWayToEvents: a re-check does not start while a pass
+// an event asked for runs, so that pass does not share the CPU with a
+// stream of re-checks; past recheckMaxWait it goes anyway.
+func TestRecheckGivesWayToEvents(t *testing.T) {
+	gate, clock := newClockedRecheckGate()
+
+	done := gate.eventPass()
+
+	if _, ok := gate.tryAcquire("r"); ok {
+		t.Fatalf("a re-check started while an event pass runs")
+	}
+
+	*clock = clock.Add(recheckMaxWait)
+
+	started, ok := gate.tryAcquire("r")
+	if !ok {
+		t.Fatalf("a re-check waited past recheckMaxWait for event passes")
+	}
+
+	gate.release(started)
+	done()
+
+	if _, ok := gate.tryAcquire("other"); !ok {
+		t.Fatalf("slot not free once the event passes ended")
+	}
+}
+
+// TestGatedRecheckWaitsForEventPass drives the wrapped reconciler: a
+// replica due for its re-check is deferred, not run, while another
+// replica's event pass is in flight.
+func TestGatedRecheckWaitsForEventPass(t *testing.T) {
+	gate, _ := newClockedRecheckGate()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	var idlePasses atomic.Int32
+
+	reconciler := gate.gate(reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+		switch req.Name {
+		case "new":
+			close(entered)
+			<-release
+		case "idle":
+			idlePasses.Add(1)
+		}
+
+		return schedulePeriodicRecheck(ctx), nil
+	}))
+
+	gate.finish("idle", gate.events("idle"), true)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		_, _ = reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "new"}})
+	}()
+
+	<-entered
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "idle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	close(release)
+	<-done
+
+	if idlePasses.Load() != 0 || result.RequeueAfter == 0 {
+		t.Errorf("a re-check ran (%d passes, result %v) while an event pass was in flight", idlePasses.Load(), result)
+	}
+}
+
+// TestRecheckSlotCoolsDown: after a re-check the slot stays closed for
+// as long as the re-check took, so back-to-back re-checks cannot take
+// all the satellite's CPU.
+func TestRecheckSlotCoolsDown(t *testing.T) {
+	gate, clock := newClockedRecheckGate()
+
+	started, ok := gate.tryAcquire("a")
+	if !ok {
+		t.Fatalf("free slot refused")
+	}
+
+	const took = 300 * time.Millisecond
+
+	*clock = clock.Add(took)
+	gate.release(started)
+
+	*clock = clock.Add(recheckCooldown*took - time.Millisecond)
+
+	if _, ok := gate.tryAcquire("b"); ok {
+		t.Fatalf("the next re-check started before the slot cooled down")
+	}
+
+	*clock = clock.Add(time.Millisecond)
+
+	if _, ok := gate.tryAcquire("b"); !ok {
+		t.Fatalf("slot still closed after the cool-down")
+	}
+}
+
+// newClockedRecheckGate is a gate whose time only moves when the test
+// moves it.
+func newClockedRecheckGate() (*recheckGate, *time.Time) {
+	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	gate := newRecheckGate()
+	gate.now = func() time.Time { return clock }
+
+	return gate, &clock
 }
 
 func TestNilRecheckGateGatesNothing(t *testing.T) {
