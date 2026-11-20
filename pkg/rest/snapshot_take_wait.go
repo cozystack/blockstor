@@ -20,6 +20,7 @@ package rest
 
 import (
 	"context"
+	"net/http"
 	"slices"
 	"time"
 
@@ -57,13 +58,33 @@ type snapshotRef struct {
 	name string
 }
 
-// waitSnapshotsSettled returns once every snapshot in refs is settled, the
-// request ends, or SnapshotTakeWait on the server runs out. A zero wait
-// returns at once, which is what a Server built without it (the unit tests)
-// gets.
-func (s *Server) waitSnapshotsSettled(ctx context.Context, refs []snapshotRef) {
+// takeEnd is how the take of one snapshot ended, as far as the wait saw.
+type takeEnd int
+
+const (
+	// takeOpen is a take the wait did not see end: no wait, the bound
+	// ran out, or the request ended first.
+	takeOpen takeEnd = iota
+	takeSucceeded
+	takeFailed
+	takeDeleted
+)
+
+// takeOutcome is how the take of one snapshot ended and, for a failed
+// one, the flag and the abort reason the controller recorded.
+type takeOutcome struct {
+	end    takeEnd
+	flag   string
+	reason string
+}
+
+// waitSnapshotsSettled returns how each take in refs ended, once every one
+// is settled, the request ends, or SnapshotTakeWait on the server runs out.
+// A ref missing from the result is still open. A zero wait returns at once,
+// which is what a Server built without it (the unit tests) gets.
+func (s *Server) waitSnapshotsSettled(ctx context.Context, refs []snapshotRef) map[snapshotRef]takeOutcome {
 	if s.SnapshotTakeWait <= 0 || len(refs) == 0 {
-		return
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, s.SnapshotTakeWait)
@@ -74,46 +95,115 @@ func (s *Server) waitSnapshotsSettled(ctx context.Context, refs []snapshotRef) {
 
 	pending := slices.Clone(refs)
 	seen := make(map[snapshotRef]bool, len(refs))
+	outcomes := make(map[snapshotRef]takeOutcome, len(refs))
 
 	for {
 		pending = slices.DeleteFunc(pending, func(ref snapshotRef) bool {
-			return s.snapshotSettled(ctx, ref, seen)
+			outcome := s.snapshotTakeOutcome(ctx, ref, seen)
+			if outcome.end == takeOpen {
+				return false
+			}
+
+			outcomes[ref] = outcome
+
+			return true
 		})
 
 		if len(pending) == 0 {
-			return
+			return outcomes
 		}
 
 		select {
 		case <-ctx.Done():
-			return
+			return outcomes
 		case <-ticker.C:
 		}
 	}
 }
 
-// snapshotSettled reports whether the take of ref is over: SUCCESSFUL, a
-// failure flag, or a delete. A snapshot the read cannot find yet is pending
+// snapshotTakeOutcome reads how the take of ref ended: SUCCESSFUL, a
+// failure flag, or a delete. A snapshot the read cannot find yet is open
 // until it has been seen once, since the cache may trail the create; gone
-// after that, it was deleted. A failing read leaves it pending.
-func (s *Server) snapshotSettled(ctx context.Context, ref snapshotRef, seen map[snapshotRef]bool) bool {
+// after that, it was deleted. A failing read leaves it open.
+func (s *Server) snapshotTakeOutcome(ctx context.Context, ref snapshotRef, seen map[snapshotRef]bool) takeOutcome {
 	snap, err := s.Store.Snapshots().Get(ctx, ref.rd, ref.name)
 	if err != nil {
-		return errors.Is(err, store.ErrNotFound) && seen[ref]
+		if errors.Is(err, store.ErrNotFound) && seen[ref] {
+			return takeOutcome{end: takeDeleted}
+		}
+
+		return takeOutcome{end: takeOpen}
 	}
 
 	seen[ref] = true
 
-	return slices.ContainsFunc(snap.Flags, isSettledSnapshotFlag)
+	// SUCCESSFUL first: a take that committed is over even if a failure
+	// marker trails it. The served flags drop SUCCESSFUL once a delete
+	// started, so a deleting snapshot lands on DELETE below.
+	if slices.Contains(snap.Flags, apiv1.SnapshotFlagSuccessful) {
+		return takeOutcome{end: takeSucceeded}
+	}
+
+	if i := slices.IndexFunc(snap.Flags, isFailedSnapshotFlag); i >= 0 {
+		return takeOutcome{end: takeFailed, flag: snap.Flags[i], reason: snap.AbortReason}
+	}
+
+	if slices.Contains(snap.Flags, apiv1.SnapshotFlagDelete) {
+		return takeOutcome{end: takeDeleted}
+	}
+
+	return takeOutcome{end: takeOpen}
 }
 
-// isSettledSnapshotFlag reports whether a served flag ends a take.
-func isSettledSnapshotFlag(flag string) bool {
+// takeFailureRcs is the error a create answers for each take in refs that
+// failed or was deleted under it. LINSTOR's create flux ends with the
+// abort's error, which its REST layer appends to the responses already
+// collected and answers with 500; linstor-csi sees the error instead of a
+// snapshot it believes taken.
+func takeFailureRcs(refs []snapshotRef, outcomes map[snapshotRef]takeOutcome) []apiv1.APICallRc {
+	var rcs []apiv1.APICallRc
+
+	for _, ref := range refs {
+		outcome := outcomes[ref]
+
+		switch outcome.end {
+		case takeFailed:
+			message := "snapshot " + ref.rd + "/" + ref.name + " aborted (" + outcome.flag + ")"
+			if outcome.reason != "" {
+				message += ": " + outcome.reason
+			}
+
+			rcs = append(rcs, apiv1.APICallRc{RetCode: apiCallRcError | apiCallRcFailUnknownError, Message: message})
+		case takeDeleted:
+			rcs = append(rcs, apiv1.APICallRc{
+				RetCode: apiCallRcError | apiCallRcFailUnknownError,
+				Message: "snapshot " + ref.rd + "/" + ref.name + " was deleted before its take ended",
+			})
+		case takeOpen, takeSucceeded:
+		}
+	}
+
+	return rcs
+}
+
+// writeSnapshotCreateAnswer answers a create with its rcs: 201, or 500 with
+// the failure appended when a take failed, as LINSTOR's REST layer maps an
+// error entry.
+func writeSnapshotCreateAnswer(w http.ResponseWriter, rcs, failures []apiv1.APICallRc) {
+	if len(failures) > 0 {
+		writeJSON(w, http.StatusInternalServerError, append(rcs, failures...))
+
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, rcs)
+}
+
+// isFailedSnapshotFlag reports whether a served flag records a failed take.
+func isFailedSnapshotFlag(flag string) bool {
 	switch flag {
-	case apiv1.SnapshotFlagSuccessful,
-		apiv1.SnapshotFlagFailedDeployment,
+	case apiv1.SnapshotFlagFailedDeployment,
 		apiv1.SnapshotFlagFailedDisconnect,
-		apiv1.SnapshotFlagDelete,
 		snapshotFlagFailed:
 		return true
 	}

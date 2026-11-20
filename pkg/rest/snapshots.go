@@ -415,12 +415,12 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Same answer point as the multi create, and LINSTOR's.
-	s.waitSnapshotsSettled(r.Context(), []snapshotRef{{rd: rd, name: snap.Name}})
+	refs := []snapshotRef{{rd: rd, name: snap.Name}}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	writeSnapshotCreateAnswer(w, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "snapshot created: " + snap.Name,
-	}})
+	}}, takeFailureRcs(refs, s.waitSnapshotsSettled(r.Context(), refs)))
 }
 
 // writeSnapshotExistsConflict emits the Bug-hunt 2026-05-30 Finding 4

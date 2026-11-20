@@ -22,8 +22,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +35,10 @@ import (
 
 // takeDelay is how long the stand-in controller takes a snapshot for.
 const takeDelay = 300 * time.Millisecond
+
+// testAbortReason is the abort the stand-in controller records with a
+// failure flag.
+const testAbortReason = "replica on n1 is not UpToDate"
 
 // postDeadline bounds every create a test sends; each wait under test is
 // either settled well before it or capped below it.
@@ -102,6 +108,10 @@ func settleAfterTake(t *testing.T, st store.Store, flag string) {
 			}
 
 			snap.Flags = append(snap.Flags, flag)
+			if flag != apiv1.SnapshotFlagSuccessful {
+				snap.AbortReason = testAbortReason
+			}
+
 			_ = st.Snapshots().Update(ctx, &snap)
 
 			return
@@ -135,13 +145,15 @@ func viewFlags(t *testing.T, base string) []string {
 	return nil
 }
 
-func postCreate(t *testing.T, base, path string) time.Duration {
-	t.Helper()
+// createAnswer is what a create answered and how long it took.
+type createAnswer struct {
+	elapsed time.Duration
+	status  int
+	rcs     []apiv1.APICallRc
+}
 
-	body := []byte(`{"name":"snap-1"}`)
-	if path == multiCreatePath {
-		body = []byte(`{"snapshots":[{"resource_name":"pvc-1","name":"snap-1"}]}`)
-	}
+func postCreateBody(t *testing.T, base, path string, body []byte) createAnswer {
+	t.Helper()
 
 	// A create that never answers fails here, not at the test binary's
 	// timeout.
@@ -163,24 +175,49 @@ func postCreate(t *testing.T, base, path string) time.Duration {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	elapsed := time.Since(start)
+	answer := createAnswer{elapsed: time.Since(start), status: resp.StatusCode}
 
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("POST %s: got %d, want 201", path, resp.StatusCode)
-	}
-
-	var rcs []apiv1.APICallRc
-
-	err = json.NewDecoder(resp.Body).Decode(&rcs)
+	err = json.NewDecoder(resp.Body).Decode(&answer.rcs)
 	if err != nil {
 		t.Fatalf("decode rcs: %v", err)
 	}
 
-	if len(rcs) != 1 || rcs[0].RetCode&apiCallRcError != 0 {
-		t.Fatalf("POST %s: want one success rc, got %+v", path, rcs)
+	return answer
+}
+
+// postSnap1 creates snap-1 on pvc-1 through path.
+func postSnap1(t *testing.T, base, path string) createAnswer {
+	t.Helper()
+
+	body := []byte(`{"name":"snap-1"}`)
+	if path == multiCreatePath {
+		body = []byte(`{"snapshots":[{"resource_name":"pvc-1","name":"snap-1"}]}`)
 	}
 
-	return elapsed
+	return postCreateBody(t, base, path, body)
+}
+
+// postCreate creates snap-1 and wants the success answer.
+func postCreate(t *testing.T, base, path string) time.Duration {
+	t.Helper()
+
+	answer := postSnap1(t, base, path)
+
+	if answer.status != http.StatusCreated {
+		t.Fatalf("POST %s: got %d, want 201", path, answer.status)
+	}
+
+	if len(answer.rcs) != 1 || answer.rcs[0].RetCode&apiCallRcError != 0 {
+		t.Fatalf("POST %s: want one success rc, got %+v", path, answer.rcs)
+	}
+
+	return answer.elapsed
+}
+
+func hasErrorRc(rcs []apiv1.APICallRc, text string) bool {
+	return slices.ContainsFunc(rcs, func(rc apiv1.APICallRc) bool {
+		return rc.RetCode&apiCallRcError != 0 && strings.Contains(rc.Message, text)
+	})
 }
 
 const (
@@ -215,30 +252,64 @@ func TestSnapshotCreateAnswersAfterTheTake(t *testing.T) {
 }
 
 // TestSnapshotCreateAnswersOnEveryEndOfTheTake: a failed or deleted take
-// ends the wait too, long before its bound.
+// ends the wait too, long before its bound, and is answered the way
+// LINSTOR answers an aborted create flux: 500 with the abort's error
+// after the responses already collected.
 func TestSnapshotCreateAnswersOnEveryEndOfTheTake(t *testing.T) {
 	t.Parallel()
 
-	ends := map[string]string{
-		"failed":            snapshotFlagFailed,
-		"failed-deployment": apiv1.SnapshotFlagFailedDeployment,
-		"failed-disconnect": apiv1.SnapshotFlagFailedDisconnect,
-		"deleted":           "",
+	ends := map[string]struct {
+		flag string
+		text string
+	}{
+		"failed":            {snapshotFlagFailed, testAbortReason},
+		"failed-deployment": {apiv1.SnapshotFlagFailedDeployment, testAbortReason},
+		"failed-disconnect": {apiv1.SnapshotFlagFailedDisconnect, testAbortReason},
+		"deleted":           {"", "deleted before its take ended"},
+		"deleting":          {apiv1.SnapshotFlagDelete, "deleted before its take ended"},
 	}
 
-	for name, flag := range ends {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+	for name, end := range ends {
+		for _, path := range []string{multiCreatePath, rdCreatePath} {
+			t.Run(name+path, func(t *testing.T) {
+				t.Parallel()
 
-			st := store.NewInMemory()
-			base := startTakeWaitServer(t, st, 20*time.Second)
-			settleAfterTake(t, st, flag)
+				st := store.NewInMemory()
+				base := startTakeWaitServer(t, st, 20*time.Second)
+				settleAfterTake(t, st, end.flag)
 
-			elapsed := postCreate(t, base, multiCreatePath)
-			if elapsed < takeDelay || elapsed > 10*time.Second {
-				t.Errorf("create answered after %v, want once the take ended (~%v)", elapsed, takeDelay)
-			}
-		})
+				answer := postSnap1(t, base, path)
+				if answer.elapsed < takeDelay || answer.elapsed > 10*time.Second {
+					t.Errorf("create answered after %v, want once the take ended (~%v)", answer.elapsed, takeDelay)
+				}
+
+				if answer.status != http.StatusInternalServerError {
+					t.Errorf("status %d, want 500 for a take that did not succeed", answer.status)
+				}
+
+				if !hasErrorRc(answer.rcs, end.text) {
+					t.Errorf("want an error rc saying %q, got %+v", end.text, answer.rcs)
+				}
+
+				if !slices.ContainsFunc(answer.rcs, func(rc apiv1.APICallRc) bool { return rc.RetCode&maskInfo != 0 }) {
+					t.Errorf("want the create's own rc kept before the failure, got %+v", answer.rcs)
+				}
+
+				if end.flag != "" {
+					resp := httpGet(t, base+"/v1/view/snapshots")
+					defer func() { _ = resp.Body.Close() }()
+
+					raw, err := io.ReadAll(resp.Body)
+					if err != nil {
+						t.Fatalf("read view: %v", err)
+					}
+
+					if bytes.Contains(raw, []byte(testAbortReason)) {
+						t.Errorf("the abort reason reached the snapshot view, which LINSTOR's DTO has no field for: %s", raw)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -315,41 +386,16 @@ func TestSnapshotCreateMultiAnswersARefusalAtOnce(t *testing.T) {
 	st := store.NewInMemory()
 	base := startTakeWaitServer(t, st, 10*time.Second)
 
-	body := []byte(`{"snapshots":[
+	answer := postCreateBody(t, base, multiCreatePath, []byte(`{"snapshots":[
 		{"resource_name":"pvc-1","name":"snap-1"},
 		{"resource_name":"pvc-missing","name":"snap-1"}
-	]}`)
+	]}`))
 
-	ctx, cancel := context.WithTimeout(t.Context(), postDeadline)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+multiCreatePath, bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("new request: %v", err)
+	if answer.elapsed > 2*time.Second {
+		t.Errorf("refused batch answered after %v, want at once", answer.elapsed)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-
-	start := time.Now()
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("POST after %v: %v", time.Since(start), err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("refused batch answered after %v, want at once", elapsed)
-	}
-
-	var rcs []apiv1.APICallRc
-
-	err = json.NewDecoder(resp.Body).Decode(&rcs)
-	if err != nil {
-		t.Fatalf("decode rcs: %v", err)
-	}
-
-	if !slices.ContainsFunc(rcs, func(rc apiv1.APICallRc) bool { return rc.RetCode&apiCallRcError != 0 }) {
-		t.Errorf("want the refusal in the answer, got %+v", rcs)
+	if !hasErrorRc(answer.rcs, "pvc-missing") {
+		t.Errorf("want the refusal in the answer, got %+v", answer.rcs)
 	}
 }

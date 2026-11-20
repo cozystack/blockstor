@@ -133,11 +133,12 @@ func (s *Server) handleSnapshotCreateMulti(w http.ResponseWriter, r *http.Reques
 	// GroupSize, so the group never assembles and no take starts until
 	// the controller's suspend deadline aborts it, past the point a
 	// client still waits for the refusal.
+	var failures []apiv1.APICallRc
 	if len(created) == len(body.Snapshots) {
-		s.waitSnapshotsSettled(r.Context(), created)
+		failures = takeFailureRcs(created, s.waitSnapshotsSettled(r.Context(), created))
 	}
 
-	writeJSON(w, http.StatusCreated, results)
+	writeSnapshotCreateAnswer(w, results, failures)
 }
 
 // clampInt32 narrows a non-negative count to int32, saturating at
