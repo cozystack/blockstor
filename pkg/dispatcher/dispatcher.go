@@ -892,19 +892,6 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			continue
 		}
 
-		// Per-VD `StorPoolName` (scenario 4.W26) is the most-specific
-		// scope and overrides the RD/Resource default. Empty value
-		// falls through to the RD-level pool resolved above.
-		// Diskless replicas still ignore per-VD pool — no backing
-		// disk to provision regardless of what the prop says.
-		pool := rdPool
-
-		if !diskless {
-			if v := vd.Props["StorPoolName"]; v != "" {
-				pool = v
-			}
-		}
-
 		// Per-volume minor (authoritative on RD.Spec). 0 == not yet
 		// allocated; the satellite renderer falls back to the
 		// DrbdOptions["minor"] base + volumeNumber derivation.
@@ -916,7 +903,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 		out = append(out, &intent.DesiredVolume{
 			VolumeNumber:   vd.VolumeNumber,
 			SizeKib:        vd.SizeKib,
-			StoragePool:    pool,
+			StoragePool:    volumePool(vd.Props, rdPool, diskless),
 			SeedFromGI:     seedFromGI(target, vd.VolumeNumber),
 			ObservedGI:     observedGI(target, vd.VolumeNumber),
 			AppliedSizeKib: appliedSizeKib(target, vd.VolumeNumber),
@@ -927,6 +914,21 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	}
 
 	return out
+}
+
+// volumePool is the pool one volume of the replica lands on. Per-VD
+// `StorPoolName` (scenario 4.W26) is the most-specific scope and
+// overrides the RD/Resource default; an empty value falls through to
+// it. Diskless replicas still ignore the per-VD pool: there is no
+// backing disk to provision regardless of what the prop says.
+func volumePool(vdProps map[string]string, rdPool string, diskless bool) string {
+	if !diskless {
+		if v := vdProps["StorPoolName"]; v != "" {
+			return v
+		}
+	}
+
+	return rdPool
 }
 
 // restoreSourceOnDisk names a restore's source definition the way its
