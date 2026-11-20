@@ -915,7 +915,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	}
 
 	if pool := req.GetStoragePool(); pool != "" {
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if ok {
 			for _, n := range req.GetVolumeNumbers() {
 				err := provider.DeleteVolume(ctx, storage.Volume{
@@ -1632,7 +1632,7 @@ func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.D
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
 			continue
 		}
@@ -1659,7 +1659,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	cloned := false
 
 	for _, vol := range dr.GetVolumes() {
-		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+		provider, ok := r.provider(vol.GetStoragePool())
 		if !ok {
 			return nil, false, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
 		}
@@ -2989,7 +2989,7 @@ func (r *Reconciler) resizeAssumeClean(dr *intent.DesiredResource) bool {
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
 			continue
 		}
@@ -5713,7 +5713,7 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 		}, true
 	}
 
-	provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+	provider, ok := r.provider(vol.GetStoragePool())
 	if !ok || provider == nil {
 		return drbd.GISeed{}, false
 	}
@@ -5810,6 +5810,19 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 	return drbd.GISeed{Current: day0, WasUpToDate: true}, true
 }
 
+// provider returns the provider registered for pool. The StoragePool
+// controller registers pools while the Resource workers apply, and an
+// unguarded map read racing that write is a fatal runtime error, not a
+// recoverable one.
+func (r *Reconciler) provider(pool string) (storage.Provider, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	provider, ok := r.cfg.Providers[pool]
+
+	return provider, ok
+}
+
 // providerForResource resolves the provider that owns the named
 // resource using the in-memory pool map. Returns an error when the
 // resource isn't known or its pool isn't registered.
@@ -5822,7 +5835,7 @@ func (r *Reconciler) providerForResource(name string) (storage.Provider, error) 
 		return nil, errors.Errorf("resource %q not known on this satellite", name)
 	}
 
-	provider, ok := r.cfg.Providers[pool]
+	provider, ok := r.provider(pool)
 	if !ok {
 		return nil, errors.Errorf("storage pool %q not registered", pool)
 	}
