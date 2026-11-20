@@ -35,7 +35,8 @@ import (
 )
 
 // The fixture under testdata/dump is a synthetic LINSTOR k8s-backend
-// dump. Its shape (tables, column sets, JSON-array-in-string columns,
+// dump, read at the storage version of LINSTOR 1.33's CRDs (v1-31-1;
+// storage_version_test.go derives the lossy read at v1-15-0). Its shape (tables, column sets, JSON-array-in-string columns,
 // layer-id joins, props instance paths, flag bitmask populations) was
 // modelled on two production cluster dumps; every identifier, IP,
 // DRBD shared-secret and LUKS ciphertext in it is fabricated.
@@ -46,8 +47,8 @@ import (
 //     writes none for diskless) — the pool falls back to the replica's
 //     StorPoolName prop; a STALE TIE_BREAKER bit (flags 128) on a
 //     diskful replica that must be dropped, mirroring auto-diskful
-//     leftovers observed in production; a preset TCP port + per-volume
-//     minor + per-replica node-ids; a SUCCESSFUL and a
+//     leftovers observed in production; a TCP port in every replica's
+//     tcp_port_list + per-volume minor + per-replica node-ids; a SUCCESSFUL and a
 //     FAILED_DEPLOYMENT snapshot (only the former migrates).
 //   - vol2: STORAGE-only single-replica volume.
 //   - vol3: DRBD,LUKS,STORAGE with LAYER_LUKS_VOLUMES ciphertexts.
@@ -352,7 +353,7 @@ func TestLiveDRBDPortWins(t *testing.T) {
 		t.Fatalf("LoadDump: %v", err)
 	}
 
-	// vol5 carries NO tcp_port in the fixture; vol1 carries 7001.
+	// vol5 has no port in the fixture; vol1's replicas carry 7001.
 	res, err := ConvertWithOptions(dump, Options{
 		DRBDPorts: map[string]int32{"pvc-vol5": 7042, "pvc-vol1": 7099},
 		LUKS:      fixtureLUKS(t),

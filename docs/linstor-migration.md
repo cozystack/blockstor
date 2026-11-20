@@ -2,11 +2,11 @@
 
 `linstor-migrate` converts a LINSTOR k8s-backend database dump into blockstor CRDs. blockstor then **adopts** the existing on-disk data (zvols/LVs + DRBD metadata) in place — no data is copied or resynced. This runbook is the required procedure; the converter is only one step of it.
 
-> **Scope.** This adopts a LINSTOR deployment whose satellites already run on the nodes blockstor will manage, keeping the same storage pools, DRBD minors, node-ids and (with the port capture below) TCP ports. It does not move data between nodes and does not change replica placement.
+> **Scope.** This adopts a LINSTOR deployment whose satellites already run on the nodes blockstor will manage, keeping the same storage pools, DRBD minors, node-ids and TCP ports. It does not move data between nodes and does not change replica placement.
 
 ## What the converter does and does not migrate
 
-Migrated: nodes, storage pools, resource groups, resource definitions (+ volume definitions), resources (replicas), and SUCCESSFUL snapshots. Controller-wide `DrbdOptions/*` become a `ControllerConfig`. DRBD minors, per-replica node-ids, the shared-secret and (when captured) TCP ports are preserved verbatim. An RD is stamped `Initialized=true` whenever its data still exists somewhere, and every replica gets `skipInitialSync=false`, so any replica added **after** migration performs a real sync instead of falsely coming up UpToDate. The latch is conditional, and it errs towards staying on: it is dropped only where no data-bearing replica is being adopted. That covers two shapes — every replica already DELETE-flagged, so nothing is migrating at all, and every replica diskless, so replicas are migrating but a client or quorum witness carries no copy to latch on. A definition whose replicas were held back because their nodes did not migrate keeps the latch, because that data is still on those nodes; so does one whose replicas were skipped for pool divergence. Unlatching in either of those would let the controller seed an empty first sync over data that exists. The report on stderr names every definition in these states, and names each reason that applies rather than only the first, so do not clear a latch by hand on the strength of a definition arriving without replicas. Snapshots are stamped `blockstor.org/adopted` so the controller records them as complete without re-taking them.
+Migrated: nodes, storage pools, resource groups, resource definitions (+ volume definitions), resources (replicas), and SUCCESSFUL snapshots. Controller-wide `DrbdOptions/*` become a `ControllerConfig`. DRBD minors, per-replica node-ids, the shared-secret and each replica's TCP port are preserved verbatim, and a resource group keeps its `peer_slots`. An RD is stamped `Initialized=true` whenever its data still exists somewhere, and every replica gets `skipInitialSync=false`, so any replica added **after** migration performs a real sync instead of falsely coming up UpToDate. The latch is conditional, and it errs towards staying on: it is dropped only where no data-bearing replica is being adopted. That covers two shapes — every replica already DELETE-flagged, so nothing is migrating at all, and every replica diskless, so replicas are migrating but a client or quorum witness carries no copy to latch on. A definition whose replicas were held back because their nodes did not migrate keeps the latch, because that data is still on those nodes; so does one whose replicas were skipped for pool divergence. Unlatching in either of those would let the controller seed an empty first sync over data that exists. The report on stderr names every definition in these states, and names each reason that applies rather than only the first, so do not clear a latch by hand on the strength of a definition arriving without replicas. Snapshots are stamped `blockstor.org/adopted` so the controller records them as complete without re-taking them.
 
 **NOT migrated — read the report on stderr for the exact list per cluster:**
 
@@ -15,22 +15,34 @@ Migrated: nodes, storage pools, resource groups, resource definitions (+ volume 
 - **`StorPoolNameDrbdMeta` over internal metadata** does not stop the definition: when every replica's chain has no `.meta` child, the metadata is on the data device (LINSTOR applies the property only to replicas created after it was set, and `.internal` asks for internal metadata). The definition converts, and the property is not carried over to the definition or its replicas, the two places blockstor reads it from, so the satellite does not look for a separate metadata volume. The report names the scope the property was set on.
 - **Definitions whose replicas disagree on the layer stack** are skipped with their replicas and reported: replicas built two ways, or with their layers in another order, under a definition with no stack of its own; a diskful replica the dump shows no layer chain for, under such a definition; or a replica built otherwise than the stack the definition names. A `layer_stack` column the converter cannot read counts as no stack, and the warning names its value. Adopted as they are, such a replica would be brought up under a stack it was not built with, DRBD metadata over a LUKS volume's ciphertext for one. Settle the stack in LINSTOR and convert again.
 - **Backup-shipping remotes**, unknown/runtime flag bits, and DELETE'd / FAILED_DEPLOYMENT rows are skipped and reported. None affect live data availability.
-- **DRBD TCP ports** are absent from most LINSTOR 1.33 dumps — see "Capture live DRBD ports" below.
+- **`x_replicas_on_different`** on a resource group is dropped and reported with its value: blockstor's ResourceGroup has no field for it, so replicas placed from that group after the migration are not held to the limit.
 
 ## Pre-flight (do all of these before touching anything)
 
 1. **Cluster is healthy.** `linstor r l --faulty` is empty; every resource is `UpToDate` on its diskful replicas; no node is `OFFLINE`. Do not migrate a degraded cluster — an Inconsistent/SyncTarget replica adopted as-is stays that way.
 
-2. **Take the database dump** (LINSTOR's k8s-backend CRDs):
+2. **Take the database dump** (LINSTOR's k8s-backend CRDs), reading every table at its CRD's storage version:
 
    ```bash
    mkdir dump && cd dump
-   kubectl get crds | grep -o ".*.internal.linstor.linbit.com" \
-     | xargs -I{} sh -c 'kubectl get {} -ojson > {}.json'
+   kubectl get crds -o json \
+     | jq -r '.items[] | select(.spec.group == "internal.linstor.linbit.com")
+              | "\(.metadata.name) \(.spec.names.plural) \(.spec.versions[] | select(.storage) | .name)"' \
+     | while read -r crd plural version; do
+         kubectl get "$plural.$version.internal.linstor.linbit.com" -o json > "$crd.json" \
+           || { echo "failed to dump $crd" >&2; exit 1; }
+       done
+   jq -r '.items[].apiVersion' *.json | sort | uniq -c
    cd ..
    ```
 
-3. **Capture the live DRBD ports.** LINSTOR 1.33 does not persist the port in its database, so the dump alone cannot preserve it, and it can give each node its own port for one definition. If blockstor adopts a replica with a port other than the one its node listens on, `drbdadm adjust` moves the connection endpoint under live I/O (a reconnect blip, and on a marginal quorum a transient quorum loss). Capture the port every replica listens on, from the kernel on every satellite:
+   The version must be named. LINSTOR's CRDs serve several schema versions (`v1-15-0` up to `v1-31-1` on LINSTOR 1.33) with no conversion between them, and since none of the names sorts like a Kubernetes version, a plain `kubectl get <crd>` reads every table at the alphabetically first one, `v1-15-0`. The API server then drops every field that version's schema lacks, without an error: on LINSTOR 1.33 that is each replica's `tcp_port_list` and a resource group's `x_replicas_on_different` and `peer_slots`. Such a dump is incomplete, LINSTOR cannot load it back (it refuses a DRBD replica stored without its ports), and `linstor-migrate` refuses it. The last command should print one version for every table, the storage version (`internal.linstor.linbit.com/v1-31-1` on LINSTOR 1.33), plus `internal.linstor.linbit.com/v1` for the `linstorversion` table, whose CRD serves only that one.
+
+   The dump holds the DRBD shared secrets and the LUKS passwords wrapped under LINSTOR's master key: keep it as carefully as the master passphrase.
+
+   **Do not delete the LINSTOR CRDs**, or any object of them, as cleanup after the cutover, for as long as a rollback to LINSTOR may still be wanted. The objects in the cluster are the only complete copy of LINSTOR's database, and the rollback below starts LINSTOR on them. Remove them only once you have decided that LINSTOR will not come back.
+
+3. **Capture the live DRBD ports as a cross-check.** LINSTOR keeps each replica's port in its database, in the `tcp_port_list` of the replica's `layerdrbdresources` row, so each node can have its own port for one definition, and the converter takes the ports from there. The capture checks them against the kernel. If blockstor adopts a replica with a port other than the one its node listens on, `drbdadm adjust` moves the connection endpoint under live I/O (a reconnect blip, and on a marginal quorum a transient quorum loss), so where the database and the kernel disagree the converter keeps the kernel's port and reports the replica. Capture the port every replica listens on, from the kernel on every satellite:
 
    ```bash
    for pod in $(kubectl -n cozy-linstor get pods -l app.kubernetes.io/component=linstor-satellite \
@@ -87,7 +99,9 @@ linstor-migrate -in ./dump -drbd-ports ./drbd-ports.txt -out ./blockstor-manifes
 
 `-linstor-passphrase-file` and `-keyring-out` are needed only when the dump has LUKS volumes; a wrong passphrase stops the run before anything is written. A passphrase that is given is checked against LINSTOR's master key even when no volume is encrypted, since the keyring made from it is what blockstor will unlock with. If LINSTOR never had a master passphrase (no `encrypted/masterkey` in the dump), there is nothing to check it against, and the run is refused: drop the LUKS flags. `./blockstor-keyring.yaml` is the keyring Secret: it holds the master key wrapped under the LINSTOR passphrase and nothing in the clear. It is applied before the blockstor controller starts, not with the manifests: see cutover step 3. To convert into a blockstor cluster that already has a keyring, pass `-keyring-in <keyring.json> -blockstor-passphrase-file <file>` instead of `-keyring-out`, where `keyring.json` is the `keyring.json` key of its `blockstor-master-key` Secret.
 
-Read the report on stderr end to end. Every `warning:` line is a thing the converter refused to guess — decide per line whether it matters for your data before continuing. In particular check that every LUKS definition reports its passwords migrated, and resolve every `no DRBD port` line, whether it names a definition, one replica, or a map whose node names match no replica. The latter should be empty if the port capture was complete: each replica it names gets a fresh port and reconnects on adoption, and `spec.drbdPort` cannot be changed after apply.
+Read the report on stderr end to end. Every `warning:` line is a thing the converter refused to guess — decide per line whether it matters for your data before continuing. In particular check that every LUKS definition reports its passwords migrated, and resolve every `no DRBD port` line, whether it names a definition, one replica, or a map whose node names match no replica: each replica it names gets a fresh port and reconnects on adoption, and `spec.drbdPort` cannot be changed after apply. A line saying LINSTOR's database gives one port and the kernel listens on another means the two disagree about a running replica; the kernel's port is the one carried, but find out why before cutover. A map whose node names match no replica leaves the database's ports unchecked, so fix the names and convert again.
+
+A dump read at the wrong version stops the run with `the LINSTOR dump was not read at its CRDs' storage version`. Take it again as pre-flight step 2 shows; a live port map does not make it usable, because the other dropped fields are not in it.
 
 ## Cutover
 
@@ -147,12 +161,16 @@ The manifests do not migrate a cluster by themselves — the control plane must 
 
 Until CSI is repointed and confirmed, rollback is: scale blockstor to 0, scale `deploy/linstor-controller` back to 1, repoint CSI at LINSTOR. The on-disk data and running DRBD devices were never touched, so this is a control-plane-only revert. If a pool-level `zfs snapshot` was taken in pre-flight, it is the last-resort data rollback point.
 
+LINSTOR comes back on the database objects still in the cluster, which is why pre-flight step 2 says not to delete the LINSTOR CRDs. A dump taken without naming the storage version cannot replace them: LINSTOR refuses to load DRBD replicas stored without their ports.
+
 ## Known limitations (accept or mitigate explicitly)
 
 | Item | Impact | Mitigation |
 | --- | --- | --- |
 | LINSTOR master passphrase lost | Its LUKS volume passwords cannot be decrypted, and the dump is refused | Copy those volumes to new ones under blockstor, or keep them on LINSTOR |
-| DRBD port not in dump (LINSTOR 1.33) | Adoption reconnects the mesh on a new port if not captured | Capture with the pre-flight command and pass `-drbd-ports` |
+| Dump read at a version other than the storage version | Ports and resource group fields are missing; the converter refuses the dump | Take it with the pre-flight step 2 command, which names each CRD's storage version |
+| DRBD port in the database differs from the kernel's | Adopting the database's port would reconnect the mesh | Capture with the pre-flight command and pass `-drbd-ports`; the kernel's port is kept and the replica reported |
+| `x_replicas_on_different` on a resource group | Dropped; blockstor does not hold new placements to it | Reported per group; where one replica per property value is acceptable, set `replicasOnDifferent` on the group instead |
 | Unknown flag bits dropped | Cosmetic runtime bookkeeping only | Reported; verified not to carry availability semantics |
 | Placement/data unchanged | The converter never moves data | Rebalance with blockstor after migration if desired |
 | `Initialized` is conditional | Left unlatched only where no data-bearing replica is adopted — every replica DELETE-flagged, or every replica diskless; a definition held back by an unmigrated node or by pool divergence keeps the latch and arrives short of replicas | Read the report, which names every reason that applies. Do not clear a latch by hand because a definition has no replicas — that is what re-enables the auto-primary election this latch exists to suppress |
