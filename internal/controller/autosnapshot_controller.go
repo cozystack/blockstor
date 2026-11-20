@@ -440,8 +440,8 @@ func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 
 		target.add(res)
 
-		if res.Spec.StoragePool != "" {
-			pools = append(pools, poolRef{node: res.Spec.NodeName, pool: res.Spec.StoragePool})
+		if pool := replicaPool(res); pool != "" {
+			pools = append(pools, poolRef{node: res.Spec.NodeName, pool: pool})
 		}
 	}
 
@@ -484,6 +484,21 @@ func (r *AutoSnapshotRunnable) listReplicas(ctx context.Context) (*blockstoriov1
 
 	return &resList, nil
 }
+
+// replicaPool is the storage pool a replica is on: the spec field, or
+// the StorPoolName prop a replica set up before the field records it
+// in, which the REST create reads through the merged props.
+func replicaPool(res *blockstoriov1alpha1.Resource) string {
+	if res.Spec.StoragePool != "" {
+		return res.Spec.StoragePool
+	}
+
+	return res.Spec.Props[propStorPoolName]
+}
+
+// propStorPoolName is the prop that named a replica's pool before
+// Spec.StoragePool did.
+const propStorPoolName = "StorPoolName"
 
 // rdFlagDelete marks a definition whose delete is under way.
 const rdFlagDelete = "DELETE"

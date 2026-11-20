@@ -491,3 +491,28 @@ func TestAutoSnapshotLeavesOutANodeBeingEvacuated(t *testing.T) {
 		t.Errorf("auto-snapshot nodes = %v, want [n1]", got)
 	}
 }
+
+// A replica set up before Spec.StoragePool existed names its pool in the
+// StorPoolName prop, which the REST create reads too. Its thick pool is
+// refused all the same.
+func TestAutoSnapshotSkipsAThickPoolNamedByProp(t *testing.T) {
+	t.Parallel()
+
+	rd := makeRDWithAutoSnapshot(t, "pvc-thick-prop", 15, "")
+
+	res := replica(rd.Name, "n1")
+	res.Spec.Props = map[string]string{"StorPoolName": "thick"}
+
+	pool := &blockstoriov1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "n1.thick"},
+		Spec:       blockstoriov1alpha1.StoragePoolSpec{NodeName: "n1", PoolName: "thick"},
+	}
+
+	r, cli := autoSnapshotFixture(t, rd, res, pool)
+
+	tick(t, r)
+
+	if snaps := listAutoSnapshotsByRD(t, cli, rd.Name); len(snaps) != 0 {
+		t.Fatalf("auto-snapshot taken on a thick pool named by prop: %+v", snaps[0].Spec)
+	}
+}
