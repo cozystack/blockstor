@@ -289,7 +289,13 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 			filter.PlaceCount = 1
 		}
 
-		_, _, perr := p.Place(ctx, rds[i].Name, &filter)
+		var perr error
+		if gate != nil {
+			perr = gate.place(ctx, p, rg, rds[i].Name, &filter)
+		} else {
+			_, _, perr = p.Place(ctx, rds[i].Name, &filter)
+		}
+
 		if perr != nil {
 			log.Error(perr, "placer call failed during RG rebalance",
 				"rg", rg.Name, "rd", rds[i].Name)
