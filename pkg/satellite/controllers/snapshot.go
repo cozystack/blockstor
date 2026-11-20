@@ -240,12 +240,12 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 // failed suspend stamps the per-node Failed=true so the
 // controller-side orchestrator drains the siblings.
 func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	needed, err := r.needsWindow(ctx, snap)
+	layers, err := r.snapshotLayers(ctx, snap)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if !needed {
+	if !layers.drbd {
 		// Nothing to suspend without DRBD; the take is point-in-time
 		// on its own.
 		return ctrl.Result{}, r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
@@ -263,14 +263,18 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 	// What the take needs from the API is read before the suspend, so
 	// the take inside the window is the storage command alone, as in
 	// LINSTOR, and a node that would refuse the take refuses it without
-	// freezing anything.
-	refused, err := r.refusesUnrecordedLUKSKey(ctx, snap)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	// freezing anything. The reads are still not free: a sibling that
+	// suspended first is frozen while this node reads, so they are
+	// made only for a resource that can carry a LUKS password.
+	if layers.luks {
+		refused, err := r.refusesUnrecordedLUKSKey(ctx, snap)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 
-	if refused {
-		return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
+		if refused {
+			return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
+		}
 	}
 
 	err = r.openWindow(ctx, snap)
@@ -331,22 +335,45 @@ func (r *SnapshotReconciler) refuseReopen(ctx context.Context, snap *blockstorio
 // suspend-io on it would fail the snapshot. An RD that is not found
 // keeps the default stack, which has DRBD.
 func (r *SnapshotReconciler) needsWindow(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (bool, error) {
+	layers, err := r.snapshotLayers(ctx, snap)
+
+	return layers.drbd, err
+}
+
+// snapshotResourceLayers is what a snapshot's resource stacks on this
+// satellite: drbd when it has a DRBD layer to suspend, luks when it can
+// carry a LUKS password.
+type snapshotResourceLayers struct {
+	drbd bool
+	luks bool
+}
+
+// snapshotLayers reads snap's layer stack from the cached definition.
+// An RD that is not found, or whose stack is empty and may still come
+// from its group, is assumed to carry LUKS, so the LUKS record is
+// checked whenever the stack does not rule it out.
+func (r *SnapshotReconciler) snapshotLayers(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot,
+) (snapshotResourceLayers, error) {
 	if !r.Config.Apply.DRBDEnabled() {
-		return false, nil
+		return snapshotResourceLayers{luks: true}, nil
 	}
 
 	var rd blockstoriov1alpha1.ResourceDefinition
 
 	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(snap.Spec.ResourceDefinitionName)}, &rd)
 	if apierrors.IsNotFound(err) {
-		return true, nil
+		return snapshotResourceLayers{drbd: true, luks: true}, nil
 	}
 
 	if err != nil {
-		return false, errors.Wrapf(err, "get ResourceDefinition %s", snap.Spec.ResourceDefinitionName)
+		return snapshotResourceLayers{}, errors.Wrapf(err, "get ResourceDefinition %s", snap.Spec.ResourceDefinitionName)
 	}
 
-	return rdNeedsDRBD(&rd), nil
+	return snapshotResourceLayers{
+		drbd: rdNeedsDRBD(&rd),
+		luks: len(rd.Spec.LayerStack) == 0 || layerStackHasLUKS(rd.Spec.LayerStack),
+	}, nil
 }
 
 // handleResumePhase closes this node's window for the snapshot: the

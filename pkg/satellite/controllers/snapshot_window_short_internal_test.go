@@ -280,6 +280,57 @@ func TestSnapshotWindowResumesAtTheDeadlineWhileTheTakeStampHangs(t *testing.T) 
 	}
 }
 
+// The LUKS record is read past the cache, before the suspend. A sibling
+// that suspended first is frozen while this node reads, and the check
+// ran again on every busy retry, so it is made only for a resource
+// whose layer stack can carry a LUKS password.
+func TestSnapshotWindowReadsTheLUKSRecordOnlyForALUKSStack(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		stack   []string
+		refused bool
+	}{
+		{stack: []string{"DRBD", "STORAGE"}},
+		{stack: []string{"DRBD", "LUKS", "STORAGE"}, refused: true},
+	} {
+		t.Run(strings.Join(tc.stack, ","), func(t *testing.T) {
+			t.Parallel()
+
+			rig := newWindowRig(t)
+			rig.create(&blockstoriov1alpha1.ResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{Name: windowTestResource},
+				Spec:       blockstoriov1alpha1.ResourceDefinitionSpec{LayerStack: tc.stack},
+			})
+			rig.create(&blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: windowTestResource + ".n1"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: windowTestResource, NodeName: "n1",
+					Volumes: []blockstoriov1alpha1.ResourceVolumeSpec{{VolumeNumber: 0, LUKSKey: testSnapshotKey()}},
+				},
+			})
+
+			reader := &suspendWatchingReader{Reader: rig.cli, kernel: rig.kernel}
+			rig.r.Config.APIReader = reader
+
+			rig.reconcile()
+
+			reads, _ := reader.counts()
+			if node := rig.node(); node.Failed != tc.refused || node.SuspendIOAcked == tc.refused {
+				t.Errorf("node status %+v, want refused=%t", node, tc.refused)
+			}
+
+			if tc.refused && reads == 0 {
+				t.Errorf("a LUKS stack was not checked for its LUKS record")
+			}
+
+			if !tc.refused && reads != 0 {
+				t.Errorf("%d API reads for a stack without LUKS, want none", reads)
+			}
+		})
+	}
+}
+
 // Between forgetting a window and removing its marker, the close is
 // still settling the Snapshot. The sweep of leftover markers took such
 // a marker for one an earlier process left and failed a snapshot whose
