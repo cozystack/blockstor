@@ -129,7 +129,7 @@ func (c *closeOnce) Close() error {
 	return nil
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
+func waitForObserver(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 
 	deadline := time.Now().Add(15 * time.Second)
@@ -213,7 +213,7 @@ func TestObserverReaderDoesNotWaitOnTheApiserver(t *testing.T) {
 
 	close(release)
 
-	waitFor(t, "the last state on the replica", func() bool {
+	waitForObserver(t, "the last state on the replica", func() bool {
 		status := getStatusReplica(t, base, name)
 
 		return healthyStatus(&status) && status.Connections[0].PeerVolumes[0].PeerDiskState == "UpToDate"
@@ -268,7 +268,7 @@ func TestObserverWritesNothingUntilTheDumpEnds(t *testing.T) {
 
 	runObserver(t, o, firstEnded, feed)
 
-	waitFor(t, "the first stream's state on the replica", func() bool {
+	waitForObserver(t, "the first stream's state on the replica", func() bool {
 		status := getStatusReplica(t, base, name)
 
 		return healthyStatus(&status)
@@ -298,7 +298,7 @@ func TestObserverWritesNothingUntilTheDumpEnds(t *testing.T) {
 		t.Fatalf("feed: %v", err)
 	}
 
-	waitFor(t, "a write after the new dump", func() bool { return len(applies.snapshot()) > before })
+	waitForObserver(t, "a write after the new dump", func() bool { return len(applies.snapshot()) > before })
 
 	for _, sent := range applies.snapshot()[before:] {
 		if !healthyStatus(&sent) {
@@ -342,7 +342,7 @@ func TestObserverClearsAResourceTheNewDumpLeftOut(t *testing.T) {
 
 	runObserver(t, o, feed)
 
-	waitFor(t, "the departed resource cleared", func() bool {
+	waitForObserver(t, "the departed resource cleared", func() bool {
 		var res blockstoriov1alpha1.Resource
 
 		err := cli.Get(t.Context(), client.ObjectKey{Name: name}, &res)
@@ -569,7 +569,7 @@ exists -
 
 	runObserver(t, o, feed)
 
-	waitFor(t, "the dump written", func() bool {
+	waitForObserver(t, "the dump written", func() bool {
 		return len(getStatusReplica(t, cli, name).Volumes[0].DiskState) > 0
 	})
 
