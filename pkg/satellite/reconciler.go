@@ -2123,7 +2123,7 @@ func (r *Reconciler) crossNodeClone(
 
 	defer func() { _ = body.Close() }()
 
-	err = shipper.RecvSnapshot(ctx, target, body)
+	err = shipper.RecvSnapshot(ctx, target, storage.Snapshot{ResourceName: srcRD, SnapshotName: snapName}, body)
 	if err != nil {
 		return errors.Wrapf(err, "recv %s/%s from %s", srcRD, snapName, peer)
 	}

@@ -52,6 +52,10 @@ const (
 	// LINSTOR's, so a dataset either of them marked is finished by both.
 	markedForDeletionProp = "linstor:marked_for_deletion"
 
+	// receivedSnapshotProp is set on a zvol by the receive that creates it,
+	// naming the snapshot the stream brought, until that snapshot is removed.
+	receivedSnapshotProp = "blockstor:received_snapshot"
+
 	// legacyDeletedMarker is the suffix older blockstor releases put on a
 	// snapshot whose delete was blocked by a clone. Such a snapshot was
 	// renamed because its delete was requested, so it counts as marked.
@@ -308,6 +312,59 @@ func (p *Provider) destroyIfReleased(ctx context.Context, snapshot string) (bool
 	}
 
 	return true, p.destroy(ctx, snapshot)
+}
+
+// receivedSnapshot names the snapshot a receive into dataset brought and has
+// not removed yet, or "" when there is none. A zvol that no receive created,
+// or whose receive finished, has no local value.
+func (p *Provider) receivedSnapshot(ctx context.Context, dataset string) (string, error) {
+	name, err := p.localProperty(ctx, dataset, receivedSnapshotProp)
+	if err != nil || name == "" {
+		return "", err
+	}
+
+	return dataset + "@" + name, nil
+}
+
+// finishReceive removes the snapshot a receive brought along with the zvol it
+// created, then the record of it. The record goes last, so a retry after any
+// failure on the way finds it and removes the snapshot again; once it is gone,
+// a snapshot of that name is one somebody took and is never touched.
+func (p *Provider) finishReceive(ctx context.Context, dataset string) error {
+	snapshot, err := p.receivedSnapshot(ctx, dataset)
+	if err != nil || snapshot == "" {
+		return err
+	}
+
+	err = p.dropReceivedSnapshot(ctx, snapshot)
+	if err != nil {
+		return err
+	}
+
+	_, err = p.exec.Run(ctx, "zfs", "inherit", receivedSnapshotProp, dataset)
+	if err != nil {
+		return errors.Wrapf(err, "zfs inherit %s %s", receivedSnapshotProp, dataset)
+	}
+
+	return nil
+}
+
+// dropReceivedSnapshot removes the snapshot a receive brought along with the
+// zvol it created. It is marked before it is destroyed, so a destroy that
+// fails leaves it to the delete of the zvol, which destroys a marked snapshot
+// without clones instead of keeping the zvol for it.
+func (p *Provider) dropReceivedSnapshot(ctx context.Context, snapshot string) error {
+	present, err := p.datasetPresent(ctx, snapshot)
+	if err != nil || !present {
+		return err
+	}
+
+	_, err = p.exec.Run(ctx, "zfs", "set", markedForDeletionProp+"=true", snapshot)
+	if err != nil {
+		return errors.Wrapf(err, "zfs set %s on received %s", markedForDeletionProp, snapshot)
+	}
+
+	return p.destroy(ctx, snapshot)
 }
 
 // markAndRename marks the dataset first and renames it second, as LINSTOR

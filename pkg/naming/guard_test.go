@@ -1437,6 +1437,8 @@ func allowed() map[string]string {
 		"pkg/dispatcher/dispatcher.go: drbdOpts[\"peer.\"+peer+\".port\"]":     oneIntent,
 		"pkg/rest/snapshots.go: objRefs[\"CreateTimestamp/\"+node.NodeName]":   shownKeys,
 		"pkg/rest/snapshots.go: objRefs[\"SnapshotUuid/\"+node.NodeName]":      shownKeys,
+		"pkg/storage/zfs/zfs.go: received != dataset": "" +
+			"two ZFS dataset names the provider built from the same snapshot name, and ZFS matches them byte for byte",
 		"pkg/store/cascade.go: slices.Contains(spellings, spelling)": "" +
 			"the store's own list of the spellings it asks under, which differ on purpose; deduplicated as written",
 		"internal/cli/definition.go: seen[key]": "" +
