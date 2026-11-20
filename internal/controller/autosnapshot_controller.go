@@ -264,7 +264,7 @@ func (r *AutoSnapshotRunnable) processRD(
 		return errors.Wrap(err, "parse NextAutoId")
 	}
 
-	nodes, skip, err := r.autoSnapshotNodes(ctx, rd)
+	target, skip, err := r.autoSnapshotTarget(ctx, rd)
 	if err != nil {
 		return err
 	}
@@ -279,7 +279,7 @@ func (r *AutoSnapshotRunnable) processRD(
 
 	snapName := formatAutoSnapshotName(id)
 
-	err = r.createAutoSnapshot(ctx, rd, snapName, nodes)
+	err = r.createAutoSnapshot(ctx, rd, snapName, &target)
 	if err != nil {
 		return errors.Wrapf(err, "create auto-snapshot %q", snapName)
 	}
@@ -298,28 +298,40 @@ func (r *AutoSnapshotRunnable) processRD(
 	return r.pruneOldAutoSnapshots(ctx, rd)
 }
 
-// autoSnapshotNodes returns the nodes an auto-snapshot of rd is taken
-// on: every node with an active diskful replica, the set a REST create
-// defaults an empty node list to. The orchestration targets exactly
-// these nodes and records SUCCESSFUL once each took its snapshot;
-// with no node listed it never starts, and linstor-csi waits on the
-// snapshot forever.
+// autoSnapshotTarget is what an auto-snapshot is taken from: the
+// nodes, and the wrapped LUKS passwords of the replicas on them.
+type autoSnapshotTarget struct {
+	nodes    []string
+	luksKeys []blockstoriov1alpha1.SnapshotLUKSKey
+}
+
+// autoSnapshotTarget returns what an auto-snapshot of rd is taken
+// from: every node with an active diskful replica, the set a REST
+// create defaults an empty node list to. The orchestration targets
+// exactly these nodes and records SUCCESSFUL once each took its
+// snapshot; with no node listed it never starts, and linstor-csi
+// waits on the snapshot forever. The replicas' LUKS passwords are
+// copied as the store copies them on a REST create: a satellite
+// refuses to take a snapshot that does not record its replica's.
 //
 // skip is non-empty when no auto-snapshot should be taken this tick,
 // as in LINSTOR's createAutoSnapshotInTransaction: a node of a replica
 // is offline, where a take could only freeze I/O on the reachable
 // replicas until the deadline aborts it, or no replica can take one.
-func (r *AutoSnapshotRunnable) autoSnapshotNodes(
+func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
-) ([]string, string, error) {
+) (autoSnapshotTarget, string, error) {
 	var resList blockstoriov1alpha1.ResourceList
 
 	err := r.Client.List(ctx, &resList)
 	if err != nil {
-		return nil, "", errors.Wrap(err, "list Resources")
+		return autoSnapshotTarget{}, "", errors.Wrap(err, "list Resources")
 	}
 
-	var nodes, offline []string
+	var (
+		target  autoSnapshotTarget
+		offline []string
+	)
 
 	for i := range resList.Items {
 		res := &resList.Items[i]
@@ -329,7 +341,7 @@ func (r *AutoSnapshotRunnable) autoSnapshotNodes(
 
 		down, nodeErr := r.nodeOffline(ctx, res.Spec.NodeName)
 		if nodeErr != nil {
-			return nil, "", nodeErr
+			return autoSnapshotTarget{}, "", nodeErr
 		}
 
 		if down {
@@ -341,21 +353,31 @@ func (r *AutoSnapshotRunnable) autoSnapshotNodes(
 			continue
 		}
 
-		nodes = append(nodes, res.Spec.NodeName)
+		target.nodes = append(target.nodes, res.Spec.NodeName)
+
+		for _, vol := range res.Spec.Volumes {
+			if vol.LUKSKey != nil {
+				target.luksKeys = append(target.luksKeys, blockstoriov1alpha1.SnapshotLUKSKey{
+					NodeName:     res.Spec.NodeName,
+					VolumeNumber: vol.VolumeNumber,
+					LUKSKey:      *vol.LUKSKey.DeepCopy(),
+				})
+			}
+		}
 	}
 
 	switch {
 	case len(offline) > 0:
 		sort.Strings(offline)
 
-		return nil, "node(s) " + strings.Join(offline, ", ") + " offline", nil
-	case len(nodes) == 0:
-		return nil, "no active diskful replica", nil
+		return autoSnapshotTarget{}, "node(s) " + strings.Join(offline, ", ") + " offline", nil
+	case len(target.nodes) == 0:
+		return autoSnapshotTarget{}, "no active diskful replica", nil
 	}
 
-	sort.Strings(nodes)
+	sort.Strings(target.nodes)
 
-	return nodes, "", nil
+	return target, "", nil
 }
 
 // nodeOffline reports whether the heartbeat watchdog marked the node
@@ -385,7 +407,7 @@ func (r *AutoSnapshotRunnable) createAutoSnapshot(
 	ctx context.Context,
 	rd *blockstoriov1alpha1.ResourceDefinition,
 	snapName string,
-	nodes []string,
+	target *autoSnapshotTarget,
 ) error {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
@@ -399,12 +421,13 @@ func (r *AutoSnapshotRunnable) createAutoSnapshot(
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: rd.Name,
 			SnapshotName:           snapName,
-			Nodes:                  nodes,
+			Nodes:                  target.nodes,
 			// Created suspended, as the REST create stamps a
 			// single snapshot: the take starts at once and the
 			// suspend deadline runs from creation.
 			SuspendIO:         true,
 			VolumeDefinitions: volumeRefsFromRD(rd),
+			LUKSKeys:          target.luksKeys,
 		},
 	}
 

@@ -19,6 +19,7 @@ limitations under the License.
 package controller_test
 
 import (
+	"bytes"
 	"context"
 	"slices"
 	"testing"
@@ -200,5 +201,49 @@ func TestAutoSnapshotSkipsWithoutADiskfulReplica(t *testing.T) {
 
 	if snaps := listAutoSnapshotsByRD(t, cli, rd.Name); len(snaps) != 0 {
 		t.Fatalf("auto-snapshot created with no diskful replica: %+v", snaps[0].Spec)
+	}
+}
+
+// A satellite refuses to take a snapshot that does not record its
+// replica's LUKS password, as the snapshot's bytes could never be read.
+// The auto-snapshot copies the passwords of the replicas it is taken on,
+// as the store does for a REST create, and only theirs.
+func TestAutoSnapshotRecordsTheReplicasLUKSPasswords(t *testing.T) {
+	t.Parallel()
+
+	rd := makeRDWithAutoSnapshot(t, "pvc-luks", 15, "")
+
+	key := func(fill byte) *blockstoriov1alpha1.LUKSKey {
+		return &blockstoriov1alpha1.LUKSKey{
+			KeyID:   "c7324c99567678f7",
+			Wrapped: bytes.Repeat([]byte{fill}, 12+64+16),
+			Origin:  blockstoriov1alpha1.LUKSKeyOriginGenerated,
+		}
+	}
+
+	encrypted := func(node string, fill byte, flags ...string) *blockstoriov1alpha1.Resource {
+		res := replica(rd.Name, node, flags...)
+		res.Spec.Volumes = []blockstoriov1alpha1.ResourceVolumeSpec{{VolumeNumber: 0, LUKSKey: key(fill)}}
+
+		return res
+	}
+
+	r, cli := autoSnapshotFixture(t, rd, encrypted("n1", 0xa1), encrypted("n2", 0xa2),
+		encrypted("n3", 0xa3, apiv1.ResourceFlagInactive))
+
+	tick(t, r)
+
+	snaps := listAutoSnapshotsByRD(t, cli, rd.Name)
+	if len(snaps) != 1 {
+		t.Fatalf("expected 1 auto-snapshot, got %d", len(snaps))
+	}
+
+	got := map[string]byte{}
+	for _, k := range snaps[0].Spec.LUKSKeys {
+		got[k.NodeName] = k.Wrapped[0]
+	}
+
+	if len(got) != 2 || got["n1"] != 0xa1 || got["n2"] != 0xa2 {
+		t.Errorf("auto-snapshot LUKS passwords by node = %#v, want n1 and n2 only", got)
 	}
 }
