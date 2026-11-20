@@ -460,3 +460,34 @@ func TestAutoSnapshotWaitsForATakeUnderWay(t *testing.T) {
 		t.Errorf("NextAutoId booked for a skipped auto-snapshot: %q", got)
 	}
 }
+
+// Evacuating a node flags the node EVICTED (LINSTOR's EVACUATE); its
+// replicas are on their way off it and are no snapshot source, as in
+// LINSTOR's createSnapshots.
+func TestAutoSnapshotLeavesOutANodeBeingEvacuated(t *testing.T) {
+	t.Parallel()
+
+	rd := makeRDWithAutoSnapshot(t, "pvc-evacuate", 15, "")
+
+	node := func(name string, flags ...string) *blockstoriov1alpha1.Node {
+		return &blockstoriov1alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       blockstoriov1alpha1.NodeSpec{Flags: flags},
+		}
+	}
+
+	r, cli := autoSnapshotFixture(t, rd,
+		node("n1"), node("n2", apiv1.NodeFlagEvicted), node("n3", "EVACUATE"),
+		replica(rd.Name, "n1"), replica(rd.Name, "n2"), replica(rd.Name, "n3"))
+
+	tick(t, r)
+
+	snaps := listAutoSnapshotsByRD(t, cli, rd.Name)
+	if len(snaps) != 1 {
+		t.Fatalf("expected 1 auto-snapshot, got %d", len(snaps))
+	}
+
+	if got := snaps[0].Spec.Nodes; !slices.Equal(got, []string{"n1"}) {
+		t.Errorf("auto-snapshot nodes = %v, want [n1]", got)
+	}
+}

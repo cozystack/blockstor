@@ -400,7 +400,9 @@ func (t *autoSnapshotTarget) add(res *blockstoriov1alpha1.Resource) {
 // as in LINSTOR's createAutoSnapshotInTransaction: a node of a replica
 // is offline, where a take could only freeze I/O on the reachable
 // replicas until the deadline aborts it, no replica can take one, or a
-// replica's pool cannot take snapshots.
+// replica's pool cannot take snapshots. A replica on a node being
+// evacuated is no source, as LINSTOR leaves out a node flagged
+// EVACUATE; blockstor's evacuate flags the node EVICTED.
 func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
 ) (autoSnapshotTarget, string, error) {
@@ -421,18 +423,18 @@ func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 			continue
 		}
 
-		down, nodeErr := r.nodeOffline(ctx, res.Spec.NodeName)
+		node, nodeErr := r.replicaNode(ctx, res.Spec.NodeName)
 		if nodeErr != nil {
 			return autoSnapshotTarget{}, "", nodeErr
 		}
 
-		if down {
+		if node.offline {
 			offline = append(offline, res.Spec.NodeName)
 		}
 
 		// A replica that holds no data, is down, or is being moved
 		// off its node is no source, as in LINSTOR's createSnapshots.
-		if slices.ContainsFunc(res.Spec.Flags, isNoSnapshotSourceFlag) {
+		if node.evacuating || slices.ContainsFunc(res.Spec.Flags, isNoSnapshotSourceFlag) {
 			continue
 		}
 
@@ -539,23 +541,40 @@ func (r *AutoSnapshotRunnable) poolsWithoutSnapshots(ctx context.Context, refs [
 	return slices.Compact(out), nil
 }
 
-// nodeOffline reports whether the heartbeat watchdog marked the node
-// OFFLINE. A node with no record is not taken for offline, the same
-// call the REST create makes.
-func (r *AutoSnapshotRunnable) nodeOffline(ctx context.Context, name string) (bool, error) {
+// replicaNodeState is what the node of a replica says about taking a
+// snapshot there.
+type replicaNodeState struct {
+	// offline: the heartbeat watchdog marked the node OFFLINE.
+	offline bool
+	// evacuating: the node is being emptied (EVICTED, or LINSTOR's
+	// EVACUATE).
+	evacuating bool
+}
+
+// replicaNode reads the state of the node named. A node with no record
+// is taken for neither, the same call the REST create makes.
+func (r *AutoSnapshotRunnable) replicaNode(ctx context.Context, name string) (replicaNodeState, error) {
 	var node blockstoriov1alpha1.Node
 
 	err := r.Client.Get(ctx, client.ObjectKey{Name: naming.Key(name)}, &node)
 	if apierrors.IsNotFound(err) {
-		return false, nil
+		return replicaNodeState{}, nil
 	}
 
 	if err != nil {
-		return false, errors.Wrapf(err, "get Node %q", name)
+		return replicaNodeState{}, errors.Wrapf(err, "get Node %q", name)
 	}
 
-	return isNodeOffline(&node), nil
+	return replicaNodeState{
+		offline: isNodeOffline(&node),
+		evacuating: slices.ContainsFunc(node.Spec.Flags, func(f string) bool {
+			return f == apiv1.NodeFlagEvicted || f == nodeFlagEvacuate
+		}),
+	}, nil
 }
+
+// nodeFlagEvacuate is LINSTOR's flag on a node being evacuated.
+const nodeFlagEvacuate = "EVACUATE"
 
 // createAutoSnapshot constructs the Snapshot CRD with the
 // `LabelAutoSnapshot=true` marker so the prune step can find it.
