@@ -220,9 +220,13 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
-	// Bug 302: allocate DRBD-IDs unconditionally on every live
-	// Resource Reconcile. The satellite's `waitForControllerAllocation`
-	// gate stalls until Status.DRBD{NodeID,Port,Minor} are non-nil,
+	// Bug 302: allocate DRBD-IDs on every live Resource Reconcile
+	// whose definition has a DRBD layer. A definition without one
+	// gets none, as in LINSTOR, where they are DRBD layer data, and
+	// one whose group stack is not pinned onto it yet waits for the
+	// pin instead of guessing (see replicaUsesDRBD). The satellite's
+	// `waitForControllerAllocation` gate stalls until
+	// Status.DRBD{NodeID,Port,Minor} are non-nil on a DRBD replica,
 	// and gating allocation behind `runApply`'s long-tail housekeeping
 	// (seed-from-Gi, auto-diskful) left a window where transient
 	// errors deeper in the apply chain prevented allocation from
@@ -246,9 +250,9 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// resourceVersion stays valid for the downstream Spec writers;
 	// requeue when allocation actually mutated state so the next
 	// pass observes the fresh revision uniformly.
-	requeue, err := r.allocateIdentity(ctx, &target)
-	if err != nil || requeue {
-		return ctrl.Result{Requeue: requeue}, err
+	result, done, err := r.allocateDRBDIDsIfUsed(ctx, &target)
+	if err != nil || done {
+		return result, err
 	}
 
 	// A freeze that fails is retried, but does not hold up the rest of
@@ -257,7 +261,7 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// still needs its apply.
 	freezeErr := r.freezeBlockSize(ctx, &target)
 
-	result, err := r.runApply(ctx, &target)
+	result, err = r.runApply(ctx, &target)
 	if freezeErr != nil {
 		return ctrl.Result{}, cerrors.Join(err, freezeErr)
 	}
@@ -389,8 +393,10 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	}
 
 	// Bug 302: DRBD-ID allocation moved to top-of-Reconcile (above the
-	// orphan gate) so it runs unconditionally on every Reconcile pass —
-	// the satellite's `waitForControllerAllocation` gate stalls until
+	// orphan gate) so it runs on every Reconcile pass of a replica whose
+	// definition has a DRBD layer, skipped for one without and held back
+	// until the layer stack is pinned (replicaUsesDRBD) — the
+	// satellite's `waitForControllerAllocation` gate stalls until
 	// Status.DRBD{NodeID,Port,Minor} are non-nil, and gating allocation
 	// behind `runApply` left a window where a Resource that hit the
 	// orphan branch or short-circuited before `runApply` could never
