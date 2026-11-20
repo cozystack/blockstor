@@ -199,3 +199,110 @@ func TestRGEventSkipsDefinitionWithoutDRBD(t *testing.T) {
 		t.Errorf("RG event placed %d replicas on a definition without DRBD, want 0", n)
 	}
 }
+
+// TestRGModifyPlacesEveryChildWithBalancingOff: `BalanceResourcesEnabled`
+// switches off LINSTOR's balance task, not an explicit `rg modify`,
+// which autoplaces every child whatever its stack. The RG event path
+// places the DRBD child on the same update and leaves out the
+// storage-only one, so the rebalance reconciler must place that one
+// before it strips the annotation, in whichever order the two run.
+func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
+	t.Parallel()
+
+	type reconciler interface {
+		Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error)
+	}
+
+	for name, rgEventFirst := range map[string]bool{
+		"RG event first":  true,
+		"rebalance first": false,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			scheme := newScheme(t)
+			cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+			st := store.NewInMemory()
+
+			seedNoDRBDRebalance(t, ctx, st, nil, []string{apiv1.LayerKindStorage}, map[string]string{
+				apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
+			})
+
+			if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+				Name:              "pvc-drbd",
+				ResourceGroupName: "rg",
+			}); err != nil {
+				t.Fatalf("seed drbd rd: %v", err)
+			}
+
+			if err := st.ControllerProps().Set(ctx, map[string]string{
+				apiv1.PropBalanceResourcesEnabled: "false",
+			}); err != nil {
+				t.Fatalf("set BalanceResourcesEnabled=false: %v", err)
+			}
+
+			order := []reconciler{
+				&controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st},
+				&controllerpkg.ResourceGroupReconciler{Client: cli, Scheme: scheme, Store: st},
+			}
+			if rgEventFirst {
+				order[0], order[1] = order[1], order[0]
+			}
+
+			for _, rec := range order {
+				if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
+					t.Fatalf("Reconcile: %v", err)
+				}
+			}
+
+			for _, rd := range []string{"pvc-local", "pvc-drbd"} {
+				if n := replicasOf(t, ctx, st, rd); n != 1 {
+					t.Errorf("rg modify with balancing off placed %d replicas on %q, want 1", n, rd)
+				}
+			}
+
+			rg, err := st.ResourceGroups().Get(ctx, "rg")
+			if err != nil {
+				t.Fatalf("get rg: %v", err)
+			}
+
+			if _, ok := rg.Annotations[apiv1.AnnotationRGRebalancePending]; ok {
+				t.Errorf("annotation not stripped with balancing off: %v", rg.Annotations)
+			}
+		})
+	}
+}
+
+// TestRGRebalanceDisabledLeavesDRBDChildToRGEvent pins the split: with
+// balancing off the rebalance reconciler places only the children the
+// RG event path leaves out, so the kill switch still holds for the
+// balance task on a DRBD definition.
+func TestRGRebalanceDisabledLeavesDRBDChildToRGEvent(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	st := store.NewInMemory()
+
+	seedNoDRBDRebalance(t, ctx, st, nil, nil, map[string]string{
+		apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
+	})
+
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropBalanceResourcesEnabled: "false",
+	}); err != nil {
+		t.Fatalf("set BalanceResourcesEnabled=false: %v", err)
+	}
+
+	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if n := replicasOf(t, ctx, st, "pvc-local"); n != 0 {
+		t.Errorf("disabled rebalance placed %d replicas on a DRBD definition, want 0", n)
+	}
+}

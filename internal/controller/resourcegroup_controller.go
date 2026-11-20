@@ -99,10 +99,11 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			continue
 		}
 
-		// Nobody asked for a placement here, so this follows the
-		// balance pass: a definition without DRBD is left alone. An
-		// explicit `rg modify` reaches it through the rebalance
-		// annotation instead.
+		// This runs on every group event, a controller start
+		// included, so it follows the balance pass: a definition
+		// without DRBD is left alone. An explicit `rg modify` reaches
+		// it through the rebalance annotation, which the rebalance
+		// reconciler places on whether balancing is on or off.
 		if !definitionUsesDRBD(&rds[i], &rg) {
 			continue
 		}
