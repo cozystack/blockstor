@@ -211,15 +211,15 @@ func TestAllocatorWaitsForLayerStackPin(t *testing.T) {
 	}
 }
 
-// countingReader counts the definition and group reads that reach the
+// layerReadCounter counts the definition and group reads that reach the
 // apiserver.
-type countingReader struct {
+type layerReadCounter struct {
 	client.Reader
 
 	defs, groups int
 }
 
-func (c *countingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+func (c *layerReadCounter) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	switch obj.(type) {
 	case *blockstoriov1alpha1.ResourceDefinition:
 		c.defs++
@@ -247,7 +247,7 @@ func TestAllocatorReadsLayerStackFromCache(t *testing.T) {
 			scheme := newScheme(t)
 			rg, rd, res := fx.objects()
 			cli := noDRBDClient(t, scheme, rg, rd, res)
-			live := &countingReader{Reader: cli}
+			live := &layerReadCounter{Reader: cli}
 
 			_, gotRes, gotRD := reconcileNoDRBD(t,
 				&controllerpkg.ResourceReconciler{Client: cli, APIReader: live, Scheme: scheme}, cli)
