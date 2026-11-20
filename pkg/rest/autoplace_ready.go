@@ -23,7 +23,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/cockroachdb/errors"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -177,14 +176,17 @@ func (s *Server) waitReplicasReadyBy(ctx context.Context, rdName string, deploye
 		return nil
 	}
 
-	notConnected := notConnectedWarnings(s.replicasNotConnected(ctx, rdName))
+	view := s.newDeployedView(rdName, deployed)
+
+	replicas, unconfirmed := view.list(ctx)
+	notConnected := notConnectedWarnings(s.replicasNotConnected(ctx, append(replicaNodes(replicas), unconfirmed...)))
 
 	volumes := s.deployedVolumeSizes(ctx, rdName)
 	if len(volumes) == 0 {
 		return notConnected
 	}
 
-	unbuilt, done := s.waitDeployedReplicasBuilt(ctx, rdName, deployed, volumes, buildDeadline)
+	unbuilt, done := s.waitDeployedReplicasBuilt(ctx, view, volumes, buildDeadline)
 	if !done {
 		return nil
 	}
@@ -200,11 +202,7 @@ func (s *Server) waitReplicasReadyBy(ctx context.Context, rdName string, deploye
 	deadline := time.Now().Add(s.ResourceReadyWait)
 
 	for {
-		pending, err := s.deployedReplicasNotReady(ctx, rdName, deployed, volumes)
-		if err != nil {
-			return notConnected
-		}
-
+		pending := s.deployedReplicasNotReady(ctx, view, volumes)
 		if len(pending) == 0 {
 			return notConnected
 		}
@@ -237,15 +235,15 @@ func (s *Server) waitReplicasReadyBy(ctx context.Context, rdName string, deploye
 // A zero s.ResourceDeployWait skips the step, which unit tests that run
 // no satellite rely on; the binaries set DefaultResourceDeployWait.
 func (s *Server) waitDeployedReplicasBuilt(
-	ctx context.Context, rdName string, deployed []string, volumes map[int32]int64, deadline time.Time,
+	ctx context.Context, view *deployedView, volumes map[int32]int64, deadline time.Time,
 ) ([]string, bool) {
 	if s.ResourceDeployWait <= 0 {
 		return nil, true
 	}
 
 	for {
-		unbuilt, err := s.deployedReplicasNotBuilt(ctx, rdName, deployed, volumes)
-		if err != nil || len(unbuilt) == 0 {
+		unbuilt := s.deployedReplicasNotBuilt(ctx, view, volumes)
+		if len(unbuilt) == 0 {
 			return nil, true
 		}
 
@@ -261,24 +259,23 @@ func (s *Server) waitDeployedReplicasBuilt(
 	}
 }
 
-// deployedReplicasNotBuilt lists the deployed replicas of rdName whose
-// satellite has not built them yet. A replica on a node that is not
-// ONLINE has been answered with the not-connected warning instead, and
-// an INACTIVE replica is never built.
-func (s *Server) deployedReplicasNotBuilt(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, error) {
-	replicas, err := s.deployedReplicas(ctx, rdName, deployed)
-	if err != nil {
-		return nil, err
-	}
+// deployedReplicasNotBuilt lists the deployed replicas of the view's
+// definition whose satellite has not built them yet. A replica on a
+// node that is not ONLINE has been answered with the not-connected
+// warning instead, and an INACTIVE replica is never built. A replica
+// neither the cache nor the API server could be read for counts as not
+// built, so the bound decides rather than a failed read.
+func (s *Server) deployedReplicasNotBuilt(ctx context.Context, view *deployedView, volumes map[int32]int64) []string {
+	replicas, unconfirmed := view.list(ctx)
 
 	byNode := make(map[string]*apiv1.Resource, len(replicas))
 	for i := range replicas {
 		byNode[naming.Key(replicas[i].NodeName)] = &replicas[i]
 	}
 
-	var out []string
+	out := s.onlineNodes(ctx, unconfirmed)
 
-	for _, node := range deployed {
+	for _, node := range view.deployed {
 		rsc, ok := byNode[naming.Key(node)]
 		if !ok || slices.Contains(rsc.Flags, apiv1.ResourceFlagInactive) || !s.nodeIsOnline(ctx, rsc.NodeName) {
 			continue
@@ -289,7 +286,20 @@ func (s *Server) deployedReplicasNotBuilt(ctx context.Context, rdName string, de
 		}
 	}
 
-	return out, nil
+	return out
+}
+
+// onlineNodes keeps the nodes of nodes whose satellite is ONLINE.
+func (s *Server) onlineNodes(ctx context.Context, nodes []string) []string {
+	var out []string
+
+	for _, node := range nodes {
+		if s.nodeIsOnline(ctx, node) {
+			out = append(out, node)
+		}
+	}
+
+	return out
 }
 
 // deployedVolumeSizes is definitionVolumeSizes for the waits: when the
@@ -319,9 +329,9 @@ func (s *Server) deployedVolumeSizes(ctx context.Context, rdName string) map[int
 	return out
 }
 
-// deployedReplicas lists the replicas of rdName for a wait on the
-// replicas on deployed. It reads the cache, and the API server when the
-// cache does not list one of them yet.
+// deployedView is what one wait reads the replicas of rdName through,
+// for the replicas on deployed. It reads the cache, and the API server
+// when the cache does not list one of them yet.
 //
 // The call that deployed them wrote them a few milliseconds earlier,
 // and this apiserver's informer cache trails its own writes. Both waits
@@ -331,24 +341,69 @@ func (s *Server) deployedVolumeSizes(ctx context.Context, rdName string) map[int
 // without the device path and refused ControllerPublishVolume with
 // "could not determine device path". LINSTOR answers from the objects
 // it just created, so it never misses one.
-func (s *Server) deployedReplicas(ctx context.Context, rdName string, deployed []string) ([]apiv1.Resource, error) {
-	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
-	if err != nil {
-		return nil, errors.Wrap(err, "list replicas")
-	}
+type deployedView struct {
+	s        *Server
+	rdName   string
+	deployed []string
 
-	for _, node := range deployed {
-		if !slices.ContainsFunc(replicas, func(r apiv1.Resource) bool { return naming.Same(r.NodeName, node) }) {
-			live, err := store.LiveReplicas(ctx, s.Store, rdName)
-			if err != nil {
-				return nil, errors.Wrap(err, "list replicas past the cache")
-			}
+	// gone holds the deployed nodes the API server listed no replica
+	// on: deleted meanwhile, for instance by a linstor-csi that gave
+	// up. The cache will not list them either, and asking the API
+	// server again on every poll would only add load.
+	gone map[string]bool
 
-			return live, nil
+	// failed is set once a failed read past the cache was logged, so a
+	// wait logs it once and not on every poll.
+	failed bool
+}
+
+func (s *Server) newDeployedView(rdName string, deployed []string) *deployedView {
+	return &deployedView{s: s, rdName: rdName, deployed: deployed, gone: map[string]bool{}}
+}
+
+// list returns the replicas of the definition, and the deployed nodes
+// whose replica neither the cache nor the API server could be read for.
+// The caller treats those as not built and not ready, so a failed read
+// holds the answer until the bound instead of ending the wait as if
+// there were nothing to wait for.
+func (v *deployedView) list(ctx context.Context) ([]apiv1.Resource, []string) {
+	replicas, cacheErr := v.s.Store.Resources().ListByDefinition(ctx, v.rdName)
+
+	var missing []string
+
+	for _, node := range v.deployed {
+		if v.gone[naming.Key(node)] {
+			continue
+		}
+
+		if cacheErr != nil || !slices.ContainsFunc(replicas, func(r apiv1.Resource) bool { return naming.Same(r.NodeName, node) }) {
+			missing = append(missing, node)
 		}
 	}
 
-	return replicas, nil
+	if len(missing) == 0 {
+		return replicas, nil
+	}
+
+	live, err := store.LiveReplicas(ctx, v.s.Store, v.rdName)
+	if err != nil {
+		if !v.failed {
+			v.failed = true
+			log.FromContext(ctx).WithName("rest").Error(err,
+				"list replicas past the cache; waiting for the ones the cache does not list until the bound",
+				"resourceDefinition", v.rdName, "nodes", missing)
+		}
+
+		return replicas, missing
+	}
+
+	for _, node := range missing {
+		if !slices.ContainsFunc(live, func(r apiv1.Resource) bool { return naming.Same(r.NodeName, node) }) {
+			v.gone[naming.Key(node)] = true
+		}
+	}
+
+	return live, nil
 }
 
 // replicaBuilt reports whether the satellite built every volume of rsc:
@@ -380,26 +435,23 @@ func (s *Server) definitionHasDRBD(ctx context.Context, rdName string) bool {
 	return apiv1.LayerInStack(s.resolveAutoplaceLayerStack(ctx, &rd), apiv1.LayerKindDRBD)
 }
 
-// replicasNotConnected lists the nodes, in order, of the replicas of
-// rdName whose satellite is not ONLINE: those LINSTOR's updateSatellites
+// replicasNotConnected lists, in order, those of the replica nodes
+// whose satellite is not ONLINE: those LINSTOR's updateSatellites
 // cannot reach and answers with the not-connected warning. A replica on
-// an EVICTED node is left out, as updateSatellites skips it.
-func (s *Server) replicasNotConnected(ctx context.Context, rdName string) []string {
-	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
-	if err != nil {
-		return nil
-	}
-
+// an EVICTED node is left out, as updateSatellites skips it. The nodes
+// come from the wait's deployedView, so a replica the cache does not
+// list yet is warned like the others.
+func (s *Server) replicasNotConnected(ctx context.Context, nodes []string) []string {
 	var out []string
 
-	for i := range replicas {
-		node, err := s.Store.Nodes().Get(ctx, replicas[i].NodeName)
+	for _, name := range nodes {
+		node, err := s.Store.Nodes().Get(ctx, name)
 		if err != nil || slices.Contains(node.Flags, apiv1.NodeFlagEvicted) {
 			continue
 		}
 
 		if node.ConnectionStatus != apiv1.NodeTypeOnline {
-			out = append(out, replicas[i].NodeName)
+			out = append(out, name)
 		}
 	}
 
@@ -408,21 +460,19 @@ func (s *Server) replicasNotConnected(ctx context.Context, rdName string) []stri
 	return out
 }
 
-// deployedReplicasNotReady lists the deployed replicas of rdName that
-// LINSTOR would wait for and that are not ready yet. A replica on a
-// node that is not ONLINE is not waited for: it has been answered with
-// the not-connected warning.
-func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, error) {
-	replicas, err := s.deployedReplicas(ctx, rdName, deployed)
-	if err != nil {
-		return nil, err
-	}
+// deployedReplicasNotReady lists the deployed replicas of the view's
+// definition that LINSTOR would wait for and that are not ready yet. A
+// replica on a node that is not ONLINE is not waited for: it has been
+// answered with the not-connected warning. A deployed replica that could
+// not be read is counted as not ready, as in deployedReplicasNotBuilt.
+func (s *Server) deployedReplicasNotReady(ctx context.Context, view *deployedView, volumes map[int32]int64) []string {
+	replicas, unconfirmed := view.list(ctx)
 
-	if len(replicas) <= 1 || allReplicasDiskless(replicas) {
+	if len(replicas)+len(unconfirmed) <= 1 || (len(unconfirmed) == 0 && allReplicasDiskless(replicas)) {
 		// The first replica has no peer to connect to, and an
 		// all-diskless definition has no data to reach: LINSTOR
 		// does not wait for either.
-		return nil, nil
+		return nil
 	}
 
 	byNode := make(map[string]*apiv1.Resource, len(replicas))
@@ -436,9 +486,9 @@ func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, de
 
 	peers := onlineDiskfulPeers(replicas, online)
 
-	var pending []string
+	pending := s.onlineNodes(ctx, unconfirmed)
 
-	for _, node := range deployed {
+	for _, node := range view.deployed {
 		rsc, ok := byNode[naming.Key(node)]
 		if !ok || slices.Contains(rsc.Flags, apiv1.ResourceFlagInactive) || !online[naming.Key(node)] {
 			continue
@@ -449,7 +499,7 @@ func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, de
 		}
 	}
 
-	return pending, nil
+	return pending
 }
 
 // nodeIsOnline reports whether the satellite on nodeName is ONLINE,
