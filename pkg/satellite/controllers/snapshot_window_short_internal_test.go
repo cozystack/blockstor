@@ -21,6 +21,7 @@ package controllers
 import (
 	"context"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -125,5 +126,39 @@ func TestSnapshotWindowRefusesAnUnrecordedLUKSKeyWithoutSuspending(t *testing.T)
 
 	if cmds := rig.kernel.commands(); slices.Contains(cmds, "drbdadm suspend-io "+windowTestResource) {
 		t.Errorf("suspended a resource whose take is refused: %v", cmds)
+	}
+}
+
+// The resume order is answered with resume-io first. A status read in
+// front of it only kept the window open for one more command; the read
+// after the resume still confirms it.
+func TestSnapshotWindowResumesBeforeReadingTheKernel(t *testing.T) {
+	t.Parallel()
+
+	rig := newWindowRig(t)
+	rig.startWatchdog()
+
+	rig.reconcile()
+	rig.controllerSets(true, true)
+	rig.reconcile()
+	eventually(t, "Ready", func() bool { return rig.node().Ready })
+
+	issued := len(rig.kernel.commands())
+
+	rig.controllerSets(false, false)
+	rig.reconcile()
+	eventually(t, "ack cleared", func() bool { return !rig.node().SuspendIOAcked })
+
+	// The watchdog's sweep reads every resource at once on its own
+	// timer; only the commands for this resource are the close's.
+	after := slices.DeleteFunc(rig.kernel.commands()[issued:], func(cmd string) bool {
+		return !strings.Contains(cmd, windowTestResource)
+	})
+	if len(after) == 0 || after[0] != "drbdadm resume-io "+windowTestResource {
+		t.Errorf("commands after the resume order %v, want resume-io first", after)
+	}
+
+	if rig.kernel.isSuspended() {
+		t.Errorf("still suspended after the window: %v", after)
 	}
 }

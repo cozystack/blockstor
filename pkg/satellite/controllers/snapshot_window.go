@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
@@ -677,10 +678,20 @@ func (*SnapshotReconciler) runBounded(ctx context.Context, bound time.Duration, 
 }
 
 // resumeAndVerify resumes the marker's resource and returns nil only
-// once the kernel reports it not suspended. It reads the state first so
-// it can fall back to resuming by minor when the .res is gone, and
-// again afterwards so the answer is the kernel's, not the exit code's.
+// once the kernel reports it not suspended. It reads the state first,
+// so a resource that is not suspended is left alone and the minors to
+// fall back on are known when the .res is gone, and again afterwards so
+// the answer is the kernel's, not the exit code's.
 func (r *SnapshotReconciler) resumeAndVerify(ctx context.Context, marker *suspendMarker) error {
+	return r.resumeVerified(ctx, marker, true)
+}
+
+// resumeVerified is resumeAndVerify with the first read optional. The
+// close of a window this process opened skips it: the resource is
+// suspended and the marker has its minors, so the read would only hold
+// I/O frozen for one more command. LINSTOR resumes right after the take
+// the same way, with resume-io alone.
+func (r *SnapshotReconciler) resumeVerified(ctx context.Context, marker *suspendMarker, readFirst bool) error {
 	if !r.Config.Apply.DRBDEnabled() {
 		return nil
 	}
@@ -692,13 +703,23 @@ func (r *SnapshotReconciler) resumeAndVerify(ctx context.Context, marker *suspen
 
 	resource := marker.Resource
 
-	before, beforeErr := r.Config.Apply.ResourceSuspendState(cmdCtx, resource)
-	if beforeErr == nil && (!before.Loaded || !before.SuspendedUser) {
-		return nil
+	var before drbd.SuspendState
+
+	if readFirst {
+		state, stateErr := r.Config.Apply.ResourceSuspendState(cmdCtx, resource)
+		if stateErr == nil && (!state.Loaded || !state.SuspendedUser) {
+			return nil
+		}
+
+		before = state
 	}
 
 	resumeErr := r.Config.Apply.ResumeResource(cmdCtx, resource)
 	if resumeErr != nil {
+		if !readFirst && len(marker.Minors) == 0 {
+			before, _ = r.Config.Apply.ResourceSuspendState(cmdCtx, resource)
+		}
+
 		minors := slices.Clone(marker.Minors)
 		for _, minor := range before.Minors {
 			if !slices.Contains(minors, minor) {
@@ -768,7 +789,7 @@ func (r *SnapshotReconciler) closeWindow(ctx context.Context, snapshot string, f
 	logger := log.FromContext(ctx).WithValues("snapshot", snapshot, "resource", marker.Resource)
 	failOwed := r.failOnClose(ctx, w, snapshot, failSnapshot, reason)
 
-	err = r.resumeAndVerify(ctx, &marker)
+	err = r.resumeVerified(ctx, &marker, false)
 	if err != nil {
 		logger.Info("resume-io not confirmed; retrying", "error", err.Error())
 		r.warnResumeFailed(ctx, snapshot, err)
