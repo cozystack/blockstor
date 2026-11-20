@@ -28,9 +28,11 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -753,6 +755,20 @@ type ObserverRunnable struct {
 	// noise filter if every one woke the reconciler.
 	lifecycleMu    sync.Mutex
 	lifecycleCache map[string]lifecycleSignature
+
+	// appliedMu / applied hold, per Resource CR, the last status this
+	// observer applied and the object version the apiserver answered
+	// with. writeStatus skips an apply that would send the same
+	// status onto that same version: nothing could have changed it.
+	appliedMu sync.Mutex
+	applied   map[string]appliedStatus
+}
+
+// appliedStatus is one entry of ObserverRunnable.applied.
+type appliedStatus struct {
+	uid             types.UID
+	resourceVersion string
+	status          blockstoriov1alpha1.ResourceStatus
 }
 
 // lifecycleSignature is the compact per-resource fingerprint
@@ -873,9 +889,10 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 const observerResyncInterval = 5 * time.Second
 
 // resyncLoop ticks every observerResyncInterval and re-applies
-// every cached resource's full snapshot. Cheap — the SSA payload
-// is small, and the apiserver's "same fields, same values" merge
-// is a no-op on the wire.
+// every cached resource's full snapshot. writeStatus sends only the
+// replicas whose status differs from the last apply or that someone
+// else wrote since; a no-op apply is still a request, and a hundred of
+// them every tick crowd out the frames that carry real changes.
 func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
 	logger := log.FromContext(ctx).WithName("observer-resync")
 
@@ -1922,6 +1939,19 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		},
 	}
 
+	// The resync re-sends every replica every 5 s. On a node with about
+	// a hundred replicas that is more than the client's 20 requests a
+	// second, and the frames carrying a running resync's progress
+	// queued behind it: `SyncTarget(x%)` trailed the kernel by several
+	// seconds. Skip what the apiserver provably holds already; any
+	// other writer's change bumps the version and brings the apply
+	// back, so a clobbered field is still restored on the next pass.
+	if lookupErr == nil && o.alreadyApplied(name, &lookup, &apply.Status) {
+		return nil
+	}
+
+	sent := apply.Status.DeepCopy()
+
 	// No ForceOwnership: observer only owns the runtime-state
 	// subfields (diskState / currentGi / connections / inUse /
 	// drbdState / outOfSyncKib / replicationState). The
@@ -1933,10 +1963,46 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
 		client.FieldOwner(k8s.SatelliteFieldOwner))
 	if err != nil {
+		o.forgetApplied(name)
+
 		return errors.Wrapf(err, "ssa apply Resource.Status %s", name)
 	}
 
+	o.rememberApplied(name, apply, sent)
+
 	return nil
+}
+
+// alreadyApplied reports whether status is what this observer last
+// applied to the replica and the replica has not been written since.
+func (o *ObserverRunnable) alreadyApplied(name string, current *blockstoriov1alpha1.Resource, status *blockstoriov1alpha1.ResourceStatus) bool {
+	o.appliedMu.Lock()
+	defer o.appliedMu.Unlock()
+
+	last, ok := o.applied[name]
+
+	return ok && last.uid == current.UID && last.resourceVersion == current.ResourceVersion &&
+		equality.Semantic.DeepEqual(&last.status, status)
+}
+
+// rememberApplied records what was sent and the version the apiserver
+// answered with; the apply decodes the response into written.
+func (o *ObserverRunnable) rememberApplied(name string, written *blockstoriov1alpha1.Resource, sent *blockstoriov1alpha1.ResourceStatus) {
+	o.appliedMu.Lock()
+	defer o.appliedMu.Unlock()
+
+	if o.applied == nil {
+		o.applied = map[string]appliedStatus{}
+	}
+
+	o.applied[name] = appliedStatus{uid: written.UID, resourceVersion: written.ResourceVersion, status: *sent}
+}
+
+func (o *ObserverRunnable) forgetApplied(name string) {
+	o.appliedMu.Lock()
+	defer o.appliedMu.Unlock()
+
+	delete(o.applied, name)
 }
 
 // skipDiskPropKey is the LINSTOR-compatible property path
