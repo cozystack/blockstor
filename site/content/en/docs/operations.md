@@ -109,7 +109,9 @@ blockstor node lost worker-2
 
 This deletes the node's replicas and pools, then the `Node`. It is refused while the satellite still reports `ONLINE`, unless you pass `--force`. Surviving replicas are left alone, and the controller places replacements for them. A satellite pod that restarts on that host afterwards does not re-create the `Node`; register it again with `node create` if the node returns.
 
-`blockstor node delete` removes only the `Node` object and refuses while replicas or pools still point at it. With `--force` it deletes them too, like `node lost`.
+As in LINSTOR, nothing on the lost node's disks is touched. Its replicas' volumes and its copies of snapshots stay where they are: the replicas are removed without waiting for a satellite that will never run again, and the node's hold on its snapshots is dropped. A satellite that turns out to be running after all, with `--force`, tears down DRBD for those replicas and keeps their volumes. If the disks come back, delete what you do not need on them by hand.
+
+`blockstor node delete` removes only the `Node` object and refuses while replicas or pools still point at it, or snapshots still have a copy on it. With `--force` it deletes them too, like `node lost`.
 
 ## Replacing a replica with a bad disk
 
@@ -176,6 +178,25 @@ In-place rollback is not available on purpose. A definition cannot be deleted wh
 ```sh
 blockstor snapshot delete my-volume before-upgrade
 ```
+
+## What deleting removes from disk
+
+Storage is deleted only by the delete of the object it belongs to, and only by that object's satellite. Nothing scans the pools for volumes no replica claims; a volume blockstor does not know about is never touched, and a volume left behind stays until you remove it.
+
+- **A replica.** Its satellite deletes the replica's volumes, then releases the `Resource`. Until then the replica stays listed with the `DELETE` flag, and `resource delete` or `resource-definition delete` adds a warning that the deletion is still in progress. A satellite that is stopped keeps its replicas in that state until it starts again; for a node that is gone for good, use `node lost`.
+- **A snapshot.** Every node in the snapshot's node list deletes its own copy, and the `Snapshot` goes once the last one has.
+- **ZFS, a volume with snapshots.** Deleting the replica does not take its snapshots with it, and nothing is ever destroyed recursively. Like LINSTOR, the satellite marks the zvol with `linstor:marked_for_deletion=true` and renames it to `_deleted_<name>_<time>`; the snapshots stay usable for restores. The zvol is destroyed when the delete of its last snapshot empties it. A snapshot that still has clones is marked and renamed to `<zvol>@_deleted_<snapshot>_<time>` in the same way, and is destroyed with its last clone. The rename suffix is recorded on the replica and on that node's snapshots as `Internal/StorDriver/ZfsRenameSuffix`, so later snapshot operations find the renamed zvol.
+- **ZFS, a restore received from another node.** A restore replica on a node that holds no copy of the snapshot is filled by `zfs send | zfs recv` from a peer, and the receive leaves a copy of the source snapshot on the new zvol. The satellite removes that copy once the receive is done, as LINSTOR does after a clone by send and receive, so deleting the restored volume destroys its zvol. Earlier releases kept the copy, and deleting such a restored volume renamed its zvol to `_deleted_<name>_<time>` and kept it with the copy. Find these with `zfs list -t snapshot -o name`: a `_deleted_` zvol whose only snapshot is named after the restore's source snapshot and that no `Snapshot` names. Destroy what you no longer need by hand. A restored volume that is still in use keeps the copy too, and the upgrade does not remove it: deleting that volume would leave the same `_deleted_` zvol, and a snapshot of the restored resource taken under the source snapshot's name would be skipped as already present and hold the restore's data. On each node, list the snapshots of the restored resource's zvol with `zfs list -t snapshot -o name <pool>/<resource>_00000`; one named after the restore's source snapshot that no `Snapshot` of the restored resource names is the copy, and `zfs destroy <pool>/<resource>_00000@<snapshot>` removes it without touching the volume's data. A receive that stops part way through records the snapshot it brought in the zvol's `blockstor:received_snapshot` property, and the satellite removes the copy on its next pass.
+- **ZFS delete strategy.** `StorDriver/Zfs/DeleteStrategy`, set on the resource definition, its resource group or the controller, works as in LINSTOR. `DELETE` refuses to delete a replica or a volume definition while the resource definition has snapshots; `RENAME` and the default `DYNAMIC` let the delete through and rename as above.
+- **LVM thin.** The volume is removed; its thin snapshots are independent and stay.
+- **LVM thick.** A volume that still has snapshots is not removed, because removing it would remove them: the delete stays pending until the snapshots are deleted.
+- **A volume definition.** `volume-definition delete` removes the volume from the definition and leaves each replica's volume on disk; see [Compatibility](../compatibility/).
+
+- **A storage pool.** Deleting a pool never touches the disk. It is refused while a replica uses the pool, and, for a diskful pool, while a snapshot has a copy on the node, since that copy can only be deleted through the node's pools. `--force` overrides both, and a snapshot copy left in a pool removed that way is not deleted.
+
+A satellite that cannot tell whether a volume is there, because the pool does not answer, is not imported, or is not registered yet after a restart, keeps the object and retries instead of reporting it deleted.
+
+Clones that an older blockstor release promoted when their source was deleted own that source's snapshots, and no `Snapshot` points at them any more. Deleting such a clone now renames it to `_deleted_<name>_<time>` with those snapshots and keeps it. After upgrading, look for them with `zfs list -t snapshot -o name`: a snapshot under a replica's zvol that no `Snapshot` names is one of these. Destroy what you no longer need by hand.
 
 ## Backing up the control plane
 

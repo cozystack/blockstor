@@ -28,6 +28,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 	"github.com/cozystack/blockstor/internal/cli/view"
@@ -150,6 +151,37 @@ func poolProps(provider storageProvider, backing string) (map[string]string, err
 	return props, nil
 }
 
+// errPoolStillReferenced refuses a pool delete while replicas use it or
+// snapshots may have a copy in it.
+var errPoolStillReferenced = errors.New("storage pool is still referenced")
+
+// refusePoolDeleteIfReferenced is the REST door's pool delete refusal. A
+// replica or a snapshot copy in the pool can only be deleted through it, and
+// with the pool gone that delete never finishes.
+func refusePoolDeleteIfReferenced(ctx context.Context, run *runContext, node, pool string) error {
+	replicas, err := store.ReplicasInPool(ctx, run.Store, node, pool)
+	if err != nil {
+		return fmt.Errorf("list replicas on %s: %w", node, err)
+	}
+
+	if len(replicas) > 0 {
+		return fmt.Errorf("%w: volumes [%s] still use %s on %s; delete them or pass --force",
+			errPoolStillReferenced, strings.Join(replicas, ", "), pool, node)
+	}
+
+	snapshots, err := store.SnapshotsInPool(ctx, run.Store, node, pool)
+	if err != nil {
+		return fmt.Errorf("list snapshots on %s: %w", node, err)
+	}
+
+	if len(snapshots) > 0 {
+		return fmt.Errorf("%w: %s on %s may hold copies of snapshots [%s]; delete them or pass --force",
+			errPoolStillReferenced, pool, node, strings.Join(snapshots, ", "))
+	}
+
+	return nil
+}
+
 // storagePoolDelete implements `storage-pool delete <node> <pool>`.
 func storagePoolDelete(ctx context.Context, run *runContext) error {
 	const wantArgs = 2
@@ -159,6 +191,13 @@ func storagePoolDelete(ctx context.Context, run *runContext) error {
 	}
 
 	node, pool := run.Flags.Positionals[0], run.Flags.Positionals[1]
+
+	if !run.Flags.Force {
+		err := refusePoolDeleteIfReferenced(ctx, run, node, pool)
+		if err != nil {
+			return err
+		}
+	}
 
 	err := run.Store.StoragePools().Delete(ctx, node, pool)
 	if err != nil && !isNotFound(err) {

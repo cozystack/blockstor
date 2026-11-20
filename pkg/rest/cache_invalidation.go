@@ -20,10 +20,13 @@ package rest
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
 
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -86,33 +89,34 @@ const cacheConvergePollInterval = 50 * time.Millisecond
 // waitForRDDeletionVisible blocks until the local Store reports that
 // the ResourceDefinition `name` and every child Resource under it
 // are gone from the cache view, or `cacheConvergeBudget` elapses.
-// Returns nil whether the deletion converged or the budget ran out
-// — both are acceptable outcomes for the caller (the write already
-// committed). Context cancellation aborts the wait early.
+// Reports whether the deletion converged. The budget running out is
+// not an error, since the write already committed, but it usually means
+// a satellite has not confirmed its storage is gone yet, and the caller
+// says so in its answer. Context cancellation aborts the wait early.
 //
 // This is invoked by handleRDDelete AFTER the apiserver-side Delete
 // returns success, so the lifetimes line up: every reader on this
 // replica sees a converged cache by the time the handler responds
 // 200.
-func (s *Server) waitForRDDeletionVisible(ctx context.Context, name string) {
+func (s *Server) waitForRDDeletionVisible(ctx context.Context, name string) bool {
 	if s == nil || s.Store == nil {
-		return
+		return true
 	}
 
 	deadline := time.Now().Add(cacheConvergeBudget)
 
 	for {
 		if rdDeletionVisible(ctx, s.Store, name) {
-			return
+			return true
 		}
 
 		if time.Now().After(deadline) {
-			return
+			return false
 		}
 
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(cacheConvergePollInterval):
 		}
 	}
@@ -157,25 +161,25 @@ func rdDeletionVisible(ctx context.Context, st store.Store, name string) bool {
 // Invoked by handleResourceDelete after the apiserver-side Delete
 // commits, so a follow-up `r l` on the same replica reflects the
 // drop immediately rather than after a 5–30 s watch lag.
-func (s *Server) waitForResourceDeletionVisible(ctx context.Context, rdName, node string) {
+func (s *Server) waitForResourceDeletionVisible(ctx context.Context, rdName, node string) bool {
 	if s == nil || s.Store == nil {
-		return
+		return true
 	}
 
 	deadline := time.Now().Add(cacheConvergeBudget)
 
 	for {
 		if resourceDeletionVisible(ctx, s.Store, rdName, node) {
-			return
+			return true
 		}
 
 		if time.Now().After(deadline) {
-			return
+			return false
 		}
 
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(cacheConvergePollInterval):
 		}
 	}
@@ -350,4 +354,35 @@ func snapshotDeletionVisible(ctx context.Context, st store.Store, rdName, snapNa
 	// converged case; a transport error means we can't probe and
 	// looping won't help.
 	return true
+}
+
+// deleteInProgress is the warning a delete answer carries for replicas still
+// waiting on their satellites.
+func deleteInProgress(rdName string, nodes []string) apiv1.APICallRc {
+	return apiv1.APICallRc{
+		RetCode: warnDeleteInProgress,
+		Message: "deletion of '" + rdName + "' is in progress on " + strings.Join(nodes, ", ") +
+			": the satellite has not confirmed yet that the storage is gone",
+		Details: "The replica stays listed with the DELETE flag until its satellite has deleted its volumes. " +
+			"A satellite that is not running holds it until it starts again; for a node that is gone for good, use `node lost`.",
+		ObjRefs: map[string]string{objRefRscDfn: rdName},
+	}
+}
+
+// replicasStillDeleting names the nodes whose replica of the definition is
+// still there after the delete.
+func (s *Server) replicasStillDeleting(ctx context.Context, rdName string) []string {
+	children, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return nil
+	}
+
+	nodes := make([]string, 0, len(children))
+	for i := range children {
+		nodes = append(nodes, children[i].NodeName)
+	}
+
+	sort.Strings(nodes)
+
+	return nodes
 }

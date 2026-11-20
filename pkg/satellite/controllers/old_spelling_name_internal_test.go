@@ -76,7 +76,7 @@ func TestAnOldMixedCaseReplicaIsSnapshottedUnderItsCRName(t *testing.T) {
 		}
 
 		snap := &blockstoriov1alpha1.Snapshot{
-			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{SatelliteSnapshotFinalizer}},
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{snapshotNodeFinalizer("node-a")}},
 			Spec: blockstoriov1alpha1.SnapshotSpec{
 				ResourceDefinitionName: snapSpelling,
 				SnapshotName:           "snap-1",
@@ -249,7 +249,7 @@ func TestAnOldMixedCaseSnapshotRowDrivesTheResourceByItsCRName(t *testing.T) {
 		phase.spec(&s)
 
 		snap := &blockstoriov1alpha1.Snapshot{
-			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{SatelliteSnapshotFinalizer}},
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{snapshotNodeFinalizer("node-a")}},
 			Spec:       s,
 			Status:     blockstoriov1alpha1.SnapshotStatus{NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{phase.status}},
 		}
@@ -268,9 +268,9 @@ func TestAnOldMixedCaseSnapshotRowDrivesTheResourceByItsCRName(t *testing.T) {
 	}
 }
 
-// The orphan sweepers count an old mixed-case replica as owning the DRBD
-// resource and the volumes it runs under, which carry the CR name.
-func TestTheSweepersOwnAnOldMixedCaseReplicaByItsCRName(t *testing.T) {
+// The DRBD orphan sweeper counts an old mixed-case replica as owning the
+// DRBD resource it runs under, which carries the CR name.
+func TestTheDRBDSweeperOwnsAnOldMixedCaseReplicaByItsCRName(t *testing.T) {
 	t.Parallel()
 
 	rd := &blockstoriov1alpha1.ResourceDefinition{
@@ -285,15 +285,6 @@ func TestTheSweepersOwnAnOldMixedCaseReplicaByItsCRName(t *testing.T) {
 	}
 
 	cli := newPassphraseTestReconciler(t, rd, res).Client
-
-	volumes, err := (&StorageOrphanSweeperRunnable{Client: cli, NodeName: "node-a"}).listOwnedVolumeRefs(t.Context())
-	if err != nil {
-		t.Fatalf("owned volumes: %v", err)
-	}
-
-	if _, ok := volumes[ownedKey("pvc-mix", 0)]; !ok {
-		t.Errorf("owned volumes %v; want pvc-mix volume 0", volumes)
-	}
 
 	resources, err := (&OrphanSweeperRunnable{Client: cli, NodeName: "node-a"}).listOwnedResourceNames(t.Context())
 	if err != nil {
