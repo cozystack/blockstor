@@ -22,6 +22,7 @@ import (
 	"context"
 	"maps"
 	"sync"
+	"time"
 
 	cerrors "github.com/cockroachdb/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -29,12 +30,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/blocksize"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // BlockSizeReleaseReconciler removes the block size LINSTOR's rule wrote
@@ -43,10 +46,11 @@ import (
 // takes the size of whatever pool it lands in, and nothing is left frozen
 // for a device that no longer exists.
 //
-// It runs on replica deletions only. A definition that simply has no
-// replica yet keeps what it carries: a restore writes the source's size
-// onto the definition before placing anything, and an operator may set a
-// size before the first replica.
+// It runs on replica deletions, and on a sweep for deletions it did not
+// see. A definition that simply has no replica yet keeps what it
+// carries: a restore writes the source's size onto the definition before
+// placing anything, and an operator may set a size before the first
+// replica.
 type BlockSizeReleaseReconciler struct {
 	client.Client
 
@@ -61,7 +65,18 @@ type BlockSizeReleaseReconciler struct {
 	// otherwise take the size from under a replica that has just come up
 	// with it. Nil only in tests that run nothing alongside.
 	Lock func(rdName string) *sync.Mutex
+
+	// SweepInterval is how often the sweep looks for definitions whose
+	// last replica went while the controller was not watching. Zero is
+	// blockSizeSweepInterval.
+	SweepInterval time.Duration
 }
+
+// blockSizeSweepInterval is the default sweep period. A definition is
+// released on the second sweep that finds it empty, so a definition whose
+// replicas are being created right behind it, as linstor-migrate applies
+// them, is never caught in between.
+const blockSizeSweepInterval = 10 * time.Minute
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch;update;patch
@@ -98,7 +113,10 @@ func (r *BlockSizeReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if !rd.DeletionTimestamp.IsZero() {
+	// A definition being restored keeps the size its snapshot gave it,
+	// whatever happens to a replica placed meanwhile: the data it restores
+	// was written at that size.
+	if !rd.DeletionTimestamp.IsZero() || rd.Spec.Props[store.RestoreFromSnapshotProp] != "" {
 		return ctrl.Result{}, nil
 	}
 
@@ -156,7 +174,12 @@ func (r *BlockSizeReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}
 
-	err := ctrl.NewControllerManagedBy(mgr).
+	err := mgr.Add(&blockSizeSweeper{release: r})
+	if err != nil {
+		return cerrors.Wrap(err, "register the block size sweep")
+	}
+
+	err = ctrl.NewControllerManagedBy(mgr).
 		Named("blocksize-release").
 		Watches(&blockstoriov1alpha1.Resource{},
 			handler.EnqueueRequestsFromMapFunc(definitionOfReplica),
@@ -177,4 +200,114 @@ func definitionOfReplica(_ context.Context, obj client.Object) []reconcile.Reque
 	}
 
 	return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}}}
+}
+
+// Sweep releases the definitions a replica deletion event never reached,
+// those whose last replica went while the controller was down. LINSTOR
+// removes the properties in the same transaction as the last resource,
+// so it has no such gap.
+//
+// Only a definition that is frozen is a candidate. The stamp is written
+// when a replica is in use, so a frozen definition with no replica has
+// provably lost its last one; a size without the stamp may equally be
+// one an operator set before placing anything, which LINSTOR keeps. A
+// size left behind without the stamp is harmless: with no replica the
+// size may still change, and the next replica raises it for its pool.
+//
+// seen holds the candidates of the previous sweep; only a definition
+// found empty both times is released. The candidates of this sweep are
+// returned for the next one.
+func (r *BlockSizeReleaseReconciler) Sweep(ctx context.Context, seen map[string]bool) (map[string]bool, error) {
+	reader := r.reader()
+
+	var replicas blockstoriov1alpha1.ResourceList
+
+	err := reader.List(ctx, &replicas)
+	if err != nil {
+		return seen, cerrors.Wrap(err, "list resources")
+	}
+
+	placed := make(map[string]bool, len(replicas.Items))
+	for i := range replicas.Items {
+		placed[naming.Key(replicas.Items[i].Spec.ResourceDefinitionName)] = true
+	}
+
+	var rds blockstoriov1alpha1.ResourceDefinitionList
+
+	err = reader.List(ctx, &rds)
+	if err != nil {
+		return seen, cerrors.Wrap(err, "list resource definitions")
+	}
+
+	candidates := map[string]bool{}
+
+	for i := range rds.Items {
+		rd := &rds.Items[i]
+		if placed[rd.Name] || !rd.DeletionTimestamp.IsZero() ||
+			rd.Spec.Props[store.RestoreFromSnapshotProp] != "" || !anyFrozen(rd) {
+			continue
+		}
+
+		candidates[rd.Name] = true
+
+		if !seen[rd.Name] {
+			continue
+		}
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKey{Name: rd.Name}})
+		if err != nil {
+			return candidates, err
+		}
+	}
+
+	return candidates, nil
+}
+
+// anyFrozen reports whether a volume definition of rd carries the stamp.
+func anyFrozen(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	for i := range rd.Spec.VolumeDefinitions {
+		if blocksize.Frozen(rd.Spec.VolumeDefinitions[i].Props) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// blockSizeSweeper runs the sweep on the leader.
+type blockSizeSweeper struct {
+	release *BlockSizeReleaseReconciler
+}
+
+// NeedLeaderElection is true: the sweep patches definitions.
+func (*blockSizeSweeper) NeedLeaderElection() bool { return true }
+
+// Start sweeps once at once and then every interval until ctx ends.
+func (s *blockSizeSweeper) Start(ctx context.Context) error {
+	interval := s.release.SweepInterval
+	if interval <= 0 {
+		interval = blockSizeSweepInterval
+	}
+
+	log := logf.FromContext(ctx).WithName("blocksize-sweep")
+
+	var seen map[string]bool
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		next, err := s.release.Sweep(ctx, seen)
+		if err != nil {
+			log.Error(err, "block size sweep failed")
+		}
+
+		seen = next
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
