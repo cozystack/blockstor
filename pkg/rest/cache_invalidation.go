@@ -386,3 +386,35 @@ func (s *Server) replicasStillDeleting(ctx context.Context, rdName string) []str
 
 	return nodes
 }
+
+// waitForSnapshotCreateVisible blocks until the local Store returns the
+// just-created Snapshot (rdName, snapName), or cacheConvergeBudget
+// elapses. LINSTOR answers a snapshot create once the definition is in
+// its database, so the `s l` that follows lists it; the store here
+// writes to the apiserver and serves reads from the informer cache, and
+// a list issued before the watch event arrives misses the new snapshot.
+// csi-snapshotter pages through ListSnapshots right after creating, and
+// a short page there reads as the end of the list.
+//
+// The budget running out is not an error: the write committed, and the
+// next read catches up as it did before this wait.
+func (s *Server) waitForSnapshotCreateVisible(ctx context.Context, rdName, snapName string) {
+	if s == nil || s.Store == nil {
+		return
+	}
+
+	deadline := time.Now().Add(cacheConvergeBudget)
+
+	for {
+		_, err := s.Store.Snapshots().Get(ctx, rdName, snapName)
+		if err == nil || !errors.Is(err, store.ErrNotFound) || time.Now().After(deadline) {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(cacheConvergePollInterval):
+		}
+	}
+}
