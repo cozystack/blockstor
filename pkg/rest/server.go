@@ -155,6 +155,13 @@ type Server struct {
 	// DefaultResourceReadyWait.
 	ResourceReadyWait time.Duration
 
+	// ResourceDeployWait bounds how long a resource create or autoplace
+	// waits for the satellites to build the replicas it deployed, the
+	// step LINSTOR takes before it waits for them to become ready. It
+	// only applies while ResourceReadyWait is set. Zero skips it; the
+	// binaries set DefaultResourceDeployWait.
+	ResourceDeployWait time.Duration
+
 	// eventBrokersInit gates the lazy initialisation of the SSE
 	// brokers below. The two brokers back `/v1/events/drbd/promotion`
 	// and `/v1/events/nodes` respectively — see pkg/rest/events.go.
