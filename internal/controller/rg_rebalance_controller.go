@@ -174,7 +174,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; hasAnnotation {
 		// Operator intent: ignore per-RD shortfall grace and the
 		// per-node offline grace — a REST modify means "act now".
-		count, perr := r.rebalanceChildRDs(ctx, rg, 0)
+		count, perr := r.rebalanceChildRDs(ctx, rg, 0, false)
 		if perr != nil {
 			return perr
 		}
@@ -191,7 +191,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 		return nil
 	}
 
-	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod)
+	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod, true)
 	if perr != nil {
 		return perr
 	}
@@ -216,7 +216,13 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // same window). Pass 0 to disable the gate — the annotation-driven
 // path does this so an operator's `linstor rg modify` acts on every
 // child RD immediately.
-func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration) (int, error) {
+//
+// `scheduled` marks the periodic balance pass, which leaves out a
+// definition without a DRBD layer, as LINSTOR's BalanceResources does:
+// such a replica has no peer to resync from, so a replica topped up
+// here would only be an empty volume under the definition's name. An
+// explicit `rg modify` still places on it.
+func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, scheduled bool) (int, error) {
 	log := logf.FromContext(ctx)
 
 	rds, err := r.Store.ResourceDefinitions().List(ctx)
@@ -230,6 +236,13 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 
 	for i := range rds {
 		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
+			continue
+		}
+
+		if scheduled && !definitionUsesDRBD(&rds[i], rg) {
+			log.V(1).Info("scheduled rebalance skipped (no DRBD layer)",
+				"rg", rg.Name, "rd", rds[i].Name)
+
 			continue
 		}
 
@@ -255,6 +268,15 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 	}
 
 	return processed, nil
+}
+
+// definitionUsesDRBD reports whether the definition's layer stack, its
+// own or else its group's, has a DRBD layer. An empty stack at both
+// levels is the default stack, which does.
+func definitionUsesDRBD(rd *apiv1.ResourceDefinition, rg *apiv1.ResourceGroup) bool {
+	stack := apiv1.ResolveLayerStack(rd.LayerStack, rg.SelectFilter.LayerStack)
+
+	return apiv1.LayerInStack(stack, apiv1.LayerKindDRBD)
 }
 
 // shortfallWithinGrace reports whether an RD carries a still-fresh

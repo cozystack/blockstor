@@ -99,6 +99,14 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			continue
 		}
 
+		// Nobody asked for a placement here, so this follows the
+		// balance pass: a definition without DRBD is left alone. An
+		// explicit `rg modify` reaches it through the rebalance
+		// annotation instead.
+		if !definitionUsesDRBD(&rds[i], &rg) {
+			continue
+		}
+
 		err := r.applyRGToRD(ctx, &rg, &rds[i])
 		if err != nil {
 			log.Error(err, "apply RG to RD",
