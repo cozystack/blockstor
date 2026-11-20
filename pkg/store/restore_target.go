@@ -163,6 +163,9 @@ func PreparedRestoreTarget(ctx context.Context, st Store, cached *apiv1.Resource
 		return false, fmt.Errorf("%w: %q", ErrRestoreTargetTearingDown, rd.Name)
 	}
 
+	// The stack itself is read again when the marker is stamped; this read
+	// only refuses a source whose stack is undecided before anything is
+	// written to the target.
 	_, err = sourceLayerStack(ctx, st, snap)
 	if err != nil {
 		return false, err
