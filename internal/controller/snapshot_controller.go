@@ -273,13 +273,8 @@ func takeCompleted(siblings []blockstoriov1alpha1.Snapshot) bool {
 // already there, or a failure marker is, which a later success
 // stamp must not contradict.
 func withSuccessfulFlag(flags []string) ([]string, bool) {
-	for _, flag := range flags {
-		switch flag {
-		case blockstoriov1alpha1.SnapshotStatusFlagSuccessful,
-			blockstoriov1alpha1.SnapshotStatusFlagFailed,
-			blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect:
-			return flags, false
-		}
+	if slices.ContainsFunc(flags, isSnapshotOutcomeFlag) {
+		return flags, false
 	}
 
 	return append(slices.Clone(flags), blockstoriov1alpha1.SnapshotStatusFlagSuccessful), true
@@ -484,7 +479,14 @@ func (r *SnapshotReconciler) checkAbortConditions(
 			"group_id", snap.Spec.GroupID,
 			"failed_node", firstFailedNodeAcrossSiblings(siblings))
 
-		return true, ctrl.Result{}, r.abortGroup(ctx, siblings)
+		err := r.abortGroup(ctx, siblings)
+		if err != nil {
+			return true, ctrl.Result{}, err
+		}
+
+		return true, ctrl.Result{}, r.stampGroupFailed(ctx, siblings,
+			"snapshot aborted: node '"+firstFailedNodeAcrossSiblings(siblings)+
+				"' failed to take its snapshot; I/O resumed")
 	}
 
 	if inSuspendPhase(snap, siblings) && suspendDeadlineExceeded(snap, time.Now()) {

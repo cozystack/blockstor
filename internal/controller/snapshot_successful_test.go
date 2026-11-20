@@ -289,3 +289,38 @@ func TestSnapshotControllerGroupIsRecordedOnlyAsAWhole(t *testing.T) {
 		}
 	}
 }
+
+// LINSTOR aborts a multi-snapshot request as a whole and flags every
+// snapshot definition in it, so a sibling whose own nodes all took their
+// snapshot is never SUCCESSFUL, not even after the failed sibling is
+// deleted. The record is on the sibling itself, so the failed one going
+// away does not turn the survivor SUCCESSFUL.
+func TestSnapshotControllerGroupSiblingStaysFailedAfterTheFailedOneGoes(t *testing.T) {
+	t.Parallel()
+
+	ok := b353GroupedSnapshot("rd-a", "g", "grp", []string{"n1"}, false, false,
+		[]blockstoriov1alpha1.SnapshotPerNodeStatus{{NodeName: "n1", Ready: true, CreateTimestamp: 1}})
+	bad := b353GroupedSnapshot("rd-b", "g", "grp", []string{"n1"}, false, false,
+		[]blockstoriov1alpha1.SnapshotPerNodeStatus{{NodeName: "n1", Failed: true}})
+	bad.Status.Flags = []string{blockstoriov1alpha1.SnapshotStatusFlagFailed}
+
+	r, cli := successfulFixture(t, ok, bad)
+
+	reconcileSnapshot(t, r, ok.Name)
+
+	got := getSnap(t, cli, ok.Name)
+	if !slices.Contains(got.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed) {
+		t.Fatalf("sibling of a failed snapshot not flagged FAILED: flags=%v", got.Status.Flags)
+	}
+
+	if err := cli.Delete(context.Background(), getSnap(t, cli, bad.Name)); err != nil {
+		t.Fatalf("delete failed sibling: %v", err)
+	}
+
+	reconcileSnapshot(t, r, ok.Name)
+
+	if isMarkedSuccessful(t, cli, ok.Name) {
+		t.Errorf("sibling of a failed group snapshot became SUCCESSFUL once the failed one was deleted: flags=%v",
+			getSnap(t, cli, ok.Name).Status.Flags)
+	}
+}

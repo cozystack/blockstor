@@ -225,6 +225,64 @@ func (r *SnapshotReconciler) stampSnapshotFailedDisconnect(
 	return nil
 }
 
+// stampGroupFailed records a per-node failure on every sibling of the
+// batch, not only on the one whose satellite gave up. LINSTOR aborts a
+// multi-snapshot request as a whole and flags every snapshot
+// definition in it FAILED_DEPLOYMENT (blockstor's FAILED), so none of
+// them is ever SUCCESSFUL, not even once the failed one is deleted.
+// Without the record a sibling whose own nodes all took their snapshot
+// would be marked SUCCESSFUL as soon as the failed sibling is gone.
+// A sibling that already carries a failure marker or SUCCESSFUL is
+// left as it is. Re-run on every pass while a node reports Failed, so
+// a stamp that did not land is retried.
+func (r *SnapshotReconciler) stampGroupFailed(
+	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot, reason string,
+) error {
+	for i := range siblings {
+		key := client.ObjectKeyFromObject(&siblings[i])
+
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var current blockstoriov1alpha1.Snapshot
+
+			getErr := r.Get(ctx, key, &current)
+			if getErr != nil {
+				if apierrors.IsNotFound(getErr) {
+					return nil
+				}
+
+				return errors.Wrap(getErr, "get Snapshot for FAILED stamp")
+			}
+
+			if slices.ContainsFunc(current.Status.Flags, isSnapshotOutcomeFlag) {
+				return nil
+			}
+
+			current.Status.Flags = append(current.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed)
+			upsertSnapshotAbortCondition(&current, reason)
+
+			return r.Status().Update(ctx, &current)
+		})
+		if err != nil {
+			return errors.Wrapf(err, "stamp FAILED on sibling %q", siblings[i].Name)
+		}
+	}
+
+	return nil
+}
+
+// isSnapshotOutcomeFlag reports whether a status flag already records
+// how the take ended.
+func isSnapshotOutcomeFlag(flag string) bool {
+	switch flag {
+	case blockstoriov1alpha1.SnapshotStatusFlagSuccessful,
+		blockstoriov1alpha1.SnapshotStatusFlagFailed,
+		blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect:
+		return true
+	}
+
+	return false
+}
+
 // upsertSnapshotAbortCondition sets (or refreshes) the
 // SnapshotComplete=False Condition carrying the abort reason. Returns
 // true iff it changed the slice (so the caller can skip a no-op

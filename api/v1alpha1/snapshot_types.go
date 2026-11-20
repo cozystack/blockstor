@@ -219,7 +219,10 @@ const AnnotationSnapshotAdoptedCreatedAt = "blockstor.org/adopted-created-at"
 // to the `State="Failed"` column in `linstor s l`. Matches
 // upstream LINSTOR's `FAILED_DEPLOYMENT` SnapshotDefinition
 // flag — same semantic ("the satellite tried and gave up"),
-// shorter name. Once stamped, the reconciler does NOT requeue:
+// shorter name. The controller-side SnapshotReconciler stamps it on
+// every other Snapshot of the same GroupID too, as LINSTOR flags
+// every snapshot definition of an aborted multi-snapshot request.
+// Once stamped, the reconciler does NOT requeue:
 // a terminal failure is a dead-letter that an operator must
 // either delete or recreate.
 const SnapshotStatusFlagFailed = "FAILED"
