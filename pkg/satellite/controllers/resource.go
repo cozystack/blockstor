@@ -148,6 +148,11 @@ type ResourceReconciler struct {
 	// sets it and gates Reconcile through it; a test calling Reconcile
 	// directly goes around it.
 	recheck *recheckGate
+
+	// bringUp ranks the local Resources this process has not brought up
+	// yet ahead of every other pass (bringUpQueue). SetupWithManager
+	// creates it.
+	bringUp *bringUpTracker
 }
 
 // Reconcile reads a Resource and drives the satellite-side
@@ -163,6 +168,8 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	err := r.Get(ctx, req.NamespacedName, &res)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.bringUp.forget(req.Name)
+
 			return ctrl.Result{}, nil
 		}
 
@@ -274,6 +281,10 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.recheck = newRecheckGate()
 
+	if r.bringUp == nil {
+		r.bringUp = newBringUpTracker()
+	}
+
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
 			builder.WithPredicates(
@@ -288,7 +299,10 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueResourcesForRD))).
 		Named("satellite-resource").
-		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.resourceWorkers()})
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: r.Config.resourceWorkers(),
+			NewQueue:                newBringUpQueueFunc(r.bringUp, mgr.GetLogger()),
+		})
 
 	// Phase 11.7 second leg: the observer-trigger channel wakes
 	// this reconciler on kernel-state changes that produce no
@@ -534,6 +548,8 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	if anyFailed {
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
 	}
+
+	r.bringUp.broughtUp(res.Name)
 
 	// Phase 11.7 safety net: schedule a periodic re-eval on
 	// active-DRBD resources. The primary-watch predicate drops
