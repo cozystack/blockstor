@@ -21,6 +21,7 @@ package controller
 import (
 	"context"
 	"maps"
+	"sync"
 
 	cerrors "github.com/cockroachdb/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -52,6 +53,14 @@ type BlockSizeReleaseReconciler struct {
 	// APIReader lists replicas past the cache, so a replica created a
 	// moment ago is not taken for an empty definition.
 	APIReader client.Reader
+
+	// Lock is the per-definition lock the block size decision for a new
+	// replica holds, ResourceReconciler.rdAllocMu. The release holds it
+	// from listing the replicas to the patch: a replica decided in
+	// between under a size it kept writes nothing, so the patch would
+	// otherwise take the size from under a replica that has just come up
+	// with it. Nil only in tests that run nothing alongside.
+	Lock func(rdName string) *sync.Mutex
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch
@@ -61,6 +70,12 @@ type BlockSizeReleaseReconciler struct {
 
 // Reconcile runs for a definition one of whose replicas was deleted.
 func (r *BlockSizeReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	if r.Lock != nil {
+		mu := r.Lock(req.Name)
+		mu.Lock()
+		defer mu.Unlock()
+	}
+
 	reader := r.reader()
 
 	var list blockstoriov1alpha1.ResourceList

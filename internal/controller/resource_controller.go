@@ -2138,7 +2138,7 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// The block size this reconciler writes for a new replica is dropped
 	// with the definition's last replica; the two halves of the rule are
 	// wired together.
-	err := (&BlockSizeReleaseReconciler{Client: r.Client, APIReader: r.APIReader}).SetupWithManager(mgr)
+	err := (&BlockSizeReleaseReconciler{Client: r.Client, APIReader: r.APIReader, Lock: r.rdAllocMu}).SetupWithManager(mgr)
 	if err != nil {
 		return err
 	}
@@ -2157,7 +2157,9 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // one on first use. Different RDs see different mutexes so they
 // allocate in parallel; replicas of the same RD serialise.
 func (r *ResourceReconciler) rdAllocMu(rdName string) *sync.Mutex {
-	loaded, _ := r.allocMu.LoadOrStore(rdName, &sync.Mutex{})
+	// Keyed by the folded name: replicas spell their definition as it
+	// was given, and the block size release only has the CR name.
+	loaded, _ := r.allocMu.LoadOrStore(naming.Key(rdName), &sync.Mutex{})
 
 	muTyped, _ := loaded.(*sync.Mutex)
 

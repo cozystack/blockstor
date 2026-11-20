@@ -20,12 +20,14 @@ package controller_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
@@ -85,5 +87,62 @@ func TestLastReplicaGoneReleasesSize(t *testing.T) {
 				t.Fatalf("an unrelated prop was dropped: %v", props)
 			}
 		})
+	}
+}
+
+// TestReleaseHoldsTheDecisionLock: the release holds the lock the block
+// size decision for a new replica takes from listing the replicas until
+// its patch. A replica decided in between under the size it kept writes
+// nothing, so no conflict stops the patch, and the release used to take
+// the size and the stamp from under a replica that had just come up at
+// it.
+func TestReleaseHoldsTheDecisionLock(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	f := newBSFixture(map[string]string{blocksize.PropBlockSize: "4096", blocksize.PropFreeze: "True"})
+
+	var mu sync.Mutex
+
+	unlockedAt := []string{}
+
+	checkHeld := func(step string) {
+		if mu.TryLock() {
+			unlockedAt = append(unlockedAt, step)
+			mu.Unlock()
+		}
+	}
+
+	base := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(f.rd).Build()
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			checkHeld("list")
+
+			return c.List(ctx, list, opts...)
+		},
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			checkHeld("get")
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			checkHeld("patch")
+
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	rec := &controllerpkg.BlockSizeReleaseReconciler{
+		Client: cli,
+		Lock:   func(string) *sync.Mutex { return &mu },
+	}
+
+	_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: bsRD}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if len(unlockedAt) != 0 {
+		t.Fatalf("the decision lock was free at %v", unlockedAt)
 	}
 }
