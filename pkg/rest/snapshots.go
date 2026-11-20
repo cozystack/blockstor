@@ -414,14 +414,20 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.waitForSnapshotCreateVisible(r.Context(), rd, snap.Name)
+	s.answerSnapshotCreate(w, r, rd, snap.Name)
+}
 
-	// Same answer point as the multi create, and LINSTOR's.
-	refs := []snapshotRef{{rd: rd, name: snap.Name}}
+// answerSnapshotCreate answers a snapshot create once the snapshot is
+// listed and its take is over: the same answer point as the multi create,
+// and LINSTOR's.
+func (s *Server) answerSnapshotCreate(w http.ResponseWriter, r *http.Request, rd, name string) {
+	s.waitForSnapshotCreateVisible(r.Context(), rd, name)
+
+	refs := []snapshotRef{{rd: rd, name: name}}
 
 	writeSnapshotCreateAnswer(w, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "snapshot created: " + snap.Name,
+		Message: "snapshot created: " + name,
 	}}, takeFailureRcs(refs, s.waitSnapshotsSettled(r.Context(), refs)))
 }
 
