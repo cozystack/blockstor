@@ -197,18 +197,21 @@ func perDefinitionCanAnswer(ctx context.Context, err error) bool {
 }
 
 // distinctDefinitionNames is the set of definitions a listing covers, in
-// first-seen order: every replica of one definition asks the same question.
+// first-seen order: every replica of one definition asks the same question,
+// whichever spelling of its name it carries.
 func distinctDefinitionNames(resources []apiv1.Resource) []string {
 	seen := make(map[string]struct{}, len(resources))
 	names := make([]string, 0, len(resources))
 
 	for i := range resources {
 		name := resources[i].Name
-		if _, dup := seen[name]; dup {
+
+		key := naming.Key(name)
+		if _, dup := seen[key]; dup {
 			continue
 		}
 
-		seen[name] = struct{}{}
+		seen[key] = struct{}{}
 
 		names = append(names, name)
 	}
