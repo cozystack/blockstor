@@ -1975,7 +1975,9 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 			Flags:                  flags,
 			DRBDNodeID:             c.drbdNode[replicaKey{node: row.NodeName, rd: row.ResourceName}],
 			// Adopted replicas carry real data (or are the witness of
-			// a data-bearing set): never allow the day0 skip.
+			// a data-bearing set): never allow the day0 skip. The
+			// satellite reads false as "not created empty here" too and
+			// never promotes such a replica to give it a filesystem.
 			SkipInitialSync: ptr(false),
 		},
 	}
