@@ -34,6 +34,22 @@ import (
 // warning (CtrlRscCrtApiHelper.DFLT_RSC_READY_WAIT_TIME_IN_MS).
 const DefaultResourceReadyWait = 15 * time.Second
 
+// DefaultResourceDeployWait bounds how long a create or autoplace waits
+// for the satellites to build the replicas it deployed, before the
+// ready wait starts. LINSTOR has no such bound: its satellites answer
+// every update, with an error when the apply failed. A blockstor
+// satellite reports no failure to the REST layer, so the wait gives up
+// and answers with the not-ready warning instead of holding the call.
+//
+// The bound is sized against the callers' own deadline. piraeus-operator
+// runs csi-provisioner and csi-attacher with --timeout=1m, which cancels
+// CreateVolume and ControllerPublishVolume, and with them this request,
+// after one minute. This bound plus DefaultResourceReadyWait leaves 15
+// seconds of that minute for the definition, volume and placement
+// writes, so a slow build is answered with the warning instead of being
+// cut off by the sidecar and retried from scratch.
+const DefaultResourceDeployWait = 30 * time.Second
+
 // resourceReadyPollInterval is how often the wait re-reads the cached
 // replicas. A variable so tests can shorten it.
 //
@@ -45,17 +61,32 @@ var resourceReadyPollInterval = 250 * time.Millisecond
 // satellite is not connected, given instead of waiting for it.
 const warnNotConnected = maskWarn | int64(1002)
 
-// waitDeployedReplicasReady holds a create or autoplace answer until
-// the replicas this call deployed are ready, or until
-// s.ResourceReadyWait runs out. It follows LINSTOR v1.33.1's
-// CtrlRscCrtApiHelper.waitResourcesReady:
+// waitDeployedReplicasReady holds a create or autoplace answer the way
+// LINSTOR v1.33.1's CtrlRscCrtApiHelper.deployResources does, in two
+// steps.
+//
+// Every replica of the definition on a node that is not ONLINE gets
+// LINSTOR's not-connected warning, whatever the layers or the replica
+// count, as updateSatellites gives it for each satellite it cannot
+// reach; neither step waits for such a replica. A deployed replica on
+// such a node is warned once, where LINSTOR may warn it again from
+// waitResourcesReady.
+//
+// First it waits, up to s.ResourceDeployWait, until the satellites
+// have built every replica this call deployed (waitDeployedReplicasBuilt),
+// as LINSTOR's updateSatellites waits for each satellite to answer the
+// update before anything else. That step applies to every definition,
+// whatever its layers or replica count: a local volume is answered once
+// its device exists and, when it was asked for, carries its filesystem.
+//
+// Then it waits, up to s.ResourceReadyWait, for the replicas to become
+// ready, following waitResourcesReady:
 //
 //   - nothing is awaited when the call deployed nothing, the definition
 //     has no volume, every replica is diskless, the definition has a
 //     single replica, or its layer stack has no DRBD;
 //   - a deployed replica, diskful or diskless, is awaited unless it is
-//     INACTIVE; one on a node that is not ONLINE is answered with
-//     LINSTOR's not-connected warning instead of being awaited;
+//     INACTIVE or on a node that is not ONLINE;
 //   - ready is ResourceState.isReady: every volume reaches UpToDate
 //     data, locally or through a connected UpToDate peer, and the
 //     replica is connected to every diskful DRBD peer on an ONLINE node.
@@ -73,25 +104,40 @@ func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, d
 		return nil
 	}
 
+	notConnected := notConnectedWarnings(s.replicasNotConnected(ctx, rdName))
+
 	volumes := s.definitionVolumeSizes(ctx, rdName)
-	if len(volumes) == 0 || !s.definitionHasDRBD(ctx, rdName) {
+	if len(volumes) == 0 {
+		return notConnected
+	}
+
+	unbuilt, done := s.waitDeployedReplicasBuilt(ctx, rdName, deployed, volumes)
+	if !done {
 		return nil
+	}
+
+	if len(unbuilt) > 0 {
+		return append(notConnected, notReadyWarnings(unbuilt)...)
+	}
+
+	if !s.definitionHasDRBD(ctx, rdName) {
+		return notConnected
 	}
 
 	deadline := time.Now().Add(s.ResourceReadyWait)
 
 	for {
-		notConnected, pending, err := s.deployedReplicasNotReady(ctx, rdName, deployed, volumes)
+		pending, err := s.deployedReplicasNotReady(ctx, rdName, deployed, volumes)
 		if err != nil {
-			return nil
+			return notConnected
 		}
 
 		if len(pending) == 0 {
-			return notConnectedWarnings(notConnected)
+			return notConnected
 		}
 
 		if !time.Now().Before(deadline) {
-			return append(notConnectedWarnings(notConnected), notReadyWarnings(pending)...)
+			return append(notConnected, notReadyWarnings(pending)...)
 		}
 
 		select {
@@ -100,6 +146,93 @@ func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, d
 		case <-time.After(resourceReadyPollInterval):
 		}
 	}
+}
+
+// waitDeployedReplicasBuilt waits, up to s.ResourceDeployWait, until the
+// satellites built every replica of rdName this call deployed, and
+// returns the nodes whose replica was not built in time. done is false
+// when the request was cancelled first.
+//
+// linstor-csi needs this before CreateVolume returns. It reads replicas
+// through a cache of the resource view that it refills after its own
+// writes and otherwise keeps for 30 seconds, so a CreateVolume answered
+// before the device path existed has ControllerPublishVolume read a
+// view without one until the cache expires, and the attacher's
+// exponential retry lands the attach well after that.
+//
+// A zero s.ResourceDeployWait skips the step, which unit tests that run
+// no satellite rely on; the binaries set DefaultResourceDeployWait.
+func (s *Server) waitDeployedReplicasBuilt(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, bool) {
+	if s.ResourceDeployWait <= 0 {
+		return nil, true
+	}
+
+	deadline := time.Now().Add(s.ResourceDeployWait)
+
+	for {
+		unbuilt, err := s.deployedReplicasNotBuilt(ctx, rdName, deployed, volumes)
+		if err != nil || len(unbuilt) == 0 {
+			return nil, true
+		}
+
+		if !time.Now().Before(deadline) {
+			return unbuilt, true
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(resourceReadyPollInterval):
+		}
+	}
+}
+
+// deployedReplicasNotBuilt lists the deployed replicas of rdName whose
+// satellite has not built them yet. A replica on a node that is not
+// ONLINE has been answered with the not-connected warning instead, and
+// an INACTIVE replica is never built.
+func (s *Server) deployedReplicasNotBuilt(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, error) {
+	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return nil, errors.Wrap(err, "list replicas")
+	}
+
+	byNode := make(map[string]*apiv1.Resource, len(replicas))
+	for i := range replicas {
+		byNode[naming.Key(replicas[i].NodeName)] = &replicas[i]
+	}
+
+	var out []string
+
+	for _, node := range deployed {
+		rsc, ok := byNode[naming.Key(node)]
+		if !ok || slices.Contains(rsc.Flags, apiv1.ResourceFlagInactive) || !s.nodeIsOnline(ctx, rsc.NodeName) {
+			continue
+		}
+
+		if !replicaBuilt(rsc, volumes) {
+			out = append(out, rsc.NodeName)
+		}
+	}
+
+	return out, nil
+}
+
+// replicaBuilt reports whether the satellite built every volume of rsc:
+// each has the device path the satellite reports once the device is up
+// (and formatted, when a filesystem was asked for). That holds for a
+// diskless replica too, whose path is its DRBD device: the path is what
+// linstor-csi's ControllerPublishVolume reads, and a disk state alone
+// let make-available answer before the view had one.
+func replicaBuilt(rsc *apiv1.Resource, volumes map[int32]int64) bool {
+	for vn := range volumes {
+		vol := reportedVolume(rsc, vn)
+		if vol == nil || vol.DevicePath == "" {
+			return false
+		}
+	}
+
+	return true
 }
 
 // definitionHasDRBD reports whether rdName's effective layer stack
@@ -114,20 +247,49 @@ func (s *Server) definitionHasDRBD(ctx context.Context, rdName string) bool {
 	return apiv1.LayerInStack(s.resolveAutoplaceLayerStack(ctx, &rd), apiv1.LayerKindDRBD)
 }
 
-// deployedReplicasNotReady splits the deployed replicas of rdName that
-// LINSTOR would wait for into those on a node that is not ONLINE and
-// those that are not ready yet.
-func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, []string, error) {
+// replicasNotConnected lists the nodes, in order, of the replicas of
+// rdName whose satellite is not ONLINE: those LINSTOR's updateSatellites
+// cannot reach and answers with the not-connected warning. A replica on
+// an EVICTED node is left out, as updateSatellites skips it.
+func (s *Server) replicasNotConnected(ctx context.Context, rdName string) []string {
 	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "list replicas")
+		return nil
+	}
+
+	var out []string
+
+	for i := range replicas {
+		node, err := s.Store.Nodes().Get(ctx, replicas[i].NodeName)
+		if err != nil || slices.Contains(node.Flags, apiv1.NodeFlagEvicted) {
+			continue
+		}
+
+		if node.ConnectionStatus != apiv1.NodeTypeOnline {
+			out = append(out, replicas[i].NodeName)
+		}
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// deployedReplicasNotReady lists the deployed replicas of rdName that
+// LINSTOR would wait for and that are not ready yet. A replica on a
+// node that is not ONLINE is not waited for: it has been answered with
+// the not-connected warning.
+func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, error) {
+	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return nil, errors.Wrap(err, "list replicas")
 	}
 
 	if len(replicas) <= 1 || allReplicasDiskless(replicas) {
 		// The first replica has no peer to connect to, and an
 		// all-diskless definition has no data to reach: LINSTOR
 		// does not wait for either.
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	byNode := make(map[string]*apiv1.Resource, len(replicas))
@@ -141,17 +303,11 @@ func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, de
 
 	peers := onlineDiskfulPeers(replicas, online)
 
-	var notConnected, pending []string
+	var pending []string
 
 	for _, node := range deployed {
 		rsc, ok := byNode[naming.Key(node)]
-		if !ok || slices.Contains(rsc.Flags, apiv1.ResourceFlagInactive) {
-			continue
-		}
-
-		if !online[naming.Key(node)] {
-			notConnected = append(notConnected, rsc.NodeName)
-
+		if !ok || slices.Contains(rsc.Flags, apiv1.ResourceFlagInactive) || !online[naming.Key(node)] {
 			continue
 		}
 
@@ -160,7 +316,7 @@ func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, de
 		}
 	}
 
-	return notConnected, pending, nil
+	return pending, nil
 }
 
 // nodeIsOnline reports whether the satellite on nodeName is ONLINE,
@@ -209,9 +365,11 @@ func onlineDiskfulPeers(replicas []apiv1.Resource, online map[string]bool) []str
 }
 
 // replicaReady is LINSTOR's ResourceState.isReady for rsc against the
-// expected peers. A diskful replica must also report a device path for
-// every volume: LINSTOR knows the path from its layer data the moment
-// the resource exists, blockstor learns it from the satellite.
+// expected peers. The replica must also report a device path for every
+// volume: LINSTOR knows the path from its layer data the moment the
+// resource exists, blockstor learns it from the satellite. After the
+// build step that always holds already; the check matters only when
+// ResourceDeployWait is zero and the build step is skipped.
 func replicaReady(rsc *apiv1.Resource, peers []string, byNode map[string]*apiv1.Resource, volumes map[int32]int64) bool {
 	conns := drbdConnections(rsc)
 
@@ -231,7 +389,7 @@ func replicaReady(rsc *apiv1.Resource, peers []string, byNode map[string]*apiv1.
 			return false
 		}
 
-		if !isDisklessReplica(rsc) && vol.DevicePath == "" {
+		if vol.DevicePath == "" {
 			return false
 		}
 

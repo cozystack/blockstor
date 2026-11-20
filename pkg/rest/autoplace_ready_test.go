@@ -101,7 +101,8 @@ func seedReplica(t *testing.T, st store.Store, rdName, node string, ready bool, 
 }
 
 // markReady gives rsc what a satellite reports once its DRBD resource
-// is up: a device path and UpToDate data for volume 0, and a live
+// is up: a device path and UpToDate data for volume 0 (Diskless for a
+// diskless replica, which still has its DRBD device), and a live
 // connection to each of peers.
 func markReady(rsc *apiv1.Resource, peers []string) {
 	diskState := diskStateUpToDate
@@ -109,7 +110,6 @@ func markReady(rsc *apiv1.Resource, peers []string) {
 
 	if isDisklessReplica(rsc) {
 		diskState = "Diskless"
-		devicePath = ""
 	}
 
 	rsc.Volumes = []apiv1.Volume{{
@@ -517,6 +517,28 @@ func TestWaitDeployedReplicasFollowsLinstorPredicate(t *testing.T) {
 				t.Helper()
 				seedReadyWaitDefinition(t, st, "rd", "n1")
 				seedReadyWaitNode(t, st, "n2", apiv1.NodeTypeConnecting)
+				seedReplica(t, st, "rd", "n1", true, nil)
+				seedReplica(t, st, "rd", "n2", false, nil)
+			},
+			warn: warnNotConnected,
+		},
+		{
+			name: "single replica on a node that is not ONLINE gets the not-connected warning",
+			seed: func(t *testing.T, st store.Store) {
+				t.Helper()
+				seedReadyWaitDefinition(t, st, "rd")
+				seedReadyWaitNode(t, st, "n2", apiv1.NodeTypeOffline)
+				seedReplica(t, st, "rd", "n2", false, nil)
+			},
+			warn: warnNotConnected,
+		},
+		{
+			name: "replica without DRBD on a node that is not ONLINE gets the not-connected warning",
+			seed: func(t *testing.T, st store.Store) {
+				t.Helper()
+				seedReadyWaitDefinition(t, st, "rd", "n1")
+				seedReadyWaitNode(t, st, "n2", apiv1.NodeTypeOffline)
+				setLayerStack(t, st, "rd", apiv1.LayerKindStorage)
 				seedReplica(t, st, "rd", "n1", true, nil)
 				seedReplica(t, st, "rd", "n2", false, nil)
 			},
