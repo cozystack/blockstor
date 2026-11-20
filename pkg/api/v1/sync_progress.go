@@ -28,9 +28,13 @@ import "fmt"
 // The value is DRBD's own `done`, measured against the resync's total,
 // not anything derived from the volume size: a replica that resyncs
 // from two peers in turn has one out-of-sync count per peer, and only
-// the per-peer progress says how far the running resync is. When more
-// than one peer is in the state, the lowest wins, so the figure is the
-// part that is still furthest from done.
+// the per-peer progress says how far the running resync is.
+//
+// DRBD runs one resync per volume as SyncTarget at a time and holds
+// the others in PausedSyncT, so in practice one peer matches and its
+// `done` is the figure LINSTOR shows. Should more than one match, the
+// lowest is taken so the result does not depend on map order; LINSTOR
+// shows whichever peer's frame came last there.
 func (s VolumeState) SyncProgress(replicationState string) (float64, bool) {
 	var (
 		lowest float64

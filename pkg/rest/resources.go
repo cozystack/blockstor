@@ -357,8 +357,8 @@ const diskStateUpToDate = "UpToDate"
 // two transient drbd-9 replication-state tokens promoted to literal
 // State-column values by Bug 348. Constants because the literal is
 // used both as the replication-state match and as the returned
-// override token — one source of truth keeps the gate and
-// the rendered output from ever disagreeing.
+// override token, so the match and the rendered output never
+// disagree.
 const (
 	replicationStateSyncSource = "SyncSource"
 	replicationStateSyncTarget = "SyncTarget"
