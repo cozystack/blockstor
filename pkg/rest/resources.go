@@ -148,11 +148,16 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
 	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
 
+	pool, err := s.placeholderPool(ctx, rsc)
+	if err != nil {
+		return apiv1.ResourceWithVolumes{}, err
+	}
+
 	// Bug 137: a replica the satellite has not reported on (a
 	// diskless witness, or a diskful replica not built yet) would
 	// otherwise reach the wire without a `volumes` key and crash
 	// python-linstor. ensureVolumesForView documents what fills it.
-	annotated = ensureVolumesForView(annotated, rsc, vdSizes)
+	annotated = ensureVolumesForView(annotated, rsc, pool, vdSizes)
 
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
 	if err != nil {
@@ -239,7 +244,8 @@ const disklessStorPoolName = "DfltDisklessStorPool"
 // Observed volumes are passed through verbatim, so a placeholder
 // never shadows satellite-reported allocation or disk state. The
 // result is never nil: the `volumes` key is always present (Bug 137).
-func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) []apiv1.Volume {
+// pool is the replica's pool as placeholderPool resolves it.
+func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, pool string, vdSizes map[int32]int64) []apiv1.Volume {
 	seen := make(map[int32]struct{}, len(observed))
 	for i := range observed {
 		seen[observed[i].VolumeNumber] = struct{}{}
@@ -261,26 +267,6 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 		return observed
 	}
 
-	pool := rsc.Props[storPoolPropKey]
-
-	diskless := isDisklessReplica(rsc)
-	if diskless {
-		pool = disklessStorPoolName
-	}
-
-	// A diskful replica with no pool on its spec (the clone path can
-	// leave one, see the k8s store's ListByDefinition) has nothing
-	// truthful to put in `storage_pool_name`. An empty name is what
-	// makes the Python CLI's `n describe` crash on a pool lookup
-	// returning None, so such a replica keeps the observed list.
-	if pool == "" {
-		if observed == nil {
-			return []apiv1.Volume{}
-		}
-
-		return observed
-	}
-
 	placeholders := make([]apiv1.Volume, 0, len(missing))
 	for _, vn := range missing {
 		// AllocatedKib stays 0 (the Bug 112 contract: always emit
@@ -289,7 +275,7 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 		placeholders = append(placeholders, apiv1.Volume{VolumeNumber: vn, StoragePool: pool})
 	}
 
-	if !diskless {
+	if !isDisklessReplica(rsc) {
 		// An observed diskful volume carries the default
 		// DRBD,STORAGE chain (the k8s store's volumesFromStatus);
 		// the RD's own stack replaces it in buildResourceView.
@@ -308,6 +294,33 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 	})
 
 	return out
+}
+
+// placeholderPool names the pool a placeholder volume of rsc lists:
+// LINSTOR's diskless sentinel on a diskless replica, else the pool on
+// the replica's spec.
+//
+// A diskful replica with no pool on its spec cannot exist in LINSTOR:
+// every Volume is created with a resolved StorPool, falling back to a
+// diskful neighbour's pool when no StorPoolName prop is set
+// (CtrlStorPoolResolveHelper.resolveNeighbourDiskfulStorPool), and the
+// create fails when nothing resolves. blockstor can be left with one
+// (a restore that read the pool off a deleted source), so the view
+// resolves it through the chain blockstor itself creates replicas
+// with: a diskful sibling's pool, then the RG's. When nothing
+// resolves the placeholder lists no pool, which only `n describe`
+// stumbles on; an empty list instead panics
+// linstor-scheduler-extender on every filter call for the volume.
+func (s *Server) placeholderPool(ctx context.Context, rsc *apiv1.Resource) (string, error) {
+	if isDisklessReplica(rsc) {
+		return disklessStorPoolName, nil
+	}
+
+	if pool := rsc.Props[storPoolPropKey]; pool != "" {
+		return pool, nil
+	}
+
+	return s.resolveTakeoverStorPool(ctx, rsc.Name, rsc.NodeName)
 }
 
 // isDisklessReplica reports whether the replica carries a DISKLESS
