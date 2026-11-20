@@ -270,14 +270,25 @@ func (r *AutoSnapshotRunnable) processRD(
 		return errors.Wrap(err, "parse NextAutoId")
 	}
 
-	target, skip, err := r.autoSnapshotTarget(ctx, rd)
+	skip, err := r.takeUnderWay(ctx, rd)
 	if err != nil {
 		return err
 	}
 
+	var target autoSnapshotTarget
+
+	if skip == "" {
+		target, skip, err = r.autoSnapshotTarget(ctx, rd)
+		if err != nil {
+			return err
+		}
+	}
+
 	if skip != "" {
-		// Nothing is booked, so the next tick tries again.
-		log.FromContext(ctx).WithName("auto-snapshot").Info("skipping auto-snapshot",
+		// Nothing is booked, so the next tick tries again. Logged at
+		// V(1): the reason holds for as long as the node stays
+		// offline, and the tick runs every minute.
+		log.FromContext(ctx).WithName("auto-snapshot").V(1).Info("skipping auto-snapshot",
 			"rd", rd.Name, "reason", skip)
 
 		return r.pruneOldAutoSnapshots(ctx, rd)
@@ -302,6 +313,55 @@ func (r *AutoSnapshotRunnable) processRD(
 	}
 
 	return r.pruneOldAutoSnapshots(ctx, rd)
+}
+
+// takeUnderWay returns a skip reason when a snapshot of rd, automatic
+// or not, still holds I/O suspended or may: a second take would
+// suspend the same replicas, and whichever resumed first would unfreeze
+// the other in the middle of its take.
+func (r *AutoSnapshotRunnable) takeUnderWay(
+	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
+) (string, error) {
+	var snapList blockstoriov1alpha1.SnapshotList
+
+	err := r.Client.List(ctx, &snapList, client.MatchingLabels{labelResourceDefinition: rd.Name})
+	if err != nil {
+		return "", errors.Wrap(err, "list snapshots")
+	}
+
+	for i := range snapList.Items {
+		if takeInFlight(&snapList.Items[i]) {
+			return "snapshot " + snapList.Items[i].Spec.SnapshotName + " is still being taken", nil
+		}
+	}
+
+	return "", nil
+}
+
+// takeInFlight reports whether a snapshot's take may still hold I/O
+// suspended: it orders a suspend or a take, or it has no outcome yet
+// and a node still reports its suspend.
+func takeInFlight(snap *blockstoriov1alpha1.Snapshot) bool {
+	return snap.Spec.SuspendIO || snap.Spec.TakeSnapshot ||
+		(!takeEnded(snap) && anyNodeSuspendAcked(snap.Status.NodeStatus))
+}
+
+// prunable reports whether an auto-snapshot past the keep budget can be
+// deleted now. LINSTOR prunes only once the take finished; a snapshot
+// deleted mid-take is never resumed, because the orchestration stops at
+// the deletion, and its replicas would stay frozen. A finished take
+// whose resume a node has not confirmed waits too.
+func prunable(snap *blockstoriov1alpha1.Snapshot) bool {
+	return takeEnded(snap) && !snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot &&
+		!anyNodeSuspendAcked(snap.Status.NodeStatus)
+}
+
+// anyNodeSuspendAcked reports whether a node still reports its replica
+// suspended for the take.
+func anyNodeSuspendAcked(entries []blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
+	return slices.ContainsFunc(entries, func(e blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
+		return e.SuspendIOAcked
+	})
 }
 
 // autoSnapshotTarget is what an auto-snapshot is taken from: the
@@ -665,6 +725,12 @@ func (r *AutoSnapshotRunnable) pruneOldAutoSnapshots(
 			// Already being deleted — skip the redundant Delete
 			// call but DO count it against the excess so we don't
 			// also delete the next one in line.
+			continue
+		}
+
+		// A take not over yet is pruned on a later tick, and a newer
+		// snapshot is not deleted in its place.
+		if !prunable(snap) {
 			continue
 		}
 

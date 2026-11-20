@@ -324,3 +324,139 @@ func TestAutoSnapshotReadsTheReplicasThroughTheAPIReader(t *testing.T) {
 		t.Fatalf("auto-snapshot does not record the password the API server holds: %+v", snaps)
 	}
 }
+
+// autoSnapshotAt is an auto-snapshot of rd created at the given time.
+func autoSnapshotAt(rd, name string, created time.Time) *blockstoriov1alpha1.Snapshot {
+	return &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              rd + "." + name,
+			CreationTimestamp: metav1.NewTime(created),
+			Labels: map[string]string{
+				"blockstor.org/resource-definition": rd,
+				"blockstor.org/snapshot-name":       name,
+				controllerpkg.LabelAutoSnapshot:     "true",
+			},
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: rd,
+			SnapshotName:           name,
+			Nodes:                  []string{"n1"},
+		},
+	}
+}
+
+// LINSTOR prunes old auto-snapshots only once the take finished. A
+// snapshot deleted mid-take is never resumed, as the orchestration stops
+// at the deletion, and its replicas stay frozen. A take still ordered
+// suspended, one with no outcome yet, and one whose node has not
+// confirmed the resume are kept past the budget; a finished one goes.
+func TestAutoSnapshotPruneKeepsATakeNotOver(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 5, 14, 11, 0, 0, 0, time.UTC)
+	acked := []blockstoriov1alpha1.SnapshotPerNodeStatus{{NodeName: "n1", SuspendIOAcked: true}}
+	successful := []string{blockstoriov1alpha1.SnapshotStatusFlagSuccessful}
+
+	cases := map[string]func(*blockstoriov1alpha1.Snapshot){
+		"suspended": func(s *blockstoriov1alpha1.Snapshot) {
+			s.Spec.SuspendIO = true
+			s.Status.NodeStatus = acked
+		},
+		"taking": func(s *blockstoriov1alpha1.Snapshot) {
+			s.Spec.SuspendIO, s.Spec.TakeSnapshot = true, true
+		},
+		"no outcome": func(*blockstoriov1alpha1.Snapshot) {},
+		"aborted, resume unconfirmed": func(s *blockstoriov1alpha1.Snapshot) {
+			s.Spec.AbortReason = "snapshot aborted: test"
+			s.Status.NodeStatus = acked
+		},
+	}
+
+	for name, shape := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rd := makeRDWithAutoSnapshot(t, "pvc-prune", 15, "1")
+			rd.Annotations = map[string]string{
+				controllerpkg.AnnotationAutoSnapshotLastAt: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+			}
+
+			inFlight := autoSnapshotAt(rd.Name, "auto-snap-00001", base)
+			shape(inFlight)
+
+			done := autoSnapshotAt(rd.Name, "auto-snap-00002", base.Add(time.Minute))
+			done.Status.Flags = successful
+
+			r, cli := autoSnapshotFixture(t, rd, replica(rd.Name, "n1"), inFlight, done)
+
+			tick(t, r)
+
+			if snaps := listAutoSnapshotsByRD(t, cli, rd.Name); len(snaps) != 2 {
+				t.Fatalf("a take not over was pruned, or a newer snapshot in its place: %d left", len(snaps))
+			}
+
+			inFlight.Spec.SuspendIO, inFlight.Spec.TakeSnapshot = false, false
+			inFlight.Spec.AbortReason = ""
+			inFlight.Status = blockstoriov1alpha1.SnapshotStatus{Flags: successful}
+
+			live := getSnap(t, cli, inFlight.Name)
+			live.Spec = inFlight.Spec
+
+			if err := cli.Update(context.Background(), live); err != nil {
+				t.Fatal(err)
+			}
+
+			live.Status = inFlight.Status
+			if err := cli.Status().Update(context.Background(), live); err != nil {
+				t.Fatal(err)
+			}
+
+			tick(t, r)
+
+			snaps := listAutoSnapshotsByRD(t, cli, rd.Name)
+			if len(snaps) != 1 || snaps[0].Name != done.Name {
+				t.Fatalf("the finished oldest take was not pruned: %d left", len(snaps))
+			}
+		})
+	}
+}
+
+// Two takes of one definition would suspend the same replicas, and
+// whichever resumed first would unfreeze the other in the middle of its
+// take. A tick that falls due while any snapshot of the definition,
+// automatic or not, is still being taken books nothing and waits.
+func TestAutoSnapshotWaitsForATakeUnderWay(t *testing.T) {
+	t.Parallel()
+
+	rd := makeRDWithAutoSnapshot(t, "pvc-busy", 15, "")
+
+	rest := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   rd.Name + ".csi-snap",
+			Labels: map[string]string{"blockstor.org/resource-definition": rd.Name},
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: rd.Name,
+			SnapshotName:           "csi-snap",
+			Nodes:                  []string{"n1"},
+			SuspendIO:              true,
+		},
+	}
+
+	r, cli := autoSnapshotFixture(t, rd, replica(rd.Name, "n1"), rest)
+
+	tick(t, r)
+
+	if snaps := listAutoSnapshotsByRD(t, cli, rd.Name); len(snaps) != 0 {
+		t.Fatalf("auto-snapshot started while another take of the definition is under way: %d", len(snaps))
+	}
+
+	var updated blockstoriov1alpha1.ResourceDefinition
+	if err := cli.Get(context.Background(), types.NamespacedName{Name: rd.Name}, &updated); err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	if got := updated.Spec.Props[controllerpkg.PropAutoSnapshotNextID]; got != "" {
+		t.Errorf("NextAutoId booked for a skipped auto-snapshot: %q", got)
+	}
+}

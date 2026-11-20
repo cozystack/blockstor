@@ -21,6 +21,7 @@ package controller_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -112,6 +113,28 @@ func listAutoSnapshotsByRD(t *testing.T, cli client.Client, rdName string) []blo
 	return snaps.Items
 }
 
+// finishTakes stands in for the take orchestration: every auto-snapshot
+// of the definition finishes its take and is recorded SUCCESSFUL, so the
+// next tick is not held back by a take still under way, and the pruner
+// may delete it.
+func finishTakes(t *testing.T, cli client.Client, rdName string) {
+	t.Helper()
+
+	for _, snap := range listAutoSnapshotsByRD(t, cli, rdName) {
+		if slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful) {
+			continue
+		}
+
+		snap.Spec.SuspendIO = false
+		snap.Spec.TakeSnapshot = false
+		snap.Status.Flags = append(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful)
+
+		if err := cli.Update(context.Background(), &snap); err != nil {
+			t.Fatalf("finish the take of %s: %v", snap.Name, err)
+		}
+	}
+}
+
 // TestAutoSnapshotFirstTickCreatesOne: RunEvery=15, no existing
 // state — the first Tick allocates id=1 and creates `auto-snap-00001`.
 // Pins the cadence semantic the scenario doc spells out ("set
@@ -187,6 +210,8 @@ func TestAutoSnapshotFiveIntervalsProduceFiveSnapshots(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 		// Advance just past 15 minutes so the next tick is due.
 		clk.advance(15*time.Minute + time.Second)
 	}
@@ -261,6 +286,8 @@ func TestAutoSnapshotKeepPrunesOldestBeyondBudget(t *testing.T) {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
 
+		finishTakes(t, cli, rd.Name)
+
 		clk.advance(15*time.Minute + time.Second)
 	}
 
@@ -323,6 +350,8 @@ func TestAutoSnapshotManualSnapshotsNotPruned(t *testing.T) {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 
 		clk.advance(15*time.Minute + time.Second)
 	}
@@ -434,6 +463,8 @@ func TestAutoSnapshotKeepZeroFallsBackToDefault10(t *testing.T) {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
 
+		finishTakes(t, cli, rd.Name)
+
 		clk.advance(15*time.Minute + time.Second)
 	}
 
@@ -464,6 +495,8 @@ func TestAutoSnapshotKeepNegativeFallsBackToDefault10(t *testing.T) {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 
 		clk.advance(15*time.Minute + time.Second)
 	}
@@ -496,6 +529,8 @@ func TestAutoSnapshotDefaultKeepIs10(t *testing.T) {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 
 		clk.advance(15*time.Minute + time.Second)
 	}
