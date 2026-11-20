@@ -371,6 +371,14 @@ type Reconciler struct {
 	// for the residual CRD-status-vs-on-disk window. Process-memory
 	// only; a restart resets the counter (at worst a few extra requeues).
 	restoreSnapshotMissingTries map[string]int
+
+	// adjustFailed records the resources whose last adjust failed, so
+	// the next one is a full adjust (adjustFailedBefore). The marker file
+	// beside the .res carries it across a satellite restart. A delete
+	// removes the file only: an entry left here makes the first adjust
+	// of a resource re-created under the name a full one, as it is
+	// anyway.
+	adjustFailed map[string]bool
 }
 
 // recoveryPromoteThrottle bounds how often a single resource may fire
@@ -424,6 +432,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
+		adjustFailed:                map[string]bool{},
 	}
 }
 
@@ -942,7 +951,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		// sweeper's ownership marker — must be removed AFTER the
 		// kernel slot is gone so a concurrent sweeper tick sees a
 		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned"} {
+		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", adjustFailedSuffix} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{
@@ -4961,8 +4970,18 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	skipNet := r.shouldSkipNetOnAdjust(ctx, dr.GetName())
+	skipNet := r.shouldSkipNetOnAdjust(ctx, dr.GetName()) && !r.adjustFailedBefore(dr.GetName())
 
+	err := r.adjustAndRecover(ctx, dr, skipDisk, skipNet)
+	r.recordAdjustOutcome(ctx, dr.GetName(), skipNet, err)
+
+	return err
+}
+
+// adjustAndRecover runs the adjust runAdjust chose, and the recoveries
+// from the two kernel races it knows (Bug 287, the tiebreaker-relocate
+// bitmap wedge).
+func (r *Reconciler) adjustAndRecover(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
 	err := r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
 	if err == nil {
 		// Talos / minimal-distro fix: same rationale as bringUpResource.
