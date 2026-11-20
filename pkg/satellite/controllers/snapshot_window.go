@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
@@ -211,9 +212,10 @@ type snapshotWindow struct {
 	// leaves such a window alone.
 	opening bool
 
-	// stampMu orders a take's verdict against the Failed stamp of a
+	// stampMu orders a take's verdict against the Failed verdict of a
 	// close, so a take that returned in time and a deadline that
-	// passed while it was being stamped do not both land.
+	// passed while it was being stamped do not both land. The close
+	// takes it only after the resume.
 	stampMu sync.Mutex
 	// reported is set, under stampMu, once a take stamped Ready.
 	reported bool
@@ -228,7 +230,8 @@ type snapshotWindows struct {
 	// storage snapshot, and a delete must not run before it returns.
 	takes map[string]*takeRun
 	// resumingMarkers guards resumes of windows left by an earlier
-	// process, which have a marker but no entry in windows.
+	// process, which have a marker but no entry in windows, and the
+	// marker of a closed window until its close has settled it.
 	resumingMarkers map[string]bool
 	// resumingResources guards resumes of suspends that no window or
 	// marker accounts for, by resource.
@@ -677,10 +680,25 @@ func (*SnapshotReconciler) runBounded(ctx context.Context, bound time.Duration, 
 }
 
 // resumeAndVerify resumes the marker's resource and returns nil only
-// once the kernel reports it not suspended. It reads the state first so
-// it can fall back to resuming by minor when the .res is gone, and
-// again afterwards so the answer is the kernel's, not the exit code's.
+// once the kernel reports it not suspended. It reads the state first,
+// so a resource that is not suspended is left alone and the minors to
+// fall back on are known when the .res is gone, and again afterwards so
+// the answer is the kernel's, not the exit code's.
 func (r *SnapshotReconciler) resumeAndVerify(ctx context.Context, marker *suspendMarker) error {
+	return r.resumeVerified(ctx, marker, true)
+}
+
+// resumeVerified is resumeAndVerify with the first read optional. The
+// close of a window this process opened skips it: the resource is
+// suspended and the marker has its minors, so the read would only hold
+// I/O frozen for one more command. LINSTOR resumes right after the take
+// the same way, with resume-io alone. Skipping the read is safe because
+// resume-io clears only the suspends a resume is meant to end: the
+// kernel recomputes a quorum suspend from the peers' state on every
+// state change (drbd_state.c sanitize_state), so a resource that lost
+// quorum stays frozen. A repeated resume-io on a close retry is
+// harmless unless fencing or on-no-data-accessible suspend-io is set.
+func (r *SnapshotReconciler) resumeVerified(ctx context.Context, marker *suspendMarker, readFirst bool) error {
 	if !r.Config.Apply.DRBDEnabled() {
 		return nil
 	}
@@ -692,13 +710,23 @@ func (r *SnapshotReconciler) resumeAndVerify(ctx context.Context, marker *suspen
 
 	resource := marker.Resource
 
-	before, beforeErr := r.Config.Apply.ResourceSuspendState(cmdCtx, resource)
-	if beforeErr == nil && (!before.Loaded || !before.SuspendedUser) {
-		return nil
+	var before drbd.SuspendState
+
+	if readFirst {
+		state, stateErr := r.Config.Apply.ResourceSuspendState(cmdCtx, resource)
+		if stateErr == nil && (!state.Loaded || !state.SuspendedUser) {
+			return nil
+		}
+
+		before = state
 	}
 
 	resumeErr := r.Config.Apply.ResumeResource(cmdCtx, resource)
 	if resumeErr != nil {
+		if !readFirst && len(marker.Minors) == 0 {
+			before, _ = r.Config.Apply.ResourceSuspendState(cmdCtx, resource)
+		}
+
 		minors := slices.Clone(marker.Minors)
 		for _, minor := range before.Minors {
 			if !slices.Contains(minors, minor) {
@@ -742,8 +770,9 @@ func (r *SnapshotReconciler) settleResumed(ctx context.Context, snapshot string,
 }
 
 // closeWindow resumes I/O for snapshot and forgets the window once the
-// kernel confirms. failSnapshot stamps this node Failed first, for a
-// window that ends without a snapshot the controller asked to keep.
+// kernel confirms. failSnapshot stamps this node Failed after the
+// resume, for a window that ends without a snapshot the controller
+// asked to keep; nothing waits on the API server while I/O is frozen.
 // Returns the resume error so the caller can retry; a concurrent close
 // of the same window reports nil and leaves the work to that caller.
 // What the Snapshot's status still owes after the resume stays in the
@@ -766,9 +795,8 @@ func (r *SnapshotReconciler) closeWindow(ctx context.Context, snapshot string, f
 	}()
 
 	logger := log.FromContext(ctx).WithValues("snapshot", snapshot, "resource", marker.Resource)
-	failOwed := r.failOnClose(ctx, w, snapshot, failSnapshot, reason)
 
-	err = r.resumeAndVerify(ctx, &marker)
+	err = r.resumeVerified(ctx, &marker, false)
 	if err != nil {
 		logger.Info("resume-io not confirmed; retrying", "error", err.Error())
 		r.warnResumeFailed(ctx, snapshot, err)
@@ -776,10 +804,18 @@ func (r *SnapshotReconciler) closeWindow(ctx context.Context, snapshot string, f
 		return err
 	}
 
+	failOwed := r.failOwedOnClose(ctx, w, snapshot, failSnapshot, reason)
+
+	// The marker outlives the window until the Snapshot is settled. It
+	// stays claimed meanwhile, or the sweep would take it for one an
+	// earlier process left and fail a snapshot this close is settling.
 	set.mu.Lock()
 	delete(set.windows, snapshot)
 	delete(set.lastWarn, snapshot)
+	set.resumingMarkers[snapshot] = true
 	set.mu.Unlock()
+
+	defer set.releaseLeftover(snapshot)
 
 	settleErr := r.settleResumed(ctx, snapshot, failOwed)
 	if settleErr != nil {
@@ -797,12 +833,14 @@ func (r *SnapshotReconciler) closeWindow(ctx context.Context, snapshot string, f
 	return nil
 }
 
-// failOnClose stamps this node Failed for a window that ends without a
-// snapshot, unless its take already stamped Ready, and reports whether
-// the stamp is still owed. The check and the stamp run under the
-// window's stampMu, which the take holds across its own check and
-// stamp.
-func (r *SnapshotReconciler) failOnClose(
+// failOwedOnClose reports whether a window that ends without a
+// snapshot owes this node's Failed stamp: it does unless its take
+// already stamped Ready. It runs after the resume and writes nothing,
+// so neither the API server nor a take holding stampMu across its own
+// stamp can keep I/O suspended; settleResumed stamps what is owed. A
+// take that returns from here on sees the window closing and discards
+// its verdict, so the answer cannot change once it is given.
+func (*SnapshotReconciler) failOwedOnClose(
 	ctx context.Context, w *snapshotWindow, snapshot string, failSnapshot bool, reason string,
 ) bool {
 	if !failSnapshot {
@@ -816,20 +854,10 @@ func (r *SnapshotReconciler) failOnClose(
 		return false
 	}
 
-	logger := log.FromContext(ctx).WithValues("snapshot", snapshot)
-	logger.Info("closing snapshot suspend window without a snapshot", "reason", reason)
+	log.FromContext(ctx).Info("closed snapshot suspend window without a snapshot",
+		"snapshot", snapshot, "reason", reason)
 
-	snap := &blockstoriov1alpha1.Snapshot{}
-	snap.Name = snapshot
-
-	err := r.stampSnapshotPerNodeFailed(ctx, snap)
-	if err != nil {
-		logger.Info("stamp Failed on window close; retried after the resume", "error", err.Error())
-
-		return true
-	}
-
-	return false
+	return true
 }
 
 // resumeLeftover resumes a window this process did not open: a marker
@@ -1039,7 +1067,7 @@ func (r *SnapshotReconciler) runTake(
 	logger := log.FromContext(parent).WithValues("snapshot", snap.Name)
 	ctx = log.IntoContext(ctx, logger)
 
-	verdict, taken, err := r.takeVerdict(ctx, snap)
+	verdict, taken, err := r.takeVerdict(ctx, snap, false)
 	retry := verdict == takeTransient || err != nil
 
 	w.stampMu.Lock()
