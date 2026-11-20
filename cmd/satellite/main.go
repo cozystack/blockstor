@@ -136,6 +136,26 @@ func run() int {
 	// gRPC `ApplyStoragePools` fallback).
 	providers := map[string]storage.Provider{}
 
+	restCfg, err := loadRESTConfig()
+	if err != nil {
+		logger.Error("no Kubernetes config", "err", err)
+
+		return 1
+	}
+
+	// The kernel is shared with whatever else runs DRBD on the node, LINSTOR
+	// during a migration among them, so only a resource blockstor has a
+	// replica of here is blockstor's to take down. The read is retried until
+	// the API server answers; only a shutdown in the meantime leaves that
+	// unknown, and then nothing is taken down.
+	owned, ownedErr := ownedKernelResources(ctx, logger, restCfg, nodeName)
+	if ownedErr != nil {
+		logger.Info("cold-start: cannot read which DRBD resources are blockstor's; leaving the kernel as it is",
+			"err", ownedErr.Error())
+
+		owned = nil
+	}
+
 	// Cold-start kernel reconciliation. ORDER MATTERS and the two
 	// steps share one decision: which kernel resources are *healthy*
 	// (carry recoverable local data or a live peer) and must survive
@@ -153,26 +173,11 @@ func run() int {
 	// (no usable local disk AND no healthy connection) and leave every
 	// UpToDate / SyncTarget / SyncSource / Established / Consistent /
 	// Outdated replica for the reconciler to adjust.
+	//
+	// Probed after the owned list, which can take a while on a node whose
+	// network is still coming up, so the decision below is made on the
+	// kernel as it is now.
 	healthy := healthyKernelResources(ctx, logger)
-
-	restCfg, err := loadRESTConfig()
-	if err != nil {
-		logger.Error("no Kubernetes config", "err", err)
-
-		return 1
-	}
-
-	// The kernel is shared with whatever else runs DRBD on the node, LINSTOR
-	// during a migration among them, so only a resource blockstor has a
-	// replica of here is blockstor's to take down. A read that fails leaves
-	// that unknown, and then nothing is taken down.
-	owned, ownedErr := ownedKernelResources(ctx, restCfg, nodeName)
-	if ownedErr != nil {
-		logger.Info("cold-start: cannot read which DRBD resources are blockstor's; leaving the kernel as it is",
-			"err", ownedErr.Error())
-
-		owned = nil
-	}
 
 	// Tear down only the kernel resources that are NOT in the healthy
 	// set. Without this, a reconcile that re-allocates a node-id
