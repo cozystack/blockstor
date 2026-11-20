@@ -287,6 +287,16 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	// also the forward-correct shape: when the INACTIVE replica returns
 	// (`r activate`) the cluster is immediately at the 2-diskful +
 	// 1-witness three-voter quorum with no recreate churn.
+	// A replica being deleted (DELETE flag, or DeletionTimestamp held
+	// open by the satellite's finalizer during a slow teardown) casts
+	// no vote either: upstream's isDrbdResource skips DELETE before it
+	// counts anything. Counting it here made a definition whose two
+	// diskful replicas were both being deleted look like "2 diskful, no
+	// witness" and grew a fresh TIE_BREAKER that linstor-csi then saw
+	// as live, so it left the definition behind. Dropped before the
+	// INACTIVE probe so a replica on its way out cannot hold a witness.
+	live = dropDeletingReplicas(live)
+
 	hasInactive := containsInactiveReplica(live)
 
 	live = filterActiveReplicas(live)
@@ -710,7 +720,7 @@ func (r *ResourceDefinitionReconciler) listReplicasDirect(ctx context.Context, r
 		out = append(out, apiv1.Resource{
 			Name:     crdList.Items[i].Spec.ResourceDefinitionName,
 			NodeName: crdList.Items[i].Spec.NodeName,
-			Flags:    crdList.Items[i].Spec.Flags,
+			Flags:    flagsWithDeleting(&crdList.Items[i]),
 		})
 	}
 
@@ -1209,6 +1219,34 @@ func (r *ResourceDefinitionReconciler) removeWitnesses(ctx context.Context, rdNa
 	}
 
 	return nil
+}
+
+// dropDeletingReplicas drops replicas flagged DELETE from the slice.
+// The Store path synthesises the flag from the CRD's DeletionTimestamp,
+// and listReplicasDirect does the same, so both readers agree.
+func dropDeletingReplicas(replicas []apiv1.Resource) []apiv1.Resource {
+	out := make([]apiv1.Resource, 0, len(replicas))
+
+	for i := range replicas {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagDelete) {
+			continue
+		}
+
+		out = append(out, replicas[i])
+	}
+
+	return out
+}
+
+// flagsWithDeleting returns the CRD's spec flags with DELETE appended
+// while the object carries a DeletionTimestamp, the same view the
+// Store's reader gives, without mutating the CRD's own slice.
+func flagsWithDeleting(crd *blockstoriov1alpha1.Resource) []string {
+	if crd.DeletionTimestamp.IsZero() || slices.Contains(crd.Spec.Flags, apiv1.ResourceFlagDelete) {
+		return crd.Spec.Flags
+	}
+
+	return append(slices.Clone(crd.Spec.Flags), apiv1.ResourceFlagDelete)
 }
 
 // filterActiveReplicas drops INACTIVE replicas from the slice. An

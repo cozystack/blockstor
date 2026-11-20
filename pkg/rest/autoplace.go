@@ -2895,6 +2895,12 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// pkg/rest/cache_invalidation.go.
 	converged := s.waitForResourceDeletionVisible(r.Context(), rdName, node)
 
+	// Drop a witness the delete left without a tie to break before
+	// replying, as upstream does for the shapes where its helper no
+	// longer wants one, so the caller's next listing shows it as going.
+	// See resource_delete_orphan_witness.go.
+	s.reapUnneededWitnesses(r.Context(), rdName)
+
 	// Bug 67: notify surviving sibling Resources of the peer change
 	// so satellite reconcilers re-derive their peer set without the
 	// dropped replica. Order ("delete first, bump second") ensures a
