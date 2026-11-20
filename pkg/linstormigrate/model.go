@@ -81,7 +81,11 @@ type ResourceGroupRow struct {
 	DoNotPlaceWithRsc    string `json:"do_not_place_with_rsc_list,omitempty"`
 	ReplicasOnSame       string `json:"replicas_on_same,omitempty"`
 	ReplicasOnDifferent  string `json:"replicas_on_different,omitempty"`
+	// XReplicasOnDifferent is a JSON object in a string, a node
+	// property name to the most replicas one value of it may hold.
+	XReplicasOnDifferent string `json:"x_replicas_on_different,omitempty"`
 	AllowedProviderList  string `json:"allowed_provider_list,omitempty"`
+	PeerSlots            *int32 `json:"peer_slots,omitempty"`
 	UUID                 string `json:"uuid"`
 }
 

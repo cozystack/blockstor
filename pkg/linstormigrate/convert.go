@@ -872,6 +872,7 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 			ObjectMeta: objectMeta(dsp),
 			Spec: crdv1alpha1.ResourceGroupSpec{
 				Description: row.Description,
+				PeerSlots:   ptrValue(row.PeerSlots),
 				Props:       residual,
 				DRBDOptions: typed,
 				ExtraProps:  extra,
@@ -888,6 +889,8 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 				},
 			},
 		}
+
+		c.reportXReplicasOnDifferent(row, dsp)
 
 		for _, vg := range c.volumeGroupsFor(row.ResourceGroupName) {
 			group.Spec.VolumeGroups = append(group.Spec.VolumeGroups, crdv1alpha1.ResourceGroupVolumeGroup{
@@ -907,6 +910,28 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 	sortByName(groups, func(g crdv1alpha1.ResourceGroup) string { return g.Name })
 
 	return groups
+}
+
+// reportXReplicasOnDifferent names a resource group whose
+// x_replicas_on_different the migration drops. The column caps how many
+// replicas may share one value of a node property; blockstor's
+// ResourceGroup has no field for it, so the replicas the group places
+// after the migration are not held to the cap.
+func (c *converter) reportXReplicasOnDifferent(row *ResourceGroupRow, dsp string) {
+	raw := strings.TrimSpace(row.XReplicasOnDifferent)
+	if raw == "{}" || emptyList(raw) {
+		return
+	}
+
+	var caps map[string]int32
+
+	err := json.Unmarshal([]byte(raw), &caps)
+	if err == nil && len(caps) == 0 {
+		return
+	}
+
+	c.warnf("resource group %s: x_replicas_on_different %s dropped: blockstor has no equivalent, so replicas it places from this group are not held to that limit",
+		dsp, raw)
 }
 
 // placementLists carries the resource group's provider allow-list and
@@ -2490,6 +2515,16 @@ func annotateParent(meta *metav1.ObjectMeta, key, display string) {
 
 func sortByName[T any](items []T, name func(T) string) {
 	sort.Slice(items, func(i, j int) bool { return name(items[i]) < name(items[j]) })
+}
+
+// ptrValue is *value, or the zero value for a nil value.
+func ptrValue[T any](value *T) T {
+	var zero T
+	if value == nil {
+		return zero
+	}
+
+	return *value
 }
 
 func ptr[T any](v T) *T {

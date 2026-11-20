@@ -346,3 +346,40 @@ func TestAnUnmatchedLiveMapKeepsTheDatabasePorts(t *testing.T) {
 		t.Errorf("replicas with database ports reported portless; warnings %v", res.Warnings)
 	}
 }
+
+// A resource group's peer_slots is carried, and an
+// x_replicas_on_different blockstor has no field for is reported as
+// dropped by name and value rather than lost silently.
+func TestResourceGroupColumnsOfTheStorageVersion(t *testing.T) {
+	dump := loadFixture(t)
+
+	for i := range dump.ResourceGroups {
+		if dump.ResourceGroups[i].ResourceGroupName == "SC-ENCRYPTED" {
+			dump.ResourceGroups[i].XReplicasOnDifferent = `{"Aux/site":1}`
+		}
+	}
+
+	res, err := convertForTest(t, dump)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	for _, group := range res.ResourceGroups {
+		want := int32(0)
+		if group.Name == "sc-replicated" {
+			want = 7
+		}
+
+		if group.Spec.PeerSlots != want {
+			t.Errorf("resource group %s peerSlots = %d, want %d", group.Name, group.Spec.PeerSlots, want)
+		}
+	}
+
+	if !hasWarning(res, `resource group sc-encrypted: x_replicas_on_different {"Aux/site":1} dropped`) {
+		t.Errorf("x_replicas_on_different not reported; warnings %v", res.Warnings)
+	}
+
+	if hasWarning(res, "sc-replicated: x_replicas_on_different") {
+		t.Errorf("an empty x_replicas_on_different was reported; warnings %v", res.Warnings)
+	}
+}
