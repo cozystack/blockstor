@@ -201,7 +201,8 @@ func TestResourceCreateOfLocalVolumeAnswersOnceItsDeviceExists(t *testing.T) {
 // TestAutoplaceWarnsWhenReplicaIsNotBuiltInTime pins the bound blockstor
 // adds where LINSTOR relies on its satellites answering every update: a
 // replica that is never built does not hold the answer past the deploy
-// bound, the placement stands, and the node gets the not-ready warning.
+// bound (30 seconds in the binaries, scaled down here), the placement
+// stands, and the node gets the not-ready warning.
 func TestAutoplaceWarnsWhenReplicaIsNotBuiltInTime(t *testing.T) {
 	st := store.NewInMemory()
 
@@ -246,6 +247,20 @@ func TestBuildBoundKeepsNotConnectedWarnings(t *testing.T) {
 	w := warningsFor(rcs)
 	if len(w) != 2 || w["n1"] != maskWarn || w["n2"] != warnNotConnected {
 		t.Errorf("want not-ready for n1 and not-connected for n2, got %v (%+v)", w, rcs)
+	}
+}
+
+// TestDeployAndReadyBoundsFitTheSidecarTimeout pins the bounds against
+// the deadline of the calls they hold: piraeus-operator runs
+// csi-provisioner and csi-attacher with --timeout=1m. Both waits back
+// to back must leave room in that minute for the writes before them,
+// or a slow build is cut off by the sidecar instead of answered.
+func TestDeployAndReadyBoundsFitTheSidecarTimeout(t *testing.T) {
+	const sidecarTimeout = time.Minute
+
+	if total := DefaultResourceDeployWait + DefaultResourceReadyWait; total > sidecarTimeout-15*time.Second {
+		t.Errorf("deploy %s + ready %s = %s leaves less than 15s of the %s sidecar timeout",
+			DefaultResourceDeployWait, DefaultResourceReadyWait, total, sidecarTimeout)
 	}
 }
 

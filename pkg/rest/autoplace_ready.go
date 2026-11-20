@@ -40,7 +40,15 @@ const DefaultResourceReadyWait = 15 * time.Second
 // every update, with an error when the apply failed. A blockstor
 // satellite reports no failure to the REST layer, so the wait gives up
 // and answers with the not-ready warning instead of holding the call.
-const DefaultResourceDeployWait = 60 * time.Second
+//
+// The bound is sized against the callers' own deadline. piraeus-operator
+// runs csi-provisioner and csi-attacher with --timeout=1m, which cancels
+// CreateVolume and ControllerPublishVolume, and with them this request,
+// after one minute. This bound plus DefaultResourceReadyWait leaves 15
+// seconds of that minute for the definition, volume and placement
+// writes, so a slow build is answered with the warning instead of being
+// cut off by the sidecar and retried from scratch.
+const DefaultResourceDeployWait = 30 * time.Second
 
 // resourceReadyPollInterval is how often the wait re-reads the cached
 // replicas. A variable so tests can shorten it.
