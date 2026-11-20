@@ -125,13 +125,22 @@ func HasSpecialLayers(stack []string) bool {
 	return false
 }
 
+// parseBoolean is Java's Boolean.parseBoolean, which LINSTOR reads both
+// switches with: true only for "true" in any case, everything else
+// false.
+func parseBoolean(value string) bool {
+	return strings.EqualFold(value, "true")
+}
+
 // AutoEnabled resolves Linstor/Drbd/auto-block-size over a volume's
 // property levels, closest first: volume definition, resource definition,
-// volume group, resource group, controller. Unset is on.
+// volume group, resource group, controller. Unset is on; a value set is
+// on only when it reads "true", so "yes" or "1" switch it off, as in
+// LINSTOR.
 func AutoEnabled(levels ...map[string]string) bool {
 	for _, level := range levels {
 		if value, ok := level[PropAuto]; ok {
-			return !strings.EqualFold(strings.TrimSpace(value), "false")
+			return parseBoolean(value)
 		}
 	}
 
@@ -140,7 +149,7 @@ func AutoEnabled(levels ...map[string]string) bool {
 
 // Frozen reports whether a volume definition's block size is frozen.
 func Frozen(vdProps map[string]string) bool {
-	return strings.EqualFold(strings.TrimSpace(vdProps[PropFreeze]), frozenValue)
+	return parseBoolean(vdProps[PropFreeze])
 }
 
 // Freeze stamps the freeze marker. It reports whether props changed.

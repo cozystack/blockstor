@@ -79,6 +79,27 @@ func TestAutoEnabled(t *testing.T) {
 	}
 }
 
+// TestSwitchesParseLikeLINSTOR: LINSTOR reads both switches with Java's
+// Boolean.parseBoolean, so only "true", in any case, is true. "yes" or
+// "1" on auto-block-size switch the rule off there, and "yes" on the
+// freeze stamp does not freeze.
+func TestSwitchesParseLikeLINSTOR(t *testing.T) {
+	t.Parallel()
+
+	for value, want := range map[string]bool{
+		"true": true, "True": true, "TRUE": true,
+		"false": false, "yes": false, "no": false, "1": false, "0": false, "off": false, "on": false, "": false,
+	} {
+		if got := blocksize.AutoEnabled(map[string]string{blocksize.PropAuto: value}); got != want {
+			t.Errorf("auto-block-size %q: on = %v, want %v", value, got, want)
+		}
+
+		if got := blocksize.Frozen(map[string]string{blocksize.PropFreeze: value}); got != want {
+			t.Errorf("freeze-block-size %q: frozen = %v, want %v", value, got, want)
+		}
+	}
+}
+
 func TestDecide(t *testing.T) {
 	t.Parallel()
 
