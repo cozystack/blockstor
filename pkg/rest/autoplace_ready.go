@@ -27,6 +27,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // DefaultResourceReadyWait is how long LINSTOR waits for a deployed
@@ -192,9 +193,9 @@ func (s *Server) waitDeployedReplicasBuilt(ctx context.Context, rdName string, d
 // ONLINE has been answered with the not-connected warning instead, and
 // an INACTIVE replica is never built.
 func (s *Server) deployedReplicasNotBuilt(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, error) {
-	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	replicas, err := s.deployedReplicas(ctx, rdName, deployed)
 	if err != nil {
-		return nil, errors.Wrap(err, "list replicas")
+		return nil, err
 	}
 
 	byNode := make(map[string]*apiv1.Resource, len(replicas))
@@ -216,6 +217,38 @@ func (s *Server) deployedReplicasNotBuilt(ctx context.Context, rdName string, de
 	}
 
 	return out, nil
+}
+
+// deployedReplicas lists the replicas of rdName for a wait on the
+// replicas on deployed. It reads the cache, and the API server when the
+// cache does not list one of them yet.
+//
+// The call that deployed them wrote them a few milliseconds earlier,
+// and this apiserver's informer cache trails its own writes. Both waits
+// skip a deployed replica they do not find, as one deleted meanwhile,
+// so a cache that had not caught up answered a single local volume at
+// once, before its satellite built it: linstor-csi then read a view
+// without the device path and refused ControllerPublishVolume with
+// "could not determine device path". LINSTOR answers from the objects
+// it just created, so it never misses one.
+func (s *Server) deployedReplicas(ctx context.Context, rdName string, deployed []string) ([]apiv1.Resource, error) {
+	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return nil, errors.Wrap(err, "list replicas")
+	}
+
+	for _, node := range deployed {
+		if !slices.ContainsFunc(replicas, func(r apiv1.Resource) bool { return naming.Same(r.NodeName, node) }) {
+			live, err := store.LiveReplicas(ctx, s.Store, rdName)
+			if err != nil {
+				return nil, errors.Wrap(err, "list replicas past the cache")
+			}
+
+			return live, nil
+		}
+	}
+
+	return replicas, nil
 }
 
 // replicaBuilt reports whether the satellite built every volume of rsc:
@@ -280,9 +313,9 @@ func (s *Server) replicasNotConnected(ctx context.Context, rdName string) []stri
 // node that is not ONLINE is not waited for: it has been answered with
 // the not-connected warning.
 func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, error) {
-	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	replicas, err := s.deployedReplicas(ctx, rdName, deployed)
 	if err != nil {
-		return nil, errors.Wrap(err, "list replicas")
+		return nil, err
 	}
 
 	if len(replicas) <= 1 || allReplicasDiskless(replicas) {
