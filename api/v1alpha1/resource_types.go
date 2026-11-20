@@ -516,6 +516,17 @@ type PeerVolumeStatus struct {
 	// A string because a CRD has no portable float type.
 	// +optional
 	Done string `json:"done,omitempty"`
+
+	// replicationState is this volume's DRBD-9 replication state with
+	// this peer, the `replication:<state>` token of the volume's own
+	// peer-device frame. DRBD keeps it per peer and per volume, and
+	// so does LINSTOR (DrbdVolume.volReplState); the connection-level
+	// `replicationState` is whichever volume's frame came last. It is
+	// what `done` belongs to: a two-volume resource can have one
+	// volume in SyncTarget and the other Established or PausedSyncT
+	// on the same connection.
+	// +optional
+	ReplicationState string `json:"replicationState,omitempty"`
 }
 
 // ResourceVolumeStatus is the runtime state of one volume of a Resource.

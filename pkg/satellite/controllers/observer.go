@@ -162,10 +162,16 @@ type volumeObservation struct {
 // volume-wide OutOfSyncKib is whichever peer-device frame came last,
 // so it can show the finished small resync while the large one is
 // half done.
+//
+// ReplicationState is the `replication:<state>` token of the same
+// frame. DRBD keeps it per peer and per volume; the connection-level
+// ReplicationState is whichever volume's frame came last, so `done`
+// is only read against this one.
 type peerVolumeObservation struct {
-	VolumeNumber  int32
-	PeerDiskState string
-	Done          string
+	VolumeNumber     int32
+	PeerDiskState    string
+	Done             string
+	ReplicationState string
 }
 
 // connectionObservation carries one per-peer DRBD connection state.
@@ -522,11 +528,19 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 		// this node's local kernel view); under partition the two
 		// views diverge, which is exactly what the partition e2e
 		// tests assert.
-		if pd := ev.Fields["peer-disk"]; pd != "" {
+		//
+		// The volume's own replication state and resync progress
+		// ride on the same entry. A peer-device frame carrying either
+		// token is a full statement of that volume's state with that
+		// peer (events2 runs with --full), so a missing `done` on it
+		// means no resync runs, whether or not it carries peer-disk.
+		pd, repl := ev.Fields["peer-disk"], ev.Fields["replication"]
+		if pd != "" || repl != "" {
 			conn.PeerVolumes = []peerVolumeObservation{{
-				VolumeNumber:  int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
-				PeerDiskState: pd,
-				Done:          ev.Fields["done"],
+				VolumeNumber:     int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
+				PeerDiskState:    pd,
+				Done:             ev.Fields["done"],
+				ReplicationState: repl,
 			}}
 		}
 
@@ -1586,17 +1600,19 @@ func (o *ObserverRunnable) pruneVolumeCacheToDesired(ev *observation, res *block
 // applies are deterministic (test stability + idempotent re-emit
 // during resync).
 //
-// Per-volume merge: an incoming PeerDiskState=="" leaves the
-// cached value alone (frame didn't carry the token). A non-empty
-// value updates the cached entry for that VolumeNumber, adding a
-// new entry if this is the first frame for that volume.
+// Per-volume merge: an incoming PeerDiskState or ReplicationState
+// of "" leaves that cached value alone (frame didn't carry the
+// token). A non-empty value updates the cached entry for that
+// VolumeNumber, adding a new entry if this is the first frame for
+// that volume. An entry carrying neither token is not a peer-device
+// state and is skipped.
 //
-// Done is replaced together with PeerDiskState, absent included.
-// events2 runs with --full, so every peer-device frame carries
-// peer-disk, and drbdsetup prints `done` on it exactly while a
+// Done is replaced on every entry that is merged, absent included.
+// events2 runs with --full, so every peer-device frame carries the
+// whole state, and drbdsetup prints `done` on it exactly while a
 // resync with that peer runs: a frame without it means the resync
 // is over. LINSTOR's DrbdVolume.update clears its done percentage on
-// such a frame the same way.
+// any frame without one the same way.
 func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolumeObservation {
 	byVol := map[int32]peerVolumeObservation{}
 	for _, peerVol := range cached {
@@ -1604,13 +1620,21 @@ func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolume
 	}
 
 	for _, peerVol := range incoming {
-		if peerVol.PeerDiskState == "" {
+		if peerVol.PeerDiskState == "" && peerVol.ReplicationState == "" {
 			continue
 		}
 
 		entry := byVol[peerVol.VolumeNumber]
 		entry.VolumeNumber = peerVol.VolumeNumber
-		entry.PeerDiskState = peerVol.PeerDiskState
+
+		if peerVol.PeerDiskState != "" {
+			entry.PeerDiskState = peerVol.PeerDiskState
+		}
+
+		if peerVol.ReplicationState != "" {
+			entry.ReplicationState = peerVol.ReplicationState
+		}
+
 		entry.Done = peerVol.Done
 		byVol[peerVol.VolumeNumber] = entry
 	}
@@ -2145,9 +2169,10 @@ func buildPeerVolumeStatus(in []peerVolumeObservation) []blockstoriov1alpha1.Pee
 	out := make([]blockstoriov1alpha1.PeerVolumeStatus, 0, len(in))
 	for _, peerVol := range in {
 		out = append(out, blockstoriov1alpha1.PeerVolumeStatus{
-			VolumeNumber:  peerVol.VolumeNumber,
-			PeerDiskState: peerVol.PeerDiskState,
-			Done:          peerVol.Done,
+			VolumeNumber:     peerVol.VolumeNumber,
+			PeerDiskState:    peerVol.PeerDiskState,
+			Done:             peerVol.Done,
+			ReplicationState: peerVol.ReplicationState,
 		})
 	}
 

@@ -628,6 +628,17 @@ spec:
                               `peer-disk:<state>` token in `drbdsetup events2
                               --statistics` peer-device frames.
                             type: string
+                          replicationState:
+                            description: |-
+                              replicationState is this volume's DRBD-9 replication state with
+                              this peer, the `replication:<state>` token of the volume's own
+                              peer-device frame. DRBD keeps it per peer and per volume, and
+                              so does LINSTOR (DrbdVolume.volReplState); the connection-level
+                              `replicationState` is whichever volume's frame came last. It is
+                              what `done` belongs to: a two-volume resource can have one
+                              volume in SyncTarget and the other Established or PausedSyncT
+                              on the same connection.
+                            type: string
                           volumeNumber:
                             description: |-
                               volumeNumber is the DRBD-9 volume number this peer-view entry

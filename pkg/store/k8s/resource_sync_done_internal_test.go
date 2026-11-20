@@ -99,3 +99,65 @@ func TestCrdToWireResourceCarriesDonePerPeerAndVolume(t *testing.T) {
 func ptrFloat64(v float64) *float64 {
 	return &v
 }
+
+// TestCrdToWireResourceReadsReplicationPerVolume pins that each
+// volume's replication state with a peer is that volume's own. DRBD
+// and LINSTOR keep it per peer and per volume; the connection-level
+// field is whichever volume's peer-device frame came last. A
+// two-volume resource whose volume 0 resyncs while volume 1's frame
+// said Established last must still report volume 0 in SyncTarget with
+// its done, and volume 1 must not borrow volume 0's SyncTarget. A
+// volume with no per-volume entry falls back to the connection.
+func TestCrdToWireResourceReadsReplicationPerVolume(t *testing.T) {
+	t.Parallel()
+
+	crd := &crdv1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-x.node-c"},
+		Spec:       crdv1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-x", NodeName: "node-c"},
+		Status: crdv1alpha1.ResourceStatus{
+			Volumes: []crdv1alpha1.ResourceVolumeStatus{
+				{VolumeNumber: 0, DiskState: "Inconsistent"},
+				{VolumeNumber: 1, DiskState: "Inconsistent"},
+				{VolumeNumber: 2, DiskState: "UpToDate"},
+			},
+			Connections: []crdv1alpha1.ResourceConnectionStatus{
+				{
+					PeerNodeName:     "node-a",
+					Connected:        true,
+					ReplicationState: "PausedSyncT",
+					PeerVolumes: []crdv1alpha1.PeerVolumeStatus{
+						{VolumeNumber: 0, PeerDiskState: "UpToDate", ReplicationState: "SyncTarget", Done: "50.31"},
+						{VolumeNumber: 1, PeerDiskState: "UpToDate", ReplicationState: "PausedSyncT", Done: "3.00"},
+					},
+				},
+			},
+		},
+	}
+
+	wire := crdToWireResource(crd)
+	if len(wire.Volumes) != 3 {
+		t.Fatalf("volumes: got %d, want 3", len(wire.Volumes))
+	}
+
+	for _, want := range []struct {
+		volume int
+		repl   string
+	}{
+		{0, "SyncTarget"},
+		{1, "PausedSyncT"},
+		{2, "PausedSyncT"}, // no per-volume entry: the connection's
+	} {
+		got := wire.Volumes[want.volume].State.ReplicationStates["node-a"]
+		if got.ReplicationState != want.repl {
+			t.Errorf("volume %d: replication_state = %q, want %q", want.volume, got.ReplicationState, want.repl)
+		}
+	}
+
+	if done, ok := wire.Volumes[0].State.SyncProgress("SyncTarget"); !ok || done != 50.31 {
+		t.Errorf("volume 0: SyncTarget progress = %v, %v; want 50.31, true", done, ok)
+	}
+
+	if done, ok := wire.Volumes[1].State.SyncProgress("SyncTarget"); ok {
+		t.Errorf("volume 1: SyncTarget progress = %v, want none (it is paused)", done)
+	}
+}

@@ -103,3 +103,75 @@ func TestObserverKeepsResyncDonePerPeer(t *testing.T) {
 		t.Errorf("node-a done = %q after the resync ended, want none", got)
 	}
 }
+
+// TestObserverKeepsReplicationPerVolume replays a two-volume resource
+// whose volume 0 resyncs from a peer while volume 1, on the same
+// connection, is paused. DRBD reports replication per peer and per
+// volume, and LINSTOR keeps it so (DrbdVolume.volReplState); the
+// connection-level state is whichever volume's frame came last. Each
+// volume must keep its own, or volume 0's `done` would be read against
+// volume 1's PausedSyncT and the other way round.
+//
+// A frame without `peer-disk` still states the volume's replication
+// and ends its `done` when it carries none, so no stale progress is
+// left behind on such a frame.
+func TestObserverKeepsReplicationPerVolume(t *testing.T) {
+	t.Parallel()
+
+	o := &ObserverRunnable{}
+
+	feed := func(line string) {
+		t.Helper()
+
+		ev, err := drbd.ParseEvent(line)
+		if err != nil {
+			t.Fatalf("ParseEvent(%q): %v", line, err)
+		}
+
+		obs, ok := translatePeerDeviceEvent(ev)
+		if !ok {
+			t.Fatalf("translatePeerDeviceEvent rejected %q", line)
+		}
+
+		o.mergeConnections(&obs)
+	}
+
+	volumeOf := func(vol int32) (string, string) {
+		t.Helper()
+
+		snap := o.snapshotFor("pvc-x")
+		for _, c := range buildObserverConnectionStatus(&snap) {
+			for _, pv := range c.PeerVolumes {
+				if pv.VolumeNumber == vol {
+					return pv.ReplicationState, pv.Done
+				}
+			}
+		}
+
+		t.Fatalf("no volume %d entry in %+v", vol, snap.Connections)
+
+		return "", ""
+	}
+
+	feed("change peer-device name:pvc-x peer-node-id:0 conn-name:node-a volume:0 " +
+		"replication:SyncTarget peer-disk:UpToDate peer-client:no resync-suspended:no " +
+		"done:50.31 received:62914560 sent:0 out-of-sync:65011712 pending:0 unacked:0")
+	feed("change peer-device name:pvc-x peer-node-id:0 conn-name:node-a volume:1 " +
+		"replication:PausedSyncT peer-disk:UpToDate peer-client:no resync-suspended:dependency " +
+		"done:3.00 received:0 sent:0 out-of-sync:1048576 pending:0 unacked:0")
+
+	if repl, done := volumeOf(0); repl != "SyncTarget" || done != "50.31" {
+		t.Errorf("volume 0 = (%q, %q), want (SyncTarget, 50.31)", repl, done)
+	}
+
+	if repl, done := volumeOf(1); repl != "PausedSyncT" || done != "3.00" {
+		t.Errorf("volume 1 = (%q, %q), want (PausedSyncT, 3.00)", repl, done)
+	}
+
+	feed("change peer-device name:pvc-x peer-node-id:0 conn-name:node-a volume:0 " +
+		"replication:Established")
+
+	if repl, done := volumeOf(0); repl != "Established" || done != "" {
+		t.Errorf("volume 0 after a frame without peer-disk = (%q, %q), want (Established, none)", repl, done)
+	}
+}
