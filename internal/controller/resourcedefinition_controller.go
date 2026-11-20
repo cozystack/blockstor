@@ -156,6 +156,13 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
+	err = r.finishVolumeDefinitionDeletes(ctx, &rd)
+	if err != nil {
+		log.Error(err, "finish volume definition deletes", "rd", rd.Name)
+
+		return ctrl.Result{}, err
+	}
+
 	// Belt-and-braces re-enqueue: the witness-decision read in
 	// ensureTiebreaker goes through the cached client, and an RD
 	// reconciled right when the second Resource arrives may see a
@@ -1749,8 +1756,11 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		DeleteFunc: func(_ event.DeleteEvent) bool { return true },
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			// Generation bump = Spec change. Status-only patches
-			// keep Generation steady.
-			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+			// keep Generation steady. The one status change that
+			// counts is a replica confirming a volume definition
+			// delete, which may be the last one the delete waits for.
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				deletedVolumesChanged(e.ObjectOld, e.ObjectNew)
 		},
 		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}

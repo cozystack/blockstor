@@ -46,6 +46,13 @@ const (
 	// same bit doubles as FAILED_DEPLOYMENT — see snapshot handling).
 	resourceFlagDelete int64 = 1 << 1
 
+	// vlmDfnFlagDelete is a volume definition's DELETE bit, which is
+	// 1<<0 in LINSTOR's VolumeDefinition.Flags, not the 1<<1 of a
+	// resource: 1<<1 is ENCRYPTED there. It survives in a dump when a
+	// `vd d` had not finished on every satellite, the controller leaving
+	// the definition flagged until they confirm.
+	vlmDfnFlagDelete int64 = 1 << 0
+
 	// resourceFlagDiskless is the generic diskless bit (1<<2).
 	resourceFlagDiskless int64 = 1 << 2
 
