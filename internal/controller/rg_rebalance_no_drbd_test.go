@@ -127,7 +127,9 @@ func TestRGRebalanceScheduledSkipsDefinitionWithoutDRBD(t *testing.T) {
 }
 
 // TestRGRebalanceScheduledStillPlacesDRBDDefinition is the control: the
-// same fixture with the default stack is topped up as before.
+// same fixture with the default stack is topped up as before. The
+// balance task tops up only a definition with an UpToDate diskful
+// replica, so one is seeded and the group asks for two.
 func TestRGRebalanceScheduledStillPlacesDRBDDefinition(t *testing.T) {
 	t.Parallel()
 
@@ -138,14 +140,34 @@ func TestRGRebalanceScheduledStillPlacesDRBDDefinition(t *testing.T) {
 
 	seedNoDRBDRebalance(t, ctx, st, nil, nil, nil)
 
+	rg, err := st.ResourceGroups().Get(ctx, "rg")
+	if err != nil {
+		t.Fatalf("get rg: %v", err)
+	}
+
+	rg.SelectFilter.PlaceCount = 2
+
+	if err := st.ResourceGroups().Update(ctx, &rg); err != nil {
+		t.Fatalf("raise place count: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-local",
+		NodeName: "n1",
+		Props:    map[string]string{"StorPoolName": "pool"},
+		Volumes:  upToDateVolumes(),
+	}); err != nil {
+		t.Fatalf("seed UpToDate replica: %v", err)
+	}
+
 	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
 
 	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	if n := replicasOf(t, ctx, st, "pvc-local"); n != 1 {
-		t.Errorf("scheduled pass placed %d replicas on a DRBD definition, want 1", n)
+	if n := replicasOf(t, ctx, st, "pvc-local"); n != 2 {
+		t.Errorf("scheduled pass left %d replicas on a DRBD definition, want 2", n)
 	}
 }
 
@@ -161,7 +183,8 @@ func TestRGRebalanceAnnotationPlacesDefinitionWithoutDRBD(t *testing.T) {
 	st := store.NewInMemory()
 
 	seedNoDRBDRebalance(t, ctx, st, []string{apiv1.LayerKindStorage}, nil, map[string]string{
-		apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
+		apiv1.AnnotationRGRebalancePending:    "2026-05-14T00:00:00Z",
+		apiv1.AnnotationRGRebalancePlaceCount: "2026-05-14T00:00:00Z",
 	})
 
 	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
@@ -200,13 +223,14 @@ func TestRGEventSkipsDefinitionWithoutDRBD(t *testing.T) {
 	}
 }
 
-// TestRGModifyPlacesEveryChildWithBalancingOff: `BalanceResourcesEnabled`
-// switches off LINSTOR's balance task, not an explicit `rg modify`,
-// which autoplaces every child whatever its stack. The RG event path
-// places the DRBD child on the same update and leaves out the
-// storage-only one, so the rebalance reconciler must place that one
-// before it strips the annotation, in whichever order the two run.
-func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
+// TestRGModifyWithBalancingOffPlacesChildWithoutDRBD: an `rg modify`
+// that raised the place count still places on a storage-only child with
+// `BalanceResourcesEnabled` off, since neither the balance task nor the
+// RG event path ever places on one, so the rebalance reconciler must
+// place it before it strips the annotation, in whichever order the two
+// run. The DRBD child stays with the RG event path, which honours the
+// switch, so the kill switch keeps holding for it.
+func TestRGModifyWithBalancingOffPlacesChildWithoutDRBD(t *testing.T) {
 	t.Parallel()
 
 	type reconciler interface {
@@ -226,7 +250,8 @@ func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
 			st := store.NewInMemory()
 
 			seedNoDRBDRebalance(t, ctx, st, nil, []string{apiv1.LayerKindStorage}, map[string]string{
-				apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
+				apiv1.AnnotationRGRebalancePending:    "2026-05-14T00:00:00Z",
+				apiv1.AnnotationRGRebalancePlaceCount: "2026-05-14T00:00:00Z",
 			})
 
 			if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
@@ -256,9 +281,9 @@ func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
 				}
 			}
 
-			for _, rd := range []string{"pvc-local", "pvc-drbd"} {
-				if n := replicasOf(t, ctx, st, rd); n != 1 {
-					t.Errorf("rg modify with balancing off placed %d replicas on %q, want 1", n, rd)
+			for rd, want := range map[string]int{"pvc-local": 1, "pvc-drbd": 0} {
+				if n := replicasOf(t, ctx, st, rd); n != want {
+					t.Errorf("rg modify with balancing off placed %d replicas on %q, want %d", n, rd, want)
 				}
 			}
 

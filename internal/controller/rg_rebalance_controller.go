@@ -152,11 +152,14 @@ func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // so a stale marker doesn't loop forever against the disabled
 // reconciler.
 //
-// The kill switch stops the balance task, not an explicit `rg modify`:
-// LINSTOR autoplaces every child of a modified group whatever its
-// BalanceResources setting. A DRBD child gets that placement from the
-// RG event path on the same update, which leaves out a child without
-// DRBD, so this pass places those before it strips the marker.
+// The kill switch stops the balance task. An explicit `rg modify` that
+// raised the place count still places on the children without DRBD,
+// which neither the balance task nor the RG event path ever places on,
+// so this pass places those before it strips the marker. A DRBD child
+// stays with the RG event path, which honours the switch, so the kill
+// switch holds for it as before. A modify that changed only a
+// placement constraint gets the balance checks, which the switch
+// fails, so it places nothing.
 func (r *RGRebalanceReconciler) handleDisabledPass(ctx context.Context, rg *apiv1.ResourceGroup) error {
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; !hasAnnotation {
 		return nil
@@ -164,8 +167,6 @@ func (r *RGRebalanceReconciler) handleDisabledPass(ctx context.Context, rg *apiv
 
 	log := logf.FromContext(ctx).WithValues("rg", rg.Name)
 
-	// The same balance checks as the annotation pass with balancing
-	// on: only a raised place count places without them.
 	_, placeCountRaised := rg.Annotations[apiv1.AnnotationRGRebalancePlaceCount]
 
 	count, err := r.rebalanceChildRDs(ctx, rg, 0, childrenWithoutDRBD, !placeCountRaised)
@@ -363,8 +364,8 @@ const (
 	childrenWithDRBD
 
 	// childrenWithoutDRBD is the explicit `rg modify` with balancing
-	// off. The RG event path already places the DRBD children on the
-	// same update; these are the ones it leaves out.
+	// off: the children the RG event path leaves out whatever the
+	// switch says.
 	childrenWithoutDRBD
 )
 
