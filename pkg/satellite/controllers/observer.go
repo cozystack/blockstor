@@ -129,7 +129,12 @@ type volumeObservation struct {
 	// frame's `backing_dev:` field. Used by the observer to read the
 	// on-disk current-UUID via drbdmeta get-gi when events2 doesn't
 	// carry it (DRBD 9.3.2). Not published to Status.
-	BackingDev   string
+	BackingDev string
+	// ProbedGI is the current-UUID the last get-gi read for this
+	// volume found on disk, kept so a write the volume did not cause
+	// (a connection or role frame) still carries it. Only published
+	// while DiskState is data-bearing.
+	ProbedGI     string
 	OutOfSyncKib int64
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
@@ -1177,6 +1182,7 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 			current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
 			if err == nil {
 				vol.CurrentUUID = current
+				o.rememberProbedGI(ev.ResourceName, vol.VolumeNumber, current)
 			}
 		}
 
@@ -1184,6 +1190,21 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 			o.RecordGI(ev.ResourceName, vol.VolumeNumber, vol.CurrentUUID)
 		}
 	}
+}
+
+// rememberProbedGI keeps a get-gi result on the cached volume, so the
+// next write that does not probe still publishes it.
+func (o *ObserverRunnable) rememberProbedGI(name string, volume int32, currentUUID string) {
+	o.volMu.Lock()
+	defer o.volMu.Unlock()
+
+	cached, ok := o.volCache[name][volume]
+	if !ok {
+		return
+	}
+
+	cached.ProbedGI = currentUUID
+	o.volCache[name][volume] = cached
 }
 
 // isDataBearingDiskState reports whether a DRBD disk state means the
@@ -1426,11 +1447,11 @@ func stringMapsEqual(left, right map[int32]string) bool {
 // same listMap key — leaving Status.Volumes[i] alternating between
 // "has disk-state, no sync" and "has sync, no disk-state".
 //
-// Throttle: when the incoming observation is identical to the
-// cached value, mergeVolumes leaves ev.Volumes empty so writeStatus
-// becomes a no-op for that slice. peer-device events fire on every
-// drbdsetup statistics tick (~1Hz per peer); without this filter
-// each idle resource would PATCH the apiserver every second.
+// When the incoming observation changes nothing on the cached
+// volumes, mergeVolumes leaves ev.Volumes empty, so backfillCurrentGI
+// does not run get-gi for a statistics frame. writeStatus still sends
+// every cached volume (completeFromCache): leaving them out of the
+// apply would delete them.
 func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 	if ev.ResourceName == "" {
 		return
@@ -1466,7 +1487,7 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 			continue
 		}
 
-		if mergeVolumeInto(cache, incoming) {
+		if mergeVolumeInto(cache, &incoming) {
 			changed = true
 		}
 	}
@@ -1615,7 +1636,7 @@ func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolume
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
 // to decide whether to emit a fresh Status snapshot.
-func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservation) bool {
+func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservation) bool {
 	merged := cache[incoming.VolumeNumber]
 	merged.VolumeNumber = incoming.VolumeNumber
 
@@ -1735,8 +1756,8 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 	}
 
 	// Only overwrite the slice when this event actually carried
-	// connection data; otherwise role/disk events would re-broadcast
-	// the cache redundantly on every kernel frame.
+	// connection data. writeStatus sends every cached peer either way
+	// (completeFromCache).
 	if len(ev.Connections) == 0 {
 		return
 	}
@@ -1747,6 +1768,81 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 	}
 
 	ev.Connections = snapshot
+}
+
+// completeFromCache replaces ev's state with everything the observer
+// holds for the resource at the moment of the write. Every status apply
+// goes out under one field manager, and server-side apply removes any
+// field that manager set before and leaves out now: an apply carrying
+// only the frame's own part (a connection, a role, or no volume at all
+// when a statistics frame changed nothing on it) deleted the disk
+// state, GI and quorum of a healthy replica, or its connections, until
+// the next resync put them back. Reading the caches here rather than
+// trusting ev also keeps a resync pass that took its snapshot before a
+// newer frame from writing the older state over it.
+//
+// ev keeps only what the caches cannot know: a current-UUID the
+// caller just read from disk. A resource the caches do not hold at all
+// (a direct call) is written from ev as it is.
+func (o *ObserverRunnable) completeFromCache(ev *observation) {
+	view, known := o.cachedView(ev.ResourceName)
+	if !known {
+		return
+	}
+
+	read := make(map[int32]string, len(ev.Volumes))
+	for _, vol := range ev.Volumes {
+		if vol.CurrentUUID != "" {
+			read[vol.VolumeNumber] = vol.CurrentUUID
+		}
+	}
+
+	for i := range view.Volumes {
+		vol := &view.Volumes[i]
+		if vol.CurrentUUID != "" {
+			continue
+		}
+
+		if gi, ok := read[vol.VolumeNumber]; ok {
+			vol.CurrentUUID = gi
+		} else if isDataBearingDiskState(drbd.DiskState(vol.DiskState)) {
+			vol.CurrentUUID = vol.ProbedGI
+		}
+	}
+
+	ev.Volumes = view.Volumes
+	ev.Connections = view.Connections
+	ev.InUse = view.InUse
+	ev.DrbdState = view.DrbdState
+	ev.Role = view.Role
+	ev.Suspended = view.Suspended
+}
+
+// cachedView is snapshotFor in a stable order, plus whether any cache
+// holds the resource. The order matters: the apiserver keeps a list in
+// the order it is sent, so the same state in a new map order would be
+// a real write.
+func (o *ObserverRunnable) cachedView(name string) (observation, bool) {
+	view := o.snapshotFor(name)
+
+	o.volMu.Lock()
+	_, haveVolumes := o.volCache[name]
+	o.volMu.Unlock()
+
+	o.connMu.Lock()
+	_, haveConnections := o.connCache[name]
+	o.connMu.Unlock()
+
+	o.resMu.Lock()
+	_, haveResource := o.resCache[name]
+	o.resMu.Unlock()
+
+	sort.Slice(view.Volumes, func(i, j int) bool { return view.Volumes[i].VolumeNumber < view.Volumes[j].VolumeNumber })
+	sort.Slice(view.Connections, func(i, j int) bool {
+		return view.Connections[i].PeerNodeName < view.Connections[j].PeerNodeName
+	})
+
+	return view, haveVolumes || haveConnections || haveResource
 }
 
 // writeStatus applies the observation onto the matching Resource
@@ -1801,6 +1897,8 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		// not thrash the apiserver.
 		o.pruneVolumeCacheToDesired(ev, &lookup)
 	}
+
+	o.completeFromCache(ev)
 
 	// No prior Get on the apply payload itself: SSA Patch is the
 	// existence check. The cached client's local cache trails the
