@@ -52,12 +52,17 @@ const layerStackUndecidedRequeue = 2 * time.Second
 // pin may keep the default for a definition that already holds data;
 // errLayerStackUndecided asks the caller to wait. A definition that is
 // gone keeps the old behaviour and allocates.
+//
+// This runs on every live Resource reconcile, RD-watch and sibling
+// fan-out included, so it reads through the cache. A stale copy cannot
+// flip the answer: a stack is set once and never cleared, and the
+// satellite applies the same gate. Only a miss goes to the apiserver,
+// because a definition created a moment before its replica may not be
+// cached yet, and reading that as gone would allocate for it.
 func (r *ResourceReconciler) replicaUsesDRBD(ctx context.Context, rdName string) (bool, error) {
-	reader := r.apiReader()
-
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
+	err := r.getCachedOrLive(ctx, rdName, &rd)
 	if errors.IsNotFound(err) {
 		return true, nil
 	}
@@ -76,7 +81,7 @@ func (r *ResourceReconciler) replicaUsesDRBD(ctx context.Context, rdName string)
 
 	var rg blockstoriov1alpha1.ResourceGroup
 
-	err = reader.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Spec.ResourceGroupName)}, &rg)
+	err = r.getCachedOrLive(ctx, rd.Spec.ResourceGroupName, &rg)
 	if errors.IsNotFound(err) {
 		return true, nil
 	}
@@ -90,6 +95,19 @@ func (r *ResourceReconciler) replicaUsesDRBD(ctx context.Context, rdName string)
 	}
 
 	return false, cerrors.Wrapf(errLayerStackUndecided, "%q in group %q", rdName, rd.Spec.ResourceGroupName)
+}
+
+// getCachedOrLive reads a cluster-scoped object from the cache and falls
+// back to the apiserver only when the cache does not have it.
+func (r *ResourceReconciler) getCachedOrLive(ctx context.Context, name string, obj client.Object) error {
+	key := client.ObjectKey{Name: naming.Key(name)}
+
+	err := r.Get(ctx, key, obj)
+	if !errors.IsNotFound(err) {
+		return err
+	}
+
+	return r.apiReader().Get(ctx, key, obj)
 }
 
 // allocateDRBDIDsIfUsed runs the Bug 302 allocation for a replica whose

@@ -22,7 +22,9 @@ import (
 	"context"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -39,17 +41,19 @@ type noDRBDFixture struct {
 	rgStack, rdStack []string
 }
 
-func (f noDRBDFixture) reconcile(t *testing.T) (ctrl.Result, *blockstoriov1alpha1.Resource, *blockstoriov1alpha1.ResourceDefinition) {
-	t.Helper()
+const (
+	noDRBDGroup    = "local"
+	noDRBDDef      = "pvc-local"
+	noDRBDNode     = "n1"
+	noDRBDResource = noDRBDDef + "." + noDRBDNode
+)
 
-	ctx := context.Background()
-	scheme := newScheme(t)
-
+func (f noDRBDFixture) objects() (*blockstoriov1alpha1.ResourceGroup, *blockstoriov1alpha1.ResourceDefinition, *blockstoriov1alpha1.Resource) {
 	const (
-		rgName   = "local"
-		rdName   = "pvc-local"
-		nodeName = "n1"
-		resName  = rdName + "." + nodeName
+		rgName   = noDRBDGroup
+		rdName   = noDRBDDef
+		nodeName = noDRBDNode
+		resName  = noDRBDResource
 	)
 
 	rg := &blockstoriov1alpha1.ResourceGroup{
@@ -78,12 +82,41 @@ func (f noDRBDFixture) reconcile(t *testing.T) (ctrl.Result, *blockstoriov1alpha
 		},
 	}
 
-	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&blockstoriov1alpha1.Resource{}, &blockstoriov1alpha1.ResourceDefinition{}).
-		WithObjects(rg, rd, res).
-		Build()
+	return rg, rd, res
+}
 
-	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+func (f noDRBDFixture) reconcile(t *testing.T) (ctrl.Result, *blockstoriov1alpha1.Resource, *blockstoriov1alpha1.ResourceDefinition) {
+	t.Helper()
+
+	scheme := newScheme(t)
+	rg, rd, res := f.objects()
+	cli := noDRBDClient(t, scheme, rg, rd, res)
+
+	return reconcileNoDRBD(t, &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}, cli)
+}
+
+func noDRBDClient(t *testing.T, scheme *runtime.Scheme, objs ...client.Object) client.Client {
+	t.Helper()
+
+	return fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}, &blockstoriov1alpha1.ResourceDefinition{}).
+		WithObjects(objs...).
+		Build()
+}
+
+// reconcileNoDRBD reconciles the fixture's replica once and reads the
+// replica and its definition back through cli.
+func reconcileNoDRBD(
+	t *testing.T, rec *controllerpkg.ResourceReconciler, cli client.Client,
+) (ctrl.Result, *blockstoriov1alpha1.Resource, *blockstoriov1alpha1.ResourceDefinition) {
+	t.Helper()
+
+	ctx := context.Background()
+
+	const (
+		rdName  = noDRBDDef
+		resName = noDRBDResource
+	)
 
 	result, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: resName}})
 	if err != nil {
@@ -176,4 +209,91 @@ func TestAllocatorWaitsForLayerStackPin(t *testing.T) {
 	if result.RequeueAfter == 0 {
 		t.Errorf("unpinned definition was not requeued: %+v", result)
 	}
+}
+
+// countingReader counts the definition and group reads that reach the
+// apiserver.
+type countingReader struct {
+	client.Reader
+
+	defs, groups int
+}
+
+func (c *countingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	switch obj.(type) {
+	case *blockstoriov1alpha1.ResourceDefinition:
+		c.defs++
+	case *blockstoriov1alpha1.ResourceGroup:
+		c.groups++
+	}
+
+	return c.Reader.Get(ctx, key, obj, opts...)
+}
+
+// TestAllocatorReadsLayerStackFromCache: the layer-stack check runs on
+// every live Resource reconcile, RD-watch and sibling fan-out included,
+// so it must not add uncached apiserver reads. A stack is set once and
+// never cleared, so the cached copy gives the same answer.
+func TestAllocatorReadsLayerStackFromCache(t *testing.T) {
+	t.Parallel()
+
+	for name, fx := range map[string]noDRBDFixture{
+		"stack on the definition": {rgStack: []string{apiv1.LayerKindStorage}, rdStack: []string{apiv1.LayerKindStorage}},
+		"stack not pinned yet":    {rgStack: []string{apiv1.LayerKindStorage}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			scheme := newScheme(t)
+			rg, rd, res := fx.objects()
+			cli := noDRBDClient(t, scheme, rg, rd, res)
+			live := &countingReader{Reader: cli}
+
+			_, gotRes, gotRD := reconcileNoDRBD(t,
+				&controllerpkg.ResourceReconciler{Client: cli, APIReader: live, Scheme: scheme}, cli)
+
+			assertNoDRBDIDs(t, gotRes, gotRD)
+
+			if live.defs != 0 || live.groups != 0 {
+				t.Errorf("layer-stack check went to the apiserver: %d definition and %d group reads, want 0",
+					live.defs, live.groups)
+			}
+		})
+	}
+}
+
+// cacheMissingDefinitions is a cache that has not seen any definition
+// yet; everything else reads through.
+type cacheMissingDefinitions struct {
+	client.Client
+}
+
+func (c cacheMissingDefinitions) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*blockstoriov1alpha1.ResourceDefinition); ok {
+		return apierrors.NewNotFound(blockstoriov1alpha1.GroupVersion.WithResource("resourcedefinitions").GroupResource(), key.Name)
+	}
+
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// TestAllocatorFallsBackToLiveReadOnCacheMiss: a replica can reach the
+// controller before the cache has its definition, which was created a
+// moment earlier. Reading that miss as a definition that is gone would
+// allocate DRBD IDs for a storage-only replica, so a miss goes to the
+// apiserver.
+func TestAllocatorFallsBackToLiveReadOnCacheMiss(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	rg, rd, res := noDRBDFixture{
+		rgStack: []string{apiv1.LayerKindStorage},
+		rdStack: []string{apiv1.LayerKindStorage},
+	}.objects()
+
+	live := noDRBDClient(t, scheme, rg, rd, res)
+
+	_, gotRes, gotRD := reconcileNoDRBD(t,
+		&controllerpkg.ResourceReconciler{Client: cacheMissingDefinitions{live}, APIReader: live, Scheme: scheme}, live)
+
+	assertNoDRBDIDs(t, gotRes, gotRD)
 }
