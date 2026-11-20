@@ -85,23 +85,57 @@ func (r *Reconciler) DeleteVolumes(ctx context.Context, req *intent.DeleteVolume
 	return nil
 }
 
+// RemoveVolumesFromDRBD takes the requested volumes out of DRBD ahead of
+// the apply that re-renders the .res without them, so they are removed in
+// the order that does not suspend the volumes that stay (see
+// drbd.Adm.RemoveMinorsKeepingQuorum) instead of inside `drbdadm adjust`,
+// which removes them while on-no-quorum suspend-io is in force.
+func (r *Reconciler) RemoveVolumesFromDRBD(ctx context.Context, req *intent.DeleteVolumesRequest) error {
+	return r.removeVolumeMinors(ctx, req)
+}
+
 // removeVolumeMinors takes every requested volume out of DRBD, then has
-// DRBD recheck the resource's quorum, which a volume's removal can leave
-// stale.
+// DRBD recheck the resource's quorum, which a removal elsewhere, by
+// `drbdadm adjust` or on a resource the quorum policy is not relaxed on,
+// can leave stale.
 func (r *Reconciler) removeVolumeMinors(ctx context.Context, req *intent.DeleteVolumesRequest) error {
-	withDRBD := false
-
-	for _, vol := range req.Volumes {
-		err := r.removeVolumeMinor(ctx, req.Name, vol)
-		if err != nil {
-			return err
-		}
-
-		withDRBD = withDRBD || vol.Minor != nil
+	if r.cfg.Adm == nil {
+		return nil
 	}
 
-	if r.cfg.Adm == nil || !withDRBD {
+	var (
+		owned    []int32
+		withDRBD bool
+	)
+
+	for _, vol := range req.Volumes {
+		if vol.Minor == nil {
+			continue
+		}
+
+		withDRBD = true
+
+		owner, err := r.cfg.Adm.ResourceOwningMinor(ctx, *vol.Minor)
+		if err != nil {
+			return errors.Wrapf(err, "find the owner of DRBD minor %d", *vol.Minor)
+		}
+
+		// A minor the kernel gives to another resource is not this
+		// volume's any more and is left alone.
+		if owner != "" && naming.Same(owner, req.Name) {
+			owned = append(owned, *vol.Minor)
+		}
+	}
+
+	if !withDRBD {
 		return nil
+	}
+
+	if len(owned) > 0 {
+		err := r.cfg.Adm.RemoveMinorsKeepingQuorum(ctx, req.Name, owned)
+		if err != nil {
+			return errors.Wrapf(err, "remove volumes of %s from DRBD", req.Name)
+		}
 	}
 
 	return r.recheckQuorum(ctx, req.Name)
@@ -136,53 +170,15 @@ func (r *Reconciler) RecheckQuorumAfterVolumeRemoval(ctx context.Context, req *i
 }
 
 // recheckQuorum has DRBD recompute the quorum verdict a removed volume left
-// behind (see drbd.Adm.RecheckQuorumAfterVolumeRemoval), holding suspendMu
-// so a snapshot cannot suspend the resource between the check and the
-// resume-io, which would lift that suspension too.
+// behind (see drbd.Adm.RecheckQuorumAfterVolumeRemoval).
 func (r *Reconciler) recheckQuorum(ctx context.Context, name string) error {
-	r.suspendMu.Lock()
-	defer r.suspendMu.Unlock()
-
 	done, err := r.cfg.Adm.RecheckQuorumAfterVolumeRemoval(ctx, name)
 	if err != nil {
-		return errors.Wrapf(err, "resume the I/O of %s after its volumes were removed", name)
+		return errors.Wrapf(err, "recheck the quorum of %s after its volumes were removed", name)
 	}
 
-	switch done {
-	case drbd.QuorumRecheckRan:
-		log.FromContext(ctx).Info("resumed I/O after a volume removal so DRBD rechecks quorum", "resource", name)
-	case drbd.QuorumRecheckUnsafe:
-		log.FromContext(ctx).Info("not resuming I/O after a volume removal: the resource fences peers or "+
-			"suspends on no data, and resume-io would lift such a suspension too; "+
-			"run drbdsetup resume-io if the remaining volumes stay suspended", "resource", name)
-	case drbd.QuorumRecheckNotNeeded:
-	}
-
-	return nil
-}
-
-// removeVolumeMinor makes sure the volume's DRBD device is gone before its
-// storage is touched. After a re-render without the volume `drbdadm adjust`
-// has removed it already; when the volume was the resource's last one no
-// .res is rendered and nothing has, so it is removed here. A minor the kernel
-// gives to another resource is not this volume's any more and is left alone.
-func (r *Reconciler) removeVolumeMinor(ctx context.Context, name string, vol intent.VolumeToDelete) error {
-	if r.cfg.Adm == nil || vol.Minor == nil {
-		return nil
-	}
-
-	owner, err := r.cfg.Adm.ResourceOwningMinor(ctx, *vol.Minor)
-	if err != nil {
-		return errors.Wrapf(err, "find the owner of DRBD minor %d", *vol.Minor)
-	}
-
-	if owner == "" || !naming.Same(owner, name) {
-		return nil
-	}
-
-	err = r.cfg.Adm.RemoveMinor(ctx, *vol.Minor)
-	if err != nil {
-		return errors.Wrapf(err, "remove volume %s/%d from DRBD", name, vol.VolumeNumber)
+	if done == drbd.QuorumRecheckRan {
+		log.FromContext(ctx).Info("had DRBD recompute quorum after a volume removal", "resource", name)
 	}
 
 	return nil

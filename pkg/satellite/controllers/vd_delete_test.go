@@ -482,6 +482,12 @@ const vdDelSuspendIOShow = `[{"resource": "pvc-vdd",
   "options": {"quorum": "majority", "on-no-quorum": "suspend-io"},
   "connections": [{"_peer_node_id": 0}]}]`
 
+// The on-no-quorum changes the satellite makes around and after a removal.
+const (
+	vdDelToIOError   = "drbdsetup resource-options pvc-vdd --on-no-quorum=io-error"
+	vdDelToSuspendIO = "drbdsetup resource-options pvc-vdd --on-no-quorum=suspend-io"
+)
+
 // `drbdadm adjust` can remove the minor of a volume flagged DELETE and then
 // fail for another reason, in the same run or in later ones. Its storage
 // stays until an apply goes through, but the quorum recheck the removal
@@ -492,11 +498,11 @@ func TestAfterAFailedApplyTheRemovedMinorsQuorumIsRechecked(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name       string
-		verbose    string
-		wantResume bool
+		name        string
+		verbose     string
+		wantRecheck bool
 	}{
-		{name: "adjust removed the minor", verbose: "pvc-vdd role:Primary\n  volume:0 minor:1000 disk:UpToDate\n", wantResume: true},
+		{name: "adjust removed the minor", verbose: "pvc-vdd role:Primary\n  volume:0 minor:1000 disk:UpToDate\n", wantRecheck: true},
 		{name: "the minor is still there", verbose: statusWithMinor},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -526,12 +532,81 @@ func TestAfterAFailedApplyTheRemovedMinorsQuorumIsRechecked(t *testing.T) {
 			}
 
 			lines := exec.CommandLines()
-			if got := slices.Contains(lines, "drbdsetup resume-io 1000"); got != tc.wantResume {
-				t.Errorf("resume-io run %t, want %t; commands %q", got, tc.wantResume, lines)
+			if got := slices.Contains(lines, vdDelToIOError); got != tc.wantRecheck {
+				t.Errorf("quorum recomputed %t, want %t; commands %q", got, tc.wantRecheck, lines)
 			}
 
-			if !tc.wantResume && slices.Contains(lines, "drbdsetup status pvc-vdd --json") {
+			if !tc.wantRecheck && slices.Contains(lines, "drbdsetup status pvc-vdd --json") {
 				t.Errorf("quorum read while the minor is still in the kernel; commands %q", lines)
+			}
+		})
+	}
+}
+
+// vdDelSecondaryStatus is `drbdsetup status pvc-vdd --json` on a Secondary
+// that still has both volumes, neither suspended nor open.
+const vdDelSecondaryStatus = `[{"name": "pvc-vdd", "role": "Secondary", "suspended": false,
+  "suspended-user": false, "suspended-no-data": false, "suspended-fencing": false,
+  "suspended-quorum": false,
+  "devices": [{"volume": 0, "minor": 1000, "disk-state": "UpToDate", "open": false, "quorum": true},
+    {"volume": 1, "minor": 1001, "disk-state": "UpToDate", "open": false, "quorum": true}]}]`
+
+// Inside `drbdadm adjust` the volume of a definition flagged DELETE is
+// removed while on-no-quorum suspend-io is in force, which suspends the
+// volumes that stay on the replica that removes it last. Ahead of the
+// apply, which re-renders the .res without the volume, the satellite takes
+// the volume out itself under io-error and sets suspend-io back, and
+// leaves its storage to the delete that follows the apply.
+func TestBeforeTheApplyFlaggedVolumesLeaveDRBDKeepingQuorum(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		flagged bool
+		want    []string
+	}{
+		{
+			name: "a volume flagged DELETE", flagged: true,
+			want: []string{vdDelToIOError, "drbdsetup detach 1001", "drbdsetup del-minor 1001", vdDelToSuspendIO},
+		},
+		{name: "nothing flagged"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			exec := storage.NewFakeExec()
+			exec.Responses["drbdsetup status --verbose"] = storage.FakeResponse{Stdout: []byte(statusWithMinor)}
+			exec.Responses["drbdsetup status pvc-vdd --json"] = storage.FakeResponse{Stdout: []byte(vdDelSecondaryStatus)}
+			exec.Responses["drbdsetup show pvc-vdd --json"] = storage.FakeResponse{Stdout: []byte(vdDelSuspendIOShow)}
+
+			provider := &recordingProvider{}
+			f := newVDDeleteFixture(t, map[string]storage.Provider{vdDelPool: provider}, drbd.NewAdm(exec),
+				func(rd *blockstoriov1alpha1.ResourceDefinition, _ *blockstoriov1alpha1.Resource) {
+					rd.Spec.LayerStack = []string{"DRBD", "STORAGE"}
+					minor := int32(1001)
+					rd.Spec.VolumeDefinitions[1].DRBDMinor = &minor
+					if tc.flagged {
+						flag(&rd.Spec.VolumeDefinitions[1], vdDelID)
+					}
+				})
+
+			f.rec.prepareDRBDApply(t.Context(), f.res, f.rd, nil, logr.Discard())
+
+			var got []string
+
+			for _, line := range exec.CommandLines() {
+				if strings.HasPrefix(line, "drbdsetup resource-options ") ||
+					strings.HasPrefix(line, "drbdsetup detach ") || strings.HasPrefix(line, "drbdsetup del-minor ") {
+					got = append(got, line)
+				}
+			}
+
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("commands %q, want %q", got, tc.want)
+			}
+
+			if deleted := provider.deletedNumbers(); len(deleted) != 0 {
+				t.Errorf("storage of volumes %v deleted before the apply", deleted)
 			}
 		})
 	}

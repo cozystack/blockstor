@@ -83,19 +83,37 @@ func (r *ResourceReconciler) deleteFlaggedVolumes(ctx context.Context, res *bloc
 	return r.applyDeletedVolumes(ctx, res, keep)
 }
 
-// recheckQuorumAfterFailedApply has DRBD recheck the resource's quorum
-// when an apply failed after its `drbdadm adjust` had already removed the
-// minor of a volume flagged DELETE. DeleteVolumes, which does that recheck
-// otherwise, waits for an apply that goes through, and until then the
-// remaining volumes of a Primary would stay suspended or failing their I/O.
-func (r *ResourceReconciler) recheckQuorumAfterFailedApply(
+// removeFlaggedVolumesFromDRBD takes the volumes of definitions flagged
+// DELETE out of DRBD before the apply re-renders the .res without them, in
+// the order that does not suspend the volumes that stay. It is best effort:
+// a volume it leaves, such as one still in use, is removed by the apply's
+// `drbdadm adjust` as LINSTOR removes it, and its quorum is rechecked then.
+// It needs no peer allocation, so it runs ahead of that gate.
+func (r *ResourceReconciler) removeFlaggedVolumesFromDRBD(
 	ctx context.Context,
 	res *blockstoriov1alpha1.Resource,
 	rd *blockstoriov1alpha1.ResourceDefinition,
 	logger logr.Logger,
 ) {
-	if !rdNeedsDRBD(rd) {
+	req := r.flaggedMinorsRequest(res, rd)
+	if req == nil {
 		return
+	}
+
+	err := r.Config.Apply.RemoveVolumesFromDRBD(ctx, req)
+	if err != nil {
+		logger.Info("volumes flagged DELETE left to drbdadm adjust", "error", err.Error())
+	}
+}
+
+// flaggedMinorsRequest lists the DRBD minors of the volume definitions
+// flagged DELETE this replica has not confirmed yet; nil when there are
+// none.
+func (r *ResourceReconciler) flaggedMinorsRequest(
+	res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition,
+) *intent.DeleteVolumesRequest {
+	if !rdNeedsDRBD(rd) {
+		return nil
 	}
 
 	_, todo := r.planVolumeDeletes(res, rd)
@@ -109,6 +127,25 @@ func (r *ResourceReconciler) recheckQuorumAfterFailedApply(
 	}
 
 	if len(req.Volumes) == 0 {
+		return nil
+	}
+
+	return req
+}
+
+// recheckQuorumAfterFailedApply has DRBD recheck the resource's quorum
+// when an apply failed after its `drbdadm adjust` had already removed the
+// minor of a volume flagged DELETE. DeleteVolumes, which does that recheck
+// otherwise, waits for an apply that goes through, and until then the
+// remaining volumes of a Primary would stay suspended or failing their I/O.
+func (r *ResourceReconciler) recheckQuorumAfterFailedApply(
+	ctx context.Context,
+	res *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	logger logr.Logger,
+) {
+	req := r.flaggedMinorsRequest(res, rd)
+	if req == nil {
 		return
 	}
 
