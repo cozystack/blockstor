@@ -233,6 +233,15 @@ func lowPriority() *int {
 	return &priority
 }
 
+// lowPriorityRecheck is the result of a converged DRBD pass: the
+// periodic re-check, marked for the re-check gate, at low priority.
+func lowPriorityRecheck(ctx context.Context) ctrl.Result {
+	result := schedulePeriodicRecheck(ctx)
+	result.Priority = lowPriority()
+
+	return result
+}
+
 // normalPriority is the queue priority of a real event, and of every
 // retry of a pass that did not converge.
 func normalPriority() *int {
@@ -745,10 +754,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// LINSTOR's satellite re-dispatches only resources with a pending
 	// change outside a full sync (DeviceManagerImpl.devMgrLoop).
 	if rdNeedsDRBD(&rd) {
-		result := schedulePeriodicRecheck(ctx)
-		result.Priority = lowPriority()
-
-		return result, nil
+		return lowPriorityRecheck(ctx), nil
 	}
 
 	return ctrl.Result{}, nil
