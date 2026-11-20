@@ -184,9 +184,8 @@ func TestStateColumnContracts(t *testing.T) {
 		}
 
 		got := cellAt(t, view.ResourceList(view.ResourceListInput{
-			Resources:      []apiv1.Resource{res},
-			VolumeSizesKib: map[string]map[int32]int64{res.Name: {0: 100}},
-			FaultyOnly:     true,
+			Resources:  []apiv1.Resource{res},
+			FaultyOnly: true,
 		}), 0, "State")
 
 		if got != "SyncTarget(50.31%)" {
@@ -200,8 +199,7 @@ func TestStateColumnContracts(t *testing.T) {
 		res := diskful("node-2", "Inconsistent", 512)
 
 		got := cellAt(t, view.ResourceList(view.ResourceListInput{
-			Resources:      []apiv1.Resource{res},
-			VolumeSizesKib: map[string]map[int32]int64{res.Name: {0: 1024}},
+			Resources: []apiv1.Resource{res},
 		}), 0, "State")
 
 		if got != "Inconsistent" {

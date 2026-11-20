@@ -69,15 +69,6 @@ type ResourceListInput struct {
 	// the caller passed those flags.
 	Resources []apiv1.Resource
 
-	// VolumeSizesKib maps a resource-definition name to its volume
-	// sizes, used to turn the observed out-of-sync KiB into a progress
-	// percentage. Absent sizes simply omit the percentage.
-	//
-	// Keyed by definition, not by volume number alone: a listing spans
-	// several definitions, and volume 0 of one is not volume 0 of
-	// another.
-	VolumeSizesKib map[string]map[int32]int64
-
 	// FaultyOnly keeps only replicas whose observed disk state is
 	// present and not converged (`--faulty`).
 	FaultyOnly bool
