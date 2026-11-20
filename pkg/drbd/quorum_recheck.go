@@ -22,7 +22,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"strconv"
 
 	"github.com/cockroachdb/errors"
 )
@@ -32,76 +31,92 @@ type QuorumRecheck int
 
 const (
 	// QuorumRecheckNotNeeded: no stale quorum verdict can be left, or one
-	// that is left is DRBD's to keep (a volume without quorum, a
-	// suspension with another reason).
+	// that is left is DRBD's to keep (a volume without quorum).
 	QuorumRecheckNotNeeded QuorumRecheck = iota
-	// QuorumRecheckRan: resume-io ran and DRBD recomputed quorum from
-	// the volumes that are left.
+	// QuorumRecheckRan: DRBD recomputed quorum from the volumes that are
+	// left.
 	QuorumRecheckRan
-	// QuorumRecheckUnsafe: a stale verdict may be left, and the resource
-	// fences peers or suspends on no data, where resume-io could lift a
-	// suspension that lands between the status read and the resume.
-	// Nothing ran, as in LINSTOR.
-	QuorumRecheckUnsafe
 )
 
-// suspendIO is the on-no-quorum and on-no-data-accessible value that
-// suspends I/O instead of failing it.
-const suspendIO = "suspend-io"
+// The two on-no-quorum policies. drbdsetup show leaves the default,
+// suspend-io, out.
+const (
+	suspendIO = "suspend-io"
+	ioError   = "io-error"
+)
 
 // RecheckQuorumAfterVolumeRemoval has DRBD recompute the resource's quorum
 // verdict after a volume was taken out of it, so the volumes that stay are
 // not held by the one that went.
 //
-// DRBD computes that verdict from every device of the resource, and only
-// when a state change runs. del-minor turns replication to each peer off
-// before it unregisters the device, so the volume going away ends with no
-// peer and no quorum, then the device is unregistered and nothing
-// recomputes. A peer's later state change does; the replica that removes
-// the volume last never sees one. With on-no-quorum suspend-io its remaining
-// volumes stay suspended on quorum. With io-error the resource keeps its
-// cached "not every device has quorum", and every request on the remaining
-// volumes of a Primary completes with EIO while the status shows nothing
-// suspended and quorum on every volume.
+// del-minor turns replication to each peer off before it unregisters the
+// device, so the volume going away ends with no peer and no quorum, and
+// DRBD computes the resource's verdict from every device it still has. The
+// device is then unregistered without a state change, so nothing recomputes
+// the verdict until some later state change does, and on the replica that
+// removes the volume last none comes. With on-no-quorum suspend-io the
+// resource stays suspended on quorum. With io-error it keeps a cached
+// "not every device has quorum", and every request on the remaining volumes
+// of a Primary completes with EIO while the status shows nothing suspended
+// and quorum on every volume.
 //
-// resume-io runs a state change, which recomputes both; on a resource that
-// is not suspended DRBD treats it as nothing to do and still recomputes. It
-// runs only when every remaining volume has quorum and nothing but quorum
-// holds the resource suspended, since resume-io also lifts a snapshot's
-// suspend-io, a no-data or a fencing suspension. The kernel can set the last
-// two between the status read and the resume, and no drbdsetup command
-// closes that window, so a resource that fences peers or suspends on no
-// data is left as it is.
+// It runs only when every remaining volume has quorum, so a resource that
+// has really lost it stays as DRBD put it. It switches on-no-quorum to the
+// other policy and back: a change of that option is the one admin command
+// that runs a forced state change, which recomputes both from the volumes
+// that are left and lifts no other suspension. resume-io is not used: it
+// also lifts a snapshot's, a no-data and a fencing suspension, and on a
+// resource that is not suspended it changes nothing, so DRBD skips the
+// state change and the io-error verdict stays stale.
 func (a *Adm) RecheckQuorumAfterVolumeRemoval(ctx context.Context, resource string) (QuorumRecheck, error) {
 	res, err := a.quorumStatus(ctx, resource)
-	if err != nil || res == nil || !everyVolumeHasQuorumAlone(res) {
+	if err != nil || res == nil || !everyVolumeHasQuorum(res) {
 		return QuorumRecheckNotNeeded, err
 	}
 
 	show, err := a.quorumConfig(ctx, resource)
-	if err != nil || show == nil {
+	if err != nil || show == nil || !quorumEnabled(show) {
 		return QuorumRecheckNotNeeded, err
 	}
 
-	verdict := quorumRecheckFor(res, show)
-	if verdict != QuorumRecheckRan {
-		return verdict, nil
+	policy := onNoQuorum(show)
+	if policy == suspendIO && !res.SuspendedQuorum {
+		return QuorumRecheckNotNeeded, nil
 	}
 
-	m := strconv.Itoa(int(res.Devices[0].Minor))
+	other := suspendIO
+	if policy == suspendIO {
+		other = ioError
+	}
 
-	_, err = a.exec.Run(ctx, "drbdsetup", "resume-io", m)
+	err = a.setOnNoQuorum(ctx, resource, other)
 	if err != nil {
-		return QuorumRecheckNotNeeded, errors.Wrapf(err, "drbdsetup resume-io %s", m)
+		return QuorumRecheckNotNeeded, err
+	}
+
+	err = a.setOnNoQuorum(ctx, resource, policy)
+	if err != nil {
+		return QuorumRecheckNotNeeded, errors.Wrapf(err, "restore on-no-quorum of %s", resource)
 	}
 
 	return QuorumRecheckRan, nil
 }
 
-// everyVolumeHasQuorumAlone reports whether the resource has volumes, each
-// of them with quorum, and nothing but quorum holds it suspended.
-func everyVolumeHasQuorumAlone(res *drbdsetupStatusResource) bool {
-	if res.SuspendedUser || res.SuspendedNoData || res.SuspendedFencing || len(res.Devices) == 0 {
+// setOnNoQuorum changes the resource's on-no-quorum policy alone; the
+// other resource options keep their values.
+func (a *Adm) setOnNoQuorum(ctx context.Context, resource, policy string) error {
+	_, err := a.exec.Run(ctx, "drbdsetup", "resource-options", resource, "--on-no-quorum="+policy)
+	if err != nil {
+		return errors.Wrapf(err, "drbdsetup resource-options %s --on-no-quorum=%s", resource, policy)
+	}
+
+	return nil
+}
+
+// everyVolumeHasQuorum reports whether the resource has volumes, each of
+// them with quorum.
+func everyVolumeHasQuorum(res *drbdsetupStatusResource) bool {
+	if len(res.Devices) == 0 {
 		return false
 	}
 
@@ -114,25 +129,18 @@ func everyVolumeHasQuorumAlone(res *drbdsetupStatusResource) bool {
 	return true
 }
 
-// quorumRecheckFor decides, from the resource's configuration, whether a
-// stale quorum verdict can be left and whether resume-io may run for it.
-func quorumRecheckFor(res *drbdsetupStatusResource, show *drbdsetupShowResource) QuorumRecheck {
-	quorumOn := show.Options.Quorum != "" && show.Options.Quorum != "off"
-	if !res.SuspendedQuorum && (!quorumOn || show.Options.OnNoQuorum == suspendIO) {
-		return QuorumRecheckNotNeeded
+// quorumEnabled reports whether the resource enforces quorum.
+func quorumEnabled(show *drbdsetupShowResource) bool {
+	return show.Options.Quorum != "" && show.Options.Quorum != "off"
+}
+
+// onNoQuorum is the resource's on-no-quorum policy.
+func onNoQuorum(show *drbdsetupShowResource) string {
+	if show.Options.OnNoQuorum == "" {
+		return suspendIO
 	}
 
-	if show.Options.OnNoData == suspendIO {
-		return QuorumRecheckUnsafe
-	}
-
-	for _, c := range show.Connections {
-		if c.Net.Fencing != "" && c.Net.Fencing != "dont-care" {
-			return QuorumRecheckUnsafe
-		}
-	}
-
-	return QuorumRecheckRan
+	return show.Options.OnNoQuorum
 }
 
 // quorumStatus reads `drbdsetup status <res> --json`; nil when the kernel

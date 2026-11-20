@@ -81,24 +81,34 @@ func vdQuorumShow(onNoQuorum, fencing string) []byte {
   "connections": [{"_peer_node_id": 0` + net + `}, {"_peer_node_id": 1` + net + `}]}]`)
 }
 
-var errResumeRefused = errors.New("state change failed")
+var errOptionsRefused = errors.New("state change failed")
 
-// `vd d` of volume 1 of a three-replica resource with quorum majority. The
-// replicas drop the volume one after another; del-minor turns replication
-// to every peer off before it unregisters the device, so the volume ends
-// with no peer and no quorum, and DRBD's verdict for the resource is
-// computed with it. A peer's later state change recomputes that on the
-// replicas that went first. The one that goes last sees none: with
-// on-no-quorum suspend-io it was left suspended with volume 0 reporting
-// quorum:yes and both peers connected, and with io-error a Primary's
-// requests on volume 0 would fail with EIO while nothing shows suspended.
+const (
+	vdToIOError   = "drbdsetup resource-options pvc-vd --on-no-quorum=io-error"
+	vdToSuspendIO = "drbdsetup resource-options pvc-vd --on-no-quorum=suspend-io"
+)
+
+// `vd d` of volume 1 of a three-replica resource with quorum majority.
+// del-minor turns replication to every peer off before it unregisters the
+// device, so the volume ends with no peer and no quorum, and DRBD's verdict
+// for the resource is computed with it and never again once it is gone.
+// With on-no-quorum suspend-io the replica that removed it last was left
+// suspended with volume 0 reporting quorum:yes and both peers connected;
+// with io-error a Primary's requests on volume 0 would fail with EIO while
+// nothing shows suspended.
 //
-// The replica that removes the volume must have DRBD recheck, once the
-// volume is out of DRBD, whether it removed the minor here or the apply's
-// `drbdadm adjust` already had. A resource that fences peers is left as it
-// is, since resume-io would also lift a fencing suspension.
+// Once the volume is out of DRBD, whether the satellite removed the minor
+// or the apply's `drbdadm adjust` already had, the verdict is recomputed by
+// switching on-no-quorum to the other policy and back, which lifts no other
+// suspension and so runs on a resource that suspends on no data or fences
+// peers too, as the replicated StorageClasses of a real cluster do.
 func TestDeleteVolumesRechecksTheQuorumTheRemovedVolumeLeft(t *testing.T) {
 	t.Parallel()
+
+	const (
+		detach   = "drbdsetup detach 20056"
+		delMinor = "drbdsetup del-minor 20056"
+	)
 
 	for _, tc := range []struct {
 		name       string
@@ -106,13 +116,29 @@ func TestDeleteVolumesRechecksTheQuorumTheRemovedVolumeLeft(t *testing.T) {
 		suspended  bool
 		onNoQuorum string
 		fencing    string
-		wantResume bool
+		want       []string
 	}{
-		{name: "last replica to remove the volume", suspended: true, onNoQuorum: "suspend-io", wantResume: true},
-		{name: "adjust removed the volume already", adjusted: true, suspended: true, onNoQuorum: "suspend-io", wantResume: true},
-		{name: "replica the removal left running", onNoQuorum: "suspend-io"},
-		{name: "io-error, nothing shows suspended", onNoQuorum: "io-error", wantResume: true},
-		{name: "a resource that fences peers", suspended: true, onNoQuorum: "suspend-io", fencing: "resource-and-stonith"},
+		{
+			name: "last replica to remove the volume", suspended: true, onNoQuorum: "suspend-io",
+			want: []string{detach, delMinor, vdToIOError, vdToSuspendIO},
+		},
+		{
+			name: "adjust removed the volume and left it suspended", adjusted: true, suspended: true, onNoQuorum: "suspend-io",
+			want: []string{vdToIOError, vdToSuspendIO},
+		},
+		{name: "adjust removed the volume, nothing suspended", adjusted: true, onNoQuorum: "suspend-io"},
+		{
+			name: "io-error, the satellite removes the volume", onNoQuorum: "io-error",
+			want: []string{detach, delMinor, vdToSuspendIO, vdToIOError},
+		},
+		{
+			name: "io-error, adjust removed the volume", adjusted: true, onNoQuorum: "io-error",
+			want: []string{vdToSuspendIO, vdToIOError},
+		},
+		{
+			name: "a resource that fences peers", adjusted: true, suspended: true, onNoQuorum: "suspend-io", fencing: "resource-and-stonith",
+			want: []string{vdToIOError, vdToSuspendIO},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -147,32 +173,26 @@ func TestDeleteVolumesRechecksTheQuorumTheRemovedVolumeLeft(t *testing.T) {
 			var got []string
 
 			for _, line := range fx.CommandLines() {
-				if line != "drbdsetup status --verbose" {
+				if !strings.HasPrefix(line, "drbdsetup status ") && !strings.HasPrefix(line, "drbdsetup show ") {
 					got = append(got, line)
 				}
 			}
 
-			var want []string
-			if !tc.adjusted {
-				want = append(want, "drbdsetup detach 20056", "drbdsetup del-minor 20056")
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("commands %q, want %q", got, tc.want)
 			}
 
-			want = append(want, "drbdsetup status pvc-vd --json", "drbdsetup show pvc-vd --json")
-			if tc.wantResume {
-				want = append(want, "drbdsetup resume-io 20055")
-			}
-
-			if !slices.Equal(got, want) {
-				t.Errorf("commands %q, want %q", got, want)
+			if slices.Contains(fx.CommandLines(), "drbdsetup resume-io 20055") {
+				t.Error("resume-io run; it lifts every other suspension too")
 			}
 		})
 	}
 }
 
-// A resume-io that fails stops the delete before the storage, so the
-// replica does not confirm and the recheck is retried; confirming would
-// leave the remaining volumes held for good.
-func TestDeleteVolumesStopsWhenTheResumeFails(t *testing.T) {
+// A recheck that fails stops the delete before the storage, so the replica
+// does not confirm and the recheck is retried; confirming would leave the
+// remaining volumes held for good.
+func TestDeleteVolumesStopsWhenTheRecheckFails(t *testing.T) {
 	t.Parallel()
 
 	fx := storage.NewFakeExec()
@@ -180,7 +200,7 @@ func TestDeleteVolumesStopsWhenTheResumeFails(t *testing.T) {
 		"  volume:0 minor:20055 disk:UpToDate open:no\n")})
 	fx.Expect("drbdsetup status pvc-vd --json", storage.FakeResponse{Stdout: vdQuorumStatus(true)})
 	fx.Expect("drbdsetup show pvc-vd --json", storage.FakeResponse{Stdout: vdQuorumShow("suspend-io", "")})
-	fx.Expect("drbdsetup resume-io 20055", storage.FakeResponse{Err: errResumeRefused})
+	fx.Expect(vdToIOError, storage.FakeResponse{Err: errOptionsRefused})
 
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: t.TempDir(), NodeName: "n3"})
 
@@ -190,12 +210,12 @@ func TestDeleteVolumesStopsWhenTheResumeFails(t *testing.T) {
 		Name:    "pvc-vd",
 		Volumes: []intent.VolumeToDelete{{VolumeNumber: 1, Minor: &minor, StoragePool: "unregistered"}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "resume the I/O of pvc-vd") {
-		t.Fatalf("DeleteVolumes: %v, want the resume-io failure", err)
+	if err == nil || !strings.Contains(err.Error(), "recheck the quorum of pvc-vd") {
+		t.Fatalf("DeleteVolumes: %v, want the recheck failure", err)
 	}
 
 	if strings.Contains(err.Error(), "not registered") {
-		t.Errorf("DeleteVolumes reached the storage after the resume failed: %v", err)
+		t.Errorf("DeleteVolumes reached the storage after the recheck failed: %v", err)
 	}
 }
 

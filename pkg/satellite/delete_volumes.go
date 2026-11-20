@@ -136,26 +136,15 @@ func (r *Reconciler) RecheckQuorumAfterVolumeRemoval(ctx context.Context, req *i
 }
 
 // recheckQuorum has DRBD recompute the quorum verdict a removed volume left
-// behind (see drbd.Adm.RecheckQuorumAfterVolumeRemoval), holding suspendMu
-// so a snapshot cannot suspend the resource between the check and the
-// resume-io, which would lift that suspension too.
+// behind (see drbd.Adm.RecheckQuorumAfterVolumeRemoval).
 func (r *Reconciler) recheckQuorum(ctx context.Context, name string) error {
-	r.suspendMu.Lock()
-	defer r.suspendMu.Unlock()
-
 	done, err := r.cfg.Adm.RecheckQuorumAfterVolumeRemoval(ctx, name)
 	if err != nil {
-		return errors.Wrapf(err, "resume the I/O of %s after its volumes were removed", name)
+		return errors.Wrapf(err, "recheck the quorum of %s after its volumes were removed", name)
 	}
 
-	switch done {
-	case drbd.QuorumRecheckRan:
-		log.FromContext(ctx).Info("resumed I/O after a volume removal so DRBD rechecks quorum", "resource", name)
-	case drbd.QuorumRecheckUnsafe:
-		log.FromContext(ctx).Info("not resuming I/O after a volume removal: the resource fences peers or "+
-			"suspends on no data, and resume-io would lift such a suspension too; "+
-			"run drbdsetup resume-io if the remaining volumes stay suspended", "resource", name)
-	case drbd.QuorumRecheckNotNeeded:
+	if done == drbd.QuorumRecheckRan {
+		log.FromContext(ctx).Info("had DRBD recompute quorum after a volume removal", "resource", name)
 	}
 
 	return nil

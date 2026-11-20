@@ -482,6 +482,12 @@ const vdDelSuspendIOShow = `[{"resource": "pvc-vdd",
   "options": {"quorum": "majority", "on-no-quorum": "suspend-io"},
   "connections": [{"_peer_node_id": 0}]}]`
 
+// The on-no-quorum changes the satellite makes around and after a removal.
+const (
+	vdDelToIOError   = "drbdsetup resource-options pvc-vdd --on-no-quorum=io-error"
+	vdDelToSuspendIO = "drbdsetup resource-options pvc-vdd --on-no-quorum=suspend-io"
+)
+
 // `drbdadm adjust` can remove the minor of a volume flagged DELETE and then
 // fail for another reason, in the same run or in later ones. Its storage
 // stays until an apply goes through, but the quorum recheck the removal
@@ -492,11 +498,11 @@ func TestAfterAFailedApplyTheRemovedMinorsQuorumIsRechecked(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name       string
-		verbose    string
-		wantResume bool
+		name        string
+		verbose     string
+		wantRecheck bool
 	}{
-		{name: "adjust removed the minor", verbose: "pvc-vdd role:Primary\n  volume:0 minor:1000 disk:UpToDate\n", wantResume: true},
+		{name: "adjust removed the minor", verbose: "pvc-vdd role:Primary\n  volume:0 minor:1000 disk:UpToDate\n", wantRecheck: true},
 		{name: "the minor is still there", verbose: statusWithMinor},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -526,11 +532,11 @@ func TestAfterAFailedApplyTheRemovedMinorsQuorumIsRechecked(t *testing.T) {
 			}
 
 			lines := exec.CommandLines()
-			if got := slices.Contains(lines, "drbdsetup resume-io 1000"); got != tc.wantResume {
-				t.Errorf("resume-io run %t, want %t; commands %q", got, tc.wantResume, lines)
+			if got := slices.Contains(lines, vdDelToIOError); got != tc.wantRecheck {
+				t.Errorf("quorum recomputed %t, want %t; commands %q", got, tc.wantRecheck, lines)
 			}
 
-			if !tc.wantResume && slices.Contains(lines, "drbdsetup status pvc-vdd --json") {
+			if !tc.wantRecheck && slices.Contains(lines, "drbdsetup status pvc-vdd --json") {
 				t.Errorf("quorum read while the minor is still in the kernel; commands %q", lines)
 			}
 		})
