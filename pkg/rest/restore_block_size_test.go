@@ -45,6 +45,7 @@ func seedBlockSizeSnapshot(t *testing.T, vdProps map[string]string) *store.InMem
 		Name:         "snap-1",
 		ResourceName: "pvc-src",
 		Nodes:        []string{"n1"},
+		Snapshots:    []apiv1.SnapshotPerNode{{NodeName: "n1", StoragePool: "pool"}},
 		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, VolumeDefinitionProps: vdProps},
 		},
