@@ -202,8 +202,9 @@ func (idx *PropsIndex) SnapshotVDFrozen(rd, snap, vlmNr string) map[string]strin
 
 // wholeBagKinds are the instance kinds whose bag the converter writes
 // onto the matching blockstor object as it is: node, storage pool,
-// resource group, definition, volume definition, replica and snapshot
-// definition. An instance of one of them that reaches no object belongs
+// resource group, definition, volume definition, replica, snapshot
+// definition and the volume definition props frozen into a snapshot,
+// which a Snapshot's volume entry carries for a restore. An instance of one of them that reaches no object belongs
 // to an object that did not convert, which the report already names
 // with its reason; its props go with it.
 //
@@ -216,6 +217,8 @@ var wholeBagKinds = map[string]bool{
 	"VLM_DFNS":   true,
 	"RSCS":       true,
 	"SNAP_DFNS":  true,
+
+	"SNAP_VLM_DFNS_VLM_DFN": true,
 }
 
 // Dropped lists, by instance, every key no blockstor object carries:
