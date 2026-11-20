@@ -87,6 +87,10 @@ type VolumeStatus struct {
 	State        string // PROVISIONED / ERROR / NOT_PROVISIONED
 }
 
+// StateNotProvisioned is the VolumeStatus.State of a volume that is not on
+// disk.
+const StateNotProvisioned = "NOT_PROVISIONED"
+
 // PoolStatus mirrors `linstor sp l` output for one pool on this node.
 type PoolStatus struct {
 	FreeCapacityKib   int64

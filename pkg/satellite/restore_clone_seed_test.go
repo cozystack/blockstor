@@ -42,6 +42,13 @@ func restoreSeedReconciler(t *testing.T) *Reconciler {
 	})
 }
 
+// markClonedHere records what materializeVolume records for a volume it
+// cloned from the snapshot into a volume that was not on disk before.
+func markClonedHere(rec *Reconciler) {
+	rec.recordRestoreBlankFallback("pvc-restored", 0, false)
+	rec.recordRestoreClonedHere("pvc-restored", 0, true)
+}
+
 func restoredVolume() *intent.DesiredVolume {
 	return &intent.DesiredVolume{
 		VolumeNumber:   0,
@@ -64,7 +71,7 @@ func TestRestoredCloneSeedsItselfUpToDateWithoutTheWinner(t *testing.T) {
 	t.Parallel()
 
 	rec := restoreSeedReconciler(t)
-	rec.recordRestoreBlankFallback("pvc-restored", 0, false)
+	markClonedHere(rec)
 
 	skip := true
 
@@ -85,7 +92,7 @@ func TestRestoredCloneIsNotSeededUpToDateBesideAPeerWithData(t *testing.T) {
 	t.Parallel()
 
 	rec := restoreSeedReconciler(t)
-	rec.recordRestoreBlankFallback("pvc-restored", 0, false)
+	markClonedHere(rec)
 
 	skip := true
 
@@ -111,7 +118,7 @@ func TestRestoredCloneIsNotSeededUpToDateBesideAConnectedPeerWithData(t *testing
 		Adm:       drbd.NewAdm(fx),
 		NodeName:  "n1",
 	})
-	rec.recordRestoreBlankFallback("pvc-restored", 0, false)
+	markClonedHere(rec)
 
 	skip := true
 
@@ -146,7 +153,7 @@ func TestRestoredCloneFollowsTheControllersSyncDecision(t *testing.T) {
 	t.Parallel()
 
 	rec := restoreSeedReconciler(t)
-	rec.recordRestoreBlankFallback("pvc-restored", 0, false)
+	markClonedHere(rec)
 
 	mustSync := false
 
@@ -166,9 +173,110 @@ func TestRestoreBlankFallbackStaysRecorded(t *testing.T) {
 
 	rec := restoreSeedReconciler(t)
 	rec.recordRestoreBlankFallback("pvc-restored", 0, true)
-	rec.recordRestoreBlankFallback("pvc-restored", 0, false)
+	markClonedHere(rec)
 
 	if !rec.isRestoreBlankFallback("pvc-restored", 0) || rec.isRestoredFromSnapshot("pvc-restored", 0) {
 		t.Error("a blank fallback read as restored from the snapshot after a later pass")
+	}
+}
+
+// A restore onto a volume already on disk is reported as done by the
+// provider whatever the volume holds. After a restart that volume may be a
+// blank fallback whose metadata step never finished, so it is not taken for
+// a clone of the snapshot and seeded UpToDate.
+func TestRestoreOntoAVolumeAlreadyOnDiskIsNotSeededAsAClone(t *testing.T) {
+	t.Parallel()
+
+	prov := &restoreSeedFakeProvider{kind: ProviderKindZFSThin}
+	rec := restoreSeedReconciler(t)
+	rec.cfg.Providers["zfsthin1"] = prov
+
+	err := rec.materializeVolume(t.Context(), prov, "pvc-restored", restoredVolume())
+	if err != nil {
+		t.Fatalf("materializeVolume: %v", err)
+	}
+
+	skip := true
+
+	seed, ok := rec.resolveVolumeSeed(t.Context(), "pvc-restored", restoredVolume(), false, false, &skip)
+	if uptodateSeed(seed, ok) {
+		t.Fatalf("volume found on disk seeded UpToDate as a clone: %+v", seed)
+	}
+}
+
+// The volume this process cloned itself is a clone, also on the passes after
+// the one that made it, when the provider finds it on disk.
+func TestRestoreCloneMadeHereIsSeededAsAClone(t *testing.T) {
+	t.Parallel()
+
+	prov := &restoreSeedFakeProvider{kind: ProviderKindZFSThin, absent: true}
+	rec := restoreSeedReconciler(t)
+	rec.cfg.Providers["zfsthin1"] = prov
+
+	for pass := range 2 {
+		err := rec.materializeVolume(t.Context(), prov, "pvc-restored", restoredVolume())
+		if err != nil {
+			t.Fatalf("materializeVolume pass %d: %v", pass, err)
+		}
+	}
+
+	skip := true
+
+	seed, ok := rec.resolveVolumeSeed(t.Context(), "pvc-restored", restoredVolume(), false, false, &skip)
+	if !uptodateSeed(seed, ok) {
+		t.Fatalf("clone made by this process = %+v, %v; want Consistent+UpToDate", seed, ok)
+	}
+}
+
+// Deleting the replica drops what was recorded about its restore, so a
+// definition re-created under the same name and cloned correctly is not
+// held back by a blank fallback of the volume that was deleted.
+func TestDeleteResourceForgetsTheRestoreRecord(t *testing.T) {
+	t.Parallel()
+
+	rec := restoreSeedReconciler(t)
+	rec.recordRestoreBlankFallback("pvc-restored", 0, true)
+	rec.recordRestoreClonedHere("pvc-restored", 0, false)
+
+	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{
+		Name:          "pvc-restored",
+		StoragePool:   "zfsthin1",
+		VolumeNumbers: []int32{0},
+	})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteResource = %+v, %v", resp, err)
+	}
+
+	prov := &restoreSeedFakeProvider{kind: ProviderKindZFSThin, absent: true}
+	rec.cfg.Providers["zfsthin1"] = prov
+
+	err = rec.materializeVolume(t.Context(), prov, "pvc-restored", restoredVolume())
+	if err != nil {
+		t.Fatalf("materializeVolume: %v", err)
+	}
+
+	if rec.isRestoreBlankFallback("pvc-restored", 0) || !rec.isRestoredFromSnapshot("pvc-restored", 0) {
+		t.Error("the clone of a re-created definition still carries the deleted volume's restore record")
+	}
+}
+
+// A replica toggled to diskless has its volume deleted the same way, and a
+// later toggle back to diskful clones afresh.
+func TestDisklessToggleForgetsTheRestoreRecord(t *testing.T) {
+	t.Parallel()
+
+	rec := restoreSeedReconciler(t)
+	rec.recordRestoreBlankFallback("pvc-restored", 0, true)
+
+	err := rec.reclaimVolumesForDiskless(t.Context(), &intent.DesiredResource{
+		Name:    "pvc-restored",
+		Volumes: []*intent.DesiredVolume{restoredVolume()},
+	})
+	if err != nil {
+		t.Fatalf("reclaimVolumesForDiskless: %v", err)
+	}
+
+	if rec.isRestoreBlankFallback("pvc-restored", 0) {
+		t.Error("the deleted volume's blank fallback is still recorded")
 	}
 }

@@ -902,7 +902,7 @@ func (p *Provider) snapshotDataset(snap storage.Snapshot) string {
 }
 
 const (
-	stateNotProvisioned = "NOT_PROVISIONED"
+	stateNotProvisioned = storage.StateNotProvisioned
 	mibPerKib           = 1024
 	bytesPerKib         = 1024
 	zfsListCols         = 3

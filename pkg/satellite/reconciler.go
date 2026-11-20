@@ -326,6 +326,17 @@ type Reconciler struct {
 	// pass, repopulating the marker, so the gate stays correct.
 	restoreBlankFallback map[string]bool
 
+	// restoreClonedHere records, per "<resource>/<volNumber>", whether
+	// this process itself cloned or received the snapshot into a volume
+	// that was not on disk before (true), or first found the volume
+	// already there (false). Only true lets a restored replica seed
+	// itself UpToDate (restoredCloneSeed): a provider reports a restore
+	// onto an existing volume as done, so after a restart a blank
+	// fallback whose metadata step never finished would otherwise read
+	// as a clone. Process-memory only, and a lost record reads as "not
+	// cloned here", which costs a sync, never data.
+	restoreClonedHere map[string]bool
+
 	// lastRecoveryPromoteAt throttles the Bug 366 recovery-promote
 	// self-heal (maybeRecoveryPromote). Keyed by resource name; value
 	// is the last wall-clock time this node fired a recovery-promote
@@ -421,6 +432,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		resourceToPool:              map[string]string{},
 		seenStuckAt:                 map[string]time.Time{},
 		restoreBlankFallback:        map[string]bool{},
+		restoreClonedHere:           map[string]bool{},
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
@@ -960,6 +972,10 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	}
 
 	r.forgetPool(req.GetName())
+
+	for _, n := range req.GetVolumeNumbers() {
+		r.forgetRestoreRecord(req.GetName(), n)
+	}
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
 }
@@ -1647,6 +1663,8 @@ func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.D
 				"reclaim volume %s/%d on diskless toggle",
 				dr.GetName(), vol.GetVolumeNumber())
 		}
+
+		r.forgetRestoreRecord(dr.GetName(), vol.GetVolumeNumber())
 	}
 
 	return nil
@@ -1848,6 +1866,8 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 		return errors.Errorf("SourceSnapshot %q must be <srcRD>:<snapName>", src)
 	}
 
+	onDisk := r.restoreTargetOnDisk(ctx, provider, rdName, target)
+
 	err := provider.RestoreVolumeFromSnapshot(ctx, target, storage.Snapshot{
 		ResourceName: srcRD,
 		SnapshotName: snapName,
@@ -1860,6 +1880,7 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 			// legitimate all-clone restore fast-path keeps its skip, and
 			// reset the Bug 038 not-yet-materialised requeue budget.
 			r.recordRestoreBlankFallback(rdName, vol.GetVolumeNumber(), false)
+			r.recordRestoreClonedHere(rdName, vol.GetVolumeNumber(), !onDisk)
 			r.clearRestoreSnapshotMissing(rdName, vol.GetVolumeNumber())
 		}
 
@@ -1900,7 +1921,63 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
 	}
 
-	return r.crossNodeClone(ctx, provider, target, rdName, srcRD, snapName, vol.GetVolumeNumber())
+	err = r.crossNodeClone(ctx, provider, target, rdName, srcRD, snapName, vol.GetVolumeNumber())
+	if err == nil {
+		r.recordRestoreClonedHere(rdName, vol.GetVolumeNumber(), !onDisk)
+	}
+
+	return err
+}
+
+// restoreTargetOnDisk reports whether the volume a restore is about to
+// materialise is already on disk, the first time this process sees it.
+// The provider treats a restore onto an existing volume as done, which
+// says nothing about what is in it: it may be a blank fallback from before
+// a restart. A failed probe reads as on disk. Once this process has
+// recorded where the volume came from, the record stands and the probe is
+// skipped.
+func (r *Reconciler) restoreTargetOnDisk(ctx context.Context, provider storage.Provider, rdName string, target storage.Volume) bool {
+	r.mu.Lock()
+	_, known := r.restoreClonedHere[restoreSeedKey(rdName, target.VolumeNumber)]
+	r.mu.Unlock()
+
+	if known {
+		return true
+	}
+
+	status, err := provider.VolumeStatus(ctx, target)
+	if err != nil {
+		return true
+	}
+
+	return status.State != storage.StateNotProvisioned
+}
+
+// recordRestoreClonedHere records, once, whether this process cloned or
+// received the snapshot into a volume that was not on disk before. The
+// first record stands: every later pass finds the volume on disk.
+func (r *Reconciler) recordRestoreClonedHere(rdName string, volNum int32, cloned bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	key := restoreSeedKey(rdName, volNum)
+	if _, known := r.restoreClonedHere[key]; !known {
+		r.restoreClonedHere[key] = cloned
+	}
+}
+
+// forgetRestoreRecord drops what this process recorded about restoring a
+// volume once that volume is deleted here, so a definition re-created
+// under the same name starts clean instead of inheriting a blank fallback
+// or a clone that no longer exists.
+func (r *Reconciler) forgetRestoreRecord(rdName string, volNum int32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	key := restoreSeedKey(rdName, volNum)
+	delete(r.restoreBlankFallback, key)
+	delete(r.restoreClonedHere, key)
+	delete(r.restoreSnapshotMissingTries, key)
 }
 
 // bumpRestoreSnapshotMissing increments and returns the consecutive
@@ -1985,8 +2062,9 @@ func (r *Reconciler) crossNodeClone(
 // decide whether the day0 skip-init-sync seed is safe (Bug 397). Keyed by
 // "<resource>/<volNumber>".
 //
-// A blank fallback stays recorded: the volume it created is never cloned
-// over afterwards, and the provider reports a later restore onto it as done
+// A blank fallback stays recorded until the volume is deleted here
+// (forgetRestoreRecord): the volume it created is never cloned over
+// afterwards, and the provider reports a later restore onto it as done
 // because the volume exists. Clearing the record then would seed the empty
 // volume as a copy of the snapshot on a pass after the one that created it.
 func (r *Reconciler) recordRestoreBlankFallback(rdName string, volNum int32, blank bool) {
@@ -2002,16 +2080,17 @@ func (r *Reconciler) recordRestoreBlankFallback(rdName string, volNum int32, bla
 }
 
 // isRestoredFromSnapshot reports whether the given (resource, volume) was
-// materialised from the snapshot on this node in the current process
-// lifetime, by a local clone or a cross-node receive. False when nothing is
-// recorded, which leaves the volume to the ordinary seed path.
+// materialised from the snapshot on this node by this process, by a local
+// clone or a cross-node receive into a volume that was not on disk before.
+// False when nothing is recorded, when the volume was already there, or
+// for a blank fallback, which leaves the volume to the ordinary seed path.
 func (r *Reconciler) isRestoredFromSnapshot(rdName string, volNum int32) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	blank, recorded := r.restoreBlankFallback[restoreSeedKey(rdName, volNum)]
+	key := restoreSeedKey(rdName, volNum)
 
-	return recorded && !blank
+	return r.restoreClonedHere[key] && !r.restoreBlankFallback[key]
 }
 
 // isRestoreBlankFallback reports whether the given (resource, volume) was

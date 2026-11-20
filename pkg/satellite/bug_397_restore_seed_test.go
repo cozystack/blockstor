@@ -38,6 +38,10 @@ type restoreSeedFakeProvider struct {
 	kind        string
 	restoreErr  error
 	createCalls int
+	// absent reports the volume as not on disk until a create or a
+	// successful restore puts it there. False (the default) reports every
+	// volume as on disk, as the tests written before the probe expect.
+	absent bool
 }
 
 func (p *restoreSeedFakeProvider) Kind() string { return p.kind }
@@ -48,6 +52,7 @@ func (*restoreSeedFakeProvider) PoolStatus(_ context.Context) (storage.PoolStatu
 
 func (p *restoreSeedFakeProvider) CreateVolume(_ context.Context, _ storage.Volume) error {
 	p.createCalls++
+	p.absent = false
 
 	return nil
 }
@@ -55,7 +60,11 @@ func (p *restoreSeedFakeProvider) CreateVolume(_ context.Context, _ storage.Volu
 func (*restoreSeedFakeProvider) DeleteVolume(_ context.Context, _ storage.Volume) error { return nil }
 func (*restoreSeedFakeProvider) ResizeVolume(_ context.Context, _ storage.Volume) error { return nil }
 
-func (*restoreSeedFakeProvider) VolumeStatus(_ context.Context, vol storage.Volume) (storage.VolumeStatus, error) {
+func (p *restoreSeedFakeProvider) VolumeStatus(_ context.Context, vol storage.Volume) (storage.VolumeStatus, error) {
+	if p.absent {
+		return storage.VolumeStatus{State: storage.StateNotProvisioned}, nil
+	}
+
 	return storage.VolumeStatus{
 		DevicePath: "/dev/fake/" + vol.ResourceName,
 		UsableKib:  vol.SizeKib,
@@ -74,6 +83,10 @@ func (*restoreSeedFakeProvider) DeleteSnapshot(_ context.Context, _ storage.Snap
 func (p *restoreSeedFakeProvider) RestoreVolumeFromSnapshot(_ context.Context,
 	_ storage.Volume, _ storage.Snapshot,
 ) error {
+	if p.restoreErr == nil {
+		p.absent = false
+	}
+
 	return p.restoreErr
 }
 

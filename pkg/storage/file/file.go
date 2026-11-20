@@ -702,7 +702,7 @@ func (p *Provider) volumePath(vol storage.Volume) string {
 }
 
 const (
-	stateNotProvisioned = "NOT_PROVISIONED"
+	stateNotProvisioned = storage.StateNotProvisioned
 	bytesPerKib         = 1024
 	// volumeFilePerm — owner-only read+write. The FILE storage pool
 	// dir already restricts access; the satellite runs as root.
