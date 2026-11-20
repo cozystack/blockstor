@@ -244,8 +244,26 @@ func listing[T any](
 	}
 }
 
+// fetchResources lists the replicas the way the controller answers
+// them: a replica on an OFFLINE node carries no satellite state
+// (apiv1.ForgetSatelliteState), so `r l` reads it Unknown and `v l`
+// shows no disk state, as they do against LINSTOR. The store keeps the
+// dead satellite's last report, UpToDate and connected, and showing it
+// hid every replica of a node that was down.
 func fetchResources(ctx context.Context, st store.Store) ([]apiv1.Resource, error) {
-	return st.Resources().List(ctx) //nolint:wrapcheck // listing() adds the context
+	resources, err := st.Resources().List(ctx)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // listing() adds the context
+	}
+
+	nodes, err := st.Nodes().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+
+	apiv1.ForgetStateOnOfflineNodes(resources, nodes)
+
+	return resources, nil
 }
 
 func fetchDefinitions(ctx context.Context, st store.Store) ([]apiv1.ResourceDefinition, error) {
