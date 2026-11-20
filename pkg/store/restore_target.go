@@ -29,16 +29,11 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // ErrRestoreTargetTaken reports a definition that carries a restore marker
 // naming another snapshot.
 var ErrRestoreTargetTaken = errors.New("resource definition is already a restore of another snapshot")
-
-// ErrRestoreTargetLayers reports a prepared target whose layer stack is not
-// the snapshot source's.
-var ErrRestoreTargetLayers = errors.New("prepared restore target has a different layer stack than the snapshot's source")
 
 // ErrRestoreTargetTearingDown reports a prepared target whose every replica is
 // still being deleted.
@@ -107,19 +102,22 @@ func LiveReplicas(ctx context.Context, st Store, rdName string) ([]apiv1.Resourc
 // marker; one being deleted, one whose volumes are not exactly the snapshot's,
 // and one with a live replica may hold somebody's data, and are not prepared.
 //
-// Two states are prepared in every other respect and still refused, with an
-// error saying why, before anything is written to the definition:
+// The target's own layer stack is not judged: the restore gives it the
+// source's (see AdoptPreparedRestoreTarget), as LINSTOR does. LINSTOR builds
+// every restored resource from the snapshot's layer data, whatever stack the
+// definition or its group names (CtrlRscCrtApiHelper.createResourceFromSnapshot
+// hands the snapshot's layer object to ResourceControllerFactory.create), so
+// the bytes are always read back through the stack they were written under.
+// That is what makes a restore into a definition of another StorageClass safe:
+// Velero's data mover restores a replicated volume's snapshot into a
+// storage-only class for its backup PVC, and gets the source's DRBD over the
+// copy rather than a raw device with DRBD's metadata at its end.
 //
-//   - A layer stack that is not the source's (ErrRestoreTargetLayers). The
-//     restore puts the source's bytes under the target's stack, so a layer the
-//     source did not have writes its own metadata across them (LUKS formats),
-//     and one it had is missing on read (the consumer sees ciphertext). The
-//     create path inherits the source's stack and the clone refuses a changed
-//     set for the same reason; through linstor-csi this is a VolumeSnapshot
-//     restored into a PVC of another StorageClass.
-//   - Replicas that are all still being deleted (ErrRestoreTargetTearingDown).
-//     Placing over them races the tear-down, and a retry once it finished
-//     takes the target cleanly.
+// A prepared target is still refused, with an error saying why, before
+// anything is written to it, when its replicas are all still being deleted
+// (ErrRestoreTargetTearingDown): placing over them races the tear-down, and a
+// retry once it finished takes the target cleanly. A source whose stack its
+// group has not decided yet is ErrLayerStackUndecided, which a retry outlasts.
 //
 // The definition, its volumes and its replicas are all read from the API
 // server. linstor-csi's volume restore and the resource restore after it can
@@ -165,24 +163,9 @@ func PreparedRestoreTarget(ctx context.Context, st Store, cached *apiv1.Resource
 		return false, fmt.Errorf("%w: %q", ErrRestoreTargetTearingDown, rd.Name)
 	}
 
-	source, err := st.ResourceDefinitions().Get(ctx, snap.ResourceName)
+	_, err = sourceLayerStack(ctx, st, snap)
 	if err != nil {
-		return false, fmt.Errorf("read the source %q of snapshot %q: %w", snap.ResourceName, snap.Name, err)
-	}
-
-	have, err := EffectiveLayerStack(ctx, st, &source)
-	if err != nil {
-		return false, fmt.Errorf("the layer stack of the source %q: %w", source.Name, err)
-	}
-
-	want, err := EffectiveLayerStack(ctx, st, rd)
-	if err != nil {
-		return false, fmt.Errorf("the layer stack of %q: %w", rd.Name, err)
-	}
-
-	if !apiv1.SameLayerSet(have, want) {
-		return false, fmt.Errorf("%w: %q has %s, the source %q has %s", ErrRestoreTargetLayers,
-			rd.Name, strings.Join(want, ","), source.Name, strings.Join(have, ","))
+		return false, err
 	}
 
 	return true, nil
@@ -306,30 +289,9 @@ func sameVolumes(vds []apiv1.VolumeDefinition, recorded []apiv1.SnapshotVolumeDe
 func stampRestoreMarker(ctx context.Context, st Store, rdName string, snap *apiv1.Snapshot) (bool, error) {
 	marker := snap.ResourceName + ":" + snap.Name
 
-	// The stack is resolved inside the patch, against the state it applies
-	// to, so the group it is resolved under is read first; a definition that
-	// moved to another group in between is answered as undecided and retried.
-	target, err := st.ResourceDefinitions().Get(ctx, rdName)
-	if err != nil {
-		return false, fmt.Errorf("read %q before stamping the restore marker: %w", rdName, err)
-	}
-
-	groupStack, err := GroupLayerStack(ctx, st, target.ResourceGroupName)
+	stack, err := sourceLayerStack(ctx, st, snap)
 	if err != nil {
 		return false, err
-	}
-
-	// The target was judged to have the source's layers before this call,
-	// and its stack can be rewritten between that judgement and the patch;
-	// the marker goes on only over the stack the snapshot's bytes need.
-	source, err := st.ResourceDefinitions().Get(ctx, snap.ResourceName)
-	if err != nil {
-		return false, fmt.Errorf("read the source %q of snapshot %q: %w", snap.ResourceName, snap.Name, err)
-	}
-
-	sourceStack, err := EffectiveLayerStack(ctx, st, &source)
-	if err != nil {
-		return false, fmt.Errorf("the layer stack of the source %q: %w", source.Name, err)
 	}
 
 	var wrote bool
@@ -344,22 +306,14 @@ func stampRestoreMarker(ctx context.Context, st Store, rdName string, snap *apiv
 		// run's, against the state the patch actually applied to.
 		wrote = current == ""
 
-		if len(rd.LayerStack) == 0 && !naming.Same(rd.ResourceGroupName, target.ResourceGroupName) {
-			return fmt.Errorf("%w: %q moved to group %q", ErrLayerStackUndecided, rdName, rd.ResourceGroupName)
-		}
-
-		stack, err := layerStackUnder(rdName, rd.LayerStack, rd.ResourceGroupName, groupStack)
-		if err != nil {
-			return err
-		}
-
-		if !apiv1.SameLayerSet(sourceStack, stack) {
-			return fmt.Errorf("%w: %q has %s, the source %q has %s", ErrRestoreTargetLayers,
-				rdName, strings.Join(stack, ","), source.Name, strings.Join(sourceStack, ","))
-		}
-
+		// The snapshot's bytes were laid down under the source's stack, so
+		// that is the stack they are read back through, whatever the target
+		// was created with or has been given since. Nothing is on the target
+		// yet, so no layer it named has written anything. A copy left short
+		// of what its group asks for (a plaintext copy in a LUKS group) is
+		// flagged by the controller, as every such definition is.
 		rd.Props = WithRestoreMarker(rd.Props, snap)
-		rd.LayerStack = stack
+		rd.LayerStack = slices.Clone(stack)
 
 		return nil
 	})
@@ -391,6 +345,22 @@ func stampRestoreMarker(ctx context.Context, st Store, rdName string, snap *apiv
 // the state any writer racing a restore on its own target meets.
 func AdoptPreparedRestoreTarget(ctx context.Context, st Store, rdName string, snap *apiv1.Snapshot) (bool, error) {
 	return stampRestoreMarker(ctx, st, rdName, snap)
+}
+
+// sourceLayerStack is the stack the snapshot's source lays its volumes down
+// under, which a restore of that snapshot inherits.
+func sourceLayerStack(ctx context.Context, st Store, snap *apiv1.Snapshot) ([]string, error) {
+	source, err := st.ResourceDefinitions().Get(ctx, snap.ResourceName)
+	if err != nil {
+		return nil, fmt.Errorf("read the source %q of snapshot %q: %w", snap.ResourceName, snap.Name, err)
+	}
+
+	stack, err := EffectiveLayerStack(ctx, st, &source)
+	if err != nil {
+		return nil, fmt.Errorf("the layer stack of the source %q: %w", source.Name, err)
+	}
+
+	return stack, nil
 }
 
 // ErrRestoreTargetGroupGone reports a restore leftover whose parent resource
