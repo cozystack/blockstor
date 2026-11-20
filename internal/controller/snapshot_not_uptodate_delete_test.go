@@ -153,15 +153,95 @@ func TestNotUpToDateAbortWaitsForResumeBeforeDelete(t *testing.T) {
 
 // TestNotUpToDateAbortLeftByEarlierVersionIsDeleted pins the cleanup of
 // the record an earlier controller left: the refused take with its
-// reason and FAILED_DISCONNECT, nothing suspended.
+// reason and FAILED_DISCONNECT, nothing suspended. Each wording a
+// released controller recorded is listed, so a reword that stops
+// matching one of them fails here instead of silently disabling the
+// sweep on upgrade.
 func TestNotUpToDateAbortLeftByEarlierVersionIsDeleted(t *testing.T) {
+	t.Parallel()
+
+	for _, tail := range []string{"I/O resumed", "resume of I/O requested", "I/O not suspended"} {
+		t.Run(tail, func(t *testing.T) {
+			t.Parallel()
+
+			scheme := newSnapshotControllerScheme(t)
+
+			snap := b046GroupedSnapshot("pvc-a", "snap", "refused-g2", 1, []string{"n1", "n2", "n3"})
+			snap.Spec.AbortReason = "snapshot aborted: replica on node 'n1' is not UpToDate; " + tail
+			snap.Status.Flags = []string{blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect}
+
+			cli := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+				WithObjects(snap).
+				Build()
+
+			r := &controller.SnapshotReconciler{Client: cli, Scheme: scheme}
+
+			reconcileSnap(t, r, "pvc-a.snap")
+
+			if !snapGone(t, cli, "pvc-a.snap") {
+				t.Error("refused snapshot left by an earlier version was kept")
+			}
+		})
+	}
+}
+
+// TestNotUpToDateAbortKeepsSuccessfulGroup pins that a group with a
+// sibling recorded SUCCESSFUL is never deleted as a refusal: the
+// record contradicts itself, and the successful snapshot may already
+// back a VolumeSnapshotContent.
+func TestNotUpToDateAbortKeepsSuccessfulGroup(t *testing.T) {
 	t.Parallel()
 
 	scheme := newSnapshotControllerScheme(t)
 
-	snap := b046GroupedSnapshot("pvc-a", "snap", "refused-g2", 1, []string{"n1", "n2", "n3"})
-	snap.Spec.AbortReason = "snapshot aborted: replica on node 'n1' is not UpToDate; I/O not suspended"
+	const groupID = "refused-g3"
+
+	reason := "snapshot aborted: replica on node 'n1' is not UpToDate; I/O not suspended"
+
+	a := b046GroupedSnapshot("pvc-a", "snap", groupID, 2, []string{"n1"})
+	a.Spec.AbortReason = reason
+	a.Status.Flags = []string{blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect}
+
+	b := b046GroupedSnapshot("pvc-b", "snap", groupID, 2, []string{"n1"})
+	b.Status.Flags = []string{blockstoriov1alpha1.SnapshotStatusFlagSuccessful}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+		WithObjects(a, b).
+		Build()
+
+	r := &controller.SnapshotReconciler{Client: cli, Scheme: scheme}
+
+	reconcileSnap(t, r, "pvc-a.snap")
+	reconcileSnap(t, r, "pvc-b.snap")
+
+	for _, name := range []string{"pvc-a.snap", "pvc-b.snap"} {
+		if snapGone(t, cli, name) {
+			t.Errorf("%s: group with a SUCCESSFUL sibling was deleted as a refusal", name)
+		}
+	}
+}
+
+// TestNotUpToDateAbortWithFailedNodeIsDeleted pins that a refusal on a
+// non-UpToDate replica is deleted even when a node also stamped its
+// take failed. That branch handles the group before the recorded
+// refusal is looked at; LINSTOR deletes the refusal whatever else
+// happened.
+func TestNotUpToDateAbortWithFailedNodeIsDeleted(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotControllerScheme(t)
+
+	snap := b046GroupedSnapshot("pvc-a", "snap", "refused-g4", 1, []string{"n1", "n2"})
+	snap.Spec.AbortReason = "snapshot aborted: replica on node 'n1' is not UpToDate; I/O resumed"
 	snap.Status.Flags = []string{blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect}
+	snap.Status.NodeStatus = []blockstoriov1alpha1.SnapshotPerNodeStatus{
+		{NodeName: "n1"},
+		{NodeName: "n2", Failed: true},
+	}
 
 	cli := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -174,7 +254,7 @@ func TestNotUpToDateAbortLeftByEarlierVersionIsDeleted(t *testing.T) {
 	reconcileSnap(t, r, "pvc-a.snap")
 
 	if !snapGone(t, cli, "pvc-a.snap") {
-		t.Error("refused snapshot left by an earlier version was kept")
+		t.Error("refusal on a non-UpToDate replica kept because a node also failed")
 	}
 }
 

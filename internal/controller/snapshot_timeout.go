@@ -376,7 +376,19 @@ func isNotUpToDateAbort(reason string) bool {
 func (r *SnapshotReconciler) deleteRefusedGroup(
 	ctx context.Context, logger logr.Logger, siblings []blockstoriov1alpha1.Snapshot,
 ) error {
-	if anySiblingNodeSuspended(siblings) {
+	// A take that succeeded on any sibling is never discarded here: its
+	// record contradicts the refusal, and LINSTOR never deletes a
+	// SUCCESSFUL snapshot definition from this path.
+	if slices.ContainsFunc(siblings, func(s blockstoriov1alpha1.Snapshot) bool {
+		return slices.Contains(s.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful)
+	}) {
+		return nil
+	}
+
+	if held := siblingNodesSuspended(siblings); len(held) > 0 {
+		logger.V(1).Info("refused snapshot kept until every node resumed I/O",
+			"suspended_nodes", held)
+
 		return nil
 	}
 
@@ -397,14 +409,28 @@ func (r *SnapshotReconciler) deleteRefusedGroup(
 	return nil
 }
 
-// anySiblingNodeSuspended reports whether any node of any sibling
-// still reports I/O suspended for the take.
-func anySiblingNodeSuspended(siblings []blockstoriov1alpha1.Snapshot) bool {
+// siblingNodesSuspended names the nodes, as snapshot/node, that still
+// report I/O suspended for the take on any sibling.
+func siblingNodesSuspended(siblings []blockstoriov1alpha1.Snapshot) []string {
+	var held []string
+
 	for i := range siblings {
 		for _, entry := range siblings[i].Status.NodeStatus {
 			if entry.SuspendIOAcked {
-				return true
+				held = append(held, siblings[i].Name+"/"+entry.NodeName)
 			}
+		}
+	}
+
+	return held
+}
+
+// groupRefusedNotUpToDate reports whether any sibling records a take
+// refused because a targeted replica was not UpToDate.
+func groupRefusedNotUpToDate(siblings []blockstoriov1alpha1.Snapshot) bool {
+	for i := range siblings {
+		if isNotUpToDateAbort(recordedAbortReason(&siblings[i])) {
+			return true
 		}
 	}
 

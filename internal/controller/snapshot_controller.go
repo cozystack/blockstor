@@ -508,7 +508,14 @@ func (r *SnapshotReconciler) checkAbortConditions(
 			return true, ctrl.Result{}, err
 		}
 
-		return true, ctrl.Result{}, r.stampGroupFailed(ctx, siblings, reason)
+		err = r.stampGroupFailed(ctx, siblings, reason)
+		if err != nil || !groupRefusedNotUpToDate(siblings) {
+			return true, ctrl.Result{}, err
+		}
+
+		// A refusal on a non-UpToDate replica is deleted whatever else
+		// went wrong in the group, as LINSTOR deletes it.
+		return true, ctrl.Result{}, r.deleteRefusedGroup(ctx, logger, siblings)
 	}
 
 	// A take aborted on an earlier pass is over. Finish what that pass
