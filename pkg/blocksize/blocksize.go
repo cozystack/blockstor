@@ -39,6 +39,7 @@ limitations under the License.
 package blocksize
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -252,13 +253,7 @@ func CanChange(placed, auto, primary bool, vdProps []map[string]string) bool {
 		return false
 	}
 
-	for _, props := range vdProps {
-		if Frozen(props) {
-			return false
-		}
-	}
-
-	return true
+	return !slices.ContainsFunc(vdProps, Frozen)
 }
 
 // Floor is LINSTOR's ResourceDefinition.getFloorVolumesMinIoSize: the

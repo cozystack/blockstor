@@ -21,6 +21,7 @@ package controller
 import (
 	"context"
 	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -93,17 +94,9 @@ func (r *BlockSizeReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	reader := r.reader()
 
-	var list blockstoriov1alpha1.ResourceList
-
-	err := reader.List(ctx, &list)
-	if err != nil {
-		return ctrl.Result{}, cerrors.Wrap(err, "list resources")
-	}
-
-	for i := range list.Items {
-		if naming.Same(list.Items[i].Spec.ResourceDefinitionName, req.Name) {
-			return ctrl.Result{}, nil
-		}
+	placed, err := hasReplica(ctx, reader, req.Name)
+	if err != nil || placed {
+		return ctrl.Result{}, err
 	}
 
 	var rd blockstoriov1alpha1.ResourceDefinition
@@ -151,6 +144,20 @@ func (r *BlockSizeReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// hasReplica reports whether any replica names the definition.
+func hasReplica(ctx context.Context, reader client.Reader, rdName string) (bool, error) {
+	var list blockstoriov1alpha1.ResourceList
+
+	err := reader.List(ctx, &list)
+	if err != nil {
+		return false, cerrors.Wrap(err, "list resources")
+	}
+
+	return slices.ContainsFunc(list.Items, func(res blockstoriov1alpha1.Resource) bool {
+		return naming.Same(res.Spec.ResourceDefinitionName, rdName)
+	}), nil
 }
 
 func (r *BlockSizeReleaseReconciler) reader() client.Reader {
