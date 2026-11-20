@@ -66,6 +66,74 @@ func ResolveOptions(controller, resourceGroup, resourceDef, resource map[string]
 	return out
 }
 
+// SectionLess reports whether a `DrbdOptions/...` key has no DRBD section
+// after the prefix (`DrbdOptions/auto-verify-alg` rather than
+// `DrbdOptions/Net/verify-alg`). LINSTOR keeps its own controller knobs
+// there; none of them is a drbd.conf option, so none is rendered as one.
+// A key outside the prefix is not section-less, it is not a DRBD option.
+func SectionLess(key string) bool {
+	rest, ok := strings.CutPrefix(key, PropPrefix)
+	if !ok {
+		return false
+	}
+
+	return !strings.Contains(rest, "/")
+}
+
+// LINSTOR's automatic verify algorithm. Its controller stores the
+// algorithm every diskful node of a definition supports under
+// AutoVerifyAlgKey, and the satellite renders it as the net section's
+// verify-alg unless one is set explicitly or AutoVerifyAlgDisableKey is
+// set to anything but "false".
+const (
+	AutoVerifyAlgKey        = "auto-verify-alg"
+	AutoVerifyAlgDisableKey = "auto-verify-algo-disable"
+
+	// autoVerifyAlgWinDRBD marks a definition with a Windows peer;
+	// WinDRBD supports only crc32c.
+	autoVerifyAlgWinDRBD    = "windrbd"
+	autoVerifyAlgWinDRBDAlg = "crc32c"
+
+	verifyAlgOption = "verify-alg"
+)
+
+// FillAutoVerifyAlg sets the net section's verify-alg from LINSTOR's
+// automatic algorithm in props, a resolved `DrbdOptions/...` bag, the way
+// LINSTOR's satellite does: only when net carries no verify-alg of its
+// own, the automatic one is set, and the disable switch is unset or
+// "false". A WinDRBD peer gets crc32c, the one algorithm it supports.
+//
+// blockstor never stores an automatic algorithm itself; a definition
+// adopted from LINSTOR does, and without this its kernels would lose the
+// verify-alg they ran with.
+//
+// LINSTOR reads the disable switch from the definition, its group and
+// the satellite bag, not from the replica or its node; props here is the
+// bag already resolved across every scope, so a switch set on a single
+// replica counts too. LINSTOR offers no command that sets one there.
+func FillAutoVerifyAlg(net, props map[string]string) {
+	for key := range net {
+		if strings.EqualFold(key, verifyAlgOption) {
+			return
+		}
+	}
+
+	alg := props[PropPrefix+AutoVerifyAlgKey]
+	if alg == "" {
+		return
+	}
+
+	if disable, set := props[PropPrefix+AutoVerifyAlgDisableKey]; set && !strings.EqualFold(disable, "false") {
+		return
+	}
+
+	if strings.EqualFold(alg, autoVerifyAlgWinDRBD) {
+		alg = autoVerifyAlgWinDRBDAlg
+	}
+
+	net[verifyAlgOption] = alg
+}
+
 // FilterDRBD returns only the `DrbdOptions/...` entries from props.
 // Used by the dispatcher when it wants to push only DRBD knobs to the
 // satellite without leaking unrelated props onto the wire.

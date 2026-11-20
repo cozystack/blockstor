@@ -14,14 +14,19 @@ Do this in a maintenance window, after a full rehearsal on a staging cluster.
 Converted:
 
 - nodes, storage pools, resource groups, resource definitions with their volumes, replicas, and successful snapshots;
-- controller-wide DRBD options;
-- DRBD minor numbers, node IDs and the shared secret, unchanged;
+- cluster-wide DRBD options, both the ones LINSTOR's controller acts on and the ones it keeps for its satellites, which is where `linstor controller set-property DrbdOptions/Net/...` and piraeus-operator's `LinstorCluster.spec.properties` put them;
+- DRBD minor numbers and node IDs, unchanged;
+- the shared secret, wherever LINSTOR used it to authenticate peers (see below);
 - DRBD ports, if you capture them from the running nodes (step 3 below).
 
 Not converted, and listed in the tool's report:
 
 - Backup shipping remotes, and replicas or snapshots that LINSTOR marked as deleted or failed.
 - Snapshots of definitions with more than one volume are adopted with their first volume only.
+- Properties blockstor has no place for, one line per LINSTOR props container, keys only: controller runtime state such as connector ports and the cluster ID, volume and volume-group props, connection props, and the props LINSTOR freezes into a snapshot.
+- DRBD options set on a node, a storage pool or a volume definition. They are kept on the object, but blockstor renders DRBD options only from the controller, resource group, definition and replica, so the adopted resources lose them. Move them to one of those levels first.
+
+LINSTOR writes `cram-hmac-alg sha1` and the shared secret into a resource only when its `DrbdOptions/auto-verify-alg` is set to something other than `windrbd`; without it, the resource runs with no peer authentication. Blockstor writes `cram-hmac-alg` only when `DrbdOptions/Net/cram-hmac-alg` is set, so the tool carries the secret and sets `DrbdOptions/Net/cram-hmac-alg` to `sha1` only where LINSTOR wrote them, and the adopted resource authenticates exactly as before. A definition without them is reported. To turn authentication on after the migration, set `DrbdOptions/Net/shared-secret` and `DrbdOptions/Net/cram-hmac-alg` on it together, at a time when no node is rebooting: each node applies them on its own, and a connection that drops between two nodes while only one of them has applied them stays down until the other one has. Blockstor also renders `DrbdOptions/auto-verify-alg` as `verify-alg` when no explicit one is set, as LINSTOR does.
 
 ## Before you start
 
@@ -63,7 +68,19 @@ Not converted, and listed in the tool's report:
 
    The same comparison the other way round lists the volumes no converted replica names, usually leftovers of earlier LINSTOR deletes. Blockstor never deletes a volume that no replica claims, so they stay until you remove them; `linstor-migrate` cannot list them, since it reads only the dump. Volumes named `_deleted_*` are ones LINSTOR renamed because they still had snapshots. Blockstor finishes them the way LINSTOR would: deleting the last of a migrated `Snapshot`'s copies on that node destroys the renamed volume with it. One whose snapshots no `Snapshot` tracks stays.
 
-6. **Rehearse on staging.** Run the whole procedure on a copy of the pools. Check that every pool registers, every replica reaches `UpToDate` without a resync, and no new empty volumes appear.
+6. **Record the DRBD configuration.** Blockstor applies the configuration it renders as soon as it adopts a resource, without comparing it with what the kernel runs, so keep a copy to compare against afterwards:
+
+   ```sh
+   for pod in $(kubectl -n cozy-linstor get pods -l app.kubernetes.io/component=linstor-satellite \
+                  -o jsonpath='{.items[*].metadata.name}'); do
+     node=$(kubectl -n cozy-linstor get pod "$pod" -o jsonpath='{.spec.nodeName}')
+     kubectl -n cozy-linstor exec "$pod" -- drbdsetup show > "drbd-before-$node.txt"
+   done
+   ```
+
+   If the blockstor satellite ships a different drbd-utils version, take the copy and the later comparison with the same binary, or the difference is only formatting.
+
+7. **Rehearse on staging.** Run the whole procedure on a copy of the pools. Check that every pool registers, every replica reaches `UpToDate` without a resync, and no new empty volumes appear.
 
 ## Convert
 
@@ -113,6 +130,7 @@ A definition with no layer stack whose replicas all agree takes their stack with
 - The number of nodes, pools, groups, definitions and replicas matches the counts in the converter's report.
 - For at least five volumes, the size, `/dev/drbd<minor>`, node IDs and port match the values from before the migration. A changed minor or node ID is a reason to stop and roll back.
 - No replica is unexpectedly syncing.
+- `drbdsetup show` on every node matches the copy from step 6 of "Before you start", apart from a port the report said would change. A DRBD option that changed or went missing is a reason to stop: look for it in the report.
 - Encrypted volumes stay closed until you set up their passphrase. Keep their consumers stopped until then.
 
 ## Roll back
