@@ -119,12 +119,11 @@ type SnapshotVolume struct {
 //	(anything else)    -> "Incomplete"
 //
 // blockstor used to ship the `FAILED` shorthand (terminal-error stamp
-// from the satellite snapshot reconciler); we keep that one and ALSO
-// stamp `SUCCESSFUL` on the wire view once every diskful peer reports
-// Ready. TIE_BREAKER + DISKLESS replicas hold no data and never take
-// the snapshot, so they MUST be excluded from the "every replica is
-// ready" denominator — otherwise the State column hangs in Incomplete
-// forever on auto-placed 2-diskful + 1-tiebreaker topologies.
+// from the satellite snapshot reconciler); we keep that one. SUCCESSFUL
+// is the flag the controller persists on the Snapshot once the take
+// completed on every targeted node, as LINSTOR persists it on the
+// snapshot definition; the wire view serves it as stored, so it
+// survives the deletion of the source volume.
 const (
 	SnapshotFlagFailedDeployment = "FAILED_DEPLOYMENT"
 	SnapshotFlagFailedDisconnect = "FAILED_DISCONNECT"

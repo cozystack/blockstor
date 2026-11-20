@@ -189,17 +189,6 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 		filtered = append(filtered, snaps[i])
 	}
 
-	// Derive the State-column flag for the python CLI's `s l` table.
-	// Runs after filter (don't bother computing for snapshots the
-	// caller filtered out) but before paginate so all callers — full
-	// page or windowed — see the same Flags slice.
-	err = s.stampSnapshotSuccessful(r.Context(), filtered)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
-	}
-
 	// Pagination: golinstor's ListOpts.{Offset,Limit} surface as
 	// `?offset=N&limit=M`. linstor-csi forwards csi-sanity's
 	// max_entries + starting_token into these, and CSI's
@@ -253,13 +242,6 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		snaps = []apiv1.Snapshot{}
 	}
 
-	err = s.stampSnapshotSuccessful(r.Context(), snaps)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
-	}
-
 	// Bug 182: same redaction as the cluster-wide view path. The
 	// per-RD list inherits the parent-RD props through every
 	// snapshot create call's hydrateSnapshotFromRD, so the three
@@ -291,18 +273,7 @@ func (s *Server) handleSnapshotGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Single-snapshot view: reuse the slice helper so the SUCCESSFUL
-	// derivation logic lives in one place. Cheap (one Resources()
-	// list call per snapshot — the same call the multi-snapshot path
-	// makes per RD anyway).
 	single := []apiv1.Snapshot{snap}
-
-	err = s.stampSnapshotSuccessful(r.Context(), single)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
-	}
 
 	// Bug 182: scrub before emit. The Snapshots().Get() above
 	// returned a value copy, so the in-place mutation is local to
@@ -336,191 +307,6 @@ func redactSnapshotsInPlace(snaps []apiv1.Snapshot) {
 			redactSensitiveProps(vds[j].VolumeDefinitionProps)
 		}
 	}
-}
-
-// stampSnapshotSuccessful derives the python-CLI `State` column from
-// the per-node materialisation. For each snapshot:
-//
-//  1. If `Flags` already carries `FAILED_DEPLOYMENT` / `FAILED_DISCONNECT`
-//     / `FAILED` (the satellite-stamped terminal-error marker) — leave
-//     the entry alone; those flags outrank SUCCESSFUL in the CLI.
-//  2. Else, look up the parent RD's diskful peer set (Resources whose
-//     Flags slice contains neither DISKLESS nor TIE_BREAKER — the
-//     TIE_BREAKER witness holds no data so it MUST be excluded from
-//     the success denominator, otherwise auto-placed 2-diskful + 1-TB
-//     topologies hang in Incomplete forever).
-//  3. If every diskful peer has a `Snapshots[]` entry with non-zero
-//     CreateTimestamp (the satellite-reported "I took the snapshot"
-//     signal), stamp `SUCCESSFUL` on the wire `Flags` so `linstor s l`
-//     renders the State column as `Successful`.
-//
-// Failure to enumerate Resources soft-fails to "no stamp": better to
-// leave the row at `Incomplete` than 5xx the whole list call.
-func (s *Server) stampSnapshotSuccessful(ctx context.Context, snaps []apiv1.Snapshot) error {
-	// Cache the per-RD diskful node set so a List of N snapshots
-	// against the same RD only walks Resources once.
-	diskfulByRD := map[string]map[string]struct{}{}
-
-	for i := range snaps {
-		snap := &snaps[i]
-
-		if slices.ContainsFunc(snap.Flags, isTerminalSnapshotFlag) {
-			continue
-		}
-
-		diskful, ok := diskfulByRD[naming.Key(snap.ResourceName)]
-		if !ok {
-			built, err := s.diskfulPeerSet(ctx, snap.ResourceName)
-			if err != nil {
-				return err
-			}
-
-			diskful = built
-			diskfulByRD[naming.Key(snap.ResourceName)] = diskful
-		}
-
-		if isSnapshotSuccessful(snap, diskful) {
-			snap.Flags = append(snap.Flags, apiv1.SnapshotFlagSuccessful)
-		}
-	}
-
-	return nil
-}
-
-// legacySnapshotFlagFailed is the satellite snapshot reconciler's
-// terminal-error stamp (F18 cli-parity wiring) kept for backwards-compat
-// with existing CRDs that carry the token in Status.Flags. Mirrored
-// from the SnapshotStatusFlagFailed constant on the CRD package;
-// duplicated here so the REST package doesn't need a v1alpha1 import
-// just to read one literal.
-const legacySnapshotFlagFailed = "FAILED"
-
-// isTerminalSnapshotFlag reports whether a flag value already pins the
-// snapshot to a non-Incomplete State that outranks `SUCCESSFUL`.
-// Mirrors the python CLI's elif-chain order in snapshot_cmds.show, where
-// DELETE comes first: a snapshot whose delete is in flight is Deleting, and
-// stamping SUCCESSFUL beside it hands a client that reads the flags in any
-// other order a snapshot being destroyed as a usable one.
-func isTerminalSnapshotFlag(flag string) bool {
-	return flag == apiv1.SnapshotFlagDelete ||
-		flag == apiv1.SnapshotFlagFailedDeployment ||
-		flag == apiv1.SnapshotFlagFailedDisconnect ||
-		flag == apiv1.SnapshotFlagSuccessful ||
-		flag == legacySnapshotFlagFailed
-}
-
-// isSnapshotSuccessful is true iff every node in the success denominator
-// has a per-node entry with non-zero CreateTimestamp.
-//
-// The denominator is:
-//
-//   - When `snap.Nodes` is non-empty (caller restricted the snap to a
-//     subset via `linstor snapshot create <rd> <snap> <node...>`):
-//     the intersection of `snap.Nodes` with the diskful peer set.
-//     Unlisted peers are never tasked, so their Snapshot-child never
-//     materialises and must not block the gate.
-//   - When `snap.Nodes` is empty (default broadcast fan-out): every
-//     diskful peer of the parent RD.
-//
-// An empty denominator returns false — a 0-replica RD with a snapshot
-// row, or a Spec.Nodes set that doesn't overlap any diskful peer, is a
-// degenerate state the operator should investigate, not silently
-// auto-mark as success.
-//
-// Why: user-reported Bug 352 — `linstor snapshot create <rd> <snap>
-// <single-node>` hung in Incomplete forever because the gate counted
-// every diskful peer, including those the caller had explicitly
-// excluded via the positional node arg. Mirrors upstream
-// CtrlSnapshotCrtApiCallHandler, which scopes per Spec.Nodes when
-// non-empty.
-func isSnapshotSuccessful(snap *apiv1.Snapshot, diskful map[string]struct{}) bool {
-	denominator := successDenominator(snap, diskful)
-	if len(denominator) == 0 {
-		return false
-	}
-
-	reported := map[string]struct{}{}
-
-	for j := range snap.Snapshots {
-		entry := &snap.Snapshots[j]
-		if entry.CreateTimestamp == 0 {
-			continue
-		}
-
-		reported[naming.Key(entry.NodeName)] = struct{}{}
-	}
-
-	for node := range denominator {
-		if _, ok := reported[naming.Key(node)]; !ok {
-			return false
-		}
-	}
-
-	return true
-}
-
-// successDenominator computes the per-snapshot success denominator.
-// See `isSnapshotSuccessful` for the policy. Factored out so the test
-// suite can pin both branches (Spec.Nodes-scoped and broadcast) without
-// reaching into per-node bookkeeping.
-func successDenominator(snap *apiv1.Snapshot, diskful map[string]struct{}) map[string]struct{} {
-	if len(snap.Nodes) == 0 {
-		return diskful
-	}
-
-	out := make(map[string]struct{}, len(snap.Nodes))
-
-	for _, node := range snap.Nodes {
-		if _, ok := diskful[naming.Key(node)]; ok {
-			out[naming.Key(node)] = struct{}{}
-		}
-	}
-
-	return out
-}
-
-// diskfulPeerSet enumerates the Resources of an RD and returns the
-// set of node names whose Flags slice contains neither DISKLESS,
-// TIE_BREAKER, nor INACTIVE. NotFound on the RD soft-fails to an empty
-// set — matches handleSnapshotList's "treat orphan snapshot rows as
-// renderable" stance.
-//
-// Bug 394: INACTIVE replicas are excluded from the snapshot target set
-// (listDiskfulNodes), so they never receive a Snapshots[] entry. They
-// must therefore also be excluded from the success denominator here,
-// otherwise an RD with an INACTIVE replica would hang at Incomplete
-// forever (the INACTIVE node can never satisfy the success check).
-// Mirrors the DISKLESS/TIE_BREAKER skips.
-func (s *Server) diskfulPeerSet(ctx context.Context, rdName string) (map[string]struct{}, error) {
-	resList, err := s.Store.Resources().ListByDefinition(ctx, rdName)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return map[string]struct{}{}, nil
-		}
-
-		return nil, err //nolint:wrapcheck // surfaced via writeError
-	}
-
-	out := make(map[string]struct{}, len(resList))
-
-	for i := range resList {
-		flags := resList[i].Flags
-		if slices.Contains(flags, apiv1.ResourceFlagDiskless) {
-			continue
-		}
-
-		if slices.Contains(flags, apiv1.ResourceFlagTieBreaker) {
-			continue
-		}
-
-		if slices.Contains(flags, apiv1.ResourceFlagInactive) {
-			continue
-		}
-
-		out[naming.Key(resList[i].NodeName)] = struct{}{}
-	}
-
-	return out, nil
 }
 
 func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {

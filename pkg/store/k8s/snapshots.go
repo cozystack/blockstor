@@ -438,11 +438,11 @@ func crdToWireSnapshot(
 		vdPropsByNumber = vdPropsMap(parent)
 	}
 
-	// Surface Status.Flags on the wire so the Python CLI's
-	// State column can render "Failed". Defensive copy: the
-	// CRD's slice header gets reused across List calls, sharing
-	// the backing array would let a downstream mutation reach
-	// back into the informer cache.
+	// Surface Status.Flags on the wire: the persisted SUCCESSFUL the
+	// State column and linstor-csi's restore wait read, and the
+	// failure markers. Defensive copy: the CRD's slice header gets
+	// reused across List calls, sharing the backing array would let a
+	// downstream mutation reach back into the informer cache.
 	if len(crd.Status.Flags) > 0 {
 		out.Flags = make([]string, len(crd.Status.Flags))
 		copy(out.Flags, crd.Status.Flags)
@@ -452,9 +452,15 @@ func crdToWireSnapshot(
 	// holds the snapshot, and that lasts until the on-disk delete succeeds.
 	// Served as a plain snapshot, a restore read it as live and was restored
 	// from data being destroyed. Same flag resources carry for the same state,
-	// and like theirs it outranks every other State: the REST view stamps no
-	// SUCCESSFUL beside it.
+	// and like theirs it outranks every other State, so the persisted
+	// SUCCESSFUL is not served beside it: a client that checks for SUCCESSFUL
+	// before DELETE would otherwise restore from it.
 	out.Flags = withDeletingFlag(out.Flags, crd.DeletionTimestamp != nil)
+	if crd.DeletionTimestamp != nil {
+		out.Flags = slices.DeleteFunc(out.Flags, func(flag string) bool {
+			return flag == apiv1.SnapshotFlagSuccessful
+		})
+	}
 
 	if len(crd.Spec.VolumeDefinitions) > 0 {
 		out.VolumeDefinitions = wireVolumeDefinitions(crd.Spec.VolumeDefinitions, vdPropsByNumber)

@@ -163,36 +163,6 @@ func TestSingleNodeCreateTakesTheBodyNodeInAnotherSpelling(t *testing.T) {
 	}
 }
 
-// A satellite reports its snapshot entry under its own node name, node-1,
-// while the snapshot lists the node as registered, Node-1, and the replica
-// listing does too. The snapshot is successful.
-func TestSnapshotIsSuccessfulWithAnEntryInAnotherNodeSpelling(t *testing.T) {
-	t.Parallel()
-
-	st := store.NewInMemory()
-	ctx := t.Context()
-
-	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-mix", NodeName: "Node-1"}); err != nil {
-		t.Fatalf("seed replica: %v", err)
-	}
-
-	diskful, err := (&Server{Store: st}).diskfulPeerSet(ctx, "pvc-mix")
-	if err != nil {
-		t.Fatalf("diskfulPeerSet: %v", err)
-	}
-
-	for _, reporter := range []string{"node-1", "NODE-1"} {
-		snap := &apiv1.Snapshot{
-			Nodes:     []string{"Node-1"},
-			Snapshots: []apiv1.SnapshotPerNode{{NodeName: reporter, CreateTimestamp: 1}},
-		}
-
-		if !isSnapshotSuccessful(snap, diskful) {
-			t.Errorf("the snapshot taken on %s for Node-1 reads as not successful", reporter)
-		}
-	}
-}
-
 // A restore onto node-1 takes the pool of the source's replica on Node-1.
 func TestRestorePoolIsTheSourceReplicasOnAnotherNodeSpelling(t *testing.T) {
 	t.Parallel()
