@@ -305,6 +305,12 @@ func (r *SnapshotReconciler) markSnapshotSuccessful(
 			return errors.Wrap(getErr, "get Snapshot for SUCCESSFUL stamp")
 		}
 
+		// The pass may have decided on an older view of the snapshot
+		// than the abort that is now on record.
+		if current.Spec.AbortReason != "" {
+			return nil
+		}
+
 		flags, marked := withSuccessfulFlag(current.Status.Flags)
 		if !marked {
 			return nil
@@ -376,6 +382,20 @@ func (r *SnapshotReconciler) advancePhase(
 	// cycle — bounding the suspend-entry slip far under the ≤5s
 	// budget. Non-grouped (Bug-351 single-snap) Snapshots skip the
 	// barrier entirely and keep flipping their own flag.
+	// A take that has not suspended yet past its deadline is not
+	// started: it could only hold I/O for the moment the next pass
+	// aborts it. This is also where a take ends whose abort record was
+	// lost, e.g. to an Update by a satellite that predates the field
+	// while its status stamp had not landed.
+	if isPhase1Entry(snap, next) && suspendDeadlineExceeded(snap, time.Now()) {
+		logger.Info("aborting snapshot group: suspend deadline passed before the take started",
+			"group_id", snap.Spec.GroupID)
+
+		return r.abortGroupWithReason(ctx, siblings,
+			"snapshot aborted: the take did not start within the "+
+				snapshotSuspendDeadline.String()+" deadline; I/O not suspended")
+	}
+
 	if isPhase1Entry(snap, next) && snap.Spec.GroupID != "" {
 		return r.openGroupSuspendBarrier(ctx, logger, snap, siblings)
 	}

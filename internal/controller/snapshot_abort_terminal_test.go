@@ -243,7 +243,10 @@ func TestSnapshotSuccessfulTakeIsNeverSuspendedAgain(t *testing.T) {
 
 // A pass that works from a listing taken before a sibling's abort landed
 // still cannot freeze that sibling again: the write re-reads it, sees the
-// abort, and leaves it alone.
+// abort, and leaves it alone. The pass may still suspend its own snapshot,
+// whose abort has not landed yet; the next pass, on a current listing,
+// aborts it with the rest of the group. Only the aborted sibling is
+// asserted on here.
 func TestSnapshotStaleGroupViewDoesNotReSuspendAnAbortedSibling(t *testing.T) {
 	t.Parallel()
 
@@ -352,5 +355,77 @@ func TestSnapshotSuccessfulTakeGetsNoAbortRecord(t *testing.T) {
 	got := getSnap(t, cli, snap.Name)
 	if got.Spec.AbortReason != "" {
 		t.Errorf("a SUCCESSFUL snapshot got an abort record: %q", got.Spec.AbortReason)
+	}
+}
+
+// A take whose abort record was lost, as to an Update by a satellite
+// that predates the field, looks unstarted while a node's suspend ack
+// lingers. Past its deadline it is not started again: no suspend is
+// ordered, and the abort is recorded.
+func TestSnapshotPastItsDeadlineIsNotSuspended(t *testing.T) {
+	t.Parallel()
+
+	snap := suspendedSnapshot("pvc-1.snap-1", "pvc-1", "snap-1", 3*time.Minute,
+		[]string{"n1", "n2"}, false,
+		[]blockstoriov1alpha1.SnapshotPerNodeStatus{{NodeName: "n1", SuspendIOAcked: true}})
+	snap.Spec.SuspendIO = false
+
+	r, cli := successfulFixture(t, snap)
+
+	reconcileSnapshot(t, r, snap.Name)
+
+	got := getSnap(t, cli, snap.Name)
+	if got.Spec.SuspendIO {
+		t.Fatalf("a take past its deadline was ordered to suspend: %+v", got.Spec)
+	}
+
+	if got.Spec.AbortReason == "" {
+		t.Errorf("the take past its deadline is not recorded aborted")
+	}
+}
+
+// The success stamp re-reads the snapshot before writing. A pass that
+// decided on a view older than the abort now on record writes nothing.
+func TestSnapshotSuccessStampYieldsToALaterAbort(t *testing.T) {
+	t.Parallel()
+
+	snap := completedSnapshot("snap-1", []string{"n1"},
+		blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "n1", Ready: true, CreateTimestamp: 1})
+	snap.Spec.AbortReason = "snapshot aborted: test"
+
+	stale := snap.DeepCopy()
+	stale.Spec.AbortReason = ""
+
+	var served atomic.Bool
+
+	scheme := newSnapshotControllerScheme(t)
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+		WithObjects(snap).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				err := c.Get(ctx, key, obj, opts...)
+
+				got, isSnap := obj.(*blockstoriov1alpha1.Snapshot)
+				if err != nil || !isSnap || served.Swap(true) {
+					return err
+				}
+
+				// The reconcile's first read predates the abort.
+				rv := got.ResourceVersion
+				*got = *stale.DeepCopy()
+				got.ResourceVersion = rv
+
+				return nil
+			},
+		}).
+		Build()
+	r := &controller.SnapshotReconciler{Client: cli, Scheme: scheme}
+
+	reconcileIgnoringError(r, snap.Name)
+
+	if hasFlag(getSnap(t, cli, snap.Name), blockstoriov1alpha1.SnapshotStatusFlagSuccessful) {
+		t.Fatal("a stale pass recorded SUCCESSFUL over an abort on record")
 	}
 }
