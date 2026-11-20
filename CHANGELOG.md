@@ -4,6 +4,25 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.4 — 2026-11-20
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #292 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.3; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.3
+
+- **A snapshot stays SUCCESSFUL after its source volume is deleted (#292).** The controller records `SUCCESSFUL` in the Snapshot's `status.flags` once every node took its snapshot and confirmed the resume, and the REST views serve that record instead of deriving it from the source's current replicas, so a linstor-csi restore from a VolumeSnapshot whose PVC is gone no longer times out.
+- **A failed group snapshot is FAILED on every sibling (#292).** None of them becomes SUCCESSFUL, not even once the failed one is deleted, as LINSTOR flags every snapshot of an aborted request.
+- **An aborted snapshot take is terminal (#292).** The controller records the abort in the new `spec.abortReason` in the same write that orders the resume, never suspends that snapshot again, and aborts a take that has not started by its deadline; the satellite opens no suspend window for a snapshot whose take is on record as ended.
+- **An abort's resume no longer waits on a status write (#292).** A failed `IOSuspended` condition stamp used to stop the pass before the abort could clear `spec.suspendIO`.
+- **Auto-snapshots are taken and orchestrated like any other snapshot (#292).** They target every node with an active diskful replica, carry the replicas' LUKS passwords, and are skipped for a tick while a replica's node is offline, when no replica holds data, when a pool cannot snapshot, or for a definition being deleted.
+- **The native CLI shows a snapshot Successful only when it is recorded so (#292).** Anything else without a failure reads Incomplete, as in the python client.
+- **`rg modify` places like LINSTOR's (#280, #289).** Any request that names a place count, raised, lowered or unchanged, places on every child below it whatever its layer stack and whatever `BalanceResourcesEnabled` says, counting every replica but tiebreakers; a modify that changes only a placement constraint gets the balance checks and places nothing with balancing off.
+- **The balance checks skip a definition without DRBD first (#289).** The scheduled pass, resource group events and a constraint-only `rg modify` leave storage-only definitions alone instead of logging a skip for each on every pass.
+- **A replica topped by STORAGE reports an empty state to linstor-csi (#283).** The REST reply always carries the state object, so the health monitor no longer raises `VolumeConditionAbnormal` on every healthy local volume.
+- **A diskless replica reports its DRBD device path (#291).** A remote attach through make-available no longer fails with "could not determine device path".
+- **Create, autoplace, spawn and make-available answer once the satellites built the replicas (#291).** The build wait fits inside the CSI sidecars' one minute timeout, a diskless replica counts as built once it has its device, and every replica on an unreachable satellite is named in the not-connected warning, as LINSTOR does.
+- **`vd d` rechecks quorum on the replicas that keep running (#273).** Once a deleted volume is out of DRBD, the satellite resumes a suspension that quorum alone held, also under `on-no-quorum io-error` and after an apply that fails past the removal; a suspension a snapshot, fencing or missing data also holds is left in place.
+
 ## v0.4.0-alpha.3 — 2026-11-19
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #291 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.2; the entries below are what changed since.
