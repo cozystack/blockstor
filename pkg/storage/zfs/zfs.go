@@ -270,7 +270,20 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	dataset := p.snapshotDataset(snap)
 
 	if p.datasetExists(ctx, dataset) {
-		return nil
+		// A receive interrupted before its cleanup left the source's
+		// snapshot on the zvol, and it may carry this name: skipping
+		// would keep the restore's data under the new snapshot.
+		zvol, _, _ := strings.Cut(dataset, "@")
+
+		received, err := p.receivedSnapshot(ctx, zvol)
+		if err != nil || received != dataset {
+			return err
+		}
+
+		err = p.finishReceive(ctx, zvol)
+		if err != nil {
+			return err
+		}
 	}
 
 	_, err := p.exec.Run(ctx, "zfs", "snapshot", dataset)
@@ -312,6 +325,13 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 	tgtDS := p.volumeDataset(target)
 
 	if p.datasetExists(ctx, tgtDS) {
+		// A cross-node receive into this zvol may have stopped before it
+		// removed the snapshot it brought.
+		err := p.finishReceive(ctx, tgtDS)
+		if err != nil {
+			return err
+		}
+
 		// Bug 253 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the dataset sparse-thick.
 		return p.ensureRefreservation(ctx, tgtDS)
@@ -469,7 +489,9 @@ func (r *zfsSendReader) Close() error {
 // restored volume's delete left `_deleted_<zvol>_<time>` and its snapshot
 // behind for good. It is removed once the receive is done, as LINSTOR's
 // clone service removes every snapshot of a volume it filled by send and
-// receive (CloneService.doZFSCloneTargetCleanup).
+// receive (CloneService.doZFSCloneTargetCleanup). The zvol records its name
+// in receivedSnapshotProp until then, so a receive that stopped half way is
+// finished by the next restore, receive or snapshot of that name.
 func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, source storage.Snapshot, src io.Reader) error {
 	tgtDS := p.volumeDataset(target)
 
@@ -482,12 +504,21 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, sour
 	}
 
 	if present {
+		err = p.finishReceive(ctx, tgtDS)
+		if err != nil {
+			return err
+		}
+
 		// Bug 254 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the recv'd dataset sparse-thick.
 		return p.ensureRefreservation(ctx, tgtDS)
 	}
 
-	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F", tgtDS)
+	// The zvol is created already carrying the name of the snapshot to
+	// remove, so a receive that stops after `zfs recv` still says what it
+	// brought, and a retry finishes the cleanup instead of keeping it.
+	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F",
+		"-o", receivedSnapshotProp+"="+source.SnapshotName, tgtDS)
 	if err != nil {
 		// On failure leave nothing behind — `zfs recv -F` may have
 		// partially created the dataset; destroy it so the next
@@ -498,7 +529,7 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, sour
 		return errors.Wrapf(err, "zfs recv %s: %s", tgtDS, strings.TrimSpace(string(out)))
 	}
 
-	err = p.dropReceivedSnapshot(ctx, tgtDS+"@"+source.SnapshotName)
+	err = p.finishReceive(ctx, tgtDS)
 	if err != nil {
 		return err
 	}
