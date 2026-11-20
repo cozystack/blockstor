@@ -915,7 +915,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	}
 
 	if pool := req.GetStoragePool(); pool != "" {
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if ok {
 			for _, n := range req.GetVolumeNumbers() {
 				err := provider.DeleteVolume(ctx, storage.Volume{
@@ -941,8 +941,9 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		// "No valid meta data found". `.owned` (Bug 432) is the
 		// sweeper's ownership marker — must be removed AFTER the
 		// kernel slot is gone so a concurrent sweeper tick sees a
-		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned"} {
+		// clean post-state (kernel + marker both absent). The .res
+		// candidate is there only when a crash cut a write short.
+		for _, suffix := range []string{".res", ResFileCandidateSuffix, ".md-created", ".mkfs.done", ".owned"} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{
@@ -1632,7 +1633,7 @@ func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.D
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
 			continue
 		}
@@ -1659,7 +1660,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	cloned := false
 
 	for _, vol := range dr.GetVolumes() {
-		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+		provider, ok := r.provider(vol.GetStoragePool())
 		if !ok {
 			return nil, false, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
 		}
@@ -2291,7 +2292,32 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 		return nil
 	}
 
-	return errors.Wrapf(os.WriteFile(resPath, []byte(body), resFilePerm), "write %s", resPath)
+	return r.installResFile(ctx, resPath, body)
+}
+
+// ResFileCandidateSuffix names the file a new .res body is written to
+// before it replaces the live one. It must not end in .res: drbd.conf
+// includes drbd.d/*.res, and a candidate that matched would be parsed as
+// a second definition of the resource by every drbdadm call on the node.
+const ResFileCandidateSuffix = ".res.tmp"
+
+// installResFile puts body at resPath in one rename.
+//
+// drbdadm parses every .res on the node for any command, whichever
+// resource it is run for, and the satellite applies several resources at
+// once. Rewritten in place, a .res is empty or half written for a moment,
+// and a drbdadm for another resource that reads it then would refuse the
+// configuration. Renamed into place, a reader sees the old body or the
+// new one, the way LINSTOR moves its .res_tmp over the .res.
+func (r *Reconciler) installResFile(_ context.Context, resPath, body string) error {
+	candidate := strings.TrimSuffix(resPath, ".res") + ResFileCandidateSuffix
+
+	err := os.WriteFile(candidate, []byte(body), resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "write %s", candidate)
+	}
+
+	return errors.Wrapf(os.Rename(candidate, resPath), "install %s", resPath)
 }
 
 // applyDRBD renders the .res file from dr's metadata and (re)applies
@@ -2964,7 +2990,7 @@ func (r *Reconciler) resizeAssumeClean(dr *intent.DesiredResource) bool {
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
 			continue
 		}
@@ -5688,7 +5714,7 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 		}, true
 	}
 
-	provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+	provider, ok := r.provider(vol.GetStoragePool())
 	if !ok || provider == nil {
 		return drbd.GISeed{}, false
 	}
@@ -5785,6 +5811,19 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 	return drbd.GISeed{Current: day0, WasUpToDate: true}, true
 }
 
+// provider returns the provider registered for pool. The StoragePool
+// controller registers pools while the Resource workers apply, and an
+// unguarded map read racing that write is a fatal runtime error, not a
+// recoverable one.
+func (r *Reconciler) provider(pool string) (storage.Provider, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	provider, ok := r.cfg.Providers[pool]
+
+	return provider, ok
+}
+
 // providerForResource resolves the provider that owns the named
 // resource using the in-memory pool map. Returns an error when the
 // resource isn't known or its pool isn't registered.
@@ -5797,7 +5836,7 @@ func (r *Reconciler) providerForResource(name string) (storage.Provider, error) 
 		return nil, errors.Errorf("resource %q not known on this satellite", name)
 	}
 
-	provider, ok := r.cfg.Providers[pool]
+	provider, ok := r.provider(pool)
 	if !ok {
 		return nil, errors.Errorf("storage pool %q not registered", pool)
 	}

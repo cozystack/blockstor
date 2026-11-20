@@ -35,10 +35,12 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -142,6 +144,11 @@ type ResourceReconciler struct {
 	client.Client
 
 	Config Config
+
+	// recheck runs the periodic re-checks one at a time. SetupWithManager
+	// sets it and gates Reconcile through it; a test calling Reconcile
+	// directly goes around it.
+	recheck *recheckGate
 }
 
 // Reconcile reads a Resource and drives the satellite-side
@@ -231,6 +238,13 @@ const peerAllocationRequeue = 2 * time.Second
 //   - short enough that any divergence between desired and observed
 //     converges within a single user-visible scenario tick (e2e
 //     tests poll at 1-2 s and budget ~30 s per assertion).
+//
+// It is the earliest a replica is re-checked, not a promise. The
+// re-check gate runs the re-checks one at a time, cools the slot down
+// after each, and holds them while an event pass runs, so on a node
+// with N replicas whose pass takes T the period is about
+// max(10s, N*(1+recheckCooldown)*T): with a hundred replicas at 0.1 s
+// a pass, about 20 s.
 const activeDRBDRequeue = 10 * time.Second
 
 // resolveDeleteStoragePool picks the pool name the
@@ -265,20 +279,31 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // rendered a peer-less .res, and never re-rendered because
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
+//
+// Every way an event reaches the queue goes through the re-check gate:
+// For and the kernel trigger through r.recheck.marker, every Watches
+// map function through r.recheck.mapFunc. A Watches added without it
+// still works, but the gate takes its passes for re-checks of replicas
+// that have one due and holds them for the re-check slot.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.recheck = newRecheckGate()
+
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
 			builder.WithPredicates(
 				predicate.And(
 					nodeNamePredicate(r.Config.NodeName),
 					primaryWatchPredicate(),
+					r.recheck.marker(passResource),
 				),
 			)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passPeer, r.enqueueLocalSiblings)),
+			builder.WithPredicates(siblingWatchPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
-		Named("satellite-resource")
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passDefinition, r.enqueueResourcesForRD))).
+		Named("satellite-resource").
+		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.resourceWorkers()})
 
 	// Phase 11.7 second leg: the observer-trigger channel wakes
 	// this reconciler on kernel-state changes that produce no
@@ -290,13 +315,20 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// builder skips the raw-source registration entirely.
 	if r.Config.ReconcileTrigger != nil {
 		bldr = bldr.WatchesRawSource(
-			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{}),
+			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
+				source.WithPredicates[client.Object, reconcile.Request](r.recheck.marker(passKernel))),
 		)
 	}
 
-	err := bldr.Complete(r)
+	err := bldr.Complete(r.recheck.gate(r))
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
+	}
+
+	err = mgr.Add(manager.RunnableFunc(r.recheck.reportEvery(passReportInterval,
+		mgr.GetLogger().WithName("satellite-resource"))))
+	if err != nil {
+		return errors.Wrap(err, "register resource pass report")
 	}
 
 	return nil
@@ -378,6 +410,82 @@ func primaryWatchPredicate() predicate.Predicate {
 			return false
 		},
 	}
+}
+
+// siblingWatchPredicate filters the events of other nodes' Resources
+// before enqueueLocalSiblings maps them onto this node's replica of
+// the same definition. It passes only what the local apply reads off
+// a peer: its spec (generation), its deletion, the allocator stamp,
+// and the per-volume disk state and current GI the day0 seed and the
+// auto-primary election consult (dispatcher.anyDiskfulPeerHasData).
+//
+// The peer's connections, role, in-use flag, out-of-sync counters and
+// conditions are dropped. Each peer's observer rewrites them on every
+// kernel frame, and every such write used to re-queue this node's
+// replica at normal priority: on a node holding a hundred replicas the
+// queue never drained, and a newly created Resource waited minutes
+// behind replicas with nothing to do. This node's own kernel view of
+// a peer reaches the reconciler through the observer-trigger channel.
+func siblingWatchPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(_ event.CreateEvent) bool { return true },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
+		GenericFunc: func(_ event.GenericEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldR, ok1 := e.ObjectOld.(*blockstoriov1alpha1.Resource)
+			newR, ok2 := e.ObjectNew.(*blockstoriov1alpha1.Resource)
+
+			if !ok1 || !ok2 {
+				return true
+			}
+
+			return siblingChangeAffectsApply(oldR, newR)
+		},
+	}
+}
+
+// siblingChangeAffectsApply reports whether an update of a peer
+// Resource changes anything the local apply derives from that peer.
+func siblingChangeAffectsApply(oldR, newR *blockstoriov1alpha1.Resource) bool {
+	if oldR.Generation != newR.Generation {
+		return true
+	}
+
+	if (oldR.DeletionTimestamp == nil) != (newR.DeletionTimestamp == nil) {
+		return true
+	}
+
+	if !int32PtrEqual(oldR.Status.DRBDNodeID, newR.Status.DRBDNodeID) ||
+		!int32PtrEqual(oldR.Status.DRBDPort, newR.Status.DRBDPort) ||
+		!int32PtrEqual(oldR.Status.DRBDMinor, newR.Status.DRBDMinor) {
+		return true
+	}
+
+	return !sameVolumeDataState(oldR.Status.Volumes, newR.Status.Volumes)
+}
+
+// sameVolumeDataState compares the per-volume disk state and current
+// GI of two Status.Volumes lists, keyed by volume number.
+func sameVolumeDataState(left, right []blockstoriov1alpha1.ResourceVolumeStatus) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	type dataState struct{ disk, gi string }
+
+	byNumber := make(map[int32]dataState, len(left))
+	for i := range left {
+		byNumber[left[i].VolumeNumber] = dataState{left[i].DiskState, left[i].CurrentGI}
+	}
+
+	for i := range right {
+		prev, ok := byNumber[right[i].VolumeNumber]
+		if !ok || prev != (dataState{right[i].DiskState, right[i].CurrentGI}) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // int32PtrEqual returns true when two *int32 pointers describe the
@@ -536,7 +644,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// keeping them quiet preserves the predicate's no-op-on-idle
 	// property.
 	if rdNeedsDRBD(&rd) {
-		return ctrl.Result{RequeueAfter: activeDRBDRequeue}, nil
+		return schedulePeriodicRecheck(ctx), nil
 	}
 
 	return ctrl.Result{}, nil
