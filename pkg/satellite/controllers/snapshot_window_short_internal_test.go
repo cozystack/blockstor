@@ -208,6 +208,77 @@ func (w *hangingStatusWriter) Patch(
 	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...) //nolint:wrapcheck // test double
 }
 
+// The deadline exists to bound how long I/O stays suspended, so it
+// cannot wait on the API server: the close resumes first and stamps the
+// node Failed after. Stamping first held I/O frozen for as long as the
+// status write hung, past the very deadline that closed the window.
+func TestSnapshotWindowResumesAtTheDeadlineWhileStatusWritesHang(t *testing.T) {
+	t.Parallel()
+
+	rig := newWindowRig(t)
+	api := &hangingStatusClient{Client: rig.cli, release: make(chan struct{})}
+	rig.r.Client = api
+	rig.r.timing.windowDeadline = 300 * time.Millisecond
+	rig.provider.hang = make(chan struct{})
+	rig.startWatchdog()
+	t.Cleanup(func() {
+		api.unblock()
+		close(rig.provider.hang)
+	})
+
+	rig.reconcile()
+	rig.controllerSets(true, true)
+	api.hang.Store(true)
+	rig.reconcile()
+
+	eventually(t, "resume at the deadline while status writes hang", func() bool {
+		return !rig.kernel.isSuspended()
+	})
+
+	if rig.node().Failed {
+		t.Errorf("node failed while status writes hang")
+	}
+
+	api.hang.Store(false)
+	api.unblock()
+
+	eventually(t, "Failed and the ack cleared once the API answers", func() bool {
+		return rig.node().Failed && !rig.node().SuspendIOAcked
+	})
+}
+
+// A take that returned in time holds stampMu across its Ready stamp.
+// When that stamp hangs past the deadline, the close resumes without
+// waiting for it, and the Ready that lands later is not also stamped
+// Failed.
+func TestSnapshotWindowResumesAtTheDeadlineWhileTheTakeStampHangs(t *testing.T) {
+	t.Parallel()
+
+	rig := newWindowRig(t)
+	api := &hangingStatusClient{Client: rig.cli, release: make(chan struct{})}
+	rig.r.Client = api
+	rig.r.timing.windowDeadline = time.Second
+	rig.startWatchdog()
+	t.Cleanup(api.unblock)
+
+	rig.reconcile()
+	rig.controllerSets(true, true)
+	api.hang.Store(true)
+	rig.reconcile()
+
+	eventually(t, "resume at the deadline while the Ready stamp hangs", func() bool {
+		return !rig.kernel.isSuspended()
+	})
+
+	api.hang.Store(false)
+	api.unblock()
+
+	eventually(t, "ack cleared once the API answers", func() bool { return !rig.node().SuspendIOAcked })
+
+	if node := rig.node(); !node.Ready || node.Failed {
+		t.Errorf("node status %+v, want Ready and not Failed", node)
+	}
+}
 
 // Between forgetting a window and removing its marker, the close is
 // still settling the Snapshot. The sweep of leftover markers took such

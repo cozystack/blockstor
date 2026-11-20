@@ -212,9 +212,10 @@ type snapshotWindow struct {
 	// leaves such a window alone.
 	opening bool
 
-	// stampMu orders a take's verdict against the Failed stamp of a
+	// stampMu orders a take's verdict against the Failed verdict of a
 	// close, so a take that returned in time and a deadline that
-	// passed while it was being stamped do not both land.
+	// passed while it was being stamped do not both land. The close
+	// takes it only after the resume.
 	stampMu sync.Mutex
 	// reported is set, under stampMu, once a take stamped Ready.
 	reported bool
@@ -764,8 +765,9 @@ func (r *SnapshotReconciler) settleResumed(ctx context.Context, snapshot string,
 }
 
 // closeWindow resumes I/O for snapshot and forgets the window once the
-// kernel confirms. failSnapshot stamps this node Failed first, for a
-// window that ends without a snapshot the controller asked to keep.
+// kernel confirms. failSnapshot stamps this node Failed after the
+// resume, for a window that ends without a snapshot the controller
+// asked to keep; nothing waits on the API server while I/O is frozen.
 // Returns the resume error so the caller can retry; a concurrent close
 // of the same window reports nil and leaves the work to that caller.
 // What the Snapshot's status still owes after the resume stays in the
@@ -788,7 +790,6 @@ func (r *SnapshotReconciler) closeWindow(ctx context.Context, snapshot string, f
 	}()
 
 	logger := log.FromContext(ctx).WithValues("snapshot", snapshot, "resource", marker.Resource)
-	failOwed := r.failOnClose(ctx, w, snapshot, failSnapshot, reason)
 
 	err = r.resumeVerified(ctx, &marker, false)
 	if err != nil {
@@ -797,6 +798,8 @@ func (r *SnapshotReconciler) closeWindow(ctx context.Context, snapshot string, f
 
 		return err
 	}
+
+	failOwed := r.failOwedOnClose(ctx, w, snapshot, failSnapshot, reason)
 
 	// The marker outlives the window until the Snapshot is settled. It
 	// stays claimed meanwhile, or the sweep would take it for one an
@@ -825,12 +828,14 @@ func (r *SnapshotReconciler) closeWindow(ctx context.Context, snapshot string, f
 	return nil
 }
 
-// failOnClose stamps this node Failed for a window that ends without a
-// snapshot, unless its take already stamped Ready, and reports whether
-// the stamp is still owed. The check and the stamp run under the
-// window's stampMu, which the take holds across its own check and
-// stamp.
-func (r *SnapshotReconciler) failOnClose(
+// failOwedOnClose reports whether a window that ends without a
+// snapshot owes this node's Failed stamp: it does unless its take
+// already stamped Ready. It runs after the resume and writes nothing,
+// so neither the API server nor a take holding stampMu across its own
+// stamp can keep I/O suspended; settleResumed stamps what is owed. A
+// take that returns from here on sees the window closing and discards
+// its verdict, so the answer cannot change once it is given.
+func (*SnapshotReconciler) failOwedOnClose(
 	ctx context.Context, w *snapshotWindow, snapshot string, failSnapshot bool, reason string,
 ) bool {
 	if !failSnapshot {
@@ -844,20 +849,10 @@ func (r *SnapshotReconciler) failOnClose(
 		return false
 	}
 
-	logger := log.FromContext(ctx).WithValues("snapshot", snapshot)
-	logger.Info("closing snapshot suspend window without a snapshot", "reason", reason)
+	log.FromContext(ctx).Info("closed snapshot suspend window without a snapshot",
+		"snapshot", snapshot, "reason", reason)
 
-	snap := &blockstoriov1alpha1.Snapshot{}
-	snap.Name = snapshot
-
-	err := r.stampSnapshotPerNodeFailed(ctx, snap)
-	if err != nil {
-		logger.Info("stamp Failed on window close; retried after the resume", "error", err.Error())
-
-		return true
-	}
-
-	return false
+	return true
 }
 
 // resumeLeftover resumes a window this process did not open: a marker
