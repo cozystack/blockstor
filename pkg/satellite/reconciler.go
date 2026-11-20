@@ -2291,7 +2291,32 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 		return nil
 	}
 
-	return errors.Wrapf(os.WriteFile(resPath, []byte(body), resFilePerm), "write %s", resPath)
+	return r.installResFile(ctx, resPath, body)
+}
+
+// ResFileCandidateSuffix names the file a new .res body is written to
+// before it replaces the live one. It must not end in .res: drbd.conf
+// includes drbd.d/*.res, and a candidate that matched would be parsed as
+// a second definition of the resource by every drbdadm call on the node.
+const ResFileCandidateSuffix = ".res.tmp"
+
+// installResFile puts body at resPath in one rename.
+//
+// drbdadm parses every .res on the node for any command, whichever
+// resource it is run for, and the satellite applies several resources at
+// once. Rewritten in place, a .res is empty or half written for a moment,
+// and a drbdadm for another resource that reads it then would refuse the
+// configuration. Renamed into place, a reader sees the old body or the
+// new one, the way LINSTOR moves its .res_tmp over the .res.
+func (r *Reconciler) installResFile(_ context.Context, resPath, body string) error {
+	candidate := strings.TrimSuffix(resPath, ".res") + ResFileCandidateSuffix
+
+	err := os.WriteFile(candidate, []byte(body), resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "write %s", candidate)
+	}
+
+	return errors.Wrapf(os.Rename(candidate, resPath), "install %s", resPath)
 }
 
 // applyDRBD renders the .res file from dr's metadata and (re)applies
