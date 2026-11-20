@@ -260,6 +260,19 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 		return r.refuseReopen(ctx, snap)
 	}
 
+	// What the take needs from the API is read before the suspend, so
+	// the take inside the window is the storage command alone, as in
+	// LINSTOR, and a node that would refuse the take refuses it without
+	// freezing anything.
+	refused, err := r.refusesUnrecordedLUKSKey(ctx, snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if refused {
+		return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
+	}
+
 	err = r.openWindow(ctx, snap)
 
 	switch {
@@ -417,7 +430,7 @@ func (r *SnapshotReconciler) takeWithoutWindow(ctx context.Context, snap *blocks
 	r.Config.Apply.FlushStorageDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName),
 		snapshotVolumeNumbers(snap))
 
-	verdict, createdAt, err := r.takeVerdict(ctx, snap)
+	verdict, createdAt, err := r.takeVerdict(ctx, snap, true)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -441,26 +454,28 @@ const (
 // takeVerdict invokes provider.CreateSnapshot via the satellite
 // Reconciler and classifies the result the way the pre-Bug-351
 // single-step path did (Bug 106 / F18): Ok, a transient failure worth
-// retrying, or a terminal one. It stamps nothing.
-func (r *SnapshotReconciler) takeVerdict(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (takeOutcome, int64, error) {
+// retrying, or a terminal one. It stamps nothing. checkLUKS reads
+// whether the snapshot records this replica's LUKS password; a take in
+// a suspend window passes false, its window was opened only after that
+// read.
+func (r *SnapshotReconciler) takeVerdict(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, checkLUKS bool,
+) (takeOutcome, int64, error) {
 	req := &intent.CreateSnapshotRequest{
 		ResourceName:  naming.Key(snap.Spec.ResourceDefinitionName),
 		SnapshotName:  snap.Spec.SnapshotName,
 		VolumeNumbers: snapshotVolumeNumbers(snap),
 	}
 
-	missing, err := r.unrecordedLUKSKey(ctx, snap, req.VolumeNumbers)
-	if err != nil {
-		return takeTransient, 0, err
-	}
+	if checkLUKS {
+		refused, err := r.refusesUnrecordedLUKSKey(ctx, snap)
+		if err != nil {
+			return takeTransient, 0, err
+		}
 
-	if missing != "" {
-		// The snapshot's bytes on this node would be encrypted under a
-		// password it does not record, so they could never be restored.
-		log.FromContext(ctx).Info("refusing to take a snapshot that does not record this replica's LUKS password",
-			"snapshot", snap.Spec.SnapshotName, "volume", missing)
-
-		return takeTerminal, 0, nil
+		if refused {
+			return takeTerminal, 0, nil
+		}
 	}
 
 	resp, err := r.Config.Apply.CreateSnapshot(ctx, req)
@@ -482,6 +497,26 @@ func (r *SnapshotReconciler) takeVerdict(ctx context.Context, snap *blockstoriov
 	}
 
 	return takeTerminal, 0, nil
+}
+
+// refusesUnrecordedLUKSKey reports whether this node must refuse the
+// take because the snapshot does not record the LUKS password of the
+// replica it would copy: the copy would be encrypted under a password
+// nothing keeps, so it could never be restored.
+func (r *SnapshotReconciler) refusesUnrecordedLUKSKey(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (bool, error) {
+	missing, err := r.unrecordedLUKSKey(ctx, snap, snapshotVolumeNumbers(snap))
+	if err != nil {
+		return false, err
+	}
+
+	if missing == "" {
+		return false, nil
+	}
+
+	log.FromContext(ctx).Info("refusing to take a snapshot that does not record this replica's LUKS password",
+		"snapshot", snap.Spec.SnapshotName, "volume", missing)
+
+	return true, nil
 }
 
 // perNodeStatusSuspendIOAcked reports whether the NodeStatus

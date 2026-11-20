@@ -1039,7 +1039,7 @@ func (r *SnapshotReconciler) runTake(
 	logger := log.FromContext(parent).WithValues("snapshot", snap.Name)
 	ctx = log.IntoContext(ctx, logger)
 
-	verdict, createdAt, err := r.takeVerdict(ctx, snap)
+	verdict, createdAt, err := r.takeVerdict(ctx, snap, false)
 	retry := verdict == takeTransient || err != nil
 
 	w.stampMu.Lock()
