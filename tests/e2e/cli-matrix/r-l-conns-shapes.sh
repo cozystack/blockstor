@@ -261,16 +261,17 @@ wait_conns_ok "$RD_TB" "$tb_node" "$N2" 60
 # ----------------------------------------------------------------------
 # Sub-test D — SyncTarget / SyncSource render shape (known-delta #85)
 #
-# A replica actively receiving data renders `SyncTarget(NN.NN%)` and
-# the source `SyncSource(NN.NN%)`, the percent being DRBD's per-peer
-# `done` for that resync, as LINSTOR shows it (Bug 348 / Bug B).
+# A replica actively receiving data renders `SyncTarget(NN.NN%)`, the
+# percent being DRBD's per-peer `done` for that resync, as LINSTOR
+# shows it (Bug B). Without a `done` it keeps its disk state
+# (Inconsistent), as LINSTOR's DrbdVolume.diskStateInfo does.
 #
-# KNOWN DELTA (docs/cli-parity-known-deltas.md row 85): while
-# drbdsetup prints no `done` for the resync (between the replication
-# state change and the first progress frame), BS renders the BARE
-# literal `SyncSource` / `SyncTarget` rather than a made-up percent.
-# So this cell asserts: a Sync* token may appear EITHER bare OR with a
-# `(NN.NN%)` suffix, and never as the old stuck `UpToDate(NN%)`.
+# KNOWN DELTA (docs/cli-parity-known-deltas.md row 85): the source
+# side renders the BARE literal `SyncSource` where LINSTOR keeps
+# `UpToDate` (Bug 348). It never carries a percent, as LINSTOR puts
+# none on the source side. So this cell asserts: SyncTarget only with
+# a `(NN.NN%)` suffix, SyncSource only bare, and never the old stuck
+# `UpToDate(NN%)`.
 #
 # We dirty the bitmap (write data on the primary), then add a second
 # diskful replica so its initial resync is a real non-instant
@@ -278,7 +279,7 @@ wait_conns_ok "$RD_TB" "$tb_node" "$N2" 60
 # is best-effort (the sync can finish fast on a small stand).
 # ----------------------------------------------------------------------
 
-echo ">> [331.D / delta #85] SyncTarget/SyncSource render (bare OR (NN%), never UpToDate(NN%))"
+echo ">> [331.D / delta #85] SyncTarget(NN.NN%) / bare SyncSource render, never UpToDate(NN%)"
 
 RD_SYNC=cli-matrix-348-syncpct
 delete_rd "$RD_SYNC" 2>/dev/null || true
@@ -319,12 +320,17 @@ while (( $(date +%s) < deadline )); do
         exit 1
     fi
 
-    # A Sync* token is the contract: accept it BOTH bare (delta #85:
-    # no `done` reported yet) AND with a (NN.NN%) suffix. Either shape
-    # proves the resync window rendered correctly.
-    if grep -qE '^(SyncTarget|SyncSource)(\([0-9]+(\.[0-9]+)?%\))?$' <<<"$state"; then
+    # SyncSource with a percent or a bare SyncTarget is not a shape
+    # LINSTOR or delta #85 allows.
+    if grep -qE '^(SyncSource\(.*|SyncTarget)$' <<<"$state"; then
+        echo "FAIL (331.D / delta #85): Sync* literal in a shape LINSTOR never shows:" >&2
+        echo "$state" >&2
+        exit 1
+    fi
+
+    if grep -qE '^(SyncTarget\([0-9]+\.[0-9]{2}%\)|SyncSource)$' <<<"$state"; then
         sync_observed=1
-        echo "   observed Sync* literal (bare or with progress): $(grep -E '^(SyncTarget|SyncSource)' <<<"$state" | head -1)"
+        echo "   observed Sync* render: $(grep -E '^(SyncTarget|SyncSource)' <<<"$state" | head -1)"
         break
     fi
 
@@ -343,4 +349,4 @@ fi
 delete_rd "$RD_SYNC" 2>/dev/null || true
 assert_no_orphans "$RD_SYNC" 2>/dev/null || true
 
-echo ">> r-l-conns-shapes OK (Bug 331: Healthy / Diskless / TieBreaker; Bug 348/A/B: UpToDate bare, Sync* carries (NN%))"
+echo ">> r-l-conns-shapes OK (Bug 331: Healthy / Diskless / TieBreaker; Bug 348/A/B: UpToDate bare, SyncTarget carries (NN.NN%), SyncSource bare)"

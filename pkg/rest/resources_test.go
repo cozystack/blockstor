@@ -1380,8 +1380,11 @@ func eligibleAffinityNodes(rs []apiv1.ResourceWithVolumes) []string {
 // replica's OutOfSyncKib can be > 0 toward a still-syncing peer; it
 // once rendered `UpToDate(22%)`.
 //
-// Bug B: SyncSource / SyncTarget carry the resync progress (Bug 348
-// promoted the literals and once stripped the percent).
+// Bug B: SyncTarget carries the resync progress (Bug 348 promoted the
+// literals and once stripped the percent). SyncSource stays a bare
+// literal: LINSTOR puts no percentage on the source side, and only
+// shows SyncTarget(NN%) when DRBD reported a `done`; without one it
+// keeps the disk state.
 //
 // Multi-peer resync: the progress is DRBD's per-peer `done`, never one
 // derived from the volume-wide OutOfSyncKib. A replica that finished a
@@ -1402,7 +1405,7 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 
 	cases := []tc{
 		{
-			name: "source side mid-sync renders SyncSource with done (Bug B)",
+			name: "source side mid-sync renders a bare SyncSource, no percent as in LINSTOR",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
 				State: apiv1.VolumeState{
@@ -1412,7 +1415,7 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 					},
 				},
 			},
-			want: "SyncSource(50.00%)",
+			want: "SyncSource",
 		},
 		{
 			name: "target side mid-sync renders SyncTarget with done (Bug B)",
@@ -1446,7 +1449,7 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 			want: "SyncTarget(50.31%)",
 		},
 		{
-			name: "SyncTarget without done stays a bare literal, never a size-derived percent",
+			name: "SyncTarget without done keeps the disk state, as LINSTOR's diskStateInfo",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
 				State: apiv1.VolumeState{
@@ -1457,7 +1460,7 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 					},
 				},
 			},
-			want: "SyncTarget",
+			want: "Inconsistent",
 		},
 		{
 			name: "UpToDate with OutOfSyncKib>0 toward a syncing peer stays bare (Bug A)",
@@ -1512,7 +1515,7 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 			want: "Inconsistent",
 		},
 		{
-			name: "3-replica mixed: SyncSource peer wins over Established peer, with its done",
+			name: "3-replica mixed: SyncSource peer wins over Established peer, bare",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
 				State: apiv1.VolumeState{
@@ -1524,7 +1527,37 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 					},
 				},
 			},
-			want: "SyncSource(12.34%)",
+			want: "SyncSource",
+		},
+		{
+			// LINSTOR shows SyncTarget(done) whenever a peer in
+			// SyncTarget reported a done, whatever the other peers do.
+			name: "SyncTarget with done wins over a SyncSource peer",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState: "Inconsistent",
+					ReplicationStates: map[string]apiv1.ReplicationState{
+						"peer-b": {ReplicationState: "SyncSource", DonePercentage: ptrFloat(80)},
+						"peer-c": {ReplicationState: "SyncTarget", DonePercentage: ptrFloat(20.5)},
+					},
+				},
+			},
+			want: "SyncTarget(20.50%)",
+		},
+		{
+			name: "SyncTarget without done next to a SyncSource peer renders the bare SyncSource",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState: "Inconsistent",
+					ReplicationStates: map[string]apiv1.ReplicationState{
+						"peer-b": {ReplicationState: "SyncSource"},
+						"peer-c": {ReplicationState: "SyncTarget"},
+					},
+				},
+			},
+			want: "SyncSource",
 		},
 	}
 
@@ -1549,58 +1582,41 @@ func ptrFloat(v float64) *float64 {
 	return &v
 }
 
-// TestActiveSyncReplicationState exercises the small helper in
-// isolation: source preference, target fallback, ignore-others, and
-// the nil-map fast path. Behaviour is locked here because Bug 348's
-// "literal token wins over (NN%)" gate funnels every replica through
-// this helper.
-func TestActiveSyncReplicationStateBug348(t *testing.T) {
+// TestHasReplicationStateBug348 exercises the small helper in
+// isolation: an exact match on any peer, nothing else promoted.
+func TestHasReplicationStateBug348(t *testing.T) {
 	t.Parallel()
 
 	type tc struct {
 		name   string
 		states map[string]apiv1.ReplicationState
-		want   string
+		want   bool
 	}
 
 	cases := []tc{
-		{name: "nil map", states: nil, want: ""},
-		{name: "empty map", states: map[string]apiv1.ReplicationState{}, want: ""},
+		{name: "nil map", states: nil, want: false},
+		{name: "empty map", states: map[string]apiv1.ReplicationState{}, want: false},
 		{
 			name: "single SyncSource peer",
 			states: map[string]apiv1.ReplicationState{
 				"b": {ReplicationState: "SyncSource"},
 			},
-			want: "SyncSource",
+			want: true,
 		},
 		{
-			name: "single SyncTarget peer",
-			states: map[string]apiv1.ReplicationState{
-				"a": {ReplicationState: "SyncTarget"},
-			},
-			want: "SyncTarget",
-		},
-		{
-			name: "Established only — not promoted",
-			states: map[string]apiv1.ReplicationState{
-				"b": {ReplicationState: "Established"},
-			},
-			want: "",
-		},
-		{
-			name: "PausedSyncS not promoted — Bug 348 scope is the two literal tokens only",
-			states: map[string]apiv1.ReplicationState{
-				"b": {ReplicationState: "PausedSyncS"},
-			},
-			want: "",
-		},
-		{
-			name: "SyncSource wins over SyncTarget in the same map",
+			name: "SyncSource among other peers",
 			states: map[string]apiv1.ReplicationState{
 				"b": {ReplicationState: "SyncTarget"},
 				"c": {ReplicationState: "SyncSource"},
 			},
-			want: "SyncSource",
+			want: true,
+		},
+		{
+			name: "PausedSyncS is not SyncSource",
+			states: map[string]apiv1.ReplicationState{
+				"b": {ReplicationState: "PausedSyncS"},
+			},
+			want: false,
 		},
 	}
 
@@ -1608,8 +1624,8 @@ func TestActiveSyncReplicationStateBug348(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := activeSyncReplicationState(c.states); got != c.want {
-				t.Errorf("activeSyncReplicationState(%+v) = %q, want %q",
+			if got := hasReplicationState(c.states, "SyncSource"); got != c.want {
+				t.Errorf("hasReplicationState(%+v, SyncSource) = %v, want %v",
 					c.states, got, c.want)
 			}
 		})

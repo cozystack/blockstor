@@ -38,8 +38,8 @@ import (
 // resync is in flight when nothing is moving.
 //
 // annotateSyncProgress only promotes to the `SyncTarget` literal when
-// activeSyncReplicationState finds a peer actually reporting
-// `SyncTarget` (see resources.go). Without that token the real
+// a peer actually reports `SyncTarget` with a `done` (see
+// resources.go). Without that token the real
 // DiskState (`Inconsistent`) stays, bare, as LINSTOR shows it: a large
 // OutOfSyncKib adds no percentage and no SyncTarget label.
 func TestU203InconsistentWithoutSyncNeverShowsSyncTarget(t *testing.T) {

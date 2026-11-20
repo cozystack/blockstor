@@ -356,8 +356,8 @@ const diskStateUpToDate = "UpToDate"
 // replicationStateSyncSource / replicationStateSyncTarget are the
 // two transient drbd-9 replication-state tokens promoted to literal
 // State-column values by Bug 348. Constants because the literal is
-// used both in the activeSyncReplicationState gate and as the
-// returned override token — one source of truth keeps the gate and
+// used both as the replication-state match and as the returned
+// override token — one source of truth keeps the gate and
 // the rendered output from ever disagreeing.
 const (
 	replicationStateSyncSource = "SyncSource"
@@ -524,21 +524,21 @@ func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[s
 // percentage being DRBD's own `done` for the resync with that peer.
 //
 // LINSTOR's satellite overrides a volume's disk state with
-// `SyncTarget(<done>%)` whenever a peer-device frame in SyncTarget
-// carries `done` (DrbdVolume.update / diskStateInfo), and shows no
-// percentage anywhere else. blockstor used to compute one from the
-// volume-wide OutOfSyncKib and the volume size instead, on every
-// non-terminal state. That number is wrong on exactly the replica an
-// operator watches: OutOfSyncKib is whichever peer-device frame came
-// last, so a replica that finished a small resync from one peer and
-// then ran a full one from another showed `Inconsistent(99%)` while
-// the kernel said `done:50.31`.
+// `SyncTarget(<done>%)` only when a peer is in SyncTarget AND its
+// frame carried `done` (DrbdVolume.diskStateInfo); without a `done`
+// it keeps the disk state, and it shows no percentage anywhere else.
+// blockstor used to compute one from the volume-wide OutOfSyncKib and
+// the volume size instead, on every non-terminal state. That number is
+// wrong on exactly the replica an operator watches: OutOfSyncKib is
+// whichever peer-device frame came last, so a replica that finished a
+// small resync from one peer and then ran a full one from another
+// showed `Inconsistent(99%)` while the kernel said `done:50.31`.
 //
-// Bug 348 keeps one blockstor addition: the source side shows the
-// `SyncSource` literal, where LINSTOR keeps `UpToDate`. Its percentage
-// now comes from `done` too. Without a `done` the literal stays bare.
-// Other replication states (PausedSync*, VerifyS/T, Ahead, Behind,
-// Off, WFBitMap*) keep the observed disk state, bare, as in LINSTOR.
+// Bug 348 keeps one blockstor addition: the source side shows the bare
+// `SyncSource` literal, where LINSTOR keeps `UpToDate`. It carries no
+// percentage, as LINSTOR puts none on the source side. Other
+// replication states (PausedSync*, VerifyS/T, Ahead, Behind, Off,
+// WFBitMap*) keep the observed disk state, bare, as in LINSTOR.
 func annotateSyncProgress(volumes []apiv1.Volume) []apiv1.Volume {
 	if len(volumes) == 0 {
 		return volumes
@@ -548,55 +548,30 @@ func annotateSyncProgress(volumes []apiv1.Volume) []apiv1.Volume {
 	copy(out, volumes)
 
 	for i := range out {
-		syncLiteral := activeSyncReplicationState(out[i].State.ReplicationStates)
-		if syncLiteral == "" {
+		if done, ok := out[i].State.SyncProgress(replicationStateSyncTarget); ok {
+			out[i].State.DiskState = apiv1.SyncProgressState(replicationStateSyncTarget, done)
+
 			continue
 		}
 
-		out[i].State.DiskState = syncLiteral
-
-		if done, ok := out[i].State.SyncProgress(syncLiteral); ok {
-			out[i].State.DiskState = apiv1.SyncProgressState(syncLiteral, done)
+		if hasReplicationState(out[i].State.ReplicationStates, replicationStateSyncSource) {
+			out[i].State.DiskState = replicationStateSyncSource
 		}
 	}
 
 	return out
 }
 
-// activeSyncReplicationState returns `SyncSource` or `SyncTarget`
-// when at least one peer in the per-peer ReplicationStates map
-// reports one of those tokens. Returns the empty string when no
-// peer is actively syncing — the legacy `(NN%)` annotation path
-// then takes over. Source wins over target when both are present
-// in the same map (3+ replica topology where one peer is mid-sync
-// to us and another is mid-sync from us — vanishingly rare in
-// practice, but the deterministic preference keeps the column
-// stable across calls). Only `SyncSource` and `SyncTarget` qualify
-// here; PausedSync* / VerifyS/T / Ahead / Behind / Off / WFBitMap*
-// are intentionally NOT promoted to literals because upstream
-// LINSTOR's CLI renders them via a different code path and Bug 348
-// is scoped to the two transient sync states only.
-func activeSyncReplicationState(states map[string]apiv1.ReplicationState) string {
-	if len(states) == 0 {
-		return ""
-	}
-
-	var sawTarget bool
-
+// hasReplicationState reports whether any peer in the per-peer
+// ReplicationStates map is in the given replication state.
+func hasReplicationState(states map[string]apiv1.ReplicationState, want string) bool {
 	for _, state := range states {
-		switch state.ReplicationState {
-		case replicationStateSyncSource:
-			return replicationStateSyncSource
-		case replicationStateSyncTarget:
-			sawTarget = true
+		if state.ReplicationState == want {
+			return true
 		}
 	}
 
-	if sawTarget {
-		return replicationStateSyncTarget
-	}
-
-	return ""
+	return false
 }
 
 // multiValueQuery returns the union of all values for a query
