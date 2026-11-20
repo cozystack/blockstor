@@ -907,7 +907,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	// missing mapper (delete-after-restart, never opened) is fine.
 	if r.cfg.Cryptsetup != nil {
 		for _, n := range req.GetVolumeNumbers() {
-			_ = r.cfg.Cryptsetup.Close(ctx, luksMapperName(req.GetName(), n))
+			r.closeLUKSMappers(ctx, req.GetName(), n)
 		}
 	}
 
@@ -1202,9 +1202,9 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, 
 	mapperGrew := false
 
 	for vol, dev := range devices {
-		dmName := luksMapperName(dr.GetName(), vol)
+		dmName, active := r.luksMapperOf(ctx, dr.GetName(), vol, dev)
 
-		if r.luksMapperSettled(ctx, dmName, dev, resized) {
+		if r.luksMapperSettled(ctx, dmName, dev, active, resized) {
 			out[vol] = luks.DevicePath(dmName)
 
 			continue
@@ -1232,14 +1232,40 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, 
 	return out, mapperGrew, nil
 }
 
+// luksMapperOf names the dm-crypt mapper vol runs on, and whether it is
+// open. That is blockstor's own, unless dev is still held by the mapper
+// LINSTOR opened before the cluster was adopted: that one is kept, under
+// LINSTOR's name, for as long as it stays open. Opening blockstor's name
+// beside it fails, since the device is in use, and closing it to reopen
+// under another name would pull the disk out from under a live DRBD
+// device. The switch happens when blockstor itself next takes the
+// replica down and closes the mapper (closeLUKSMappers).
+//
+// LINSTOR's mapper is taken only when the live device-mapper table shows
+// a crypt target over dev itself, so a name that merely matches is not
+// enough.
+func (r *Reconciler) luksMapperOf(ctx context.Context, rdName string, vol int32, dev string) (string, bool) {
+	own := luksMapperName(rdName, vol)
+	if r.cfg.Cryptsetup.IsActive(ctx, own) {
+		return own, true
+	}
+
+	adopted := linstorLUKSMapperName(rdName, vol)
+	if r.cfg.Cryptsetup.MapsDevice(ctx, adopted, dev) {
+		return adopted, true
+	}
+
+	return own, false
+}
+
 // luksMapperSettled reports whether dmName is already open and has nothing
 // to grow, so the reconcile needs no password for it. Only opening,
 // formatting and resizing take the password: reading it costs API reads
 // and, on a cold cache, an Argon2id unlock, and on a locked cluster it
 // fails. An open mapper keeps serving whether or not the master key is
 // unlocked, so its replica reconciles as usual.
-func (r *Reconciler) luksMapperSettled(ctx context.Context, dmName, dev string, resized bool) bool {
-	if resized || !r.cfg.Cryptsetup.IsActive(ctx, dmName) {
+func (r *Reconciler) luksMapperSettled(ctx context.Context, dmName, dev string, active, resized bool) bool {
+	if resized || !active {
 		return false
 	}
 
@@ -1457,6 +1483,23 @@ func luksMapperName(rdName string, vol int32) string {
 	return fmt.Sprintf("%s-%d-luks", rdName, vol)
 }
 
+// linstorLUKSMapperName is the name LINSTOR's satellite opens the same
+// volume's dm-crypt mapper under: a fixed prefix, the resource name and
+// the volume number padded to five digits. A replica adopted from LINSTOR
+// can still be running on it (luksMapperOf).
+func linstorLUKSMapperName(rdName string, vol int32) string {
+	return fmt.Sprintf("Linstor-Crypt-%s_%05d", rdName, vol)
+}
+
+// closeLUKSMappers closes vol's mapper under each name it can be open
+// under, once blockstor has taken DRBD off it. Best-effort: the name that
+// is not open fails, and the kernel refuses to close a mapper something
+// still holds, so a DRBD device that did not come down keeps its disk.
+func (r *Reconciler) closeLUKSMappers(ctx context.Context, rdName string, vol int32) {
+	_ = r.cfg.Cryptsetup.Close(ctx, luksMapperName(rdName, vol))
+	_ = r.cfg.Cryptsetup.Close(ctx, linstorLUKSMapperName(rdName, vol))
+}
+
 // needsDRBD reports whether the satellite should render a .res and
 // run drbdadm for this resource. Empty stack → default-true (legacy
 // + Phase-1..8 wire compatibility); explicit stack → only run DRBD
@@ -1540,6 +1583,18 @@ func (r *Reconciler) applyInactive(ctx context.Context, dr *intent.DesiredResour
 	if err != nil {
 		res.Ok = false
 		res.Message = err.Error()
+
+		return
+	}
+
+	// An inactive replica keeps blockstor's own mapper open, as it always
+	// has, but lets go of one LINSTOR left behind: with DRBD down nothing
+	// holds it, and closing it here is what moves the volume onto
+	// blockstor's name when the replica is activated again.
+	if r.cfg.Cryptsetup != nil && needsLUKS(dr.GetLayerStack()) {
+		for _, vol := range dr.GetVolumes() {
+			_ = r.cfg.Cryptsetup.Close(ctx, linstorLUKSMapperName(dr.GetName(), vol.GetVolumeNumber()))
+		}
 	}
 }
 
@@ -1607,7 +1662,7 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 		// the toggle.
 		if r.cfg.Cryptsetup != nil && needsLUKS(dr.GetLayerStack()) {
 			for _, vol := range dr.GetVolumes() {
-				_ = r.cfg.Cryptsetup.Close(ctx, luksMapperName(dr.GetName(), vol.GetVolumeNumber()))
+				r.closeLUKSMappers(ctx, dr.GetName(), vol.GetVolumeNumber())
 			}
 		}
 
