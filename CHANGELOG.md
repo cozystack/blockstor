@@ -4,6 +4,23 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.6 — 2026-11-20
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #298 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.5; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.5
+
+- **A rebooted node brings every local replica up before it repeats passes (#298).** A Resource this satellite process has not had a first pass for is queued ahead of every other pass, so the kernel and peer events of replicas already up no longer hold the rest back; the rank ends when the first pass starts, whatever it ends with.
+- **Periodic re-checks run one at a time and yield to real work (#295).** A converged replica's ten second re-check waits for a single slot, is held while a pass an event asked for runs, and is deferred without holding a worker, so new replicas provision and attach on time with eight workers.
+- **The peer watch ignores status churn (#295).** A peer's Resource starts a local pass only when something the local apply reads from it changes.
+- **The satellite logs how many resource passes ran, and why, once a minute (#295).**
+- **`r l` no longer shows healthy replicas as `Unknown` (#297).** Every observer status write carries its whole cached view of the replica, so a connection or statistics frame no longer drops the disk state, GI and quorum through server-side apply.
+- **Resync progress keeps up with the kernel (#297).** The observer reads events2 apart from its status writes and skips writes the apiserver already holds, so the 5 s resync no longer exhausts the client rate limit.
+- **Replica states no longer freeze after a reboot (#297).** The observer restarts the events2 stream when it ends, reconciles its caches against the new dump, and clears a replica the kernel no longer has.
+- **The observer publishes no GI it could not read (#297).** A GI kept from an earlier read is dropped when a later read fails, the volume leaves the data-bearing states, or its backing device changes.
+- **A snapshot's suspend window holds only suspend, take and resume (#282).** The LUKS password check runs before the node suspends and only for a stack that can carry LUKS, and the resume follows the take at once.
+- **A suspend window that ends unused is resumed before its status is written, and a closing window's marker is kept from the sweep (#282).**
+
 ## v0.4.0-alpha.5 — 2026-11-20
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #296 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.4; the entries below are what changed since.
