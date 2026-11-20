@@ -461,7 +461,16 @@ func (r *zfsSendReader) Close() error {
 // permanently sparse-thick across reconciles. Even on the
 // idempotent-skip path, ensureRefreservation is called so the thick
 // guarantee is restored on every reconcile.
-func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, _ storage.Snapshot, src io.Reader) error {
+//
+// The stream is a full send of the source snapshot, so `zfs recv` leaves a
+// copy of that snapshot on the new zvol. No Snapshot of the restored
+// resource names it, so nothing would ever delete it, and a zvol that has a
+// snapshot is renamed rather than destroyed when its replica goes: the
+// restored volume's delete left `_deleted_<zvol>_<time>` and its snapshot
+// behind for good. It is removed once the receive is done, as LINSTOR's
+// clone service removes every snapshot of a volume it filled by send and
+// receive (CloneService.doZFSCloneTargetCleanup).
+func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, source storage.Snapshot, src io.Reader) error {
 	tgtDS := p.volumeDataset(target)
 
 	// Strict probe: `zfs recv -F` over a dataset that exists, and the
@@ -487,6 +496,11 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, _ st
 		_, _ = p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
 
 		return errors.Wrapf(err, "zfs recv %s: %s", tgtDS, strings.TrimSpace(string(out)))
+	}
+
+	err = p.dropReceivedSnapshot(ctx, tgtDS+"@"+source.SnapshotName)
+	if err != nil {
+		return err
 	}
 
 	// THICK mode: restore the space guarantee even if the peer sender

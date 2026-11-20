@@ -261,6 +261,28 @@ func (p *Provider) destroyIfReleased(ctx context.Context, snapshot string) (bool
 	return true, p.destroy(ctx, snapshot)
 }
 
+// dropReceivedSnapshot removes the snapshot a receive brought along with the
+// zvol it created. Only that one snapshot is touched: it is named after the
+// snapshot the stream was sent from, and the zvol did not exist before the
+// receive. It is marked before it is destroyed, so a destroy that fails
+// leaves it to the delete of the zvol, which destroys a marked snapshot
+// without clones instead of keeping the zvol for it. A snapshot that has
+// clones by now is not destroyed: ZFS refuses, and the mark keeps it for the
+// cascade of its last clone.
+func (p *Provider) dropReceivedSnapshot(ctx context.Context, snapshot string) error {
+	present, err := p.datasetPresent(ctx, snapshot)
+	if err != nil || !present {
+		return err
+	}
+
+	_, err = p.exec.Run(ctx, "zfs", "set", markedForDeletionProp+"=true", snapshot)
+	if err != nil {
+		return errors.Wrapf(err, "zfs set %s on received %s", markedForDeletionProp, snapshot)
+	}
+
+	return p.destroy(ctx, snapshot)
+}
+
 // markAndRename marks the dataset first and renames it second, as LINSTOR
 // does. A crash in between leaves a marked dataset under its old name, which
 // the retried delete marks and renames again.
