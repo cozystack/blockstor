@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/internal/controller"
 )
 
 // During a rollout a satellite or API server that predates
@@ -115,5 +116,31 @@ func TestSnapshotAbortConditionIsNeverRecordedSuccessful(t *testing.T) {
 
 	if !hasFlag(got, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect) {
 		t.Errorf("the abort condition did not end the take failed: flags=%v", got.Status.Flags)
+	}
+}
+
+// An auto-snapshot created before auto-snapshots named their nodes was
+// never taken anywhere. It is recorded FAILED so it has an outcome, and
+// the pruner, which deletes only finished takes, can delete it. Any
+// other snapshot without nodes is left alone.
+func TestSnapshotNodelessAutoSnapshotIsRecordedFailed(t *testing.T) {
+	t.Parallel()
+
+	auto := completedSnapshot("auto-snap-00001", nil)
+	auto.Labels = map[string]string{controller.LabelAutoSnapshot: "true"}
+
+	other := completedSnapshot("manual", nil)
+
+	r, cli := successfulFixture(t, auto, other)
+
+	reconcileSnapshot(t, r, auto.Name)
+	reconcileSnapshot(t, r, other.Name)
+
+	if got := getSnap(t, cli, auto.Name); !hasFlag(got, blockstoriov1alpha1.SnapshotStatusFlagFailed) {
+		t.Errorf("a nodeless auto-snapshot has no outcome: flags=%v", got.Status.Flags)
+	}
+
+	if got := getSnap(t, cli, other.Name); len(got.Status.Flags) != 0 {
+		t.Errorf("a nodeless snapshot that is not automatic was stamped: flags=%v", got.Status.Flags)
 	}
 }

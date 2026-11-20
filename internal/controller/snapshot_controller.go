@@ -161,7 +161,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// unreachable in production; defensive guard so a hand-crafted
 	// Snapshot CRD with no Spec.Nodes doesn't hang the controller.
 	if len(snap.Spec.Nodes) == 0 {
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.failNodelessAutoSnapshot(ctx, &snap)
 	}
 
 	// The take is over on every node and every node confirmed the
@@ -862,6 +862,20 @@ func abortRecorded(snap *blockstoriov1alpha1.Snapshot) bool {
 // controller recorded an abort, or its status carries an outcome.
 func takeEnded(snap *blockstoriov1alpha1.Snapshot) bool {
 	return abortRecorded(snap) || slices.ContainsFunc(snap.Status.Flags, isSnapshotOutcomeFlag)
+}
+
+// failNodelessAutoSnapshot records FAILED on an auto-snapshot created
+// before auto-snapshots named their nodes. No satellite ever took it,
+// so it would otherwise stay without an outcome for good, and the
+// pruner, which deletes only finished takes, would keep it past the
+// budget. Any other Snapshot without nodes is left alone.
+func (r *SnapshotReconciler) failNodelessAutoSnapshot(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) error {
+	if snap.Labels[LabelAutoSnapshot] != labelTrueValue || takeEnded(snap) {
+		return nil
+	}
+
+	return r.stampSnapshotFailure(ctx, snap, blockstoriov1alpha1.SnapshotStatusFlagFailed,
+		"snapshot aborted: auto-snapshot created with no node to take it on; nothing was taken")
 }
 
 // allNodesSuspendAcked reports whether every targeted node has
