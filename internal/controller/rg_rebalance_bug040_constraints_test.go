@@ -89,6 +89,8 @@ func seedBug040RebalanceFixture(
 		},
 		Annotations: map[string]string{
 			apiv1.AnnotationRGRebalancePending: "2026-06-13T00:00:00Z",
+			// The `rg modify` behind it raised the place count.
+			apiv1.AnnotationRGRebalancePlaceCount: "2026-06-13T00:00:00Z",
 		},
 	}); err != nil {
 		t.Fatalf("seed rg: %v", err)

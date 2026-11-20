@@ -319,6 +319,64 @@ func TestRGModifyStampsRebalanceAnnotationOnPlaceCountIncrease(t *testing.T) {
 	}
 }
 
+// TestRGModifyMarksOnlyAPlaceCountRaise: the rebalance pass places
+// without the balance checks only for a raised place count, the one
+// change LINSTOR's own `rg modify` places replicas for. A modify that
+// changes a placement constraint alone still schedules a rebalance,
+// but without the place-count marker, so a definition kept only by its
+// snapshots gets no fresh replicas from it. A raise landing on top of
+// an earlier constraint-only modify keeps the marker; a later
+// constraint-only modify does not clear it.
+func TestRGModifyMarksOnlyAPlaceCountRaise(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	steps := []struct {
+		name       string
+		filter     apiv1.AutoSelectFilter
+		wantMarker bool
+	}{
+		{name: "layer stack only", filter: apiv1.AutoSelectFilter{LayerStack: []string{"DRBD", "STORAGE"}}, wantMarker: false},
+		{name: "place count raised", filter: apiv1.AutoSelectFilter{PlaceCount: 3}, wantMarker: true},
+		{name: "replicas on same only", filter: apiv1.AutoSelectFilter{ReplicasOnSame: []string{"Aux/zone"}}, wantMarker: true},
+	}
+
+	for _, step := range steps {
+		body, _ := json.Marshal(apiv1.ResourceGroup{SelectFilter: step.filter})
+
+		resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status: got %d, want 200", step.name, resp.StatusCode)
+		}
+
+		got, err := st.ResourceGroups().Get(ctx, "rg-1")
+		if err != nil {
+			t.Fatalf("%s: Get: %v", step.name, err)
+		}
+
+		if _, ok := got.Annotations[apiv1.AnnotationRGRebalancePending]; !ok {
+			t.Fatalf("%s: rebalance not scheduled; annotations=%v", step.name, got.Annotations)
+		}
+
+		if _, ok := got.Annotations[apiv1.AnnotationRGRebalancePlaceCount]; ok != step.wantMarker {
+			t.Fatalf("%s: place-count marker present=%v, want %v; annotations=%v",
+				step.name, ok, step.wantMarker, got.Annotations)
+		}
+	}
+}
+
 // TestRGModifyNoAnnotationOnPlaceCountDecrease: scale-DOWN is not a
 // rebalance trigger. Upstream LINSTOR's rebalance is strictly
 // additive — shedding replicas requires explicit `linstor r d`. So a

@@ -271,7 +271,12 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 				existing.Annotations = map[string]string{}
 			}
 
-			existing.Annotations[apiv1.AnnotationRGRebalancePending] = time.Now().UTC().Format(time.RFC3339Nano)
+			stamp := time.Now().UTC().Format(time.RFC3339Nano)
+			existing.Annotations[apiv1.AnnotationRGRebalancePending] = stamp
+
+			if existing.SelectFilter.PlaceCount > prevFilter.PlaceCount {
+				existing.Annotations[apiv1.AnnotationRGRebalancePlaceCount] = stamp
+			}
 		}
 
 		return nil
