@@ -1389,3 +1389,30 @@ func TestRestoreKeepsASnapshotNoReceiveRecorded(t *testing.T) {
 		t.Errorf("a snapshot no receive recorded was marked")
 	}
 }
+
+// A snapshot whose source volume was deleted on this node lives under the
+// renamed zvol, and the pool still holds it: the restore after the source
+// is gone is placed in the pool HasSnapshot names.
+func TestHasSnapshotFindsTheCopyOfADeletedZvol(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-a_00000", "tank/pvc-a_00000@s1")
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank"}, p)
+
+	err := prov.DeleteVolume(t.Context(), vol("pvc-a"))
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	deletedName(t, p, "tank/_deleted_pvc-a_00000_")
+
+	has, err := prov.HasSnapshot(t.Context(), snap("pvc-a", "s1"))
+	if err != nil || !has {
+		t.Errorf("HasSnapshot(s1) = %v, %v; want true under the renamed zvol", has, err)
+	}
+
+	has, err = prov.HasSnapshot(t.Context(), snap("pvc-a", "s2"))
+	if err != nil || has {
+		t.Errorf("HasSnapshot(s2) = %v, %v; want false", has, err)
+	}
+}
