@@ -137,6 +137,13 @@ type drbdsetupStatusResource struct {
 	// recovery-promote self-heal reads it to confirm the local node
 	// is not already Primary before re-arming the auto-primary seed.
 	Role string `json:"role"`
+	// The suspension reasons the kernel holds the resource's I/O for.
+	// RecheckQuorumAfterVolumeRemoval resumes a suspension that is
+	// about quorum alone, and none that another reason also holds.
+	SuspendedUser    bool `json:"suspended-user"`
+	SuspendedNoData  bool `json:"suspended-no-data"`
+	SuspendedFencing bool `json:"suspended-fencing"`
+	SuspendedQuorum  bool `json:"suspended-quorum"`
 	// Devices is the local per-volume state. The Bug 366
 	// recovery-promote reads `disk-state` to confirm THIS node is
 	// locally UpToDate (a viable SyncSource) before promoting.
@@ -157,6 +164,9 @@ type drbdsetupStatusDevice struct {
 	// target `drbdsetup new-current-uuid --clear-bitmap <minor>` at the
 	// specific stuck volume.
 	Minor int32 `json:"minor"`
+	// Quorum is whether DRBD counts the volume as having quorum. A
+	// pointer, so an output without the key is not read as false or true.
+	Quorum *bool `json:"quorum"`
 }
 
 // drbdsetupStatusConnection is one peer connection slot, as emitted by
@@ -392,4 +402,21 @@ func attachedVolumeSet(devices []drbdsetupStatusDevice) map[int32]struct{} {
 	}
 
 	return out
+}
+
+// drbdsetupShowResource is the part of `drbdsetup show <res> --json` the
+// quorum recheck reads. drbdsetup leaves an option at its default out, so
+// an empty string is the default: quorum off, on-no-quorum io-error,
+// on-no-data-accessible io-error and fencing dont-care.
+type drbdsetupShowResource struct {
+	Options struct {
+		Quorum     string `json:"quorum"`
+		OnNoQuorum string `json:"on-no-quorum"`
+		OnNoData   string `json:"on-no-data-accessible"`
+	} `json:"options"`
+	Connections []struct {
+		Net struct {
+			Fencing string `json:"fencing"`
+		} `json:"net"`
+	} `json:"connections"`
 }

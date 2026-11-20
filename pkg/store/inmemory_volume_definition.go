@@ -160,12 +160,16 @@ func (s *inMemoryVolumeDefinitions) Update(_ context.Context, rdName string, vd 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := vdKey{naming.Key(rdName), vd.VolumeNumber}
-	if _, exists := s.m[k]; !exists {
+	key := vdKey{naming.Key(rdName), vd.VolumeNumber}
+
+	prev, exists := s.m[key]
+	if !exists {
 		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
 	}
 
-	s.m[k] = *vd
+	next := *vd
+	keepDeleteMark(&prev, &next)
+	s.m[key] = next
 
 	return nil
 }
@@ -199,6 +203,7 @@ func (s *inMemoryVolumeDefinitions) PatchVolumeDefinitionSpec(_ context.Context,
 		return errors.Wrapf(err, "patch volume %d on resource definition %q", volumeNumber, rdName)
 	}
 
+	keepDeleteMark(&vd, &working)
 	s.m[key] = working
 
 	return nil
@@ -214,6 +219,27 @@ func (s *inMemoryVolumeDefinitions) Delete(_ context.Context, rdName string, vol
 	}
 
 	delete(s.m, k)
+
+	return nil
+}
+
+// RemoveDeleted is VolumeDefinitionStore.RemoveDeleted.
+func (s *inMemoryVolumeDefinitions) RemoveDeleted(_ context.Context, rdName string, volumeNumber int32, deleteID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := vdKey{naming.Key(rdName), volumeNumber}
+
+	vd, exists := s.m[key]
+	if !exists {
+		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
+	}
+
+	if !vd.Deleting() || vd.DeleteID != deleteID {
+		return errors.Wrapf(ErrVolumeDefinitionNotDeleting, "volume %d on resource definition %q", volumeNumber, rdName)
+	}
+
+	delete(s.m, key)
 
 	return nil
 }

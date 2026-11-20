@@ -106,6 +106,9 @@ func TestBug355VDDeleteCascadesSecondaryReplicas(t *testing.T) {
 		}
 	}
 
+	// Both satellites delete their volume and confirm.
+	fakeSatellites(t, st, rdName, nodeA, nodeB)
+
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
@@ -316,6 +319,9 @@ func TestBug355VDDeleteIdempotentOnRepeatedDelete(t *testing.T) {
 		t.Fatalf("seed Resource: %v", err)
 	}
 
+	// The replica's satellite deletes its volume and confirms.
+	fakeSatellites(t, st, rdName, nodeA)
+
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
@@ -354,7 +360,7 @@ func TestBug355VDDeleteIdempotentOnRepeatedDelete(t *testing.T) {
 			rcs[0].RetCode, maskWarn)
 	}
 
-	if !strings.Contains(rcs[0].Message, "already absent") {
-		t.Errorf("idempotent replay message: got %q, want 'already absent' marker", rcs[0].Message)
+	if !strings.HasSuffix(rcs[0].Message, " not found.") {
+		t.Errorf("idempotent replay message: got %q, want LINSTOR's not-found text", rcs[0].Message)
 	}
 }

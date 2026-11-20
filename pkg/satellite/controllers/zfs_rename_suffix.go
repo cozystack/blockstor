@@ -46,7 +46,14 @@ func snapshotRenameSuffixProp(node string) string { return zfs.SnapshotRenameSuf
 // reuses the suffix the Snapshots may already hold. Only a replica on a ZFS
 // pool is renamed, so only it gets one.
 func (r *ResourceReconciler) recordRenameSuffix(ctx context.Context, res *blockstoriov1alpha1.Resource) (string, error) {
-	pool := resolveDeleteStoragePool(res)
+	return r.recordRenameSuffixFor(ctx, res, resolveDeleteStoragePool(res))
+}
+
+// recordRenameSuffixFor is recordRenameSuffix for volumes in the named pool,
+// which is not the replica's own for a volume definition that names its own
+// pool. A volume definition delete records it the same way: LINSTOR's
+// controller does so for both before the satellite deletes anything.
+func (r *ResourceReconciler) recordRenameSuffixFor(ctx context.Context, res *blockstoriov1alpha1.Resource, pool string) (string, error) {
 	if pool == "" {
 		return "", nil
 	}
