@@ -35,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -142,6 +143,16 @@ type ResourceReconciler struct {
 	client.Client
 
 	Config Config
+
+	// recheck runs the periodic re-checks one at a time. SetupWithManager
+	// sets it and gates Reconcile through it; a test calling Reconcile
+	// directly goes around it.
+	recheck *recheckGate
+
+	// bringUp ranks the first pass of every local Resource in this
+	// process ahead of every other pass (bringUpQueue). SetupWithManager
+	// creates it.
+	bringUp *bringUpTracker
 }
 
 // Reconcile reads a Resource and drives the satellite-side
@@ -157,6 +168,8 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	err := r.Get(ctx, req.NamespacedName, &res)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.bringUp.forget(req.Name)
+
 			return ctrl.Result{}, nil
 		}
 
@@ -169,11 +182,20 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	// From here a pass of the replica counts as its first one, whatever
+	// it ends with, so it gives up the bring-up rank (bringUpTracker).
+	// A pass that only stamps the finalizer does not: the pass it
+	// requeues is the one that brings the replica up.
+	hasFinalizer := slices.Contains(res.Finalizers, SatelliteResourceFinalizer)
+	if hasFinalizer || !res.DeletionTimestamp.IsZero() {
+		r.bringUp.started(res.Name)
+	}
+
 	if !res.DeletionTimestamp.IsZero() {
 		return r.handleDelete(ctx, &res)
 	}
 
-	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
+	if !hasFinalizer {
 		res.Finalizers = append(res.Finalizers, SatelliteResourceFinalizer)
 
 		err := r.Update(ctx, &res)
@@ -266,19 +288,30 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.recheck = newRecheckGate()
+
+	if r.bringUp == nil {
+		r.bringUp = newBringUpTracker()
+	}
+
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
 			builder.WithPredicates(
 				predicate.And(
 					nodeNamePredicate(r.Config.NodeName),
 					primaryWatchPredicate(),
+					r.recheck.marker(),
 				),
 			)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueLocalSiblings))).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
-		Named("satellite-resource")
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(r.enqueueResourcesForRD))).
+		Named("satellite-resource").
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: r.Config.resourceWorkers(),
+			NewQueue:                newBringUpQueueFunc(r.bringUp, mgr.GetControllerOptions().Logger),
+		})
 
 	// Phase 11.7 second leg: the observer-trigger channel wakes
 	// this reconciler on kernel-state changes that produce no
@@ -290,11 +323,12 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// builder skips the raw-source registration entirely.
 	if r.Config.ReconcileTrigger != nil {
 		bldr = bldr.WatchesRawSource(
-			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{}),
+			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
+				source.WithPredicates[client.Object, reconcile.Request](r.recheck.marker())),
 		)
 	}
 
-	err := bldr.Complete(r)
+	err := bldr.Complete(r.recheck.gate(r))
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
 	}
