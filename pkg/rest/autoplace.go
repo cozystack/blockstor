@@ -121,6 +121,8 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.forgetOfflineReplicas(r.Context(), resList)
+
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {
 		out = append(out, wrapResourceWithVolumes(&resList[i]))
@@ -212,6 +214,10 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	answered := []apiv1.Resource{res}
+	s.forgetOfflineReplicas(r.Context(), answered)
+	res = answered[0]
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys before emit.
 	// Resources().Get returns a value copy, so the in-place mutation
