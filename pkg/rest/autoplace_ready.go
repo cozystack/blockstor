@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
@@ -107,7 +108,7 @@ func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, d
 
 	notConnected := notConnectedWarnings(s.replicasNotConnected(ctx, rdName))
 
-	volumes := s.definitionVolumeSizes(ctx, rdName)
+	volumes := s.deployedVolumeSizes(ctx, rdName)
 	if len(volumes) == 0 {
 		return notConnected
 	}
@@ -217,6 +218,33 @@ func (s *Server) deployedReplicasNotBuilt(ctx context.Context, rdName string, de
 	}
 
 	return out, nil
+}
+
+// deployedVolumeSizes is definitionVolumeSizes for the waits: when the
+// cache lists no volume, it asks the API server. linstor-csi writes the
+// volume definitions right before the autoplace or create, through
+// whichever apiserver replica the Service picks, and a cache that has
+// not caught up made the waits answer as for a definition without
+// volumes, before anything was built.
+func (s *Server) deployedVolumeSizes(ctx context.Context, rdName string) map[int32]int64 {
+	if sizes := s.definitionVolumeSizes(ctx, rdName); len(sizes) > 0 {
+		return sizes
+	}
+
+	vds, err := store.LiveVolumes(ctx, s.Store, rdName)
+	if err != nil {
+		log.FromContext(ctx).WithName("rest").Error(err,
+			"list volume definitions past the cache; answering without waiting", "resourceDefinition", rdName)
+
+		return nil
+	}
+
+	out := make(map[int32]int64, len(vds))
+	for i := range vds {
+		out[vds[i].VolumeNumber] = vds[i].SizeKib
+	}
+
+	return out
 }
 
 // deployedReplicas lists the replicas of rdName for a wait on the

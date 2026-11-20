@@ -139,6 +139,33 @@ func TestBuildWaitSeesReplicaTheCacheHasNotSeen(t *testing.T) {
 	}
 }
 
+// TestBuildWaitSeesVolumesTheCacheHasNotSeen pins the same against the
+// volume definitions: linstor-csi writes them right before the
+// autoplace, possibly through a sibling apiserver replica, and a cache
+// that does not list them yet must not turn the wait into an answer
+// for a definition without volumes.
+func TestBuildWaitSeesVolumesTheCacheHasNotSeen(t *testing.T) {
+	shortenReadyPoll(t)
+
+	backend := store.NewInMemory()
+	seedReadyWaitDefinition(t, backend, "pvc-local", "n1")
+	setLayerStack(t, backend, "pvc-local", apiv1.LayerKindStorage)
+	seedReplica(t, backend, "pvc-local", "n1", false, nil)
+
+	st := trailingCache(backend, false, true)
+	srv := &Server{Store: st, ResourceReadyWait: 10 * time.Second, ResourceDeployWait: 10 * time.Second}
+
+	standIn := deviceStandIn(t.Context(), backend, "pvc-local", 1, []string{"n1"}, 300*time.Millisecond)
+
+	srv.waitDeployedReplicasReady(t.Context(), "pvc-local", []string{"n1"})
+
+	requireDevicePaths(t, backend, "pvc-local", []string{"n1"})
+
+	if err := <-standIn; err != nil {
+		t.Fatalf("satellite stand-in: %v", err)
+	}
+}
+
 // TestReadyWaitSeesReplicasTheCacheHasNotSeen pins the ready step the
 // same way: replicas of a replicated definition that the cache does not
 // list yet are still awaited, rather than skipped as gone.
