@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -147,6 +148,11 @@ type ResourceReconciler struct {
 	client.Client
 
 	Config Config
+
+	// recheck runs the periodic re-checks one at a time. SetupWithManager
+	// sets it and gates Reconcile through it; a test calling Reconcile
+	// directly goes around it.
+	recheck *recheckGate
 }
 
 // Reconcile reads a Resource and drives the satellite-side
@@ -205,6 +211,13 @@ const peerAllocationRequeue = 2 * time.Second
 //   - short enough that any divergence between desired and observed
 //     converges within a single user-visible scenario tick (e2e
 //     tests poll at 1-2 s and budget ~30 s per assertion).
+//
+// It is the earliest a replica is re-checked, not a promise. The
+// re-check gate runs the re-checks one at a time, cools the slot down
+// after each, and holds them while an event pass runs, so on a node
+// with N replicas whose pass takes T the period is about
+// max(10s, N*(1+recheckCooldown)*T): with a hundred replicas at 0.1 s
+// a pass, about 20 s.
 const activeDRBDRequeue = 10 * time.Second
 
 // lowPriority is the queue priority of the periodic re-check, the one
@@ -255,22 +268,31 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // rendered a peer-less .res, and never re-rendered because
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
+//
+// Every way an event reaches the queue goes through the re-check gate:
+// For and the kernel trigger through r.recheck.marker, every Watches
+// map function through r.recheck.mapFunc. A Watches added without it
+// still works, but the gate takes its passes for re-checks of replicas
+// that have one due and holds them for the re-check slot.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.recheck = newRecheckGate()
+
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
 			builder.WithPredicates(
 				predicate.And(
 					nodeNamePredicate(r.Config.NodeName),
 					primaryWatchPredicate(),
+					r.recheck.marker(passResource),
 				),
 			)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings),
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passPeer, r.enqueueLocalSiblings)),
 			builder.WithPredicates(siblingWatchPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passDefinition, r.enqueueResourcesForRD))).
 		Watches(&blockstoriov1alpha1.ResourceGroup{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRG)).
+			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passDefinition, r.enqueueResourcesForRG))).
 		Named("satellite-resource").
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.resourceWorkers()})
 
@@ -284,13 +306,20 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// builder skips the raw-source registration entirely.
 	if r.Config.ReconcileTrigger != nil {
 		bldr = bldr.WatchesRawSource(
-			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{}),
+			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
+				source.WithPredicates[client.Object, reconcile.Request](r.recheck.marker(passKernel))),
 		)
 	}
 
-	err := bldr.Complete(r)
+	err := bldr.Complete(r.recheck.gate(r))
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
+	}
+
+	err = mgr.Add(manager.RunnableFunc(r.recheck.reportEvery(passReportInterval,
+		mgr.GetLogger().WithName("satellite-resource"))))
+	if err != nil {
+		return errors.Wrap(err, "register resource pass report")
 	}
 
 	return nil
@@ -693,7 +722,10 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// LINSTOR's satellite re-dispatches only resources with a pending
 	// change outside a full sync (DeviceManagerImpl.devMgrLoop).
 	if rdNeedsDRBD(&rd) {
-		return ctrl.Result{RequeueAfter: activeDRBDRequeue, Priority: lowPriority()}, nil
+		result := schedulePeriodicRecheck(ctx)
+		result.Priority = lowPriority()
+
+		return result, nil
 	}
 
 	return ctrl.Result{}, nil
