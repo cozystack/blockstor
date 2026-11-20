@@ -1039,7 +1039,7 @@ func (r *SnapshotReconciler) runTake(
 	logger := log.FromContext(parent).WithValues("snapshot", snap.Name)
 	ctx = log.IntoContext(ctx, logger)
 
-	verdict, createdAt, err := r.takeVerdict(ctx, snap)
+	verdict, taken, err := r.takeVerdict(ctx, snap)
 	retry := verdict == takeTransient || err != nil
 
 	w.stampMu.Lock()
@@ -1051,7 +1051,7 @@ func (r *SnapshotReconciler) runTake(
 	case err != nil:
 		logger.Info("snapshot take failed; retrying inside the window", "error", err.Error())
 	case !retry:
-		stampErr := r.reportTake(ctx, snap, verdict, createdAt)
+		stampErr := r.reportTake(ctx, snap, verdict, taken)
 		if stampErr != nil {
 			logger.Info("stamp snapshot take result; retaking", "error", stampErr.Error())
 
@@ -1095,10 +1095,10 @@ func (r *SnapshotReconciler) windowClosing(snapshot string, run *takeRun) bool {
 
 // reportTake stamps a final take verdict on the Snapshot.
 func (r *SnapshotReconciler) reportTake(
-	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, verdict takeOutcome, createdAt int64,
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, verdict takeOutcome, taken takenCopy,
 ) error {
 	if verdict == takeOK {
-		return r.stampSnapshotPerNodeReady(ctx, snap, createdAt)
+		return r.stampSnapshotPerNodeReady(ctx, snap, taken.createdAt, taken.pool)
 	}
 
 	return r.stampSnapshotPerNodeFailed(ctx, snap)

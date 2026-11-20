@@ -334,7 +334,7 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 	// Everything about where the replicas go is settled before anything is
 	// written: a node that does not hold the snapshot, or a pool that cannot
 	// be inferred, refused after the definition or its marker had landed.
-	planned, err := planRestoredReplicas(ctx, run, args.fromResource, args.toResource, &snap)
+	planned, err := planRestoredReplicas(ctx, run, args.toResource, &snap)
 	if err != nil {
 		return err
 	}
@@ -463,7 +463,7 @@ func restoreIntoExistingTarget(
 	}
 
 	if own {
-		return finishRestoreLeftover(ctx, run, args, existing.Name, snap, progress)
+		return finishRestoreLeftover(ctx, run, existing.Name, snap, progress)
 	}
 
 	// Replicas still being deleted, or a source whose stack is not decided
@@ -487,7 +487,7 @@ func restoreIntoExistingTarget(
 		return fmt.Errorf("restore into %s: %w", existing.Name, err)
 	}
 
-	planned, err := planRestoredReplicas(ctx, run, args.fromResource, existing.Name, snap)
+	planned, err := planRestoredReplicas(ctx, run, existing.Name, snap)
 	if err != nil {
 		return err
 	}
@@ -502,7 +502,7 @@ func restoreIntoExistingTarget(
 	// there first. Its definition is judged and finished as a leftover, the
 	// way the REST door does, rather than placed over with this run's nodes.
 	if !adopted {
-		return finishConcurrentRestore(ctx, run, args, existing.Name, snap, createErr)
+		return finishConcurrentRestore(ctx, run, existing.Name, snap, createErr)
 	}
 
 	return placeOverMarkedTarget(ctx, run, existing.Name, snap, planned)
@@ -526,7 +526,7 @@ func placeOverMarkedTarget(
 // finishConcurrentRestore judges a target another run of the same restore
 // marked first, and finishes it as a leftover of this restore.
 func finishConcurrentRestore(
-	ctx context.Context, run *runContext, args restoreArgs, rdName string, snap *apiv1.Snapshot, createErr error,
+	ctx context.Context, run *runContext, rdName string, snap *apiv1.Snapshot, createErr error,
 ) error {
 	progress, own, err := store.JudgeRestoreLeftover(ctx, run.Store, rdName, snap)
 	if err != nil {
@@ -537,7 +537,7 @@ func finishConcurrentRestore(
 		return fmt.Errorf("create resource definition %s: %w", rdName, createErr)
 	}
 
-	return finishRestoreLeftover(ctx, run, args, rdName, snap, progress)
+	return finishRestoreLeftover(ctx, run, rdName, snap, progress)
 }
 
 // readRestoreSource reads the definition and the snapshot a restore is taken
@@ -652,7 +652,7 @@ func judgeOwnRestore(
 // attempt that created it yields rather than deleting what this run finishes,
 // then gets the volumes it is still missing and its placement.
 func finishRestoreLeftover(
-	ctx context.Context, run *runContext, args restoreArgs, rdName string, snap *apiv1.Snapshot,
+	ctx context.Context, run *runContext, rdName string, snap *apiv1.Snapshot,
 	progress store.LeftoverProgress,
 ) error {
 	// Done before, and left alone. Said out loud: a re-run that exits 0
@@ -661,7 +661,7 @@ func finishRestoreLeftover(
 		return answerFinishedLeftover(ctx, run, rdName, snap.ResourceName, snap.Name)
 	}
 
-	planned, err := planRestoredReplicas(ctx, run, args.fromResource, rdName, snap)
+	planned, err := planRestoredReplicas(ctx, run, rdName, snap)
 	if err != nil {
 		return err
 	}
@@ -1106,7 +1106,7 @@ func unwindVolumes(ctx context.Context, run *runContext, rdName string, added []
 // snapshot stream into the wrong receiver, which never converges.
 // Explicit `--nodes` values win when the operator gave them.
 func planRestoredReplicas(
-	ctx context.Context, run *runContext, srcRD, rdName string, snap *apiv1.Snapshot,
+	ctx context.Context, run *runContext, rdName string, snap *apiv1.Snapshot,
 ) ([]apiv1.Resource, error) {
 	// The same refusal the REST door makes, before anything is written: see
 	// store.RefuseReplicasWithoutDefinition. A target that already has its
@@ -1147,7 +1147,7 @@ func planRestoredReplicas(
 	for _, node := range nodes {
 		res := apiv1.Resource{Name: rdName, NodeName: node}
 
-		pool, err := sourcePoolOn(ctx, run, srcRD, node)
+		pool, err := sourcePoolOn(ctx, run, snap, node)
 		if err != nil {
 			return nil, err
 		}
@@ -1277,62 +1277,40 @@ var errReplicaHoldsNoData = errors.New("a replica of the restore target is diskl
 // a replica nobody could read back.
 var errReplicaCollisionRecurs = errors.New("the replica create kept colliding with a replica that was gone when read back")
 
-// errNoSourcePool is returned when a restore cannot work out which
-// storage pool the new replica belongs in and the operator did not say.
-var errNoSourcePool = errors.New("no storage pool to restore into")
-
 // errNothingToRestore refuses a restore that would report success
 // while materialising no data — no node to place on, or no volume
 // captured. Mirrors errNothingToCapture on the create side.
 var errNothingToRestore = errors.New("the snapshot describes nothing to restore")
 
 // sourcePoolOn reports which pool the restored replica should use on a
-// node: `--storage-pool` when the operator named one, otherwise the
-// pool the source uses on that node, otherwise the source's first
-// diskful pool.
+// node: `--storage-pool` when the operator named one, otherwise the pool
+// that holds the snapshot there; see store.RestorePools, which the REST
+// door reads too.
 //
 // It REFUSES rather than returning an empty pool. A diskful Resource
 // with no StorPoolName is created happily — nothing in the CRD requires
 // the field — and then the satellite fails every reconcile with
-// `unknown storage pool ""`, which this repository has already been
-// bitten by once (pkg/store/k8s/resources.go). The verb would report
-// success while producing a replica that can never come up.
+// `unknown storage pool ""`. The verb would report success while
+// producing a replica that can never come up.
 //
 // The case is not exotic: it is the disaster-recovery one restore
-// exists for. A snapshot outlives its source, the source degrades to
-// diskless-only or loses its replicas, and there is no pool left to
-// infer. The operator knows where it should land; the code does not.
-func sourcePoolOn(ctx context.Context, run *runContext, srcRD, node string) (string, error) {
+// exists for. A snapshot outlives its source, and once the source has
+// no replica left, only the snapshot's own record names the pool. A
+// snapshot taken before that record existed has nothing to read it from;
+// the operator knows where it should land, the code does not.
+func sourcePoolOn(ctx context.Context, run *runContext, snap *apiv1.Snapshot, node string) (string, error) {
 	if chosen := run.Flags.Values["storage-pool"]; chosen != "" {
 		return chosen, nil
 	}
 
-	replicas, err := run.Store.Resources().ListByDefinition(ctx, srcRD)
+	pools, err := store.RestorePools(ctx, run.Store, snap, []string{node})
+	if errors.Is(err, store.ErrNoRestorePool) {
+		return "", fmt.Errorf("%w; name one with --storage-pool", err)
+	}
+
 	if err != nil {
-		return "", fmt.Errorf("list replicas of %s: %w", srcRD, err)
+		return "", err //nolint:wrapcheck // names the pool and the node itself
 	}
 
-	fallback := ""
-
-	for i := range replicas {
-		pool := replicas[i].Props[storPoolNameProp]
-		if pool == "" {
-			continue
-		}
-
-		if naming.Same(replicas[i].NodeName, node) {
-			return pool, nil
-		}
-
-		if fallback == "" {
-			fallback = pool
-		}
-	}
-
-	if fallback == "" {
-		return "", fmt.Errorf("%w: %s has no diskful replica to take a storage pool from; "+
-			"name one with --storage-pool", errNoSourcePool, srcRD)
-	}
-
-	return fallback, nil
+	return pools[naming.Key(node)], nil
 }

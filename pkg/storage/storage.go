@@ -93,6 +93,10 @@ type VolumeStatus struct {
 	State        string // PROVISIONED / ERROR / NOT_PROVISIONED
 }
 
+// StateNotProvisioned is the VolumeStatus.State of a volume that is not on
+// disk.
+const StateNotProvisioned = "NOT_PROVISIONED"
+
 // PoolStatus mirrors `linstor sp l` output for one pool on this node.
 type PoolStatus struct {
 	FreeCapacityKib   int64
@@ -150,6 +154,16 @@ type Provider interface {
 	//                       --name <tgt> <pool>/<src-snap>`
 	//   FILE / FILE_THIN: `cp --reflink=auto <src-snap>.img <tgt>.img`
 	RestoreVolumeFromSnapshot(ctx context.Context, target Volume, sourceSnapshot Snapshot) error
+}
+
+// SnapshotProber is the optional "does this pool hold the snapshot"
+// capability. A satellite records which of its pools holds its copy of a
+// snapshot, since a restore has to be placed in that pool after the
+// replica the copy was taken from is gone; for a copy taken before that
+// record existed it asks the pools themselves, because the pool a replica
+// is in now need not be the one an older copy of it was taken in.
+type SnapshotProber interface {
+	HasSnapshot(ctx context.Context, snap Snapshot) (bool, error)
 }
 
 // SuffixedDeleter is the optional capability of a provider that cannot

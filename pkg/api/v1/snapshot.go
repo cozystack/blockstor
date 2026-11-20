@@ -101,6 +101,11 @@ type SnapshotPerNode struct {
 	Flags           []string         `json:"flags,omitempty"`
 	SnapshotVolumes []SnapshotVolume `json:"snapshot_volumes,omitempty"`
 	UUID            string           `json:"uuid,omitempty"`
+
+	// StoragePool is the pool holding this node's copy, as the satellite
+	// recorded it. A restore places its replica there. Not part of the
+	// LINSTOR wire shape, which keeps the pool off the snapshot view.
+	StoragePool string `json:"-"`
 }
 
 // SnapshotVolume is one per-node, per-volume slot inside a

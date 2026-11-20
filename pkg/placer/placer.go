@@ -132,7 +132,7 @@ func (e *OversubscriptionShortfallError) Error() string {
 // a backing storage pool. Mirrors the literal the REST handlers and the
 // satellite dispatcher key on; centralised here so the placer's
 // create-and-promote paths can't drift on the spelling.
-const storPoolNameProp = "StorPoolName"
+const storPoolNameProp = apiv1.KeyStorPoolName
 
 // Placer adds replicas to satisfy a placement filter. Construct via
 // New; one instance per autoplace call (it does no internal caching).
@@ -339,6 +339,8 @@ func (p *Placer) buildPlan(ctx context.Context, rdName string, filter *apiv1.Aut
 			oversubShortfall:  gates.oversubBest,
 		}, nil
 	}
+
+	candidates = p.pinRestoreCopyPools(ctx, rdName, candidates)
 
 	return p.assemblePlan(ctx, rdName, filter, candidates, requiredKib, gates)
 }
@@ -1822,7 +1824,9 @@ const restoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
 // constrainFilterToRestoreSource applies the restore-source BACKEND
 // pin for an RD that was materialised from a snapshot
 // (BlockstorRestoreFromSnapshot prop): candidate pools are pinned to
-// the source replica's ProviderKind. Returns the caller's filter
+// the source replica's ProviderKind, or once the source is gone, the
+// backend of the pool the snapshot records its copies in. Returns the
+// caller's filter
 // untouched when the RD carries no restore marker (the overwhelmingly
 // common case).
 //
@@ -1855,9 +1859,9 @@ const restoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
 // autoplacer's call, and the REST `--node-name` Bug 397 guard already
 // rejects an explicit diskful replica on a snapshot-less node up front.
 //
-// Every lookup is best-effort: when the marker is malformed, the
-// snapshot is gone, or the source has no diskful replica left, the
-// filter passes through unchanged and the regular placement gates
+// Every lookup is best-effort: when the marker is malformed, or neither
+// the source's live replicas nor the snapshot's recorded pools name a
+// backend, the filter passes through unchanged and the regular placement gates
 // apply (satellite-side Bug 397 blank-fallback seeding still protects
 // data integrity in those edge cases).
 func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) *apiv1.AutoSelectFilter {
@@ -1871,12 +1875,7 @@ func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName stri
 		return filter
 	}
 
-	srcRD, _, ok := strings.Cut(stamp, ":")
-	if !ok || srcRD == "" {
-		return filter
-	}
-
-	kind := SourceProviderKind(ctx, p.store, srcRD)
+	kind := RestoreSourceProviderKind(ctx, p.store, stamp)
 	if kind == "" {
 		return filter
 	}
@@ -1887,6 +1886,118 @@ func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName stri
 	out.ProviderList = []string{kind}
 
 	return &out
+}
+
+// RestoreSourceProviderKind is the ProviderKind a replica of a definition
+// restored from stamp (`<srcRD>:<snapName>`) has to be placed on: the
+// backend of the source's live replicas, or, once the source has none
+// left, the backend of the pool the snapshot records holding a copy in.
+// Without that fallback the backend pin disappeared exactly when the
+// source was deleted, and a clone could land on a pool of another backend
+// whose snapshot stream it cannot receive. "" when neither names one.
+func RestoreSourceProviderKind(ctx context.Context, st store.Store, stamp string) string {
+	srcRD, snapName, ok := strings.Cut(stamp, ":")
+	if !ok || srcRD == "" {
+		return ""
+	}
+
+	if kind := SourceProviderKind(ctx, st, srcRD); kind != "" {
+		return kind
+	}
+
+	if snapName == "" {
+		return ""
+	}
+
+	snap, err := st.Snapshots().Get(ctx, srcRD, snapName)
+	if err != nil {
+		return ""
+	}
+
+	for i := range snap.Snapshots {
+		kind := poolProviderKind(ctx, st, snap.Snapshots[i].NodeName, snap.Snapshots[i].StoragePool)
+		if kind != "" {
+			return kind
+		}
+	}
+
+	return ""
+}
+
+// RestoreCopyPools names, per node (keyed by naming.Key), the pool the
+// snapshot behind stamp records holding that node's copy in. A replica
+// placed on such a node is cloned from that copy, so it has to land in
+// that pool: on a node with two pools of one backend another pool holds
+// no snapshot to clone from. Nil when stamp names no snapshot or the
+// snapshot records no pool.
+func RestoreCopyPools(ctx context.Context, st store.Store, stamp string) map[string]string {
+	srcRD, snapName, ok := strings.Cut(stamp, ":")
+	if !ok || srcRD == "" || snapName == "" {
+		return nil
+	}
+
+	snap, err := st.Snapshots().Get(ctx, srcRD, snapName)
+	if err != nil {
+		return nil
+	}
+
+	var pools map[string]string
+
+	for i := range snap.Snapshots {
+		if pool := snap.Snapshots[i].StoragePool; pool != "" {
+			if pools == nil {
+				pools = map[string]string{}
+			}
+
+			pools[naming.Key(snap.Snapshots[i].NodeName)] = pool
+		}
+	}
+
+	return pools
+}
+
+// pinRestoreCopyPools drops, for a definition restored from a snapshot,
+// every candidate pool on a node whose copy the snapshot records in another
+// pool of that node. Nodes without a recorded copy are left to the backend
+// pin.
+func (p *Placer) pinRestoreCopyPools(ctx context.Context, rdName string, candidates []apiv1.StoragePool) []apiv1.StoragePool {
+	rd, err := p.store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return candidates
+	}
+
+	pinned := RestoreCopyPools(ctx, p.store, rd.Props[restoreFromSnapshotProp])
+	if len(pinned) == 0 {
+		return candidates
+	}
+
+	out := make([]apiv1.StoragePool, 0, len(candidates))
+
+	for i := range candidates {
+		pool, ok := pinned[naming.Key(candidates[i].NodeName)]
+		if ok && pool != candidates[i].StoragePoolName {
+			continue
+		}
+
+		out = append(out, candidates[i])
+	}
+
+	return out
+}
+
+// poolProviderKind is the backend of pool on node, or "" when it is not
+// known or is diskless.
+func poolProviderKind(ctx context.Context, st store.Store, node, pool string) string {
+	if pool == "" {
+		return ""
+	}
+
+	sp, err := st.StoragePools().Get(ctx, node, pool)
+	if err != nil || sp.ProviderKind == apiv1.StoragePoolKindDiskless {
+		return ""
+	}
+
+	return sp.ProviderKind
 }
 
 // SourceProviderKind returns the ProviderKind of the pool backing the

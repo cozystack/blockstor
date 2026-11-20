@@ -1407,7 +1407,7 @@ func (r *ResourceReconciler) ensureSkipInitSyncDecision(ctx context.Context, tar
 	// permanently poison the RD (every later re-created replica then
 	// full-syncs a never-written volume — the r-full Phase-2 flake).
 	// See anyProvenDataBearingDiskfulPeer.
-	if !rdInitialized(rd) && anyProvenDataBearingDiskfulPeer(peers, "") {
+	if !rdInitialized(rd) && (anyProvenDataBearingDiskfulPeer(peers, "") || restoredDefinitionInUse(rd, peers)) {
 		if err := r.patchRDInitialized(ctx, rd.Name); err != nil {
 			if errors.IsNotFound(err) {
 				return false, nil
@@ -1441,6 +1441,31 @@ func (r *ResourceReconciler) ensureSkipInitSyncDecision(ctx context.Context, tar
 	}
 
 	return true, nil
+}
+
+// restoredDefinitionInUse reports whether rd was restored or cloned from a
+// snapshot and one of its replicas has been Primary, which ends its
+// restore set. The satellite seeds a replica cloned from the snapshot
+// UpToDate on its own only while the RD is not Initialized; once the
+// volume is in use a new clone of the old snapshot is stale, so the RD is
+// latched and every later replica syncs from a peer, as one LINSTOR
+// places next to a restored resource does.
+//
+// The GI scan cannot stand in for this: a Primary connected to all its
+// peers keeps the day0 current UUID it was restored with however much it
+// writes, so the restored RD would never read as data-bearing.
+func restoredDefinitionInUse(rd *blockstoriov1alpha1.ResourceDefinition, peers []blockstoriov1alpha1.Resource) bool {
+	if rd.Spec.Props[store.RestoreFromSnapshotProp] == "" {
+		return false
+	}
+
+	for i := range peers {
+		if peers[i].Status.InUse || drbd.Role(peers[i].Status.Role).IsPrimary() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // rdInitialized reports whether the RD's append-only initialized latch

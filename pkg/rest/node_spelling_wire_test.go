@@ -167,9 +167,19 @@ func TestSingleNodeCreateTakesTheBodyNodeInAnotherSpelling(t *testing.T) {
 func TestRestorePoolIsTheSourceReplicasOnAnotherNodeSpelling(t *testing.T) {
 	t.Parallel()
 
-	byNode, _ := storPoolsByNodeFromSourceRD(t.Context(), nodeSpellingStore(t), "pvc-mix")
-	if pool := byNode[naming.Key("node-1")]; pool != "pool-Node-1" {
-		t.Errorf("pool for node-1 = %q, want pool-Node-1", pool)
+	st := nodeSpellingStore(t)
+
+	if err := st.StoragePools().Create(t.Context(), &apiv1.StoragePool{
+		StoragePoolName: "pool-Node-1", NodeName: "Node-1",
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	snap := &apiv1.Snapshot{Name: "snap", ResourceName: "pvc-mix", Nodes: []string{"Node-1", "Node-2"}}
+
+	byNode, err := store.RestorePools(t.Context(), st, snap, []string{"node-1"})
+	if pool := byNode[naming.Key("node-1")]; err != nil || pool != "pool-Node-1" {
+		t.Errorf("pool for node-1 = %q, %v; want pool-Node-1", pool, err)
 	}
 }
 

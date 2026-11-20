@@ -254,19 +254,20 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 		return r.handleResumePhase(ctx, snap)
 	}
 
+	// Already took our local snapshot: the controller is either still
+	// waiting on slow siblings, or the take is over and it cleared both
+	// flags. All that is left is to record which pool holds the copy,
+	// which a snapshot taken before that record gets here too.
+	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
+		return ctrl.Result{}, r.recordSnapshotPool(ctx, snap)
+	}
+
 	// Phase 2: take the per-node snapshot. Gated on Spec.TakeSnapshot
 	// (controller stamps it once every targeted node has acked Phase
 	// 1) AND on this node not having already succeeded.
 	if !snap.Spec.TakeSnapshot {
 		// Suspend acked, but the controller hasn't promoted to
 		// take-snapshot yet — siblings still suspending. Wait.
-		return ctrl.Result{}, nil
-	}
-
-	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
-		// Already took our local snapshot; the controller is
-		// either still waiting on slow siblings or hasn't
-		// observed our Ready stamp yet. No-op.
 		return ctrl.Result{}, nil
 	}
 
@@ -476,7 +477,7 @@ func (r *SnapshotReconciler) takeWithoutWindow(ctx context.Context, snap *blocks
 	r.Config.Apply.FlushStorageDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName),
 		snapshotVolumeNumbers(snap))
 
-	verdict, createdAt, err := r.takeVerdict(ctx, snap)
+	verdict, taken, err := r.takeVerdict(ctx, snap)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -485,7 +486,7 @@ func (r *SnapshotReconciler) takeWithoutWindow(ctx context.Context, snap *blocks
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	return ctrl.Result{}, r.reportTake(ctx, snap, verdict, createdAt)
+	return ctrl.Result{}, r.reportTake(ctx, snap, verdict, taken)
 }
 
 // takeOutcome is the three-way verdict of one storage-layer take.
@@ -497,11 +498,18 @@ const (
 	takeTerminal
 )
 
+// takenCopy is what a successful take reports about the copy it made: when
+// it was taken and the pool that holds it.
+type takenCopy struct {
+	createdAt int64
+	pool      string
+}
+
 // takeVerdict invokes provider.CreateSnapshot via the satellite
 // Reconciler and classifies the result the way the pre-Bug-351
 // single-step path did (Bug 106 / F18): Ok, a transient failure worth
 // retrying, or a terminal one. It stamps nothing.
-func (r *SnapshotReconciler) takeVerdict(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (takeOutcome, int64, error) {
+func (r *SnapshotReconciler) takeVerdict(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (takeOutcome, takenCopy, error) {
 	req := &intent.CreateSnapshotRequest{
 		ResourceName:  naming.Key(snap.Spec.ResourceDefinitionName),
 		SnapshotName:  snap.Spec.SnapshotName,
@@ -510,7 +518,7 @@ func (r *SnapshotReconciler) takeVerdict(ctx context.Context, snap *blockstoriov
 
 	missing, err := r.unrecordedLUKSKey(ctx, snap, req.VolumeNumbers)
 	if err != nil {
-		return takeTransient, 0, err
+		return takeTransient, takenCopy{}, err
 	}
 
 	if missing != "" {
@@ -519,16 +527,16 @@ func (r *SnapshotReconciler) takeVerdict(ctx context.Context, snap *blockstoriov
 		log.FromContext(ctx).Info("refusing to take a snapshot that does not record this replica's LUKS password",
 			"snapshot", snap.Spec.SnapshotName, "volume", missing)
 
-		return takeTerminal, 0, nil
+		return takeTerminal, takenCopy{}, nil
 	}
 
 	resp, err := r.Config.Apply.CreateSnapshot(ctx, req)
 	if err != nil {
-		return takeTransient, 0, errors.Wrap(err, "CreateSnapshot")
+		return takeTransient, takenCopy{}, errors.Wrap(err, "CreateSnapshot")
 	}
 
 	if resp.GetOk() {
-		return takeOK, resp.CreateTimestampUnix, nil
+		return takeOK, takenCopy{createdAt: resp.CreateTimestampUnix, pool: resp.GetStoragePool()}, nil
 	}
 
 	log.FromContext(ctx).Info("CreateSnapshot per-snapshot failure",
@@ -537,10 +545,10 @@ func (r *SnapshotReconciler) takeVerdict(ctx context.Context, snap *blockstoriov
 		"terminal", resp.GetTerminal())
 
 	if !resp.GetTerminal() {
-		return takeTransient, 0, nil
+		return takeTransient, takenCopy{}, nil
 	}
 
-	return takeTerminal, 0, nil
+	return takeTerminal, takenCopy{}, nil
 }
 
 // perNodeStatusSuspendIOAcked reports whether the NodeStatus
@@ -792,6 +800,11 @@ func collapseNodeStatus(
 			kept.SuspendIOAcked = kept.SuspendIOAcked || entry.SuspendIOAcked
 			kept.Failed = kept.Failed || entry.Failed
 			kept.CreateTimestamp = max(kept.CreateTimestamp, entry.CreateTimestamp)
+
+			if kept.StoragePool == "" {
+				kept.StoragePool = entry.StoragePool
+			}
+
 			folded = true
 		}
 	}
@@ -812,8 +825,14 @@ func collapseNodeStatus(
 // converges in well under a second on a 3-node stand. After the
 // retry budget the caller's outer reconcile rate-limiter backs off
 // and we try again on the next pass.
+//
+// The same write records pool, the pool the copy was taken in. Written
+// apart from Ready, the record would miss whenever the source replica went
+// between the two writes, which is the usual CSI order (the PVC is deleted
+// as soon as its VolumeSnapshot is ready), and every restore of the copy
+// would then be refused.
 func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
-	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, createTimestamp int64,
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, createTimestamp int64, pool string,
 ) error {
 	key := client.ObjectKeyFromObject(snap)
 
@@ -841,6 +860,7 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
 
 		current.Status.NodeStatus = upsertPerNodeStatus(
 			current.Status.NodeStatus, r.Config.NodeName, createTimestamp)
+		recordPoolOnEntry(current.Status.NodeStatus, r.Config.NodeName, pool)
 
 		err = r.Status().Update(ctx, &current)
 		if err == nil {

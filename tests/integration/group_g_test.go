@@ -295,6 +295,10 @@ func TestGroupG(t *testing.T) {
 	t.Run("SnapRestoreCreatesNewRD", func(t *testing.T) { testGroupGSnapRestoreCreatesNewRD(t, stack, cli) })
 	t.Run("SnapRollbackOnExistingRD", func(t *testing.T) { testGroupGSnapRollbackOnExistingRD(t, stack, cli) })
 	t.Run("SnapRestoreSnapshotHolderOnly", func(t *testing.T) { testGroupGSnapRestoreSnapshotHolderOnly(t, stack, cli) })
+	t.Run("SnapRestoreAfterSourceDeleted", func(t *testing.T) { testGroupGSnapRestoreAfterSourceDeleted(t, stack) })
+	t.Run("SnapRestoreAfterSourceDeletedNeedsAPool", func(t *testing.T) {
+		testGroupGSnapRestoreAfterSourceDeletedNeedsAPool(t, stack)
+	})
 	t.Run("SnapOrphanCleanup", func(t *testing.T) { testGroupGSnapOrphanCleanup(t, stack, cli) })
 	t.Run("SnapDeleteBlockedByLater", func(t *testing.T) { testGroupGSnapDeleteBlockedByLater(t, stack, cli) })
 	t.Run("AutoSnapshotPeriodicTick", func(t *testing.T) { testGroupGAutoSnapshotPeriodicTick(t, stack) })

@@ -289,6 +289,23 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return nil
 }
 
+// HasSnapshot reports whether this pool holds the snapshot, under its
+// resource's zvol or under one a delete renamed (locateSnapshot), so a copy
+// whose source volume is gone is still found. Several renamed copies of one
+// name still mean the pool holds it.
+func (p *Provider) HasSnapshot(ctx context.Context, snap storage.Snapshot) (bool, error) {
+	dataset, err := p.locateSnapshot(ctx, snap)
+	if errors.Is(err, errAmbiguousSnapshot) {
+		return true, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	return dataset != "", nil
+}
+
 // RestoreVolumeFromSnapshot materialises target as a `zfs clone` of
 // the source snapshot. ZFS clones are CoW — instant create, lazy
 // allocation as writes diverge from the snapshot.
@@ -687,7 +704,7 @@ func (p *Provider) snapshotDataset(snap storage.Snapshot) string {
 }
 
 const (
-	stateNotProvisioned = "NOT_PROVISIONED"
+	stateNotProvisioned = storage.StateNotProvisioned
 	mibPerKib           = 1024
 	bytesPerKib         = 1024
 	zfsListCols         = 3

@@ -374,6 +374,14 @@ spec:
                       type: string
                     ready:
                       type: boolean
+                    storagePool:
+                      description: |-
+                        storagePool is the pool that holds this node's copy: the pool of
+                        the replica it was taken from. The local satellite records it once
+                        its copy exists, because the copy outlives the replica and a
+                        restore has to be placed in the same pool, the way LINSTOR keeps
+                        the pool on each snapshot volume.
+                      type: string
                     suspendIOAcked:
                       description: |-
                         suspendIOAcked is stamped true by the local satellite once
