@@ -103,8 +103,11 @@ type observation struct {
 	// listMap entry on the apiserver or (worse) emit False frames
 	// the next reconcile would treat as "kernel slot gone".
 	HasKernelLoaded bool
-	Volumes         []volumeObservation
-	Connections     []connectionObservation
+	// Destroyed marks a `destroy resource` frame: the kernel slot is
+	// gone, and with it everything the observer knew about it.
+	Destroyed   bool
+	Volumes     []volumeObservation
+	Connections []connectionObservation
 }
 
 // volumeObservation carries per-volume DiskState + the
@@ -294,6 +297,7 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		HasResource:     true,
 		KernelLoaded:    normalizeKernelLoaded(ev.Action),
 		HasKernelLoaded: true,
+		Destroyed:       ev.Action == eventActionDestroy,
 	}, true
 }
 
@@ -546,29 +550,8 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 	return out, true
 }
 
-// observationsFrom transforms a stream of events2 lines into a
-// stream of satellite observations. Returns when in closes.
-func observationsFrom(in <-chan drbd.Event) <-chan observation {
-	out := make(chan observation)
-
-	go func() {
-		defer close(out)
-
-		for ev := range in {
-			obs, ok := translateEvent(ev)
-			if !ok {
-				continue
-			}
-
-			out <- obs
-		}
-	}()
-
-	return out
-}
-
-// observerEventBuffer bounds the events2 → translate goroutine
-// queue. drbd-9 reconnect storms can burst dozens of events; 256
+// observerEventBuffer bounds the queue between the events2 pipe and
+// the goroutine that reads it. drbd-9 reconnect storms can burst dozens of events; 256
 // matches the value the retired gRPC observer used.
 const observerEventBuffer = 256
 
@@ -756,12 +739,30 @@ type ObserverRunnable struct {
 	lifecycleMu    sync.Mutex
 	lifecycleCache map[string]lifecycleSignature
 
-	// appliedMu / applied hold, per Resource CR, the last status this
+	// appliedMu / applied hold, per resource, the last status this
 	// observer applied and the object version the apiserver answered
 	// with. writeStatus skips an apply that would send the same
 	// status onto that same version: nothing could have changed it.
 	appliedMu sync.Mutex
 	applied   map[string]appliedStatus
+
+	// pendingMu guards the hand-off from the goroutine reading events2
+	// to the one writing status. pending holds, per resource, what the
+	// writer owes it; wake tells the writer there is something.
+	// holding is set from the start of a stream until its initial dump
+	// ends, and nothing is written meanwhile. previous holds the
+	// resources the ended stream knew, to find those the new dump no
+	// longer has.
+	pendingMu sync.Mutex
+	pending   map[string]pendingWrite
+	wake      chan struct{}
+	holding   bool
+	previous  map[string]struct{}
+
+	// writeMu makes one write pass at a time: a pass reads the caches
+	// when it writes a resource, so with passes in turn the newest view
+	// is always the last one sent.
+	writeMu sync.Mutex
 
 	// startEvents2 starts the kernel event stream; nil runs drbdsetup.
 	// restartDelay is the wait before a stream that ended is started
@@ -849,19 +850,28 @@ type resourceObservation struct {
 // at the Config level anyway, so this is belt-and-braces.
 func (*ObserverRunnable) NeedLeaderElection() bool { return false }
 
-// Start launches the events2 watcher + observation translator +
-// per-event Status SSA write loop. Returns when ctx cancels.
+// Start launches the events2 reader, the status writer and the resync
+// ticker. Returns when ctx cancels.
+//
+// The reader never waits on the apiserver: it folds each frame into the
+// caches and marks the resource pending. The writer then writes each
+// pending resource's whole view once, however many frames it took.
+// Writing every frame in the reader, as before, made the reader as slow
+// as the client's rate limit; during a node's resync storm the frames
+// queued in the channel, then in the pipe, then in drbdsetup's netlink
+// socket, until the kernel dropped notifications and drbdsetup exited.
+// LINSTOR likewise reads events2 apart from what it reports.
 //
 // drbdsetup events2 ends on its own when it falls behind: the kernel
 // drops notifications its socket has no room for, and drbdsetup exits
 // on that error rather than carry on with a state it knows is
-// incomplete. The stream used to end the loop for good while the
-// resync went on re-writing the last cached state, so a replica stayed
-// SyncTarget or Attaching in `r l` long after the kernel had moved on.
-// LINSTOR restarts the stream and drops its state (DrbdEventService);
-// so does this: the new stream's initial dump rebuilds the caches.
+// incomplete. LINSTOR restarts the stream and drops its state
+// (DrbdEventService); so does this: the new stream's initial dump
+// rebuilds the caches.
 func (o *ObserverRunnable) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("observer")
+
+	o.holdWrites()
 
 	stream, stop, err := o.events2Source()(ctx)
 	if err != nil {
@@ -870,10 +880,11 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 
 	adm := drbd.NewAdm(o.Exec)
 
+	go o.writeLoop(ctx, adm)
 	go o.resyncLoop(ctx)
 
 	for {
-		o.follow(ctx, logger, adm, stream)
+		o.follow(ctx, logger, stream)
 		stop()
 
 		select {
@@ -895,8 +906,14 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 	}
 }
 
-// follow handles every frame of one events2 stream until it ends.
-func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, adm *drbd.Adm, stream *drbd.Watcher) {
+// follow reads every frame of one events2 stream until it ends.
+//
+// Until the `exists -` line ends the initial dump, change and destroy
+// frames are kept back and replayed after it, as LINSTOR's
+// DrbdEventsMonitor does: a change the kernel reported while the dump
+// was being written may be newer than the dump's line for the same
+// object, and must not be overwritten by it.
+func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, stream *drbd.Watcher) {
 	events := make(chan drbd.Event, observerEventBuffer)
 
 	go func() {
@@ -906,9 +923,27 @@ func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, adm *
 		}
 	}()
 
-	for ev := range observationsFrom(events) {
-		obs := ev
-		o.handleObservation(ctx, adm, &obs)
+	var deferred []drbd.Event
+
+	dumped := false
+
+	for ev := range events {
+		switch {
+		case dumped:
+			o.ingestEvent(ctx, ev)
+		case ev.EndsInitialState():
+			dumped = true
+
+			for _, held := range deferred {
+				o.ingestEvent(ctx, held)
+			}
+
+			o.releaseWrites(ctx)
+		case ev.Action == eventActionExists:
+			o.ingestEvent(ctx, ev)
+		default:
+			deferred = append(deferred, ev)
+		}
 	}
 }
 
@@ -931,11 +966,36 @@ func (o *ObserverRunnable) restartEvents2(ctx context.Context, logger logr.Logge
 	}
 }
 
-// forgetObserved drops everything the ended stream told the observer.
-// A peer or volume that went away while no stream ran sends no destroy
-// frame afterwards, so a kept entry would be re-written forever; the
-// new stream's initial dump restates everything that still exists.
+// forgetObserved drops everything the ended stream told the observer
+// and holds writes until the new stream's dump ends. A peer or volume
+// that went away while no stream ran sends no destroy frame afterwards,
+// so a kept entry would be re-written forever; the new stream's initial
+// dump restates everything that still exists. The resources the ended
+// stream knew are kept by name, so releaseWrites can clear those the
+// new dump leaves out.
 func (o *ObserverRunnable) forgetObserved() {
+	// Wait for a pass in flight: it must not write a view the clearing
+	// below has half emptied.
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
+
+	known := o.cachedResourceNames()
+
+	o.pendingMu.Lock()
+	o.holding = true
+	o.pending = nil
+
+	if o.previous == nil {
+		o.previous = map[string]struct{}{}
+	}
+
+	// A stream that ended before its own dump did adds to, rather than
+	// replaces, what the one before it knew.
+	for _, name := range known {
+		o.previous[name] = struct{}{}
+	}
+	o.pendingMu.Unlock()
+
 	o.volMu.Lock()
 	o.volCache = nil
 	o.volMu.Unlock()
@@ -951,6 +1011,63 @@ func (o *ObserverRunnable) forgetObserved() {
 	o.lifecycleMu.Lock()
 	o.lifecycleCache = nil
 	o.lifecycleMu.Unlock()
+}
+
+// holdWrites stops the writer until releaseWrites: a stream is about
+// to start, and its initial dump is not whole until it ends.
+func (o *ObserverRunnable) holdWrites() {
+	o.pendingMu.Lock()
+	defer o.pendingMu.Unlock()
+
+	o.holding = true
+}
+
+// releaseWrites runs when a stream's initial dump has ended. Every
+// resource the dump restated is written once from its complete view;
+// one the ended stream knew and the dump did not restate went away
+// while no stream ran, and is written as gone. The reconciler is woken
+// for each, which the dump's frames did not do while writes were held.
+func (o *ObserverRunnable) releaseWrites(ctx context.Context) {
+	current := o.cachedResourceNames()
+
+	o.pendingMu.Lock()
+
+	if o.pending == nil {
+		o.pending = map[string]pendingWrite{}
+	}
+
+	restated := make(map[string]struct{}, len(current))
+
+	for _, name := range current {
+		restated[name] = struct{}{}
+
+		entry := o.pending[name]
+		entry.probeGI = true
+		o.pending[name] = entry
+	}
+
+	for name := range o.previous {
+		if _, ok := restated[name]; !ok {
+			o.pending[name] = pendingWrite{departed: true}
+		}
+	}
+
+	o.previous = nil
+	o.holding = false
+	o.pendingMu.Unlock()
+
+	o.signalWriter()
+
+	for _, name := range current {
+		o.emitReconcileTrigger(ctx, &observation{ResourceName: name})
+	}
+}
+
+func (o *ObserverRunnable) isHolding() bool {
+	o.pendingMu.Lock()
+	defer o.pendingMu.Unlock()
+
+	return o.holding
 }
 
 func (o *ObserverRunnable) events2Source() func(context.Context) (*drbd.Watcher, func(), error) {
@@ -988,8 +1105,6 @@ const observerResyncInterval = 5 * time.Second
 // else wrote since; a no-op apply is still a request, and a hundred of
 // them every tick crowd out the frames that carry real changes.
 func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
-	logger := log.FromContext(ctx).WithName("observer-resync")
-
 	ticker := time.NewTicker(observerResyncInterval)
 	defer ticker.Stop()
 
@@ -998,43 +1113,24 @@ func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			o.resyncOnce(ctx, logger)
+			o.resyncOnce(ctx)
 		}
 	}
 }
 
-// resyncOnce snapshots both caches and re-applies each known
-// resource. Called by resyncLoop and unit-tested directly.
-func (o *ObserverRunnable) resyncOnce(ctx context.Context, logger logr.Logger) {
-	names := o.cachedResourceNames()
-
-	adm := drbd.NewAdm(o.Exec)
-
-	for _, name := range names {
-		// A restarted stream may have dropped the resource since the
-		// names were listed; an empty view would strip its status.
-		obs, known := o.cachedView(name)
-		if !known {
-			continue
-		}
-
-		// Backfill CurrentGI from on-disk metadata here too (not just
-		// the event-driven path): the 5s resync guarantees a
-		// data-state volume's CurrentGI converges even when no further
-		// events2 frame fires after it reached UpToDate.
-		o.backfillCurrentGI(ctx, adm, &obs)
-
-		err := o.writeStatus(ctx, &obs)
-		if err == nil {
-			continue
-		}
-
-		if apierrors.IsNotFound(err) {
-			continue
-		}
-
-		logger.Error(err, "resync Resource.Status", "resource", name)
+// resyncOnce marks every known resource pending, reading its GI from
+// disk afresh, and writes them. The pass waits for one the writer has
+// in flight, and writes nothing while a stream's dump is being read.
+//
+// The GI is read here too, not only when a frame changes a volume: the
+// 5 s resync guarantees a data-state volume's CurrentGI converges even
+// when no further events2 frame fires after it reached UpToDate.
+func (o *ObserverRunnable) resyncOnce(ctx context.Context) {
+	for _, name := range o.cachedResourceNames() {
+		o.markPending(name, func(entry *pendingWrite) { entry.probeGI = true })
 	}
+
+	o.flush(ctx, drbd.NewAdm(o.Exec))
 }
 
 // cachedResourceNames returns the union of resource keys held by
@@ -1155,11 +1251,263 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 	ev.Suspended = cur.Suspended
 }
 
-// handleObservation runs the per-event side-effects: the
-// backing-device-failure auto-detach (kernel-reported disk:Failed
-// → drbdadm detach) plus the SkipDisk prop write that pins the
-// next reconcile onto `drbdadm adjust --skip-disk`, and the
-// Resource.Status SSA write.
+// pendingWrite is what the writer owes one resource.
+type pendingWrite struct {
+	// probeGI reads the GI of the resource's data-bearing volumes from
+	// disk: a frame changed a volume, or a resync or a new stream asks
+	// for it. Without it the write carries the GI last read.
+	probeGI bool
+	// detachFailed answers a device frame that reported disk:Failed.
+	detachFailed bool
+	// kernelLoaded is the KernelLoaded value the last resource frame
+	// carried; nil when no resource frame came.
+	kernelLoaded *bool
+	// departed means the kernel no longer has the resource: a destroy
+	// frame, or a new stream's dump that left it out.
+	departed bool
+}
+
+// ingestEvent folds one events2 frame into the caches.
+func (o *ObserverRunnable) ingestEvent(ctx context.Context, ev drbd.Event) {
+	obs, ok := translateEvent(ev)
+	if !ok {
+		return
+	}
+
+	o.ingest(ctx, &obs)
+}
+
+// ingest folds an observation into the caches, wakes the reconciler on
+// a lifecycle change, and marks the resource pending for the writer.
+// It does not touch the apiserver or run DRBD tools, so the events2
+// reader never waits on either.
+//
+// Connection observations arrive one peer at a time and volume ones one
+// volume at a time; the caches hold the union, and the writer sends it
+// whole (completeFromCache).
+func (o *ObserverRunnable) ingest(ctx context.Context, ev *observation) {
+	if ev.ResourceName == "" {
+		return
+	}
+
+	if ev.Destroyed {
+		o.forgetResource(ev.ResourceName)
+		o.markPending(ev.ResourceName, func(entry *pendingWrite) { *entry = pendingWrite{departed: true} })
+
+		if !o.isHolding() {
+			o.sendReconcileTrigger(ctx, ev.ResourceName)
+		}
+
+		return
+	}
+
+	// Read before mergeResource puts the cached disk state on ev.
+	failed := ev.DrbdState == drbdDiskStateFailed
+
+	o.mergeConnections(ev)
+	o.mergeVolumes(ev)
+	o.mergeResource(ev)
+
+	// mergeVolumes leaves ev.Volumes empty when the frame changed no
+	// volume; a statistics tick then costs no get-gi.
+	volumesChanged := len(ev.Volumes) > 0
+
+	// Phase 11.7: wake the ResourceReconciler on every kernel-state
+	// lifecycle change (resource lifecycle, role, disk, conn, repl).
+	// Many recovery decisions (a peer flapping to StandAlone, the local
+	// disk going Failed → Diskless) generate no apiserver Spec write,
+	// so Generation never bumps and the primary For watch sees
+	// nothing. Statistics ticks are filtered by emitReconcileTrigger's
+	// signature compare. Not while a dump is being read: the view is
+	// partial, and releaseWrites wakes every resource once it is whole.
+	if !o.isHolding() {
+		o.emitReconcileTrigger(ctx, ev)
+	}
+
+	o.markPending(ev.ResourceName, func(entry *pendingWrite) {
+		entry.departed = false
+		entry.probeGI = entry.probeGI || volumesChanged
+		entry.detachFailed = entry.detachFailed || failed
+
+		if ev.HasKernelLoaded {
+			loaded := ev.KernelLoaded
+			entry.kernelLoaded = &loaded
+		}
+	})
+}
+
+// forgetResource drops what the caches hold for a resource the kernel
+// destroyed. LINSTOR's tracker removes it the same way; kept, it would
+// be re-written by every resync for as long as the satellite runs.
+func (o *ObserverRunnable) forgetResource(name string) {
+	o.volMu.Lock()
+	delete(o.volCache, name)
+	o.volMu.Unlock()
+
+	o.connMu.Lock()
+	delete(o.connCache, name)
+	o.connMu.Unlock()
+
+	o.resMu.Lock()
+	delete(o.resCache, name)
+	o.resMu.Unlock()
+
+	o.lifecycleMu.Lock()
+	delete(o.lifecycleCache, name)
+	o.lifecycleMu.Unlock()
+}
+
+// markPending updates what the writer owes name and wakes the writer.
+func (o *ObserverRunnable) markPending(name string, update func(*pendingWrite)) {
+	o.pendingMu.Lock()
+
+	if o.pending == nil {
+		o.pending = map[string]pendingWrite{}
+	}
+
+	entry := o.pending[name]
+	update(&entry)
+	o.pending[name] = entry
+	o.pendingMu.Unlock()
+
+	o.signalWriter()
+}
+
+// signalWriter wakes the writer without waiting: a wake-up already
+// queued covers this one too.
+func (o *ObserverRunnable) signalWriter() {
+	select {
+	case o.wakeChannel() <- struct{}{}:
+	default:
+	}
+}
+
+func (o *ObserverRunnable) wakeChannel() chan struct{} {
+	o.pendingMu.Lock()
+	defer o.pendingMu.Unlock()
+
+	if o.wake == nil {
+		o.wake = make(chan struct{}, 1)
+	}
+
+	return o.wake
+}
+
+// writeLoop writes pending resources whenever the reader marks some.
+func (o *ObserverRunnable) writeLoop(ctx context.Context, adm *drbd.Adm) {
+	wake := o.wakeChannel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-wake:
+			o.flush(ctx, adm)
+		}
+	}
+}
+
+// flush writes every pending resource once, from its view at the time
+// of the write. Frames that arrive meanwhile mark the resource pending
+// again for the next pass. Nothing is written while a stream's dump is
+// being read; the entries wait for releaseWrites.
+func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
+
+	o.pendingMu.Lock()
+
+	if o.holding {
+		o.pendingMu.Unlock()
+
+		return
+	}
+
+	batch := o.pending
+	o.pending = nil
+	o.pendingMu.Unlock()
+
+	names := make([]string, 0, len(batch))
+	for name := range batch {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	for _, name := range names {
+		if ctx.Err() != nil {
+			return
+		}
+
+		o.writeResource(ctx, adm, name, batch[name])
+	}
+}
+
+// writeResource carries out what the writer owes one resource.
+func (o *ObserverRunnable) writeResource(ctx context.Context, adm *drbd.Adm, name string, owed pendingWrite) {
+	logger := log.FromContext(ctx).WithName("observer")
+
+	if owed.detachFailed {
+		o.detachFailedReplica(ctx, logger, adm, name)
+	}
+
+	if owed.departed {
+		o.writeDeparted(ctx, logger, name)
+
+		return
+	}
+
+	// Stamped before the status so a status NotFound (Resource CRD not
+	// created yet) doesn't suppress the Condition; stampKernelLoaded
+	// silences NotFound the same way. Phase 11.3 Stage 3.
+	if owed.kernelLoaded != nil {
+		o.stampKernelLoadedLogged(ctx, logger, name, *owed.kernelLoaded)
+	}
+
+	view, known := o.cachedView(name)
+	if !known {
+		return
+	}
+
+	if owed.probeGI {
+		o.backfillCurrentGI(ctx, adm, &view)
+	}
+
+	err := o.writeStatus(ctx, &view)
+
+	switch {
+	case err == nil:
+	case apierrors.IsNotFound(err):
+		// Resource CRD not yet created — convergence-pending; the
+		// resync writes it once the CRD lands.
+	default:
+		logger.Error(err, "write Resource.Status", "resource", name)
+	}
+}
+
+// writeDeparted writes a resource the kernel no longer has: no observed
+// state at all, and KernelLoaded=False. Otherwise its status would keep
+// the last state seen, Connected and UpToDate, for good.
+func (o *ObserverRunnable) writeDeparted(ctx context.Context, logger logr.Logger, name string) {
+	err := o.writeStatus(ctx, &observation{ResourceName: name})
+	if err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "clear Resource.Status of a departed resource", "resource", name)
+	}
+
+	o.forgetApplied(name)
+	o.stampKernelLoadedLogged(ctx, logger, name, false)
+}
+
+func (o *ObserverRunnable) stampKernelLoadedLogged(ctx context.Context, logger logr.Logger, name string, loaded bool) {
+	err := o.stampKernelLoaded(ctx, name, loaded)
+	if err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "stamp KernelLoaded Condition", "resource", name)
+	}
+}
+
+// detachFailedReplica is the backing-device-failure auto-detach
+// (kernel-reported disk:Failed → drbdadm detach) plus the SkipDisk prop
+// write that pins the next reconcile onto `drbdadm adjust --skip-disk`.
 //
 // Scenario 5.11 (UG9 §4428-4460): kernel reports `change device
 // disk:Failed` when the backing block device starts returning I/O
@@ -1182,90 +1530,25 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 // the existing prop-management path drops the key and the next
 // reconcile resumes normal `drbdadm adjust` (which then tries to
 // re-attach the disk if the underlying block device is back).
-func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm, ev *observation) {
-	logger := log.FromContext(ctx).WithName("observer")
-
-	if ev.DrbdState == drbdDiskStateFailed {
-		err := adm.Detach(ctx, ev.ResourceName)
-		if err != nil {
-			logger.Error(err, "auto-detach on Failed", "resource", ev.ResourceName)
-		} else {
-			logger.Info("auto-detached failed replica", "resource", ev.ResourceName)
-		}
-
-		err = o.writeSkipDiskProp(ctx, ev.ResourceName)
-		switch {
-		case err == nil:
-			logger.Info("set DrbdOptions/SkipDisk on failed replica", "resource", ev.ResourceName)
-		case apierrors.IsNotFound(err):
-			// Resource CRD not yet created — convergence-pending; same
-			// silence policy as writeStatus.
-		default:
-			logger.Error(err, "set SkipDisk prop on Failed", "resource", ev.ResourceName)
-		}
+func (o *ObserverRunnable) detachFailedReplica(ctx context.Context, logger logr.Logger, adm *drbd.Adm, name string) {
+	err := adm.Detach(ctx, name)
+	if err != nil {
+		logger.Error(err, "auto-detach on Failed", "resource", name)
+	} else {
+		logger.Info("auto-detached failed replica", "resource", name)
 	}
 
-	// Connection observations arrive one peer at a time. SSA with the
-	// same FieldOwner replaces the full list each apply, so we
-	// aggregate per-resource state in-memory and emit the full
-	// snapshot. Without the merge, Apply N drops Apply N-1's other
-	// peers from this owner's claims and they vanish from Status.
-	o.mergeConnections(ev)
-	o.mergeVolumes(ev)
-	o.mergeResource(ev)
+	err = o.writeSkipDiskProp(ctx, name)
 
-	// Phase 11.7: wake the ResourceReconciler on every kernel-state
-	// lifecycle change (resource lifecycle, role, disk, conn, repl).
-	// The satellite's recovery decisions depend on observed state
-	// but many of them (peer flapping to StandAlone, the local disk
-	// transitioning Failed → Diskless) generate no apiserver Spec
-	// writes — so Generation never bumps and the primary For watch
-	// sees nothing. The trigger channel closes that loop
-	// architecturally; the primary watch's Status whitelist on
-	// DRBDNodeID/Port/Minor handles controller-allocator stamps
-	// separately. Pure out-of-sync deltas (statistics ticks) are
-	// suppressed by emitReconcileTrigger's signature-compare —
-	// without that suppression the trigger fires at ~1Hz per peer
-	// and defeats the primary-watch predicate's noise filter.
-	//
-	// Done BEFORE writeStatus so an apiserver hiccup on Status SSA
-	// doesn't suppress the wake-up — the recovery decision only
-	// needs the kernel-state change to land in the reconcile queue,
-	// not the corresponding Status PATCH to commit.
-	o.emitReconcileTrigger(ctx, ev)
-
-	// Phase 11.3 Stage 3: stamp the KernelLoaded Condition off the
-	// resource-kind frame lifecycle. Gated on HasKernelLoaded so
-	// device / peer-device / connection events (which carry no slot
-	// signal) don't drive a Condition write. Done before
-	// writeStatus so a writeStatus NotFound (Resource CRD not yet
-	// created) doesn't suppress the Condition path — stampKernelLoaded
-	// silences NotFound the same way writeStatus does.
-	if ev.HasKernelLoaded {
-		stampErr := o.stampKernelLoaded(ctx, ev.ResourceName, ev.KernelLoaded)
-		switch {
-		case stampErr == nil:
-		case apierrors.IsNotFound(stampErr):
-			// Resource CRD not yet created — convergence-pending; the
-			// observer's 5-second resync ticker plus the next events2
-			// frame will re-stamp once the CRD lands.
-		default:
-			logger.Error(stampErr, "stamp KernelLoaded Condition", "resource", ev.ResourceName)
-		}
+	switch {
+	case err == nil:
+		logger.Info("set DrbdOptions/SkipDisk on failed replica", "resource", name)
+	case apierrors.IsNotFound(err):
+		// Resource CRD not yet created — convergence-pending; same
+		// silence policy as writeStatus.
+	default:
+		logger.Error(err, "set SkipDisk prop on Failed", "resource", name)
 	}
-
-	o.backfillCurrentGI(ctx, adm, ev)
-
-	err := o.writeStatus(ctx, ev)
-	if err == nil {
-		return
-	}
-
-	if apierrors.IsNotFound(err) {
-		return
-	}
-
-	logger.Error(err, "write Resource.Status", "resource", ev.ResourceName)
 }
 
 // backfillCurrentGI fills ev.Volumes[].CurrentUUID from the on-disk GI
@@ -1280,8 +1563,7 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 //
 // Only volumes in a data-bearing disk state are probed (UpToDate /
 // Consistent / Outdated) — a fresh Inconsistent slot has no
-// meaningful GI to publish yet, and skipping it avoids a get-gi
-// round-trip on every statistics tick. Best-effort: a get-gi error or
+// meaningful GI to publish yet. Best-effort: a get-gi error or
 // empty result leaves CurrentUUID as-is (the gate stays conservative).
 func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm, ev *observation) {
 	for i := range ev.Volumes {
@@ -1381,7 +1663,17 @@ func (o *ObserverRunnable) emitReconcileTrigger(ctx context.Context, ev *observa
 	o.lifecycleCache[ev.ResourceName] = want
 	o.lifecycleMu.Unlock()
 
-	name, err := replicaCRName(ctx, o.Client, ev.ResourceName, o.NodeName)
+	o.sendReconcileTrigger(ctx, ev.ResourceName)
+}
+
+// sendReconcileTrigger enqueues the replica of rdName on the reconcile
+// trigger without waiting.
+func (o *ObserverRunnable) sendReconcileTrigger(ctx context.Context, rdName string) {
+	if o.ReconcileTrigger == nil {
+		return
+	}
+
+	name, err := replicaCRName(ctx, o.Client, rdName, o.NodeName)
 	if err != nil {
 		// The 5-second resync re-enqueues every local Resource anyway.
 		return
@@ -2042,7 +2334,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 	// seconds. Skip what the apiserver provably holds already; any
 	// other writer's change bumps the version and brings the apply
 	// back, so a clobbered field is still restored on the next pass.
-	if lookupErr == nil && o.alreadyApplied(name, &lookup, &apply.Status) {
+	if lookupErr == nil && o.alreadyApplied(ev.ResourceName, &lookup, &apply.Status) {
 		return nil
 	}
 
@@ -2059,12 +2351,12 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
 		client.FieldOwner(k8s.SatelliteFieldOwner))
 	if err != nil {
-		o.forgetApplied(name)
+		o.forgetApplied(ev.ResourceName)
 
 		return errors.Wrapf(err, "ssa apply Resource.Status %s", name)
 	}
 
-	o.rememberApplied(name, apply, sent)
+	o.rememberApplied(ev.ResourceName, apply, sent)
 
 	return nil
 }

@@ -23,7 +23,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -64,14 +63,12 @@ func TestObserverResyncSkipsAReplicaNothingChanged(t *testing.T) {
 	o.handleObservation(ctx, adm, deviceUpToDate())
 	o.handleObservation(ctx, adm, peerConnected("n2"))
 
-	logger := logr.Discard()
-
-	o.resyncOnce(ctx, logger)
+	o.resyncOnce(ctx)
 
 	before := applies.Load()
 
 	for range 3 {
-		o.resyncOnce(ctx, logger)
+		o.resyncOnce(ctx)
 	}
 
 	if got := applies.Load() - before; got != 0 {
@@ -96,7 +93,7 @@ func TestObserverResyncSkipsAReplicaNothingChanged(t *testing.T) {
 	}
 
 	before = applies.Load()
-	o.resyncOnce(ctx, logger)
+	o.resyncOnce(ctx)
 
 	if got := applies.Load() - before; got != 1 {
 		t.Fatalf("resync after another writer applied %d times, want 1", got)

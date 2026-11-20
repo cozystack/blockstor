@@ -38,6 +38,7 @@ exists device name:pvc-status volume:0 minor:1000 disk:Inconsistent client:no qu
 exists connection name:pvc-status peer-node-id:1 conn-name:n2 connection:Connected role:Secondary
 exists connection name:pvc-status peer-node-id:2 conn-name:n3 connection:StandAlone role:Unknown
 exists peer-device name:pvc-status peer-node-id:1 conn-name:n2 volume:0 replication:SyncTarget peer-disk:UpToDate done:12.50
+exists -
 `
 
 // What the kernel holds by the time a new stream dumps it: the resync
@@ -46,6 +47,7 @@ const events2AfterTheRestart = `exists resource name:pvc-status role:Secondary s
 exists device name:pvc-status volume:0 minor:1000 disk:UpToDate client:no quorum:yes
 exists connection name:pvc-status peer-node-id:1 conn-name:n2 connection:Connected role:Secondary
 exists peer-device name:pvc-status peer-node-id:1 conn-name:n2 volume:0 replication:Established peer-disk:UpToDate
+exists -
 `
 
 // drbdsetup events2 exits when the kernel drops notifications it had
