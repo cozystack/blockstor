@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
@@ -514,5 +516,50 @@ func TestAutoSnapshotSkipsAThickPoolNamedByProp(t *testing.T) {
 
 	if snaps := listAutoSnapshotsByRD(t, cli, rd.Name); len(snaps) != 0 {
 		t.Fatalf("auto-snapshot taken on a thick pool named by prop: %+v", snaps[0].Spec)
+	}
+}
+
+// The replicas are read scoped to the definition where the server can
+// select on the field: a full read of every Resource for every due
+// definition costs the API server on each tick.
+func TestAutoSnapshotReadsOnlyTheDefinitionsReplicas(t *testing.T) {
+	t.Parallel()
+
+	rd := makeRDWithAutoSnapshot(t, "pvc-scoped", 15, "")
+
+	var unscoped atomic.Int32
+
+	reader := fake.NewClientBuilder().
+		WithScheme(newSnapshotControllerScheme(t)).
+		WithObjects(replica(rd.Name, "n1"), replica("pvc-other", "n2")).
+		WithIndex(&blockstoriov1alpha1.Resource{}, "spec.resourceDefinitionName", func(o client.Object) []string {
+			return []string{o.(*blockstoriov1alpha1.Resource).Spec.ResourceDefinitionName}
+		}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				var lo client.ListOptions
+				lo.ApplyOptions(opts)
+
+				if _, isRes := list.(*blockstoriov1alpha1.ResourceList); isRes && lo.FieldSelector == nil {
+					unscoped.Add(1)
+				}
+
+				return c.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+
+	r, cli := autoSnapshotFixture(t, rd)
+	r.APIReader = reader
+
+	tick(t, r)
+
+	if n := unscoped.Load(); n != 0 {
+		t.Errorf("replicas read with %d unscoped list(s) of every Resource", n)
+	}
+
+	snaps := listAutoSnapshotsByRD(t, cli, rd.Name)
+	if len(snaps) != 1 || !slices.Equal(snaps[0].Spec.Nodes, []string{"n1"}) {
+		t.Fatalf("auto-snapshot not taken on the definition's replica: %+v", snaps)
 	}
 }

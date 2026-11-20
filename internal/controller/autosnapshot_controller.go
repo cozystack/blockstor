@@ -39,6 +39,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // AutoSnapshot prop keys mirror upstream LINSTOR's namespaced keys
@@ -406,7 +407,7 @@ func (t *autoSnapshotTarget) add(res *blockstoriov1alpha1.Resource) {
 func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
 ) (autoSnapshotTarget, string, error) {
-	resList, err := r.listReplicas(ctx)
+	replicas, err := r.replicasOf(ctx, rd)
 	if err != nil {
 		return autoSnapshotTarget{}, "", err
 	}
@@ -417,11 +418,8 @@ func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 		pools   []poolRef
 	)
 
-	for i := range resList.Items {
-		res := &resList.Items[i]
-		if !naming.Same(res.Spec.ResourceDefinitionName, rd.Name) {
-			continue
-		}
+	for i := range replicas {
+		res := &replicas[i]
 
 		node, nodeErr := r.replicaNode(ctx, res.Spec.NodeName)
 		if nodeErr != nil {
@@ -468,21 +466,21 @@ func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 	return target, "", nil
 }
 
-// listReplicas lists every Resource, through APIReader when set.
-func (r *AutoSnapshotRunnable) listReplicas(ctx context.Context) (*blockstoriov1alpha1.ResourceList, error) {
-	var resList blockstoriov1alpha1.ResourceList
-
+// replicasOf lists the replicas of rd, through APIReader when set.
+func (r *AutoSnapshotRunnable) replicasOf(
+	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
+) ([]blockstoriov1alpha1.Resource, error) {
 	reader := client.Reader(r.Client)
 	if r.APIReader != nil {
 		reader = r.APIReader
 	}
 
-	err := reader.List(ctx, &resList)
+	replicas, err := k8s.ResourceCRDsOfDefinition(ctx, reader, rd.Name)
 	if err != nil {
 		return nil, errors.Wrap(err, "list Resources")
 	}
 
-	return &resList, nil
+	return replicas, nil
 }
 
 // replicaPool is the storage pool a replica is on: the spec field, or

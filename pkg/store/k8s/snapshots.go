@@ -705,7 +705,7 @@ func (s *snapshots) sourceLUKSKeys(ctx context.Context, rdCRName string, nodes [
 		reader = s.apiReader
 	}
 
-	replicas, err := resourceCRDsOfDefinition(ctx, reader, rdCRName)
+	replicas, err := ResourceCRDsOfDefinition(ctx, reader, rdCRName)
 	if err != nil {
 		return nil, err
 	}
@@ -739,30 +739,59 @@ func (s *snapshots) sourceLUKSKeys(ctx context.Context, rdCRName string, nodes [
 	return out, nil
 }
 
-// resourceCRDsOfDefinition lists the Resource CRs whose spec names the
-// definition rdCRName, scoped by the selectable field where the server serves
-// it and by a full read otherwise.
-func resourceCRDsOfDefinition(ctx context.Context, reader ctrlclient.Reader, rdCRName string) ([]crdv1alpha1.Resource, error) {
+// ResourceCRDsOfDefinition lists the Resource CRs of the definition rdName,
+// under every spelling a replica may name it by, scoped by the selectable
+// field where the server serves it and by a single full read otherwise. The
+// auto-snapshot runnable shares it with the REST create, so both take a
+// snapshot from, and copy the LUKS passwords of, the same replicas.
+func ResourceCRDsOfDefinition(ctx context.Context, reader ctrlclient.Reader, rdName string) ([]crdv1alpha1.Resource, error) {
+	spellings, err := rdSpellings(ctx, reader, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []crdv1alpha1.Resource
+
+	seen := map[string]bool{}
+
+	for _, spelling := range spellings {
+		var list crdv1alpha1.ResourceList
+
+		err := reader.List(ctx, &list, ctrlclient.MatchingFields{FieldResourceDefinitionName: spelling})
+		if SelectorUnsupported(err) {
+			return resourceCRDsNamedAnyOf(ctx, reader, spellings)
+		}
+
+		if err != nil {
+			return nil, errors.Wrapf(err, "list the replicas of %q", rdName)
+		}
+
+		for i := range list.Items {
+			if !seen[list.Items[i].Name] {
+				seen[list.Items[i].Name] = true
+
+				out = append(out, list.Items[i])
+			}
+		}
+	}
+
+	return out, nil
+}
+
+// resourceCRDsNamedAnyOf is ResourceCRDsOfDefinition for a server that cannot
+// select on the field: one full read, filtered here.
+func resourceCRDsNamedAnyOf(ctx context.Context, reader ctrlclient.Reader, spellings []string) ([]crdv1alpha1.Resource, error) {
 	var list crdv1alpha1.ResourceList
 
-	err := reader.List(ctx, &list, ctrlclient.MatchingFields{FieldResourceDefinitionName: rdCRName})
-	if err == nil {
-		return list.Items, nil
-	}
-
-	if !SelectorUnsupported(err) {
-		return nil, errors.Wrapf(err, "list the replicas of %q", rdCRName)
-	}
-
-	err = reader.List(ctx, &list)
+	err := reader.List(ctx, &list)
 	if err != nil {
-		return nil, errors.Wrapf(err, "list the replicas of %q", rdCRName)
+		return nil, errors.Wrapf(err, "list the replicas of %q", spellings[0])
 	}
 
 	out := list.Items[:0]
 
 	for i := range list.Items {
-		if list.Items[i].Spec.ResourceDefinitionName == rdCRName {
+		if slices.Contains(spellings, list.Items[i].Spec.ResourceDefinitionName) {
 			out = append(out, list.Items[i])
 		}
 	}
