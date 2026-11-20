@@ -283,7 +283,7 @@ func TestCreateMDWithCollisionRecoveryFreesForeignZombie(t *testing.T) {
 		Adm: drbd.NewAdm(seq),
 	})
 
-	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol")
+	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol", drbd.DefaultGeometry())
 	if err != nil {
 		t.Fatalf("createMDWithCollisionRecovery: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestCreateMDWithCollisionRecoveryRefusesSelfTearDown(t *testing.T) {
 		Adm: drbd.NewAdm(fx),
 	})
 
-	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol")
+	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol", drbd.DefaultGeometry())
 	if err == nil {
 		t.Fatalf("createMDWithCollisionRecovery: expected error on self-owned collision, got nil")
 	}
@@ -579,6 +579,9 @@ func uncleanFixture(
 	fx := storage.NewFakeExec()
 	fx.Expect("drbdadm dump-md pvc-unclean/0", storage.FakeResponse{Err: errDumpMdUnclean})
 	fx.Expect("drbdadm create-md --force --max-peers=15 pvc-unclean/0", storage.FakeResponse{})
+	// The superblock is one blockstor made, in its own layout. A test of
+	// another layout registers its own.
+	fx.Expect("drbdadm dump-md --force pvc-unclean/0", storage.FakeResponse{Stdout: dumpWithPeerSlots(15)})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := NewReconciler(ReconcilerConfig{
@@ -703,6 +706,13 @@ func dumpWithHistory(current, history string) []byte {
 	return dumpV09(current, "0000000000000000", history)
 }
 
+// dumpWithPeerSlots is a dump of a superblock with the given peer-slot
+// count and no GI anything here recorded.
+func dumpWithPeerSlots(slots int) []byte {
+	return []byte(strings.Replace(string(dumpWithPeerBitmap("9F00AA11BB22CC33", "0000000000000000")),
+		"max-peers 7;", "max-peers "+strconv.Itoa(slots)+";", 1))
+}
+
 func dumpV09(current, peerBitmap, history string) []byte {
 	return []byte("# DRBD meta data dump\nversion \"v09\";\n\nmax-peers 7;\n" +
 		"node-id 0;\ncurrent-uuid 0x" + current + ";\nflags 0x00000011;\n" +
@@ -713,6 +723,7 @@ func dumpV09(current, peerBitmap, history string) []byte {
 		"    bitmap-dagtag 0x0000000000000000;\n    flags 0x00000005;\n}\n" +
 		"history-uuids {\n        0x" + history + "; 0x0000000000000000; 0x0000000000000000; 0x0000000000000000;\n}\n" +
 		"la-size-sect 2097152;\nbm-byte-per-bit 4096;\ndevice-uuid 0x5A5A5A5A5A5A5A5A;\n" +
+		"la-peer-max-bio-size 1048576;\nal-stripes 1;\nal-stripe-size-4k 8;\n" +
 		"bitmap[0] {\n   # at 0kB\n    64 times 0x0000000000000000;\n}\n")
 }
 

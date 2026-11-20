@@ -48,6 +48,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/luks"
@@ -667,7 +668,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// RequeueAfter ensures the next attempt sees the freshly-
 	// committed peer state.
 	if anyFailed {
-		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
+		return ctrl.Result{RequeueAfter: failureRequeue(results)}, nil
 	}
 
 	// Phase 11.7 safety net: schedule a periodic re-eval on
@@ -842,9 +843,10 @@ func (r *ResourceReconciler) holdForAdoptedPeers(
 // returns whether any of the results came back not-Ok. Extracted from
 // runApply so the orchestration stays under the funlen budget.
 //
-// A LUKS layer that refused to format a device holding data also gets a
-// Warning Event on the Resource: the volume never comes up, and an Info
-// line in this log is not where an operator looks for why.
+// A refusal an operator must act on, the LUKS layer's or drbdmeta's over
+// data on the lower disk, also gets a Warning Event on the Resource: the
+// volume never comes up, and an Info line in this log is not where an
+// operator looks for why.
 func (r *ResourceReconciler) recordPerResourceFailures(
 	res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult, logger logr.Logger,
 ) bool {
@@ -863,7 +865,7 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 			continue
 		}
 
-		for _, refusal := range luksRefusals() {
+		for _, refusal := range applyRefusals() {
 			if strings.Contains(result.GetMessage(), refusal.err.Error()) {
 				r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, refusal.reason, "Apply",
 					"%s: %s", refusal.what, result.GetMessage())
@@ -880,18 +882,50 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 // a device that carries a signature.
 const deviceHoldsDataReason = "LUKSDeviceHoldsData"
 
-// luksRefusal is a LUKS layer refusal an operator must act on, and the
-// Warning Event reason it is reported under.
-type luksRefusal struct {
+// applyRefusal is a refusal of the apply an operator must act on, from the
+// LUKS layer or from drbdmeta, and the Warning Event reason it is reported
+// under.
+type applyRefusal struct {
 	err          error
 	reason, what string
+}
+
+// createMDRefusedReason is the Event reason for metadata drbdmeta refused
+// to write over the data on a lower disk.
+const createMDRefusedReason = "CreateMdRefused"
+
+// applyRefusals lists every refusal reported as a Warning Event.
+func applyRefusals() []applyRefusal {
+	return append(luksRefusals(), applyRefusal{
+		drbd.ErrCreateMDRefused, createMDRefusedReason,
+		"drbdmeta refused to create metadata over the data on the lower disk",
+	})
+}
+
+// refusedApplyRequeue is the retry interval of an apply whose only failure
+// is a create-md drbdmeta refused. drbdmeta refuses the same lower disk the
+// same way every time, so the 5 second retry of applyFailureRequeue only
+// loops: it repeats the command, the log line and the Event, and holds the
+// satellite's work queue, for nothing that can change by itself. A change
+// to the Resource or its definition still reconciles at once.
+const refusedApplyRequeue = 5 * time.Minute
+
+// failureRequeue picks the retry interval of an apply that failed.
+func failureRequeue(results []*intent.ResourceApplyResult) time.Duration {
+	for _, result := range results {
+		if !result.GetOk() && !strings.Contains(result.GetMessage(), drbd.ErrCreateMDRefused.Error()) {
+			return applyFailureRequeue
+		}
+	}
+
+	return refusedApplyRequeue
 }
 
 // luksRefusals lists the refusals the LUKS layer reports through the apply
 // message. Each leaves the volume down, and an Info line in this log is
 // not where an operator looks for why.
-func luksRefusals() []luksRefusal {
-	return []luksRefusal{
+func luksRefusals() []applyRefusal {
+	return []applyRefusal{
 		{luks.ErrDeviceHoldsData, deviceHoldsDataReason, "the LUKS layer refused to format a device that already holds data"},
 		{luks.ErrLUKSKeyMissing, "LUKSKeyMissing", "the device has a LUKS header but the replica carries no password for it"},
 		{luks.ErrLUKSKeyMismatch, "LUKSKeyMismatch", "the replica's password does not open the device's LUKS header"},
