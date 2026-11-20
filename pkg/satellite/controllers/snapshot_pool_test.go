@@ -222,7 +222,8 @@ func TestSnapshotPoolTieGoesToTheReplica(t *testing.T) {
 // Recorded on a later pass, it would be lost whenever the source replica
 // goes in between, which is what linstor-csi does as soon as the
 // VolumeSnapshot is ready; the probe here finds nothing, so only the take
-// can record it.
+// can record it. The satellite runs no DRBD, so the take needs no suspend
+// window and runs on this pass.
 func TestSnapshotTakeRecordsItsPoolWithReady(t *testing.T) {
 	t.Parallel()
 
@@ -235,12 +236,8 @@ func TestSnapshotTakeRecordsItsPoolWithReady(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1"},
-			SuspendIO:              true,
 			TakeSnapshot:           true,
 			VolumeDefinitions:      []blockstoriov1alpha1.SnapshotVolumeRef{{VolumeNumber: 0}},
-		},
-		Status: blockstoriov1alpha1.SnapshotStatus{
-			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{{NodeName: "n1", SuspendIOAcked: true}},
 		},
 	}
 
@@ -263,16 +260,25 @@ func TestSnapshotTakeRecordsItsPoolWithReady(t *testing.T) {
 		},
 	}
 
-	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "pvc-1.snap-1"},
-	})
-	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
 	var got blockstoriov1alpha1.Snapshot
-	if err := cli.Get(t.Context(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got); err != nil {
-		t.Fatalf("Get: %v", err)
+
+	// The passes before the take may only requeue; the one that takes
+	// stamps Ready, and the take is what has to record the pool.
+	for range 3 {
+		_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: "pvc-1.snap-1"},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+
+		if err := cli.Get(t.Context(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got); err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+
+		if len(got.Status.NodeStatus) == 1 && got.Status.NodeStatus[0].Ready {
+			break
+		}
 	}
 
 	if len(got.Status.NodeStatus) != 1 || !got.Status.NodeStatus[0].Ready {

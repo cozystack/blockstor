@@ -618,7 +618,10 @@ func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnaps
 // snapshot of rdName. Pools whose provider cannot tell are left out, and
 // so is one whose probe fails: a pool listed here holds the copy.
 func (r *Reconciler) SnapshotPools(ctx context.Context, rdName, snapName string) []string {
-	providers := r.SnapshotProviders()
+	r.mu.Lock()
+	providers := maps.Clone(r.cfg.Providers)
+	r.mu.Unlock()
+
 	pools := slices.Sorted(maps.Keys(providers))
 	holding := make([]string, 0, 1)
 
