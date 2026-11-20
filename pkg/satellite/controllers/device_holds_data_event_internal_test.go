@@ -15,20 +15,20 @@ import (
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
-// A LUKS format refused over a device that holds data leaves the volume down
-// for good, so the refusal reaches the Resource as a Warning Event and not
-// only the satellite log. Any other failure stays a log line.
+// A failed apply leaves the replica down or StandAlone, so it reaches the
+// Resource as a Warning Event and not only the satellite log: a LUKS format
+// refused over a device that holds data under its own reason, any other
+// failure, a drbdadm adjust refused over a port in use say, as ApplyFailed.
 func TestAFormatRefusedOverDataIsAWarningEventOnTheResource(t *testing.T) {
 	t.Parallel()
 
 	res := &blockstoriov1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.node-a"}}
 
 	for _, tc := range []struct {
-		name, message string
-		event         bool
+		name, message, reason string
 	}{
-		{name: "holds-data", message: "luks format /dev/vg/pvc-1_00000: carries TYPE=ext4; refusing luksFormat: " + luks.ErrDeviceHoldsData.Error(), event: true},
-		{name: "other", message: "drbdadm adjust pvc-1: exit status 10", event: false},
+		{name: "holds-data", message: "luks format /dev/vg/pvc-1_00000: carries TYPE=ext4; refusing luksFormat: " + luks.ErrDeviceHoldsData.Error(), reason: deviceHoldsDataReason},
+		{name: "other", message: "adjust pvc-1: drbdadm adjust pvc-1: Failure: (103) Remote address(port) already in use", reason: applyFailedReason},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -43,15 +43,17 @@ func TestAFormatRefusedOverDataIsAWarningEventOnTheResource(t *testing.T) {
 
 			select {
 			case ev := <-recorder.Events:
-				if !tc.event {
-					t.Errorf("unexpected Event %q", ev)
-				} else if !strings.Contains(ev, "Warning "+deviceHoldsDataReason) {
-					t.Errorf("Event = %q, want a Warning %s", ev, deviceHoldsDataReason)
+				if !strings.Contains(ev, "Warning "+tc.reason) || !strings.Contains(ev, tc.message) {
+					t.Errorf("Event = %q, want a Warning %s carrying the failure", ev, tc.reason)
+				}
+
+				select {
+				case extra := <-recorder.Events:
+					t.Errorf("a second Event %q for one failure", extra)
+				default:
 				}
 			default:
-				if tc.event {
-					t.Error("no Event for a format refused over data")
-				}
+				t.Errorf("no Event for a failed apply (%s)", tc.name)
 			}
 		})
 	}
