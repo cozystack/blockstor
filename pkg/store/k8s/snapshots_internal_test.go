@@ -222,3 +222,32 @@ func TestSnapshotWithoutRecordFallsBackToDefinition(t *testing.T) {
 		t.Fatalf("a snapshot recorded with no props serves %v", props)
 	}
 }
+
+// TestCrdToWireSnapshotCarriesTheAbortReason: the snapshot create answers
+// a failed take with the abort the controller recorded, so the wire DTO
+// carries it, from Spec or, for a writer that predates the field, from the
+// annotation written beside it.
+func TestCrdToWireSnapshotCarriesTheAbortReason(t *testing.T) {
+	t.Parallel()
+
+	const reason = "snapshot aborted: the take did not start in time"
+
+	fromSpec := &crdv1alpha1.Snapshot{
+		Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "src", SnapshotName: "snap", AbortReason: reason},
+	}
+
+	if got := crdToWireSnapshot(fromSpec, nil).AbortReason; got != reason {
+		t.Errorf("from Spec: AbortReason %q, want %q", got, reason)
+	}
+
+	fromAnnotation := &crdv1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			crdv1alpha1.AnnotationSnapshotAbortReason: reason,
+		}},
+		Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "src", SnapshotName: "snap"},
+	}
+
+	if got := crdToWireSnapshot(fromAnnotation, nil).AbortReason; got != reason {
+		t.Errorf("from the annotation: AbortReason %q, want %q", got, reason)
+	}
+}

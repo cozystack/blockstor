@@ -431,6 +431,13 @@ func crdToWireSnapshot(
 		Annotations:             withoutNameAnnotations(userAnnotations(crd.Annotations)),
 		UUID:                    string(crd.UID),
 		SnapshotDefinitionProps: crd.Spec.Props,
+		AbortReason:             crd.Spec.AbortReason,
+	}
+
+	// A writer that predates Spec.AbortReason keeps the record only in
+	// the annotation the controller writes beside it.
+	if out.AbortReason == "" {
+		out.AbortReason = crd.Annotations[crdv1alpha1.AnnotationSnapshotAbortReason]
 	}
 
 	// Parent-RD-derived fields — guarded by nil-check so an orphan
