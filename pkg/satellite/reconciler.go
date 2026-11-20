@@ -509,10 +509,9 @@ func (r *Reconciler) SetSkipDiskClearer(c SkipDiskClearer) {
 // "Failed to adjust DRBD resource …" / "Cannot resize volume, because
 // we have a non-UpToDate DRBD device" upstream.
 //
-// Empty string means "StateDir-based filtering disabled" — the sweeper
-// then sweeps purely on CRD presence, the legacy behaviour. Tests use
-// the empty default to keep assertions simple; production always
-// passes the real on-disk path from cmd/satellite.
+// Empty string leaves the sweeper with no ownership record, so it
+// tears nothing down; production always passes the real on-disk path
+// from cmd/satellite.
 func (r *Reconciler) StateDir() string {
 	return r.cfg.StateDir
 }
