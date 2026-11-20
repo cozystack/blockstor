@@ -343,3 +343,49 @@ func TestMakeAvailableAnswersOnceTheDisklessReplicaIsBuilt(t *testing.T) {
 		t.Fatalf("satellite stand-in: %v", err)
 	}
 }
+
+// TestSpawnAnswersOnceThePlacedReplicaIsBuilt pins the same wait on a
+// spawn: LINSTOR places it through autoplace and its deployResources.
+func TestSpawnAnswersOnceThePlacedReplicaIsBuilt(t *testing.T) {
+	st := store.NewInMemory()
+
+	seedReadyWaitNode(t, st, "n1", apiv1.NodeTypeOnline)
+
+	if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{
+		Name: "rg-local",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+			LayerStack:  []string{apiv1.LayerKindStorage},
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base := startDeployWaitServer(t, st, 10*time.Second, 10*time.Second)
+	standIn := deviceStandIn(t.Context(), st, "pvc-spawn", 1, []string{"n1"}, 300*time.Millisecond)
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-spawn",
+		VolumeSizes:            []int64{1 << 20},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rcs, _ := postForRcs(t, base+"/v1/resource-groups/rg-local/spawn", body, http.StatusCreated)
+
+	if replicas, err := st.Resources().ListByDefinition(t.Context(), "pvc-spawn"); err != nil || len(replicas) != 1 {
+		t.Fatalf("spawn placed %d replicas (err %v), want 1: %+v", len(replicas), err, rcs)
+	}
+
+	requireDevicePaths(t, st, "pvc-spawn", []string{"n1"})
+
+	if w := warningsFor(rcs); len(w) != 0 {
+		t.Errorf("unexpected warnings for a replica that was built: %v", w)
+	}
+
+	if err := <-standIn; err != nil {
+		t.Fatalf("satellite stand-in: %v", err)
+	}
+}
