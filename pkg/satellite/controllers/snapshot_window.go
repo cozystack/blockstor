@@ -692,7 +692,12 @@ func (r *SnapshotReconciler) resumeAndVerify(ctx context.Context, marker *suspen
 // close of a window this process opened skips it: the resource is
 // suspended and the marker has its minors, so the read would only hold
 // I/O frozen for one more command. LINSTOR resumes right after the take
-// the same way, with resume-io alone.
+// the same way, with resume-io alone. Skipping the read is safe because
+// resume-io clears only the suspends a resume is meant to end: the
+// kernel recomputes a quorum suspend from the peers' state on every
+// state change (drbd_state.c sanitize_state), so a resource that lost
+// quorum stays frozen. A repeated resume-io on a close retry is
+// harmless unless fencing or on-no-data-accessible suspend-io is set.
 func (r *SnapshotReconciler) resumeVerified(ctx context.Context, marker *suspendMarker, readFirst bool) error {
 	if !r.Config.Apply.DRBDEnabled() {
 		return nil
