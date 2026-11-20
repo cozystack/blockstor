@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -406,6 +407,57 @@ func TestApplyDisklessNoCreateMD(t *testing.T) {
 		if strings.HasPrefix(line, "drbdadm create-md") {
 			t.Errorf("DISKLESS issued create-md: %s", line)
 		}
+	}
+}
+
+// TestApplyDisklessReportsDRBDDevicePath pins the device path of a
+// diskless DRBD replica: /dev/drbd<minor>, as LINSTOR reports it. The
+// REST view copies it into the volume linstor-csi reads on a remote
+// attach; without it ControllerPublishVolume fails with "could not
+// determine device path" on every attempt.
+func TestApplyDisklessReportsDRBDDevicePath(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  t.TempDir(),
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-remote",
+			NodeName: "n1",
+			Flags:    []string{"DISKLESS"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1 << 20},
+				{VolumeNumber: 1, SizeKib: 1 << 20, Minor: 1007},
+			},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply results: %+v", results)
+	}
+
+	got := map[int32]string{}
+	for _, v := range results[0].GetVolumes() {
+		got[v.GetVolumeNumber()] = v.GetDevicePath()
+	}
+
+	want := map[int32]string{0: "/dev/drbd1000", 1: "/dev/drbd1007"}
+	if !maps.Equal(got, want) {
+		t.Errorf("diskless device paths: got %v, want %v", got, want)
 	}
 }
 
