@@ -246,12 +246,18 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{Requeue: requeue}, err
 	}
 
-	err = r.freezeBlockSize(ctx, &target)
-	if err != nil {
-		return ctrl.Result{}, err
+	// A freeze that fails is retried, but does not hold up the rest of
+	// the replica's housekeeping: the stamp only stops a later size
+	// change, and an in-use replica whose freeze keeps being refused
+	// still needs its apply.
+	freezeErr := r.freezeBlockSize(ctx, &target)
+
+	result, err := r.runApply(ctx, &target)
+	if freezeErr != nil {
+		return ctrl.Result{}, cerrors.Join(err, freezeErr)
 	}
 
-	return r.runApply(ctx, &target)
+	return result, err
 }
 
 // allocateIdentity gives a replica its DRBD identity, the block size of

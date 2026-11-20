@@ -20,6 +20,8 @@ package controller_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,6 +29,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
@@ -383,5 +386,66 @@ func TestRunningPeerIsNotPending(t *testing.T) {
 
 	if got := props[blocksize.PropBlockSize]; got != "512" {
 		t.Fatalf("block-size = %q, want 512", got)
+	}
+}
+
+var errFreezeRefused = errors.New("admission refused the freeze")
+
+// TestRefusedFreezeStillApplies: a freeze the API server keeps refusing
+// is retried, but the in-use replica's housekeeping still runs. Here it
+// drops a volume its definition no longer has; returning before the
+// apply left that undone for as long as the freeze failed.
+func TestRefusedFreezeStillApplies(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	f := newBSFixture(map[string]string{blocksize.PropBlockSize: "4096"})
+
+	target := running(bsReplica(bsNode))
+	target.Status.Role = "Primary"
+	target.Status.InUse = true
+	target.Spec.Volumes = []blockstoriov1alpha1.ResourceVolumeSpec{{VolumeNumber: 0}, {VolumeNumber: 7}}
+
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}, &blockstoriov1alpha1.ResourceDefinition{}).
+		WithObjects(append([]client.Object{f.rd, target}, f.objects...)...).
+		Build()
+
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if data, _ := patch.Data(obj); strings.Contains(string(data), blocksize.PropFreeze) {
+				return errFreezeRefused
+			}
+
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+
+	// The first passes give the replica the rest of its identity and
+	// requeue; the freeze comes after.
+	var err error
+
+	for range 4 {
+		_, err = rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: target.Name}})
+	}
+
+	if !errors.Is(err, errFreezeRefused) {
+		t.Fatalf("Reconcile: %v, want the freeze error so it is retried", err)
+	}
+
+	var got blockstoriov1alpha1.Resource
+
+	err = cli.Get(ctx, client.ObjectKey{Name: target.Name}, &got)
+	if err != nil {
+		t.Fatalf("get replica: %v", err)
+	}
+
+	for _, vol := range got.Spec.Volumes {
+		if vol.VolumeNumber == 7 {
+			t.Fatalf("the apply did not run while the freeze failed: volumes %v", got.Spec.Volumes)
+		}
 	}
 }
