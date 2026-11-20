@@ -4,6 +4,29 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.5 — 2026-11-20
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #296 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.4; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.4
+
+- **A snapshot restores after its source volume is deleted (#294).** Each satellite records the pool that holds its copy in the Snapshot's new `status.nodeStatus[].storagePool`, in the write that marks the copy Ready; older copies are backfilled from the pools that hold them, including the snapshots ZFS keeps under a deleted zvol's renamed name.
+- **A restore takes each replica's pool from the snapshot (#294).** The REST restore and `s resource restore` read the pool recorded for the node, and a restore with no usable pool is refused with `FAIL_NOT_FOUND_STOR_POOL` before anything is written.
+- **Autoplace keeps a restored definition on the snapshot's backend after the source is gone (#294).** On a node holding a copy the new replica stays in that pool.
+- **Replicas cloned from the snapshot come up UpToDate on their own (#294).** The restore no longer depends on one elected replica coming up, and the restore set ends the first time a replica is Primary, so a replica added later syncs from a peer as in LINSTOR.
+- **`linstor-migrate` refuses a dump not read at the storage version (#293).** A plain `kubectl get` reads LINSTOR's CRDs at an old schema that silently drops each replica's `tcp_port_list`; the runbook now names the storage version, and the error points to that step.
+- **Each adopted replica takes its DRBD port from LINSTOR's database (#293).** A live port map is the cross-check: the kernel's port is kept and any disagreement is reported per replica.
+- **A resource group keeps its `peer_slots`, and a dropped `x_replicas_on_different` is reported (#293).**
+- **A rebooted node brings its resources up in parallel (#295).** The satellite's Resource controller runs eight workers by default, set with `--resource-workers`.
+- **A `.res` is replaced in one rename (#295).** A drbdadm for another resource never reads a half-written file, and deleting a resource also removes a candidate a crash left behind.
+- **The cold start waits for the API server and stays live (#295).** Ownership reads retry with back-off while the satellite answers `/healthz` itself, and a probe cut short by shutdown cleans nothing.
+- **A resyncing replica shows DRBD's own progress, as LINSTOR does (#296).** The satellite keeps `done` and the replication state per peer and volume, the REST view and the CLI render `SyncTarget(50.31%)`, and `Inconsistent(NN%)` is gone.
+- **`resource list` in the native CLI no longer reads volume definitions (#296).**
+- **`vd d` takes a volume out of DRBD without suspending the volumes that stay (#273).** On a Secondary whose other volumes hold quorum the satellite relaxes `on-no-quorum` for the removal, and the quorum recheck switches the policy and back instead of running `resume-io`, so a snapshot's suspension is never lifted.
+- **A pool-less replica lists its volumes with a pool its node has (#278).** The pool is resolved the way LINSTOR does, on the view and on every other volume listing, so the scheduler extender no longer panics on an empty list.
+- **A snapshot create answers once its take is over (#292).** Both REST mounts hold the answer, and a failed take is answered with its abort error.
+- **A cross-node ZFS restore removes the snapshot it received (#271).** A receive interrupted before its cleanup is finished on the next pass.
+
 ## v0.4.0-alpha.4 — 2026-11-20
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #292 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.3; the entries below are what changed since.
