@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package blocksize_test
+
+import (
+	"testing"
+
+	"github.com/cozystack/blockstor/pkg/blocksize"
+)
+
+func TestPoolIoSize(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		value string
+		want  int64
+	}{
+		{value: "", want: 512},
+		{value: "4096", want: 4096},
+		{value: "16384", want: 4096},
+		{value: "256", want: 512},
+		{value: "junk", want: 512},
+	} {
+		got := blocksize.PoolIoSize(map[string]string{blocksize.PropPoolMinIoSize: tc.value})
+		if got != tc.want {
+			t.Errorf("PoolIoSize(%q) = %d, want %d", tc.value, got, tc.want)
+		}
+	}
+}
+
+func TestHasSpecialLayers(t *testing.T) {
+	t.Parallel()
+
+	if blocksize.HasSpecialLayers([]string{"DRBD", "STORAGE"}) {
+		t.Error("DRBD,STORAGE counted as special")
+	}
+
+	if blocksize.HasSpecialLayers(nil) {
+		t.Error("an empty stack counted as special")
+	}
+
+	if !blocksize.HasSpecialLayers([]string{"DRBD", "LUKS", "STORAGE"}) {
+		t.Error("LUKS not counted as special")
+	}
+}
+
+func TestAutoEnabled(t *testing.T) {
+	t.Parallel()
+
+	off := map[string]string{blocksize.PropAuto: "false"}
+	on := map[string]string{blocksize.PropAuto: "true"}
+
+	if !blocksize.AutoEnabled() {
+		t.Error("unset is not on")
+	}
+
+	if blocksize.AutoEnabled(nil, off) {
+		t.Error("false on a lower level was ignored")
+	}
+
+	if !blocksize.AutoEnabled(on, off) {
+		t.Error("the closest level did not win")
+	}
+}
+
+func TestDecide(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		in   blocksize.Input
+		want blocksize.Decision
+	}{
+		{
+			name: "auto-off",
+			in:   blocksize.Input{ReplicaSize: 4096, CanChange: true},
+			want: blocksize.Decision{Verdict: blocksize.Keep},
+		},
+		{
+			name: "unset-takes-pool",
+			in:   blocksize.Input{Auto: true, ReplicaSize: 4096, CanChange: true},
+			want: blocksize.Decision{Verdict: blocksize.Set, Size: 4096},
+		},
+		{
+			name: "unset-takes-default-pool",
+			in:   blocksize.Input{Auto: true, ReplicaSize: 512, CanChange: true},
+			want: blocksize.Decision{Verdict: blocksize.Set, Size: 512},
+		},
+		{
+			name: "unset-cannot-change",
+			in:   blocksize.Input{Auto: true, ReplicaSize: 4096},
+			want: blocksize.Decision{Verdict: blocksize.Incompatible},
+		},
+		{
+			name: "smaller-pool-keeps",
+			in: blocksize.Input{
+				Auto: true, ReplicaSize: 512,
+				VDProps: map[string]string{blocksize.PropBlockSize: "4096"},
+			},
+			want: blocksize.Decision{Verdict: blocksize.Keep},
+		},
+		{
+			name: "larger-pool-raises",
+			in: blocksize.Input{
+				Auto: true, ReplicaSize: 4096, CanChange: true,
+				VDProps: map[string]string{blocksize.PropBlockSize: "512"},
+			},
+			want: blocksize.Decision{Verdict: blocksize.Set, Size: 4096},
+		},
+		{
+			name: "larger-pool-frozen",
+			in: blocksize.Input{
+				Auto: true, ReplicaSize: 4096,
+				VDProps: map[string]string{blocksize.PropBlockSize: "512"},
+			},
+			want: blocksize.Decision{Verdict: blocksize.Incompatible, Size: 512},
+		},
+	} {
+		if got := blocksize.Decide(tc.in); got != tc.want {
+			t.Errorf("%s: Decide = %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestFreezeAndRelease(t *testing.T) {
+	t.Parallel()
+
+	props := map[string]string{blocksize.PropBlockSize: "4096", "Other": "x"}
+
+	if !blocksize.Freeze(props) || !blocksize.Frozen(props) {
+		t.Fatalf("Freeze did not freeze: %v", props)
+	}
+
+	if blocksize.Freeze(props) {
+		t.Fatal("a second Freeze reported a change")
+	}
+
+	if !blocksize.Release(props) {
+		t.Fatal("Release reported no change")
+	}
+
+	if len(props) != 1 || props["Other"] != "x" {
+		t.Fatalf("Release left %v", props)
+	}
+}
