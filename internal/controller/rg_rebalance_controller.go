@@ -152,10 +152,12 @@ func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // reconciler.
 //
 // The kill switch stops the balance task, not an explicit `rg modify`:
-// LINSTOR autoplaces every child of a modified group whatever its
-// BalanceResources setting. A DRBD child gets that placement from the
-// RG event path on the same update, which leaves out a child without
-// DRBD, so this pass places those before it strips the marker.
+// LINSTOR reads it in BalanceResources alone and autoplaces every child
+// of a modified group without consulting it. So this pass places every
+// child before it strips the marker, whatever its layer stack. It does
+// not leave the DRBD children to the RG event path: that path is not
+// where LINSTOR's modify places, and it is free to apply the balance
+// checks, the switch among them.
 func (r *RGRebalanceReconciler) handleDisabledPass(ctx context.Context, rg *apiv1.ResourceGroup) error {
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; !hasAnnotation {
 		return nil
@@ -163,12 +165,12 @@ func (r *RGRebalanceReconciler) handleDisabledPass(ctx context.Context, rg *apiv
 
 	log := logf.FromContext(ctx).WithValues("rg", rg.Name)
 
-	count, err := r.rebalanceChildRDs(ctx, rg, 0, childrenWithoutDRBD)
+	count, err := r.rebalanceChildRDs(ctx, rg, 0, allChildren)
 	if err != nil {
 		return err
 	}
 
-	log.Info("rebalance disabled by BalanceResourcesEnabled=false; placed only the explicit modify on children without DRBD, stripping annotation",
+	log.Info("rebalance disabled by BalanceResourcesEnabled=false; placed the explicit modify, stripping annotation",
 		"rds_processed", count)
 
 	return r.stripRebalanceAnnotation(ctx, rg)
@@ -285,8 +287,9 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 type rebalanceChildren int
 
 const (
-	// allChildren is the explicit `rg modify` with balancing on: LINSTOR
-	// autoplaces every child of the group, whatever its layer stack.
+	// allChildren is the explicit `rg modify`, with balancing on or
+	// off: LINSTOR autoplaces every child of the group, whatever its
+	// layer stack.
 	allChildren rebalanceChildren = iota
 
 	// childrenWithDRBD is the scheduled balance pass. It leaves out a
@@ -294,19 +297,12 @@ const (
 	// does: such a replica has no peer to resync from, so a replica
 	// topped up here would only be an empty volume under its name.
 	childrenWithDRBD
-
-	// childrenWithoutDRBD is the explicit `rg modify` with balancing
-	// off. The RG event path already places the DRBD children on the
-	// same update; these are the ones it leaves out.
-	childrenWithoutDRBD
 )
 
 func (c rebalanceChildren) includes(rd *apiv1.ResourceDefinition, rg *apiv1.ResourceGroup) bool {
 	switch c {
 	case childrenWithDRBD:
 		return definitionUsesDRBD(rd, rg)
-	case childrenWithoutDRBD:
-		return !definitionUsesDRBD(rd, rg)
 	case allChildren:
 		return true
 	}

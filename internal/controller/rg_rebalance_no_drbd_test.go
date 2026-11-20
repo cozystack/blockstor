@@ -202,10 +202,9 @@ func TestRGEventSkipsDefinitionWithoutDRBD(t *testing.T) {
 
 // TestRGModifyPlacesEveryChildWithBalancingOff: `BalanceResourcesEnabled`
 // switches off LINSTOR's balance task, not an explicit `rg modify`,
-// which autoplaces every child whatever its stack. The RG event path
-// places the DRBD child on the same update and leaves out the
-// storage-only one, so the rebalance reconciler must place that one
-// before it strips the annotation, in whichever order the two run.
+// which autoplaces every child whatever its stack. Each child ends up
+// with its replica, in whichever order the RG event and the rebalance
+// reconciler run.
 func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
 	t.Parallel()
 
@@ -274,11 +273,12 @@ func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
 	}
 }
 
-// TestRGRebalanceDisabledLeavesDRBDChildToRGEvent pins the split: with
-// balancing off the rebalance reconciler places only the children the
-// RG event path leaves out, so the kill switch still holds for the
-// balance task on a DRBD definition.
-func TestRGRebalanceDisabledLeavesDRBDChildToRGEvent(t *testing.T) {
+// TestRGRebalanceDisabledPlacesDRBDChildItself: with balancing off the
+// rebalance reconciler places the explicit modify on a DRBD child too,
+// without the RG event path. Leaving that child to the RG event path
+// made the placement depend on a path LINSTOR does not place from, and
+// that path may make the balance checks and skip it.
+func TestRGRebalanceDisabledPlacesDRBDChildItself(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -302,7 +302,7 @@ func TestRGRebalanceDisabledLeavesDRBDChildToRGEvent(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	if n := replicasOf(t, ctx, st, "pvc-local"); n != 0 {
-		t.Errorf("disabled rebalance placed %d replicas on a DRBD definition, want 0", n)
+	if n := replicasOf(t, ctx, st, "pvc-local"); n != 1 {
+		t.Errorf("rg modify with balancing off placed %d replicas on a DRBD definition, want 1", n)
 	}
 }
