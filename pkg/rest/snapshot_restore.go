@@ -2012,6 +2012,8 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 	// GI and the LUKS password, which blockstor keeps elsewhere.
 	copyProps := false
 
+	var scope *restoreScope
+
 	if ownTarget {
 		placed, err := s.Store.Resources().ListByDefinition(ctx, rdName)
 		if err != nil {
@@ -2019,6 +2021,15 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 		}
 
 		copyProps = len(placed) == 0
+	}
+
+	if copyProps {
+		var err error
+
+		scope, err = loadRestoreScope(ctx, s.Store, rdName)
+		if err != nil {
+			return err
+		}
 	}
 
 	for i := range snap.VolumeDefinitions {
@@ -2029,7 +2040,7 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 		}
 
 		if copyProps {
-			vd.Props = restoredVolumeProps(svd.VolumeDefinitionProps)
+			vd.Props = restoredVolumeProps(svd.VolumeDefinitionProps, scope.levels(svd.VolumeNumber)...)
 		}
 
 		err := s.Store.VolumeDefinitions().Create(ctx, rdName, &vd)
@@ -2098,16 +2109,78 @@ func copySnapshotVolumeProps(ctx context.Context, s *Server, rdName string, volu
 // the snapshot's copy of its source's props. A source that carried no
 // block size ran at DRBD's default, and that is written down, so the
 // controller does not give the restored data the pool's size, a sector
-// size it was never written at, while the automatic size is on.
-func restoredVolumeProps(snapshotProps map[string]string) map[string]string {
+// size it was never written at, while the automatic size is on. With it
+// off anywhere above, as LINSTOR resolves it for the restored volume,
+// nothing is added: LINSTOR's restore writes no size of its own, and the
+// controller writes none for such a volume either.
+func restoredVolumeProps(snapshotProps map[string]string, above ...map[string]string) map[string]string {
 	props := store.TravellingProps(snapshotProps)
 	if props == nil {
 		props = map[string]string{}
 	}
 
-	if _, ok := props[blocksize.PropBlockSize]; !ok && blocksize.AutoEnabled(props) {
+	_, has := props[blocksize.PropBlockSize]
+	if !has && blocksize.AutoEnabled(append([]map[string]string{props}, above...)...) {
 		props[blocksize.PropBlockSize] = blocksize.Format(blocksize.DefaultIoSize)
 	}
 
 	return props
+}
+
+// restoreScope is what lies above a restored volume definition, where
+// Linstor/Drbd/auto-block-size can also be set: the target resource
+// definition, its group and the controller.
+type restoreScope struct {
+	rdProps   map[string]string
+	rg        *apiv1.ResourceGroup
+	ctrlProps map[string]string
+}
+
+func loadRestoreScope(ctx context.Context, st store.Store, rdName string) (*restoreScope, error) {
+	rd, err := st.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+	}
+
+	scope := &restoreScope{rdProps: rd.Props}
+
+	if rd.ResourceGroupName != "" {
+		rg, rgErr := st.ResourceGroups().Get(ctx, rd.ResourceGroupName)
+
+		switch {
+		case rgErr == nil:
+			scope.rg = &rg
+		case !errors.Is(rgErr, store.ErrNotFound):
+			return nil, rgErr //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+		}
+	}
+
+	scope.ctrlProps, err = st.ControllerProps().Get(ctx)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+	}
+
+	return scope, nil
+}
+
+// levels lists the scope's levels for one volume, closest first, in
+// LINSTOR's order after the volume definition itself.
+func (s *restoreScope) levels(volumeNumber int32) []map[string]string {
+	if s == nil {
+		return nil
+	}
+
+	levels := []map[string]string{s.rdProps}
+
+	if s.rg != nil {
+		for i := range s.rg.VolumeGroups {
+			if s.rg.VolumeGroups[i].VolumeNumber == volumeNumber {
+				levels = append(levels, s.rg.VolumeGroups[i].Props)
+			}
+		}
+
+		levels = append(levels, s.rg.Props)
+	}
+
+	return append(levels, s.ctrlProps)
 }

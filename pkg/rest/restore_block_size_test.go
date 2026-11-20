@@ -160,3 +160,59 @@ func TestCSIRestoreOrderKeepsSourceBlockSize(t *testing.T) {
 		t.Fatalf("restored block-size %q, want the source's 4096", got)
 	}
 }
+
+// TestRestoreWithAutoOffAboveWritesNoSize: with Linstor/Drbd/auto-block-size
+// false on the controller, or on the target definition linstor-csi made,
+// a source without a size restores without one, as LINSTOR's restore
+// writes none. Only the snapshot's own props used to be read for the
+// switch, so the restore wrote 512 anyway.
+func TestRestoreWithAutoOffAboveWritesNoSize(t *testing.T) {
+	t.Parallel()
+
+	off := map[string]string{blocksize.PropAuto: "false"}
+
+	t.Run("controller", func(t *testing.T) {
+		t.Parallel()
+
+		st := seedBlockSizeSnapshot(t, nil)
+		if err := st.ControllerProps().Set(t.Context(), off); err != nil {
+			t.Fatalf("seed controller props: %v", err)
+		}
+
+		base, stop := startServerWithStore(t, st)
+		defer stop()
+
+		bsRestoreInto(t, base, "pvc-dst")
+
+		if got, ok := bsVolumeProps(t, st, "pvc-dst")[blocksize.PropBlockSize]; ok {
+			t.Fatalf("restored block-size %q with the automatic size off", got)
+		}
+	})
+
+	t.Run("target-definition", func(t *testing.T) {
+		t.Parallel()
+
+		st := seedBlockSizeSnapshot(t, nil)
+		if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-dst", Props: off}); err != nil {
+			t.Fatalf("seed target: %v", err)
+		}
+
+		base, stop := startServerWithStore(t, st)
+		defer stop()
+
+		body, _ := json.Marshal(map[string]string{"to_resource": "pvc-dst"})
+
+		resp := httpPost(t, base+"/v1/resource-definitions/pvc-src/snapshot-restore-volume-definition/snap-1", body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("volume-definition restore status: got %d, want 200", resp.StatusCode)
+		}
+
+		bsRestoreInto(t, base, "pvc-dst", "n1")
+
+		if got, ok := bsVolumeProps(t, st, "pvc-dst")[blocksize.PropBlockSize]; ok {
+			t.Fatalf("restored block-size %q with the automatic size off", got)
+		}
+	})
+}
