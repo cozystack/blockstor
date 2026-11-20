@@ -791,6 +791,15 @@ func DiskfulPeersAllocated(target *blockstoriov1alpha1.Resource, peers []blockst
 	return diskfulPeersAllocated(target, peers)
 }
 
+// AllocatedNodeID is the exported façade over `nodeIDOf`: the replica's
+// DRBD node-id, Spec first, and false when neither Spec nor Status
+// carries one yet.
+func AllocatedNodeID(r *blockstoriov1alpha1.Resource) (int32, bool) {
+	id := nodeIDOf(r)
+
+	return id, id >= 0
+}
+
 // buildVolumes turns the parent ResourceDefinition's VolumeDefinitions
 // into DesiredVolumes for the satellite. DISKLESS replicas still get
 // volume entries — DRBD-9 needs a `volume { ... }` block per peer in
