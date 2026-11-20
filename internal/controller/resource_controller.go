@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -133,6 +134,32 @@ type ResourceReconciler struct {
 	// ledger holds the identities written under clusterAllocMu that
 	// the cache may not show yet; see allocLedger.
 	ledger allocLedger
+
+	// Workers is how many Resources reconcile at once; zero means
+	// DefaultResourceWorkers.
+	Workers int
+}
+
+// DefaultResourceWorkers is how many Resources the controller
+// reconciles at once.
+//
+// Every status report a satellite writes reconciles the replica and
+// its siblings. With one worker a new replica waited for its DRBD
+// identities behind all of them, and the satellites build nothing
+// before those exist: a burst of 16 new volumes on a cluster with
+// about 400 replicas left replicas waiting more than a minute, past
+// the CSI provisioner's deadline. Allocation itself stays serialised
+// by clusterAllocMu; the other workers keep the rest of the queue
+// moving meanwhile.
+const DefaultResourceWorkers = 8
+
+// workers returns the configured worker count, or the default.
+func (r *ResourceReconciler) workers() int {
+	if r.Workers > 0 {
+		return r.Workers
+	}
+
+	return DefaultResourceWorkers
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
@@ -2138,6 +2165,7 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&blockstoriov1alpha1.Resource{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings)).
 		Named("resource").
+		WithOptions(controller.Options{MaxConcurrentReconciles: r.workers()}).
 		Complete(r)
 }
 
