@@ -135,9 +135,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			logger.Info("ignoring adopted annotation on an in-flight snapshot; completing normal orchestration so suspended I/O resumes",
 				"suspendIO", true)
 		} else {
-			res, backfillErr := r.backfillAdoptedSnapshot(ctx, logger, &snap)
-
-			return res, errors.Join(backfillErr, stampErr)
+			return ctrl.Result{}, errors.Join(r.backfillAdoptedSnapshot(ctx, logger, &snap), stampErr)
 		}
 	}
 
@@ -204,10 +202,10 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // ends in (allSiblingsReady) without any satellite involvement.
 func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 	ctx context.Context, logger logr.Logger, snap *blockstoriov1alpha1.Snapshot,
-) (ctrl.Result, error) {
+) error {
 	if allNodesReady(snap.Status.NodeStatus, snap.Spec.Nodes) &&
 		slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful) {
-		return ctrl.Result{}, nil
+		return nil
 	}
 
 	createdAt := adoptedCreatedAt(logger, snap)
@@ -257,12 +255,12 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 		return r.Status().Update(ctx, &current)
 	})
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "backfill adopted Snapshot status")
+		return errors.Wrap(err, "backfill adopted Snapshot status")
 	}
 
 	logger.V(1).Info("backfilled adopted snapshot per-node status", "nodes", len(snap.Spec.Nodes))
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // takeCompleted reports whether the orchestration of the batch has
