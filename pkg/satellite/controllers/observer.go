@@ -1563,8 +1563,10 @@ func (o *ObserverRunnable) detachFailedReplica(ctx context.Context, logger logr.
 //
 // Only volumes in a data-bearing disk state are probed (UpToDate /
 // Consistent / Outdated) — a fresh Inconsistent slot has no
-// meaningful GI to publish yet. Best-effort: a get-gi error or
-// empty result leaves CurrentUUID as-is (the gate stays conservative).
+// meaningful GI to publish yet. Best-effort: a get-gi error leaves
+// CurrentUUID empty and forgets the GI read before, so a write that
+// does not probe publishes none rather than one from an older data
+// generation (the gate stays conservative).
 func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm, ev *observation) {
 	for i := range ev.Volumes {
 		vol := &ev.Volumes[i]
@@ -1575,10 +1577,12 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 
 		if vol.CurrentUUID == "" && vol.BackingDev != "" {
 			current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
-			if err == nil {
-				vol.CurrentUUID = current
-				o.rememberProbedGI(ev.ResourceName, vol.VolumeNumber, current)
+			if err != nil {
+				current = ""
 			}
+
+			vol.CurrentUUID = current
+			o.rememberProbedGI(ev.ResourceName, vol.VolumeNumber, current)
 		}
 
 		if vol.CurrentUUID != "" && o.RecordGI != nil {
@@ -1588,7 +1592,8 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 }
 
 // rememberProbedGI keeps a get-gi result on the cached volume, so the
-// next write that does not probe still publishes it.
+// next write that does not probe still publishes it. An empty result
+// forgets the one before.
 func (o *ObserverRunnable) rememberProbedGI(name string, volume int32, currentUUID string) {
 	o.volMu.Lock()
 	defer o.volMu.Unlock()
@@ -2050,6 +2055,15 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 	if incoming.DiskState != "" && merged.DiskState != incoming.DiskState {
 		merged.DiskState = incoming.DiskState
 		changed = true
+	}
+
+	// The GI read from disk belongs to the data the volume held then.
+	// A volume that stops holding data, or now sits on another backing
+	// device, must not publish it again: a new replica could skip a
+	// sync it needed on the strength of it (isDay0SeededVolume).
+	if !isDataBearingDiskState(drbd.DiskState(merged.DiskState)) ||
+		(incoming.BackingDev != "" && merged.BackingDev != incoming.BackingDev) {
+		merged.ProbedGI = ""
 	}
 
 	if incoming.CurrentUUID != "" && merged.CurrentUUID != incoming.CurrentUUID {

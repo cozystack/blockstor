@@ -473,6 +473,73 @@ func TestObserverForgetsADestroyedResource(t *testing.T) {
 	}
 }
 
+// A GI that could not be read is not published from an earlier read:
+// it may belong to an older data generation, and a new replica could
+// skip a sync it needed on the strength of it.
+func TestObserverForgetsAGIItCouldNotRead(t *testing.T) {
+	cli := startStatusEnvtest(t)
+	name := createStatusReplica(t, cli)
+
+	fx := statusTestExec()
+	o := &ObserverRunnable{Client: cli, Exec: fx, NodeName: statusTestNode}
+	adm := drbd.NewAdm(fx)
+	ctx := t.Context()
+
+	o.handleObservation(ctx, adm, deviceUpToDate())
+
+	if got := getStatusReplica(t, cli, name).Volumes[0].CurrentGI; got != statusTestGI {
+		t.Fatalf("GI not published: %q", got)
+	}
+
+	fx.Expect("drbdmeta --force - v09 "+statusTestBacking+" internal get-gi --node-id 0",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 1}})
+
+	o.resyncOnce(ctx)
+	o.handleObservation(ctx, adm, peerConnected("n2"))
+
+	status := getStatusReplica(t, cli, name)
+	if status.Volumes[0].CurrentGI != "" {
+		t.Fatalf("a GI read before get-gi failed is still published: %q", status.Volumes[0].CurrentGI)
+	}
+
+	if status.Volumes[0].DiskState != "UpToDate" || len(status.Connections) != 1 {
+		t.Fatalf("state lost: %+v", status)
+	}
+}
+
+// The GI read from disk belongs to the data the volume held then.
+func TestMergeVolumeIntoForgetsTheGIOfOtherData(t *testing.T) {
+	seeded := func() map[int32]volumeObservation {
+		return map[int32]volumeObservation{0: {
+			VolumeNumber: 0, DiskState: "UpToDate", BackingDev: "/dev/a", ProbedGI: statusTestGI,
+		}}
+	}
+
+	cases := []struct {
+		name     string
+		incoming volumeObservation
+		keep     bool
+	}{
+		{"statistics", volumeObservation{VolumeNumber: 0, HasSync: true, OutOfSyncKib: 8}, true},
+		{"still data-bearing", volumeObservation{VolumeNumber: 0, DiskState: "Outdated"}, true},
+		{"same backing device", volumeObservation{VolumeNumber: 0, BackingDev: "/dev/a"}, true},
+		{"resync started", volumeObservation{VolumeNumber: 0, DiskState: "Inconsistent"}, false},
+		{"detached", volumeObservation{VolumeNumber: 0, DiskState: "Diskless"}, false},
+		{"other backing device", volumeObservation{VolumeNumber: 0, BackingDev: "/dev/b"}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := seeded()
+			mergeVolumeInto(cache, &tc.incoming)
+
+			if kept := cache[0].ProbedGI == statusTestGI; kept != tc.keep {
+				t.Fatalf("ProbedGI kept = %v, want %v (cache %+v)", kept, tc.keep, cache[0])
+			}
+		})
+	}
+}
+
 // A change the kernel reported while drbdsetup was still writing its
 // dump can precede the dump's own, older line for the same object.
 // LINSTOR applies such changes after the dump ends; applied in arrival
