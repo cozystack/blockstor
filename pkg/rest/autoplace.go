@@ -345,19 +345,30 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.runPlaceAndReport(w, r, rdName, &filter, srcKind) {
+	deployed, ok := s.runPlaceAndReport(w, r, rdName, &filter, srcKind)
+	if !ok {
 		return
 	}
 
-	// Java LINSTOR replies with a `[]ApiCallRc` envelope on success.
-	// golinstor's RD.Autoplace ignores an empty body, but tools that
-	// surface API messages (e.g. the linstor CLI) want a real result
-	// to log. Return MASK_INFO + RC_PLACEMENT_DONE-style entry so the
-	// shape matches the oracle's.
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	s.writeAutoplaceDone(w, r, rdName, deployed)
+}
+
+// writeAutoplaceDone answers a successful autoplace once the
+// satellites brought up the replicas it deployed, as LINSTOR does;
+// see waitDeployedReplicasReady.
+//
+// Java LINSTOR replies with a `[]ApiCallRc` envelope on success.
+// golinstor's RD.Autoplace ignores an empty body, but tools that
+// surface API messages (e.g. the linstor CLI) want a real result
+// to log. Return MASK_INFO + RC_PLACEMENT_DONE-style entry so the
+// shape matches the oracle's.
+func (s *Server) writeAutoplaceDone(w http.ResponseWriter, r *http.Request, rdName string, deployed []string) {
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, deployed)
+
+	writeJSON(w, http.StatusOK, append([]apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRDAutoplaceDone,
 		Message: "Resource definition '" + rdName + "' auto-placed",
-	}})
+	}}, notReady...))
 }
 
 // refuseAutoplaceMultiPlaceWithoutReplication is Bug 335's
@@ -570,8 +581,9 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 }
 
 // runPlaceAndReport drives the placer and writes the appropriate
-// HTTP error on shortfall. Returns true on success (caller writes
-// the success body), false on any error path (caller returns).
+// HTTP error on shortfall. On success it returns the nodes this call
+// deployed a replica to and true (caller writes the success body);
+// on any error path it returns false (caller returns).
 // Pulled out of handleAutoplace to keep that function under the
 // cyclomatic / funlen budget once the snapshot-clone provider-kind
 // constraint was added.
@@ -584,8 +596,8 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 // path now emit the full envelope shape so the CLI surfaces the
 // same diagnostic upstream Java LINSTOR does (criteria bullet list +
 // "Auto-place configuration details" block).
-func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) bool {
-	placed, want, err := placer.New(s.Store).Place(r.Context(), rdName, filter)
+func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) ([]string, bool) {
+	placement, err := placer.New(s.Store).PlaceDeployed(r.Context(), rdName, filter)
 	if err != nil {
 		// Capacity-shortfall (Bug 35) is operator-actionable, not a
 		// 500. Surface as a structured 409 envelope so the Python
@@ -595,21 +607,21 @@ func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdNam
 		if errors.As(err, &capErr) {
 			writeAutoplaceShortfall(w, filter, srcKind, capErr)
 
-			return false
+			return nil, false
 		}
 
 		writeError(w, http.StatusInternalServerError, err.Error())
 
-		return false
+		return nil, false
 	}
 
-	if placed < want {
+	if placement.Placed < placement.Want {
 		writeAutoplaceShortfall(w, filter, srcKind, nil)
 
-		return false
+		return nil, false
 	}
 
-	return true
+	return placement.Deployed, true
 }
 
 // resolveAdditionalPlaceCount implements the W17 `--auto-place +N`
@@ -1365,12 +1377,16 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
 	}
 
+	// LINSTOR answers an explicit create after the same wait as an
+	// autoplace (CtrlRscCrtApiCallHandler → deployResources).
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, replicaNodes(created))
+
 	// Python CLI demands an ApiCallRc list envelope; upstream's
 	// `linstor r c` walks it on every reply.
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	writeJSON(w, http.StatusCreated, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource(s) created on resource-definition: " + rdName,
-	}})
+	}}, notReady...))
 }
 
 // handleResourceCreateOnNode answers `POST /v1/resource-definitions/
@@ -1453,11 +1469,15 @@ func (s *Server) handleResourceCreateOnNode(w http.ResponseWriter, r *http.Reque
 		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	// The create linstor-csi's Manual scheduler posts: answer it after
+	// the same wait as an autoplace, as LINSTOR does.
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, replicaNodes(created))
+
+	writeJSON(w, http.StatusCreated, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource created on resource-definition: " + rdName +
 			" / node: " + node,
-	}})
+	}}, notReady...))
 }
 
 // createResources walks the envelopes from a POST to
