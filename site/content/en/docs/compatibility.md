@@ -34,6 +34,8 @@ Blockstor implements the LINSTOR REST API, so `linstor-csi`, `piraeus-operator`,
 | Autoplacer weights | `MaxFreeSpace` is 1, the other weights 0. | All four weights default to 1. |
 | `controller version` | Reports a git commit hash. | Through the REST API, release images report the commit they were built from. A development build that was not given one reports a placeholder instead. |
 | `node info` | Shows OS, CPU and memory. | These fields are empty. |
+| `volume-definition delete` | Deletes the volume on every replica, then the volume definition. | Removes the volume definition only. Each replica's volume stays on disk and nothing deletes it later; remove it by hand. |
+| Snapshots on thick LVM | Not supported. | Supported. A replica whose volume still has snapshots cannot be deleted until they are, since removing the volume would remove them. |
 
 ## Using the `linstor` client
 

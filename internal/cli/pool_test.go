@@ -173,3 +173,26 @@ func TestVolumeGroupCreateAndList(t *testing.T) {
 		t.Errorf("second create reused volume number %d", group.VolumeGroups[0].VolumeNumber)
 	}
 }
+
+// A pool a replica still uses is not deleted by the CLI either: the replica's
+// storage can only be deleted through it, so its delete would never finish.
+func TestStoragePoolDeleteRefusedWhileAReplicaUsesIt(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.StoragePools().Create(ctx, &apiv1.StoragePool{NodeName: "node-1", StoragePoolName: "data"})
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-x", NodeName: "node-1",
+			Volumes: []apiv1.Volume{{VolumeNumber: 0, StoragePool: "data"}},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"sp", "d", "node-1", "data"}); got == 0 {
+		t.Errorf("sp d of a pool pvc-x still uses exited 0")
+	}
+
+	if got := app.Run(t.Context(), []string{"sp", "d", "node-1", "data", "--force"}); got != 0 {
+		t.Errorf("sp d --force exited %d, want the refusal overridden", got)
+	}
+}
