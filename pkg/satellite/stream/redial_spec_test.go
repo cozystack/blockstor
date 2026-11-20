@@ -160,9 +160,10 @@ func TestSatelliteFlagsLackControllerBindAddress(t *testing.T) {
 	// controller-wire question this spec guards.
 	// The stream-tls-* files are the mutual TLS of the snapshot stream
 	// between satellites; they carry no controller address either.
+	// resource-workers is how many local resources are applied at once.
 	want := []string{
 		"node-name", "state-dir", "health-probe-bind-address", "controller-namespace",
-		"stream-tls-cert-file", "stream-tls-key-file", "stream-tls-ca-file",
+		"stream-tls-cert-file", "stream-tls-key-file", "stream-tls-ca-file", "resource-workers",
 	}
 	if !equalStringSlices(flags, want) {
 		t.Fatalf("satellite flag set drifted: got %v, want %v. "+

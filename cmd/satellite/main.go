@@ -205,7 +205,7 @@ func run() int {
 		LocalAddress:           localAddress,
 		Logger:                 logger,
 		RESTConfig:             restCfg,
-		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace, streamTLS),
+		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace, streamTLS, opts.resourceWorkers),
 		HealthProbeBindAddress: probeAddr,
 		StreamTLS:              streamTLS,
 		OnCacheSynced: func() {
@@ -255,7 +255,7 @@ func loadRESTConfig() (*rest.Config, error) {
 // satellite.ManagerFactory signature.
 func mgrFactory(
 	ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier,
-	controllerNamespace string, streamTLS stream.TLSFiles,
+	controllerNamespace string, streamTLS stream.TLSFiles, resourceWorkers int,
 ) satellite.ManagerFactory {
 	return func(restCfg *rest.Config, nodeName, probeAddr string, rec *satellite.Reconciler) (manager.Manager, error) {
 		mgr, err := controllers.NewManager(restCfg, &controllers.Config{
@@ -271,8 +271,9 @@ func mgrFactory(
 			// Optional: nil when `uevent.New` failed at startup —
 			// PhysicalDeviceDiscoveryRunnable falls back to pure-
 			// polling discovery.
-			UeventListener: ueventListener,
-			StreamTLS:      streamTLS,
+			UeventListener:  ueventListener,
+			StreamTLS:       streamTLS,
+			ResourceWorkers: resourceWorkers,
 		})
 		if err != nil {
 			return nil, err //nolint:wrapcheck // controllers.NewManager already wraps
