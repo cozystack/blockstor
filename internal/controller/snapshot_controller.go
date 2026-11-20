@@ -394,7 +394,7 @@ func (r *SnapshotReconciler) advancePhase(
 
 		return r.abortGroupWithReason(ctx, siblings,
 			"snapshot aborted: the take did not start within the "+
-				snapshotSuspendDeadline.String()+" deadline; I/O not suspended")
+				snapshotSuspendDeadline.String()+" deadline; the take was not started")
 	}
 
 	if isPhase1Entry(snap, next) && snap.Spec.GroupID != "" {
@@ -421,7 +421,7 @@ func (r *SnapshotReconciler) advancePhase(
 
 			return r.abortGroupWithReason(ctx, siblings,
 				"snapshot aborted: replica on node '"+offending+
-					"' is not UpToDate; I/O resumed")
+					"' is not UpToDate; resume of I/O requested")
 		}
 	}
 
@@ -502,7 +502,7 @@ func (r *SnapshotReconciler) checkAbortConditions(
 			"failed_node", firstFailedNodeAcrossSiblings(siblings))
 
 		reason := "snapshot aborted: node '" + firstFailedNodeAcrossSiblings(siblings) +
-			"' failed to take its snapshot; I/O resumed"
+			"' failed to take its snapshot; resume of I/O requested"
 
 		err := r.abortGroup(ctx, siblings, reason)
 		if err != nil {
@@ -530,7 +530,7 @@ func (r *SnapshotReconciler) checkAbortConditions(
 
 		res, err := r.abortGroupWithReason(ctx, siblings,
 			"snapshot aborted: suspend/take exceeded the "+
-				snapshotSuspendDeadline.String()+" deadline; I/O resumed")
+				snapshotSuspendDeadline.String()+" deadline; resume of I/O requested")
 
 		return true, res, err
 	}

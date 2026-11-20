@@ -261,7 +261,7 @@ func groupAbortReason(siblings []blockstoriov1alpha1.Snapshot) (string, bool) {
 	for i := range siblings {
 		if slices.ContainsFunc(siblings[i].Status.Flags, isSnapshotFailureFlag) {
 			return "snapshot aborted: the take of '" + siblings[i].Spec.SnapshotName +
-				"' failed; I/O resumed", true
+				"' failed; resume of I/O requested", true
 		}
 	}
 
