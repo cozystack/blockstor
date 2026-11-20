@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -101,6 +102,10 @@ type ResourceReconciler struct {
 	// nodeID off the cache and pick the same lowest-free value.
 	// Wired from `mgr.GetAPIReader()` in SetupWithManager.
 	APIReader client.Reader
+
+	// Recorder raises the Warning Event for a replica whose pool needs a
+	// larger block size than its volume definition may take. Optional.
+	Recorder events.EventRecorder
 
 	// allocMu serialises DRBD-ID allocation across replicas of the
 	// same RD. APIReader bypasses the informer cache but doesn't
@@ -236,18 +241,40 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// resourceVersion stays valid for the downstream Spec writers;
 	// requeue when allocation actually mutated state so the next
 	// pass observes the fresh revision uniformly.
-	allocCopy := target.DeepCopy()
+	requeue, err := r.allocateIdentity(ctx, &target)
+	if err != nil || requeue {
+		return ctrl.Result{Requeue: requeue}, err
+	}
 
-	allocated, err := r.ensureDRBDIDs(ctx, allocCopy, nil)
+	err = r.freezeBlockSize(ctx, &target)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if allocated {
-		return ctrl.Result{Requeue: true}, nil
+	return r.runApply(ctx, &target)
+}
+
+// allocateIdentity gives a replica its DRBD identity, the block size of
+// its volume definitions first, and reports whether it changed anything,
+// so the caller requeues onto the fresh revision.
+//
+// The block size goes on the volume definition before the replica gets
+// its identity: the satellite brings nothing up before that, and the
+// size of an attached device never changes afterwards.
+//
+// The allocation runs on a copy: ensureDRBDIDs re-fetches via APIReader
+// and patches Status, which bumps the apiserver-side resource version,
+// and the Spec writers downstream in runApply use the caller's
+// top-of-Reconcile snapshot.
+func (r *ResourceReconciler) allocateIdentity(ctx context.Context, target *blockstoriov1alpha1.Resource) (bool, error) {
+	if awaitingIdentity(target) {
+		err := r.decideBlockSize(ctx, target)
+		if err != nil {
+			return false, err
+		}
 	}
 
-	return r.runApply(ctx, &target)
+	return r.ensureDRBDIDs(ctx, target.DeepCopy(), nil)
 }
 
 // satelliteResourceFinalizer mirrors the
