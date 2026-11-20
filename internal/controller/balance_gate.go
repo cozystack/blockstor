@@ -112,9 +112,9 @@ func newBalanceGate(ctx context.Context, st store.Store) (*balanceGate, error) {
 // replicas, and LINSTOR's balance task never misses that, since it
 // reads the definition under the lock the switch is written under. So
 // a definition that passes on the listed copy is read again past the
-// cache, and only that read decides.
+// cache (currentSkip), and only that read decides.
 func (g *balanceGate) skipReason(ctx context.Context, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) (string, error) {
-	if reason := g.definitionSkip(rg, rd); reason != "" {
+	if reason := definitionSkip(rd, rg.Props, g.ctrlProps); reason != "" {
 		return reason, nil
 	}
 
@@ -127,7 +127,7 @@ func (g *balanceGate) skipReason(ctx context.Context, rg *apiv1.ResourceGroup, r
 		return balanceSkipNoUpToDate, nil
 	}
 
-	reason, err := g.currentDefinitionSkip(ctx, rg, rd.Name)
+	reason, err := g.currentSkip(ctx, rg, rd.Name)
 	if err != nil || reason != "" {
 		return reason, err
 	}
@@ -144,23 +144,23 @@ func (g *balanceGate) skipReason(ctx context.Context, rg *apiv1.ResourceGroup, r
 	return "", nil
 }
 
-// definitionSkip is the part of skipReason that reads the definition
-// alone: being deleted, or balancing switched off for it.
-func (g *balanceGate) definitionSkip(rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) string {
+// definitionSkip is the part of skipReason that reads props and flags
+// alone: the definition being deleted, or balancing switched off for it.
+func definitionSkip(rd *apiv1.ResourceDefinition, rgProps, ctrlProps map[string]string) string {
 	if slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
 		return balanceSkipDeleting
 	}
 
-	if balanceDisabled(rd.Props, rg.Props, g.ctrlProps) {
+	if balanceDisabled(rd.Props, rgProps, ctrlProps) {
 		return balanceSkipDisabled
 	}
 
 	return ""
 }
 
-// currentDefinitionSkip applies definitionSkip to the definition as the
-// API server holds it now.
-func (g *balanceGate) currentDefinitionSkip(ctx context.Context, rg *apiv1.ResourceGroup, rdName string) (string, error) {
+// currentSkip applies definitionSkip to the definition as the API
+// server holds it now.
+func (g *balanceGate) currentSkip(ctx context.Context, rg *apiv1.ResourceGroup, rdName string) (string, error) {
 	current, err := g.st.ResourceDefinitions().GetUncached(ctx, rdName)
 	if errors.Is(err, store.ErrNotFound) {
 		return balanceSkipGone, nil
@@ -170,68 +170,54 @@ func (g *balanceGate) currentDefinitionSkip(ctx context.Context, rg *apiv1.Resou
 		return "", fmt.Errorf("read definition %q: %w", rdName, err)
 	}
 
-	return g.definitionSkip(rg, &current), nil
+	return definitionSkip(&current, rg.Props, g.ctrlProps), nil
 }
 
-// place runs the placer on a definition skipReason let through, then
-// reads the definition once more. If balancing was switched off for it,
-// or it started going, while the placer ran, the replicas this pass
-// created are deleted again.
+// place runs the placer on a definition skipReason let through. If it
+// created any replica, it checks the definition once more (currentSkip)
+// and, if balancing was switched off for it or it started going while
+// the placer ran, deletes again the replicas this call created.
 //
-// That closes what the read in skipReason leaves open: linstor-csi
+// That closes what the check in skipReason leaves open: linstor-csi
 // switches balancing off and then lists the replicas it deletes, so a
 // replica created after that list is never deleted, and it keeps the
 // definition, a kernel resource and its ports for good. LINSTOR's
 // balance task cannot interleave there, since it places under the lock
 // the switch is written under; here the order of the two reads stands
-// in for that lock. A replica created after this read was created
-// before the switch, so linstor-csi lists and deletes it.
+// in for that lock. A replica created before this read was created
+// before the switch, so linstor-csi lists it: the REST list of a
+// definition with balancing off reads past the cache.
 //
-// A tiebreaker that appeared meanwhile is left alone: it is the
-// definition controller's, which removes it itself.
+// Only the replicas the placer reports as its own are taken back. One
+// another writer created meanwhile, by hand, through autoplace, or as a
+// diskless attach, stays, as it would in LINSTOR.
 func (g *balanceGate) place(
 	ctx context.Context, p *placer.Placer, rg *apiv1.ResourceGroup, rdName string, filter *apiv1.AutoSelectFilter,
 ) error {
-	before, err := store.LiveReplicas(ctx, g.st, rdName)
-	if err != nil {
-		return fmt.Errorf("list the replicas of %q: %w", rdName, err)
+	created, _, _, placeErr := p.PlaceCreating(ctx, rdName, filter)
+	if len(created) == 0 {
+		return placeErr
 	}
 
-	_, _, placeErr := p.Place(ctx, rdName, filter)
-
-	reason, err := g.currentDefinitionSkip(ctx, rg, rdName)
+	reason, err := g.currentSkip(ctx, rg, rdName)
 	if err != nil || reason == "" {
 		return errors.Join(placeErr, err)
 	}
 
-	return errors.Join(placeErr, g.withdraw(ctx, rdName, before, reason))
+	return errors.Join(placeErr, g.withdraw(ctx, rdName, created, reason))
 }
 
-// withdraw deletes the replicas of rdName that are not in before.
-func (g *balanceGate) withdraw(ctx context.Context, rdName string, before []apiv1.Resource, reason string) error {
-	after, err := store.LiveReplicas(ctx, g.st, rdName)
-	if err != nil {
-		return fmt.Errorf("list the replicas of %q: %w", rdName, err)
-	}
-
-	had := make(map[string]bool, len(before))
-	for i := range before {
-		had[naming.Key(before[i].NodeName)] = true
-	}
-
+// withdraw deletes the replicas of rdName on the given nodes.
+func (g *balanceGate) withdraw(ctx context.Context, rdName string, nodes []string, reason string) error {
 	var errs []error
 
-	for i := range after {
-		if had[naming.Key(after[i].NodeName)] || slices.Contains(after[i].Flags, apiv1.ResourceFlagTieBreaker) {
-			continue
-		}
-
+	for _, node := range nodes {
 		logf.FromContext(ctx).Info("deleting a replica placed while balancing stopped for its definition",
-			"rd", rdName, "node", after[i].NodeName, "reason", reason)
+			"rd", rdName, "node", node, "reason", reason)
 
-		err := g.st.Resources().Delete(ctx, rdName, after[i].NodeName)
+		err := g.st.Resources().Delete(ctx, rdName, node)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			errs = append(errs, fmt.Errorf("delete replica of %q on %q: %w", rdName, after[i].NodeName, err))
+			errs = append(errs, fmt.Errorf("delete replica of %q on %q: %w", rdName, node, err))
 		}
 	}
 

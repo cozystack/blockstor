@@ -21,6 +21,7 @@ package controller_test
 import (
 	"context"
 	"maps"
+	"slices"
 	"sync"
 	"testing"
 
@@ -215,5 +216,56 @@ func TestPlacementPassStillTopsUpAnUnchangedDefinition(t *testing.T) {
 
 	if n := replicaCount(t, ctx, inner, "pvc-interval"); n != 3 {
 		t.Fatalf("got %d replicas; want 3", n)
+	}
+}
+
+// TestPlacementPassTakesBackOnlyItsOwnReplicas: when balancing stops on
+// a definition while a pass places on it, the pass deletes the replicas
+// it created and nothing else. Here an operator switches balancing off
+// and creates a replica by hand while the pass runs; LINSTOR keeps
+// that replica, so the pass must too.
+func TestPlacementPassTakesBackOnlyItsOwnReplicas(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	inner := store.NewInMemory()
+
+	seedIntervalFixture(t, ctx, inner, 3, []string{"n1"})
+
+	if err := inner.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n4", Type: apiv1.NodeTypeSatellite, ConnectionStatus: apiv1.NodeTypeOnline,
+	}); err != nil {
+		t.Fatalf("seed node n4: %v", err)
+	}
+
+	byHand := func(rd *apiv1.ResourceDefinition) {
+		switchBalancingOff(rd)
+
+		err := inner.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-interval", NodeName: "n4", Flags: []string{apiv1.ResourceFlagDiskless},
+		})
+		if err != nil {
+			t.Errorf("create the replica by hand: %v", err)
+		}
+	}
+
+	st := &midPassStore{Store: inner, t: t, change: byHand}
+
+	reconcileRebalance(t, ctx, st)
+
+	got, err := inner.Resources().ListByDefinition(ctx, "pvc-interval")
+	if err != nil {
+		t.Fatalf("list replicas: %v", err)
+	}
+
+	nodes := make([]string, 0, len(got))
+	for i := range got {
+		nodes = append(nodes, got[i].NodeName)
+	}
+
+	slices.Sort(nodes)
+
+	if !slices.Equal(nodes, []string{"n1", "n4"}) {
+		t.Fatalf("replicas on %v; want the one the definition had and the one made by hand, [n1 n4]", nodes)
 	}
 }
