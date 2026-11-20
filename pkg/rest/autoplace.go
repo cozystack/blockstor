@@ -2853,10 +2853,11 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
 
-	// The last diskful is gone: drop a witness left without peers
-	// before replying, as upstream does, so the caller's next listing
-	// shows nothing undeleted. See resource_delete_orphan_witness.go.
-	s.reapOrphanWitnesses(r.Context(), rdName)
+	// Drop a witness the delete left without a tie to break before
+	// replying, as upstream does for the shapes where its helper no
+	// longer wants one, so the caller's next listing shows it as going.
+	// See resource_delete_orphan_witness.go.
+	s.reapUnneededWitnesses(r.Context(), rdName)
 
 	// Bug 67: notify surviving sibling Resources of the peer change
 	// so satellite reconcilers re-derive their peer set without the
