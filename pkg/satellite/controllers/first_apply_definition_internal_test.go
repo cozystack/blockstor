@@ -19,6 +19,8 @@ limitations under the License.
 package controllers
 
 import (
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -29,6 +31,9 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/blocksize"
+	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
 
 func blockSizeRD(props map[string]string) *blockstoriov1alpha1.ResourceDefinition {
@@ -121,5 +126,51 @@ func TestAppliedReplicaKeepsTheCachedDefinition(t *testing.T) {
 
 	if _, ok := rd.Spec.VolumeDefinitions[0].Props[blocksize.PropBlockSize]; ok {
 		t.Fatalf("an applied replica re-read the definition: %v", rd.Spec.VolumeDefinitions[0].Props)
+	}
+}
+
+// TestRunApplyLaysTheFirstApplyDownFromTheAPIServer drives the apply
+// itself, so the refresh is pinned where it is called and not only as a
+// helper: the cached definition is a size behind the API server's, and
+// the first apply must carve the volume at the API server's size. A
+// runApply that stopped refreshing would carve the cached one, and on a
+// DRBD stack render the cached definition's block size with it.
+func TestRunApplyLaysTheFirstApplyDownFromTheAPIServer(t *testing.T) {
+	t.Parallel()
+
+	stale := blockSizeRD(nil)
+	stale.Spec.LayerStack = []string{"STORAGE"}
+
+	fresh := blockSizeRD(map[string]string{blocksize.PropBlockSize: "4096"})
+	fresh.Spec.LayerStack = []string{"STORAGE"}
+	fresh.Spec.VolumeDefinitions[0].SizeKib = 8 * 1024
+
+	res := firstApplyReplica()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1 to scheme: %v", err)
+	}
+
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("blockstor to scheme: %v", err)
+	}
+
+	fx := storage.NewFakeExec()
+	r := newPassphraseTestReconciler(t, stale, res)
+	r.Config.Exec = fx
+	r.Config.Apply = satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"pool-a": lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)},
+		NodeName:  "node-a",
+	})
+	r.Config.APIReader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(fresh, firstApplyReplica()).Build()
+
+	if _, err := r.runApply(t.Context(), res, logr.Discard()); err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	creates := slices.DeleteFunc(fx.CommandLines(), func(c string) bool { return !strings.HasPrefix(c, "lvcreate ") })
+	if len(creates) != 1 || !strings.Contains(creates[0], "--virtualsize 8MiB") {
+		t.Fatalf("first apply carved %v, want one volume at the API server's 8MiB", creates)
 	}
 }
