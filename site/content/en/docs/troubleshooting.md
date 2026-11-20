@@ -62,6 +62,16 @@ drbdadm connect <definition>
 
 The victim resyncs from the survivor. While the slot is `StandAlone` the satellite still adjusts it, but with `--skip-net`, so it leaves the connection to you. The victim's independent writes are lost, so if you are not sure which side is right, stop and copy the data off first.
 
+## StandAlone after a failed apply
+
+A replica whose `drbdadm adjust` failed half way is also left `StandAlone`, with nothing to do with a split: the satellite created its connections but never connected them. The usual cause is a port another DRBD resource on the node still holds, a leftover of a deleted definition for example. The failure is a Warning Event on the Resource:
+
+```sh
+kubectl get events -A --field-selector involvedObject.name=<definition>.<node>,reason=ApplyFailed
+```
+
+The satellite retries the apply with a full `drbdadm adjust`, never with `--skip-net`, first after five seconds and then at doubling intervals up to five minutes, until one goes through. Remove the cause, and the replica connects and resyncs at the next retry. A satellite restart keeps the record that the last adjust failed, so the retry after it is a full one too.
+
 ## Inconsistent or SyncTarget that never finishes
 
 Look at the disk state of each replica and at the replication state towards the peer that should be the source:
