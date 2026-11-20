@@ -19,9 +19,11 @@ limitations under the License.
 package controllers
 
 import (
+	"context"
 	"testing"
 
-	ctrl "sigs.k8s.io/controller-runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 func TestRecheckGateTellsRechecksFromEvents(t *testing.T) {
@@ -95,15 +97,37 @@ func TestNilRecheckGateGatesNothing(t *testing.T) {
 	}
 }
 
-func TestPeriodicRecheckIsOnlyTheActiveDRBDRequeue(t *testing.T) {
-	if !isPeriodicRecheck(ctrl.Result{RequeueAfter: activeDRBDRequeue}) {
-		t.Errorf("the periodic re-check is not recognised")
+// TestRecheckIsWhatThePassSays: a pass is followed by a re-check only
+// when it said so, not when its requeue delay happens to equal the
+// re-check period.
+func TestRecheckIsWhatThePassSays(t *testing.T) {
+	gate := newRecheckGate()
+
+	same := reconcile.Func(func(context.Context, reconcile.Request) (reconcile.Result, error) {
+		return reconcile.Result{RequeueAfter: activeDRBDRequeue}, nil
+	})
+	marked := reconcile.Func(func(ctx context.Context, _ reconcile.Request) (reconcile.Result, error) {
+		return schedulePeriodicRecheck(ctx), nil
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "r"}}
+
+	_, err := gate.gate(same).Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for _, result := range []ctrl.Result{{}, {RequeueAfter: applyFailureRequeue}, {RequeueAfter: peerAllocationRequeue}} {
-		if isPeriodicRecheck(result) {
-			t.Errorf("%v counted as the periodic re-check", result)
-		}
+	if _, recheck := gate.begin("r"); recheck {
+		t.Errorf("a pass that only shares the re-check period counted as scheduling a re-check")
+	}
+
+	_, err = gate.gate(marked).Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, recheck := gate.begin("r"); !recheck {
+		t.Errorf("a pass that scheduled the re-check was not followed by one")
 	}
 }
 

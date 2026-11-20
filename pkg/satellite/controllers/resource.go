@@ -624,7 +624,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// keeping them quiet preserves the predicate's no-op-on-idle
 	// property.
 	if rdNeedsDRBD(&rd) {
-		return ctrl.Result{RequeueAfter: activeDRBDRequeue}, nil
+		return schedulePeriodicRecheck(ctx), nil
 	}
 
 	return ctrl.Result{}, nil

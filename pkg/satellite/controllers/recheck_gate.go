@@ -172,19 +172,30 @@ func (g *recheckGate) gate(inner reconcile.Reconciler) reconcile.Reconciler {
 			defer g.release()
 		}
 
-		result, err := inner.Reconcile(ctx, req)
+		scheduled := false
 
-		g.finish(req.Name, token, err == nil && isPeriodicRecheck(result))
+		result, err := inner.Reconcile(context.WithValue(ctx, recheckMarkKey{}, &scheduled), req)
+
+		g.finish(req.Name, token, err == nil && scheduled)
 
 		return result, err //nolint:wrapcheck // the inner reconciler's own error
 	})
 }
 
-// isPeriodicRecheck reports whether a pass ended by scheduling the
-// periodic re-check of a converged DRBD replica: no other path
-// requeues after activeDRBDRequeue.
-func isPeriodicRecheck(result reconcile.Result) bool {
-	return result.RequeueAfter == activeDRBDRequeue
+// recheckMarkKey carries, in the context of a gated pass, the flag
+// schedulePeriodicRecheck sets.
+type recheckMarkKey struct{}
+
+// schedulePeriodicRecheck is the result of a pass that leaves a
+// converged DRBD replica to its periodic re-check, and tells the gate
+// so. The pass says it rather than the gate guessing it from the
+// requeue delay, which another path may share some day.
+func schedulePeriodicRecheck(ctx context.Context) reconcile.Result {
+	if mark, ok := ctx.Value(recheckMarkKey{}).(*bool); ok {
+		*mark = true
+	}
+
+	return reconcile.Result{RequeueAfter: activeDRBDRequeue}
 }
 
 // marker is a predicate that lets every event through and records it.
