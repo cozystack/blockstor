@@ -461,7 +461,7 @@ func (r *zfsSendReader) Close() error {
 // permanently sparse-thick across reconciles. Even on the
 // idempotent-skip path, ensureRefreservation is called so the thick
 // guarantee is restored on every reconcile.
-func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, _ storage.Snapshot, src io.Reader) error {
 	tgtDS := p.volumeDataset(target)
 
 	// Strict probe: `zfs recv -F` over a dataset that exists, and the

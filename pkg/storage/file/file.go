@@ -452,7 +452,7 @@ func (p *Provider) SendSnapshot(_ context.Context, snap storage.Snapshot) (io.Re
 // divergent write could ENOSPC even though the file's apparent size
 // looked fine. Thin path skips fallocate (sparse / overcommit is the
 // FILE_THIN contract).
-func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, _ storage.Snapshot, src io.Reader) error {
 	finalPath := p.volumePath(target)
 	partialPath := finalPath + ".partial"
 

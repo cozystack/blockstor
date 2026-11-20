@@ -351,7 +351,7 @@ func (r *lvmDDReader) Close() error {
 // runs, and post-dd `lvchange --deltag` clears the sentinel. The
 // idempotent-skip path inspects the tag: present → re-run the dd;
 // absent → previous run completed cleanly.
-func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, _ storage.Snapshot, src io.Reader) error {
 	tgtName := volumeLVName(target)
 
 	if t.lvExists(ctx, tgtName) {

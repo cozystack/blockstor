@@ -183,8 +183,10 @@ type SnapshotShipper interface {
 	// SendSnapshot on a peer satellite. After this returns, target
 	// is fully populated with the snapshot's bytes; the caller
 	// wires drbdmeta drop-md + create-md to stamp fresh DRBD
-	// metadata for the local node-id.
-	RecvSnapshot(ctx context.Context, target Volume, src io.Reader) error
+	// metadata for the local node-id. source is the snapshot the
+	// stream was sent from, so a backend whose receive also leaves a
+	// copy of that snapshot behind can remove it.
+	RecvSnapshot(ctx context.Context, target Volume, source Snapshot, src io.Reader) error
 }
 
 // ResizeZeroFiller is the optional "grown region reads back as zeros"

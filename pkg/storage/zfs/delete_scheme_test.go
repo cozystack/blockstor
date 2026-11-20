@@ -812,7 +812,7 @@ func TestRecvSnapshotProbeFailureTouchesNothing(t *testing.T) {
 	p := newPool(t, "tank/pvc-a_00000")
 	p.failList = true
 
-	err := zfs.NewProvider(zfs.Config{Pool: "tank"}, p).RecvSnapshot(t.Context(), vol("pvc-a"), strings.NewReader("stream"))
+	err := zfs.NewProvider(zfs.Config{Pool: "tank"}, p).RecvSnapshot(t.Context(), vol("pvc-a"), snap("pvc-src", "s1"), strings.NewReader("s1"))
 	if err == nil {
 		t.Fatalf("RecvSnapshot with a failing probe: got nil, want an error")
 	}
