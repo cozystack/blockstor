@@ -143,16 +143,15 @@ func (s *Server) createBuildDeadline(ctx context.Context, rdName string, deploye
 	now := time.Now()
 	deadline := now.Add(s.ResourceDeployWait)
 
-	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
-	if err != nil {
+	if s.ResourceReadyWait <= 0 || s.ResourceDeployWait <= 0 {
 		return deadline
 	}
 
-	for i := range replicas {
-		rsc := &replicas[i]
-		if rsc.CreateTimestamp == 0 || slices.ContainsFunc(deployed, func(node string) bool {
-			return naming.Same(node, rsc.NodeName)
-		}) {
+	earlier := s.earlierReplicas(ctx, rdName, deployed)
+
+	for i := range earlier {
+		rsc := &earlier[i]
+		if rsc.CreateTimestamp == 0 {
 			continue
 		}
 
@@ -167,6 +166,42 @@ func (s *Server) createBuildDeadline(ctx context.Context, rdName string, deploye
 	}
 
 	return deadline
+}
+
+// earlierReplicas lists the replicas of rdName on nodes other than
+// deployed. When the cache lists none, it asks the API server: the
+// first call of the create may have gone through a sibling apiserver
+// replica whose write this one's cache has not seen yet, and missing it
+// restarted the bound at a whole s.ResourceDeployWait from now.
+func (s *Server) earlierReplicas(ctx context.Context, rdName string, deployed []string) []apiv1.Resource {
+	others := func(replicas []apiv1.Resource) []apiv1.Resource {
+		var out []apiv1.Resource
+
+		for i := range replicas {
+			if !slices.ContainsFunc(deployed, func(node string) bool { return naming.Same(node, replicas[i].NodeName) }) {
+				out = append(out, replicas[i])
+			}
+		}
+
+		return out
+	}
+
+	cached, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err == nil {
+		if out := others(cached); len(out) > 0 {
+			return out
+		}
+	}
+
+	live, err := store.LiveReplicas(ctx, s.Store, rdName)
+	if err != nil {
+		log.FromContext(ctx).WithName("rest").Error(err,
+			"list replicas past the cache; counting the build bound from this call", "resourceDefinition", rdName)
+
+		return nil
+	}
+
+	return others(live)
 }
 
 // waitReplicasReadyBy is waitDeployedReplicasReady with the build

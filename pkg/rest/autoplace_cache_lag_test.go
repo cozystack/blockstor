@@ -337,6 +337,27 @@ func TestNotConnectedWarningForReplicaTheCacheHasNotSeen(t *testing.T) {
 	}
 }
 
+// TestSecondPlacementSharesTheBoundWithAReplicaTheCacheHasNotSeen pins
+// createBuildDeadline against the lag: linstor-csi's second placement
+// call may reach an apiserver replica whose cache does not list the
+// first call's replica yet. Its bound still counts from that replica,
+// not a whole bound from now, which with the ready wait could run past
+// csi-provisioner's minute.
+func TestSecondPlacementSharesTheBoundWithAReplicaTheCacheHasNotSeen(t *testing.T) {
+	const deployWait = 2 * time.Second
+
+	backend := store.NewInMemory()
+	seedReadyWaitDefinition(t, backend, "pvc-second", "n1", "n2")
+	seedReplicaCreatedAgo(t, backend, "pvc-second", "n1", 1500*time.Millisecond)
+
+	st := cacheTrailsWrites{Store: backend, catchUp: time.Now().Add(time.Minute), replicas: true}
+	srv := &Server{Store: st, ResourceReadyWait: 10 * time.Second, ResourceDeployWait: deployWait}
+
+	if left := time.Until(srv.createBuildDeadline(t.Context(), "pvc-second", []string{"n2"})); left > time.Second {
+		t.Errorf("second placement has %s of build bound left, want what is left of the create's %s (about 500ms)", left, deployWait)
+	}
+}
+
 // TestBuildWaitAsksTheAPIServerOnceForADeletedReplica pins the load of
 // the fallback: a deployed replica deleted during the wait, while
 // another is still building, is confirmed gone once and not read past
