@@ -29,27 +29,43 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// bringUpPriority is the queue priority of a local Resource this process
-// has not brought up yet. It ranks above the normal priority of an event,
-// so a replica waiting for its first pass goes before passes of replicas
-// that are already up.
+// bringUpPriority is the queue priority of a local Resource whose first
+// pass has not started yet. It ranks above the normal priority of an
+// event, so a replica waiting for its first pass goes before the repeat
+// passes of replicas that already had one.
 const bringUpPriority = 100
 
-// bringUpTracker records which local Resources this process has brought
-// up: applied once with every layer converged. A Resource it has not seen
-// yet is pending, which covers both the replicas of a node that just
-// started and a replica created while the satellite runs.
+// bringUpTracker records which local Resources had their first pass in
+// this process. A Resource it has not seen yet is pending, which covers
+// both the replicas of a node that just started and a replica created
+// while the satellite runs.
+//
+// A replica leaves the rank when its first pass starts, whatever that
+// pass ends with. One that keeps failing, its storage pool not imported
+// after a reboot say, is then retried like any other pass instead of
+// holding every worker for as long as it fails. LINSTOR's device manager
+// does the same: it dispatches every resource of the first full sync
+// once and retries a failure as an ordinary update.
 type bringUpTracker struct {
-	mu   sync.Mutex
-	done map[string]struct{}
+	mu      sync.Mutex
+	entries map[string]bringUpEntry
+}
+
+// bringUpEntry is what the tracker knows about one Resource: whether its
+// first pass started, and the priority its adds asked for while it was
+// raised, which is the priority it would have run at without the rank.
+type bringUpEntry struct {
+	started  bool
+	asked    int
+	hasAsked bool
 }
 
 func newBringUpTracker() *bringUpTracker {
-	return &bringUpTracker{done: map[string]struct{}{}}
+	return &bringUpTracker{entries: map[string]bringUpEntry{}}
 }
 
-// pending reports whether the Resource still waits for its first
-// converged pass. A nil tracker has nothing pending.
+// pending reports whether the Resource still waits for its first pass.
+// A nil tracker has nothing pending.
 func (t *bringUpTracker) pending(name string) bool {
 	if t == nil {
 		return false
@@ -58,13 +74,11 @@ func (t *bringUpTracker) pending(name string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	_, done := t.done[name]
-
-	return !done
+	return !t.entries[name].started
 }
 
-// broughtUp marks the Resource converged.
-func (t *bringUpTracker) broughtUp(name string) {
+// started marks the first pass of the Resource begun.
+func (t *bringUpTracker) started(name string) {
 	if t == nil {
 		return
 	}
@@ -72,7 +86,49 @@ func (t *bringUpTracker) broughtUp(name string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.done[name] = struct{}{}
+	entry := t.entries[name]
+	entry.started = true
+	t.entries[name] = entry
+}
+
+// raised records the priority an add of a pending Resource asked for
+// before the rank replaced it. Priorities at or above the rank are the
+// rank itself coming back from a requeue and say nothing.
+func (t *bringUpTracker) raised(name string, priority int) {
+	if t == nil || priority >= bringUpPriority {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	entry := t.entries[name]
+	if !entry.hasAsked || priority > entry.asked {
+		entry.asked = priority
+		entry.hasAsked = true
+	}
+
+	t.entries[name] = entry
+}
+
+// unranked is the priority a requeue of the Resource returns to when it
+// comes back at the rank: the highest one its adds asked for while it
+// was pending, or handler.LowPriority, where a Resource of the initial
+// list runs, when none did.
+func (t *bringUpTracker) unranked(name string) int {
+	if t == nil {
+		return handler.LowPriority
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	entry := t.entries[name]
+	if !entry.hasAsked {
+		return handler.LowPriority
+	}
+
+	return entry.asked
 }
 
 // forget drops a Resource that is gone, so one created again under the
@@ -85,7 +141,7 @@ func (t *bringUpTracker) forget(name string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	delete(t.done, name)
+	delete(t.entries, name)
 }
 
 // bringUpQueue raises every add of a pending Resource to bringUpPriority.
@@ -143,17 +199,23 @@ func (q *bringUpQueue) AddRateLimited(item reconcile.Request) {
 
 // AddWithOpts ranks each item by whether it is pending.
 //
-// A pass of a pending Resource is dequeued at bringUpPriority, and
-// controller-runtime queues the pass's own requeue at the priority it
-// dequeued, so the periodic re-check of a replica its first pass just
-// brought up would keep the bring-up rank for good. That one goes back to
-// handler.LowPriority, where the re-check of a replica from the initial
-// list has always run.
+// A first pass is dequeued at bringUpPriority, and controller-runtime
+// queues the pass's own requeue (a failure retry, the periodic re-check)
+// at the priority it dequeued, so the replica would keep the rank for
+// good. That requeue goes back to the priority the replica's adds asked
+// for while it was pending: handler.LowPriority for a replica of the
+// initial list, normal priority for one an event queued.
+//
+// An event that comes in after a first pass is dequeued and before the
+// pass marks the replica started is still queued at the rank, and gives
+// the replica one more pass ahead of the others. The window is the
+// replica's read from the cache.
 func (q *bringUpQueue) AddWithOpts(opts priorityqueue.AddOpts, items ...reconcile.Request) {
 	var raised, rest []reconcile.Request
 
 	for _, item := range items {
 		if q.tracker.pending(item.Name) {
+			q.tracker.raised(item.Name, priorityOf(opts))
 			raised = append(raised, item)
 		} else {
 			rest = append(rest, item)
@@ -166,12 +228,13 @@ func (q *bringUpQueue) AddWithOpts(opts priorityqueue.AddOpts, items ...reconcil
 		q.PriorityQueue.AddWithOpts(up, raised...)
 	}
 
-	if len(rest) > 0 {
+	for _, item := range rest {
+		down := opts
 		if priorityOf(opts) >= bringUpPriority {
-			opts.Priority = priorityPtr(handler.LowPriority)
+			down.Priority = priorityPtr(q.tracker.unranked(item.Name))
 		}
 
-		q.PriorityQueue.AddWithOpts(opts, rest...)
+		q.PriorityQueue.AddWithOpts(down, item)
 	}
 }
 

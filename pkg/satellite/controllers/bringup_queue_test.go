@@ -47,7 +47,7 @@ func bringUpRequest(name string) reconcile.Request {
 
 func TestBringUpQueueRanksPendingReplicasFirst(t *testing.T) {
 	tracker := newBringUpTracker()
-	tracker.broughtUp("up")
+	tracker.started("up")
 
 	inner := &recordingQueue{adds: map[string]priorityqueue.AddOpts{}}
 	queue := &bringUpQueue{PriorityQueue: inner, tracker: tracker}
@@ -81,25 +81,67 @@ func TestBringUpQueueRanksPendingReplicasFirst(t *testing.T) {
 	}
 }
 
-// The pass that brings a replica up was dequeued at bringUpPriority, and
-// controller-runtime queues its periodic re-check at that priority. The
-// re-check must not keep it.
-func TestBringUpQueueDropsTheRankOnceUp(t *testing.T) {
+// A first pass was dequeued at bringUpPriority, and controller-runtime
+// queues its requeue at that priority. The requeue must not keep the
+// rank: it goes back to the priority the replica would have run at
+// without it, low for a replica of the initial list, normal for one an
+// event queued.
+func TestBringUpQueueDropsTheRankAfterTheFirstPass(t *testing.T) {
 	tracker := newBringUpTracker()
 	inner := &recordingQueue{adds: map[string]priorityqueue.AddOpts{}}
 	queue := &bringUpQueue{PriorityQueue: inner, tracker: tracker}
 
-	tracker.broughtUp("r1")
-	queue.AddWithOpts(priorityqueue.AddOpts{After: activeDRBDRequeue, Priority: priorityPtr(bringUpPriority)}, bringUpRequest("r1"))
+	queue.AddWithOpts(priorityqueue.AddOpts{Priority: priorityPtr(handler.LowPriority)}, bringUpRequest("listed"))
+	queue.Add(bringUpRequest("created"))
 
-	if got := inner.adds["r1"]; priorityOf(got) != handler.LowPriority || got.After != activeDRBDRequeue {
-		t.Errorf("re-check after the bring-up: %+v, want priority %d after %v", got, handler.LowPriority, activeDRBDRequeue)
+	for _, name := range []string{"listed", "created"} {
+		if got := priorityOf(inner.adds[name]); got != bringUpPriority {
+			t.Fatalf("first pass of %s: priority %d, want %d", name, got, bringUpPriority)
+		}
+
+		tracker.started(name)
+		queue.AddWithOpts(priorityqueue.AddOpts{After: activeDRBDRequeue, Priority: priorityPtr(bringUpPriority)}, bringUpRequest(name))
 	}
 
-	tracker.forget("r1")
-	queue.Add(bringUpRequest("r1"))
+	if got := inner.adds["listed"]; priorityOf(got) != handler.LowPriority || got.After != activeDRBDRequeue {
+		t.Errorf("requeue of a replica from the initial list: %+v, want priority %d after %v", got, handler.LowPriority, activeDRBDRequeue)
+	}
 
-	if got := priorityOf(inner.adds["r1"]); got != bringUpPriority {
+	if got := inner.adds["created"]; priorityOf(got) != 0 || got.After != activeDRBDRequeue {
+		t.Errorf("requeue of a replica created while the satellite runs: %+v, want normal priority after %v", got, activeDRBDRequeue)
+	}
+
+	// A failed first pass is retried like any other pass.
+	queue.AddWithOpts(priorityqueue.AddOpts{RateLimited: true, Priority: priorityPtr(bringUpPriority)}, bringUpRequest("created"))
+
+	if got := inner.adds["created"]; priorityOf(got) != 0 || !got.RateLimited {
+		t.Errorf("retry of a failed first pass: %+v, want normal priority", got)
+	}
+
+	tracker.forget("listed")
+	queue.Add(bringUpRequest("listed"))
+
+	if got := priorityOf(inner.adds["listed"]); got != bringUpPriority {
 		t.Errorf("replica created again under a deleted one's name: priority %d, want %d", got, bringUpPriority)
+	}
+}
+
+// The rank a requeue carries back says nothing about the priority the
+// replica would have had; only what its adds asked for counts.
+func TestBringUpTrackerIgnoresTheRankItself(t *testing.T) {
+	tracker := newBringUpTracker()
+
+	tracker.raised("r1", bringUpPriority)
+
+	if got := tracker.unranked("r1"); got != handler.LowPriority {
+		t.Errorf("only the rank was asked for: unranked %d, want %d", got, handler.LowPriority)
+	}
+
+	tracker.raised("r1", handler.LowPriority)
+	tracker.raised("r1", 0)
+	tracker.raised("r1", handler.LowPriority)
+
+	if got := tracker.unranked("r1"); got != 0 {
+		t.Errorf("low then normal asked for: unranked %d, want the highest, 0", got)
 	}
 }

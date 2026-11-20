@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
@@ -191,4 +192,168 @@ func TestColdStartBringsEveryReplicaUpUnderEventChurn(t *testing.T) {
 
 		return true
 	})
+}
+
+// brokenPool is a storage provider whose pool did not come back: every
+// pass of a replica in it takes perPass and fails.
+type brokenPool struct {
+	passRecorder
+}
+
+func (p *brokenPool) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.VolumeStatus, error) {
+	_, _ = p.passRecorder.VolumeStatus(ctx, vol)
+
+	return storage.VolumeStatus{}, errors.New("pool not imported")
+}
+
+func (p *brokenPool) CreateVolume(ctx context.Context, vol storage.Volume) error {
+	_, _ = p.passRecorder.VolumeStatus(ctx, vol)
+
+	return errors.New("pool not imported")
+}
+
+// TestColdStartFailingReplicasDoNotStarveTheRest: after a reboot one
+// storage pool did not come back, so the passes of its replicas fail
+// and their kernel and peer events keep coming. Each of them gets its
+// first pass ahead of everything else, like every other replica, and
+// after that it queues as any other pass does. Had it kept the bring-up
+// rank until it applied cleanly, its passes would hold every worker as
+// long as the pool is broken, and an event for a healthy replica would
+// never get a pass.
+func TestColdStartFailingReplicasDoNotStarveTheRest(t *testing.T) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		t.Skip("KUBEBUILDER_ASSETS not set; run via `make test` (needs envtest apiserver)")
+	}
+
+	const (
+		local   = "n1"
+		peer    = "n2"
+		good    = "lvm-thin"
+		bad     = "zfs-broken"
+		healthy = 4
+		broken  = 6
+		workers = 2
+		perPass = 100 * time.Millisecond
+	)
+
+	cli, mgr := startBringupEnvtest(t)
+
+	for _, node := range []string{local, peer} {
+		bringupCreate(t, cli, &blockstoriov1alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: node},
+			Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+		})
+	}
+
+	for _, pool := range []string{good, bad} {
+		bringupCreate(t, cli, &blockstoriov1alpha1.StoragePool{
+			ObjectMeta: metav1.ObjectMeta{Name: pool + "." + local},
+			Spec:       blockstoriov1alpha1.StoragePoolSpec{NodeName: local, PoolName: pool, ProviderKind: "LVM_THIN"},
+		})
+	}
+
+	for i := range healthy + broken {
+		pool := good
+		if i >= healthy {
+			pool = bad
+		}
+
+		rd := fmt.Sprintf("pvc-pool-%02d", i)
+		bringupDefinition(t, cli, rd)
+		bringupReplica(t, cli, rd, local, pool, int32(i), 0)
+		bringupReplica(t, cli, rd, peer, pool, int32(i), 1)
+	}
+
+	up := &passRecorder{delay: perPass, seen: map[string]struct{}{}}
+	down := &brokenPool{passRecorder{delay: perPass, seen: map[string]struct{}{}}}
+	trigger := make(chan event.GenericEvent, 1024)
+
+	rec := &ResourceReconciler{
+		Client: mgr.GetClient(),
+		Config: Config{
+			NodeName: local,
+			Apply: satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{good: up, bad: down},
+				NodeName:  local,
+			}),
+			Exec:             storage.NewFakeExec(),
+			APIReader:        mgr.GetAPIReader(),
+			ResourceWorkers:  workers,
+			ReconcileTrigger: trigger,
+		},
+	}
+
+	err := rec.SetupWithManager(mgr)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		mgrErr := mgr.Start(ctx)
+		if mgrErr != nil {
+			t.Errorf("manager: %v", mgrErr)
+		}
+	})
+
+	// The observer: the replicas of the broken pool keep producing
+	// kernel and peer events.
+	wg.Go(func() {
+		for ctx.Err() == nil {
+			for _, rd := range down.passed() {
+				select {
+				case trigger <- event.GenericEvent{Object: &blockstoriov1alpha1.Resource{
+					ObjectMeta: metav1.ObjectMeta{Name: rd + "." + local},
+				}}:
+				default:
+				}
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	// Every replica gets its first pass, the failing ones included.
+	bringupWaitFor(t, (healthy+broken)*perPass+10*time.Second, func() bool {
+		return len(up.passed()) == healthy && len(down.passed()) == broken
+	})
+
+	// An event for a healthy replica that is already up, a peer that
+	// came back say, must reach it while the broken pool stays broken.
+	target := "pvc-pool-00"
+
+	up.mu.Lock()
+	delete(up.seen, target)
+	up.mu.Unlock()
+
+	trigger <- event.GenericEvent{Object: &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: target + "." + local},
+	}}
+
+	budget := 5 * time.Second
+	deadline := time.Now().Add(budget)
+
+	for {
+		up.mu.Lock()
+		_, done := up.seen[target]
+		up.mu.Unlock()
+
+		if done {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("event for a healthy replica had no pass within %v: the failing passes of the broken pool held every worker", budget)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
 }

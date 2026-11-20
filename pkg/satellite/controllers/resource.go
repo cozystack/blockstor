@@ -149,8 +149,8 @@ type ResourceReconciler struct {
 	// directly goes around it.
 	recheck *recheckGate
 
-	// bringUp ranks the local Resources this process has not brought up
-	// yet ahead of every other pass (bringUpQueue). SetupWithManager
+	// bringUp ranks the first pass of every local Resource in this
+	// process ahead of every other pass (bringUpQueue). SetupWithManager
 	// creates it.
 	bringUp *bringUpTracker
 }
@@ -182,11 +182,20 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	// From here a pass of the replica counts as its first one, whatever
+	// it ends with, so it gives up the bring-up rank (bringUpTracker).
+	// A pass that only stamps the finalizer does not: the pass it
+	// requeues is the one that brings the replica up.
+	hasFinalizer := slices.Contains(res.Finalizers, SatelliteResourceFinalizer)
+	if hasFinalizer || !res.DeletionTimestamp.IsZero() {
+		r.bringUp.started(res.Name)
+	}
+
 	if !res.DeletionTimestamp.IsZero() {
 		return r.handleDelete(ctx, &res)
 	}
 
-	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
+	if !hasFinalizer {
 		res.Finalizers = append(res.Finalizers, SatelliteResourceFinalizer)
 
 		err := r.Update(ctx, &res)
@@ -301,7 +310,7 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Named("satellite-resource").
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.Config.resourceWorkers(),
-			NewQueue:                newBringUpQueueFunc(r.bringUp, mgr.GetLogger()),
+			NewQueue:                newBringUpQueueFunc(r.bringUp, mgr.GetControllerOptions().Logger),
 		})
 
 	// Phase 11.7 second leg: the observer-trigger channel wakes
@@ -548,8 +557,6 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	if anyFailed {
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
 	}
-
-	r.bringUp.broughtUp(res.Name)
 
 	// Phase 11.7 safety net: schedule a periodic re-eval on
 	// active-DRBD resources. The primary-watch predicate drops
