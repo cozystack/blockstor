@@ -198,19 +198,20 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 		return r.handleResumePhase(ctx, snap)
 	}
 
+	// Already took our local snapshot: the controller is either still
+	// waiting on slow siblings, or the take is over and it cleared both
+	// flags. All that is left is to record which pool holds the copy,
+	// which a snapshot taken before that record gets here too.
+	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
+		return ctrl.Result{}, r.recordSnapshotPool(ctx, snap)
+	}
+
 	// Phase 2: take the per-node snapshot. Gated on Spec.TakeSnapshot
 	// (controller stamps it once every targeted node has acked Phase
 	// 1) AND on this node not having already succeeded.
 	if !snap.Spec.TakeSnapshot {
 		// Suspend acked, but the controller hasn't promoted to
 		// take-snapshot yet — siblings still suspending. Wait.
-		return ctrl.Result{}, nil
-	}
-
-	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
-		// Already took our local snapshot; the controller is
-		// either still waiting on slow siblings or hasn't
-		// observed our Ready stamp yet. No-op.
 		return ctrl.Result{}, nil
 	}
 
@@ -622,6 +623,11 @@ func collapseNodeStatus(
 			kept.SuspendIOAcked = kept.SuspendIOAcked || entry.SuspendIOAcked
 			kept.Failed = kept.Failed || entry.Failed
 			kept.CreateTimestamp = max(kept.CreateTimestamp, entry.CreateTimestamp)
+
+			if kept.StoragePool == "" {
+				kept.StoragePool = entry.StoragePool
+			}
+
 			folded = true
 		}
 	}
