@@ -762,6 +762,12 @@ type ObserverRunnable struct {
 	// status onto that same version: nothing could have changed it.
 	appliedMu sync.Mutex
 	applied   map[string]appliedStatus
+
+	// startEvents2 starts the kernel event stream; nil runs drbdsetup.
+	// restartDelay is the wait before a stream that ended is started
+	// again; zero means events2RestartDelay. Both are for tests.
+	startEvents2 func(context.Context) (*drbd.Watcher, func(), error)
+	restartDelay time.Duration
 }
 
 // appliedStatus is one entry of ObserverRunnable.applied.
@@ -845,38 +851,126 @@ func (*ObserverRunnable) NeedLeaderElection() bool { return false }
 
 // Start launches the events2 watcher + observation translator +
 // per-event Status SSA write loop. Returns when ctx cancels.
-// Surface errors are logged but do not abort the runnable; the
-// drbdsetup process is supervised externally by the satellite
-// pod's restart policy.
+//
+// drbdsetup events2 ends on its own when it falls behind: the kernel
+// drops notifications its socket has no room for, and drbdsetup exits
+// on that error rather than carry on with a state it knows is
+// incomplete. The stream used to end the loop for good while the
+// resync went on re-writing the last cached state, so a replica stayed
+// SyncTarget or Attaching in `r l` long after the kernel had moved on.
+// LINSTOR restarts the stream and drops its state (DrbdEventService);
+// so does this: the new stream's initial dump rebuilds the caches.
 func (o *ObserverRunnable) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("observer")
 
-	watcher, cleanup, err := drbd.StartDrbdsetupEvents2(ctx)
+	stream, stop, err := o.events2Source()(ctx)
 	if err != nil {
 		return errors.Wrap(err, "start drbdsetup events2")
 	}
-	defer cleanup()
-
-	events := make(chan drbd.Event, observerEventBuffer)
-
-	go func() {
-		watchErr := watcher.Watch(ctx, events)
-		if watchErr != nil && !errors.Is(watchErr, context.Canceled) {
-			logger.Error(watchErr, "events2 watch")
-		}
-	}()
 
 	adm := drbd.NewAdm(o.Exec)
 
 	go o.resyncLoop(ctx)
 
+	for {
+		o.follow(ctx, logger, adm, stream)
+		stop()
+
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		logger.Info("drbdsetup events2 ended; reading the kernel state afresh",
+			"after", o.events2RestartDelay())
+		o.forgetObserved()
+
+		var started bool
+
+		stream, stop, started = o.restartEvents2(ctx, logger)
+		if !started {
+			return nil
+		}
+	}
+}
+
+// follow handles every frame of one events2 stream until it ends.
+func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, adm *drbd.Adm, stream *drbd.Watcher) {
+	events := make(chan drbd.Event, observerEventBuffer)
+
+	go func() {
+		watchErr := stream.Watch(ctx, events)
+		if watchErr != nil && !errors.Is(watchErr, context.Canceled) {
+			logger.Error(watchErr, "events2 watch")
+		}
+	}()
+
 	for ev := range observationsFrom(events) {
 		obs := ev
 		o.handleObservation(ctx, adm, &obs)
 	}
-
-	return nil
 }
+
+// restartEvents2 starts a new stream after the restart delay, retrying
+// until it starts (true) or ctx ends (false).
+func (o *ObserverRunnable) restartEvents2(ctx context.Context, logger logr.Logger) (*drbd.Watcher, func(), bool) {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, nil, false
+		case <-time.After(o.events2RestartDelay()):
+		}
+
+		stream, stop, err := o.events2Source()(ctx)
+		if err == nil {
+			return stream, stop, true
+		}
+
+		logger.Error(err, "restart drbdsetup events2")
+	}
+}
+
+// forgetObserved drops everything the ended stream told the observer.
+// A peer or volume that went away while no stream ran sends no destroy
+// frame afterwards, so a kept entry would be re-written forever; the
+// new stream's initial dump restates everything that still exists.
+func (o *ObserverRunnable) forgetObserved() {
+	o.volMu.Lock()
+	o.volCache = nil
+	o.volMu.Unlock()
+
+	o.connMu.Lock()
+	o.connCache = nil
+	o.connMu.Unlock()
+
+	o.resMu.Lock()
+	o.resCache = nil
+	o.resMu.Unlock()
+
+	o.lifecycleMu.Lock()
+	o.lifecycleCache = nil
+	o.lifecycleMu.Unlock()
+}
+
+func (o *ObserverRunnable) events2Source() func(context.Context) (*drbd.Watcher, func(), error) {
+	if o.startEvents2 != nil {
+		return o.startEvents2
+	}
+
+	return drbd.StartDrbdsetupEvents2
+}
+
+func (o *ObserverRunnable) events2RestartDelay() time.Duration {
+	if o.restartDelay > 0 {
+		return o.restartDelay
+	}
+
+	return events2RestartDelay
+}
+
+// events2RestartDelay is LINSTOR's RESTART_EVENTS2_STREAM_TIMEOUT.
+const events2RestartDelay = 5 * time.Second
 
 // observerResyncInterval is how often the observer re-applies its
 // cached per-resource state to the apiserver. Belt-and-braces
@@ -917,8 +1011,10 @@ func (o *ObserverRunnable) resyncOnce(ctx context.Context, logger logr.Logger) {
 	adm := drbd.NewAdm(o.Exec)
 
 	for _, name := range names {
-		obs := o.snapshotFor(name)
-		if obs.ResourceName == "" {
+		// A restarted stream may have dropped the resource since the
+		// names were listed; an empty view would strip its status.
+		obs, known := o.cachedView(name)
+		if !known {
 			continue
 		}
 
