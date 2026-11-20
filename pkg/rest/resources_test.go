@@ -1373,34 +1373,26 @@ func eligibleAffinityNodes(rs []apiv1.ResourceWithVolumes) []string {
 	return out
 }
 
-// TestAnnotateSyncProgressStateBug348 pins the upstream-shaped State
-// column for the SyncSource / SyncTarget transient window and the two
-// percentage bugs the user hit live on a 3-replica stand (worker-1
-// SyncSource, worker-2 UpToDate, worker-3 SyncTarget):
+// TestAnnotateSyncProgressStateBug348 pins the State column for the
+// SyncSource / SyncTarget window and the percentage bugs met live:
 //
-// Bug A — `(NN%)` must NEVER decorate a terminal state. A fully
-// UpToDate replica's per-volume OutOfSyncKib can be > 0 because it
-// tracks out-of-sync bytes toward a still-syncing peer; the old
-// fallthrough rendered `UpToDate(22%)`, which the golden upstream
-// shape forbids. UpToDate / Diskless / TieBreaker / Outdated stay
-// bare regardless of OutOfSyncKib.
+// Bug A: a terminal state never carries a percentage. A fully UpToDate
+// replica's OutOfSyncKib can be > 0 toward a still-syncing peer; it
+// once rendered `UpToDate(22%)`.
 //
-// Bug B — SyncSource / SyncTarget must carry the progress `(NN%)`.
-// Bug 348 promoted the two transient drbd-9 tokens to literal
-// State-column values but over-corrected by stripping the percent;
-// operators want to see how far the resync has come. The percent is
-// computed from THIS replica's own OutOfSyncKib + VD size, falling
-// back to the bare literal when that data is unavailable.
+// Bug B: SyncSource / SyncTarget carry the resync progress (Bug 348
+// promoted the literals and once stripped the percent).
 //
-// When replication settles into `Established` (or the map is empty
-// because no peer is mid-sync), the disk_state-with-progress path
-// takes over and the column collapses cleanly back to `UpToDate`.
+// Multi-peer resync: the progress is DRBD's per-peer `done`, never one
+// derived from the volume-wide OutOfSyncKib. A replica that finished a
+// small resync from one peer and ran a full one from another showed
+// `Inconsistent(99%)` while the kernel said `done:50.31`. LINSTOR
+// renders `SyncTarget(50.31%)` from that `done`, and no percentage on
+// any other state.
 func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 	t.Parallel()
 
 	const sizeKib = int64(1024 * 1024) // 1 GiB
-
-	sizes := map[int32]int64{0: sizeKib}
 
 	type tc struct {
 		name string
@@ -1410,40 +1402,56 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 
 	cases := []tc{
 		{
-			name: "source side mid-sync renders SyncSource with progress (Bug B)",
+			name: "source side mid-sync renders SyncSource with done (Bug B)",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
 				State: apiv1.VolumeState{
-					DiskState:    "UpToDate",
-					OutOfSyncKib: sizeKib / 2, // 50% out-of-sync → 50%
+					DiskState: "UpToDate",
 					ReplicationStates: map[string]apiv1.ReplicationState{
-						"peer-b": {ReplicationState: "SyncSource"},
+						"peer-b": {ReplicationState: "SyncSource", DonePercentage: ptrFloat(50)},
 					},
 				},
 			},
-			want: "SyncSource(50%)",
+			want: "SyncSource(50.00%)",
 		},
 		{
-			name: "target side mid-sync renders SyncTarget with progress (Bug B)",
+			name: "target side mid-sync renders SyncTarget with done (Bug B)",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState: "Inconsistent",
+					ReplicationStates: map[string]apiv1.ReplicationState{
+						"peer-a": {ReplicationState: "SyncTarget", DonePercentage: ptrFloat(75.5)},
+					},
+				},
+			},
+			want: "SyncTarget(75.50%)",
+		},
+		{
+			// The live report: the small resync from peer-b is over
+			// (its frame came last, OutOfSyncKib ~1%), the full one
+			// from peer-a is half way. The kernel says done:50.31.
+			name: "full resync after a small one shows the running resync's done, not OutOfSyncKib",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
 				State: apiv1.VolumeState{
 					DiskState:    "Inconsistent",
-					OutOfSyncKib: sizeKib / 4, // 75% synced
+					OutOfSyncKib: sizeKib / 100,
 					ReplicationStates: map[string]apiv1.ReplicationState{
-						"peer-a": {ReplicationState: "SyncTarget"},
+						"peer-a": {ReplicationState: "SyncTarget", DonePercentage: ptrFloat(50.31)},
+						"peer-b": {ReplicationState: "Established"},
 					},
 				},
 			},
-			want: "SyncTarget(75%)",
+			want: "SyncTarget(50.31%)",
 		},
 		{
-			name: "SyncTarget with no usable size falls back to bare literal (Bug B fallback)",
+			name: "SyncTarget without done stays a bare literal, never a size-derived percent",
 			in: apiv1.Volume{
-				VolumeNumber: 1, // not in sizes map → size 0
+				VolumeNumber: 0,
 				State: apiv1.VolumeState{
 					DiskState:    "Inconsistent",
-					OutOfSyncKib: 12345,
+					OutOfSyncKib: sizeKib / 4,
 					ReplicationStates: map[string]apiv1.ReplicationState{
 						"peer-a": {ReplicationState: "SyncTarget"},
 					},
@@ -1456,12 +1464,8 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 			in: apiv1.Volume{
 				VolumeNumber: 0,
 				State: apiv1.VolumeState{
-					// No SyncSource/SyncTarget entry for THIS replica:
-					// it is fully UpToDate, but a peer is still syncing
-					// so the worst-case OutOfSyncKib is non-zero. Must
-					// NOT render UpToDate(22%).
 					DiskState:    "UpToDate",
-					OutOfSyncKib: sizeKib * 78 / 100, // would be (22%)
+					OutOfSyncKib: sizeKib * 78 / 100,
 					ReplicationStates: map[string]apiv1.ReplicationState{
 						"peer-b": {ReplicationState: "Established"},
 					},
@@ -1470,93 +1474,45 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 			want: "UpToDate",
 		},
 		{
-			name: "Diskless with OutOfSyncKib>0 stays bare (Bug A — terminal state)",
+			name: "Diskless with OutOfSyncKib>0 stays bare (Bug A)",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
-				State: apiv1.VolumeState{
-					DiskState:    "Diskless",
-					OutOfSyncKib: sizeKib / 2,
-				},
+				State:        apiv1.VolumeState{DiskState: "Diskless", OutOfSyncKib: sizeKib / 2},
 			},
 			want: "Diskless",
 		},
 		{
-			name: "TieBreaker with OutOfSyncKib>0 stays bare (Bug A — terminal state)",
+			name: "Outdated with OutOfSyncKib>0 stays bare (Bug A)",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
-				State: apiv1.VolumeState{
-					DiskState:    "TieBreaker",
-					OutOfSyncKib: sizeKib / 2,
-				},
-			},
-			want: "TieBreaker",
-		},
-		{
-			name: "Outdated with OutOfSyncKib>0 stays bare (Bug A — frozen state)",
-			in: apiv1.Volume{
-				VolumeNumber: 0,
-				State: apiv1.VolumeState{
-					DiskState:    "Outdated",
-					OutOfSyncKib: sizeKib / 2,
-				},
+				State:        apiv1.VolumeState{DiskState: "Outdated", OutOfSyncKib: sizeKib / 2},
 			},
 			want: "Outdated",
 		},
 		{
-			name: "both peers Established with UpToDate disk renders UpToDate clean",
+			name: "Inconsistent with OutOfSyncKib but no syncing peer stays bare, as in LINSTOR",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
-				State: apiv1.VolumeState{
-					DiskState:    "UpToDate",
-					OutOfSyncKib: 0,
-					ReplicationStates: map[string]apiv1.ReplicationState{
-						"peer-b": {ReplicationState: "Established"},
-					},
-				},
+				State:        apiv1.VolumeState{DiskState: "Inconsistent", OutOfSyncKib: sizeKib / 4},
 			},
-			want: "UpToDate",
+			want: "Inconsistent",
 		},
 		{
-			name: "Inconsistent with no replication-state info stays Inconsistent (no NN%)",
+			name: "PausedSyncT keeps the bare disk state even with a done (Bug 348 scope)",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
 				State: apiv1.VolumeState{
 					DiskState:    "Inconsistent",
-					OutOfSyncKib: 0, // no progress signal → no suffix
+					OutOfSyncKib: sizeKib / 2,
+					ReplicationStates: map[string]apiv1.ReplicationState{
+						"peer-b": {ReplicationState: "PausedSyncT", DonePercentage: ptrFloat(10)},
+					},
 				},
 			},
 			want: "Inconsistent",
 		},
 		{
-			name: "Inconsistent with progress but no replication-state still annotates legacy (NN%)",
-			in: apiv1.Volume{
-				VolumeNumber: 0,
-				State: apiv1.VolumeState{
-					DiskState:    "Inconsistent",
-					OutOfSyncKib: sizeKib / 4, // 75% synced
-				},
-			},
-			want: "Inconsistent(75%)",
-		},
-		{
-			name: "PausedSyncS falls through to legacy annotation (Bug 348 scope is SyncSource/SyncTarget only)",
-			in: apiv1.Volume{
-				VolumeNumber: 0,
-				State: apiv1.VolumeState{
-					// PausedSyncS is NOT promoted to a literal; disk_state
-					// here is Inconsistent (a non-terminal state) so the
-					// legacy progress suffix still applies.
-					DiskState:    "Inconsistent",
-					OutOfSyncKib: sizeKib / 2,
-					ReplicationStates: map[string]apiv1.ReplicationState{
-						"peer-b": {ReplicationState: "PausedSyncS"},
-					},
-				},
-			},
-			want: "Inconsistent(50%)",
-		},
-		{
-			name: "3-replica mixed: SyncSource peer wins over Established peer, with progress",
+			name: "3-replica mixed: SyncSource peer wins over Established peer, with its done",
 			in: apiv1.Volume{
 				VolumeNumber: 0,
 				State: apiv1.VolumeState{
@@ -1564,11 +1520,11 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 					OutOfSyncKib: sizeKib / 2,
 					ReplicationStates: map[string]apiv1.ReplicationState{
 						"peer-b": {ReplicationState: "Established"},
-						"peer-c": {ReplicationState: "SyncSource"},
+						"peer-c": {ReplicationState: "SyncSource", DonePercentage: ptrFloat(12.34)},
 					},
 				},
 			},
-			want: "SyncSource(50%)",
+			want: "SyncSource(12.34%)",
 		},
 	}
 
@@ -1576,7 +1532,7 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := annotateSyncProgress([]apiv1.Volume{c.in}, sizes)
+			got := annotateSyncProgress([]apiv1.Volume{c.in})
 			if len(got) != 1 {
 				t.Fatalf("annotateSyncProgress returned %d volumes, want 1", len(got))
 			}
@@ -1587,6 +1543,10 @@ func TestAnnotateSyncProgressStateBug348(t *testing.T) {
 			}
 		})
 	}
+}
+
+func ptrFloat(v float64) *float64 {
+	return &v
 }
 
 // TestActiveSyncReplicationState exercises the small helper in

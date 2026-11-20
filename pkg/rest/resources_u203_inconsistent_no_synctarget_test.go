@@ -39,15 +39,13 @@ import (
 //
 // annotateSyncProgress only promotes to the `SyncTarget` literal when
 // activeSyncReplicationState finds a peer actually reporting
-// `SyncTarget` (see resources.go). Without that token it falls through to
-// the legacy disk_state path, which keeps the real DiskState
-// (`Inconsistent`) — optionally with a `(NN%)` progress suffix when
-// OutOfSyncKib is known, but NEVER relabelled to `SyncTarget`.
+// `SyncTarget` (see resources.go). Without that token the real
+// DiskState (`Inconsistent`) stays, bare, as LINSTOR shows it: a large
+// OutOfSyncKib adds no percentage and no SyncTarget label.
 func TestU203InconsistentWithoutSyncNeverShowsSyncTarget(t *testing.T) {
 	t.Parallel()
 
 	const sizeKib = int64(1024 * 1024) // 1 GiB
-	sizes := map[int32]int64{0: sizeKib}
 
 	cases := []struct {
 		name string
@@ -66,12 +64,7 @@ func TestU203InconsistentWithoutSyncNeverShowsSyncTarget(t *testing.T) {
 					OutOfSyncKib: sizeKib, // 100% out-of-sync, nothing moving
 				},
 			},
-			// Legacy progress path renders 0% → but withSyncPercent
-			// returns max(0, 100-100) = 0, so the suffix is "(0%)". The
-			// CRITICAL invariant is only that it is NOT a SyncTarget
-			// literal; the exact legacy suffix is asserted by the
-			// substring guard below, not this equality.
-			want: "Inconsistent(0%)",
+			want: "Inconsistent",
 		},
 		{
 			// Inconsistent with a peer that is merely Established (the
@@ -88,7 +81,7 @@ func TestU203InconsistentWithoutSyncNeverShowsSyncTarget(t *testing.T) {
 					},
 				},
 			},
-			want: "Inconsistent(50%)",
+			want: "Inconsistent",
 		},
 		{
 			// Inconsistent with a peer in Connecting (link down): no
@@ -104,7 +97,7 @@ func TestU203InconsistentWithoutSyncNeverShowsSyncTarget(t *testing.T) {
 					},
 				},
 			},
-			want: "Inconsistent(75%)",
+			want: "Inconsistent",
 		},
 		{
 			// Inconsistent with no progress signal at all (OutOfSyncKib
@@ -130,11 +123,11 @@ func TestU203InconsistentWithoutSyncNeverShowsSyncTarget(t *testing.T) {
 					DiskState:    "Inconsistent",
 					OutOfSyncKib: sizeKib / 4,
 					ReplicationStates: map[string]apiv1.ReplicationState{
-						"peer-a": {ReplicationState: "SyncTarget"},
+						"peer-a": {ReplicationState: "SyncTarget", DonePercentage: ptrFloat(75)},
 					},
 				},
 			},
-			want: "SyncTarget(75%)",
+			want: "SyncTarget(75.00%)",
 		},
 	}
 
@@ -142,7 +135,7 @@ func TestU203InconsistentWithoutSyncNeverShowsSyncTarget(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := annotateSyncProgress([]apiv1.Volume{c.in}, sizes)
+			got := annotateSyncProgress([]apiv1.Volume{c.in})
 			if len(got) != 1 {
 				t.Fatalf("annotateSyncProgress returned %d volumes, want 1", len(got))
 			}

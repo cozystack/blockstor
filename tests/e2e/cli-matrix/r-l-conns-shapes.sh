@@ -261,22 +261,16 @@ wait_conns_ok "$RD_TB" "$tb_node" "$N2" 60
 # ----------------------------------------------------------------------
 # Sub-test D — SyncTarget / SyncSource render shape (known-delta #85)
 #
-# A replica actively receiving data renders `SyncTarget(NN%)` and the
-# source `SyncSource(NN%)` while there is still data to copy — the
-# percent gives the operator resync progress (Bug 348 / Bug B).
+# A replica actively receiving data renders `SyncTarget(NN.NN%)` and
+# the source `SyncSource(NN.NN%)`, the percent being DRBD's per-peer
+# `done` for that resync, as LINSTOR shows it (Bug 348 / Bug B).
 #
-# KNOWN DELTA (docs/cli-parity-known-deltas.md row 85): when the
-# per-volume OutOfSyncKib is <= 0 (or the VD size is unknown), BS
-# DELIBERATELY renders the BARE literal `SyncSource` / `SyncTarget`
-# with NO `(NN%)` suffix — `withSyncPercent` short-circuits on
-# OutOfSyncKib<=0 rather than emit a misleading `(0%)`/`(100%)`
-# (pkg/rest/resources.go: annotateSyncProgress → withSyncPercent).
-# This window is real: drbd briefly reports the SyncSource/SyncTarget
-# replication-state literal before/after the peer-device OutOfSyncKib
-# counter has a non-zero value to decorate with. A bare Sync* literal
-# is therefore the INTENDED BS shape, not a regression — so this cell
-# asserts the BS contract: a Sync* token may appear EITHER bare OR
-# with a `(NN%)` suffix, and never as the old stuck `UpToDate(NN%)`.
+# KNOWN DELTA (docs/cli-parity-known-deltas.md row 85): while
+# drbdsetup prints no `done` for the resync (between the replication
+# state change and the first progress frame), BS renders the BARE
+# literal `SyncSource` / `SyncTarget` rather than a made-up percent.
+# So this cell asserts: a Sync* token may appear EITHER bare OR with a
+# `(NN.NN%)` suffix, and never as the old stuck `UpToDate(NN%)`.
 #
 # We dirty the bitmap (write data on the primary), then add a second
 # diskful replica so its initial resync is a real non-instant
@@ -319,17 +313,16 @@ while (( $(date +%s) < deadline )); do
     # The REGRESSION is the legacy stuck `UpToDate(NN%)` shape — a
     # terminal disk_state must never carry a sync-progress suffix
     # (Bug A). Fail immediately if we ever see one.
-    if grep -qE '^UpToDate\([0-9]+%\)$' <<<"$state"; then
+    if grep -qE '^UpToDate\([0-9]+(\.[0-9]+)?%\)$' <<<"$state"; then
         echo "FAIL (331.D / delta #85): terminal UpToDate carries a (NN%) suffix — Bug A regression:" >&2
         echo "$state" >&2
         exit 1
     fi
 
-    # A Sync* token is the contract — accept it BOTH bare (delta #85:
-    # OutOfSyncKib<=0, withSyncPercent short-circuits) AND with a
-    # (NN%) suffix (OutOfSyncKib>0). Either shape proves the resync
-    # window rendered correctly.
-    if grep -qE '^(SyncTarget|SyncSource)(\([0-9]+%\))?$' <<<"$state"; then
+    # A Sync* token is the contract: accept it BOTH bare (delta #85:
+    # no `done` reported yet) AND with a (NN.NN%) suffix. Either shape
+    # proves the resync window rendered correctly.
+    if grep -qE '^(SyncTarget|SyncSource)(\([0-9]+(\.[0-9]+)?%\))?$' <<<"$state"; then
         sync_observed=1
         echo "   observed Sync* literal (bare or with progress): $(grep -E '^(SyncTarget|SyncSource)' <<<"$state" | head -1)"
         break

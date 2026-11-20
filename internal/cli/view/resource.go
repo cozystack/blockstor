@@ -49,6 +49,8 @@ const (
 	stateDeleting = "DELETING"
 	stateUnknown  = "Unknown"
 	flagDelete    = "DELETE"
+
+	replicationStateSyncTarget = "SyncTarget"
 )
 
 // State cells that are terminal — a converged replica never carries a
@@ -100,7 +102,7 @@ func ResourceList(in ResourceListInput) *metav1.Table {
 			drbdPort(res),
 			usageCell(res),
 			connsCell(res),
-			stateCell(res, in.VolumeSizesKib[res.Name]),
+			stateCell(res),
 			createdOn(res.CreateTimestamp),
 		}})
 	}
@@ -188,7 +190,15 @@ func connsCell(res *apiv1.Resource) string {
 // disk says, and a tie-breaker reads the literal `TieBreaker` (a
 // harness greps for that exact token, case included) rather than the
 // Diskless it also technically is.
-func stateCell(res *apiv1.Resource, sizes map[int32]int64) string {
+//
+// A replica resyncing from a peer reads `SyncTarget(50.31%)`, DRBD's
+// own `done` for that resync, which is what `linstor r l` shows
+// against LINSTOR. No other state carries a percentage. One derived
+// from the volume size and the out-of-sync count is wrong once a
+// replica resyncs from more than one peer: the count is the last
+// peer's, so a replica half way through a full resync read
+// `Inconsistent(99%)` after a small resync from another peer.
+func stateCell(res *apiv1.Resource) string {
 	if slices.Contains(res.Flags, flagDelete) {
 		return stateDeleting
 	}
@@ -206,20 +216,11 @@ func stateCell(res *apiv1.Resource, sizes map[int32]int64) string {
 		return stateUnknown
 	}
 
-	state := vol.State.DiskState
-
-	// A converged replica never carries a percentage; a syncing one
-	// does, computed from what the satellite reports as still
-	// out-of-sync.
-	if _, terminal := terminalStates[strings.ToLower(state)]; terminal {
-		return state
+	if done, ok := vol.State.SyncProgress(replicationStateSyncTarget); ok {
+		return apiv1.SyncProgressState(replicationStateSyncTarget, done)
 	}
 
-	if pct, ok := syncPercent(vol, sizes); ok {
-		return fmt.Sprintf("%s(%d%%)", state, pct)
-	}
-
-	return state
+	return vol.State.DiskState
 }
 
 // worstVolume picks the volume whose state the row should report: the
@@ -241,25 +242,6 @@ func worstVolume(res *apiv1.Resource) *apiv1.Volume {
 	}
 
 	return &res.Volumes[0]
-}
-
-// syncPercent converts the observed out-of-sync KiB into progress.
-func syncPercent(vol *apiv1.Volume, sizes map[int32]int64) (int, bool) {
-	if vol.State.OutOfSyncKib <= 0 {
-		return 0, false
-	}
-
-	size, ok := sizes[vol.VolumeNumber]
-	if !ok || size <= 0 {
-		return 0, false
-	}
-
-	done := float64(size-vol.State.OutOfSyncKib) / float64(size) * 100
-	if done < 0 {
-		done = 0
-	}
-
-	return int(done), true
 }
 
 // IsFaulty backs `--faulty`: a replica counts as faulty when a volume
