@@ -443,6 +443,32 @@ func TestAutoplaceWaitsOnlyForReplicasItCreated(t *testing.T) {
 	}
 }
 
+// TestResourceCreateOnNodeAnswersAfterReplicaIsReady pins the same wait
+// on the explicit create linstor-csi's Manual scheduler posts: LINSTOR
+// answers it through the same deployResources.
+func TestResourceCreateOnNodeAnswersAfterReplicaIsReady(t *testing.T) {
+	st := store.NewInMemory()
+	nodes := []string{"n1", "n2"}
+
+	seedReadyWaitDefinition(t, st, "pvc-manual", nodes...)
+	seedReplica(t, st, "pvc-manual", "n1", true, nil)
+
+	base := startReadyWaitServer(t, st, 10*time.Second)
+	standIn := satelliteStandIn(t.Context(), st, "pvc-manual", 2, []string{"n2"}, false)
+
+	rcs, _ := postForRcs(t, base+"/v1/resource-definitions/pvc-manual/resources/n2", nil, http.StatusCreated)
+
+	requireReadyReplicas(t, st, "pvc-manual", []string{"n2"})
+
+	if w := warningsFor(rcs); len(w) != 0 {
+		t.Errorf("unexpected warnings: %v", w)
+	}
+
+	if err := <-standIn; err != nil {
+		t.Fatalf("satellite stand-in: %v", err)
+	}
+}
+
 // TestWaitDeployedReplicasFollowsLinstorPredicate pins which deployed
 // replicas LINSTOR's waitResourcesReady waits for, and how it answers
 // for the others, with a deployed replica that never becomes ready.

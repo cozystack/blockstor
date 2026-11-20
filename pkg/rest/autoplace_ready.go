@@ -290,6 +290,17 @@ func reachesUpToDatePeer(conns map[string]bool, byNode map[string]*apiv1.Resourc
 	return false
 }
 
+// replicaNodes lists the nodes of replicas.
+func replicaNodes(replicas []apiv1.Resource) []string {
+	out := make([]string, 0, len(replicas))
+
+	for i := range replicas {
+		out = append(out, replicas[i].NodeName)
+	}
+
+	return out
+}
+
 // notConnectedWarnings renders LINSTOR's makeNotConnectedWarning for
 // each deployed replica whose satellite is not connected.
 func notConnectedWarnings(nodes []string) []apiv1.APICallRc {

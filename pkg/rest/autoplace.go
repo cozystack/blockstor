@@ -1377,12 +1377,16 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
 	}
 
+	// LINSTOR answers an explicit create after the same wait as an
+	// autoplace (CtrlRscCrtApiCallHandler → deployResources).
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, replicaNodes(created))
+
 	// Python CLI demands an ApiCallRc list envelope; upstream's
 	// `linstor r c` walks it on every reply.
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	writeJSON(w, http.StatusCreated, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource(s) created on resource-definition: " + rdName,
-	}})
+	}}, notReady...))
 }
 
 // handleResourceCreateOnNode answers `POST /v1/resource-definitions/
@@ -1465,11 +1469,15 @@ func (s *Server) handleResourceCreateOnNode(w http.ResponseWriter, r *http.Reque
 		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	// The create linstor-csi's Manual scheduler posts: answer it after
+	// the same wait as an autoplace, as LINSTOR does.
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, replicaNodes(created))
+
+	writeJSON(w, http.StatusCreated, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource created on resource-definition: " + rdName +
 			" / node: " + node,
-	}})
+	}}, notReady...))
 }
 
 // createResources walks the envelopes from a POST to
