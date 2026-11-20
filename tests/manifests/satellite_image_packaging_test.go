@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -198,5 +200,44 @@ func TestDockerfileDownloadsArePinnedByDigest(t *testing.T) {
 		if !verified {
 			t.Errorf("Dockerfile downloads %s into %s without checking it against a pinned sha256", fields[1], dest)
 		}
+	}
+}
+
+// drbdmeta before 9.36.0 clears DRBD_MDFF_BITMAP_AUTHORITATIVE whenever
+// it writes the superblock. apply-al does that after every crash, and
+// DRBD 9.3.4 then treats every out-of-sync bit of the crashed node as
+// one its peers lack: at equal current UUIDs the node that was down
+// becomes the resync source of an UpToDate peer, or a Primary peer
+// refuses the handshake as a SyncTarget.
+func TestSatelliteDrbdUtilsKeepsBitmapProvenance(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join(repoRoot240(t), "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+
+	src := string(body)
+
+	pin := regexp.MustCompile(`(?m)^ARG DRBD_UTILS_VERSION=(\d+)\.(\d+)\.(\d+)-\d+$`).FindStringSubmatch(src)
+	if pin == nil {
+		t.Fatal("Dockerfile must pin drbd-utils with ARG DRBD_UTILS_VERSION=<major>.<minor>.<patch>-<rev>")
+	}
+
+	if !strings.Contains(src, `drbd-utils="${DRBD_UTILS_VERSION}"`) {
+		t.Error("the satellite stage must install drbd-utils at DRBD_UTILS_VERSION")
+	}
+
+	got := [3]int{}
+	for i := range got {
+		got[i], err = strconv.Atoi(pin[i+1])
+		if err != nil {
+			t.Fatalf("parse DRBD_UTILS_VERSION: %v", err)
+		}
+	}
+
+	if want := [3]int{9, 36, 0}; slices.Compare(got[:], want[:]) < 0 {
+		t.Errorf("drbd-utils %d.%d.%d clears the bitmap provenance feature on apply-al; need at least 9.36.0",
+			got[0], got[1], got[2])
 	}
 }

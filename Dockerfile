@@ -75,13 +75,19 @@ ENTRYPOINT ["/apiserver"]
 
 FROM debian:trixie-slim AS satellite
 # drbd-utils comes from LINBIT's public repository, the one the LINSTOR
-# satellite image is built from, pinned to the release that image ships.
+# satellite image is built from, and which that image installs unpinned.
 # Debian's own package is 9.22, whose drbdadm predates the device options
 # (block-size, discard-granularity) LINSTOR writes into a volume's disk
 # section: it refuses such a .res as a parse error, and since drbdadm
 # reads every .res on the node, one adopted volume carrying block-size
 # stops adjust for every resource there.
-ARG DRBD_UTILS_VERSION=9.35.0-1
+# 9.36.0 is the first drbdmeta that keeps the bitmap provenance feature
+# DRBD 9.3.4 writes into the superblock. Older ones clear it, so the
+# apply-al run after every crash makes the kernel count a crashed
+# Secondary's activity log bits as bits its peers lack: at equal current
+# UUIDs the crashed node then becomes a resync source, or a Primary peer
+# refuses the connection as a SyncTarget.
+ARG DRBD_UTILS_VERSION=9.36.0-1
 # zfsutils-linux is in contrib on trixie — enable it so we can pull
 # zpool/zfs alongside drbd-utils, lvm2, cryptsetup. Note: the kernel
 # module is provided by the host (Talos siderolabs/zfs extension);
