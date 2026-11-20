@@ -20,15 +20,20 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 )
@@ -136,10 +141,9 @@ func (b *MetadataCreatedBackfillRunnable) RegisterWithManager(mgr manager.Manage
 }
 
 // backfillOne handles the per-Resource branch of Start: filter to
-// this node, skip if Condition already True, kernel-probe via
-// HasMD, stamp on True. Returns true iff a Condition was stamped
-// (caller bumps the counter). Pulled out so Start stays under the
-// funlen budget.
+// this node, skip if Condition already True, kernel-probe every
+// volume via HasMD, stamp when all of them carry metadata. Returns
+// true iff a Condition was stamped (caller bumps the counter).
 func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) bool {
 	if !naming.Same(res.Spec.NodeName, b.NodeName) {
 		return false
@@ -149,19 +153,30 @@ func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *
 		return false
 	}
 
-	// Authoritative kernel-side probe. The Resource may be
-	// pre-create-md (newly-placed diskless) or post-tear-down;
-	// in both cases HasMD returns false and we skip — no
-	// metadata to advertise.
-	hasMD, probeErr := b.Adm.HasMD(ctx, res.Name)
-	if probeErr != nil {
-		logger.Info("dump-md probe failed (best-effort)", "err", probeErr.Error())
-
+	// A diskless replica has no lower disk to carry metadata.
+	if slices.Contains(res.Spec.Flags, apiv1.ResourceFlagDiskless) {
 		return false
 	}
 
-	if !hasMD {
+	targets, ok := b.probeTargets(ctx, res, logger)
+	if !ok {
 		return false
+	}
+
+	// Authoritative kernel-side probe. The Resource may be
+	// pre-create-md or post-tear-down; then HasMD returns false
+	// and we skip: no metadata to advertise.
+	for _, target := range targets {
+		hasMD, probeErr := b.Adm.HasMD(ctx, target)
+		if probeErr != nil {
+			logger.Info("dump-md probe failed (best-effort)", "err", probeErr.Error())
+
+			return false
+		}
+
+		if !hasMD {
+			return false
+		}
 	}
 
 	// The backfill only probes: dump-md found the metadata, nothing
@@ -174,4 +189,42 @@ func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *
 	}
 
 	return true
+}
+
+// probeTargets names the drbdadm targets of res's volumes the way the
+// apply chain renders them in the .res file: the DRBD resource is the
+// definition's key, not the `<rd>.<node>` CR name, which drbdadm does
+// not know. Volumes are probed one by one, as ensureMetadata does,
+// because a resource-wide dump-md stops at the first volume and
+// answers for it alone. ok is false when there is nothing to probe:
+// the definition is gone, carries no DRBD layer, or has no volumes.
+func (b *MetadataCreatedBackfillRunnable) probeTargets(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) ([]string, bool) {
+	drbdName := naming.Key(res.Spec.ResourceDefinitionName)
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := b.Client.Get(ctx, client.ObjectKey{Name: drbdName}, &rd)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.Info("get ResourceDefinition for backfill (best-effort)", "err", err.Error())
+		}
+
+		return nil, false
+	}
+
+	if !layerStackHasDRBD(rd.Spec.LayerStack) {
+		return nil, false
+	}
+
+	targets := make([]string, 0, len(rd.Spec.VolumeDefinitions))
+	for i := range rd.Spec.VolumeDefinitions {
+		targets = append(targets, fmt.Sprintf("%s/%d", drbdName, rd.Spec.VolumeDefinitions[i].VolumeNumber))
+	}
+
+	return targets, len(targets) > 0
+}
+
+// layerStackHasDRBD reports whether the stack renders a .res file.
+func layerStackHasDRBD(stack []string) bool {
+	return slices.ContainsFunc(stack, func(layer string) bool { return strings.EqualFold(layer, "DRBD") })
 }
