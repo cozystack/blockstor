@@ -123,11 +123,16 @@ type ResourceReconciler struct {
 	// DRBD ports → satellite-side .res collision. Holding this mutex
 	// across {list taken → pick free → Status patch} on the parent
 	// RD makes the cross-RD allocation atomic in-process. Combined
-	// with APIReader-direct reads, this guarantees collision-free
-	// allocation under batch creation. Single-controller process
-	// (Deployment replicas=1 + leader election in HA) is the
-	// supported topology, so an in-process mutex is sufficient.
+	// with the ledger of values the cache does not show yet, this
+	// guarantees collision-free allocation under batch creation.
+	// Single-controller process (Deployment replicas=1 + leader
+	// election in HA) is the supported topology, so an in-process
+	// mutex is sufficient.
 	clusterAllocMu sync.Mutex
+
+	// ledger holds the identities written under clusterAllocMu that
+	// the cache may not show yet; see allocLedger.
+	ledger allocLedger
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
@@ -685,6 +690,8 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 
 			return false, perr
 		}
+
+		r.ledger.recordReplica(target)
 	}
 
 	// (4) mirror Spec identities onto Status for backward-compat
@@ -1513,6 +1520,8 @@ func (r *ResourceReconciler) ensureRDVolumeMinors(ctx context.Context, target *b
 		return false, nil, err
 	}
 
+	r.ledger.recordMinors(&rd)
+
 	return true, vol0MinorOf(&rd), nil
 }
 
@@ -1753,20 +1762,20 @@ func (r *ResourceReconciler) apiReader() client.Reader {
 // the named RD. Used by the per-RD allocator to intersect each
 // node's port/minor range.
 func (r *ResourceReconciler) hostingNodesForRD(ctx context.Context, rdName string) ([]string, error) {
-	list := &blockstoriov1alpha1.ResourceList{}
-	if err := r.List(ctx, list); err != nil {
+	replicas, err := r.cachedResources(ctx)
+	if err != nil {
 		return nil, err
 	}
 
 	seen := map[string]bool{}
-	out := make([]string, 0, len(list.Items))
+	out := make([]string, 0, len(replicas))
 
-	for i := range list.Items {
-		if !isReplicaOf(&list.Items[i], rdName) {
+	for i := range replicas {
+		if !isReplicaOf(&replicas[i], rdName) {
 			continue
 		}
 
-		node := list.Items[i].Spec.NodeName
+		node := replicas[i].Spec.NodeName
 		if seen[naming.Key(node)] {
 			continue
 		}
@@ -1841,28 +1850,32 @@ func (r *ResourceReconciler) intersectRange(
 // resources inside the 20000-20999 window instead of the whole cluster
 // sharing it.
 //
-// Reads the authoritative Spec.DRBDPort. Uses APIReader (uncached) so
-// concurrent allocations on the same node observe each other's
-// freshly-committed Spec instead of a stale informer snapshot;
-// combined with the per-RD/cluster mutexes this keeps same-node
+// Reads the authoritative Spec.DRBDPort from the cache, plus the ports
+// this controller wrote that the cache does not show yet (allocLedger);
+// with clusterAllocMu held by the caller this keeps same-node
 // allocation collision-free.
 func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, selfName string) ([]int32, error) {
 	out := make([]int32, 0, takenAllocsInitialCap)
-	reader := r.apiReader()
 
-	var resList blockstoriov1alpha1.ResourceList
-	if err := reader.List(ctx, &resList); err != nil {
+	replicas, err := r.cachedResources(ctx)
+	if err != nil {
 		return nil, err
 	}
 
-	for i := range resList.Items {
-		res := &resList.Items[i]
+	for i := range replicas {
+		res := &replicas[i]
 		if !naming.Same(res.Spec.NodeName, nodeName) || res.Name == selfName {
 			continue
 		}
 
 		if p := res.Spec.DRBDPort; p != nil {
 			out = append(out, *p)
+		}
+	}
+
+	for _, grant := range r.ledger.pendingReplicas(replicas) {
+		if grant.port != nil && naming.Same(grant.node, nodeName) {
+			out = append(out, *grant.port)
 		}
 	}
 
@@ -1878,19 +1891,29 @@ func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, sel
 // minors. Excludes `selfRD` so an RD mid-allocation doesn't trip on its
 // own draft.
 //
-// Uses APIReader (uncached) so cross-RD batch allocation observes
-// freshly-committed sibling minors rather than a stale cache.
+// Reads the cache, plus the minors this controller wrote that the
+// cache does not show yet (allocLedger), so cross-RD batch allocation
+// under clusterAllocMu observes every minor already handed out.
 func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD string) ([]int32, error) {
 	out := make([]int32, 0, takenAllocsInitialCap)
-	reader := r.apiReader()
 
-	var rdList blockstoriov1alpha1.ResourceDefinitionList
-	if err := reader.List(ctx, &rdList); err != nil {
+	definitions, err := r.cachedDefinitions(ctx)
+	if err != nil {
 		return nil, err
 	}
 
-	for i := range rdList.Items {
-		rd := &rdList.Items[i]
+	for key, grant := range r.ledger.pendingMinors(definitions) {
+		if key == naming.Key(selfRD) {
+			continue
+		}
+
+		for _, minor := range grant.minors {
+			out = append(out, minor)
+		}
+	}
+
+	for i := range definitions {
+		rd := &definitions[i]
 		if naming.Same(rd.Name, selfRD) {
 			continue
 		}
@@ -2187,19 +2210,10 @@ func (r *ResourceReconciler) allocateNodeIDLocked(ctx context.Context, target *b
 // is conservative and self-healing; strictly better than the
 // permanent wedge a premature reuse causes.
 func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]int32, error) {
-	// Fall back to the cached client when APIReader hasn't been
-	// wired — tests construct `ResourceReconciler{}` directly with
-	// a fake client and skip SetupWithManager; the race we're
-	// guarding against only matters under real-cluster
-	// informer-cache load, which the fake client doesn't simulate.
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
-	}
-
-	var resList blockstoriov1alpha1.ResourceList
-
-	err := reader.List(ctx, &resList)
+	// The cache plus the node ids this controller wrote that the
+	// cache does not show yet (allocLedger); the caller holds
+	// clusterAllocMu, under which every such write happens.
+	replicas, err := r.cachedResources(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -2207,10 +2221,16 @@ func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *bl
 	// Dedup so the union of own-ids and observed-peer-ids doesn't
 	// hand LowestFreeNodeID a slice with repeats (functionally
 	// harmless, but keeps the taken set minimal and inspectable).
-	occupied := make(map[int32]struct{}, len(resList.Items))
+	occupied := make(map[int32]struct{}, len(replicas))
 
-	for i := range resList.Items {
-		res := &resList.Items[i]
+	for _, grant := range r.ledger.pendingReplicas(replicas) {
+		if grant.nodeID != nil && naming.Same(grant.rd, target.Spec.ResourceDefinitionName) {
+			occupied[*grant.nodeID] = struct{}{}
+		}
+	}
+
+	for i := range replicas {
+		res := &replicas[i]
 
 		if res.Name == target.Name {
 			continue
