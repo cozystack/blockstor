@@ -71,7 +71,7 @@ func tick(t *testing.T, r *controllerpkg.AutoSnapshotRunnable) {
 // LINSTOR takes an auto-snapshot like any other: on every diskful replica
 // of the definition. The snapshot lists those nodes, as a REST create
 // defaults them, so the orchestration has nodes to take it on: the
-// diskless witness and an INACTIVE replica are left out.
+// witness, an INACTIVE replica and one being evacuated are left out.
 func TestAutoSnapshotTargetsEveryActiveDiskfulReplica(t *testing.T) {
 	t.Parallel()
 
@@ -82,6 +82,8 @@ func TestAutoSnapshotTargetsEveryActiveDiskfulReplica(t *testing.T) {
 		replica(rd.Name, "n1"),
 		replica(rd.Name, "n3", apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker),
 		replica(rd.Name, "n4", apiv1.ResourceFlagInactive),
+		replica(rd.Name, "n6", apiv1.ResourceFlagTieBreaker),
+		replica(rd.Name, "n7", "EVACUATE"),
 		replica("pvc-other", "n5"),
 	)
 
@@ -245,5 +247,80 @@ func TestAutoSnapshotRecordsTheReplicasLUKSPasswords(t *testing.T) {
 
 	if len(got) != 2 || got["n1"] != 0xa1 || got["n2"] != 0xa2 {
 		t.Errorf("auto-snapshot LUKS passwords by node = %#v, want n1 and n2 only", got)
+	}
+}
+
+// LINSTOR refuses a snapshot on a pool whose provider cannot take one,
+// as the REST create does. Taken anyway, a thick LVM pool would freeze
+// I/O each tick and pile up copy-on-write overlays until the volume
+// group fills, so the auto-snapshot is skipped.
+func TestAutoSnapshotSkipsAPoolWithoutSnapshots(t *testing.T) {
+	t.Parallel()
+
+	rd := makeRDWithAutoSnapshot(t, "pvc-thick", 15, "")
+
+	onPool := func(node, pool string) *blockstoriov1alpha1.Resource {
+		res := replica(rd.Name, node)
+		res.Spec.StoragePool = pool
+
+		return res
+	}
+
+	pool := func(node, name string, snapshots bool) *blockstoriov1alpha1.StoragePool {
+		return &blockstoriov1alpha1.StoragePool{
+			ObjectMeta: metav1.ObjectMeta{Name: node + "." + name},
+			Spec:       blockstoriov1alpha1.StoragePoolSpec{NodeName: node, PoolName: name},
+			Status:     blockstoriov1alpha1.StoragePoolStatus{SupportsSnapshots: snapshots},
+		}
+	}
+
+	r, cli := autoSnapshotFixture(t, rd,
+		onPool("n1", "thin"), onPool("n2", "thick"),
+		pool("n1", "thin", true), pool("n2", "thick", false))
+
+	tick(t, r)
+
+	if snaps := listAutoSnapshotsByRD(t, cli, rd.Name); len(snaps) != 0 {
+		t.Fatalf("auto-snapshot taken on a pool without snapshots: %+v", snaps[0].Spec)
+	}
+}
+
+// A definition whose delete is under way gets no new auto-snapshot.
+func TestAutoSnapshotSkipsADefinitionBeingDeleted(t *testing.T) {
+	t.Parallel()
+
+	rd := makeRDWithAutoSnapshot(t, "pvc-delete-flag", 15, "")
+	rd.Spec.Flags = []string{"DELETE"}
+
+	r, cli := autoSnapshotFixture(t, rd, replica(rd.Name, "n1"))
+
+	tick(t, r)
+
+	if snaps := listAutoSnapshotsByRD(t, cli, rd.Name); len(snaps) != 0 {
+		t.Fatalf("auto-snapshot taken of a definition flagged DELETE")
+	}
+}
+
+// The replicas are read through the API reader when one is set: a LUKS
+// password a fresh replica was just given may not be in the cache yet,
+// and a snapshot without it would be refused by the satellite.
+func TestAutoSnapshotReadsTheReplicasThroughTheAPIReader(t *testing.T) {
+	t.Parallel()
+
+	rd := makeRDWithAutoSnapshot(t, "pvc-reader", 15, "")
+
+	fresh := replica(rd.Name, "n1")
+	fresh.Spec.Volumes = []blockstoriov1alpha1.ResourceVolumeSpec{{VolumeNumber: 0, LUKSKey: &blockstoriov1alpha1.LUKSKey{
+		KeyID: "c7324c99567678f7", Wrapped: bytes.Repeat([]byte{0xa1}, 12+64+16), Origin: blockstoriov1alpha1.LUKSKeyOriginGenerated,
+	}}}
+
+	r, cli := autoSnapshotFixture(t, rd, replica(rd.Name, "n1"))
+	r.APIReader = fake.NewClientBuilder().WithScheme(newSnapshotControllerScheme(t)).WithObjects(fresh).Build()
+
+	tick(t, r)
+
+	snaps := listAutoSnapshotsByRD(t, cli, rd.Name)
+	if len(snaps) != 1 || len(snaps[0].Spec.LUKSKeys) != 1 {
+		t.Fatalf("auto-snapshot does not record the password the API server holds: %+v", snaps)
 	}
 }

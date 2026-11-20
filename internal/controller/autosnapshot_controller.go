@@ -158,6 +158,12 @@ type AutoSnapshotRunnable struct {
 	// judges whether a restore from it is finished. Nil keeps every
 	// auto-snapshot a definition was restored from.
 	Store store.Store
+
+	// APIReader, when set, reads the replicas an auto-snapshot is
+	// taken from straight from the API server, as the store does on a
+	// REST create: a LUKS password a fresh replica was just given may
+	// not be in the cache yet. Nil reads through Client.
+	APIReader client.Reader
 }
 
 // NeedLeaderElection returns true: the cron writes Snapshot CRDs
@@ -222,7 +228,7 @@ func (r *AutoSnapshotRunnable) Tick(ctx context.Context) error {
 		// Skip RDs being torn down — creating a snapshot on a
 		// DeletionTimestamp-marked RD just produces a snapshot the
 		// downstream RD-delete will block on.
-		if !rd.DeletionTimestamp.IsZero() {
+		if !rd.DeletionTimestamp.IsZero() || slices.Contains(rd.Spec.Flags, rdFlagDelete) {
 			continue
 		}
 
@@ -305,6 +311,22 @@ type autoSnapshotTarget struct {
 	luksKeys []blockstoriov1alpha1.SnapshotLUKSKey
 }
 
+// add takes a snapshot from res: its node, and the LUKS passwords of
+// its volumes.
+func (t *autoSnapshotTarget) add(res *blockstoriov1alpha1.Resource) {
+	t.nodes = append(t.nodes, res.Spec.NodeName)
+
+	for _, vol := range res.Spec.Volumes {
+		if vol.LUKSKey != nil {
+			t.luksKeys = append(t.luksKeys, blockstoriov1alpha1.SnapshotLUKSKey{
+				NodeName:     res.Spec.NodeName,
+				VolumeNumber: vol.VolumeNumber,
+				LUKSKey:      *vol.LUKSKey.DeepCopy(),
+			})
+		}
+	}
+}
+
 // autoSnapshotTarget returns what an auto-snapshot of rd is taken
 // from: every node with an active diskful replica, the set a REST
 // create defaults an empty node list to. The orchestration targets
@@ -317,20 +339,20 @@ type autoSnapshotTarget struct {
 // skip is non-empty when no auto-snapshot should be taken this tick,
 // as in LINSTOR's createAutoSnapshotInTransaction: a node of a replica
 // is offline, where a take could only freeze I/O on the reachable
-// replicas until the deadline aborts it, or no replica can take one.
+// replicas until the deadline aborts it, no replica can take one, or a
+// replica's pool cannot take snapshots.
 func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
 ) (autoSnapshotTarget, string, error) {
-	var resList blockstoriov1alpha1.ResourceList
-
-	err := r.Client.List(ctx, &resList)
+	resList, err := r.listReplicas(ctx)
 	if err != nil {
-		return autoSnapshotTarget{}, "", errors.Wrap(err, "list Resources")
+		return autoSnapshotTarget{}, "", err
 	}
 
 	var (
 		target  autoSnapshotTarget
 		offline []string
+		pools   []poolRef
 	)
 
 	for i := range resList.Items {
@@ -348,21 +370,16 @@ func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 			offline = append(offline, res.Spec.NodeName)
 		}
 
-		if slices.Contains(res.Spec.Flags, apiv1.ResourceFlagDiskless) ||
-			slices.Contains(res.Spec.Flags, apiv1.ResourceFlagInactive) {
+		// A replica that holds no data, is down, or is being moved
+		// off its node is no source, as in LINSTOR's createSnapshots.
+		if slices.ContainsFunc(res.Spec.Flags, isNoSnapshotSourceFlag) {
 			continue
 		}
 
-		target.nodes = append(target.nodes, res.Spec.NodeName)
+		target.add(res)
 
-		for _, vol := range res.Spec.Volumes {
-			if vol.LUKSKey != nil {
-				target.luksKeys = append(target.luksKeys, blockstoriov1alpha1.SnapshotLUKSKey{
-					NodeName:     res.Spec.NodeName,
-					VolumeNumber: vol.VolumeNumber,
-					LUKSKey:      *vol.LUKSKey.DeepCopy(),
-				})
-			}
+		if res.Spec.StoragePool != "" {
+			pools = append(pools, poolRef{node: res.Spec.NodeName, pool: res.Spec.StoragePool})
 		}
 	}
 
@@ -375,9 +392,91 @@ func (r *AutoSnapshotRunnable) autoSnapshotTarget(
 		return autoSnapshotTarget{}, "no active diskful replica", nil
 	}
 
+	thick, err := r.poolsWithoutSnapshots(ctx, pools)
+	if err != nil {
+		return autoSnapshotTarget{}, "", err
+	}
+
+	if len(thick) > 0 {
+		return autoSnapshotTarget{}, "storage pool(s) " + strings.Join(thick, ", ") + " do not support snapshots", nil
+	}
+
 	sort.Strings(target.nodes)
 
 	return target, "", nil
+}
+
+// listReplicas lists every Resource, through APIReader when set.
+func (r *AutoSnapshotRunnable) listReplicas(ctx context.Context) (*blockstoriov1alpha1.ResourceList, error) {
+	var resList blockstoriov1alpha1.ResourceList
+
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+
+	err := reader.List(ctx, &resList)
+	if err != nil {
+		return nil, errors.Wrap(err, "list Resources")
+	}
+
+	return &resList, nil
+}
+
+// rdFlagDelete marks a definition whose delete is under way.
+const rdFlagDelete = "DELETE"
+
+// isNoSnapshotSourceFlag reports whether a replica flag rules the
+// replica out as a snapshot source.
+func isNoSnapshotSourceFlag(flag string) bool {
+	switch flag {
+	case apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker,
+		apiv1.ResourceFlagInactive, resourceFlagEvacuate:
+		return true
+	}
+
+	return false
+}
+
+// resourceFlagEvacuate marks a replica being moved off its node.
+const resourceFlagEvacuate = "EVACUATE"
+
+// poolRef names a storage pool on a node.
+type poolRef struct {
+	node, pool string
+}
+
+// poolsWithoutSnapshots returns the "node/pool" of every pool in refs
+// whose provider reports it cannot take a snapshot, the refusal the
+// REST create and LINSTOR make for a thick pool. A pool not found is
+// not taken for one, as on the REST create.
+func (r *AutoSnapshotRunnable) poolsWithoutSnapshots(ctx context.Context, refs []poolRef) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	var list blockstoriov1alpha1.StoragePoolList
+
+	err := r.Client.List(ctx, &list)
+	if err != nil {
+		return nil, errors.Wrap(err, "list StoragePools")
+	}
+
+	var out []string
+
+	for _, ref := range refs {
+		for i := range list.Items {
+			pool := &list.Items[i]
+			if naming.Same(pool.Spec.NodeName, ref.node) && naming.Same(pool.Spec.PoolName, ref.pool) &&
+				!pool.Status.SupportsSnapshots {
+				out = append(out, ref.node+"/"+ref.pool)
+			}
+		}
+	}
+
+	sort.Strings(out)
+
+	return slices.Compact(out), nil
 }
 
 // nodeOffline reports whether the heartbeat watchdog marked the node
