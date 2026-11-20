@@ -995,11 +995,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		}
 	}
 
-	r.forgetPool(req.GetName())
-
-	for _, n := range req.GetVolumeNumbers() {
-		r.forgetRestoreRecord(req.GetName(), n)
-	}
+	r.forgetResource(req.GetName(), req.GetVolumeNumbers())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
 }
@@ -1987,6 +1983,16 @@ func (r *Reconciler) recordRestoreClonedHere(rdName string, volNum int32, cloned
 	key := restoreSeedKey(rdName, volNum)
 	if _, known := r.restoreClonedHere[key]; !known {
 		r.restoreClonedHere[key] = cloned
+	}
+}
+
+// forgetResource drops what this process holds about a resource deleted
+// here: its pool, and the restore records of its volumes.
+func (r *Reconciler) forgetResource(rdName string, volNums []int32) {
+	r.forgetPool(rdName)
+
+	for _, n := range volNums {
+		r.forgetRestoreRecord(rdName, n)
 	}
 }
 
