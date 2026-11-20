@@ -293,6 +293,14 @@ type SnapshotPerNodeStatus struct {
 	// Snapshot's Status.Flags with FAILED. Bug 351.
 	// +optional
 	Failed bool `json:"failed,omitempty"`
+
+	// storagePool is the pool that holds this node's copy: the pool of
+	// the replica it was taken from. The local satellite records it once
+	// its copy exists, because the copy outlives the replica and a
+	// restore has to be placed in the same pool, the way LINSTOR keeps
+	// the pool on each snapshot volume.
+	// +optional
+	StoragePool string `json:"storagePool,omitempty"`
 }
 
 // +kubebuilder:object:root=true

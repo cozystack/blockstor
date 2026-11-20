@@ -858,12 +858,7 @@ func resolveCloneSourceProviderKind(ctx context.Context, st store.Store, rd *api
 		return ""
 	}
 
-	srcRD, _, ok := strings.Cut(stamp, ":")
-	if !ok || srcRD == "" {
-		return ""
-	}
-
-	return placer.SourceProviderKind(ctx, st, srcRD)
+	return placer.RestoreSourceProviderKind(ctx, st, stamp)
 }
 
 // constrainAutoplaceToSnapshotNodes restricts the filter's

@@ -326,6 +326,17 @@ type Reconciler struct {
 	// pass, repopulating the marker, so the gate stays correct.
 	restoreBlankFallback map[string]bool
 
+	// restoreClonedHere records, per "<resource>/<volNumber>", whether
+	// this process itself cloned or received the snapshot into a volume
+	// that was not on disk before (true), or first found the volume
+	// already there (false). Only true lets a restored replica seed
+	// itself UpToDate (restoredCloneSeed): a provider reports a restore
+	// onto an existing volume as done, so after a restart a blank
+	// fallback whose metadata step never finished would otherwise read
+	// as a clone. Process-memory only, and a lost record reads as "not
+	// cloned here", which costs a sync, never data.
+	restoreClonedHere map[string]bool
+
 	// lastRecoveryPromoteAt throttles the Bug 366 recovery-promote
 	// self-heal (maybeRecoveryPromote). Keyed by resource name; value
 	// is the last wall-clock time this node fired a recovery-promote
@@ -421,6 +432,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		resourceToPool:              map[string]string{},
 		seenStuckAt:                 map[string]time.Time{},
 		restoreBlankFallback:        map[string]bool{},
+		restoreClonedHere:           map[string]bool{},
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
@@ -573,7 +585,7 @@ func (r *Reconciler) Apply(ctx context.Context, res []*intent.DesiredResource) (
 //     ⇒ Terminal=true. Same logic.
 //   - any other error ⇒ Terminal=false. Transient lvm/zfs noise.
 func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnapshotRequest) (*intent.CreateSnapshotResponse, error) {
-	provider, err := r.providerForResource(req.GetResourceName())
+	pool, provider, err := r.poolForResource(req.GetResourceName())
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
 		return &intent.CreateSnapshotResponse{Ok: false, Terminal: true, Message: err.Error()}, nil
@@ -598,7 +610,34 @@ func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnaps
 		// by 1000 before formatting. UnixMilli matches; Unix
 		// (seconds) would render the stamp as 1970-01-21.
 		CreateTimestampUnix: time.Now().UnixMilli(),
+		StoragePool:         pool,
 	}, nil
+}
+
+// SnapshotPools lists, sorted, the registered pools that hold the named
+// snapshot of rdName. Pools whose provider cannot tell are left out, and
+// so is one whose probe fails: a pool listed here holds the copy.
+func (r *Reconciler) SnapshotPools(ctx context.Context, rdName, snapName string) []string {
+	r.mu.Lock()
+	providers := maps.Clone(r.cfg.Providers)
+	r.mu.Unlock()
+
+	pools := slices.Sorted(maps.Keys(providers))
+	holding := make([]string, 0, 1)
+
+	for _, pool := range pools {
+		prober, ok := providers[pool].(storage.SnapshotProber)
+		if !ok {
+			continue
+		}
+
+		has, err := prober.HasSnapshot(ctx, storage.Snapshot{ResourceName: rdName, SnapshotName: snapName})
+		if err == nil && has {
+			holding = append(holding, pool)
+		}
+	}
+
+	return holding
 }
 
 // DeleteSnapshot mirrors CreateSnapshot. Idempotency lives at the
@@ -959,7 +998,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		}
 	}
 
-	r.forgetPool(req.GetName())
+	r.forgetResource(req.GetName(), req.GetVolumeNumbers())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
 }
@@ -1647,6 +1686,8 @@ func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.D
 				"reclaim volume %s/%d on diskless toggle",
 				dr.GetName(), vol.GetVolumeNumber())
 		}
+
+		r.forgetRestoreRecord(dr.GetName(), vol.GetVolumeNumber())
 	}
 
 	return nil
@@ -1848,6 +1889,8 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 		return errors.Errorf("SourceSnapshot %q must be <srcRD>:<snapName>", src)
 	}
 
+	onDisk := r.restoreTargetOnDisk(ctx, provider, rdName, target)
+
 	err := provider.RestoreVolumeFromSnapshot(ctx, target, storage.Snapshot{
 		ResourceName: srcRD,
 		SnapshotName: snapName,
@@ -1860,6 +1903,7 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 			// legitimate all-clone restore fast-path keeps its skip, and
 			// reset the Bug 038 not-yet-materialised requeue budget.
 			r.recordRestoreBlankFallback(rdName, vol.GetVolumeNumber(), false)
+			r.recordRestoreClonedHere(rdName, vol.GetVolumeNumber(), !onDisk)
 			r.clearRestoreSnapshotMissing(rdName, vol.GetVolumeNumber())
 		}
 
@@ -1900,7 +1944,73 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
 	}
 
-	return r.crossNodeClone(ctx, provider, target, rdName, srcRD, snapName, vol.GetVolumeNumber())
+	err = r.crossNodeClone(ctx, provider, target, rdName, srcRD, snapName, vol.GetVolumeNumber())
+	if err == nil {
+		r.recordRestoreClonedHere(rdName, vol.GetVolumeNumber(), !onDisk)
+	}
+
+	return err
+}
+
+// restoreTargetOnDisk reports whether the volume a restore is about to
+// materialise is already on disk, the first time this process sees it.
+// The provider treats a restore onto an existing volume as done, which
+// says nothing about what is in it: it may be a blank fallback from before
+// a restart. A failed probe reads as on disk. Once this process has
+// recorded where the volume came from, the record stands and the probe is
+// skipped.
+func (r *Reconciler) restoreTargetOnDisk(ctx context.Context, provider storage.Provider, rdName string, target storage.Volume) bool {
+	r.mu.Lock()
+	_, known := r.restoreClonedHere[restoreSeedKey(rdName, target.VolumeNumber)]
+	r.mu.Unlock()
+
+	if known {
+		return true
+	}
+
+	status, err := provider.VolumeStatus(ctx, target)
+	if err != nil {
+		return true
+	}
+
+	return status.State != storage.StateNotProvisioned
+}
+
+// recordRestoreClonedHere records, once, whether this process cloned or
+// received the snapshot into a volume that was not on disk before. The
+// first record stands: every later pass finds the volume on disk.
+func (r *Reconciler) recordRestoreClonedHere(rdName string, volNum int32, cloned bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	key := restoreSeedKey(rdName, volNum)
+	if _, known := r.restoreClonedHere[key]; !known {
+		r.restoreClonedHere[key] = cloned
+	}
+}
+
+// forgetResource drops what this process holds about a resource deleted
+// here: its pool, and the restore records of its volumes.
+func (r *Reconciler) forgetResource(rdName string, volNums []int32) {
+	r.forgetPool(rdName)
+
+	for _, n := range volNums {
+		r.forgetRestoreRecord(rdName, n)
+	}
+}
+
+// forgetRestoreRecord drops what this process recorded about restoring a
+// volume once that volume is deleted here, so a definition re-created
+// under the same name starts clean instead of inheriting a blank fallback
+// or a clone that no longer exists.
+func (r *Reconciler) forgetRestoreRecord(rdName string, volNum int32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	key := restoreSeedKey(rdName, volNum)
+	delete(r.restoreBlankFallback, key)
+	delete(r.restoreClonedHere, key)
+	delete(r.restoreSnapshotMissingTries, key)
 }
 
 // bumpRestoreSnapshotMissing increments and returns the consecutive
@@ -1984,11 +2094,36 @@ func (r *Reconciler) crossNodeClone(
 // (false). resolveVolumeSeed reads this within the same reconcile pass to
 // decide whether the day0 skip-init-sync seed is safe (Bug 397). Keyed by
 // "<resource>/<volNumber>".
+//
+// A blank fallback stays recorded until the volume is deleted here
+// (forgetRestoreRecord): the volume it created is never cloned over
+// afterwards, and the provider reports a later restore onto it as done
+// because the volume exists. Clearing the record then would seed the empty
+// volume as a copy of the snapshot on a pass after the one that created it.
 func (r *Reconciler) recordRestoreBlankFallback(rdName string, volNum int32, blank bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.restoreBlankFallback[restoreSeedKey(rdName, volNum)] = blank
+	key := restoreSeedKey(rdName, volNum)
+	if !blank && r.restoreBlankFallback[key] {
+		return
+	}
+
+	r.restoreBlankFallback[key] = blank
+}
+
+// isRestoredFromSnapshot reports whether the given (resource, volume) was
+// materialised from the snapshot on this node by this process, by a local
+// clone or a cross-node receive into a volume that was not on disk before.
+// False when nothing is recorded, when the volume was already there, or
+// for a blank fallback, which leaves the volume to the ordinary seed path.
+func (r *Reconciler) isRestoredFromSnapshot(rdName string, volNum int32) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	key := restoreSeedKey(rdName, volNum)
+
+	return r.restoreClonedHere[key] && !r.restoreBlankFallback[key]
 }
 
 // isRestoreBlankFallback reports whether the given (resource, volume) was
@@ -5577,6 +5712,10 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 		return drbd.GISeed{}, false
 	}
 
+	if seed, ok := r.restoredCloneSeed(ctx, resourceName, vol, skipInitialSync); ok {
+		return seed, true
+	}
+
 	// Skip-init-sync hardening — the AUTHORITATIVE, controller-decided,
 	// persisted, OFFLINE-SAFE gate (replaces the live-kernel probe that
 	// follows as authority). The controller stamps Resource.Spec.
@@ -5785,24 +5924,74 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 	return drbd.GISeed{Current: day0, WasUpToDate: true}, true
 }
 
+// restoredCloneSeed is the seed of a replica of the restore set that was
+// cloned or received here from the snapshot: it holds the snapshot's data,
+// so it comes up UpToDate on its own, the way LINSTOR keeps the snapshot's
+// up-to-date metadata on every replica snapshot-restore-resource creates.
+// Waiting for the elected winner instead leaves the clones Inconsistent for
+// good when the winner never comes up (a blank fallback, or a replica that
+// cannot be created), and an Inconsistent peer is no source to sync from.
+//
+// The restore set is the replicas created before the restored definition
+// was first used: the controller latches RD.Spec.Initialized the first time
+// a replica of a restored definition is Primary, so every replica created
+// after that is stamped SkipInitialSync=false and syncs from a peer, as a
+// replica LINSTOR autoplaces next to a restored one does. A replica cloned
+// from the old snapshot after the volume was written would otherwise come
+// up UpToDate on stale data, and with the writer still at day0 (a Primary
+// connected to all its peers does not rotate its current UUID) DRBD finds
+// nothing to sync when they meet.
+//
+// The vetoes of resolveVolumeSeed come first: a peer the dispatcher knows
+// holds data (checked by the caller), or one whose connection already shows
+// committed data in the kernel, refuses the seed. So does anything that is
+// not a fresh member of the restore set: SkipInitialSync not true, a GI the
+// controller copied from a real peer, a blank fallback, or a volume this
+// process did not itself clone or receive.
+func (r *Reconciler) restoredCloneSeed(ctx context.Context, resourceName string, vol *intent.DesiredVolume, skipInitialSync *bool) (drbd.GISeed, bool) {
+	restoredHere := skipInitialSync != nil && *skipInitialSync &&
+		vol.GetSourceSnapshot() != "" && vol.GetSeedFromGI() == "" &&
+		r.isRestoredFromSnapshot(resourceName, vol.GetVolumeNumber())
+	if !restoredHere {
+		return drbd.GISeed{}, false
+	}
+
+	if r.cfg.Adm.AnyConnectedPeerHasDataForVolume(ctx, resourceName, vol.GetVolumeNumber()) {
+		return drbd.GISeed{}, false
+	}
+
+	return drbd.GISeed{
+		Current:    day0GiFor(resourceName, vol.GetVolumeNumber()),
+		Consistent: true,
+		UpToDate:   true,
+	}, true
+}
+
 // providerForResource resolves the provider that owns the named
 // resource using the in-memory pool map. Returns an error when the
 // resource isn't known or its pool isn't registered.
 func (r *Reconciler) providerForResource(name string) (storage.Provider, error) {
+	_, provider, err := r.poolForResource(name)
+
+	return provider, err
+}
+
+// poolForResource is providerForResource that also names the pool.
+func (r *Reconciler) poolForResource(name string) (string, storage.Provider, error) {
 	r.mu.Lock()
 	pool, ok := r.resourceToPool[name]
 	r.mu.Unlock()
 
 	if !ok {
-		return nil, errors.Errorf("resource %q not known on this satellite", name)
+		return "", nil, errors.Errorf("resource %q not known on this satellite", name)
 	}
 
 	provider, ok := r.cfg.Providers[pool]
 	if !ok {
-		return nil, errors.Errorf("storage pool %q not registered", pool)
+		return "", nil, errors.Errorf("storage pool %q not registered", pool)
 	}
 
-	return provider, nil
+	return pool, provider, nil
 }
 
 // rememberPool records the pool that backs a resource, so subsequent
