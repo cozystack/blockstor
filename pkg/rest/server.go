@@ -147,8 +147,8 @@ type Server struct {
 	// blocking work delays the serve loop entry.
 	OnReady func()
 
-	// ResourceReadyWait bounds how long an autoplace waits for the
-	// replicas it placed to report their device paths before it
+	// ResourceReadyWait bounds how long a resource create or autoplace
+	// waits for the replicas it deployed to become ready before it
 	// answers, as LINSTOR waits for its satellites before it answers
 	// a resource create. Zero answers at once, which unit tests that
 	// run no satellite rely on; the binaries set

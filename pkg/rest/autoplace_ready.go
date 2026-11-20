@@ -26,9 +26,10 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
-// DefaultResourceReadyWait is how long LINSTOR waits for a placed
+// DefaultResourceReadyWait is how long LINSTOR waits for a deployed
 // resource to become ready before it answers the create with a
 // warning (CtrlRscCrtApiHelper.DFLT_RSC_READY_WAIT_TIME_IN_MS).
 const DefaultResourceReadyWait = 15 * time.Second
@@ -39,43 +40,58 @@ const DefaultResourceReadyWait = 15 * time.Second
 //nolint:gochecknoglobals // tunable
 var resourceReadyPollInterval = 250 * time.Millisecond
 
-// waitPlacedReplicasReady holds an autoplace answer until every
-// diskful replica of rdName on a reachable node reports a device path
-// for every volume of the definition, or until s.ResourceReadyWait
-// runs out.
+// warnNotConnected is LINSTOR's WARN_NOT_CONNECTED (1002) in
+// blockstor's warning band: the answer for a deployed resource whose
+// satellite is not connected, given instead of waiting for it.
+const warnNotConnected = maskWarn | int64(1002)
+
+// waitDeployedReplicasReady holds a create or autoplace answer until
+// the replicas this call deployed are ready, or until
+// s.ResourceReadyWait runs out. It follows LINSTOR v1.33.1's
+// CtrlRscCrtApiHelper.waitResourcesReady:
 //
-// LINSTOR answers an autoplace only after its satellites applied the
-// new resources and, within fifteen seconds, reported them ready.
-// linstor-csi relies on that: its ControllerPublishVolume reads the
-// volume's device path right after CreateVolume returned, and fails
-// the attach when there is none. Answering before the satellites
-// built the replicas turned that into a ControllerPublishVolume error
-// whose exponential retry roughly doubled the time to attach.
+//   - nothing is awaited when the call deployed nothing, the definition
+//     has no volume, every replica is diskless, the definition has a
+//     single replica, or its layer stack has no DRBD;
+//   - a deployed replica, diskful or diskless, is awaited unless it is
+//     INACTIVE; one on a node that is not ONLINE is answered with
+//     LINSTOR's not-connected warning instead of being awaited;
+//   - ready is ResourceState.isReady: every volume reaches UpToDate
+//     data, locally or through a connected UpToDate peer, and the
+//     replica is connected to every diskful DRBD peer on an ONLINE node.
 //
-// Replicas that never report a path within the bound get the warning
-// LINSTOR gives in that case; the placement itself stands either way.
-func (s *Server) waitPlacedReplicasReady(ctx context.Context, rdName string) []apiv1.APICallRc {
-	if s.ResourceReadyWait <= 0 {
+// linstor-csi relies on that answer: its ControllerPublishVolume reads
+// the volume's device path right after CreateVolume returned and fails
+// the attach when there is none. Answering before the satellites built
+// the replicas turned that into a ControllerPublishVolume error whose
+// exponential retry roughly doubled the time to attach.
+//
+// Replicas that are not ready within the bound get the warning LINSTOR
+// gives in that case; the placement itself stands either way.
+func (s *Server) waitDeployedReplicasReady(ctx context.Context, rdName string, deployed []string) []apiv1.APICallRc {
+	if s.ResourceReadyWait <= 0 || len(deployed) == 0 {
 		return nil
 	}
 
 	volumes := s.definitionVolumeSizes(ctx, rdName)
-	if len(volumes) == 0 {
-		// No volume, nothing for a satellite to build: LINSTOR does
-		// not wait either.
+	if len(volumes) == 0 || !s.definitionHasDRBD(ctx, rdName) {
 		return nil
 	}
 
 	deadline := time.Now().Add(s.ResourceReadyWait)
 
 	for {
-		pending, err := s.replicasWithoutDevicePath(ctx, rdName, volumes)
-		if err != nil || len(pending) == 0 {
+		notConnected, pending, err := s.deployedReplicasNotReady(ctx, rdName, deployed, volumes)
+		if err != nil {
 			return nil
 		}
 
+		if len(pending) == 0 {
+			return notConnectedWarnings(notConnected)
+		}
+
 		if !time.Now().Before(deadline) {
-			return notReadyWarnings(pending)
+			return append(notConnectedWarnings(notConnected), notReadyWarnings(pending)...)
 		}
 
 		select {
@@ -86,51 +102,211 @@ func (s *Server) waitPlacedReplicasReady(ctx context.Context, rdName string) []a
 	}
 }
 
-// replicasWithoutDevicePath returns the nodes of rdName's diskful,
-// live replicas on reachable nodes that miss a device path for at
-// least one of the definition's volumes.
-func (s *Server) replicasWithoutDevicePath(ctx context.Context, rdName string, volumes map[int32]int64) ([]string, error) {
-	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+// definitionHasDRBD reports whether rdName's effective layer stack
+// carries DRBD; without it there is no DRBD resource to become ready
+// (LINSTOR's containsDrbdLayerData).
+func (s *Server) definitionHasDRBD(ctx context.Context, rdName string) bool {
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
 	if err != nil {
-		return nil, errors.Wrap(err, "list replicas")
+		return false
 	}
 
-	var pending []string
+	return apiv1.LayerInStack(s.resolveAutoplaceLayerStack(ctx, &rd), apiv1.LayerKindDRBD)
+}
+
+// deployedReplicasNotReady splits the deployed replicas of rdName that
+// LINSTOR would wait for into those on a node that is not ONLINE and
+// those that are not ready yet.
+func (s *Server) deployedReplicasNotReady(ctx context.Context, rdName string, deployed []string, volumes map[int32]int64) ([]string, []string, error) {
+	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "list replicas")
+	}
+
+	if len(replicas) <= 1 || allReplicasDiskless(replicas) {
+		// The first replica has no peer to connect to, and an
+		// all-diskless definition has no data to reach: LINSTOR
+		// does not wait for either.
+		return nil, nil, nil
+	}
+
+	byNode := make(map[string]*apiv1.Resource, len(replicas))
+	online := make(map[string]bool, len(replicas))
 
 	for i := range replicas {
-		rsc := &replicas[i]
+		key := naming.Key(replicas[i].NodeName)
+		byNode[key] = &replicas[i]
+		online[key] = s.nodeIsOnline(ctx, replicas[i].NodeName)
+	}
 
-		if isDisklessReplica(rsc) ||
-			slices.Contains(rsc.Flags, apiv1.ResourceFlagDeleting) ||
-			slices.Contains(rsc.Flags, apiv1.ResourceFlagDelete) {
+	peers := onlineDiskfulPeers(replicas, online)
+
+	var notConnected, pending []string
+
+	for _, node := range deployed {
+		rsc, ok := byNode[naming.Key(node)]
+		if !ok || slices.Contains(rsc.Flags, apiv1.ResourceFlagInactive) {
 			continue
 		}
 
-		if !isNodeOnline(ctx, s.Store.Nodes(), rsc.NodeName) {
+		if !online[naming.Key(node)] {
+			notConnected = append(notConnected, rsc.NodeName)
+
 			continue
 		}
 
-		if !hasDevicePathForEveryVolume(rsc.Volumes, volumes) {
+		if !replicaReady(rsc, peers, byNode, volumes) {
 			pending = append(pending, rsc.NodeName)
 		}
 	}
 
-	return pending, nil
+	return notConnected, pending, nil
 }
 
-// hasDevicePathForEveryVolume reports whether every volume number in
-// volumes has a reported entry with a device path.
-func hasDevicePathForEveryVolume(reported []apiv1.Volume, volumes map[int32]int64) bool {
-	for vn := range volumes {
-		built := slices.ContainsFunc(reported, func(v apiv1.Volume) bool {
-			return v.VolumeNumber == vn && v.DevicePath != ""
-		})
-		if !built {
+// nodeIsOnline reports whether the satellite on nodeName is ONLINE,
+// the only connection state LINSTOR waits on.
+func (s *Server) nodeIsOnline(ctx context.Context, nodeName string) bool {
+	node, err := s.Store.Nodes().Get(ctx, nodeName)
+	if err != nil {
+		return false
+	}
+
+	return node.ConnectionStatus == apiv1.NodeTypeOnline
+}
+
+// allReplicasDiskless is LINSTOR's allDiskless.
+func allReplicasDiskless(replicas []apiv1.Resource) bool {
+	for i := range replicas {
+		if !isDisklessReplica(&replicas[i]) {
 			return false
 		}
 	}
 
 	return true
+}
+
+// onlineDiskfulPeers is LINSTOR's getOnlineNodeIds: the diskful,
+// active replicas on ONLINE nodes, which a ready replica is connected
+// to. Replicas being deleted are left out as well, so a create next to
+// a deletion is not held for a peer that is going away.
+func onlineDiskfulPeers(replicas []apiv1.Resource, online map[string]bool) []string {
+	var out []string
+
+	for i := range replicas {
+		rsc := &replicas[i]
+
+		if isDisklessReplica(rsc) || !online[naming.Key(rsc.NodeName)] ||
+			slices.Contains(rsc.Flags, apiv1.ResourceFlagInactive) ||
+			slices.Contains(rsc.Flags, apiv1.ResourceFlagDeleting) ||
+			slices.Contains(rsc.Flags, apiv1.ResourceFlagDelete) {
+			continue
+		}
+
+		out = append(out, rsc.NodeName)
+	}
+
+	return out
+}
+
+// replicaReady is LINSTOR's ResourceState.isReady for rsc against the
+// expected peers. A diskful replica must also report a device path for
+// every volume: LINSTOR knows the path from its layer data the moment
+// the resource exists, blockstor learns it from the satellite.
+func replicaReady(rsc *apiv1.Resource, peers []string, byNode map[string]*apiv1.Resource, volumes map[int32]int64) bool {
+	conns := drbdConnections(rsc)
+
+	for _, peer := range peers {
+		if naming.Same(peer, rsc.NodeName) {
+			continue
+		}
+
+		if !conns[naming.Key(peer)] {
+			return false
+		}
+	}
+
+	for vn := range volumes {
+		vol := reportedVolume(rsc, vn)
+		if vol == nil {
+			return false
+		}
+
+		if !isDisklessReplica(rsc) && vol.DevicePath == "" {
+			return false
+		}
+
+		if vol.State.DiskState != diskStateUpToDate && !reachesUpToDatePeer(conns, byNode, vn) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// drbdConnections returns the peers rsc reports a live DRBD connection
+// to, keyed by naming.Key of the peer node.
+func drbdConnections(rsc *apiv1.Resource) map[string]bool {
+	out := map[string]bool{}
+
+	if rsc.LayerObject == nil || rsc.LayerObject.Drbd == nil {
+		return out
+	}
+
+	for peer, conn := range rsc.LayerObject.Drbd.Connections {
+		if conn.Connected {
+			out[naming.Key(peer)] = true
+		}
+	}
+
+	return out
+}
+
+// reportedVolume returns rsc's reported volume vn, or nil.
+func reportedVolume(rsc *apiv1.Resource, vn int32) *apiv1.Volume {
+	for i := range rsc.Volumes {
+		if rsc.Volumes[i].VolumeNumber == vn {
+			return &rsc.Volumes[i]
+		}
+	}
+
+	return nil
+}
+
+// reachesUpToDatePeer reports whether one of the connected peers holds
+// UpToDate data for volume vn: the way a diskless or still-syncing
+// replica has access to up-to-date data.
+func reachesUpToDatePeer(conns map[string]bool, byNode map[string]*apiv1.Resource, vn int32) bool {
+	for peer := range conns {
+		rsc, ok := byNode[peer]
+		if !ok {
+			continue
+		}
+
+		if vol := reportedVolume(rsc, vn); vol != nil && vol.State.DiskState == diskStateUpToDate {
+			return true
+		}
+	}
+
+	return false
+}
+
+// notConnectedWarnings renders LINSTOR's makeNotConnectedWarning for
+// each deployed replica whose satellite is not connected.
+func notConnectedWarnings(nodes []string) []apiv1.APICallRc {
+	out := make([]apiv1.APICallRc, 0, len(nodes))
+
+	for _, node := range nodes {
+		out = append(out, apiv1.APICallRc{
+			RetCode: warnNotConnected,
+			Message: "No active connection to satellite '" + node + "'",
+			Details: "The controller is trying to (re-) establish a connection to the satellite. " +
+				"The controller stored the changes and as soon the satellite is connected, it will " +
+				"receive this update.",
+			ObjRefs: map[string]string{"Node": node},
+		})
+	}
+
+	return out
 }
 
 // notReadyWarnings renders LINSTOR's per-node warning for a resource
