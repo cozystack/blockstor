@@ -83,8 +83,9 @@ type ResourceGroupReconciler struct {
 // deleted, one with BalanceResourcesEnabled=false, which linstor-csi
 // sets while it deletes a volume's replicas, and one with no UpToDate
 // diskful replica on an online node, such as a volume deleted while its
-// snapshots keep the definition. An `rg modify` that raises the place
-// count still reaches those through the rebalance-pending path.
+// snapshots keep the definition. An `rg modify` that names a place
+// count still reaches those through the rebalance-pending path, with
+// balancing on or off.
 func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 

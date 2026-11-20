@@ -43,8 +43,11 @@ import (
 //
 //  1. REST `linstor rg modify` stamps the
 //     `blockstor.org/rebalance-pending` annotation on the RG CRD when
-//     PlaceCount strictly increases or a placement-affecting
-//     SelectFilter changes (see pkg/rest/resource_groups.go).
+//     the request names a place count or changes a placement-affecting
+//     SelectFilter (see pkg/rest/resource_groups.go). A named place
+//     count also stamps `blockstor.org/rebalance-place-count`, and that
+//     pass places with BalanceResourcesEnabled=false too, as LINSTOR's
+//     `rg modify` does.
 //  2. The controller-runtime watch on RG CRDs delivers a reconcile
 //     request. The annotation-driven path runs the additive placer
 //     for every child RD, then strips the marker so the next event
@@ -148,16 +151,34 @@ func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 }
 
 // handleDisabledPass implements scenario 2.W02's "kill-switched" branch.
-// Both the annotation path AND the scheduled-tick path are suppressed;
-// a stamped annotation is stripped so a stale marker doesn't loop
-// forever against the disabled reconciler.
+// The scheduled tick is suppressed, and so is the pass for an
+// `rg modify` that changed only a placement constraint. A stamped
+// annotation is stripped so a stale marker doesn't loop forever against
+// the disabled reconciler.
+//
+// An `rg modify` that names a place count still places. The switch is
+// read by LINSTOR's balance task alone (BalanceResources.isRscDfnDisabled);
+// its `rg modify` autoplaces the short children without consulting it.
 func (r *RGRebalanceReconciler) handleDisabledPass(ctx context.Context, rg *apiv1.ResourceGroup) error {
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; !hasAnnotation {
 		return nil
 	}
 
-	logf.FromContext(ctx).WithValues("rg", rg.Name).
-		Info("rebalance disabled by BalanceResourcesEnabled=false; stripping stale annotation")
+	log := logf.FromContext(ctx).WithValues("rg", rg.Name)
+
+	if _, placeCount := rg.Annotations[apiv1.AnnotationRGRebalancePlaceCount]; !placeCount {
+		log.Info("rebalance disabled by BalanceResourcesEnabled=false; stripping stale annotation")
+
+		return r.stripRebalanceAnnotation(ctx, rg)
+	}
+
+	count, err := r.rebalanceChildRDs(ctx, rg, 0, false)
+	if err != nil {
+		return err
+	}
+
+	log.Info("rebalance pass complete (rg modify place count; BalanceResourcesEnabled=false stops only the balance task)",
+		"rds_processed", count)
 
 	return r.stripRebalanceAnnotation(ctx, rg)
 }

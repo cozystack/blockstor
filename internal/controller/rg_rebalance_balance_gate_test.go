@@ -280,22 +280,37 @@ func TestScheduledRebalanceHonoursBalanceResourcesEnabledPerDefinition(t *testin
 }
 
 // TestRebalanceKillSwitchIgnoresCase: the controller-wide switch stops
-// the rg modify path too, and "False" stops it the way "false" does.
+// the pass for a constraint-only `rg modify`, and "False" stops it the
+// way "false" does. The definition passes every other balance check,
+// so without the switch the same pass tops it up.
 func TestRebalanceKillSwitchIgnoresCase(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	st := store.NewInMemory()
+	for value, want := range map[string]int{"False": 1, "": 3} {
+		t.Run("BalanceResourcesEnabled="+value, func(t *testing.T) {
+			t.Parallel()
 
-	seedRebalanceFixture(t, ctx, st, 3, []string{"n1"})
+			ctx := context.Background()
+			st := store.NewInMemory()
 
-	if err := st.ControllerProps().Set(ctx, map[string]string{apiv1.PropBalanceResourcesEnabled: "False"}); err != nil {
-		t.Fatalf("set controller props: %v", err)
-	}
+			rg := seedIntervalFixture(t, ctx, st, 3, []string{"n1"})
 
-	reconcileRebalance(t, ctx, st)
+			rg.Annotations = map[string]string{apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z"}
+			if err := st.ResourceGroups().Update(ctx, rg); err != nil {
+				t.Fatalf("stamp rebalance-pending: %v", err)
+			}
 
-	if n := replicaCount(t, ctx, st, "pvc-rebalance"); n != 1 {
-		t.Fatalf("got %d replicas with BalanceResourcesEnabled=False; want 1", n)
+			if value != "" {
+				if err := st.ControllerProps().Set(ctx, map[string]string{apiv1.PropBalanceResourcesEnabled: value}); err != nil {
+					t.Fatalf("set controller props: %v", err)
+				}
+			}
+
+			reconcileRebalance(t, ctx, st)
+
+			if n := replicaCount(t, ctx, st, "pvc-interval"); n != want {
+				t.Fatalf("got %d replicas; want %d", n, want)
+			}
+		})
 	}
 }
