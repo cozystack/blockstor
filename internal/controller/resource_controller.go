@@ -2135,6 +2135,14 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.APIReader = mgr.GetAPIReader()
 	}
 
+	// The block size this reconciler writes for a new replica is dropped
+	// with the definition's last replica; the two halves of the rule are
+	// wired together.
+	err := (&BlockSizeReleaseReconciler{Client: r.Client, APIReader: r.APIReader}).SetupWithManager(mgr)
+	if err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{}).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
