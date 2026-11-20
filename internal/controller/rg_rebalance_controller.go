@@ -20,7 +20,6 @@ package controller
 
 import (
 	"context"
-	"slices"
 	"sync"
 	"time"
 
@@ -246,10 +245,8 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 //
 // `gated` applies the checks LINSTOR's balance task makes before it
 // touches a definition (balanceGate.skipReason). Only an `rg modify`
-// that raised the place count leaves them off: LINSTOR runs the
-// autoplacer for that on every child definition short of the new
-// count, one kept only by its snapshots included. It still skips a
-// definition being deleted, which no placement may grow.
+// that named a place count leaves them off, and places on the
+// definitions modifyPlaceCountSkip lets through.
 func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, gated bool) (int, error) {
 	log := logf.FromContext(ctx)
 
@@ -305,23 +302,23 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 }
 
 // skipRD reports whether the pass leaves rd alone. Without a gate
-// (an `rg modify` that raised the place count) only a definition being
-// deleted is skipped. The reason goes to the debug log; a definition
-// whose replicas cannot be read is skipped.
+// (an `rg modify` that named a place count) modifyPlaceCountSkip
+// decides. The reason goes to the debug log; a definition whose
+// replicas cannot be read is skipped.
 func (r *RGRebalanceReconciler) skipRD(ctx context.Context, gate *balanceGate, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) bool {
 	log := logf.FromContext(ctx).WithValues("rg", rg.Name, "rd", rd.Name)
 
+	var (
+		reason string
+		err    error
+	)
+
 	if gate == nil {
-		if slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
-			log.V(1).Info("rebalance skipped", "reason", balanceSkipDeleting)
-
-			return true
-		}
-
-		return false
+		reason, err = modifyPlaceCountSkip(ctx, r.Store, rg, rd)
+	} else {
+		reason, err = gate.skipReason(ctx, rg, rd)
 	}
 
-	reason, err := gate.skipReason(ctx, rg, rd)
 	if err != nil {
 		log.Error(err, "rebalance skipped: replicas unreadable")
 

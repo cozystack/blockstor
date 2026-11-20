@@ -38,6 +38,7 @@ const (
 	balanceSkipDeleting   = "definition is being deleted"
 	balanceSkipDisabled   = "BalanceResourcesEnabled is false"
 	balanceSkipNoUpToDate = "no diskful replica on an online node is UpToDate"
+	modifySkipAtCount     = "replicas other than tiebreakers already reach the place count"
 )
 
 // balanceGate holds what one placement pass nobody asked for (the
@@ -179,4 +180,43 @@ func balanceDisabled(rdProps, rgProps, ctrlProps map[string]string) bool {
 	}
 
 	return false
+}
+
+// modifyPlaceCountSkip reports why the pass for an `rg modify` that
+// named a place count must not place on rd, or "" when it may. It
+// makes the one check LINSTOR's modify makes before it autoplaces a
+// child (CtrlRscGrpApiCallHandler.modifyInTransaction): the
+// definition's replicas, every one but a tiebreaker, diskless ones and
+// ones being deleted included, number fewer than the place count. None
+// of the balance task's checks apply, so a definition kept only by its
+// snapshots is topped up from zero and BalanceResourcesEnabled is not
+// read.
+//
+// A definition being deleted is skipped as well, which LINSTOR does
+// not do. In blockstor that flag is the object's deletion timestamp,
+// which cannot be withdrawn; a replica placed under it is torn down
+// with the definition or outlives it.
+func modifyPlaceCountSkip(ctx context.Context, st store.Store, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) (string, error) {
+	if slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
+		return balanceSkipDeleting, nil
+	}
+
+	replicas, err := st.Resources().ListByDefinition(ctx, rd.Name)
+	if err != nil {
+		return "", fmt.Errorf("list the replicas of %q: %w", rd.Name, err)
+	}
+
+	counted := 0
+
+	for i := range replicas {
+		if !slices.Contains(replicas[i].Flags, apiv1.ResourceFlagTieBreaker) {
+			counted++
+		}
+	}
+
+	if counted >= max(int(rg.SelectFilter.PlaceCount), 1) {
+		return modifySkipAtCount, nil
+	}
+
+	return "", nil
 }
