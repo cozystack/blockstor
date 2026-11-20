@@ -178,6 +178,28 @@ func New(st store.Store) *Placer {
 // the migration semantic: even if 2 replicas exist, if one is on an
 // evicted node the placer will create a third on a healthy peer.
 func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
+	res, err := p.PlaceDeployed(ctx, rdName, filter)
+
+	return res.Placed, res.Want, err
+}
+
+// Placement is what a Place call did: the diskful count it reached,
+// the count it was asked for, and the nodes whose replica this call
+// created or promoted from a diskless witness.
+type Placement struct {
+	Placed int
+	Want   int
+	// Deployed lists the nodes this call put a replica on, as LINSTOR's
+	// autoplace collects its deployedResources: the replicas that were
+	// there before the call are not in it.
+	Deployed []string
+}
+
+// PlaceDeployed is Place that also reports which nodes it deployed to,
+// so the REST autoplace can wait for those replicas only, as LINSTOR
+// waits for the resources the call created and not for the ones the
+// definition already had.
+func (p *Placer) PlaceDeployed(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (Placement, error) {
 	defer lockDefinition(rdName)()
 
 	// Bug 038: an RD born from a snapshot restore / clone must never
@@ -189,7 +211,7 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 
 	plan, err := p.buildPlan(ctx, rdName, filter)
 	if err != nil {
-		return 0, 0, err
+		return Placement{}, err
 	}
 
 	if plan.capacityShortfall {
@@ -205,10 +227,10 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 		// envelope so the relevant ratio (Free / Total / Master) is
 		// named in the 409 (scenarios 7.W10 / 7.W11).
 		if plan.maxFreeKib == 0 && plan.oversubShortfall != nil {
-			return 0, int(filter.PlaceCount), plan.oversubShortfall
+			return Placement{Want: int(filter.PlaceCount)}, plan.oversubShortfall
 		}
 
-		return 0, int(filter.PlaceCount), &CapacityShortfallError{
+		return Placement{Want: int(filter.PlaceCount)}, &CapacityShortfallError{
 			RequiredKib: plan.requiredKib,
 			MaxFreeKib:  plan.maxFreeKib,
 		}
@@ -219,18 +241,18 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.preferred, placed, want)
 	if err != nil {
-		return placed, want, err
+		return plan.state.placement(placed, want), err
 	}
 
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.lastResort, placed, want)
 	if err != nil {
-		return placed, want, err
+		return plan.state.placement(placed, want), err
 	}
 
 	if filter.DisklessOnRemaining && placed >= want {
 		err = p.placeDisklessOnRemaining(ctx, rdName, plan.state)
 		if err != nil {
-			return placed, want, err
+			return plan.state.placement(placed, want), err
 		}
 	}
 
@@ -247,18 +269,18 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	// see the capacityShortfall branch above for the rationale.
 	if placed < want && plan.requiredKib > 0 {
 		if plan.maxFreeKib > 0 {
-			return placed, want, &CapacityShortfallError{
+			return plan.state.placement(placed, want), &CapacityShortfallError{
 				RequiredKib: plan.requiredKib,
 				MaxFreeKib:  plan.maxFreeKib,
 			}
 		}
 
 		if plan.oversubShortfall != nil {
-			return placed, want, plan.oversubShortfall
+			return plan.state.placement(placed, want), plan.oversubShortfall
 		}
 	}
 
-	return placed, want, nil
+	return plan.state.placement(placed, want), nil
 }
 
 // placePlan bundles everything Place needs after the read-side
@@ -490,6 +512,10 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 			return errors.Wrap(err, "create diskless witness")
 		}
 
+		if err == nil {
+			state.deployed = append(state.deployed, nodeName)
+		}
+
 		state.taken[naming.Key(nodeName)] = struct{}{}
 	}
 
@@ -545,6 +571,15 @@ type state struct {
 	// exact transition pkg/rest.promoteDisklessReplica performs for the
 	// explicit `r c <node> --storage-pool` toggle-disk path.
 	upgradeable map[string]string
+	// deployed lists, in order, the nodes this call created a replica
+	// on or promoted a witness on. A Create that found the replica
+	// already there does not count.
+	deployed []string
+}
+
+// placement renders the call's result.
+func (s *state) placement(placed, want int) Placement {
+	return Placement{Placed: placed, Want: want, Deployed: s.deployed}
 }
 
 func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string, pools []apiv1.StoragePool, allowPoolDriverMixing bool) *state {
@@ -744,6 +779,8 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		if err != nil {
 			return false, err
 		}
+
+		s.deployed = append(s.deployed, pool.NodeName)
 	} else {
 		res := apiv1.Resource{
 			Name:     rdName,
@@ -754,6 +791,10 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		err := st.Resources().Create(ctx, &res)
 		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
 			return false, errors.Wrap(err, "create resource")
+		}
+
+		if err == nil {
+			s.deployed = append(s.deployed, pool.NodeName)
 		}
 	}
 
