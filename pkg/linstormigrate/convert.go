@@ -2509,7 +2509,11 @@ func (c *converter) resolveReplicaDRBDPort(row *ResourceRow, dumpPort *int32, rd
 }
 
 // snapshotVolumeRefsFor collects the snapshot's captured volume slots
-// (number + size) from the snapshot-scoped VOLUME_DEFINITIONS rows.
+// (number + size) from the snapshot-scoped VOLUME_DEFINITIONS rows, each
+// with the volume definition props LINSTOR froze into the snapshot. A
+// restore copies those, the block size among them, the way LINSTOR's
+// restore does; without them a restored volume came up at DRBD's default
+// sector size instead of its source's.
 func (c *converter) snapshotVolumeRefsFor(rdName, snapName string) []crdv1alpha1.SnapshotVolumeRef {
 	var out []crdv1alpha1.SnapshotVolumeRef
 
@@ -2519,9 +2523,19 @@ func (c *converter) snapshotVolumeRefsFor(rdName, snapName string) []crdv1alpha1
 			continue
 		}
 
+		// The dump is the record of what the snapshot held: a volume
+		// definition with no props there had none, and is recorded as
+		// {} so the store does not take it for a snapshot from before
+		// props were kept and fill in the definition's props of today.
+		props := c.props.SnapshotVDFrozen(rdName, snapName, strconv.Itoa(int(vd.VlmNr)))
+		if props == nil {
+			props = map[string]string{}
+		}
+
 		out = append(out, crdv1alpha1.SnapshotVolumeRef{
 			VolumeNumber: vd.VlmNr,
 			SizeKib:      vd.VlmSize,
+			Props:        props,
 		})
 	}
 

@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -102,6 +103,10 @@ type ResourceReconciler struct {
 	// nodeID off the cache and pick the same lowest-free value.
 	// Wired from `mgr.GetAPIReader()` in SetupWithManager.
 	APIReader client.Reader
+
+	// Recorder raises the Warning Event for a replica whose pool needs a
+	// larger block size than its volume definition may take. Optional.
+	Recorder events.EventRecorder
 
 	// allocMu serialises DRBD-ID allocation across replicas of the
 	// same RD. APIReader bypasses the informer cache but doesn't
@@ -237,18 +242,46 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// resourceVersion stays valid for the downstream Spec writers;
 	// requeue when allocation actually mutated state so the next
 	// pass observes the fresh revision uniformly.
-	allocCopy := target.DeepCopy()
-
-	allocated, err := r.ensureDRBDIDs(ctx, allocCopy, nil)
-	if err != nil {
-		return ctrl.Result{}, err
+	requeue, err := r.allocateIdentity(ctx, &target)
+	if err != nil || requeue {
+		return ctrl.Result{Requeue: requeue}, err
 	}
 
-	if allocated {
-		return ctrl.Result{Requeue: true}, nil
+	// A freeze that fails is retried, but does not hold up the rest of
+	// the replica's housekeeping: the stamp only stops a later size
+	// change, and an in-use replica whose freeze keeps being refused
+	// still needs its apply.
+	freezeErr := r.freezeBlockSize(ctx, &target)
+
+	result, err := r.runApply(ctx, &target)
+	if freezeErr != nil {
+		return ctrl.Result{}, cerrors.Join(err, freezeErr)
 	}
 
-	return r.runApply(ctx, &target)
+	return result, err
+}
+
+// allocateIdentity gives a replica its DRBD identity, the block size of
+// its volume definitions first, and reports whether it changed anything,
+// so the caller requeues onto the fresh revision.
+//
+// The block size goes on the volume definition before the replica gets
+// its identity: the satellite brings nothing up before that, and the
+// size of an attached device never changes afterwards.
+//
+// The allocation runs on a copy: ensureDRBDIDs re-fetches via APIReader
+// and patches Status, which bumps the apiserver-side resource version,
+// and the Spec writers downstream in runApply use the caller's
+// top-of-Reconcile snapshot.
+func (r *ResourceReconciler) allocateIdentity(ctx context.Context, target *blockstoriov1alpha1.Resource) (bool, error) {
+	if awaitingIdentity(target) {
+		err := r.decideBlockSize(ctx, target)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	return r.ensureDRBDIDs(ctx, target.DeepCopy(), nil)
 }
 
 // satelliteResourceFinalizer is the satellite's replica finalizer, shared
@@ -2105,6 +2138,14 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.APIReader = mgr.GetAPIReader()
 	}
 
+	// The block size this reconciler writes for a new replica is dropped
+	// with the definition's last replica; the two halves of the rule are
+	// wired together.
+	err := (&BlockSizeReleaseReconciler{Client: r.Client, APIReader: r.APIReader, Lock: r.rdAllocMu}).SetupWithManager(mgr)
+	if err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{}).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
@@ -2119,7 +2160,9 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // one on first use. Different RDs see different mutexes so they
 // allocate in parallel; replicas of the same RD serialise.
 func (r *ResourceReconciler) rdAllocMu(rdName string) *sync.Mutex {
-	loaded, _ := r.allocMu.LoadOrStore(rdName, &sync.Mutex{})
+	// Keyed by the folded name: replicas spell their definition as it
+	// was given, and the block size release only has the CR name.
+	loaded, _ := r.allocMu.LoadOrStore(naming.Key(rdName), &sync.Mutex{})
 
 	muTyped, _ := loaded.(*sync.Mutex)
 
