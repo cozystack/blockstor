@@ -544,7 +544,8 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 // afterApply records the apply's outcome on the Resource and reports
 // whether anything failed. The volumes of definitions flagged DELETE are
 // deleted only after an apply that went through, since that apply is what
-// took them out of DRBD.
+// took them out of DRBD. A failed apply may still have removed their
+// minors, so the quorum recheck that removal needs runs either way.
 func (r *ResourceReconciler) afterApply(
 	ctx context.Context,
 	res *blockstoriov1alpha1.Resource,
@@ -557,6 +558,8 @@ func (r *ResourceReconciler) afterApply(
 	r.stampPostApply(ctx, res, rd, results, anyFailed, logger)
 
 	if anyFailed {
+		r.recheckQuorumAfterFailedApply(ctx, res, rd, logger)
+
 		return true
 	}
 

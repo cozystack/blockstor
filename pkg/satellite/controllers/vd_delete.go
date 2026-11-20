@@ -23,6 +23,8 @@ import (
 	"slices"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -79,6 +81,48 @@ func (r *ResourceReconciler) deleteFlaggedVolumes(ctx context.Context, res *bloc
 	}
 
 	return r.applyDeletedVolumes(ctx, res, keep)
+}
+
+// recheckQuorumAfterFailedApply has DRBD recheck the resource's quorum
+// when an apply failed after its `drbdadm adjust` had already removed the
+// minor of a volume flagged DELETE. DeleteVolumes, which does that recheck
+// otherwise, waits for an apply that goes through, and until then the
+// remaining volumes of a Primary would stay suspended or failing their I/O.
+func (r *ResourceReconciler) recheckQuorumAfterFailedApply(
+	ctx context.Context,
+	res *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	logger logr.Logger,
+) {
+	if !rdNeedsDRBD(rd) {
+		return
+	}
+
+	_, todo := r.planVolumeDeletes(res, rd)
+
+	req := &intent.DeleteVolumesRequest{Name: naming.Key(res.Spec.ResourceDefinitionName)}
+
+	for _, vd := range todo {
+		if vd.DRBDMinor != nil {
+			req.Volumes = append(req.Volumes, intent.VolumeToDelete{VolumeNumber: vd.VolumeNumber, Minor: vd.DRBDMinor})
+		}
+	}
+
+	if len(req.Volumes) == 0 {
+		return
+	}
+
+	err := r.Config.Apply.RecheckQuorumAfterVolumeRemoval(ctx, req)
+	if err == nil {
+		return
+	}
+
+	logger.Info("quorum recheck after a volume removal failed", "error", err.Error())
+
+	if r.Config.Recorder != nil {
+		r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, volumeDeleteFailedReason, "DeleteVolume",
+			"volume definition delete is waiting for this replica: %s", err.Error())
+	}
 }
 
 // planVolumeDeletes splits the volume definitions flagged DELETE into the
