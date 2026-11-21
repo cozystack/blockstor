@@ -19,10 +19,12 @@ limitations under the License.
 package controllers
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
+	"k8s.io/client-go/tools/events"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -111,5 +113,74 @@ func TestApplyBackOffCountsOnlyTheRetriesThatCameDue(t *testing.T) {
 
 	if got := b.next("r"); got != 2*applyFailureRequeue {
 		t.Fatalf("the first retry that came due and failed retried after %v, want %v", got, 2*applyFailureRequeue)
+	}
+}
+
+// An apply that goes through after failures is reported as a Normal
+// Event on the Resource, once: the Warning Events of the failures stay
+// until they expire and would otherwise read as a replica still down,
+// as LINSTOR logs a failed resource leaving its retry task.
+func TestAnApplyThatRecoversIsReportedOnce(t *testing.T) {
+	t.Parallel()
+
+	rd := groupMemberRD("STORAGE")
+	res := memberReplica()
+	r := newPassphraseTestReconciler(t, luksGroup(), rd, res)
+
+	recorder := events.NewFakeRecorder(16)
+	r.Config.Recorder = recorder
+
+	provider := &flakyCreateProvider{failsRemaining: 2}
+	r.Config.Exec = storage.NewFakeExec()
+	r.Config.Apply = satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"pool-a": provider},
+		NodeName:  "node-a",
+	})
+
+	drain := func() []string {
+		var got []string
+
+		for {
+			select {
+			case ev := <-recorder.Events:
+				got = append(got, ev)
+			default:
+				return got
+			}
+		}
+	}
+
+	for range 2 {
+		if _, err := r.runApply(t.Context(), res, logr.Discard()); err != nil {
+			t.Fatalf("runApply: %v", err)
+		}
+	}
+
+	failed := drain()
+	if len(failed) != 2 {
+		t.Fatalf("events after two failed applies = %q, want two %s Warnings", failed, applyFailedReason)
+	}
+
+	for _, ev := range failed {
+		if !strings.HasPrefix(ev, "Warning "+applyFailedReason) {
+			t.Fatalf("events after two failed applies = %q, want two %s Warnings", failed, applyFailedReason)
+		}
+	}
+
+	if _, err := r.runApply(t.Context(), res, logr.Discard()); err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	evs := drain()
+	if len(evs) != 1 || !strings.HasPrefix(evs[0], "Normal "+applySucceededReason) || !strings.Contains(evs[0], "after 2 failed attempts") {
+		t.Fatalf("events after the apply went through = %q, want one Normal %s after 2 failed attempts", evs, applySucceededReason)
+	}
+
+	if _, err := r.runApply(t.Context(), res, logr.Discard()); err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	if evs := drain(); len(evs) != 0 {
+		t.Fatalf("an apply with no failure before it reported %q", evs)
 	}
 }

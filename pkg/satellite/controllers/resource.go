@@ -743,7 +743,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
-	r.retries.reset(res.Name)
+	r.recordRecovery(res, r.retries.reset(res.Name), logger)
 
 	// Phase 11.7 safety net: schedule a periodic re-eval on
 	// active-DRBD resources. The primary-watch predicate drops
@@ -1103,6 +1103,31 @@ func luksRefusals() []applyRefusal {
 // applyFailedReason is the Event reason for a failed apply that is not
 // one of the LUKS refusals.
 const applyFailedReason = "ApplyFailed"
+
+// applySucceededReason is the Event reason for an apply that went
+// through after failures.
+const applySucceededReason = "ApplySucceeded"
+
+// recordRecovery reports an apply that went through after `failures`
+// failed applies: an Info line and a Normal Event on the Resource. The
+// Warning Events of the failures stay on the Resource until they
+// expire and would otherwise read as a replica still down; LINSTOR
+// likewise logs a failed resource leaving its retry task and clears the
+// volume's error reports once the satellite reports it applied.
+func (r *ResourceReconciler) recordRecovery(res *blockstoriov1alpha1.Resource, failures int, logger logr.Logger) {
+	if failures == 0 {
+		return
+	}
+
+	logger.Info("Apply succeeded after failures", "failedApplies", failures)
+
+	if r.Config.Recorder == nil {
+		return
+	}
+
+	r.Config.Recorder.Eventf(res, nil, corev1.EventTypeNormal, applySucceededReason, "Apply",
+		"apply succeeded after %d failed attempts", failures)
+}
 
 // applyFailureEvent is the Warning Event reason and note for a failed
 // apply with message: those of the LUKS refusal it carries, or
