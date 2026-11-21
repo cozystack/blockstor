@@ -258,7 +258,15 @@ func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
 		return errors.Wrap(err, "add ObserverRunnable")
 	}
 
-	err = newHeartbeatRunnableFromConfig(mgr.GetClient(), cfg).RegisterWithManager(mgr)
+	hbClient, resetHB, err := NewHeartbeatClient(mgr.GetConfig(), mgr.GetScheme(), mgr.GetRESTMapper())
+	if err != nil {
+		return err
+	}
+
+	hb := newHeartbeatRunnableFromConfig(hbClient, cfg)
+	hb.ResetConnections = resetHB
+
+	err = hb.RegisterWithManager(mgr)
 	if err != nil {
 		return errors.Wrap(err, "register HeartbeatRunnable")
 	}

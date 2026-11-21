@@ -43,6 +43,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/cozystack/blockstor/pkg/apihealth"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/satellite/controllers"
 	"github.com/cozystack/blockstor/pkg/satellite/stream"
@@ -239,12 +240,7 @@ func run() int {
 // now aborts startup rather than silently falling back to the
 // (removed) gRPC path.
 func loadRESTConfig() (*rest.Config, error) {
-	cfg, err := ctrl.GetConfig()
-	if err != nil {
-		return nil, errors.Wrap(err, "load Kubernetes config")
-	}
-
-	return cfg, nil
+	return apihealth.GetConfig() //nolint:wrapcheck // apihealth wraps it
 }
 
 // mgrFactory returns a satellite.ManagerFactory closure that builds
