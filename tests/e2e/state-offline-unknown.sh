@@ -43,7 +43,7 @@
 # so heartbeats KEEP flowing — that wouldn't exercise the OFFLINE
 # flip at all. The affinity-based eviction is the only reliable
 # way on this stand to land the satellite in a truly absent state
-# for the >40 s grace window.
+# for the >50 s grace window.
 
 set -euo pipefail
 
