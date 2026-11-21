@@ -37,6 +37,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/satellite/stream"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // reconcileTriggerBuffer bounds the observer → reconciler trigger
@@ -111,6 +112,14 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 		return nil, errors.Wrap(err, "create manager")
 	}
 
+	// Every pass looks up which spellings of its definition the cached
+	// replicas carry (storek8s.ReplicasOf). Without the index that is a
+	// copy of every Resource in the cache, per pass.
+	err = storek8s.RegisterReplicaKeyIndex(mgr.GetFieldIndexer())
+	if err != nil {
+		return nil, errors.Wrap(err, "index cached replicas by definition")
+	}
+
 	// Inject the manager's APIReader so reconcilers can bypass
 	// the informer cache for late-stage finalizer re-reads (Bug
 	// 65). Falls back gracefully in tests where the field is
@@ -132,29 +141,9 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	// the field nil to short-circuit both ends.
 	ensureWiredDefaults(cfg)
 
-	err = (&ResourceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	err = setupReconcilers(mgr, cfg)
 	if err != nil {
-		return nil, errors.Wrap(err, "setup ResourceReconciler")
-	}
-
-	err = (&ResourceDefinitionReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup ResourceDefinitionReconciler")
-	}
-
-	err = (&SnapshotReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup SnapshotReconciler")
-	}
-
-	err = (&StoragePoolReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup StoragePoolReconciler")
-	}
-
-	err = (&PhysicalDeviceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup PhysicalDeviceReconciler")
+		return nil, err
 	}
 
 	err = addBackgroundRunnables(mgr, cfg)
@@ -167,6 +156,37 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	wireConditionStampers(mgr, cfg)
 
 	return mgr, nil
+}
+
+// setupReconcilers registers the satellite's reconcilers on mgr, each
+// with its own copy of cfg. Kept out of NewManager for its funlen budget.
+func setupReconcilers(mgr manager.Manager, cfg *Config) error {
+	err := (&ResourceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup ResourceReconciler")
+	}
+
+	err = (&ResourceDefinitionReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup ResourceDefinitionReconciler")
+	}
+
+	err = (&SnapshotReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup SnapshotReconciler")
+	}
+
+	err = (&StoragePoolReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup StoragePoolReconciler")
+	}
+
+	err = (&PhysicalDeviceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup PhysicalDeviceReconciler")
+	}
+
+	return nil
 }
 
 // validateConfig sanity-checks the NewManager input — keeps the
