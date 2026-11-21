@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
@@ -668,11 +669,36 @@ const applyFailedReason = "ApplyFailed"
 func applyFailureEvent(message string) (string, string) {
 	for _, refusal := range luksRefusals() {
 		if strings.Contains(message, refusal.err.Error()) {
-			return refusal.reason, refusal.what + ": " + message
+			return refusal.reason, eventNote(refusal.what + ": " + message)
 		}
 	}
 
-	return applyFailedReason, "apply failed, retrying with back-off: " + message
+	return applyFailedReason, eventNote("apply failed, retrying with back-off: " + message)
+}
+
+// eventNoteLimit is the longest note the apiserver accepts on an
+// events.k8s.io/v1 Event.
+const eventNoteLimit = 1024
+
+// eventNoteEllipsis marks a note cut to eventNoteLimit.
+const eventNoteEllipsis = "..."
+
+// eventNote cuts note to eventNoteLimit bytes, on a rune boundary. The
+// apiserver rejects a longer one and the recorder drops the Event
+// without a word, and a drbdadm failure carries the whole command line
+// and stderr, past the limit with a few peers. The head names the
+// failing step; the satellite log keeps the rest.
+func eventNote(note string) string {
+	if len(note) <= eventNoteLimit {
+		return note
+	}
+
+	cut := eventNoteLimit - len(eventNoteEllipsis)
+	for cut > 0 && !utf8.RuneStart(note[cut]) {
+		cut--
+	}
+
+	return note[:cut] + eventNoteEllipsis
 }
 
 // stampPostApply runs the four best-effort post-apply stamps:

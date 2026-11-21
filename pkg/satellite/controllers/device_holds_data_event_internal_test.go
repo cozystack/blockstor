@@ -5,6 +5,7 @@ package controllers
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,5 +57,41 @@ func TestAFormatRefusedOverDataIsAWarningEventOnTheResource(t *testing.T) {
 				t.Errorf("no Event for a failed apply (%s)", tc.name)
 			}
 		})
+	}
+}
+
+// A drbdadm failure carries the whole command line and stderr, past the
+// 1 KiB the apiserver accepts in an events.k8s.io/v1 note with a few
+// peers. The note is cut to fit, on a rune boundary, rather than the
+// Event being rejected and the failure going unreported.
+func TestAFailedApplyEventNoteFitsTheAPILimit(t *testing.T) {
+	t.Parallel()
+
+	message := "adjust pvc-1: drbdadm adjust pvc-1: Failure: (103) Remote address(port) already in use. " +
+		strings.Repeat("Command 'drbdsetup new-path pvc-1 0 ipv4:10.0.0.1:7001 ipv4:10.0.0.3:7003' ü ", 40)
+
+	for _, prefix := range []string{"", luks.ErrDeviceHoldsData.Error() + " "} {
+		_, note := applyFailureEvent(prefix + message)
+
+		if len(note) > eventNoteLimit {
+			t.Errorf("note is %d bytes, the apiserver takes at most %d", len(note), eventNoteLimit)
+		}
+
+		if !utf8.ValidString(note) {
+			t.Errorf("note cut inside a rune: %q", note[len(note)-8:])
+		}
+
+		if !strings.Contains(note, "(103) Remote address(port) already in use") {
+			t.Errorf("the cut note lost the failure: %q", note)
+		}
+	}
+
+	// Two-byte runes from offset 0 put the cut inside one.
+	if note := eventNote(strings.Repeat("ü", eventNoteLimit)); len(note) > eventNoteLimit || !utf8.ValidString(note) {
+		t.Errorf("a note of two-byte runes was cut to %d bytes, valid UTF-8 %v", len(note), utf8.ValidString(note))
+	}
+
+	if _, note := applyFailureEvent("short"); strings.HasSuffix(note, eventNoteEllipsis) {
+		t.Errorf("a note within the limit was cut: %q", note)
 	}
 }
