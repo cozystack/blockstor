@@ -1415,8 +1415,8 @@ func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
 	}
 }
 
-// resyncOnce marks every known resource pending, reading its GI from
-// disk afresh, and writes them. The pass waits for one the writer has
+// resyncOnce marks every known resource pending, reading its GI
+// afresh (readCurrentGI), and writes them. The pass waits for one the writer has
 // in flight, and writes nothing while a stream's dump is being read.
 //
 // The GI is read here too, not only when a frame changes a volume: the
@@ -1939,10 +1939,7 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 		}
 
 		if vol.CurrentUUID == "" && vol.BackingDev != "" {
-			current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
-			if err != nil {
-				current = ""
-			}
+			current := o.readCurrentGI(ctx, adm, ev.ResourceName, vol)
 
 			vol.CurrentUUID = current
 			o.rememberProbedGI(ev.ResourceName, vol.VolumeNumber, current)
@@ -1952,6 +1949,63 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 			o.RecordGI(ev.ResourceName, vol.VolumeNumber, vol.CurrentUUID)
 		}
 	}
+}
+
+// readCurrentGI reads one volume's current-UUID, from the kernel
+// when the replica has a peer to name the volume by, else from the
+// backing device. It returns empty when neither read found one.
+//
+// The resync reads every data-bearing volume every 5 s, and it must:
+// DRBD can move a GI with no events2 frame. A Primary that lost a peer
+// or was just promoted mints its new current UUID on the first write
+// after, which may come long after the last frame, and a Secondary
+// takes the new UUID a connected Primary sends it. A GI read once and
+// kept would let the seed gates take a written replica for a day0
+// sibling and skip a new replica's initial sync.
+//
+// drbdmeta opens the backing device read-write, and udev answers the
+// close with a change uevent for the device and each of its
+// partitions. Read that way on every resync, a hundred replicas held
+// a satellite at its CPU limit, with the disk rescans the uevents set
+// off. drbdsetup asks the kernel over netlink and opens nothing.
+func (o *ObserverRunnable) readCurrentGI(ctx context.Context, adm *drbd.Adm, name string, vol *volumeObservation) string {
+	if peer, ok := o.anyPeerNodeID(name); ok {
+		current, err := adm.KernelCurrentGI(ctx, name, peer, vol.VolumeNumber)
+		if err == nil && current != "" {
+			return current
+		}
+	}
+
+	current, err := adm.CurrentGI(ctx, name, vol.VolumeNumber, vol.BackingDev)
+	if err != nil {
+		return ""
+	}
+
+	return current
+}
+
+// anyPeerNodeID returns the lowest DRBD node-id of name's peers the
+// observer has seen, for naming a peer device to drbdsetup.
+func (o *ObserverRunnable) anyPeerNodeID(name string) (int32, bool) {
+	o.connMu.Lock()
+	defer o.connMu.Unlock()
+
+	var (
+		lowest int32
+		found  bool
+	)
+
+	for _, peer := range o.connCache[name] {
+		if peer.PeerDRBDNodeID == nil {
+			continue
+		}
+
+		if !found || *peer.PeerDRBDNodeID < lowest {
+			lowest, found = *peer.PeerDRBDNodeID, true
+		}
+	}
+
+	return lowest, found
 }
 
 // rememberProbedGI keeps a get-gi result on the cached volume, so the
