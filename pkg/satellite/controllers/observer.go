@@ -758,6 +758,9 @@ type ObserverRunnable struct {
 	wake      chan struct{}
 	holding   bool
 	previous  map[string]struct{}
+	// releasedAt is when releaseWrites ended the hold, until the pass
+	// it woke takes it to report how long the node's state took.
+	releasedAt time.Time
 
 	// writeMu makes one write pass at a time: a pass reads the caches
 	// when it writes a resource, so with passes in turn the newest view
@@ -784,8 +787,8 @@ type appliedStatus struct {
 
 // observerWriters bounds the resources one write pass writes at once.
 // The pass that follows a stream's initial dump writes every replica on
-// the node, and a satellite that just started shows none of them until
-// it has (ForgetStaleSatelliteState). One at a time, with a status
+// the node, and reads that hide the replicas of a satellite that just
+// started show none of them until it has. One at a time, with a status
 // write, a get-gi and a Condition write each, that kept every replica
 // of a node with ~110 of them Unknown for tens of seconds; LINSTOR
 // sends a reconnected node's state in one batch after the full sync.
@@ -1095,6 +1098,7 @@ func (o *ObserverRunnable) releaseWrites(ctx context.Context) {
 
 	o.previous = nil
 	o.holding = false
+	o.releasedAt = time.Now()
 	o.pendingMu.Unlock()
 
 	o.signalWriter()
@@ -1468,6 +1472,13 @@ func (o *ObserverRunnable) writeLoop(ctx context.Context, adm *drbd.Adm) {
 // of the write. Frames that arrive meanwhile mark the resource pending
 // again for the next pass. Nothing is written while a stream's dump is
 // being read; the entries wait for releaseWrites.
+//
+// The statuses of a pass go out before its KernelLoaded Conditions.
+// The pass after a dump writes every replica on the node, and reads
+// that hide the replicas of a satellite that just started show each
+// one again only once its status is out: with a Condition written
+// ahead of each status, they came back at half the rate the satellite
+// could write them.
 func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
@@ -1482,6 +1493,8 @@ func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 
 	batch := o.pending
 	o.pending = nil
+	released := o.releasedAt
+	o.releasedAt = time.Time{}
 	o.pendingMu.Unlock()
 
 	names := make([]string, 0, len(batch))
@@ -1491,6 +1504,24 @@ func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 
 	sort.Strings(names)
 
+	o.forEachPending(ctx, names, func(name string) { o.writeResource(ctx, adm, name, batch[name]) })
+
+	if !released.IsZero() {
+		log.FromContext(ctx).WithName("observer").Info("DRBD state written after the events2 dump",
+			"resources", len(names), "took", time.Since(released))
+	}
+
+	o.forEachPending(ctx, names, func(name string) {
+		owed := batch[name]
+		if owed.kernelLoaded != nil && !owed.departed {
+			o.stampKernelLoadedLogged(ctx, log.FromContext(ctx).WithName("observer"), name, *owed.kernelLoaded)
+		}
+	})
+}
+
+// forEachPending runs write for every name, observerWriters at a time,
+// and waits for all of them. It stops starting new ones once ctx ends.
+func (*ObserverRunnable) forEachPending(ctx context.Context, names []string, write func(name string)) {
 	sem := make(chan struct{}, observerWriters)
 
 	var wg sync.WaitGroup
@@ -1505,7 +1536,7 @@ func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 		wg.Go(func() {
 			defer func() { <-sem }()
 
-			o.writeResource(ctx, adm, name, batch[name])
+			write(name)
 		})
 	}
 
@@ -1526,12 +1557,8 @@ func (o *ObserverRunnable) writeResource(ctx context.Context, adm *drbd.Adm, nam
 		return
 	}
 
-	// Stamped before the status so a status NotFound (Resource CRD not
-	// created yet) doesn't suppress the Condition; stampKernelLoaded
-	// silences NotFound the same way. Phase 11.3 Stage 3.
-	if owed.kernelLoaded != nil {
-		o.stampKernelLoadedLogged(ctx, logger, name, *owed.kernelLoaded)
-	}
+	// The KernelLoaded Condition it owes is stamped by flush once the
+	// pass's statuses are out.
 
 	view, known := o.cachedView(name)
 	if !known {
