@@ -44,8 +44,9 @@ type Node struct {
 	UnsupportedLayers    map[string][]string `json:"unsupported_layers,omitempty"`
 	UnsupportedProviders map[string][]string `json:"unsupported_providers,omitempty"`
 
-	// SatelliteIncarnation names the satellite process now running on
-	// the node (CRD `Status.SatelliteIncarnation`). Not on the wire;
+	// SatelliteIncarnation names the kernel boot the satellite now
+	// running on the node reports from (CRD
+	// `Status.SatelliteIncarnation`). Not on the wire;
 	// see Resource.SatelliteIncarnation.
 	SatelliteIncarnation string `json:"-"`
 }

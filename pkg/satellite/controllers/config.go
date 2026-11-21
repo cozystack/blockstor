@@ -103,14 +103,16 @@ type Config struct {
 	// short-circuits — neither Watches consumer nor producer fires.
 	ReconcileTrigger chan event.GenericEvent
 
-	// Incarnation names this satellite process. The heartbeat stamps it
-	// on the Node and the observer on every Resource status it writes,
-	// so a read can tell the running satellite's reports from those an
-	// earlier process left behind before a crash or reboot.
+	// Incarnation names the kernel boot this satellite reports DRBD
+	// state from. The heartbeat stamps it on the Node and the observer
+	// on every Resource status it writes, so a read can tell reports of
+	// the kernel state the node holds now from those left behind before
+	// a reboot. A satellite restart keeps it: the kernel state it
+	// reported is still there.
 	//
-	// Production wires a fresh random value from
-	// `NewManager.ensureWiredDefaults`. Left empty, nothing is stamped
-	// and reads treat every stored report as current.
+	// Production wires the host's boot id from
+	// `NewManager.ensureWiredDefaults` (bootIncarnation). Left empty,
+	// nothing is stamped and reads treat every stored report as current.
 	Incarnation string
 
 	// UeventListener is the optional source of kernel block-device

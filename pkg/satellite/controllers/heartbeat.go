@@ -105,9 +105,9 @@ type HeartbeatRunnable struct {
 	NodeName string
 	Period   time.Duration
 
-	// Incarnation is this satellite process's Config.Incarnation,
-	// stamped on the Node so reads can tell which Resource reports the
-	// running process wrote. Empty stamps none.
+	// Incarnation is this satellite's Config.Incarnation, stamped on
+	// the Node so reads can tell which Resource reports came from the
+	// kernel boot the node runs now. Empty stamps none.
 	Incarnation string
 
 	// missCount tracks consecutive NotFound observations. Reset
