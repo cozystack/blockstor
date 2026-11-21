@@ -256,6 +256,26 @@ func TestFailedSkipNetAdjustKeepsTheOperatorsDisconnect(t *testing.T) {
 	}
 }
 
+// A delete drops the record, in memory as well as on disk, so a
+// resource re-created under the name does not inherit it.
+func TestDeleteResourceForgetsAFailedAdjust(t *testing.T) {
+	t.Parallel()
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm: drbd.NewAdm(storage.NewFakeExec()), StateDir: t.TempDir(), NodeName: "n1",
+	})
+	rec.setAdjustFailed(t.Context(), portInUseRes)
+
+	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{Name: portInUseRes})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteResource: %v, %+v", err, resp)
+	}
+
+	if rec.adjustFailedBefore(portInUseRes) {
+		t.Error("a deleted resource must not keep its failed-adjust record")
+	}
+}
+
 func assertAdjustedInFull(t *testing.T, cmds []string) {
 	t.Helper()
 

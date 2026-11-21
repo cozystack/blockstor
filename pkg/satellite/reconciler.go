@@ -375,9 +375,8 @@ type Reconciler struct {
 	// adjustFailed records the resources whose last adjust failed, so
 	// the next one is a full adjust (adjustFailedBefore). The marker file
 	// beside the .res carries it across a satellite restart. A delete
-	// removes the file only: an entry left here makes the first adjust
-	// of a resource re-created under the name a full one, as it is
-	// anyway.
+	// drops both, so a resource re-created under the name does not
+	// inherit the record.
 	adjustFailed map[string]bool
 }
 
@@ -942,35 +941,43 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		}
 	}
 
-	if r.cfg.StateDir != "" {
-		// Drop the per-resource state files together. Leaving
-		// `.md-created` behind would make a re-created RD with the
-		// same name see firstActivation=false on its first apply,
-		// skip create-md, and fail drbdadm adjust with
-		// "No valid meta data found". `.owned` (Bug 432) is the
-		// sweeper's ownership marker — must be removed AFTER the
-		// kernel slot is gone so a concurrent sweeper tick sees a
-		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", adjustFailedSuffix} {
-			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
-			if err != nil && !os.IsNotExist(err) {
-				return &intent.DeleteResourceResponse{
-					Ok:      false,
-					Message: err.Error(),
-				}, nil
-			}
-		}
-
-		err := r.forgetGIHistory(req.GetName())
-		if err != nil {
-			//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
-			return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
-		}
+	err := r.removeResourceState(req.GetName())
+	if err != nil {
+		//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
+		return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
 	}
 
 	r.forgetPool(req.GetName())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
+}
+
+// removeResourceState drops what this satellite keeps about a deleted
+// resource beside its kernel slot and volumes: the failed-adjust record
+// and, with a StateDir, the per-resource state files and GI history.
+func (r *Reconciler) removeResourceState(name string) error {
+	r.forgetAdjustFailed(name)
+
+	if r.cfg.StateDir == "" {
+		return nil
+	}
+
+	// Drop the per-resource state files together. Leaving
+	// `.md-created` behind would make a re-created RD with the
+	// same name see firstActivation=false on its first apply,
+	// skip create-md, and fail drbdadm adjust with
+	// "No valid meta data found". `.owned` (Bug 432) is the
+	// sweeper's ownership marker — must be removed AFTER the
+	// kernel slot is gone so a concurrent sweeper tick sees a
+	// clean post-state (kernel + marker both absent).
+	for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", adjustFailedSuffix} {
+		err := os.Remove(filepath.Join(r.cfg.StateDir, name+suffix))
+		if err != nil && !os.IsNotExist(err) {
+			return errors.WithStack(err)
+		}
+	}
+
+	return r.forgetGIHistory(name)
 }
 
 // forgetPool drops the resource from the resource→pool map so a
