@@ -137,7 +137,7 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			continue
 		}
 
-		err = r.applyRGToRD(ctx, &rg, &rds[i])
+		err = r.applyRGToRD(ctx, gate, &rg, &rds[i])
 		if err != nil {
 			log.Error(err, "apply RG to RD",
 				"rg", rg.Name, "rd", rds[i].Name)
@@ -153,15 +153,13 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // The placer is idempotent: if the RD already has place_count
 // replicas, no change. If the RG bumped place_count, the gap is
 // filled. Reductions are not auto-acted on here.
-func (r *ResourceGroupReconciler) applyRGToRD(ctx context.Context, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) error {
+func (r *ResourceGroupReconciler) applyRGToRD(ctx context.Context, gate *balanceGate, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) error {
 	filter := rg.SelectFilter
 	if filter.PlaceCount == 0 {
 		filter.PlaceCount = 1
 	}
 
-	_, _, err := placer.New(r.Store).Place(ctx, rd.Name, &filter)
-
-	return err
+	return gate.place(ctx, placer.New(r.Store), rg, rd.Name, &filter)
 }
 
 // SetupWithManager sets up the controller with the Manager.

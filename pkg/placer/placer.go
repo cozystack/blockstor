@@ -200,6 +200,27 @@ type Placement struct {
 // waits for the resources the call created and not for the ones the
 // definition already had.
 func (p *Placer) PlaceDeployed(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (Placement, error) {
+	return p.place(ctx, rdName, filter, nil)
+}
+
+// PlaceCreating is Place that also names the nodes it created a replica
+// on, for a caller that may have to take back what this call did and
+// nothing else: a replica that was already there, one another writer
+// created meanwhile, and a diskless witness promoted in place are not
+// on the list. It holds whatever was created before an error, too.
+func (p *Placer) PlaceCreating(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) ([]string, int, int, error) {
+	var created []string
+
+	res, err := p.place(ctx, rdName, filter, &created)
+
+	return created, res.Placed, res.Want, err
+}
+
+// place runs one placement. created, when not nil, receives the nodes
+// the call created a replica on, which is narrower than
+// Placement.Deployed: a witness promoted in place is deployed to but
+// not created.
+func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, created *[]string) (Placement, error) {
 	defer lockDefinition(rdName)()
 
 	// Bug 038: an RD born from a snapshot restore / clone must never
@@ -213,6 +234,12 @@ func (p *Placer) PlaceDeployed(ctx context.Context, rdName string, filter *apiv1
 	if err != nil {
 		return Placement{}, err
 	}
+
+	defer func() {
+		if created != nil && plan.state != nil {
+			*created = plan.state.created
+		}
+	}()
 
 	if plan.capacityShortfall {
 		// Fail-fast: no pool can host the largest volume. Surface the
@@ -521,6 +548,7 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 
 		if err == nil {
 			state.deployed = append(state.deployed, nodeName)
+			state.created = append(state.created, nodeName)
 		}
 
 		state.taken[naming.Key(nodeName)] = struct{}{}
@@ -532,6 +560,8 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 // state holds the per-call lookup tables. Pulled out of Placer so a
 // concurrent Placer call doesn't share the mutable bookkeeping.
 type state struct {
+	// created names the nodes this Place call created a replica on.
+	created    []string
 	nodes      map[string]map[string]string
 	taken      map[string]struct{}
 	sameTuple  map[string]string
@@ -802,6 +832,7 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 
 		if err == nil {
 			s.deployed = append(s.deployed, pool.NodeName)
+			s.created = append(s.created, pool.NodeName)
 		}
 	}
 
