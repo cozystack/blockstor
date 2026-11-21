@@ -481,6 +481,8 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "get parent RD")
 	}
 
+	r.refreshDefinitionForFirstApply(ctx, res, &rd, logger)
+
 	// Read peer Resources fresh via APIReader (uncached). The c-r
 	// informer cache trails the apiserver by hundreds of milliseconds,
 	// and the auto-primary election downstream needs every diskful
@@ -1420,6 +1422,39 @@ func (r *ResourceReconciler) waitForControllerAllocation(ctx context.Context, re
 	}
 
 	return ctrl.Result{}, true
+}
+
+// refreshDefinitionForFirstApply replaces the cached definition with the
+// API server's copy while the replica has never been applied here. The
+// controller writes the volume block size onto the definition before it
+// gives the replica its DRBD identity, but the two objects reach this
+// satellite through separate watches, so the cached definition can still
+// predate the size when the identity arrives. The first apply attaches
+// the device, and drbdsetup never changes the block size of an attached
+// device, so a size read late is a size lost until the next detach. A
+// failed read keeps the cached copy.
+func (r *ResourceReconciler) refreshDefinitionForFirstApply(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, logger logr.Logger,
+) {
+	if _, applied := res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]; applied {
+		return
+	}
+
+	reader := r.peerReader()
+	if reader == nil {
+		return
+	}
+
+	var fresh blockstoriov1alpha1.ResourceDefinition
+
+	err := reader.Get(ctx, client.ObjectKey{Name: rd.Name}, &fresh)
+	if err != nil {
+		logger.V(1).Info("definition refresh before the first apply failed; using the cached copy", "err", err.Error())
+
+		return
+	}
+
+	*rd = fresh
 }
 
 // refreshTargetFromAPIReader does an uncached Get on the target
