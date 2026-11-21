@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
+	"k8s.io/client-go/tools/events"
+
+	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/storage"
+)
+
+// scriptedCreateProvider fails its creates with the next message in
+// script, an empty one meaning the create goes through, and goes
+// through once the script runs out.
+type scriptedCreateProvider struct {
+	flakyCreateProvider
+
+	script []string
+}
+
+func (p *scriptedCreateProvider) CreateVolume(_ context.Context, _ storage.Volume) error {
+	if len(p.script) == 0 {
+		return nil
+	}
+
+	message := p.script[0]
+	p.script = p.script[1:]
+
+	if message == "" {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %s", errScriptedCreate, message)
+}
+
+// errScriptedCreate is a create scriptedCreateProvider fails.
+var errScriptedCreate = errors.New("create volume")
+
+// stampWait is the apply's message for a fresh replica the controller
+// has not stamped Spec.SkipInitialSync on yet.
+const stampWait = "Resource.Spec.SkipInitialSync not yet stamped by controller"
+
+// A fresh replica whose apply waits for the controller to stamp it is
+// not a failed apply: no Warning Event, no back-off, and no "succeeded
+// after failures" once it goes through. It is retried on the short
+// timer like the allocation waits ahead of the apply. Reported as an
+// ApplyFailed Warning, the wait read as a fault on every few new
+// replicas, and counting it stretched the retries of a replica that
+// then failed for real.
+func TestAWaitForTheControllerStampIsNotAFailedApply(t *testing.T) {
+	t.Parallel()
+
+	rd := groupMemberRD("STORAGE")
+	res := memberReplica()
+	r := newPassphraseTestReconciler(t, luksGroup(), rd, res)
+
+	recorder := events.NewFakeRecorder(16)
+	r.Config.Recorder = recorder
+
+	provider := &scriptedCreateProvider{script: []string{
+		stampWait, stampWait, stampWait, stampWait, "",
+		stampWait, stampWait, stampWait, stampWait, "storage pool transiently unavailable",
+	}}
+	r.Config.Exec = storage.NewFakeExec()
+	r.Config.Apply = satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"pool-a": provider},
+		NodeName:  "node-a",
+	})
+
+	now := time.Unix(0, 0)
+	r.retries.now = func() time.Time { return now }
+
+	run := func() time.Duration {
+		t.Helper()
+
+		result, err := r.runApply(t.Context(), res, logr.Discard())
+		if err != nil {
+			t.Fatalf("runApply: %v", err)
+		}
+
+		now = now.Add(result.RequeueAfter)
+
+		return result.RequeueAfter
+	}
+
+	for i := range 4 {
+		if got := run(); got != applyFailureRequeue {
+			t.Fatalf("wait %d retried after %v, want %v", i+1, got, applyFailureRequeue)
+		}
+	}
+
+	if got := run(); got != 0 {
+		t.Fatalf("the apply that went through requeued after %v, want no requeue", got)
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		t.Fatalf("waits for the controller stamp emitted %q, want no Event", ev)
+	default:
+	}
+
+	for range 4 {
+		run()
+	}
+
+	if got := run(); got != applyFailureRequeue {
+		t.Fatalf("the first real failure after waits retried after %v, want %v: the waits counted toward the back-off",
+			got, applyFailureRequeue)
+	}
+}

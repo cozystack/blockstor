@@ -371,6 +371,13 @@ type Reconciler struct {
 	// for the residual CRD-status-vs-on-disk window. Process-memory
 	// only; a restart resets the counter (at worst a few extra requeues).
 	restoreSnapshotMissingTries map[string]int
+
+	// adjustFailed records the resources whose last adjust failed, so
+	// the next one is a full adjust (adjustFailedBefore). The marker file
+	// beside the .res carries it across a satellite restart. A delete
+	// drops both, so a resource re-created under the name does not
+	// inherit the record.
+	adjustFailed map[string]bool
 }
 
 // recoveryPromoteThrottle bounds how often a single resource may fire
@@ -424,6 +431,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
+		adjustFailed:                map[string]bool{},
 	}
 }
 
@@ -933,35 +941,43 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		}
 	}
 
-	if r.cfg.StateDir != "" {
-		// Drop the per-resource state files together. Leaving
-		// `.md-created` behind would make a re-created RD with the
-		// same name see firstActivation=false on its first apply,
-		// skip create-md, and fail drbdadm adjust with
-		// "No valid meta data found". `.owned` (Bug 432) is the
-		// sweeper's ownership marker — must be removed AFTER the
-		// kernel slot is gone so a concurrent sweeper tick sees a
-		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned"} {
-			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
-			if err != nil && !os.IsNotExist(err) {
-				return &intent.DeleteResourceResponse{
-					Ok:      false,
-					Message: err.Error(),
-				}, nil
-			}
-		}
-
-		err := r.forgetGIHistory(req.GetName())
-		if err != nil {
-			//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
-			return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
-		}
+	err := r.removeResourceState(req.GetName())
+	if err != nil {
+		//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
+		return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
 	}
 
 	r.forgetPool(req.GetName())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
+}
+
+// removeResourceState drops what this satellite keeps about a deleted
+// resource beside its kernel slot and volumes: the failed-adjust record
+// and, with a StateDir, the per-resource state files and GI history.
+func (r *Reconciler) removeResourceState(name string) error {
+	r.forgetAdjustFailed(name)
+
+	if r.cfg.StateDir == "" {
+		return nil
+	}
+
+	// Drop the per-resource state files together. Leaving
+	// `.md-created` behind would make a re-created RD with the
+	// same name see firstActivation=false on its first apply,
+	// skip create-md, and fail drbdadm adjust with
+	// "No valid meta data found". `.owned` (Bug 432) is the
+	// sweeper's ownership marker — must be removed AFTER the
+	// kernel slot is gone so a concurrent sweeper tick sees a
+	// clean post-state (kernel + marker both absent).
+	for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", adjustFailedSuffix} {
+		err := os.Remove(filepath.Join(r.cfg.StateDir, name+suffix))
+		if err != nil && !os.IsNotExist(err) {
+			return errors.WithStack(err)
+		}
+	}
+
+	return r.forgetGIHistory(name)
 }
 
 // forgetPool drops the resource from the resource→pool map so a
@@ -1560,7 +1576,7 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 // volume. This is the satellite's response to `linstor r td
 // --diskless` on a previously-diskful replica (Bug 330).
 //
-// Probe order matters: IsLoaded → HasDisklessVolume. A slot that
+// Probe order matters: IsLoaded → HasAttachedDisk. A slot that
 // isn't loaded at all (never brought up, or torn down by an earlier
 // DeleteResource) has nothing to detach; a slot already reporting
 // disk:Diskless has converged to the target state and re-issuing
@@ -1595,13 +1611,14 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 		return nil //nolint:nilerr // probe failure is "no-op" by design
 	}
 
-	disklessVol, err := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
-	if err == nil && disklessVol {
+	attached, err := r.cfg.Adm.HasAttachedDisk(ctx, dr.GetName())
+	if err == nil && !attached {
 		// Kernel has already converged to Diskless (operator-driven
-		// detach, prior reconcile pass, or a peer-driven event). No
-		// further work — re-issuing detach is harmless but the
-		// shell-out cost adds up on every reconcile of a steady-
-		// state diskless replica.
+		// detach, prior reconcile pass, or a peer-driven event), or
+		// shows no local volume at all, as a TieBreaker's slot did
+		// after its kernel resource was taken down by hand. drbdadm
+		// refuses a detach on a resource configured without a disk,
+		// and that refusal failed the apply of a diskless witness.
 		return nil
 	}
 
@@ -4756,7 +4773,7 @@ func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredRes
 // (Stage 2), createMetadata (Stage 3a), and adjustResource (Stage
 // 3b) shadows.
 func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredResource) error {
-	err := r.cfg.Adm.Up(ctx, dr.GetName())
+	err := r.upRecorded(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "drbdadm up %s", dr.GetName())
 	}
@@ -4961,8 +4978,18 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	skipNet := r.shouldSkipNetOnAdjust(ctx, dr.GetName())
+	skipNet := r.shouldSkipNetOnAdjust(ctx, dr.GetName()) && !r.adjustFailedBefore(dr.GetName())
 
+	err := r.adjustAndRecover(ctx, dr, skipDisk, skipNet)
+	r.recordAdjustOutcome(ctx, dr.GetName(), skipNet, err)
+
+	return err
+}
+
+// adjustAndRecover runs the adjust runAdjust chose, and the recoveries
+// from the two kernel races it knows (Bug 287, the tiebreaker-relocate
+// bitmap wedge).
+func (r *Reconciler) adjustAndRecover(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
 	err := r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
 	if err == nil {
 		// Talos / minimal-distro fix: same rationale as bringUpResource.
@@ -4984,7 +5011,7 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 	// metadata; surface its error directly so the reconciler retry
 	// loop can re-converge if up also fails.
 	if isUnknownResourceErr(err) {
-		upErr := r.cfg.Adm.Up(ctx, dr.GetName())
+		upErr := r.upRecorded(ctx, dr.GetName())
 		if upErr != nil {
 			return errors.Wrapf(upErr, "drbdadm up %s (after adjust 158 fallback)", dr.GetName())
 		}
@@ -5040,7 +5067,7 @@ func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.
 		return errors.Wrapf(err, "drbdadm down %s (recovery from bitmap-bothdisks)", dr.GetName())
 	}
 
-	err = r.cfg.Adm.Up(ctx, dr.GetName())
+	err = r.upRecorded(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "drbdadm up %s (recovery from bitmap-bothdisks)", dr.GetName())
 	}
@@ -5426,6 +5453,18 @@ func refuseUnresolvedSkipInitialSync(dr *intent.DesiredResource, freshActivation
 	}
 
 	return nil
+}
+
+// WaitsForController reports whether an apply result's message is one
+// of the gates above holding the apply until the controller stamps the
+// replica: its DRBD node-id, or the SkipInitialSync decision. A fresh
+// replica routinely meets them, since the satellite sees the Resource
+// before the controller's pass that stamps it is through, and the
+// stamp is an update of the Resource that runs the apply again. The
+// caller treats such a result as a wait, not as a failed apply.
+func WaitsForController(message string) bool {
+	return strings.Contains(message, errUnresolvedLocalNodeID.Error()) ||
+		strings.Contains(message, errUnresolvedSkipInitialSync.Error())
 }
 
 // gateBringUpReadiness refuses (requeues) the DRBD apply while a

@@ -62,6 +62,18 @@ drbdadm connect <definition>
 
 The victim resyncs from the survivor. While the slot is `StandAlone` the satellite still adjusts it, but with `--skip-net`, so it leaves the connection to you. The victim's independent writes are lost, so if you are not sure which side is right, stop and copy the data off first.
 
+## StandAlone after a failed apply
+
+A replica whose `drbdadm adjust` or `drbdadm up` failed half way is also left `StandAlone`, with nothing to do with a split: the satellite created its connections but never connected them. The usual cause is a port another DRBD resource on the node still holds, a leftover of a deleted definition for example. The failure is a Warning Event on the Resource, under the Resource's name as `kubectl get resources` lists it:
+
+```sh
+kubectl get events -A --field-selector involvedObject.name=<resource>,reason=ApplyFailed
+```
+
+The satellite retries the apply with a full `drbdadm adjust`, never with `--skip-net`, first after five seconds and then at doubling intervals up to five minutes, until one goes through. Remove the cause, and the replica connects and resyncs at the next retry, which leaves a Normal `ApplySucceeded` Event on the Resource with the number of failed attempts before it; the `ApplyFailed` Warnings stay listed until they expire, so read them against that Event rather than as a replica still down. The satellite counts the failed attempts in memory, as LINSTOR keeps its retry list, so a retry that goes through after the satellite restarted leaves no `ApplySucceeded` Event; read the replica's state on the Resource then. The satellite does keep, across a restart, the record that the last adjust failed, so the retry after it is a full one too. The full adjust connects every peer, so a `drbdadm disconnect` you make while the retries keep failing is undone by the next one; wait until the apply goes through, or remove the cause first, before you start the split-brain recovery above.
+
+A new replica whose apply waits for the controller to give it its DRBD node id or its initial-sync decision is not a failed apply: it leaves no Event, does not count toward the back-off, and is tried again every five seconds and as soon as the controller writes the Resource.
+
 ## Inconsistent or SyncTarget that never finishes
 
 Look at the disk state of each replica and at the replication state towards the peer that should be the source:
