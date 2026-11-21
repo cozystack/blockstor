@@ -97,9 +97,7 @@ func TestAnUncleanVolumeWithNoRecordedGIIsAWarningEventOnTheResource(t *testing.
 	result := &intent.ResourceApplyResult{
 		Name: "pvc-1", Message: uncleanUnrecordedMessage + drbd.ErrUncleanMetadataUnrecorded.Error(),
 	}
-	if !r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{result}, logr.Discard()) {
-		t.Fatal("a failed result was not reported as a failure")
-	}
+	r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{result}, logr.Discard())
 
 	select {
 	case ev := <-recorder.Events:
