@@ -207,6 +207,18 @@ const warnNodeAlreadyGone = maskWarn | int64(2060)
 // envelope wrapper at the call site.
 const apiCallRcFailSnapshotFinalizerStuck int64 = 998
 
+// apiCallRcFailUnknownError mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_UNKNOWN_ERROR` (`998 | MASK_ERROR`), the code its REST
+// layer gives an error the flux carries without one of its own, as a
+// snapshot take aborted on a timeout or a disconnected satellite does. A
+// snapshot create answers a failed take with it.
+const apiCallRcFailUnknownError int64 = 998
+
+// apiCallRcFailSnapshotNotUpToDate mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_SNAPSHOT_NOT_UPTODATE` (`979 | MASK_ERROR`), the code a
+// snapshot create ends with when a targeted replica is not UpToDate.
+const apiCallRcFailSnapshotNotUpToDate int64 = 979
+
 // apiCallRcFailSnapshotsNotSupported mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_SNAPSHOTS_NOT_SUPPORTED` (`994 | MASK_ERROR`).
 // Emitted by `POST /v1/resource-definitions/{rd}/snapshots` (G5) when

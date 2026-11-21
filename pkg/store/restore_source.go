@@ -95,7 +95,7 @@ func DeleteSnapshot(ctx context.Context, st Store, srcRD, snapName string) error
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotDeleteBudget)
 	defer cancel()
 
-	snap, err := uncachedSnapshot(ctx, st, srcRD, snapName)
+	snap, err := UncachedSnapshot(ctx, st, srcRD, snapName)
 	if err != nil {
 		return err
 	}
