@@ -231,6 +231,7 @@ var errBusyTool = errors.New("exit status 1")
 // busyExec runs a satellite's tools against busyCPU. A drbdmeta run on
 // a zvol opens it read-write, and udev answers the close with a change
 // uevent for it, which reaches the satellite's discovery loop.
+// drbdsetup get-gi asks the kernel and opens nothing.
 type busyExec struct {
 	cpu     *busyCPU
 	uevents chan uevent.Event
@@ -249,6 +250,10 @@ func (e *busyExec) Run(ctx context.Context, name string, args ...string) ([]byte
 		}
 	case "drbdmeta":
 		return e.drbdmeta(args)
+	case "drbdsetup":
+		if slices.Contains(args, "get-gi") {
+			return []byte(busyGI + "\n"), nil
+		}
 	}
 
 	return nil, nil
@@ -272,13 +277,16 @@ func (e *busyExec) drbdmeta(args []string) ([]byte, error) {
 
 	switch {
 	case slices.Contains(args, "get-gi"):
-		return []byte("9F1D3C5A7E2B4D60:0000000000000000:0000000000000000:0000000000000000\n"), nil
+		return []byte(busyGI + "\n"), nil
 	case slices.Contains(args, "dump-md"):
 		return nil, errBusyTool
 	}
 
 	return nil, nil
 }
+
+// busyGI is the GI tuple every replica of the benchmark reports.
+const busyGI = "9F1D3C5A7E2B4D60:0000000000000000:0000000000000000:0000000000000000"
 
 // busyUevents is the uevent listener of one node.
 type busyUevents struct{ ch chan uevent.Event }
