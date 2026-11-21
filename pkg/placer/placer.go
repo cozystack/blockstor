@@ -200,7 +200,9 @@ type Placement struct {
 // waits for the resources the call created and not for the ones the
 // definition already had.
 func (p *Placer) PlaceDeployed(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (Placement, error) {
-	return p.place(ctx, rdName, filter, nil)
+	var created []string
+
+	return p.place(ctx, rdName, filter, &created)
 }
 
 // PlaceCreating is Place that also names the nodes it created a replica
@@ -216,10 +218,9 @@ func (p *Placer) PlaceCreating(ctx context.Context, rdName string, filter *apiv1
 	return created, res.Placed, res.Want, err
 }
 
-// place runs one placement. created, when not nil, receives the nodes
-// the call created a replica on, which is narrower than
-// Placement.Deployed: a witness promoted in place is deployed to but
-// not created.
+// place runs one placement. created receives the nodes the call
+// created a replica on, which is narrower than Placement.Deployed: a
+// witness promoted in place is deployed to but not created.
 func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, created *[]string) (Placement, error) {
 	defer lockDefinition(rdName)()
 
@@ -236,7 +237,7 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	}
 
 	defer func() {
-		if created != nil && plan.state != nil {
+		if plan.state != nil {
 			*created = plan.state.created
 		}
 	}()
