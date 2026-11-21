@@ -29,8 +29,8 @@ import (
 // finished, a full resync from the other is half way. drbdsetup prints
 // `done` on the peer-device frame of the running resync only
 // (drbdsetup_events2.c print_peer_device_statistics, from rs_total,
-// drbd_nl.c), and the kernel re-broadcasts that frame every few
-// seconds while it runs (RS_PROGRESS, drbd_actlog.c).
+// drbd_nl.c), and the kernel re-broadcasts that frame at most every
+// 3 s while the resync clears bits (RS_PROGRESS, drbd_actlog.c).
 //
 // The progress must stay with its peer. The volume-wide OutOfSyncKib
 // is whichever peer's frame came last, which is how `r l --faulty`
@@ -173,5 +173,90 @@ func TestObserverKeepsReplicationPerVolume(t *testing.T) {
 
 	if repl, done := volumeOf(0); repl != "Established" || done != "" {
 		t.Errorf("volume 0 after a frame without peer-disk = (%q, %q), want (Established, none)", repl, done)
+	}
+}
+
+// TestObserverFollowsAResyncThatMovesToAnotherPeer replays the frames
+// a replica's node sees when its resync starts from one peer and DRBD
+// moves it to another in the same state change: the first peer goes
+// to PausedSyncT, the second to SyncTarget, both at done 0.00. The
+// paused peer must not be left reading SyncTarget, and the running
+// one keeps the figure of its last frame until the next one: DRBD
+// sends progress only when bits are cleared and at most every 3 s,
+// so a resync that stalls before its first report keeps 0.00, which
+// is also what LINSTOR shows (DrbdVolume.update).
+func TestObserverFollowsAResyncThatMovesToAnotherPeer(t *testing.T) {
+	t.Parallel()
+
+	o := &ObserverRunnable{}
+
+	feed := func(line string) {
+		t.Helper()
+
+		ev, err := drbd.ParseEvent(line)
+		if err != nil {
+			t.Fatalf("ParseEvent(%q): %v", line, err)
+		}
+
+		obs, ok := translatePeerDeviceEvent(ev)
+		if !ok {
+			t.Fatalf("translatePeerDeviceEvent rejected %q", line)
+		}
+
+		o.mergeConnections(&obs)
+	}
+
+	stateOf := func(peer string) (string, string) {
+		t.Helper()
+
+		snap := o.snapshotFor("pvc-x")
+		for _, c := range buildObserverConnectionStatus(&snap) {
+			if c.PeerNodeName != peer {
+				continue
+			}
+
+			for _, pv := range c.PeerVolumes {
+				if pv.VolumeNumber == 0 {
+					return pv.ReplicationState, pv.Done
+				}
+			}
+		}
+
+		t.Fatalf("no volume 0 entry for peer %s in %+v", peer, snap.Connections)
+
+		return "", ""
+	}
+
+	feed("change peer-device name:pvc-x peer-node-id:0 conn-name:node-a volume:0 " +
+		"replication:SyncTarget peer-disk:UpToDate peer-client:no resync-suspended:no " +
+		"done:0.00 received:0 sent:0 out-of-sync:172032 pending:0 unacked:0")
+	feed("change peer-device name:pvc-x peer-node-id:2 conn-name:node-b volume:0 " +
+		"replication:PausedSyncT peer-disk:UpToDate peer-client:no resync-suspended:peer " +
+		"done:0.00 received:0 sent:0 out-of-sync:107104 pending:0 unacked:0")
+	feed("change peer-device name:pvc-x peer-node-id:0 conn-name:node-a volume:0 " +
+		"replication:PausedSyncT peer-disk:UpToDate peer-client:no resync-suspended:dependency " +
+		"done:0.00 received:0 sent:0 out-of-sync:172032 pending:0 unacked:0")
+	feed("change peer-device name:pvc-x peer-node-id:2 conn-name:node-b volume:0 " +
+		"replication:SyncTarget peer-disk:UpToDate peer-client:no resync-suspended:no " +
+		"done:0.00 received:0 sent:0 out-of-sync:107104 pending:0 unacked:0")
+
+	if repl, done := stateOf("node-a"); repl != "PausedSyncT" || done != "0.00" {
+		t.Errorf("node-a after the switch = (%q, %q), want (PausedSyncT, 0.00)", repl, done)
+	}
+
+	if repl, done := stateOf("node-b"); repl != "SyncTarget" || done != "0.00" {
+		t.Errorf("node-b after the switch = (%q, %q), want (SyncTarget, 0.00)", repl, done)
+	}
+
+	feed("change peer-device name:pvc-x peer-node-id:2 conn-name:node-b volume:0 " +
+		"replication:SyncTarget peer-disk:UpToDate peer-client:no resync-suspended:no " +
+		"done:65.45 received:70144 sent:0 out-of-sync:37284 pending:0 unacked:0")
+
+	if repl, done := stateOf("node-b"); repl != "SyncTarget" || done != "65.45" {
+		t.Errorf("node-b after its progress frame = (%q, %q), want (SyncTarget, 65.45)", repl, done)
+	}
+
+	if repl, _ := stateOf("node-a"); repl != "PausedSyncT" {
+		t.Errorf("node-a after node-b's progress frame = %q, want PausedSyncT", repl)
 	}
 }
