@@ -79,9 +79,9 @@ func (f *ctxDeadlineRecorder) RunWithStdin(
 	return nil, nil
 }
 
-// TestPoolStatusBoundsZpoolList pins Bug 271: PoolStatus must
+// TestPoolStatusBoundsProbes pins Bug 271: PoolStatus must
 // derive a deadline before shelling out to `zfs get` / `zpool get`.
-func TestPoolStatusBoundsZpoolList(t *testing.T) {
+func TestPoolStatusBoundsProbes(t *testing.T) {
 	t.Parallel()
 
 	fx := newCtxDeadlineRecorder()
