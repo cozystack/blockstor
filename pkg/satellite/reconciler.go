@@ -1576,7 +1576,7 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 // volume. This is the satellite's response to `linstor r td
 // --diskless` on a previously-diskful replica (Bug 330).
 //
-// Probe order matters: IsLoaded → HasDisklessVolume. A slot that
+// Probe order matters: IsLoaded → HasAttachedDisk. A slot that
 // isn't loaded at all (never brought up, or torn down by an earlier
 // DeleteResource) has nothing to detach; a slot already reporting
 // disk:Diskless has converged to the target state and re-issuing
@@ -1611,13 +1611,14 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 		return nil //nolint:nilerr // probe failure is "no-op" by design
 	}
 
-	disklessVol, err := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
-	if err == nil && disklessVol {
+	attached, err := r.cfg.Adm.HasAttachedDisk(ctx, dr.GetName())
+	if err == nil && !attached {
 		// Kernel has already converged to Diskless (operator-driven
-		// detach, prior reconcile pass, or a peer-driven event). No
-		// further work — re-issuing detach is harmless but the
-		// shell-out cost adds up on every reconcile of a steady-
-		// state diskless replica.
+		// detach, prior reconcile pass, or a peer-driven event), or
+		// shows no local volume at all, as a TieBreaker's slot did
+		// after its kernel resource was taken down by hand. drbdadm
+		// refuses a detach on a resource configured without a disk,
+		// and that refusal failed the apply of a diskless witness.
 		return nil
 	}
 
