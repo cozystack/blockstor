@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -103,6 +104,13 @@ type observation struct {
 	HasKernelLoaded bool
 	Volumes         []volumeObservation
 	Connections     []connectionObservation
+
+	// Initial marks a frame of the initial state drbdsetup reports
+	// when the stream starts (`exists`), as opposed to a live change.
+	Initial bool
+	// InitialStateDone marks the `exists -` line that ends the
+	// initial state. It carries no resource.
+	InitialStateDone bool
 }
 
 // volumeObservation carries per-volume DiskState + the
@@ -548,10 +556,18 @@ func observationsFrom(in <-chan drbd.Event) <-chan observation {
 		defer close(out)
 
 		for ev := range in {
+			if ev.Kind == drbd.KindInitialStateDone {
+				out <- observation{InitialStateDone: true}
+
+				continue
+			}
+
 			obs, ok := translateEvent(ev)
 			if !ok {
 				continue
 			}
+
+			obs.Initial = ev.Action == eventActionExists
 
 			out <- obs
 		}
@@ -755,7 +771,25 @@ type ObserverRunnable struct {
 	// noise filter if every one woke the reconciler.
 	lifecycleMu    sync.Mutex
 	lifecycleCache map[string]lifecycleSignature
+
+	// replaying is set while the observer reads the initial state of a
+	// fresh events2 stream. Its frames are merged into the caches and
+	// written once per resource when the initial state ends
+	// (flushInitialState), and the resync loop holds off meanwhile.
+	replaying atomic.Bool
+
+	// initialNames lists, in stream order, the resources the initial
+	// state reported, and initialKernel the KernelLoaded value each
+	// resource frame carried. Touched only by the goroutine consuming
+	// the stream.
+	initialNames  []string
+	initialSeen   map[string]struct{}
+	initialKernel map[string]bool
 }
+
+// observerInitialWriters bounds the status writes flushInitialState
+// runs at once.
+const observerInitialWriters = 8
 
 // lifecycleSignature is the compact per-resource fingerprint
 // emitReconcileTrigger compares to the cached value to decide
@@ -854,14 +888,135 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 
 	adm := drbd.NewAdm(o.Exec)
 
+	// Set before the resync loop starts, so it never writes a resource
+	// whose initial frames are only half merged.
+	o.replaying.Store(true)
+
 	go o.resyncLoop(ctx)
 
-	for ev := range observationsFrom(events) {
+	o.consume(ctx, adm, observationsFrom(events))
+
+	return nil
+}
+
+// consume handles the observations of one events2 stream, starting
+// with the initial state drbdsetup reports for every DRBD object the
+// kernel holds.
+//
+// A satellite that starts shows none of its replicas until it has
+// written their status again (ForgetStaleSatelliteState), which LINSTOR
+// matches only for as long as its controller takes to get the node's
+// state back over the new connection: one batch after the full sync.
+// Writing every initial frame as it came took several API round trips
+// and a get-gi per frame, 30 to 40 seconds for a node with ~110
+// replicas, all of them Unknown meanwhile. The initial state is
+// therefore merged first and written once per resource when it ends.
+//
+// A replica the initial state does not report is not written, so it
+// stays hidden, as LINSTOR shows a resource the satellite reports no
+// state for.
+func (o *ObserverRunnable) consume(ctx context.Context, adm *drbd.Adm, in <-chan observation) {
+	o.replaying.Store(true)
+
+	for ev := range in {
 		obs := ev
+
+		// A live frame ends the initial state too, should the marker
+		// ever be missing.
+		if o.replaying.Load() && (obs.InitialStateDone || !obs.Initial) {
+			o.flushInitialState(ctx, adm)
+		}
+
+		if obs.InitialStateDone {
+			continue
+		}
+
 		o.handleObservation(ctx, adm, &obs)
 	}
 
-	return nil
+	if o.replaying.Load() {
+		o.flushInitialState(ctx, adm)
+	}
+}
+
+// holdInitialState records that the initial state reported ev's
+// resource, for flushInitialState to write.
+func (o *ObserverRunnable) holdInitialState(ev *observation) {
+	if ev.ResourceName == "" {
+		return
+	}
+
+	if o.initialSeen == nil {
+		o.initialSeen = map[string]struct{}{}
+		o.initialKernel = map[string]bool{}
+	}
+
+	if _, ok := o.initialSeen[ev.ResourceName]; !ok {
+		o.initialSeen[ev.ResourceName] = struct{}{}
+		o.initialNames = append(o.initialNames, ev.ResourceName)
+	}
+
+	if ev.HasKernelLoaded {
+		o.initialKernel[ev.ResourceName] = ev.KernelLoaded
+	}
+}
+
+// flushInitialState writes the status of every resource the initial
+// state reported, from the merged caches, then their KernelLoaded
+// Conditions, and ends the replay. The status writes go first: they
+// are what shows the node's replicas again.
+func (o *ObserverRunnable) flushInitialState(ctx context.Context, adm *drbd.Adm) {
+	logger := log.FromContext(ctx).WithName("observer")
+	started := time.Now()
+
+	names, kernel := o.initialNames, o.initialKernel
+	o.initialNames, o.initialSeen, o.initialKernel = nil, nil, nil
+
+	o.forEachInitial(names, func(name string) {
+		obs := o.snapshotFor(name)
+		o.backfillCurrentGI(ctx, adm, &obs)
+
+		err := o.writeStatus(ctx, &obs)
+		if err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "write Resource.Status", "resource", name)
+		}
+	})
+
+	o.forEachInitial(names, func(name string) {
+		loaded, ok := kernel[name]
+		if !ok {
+			return
+		}
+
+		err := o.stampKernelLoaded(ctx, name, loaded)
+		if err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "stamp KernelLoaded Condition", "resource", name)
+		}
+	})
+
+	o.replaying.Store(false)
+
+	logger.Info("initial DRBD state written", "resources", len(names), "took", time.Since(started))
+}
+
+// forEachInitial runs write for every name, observerInitialWriters at
+// a time, and waits for all of them.
+func (*ObserverRunnable) forEachInitial(names []string, write func(name string)) {
+	sem := make(chan struct{}, observerInitialWriters)
+
+	var wg sync.WaitGroup
+
+	for _, name := range names {
+		sem <- struct{}{}
+
+		wg.Go(func() {
+			defer func() { <-sem }()
+
+			write(name)
+		})
+	}
+
+	wg.Wait()
 }
 
 // observerResyncInterval is how often the observer re-applies its
@@ -897,6 +1052,12 @@ func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
 // resyncOnce snapshots both caches and re-applies each known
 // resource. Called by resyncLoop and unit-tested directly.
 func (o *ObserverRunnable) resyncOnce(ctx context.Context, logger logr.Logger) {
+	// The initial state is written in one go when it ends; a resync
+	// before that would show resources whose frames are half merged.
+	if o.replaying.Load() {
+		return
+	}
+
 	names := o.cachedResourceNames()
 
 	adm := drbd.NewAdm(o.Exec)
@@ -1122,6 +1283,14 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	// needs the kernel-state change to land in the reconcile queue,
 	// not the corresponding Status PATCH to commit.
 	o.emitReconcileTrigger(ctx, ev)
+
+	// Frames of the initial state are written together once it ends
+	// (consume).
+	if o.replaying.Load() {
+		o.holdInitialState(ev)
+
+		return
+	}
 
 	// Phase 11.3 Stage 3: stamp the KernelLoaded Condition off the
 	// resource-kind frame lifecycle. Gated on HasKernelLoaded so
