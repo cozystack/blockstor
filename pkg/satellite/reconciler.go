@@ -1587,10 +1587,17 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 // detach would be a no-op shell-out but still costs a netlink
 // round-trip on every reconcile pass.
 //
-// Probe errors fall through to a best-effort detach: a transient
-// netlink hiccup shouldn't strand the toggle — the kernel will
-// either accept the detach (state already matches) or surface a
-// real error the caller wraps. The detach itself runs with --force
+// A failed disk probe falls through to a best-effort detach only for
+// a replica toggled from diskful, whose volumes still carry the pool
+// they were reclaimed from: a transient netlink hiccup shouldn't
+// strand the toggle, and the LV must not be reclaimed under a disk
+// that may still be attached. A replica that never had a disk, such
+// as a TieBreaker, has nothing to detach, and drbdadm refuses the
+// detach anyway because its configuration gives no disk. The probe
+// fails that way when the slot goes away between the two probes, as
+// it does while an operator takes the kernel resource down, and the
+// refused detach used to fail the apply with an ApplyFailed Warning.
+// The detach itself runs with --force
 // so the kernel doesn't block on outstanding I/O references when
 // the satellite has already declared the replica diskless at the
 // REST layer.
@@ -1616,6 +1623,10 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 	}
 
 	attached, err := r.cfg.Adm.HasAttachedDisk(ctx, dr.GetName())
+	if err != nil && !hasReclaimableVolume(dr) {
+		return nil
+	}
+
 	if err == nil && !attached {
 		// Kernel has already converged to Diskless (operator-driven
 		// detach, prior reconcile pass, or a peer-driven event), or
@@ -1632,6 +1643,15 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 	}
 
 	return nil
+}
+
+// hasReclaimableVolume reports whether any volume of a diskless
+// replica still names a storage pool, the dispatcher's marker for a
+// replica toggled from diskful (see applyStorageIfDiskful).
+func hasReclaimableVolume(dr *intent.DesiredResource) bool {
+	return slices.ContainsFunc(dr.GetVolumes(), func(vol *intent.DesiredVolume) bool {
+		return vol.GetStoragePool() != ""
+	})
 }
 
 // reclaimVolumesForDiskless iterates the DesiredResource's volumes
