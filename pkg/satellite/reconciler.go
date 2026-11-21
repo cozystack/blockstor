@@ -2068,6 +2068,93 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 	return nil
 }
 
+// tearDownReidentifiedPeers drops the kernel connection to a peer that
+// came back under a new node-id: the kernel still knows the node by its
+// old one, and new-peer for the new one fails with "name already
+// exists" for as long as the old connection is there. tearDownRemovedPeers
+// misses this peer, as the node's name never left the .res, and
+// drbdadm adjust does too: it matches peers by node-id, and the del-peer
+// it schedules for the old one waits on the new-peer that fails.
+//
+// The old connection goes by node-id, as LINSTOR's satellite removes a
+// deleted peer, and its slot is forgotten when the local replica has
+// metadata. A peer the controller has not given a node-id yet is left
+// alone. A kernel that cannot be read leaves the decision to the next
+// pass. The kernel is read only when the .res last rendered does not
+// already name every peer under its node-id, so a steady resource costs
+// no extra call.
+func (r *Reconciler) tearDownReidentifiedPeers(ctx context.Context, dr *intent.DesiredResource, resPath string, devices map[int32]string) error {
+	if !peerIdentitiesChanged(resPath, dr) {
+		return nil
+	}
+
+	slots, err := r.cfg.Adm.Show(ctx, dr.GetName())
+	if err != nil || len(slots) == 0 {
+		return nil //nolint:nilerr // best-effort: an unreadable kernel retries next pass
+	}
+
+	for _, peer := range dr.GetPeers() {
+		if peer.NodeID == nil {
+			continue
+		}
+
+		for name, slot := range slots {
+			if !naming.Same(name, peer.Name) || slot.NodeID == *peer.NodeID {
+				continue
+			}
+
+			err := r.cfg.Adm.DelPeerByNodeID(ctx, dr.GetName(), slot.NodeID)
+			if err != nil {
+				return errors.Wrapf(err, "del-peer %s (node-id %d, now %d) from %s",
+					peer.Name, slot.NodeID, *peer.NodeID, dr.GetName())
+			}
+
+			if anyDevice(devices) {
+				// Non-fatal, as in tearDownRemovedPeers: a stale slot
+				// costs one of the MaxPeers-1 entries until a retry.
+				_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), slot.NodeID)
+			}
+		}
+	}
+
+	return nil
+}
+
+// peerIdentitiesChanged reports a peer the .res at resPath does not
+// name under the node-id the desired state gives it, or a .res that
+// cannot be read.
+func peerIdentitiesChanged(resPath string, dr *intent.DesiredResource) bool {
+	rendered := extractResFilePeerNodeIDs(resPath)
+	if rendered == nil {
+		return true
+	}
+
+	for _, peer := range dr.GetPeers() {
+		if peer.NodeID == nil {
+			continue
+		}
+
+		id, ok := renderedNodeID(rendered, peer.Name)
+		if !ok || id != *peer.NodeID {
+			return true
+		}
+	}
+
+	return false
+}
+
+// renderedNodeID looks a peer up in a parsed .res under any spelling of
+// its name.
+func renderedNodeID(rendered map[string]int32, peer string) (int32, bool) {
+	for name, id := range rendered {
+		if naming.Same(name, peer) {
+			return id, true
+		}
+	}
+
+	return 0, false
+}
+
 // anyDevice reports whether the local replica has a device for at least
 // one volume, so it has metadata a forgotten peer's slot can be cleared in.
 func anyDevice(devices map[int32]string) bool {
@@ -2359,6 +2446,11 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// (force-strip, harness preflight `rm -f *.res *.md-created`,
 	// satellite crash mid-write) have wiped the other state files.
 	err = r.tearDownRemovedPeers(ctx, dr, resPath, devices)
+	if err != nil {
+		return err
+	}
+
+	err = r.tearDownReidentifiedPeers(ctx, dr, resPath, devices)
 	if err != nil {
 		return err
 	}
