@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -116,5 +117,80 @@ func TestSnapshotListAfterDeleteDoesNotShowTheDeletedSnapshot(t *testing.T) {
 			t.Errorf("snapshot %q listed as live after its delete answered; linstor-csi keeps definition %q for it",
 				snaps[i].Name, rdName)
 		}
+	}
+}
+
+// cacheCatchingUpOnSnapshotDelete is a cache that still serves a snapshot
+// the API server has already deleted, until it has been asked for it a few
+// times: the informer delivering the delete a moment after the API server
+// committed it.
+type cacheCatchingUpOnSnapshotDelete struct {
+	store.SnapshotStore
+
+	ghost   apiv1.Snapshot
+	pending *atomic.Int32
+}
+
+func (c cacheCatchingUpOnSnapshotDelete) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
+	if rdName == c.ghost.ResourceName && snapName == c.ghost.Name && c.pending.Add(-1) >= 0 {
+		return c.ghost, nil
+	}
+
+	return c.SnapshotStore.Get(ctx, rdName, snapName) //nolint:wrapcheck // pass-through test double
+}
+
+type cacheCatchingUpOnSnapshotDeleteStore struct {
+	store.Store
+
+	ghost   apiv1.Snapshot
+	pending *atomic.Int32
+}
+
+func (s cacheCatchingUpOnSnapshotDeleteStore) Snapshots() store.SnapshotStore {
+	return cacheCatchingUpOnSnapshotDelete{SnapshotStore: s.Store.Snapshots(), ghost: s.ghost, pending: s.pending}
+}
+
+// A retried snapshot delete that finds the snapshot already gone on the API
+// server answers only once this server's cache has seen it go, as the first
+// delete and the resource delete do. LINSTOR answers every read after the
+// delete from the model the delete changed, so a GET of the snapshot right
+// after the answer is a 404, never the snapshot as it was.
+func TestSnapshotGetAfterRetriedDeleteIsNotFound(t *testing.T) {
+	t.Parallel()
+
+	const (
+		rdName   = "pvc-retried-delete"
+		snapName = "snapshot-retried-delete"
+	)
+
+	backend := store.NewInMemory()
+	if err := backend.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: rdName}); err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	pending := &atomic.Int32{}
+	pending.Store(2)
+
+	ghost := apiv1.Snapshot{
+		Name:         snapName,
+		ResourceName: rdName,
+		Flags:        []string{apiv1.SnapshotFlagSuccessful},
+	}
+
+	base, stop := startServerWithStore(t, cacheCatchingUpOnSnapshotDeleteStore{Store: backend, ghost: ghost, pending: pending})
+	defer stop()
+
+	del := httpDelete(t, base+"/v1/resource-definitions/"+rdName+"/snapshots/"+snapName)
+	_ = del.Body.Close()
+
+	if del.StatusCode != http.StatusOK {
+		t.Fatalf("snapshot delete = %d, want 200", del.StatusCode)
+	}
+
+	resp := httpGet(t, base+"/v1/resource-definitions/"+rdName+"/snapshots/"+snapName)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("get snapshot after its delete answered = %d, want 404", resp.StatusCode)
 	}
 }

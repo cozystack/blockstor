@@ -1271,6 +1271,14 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	err := store.DeleteSnapshot(r.Context(), s.Store, rd, snapName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			// A retry of a delete that timed out lands here once the
+			// finalizer drained. Answer only after the cache has seen the
+			// snapshot go too, as the resource delete does: LINSTOR serves
+			// every read after the answer from the model the delete
+			// changed. Lag is not a stuck satellite, so the outcome of
+			// the wait does not change the answer.
+			_ = s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
+
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 				RetCode: warnSnapshotNotFound,
 				Message: "snapshot already absent: " + snapName,
