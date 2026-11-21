@@ -223,7 +223,14 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snaps, err := s.Store.Snapshots().ListByDefinition(r.Context(), rd)
+	// Past the cache: linstor-csi deletes the definition of a deleted volume
+	// only when this list, read right after a snapshot delete answered, has
+	// no snapshot left that is not being deleted. A delete retried after a
+	// timeout finds the snapshot gone on the API server and answers at once,
+	// and a cache that has not seen the snapshot go hands it back here as
+	// live, so the definition was kept for good. LINSTOR answers the delete
+	// and the list from one model, where the snapshot is gone for both.
+	snaps, err := s.Store.Snapshots().ListByDefinitionUncached(r.Context(), rd)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -1063,6 +1070,14 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	err := store.DeleteSnapshot(r.Context(), s.Store, rd, snapName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			// A retry of a delete that timed out lands here once the
+			// finalizer drained. Answer only after the cache has seen the
+			// snapshot go too, as the resource delete does: LINSTOR serves
+			// every read after the answer from the model the delete
+			// changed. Lag is not a stuck satellite, so the outcome of
+			// the wait does not change the answer.
+			_ = s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
+
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 				RetCode: warnSnapshotNotFound,
 				Message: "snapshot already absent: " + snapName,
