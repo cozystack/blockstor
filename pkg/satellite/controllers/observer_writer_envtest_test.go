@@ -611,7 +611,7 @@ func TestObserverWritesADumpThatNeverEnds(t *testing.T) {
 
 	runObserver(t, o, feed)
 
-	waitFor(t, "the dump written without its end line", func() bool {
+	waitForObserver(t, "the dump written without its end line", func() bool {
 		status := getStatusReplica(t, cli, name)
 
 		return healthyStatus(&status) && status.Connections[0].PeerVolumes[0].PeerDiskState == "Outdated"
@@ -653,7 +653,7 @@ func TestObserverKeepsAReplayedChangeOverALateDumpLine(t *testing.T) {
 
 	runObserver(t, o, feed)
 
-	waitFor(t, "the rest of the dump written", func() bool {
+	waitForObserver(t, "the rest of the dump written", func() bool {
 		status := getStatusReplica(t, cli, name)
 
 		return healthyStatus(&status)
@@ -713,7 +713,7 @@ func TestObserverClearsNothingForADumpTakenAsEnded(t *testing.T) {
 
 	runObserver(t, o, firstEnded, feed)
 
-	waitFor(t, "the first stream's state on the replica", func() bool {
+	waitForObserver(t, "the first stream's state on the replica", func() bool {
 		status := getStatusReplica(t, base, name)
 
 		return healthyStatus(&status)
@@ -723,7 +723,7 @@ func TestObserverClearsNothingForADumpTakenAsEnded(t *testing.T) {
 
 	_ = firstEnded.Close()
 
-	waitFor(t, "the second stream", func() bool { return starts.Load() > 1 })
+	waitForObserver(t, "the second stream", func() bool { return starts.Load() > 1 })
 
 	// Long enough for the new dump to be taken as ended and for a
 	// pass to write whatever that owed.
@@ -734,7 +734,7 @@ func TestObserverClearsNothingForADumpTakenAsEnded(t *testing.T) {
 		t.Fatalf("feed: %v", err)
 	}
 
-	waitFor(t, "a write after the new dump", func() bool { return len(applies.snapshot()) > before })
+	waitForObserver(t, "a write after the new dump", func() bool { return len(applies.snapshot()) > before })
 
 	// Let a pass clearing departed replicas, if any, land.
 	time.Sleep(300 * time.Millisecond)
@@ -795,7 +795,7 @@ func TestObserverWaitsForADumpWhileChangesCome(t *testing.T) {
 
 	runObserver(t, o, firstEnded, feed)
 
-	waitFor(t, "the first stream's state on the replica", func() bool {
+	waitForObserver(t, "the first stream's state on the replica", func() bool {
 		status := getStatusReplica(t, base, name)
 
 		return healthyStatus(&status)
@@ -832,7 +832,7 @@ func TestObserverWaitsForADumpWhileChangesCome(t *testing.T) {
 		t.Fatalf("feed: %v", err)
 	}
 
-	waitFor(t, "a write after the new dump", func() bool { return len(applies.snapshot()) > before })
+	waitForObserver(t, "a write after the new dump", func() bool { return len(applies.snapshot()) > before })
 
 	for _, sent := range applies.snapshot()[before:] {
 		if !healthyStatus(&sent) {
@@ -877,7 +877,7 @@ func TestObserverClearsAResourceALateDumpLeftOut(t *testing.T) {
 
 	runObserver(t, o, feed)
 
-	waitFor(t, "the departed resource cleared", func() bool {
+	waitForObserver(t, "the departed resource cleared", func() bool {
 		status := getStatusReplica(t, cli, name)
 
 		return starts.Load() > 1 && len(status.Connections) == 0 &&
