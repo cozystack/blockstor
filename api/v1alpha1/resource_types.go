@@ -393,6 +393,12 @@ type ResourceStatus struct {
 	// +optional
 	Connections []ResourceConnectionStatus `json:"connections,omitempty"`
 
+	// satelliteIncarnation is the node's status.satelliteIncarnation of
+	// the satellite process that wrote the runtime state above. Written
+	// by the satellite observer with that state; do not hand-set.
+	// +optional
+	SatelliteIncarnation string `json:"satelliteIncarnation,omitempty"`
+
 	// conditions represent the current state of the Resource.
 	// +listType=map
 	// +listMapKey=type

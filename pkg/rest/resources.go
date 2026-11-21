@@ -47,6 +47,8 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.forgetStaleReplicas(r.Context(), resList)
+
 	// Optional filters. Two wire dialects in the wild:
 	//   - golinstor (csi side): comma-joined `?nodes=a,b`
 	//   - python-linstor CLI:   repeat-key `?nodes=a&nodes=b` (via

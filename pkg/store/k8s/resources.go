@@ -694,7 +694,8 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 			DrbdState:         crd.Status.DrbdState,
 			ToggleDiskRetries: crd.Status.ToggleDiskRetries,
 		},
-		ToggleDiskCancel: crd.Spec.ToggleDiskCancel,
+		ToggleDiskCancel:     crd.Spec.ToggleDiskCancel,
+		SatelliteIncarnation: crd.Status.SatelliteIncarnation,
 		Volumes: volumesWithReplicationStates(
 			volumesFromStatus(crd.Status.Volumes),
 			crd.Status.Connections,

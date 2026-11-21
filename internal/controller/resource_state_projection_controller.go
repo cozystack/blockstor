@@ -78,12 +78,11 @@ const ResourceStateProjectionFieldOwner = "blockstor-controller-resource-project
 //     satellite's next observer write to re-claim DrbdState with
 //     fresh evidence.
 //
-// Wire shape: the REST `linstor r l` view reads `state.drbd_state`
-// directly from CRD Status; the Python CLI's `r l` State column
-// reads `volumes[].state.disk_state`. With this projection in place
-// the two columns diverge by design while a satellite is OFFLINE:
-// `state.drbd_state` shows Unknown (we can't prove anything), the
-// per-volume column shows the last observed disk state.
+// Wire shape: this projection marks the stored object only. The REST
+// view and the CLI do not read it to decide what a replica on an
+// OFFLINE node shows; they answer such a replica with no satellite
+// state at all, the way LINSTOR does (pkg/api/v1/offline.go), so
+// `linstor r l` reads it Unknown and `--faulty` lists it.
 type ResourceStateProjectionReconciler struct {
 	client.Client
 }
@@ -215,12 +214,8 @@ func (r *ResourceStateProjectionReconciler) releaseClaim(ctx context.Context, re
 }
 
 // drbdStateUnknown is the resource-level state surfaced when the
-// satellite is OFFLINE — operators read this on `linstor r l`'s
-// State column when the per-volume disk_state is unavailable. The
-// canonical spelling matches upstream LINSTOR's `DrbdConnState
-// UNKNOWN`; the REST view echoes Status.DrbdState verbatim so the
-// wire payload's `state.drbd_state` field carries this exact
-// string.
+// satellite is OFFLINE, on the stored object. The canonical spelling
+// matches upstream LINSTOR's `DrbdConnState UNKNOWN`.
 const drbdStateUnknown = "Unknown"
 
 // resourceProjectionResourceKind mirrors the Resource CRD's Kind
