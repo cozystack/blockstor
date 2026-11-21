@@ -37,7 +37,7 @@ func TestAFormatRefusedOverDataIsAWarningEventOnTheResource(t *testing.T) {
 			recorder := events.NewFakeRecorder(4)
 			r := &ResourceReconciler{Config: Config{Recorder: recorder}}
 
-			failed := r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{{Name: "pvc-1", Ok: false, Message: tc.message}}, logr.Discard())
+			failed, _ := r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{{Name: "pvc-1", Ok: false, Message: tc.message}}, logr.Discard())
 			if !failed {
 				t.Fatal("a failed result was not reported as a failure")
 			}

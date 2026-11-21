@@ -52,6 +52,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/satellite"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -517,20 +518,12 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
-	anyFailed := r.recordPerResourceFailures(res, results, logger)
+	anyFailed, waiting := r.recordPerResourceFailures(res, results, logger)
 
 	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
-	// Apply chain surfaces per-resource errors via results (e.g.
-	// drbdadm adjust failing on a stale .res rendered before the
-	// peer's Status caught up). Returning nil here would let c-r
-	// stop until an external event drove another reconcile;
-	// RequeueAfter ensures the next attempt sees the freshly-
-	// committed peer state. A failure that persists, a DRBD port
-	// another resource holds say, is retried with back-off rather
-	// than every applyFailureRequeue.
-	if anyFailed {
-		return ctrl.Result{RequeueAfter: r.retries.next(res.Name)}, nil
+	if requeue := r.retryAfterApply(res.Name, anyFailed, waiting); requeue > 0 {
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	r.recordRecovery(res, r.retries.reset(res.Name), logger)
@@ -551,6 +544,32 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// retryAfterApply is how soon a pass whose apply did not go through
+// runs again, and zero after one that did.
+//
+// Apply chain surfaces per-resource errors via results (e.g. drbdadm
+// adjust failing on a stale .res rendered before the peer's Status
+// caught up). Returning nil here would let c-r stop until an external
+// event drove another reconcile; RequeueAfter ensures the next attempt
+// sees the freshly-committed peer state. A failure that persists, a
+// DRBD port another resource holds say, is retried with back-off rather
+// than every applyFailureRequeue.
+//
+// An apply held until the controller stamps the replica is a wait like
+// the allocation waits ahead of it: retried on the short timer and on
+// the update the stamp makes, and kept out of the back-off and of the
+// failures a recovery reports.
+func (r *ResourceReconciler) retryAfterApply(name string, anyFailed, waiting bool) time.Duration {
+	switch {
+	case waiting:
+		return applyFailureRequeue
+	case anyFailed:
+		return r.retries.next(name)
+	default:
+		return 0
+	}
 }
 
 // prepareDRBDApply runs the DRBD-only pre-apply sequence: stale
@@ -601,17 +620,21 @@ func (r *ResourceReconciler) prepareDRBDApply(
 }
 
 // recordPerResourceFailures logs each per-resource Apply failure and
-// returns whether any of the results came back not-Ok. Extracted from
-// runApply so the orchestration stays under the funlen budget.
+// returns whether any of the results came back not-Ok, and whether
+// every one of those is only waiting for the controller to stamp the
+// replica (satellite.WaitsForController). Extracted from runApply so
+// the orchestration stays under the funlen budget.
 //
 // Each failure also gets a Warning Event on the Resource, under the
 // reason of the LUKS refusal it carries when it carries one: an Info
 // line in this log is not where an operator looks for why a replica
-// does not come up.
+// does not come up. A wait gets neither the Event nor the failure
+// line: it is part of every fresh replica's bring-up, and a Warning
+// for it reads as a fault that is not there.
 func (r *ResourceReconciler) recordPerResourceFailures(
 	res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult, logger logr.Logger,
-) bool {
-	var anyFailed bool
+) (bool, bool) {
+	var anyFailed, anyFault bool
 
 	for _, result := range results {
 		if result.GetOk() {
@@ -619,6 +642,15 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 		}
 
 		anyFailed = true
+
+		if satellite.WaitsForController(result.GetMessage()) {
+			logger.Info("waiting for the controller to stamp the replica", "name", result.GetName(),
+				"message", result.GetMessage())
+
+			continue
+		}
+
+		anyFault = true
 
 		logger.Info("Apply per-resource failure", "name", result.GetName(), "message", result.GetMessage())
 
@@ -630,7 +662,7 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 		r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, reason, "Apply", "%s", note)
 	}
 
-	return anyFailed
+	return anyFailed, anyFailed && !anyFault
 }
 
 // deviceHoldsDataReason is the Event reason for a LUKS format refused over

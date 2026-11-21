@@ -5454,6 +5454,18 @@ func refuseUnresolvedSkipInitialSync(dr *intent.DesiredResource, freshActivation
 	return nil
 }
 
+// WaitsForController reports whether an apply result's message is one
+// of the gates above holding the apply until the controller stamps the
+// replica: its DRBD node-id, or the SkipInitialSync decision. A fresh
+// replica routinely meets them, since the satellite sees the Resource
+// before the controller's pass that stamps it is through, and the
+// stamp is an update of the Resource that runs the apply again. The
+// caller treats such a result as a wait, not as a failed apply.
+func WaitsForController(message string) bool {
+	return strings.Contains(message, errUnresolvedLocalNodeID.Error()) ||
+		strings.Contains(message, errUnresolvedSkipInitialSync.Error())
+}
+
 // gateBringUpReadiness refuses (requeues) the DRBD apply while a
 // controller-allocated per-replica Spec field the satellite depends on
 // is still unstamped. Extracted out of applyDRBD so the orchestrator
