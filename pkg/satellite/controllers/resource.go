@@ -739,11 +739,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// committed peer state. A failure that persists, a DRBD port
 	// another resource holds say, is retried with back-off rather
 	// than every applyFailureRequeue.
-	if requeue := retryAfter(results, anyFailed); requeue > 0 {
-		if requeue == applyFailureRequeue && anyFailed && !growPending(results) {
-			requeue = r.retries.next(res.Name)
-		}
-
+	if requeue := r.applyRetryAfter(res.Name, results, anyFailed); requeue > 0 {
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
@@ -1064,6 +1060,20 @@ func retryAfter(results []*intent.ResourceApplyResult, anyFailed bool) time.Dura
 	default:
 		return 0
 	}
+}
+
+// applyRetryAfter is retryAfter with the back-off of a failing apply:
+// a failure on the short timer, other than a pending grow, waits as
+// long as applyBackoff says for this replica instead. A pending grow
+// keeps the short timer, since the resize answer waits on it, and a
+// refused create-md keeps its own long one.
+func (r *ResourceReconciler) applyRetryAfter(name string, results []*intent.ResourceApplyResult, anyFailed bool) time.Duration {
+	requeue := retryAfter(results, anyFailed)
+	if requeue == applyFailureRequeue && anyFailed && !growPending(results) {
+		return r.retries.next(name)
+	}
+
+	return requeue
 }
 
 // failureRequeue picks the retry interval of an apply that failed.
