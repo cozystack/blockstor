@@ -310,27 +310,34 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(
 			continue
 		}
 
-		filter := rg.SelectFilter
-		if filter.PlaceCount == 0 {
-			filter.PlaceCount = 1
-		}
-
-		var perr error
-		if gate != nil {
-			perr = gate.place(ctx, p, rg, rds[i].Name, &filter)
-		} else {
-			_, _, perr = p.Place(ctx, rds[i].Name, &filter)
-		}
-
-		if perr != nil {
-			log.Error(perr, "placer call failed during RG rebalance",
-				"rg", rg.Name, "rd", rds[i].Name)
-		}
+		placeChild(ctx, gate, p, rg, rds[i].Name)
 
 		processed++
 	}
 
 	return processed, nil
+}
+
+// placeChild runs the placer on one child definition of rg, through
+// the gate when the pass has one, and logs a failure: one definition
+// that cannot be placed does not stop the pass.
+func placeChild(ctx context.Context, gate *balanceGate, p *placer.Placer, rg *apiv1.ResourceGroup, rdName string) {
+	filter := rg.SelectFilter
+	if filter.PlaceCount == 0 {
+		filter.PlaceCount = 1
+	}
+
+	var err error
+	if gate != nil {
+		err = gate.place(ctx, p, rg, rdName, &filter)
+	} else {
+		_, _, err = p.Place(ctx, rdName, &filter)
+	}
+
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "placer call failed during RG rebalance",
+			"rg", rg.Name, "rd", rdName)
+	}
 }
 
 // skipRD reports whether the pass leaves rd alone. Without a gate
