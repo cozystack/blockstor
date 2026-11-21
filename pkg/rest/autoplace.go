@@ -121,7 +121,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.forgetOfflineReplicas(r.Context(), resList)
+	s.forgetStaleReplicas(r.Context(), resList)
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {

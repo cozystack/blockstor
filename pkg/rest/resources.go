@@ -45,7 +45,7 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.forgetOfflineReplicas(r.Context(), resList)
+	s.forgetStaleReplicas(r.Context(), resList)
 
 	// Optional filters. Two wire dialects in the wild:
 	//   - golinstor (csi side): comma-joined `?nodes=a,b`

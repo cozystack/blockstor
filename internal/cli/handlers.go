@@ -245,11 +245,13 @@ func listing[T any](
 }
 
 // fetchResources lists the replicas the way the controller answers
-// them: a replica on an OFFLINE node carries no satellite state
-// (apiv1.ForgetSatelliteState), so `r l` reads it Unknown and `v l`
-// shows no disk state, as they do against LINSTOR. The store keeps the
-// dead satellite's last report, UpToDate and connected, and showing it
-// hid every replica of a node that was down.
+// them: a replica whose state the satellite now running on its node
+// did not report, on an OFFLINE node or not yet brought back up after
+// a restart, carries no satellite state (apiv1.ForgetStaleSatelliteState),
+// so `r l` reads it Unknown and `v l` shows no disk state, as they do
+// against LINSTOR. The store keeps the dead satellite's last report,
+// UpToDate and connected, and showing it hid every replica of a node
+// that was down.
 //
 // A failed node list fails the command, where the REST reads fall back
 // to the stored state. The REST reads serve linstor-csi, whose volume
@@ -267,7 +269,7 @@ func fetchResources(ctx context.Context, st store.Store) ([]apiv1.Resource, erro
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
 
-	apiv1.ForgetStateOnOfflineNodes(resources, nodes)
+	apiv1.ForgetStaleSatelliteState(resources, nodes)
 
 	return resources, nil
 }

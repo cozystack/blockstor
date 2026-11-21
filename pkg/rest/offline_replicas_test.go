@@ -188,3 +188,46 @@ func TestOfflineNodeVolumesCarryNoSatelliteState(t *testing.T) {
 		t.Errorf("volume 0 of the ONLINE node's replica = %q, want UpToDate", onlineOne.State.DiskState)
 	}
 }
+
+// A node back ONLINE after a reboot runs a new satellite, which has
+// not reported the replica yet: the stored state is the one from before
+// the crash, and the reads answer it with no state, as LINSTOR does
+// until the reconnected satellite reports it.
+func TestReplicaNotReportedSinceRestartCarriesNoSatelliteState(t *testing.T) {
+	backend := seedOfflinePeer(t)
+	ctx := t.Context()
+
+	node, err := backend.Nodes().Get(ctx, "n2")
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	node.ConnectionStatus = apiv1.NodeTypeOnline
+	node.SatelliteIncarnation = "inc-2"
+
+	if err := backend.Nodes().Update(ctx, &node); err != nil {
+		t.Fatalf("bring node back: %v", err)
+	}
+
+	stale, err := backend.Resources().Get(ctx, "pvc-x", "n2")
+	if err != nil {
+		t.Fatalf("get replica: %v", err)
+	}
+
+	stale.SatelliteIncarnation = "inc-1"
+
+	if err := backend.Resources().Update(ctx, &stale); err != nil {
+		t.Fatalf("stamp the old incarnation: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, backend)
+	defer stop()
+
+	got := decodeReplicas(t, base+"/v1/view/resources")
+
+	before := got["n2"]
+	assertNoSatelliteState(t, "replica reported before the restart", &before)
+
+	online := got["n1"]
+	assertSatelliteState(t, "replica on the other node", &online)
+}

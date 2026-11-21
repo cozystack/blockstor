@@ -131,6 +131,126 @@ func TestGroupAOfflineNodeReplicasReadUnknown(t *testing.T) {
 	}
 }
 
+// TestGroupARestartedSatelliteReplicasReadUnknown: a node back ONLINE
+// after a reboot runs a new satellite, which brings its replicas up one
+// by one. Until it reports a replica the store holds the report from
+// before the crash, a connected UpToDate Secondary. LINSTOR shows state
+// only from the satellite it is connected to now, so linstor-client
+// reads that replica Unknown and `r l --faulty` lists it, until the new
+// satellite reports it.
+func TestGroupARestartedSatelliteReplicasReadUnknown(t *testing.T) {
+	stack := harness.StartStack(t)
+	harness.SeedThreeNodeCluster(t, stack)
+
+	ctx := context.Background()
+
+	const rdName = "rd-restarted"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec:       blockstoriov1alpha1.ResourceDefinitionSpec{ResourceGroupName: harness.FixtureDefaultRG},
+	}
+
+	err := stack.Env.Client.Create(ctx, rd)
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	cli := &harness.CLI{URL: stack.RestURL}
+	cli.Run(t, "volume-definition", "create", rdName, "10M")
+
+	peers := map[string]string{harness.NodeWorker1: harness.NodeWorker2, harness.NodeWorker2: harness.NodeWorker1}
+	for node := range peers {
+		res := &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: rdName + "." + node},
+			Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: rdName, NodeName: node},
+		}
+
+		err = stack.Env.Client.Create(ctx, res)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("seed Resource on %s: %v", node, err)
+		}
+	}
+
+	for node, peer := range peers {
+		reportHealthySecondary(t, stack, rdName+"."+node, peer)
+	}
+
+	// worker-1's satellite before the reboot reported its replica;
+	// the one running there now has not yet.
+	stampReplicaIncarnation(t, stack, rdName+"."+harness.NodeWorker1, "inc-1")
+	stampNodeIncarnation(t, stack, harness.NodeWorker1, "inc-2")
+
+	waitForNodeConnectionStatus(t, stack, harness.NodeWorker1, blockstoriov1alpha1.NodeConnectionStatusOnline)
+
+	table := faultyTable(t, stack, rdName)
+	if !strings.Contains(faultyRow(table, harness.NodeWorker1), "Unknown") {
+		t.Errorf("`r l --faulty` does not list the replica the restarted satellite has not reported as Unknown:\n%s", table)
+	}
+
+	if strings.Contains(table, harness.NodeWorker2) {
+		t.Errorf("`r l --faulty` lists the healthy replica on the other node:\n%s", table)
+	}
+
+	// The new satellite reports the replica: its state reads again.
+	stampReplicaIncarnation(t, stack, rdName+"."+harness.NodeWorker1, "inc-2")
+
+	table = faultyTable(t, stack, rdName)
+	if strings.Contains(table, harness.NodeWorker1) {
+		t.Errorf("`r l --faulty` still lists the replica the restarted satellite has reported:\n%s", table)
+	}
+}
+
+func faultyRow(table, node string) string {
+	row := ""
+
+	for line := range strings.SplitSeq(table, "\n") {
+		if strings.Contains(line, node) {
+			row = line
+		}
+	}
+
+	return row
+}
+
+// stampReplicaIncarnation marks the replica's status as reported by
+// the satellite process named incarnation.
+func stampReplicaIncarnation(t *testing.T, stack *harness.Stack, name, incarnation string) {
+	t.Helper()
+
+	harness.Eventually(t, 10*time.Second, func() bool {
+		var res blockstoriov1alpha1.Resource
+
+		err := stack.Env.Client.Get(context.Background(), types.NamespacedName{Name: name}, &res)
+		if err != nil {
+			return false
+		}
+
+		res.Status.SatelliteIncarnation = incarnation
+
+		return stack.Env.Client.Status().Update(context.Background(), &res) == nil
+	}, "stamp "+name+" with "+incarnation)
+}
+
+// stampNodeIncarnation names the satellite process running on node, as
+// the satellite heartbeat does.
+func stampNodeIncarnation(t *testing.T, stack *harness.Stack, node, incarnation string) {
+	t.Helper()
+
+	harness.Eventually(t, 10*time.Second, func() bool {
+		var n blockstoriov1alpha1.Node
+
+		err := stack.Env.Client.Get(context.Background(), types.NamespacedName{Name: node}, &n)
+		if err != nil {
+			return false
+		}
+
+		n.Status.SatelliteIncarnation = incarnation
+
+		return stack.Env.Client.Status().Update(context.Background(), &n) == nil
+	}, "stamp node "+node+" with "+incarnation)
+}
+
 // reportHealthySecondary writes the status a satellite reports for a
 // connected UpToDate Secondary, retrying over the mock's own writes.
 func reportHealthySecondary(t *testing.T, stack *harness.Stack, name, peer string) {

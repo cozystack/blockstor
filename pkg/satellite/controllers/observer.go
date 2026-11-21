@@ -667,6 +667,8 @@ func newObserverRunnableFromConfig(cli client.Client, cfg *Config) *ObserverRunn
 		Exec:     cfg.Exec,
 		NodeName: cfg.NodeName,
 		RecordGI: cfg.Apply.RecordObservedGI,
+		// Stamped on every status write, next to the state it reports.
+		Incarnation: cfg.Incarnation,
 		// Phase 11.7: producer end of the observer-trigger channel.
 		// Fires on kernel-state changes (resource lifecycle, role,
 		// disk, conn, repl) so the ResourceReconciler wakes even
@@ -699,6 +701,11 @@ type ObserverRunnable struct {
 	// with in the satellite's own record, which outlives the status
 	// field (satellite.Reconciler.RecordObservedGI). Nil records nothing.
 	RecordGI func(rdName string, vol int32, gi string)
+
+	// Incarnation is this satellite process's Config.Incarnation,
+	// written onto Resource.Status with every state the observer
+	// reports. Empty writes none.
+	Incarnation string
 
 	// connCache holds the latest observed per-peer connection state
 	// keyed by `<resource>/<peer>`. We apply the full snapshot per
@@ -1821,6 +1828,8 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 			Suspended:   normalizeSuspended(ev.Suspended),
 			Volumes:     buildObserverVolumeStatus(ev, storagePool),
 			Connections: buildObserverConnectionStatus(ev),
+
+			SatelliteIncarnation: o.Incarnation,
 		},
 	}
 

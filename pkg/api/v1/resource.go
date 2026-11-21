@@ -56,6 +56,13 @@ type Resource struct {
 	// flips it.
 	ToggleDiskCancel bool `json:"toggle_disk_cancel,omitempty"`
 
+	// SatelliteIncarnation names the satellite process that reported
+	// the runtime state this replica carries (CRD
+	// `Status.SatelliteIncarnation`). Not on the wire: it only lets a
+	// read tell a report from the running satellite from one an earlier
+	// process left behind (ForgetStaleSatelliteState).
+	SatelliteIncarnation string `json:"-"`
+
 	// Volumes is the per-replica volume slice — sourced from
 	// Resource.Status.Volumes which the satellite observer writes.
 	// Upstream LINSTOR's `Resource` carries volumes inline; the

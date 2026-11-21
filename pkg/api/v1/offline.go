@@ -24,26 +24,39 @@ import (
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
-// OfflineNodes returns the keys (naming.Key) of the nodes whose
-// satellite the heartbeat watchdog has marked OFFLINE.
-func OfflineNodes(nodes []Node) map[string]struct{} {
-	out := make(map[string]struct{})
+// liveSatellites maps each node (by naming.Key) to the satellite
+// process whose reports a read may show: none when the heartbeat
+// watchdog has marked the node OFFLINE.
+func liveSatellites(nodes []Node) map[string]liveSatellite {
+	out := make(map[string]liveSatellite, len(nodes))
 
 	for i := range nodes {
-		if nodes[i].ConnectionStatus == NodeTypeOffline {
-			out[naming.Key(nodes[i].Name)] = struct{}{}
+		out[naming.Key(nodes[i].Name)] = liveSatellite{
+			offline:     nodes[i].ConnectionStatus == NodeTypeOffline,
+			incarnation: nodes[i].SatelliteIncarnation,
 		}
 	}
 
 	return out
 }
 
-// OnOfflineNode reports whether the replica lives on one of the nodes
-// OfflineNodes returned.
-func OnOfflineNode(r *Resource, offline map[string]struct{}) bool {
-	_, ok := offline[naming.Key(r.NodeName)]
+type liveSatellite struct {
+	offline     bool
+	incarnation string
+}
 
-	return ok
+// reported tells whether the state stored on the replica comes from
+// the satellite now running on its node.
+//
+// An incarnation missing on either side says nothing: a satellite
+// older than the field does not stamp it, and a replica no satellite
+// has reported to since carries nothing to forget.
+func (l liveSatellite) reported(r *Resource) bool {
+	if l.offline {
+		return false
+	}
+
+	return l.incarnation == "" || r.SatelliteIncarnation == "" || r.SatelliteIncarnation == l.incarnation
 }
 
 // ForgetSatelliteState drops from a replica everything LINSTOR answers
@@ -72,16 +85,23 @@ func ForgetSatelliteState(r *Resource) {
 	r.LayerObject = forgetLayerState(r.LayerObject)
 }
 
-// ForgetStateOnOfflineNodes applies ForgetSatelliteState to every
-// replica on a node that is OFFLINE.
-func ForgetStateOnOfflineNodes(resources []Resource, nodes []Node) {
-	offline := OfflineNodes(nodes)
-	if len(offline) == 0 {
-		return
-	}
+// ForgetStaleSatelliteState applies ForgetSatelliteState to every
+// replica whose stored state the satellite now running on its node did
+// not report: the node is OFFLINE, or the report came from an earlier
+// satellite process.
+//
+// LINSTOR shows a satellite's state only from the connection it holds
+// to it now. Once the node is back ONLINE, a rebooted satellite brings
+// its replicas up one by one, minutes apart on a busy node, and until
+// it reports one the store still holds the report from before the
+// crash. Showing that would read a replica that is not even up yet as
+// UpToDate and connected.
+func ForgetStaleSatelliteState(resources []Resource, nodes []Node) {
+	live := liveSatellites(nodes)
 
 	for i := range resources {
-		if OnOfflineNode(&resources[i], offline) {
+		sat, ok := live[naming.Key(resources[i].NodeName)]
+		if ok && !sat.reported(&resources[i]) {
 			ForgetSatelliteState(&resources[i])
 		}
 	}

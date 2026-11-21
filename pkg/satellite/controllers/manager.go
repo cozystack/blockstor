@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -214,6 +215,10 @@ func ensureWiredDefaults(cfg *Config) {
 	if cfg.ReconcileTrigger == nil {
 		cfg.ReconcileTrigger = make(chan event.GenericEvent, reconcileTriggerBuffer)
 	}
+
+	if cfg.Incarnation == "" {
+		cfg.Incarnation = string(uuid.NewUUID())
+	}
 }
 
 // addBackgroundRunnables wires the per-pod background loops
@@ -227,7 +232,7 @@ func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
 		return errors.Wrap(err, "add ObserverRunnable")
 	}
 
-	err = (&HeartbeatRunnable{Client: mgr.GetClient(), NodeName: cfg.NodeName}).RegisterWithManager(mgr)
+	err = newHeartbeatRunnableFromConfig(mgr.GetClient(), cfg).RegisterWithManager(mgr)
 	if err != nil {
 		return errors.Wrap(err, "register HeartbeatRunnable")
 	}

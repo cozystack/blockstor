@@ -50,7 +50,7 @@ func TestForgetSatelliteStateLeavesSharedDataAlone(t *testing.T) {
 		LayerObject: layer,
 	}
 
-	apiv1.ForgetStateOnOfflineNodes([]apiv1.Resource{rsc}, []apiv1.Node{{Name: "n2", ConnectionStatus: apiv1.NodeTypeOffline}})
+	apiv1.ForgetStaleSatelliteState([]apiv1.Resource{rsc}, []apiv1.Node{{Name: "n2", ConnectionStatus: apiv1.NodeTypeOffline}})
 
 	if vols[0].State.DiskState != "UpToDate" || len(drbd.Connections) != 1 ||
 		drbd.DrbdVolumes[0].DiskState != "UpToDate" || storage.StorageVolumes[0].DiskState != "UpToDate" ||
@@ -59,7 +59,7 @@ func TestForgetSatelliteStateLeavesSharedDataAlone(t *testing.T) {
 	}
 
 	answered := []apiv1.Resource{rsc}
-	apiv1.ForgetStateOnOfflineNodes(answered, []apiv1.Node{{Name: "n2", ConnectionStatus: apiv1.NodeTypeOffline}})
+	apiv1.ForgetStaleSatelliteState(answered, []apiv1.Node{{Name: "n2", ConnectionStatus: apiv1.NodeTypeOffline}})
 
 	got := answered[0]
 	if got.State.InUse != nil || got.State.DrbdState != "" || got.Volumes[0].State.DiskState != "" ||
@@ -74,5 +74,46 @@ func TestForgetSatelliteStateLeavesSharedDataAlone(t *testing.T) {
 		got.LayerObject.Children[0].Storage.StorageVolumes[0].DiskState != "UpToDate" {
 		t.Errorf("layer volumes lost the disk state LINSTOR keeps: drbd %+v, storage %+v",
 			got.LayerObject.Drbd.DrbdVolumes, got.LayerObject.Children[0].Storage.StorageVolumes)
+	}
+}
+
+// Once a rebooted node is ONLINE again, its satellite brings the
+// replicas up one by one; until it reports one, the store still holds
+// what the satellite before the reboot said. LINSTOR shows state only
+// from the satellite it is connected to now, so such a replica reads
+// with no state. A missing incarnation on either side, from a satellite
+// older than the field or a replica nothing has reported to since,
+// proves nothing and leaves the state shown.
+func TestForgetStaleSatelliteStateByIncarnation(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		node, rsc  string
+		wantForget bool
+	}{
+		{"reported before the restart", "inc-2", "inc-1", true},
+		{"reported since the restart", "inc-2", "inc-2", false},
+		{"satellite stamps no incarnation", "", "inc-1", false},
+		{"replica carries no incarnation", "inc-2", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			inUse := false
+			answered := []apiv1.Resource{{
+				Name: "pvc-x", NodeName: "n2", SatelliteIncarnation: tc.rsc,
+				State:   apiv1.ResourceState{InUse: &inUse, DrbdState: "UpToDate"},
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: "UpToDate"}}},
+			}}
+			nodes := []apiv1.Node{{Name: "N2", ConnectionStatus: apiv1.NodeTypeOnline, SatelliteIncarnation: tc.node}}
+
+			apiv1.ForgetStaleSatelliteState(answered, nodes)
+
+			forgotten := answered[0].State.InUse == nil && answered[0].Volumes[0].State.DiskState == ""
+			if forgotten != tc.wantForget {
+				t.Errorf("forgotten = %v, want %v: %+v", forgotten, tc.wantForget, answered[0])
+			}
+		})
 	}
 }
