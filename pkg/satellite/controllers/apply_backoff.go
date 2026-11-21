@@ -48,6 +48,9 @@ type applyBackoff struct {
 
 // applyRetry is the schedule of one replica whose apply keeps failing.
 type applyRetry struct {
+	// failures counts every failed apply, the retries that came due and
+	// the reconciles a watch event triggered in between.
+	failures int
 	// retries counts the retries that came due and failed.
 	retries int
 	// due is when the next retry is.
@@ -72,7 +75,11 @@ func (b *applyBackoff) next(name string) time.Duration {
 	}
 
 	retry, failing := b.pending[name]
+	retry.failures++
+
 	if failing && now.Before(retry.due) {
+		b.pending[name] = retry
+
 		return retry.due.Sub(now)
 	}
 
@@ -97,10 +104,15 @@ func (b *applyBackoff) next(name string) time.Duration {
 }
 
 // reset forgets the failures of name after an apply that went through,
-// or after the Resource is gone.
-func (b *applyBackoff) reset(name string) {
+// or after the Resource is gone, and returns how many applies of name
+// had failed since the last one that went through: zero when name was
+// not failing, so the caller reports a recovery only once.
+func (b *applyBackoff) reset(name string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	failures := b.pending[name].failures
 	delete(b.pending, name)
+
+	return failures
 }
