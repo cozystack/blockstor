@@ -809,6 +809,16 @@ spec:
                         states correctly. The CSI plugin's quorum-aware mount path
                         (refusing to mount a no-quorum volume) reads this signal.
                       type: boolean
+                    resyncPeer:
+                      description: |-
+                        resyncPeer is the peer whose peer-device frame last reported
+                        this volume in SyncTarget with a `done`: the resync the kernel
+                        is running and reporting progress for. It is cleared by that
+                        peer's next frame without either. LINSTOR's satellite shows the
+                        progress of exactly that frame as the volume's state
+                        (DrbdVolume.update), so another peer's entry that still reads
+                        SyncTarget with an old `done` does not take its place.
+                      type: string
                     storagePool:
                       type: string
                     usableKib:

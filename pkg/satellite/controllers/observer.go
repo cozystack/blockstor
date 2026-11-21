@@ -135,6 +135,18 @@ type volumeObservation struct {
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
 
+	// ResyncPeer is the peer of the last peer-device frame that
+	// reported this volume in SyncTarget with a `done`: the resync the
+	// kernel is reporting progress for. ResyncFrameFrom is set on an
+	// observation built from a peer-device frame and names that
+	// frame's peer, so mergeVolumeInto can tell the reporting peer's
+	// own frame without one (its resync paused or ended) from another
+	// peer's frame, which leaves it alone. LINSTOR's satellite shows
+	// the `done` of the same frame as the volume's state
+	// (DrbdVolume.update).
+	ResyncPeer      string
+	ResyncFrameFrom string
+
 	// Removed is an internal marker set by translateDeviceEvent for
 	// `destroy device` frames (drbdsetup emits one after a volume is
 	// torn down from the kernel — e.g. the `vd d` cascade adjusts the
@@ -512,6 +524,9 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 
 	peer := ev.Fields["conn-name"]
 	if peer != "" {
+		//nolint:gosec // drbd-9 volume numbers fit in int32
+		out.Volumes = stampResyncPeer(out.Volumes, int32(volNum), peer, ev)
+
 		conn := connectionObservation{
 			PeerNodeName:   peer,
 			PeerDRBDNodeID: parsePeerNodeID(ev.Fields["peer-node-id"]),
@@ -560,6 +575,30 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 	}
 
 	return out, true
+}
+
+// stampResyncPeer records on the frame's volume observation which
+// peer the frame is about and whether it reports a running resync: a
+// SyncTarget with a `done`. Every peer-device frame carries both
+// tokens while a resync runs (events2 runs with --full), and the
+// kernel re-sends the running one's frame every few seconds
+// (RS_PROGRESS), so the last such frame names the resync in progress.
+func stampResyncPeer(vols []volumeObservation, volNum int32, peer string, ev drbd.Event) []volumeObservation {
+	var resyncPeer string
+	if ev.Fields["replication"] == drbdReplStateSyncTarget && ev.Fields["done"] != "" {
+		resyncPeer = peer
+	}
+
+	for i := range vols {
+		if vols[i].VolumeNumber == volNum {
+			vols[i].ResyncPeer = resyncPeer
+			vols[i].ResyncFrameFrom = peer
+
+			return vols
+		}
+	}
+
+	return append(vols, volumeObservation{VolumeNumber: volNum, ResyncPeer: resyncPeer, ResyncFrameFrom: peer})
 }
 
 // observationsFrom transforms a stream of events2 lines into a
@@ -628,6 +667,10 @@ const (
 	// where the local `device` frame's `disk:UpToDate` is missing or
 	// stale on a Secondary SyncSource (see peerDeviceVolumeObservation).
 	drbdReplStateSyncSource = "SyncSource"
+	// drbdReplStateSyncTarget is the DRBD-9 per-peer replication-state
+	// token meaning "this node is being resynced from that peer". A
+	// frame in it with a `done` names the resync in progress.
+	drbdReplStateSyncTarget = "SyncTarget"
 	// drbdDiskStateUpToDate is the DRBD-9 device disk_state token
 	// meaning the local replica holds a complete, current copy. Used
 	// as the value the SyncSource invariant stamps onto the local
@@ -1689,6 +1732,20 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservati
 		changed = true
 	}
 
+	// The resync peer follows the last frame that reported one. Only
+	// that peer's own frame clears it: a paused or established peer's
+	// frames arrive in between and say nothing about the running one.
+	if incoming.ResyncFrameFrom != "" {
+		switch {
+		case incoming.ResyncPeer != "" && merged.ResyncPeer != incoming.ResyncPeer:
+			merged.ResyncPeer = incoming.ResyncPeer
+			changed = true
+		case incoming.ResyncPeer == "" && merged.ResyncPeer == incoming.ResyncFrameFrom:
+			merged.ResyncPeer = ""
+			changed = true
+		}
+	}
+
 	// BackingDev is carried in the cache (so the snapshot the backfill
 	// reads has the lower-disk path) but never marks the volume
 	// `changed` on its own — it is an internal helper field, not a
@@ -2116,6 +2173,7 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 			CurrentGI:    vol.CurrentUUID,
 			OutOfSyncKib: vol.OutOfSyncKib,
 			Quorum:       vol.Quorum,
+			ResyncPeer:   vol.ResyncPeer,
 		})
 	}
 

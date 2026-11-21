@@ -161,3 +161,49 @@ func TestCrdToWireResourceReadsReplicationPerVolume(t *testing.T) {
 		t.Errorf("volume 1: SyncTarget progress = %v, want none (it is paused)", done)
 	}
 }
+
+// TestCrdToWireResourceCarriesTheResyncPeer pins that the peer the
+// satellite saw report the running resync reaches the volume state,
+// so the progress shown is that resync's even while another peer's
+// entry still reads SyncTarget with an older `done`.
+func TestCrdToWireResourceCarriesTheResyncPeer(t *testing.T) {
+	t.Parallel()
+
+	crd := &crdv1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-x.node-c"},
+		Spec:       crdv1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-x", NodeName: "node-c"},
+		Status: crdv1alpha1.ResourceStatus{
+			Volumes: []crdv1alpha1.ResourceVolumeStatus{
+				{VolumeNumber: 0, DiskState: "Inconsistent", ResyncPeer: "node-b"},
+			},
+			Connections: []crdv1alpha1.ResourceConnectionStatus{
+				{
+					PeerNodeName: "node-a",
+					PeerVolumes: []crdv1alpha1.PeerVolumeStatus{
+						{VolumeNumber: 0, PeerDiskState: "UpToDate", ReplicationState: "SyncTarget", Done: "0.00"},
+					},
+				},
+				{
+					PeerNodeName: "node-b",
+					PeerVolumes: []crdv1alpha1.PeerVolumeStatus{
+						{VolumeNumber: 0, PeerDiskState: "UpToDate", ReplicationState: "SyncTarget", Done: "65.53"},
+					},
+				},
+			},
+		},
+	}
+
+	wire := crdToWireResource(crd)
+	if len(wire.Volumes) != 1 {
+		t.Fatalf("volumes: got %d, want 1", len(wire.Volumes))
+	}
+
+	state := wire.Volumes[0].State
+	if state.ResyncPeer != "node-b" {
+		t.Errorf("ResyncPeer = %q, want node-b", state.ResyncPeer)
+	}
+
+	if done, ok := state.SyncProgress("SyncTarget"); !ok || done != 65.53 {
+		t.Errorf("SyncProgress(SyncTarget) = %v, %v; want 65.53, true", done, ok)
+	}
+}

@@ -218,6 +218,13 @@ type VolumeState struct {
 	// renders the column as `Established(N)`; non-uniform states
 	// surface per-peer with optional sync-progress percentages.
 	ReplicationStates map[string]ReplicationState `json:"replication_states,omitempty"`
+
+	// ResyncPeer is the peer whose frame last reported this volume in
+	// SyncTarget with a `done`, as the satellite recorded it. It picks
+	// the progress SyncProgress shows when more than one peer reads
+	// SyncTarget. Not on the wire: LINSTOR has no such field and puts
+	// the result in disk_state instead.
+	ResyncPeer string `json:"-"`
 }
 
 // ReplicationState is one entry of VolumeState.ReplicationStates:

@@ -175,3 +175,91 @@ func TestObserverKeepsReplicationPerVolume(t *testing.T) {
 		t.Errorf("volume 0 after a frame without peer-disk = (%q, %q), want (Established, none)", repl, done)
 	}
 }
+
+// TestObserverRecordsTheResyncInProgress replays the frames of a
+// replica that starts a resync from one peer and moves to another
+// within the same second, which DRBD does when the second peer has
+// fewer bits to send: node-a goes SyncTarget then PausedSyncT, node-b
+// PausedSyncT then SyncTarget. The volume must name the peer whose
+// frame last reported SyncTarget with a `done`, keep it while the
+// paused peer's frames arrive in between, and drop it when that peer
+// reports something else. That is the frame LINSTOR shows the
+// progress of. Without it the State column took the lowest `done` of
+// every peer that read SyncTarget, and after a node reset one replica
+// read `SyncTarget(0.00%)` for 40 minutes while the kernel said 65 %.
+func TestObserverRecordsTheResyncInProgress(t *testing.T) {
+	t.Parallel()
+
+	o := &ObserverRunnable{}
+
+	feed := func(line string) {
+		t.Helper()
+
+		ev, err := drbd.ParseEvent(line)
+		if err != nil {
+			t.Fatalf("ParseEvent(%q): %v", line, err)
+		}
+
+		obs, ok := translatePeerDeviceEvent(ev)
+		if !ok {
+			t.Fatalf("translatePeerDeviceEvent rejected %q", line)
+		}
+
+		o.mergeConnections(&obs)
+		o.mergeVolumes(&obs)
+	}
+
+	resyncPeer := func() string {
+		t.Helper()
+
+		snap := o.snapshotFor("pvc-x")
+		for _, vol := range buildObserverVolumeStatus(&snap, "") {
+			if vol.VolumeNumber == 0 {
+				return vol.ResyncPeer
+			}
+		}
+
+		t.Fatalf("no volume 0 in %+v", snap.Volumes)
+
+		return ""
+	}
+
+	const (
+		nodeA = "change peer-device name:pvc-x peer-node-id:0 conn-name:node-a volume:0 "
+		nodeB = "change peer-device name:pvc-x peer-node-id:2 conn-name:node-b volume:0 "
+	)
+
+	feed(nodeA + "replication:SyncTarget peer-disk:UpToDate peer-client:no resync-suspended:no " +
+		"done:0.00 received:0 sent:0 out-of-sync:172032 pending:0 unacked:0")
+
+	if got := resyncPeer(); got != "node-a" {
+		t.Errorf("after node-a started: resync peer = %q, want node-a", got)
+	}
+
+	feed(nodeB + "replication:PausedSyncT peer-disk:UpToDate peer-client:no resync-suspended:peer " +
+		"done:0.00 received:0 sent:0 out-of-sync:107104 pending:0 unacked:0")
+	feed(nodeB + "replication:SyncTarget peer-disk:UpToDate peer-client:no resync-suspended:no " +
+		"done:0.00 received:0 sent:0 out-of-sync:107104 pending:0 unacked:0")
+
+	if got := resyncPeer(); got != "node-b" {
+		t.Errorf("after node-b took over: resync peer = %q, want node-b", got)
+	}
+
+	feed(nodeA + "replication:PausedSyncT peer-disk:UpToDate peer-client:no resync-suspended:dependency " +
+		"done:0.00 received:2160 sent:0 out-of-sync:172032 pending:0 unacked:38")
+	feed(nodeB + "replication:SyncTarget peer-disk:UpToDate peer-client:no resync-suspended:no " +
+		"done:65.53 received:64592 sent:0 out-of-sync:37152 pending:0 unacked:2242")
+	feed(nodeA + "replication:PausedSyncT peer-disk:UpToDate peer-client:no resync-suspended:dependency " +
+		"done:9.09 received:2160 sent:0 out-of-sync:163840 pending:0 unacked:38")
+
+	if got := resyncPeer(); got != "node-b" {
+		t.Errorf("with node-a paused: resync peer = %q, want node-b", got)
+	}
+
+	feed(nodeB + "replication:Established peer-disk:UpToDate peer-client:no resync-suspended:no " +
+		"received:107104 sent:0 out-of-sync:0 pending:0 unacked:0")
+
+	if got := resyncPeer(); got != "" {
+		t.Errorf("after node-b's resync ended: resync peer = %q, want none", got)
+	}
+}
