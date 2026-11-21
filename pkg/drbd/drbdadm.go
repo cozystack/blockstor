@@ -2184,6 +2184,8 @@ func (a *Adm) HasAttachedDisk(ctx context.Context, resource string) (bool, error
 		return false, errors.Wrapf(err, "drbdsetup status --verbose %s", resource)
 	}
 
+	notAttached := []DiskState{DiskStateDiskless, DiskStateDetaching, DiskStateFailed}
+
 	for line := range strings.SplitSeq(string(out), "\n") {
 		for field := range strings.FieldsSeq(line) {
 			state, local := strings.CutPrefix(field, "disk:")
@@ -2191,9 +2193,7 @@ func (a *Adm) HasAttachedDisk(ctx context.Context, resource string) (bool, error
 				continue
 			}
 
-			switch state {
-			case "Diskless", "Detaching", "Failed":
-			default:
+			if !slices.Contains(notAttached, DiskState(state)) {
 				return true, nil
 			}
 		}
