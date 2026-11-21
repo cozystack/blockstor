@@ -28,13 +28,19 @@ package v1
 // `linstor r list`, so emitting nothing crashes the CLI with
 // AttributeError.
 type Resource struct {
-	Name        string            `json:"name"`
-	NodeName    string            `json:"node_name"`
-	Props       map[string]string `json:"props,omitempty"`
-	Flags       []string          `json:"flags,omitempty"`
-	State       ResourceState     `json:"state,omitzero"`
-	UUID        string            `json:"uuid,omitempty"`
-	LayerObject *ResourceLayer    `json:"layer_object,omitempty"`
+	Name     string            `json:"name"`
+	NodeName string            `json:"node_name"`
+	Props    map[string]string `json:"props,omitempty"`
+	Flags    []string          `json:"flags,omitempty"`
+
+	// State is always sent, as `{}` when nothing in it is known.
+	// linstor-csi counts a replica without a state object as faulty
+	// and raises VolumeConditionAbnormal for its volume. LINSTOR
+	// sends `{}` for a STORAGE-topped replica, whose in_use it never
+	// learns, so an empty state must stay on the wire.
+	State       ResourceState  `json:"state"`
+	UUID        string         `json:"uuid,omitempty"`
+	LayerObject *ResourceLayer `json:"layer_object,omitempty"`
 
 	// Annotations carries the K8s-native metadata.annotations of the
 	// backing Resource CRD. Used by Bug 67's `PeerChangedAnnotation`
