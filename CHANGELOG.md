@@ -4,6 +4,18 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.8 — 2026-11-21
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #304 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.7; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.7
+
+- **A healthy node stays ONLINE when one API server dies (#304).** The satellite heartbeat uses its own client with a one-period stamp timeout and redials after a stamp that got no answer, backing off instead after one the API server refused.
+- **Daemons drop a silently dead API connection within 15 s (#304).** The satellite, the controller and the apiserver shorten the HTTP/2 health check to 10 s read idle and 5 s ping, unless `HTTP2_READ_IDLE_TIMEOUT_SECONDS` or `HTTP2_PING_TIMEOUT_SECONDS` is set on the pod.
+- **The node monitor grace period is 50 s instead of 40 s (#304).** One API endpoint failover no longer makes a node OFFLINE; a node that really died is called OFFLINE about 10 s later than before.
+- **The controller and the satellites read only the replicas they need (#303).** The definition reconciler and every satellite pass list the definition's replicas by field selector instead of every Resource in the cluster, which removes most of the idle CPU load that slowed a provisioning burst.
+- **A recovered apply is reported on the Resource (#299).** An apply that goes through after failures records a Normal `ApplySucceeded` Event with the number of failed attempts, once.
+
 ## v0.4.0-alpha.7 — 2026-11-20
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #302 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.6; the entries below are what changed since.
