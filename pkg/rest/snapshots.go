@@ -234,7 +234,14 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snaps, err := s.Store.Snapshots().ListByDefinition(r.Context(), rd)
+	// Past the cache: linstor-csi deletes the definition of a deleted volume
+	// only when this list, read right after a snapshot delete answered, has
+	// no snapshot left that is not being deleted. A delete retried after a
+	// timeout finds the snapshot gone on the API server and answers at once,
+	// and a cache that has not seen the snapshot go hands it back here as
+	// live, so the definition was kept for good. LINSTOR answers the delete
+	// and the list from one model, where the snapshot is gone for both.
+	snaps, err := s.Store.Snapshots().ListByDefinitionUncached(r.Context(), rd)
 	if err != nil {
 		writeStoreError(w, err)
 
