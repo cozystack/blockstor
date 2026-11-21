@@ -1587,19 +1587,20 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 // detach would be a no-op shell-out but still costs a netlink
 // round-trip on every reconcile pass.
 //
-// A failed disk probe falls through to a best-effort detach only for
-// a replica toggled from diskful, whose volumes still carry the pool
-// they were reclaimed from: a transient netlink hiccup shouldn't
-// strand the toggle, and the LV must not be reclaimed under a disk
-// that may still be attached. A replica that never had a disk, such
-// as a TieBreaker, has nothing to detach, and drbdadm refuses the
-// detach anyway because its configuration gives no disk. The probe
-// fails that way when the slot goes away between the two probes, as
-// it does while an operator takes the kernel resource down, and the
-// refused detach used to fail the apply with an ApplyFailed Warning.
-// The detach itself runs with --force
-// so the kernel doesn't block on outstanding I/O references when
-// the satellite has already declared the replica diskless at the
+// A slot that goes away between the two probes, as it does while an
+// operator takes the kernel resource down, is not a failed probe:
+// HasAttachedDisk reads drbdsetup's "No such resource" as no disk
+// attached, so nothing is detached, whatever the volumes name. Any
+// other failed probe falls through to a best-effort detach only when
+// the replica has a volume to reclaim, one whose pool has a provider
+// on this node: a transient netlink hiccup shouldn't strand the
+// toggle, and the LV must not be reclaimed under a disk that may
+// still be attached. A replica with nothing to reclaim, such as a
+// TieBreaker or a witness migrated from LINSTOR on the diskless pool,
+// has no disk to detach, and drbdadm refuses the detach anyway
+// because its configuration gives none. The detach itself runs with
+// --force so the kernel doesn't block on outstanding I/O references
+// when the satellite has already declared the replica diskless at the
 // REST layer.
 //
 // Why not gate inside the FSM transition table: the FSM currently
@@ -1623,7 +1624,7 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 	}
 
 	attached, err := r.cfg.Adm.HasAttachedDisk(ctx, dr.GetName())
-	if err != nil && !hasReclaimableVolume(dr) {
+	if err != nil && !r.hasReclaimableVolume(dr) {
 		return nil
 	}
 
@@ -1645,12 +1646,16 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 	return nil
 }
 
-// hasReclaimableVolume reports whether any volume of a diskless
-// replica still names a storage pool, the dispatcher's marker for a
-// replica toggled from diskful (see applyStorageIfDiskful).
-func hasReclaimableVolume(dr *intent.DesiredResource) bool {
+// hasReclaimableVolume reports whether reclaimVolumesForDiskless would
+// delete a volume of the diskless replica: one that names a pool with a
+// provider on this node. A pool name alone does not mean a disk, since
+// a witness migrated from LINSTOR names the diskless pool, which
+// registers no provider.
+func (r *Reconciler) hasReclaimableVolume(dr *intent.DesiredResource) bool {
 	return slices.ContainsFunc(dr.GetVolumes(), func(vol *intent.DesiredVolume) bool {
-		return vol.GetStoragePool() != ""
+		_, ok := r.cfg.Providers[vol.GetStoragePool()]
+
+		return ok
 	})
 }
 
