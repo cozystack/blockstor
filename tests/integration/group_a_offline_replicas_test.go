@@ -131,14 +131,14 @@ func TestGroupAOfflineNodeReplicasReadUnknown(t *testing.T) {
 	}
 }
 
-// TestGroupARestartedSatelliteReplicasReadUnknown: a node back ONLINE
+// TestGroupARebootedNodeReplicasReadUnknown: a node back ONLINE
 // after a reboot runs a new satellite, which brings its replicas up one
 // by one. Until it reports a replica the store holds the report from
-// before the crash, a connected UpToDate Secondary. LINSTOR shows state
+// before the reboot, a connected UpToDate Secondary. LINSTOR shows state
 // only from the satellite it is connected to now, so linstor-client
 // reads that replica Unknown and `r l --faulty` lists it, until the new
 // satellite reports it.
-func TestGroupARestartedSatelliteReplicasReadUnknown(t *testing.T) {
+func TestGroupARebootedNodeReplicasReadUnknown(t *testing.T) {
 	stack := harness.StartStack(t)
 	harness.SeedThreeNodeCluster(t, stack)
 
@@ -185,7 +185,7 @@ func TestGroupARestartedSatelliteReplicasReadUnknown(t *testing.T) {
 
 	table := faultyTable(t, stack, rdName)
 	if !strings.Contains(faultyRow(table, harness.NodeWorker1), "Unknown") {
-		t.Errorf("`r l --faulty` does not list the replica the restarted satellite has not reported as Unknown:\n%s", table)
+		t.Errorf("`r l --faulty` does not list the replica the rebooted node's satellite has not reported as Unknown:\n%s", table)
 	}
 
 	if strings.Contains(table, harness.NodeWorker2) {
@@ -197,7 +197,7 @@ func TestGroupARestartedSatelliteReplicasReadUnknown(t *testing.T) {
 
 	table = faultyTable(t, stack, rdName)
 	if strings.Contains(table, harness.NodeWorker1) {
-		t.Errorf("`r l --faulty` still lists the replica the restarted satellite has reported:\n%s", table)
+		t.Errorf("`r l --faulty` still lists the replica the rebooted node's satellite has reported:\n%s", table)
 	}
 }
 
@@ -214,7 +214,7 @@ func faultyRow(table, node string) string {
 }
 
 // stampReplicaIncarnation marks the replica's status as reported by
-// the satellite process named incarnation.
+// the satellite on the kernel boot named incarnation.
 func stampReplicaIncarnation(t *testing.T, stack *harness.Stack, name, incarnation string) {
 	t.Helper()
 
@@ -232,8 +232,8 @@ func stampReplicaIncarnation(t *testing.T, stack *harness.Stack, name, incarnati
 	}, "stamp "+name+" with "+incarnation)
 }
 
-// stampNodeIncarnation names the satellite process running on node, as
-// the satellite heartbeat does.
+// stampNodeIncarnation names the kernel boot node runs now, as the
+// satellite heartbeat does.
 func stampNodeIncarnation(t *testing.T, stack *harness.Stack, node, incarnation string) {
 	t.Helper()
 
