@@ -110,6 +110,29 @@ func TestHasAttachedDisk(t *testing.T) {
 			t.Error("a failed probe reported a disk state, want the error")
 		}
 	})
+
+	// drbdsetup exits 10 with "No such resource" for a slot taken down
+	// between the caller's load probe and this one. That is an answer,
+	// not a failure: the kernel holds no disk for a resource it does
+	// not hold at all.
+	t.Run("slot not loaded", func(t *testing.T) {
+		t.Parallel()
+
+		fx := storage.NewFakeExec()
+		fx.Expect("drbdsetup status --verbose r", storage.FakeResponse{
+			Stdout: []byte("No such resource: r\n"),
+			Err:    storage.FakeExitError{Code: 10},
+		})
+
+		attached, err := drbd.NewAdm(fx).HasAttachedDisk(t.Context(), "r")
+		if err != nil {
+			t.Fatalf("HasAttachedDisk on a slot that is not loaded: %v", err)
+		}
+
+		if attached {
+			t.Error("a slot that is not loaded reported an attached disk")
+		}
+	})
 }
 
 // The fixtures below are `drbdsetup status --verbose <resource>` as

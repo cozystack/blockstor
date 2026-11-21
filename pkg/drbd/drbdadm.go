@@ -2178,8 +2178,16 @@ func (a *Adm) EvaluateDownVeto(ctx context.Context, resource string) DownVeto {
 //
 // The convention matches HasDisklessVolume, except that a failed
 // probe is returned: the caller decides what an unknown state means.
+// A slot that is not loaded is not a failed probe: drbdsetup says so
+// in words ("No such resource" while a down is in flight), and a
+// resource the kernel no longer holds has no disk attached, whatever
+// the replica's configuration says.
 func (a *Adm) HasAttachedDisk(ctx context.Context, resource string) (bool, error) {
 	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose", resource)
+	if isResourceNotLoadedErr(err, out) {
+		return false, nil
+	}
+
 	if err != nil {
 		return false, errors.Wrapf(err, "drbdsetup status --verbose %s", resource)
 	}
