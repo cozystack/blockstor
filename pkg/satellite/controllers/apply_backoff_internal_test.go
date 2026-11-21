@@ -45,6 +45,10 @@ func TestAFailingApplyIsRetriedWithBackOff(t *testing.T) {
 		NodeName:  "node-a",
 	})
 
+	now := time.Unix(0, 0)
+	r.retries.now = func() time.Time { return now }
+
+	// Each run is the retry that came due.
 	run := func() time.Duration {
 		t.Helper()
 
@@ -52,6 +56,8 @@ func TestAFailingApplyIsRetriedWithBackOff(t *testing.T) {
 		if err != nil {
 			t.Fatalf("runApply: %v", err)
 		}
+
+		now = now.Add(result.RequeueAfter)
 
 		return result.RequeueAfter
 	}
@@ -74,5 +80,36 @@ func TestAFailingApplyIsRetriedWithBackOff(t *testing.T) {
 
 	if got := run(); got != applyFailureRequeue {
 		t.Fatalf("the first failure after a success retried after %v, want %v", got, applyFailureRequeue)
+	}
+}
+
+// Reconciles that a watch event triggers before the retry is due, the
+// peers' Status updates while a volume is created say, fail too, but
+// they are not retries: the back-off counts only the retry that came
+// due, as LINSTOR's RetryResourcesTask does, so a cause that clears up
+// without an event is retried in seconds and not minutes.
+func TestApplyBackOffCountsOnlyTheRetriesThatCameDue(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(0, 0)
+	now := start
+	b := applyBackoff{now: func() time.Time { return now }}
+
+	if got := b.next("r"); got != applyFailureRequeue {
+		t.Fatalf("first failure retried after %v, want %v", got, applyFailureRequeue)
+	}
+
+	for range 6 {
+		now = now.Add(500 * time.Millisecond)
+
+		if got := b.next("r"); got > applyFailureRequeue {
+			t.Fatalf("a failure before the retry was due pushed it out to %v", got)
+		}
+	}
+
+	now = start.Add(applyFailureRequeue)
+
+	if got := b.next("r"); got != 2*applyFailureRequeue {
+		t.Fatalf("the first retry that came due and failed retried after %v, want %v", got, 2*applyFailureRequeue)
 	}
 }
