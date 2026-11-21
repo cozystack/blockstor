@@ -752,7 +752,11 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		}
 
 		err := st.Resources().Create(ctx, &res)
-		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			err = s.takeOverReplicaWrittenMeanwhile(ctx, st, rdName, pool)
+		}
+
+		if err != nil {
 			return false, errors.Wrap(err, "create resource")
 		}
 	}
@@ -845,6 +849,40 @@ func (s *state) promoteWitness(ctx context.Context, st store.Store, rdName strin
 	}
 
 	return nil
+}
+
+// takeOverReplicaWrittenMeanwhile settles a create that found a replica
+// of rdName already on pool.NodeName, written after the placement read
+// the definition's replicas. The one writer that does that is the
+// controller's tiebreaker reconciler: it watches the replicas the
+// placement creates one by one, and at the two diskful replicas of a
+// three-replica placement puts a TIE_BREAKER witness on the very node
+// the third one is for. Counting that witness as the replica placed
+// left the definition one diskful replica short, with a witness in its
+// quorum, until a later placement promoted it minutes on. LINSTOR
+// places a diskful replica over a TieBreaker by taking the witness
+// over, as this placer does for a witness it saw before it started
+// (promoteWitness), so a diskless replica found here is promoted the
+// same way. A diskful one is a replica that is already there and is
+// left as it is.
+func (s *state) takeOverReplicaWrittenMeanwhile(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
+	existing, err := st.Resources().Get(ctx, rdName, pool.NodeName)
+	if errors.Is(err, store.ErrNotFound) {
+		// Gone again since the create: promoteWitness lands a
+		// fresh replica for one that vanished.
+		return s.promoteWitness(ctx, st, rdName, pool)
+	}
+
+	if err != nil {
+		return errors.Wrap(err, "read the replica written meanwhile")
+	}
+
+	if !slices.Contains(existing.Flags, apiv1.ResourceFlagDiskless) &&
+		!slices.Contains(existing.Flags, apiv1.ResourceFlagTieBreaker) {
+		return nil
+	}
+
+	return s.promoteWitness(ctx, st, rdName, pool)
 }
 
 // poolKey is the composite (node, pool) lookup key used to find a
