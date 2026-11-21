@@ -190,9 +190,14 @@ func TestHeartbeatSurvivesAPIServerDyingSilently(t *testing.T) {
 
 	waitForStamps(t, &stamps, 1, 3*time.Second, "first stamp")
 
+	// A stamp already on its way when the API server goes silent can
+	// still land and be counted; only the second one after the count
+	// is certain to have been sent after the kill.
+	before := stamps.Load()
+
 	proxy.kill()
 
-	waitForStamps(t, &stamps, stamps.Load()+1, 3*time.Second,
+	waitForStamps(t, &stamps, before+2, 3*time.Second,
 		"a stamp after the API server went silent")
 
 	select {
