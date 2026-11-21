@@ -21,7 +21,10 @@ package controller_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,6 +38,7 @@ import (
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
 	"github.com/cozystack/blockstor/pkg/blocksize"
 	"github.com/cozystack/blockstor/pkg/store"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 const (
@@ -447,5 +451,183 @@ func TestRefusedFreezeStillApplies(t *testing.T) {
 		if vol.VolumeNumber == 7 {
 			t.Fatalf("the apply did not run while the freeze failed: volumes %v", got.Spec.Volumes)
 		}
+	}
+}
+
+// scopeCountingReader counts the Resource lists that reach it without a
+// field selector, reads of every replica in the cluster, until stopped.
+type scopeCountingReader struct {
+	client.Reader
+
+	mu       sync.Mutex
+	unscoped int
+	stopped  bool
+}
+
+func (r *scopeCountingReader) stop() {
+	r.mu.Lock()
+	r.stopped = true
+	r.mu.Unlock()
+}
+
+func (r *scopeCountingReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*blockstoriov1alpha1.ResourceList); ok {
+		var lo client.ListOptions
+		lo.ApplyOptions(opts)
+
+		r.mu.Lock()
+		if lo.FieldSelector == nil && !r.stopped {
+			r.unscoped++
+		}
+		r.mu.Unlock()
+	}
+
+	return r.Reader.List(ctx, list, opts...)
+}
+
+// TestBlockSizeReadsOnlyTheDefinitionsReplicas pins how the decision for
+// a new replica reads its peers. Listing every Resource in the cluster
+// past the cache, once per new replica, made a provisioning burst on a
+// cluster with a few hundred replicas spend most of each allocation
+// decoding replicas of other volumes, and the satellites build nothing
+// before the allocation is done. The peer created a moment ago, which
+// the cache does not show yet, must still count.
+func TestBlockSizeReadsOnlyTheDefinitionsReplicas(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	f := newBSFixture(nil)
+	target := bsReplica(bsNode)
+	fresh := bsReplica("n2")
+
+	const others = 20
+
+	objects := make([]client.Object, 0, others+4)
+	objects = append(objects, f.rd, target, bsStoragePool(bsNode, "512"), bsStoragePool("n2", "4096"))
+
+	for i := range others {
+		objects = append(objects, &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pvc-other-%02d.n2", i)},
+			Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: fmt.Sprintf("pvc-other-%02d", i), NodeName: "n2"},
+		})
+	}
+
+	byDefinition := func(obj client.Object) []string {
+		res, ok := obj.(*blockstoriov1alpha1.Resource)
+		if !ok {
+			return nil
+		}
+
+		return []string{res.Spec.ResourceDefinitionName}
+	}
+
+	build := func(objs ...client.Object) client.WithWatch {
+		return fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&blockstoriov1alpha1.Resource{}, &blockstoriov1alpha1.ResourceDefinition{}).
+			WithIndex(&blockstoriov1alpha1.Resource{}, storek8s.FieldResourceDefinitionName, byDefinition).
+			WithObjects(objs...).
+			Build()
+	}
+
+	live := build(append(slices.Clone(objects), fresh)...)
+	cached := build(objects...)
+
+	apiReader := &scopeCountingReader{Reader: live}
+	cache := interceptor.NewClient(live, interceptor.Funcs{
+		Get: func(ctx context.Context, _ client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			return cached.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, _ client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			return cached.List(ctx, list, opts...)
+		},
+		// The block size is the first thing written for a new replica;
+		// what reads past the cache after it is the allocation's.
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*blockstoriov1alpha1.ResourceDefinition); ok {
+				apiReader.stop()
+			}
+
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	rec := &controllerpkg.ResourceReconciler{Client: cache, Scheme: scheme, APIReader: apiReader}
+
+	_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: target.Name}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+	if err := live.Get(ctx, client.ObjectKey{Name: bsRD}, &rd); err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if got := rd.Spec.VolumeDefinitions[0].Props[blocksize.PropBlockSize]; got != "4096" {
+		t.Errorf("block-size = %q, want 4096 for the peer created a moment ago on the 4096 pool", got)
+	}
+
+	if apiReader.unscoped != 0 {
+		t.Errorf("the decision listed every Resource past the cache %d times, want 0", apiReader.unscoped)
+	}
+}
+
+// TestBlockSizeIgnoresAPeerOnlyTheCacheStillShows pins a replica that
+// is gone on the API server while the cache still lists it: the last
+// replica of a volume deleted, and a new one created a moment later.
+// LINSTOR decides from the replicas that exist, so the new replica's
+// pool sets the size. Counting the deleted one as a running peer kept
+// the volume at the 512 default on a 4096 pool.
+func TestBlockSizeIgnoresAPeerOnlyTheCacheStillShows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	f := newBSFixture(nil)
+	target := bsReplica(bsNode)
+	gone := running(bsReplica("n2"))
+
+	byDefinition := func(obj client.Object) []string {
+		res, ok := obj.(*blockstoriov1alpha1.Resource)
+		if !ok {
+			return nil
+		}
+
+		return []string{res.Spec.ResourceDefinitionName}
+	}
+
+	build := func(objs ...client.Object) client.WithWatch {
+		return fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&blockstoriov1alpha1.Resource{}, &blockstoriov1alpha1.ResourceDefinition{}).
+			WithIndex(&blockstoriov1alpha1.Resource{}, storek8s.FieldResourceDefinitionName, byDefinition).
+			WithObjects(objs...).
+			Build()
+	}
+
+	objects := append([]client.Object{f.rd, target}, f.objects...)
+	live := build(objects...)
+	cached := build(append(slices.Clone(objects), gone)...)
+
+	cache := interceptor.NewClient(live, interceptor.Funcs{
+		List: func(ctx context.Context, _ client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			return cached.List(ctx, list, opts...)
+		},
+	})
+	rec := &controllerpkg.ResourceReconciler{Client: cache, Scheme: scheme, APIReader: live}
+
+	_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: target.Name}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+	if err := live.Get(ctx, client.ObjectKey{Name: bsRD}, &rd); err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if got := rd.Spec.VolumeDefinitions[0].Props[blocksize.PropBlockSize]; got != "4096" {
+		t.Errorf("block-size = %q, want 4096: the only replica left is on the 4096 pool", got)
 	}
 }

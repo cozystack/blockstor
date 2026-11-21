@@ -22,6 +22,7 @@ import (
 	"context"
 	"maps"
 	"slices"
+	"strings"
 
 	cerrors "github.com/cockroachdb/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +35,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/blocksize"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 const (
@@ -232,7 +234,7 @@ func (r *ResourceReconciler) decideBlockSize(ctx context.Context, target *blocks
 func (r *ResourceReconciler) blockSizeInputsFor(
 	ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition,
 ) (*blockSizeScope, blockSizeInputs, error) {
-	peers, err := r.otherReplicas(ctx, target)
+	peers, err := r.otherReplicas(ctx, target, rd)
 	if err != nil {
 		return nil, blockSizeInputs{}, err
 	}
@@ -348,9 +350,78 @@ func canChangeBlockSize(scope *blockSizeScope, peers []blockstoriov1alpha1.Resou
 	return true
 }
 
-// otherReplicas lists the definition's other replicas, read past the
-// cache so a replica created a moment ago counts.
-func (r *ResourceReconciler) otherReplicas(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]blockstoriov1alpha1.Resource, error) {
+// otherReplicas lists the definition's other replicas: read past the
+// cache, every one written under the target's spelling or the
+// definition's object name, so a replica created a moment ago counts
+// and one deleted a moment ago does not, plus every one the cache holds
+// under any other spelling of the definition.
+//
+// The read past the cache asks for the definition's replicas only. It
+// runs once for every new replica, and reading every Resource in the
+// cluster there made a provisioning burst on a cluster with a few
+// hundred replicas spend most of each allocation decoding the replicas
+// of other volumes, while the satellites waited for the identity that
+// follows the decision. What it can miss is a replica written under
+// another spelling that the cache has not seen yet, which nothing
+// blockstor writes is: the store, the placer and the LINSTOR migration
+// all write the definition's object name. A reader that cannot select
+// by definition reads every Resource instead, as before.
+func (r *ResourceReconciler) otherReplicas(
+	ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition,
+) ([]blockstoriov1alpha1.Resource, error) {
+	var cached blockstoriov1alpha1.ResourceList
+
+	err := r.List(ctx, &cached, client.UnsafeDisableDeepCopy)
+	if err != nil {
+		return nil, cerrors.Wrap(err, "list cached resources")
+	}
+
+	spellings := slices.Compact([]string{target.Spec.ResourceDefinitionName, rd.Name})
+	byName := map[string]blockstoriov1alpha1.Resource{}
+
+	for i := range cached.Items {
+		res := &cached.Items[i]
+		// The read below answers in full for the spellings it asks
+		// for; the cache may still list a replica of theirs that is
+		// already deleted, and a deleted replica is no peer.
+		if naming.Same(res.Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) &&
+			!slices.Contains(spellings, res.Spec.ResourceDefinitionName) {
+			byName[res.Name] = *res.DeepCopy()
+		}
+	}
+
+	for _, spelling := range spellings {
+		var live blockstoriov1alpha1.ResourceList
+
+		err := r.apiReader().List(ctx, &live, client.MatchingFields{storek8s.FieldResourceDefinitionName: spelling})
+		if storek8s.SelectorUnsupported(err) {
+			return r.everyOtherReplica(ctx, target)
+		}
+
+		if err != nil {
+			return nil, cerrors.Wrap(err, "list resources")
+		}
+
+		for i := range live.Items {
+			byName[live.Items[i].Name] = live.Items[i]
+		}
+	}
+
+	delete(byName, target.Name)
+
+	out := make([]blockstoriov1alpha1.Resource, 0, len(byName))
+	for name := range byName {
+		out = append(out, byName[name])
+	}
+
+	slices.SortFunc(out, func(a, b blockstoriov1alpha1.Resource) int { return strings.Compare(a.Name, b.Name) })
+
+	return out, nil
+}
+
+// everyOtherReplica is otherReplicas for a reader that cannot select by
+// definition: every Resource past the cache, keeping the definition's.
+func (r *ResourceReconciler) everyOtherReplica(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]blockstoriov1alpha1.Resource, error) {
 	var list blockstoriov1alpha1.ResourceList
 
 	err := r.apiReader().List(ctx, &list)
