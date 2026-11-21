@@ -204,7 +204,8 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 // applyFailureRequeue is the first backoff between satellite Apply
 // retries when at least one per-resource result reported failure;
-// applyBackoff doubles it for each failure in a row. Short enough that a transient stale-peer .res renders converge
+// applyBackoff doubles it for each retry that came due and failed.
+// Short enough that a transient stale-peer .res renders converge
 // within a couple of ticks; long enough that a permanently failing
 // drbdadm command (e.g. missing kernel module) doesn't flood the
 // log.
