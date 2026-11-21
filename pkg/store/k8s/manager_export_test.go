@@ -7,6 +7,7 @@ import (
 
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // NewIndexedManagerWithin is NewManager's manager half, with the registration
@@ -23,7 +24,9 @@ func NodeScopedReadsBypassTheCache(s *Store) bool {
 
 // ReplicaKeyIndexer is the extractor of the FieldResourceDefinitionKey
 // index NewManager and RegisterReplicaKeyIndex register.
-var ReplicaKeyIndexer = replicaKeyIndex().extract
+func ReplicaKeyIndexer(obj ctrlclient.Object) []string {
+	return replicaKeyIndex().extract(obj)
+}
 
 // ForgetSelectorRefusal clears what ReplicasOf remembered of a server that
 // refused the definition selector.

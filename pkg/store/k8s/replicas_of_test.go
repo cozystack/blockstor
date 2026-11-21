@@ -211,11 +211,13 @@ func keyIndexedCluster(t *testing.T, objs ...client.Object) client.Client {
 func TestReplicasOfLooksUpCachedSpellingsThroughTheIndex(t *testing.T) {
 	t.Parallel()
 
-	objs := []client.Object{
+	objs := make([]client.Object, 0, 23)
+	objs = append(objs,
 		&crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix"}},
 		replicaRow("pvc-mix.n1", "pvc-mix", "n1"),
 		replicaRow("pvc-mix.n2", "Pvc-Mix", "N2"),
-	}
+	)
+
 	for i := range 20 {
 		objs = append(objs, replicaRow(fmt.Sprintf("pvc-%02d.n1", i), fmt.Sprintf("pvc-%02d", i), "n1"))
 	}
@@ -302,8 +304,6 @@ func TestReplicasOfAnswersInObjectNameOrder(t *testing.T) {
 // definition and the refused list first each time.
 //
 // Not parallel: the refusal is remembered for the process.
-//
-//nolint:paralleltest // process-wide state
 func TestReplicasOfStopsAskingAServerThatRefusedTheField(t *testing.T) {
 	t.Cleanup(k8s.ForgetSelectorRefusal)
 

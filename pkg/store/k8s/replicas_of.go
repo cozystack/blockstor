@@ -70,6 +70,8 @@ func RegisterReplicaKeyIndex(indexer ctrlclient.FieldIndexer) error {
 // whole-cluster read each call ends on anyway. The CRD and the binaries
 // ship in one release, so a process that saw the refusal is replaced
 // before the CRD that would accept it is installed.
+//
+//nolint:gochecknoglobals // a fact about the one API server the process talks to
 var serverRefusesSelector atomic.Bool
 
 // ReplicasOf lists into list the Resource objects of definition rdName
