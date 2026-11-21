@@ -187,7 +187,8 @@ func TestWatcherStreamsEvents(t *testing.T) {
 		"exists resource name:pvc-1 role:Primary",
 		"change device name:pvc-1 minor:1000 disk:UpToDate",
 		"",         // blank line — must be skipped, not abort the pipeline
-		"exists -", // initial-sync marker — filtered at parser layer
+		"exists -", // end of the initial state
+		"change resource name:pvc-1 role:Secondary",
 	}, "\n") + "\n")
 
 	w := drbd.NewWatcher(src)
@@ -202,8 +203,8 @@ func TestWatcherStreamsEvents(t *testing.T) {
 		got = append(got, ev)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("event count: got %d, want 2 (blank line and exists - marker must be skipped); %+v", len(got), got)
+	if len(got) != 4 {
+		t.Fatalf("event count: got %d, want 4 (blank line skipped, exists - passed on); %+v", len(got), got)
 	}
 
 	if got[0].Action != "exists" || got[0].Kind != "resource" || got[0].Fields["name"] != "pvc-1" {
@@ -212,6 +213,16 @@ func TestWatcherStreamsEvents(t *testing.T) {
 
 	if got[1].Action != "change" || got[1].Fields["disk"] != "UpToDate" {
 		t.Errorf("event[1]: got %+v", got[1])
+	}
+
+	// A consumer batching the initial state needs to know where it
+	// ends, in order with the frames around it.
+	if got[2].Kind != drbd.KindInitialStateDone {
+		t.Errorf("event[2]: got %+v, want the end of the initial state", got[2])
+	}
+
+	if got[3].Action != "change" || got[3].Fields["role"] != "Secondary" {
+		t.Errorf("event[3]: got %+v", got[3])
 	}
 }
 

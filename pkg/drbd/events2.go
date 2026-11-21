@@ -50,15 +50,22 @@ type Event struct {
 // ErrStreamSyncMarker is the sentinel ParseEvent returns when the
 // line is the `exists -` marker drbdsetup emits at the boundary
 // between its initial-state flush and the live event stream. The
-// marker is a synchronisation breadcrumb for consumers that want
-// to flip a "ready" flag once initial state is fully delivered —
-// it carries no per-resource state, so the Watcher filters it from
-// the channel rather than emitting a kind=- frame that would fall
-// through the satellite observer's switch as an unhandled no-op.
-// Mirrors drbd-reactor's `exists -` filter (src/events.rs):
-// public protocol behaviour, pattern only — no upstream code
-// copied.
+// marker carries no per-resource state, so ParseEvent does not hand
+// it out as an ordinary frame; the Watcher passes it on as
+// InitialStateDone instead.
 var ErrStreamSyncMarker = errors.New("drbd: events2 stream-sync marker")
+
+// KindInitialStateDone is the Kind of the Event the Watcher emits for
+// the `exists -` marker: every object the kernel held when the stream
+// started has been reported, and live changes follow. A consumer that
+// batches the initial state flushes it here.
+const KindInitialStateDone = "-"
+
+// InitialStateDone is the Event the Watcher emits for the `exists -`
+// marker.
+func InitialStateDone() Event {
+	return Event{Action: "exists", Kind: KindInitialStateDone}
+}
 
 // ParseEvent parses one drbdsetup events2 line. Returns an error for
 // blank or single-token lines so the caller can log and continue.
@@ -114,7 +121,8 @@ func NewWatcher(src io.Reader) *Watcher {
 
 // Watch streams events into ch until ctx is cancelled or the source
 // EOFs. Malformed lines are skipped (they would otherwise stall the
-// pipeline on a single kernel quirk). The channel is closed on return.
+// pipeline on a single kernel quirk); the `exists -` marker arrives
+// as InitialStateDone. The channel is closed on return.
 func (w *Watcher) Watch(ctx context.Context, ch chan<- Event) error {
 	defer close(ch)
 
@@ -128,6 +136,10 @@ func (w *Watcher) Watch(ctx context.Context, ch chan<- Event) error {
 		}
 
 		ev, err := ParseEvent(scanner.Text())
+		if errors.Is(err, ErrStreamSyncMarker) {
+			ev, err = InitialStateDone(), nil
+		}
+
 		if err != nil {
 			continue
 		}
