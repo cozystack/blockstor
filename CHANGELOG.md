@@ -4,6 +4,18 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.10 — 2026-11-21
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #306 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.9; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.9
+
+- **The satellite reads a replica's GI from the kernel, not from its backing device (#305).** The observer's resync asks `drbdsetup get-gi`, which opens no device, so it no longer sets off a change uevent and a disk rescan per replica every 5 seconds; a replica without a peer, or whose kernel read fails, is still read with drbdmeta.
+- **A deleted volume's definition is removed even when its snapshot delete was retried (#306).** The per-definition snapshot list reads past the informer cache, and a retried snapshot delete that finds the snapshot gone answers once the local cache agrees.
+- **An events2 dump that never sends its end line no longer hides the node's replicas (#297).** Once the stream has been quiet for ten seconds the observer writes what the dump said, replays the changes held behind it and writes no replica as gone until the end line comes; later dump lines no longer override newer frames.
+- **The pass after a dump writes every replica's status before any KernelLoaded Condition (#297).** A restarted satellite shows its replicas again sooner, and the log says how long that pass took.
+- **A TieBreaker whose disk probe fails or whose slot is gone is not detached (#299).** Only a replica toggled from diskful, whose volume is still reclaimed from a pool, is detached after a probe that failed without saying why.
+
 ## v0.4.0-alpha.9 — 2026-11-21
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #304 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.8; the entries below are what changed since.
