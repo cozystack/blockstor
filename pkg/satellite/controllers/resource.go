@@ -52,7 +52,6 @@ import (
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
-	"github.com/cozystack/blockstor/pkg/satellite"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -622,7 +621,7 @@ func (r *ResourceReconciler) prepareDRBDApply(
 // recordPerResourceFailures logs each per-resource Apply failure and
 // returns whether any of the results came back not-Ok, and whether
 // every one of those is only waiting for the controller to stamp the
-// replica (satellite.WaitsForController). Extracted from runApply so
+// replica (WaitingForController). Extracted from runApply so
 // the orchestration stays under the funlen budget.
 //
 // Each failure also gets a Warning Event on the Resource, under the
@@ -643,7 +642,7 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 
 		anyFailed = true
 
-		if satellite.WaitsForController(result.GetMessage()) {
+		if result.GetWaitingForController() {
 			logger.Info("waiting for the controller to stamp the replica", "name", result.GetName(),
 				"message", result.GetMessage())
 

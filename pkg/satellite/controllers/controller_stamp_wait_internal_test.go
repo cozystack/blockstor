@@ -49,8 +49,11 @@ func (p *scriptedCreateProvider) CreateVolume(_ context.Context, _ storage.Volum
 	message := p.script[0]
 	p.script = p.script[1:]
 
-	if message == "" {
+	switch message {
+	case "":
 		return nil
+	case stampWait:
+		return fmt.Errorf("%w: %w", errScriptedCreate, satellite.ErrWaitingForController)
 	}
 
 	return fmt.Errorf("%w: %s", errScriptedCreate, message)
@@ -59,9 +62,10 @@ func (p *scriptedCreateProvider) CreateVolume(_ context.Context, _ storage.Volum
 // errScriptedCreate is a create scriptedCreateProvider fails.
 var errScriptedCreate = errors.New("create volume")
 
-// stampWait is the apply's message for a fresh replica the controller
-// has not stamped Spec.SkipInitialSync on yet.
-const stampWait = "Resource.Spec.SkipInitialSync not yet stamped by controller"
+// stampWait scripts a create held for the controller's stamp, the
+// error a fresh replica's apply gets before the controller stamped
+// Spec.SkipInitialSync on it.
+const stampWait = "wait for the stamp"
 
 // A fresh replica whose apply waits for the controller to stamp it is
 // not a failed apply: no Warning Event, no back-off, and no "succeeded

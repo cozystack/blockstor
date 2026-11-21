@@ -28,7 +28,8 @@ import (
 
 // The apply result carries the gate's error wrapped in the steps that
 // ran before it; WaitsForController finds both controller-stamp gates
-// in it and nothing else.
+// in it and nothing else. It goes by the error's identity: a drbdadm
+// failure that happens to quote a gate's text is not a wait.
 func TestWaitsForControllerRecognisesTheStampGates(t *testing.T) {
 	t.Parallel()
 
@@ -42,6 +43,7 @@ func TestWaitsForControllerRecognisesTheStampGates(t *testing.T) {
 		{"node-id", refuseUnresolvedLocalNodeID(fresh), true},
 		{"skip-init-sync", refuseUnresolvedSkipInitialSync(fresh, true), true},
 		{"port in use", errors.New("drbdadm adjust pvc-1: Failure: (103) Remote address(port) already in use"), false},
+		{"gate text only", errors.New(errUnresolvedSkipInitialSync.Error()), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -50,9 +52,17 @@ func TestWaitsForControllerRecognisesTheStampGates(t *testing.T) {
 				t.Fatal("the gate let a fresh replica through")
 			}
 
-			message := errors.Wrap(tc.err, "apply pvc-1").Error()
-			if got := WaitsForController(message); got != tc.want {
-				t.Errorf("WaitsForController(%q) = %v, want %v", message, got, tc.want)
+			err := errors.Wrap(tc.err, "apply pvc-1")
+			if got := WaitsForController(err); got != tc.want {
+				t.Errorf("WaitsForController(%q) = %v, want %v", err, got, tc.want)
+			}
+
+			res := &intent.ResourceApplyResult{Ok: true}
+			failApply(res, err)
+
+			if res.Ok || res.Message != err.Error() || res.WaitingForController != tc.want {
+				t.Errorf("failApply: Ok=%v Message=%q WaitingForController=%v, want false, %q, %v",
+					res.Ok, res.Message, res.WaitingForController, err.Error(), tc.want)
 			}
 		})
 	}
