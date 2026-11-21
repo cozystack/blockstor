@@ -606,68 +606,101 @@ func uncleanFixture(
 	return rec, dr, devices, filepath.Join(dir, "pvc-unclean.md-created"), fx
 }
 
-// A lower disk carrying an unclean superblock and no reported GI is
-// initialised, on both activation arms.
-//
-// An unapplied activity log does NOT mean "this volume is established": a
-// volume added to a live resource arrives with firstActivation=false on a
-// lower disk that is brand new, and one carved from a recycled pool extent
-// carries whatever superblock the previous tenant left. Gating
-// re-initialisation on firstActivation stalled exactly that shape — the e2e
-// suite caught vol-1 never leaving Diskless while the kernel had it UpToDate.
-// What tells an established replica apart is a GI it reported, see
-// TestEnsureMetadataRepairsTheCrashOfAReplicaWithAReportedGI.
-func TestEnsureMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
-	for _, firstActivation := range []bool{true, false} {
-		rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+// An unclean superblock on a volume with no GI recorded for it is not
+// re-created, on either metadata path and either activation arm. Before, it
+// was: create-md --force threw away the GI and dirty bitmap of a replica
+// that went down while Primary and writing before a GI was recorded for it,
+// an adopted LINSTOR replica on its first activation here among them, and a
+// full resync followed, or data loss when it held the last good copy.
+// LINSTOR never re-creates metadata that is there. A new lower disk carries
+// no superblock, so the refusal cannot stall one: zvols and thin volumes
+// read zeros, and a thick LV is wiped before it is named.
+func TestAnUncleanVolumeWithNoRecordedGIIsRefused(t *testing.T) {
+	for name, run := range map[string]func(*Reconciler, *intent.DesiredResource, map[int32]string, string) error{
+		"first activation": func(rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, marker string) error {
+			return rec.ensureMetadata(t.Context(), dr, devices, marker, true)
+		},
+		"diskful flip": func(rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, marker string) error {
+			return rec.ensureMetadata(t.Context(), dr, devices, marker, false)
+		},
+		"per volume": func(rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, _ string) error {
+			return rec.ensurePerVolumeMetadata(t.Context(), dr, devices, false)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
 
-		if !firstActivation {
-			if err := os.WriteFile(mdMarkerPath, nil, 0o600); err != nil {
-				t.Fatalf("seed .md-created marker: %v", err)
+			err := run(rec, dr, devices, mdMarkerPath)
+			if !errors.Is(err, drbd.ErrUncleanMetadataUnrecorded) {
+				t.Fatalf("err = %v, want %v", err, drbd.ErrUncleanMetadataUnrecorded)
 			}
-		}
 
-		err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, firstActivation)
-		if err != nil {
-			t.Fatalf("firstActivation=%v: ensureMetadata: %v", firstActivation, err)
-		}
-
-		created := false
-
-		for _, line := range fx.CommandLines() {
-			if strings.Contains(line, "create-md") {
-				created = true
+			if !strings.Contains(err.Error(), "drbdadm apply-al pvc-unclean/0") {
+				t.Errorf("err = %v, want it to name the command that keeps the metadata", err)
 			}
-		}
 
-		if !created {
-			t.Errorf("firstActivation=%v: the volume was left without metadata", firstActivation)
-		}
+			for _, cmd := range []string{"create-md", "apply-al", "set-gi"} {
+				if ranCommand(fx, cmd) {
+					t.Errorf("%s ran over metadata nothing records as foreign", cmd)
+				}
+			}
+		})
 	}
 }
 
-// ensurePerVolumeMetadata carries its own copy of the unclean mapping, and
-// nothing drove it before: deleting that mapping left the whole suite green
-// while an unclean lower disk stopped being initialised on the path that
-// reaches established resources.
-//
-// The behaviour is the same as its ensureMetadata twin and pinned for the
-// same reason — see TestEnsureMetadataInitialisesAnUncleanLowerDisk.
-func TestEnsurePerVolumeMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
-	rec, dr, devices, _, fx := uncleanFixture(t)
+// A restore is the one volume with no GI that is initialised over an
+// unclean superblock: a clone or a receive of a snapshot of an attached
+// volume carries the source's superblock with its activity log open, and
+// needs metadata of its own. Once this node created metadata for it, the
+// superblock is the replica's own and a dirty log on it is refused like
+// any other.
+func TestAnUncleanRestoreIsInitialisedOnlyBeforeItsMetadataIsCreated(t *testing.T) {
+	for name, tc := range map[string]struct {
+		created func(t *testing.T, dr *intent.DesiredResource, marker string)
+		init    bool
+	}{
+		"not yet created": {created: func(*testing.T, *intent.DesiredResource, string) {}, init: true},
+		"condition": {created: func(_ *testing.T, dr *intent.DesiredResource, _ string) {
+			dr.MetadataCreated = true
+		}},
+		"marker": {created: func(t *testing.T, _ *intent.DesiredResource, marker string) {
+			t.Helper()
 
-	err := rec.ensurePerVolumeMetadata(context.Background(), dr, devices, false)
-	if err != nil {
-		t.Fatalf("ensurePerVolumeMetadata: %v", err)
-	}
+			if err := os.WriteFile(marker, nil, 0o600); err != nil {
+				t.Fatalf("seed .md-created marker: %v", err)
+			}
+		}},
+	} {
+		for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
+			t.Run(name+"/"+path, func(t *testing.T) {
+				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+				dr.Volumes[0].SourceSnapshot = "pvc-source:snap-1"
+				tc.created(t, dr, mdMarkerPath)
 
-	for _, line := range fx.CommandLines() {
-		if strings.Contains(line, "create-md") {
-			return
+				err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath)
+
+				if tc.init {
+					if err != nil {
+						t.Fatalf("%s: %v", path, err)
+					}
+
+					if !ranCommand(fx, "create-md") {
+						t.Error("the restored volume was left without metadata of its own")
+					}
+
+					return
+				}
+
+				if !errors.Is(err, drbd.ErrUncleanMetadataUnrecorded) {
+					t.Fatalf("err = %v, want %v", err, drbd.ErrUncleanMetadataUnrecorded)
+				}
+
+				if ranCommand(fx, "create-md") {
+					t.Error("create-md ran over a restored replica whose metadata was created here")
+				}
+			})
 		}
 	}
-
-	t.Error("the volume was left without metadata")
 }
 
 const (

@@ -320,6 +320,16 @@ var metadataAbsentMarkers = []string{
 // looking at, so the probe names the state and refuses to guess.
 var ErrMetadataUnclean = errors.New("metadata is present but its activity log needs applying")
 
+// ErrUncleanMetadataUnrecorded reports metadata under an unapplied
+// activity log on a volume that its replica holds no record of: no GI
+// was ever seen on it, and it is not the destination of a restore. It
+// can be a replica that went down while Primary and writing before a GI
+// was recorded for it, a LINSTOR one among them, and re-creating its
+// metadata would throw away its GI and dirty bitmap. LINSTOR never
+// re-creates metadata that is there; an operator decides instead.
+var ErrUncleanMetadataUnrecorded = errors.New(
+	"refusing to re-create metadata under an unapplied activity log on a volume with no recorded GI")
+
 // metadataUncleanMarkers are the exits that positively state that.
 //
 //nolint:gochecknoglobals // a fixed vocabulary, matched in one place

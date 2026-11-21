@@ -72,22 +72,23 @@ func TestARestoredCloneKeepsThePeerSlotsOfItsSource(t *testing.T) {
 	}
 }
 
-// A superblock that is there decides the layout whatever made it. Every
-// replica adopted from LINSTOR carries metadata for 7 slots, and one that
-// crashed with its activity log open and no GI recorded here is
-// re-initialised: with 15 slots, drbdmeta refused it under ext4, and under
-// a partition table or a VM disk --force let it overwrite the end of the
-// data. It keeps its 7. A superblock with more slots than blockstor creates
-// gets 15, which is smaller and fits; one blockstor made keeps its 15.
+// A superblock that is there decides the layout whatever made it. A volume
+// LINSTOR created carries metadata for 7 slots, and re-initialised with 15,
+// drbdmeta refused it under ext4, and under a partition table or a VM disk
+// --force let it overwrite the end of the data. It keeps its 7. A
+// superblock with more slots than blockstor creates gets 15, which is
+// smaller and fits; one blockstor made keeps its 15. An adopted replica
+// with no GI recorded here is not re-initialised at all, see
+// TestAnUncleanVolumeWithNoRecordedGIIsRefused.
 func TestAReinitialisedSuperblockKeepsItsLayout(t *testing.T) {
 	for name, tc := range map[string]struct {
 		source string
 		slots  int
 		want   string
 	}{
-		"adopted, not a restore": {slots: 7, want: "--max-peers=7"},
+		"restore of LINSTOR's":   {source: "pvc-source:snap-1", slots: 7, want: "--max-peers=7"},
 		"restore of 31 slots":    {source: "pvc-source:snap-1", slots: 31, want: "--max-peers=15"},
-		"blockstor's own":        {slots: 15, want: "--max-peers=15"},
+		"restore of blockstor's": {source: "pvc-source:snap-1", slots: 15, want: "--max-peers=15"},
 	} {
 		for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
 			t.Run(name+"/"+path, func(t *testing.T) {
