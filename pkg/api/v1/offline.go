@@ -46,9 +46,14 @@ func OnOfflineNode(r *Resource, offline map[string]struct{}) bool {
 	return ok
 }
 
-// ForgetSatelliteState drops from a replica everything only its
-// satellite can report: the role, every volume's disk and replication
-// state and every peer link, in the layer data too.
+// ForgetSatelliteState drops from a replica everything LINSTOR answers
+// from the satellite's live state: the role, every volume's disk and
+// replication state, and the DRBD layer's peer links.
+//
+// The layer volumes' own disk_state stays. LINSTOR fills it from the
+// layer data the controller merged from the satellite's last apply
+// (CtrlRscLayerDataMerger) and keeps that when the satellite goes
+// offline, so its answer still carries it.
 //
 // The store keeps the satellite's last report after the satellite
 // goes away, so a replica on a dead node would keep reading UpToDate
@@ -112,24 +117,7 @@ func forgetLayerState(layer *ResourceLayer) *ResourceLayer {
 	if layer.Drbd != nil {
 		drbd := *layer.Drbd
 		drbd.Connections = nil
-		drbd.DrbdVolumes = slices.Clone(drbd.DrbdVolumes)
-
-		for i := range drbd.DrbdVolumes {
-			drbd.DrbdVolumes[i].DiskState = ""
-		}
-
 		out.Drbd = &drbd
-	}
-
-	if layer.Storage != nil {
-		storage := *layer.Storage
-		storage.StorageVolumes = slices.Clone(storage.StorageVolumes)
-
-		for i := range storage.StorageVolumes {
-			storage.StorageVolumes[i].DiskState = ""
-		}
-
-		out.Storage = &storage
 	}
 
 	return &out

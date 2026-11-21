@@ -63,8 +63,16 @@ func TestForgetSatelliteStateLeavesSharedDataAlone(t *testing.T) {
 
 	got := answered[0]
 	if got.State.InUse != nil || got.State.DrbdState != "" || got.Volumes[0].State.DiskState != "" ||
-		got.LayerObject.Drbd.Connections != nil || got.LayerObject.Drbd.DrbdVolumes[0].DiskState != "" ||
-		got.LayerObject.Children[0].Storage.StorageVolumes[0].DiskState != "" {
+		got.LayerObject.Drbd.Connections != nil {
 		t.Errorf("replica on the OFFLINE node (spelled in another case) kept satellite state: %+v", got)
+	}
+
+	// LINSTOR answers the layer volumes from the layer data the
+	// controller merged from the last apply, which it keeps while the
+	// satellite is offline.
+	if got.LayerObject.Drbd.DrbdVolumes[0].DiskState != "UpToDate" ||
+		got.LayerObject.Children[0].Storage.StorageVolumes[0].DiskState != "UpToDate" {
+		t.Errorf("layer volumes lost the disk state LINSTOR keeps: drbd %+v, storage %+v",
+			got.LayerObject.Drbd.DrbdVolumes, got.LayerObject.Children[0].Storage.StorageVolumes)
 	}
 }

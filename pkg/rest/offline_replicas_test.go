@@ -104,12 +104,6 @@ func assertNoSatelliteState(t *testing.T, where string, rsc *apiv1.ResourceWithV
 		if len(rsc.LayerObject.Drbd.Connections) > 0 {
 			t.Errorf("%s: replica on the OFFLINE node keeps its peer links: %+v", where, rsc.LayerObject.Drbd.Connections)
 		}
-
-		for _, vol := range rsc.LayerObject.Drbd.DrbdVolumes {
-			if vol.DiskState != "" {
-				t.Errorf("%s: DRBD layer volume %d keeps %q", where, vol.VolumeNumber, vol.DiskState)
-			}
-		}
 	}
 }
 
