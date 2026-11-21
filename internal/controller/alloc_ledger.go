@@ -56,8 +56,10 @@ import (
 // strictly one after another at the speed of those lists. The point
 // reads past the cache here happen only while the cache trails.
 //
-// Every access happens under clusterAllocMu, which also covers the
-// writes, so the ledger needs no lock of its own.
+// Every access happens under clusterAllocMu, so the ledger needs no
+// lock of its own. The writes that persist a reservation run after the
+// mutex is released: the reservation is what keeps the value taken
+// while they are in flight.
 type allocLedger struct {
 	replicas map[string]replicaGrant
 	minors   map[string]minorGrant

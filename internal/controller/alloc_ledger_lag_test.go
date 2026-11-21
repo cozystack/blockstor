@@ -20,8 +20,10 @@ package controller_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -254,5 +256,149 @@ func TestRetryAfterAFailedWriteKeepsTheLowestValues(t *testing.T) {
 
 	if *target.Spec.DRBDNodeID != 0 || *target.Spec.DRBDPort != 20000 {
 		t.Errorf("retried replica got node id %d, port %d; want 0, 20000", *target.Spec.DRBDNodeID, *target.Spec.DRBDPort)
+	}
+}
+
+// TestAllocationDoesNotWaitForAnotherReplicasWrites pins that the
+// allocation lock covers choosing a replica's identities, not the API
+// writes that persist them. Held across the writes, it made every new
+// replica of a provisioning burst wait for the round trips of all the
+// replicas before it, so the last ones got their identities, and the
+// satellites started building them, many seconds after they were
+// created. The replica allocated meanwhile must still get its own port
+// and minor: the first one's are reserved while their writes are in
+// flight.
+func TestAllocationDoesNotWaitForAnotherReplicasWrites(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	objs := burstObjects(2, "w1")
+	live := newBurstClient(t, objs)
+	frozen := newBurstClient(t, objs)
+
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	cache := cacheOf(live, frozen, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if strings.HasPrefix(obj.GetName(), "pvc-burst-00") {
+				once.Do(func() {
+					close(blocked)
+					<-release
+				})
+			}
+
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	rec := &controllerpkg.ResourceReconciler{Client: cache, Scheme: live.Scheme(), APIReader: live}
+
+	allocate := func(name string) <-chan error {
+		done := make(chan error, 1)
+
+		go func() {
+			var target blockstoriov1alpha1.Resource
+			if err := live.Get(ctx, client.ObjectKey{Name: name}, &target); err != nil {
+				done <- err
+
+				return
+			}
+
+			_, err := rec.EnsureDRBDIDsForTest(ctx, &target, nil)
+			done <- err
+		}()
+
+		return done
+	}
+
+	first := allocate("pvc-burst-00.w1")
+	<-blocked
+
+	select {
+	case err := <-allocate("pvc-burst-01.w1"):
+		if err != nil {
+			t.Fatalf("allocate pvc-burst-01.w1: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("pvc-burst-01.w1 waited for the writes of pvc-burst-00.w1")
+	}
+
+	close(release)
+
+	if err := <-first; err != nil {
+		t.Fatalf("allocate pvc-burst-00.w1: %v", err)
+	}
+
+	assertBurstUnique(ctx, t, live, 2)
+}
+
+// TestDefinitionWrittenMeanwhileStillGetsItsMinor pins a write to the
+// definition, any write, landing between the allocator's read of it
+// and the write of the minors. The minor write carries the
+// resourceVersion it read, so it fails with a conflict; the allocator
+// took that for a sibling having written the minors first and went on
+// without them. The replica then came up with no minor on its
+// definition until some later event reconciled it again, a whole
+// pass of a provisioning burst lost.
+func TestDefinitionWrittenMeanwhileStillGetsItsMinor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	objs := burstObjects(1, "w1")
+	live := newBurstClient(t, objs)
+
+	var (
+		mu      sync.Mutex
+		touched bool
+	)
+
+	cache := interceptor.NewClient(live, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			mu.Lock()
+			defer mu.Unlock()
+
+			if _, ok := obj.(*blockstoriov1alpha1.ResourceDefinition); ok && !touched {
+				touched = true
+
+				var rd blockstoriov1alpha1.ResourceDefinition
+				if err := c.Get(ctx, client.ObjectKeyFromObject(obj), &rd); err != nil {
+					return err
+				}
+
+				rd.Annotations = map[string]string{"example.com/touched": "true"}
+				if err := c.Update(ctx, &rd); err != nil {
+					return err
+				}
+			}
+
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	rec := &controllerpkg.ResourceReconciler{Client: cache, Scheme: live.Scheme(), APIReader: live}
+
+	allocateEach(ctx, t, rec, live, onlyKind[*blockstoriov1alpha1.Resource](objs))
+
+	if !touched {
+		t.Fatal("the definition was never written meanwhile")
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+	if err := live.Get(ctx, client.ObjectKey{Name: "pvc-burst-00"}, &rd); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if rd.Spec.VolumeDefinitions[0].DRBDMinor == nil {
+		t.Fatal("definition has no minor after the allocation pass")
+	}
+
+	var res blockstoriov1alpha1.Resource
+	if err := live.Get(ctx, client.ObjectKey{Name: "pvc-burst-00.w1"}, &res); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if res.Status.DRBDMinor == nil || *res.Status.DRBDMinor != *rd.Spec.VolumeDefinitions[0].DRBDMinor {
+		t.Errorf("replica mirrors minor %v, definition has %d", res.Status.DRBDMinor, *rd.Spec.VolumeDefinitions[0].DRBDMinor)
 	}
 }
