@@ -73,7 +73,8 @@ func RegisterReplicaKeyIndex(indexer ctrlclient.FieldIndexer) error {
 var serverRefusesSelector atomic.Bool
 
 // ReplicasOf lists into list the Resource objects of definition rdName
-// through reader, whichever spelling of the name they carry.
+// through reader, whichever spelling of the name they carry, sorted by
+// object name the way a whole-collection list is.
 //
 // It asks for the definition's replicas only, one field-selected read
 // per spelling, instead of reading every Resource in the cluster and
@@ -142,6 +143,8 @@ func ReplicasOf(ctx context.Context, reader, cache ctrlclient.Reader, rdName str
 			out = append(out, found.Items[i])
 		}
 	}
+
+	slices.SortFunc(out, func(a, b crdv1alpha1.Resource) int { return strings.Compare(a.Name, b.Name) })
 
 	list.Items = out
 

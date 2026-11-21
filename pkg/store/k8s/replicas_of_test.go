@@ -267,6 +267,35 @@ func TestReplicasOfTakesACachedDefinitionsSpellingsFromTheCache(t *testing.T) {
 	}
 }
 
+// A whole-collection list comes back sorted by object name, and the read
+// that replaced it answers in the same order, whichever spellings the
+// replicas are found under.
+func TestReplicasOfAnswersInObjectNameOrder(t *testing.T) {
+	t.Parallel()
+
+	cli := keyIndexedCluster(t,
+		&crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix"}},
+		replicaRow("pvc-mix.n1", "Pvc-Mix", "n1"),
+		replicaRow("pvc-mix.n2", "pvc-mix", "n2"),
+	)
+
+	var got crdv1alpha1.ResourceList
+
+	err := k8s.ReplicasOf(context.Background(), cli, cli, "pvc-mix", &got)
+	if err != nil {
+		t.Fatalf("ReplicasOf: %v", err)
+	}
+
+	names := make([]string, 0, len(got.Items))
+	for i := range got.Items {
+		names = append(names, got.Items[i].Name)
+	}
+
+	if want := []string{"pvc-mix.n1", "pvc-mix.n2"}; !slices.Equal(names, want) {
+		t.Errorf("replicas of pvc-mix in order %v, want %v", names, want)
+	}
+}
+
 // A server whose CRD predates the selectable field refuses the selector.
 // Once it has, every later read goes straight to the whole-cluster list,
 // one request as before the scoped read existed, instead of asking for the
