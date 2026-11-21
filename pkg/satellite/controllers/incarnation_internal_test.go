@@ -33,8 +33,13 @@ import (
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
-// Every satellite start must name a new process: a report the process
-// before a reboot left behind is told apart only by a different name.
+// Every satellite start must name a new process, a restart on the same
+// kernel boot included. LINSTOR keeps a satellite's state on the
+// connection to it and drops it when that connection closes, so it
+// shows a node's replicas Unknown after any satellite restart until the
+// new satellite reports them. A report the previous process left behind
+// is told apart only by a different name; reusing one across restarts
+// would also keep showing a replica that left the kernel in between.
 func TestEachSatelliteStartPicksANewIncarnation(t *testing.T) {
 	t.Parallel()
 
@@ -45,6 +50,11 @@ func TestEachSatelliteStartPicksANewIncarnation(t *testing.T) {
 	if first.Incarnation == "" || first.Incarnation == second.Incarnation {
 		t.Fatalf("incarnations %q and %q; want two distinct non-empty ones", first.Incarnation, second.Incarnation)
 	}
+}
+
+// A test or caller that names the incarnation itself keeps it.
+func TestWiringKeepsAGivenIncarnation(t *testing.T) {
+	t.Parallel()
 
 	preset := &Config{Incarnation: "given"}
 	ensureWiredDefaults(preset)

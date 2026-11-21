@@ -96,6 +96,12 @@ func ForgetSatelliteState(r *Resource) {
 // it reports one the store still holds the report from before the
 // crash. Showing that would read a replica that is not even up yet as
 // UpToDate and connected.
+//
+// A restart of the satellite alone hides the node's replicas too, as
+// LINSTOR shows them Unknown until the reconnected satellite has sent
+// their state. The kernel still holds them then, so the new satellite
+// writes them all right after the initial events2 state, and that
+// lasts seconds.
 func ForgetStaleSatelliteState(resources []Resource, nodes []Node) {
 	live := liveSatellites(nodes)
 
