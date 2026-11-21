@@ -20,6 +20,7 @@ package controllers
 
 import (
 	"context"
+	"io"
 	"net"
 	"time"
 
@@ -54,9 +55,11 @@ const HeartbeatPeriod = 10 * time.Second
 // is alive gets marked OFFLINE because a different node went down.
 const HeartbeatTimeout = 5 * time.Second
 
-// HeartbeatRetryPeriod is how soon a failed stamp is retried. Waiting
-// a full HeartbeatPeriod after a failure would spend a third of the
-// grace period on a single lost write.
+// HeartbeatRetryPeriod is how soon a stamp that failed to reach an
+// API server is retried. Waiting a full HeartbeatPeriod after such a
+// failure would spend a fifth of the grace period on one lost write.
+// A stamp the API server answered with an error backs off from here
+// instead, up to HeartbeatPeriod.
 const HeartbeatRetryPeriod = time.Second
 
 // HeartbeatFieldOwner is the SSA field-manager the heartbeat
@@ -130,9 +133,10 @@ type HeartbeatRunnable struct {
 	RetryPeriod time.Duration
 
 	// ResetConnections, when set, closes every connection Client
-	// holds, the busy ones included. A failed stamp calls it so the
-	// retry dials again instead of queueing behind a connection to an
-	// API server that is gone (see NewHeartbeatClient).
+	// holds, the busy ones included. A stamp that did not reach an API
+	// server calls it so the retry dials again instead of queueing
+	// behind a connection to an API server that is gone (see
+	// NewHeartbeatClient).
 	ResetConnections func()
 
 	// missCount tracks consecutive NotFound observations. Reset
@@ -169,6 +173,8 @@ func (h *HeartbeatRunnable) Start(ctx context.Context) error {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
+	backoff := retry
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -177,19 +183,47 @@ func (h *HeartbeatRunnable) Start(ctx context.Context) error {
 			next := period
 
 			err := h.stampWithin(ctx, logger)
-			if err != nil {
-				logger.Error(err, "heartbeat stamp")
+			switch {
+			case err == nil:
+				backoff = retry
+			case unreachable(err):
+				logger.Error(err, "heartbeat stamp did not reach an API server")
 
 				if h.ResetConnections != nil {
 					h.ResetConnections()
 				}
 
 				next = retry
+			default:
+				// The API server is there and said no: overloaded, a
+				// revoked grant, a CRD mid-upgrade. A new connection
+				// would get the same answer, and every satellite
+				// redialling and resending each second would load an
+				// API server that may already be shedding requests.
+				logger.Error(err, "heartbeat stamp refused")
+
+				next = backoff
+				backoff = min(2*backoff, period)
 			}
 
 			timer.Reset(next)
 		}
 	}
+}
+
+// unreachable reports whether a stamp failed for want of a working
+// connection to an API server, rather than on an answer from one.
+// Only then does a new connection, and a quick retry, help.
+func unreachable(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
+		return true
+	}
+
+	var netErr net.Error
+
+	return errors.As(err, &netErr)
 }
 
 // NewHeartbeatClient builds the client the heartbeat stamps with and
