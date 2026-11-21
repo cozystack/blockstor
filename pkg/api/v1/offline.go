@@ -67,13 +67,6 @@ func ForgetSatelliteState(r *Resource) {
 	r.LayerObject = forgetLayerState(r.LayerObject)
 }
 
-// ForgetSatelliteStateWithVolumes is ForgetSatelliteState for the
-// view shape, whose own volume list is the one on the wire.
-func ForgetSatelliteStateWithVolumes(r *ResourceWithVolumes) {
-	ForgetSatelliteState(&r.Resource)
-	r.Volumes = forgetVolumeStates(r.Volumes)
-}
-
 // ForgetStateOnOfflineNodes applies ForgetSatelliteState to every
 // replica on a node that is OFFLINE.
 func ForgetStateOnOfflineNodes(resources []Resource, nodes []Node) {
