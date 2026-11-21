@@ -61,13 +61,17 @@ func (r *Reconciler) adjustFailedBefore(name string) bool {
 }
 
 // recordAdjustOutcome keeps the failed-adjust record in step with the
-// adjust that just ran. Only an adjust that configured the network
-// clears it: one run with --skip-net left the connections as they were.
+// adjust that just ran. Only an adjust that configured the network sets
+// or clears it. One run with --skip-net left the connections as they
+// were, so it cannot have half built them, and recording its failure
+// would turn the retry into a full adjust that connects a peer the
+// operator disconnected, the first step of a split-brain recovery.
 func (r *Reconciler) recordAdjustOutcome(ctx context.Context, name string, skipNet bool, adjustErr error) {
 	switch {
+	case skipNet:
 	case adjustErr != nil:
 		r.setAdjustFailed(ctx, name)
-	case !skipNet:
+	default:
 		r.forgetAdjustFailed(name)
 	}
 }

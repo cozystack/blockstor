@@ -38,6 +38,8 @@ const (
 var errPortInUse = errors.New("drbdadm adjust: Failure: (103) Remote address(port) already in use. " +
 	"Command 'drbdsetup new-path " + portInUseRes + " 0 ipv4:10.0.0.1:7001 ipv4:10.0.0.3:7003' terminated with exit code 10")
 
+var errLowerDevTooSmall = errors.New("drbdadm adjust: Failure: (111) Low.dev. smaller than requested DRBD-dev. size")
+
 // portInUseStatus is the kernel a failed adjust of a new replica leaves:
 // the connections and their peer devices exist, nothing connected them.
 // The same status follows an operator's `drbdadm disconnect`.
@@ -159,6 +161,39 @@ func TestAdjustRetriesAFailedAdjustInFullAfterARestart(t *testing.T) {
 
 	if after.adjustFailedBefore(portInUseRes) {
 		t.Error("a full adjust that went through must clear the record")
+	}
+}
+
+// An adjust run with --skip-net never touched the connections, so its
+// failure, a disk-side one, is no reason to configure the network on
+// the retry: that would connect a peer the operator disconnected as the
+// first step of a split-brain recovery.
+func TestFailedSkipNetAdjustKeepsTheOperatorsDisconnect(t *testing.T) {
+	t.Parallel()
+
+	fx := portInUseExec()
+	fx.Expect("drbdsetup status -j "+portInUseRes, portInUseStatus())
+	fx.ExpectSequence(portInUseSkipNet, storage.FakeResponse{Err: errLowerDevTooSmall})
+
+	rec := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: t.TempDir(), NodeName: "n1"})
+	dr := portInUseDesired()
+
+	if err := rec.adjustResource(t.Context(), dr, false); err == nil {
+		t.Fatal("the disk-side failure must surface")
+	}
+
+	if rec.adjustFailedBefore(portInUseRes) {
+		t.Error("a failed --skip-net adjust must not record a failed adjust")
+	}
+
+	fx.Reset()
+
+	if err := rec.adjustResource(t.Context(), dr, false); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+
+	if cmds := fx.CommandLines(); !slices.Contains(cmds, portInUseSkipNet) || slices.Contains(cmds, portInUseBare) {
+		t.Errorf("the retry must keep the operator's disconnect with --skip-net; got %v", cmds)
 	}
 }
 
