@@ -4,6 +4,22 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.7 — 2026-11-20
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #302 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.6; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.6
+
+- **The satellite image ships drbd-utils 9.36.0 (#275).** Its drbdmeta keeps the bitmap provenance feature when `apply-al` rewrites the superblock after a crash, so a rejoining Secondary is no longer made a resync source, or refused by a Primary, for its activity log bits.
+- **A failed adjust or up is retried in full (#299).** A half-built connection is no longer mistaken for an operator's disconnect and kept with `--skip-net`, so a replica left `StandAlone` by a failed apply reconnects once the cause is gone.
+- **A failing apply backs off and is reported on the Resource (#299).** Retries start at five seconds and double up to five minutes, and every failure is a Warning Event, `ApplyFailed` unless it is a LUKS refusal.
+- **A burst of new volumes gets its DRBD identities in seconds (#300).** The allocator reads the taken node ids, ports and minors from the cache, a ledger reserves each one until the cache shows it, and the resource controller runs eight workers.
+- **`AutoSnapshot/RunEvery` takes one snapshot per interval (#301).** The schedule polls every ten seconds and books each snapshot at the slot that fell due, so `RunEvery 1` no longer takes one every two minutes; after downtime one snapshot is taken, not a catch-up burst.
+- **An offline or restarted node's replicas read as `Unknown` (#302).** REST and the CLI drop the stored state a satellite reported before it went away or restarted, so `r l --faulty` lists them; new optional `satelliteIncarnation` fields on Node and Resource status carry the check.
+- **Rebalance re-reads a definition around each placement (#280).** A pass that placed while linstor-csi switched balancing off or started a delete takes back the replicas it created, and the replica list of such a definition is read past the cache.
+- **Resource create waits keep the replicas they just wrote in view (#291).** A replica or volume the cache does not list yet is read from the API server, and the two placement calls of one CreateVolume share one build bound.
+- **A snapshot refused on a non-UpToDate replica is deleted (#292).** It goes once every node resumed I/O, and the create answers with LINSTOR's `FAIL_SNAPSHOT_NOT_UPTODATE` after the delete.
+
 ## v0.4.0-alpha.6 — 2026-11-20
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #298 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.5; the entries below are what changed since.
