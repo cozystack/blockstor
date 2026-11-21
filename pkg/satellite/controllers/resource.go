@@ -52,6 +52,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // kubeInternalNICName is the NetInterface name the dispatcher prefers
@@ -1210,11 +1211,12 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 // what produces Bug 80's stuck-Inconsistent outcome. Falls back to
 // the cached client when APIReader is nil (unit-test path).
 func (r *ResourceReconciler) listPeerResources(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]blockstoriov1alpha1.Resource, error) {
-	reader := r.peerReader()
-
 	var resList blockstoriov1alpha1.ResourceList
 
-	err := reader.List(ctx, &resList)
+	// Only the definition's replicas: every pass of every replica on the
+	// node runs this, and reading the whole cluster here took the
+	// satellite's CPU (storek8s.ReplicasOf).
+	err := storek8s.ReplicasOf(ctx, r.peerReader(), r.Client, target.Spec.ResourceDefinitionName, &resList)
 	if err != nil {
 		return nil, errors.Wrap(err, "list Resources for peer set")
 	}
