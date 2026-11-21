@@ -50,10 +50,13 @@ const HeartbeatPeriod = 10 * time.Second
 
 // HeartbeatTimeout bounds one stamp. Without it a stamp sent down a
 // connection whose API server endpoint died without a FIN or RST
-// waits for TCP or the HTTP/2 health check to give up, about 45 s,
-// which is longer than the controller's grace period: a node that
-// is alive gets marked OFFLINE because a different node went down.
-const HeartbeatTimeout = 5 * time.Second
+// waits for TCP or the HTTP/2 health check to give up, which can be
+// longer than the controller's grace period: a node that is alive
+// gets marked OFFLINE because a different node went down. It is no
+// shorter than kubelet's bound on a node status update, one period,
+// so an API server that is alive but slow to commit, an etcd that
+// is catching up after it lost a member, still gets the stamp in.
+const HeartbeatTimeout = HeartbeatPeriod
 
 // HeartbeatRetryPeriod is how soon a stamp that failed to reach an
 // API server is retried. Waiting a full HeartbeatPeriod after such a
