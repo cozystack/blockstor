@@ -19,6 +19,8 @@ limitations under the License.
 package zfs_test
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -58,7 +60,7 @@ func TestZFSAgainstRealPool(t *testing.T) {
 
 	// Cleanup whatever a prior aborted run left behind.
 	t.Cleanup(func() {
-		_ = provider.DeleteVolume(t.Context(), vol)
+		_ = provider.DeleteVolume(context.Background(), vol)
 	})
 
 	err := provider.CreateVolume(ctx, vol)
@@ -122,9 +124,7 @@ func TestZFSAgainstRealPool(t *testing.T) {
 // TestZFSPoolStatusAgainstRealPool just walks PoolStatus once and
 // verifies the numbers look sensible.
 func TestZFSPoolStatusAgainstRealPool(t *testing.T) {
-	if _, err := exec.LookPath("zpool"); err != nil {
-		t.Skip("zpool binary not on PATH; skipping integration smoke")
-	}
+	requireZFSTools(t)
 
 	pool := requireEnv(t, "BLOCKSTOR_ZFS_POOL")
 
@@ -154,23 +154,82 @@ func TestZFSPoolStatusAgainstRealPool(t *testing.T) {
 // until the blocks are written, which is how a thick pool came to
 // advertise space its refreservations had already taken.
 func TestZFSThickVolumeConsumesFreeCapacity(t *testing.T) {
-	if _, err := exec.LookPath("zfs"); err != nil {
-		t.Skip("zfs binary not on PATH; skipping integration smoke")
-	}
+	requireZFSTools(t)
 
 	pool := requireEnv(t, "BLOCKSTOR_ZFS_POOL")
 
 	provider := zfs.NewProvider(zfs.Config{Pool: pool}, storage.RealExec{})
-	ctx := t.Context()
 
-	vol := storage.Volume{
+	assertThickVolumeConsumesFree(t, provider, storage.Volume{
 		ResourceName: "blockstor-it-free",
 		VolumeNumber: 0,
 		SizeKib:      64 * 1024,
+	})
+}
+
+// TestZFSPoolStatusChildDatasetQuota checks a pool configured as a
+// child dataset carrying a quota, the layout LINSTOR supports and the
+// one `zpool list` could not answer: total must be the quota, and a
+// thick zvol inside it must come off the reported free capacity.
+func TestZFSPoolStatusChildDatasetQuota(t *testing.T) {
+	requireZFSTools(t)
+
+	parent := requireEnv(t, "BLOCKSTOR_ZFS_POOL")
+	child := parent + "/blockstor-it-quota"
+
+	const quotaBytes = 256 * 1024 * 1024
+
+	ctx := t.Context()
+	run := storage.RealExec{}
+
+	// A run aborted before its cleanup leaves the dataset behind,
+	// possibly with a different quota; start from nothing.
+	destroyDatasetIfPresent(t, run, child)
+	t.Cleanup(func() { destroyDatasetIfPresent(t, run, child) })
+
+	out, err := run.Run(ctx, "zfs", "create", "-o", fmt.Sprintf("quota=%d", quotaBytes), child)
+	if err != nil {
+		t.Fatalf("zfs create %s: %v: %s", child, err, out)
+	}
+
+	provider := zfs.NewProvider(zfs.Config{Pool: child}, run)
+
+	ps, err := provider.PoolStatus(ctx)
+	if err != nil {
+		t.Fatalf("PoolStatus: %v", err)
+	}
+
+	if ps.TotalCapacityKib != quotaBytes/1024 {
+		t.Errorf("TotalCapacityKib: got %d, want the quota %d", ps.TotalCapacityKib, quotaBytes/1024)
+	}
+
+	if ps.FreeCapacityKib <= 0 || ps.FreeCapacityKib > ps.TotalCapacityKib {
+		t.Errorf("FreeCapacityKib: got %d, want 1..%d", ps.FreeCapacityKib, ps.TotalCapacityKib)
+	}
+
+	assertThickVolumeConsumesFree(t, provider, storage.Volume{
+		ResourceName: "blockstor-it-quota-vol",
+		VolumeNumber: 0,
+		SizeKib:      64 * 1024,
+	})
+}
+
+// assertThickVolumeConsumesFree creates vol on provider and fails
+// unless the reported free capacity drops by at least its size.
+func assertThickVolumeConsumesFree(t *testing.T, provider *zfs.Provider, vol storage.Volume) {
+	t.Helper()
+
+	ctx := t.Context()
+
+	// A zvol left by an aborted run would make CreateVolume a no-op,
+	// free would not move, and the test would fail for no reason.
+	err := provider.DeleteVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("DeleteVolume (leftover): %v", err)
 	}
 
 	t.Cleanup(func() {
-		_ = provider.DeleteVolume(t.Context(), vol)
+		_ = provider.DeleteVolume(context.WithoutCancel(ctx), vol)
 	})
 
 	before, err := provider.PoolStatus(ctx)
@@ -191,6 +250,35 @@ func TestZFSThickVolumeConsumesFreeCapacity(t *testing.T) {
 	if drop := before.FreeCapacityKib - after.FreeCapacityKib; drop < vol.SizeKib {
 		t.Errorf("free capacity dropped by %d KiB after a %d KiB thick zvol, want at least its size",
 			drop, vol.SizeKib)
+	}
+}
+
+// destroyDatasetIfPresent removes dataset and everything below it,
+// tolerating its absence.
+func destroyDatasetIfPresent(t *testing.T, run storage.Exec, dataset string) {
+	t.Helper()
+
+	ctx := context.Background()
+
+	if _, err := run.Run(ctx, "zfs", "list", "-H", "-o", "name", dataset); err != nil {
+		return
+	}
+
+	out, err := run.Run(ctx, "zfs", "destroy", "-r", dataset)
+	if err != nil {
+		t.Errorf("zfs destroy -r %s: %v: %s", dataset, err, out)
+	}
+}
+
+// requireZFSTools skips unless both `zfs` and `zpool` are on PATH;
+// PoolStatus shells out to each.
+func requireZFSTools(t *testing.T) {
+	t.Helper()
+
+	for _, bin := range []string{"zfs", "zpool"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s binary not on PATH; skipping integration smoke", bin)
+		}
 	}
 }
 
