@@ -5413,7 +5413,7 @@ var errUnresolvedLocalNodeID = errors.Mark(
 // "0" (ok=true) from an absent/empty key (ok=false).
 func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 	if _, ok := localNodeIDFromOpts(dr); !ok {
-		return errUnresolvedLocalNodeID
+		return errors.WithStack(errUnresolvedLocalNodeID)
 	}
 
 	return nil
@@ -5455,7 +5455,7 @@ var errUnresolvedSkipInitialSync = errors.Mark(
 // "not stamped yet" (requeue).
 func refuseUnresolvedSkipInitialSync(dr *intent.DesiredResource, freshActivation bool) error {
 	if freshActivation && dr.GetSkipInitialSync() == nil {
-		return errUnresolvedSkipInitialSync
+		return errors.WithStack(errUnresolvedSkipInitialSync)
 	}
 
 	return nil
