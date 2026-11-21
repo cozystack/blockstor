@@ -236,6 +236,11 @@ func run() int {
 // now aborts startup rather than silently falling back to the
 // (removed) gRPC path.
 func loadRESTConfig() (*rest.Config, error) {
+	err := tuneAPIHealthCheck()
+	if err != nil {
+		return nil, err
+	}
+
 	cfg, err := ctrl.GetConfig()
 	if err != nil {
 		return nil, errors.Wrap(err, "load Kubernetes config")
