@@ -24,9 +24,9 @@ import (
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
-// liveSatellites maps each node (by naming.Key) to the kernel boot
-// whose reports a read may show: none when the heartbeat watchdog has
-// marked the node OFFLINE.
+// liveSatellites maps each node (by naming.Key) to the satellite
+// process whose reports a read may show: none when the heartbeat
+// watchdog has marked the node OFFLINE.
 func liveSatellites(nodes []Node) map[string]liveSatellite {
 	out := make(map[string]liveSatellite, len(nodes))
 
@@ -86,17 +86,15 @@ func ForgetSatelliteState(r *Resource) {
 }
 
 // ForgetStaleSatelliteState applies ForgetSatelliteState to every
-// replica whose stored state does not describe the kernel its node runs
-// now: the node is OFFLINE, or the report predates the node's last
-// reboot. A report from before a satellite restart on the same boot is
-// still current and stays, the way LINSTOR keeps a node's last state
-// until the reconnected satellite refreshes it.
+// replica whose stored state the satellite now running on its node did
+// not report: the node is OFFLINE, or the report came from an earlier
+// satellite process.
 //
 // LINSTOR shows a satellite's state only from the connection it holds
 // to it now. Once the node is back ONLINE, a rebooted satellite brings
 // its replicas up one by one, minutes apart on a busy node, and until
 // it reports one the store still holds the report from before the
-// reboot. Showing that would read a replica that is not even up yet as
+// crash. Showing that would read a replica that is not even up yet as
 // UpToDate and connected.
 func ForgetStaleSatelliteState(resources []Resource, nodes []Node) {
 	live := liveSatellites(nodes)

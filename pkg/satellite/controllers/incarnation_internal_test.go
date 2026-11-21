@@ -20,9 +20,6 @@ package controllers
 
 import (
 	"context"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -36,79 +33,34 @@ import (
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
-// A satellite restart on the same kernel boot must keep the incarnation:
-// the DRBD devices are untouched, so the state the previous process
-// reported is still current, and a new name would hide every replica of
-// the node until the observer had rewritten each one. A reboot drops the
-// devices and must name a new one.
-func TestIncarnationFollowsTheKernelBoot(t *testing.T) {
+// Every satellite start must name a new process, a restart on the same
+// kernel boot included. LINSTOR keeps a satellite's state on the
+// connection to it and drops it when that connection closes, so it
+// shows a node's replicas Unknown after any satellite restart until the
+// new satellite reports them. A report the previous process left behind
+// is told apart only by a different name; reusing one across restarts
+// would also keep showing a replica that left the kernel in between.
+func TestEachSatelliteStartPicksANewIncarnation(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "boot_id")
-	writeBootID(t, path, "boot-a\n")
+	first, second := &Config{}, &Config{}
+	ensureWiredDefaults(first)
+	ensureWiredDefaults(second)
 
-	first, restarted := bootIncarnation(path), bootIncarnation(path)
-	if first != "boot-a" || restarted != first {
-		t.Fatalf("incarnations before and after a satellite restart = %q, %q; want boot-a twice", first, restarted)
-	}
-
-	writeBootID(t, path, "boot-b\n")
-
-	if rebooted := bootIncarnation(path); rebooted != "boot-b" {
-		t.Errorf("incarnation after a reboot = %q, want boot-b", rebooted)
+	if first.Incarnation == "" || first.Incarnation == second.Incarnation {
+		t.Fatalf("incarnations %q and %q; want two distinct non-empty ones", first.Incarnation, second.Incarnation)
 	}
 }
 
-// Without a readable boot id each start still names a new process, so a
-// report is hidden rather than shown when the kernel may no longer back it.
-func TestIncarnationWithoutBootIDIsPerProcess(t *testing.T) {
+// A test or caller that names the incarnation itself keeps it.
+func TestWiringKeepsAGivenIncarnation(t *testing.T) {
 	t.Parallel()
-
-	dir := t.TempDir()
-	empty := filepath.Join(dir, "empty")
-	writeBootID(t, empty, " \n")
-
-	for _, path := range []string{filepath.Join(dir, "missing"), empty} {
-		first, second := bootIncarnation(path), bootIncarnation(path)
-		if first == "" || first == second {
-			t.Errorf("%s: incarnations %q and %q; want two distinct non-empty ones", filepath.Base(path), first, second)
-		}
-	}
 
 	preset := &Config{Incarnation: "given"}
 	ensureWiredDefaults(preset)
 
 	if preset.Incarnation != "given" {
 		t.Errorf("a given incarnation was replaced with %q", preset.Incarnation)
-	}
-}
-
-// The manager names its satellite after the host's kernel boot, so two
-// wirings on one boot agree. Only a Linux host has the file to check.
-func TestManagerIncarnationIsTheKernelBoot(t *testing.T) {
-	t.Parallel()
-
-	raw, err := os.ReadFile(kernelBootIDPath)
-	if err != nil {
-		t.Skipf("no kernel boot id here: %v", err)
-	}
-
-	first, second := &Config{}, &Config{}
-	ensureWiredDefaults(first)
-	ensureWiredDefaults(second)
-
-	want := strings.TrimSpace(string(raw))
-	if first.Incarnation != want || second.Incarnation != want {
-		t.Errorf("incarnations %q and %q; want the boot id %q", first.Incarnation, second.Incarnation, want)
-	}
-}
-
-func writeBootID(t *testing.T, path, id string) {
-	t.Helper()
-
-	err := os.WriteFile(path, []byte(id), 0o600)
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 

@@ -257,13 +257,11 @@ spec:
                 type: string
               satelliteIncarnation:
                 description: |-
-                  satelliteIncarnation identifies the kernel boot the satellite now
-                  running on this node reports DRBD state from: the boot id, or a
-                  per-process value where none can be read. A Resource whose
-                  status.satelliteIncarnation differs was last reported before a
-                  reboot, so its state predates it and is not shown; a restart of
-                  the satellite alone keeps it. Written by the satellite heartbeat;
-                  do not hand-set.
+                  satelliteIncarnation identifies the satellite process now running
+                  on this node; every satellite start picks a new one. A Resource
+                  whose status.satelliteIncarnation differs was last reported by an
+                  earlier process, so its state predates the restart and is not
+                  shown. Written by the satellite heartbeat; do not hand-set.
                 type: string
             type: object
         required:

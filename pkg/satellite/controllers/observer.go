@@ -702,7 +702,7 @@ type ObserverRunnable struct {
 	// field (satellite.Reconciler.RecordObservedGI). Nil records nothing.
 	RecordGI func(rdName string, vol int32, gi string)
 
-	// Incarnation is this satellite's Config.Incarnation,
+	// Incarnation is this satellite process's Config.Incarnation,
 	// written onto Resource.Status with every state the observer
 	// reports. Empty writes none.
 	Incarnation string

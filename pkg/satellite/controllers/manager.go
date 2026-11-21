@@ -19,8 +19,6 @@ limitations under the License.
 package controllers
 
 import (
-	"os"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -219,41 +217,8 @@ func ensureWiredDefaults(cfg *Config) {
 	}
 
 	if cfg.Incarnation == "" {
-		cfg.Incarnation = bootIncarnation(kernelBootIDPath)
+		cfg.Incarnation = string(uuid.NewUUID())
 	}
-}
-
-// kernelBootIDPath holds the id the kernel picks on every boot. The file
-// is not namespaced, so a satellite container reads the host's.
-const kernelBootIDPath = "/proc/sys/kernel/random/boot_id"
-
-// bootIncarnation names the kernel boot the satellite reports DRBD state
-// from: the boot id read from path, or, when that cannot be read, a fresh
-// random value.
-//
-// The reads hide a replica's stored state whose incarnation differs from
-// the node's, so the incarnation must change exactly when the kernel
-// state the store holds a report of may be gone. A reboot drops every
-// DRBD device, and the replicas come back one by one, minutes apart on a
-// busy node; until the new satellite reports one, the report from before
-// the reboot would read UpToDate and connected. A restart of the
-// satellite alone leaves the kernel untouched, so the stored state is
-// still what the kernel holds: LINSTOR shows a node's last state until
-// the reconnected satellite refreshes it, and hiding it here would list
-// every replica of the node as Unknown in `--faulty` until the observer
-// had rewritten each one, 30 to 40 seconds on a node with ~110 replicas.
-//
-// Without a boot id each process stays distinct, which hides more rather
-// than showing a report the kernel may no longer back.
-func bootIncarnation(path string) string {
-	raw, err := os.ReadFile(path)
-	if err == nil {
-		if id := strings.TrimSpace(string(raw)); id != "" {
-			return id
-		}
-	}
-
-	return string(uuid.NewUUID())
 }
 
 // addBackgroundRunnables wires the per-pod background loops
