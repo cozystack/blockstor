@@ -112,7 +112,7 @@ func TestGroupAOfflineNodeReplicasReadUnknown(t *testing.T) {
 
 	// The table linstor-client renders from that answer. Run directly:
 	// the harness CLI always asks for the machine-readable form.
-	table := runLinstorTable(t, stack.RestURL, "resource", "list", "-r", rdName, "--faulty")
+	table := faultyTable(t, stack, rdName)
 
 	row := ""
 
@@ -152,6 +152,18 @@ func reportHealthySecondary(t *testing.T, stack *harness.Stack, name, peer strin
 
 		return stack.Env.Client.Status().Update(context.Background(), &res) == nil
 	}, "report "+name+" as a healthy Secondary")
+}
+
+// faultyTable renders `r l --faulty` for the two diskful replicas. The
+// tie-breaker the controller adds is left out: the mock satellite never
+// reports it, so its DRBD layer carries no data and linstor-client's
+// table crashes on it with a KeyError once the controller has placed
+// it, which it does at an unpredictable moment during the test.
+func faultyTable(t *testing.T, stack *harness.Stack, rdName string) string {
+	t.Helper()
+
+	return runLinstorTable(t, stack.RestURL, "resource", "list", "-r", rdName,
+		"-n", harness.NodeWorker1, harness.NodeWorker2, "--faulty")
 }
 
 // runLinstorTable runs linstor-client for its human-readable table.
