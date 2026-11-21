@@ -1297,11 +1297,13 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug 193: wait until the Snapshot CRD is actually gone (finalizer
-	// drained, CRD reaped) before declaring success. A bounded budget
-	// caps the worst-case latency; on timeout we surface 504 + a
-	// stuck-satellite envelope so the operator gets a concrete next
-	// action instead of a silently-half-completed delete.
-	converged := s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
+	// drained, CRD reaped) before declaring success, as LINSTOR waits
+	// for its satellites. While every listed node is online the wait
+	// lasts as long as the satellites take; once one is offline the
+	// budget applies and we surface 504 + a stuck-satellite envelope so
+	// the operator gets a concrete next action instead of a
+	// silently-half-completed delete.
+	converged := s.waitForSnapshotDrained(r.Context(), rd, snapName)
 	if !converged {
 		writeJSON(w, http.StatusGatewayTimeout, []apiv1.APICallRc{{
 			RetCode: apiCallRcError | apiCallRcFailSnapshotFinalizerStuck,
