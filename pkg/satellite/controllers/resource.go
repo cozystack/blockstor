@@ -1221,15 +1221,7 @@ func (r *ResourceReconciler) listPeerResources(ctx context.Context, target *bloc
 		return nil, errors.Wrap(err, "list Resources for peer set")
 	}
 
-	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
-
-	for i := range resList.Items {
-		if naming.Same(resList.Items[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
-			peers = append(peers, resList.Items[i])
-		}
-	}
-
-	return peers, nil
+	return resList.Items, nil
 }
 
 // peerReader returns the APIReader (uncached) when the manager

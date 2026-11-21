@@ -86,9 +86,24 @@ var serverRefusesSelector atomic.Bool
 // of new volumes waited behind it.
 //
 // A field selector matches a spelling exactly, so the spellings asked
-// for are those rdSpellings knows and every one a replica in cache
-// carries: a replica the read missed would be a peer left out of a
-// rendered resource file. cache may be nil.
+// for are those of the definition (rdSpellings) and every one a replica
+// in cache carries. That leaves one replica a whole-cluster read would
+// have found and this one does not: a replica whose spec spells the
+// definition in none of those ways, and that the cache has not seen yet.
+// Nothing blockstor writes is one: the store, the controller and the
+// LINSTOR migration all write the definition's object name, which is
+// always asked for. It takes a replica applied by hand under another
+// spelling, read in the moment before the cache catches up with it; the
+// next pass, a few seconds on, finds it. A replica that is already
+// connected to its peers has long been in the cache, so the miss can
+// delay a new peer but cannot drop a running one.
+//
+// The store's definition reads (resources.listByDefinitionThrough) do not
+// add the cached spellings and fall back per spelling. They answer the
+// REST surface, where a definition's replicas are those written under
+// its registered spellings; this read decides DRBD peers and witnesses,
+// where any spelling of the definition is the same definition. cache
+// may be nil.
 //
 // A reader that cannot serve the selector (a CRD that predates the
 // selectable field, a cache without the index) fails the read rather

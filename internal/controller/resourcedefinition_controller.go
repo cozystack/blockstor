@@ -700,10 +700,6 @@ func (r *ResourceDefinitionReconciler) listReplicasDirect(ctx context.Context, r
 	out := make([]apiv1.Resource, 0, len(crdList.Items))
 
 	for i := range crdList.Items {
-		if !isReplicaOf(&crdList.Items[i], rdName) {
-			continue
-		}
-
 		out = append(out, apiv1.Resource{
 			Name:     crdList.Items[i].Spec.ResourceDefinitionName,
 			NodeName: crdList.Items[i].Spec.NodeName,
