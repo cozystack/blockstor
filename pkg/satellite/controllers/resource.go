@@ -665,7 +665,7 @@ const applyFailedReason = "ApplyFailed"
 // through after failures.
 const applySucceededReason = "ApplySucceeded"
 
-// recordRecovery reports an apply that went through after failures
+// recordRecovery reports an apply that went through after `failures`
 // failed applies: an Info line and a Normal Event on the Resource. The
 // Warning Events of the failures stay on the Resource until they
 // expire and would otherwise read as a replica still down; LINSTOR
