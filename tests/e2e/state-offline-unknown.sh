@@ -9,7 +9,7 @@
 #   1. `linstor n l` for the offline worker must flip to State=Offline
 #      (driven by the heartbeat watchdog at internal/controller/
 #      node_heartbeat_controller.go: stale beyond
-#      NodeMonitorGracePeriod=40 s → ConnectionStatus=OFFLINE).
+#      NodeMonitorGracePeriod=50 s → ConnectionStatus=OFFLINE).
 #
 #   2. `linstor r l -r <RD>` row for the offline worker must show
 #      State=Unknown — the observer can no longer prove anything
@@ -63,9 +63,9 @@ fi
 
 RD=e2e-5-5-offline-unknown
 EVICT_LABEL=blockstor.org/offline-unknown-test
-OFFLINE_TIMEOUT=75    # 40 s grace + watchdog requeue period (5 s) +
+OFFLINE_TIMEOUT=85    # 50 s grace + watchdog requeue period (5 s) +
                       # apiserver/SSA-apply slack on a busy QEMU stand
-HEAL_TIMEOUT=180      # satellite startup + heartbeat (max 40 s for the
+HEAL_TIMEOUT=180      # satellite startup + heartbeat (max 50 s for the
                       # watchdog to flip ConnectionStatus back) +
                       # DRBD reconnect + full re-sync of the
                       # offline-window-delta on a busy QEMU stand
