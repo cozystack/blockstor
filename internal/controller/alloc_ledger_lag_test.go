@@ -333,3 +333,72 @@ func TestAllocationDoesNotWaitForAnotherReplicasWrites(t *testing.T) {
 
 	assertBurstUnique(ctx, t, live, 2)
 }
+
+// TestDefinitionWrittenMeanwhileStillGetsItsMinor pins a write to the
+// definition, any write, landing between the allocator's read of it
+// and the write of the minors. The minor write carries the
+// resourceVersion it read, so it fails with a conflict; the allocator
+// took that for a sibling having written the minors first and went on
+// without them. The replica then came up with no minor on its
+// definition until some later event reconciled it again, a whole
+// pass of a provisioning burst lost.
+func TestDefinitionWrittenMeanwhileStillGetsItsMinor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	objs := burstObjects(1, "w1")
+	live := newBurstClient(t, objs)
+
+	var (
+		mu      sync.Mutex
+		touched bool
+	)
+
+	cache := interceptor.NewClient(live, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			mu.Lock()
+			defer mu.Unlock()
+
+			if _, ok := obj.(*blockstoriov1alpha1.ResourceDefinition); ok && !touched {
+				touched = true
+
+				var rd blockstoriov1alpha1.ResourceDefinition
+				if err := c.Get(ctx, client.ObjectKeyFromObject(obj), &rd); err != nil {
+					return err
+				}
+
+				rd.Annotations = map[string]string{"example.com/touched": "true"}
+				if err := c.Update(ctx, &rd); err != nil {
+					return err
+				}
+			}
+
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	rec := &controllerpkg.ResourceReconciler{Client: cache, Scheme: live.Scheme(), APIReader: live}
+
+	allocateEach(ctx, t, rec, live, onlyKind[*blockstoriov1alpha1.Resource](objs))
+
+	if !touched {
+		t.Fatal("the definition was never written meanwhile")
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+	if err := live.Get(ctx, client.ObjectKey{Name: "pvc-burst-00"}, &rd); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if rd.Spec.VolumeDefinitions[0].DRBDMinor == nil {
+		t.Fatal("definition has no minor after the allocation pass")
+	}
+
+	var res blockstoriov1alpha1.Resource
+	if err := live.Get(ctx, client.ObjectKey{Name: "pvc-burst-00.w1"}, &res); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if res.Status.DRBDMinor == nil || *res.Status.DRBDMinor != *rd.Spec.VolumeDefinitions[0].DRBDMinor {
+		t.Errorf("replica mirrors minor %v, definition has %d", res.Status.DRBDMinor, *rd.Spec.VolumeDefinitions[0].DRBDMinor)
+	}
+}

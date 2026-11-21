@@ -669,9 +669,11 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 
 	// One uncached read of the definition serves every decision below
 	// that depends on it: the preferred port, the skip-initial-sync
-	// latch and the volume minors. It runs under the per-RD allocMu the
-	// caller holds, and only this allocator writes the definition's
-	// minors, so the copy cannot miss one.
+	// latch and the volume minors. The copy may go stale before the
+	// minors are written (a restore, a migration or `vd c` can write
+	// the definition meanwhile); the minor write carries its
+	// resourceVersion, so a stale copy ends in a conflict and a fresh
+	// pass, never in a lost volume.
 	rd, err := r.definitionForAllocation(ctx, reader, target.Spec.ResourceDefinitionName)
 	if err != nil {
 		return false, err
@@ -1519,21 +1521,12 @@ func ptrEqI32(a, b *int32) bool {
 
 // persistRDVolumeMinors writes the per-volume DRBD minors
 // reserveIdentities picked for the parent RD's
-// Spec.VolumeDefinitions, following the clusterIP model: a non-nil
-// minor is authoritative and NEVER overwritten (restore-safe /
-// settable-once), a nil minor gets allocated from the cluster-wide free
-// set and written back to the RD Spec under optimistic concurrency.
-//
-// Per-volume (not per-RD base+k): each VolumeDefinition carries its own
-// minor, so adoption can preserve arbitrary, possibly non-contiguous
-// LINSTOR minors verbatim. Native allocation stays contiguous-ish (it
-// hands out the lowest free value per volume) but never assumes
-// contiguity — the satellite renders each volume's own minor.
-//
-// One-time backfill: when every VolumeDefinition minor is nil but the
-// legacy RD.Status.DRBDMinor base is set, the volumes are seeded with
-// base+volumeIndex (preserving the pre-refactor base+k behaviour) so an
-// upgraded cluster keeps its existing /dev/drbd<N> device paths.
+// Spec.VolumeDefinitions. It chooses nothing itself: the choice, the
+// legacy base+k backfill included, is allocateRDVolumeMinors', made
+// under clusterAllocMu. The write runs after that lock is released and
+// carries the resourceVersion of the copy the choice was made on, so a
+// definition written meanwhile ends in a conflict, never in a clobbered
+// volume list.
 //
 // rd is the definition as read before the choice, picked the copy
 // carrying the chosen minors, nil when nothing was chosen. Returns
@@ -1558,11 +1551,15 @@ func (r *ResourceReconciler) persistRDVolumeMinors(
 	}
 
 	if errors.IsConflict(err) {
-		// Sibling reconcile committed minors first. Re-read and
-		// return whatever it stamped — the next reconcile observes
-		// the committed values uniformly.
+		// The definition moved on since it was read. When another
+		// writer set the minors meanwhile, take theirs. Any other
+		// write (status, metadata, a new volume) leaves them unset:
+		// hand the conflict back so the whole pass runs again on a
+		// fresh read, rather than writing the replica without a minor
+		// on its definition and waiting for some later event.
 		var fresh blockstoriov1alpha1.ResourceDefinition
-		if gerr := reader.Get(ctx, client.ObjectKey{Name: naming.Key(picked.Name)}, &fresh); gerr == nil {
+		if gerr := reader.Get(ctx, client.ObjectKey{Name: naming.Key(picked.Name)}, &fresh); gerr == nil &&
+			rdVolumeMinorsComplete(&fresh) {
 			r.clusterAllocMu.Lock()
 			r.ledger.recordMinors(&fresh)
 			r.clusterAllocMu.Unlock()
