@@ -34,7 +34,7 @@ func TestARefusedCreateMDIsAWarningEventOnTheResource(t *testing.T) {
 	r := &ResourceReconciler{Config: Config{Recorder: recorder}}
 
 	message := refusedMessage + drbd.ErrCreateMDRefused.Error()
-	if !r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{{Name: "pvc-1", Message: message}}, logr.Discard()) {
+	if failed, _ := r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{{Name: "pvc-1", Message: message}}, logr.Discard()); !failed {
 		t.Fatal("a failed result was not reported as a failure")
 	}
 

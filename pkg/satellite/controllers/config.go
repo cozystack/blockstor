@@ -65,10 +65,11 @@ type Config struct {
 
 	// Recorder emits the apply's Events on the Resource: a Warning for
 	// every failed apply, including one the satellite refused to carry
-	// out over data, and a Normal one for an apply that went through
-	// after failures, so they reach `kubectl describe` rather than only
-	// the satellite log. Production is wired from the manager in
-	// NewManager; nil skips the Events.
+	// out over data, a Normal one for an apply that went through after
+	// failures, and a Warning for an apply that has waited more than a
+	// minute for the controller's stamp, so they reach `kubectl
+	// describe` rather than only the satellite log. Production is wired
+	// from the manager in NewManager; nil skips the Events.
 	Recorder events.EventRecorder
 
 	// Namespace is where the controller-side Secrets live — in

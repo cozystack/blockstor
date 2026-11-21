@@ -163,6 +163,9 @@ type ResourceReconciler struct {
 
 	// retries spaces the retries of a replica whose apply keeps failing.
 	retries applyBackoff
+
+	// waits reports an apply that waits too long for the controller.
+	waits controllerWaits
 }
 
 // Reconcile reads a Resource and drives the satellite-side
@@ -364,6 +367,7 @@ func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Req
 		if apierrors.IsNotFound(err) {
 			r.bringUp.forget(req.Name)
 			r.retries.reset(req.Name)
+			r.waits.forget(req.Name)
 
 			return ctrl.Result{}, nil
 		}
@@ -730,17 +734,9 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
-	anyFailed := r.afterApply(ctx, res, &rd, results, logger)
+	outcome := r.afterApply(ctx, res, &rd, results, logger)
 
-	// Apply chain surfaces per-resource errors via results (e.g.
-	// drbdadm adjust failing on a stale .res rendered before the
-	// peer's Status caught up). Returning nil here would let c-r
-	// stop until an external event drove another reconcile;
-	// RequeueAfter ensures the next attempt sees the freshly-
-	// committed peer state. A failure that persists, a DRBD port
-	// another resource holds say, is retried with back-off rather
-	// than every applyFailureRequeue.
-	if requeue := r.applyRetryAfter(res.Name, results, anyFailed); requeue > 0 {
+	if requeue := r.applyRetryAfter(res.Name, results, outcome); requeue > 0 {
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
@@ -772,7 +768,8 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 }
 
 // afterApply records the apply's outcome on the Resource and reports
-// whether anything failed. The volumes of definitions flagged DELETE are
+// how it ended: failed when anything failed, waiting when every failed
+// result only waits for the controller to stamp the replica. The volumes of definitions flagged DELETE are
 // deleted only after an apply that went through, since that apply is what
 // took them out of DRBD. A failed apply may still have removed their
 // minors, so the quorum recheck that removal needs runs either way.
@@ -782,15 +779,16 @@ func (r *ResourceReconciler) afterApply(
 	rd *blockstoriov1alpha1.ResourceDefinition,
 	results []*intent.ResourceApplyResult,
 	logger logr.Logger,
-) bool {
-	anyFailed := r.recordPerResourceFailures(res, results, logger)
+) applyOutcome {
+	anyFailed, waiting := r.recordPerResourceFailures(res, results, logger)
+	outcome := applyOutcome{failed: anyFailed, waiting: waiting}
 
-	r.stampPostApply(ctx, res, rd, results, anyFailed, logger)
+	r.stampPostApply(ctx, res, rd, results, outcome, logger)
 
 	if anyFailed {
 		r.recheckQuorumAfterFailedApply(ctx, res, rd, logger)
 
-		return true
+		return outcome
 	}
 
 	err := r.deleteFlaggedVolumes(ctx, res, rd)
@@ -806,10 +804,10 @@ func (r *ResourceReconciler) afterApply(
 				"volume definition delete is waiting for this replica: %s", err.Error())
 		}
 
-		return true
+		return applyOutcome{failed: true}
 	}
 
-	return false
+	return applyOutcome{}
 }
 
 // volumeDeleteFailedReason is the Event reason for a replica that could not
@@ -920,18 +918,23 @@ func (r *ResourceReconciler) holdForAdoptedPeers(
 }
 
 // recordPerResourceFailures logs each per-resource Apply failure and
-// returns whether any of the results came back not-Ok. Extracted from
-// runApply so the orchestration stays under the funlen budget.
+// returns whether any of the results came back not-Ok, and whether
+// every one of those is only waiting for the controller to stamp the
+// replica (WaitingForController). Extracted from runApply so
+// the orchestration stays under the funlen budget.
 //
 // Each failure also gets a Warning Event on the Resource, under the
 // reason of the refusal it carries when it carries one, the LUKS
 // layer's or drbdmeta's over data on the lower disk: an Info line in
 // this log is not where an operator looks for why a replica does not
-// come up.
+// come up. A wait gets neither the Event nor the failure line: it is
+// part of every fresh replica's bring-up, and a Warning for it reads as
+// a fault that is not there. Only a wait that lasts past a minute is
+// reported, once (trackControllerWait).
 func (r *ResourceReconciler) recordPerResourceFailures(
 	res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult, logger logr.Logger,
-) bool {
-	var anyFailed bool
+) (bool, bool) {
+	var anyFailed, anyFault bool
 
 	for _, result := range results {
 		if result.GetOk() {
@@ -939,6 +942,15 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 		}
 
 		anyFailed = true
+
+		if result.GetWaitingForController() {
+			logger.Info("waiting for the controller to stamp the replica", "name", result.GetName(),
+				"message", result.GetMessage())
+
+			continue
+		}
+
+		anyFault = true
 
 		logger.Info("Apply per-resource failure", "name", result.GetName(), "message", result.GetMessage())
 
@@ -950,7 +962,10 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 		r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, reason, "Apply", "%s", note)
 	}
 
-	return anyFailed
+	waiting := anyFailed && !anyFault
+	r.trackControllerWait(res, results, waiting)
+
+	return anyFailed, waiting
 }
 
 // recordApplyFailure keeps Status.ApplyFailure in step with the pass
@@ -1068,9 +1083,24 @@ func retryAfter(results []*intent.ResourceApplyResult, anyFailed bool) time.Dura
 // long as applyBackoff says for this replica instead. A pending grow
 // keeps the short timer, since the resize answer waits on it, and a
 // refused create-md keeps its own long one.
-func (r *ResourceReconciler) applyRetryAfter(name string, results []*intent.ResourceApplyResult, anyFailed bool) time.Duration {
-	requeue := retryAfter(results, anyFailed)
-	if requeue == applyFailureRequeue && anyFailed && !growPending(results) {
+//
+// Apply chain surfaces per-resource errors via results (e.g. drbdadm
+// adjust failing on a stale .res rendered before the peer's Status
+// caught up). Returning nil here would let c-r stop until an external
+// event drove another reconcile; RequeueAfter ensures the next attempt
+// sees the freshly-committed peer state.
+//
+// An apply held until the controller stamps the replica is a wait like
+// the allocation waits ahead of it: retried on the short timer and on
+// the update the stamp makes, and kept out of the back-off and of the
+// failures a recovery reports.
+func (r *ResourceReconciler) applyRetryAfter(name string, results []*intent.ResourceApplyResult, outcome applyOutcome) time.Duration {
+	if outcome.waiting {
+		return applyFailureRequeue
+	}
+
+	requeue := retryAfter(results, outcome.failed)
+	if requeue == applyFailureRequeue && outcome.failed && !growPending(results) {
 		return r.retries.next(name)
 	}
 
@@ -1177,7 +1207,7 @@ func eventNote(note string) string {
 // and the Bug-39 toggle-disk retry counter. Each helper is
 // independently fallible — we log and move on so a transient
 // apiserver hiccup on one stamp doesn't suppress the others.
-func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) {
+func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, outcome applyOutcome, logger logr.Logger) {
 	// Stamp per-volume DevicePath into Status.Volumes so
 	// linstor-csi / any consumer that reads the CRD sees the
 	// /dev path the satellite materialised. Done even when one
@@ -1224,16 +1254,28 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// Bug 39: bump or clear Status.ToggleDiskRetries based on the
 	// per-resource result. The helper is a no-op when the Resource
 	// isn't mid diskless→diskful conversion, so it's safe to call
-	// unconditionally on every apply pass.
-	err = r.recordToggleDiskOutcome(ctx, res, !anyFailed)
-	if err != nil {
-		logger.Error(err, "record toggle-disk outcome")
+	// unconditionally on every apply pass. A wait for the controller's
+	// stamp is neither: a witness promoted before the controller
+	// stamped it meets that wait, and counting it as a failed attempt
+	// would spend the conversion's retries on a replica with no fault.
+	if !outcome.waiting {
+		err = r.recordToggleDiskOutcome(ctx, res, !outcome.failed)
+		if err != nil {
+			logger.Error(err, "record toggle-disk outcome")
+		}
 	}
 
 	err = r.recordApplyFailure(ctx, res, rd, results)
 	if err != nil {
 		logger.Error(err, "record apply failure")
 	}
+}
+
+// applyOutcome is how an apply pass ended: failed when a result came
+// back not Ok, and waiting when every such result only waits for the
+// controller to stamp the replica.
+type applyOutcome struct {
+	failed, waiting bool
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the

@@ -512,6 +512,11 @@ type ResourceApplyResult struct {
 	Ok       bool
 	Message  string
 
+	// WaitingForController is set on a result that is not Ok only
+	// because the apply waits for the controller to stamp the replica
+	// (satellite.ErrWaitingForController): a wait, not a failed apply.
+	WaitingForController bool
+
 	// Volumes carries per-volume DevicePath the satellite materialised
 	// during this apply. Empty when the resource is DISKLESS or the
 	// apply chain failed before assigning a device. The c-r reconciler
@@ -557,6 +562,16 @@ func (v *ResourceApplyVolumeResult) GetAppliedSizeKib() int64 {
 	}
 
 	return v.AppliedSizeKib
+}
+
+// GetWaitingForController reports whether the result is only a wait
+// for the controller's stamp — nil-safe.
+func (x *ResourceApplyResult) GetWaitingForController() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.WaitingForController
 }
 
 // GetVolumes returns the per-volume slice — nil-safe.

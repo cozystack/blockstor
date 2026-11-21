@@ -1100,6 +1100,14 @@ func (r *Reconciler) forgetPool(resourceName string) {
 	delete(r.resourceToPool, resourceName)
 }
 
+// failApply records err as the outcome of res, and whether it only
+// waits for the controller's stamp (WaitsForController).
+func failApply(res *intent.ResourceApplyResult, err error) {
+	res.Ok = false
+	res.Message = err.Error()
+	res.WaitingForController = WaitsForController(err)
+}
+
 // applyOne reconciles a single DesiredResource. Diskless replicas skip
 // the storage path (they're memory-backed by the DRBD stack); everything
 // else routes one CreateVolume per DesiredVolume. When the DRBD half is
@@ -1124,16 +1132,14 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 
 	devices, resized, cloned, err := r.applyStorageIfDiskful(ctx, dr, diskless)
 	if err != nil {
-		res.Ok = false
-		res.Message = err.Error()
+		failApply(res, err)
 
 		return res
 	}
 
 	devices, luksGrew, err := r.maybeLUKS(ctx, dr, diskless, devices, resized)
 	if err != nil {
-		res.Ok = false
-		res.Message = err.Error()
+		failApply(res, err)
 
 		return res
 	}
@@ -1154,8 +1160,7 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 	if withDRBD {
 		err := r.applyDRBD(ctx, dr, diskless, devices, resized, cloned)
 		if err != nil {
-			res.Ok = false
-			res.Message = err.Error()
+			failApply(res, err)
 
 			return res
 		}
@@ -1172,8 +1177,7 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 		// path against the raw device map from applyStorage.
 		err := r.runStorageOnlyMkfs(ctx, dr, diskless, devices)
 		if err != nil {
-			res.Ok = false
-			res.Message = err.Error()
+			failApply(res, err)
 
 			return res
 		}
@@ -1742,7 +1746,7 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 // volume. This is the satellite's response to `linstor r td
 // --diskless` on a previously-diskful replica (Bug 330).
 //
-// Probe order matters: IsLoaded → HasDisklessVolume. A slot that
+// Probe order matters: IsLoaded → HasAttachedDisk. A slot that
 // isn't loaded at all (never brought up, or torn down by an earlier
 // DeleteResource) has nothing to detach; a slot already reporting
 // disk:Diskless has converged to the target state and re-issuing
@@ -1777,13 +1781,14 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 		return nil //nolint:nilerr // probe failure is "no-op" by design
 	}
 
-	disklessVol, err := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
-	if err == nil && disklessVol {
+	attached, err := r.cfg.Adm.HasAttachedDisk(ctx, dr.GetName())
+	if err == nil && !attached {
 		// Kernel has already converged to Diskless (operator-driven
-		// detach, prior reconcile pass, or a peer-driven event). No
-		// further work — re-issuing detach is harmless but the
-		// shell-out cost adds up on every reconcile of a steady-
-		// state diskless replica.
+		// detach, prior reconcile pass, or a peer-driven event), or
+		// shows no local volume at all, as a TieBreaker's slot did
+		// after its kernel resource was taken down by hand. drbdadm
+		// refuses a detach on a resource configured without a disk,
+		// and that refusal failed the apply of a diskless witness.
 		return nil
 	}
 
@@ -5988,7 +5993,8 @@ func localNodeIDFromOpts(dr *intent.DesiredResource) (int32, bool) {
 // rather than treating it as a hard, non-retryable failure — the id
 // always arrives on a subsequent reconcile once the controller's
 // allocator stamps Status.DRBDNodeID.
-var errUnresolvedLocalNodeID = errors.New("local DRBD node-id not yet allocated by controller")
+var errUnresolvedLocalNodeID = errors.Mark(
+	errors.New("local DRBD node-id not yet allocated by controller"), ErrWaitingForController)
 
 // refuseUnresolvedLocalNodeID is the Bug 360 prevention gate: it
 // returns errUnresolvedLocalNodeID when the DesiredResource carries no
@@ -6010,7 +6016,7 @@ var errUnresolvedLocalNodeID = errors.New("local DRBD node-id not yet allocated 
 // "0" (ok=true) from an absent/empty key (ok=false).
 func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 	if _, ok := localNodeIDFromOpts(dr); !ok {
-		return errUnresolvedLocalNodeID
+		return errors.WithStack(errUnresolvedLocalNodeID)
 	}
 
 	return nil
@@ -6023,7 +6029,8 @@ func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 // always arrives on a subsequent reconcile once the controller's
 // allocateResourceSpecFields / ensureSkipInitSyncDecision pass commits
 // it. Mirrors errUnresolvedLocalNodeID.
-var errUnresolvedSkipInitialSync = errors.New("Resource.Spec.SkipInitialSync not yet stamped by controller")
+var errUnresolvedSkipInitialSync = errors.Mark(
+	errors.New("Resource.Spec.SkipInitialSync not yet stamped by controller"), ErrWaitingForController)
 
 // refuseUnresolvedSkipInitialSync is the skip-init-sync prevention
 // gate: it returns errUnresolvedSkipInitialSync when this satellite is
@@ -6051,10 +6058,27 @@ var errUnresolvedSkipInitialSync = errors.New("Resource.Spec.SkipInitialSync not
 // "not stamped yet" (requeue).
 func refuseUnresolvedSkipInitialSync(dr *intent.DesiredResource, freshActivation bool) error {
 	if freshActivation && dr.GetSkipInitialSync() == nil {
-		return errUnresolvedSkipInitialSync
+		return errors.WithStack(errUnresolvedSkipInitialSync)
 	}
 
 	return nil
+}
+
+// ErrWaitingForController marks the errors of the gates above that
+// hold the apply until the controller stamps the replica: its DRBD
+// node-id, or the SkipInitialSync decision. A fresh replica routinely
+// meets them, since the satellite sees the Resource before the
+// controller's pass that stamps it is through, and the stamp is an
+// update of the Resource that runs the apply again. The apply result
+// carries it as WaitingForController, and the caller treats such a
+// result as a wait, not as a failed apply.
+var ErrWaitingForController = errors.New("waiting for the controller to stamp the replica")
+
+// WaitsForController reports whether err is one of the gates holding
+// the apply until the controller stamps the replica. It goes by the
+// error's identity, not its text, so a reworded gate stays a wait.
+func WaitsForController(err error) bool {
+	return errors.Is(err, ErrWaitingForController)
 }
 
 // gateBringUpReadiness refuses (requeues) the DRBD apply while a
