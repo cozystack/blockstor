@@ -21,6 +21,7 @@ package controller
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -28,23 +29,32 @@ import (
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
-// allocLedger holds the DRBD identities this controller has written and
-// its cache may not show yet, the way LINSTOR keeps its number pools in
-// the controller's memory.
+// allocLedger holds the DRBD identities this controller has handed
+// out and its cache may not show yet, the way LINSTOR keeps its number
+// pools in the controller's memory.
 //
 // The allocator reads the taken node ids, ports and minors from the
 // cache. A cache trails the writes this process just made, so two
 // allocations in a row could both see a value as free and both take
-// it; the ledger closes that window. Every write of a new identity is
-// recorded here after it succeeds, and every read of a taken set adds
-// what is recorded. An entry goes away once the cache shows the object
-// with the recorded values, or shows the object gone.
+// it; the ledger closes that window. A value is reserved here as soon
+// as it is chosen, before the write that persists it: a write whose
+// answer is lost (a timeout, a 5xx) may still have landed, and the
+// retry that finds the value already persisted has nothing left to
+// record. Every read of a taken set adds what is reserved.
+//
+// A reservation is released once the cache shows the object, under the
+// reserved UID, carrying the reserved fields, or once the API server
+// says the object is gone or replaced. A cache that does not list the
+// object at all says nothing: definitions and replicas come through
+// separate informers, and the replica that triggers an allocation is
+// routinely listed before its freshly created definition is.
 //
 // Reading the cache instead of the apiserver is what keeps a burst of
 // new replicas from queueing: each allocation used to list every
 // Resource in the cluster from the apiserver several times while
 // holding clusterAllocMu, which made the allocations of a burst run
-// strictly one after another at the speed of those lists.
+// strictly one after another at the speed of those lists. The point
+// reads past the cache here happen only while the cache trails.
 //
 // Every access happens under clusterAllocMu, which also covers the
 // writes, so the ledger needs no lock of its own.
@@ -53,8 +63,9 @@ type allocLedger struct {
 	minors   map[string]minorGrant
 }
 
-// replicaGrant is the node id and port written onto one Resource.
+// replicaGrant is the node id and port reserved for one Resource.
 type replicaGrant struct {
+	name   string
 	uid    types.UID
 	rd     string
 	node   string
@@ -62,19 +73,25 @@ type replicaGrant struct {
 	port   *int32
 }
 
-// minorGrant is the minor of every volume written onto one definition.
+// minorGrant is the minor of every volume reserved for one definition.
 type minorGrant struct {
+	name   string
 	uid    types.UID
 	minors map[int32]int32
 }
 
-// recordReplica remembers the identities just written onto res.
+// recordReplica reserves the identities res carries.
 func (l *allocLedger) recordReplica(res *blockstoriov1alpha1.Resource) {
+	if res.Spec.DRBDNodeID == nil && res.Spec.DRBDPort == nil {
+		return
+	}
+
 	if l.replicas == nil {
 		l.replicas = map[string]replicaGrant{}
 	}
 
 	l.replicas[res.Name] = replicaGrant{
+		name:   res.Name,
 		uid:    res.UID,
 		rd:     res.Spec.ResourceDefinitionName,
 		node:   res.Spec.NodeName,
@@ -83,13 +100,9 @@ func (l *allocLedger) recordReplica(res *blockstoriov1alpha1.Resource) {
 	}
 }
 
-// recordMinors remembers the minors just written onto rd.
+// recordMinors reserves the minors rd carries.
 func (l *allocLedger) recordMinors(rd *blockstoriov1alpha1.ResourceDefinition) {
-	if l.minors == nil {
-		l.minors = map[string]minorGrant{}
-	}
-
-	grant := minorGrant{uid: rd.UID, minors: map[int32]int32{}}
+	grant := minorGrant{name: rd.Name, uid: rd.UID, minors: map[int32]int32{}}
 
 	for i := range rd.Spec.VolumeDefinitions {
 		if m := rd.Spec.VolumeDefinitions[i].DRBDMinor; m != nil {
@@ -97,14 +110,24 @@ func (l *allocLedger) recordMinors(rd *blockstoriov1alpha1.ResourceDefinition) {
 		}
 	}
 
+	if len(grant.minors) == 0 {
+		return
+	}
+
+	if l.minors == nil {
+		l.minors = map[string]minorGrant{}
+	}
+
 	l.minors[naming.Key(rd.Name)] = grant
 }
 
-// pendingReplicas drops every grant the cached Resources already show,
-// or show gone, and returns the rest: the grants the cache still lags.
-func (l *allocLedger) pendingReplicas(cached []blockstoriov1alpha1.Resource) []replicaGrant {
+// pendingReplicas releases every reservation that is settled and
+// returns the rest: the ones the cache still trails.
+func (l *allocLedger) pendingReplicas(
+	ctx context.Context, reader client.Reader, cached []blockstoriov1alpha1.Resource,
+) ([]replicaGrant, error) {
 	if len(l.replicas) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	byName := make(map[string]*blockstoriov1alpha1.Resource, len(cached))
@@ -115,8 +138,26 @@ func (l *allocLedger) pendingReplicas(cached []blockstoriov1alpha1.Resource) []r
 	out := make([]replicaGrant, 0, len(l.replicas))
 
 	for name, grant := range l.replicas {
-		res, ok := byName[name]
-		if !ok || res.UID != grant.uid || replicaShows(res, grant) {
+		if res, ok := byName[name]; ok && res.UID == grant.uid {
+			if replicaShows(res, &grant) {
+				delete(l.replicas, name)
+
+				continue
+			}
+
+			out = append(out, grant)
+
+			continue
+		}
+
+		var live blockstoriov1alpha1.Resource
+
+		held, err := reservationHeld(ctx, reader, client.ObjectKey{Name: grant.name}, &live, grant.uid)
+		if err != nil {
+			return nil, err
+		}
+
+		if !held {
 			delete(l.replicas, name)
 
 			continue
@@ -125,14 +166,16 @@ func (l *allocLedger) pendingReplicas(cached []blockstoriov1alpha1.Resource) []r
 		out = append(out, grant)
 	}
 
-	return out
+	return out, nil
 }
 
-// pendingMinors drops every grant the cached definitions already show,
-// or show gone, and returns the rest keyed by definition.
-func (l *allocLedger) pendingMinors(cached []blockstoriov1alpha1.ResourceDefinition) map[string]minorGrant {
+// pendingMinors releases every reservation that is settled and returns
+// the rest keyed by definition.
+func (l *allocLedger) pendingMinors(
+	ctx context.Context, reader client.Reader, cached []blockstoriov1alpha1.ResourceDefinition,
+) (map[string]minorGrant, error) {
 	if len(l.minors) == 0 {
-		return nil
+		return map[string]minorGrant{}, nil
 	}
 
 	byName := make(map[string]*blockstoriov1alpha1.ResourceDefinition, len(cached))
@@ -143,8 +186,26 @@ func (l *allocLedger) pendingMinors(cached []blockstoriov1alpha1.ResourceDefinit
 	out := make(map[string]minorGrant, len(l.minors))
 
 	for key, grant := range l.minors {
-		rd, ok := byName[key]
-		if !ok || rd.UID != grant.uid || definitionShows(rd, grant) {
+		if rd, ok := byName[key]; ok && rd.UID == grant.uid {
+			if definitionShows(rd, grant) {
+				delete(l.minors, key)
+
+				continue
+			}
+
+			out[key] = grant
+
+			continue
+		}
+
+		var live blockstoriov1alpha1.ResourceDefinition
+
+		held, err := reservationHeld(ctx, reader, client.ObjectKey{Name: naming.Key(grant.name)}, &live, grant.uid)
+		if err != nil {
+			return nil, err
+		}
+
+		if !held {
 			delete(l.minors, key)
 
 			continue
@@ -153,25 +214,44 @@ func (l *allocLedger) pendingMinors(cached []blockstoriov1alpha1.ResourceDefinit
 		out[key] = grant
 	}
 
-	return out
+	return out, nil
 }
 
-// replicaShows reports whether the cached res carries the granted
-// identities.
-func replicaShows(res *blockstoriov1alpha1.Resource, grant replicaGrant) bool {
-	return (grant.nodeID == nil || ptrEqI32(res.Spec.DRBDNodeID, grant.nodeID)) &&
-		(grant.port == nil || ptrEqI32(res.Spec.DRBDPort, grant.port))
+// reservationHeld asks the API server whether the object a reservation
+// was made for still exists under the reserved UID. It is asked only
+// when the cache does not list that object, or lists another one under
+// its name: a cache that has not seen the object yet, or still shows
+// the one it replaced, cannot tell either way.
+func reservationHeld(ctx context.Context, reader client.Reader, key client.ObjectKey, obj client.Object, uid types.UID) (bool, error) {
+	err := reader.Get(ctx, key, obj)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return obj.GetUID() == uid, nil
 }
 
-// definitionShows reports whether the cached rd carries every granted
-// minor.
+// replicaShows reports whether the cached res carries every reserved
+// field. Spec identities are written once, so a cached value that is
+// set is the final one even when it is not the reserved value.
+func replicaShows(res *blockstoriov1alpha1.Resource, grant *replicaGrant) bool {
+	return (grant.nodeID == nil || res.Spec.DRBDNodeID != nil) &&
+		(grant.port == nil || res.Spec.DRBDPort != nil)
+}
+
+// definitionShows reports whether the cached rd carries a minor on
+// every volume a minor was reserved for.
 func definitionShows(rd *blockstoriov1alpha1.ResourceDefinition, grant minorGrant) bool {
-	for vn, minor := range grant.minors {
+	for vn := range grant.minors {
 		found := false
 
 		for i := range rd.Spec.VolumeDefinitions {
 			vd := &rd.Spec.VolumeDefinitions[i]
-			if vd.VolumeNumber == vn && vd.DRBDMinor != nil && *vd.DRBDMinor == minor {
+			if vd.VolumeNumber == vn && vd.DRBDMinor != nil {
 				found = true
 
 				break

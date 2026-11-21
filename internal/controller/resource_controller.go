@@ -710,6 +710,11 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 	specMutated := !equalResourceIdentitySpec(originalSpec, &target.Spec)
 
 	if specMutated {
+		// Reserve before writing: a patch whose answer is lost may
+		// still have landed, and the retry then finds nothing to
+		// allocate and nothing to record.
+		r.ledger.recordReplica(target)
+
 		if perr := r.patchResourceSpecIdentities(ctx, target); perr != nil {
 			if errors.IsNotFound(perr) {
 				return false, nil
@@ -717,8 +722,6 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 
 			return false, perr
 		}
-
-		r.ledger.recordReplica(target)
 	}
 
 	// (4) mirror Spec identities onto Status for backward-compat
@@ -1533,6 +1536,9 @@ func (r *ResourceReconciler) ensureRDVolumeMinors(ctx context.Context, target *b
 		return false, vol0MinorOf(&rd), nil
 	}
 
+	// Reserve before writing, as for the replica identities.
+	r.ledger.recordMinors(&rd)
+
 	if err = r.patchRDVolumeMinors(ctx, &rd); err != nil {
 		if errors.IsConflict(err) {
 			// Sibling reconcile committed minors first. Re-read and
@@ -1540,14 +1546,14 @@ func (r *ResourceReconciler) ensureRDVolumeMinors(ctx context.Context, target *b
 			// the committed values uniformly.
 			var fresh blockstoriov1alpha1.ResourceDefinition
 			if gerr := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &fresh); gerr == nil {
+				r.ledger.recordMinors(&fresh)
+
 				return false, vol0MinorOf(&fresh), nil
 			}
 		}
 
 		return false, nil, err
 	}
-
-	r.ledger.recordMinors(&rd)
 
 	return true, vol0MinorOf(&rd), nil
 }
@@ -1878,7 +1884,7 @@ func (r *ResourceReconciler) intersectRange(
 // sharing it.
 //
 // Reads the authoritative Spec.DRBDPort from the cache, plus the ports
-// this controller wrote that the cache does not show yet (allocLedger);
+// this controller reserved that the cache does not show yet (allocLedger);
 // with clusterAllocMu held by the caller this keeps same-node
 // allocation collision-free.
 func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, selfName string) ([]int32, error) {
@@ -1900,8 +1906,13 @@ func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, sel
 		}
 	}
 
-	for _, grant := range r.ledger.pendingReplicas(replicas) {
-		if grant.port != nil && naming.Same(grant.node, nodeName) {
+	pending, err := r.ledger.pendingReplicas(ctx, r.apiReader(), replicas)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, grant := range pending {
+		if grant.port != nil && naming.Same(grant.node, nodeName) && grant.name != selfName {
 			out = append(out, *grant.port)
 		}
 	}
@@ -1918,7 +1929,7 @@ func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, sel
 // minors. Excludes `selfRD` so an RD mid-allocation doesn't trip on its
 // own draft.
 //
-// Reads the cache, plus the minors this controller wrote that the
+// Reads the cache, plus the minors this controller reserved that the
 // cache does not show yet (allocLedger), so cross-RD batch allocation
 // under clusterAllocMu observes every minor already handed out.
 func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD string) ([]int32, error) {
@@ -1929,7 +1940,12 @@ func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD stri
 		return nil, err
 	}
 
-	for key, grant := range r.ledger.pendingMinors(definitions) {
+	pending, err := r.ledger.pendingMinors(ctx, r.apiReader(), definitions)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, grant := range pending {
 		if key == naming.Key(selfRD) {
 			continue
 		}
@@ -2238,7 +2254,7 @@ func (r *ResourceReconciler) allocateNodeIDLocked(ctx context.Context, target *b
 // is conservative and self-healing; strictly better than the
 // permanent wedge a premature reuse causes.
 func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]int32, error) {
-	// The cache plus the node ids this controller wrote that the
+	// The cache plus the node ids this controller reserved that the
 	// cache does not show yet (allocLedger); the caller holds
 	// clusterAllocMu, under which every such write happens.
 	replicas, err := r.cachedResources(ctx)
@@ -2251,8 +2267,14 @@ func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *bl
 	// harmless, but keeps the taken set minimal and inspectable).
 	occupied := make(map[int32]struct{}, len(replicas))
 
-	for _, grant := range r.ledger.pendingReplicas(replicas) {
-		if grant.nodeID != nil && naming.Same(grant.rd, target.Spec.ResourceDefinitionName) {
+	pending, err := r.ledger.pendingReplicas(ctx, r.apiReader(), replicas)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, grant := range pending {
+		if grant.nodeID != nil && grant.name != target.Name &&
+			naming.Same(grant.rd, target.Spec.ResourceDefinitionName) {
 			occupied[*grant.nodeID] = struct{}{}
 		}
 	}
