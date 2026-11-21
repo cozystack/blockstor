@@ -572,3 +572,62 @@ func TestBlockSizeReadsOnlyTheDefinitionsReplicas(t *testing.T) {
 		t.Errorf("the decision listed every Resource past the cache %d times, want 0", apiReader.unscoped)
 	}
 }
+
+// TestBlockSizeIgnoresAPeerOnlyTheCacheStillShows pins a replica that
+// is gone on the API server while the cache still lists it: the last
+// replica of a volume deleted, and a new one created a moment later.
+// LINSTOR decides from the replicas that exist, so the new replica's
+// pool sets the size. Counting the deleted one as a running peer kept
+// the volume at the 512 default on a 4096 pool.
+func TestBlockSizeIgnoresAPeerOnlyTheCacheStillShows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	f := newBSFixture(nil)
+	target := bsReplica(bsNode)
+	gone := running(bsReplica("n2"))
+
+	byDefinition := func(obj client.Object) []string {
+		res, ok := obj.(*blockstoriov1alpha1.Resource)
+		if !ok {
+			return nil
+		}
+
+		return []string{res.Spec.ResourceDefinitionName}
+	}
+
+	build := func(objs ...client.Object) client.WithWatch {
+		return fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&blockstoriov1alpha1.Resource{}, &blockstoriov1alpha1.ResourceDefinition{}).
+			WithIndex(&blockstoriov1alpha1.Resource{}, storek8s.FieldResourceDefinitionName, byDefinition).
+			WithObjects(objs...).
+			Build()
+	}
+
+	objects := append([]client.Object{f.rd, target}, f.objects...)
+	live := build(objects...)
+	cached := build(append(slices.Clone(objects), gone)...)
+
+	cache := interceptor.NewClient(live, interceptor.Funcs{
+		List: func(ctx context.Context, _ client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			return cached.List(ctx, list, opts...)
+		},
+	})
+	rec := &controllerpkg.ResourceReconciler{Client: cache, Scheme: scheme, APIReader: live}
+
+	_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: target.Name}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+	if err := live.Get(ctx, client.ObjectKey{Name: bsRD}, &rd); err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if got := rd.Spec.VolumeDefinitions[0].Props[blocksize.PropBlockSize]; got != "4096" {
+		t.Errorf("block-size = %q, want 4096: the only replica left is on the 4096 pool", got)
+	}
+}

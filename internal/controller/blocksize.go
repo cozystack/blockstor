@@ -350,10 +350,11 @@ func canChangeBlockSize(scope *blockSizeScope, peers []blockstoriov1alpha1.Resou
 	return true
 }
 
-// otherReplicas lists the definition's other replicas: every one the
-// cache holds, under whichever spelling of the definition, and, read
-// past the cache, every one written under the target's spelling or the
-// definition's object name, so a replica created a moment ago counts.
+// otherReplicas lists the definition's other replicas: read past the
+// cache, every one written under the target's spelling or the
+// definition's object name, so a replica created a moment ago counts
+// and one deleted a moment ago does not, plus every one the cache holds
+// under any other spelling of the definition.
 //
 // The read past the cache asks for the definition's replicas only. It
 // runs once for every new replica, and reading every Resource in the
@@ -375,16 +376,21 @@ func (r *ResourceReconciler) otherReplicas(
 		return nil, cerrors.Wrap(err, "list cached resources")
 	}
 
+	spellings := slices.Compact([]string{target.Spec.ResourceDefinitionName, rd.Name})
 	byName := map[string]blockstoriov1alpha1.Resource{}
 
 	for i := range cached.Items {
 		res := &cached.Items[i]
-		if naming.Same(res.Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
+		// The read below answers in full for the spellings it asks
+		// for; the cache may still list a replica of theirs that is
+		// already deleted, and a deleted replica is no peer.
+		if naming.Same(res.Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) &&
+			!slices.Contains(spellings, res.Spec.ResourceDefinitionName) {
 			byName[res.Name] = *res.DeepCopy()
 		}
 	}
 
-	for _, spelling := range slices.Compact([]string{target.Spec.ResourceDefinitionName, rd.Name}) {
+	for _, spelling := range spellings {
 		var live blockstoriov1alpha1.ResourceList
 
 		err := r.apiReader().List(ctx, &live, client.MatchingFields{storek8s.FieldResourceDefinitionName: spelling})
