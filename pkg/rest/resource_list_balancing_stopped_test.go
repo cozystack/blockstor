@@ -71,18 +71,18 @@ func (c trailingDefinitionCache) Get(ctx context.Context, name string) (apiv1.Re
 	return rd, err //nolint:wrapcheck // test double
 }
 
-type trailingCacheStore struct {
+type trailingReplicaListStore struct {
 	store.Store
 
 	definitionTrails bool
 	uncached         *atomic.Int64
 }
 
-func (s trailingCacheStore) Resources() store.ResourceStore {
+func (s trailingReplicaListStore) Resources() store.ResourceStore {
 	return trailingReplicaCache{ResourceStore: s.Store.Resources(), uncached: s.uncached}
 }
 
-func (s trailingCacheStore) ResourceDefinitions() store.ResourceDefinitionStore {
+func (s trailingReplicaListStore) ResourceDefinitions() store.ResourceDefinitionStore {
 	if s.definitionTrails {
 		return trailingDefinitionCache{s.Store.ResourceDefinitions()}
 	}
@@ -150,7 +150,7 @@ func TestResourceListShowsEveryReplicaOnceBalancingStops(t *testing.T) {
 
 			var uncached atomic.Int64
 
-			base, stop := startServerWithStore(t, trailingCacheStore{
+			base, stop := startServerWithStore(t, trailingReplicaListStore{
 				Store: backend, definitionTrails: tc.definitionTrails, uncached: &uncached,
 			})
 			defer stop()
