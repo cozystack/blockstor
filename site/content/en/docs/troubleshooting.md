@@ -70,7 +70,7 @@ A replica whose `drbdadm adjust` or `drbdadm up` failed half way is also left `S
 kubectl get events -A --field-selector involvedObject.name=<resource>,reason=ApplyFailed
 ```
 
-The satellite retries the apply with a full `drbdadm adjust`, never with `--skip-net`, first after five seconds and then at doubling intervals up to five minutes, until one goes through. Remove the cause, and the replica connects and resyncs at the next retry. A satellite restart keeps the record that the last adjust failed, so the retry after it is a full one too. The full adjust connects every peer, so a `drbdadm disconnect` you make while the retries keep failing is undone by the next one; wait until the apply goes through, or remove the cause first, before you start the split-brain recovery above.
+The satellite retries the apply with a full `drbdadm adjust`, never with `--skip-net`, first after five seconds and then at doubling intervals up to five minutes, until one goes through. Remove the cause, and the replica connects and resyncs at the next retry, which leaves a Normal `ApplySucceeded` Event on the Resource with the number of failed attempts before it; the `ApplyFailed` Warnings stay listed until they expire, so read them against that Event rather than as a replica still down. A satellite restart keeps the record that the last adjust failed, so the retry after it is a full one too. The full adjust connects every peer, so a `drbdadm disconnect` you make while the retries keep failing is undone by the next one; wait until the apply goes through, or remove the cause first, before you start the split-brain recovery above.
 
 ## Inconsistent or SyncTarget that never finishes
 
