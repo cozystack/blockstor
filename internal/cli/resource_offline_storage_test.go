@@ -64,7 +64,7 @@ func TestResourceListOfflineNodeStorageOnlyReadsCreated(t *testing.T) {
 
 	app, out, errBuf := newApp(t, seedOfflineStorageOnly)
 
-	if got := app.Run(t.Context(), []string{"r", "l", "--pastable"}); got != 0 {
+	if got := app.Run(t.Context(), []string{"r", "l"}); got != 0 {
 		t.Fatalf("exit = %d (stderr: %s)", got, errBuf.String())
 	}
 
@@ -93,7 +93,7 @@ func TestResourceListFaultyOmitsOfflineStorageOnly(t *testing.T) {
 
 	app, out, errBuf := newApp(t, seedOfflineStorageOnly)
 
-	if got := app.Run(t.Context(), []string{"r", "l", "--faulty", "--pastable"}); got != 0 {
+	if got := app.Run(t.Context(), []string{"r", "l", "--faulty"}); got != 0 {
 		t.Fatalf("exit = %d (stderr: %s)", got, errBuf.String())
 	}
 
