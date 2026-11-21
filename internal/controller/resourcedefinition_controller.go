@@ -43,6 +43,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // Bug148ResizePendingAnnotationPrefix is the per-volume annotation
@@ -688,8 +689,11 @@ func (r *ResourceDefinitionReconciler) listReplicasDirect(ctx context.Context, r
 		return r.Store.Resources().ListByDefinition(ctx, rdName)
 	}
 
+	// Only the definition's replicas: this runs on every pass of every
+	// definition, and reading the whole cluster here kept the controller
+	// at its CPU limit (storek8s.ReplicasOf).
 	var crdList blockstoriov1alpha1.ResourceList
-	if err := r.APIReader.List(ctx, &crdList); err != nil {
+	if err := storek8s.ReplicasOf(ctx, r.APIReader, r.Client, rdName, &crdList); err != nil {
 		return nil, err
 	}
 

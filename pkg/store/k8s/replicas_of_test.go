@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package k8s_test
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"sync/atomic"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
+)
+
+// unscopedListCounter counts the Resource lists sent without a field
+// selector: reads of every replica in the cluster.
+type unscopedListCounter struct {
+	client.Reader
+
+	unscoped atomic.Int64
+}
+
+func (c *unscopedListCounter) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	var o client.ListOptions
+	o.ApplyOptions(opts)
+
+	if _, ok := list.(*crdv1alpha1.ResourceList); ok && o.FieldSelector == nil {
+		c.unscoped.Add(1)
+	}
+
+	return c.Reader.List(ctx, list, opts...) //nolint:wrapcheck // test double
+}
+
+func replicasOfScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := crdv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+
+	return scheme
+}
+
+func replicaRow(name, rd, node string) *crdv1alpha1.Resource {
+	return &crdv1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       crdv1alpha1.ResourceSpec{ResourceDefinitionName: rd, NodeName: node},
+	}
+}
+
+// replicasOfCluster is a cluster with many definitions, one of them
+// pvc-mix with a replica written in another spelling of its name.
+func replicasOfCluster(t *testing.T, indexed bool) client.Client {
+	t.Helper()
+
+	objs := make([]client.Object, 0, 53)
+	objs = append(objs,
+		&crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix"}},
+		replicaRow("pvc-mix.n1", "pvc-mix", "n1"),
+		replicaRow("pvc-mix.n2", "Pvc-Mix", "N2"),
+	)
+
+	for i := range 50 {
+		objs = append(objs, replicaRow(fmt.Sprintf("pvc-%02d.n1", i), fmt.Sprintf("pvc-%02d", i), "n1"))
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(replicasOfScheme(t)).WithObjects(objs...)
+	if indexed {
+		builder = builder.WithIndex(&crdv1alpha1.Resource{}, k8s.FieldResourceDefinitionName, func(o client.Object) []string {
+			return []string{o.(*crdv1alpha1.Resource).Spec.ResourceDefinitionName}
+		})
+	}
+
+	return builder.Build()
+}
+
+func replicaNames(replicas []crdv1alpha1.Resource) []string {
+	out := make([]string, 0, len(replicas))
+	for i := range replicas {
+		out = append(out, replicas[i].Name)
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// The controller and every satellite read a definition's replicas past
+// the cache on every pass. They must read that definition's replicas
+// only, never every Resource in the cluster: on a cluster with a few
+// hundred replicas that read kept them at their CPU limit. Every
+// spelling of the definition a replica carries is still found.
+func TestReplicasOfReadsOnlyTheDefinitionsReplicas(t *testing.T) {
+	t.Parallel()
+
+	cli := replicasOfCluster(t, true)
+	reader := &unscopedListCounter{Reader: cli}
+
+	var got crdv1alpha1.ResourceList
+
+	err := k8s.ReplicasOf(context.Background(), reader, cli, "pvc-mix", &got)
+	if err != nil {
+		t.Fatalf("ReplicasOf: %v", err)
+	}
+
+	if want := []string{"pvc-mix.n1", "pvc-mix.n2"}; !slices.Equal(replicaNames(got.Items), want) {
+		t.Errorf("replicas of pvc-mix = %v, want %v", replicaNames(got.Items), want)
+	}
+
+	if n := reader.unscoped.Load(); n != 0 {
+		t.Errorf("read every Resource in the cluster %d time(s) for one definition", n)
+	}
+}
+
+// A reader that cannot select on the field gets the whole-cluster read,
+// and the same answer.
+func TestReplicasOfFallsBackWhenTheSelectorIsRefused(t *testing.T) {
+	t.Parallel()
+
+	cli := replicasOfCluster(t, false)
+
+	var got crdv1alpha1.ResourceList
+
+	err := k8s.ReplicasOf(context.Background(), cli, nil, "pvc-mix", &got)
+	if err != nil {
+		t.Fatalf("ReplicasOf: %v", err)
+	}
+
+	if want := []string{"pvc-mix.n1", "pvc-mix.n2"}; !slices.Equal(replicaNames(got.Items), want) {
+		t.Errorf("replicas of pvc-mix = %v, want %v", replicaNames(got.Items), want)
+	}
+}
