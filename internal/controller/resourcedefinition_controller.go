@@ -1294,16 +1294,16 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 		excluded[naming.Key(name)] = hosting
 	}
 
-	if rdName != "" {
-		err := r.excludeOccupiedNodes(ctx, rdName, excluded)
-		if err != nil {
-			return "", err
-		}
-	}
-
 	nodes, err := r.Store.Nodes().List(ctx)
 	if err != nil {
 		return "", err
+	}
+
+	if rdName != "" {
+		err := r.excludeOccupiedNodes(ctx, rdName, excluded, offlineNodes(nodes))
+		if err != nil {
+			return "", err
+		}
 	}
 
 	candidates := make([]string, 0, len(nodes))
@@ -1345,15 +1345,25 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 // (Bug 261 defense-in-depth against a stale caller snapshot, the
 // freshest signal the controller has without a full reconcile fan-out)
 // and every node a replica's kernel still holds a connection to.
-func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context, rdName string, excluded map[string]bool) error {
+//
+// The connections of a replica whose node is offline do not count: they
+// are the last report of a satellite that is not there to drop them, and
+// upstream's resource delete does not wait for an offline satellite
+// either (the update to it ends in a not-connected warning and the
+// delete goes on). Counting them would keep the witness off the node for
+// as long as the satellite stays away. When it comes back it learns the
+// node's new node-id and drops the old connection itself.
+func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context, rdName string, excluded, offline map[string]bool) error {
 	live, err := r.Store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
 		return err
 	}
 
 	for i := range live {
-		for _, peer := range kernelPeersOf(&live[i]) {
-			excluded[naming.Key(peer)] = true
+		if !offline[naming.Key(live[i].NodeName)] {
+			for _, peer := range kernelPeersOf(&live[i]) {
+				excluded[naming.Key(peer)] = true
+			}
 		}
 
 		if slices.Contains(live[i].Flags, apiv1.ResourceFlagDiskless) {
@@ -1364,6 +1374,20 @@ func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context,
 	}
 
 	return nil
+}
+
+// offlineNodes returns the nodes whose satellite the controller has
+// marked OFFLINE, by naming key.
+func offlineNodes(nodes []apiv1.Node) map[string]bool {
+	offline := make(map[string]bool)
+
+	for i := range nodes {
+		if nodes[i].ConnectionStatus == apiv1.NodeTypeOffline {
+			offline[naming.Key(nodes[i].Name)] = true
+		}
+	}
+
+	return offline
 }
 
 // kernelPeersOf returns the nodes a replica's kernel still holds a

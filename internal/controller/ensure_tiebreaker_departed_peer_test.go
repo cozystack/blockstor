@@ -166,3 +166,48 @@ func TestEnsureTiebreakerSkipsDefinitionFlaggedDelete(t *testing.T) {
 		t.Fatalf("witness placed for a definition flagged DELETE (err=%v)", err)
 	}
 }
+
+// A survivor whose satellite is offline keeps the connections it last
+// reported, and nobody is there to drop them. Its stale list must not
+// keep the witness off the spare node: upstream's resource delete goes
+// on past an offline satellite with a not-connected warning, and the
+// satellite drops the old connection itself once it is back.
+func TestEnsureTiebreakerIgnoresStalePeersOfAnOfflineSurvivor(t *testing.T) {
+	t.Parallel()
+
+	const rdName = "pvc-offline-survivor"
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	seedNodes(t, ctx, st, "n1", "n2", "n3")
+
+	if err := st.Nodes().SetConnectionStatus(ctx, "n2", apiv1.NodeTypeOffline); err != nil {
+		t.Fatalf("mark n2 offline: %v", err)
+	}
+
+	online := apiv1.Resource{Name: rdName, NodeName: "n1"}
+	withKernelPeers(&online, "n2")
+
+	offline := apiv1.Resource{Name: rdName, NodeName: "n2"}
+	withKernelPeers(&offline, "n1", "n3")
+
+	for _, res := range []*apiv1.Resource{&online, &offline} {
+		if err := st.Resources().Create(ctx, res); err != nil {
+			t.Fatalf("seed diskful %s: %v", res.NodeName, err)
+		}
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: rdName}}
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	if _, err := st.Resources().Get(ctx, rdName, "n3"); err != nil {
+		t.Fatalf("witness kept off n3 by the stale connections of an offline survivor: %v", err)
+	}
+}
