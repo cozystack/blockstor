@@ -873,7 +873,7 @@ func (*ObserverRunnable) NeedLeaderElection() bool { return false }
 // caches and marks the resource pending. The writer then writes each
 // pending resource's whole view once, however many frames it took.
 // Writing every frame in the reader, as before, made the reader as slow
-// as the client's rate limit; during a node's resync storm the frames
+// as the apiserver round trips; during a node's resync storm the frames
 // queued in the channel, then in the pipe, then in drbdsetup's netlink
 // socket, until the kernel dropped notifications and drbdsetup exited.
 // LINSTOR likewise reads events2 apart from what it reports.
@@ -2438,12 +2438,15 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 	}
 
 	// The resync re-sends every replica every 5 s. On a node with about
-	// a hundred replicas that is more than the client's 20 requests a
-	// second, and the frames carrying a running resync's progress
-	// queued behind it: `SyncTarget(x%)` trailed the kernel by several
-	// seconds. Skip what the apiserver provably holds already; any
-	// other writer's change bumps the version and brings the apply
-	// back, so a clobbered field is still restored on the next pass.
+	// a hundred replicas that is a write pass of round trips, each also
+	// a burst of CPU on a satellite held to a fraction of a core, and
+	// the frames carrying a running resync's progress queued behind it:
+	// `SyncTarget(x%)` trailed the kernel by several seconds. The
+	// client itself has no rate limit (ctrl.GetConfig leaves it to the
+	// apiserver's priority and fairness). Skip what the apiserver
+	// provably holds already; any other writer's change bumps the
+	// version and brings the apply back, so a clobbered field is still
+	// restored on the next pass.
 	if lookupErr == nil && o.alreadyApplied(ev.ResourceName, &lookup, &apply.Status) {
 		return nil
 	}
