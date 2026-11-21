@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/cockroachdb/errors"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -74,6 +75,19 @@ func (r *Reconciler) recordAdjustOutcome(ctx context.Context, name string, skipN
 	default:
 		r.forgetAdjustFailed(name)
 	}
+}
+
+// upRecorded runs `drbdadm up` and keeps the failed-adjust record in
+// step with it. Up configures the network the way a full adjust does,
+// new-peer and new-path before connect, so a failure leaves the same
+// StandAlone connections with peer devices behind, and the next pass,
+// an adjust because the slot is loaded now, must not read them as an
+// operator's disconnect.
+func (r *Reconciler) upRecorded(ctx context.Context, name string) error {
+	err := r.cfg.Adm.Up(ctx, name)
+	r.recordAdjustOutcome(ctx, name, false, err)
+
+	return errors.WithStack(err)
 }
 
 func (r *Reconciler) setAdjustFailed(ctx context.Context, name string) {

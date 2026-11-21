@@ -33,10 +33,14 @@ const (
 
 	portInUseBare    = "drbdadm adjust " + portInUseRes
 	portInUseSkipNet = "drbdadm adjust --skip-net " + portInUseRes
+	portInUseUp      = "drbdadm up " + portInUseRes
 )
 
 var errPortInUse = errors.New("drbdadm adjust: Failure: (103) Remote address(port) already in use. " +
 	"Command 'drbdsetup new-path " + portInUseRes + " 0 ipv4:10.0.0.1:7001 ipv4:10.0.0.3:7003' terminated with exit code 10")
+
+var errUnknownResource = errors.New(portInUseRes + ": Failure: (158) Unknown resource\n" +
+	"additional info from kernel:\nunknown resource")
 
 var errLowerDevTooSmall = errors.New("drbdadm adjust: Failure: (111) Low.dev. smaller than requested DRBD-dev. size")
 
@@ -162,6 +166,61 @@ func TestAdjustRetriesAFailedAdjustInFullAfterARestart(t *testing.T) {
 	if after.adjustFailedBefore(portInUseRes) {
 		t.Error("a full adjust that went through must clear the record")
 	}
+}
+
+// `drbdadm up` runs the same new-peer and new-path steps as a full
+// adjust, so one refused at new-path leaves the same StandAlone
+// connections with peer devices behind: after a reboot, an operator's
+// down or the my-node-id self-heal. The next pass is an adjust, since
+// the slot is loaded now, and it must be a full one.
+func TestAdjustAfterAFailedUpIsAFullAdjust(t *testing.T) {
+	t.Parallel()
+
+	fx := portInUseExec()
+	fx.Expect(portInUseUp, storage.FakeResponse{Err: errPortInUse})
+	fx.Expect("drbdsetup status -j "+portInUseRes, portInUseStatus())
+
+	rec := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: t.TempDir(), NodeName: "n1"})
+	dr := portInUseDesired()
+
+	if err := rec.bringUpResource(t.Context(), dr); err == nil {
+		t.Fatal("the up hit the port in use and must fail")
+	}
+
+	fx.Reset()
+
+	if err := rec.adjustResource(t.Context(), dr, false); err != nil {
+		t.Fatalf("adjust after the failed up: %v", err)
+	}
+
+	assertAdjustedInFull(t, fx.CommandLines())
+}
+
+// The Bug-287 fallback runs `drbdadm up` from inside an adjust that may
+// have skipped the network. An up that fails there half built the
+// connections just the same, so the next adjust is a full one.
+func TestAdjustAfterAFailedUpFallbackIsAFullAdjust(t *testing.T) {
+	t.Parallel()
+
+	fx := portInUseExec()
+	fx.Expect("drbdsetup status -j "+portInUseRes, portInUseStatus())
+	fx.ExpectSequence(portInUseSkipNet, storage.FakeResponse{Err: errUnknownResource})
+	fx.Expect(portInUseUp, storage.FakeResponse{Err: errPortInUse})
+
+	rec := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: t.TempDir(), NodeName: "n1"})
+	dr := portInUseDesired()
+
+	if err := rec.adjustResource(t.Context(), dr, false); err == nil {
+		t.Fatal("the fallback up hit the port in use and must fail")
+	}
+
+	fx.Reset()
+
+	if err := rec.adjustResource(t.Context(), dr, false); err != nil {
+		t.Fatalf("adjust after the failed fallback up: %v", err)
+	}
+
+	assertAdjustedInFull(t, fx.CommandLines())
 }
 
 // An adjust run with --skip-net never touched the connections, so its

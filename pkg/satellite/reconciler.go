@@ -4765,7 +4765,7 @@ func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredRes
 // (Stage 2), createMetadata (Stage 3a), and adjustResource (Stage
 // 3b) shadows.
 func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredResource) error {
-	err := r.cfg.Adm.Up(ctx, dr.GetName())
+	err := r.upRecorded(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "drbdadm up %s", dr.GetName())
 	}
@@ -5003,7 +5003,7 @@ func (r *Reconciler) adjustAndRecover(ctx context.Context, dr *intent.DesiredRes
 	// metadata; surface its error directly so the reconciler retry
 	// loop can re-converge if up also fails.
 	if isUnknownResourceErr(err) {
-		upErr := r.cfg.Adm.Up(ctx, dr.GetName())
+		upErr := r.upRecorded(ctx, dr.GetName())
 		if upErr != nil {
 			return errors.Wrapf(upErr, "drbdadm up %s (after adjust 158 fallback)", dr.GetName())
 		}
@@ -5059,7 +5059,7 @@ func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.
 		return errors.Wrapf(err, "drbdadm down %s (recovery from bitmap-bothdisks)", dr.GetName())
 	}
 
-	err = r.cfg.Adm.Up(ctx, dr.GetName())
+	err = r.upRecorded(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "drbdadm up %s (recovery from bitmap-bothdisks)", dr.GetName())
 	}
