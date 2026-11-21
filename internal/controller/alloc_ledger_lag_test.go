@@ -20,8 +20,10 @@ package controller_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -255,4 +257,79 @@ func TestRetryAfterAFailedWriteKeepsTheLowestValues(t *testing.T) {
 	if *target.Spec.DRBDNodeID != 0 || *target.Spec.DRBDPort != 20000 {
 		t.Errorf("retried replica got node id %d, port %d; want 0, 20000", *target.Spec.DRBDNodeID, *target.Spec.DRBDPort)
 	}
+}
+
+// TestAllocationDoesNotWaitForAnotherReplicasWrites pins that the
+// allocation lock covers choosing a replica's identities, not the API
+// writes that persist them. Held across the writes, it made every new
+// replica of a provisioning burst wait for the round trips of all the
+// replicas before it, so the last ones got their identities, and the
+// satellites started building them, many seconds after they were
+// created. The replica allocated meanwhile must still get its own port
+// and minor: the first one's are reserved while their writes are in
+// flight.
+func TestAllocationDoesNotWaitForAnotherReplicasWrites(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	objs := burstObjects(2, "w1")
+	live := newBurstClient(t, objs)
+	frozen := newBurstClient(t, objs)
+
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	cache := cacheOf(live, frozen, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if strings.HasPrefix(obj.GetName(), "pvc-burst-00") {
+				once.Do(func() {
+					close(blocked)
+					<-release
+				})
+			}
+
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	rec := &controllerpkg.ResourceReconciler{Client: cache, Scheme: live.Scheme(), APIReader: live}
+
+	allocate := func(name string) <-chan error {
+		done := make(chan error, 1)
+
+		go func() {
+			var target blockstoriov1alpha1.Resource
+			if err := live.Get(ctx, client.ObjectKey{Name: name}, &target); err != nil {
+				done <- err
+
+				return
+			}
+
+			_, err := rec.EnsureDRBDIDsForTest(ctx, &target, nil)
+			done <- err
+		}()
+
+		return done
+	}
+
+	first := allocate("pvc-burst-00.w1")
+	<-blocked
+
+	select {
+	case err := <-allocate("pvc-burst-01.w1"):
+		if err != nil {
+			t.Fatalf("allocate pvc-burst-01.w1: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("pvc-burst-01.w1 waited for the writes of pvc-burst-00.w1")
+	}
+
+	close(release)
+
+	if err := <-first; err != nil {
+		t.Fatalf("allocate pvc-burst-00.w1: %v", err)
+	}
+
+	assertBurstUnique(ctx, t, live, 2)
 }
