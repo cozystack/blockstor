@@ -56,6 +56,13 @@ type Resource struct {
 	// flips it.
 	ToggleDiskCancel bool `json:"toggle_disk_cancel,omitempty"`
 
+	// SatelliteIncarnation names the kernel boot the runtime state this
+	// replica carries was reported from (CRD
+	// `Status.SatelliteIncarnation`). Not on the wire: it only lets a
+	// read tell a report of the node's current kernel state from one
+	// left behind before a reboot (ForgetStaleSatelliteState).
+	SatelliteIncarnation string `json:"-"`
+
 	// Volumes is the per-replica volume slice — sourced from
 	// Resource.Status.Volumes which the satellite observer writes.
 	// Upstream LINSTOR's `Resource` carries volumes inline; the

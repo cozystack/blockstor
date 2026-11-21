@@ -73,6 +73,8 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	s.forgetStaleReplica(r.Context(), &res)
+
 	vols := res.Volumes
 	if vols == nil {
 		vols = []apiv1.Volume{}
@@ -105,6 +107,8 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 
 		return
 	}
+
+	s.forgetStaleReplica(r.Context(), &res)
 
 	for i := range res.Volumes {
 		if res.Volumes[i].VolumeNumber == vlmNr {

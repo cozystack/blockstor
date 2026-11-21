@@ -130,6 +130,16 @@ type NodeStatus struct {
 	// +optional
 	LastHeartbeatTime *metav1.Time `json:"lastHeartbeatTime,omitempty"`
 
+	// satelliteIncarnation identifies the kernel boot the satellite now
+	// running on this node reports DRBD state from: the boot id, or a
+	// per-process value where none can be read. A Resource whose
+	// status.satelliteIncarnation differs was last reported before a
+	// reboot, so its state predates it and is not shown; a restart of
+	// the satellite alone keeps it. Written by the satellite heartbeat;
+	// do not hand-set.
+	// +optional
+	SatelliteIncarnation string `json:"satelliteIncarnation,omitempty"`
+
 	// conditions represents the current state of the Node resource.
 	// The well-known `Ready` condition (status=True when the satellite
 	// is healthy, Unknown when its heartbeat is stale, False when the

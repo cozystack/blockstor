@@ -105,11 +105,28 @@ type HeartbeatRunnable struct {
 	NodeName string
 	Period   time.Duration
 
+	// Incarnation is this satellite's Config.Incarnation, stamped on
+	// the Node so reads can tell which Resource reports came from the
+	// kernel boot the node runs now. Empty stamps none.
+	Incarnation string
+
 	// missCount tracks consecutive NotFound observations. Reset
 	// on the first successful stamp. Internal — exposed only so
 	// the controller-package tests can pin the rate-limit behaviour
 	// without needing to assert on log output.
 	missCount int
+}
+
+// newHeartbeatRunnableFromConfig builds the heartbeat the manager runs, so
+// the wiring from cfg (the incarnation above all, whose absence no read
+// would notice) lives where a unit test can drive it. Production caller:
+// manager.go addBackgroundRunnables.
+func newHeartbeatRunnableFromConfig(cli client.Client, cfg *Config) *HeartbeatRunnable {
+	return &HeartbeatRunnable{
+		Client:      cli,
+		NodeName:    cfg.NodeName,
+		Incarnation: cfg.Incarnation,
+	}
 }
 
 // NeedLeaderElection returns false — satellites are per-node and
@@ -187,7 +204,8 @@ func (h *HeartbeatRunnable) stamp(ctx context.Context, logger logr.Logger) error
 		},
 		ObjectMeta: metav1.ObjectMeta{Name: naming.Key(h.NodeName)},
 		Status: blockstoriov1alpha1.NodeStatus{
-			LastHeartbeatTime: &now,
+			LastHeartbeatTime:    &now,
+			SatelliteIncarnation: h.Incarnation,
 			Conditions: []metav1.Condition{
 				{
 					Type:               blockstoriov1alpha1.NodeConditionReady,
