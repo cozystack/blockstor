@@ -207,6 +207,12 @@ func restartObserverClient(ctx context.Context, t *testing.T, cfg *rest.Config) 
 
 	go func() { _ = informers.Start(ctx) }()
 
+	// A read before Start has run fails with "the cache is not
+	// started", which a loaded machine hits.
+	if !informers.WaitForCacheSync(ctx) {
+		t.Fatal("cache did not start")
+	}
+
 	cached, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme, Cache: &client.CacheOptions{Reader: informers}})
 	if err != nil {
 		t.Fatalf("cached client: %v", err)
