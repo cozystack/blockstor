@@ -215,7 +215,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res = s.answeredReplica(r.Context(), res)
+	s.forgetStaleReplica(r.Context(), &res)
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys before emit.
 	// Resources().Get returns a value copy, so the in-place mutation
