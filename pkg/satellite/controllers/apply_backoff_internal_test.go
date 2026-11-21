@@ -156,8 +156,15 @@ func TestAnApplyThatRecoversIsReportedOnce(t *testing.T) {
 		}
 	}
 
-	if evs := drain(); len(evs) != 2 || !strings.HasPrefix(evs[1], "Warning "+applyFailedReason) {
-		t.Fatalf("events after two failed applies = %q, want two %s Warnings", evs, applyFailedReason)
+	failed := drain()
+	if len(failed) != 2 {
+		t.Fatalf("events after two failed applies = %q, want two %s Warnings", failed, applyFailedReason)
+	}
+
+	for _, ev := range failed {
+		if !strings.HasPrefix(ev, "Warning "+applyFailedReason) {
+			t.Fatalf("events after two failed applies = %q, want two %s Warnings", failed, applyFailedReason)
+		}
 	}
 
 	if _, err := r.runApply(t.Context(), res, logr.Discard()); err != nil {
