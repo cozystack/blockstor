@@ -570,16 +570,6 @@ type ResourceVolumeStatus struct {
 	// +optional
 	OutOfSyncKib int64 `json:"outOfSyncKib,omitempty"`
 
-	// resyncPeer is the peer whose peer-device frame last reported
-	// this volume in SyncTarget with a `done`: the resync the kernel
-	// is running and reporting progress for. It is cleared by that
-	// peer's next frame without either. LINSTOR's satellite shows the
-	// progress of exactly that frame as the volume's state
-	// (DrbdVolume.update), so another peer's entry that still reads
-	// SyncTarget with an old `done` does not take its place.
-	// +optional
-	ResyncPeer string `json:"resyncPeer,omitempty"`
-
 	// quorum reports the DRBD-9 kernel's per-volume quorum view
 	// from the `quorum:yes|no` field in events2 `device` frames.
 	// true means the local replica has quorum and may serve I/O;

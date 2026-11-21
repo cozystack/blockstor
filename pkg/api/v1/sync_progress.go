@@ -31,20 +31,11 @@ import "fmt"
 // the per-peer progress says how far the running resync is.
 //
 // DRBD runs one resync per volume as SyncTarget at a time and holds
-// the others in PausedSyncT, but more than one peer can read SyncTarget
-// here: a resync that starts from one peer and moves to another within
-// a second, or an entry that kept an earlier frame. LINSTOR shows the
-// `done` of the last frame that reported a SyncTarget with one
-// (DrbdVolume.update), which is the resync the kernel is reporting
-// progress for. ResyncPeer names that peer, and its figure wins while
-// it is still in the state and has a `done`. Without it the lowest is
-// taken, so the result does not depend on map order.
+// the others in PausedSyncT, so in practice one peer matches and its
+// `done` is the figure LINSTOR shows. Should more than one match, the
+// lowest is taken so the result does not depend on map order; LINSTOR
+// shows whichever peer's frame came last there.
 func (s VolumeState) SyncProgress(replicationState string) (float64, bool) {
-	if peer, ok := s.ReplicationStates[s.ResyncPeer]; ok && s.ResyncPeer != "" &&
-		peer.ReplicationState == replicationState && peer.DonePercentage != nil {
-		return *peer.DonePercentage, true
-	}
-
 	var (
 		lowest float64
 		found  bool
