@@ -767,11 +767,6 @@ type ObserverRunnable struct {
 	// is always the last one sent.
 	writeMu sync.Mutex
 
-	// giMu guards giUnsettled: per resource, until when the resync
-	// still reads its GI from disk (giSettleWindow).
-	giMu        sync.Mutex
-	giUnsettled map[string]time.Time
-
 	// startEvents2 starts the kernel event stream; nil runs drbdsetup.
 	// restartDelay is the wait before a stream that ended is started
 	// again; zero means events2RestartDelay. Both are for tests.
@@ -781,9 +776,6 @@ type ObserverRunnable struct {
 	// line before it is taken as ended; zero means
 	// observerInitialStateQuiet. For tests.
 	initialStateQuiet time.Duration
-	// clock tells the GI settle window the time; nil is time.Now. For
-	// tests.
-	clock func() time.Time
 }
 
 // appliedStatus is one entry of ObserverRunnable.applied.
@@ -1109,11 +1101,6 @@ func (o *ObserverRunnable) releaseWrites(ctx context.Context) {
 	o.releasedAt = time.Now()
 	o.pendingMu.Unlock()
 
-	// While no stream ran the kernel may have changed anything.
-	for _, name := range current {
-		o.unsettleGI(name)
-	}
-
 	o.signalWriter()
 
 	for _, name := range current {
@@ -1192,101 +1179,19 @@ func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
 	}
 }
 
-// resyncOnce marks every known resource pending and writes them. The
-// pass waits for one the writer has in flight, and writes nothing while
-// a stream's dump is being read.
+// resyncOnce marks every known resource pending, reading its GI
+// afresh (readCurrentGI), and writes them. The pass waits for one the writer has
+// in flight, and writes nothing while a stream's dump is being read.
 //
-// It reads a resource's GI from disk afresh while the GI may still
-// settle after a frame (giSettleWindow) or while a data-bearing volume
-// has none yet, so a data-state volume's CurrentGI converges even when
-// no further events2 frame fires after it reached UpToDate.
+// The GI is read here too, not only when a frame changes a volume: the
+// 5 s resync guarantees a data-state volume's CurrentGI converges even
+// when no further events2 frame fires after it reached UpToDate.
 func (o *ObserverRunnable) resyncOnce(ctx context.Context) {
-	now := o.now()
-
 	for _, name := range o.cachedResourceNames() {
-		probe := o.giUnsettledAt(name, now) || o.lacksGI(name)
-		o.markPending(name, func(entry *pendingWrite) { entry.probeGI = entry.probeGI || probe })
+		o.markPending(name, func(entry *pendingWrite) { entry.probeGI = true })
 	}
 
 	o.flush(ctx, drbd.NewAdm(o.Exec))
-}
-
-// giSettleWindow is how long after the last events2 frame of a resource
-// the resync keeps reading its GI from disk.
-//
-// A GI only changes along with the kernel state events2 reports: a
-// promotion, a lost peer, a finished resync, a new disk. DRBD writes the
-// changed GI to the metadata within the 5 s of its md_sync_timer
-// (drbd_md_mark_dirty), so a read at the frame can still find the old
-// one; three resyncs after the frame take the last read past that.
-//
-// Past the window the GI on disk is the one last read, and reading it
-// again on every resync is all cost. Each read is a drbdmeta run that
-// opens the backing device read-write, and udev answers that close
-// with a change uevent for the device and each of its partitions. With
-// a hundred replicas on a node that was twenty reads a second, the
-// satellite's whole CPU limit spent on them and on the disk rescans the
-// uevents set off, and a new replica took seconds per pass to build.
-// LINSTOR does not read GIs from disk at all.
-const giSettleWindow = 3 * observerResyncInterval
-
-// now is the time the GI settle window reads.
-func (o *ObserverRunnable) now() time.Time {
-	if o.clock != nil {
-		return o.clock()
-	}
-
-	return time.Now()
-}
-
-// unsettleGI has the resync read name's GI from disk until
-// giSettleWindow from now.
-func (o *ObserverRunnable) unsettleGI(name string) {
-	o.giMu.Lock()
-	defer o.giMu.Unlock()
-
-	if o.giUnsettled == nil {
-		o.giUnsettled = map[string]time.Time{}
-	}
-
-	o.giUnsettled[name] = o.now().Add(giSettleWindow)
-}
-
-// giUnsettledAt reports whether name's GI still settles at now, and
-// forgets it once it does not.
-func (o *ObserverRunnable) giUnsettledAt(name string, now time.Time) bool {
-	o.giMu.Lock()
-	defer o.giMu.Unlock()
-
-	until, ok := o.giUnsettled[name]
-	if !ok {
-		return false
-	}
-
-	if now.Before(until) {
-		return true
-	}
-
-	delete(o.giUnsettled, name)
-
-	return false
-}
-
-// lacksGI reports whether a data-bearing volume of name has a backing
-// device but no GI, from events2 or from a read: the first read failed
-// or found none, and the resync tries again.
-func (o *ObserverRunnable) lacksGI(name string) bool {
-	o.volMu.Lock()
-	defer o.volMu.Unlock()
-
-	for _, vol := range o.volCache[name] {
-		if isDataBearingDiskState(drbd.DiskState(vol.DiskState)) &&
-			vol.BackingDev != "" && vol.CurrentUUID == "" && vol.ProbedGI == "" {
-			return true
-		}
-	}
-
-	return false
 }
 
 // cachedResourceNames returns the union of resource keys held by
@@ -1457,10 +1362,6 @@ func (o *ObserverRunnable) ingest(ctx context.Context, ev *observation) {
 		return
 	}
 
-	// events2 sends nothing for a resource whose kernel state holds
-	// still, so a frame is a change the GI may follow.
-	o.unsettleGI(ev.ResourceName)
-
 	// Read before mergeResource puts the cached disk state on ev.
 	failed := ev.DrbdState == drbdDiskStateFailed
 
@@ -1515,10 +1416,6 @@ func (o *ObserverRunnable) forgetResource(name string) {
 	o.lifecycleMu.Lock()
 	delete(o.lifecycleCache, name)
 	o.lifecycleMu.Unlock()
-
-	o.giMu.Lock()
-	delete(o.giUnsettled, name)
-	o.giMu.Unlock()
 }
 
 // markPending updates what the writer owes name and wakes the writer.
@@ -1775,10 +1672,7 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 		}
 
 		if vol.CurrentUUID == "" && vol.BackingDev != "" {
-			current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
-			if err != nil {
-				current = ""
-			}
+			current := o.readCurrentGI(ctx, adm, ev.ResourceName, vol)
 
 			vol.CurrentUUID = current
 			o.rememberProbedGI(ev.ResourceName, vol.VolumeNumber, current)
@@ -1788,6 +1682,63 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 			o.RecordGI(ev.ResourceName, vol.VolumeNumber, vol.CurrentUUID)
 		}
 	}
+}
+
+// readCurrentGI reads one volume's current-UUID, from the kernel
+// when the replica has a peer to name the volume by, else from the
+// backing device. It returns empty when neither read found one.
+//
+// The resync reads every data-bearing volume every 5 s, and it must:
+// DRBD can move a GI with no events2 frame. A Primary that lost a peer
+// or was just promoted mints its new current UUID on the first write
+// after, which may come long after the last frame, and a Secondary
+// takes the new UUID a connected Primary sends it. A GI read once and
+// kept would let the seed gates take a written replica for a day0
+// sibling and skip a new replica's initial sync.
+//
+// drbdmeta opens the backing device read-write, and udev answers the
+// close with a change uevent for the device and each of its
+// partitions. Read that way on every resync, a hundred replicas held
+// a satellite at its CPU limit, with the disk rescans the uevents set
+// off. drbdsetup asks the kernel over netlink and opens nothing.
+func (o *ObserverRunnable) readCurrentGI(ctx context.Context, adm *drbd.Adm, name string, vol *volumeObservation) string {
+	if peer, ok := o.anyPeerNodeID(name); ok {
+		current, err := adm.KernelCurrentGI(ctx, name, peer, vol.VolumeNumber)
+		if err == nil && current != "" {
+			return current
+		}
+	}
+
+	current, err := adm.CurrentGI(ctx, name, vol.VolumeNumber, vol.BackingDev)
+	if err != nil {
+		return ""
+	}
+
+	return current
+}
+
+// anyPeerNodeID returns the lowest DRBD node-id of name's peers the
+// observer has seen, for naming a peer device to drbdsetup.
+func (o *ObserverRunnable) anyPeerNodeID(name string) (int32, bool) {
+	o.connMu.Lock()
+	defer o.connMu.Unlock()
+
+	var (
+		lowest int32
+		found  bool
+	)
+
+	for _, peer := range o.connCache[name] {
+		if peer.PeerDRBDNodeID == nil {
+			continue
+		}
+
+		if !found || *peer.PeerDRBDNodeID < lowest {
+			lowest, found = *peer.PeerDRBDNodeID, true
+		}
+	}
+
+	return lowest, found
 }
 
 // rememberProbedGI keeps a get-gi result on the cached volume, so the
