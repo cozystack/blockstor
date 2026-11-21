@@ -149,3 +149,48 @@ func TestOfflineNodeReplicasCarryNoSatelliteState(t *testing.T) {
 
 	assertNoSatelliteState(t, "single replica", &one)
 }
+
+// The per-replica volume reads answer from the same replica and must
+// agree with the view: LINSTOR fills `volumes[].state` from the
+// satellite's state on these endpoints too, so an OFFLINE node's
+// volume carries none.
+func TestOfflineNodeVolumesCarryNoSatelliteState(t *testing.T) {
+	base, stop := startServerWithStore(t, seedOfflinePeer(t))
+	defer stop()
+
+	decode := func(url string, into any) {
+		t.Helper()
+
+		resp := httpGet(t, url)
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status = %d", url, resp.StatusCode)
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
+			t.Fatalf("%s: decode: %v", url, err)
+		}
+	}
+
+	var offlineList []apiv1.Volume
+	decode(base+"/v1/resource-definitions/pvc-x/resources/n2/volumes", &offlineList)
+
+	if len(offlineList) != 1 || offlineList[0].State.DiskState != "" {
+		t.Errorf("volume list of the OFFLINE node's replica = %+v, want one volume with no disk state", offlineList)
+	}
+
+	var offlineOne apiv1.Volume
+	decode(base+"/v1/resource-definitions/pvc-x/resources/n2/volumes/0", &offlineOne)
+
+	if offlineOne.State.DiskState != "" {
+		t.Errorf("volume 0 of the OFFLINE node's replica keeps disk state %q", offlineOne.State.DiskState)
+	}
+
+	var onlineOne apiv1.Volume
+	decode(base+"/v1/resource-definitions/pvc-x/resources/n1/volumes/0", &onlineOne)
+
+	if onlineOne.State.DiskState != "UpToDate" {
+		t.Errorf("volume 0 of the ONLINE node's replica = %q, want UpToDate", onlineOne.State.DiskState)
+	}
+}

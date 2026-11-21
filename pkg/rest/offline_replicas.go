@@ -48,3 +48,12 @@ func (s *Server) forgetOfflineReplicas(ctx context.Context, resources []apiv1.Re
 
 	apiv1.ForgetStateOnOfflineNodes(resources, nodes)
 }
+
+// answeredReplica is forgetOfflineReplicas for a read that answers a
+// single replica.
+func (s *Server) answeredReplica(ctx context.Context, res apiv1.Resource) apiv1.Resource {
+	answered := []apiv1.Resource{res}
+	s.forgetOfflineReplicas(ctx, answered)
+
+	return answered[0]
+}
