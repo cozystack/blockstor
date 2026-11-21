@@ -33,7 +33,10 @@ import (
 // the node was down.
 //
 // A node list that fails leaves the replicas as stored: the read still
-// answers, with the state last reported, rather than failing outright.
+// answers, with the state last reported, rather than failing outright:
+// linstor-csi reads replicas here, and a node list error must not stop
+// its volume operations. The blockstor CLI fails instead (see
+// fetchResources there), since it serves a person reading the state.
 func (s *Server) forgetOfflineReplicas(ctx context.Context, resources []apiv1.Resource) {
 	if len(resources) == 0 {
 		return

@@ -250,6 +250,12 @@ func listing[T any](
 // shows no disk state, as they do against LINSTOR. The store keeps the
 // dead satellite's last report, UpToDate and connected, and showing it
 // hid every replica of a node that was down.
+//
+// A failed node list fails the command, where the REST reads fall back
+// to the stored state. The REST reads serve linstor-csi, whose volume
+// operations must not stop on a node list error; an operator running
+// `r l` is better told the answer is incomplete than shown a dead node
+// as healthy.
 func fetchResources(ctx context.Context, st store.Store) ([]apiv1.Resource, error) {
 	resources, err := st.Resources().List(ctx)
 	if err != nil {
