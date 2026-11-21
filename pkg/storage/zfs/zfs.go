@@ -270,10 +270,13 @@ func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storag
 // child dataset (`tank/linstor`), so the zpool is the name up to the
 // first slash.
 //
-// An empty response (the dataset or the zpool was destroyed out of
-// band) is surfaced as ErrPoolGone so the satellite's writeCapacity
-// loop flips Status.PoolMissing=true and `linstor sp l` lands
-// state=Faulty instead of a silent state=Ok with zeroed capacity.
+// A dataset or zpool destroyed out of band makes `zfs get` or
+// `zpool get` exit non-zero, and the satellite's writeCapacity loop
+// flips Status.PoolMissing on that error as on any failure other than
+// a probe timeout, so `linstor sp l` shows state=Faulty instead of
+// state=Ok with zeroed capacity. An empty response, which only a
+// wrapped or fake exec produces, is tagged ErrPoolGone to the same
+// end.
 func (p *Provider) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 	// Bug 271: bounded ctx so a suspended zpool cannot block the
 	// every-30-seconds writeCapacity loop. Without this the
