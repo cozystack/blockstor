@@ -790,7 +790,7 @@ type appliedStatus struct {
 // the node, and reads that hide the replicas of a satellite that just
 // started show none of them until it has. One at a time, with a status
 // write, a get-gi and a Condition write each, that kept every replica
-// of a node with ~110 of them Unknown for tens of seconds; LINSTOR
+// of a node with ~140 of them Unknown for tens of seconds; LINSTOR
 // sends a reconnected node's state in one batch after the full sync.
 const observerWriters = 8
 
@@ -1650,7 +1650,8 @@ func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 
 	o.forEachPending(ctx, names, func(name string) { o.writeResource(ctx, adm, name, batch[name]) })
 
-	if !released.IsZero() {
+	// A pass cut short by shutdown did not write them all.
+	if !released.IsZero() && ctx.Err() == nil {
 		log.FromContext(ctx).WithName("observer").Info("DRBD state written after the events2 dump",
 			"resources", len(names), "took", time.Since(released))
 	}
