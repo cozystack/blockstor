@@ -148,6 +148,52 @@ func TestZFSPoolStatusAgainstRealPool(t *testing.T) {
 	}
 }
 
+// TestZFSThickVolumeConsumesFreeCapacity checks against a real pool
+// that a thick zvol, never written to, lowers the reported free
+// capacity by its full size. The zpool's own `free` does not move
+// until the blocks are written, which is how a thick pool came to
+// advertise space its refreservations had already taken.
+func TestZFSThickVolumeConsumesFreeCapacity(t *testing.T) {
+	if _, err := exec.LookPath("zfs"); err != nil {
+		t.Skip("zfs binary not on PATH; skipping integration smoke")
+	}
+
+	pool := requireEnv(t, "BLOCKSTOR_ZFS_POOL")
+
+	provider := zfs.NewProvider(zfs.Config{Pool: pool}, storage.RealExec{})
+	ctx := t.Context()
+
+	vol := storage.Volume{
+		ResourceName: "blockstor-it-free",
+		VolumeNumber: 0,
+		SizeKib:      64 * 1024,
+	}
+
+	t.Cleanup(func() {
+		_ = provider.DeleteVolume(t.Context(), vol)
+	})
+
+	before, err := provider.PoolStatus(ctx)
+	if err != nil {
+		t.Fatalf("PoolStatus (before): %v", err)
+	}
+
+	err = provider.CreateVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	after, err := provider.PoolStatus(ctx)
+	if err != nil {
+		t.Fatalf("PoolStatus (after): %v", err)
+	}
+
+	if drop := before.FreeCapacityKib - after.FreeCapacityKib; drop < vol.SizeKib {
+		t.Errorf("free capacity dropped by %d KiB after a %d KiB thick zvol, want at least its size",
+			drop, vol.SizeKib)
+	}
+}
+
 // requireEnv reads the env var or skips the test (rather than fails)
 // when missing — these are opt-in integration tests.
 func requireEnv(t *testing.T, key string) string {

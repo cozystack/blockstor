@@ -80,12 +80,13 @@ func (f *ctxDeadlineRecorder) RunWithStdin(
 }
 
 // TestPoolStatusBoundsZpoolList pins Bug 271: PoolStatus must
-// derive a deadline before shelling out to `zpool list`.
+// derive a deadline before shelling out to `zfs get` / `zpool get`.
 func TestPoolStatusBoundsZpoolList(t *testing.T) {
 	t.Parallel()
 
 	fx := newCtxDeadlineRecorder()
-	fx.stdout["zpool list -H -p -o size,free tank"] = []byte("104857600000\t78643200000\n")
+	fx.stdout["zfs get -Hp -o property,value available,quota tank"] = []byte("available\t78643200000\nquota\t0\n")
+	fx.stdout["zpool get -Hp -o value size tank"] = []byte("104857600000\n")
 
 	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
 
@@ -98,8 +99,10 @@ func TestPoolStatusBoundsZpoolList(t *testing.T) {
 		t.Fatalf("no exec calls recorded")
 	}
 
-	if !fx.hadDeadline[0] {
-		t.Errorf("PoolStatus must bound the zpool list ctx with a deadline (Bug 271)")
+	for i, ok := range fx.hadDeadline {
+		if !ok {
+			t.Errorf("PoolStatus call %d must run under a deadline (Bug 271)", i)
+		}
 	}
 }
 

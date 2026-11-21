@@ -180,11 +180,14 @@ func TestVolumeStatusParsesZfsList(t *testing.T) {
 	}
 }
 
-// TestPoolStatusParsesZpoolGet: free + total via zpool list -p.
-func TestPoolStatusParsesZpoolGet(t *testing.T) {
+// TestPoolStatusParsesZfsGet: free is the dataset's `available`,
+// total the zpool size when no quota is set.
+func TestPoolStatusParsesZfsGet(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("zpool list -H -p -o size,free tank",
-		storage.FakeResponse{Stdout: []byte("107374182400\t80530636800\n")})
+	fx.Expect("zfs get -Hp -o property,value available,quota tank",
+		storage.FakeResponse{Stdout: []byte("available\t80530636800\nquota\t0\n")})
+	fx.Expect("zpool get -Hp -o value size tank",
+		storage.FakeResponse{Stdout: []byte("107374182400\n")})
 
 	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
 
@@ -348,12 +351,12 @@ func TestVolumeStatusBadColumns(t *testing.T) {
 	}
 }
 
-// TestPoolStatusBadColumns: zpool list output with the wrong number
+// TestPoolStatusBadColumns: zfs get output with the wrong number
 // of columns surfaces a parse error, not a slice panic.
 func TestPoolStatusBadColumns(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect(
-		"zpool list -H -p -o size,free tank",
+		"zfs get -Hp -o property,value available,quota tank",
 		storage.FakeResponse{Stdout: []byte("only_one_field\n")},
 	)
 
@@ -361,13 +364,13 @@ func TestPoolStatusBadColumns(t *testing.T) {
 
 	_, err := p.PoolStatus(t.Context())
 	if err == nil {
-		t.Errorf("expected error on malformed zpool list output")
+		t.Errorf("expected error on malformed zfs get output")
 	}
 }
 
 // TestPoolStatusMissingZPoolEmptyOutput pins Issue 74: when the
 // operator destroys the ZFS pool out-of-band (`zpool destroy`),
-// `zpool list -H -p -o size,free <pool>` returns empty stdout in
+// the capacity probe of `<pool>` returns empty stdout in
 // some configurations (or exit 0 + empty stdout in tooling chains).
 // `PoolStatus` MUST surface that as an error whose message mentions
 // "not found" so the satellite's writeCapacity loop flips
@@ -382,12 +385,16 @@ func TestPoolStatusMissingZPoolEmptyOutput(t *testing.T) {
 
 	_, err := p.PoolStatus(t.Context())
 	if err == nil {
-		t.Fatalf("expected error on empty zpool list output, got nil")
+		t.Fatalf("expected error on empty zfs get output, got nil")
 	}
 
 	if !strings.Contains(err.Error(), "not found") {
 		t.Errorf("error message should mention %q to mark the pool absent; got %q",
 			"not found", err.Error())
+	}
+
+	if !errors.Is(err, storage.ErrPoolGone) {
+		t.Errorf("error must wrap storage.ErrPoolGone; got %v", err)
 	}
 }
 
@@ -396,8 +403,8 @@ func TestPoolStatusMissingZPoolEmptyOutput(t *testing.T) {
 func TestPoolStatusBadNumbers(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect(
-		"zpool list -H -p -o size,free tank",
-		storage.FakeResponse{Stdout: []byte("nope\tnope\n")},
+		"zfs get -Hp -o property,value available,quota tank",
+		storage.FakeResponse{Stdout: []byte("available\tnope\nquota\tnope\n")},
 	)
 
 	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
@@ -572,47 +579,6 @@ func TestZFSThinCreateIncludesSparseFlag(t *testing.T) {
 
 	if !strings.Contains(createCmd, " -V 1024M tank/pvc-1_00000") {
 		t.Errorf("create cmd missing `-V 1024M tank/pvc-1_00000`: %q", createCmd)
-	}
-}
-
-// TestZFSThickPoolStatusMatchesZpoolFree pins the THICK
-// PoolStatus arithmetic: even though thick reservations affect
-// capacity SEMANTICS (no oversubscription), the math itself is
-// identical to thin — `zpool list -H -p -o size,free` reports
-// `free` already net of reservations from sibling thick zvols, so
-// we surface `free/1024` as FreeCapacityKib and `size/1024` as
-// TotalCapacityKib unchanged. The test exists to lock the
-// invariant in case someone "fixes" the thick path to subtract
-// allocated bytes manually (which would double-count).
-func TestZFSThickPoolStatusMatchesZpoolFree(t *testing.T) {
-	const (
-		sizeBytes = int64(107374182400) // 100 GiB
-		freeBytes = int64(80530636800)  // 75 GiB
-		wantTotal = sizeBytes / 1024
-		wantFree  = freeBytes / 1024
-	)
-
-	fx := storage.NewFakeExec()
-	fx.Expect("zpool list -H -p -o size,free tank",
-		storage.FakeResponse{Stdout: []byte("107374182400\t80530636800\n")})
-
-	p := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: false}, fx)
-
-	got, err := p.PoolStatus(t.Context())
-	if err != nil {
-		t.Fatalf("PoolStatus: %v", err)
-	}
-
-	if got.TotalCapacityKib != wantTotal {
-		t.Errorf("TotalCapacityKib (thick): got %d, want %d", got.TotalCapacityKib, wantTotal)
-	}
-
-	if got.FreeCapacityKib != wantFree {
-		t.Errorf("FreeCapacityKib (thick): got %d, want %d", got.FreeCapacityKib, wantFree)
-	}
-
-	if !got.SupportsSnapshots {
-		t.Errorf("SupportsSnapshots: got false, want true (ZFS always supports snapshots)")
 	}
 }
 

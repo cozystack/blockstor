@@ -253,55 +253,52 @@ func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storag
 	}, nil
 }
 
-// PoolStatus reads `zpool list -p` for free/total bytes.
+// PoolStatus reports the pool's capacity the way LINSTOR does, for
+// thick and thin alike.
 //
-// An empty `zpool list` response (operator ran `zpool destroy` out
-// of band) is surfaced as a `pool %q not found` error so the
-// satellite's writeCapacity loop flips Status.PoolMissing=true and
-// the wire view in `linstor sp l` lands state=Faulty. Without this
-// check, an empty stdout would slip through as success-with-no-data
-// and the pool would silently report state=Ok with zeroed capacity.
+// Free is the pool dataset's `available`, not the zpool's `free`.
+// `zpool free` counts only blocks already written, so the unwritten
+// part of every thick zvol's refreservation still looks free there,
+// and on a raidz pool it also counts parity. A thick pool reported
+// through `zpool free` advertises space that `zfs create` will then
+// refuse, and the autoplacer, which takes FreeCapacity at face value
+// for thick pools, overcommits the node. `available` is what ZFS
+// itself will grant the next zvol.
+//
+// Total is the dataset's `quota` when one is set, and the size of the
+// zpool that holds the dataset otherwise; the pool may be named as a
+// child dataset (`tank/linstor`), so the zpool is the name up to the
+// first slash.
+//
+// An empty response (the dataset or the zpool was destroyed out of
+// band) is surfaced as ErrPoolGone so the satellite's writeCapacity
+// loop flips Status.PoolMissing=true and `linstor sp l` lands
+// state=Faulty instead of a silent state=Ok with zeroed capacity.
 func (p *Provider) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 	// Bug 271: bounded ctx so a suspended zpool cannot block the
 	// every-30-seconds writeCapacity loop. Without this the
-	// controller-runtime reconcile worker stays parked in `zpool
-	// list` indefinitely and `linstor sp l` returns nothing for the
+	// controller-runtime reconcile worker stays parked in the probe
+	// indefinitely and `linstor sp l` returns nothing for the
 	// affected node — same symptom class as the LVM Bug 270 wedge.
 	ctx, cancel := withProbeTimeout(ctx)
 	defer cancel()
 
-	out, err := p.exec.Run(ctx, "zpool", "list", "-H", "-p", "-o", "size,free", p.cfg.Pool)
+	props, err := p.datasetSpaceProps(ctx)
 	if err != nil {
-		return storage.PoolStatus{}, errors.Wrapf(err, "zpool list %s", p.cfg.Pool)
+		return storage.PoolStatus{}, err
 	}
 
-	line := strings.TrimSpace(string(out))
-	if line == "" {
-		// Bug 282: tag with ErrPoolGone so writeCapacity flips
-		// PoolMissing=true. Transient zpool errors (timeout, etc.)
-		// MUST NOT carry this tag.
-		return storage.PoolStatus{}, errors.Wrapf(storage.ErrPoolGone,
-			"zpool %s not found", p.cfg.Pool)
-	}
-
-	parts := strings.Split(line, "\t")
-	if len(parts) != zpoolListCols {
-		return storage.PoolStatus{}, errors.Errorf("zpool list: unexpected output %q", out)
-	}
-
-	sizeBytes, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		return storage.PoolStatus{}, errors.Wrap(err, "parse size")
-	}
-
-	freeBytes, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		return storage.PoolStatus{}, errors.Wrap(err, "parse free")
+	totalBytes := props[zfsPropQuota]
+	if totalBytes == 0 {
+		totalBytes, err = p.zpoolSize(ctx)
+		if err != nil {
+			return storage.PoolStatus{}, err
+		}
 	}
 
 	return storage.PoolStatus{
-		FreeCapacityKib:   freeBytes / bytesPerKib,
-		TotalCapacityKib:  sizeBytes / bytesPerKib,
+		FreeCapacityKib:   props[zfsPropAvailable] / bytesPerKib,
+		TotalCapacityKib:  totalBytes / bytesPerKib,
 		SupportsSnapshots: true,
 	}, nil
 }
@@ -854,6 +851,70 @@ func (p *Provider) ensureRefreservation(ctx context.Context, dataset string) err
 	return nil
 }
 
+// datasetSpaceProps reads `available` and `quota` of the pool dataset
+// in bytes. `-p` prints an unset quota as 0.
+func (p *Provider) datasetSpaceProps(ctx context.Context) (map[string]int64, error) {
+	out, err := p.exec.Run(ctx, "zfs", "get", "-Hp", "-o", "property,value",
+		zfsPropAvailable+","+zfsPropQuota, p.cfg.Pool)
+	if err != nil {
+		return nil, errors.Wrapf(err, "zfs get %s,%s %s", zfsPropAvailable, zfsPropQuota, p.cfg.Pool)
+	}
+
+	if strings.TrimSpace(string(out)) == "" {
+		// Bug 282: tag with ErrPoolGone so writeCapacity flips
+		// PoolMissing=true. Transient zfs errors (timeout, etc.)
+		// MUST NOT carry this tag.
+		return nil, errors.Wrapf(storage.ErrPoolGone, "zfs dataset %s not found", p.cfg.Pool)
+	}
+
+	props := make(map[string]int64, zfsSpacePropCount)
+
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.Split(strings.TrimSpace(line), "\t")
+		if len(parts) != zfsGetCols {
+			return nil, errors.Errorf("zfs get: unexpected output %q", out)
+		}
+
+		value, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "parse %s", parts[0])
+		}
+
+		props[parts[0]] = value
+	}
+
+	for _, name := range []string{zfsPropAvailable, zfsPropQuota} {
+		if _, ok := props[name]; !ok {
+			return nil, errors.Errorf("zfs get: no %s in output %q", name, out)
+		}
+	}
+
+	return props, nil
+}
+
+// zpoolSize reads the size in bytes of the zpool holding the pool
+// dataset.
+func (p *Provider) zpoolSize(ctx context.Context) (int64, error) {
+	root, _, _ := strings.Cut(p.cfg.Pool, "/")
+
+	out, err := p.exec.Run(ctx, "zpool", "get", "-Hp", "-o", "value", "size", root)
+	if err != nil {
+		return 0, errors.Wrapf(err, "zpool get size %s", root)
+	}
+
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return 0, errors.Wrapf(storage.ErrPoolGone, "zpool %s not found", root)
+	}
+
+	size, err := strconv.ParseInt(line, 10, 64)
+	if err != nil {
+		return 0, errors.Wrap(err, "parse zpool size")
+	}
+
+	return size, nil
+}
+
 // datasetExists is the idempotency primitive — analogous to lvExists.
 // Bug 272: bounded ctx; same rationale as PoolStatus/VolumeStatus, but
 // the hot-path impact is larger — datasetExists is called from every
@@ -906,5 +967,8 @@ const (
 	mibPerKib           = 1024
 	bytesPerKib         = 1024
 	zfsListCols         = 3
-	zpoolListCols       = 2
+	zfsGetCols          = 2
+	zfsSpacePropCount   = 2
+	zfsPropAvailable    = "available"
+	zfsPropQuota        = "quota"
 )
