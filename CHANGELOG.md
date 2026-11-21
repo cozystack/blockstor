@@ -4,6 +4,19 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.9 — 2026-11-21
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #304 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.8; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.8
+
+- **A three-replica spawn no longer comes up with a TieBreaker in place of its third replica (#303).** The placer takes over a witness the tiebreaker reconciler grew on the target node during the placement, deciding on the live replica; a witness being deleted is not promoted and the placement reports one replica short.
+- **A wait for the controller's stamp is no longer a failed apply (#299).** A new replica held for its DRBD node id or `SkipInitialSync` stamp leaves no `ApplyFailed` Warning, does not grow the back-off and does not count as a toggle-disk attempt; a wait past a minute leaves one `WaitingForController` Warning.
+- **A replica without a disk is not detached (#299).** The apply detaches only a volume that shows an attached local disk, so a TieBreaker whose kernel resource was taken down no longer gets an `ApplyFailed` Warning.
+- **The DRBD identity allocator no longer holds its lock across the writes (#300).** It reads the definition before the lock, chooses and reserves values under it and writes after; a minor write that lost to another writer is retried on a fresh read instead of leaving the replica without a minor.
+- **The block size decision reads only the definition's replicas (#287).** It no longer lists every Resource past the cache for each new replica, and a replica being deleted no longer counts toward the size.
+- **A restarted satellite shows its replicas again within seconds (#302).** The observer writes every replica once after the initial events2 dump, eight at a time, so a node with about 110 replicas reads `Unknown` for about a second instead of tens of seconds.
+
 ## v0.4.0-alpha.8 — 2026-11-21
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #304 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.7; the entries below are what changed since.
