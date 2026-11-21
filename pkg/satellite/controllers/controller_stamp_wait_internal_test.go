@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,5 +197,66 @@ func TestAWaitForTheControllerStampKeepsTheToggleDiskRetries(t *testing.T) {
 
 	if after.Status.ToggleDiskRetries != 2 {
 		t.Errorf("ToggleDiskRetries = %d after a wait, want 2", after.Status.ToggleDiskRetries)
+	}
+}
+
+// An apply that waits for the controller's stamp for more than a
+// minute is reported once, as a WaitingForController Warning on the
+// Resource: the controller is down or cannot stamp it, and the short
+// waits leave nothing, so without it the Resource showed nothing at
+// all. Waits after the report, and the apply that then goes through,
+// add no further Event.
+func TestAWaitForTheControllerPastAMinuteIsReportedOnce(t *testing.T) {
+	t.Parallel()
+
+	rd := groupMemberRD("STORAGE")
+	res := memberReplica()
+	r := newPassphraseTestReconciler(t, luksGroup(), rd, res)
+
+	recorder := events.NewFakeRecorder(32)
+	r.Config.Recorder = recorder
+
+	const waits = 20
+
+	script := make([]string, 0, waits+1)
+	for range waits {
+		script = append(script, stampWait)
+	}
+
+	r.Config.Exec = storage.NewFakeExec()
+	r.Config.Apply = satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"pool-a": &scriptedCreateProvider{script: append(script, "")}},
+		NodeName:  "node-a",
+	})
+
+	now := time.Unix(0, 0)
+	clock := func() time.Time { return now }
+	r.retries.now = clock
+	r.waits.now = clock
+
+	var reported []string
+
+	for pass := range waits + 1 {
+		result, err := r.runApply(t.Context(), res, logr.Discard())
+		if err != nil {
+			t.Fatalf("runApply: %v", err)
+		}
+
+		select {
+		case ev := <-recorder.Events:
+			reported = append(reported, fmt.Sprintf("pass %d at %v: %s", pass+1, now.Sub(time.Unix(0, 0)), ev))
+		default:
+		}
+
+		now = now.Add(result.RequeueAfter)
+	}
+
+	if len(reported) != 1 {
+		t.Fatalf("Events: %q, want one WaitingForController Warning", reported)
+	}
+
+	if !strings.Contains(reported[0], "Warning "+waitingForControllerReason) ||
+		!strings.HasPrefix(reported[0], "pass 13 at 1m0s:") {
+		t.Errorf("Event %q, want a WaitingForController Warning on the pass a minute into the wait", reported[0])
 	}
 }

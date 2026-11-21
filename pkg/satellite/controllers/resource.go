@@ -146,6 +146,9 @@ type ResourceReconciler struct {
 
 	// retries spaces the retries of a replica whose apply keeps failing.
 	retries applyBackoff
+
+	// waits reports an apply that waits too long for the controller.
+	waits controllerWaits
 }
 
 // Reconcile reads a Resource and drives the satellite-side
@@ -162,6 +165,7 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			r.retries.reset(req.Name)
+			r.waits.forget(req.Name)
 
 			return ctrl.Result{}, nil
 		}
@@ -629,7 +633,8 @@ func (r *ResourceReconciler) prepareDRBDApply(
 // line in this log is not where an operator looks for why a replica
 // does not come up. A wait gets neither the Event nor the failure
 // line: it is part of every fresh replica's bring-up, and a Warning
-// for it reads as a fault that is not there.
+// for it reads as a fault that is not there. Only a wait that lasts
+// past a minute is reported, once (trackControllerWait).
 func (r *ResourceReconciler) recordPerResourceFailures(
 	res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult, logger logr.Logger,
 ) (bool, bool) {
@@ -661,7 +666,10 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 		r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, reason, "Apply", "%s", note)
 	}
 
-	return anyFailed, anyFailed && !anyFault
+	waiting := anyFailed && !anyFault
+	r.trackControllerWait(res, results, waiting)
+
+	return anyFailed, waiting
 }
 
 // deviceHoldsDataReason is the Event reason for a LUKS format refused over
