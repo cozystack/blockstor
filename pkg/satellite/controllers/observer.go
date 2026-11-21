@@ -848,6 +848,9 @@ type ObserverRunnable struct {
 	wake      chan struct{}
 	holding   bool
 	previous  map[string]struct{}
+	// releasedAt is when releaseWrites ended the hold, until the pass
+	// it woke takes it to report how long the node's state took.
+	releasedAt time.Time
 
 	// writeMu makes one write pass at a time: a pass reads the caches
 	// when it writes a resource, so with passes in turn the newest view
@@ -859,6 +862,10 @@ type ObserverRunnable struct {
 	// again; zero means events2RestartDelay. Both are for tests.
 	startEvents2 func(context.Context) (*drbd.Watcher, func(), error)
 	restartDelay time.Duration
+	// initialStateQuiet is how long a stream's dump may go without a
+	// line before it is taken as ended; zero means
+	// observerInitialStateQuiet. For tests.
+	initialStateQuiet time.Duration
 }
 
 // appliedStatus is one entry of ObserverRunnable.applied.
@@ -870,10 +877,10 @@ type appliedStatus struct {
 
 // observerWriters bounds the resources one write pass writes at once.
 // The pass that follows a stream's initial dump writes every replica on
-// the node, and a satellite that just started shows none of them until
-// it has (ForgetStaleSatelliteState). One at a time, with a status
+// the node, and reads that hide the replicas of a satellite that just
+// started show none of them until it has. One at a time, with a status
 // write, a get-gi and a Condition write each, that kept every replica
-// of a node with ~110 of them Unknown for tens of seconds; LINSTOR
+// of a node with ~140 of them Unknown for tens of seconds; LINSTOR
 // sends a reconnected node's state in one batch after the full sync.
 const observerWriters = 8
 
@@ -958,7 +965,7 @@ func (*ObserverRunnable) NeedLeaderElection() bool { return false }
 // caches and marks the resource pending. The writer then writes each
 // pending resource's whole view once, however many frames it took.
 // Writing every frame in the reader, as before, made the reader as slow
-// as the client's rate limit; during a node's resync storm the frames
+// as the apiserver round trips; during a node's resync storm the frames
 // queued in the channel, then in the pipe, then in drbdsetup's netlink
 // socket, until the kernel dropped notifications and drbdsetup exited.
 // LINSTOR likewise reads events2 apart from what it reports.
@@ -1014,6 +1021,14 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 // DrbdEventsMonitor does: a change the kernel reported while the dump
 // was being written may be newer than the dump's line for the same
 // object, and must not be overwritten by it.
+//
+// The dump comes in one burst. Should its end line never come, writes
+// would stay held and the node's replicas hidden for as long as the
+// stream runs, so once the stream has sent no line for
+// initialStateWait the dump is taken as ended. The rest of the dump
+// may still come after that: until its end line does, no resource is
+// taken as gone, and a dump line does not overwrite an object a frame
+// applied since has set.
 func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, stream *drbd.Watcher) {
 	events := make(chan drbd.Event, observerEventBuffer)
 
@@ -1024,28 +1039,163 @@ func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, strea
 		}
 	}()
 
-	var deferred []drbd.Event
+	dump := &initialDump{o: o}
 
-	dumped := false
+	quiet := time.NewTimer(o.initialStateWait())
+	defer quiet.Stop()
 
-	for ev := range events {
-		switch {
-		case dumped:
-			o.ingestEvent(ctx, ev)
-		case ev.EndsInitialState():
-			dumped = true
-
-			for _, held := range deferred {
-				o.ingestEvent(ctx, held)
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				return
 			}
 
-			o.releaseWrites(ctx)
-		case ev.Action == eventActionExists:
-			o.ingestEvent(ctx, ev)
-		default:
-			deferred = append(deferred, ev)
+			if dump.take(ctx, ev) {
+				quiet.Reset(o.initialStateWait())
+			}
+		case <-quiet.C:
+			if !dump.dumped {
+				logger.Info("drbdsetup events2 sent no end of its initial state; writing the state read so far",
+					"quiet", o.initialStateWait(), "held", len(dump.deferred))
+				dump.end(ctx, false)
+			}
 		}
 	}
+}
+
+// initialDump is where follow is in one stream's initial dump.
+type initialDump struct {
+	o *ObserverRunnable
+
+	// deferred holds the change and destroy frames kept back behind
+	// the dump; dumped is set once it has ended or been taken as ended.
+	deferred []drbd.Event
+	dumped   bool
+
+	// late is set from when the dump is taken as ended until its end
+	// line comes after all.
+	late *lateDump
+}
+
+// take applies or keeps back one frame, and reports whether the dump
+// is still being read, so the quiet timer starts again.
+func (d *initialDump) take(ctx context.Context, ev drbd.Event) bool {
+	switch {
+	case d.late != nil:
+		d.late = d.o.ingestLate(ctx, d.late, ev)
+	case d.dumped:
+		d.o.ingestEvent(ctx, ev)
+	case ev.EndsInitialState():
+		d.end(ctx, true)
+	case ev.Action == eventActionExists:
+		d.o.ingestEvent(ctx, ev)
+
+		return true
+	default:
+		// A change kept back shows the stream is alive as much as a
+		// dump line does.
+		d.deferred = append(d.deferred, ev)
+
+		return true
+	}
+
+	return false
+}
+
+// end ends the dump, or takes it as ended (whole false): the frames
+// kept back are replayed and writes released.
+func (d *initialDump) end(ctx context.Context, whole bool) {
+	d.dumped = true
+
+	if !whole {
+		d.late = &lateDump{}
+	}
+
+	for _, held := range d.deferred {
+		d.late.record(held)
+		d.o.ingestEvent(ctx, held)
+	}
+
+	d.deferred = nil
+
+	d.o.releaseWrites(ctx, whole)
+}
+
+// ingestLate applies a frame that came after the dump was taken as
+// ended, and returns nil once the dump's end line has come.
+func (o *ObserverRunnable) ingestLate(ctx context.Context, late *lateDump, ev drbd.Event) *lateDump {
+	switch {
+	case ev.EndsInitialState():
+		o.clearDeparted()
+
+		return nil
+	case ev.Action == eventActionExists:
+		if !late.covers(ev) {
+			o.ingestEvent(ctx, ev)
+		}
+	default:
+		late.record(ev)
+		o.ingestEvent(ctx, ev)
+	}
+
+	return late
+}
+
+// lateDump holds the objects that frames applied after a dump was
+// taken as ended have set, and whether they destroyed them. A dump
+// line that comes later for such an object, or for a part of one
+// destroyed, is older than the frame.
+type lateDump struct {
+	set map[dumpObject]bool
+}
+
+// dumpObject names the kernel object an events2 frame is about.
+type dumpObject struct {
+	kind, name, peer, volume, local, remote string
+}
+
+func objectOf(ev drbd.Event) dumpObject {
+	return dumpObject{
+		kind:   ev.Kind,
+		name:   ev.Fields["name"],
+		peer:   ev.Fields["peer-node-id"],
+		volume: ev.Fields["volume"],
+		local:  ev.Fields["local"],
+		remote: ev.Fields["remote"],
+	}
+}
+
+// record notes a frame that is not a dump line. A nil lateDump, that
+// of a dump which ended whole, records nothing.
+func (l *lateDump) record(ev drbd.Event) {
+	if l == nil {
+		return
+	}
+
+	if l.set == nil {
+		l.set = map[dumpObject]bool{}
+	}
+
+	obj := objectOf(ev)
+	l.set[obj] = l.set[obj] || ev.Action == eventActionDestroy
+}
+
+// covers reports whether a dump line is older than a frame recorded
+// for its object, or for the connection or resource it belongs to and
+// that the frame destroyed.
+func (l *lateDump) covers(ev drbd.Event) bool {
+	obj := objectOf(ev)
+
+	if _, ok := l.set[obj]; ok {
+		return true
+	}
+
+	if l.set[dumpObject{kind: eventKindResource, name: obj.name}] {
+		return true
+	}
+
+	return obj.peer != "" && l.set[dumpObject{kind: eventKindConnection, name: obj.name, peer: obj.peer}]
 }
 
 // restartEvents2 starts a new stream after the restart delay, retrying
@@ -1123,12 +1273,13 @@ func (o *ObserverRunnable) holdWrites() {
 	o.holding = true
 }
 
-// releaseWrites runs when a stream's initial dump has ended. Every
-// resource the dump restated is written once from its complete view;
-// one the ended stream knew and the dump did not restate went away
-// while no stream ran, and is written as gone. The reconciler is woken
+// releaseWrites runs when a stream's initial dump has ended, or has
+// been taken as ended (whole false). Every resource the dump restated
+// is written once from its complete view, and the reconciler is woken
 // for each, which the dump's frames did not do while writes were held.
-func (o *ObserverRunnable) releaseWrites(ctx context.Context) {
+// Only a dump that ended whole tells what went away; for one taken as
+// ended, clearDeparted waits for its end line.
+func (o *ObserverRunnable) releaseWrites(ctx context.Context, whole bool) {
 	current := o.cachedResourceNames()
 
 	o.pendingMu.Lock()
@@ -1137,14 +1288,51 @@ func (o *ObserverRunnable) releaseWrites(ctx context.Context) {
 		o.pending = map[string]pendingWrite{}
 	}
 
-	restated := make(map[string]struct{}, len(current))
-
 	for _, name := range current {
-		restated[name] = struct{}{}
-
 		entry := o.pending[name]
 		entry.probeGI = true
 		o.pending[name] = entry
+	}
+
+	if whole {
+		o.markDepartedLocked(current)
+	}
+
+	o.holding = false
+	o.releasedAt = time.Now()
+	o.pendingMu.Unlock()
+
+	o.signalWriter()
+
+	for _, name := range current {
+		o.emitReconcileTrigger(ctx, &observation{ResourceName: name})
+	}
+}
+
+// clearDeparted runs when the end line of a dump taken as ended comes
+// after all, and writes as gone what the dump did not restate.
+func (o *ObserverRunnable) clearDeparted() {
+	current := o.cachedResourceNames()
+
+	o.pendingMu.Lock()
+
+	if o.pending == nil {
+		o.pending = map[string]pendingWrite{}
+	}
+
+	o.markDepartedLocked(current)
+	o.pendingMu.Unlock()
+
+	o.signalWriter()
+}
+
+// markDepartedLocked marks as gone each resource the ended stream knew
+// and the new dump did not restate: it went away while no stream ran.
+// pendingMu must be held.
+func (o *ObserverRunnable) markDepartedLocked(current []string) {
+	restated := make(map[string]struct{}, len(current))
+	for _, name := range current {
+		restated[name] = struct{}{}
 	}
 
 	for name := range o.previous {
@@ -1154,14 +1342,6 @@ func (o *ObserverRunnable) releaseWrites(ctx context.Context) {
 	}
 
 	o.previous = nil
-	o.holding = false
-	o.pendingMu.Unlock()
-
-	o.signalWriter()
-
-	for _, name := range current {
-		o.emitReconcileTrigger(ctx, &observation{ResourceName: name})
-	}
 }
 
 func (o *ObserverRunnable) isHolding() bool {
@@ -1186,6 +1366,22 @@ func (o *ObserverRunnable) events2RestartDelay() time.Duration {
 
 	return events2RestartDelay
 }
+
+func (o *ObserverRunnable) initialStateWait() time.Duration {
+	if o.initialStateQuiet > 0 {
+		return o.initialStateQuiet
+	}
+
+	return observerInitialStateQuiet
+}
+
+// observerInitialStateQuiet bounds how long writes stay held for a dump
+// whose `exists -` line does not come. drbdsetup writes the dump in one
+// burst, well under a second on a node with a few hundred replicas, so
+// a gap this long means the line is missing, not late. LINSTOR waits
+// for it with no bound; a satellite that did would hide its node's
+// replicas until the stream next restarts.
+const observerInitialStateQuiet = 10 * time.Second
 
 // events2RestartDelay is LINSTOR's RESTART_EVENTS2_STREAM_TIMEOUT.
 const events2RestartDelay = 5 * time.Second
@@ -1542,6 +1738,13 @@ func (o *ObserverRunnable) writeLoop(ctx context.Context, adm *drbd.Adm) {
 // of the write. Frames that arrive meanwhile mark the resource pending
 // again for the next pass. Nothing is written while a stream's dump is
 // being read; the entries wait for releaseWrites.
+//
+// The statuses of a pass go out before its KernelLoaded Conditions.
+// The pass after a dump writes every replica on the node, and reads
+// that hide the replicas of a satellite that just started show each
+// one again only once its status is out: with a Condition written
+// ahead of each status, they came back at half the rate the satellite
+// could write them.
 func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
@@ -1556,6 +1759,8 @@ func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 
 	batch := o.pending
 	o.pending = nil
+	released := o.releasedAt
+	o.releasedAt = time.Time{}
 	o.pendingMu.Unlock()
 
 	names := make([]string, 0, len(batch))
@@ -1565,6 +1770,25 @@ func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 
 	sort.Strings(names)
 
+	o.forEachPending(ctx, names, func(name string) { o.writeResource(ctx, adm, name, batch[name]) })
+
+	// A pass cut short by shutdown did not write them all.
+	if !released.IsZero() && ctx.Err() == nil {
+		log.FromContext(ctx).WithName("observer").Info("DRBD state written after the events2 dump",
+			"resources", len(names), "took", time.Since(released))
+	}
+
+	o.forEachPending(ctx, names, func(name string) {
+		owed := batch[name]
+		if owed.kernelLoaded != nil && !owed.departed {
+			o.stampKernelLoadedLogged(ctx, log.FromContext(ctx).WithName("observer"), name, *owed.kernelLoaded)
+		}
+	})
+}
+
+// forEachPending runs write for every name, observerWriters at a time,
+// and waits for all of them. It stops starting new ones once ctx ends.
+func (*ObserverRunnable) forEachPending(ctx context.Context, names []string, write func(name string)) {
 	sem := make(chan struct{}, observerWriters)
 
 	var wg sync.WaitGroup
@@ -1579,7 +1803,7 @@ func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 		wg.Go(func() {
 			defer func() { <-sem }()
 
-			o.writeResource(ctx, adm, name, batch[name])
+			write(name)
 		})
 	}
 
@@ -1600,12 +1824,8 @@ func (o *ObserverRunnable) writeResource(ctx context.Context, adm *drbd.Adm, nam
 		return
 	}
 
-	// Stamped before the status so a status NotFound (Resource CRD not
-	// created yet) doesn't suppress the Condition; stampKernelLoaded
-	// silences NotFound the same way. Phase 11.3 Stage 3.
-	if owed.kernelLoaded != nil {
-		o.stampKernelLoadedLogged(ctx, logger, name, *owed.kernelLoaded)
-	}
+	// The KernelLoaded Condition it owes is stamped by flush once the
+	// pass's statuses are out.
 
 	view, known := o.cachedView(name)
 	if !known {
@@ -2507,12 +2727,15 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 	}
 
 	// The resync re-sends every replica every 5 s. On a node with about
-	// a hundred replicas that is more than the client's 20 requests a
-	// second, and the frames carrying a running resync's progress
-	// queued behind it: `SyncTarget(x%)` trailed the kernel by several
-	// seconds. Skip what the apiserver provably holds already; any
-	// other writer's change bumps the version and brings the apply
-	// back, so a clobbered field is still restored on the next pass.
+	// a hundred replicas that is a write pass of round trips, each also
+	// a burst of CPU on a satellite held to a fraction of a core, and
+	// the frames carrying a running resync's progress queued behind it:
+	// `SyncTarget(x%)` trailed the kernel by several seconds. The
+	// client itself has no rate limit (ctrl.GetConfig leaves it to the
+	// apiserver's priority and fairness). Skip what the apiserver
+	// provably holds already; any other writer's change bumps the
+	// version and brings the apply back, so a clobbered field is still
+	// restored on the next pass.
 	if lookupErr == nil && o.alreadyApplied(ev.ResourceName, &lookup, &apply.Status) {
 		return nil
 	}
