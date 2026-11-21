@@ -68,6 +68,38 @@ func TestHasAttachedDisk(t *testing.T) {
 		})
 	}
 
+	t.Run("drbdsetup output", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tc := range []struct {
+			name, out string
+			want      bool
+		}{
+			{"diskful with diskful peers", verboseDiskful, true},
+			{"diskless witness", verboseWitness, false},
+			{"diskful beside a diskless peer", verboseBesideWitness, true},
+			{"two volumes, one detached", verboseOneDetached, true},
+			{"two volumes, both diskless", verboseTwoDiskless, false},
+			{"no volume yet", verboseNoVolume, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				fx := storage.NewFakeExec()
+				fx.Expect("drbdsetup status --verbose pvc-a", storage.FakeResponse{Stdout: []byte(tc.out)})
+
+				got, err := drbd.NewAdm(fx).HasAttachedDisk(t.Context(), "pvc-a")
+				if err != nil {
+					t.Fatalf("HasAttachedDisk: %v", err)
+				}
+
+				if got != tc.want {
+					t.Errorf("HasAttachedDisk = %v, want %v for\n%s", got, tc.want, tc.out)
+				}
+			})
+		}
+	})
+
 	t.Run("probe fails", func(t *testing.T) {
 		t.Parallel()
 
@@ -79,3 +111,85 @@ func TestHasAttachedDisk(t *testing.T) {
 		}
 	})
 }
+
+// The fixtures below are `drbdsetup status --verbose <resource>` as
+// drbd-utils 9.36 prints it for DRBD 9.3: verboseDiskful is a capture
+// from a three-node cluster with the names replaced; the others vary
+// it the way device_status and peer_device_status in drbdsetup.c print
+// a diskless volume (`disk:Diskless client:yes`, `backing_dev:none`), a
+// diskless peer (`peer-disk:Diskless peer-client:yes`), a second volume,
+// and a slot with no volume yet.
+const verboseDiskful = `pvc-a node-id:2 role:Secondary suspended:no
+    force-io-failures:no
+  volume:0 minor:1005 disk:UpToDate
+      backing_dev:/dev/zvol/data/pvc-a_00000
+      quorum:yes open:no blocked:no
+  n1 node-id:1 connection:Connected role:Secondary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+  n3 node-id:0 connection:Connected role:Secondary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+`
+
+const verboseWitness = `pvc-a node-id:2 role:Secondary suspended:no
+    force-io-failures:no
+  volume:0 minor:1005 disk:Diskless client:yes
+      backing_dev:none
+      quorum:yes open:no blocked:no
+  n1 node-id:1 connection:Connected role:Secondary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+  n3 node-id:0 connection:Connected role:Secondary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+`
+
+const verboseBesideWitness = `pvc-a node-id:2 role:Secondary suspended:no
+    force-io-failures:no
+  volume:0 minor:1005 disk:UpToDate
+      backing_dev:/dev/zvol/data/pvc-a_00000
+      quorum:yes open:no blocked:no
+  n1 node-id:1 connection:Connected role:Secondary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:Diskless peer-client:yes resync-suspended:no
+  n3 node-id:0 connection:Connected role:Secondary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+`
+
+const verboseOneDetached = `pvc-a node-id:2 role:Secondary suspended:no
+    force-io-failures:no
+  volume:0 minor:1005 disk:Diskless client:no
+      backing_dev:none
+      quorum:yes open:no blocked:no
+  volume:1 minor:1006 disk:UpToDate
+      backing_dev:/dev/zvol/data/pvc-a_00001
+      quorum:yes open:no blocked:no
+  n1 node-id:1 connection:Connected role:Secondary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+    volume:1 replication:Established peer-disk:UpToDate resync-suspended:no
+`
+
+const verboseTwoDiskless = `pvc-a node-id:2 role:Secondary suspended:no
+    force-io-failures:no
+  volume:0 minor:1005 disk:Diskless client:yes
+      backing_dev:none
+      quorum:yes open:no blocked:no
+  volume:1 minor:1006 disk:Diskless client:yes
+      backing_dev:none
+      quorum:yes open:no blocked:no
+  n1 node-id:1 connection:Connected role:Secondary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+    volume:1 replication:Established peer-disk:UpToDate resync-suspended:no
+`
+
+const verboseNoVolume = `pvc-a node-id:2 role:Secondary suspended:no
+    force-io-failures:no
+  n1 node-id:1 connection:Connecting role:Unknown tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+  n3 node-id:0 connection:Connecting role:Unknown tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+`
