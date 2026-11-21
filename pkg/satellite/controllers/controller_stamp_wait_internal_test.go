@@ -26,7 +26,13 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -133,5 +139,62 @@ func TestAWaitForTheControllerStampIsNotAFailedApply(t *testing.T) {
 	if got := run(); got != applyFailureRequeue {
 		t.Fatalf("the first real failure after waits retried after %v, want %v: the waits counted toward the back-off",
 			got, applyFailureRequeue)
+	}
+}
+
+// A wait for the controller's stamp during a diskless-to-diskful
+// conversion is neither a failed attempt nor the one that went
+// through: Status.ToggleDiskRetries keeps its count. A witness the
+// placer promotes before the controller stamped it meets this wait,
+// and counting it spent the conversion's retries on a replica with no
+// fault.
+func TestAWaitForTheControllerStampKeepsTheToggleDiskRetries(t *testing.T) {
+	t.Parallel()
+
+	const (
+		rdName = "pvc-toggle-wait"
+		node   = "n-toggle"
+		pool   = "lvm-thin"
+	)
+
+	res := makeToggledResource(rdName, node, pool)
+	res.Status.ToggleDiskRetries = 2
+
+	cli := fake.NewClientBuilder().
+		WithScheme(newToggleDiskTestScheme(t)).
+		WithObjects(makeStorageOnlyRD(rdName), res).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	reconciler := &ResourceReconciler{
+		Client: cli,
+		Config: Config{
+			NodeName: node,
+			Apply: satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{pool: &scriptedCreateProvider{script: []string{stampWait}}},
+				NodeName:  node,
+			}),
+			Exec: storage.NewFakeExec(),
+		},
+	}
+
+	result, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: res.Name}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if result.RequeueAfter != applyFailureRequeue {
+		t.Fatalf("the pass requeued after %v, want the wait's %v: the apply did not wait", result.RequeueAfter, applyFailureRequeue)
+	}
+
+	var after blockstoriov1alpha1.Resource
+
+	err = cli.Get(t.Context(), client.ObjectKey{Name: res.Name}, &after)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if after.Status.ToggleDiskRetries != 2 {
+		t.Errorf("ToggleDiskRetries = %d after a wait, want 2", after.Status.ToggleDiskRetries)
 	}
 }

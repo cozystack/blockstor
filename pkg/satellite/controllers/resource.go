@@ -519,7 +519,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	anyFailed, waiting := r.recordPerResourceFailures(res, results, logger)
 
-	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
+	r.stampPostApply(ctx, res, &rd, results, applyOutcome{failed: anyFailed, waiting: waiting}, logger)
 
 	if requeue := r.retryAfterApply(res.Name, anyFailed, waiting); requeue > 0 {
 		return ctrl.Result{RequeueAfter: requeue}, nil
@@ -764,7 +764,7 @@ func eventNote(note string) string {
 // and the Bug-39 toggle-disk retry counter. Each helper is
 // independently fallible — we log and move on so a transient
 // apiserver hiccup on one stamp doesn't suppress the others.
-func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) {
+func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, outcome applyOutcome, logger logr.Logger) {
 	// Stamp per-volume DevicePath into Status.Volumes so
 	// linstor-csi / any consumer that reads the CRD sees the
 	// /dev path the satellite materialised. Done even when one
@@ -811,11 +811,25 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// Bug 39: bump or clear Status.ToggleDiskRetries based on the
 	// per-resource result. The helper is a no-op when the Resource
 	// isn't mid diskless→diskful conversion, so it's safe to call
-	// unconditionally on every apply pass.
-	err = r.recordToggleDiskOutcome(ctx, res, !anyFailed)
+	// unconditionally on every apply pass. A wait for the controller's
+	// stamp is neither: a witness promoted before the controller
+	// stamped it meets that wait, and counting it as a failed attempt
+	// would spend the conversion's retries on a replica with no fault.
+	if outcome.waiting {
+		return
+	}
+
+	err = r.recordToggleDiskOutcome(ctx, res, !outcome.failed)
 	if err != nil {
 		logger.Error(err, "record toggle-disk outcome")
 	}
+}
+
+// applyOutcome is how an apply pass ended: failed when a result came
+// back not Ok, and waiting when every such result only waits for the
+// controller to stamp the replica.
+type applyOutcome struct {
+	failed, waiting bool
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the
