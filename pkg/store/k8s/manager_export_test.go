@@ -24,3 +24,7 @@ func NodeScopedReadsBypassTheCache(s *Store) bool {
 // ReplicaKeyIndexer is the extractor of the FieldResourceDefinitionKey
 // index NewManager and RegisterReplicaKeyIndex register.
 var ReplicaKeyIndexer = replicaKeyIndex().extract
+
+// ForgetSelectorRefusal clears what ReplicasOf remembered of a server that
+// refused the definition selector.
+func ForgetSelectorRefusal() { serverRefusesSelector.Store(false) }

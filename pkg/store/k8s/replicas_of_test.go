@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -154,12 +155,13 @@ func TestReplicasOfFallsBackWhenTheSelectorIsRefused(t *testing.T) {
 	}
 }
 
-// requestCounter counts the requests a reader sends, and how many of the
+// requestCounter counts every request a reader sends, and how many of the
 // Resource lists among them carried no field selector.
 type requestCounter struct {
 	client.Reader
 
 	gets, lists, unscoped atomic.Int64
+	refuseSelector        bool
 }
 
 func (c *requestCounter) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -176,6 +178,14 @@ func (c *requestCounter) List(ctx context.Context, list client.ObjectList, opts 
 
 	if _, ok := list.(*crdv1alpha1.ResourceList); ok && o.FieldSelector == nil {
 		c.unscoped.Add(1)
+	}
+
+	if c.refuseSelector && o.FieldSelector != nil {
+		// What the API server answers for a CRD that predates the
+		// selectable field.
+		return apierrors.NewBadRequest(`Unable to find "blockstor.org/v1alpha1, Resource=resources" that match ` +
+			`label selector "", field selector "spec.resourceDefinitionName=pvc-mix": ` +
+			`field label not supported: spec.resourceDefinitionName`)
 	}
 
 	return c.Reader.List(ctx, list, opts...) //nolint:wrapcheck // test double
@@ -254,5 +264,40 @@ func TestReplicasOfTakesACachedDefinitionsSpellingsFromTheCache(t *testing.T) {
 
 	if want := []string{"pvc-mix.n1"}; !slices.Equal(replicaNames(got.Items), want) {
 		t.Errorf("replicas of pvc-mix = %v, want %v", replicaNames(got.Items), want)
+	}
+}
+
+// A server whose CRD predates the selectable field refuses the selector.
+// Once it has, every later read goes straight to the whole-cluster list,
+// one request as before the scoped read existed, instead of asking for the
+// definition and the refused list first each time.
+//
+// Not parallel: the refusal is remembered for the process.
+//
+//nolint:paralleltest // process-wide state
+func TestReplicasOfStopsAskingAServerThatRefusedTheField(t *testing.T) {
+	t.Cleanup(k8s.ForgetSelectorRefusal)
+
+	cli := replicasOfCluster(t, true)
+	reader := &requestCounter{Reader: cli, refuseSelector: true}
+
+	for pass := range 2 {
+		reader.gets.Store(0)
+		reader.lists.Store(0)
+
+		var got crdv1alpha1.ResourceList
+
+		err := k8s.ReplicasOf(context.Background(), reader, nil, "pvc-mix", &got)
+		if err != nil {
+			t.Fatalf("pass %d: ReplicasOf: %v", pass, err)
+		}
+
+		if want := []string{"pvc-mix.n1", "pvc-mix.n2"}; !slices.Equal(replicaNames(got.Items), want) {
+			t.Errorf("pass %d: replicas of pvc-mix = %v, want %v", pass, replicaNames(got.Items), want)
+		}
+	}
+
+	if n := reader.gets.Load() + reader.lists.Load(); n != 1 {
+		t.Errorf("a read after the refusal sent %d requests, want the one whole-cluster list", n)
 	}
 }

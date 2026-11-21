@@ -21,8 +21,11 @@ package k8s
 import (
 	"context"
 	"slices"
+	"strings"
+	"sync/atomic"
 
 	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -60,6 +63,15 @@ func RegisterReplicaKeyIndex(indexer ctrlclient.FieldIndexer) error {
 	return registerIndexesWithin(indexRegistrationBudget, indexer, []fieldIndex{replicaKeyIndex()})
 }
 
+// serverRefusesSelector remembers that the API server answered the
+// definition selector with "field label not supported": a CRD that
+// predates the selectable field. Asking again on every call would be two
+// wasted requests (the definition and the refused list) in front of the
+// whole-cluster read each call ends on anyway. The CRD and the binaries
+// ship in one release, so a process that saw the refusal is replaced
+// before the CRD that would accept it is installed.
+var serverRefusesSelector atomic.Bool
+
 // ReplicasOf lists into list the Resource objects of definition rdName
 // through reader, whichever spelling of the name they carry.
 //
@@ -82,6 +94,10 @@ func RegisterReplicaKeyIndex(indexer ctrlclient.FieldIndexer) error {
 // than answering short, and ReplicasOf then reads every Resource and
 // keeps the definition's, as before.
 func ReplicasOf(ctx context.Context, reader, cache ctrlclient.Reader, rdName string, list *crdv1alpha1.ResourceList) error {
+	if serverRefusesSelector.Load() {
+		return allReplicasOf(ctx, reader, rdName, list)
+	}
+
 	spellings, err := definitionSpellings(ctx, reader, cache, rdName)
 	if err != nil {
 		return err
@@ -102,6 +118,10 @@ func ReplicasOf(ctx context.Context, reader, cache ctrlclient.Reader, rdName str
 
 		err := reader.List(ctx, &found, ctrlclient.MatchingFields{FieldResourceDefinitionName: spelling})
 		if SelectorUnsupported(err) {
+			if fieldUnknownToServer(err) {
+				serverRefusesSelector.Store(true)
+			}
+
 			log.FromContext(ctx).V(1).Info("scoped Resource read unavailable; reading every replica instead",
 				"resourceDefinition", rdName, "reason", err.Error())
 
@@ -126,6 +146,12 @@ func ReplicasOf(ctx context.Context, reader, cache ctrlclient.Reader, rdName str
 	list.Items = out
 
 	return nil
+}
+
+// fieldUnknownToServer reports whether err is the API server refusing a
+// field selector over a field the CRD does not declare selectable.
+func fieldUnknownToServer(err error) bool {
+	return apierrors.IsBadRequest(err) && strings.Contains(err.Error(), "field label not supported")
 }
 
 // definitionSpellings is rdSpellings answered from cache when the
