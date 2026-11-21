@@ -778,6 +778,15 @@ type appliedStatus struct {
 	status          blockstoriov1alpha1.ResourceStatus
 }
 
+// observerWriters bounds the resources one write pass writes at once.
+// The pass that follows a stream's initial dump writes every replica on
+// the node, and a satellite that just started shows none of them until
+// it has (ForgetStaleSatelliteState). One at a time, with a status
+// write, a get-gi and a Condition write each, that kept every replica
+// of a node with ~110 of them Unknown for tens of seconds; LINSTOR
+// sends a reconnected node's state in one batch after the full sync.
+const observerWriters = 8
+
 // lifecycleSignature is the compact per-resource fingerprint
 // emitReconcileTrigger compares to the cached value to decide
 // whether the new observation represents a kernel-state lifecycle
@@ -1434,13 +1443,25 @@ func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 
 	sort.Strings(names)
 
+	sem := make(chan struct{}, observerWriters)
+
+	var wg sync.WaitGroup
+
 	for _, name := range names {
 		if ctx.Err() != nil {
-			return
+			break
 		}
 
-		o.writeResource(ctx, adm, name, batch[name])
+		sem <- struct{}{}
+
+		wg.Go(func() {
+			defer func() { <-sem }()
+
+			o.writeResource(ctx, adm, name, batch[name])
+		})
 	}
+
+	wg.Wait()
 }
 
 // writeResource carries out what the writer owes one resource.
