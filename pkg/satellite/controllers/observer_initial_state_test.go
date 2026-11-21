@@ -225,7 +225,7 @@ func TestObserverResyncWaitsForTheInitialState(t *testing.T) {
 		t.Errorf("resync wrote %d statuses during the initial state, want none", n)
 	}
 
-	o.releaseWrites(t.Context())
+	o.releaseWrites(t.Context(), true)
 	o.flush(t.Context(), drbd.NewAdm(storage.NewFakeExec()))
 
 	if n := writes.Load(); n != 1 {
