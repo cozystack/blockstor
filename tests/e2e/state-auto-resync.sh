@@ -289,10 +289,10 @@ echo ">> heal partition on $N3 (iptables -F)"
 cleanup_partition
 
 # Sample the observer surface during the sync window. We want to
-# see EITHER Inconsistent OR SyncTarget on $N3 (the CLI/observer
-# annotates the disk state with a sync-progress percentage like
-# `Inconsistent(28%)` while bitmap-resync runs; both prefixes
-# match the post-Bug-29 observer fix). State=Unknown must NEVER
+# see EITHER Inconsistent OR SyncTarget on $N3 (the CLI renders
+# `SyncTarget(28.00%)` from DRBD's `done` while bitmap-resync runs,
+# and the bare `Inconsistent` before the first progress frame; both
+# prefixes match the post-Bug-29 observer fix). State=Unknown must NEVER
 # appear — that signals the observer pipeline lost the row during
 # the reconnect handshake.
 echo ">> sample $N3 disk state during reconnect+resync (deadline ${RESYNC_DEADLINE_SECS}s)"

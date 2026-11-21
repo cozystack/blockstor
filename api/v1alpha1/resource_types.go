@@ -506,6 +506,27 @@ type PeerVolumeStatus struct {
 	// --statistics` peer-device frames.
 	// +optional
 	PeerDiskState string `json:"peerDiskState,omitempty"`
+
+	// done is the progress of the resync running with this peer, as
+	// the `done:<percent>` token of the peer-device frame carries it
+	// ("50.31"). DRBD measures it against that resync's own total,
+	// not the volume size, and prints it only while a resync with
+	// this peer runs; empty otherwise. It is what LINSTOR reports as
+	// the peer's `done_percentage` and renders in `SyncTarget(NN%)`.
+	// A string because a CRD has no portable float type.
+	// +optional
+	Done string `json:"done,omitempty"`
+
+	// replicationState is this volume's DRBD-9 replication state with
+	// this peer, the `replication:<state>` token of the volume's own
+	// peer-device frame. DRBD keeps it per peer and per volume, and
+	// so does LINSTOR (DrbdVolume.volReplState); the connection-level
+	// `replicationState` is whichever volume's frame came last. It is
+	// what `done` belongs to: a two-volume resource can have one
+	// volume in SyncTarget and the other Established or PausedSyncT
+	// on the same connection.
+	// +optional
+	ReplicationState string `json:"replicationState,omitempty"`
 }
 
 // ResourceVolumeStatus is the runtime state of one volume of a Resource.
@@ -539,16 +560,13 @@ type ResourceVolumeStatus struct {
 	// +optional
 	HistoryGI []string `json:"historyGI,omitempty"`
 
-	// outOfSyncKib is the worst-case "how many KiB this volume is
-	// behind any peer" reported by `drbdsetup events2 --statistics`
-	// peer-device frames. Combined with RD.Spec.VolumeDefinitions
-	// SizeKib, callers compute a sync-progress percentage:
-	//   progress = (1 - outOfSyncKib / sizeKib) * 100
-	//
-	// 0 means fully in sync; sizeKib (or close to it) means fresh
-	// resync hasn't started yet. Surfaced via the REST view layer
-	// so `linstor r l` / piraeus dashboards can render a CDI-style
-	// progress bar without polling drbdsetup themselves.
+	// outOfSyncKib is the out-of-sync count of the last
+	// `drbdsetup events2 --statistics` peer-device frame for this
+	// volume, whichever peer it was about. 0 means in sync with that
+	// peer. It is not a resync progress once the replica has more
+	// than one peer: a finished resync with one peer can be the last
+	// frame while a full one with another runs. The progress is
+	// connections[].peerVolumes[].done.
 	// +optional
 	OutOfSyncKib int64 `json:"outOfSyncKib,omitempty"`
 
