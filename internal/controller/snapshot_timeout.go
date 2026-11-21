@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -339,6 +340,95 @@ func setSnapshotCondition(conditions *[]metav1.Condition, cond *metav1.Condition
 	*conditions = append(*conditions, *cond)
 
 	return true
+}
+
+// notUpToDateAbortReason is the abort reason for a take refused on
+// node's replica; tail says what became of the I/O.
+func notUpToDateAbortReason(node, tail string) string {
+	return "snapshot aborted: replica on node '" + node + blockstoriov1alpha1.SnapshotAbortNotUpToDateMark + tail
+}
+
+// isNotUpToDateAbort reports whether reason records a take refused
+// because a targeted replica was not UpToDate.
+func isNotUpToDateAbort(reason string) bool {
+	return strings.Contains(reason, blockstoriov1alpha1.SnapshotAbortNotUpToDateMark)
+}
+
+// deleteRefusedGroup deletes every snapshot of a group whose take was
+// refused because a replica was not UpToDate. LINSTOR does the same:
+// that refusal flags each snapshot definition of the request DELETE,
+// resumes I/O and deletes them before answering the create with
+// FAIL_SNAPSHOT_NOT_UPTODATE. A snapshot kept instead held a finalizer
+// per node and kept its resource definition from being deleted once
+// the CSI snapshot that asked for it was gone, since no DeleteSnapshot
+// ever names a snapshot whose create never succeeded.
+//
+// The delete waits until no node reports I/O suspended for the group:
+// a satellite tears a deleting snapshot down without resuming, so a
+// delete that overtook the resume would leave the volume frozen. The
+// satellite's status write on resume brings the group back here.
+func (r *SnapshotReconciler) deleteRefusedGroup(
+	ctx context.Context, logger logr.Logger, siblings []blockstoriov1alpha1.Snapshot,
+) error {
+	// A take that succeeded on any sibling is never discarded here: its
+	// record contradicts the refusal, and LINSTOR never deletes a
+	// SUCCESSFUL snapshot definition from this path.
+	if slices.ContainsFunc(siblings, func(s blockstoriov1alpha1.Snapshot) bool {
+		return slices.Contains(s.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful)
+	}) {
+		return nil
+	}
+
+	if held := siblingNodesSuspended(siblings); len(held) > 0 {
+		logger.V(1).Info("refused snapshot kept until every node resumed I/O",
+			"suspended_nodes", held)
+
+		return nil
+	}
+
+	for i := range siblings {
+		if !siblings[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+
+		logger.Info("deleting snapshot whose take was refused on a non-UpToDate replica",
+			"snapshot", siblings[i].Name)
+
+		err := r.Delete(ctx, &siblings[i])
+		if err != nil && !apierrors.IsNotFound(err) {
+			return errors.Wrapf(err, "delete refused snapshot %q", siblings[i].Name)
+		}
+	}
+
+	return nil
+}
+
+// siblingNodesSuspended names the nodes, as snapshot/node, that still
+// report I/O suspended for the take on any sibling.
+func siblingNodesSuspended(siblings []blockstoriov1alpha1.Snapshot) []string {
+	var held []string
+
+	for i := range siblings {
+		for _, entry := range siblings[i].Status.NodeStatus {
+			if entry.SuspendIOAcked {
+				held = append(held, siblings[i].Name+"/"+entry.NodeName)
+			}
+		}
+	}
+
+	return held
+}
+
+// groupRefusedNotUpToDate reports whether any sibling records a take
+// refused because a targeted replica was not UpToDate.
+func groupRefusedNotUpToDate(siblings []blockstoriov1alpha1.Snapshot) bool {
+	for i := range siblings {
+		if isNotUpToDateAbort(recordedAbortReason(&siblings[i])) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // allTargetedReplicasUpToDate verifies every targeted diskful replica

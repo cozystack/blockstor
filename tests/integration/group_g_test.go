@@ -54,6 +54,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -449,9 +450,10 @@ func restSnapshotFlags(t *testing.T, stack *harness.Stack, rd, snapName string) 
 // testGroupGSnapAbortedTakeStaysOver aborts a take the way LINSTOR does
 // when a replica is not UpToDate, then lets the satellites catch up
 // late: their suspend acks linger before the resume lands, and the take
-// reports Ready afterwards. LINSTOR flags the definition failed and never
-// takes it again. The controller must not order a new suspend while the
-// acks linger, nor record SUCCESSFUL once every node reports Ready.
+// reports Ready afterwards. LINSTOR resumes I/O and deletes the snapshot
+// it refused to take. The controller must not order a new suspend, nor
+// delete the snapshot, while the acks linger; once every node resumed
+// it deletes it, never having served it SUCCESSFUL.
 func testGroupGSnapAbortedTakeStaysOver(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
 	ctx := context.Background()
 	rd := seedRDWithVolume(t, stack, "aborted")
@@ -493,20 +495,35 @@ func testGroupGSnapAbortedTakeStaysOver(t *testing.T, stack *harness.Stack, cli 
 			slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect)
 	}, "controller did not abort the take of a replica that is not UpToDate")
 
-	// The acks linger: no satellite confirmed the resume yet.
-	holdsFor(t, 3*time.Second, func() bool { return !getSnapshotCRD(t, stack, key).Spec.SuspendIO },
-		"controller froze I/O again for an aborted take")
-
-	// The take returns late on every node, and every node resumes.
-	stampSnapshotNodes(t, stack, key, false, true)
-
+	// The acks linger: no satellite confirmed the resume yet, so the
+	// snapshot stays, flagged, and I/O is not frozen again.
 	holdsFor(t, 3*time.Second, func() bool {
-		return !slices.Contains(restSnapshotFlags(t, stack, rd, "snap-1"), "SUCCESSFUL")
-	}, "an aborted take was served SUCCESSFUL once its nodes reported Ready")
+		snap := getSnapshotCRD(t, stack, key)
+
+		return !snap.Spec.SuspendIO && snap.DeletionTimestamp.IsZero()
+	}, "controller froze I/O again, or deleted the snapshot before its nodes resumed")
 
 	if flags := restSnapshotFlags(t, stack, rd, "snap-1"); !slices.Contains(flags, "FAILED_DISCONNECT") {
 		t.Errorf("aborted take served with flags %v, want FAILED_DISCONNECT", flags)
 	}
+
+	// The take returns late on every node, and every node resumes.
+	stampSnapshotNodes(t, stack, key, false, true)
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		var snap blockstoriov1alpha1.Snapshot
+
+		err := stack.Env.Client.Get(ctx, key, &snap)
+		if apierrors.IsNotFound(err) {
+			return true
+		}
+
+		if slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful) {
+			t.Fatal("an aborted take was recorded SUCCESSFUL once its nodes reported Ready")
+		}
+
+		return err == nil && !snap.DeletionTimestamp.IsZero()
+	}, "snapshot refused on a non-UpToDate replica was kept after every node resumed")
 }
 
 // holdsFor fails the test the first time predicate turns false within d.

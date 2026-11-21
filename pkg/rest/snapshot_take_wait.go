@@ -20,12 +20,14 @@ package rest
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"slices"
 	"time"
 
 	"github.com/cockroachdb/errors"
 
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -74,6 +76,11 @@ const (
 	takeSucceeded
 	takeFailed
 	takeDeleted
+	// takeRefused is a take refused because a targeted replica was not
+	// UpToDate. The controller deletes such a snapshot, and LINSTOR
+	// answers the create only once that delete is done, so the wait
+	// holds it until the snapshot is gone.
+	takeRefused
 )
 
 // takeOutcome is how the take of one snapshot ended and, for a failed
@@ -102,12 +109,24 @@ func (s *Server) waitSnapshotsSettled(ctx context.Context, refs []snapshotRef) m
 	pending := slices.Clone(refs)
 	seen := make(map[snapshotRef]int, len(refs))
 	outcomes := make(map[snapshotRef]takeOutcome, len(refs))
+	refused := make(map[snapshotRef]takeOutcome)
 
 	for {
 		pending = slices.DeleteFunc(pending, func(ref snapshotRef) bool {
 			outcome := s.snapshotTakeOutcome(ctx, ref, seen)
-			if outcome.end == takeOpen {
+
+			switch outcome.end {
+			case takeOpen:
 				return false
+			case takeRefused:
+				refused[ref] = outcome
+
+				return false
+			case takeDeleted:
+				if prior, ok := refused[ref]; ok {
+					outcome = prior
+				}
+			case takeSucceeded, takeFailed:
 			}
 
 			outcomes[ref] = outcome
@@ -121,6 +140,9 @@ func (s *Server) waitSnapshotsSettled(ctx context.Context, refs []snapshotRef) m
 
 		select {
 		case <-ctx.Done():
+			// A refusal whose delete outlasted the wait still failed.
+			maps.Copy(outcomes, refused)
+
 			return outcomes
 		case <-ticker.C:
 		}
@@ -171,7 +193,12 @@ func (s *Server) snapshotTakeOutcome(ctx context.Context, ref snapshotRef, seen 
 	}
 
 	if i := slices.IndexFunc(snap.Flags, isFailedSnapshotFlag); i >= 0 {
-		return takeOutcome{end: takeFailed, flag: snap.Flags[i], reason: snap.AbortReason}
+		end := takeFailed
+		if blockstoriov1alpha1.IsSnapshotAbortNotUpToDate(snap.AbortReason) {
+			end = takeRefused
+		}
+
+		return takeOutcome{end: end, flag: snap.Flags[i], reason: snap.AbortReason}
 	}
 
 	if slices.Contains(snap.Flags, apiv1.SnapshotFlagDelete) {
@@ -200,6 +227,11 @@ func takeFailureRcs(refs []snapshotRef, outcomes map[snapshotRef]takeOutcome) []
 			}
 
 			rcs = append(rcs, apiv1.APICallRc{RetCode: apiCallRcError | apiCallRcFailUnknownError, Message: message})
+		case takeRefused:
+			rcs = append(rcs, apiv1.APICallRc{
+				RetCode: apiCallRcError | apiCallRcFailSnapshotNotUpToDate,
+				Message: snapshotNotUpToDateMessage,
+			})
 		case takeDeleted:
 			rcs = append(rcs, apiv1.APICallRc{
 				RetCode: apiCallRcError | apiCallRcFailUnknownError,
@@ -211,6 +243,10 @@ func takeFailureRcs(refs []snapshotRef, outcomes map[snapshotRef]takeOutcome) []
 
 	return rcs
 }
+
+// snapshotNotUpToDateMessage is LINSTOR's answer to a create it refused
+// because a targeted replica was not UpToDate.
+const snapshotNotUpToDateMessage = "Cannot take snapshot from non-UpToDate DRBD device. Snapshot creation aborted"
 
 // writeSnapshotCreateAnswer answers a create with its rcs: 201, or 500 with
 // the failure appended when a take failed, as LINSTOR's REST layer maps an

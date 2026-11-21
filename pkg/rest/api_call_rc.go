@@ -222,6 +222,11 @@ const apiCallRcFailSnapshotFinalizerStuck int64 = 998
 // snapshot create answers a failed take with it.
 const apiCallRcFailUnknownError int64 = 998
 
+// apiCallRcFailSnapshotNotUpToDate mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_SNAPSHOT_NOT_UPTODATE` (`979 | MASK_ERROR`), the code a
+// snapshot create ends with when a targeted replica is not UpToDate.
+const apiCallRcFailSnapshotNotUpToDate int64 = 979
+
 // apiCallRcFailSnapshotsNotSupported mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_SNAPSHOTS_NOT_SUPPORTED` (`994 | MASK_ERROR`).
 // Emitted by `POST /v1/resource-definitions/{rd}/snapshots` (G5) when

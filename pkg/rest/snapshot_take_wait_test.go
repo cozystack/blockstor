@@ -453,3 +453,110 @@ func TestSnapshotCreateEndsTheWaitForASnapshotGoneBeforeTheCacheSawIt(t *testing
 		t.Errorf("want the delete in the answer, got %+v", answer.rcs)
 	}
 }
+
+// refuseNotUpToDate plays the controller refusing the take because a
+// replica is not UpToDate: once the snapshot shows up it records
+// FAILED_DISCONNECT with that reason after takeDelay and, when deleteIt
+// is set, deletes the snapshot takeDelay later.
+func refuseNotUpToDate(t *testing.T, st store.Store, deleteIt bool) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+	done := make(chan struct{})
+
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	go func() {
+		defer close(done)
+
+		for ctx.Err() == nil {
+			snap, err := st.Snapshots().Get(ctx, "pvc-1", "snap-1")
+			if err != nil {
+				time.Sleep(10 * time.Millisecond)
+
+				continue
+			}
+
+			time.Sleep(takeDelay)
+
+			snap.Flags = append(snap.Flags, apiv1.SnapshotFlagFailedDisconnect)
+			snap.AbortReason = "snapshot aborted: replica on node 'n1' is not UpToDate; I/O resumed"
+			_ = st.Snapshots().Update(ctx, &snap)
+
+			if deleteIt {
+				time.Sleep(takeDelay)
+
+				_ = st.Snapshots().Delete(ctx, "pvc-1", "snap-1")
+			}
+
+			return
+		}
+	}()
+}
+
+// isNotUpToDateRc reports whether rc is LINSTOR's answer to a create
+// refused on a non-UpToDate replica.
+func isNotUpToDateRc(rc apiv1.APICallRc) bool {
+	return rc.RetCode == apiCallRcError|apiCallRcFailSnapshotNotUpToDate &&
+		rc.Message == snapshotNotUpToDateMessage
+}
+
+// TestSnapshotCreateAnswersANotUpToDateRefusalAfterTheDelete pins
+// LINSTOR's answer to a take refused on a non-UpToDate replica: it
+// deletes the snapshots first and then fails the create with
+// FAIL_SNAPSHOT_NOT_UPTODATE. Answered before the delete, linstor-csi
+// retries the create, finds the refused snapshot and deletes it itself
+// while the controller is still resuming I/O.
+func TestSnapshotCreateAnswersANotUpToDateRefusalAfterTheDelete(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{multiCreatePath, rdCreatePath} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewInMemory()
+			base := startTakeWaitServer(t, st, 20*time.Second)
+			refuseNotUpToDate(t, st, true)
+
+			answer := postSnap1(t, base, path)
+			if answer.elapsed < 2*takeDelay || answer.elapsed > 10*time.Second {
+				t.Errorf("create answered after %v, want once the refused snapshot was deleted (~%v)",
+					answer.elapsed, 2*takeDelay)
+			}
+
+			if answer.status != http.StatusInternalServerError {
+				t.Errorf("status %d, want 500", answer.status)
+			}
+
+			if !slices.ContainsFunc(answer.rcs, isNotUpToDateRc) {
+				t.Errorf("want FAIL_SNAPSHOT_NOT_UPTODATE with LINSTOR's message, got %+v", answer.rcs)
+			}
+		})
+	}
+}
+
+// TestSnapshotCreateAnswersANotUpToDateRefusalAtTheBound: a refusal
+// whose delete outlasts the wait still fails the create; it must not
+// pass for a take still open.
+func TestSnapshotCreateAnswersANotUpToDateRefusalAtTheBound(t *testing.T) {
+	t.Parallel()
+
+	const wait = 2 * time.Second
+
+	st := store.NewInMemory()
+	base := startTakeWaitServer(t, st, wait)
+	refuseNotUpToDate(t, st, false)
+
+	answer := postSnap1(t, base, multiCreatePath)
+	if answer.elapsed < wait || answer.elapsed > 10*time.Second {
+		t.Errorf("create answered after %v, want about the %v bound", answer.elapsed, wait)
+	}
+
+	if answer.status != http.StatusInternalServerError || !slices.ContainsFunc(answer.rcs, isNotUpToDateRc) {
+		t.Errorf("want 500 with FAIL_SNAPSHOT_NOT_UPTODATE, got %d %+v", answer.status, answer.rcs)
+	}
+}

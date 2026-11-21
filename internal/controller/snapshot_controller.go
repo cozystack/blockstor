@@ -431,8 +431,7 @@ func (r *SnapshotReconciler) advancePhase(
 				"group_id", snap.Spec.GroupID, "node", offending)
 
 			return r.abortGroupWithReason(ctx, siblings,
-				"snapshot aborted: replica on node '"+offending+
-					"' is not UpToDate; resume of I/O requested")
+				notUpToDateAbortReason(offending, "resume of I/O requested"))
 		}
 	}
 
@@ -520,7 +519,14 @@ func (r *SnapshotReconciler) checkAbortConditions(
 			return true, ctrl.Result{}, err
 		}
 
-		return true, ctrl.Result{}, r.stampGroupFailed(ctx, siblings, reason)
+		err = r.stampGroupFailed(ctx, siblings, reason)
+		if err != nil || !groupRefusedNotUpToDate(siblings) {
+			return true, ctrl.Result{}, err
+		}
+
+		// A refusal on a non-UpToDate replica is deleted whatever else
+		// went wrong in the group, as LINSTOR deletes it.
+		return true, ctrl.Result{}, r.deleteRefusedGroup(ctx, logger, siblings)
 	}
 
 	// A take aborted on an earlier pass is over. Finish what that pass
@@ -529,8 +535,11 @@ func (r *SnapshotReconciler) checkAbortConditions(
 	// see a take that never started and freeze I/O again.
 	if reason, flag, ended := groupAbortReason(siblings); ended {
 		res, err := r.abortGroupWithFlag(ctx, siblings, flag, reason)
+		if err != nil || !isNotUpToDateAbort(reason) {
+			return true, res, err
+		}
 
-		return true, res, err
+		return true, res, r.deleteRefusedGroup(ctx, logger, siblings)
 	}
 
 	if inSuspendPhase(snap, siblings) && suspendDeadlineExceeded(snap, time.Now()) {
@@ -603,8 +612,7 @@ func (r *SnapshotReconciler) openGroupSuspendBarrier(
 			"group_id", snap.Spec.GroupID, "node", offending)
 
 		return r.abortGroupWithReason(ctx, siblings,
-			"snapshot aborted: replica on node '"+offending+
-				"' is not UpToDate; I/O not suspended")
+			notUpToDateAbortReason(offending, "I/O not suspended"))
 	}
 
 	logger.V(1).Info("opening group suspend barrier",
