@@ -139,29 +139,9 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	// the field nil to short-circuit both ends.
 	ensureWiredDefaults(cfg)
 
-	err = (&ResourceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	err = setupReconcilers(mgr, cfg)
 	if err != nil {
-		return nil, errors.Wrap(err, "setup ResourceReconciler")
-	}
-
-	err = (&ResourceDefinitionReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup ResourceDefinitionReconciler")
-	}
-
-	err = (&SnapshotReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup SnapshotReconciler")
-	}
-
-	err = (&StoragePoolReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup StoragePoolReconciler")
-	}
-
-	err = (&PhysicalDeviceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup PhysicalDeviceReconciler")
+		return nil, err
 	}
 
 	err = addBackgroundRunnables(mgr, cfg)
@@ -174,6 +154,37 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	wireConditionStampers(mgr, cfg)
 
 	return mgr, nil
+}
+
+// setupReconcilers registers the satellite's reconcilers on mgr, each
+// with its own copy of cfg. Kept out of NewManager for its funlen budget.
+func setupReconcilers(mgr manager.Manager, cfg *Config) error {
+	err := (&ResourceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup ResourceReconciler")
+	}
+
+	err = (&ResourceDefinitionReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup ResourceDefinitionReconciler")
+	}
+
+	err = (&SnapshotReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup SnapshotReconciler")
+	}
+
+	err = (&StoragePoolReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup StoragePoolReconciler")
+	}
+
+	err = (&PhysicalDeviceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup PhysicalDeviceReconciler")
+	}
+
+	return nil
 }
 
 // validateConfig sanity-checks the NewManager input — keeps the
