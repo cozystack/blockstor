@@ -228,3 +228,31 @@ func TestReplicasOfLooksUpCachedSpellingsThroughTheIndex(t *testing.T) {
 		t.Errorf("walked every cached Resource %d time(s) to find the spellings of one definition", n)
 	}
 }
+
+// The definition's own spellings are fixed when it is created, so the
+// cache names them as well as the API server does. Asking the server on
+// every pass of every definition is a request each time for nothing.
+func TestReplicasOfTakesACachedDefinitionsSpellingsFromTheCache(t *testing.T) {
+	t.Parallel()
+
+	cli := keyIndexedCluster(t,
+		&crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix"}},
+		replicaRow("pvc-mix.n1", "pvc-mix", "n1"),
+	)
+	reader := &requestCounter{Reader: cli}
+
+	var got crdv1alpha1.ResourceList
+
+	err := k8s.ReplicasOf(context.Background(), reader, cli, "pvc-mix", &got)
+	if err != nil {
+		t.Fatalf("ReplicasOf: %v", err)
+	}
+
+	if n := reader.gets.Load(); n != 0 {
+		t.Errorf("asked the API server for the definition %d time(s) although the cache holds it", n)
+	}
+
+	if want := []string{"pvc-mix.n1"}; !slices.Equal(replicaNames(got.Items), want) {
+		t.Errorf("replicas of pvc-mix = %v, want %v", replicaNames(got.Items), want)
+	}
+}

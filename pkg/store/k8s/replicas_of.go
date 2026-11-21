@@ -82,7 +82,7 @@ func RegisterReplicaKeyIndex(indexer ctrlclient.FieldIndexer) error {
 // than answering short, and ReplicasOf then reads every Resource and
 // keeps the definition's, as before.
 func ReplicasOf(ctx context.Context, reader, cache ctrlclient.Reader, rdName string, list *crdv1alpha1.ResourceList) error {
-	spellings, err := rdSpellings(ctx, reader, rdName)
+	spellings, err := definitionSpellings(ctx, reader, cache, rdName)
 	if err != nil {
 		return err
 	}
@@ -126,6 +126,22 @@ func ReplicasOf(ctx context.Context, reader, cache ctrlclient.Reader, rdName str
 	list.Items = out
 
 	return nil
+}
+
+// definitionSpellings is rdSpellings answered from cache when the
+// definition is there. Its spellings are fixed when it is created, so
+// the cache's copy names them as well as the API server's does, and the
+// read on every pass costs no request. A definition the cache has not
+// seen yet, or a cache that cannot answer, is asked of reader.
+func definitionSpellings(ctx context.Context, reader, cache ctrlclient.Reader, rdName string) ([]string, error) {
+	if cache != nil {
+		found, ok, err := lookupRD(ctx, cache, rdName)
+		if err == nil && ok {
+			return spellingSet(rdName, found, true), nil
+		}
+	}
+
+	return rdSpellings(ctx, reader, rdName)
 }
 
 // cachedSpellings lists the spellings of rdName the replicas in cache
