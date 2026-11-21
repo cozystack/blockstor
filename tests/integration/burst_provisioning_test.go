@@ -149,6 +149,20 @@ type burstStack struct {
 func startBurstStack(t *testing.T, nodes []string, passDelay time.Duration) *burstStack {
 	t.Helper()
 
+	return startBurstStackWith(t, nodes, burstLatency{pass: passDelay})
+}
+
+// burstLatency is what the stack's API round trips cost on a real
+// cluster, where envtest answers in a fraction of it: a drbdadm call
+// on the satellites, a replica create from the REST server, and a
+// controller read of every Resource in the cluster. Zero is envtest's.
+type burstLatency struct {
+	pass, create, wholeClusterRead time.Duration
+}
+
+func startBurstStackWith(t *testing.T, nodes []string, latency burstLatency) *burstStack {
+	t.Helper()
+
 	env := harness.Start(t)
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -171,13 +185,13 @@ func startBurstStack(t *testing.T, nodes []string, passDelay time.Duration) *bur
 		t.Fatalf("controller manager: %v", err)
 	}
 
-	wireBurstController(t, mgr, st)
+	wireBurstController(t, mgr, st, slowWholeClusterReader{Reader: mgr.GetAPIReader(), delay: latency.wholeClusterRead})
 
 	addr := freeAddr(t)
 
 	err = mgr.Add(&rest.Server{
 		Addr:         addr,
-		Store:        st,
+		Store:        slowCreateStore{Store: st, delay: latency.create},
 		Client:       mgr.GetClient(),
 		Namespace:    "default",
 		SecretReader: mgr.GetAPIReader(),
@@ -189,7 +203,7 @@ func startBurstStack(t *testing.T, nodes []string, passDelay time.Duration) *bur
 	runManager(ctx, t, &wg, mgr)
 
 	for _, node := range nodes {
-		ex := &slowExec{Exec: &quietExec{}, delay: passDelay}
+		ex := &slowExec{Exec: &quietExec{}, delay: latency.pass}
 
 		satMgr, err := ctrl.NewManager(env.Cfg, opts)
 		if err != nil {
@@ -228,14 +242,16 @@ func startBurstStack(t *testing.T, nodes []string, passDelay time.Duration) *bur
 	return s
 }
 
-func wireBurstController(t *testing.T, mgr manager.Manager, st *storek8s.Store) {
+func wireBurstController(t *testing.T, mgr manager.Manager, st *storek8s.Store, apiReader client.Reader) {
 	t.Helper()
 
 	steps := []func(ctrl.Manager) error{
 		(&controller.NodeReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Store: st}).SetupWithManager,
 		(&controller.StoragePoolReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager,
 		(&controller.ResourceGroupReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Store: st}).SetupWithManager,
-		(&controller.ResourceDefinitionReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Store: st}).SetupWithManager,
+		(&controller.ResourceDefinitionReconciler{
+			Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Store: st, APIReader: apiReader,
+		}).SetupWithManager,
 		(&controller.ResourceReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Store: st}).SetupWithManager,
 		(&controller.ResourceMigrationReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager,
 	}
