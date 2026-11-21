@@ -580,3 +580,40 @@ exists -
 		t.Fatalf("disk state %q: the dump's older line went over a newer change", got)
 	}
 }
+
+// Writes are held until the dump's `exists -` line, and a satellite
+// that starts shows none of its node's replicas until they are written
+// again. A stream that never sends the line must not hide them for as
+// long as it runs: once the dump has gone quiet, what it said is
+// written, and the changes kept back behind it after that.
+func TestObserverWritesADumpThatNeverEnds(t *testing.T) {
+	cli := startStatusEnvtest(t)
+	name := createStatusReplica(t, cli)
+
+	dump := strings.TrimSuffix(healthyDump, "exists -\n")
+
+	const later = "change peer-device name:pvc-status peer-node-id:1 conn-name:n2 volume:0 " +
+		"replication:Established peer-disk:Outdated\n"
+
+	live, feed := io.Pipe()
+
+	o := &ObserverRunnable{
+		Client:            cli,
+		Exec:              storage.NewFakeExec(),
+		NodeName:          statusTestNode,
+		initialStateQuiet: 200 * time.Millisecond,
+		startEvents2: func(context.Context) (*drbd.Watcher, func(), error) {
+			go func() { _, _ = io.WriteString(feed, dump+later) }()
+
+			return drbd.NewWatcher(live), func() {}, nil
+		},
+	}
+
+	runObserver(t, o, feed)
+
+	waitFor(t, "the dump written without its end line", func() bool {
+		status := getStatusReplica(t, cli, name)
+
+		return healthyStatus(&status) && status.Connections[0].PeerVolumes[0].PeerDiskState == "Outdated"
+	})
+}

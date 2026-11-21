@@ -769,6 +769,10 @@ type ObserverRunnable struct {
 	// again; zero means events2RestartDelay. Both are for tests.
 	startEvents2 func(context.Context) (*drbd.Watcher, func(), error)
 	restartDelay time.Duration
+	// initialStateQuiet is how long a stream's dump may go without a
+	// line before it is taken as ended; zero means
+	// observerInitialStateQuiet. For tests.
+	initialStateQuiet time.Duration
 }
 
 // appliedStatus is one entry of ObserverRunnable.applied.
@@ -922,6 +926,11 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 // DrbdEventsMonitor does: a change the kernel reported while the dump
 // was being written may be newer than the dump's line for the same
 // object, and must not be overwritten by it.
+//
+// The dump comes in one burst. Should its end line never come, writes
+// would stay held and the node's replicas hidden for as long as the
+// stream runs, so once no dump line has come for initialStateWait the
+// dump is taken as ended.
 func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, stream *drbd.Watcher) {
 	events := make(chan drbd.Event, observerEventBuffer)
 
@@ -936,22 +945,45 @@ func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, strea
 
 	dumped := false
 
-	for ev := range events {
-		switch {
-		case dumped:
-			o.ingestEvent(ctx, ev)
-		case ev.EndsInitialState():
-			dumped = true
+	endDump := func() {
+		dumped = true
 
-			for _, held := range deferred {
-				o.ingestEvent(ctx, held)
+		for _, held := range deferred {
+			o.ingestEvent(ctx, held)
+		}
+
+		deferred = nil
+
+		o.releaseWrites(ctx)
+	}
+
+	quiet := time.NewTimer(o.initialStateWait())
+	defer quiet.Stop()
+
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				return
 			}
 
-			o.releaseWrites(ctx)
-		case ev.Action == eventActionExists:
-			o.ingestEvent(ctx, ev)
-		default:
-			deferred = append(deferred, ev)
+			switch {
+			case dumped:
+				o.ingestEvent(ctx, ev)
+			case ev.EndsInitialState():
+				endDump()
+			case ev.Action == eventActionExists:
+				o.ingestEvent(ctx, ev)
+				quiet.Reset(o.initialStateWait())
+			default:
+				deferred = append(deferred, ev)
+			}
+		case <-quiet.C:
+			if !dumped {
+				logger.Info("drbdsetup events2 sent no end of its initial state; writing the state read so far",
+					"quiet", o.initialStateWait(), "held", len(deferred))
+				endDump()
+			}
 		}
 	}
 }
@@ -1094,6 +1126,22 @@ func (o *ObserverRunnable) events2RestartDelay() time.Duration {
 
 	return events2RestartDelay
 }
+
+func (o *ObserverRunnable) initialStateWait() time.Duration {
+	if o.initialStateQuiet > 0 {
+		return o.initialStateQuiet
+	}
+
+	return observerInitialStateQuiet
+}
+
+// observerInitialStateQuiet bounds how long writes stay held for a dump
+// whose `exists -` line does not come. drbdsetup writes the dump in one
+// burst, well under a second on a node with a few hundred replicas, so
+// a gap this long means the line is missing, not late. LINSTOR waits
+// for it with no bound; a satellite that did would hide its node's
+// replicas until the stream next restarts.
+const observerInitialStateQuiet = 10 * time.Second
 
 // events2RestartDelay is LINSTOR's RESTART_EVENTS2_STREAM_TIMEOUT.
 const events2RestartDelay = 5 * time.Second
