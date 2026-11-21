@@ -20,3 +20,7 @@ func NewIndexedManagerWithin(cfg *rest.Config, opts ctrl.Options, budget time.Du
 func NodeScopedReadsBypassTheCache(s *Store) bool {
 	return s.resources.apiReader != nil && s.storagePools.apiReader != nil
 }
+
+// ReplicaKeyIndexer is the extractor of the FieldResourceDefinitionKey
+// index NewManager and RegisterReplicaKeyIndex register.
+var ReplicaKeyIndexer = replicaKeyIndex().extract

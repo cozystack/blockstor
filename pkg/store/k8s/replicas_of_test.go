@@ -153,3 +153,78 @@ func TestReplicasOfFallsBackWhenTheSelectorIsRefused(t *testing.T) {
 		t.Errorf("replicas of pvc-mix = %v, want %v", replicaNames(got.Items), want)
 	}
 }
+
+// requestCounter counts the requests a reader sends, and how many of the
+// Resource lists among them carried no field selector.
+type requestCounter struct {
+	client.Reader
+
+	gets, lists, unscoped atomic.Int64
+}
+
+func (c *requestCounter) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	c.gets.Add(1)
+
+	return c.Reader.Get(ctx, key, obj, opts...) //nolint:wrapcheck // test double
+}
+
+func (c *requestCounter) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	c.lists.Add(1)
+
+	var o client.ListOptions
+	o.ApplyOptions(opts)
+
+	if _, ok := list.(*crdv1alpha1.ResourceList); ok && o.FieldSelector == nil {
+		c.unscoped.Add(1)
+	}
+
+	return c.Reader.List(ctx, list, opts...) //nolint:wrapcheck // test double
+}
+
+// keyIndexedCluster is replicasOfCluster with the cache's definition-key
+// index registered as well, as a manager's cache has it.
+func keyIndexedCluster(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+
+	return fake.NewClientBuilder().WithScheme(replicasOfScheme(t)).WithObjects(objs...).
+		WithIndex(&crdv1alpha1.Resource{}, k8s.FieldResourceDefinitionName, func(o client.Object) []string {
+			return []string{o.(*crdv1alpha1.Resource).Spec.ResourceDefinitionName}
+		}).
+		WithIndex(&crdv1alpha1.Resource{}, k8s.FieldResourceDefinitionKey, k8s.ReplicaKeyIndexer).
+		Build()
+}
+
+// The spellings the cached replicas carry are looked up on every pass of
+// every definition. Through the cache's definition-key index that touches
+// the definition's replicas only; a walk of the whole cache copies every
+// Resource in it, once per pass.
+func TestReplicasOfLooksUpCachedSpellingsThroughTheIndex(t *testing.T) {
+	t.Parallel()
+
+	objs := []client.Object{
+		&crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix"}},
+		replicaRow("pvc-mix.n1", "pvc-mix", "n1"),
+		replicaRow("pvc-mix.n2", "Pvc-Mix", "N2"),
+	}
+	for i := range 20 {
+		objs = append(objs, replicaRow(fmt.Sprintf("pvc-%02d.n1", i), fmt.Sprintf("pvc-%02d", i), "n1"))
+	}
+
+	cli := keyIndexedCluster(t, objs...)
+	cache := &requestCounter{Reader: cli}
+
+	var got crdv1alpha1.ResourceList
+
+	err := k8s.ReplicasOf(context.Background(), cli, cache, "pvc-mix", &got)
+	if err != nil {
+		t.Fatalf("ReplicasOf: %v", err)
+	}
+
+	if want := []string{"pvc-mix.n1", "pvc-mix.n2"}; !slices.Equal(replicaNames(got.Items), want) {
+		t.Errorf("replicas of pvc-mix = %v, want %v", replicaNames(got.Items), want)
+	}
+
+	if n := cache.unscoped.Load(); n != 0 {
+		t.Errorf("walked every cached Resource %d time(s) to find the spellings of one definition", n)
+	}
+}

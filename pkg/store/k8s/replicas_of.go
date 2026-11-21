@@ -30,6 +30,36 @@ import (
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
+// FieldResourceDefinitionKey is a cache index over Resources by the key
+// (naming.Key) of the definition name in spec. It exists in a manager's
+// cache only: the API server has no such field, and nothing sends it
+// there. ReplicasOf asks it which spellings the cached replicas of a
+// definition carry, in time proportional to that definition's replicas
+// rather than to the cluster's.
+const FieldResourceDefinitionKey = "blockstor.org/resourceDefinitionKey"
+
+// replicaKeyIndex is the FieldResourceDefinitionKey index.
+func replicaKeyIndex() fieldIndex {
+	return fieldIndex{
+		object: &crdv1alpha1.Resource{}, field: FieldResourceDefinitionKey,
+		extract: func(obj ctrlclient.Object) []string {
+			res, ok := obj.(*crdv1alpha1.Resource)
+			if !ok || res.Spec.ResourceDefinitionName == "" {
+				return nil
+			}
+
+			return []string{naming.Key(res.Spec.ResourceDefinitionName)}
+		},
+	}
+}
+
+// RegisterReplicaKeyIndex registers the FieldResourceDefinitionKey index
+// on a manager that NewManager did not build: the satellite's. NewManager
+// registers it with the rest of the store's indexes.
+func RegisterReplicaKeyIndex(indexer ctrlclient.FieldIndexer) error {
+	return registerIndexesWithin(indexRegistrationBudget, indexer, []fieldIndex{replicaKeyIndex()})
+}
+
 // ReplicasOf lists into list the Resource objects of definition rdName
 // through reader, whichever spelling of the name they carry.
 //
@@ -99,8 +129,10 @@ func ReplicasOf(ctx context.Context, reader, cache ctrlclient.Reader, rdName str
 }
 
 // cachedSpellings lists the spellings of rdName the replicas in cache
-// carry in spec. The cache holds every Resource already, and is read
-// without copying, so this costs a walk over pointers.
+// carry in spec. It reads the FieldResourceDefinitionKey index, which
+// holds the definition's replicas only, without copying them. A cache
+// without the index is walked whole instead, which is correct but
+// copies every Resource in it.
 func cachedSpellings(ctx context.Context, cache ctrlclient.Reader, rdName string) []string {
 	if cache == nil {
 		return nil
@@ -108,7 +140,15 @@ func cachedSpellings(ctx context.Context, cache ctrlclient.Reader, rdName string
 
 	var list crdv1alpha1.ResourceList
 
-	err := cache.List(ctx, &list, ctrlclient.UnsafeDisableDeepCopy)
+	err := cache.List(ctx, &list,
+		ctrlclient.MatchingFields{FieldResourceDefinitionKey: naming.Key(rdName)}, ctrlclient.UnsafeDisableDeepCopy)
+	if SelectorUnsupported(err) {
+		log.FromContext(ctx).V(1).Info("cache has no definition-key index; walking every cached replica",
+			"resourceDefinition", rdName, "reason", err.Error())
+
+		err = cache.List(ctx, &list, ctrlclient.UnsafeDisableDeepCopy)
+	}
+
 	if err != nil {
 		return nil
 	}

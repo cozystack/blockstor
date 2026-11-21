@@ -35,6 +35,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/satellite/stream"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // reconcileTriggerBuffer bounds the observer → reconciler trigger
@@ -107,6 +108,14 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	mgr, err := ctrl.NewManager(restCfg, managerOptions(cfg, &gracefulShutdownTimeout))
 	if err != nil {
 		return nil, errors.Wrap(err, "create manager")
+	}
+
+	// Every pass looks up which spellings of its definition the cached
+	// replicas carry (storek8s.ReplicasOf). Without the index that is a
+	// copy of every Resource in the cache, per pass.
+	err = storek8s.RegisterReplicaKeyIndex(mgr.GetFieldIndexer())
+	if err != nil {
+		return nil, errors.Wrap(err, "index cached replicas by definition")
 	}
 
 	// Inject the manager's APIReader so reconcilers can bypass
