@@ -286,31 +286,7 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 		}
 	}
 
-	// Partial-shortfall path (Bug 35 + scenarios 7.W10 / 7.W11): the
-	// diskful loop ran out of candidates because the capacity or
-	// over-subscription gate dropped pools that would otherwise have
-	// qualified. Surface the actionable error so the REST 409 names
-	// the missing capacity OR the over-subscription cap. We only fire
-	// when one of those gates was actually the rejecter; a shortfall
-	// caused purely by topology/anti-affinity still falls through to
-	// the generic "not enough candidate storage pools" path.
-	//
-	// Precedence: physical floor (maxFreeKib > 0) wins over oversub —
-	// see the capacityShortfall branch above for the rationale.
-	if placed < want && plan.requiredKib > 0 {
-		if plan.maxFreeKib > 0 {
-			return plan.state.placement(placed, want), &CapacityShortfallError{
-				RequiredKib: plan.requiredKib,
-				MaxFreeKib:  plan.maxFreeKib,
-			}
-		}
-
-		if plan.oversubShortfall != nil {
-			return plan.state.placement(placed, want), plan.oversubShortfall
-		}
-	}
-
-	return plan.state.placement(placed, want), nil
+	return plan.state.placement(placed, want), plan.partialShortfall(placed, want)
 }
 
 // placePlan bundles everything Place needs after the read-side
@@ -338,6 +314,36 @@ type placePlan struct {
 	// mutually exclusive so REST can render a single 409 naming the
 	// exact ratio the operator needs to tune.
 	oversubShortfall *OversubscriptionShortfallError
+}
+
+// partialShortfall is the error a placement that fell short of want
+// returns (Bug 35 + scenarios 7.W10 / 7.W11): the diskful loop ran out
+// of candidates because the capacity or over-subscription gate dropped
+// pools that would otherwise have qualified, so the REST 409 names the
+// missing capacity OR the over-subscription cap. It is nil when
+// neither gate was the rejecter; a shortfall caused purely by
+// topology/anti-affinity still falls through to the generic "not
+// enough candidate storage pools" path.
+//
+// Precedence: physical floor (maxFreeKib > 0) wins over oversub, see
+// the capacityShortfall branch of place for the rationale.
+func (plan *placePlan) partialShortfall(placed, want int) error {
+	if placed >= want || plan.requiredKib <= 0 {
+		return nil
+	}
+
+	if plan.maxFreeKib > 0 {
+		return &CapacityShortfallError{
+			RequiredKib: plan.requiredKib,
+			MaxFreeKib:  plan.maxFreeKib,
+		}
+	}
+
+	if plan.oversubShortfall != nil {
+		return plan.oversubShortfall
+	}
+
+	return nil
 }
 
 // buildPlan does the read-side legwork: load VDs, candidate pools,
