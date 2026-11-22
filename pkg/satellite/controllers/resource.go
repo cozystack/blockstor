@@ -782,6 +782,7 @@ func (r *ResourceReconciler) afterApply(
 ) applyOutcome {
 	anyFailed, waiting := r.recordPerResourceFailures(res, results, logger)
 	r.recordDroppedOptions(res, results)
+
 	outcome := applyOutcome{failed: anyFailed, waiting: waiting}
 
 	outcome.stampFailed = r.stampPostApply(ctx, res, rd, results, outcome, logger)
