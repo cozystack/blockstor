@@ -1180,6 +1180,32 @@ func applyRDModify(rd *apiv1.ResourceDefinition, patch *resourceDefinitionModify
 	return nil
 }
 
+// flagAndCascadeRDDelete flags the definition DELETE and then cascades the
+// delete to all its child Resource replicas, BEFORE the RD itself is
+// dropped. Without the cascade, child Resources are orphaned: no
+// DeletionTimestamp is ever stamped on them, the satellite reconciler's
+// finalizer chain never fires, and `drbdadm down` never runs, leaving DRBD
+// kernel state (minors, ports, peer entries) live on every satellite. The
+// next RD-create with the same name then collides with a stale port (.res)
+// or sees a half-configured peer.
+//
+// Upstream LINSTOR does this server-side too: deleting an RD flags the RD
+// with DELETE, then walks Resources and stamps DELETE on each. The
+// satellite drives the teardown from there. Our equivalent is: the RD is
+// flagged DELETE first (store.MarkDefinitionDeleting, which keeps the
+// tiebreaker reconciler off it and lifts the mid-sync replica guard), then
+// per-child Resources().Delete() stamps DeletionTimestamp on the CRD; the
+// satellite's existing `blockstor.org/satellite-resource` finalizer then
+// drains DRBD before the apiserver removes the object.
+func (s *Server) flagAndCascadeRDDelete(ctx context.Context, name string) error {
+	err := store.MarkDefinitionDeleting(ctx, s.Store, name)
+	if err != nil {
+		return err //nolint:wrapcheck // answered through writeStoreError by the caller
+	}
+
+	return s.cascadeDeleteResources(ctx, name)
+}
+
 // handleRDDelete drops an RD plus cascades the per-replica teardown.
 //
 // Idempotent on NotFound (Bug 56 sibling): CSI spec § DeleteVolume
@@ -1215,34 +1241,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cascade the delete to all child Resource replicas BEFORE
-	// dropping the RD itself. Without this, child Resources are
-	// orphaned: no DeletionTimestamp is ever stamped on them, the
-	// satellite reconciler's finalizer chain never fires, and
-	// `drbdadm down` never runs — leaving DRBD kernel state
-	// (minors, ports, peer entries) live on every satellite. The
-	// next RD-create with the same name then collides with a
-	// stale port (.res) or sees a half-configured peer.
-	//
-	// Upstream LINSTOR does this server-side too: deleting an RD
-	// flags the RD with DELETE, then walks Resources and stamps
-	// DELETE on each. The satellite drives the teardown from
-	// there. Our equivalent is: the RD is flagged DELETE first
-	// (store.MarkDefinitionDeleting, which keeps the tiebreaker
-	// reconciler off it and lifts the mid-sync replica guard), then
-	// per-child Resources().Delete() stamps DeletionTimestamp on the
-	// CRD; the satellite's
-	// existing `blockstor.org/satellite-resource`
-	// finalizer then drains DRBD before the apiserver removes
-	// the object.
-	err = store.MarkDefinitionDeleting(r.Context(), s.Store, name)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
-	}
-
-	err = s.cascadeDeleteResources(r.Context(), name)
+	err = s.flagAndCascadeRDDelete(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
 
