@@ -290,6 +290,36 @@ func (u *Unlocker) Unlock(ctx context.Context) (Status, error) {
 //
 // It reports whether it created the keyring.
 func Bootstrap(ctx context.Context, writer client.Client, secrets Secrets, now time.Time) (bool, error) {
+	if secrets.Direct == nil {
+		return bootstrap(ctx, writer, secrets, now)
+	}
+
+	// The steady state, a keyring that exists, is answered from Reader.
+	ref, err := ResolveRef(ctx, secrets.Reader)
+	if err != nil || ref.Generated {
+		return false, err
+	}
+
+	ring, _, err := secrets.Keyring(ctx)
+	if err != nil || ring != nil {
+		return false, err
+	}
+
+	pass, _, err := secrets.Passphrase(ctx, ref)
+	clear(pass)
+
+	if err != nil || pass == nil {
+		return false, err
+	}
+
+	// Reader says there is a keyring to create, but a watch trails the
+	// API server: whether one is there by now, which Secret it is
+	// created from and the passphrase it holds are read from Direct.
+	return bootstrap(ctx, writer, secrets.direct(), now)
+}
+
+// bootstrap is Bootstrap with every read through secrets.Reader.
+func bootstrap(ctx context.Context, writer client.Client, secrets Secrets, now time.Time) (bool, error) {
 	ref, err := ResolveRef(ctx, secrets.Reader)
 	if err != nil || ref.Generated {
 		return false, err
@@ -307,14 +337,7 @@ func Bootstrap(ctx context.Context, writer client.Client, secrets Secrets, now t
 
 	defer clear(pass)
 
-	// A watch may not have seen a keyring created a moment ago; refusing
-	// over a keyring that is there would be a false alarm.
-	ring, _, err = secrets.direct().Keyring(ctx)
-	if err != nil || ring != nil {
-		return false, err
-	}
-
-	err = refuseLostKeyring(ctx, secrets.direct().Reader)
+	err = refuseLostKeyring(ctx, secrets.Reader)
 	if err != nil {
 		return false, err
 	}
