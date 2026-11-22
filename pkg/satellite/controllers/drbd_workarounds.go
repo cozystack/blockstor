@@ -289,8 +289,10 @@ func (w *DRBDWorkaroundsRunnable) kernelStatusWanted() bool {
 }
 
 // replica is blockstor's Resource of the kernel resource name on this
-// node, read from the cache; nil when blockstor has none here or the read
-// failed, and then the checks leave the resource alone.
+// node, read from the cache; nil when blockstor has none here, the read
+// failed or the replica is being deleted, and then the checks leave the
+// resource alone. A replica being deleted is the satellite's delete to
+// take down, not a workaround's to demote or restart in the meantime.
 func (w *DRBDWorkaroundsRunnable) replica(ctx context.Context, logger logr.Logger, name string) *blockstoriov1alpha1.Resource {
 	crName, err := replicaCRName(ctx, w.Reader, name, w.NodeName)
 	if err != nil {
@@ -307,6 +309,10 @@ func (w *DRBDWorkaroundsRunnable) replica(ctx context.Context, logger logr.Logge
 			logger.Error(err, "read the replica of a DRBD resource", "resource", name)
 		}
 
+		return nil
+	}
+
+	if !replica.DeletionTimestamp.IsZero() {
 		return nil
 	}
 

@@ -693,3 +693,31 @@ func TestNewDRBDWorkaroundsRunnableWiresConfigHintsAndHold(t *testing.T) {
 		t.Errorf("zero interval: %v", err)
 	}
 }
+
+// A replica whose Resource is being deleted is left to the satellite's
+// delete: no check demotes or restarts it in the meantime.
+func TestWorkaroundsSkipAReplicaBeingDeleted(t *testing.T) {
+	t.Parallel()
+
+	now := metav1.Now()
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              k8s.ResourceCRName("pvc-idle", workaroundNode),
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"blockstor.io/test"},
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-idle", NodeName: workaroundNode},
+	}).Build()
+
+	adm := &fakeWorkaroundAdm{status: idlePrimaryStatus}
+	w, _ := newTestWorkarounds(t, adm, idleConfig())
+	w.Reader = reader
+
+	for range 4 {
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if len(adm.actions) != 0 {
+		t.Errorf("acted on a replica being deleted: %v", adm.actions)
+	}
+}
