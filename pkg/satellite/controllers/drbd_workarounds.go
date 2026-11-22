@@ -67,6 +67,9 @@ type WorkaroundsConfig struct {
 	// with no progress.
 	StalledResync       bool
 	StalledResyncPasses int
+
+	// IdlePrimary demotes a Primary nobody uses (checkIdlePrimary).
+	IdlePrimary bool
 }
 
 // The plunger's cadence: a pass every 30 s, a resync stalled for 4 of
@@ -82,6 +85,7 @@ func DefaultWorkaroundsConfig() WorkaroundsConfig {
 		Interval:            defaultWorkaroundInterval,
 		StalledResync:       true,
 		StalledResyncPasses: defaultStalledResyncPasses,
+		IdlePrimary:         true,
 	}
 }
 
@@ -90,6 +94,7 @@ type workaroundAdm interface {
 	KernelStatus(ctx context.Context) ([]drbd.KernelResource, error)
 	DisconnectPeer(ctx context.Context, resource, peer string) error
 	ConnectPeer(ctx context.Context, resource, peer string) error
+	Secondary(ctx context.Context, resource string) error
 }
 
 // DRBDWorkaroundsRunnable runs the DRBD workarounds on this node.
@@ -111,6 +116,9 @@ type DRBDWorkaroundsRunnable struct {
 
 	// stalls is the resync progress of each resource across passes.
 	stalls map[string]resyncProgress
+
+	// idle counts the passes in a row each resource was an idle Primary.
+	idle map[string]int
 }
 
 // newDRBDWorkaroundsRunnable builds the runnable the manager runs, gated
@@ -168,7 +176,7 @@ func (w *DRBDWorkaroundsRunnable) RegisterWithManager(mgr manager.Manager) error
 // pass runs every enabled check once.
 func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) {
 	if !w.kernelStatusWanted() {
-		w.stalls = nil
+		w.stalls, w.idle = nil, nil
 
 		return
 	}
@@ -181,6 +189,7 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 	}
 
 	stalls := map[string]resyncProgress{}
+	idle := map[string]int{}
 
 	for i := range resources {
 		res := &resources[i]
@@ -201,9 +210,13 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 		if w.Config.StalledResync {
 			w.checkStalledResync(ctx, logger, res, replica, stalls)
 		}
+
+		if w.Config.IdlePrimary {
+			w.checkIdlePrimary(ctx, logger, res, replica, idle)
+		}
 	}
 
-	w.stalls = stalls
+	w.stalls, w.idle = stalls, idle
 }
 
 // kernelStatusWanted reports whether the observer's cache shows a shape an
@@ -215,7 +228,8 @@ func (w *DRBDWorkaroundsRunnable) kernelStatusWanted() bool {
 
 	hints := w.Hints()
 
-	return w.Config.StalledResync && hints.Inconsistent
+	return (w.Config.StalledResync && hints.Inconsistent) ||
+		(w.Config.IdlePrimary && hints.Primary)
 }
 
 // replica is blockstor's Resource of the kernel resource name on this
@@ -317,4 +331,50 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 	// Counting starts over either way: the reconnect needs passes of
 	// its own to show whether the resync moves again.
 	stalls[res.Name] = resyncProgress{Peer: from.Peer, Percent: from.PercentInSync}
+}
+
+// Workaround for DRBD auto-demote not firing
+// (https://github.com/piraeusdatastore/piraeus-operator/issues/942). DRBD
+// promotes a replica when something opens it (auto-promote) and should
+// demote it on the last close; sometimes it does not, and the replica
+// stays Primary on a node where nothing uses it. Every other node then
+// fails to promote, so the volume cannot be attached anywhere else
+// (NodePublishVolume fails with "failed to set source device readwrite"),
+// and deleting it fails too. No volume of the resource open means nobody
+// uses it, so `drbdadm secondary` loses nothing; whoever opens it next is
+// promoted again. Two passes in a row are required, and a resource an
+// apply is changing is skipped (Busy): an auto-promote is Primary with
+// nothing open until its mkfs opens the device. The demote the satellite
+// owes after its own auto-promote is retried by the apply itself
+// (pkg/satellite auto_demote.go); this check covers the kernel's.
+
+// idlePrimaryPasses is how many passes in a row a resource must be an
+// idle Primary before it is demoted.
+const idlePrimaryPasses = 2
+
+// checkIdlePrimary demotes res when it was an idle Primary on
+// idlePrimaryPasses passes in a row.
+func (w *DRBDWorkaroundsRunnable) checkIdlePrimary(
+	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
+	replica *blockstoriov1alpha1.Resource, idle map[string]int,
+) {
+	if !res.IdlePrimary() {
+		return
+	}
+
+	passes := w.idle[res.Name] + 1
+	if passes < idlePrimaryPasses {
+		idle[res.Name] = passes
+
+		return
+	}
+
+	w.acted(logger, replica, res.Name, "DRBDIdlePrimary", fmt.Sprintf(
+		"Primary with no volume open for %d passes: drbdadm secondary "+
+			"(DRBD auto-demote did not fire, piraeus-operator#942)", passes))
+
+	err := w.Adm.Secondary(ctx, res.Name)
+	if err != nil {
+		w.failed(logger, err, res.Name, "demote an idle Primary")
+	}
 }

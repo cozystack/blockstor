@@ -319,3 +319,141 @@ func TestTranslateResourceEventReadsForcedIOFailures(t *testing.T) {
 		t.Errorf("force-io-failures:yes not read: %+v", obs)
 	}
 }
+
+func idleConfig() WorkaroundsConfig {
+	return WorkaroundsConfig{Interval: 1, IdlePrimary: true}
+}
+
+const idlePrimaryStatus = `[{"name":"pvc-idle","role":"Primary",
+ "devices":[{"volume":0,"disk-state":"UpToDate","open":false},{"volume":1,"disk-state":"UpToDate","open":false}]}]`
+
+// piraeus-operator#942, and alpha.15 issue 01 had the kernel side been at
+// fault: a Primary nobody has open is demoted on the second pass in a row.
+func TestIdlePrimaryIsDemotedOnTheSecondPass(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{status: idlePrimaryStatus}
+	w, recorder := newTestWorkarounds(t, adm, idleConfig(), "pvc-idle")
+
+	w.pass(t.Context(), logr.Discard())
+
+	if len(adm.actions) != 0 {
+		t.Fatalf("demoted on the first pass: %v", adm.actions)
+	}
+
+	w.pass(t.Context(), logr.Discard())
+
+	if strings.Join(adm.actions, ",") != "secondary pvc-idle" {
+		t.Fatalf("actions = %v, want secondary pvc-idle", adm.actions)
+	}
+
+	evs := drainEvents(recorder)
+	if len(evs) != 1 || !strings.Contains(evs[0], "Warning DRBDIdlePrimary") {
+		t.Errorf("events = %v, want one Warning DRBDIdlePrimary", evs)
+	}
+}
+
+// A Primary with a volume open, one that was opened in between, and one
+// an apply is changing (an auto-promote before its mkfs) are not demoted.
+func TestIdlePrimaryLeavesUsedPrimariesAlone(t *testing.T) {
+	t.Parallel()
+
+	t.Run("open", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{status: `[{"name":"pvc-idle","role":"Primary",
+ "devices":[{"volume":0,"disk-state":"UpToDate","open":false},{"volume":1,"disk-state":"UpToDate","open":true}]}]`}
+		w, _ := newTestWorkarounds(t, adm, idleConfig(), "pvc-idle")
+
+		for range 4 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 {
+			t.Errorf("demoted a Primary in use: %v", adm.actions)
+		}
+	})
+
+	t.Run("opened-between", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{}
+		w, _ := newTestWorkarounds(t, adm, idleConfig(), "pvc-idle")
+
+		for _, status := range []string{
+			idlePrimaryStatus,
+			`[{"name":"pvc-idle","role":"Primary","devices":[{"volume":0,"disk-state":"UpToDate","open":true}]}]`,
+			idlePrimaryStatus,
+		} {
+			adm.status = status
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 {
+			t.Errorf("demoted a Primary that was not idle two passes in a row: %v", adm.actions)
+		}
+	})
+
+	t.Run("busy", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{status: idlePrimaryStatus}
+		w, _ := newTestWorkarounds(t, adm, idleConfig(), "pvc-idle")
+		w.Busy = func(string) bool { return true }
+
+		for range 4 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 {
+			t.Errorf("demoted a Primary an apply is changing: %v", adm.actions)
+		}
+	})
+
+	t.Run("off", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{status: idlePrimaryStatus}
+		w, _ := newTestWorkarounds(t, adm, WorkaroundsConfig{Interval: 1, StalledResync: true, StalledResyncPasses: 4}, "pvc-idle")
+		hints := WorkaroundHints{Primary: true}
+		w.Hints = func() WorkaroundHints { return hints }
+
+		for range 4 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 || adm.reads != 0 {
+			t.Errorf("check off, only a Primary: actions=%v reads=%d, want none", adm.actions, adm.reads)
+		}
+
+		// Another check reads the status: the idle Primary in it is
+		// still left alone.
+		hints.Inconsistent = true
+
+		for range 4 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 || adm.reads == 0 {
+			t.Errorf("check off, status read: actions=%v reads=%d, want none and some", adm.actions, adm.reads)
+		}
+	})
+}
+
+// A check turned off leaves its shape alone even when another check has
+// the kernel status read.
+func TestStalledResyncOffLeavesAStallAlone(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{status: `[` + strings.Trim(stalledStatus("42.17"), "[]") + `,` +
+		strings.Trim(idlePrimaryStatus, "[]") + `]`}
+	w, _ := newTestWorkarounds(t, adm, idleConfig(), "pvc-stall")
+
+	for range 6 {
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if adm.reads == 0 || len(adm.actions) != 0 {
+		t.Errorf("stall check off: reads=%d actions=%v, want some and none", adm.reads, adm.actions)
+	}
+}
