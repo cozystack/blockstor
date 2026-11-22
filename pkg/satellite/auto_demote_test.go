@@ -246,3 +246,38 @@ func TestAutoSecondaryOwedDemoteIsPaced(t *testing.T) {
 		t.Errorf("apply within the pacing interval: ok=%v demotes=%d, want true, 0", ok, demotes)
 	}
 }
+
+// An owed demote that a later apply retries and that fails for another
+// reason than a held-open device, say a peer refusing the state change
+// for a while, does not fail that apply: the debt stays and the next
+// try waits out the pacing interval like a held-open device does.
+func TestOwedDemoteOtherFailureDoesNotFailLaterApplies(t *testing.T) {
+	t.Parallel()
+
+	rec, fx, dr, owed := demoteFixture(t)
+	fx.ExpectSequence(demoteSecondary,
+		storage.FakeResponse{Err: errHeldOpen},
+		storage.FakeResponse{Err: errHeldOpen},
+		storage.FakeResponse{Err: errSecondaryOther})
+
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !demoteOwed(t, owed) {
+		t.Fatal("the demote that did not go through is not owed")
+	}
+
+	rec.SetDemoteRetryForTest(nil, time.Hour)
+
+	ok, demotes := steadyApply(t, rec, fx, dr)
+	if !ok || demotes != 1 || !demoteOwed(t, owed) {
+		t.Errorf("apply whose owed demote failed: ok=%v demotes=%d owed=%v, want true, 1, true",
+			ok, demotes, demoteOwed(t, owed))
+	}
+
+	if ok, demotes := steadyApply(t, rec, fx, dr); !ok || demotes != 0 {
+		t.Errorf("apply within the pacing interval: ok=%v demotes=%d, want true, 0", ok, demotes)
+	}
+}

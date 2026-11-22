@@ -56,7 +56,11 @@ import (
 // failure: right after mkfs the demote is retried a few times within the
 // apply, and if the device is still held open it stays owed and is retried
 // by later applies until whoever holds the device lets go. Any other
-// demote error fails the apply as before.
+// demote error right after mkfs fails the apply as before. A later
+// apply that retries an owed demote does not fail on it: it logs the
+// error, keeps the debt and goes on, so a peer refusing the state change
+// for a while does not block the resize or promote that apply carries;
+// the next try waits pendingDemoteRetry, as for a held-open device.
 
 // demotePendingSuffix names the state file recording that this satellite
 // promoted a replica itself and has not yet seen it demoted.
@@ -110,8 +114,8 @@ func (d *demoteRetry) due(name string) bool {
 	return !ok || !d.now().Before(next)
 }
 
-// heldOpen paces the next try of name after the device was held open.
-func (d *demoteRetry) heldOpen(name string) {
+// later paces the next try of name after a demote did not go through.
+func (d *demoteRetry) later(name string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -207,7 +211,7 @@ func (r *Reconciler) autoSecondary(ctx context.Context, name string) error {
 	case err == nil:
 		return r.settlePendingDemote(name)
 	case drbd.IsDeviceHeldOpenErr(err) && r.demotePendingPath(name) != "":
-		r.demotes.heldOpen(name)
+		r.demotes.later(name)
 
 		log.FromContext(ctx).Info("auto-secondary: the device is still held open; the demote is owed and retried by a later apply",
 			"resource", name, "retryAfter", r.demotes.every.String(), "err", err.Error())
@@ -219,8 +223,8 @@ func (r *Reconciler) autoSecondary(ctx context.Context, name string) error {
 }
 
 // retryPendingDemote tries the demote name still owes from an earlier
-// auto-promote, at most once per pendingDemoteRetry while the device stays
-// held open.
+// auto-promote, at most once per pendingDemoteRetry while it does not go
+// through. A demote that fails keeps the debt and never fails the apply.
 func (r *Reconciler) retryPendingDemote(ctx context.Context, name string) error {
 	if r.cfg.Adm == nil || !r.demoteOwed(name) || !r.demotes.due(name) {
 		return nil
@@ -235,13 +239,18 @@ func (r *Reconciler) retryPendingDemote(ctx context.Context, name string) error 
 
 		return r.settlePendingDemote(name)
 	case drbd.IsDeviceHeldOpenErr(err):
-		r.demotes.heldOpen(name)
+		r.demotes.later(name)
 
 		log.FromContext(ctx).V(1).Info("auto-secondary: the device is still held open; the demote stays owed",
 			"resource", name, "retryAfter", r.demotes.every.String())
 
 		return nil
 	default:
-		return errors.Wrapf(err, "auto-secondary %s", name)
+		r.demotes.later(name)
+
+		log.FromContext(ctx).Error(err, "auto-secondary: the demote owed since the auto-promote failed; it stays owed",
+			"resource", name, "retryAfter", r.demotes.every.String())
+
+		return nil
 	}
 }
