@@ -21,6 +21,7 @@ package satellite_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/satellite"
@@ -90,5 +91,77 @@ func TestBusyWhileApplyingOrDeleting(t *testing.T) {
 
 	if !busyInside || rec.Busy("pvc-busy") {
 		t.Errorf("delete: busy inside=%v, after=%v; want true, false", busyInside, rec.Busy("pvc-busy"))
+	}
+}
+
+// A workaround's hold keeps an apply of the resource from starting until
+// it is released, and is refused while an apply runs, so the satellite's
+// own up/adjust never runs between a workaround's down and up.
+func TestHoldKeepsAppliesOut(t *testing.T) {
+	t.Parallel()
+
+	var holdDuringApply bool
+
+	var rec *satellite.Reconciler
+
+	exec := &probeExec{FakeExec: storage.NewFakeExec()}
+	exec.probe = func() {
+		if release, ok := rec.Hold("pvc-held"); ok {
+			holdDuringApply = true
+
+			release()
+		}
+	}
+
+	rec = satellite.NewReconciler(satellite.ReconcilerConfig{
+		Adm:      drbd.NewAdm(exec),
+		Exec:     exec,
+		StateDir: t.TempDir(),
+		NodeName: "n1",
+	})
+
+	release, ok := rec.Hold("pvc-held")
+	if !ok {
+		t.Fatal("hold of an idle resource refused")
+	}
+
+	if _, again := rec.Hold("pvc-held"); again {
+		t.Error("a second hold of the same resource went through")
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		_, err := rec.Apply(context.Background(), []*intent.DesiredResource{{
+			Name: "pvc-held", NodeName: "n1", Flags: []string{"DISKLESS"},
+			Volumes:     []*intent.DesiredVolume{{VolumeNumber: 0, SizeKib: 1024}},
+			DrbdOptions: map[string]string{"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000"},
+		}})
+		if err != nil {
+			t.Errorf("Apply: %v", err)
+		}
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("the apply ran while a workaround held the resource")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if n := len(exec.CommandLines()); n != 0 {
+		t.Fatalf("the apply ran %d commands while the resource was held", n)
+	}
+
+	release()
+	<-done
+
+	if holdDuringApply {
+		t.Error("a hold went through while the apply ran")
+	}
+
+	if _, ok := rec.Hold("pvc-held"); !ok {
+		t.Error("hold refused after the apply returned")
 	}
 }

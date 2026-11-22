@@ -234,8 +234,7 @@ func TestStalledResyncSkipsForeignAndBusyResources(t *testing.T) {
 		adm := &fakeWorkaroundAdm{status: stalledStatus("42.17")}
 		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
 
-		busy := true
-		w.Busy = func(string) bool { return busy }
+		w.Hold = func(string) (func(), bool) { return nil, false }
 
 		for range 6 {
 			w.pass(t.Context(), logr.Discard())
@@ -404,7 +403,7 @@ func TestIdlePrimaryLeavesUsedPrimariesAlone(t *testing.T) {
 
 		adm := &fakeWorkaroundAdm{status: idlePrimaryStatus}
 		w, _ := newTestWorkarounds(t, adm, idleConfig(), "pvc-idle")
-		w.Busy = func(string) bool { return true }
+		w.Hold = func(string) (func(), bool) { return nil, false }
 
 		for range 4 {
 			w.pass(t.Context(), logr.Discard())
@@ -651,7 +650,7 @@ func TestStaleLoopDevicesOffDetachesNothing(t *testing.T) {
 
 // The manager's runnable reads its checks from the satellite's config,
 // its hints from the observer and its busy resources from the apply.
-func TestNewDRBDWorkaroundsRunnableWiresConfigHintsAndBusy(t *testing.T) {
+func TestNewDRBDWorkaroundsRunnableWiresConfigHintsAndHold(t *testing.T) {
 	t.Parallel()
 
 	cfg := &Config{
@@ -673,9 +672,20 @@ func TestNewDRBDWorkaroundsRunnableWiresConfigHintsAndBusy(t *testing.T) {
 		t.Error("hints are not the observer's")
 	}
 
-	if w.Busy == nil || w.Busy("a") {
-		t.Error("busy is not the apply's")
+	if w.Hold == nil {
+		t.Fatal("no hold")
 	}
+
+	release, ok := w.Hold("a")
+	if !ok {
+		t.Fatal("hold of an idle resource refused")
+	}
+
+	if _, again := cfg.Apply.Hold("a"); again {
+		t.Error("hold is not the apply's: the apply does not see it")
+	}
+
+	release()
 
 	// A zero interval registers nothing (and touches no manager).
 	off := &DRBDWorkaroundsRunnable{}

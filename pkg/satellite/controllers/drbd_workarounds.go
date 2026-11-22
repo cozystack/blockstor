@@ -57,9 +57,10 @@ import (
 // whose replicas are all Secondary and UpToDate runs no command and makes
 // no API call. A check acts only on a resource blockstor has a replica of
 // on this node (the kernel is shared with LINSTOR during a migration),
-// never on one an apply or delete is changing at that moment, and every
-// action it takes is logged and recorded as a Warning Event on the
-// replica's Resource.
+// never on one an apply or delete is changing at that moment, and holds
+// the resource while it looks and acts, so no apply or delete of it
+// starts meanwhile (Hold). Every action it takes is logged and recorded
+// as a Warning Event on the replica's Resource.
 
 // WorkaroundsConfig turns the DRBD workarounds on and off.
 type WorkaroundsConfig struct {
@@ -126,9 +127,11 @@ type DRBDWorkaroundsRunnable struct {
 	// every pass.
 	Hints func() WorkaroundHints
 
-	// Busy reports a resource an apply or delete is changing right now;
-	// nil reports none.
-	Busy func(name string) bool
+	// Hold claims a resource for the checks of one pass, so no apply or
+	// delete of it starts until the returned func runs; false while one
+	// is running, and the checks then leave the resource alone. nil
+	// claims every resource.
+	Hold func(name string) (func(), bool)
 
 	// SysBlock is where the block devices are listed in sysfs; empty
 	// means /sys/block.
@@ -157,7 +160,7 @@ func newDRBDWorkaroundsRunnable(cli client.Client, cfg *Config, observer *Observ
 		NodeName: cfg.NodeName,
 		Config:   cfg.Workarounds,
 		Hints:    observer.WorkaroundHints,
-		Busy:     cfg.Apply.Busy,
+		Hold:     cfg.Apply.Hold,
 	}
 }
 
@@ -223,33 +226,52 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 	for i := range resources {
 		res := &resources[i]
 
-		if w.Busy != nil && w.Busy(res.Name) {
-			if progress, ok := w.stalls[res.Name]; ok {
+		release, ok := w.hold(res.Name)
+		if !ok {
+			if progress, seen := w.stalls[res.Name]; seen {
 				stalls[res.Name] = progress
 			}
 
 			continue
 		}
 
-		replica := w.replica(ctx, logger, res.Name)
-		if replica == nil {
-			continue
-		}
-
-		if w.Config.StalledResync {
-			w.checkStalledResync(ctx, logger, res, replica, stalls)
-		}
-
-		if w.Config.IdlePrimary {
-			w.checkIdlePrimary(ctx, logger, res, replica, idle)
-		}
-
-		if w.Config.ForcedIOFailures {
-			w.checkForcedIOFailures(ctx, logger, res, replica, failingIO)
-		}
+		w.checkResource(ctx, logger, res, stalls, idle, failingIO)
+		release()
 	}
 
 	w.stalls, w.idle, w.failingIO = stalls, idle, failingIO
+}
+
+// hold claims name for this pass's checks; see Hold.
+func (w *DRBDWorkaroundsRunnable) hold(name string) (func(), bool) {
+	if w.Hold == nil {
+		return func() {}, true
+	}
+
+	return w.Hold(name)
+}
+
+// checkResource runs the enabled checks on res while it is held.
+func (w *DRBDWorkaroundsRunnable) checkResource(
+	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
+	stalls map[string]resyncProgress, idle, failingIO map[string]int,
+) {
+	replica := w.replica(ctx, logger, res.Name)
+	if replica == nil {
+		return
+	}
+
+	if w.Config.StalledResync {
+		w.checkStalledResync(ctx, logger, res, replica, stalls)
+	}
+
+	if w.Config.IdlePrimary {
+		w.checkIdlePrimary(ctx, logger, res, replica, idle)
+	}
+
+	if w.Config.ForcedIOFailures {
+		w.checkForcedIOFailures(ctx, logger, res, replica, failingIO)
+	}
 }
 
 // kernelStatusWanted reports whether the observer's cache shows a shape an
@@ -377,7 +399,7 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 // and deleting it fails too. No volume of the resource open means nobody
 // uses it, so `drbdadm secondary` loses nothing; whoever opens it next is
 // promoted again. Two passes in a row are required, and a resource an
-// apply is changing is skipped (Busy): an auto-promote is Primary with
+// apply is changing is skipped (Hold): an auto-promote is Primary with
 // nothing open until its mkfs opens the device. The demote the satellite
 // owes after its own auto-promote is retried by the apply itself
 // (pkg/satellite auto_demote.go); this check covers the kernel's.
