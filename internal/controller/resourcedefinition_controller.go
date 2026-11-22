@@ -1707,6 +1707,10 @@ func (r *ResourceDefinitionReconciler) stampResizePending(ctx context.Context, r
 
 		err = r.stampResizePendingOnResource(ctx, rd, &resList.Items[i])
 		if err != nil && !apierrors.IsNotFound(err) {
+			// Usually a conflict with the satellite's write over the
+			// cached copy. The RD has no periodic pass to retry it in.
+			askRDRetry(ctx, rdReconcileRequeue)
+
 			logf.FromContext(ctx).Info("stampResizePending: update skipped",
 				"resource", resList.Items[i].Name, "err", err.Error())
 		}
