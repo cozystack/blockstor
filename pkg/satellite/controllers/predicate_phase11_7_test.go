@@ -20,6 +20,7 @@ package controllers
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"testing"
 	"time"
@@ -462,6 +463,74 @@ func TestObserverEmitsTriggerOnDiskChange(t *testing.T) {
 	got := readOneTrigger(t, ch)
 	if got.Object.GetName() != "pvc-1.n1" {
 		t.Errorf("trigger object name: got %q, want pvc-1.n1", got.Object.GetName())
+	}
+}
+
+// TestObserverEmitsTriggerOnPeerRoleChange: the latch-free mkfs retry
+// and the recovery and late-add promotes refuse while a connected peer
+// is Primary and wait for it to step down. The step-down reaches this
+// node only as a connection frame carrying the peer's role, and the
+// periodic re-check that used to come back for the refused step is
+// gone; so a peer's role change wakes the local replica, and a frame
+// that repeats the role does not.
+func TestObserverEmitsTriggerOnPeerRoleChange(t *testing.T) {
+	t.Parallel()
+
+	observer, ch, adm := newTriggerObserver(t, 4)
+
+	frame := func(fields map[string]string) *observation {
+		t.Helper()
+
+		all := map[string]string{"name": "pvc-1", "peer-node-id": "1", "conn-name": "n2"}
+		maps.Copy(all, fields)
+
+		obs, ok := translateEvent(drbd.Event{Action: eventActionChange, Kind: eventKindConnection, Fields: all})
+		if !ok {
+			t.Fatalf("frame %v dropped", fields)
+		}
+
+		return &obs
+	}
+
+	observer.handleObservation(context.Background(), adm,
+		frame(map[string]string{"connection": "Connected", "role": "Primary"}))
+	readOneTrigger(t, ch)
+
+	// drbd-reactor demotes after a failed mount: a change frame that
+	// carries the role alone.
+	observer.handleObservation(context.Background(), adm, frame(map[string]string{"role": "Secondary"}))
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "pvc-1.n1" {
+		t.Errorf("trigger %q, want pvc-1.n1", got.Object.GetName())
+	}
+
+	if c := observer.connCache["pvc-1"]["n2"]; !c.Connected || c.Message != "Connected" {
+		t.Errorf("a role-only frame changed the connection state: %+v", c)
+	}
+
+	observer.handleObservation(context.Background(), adm, frame(map[string]string{"role": "Secondary"}))
+	assertNoTrigger(t, ch)
+}
+
+// TestObserverRoleFrameNeedsAKnownPeer: a role alone does not make a
+// peer, and a peer that drops its connection has no role the observer
+// knows.
+func TestObserverRoleFrameNeedsAKnownPeer(t *testing.T) {
+	t.Parallel()
+
+	peers := map[string]connectionObservation{}
+
+	mergeConnectionInto(peers, &connectionObservation{PeerNodeName: "n2", PeerRole: "Primary"})
+
+	if _, ok := peers["n2"]; ok {
+		t.Fatal("a role-only frame created a peer")
+	}
+
+	mergeConnectionInto(peers, &connectionObservation{PeerNodeName: "n2", Connected: true, Message: "Connected", PeerRole: "Primary"})
+	mergeConnectionInto(peers, &connectionObservation{PeerNodeName: "n2", Message: "Connecting"})
+
+	if role := peers["n2"].PeerRole; role != "" {
+		t.Errorf("a disconnected peer kept the role %q", role)
 	}
 }
 

@@ -184,6 +184,10 @@ type peerVolumeObservation struct {
 // volume number. Stitched per-volume by mergeConnections so a
 // peer-device frame covering one volume doesn't blank the cached
 // view of the other.
+//
+// PeerRole is the peer's DRBD role (the `role:` field of connection
+// frames), empty when unknown. It is not published; a change of it
+// wakes the local replica (lifecycleSignature).
 type connectionObservation struct {
 	PeerNodeName     string
 	Connected        bool
@@ -191,6 +195,7 @@ type connectionObservation struct {
 	ReplicationState string
 	PeerDRBDNodeID   *int32
 	PeerVolumes      []peerVolumeObservation
+	PeerRole         string
 
 	Removed bool
 }
@@ -244,7 +249,10 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 			}, true
 		}
 
-		if state == "" {
+		// A change frame carries only what changed: a peer promoted
+		// while connected sends its role alone.
+		role := ev.Fields["role"]
+		if state == "" && role == "" {
 			return observation{}, false
 		}
 
@@ -255,6 +263,7 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 				Connected:      state == drbdStateConnected,
 				Message:        state,
 				PeerDRBDNodeID: parsePeerNodeID(ev.Fields["peer-node-id"]),
+				PeerRole:       role,
 			}},
 		}, true
 	}
@@ -792,10 +801,16 @@ type volumeLifecycle struct {
 }
 
 // connectionLifecycle is the per-peer slice of lifecycleSignature.
+//
+// PeerRole is in it because several local decisions refuse while a
+// peer is Primary (the latch-free mkfs retry, the recovery and late-add
+// promotes) and wait for the peer to step down; no other frame and no
+// write to the peer's Resource reports that step-down to this node.
 type connectionLifecycle struct {
 	Connected        bool
 	Message          string
 	ReplicationState string
+	PeerRole         string
 	// peerDisk keyed by VolumeNumber. The peer's view of a
 	// volume's disk-state matters for partition recovery: a peer
 	// disk flipping to Outdated is the signal that triggers our
@@ -1324,6 +1339,7 @@ func (o *ObserverRunnable) lifecycleSnapshotLocked(name string) lifecycleSignatu
 				Connected:        c.Connected,
 				Message:          c.Message,
 				ReplicationState: c.ReplicationState,
+				PeerRole:         c.PeerRole,
 				PeerDisk:         peerDisk,
 			}
 		}
@@ -1396,7 +1412,8 @@ func connectionLifecycleMapsEqual(left, right map[string]connectionLifecycle) bo
 
 		if leftConn.Connected != rightConn.Connected ||
 			leftConn.Message != rightConn.Message ||
-			leftConn.ReplicationState != rightConn.ReplicationState {
+			leftConn.ReplicationState != rightConn.ReplicationState ||
+			leftConn.PeerRole != rightConn.PeerRole {
 			return false
 		}
 
@@ -1701,44 +1718,8 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 	// also removes its per-volume `peer-disk` view, so the partition
 	// e2e tests don't see a stale PeerDiskState lingering on a peer
 	// that has been del-peer'd.
-	for _, c := range ev.Connections {
-		if c.Removed {
-			delete(peers, c.PeerNodeName)
-
-			continue
-		}
-
-		merged := peers[c.PeerNodeName]
-		merged.PeerNodeName = c.PeerNodeName
-
-		if c.Message != "" {
-			merged.Connected = c.Connected
-			merged.Message = c.Message
-		}
-
-		if c.ReplicationState != "" {
-			merged.ReplicationState = c.ReplicationState
-		}
-
-		// PeerDRBDNodeID arrives on both connection-kind and
-		// peer-device-kind frames. nil means "frame didn't carry
-		// the field" — preserve the cached value so a partial
-		// peer-device frame after a connection event doesn't
-		// blank the id.
-		if c.PeerDRBDNodeID != nil {
-			merged.PeerDRBDNodeID = c.PeerDRBDNodeID
-		}
-
-		// PeerVolumes merges per-volume so a peer-device frame
-		// covering volume 0 doesn't blank the cached peer-disk
-		// view of volume 1 on the same peer. Stitch by
-		// VolumeNumber into a per-peer map and re-emit a sorted
-		// slice deterministically (test predictability).
-		if len(c.PeerVolumes) > 0 {
-			merged.PeerVolumes = mergePeerVolumesInto(merged.PeerVolumes, c.PeerVolumes)
-		}
-
-		peers[c.PeerNodeName] = merged
+	for i := range ev.Connections {
+		mergeConnectionInto(peers, &ev.Connections[i])
 	}
 
 	// Only overwrite the slice when this event actually carried
@@ -1754,6 +1735,69 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 	}
 
 	ev.Connections = snapshot
+}
+
+// mergeConnectionInto folds connection frame c into peers.
+func mergeConnectionInto(peers map[string]connectionObservation, c *connectionObservation) {
+	if c.Removed {
+		delete(peers, c.PeerNodeName)
+
+		return
+	}
+
+	merged, known := peers[c.PeerNodeName]
+	if !known && c.Message == "" && c.ReplicationState == "" && len(c.PeerVolumes) == 0 {
+		// A role alone does not make a peer: the frame that
+		// creates the connection carries its state.
+		return
+	}
+
+	merged.PeerNodeName = c.PeerNodeName
+
+	if c.Message != "" {
+		merged.Connected = c.Connected
+		merged.Message = c.Message
+	}
+
+	merged.PeerRole = mergePeerRole(merged.PeerRole, c)
+
+	if c.ReplicationState != "" {
+		merged.ReplicationState = c.ReplicationState
+	}
+
+	// PeerDRBDNodeID arrives on both connection-kind and
+	// peer-device-kind frames. nil means "frame didn't carry
+	// the field" — preserve the cached value so a partial
+	// peer-device frame after a connection event doesn't
+	// blank the id.
+	if c.PeerDRBDNodeID != nil {
+		merged.PeerDRBDNodeID = c.PeerDRBDNodeID
+	}
+
+	// PeerVolumes merges per-volume so a peer-device frame
+	// covering volume 0 doesn't blank the cached peer-disk
+	// view of volume 1 on the same peer. Stitch by
+	// VolumeNumber into a per-peer map and re-emit a sorted
+	// slice deterministically (test predictability).
+	if len(c.PeerVolumes) > 0 {
+		merged.PeerVolumes = mergePeerVolumesInto(merged.PeerVolumes, c.PeerVolumes)
+	}
+
+	peers[c.PeerNodeName] = merged
+}
+
+// mergePeerRole is the peer role cached after frame c: the role c
+// carries, none once c reports the peer out of reach without one, else
+// the cached one.
+func mergePeerRole(cached string, c *connectionObservation) string {
+	switch {
+	case c.PeerRole != "":
+		return c.PeerRole
+	case c.Message != "" && !c.Connected:
+		return ""
+	default:
+		return cached
+	}
 }
 
 // writeStatus applies the observation onto the matching Resource
