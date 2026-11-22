@@ -771,10 +771,9 @@ type ObserverRunnable struct {
 // whether the new observation represents a kernel-state lifecycle
 // change worth waking the reconciler on. Out-of-sync deltas and
 // other statistics-tick values are intentionally NOT part of the
-// signature — they fire too often to be a useful trigger, and the
-// observer's 5-second resync ticker + the reconciler's
-// RequeueAfter cover any wake-up that would otherwise have come
-// from a missed statistics frame.
+// signature — they fire too often to be a useful trigger, and no
+// local decision waits on one. Nothing periodic wakes the reconciler,
+// so a field a decision does wait on belongs in the signature.
 type lifecycleSignature struct {
 	// Role, DrbdState, Suspended come from resource / device kind
 	// frames. Role transitions (Secondary → Primary) and disk-state
@@ -1271,8 +1270,16 @@ func (o *ObserverRunnable) emitReconcileTrigger(ctx context.Context, ev *observa
 
 	name, err := replicaCRName(ctx, o.Client, ev.ResourceName, o.NodeName)
 	if err != nil {
-		// No local replica to wake: it is not in the cache yet, and its
-		// creation starts its first pass.
+		// The definition or node read failed (a missing object is no
+		// error). The signature is already cached, so an identical
+		// next frame would be taken for one already delivered: forget
+		// it, and the next frame wakes the replica.
+		o.lifecycleMu.Lock()
+		delete(o.lifecycleCache, ev.ResourceName)
+		o.lifecycleMu.Unlock()
+
+		log.FromContext(ctx).Error(err, "name the local replica to wake", "resource", ev.ResourceName)
+
 		return
 	}
 

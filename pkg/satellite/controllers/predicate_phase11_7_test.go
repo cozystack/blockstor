@@ -22,6 +22,7 @@ import (
 	"context"
 	"maps"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -496,6 +497,56 @@ func TestObserverCoalescesWakeUpsTheTriggerHasNoRoomFor(t *testing.T) {
 
 	if wakeUps < 1 || wakeUps > 2 {
 		t.Errorf("%d wake-ups of pvc-1.n1 for 50 changes behind a full channel, want 1 or 2", wakeUps)
+	}
+}
+
+// TestObserverWakesAfterAFailedNameRead: the observer names the local
+// replica to wake from the definition and node it reads. When that read
+// fails the wake-up cannot go out, and the next frame with the same
+// state must not be taken for one already delivered: nothing periodic
+// would wake the replica after it.
+func TestObserverWakesAfterAFailedNameRead(t *testing.T) {
+	t.Parallel()
+
+	var failing atomic.Bool
+
+	failing.Store(true)
+
+	cli := fake.NewClientBuilder().
+		WithScheme(newToggleDiskTestScheme(t)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*blockstoriov1alpha1.ResourceDefinition); ok && failing.Load() {
+					return apierrors.NewServiceUnavailable("apiserver hiccup")
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	fx := storage.NewFakeExec()
+	ch := make(chan event.GenericEvent, 4)
+	observer := &ObserverRunnable{Client: cli, Exec: fx, NodeName: "n1", ReconcileTrigger: ch}
+	adm := drbd.NewAdm(fx)
+
+	frame := func() *observation {
+		return &observation{
+			ResourceName: "pvc-1",
+			DrbdState:    "UpToDate",
+			Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: "UpToDate"}},
+		}
+	}
+
+	observer.handleObservation(t.Context(), adm, frame())
+	assertNoTrigger(t, ch)
+
+	failing.Store(false)
+
+	observer.handleObservation(t.Context(), adm, frame())
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "pvc-1.n1" {
+		t.Errorf("trigger %q, want pvc-1.n1", got.Object.GetName())
 	}
 }
 
