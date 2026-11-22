@@ -91,3 +91,15 @@ func TestGroupCreationBringsItsRDsBack(t *testing.T) {
 		t.Error("a group's creation did not bring its RDs back")
 	}
 }
+
+// TestGroupDeletionBringsItsRDsBack: an RD whose stack lacks a layer of
+// its group's carries the unapplied-group annotation, and loses it once
+// the group is gone. The RD's own pass is what drops it, and with no
+// periodic pass left only the group's deletion brings the RD back.
+func TestGroupDeletionBringsItsRDsBack(t *testing.T) {
+	t.Parallel()
+
+	if !groupLayerStackChanged().Delete(event.DeleteEvent{Object: watchGroup("LUKS", "DRBD", "STORAGE")}) {
+		t.Error("a group's deletion did not bring its RDs back")
+	}
+}
