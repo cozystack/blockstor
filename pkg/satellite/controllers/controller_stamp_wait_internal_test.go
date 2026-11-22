@@ -260,3 +260,103 @@ func TestAWaitForTheControllerPastAMinuteIsReportedOnce(t *testing.T) {
 		t.Errorf("Event %q, want a WaitingForController Warning on the pass a minute into the wait", reported[0])
 	}
 }
+
+// A fresh replica the satellite sees before it has its storage pool
+// waits for the pool like for the controller's other stamps: no
+// ApplyFailed Warning, no back-off, and no "succeeded after failures"
+// once the pool lands and the apply goes through.
+func TestAReplicaWithoutItsPoolYetIsNotAFailedApply(t *testing.T) {
+	t.Parallel()
+
+	rd := groupMemberRD("STORAGE")
+	res := memberReplica()
+	res.Spec.StoragePool = ""
+	r := newPassphraseTestReconciler(t, luksGroup(), rd, res)
+
+	recorder := events.NewFakeRecorder(16)
+	r.Config.Recorder = recorder
+	r.Config.Exec = storage.NewFakeExec()
+	r.Config.Apply = satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"pool-a": &scriptedCreateProvider{}},
+		NodeName:  "node-a",
+	})
+
+	result, err := r.runApply(t.Context(), res, logr.Discard())
+	if err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	if result.RequeueAfter != applyFailureRequeue {
+		t.Fatalf("the pass without a pool requeued after %v, want the wait's %v", result.RequeueAfter, applyFailureRequeue)
+	}
+
+	res.Spec.StoragePool = "pool-a"
+
+	result, err = r.runApply(t.Context(), res, logr.Discard())
+	if err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	if result.RequeueAfter != 0 {
+		t.Fatalf("the pass with the pool requeued after %v, want no requeue", result.RequeueAfter)
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		t.Fatalf("a replica waiting for its pool emitted %q, want no Event", ev)
+	default:
+	}
+}
+
+// A replica still without a pool once the satellite's wait for it is
+// over was created or promoted without one, and nothing on the
+// controller side will give it one. Its apply is then a failed apply
+// with an ApplyFailed Warning that says how to name the pool, not a
+// WaitingForController report that sends the operator to a controller
+// with nothing to stamp.
+func TestAReplicaStillWithoutAPoolIsAFailedApply(t *testing.T) {
+	t.Parallel()
+
+	const dwell = 20 * time.Millisecond
+
+	rd := groupMemberRD("STORAGE")
+	res := memberReplica()
+	res.Spec.StoragePool = ""
+	r := newPassphraseTestReconciler(t, luksGroup(), rd, res)
+
+	recorder := events.NewFakeRecorder(16)
+	r.Config.Recorder = recorder
+	r.Config.Exec = storage.NewFakeExec()
+	r.Config.Apply = satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:           map[string]storage.Provider{"pool-a": &scriptedCreateProvider{}},
+		NodeName:            "node-a",
+		UnresolvedPoolDwell: dwell,
+	})
+
+	_, err := r.runApply(t.Context(), res, logr.Discard())
+	if err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		t.Fatalf("the first pass without a pool emitted %q, want a silent wait", ev)
+	default:
+	}
+
+	time.Sleep(2 * dwell)
+
+	_, err = r.runApply(t.Context(), res, logr.Discard())
+	if err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "Warning "+applyFailedReason) || !strings.Contains(ev, "--storage-pool") {
+			t.Errorf("Event %q, want an ApplyFailed Warning naming --storage-pool", ev)
+		}
+	default:
+		t.Fatalf("the pass past the wait emitted no Event, want an ApplyFailed Warning")
+	}
+}

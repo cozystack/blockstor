@@ -74,6 +74,8 @@ The satellite retries the apply with a full `drbdadm adjust`, never with `--skip
 
 A new replica whose apply waits for the controller to give it its DRBD node id or its initial-sync decision is not a failed apply: it leaves no Event, does not count toward the back-off, and is tried again every five seconds and as soon as the controller writes the Resource. A wait that lasts more than a minute leaves one Warning `WaitingForController` Event on the Resource, naming what it waits for: the controller is then down, or cannot stamp the replica, and the controller log says why.
 
+A diskful replica that names no storage pool waits for one the same way, but for 30 seconds only. A new replica can be seen a moment before the write that gives it its pool, and that write lands within seconds. A replica still without a pool after that was created or converted to diskful without one, and nothing gives it one later, so its apply fails with an `ApplyFailed` Warning, `no storage pool resolved for the diskful replica`, and is retried with the back-off above. Name the pool with `linstor r td <node> <rd> --storage-pool <pool>`, or set `StorPoolName` on the resource definition, and the next retry goes through.
+
 ## Inconsistent or SyncTarget that never finishes
 
 Look at the disk state of each replica and at the replication state towards the peer that should be the source:
