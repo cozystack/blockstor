@@ -158,3 +158,51 @@ func TestRDComesBackWhenAWitnessDeadlinePasses(t *testing.T) {
 		t.Errorf("a passed deadline brought the RD back after %v", result.RequeueAfter)
 	}
 }
+
+// A witness held off a node because a survivor's kernel still holds its
+// old connection there waits for the survivor's del-peer, a status write
+// the Resource watch does not pass on. The pass asks for the next one
+// itself, and the witness lands once the connection is gone.
+func TestWitnessHeldByAStaleConnectionComesBack(t *testing.T) {
+	t.Parallel()
+
+	rec, inner, _ := tiebreakerFixture(t, nil)
+	ctx := context.Background()
+
+	setPeers := func(node string, peers ...string) {
+		t.Helper()
+
+		res, err := inner.Resources().Get(ctx, "pvc-settle", node)
+		if err != nil {
+			t.Fatalf("get %s: %v", node, err)
+		}
+
+		withKernelPeers(&res, peers...)
+
+		err = inner.Resources().Update(ctx, &res)
+		if err != nil {
+			t.Fatalf("update %s: %v", node, err)
+		}
+	}
+
+	setPeers("n1", "n2", "n3")
+	setPeers("n2", "n1")
+
+	if result := reconcileSettle(t, rec); result.RequeueAfter != controllerpkg.RDReconcileRequeue {
+		t.Fatalf("a witness held by a stale connection came back after %v, want %v", result.RequeueAfter, controllerpkg.RDReconcileRequeue)
+	}
+
+	if _, err := inner.Resources().Get(ctx, "pvc-settle", "n3"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("witness placed on n3 while n1 still holds its old connection (err=%v)", err)
+	}
+
+	setPeers("n1", "n2")
+
+	if result := reconcileSettle(t, rec); result.RequeueAfter != 0 {
+		t.Errorf("the pass that placed the witness asked to come back after %v", result.RequeueAfter)
+	}
+
+	if _, err := inner.Resources().Get(ctx, "pvc-settle", "n3"); errors.Is(err, store.ErrNotFound) {
+		t.Fatal("the witness never landed on n3")
+	}
+}

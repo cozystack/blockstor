@@ -1458,10 +1458,16 @@ func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context,
 		return err
 	}
 
+	hosting := make(map[string]bool, len(live))
+	held := make(map[string]bool)
+
 	for i := range live {
+		hosting[naming.Key(live[i].NodeName)] = true
+
 		if !offline[naming.Key(live[i].NodeName)] {
 			for _, peer := range kernelPeersOf(&live[i]) {
 				excluded[naming.Key(peer)] = true
+				held[naming.Key(peer)] = true
 			}
 		}
 
@@ -1470,6 +1476,18 @@ func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context,
 		}
 
 		excluded[naming.Key(live[i].NodeName)] = true
+	}
+
+	// A node held only by a survivor's old connection frees up when the
+	// survivor runs del-peer, a status write the Resource watch does not
+	// pass on. No other event is bound to come, so the pass asks for the
+	// next one itself.
+	for node := range held {
+		if !hosting[node] {
+			askRDRetry(ctx, rdReconcileRequeue)
+
+			break
+		}
 	}
 
 	return nil
