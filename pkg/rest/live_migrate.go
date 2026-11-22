@@ -59,17 +59,17 @@ import (
 // client, a dump or an operator reading them sees the same thing on
 // either controller.
 const (
-	liveMigrateNamespace         = "Internal/Drbd/LiveMigrate"
-	liveMigrateSourceProp        = liveMigrateNamespace + "/SourceNode"
-	liveMigrateTargetProp        = liveMigrateNamespace + "/TargetNode"
-	liveMigrateProtocolSetOnProp = liveMigrateNamespace + "/ProtocolSetOn"
-	liveMigratePrevProtocolProp  = liveMigrateNamespace + "/PrevProtocol"
+	liveMigrateNamespace         = apiv1.LiveMigrateNamespace
+	liveMigrateSourceProp        = apiv1.LiveMigrateSourceProp
+	liveMigrateTargetProp        = apiv1.LiveMigrateTargetProp
+	liveMigrateProtocolSetOnProp = apiv1.LiveMigrateProtocolSetOnProp
+	liveMigratePrevProtocolProp  = apiv1.LiveMigratePrevProtocolProp
 
-	protocolSetOnDefinition = "RSC_DFN"
-	protocolSetOnConnection = "RSC_CONN"
+	protocolSetOnDefinition = apiv1.LiveMigrateProtocolSetOnDefinition
+	protocolSetOnConnection = apiv1.LiveMigrateProtocolSetOnConnection
 
-	allowTwoPrimariesProp = "DrbdOptions/Net/allow-two-primaries"
-	drbdProtocolProp      = "DrbdOptions/Net/protocol"
+	allowTwoPrimariesProp = apiv1.AllowTwoPrimariesProp
+	drbdProtocolProp      = apiv1.DRBDProtocolProp
 	drbdProtocolC         = "C"
 	drbdOptionYes         = "yes"
 )
@@ -334,129 +334,26 @@ func (p *dualPrimaryPlan) apply(props map[string]string) []apiv1.APICallRc {
 }
 
 // revertDualPrimary takes the dual-Primary props back out of a
-// definition's props: allow-two-primaries on the definition, on every
-// connection of node and on the connection the marks name; the protocol
-// the marks say was changed, back to what it was; and the marks.
+// definition's props (see apiv1.RevertLiveMigration) and answers whether
+// anything changed, so the caller can skip the write, and the messages for
+// the caller.
 //
 // It is unconditional on purpose. A definition may still carry
 // allow-two-primaries from a CSI driver that set it client-side before
 // LINSTOR 1.35, and unmake-available is the call that clears it.
-//
-// Answers whether anything changed, so the caller can skip the write.
 func revertDualPrimary(rdName, node string, props map[string]string) (bool, []apiv1.APICallRc) {
-	changed := dropAllowTwoPrimaries(node, props)
-
-	restored, msgs := restoreProtocol(rdName, props)
-	changed = changed || restored
-
-	for prop := range props {
-		if propInNamespace(prop, liveMigrateNamespace) {
-			delete(props, prop)
-
-			changed = true
-		}
-	}
-
-	return changed, msgs
-}
-
-// dropAllowTwoPrimaries removes allow-two-primaries from the definition,
-// from every connection of node and from the connection the marks name.
-func dropAllowTwoPrimaries(node string, props map[string]string) bool {
-	_, changed := props[allowTwoPrimariesProp]
-	delete(props, allowTwoPrimariesProp)
-
-	markSource, markTarget := props[liveMigrateSourceProp], props[liveMigrateTargetProp]
-	marked := markSource != "" && markTarget != ""
-
-	for prop := range props {
-		pair, key, ok := apiv1.ParseResourceConnectionPropKey(prop)
-		if !ok || key != allowTwoPrimariesProp {
-			continue
-		}
-
-		if pair.Has(node) || (marked && pair.Has(markSource) && pair.Has(markTarget)) {
-			delete(props, prop)
-
-			changed = true
-		}
-	}
-
-	return changed
-}
-
-// restoreProtocol puts back the protocol the marks say a make-available
-// changed: the previous explicit value, or none. A connection the marks
-// name but no prop of which is left needs nothing.
-func restoreProtocol(rdName string, props map[string]string) (bool, []apiv1.APICallRc) {
-	protocolKey := ""
-
-	switch props[liveMigrateProtocolSetOnProp] {
-	case protocolSetOnDefinition:
-		protocolKey = drbdProtocolProp
-	case protocolSetOnConnection:
-		// A connection whose replica was deleted took its props
-		// along (dropConnectionProps): there is nothing left to put
-		// back, and writing the old protocol would bring it back.
-		source, target := props[liveMigrateSourceProp], props[liveMigrateTargetProp]
-		if source != "" && target != "" && connectionHasProps(props, source, target) {
-			protocolKey = apiv1.ResourceConnectionPropKey(source, target, drbdProtocolProp)
-		}
-	}
-
-	if protocolKey == "" {
-		return false, nil
-	}
-
-	prev := props[liveMigratePrevProtocolProp]
+	changed, prev := apiv1.RevertLiveMigration(node, props)
 	if prev == "" {
-		_, had := props[protocolKey]
-		delete(props, protocolKey)
-
-		return had, nil
+		return changed, nil
 	}
 
-	props[protocolKey] = prev
-
-	return true, []apiv1.APICallRc{{
+	return changed, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: fmt.Sprintf("DRBD protocol of resource '%s' restored to '%s'", rdName, prev),
 	}}
 }
 
-// connectionHasProps reports whether the connection between a and b
-// still holds any prop.
-func connectionHasProps(props map[string]string, a, b string) bool {
-	prefix := apiv1.ResourceConnectionPropKey(a, b, "")
-
-	for prop := range props {
-		if strings.HasPrefix(prop, prefix) {
-			return true
-		}
-	}
-
-	return false
-}
-
 // propInNamespace reports whether prop lives in namespace ns.
 func propInNamespace(prop, ns string) bool {
 	return strings.HasPrefix(prop, ns+"/")
-}
-
-// dropConnectionProps removes every resource-connection prop of node from
-// a definition's props. A connection lives as long as the replicas on
-// both of its ends: once one is deleted, LINSTOR deletes its connections
-// with it, and a replica created on that node later starts from none.
-func dropConnectionProps(node string, props map[string]string) bool {
-	changed := false
-
-	for prop := range props {
-		if pair, _, ok := apiv1.ParseResourceConnectionPropKey(prop); ok && pair.Has(node) {
-			delete(props, prop)
-
-			changed = true
-		}
-	}
-
-	return changed
 }
