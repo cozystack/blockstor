@@ -322,11 +322,11 @@ var ErrMetadataUnclean = errors.New("metadata is present but its activity log ne
 
 // ErrUncleanMetadataUnrecorded reports metadata under an unapplied
 // activity log on a volume that its replica holds no record of: no GI
-// was ever seen on it, and it is not the destination of a restore. It
-// can be a replica that went down while Primary and writing before a GI
-// was recorded for it, a LINSTOR one among them, and re-creating its
-// metadata would throw away its GI and dirty bitmap. LINSTOR never
-// re-creates metadata that is there; an operator decides instead.
+// was ever seen on it, it is not the destination of a restore, and its
+// superblock does not carry this replica's node id, or that cannot be
+// read. Re-creating it could throw away the GI and dirty bitmap of a
+// replica that holds data, and LINSTOR never re-creates metadata that is
+// there; an operator decides instead.
 var ErrUncleanMetadataUnrecorded = errors.New(
 	"refusing to re-create metadata under an unapplied activity log on a volume with no recorded GI")
 

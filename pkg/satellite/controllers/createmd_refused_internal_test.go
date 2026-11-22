@@ -78,9 +78,11 @@ func TestARefusedCreateMDIsNotRetriedOnTheFailureTimer(t *testing.T) {
 
 // uncleanUnrecordedMessage is the apply message of a volume the satellite
 // would not re-create metadata on, in the shape it reports it.
-const uncleanUnrecordedMessage = "fsm dispatch createMd: dump-md pvc-1/0: it may hold the only " +
-	"up-to-date copy of the data; run `drbdadm apply-al pvc-1/0` to keep its metadata, or " +
-	"`drbdadm wipe-md pvc-1/0` to have it re-created and resynced: "
+const uncleanUnrecordedMessage = "fsm dispatch createMd: dump-md pvc-1/0: its superblock was written " +
+	"for node id 3, and this replica is node id 0; it may hold the only up-to-date copy of the data: " +
+	"run `drbdadm apply-al pvc-1/0` to keep its metadata, or `drbdadm wipe-md pvc-1/0` to have it " +
+	"re-created and resynced; the satellite retries every 5 minutes, or at once on any change to the " +
+	"Resource or its ResourceDefinition: "
 
 // Metadata under an unapplied activity log on a volume with no recorded GI
 // is no longer re-created; the replica stays down until an operator acts.

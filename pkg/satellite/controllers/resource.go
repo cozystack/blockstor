@@ -646,8 +646,9 @@ type applyRefusal struct {
 const createMDRefusedReason = "CreateMdRefused"
 
 // uncleanMetadataRefusedReason is the Event reason for metadata under an
-// unapplied activity log that the satellite would not re-create, because
-// nothing records the volume as anything but a replica holding data.
+// unapplied activity log that the satellite would neither keep nor
+// re-create: no GI is recorded for the volume, and its superblock does
+// not carry this replica's node id.
 const uncleanMetadataRefusedReason = "UncleanMetadataRefused"
 
 // applyRefusals lists every refusal reported as a Warning Event.
@@ -666,7 +667,8 @@ func metadataRefusals() []applyRefusal {
 		},
 		{
 			drbd.ErrUncleanMetadataUnrecorded, uncleanMetadataRefusedReason,
-			"the volume's metadata was left with an unapplied activity log and no GI is recorded for it",
+			"the volume's metadata was left with an unapplied activity log, no GI is recorded for it " +
+				"and its superblock does not carry this replica's node id",
 		},
 	}
 }

@@ -606,17 +606,13 @@ func uncleanFixture(
 	return rec, dr, devices, filepath.Join(dir, "pvc-unclean.md-created"), fx
 }
 
-// An unclean superblock on a volume with no GI recorded for it is not
-// re-created, on either metadata path and either activation arm. Before, it
-// was: create-md --force threw away the GI and dirty bitmap of a replica
-// that went down while Primary and writing before a GI was recorded for it,
-// an adopted LINSTOR replica on its first activation here among them, and a
-// full resync followed, or data loss when it held the last good copy.
-// LINSTOR never re-creates metadata that is there. A new lower disk carries
-// no superblock, so the refusal cannot stall one: zvols and thin volumes
-// read zeros, and a thick LV is wiped before it is named.
-func TestAnUncleanVolumeWithNoRecordedGIIsRefused(t *testing.T) {
-	for name, run := range map[string]func(*Reconciler, *intent.DesiredResource, map[int32]string, string) error{
+// uncleanMetadataPaths are the three ways the satellite reaches the metadata
+// probe of a volume: the first activation, the diskless to diskful flip and
+// the per-volume path of an established resource.
+func uncleanMetadataPaths(t *testing.T) map[string]func(*Reconciler, *intent.DesiredResource, map[int32]string, string) error {
+	t.Helper()
+
+	return map[string]func(*Reconciler, *intent.DesiredResource, map[int32]string, string) error{
 		"first activation": func(rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, marker string) error {
 			return rec.ensureMetadata(t.Context(), dr, devices, marker, true)
 		},
@@ -626,23 +622,79 @@ func TestAnUncleanVolumeWithNoRecordedGIIsRefused(t *testing.T) {
 		"per volume": func(rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, _ string) error {
 			return rec.ensurePerVolumeMetadata(t.Context(), dr, devices, false)
 		},
+	}
+}
+
+// dumpForNodeID is dumpWithPeerSlots(7) written for another node id.
+func dumpForNodeID(nodeID int) []byte {
+	return []byte(strings.Replace(string(dumpWithPeerSlots(7)),
+		"node-id 0;", "node-id "+strconv.Itoa(nodeID)+";", 1))
+}
+
+// An unclean superblock on a volume with no GI recorded for it is not
+// re-created, on any metadata path. Before, it was: create-md --force threw
+// away the GI and dirty bitmap of a replica that went down while Primary
+// and writing before a GI was recorded for it, an adopted LINSTOR replica
+// on its first activation here among them, and a full resync followed, or
+// data loss when it held the last good copy. LINSTOR never re-creates
+// metadata that is there. One written for this replica's node id is kept,
+// see TestAnUncleanSuperblockOfThisNodeIDIsKeptWithNoRecordedGI; one written
+// for another node id, or whose node id cannot be read, is refused.
+func TestAnUncleanVolumeWithNoRecordedGIIsRefused(t *testing.T) {
+	for superblock, dump := range map[string]storage.FakeResponse{
+		"another node id":   {Stdout: dumpForNodeID(3)},
+		"never attached":    {Stdout: dumpForNodeID(-1)},
+		"unreadable layout": {Err: errApplyALFailed},
 	} {
+		for name, run := range uncleanMetadataPaths(t) {
+			t.Run(superblock+"/"+name, func(t *testing.T) {
+				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+				fx.Expect("drbdadm dump-md --force pvc-unclean/0", dump)
+
+				err := run(rec, dr, devices, mdMarkerPath)
+				if !errors.Is(err, drbd.ErrUncleanMetadataUnrecorded) {
+					t.Fatalf("err = %v, want %v", err, drbd.ErrUncleanMetadataUnrecorded)
+				}
+
+				for _, want := range []string{"drbdadm apply-al pvc-unclean/0", "retries every 5 minutes"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("err = %v, want it to name %q", err, want)
+					}
+				}
+
+				for _, cmd := range []string{"create-md", "apply-al", "set-gi"} {
+					if ranCommand(fx, cmd) {
+						t.Errorf("%s ran over metadata nothing records as foreign", cmd)
+					}
+				}
+			})
+		}
+	}
+}
+
+// A replica with no recorded GI whose superblock carries its own node id
+// under a dirty activity log is one that crashed while Primary before its
+// GI was recorded, an adopted LINSTOR replica that crashed before the
+// cutover among them. LINSTOR keeps that metadata and attaches it, the
+// kernel applies the log, and the replica resyncs only its dirty extents.
+// Refusing it left the whole resource down, healthy sibling volumes too,
+// until an operator ran drbdadm inside the satellite pod.
+func TestAnUncleanSuperblockOfThisNodeIDIsKeptWithNoRecordedGI(t *testing.T) {
+	for name, run := range uncleanMetadataPaths(t) {
 		t.Run(name, func(t *testing.T) {
 			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+			fx.Expect(uncleanApplyAL, storage.FakeResponse{})
 
-			err := run(rec, dr, devices, mdMarkerPath)
-			if !errors.Is(err, drbd.ErrUncleanMetadataUnrecorded) {
-				t.Fatalf("err = %v, want %v", err, drbd.ErrUncleanMetadataUnrecorded)
+			if err := run(rec, dr, devices, mdMarkerPath); err != nil {
+				t.Fatalf("err = %v, want the metadata kept", err)
 			}
 
-			if !strings.Contains(err.Error(), "drbdadm apply-al pvc-unclean/0") {
-				t.Errorf("err = %v, want it to name the command that keeps the metadata", err)
+			if !ranCommand(fx, "apply-al") {
+				t.Error("the activity log was not applied")
 			}
 
-			for _, cmd := range []string{"create-md", "apply-al", "set-gi"} {
-				if ranCommand(fx, cmd) {
-					t.Errorf("%s ran over metadata nothing records as foreign", cmd)
-				}
+			if ranCommand(fx, "create-md") {
+				t.Error("create-md ran over a superblock of this replica's node id")
 			}
 		})
 	}
@@ -651,9 +703,10 @@ func TestAnUncleanVolumeWithNoRecordedGIIsRefused(t *testing.T) {
 // A restore is the one volume with no GI that is initialised over an
 // unclean superblock: a clone or a receive of a snapshot of an attached
 // volume carries the source's superblock with its activity log open, and
-// needs metadata of its own. Once this node created metadata for it, the
-// superblock is the replica's own and a dirty log on it is refused like
-// any other.
+// needs metadata of its own, even when the source replica had this
+// replica's node id. Once this node created metadata for it, the
+// superblock is the replica's own: a dirty log on it is repaired, and
+// never re-created.
 func TestAnUncleanRestoreIsInitialisedOnlyBeforeItsMetadataIsCreated(t *testing.T) {
 	for name, tc := range map[string]struct {
 		created func(t *testing.T, dr *intent.DesiredResource, marker string)
@@ -675,28 +728,32 @@ func TestAnUncleanRestoreIsInitialisedOnlyBeforeItsMetadataIsCreated(t *testing.
 			t.Run(name+"/"+path, func(t *testing.T) {
 				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
 				dr.Volumes[0].SourceSnapshot = "pvc-source:snap-1"
+				fx.Expect(uncleanApplyAL, storage.FakeResponse{})
 				tc.created(t, dr, mdMarkerPath)
 
 				err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath)
+				if err != nil {
+					t.Fatalf("%s: %v", path, err)
+				}
 
 				if tc.init {
-					if err != nil {
-						t.Fatalf("%s: %v", path, err)
-					}
-
 					if !ranCommand(fx, "create-md") {
 						t.Error("the restored volume was left without metadata of its own")
+					}
+
+					if ranCommand(fx, "apply-al") {
+						t.Error("the source's activity log was applied to the restored volume")
 					}
 
 					return
 				}
 
-				if !errors.Is(err, drbd.ErrUncleanMetadataUnrecorded) {
-					t.Fatalf("err = %v, want %v", err, drbd.ErrUncleanMetadataUnrecorded)
-				}
-
 				if ranCommand(fx, "create-md") {
 					t.Error("create-md ran over a restored replica whose metadata was created here")
+				}
+
+				if !ranCommand(fx, "apply-al") {
+					t.Error("the activity log of a restored replica whose metadata was created here was not applied")
 				}
 			})
 		}
