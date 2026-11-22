@@ -119,12 +119,18 @@ func ResolveRef(ctx context.Context, reader client.Reader) (Ref, error) {
 	return Ref{Name: ref.Name, Key: key, Generated: false}, nil
 }
 
-// Secrets reads the passphrase Secret and the keyring Secret. Reader
-// should be the manager's direct reader: Secret RBAC is a namespaced get,
-// which a cache cannot list and watch with.
+// Secrets reads the passphrase Secret and the keyring Secret. Reader is
+// the manager's direct reader or a WatchedReader: the manager's cache
+// would watch every Secret in the cluster, which the name-limited Secret
+// Role does not allow.
 type Secrets struct {
 	Reader    client.Reader
 	Namespace string
+
+	// Direct, when set, is what a read-modify-write of a Secret reads:
+	// a WatchedReader trails the API server, and an update made from
+	// what it read conflicts until it catches up. Nil is Reader.
+	Direct client.Reader
 }
 
 // Keyring returns the keyring and its Secret's resourceVersion, or a nil
@@ -170,6 +176,15 @@ func (s Secrets) Passphrase(ctx context.Context, ref Ref) ([]byte, string, error
 	}
 
 	return bytes.Clone(value), sec.ResourceVersion, nil
+}
+
+// direct is the reader a read-modify-write reads through.
+func (s Secrets) direct() Secrets {
+	if s.Direct != nil {
+		s.Reader = s.Direct
+	}
+
+	return s
 }
 
 // Status is what Unlock found.
@@ -292,7 +307,14 @@ func Bootstrap(ctx context.Context, writer client.Client, secrets Secrets, now t
 
 	defer clear(pass)
 
-	err = refuseLostKeyring(ctx, secrets.Reader)
+	// A watch may not have seen a keyring created a moment ago; refusing
+	// over a keyring that is there would be a false alarm.
+	ring, _, err = secrets.direct().Keyring(ctx)
+	if err != nil || ring != nil {
+		return false, err
+	}
+
+	err = refuseLostKeyring(ctx, secrets.direct().Reader)
 	if err != nil {
 		return false, err
 	}

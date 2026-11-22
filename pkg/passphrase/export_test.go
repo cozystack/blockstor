@@ -25,3 +25,11 @@ func UnlockAttempts(u *Unlocker) int {
 
 	return u.attempts
 }
+
+// Started reports whether w's Start has run, so reads start watches.
+func Started(w *WatchedReader) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.ctx != nil
+}
