@@ -43,7 +43,7 @@ func TestRepairedActivityLogIsNotReportedAsACrash(t *testing.T) {
 
 	logger := funcr.New(func(prefix, args string) { lines = append(lines, args) }, funcr.Options{})
 
-	keep, err := rec.repairUncleanMetadata(log.IntoContext(t.Context(), logger), dr.GetName(), dr.Volumes[0])
+	keep, err := rec.repairUncleanMetadata(log.IntoContext(t.Context(), logger), dr, dr.Volumes[0])
 	if err != nil || !keep {
 		t.Fatalf("repair: keep=%v err=%v", keep, err)
 	}
