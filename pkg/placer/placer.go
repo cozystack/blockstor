@@ -217,6 +217,8 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	placed := countDiskfulReplicas(plan.existing, plan.disabled)
 	want := int(filter.PlaceCount)
 
+	defer p.holdWitness(ctx, rdName, want-placed)()
+
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.preferred, placed, want)
 	if err != nil {
 		return placed, want, err
