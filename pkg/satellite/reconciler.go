@@ -551,6 +551,21 @@ func (r *Reconciler) Apply(ctx context.Context, res []*intent.DesiredResource) (
 			return results, errors.Wrap(err, "apply: context cancelled")
 		}
 
+		// A peer about to be configured may give this replica data it
+		// then holds only in part, so its solo-birth record goes before
+		// anything else the apply does: a later step that fails must not
+		// leave the record standing for a replica no longer alone.
+		err = r.forgetSoloBirthUnlessAlone(dr)
+		if err != nil {
+			results = append(results, &intent.ResourceApplyResult{
+				Name:     dr.GetName(),
+				NodeName: dr.GetNodeName(),
+				Message:  err.Error(),
+			})
+
+			continue
+		}
+
 		results = append(results, r.applyOne(ctx, dr))
 	}
 
@@ -2936,12 +2951,9 @@ func (r *Reconciler) maybeSoloPromote(ctx context.Context, dr *intent.DesiredRes
 		return nil
 	}
 
+	// Apply has already dropped the solo-birth record of a replica that
+	// is not alone by desire.
 	if !soloByDesire(dr) {
-		// A replica that has, or had while below UpToDate, a peer that
-		// may hold newer data is not the only copy, however few
-		// connections it has right now. Forget that it was born alone.
-		r.forgetSoloBirth(dr.GetName())
-
 		return nil
 	}
 
@@ -2973,7 +2985,15 @@ func (r *Reconciler) maybeSoloPromote(ctx context.Context, dr *intent.DesiredRes
 	log.FromContext(ctx).Info("solo-promote: force-primary on lone peerless diskful replica wedged below UpToDate",
 		"resource", dr.GetName())
 
-	return r.runAutoPromote(ctx, dr)
+	err := r.runAutoPromote(ctx, dr)
+	if err != nil {
+		return err
+	}
+
+	// One shot, like LINSTOR's createPrimary: the replica is UpToDate
+	// now, and any later drop below UpToDate comes from a peer that
+	// holds the data.
+	return r.forgetSoloBirth(dr.GetName())
 }
 
 // bornSoloSuffix names the state file that records a replica whose
@@ -2999,16 +3019,11 @@ func (r *Reconciler) recordSoloBirth(dr *intent.DesiredResource) error {
 		return nil
 	}
 
-	path := filepath.Join(r.cfg.StateDir, dr.GetName()+bornSoloSuffix)
-
 	if !soloByDesire(dr) || dr.GetDeleting() {
-		err := os.Remove(path)
-		if err != nil && !os.IsNotExist(err) {
-			return errors.Wrapf(err, "remove %s", path)
-		}
-
-		return nil
+		return r.forgetSoloBirth(dr.GetName())
 	}
+
+	path := filepath.Join(r.cfg.StateDir, dr.GetName()+bornSoloSuffix)
 
 	err := os.WriteFile(path, nil, resFilePerm)
 	if err != nil {
@@ -3030,17 +3045,34 @@ func (r *Reconciler) bornSolo(name string) bool {
 	return err == nil
 }
 
-// forgetSoloBirth drops the solo-birth record of name once a peer, or a
-// diskful replica elsewhere, has appeared: from then on a peer may hold
-// data this replica lacks. Best effort: a record that survives a failed
-// remove is dropped again on the next pass, and the promote it would
-// allow still needs zero desired peers and zero kernel connections.
-func (r *Reconciler) forgetSoloBirth(name string) {
-	if r.cfg.StateDir == "" {
-		return
+// forgetSoloBirthUnlessAlone drops the solo-birth record of a replica
+// that has a desired peer or a diskful replica elsewhere.
+func (r *Reconciler) forgetSoloBirthUnlessAlone(dr *intent.DesiredResource) error {
+	if soloByDesire(dr) {
+		return nil
 	}
 
-	_ = os.Remove(filepath.Join(r.cfg.StateDir, name+bornSoloSuffix))
+	return r.forgetSoloBirth(dr.GetName())
+}
+
+// forgetSoloBirth drops the solo-birth record of name: once a peer, or
+// a diskful replica elsewhere, has appeared, that peer may hold data
+// this replica lacks, and once the promote has run it has done its one
+// job. A failed remove is returned, so the apply fails rather than
+// carry on with a record that should be gone.
+func (r *Reconciler) forgetSoloBirth(name string) error {
+	if r.cfg.StateDir == "" {
+		return nil
+	}
+
+	path := filepath.Join(r.cfg.StateDir, name+bornSoloSuffix)
+
+	err := os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "remove %s", path)
+	}
+
+	return nil
 }
 
 // resizeAssumeClean decides whether the pickup-time `drbdadm resize`

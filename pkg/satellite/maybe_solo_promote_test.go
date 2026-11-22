@@ -85,7 +85,7 @@ func TestMaybeSoloPromote_FiresForLonePeerlessInconsistent(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect(soloStatusKey, storage.FakeResponse{Stdout: []byte(soloStatusInconsistent)})
 
-	rec, _ := soloReconciler(t, fx, true)
+	rec, dir := soloReconciler(t, fx, true)
 
 	if err := rec.maybeSoloPromote(context.Background(), soloDR(), false); err != nil {
 		t.Fatalf("maybeSoloPromote: %v", err)
@@ -98,6 +98,12 @@ func TestMaybeSoloPromote_FiresForLonePeerlessInconsistent(t *testing.T) {
 
 	if !slices.Contains(cmds, "drbdadm secondary pvc-solo") {
 		t.Errorf("expected `drbdadm secondary pvc-solo` (demote after promote), got: %v", cmds)
+	}
+
+	// One shot: the record is spent by the promote, so a later drop
+	// below UpToDate (data synced from a peer since) is never forced.
+	if _, err := os.Stat(filepath.Join(dir, "pvc-solo"+bornSoloSuffix)); !os.IsNotExist(err) {
+		t.Errorf("born-solo record must be spent by the promote, stat err=%v", err)
 	}
 }
 
@@ -228,15 +234,19 @@ func TestMaybeSoloPromote_SkipsWhenAnotherDiskfulReplicaExists(t *testing.T) {
 	dr := soloDR()
 	dr.OtherDiskfulReplica = true
 
+	// The apply drops the record before its first step, here the
+	// storage layer, which fails because no provider serves the pool.
+	applyFailing(t, rec, dr)
+
+	if _, err := os.Stat(filepath.Join(dir, "pvc-solo"+bornSoloSuffix)); !os.IsNotExist(err) {
+		t.Errorf("born-solo record must be dropped once another diskful replica appeared, stat err=%v", err)
+	}
+
 	if err := rec.maybeSoloPromote(context.Background(), dr, false); err != nil {
 		t.Fatalf("maybeSoloPromote: %v", err)
 	}
 
 	assertNoSoloPromote(t, fx)
-
-	if _, err := os.Stat(filepath.Join(dir, "pvc-solo"+bornSoloSuffix)); !os.IsNotExist(err) {
-		t.Errorf("born-solo record must be dropped once another diskful replica appeared, stat err=%v", err)
-	}
 
 	// The peer goes again: the replica stays unpromoted.
 	if err := rec.maybeSoloPromote(context.Background(), soloDR(), false); err != nil {
@@ -329,6 +339,42 @@ func TestEnsureMetadata_RecordsSoloBirth(t *testing.T) {
 				t.Errorf("bornSolo = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// applyFailing runs one Apply pass that fails in the storage layer: no
+// provider serves the replica's pool.
+func applyFailing(t *testing.T, rec *Reconciler, dr *intent.DesiredResource) {
+	t.Helper()
+
+	results, err := rec.Apply(context.Background(), []*intent.DesiredResource{dr})
+	if err != nil || len(results) != 1 || results[0].GetOk() {
+		t.Fatalf("precondition: apply must fail in the storage layer, got %+v, %v", results, err)
+	}
+}
+
+// TestApply_DropsSoloBirthBeforeAFailingStep: a replica born alone
+// gains a desired peer, and its apply fails before the self-heals run.
+// The record must still go, or the peer could later sync part of its
+// data into this replica, leave, and the solo-promote would declare
+// the partial copy UpToDate.
+func TestApply_DropsSoloBirthBeforeAFailingStep(t *testing.T) {
+	fx := storage.NewFakeExec()
+	rec, dir := soloReconciler(t, fx, true)
+
+	applyFailing(t, rec, soloDR(intent.DesiredPeer{Name: "n2"}))
+
+	if _, err := os.Stat(filepath.Join(dir, "pvc-solo"+bornSoloSuffix)); !os.IsNotExist(err) {
+		t.Errorf("born-solo record survived an apply with a desired peer, stat err=%v", err)
+	}
+
+	// A lone replica's failing apply leaves its own record alone.
+	rec, _ = soloReconciler(t, fx, true)
+
+	applyFailing(t, rec, soloDR())
+
+	if !rec.bornSolo("pvc-solo") {
+		t.Error("a lone replica must keep its born-solo record")
 	}
 }
 
