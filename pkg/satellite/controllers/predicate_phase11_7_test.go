@@ -24,10 +24,13 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -553,6 +556,52 @@ func TestObserverHandlesNilTriggerChannel(t *testing.T) {
 func TestConvergedDrbdApplyAsksForNoRequeue(t *testing.T) {
 	t.Parallel()
 
+	reconciler, req := convergedDrbdFixture(t, interceptor.Funcs{})
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter: got %v, want none for a converged replica", result.RequeueAfter)
+	}
+}
+
+// TestFailedStampAsksForARetry: the stamps after a successful apply are
+// best effort, and a failed one used to wait for the periodic re-check.
+// With none left, a pass whose volume-numbers stamp hit an apiserver
+// hiccup has to ask for another itself, or the record a later delete
+// needs (Bug 107) is never written while nothing else happens to the
+// replica.
+func TestFailedStampAsksForARetry(t *testing.T) {
+	t.Parallel()
+
+	reconciler, req := convergedDrbdFixture(t, interceptor.Funcs{
+		Patch: func(ctx context.Context, cli client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*blockstoriov1alpha1.Resource); ok {
+				return apierrors.NewServiceUnavailable("apiserver hiccup")
+			}
+
+			return cli.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if result.RequeueAfter <= 0 {
+		t.Errorf("RequeueAfter: got %v, want a retry after a failed stamp", result.RequeueAfter)
+	}
+}
+
+// convergedDrbdFixture is a DRBD-stacked replica whose allocator stamp
+// is in place, so a pass runs the whole apply and the stamps after it.
+func convergedDrbdFixture(t *testing.T, funcs interceptor.Funcs) (*ResourceReconciler, ctrl.Request) {
+	t.Helper()
+
 	const (
 		node   = "n1"
 		rdName = "pvc-active-drbd"
@@ -609,6 +658,7 @@ func TestConvergedDrbdApplyAsksForNoRequeue(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(rd, res, storagePool, nodeObj).
 		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		WithInterceptorFuncs(funcs).
 		Build()
 
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -626,16 +676,7 @@ func TestConvergedDrbdApplyAsksForNoRequeue(t *testing.T) {
 		},
 	}
 
-	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: rdName + "." + node},
-	})
-	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if result.RequeueAfter != 0 {
-		t.Errorf("RequeueAfter: got %v, want none for a converged replica", result.RequeueAfter)
-	}
+	return reconciler, ctrl.Request{NamespacedName: types.NamespacedName{Name: rdName + "." + node}}
 }
 
 // noopProvider is the smallest storage.Provider implementation that

@@ -620,15 +620,18 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	anyFailed := r.recordPerResourceFailures(res, results, logger)
 
-	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
+	stampFailed := r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
 	// Apply chain surfaces per-resource errors via results (e.g.
 	// drbdadm adjust failing on a stale .res rendered before the
 	// peer's Status caught up). Returning nil here would let c-r
 	// stop until an external event drove another reconcile;
 	// RequeueAfter ensures the next attempt sees the freshly-
-	// committed peer state.
-	if anyFailed {
+	// committed peer state. A stamp that failed is retried the same
+	// way: no periodic pass comes back for a device path the CSI
+	// node is waiting on, or for the volume-numbers record a later
+	// delete needs.
+	if anyFailed || stampFailed {
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
 	}
 
@@ -757,15 +760,20 @@ func luksRefusals() []luksRefusal {
 // purge (Bug 355 followup), the Bug-107 volume-numbers annotation,
 // and the Bug-39 toggle-disk retry counter. Each helper is
 // independently fallible — we log and move on so a transient
-// apiserver hiccup on one stamp doesn't suppress the others.
-func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) {
+// apiserver hiccup on one stamp doesn't suppress the others. It
+// reports whether any of them failed, so the pass asks for another.
+func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) bool {
 	// Stamp per-volume DevicePath into Status.Volumes so
 	// linstor-csi / any consumer that reads the CRD sees the
 	// /dev path the satellite materialised. Done even when one
 	// volume's apply failed: a partial success is still useful
 	// to surface (volumes that did apply have a real device).
+	failed := false
+
 	err := r.stampVolumeStatus(ctx, res, results)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "stamp Status.Volumes")
 	}
 
@@ -787,6 +795,8 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// volumes and was reverted.
 	err = r.purgeStaleVolumeStatus(ctx, res, rd)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "purge stale Status.Volumes")
 	}
 
@@ -799,6 +809,8 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// the backing .img / ZVOL / LV leaks forever.
 	err = r.stampVolumeNumbersAnnotation(ctx, res, rd)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "stamp volume-numbers annotation")
 	}
 
@@ -808,8 +820,12 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// unconditionally on every apply pass.
 	err = r.recordToggleDiskOutcome(ctx, res, !anyFailed)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "record toggle-disk outcome")
 	}
+
+	return failed
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the
