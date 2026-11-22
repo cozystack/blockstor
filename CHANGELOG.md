@@ -4,6 +4,17 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.12 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #308 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.11; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.11
+
+- **A scheduled rebalance no longer reads a settled definition past the cache (#280).** A definition whose diskful replicas already reach its group's place count is skipped from the cache, so an idle controller no longer sends kube-apiserver a burst of GETs and LISTs every five minutes; the reads past the cache stay for a definition that is short of its place count.
+- **A gated rebalance pass adds no diskless replicas to a definition that has its diskful ones (#280).** With `DisklessOnRemaining` on a group, the scheduled tick and RG events leave a full definition alone, as LINSTOR's balance task does.
+- **A diskful replica without a storage pool waits up to 30 seconds for one instead of failing its first apply (#299).** The wait leaves no `ApplyFailed` Warning and counts no failed attempt, so a fresh replica whose pool lands a moment later no longer fires an alert during normal provisioning.
+- **A diskful replica still without a pool after 30 seconds fails with a message that says how to fix it (#299).** It names `linstor r td <node> <rd> --storage-pool <pool>` and `StorPoolName` on the resource definition, and no volume of the replica is created while any of its volumes has no pool.
+
 ## v0.4.0-alpha.11 — 2026-11-22
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #308 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.10; the entries below are what changed since.
