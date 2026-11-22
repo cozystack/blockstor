@@ -660,7 +660,11 @@ func (r *ResourceDefinitionReconciler) rdIsDeleting(_ context.Context, rd *block
 		return true
 	}
 
-	return !rd.DeletionTimestamp.IsZero()
+	// The DELETE flag is set before the replicas are walked
+	// (store.MarkDefinitionDeleting); the definition itself is only
+	// deleted after them, so its DeletionTimestamp comes too late to keep
+	// a witness from being added and removed between replica deletes.
+	return !rd.DeletionTimestamp.IsZero() || slices.Contains(rd.Spec.Flags, apiv1.ResourceFlagDelete)
 }
 
 // directOrCached returns the APIReader-direct reader when available

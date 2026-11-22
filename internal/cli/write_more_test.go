@@ -25,6 +25,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/storetest"
 )
 
 func seedDefinition(ctx context.Context, backend store.Store) {
@@ -445,3 +446,41 @@ func TestResourceDeleteDuringVolumeTeardownIsNotGuarded(t *testing.T) {
 	}
 }
 
+// `rd d` flags the definition DELETE before the first replica goes and
+// deletes the Inconsistent replica before its source, the way the REST
+// door does.
+func TestDefinitionDeleteFlagsDefinitionBeforeItsReplicas(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedDefinition(ctx, backend)
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+	})
+
+	rec := storetest.NewDeleteRecorder(appStore(t, app))
+	app.StoreFor = func(context.Context) (store.Store, error) { return rec, nil }
+
+	if got := app.Run(t.Context(), []string{"rd", "d", "pvc-x"}); got != 0 {
+		t.Fatalf("delete exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	deletes := rec.Deletes()
+	if len(deletes) == 0 || deletes[0].Node != "node-b" {
+		t.Errorf("deletes = %+v, want the Inconsistent node-b first", deletes)
+	}
+
+	for _, d := range deletes {
+		if !d.DefinitionFlagged {
+			t.Errorf("replica on %s deleted before the definition was flagged DELETE", d.Node)
+		}
+	}
+}

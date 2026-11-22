@@ -25,6 +25,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/storetest"
 )
 
 // seedInitialSyncVolume lays out a three-replica volume deleted a few
@@ -120,3 +121,59 @@ func TestSingleReplicaDeleteDuringInitialSyncStaysGuarded(t *testing.T) {
 	}
 }
 
+// A definition flagged DELETE (rd d marks it before walking the replicas)
+// is being deleted as a whole too.
+func TestReplicaDeleteOfDefinitionFlaggedDeleteIsNotGuarded(t *testing.T) {
+	st := store.NewInMemory()
+	rd := "pvc-initial-sync-rdd"
+
+	seedInitialSyncVolume(t, st, rd)
+
+	if err := st.Resources().Delete(t.Context(), rd, "node-a"); err != nil {
+		t.Fatalf("drop node-a: %v", err)
+	}
+
+	if err := store.MarkDefinitionDeleting(t.Context(), st, rd); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	if code := deleteReplica(t, base, rd, "node-b"); code != http.StatusOK {
+		t.Fatalf("delete node-b: got %d, want 200", code)
+	}
+}
+
+// rd d flags the definition DELETE before the first replica goes, so the
+// RD reconciler keeps its hands off the tiebreaker for the whole walk, and
+// deletes the Inconsistent replica before its source.
+func TestRDDeleteFlagsDefinitionBeforeItsReplicas(t *testing.T) {
+	backend := store.NewInMemory()
+	rd := "pvc-initial-sync-flag"
+
+	seedInitialSyncVolume(t, backend, rd)
+
+	rec := storetest.NewDeleteRecorder(backend)
+
+	base, stop := startServerWithStore(t, rec)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/"+rd)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rd d: got %d, want 200", resp.StatusCode)
+	}
+
+	deletes := rec.Deletes()
+	if len(deletes) == 0 || deletes[0].Node != "node-c" {
+		t.Errorf("deletes = %+v, want the Inconsistent node-c first", deletes)
+	}
+
+	for _, d := range deletes {
+		if !d.DefinitionFlagged {
+			t.Errorf("replica on %s deleted before the definition was flagged DELETE", d.Node)
+		}
+	}
+}
