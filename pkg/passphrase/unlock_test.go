@@ -863,6 +863,56 @@ func TestCleanupKeepsTheSlotTheSecretOpensNow(t *testing.T) {
 	}
 }
 
+// The cleanup decides on the ControllerConfig the API server holds, not
+// on the one a watch saw: a Secret the operator has switched back to, but
+// the watch has not seen yet, keeps the slot it opens, and the cluster
+// stays unlocked.
+func TestCleanupKeepsTheSlotOfASecretTheWatchHasNotSeen(t *testing.T) {
+	t.Parallel()
+
+	direct := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(
+		refConfig("a", ""), passSecret("a", "MASTER_PASSPHRASE", "one"),
+		passSecret("b", "MASTER_PASSPHRASE", "two")).Build()
+	setup := &passphrase.Ops{Client: direct, Secrets: passphrase.Secrets{Reader: direct, Namespace: ns}}
+
+	_, err := passphrase.Bootstrap(t.Context(), direct, setup.Secrets, time.Now())
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	// The rotation: slot X, opened by a, is superseded by slot Y, opened
+	// by b, and the operator points the ControllerConfig at b.
+	_, err = setup.Modify(t.Context(), []byte("one"), []byte("two"))
+	if err != nil {
+		t.Fatalf("modify: %v", err)
+	}
+
+	var ringSec corev1.Secret
+
+	err = direct.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: passphrase.KeyringSecretName}, &ringSec)
+	if err != nil {
+		t.Fatalf("get keyring: %v", err)
+	}
+
+	ringSec.ResourceVersion = ""
+
+	// The watch still holds b; the operator has since switched back to a.
+	watch := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(
+		refConfig("b", ""), passSecret("a", "MASTER_PASSPHRASE", "one"),
+		passSecret("b", "MASTER_PASSPHRASE", "two"), &ringSec).Build()
+
+	ops := &passphrase.Ops{Client: direct, Secrets: passphrase.Secrets{Reader: watch, Namespace: ns, Direct: direct}}
+
+	removed, err := ops.CleanupSuperseded(t.Context())
+	if err != nil || removed {
+		t.Fatalf("cleanup: %v, %v; want the slot Secret a opens kept", removed, err)
+	}
+
+	if stateOf(t, setup).State != passphrase.StateUnlocked {
+		t.Fatal("the cluster is locked: Secret a opens no slot")
+	}
+}
+
 // The cleanup answers the steady state from the keyring alone, and while a
 // superseded slot waits for the Secret to move, a shared Unlocker tries the
 // Secret's passphrase once, not once per call.

@@ -494,6 +494,19 @@ func (o *Ops) CleanupSuperseded(ctx context.Context) (bool, error) {
 	removed := false
 
 	err = o.mutate(ctx, func(ring *keyring.Keyring) error {
+		// The state may have been read from a watch that has not seen
+		// the ControllerConfig move to another Secret yet, one that
+		// opens a slot this would remove. The next pass decides on
+		// the ref the API server holds.
+		ref, refErr := ResolveRef(ctx, o.Secrets.direct().Reader)
+		if refErr != nil {
+			return refErr
+		}
+
+		if ref != status.Ref {
+			return errNothingToWrite
+		}
+
 		// The Secret may have moved back to the superseded passphrase
 		// since the state was read; the slot it opens now, in the
 		// keyring about to be written, is the one to keep.
