@@ -226,6 +226,13 @@ func nextTiebreakerDeadline(rd *blockstoriov1alpha1.ResourceDefinition, now time
 		}
 	}
 
+	if deadline, ok := apiv1.PlacementInProgressUntil(rd.Annotations, now); ok {
+		left := deadline.Sub(now) + time.Second
+		if !found || left < earliest {
+			earliest, found = left, true
+		}
+	}
+
 	return earliest, found
 }
 
