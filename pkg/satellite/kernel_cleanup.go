@@ -217,6 +217,8 @@ func (r *Reconciler) prunePass3Stuck(
 
 		first, ready := r.observeStuck(key, now, grace)
 		if !ready {
+			r.retryLater(rdName, grace-now.Sub(first))
+
 			logger.V(1).Info("Pass 3: slot stuck but inside grace window",
 				"peer", name,
 				"state", slot.ConnectionState,
@@ -228,6 +230,8 @@ func (r *Reconciler) prunePass3Stuck(
 
 		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, devices, logger.WithValues("pass", pruneLogPass3, "peer", name))
 		if teardownErr != nil {
+			r.retryLater(rdName, bestEffortRetry)
+
 			logger.Info("Pass 3: teardown of stuck slot failed; will retry next reconcile",
 				"peer", name,
 				"err", teardownErr.Error())

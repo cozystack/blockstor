@@ -371,6 +371,13 @@ type Reconciler struct {
 	// for the residual CRD-status-vs-on-disk window. Process-memory
 	// only; a restart resets the counter (at worst a few extra requeues).
 	restoreSnapshotMissingTries map[string]int
+
+	// retryAt is, per resource name, when a pass put off work that is
+	// due again with no event to bring it: a dwell window, a throttle,
+	// a best-effort step that failed. The satellite runs no periodic
+	// pass of a converged replica, so the controller asks for it with
+	// TakeRetry once the pass is done. Serialised by mu.
+	retryAt map[string]time.Time
 }
 
 // recoveryPromoteThrottle bounds how often a single resource may fire
@@ -2063,7 +2070,9 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 		// the MaxPeers-1 budget entries but the resource keeps serving
 		// I/O, and the next reconcile retries. del-peer errors still
 		// bubble (above): those leak a live kernel connection.
-		_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), peerID)
+		if r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), peerID) != nil {
+			r.retryLater(dr.GetName(), bestEffortRetry)
+		}
 	}
 
 	return nil
@@ -3222,11 +3231,18 @@ func (r *Reconciler) lateAddStallDwellElapsed(name string) bool {
 	first, ok := r.firstLateAddStallAt[name]
 	if !ok {
 		r.firstLateAddStallAt[name] = now
+		r.retryLaterLocked(name, lateAddStallDwell)
 
 		return false
 	}
 
-	return now.Sub(first) >= lateAddStallDwell
+	if left := lateAddStallDwell - now.Sub(first); left > 0 {
+		r.retryLaterLocked(name, left)
+
+		return false
+	}
+
+	return true
 }
 
 // clearLateAddStall drops the recorded stall start for a resource, so a
@@ -3249,6 +3265,9 @@ func (r *Reconciler) recoveryPromoteDue(name string) bool {
 
 	now := time.Now()
 	if last, ok := r.lastRecoveryPromoteAt[name]; ok && now.Sub(last) < recoveryPromoteThrottle {
+		// The recovery is still wanted; it is only too soon for it.
+		r.retryLaterLocked(name, recoveryPromoteThrottle-now.Sub(last))
+
 		return false
 	}
 
@@ -3819,6 +3838,7 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		// source of truth) so no functional regression, just noise.
 		stampErr := r.cfg.MetadataCreatedStamper.StampMetadataCreated(ctx, dr.GetName(), dr.GetNodeName())
 		if stampErr != nil {
+			r.retryLater(dr.GetName(), bestEffortRetry)
 			log.FromContext(ctx).Error(stampErr, "stamp MetadataCreated Condition; will retry next reconcile",
 				"resource", dr.GetName(), "node", dr.GetNodeName())
 		}
@@ -4617,6 +4637,7 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 		// so no functional regression on a transient apiserver hiccup.
 		stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemFormatted(ctx, dr.GetName(), dr.GetNodeName())
 		if stampErr != nil {
+			r.retryLater(dr.GetName(), bestEffortRetry)
 			log.FromContext(ctx).Error(stampErr, "stamp FilesystemFormatted Condition; will retry next reconcile",
 				"resource", dr.GetName(), "node", dr.GetNodeName())
 		}
@@ -4983,7 +5004,9 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 			// Best-effort: a clearer error doesn't strand the reconciler
 			// (the worst case is the same as not having the clearer at
 			// all — the prop stays pinned and the next pass re-tries).
-			_ = r.cfg.SkipDiskClearer.ClearSkipDisk(ctx, dr.GetName())
+			if r.cfg.SkipDiskClearer.ClearSkipDisk(ctx, dr.GetName()) != nil {
+				r.retryLater(dr.GetName(), bestEffortRetry)
+			}
 		}
 	}
 
