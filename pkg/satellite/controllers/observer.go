@@ -21,6 +21,7 @@ package controllers
 import (
 	"cmp"
 	"context"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -157,6 +158,16 @@ type volumeObservation struct {
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
+
+	// SyncPeer is the peer a peer-device frame's out-of-sync count is
+	// about (its `conn-name`).
+	SyncPeer string
+	// PeerOutOfSync is the cached count per peer; OutOfSyncKib is its
+	// largest. Kept in the cache only: with the count of whichever
+	// peer's frame came last, a replica with one peer in sync and one
+	// not flipped between zero and the count on every statistics
+	// frame, and each flip was a status write.
+	PeerOutOfSync map[string]int64
 
 	// Removed is an internal marker set by translateDeviceEvent for
 	// `destroy device` frames (drbdsetup emits one after a volume is
@@ -589,10 +600,14 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 
 	out := observation{ResourceName: name}
 
+	peer := ev.Fields["conn-name"]
+
 	//nolint:gosec // drbd-9 volume numbers fit in int32
 	out.Volumes = peerDeviceVolumeObservation(ev, int32(volNum))
+	for i := range out.Volumes {
+		out.Volumes[i].SyncPeer = peer
+	}
 
-	peer := ev.Fields["conn-name"]
 	if peer != "" {
 		conn := connectionObservation{
 			PeerNodeName:   peer,
@@ -689,6 +704,9 @@ const (
 	// where the local `device` frame's `disk:UpToDate` is missing or
 	// stale on a Secondary SyncSource (see peerDeviceVolumeObservation).
 	drbdReplStateSyncSource = "SyncSource"
+	// drbdReplStateSyncTarget is the per-peer replication-state token
+	// of the replica a resync is writing to.
+	drbdReplStateSyncTarget = "SyncTarget"
 	// drbdDiskStateUpToDate is the DRBD-9 device disk_state token
 	// meaning the local replica holds a complete, current copy. Used
 	// as the value the SyncSource invariant stamps onto the local
@@ -891,7 +909,22 @@ type appliedStatus struct {
 	uid             types.UID
 	resourceVersion string
 	status          blockstoriov1alpha1.ResourceStatus
+	at              time.Time
 }
+
+// outOfSyncRefresh is how long a replica whose only change is the
+// size of a non-zero out-of-sync count goes without a status write.
+// DRBD moves that count on every write to a volume whose bitmap a
+// peer never cleared, with both sides UpToDate and nothing else
+// changing, and the statistics frames carrying it arrive every few
+// seconds: written each time, a few such volumes were most of an
+// idle satellite's API requests. LINSTOR does not keep the count at
+// all. Going to or from zero is written at once, and so is any
+// other change, which carries the current count with it. A volume
+// that is not UpToDate, or a replica resyncing with a peer, writes
+// every change: the REST view and the CLI render the count as the
+// percentage in `SyncTarget(NN%)` / `Inconsistent(NN%)`.
+const outOfSyncRefresh = 5 * time.Minute
 
 // observerWriters bounds the resources one write pass writes at once.
 // The pass that follows a stream's initial dump writes every replica on
@@ -1747,8 +1780,10 @@ func (o *ObserverRunnable) ingest(ctx context.Context, ev *observation) {
 	// cached roles on ev.
 	role := carriesRole(ev)
 
-	o.mergeConnections(ev)
+	// mergeVolumes reads a destroyed connection off ev before
+	// mergeConnections replaces ev.Connections with the cached peers.
 	o.mergeVolumes(ev)
+	o.mergeConnections(ev)
 	o.mergeResource(ev)
 
 	// mergeVolumes leaves ev.Volumes empty when the frame changed no
@@ -2488,6 +2523,12 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 
 	changed := false
 
+	for _, conn := range ev.Connections {
+		if conn.Removed && forgetPeerOutOfSync(cache, conn.PeerNodeName) {
+			changed = true
+		}
+	}
+
 	for _, incoming := range ev.Volumes {
 		if incoming.Removed {
 			// `destroy device` — evict the volume so the snapshot
@@ -2667,6 +2708,74 @@ func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolume
 	return out
 }
 
+// largestOutOfSync is the out-of-sync count a volume publishes: the
+// one of the peer it is furthest behind.
+func largestOutOfSync(peers map[string]int64) int64 {
+	var largest int64
+
+	for _, kib := range peers {
+		largest = max(largest, kib)
+	}
+
+	return largest
+}
+
+// forgetPeerOutOfSync drops a removed peer's out-of-sync count from
+// every cached volume, so a peer that is gone no longer holds the
+// volume's count up. Returns true if a published count changed.
+func forgetPeerOutOfSync(cache map[int32]volumeObservation, peer string) bool {
+	changed := false
+
+	for num, vol := range cache {
+		if _, ok := vol.PeerOutOfSync[peer]; !ok {
+			continue
+		}
+
+		peers := maps.Clone(vol.PeerOutOfSync)
+		delete(peers, peer)
+		vol.PeerOutOfSync = peers
+
+		if oos := largestOutOfSync(peers); oos != vol.OutOfSyncKib {
+			vol.OutOfSyncKib = oos
+			changed = true
+		}
+
+		cache[num] = vol
+	}
+
+	return changed
+}
+
+// mergeOutOfSyncInto records the out-of-sync count of a frame that
+// carried one, against its peer when the frame names it, and reports
+// whether the count the volume publishes changed.
+func mergeOutOfSyncInto(merged, incoming *volumeObservation) bool {
+	oos := incoming.OutOfSyncKib
+
+	if incoming.SyncPeer != "" {
+		if last, ok := merged.PeerOutOfSync[incoming.SyncPeer]; !ok || last != oos {
+			peers := maps.Clone(merged.PeerOutOfSync)
+			if peers == nil {
+				peers = map[string]int64{}
+			}
+
+			peers[incoming.SyncPeer] = oos
+			merged.PeerOutOfSync = peers
+		}
+
+		oos = largestOutOfSync(merged.PeerOutOfSync)
+	}
+
+	if merged.HasSync && merged.OutOfSyncKib == oos {
+		return false
+	}
+
+	merged.OutOfSyncKib = oos
+	merged.HasSync = true
+
+	return true
+}
+
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
 // to decide whether to emit a fresh Status snapshot.
@@ -2695,9 +2804,7 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 		changed = true
 	}
 
-	if incoming.HasSync && (!merged.HasSync || merged.OutOfSyncKib != incoming.OutOfSyncKib) {
-		merged.OutOfSyncKib = incoming.OutOfSyncKib
-		merged.HasSync = true
+	if incoming.HasSync && mergeOutOfSyncInto(&merged, incoming) {
 		changed = true
 	}
 
@@ -3040,9 +3147,62 @@ func (o *ObserverRunnable) alreadyApplied(name string, current *blockstoriov1alp
 	defer o.appliedMu.Unlock()
 
 	last, ok := o.applied[name]
+	if !ok || last.uid != current.UID || last.resourceVersion != current.ResourceVersion {
+		return false
+	}
 
-	return ok && last.uid == current.UID && last.resourceVersion == current.ResourceVersion &&
-		equality.Semantic.DeepEqual(&last.status, status)
+	if equality.Semantic.DeepEqual(&last.status, status) {
+		return true
+	}
+
+	if time.Since(last.at) >= outOfSyncRefresh {
+		return false
+	}
+
+	return equality.Semantic.DeepEqual(&last.status, withAppliedOutOfSync(status, &last.status))
+}
+
+// withAppliedOutOfSync returns a copy of status in which each UpToDate
+// volume of a replica that resyncs with no peer carries the
+// out-of-sync count last applied, when that count and the new one are
+// both non-zero. If the copy equals the applied status, the only
+// change is the size of such a count, which can wait.
+func withAppliedOutOfSync(status, applied *blockstoriov1alpha1.ResourceStatus) *blockstoriov1alpha1.ResourceStatus {
+	out := status.DeepCopy()
+
+	if resyncRunning(status) {
+		return out
+	}
+
+	for i := range out.Volumes {
+		vol := &out.Volumes[i]
+		if vol.DiskState != drbdDiskStateUpToDate || vol.OutOfSyncKib == 0 {
+			continue
+		}
+
+		for j := range applied.Volumes {
+			prev := &applied.Volumes[j]
+			if prev.VolumeNumber == vol.VolumeNumber && prev.OutOfSyncKib != 0 {
+				vol.OutOfSyncKib = prev.OutOfSyncKib
+			}
+		}
+	}
+
+	return out
+}
+
+// resyncRunning reports whether the replica is the source or the
+// target of a resync with any peer: the states in which the REST view
+// renders the out-of-sync count as progress.
+func resyncRunning(status *blockstoriov1alpha1.ResourceStatus) bool {
+	for i := range status.Connections {
+		switch status.Connections[i].ReplicationState {
+		case drbdReplStateSyncSource, drbdReplStateSyncTarget:
+			return true
+		}
+	}
+
+	return false
 }
 
 // rememberApplied records what was sent and the version the apiserver
@@ -3055,7 +3215,9 @@ func (o *ObserverRunnable) rememberApplied(name string, written *blockstoriov1al
 		o.applied = map[string]appliedStatus{}
 	}
 
-	o.applied[name] = appliedStatus{uid: written.UID, resourceVersion: written.ResourceVersion, status: *sent}
+	o.applied[name] = appliedStatus{
+		uid: written.UID, resourceVersion: written.ResourceVersion, status: *sent, at: time.Now(),
+	}
 }
 
 func (o *ObserverRunnable) forgetApplied(name string) {

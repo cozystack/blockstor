@@ -246,11 +246,15 @@ type VolumeState struct {
 	// full initial-sync (Phase 8.1).
 	CurrentGi string `json:"current_gi,omitempty"`
 
-	// OutOfSyncKib is the out-of-sync count of the last
-	// `drbdsetup events2 --statistics` peer-device frame for this
-	// volume, whichever peer it was about. 0 means in sync with that
-	// peer. It is not a resync progress once a replica has more than
-	// one peer; that is ReplicationStates[peer].DonePercentage.
+	// OutOfSyncKib is the largest out-of-sync count over this
+	// volume's peers, as `drbdsetup events2 --statistics` peer-device
+	// frames report it. 0 means in sync with every peer. It is not a
+	// resync progress once a replica has more than one peer; that is
+	// ReplicationStates[peer].DonePercentage. While the volume is
+	// UpToDate and no peer resyncs with the replica, a change that
+	// keeps the count non-zero can arrive up to 5 minutes late; a
+	// change to or from 0, and any change during a resync, arrives at
+	// once.
 	OutOfSyncKib int64 `json:"out_of_sync_kib,omitempty"`
 
 	// ReplicationStates is the per-peer replication-state map the
