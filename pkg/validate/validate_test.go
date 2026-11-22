@@ -383,6 +383,21 @@ func TestMidSyncDeleteRefusalIgnoresPeerBeingDeleted(t *testing.T) {
 	}
 }
 
+// A complete copy that is itself being deleted is no source for the peer
+// still syncing: `r d` of the source, then `r d` of the other complete
+// copy, must not pass on the strength of the first one.
+func TestMidSyncDeleteRefusalDoesNotCountDeletingSource(t *testing.T) {
+	t.Parallel()
+
+	target := diskful("node-b", "UpToDate")
+	going := diskful("node-a", "UpToDate")
+	going.Flags = []string{apiv1.ResourceFlagDelete}
+
+	if !validate.MidSyncDeleteRefusal(&target, []apiv1.Resource{going, diskful("node-c", "Inconsistent")}) {
+		t.Error("counted a source that is being deleted, stranding the syncing peer")
+	}
+}
+
 // Deleting replicas one at a time, the incomplete ones go first, so the
 // source of an initial sync is never the first replica removed.
 func TestSortForDeletionPutsIncompleteReplicasFirst(t *testing.T) {
