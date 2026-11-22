@@ -145,10 +145,10 @@ type ResourceReconciler struct {
 
 	Config Config
 
-	// recheck runs the periodic re-checks one at a time. SetupWithManager
-	// sets it and gates Reconcile through it; a test calling Reconcile
-	// directly goes around it.
-	recheck *recheckGate
+	// passes counts the passes by reason. SetupWithManager sets it and
+	// counts Reconcile through it; a test calling Reconcile directly goes
+	// around it.
+	passes *passCounter
 }
 
 // Reconcile reads a Resource and drives the satellite-side
@@ -221,32 +221,6 @@ const applyFailureRequeue = 5 * time.Second
 // still giving the apiserver time to commit the Status patch.
 const peerAllocationRequeue = 2 * time.Second
 
-// activeDRBDRequeue is the periodic self-evaluation requeue applied
-// after a successful Apply on a DRBD-backed resource (Phase 11.7
-// safety net). The primary-watch predicate filters out pure
-// observer Status noise and the observer-trigger channel only fires
-// on lifecycle changes, so the reconciler no longer wakes for every
-// kernel statistics tick. This RequeueAfter is the belt-and-braces
-// re-eval that catches the rare case where the events2 stream missed
-// a frame (drbdsetup restart, kernel events2 stall) — without it the
-// reconciler could go arbitrarily long without re-checking a
-// long-lived active DRBD resource against its desired state.
-//
-// 10s is chosen to be:
-//   - long enough that steady-state idle resources don't generate
-//     pointless apiserver round-trips;
-//   - short enough that any divergence between desired and observed
-//     converges within a single user-visible scenario tick (e2e
-//     tests poll at 1-2 s and budget ~30 s per assertion).
-//
-// It is the earliest a replica is re-checked, not a promise. The
-// re-check gate runs the re-checks one at a time, cools the slot down
-// after each, and holds them while an event pass runs, so on a node
-// with N replicas whose pass takes T the period is about
-// max(10s, N*(1+recheckCooldown)*T): with a hundred replicas at 0.1 s
-// a pass, about 20 s.
-const activeDRBDRequeue = 10 * time.Second
-
 // resolveDeleteStoragePool picks the pool name the
 // satellite's DeleteVolume should route through. Phase 10.3
 // typed `Spec.StoragePool` wins; legacy `Props["StorPoolName"]`
@@ -280,13 +254,15 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
 //
-// Every way an event reaches the queue goes through the re-check gate:
-// For and the kernel trigger through r.recheck.marker, every Watches
-// map function through r.recheck.mapFunc. A Watches added without it
-// still works, but the gate takes its passes for re-checks of replicas
-// that have one due and holds them for the re-check slot.
+// Every way an event reaches the queue is counted for the pass report:
+// For, the kernel trigger and the drift check through r.passes.marker,
+// every Watches map function through r.passes.mapFunc. A Watches added
+// without it still works, but its passes are counted as retries.
+//
+// A converged replica gets no periodic pass. The drift check (see
+// driftCheckInterval) passes the replicas drbdadm lists as adjustable.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.recheck = newRecheckGate()
+	r.passes = newPassCounter()
 
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
@@ -294,14 +270,14 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				predicate.And(
 					nodeNamePredicate(r.Config.NodeName),
 					primaryWatchPredicate(),
-					r.recheck.marker(passResource),
+					r.passes.marker(passResource),
 				),
 			)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passPeer, r.enqueueLocalSiblings)),
+			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passPeer, r.enqueueLocalSiblings)),
 			builder.WithPredicates(siblingWatchPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
-			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passDefinition, r.enqueueResourcesForRD))).
+			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRD))).
 		Named("satellite-resource").
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.resourceWorkers()})
 
@@ -316,19 +292,41 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Config.ReconcileTrigger != nil {
 		bldr = bldr.WatchesRawSource(
 			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
-				source.WithPredicates[client.Object, reconcile.Request](r.recheck.marker(passKernel))),
+				source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passKernel))),
 		)
 	}
 
-	err := bldr.Complete(r.recheck.gate(r))
+	var drift *driftCheck
+
+	if r.Config.Exec != nil {
+		trigger := make(chan event.GenericEvent, reconcileTriggerBuffer)
+		drift = &driftCheck{
+			reader: mgr.GetClient(), exec: r.Config.Exec, node: r.Config.NodeName,
+			out: trigger, interval: r.Config.DriftCheckInterval,
+		}
+		bldr = bldr.WatchesRawSource(
+			source.Channel(trigger, &handler.EnqueueRequestForObject{},
+				source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passDrift))),
+		)
+	}
+
+	err := bldr.Complete(r.passes.counted(r))
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
 	}
 
-	err = mgr.Add(manager.RunnableFunc(r.recheck.reportEvery(passReportInterval,
-		mgr.GetLogger().WithName("satellite-resource"))))
+	logger := mgr.GetLogger().WithName("satellite-resource")
+
+	err = mgr.Add(manager.RunnableFunc(r.passes.reportEvery(passReportInterval, logger)))
 	if err != nil {
 		return errors.Wrap(err, "register resource pass report")
+	}
+
+	if drift != nil {
+		err = mgr.Add(manager.RunnableFunc(drift.run(logger.WithName("drift-check"))))
+		if err != nil {
+			return errors.Wrap(err, "register drift check")
+		}
 	}
 
 	return nil
@@ -618,6 +616,8 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
+	retry, retryAsked := r.Config.Apply.TakeRetry(desired.GetName())
+
 	anyFailed := r.recordPerResourceFailures(res, results, logger)
 
 	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
@@ -632,19 +632,12 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
 	}
 
-	// Phase 11.7 safety net: schedule a periodic re-eval on
-	// active-DRBD resources. The primary-watch predicate drops
-	// pure observer Status noise and the observer-trigger channel
-	// only fires on lifecycle changes; combined, the reconciler no
-	// longer wakes on every kernel statistics tick. Without a
-	// belt-and-braces requeue, a missed events2 frame (drbdsetup
-	// restart, kernel stall) could leave the resource un-re-eval'd
-	// for arbitrarily long. Only fires on DRBD-stack RDs — pure
-	// STORAGE-only RDs have no kernel-state to drift against, so
-	// keeping them quiet preserves the predicate's no-op-on-idle
-	// property.
-	if rdNeedsDRBD(&rd) {
-		return schedulePeriodicRecheck(ctx), nil
+	// A converged replica waits for its next event, the way LINSTOR's
+	// satellite dispatches only resources with a pending change. The
+	// one exception is work this pass put off for a while, a dwell
+	// window or a throttle, that no event is bound to bring back.
+	if retryAsked {
+		return ctrl.Result{RequeueAfter: retry}, nil
 	}
 
 	return ctrl.Result{}, nil

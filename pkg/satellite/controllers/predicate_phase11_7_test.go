@@ -541,18 +541,16 @@ func TestObserverHandlesNilTriggerChannel(t *testing.T) {
 }
 
 // -----------------------------------------------------------------
-// RequeueAfter safety-net test (Phase 11.7 third leg).
+// Converged apply test (Phase 11.7 third leg, retired).
 // -----------------------------------------------------------------
 
-// TestRunApplyReturnsRequeueAfterForActiveDrbd pins the safety-net
-// invariant: a successful apply on a DRBD-stacked Resource MUST
-// schedule a periodic re-eval via RequeueAfter so the reconciler
-// self-evaluates against current kernel state even when the events2
-// stream misses a frame. Without this, the predicate's noise filter
-// + the trigger channel's lifecycle-only emit could leave an active
-// DRBD resource un-re-eval'd for arbitrarily long after a frame
-// drop.
-func TestRunApplyReturnsRequeueAfterForActiveDrbd(t *testing.T) {
+// TestConvergedDrbdApplyAsksForNoRequeue: a successful apply on a
+// DRBD-stacked Resource that put nothing off schedules no further pass.
+// The periodic re-check it used to schedule ran a full pass of every
+// replica every ten seconds; on a node with a hundred replicas that was
+// about half a core spent while nothing changed. Kernel drift reaches
+// the replica through the drift check instead.
+func TestConvergedDrbdApplyAsksForNoRequeue(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -635,16 +633,15 @@ func TestRunApplyReturnsRequeueAfterForActiveDrbd(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	if result.RequeueAfter != activeDRBDRequeue {
-		t.Errorf("RequeueAfter: got %v, want %v (Phase 11.7 safety net)",
-			result.RequeueAfter, activeDRBDRequeue)
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter: got %v, want none for a converged replica", result.RequeueAfter)
 	}
 }
 
 // noopProvider is the smallest storage.Provider implementation that
 // satisfies the satellite reconciler's contract for the
 // "happy-path apply" tests: every per-volume operation is a no-op.
-// Used by the active-DRBD-RequeueAfter test where we care only
+// Used by the converged-DRBD apply test where we care only
 // about the post-apply control flow, not the underlying storage
 // provider's behaviour.
 type noopProvider struct{}
