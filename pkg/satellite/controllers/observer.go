@@ -783,7 +783,19 @@ type appliedStatus struct {
 	uid             types.UID
 	resourceVersion string
 	status          blockstoriov1alpha1.ResourceStatus
+	at              time.Time
 }
+
+// outOfSyncRefresh is how long a replica whose only change is the
+// size of a non-zero out-of-sync count goes without a status write.
+// DRBD moves that count on every write to a volume whose bitmap a
+// peer never cleared, with both sides UpToDate and nothing else
+// changing, and the statistics frames carrying it arrive every few
+// seconds: written each time, a few such volumes were most of an
+// idle satellite's API requests. LINSTOR does not keep the count at
+// all. Going to or from zero is written at once, and so is any
+// other change, which carries the current count with it.
+const outOfSyncRefresh = 5 * time.Minute
 
 // observerWriters bounds the resources one write pass writes at once.
 // The pass that follows a stream's initial dump writes every replica on
@@ -2626,9 +2638,40 @@ func (o *ObserverRunnable) alreadyApplied(name string, current *blockstoriov1alp
 	defer o.appliedMu.Unlock()
 
 	last, ok := o.applied[name]
+	if !ok || last.uid != current.UID || last.resourceVersion != current.ResourceVersion {
+		return false
+	}
 
-	return ok && last.uid == current.UID && last.resourceVersion == current.ResourceVersion &&
-		equality.Semantic.DeepEqual(&last.status, status)
+	if equality.Semantic.DeepEqual(&last.status, status) {
+		return true
+	}
+
+	if time.Since(last.at) >= outOfSyncRefresh {
+		return false
+	}
+
+	return equality.Semantic.DeepEqual(&last.status, withAppliedOutOfSync(status, &last.status))
+}
+
+// withAppliedOutOfSync returns a copy of status whose volumes carry
+// the out-of-sync count last applied wherever both that one and the
+// new one are non-zero: what is left differs from the applied status
+// only by something worth a write (outOfSyncRefresh).
+func withAppliedOutOfSync(status, applied *blockstoriov1alpha1.ResourceStatus) *blockstoriov1alpha1.ResourceStatus {
+	out := status.DeepCopy()
+
+	for i := range out.Volumes {
+		vol := &out.Volumes[i]
+
+		for j := range applied.Volumes {
+			prev := &applied.Volumes[j]
+			if prev.VolumeNumber == vol.VolumeNumber && prev.OutOfSyncKib != 0 && vol.OutOfSyncKib != 0 {
+				vol.OutOfSyncKib = prev.OutOfSyncKib
+			}
+		}
+	}
+
+	return out
 }
 
 // rememberApplied records what was sent and the version the apiserver
@@ -2641,7 +2684,9 @@ func (o *ObserverRunnable) rememberApplied(name string, written *blockstoriov1al
 		o.applied = map[string]appliedStatus{}
 	}
 
-	o.applied[name] = appliedStatus{uid: written.UID, resourceVersion: written.ResourceVersion, status: *sent}
+	o.applied[name] = appliedStatus{
+		uid: written.UID, resourceVersion: written.ResourceVersion, status: *sent, at: time.Now(),
+	}
 }
 
 func (o *ObserverRunnable) forgetApplied(name string) {

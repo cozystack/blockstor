@@ -22,6 +22,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -102,5 +103,95 @@ func TestObserverResyncSkipsAReplicaNothingChanged(t *testing.T) {
 	status := getStatusReplica(t, base, name)
 	if status.Volumes[0].DiskState != "UpToDate" || len(status.Connections) != 1 {
 		t.Fatalf("state lost: %+v", status)
+	}
+}
+
+func outOfSync(kib int64) *observation {
+	return &observation{
+		ResourceName: statusTestRD,
+		Volumes:      []volumeObservation{{VolumeNumber: 0, OutOfSyncKib: kib, HasSync: true}},
+	}
+}
+
+// A non-zero out-of-sync count that only drifts is not written on each
+// statistics frame. With both sides UpToDate on an Established
+// connection, DRBD moves a count the peer never cleared on every write
+// to the volume, and a satellite with a few such volumes sent a status
+// patch every ~10 s at idle. Going to or from zero is written at once,
+// and the drifted count goes out with the next write, or once
+// outOfSyncRefresh has passed.
+func TestObserverCoalescesADriftingOutOfSyncCount(t *testing.T) {
+	base := startStatusEnvtest(t)
+	name := createStatusReplica(t, base)
+
+	var applies atomic.Int64
+
+	cli := countStatusPatches(base, &applies)
+	o := &ObserverRunnable{Client: cli, Exec: storage.NewFakeExec(), NodeName: statusTestNode}
+	adm := drbd.NewAdm(o.Exec)
+	ctx := t.Context()
+
+	o.handleObservation(ctx, adm, deviceUpToDate())
+	o.handleObservation(ctx, adm, peerEstablished("n2"))
+	o.handleObservation(ctx, adm, outOfSync(1380924))
+
+	if got := getStatusReplica(t, base, name); got.Volumes[0].OutOfSyncKib != 1380924 {
+		t.Fatalf("first non-zero count not written: %+v", got.Volumes)
+	}
+
+	before := applies.Load()
+
+	for i := range int64(5) {
+		o.handleObservation(ctx, adm, outOfSync(1380900-i*4))
+		o.resyncOnce(ctx)
+	}
+
+	if got := applies.Load() - before; got != 0 {
+		t.Fatalf("a drifting out-of-sync count was written %d times", got)
+	}
+
+	steps := []struct {
+		what string
+		obs  *observation
+		age  time.Duration
+		want int64
+	}{
+		{what: "drop to zero", obs: outOfSync(0), want: 0},
+		{what: "rise from zero", obs: outOfSync(64), want: 64},
+		{what: "drift after the refresh period", obs: outOfSync(72), age: outOfSyncRefresh, want: 72},
+	}
+
+	for _, step := range steps {
+		if step.age > 0 {
+			o.appliedMu.Lock()
+			entry := o.applied[statusTestRD]
+			entry.at = entry.at.Add(-step.age)
+			o.applied[statusTestRD] = entry
+			o.appliedMu.Unlock()
+		}
+
+		before = applies.Load()
+		o.handleObservation(ctx, adm, step.obs)
+
+		if got := applies.Load() - before; got != 1 {
+			t.Fatalf("%s: applied %d times, want 1", step.what, got)
+		}
+
+		if got := getStatusReplica(t, base, name); got.Volumes[0].OutOfSyncKib != step.want {
+			t.Fatalf("%s: outOfSyncKib = %d, want %d", step.what, got.Volumes[0].OutOfSyncKib, step.want)
+		}
+	}
+
+	// Any other change carries the current count with it.
+	o.handleObservation(ctx, adm, outOfSync(80))
+
+	if got := getStatusReplica(t, base, name); got.Volumes[0].OutOfSyncKib != 72 {
+		t.Fatalf("drift inside the refresh period written: %d", got.Volumes[0].OutOfSyncKib)
+	}
+
+	o.handleObservation(ctx, adm, peerConnected("n3"))
+
+	if got := getStatusReplica(t, base, name); got.Volumes[0].OutOfSyncKib != 80 {
+		t.Fatalf("a write for another change kept the old count: %d", got.Volumes[0].OutOfSyncKib)
 	}
 }
