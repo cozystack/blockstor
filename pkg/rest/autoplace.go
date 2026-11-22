@@ -1559,6 +1559,12 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		return nil, false
 	}
 
+	// The replicas are written one at a time, and LINSTOR writes them in
+	// one transaction: without the hold the tiebreaker reconciler sees
+	// the first two of `r c n1 n2 n3` as an even-diskful tie and puts a
+	// witness on n3 before its own create turns it diskful.
+	defer placer.HoldWitness(r.Context(), s.Store, rdName, countDiskfulEnvelopes(envelopes))()
+
 	created := make([]apiv1.Resource, 0, len(envelopes))
 
 	for i := range envelopes {
@@ -1571,6 +1577,21 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	}
 
 	return created, true
+}
+
+// countDiskfulEnvelopes counts the envelopes of a resource create that
+// ask for a diskful replica: neither spelling of the diskless flag.
+func countDiskfulEnvelopes(envelopes []apiv1.ResourceCreate) int {
+	n := 0
+
+	for i := range envelopes {
+		flags := envelopes[i].Resource.Flags
+		if !slices.Contains(flags, apiv1.ResourceFlagDiskless) && !slices.Contains(flags, rscFlagDrbdDiskless) {
+			n++
+		}
+	}
+
+	return n
 }
 
 // createOneResource runs the full per-envelope wire-boundary

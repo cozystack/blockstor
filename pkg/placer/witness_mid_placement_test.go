@@ -23,6 +23,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/placer"
@@ -188,4 +189,154 @@ func (r *diskfulOnFirstCreateResources) Create(ctx context.Context, res *apiv1.R
 	})
 
 	return r.ResourceStore.Create(ctx, res) //nolint:wrapcheck // test double
+}
+
+// holdObserver records, at every replica create, whether the
+// definition carries a placement in progress that is still due.
+type holdObserver struct {
+	store.Store
+
+	mu   *sync.Mutex
+	held *[]bool
+}
+
+func (s holdObserver) Resources() store.ResourceStore {
+	return holdObserverResources{ResourceStore: s.Store.Resources(), st: s}
+}
+
+type holdObserverResources struct {
+	store.ResourceStore
+
+	st holdObserver
+}
+
+func (r holdObserverResources) Create(ctx context.Context, res *apiv1.Resource) error {
+	rd, err := r.st.ResourceDefinitions().Get(ctx, res.Name)
+	if err != nil {
+		return err //nolint:wrapcheck // test double
+	}
+
+	r.st.mu.Lock()
+	*r.st.held = append(*r.st.held, placementHeld(&rd))
+	r.st.mu.Unlock()
+
+	return r.ResourceStore.Create(ctx, res) //nolint:wrapcheck // test double
+}
+
+func placementHeld(rd *apiv1.ResourceDefinition) bool {
+	deadline, err := time.Parse(time.RFC3339, rd.Annotations[apiv1.PlacementInProgressUntilAnnotation])
+
+	return err == nil && time.Now().Before(deadline)
+}
+
+// A placement that writes several diskful replicas tells the tiebreaker
+// reconciler so for as long as it writes them, and says it is done when
+// it is: the reconciler, seeing two of three replicas, would otherwise
+// put a witness on the third node, which the peers set up as diskless
+// and the placement then turns diskful under them. A placement of one
+// replica passes through no intermediate shape and leaves the
+// definition alone.
+func TestPlaceHoldsTheWitnessWhileItWritesReplicas(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		count int32
+		held  bool
+	}{
+		{name: "three replicas", count: 3, held: true},
+		{name: "one replica", count: 1, held: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			inner := store.NewInMemory()
+			seedStore(t, inner, []string{"n1", "n2", "n3"})
+
+			err := inner.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"})
+			if err != nil {
+				t.Fatalf("seed definition: %v", err)
+			}
+
+			var held []bool
+
+			st := holdObserver{Store: inner, mu: &sync.Mutex{}, held: &held}
+
+			placed, _, err := placer.New(st).Place(t.Context(), "pvc-1", &apiv1.AutoSelectFilter{PlaceCount: apiv1.LaxInt32(tc.count)})
+			if err != nil || placed != int(tc.count) {
+				t.Fatalf("Place: placed %d, err %v; want %d", placed, err, tc.count)
+			}
+
+			if len(held) != int(tc.count) {
+				t.Fatalf("observed %d creates, want %d", len(held), tc.count)
+			}
+
+			for i, h := range held {
+				if h != tc.held {
+					t.Errorf("create %d: placement in progress %v, want %v", i+1, h, tc.held)
+				}
+			}
+
+			rd, err := inner.ResourceDefinitions().Get(t.Context(), "pvc-1")
+			if err != nil {
+				t.Fatalf("get definition: %v", err)
+			}
+
+			if v, ok := rd.Annotations[apiv1.PlacementInProgressUntilAnnotation]; ok {
+				t.Errorf("placement done, the definition still carries %s=%q", apiv1.PlacementInProgressUntilAnnotation, v)
+			}
+		})
+	}
+}
+
+// Placements of one definition run in more than one process, the REST
+// server and the controller, so two of them can hold the witness at
+// once. The one that finishes first ends its own hold only: the other
+// is still writing replicas, and a witness added under it lands on a
+// node it is about to make diskful.
+func TestHoldWitnessKeepsTheHoldOfAnotherPlacement(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"})
+	if err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	inProgress := func() bool {
+		rd, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
+		if err != nil {
+			t.Fatalf("get definition: %v", err)
+		}
+
+		_, ok := apiv1.PlacementInProgressUntil(rd.Annotations, time.Now())
+
+		return ok
+	}
+
+	releaseFirst := placer.HoldWitness(ctx, st, "pvc-1", 3)
+	releaseSecond := placer.HoldWitness(ctx, st, "pvc-1", 2)
+
+	releaseSecond()
+
+	if !inProgress() {
+		t.Fatalf("the second placement finished and ended the hold of the first, still writing")
+	}
+
+	releaseFirst()
+
+	if inProgress() {
+		t.Errorf("both placements finished, the definition still holds the witness")
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("get definition: %v", err)
+	}
+
+	if v, ok := rd.Annotations[apiv1.PlacementInProgressUntilAnnotation]; ok {
+		t.Errorf("both placements finished, the definition still carries %s=%q", apiv1.PlacementInProgressUntilAnnotation, v)
+	}
 }

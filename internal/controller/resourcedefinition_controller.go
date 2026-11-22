@@ -456,7 +456,9 @@ func shouldKeepExistingWitness(diskful, _, witnessUnnecessaryDiskfulCount int) b
 //     breaks the tie. Suppression also gates this branch — the REST
 //     per-resource-delete handler stamps a short-lived annotation
 //     right before dropping the witness so the next reconcile
-//     doesn't put it back milliseconds later.
+//     doesn't put it back milliseconds later. So does a placement
+//     still writing its diskful replicas (isPlacementInProgress): the
+//     replicas it wrote so far are not the shape to decide on.
 //
 //  2. Keep branch (Bug 104): preserve an already-stamped TIE_BREAKER
 //     only at the even-diskful tie it defends (diskful == 2). Below
@@ -480,7 +482,7 @@ func shouldTieBreakerExist(
 
 	nonWitnessDiskless := len(diskless) - len(witness)
 
-	wantNewWitness := !isTiebreakerSuppressed(rd) &&
+	wantNewWitness := !isTiebreakerSuppressed(rd) && !isPlacementInProgress(rd) &&
 		len(diskful) >= 2 && len(diskful)%2 == 0 && nonWitnessDiskless == 0
 
 	const witnessUnnecessaryDiskfulCount = 3
@@ -660,6 +662,19 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	}
 
 	return time.Now().Before(deadline)
+}
+
+// isPlacementInProgress reports whether a placement is still writing
+// the RD's diskful replicas (PlacementInProgressUntilAnnotation). The
+// replicas it has written so far are not the shape the witness decision
+// is for: a three-replica placement two replicas in looks like the
+// even-diskful tie a witness breaks, and the witness would land on the
+// node the third replica is for. The placement removing the annotation
+// wakes the RD, and the decision is made on the replicas it placed.
+func isPlacementInProgress(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	_, ok := apiv1.PlacementInProgressUntil(rd.Annotations, time.Now())
+
+	return ok
 }
 
 // isKeepTiebreakerActive reports whether an operator recently ran

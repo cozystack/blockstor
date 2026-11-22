@@ -24,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,7 +92,14 @@ func (s slowWholeClusterReader) List(ctx context.Context, list client.ObjectList
 // spawn came up with a witness and was ready only minutes later. The
 // latencies are those of that cluster's size: 100 ms a create, 400 ms
 // a read of every Resource (SPAWN3_CREATE_MS, SPAWN3_WHOLE_READ_MS).
-func TestSpawnThreeDiskfulTakesOverTheWitnessGrownMeanwhile(t *testing.T) {
+//
+// Taking the witness over settles the count but not the peers: they
+// set the witness up as a diskless peer, and when it came up diskful
+// one of them refused the handshake and left the connection StandAlone.
+// So no witness may appear during the placement at all, the way none
+// does in LINSTOR, which decides on the witness once the placement is
+// written.
+func TestSpawnThreeDiskfulComesUpWithoutAWitness(t *testing.T) {
 	s := startBurstStackWith(t, []string{"n1", "n2", "n3"}, burstLatency{
 		create:           time.Duration(envInt("SPAWN3_CREATE_MS", 100)) * time.Millisecond,
 		wholeClusterRead: time.Duration(envInt("SPAWN3_WHOLE_READ_MS", 400)) * time.Millisecond,
@@ -114,6 +122,8 @@ func TestSpawnThreeDiskfulTakesOverTheWitnessGrownMeanwhile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("volume of %s: %v", name, err)
 		}
+
+		witnesses := s.watchWitnesses(ctx, t, name)
 
 		_, _, err = s.post(ctx, "/v1/resource-definitions/"+name+"/autoplace", apiv1.AutoPlaceRequest{
 			SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 3, StoragePool: burstPool},
@@ -146,5 +156,57 @@ func TestSpawnThreeDiskfulTakesOverTheWitnessGrownMeanwhile(t *testing.T) {
 		if err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
+
+		if nodes := witnesses(); len(nodes) > 0 {
+			t.Errorf("%s: a TIE_BREAKER witness appeared on %v during the placement; the peers set it up "+
+				"as a diskless peer and drop the connection when the placement turns it diskful", name, nodes)
+		}
+	}
+}
+
+// watchWitnesses records every node a TIE_BREAKER replica of rdName
+// shows up on from now until the returned function is called, which
+// stops the watch and returns them. A witness the placement took over
+// is gone by the time the autoplace answers, so only a watch sees it.
+func (s *burstStack) watchWitnesses(ctx context.Context, t *testing.T, rdName string) func() []string {
+	t.Helper()
+
+	w, err := s.watch.Watch(ctx, &blockstoriov1alpha1.ResourceList{})
+	if err != nil {
+		t.Fatalf("watch resources: %v", err)
+	}
+
+	var (
+		mu    sync.Mutex
+		nodes []string
+		done  = make(chan struct{})
+	)
+
+	go func() {
+		defer close(done)
+
+		for ev := range w.ResultChan() {
+			res, ok := ev.Object.(*blockstoriov1alpha1.Resource)
+			if !ok || res.Spec.ResourceDefinitionName != rdName ||
+				!slices.Contains(res.Spec.Flags, apiv1.ResourceFlagTieBreaker) {
+				continue
+			}
+
+			mu.Lock()
+			if !slices.Contains(nodes, res.Spec.NodeName) {
+				nodes = append(nodes, res.Spec.NodeName)
+			}
+			mu.Unlock()
+		}
+	}()
+
+	return func() []string {
+		w.Stop()
+		<-done
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		return nodes
 	}
 }
