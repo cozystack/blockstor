@@ -659,8 +659,12 @@ func isKeepTiebreakerActive(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // A DELETE flag on the RD's spec counts the same way. Upstream's
 // definition delete marks the definition and never runs the
 // auto-tiebreaker helper on it again, so a definition carrying the
-// flag (one adopted from LINSTOR mid-delete included) gets no new
-// witness either.
+// flag gets no new witness either. The guard stops all witness
+// management for it, removal and the quorum recount included, as
+// upstream does; a flag nothing ever clears therefore leaves the
+// definition's witness as it stands. linstor-migrate does not adopt a
+// definition flagged DELETE in the source cluster, so the flag reaches
+// a definition only through an explicit write.
 func (r *ResourceDefinitionReconciler) rdIsDeleting(_ context.Context, rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	if rd == nil {
 		return true
