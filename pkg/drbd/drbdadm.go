@@ -617,6 +617,20 @@ func (a *Adm) ForgetPeer(ctx context.Context, resource string, peerNodeID int32)
 	return nil
 }
 
+// DelPeerByNodeID removes the kernel's connection to the peer with the
+// given node-id, through `drbdsetup del-peer <resource> <node-id>`, the
+// call LINSTOR's satellite makes for a peer being deleted. Unlike
+// DelPeer it does not resolve the peer through the .res, which by then
+// may name the same node under a different node-id.
+func (a *Adm) DelPeerByNodeID(ctx context.Context, resource string, peerNodeID int32) error {
+	_, err := a.exec.Run(ctx, "drbdsetup", "del-peer", resource, strconv.Itoa(int(peerNodeID)))
+	if err != nil {
+		return errors.Wrapf(err, "drbdsetup del-peer %s %d", resource, peerNodeID)
+	}
+
+	return nil
+}
+
 // DelPeer disconnects and forgets a peer node for the given resource.
 // Run this BEFORE rewriting the .res file with the peer removed —
 // drbdadm needs the peer's `on <peer>` block in the .res to resolve
