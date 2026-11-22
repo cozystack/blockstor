@@ -1328,9 +1328,9 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	// for its satellites. A satellite that reports its delete failed
 	// ends the wait with that error, as in LINSTOR. While every listed
 	// node is online the wait lasts as long as the satellites take;
-	// once one is offline the budget applies and we surface 504 + a
-	// stuck-satellite envelope so the operator gets a concrete next
-	// action instead of a silently-half-completed delete.
+	// once one is offline or unknown the budget applies and we surface
+	// 504 + a stuck-satellite envelope so the operator gets a concrete
+	// next action instead of a silently-half-completed delete.
 	outcome, failures := s.waitForSnapshotDrained(r.Context(), rd, snapName)
 	if outcome == snapshotWaitFailed {
 		writeJSON(w, http.StatusInternalServerError, snapshotDeleteFailureRcs(rd, snapName, failures))

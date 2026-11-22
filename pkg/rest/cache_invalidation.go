@@ -276,7 +276,7 @@ func vdDeletionVisible(ctx context.Context, st store.Store, rdName string, volum
 // snapshot.go: `snapshotFinalizerRequeue = time.Second`) while
 // still bounding the wait on a node that is gone. Past the budget
 // a delete gives up and surfaces 504 only once one of the
-// snapshot's nodes is offline; see waitForSnapshotDrained.
+// snapshot's nodes is offline or unknown; see waitForSnapshotDrained.
 const snapshotDeleteWaitBudget = 10 * time.Second
 
 // snapshotDeleteWaitPoll is the cadence between successive Get
@@ -327,8 +327,8 @@ func (s *Server) waitForSnapshotDeletionVisible(ctx context.Context, rdName, sna
 // deleted volume only after a delete that succeeded; its retry finds
 // the snapshot being deleted, or gone, and never sends the delete
 // again, so a 504 here left that definition behind for good. The budget
-// still applies once a listed node is offline: that node's copy will
-// not go until it is back.
+// still applies once a listed node is offline or unknown: that node's
+// copy will not go until it is back.
 //
 // The CRD goes once the first listed satellite has deleted its copy and
 // dropped the finalizer the satellites share, so "gone" means that, not
@@ -386,11 +386,28 @@ func (s *Server) waitForSnapshotGone(
 
 // snapshotDrainCanProgress reports whether every node snap lists is
 // online, so each one still holding its copy can delete it. A snapshot
-// that lists no node has no satellite to drain it.
+// that lists no node has no satellite to drain it, and neither does a
+// node the store no longer knows: no satellite of that name will take
+// the finalizer off.
 func (s *Server) snapshotDrainCanProgress(ctx context.Context, snap *apiv1.Snapshot) bool {
 	if len(snap.Nodes) == 0 {
 		return false
 	}
 
-	return len(s.offlineTargetNodes(ctx, snap.Nodes)) == 0
+	for _, name := range snap.Nodes {
+		node, err := s.Store.Nodes().Get(ctx, name)
+
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return false
+		case err != nil:
+			// A failed read does not show the node is gone; keep the
+			// best-effort reading isNodeOnline gives every other wait.
+			continue
+		case node.ConnectionStatus == apiv1.NodeTypeOffline:
+			return false
+		}
+	}
+
+	return true
 }

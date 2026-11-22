@@ -161,6 +161,29 @@ func TestSnapshotDeleteGivesUpOnAnOfflineNode(t *testing.T) {
 	}
 }
 
+// TestSnapshotDeleteGivesUpOnAnUnknownNode: the snapshot lists a node
+// the store no longer has (deleted or lost without a cascade), so no
+// satellite of that name will take the finalizer off. The delete must
+// answer 504 once the budget is spent, as for an offline node, instead
+// of counting the missing node as online and waiting for good.
+func TestSnapshotDeleteGivesUpOnAnUnknownNode(t *testing.T) {
+	base := startSnapshotDeleteServer(t, 0, []apiv1.Node{
+		{Name: "n1", Type: "SATELLITE", ConnectionStatus: apiv1.NodeTypeOnline},
+	}, apiv1.Snapshot{Nodes: []string{"n1", "gone"}})
+
+	resp, elapsed := deleteSnap1(t, base)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got %d, want 504 (body=%s)", resp.StatusCode, body)
+	}
+
+	if elapsed > slowSatelliteBudget+2*time.Second {
+		t.Errorf("DELETE returned in %v; want about the %v budget", elapsed, slowSatelliteBudget)
+	}
+}
+
 // TestSnapshotDeleteAnswersASatelliteFailure: the satellites are online,
 // but one of them failed to delete its copy (lvremove refused, pool in
 // error). LINSTOR answers the delete with the error its satellite
