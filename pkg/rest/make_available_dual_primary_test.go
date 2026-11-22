@@ -303,3 +303,119 @@ func TestResourceConnectionListShowsMigrationProps(t *testing.T) {
 		t.Fatalf("resource connections: %+v", got)
 	}
 }
+
+// liveMigrationServer is a Server on st for calling the dual-Primary steps
+// directly, to put them in the order a race would.
+func liveMigrationServer(t *testing.T, st store.Store) *Server {
+	t.Helper()
+
+	return &Server{Store: st, Client: newFakeRESTClient(t), Namespace: testRESTNamespace}
+}
+
+func createDisklessReplica(t *testing.T, st store.Store, node string) {
+	t.Helper()
+
+	err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name: "vm-disk", NodeName: node, Flags: []string{apiv1.ResourceFlagDiskless},
+	})
+	if err != nil {
+		t.Fatalf("create diskless replica on %s: %v", node, err)
+	}
+}
+
+// Two attaches with the flag on two targets at once (an RWX block volume
+// with pods on two nodes) both pick the one node in use as their source
+// before either writes. The one that writes second must find the first
+// one's marks and be refused, not move the marks to its own pair: an
+// unmake-available on the source would then put back the protocol of only
+// one of the two connections and leave protocol C on the other for good.
+func TestOpenDualPrimaryRefusesWhenAnotherMigrationWonTheRace(t *testing.T) {
+	st, base := liveMigrationFixture(t, nil)
+	srv := liveMigrationServer(t, st)
+
+	status, rcs := postRcs(t, base+"/v1/resource-definitions/vm-disk/resources/node-b/make-available",
+		`{"diskful":false,"auto_manage_dual_primary":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("make-available on node-b: %d %+v", status, rcs)
+	}
+
+	// The call for node-c picked node-a as its source before node-b's
+	// marks landed, and writes now.
+	_, err := srv.openDualPrimary(t.Context(), "vm-disk", "node-a", "node-c")
+	if code := refusalCode(t, err); code != apiCallRcError|apiCallRcFailExistsLiveMigrate {
+		t.Fatalf("losing make-available: rc %d, want FAIL_EXISTS_LIVE_MIGRATE", code)
+	}
+
+	props := rdProps(t, st)
+	if props[liveMigrateTargetProp] != "node-b" {
+		t.Errorf("marks moved to %q, want them left on node-b", props[liveMigrateTargetProp])
+	}
+
+	for key := range props {
+		if pair, _, ok := apiv1.ParseResourceConnectionPropKey(key); ok && pair.Has("node-c") {
+			t.Errorf("the refused call wrote %s", key)
+		}
+	}
+
+	// The winner's repeat still goes through.
+	if _, err = srv.openDualPrimary(t.Context(), "vm-disk", "node-a", "node-b"); err != nil {
+		t.Fatalf("repeat of the prepared migration: %v", err)
+	}
+}
+
+// A retried attach on the target picked the source while the VM still ran
+// there; an unmake-available on the source reverted everything before the
+// attach wrote. The attach must not write the migration back: nobody would
+// revert it again, and every later migration would be refused.
+func TestOpenDualPrimaryAfterTheSourceLetGo(t *testing.T) {
+	st, _ := liveMigrationFixture(t, nil)
+	srv := liveMigrationServer(t, st)
+
+	createDisklessReplica(t, st, "node-b")
+	setInUse(t, st, "node-a", false)
+
+	rcs, err := srv.openDualPrimary(t.Context(), "vm-disk", "node-a", "node-b")
+	if err != nil {
+		t.Fatalf("openDualPrimary: %v", err)
+	}
+
+	if len(rcs) != 1 || rcs[0].RetCode != maskInfo {
+		t.Errorf("answer %+v, want the no-migration note", rcs)
+	}
+
+	for key := range rdProps(t, st) {
+		if propInNamespace(key, liveMigrateNamespace) || propInNamespace(key, "Cozystack/ResourceConnectionProps") {
+			t.Errorf("a migration whose source let go wrote %s", key)
+		}
+	}
+}
+
+// The node the VM ran on dies and the VM comes back on another node. The
+// dead node's last report still says in use, but it is OFFLINE: the attach
+// on the new node is a plain one, and the detach of the dead node is not
+// refused with FAIL_IN_USE, which linstor-csi takes as done and never
+// retries.
+func TestDualPrimaryIgnoresTheInUseOfAnOfflineNode(t *testing.T) {
+	st, base := liveMigrationFixture(t, nil)
+	url := base + "/v1/resource-definitions/vm-disk/resources/"
+
+	if err := st.Nodes().SetConnectionStatus(t.Context(), "node-a", apiv1.NodeTypeOffline); err != nil {
+		t.Fatalf("mark node-a offline: %v", err)
+	}
+
+	status, rcs := postRcs(t, url+"node-b/make-available", `{"diskful":false,"auto_manage_dual_primary":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("make-available on node-b: %d %+v", status, rcs)
+	}
+
+	for key := range rdProps(t, st) {
+		if propInNamespace(key, liveMigrateNamespace) || propInNamespace(key, "Cozystack/ResourceConnectionProps") {
+			t.Errorf("an attach next to an offline node prepared a migration: %s", key)
+		}
+	}
+
+	status, rcs = postRcs(t, url+"node-a/unmake-available", ``)
+	if status != http.StatusOK {
+		t.Fatalf("unmake-available on the offline node: %d %+v, want 200", status, rcs)
+	}
+}

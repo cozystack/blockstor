@@ -288,6 +288,11 @@ type dualPrimaryPlan struct {
 	ends         [2]protocolSources
 }
 
+// is reports whether the migration from source to target is this plan's.
+func (p *dualPrimaryPlan) is(source, target string) bool {
+	return naming.Same(p.source, source) && naming.Same(p.target, target)
+}
+
 // apply writes the dual-Primary props into a definition's props and
 // answers the messages for the caller. It runs inside the definition
 // patch, so the protocol is judged against the props it changes.

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -114,6 +115,13 @@ func (s *Server) liveMigrationSource(ctx context.Context, rd *apiv1.ResourceDefi
 		return "", errors.Wrapf(err, "list replicas of %s", rd.Name)
 	}
 
+	// An in-use reported by a node that is gone is stale: see inUseOnline.
+	for i := range replicas {
+		if inUse(&replicas[i]) && nodeOffline(ctx, s.Store, replicas[i].NodeName) {
+			replicas[i].State.InUse = nil
+		}
+	}
+
 	return migrationSource(rd.Name, rd.Props, replicas, target)
 }
 
@@ -121,42 +129,49 @@ func (s *Server) liveMigrationSource(ctx context.Context, rd *apiv1.ResourceDefi
 // source to target onto the definition, once target is available. With no
 // source there is no migration and only the note saying so is answered.
 //
+// The source was picked before target was made available, outside the
+// definition write. LINSTOR picks it and writes the props under one lock;
+// here the write re-checks what the pick relied on against the definition
+// it changes, so a call that lost a race does not overwrite the winner:
+//
+//   - marks naming another migration refuse the call, as they would have
+//     had they been there at the pick (two targets attached at once);
+//   - a source that let go of the device meanwhile means there is no
+//     migration to prepare any more (an unmake-available on the source
+//     ran in between), and nothing is written.
+//
 // Unlike LINSTOR, the call does not wait for the satellites to apply the
 // change: no definition prop write in blockstor does. The satellites of
 // both ends re-render their resource file from the definition watch.
 func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target string) ([]apiv1.APICallRc, error) {
 	if source == "" {
-		return []apiv1.APICallRc{{
-			RetCode: maskInfo,
-			Message: fmt.Sprintf("Resource '%s' is not in use on another node, no dual-primary preparation needed",
-				rdName),
-		}}, nil
+		return notMigrating(rdName), nil
 	}
 
-	plan := dualPrimaryPlan{rdName: rdName, source: source, target: target, bothDiskless: true}
-
-	for i, node := range []string{source, target} {
-		res, err := getResourceWithCacheRetry(ctx, s.Store, rdName, node)
-		if err != nil {
-			return nil, errors.Wrapf(err, "replica of %s on %s", rdName, node)
-		}
-
-		plan.bothDiskless = plan.bothDiskless && drbdDiskless(&res)
-
-		eff, _, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, &res)
-		if err != nil {
-			return nil, err
-		}
-
-		plan.ends[i] = protocolSourcesOf(eff)
+	plan, err := s.planDualPrimary(ctx, rdName, source, target)
+	if err != nil {
+		return nil, err
 	}
 
-	var msgs []apiv1.APICallRc
+	var (
+		msgs      []apiv1.APICallRc
+		migrating bool
+	)
 
-	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
+	err = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
 		func(live *apiv1.ResourceDefinition) error {
 			if live.Props == nil {
 				live.Props = map[string]string{}
+			}
+
+			markSource, markTarget := live.Props[liveMigrateSourceProp], live.Props[liveMigrateTargetProp]
+			if apiv1.LiveMigrationMarked(live.Props) && !plan.is(markSource, markTarget) {
+				return conflictingMigration(rdName, markSource, markTarget)
+			}
+
+			migrating = s.inUseOnline(ctx, rdName, source)
+			if !migrating {
+				return nil
 			}
 
 			msgs = plan.apply(live.Props)
@@ -167,7 +182,71 @@ func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target str
 		return nil, errors.Wrapf(err, "set dual-primary props on %s", rdName)
 	}
 
+	if !migrating {
+		return notMigrating(rdName), nil
+	}
+
 	return msgs, nil
+}
+
+// planDualPrimary reads what the protocol of each end depends on below and
+// above the definition, and whether both ends are diskless.
+func (s *Server) planDualPrimary(ctx context.Context, rdName, source, target string) (dualPrimaryPlan, error) {
+	plan := dualPrimaryPlan{rdName: rdName, source: source, target: target, bothDiskless: true}
+
+	for i, node := range []string{source, target} {
+		res, err := getResourceWithCacheRetry(ctx, s.Store, rdName, node)
+		if err != nil {
+			return plan, errors.Wrapf(err, "replica of %s on %s", rdName, node)
+		}
+
+		plan.bothDiskless = plan.bothDiskless && drbdDiskless(&res)
+
+		eff, _, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, &res)
+		if err != nil {
+			return plan, err
+		}
+
+		plan.ends[i] = protocolSourcesOf(eff)
+	}
+
+	return plan, nil
+}
+
+// notMigrating is the answer of a make-available with
+// auto_manage_dual_primary that has no live migration to prepare.
+func notMigrating(rdName string) []apiv1.APICallRc {
+	return []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: fmt.Sprintf("Resource '%s' is not in use on another node, no dual-primary preparation needed",
+			rdName),
+	}}
+}
+
+// inUseOnline reports whether the replica of rdName on node holds the
+// device open, as far as anyone can tell: a replica on an OFFLINE node is
+// not. The satellite of a node that went away cannot clear the in-use it
+// last reported, so that report outlives the VM it described; LINSTOR
+// forgets a satellite's state when the connection drops, and a node that
+// is gone is in use nowhere.
+func (s *Server) inUseOnline(ctx context.Context, rdName, node string) bool {
+	res, err := s.Store.Resources().Get(ctx, rdName, node)
+	if err != nil {
+		return false
+	}
+
+	return inUse(&res) && !nodeOffline(ctx, s.Store, node)
+}
+
+// nodeOffline reports whether the node is known to be unreachable: its
+// heartbeat went stale and the controller marked it OFFLINE.
+func nodeOffline(ctx context.Context, st store.Store, node string) bool {
+	n, err := st.Nodes().Get(ctx, node)
+	if err != nil {
+		return false
+	}
+
+	return strings.EqualFold(n.ConnectionStatus, apiv1.NodeTypeOffline)
 }
 
 // handleResourceUnmakeAvailable answers
@@ -177,7 +256,8 @@ func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target str
 //
 //   - refused with FAIL_IN_USE while the replica on node is in use, and
 //     nothing is changed then, the dual-Primary props included: the
-//     caller retries once the node let go;
+//     caller retries once the node let go. An OFFLINE node is in use
+//     nowhere, whatever it reported last (see inUseOnline);
 //   - the dual-Primary props come off the definition (see
 //     revertDualPrimary);
 //   - the replica on node is deleted when it is a diskless attachment;
@@ -221,7 +301,7 @@ func (s *Server) handleResourceUnmakeAvailable(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if present != nil && inUse(present) {
+	if present != nil && inUse(present) && !nodeOffline(ctx, s.Store, node) {
 		writeStillInUse(w, rdName, node)
 
 		return
