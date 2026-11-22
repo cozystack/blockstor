@@ -546,7 +546,7 @@ func TestGroupFREffectivePropsEndpoint(t *testing.T) {
 
 	// Stamp a controller-scope prop so the Controller rung of the
 	// effective-props chain has something to surface.
-	postControllerProp(t, stack, "DrbdOptions/Net/ping-timeout", "500")
+	postControllerProp(t, stack, "DrbdOptions/Net/ping-timeout", "250")
 
 	harness.Eventually(t, groupFAssertTimeout, func() bool {
 		rows := cli.JSON(t, "resource", "list", "-r", rd)
@@ -616,7 +616,7 @@ func TestGroupFRListVolumePoolField(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestGroupFRSetPropertyDrbdNet — a per-Resource DrbdOptions/Net/<key>
+// TestGroupFRSetPropertyDrbdNet — a per-Resource DrbdOptions/<key>
 // prop MUST be persisted on the CRD so the dispatcher's effective-props
 // chain (Controller→RG→RD→Resource) picks it up at the satellite-facing
 // scope. Drives the write through python-linstor's
@@ -636,8 +636,11 @@ func TestGroupFRSetPropertyDrbdNet(t *testing.T) {
 	waitForResourceExists(t, stack, rd, harness.NodeWorker1)
 
 	const (
-		propKey = "DrbdOptions/Net/ping-timeout"
-		propVal = "500"
+		// LINSTOR whitelists no DRBD section option on a single
+		// replica, so this is one of the two DrbdOptions keys it
+		// does allow there.
+		propKey = "DrbdOptions/auto-diskful-allow-cleanup"
+		propVal = "true"
 	)
 
 	// Production path: drive the modify through the linstor CLI.
@@ -648,8 +651,8 @@ func TestGroupFRSetPropertyDrbdNet(t *testing.T) {
 
 	// CRD-side assertion (envtest client is read-only here): the
 	// REST handler MUST have merged override_props onto the Resource
-	// CRD. `DrbdOptions/Net/ping-timeout` is an UNRECOGNISED Net key in
-	// the k8s store's typed transcoder (`applyNetKey` switch), so the
+	// CRD. `DrbdOptions/auto-diskful-allow-cleanup` is an UNRECOGNISED key in
+	// the k8s store's typed transcoder, so the
 	// store routes it into Spec.ExtraProps rather than the typed
 	// Spec.DRBDOptions.Net struct — Spec.Props itself carries only
 	// non-DRBD residual keys. Reading via the controller-runtime client
@@ -694,7 +697,7 @@ func TestGroupFRSetPropertyDrbdNet(t *testing.T) {
 		}
 
 		return false
-	}, "DrbdOptions/Net/ping-timeout never surfaced via effective_props")
+	}, propKey+" never surfaced via effective_props")
 }
 
 // ===========================================================================

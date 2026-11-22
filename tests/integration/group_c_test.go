@@ -394,7 +394,7 @@ func TestGroupCRGSetPropertyDrbdNet(t *testing.T) {
 		rgName  = "rg-net"
 		rdName  = "pvc-net"
 		propKey = "DrbdOptions/Net/ping-timeout"
-		propVal = "500"
+		propVal = "250"
 	)
 
 	cli.Run(t, "resource-group", "create", rgName,
@@ -444,7 +444,7 @@ func TestGroupCRGSetPropertyDrbdNet(t *testing.T) {
 
 		// Inherited from the RG. Scenario 5.W03: the value must
 		// reach satellite scope so the .res renderer can emit
-		// `net { ping-timeout 500; }`. Spawn copies the bag from
+		// `net { ping-timeout 250; }`. Spawn copies the bag from
 		// RG → RD, so the highest-precedence origin is either RG
 		// (untouched RD) or RD (post-copy) — both are inheritance,
 		// neither is a per-Resource override. R-scope here would
