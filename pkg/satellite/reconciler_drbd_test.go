@@ -1285,11 +1285,63 @@ func TestApplyUnknownStoragePool(t *testing.T) {
 			results[0].GetMessage())
 	}
 
+	if results[0].GetWaitingForController() {
+		t.Errorf("a named pool this node has no provider for read as a wait; want a failed apply")
+	}
+
 	// No DRBD commands should fire — we bail before applyDRBD.
 	for _, line := range fx.CommandLines() {
 		if strings.HasPrefix(line, "drbdadm ") {
 			t.Errorf("drbdadm should not run when storage step fails: %s", line)
 		}
+	}
+}
+
+// A diskful replica whose volumes name no pool yet waits for it, like
+// the other stamps a fresh replica can be seen without: no storage is
+// touched and the result is a wait, not a failed apply. Reported as a
+// failure, it put an ApplyFailed Warning on a replica that came up a
+// second later.
+func TestApplyWithoutAPoolYetWaits(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-no-pool-yet",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply outer error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	if results[0].GetOk() || !results[0].GetWaitingForController() {
+		t.Fatalf("result Ok=%v WaitingForController=%v (%q); want a wait",
+			results[0].GetOk(), results[0].GetWaitingForController(), results[0].GetMessage())
+	}
+
+	if lines := fx.CommandLines(); len(lines) != 0 {
+		t.Errorf("a replica without a pool ran %v; want nothing run", lines)
 	}
 }
 

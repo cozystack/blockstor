@@ -1705,6 +1705,10 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	cloned := false
 
 	for _, vol := range dr.GetVolumes() {
+		if vol.GetStoragePool() == "" {
+			return nil, false, false, errors.WithStack(errUnresolvedStoragePool)
+		}
+
 		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
 		if !ok {
 			return nil, false, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
@@ -5486,14 +5490,23 @@ func refuseUnresolvedSkipInitialSync(dr *intent.DesiredResource, freshActivation
 	return nil
 }
 
+// errUnresolvedStoragePool is what applyStorage returns for a diskful
+// replica whose volumes name no storage pool yet. The satellite can see
+// a fresh replica before the write that gives it its pool, and the pool
+// then lands as an update of the Resource that runs the apply again. A
+// pool that is named but has no provider on this node stays a failure:
+// that is a pool this node cannot serve, not one on its way.
+var errUnresolvedStoragePool = errors.Mark(
+	errors.New("storage pool not yet set on the diskful replica"), ErrWaitingForController)
+
 // ErrWaitingForController marks the errors of the gates above that
 // hold the apply until the controller stamps the replica: its DRBD
-// node-id, or the SkipInitialSync decision. A fresh replica routinely
-// meets them, since the satellite sees the Resource before the
-// controller's pass that stamps it is through, and the stamp is an
-// update of the Resource that runs the apply again. The apply result
-// carries it as WaitingForController, and the caller treats such a
-// result as a wait, not as a failed apply.
+// node-id, the SkipInitialSync decision, or a diskful replica's
+// storage pool. A fresh replica routinely meets them, since the
+// satellite sees the Resource before the controller's pass that stamps
+// it is through, and the stamp is an update of the Resource that runs
+// the apply again. The apply result carries it as WaitingForController,
+// and the caller treats such a result as a wait, not as a failed apply.
 var ErrWaitingForController = errors.New("waiting for the controller to stamp the replica")
 
 // WaitsForController reports whether err is one of the gates holding
