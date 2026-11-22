@@ -80,6 +80,11 @@ const (
 	busyCostZFS     = 13 * time.Millisecond
 	busyCostDefault = 4 * time.Millisecond
 
+	// busyCostListAdjustable is drbdadm sh-list-adjustable for the
+	// whole node, 115 resources: it parses every .res and asks the
+	// kernel for every resource's configuration.
+	busyCostListAdjustable = 70 * time.Millisecond
+
 	// busyCandidateDisks is how many empty disks lsblk lists on each
 	// node, as on the field nodes: each costs a pvs in every scan.
 	busyCandidateDisks = 8
@@ -97,6 +102,13 @@ type busyCPU struct {
 	// limited is off while the benchmark seeds the nodes, which is
 	// not what it measures.
 	limited atomic.Bool
+
+	// cores is how many cores the runs in flight share: the pod's CPU
+	// limit, or more for a pod without one.
+	cores float64
+
+	// runs counts the tool runs by tool since the last tools call.
+	runs map[string]int
 }
 
 // busyJob is one tool run: the CPU time it still needs.
@@ -109,7 +121,10 @@ type busyJob struct {
 const busyTick = 5 * time.Millisecond
 
 func newBusyCPU() *busyCPU {
-	return &busyCPU{active: map[*busyJob]struct{}{}, byTool: map[string]time.Duration{}}
+	return &busyCPU{
+		active: map[*busyJob]struct{}{}, byTool: map[string]time.Duration{}, runs: map[string]int{},
+		cores: busyCPULimit,
+	}
 }
 
 func (c *busyCPU) spend(ctx context.Context, tool string, cost time.Duration) {
@@ -123,6 +138,7 @@ func (c *busyCPU) spend(ctx context.Context, tool string, cost time.Duration) {
 	c.active[job] = struct{}{}
 	c.used += cost
 	c.byTool[tool] += cost
+	c.runs[tool]++
 	c.mu.Unlock()
 
 	select {
@@ -149,7 +165,7 @@ func (c *busyCPU) run(ctx context.Context) {
 		c.mu.Lock()
 
 		if n := len(c.active); n > 0 {
-			share := time.Duration(float64(busyTick) * busyCPULimit / float64(n))
+			share := time.Duration(float64(busyTick) * min(c.cores, float64(n)) / float64(n))
 
 			for job := range c.active {
 				job.left -= share
@@ -186,10 +202,11 @@ func (c *busyCPU) tools() string {
 
 	parts := make([]string, 0, len(names))
 	for _, name := range names {
-		parts = append(parts, fmt.Sprintf("%s %v", name, c.byTool[name].Round(10*time.Millisecond)))
+		parts = append(parts, fmt.Sprintf("%s %v/%d", name, c.byTool[name].Round(10*time.Millisecond), c.runs[name]))
 	}
 
 	clear(c.byTool)
+	clear(c.runs)
 
 	return strings.Join(parts, ", ")
 }
@@ -203,6 +220,10 @@ func busyCost(name string, args []string) time.Duration {
 	case "pvs", "vgs":
 		return busyCostLVM
 	case "drbdadm":
+		if slices.Contains(args, "sh-list-adjustable") {
+			return busyCostListAdjustable
+		}
+
 		return busyCostDrbdadm
 	case "zfs", "zpool":
 		return busyCostZFS
@@ -341,6 +362,18 @@ type busyStack struct {
 	cpus    map[string]*busyCPU
 	execs   map[string]*busyExec
 	idle    atomic.Bool
+
+	// clients are the satellites' cached clients, which their observer
+	// and disk discovery share, as they do in the satellite binary.
+	clients map[string]client.Client
+
+	// requests counts the API requests of the controller and of each
+	// node's satellite.
+	requests *busyRequests
+
+	// quiet stops the stand-in kernel, which lists every Resource five
+	// times a second, while the idle cost is measured.
+	quiet atomic.Bool
 }
 
 func startBusyStack(t *testing.T, nodes []string) *busyStack {
@@ -371,7 +404,9 @@ func startBusyStack(t *testing.T, nodes []string) *busyStack {
 		Controller:             config.Controller{SkipNameValidation: &skip},
 	}
 
-	mgr, st, err := storek8s.NewManager(env.Cfg, opts)
+	requests := newBusyRequests()
+
+	mgr, st, err := storek8s.NewManager(requests.config(env.Cfg, busyController), opts)
 	if err != nil {
 		t.Fatalf("controller manager: %v", err)
 	}
@@ -391,7 +426,8 @@ func startBusyStack(t *testing.T, nodes []string) *busyStack {
 
 	s := &busyStack{
 		cli: env.Client, restURL: "http://" + addr, nodes: nodes,
-		cpus: map[string]*busyCPU{}, execs: map[string]*busyExec{},
+		cpus: map[string]*busyCPU{}, execs: map[string]*busyExec{}, requests: requests,
+		clients: map[string]client.Client{},
 	}
 
 	for _, node := range nodes {
@@ -400,7 +436,7 @@ func startBusyStack(t *testing.T, nodes []string) *busyStack {
 		ex := &busyExec{cpu: cpu, uevents: make(chan uevent.Event, 1024), lsblk: busyLsblk()}
 		s.cpus[node], s.execs[node] = cpu, ex
 
-		satMgr, err := ctrl.NewManager(env.Cfg, opts)
+		satMgr, err := ctrl.NewManager(requests.config(env.Cfg, node), opts)
 		if err != nil {
 			t.Fatalf("satellite manager %s: %v", node, err)
 		}
@@ -420,6 +456,8 @@ func startBusyStack(t *testing.T, nodes []string) *busyStack {
 				APIReader: satMgr.GetAPIReader(),
 			},
 		}
+
+		s.clients[node] = satMgr.GetClient()
 
 		err = rec.SetupWithManager(satMgr)
 		if err != nil {
@@ -587,6 +625,10 @@ func (s *busyStack) kernel(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+
+		if s.quiet.Load() {
+			continue
 		}
 
 		var list blockstoriov1alpha1.ResourceList
@@ -864,7 +906,8 @@ func (s *busyStack) startNodeAgents(ctx context.Context, t *testing.T, idle []st
 	for _, node := range s.nodes {
 		ex := s.execs[node]
 
-		observer := &satcontrollers.ObserverRunnable{Client: s.cli, Exec: ex, NodeName: node}
+		cli := s.clients[node]
+		observer := &satcontrollers.ObserverRunnable{Client: cli, Exec: ex, NodeName: node}
 		busyRun(ctx, t, &wg, observer)
 
 		// One stream claims one node's dump; start the next observer
@@ -883,7 +926,7 @@ func (s *busyStack) startNodeAgents(ctx context.Context, t *testing.T, idle []st
 		}
 
 		discovery := &satcontrollers.PhysicalDeviceDiscoveryRunnable{
-			Client: s.cli, Exec: ex, NodeName: node, Uevent: busyUevents{ch: ex.uevents},
+			Client: cli, Exec: ex, NodeName: node, Uevent: busyUevents{ch: ex.uevents},
 		}
 		busyRun(ctx, t, &wg, discovery)
 	}
