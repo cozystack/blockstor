@@ -20,6 +20,7 @@ package satellite
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -375,6 +376,31 @@ func TestApply_DropsSoloBirthBeforeAFailingStep(t *testing.T) {
 
 	if !rec.bornSolo("pvc-solo") {
 		t.Error("a lone replica must keep its born-solo record")
+	}
+}
+
+var errCreateMDCrash = errors.New("satellite died here")
+
+// TestEnsureMetadata_RecordsSoloBirthBeforeCreateMD: the record is in
+// place before create-md runs. Were it written after, a crash between
+// the two would find the metadata present on restart, never record the
+// birth, and strand the lone replica Inconsistent.
+func TestEnsureMetadata_RecordsSoloBirthBeforeCreateMD(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md pvc-solo/0", storage.FakeResponse{Err: errDumpMdNoMeta})
+	fx.Expect("drbdadm create-md --force --max-peers=15 pvc-solo/0",
+		storage.FakeResponse{Err: errCreateMDCrash})
+
+	rec, dir := soloReconciler(t, fx, false)
+
+	err := rec.ensureMetadata(context.Background(), soloDR(), map[int32]string{0: "/dev/zvol/pvc-solo_00000"},
+		filepath.Join(dir, "pvc-solo.md-created"), false)
+	if err == nil {
+		t.Fatal("precondition: create-md must fail")
+	}
+
+	if !rec.bornSolo("pvc-solo") {
+		t.Error("born-solo record must be written before create-md runs")
 	}
 }
 

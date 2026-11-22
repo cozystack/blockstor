@@ -3010,7 +3010,7 @@ func soloByDesire(dr *intent.DesiredResource) bool {
 	return len(dr.GetPeerNames()) == 0 && !dr.GetOtherDiskfulReplica() && !dr.GetPeerHasData()
 }
 
-// recordSoloBirth runs when create-md has just written fresh metadata
+// recordSoloBirth runs when create-md is about to write fresh metadata
 // for this replica. It records the birth as solo when the desired state
 // has no other copy, and clears any earlier record otherwise. Without a
 // state dir nothing is recorded, and the solo-promote stays off.
@@ -3889,6 +3889,18 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 			continue
 		}
 
+		// The solo-birth record is settled before the first create-md,
+		// not after the last: a crash in between would find the
+		// metadata present on restart, never record the birth, and
+		// leave a lone replica Inconsistent for good. The record alone
+		// promotes nothing.
+		if !metadataFreshlyCreated {
+			err := r.recordSoloBirth(dr)
+			if err != nil {
+				return err
+			}
+		}
+
 		// Why (Bug 347): capture "at least one volume's metadata is
 		// about to be freshly created" so the downstream GI-seed
 		// gate fires. Mirrors the pre-CreateMD HasMD signal the
@@ -3902,13 +3914,6 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
-		}
-	}
-
-	if metadataFreshlyCreated {
-		err := r.recordSoloBirth(dr)
-		if err != nil {
-			return err
 		}
 	}
 
