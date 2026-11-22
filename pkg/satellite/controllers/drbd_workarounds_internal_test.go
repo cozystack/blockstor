@@ -304,13 +304,14 @@ func TestObserverWorkaroundHints(t *testing.T) {
 		ResourceName: "a", HasResource: true, Role: drbdRolePrimary,
 		HasKernelLoaded: true, KernelLoaded: true,
 	})
+	o.mergeVolumes(&observation{ResourceName: "a", Volumes: []volumeObservation{{VolumeNumber: 0, DiskState: "UpToDate", Open: "no"}}})
 	o.mergeResource(&observation{
 		ResourceName: "b", HasResource: true, Role: "Secondary", ForceIOFailures: true,
 		HasKernelLoaded: true, KernelLoaded: true,
 	})
 	o.mergeVolumes(&observation{ResourceName: "c", Volumes: []volumeObservation{{VolumeNumber: 0, DiskState: "Inconsistent"}}})
 
-	if got := o.WorkaroundHints(); got != (WorkaroundHints{Primary: true, Inconsistent: true, ForcedIOFailures: true}) {
+	if got := o.WorkaroundHints(); got != (WorkaroundHints{IdlePrimary: true, Inconsistent: true, ForcedIOFailures: true}) {
 		t.Errorf("hints = %+v, want all set", got)
 	}
 
@@ -320,6 +321,91 @@ func TestObserverWorkaroundHints(t *testing.T) {
 
 	if got := o.WorkaroundHints(); got != (WorkaroundHints{}) {
 		t.Errorf("hints of destroyed resources = %+v, want none", got)
+	}
+}
+
+// A Primary in use, as on every node running a VM, gives no hint, so it
+// costs the pass no status read; nor does one whose open state the
+// kernel does not report. The open state comes from events2 device
+// frames.
+func TestObserverIdlePrimaryHintFollowsOpen(t *testing.T) {
+	t.Parallel()
+
+	o := &ObserverRunnable{}
+	o.mergeResource(&observation{
+		ResourceName: "vm", HasResource: true, Role: drbdRolePrimary,
+		HasKernelLoaded: true, KernelLoaded: true,
+	})
+
+	device := func(open string) {
+		obs, ok := translateDeviceEvent(drbd.Event{
+			Action: "change", Kind: "device",
+			Fields: map[string]string{"name": "vm", "volume": "1", "disk": "UpToDate", "open": open},
+		})
+		if !ok {
+			t.Fatal("device frame not translated")
+		}
+
+		o.mergeVolumes(&obs)
+		o.mergeVolumes(&observation{ResourceName: "vm", Volumes: []volumeObservation{{VolumeNumber: 0, DiskState: "UpToDate", Open: "no"}}})
+	}
+
+	device("yes")
+
+	if o.WorkaroundHints().IdlePrimary {
+		t.Error("a Primary with a volume open hints an idle Primary")
+	}
+
+	// A peer-device frame carries no open: and must not reset it.
+	o.mergeVolumes(&observation{ResourceName: "vm", Volumes: []volumeObservation{{VolumeNumber: 1, OutOfSyncKib: 0, HasSync: true}}})
+
+	if o.WorkaroundHints().IdlePrimary {
+		t.Error("a frame without open: made an open Primary look idle")
+	}
+
+	device("unknown")
+
+	if o.WorkaroundHints().IdlePrimary || !o.OpenUnknown("vm") {
+		t.Errorf("open:unknown: hint %v, unknown %v; want no hint, unknown", o.WorkaroundHints().IdlePrimary, o.OpenUnknown("vm"))
+	}
+
+	device("no")
+
+	if !o.WorkaroundHints().IdlePrimary || o.OpenUnknown("vm") {
+		t.Errorf("nothing open: hint %v, unknown %v; want a hint, known", o.WorkaroundHints().IdlePrimary, o.OpenUnknown("vm"))
+	}
+}
+
+// `drbdsetup status --json` prints a volume whose open state the kernel
+// does not report as not open; the checks that act on an unused replica
+// leave such a resource alone.
+func TestUnusedChecksSkipAnUnknownOpenState(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		status string
+		cfg    WorkaroundsConfig
+		rd     string
+	}{
+		{"idle primary", idlePrimaryStatus, idleConfig(), "pvc-idle"},
+		{"failing io", failingIOStatus("Secondary", false), failingIOConfig(), "pvc-failio"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			adm := &fakeWorkaroundAdm{status: tc.status}
+			w, _ := newTestWorkarounds(t, adm, tc.cfg, tc.rd)
+			w.OpenUnknown = func(string) bool { return true }
+
+			for range 4 {
+				w.pass(t.Context(), logr.Discard())
+			}
+
+			if len(adm.actions) != 0 {
+				t.Errorf("acted on a replica whose open state is unknown: %v", adm.actions)
+			}
+		})
 	}
 }
 
@@ -431,7 +517,7 @@ func TestIdlePrimaryLeavesUsedPrimariesAlone(t *testing.T) {
 
 		adm := &fakeWorkaroundAdm{status: idlePrimaryStatus}
 		w, _ := newTestWorkarounds(t, adm, WorkaroundsConfig{Interval: 1, StalledResync: true, StalledResyncPasses: 4}, "pvc-idle")
-		hints := WorkaroundHints{Primary: true}
+		hints := WorkaroundHints{IdlePrimary: true}
 		w.Hints = func() WorkaroundHints { return hints }
 
 		for range 4 {
@@ -699,8 +785,14 @@ func TestNewDRBDWorkaroundsRunnableWiresConfigHintsAndHold(t *testing.T) {
 		t.Errorf("runnable = %+v, want the satellite's config", w)
 	}
 
-	if w.Hints == nil || !w.Hints().Primary {
+	if w.Hints == nil || !w.Hints().IdlePrimary {
 		t.Error("hints are not the observer's")
+	}
+
+	observer.mergeVolumes(&observation{ResourceName: "a", Volumes: []volumeObservation{{VolumeNumber: 0, Open: drbdOpenUnknown}}})
+
+	if w.OpenUnknown == nil || !w.OpenUnknown("a") {
+		t.Error("the open-unknown lookup is not the observer's")
 	}
 
 	if w.Hold == nil {

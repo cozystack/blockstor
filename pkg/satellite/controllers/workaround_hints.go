@@ -20,11 +20,14 @@ package controllers
 
 // WorkaroundHints is what the observer's events2 cache shows of the shapes
 // the DRBD workarounds act on. A pass reads `drbdsetup status` only when
-// one of them may be there, so a node with every replica Secondary and
-// UpToDate costs the workarounds no command at all.
+// one of them may be there, so a node whose replicas are all Secondary
+// and UpToDate, or Primary and in use, costs the workarounds no command
+// at all.
 type WorkaroundHints struct {
-	// Primary: some resource is Primary on this node.
-	Primary bool
+	// IdlePrimary: some resource is Primary on this node with no volume
+	// open. events2 device frames carry `open:yes|no|unknown`; a volume
+	// whose open state the kernel does not report counts as open.
+	IdlePrimary bool
 	// Inconsistent: some local volume is Inconsistent.
 	Inconsistent bool
 	// ForcedIOFailures: some resource reports force-io-failures:yes.
@@ -38,6 +41,8 @@ func (o *ObserverRunnable) WorkaroundHints() WorkaroundHints {
 
 	unloaded := map[string]bool{}
 
+	var primaries []string
+
 	o.resMu.Lock()
 
 	for name, res := range o.resCache {
@@ -47,7 +52,10 @@ func (o *ObserverRunnable) WorkaroundHints() WorkaroundHints {
 			continue
 		}
 
-		hints.Primary = hints.Primary || res.Role == drbdRolePrimary
+		if res.Role == drbdRolePrimary {
+			primaries = append(primaries, name)
+		}
+
 		hints.ForcedIOFailures = hints.ForcedIOFailures || res.ForceIOFailures
 	}
 
@@ -55,6 +63,12 @@ func (o *ObserverRunnable) WorkaroundHints() WorkaroundHints {
 
 	o.volMu.Lock()
 	defer o.volMu.Unlock()
+
+	for _, name := range primaries {
+		if !anyVolumeMaybeOpen(o.volCache[name]) {
+			hints.IdlePrimary = true
+		}
+	}
 
 	for name, volumes := range o.volCache {
 		if unloaded[name] {
@@ -70,6 +84,40 @@ func (o *ObserverRunnable) WorkaroundHints() WorkaroundHints {
 
 	return hints
 }
+
+// OpenUnknown reports whether the kernel does not report whether some
+// volume of the resource name is open (events2 `open:unknown`, a DRBD
+// module too old to say). `drbdsetup status --json` prints such a volume
+// as not open, so the checks that act only on an unused replica leave
+// this one alone.
+func (o *ObserverRunnable) OpenUnknown(name string) bool {
+	o.volMu.Lock()
+	defer o.volMu.Unlock()
+
+	for _, vol := range o.volCache[name] {
+		if vol.Open == drbdOpenUnknown {
+			return true
+		}
+	}
+
+	return false
+}
+
+// anyVolumeMaybeOpen reports whether some volume is open or its open
+// state is unknown.
+func anyVolumeMaybeOpen(volumes map[int32]volumeObservation) bool {
+	for _, vol := range volumes {
+		if vol.Open == drbdFlagYes || vol.Open == drbdOpenUnknown {
+			return true
+		}
+	}
+
+	return false
+}
+
+// drbdOpenUnknown is events2's `open:` of a volume whose open state the
+// kernel does not report.
+const drbdOpenUnknown = "unknown"
 
 // drbdDiskStateInconsistent is the DRBD-9 disk_state of a volume that
 // holds a partial copy, as a resync target does.

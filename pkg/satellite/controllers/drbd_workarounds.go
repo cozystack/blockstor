@@ -54,8 +54,8 @@ import (
 // The checks share one pass every WorkaroundsConfig.Interval. A pass reads
 // `drbdsetup status --json` only when the observer's events2 cache shows a
 // shape one of the enabled checks acts on (WorkaroundHints), so a node
-// whose replicas are all Secondary and UpToDate runs no command and makes
-// no API call. A check acts only on a resource blockstor has a replica of
+// whose replicas are all Secondary and UpToDate, or Primary and in use,
+// runs no command and makes no API call. A check acts only on a resource blockstor has a replica of
 // on this node (the kernel is shared with LINSTOR during a migration),
 // never on one an apply or delete is changing at that moment, and holds
 // the resource while it looks and acts, so no apply or delete of it
@@ -128,6 +128,12 @@ type DRBDWorkaroundsRunnable struct {
 	// every pass.
 	Hints func() WorkaroundHints
 
+	// OpenUnknown reports a resource some volume of which the kernel
+	// does not report as open or not; nil reports none. The checks that
+	// act on an unused replica leave such a resource alone, since
+	// `drbdsetup status --json` prints it as not open.
+	OpenUnknown func(name string) bool
+
 	// Hold claims a resource for the checks of one pass, so no apply or
 	// delete of it starts until the returned func runs; false while one
 	// is running, and the checks then leave the resource alone. nil
@@ -158,14 +164,15 @@ type DRBDWorkaroundsRunnable struct {
 // changing. Production caller: manager.go addBackgroundRunnables.
 func newDRBDWorkaroundsRunnable(cli client.Client, cfg *Config, observer *ObserverRunnable) *DRBDWorkaroundsRunnable {
 	return &DRBDWorkaroundsRunnable{
-		Reader:   cli,
-		Adm:      drbd.NewAdm(cfg.Exec),
-		Exec:     cfg.Exec,
-		Recorder: cfg.Recorder,
-		NodeName: cfg.NodeName,
-		Config:   cfg.Workarounds,
-		Hints:    observer.WorkaroundHints,
-		Hold:     cfg.Apply.Hold,
+		Reader:      cli,
+		Adm:         drbd.NewAdm(cfg.Exec),
+		Exec:        cfg.Exec,
+		Recorder:    cfg.Recorder,
+		NodeName:    cfg.NodeName,
+		Config:      cfg.Workarounds,
+		Hints:       observer.WorkaroundHints,
+		OpenUnknown: observer.OpenUnknown,
+		Hold:        cfg.Apply.Hold,
 	}
 }
 
@@ -258,6 +265,12 @@ func (w *DRBDWorkaroundsRunnable) hold(name string) (func(), bool) {
 	return w.Hold(name)
 }
 
+// openUnknown reports whether the open state of some volume of name is
+// unknown; see OpenUnknown.
+func (w *DRBDWorkaroundsRunnable) openUnknown(name string) bool {
+	return w.OpenUnknown != nil && w.OpenUnknown(name)
+}
+
 // checkResource runs the enabled checks on res while it is held.
 func (w *DRBDWorkaroundsRunnable) checkResource(
 	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
@@ -291,7 +304,7 @@ func (w *DRBDWorkaroundsRunnable) kernelStatusWanted() bool {
 	hints := w.Hints()
 
 	return (w.Config.StalledResync && hints.Inconsistent) ||
-		(w.Config.IdlePrimary && hints.Primary) ||
+		(w.Config.IdlePrimary && hints.IdlePrimary) ||
 		(w.Config.ForcedIOFailures && hints.ForcedIOFailures)
 }
 
@@ -427,7 +440,7 @@ func (w *DRBDWorkaroundsRunnable) checkIdlePrimary(
 	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
 	replica *blockstoriov1alpha1.Resource, idle map[string]int,
 ) {
-	if !res.IdlePrimary() {
+	if !res.IdlePrimary() || w.openUnknown(res.Name) {
 		return
 	}
 
@@ -480,7 +493,7 @@ func (w *DRBDWorkaroundsRunnable) checkForcedIOFailures(
 	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
 	replica *blockstoriov1alpha1.Resource, failingIO map[string]int,
 ) {
-	if !res.UnusedSecondaryFailingIO() {
+	if !res.UnusedSecondaryFailingIO() || w.openUnknown(res.Name) {
 		return
 	}
 

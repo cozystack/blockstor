@@ -139,6 +139,11 @@ type volumeObservation struct {
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
 
+	// Open is the `open:yes|no|unknown` of the events2 `device` frame,
+	// empty when the frame did not carry it. Not published to Status:
+	// only the DRBD workarounds' hints read it (workaround_hints.go).
+	Open string
+
 	// Removed is an internal marker set by translateDeviceEvent for
 	// `destroy device` frames (drbdsetup emits one after a volume is
 	// torn down from the kernel — e.g. the `vd d` cascade adjusts the
@@ -358,6 +363,7 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 		DiskState:    disk,
 		CurrentUUID:  ev.Fields["current-uuid"],
 		BackingDev:   ev.Fields["backing_dev"],
+		Open:         ev.Fields["open"],
 	}
 
 	// `quorum:yes|no` is emitted on every `device` frame on
@@ -1482,7 +1488,7 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 			continue
 		}
 
-		if mergeVolumeInto(cache, incoming) {
+		if mergeVolumeInto(cache, &incoming) {
 			changed = true
 		}
 	}
@@ -1631,7 +1637,7 @@ func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolume
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
 // to decide whether to emit a fresh Status snapshot.
-func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservation) bool {
+func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservation) bool {
 	merged := cache[incoming.VolumeNumber]
 	merged.VolumeNumber = incoming.VolumeNumber
 
@@ -1671,6 +1677,12 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservati
 	// Status SSA write.
 	if incoming.BackingDev != "" {
 		merged.BackingDev = incoming.BackingDev
+	}
+
+	// Open, like BackingDev, is cached for the workarounds' hints only
+	// and never marks the volume changed.
+	if incoming.Open != "" {
+		merged.Open = incoming.Open
 	}
 
 	cache[incoming.VolumeNumber] = merged
