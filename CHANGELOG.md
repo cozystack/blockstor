@@ -4,6 +4,23 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.15 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #313 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.14; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.14
+
+- **A `DrbdOptions/*` property LINSTOR's whitelist refuses is refused before it is stored (#313).** Every REST door that stores properties and the native CLI's `set-property` and `drbd-options` check the key against the object it is set on and the value against the key's rule, and answer LINSTOR's `FAIL_INVLD_PROP` with nothing stored; a typo such as `DrbdOptions/AutoSnapshot/Keep` no longer reaches every satellite's `.res`.
+- **blockstor's own DrbdOptions keys stay settable (#313).** `AutoAddQuorumTiebreaker` on the controller, definitions and groups, and `TcpPortRange` and `MinorNrRange` on nodes, are accepted with a value their reader can parse.
+- **An accepted boolean is stored the way LINSTOR stores it (#313).** `Yes` becomes `yes` for a yes/no option and `No` or `FALSE` becomes `false` for a true/false key, so a capitalised value no longer drops out of the `.res` or reads as unset.
+- **`drbd-options --after-resync-source` and `--disconnected` are gone (#313).** LINSTOR does not whitelist those handlers, so the flags could only fail.
+- **Upgrade note (#313).** A StorageClass parameter or a group property that linstor-csi sends with every provisioning and that the whitelist refuses fails each new PVC after the upgrade; check them before upgrading.
+- **The satellite leaves out of the `.res` every option drbdadm would refuse (#275).** A key under a section no `.res` block takes, or with a nested option name, is dropped, and net, resource options and peer-device options are now held against this node's `drbdsetup xml-help` like the disk sections; handlers are kept only if LINSTOR whitelists them.
+- **Each option left out is a Warning Event `DrbdOptionIgnored` on the Resource (#275).** The rest of the configuration keeps applying, instead of every replica of the definition reporting `ApplyFailed` until the key is deleted.
+- **A failed `drbdsetup xml-help` read is retried after a minute (#275).** A node whose drbdsetup cannot describe its options renders unchecked, as before, without running the failing calls on every render.
+- **The solo-promote forces primary only on a replica born as the only copy (#312).** A replica left `Inconsistent` and peerless while its definition is deleted during the initial sync, or after its sync source went, is no longer declared `UpToDate`; the satellite records a solo birth before `create-md` and spends it on the first promote, the way LINSTOR's `createPrimary` is a one-shot.
+- **The dispatcher tells a replica it is being deleted or is not alone (#312).** A deletion timestamp or DELETE flag on the replica or its definition, or a diskful replica on another node in any state, keeps the solo-promote from firing.
+
 ## v0.4.0-alpha.14 — 2026-11-22
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #311 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.13; the entries below are what changed since.
