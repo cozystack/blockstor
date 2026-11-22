@@ -757,6 +757,13 @@ type ObserverRunnable struct {
 	// noise filter if every one woke the reconciler.
 	lifecycleMu    sync.Mutex
 	lifecycleCache map[string]lifecycleSignature
+
+	// overflow holds the replicas whose wake-up found the trigger
+	// channel full, each once, and overflowSending is set while the
+	// one goroutine that hands them over runs (sendOverflow).
+	overflowMu      sync.Mutex
+	overflow        map[string]struct{}
+	overflowSending bool
 }
 
 // lifecycleSignature is the compact per-resource fingerprint
@@ -1225,11 +1232,11 @@ func isDataBearingDiskState(s drbd.DiskState) bool {
 // channel would re-add the very Reconcile noise the predicate
 // just removed.
 //
-// Non-blocking: a full channel is treated as "reconciler is already
-// behind, drop this wake-up" rather than back-pressuring the events2
-// loop. The observer's 5-second resync ticker re-emits cached state
-// onto Status so a coalesced wake-up still arrives within the same
-// window; reconciler's RequeueAfter covers any per-resource hand-off.
+// Non-blocking: a wake-up the full channel has no room for waits in
+// the overflow set (queueOverflow) rather than back-pressuring the
+// events2 loop. Nothing periodic would make up for one dropped here:
+// the resync re-stamps Status but wakes no reconcile, and a converged
+// replica asks for no further pass.
 //
 // The emitted object carries only `Name` — the ResourceReconciler's
 // SetupWithManager registers the channel as a raw source whose
@@ -1269,25 +1276,86 @@ func (o *ObserverRunnable) emitReconcileTrigger(ctx context.Context, ev *observa
 		return
 	}
 
-	trigger := event.GenericEvent{
-		Object: &blockstoriov1alpha1.Resource{
-			ObjectMeta: metav1.ObjectMeta{Name: name},
-		},
-	}
-
 	select {
-	case o.ReconcileTrigger <- trigger:
+	case o.ReconcileTrigger <- wakeUp(name):
 	default:
 		// Channel full. No periodic pass of the replica makes up for a
 		// wake-up dropped here, so it waits for room without holding
 		// up the events2 reader.
-		go func() {
-			select {
-			case o.ReconcileTrigger <- trigger:
-			case <-ctx.Done():
-			}
-		}()
+		o.queueOverflow(ctx, name)
 	}
+}
+
+// wakeUp is the trigger event for the local replica name.
+func wakeUp(name string) event.GenericEvent {
+	return event.GenericEvent{
+		Object: &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+		},
+	}
+}
+
+// queueOverflow keeps a wake-up the trigger channel had no room for.
+// A replica waits in the overflow set at most once, however many
+// wake-ups it gets meanwhile, besides the one wake-up being handed
+// over, and one goroutine hands the set over: in
+// a reconnect storm of hundreds of resources a goroutine per dropped
+// wake-up piled up without bound, most of them for the same replicas.
+func (o *ObserverRunnable) queueOverflow(ctx context.Context, name string) {
+	o.overflowMu.Lock()
+	defer o.overflowMu.Unlock()
+
+	if o.overflow == nil {
+		o.overflow = map[string]struct{}{}
+	}
+
+	o.overflow[name] = struct{}{}
+
+	if o.overflowSending {
+		return
+	}
+
+	o.overflowSending = true
+
+	go o.sendOverflow(ctx)
+}
+
+// sendOverflow hands the overflow set to the trigger channel, waiting
+// for room, until the set is empty or ctx ends.
+func (o *ObserverRunnable) sendOverflow(ctx context.Context) {
+	for {
+		o.overflowMu.Lock()
+
+		name, ok := anyKey(o.overflow)
+		if !ok {
+			o.overflowSending = false
+			o.overflowMu.Unlock()
+
+			return
+		}
+
+		delete(o.overflow, name)
+		o.overflowMu.Unlock()
+
+		select {
+		case o.ReconcileTrigger <- wakeUp(name):
+		case <-ctx.Done():
+			o.overflowMu.Lock()
+			o.overflowSending = false
+			o.overflowMu.Unlock()
+
+			return
+		}
+	}
+}
+
+// anyKey returns some key of set, and false when it is empty.
+func anyKey(set map[string]struct{}) (string, bool) {
+	for key := range set {
+		return key, true
+	}
+
+	return "", false
 }
 
 // lifecycleSnapshotLocked builds the current lifecycle signature for

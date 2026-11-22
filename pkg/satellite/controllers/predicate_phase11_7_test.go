@@ -443,6 +443,62 @@ func TestObserverKeepsTheWakeUpWhenTheTriggerIsFull(t *testing.T) {
 	}
 }
 
+// TestObserverCoalescesWakeUpsTheTriggerHasNoRoomFor: in a reconnect
+// storm the trigger channel fills, and the same replica changes state
+// many times before there is room again. It waits at most once besides
+// the wake-up being handed over: a pass reads the state it acts on when
+// it runs, so one covers every change before it, where a goroutine per
+// dropped wake-up both piled up without bound and ran the replica once
+// per change.
+func TestObserverCoalescesWakeUpsTheTriggerHasNoRoomFor(t *testing.T) {
+	t.Parallel()
+
+	observer, ch, adm := newTriggerObserver(t, 1)
+
+	ch <- event.GenericEvent{Object: &blockstoriov1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: "filler"}}}
+
+	for i := range 50 {
+		state := "UpToDate"
+		if i%2 == 1 {
+			state = "Inconsistent"
+		}
+
+		observer.handleObservation(t.Context(), adm, &observation{
+			ResourceName: "pvc-1",
+			DrbdState:    state,
+			Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: state}},
+		})
+	}
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "filler" {
+		t.Fatalf("first trigger %q, want the one that filled the channel", got.Object.GetName())
+	}
+
+	// The wake-up being handed over when the channel filled, and at
+	// most one more for the changes that came while it waited.
+	wakeUps := 0
+
+	for {
+		select {
+		case got := <-ch:
+			if got.Object.GetName() != "pvc-1.n1" {
+				t.Fatalf("trigger %q, want pvc-1.n1", got.Object.GetName())
+			}
+
+			wakeUps++
+
+			continue
+		case <-time.After(triggerTestTimeout):
+		}
+
+		break
+	}
+
+	if wakeUps < 1 || wakeUps > 2 {
+		t.Errorf("%d wake-ups of pvc-1.n1 for 50 changes behind a full channel, want 1 or 2", wakeUps)
+	}
+}
+
 // TestObserverEmitsTriggerOnDiskChange pins the device-kind path: a
 // per-volume disk-state frame (UpToDate / Inconsistent / Diskless)
 // emits a trigger. Without the wake-up the satellite's recovery
