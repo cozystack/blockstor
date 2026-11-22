@@ -75,9 +75,14 @@ const KeepTiebreakerUntilAnnotation = "blockstor.org/keep-tiebreaker-until"
 // it is done, and the deadline only bounds a placement that never got
 // to remove it.
 //
-// The value is an RFC3339 wall-clock deadline, fractional seconds
-// allowed so that each placement's stamp is its own. Bad or unparseable
-// values count as no placement in progress.
+// The value lists one RFC3339 wall-clock deadline per placement in
+// progress, separated by spaces, fractional seconds allowed so that
+// each placement's stamp is its own: placements of one definition run
+// in more than one process (the REST server, the controller), and one
+// that finishes must not end the hold of another still writing. Read
+// and write it with PlacementInProgressUntil, AddPlacementHold and
+// RemovePlacementHold. Bad or unparseable entries count as no placement
+// in progress.
 const PlacementInProgressUntilAnnotation = "blockstor.org/placement-in-progress-until"
 
 // AutoDiskfulDeadlineAnnotation is stamped on an RD when the

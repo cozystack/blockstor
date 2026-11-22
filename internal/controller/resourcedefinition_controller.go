@@ -607,12 +607,9 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // node the third replica is for. The placement removing the annotation
 // wakes the RD, and the decision is made on the replicas it placed.
 func isPlacementInProgress(rd *blockstoriov1alpha1.ResourceDefinition) bool {
-	deadline, err := time.Parse(time.RFC3339, rd.Annotations[apiv1.PlacementInProgressUntilAnnotation])
-	if err != nil {
-		return false
-	}
+	_, ok := apiv1.PlacementInProgressUntil(rd.Annotations, time.Now())
 
-	return time.Now().Before(deadline)
+	return ok
 }
 
 // isKeepTiebreakerActive reports whether an operator recently ran

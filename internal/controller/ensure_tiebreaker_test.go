@@ -1858,13 +1858,16 @@ func TestBug386EnqueueRDsForNode(t *testing.T) {
 func TestEnsureTiebreakerWaitsForAPlacementInProgress(t *testing.T) {
 	t.Parallel()
 
+	stamp := func(d time.Duration) string { return time.Now().Add(d).UTC().Format(time.RFC3339Nano) }
+
 	for _, tc := range []struct {
 		name        string
-		deadline    time.Duration
+		holds       string
 		wantWitness bool
 	}{
-		{name: "in progress", deadline: time.Minute, wantWitness: false},
-		{name: "stamp expired", deadline: -time.Minute, wantWitness: true},
+		{name: "in progress", holds: stamp(time.Minute), wantWitness: false},
+		{name: "stamp expired", holds: stamp(-time.Minute), wantWitness: true},
+		{name: "one of two placements in progress", holds: stamp(-time.Minute) + " " + stamp(time.Minute), wantWitness: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1889,7 +1892,7 @@ func TestEnsureTiebreakerWaitsForAPlacementInProgress(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "pvc-placing",
 					Annotations: map[string]string{
-						apiv1.PlacementInProgressUntilAnnotation: time.Now().Add(tc.deadline).UTC().Format(time.RFC3339Nano),
+						apiv1.PlacementInProgressUntilAnnotation: tc.holds,
 					},
 				},
 			}

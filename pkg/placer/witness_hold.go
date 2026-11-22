@@ -23,6 +23,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // witnessHoldWindow bounds how long a placement keeps the tiebreaker
@@ -51,22 +52,33 @@ const witnessHoldWindow = time.Minute
 //
 // A placement of one replica passes through no other shape, and needs
 // no hold. The hold is best effort: one that cannot be written leaves
-// the take-over to settle the count, as before. Its removal names the
-// stamp this placement wrote, so a placement still running elsewhere
-// keeps its own.
+// the take-over to settle the count, as before. Placements of one
+// definition in different processes (lockDefinition serialises them
+// within one only) each add their own stamp to the annotation and
+// remove only that one, so the first to finish does not end the hold of
+// another still writing.
 func (p *Placer) holdWitness(ctx context.Context, rdName string, toPlace int) func() {
-	if toPlace < 2 {
+	return HoldWitness(ctx, p.store, rdName, toPlace)
+}
+
+// HoldWitness is holdWitness for a writer of replicas other than the
+// placer: the REST handler of an explicit `linstor r c n1 n2 n3 rd`
+// writes its replicas one at a time just the same. diskful is the
+// number of diskful replicas it is about to write.
+func HoldWitness(ctx context.Context, st store.Store, rdName string, diskful int) func() {
+	if diskful < 2 {
 		return func() {}
 	}
 
 	stamp := time.Now().Add(witnessHoldWindow).UTC().Format(time.RFC3339Nano)
 
-	err := p.store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
+	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
 		if rd.Annotations == nil {
 			rd.Annotations = map[string]string{}
 		}
 
-		rd.Annotations[apiv1.PlacementInProgressUntilAnnotation] = stamp
+		rd.Annotations[apiv1.PlacementInProgressUntilAnnotation] = apiv1.AddPlacementHold(
+			rd.Annotations[apiv1.PlacementInProgressUntilAnnotation], stamp, time.Now())
 
 		return nil
 	})
@@ -75,10 +87,18 @@ func (p *Placer) holdWitness(ctx context.Context, rdName string, toPlace int) fu
 	}
 
 	return func() {
-		_ = p.store.ResourceDefinitions().PatchResourceDefinitionSpec(context.WithoutCancel(ctx), rdName,
+		_ = st.ResourceDefinitions().PatchResourceDefinitionSpec(context.WithoutCancel(ctx), rdName,
 			func(rd *apiv1.ResourceDefinition) error {
-				if rd.Annotations[apiv1.PlacementInProgressUntilAnnotation] == stamp {
+				holds, ok := rd.Annotations[apiv1.PlacementInProgressUntilAnnotation]
+				if !ok {
+					return nil
+				}
+
+				holds = apiv1.RemovePlacementHold(holds, stamp, time.Now())
+				if holds == "" {
 					delete(rd.Annotations, apiv1.PlacementInProgressUntilAnnotation)
+				} else {
+					rd.Annotations[apiv1.PlacementInProgressUntilAnnotation] = holds
 				}
 
 				return nil

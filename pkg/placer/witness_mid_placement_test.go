@@ -288,3 +288,55 @@ func TestPlaceHoldsTheWitnessWhileItWritesReplicas(t *testing.T) {
 		})
 	}
 }
+
+// Placements of one definition run in more than one process, the REST
+// server and the controller, so two of them can hold the witness at
+// once. The one that finishes first ends its own hold only: the other
+// is still writing replicas, and a witness added under it lands on a
+// node it is about to make diskful.
+func TestHoldWitnessKeepsTheHoldOfAnotherPlacement(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"})
+	if err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	inProgress := func() bool {
+		rd, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
+		if err != nil {
+			t.Fatalf("get definition: %v", err)
+		}
+
+		_, ok := apiv1.PlacementInProgressUntil(rd.Annotations, time.Now())
+
+		return ok
+	}
+
+	releaseFirst := placer.HoldWitness(ctx, st, "pvc-1", 3)
+	releaseSecond := placer.HoldWitness(ctx, st, "pvc-1", 2)
+
+	releaseSecond()
+
+	if !inProgress() {
+		t.Fatalf("the second placement finished and ended the hold of the first, still writing")
+	}
+
+	releaseFirst()
+
+	if inProgress() {
+		t.Errorf("both placements finished, the definition still holds the witness")
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("get definition: %v", err)
+	}
+
+	if v, ok := rd.Annotations[apiv1.PlacementInProgressUntilAnnotation]; ok {
+		t.Errorf("both placements finished, the definition still carries %s=%q", apiv1.PlacementInProgressUntilAnnotation, v)
+	}
+}
