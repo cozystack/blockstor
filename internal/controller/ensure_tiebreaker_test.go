@@ -1633,7 +1633,7 @@ func TestEnsureTiebreakerRelocateOntoTiebreakerConverges(t *testing.T) {
 // hazard on a subsequent failure.
 //
 // `linstor n rst n3` clears the EVICTED flag. The fix wires a Node
-// watch (nodeDrainFlagChanged → enqueueRDsForNode) so the restore
+// watch (witnessCandidacyChanged → enqueueRDsForNode) so the restore
 // re-enqueues the RD and ensureTiebreaker re-runs. This test pins the
 // reconcile-level outcome: with EVICTED cleared, the witness must be
 // (re)placed on n3 so the resource regains the diskful+diskful+TB
