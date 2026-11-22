@@ -21,6 +21,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,6 +50,9 @@ type fakeWorkaroundAdm struct {
 	status  string
 	reads   int
 	actions []string
+
+	// errs fails the next calls of an action ("up pvc-x"), in order.
+	errs map[string][]error
 }
 
 func (f *fakeWorkaroundAdm) KernelStatus(context.Context) ([]drbd.KernelResource, error) {
@@ -65,33 +69,41 @@ func (f *fakeWorkaroundAdm) KernelStatus(context.Context) ([]drbd.KernelResource
 }
 
 func (f *fakeWorkaroundAdm) DisconnectPeer(_ context.Context, res, peer string) error {
-	f.actions = append(f.actions, "disconnect "+res+":"+peer)
-
-	return nil
+	return f.act("disconnect " + res + ":" + peer)
 }
 
 func (f *fakeWorkaroundAdm) ConnectPeer(_ context.Context, res, peer string) error {
-	f.actions = append(f.actions, "connect "+res+":"+peer)
-
-	return nil
+	return f.act("connect " + res + ":" + peer)
 }
 
 func (f *fakeWorkaroundAdm) Secondary(_ context.Context, res string) error {
-	f.actions = append(f.actions, "secondary "+res)
-
-	return nil
+	return f.act("secondary " + res)
 }
 
 func (f *fakeWorkaroundAdm) Down(_ context.Context, res string) error {
-	f.actions = append(f.actions, "down "+res)
-
-	return nil
+	return f.act("down " + res)
 }
 
 func (f *fakeWorkaroundAdm) Up(_ context.Context, res string) error {
-	f.actions = append(f.actions, "up "+res)
+	return f.act("up " + res)
+}
 
-	return nil
+func (f *fakeWorkaroundAdm) Adjust(_ context.Context, res string) error {
+	return f.act("adjust " + res)
+}
+
+// act records action and returns the next error queued for it.
+func (f *fakeWorkaroundAdm) act(action string) error {
+	f.actions = append(f.actions, action)
+
+	queued := f.errs[action]
+	if len(queued) == 0 {
+		return nil
+	}
+
+	f.errs[action] = queued[1:]
+
+	return queued[0]
 }
 
 // workaroundReader has a blockstor replica on this node of each of rds.
@@ -719,5 +731,47 @@ func TestWorkaroundsSkipAReplicaBeingDeleted(t *testing.T) {
 
 	if len(adm.actions) != 0 {
 		t.Errorf("acted on a replica being deleted: %v", adm.actions)
+	}
+}
+
+// errUp is a `drbdadm up` that did not go through.
+var errUp = errors.New("exit status 10: pvc-failio: Failure: (114) Lower device is already claimed")
+
+// A failed `drbdadm up` after the down leaves the replica down: the
+// following passes bring it up with adjust until that goes through, even
+// with nothing in the observer's cache to read the status for, and the
+// failure is recorded as an Event of its own.
+func TestForcedIOFailuresRetriesAFailedUp(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{
+		status: failingIOStatus("Secondary", false),
+		errs: map[string][]error{
+			"up pvc-failio":     {errUp},
+			"adjust pvc-failio": {errUp},
+		},
+	}
+	w, recorder := newTestWorkarounds(t, adm, failingIOConfig(), "pvc-failio")
+
+	w.pass(t.Context(), logr.Discard())
+	w.pass(t.Context(), logr.Discard())
+
+	evs := drainEvents(recorder)
+	if len(evs) != 2 || !strings.Contains(evs[1], "Warning DRBDWorkaroundUpFailed") {
+		t.Fatalf("events = %v, want DRBDForcedIOFailures then DRBDWorkaroundUpFailed", evs)
+	}
+
+	// The replica is down: the kernel no longer lists it and the
+	// observer gives no hint.
+	adm.status = "[]"
+	w.Hints = func() WorkaroundHints { return WorkaroundHints{} }
+	adm.actions = nil
+
+	w.pass(t.Context(), logr.Discard())
+	w.pass(t.Context(), logr.Discard())
+	w.pass(t.Context(), logr.Discard())
+
+	if got := strings.Join(adm.actions, ","); got != "adjust pvc-failio,adjust pvc-failio" {
+		t.Errorf("actions = %q, want one failed adjust, one that went through, then nothing", got)
 	}
 }

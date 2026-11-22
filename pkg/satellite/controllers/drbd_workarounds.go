@@ -112,6 +112,7 @@ type workaroundAdm interface {
 	Secondary(ctx context.Context, resource string) error
 	Down(ctx context.Context, resource string) error
 	Up(ctx context.Context, resource string) error
+	Adjust(ctx context.Context, resource string) error
 }
 
 // DRBDWorkaroundsRunnable runs the DRBD workarounds on this node.
@@ -146,6 +147,10 @@ type DRBDWorkaroundsRunnable struct {
 	// failingIO counts the passes in a row each resource was an unused
 	// Secondary failing I/O.
 	failingIO map[string]int
+
+	// owedUp holds the resources checkForcedIOFailures took down and
+	// failed to bring up again; every pass retries them (bringUpOwed).
+	owedUp map[string]bool
 }
 
 // newDRBDWorkaroundsRunnable builds the runnable the manager runs, gated
@@ -205,6 +210,8 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 	if w.Config.StaleLoopDevices {
 		w.detachStaleLoopDevices(ctx, logger)
 	}
+
+	w.bringUpOwed(ctx, logger)
 
 	if !w.kernelStatusWanted() {
 		w.stalls, w.idle, w.failingIO = nil, nil, nil
@@ -491,7 +498,51 @@ func (w *DRBDWorkaroundsRunnable) checkForcedIOFailures(
 
 	err = w.Adm.Up(ctx, res.Name)
 	if err != nil {
-		w.failed(logger, err, res.Name, "bring up a Secondary that was failing I/O")
+		// The replica is down now and nothing else brings it back
+		// until some unrelated apply runs: the next passes retry.
+		w.acted(logger, replica, res.Name, "DRBDWorkaroundUpFailed", fmt.Sprintf(
+			"drbdadm up after the down failed, the replica is down: retrying with drbdadm adjust "+
+				"every pass: %v", err))
+
+		if w.owedUp == nil {
+			w.owedUp = map[string]bool{}
+		}
+
+		w.owedUp[res.Name] = true
+	}
+}
+
+// bringUpOwed brings up again every resource a forced-I/O restart took
+// down and failed to bring up. `drbdadm adjust` rather than `up`: it
+// also completes an up that stopped half way. A resource an apply is
+// changing is left to that apply and tried on the next pass; one
+// blockstor no longer has a replica of, or is deleting, is dropped.
+func (w *DRBDWorkaroundsRunnable) bringUpOwed(ctx context.Context, logger logr.Logger) {
+	for name := range w.owedUp {
+		release, ok := w.hold(name)
+		if !ok {
+			continue
+		}
+
+		if w.replica(ctx, logger, name) == nil {
+			delete(w.owedUp, name)
+			release()
+
+			continue
+		}
+
+		err := w.Adm.Adjust(ctx, name)
+
+		release()
+
+		if err != nil {
+			w.failed(logger, err, name, "bring up a Secondary whose up failed")
+
+			continue
+		}
+
+		delete(w.owedUp, name)
+		logger.Info("DRBD workaround: brought up the Secondary whose up had failed", "resource", name)
 	}
 }
 
