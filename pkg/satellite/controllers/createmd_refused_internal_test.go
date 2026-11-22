@@ -75,3 +75,42 @@ func TestARefusedCreateMDIsNotRetriedOnTheFailureTimer(t *testing.T) {
 		})
 	}
 }
+
+// uncleanUnrecordedMessage is the apply message of a volume the satellite
+// would not re-create metadata on, in the shape it reports it.
+const uncleanUnrecordedMessage = "fsm dispatch createMd: dump-md pvc-1/0: its superblock was written " +
+	"for node id 3, and this replica is node id 0; it may hold the only up-to-date copy of the data: " +
+	"run `drbdadm apply-al pvc-1/0` to keep its metadata, or `drbdadm wipe-md pvc-1/0` to have it " +
+	"re-created and resynced; the satellite retries every 5 minutes, or at once on any change to the " +
+	"Resource or its ResourceDefinition: "
+
+// Metadata under an unapplied activity log on a volume with no recorded GI
+// is no longer re-created; the replica stays down until an operator acts.
+// That has to reach the operator as a Warning Event carrying the commands
+// to act with, and stay off the 5 second failure timer, which only repeats
+// the same refusal.
+func TestAnUncleanVolumeWithNoRecordedGIIsAWarningEventOnTheResource(t *testing.T) {
+	t.Parallel()
+
+	res := &blockstoriov1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.node-a"}}
+	recorder := events.NewFakeRecorder(4)
+	r := &ResourceReconciler{Config: Config{Recorder: recorder}}
+
+	result := &intent.ResourceApplyResult{
+		Name: "pvc-1", Message: uncleanUnrecordedMessage + drbd.ErrUncleanMetadataUnrecorded.Error(),
+	}
+	r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{result}, logr.Discard())
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "Warning "+uncleanMetadataRefusedReason) || !strings.Contains(ev, "drbdadm apply-al pvc-1/0") {
+			t.Errorf("Event = %q, want a Warning %s naming the command that keeps the metadata", ev, uncleanMetadataRefusedReason)
+		}
+	default:
+		t.Error("no Event for refused metadata under an unapplied activity log")
+	}
+
+	if got := failureRequeue([]*intent.ResourceApplyResult{result}); got != refusedApplyRequeue {
+		t.Errorf("failureRequeue = %v, want %v", got, refusedApplyRequeue)
+	}
+}

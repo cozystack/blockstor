@@ -1022,20 +1022,41 @@ type applyRefusal struct {
 // to write over the data on a lower disk.
 const createMDRefusedReason = "CreateMdRefused"
 
+// uncleanMetadataRefusedReason is the Event reason for metadata under an
+// unapplied activity log that the satellite would neither keep nor
+// re-create: no GI is recorded for the volume, and its superblock does
+// not carry this replica's node id.
+const uncleanMetadataRefusedReason = "UncleanMetadataRefused"
+
 // applyRefusals lists every refusal reported as a Warning Event.
 func applyRefusals() []applyRefusal {
-	return append(luksRefusals(), applyRefusal{
-		drbd.ErrCreateMDRefused, createMDRefusedReason,
-		"drbdmeta refused to create metadata over the data on the lower disk",
-	})
+	return append(luksRefusals(), metadataRefusals()...)
 }
 
-// refusedApplyRequeue is the retry interval of an apply whose only failure
-// is a create-md drbdmeta refused. drbdmeta refuses the same lower disk the
-// same way every time, so the 5 second retry of applyFailureRequeue only
-// loops: it repeats the command, the log line and the Event, and holds the
-// satellite's work queue, for nothing that can change by itself. A change
-// to the Resource or its definition still reconciles at once.
+// metadataRefusals are the refusals to write DRBD metadata. Each one is
+// answered the same way on every attempt until an operator acts on the
+// lower disk.
+func metadataRefusals() []applyRefusal {
+	return []applyRefusal{
+		{
+			drbd.ErrCreateMDRefused, createMDRefusedReason,
+			"drbdmeta refused to create metadata over the data on the lower disk",
+		},
+		{
+			drbd.ErrUncleanMetadataUnrecorded, uncleanMetadataRefusedReason,
+			"the volume's metadata was left with an unapplied activity log, no GI is recorded for it " +
+				"and its superblock does not carry this replica's node id",
+		},
+	}
+}
+
+// refusedApplyRequeue is the retry interval of an apply whose only failures
+// are metadata refusals. drbdmeta refuses the same lower disk the same way
+// every time, and so does the satellite a volume it has no record of, so
+// the 5 second retry of applyFailureRequeue only loops: it repeats the
+// command, the log line and the Event, and holds the satellite's work
+// queue, for nothing that can change by itself. A change to the Resource
+// or its definition still reconciles at once.
 const refusedApplyRequeue = 5 * time.Minute
 
 // retryAfter is the delay before an apply that did not converge is
@@ -1086,12 +1107,24 @@ func (r *ResourceReconciler) applyRetryAfter(name string, results []*intent.Reso
 // failureRequeue picks the retry interval of an apply that failed.
 func failureRequeue(results []*intent.ResourceApplyResult) time.Duration {
 	for _, result := range results {
-		if !result.GetOk() && !strings.Contains(result.GetMessage(), drbd.ErrCreateMDRefused.Error()) {
+		if !result.GetOk() && !isMetadataRefusal(result.GetMessage()) {
 			return applyFailureRequeue
 		}
 	}
 
 	return refusedApplyRequeue
+}
+
+// isMetadataRefusal reports whether an apply message carries one of the
+// metadataRefusals.
+func isMetadataRefusal(message string) bool {
+	for _, refusal := range metadataRefusals() {
+		if strings.Contains(message, refusal.err.Error()) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // luksRefusals lists the refusals the LUKS layer reports through the apply

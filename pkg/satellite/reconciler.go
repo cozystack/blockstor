@@ -4179,16 +4179,21 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 	// existing GI + bitmap state. Targeting `<rd>/<volNumber>` keeps
 	// drbdmeta away from already-stamped lower disks.
 	metadataFreshlyCreated := false
+	repaired := map[int32]struct{}{}
 
 	for _, vol := range dr.GetVolumes() {
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
-		geometry, create, probeErr := r.metadataToCreate(ctx, dr, vol)
+		plan, probeErr := r.metadataToCreate(ctx, dr, vol)
 		if probeErr != nil {
 			return probeErr
 		}
 
-		if !create {
+		if plan.repaired {
+			repaired[vol.GetVolumeNumber()] = struct{}{}
+		}
+
+		if !plan.create {
 			continue
 		}
 
@@ -4202,7 +4207,7 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		// resync.
 		metadataFreshlyCreated = true
 
-		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, geometry)
+		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, plan.geometry)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
 		}
@@ -4284,7 +4289,9 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		return nil
 	}
 
-	err = r.seedInitialGI(ctx, dr, devices, isInitialUpToDateWinner(dr, firstActivation))
+	// A volume whose metadata was repaired from a dirty activity log is
+	// left out: see metadataPlan.repaired.
+	err = r.seedInitialGI(ctx, dr, devices, isInitialUpToDateWinner(dr, firstActivation), repaired)
 	if err != nil {
 		return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
 	}
@@ -4327,8 +4334,8 @@ func isInitialUpToDateWinner(dr *intent.DesiredResource, firstActivation bool) b
 
 // repairUncleanMetadata answers a metadata probe that found a dirty activity
 // log. It returns whether the volume now carries usable metadata of its own
-// (true: keep it), or false for "initialise it", which is what the caller
-// did for every dirty log before.
+// (true: keep it), false for "initialise it", or an error when neither is
+// safe.
 //
 // drbdmeta words two different situations the same way. A replica that went
 // down while Primary and writing left its own activity log open, and
@@ -4338,28 +4345,43 @@ func isInitialUpToDateWinner(dr *intent.DesiredResource, firstActivation bool) b
 // snapshot receive brings the source's, and an extent reused from a pool
 // brings the previous tenant's. That one needs metadata of its own.
 //
-// The record that separates them is the set of GIs this replica's volume was
-// seen to carry: the satellite's own history file (RecordObservedGI), plus the
-// GI in the Resource status. A volume with neither never carried established
-// metadata here, so it is initialised as before: a clone, a receive, a volume
-// added to a live resource, a replica created again. One with a record is
-// repaired with apply-al and then checked: some UUID now in its metadata, the
-// current one, a peer slot's bitmap UUID or a history UUID, has to be one it
-// was seen with, or the superblock is not this replica's and it is
-// initialised after all. A repair or a check that fails is an error, not a
-// re-initialisation: the record proves there was data-bearing metadata here.
+// A restore whose metadata this node has not created yet is the second
+// kind by construction, and is initialised whatever node id its superblock
+// names: the source replica may well have had this replica's.
+//
+// Otherwise the record that separates them is the set of GIs this
+// replica's volume was seen to carry: the satellite's own history file
+// (RecordObservedGI), plus the GI in the Resource status. A volume with a
+// record is repaired with apply-al and then checked: some UUID now in its
+// metadata, the current one, a peer slot's bitmap UUID or a history UUID,
+// has to be one it was seen with, or the superblock is not this replica's
+// and it is initialised after all. A repair or a check that fails is an
+// error, not a re-initialisation: the record proves there was data-bearing
+// metadata here.
+//
+// A volume with no record, an adopted LINSTOR replica on its first
+// activation here or one that crashed before its GI was recorded, is told
+// apart by the node id its superblock was written for (see
+// repairUnrecordedUncleanMetadata).
 //
 // External metadata takes the same check: dump-md finds the meta disk from
 // the rendered .res, wherever it lives. Its record holds only the GI in the
 // status for now: the observer reads a GI with get-gi, which assumes internal
 // metadata, so the history file does not fill for such a volume.
 func (r *Reconciler) repairUncleanMetadata(
-	ctx context.Context, rdName string, vol *intent.DesiredVolume,
+	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume,
 ) (bool, error) {
-	target := fmt.Sprintf("%s/%d", rdName, vol.GetVolumeNumber())
+	target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 	logger := log.FromContext(ctx).WithValues("volume", target)
 
-	known, err := r.recordedGIs(rdName, vol.GetVolumeNumber())
+	if r.restoreAwaitsMetadata(dr, vol) {
+		logger.Info("dirty activity log on a volume restored from a snapshot; initialising its metadata",
+			"sourceSnapshot", vol.GetSourceSnapshot())
+
+		return false, nil
+	}
+
+	known, err := r.recordedGIs(dr.GetName(), vol.GetVolumeNumber())
 	if err != nil {
 		return false, err
 	}
@@ -4369,9 +4391,7 @@ func (r *Reconciler) repairUncleanMetadata(
 	}
 
 	if len(known) == 0 {
-		logger.Info("dirty activity log on a volume with no recorded GI; initialising its metadata")
-
-		return false, nil
+		return r.repairUnrecordedUncleanMetadata(ctx, dr, target)
 	}
 
 	err = r.cfg.Adm.ApplyAL(ctx, target)
@@ -4401,6 +4421,77 @@ func (r *Reconciler) repairUncleanMetadata(
 	return true, nil
 }
 
+// repairUnrecordedUncleanMetadata keeps the metadata under a dirty activity
+// log on a volume with no GI recorded for it when the superblock was written
+// for this replica's node id, as LINSTOR does: it never re-creates metadata
+// that is there, attaches it, and the kernel applies the log, so the replica
+// comes back and resyncs only its dirty extents. That is an adopted LINSTOR
+// replica that crashed before the cutover, or any replica that crashed
+// before its GI was recorded.
+//
+// A superblock written for another node id, or one whose node id cannot be
+// read, is refused with drbd.ErrUncleanMetadataUnrecorded rather than
+// re-created: nothing here proves it holds no data. A new lower disk
+// carries no superblock to refuse, since every provider creates a blank
+// volume (zvols and thin volumes read zeros, a thick LV is wiped before it
+// is named, a file is new), so what reaches the refusal held data.
+func (r *Reconciler) repairUnrecordedUncleanMetadata(
+	ctx context.Context, dr *intent.DesiredResource, target string,
+) (bool, error) {
+	local, ok := localNodeIDFromOpts(dr)
+	if !ok {
+		return false, uncleanMetadataRefusal(target, "this replica's node id is not known yet")
+	}
+
+	found, err := r.cfg.Adm.MetadataGeometry(ctx, target)
+	if err != nil {
+		return false, uncleanMetadataRefusal(target, "the node id of its superblock cannot be read: "+err.Error())
+	}
+
+	if found.NodeID != int(local) {
+		return false, uncleanMetadataRefusal(target, fmt.Sprintf(
+			"its superblock was written for node id %d, and this replica is node id %d", found.NodeID, local))
+	}
+
+	err = r.cfg.Adm.ApplyAL(ctx, target)
+	if err != nil {
+		return false, errors.Wrapf(err, "apply the activity log of %s, whose superblock carries this replica's node id", target)
+	}
+
+	log.FromContext(ctx).Info("repaired the activity log of a superblock with this replica's node id and no recorded GI",
+		"volume", target, "nodeID", local)
+
+	return true, nil
+}
+
+// uncleanMetadataRefusal is the ErrUncleanMetadataUnrecorded an operator
+// reads, in the Event and the satellite log: why, the two ways out, and
+// when the satellite looks again.
+func uncleanMetadataRefusal(target, why string) error {
+	return errors.Wrapf(drbd.ErrUncleanMetadataUnrecorded,
+		"%s; it may hold the only up-to-date copy of the data: run `drbdadm apply-al %s` "+
+			"to keep its metadata, or `drbdadm wipe-md %s` to have it re-created and resynced; "+
+			"the satellite retries every 5 minutes, or at once on any change to the Resource "+
+			"or its ResourceDefinition", why, target, target)
+}
+
+// restoreAwaitsMetadata reports whether vol is a restore whose metadata
+// was never created on this node: a clone or a receive of a snapshot of
+// an attached volume, which carries the source's superblock with its
+// activity log open and needs metadata of its own. Once this node created
+// metadata for the resource (the MetadataCreated condition, or the
+// .md-created marker it falls back on), the superblock is the replica's
+// own, and a dirty activity log on it is a crash like any other.
+func (r *Reconciler) restoreAwaitsMetadata(dr *intent.DesiredResource, vol *intent.DesiredVolume) bool {
+	if vol.GetSourceSnapshot() == "" || dr.GetMetadataCreated() {
+		return false
+	}
+
+	_, err := os.Stat(filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created"))
+
+	return os.IsNotExist(err)
+}
+
 // anySameGeneration reports whether some UUID in onDisk is one of known.
 func anySameGeneration(onDisk, known []string) bool {
 	for _, a := range onDisk {
@@ -4428,8 +4519,11 @@ func anySameGeneration(onDisk, known []string) bool {
 // volume, --force answers its question and the end of the data is gone.
 //
 // So a superblock that is there is re-initialised in its own layout, with
-// no more slots than blockstor creates, whatever made it: a restore, or an
-// adopted replica with no GI recorded here. LINSTOR does the same: it keeps
+// no more slots than blockstor creates, whatever made it: a restore, or a
+// superblock under a recorded GI that turned out not to be this replica's.
+// An adopted replica with no GI recorded here is not re-initialised at all:
+// it is kept under its own node id and refused under another one
+// (repairUnrecordedUncleanMetadata). LINSTOR does the same: it keeps
 // the snapshot's slots and activity-log layout on the restored resource
 // (RscDrbdLayerHelper.restoreRscData) and creates metadata with them
 // (DrbdLayer.createMetaData). A superblock whose layout cannot be read is
@@ -4501,11 +4595,24 @@ func (r *Reconciler) foreignRestoredSuperblock(
 	return found.Clamped(), true
 }
 
+// metadataPlan is what the metadata probe of one volume decided.
+type metadataPlan struct {
+	// geometry is the layout to create metadata in, when create is set.
+	geometry drbd.MetadataGeometry
+	create   bool
+	// repaired marks metadata kept after its activity log was applied. It
+	// carries the generation and dirty bitmap the replica went down with,
+	// which a GI seed would overwrite: the bitmap would then be reconciled
+	// against the wrong generation and its dirty blocks never resynced.
+	// LINSTOR seeds GIs only on metadata it just created.
+	repaired bool
+}
+
 // metadataToCreate answers the metadata probe of one volume: whether it
 // needs create-md, and the layout to create it in.
 func (r *Reconciler) metadataToCreate(
 	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume,
-) (drbd.MetadataGeometry, bool, error) {
+) (metadataPlan, error) {
 	target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
 	hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
@@ -4516,29 +4623,29 @@ func (r *Reconciler) metadataToCreate(
 	// its own.
 	unclean := errors.Is(probeErr, drbd.ErrMetadataUnclean)
 	if unclean {
-		hasMD, probeErr = r.repairUncleanMetadata(ctx, dr.GetName(), vol)
+		hasMD, probeErr = r.repairUncleanMetadata(ctx, dr, vol)
 	}
 
 	if probeErr != nil {
-		return drbd.MetadataGeometry{}, false, errors.Wrapf(probeErr, "dump-md %s", target)
+		return metadataPlan{}, errors.Wrapf(probeErr, "dump-md %s", target)
 	}
 
 	if hasMD {
 		if unclean {
-			return drbd.MetadataGeometry{}, false, nil
+			return metadataPlan{repaired: true}, nil
 		}
 
 		geometry, foreign := r.foreignRestoredSuperblock(ctx, dr, vol, target)
 
-		return geometry, foreign, nil
+		return metadataPlan{geometry: geometry, create: foreign}, nil
 	}
 
 	geometry, err := r.createMDGeometry(ctx, target, unclean)
 	if err != nil {
-		return drbd.MetadataGeometry{}, false, err
+		return metadataPlan{}, err
 	}
 
-	return geometry, true, nil
+	return metadataPlan{geometry: geometry, create: true}, nil
 }
 
 // ensurePerVolumeMetadata stamps DRBD-9 metadata on every diskful
@@ -4601,18 +4708,18 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
 		// The same probe as in ensureMetadata: a volume just added to a
-		// live resource has no reported GI and is initialised, an
+		// live resource has a blank lower disk and is initialised, an
 		// established one that crashed is repaired.
-		geometry, create, probeErr := r.metadataToCreate(ctx, dr, vol)
+		plan, probeErr := r.metadataToCreate(ctx, dr, vol)
 		if probeErr != nil {
 			return probeErr
 		}
 
-		if !create {
+		if !plan.create {
 			continue
 		}
 
-		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, geometry)
+		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, plan.geometry)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
 		}
@@ -5891,11 +5998,20 @@ func isUnknownResourceErr(err error) bool {
 // Must be called between create-md (which writes the metadata
 // block this then mutates) and drbdadm adjust (which reads the
 // metadata into kernel state).
+//
+// Volumes in skip are left alone: their metadata was kept, not
+// created, and carries a generation of its own.
 
-func (r *Reconciler) seedInitialGI(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, isWinner bool) error {
+func (r *Reconciler) seedInitialGI(
+	ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, isWinner bool, skip map[int32]struct{},
+) error {
 	for _, vol := range dr.GetVolumes() {
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
+			continue
+		}
+
+		if _, ok := skip[vol.GetVolumeNumber()]; ok {
 			continue
 		}
 
