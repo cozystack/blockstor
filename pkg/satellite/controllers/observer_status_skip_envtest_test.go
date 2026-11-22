@@ -195,3 +195,61 @@ func TestObserverCoalescesADriftingOutOfSyncCount(t *testing.T) {
 		t.Fatalf("a write for another change kept the old count: %d", got.Volumes[0].OutOfSyncKib)
 	}
 }
+
+func peerReplicating(peer, state string) *observation {
+	return &observation{
+		ResourceName: statusTestRD,
+		Connections: []connectionObservation{{
+			PeerNodeName: peer, Connected: true, Message: "Connected", ReplicationState: state,
+		}},
+	}
+}
+
+// A running resync writes every change to the out-of-sync count. The
+// REST view and the CLI render that count as the percentage in
+// `SyncTarget(NN%)` and `Inconsistent(NN%)`; coalesced, the percentage
+// froze for minutes while LINSTOR's moves live.
+func TestObserverWritesEveryOutOfSyncChangeOfARunningResync(t *testing.T) {
+	base := startStatusEnvtest(t)
+	name := createStatusReplica(t, base)
+
+	var applies atomic.Int64
+
+	cli := countStatusPatches(base, &applies)
+	o := &ObserverRunnable{Client: cli, Exec: storage.NewFakeExec(), NodeName: statusTestNode}
+	adm := drbd.NewAdm(o.Exec)
+	ctx := t.Context()
+
+	phases := []struct {
+		name string
+		disk string
+		repl string
+	}{
+		{name: "sync target", disk: "Inconsistent", repl: "SyncTarget"},
+		{name: "sync source", disk: "UpToDate", repl: "SyncSource"},
+		{name: "inconsistent without a resync", disk: "Inconsistent", repl: "Established"},
+	}
+
+	for _, phase := range phases {
+		device := deviceUpToDate()
+		device.DrbdState = phase.disk
+		device.Volumes[0].DiskState = phase.disk
+
+		o.handleObservation(ctx, adm, device)
+		o.handleObservation(ctx, adm, peerReplicating("n2", phase.repl))
+		o.handleObservation(ctx, adm, outOfSync(1048576))
+
+		for _, kib := range []int64{786432, 524288, 262144} {
+			before := applies.Load()
+			o.handleObservation(ctx, adm, outOfSync(kib))
+
+			if got := applies.Load() - before; got != 1 {
+				t.Fatalf("%s, out-of-sync %d: applied %d times, want 1", phase.name, kib, got)
+			}
+
+			if got := getStatusReplica(t, base, name); got.Volumes[0].OutOfSyncKib != kib {
+				t.Fatalf("%s: outOfSyncKib = %d, want %d", phase.name, got.Volumes[0].OutOfSyncKib, kib)
+			}
+		}
+	}
+}

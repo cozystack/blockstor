@@ -595,6 +595,9 @@ const (
 	// where the local `device` frame's `disk:UpToDate` is missing or
 	// stale on a Secondary SyncSource (see peerDeviceVolumeObservation).
 	drbdReplStateSyncSource = "SyncSource"
+	// drbdReplStateSyncTarget is the per-peer replication-state token
+	// of the replica a resync is writing to.
+	drbdReplStateSyncTarget = "SyncTarget"
 	// drbdDiskStateUpToDate is the DRBD-9 device disk_state token
 	// meaning the local replica holds a complete, current copy. Used
 	// as the value the SyncSource invariant stamps onto the local
@@ -794,7 +797,10 @@ type appliedStatus struct {
 // seconds: written each time, a few such volumes were most of an
 // idle satellite's API requests. LINSTOR does not keep the count at
 // all. Going to or from zero is written at once, and so is any
-// other change, which carries the current count with it.
+// other change, which carries the current count with it. A volume
+// that is not UpToDate, or a replica resyncing with a peer, writes
+// every change: the REST view and the CLI render the count as the
+// percentage in `SyncTarget(NN%)` / `Inconsistent(NN%)`.
 const outOfSyncRefresh = 5 * time.Minute
 
 // observerWriters bounds the resources one write pass writes at once.
@@ -2653,25 +2659,47 @@ func (o *ObserverRunnable) alreadyApplied(name string, current *blockstoriov1alp
 	return equality.Semantic.DeepEqual(&last.status, withAppliedOutOfSync(status, &last.status))
 }
 
-// withAppliedOutOfSync returns a copy of status whose volumes carry
-// the out-of-sync count last applied wherever both that one and the
-// new one are non-zero: what is left differs from the applied status
-// only by something worth a write (outOfSyncRefresh).
+// withAppliedOutOfSync returns a copy of status in which each UpToDate
+// volume of a replica that resyncs with no peer carries the
+// out-of-sync count last applied, when that count and the new one are
+// both non-zero. If the copy equals the applied status, the only
+// change is the size of such a count, which can wait.
 func withAppliedOutOfSync(status, applied *blockstoriov1alpha1.ResourceStatus) *blockstoriov1alpha1.ResourceStatus {
 	out := status.DeepCopy()
 
+	if resyncRunning(status) {
+		return out
+	}
+
 	for i := range out.Volumes {
 		vol := &out.Volumes[i]
+		if vol.DiskState != drbdDiskStateUpToDate || vol.OutOfSyncKib == 0 {
+			continue
+		}
 
 		for j := range applied.Volumes {
 			prev := &applied.Volumes[j]
-			if prev.VolumeNumber == vol.VolumeNumber && prev.OutOfSyncKib != 0 && vol.OutOfSyncKib != 0 {
+			if prev.VolumeNumber == vol.VolumeNumber && prev.OutOfSyncKib != 0 {
 				vol.OutOfSyncKib = prev.OutOfSyncKib
 			}
 		}
 	}
 
 	return out
+}
+
+// resyncRunning reports whether the replica is the source or the
+// target of a resync with any peer: the states in which the REST view
+// renders the out-of-sync count as progress.
+func resyncRunning(status *blockstoriov1alpha1.ResourceStatus) bool {
+	for i := range status.Connections {
+		switch status.Connections[i].ReplicationState {
+		case drbdReplStateSyncSource, drbdReplStateSyncTarget:
+			return true
+		}
+	}
+
+	return false
 }
 
 // rememberApplied records what was sent and the version the apiserver
