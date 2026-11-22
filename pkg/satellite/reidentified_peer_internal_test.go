@@ -20,6 +20,7 @@ package satellite
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -29,6 +30,11 @@ import (
 	"github.com/cozystack/blockstor/pkg/drbd"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
+)
+
+var (
+	errUnknownConnection = errors.New("unknown connection")
+	errForgetPeer        = errors.New("forget-peer failed")
 )
 
 // kernelWithPeer is `drbdsetup status -j` for a resource holding one
@@ -118,15 +124,10 @@ func TestPeerUnderItsOwnNodeIDIsKept(t *testing.T) {
 	}
 }
 
-// Through the full apply, the old connection goes before the adjust that
-// adds the peer back, so that adjust's new-peer does not fail on it.
-func TestApplyRemovesAReidentifiedPeerBeforeAdjust(t *testing.T) {
-	t.Parallel()
-
-	rec, fx := reidReconciler(t)
-	resWithPeer(t, rec)
-
-	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{{
+// reidentifiedDiskless is a diskless replica on n1 whose peer n2 now has
+// node-id 3.
+func reidentifiedDiskless() *intent.DesiredResource {
+	return &intent.DesiredResource{
 		Name:     "pvc-reid",
 		NodeName: "n1",
 		Flags:    []string{"DISKLESS"},
@@ -141,7 +142,18 @@ func TestApplyRemovesAReidentifiedPeerBeforeAdjust(t *testing.T) {
 			"peer.n2.node-id": "3",
 			"peer.n2.port":    "7000",
 		},
-	}})
+	}
+}
+
+// Through the full apply, the old connection goes before the adjust that
+// adds the peer back, so that adjust's new-peer does not fail on it.
+func TestApplyRemovesAReidentifiedPeerBeforeAdjust(t *testing.T) {
+	t.Parallel()
+
+	rec, fx := reidReconciler(t)
+	resWithPeer(t, rec)
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{reidentifiedDiskless()})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -196,5 +208,47 @@ func TestConnectedPeerUnderAnOldNodeIDIsKept(t *testing.T) {
 		if strings.Contains(c, "del-peer") || strings.Contains(c, "forget-peer") {
 			t.Errorf("a Connected peer was torn down: %s", c)
 		}
+	}
+}
+
+// The old connection can go on its own between the kernel read and the
+// del-peer, which then fails with "unknown connection". As in LINSTOR's
+// satellite, that is no error once forget-peer succeeds or the kernel no
+// longer holds the node-id; a del-peer failure with the connection still
+// there is.
+func TestDelPeerOfAConnectionAlreadyGone(t *testing.T) {
+	t.Parallel()
+
+	unknown := storage.FakeResponse{Err: errUnknownConnection}
+	gone := storage.FakeResponse{Stdout: []byte(`[{"name":"pvc-reid","node-id":0,"connections":[]}]`)}
+	still := storage.FakeResponse{Stdout: []byte(kernelWithPeer)}
+
+	for name, tc := range map[string]struct {
+		devices   map[int32]string
+		forgetErr error
+		reread    storage.FakeResponse
+		wantErr   bool
+	}{
+		"forget-peer succeeds":          {devices: map[int32]string{0: "/dev/vg/pvc-reid_00000"}, reread: still},
+		"diskless, connection gone":     {reread: gone},
+		"forget fails, connection gone": {devices: map[int32]string{0: "/dev/vg/pvc-reid_00000"}, forgetErr: errForgetPeer, reread: gone},
+		"diskless, connection still up": {reread: still, wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			fx := storage.NewFakeExec()
+			fx.ExpectSequence("drbdsetup status -j pvc-reid", still, tc.reread)
+			fx.Expect("drbdsetup del-peer pvc-reid 1", unknown)
+			fx.Expect("drbdsetup forget-peer pvc-reid 1", storage.FakeResponse{Err: tc.forgetErr})
+			rec := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: t.TempDir(), NodeName: "n1"})
+
+			dr := &intent.DesiredResource{Name: "pvc-reid", NodeName: "n1", Peers: []intent.DesiredPeer{peerAt("n2", 3)}}
+
+			err := rec.tearDownReidentifiedPeers(context.Background(), dr, resWithPeer(t, rec), tc.devices)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, want error %v; calls %v", err, tc.wantErr, fx.CommandLines())
+			}
+		})
 	}
 }

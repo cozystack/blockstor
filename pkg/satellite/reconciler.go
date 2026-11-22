@@ -2083,9 +2083,11 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 // belonged to is gone in the case this handles, so a Connected slot
 // under the old id means the ids disagree some other way, and dropping
 // it would cut a working peer. A kernel that cannot be read leaves the
-// decision to the next pass. The kernel is read only when the .res last rendered does not
-// already name every peer under its node-id, so a steady resource costs
-// no extra call.
+// decision to the next pass.
+//
+// The kernel is read only when the .res last rendered does not already
+// name every peer under its node-id, so a steady resource costs no extra
+// call.
 func (r *Reconciler) tearDownReidentifiedPeers(ctx context.Context, dr *intent.DesiredResource, resPath string, devices map[int32]string) error {
 	if !peerIdentitiesChanged(resPath, dr) {
 		return nil
@@ -2106,17 +2108,44 @@ func (r *Reconciler) tearDownReidentifiedPeers(ctx context.Context, dr *intent.D
 				continue
 			}
 
-			err := r.cfg.Adm.DelPeerByNodeID(ctx, dr.GetName(), slot.NodeID)
+			err := r.dropOldConnection(ctx, dr.GetName(), slot.NodeID, anyDevice(devices))
 			if err != nil {
 				return errors.Wrapf(err, "del-peer %s (node-id %d, now %d) from %s",
 					peer.Name, slot.NodeID, *peer.NodeID, dr.GetName())
 			}
+		}
+	}
 
-			if anyDevice(devices) {
-				// Non-fatal, as in tearDownRemovedPeers: a stale slot
-				// costs one of the MaxPeers-1 entries until a retry.
-				_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), slot.NodeID)
-			}
+	return nil
+}
+
+// dropOldConnection runs del-peer for nodeID and, when the local replica
+// has metadata, forget-peer. As in LINSTOR's satellite, a failed
+// del-peer is not an error when forget-peer then succeeds or the kernel
+// no longer holds a connection under that node-id: the connection went
+// on its own between the read and the call, and drbdsetup answers
+// "unknown connection". A failed forget-peer alone is not fatal either;
+// a stale slot costs one of the MaxPeers-1 entries until a retry.
+func (r *Reconciler) dropOldConnection(ctx context.Context, resource string, nodeID int32, withMetadata bool) error {
+	delErr := r.cfg.Adm.DelPeerByNodeID(ctx, resource, nodeID)
+
+	forgotten := false
+	if withMetadata {
+		forgotten = r.cfg.Adm.ForgetPeer(ctx, resource, nodeID) == nil
+	}
+
+	if delErr == nil || forgotten {
+		return nil
+	}
+
+	slots, err := r.cfg.Adm.Show(ctx, resource)
+	if err != nil {
+		return errors.Wrap(delErr, "kernel unreadable after the failure")
+	}
+
+	for _, slot := range slots {
+		if slot.NodeID == nodeID {
+			return errors.Wrap(delErr, "connection still present")
 		}
 	}
 
