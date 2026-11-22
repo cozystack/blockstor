@@ -20,6 +20,7 @@ package satellite
 
 import (
 	"context"
+	"slices"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -49,5 +50,11 @@ func reportReconnectedPeers(ctx context.Context, resource string, peers []string
 		return
 	}
 
-	res.ReconnectedPeers = append(res.ReconnectedPeers, peers...)
+	// An apply can run the adjust more than once; a peer it reconnected
+	// twice is still one peer, and one Event.
+	for _, peer := range peers {
+		if !slices.Contains(res.ReconnectedPeers, peer) {
+			res.ReconnectedPeers = append(res.ReconnectedPeers, peer)
+		}
+	}
 }

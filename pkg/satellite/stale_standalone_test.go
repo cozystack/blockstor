@@ -85,6 +85,34 @@ func TestAdjustReconnectsAStandAlonePeerWithStaleConfig(t *testing.T) {
 	}
 }
 
+// An apply can run the adjust more than once, the FSM's adjust and the
+// first-activation one in the same pass say. A peer reconnected by
+// both is one peer, and gets one Event.
+func TestAdjustReportsAReconnectedPeerOncePerApply(t *testing.T) {
+	t.Parallel()
+
+	fx := portInUseExec()
+	fx.Expect("drbdsetup status -j "+portInUseRes, staleStandAloneStatus())
+	fx.Expect(staleStandAlonePlan, storage.FakeResponse{Stdout: []byte(
+		"drbdsetup peer-device-options " + portInUseRes + " 2 0 --set-defaults\n" +
+			"drbdsetup connect " + portInUseRes + " 2\n",
+	)})
+
+	rec := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: t.TempDir(), NodeName: "n1"})
+	result := &intent.ResourceApplyResult{Name: portInUseRes}
+	ctx := withApplyResult(t.Context(), result)
+
+	for range 2 {
+		if err := rec.adjustResource(ctx, portInUseDesired(), false); err != nil {
+			t.Fatalf("adjust: %v", err)
+		}
+	}
+
+	if got := result.GetReconnectedPeers(); !slices.Equal(got, []string{"n2"}) {
+		t.Errorf("reconnected peers = %v, want [n2] once", got)
+	}
+}
+
 // A peer the operator disconnected is still kept: the plan of a full
 // adjust only connects it again, so the adjust skips the network and
 // reports nothing.
