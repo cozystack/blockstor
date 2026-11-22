@@ -92,6 +92,8 @@ func (s *Server) registerAutoplace(mux *http.ServeMux) {
 		s.requireStore(s.handleResourceCreateOnNode))
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources/{node}/make-available",
 		s.requireStore(s.handleResourceMakeAvailable))
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources/{node}/unmake-available",
+		s.requireStore(s.handleResourceUnmakeAvailable))
 	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/resources/{node}",
 		s.requireStore(s.handleResourceDelete))
 }
@@ -2470,6 +2472,9 @@ func normalizeDisklessFlag(res *apiv1.Resource) {
 //     stamps the new StorPoolName.
 //   - If a diskful replica already lives on the node: no-op
 //     (already available).
+//   - With `auto_manage_dual_primary` (linstor-csi v1.13+ on every RWX
+//     block Attach) the call additionally prepares a live migration
+//     from the node the resource is in use on: see live_migrate.go.
 //
 // Always responds with the upstream `[]ApiCallRc` envelope — golinstor
 // discards the body but the Python CLI and `linstor` operator UI
@@ -2520,15 +2525,7 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	ok = s.applyMakeAvailable(w, r, rdName, node, &req)
-	if !ok {
-		return
-	}
-
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "Resource '" + rdName + "' on node '" + node + "' made available",
-	}})
+	s.makeAvailableAndPrepareMigration(w, r, &rd, node, &req)
 }
 
 // decodeMakeAvailableBody parses the optional JSON body. Upstream
@@ -2852,6 +2849,10 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// this apiserver replica reflects it. See
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
+
+	// The replica's resource connections go with it, as LINSTOR's do:
+	// a replica created on the node later starts from none.
+	s.dropConnectionPropsOf(r.Context(), rdName, node)
 
 	// Bug 67: notify surviving sibling Resources of the peer change
 	// so satellite reconcilers re-derive their peer set without the

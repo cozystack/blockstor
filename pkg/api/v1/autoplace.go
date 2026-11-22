@@ -82,10 +82,17 @@ type ResourceCreate struct {
 // ResourceCreate additions — same `_require_version` gate, same accept-
 // and-no-op disposition. Without them the make-available decoder 400's
 // and linstor-csi's Attach can never publish the volume.
+//
+// AutoManageDualPrimary asks the server to prepare a live migration to
+// this node: when the resource is in use on exactly one other node, the
+// DRBD connection between the two allows two Primaries (and runs protocol
+// C) until unmake-available is called on the migration source. linstor-csi
+// from v1.13 sets it on every Attach of an RWX block volume.
 type ResourceMakeAvailable struct {
-	LayerList    []string `json:"layer_list,omitempty"`
-	Diskful      bool     `json:"diskful,omitempty"`
-	DrbdTCPPorts []int32  `json:"drbd_tcp_ports,omitempty"`
-	CopyAllSnaps bool     `json:"copy_all_snaps,omitempty"`
-	SnapNames    []string `json:"snap_names,omitempty"`
+	LayerList             []string `json:"layer_list,omitempty"`
+	Diskful               bool     `json:"diskful,omitempty"`
+	DrbdTCPPorts          []int32  `json:"drbd_tcp_ports,omitempty"`
+	CopyAllSnaps          bool     `json:"copy_all_snaps,omitempty"`
+	SnapNames             []string `json:"snap_names,omitempty"`
+	AutoManageDualPrimary bool     `json:"auto_manage_dual_primary,omitempty"`
 }
