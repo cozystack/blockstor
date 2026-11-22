@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -51,14 +52,33 @@ type Adm struct {
 	exec storage.Exec
 
 	// schemaMu guards schemas, the per-section schemas read once from
-	// this node's drbdsetup (OptionSchema).
-	schemaMu sync.Mutex
-	schemas  map[string]*OptionSchema
+	// this node's drbdsetup (OptionSchema), and schemaFailures, the last
+	// failed read of each, kept for schemaRetryAfter.
+	schemaMu       sync.Mutex
+	schemas        map[string]*OptionSchema
+	schemaFailures map[string]schemaFailure
+
+	// now is the clock schemaFailures are aged by; time.Now unless a
+	// test sets it.
+	now func() time.Time
 }
+
+// schemaFailure is a failed schema read and when it failed.
+type schemaFailure struct {
+	at  time.Time
+	err error
+}
+
+// schemaRetryAfter is how long a failed schema read is answered from
+// memory before drbdsetup is asked again. Every .res render reads each
+// section's schema, so without it a node whose drbdsetup cannot answer
+// runs the failing xml-help calls again on every render of every
+// resource, adding their latency to each create.
+const schemaRetryAfter = time.Minute
 
 // NewAdm constructs an Adm with the given Exec.
 func NewAdm(ex storage.Exec) *Adm {
-	return &Adm{exec: ex}
+	return &Adm{exec: ex, now: time.Now}
 }
 
 // Up activates the resource: `drbdadm up <res>`. Idempotent on the DRBD
@@ -145,8 +165,9 @@ func (a *Adm) DiskOptionSchema(ctx context.Context) (*OptionSchema, error) {
 // process: drbd-utils ships in the image, so it cannot change under a
 // running satellite.
 //
-// A failure is not kept, so a drbdsetup that could not answer once is
-// asked again on the next render, and it returns a nil schema, which
+// A failure is kept only for schemaRetryAfter, so a drbdsetup that could
+// not answer once is asked again a minute later, not on every render; it
+// returns a nil schema, which
 // accepts every option: the render then goes ahead unfiltered, as it did
 // before the schema existed, and CheckResFile still stands between a
 // body drbdadm refuses and the live file. A section xml-help does not
@@ -168,19 +189,18 @@ func (a *Adm) OptionSchema(ctx context.Context, section string) (*OptionSchema, 
 		return schema, nil
 	}
 
-	docs := make([][]byte, 0, len(commands))
-
-	for _, cmd := range commands {
-		out, err := a.exec.Run(ctx, "drbdsetup", "xml-help", cmd)
-		if err != nil {
-			return nil, errors.Wrapf(err, "drbdsetup xml-help %s", cmd)
-		}
-
-		docs = append(docs, out)
+	if failed, ok := a.schemaFailures[cacheKey]; ok && a.now().Sub(failed.at) < schemaRetryAfter {
+		return nil, failed.err
 	}
 
-	schema, err := ParseOptionSchema(docs...)
+	schema, err := a.readOptionSchema(ctx, commands)
 	if err != nil {
+		if a.schemaFailures == nil {
+			a.schemaFailures = map[string]schemaFailure{}
+		}
+
+		a.schemaFailures[cacheKey] = schemaFailure{at: a.now(), err: err}
+
 		return nil, err
 	}
 
@@ -189,6 +209,7 @@ func (a *Adm) OptionSchema(ctx context.Context, section string) (*OptionSchema, 
 	}
 
 	a.schemas[cacheKey] = schema
+	delete(a.schemaFailures, cacheKey)
 
 	return schema, nil
 }
@@ -2421,4 +2442,21 @@ func (a *Adm) run(ctx context.Context, args ...string) error {
 	}
 
 	return nil
+}
+
+// readOptionSchema asks drbdsetup to describe commands and parses the
+// answers into one schema.
+func (a *Adm) readOptionSchema(ctx context.Context, commands []string) (*OptionSchema, error) {
+	docs := make([][]byte, 0, len(commands))
+
+	for _, cmd := range commands {
+		out, err := a.exec.Run(ctx, "drbdsetup", "xml-help", cmd)
+		if err != nil {
+			return nil, errors.Wrapf(err, "drbdsetup xml-help %s", cmd)
+		}
+
+		docs = append(docs, out)
+	}
+
+	return ParseOptionSchema(docs...)
 }
