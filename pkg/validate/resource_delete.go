@@ -98,7 +98,8 @@ func MidSyncDeleteRefusal(target *apiv1.Resource, siblings []apiv1.Resource) boo
 }
 
 // DefinitionBeingDeleted reports whether the whole definition is being
-// taken apart, as opposed to one replica of a volume that stays.
+// taken apart, as opposed to one replica of a volume that stays. replicas
+// are the definition's replicas as they stand.
 //
 // MidSyncDeleteRefusal protects the data of a volume that outlives the
 // delete. LINSTOR has no such check on any delete path; blockstor keeps it
@@ -108,13 +109,21 @@ func MidSyncDeleteRefusal(target *apiv1.Resource, siblings []apiv1.Resource) boo
 // be removed at all.
 //
 // Two shapes say the definition is going. The DELETE flag is LINSTOR's own
-// mark for `rd d`. linstor-csi's DeleteVolume never sends `rd d` first: it
-// sets BalanceResourcesEnabled=False on the definition, then deletes the
-// replicas one by one, then the definition (pkg/client/linstor.go, Delete).
-// That property write is the only notice the replica deletes get that they
-// are one volume teardown. An operator who switched balancing off by hand
-// loses the guard on that definition, which is where LINSTOR always is.
-func DefinitionBeingDeleted(rd *apiv1.ResourceDefinition) bool {
+// mark for `rd d`, and it settles the question. linstor-csi's DeleteVolume
+// never sends `rd d` first: it sets BalanceResourcesEnabled=False on the
+// definition, waits until no replica is InUse, then deletes the replicas
+// one by one and the volume definitions after them; the definition itself
+// goes only when no snapshot still needs it (pkg/client/linstor.go,
+// Delete). That property write is the only notice the replica deletes get
+// that they are one volume teardown.
+//
+// The same property is what an operator sets to place replicas by hand,
+// and a hand placement is exactly where U130 happens: a second diskful
+// added next to a diskless Primary and the original dropped before the
+// sync finishes. So the property alone counts only while nothing is
+// InUse, which is the state DeleteVolume waits for and a volume with a
+// Primary is never in.
+func DefinitionBeingDeleted(rd *apiv1.ResourceDefinition, replicas []apiv1.Resource) bool {
 	if rd == nil {
 		return false
 	}
@@ -123,7 +132,13 @@ func DefinitionBeingDeleted(rd *apiv1.ResourceDefinition) bool {
 		return true
 	}
 
-	return strings.EqualFold(rd.Props[apiv1.PropBalanceResourcesEnabled], "false")
+	if !strings.EqualFold(rd.Props[apiv1.PropBalanceResourcesEnabled], "false") {
+		return false
+	}
+
+	return !slices.ContainsFunc(replicas, func(res apiv1.Resource) bool {
+		return res.State.InUse != nil && *res.State.InUse
+	})
 }
 
 // SortForDeletion orders replicas the way they are safe to delete one at a

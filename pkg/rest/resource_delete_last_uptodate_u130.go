@@ -119,10 +119,6 @@ func (s *Server) refuseLastUpToDateDiskfulMidSyncDelete(
 		return false
 	}
 
-	if validate.DefinitionBeingDeleted(&rd) {
-		return true
-	}
-
 	siblings, err := s.Store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
 		// A list failure must not silently allow a destructive delete
@@ -136,6 +132,10 @@ func (s *Server) refuseLastUpToDateDiskfulMidSyncDelete(
 		writeStoreError(w, err)
 
 		return false
+	}
+
+	if validate.DefinitionBeingDeleted(&rd, siblings) {
+		return true
 	}
 
 	if !resourceMidSyncDeleteRefusal(target, siblings) {

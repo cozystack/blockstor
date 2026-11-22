@@ -177,3 +177,40 @@ func TestRDDeleteFlagsDefinitionBeforeItsReplicas(t *testing.T) {
 		}
 	}
 }
+
+// U130 on a definition whose replicas are placed by hand: balancing is
+// switched off, a diskless Primary runs on it, a second diskful replica is
+// still syncing, and the original is deleted. The property alone does not
+// make this a teardown; DeleteVolume only deletes once nothing is InUse.
+func TestReplicaDeleteWithBalancingOffAndAPrimaryStaysGuarded(t *testing.T) {
+	st := store.NewInMemory()
+	rd := "pvc-hand-placed"
+
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{
+		Name:  rd,
+		Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	inUse := true
+	primary := disklessReplica(rd, "node-p", apiv1.ResourceFlagDiskless)
+	primary.State.InUse = &inUse
+
+	for _, res := range []*apiv1.Resource{
+		diskfulReplica(rd, "node-a", drbdDiskStateUpToDate),
+		diskfulReplica(rd, "node-b", drbdDiskStateInconsistent),
+		primary,
+	} {
+		if err := st.Resources().Create(t.Context(), res); err != nil {
+			t.Fatalf("seed %s: %v", res.NodeName, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	if code := deleteReplica(t, base, rd, "node-a"); code != http.StatusConflict {
+		t.Fatalf("delete node-a: got %d, want 409 (the Primary's last complete copy)", code)
+	}
+}

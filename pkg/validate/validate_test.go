@@ -323,26 +323,46 @@ func TestMidSyncDeleteRefusalLiftedWhileDefinitionIsDeleted(t *testing.T) {
 		t.Fatal("a single replica delete of the last complete copy must stay guarded")
 	}
 
+	inUse := true
+	primary := apiv1.Resource{
+		NodeName: "node-p",
+		Flags:    []string{apiv1.ResourceFlagDiskless},
+		State:    apiv1.ResourceState{InUse: &inUse},
+	}
+	notInUse := false
+	secondary := primary
+	secondary.State = apiv1.ResourceState{InUse: &notInUse}
+
+	balancingOff := apiv1.ResourceDefinition{Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"}}
+	flagged := apiv1.ResourceDefinition{Flags: []string{apiv1.ResourceFlagDelete}}
+
 	for name, tc := range map[string]struct {
-		rd      apiv1.ResourceDefinition
-		deleted bool
+		rd       apiv1.ResourceDefinition
+		replicas []apiv1.Resource
+		deleted  bool
 	}{
-		"a live definition": {apiv1.ResourceDefinition{}, false},
+		"a live definition": {apiv1.ResourceDefinition{}, nil, false},
 		"balancing switched on": {
-			apiv1.ResourceDefinition{Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "true"}}, false,
+			apiv1.ResourceDefinition{Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "true"}}, nil, false,
 		},
-		"rd d flagged it DELETE": {
-			apiv1.ResourceDefinition{Flags: []string{apiv1.ResourceFlagDelete}}, true,
+		"rd d flagged it DELETE": {flagged, nil, true},
+		"rd d flagged it DELETE with a Primary left": {
+			flagged, []apiv1.Resource{primary}, true,
 		},
 		"linstor-csi DeleteVolume switched balancing off": {
-			apiv1.ResourceDefinition{Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"}}, true,
+			balancingOff, append([]apiv1.Resource{secondary}, stranded...), true,
+		},
+		// U130 on a hand-placed definition: a Primary still runs on it,
+		// which DeleteVolume never leaves behind.
+		"balancing off by hand with a Primary": {
+			balancingOff, append([]apiv1.Resource{primary}, stranded...), false,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			rd := tc.rd
-			if got := validate.DefinitionBeingDeleted(&rd); got != tc.deleted {
+			if got := validate.DefinitionBeingDeleted(&rd, tc.replicas); got != tc.deleted {
 				t.Errorf("DefinitionBeingDeleted = %v, want %v", got, tc.deleted)
 			}
 		})

@@ -484,3 +484,38 @@ func TestDefinitionDeleteFlagsDefinitionBeforeItsReplicas(t *testing.T) {
 		}
 	}
 }
+
+// U130 on a definition placed by hand: balancing off, a diskless Primary,
+// a diskful replica still syncing. Deleting the complete copy stays
+// refused; only a teardown with nothing InUse lifts the guard.
+func TestResourceDeleteWithBalancingOffAndAPrimaryStaysGuarded(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:  "pvc-x",
+			Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"},
+		})
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+
+		inUse := true
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-x", NodeName: "node-p",
+			Flags: []string{apiv1.ResourceFlagDiskless},
+			State: apiv1.ResourceState{InUse: &inUse},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "pvc-x"}); got == 0 {
+		t.Fatal("the Primary's last complete copy was deleted while a peer was still syncing")
+	}
+}

@@ -602,20 +602,22 @@ func checkDeletable(ctx context.Context, run *runContext, rdName, node string) e
 		return fmt.Errorf("get resource %s on %s: %w", rdName, node, err)
 	}
 
-	// Only a replica dropped from a volume that stays is guarded; see
-	// validate.DefinitionBeingDeleted.
 	rd, err := run.Store.ResourceDefinitions().Get(ctx, rdName)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("get resource definition %s: %w", rdName, err)
 	}
 
-	if err == nil && validate.DefinitionBeingDeleted(&rd) {
-		return nil
-	}
+	rdFound := err == nil
 
 	siblings, err := run.Store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
 		return fmt.Errorf("list replicas of %s: %w", rdName, err)
+	}
+
+	// Only a replica dropped from a volume that stays is guarded; see
+	// validate.DefinitionBeingDeleted.
+	if rdFound && validate.DefinitionBeingDeleted(&rd, siblings) {
+		return nil
 	}
 
 	if validate.MidSyncDeleteRefusal(&target, siblings) {
