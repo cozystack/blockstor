@@ -3730,16 +3730,21 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 	// existing GI + bitmap state. Targeting `<rd>/<volNumber>` keeps
 	// drbdmeta away from already-stamped lower disks.
 	metadataFreshlyCreated := false
+	repaired := map[int32]struct{}{}
 
 	for _, vol := range dr.GetVolumes() {
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
-		geometry, create, probeErr := r.metadataToCreate(ctx, dr, vol)
+		plan, probeErr := r.metadataToCreate(ctx, dr, vol)
 		if probeErr != nil {
 			return probeErr
 		}
 
-		if !create {
+		if plan.repaired {
+			repaired[vol.GetVolumeNumber()] = struct{}{}
+		}
+
+		if !plan.create {
 			continue
 		}
 
@@ -3753,7 +3758,7 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		// resync.
 		metadataFreshlyCreated = true
 
-		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, geometry)
+		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, plan.geometry)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
 		}
@@ -3822,7 +3827,9 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		return nil
 	}
 
-	err = r.seedInitialGI(ctx, dr, devices, isInitialUpToDateWinner(dr, firstActivation))
+	// A volume whose metadata was repaired from a dirty activity log is
+	// left out: see metadataPlan.repaired.
+	err = r.seedInitialGI(ctx, dr, devices, isInitialUpToDateWinner(dr, firstActivation), repaired)
 	if err != nil {
 		return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
 	}
@@ -4121,11 +4128,24 @@ func (r *Reconciler) foreignRestoredSuperblock(
 	return found.Clamped(), true
 }
 
+// metadataPlan is what the metadata probe of one volume decided.
+type metadataPlan struct {
+	// geometry is the layout to create metadata in, when create is set.
+	geometry drbd.MetadataGeometry
+	create   bool
+	// repaired marks metadata kept after its activity log was applied. It
+	// carries the generation and dirty bitmap the replica went down with,
+	// which a GI seed would overwrite: the bitmap would then be reconciled
+	// against the wrong generation and its dirty blocks never resynced.
+	// LINSTOR seeds GIs only on metadata it just created.
+	repaired bool
+}
+
 // metadataToCreate answers the metadata probe of one volume: whether it
 // needs create-md, and the layout to create it in.
 func (r *Reconciler) metadataToCreate(
 	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume,
-) (drbd.MetadataGeometry, bool, error) {
+) (metadataPlan, error) {
 	target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
 	hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
@@ -4140,25 +4160,25 @@ func (r *Reconciler) metadataToCreate(
 	}
 
 	if probeErr != nil {
-		return drbd.MetadataGeometry{}, false, errors.Wrapf(probeErr, "dump-md %s", target)
+		return metadataPlan{}, errors.Wrapf(probeErr, "dump-md %s", target)
 	}
 
 	if hasMD {
 		if unclean {
-			return drbd.MetadataGeometry{}, false, nil
+			return metadataPlan{repaired: true}, nil
 		}
 
 		geometry, foreign := r.foreignRestoredSuperblock(ctx, dr, vol, target)
 
-		return geometry, foreign, nil
+		return metadataPlan{geometry: geometry, create: foreign}, nil
 	}
 
 	geometry, err := r.createMDGeometry(ctx, target, unclean)
 	if err != nil {
-		return drbd.MetadataGeometry{}, false, err
+		return metadataPlan{}, err
 	}
 
-	return geometry, true, nil
+	return metadataPlan{geometry: geometry, create: true}, nil
 }
 
 // ensurePerVolumeMetadata stamps DRBD-9 metadata on every diskful
@@ -4223,16 +4243,16 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 		// The same probe as in ensureMetadata: a volume just added to a
 		// live resource has a blank lower disk and is initialised, an
 		// established one that crashed is repaired.
-		geometry, create, probeErr := r.metadataToCreate(ctx, dr, vol)
+		plan, probeErr := r.metadataToCreate(ctx, dr, vol)
 		if probeErr != nil {
 			return probeErr
 		}
 
-		if !create {
+		if !plan.create {
 			continue
 		}
 
-		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, geometry)
+		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, plan.geometry)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
 		}
@@ -5403,11 +5423,20 @@ func isUnknownResourceErr(err error) bool {
 // Must be called between create-md (which writes the metadata
 // block this then mutates) and drbdadm adjust (which reads the
 // metadata into kernel state).
+//
+// Volumes in skip are left alone: their metadata was kept, not
+// created, and carries a generation of its own.
 
-func (r *Reconciler) seedInitialGI(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, isWinner bool) error {
+func (r *Reconciler) seedInitialGI(
+	ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, isWinner bool, skip map[int32]struct{},
+) error {
 	for _, vol := range dr.GetVolumes() {
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
+			continue
+		}
+
+		if _, ok := skip[vol.GetVolumeNumber()]; ok {
 			continue
 		}
 

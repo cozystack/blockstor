@@ -700,6 +700,48 @@ func TestAnUncleanSuperblockOfThisNodeIDIsKeptWithNoRecordedGI(t *testing.T) {
 	}
 }
 
+// Metadata repaired from a dirty activity log on a first activation keeps
+// the generation and dirty bitmap the replica went down with. The day0 GI
+// seed of a first activation used to overwrite them: with a seed from a
+// peer's GI, or a skip of the initial sync, the bitmap was then reconciled
+// against the wrong generation and its dirty blocks were never resynced,
+// which is what keeping the metadata is for.
+func TestRepairedMetadataIsNotSeededOnAFirstActivation(t *testing.T) {
+	for name, record := range map[string]func(*Reconciler, *intent.DesiredResource, *storage.FakeExec){
+		"this node id, no record": func(*Reconciler, *intent.DesiredResource, *storage.FakeExec) {},
+		"recorded GI": func(_ *Reconciler, dr *intent.DesiredResource, fx *storage.FakeExec) {
+			dr.Volumes[0].ObservedGI = uncleanReportedGI
+			fx.ExpectSequence(uncleanDumpMD,
+				storage.FakeResponse{Err: errDumpMdUnclean},
+				storage.FakeResponse{Stdout: dumpWithPeerBitmap("9F00AA11BB22CC33", uncleanReportedGI)})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+			fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+			record(rec, dr, fx)
+
+			skip := true
+			dr.SkipInitialSync = &skip
+			dr.Volumes[0].SeedFromGI = "4B1C2D3E4F506172"
+
+			if err := rec.ensureMetadata(t.Context(), dr, devices, mdMarkerPath, true); err != nil {
+				t.Fatalf("ensureMetadata: %v", err)
+			}
+
+			if !ranCommand(fx, "apply-al") {
+				t.Fatal("the activity log was not applied")
+			}
+
+			for _, cmd := range []string{"create-md", "set-gi"} {
+				if ranCommand(fx, cmd) {
+					t.Errorf("%s ran over metadata repaired from a dirty activity log", cmd)
+				}
+			}
+		})
+	}
+}
+
 // A restore is the one volume with no GI that is initialised over an
 // unclean superblock: a clone or a receive of a snapshot of an attached
 // volume carries the source's superblock with its activity log open, and
