@@ -160,3 +160,57 @@ func TestAdmDiskOptionSchemaIsReadOnceFromDrbdsetup(t *testing.T) {
 		t.Errorf("drbdsetup xml-help new-minor asked %d times, want 2 (failure retried, success kept)", asked)
 	}
 }
+
+// Each section is held against the drbdsetup commands that describe it:
+// net against new-peer, the resource options block against
+// resource-options. A section xml-help does not describe has no schema.
+func TestAdmOptionSchemaPerSection(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	for _, cmd := range []string{"new-peer", "resource-options"} {
+		doc, err := os.ReadFile(filepath.Join("testdata", "xml-help-"+cmd+".xml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fx.Expect("drbdsetup xml-help "+cmd, storage.FakeResponse{Stdout: doc})
+	}
+
+	cases := []struct {
+		section, name, value string
+		ok                   bool
+	}{
+		{drbd.SectionNet, "max-buffers", "8000", true},
+		{drbd.SectionNet, "max-buffers", "8", false},
+		{drbd.SectionNet, "verify-alg", "crc32c", true},
+		{drbd.SectionNet, "quorum", "majority", false}, // a resource option
+		{drbd.SectionOptions, "quorum", "majority", true},
+		{drbd.SectionOptions, "quorum", "2", true},
+		{drbd.SectionOptions, "on-no-quorum", "explode", false},
+		{drbd.SectionOptions, "Keep", "2", false},
+	}
+
+	for _, tc := range cases {
+		schema, err := adm.OptionSchema(t.Context(), tc.section)
+		if err != nil {
+			t.Fatalf("OptionSchema(%s): %v", tc.section, err)
+		}
+
+		err = schema.Check(tc.name, tc.value)
+		if tc.ok && err != nil {
+			t.Errorf("%s: Check(%s, %s) = %v, want accepted", tc.section, tc.name, tc.value, err)
+		}
+
+		if !tc.ok && !errors.Is(err, drbd.ErrOptionRejected) {
+			t.Errorf("%s: Check(%s, %s) = %v, want ErrOptionRejected", tc.section, tc.name, tc.value, err)
+		}
+	}
+
+	handlers, err := adm.OptionSchema(t.Context(), drbd.SectionHandlers)
+	if err != nil || handlers != nil {
+		t.Errorf("handlers schema = %v, %v; want none", handlers, err)
+	}
+}

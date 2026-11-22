@@ -50,10 +50,10 @@ const drbdmetaNoMinor = "-"
 type Adm struct {
 	exec storage.Exec
 
-	// schemaMu guards diskSchema, the disk-section schema read once from
-	// this node's drbdsetup (DiskOptionSchema).
-	schemaMu   sync.Mutex
-	diskSchema *OptionSchema
+	// schemaMu guards schemas, the per-section schemas read once from
+	// this node's drbdsetup (OptionSchema).
+	schemaMu sync.Mutex
+	schemas  map[string]*OptionSchema
 }
 
 // NewAdm constructs an Adm with the given Exec.
@@ -133,8 +133,14 @@ func (a *Adm) CheckResFile(ctx context.Context, candidate, live string) error {
 }
 
 // DiskOptionSchema returns what this node's drbd-utils accepts inside a
-// `disk { }` section, read from `drbdsetup xml-help` for each of
-// DiskSectionCommands, the way LINSTOR's satellite builds its option
+// `disk { }` section; see OptionSchema.
+func (a *Adm) DiskOptionSchema(ctx context.Context) (*OptionSchema, error) {
+	return a.OptionSchema(ctx, SectionDisk)
+}
+
+// OptionSchema returns what this node's drbd-utils accepts inside one
+// `.res` section, read from `drbdsetup xml-help` for each of its
+// SectionCommands, the way LINSTOR's satellite builds its option
 // whitelist when it starts. The answer is kept for the life of the
 // process: drbd-utils ships in the image, so it cannot change under a
 // running satellite.
@@ -143,16 +149,25 @@ func (a *Adm) CheckResFile(ctx context.Context, candidate, live string) error {
 // asked again on the next render, and it returns a nil schema, which
 // accepts every option: the render then goes ahead unfiltered, as it did
 // before the schema existed, and CheckResFile still stands between a
-// body drbdadm refuses and the live file.
-func (a *Adm) DiskOptionSchema(ctx context.Context) (*OptionSchema, error) {
+// body drbdadm refuses and the live file. A section xml-help does not
+// describe has a nil schema too.
+func (a *Adm) OptionSchema(ctx context.Context, section string) (*OptionSchema, error) {
+	commands := SectionCommands(section)
+	if len(commands) == 0 {
+		return nil, nil //nolint:nilnil // a nil schema is the documented "check nothing"
+	}
+
 	a.schemaMu.Lock()
 	defer a.schemaMu.Unlock()
 
-	if a.diskSchema != nil {
-		return a.diskSchema, nil
+	// The disk and peer-device sections share their commands, so they
+	// share one schema and one round of drbdsetup calls.
+	cacheKey := strings.Join(commands, ",")
+
+	if schema, ok := a.schemas[cacheKey]; ok {
+		return schema, nil
 	}
 
-	commands := DiskSectionCommands()
 	docs := make([][]byte, 0, len(commands))
 
 	for _, cmd := range commands {
@@ -169,7 +184,11 @@ func (a *Adm) DiskOptionSchema(ctx context.Context) (*OptionSchema, error) {
 		return nil, err
 	}
 
-	a.diskSchema = schema
+	if a.schemas == nil {
+		a.schemas = map[string]*OptionSchema{}
+	}
+
+	a.schemas[cacheKey] = schema
 
 	return schema, nil
 }
