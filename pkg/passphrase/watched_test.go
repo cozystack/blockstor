@@ -20,6 +20,9 @@ package passphrase_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -30,7 +33,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -353,5 +358,62 @@ func TestWatchedReaderFallsBackWithoutListAndWatch(t *testing.T) {
 
 	if requests.Load() == before {
 		t.Error("the state was not read through the API")
+	}
+}
+
+// A watch the API server refuses gives up at once, not when its sync
+// timeout runs out: its reflector would otherwise retry for as long as the
+// refusal lasts.
+func TestWatchedReaderGivesUpARefusedWatchAtOnce(t *testing.T) {
+	t.Parallel()
+
+	env := startWatchEnv(t)
+	reader, _ := watched(t, env.user(t, "refused", "get"), time.Hour)
+	unlocker := &passphrase.Unlocker{Secrets: passphrase.Secrets{Reader: reader, Namespace: ns, Direct: nil}}
+
+	if state := unlock(t, unlocker); state != passphrase.StateUnlocked {
+		t.Fatalf("state = %s, want unlocked", state)
+	}
+
+	deadline := time.Now().Add(watchBudget)
+
+	for !passphrase.SecretWatchFailed(reader, passphrase.KeyringSecretName) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the refused watch had not given up after %v", watchBudget)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+var errRevoked = errors.New("revoked")
+
+// A watch that has listed its object and is then refused, because its
+// list and watch were revoked, stops serving that object: the cache would
+// otherwise go on returning it, however stale, for as long as the
+// refusal lasts. Any other watch error is the reflector's to retry.
+func TestWatchedReaderStopsAWatchRefusedAfterItListed(t *testing.T) {
+	t.Parallel()
+
+	gr := schema.GroupResource{Group: "", Resource: "secrets"}
+
+	for _, tc := range []struct {
+		name string
+		err  error
+		fail bool
+	}{
+		{"forbidden", apierrors.NewForbidden(gr, passphrase.KeyringSecretName, errRevoked), true},
+		{"unauthorized", apierrors.NewUnauthorized("expired"), true},
+		{"expired", apierrors.NewResourceExpired("too old"), false},
+		{"unexpected EOF", io.ErrUnexpectedEOF, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			failed, stopped := passphrase.ReportToSyncedWatch(fmt.Errorf("failed to list *v1.Secret: %w", tc.err))
+			if failed != tc.fail || stopped != tc.fail {
+				t.Errorf("failed %v, stopped %v; want %v", failed, stopped, tc.fail)
+			}
+		})
 	}
 }

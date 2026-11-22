@@ -25,8 +25,10 @@ import (
 
 	"github.com/cockroachdb/errors"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
+	toolscache "k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -36,9 +38,10 @@ import (
 )
 
 // WatchSyncTimeout is how long a watch gets to list its object. One that
-// has not by then, most likely because the Role grants get but not list
-// and watch on that Secret, is stopped, and its object is read through
-// the API from then on, as it was before there were watches.
+// has not by then, because the API server is slow or out of reach, is
+// stopped, and its object is read through the API from then on, as it was
+// before there were watches. A watch the API server refuses, under a Role
+// that grants get but not list and watch on that Secret, stops at once.
 const WatchSyncTimeout = 30 * time.Second
 
 // WatchedReader serves the reads the encryption state is derived from, the
@@ -52,8 +55,9 @@ const WatchSyncTimeout = 30 * time.Second
 // first read, so a passphrase Secret the ControllerConfig is switched to
 // gets one too.
 //
-// Until a watch has listed its object, and for good once it fails to,
-// reads go to Direct. Every other read, a List included, goes to Direct.
+// Until a watch has listed its object, and for good once it fails to or
+// is refused, reads go to Direct. Every other read, a List included, goes
+// to Direct.
 //
 // A watch trails the API server: a read-modify-write must read through
 // Direct (Secrets.Direct), or its update conflicts until the watch
@@ -85,6 +89,7 @@ type objectWatch struct {
 	cache cache.Cache
 
 	mu     sync.Mutex
+	cancel context.CancelFunc
 	synced bool
 	failed bool
 }
@@ -96,11 +101,34 @@ func (o *objectWatch) state() (bool, bool) {
 	return o.synced, o.failed
 }
 
-func (o *objectWatch) settle(synced bool) {
+// markSynced records that the watch has listed its object, unless it has
+// failed already: a failed watch is stopped and serves nothing again.
+func (o *objectWatch) markSynced() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	o.synced, o.failed = synced, !synced
+	if !o.failed {
+		o.synced = true
+	}
+}
+
+// fail stops the watch and sends its reads to Direct, and reports whether
+// this call is the one that failed it.
+func (o *objectWatch) fail() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.failed {
+		return false
+	}
+
+	o.synced, o.failed = false, true
+
+	if o.cancel != nil {
+		o.cancel()
+	}
+
+	return true
 }
 
 // NeedLeaderElection returns false: every replica that derives the state
@@ -179,7 +207,7 @@ func (w *WatchedReader) watchFor(ctx context.Context, key client.ObjectKey, obj 
 	if err != nil {
 		log.FromContext(ctx).WithName("passphrase").Error(err, "watch; reading through the API instead",
 			"secret", wkey.secret, "name", wkey.name)
-		owatch.settle(false)
+		owatch.fail()
 	}
 
 	return owatch
@@ -201,6 +229,7 @@ func (w *WatchedReader) startWatch(owatch *objectWatch, wkey watchKey) error {
 	opts.ByObject = map[client.Object]cache.ByObject{obj: byObject}
 	opts.DefaultNamespaces = nil
 	opts.ReaderFailOnMissingInformer = true
+	opts.DefaultWatchErrorHandler = w.watchErrorHandler(owatch, wkey)
 
 	objCache, err := cache.New(w.Config, opts)
 	if err != nil {
@@ -208,6 +237,10 @@ func (w *WatchedReader) startWatch(owatch *objectWatch, wkey watchKey) error {
 	}
 
 	ctx, cancel := context.WithCancel(w.ctx)
+
+	owatch.mu.Lock()
+	owatch.cancel = cancel
+	owatch.mu.Unlock()
 
 	_, err = objCache.GetInformer(ctx, obj, cache.BlockUntilSynced(false))
 	if err != nil {
@@ -222,31 +255,54 @@ func (w *WatchedReader) startWatch(owatch *objectWatch, wkey watchKey) error {
 		_ = objCache.Start(ctx)
 	}()
 
+	go w.awaitSync(ctx, owatch, wkey)
+
+	return nil
+}
+
+// awaitSync marks owatch synced once its cache has listed the object, and
+// fails it once the cache has run out of time to.
+func (w *WatchedReader) awaitSync(ctx context.Context, owatch *objectWatch, wkey watchKey) {
 	timeout := w.SyncTimeout
 	if timeout == 0 {
 		timeout = WatchSyncTimeout
 	}
 
-	go func() {
-		syncCtx, syncCancel := context.WithTimeout(ctx, timeout)
-		defer syncCancel()
+	syncCtx, syncCancel := context.WithTimeout(ctx, timeout)
+	defer syncCancel()
 
-		synced := objCache.WaitForCacheSync(syncCtx)
-		owatch.settle(synced)
+	if owatch.cache.WaitForCacheSync(syncCtx) {
+		owatch.markSynced()
 
-		if !synced {
-			cancel()
+		return
+	}
 
-			if w.ctx.Err() == nil {
-				log.FromContext(w.ctx).WithName("passphrase").Info( //nolint:contextcheck // the watch's own context
-					"the watch did not list its object in time; reading it through the API instead "+
-						"(a Role that grants only get on a Secret needs list and watch for the watch)",
-					"secret", wkey.secret, "name", wkey.name, "timeout", timeout)
-			}
+	if owatch.fail() && w.ctx.Err() == nil {
+		log.FromContext(ctx).WithName("passphrase").Info(
+			"the watch did not list its object in time; reading it through the API instead",
+			"secret", wkey.secret, "name", wkey.name, "timeout", timeout)
+	}
+}
+
+// watchErrorHandler is the watch's error handler. A watch that is refused,
+// whether it has listed its object or not, fails: its reflector would
+// retry for as long as the refusal lasts while the cache went on serving
+// the object it last listed, however stale. Direct reads the object
+// again, and reports the refusal, if it is one, to the caller.
+func (w *WatchedReader) watchErrorHandler(owatch *objectWatch, wkey watchKey) toolscache.WatchErrorHandlerWithContext {
+	return func(ctx context.Context, r *toolscache.Reflector, err error) {
+		if !apierrors.IsForbidden(err) && !apierrors.IsUnauthorized(err) {
+			toolscache.DefaultWatchErrorHandler(ctx, r, err)
+
+			return
 		}
-	}()
 
-	return nil
+		if owatch.fail() {
+			log.FromContext(ctx).WithName("passphrase").Info(
+				"the watch was refused; reading its object through the API instead",
+				"secret", wkey.secret, "name", wkey.name, "error", err.Error())
+		}
+	}
 }
 
 // AddWatchedReader adds to mgr a WatchedReader over namespace, reading past
