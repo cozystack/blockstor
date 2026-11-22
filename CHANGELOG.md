@@ -4,6 +4,22 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.14 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #311 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.13; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.13
+
+- **A volume deleted during its initial sync can be deleted (#310).** linstor-csi's DeleteVolume removed the sync source first and the last complete copy was then refused for good; the mid-sync guard is now lifted when the definition carries DELETE, or when balancing is off on it and no replica is InUse, which is the state DeleteVolume waits for.
+- **The mid-sync guard still protects a volume that stays (#310).** A single `r d` of the last complete copy next to a syncing replica is still refused, a replica being deleted no longer counts as a source for the others, and a store error reading the definition refuses the delete instead of letting it through.
+- **`rd d` flags the definition DELETE before it deletes the replicas (#310).** The tiebreaker reconciler leaves a definition so flagged alone, so no witness is added and removed between replica deletes, the way LINSTOR does it.
+- **`r d` naming several nodes deletes the incomplete replicas first (#310).** Naming the sync source before the replica syncing from it is no longer refused over a peer the same command was about to delete.
+- **The encryption state is served from name-limited watches (#311).** The controller's master-key pass and every apiserver's resource view no longer read the ControllerConfig and the keyring and passphrase Secrets from the API server on an idle cluster; whatever decides a write still reads the API server.
+- **The controller and apiserver Secret Roles gain `list` and `watch` under the same `resourceNames` (#311).** A chart that renders these Roles itself needs the two verbs too; without them the reads fall back to one get per derivation, and the watches pick the verbs up within five minutes once granted.
+- **The controller no longer stores `Unknown` over an offline node's replicas (#302).** It used to claim `Status.DrbdState` with forced ownership, which conflicted with every write of a rebooted satellite and left replicas `Unknown` while the kernel had them UpToDate; it now only releases a claim an earlier version took, and reads answer such replicas with no state, as before.
+- **`sync-status` follows LINSTOR's rule (#302).** Diskless replicas and tiebreakers are skipped and a replica with no current state counts as synced, so a definition with a tiebreaker no longer answers `false` for good and piraeus-operator's evacuation is not stalled by it.
+- **The State column of `kubectl get resources.blockstor.org` shows the satellite's last report (#302).** It is not live for a node that is down; `linstor r l` and the REST reads give the live state.
+
 ## v0.4.0-alpha.13 — 2026-11-22
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #308 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.12; the entries below are what changed since.
