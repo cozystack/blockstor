@@ -661,7 +661,7 @@ func (s *Server) restoreReplayState(
 	}
 
 	if finished {
-		s.writeFinishedRestoreReplay(ctx, w, snap.Name, req.ToResource, !prepared)
+		s.writeFinishedRestoreReplay(ctx, w, snap.Name, req, !prepared)
 
 		return false, true
 	}
@@ -688,9 +688,15 @@ func (s *Server) restoreReplayState(
 // The leftover is adopted, not this request's, so the group guard over it
 // refuses rather than rolls back when its group is gone, the same answer the
 // resume of an unfinished one gets.
+//
+// Finished means written, not built: a client that gave up during the first
+// answer's deploy wait left replicas the satellites may still be building, so
+// the replay waits for them as the first answer does.
 func (s *Server) writeFinishedRestoreReplay(
-	ctx context.Context, w http.ResponseWriter, snapName, rdName string, resumed bool,
+	ctx context.Context, w http.ResponseWriter, snapName string, req *snapshotRestoreRequest, resumed bool,
 ) {
+	rdName := req.ToResource
+
 	existing, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
 	if err != nil {
 		writeStoreError(w, err)
@@ -720,7 +726,9 @@ func (s *Server) writeFinishedRestoreReplay(
 		return
 	}
 
-	writeRestoreDone(w, restoreDoneMessage(resumed, snapName, rdName), nil)
+	notReady := s.waitDeployedReplicasReady(ctx, rdName, canonicalRestoreNodeList(req))
+
+	writeRestoreDone(w, restoreDoneMessage(resumed, snapName, rdName), nil, notReady...)
 }
 
 // restoreLeftoverIsFinished answers a retry over a leftover of this restore
@@ -884,7 +892,7 @@ func (s *Server) replayWithoutSnapshot(
 	}
 
 	if finished {
-		s.writeFinishedRestoreReplay(ctx, w, snapName, req.ToResource, true)
+		s.writeFinishedRestoreReplay(ctx, w, snapName, req, true)
 
 		return
 	}

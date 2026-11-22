@@ -21,6 +21,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,5 +109,69 @@ func TestSnapshotRestoreWarnsWhenReplicaIsNotBuiltInTime(t *testing.T) {
 
 	if w := warningsFor(rcs); len(w) != 1 || w["n1"] != maskWarn {
 		t.Errorf("want one not-ready warning, for n1, got %v", w)
+	}
+}
+
+// TestSnapshotRestoreReplayWaitsForTheRestoredReplica pins the replay
+// of a finished restore to the same wait as its first answer. A client
+// that gave up during the build wait finds its replicas already
+// written, so the retry is answered as a finished restore; answered at
+// once, it handed linstor-csi the replica whose device path the attach
+// reads before the satellite had built it, the gap the first answer's
+// wait closes.
+func TestSnapshotRestoreReplayWaitsForTheRestoredReplica(t *testing.T) {
+	st := store.NewInMemory()
+	seedRestoreWithOnlineNodes(t, st, "src-replay", "snap-replay")
+
+	base := startDeployWaitServer(t, st, 500*time.Millisecond, 10*time.Second)
+
+	restoreOnto(t, base, "src-replay", "snap-replay", "dst-replay", "n1")
+
+	standIn := deviceStandIn(t.Context(), st, "dst-replay", 1, []string{"n1"}, 300*time.Millisecond)
+
+	rcs, _ := restoreOnto(t, base, "src-replay", "snap-replay", "dst-replay", "n1")
+	requireReplayAnswer(t, rcs)
+
+	requireDevicePaths(t, st, "dst-replay", []string{"n1"})
+
+	if w := warningsFor(rcs); len(w) != 0 {
+		t.Errorf("unexpected warnings for a replayed restore whose replica was built: %v", w)
+	}
+
+	if err := <-standIn; err != nil {
+		t.Fatalf("satellite stand-in: %v", err)
+	}
+}
+
+// TestSnapshotRestoreReplayWarnsWhenReplicaIsNotBuiltInTime pins the
+// bound on the replay: a replica still unbuilt gets LINSTOR's not-ready
+// warning instead of a bare success.
+func TestSnapshotRestoreReplayWarnsWhenReplicaIsNotBuiltInTime(t *testing.T) {
+	st := store.NewInMemory()
+	seedRestoreWithOnlineNodes(t, st, "src-replay-nb", "snap-replay-nb")
+
+	base := startDeployWaitServer(t, st, 500*time.Millisecond, 10*time.Second)
+
+	restoreOnto(t, base, "src-replay-nb", "snap-replay-nb", "dst-replay-nb", "n1")
+
+	rcs, elapsed := restoreOnto(t, base, "src-replay-nb", "snap-replay-nb", "dst-replay-nb", "n1")
+	requireReplayAnswer(t, rcs)
+
+	if elapsed < 500*time.Millisecond || elapsed > 5*time.Second {
+		t.Errorf("replay took %s, want the 500ms deploy bound", elapsed)
+	}
+
+	if w := warningsFor(rcs); len(w) != 1 || w["n1"] != maskWarn {
+		t.Errorf("want one not-ready warning on the replay, for n1, got %v", w)
+	}
+}
+
+// requireReplayAnswer fails unless rcs is the answer of a replayed restore,
+// so the replay tests cannot pass through the first-run path.
+func requireReplayAnswer(t *testing.T, rcs []apiv1.APICallRc) {
+	t.Helper()
+
+	if len(rcs) == 0 || !strings.HasPrefix(rcs[0].Message, "snapshot restore completed on retry") {
+		t.Fatalf("want the replay answer of a finished restore, got %v", rcs)
 	}
 }
