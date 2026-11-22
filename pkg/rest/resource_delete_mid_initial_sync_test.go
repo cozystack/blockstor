@@ -53,7 +53,7 @@ func seedInitialSyncVolume(t *testing.T, st store.Store, rd string) {
 	}
 }
 
-func deleteReplica(t *testing.T, base, rd, node string) int {
+func deleteReplicaStatus(t *testing.T, base, rd, node string) int {
 	t.Helper()
 
 	resp := httpDelete(t, base+"/v1/resource-definitions/"+rd+"/resources/"+node)
@@ -86,7 +86,7 @@ func TestCSIDeleteVolumeDuringInitialSyncDeletesEveryReplica(t *testing.T) {
 	}
 
 	for _, node := range []string{"node-a", "node-b", "node-c"} {
-		if code := deleteReplica(t, base, rd, node); code != http.StatusOK {
+		if code := deleteReplicaStatus(t, base, rd, node); code != http.StatusOK {
 			t.Fatalf("delete %s: got %d, want 200", node, code)
 		}
 	}
@@ -112,11 +112,11 @@ func TestSingleReplicaDeleteDuringInitialSyncStaysGuarded(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	if code := deleteReplica(t, base, rd, "node-a"); code != http.StatusOK {
+	if code := deleteReplicaStatus(t, base, rd, "node-a"); code != http.StatusOK {
 		t.Fatalf("delete node-a: got %d, want 200 (node-b survives)", code)
 	}
 
-	if code := deleteReplica(t, base, rd, "node-b"); code != http.StatusConflict {
+	if code := deleteReplicaStatus(t, base, rd, "node-b"); code != http.StatusConflict {
 		t.Fatalf("delete node-b: got %d, want 409 (last complete copy)", code)
 	}
 }
@@ -140,7 +140,7 @@ func TestReplicaDeleteOfDefinitionFlaggedDeleteIsNotGuarded(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	if code := deleteReplica(t, base, rd, "node-b"); code != http.StatusOK {
+	if code := deleteReplicaStatus(t, base, rd, "node-b"); code != http.StatusOK {
 		t.Fatalf("delete node-b: got %d, want 200", code)
 	}
 }
@@ -209,7 +209,7 @@ func TestReplicaDeleteWithBalancingOffAndAPrimaryStaysGuarded(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	if code := deleteReplica(t, base, rd, "node-a"); code != http.StatusConflict {
+	if code := deleteReplicaStatus(t, base, rd, "node-a"); code != http.StatusConflict {
 		t.Fatalf("delete node-a: got %d, want 409 (the Primary's last complete copy)", code)
 	}
 }
@@ -225,7 +225,7 @@ func TestReplicaDeleteRefusedWhenTheDefinitionCannotBeRead(t *testing.T) {
 	base, stop := startServerWithStore(t, storetest.FailingDefinitionGet{Store: backend})
 	defer stop()
 
-	if code := deleteReplica(t, base, rd, "node-a"); code == http.StatusOK {
+	if code := deleteReplicaStatus(t, base, rd, "node-a"); code == http.StatusOK {
 		t.Fatal("delete went through although the definition could not be read")
 	}
 
