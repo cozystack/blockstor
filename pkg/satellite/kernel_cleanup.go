@@ -175,6 +175,12 @@ func (r *Reconciler) prunePass1Unexpected(
 
 		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, devices, logger.WithValues("pass", pruneLogPass1, "peer", name))
 		if teardownErr != nil {
+			// The caller logs the error and goes on with the apply,
+			// and a replica that converges asks for no further pass:
+			// without this ask the connection stays up until some
+			// other event reaches the replica.
+			r.retryLater(rdName, bestEffortRetry)
+
 			return errors.Wrapf(teardownErr, "PruneStaleKernelSlots pass 1 (unexpected peer %s)", name)
 		}
 	}

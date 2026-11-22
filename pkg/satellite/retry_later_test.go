@@ -168,3 +168,20 @@ func TestFailedDeviceNodeAsksForARetry(t *testing.T) {
 		})
 	}
 }
+
+// TestFailedUnexpectedPeerTeardownAsksForARetry: the prune's del-peer of
+// a kernel peer K8s no longer expects can fail, and the Resource
+// controller logs that and goes on with the apply. Without an ask the
+// live connection to that peer stays up until another event reaches the
+// replica.
+func TestFailedUnexpectedPeerTeardownAsksForARetry(t *testing.T) {
+	r, fx := newKernelCleanupReconciler(t)
+	fx.Expect("drbdadm del-peer worker-2:pvc-1", storage.FakeResponse{Err: storage.FakeExitError{Code: 10}})
+
+	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1", []string{"worker-1"}, []int32{0}, nil)
+	if err == nil {
+		t.Fatal("PruneStaleKernelSlots hid the failed del-peer")
+	}
+
+	wantRetry(t, r, "pvc-1", bestEffortRetry)
+}
