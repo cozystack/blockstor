@@ -28,9 +28,20 @@ import (
 // The plan of a full adjust tells a connection the operator
 // disconnected, which it only connects again, from one the kernel
 // dropped over a stale peer configuration, which it reconfigures
-// first. The second plan is the one drbd-utils 9.36 printed for a
-// replica whose peer node-id 2 had been set up as diskless and turned
-// diskful.
+// first.
+//
+// The diskless-peer plan is the one `drbdadm -d adjust` printed on the
+// node whose connection the kernel had dropped, with the resource name
+// replaced. The other plans are built from the drbd-utils 9.36 source,
+// which also explains the captured one: a peer set up as diskless
+// carries the peer-device option bitmap=no (drbdadm_postparse.c), so
+// once it turns diskful the configured options differ from the
+// kernel's and adjust_peer_devices schedules `peer-device-options <res>
+// <peer> <vol> --set-defaults` (adm_peer_device); a StandAlone
+// connection adds the connect and its wait (adjust_conn); a changed
+// transport re-creates the peer with del-peer and new-peer. DRBD 9.3's
+// drbd_adm_peer_device_opts turns the bitmap back on in any connection
+// state, taking a bitmap slot.
 func TestPlanReconfiguresPeer(t *testing.T) {
 	t.Parallel()
 
