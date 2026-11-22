@@ -38,6 +38,10 @@ const apiCallRcFailInvldProp int64 = 213
 // not judged; nor is anything outside DrbdOptions/. Returns true when the
 // request was answered.
 //
+// An accepted request has its values rewritten in props, in place, to the
+// form LINSTOR stores them in (propwhitelist.Normalize), so the caller
+// stores Yes as yes as LINSTOR does.
+//
 // Without this a typo such as DrbdOptions/AutoSnapshot/Keep was stored, the
 // satellites rendered it into the .res, drbdadm refused the file, and every
 // replica of the definition failed each apply until the key was deleted.
@@ -52,6 +56,8 @@ func refuseUnwhitelistedProps(w http.ResponseWriter, obj propwhitelist.Object, p
 
 	err := propwhitelist.CheckAll(obj, set)
 	if err == nil {
+		propwhitelist.NormalizeAll(obj, props)
+
 		return false
 	}
 

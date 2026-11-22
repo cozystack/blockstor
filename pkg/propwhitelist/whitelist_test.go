@@ -219,3 +219,27 @@ func TestCheckAcceptsBlockstorsOwnKeysWhereTheyAreRead(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeStoresBooleansAsLinstorDoes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		obj               propwhitelist.Object
+		key, value, wants string
+	}{
+		{propwhitelist.ResourceDefinition, "DrbdOptions/Net/load-balance-paths", "Yes", "yes"},
+		{propwhitelist.ResourceDefinition, "DrbdOptions/Net/allow-two-primaries", "NO", "no"},
+		{propwhitelist.ResourceDefinition, "DrbdOptions/auto-add-quorum-tiebreaker", "No", "false"},
+		{propwhitelist.Controller, "DrbdOptions/AutoEvictAllowEviction", "YES", "true"},
+		{propwhitelist.ResourceDefinition, "DrbdOptions/AutoAddQuorumTiebreaker", "False", "false"},
+		{propwhitelist.ResourceDefinition, "DrbdOptions/Net/protocol", "C", "C"},
+		{propwhitelist.ResourceDefinition, "Aux/Flag", "Yes", "Yes"},
+		{propwhitelist.ResourceDefinition, "DrbdOptions/Net/load-balance-paths", "Maybe", "Maybe"},
+	}
+
+	for _, c := range cases {
+		if got := propwhitelist.Normalize(c.obj, c.key, c.value); got != c.wants {
+			t.Errorf("%s %s=%s: normalized to %q, want %q", c.obj, c.key, c.value, got, c.wants)
+		}
+	}
+}

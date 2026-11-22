@@ -108,6 +108,8 @@ func setProperty(accessor propertyAccessor) handler {
 			if whitelistErr != nil {
 				return fmt.Errorf("%w: %w", errUnwhitelistedProp, whitelistErr)
 			}
+
+			value = propwhitelist.Normalize(accessor.whitelist, key, value)
 		}
 
 		if accessor.namedKey != nil {

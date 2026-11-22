@@ -76,8 +76,17 @@ func drbdOptions(accessor propertyAccessor) handler {
 
 		return accessor.edit(ctx, run.Store, ident, func(props map[string]string) error {
 			_, applyErr := applyDRBDFlags(run.Flags, props)
+			if applyErr != nil {
+				return applyErr
+			}
 
-			return applyErr
+			for key := range requested {
+				if value, ok := props[key]; ok {
+					props[key] = propwhitelist.Normalize(accessor.whitelist, key, value)
+				}
+			}
+
+			return nil
 		})
 	}
 }

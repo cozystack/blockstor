@@ -166,3 +166,35 @@ func TestSetPropertyAcceptsBlockstorsOwnKeys(t *testing.T) {
 		t.Errorf("node ranges not stored: %v", node.Props)
 	}
 }
+
+// TestPropertyWritesStoreBooleansAsLinstorDoes: LINSTOR stores an accepted
+// Yes as yes. Stored as given, the satellite leaves it out of the .res,
+// since drbdadm takes yes and no only.
+func TestPropertyWritesStoreBooleansAsLinstorDoes(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedDefinition)
+
+	for _, argv := range [][]string{
+		{"rd", "sp", "pvc-x", "DrbdOptions/Net/load-balance-paths", "Yes"},
+		{"rd", "drbd-options", "--tcp-cork", "NO", "pvc-x"},
+	} {
+		if got := app.Run(t.Context(), argv); got != 0 {
+			t.Fatalf("%v: exit %d (stderr: %s)", argv, got, errBuf.String())
+		}
+	}
+
+	def, err := appStore(t, app).ResourceDefinitions().Get(t.Context(), "pvc-x")
+	if err != nil {
+		t.Fatalf("get definition: %v", err)
+	}
+
+	for key, want := range map[string]string{
+		"DrbdOptions/Net/load-balance-paths": "yes",
+		"DrbdOptions/Net/tcp-cork":           "no",
+	} {
+		if def.Props[key] != want {
+			t.Errorf("%s: stored %q, want %q", key, def.Props[key], want)
+		}
+	}
+}

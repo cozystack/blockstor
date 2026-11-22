@@ -170,6 +170,44 @@ func ruleFor(cat *catalogue, keys []string, obj Object, key string) (rule, bool)
 	return ownRuleFor(obj, key)
 }
 
+// Normalize returns the form LINSTOR stores an accepted value in
+// (WhitelistProps.normalize): a yes/no boolean in lower case, a
+// true/false-or-yes/no boolean as true or false. Every other value, and any
+// key Check would not accept, comes back as given.
+//
+// The stored form matters because the readers are not as lenient as the
+// check: drbdadm takes yes and no only, so a Yes accepted here would be left
+// out of the .res, and strconv.ParseBool takes no yes or no at all.
+func Normalize(obj Object, key, value string) string {
+	if Check(obj, key, value) != nil {
+		return value
+	}
+
+	cat := loaded()
+
+	keyRule, ok := ruleFor(cat, cat.Objects[string(obj)], obj, key)
+	if !ok {
+		return value
+	}
+
+	switch keyRule.Type {
+	case typeBoolean:
+		return strings.ToLower(value)
+	case typeBooleanTrueFalse:
+		return strconv.FormatBool(strings.EqualFold(value, "true") || strings.EqualFold(value, "yes"))
+	default:
+		return value
+	}
+}
+
+// NormalizeAll rewrites every value of props to the form Normalize gives
+// it, in place.
+func NormalizeAll(obj Object, props map[string]string) {
+	for key, value := range props {
+		props[key] = Normalize(obj, key, value)
+	}
+}
+
 // CheckAll checks every key=value of props on obj, in key order, and returns
 // the first refusal, the one LINSTOR's request would fail on.
 func CheckAll(obj Object, props map[string]string) error {

@@ -315,7 +315,7 @@ func TestRDModifyAcceptsWhitelistedOptionsAndOtherNamespaces(t *testing.T) {
 	want := map[string]string{
 		"DrbdOptions/Resource/on-no-quorum":      "suspend-io",
 		"DrbdOptions/Net/allow-two-primaries":    "yes",
-		"DrbdOptions/auto-add-quorum-tiebreaker": "False",
+		"DrbdOptions/auto-add-quorum-tiebreaker": "false",
 		"Aux/anything/goes":                      "x",
 		"AutoSnapshot/Keep":                      "2",
 	}
@@ -421,5 +421,60 @@ func TestPropsDoorsRefuseBlockstorsOwnKeysElsewhere(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("PUT %s %s: status %d, want 400", door.path, door.body, resp.StatusCode)
 		}
+	}
+}
+
+// TestPropsDoorsStoreBooleansAsLinstorDoes: LINSTOR accepts Yes and TRUE
+// but stores yes and true (WhitelistProps.normalize). Stored as given, Yes
+// is left out of the .res by the satellite, which takes what drbdadm takes,
+// and No on a true/false key reads as unset to strconv.ParseBool.
+func TestPropsDoorsStoreBooleansAsLinstorDoes(t *testing.T) {
+	st := store.NewInMemory()
+	seedWhitelistObjects(t, st)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body := `{"override_props":{"DrbdOptions/Net/load-balance-paths":"Yes",` +
+		`"DrbdOptions/auto-add-quorum-tiebreaker":"No","DrbdOptions/AutoAddQuorumTiebreaker":"YES"}}`
+
+	resp := httpPut(t, base+"/v1/resource-definitions/rd1", []byte(body))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+
+	nodeBody := `{"override_props":{"DrbdOptions/AutoEvictAllowEviction":"No"}}`
+
+	resp = httpPut(t, base+"/v1/nodes/n1", []byte(nodeBody))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("node: status %d, want 200", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(t.Context(), "rd1")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	node, err := st.Nodes().Get(t.Context(), "n1")
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	for key, want := range map[string]string{
+		"DrbdOptions/Net/load-balance-paths":     "yes",
+		"DrbdOptions/auto-add-quorum-tiebreaker": "false",
+		"DrbdOptions/AutoAddQuorumTiebreaker":    "true",
+	} {
+		if rd.Props[key] != want {
+			t.Errorf("%s: stored %q, want %q", key, rd.Props[key], want)
+		}
+	}
+
+	if got := node.Props["DrbdOptions/AutoEvictAllowEviction"]; got != "false" {
+		t.Errorf("node AutoEvictAllowEviction: stored %q, want false", got)
 	}
 }
