@@ -1227,11 +1227,21 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// Upstream LINSTOR does this server-side too: deleting an RD
 	// flags the RD with DELETE, then walks Resources and stamps
 	// DELETE on each. The satellite drives the teardown from
-	// there. Our equivalent is: per-child Resources().Delete()
-	// stamps DeletionTimestamp on the CRD; the satellite's
+	// there. Our equivalent is: the RD is flagged DELETE first
+	// (store.MarkDefinitionDeleting, which keeps the tiebreaker
+	// reconciler off it and lifts the mid-sync replica guard), then
+	// per-child Resources().Delete() stamps DeletionTimestamp on the
+	// CRD; the satellite's
 	// existing `blockstor.org/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
+	err = store.MarkDefinitionDeleting(r.Context(), s.Store, name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
 	err = s.cascadeDeleteResources(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
