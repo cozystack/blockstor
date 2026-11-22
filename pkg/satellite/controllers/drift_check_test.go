@@ -21,7 +21,9 @@ package controllers
 import (
 	"slices"
 	"testing"
+	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -97,18 +99,79 @@ func TestDriftCheckPassesWhatDrbdadmLists(t *testing.T) {
 	}
 }
 
-// TestDriftCheckPassesEveryReplicaWhenDrbdadmCannotTell: drbd-utils
-// before 9.32 has no sh-list-adjustable, and drbdadm fails on a .res it
-// cannot parse. LINSTOR then adjusts every resource; so does the check.
-func TestDriftCheckPassesEveryReplicaWhenDrbdadmCannotTell(t *testing.T) {
+// TestDriftCheckPassesEveryReplicaOnceWhenDrbdadmFails: drbdadm fails
+// on a .res it cannot parse, and LINSTOR then adjusts every resource of
+// the run. The check passes every local replica when the failure
+// starts, and not again every interval while it lasts: a sweep of every
+// replica every 30 s is the periodic full pass the check replaced.
+func TestDriftCheckPassesEveryReplicaOnceWhenDrbdadmFails(t *testing.T) {
+	parseErr := storage.FakeResponse{
+		Err: errors.Wrap(storage.FakeExitError{Code: 10}, "drbdadm sh-list-adjustable all: pvc-x.res:3: parse error"),
+	}
+
 	exec := storage.NewFakeExec()
-	exec.Expect(listAdjustable, storage.FakeResponse{Err: storage.FakeExitError{Code: 20}})
+	exec.ExpectSequence(listAdjustable,
+		parseErr, parseErr,
+		storage.FakeResponse{Stdout: []byte("")},
+		parseErr,
+	)
 
 	check, out := driftFixture(t, exec)
+	every := []string{"pvc-a.n1", "pvc-b.n1", "pvc-c.n1"}
 
 	check.check(t.Context(), logr.Discard())
 
-	if got, want := drained(out), []string{"pvc-a.n1", "pvc-b.n1", "pvc-c.n1"}; !slices.Equal(got, want) {
-		t.Errorf("passes for %v, want every local replica %v", got, want)
+	if got := drained(out); !slices.Equal(got, every) {
+		t.Errorf("passes for %v when the failure starts, want every local replica %v", got, every)
+	}
+
+	check.check(t.Context(), logr.Discard())
+
+	if got := drained(out); len(got) != 0 {
+		t.Errorf("passes for %v while the failure lasts, want none", got)
+	}
+
+	check.check(t.Context(), logr.Discard())
+	check.check(t.Context(), logr.Discard())
+
+	if got := drained(out); !slices.Equal(got, every) {
+		t.Errorf("passes for %v when a new failure starts, want every local replica %v", got, every)
+	}
+}
+
+// TestDriftCheckTurnsOffWithoutListAdjustable: Debian's drbd-utils
+// 9.22, which the satellite image on main installs, has no
+// sh-list-adjustable. LINSTOR does not ask such a drbdadm and runs
+// nothing periodic, so the check sends nothing and stops, where it used
+// to pass every replica on the node every 30 s.
+func TestDriftCheckTurnsOffWithoutListAdjustable(t *testing.T) {
+	exec := storage.NewFakeExec()
+	exec.Expect(listAdjustable, storage.FakeResponse{
+		Err: errors.Wrap(storage.FakeExitError{Code: 1},
+			"drbdadm sh-list-adjustable all: drbdadm: Unknown command 'sh-list-adjustable'"),
+	})
+
+	check, out := driftFixture(t, exec)
+	check.interval = time.Millisecond
+
+	done := make(chan error, 1)
+
+	go func() { done <- check.run(logr.Discard())(t.Context()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the drift check ended with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drift check kept running on a drbdadm without sh-list-adjustable")
+	}
+
+	if got := drained(out); len(got) != 0 {
+		t.Errorf("passes for %v on a drbdadm without sh-list-adjustable, want none", got)
+	}
+
+	if calls := len(exec.CallsSnapshot()); calls != 1 {
+		t.Errorf("drbdadm asked %d times, want once", calls)
 	}
 }

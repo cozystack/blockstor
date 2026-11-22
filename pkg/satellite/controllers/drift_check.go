@@ -55,9 +55,13 @@ type driftCheck struct {
 	out      chan<- event.GenericEvent
 	interval time.Duration
 
-	// failing is set while drbdadm fails, so the failure is logged
-	// once rather than every interval.
+	// failing is set while drbdadm fails, so the failure is logged and
+	// answered once rather than every interval.
 	failing bool
+
+	// unsupported is set once drbdadm turns out to have no
+	// sh-list-adjustable, and the check stops.
+	unsupported bool
 }
 
 // run checks every interval until ctx ends.
@@ -77,15 +81,30 @@ func (d *driftCheck) run(logger logr.Logger) func(context.Context) error {
 				return nil
 			case <-ticker.C:
 				d.check(ctx, logger)
+
+				if d.unsupported {
+					return nil
+				}
 			}
 		}
 	}
 }
 
 // check sends a pass for every local replica drbdadm lists as
-// adjustable. When drbdadm cannot tell (an older drbd-utils without
-// sh-list-adjustable, a .res it cannot parse), every local replica
-// gets one, the way LINSTOR adjusts every resource then.
+// adjustable.
+//
+// drbd-utils before 9.32 (Debian's 9.22 among them) has no
+// sh-list-adjustable. LINSTOR does not ask such a drbdadm for the list
+// and runs nothing periodic either, so on one the check turns itself
+// off with a warning: a pass of every replica every interval is the
+// full sweep the drift check replaced, and on a node with a hundred
+// replicas it stalls a new replica's first pass behind them all.
+//
+// When a drbdadm that has the command still fails (a .res it cannot
+// parse), LINSTOR adjusts every resource of the run it is in. The check
+// passes every local replica once when the failure starts, and nothing
+// more while it lasts: each of those passes runs its own adjust, and a
+// failed adjust asks for its own retry.
 func (d *driftCheck) check(ctx context.Context, logger logr.Logger) {
 	out, err := d.exec.Run(ctx, "drbdadm", "sh-list-adjustable", "all")
 	if err != nil {
@@ -93,9 +112,20 @@ func (d *driftCheck) check(ctx context.Context, logger logr.Logger) {
 			return
 		}
 
-		if !d.failing {
-			logger.Error(err, "drbdadm sh-list-adjustable failed; passing every local replica until it answers")
+		if isUnknownDrbdadmCommand(err) {
+			logger.Error(err, "drbdadm has no sh-list-adjustable (drbd-utils before 9.32); "+
+				"the drift check is off and kernel drift no event reports goes unchecked")
+
+			d.unsupported = true
+
+			return
 		}
+
+		if d.failing {
+			return
+		}
+
+		logger.Error(err, "drbdadm sh-list-adjustable failed; passing every local replica once")
 
 		d.failing = true
 
@@ -125,6 +155,12 @@ func (d *driftCheck) check(ctx context.Context, logger logr.Logger) {
 	d.send(ctx, logger, func(res *blockstoriov1alpha1.Resource) bool {
 		return listed[naming.Key(res.Spec.ResourceDefinitionName)]
 	})
+}
+
+// isUnknownDrbdadmCommand reports whether err is drbdadm refusing a
+// command it does not know ("drbdadm: Unknown command '<verb>'").
+func isUnknownDrbdadmCommand(err error) bool {
+	return strings.Contains(err.Error(), "Unknown command")
 }
 
 func (d *driftCheck) sendAll(ctx context.Context, logger logr.Logger) {
