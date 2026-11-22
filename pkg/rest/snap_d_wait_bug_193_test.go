@@ -42,9 +42,10 @@ import (
 //  1. Wait-for-convergence: the handler blocks until the local store
 //     reports the snapshot is gone, OR a bounded timeout fires.
 //  2. Stuck-finalizer surface: when the snapshot stays observable past
-//     the wait budget, the response flips to 504 + an actionable
-//     envelope citing the satellite issue. The naked 200 success path
-//     from Bug 193 must not happen on a stuck satellite.
+//     the wait budget and a node it lists is offline or unknown (or it
+//     lists none), the response flips to 504 + an actionable envelope
+//     citing the satellite issue. The naked 200 success path from
+//     Bug 193 must not happen on a stuck satellite.
 //  3. Fast paths: snapshots without the satellite finalizer (or already
 //     reaped) return immediately — no extra latency.
 
@@ -217,11 +218,18 @@ func readEnvelope(t *testing.T, resp *http.Response) ([]apiv1.APICallRc, []byte)
 // TestBug193SnapshotDeleteWaitsForFinalizer is the primary contract:
 // when the satellite finalizer never runs (the stuckSnapshots wrapper
 // holds the row forever), DELETE must NOT return 200 immediately.
-// Instead the handler waits up to the bounded budget, then surfaces a
-// 504 envelope citing the stuck satellite. The pre-fix wire shape was
+// The seeded snapshot lists no node, so no satellite can drain it:
+// the handler waits up to the bounded budget, then surfaces a 504
+// envelope citing the stuck satellite. The pre-fix wire shape was
 // "200 + snapshot deleted: snap1" within milliseconds — a regression
 // here means we've gone back to lying to the caller about the
-// snapshot being reaped.
+// snapshot being reaped. A snapshot whose nodes are all online is not
+// given up on at the budget: the wait lasts until the satellites are
+// done or the client's deadline, see
+// TestSnapshotDeleteWaitsOutASlowOnlineSatellite. One whose nodes
+// are offline or unknown gets this 504, see
+// TestSnapshotDeleteGivesUpOnAnOfflineNode and
+// TestSnapshotDeleteGivesUpOnAnUnknownNode.
 func TestBug193SnapshotDeleteWaitsForFinalizer(t *testing.T) {
 	st := newStuckSnapshotStore(0) // 0 = stuck forever
 	seedSnapshot(t, st, "rd1", "snap1")

@@ -251,3 +251,25 @@ func TestCrdToWireSnapshotCarriesTheAbortReason(t *testing.T) {
 		t.Errorf("from the annotation: AbortReason %q, want %q", got, reason)
 	}
 }
+
+// TestCRDToWireSnapshotCarriesDeleteFailures: the satellite records why
+// deleting its copy failed on the CRD status; the REST delete reads the
+// snapshot through this conversion and answers with that error, so the
+// conversion must not drop it.
+func TestCRDToWireSnapshotCarriesDeleteFailures(t *testing.T) {
+	t.Parallel()
+
+	crd := &crdv1alpha1.Snapshot{
+		Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "rd1", SnapshotName: "snap1", Nodes: []string{"n1"}},
+		Status: crdv1alpha1.SnapshotStatus{
+			DeleteFailures: []crdv1alpha1.SnapshotDeleteFailure{{NodeName: "n1", Message: "pool in error"}},
+		},
+	}
+
+	got := crdToWireSnapshot(crd, nil).DeleteFailures
+
+	want := []apiv1.SnapshotDeleteFailure{{NodeName: "n1", Message: "pool in error"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("DeleteFailures: got %+v, want %+v", got, want)
+	}
+}

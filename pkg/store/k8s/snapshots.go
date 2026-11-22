@@ -479,6 +479,13 @@ func crdToWireSnapshot(
 
 	out.Snapshots = wirePerNodeSnapshots(crd)
 
+	for _, failure := range crd.Status.DeleteFailures {
+		out.DeleteFailures = append(out.DeleteFailures, apiv1.SnapshotDeleteFailure{
+			NodeName: failure.NodeName,
+			Message:  failure.Message,
+		})
+	}
+
 	return out
 }
 

@@ -74,6 +74,19 @@ type Snapshot struct {
 	// answers with the abort's error. LINSTOR's snapshot DTO has no such
 	// field, so it never reaches the wire.
 	AbortReason string `json:"-"`
+
+	// DeleteFailures carries the per-node errors the satellites hit
+	// deleting their copies of a deleting snapshot, so the delete call
+	// can answer with them. Internal: LINSTOR has no such field and
+	// reports the error only in the answer to the delete.
+	DeleteFailures []SnapshotDeleteFailure `json:"-"`
+}
+
+// SnapshotDeleteFailure is the error one node hit deleting its copy
+// of a snapshot.
+type SnapshotDeleteFailure struct {
+	NodeName string
+	Message  string
 }
 
 // SnapshotVolumeDef is one volume slot inside a Snapshot. F20:
