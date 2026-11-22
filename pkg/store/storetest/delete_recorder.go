@@ -38,8 +38,7 @@ type ReplicaDelete struct {
 // DeleteRecorder wraps a store and notes every replica delete in order,
 // with whether its definition had been flagged DELETE by then. The `rd d`
 // doors are tested with it: the flag has to be on the definition before
-// the first replica goes, and the replicas go in validate.SortForDeletion
-// order.
+// the first replica goes.
 type DeleteRecorder struct {
 	store.Store
 

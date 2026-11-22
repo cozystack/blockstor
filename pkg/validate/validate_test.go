@@ -398,8 +398,8 @@ func TestMidSyncDeleteRefusalDoesNotCountDeletingSource(t *testing.T) {
 	}
 }
 
-// Deleting replicas one at a time, the incomplete ones go first, so the
-// source of an initial sync is never the first replica removed.
+// `r d` naming several replicas deletes the incomplete ones first, so the
+// guard never refuses a source over a peer the same command removes.
 func TestSortForDeletionPutsIncompleteReplicasFirst(t *testing.T) {
 	t.Parallel()
 

@@ -145,12 +145,13 @@ func DefinitionBeingDeleted(rd *apiv1.ResourceDefinition, replicas []apiv1.Resou
 // time: the diskful replicas that are not complete copies yet first, every
 // other replica after them in its original order.
 //
-// Removing the source of an initial sync while its target is still
-// Inconsistent can leave the target with a cleared bitmap on an Established
-// connection to the remaining UpToDate peer: DRBD sees nothing to resync
-// and the replica stays Inconsistent for good. Taking the incomplete
-// replicas away first means a source never goes while something still
-// depends on it.
+// It matters where the mid-sync guard runs between two deletes, which is
+// `r d` naming several nodes: naming a source before the replica syncing
+// from it would have the guard refuse the source over a peer the same
+// command was about to delete. Once the incomplete replica is deleted it
+// carries DELETE, and MidSyncDeleteRefusal no longer counts it. It does not
+// order the teardown itself: a delete only stamps the replica, and the
+// satellites take DRBD down in parallel.
 func SortForDeletion(replicas []apiv1.Resource) {
 	slices.SortStableFunc(replicas, func(a, b apiv1.Resource) int {
 		return deletionRank(&a) - deletionRank(&b)

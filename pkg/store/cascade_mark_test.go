@@ -24,46 +24,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
-	"github.com/cozystack/blockstor/pkg/store/storetest"
 )
-
-// The cascade of a volume still in its initial sync deletes the
-// Inconsistent replica before the UpToDate copies it depends on, so the
-// source of the sync is never the first replica to go.
-func TestCascadeDeletesIncompleteReplicasFirst(t *testing.T) {
-	t.Parallel()
-
-	ctx := t.Context()
-	backend := store.NewInMemory()
-
-	if err := backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-sync"}); err != nil {
-		t.Fatalf("seed RD: %v", err)
-	}
-
-	for node, disk := range map[string]string{
-		"node-a": "UpToDate",
-		"node-b": "UpToDate",
-		"node-c": "Inconsistent",
-	} {
-		if err := backend.Resources().Create(ctx, &apiv1.Resource{
-			Name: "pvc-sync", NodeName: node,
-			Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
-		}); err != nil {
-			t.Fatalf("seed %s: %v", node, err)
-		}
-	}
-
-	rec := storetest.NewDeleteRecorder(backend)
-
-	if err := store.CascadeDeleteResources(ctx, rec, "pvc-sync"); err != nil {
-		t.Fatalf("cascade: %v", err)
-	}
-
-	deletes := rec.Deletes()
-	if len(deletes) != 3 || deletes[0].Node != "node-c" {
-		t.Errorf("deletes = %+v, want the Inconsistent node-c first", deletes)
-	}
-}
 
 // MarkDefinitionDeleting flags the definition once, and is a no-op on a
 // definition that is already gone.

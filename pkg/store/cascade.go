@@ -27,7 +27,6 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
-	"github.com/cozystack/blockstor/pkg/validate"
 )
 
 // The teardown a delete has to perform, shared by the two write doors.
@@ -79,8 +78,6 @@ func CascadeDeleteResources(ctx context.Context, st Store, rdName string) error 
 		if len(children) == 0 {
 			return nil
 		}
-
-		validate.SortForDeletion(children)
 
 		for i := range children {
 			err = st.Resources().Delete(ctx, rdName, children[i].NodeName)

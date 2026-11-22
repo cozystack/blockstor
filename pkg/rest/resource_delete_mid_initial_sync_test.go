@@ -146,8 +146,7 @@ func TestReplicaDeleteOfDefinitionFlaggedDeleteIsNotGuarded(t *testing.T) {
 }
 
 // rd d flags the definition DELETE before the first replica goes, so the
-// RD reconciler keeps its hands off the tiebreaker for the whole walk, and
-// deletes the Inconsistent replica before its source.
+// RD reconciler keeps its hands off the tiebreaker for the whole walk.
 func TestRDDeleteFlagsDefinitionBeforeItsReplicas(t *testing.T) {
 	backend := store.NewInMemory()
 	rd := "pvc-initial-sync-flag"
@@ -167,8 +166,8 @@ func TestRDDeleteFlagsDefinitionBeforeItsReplicas(t *testing.T) {
 	}
 
 	deletes := rec.Deletes()
-	if len(deletes) == 0 || deletes[0].Node != "node-c" {
-		t.Errorf("deletes = %+v, want the Inconsistent node-c first", deletes)
+	if len(deletes) != 3 {
+		t.Errorf("deletes = %+v, want all three replicas", deletes)
 	}
 
 	for _, d := range deletes {

@@ -446,9 +446,8 @@ func TestResourceDeleteDuringVolumeTeardownIsNotGuarded(t *testing.T) {
 	}
 }
 
-// `rd d` flags the definition DELETE before the first replica goes and
-// deletes the Inconsistent replica before its source, the way the REST
-// door does.
+// `rd d` flags the definition DELETE before the first replica goes, the
+// way the REST door does.
 func TestDefinitionDeleteFlagsDefinitionBeforeItsReplicas(t *testing.T) {
 	t.Parallel()
 
@@ -474,8 +473,8 @@ func TestDefinitionDeleteFlagsDefinitionBeforeItsReplicas(t *testing.T) {
 	}
 
 	deletes := rec.Deletes()
-	if len(deletes) == 0 || deletes[0].Node != "node-b" {
-		t.Errorf("deletes = %+v, want the Inconsistent node-b first", deletes)
+	if len(deletes) != 2 {
+		t.Errorf("deletes = %+v, want both replicas", deletes)
 	}
 
 	for _, d := range deletes {
