@@ -284,34 +284,7 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			NewQueue:                newBringUpQueueFunc(r.bringUp, mgr.GetControllerOptions().Logger),
 		})
 
-	// Phase 11.7 second leg: the observer-trigger channel wakes
-	// this reconciler on kernel-state changes that produce no
-	// apiserver Spec write (peer flapping, role / disk / conn /
-	// repl frames). Each GenericEvent carries the local Resource
-	// object name; the EnqueueRequestForObject handler turns it
-	// straight into a reconcile.Request, no per-event mapping
-	// needed. Nil channel (unit-test path) short-circuits — the
-	// builder skips the raw-source registration entirely.
-	if r.Config.ReconcileTrigger != nil {
-		bldr = bldr.WatchesRawSource(
-			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
-				source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passKernel))),
-		)
-	}
-
-	var drift *driftCheck
-
-	if r.Config.Exec != nil {
-		trigger := make(chan event.GenericEvent, reconcileTriggerBuffer)
-		drift = &driftCheck{
-			reader: mgr.GetClient(), exec: r.Config.Exec, node: r.Config.NodeName,
-			out: trigger, interval: r.Config.DriftCheckInterval,
-		}
-		bldr = bldr.WatchesRawSource(
-			source.Channel(trigger, &handler.EnqueueRequestForObject{},
-				source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passDrift))),
-		)
-	}
+	bldr, drift := r.watchRawSources(mgr, bldr)
 
 	err := bldr.Complete(r.passes.counted(r))
 	if err != nil {
@@ -333,6 +306,43 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// watchRawSources adds the channel sources to bldr: the observer's
+// kernel trigger and, on a satellite that runs tools, the drift check's.
+// It returns the drift check the manager has to run, or nil.
+//
+// Phase 11.7 second leg: the observer-trigger channel wakes this
+// reconciler on kernel-state changes that produce no apiserver Spec
+// write (peer flapping, role / disk / conn / repl frames). Each
+// GenericEvent carries the local Resource object name; the
+// EnqueueRequestForObject handler turns it straight into a
+// reconcile.Request, no per-event mapping needed. Nil channel
+// (unit-test path) short-circuits — the builder skips the raw-source
+// registration entirely.
+func (r *ResourceReconciler) watchRawSources(mgr ctrl.Manager, bldr *builder.Builder) (*builder.Builder, *driftCheck) {
+	if r.Config.ReconcileTrigger != nil {
+		bldr = bldr.WatchesRawSource(
+			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
+				source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passKernel))),
+		)
+	}
+
+	if r.Config.Exec == nil {
+		return bldr, nil
+	}
+
+	trigger := make(chan event.GenericEvent, reconcileTriggerBuffer)
+	drift := &driftCheck{
+		reader: mgr.GetClient(), exec: r.Config.Exec, node: r.Config.NodeName,
+		out: trigger, interval: r.Config.DriftCheckInterval,
+	}
+	bldr = bldr.WatchesRawSource(
+		source.Channel(trigger, &handler.EnqueueRequestForObject{},
+			source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passDrift))),
+	)
+
+	return bldr, drift
 }
 
 // reconcileResource is the body of Reconcile, which only settles the
@@ -718,8 +728,22 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	outcome := r.afterApply(ctx, res, &rd, results, logger)
 
+	return r.nextPass(res, results, outcome, retry, retryAsked, logger), nil
+}
+
+// nextPass is the result of an apply pass: a retry of what failed, or,
+// for a converged replica, nothing but the retry work it put off asked
+// for (retryAsked, after retry).
+func (r *ResourceReconciler) nextPass(
+	res *blockstoriov1alpha1.Resource,
+	results []*intent.ResourceApplyResult,
+	outcome applyOutcome,
+	retry time.Duration,
+	retryAsked bool,
+	logger logr.Logger,
+) ctrl.Result {
 	if requeue := r.applyRetryAfter(res.Name, results, outcome); requeue > 0 {
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		return ctrl.Result{RequeueAfter: requeue}
 	}
 
 	// A stamp that failed is retried the way a failed apply is: no
@@ -727,7 +751,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// waiting on, or for the volume-numbers record a later delete
 	// needs.
 	if outcome.stampFailed {
-		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
+		return ctrl.Result{RequeueAfter: applyFailureRequeue}
 	}
 
 	r.recordRecovery(res, r.retries.reset(res.Name), logger)
@@ -737,10 +761,10 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// one exception is work this pass put off for a while, a dwell
 	// window or a throttle, that no event is bound to bring back.
 	if retryAsked {
-		return ctrl.Result{RequeueAfter: retry}, nil
+		return ctrl.Result{RequeueAfter: retry}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}
 }
 
 // afterApply records the apply's outcome on the Resource and reports

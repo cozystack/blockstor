@@ -1052,10 +1052,7 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 
 	resp, err := r.Config.Apply.DeleteSnapshot(ctx, req)
 	if err != nil {
-		stampErr := r.stampSnapshotDeleteFailure(ctx, snap, err.Error())
-		if stampErr != nil {
-			log.FromContext(ctx).Error(stampErr, "record snapshot delete failure")
-		}
+		r.recordSnapshotDeleteFailure(ctx, snap, err.Error())
 
 		return ctrl.Result{}, errors.Wrap(err, "DeleteSnapshot")
 	}
@@ -1067,10 +1064,7 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 		log.FromContext(ctx).Info("DeleteSnapshot per-snapshot failure",
 			"snapshot", snap.Spec.SnapshotName, "message", resp.GetMessage())
 
-		err = r.stampSnapshotDeleteFailure(ctx, snap, resp.GetMessage())
-		if err != nil {
-			log.FromContext(ctx).Error(err, "record snapshot delete failure")
-		}
+		r.recordSnapshotDeleteFailure(ctx, snap, resp.GetMessage())
 
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -1139,6 +1133,16 @@ func (r *SnapshotReconciler) diskfulPools(ctx context.Context) ([]string, error)
 	slices.Sort(pools)
 
 	return pools, nil
+}
+
+// recordSnapshotDeleteFailure stamps a failed delete of this node's copy
+// and logs a stamp that did not land: the delete is retried either way,
+// and the stamp with it.
+func (r *SnapshotReconciler) recordSnapshotDeleteFailure(ctx context.Context, snap *blockstoriov1alpha1.Snapshot, message string) {
+	err := r.stampSnapshotDeleteFailure(ctx, snap, message)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "record snapshot delete failure")
+	}
 }
 
 // stampSnapshotDeleteFailure records why this node failed to delete
