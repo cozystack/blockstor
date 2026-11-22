@@ -1249,7 +1249,8 @@ func (o *ObserverRunnable) emitReconcileTrigger(ctx context.Context, ev *observa
 
 	name, err := replicaCRName(ctx, o.Client, ev.ResourceName, o.NodeName)
 	if err != nil {
-		// The 5-second resync re-enqueues every local Resource anyway.
+		// No local replica to wake: it is not in the cache yet, and its
+		// creation starts its first pass.
 		return
 	}
 
@@ -1262,9 +1263,15 @@ func (o *ObserverRunnable) emitReconcileTrigger(ctx context.Context, ev *observa
 	select {
 	case o.ReconcileTrigger <- trigger:
 	default:
-		// Channel full — reconciler is already behind. Drop this
-		// wake-up; the 5-second resync ticker plus c-r's
-		// per-resource debouncer guarantee a follow-up.
+		// Channel full. No periodic pass of the replica makes up for a
+		// wake-up dropped here, so it waits for room without holding
+		// up the events2 reader.
+		go func() {
+			select {
+			case o.ReconcileTrigger <- trigger:
+			case <-ctx.Done():
+			}
+		}()
 	}
 }
 

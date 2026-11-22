@@ -399,6 +399,46 @@ func TestObserverEmitsTriggerOnRoleChange(t *testing.T) {
 	}
 }
 
+// TestObserverKeepsTheWakeUpWhenTheTriggerIsFull: the observer must not
+// block the events2 reader on a full trigger channel, and must not drop
+// the wake-up either. It used to drop it and count on the periodic
+// re-check to pass the replica later; with no periodic pass the replica
+// would keep a kernel state change unanswered until its next event.
+func TestObserverKeepsTheWakeUpWhenTheTriggerIsFull(t *testing.T) {
+	t.Parallel()
+
+	observer, ch, adm := newTriggerObserver(t, 1)
+
+	ch <- event.GenericEvent{Object: &blockstoriov1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: "filler"}}}
+
+	done := make(chan struct{})
+
+	go func() {
+		observer.handleObservation(t.Context(), adm, &observation{
+			ResourceName: "pvc-1",
+			InUse:        true,
+			Role:         "Primary",
+			HasResource:  true,
+		})
+
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(triggerTestTimeout):
+		t.Fatal("the observer blocked on a full trigger channel")
+	}
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "filler" {
+		t.Fatalf("first trigger %q, want the one that filled the channel", got.Object.GetName())
+	}
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "pvc-1.n1" {
+		t.Errorf("trigger %q, want pvc-1.n1", got.Object.GetName())
+	}
+}
+
 // TestObserverEmitsTriggerOnDiskChange pins the device-kind path: a
 // per-volume disk-state frame (UpToDate / Inconsistent / Diskless)
 // emits a trigger. Without the wake-up the satellite's recovery
