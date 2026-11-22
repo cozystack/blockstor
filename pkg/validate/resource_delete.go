@@ -126,6 +126,30 @@ func DefinitionBeingDeleted(rd *apiv1.ResourceDefinition) bool {
 	return strings.EqualFold(rd.Props[apiv1.PropBalanceResourcesEnabled], "false")
 }
 
+// SortForDeletion orders replicas the way they are safe to delete one at a
+// time: the diskful replicas that are not complete copies yet first, every
+// other replica after them in its original order.
+//
+// Removing the source of an initial sync while its target is still
+// Inconsistent can leave the target with a cleared bitmap on an Established
+// connection to the remaining UpToDate peer: DRBD sees nothing to resync
+// and the replica stays Inconsistent for good. Taking the incomplete
+// replicas away first means a source never goes while something still
+// depends on it.
+func SortForDeletion(replicas []apiv1.Resource) {
+	slices.SortStableFunc(replicas, func(a, b apiv1.Resource) int {
+		return deletionRank(&a) - deletionRank(&b)
+	})
+}
+
+func deletionRank(res *apiv1.Resource) int {
+	if ResourceIsDiskful(res) && resourceIsMidSync(res) {
+		return 0
+	}
+
+	return 1
+}
+
 // ResourceIsDiskful reports whether a replica carries real backing storage
 // (not DISKLESS, not TIE_BREAKER).
 func ResourceIsDiskful(res *apiv1.Resource) bool {

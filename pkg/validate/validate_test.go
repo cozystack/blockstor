@@ -363,6 +363,33 @@ func TestMidSyncDeleteRefusalIgnoresPeerBeingDeleted(t *testing.T) {
 	}
 }
 
+// Deleting replicas one at a time, the incomplete ones go first, so the
+// source of an initial sync is never the first replica removed.
+func TestSortForDeletionPutsIncompleteReplicasFirst(t *testing.T) {
+	t.Parallel()
+
+	witness := apiv1.Resource{NodeName: "node-d", Flags: []string{apiv1.ResourceFlagTieBreaker}}
+	replicas := []apiv1.Resource{
+		diskful("node-a", "UpToDate"),
+		diskful("node-b", "UpToDate"),
+		witness,
+		diskful("node-c", "Inconsistent"),
+		diskful("node-e", "SyncTarget"),
+	}
+
+	validate.SortForDeletion(replicas)
+
+	got := make([]string, 0, len(replicas))
+	for i := range replicas {
+		got = append(got, replicas[i].NodeName)
+	}
+
+	want := []string{"node-c", "node-e", "node-a", "node-b", "node-d"}
+	if !slices.Equal(got, want) {
+		t.Errorf("delete order = %v, want %v", got, want)
+	}
+}
+
 func TestResourceIsDiskful(t *testing.T) {
 	t.Parallel()
 

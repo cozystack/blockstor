@@ -359,6 +359,41 @@ func TestResourceGroupSpawnEnforcesBounds(t *testing.T) {
 	}
 }
 
+// `r d` naming every replica of a volume still in its initial sync, the
+// source first: the Inconsistent replica is deleted before the copies it
+// depends on, so the last complete copy is never refused over a peer the
+// same command was about to delete.
+func TestResourceDeleteOfEveryReplicaMidInitialSync(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedDefinition(ctx, backend)
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "node-b", "pvc-x"}); got != 0 {
+		t.Fatalf("delete exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	resources, err := appStore(t, app).Resources().List(t.Context())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(resources) != 0 {
+		t.Errorf("replicas survived the delete: %+v", resources)
+	}
+}
+
 // The last complete copy of a volume that stays is still refused.
 func TestResourceDeleteOfLastCompleteCopyStaysGuarded(t *testing.T) {
 	t.Parallel()

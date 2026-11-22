@@ -512,7 +512,12 @@ func resourceDelete(ctx context.Context, run *runContext) error {
 	last := len(run.Flags.Positionals) - 1
 	rdName := run.Flags.Positionals[last]
 
-	for _, node := range run.Flags.Positionals[:last] {
+	nodes, err := deletionOrder(ctx, run, rdName, run.Flags.Positionals[:last])
+	if err != nil {
+		return err
+	}
+
+	for _, node := range nodes {
 		err := checkDeletable(ctx, run, rdName, node)
 		if err != nil {
 			return err
@@ -525,6 +530,49 @@ func resourceDelete(ctx context.Context, run *runContext) error {
 	}
 
 	return nil
+}
+
+// deletionOrder puts the named replicas in the order they are safe to
+// delete one at a time (validate.SortForDeletion): `r d a b c <rd>` naming a
+// syncing replica after its source would otherwise drop the source first and
+// be refused on the replica it was about to delete anyway.
+func deletionOrder(ctx context.Context, run *runContext, rdName string, named []string) ([]string, error) {
+	if len(named) < 2 {
+		return named, nil
+	}
+
+	replicas, err := run.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		if isNotFound(err) {
+			return named, nil
+		}
+
+		return nil, fmt.Errorf("list replicas of %s: %w", rdName, err)
+	}
+
+	validate.SortForDeletion(replicas)
+
+	ordered := make([]string, 0, len(named))
+	taken := make([]bool, len(named))
+
+	for i := range replicas {
+		for j, node := range named {
+			if !taken[j] && naming.Same(node, replicas[i].NodeName) {
+				ordered = append(ordered, node)
+				taken[j] = true
+			}
+		}
+	}
+
+	// Names with no replica behind them keep their place at the end; the
+	// delete is idempotent for them.
+	for j, node := range named {
+		if !taken[j] {
+			ordered = append(ordered, node)
+		}
+	}
+
+	return ordered, nil
 }
 
 // checkDeletable refuses a delete that would strand a peer still resyncing
