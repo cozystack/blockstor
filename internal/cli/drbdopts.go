@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
@@ -54,13 +55,23 @@ func drbdOptions(accessor propertyAccessor) handler {
 		// flags alone. Deciding it here, against a scratch bag, keeps a
 		// usage error a usage error — raised from inside the patch it
 		// would come back wrapped in two layers of store context.
-		changed, err := applyDRBDFlags(run.Flags, map[string]string{})
+		requested := map[string]string{}
+
+		changed, err := applyDRBDFlags(run.Flags, requested)
 		if err != nil {
 			return err
 		}
 
 		if !changed {
 			return fmt.Errorf("%w: drbd-options needs at least one --<option>", command.ErrUsage)
+		}
+
+		// The knob names are fixed, but a value is the operator's: one
+		// drbdadm refuses fails the whole .res on every node, as a
+		// set-property of the same key would, so it is refused here too.
+		whitelistErr := propwhitelist.CheckAll(accessor.whitelist, requested)
+		if whitelistErr != nil {
+			return fmt.Errorf("%w: %w", errUnwhitelistedProp, whitelistErr)
 		}
 
 		return accessor.edit(ctx, run.Store, ident, func(props map[string]string) error {
