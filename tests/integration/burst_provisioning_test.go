@@ -142,6 +142,7 @@ func (e *slowExec) RunWithStdin(ctx context.Context, stdin io.Reader, name strin
 // resource reconciler per node, each with its own cache, on envtest.
 type burstStack struct {
 	cli     client.Client
+	watch   client.WithWatch
 	restURL string
 	nodes   []string
 }
@@ -234,7 +235,12 @@ func startBurstStackWith(t *testing.T, nodes []string, latency burstLatency) *bu
 		runManager(ctx, t, &wg, satMgr)
 	}
 
-	s := &burstStack{cli: env.Client, restURL: "http://" + addr, nodes: nodes}
+	watch, err := client.NewWithWatch(env.Cfg, client.Options{Scheme: mgr.GetScheme()})
+	if err != nil {
+		t.Fatalf("watch client: %v", err)
+	}
+
+	s := &burstStack{cli: env.Client, watch: watch, restURL: "http://" + addr, nodes: nodes}
 	s.seed(ctx, t)
 
 	wg.Go(func() { s.kernel(ctx) })
