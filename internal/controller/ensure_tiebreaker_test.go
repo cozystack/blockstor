@@ -1846,3 +1846,65 @@ func TestBug386EnqueueRDsForNode(t *testing.T) {
 		}
 	}
 }
+
+// A placement still writing a three-replica definition's diskful
+// replicas holds the witness back: two replicas in, the definition
+// looks like the even-diskful tie a witness breaks, and the witness
+// would land on the node the third replica is for. The peers set it up
+// as a diskless peer, and when the placement took it over as diskful
+// their kernel dropped the connection to it. Once the placement is
+// done, or its stamp has expired because it never got to remove it,
+// the witness decision runs as before.
+func TestEnsureTiebreakerWaitsForAPlacementInProgress(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		deadline    time.Duration
+		wantWitness bool
+	}{
+		{name: "in progress", deadline: time.Minute, wantWitness: false},
+		{name: "stamp expired", deadline: -time.Minute, wantWitness: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			scheme := newScheme(t)
+			st := store.NewInMemory()
+			ctx := t.Context()
+
+			for _, n := range []string{"n1", "n2", "n3"} {
+				if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}); err != nil {
+					t.Fatalf("seed node %s: %v", n, err)
+				}
+			}
+
+			for _, n := range []string{"n1", "n2"} {
+				if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-placing", NodeName: n}); err != nil {
+					t.Fatalf("seed replica %s: %v", n, err)
+				}
+			}
+
+			rd := &blockstoriov1alpha1.ResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pvc-placing",
+					Annotations: map[string]string{
+						apiv1.PlacementInProgressUntilAnnotation: time.Now().Add(tc.deadline).UTC().Format(time.RFC3339Nano),
+					},
+				},
+			}
+
+			cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+			rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme, Store: st}
+
+			if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+				t.Fatalf("EnsureTiebreaker: %v", err)
+			}
+
+			_, err := st.Resources().Get(ctx, "pvc-placing", "n3")
+			if gotWitness := err == nil; gotWitness != tc.wantWitness {
+				t.Errorf("witness on n3: got %v, want %v", gotWitness, tc.wantWitness)
+			}
+		})
+	}
+}

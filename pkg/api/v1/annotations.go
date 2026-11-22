@@ -60,6 +60,26 @@ const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.org/auto-tiebreaker-s
 // the neutral, dependency-free shared layer both already import.
 const KeepTiebreakerUntilAnnotation = "blockstor.org/keep-tiebreaker-until"
 
+// PlacementInProgressUntilAnnotation is stamped on an RD by a placement
+// that writes more than one diskful replica, for as long as it writes
+// them. The placer creates the replicas one at a time, and the RD
+// reconciler, seeing the first two of a three-replica placement, would
+// put a TIE_BREAKER witness on the node the third one is for. The
+// placement takes that witness over, but the peers have set it up as a
+// diskless peer by then, and a peer that turns diskful under a
+// connection set up for a diskless one fails the handshake: the kernel
+// drops the connection and leaves it StandAlone. LINSTOR decides the
+// witness after the whole placement, in the same transaction, so it
+// never puts one there. While this annotation names a deadline in the
+// future the reconciler adds no witness; the placement removes it when
+// it is done, and the deadline only bounds a placement that never got
+// to remove it.
+//
+// The value is an RFC3339 wall-clock deadline, fractional seconds
+// allowed so that each placement's stamp is its own. Bad or unparseable
+// values count as no placement in progress.
+const PlacementInProgressUntilAnnotation = "blockstor.org/placement-in-progress-until"
+
 // AutoDiskfulDeadlineAnnotation is stamped on an RD when the
 // AutoDiskfulReconciler first observes a diskful-replica deficit
 // (count < SelectFilter.PlaceCount) and the effective
