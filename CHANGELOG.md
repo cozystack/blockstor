@@ -4,6 +4,26 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.11 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #308 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.10; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.10
+
+- **A converged replica no longer gets a full satellite pass every 10 seconds (#295).** A replica waits for its next event, and a node-wide `drbdadm sh-list-adjustable` run every 30 seconds passes the replicas whose kernel state drifted from their configuration; with a drbdadm older than 9.32 the drift check is off, with an error in the log.
+- **Work a satellite pass puts off asks for a pass of its own (#295).** The stuck-slot grace, the late-add stall dwell, the recovery-promote throttle, a failed best-effort step and a failed status stamp after the apply bring the replica back when they are due, where they used to wait for the periodic re-check.
+- **A kernel wake-up the trigger channel has no room for is kept, not dropped (#295).** It waits in a set with one entry per replica, and a frame whose replica name could not be read wakes the replica on the next identical frame.
+- **A connected peer's role change wakes the local replica (#295).** The mkfs retry and the recovery and late-add promotes, which wait for a Primary peer to step down, now run as soon as it does.
+- **The satellite reads a volume's GI only while it can move (#305).** The resync skips the `drbdsetup get-gi` of a volume whose GI was read and has left day0, or is day0 with no Primary replica, so an idle node runs no drbdsetup for it.
+- **The controller no longer re-reads every resource definition every 5 seconds (#308).** A settled definition waits for its next event; a node that joins or changes its type or `AutoplaceTarget`, a group's creation or deletion, a witness deadline, a deferred witness create and a failed resize-pending stamp bring it back.
+- **A tiebreaker is re-added on a node only after the survivors dropped their connection to the replica deleted there (#307).** The survivors' `drbdadm adjust` no longer fails with `(174) Already exists` for 30 seconds after a replica is deleted from a three-node definition; the connections an OFFLINE survivor last reported do not count.
+- **A satellite removes a peer's old connection when the peer comes back under a new node-id (#307).** The old connection goes with `drbdsetup del-peer` by node-id before the adjust, unless it is Connected.
+- **A definition flagged DELETE gets no tiebreaker (#307).** Witness management stops for it, as for a definition with a deletion timestamp.
+- **A snapshot restore onto a node answers once the restored replica is built (#291).** The replay of a finished restore waits the same way, so linstor-csi's attach after CreateVolume finds the device path instead of backing off for about 30 seconds.
+- **A snapshot delete waits for slow satellites that are online, instead of answering 504 after 10 seconds (#306).** A satellite that fails to delete its copy records the error, and the delete answers it with HTTP 500; only a node that is offline or unknown still ends the wait with 504.
+- **Unclean metadata on a volume with no recorded GI is no longer re-created (#279).** When its superblock names this replica's node id the satellite applies the activity log and keeps it; otherwise the apply is refused with a Warning Event `UncleanMetadataRefused` that names `drbdadm apply-al` and `drbdadm wipe-md` as the ways out.
+- **Metadata repaired from an open activity log is left out of the GI seed of a first activation (#279).** The generation a replica went down with is no longer overwritten by a peer's GI or a skipped initial sync.
+
 ## v0.4.0-alpha.10 — 2026-11-21
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #306 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.9; the entries below are what changed since.
