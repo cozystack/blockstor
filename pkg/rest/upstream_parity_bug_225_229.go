@@ -165,6 +165,12 @@ func (s *Server) handleResourceDefinitionSyncStatus(w http.ResponseWriter, r *ht
 		return
 	}
 
+	// The store keeps a satellite's last report after the satellite is
+	// gone, so a replica on an OFFLINE node, or one the restarted
+	// satellite has not reported yet, would still read UpToDate. Answer
+	// from the state the other replica reads show instead.
+	s.forgetStaleReplicas(r.Context(), resources)
+
 	synced := true
 
 	for i := range resources {

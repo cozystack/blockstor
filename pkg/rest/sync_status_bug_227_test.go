@@ -145,3 +145,95 @@ func TestBug227SyncStatusUnknownRD(t *testing.T) {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
+
+func getSyncedOnAll(t *testing.T, url string) bool {
+	t.Helper()
+
+	resp := httpGet(t, url)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got struct {
+		SyncedOnAll bool `json:"synced_on_all"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	return got.SyncedOnAll
+}
+
+// restartSatellite brings n2 back ONLINE under a new satellite process,
+// leaving its replica stamped by the given incarnation.
+func restartSatellite(t *testing.T, backend store.Store, replicaIncarnation string) {
+	t.Helper()
+
+	ctx := t.Context()
+
+	node, err := backend.Nodes().Get(ctx, "n2")
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	node.ConnectionStatus = apiv1.NodeTypeOnline
+	node.SatelliteIncarnation = "inc-2"
+
+	if err := backend.Nodes().Update(ctx, &node); err != nil {
+		t.Fatalf("bring node back: %v", err)
+	}
+
+	rsc, err := backend.Resources().Get(ctx, "pvc-x", "n2")
+	if err != nil {
+		t.Fatalf("get replica: %v", err)
+	}
+
+	rsc.SatelliteIncarnation = replicaIncarnation
+
+	if err := backend.Resources().Update(ctx, &rsc); err != nil {
+		t.Fatalf("stamp incarnation: %v", err)
+	}
+}
+
+// The store still holds the UpToDate an OFFLINE node's satellite last
+// reported. Sync status must not answer from it: the replica reads
+// with no state, and a replica with no state is not synced.
+func TestBug227SyncStatusOfflineReplicaIsNotSynced(t *testing.T) {
+	base, stop := startServerWithStore(t, seedOfflinePeer(t))
+	defer stop()
+
+	if getSyncedOnAll(t, base+"/v1/resource-definitions/pvc-x/sync-status") {
+		t.Errorf("synced_on_all: got true, want false (n2 is OFFLINE and its UpToDate is a stale report)")
+	}
+}
+
+// After a satellite restart the stored state comes from the previous
+// process until the new one reports the replica, so it is not synced
+// yet; once the new process has reported it, it is.
+func TestBug227SyncStatusFollowsSatelliteIncarnation(t *testing.T) {
+	cases := []struct {
+		name       string
+		reportedBy string
+		want       bool
+	}{
+		{name: "reported by the previous satellite", reportedBy: "inc-1", want: false},
+		{name: "reported by the running satellite", reportedBy: "inc-2", want: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := seedOfflinePeer(t)
+			restartSatellite(t, backend, tc.reportedBy)
+
+			base, stop := startServerWithStore(t, backend)
+			defer stop()
+
+			if got := getSyncedOnAll(t, base+"/v1/resource-definitions/pvc-x/sync-status"); got != tc.want {
+				t.Errorf("synced_on_all: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
