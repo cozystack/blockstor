@@ -95,3 +95,32 @@ func TestAFailedApplyEventNoteFitsTheAPILimit(t *testing.T) {
 		t.Errorf("a note within the limit was cut: %q", note)
 	}
 }
+
+// A StandAlone connection the apply set up again because the kernel had
+// dropped it over a stale peer configuration reaches the Resource as a
+// Warning Event naming the peer: until then the replica's own disk was
+// UpToDate and nothing but the connection column said anything was
+// wrong.
+func TestAReconnectedStaleConnectionIsAWarningEventOnTheResource(t *testing.T) {
+	t.Parallel()
+
+	res := &blockstoriov1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.node-a"}}
+	recorder := events.NewFakeRecorder(4)
+	r := &ResourceReconciler{Config: Config{Recorder: recorder}}
+
+	failed, _ := r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{
+		{Name: "pvc-1", Ok: true, ReconnectedPeers: []string{"node-c"}},
+	}, logr.Discard())
+	if failed {
+		t.Fatal("an apply that went through was reported as a failure")
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "Warning "+staleConnectionReason) || !strings.Contains(ev, "node-c") {
+			t.Errorf("Event = %q, want a Warning %s naming the peer", ev, staleConnectionReason)
+		}
+	default:
+		t.Error("no Event for a reconnected stale connection")
+	}
+}

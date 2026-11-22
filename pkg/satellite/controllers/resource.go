@@ -635,10 +635,16 @@ func (r *ResourceReconciler) prepareDRBDApply(
 // line: it is part of every fresh replica's bring-up, and a Warning
 // for it reads as a fault that is not there. Only a wait that lasts
 // past a minute is reported, once (trackControllerWait).
+//
+// A peer the apply reconnected after the kernel dropped it is reported
+// here as well (recordReconnectedPeers), whether the apply went through
+// or not.
 func (r *ResourceReconciler) recordPerResourceFailures(
 	res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult, logger logr.Logger,
 ) (bool, bool) {
 	var anyFailed, anyFault bool
+
+	r.recordReconnectedPeers(res, results)
 
 	for _, result := range results {
 		if result.GetOk() {
@@ -723,6 +729,30 @@ func (r *ResourceReconciler) recordRecovery(res *blockstoriov1alpha1.Resource, f
 
 	r.Config.Recorder.Eventf(res, nil, corev1.EventTypeNormal, applySucceededReason, "Apply",
 		"apply succeeded after %d failed attempts", failures)
+}
+
+// staleConnectionReason is the Event reason for a StandAlone connection
+// the apply set up again because the kernel held it with a peer
+// configuration the resource no longer has.
+const staleConnectionReason = "StaleConnectionReconnected"
+
+// recordReconnectedPeers reports each peer an apply reconnected after
+// the kernel had dropped the connection to it over a stale peer
+// configuration: a Warning Event on the Resource. Until that apply the
+// replica was StandAlone towards the peer while its own disk stayed
+// UpToDate, and nothing but this Event says why it was.
+func (r *ResourceReconciler) recordReconnectedPeers(res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult) {
+	if r.Config.Recorder == nil {
+		return
+	}
+
+	for _, result := range results {
+		for _, peer := range result.GetReconnectedPeers() {
+			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, staleConnectionReason, "Apply",
+				"%s", eventNote("the connection to "+peer+" was StandAlone with a peer configuration "+
+					"the resource no longer has; a full adjust set it up again"))
+		}
+	}
 }
 
 // applyFailureEvent is the Warning Event reason and note for a failed
