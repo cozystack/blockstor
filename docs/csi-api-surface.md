@@ -107,7 +107,8 @@ Last sync against handler list: 2026-05-09 (Phase 8.5 close).
 | `/v1/resource-definitions/{rd}/resources/{node}/volumes` | GET / PUT | ⬜ |
 | `/v1/resource-definitions/{rd}/resources/{node}/migrate-disk/...` | PUT | ⬜ |
 | `/v1/resource-definitions/{rd}/resources/{node}/toggle-disk/...` | PUT | ⬜ (auto-diskful covers the common case) |
-| `/v1/resource-definitions/{rd}/resources/{node}/make-available` | POST | ⬜ |
+| `/v1/resource-definitions/{rd}/resources/{node}/make-available` | POST | ✅ (incl. `auto_manage_dual_primary`, see [live-migration.md](live-migration.md)) |
+| `/v1/resource-definitions/{rd}/resources/{node}/unmake-available` | POST | ✅ (see [live-migration.md](live-migration.md)) |
 | `/v1/resource-definitions/{rd}/resources/{node}/activate` | POST | ✅ |
 | `/v1/resource-definitions/{rd}/resources/{node}/deactivate` | POST | ✅ |
 | `/v1/resource-definitions/{rd}/resources/{node}/adjust` | POST | ✅ |
