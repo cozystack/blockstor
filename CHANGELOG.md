@@ -4,6 +4,20 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.13 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #308 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.12; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.12
+
+- **A placement of several diskful replicas gets no tiebreaker while it writes them (#303).** The placer stamps a per-placement hold on the definition before its first create and removes it when done, so the tiebreaker reconciler no longer reads the first two of three replicas as an even split and puts a witness on the node the third is for; a hold left by a process that died runs out after one minute.
+- **`linstor r c` of two or more diskful replicas holds the tiebreaker the same way (#303).** A single replica, or a diskful one next to a diskless one, writes no hold.
+- **The controller comes back for a definition when its placement hold runs out (#303, #308).** The witness deadline requeue also reads the placement hold, so a witness held back by a placement that never removed its stamp is added once the stamp expires.
+- **A StandAlone connection the kernel dropped over a peer's stale options is reconnected (#299).** Before adjusting with `--skip-net` the satellite reads the plan of a full adjust and keeps the peer disconnected only when the plan would do nothing but connect it, as for an operator's `drbdadm disconnect`; otherwise it runs the full adjust.
+- **A peer reconnected that way is reported (#299).** The satellite logs it and emits a Warning Event `StaleConnectionReconnected` on the Resource, and the troubleshooting page describes the case.
+- **An out-of-sync count that only drifts no longer causes a status write (#297).** On an UpToDate volume of a replica that is neither SyncSource nor SyncTarget, a change that keeps `outOfSyncKib` non-zero waits for the next write the replica needs or five minutes at the latest; a change to or from zero and every change during a resync is written at once.
+- **A volume's `outOfSyncKib` is the largest count over its peers (#297).** It used to be the count of whichever peer's frame came last, which flipped between zero and a count on every statistics frame of a replica in sync with one peer but not another.
+
 ## v0.4.0-alpha.12 — 2026-11-22
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #308 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.11; the entries below are what changed since.
