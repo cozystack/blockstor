@@ -209,7 +209,10 @@ type VolumeState struct {
 	// behind any peer" reported by `drbdsetup events2 --statistics`
 	// peer-device frames. UI/CLI compute a sync-progress %:
 	//   progress = (1 - OutOfSyncKib / VolumeDefinition.SizeKib) * 100
-	// 0 means fully in sync.
+	// 0 means fully in sync. While the volume is UpToDate and no peer
+	// resyncs with the replica, a change that keeps the count non-zero
+	// can arrive up to 5 minutes late; a change to or from 0, and any
+	// change during a resync, arrives at once.
 	OutOfSyncKib int64 `json:"out_of_sync_kib,omitempty"`
 
 	// ReplicationStates is the per-peer replication-state map the
