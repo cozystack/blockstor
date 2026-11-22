@@ -668,7 +668,7 @@ const (
 	drbdQuorumYes = "yes"
 	// drbdFlagYes is how events2 prints any set flag, such as
 	// `force-io-failures:yes` on resource frames.
-	drbdFlagYes = drbdQuorumYes
+	drbdFlagYes = "yes"
 )
 
 // newObserverRunnableFromConfig builds the observer the manager runs, so the
