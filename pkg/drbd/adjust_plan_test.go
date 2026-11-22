@@ -73,6 +73,18 @@ func TestPlanReconfiguresPeer(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "a new minor whose number reads like the peer",
+			plan: []string{"drbdsetup new-minor pvc-a 2 0", "drbdsetup connect pvc-a 2"},
+			peer: 2,
+			want: false,
+		},
+		{
+			name: "peer re-created over a changed transport",
+			plan: []string{"drbdsetup del-peer pvc-a 2", "drbdsetup new-peer pvc-a 2 --transport=tcp", "drbdsetup new-path pvc-a 2 ipv4:10.0.0.1:7000 ipv4:10.0.0.2:7000", "drbdsetup connect pvc-a 2"},
+			peer: 2,
+			want: true,
+		},
+		{
 			name: "another resource",
 			plan: []string{"drbdsetup peer-device-options pvc-b 2 0 --set-defaults"},
 			peer: 2,

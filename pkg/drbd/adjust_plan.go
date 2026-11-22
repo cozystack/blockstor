@@ -63,11 +63,7 @@ func PlanReconfiguresPeer(plan []string, resource string, peerNodeID int32) bool
 
 	for _, line := range plan {
 		verb, args, ok := drbdsetupCommand(line)
-		if !ok || len(args) < 2 || args[0] != resource || args[1] != peer {
-			continue
-		}
-
-		if verb == "connect" || strings.HasPrefix(verb, "wait-connect") {
+		if !ok || !reconfiguresPeer(verb) || len(args) < 2 || args[0] != resource || args[1] != peer {
 			continue
 		}
 
@@ -75,6 +71,25 @@ func PlanReconfiguresPeer(plan []string, resource string, peerNodeID int32) bool
 	}
 
 	return false
+}
+
+// reconfiguresPeer reports whether verb is one of the drbdsetup
+// commands of an adjust plan that change a connection's configuration,
+// each taking the resource and the peer's node-id as its first two
+// arguments (drbd-utils 9.36, drbdadm_main.c: adm_new_peer, adm_path,
+// adm_peer_device and the del-peer, disconnect and forget-peer
+// commands). connect and the wait-connect family only connect. A
+// command of another scope can carry the same two leading values with
+// another meaning: new-minor takes the resource and a minor number, and
+// a minor equal to the peer's node-id is no change to that peer.
+func reconfiguresPeer(verb string) bool {
+	switch verb {
+	case "new-peer", "del-peer", "net-options", "peer-device-options",
+		"new-path", "del-path", "disconnect", "forget-peer":
+		return true
+	default:
+		return false
+	}
 }
 
 // drbdsetupCommand splits one line of an adjust plan into the drbdsetup
