@@ -147,6 +147,11 @@ type ReconcilerConfig struct {
 	// and demotes via Adm, but a configured `FileSystem/Type` prop
 	// becomes a no-op rather than panicking.
 	Exec storage.Exec
+
+	// UnresolvedPoolDwell is how long a diskful replica whose volumes
+	// name no storage pool waits for one before its apply fails.
+	// Zero means unresolvedPoolDwellDefault.
+	UnresolvedPoolDwell time.Duration
 }
 
 // CrossNodeFetcher abstracts the "fetch a snapshot from a peer that
@@ -378,7 +383,23 @@ type Reconciler struct {
 	// drops both, so a resource re-created under the name does not
 	// inherit the record.
 	adjustFailed map[string]bool
+
+	// firstUnresolvedPoolAt records, per resource name, when an apply
+	// first met the diskful replica without a storage pool. The apply
+	// waits for the pool until unresolvedPoolDwell has passed, then
+	// fails. Process-memory only; a restart starts the wait over.
+	firstUnresolvedPoolAt map[string]time.Time
 }
+
+// unresolvedPoolDwellDefault is how long a diskful replica without a
+// storage pool waits for one. A fresh replica the satellite sees a beat
+// before the write that gives it its pool gets the pool within seconds.
+// One still without a pool after this was created or promoted without
+// one, which nothing on the controller side fills in later, so its
+// apply fails, with the Event and the back-off that tell the operator.
+// Kept under controllerWaitReportAfter, so the wait never reads as a
+// controller that cannot stamp the replica.
+const unresolvedPoolDwellDefault = 30 * time.Second
 
 // recoveryPromoteThrottle bounds how often a single resource may fire
 // the Bug 366 recovery-promote self-heal. Generous relative to a
@@ -432,6 +453,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
 		adjustFailed:                map[string]bool{},
+		firstUnresolvedPoolAt:       map[string]time.Time{},
 	}
 }
 
@@ -948,6 +970,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	}
 
 	r.forgetPool(req.GetName())
+	r.clearUnresolvedPool(req.GetName())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
 }
@@ -1517,6 +1540,8 @@ func (r *Reconciler) applyInactive(ctx context.Context, dr *intent.DesiredResour
 // StoragePool empty) hit the no-op short-circuit at the top.
 func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.DesiredResource, diskless bool) (map[int32]string, bool, bool, error) {
 	if diskless {
+		r.clearUnresolvedPool(dr.GetName())
+
 		// Bug 330 (P1, real stand): `linstor r td --diskless` returned
 		// REST SUCCESS but `linstor r l` kept reporting the replica as
 		// `UpToDate`. Root cause: the reconciler had no detach path —
@@ -1704,11 +1729,12 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	resized := false
 	cloned := false
 
-	for _, vol := range dr.GetVolumes() {
-		if vol.GetStoragePool() == "" {
-			return nil, false, false, errors.WithStack(errUnresolvedStoragePool)
-		}
+	err := r.checkStoragePoolsResolved(dr)
+	if err != nil {
+		return nil, false, false, err
+	}
 
+	for _, vol := range dr.GetVolumes() {
 		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
 		if !ok {
 			return nil, false, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
@@ -5491,21 +5517,77 @@ func refuseUnresolvedSkipInitialSync(dr *intent.DesiredResource, freshActivation
 }
 
 // errUnresolvedStoragePool is what applyStorage returns for a diskful
-// replica whose volumes name no storage pool yet. The satellite can see
-// a fresh replica before the write that gives it its pool, and the pool
-// then lands as an update of the Resource that runs the apply again. A
-// pool that is named but has no provider on this node stays a failure:
-// that is a pool this node cannot serve, not one on its way.
+// replica whose volumes name no storage pool yet, while it is still
+// within unresolvedPoolDwell. The satellite can see a fresh replica
+// before the write that gives it its pool, and the pool then lands as
+// an update of the Resource that runs the apply again. A pool that is
+// named but has no provider on this node stays a failure: that is a
+// pool this node cannot serve, not one on its way.
 var errUnresolvedStoragePool = errors.Mark(
 	errors.New("storage pool not yet set on the diskful replica"), ErrWaitingForController)
 
+// checkStoragePoolsResolved holds the apply of a diskful replica any of
+// whose volumes names no storage pool, before any volume is touched, so
+// a replica with some pools resolved does not half-materialise. The
+// hold is a wait (errUnresolvedStoragePool) for unresolvedPoolDwell and
+// a failed apply after it: an empty pool is either the beat before the
+// pool's write lands or a replica created or promoted without one,
+// which only the operator can fix.
+func (r *Reconciler) checkStoragePoolsResolved(dr *intent.DesiredResource) error {
+	name := dr.GetName()
+
+	unresolved := slices.ContainsFunc(dr.GetVolumes(), func(vol *intent.DesiredVolume) bool {
+		return vol.GetStoragePool() == ""
+	})
+	if !unresolved {
+		r.clearUnresolvedPool(name)
+
+		return nil
+	}
+
+	dwell := r.cfg.UnresolvedPoolDwell
+	if dwell <= 0 {
+		dwell = unresolvedPoolDwellDefault
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+
+	first, ok := r.firstUnresolvedPoolAt[name]
+	if !ok {
+		r.firstUnresolvedPoolAt[name] = now
+
+		return errors.WithStack(errUnresolvedStoragePool)
+	}
+
+	waited := now.Sub(first)
+	if waited < dwell {
+		return errors.WithStack(errUnresolvedStoragePool)
+	}
+
+	return errors.Errorf("no storage pool resolved for the diskful replica after %s: "+
+		"name one with `linstor r td <node> <rd> --storage-pool <pool>`, "+
+		"or set StorPoolName on the resource definition", waited.Round(time.Second))
+}
+
+// clearUnresolvedPool ends the wait for the storage pool of name: the
+// pool arrived, the replica went diskless, or it is gone.
+func (r *Reconciler) clearUnresolvedPool(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.firstUnresolvedPoolAt, name)
+}
+
 // ErrWaitingForController marks the errors of the gates above that
 // hold the apply until the controller stamps the replica: its DRBD
-// node-id, the SkipInitialSync decision, or a diskful replica's
-// storage pool. A fresh replica routinely meets them, since the
-// satellite sees the Resource before the controller's pass that stamps
-// it is through, and the stamp is an update of the Resource that runs
-// the apply again. The apply result carries it as WaitingForController,
+// node-id, the SkipInitialSync decision, or, for a bounded time, a
+// diskful replica's storage pool. A fresh replica routinely meets them,
+// since the satellite sees the Resource before the controller's pass
+// that stamps it is through, and the stamp is an update of the Resource
+// that runs the apply again. The apply result carries it as WaitingForController,
 // and the caller treats such a result as a wait, not as a failed apply.
 var ErrWaitingForController = errors.New("waiting for the controller to stamp the replica")
 
