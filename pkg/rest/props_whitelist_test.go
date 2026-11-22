@@ -343,3 +343,83 @@ func TestRDModifyAcceptsWhitelistedOptionsAndOtherNamespaces(t *testing.T) {
 		}
 	}
 }
+
+// TestPropsDoorsAcceptBlockstorsOwnDrbdOptions: blockstor reads a few
+// DrbdOptions keys LINSTOR's whitelist does not list, and documents them as
+// the way to set what they set. The tiebreaker switch on a definition or a
+// group and the port and minor ranges on a node must still be stored, and
+// only on the objects they are read from.
+func TestPropsDoorsAcceptBlockstorsOwnDrbdOptions(t *testing.T) {
+	st := store.NewInMemory()
+	seedWhitelistObjects(t, st)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	tiebreaker := `{"override_props":{"DrbdOptions/AutoAddQuorumTiebreaker":"false"}}`
+	ranges := `{"override_props":{"DrbdOptions/TcpPortRange":"21000-21999","DrbdOptions/MinorNrRange":"21000-29999"}}`
+
+	for _, door := range []struct{ path, body string }{
+		{"/v1/resource-definitions/rd1", tiebreaker},
+		{"/v1/resource-groups/rg1", tiebreaker},
+		{"/v1/nodes/n1", ranges},
+	} {
+		resp := httpPut(t, base+door.path, []byte(door.body))
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("PUT %s %s: status %d, want 200", door.path, door.body, resp.StatusCode)
+		}
+	}
+
+	rd, err := st.ResourceDefinitions().Get(t.Context(), "rd1")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	rg, err := st.ResourceGroups().Get(t.Context(), "rg1")
+	if err != nil {
+		t.Fatalf("get rg: %v", err)
+	}
+
+	node, err := st.Nodes().Get(t.Context(), "n1")
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	for what, got := range map[string]string{
+		"definition tiebreaker": rd.Props["DrbdOptions/AutoAddQuorumTiebreaker"],
+		"group tiebreaker":      rg.Props["DrbdOptions/AutoAddQuorumTiebreaker"],
+		"node port range":       node.Props["DrbdOptions/TcpPortRange"],
+		"node minor range":      node.Props["DrbdOptions/MinorNrRange"],
+	} {
+		if got == "" {
+			t.Errorf("%s was not stored", what)
+		}
+	}
+}
+
+// TestPropsDoorsRefuseBlockstorsOwnKeysElsewhere: an own key is judged like
+// a LINSTOR one, on the wrong object and with a value its reader cannot
+// parse.
+func TestPropsDoorsRefuseBlockstorsOwnKeysElsewhere(t *testing.T) {
+	st := store.NewInMemory()
+	seedWhitelistObjects(t, st)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	for _, door := range []struct{ path, body string }{
+		{"/v1/resource-definitions/rd1", `{"override_props":{"DrbdOptions/TcpPortRange":"21000-21999"}}`},
+		{"/v1/nodes/n1", `{"override_props":{"DrbdOptions/AutoAddQuorumTiebreaker":"false"}}`},
+		{"/v1/nodes/n1", `{"override_props":{"DrbdOptions/TcpPortRange":"bogus"}}`},
+		{"/v1/resource-definitions/rd1", `{"override_props":{"DrbdOptions/AutoAddQuorumTiebreaker":"maybe"}}`},
+	} {
+		resp := httpPut(t, base+door.path, []byte(door.body))
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("PUT %s %s: status %d, want 400", door.path, door.body, resp.StatusCode)
+		}
+	}
+}

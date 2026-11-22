@@ -128,3 +128,41 @@ func TestDrbdOptionsRefusesAValueTheRuleRefuses(t *testing.T) {
 		t.Errorf("the refused value was stored: %v", def.Props)
 	}
 }
+
+// TestSetPropertyAcceptsBlockstorsOwnKeys: the tiebreaker switch and the
+// node port and minor ranges are blockstor's own keys, documented as the
+// way to set them, so the whitelist must not refuse them.
+func TestSetPropertyAcceptsBlockstorsOwnKeys(t *testing.T) {
+	t.Parallel()
+
+	app, backend, errBuf := newKubeAppWithStore(t)
+
+	err := backend.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-x"})
+	if err != nil {
+		t.Fatalf("seed definition: %v", err)
+	}
+
+	err = backend.Nodes().Create(t.Context(), &apiv1.Node{Name: "node-1"})
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	for _, argv := range [][]string{
+		{"rd", "sp", "pvc-x", "DrbdOptions/AutoAddQuorumTiebreaker", "false"},
+		{"n", "sp", "node-1", "DrbdOptions/TcpPortRange", "21000-21999"},
+		{"n", "sp", "node-1", "DrbdOptions/MinorNrRange", "21000-29999"},
+	} {
+		if got := app.Run(t.Context(), argv); got != 0 {
+			t.Errorf("%v: exit %d (stderr: %s)", argv, got, errBuf.String())
+		}
+	}
+
+	node, err := backend.Nodes().Get(t.Context(), "node-1")
+	if err != nil {
+		t.Fatalf("read the node: %v", err)
+	}
+
+	if node.Props["DrbdOptions/TcpPortRange"] != "21000-21999" || node.Props["DrbdOptions/MinorNrRange"] != "21000-29999" {
+		t.Errorf("node ranges not stored: %v", node.Props)
+	}
+}

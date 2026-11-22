@@ -148,16 +148,26 @@ func Check(obj Object, key, value string) error {
 		return nil
 	}
 
-	if !slices.Contains(keys, key) {
+	keyRule, ok := ruleFor(cat, keys, obj, key)
+	if !ok {
 		return &Error{Key: key, Value: value}
 	}
 
-	keyRule := cat.Rules[key]
 	if keyRule.valid(value) {
 		return nil
 	}
 
 	return &Error{Key: key, Value: value, Known: true, Detail: keyRule.errorMsg()}
+}
+
+// ruleFor finds key's rule on obj: LINSTOR's when its whitelist lists the
+// key for the object, otherwise blockstor's own when it reads the key there.
+func ruleFor(cat *catalogue, keys []string, obj Object, key string) (rule, bool) {
+	if slices.Contains(keys, key) {
+		return cat.Rules[key], true
+	}
+
+	return ownRuleFor(obj, key)
 }
 
 // CheckAll checks every key=value of props on obj, in key order, and returns

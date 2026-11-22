@@ -171,3 +171,51 @@ func TestCheckAllReportsTheFirstKeyInOrder(t *testing.T) {
 		t.Fatalf("got %v, want the refusal of DrbdOptions/AutoSnapshot/Keep", err)
 	}
 }
+
+func TestCheckAcceptsBlockstorsOwnKeysWhereTheyAreRead(t *testing.T) {
+	t.Parallel()
+
+	accepted := []struct {
+		obj        propwhitelist.Object
+		key, value string
+	}{
+		{propwhitelist.ResourceDefinition, "DrbdOptions/AutoAddQuorumTiebreaker", "false"},
+		{propwhitelist.Controller, "DrbdOptions/AutoAddQuorumTiebreaker", "yes"},
+		{propwhitelist.Node, "DrbdOptions/TcpPortRange", "21000-21999"},
+		{propwhitelist.Node, "DrbdOptions/MinorNrRange", "21000-29999"},
+	}
+
+	for _, c := range accepted {
+		err := propwhitelist.Check(c.obj, c.key, c.value)
+		if err != nil {
+			t.Errorf("%s %s=%s refused: %v", c.obj, c.key, c.value, err)
+		}
+	}
+
+	refused := []struct {
+		obj        propwhitelist.Object
+		key, value string
+		known      bool
+	}{
+		{propwhitelist.Node, "DrbdOptions/AutoAddQuorumTiebreaker", "false", false},
+		{propwhitelist.ResourceDefinition, "DrbdOptions/TcpPortRange", "21000-21999", false},
+		{propwhitelist.Controller, "DrbdOptions/MinorNrRange", "21000-29999", false},
+		{propwhitelist.ResourceDefinition, "DrbdOptions/AutoAddQuorumTiebreaker", "1", true},
+		{propwhitelist.Node, "DrbdOptions/TcpPortRange", "21000", true},
+	}
+
+	for _, c := range refused {
+		var refusal *propwhitelist.Error
+
+		err := propwhitelist.Check(c.obj, c.key, c.value)
+		if !errors.As(err, &refusal) {
+			t.Errorf("%s %s=%s accepted", c.obj, c.key, c.value)
+
+			continue
+		}
+
+		if refusal.Known != c.known {
+			t.Errorf("%s %s=%s: Known = %v, want %v", c.obj, c.key, c.value, refusal.Known, c.known)
+		}
+	}
+}
