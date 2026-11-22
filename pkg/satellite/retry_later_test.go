@@ -19,8 +19,15 @@ limitations under the License.
 package satellite
 
 import (
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/errors"
+
+	"github.com/cozystack/blockstor/pkg/drbd"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
+	"github.com/cozystack/blockstor/pkg/storage"
 )
 
 // The satellite runs no periodic pass of a converged replica any more.
@@ -106,5 +113,58 @@ func TestEarliestRetryWins(t *testing.T) {
 
 	if _, ok := r.TakeRetry("pvc-2"); ok {
 		t.Error("a retry for a resource nothing asked for")
+	}
+}
+
+// TestFailedDeviceNodeAsksForARetry: on a node without udev the
+// satellite creates /dev/drbd<minor> itself after an adjust. A failed
+// mknod used to wait for the periodic re-check; now the pass asks for
+// another, and one that created the node asks for none.
+func TestFailedDeviceNodeAsksForARetry(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mknodErr  error
+		wantRetry bool
+	}{
+		{name: "mknod failed", mknodErr: errors.New("mknod /dev/drbd1000: operation not permitted"), wantRetry: true},
+		{name: "node in place", wantRetry: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(storage.NewFakeExec()), NodeName: "n1"})
+
+			var minors []int
+
+			rec.ensureDeviceNode = func(minor int) error {
+				minors = append(minors, minor)
+
+				return tc.mknodErr
+			}
+
+			dr := &intent.DesiredResource{
+				Name:        "pvc-1",
+				NodeName:    "n1",
+				Volumes:     []*intent.DesiredVolume{{VolumeNumber: 0, SizeKib: 1024}},
+				DrbdOptions: map[string]string{"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000"},
+			}
+
+			err := rec.adjustResource(t.Context(), dr, false)
+			if err != nil {
+				t.Fatalf("adjustResource: %v", err)
+			}
+
+			if !slices.Equal(minors, []int{1000}) {
+				t.Fatalf("device nodes ensured for minors %v, want [1000]", minors)
+			}
+
+			if tc.wantRetry {
+				wantRetry(t, rec, "pvc-1", bestEffortRetry)
+
+				return
+			}
+
+			if after, ok := rec.TakeRetry("pvc-1"); ok {
+				t.Errorf("a retry after %v with the device node in place", after)
+			}
+		})
 	}
 }
