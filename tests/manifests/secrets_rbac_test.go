@@ -126,8 +126,12 @@ func TestSecretAccessIsLimitedToBlockstorsSecrets(t *testing.T) {
 						path, role.Name, rule.Verbs, rule.ResourceNames, blockstorSecrets())
 				}
 
-				if slices.Contains(rule.Verbs, "list") || slices.Contains(rule.Verbs, "watch") || slices.Contains(rule.Verbs, "*") {
-					t.Errorf("%s: Role %s lists or watches Secrets", path, role.Name)
+				// A list or watch limited by resourceNames is allowed only
+				// for a request that selects one of those Secrets by name;
+				// without the names it reads every Secret in the namespace.
+				listsOrWatches := slices.Contains(rule.Verbs, "list") || slices.Contains(rule.Verbs, "watch")
+				if slices.Contains(rule.Verbs, "*") || (listsOrWatches && len(rule.ResourceNames) == 0) {
+					t.Errorf("%s: Role %s lists or watches Secrets beyond blockstor's own", path, role.Name)
 				}
 			}
 
@@ -147,6 +151,35 @@ func TestSecretAccessIsLimitedToBlockstorsSecrets(t *testing.T) {
 
 		if secretRoles == 0 {
 			t.Errorf("%s: no Role grants the Secrets blockstor reads", path)
+		}
+	}
+}
+
+// The controller and the apiserver derive the encryption state from one
+// watch per Secret (passphrase.WatchedReader); without list and watch on
+// those names every derivation is a get again, every resource view and
+// every controller pass.
+func TestSecretWatchIsGrantedWhereTheStateIsDerived(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"stand/blockstor-deploy.yaml",
+		"stand/blockstor-apiserver-deploy.yaml",
+		"config/rbac/secrets_role.yaml",
+	} {
+		roles, _, _ := secretsManifests(t, path)
+
+		watches := slices.ContainsFunc(roles, func(role rbacv1.Role) bool {
+			return slices.ContainsFunc(role.Rules, func(rule rbacv1.PolicyRule) bool {
+				return slices.Contains(rule.Resources, "secrets") &&
+					slices.Equal(rule.ResourceNames, blockstorSecrets()) &&
+					slices.Contains(rule.Verbs, "get") &&
+					slices.Contains(rule.Verbs, "list") &&
+					slices.Contains(rule.Verbs, "watch")
+			})
+		})
+		if !watches {
+			t.Errorf("%s: no Role grants get, list and watch on %v", path, blockstorSecrets())
 		}
 	}
 }
