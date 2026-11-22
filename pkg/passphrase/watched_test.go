@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +35,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -197,6 +199,15 @@ func (e *watchEnv) user(t *testing.T, name string, secretVerbs ...string) *rest.
 func watched(t *testing.T, cfg *rest.Config, syncTimeout time.Duration) (*passphrase.WatchedReader, *atomic.Int64) {
 	t.Helper()
 
+	return watchedWith(t, cfg, syncTimeout, func(m meta.RESTMapper) meta.RESTMapper { return m })
+}
+
+// watchedWith is watched with the watches' REST mapper wrapped.
+func watchedWith(t *testing.T, cfg *rest.Config, syncTimeout time.Duration,
+	wrapMapper func(meta.RESTMapper) meta.RESTMapper,
+) (*passphrase.WatchedReader, *atomic.Int64) {
+	t.Helper()
+
 	requests := &atomic.Int64{}
 
 	counted := rest.CopyConfig(cfg)
@@ -221,7 +232,7 @@ func watched(t *testing.T, cfg *rest.Config, syncTimeout time.Duration) (*passph
 
 	reader := &passphrase.WatchedReader{
 		Config:      counted,
-		Options:     cache.Options{HTTPClient: httpClient, Scheme: scheme(t), Mapper: mapper},
+		Options:     cache.Options{HTTPClient: httpClient, Scheme: scheme(t), Mapper: wrapMapper(mapper)},
 		Direct:      direct,
 		Namespace:   ns,
 		SyncTimeout: syncTimeout,
@@ -415,5 +426,137 @@ func TestWatchedReaderStopsAWatchRefusedAfterItListed(t *testing.T) {
 				t.Errorf("failed %v, stopped %v; want %v", failed, stopped, tc.fail)
 			}
 		})
+	}
+}
+
+// A watch that failed is started again by a later read: a Role granted
+// list and watch after the pod started takes the reads off the API server
+// without a restart.
+func TestWatchedReaderRetriesAFailedWatch(t *testing.T) {
+	t.Parallel()
+
+	env := startWatchEnv(t)
+	reader, requests := watched(t, env.user(t, "granted-later", "get"), watchBudget)
+	reader.RetryAfter = time.Second
+	unlocker := &passphrase.Unlocker{Secrets: passphrase.Secrets{Reader: reader, Namespace: ns, Direct: nil}}
+
+	deadline := time.Now().Add(watchBudget)
+
+	for !passphrase.SecretWatchFailed(reader, passphrase.KeyringSecretName) {
+		if state := unlock(t, unlocker); state != passphrase.StateUnlocked {
+			t.Fatalf("state = %s, want unlocked", state)
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("the refused watch had not given up after %v", watchBudget)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	var role rbacv1.Role
+
+	err := env.admin.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: "granted-later"}, &role)
+	if err != nil {
+		t.Fatalf("get role: %v", err)
+	}
+
+	role.Rules[0].Verbs = []string{"get", "list", "watch"}
+
+	err = env.admin.Update(t.Context(), &role)
+	if err != nil {
+		t.Fatalf("grant list and watch: %v", err)
+	}
+
+	deadline = time.Now().Add(watchBudget)
+
+	for {
+		before := requests.Load()
+
+		if state := unlock(t, unlocker); state != passphrase.StateUnlocked {
+			t.Fatalf("state = %s, want unlocked", state)
+		}
+
+		if requests.Load() == before {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("deriving the state still sends requests %v after list and watch were granted", watchBudget)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// stallingMapper holds the watches' lookups of the Secret kind until
+// release is closed, as a slow discovery would.
+type stallingMapper struct {
+	meta.RESTMapper
+
+	stalled chan<- struct{}
+	release <-chan struct{}
+}
+
+func (m stallingMapper) RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+	if gk.Kind == "Secret" {
+		select {
+		case m.stalled <- struct{}{}:
+		default:
+		}
+
+		<-m.release
+	}
+
+	return m.RESTMapper.RESTMapping(gk, versions...) //nolint:wrapcheck // a wrapper passes through
+}
+
+// A watch that is slow to start holds up the reads of its own object, not
+// the reads of the others.
+func TestWatchedReaderStartsAWatchWithoutHoldingUpOtherReads(t *testing.T) {
+	t.Parallel()
+
+	env := startWatchEnv(t)
+	stalled := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	var releaseOnce sync.Once
+
+	unstall := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unstall)
+
+	reader, _ := watchedWith(t, env.user(t, "stalled", "get", "list", "watch"), watchBudget,
+		func(m meta.RESTMapper) meta.RESTMapper {
+			return stallingMapper{RESTMapper: m, stalled: stalled, release: release}
+		})
+
+	go func() {
+		var sec corev1.Secret
+
+		_ = reader.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: passphrase.KeyringSecretName}, &sec)
+	}()
+
+	select {
+	case <-stalled:
+	case <-time.After(watchBudget):
+		t.Fatal("the keyring watch never looked up its kind")
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		var cfg blockstoriov1alpha1.ControllerConfig
+
+		done <- reader.Get(context.Background(), client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &cfg)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("read the ControllerConfig: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		unstall()
+		t.Fatal("the ControllerConfig read waited for the keyring watch to start")
 	}
 }

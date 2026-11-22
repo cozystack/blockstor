@@ -44,6 +44,11 @@ import (
 // that grants get but not list and watch on that Secret, stops at once.
 const WatchSyncTimeout = 30 * time.Second
 
+// WatchRetryAfter is how long a failed watch waits before a read starts it
+// again: a Role granted list and watch later, or an API server back in
+// reach, then takes the reads off it without a restart.
+const WatchRetryAfter = 5 * time.Minute
+
 // WatchedReader serves the reads the encryption state is derived from, the
 // ControllerConfig and the Secrets in Namespace, from one watch per object,
 // so a caller that derives the state over and over (the controller's pass,
@@ -55,9 +60,10 @@ const WatchSyncTimeout = 30 * time.Second
 // first read, so a passphrase Secret the ControllerConfig is switched to
 // gets one too.
 //
-// Until a watch has listed its object, and for good once it fails to or
-// is refused, reads go to Direct. Every other read, a List included, goes
-// to Direct.
+// Until a watch has listed its object, and once it fails to or is
+// refused, reads go to Direct; a read WatchRetryAfter after a failure
+// starts the watch again. Every other read, a List included, goes to
+// Direct.
 //
 // A watch trails the API server: a read-modify-write must read through
 // Direct (Secrets.Direct), or its update conflicts until the watch
@@ -72,8 +78,10 @@ type WatchedReader struct {
 	// Namespace is where the watched Secrets live.
 	Namespace string
 
-	// SyncTimeout overrides WatchSyncTimeout (tests).
+	// SyncTimeout and RetryAfter override WatchSyncTimeout and
+	// WatchRetryAfter (tests).
 	SyncTimeout time.Duration
+	RetryAfter  time.Duration
 
 	mu      sync.Mutex
 	ctx     context.Context //nolint:containedctx // the watches live as long as the Runnable
@@ -88,10 +96,15 @@ type watchKey struct {
 type objectWatch struct {
 	cache cache.Cache
 
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	synced bool
-	failed bool
+	// retry counts the attempts on this object that failed before this
+	// one.
+	retry int
+
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	synced   bool
+	failed   bool
+	failedAt time.Time
 }
 
 func (o *objectWatch) state() (bool, bool) {
@@ -122,13 +135,32 @@ func (o *objectWatch) fail() bool {
 		return false
 	}
 
-	o.synced, o.failed = false, true
+	o.synced, o.failed, o.failedAt = false, true, time.Now()
 
 	if o.cancel != nil {
 		o.cancel()
 	}
 
 	return true
+}
+
+// retryDue reports whether the watch failed at least after ago.
+func (o *objectWatch) retryDue(after time.Duration) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.failed && time.Since(o.failedAt) >= after
+}
+
+// logFailure logs why the watch failed: at info the first time, and less
+// loudly on a retry, which a Role that grants only get fails every time.
+func (o *objectWatch) logFailure(ctx context.Context, wkey watchKey, msg string, keysAndValues ...any) {
+	logger := log.FromContext(ctx).WithName("passphrase")
+	if o.retry > 0 {
+		logger = logger.V(1)
+	}
+
+	logger.Info(msg, append([]any{"secret", wkey.secret, "name", wkey.name, "retry", o.retry}, keysAndValues...)...)
 }
 
 // NeedLeaderElection returns false: every replica that derives the state
@@ -182,18 +214,50 @@ func (w *WatchedReader) watchFor(ctx context.Context, key client.ObjectKey, obj 
 		return nil
 	}
 
+	owatch, parent := w.claim(wkey)
+	if parent == nil {
+		return owatch
+	}
+
+	// The watch outlives the read that starts it: it runs under Start's
+	// context, not ctx. It starts outside w.mu, which reads of the other
+	// objects take: building its cache may ask the API server's
+	// discovery.
+	err := w.startWatch(parent, owatch, wkey) //nolint:contextcheck // see above
+	if err != nil && owatch.fail() {
+		owatch.logFailure(ctx, wkey, "the watch did not start; reading its object through the API instead",
+			"error", err.Error())
+	}
+
+	return owatch
+}
+
+// claim returns the watch on wkey and, when the caller is to start it, the
+// context it runs under: for the first read of the object, and for the
+// first read WatchRetryAfter after the watch failed. It returns nil, nil
+// before Start.
+func (w *WatchedReader) claim(wkey watchKey) (*objectWatch, context.Context) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.ctx == nil {
-		return nil
+		return nil, nil
 	}
 
-	if owatch, ok := w.watches[wkey]; ok {
-		return owatch
+	retryAfter := w.RetryAfter
+	if retryAfter == 0 {
+		retryAfter = WatchRetryAfter
+	}
+
+	prev, ok := w.watches[wkey]
+	if ok && !prev.retryDue(retryAfter) {
+		return prev, nil
 	}
 
 	owatch := &objectWatch{}
+	if ok {
+		owatch.retry = prev.retry + 1
+	}
 
 	if w.watches == nil {
 		w.watches = map[watchKey]*objectWatch{}
@@ -201,21 +265,12 @@ func (w *WatchedReader) watchFor(ctx context.Context, key client.ObjectKey, obj 
 
 	w.watches[wkey] = owatch
 
-	// The watch outlives the read that starts it: it runs under Start's
-	// context, not ctx.
-	err := w.startWatch(owatch, wkey) //nolint:contextcheck // see above
-	if err != nil {
-		log.FromContext(ctx).WithName("passphrase").Error(err, "watch; reading through the API instead",
-			"secret", wkey.secret, "name", wkey.name)
-		owatch.fail()
-	}
-
-	return owatch
+	return owatch, w.ctx
 }
 
 // startWatch starts a cache that holds the one object wkey names and settles
 // owatch once that cache has listed it or has run out of time to.
-func (w *WatchedReader) startWatch(owatch *objectWatch, wkey watchKey) error {
+func (w *WatchedReader) startWatch(parent context.Context, owatch *objectWatch, wkey watchKey) error {
 	var obj client.Object = &blockstoriov1alpha1.ControllerConfig{}
 
 	byObject := cache.ByObject{Field: fields.OneTermEqualSelector("metadata.name", wkey.name)}
@@ -236,7 +291,7 @@ func (w *WatchedReader) startWatch(owatch *objectWatch, wkey watchKey) error {
 		return errors.Wrap(err, "new cache")
 	}
 
-	ctx, cancel := context.WithCancel(w.ctx)
+	ctx, cancel := context.WithCancel(parent)
 
 	owatch.mu.Lock()
 	owatch.cancel = cancel
@@ -277,10 +332,11 @@ func (w *WatchedReader) awaitSync(ctx context.Context, owatch *objectWatch, wkey
 		return
 	}
 
-	if owatch.fail() && w.ctx.Err() == nil {
-		log.FromContext(ctx).WithName("passphrase").Info(
-			"the watch did not list its object in time; reading it through the API instead",
-			"secret", wkey.secret, "name", wkey.name, "timeout", timeout)
+	stopping := ctx.Err() != nil
+
+	if owatch.fail() && !stopping {
+		owatch.logFailure(ctx, wkey, "the watch did not list its object in time; reading it through the API instead",
+			"timeout", timeout)
 	}
 }
 
@@ -298,9 +354,8 @@ func (w *WatchedReader) watchErrorHandler(owatch *objectWatch, wkey watchKey) to
 		}
 
 		if owatch.fail() {
-			log.FromContext(ctx).WithName("passphrase").Info(
-				"the watch was refused; reading its object through the API instead",
-				"secret", wkey.secret, "name", wkey.name, "error", err.Error())
+			owatch.logFailure(ctx, wkey, "the watch was refused; reading its object through the API instead",
+				"error", err.Error())
 		}
 	}
 }
