@@ -494,8 +494,10 @@ func TestObserverForgetsAGIItCouldNotRead(t *testing.T) {
 	fx.Expect("drbdmeta --force - v09 "+statusTestBacking+" internal get-gi --node-id 0",
 		storage.FakeResponse{Err: storage.FakeExitError{Code: 1}})
 
-	o.resyncOnce(ctx)
-	o.handleObservation(ctx, adm, peerConnected("n2"))
+	// A peer's role reads the GI again (carriesRole).
+	peer := peerConnected("n2")
+	peer.Connections[0].PeerRole = "Secondary"
+	o.handleObservation(ctx, adm, peer)
 
 	status := getStatusReplica(t, cli, name)
 	if status.Volumes[0].CurrentGI != "" {

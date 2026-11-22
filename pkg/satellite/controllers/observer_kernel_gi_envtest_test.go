@@ -95,23 +95,53 @@ func TestObserverReadsTheGIFromTheKernel(t *testing.T) {
 	}
 }
 
-// DRBD moves a GI with no events2 frame: a Primary that lost a peer
-// mints its new current UUID on the first write after, which can come
-// long after the last frame. The published GI has to follow on the next
-// resync, or the seed gates take the written replica for a day0
-// sibling and let a new replica skip its initial sync.
-func TestObserverFollowsAGIThatMovesWithoutAFrame(t *testing.T) {
+// kernelGIReads counts the drbdsetup get-gi runs fx has seen.
+func kernelGIReads(fx *storage.FakeExec) int {
+	n := 0
+
+	for _, line := range fx.CommandLines() {
+		if line == kernelGetGI {
+			n++
+		}
+	}
+
+	return n
+}
+
+// peerWithRole is peerConnectedWithID with the peer's role, as the
+// events2 connection frames carry it.
+func peerWithRole(peer string, nodeID int32, role string) *observation {
+	ev := peerConnectedWithID(peer, nodeID)
+	ev.Connections[0].PeerRole = role
+
+	return ev
+}
+
+// kernelAnswers makes the kernel report gi as the test volume's GI.
+func kernelAnswers(fx *storage.FakeExec, gi string) {
+	fx.Expect(kernelGetGI, storage.FakeResponse{Stdout: []byte(gi + ":0:0:0\n")})
+}
+
+// DRBD moves a GI with no events2 frame: a replica promoted mints a new
+// current UUID on its first write after, which can come long after the
+// last frame, and its connected peers take it then. While the GI is
+// still day0 and a replica is Primary, the published GI has to follow
+// on the next resync, or the seed gates take the written replica for a
+// day0 sibling and let a new replica skip its initial sync.
+func TestObserverFollowsADay0GIThatMovesWithoutAFrame(t *testing.T) {
 	cli := startStatusEnvtest(t)
 	name := createStatusReplica(t, cli)
 
+	day0 := drbd.Day0GIFor(statusTestRD, 0)
+
 	fx := statusTestExec()
-	fx.Expect(kernelGetGI, storage.FakeResponse{Stdout: []byte(kernelTestGI + ":0:0:0\n")})
+	kernelAnswers(fx, day0)
 
 	o := &ObserverRunnable{Client: cli, Exec: fx, NodeName: statusTestNode}
 	adm := drbd.NewAdm(fx)
 	ctx := t.Context()
 
-	o.handleObservation(ctx, adm, peerConnectedWithID("n2", kernelTestPeerID))
+	o.handleObservation(ctx, adm, peerWithRole("n2", kernelTestPeerID, drbdRolePrimary))
 	o.handleObservation(ctx, adm, deviceUpToDate())
 
 	// Long enough for any window after the last frame to have closed.
@@ -119,17 +149,94 @@ func TestObserverFollowsAGIThatMovesWithoutAFrame(t *testing.T) {
 		o.resyncOnce(ctx)
 	}
 
-	if got := getStatusReplica(t, cli, name).Volumes[0].CurrentGI; got != kernelTestGI {
-		t.Fatalf("published GI %q, want %q", got, kernelTestGI)
+	if got := getStatusReplica(t, cli, name).Volumes[0].CurrentGI; got != day0 {
+		t.Fatalf("published GI %q, want day0 %q", got, day0)
 	}
 
-	// The first write after the peer left mints a new current UUID.
-	fx.Expect(kernelGetGI, storage.FakeResponse{Stdout: []byte(kernelTestMinted + ":0:" + kernelTestGI + ":0\n")})
+	// The Primary's first write mints a new current UUID.
+	kernelAnswers(fx, kernelTestMinted)
 
 	o.resyncOnce(ctx)
 
 	if got := getStatusReplica(t, cli, name).Volumes[0].CurrentGI; got != kernelTestMinted {
 		t.Fatalf("published GI %q after a write minted %q with no frame", got, kernelTestMinted)
+	}
+}
+
+// A GI that left day0 never comes back to it, and the seed gates treat
+// every other GI alike; a day0 GI with no replica Primary cannot move.
+// Neither is read again until a frame changes the replica: reading
+// every data-bearing volume on every resync cost a drbdsetup run per
+// volume every 5 s, twenty a second on a node with a hundred replicas,
+// while nothing happened.
+func TestObserverLeavesASettledGIAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gi   string
+		peer *observation
+	}{
+		{"left day0", kernelTestGI, peerWithRole("n2", kernelTestPeerID, drbdRolePrimary)},
+		{"day0 with no replica primary", drbd.Day0GIFor(statusTestRD, 0), peerWithRole("n2", kernelTestPeerID, "Secondary")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cli := startStatusEnvtest(t)
+			name := createStatusReplica(t, cli)
+
+			fx := statusTestExec()
+			kernelAnswers(fx, tc.gi)
+
+			o := &ObserverRunnable{Client: cli, Exec: fx, NodeName: statusTestNode}
+			adm := drbd.NewAdm(fx)
+			ctx := t.Context()
+
+			o.handleObservation(ctx, adm, tc.peer)
+			o.handleObservation(ctx, adm, deviceUpToDate())
+
+			if got := getStatusReplica(t, cli, name).Volumes[0].CurrentGI; got != tc.gi {
+				t.Fatalf("published GI %q, want %q", got, tc.gi)
+			}
+
+			before := kernelGIReads(fx)
+
+			for range 10 {
+				o.resyncOnce(ctx)
+			}
+
+			if n := kernelGIReads(fx) - before; n != 0 {
+				t.Errorf("%d GI reads in 10 resyncs of a replica whose GI cannot move", n)
+			}
+
+			if got := getStatusReplica(t, cli, name).Volumes[0].CurrentGI; got != tc.gi {
+				t.Errorf("published GI %q after the resyncs, want %q", got, tc.gi)
+			}
+		})
+	}
+}
+
+// A Primary can write and step down between two resyncs. Once it has,
+// no replica is Primary and the resync no longer reads the day0 GI, so
+// the frame that reports the role change reads it.
+func TestObserverReadsTheGIWhenARoleChanges(t *testing.T) {
+	cli := startStatusEnvtest(t)
+	name := createStatusReplica(t, cli)
+
+	fx := statusTestExec()
+	kernelAnswers(fx, drbd.Day0GIFor(statusTestRD, 0))
+
+	o := &ObserverRunnable{Client: cli, Exec: fx, NodeName: statusTestNode}
+	adm := drbd.NewAdm(fx)
+	ctx := t.Context()
+
+	o.handleObservation(ctx, adm, peerWithRole("n2", kernelTestPeerID, drbdRolePrimary))
+	o.handleObservation(ctx, adm, deviceUpToDate())
+
+	// The peer writes, minting a new GI that reaches this replica, and
+	// steps down before the next resync.
+	kernelAnswers(fx, kernelTestMinted)
+	o.handleObservation(ctx, adm, peerWithRole("n2", kernelTestPeerID, "Secondary"))
+
+	if got := getStatusReplica(t, cli, name).Volumes[0].CurrentGI; got != kernelTestMinted {
+		t.Fatalf("published GI %q after the peer stepped down, want %q", got, kernelTestMinted)
 	}
 }
 
