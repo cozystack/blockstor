@@ -375,6 +375,10 @@ type Reconciler struct {
 	// demotes paces the retry of a demote this satellite still owes a
 	// replica it promoted itself; see auto_demote.go.
 	demotes demoteRetry
+
+	// inflight marks the resources an apply or delete is changing; see
+	// inflight.go.
+	inflight inFlight
 }
 
 // recoveryPromoteThrottle bounds how often a single resource may fire
@@ -863,6 +867,15 @@ func zpoolNameForProvider(provider storage.Provider, registryName string) string
 // land in the response body so the controller can surface granular
 // status without aborting the rest of the cleanup.
 func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResourceRequest) (*intent.DeleteResourceResponse, error) {
+	defer r.inflight.enter(req.GetName())()
+
+	return r.deleteResource(ctx, req)
+}
+
+// deleteResource is DeleteResource while the resource is marked busy.
+//
+//nolint:unparam // DeleteResource's signature, error reserved for transport faults
+func (r *Reconciler) deleteResource(ctx context.Context, req *intent.DeleteResourceRequest) (*intent.DeleteResourceResponse, error) {
 	var downMsg string
 
 	if r.cfg.Adm != nil {
@@ -984,6 +997,8 @@ func (r *Reconciler) forgetPool(resourceName string) {
 // enabled (cfg.Adm != nil), also renders the `.res` file and runs
 // drbdadm create-md / adjust.
 func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *intent.ResourceApplyResult {
+	defer r.inflight.enter(dr.GetName())()
+
 	res := &intent.ResourceApplyResult{
 		Name:     dr.GetName(),
 		NodeName: dr.GetNodeName(),
