@@ -1398,6 +1398,19 @@ func (p *Placer) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 		return nil, errors.Wrap(err, "list nodes")
 	}
 
+	return disabledNodeSet(nodes), nil
+}
+
+// DiskfulReplicaCount is how many of a definition's replicas Place
+// counts toward the place count, given the cluster's nodes. A caller
+// that already holds both can tell from it, without a read of its own,
+// that Place would add no diskful replica.
+func DiskfulReplicaCount(existing []apiv1.Resource, nodes []apiv1.Node) int {
+	return countDiskfulReplicas(existing, disabledNodeSet(nodes))
+}
+
+// disabledNodeSet is disabledNodes over a node list already read.
+func disabledNodeSet(nodes []apiv1.Node) map[string]struct{} {
 	out := make(map[string]struct{}, len(nodes))
 
 	for i := range nodes {
@@ -1410,7 +1423,7 @@ func (p *Placer) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 		}
 	}
 
-	return out, nil
+	return out
 }
 
 // autoplaceExcludedNodes returns the set of nodes that may not host a
