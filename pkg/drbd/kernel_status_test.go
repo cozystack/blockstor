@@ -177,3 +177,39 @@ func TestPeerConnectionVerbs(t *testing.T) {
 		t.Errorf("commands = %q", got)
 	}
 }
+
+// A Primary peer that reaches no other UpToDate disk depends on this
+// replica; one with an UpToDate disk of its own, or another UpToDate
+// peer, or one not connected, does not.
+func TestKernelStatusSoleUpToDateOfAPrimaryPeer(t *testing.T) {
+	t.Parallel()
+
+	resources := kernelStatus(t, `[
+{"name":"sole","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"n1","connection-state":"Connected","peer-role":"Primary",
+  "peer_devices":[{"volume":0,"peer-disk-state":"Diskless"}]},
+  {"name":"n2","connection-state":"Connecting","peer-role":"Unknown",
+  "peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
+{"name":"primary-has-disk","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"n1","connection-state":"Connected","peer-role":"Primary",
+  "peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]},
+{"name":"other-source","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"n1","connection-state":"Connected","peer-role":"Primary",
+  "peer_devices":[{"volume":0,"peer-disk-state":"Diskless"}]},
+  {"name":"n2","connection-state":"Connected","peer-role":"Secondary",
+  "peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]},
+{"name":"stale-here","role":"Secondary","devices":[{"volume":0,"disk-state":"Outdated"}],
+ "connections":[{"name":"n1","connection-state":"Connected","peer-role":"Primary",
+  "peer_devices":[{"volume":0,"peer-disk-state":"Diskless"}]}]},
+{"name":"no-primary","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"n1","connection-state":"Connected","peer-role":"Secondary",
+  "peer_devices":[{"volume":0,"peer-disk-state":"Diskless"}]}]}
+]`)
+
+	want := []bool{true, false, false, false, false}
+	for i := range resources {
+		if got := resources[i].SoleUpToDateOfAPrimaryPeer(); got != want[i] {
+			t.Errorf("%s: SoleUpToDateOfAPrimaryPeer = %v, want %v", resources[i].Name, got, want[i])
+		}
+	}
+}

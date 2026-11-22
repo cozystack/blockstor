@@ -794,3 +794,33 @@ func TestForcedIOFailuresRetriesAFailedUp(t *testing.T) {
 		t.Errorf("actions = %q, want one failed adjust, one that went through, then nothing", got)
 	}
 }
+
+// A Secondary failing I/O that a diskless Primary on another node reads
+// from, as its only UpToDate disk, is left up while that lasts, and
+// restarted on the first pass it no longer is.
+func TestForcedIOFailuresLeavesTheSourceOfAPrimaryPeerUp(t *testing.T) {
+	t.Parallel()
+
+	const sole = `[{"name":"pvc-failio","role":"Secondary","force-io-failures":true,
+ "devices":[{"volume":0,"disk-state":"UpToDate","open":false}],
+ "connections":[{"name":"n1","connection-state":"Connected","peer-role":"Primary",
+  "peer_devices":[{"volume":0,"peer-disk-state":"Diskless"}]}]}]`
+
+	adm := &fakeWorkaroundAdm{status: sole}
+	w, _ := newTestWorkarounds(t, adm, failingIOConfig(), "pvc-failio")
+
+	for range 4 {
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if len(adm.actions) != 0 {
+		t.Fatalf("took down the only UpToDate disk of a Primary peer: %v", adm.actions)
+	}
+
+	adm.status = strings.Replace(sole, `"peer-role":"Primary"`, `"peer-role":"Secondary"`, 1)
+	w.pass(t.Context(), logr.Discard())
+
+	if got := strings.Join(adm.actions, ","); got != "down pvc-failio,up pvc-failio" {
+		t.Errorf("actions once the peer demoted = %q, want down and up", got)
+	}
+}

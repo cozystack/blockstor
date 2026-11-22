@@ -48,8 +48,10 @@ type KernelDevice struct {
 
 // KernelConnection is one peer of a KernelResource.
 type KernelConnection struct {
-	Name        string             `json:"name"`
-	PeerDevices []KernelPeerDevice `json:"peer_devices"`
+	Name            string             `json:"name"`
+	ConnectionState string             `json:"connection-state"`
+	PeerRole        string             `json:"peer-role"`
+	PeerDevices     []KernelPeerDevice `json:"peer_devices"`
 }
 
 // KernelPeerDevice is one volume of a peer connection. PercentInSync is
@@ -57,6 +59,7 @@ type KernelConnection struct {
 type KernelPeerDevice struct {
 	Volume           int32    `json:"volume"`
 	ReplicationState string   `json:"replication-state"`
+	PeerDiskState    string   `json:"peer-disk-state"`
 	ResyncSuspended  string   `json:"resync-suspended"`
 	PercentInSync    *float64 `json:"percent-in-sync"`
 }
@@ -127,6 +130,24 @@ func (r *KernelResource) UnusedSecondaryFailingIO() bool {
 	return r.Role == "Secondary" && bool(r.ForceIOFailures) && len(r.Devices) > 0 && r.unused()
 }
 
+// SoleUpToDateOfAPrimaryPeer reports a resource a connected peer is
+// Primary of while, for some volume, this node's disk is UpToDate and no
+// connected peer reports an UpToDate disk of its own: that Primary's
+// I/O depends on this replica, so taking it down, even for a moment, can
+// leave the Primary without good data or quorum.
+func (r *KernelResource) SoleUpToDateOfAPrimaryPeer() bool {
+	primaryPeer := slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
+		return c.ConnectionState == string(ConnectionStateConnected) && c.PeerRole == string(RolePrimary)
+	})
+	if !primaryPeer {
+		return false
+	}
+
+	return slices.ContainsFunc(r.Devices, func(d KernelDevice) bool {
+		return d.DiskState == string(DiskStateUpToDate) && !r.peerUpToDate(d.Volume)
+	})
+}
+
 // ResyncSource is the peer a local Inconsistent volume of the resource
 // is resyncing from, with how far that resync got, while the resync from
 // another peer waits on it (resync-suspended:dependency). ok is false
@@ -164,6 +185,16 @@ func (r *KernelResource) ResyncSource() (ResyncFrom, bool) {
 type ResyncFrom struct {
 	Peer          string
 	PercentInSync float64
+}
+
+// peerUpToDate reports whether a connected peer has an UpToDate disk of
+// volume.
+func (r *KernelResource) peerUpToDate(volume int32) bool {
+	return slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
+		return c.ConnectionState == string(ConnectionStateConnected) && slices.ContainsFunc(c.PeerDevices, func(p KernelPeerDevice) bool {
+			return p.Volume == volume && p.PeerDiskState == string(DiskStateUpToDate)
+		})
+	})
 }
 
 // unused reports whether no local volume of the resource is open.

@@ -462,7 +462,13 @@ func (w *DRBDWorkaroundsRunnable) checkIdlePrimary(
 // device is not touched, and a resync it was part of continues from its
 // bitmap. Never done to a Primary or to a replica with a volume open, and
 // only after two passes in a row, so the moment between the last close
-// and the clear is not mistaken for it. Same check as the plunger.
+// and the clear is not mistaken for it. Same check as the plunger, which
+// looks at this node alone; here a replica a connected Primary peer
+// depends on, as the only UpToDate disk it reaches, is also left up:
+// taking it down could push that Primary into its no-quorum or
+// no-data behaviour. It is unlikely, since force-io-failures comes from
+// a demote towards SyncTarget and such a replica is normally the stale
+// one, but it costs nothing to check.
 
 // failingIOPasses is how many passes in a row a Secondary must fail I/O
 // with nothing open before it is taken down and up.
@@ -481,6 +487,17 @@ func (w *DRBDWorkaroundsRunnable) checkForcedIOFailures(
 	passes := w.failingIO[res.Name] + 1
 	if passes < failingIOPasses {
 		failingIO[res.Name] = passes
+
+		return
+	}
+
+	if res.SoleUpToDateOfAPrimaryPeer() {
+		// Counted on, so the restart follows on the first pass the
+		// Primary no longer depends on this replica.
+		failingIO[res.Name] = passes
+
+		logger.V(1).Info("DRBD workaround: a Secondary failing I/O is the only UpToDate disk a Primary peer reaches; left up",
+			"resource", res.Name)
 
 		return
 	}
