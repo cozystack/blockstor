@@ -109,6 +109,10 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
+	var retry time.Duration
+
+	ctx = context.WithValue(ctx, rdRetryKey{}, &retry)
+
 	var rd blockstoriov1alpha1.ResourceDefinition
 
 	// Use APIReader for the initial fetch when available — the
@@ -164,22 +168,66 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	// Belt-and-braces re-enqueue: the witness-decision read in
-	// ensureTiebreaker goes through the cached client, and an RD
-	// reconciled right when the second Resource arrives may see a
-	// stale 1-diskful view and skip witness creation. Watches on
-	// Resource events re-enqueue the RD as the cache fills, but if
-	// only one Resource event lands before the reconciler drains
-	// the queue we'd wait for the next periodic re-sync (minutes)
-	// before the witness appears. A short requeue closes that
-	// window without changing the steady-state behaviour: once the
-	// witness exists, the next ensureTiebreaker is a no-op.
-	return ctrl.Result{RequeueAfter: rdReconcileRequeue}, nil
+	// A settled RD waits for its next event: its own change, a
+	// replica's, a node's or its group's (SetupWithManager). It used
+	// to come back every 5 s, which on a cluster with a few hundred
+	// definitions kept the controller busy with uncached reads while
+	// nothing changed. Only a decision with a deadline, or one this
+	// pass deferred, comes back on its own.
+	if until, ok := nextTiebreakerDeadline(&rd, time.Now()); ok {
+		askRDRetry(ctx, until)
+	}
+
+	return ctrl.Result{RequeueAfter: retry}, nil
 }
 
-// rdReconcileRequeue is the cache-warmup safety net for the RD
-// reconciler. See the comment in Reconcile for why it exists.
+// rdReconcileRequeue is how soon an RD comes back when a pass deferred
+// its witness decision.
 const rdReconcileRequeue = 5 * time.Second
+
+// rdRetryKey carries, in the context of an RD pass, how soon the pass
+// wants the next one; zero means on the next event only.
+type rdRetryKey struct{}
+
+// askRDRetry asks for another pass of the RD in ctx after d. Of several
+// asks the earliest wins.
+func askRDRetry(ctx context.Context, d time.Duration) {
+	retry, ok := ctx.Value(rdRetryKey{}).(*time.Duration)
+	if !ok || d <= 0 {
+		return
+	}
+
+	if *retry == 0 || d < *retry {
+		*retry = d
+	}
+}
+
+// nextTiebreakerDeadline returns how long until the earliest of the
+// RD's witness deadlines (the suppression after a witness delete, the
+// keep-tiebreaker window) passes, when one is still ahead. The witness
+// decision changes when it passes, and no event marks the moment.
+func nextTiebreakerDeadline(rd *blockstoriov1alpha1.ResourceDefinition, now time.Time) (time.Duration, bool) {
+	var (
+		earliest time.Duration
+		found    bool
+	)
+
+	for _, key := range []string{apiv1.AutoTiebreakerSuppressedUntilAnnotation, apiv1.KeepTiebreakerUntilAnnotation} {
+		deadline, err := time.Parse(time.RFC3339, rd.Annotations[key])
+		if err != nil || !deadline.After(now) {
+			continue
+		}
+
+		// RFC3339 drops the fraction: come back just after the
+		// second the deadline names, not inside it.
+		left := deadline.Sub(now) + time.Second
+		if !found || left < earliest {
+			earliest, found = left, true
+		}
+	}
+
+	return earliest, found
+}
 
 // ensureTiebreaker keeps both invariants upstream LINSTOR maintains:
 //
@@ -907,8 +955,8 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 	// event, no finalizer). Re-validate the pick against the
 	// authoritative reader right before the write — the same shape
 	// as the REST layer's Bug 174 node-deleted-race guard. On a miss
-	// (or a freshly-stamped drain flag) skip this pass; the standing
-	// rdReconcileRequeue retries with a fresh candidate list.
+	// (or a freshly-stamped drain flag) skip this pass and ask for
+	// another after rdReconcileRequeue, with a fresh candidate list.
 	probe, err := r.probeNodeDirect(ctx, tiebreakerNode)
 	if err != nil {
 		return false, err
@@ -917,6 +965,8 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 	if !probe.found || probe.drained {
 		logf.FromContext(ctx).Info("witness candidate vanished or drained; deferring witness create",
 			"rd", rd.Name, "node", tiebreakerNode, "found", probe.found)
+
+		askRDRetry(ctx, rdReconcileRequeue)
 
 		return false, nil
 	}
@@ -1778,6 +1828,10 @@ func (r *ResourceDefinitionReconciler) stampResizePending(ctx context.Context, r
 
 		err = r.stampResizePendingOnResource(ctx, rd, &resList.Items[i])
 		if err != nil && !apierrors.IsNotFound(err) {
+			// Usually a conflict with the satellite's write over the
+			// cached copy. The RD has no periodic pass to retry it in.
+			askRDRetry(ctx, rdReconcileRequeue)
+
 			logf.FromContext(ctx).Info("stampResizePending: update skipped",
 				"resource", resList.Items[i].Name, "err", err.Error())
 		}
@@ -1895,12 +1949,12 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		// the witness is only (re)placed on the next periodic re-sync —
 		// leaving two diskful UpToDate replicas with no quorum witness
 		// in between (split-brain risk on a subsequent failure). The
-		// nodeDrainFlagChanged predicate filters to the flag transition
-		// so unrelated Node Spec edits (props, net-interfaces) don't
-		// fan out to every RD.
+		// witnessCandidacyChanged predicate filters to what the witness
+		// pick reads, so unrelated Node Spec edits (net-interfaces,
+		// other props) don't fan out to every RD.
 		Watches(&blockstoriov1alpha1.Node{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsForNode),
-			builder.WithPredicates(nodeDrainFlagChanged())).
+			builder.WithPredicates(witnessCandidacyChanged())).
 		// A group that gains or drops a layer re-checks its RDs'
 		// unapplied-group annotation now, not at the next resync.
 		Watches(&blockstoriov1alpha1.ResourceGroup{},
@@ -1910,27 +1964,20 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Complete(r)
 }
 
-// nodeDrainFlagChanged fires only when a Node's drain-signal flag set
-// (EVICTED / LOST) transitions. The REST `n rst` / `n evacuate` /
-// `n lost` handlers stamp these onto `Spec.Flags`; the satellite also
-// re-applies Node Spec on every reconcile with the flag set unchanged,
-// so a bare generation/Spec-equality watch would fan out to every RD
-// on every heartbeat. Restricting to the EVICTED/LOST membership delta
-// keeps the Bug 386 re-enqueue precise.
+// witnessCandidacyChanged fires when a Node changes whether it can take
+// a witness: it appears or goes, its drain-signal flag set (EVICTED /
+// LOST) transitions, its AutoplaceTarget opt-out or its type changes.
+// The REST `n rst` / `n evacuate` / `n lost` handlers stamp the flags
+// onto `Spec.Flags`; the satellite also re-applies Node Spec on every
+// reconcile with the flag set unchanged, so a bare generation/Spec-
+// equality watch would fan out to every RD on every heartbeat.
 //
-// Create fires when the node already carries a drain flag (controller
-// restart re-reads existing state) so the witness invariant runs at
-// least once against the recovered topology.
-func nodeDrainFlagChanged() predicate.Predicate {
+// The RD reconciler has no periodic pass any more, so a node that
+// joins has to start the one that gives a 2-diskful RD the witness a
+// third node allows.
+func witnessCandidacyChanged() predicate.Predicate {
 	return predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			n, ok := e.Object.(*blockstoriov1alpha1.Node)
-			if !ok {
-				return false
-			}
-
-			return nodeHasDrainFlag(n)
-		},
+		CreateFunc: func(event.CreateEvent) bool { return true },
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldNode, ok := e.ObjectOld.(*blockstoriov1alpha1.Node)
 			if !ok {
@@ -1942,15 +1989,16 @@ func nodeDrainFlagChanged() predicate.Predicate {
 				return false
 			}
 
-			return nodeHasDrainFlag(oldNode) != nodeHasDrainFlag(newNode)
+			return nodeHasDrainFlag(oldNode) != nodeHasDrainFlag(newNode) ||
+				oldNode.Spec.Type != newNode.Spec.Type ||
+				oldNode.Spec.Props[apiv1.PropAutoplaceTarget] != newNode.Spec.Props[apiv1.PropAutoplaceTarget]
 		},
 		// Bug-024: a node DELETE is the strongest drain signal there
 		// is — `n lost` removes the Node row outright. Re-running the
 		// witness invariant on it lets the ghost-repair leg
 		// (dropStrandedReplicas) reap a TIE_BREAKER stranded on the
-		// deleted node as soon as the event lands instead of waiting
-		// for the periodic requeue. Node deletion is rare, so the
-		// all-RD fan-out stays cheap.
+		// deleted node as soon as the event lands. Node deletion is
+		// rare, so the all-RD fan-out stays cheap.
 		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
 		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}
@@ -1995,13 +2043,14 @@ func nodeCRDAutoplaceExcluded(n *blockstoriov1alpha1.Node) bool {
 	return err == nil && !v
 }
 
-// enqueueRDsForNode maps a Node flag-change event to every
-// ResourceDefinition in the cluster. The tiebreaker invariant is a
-// cluster-wide candidate-set decision (any RD's witness might have
-// collapsed onto, or now want to re-land on, the toggled node), so a
-// per-node restore re-evaluates all RDs. The set of RDs is small
-// relative to Resources, and the nodeDrainFlagChanged predicate gates
-// the fan-out to genuine EVICTED/LOST transitions, so this stays cheap.
+// enqueueRDsForNode maps a Node event to every ResourceDefinition in
+// the cluster. The tiebreaker invariant is a cluster-wide candidate-set
+// decision (any RD's witness might have collapsed onto, or now want to
+// re-land on, the changed node), so a per-node change re-evaluates all
+// RDs. The set of RDs is small relative to Resources, and the
+// witnessCandidacyChanged predicate gates the fan-out to a node joining
+// or going and to the fields the witness pick reads, so this stays
+// cheap.
 func (r *ResourceDefinitionReconciler) enqueueRDsForNode(ctx context.Context, _ client.Object) []reconcile.Request {
 	var rdList blockstoriov1alpha1.ResourceDefinitionList
 
