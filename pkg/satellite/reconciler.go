@@ -1155,6 +1155,8 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 		Ok:       true,
 	}
 
+	ctx = withApplyResult(ctx, res)
+
 	diskless := isDiskless(dr.GetFlags())
 
 	r.keepGIHistoryOf(dr.GetName(), desiredVolumeNumbers(dr))
@@ -5905,10 +5907,15 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	skipNet := r.shouldSkipNetOnAdjust(ctx, dr.GetName()) && !r.adjustFailedBefore(dr.GetName())
+	skipNet, stale := r.shouldSkipNetOnAdjust(ctx, dr.GetName())
+	skipNet = skipNet && !r.adjustFailedBefore(dr.GetName())
 
 	err := r.adjustAndRecover(ctx, dr, skipDisk, skipNet)
 	r.recordAdjustOutcome(ctx, dr.GetName(), skipNet, err)
+
+	if err == nil && len(stale) > 0 {
+		reportReconnectedPeers(ctx, dr.GetName(), stale)
+	}
 
 	return err
 }
@@ -6085,11 +6092,26 @@ func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDi
 // adjust on any transient drbdsetup hiccup). The probe is
 // per-resource, so a healthy peer on a multi-peer RD still gets
 // reconnected when its own slot is in Connecting/Timeout/etc.
-func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string) bool {
+//
+// A StandAlone connection with peer devices is also what the kernel
+// leaves when it drops a connection whose handshake its own
+// configuration refused: a peer set up as diskless ("The peer is
+// configured to be diskless but presents Inconsistent") that has
+// turned diskful since, the witness a placement took over. Nobody
+// disconnected that one, and --skip-net leaves both the stale peer
+// options and the connection as they are, for good: the drift check
+// lists the resource every interval and every pass skips the very
+// change it lists. Such a connection is told apart by the plan of a
+// full adjust: for a peer the operator disconnected it is the connect
+// and nothing else, for this one it resets the peer's options first.
+// Those connections come back as stale, and the adjust is a full one.
+func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string) (bool, []string) {
 	slots, probeErr := r.cfg.Adm.Show(ctx, resource)
 	if probeErr != nil {
-		return false
+		return false, nil
 	}
+
+	var standAlone []drbd.KernelSlot
 
 	for _, slot := range slots {
 		if slot.ConnectionState != string(drbd.ConnectionStateStandAlone) {
@@ -6106,10 +6128,45 @@ func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string)
 			continue
 		}
 
-		return true
+		standAlone = append(standAlone, slot)
 	}
 
-	return false
+	if len(standAlone) == 0 {
+		return false, nil
+	}
+
+	stale := r.standAloneWithStaleConfig(ctx, resource, standAlone)
+	if len(stale) > 0 {
+		return false, stale
+	}
+
+	return true, nil
+}
+
+// standAloneWithStaleConfig names the StandAlone connections of
+// resource whose peer configuration a full adjust would change, sorted.
+// A plan that cannot be read names none, which keeps the --skip-net an
+// operator's disconnect has always had.
+func (r *Reconciler) standAloneWithStaleConfig(ctx context.Context, resource string, standAlone []drbd.KernelSlot) []string {
+	plan, err := r.cfg.Adm.AdjustPlan(ctx, resource)
+	if err != nil {
+		log.FromContext(ctx).Info("cannot read the adjust plan; keeping StandAlone connections as they are",
+			"resource", resource, "error", err.Error())
+
+		return nil
+	}
+
+	var stale []string
+
+	for _, slot := range standAlone {
+		if drbd.PlanReconfiguresPeer(plan, resource, slot.NodeID) {
+			stale = append(stale, slot.Name)
+		}
+	}
+
+	slices.Sort(stale)
+
+	return stale
 }
 
 // isUnknownResourceErr reports whether a drbdadm error is the

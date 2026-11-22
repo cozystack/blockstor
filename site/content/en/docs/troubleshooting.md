@@ -76,6 +76,10 @@ A new replica whose apply waits for the controller to give it its DRBD node id o
 
 A diskful replica that names no storage pool waits for one the same way, but for 30 seconds only. A new replica can be seen a moment before the write that gives it its pool, and that write lands within seconds. A replica still without a pool after that was created or converted to diskful without one, and nothing gives it one later, so its apply fails with an `ApplyFailed` Warning, `no storage pool resolved for the diskful replica`, and is retried with the back-off above. Name the pool with `linstor r td <node> <rd> --storage-pool <pool>`, or set `StorPoolName` on the resource definition, and the next retry goes through.
 
+## StandAlone towards a peer that changed
+
+The kernel itself drops a connection whose handshake its configuration refuses, and leaves it `StandAlone`. The case seen in practice is a new replica whose peer was set up as a diskless witness and came up diskful: the kernel log on the node that dropped it says `The peer is configured to be diskless but presents Inconsistent`. Nobody disconnected that peer, so the satellite does not keep it as it keeps yours: before it adjusts a resource with a `StandAlone` peer it reads the plan of a full adjust (`drbdadm -d adjust <definition>`), and when the plan changes that peer's options rather than only connecting it again, the adjust is a full one. It resets the options and connects the peer at the next pass of the resource, and leaves a Warning `StaleConnectionReconnected` Event on the Resource naming the peer.
+
 ## Inconsistent or SyncTarget that never finishes
 
 Look at the disk state of each replica and at the replication state towards the peer that should be the source:
