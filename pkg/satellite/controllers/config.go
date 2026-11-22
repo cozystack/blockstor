@@ -119,4 +119,9 @@ type Config struct {
 	// peer satellites with. Not configured, nothing is fetched and a
 	// restore on this node falls back to a DRBD resync.
 	StreamTLS stream.TLSFiles
+
+	// Workarounds turns the satellite's DRBD workarounds on and off
+	// (drbd_workarounds.go). The zero value turns them all off;
+	// cmd/satellite wires DefaultWorkaroundsConfig adjusted by its flags.
+	Workarounds WorkaroundsConfig
 }

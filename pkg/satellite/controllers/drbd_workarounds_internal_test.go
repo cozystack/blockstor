@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/go-logr/logr"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
+)
+
+const workaroundNode = "n3"
+
+// fakeWorkaroundAdm hands out one kernel status per pass and records the
+// actions taken.
+type fakeWorkaroundAdm struct {
+	status  string
+	reads   int
+	actions []string
+}
+
+func (f *fakeWorkaroundAdm) KernelStatus(context.Context) ([]drbd.KernelResource, error) {
+	f.reads++
+
+	var out []drbd.KernelResource
+
+	err := json.Unmarshal([]byte(f.status), &out)
+	if err != nil {
+		return nil, fmt.Errorf("fake kernel status: %w", err)
+	}
+
+	return out, nil
+}
+
+func (f *fakeWorkaroundAdm) DisconnectPeer(_ context.Context, res, peer string) error {
+	f.actions = append(f.actions, "disconnect "+res+":"+peer)
+
+	return nil
+}
+
+func (f *fakeWorkaroundAdm) ConnectPeer(_ context.Context, res, peer string) error {
+	f.actions = append(f.actions, "connect "+res+":"+peer)
+
+	return nil
+}
+
+func (f *fakeWorkaroundAdm) Secondary(_ context.Context, res string) error {
+	f.actions = append(f.actions, "secondary "+res)
+
+	return nil
+}
+
+func (f *fakeWorkaroundAdm) Down(_ context.Context, res string) error {
+	f.actions = append(f.actions, "down "+res)
+
+	return nil
+}
+
+func (f *fakeWorkaroundAdm) Up(_ context.Context, res string) error {
+	f.actions = append(f.actions, "up "+res)
+
+	return nil
+}
+
+// workaroundReader has a blockstor replica on this node of each of rds.
+func workaroundReader(t *testing.T, rds ...string) client.Reader {
+	t.Helper()
+
+	builder := fake.NewClientBuilder().WithScheme(scheme)
+
+	for _, rd := range rds {
+		builder = builder.WithObjects(&blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: k8s.ResourceCRName(rd, workaroundNode)},
+			Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: rd, NodeName: workaroundNode},
+		})
+	}
+
+	return builder.Build()
+}
+
+func newTestWorkarounds(t *testing.T, adm *fakeWorkaroundAdm, cfg WorkaroundsConfig, rds ...string) (*DRBDWorkaroundsRunnable, *events.FakeRecorder) {
+	t.Helper()
+
+	recorder := events.NewFakeRecorder(16)
+
+	return &DRBDWorkaroundsRunnable{
+		Reader:   workaroundReader(t, rds...),
+		Adm:      adm,
+		Recorder: recorder,
+		NodeName: workaroundNode,
+		Config:   cfg,
+	}, recorder
+}
+
+// stalledStatus is a replica resyncing from n1 at percent while its resync
+// from n2 waits on that one.
+func stalledStatus(percent string) string {
+	return `[{"name":"pvc-stall","role":"Secondary",
+ "devices":[{"volume":0,"disk-state":"Inconsistent","open":false}],
+ "connections":[
+  {"name":"n1","peer_devices":[{"volume":0,"replication-state":"SyncTarget","resync-suspended":"no","percent-in-sync":` + percent + `}]},
+  {"name":"n2","peer_devices":[{"volume":0,"replication-state":"PausedSyncT","resync-suspended":"dependency","percent-in-sync":` + percent + `}]}]}]`
+}
+
+func stallConfig() WorkaroundsConfig {
+	return WorkaroundsConfig{Interval: 1, StalledResync: true, StalledResyncPasses: 4}
+}
+
+func drainEvents(recorder *events.FakeRecorder) []string {
+	var out []string
+
+	for {
+		select {
+		case ev := <-recorder.Events:
+			out = append(out, ev)
+		default:
+			return out
+		}
+	}
+}
+
+// LINBIT/drbd#149: the resync from n1 sits at the same percent while n2
+// waits on it. The fourth pass in a row reconnects n1, and not before.
+func TestStalledResyncReconnectsTheStuckSourceAfterFourPasses(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{status: stalledStatus("42.17")}
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	for pass := 1; pass <= 3; pass++ {
+		w.pass(t.Context(), logr.Discard())
+
+		if len(adm.actions) != 0 {
+			t.Fatalf("pass %d acted early: %v", pass, adm.actions)
+		}
+	}
+
+	w.pass(t.Context(), logr.Discard())
+
+	want := []string{"disconnect pvc-stall:n1", "connect pvc-stall:n1"}
+	if strings.Join(adm.actions, ",") != strings.Join(want, ",") {
+		t.Fatalf("actions = %v, want %v", adm.actions, want)
+	}
+
+	evs := drainEvents(recorder)
+	if len(evs) != 1 || !strings.Contains(evs[0], "Warning DRBDResyncStalled") {
+		t.Errorf("events = %v, want one Warning DRBDResyncStalled", evs)
+	}
+
+	// The reconnect starts the count over.
+	adm.actions = nil
+
+	for range 3 {
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if len(adm.actions) != 0 {
+		t.Errorf("reconnected again before four more passes: %v", adm.actions)
+	}
+}
+
+// A resync that moves is left alone, however long it takes.
+func TestStalledResyncLeavesAMovingResyncAlone(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	for _, percent := range []string{"10.00", "10.00", "10.00", "11.50", "11.50", "11.50", "12.00"} {
+		adm.status = stalledStatus(percent)
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if len(adm.actions) != 0 {
+		t.Errorf("a moving resync was reconnected: %v", adm.actions)
+	}
+}
+
+// The workarounds touch only resources blockstor has a replica of on this
+// node, and none an apply is changing.
+func TestStalledResyncSkipsForeignAndBusyResources(t *testing.T) {
+	t.Parallel()
+
+	t.Run("foreign", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{status: stalledStatus("42.17")}
+		w, _ := newTestWorkarounds(t, adm, stallConfig())
+
+		for range 6 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 {
+			t.Errorf("acted on a resource blockstor has no replica of: %v", adm.actions)
+		}
+	})
+
+	t.Run("busy", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{status: stalledStatus("42.17")}
+		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		busy := true
+		w.Busy = func(string) bool { return busy }
+
+		for range 6 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 {
+			t.Errorf("acted on a resource an apply is changing: %v", adm.actions)
+		}
+	})
+}
+
+// With nothing in the observer's cache a check acts on, a pass runs no
+// command at all; with the check off, its shape does not count.
+func TestWorkaroundPassReadsTheKernelOnlyOnAHint(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{status: stalledStatus("42.17")}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	hints := WorkaroundHints{}
+	w.Hints = func() WorkaroundHints { return hints }
+
+	w.pass(t.Context(), logr.Discard())
+
+	if adm.reads != 0 {
+		t.Fatalf("idle pass read the kernel status %d times", adm.reads)
+	}
+
+	hints.Inconsistent = true
+	w.pass(t.Context(), logr.Discard())
+
+	if adm.reads != 1 {
+		t.Fatalf("pass with an Inconsistent volume read the kernel status %d times, want 1", adm.reads)
+	}
+
+	w.Config.StalledResync = false
+	w.pass(t.Context(), logr.Discard())
+
+	if adm.reads != 1 {
+		t.Errorf("an Inconsistent volume read the kernel status with the stall check off")
+	}
+}
+
+// The observer's cache gives the hints, ignoring resources whose kernel
+// slot is gone.
+func TestObserverWorkaroundHints(t *testing.T) {
+	t.Parallel()
+
+	o := &ObserverRunnable{}
+	if o.WorkaroundHints() != (WorkaroundHints{}) {
+		t.Fatal("an empty cache gives hints")
+	}
+
+	o.mergeResource(&observation{
+		ResourceName: "a", HasResource: true, Role: drbdRolePrimary,
+		HasKernelLoaded: true, KernelLoaded: true,
+	})
+	o.mergeResource(&observation{
+		ResourceName: "b", HasResource: true, Role: "Secondary", ForceIOFailures: true,
+		HasKernelLoaded: true, KernelLoaded: true,
+	})
+	o.mergeVolumes(&observation{ResourceName: "c", Volumes: []volumeObservation{{VolumeNumber: 0, DiskState: "Inconsistent"}}})
+
+	if got := o.WorkaroundHints(); got != (WorkaroundHints{Primary: true, Inconsistent: true, ForcedIOFailures: true}) {
+		t.Errorf("hints = %+v, want all set", got)
+	}
+
+	for _, name := range []string{"a", "b", "c"} {
+		o.mergeResource(&observation{ResourceName: name, HasResource: true, HasKernelLoaded: true, KernelLoaded: false})
+	}
+
+	if got := o.WorkaroundHints(); got != (WorkaroundHints{}) {
+		t.Errorf("hints of destroyed resources = %+v, want none", got)
+	}
+}
+
+// translateResourceEvent reads force-io-failures off resource frames.
+func TestTranslateResourceEventReadsForcedIOFailures(t *testing.T) {
+	t.Parallel()
+
+	obs, ok := translateResourceEvent(drbd.Event{
+		Action: "change", Kind: "resource",
+		Fields: map[string]string{"name": "r", "role": "Secondary", "force-io-failures": "yes"},
+	})
+	if !ok || !obs.ForceIOFailures {
+		t.Errorf("force-io-failures:yes not read: %+v", obs)
+	}
+}

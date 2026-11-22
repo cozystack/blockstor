@@ -222,9 +222,16 @@ func ensureWiredDefaults(cfg *Config) {
 // budget — Scenario 5.34 added the third runnable and the
 // inline chain tipped over the limit.
 func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
-	err := mgr.Add(newObserverRunnableFromConfig(mgr.GetClient(), cfg))
+	observer := newObserverRunnableFromConfig(mgr.GetClient(), cfg)
+
+	err := mgr.Add(observer)
 	if err != nil {
 		return errors.Wrap(err, "add ObserverRunnable")
+	}
+
+	err = newDRBDWorkaroundsRunnable(mgr.GetClient(), cfg, observer).RegisterWithManager(mgr)
+	if err != nil {
+		return err
 	}
 
 	err = (&HeartbeatRunnable{Client: mgr.GetClient(), NodeName: cfg.NodeName}).RegisterWithManager(mgr)
