@@ -20,6 +20,8 @@ package validate
 
 import (
 	"errors"
+	"slices"
+	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
@@ -72,6 +74,12 @@ func MidSyncDeleteRefusal(target *apiv1.Resource, siblings []apiv1.Resource) boo
 			continue
 		}
 
+		// A peer already on its way out is not stranded by losing its
+		// source: nothing will ever read what it was syncing.
+		if slices.Contains(sib.Flags, apiv1.ResourceFlagDelete) {
+			continue
+		}
+
 		switch {
 		case resourceIsConfirmedUpToDateSource(sib):
 			confirmedSources++
@@ -87,6 +95,35 @@ func MidSyncDeleteRefusal(target *apiv1.Resource, siblings []apiv1.Resource) boo
 	}
 
 	return midSyncPeers > 0
+}
+
+// DefinitionBeingDeleted reports whether the whole definition is being
+// taken apart, as opposed to one replica of a volume that stays.
+//
+// MidSyncDeleteRefusal protects the data of a volume that outlives the
+// delete. LINSTOR has no such check on any delete path; blockstor keeps it
+// for a single replica dropped from a live volume, and nowhere else. When
+// every replica is going, a peer left Inconsistent is about to go too, and
+// refusing the source only strands the delete: the volume can then never
+// be removed at all.
+//
+// Two shapes say the definition is going. The DELETE flag is LINSTOR's own
+// mark for `rd d`. linstor-csi's DeleteVolume never sends `rd d` first: it
+// sets BalanceResourcesEnabled=False on the definition, then deletes the
+// replicas one by one, then the definition (pkg/client/linstor.go, Delete).
+// That property write is the only notice the replica deletes get that they
+// are one volume teardown. An operator who switched balancing off by hand
+// loses the guard on that definition, which is where LINSTOR always is.
+func DefinitionBeingDeleted(rd *apiv1.ResourceDefinition) bool {
+	if rd == nil {
+		return false
+	}
+
+	if slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
+		return true
+	}
+
+	return strings.EqualFold(rd.Props[apiv1.PropBalanceResourcesEnabled], "false")
 }
 
 // ResourceIsDiskful reports whether a replica carries real backing storage

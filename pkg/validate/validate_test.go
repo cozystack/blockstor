@@ -308,6 +308,61 @@ func TestMidSyncDeleteRefusal(t *testing.T) {
 	}
 }
 
+// The shape a volume deleted during its initial sync is left in: the sync
+// source is gone, one complete copy remains, and the other replica stays
+// Inconsistent on an Established connection to it. The guard is for a
+// volume that stays; once the definition is being deleted the remaining
+// replicas have to be deletable, or the volume never goes away.
+func TestMidSyncDeleteRefusalLiftedWhileDefinitionIsDeleted(t *testing.T) {
+	t.Parallel()
+
+	target := diskful("node-b", "UpToDate")
+	stranded := []apiv1.Resource{diskful("node-c", "Inconsistent")}
+
+	if !validate.MidSyncDeleteRefusal(&target, stranded) {
+		t.Fatal("a single replica delete of the last complete copy must stay guarded")
+	}
+
+	for name, tc := range map[string]struct {
+		rd      apiv1.ResourceDefinition
+		deleted bool
+	}{
+		"a live definition": {apiv1.ResourceDefinition{}, false},
+		"balancing switched on": {
+			apiv1.ResourceDefinition{Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "true"}}, false,
+		},
+		"rd d flagged it DELETE": {
+			apiv1.ResourceDefinition{Flags: []string{apiv1.ResourceFlagDelete}}, true,
+		},
+		"linstor-csi DeleteVolume switched balancing off": {
+			apiv1.ResourceDefinition{Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"}}, true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rd := tc.rd
+			if got := validate.DefinitionBeingDeleted(&rd); got != tc.deleted {
+				t.Errorf("DefinitionBeingDeleted = %v, want %v", got, tc.deleted)
+			}
+		})
+	}
+}
+
+// A peer that is itself being deleted cannot be stranded: deleting the
+// source after it is the order SortForDeletion produces.
+func TestMidSyncDeleteRefusalIgnoresPeerBeingDeleted(t *testing.T) {
+	t.Parallel()
+
+	target := diskful("node-b", "UpToDate")
+	going := diskful("node-c", "Inconsistent")
+	going.Flags = []string{apiv1.ResourceFlagDelete}
+
+	if validate.MidSyncDeleteRefusal(&target, []apiv1.Resource{going}) {
+		t.Error("refused over a peer that is already being deleted")
+	}
+}
+
 func TestResourceIsDiskful(t *testing.T) {
 	t.Parallel()
 

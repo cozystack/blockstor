@@ -358,3 +358,55 @@ func TestResourceGroupSpawnEnforcesBounds(t *testing.T) {
 		t.Error("spawn accepted a sub-floor volume size")
 	}
 }
+
+// The last complete copy of a volume that stays is still refused.
+func TestResourceDeleteOfLastCompleteCopyStaysGuarded(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedDefinition(ctx, backend)
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "pvc-x"}); got == 0 {
+		t.Fatal("the last complete copy was deleted while a peer was still syncing")
+	}
+}
+
+// A replica delete on a definition linstor-csi's DeleteVolume is tearing
+// down (balancing switched off first) is not guarded: every replica is
+// going, so the Inconsistent one is not stranded.
+func TestResourceDeleteDuringVolumeTeardownIsNotGuarded(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:  "pvc-x",
+			Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"},
+		})
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "pvc-x"}); got != 0 {
+		t.Fatalf("delete exit = %d (stderr: %s)", got, errBuf.String())
+	}
+}
+

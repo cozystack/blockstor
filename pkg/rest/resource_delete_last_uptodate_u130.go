@@ -103,6 +103,26 @@ func (s *Server) refuseLastUpToDateDiskfulMidSyncDelete(
 		return true
 	}
 
+	// The guard is for a replica dropped from a volume that stays. When
+	// the whole definition is going (`rd d`, or linstor-csi's
+	// DeleteVolume deleting every replica in turn) the peer it would
+	// protect goes too, and refusing here only leaves a volume that can
+	// never be deleted. See validate.DefinitionBeingDeleted.
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return true
+		}
+
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if validate.DefinitionBeingDeleted(&rd) {
+		return true
+	}
+
 	siblings, err := s.Store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
 		// A list failure must not silently allow a destructive delete
