@@ -21,6 +21,7 @@ package rest
 import (
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,17 +33,26 @@ import (
 const slowSatelliteBudget = time.Second
 
 // startSlowSatelliteServer seeds a definition with one snapshot on two
-// nodes in the given connection state and serves it with the short
-// budget.
+// nodes, the second in the given connection state, and serves it with
+// the short budget.
 func startSlowSatelliteServer(t *testing.T, clearAfter time.Duration, secondNode string) string {
+	t.Helper()
+
+	return startSnapshotDeleteServer(t, clearAfter, []apiv1.Node{
+		{Name: "n1", Type: "SATELLITE", ConnectionStatus: apiv1.NodeTypeOnline},
+		{Name: "n2", Type: "SATELLITE", ConnectionStatus: secondNode},
+	}, apiv1.Snapshot{Nodes: []string{"n1", "n2"}})
+}
+
+// startSnapshotDeleteServer seeds the given nodes and a definition rd1
+// with the snapshot snap1 shaped by snap, and serves them with the
+// short budget.
+func startSnapshotDeleteServer(t *testing.T, clearAfter time.Duration, nodes []apiv1.Node, snap apiv1.Snapshot) string {
 	t.Helper()
 
 	st := newStuckSnapshotStore(clearAfter)
 
-	for _, node := range []apiv1.Node{
-		{Name: "n1", Type: "SATELLITE", ConnectionStatus: apiv1.NodeTypeOnline},
-		{Name: "n2", Type: "SATELLITE", ConnectionStatus: secondNode},
-	} {
+	for _, node := range nodes {
 		err := st.inner.Nodes().Create(t.Context(), &node)
 		if err != nil {
 			t.Fatalf("seed node %s: %v", node.Name, err)
@@ -54,11 +64,10 @@ func startSlowSatelliteServer(t *testing.T, clearAfter time.Duration, secondNode
 		t.Fatalf("seed RD: %v", err)
 	}
 
-	err = st.inner.Snapshots().Create(t.Context(), &apiv1.Snapshot{
-		Name:         "snap1",
-		ResourceName: "rd1",
-		Nodes:        []string{"n1", "n2"},
-	})
+	snap.Name = "snap1"
+	snap.ResourceName = "rd1"
+
+	err = st.inner.Snapshots().Create(t.Context(), &snap)
 	if err != nil {
 		t.Fatalf("seed snapshot: %v", err)
 	}
@@ -73,6 +82,29 @@ func startSlowSatelliteServer(t *testing.T, clearAfter time.Duration, secondNode
 	t.Cleanup(stop)
 
 	return base
+}
+
+// deleteSnap1 sends the snapshot delete with a client deadline well past
+// the budget, so a delete that keeps waiting fails the test instead of
+// hanging the suite, and reports how long the answer took. The caller
+// closes the body.
+func deleteSnap1(t *testing.T, base string) (*http.Response, time.Duration) {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodDelete,
+		base+"/v1/resource-definitions/rd1/snapshots/snap1", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	start := time.Now()
+
+	resp, err := (&http.Client{Timeout: 5 * slowSatelliteBudget}).Do(req)
+	if err != nil {
+		t.Fatalf("delete did not answer within %v: %v", 5*slowSatelliteBudget, err)
+	}
+
+	return resp, time.Since(start)
 }
 
 // TestSnapshotDeleteWaitsOutASlowOnlineSatellite: the satellites are
@@ -116,23 +148,8 @@ func TestSnapshotDeleteWaitsOutASlowOnlineSatellite(t *testing.T) {
 func TestSnapshotDeleteGivesUpOnAnOfflineNode(t *testing.T) {
 	base := startSlowSatelliteServer(t, 0, apiv1.NodeTypeOffline)
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodDelete,
-		base+"/v1/resource-definitions/rd1/snapshots/snap1", nil)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-
-	start := time.Now()
-
-	// A client deadline well past the budget, so a delete that keeps
-	// waiting on the offline node fails here instead of hanging the suite.
-	resp, err := (&http.Client{Timeout: 5 * slowSatelliteBudget}).Do(req)
-	if err != nil {
-		t.Fatalf("delete did not answer within %v: %v", 5*slowSatelliteBudget, err)
-	}
+	resp, elapsed := deleteSnap1(t, base)
 	defer func() { _ = resp.Body.Close() }()
-
-	elapsed := time.Since(start)
 
 	if resp.StatusCode != http.StatusGatewayTimeout {
 		body, _ := io.ReadAll(resp.Body)
@@ -141,5 +158,40 @@ func TestSnapshotDeleteGivesUpOnAnOfflineNode(t *testing.T) {
 
 	if elapsed > slowSatelliteBudget+2*time.Second {
 		t.Errorf("DELETE returned in %v; want about the %v budget", elapsed, slowSatelliteBudget)
+	}
+}
+
+// TestSnapshotDeleteAnswersASatelliteFailure: the satellites are online,
+// but one of them failed to delete its copy (lvremove refused, pool in
+// error). LINSTOR answers the delete with the error its satellite
+// returned; waiting here, with the heartbeat alive, hung the call until
+// the client gave up and told it nothing about why.
+func TestSnapshotDeleteAnswersASatelliteFailure(t *testing.T) {
+	base := startSnapshotDeleteServer(t, 0, []apiv1.Node{
+		{Name: "n1", Type: "SATELLITE", ConnectionStatus: apiv1.NodeTypeOnline},
+		{Name: "n2", Type: "SATELLITE", ConnectionStatus: apiv1.NodeTypeOnline},
+	}, apiv1.Snapshot{
+		Nodes: []string{"n1", "n2"},
+		DeleteFailures: []apiv1.SnapshotDeleteFailure{
+			{NodeName: "n2", Message: "logical volume vg/rd1_snap1_00000 in use"},
+		},
+	})
+
+	resp, elapsed := deleteSnap1(t, base)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got %d, want 500 with the satellite's error (body=%s)", resp.StatusCode, body)
+	}
+
+	if elapsed > slowSatelliteBudget {
+		t.Errorf("DELETE returned in %v; want the failure answered before the %v budget", elapsed, slowSatelliteBudget)
+	}
+
+	rcs, raw := readEnvelope(t, resp)
+	if len(rcs) != 1 || rcs[0].RetCode&apiCallRcError != apiCallRcError ||
+		rcs[0].ObjRefs[objRefNode] != "n2" || !strings.Contains(rcs[0].Cause, "in use") {
+		t.Errorf("envelope: got %s, want one error for n2 carrying its message", raw)
 	}
 }

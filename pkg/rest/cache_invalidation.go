@@ -286,6 +286,20 @@ const snapshotDeleteWaitBudget = 10 * time.Second
 // 3-replica apiserver.
 const snapshotDeleteWaitPoll = 500 * time.Millisecond
 
+// snapshotWait is how a wait for a deleted snapshot ended.
+type snapshotWait int
+
+const (
+	// snapshotWaitGone: the store no longer has the snapshot.
+	snapshotWaitGone snapshotWait = iota
+	// snapshotWaitPending: the snapshot is still there when the wait
+	// gave up (budget spent, or the caller went away).
+	snapshotWaitPending
+	// snapshotWaitFailed: a satellite reported that deleting its copy
+	// failed.
+	snapshotWaitFailed
+)
+
 // waitForSnapshotDeletionVisible blocks until the local Store
 // reports the Snapshot (rdName, snapName) is gone, OR the wait
 // budget elapses. Returns true if convergence was observed (the
@@ -294,38 +308,42 @@ const snapshotDeleteWaitPoll = 500 * time.Millisecond
 // observable). The retry of a delete uses it: the API server already
 // said the snapshot is gone, so only cache lag is waited out.
 //
-// Unlike waitForRDDeletionVisible / waitForVDDeletionVisible (which
-// always return success because the apiserver write committed even
-// if the cache hasn't caught up), this helper's caller MUST
-// distinguish converged-vs-timeout: a stuck satellite is a real
-// failure mode the operator needs to know about, not a silently-
-// swallowed "still pending" cache lag.
-//
 // Use the request context's deadline if shorter than the budget so
 // CSI-side gRPC deadlines cap our wait, not the other way around.
 func (s *Server) waitForSnapshotDeletionVisible(ctx context.Context, rdName, snapName string) bool {
-	return s.waitForSnapshotGone(ctx, rdName, snapName, false)
+	outcome, _ := s.waitForSnapshotGone(ctx, rdName, snapName, false)
+
+	return outcome == snapshotWaitGone
 }
 
-// waitForSnapshotDrained is waitForSnapshotDeletionVisible for the
-// delete that set the deletion: past the budget it keeps waiting for as
-// long as every node the snapshot lists is online. LINSTOR answers a
-// snapshot delete only once the satellites have deleted their copies
-// and has no deadline of its own for a connected satellite, so a
-// satellite that is merely slow (a burst of deletes on a CPU-limited
-// pod) must not turn the answer into a failure. linstor-csi removes the
-// definition of a deleted volume only after a delete that succeeded;
-// its retry finds the snapshot being deleted, or gone, and never sends
-// the delete again, so a 504 here left that definition behind for
-// good. The budget still applies once a listed node is offline: that
-// node's copy will not go until it is back.
-func (s *Server) waitForSnapshotDrained(ctx context.Context, rdName, snapName string) bool {
+// waitForSnapshotDrained is the wait of the delete that set the
+// deletion. It ends as soon as a satellite reports that deleting its
+// copy failed, returning those failures, as LINSTOR answers with the
+// error its satellite returned. Past the budget it keeps waiting for as
+// long as every node the snapshot lists is online: LINSTOR has no
+// deadline of its own for a connected satellite, so a satellite that is
+// merely slow (a burst of deletes on a CPU-limited pod) must not turn
+// the answer into a failure. linstor-csi removes the definition of a
+// deleted volume only after a delete that succeeded; its retry finds
+// the snapshot being deleted, or gone, and never sends the delete
+// again, so a 504 here left that definition behind for good. The budget
+// still applies once a listed node is offline: that node's copy will
+// not go until it is back.
+//
+// The CRD goes once the first listed satellite has deleted its copy and
+// dropped the finalizer the satellites share, so "gone" means that, not
+// that every node has.
+func (s *Server) waitForSnapshotDrained(
+	ctx context.Context, rdName, snapName string,
+) (snapshotWait, []apiv1.SnapshotDeleteFailure) {
 	return s.waitForSnapshotGone(ctx, rdName, snapName, true)
 }
 
-func (s *Server) waitForSnapshotGone(ctx context.Context, rdName, snapName string, whileOnline bool) bool {
+func (s *Server) waitForSnapshotGone(
+	ctx context.Context, rdName, snapName string, whileOnline bool,
+) (snapshotWait, []apiv1.SnapshotDeleteFailure) {
 	if s == nil || s.Store == nil {
-		return true
+		return snapshotWaitGone, nil
 	}
 
 	budget := s.snapshotDeleteBudget
@@ -347,16 +365,20 @@ func (s *Server) waitForSnapshotGone(ctx context.Context, rdName, snapName strin
 		if err != nil {
 			// NotFound is the converged case; a transport error means
 			// we can't probe and looping won't help.
-			return true
+			return snapshotWaitGone, nil
+		}
+
+		if whileOnline && len(snap.DeleteFailures) > 0 {
+			return snapshotWaitFailed, snap.DeleteFailures
 		}
 
 		if !time.Now().Before(deadline) && (!whileOnline || !s.snapshotDrainCanProgress(ctx, &snap)) {
-			return false
+			return snapshotWaitPending, nil
 		}
 
 		select {
 		case <-ctx.Done():
-			return false
+			return snapshotWaitPending, nil
 		case <-time.After(snapshotDeleteWaitPoll):
 		}
 	}

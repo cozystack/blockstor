@@ -777,6 +777,11 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 
 	resp, err := r.Config.Apply.DeleteSnapshot(ctx, req)
 	if err != nil {
+		stampErr := r.stampSnapshotDeleteFailure(ctx, snap, err.Error())
+		if stampErr != nil {
+			log.FromContext(ctx).Error(stampErr, "record snapshot delete failure")
+		}
+
 		return ctrl.Result{}, errors.Wrap(err, "DeleteSnapshot")
 	}
 
@@ -786,6 +791,11 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 		// CRD doesn't vanish before tear-down succeeds.
 		log.FromContext(ctx).Info("DeleteSnapshot per-snapshot failure",
 			"snapshot", snap.Spec.SnapshotName, "message", resp.GetMessage())
+
+		err = r.stampSnapshotDeleteFailure(ctx, snap, resp.GetMessage())
+		if err != nil {
+			log.FromContext(ctx).Error(err, "record snapshot delete failure")
+		}
 
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -799,6 +809,60 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// stampSnapshotDeleteFailure records why this node failed to delete
+// its copy in Status.DeleteFailures. LINSTOR answers a snapshot delete
+// with the error its satellite returned; without the record the REST
+// call could only keep waiting on a node that is online but failing,
+// since the finalizer stays and nothing else tells the two apart.
+func (r *SnapshotReconciler) stampSnapshotDeleteFailure(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, message string,
+) error {
+	if message == "" {
+		message = "the satellite could not delete its copy of the snapshot"
+	}
+
+	key := client.ObjectKeyFromObject(snap)
+
+	for range snapshotStatusUpdateRetries {
+		var current blockstoriov1alpha1.Snapshot
+
+		err := r.Get(ctx, key, &current)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+
+			return errors.Wrap(err, "get Snapshot for delete failure stamp")
+		}
+
+		idx := slices.IndexFunc(current.Status.DeleteFailures,
+			func(f blockstoriov1alpha1.SnapshotDeleteFailure) bool {
+				return naming.Same(f.NodeName, r.Config.NodeName)
+			})
+
+		switch {
+		case idx < 0:
+			current.Status.DeleteFailures = append(current.Status.DeleteFailures,
+				blockstoriov1alpha1.SnapshotDeleteFailure{NodeName: r.Config.NodeName, Message: message})
+		case current.Status.DeleteFailures[idx].Message == message:
+			return nil
+		default:
+			current.Status.DeleteFailures[idx].Message = message
+		}
+
+		err = r.Status().Update(ctx, &current)
+		if err == nil {
+			return nil
+		}
+
+		if !apierrors.IsConflict(err) {
+			return errors.Wrap(err, "stamp Status.DeleteFailures")
+		}
+	}
+
+	return errors.New("Status.DeleteFailures stamp conflicted out of retries")
 }
 
 // snapshotNodePredicate filters Snapshot events to those whose
