@@ -160,9 +160,13 @@ func TestSatelliteFlagsLackControllerBindAddress(t *testing.T) {
 	// controller-wire question this spec guards.
 	// The stream-tls-* files are the mutual TLS of the snapshot stream
 	// between satellites; they carry no controller address either.
+	// The drbd-workaround* flags tune the satellite's local DRBD
+	// workarounds; no address either.
 	want := []string{
 		"node-name", "state-dir", "health-probe-bind-address", "controller-namespace",
 		"stream-tls-cert-file", "stream-tls-key-file", "stream-tls-ca-file",
+		"drbd-workarounds-interval", "drbd-workaround-stalled-resync", "drbd-workaround-stalled-resync-passes",
+		"drbd-workaround-idle-primary", "drbd-workaround-forced-io-failures", "drbd-workaround-stale-loop-devices",
 	}
 	if !equalStringSlices(flags, want) {
 		t.Fatalf("satellite flag set drifted: got %v, want %v. "+

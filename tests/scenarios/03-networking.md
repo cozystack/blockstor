@@ -126,6 +126,8 @@ Note on `--controller-namespace` (Bug 023): the satellite binary grew this flag 
 
 Note on `--stream-tls-cert-file`, `--stream-tls-key-file` and `--stream-tls-ca-file`: the PEM files of the mutual TLS on the satellite-to-satellite snapshot stream. They name local files, carry no controller ADDRESS, and do not change the Outcome B posture either.
 
+Note on `--drbd-workarounds-interval` and the `--drbd-workaround-*` flags: they turn the satellite's local DRBD workarounds (the checks the LINSTOR-mode plunger sidecar runs) on and off and set their cadence. They carry no controller ADDRESS and do not change the Outcome B posture either.
+
 ---
 
 ## End-to-end on dedicated replication network
