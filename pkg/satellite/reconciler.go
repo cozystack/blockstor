@@ -311,6 +311,10 @@ type Reconciler struct {
 	mu             sync.Mutex
 	resourceToPool map[string]string
 
+	// droppedOptions is why the .res rendered for each resource during
+	// the apply in flight left options out; see noteDroppedOptions.
+	droppedOptions map[string][]string
+
 	// seenStuckAt is the in-memory debounce table for the Bug 342
 	// v3 proactive kernel cleanup (Pass 3 stuck-slot probe). Keyed
 	// by "<rd>/<peerName>"; value is the first wall-clock time the
@@ -1141,6 +1145,32 @@ func (r *Reconciler) removeResourceState(name string) error {
 	return r.forgetGIHistory(name)
 }
 
+// noteDroppedOptions records why the last .res rendered for a resource
+// left options out, for the apply result to carry to the replica's
+// Warning event.
+func (r *Reconciler) noteDroppedOptions(resourceName string, dropped []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.droppedOptions == nil {
+		r.droppedOptions = map[string][]string{}
+	}
+
+	r.droppedOptions[resourceName] = dropped
+}
+
+// takeDroppedOptions returns and forgets what noteDroppedOptions recorded
+// for a resource during this apply.
+func (r *Reconciler) takeDroppedOptions(resourceName string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	dropped := r.droppedOptions[resourceName]
+	delete(r.droppedOptions, resourceName)
+
+	return dropped
+}
+
 // forgetPool drops the resource from the resource→pool map so a
 // future Apply with a different pool starts clean.
 func (r *Reconciler) forgetPool(resourceName string) {
@@ -1171,6 +1201,10 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 	}
 
 	ctx = withApplyResult(ctx, res)
+
+	// Whatever path the apply ends on, the options a .res rendered on
+	// the way left out go back with the result.
+	defer func() { res.DroppedOptions = r.takeDroppedOptions(dr.GetName()) }()
 
 	diskless := isDiskless(dr.GetFlags())
 
@@ -2780,15 +2814,17 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 	autoDisk := r.autoDiskOptionsForResource(ctx, dr, devices)
 	autoVolumeDisk := r.autoDiskOptionsForVolumes(ctx, dr, devices)
 
-	body, dropped, err := buildResFileChecked(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices, autoDisk, autoVolumeDisk, r.diskOptionSchema(ctx))
+	body, dropped, err := buildResFileChecked(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices, autoDisk, autoVolumeDisk, r.optionSchemas(ctx))
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
 	}
 
 	for _, why := range dropped {
-		log.FromContext(ctx).Info("disk option left out of .res: this drbd-utils rejects it",
+		log.FromContext(ctx).Info("option left out of .res: drbdadm would refuse it",
 			"resource", dr.GetName(), "reason", why)
 	}
+
+	r.noteDroppedOptions(dr.GetName(), dropped)
 
 	// Bug 432: stamp the ownership marker every time we render
 	// `.res`. The marker survives aggressive cleanup paths that
@@ -7148,16 +7184,27 @@ func (r *Reconciler) rememberPool(resourceName, pool string) {
 // autoVolumeDisk the per-volume ones (see autoDiskOptionsForVolumes);
 // either may be nil.
 func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string, autoVolumeDisk map[int32]map[string]string) (string, error) {
-	body, _, err := buildResFileChecked(dr, localNode, localAddr, devices, autoDisk, autoVolumeDisk, nil)
+	body, _, err := buildResFileChecked(dr, localNode, localAddr, devices, autoDisk, autoVolumeDisk, resOptionSchemas{})
 
 	return body, err
 }
 
-// buildResFileChecked is buildResFile with the disk options held against
-// schema, what this node's drbd-utils accepts (see dropRejectedDiskOptions).
-// It also returns why each option it left out was left out. A nil schema
-// keeps every option.
-func buildResFileChecked(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string, autoVolumeDisk map[int32]map[string]string, schema *drbd.OptionSchema) (string, []string, error) {
+// resOptionSchemas is what this node's drbd-utils accepts in each `.res`
+// section that carries operator options. A nil schema checks nothing; the
+// disk one also judges the peer-device options, which drbdadm reads in a
+// disk section.
+type resOptionSchemas struct {
+	Net     *drbd.OptionSchema
+	Options *drbd.OptionSchema
+	Disk    *drbd.OptionSchema
+}
+
+// buildResFileChecked is buildResFile with the options held against
+// schemas, what this node's drbd-utils accepts (see dropRejectedOptions).
+// It also returns why each option it left out was left out. A key no
+// `.res` section takes is always left out (see splitDRBDOptions); a nil
+// schema keeps every option of its section.
+func buildResFileChecked(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string, autoVolumeDisk map[int32]map[string]string, schemas resOptionSchemas) (string, []string, error) {
 	opts := dr.GetDrbdOptions()
 	port, _ := strconv.Atoi(opts["port"])
 	nodeID, _ := strconv.Atoi(opts["node-id"])
@@ -7191,7 +7238,7 @@ func buildResFileChecked(dr *intent.DesiredResource, localNode, localAddr string
 	sections := splitDRBDOptions(opts)
 	mergeAutoDiskOptions(sections.Disk, autoDisk)
 	mergeAutoVolumeDiskOptions(vols, sections.Disk, autoVolumeDisk)
-	dropped := dropRejectedDiskOptions(schema, sections.Disk, vols)
+	dropped := slices.Concat(sections.Dropped, dropRejectedOptions(schemas, &sections, vols))
 
 	out, err := drbd.Build(drbd.Resource{
 		Name:        dr.GetName(),
@@ -7211,22 +7258,75 @@ func buildResFileChecked(dr *intent.DesiredResource, localNode, localAddr string
 	return out, dropped, nil
 }
 
-// diskOptionSchema is what this node's drbd-utils accepts in a disk
-// section, nil when drbdsetup could not say. nil accepts everything, so
+// optionSchemas is what this node's drbd-utils accepts in each section,
+// a nil schema where drbdsetup could not say. nil accepts everything, so
 // a satellite that cannot ask renders what it rendered before.
-func (r *Reconciler) diskOptionSchema(ctx context.Context) *drbd.OptionSchema {
+func (r *Reconciler) optionSchemas(ctx context.Context) resOptionSchemas {
 	if r.cfg.Adm == nil {
+		return resOptionSchemas{}
+	}
+
+	read := func(section string) *drbd.OptionSchema {
+		schema, err := r.cfg.Adm.OptionSchema(ctx, section)
+		if err != nil {
+			log.FromContext(ctx).Info("options rendered unchecked: drbdsetup did not describe them",
+				"section", section, "err", err.Error())
+
+			return nil
+		}
+
+		return schema
+	}
+
+	return resOptionSchemas{
+		Net:     read(drbd.SectionNet),
+		Options: read(drbd.SectionOptions),
+		Disk:    read(drbd.SectionDisk),
+	}
+}
+
+// dropRejectedOptions holds every operator section against what this
+// node's drbd-utils accepts and returns why each option it left out went:
+// the disk sections against the disk schema (dropRejectedDiskOptions), the
+// peer-device options against it too, net and the resource options block
+// against their own, and the handlers against the names drbdadm runs.
+func dropRejectedOptions(schemas resOptionSchemas, sections *drbdOptionSections, vols []drbd.Volume) []string {
+	dropped := dropRejectedDiskOptions(schemas.Disk, sections.Disk, vols)
+	dropped = append(dropped, dropRejectedSectionOptions(schemas.Disk, "peer-device", sections.PeerDevice)...)
+	dropped = append(dropped, dropRejectedSectionOptions(schemas.Net, drbd.SectionNet, sections.Net)...)
+	dropped = append(dropped, dropRejectedSectionOptions(schemas.Options, drbd.SectionOptions, sections.Resource)...)
+
+	for _, name := range slices.Sorted(maps.Keys(sections.Handlers)) {
+		if !slices.Contains(drbd.HandlerNames(), name) {
+			delete(sections.Handlers, name)
+
+			dropped = append(dropped, "handlers: "+name+" is not a handler drbdadm runs")
+		}
+	}
+
+	return dropped
+}
+
+// dropRejectedSectionOptions removes from one section's options every one
+// schema says this node's drbd-utils rejects, and returns why each went,
+// named by section. A nil schema keeps them all.
+func dropRejectedSectionOptions(schema *drbd.OptionSchema, section string, options map[string]string) []string {
+	if schema == nil {
 		return nil
 	}
 
-	schema, err := r.cfg.Adm.DiskOptionSchema(ctx)
-	if err != nil {
-		log.FromContext(ctx).Info("disk options rendered unchecked: drbdsetup did not describe them", "err", err.Error())
+	var dropped []string
 
-		return nil
+	for _, name := range slices.Sorted(maps.Keys(options)) {
+		err := schema.Check(name, options[name])
+		if err != nil {
+			delete(options, name)
+
+			dropped = append(dropped, section+": "+err.Error())
+		}
 	}
 
-	return schema
+	return dropped
 }
 
 // dropRejectedDiskOptions removes from the resource-scope disk section
@@ -7412,6 +7512,10 @@ type drbdOptionSections struct {
 	Disk       map[string]string
 	PeerDevice map[string]string
 	Handlers   map[string]string
+
+	// Dropped says why each DrbdOptions key no section takes was left
+	// out of the .res.
+	Dropped []string
 }
 
 // splitDRBDOptions partitions the satellite-received drbd_options bag
@@ -7425,8 +7529,15 @@ type drbdOptionSections struct {
 //   - `DrbdOptions/Disk/*`    → `disk { }`        at resource scope
 //   - `DrbdOptions/Handlers/*` → `handlers { }`   at resource scope
 //   - `DrbdOptions/PeerDevice/*` → `disk { }`     inside each connection
-//   - `DrbdOptions/Resource/*` (and unknown sections) → `options { }`
-//     (drbd's catch-all top-level block)
+//   - `DrbdOptions/Resource/*` → `options { }`
+//
+// A key under any other section (`DrbdOptions/AutoSnapshot/Keep`, a typo
+// of `AutoSnapshot/Keep`), or with a further `/` in its option name, is
+// left out and reported in Dropped. It used to land in options{}, where
+// drbdadm refused the whole file, so every replica of the definition
+// failed each apply until the key was deleted. LINSTOR's satellite renders
+// only those five namespaces and drops what its whitelist does not list
+// (ConfFileBuilder.checkValidDrbdOption).
 //
 // The renderer writes the keys verbatim with the
 // `DrbdOptions/<Section>/` prefix stripped — that's the form drbdadm
@@ -7463,36 +7574,50 @@ func splitDRBDOptions(opts map[string]string) drbdOptionSections {
 			continue
 		}
 
-		_, rawKey, hasSection := strings.Cut(rest, "/")
+		section, rawKey, hasSection := strings.Cut(rest, "/")
 		if !hasSection {
 			// LINSTOR-only key (no DRBD section subpath); these
 			// don't belong in the rendered .res. See doc comment.
 			continue
 		}
 
-		switch drbd.SectionFor(key) {
-		case drbd.SectionNet:
-			out.Net[rawKey] = value
-		case drbd.SectionDisk:
-			out.Disk[rawKey] = value
-		case drbd.SectionPeerDevice:
-			out.PeerDevice[rawKey] = value
-		case drbd.SectionHandlers:
-			out.Handlers[rawKey] = value
-		default:
-			// SectionOptions — drbd's catch-all top-level block.
-			// Covers `DrbdOptions/Resource/*` plus any unknown
-			// section so a future upstream key still lands
-			// somewhere sensible (matches SectionFor's fallback).
-			out.Resource[rawKey] = value
+		target := out.sectionMap(section)
+		if target == nil || strings.Contains(rawKey, "/") {
+			out.Dropped = append(out.Dropped, key+": no .res section takes it")
+
+			continue
 		}
+
+		target[rawKey] = value
 	}
 
 	// The one section-less key that does reach the .res: LINSTOR's
 	// automatic verify algorithm stands in for an unset verify-alg.
 	drbd.FillAutoVerifyAlg(out.Net, opts)
 
+	slices.Sort(out.Dropped)
+
 	return out
+}
+
+// sectionMap is the map a `DrbdOptions/<section>/` key renders into, nil
+// for a section the .res has no block for. The section is matched without
+// regard to case, as drbd.SectionFor matches it.
+func (s *drbdOptionSections) sectionMap(section string) map[string]string {
+	switch strings.ToLower(section) {
+	case "net":
+		return s.Net
+	case "disk":
+		return s.Disk
+	case "peerdevice", "peer-device":
+		return s.PeerDevice
+	case "handlers":
+		return s.Handlers
+	case "resource":
+		return s.Resource
+	default:
+		return nil
+	}
 }
 
 // mergeAutoDiskOptions folds the satellite-derived thin-aware-resync

@@ -570,6 +570,12 @@ type ResourceApplyResult struct {
 	// yet, typically because a peer's backing has not grown: the pass
 	// is to be repeated so the size applied is reported once it has.
 	GrowPending bool
+
+	// DroppedOptions says why each option the satellite left out of the
+	// resource's .res went: drbdadm would have refused the whole file
+	// over it. The c-r reconciler reports each as a Warning Event on the
+	// Resource, since the operator set it and it does not take effect.
+	DroppedOptions []string
 }
 
 // GetGrowPending reports a volume whose grow has not reached its device.

@@ -124,3 +124,27 @@ func TestAReconnectedStaleConnectionIsAWarningEventOnTheResource(t *testing.T) {
 		t.Error("no Event for a reconnected stale connection")
 	}
 }
+
+// An option the satellite left out of the .res does not take effect, so
+// each one reaches the Resource as a Warning Event naming it.
+func TestADroppedOptionIsAWarningEventOnTheResource(t *testing.T) {
+	t.Parallel()
+
+	res := &blockstoriov1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.node-a"}}
+	recorder := events.NewFakeRecorder(4)
+	r := &ResourceReconciler{Config: Config{Recorder: recorder}}
+
+	r.recordDroppedOptions(res, []*intent.ResourceApplyResult{{
+		Name: "pvc-1", Ok: true,
+		DroppedOptions: []string{"DrbdOptions/AutoSnapshot/Keep: no .res section takes it"},
+	}})
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "Warning "+droppedOptionReason) || !strings.Contains(ev, "DrbdOptions/AutoSnapshot/Keep") {
+			t.Errorf("Event = %q, want a Warning %s naming the key", ev, droppedOptionReason)
+		}
+	default:
+		t.Error("no Event for an option left out of the .res")
+	}
+}

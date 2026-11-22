@@ -42,6 +42,47 @@ func DiskSectionCommands() []string {
 	return []string{"disk-options", "new-minor", "peer-device-options"}
 }
 
+// SectionCommands are the drbdsetup commands whose xml-help together
+// describe what drbdadm accepts inside one `.res` section, the ones
+// LINSTOR's satellite builds its whitelist from
+// (WhitelistPropsReconfigurator): new-peer for net, resource-options for
+// the resource options block, and DiskSectionCommands for a disk section,
+// which also holds the peer-device options. A section xml-help does not
+// describe (handlers) has none.
+func SectionCommands(section string) []string {
+	switch section {
+	case SectionNet:
+		return []string{"new-peer"}
+	case SectionOptions:
+		return []string{"resource-options"}
+	case SectionDisk, SectionPeerDevice:
+		return DiskSectionCommands()
+	default:
+		return nil
+	}
+}
+
+// HandlerNames are the handlers a `handlers { }` section may name, the
+// list LINSTOR whitelists (WhitelistProps.overrideDrbdProperties). drbdsetup
+// has no xml-help for them: drbdadm alone runs them.
+func HandlerNames() []string {
+	return []string{
+		"after-resync-target",
+		"before-resync-target",
+		"before-resync-source",
+		"out-of-sync",
+		"quorum-lost",
+		"fence-peer",
+		"unfence-peer",
+		"initial-split-brain",
+		"local-io-error",
+		"pri-lost",
+		"pri-lost-after-sb",
+		"pri-on-incon-degr",
+		"split-brain",
+	}
+}
+
 // Option names the schema treats specially; see notInResFile and
 // valueUnchecked.
 const (
