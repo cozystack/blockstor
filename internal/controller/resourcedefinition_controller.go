@@ -1919,13 +1919,14 @@ func nodeCRDAutoplaceExcluded(n *blockstoriov1alpha1.Node) bool {
 	return err == nil && !v
 }
 
-// enqueueRDsForNode maps a Node flag-change event to every
-// ResourceDefinition in the cluster. The tiebreaker invariant is a
-// cluster-wide candidate-set decision (any RD's witness might have
-// collapsed onto, or now want to re-land on, the toggled node), so a
-// per-node restore re-evaluates all RDs. The set of RDs is small
-// relative to Resources, and the nodeDrainFlagChanged predicate gates
-// the fan-out to genuine EVICTED/LOST transitions, so this stays cheap.
+// enqueueRDsForNode maps a Node event to every ResourceDefinition in
+// the cluster. The tiebreaker invariant is a cluster-wide candidate-set
+// decision (any RD's witness might have collapsed onto, or now want to
+// re-land on, the changed node), so a per-node change re-evaluates all
+// RDs. The set of RDs is small relative to Resources, and the
+// witnessCandidacyChanged predicate gates the fan-out to a node joining
+// or going and to the fields the witness pick reads, so this stays
+// cheap.
 func (r *ResourceDefinitionReconciler) enqueueRDsForNode(ctx context.Context, _ client.Object) []reconcile.Request {
 	var rdList blockstoriov1alpha1.ResourceDefinitionList
 
