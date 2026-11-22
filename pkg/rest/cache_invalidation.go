@@ -361,19 +361,10 @@ func (s *Server) waitForSnapshotGone(
 	}
 
 	for {
-		snap, err := s.Store.Snapshots().Get(ctx, rdName, snapName)
-		if err != nil {
-			// NotFound is the converged case; a transport error means
-			// we can't probe and looping won't help.
-			return snapshotWaitGone, nil
-		}
-
-		if whileOnline && len(snap.DeleteFailures) > 0 {
-			return snapshotWaitFailed, snap.DeleteFailures
-		}
-
-		if !time.Now().Before(deadline) && (!whileOnline || !s.snapshotDrainCanProgress(ctx, &snap)) {
-			return snapshotWaitPending, nil
+		outcome, failures, done := s.probeDeletedSnapshot(ctx, rdName, snapName,
+			!time.Now().Before(deadline), whileOnline)
+		if done {
+			return outcome, failures
 		}
 
 		select {
@@ -382,6 +373,37 @@ func (s *Server) waitForSnapshotGone(
 		case <-time.After(snapshotDeleteWaitPoll):
 		}
 	}
+}
+
+// probeDeletedSnapshot reads the snapshot once for waitForSnapshotGone
+// and reports whether the wait is over, and how. spent says the budget
+// is used up.
+func (s *Server) probeDeletedSnapshot(
+	ctx context.Context, rdName, snapName string, spent, whileOnline bool,
+) (snapshotWait, []apiv1.SnapshotDeleteFailure, bool) {
+	snap, err := s.Store.Snapshots().Get(ctx, rdName, snapName)
+
+	switch {
+	case err == nil:
+		if whileOnline && len(snap.DeleteFailures) > 0 {
+			return snapshotWaitFailed, snap.DeleteFailures, true
+		}
+
+		if spent && (!whileOnline || !s.snapshotDrainCanProgress(ctx, &snap)) {
+			return snapshotWaitPending, nil, true
+		}
+	case errors.Is(err, store.ErrNotFound):
+		return snapshotWaitGone, nil, true
+	case ctx.Err() != nil:
+		// The caller went away (or the server is shutting down): the
+		// snapshot was not seen to go, so this is no success.
+		return snapshotWaitPending, nil, true
+	case spent:
+		// A read that keeps failing proves nothing either way.
+		return snapshotWaitPending, nil, true
+	}
+
+	return snapshotWaitPending, nil, false
 }
 
 // snapshotDrainCanProgress reports whether every node snap lists is

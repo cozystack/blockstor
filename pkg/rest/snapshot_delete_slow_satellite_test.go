@@ -19,6 +19,8 @@ limitations under the License.
 package rest
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -26,6 +28,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // The budget the tests below give the snapshot delete: short, so a drain
@@ -216,5 +219,57 @@ func TestSnapshotDeleteAnswersASatelliteFailure(t *testing.T) {
 	if len(rcs) != 1 || rcs[0].RetCode&apiCallRcError != apiCallRcError ||
 		rcs[0].ObjRefs[objRefNode] != "n2" || !strings.Contains(rcs[0].Cause, "in use") {
 		t.Errorf("envelope: got %s, want one error for n2 carrying its message", raw)
+	}
+}
+
+// errSnapshotStoreUnreachable stands for a read that cannot reach the store.
+var errSnapshotStoreUnreachable = errors.New("apiserver unreachable")
+
+// failingSnapshots answers every Get with err.
+type failingSnapshots struct {
+	store.SnapshotStore
+
+	err error
+}
+
+func (f failingSnapshots) Get(context.Context, string, string) (apiv1.Snapshot, error) {
+	return apiv1.Snapshot{}, f.err
+}
+
+type failingSnapshotStore struct {
+	store.Store
+
+	snapshots failingSnapshots
+}
+
+func (f failingSnapshotStore) Snapshots() store.SnapshotStore { return f.snapshots }
+
+// TestSnapshotDrainIsNotProvedByAFailedRead: only a NotFound shows the
+// snapshot went. A read cut short by the request ending (server shutdown
+// while the client is still connected) or one that keeps failing must
+// not let the delete answer 200 "snapshot deleted" with the snapshot
+// still there.
+func TestSnapshotDrainIsNotProvedByAFailedRead(t *testing.T) {
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	for name, tc := range map[string]struct {
+		ctx context.Context //nolint:containedctx // table input
+		err error
+	}{
+		"canceled request": {ctx: canceled, err: context.Canceled},
+		"failing read":     {ctx: t.Context(), err: errSnapshotStoreUnreachable},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := &Server{
+				Store:                failingSnapshotStore{Store: store.NewInMemory(), snapshots: failingSnapshots{err: tc.err}},
+				snapshotDeleteBudget: 100 * time.Millisecond,
+			}
+
+			outcome, _ := srv.waitForSnapshotDrained(tc.ctx, "rd1", "snap1")
+			if outcome == snapshotWaitGone {
+				t.Errorf("a %s was taken for the snapshot being gone", name)
+			}
+		})
 	}
 }
