@@ -75,6 +75,11 @@ type WatchedReader struct {
 	Options cache.Options
 	Direct  client.Reader
 
+	// ConfigReader, when set, serves the ControllerConfig in place of a
+	// watch of its own: the manager's cache, which the REST server's
+	// client already watches the ControllerConfig through.
+	ConfigReader client.Reader
+
 	// Namespace is where the watched Secrets live.
 	Namespace string
 
@@ -180,6 +185,10 @@ func (w *WatchedReader) Start(ctx context.Context) error {
 
 // Get reads a watched object from its watch, everything else from Direct.
 func (w *WatchedReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*blockstoriov1alpha1.ControllerConfig); ok && w.ConfigReader != nil {
+		return w.ConfigReader.Get(ctx, key, obj, opts...) //nolint:wrapcheck // the reader's error, as it is
+	}
+
 	owatch := w.watchFor(ctx, key, obj)
 	if owatch != nil {
 		if synced, _ := owatch.state(); synced {
@@ -361,7 +370,9 @@ func (w *WatchedReader) watchErrorHandler(owatch *objectWatch, wkey watchKey) to
 }
 
 // AddWatchedReader adds to mgr a WatchedReader over namespace, reading past
-// its watches through mgr's API reader.
+// its watches through mgr's API reader. The ControllerConfig is read from
+// mgr's cache: the REST server's client, mgr.GetClient(), reads it from
+// there too, so a watch of its own would be a second one.
 func AddWatchedReader(mgr manager.Manager, namespace string) (*WatchedReader, error) {
 	watched := &WatchedReader{
 		Config: mgr.GetConfig(),
@@ -370,8 +381,9 @@ func AddWatchedReader(mgr manager.Manager, namespace string) (*WatchedReader, er
 			Scheme:     mgr.GetScheme(),
 			Mapper:     mgr.GetRESTMapper(),
 		},
-		Direct:    mgr.GetAPIReader(),
-		Namespace: namespace,
+		Direct:       mgr.GetAPIReader(),
+		ConfigReader: mgr.GetCache(),
+		Namespace:    namespace,
 	}
 
 	err := mgr.Add(watched)

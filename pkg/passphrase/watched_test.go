@@ -42,7 +42,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/keyring"
@@ -558,5 +560,39 @@ func TestWatchedReaderStartsAWatchWithoutHoldingUpOtherReads(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		unstall()
 		t.Fatal("the ControllerConfig read waited for the keyring watch to start")
+	}
+}
+
+// The ControllerConfig is read from the manager's cache, which the REST
+// server's client watches it through already, not from a second watch.
+func TestWatchedReaderReadsTheControllerConfigFromTheManagersCache(t *testing.T) {
+	t.Parallel()
+
+	mgr, err := manager.New(&rest.Config{Host: "https://127.0.0.1:1"}, manager.Options{Scheme: scheme(t)})
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+
+	reader, err := passphrase.AddWatchedReader(mgr, ns)
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	if reader.ConfigReader != mgr.GetCache() {
+		t.Error("the ControllerConfig is not read from the manager's cache")
+	}
+
+	reader.Direct = fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(refConfig("direct", "")).Build()
+	reader.ConfigReader = fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(refConfig("cached", "")).Build()
+
+	var cfg blockstoriov1alpha1.ControllerConfig
+
+	err = reader.Get(t.Context(), client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &cfg)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if got := cfg.Spec.PassphraseSecretRef.Name; got != "cached" {
+		t.Errorf("the ControllerConfig came from %q, want the ConfigReader", got)
 	}
 }
