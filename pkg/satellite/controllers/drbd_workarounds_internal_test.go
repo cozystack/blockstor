@@ -557,6 +557,10 @@ func TestForcedIOFailuresHintReadsTheStatus(t *testing.T) {
 	}
 }
 
+// autoclearMark at the end of a fakeSysBlock backing file marks the loop
+// device to go away on its last close.
+const autoclearMark = "+autoclear"
+
 // fakeSysBlock lays out /sys/block with a loop device per entry of
 // backing (name → backing_file content); an empty content leaves the
 // loop device unattached (no loop/ directory).
@@ -580,7 +584,19 @@ func fakeSysBlock(t *testing.T, backing map[string]string) string {
 			continue
 		}
 
+		autoclearFlag := "0"
+
+		file, marked := strings.CutSuffix(file, autoclearMark)
+		if marked {
+			autoclearFlag = "1"
+		}
+
 		err = os.WriteFile(filepath.Join(dir, "backing_file"), []byte(file+"\n"), 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = os.WriteFile(filepath.Join(dir, "autoclear"), []byte(autoclearFlag+"\n"), 0o600)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -591,7 +607,8 @@ func fakeSysBlock(t *testing.T, backing map[string]string) string {
 
 // A loop device whose backing file reads "/" or "/ (deleted)" is
 // detached, and the action recorded on this satellite's Node; loop
-// devices with a real backing file, and unattached ones, are left alone.
+// devices with a real backing file, unattached ones, and ones a detach
+// already marked to go away on their last close are left alone.
 // No kernel status is read for it.
 func TestStaleLoopDevicesAreDetached(t *testing.T) {
 	t.Parallel()
@@ -616,6 +633,8 @@ func TestStaleLoopDevicesAreDetached(t *testing.T) {
 			"loop2": "/var/lib/blockstor/pool/pvc-a_00000.img",
 			"loop3": "",
 			"loop4": "/var/lib/kubelet/plugins/kubernetes.io/csi/volumeDevices/pvc-b/dev/0b5c (deleted)",
+			// Detached on an earlier pass while still open.
+			"loop5": "/" + autoclearMark,
 		}),
 	}
 

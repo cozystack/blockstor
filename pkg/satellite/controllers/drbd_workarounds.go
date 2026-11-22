@@ -559,15 +559,21 @@ func (w *DRBDWorkaroundsRunnable) bringUpOwed(ctx context.Context, logger logr.L
 // that mount is gone (https://github.com/util-linux/util-linux/issues/4166).
 // A backing file that still exists is never "/", so such a loop device is
 // detached; the detach of one still open only marks it to go away on its
-// last close. Same check as the plunger, which reads the same sysfs file
-// through `losetup --json`; reading sysfs directly costs no command on a
-// node without such a loop device.
+// last close (autoclear). A loop device already marked so is skipped: a
+// detach adds nothing to it, and it would otherwise read "/" and be
+// detached and reported again on every pass until its holder lets go.
+// Same check as the plunger, which reads the same sysfs file through
+// `losetup --json`; reading sysfs directly costs no command on a node
+// without such a loop device. Like the plunger, it detaches any such
+// loop device on the node, whether or not a DRBD device sits on it: a
+// loop device whose backing file is gone serves nothing either way.
 
 // defaultSysBlock is where sysfs lists the block devices.
 const defaultSysBlock = "/sys/block"
 
 // staleLoopDevices lists the loop devices under sysBlock whose backing
-// file reads "/" or "/ (deleted)".
+// file reads "/" or "/ (deleted)" and that are not yet marked to detach
+// on their last close.
 func staleLoopDevices(sysBlock string) []string {
 	files, err := filepath.Glob(filepath.Join(sysBlock, "loop*", "loop", "backing_file"))
 	if err != nil {
@@ -585,11 +591,21 @@ func staleLoopDevices(sysBlock string) []string {
 
 		switch strings.TrimRight(string(raw), "\n") {
 		case "/", "/ (deleted)":
-			stale = append(stale, "/dev/"+filepath.Base(filepath.Dir(filepath.Dir(file))))
+			if !autoclear(filepath.Dir(file)) {
+				stale = append(stale, "/dev/"+filepath.Base(filepath.Dir(filepath.Dir(file))))
+			}
 		}
 	}
 
 	return stale
+}
+
+// autoclear reports whether the loop device whose sysfs loop directory is
+// dir goes away on its last close, as a detach of an open one leaves it.
+func autoclear(dir string) bool {
+	raw, err := os.ReadFile(filepath.Join(dir, "autoclear"))
+
+	return err == nil && strings.TrimSpace(string(raw)) == "1"
 }
 
 // detachStaleLoopDevices detaches every loop device whose backing file is
