@@ -32,6 +32,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/pkg/errors"
@@ -182,7 +183,7 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if refuseServerOwnedGroupProps(w, rg.Name, rg.Props, rg.OverrideProps) {
+	if refuseRGCreateProps(w, &rg) {
 		return
 	}
 
@@ -225,6 +226,30 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource group created: " + rg.Name,
 	}})
+}
+
+// refuseRGCreateProps runs the refusals an `rg c` body's props meet: the
+// props blockstor owns, and LINSTOR's whitelist, which judges a group's
+// props as a definition's and its volume groups' as a volume definition's,
+// since that is what they are copied onto. True means the refusal has been
+// written.
+func refuseRGCreateProps(w http.ResponseWriter, rg *apiv1.ResourceGroup) bool {
+	if refuseServerOwnedGroupProps(w, rg.Name, rg.Props, rg.OverrideProps) {
+		return true
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, rg.Props) ||
+		refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, rg.OverrideProps) {
+		return true
+	}
+
+	for i := range rg.VolumeGroups {
+		if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, rg.VolumeGroups[i].Props) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
@@ -642,6 +667,11 @@ func (s *Server) refuseRGUpdate(
 	}
 
 	if refuseServerOwnedGroupProps(w, name, patch.Props, patch.OverrideProps) {
+		return true
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.Props) ||
+		refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.OverrideProps) {
 		return true
 	}
 

@@ -29,6 +29,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/passphrase"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -445,6 +446,10 @@ func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, bo
 	if nameErr != nil {
 		writeError(w, http.StatusBadRequest, nameErr.Error())
 
+		return false
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, rd.Props) {
 		return false
 	}
 
@@ -1103,6 +1108,10 @@ func (s *Server) refuseOwnedPropEdits(
 	// with it, and a creator's rollback then reaped a definition a retry had
 	// already answered for. The clone door refuses the same edits.
 	if refuseServerOwnedModify(w, name, patch) {
+		return true
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.OverrideProps) {
 		return true
 	}
 

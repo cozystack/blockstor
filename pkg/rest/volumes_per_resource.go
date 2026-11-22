@@ -23,6 +23,7 @@ import (
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 )
 
 // registerVolumesPerResource wires the per-Resource Volume routes
@@ -155,6 +156,10 @@ func (s *Server) handleVolumesPerResourceModify(w http.ResponseWriter, r *http.R
 	var patch apiv1.GenericPropsModify
 
 	if !decodeJSON(w, r, &patch) {
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.Volume, patch.OverrideProps) {
 		return
 	}
 

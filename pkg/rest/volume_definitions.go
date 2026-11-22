@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
@@ -338,6 +339,10 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	if sizeErr != nil {
 		writeVDSizeRejection(w, rd, vd.VolumeNumber, vd.SizeKib, sizeErr)
 
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, vd.Props) {
 		return
 	}
 
@@ -715,6 +720,11 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 	previousSizeKib := existing.SizeKib
 
 	if rejectVDPatchSize(w, r, &patch, rd, vn, previousSizeKib) {
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, patch.OverrideProps) ||
+		refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, patch.Props) {
 		return
 	}
 
