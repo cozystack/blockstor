@@ -158,10 +158,16 @@ type DesiredResource struct {
 // DesiredResource. The satellite's `.res` renderer turns each entry
 // into one `connection { … }` block carrying one `path { … }`
 // sub-block per Path.
+//
+// DrbdOptions carries the resource connection's own DRBD props, keyed
+// as the client set them (`DrbdOptions/Net/allow-two-primaries`). They
+// override the resource-wide options for this one connection only; the
+// renderer emits the Net ones as the connection's `net { … }` block.
 type DesiredConnection struct {
-	NodeA string
-	NodeB string
-	Paths []DesiredConnectionPath
+	NodeA       string
+	NodeB       string
+	Paths       []DesiredConnectionPath
+	DrbdOptions map[string]string
 }
 
 // DesiredConnectionPath is one path inside a DesiredConnection.
