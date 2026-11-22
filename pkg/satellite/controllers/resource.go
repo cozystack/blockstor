@@ -151,10 +151,10 @@ type ResourceReconciler struct {
 
 	Config Config
 
-	// recheck runs the periodic re-checks one at a time. SetupWithManager
-	// sets it and gates Reconcile through it; a test calling Reconcile
-	// directly goes around it.
-	recheck *recheckGate
+	// passes counts the passes by reason. SetupWithManager sets it and
+	// counts Reconcile through it; a test calling Reconcile directly goes
+	// around it.
+	passes *passCounter
 
 	// bringUp ranks the first pass of every local Resource in this
 	// process ahead of every other pass (bringUpQueue). SetupWithManager
@@ -174,12 +174,11 @@ type ResourceReconciler struct {
 // every live Resource so kube-apiserver waits for our tear-down
 // before allowing the object to disappear.
 //
-// Only a converged pass's periodic re-check keeps low priority. Every
-// other retry (a failed apply, an error, a wait on the allocator) is
-// pinned back to normal priority: controller-runtime otherwise keeps
-// the priority the item was dequeued with, so a re-check that found
-// drift would repair it at low priority, behind every other replica's
-// idle re-check.
+// Every retry (a failed apply, an error, a wait on the allocator) is
+// pinned to normal priority: controller-runtime otherwise keeps the
+// priority the item was dequeued with, so a replica first seen in the
+// initial list, which controller-runtime queues at low priority, would
+// be retried behind every other replica of a cold start.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	result, err := r.reconcileResource(ctx, req)
 	if result.Priority == nil {
@@ -207,49 +206,6 @@ const applyFailureRequeue = 5 * time.Second
 // faster than the user-visible auto-place latency budget while
 // still giving the apiserver time to commit the Status patch.
 const peerAllocationRequeue = 2 * time.Second
-
-// activeDRBDRequeue is the periodic self-evaluation requeue applied
-// after a successful Apply on a DRBD-backed resource (Phase 11.7
-// safety net). The primary-watch predicate filters out pure
-// observer Status noise and the observer-trigger channel only fires
-// on lifecycle changes, so the reconciler no longer wakes for every
-// kernel statistics tick. This RequeueAfter is the belt-and-braces
-// re-eval that catches the rare case where the events2 stream missed
-// a frame (drbdsetup restart, kernel events2 stall) — without it the
-// reconciler could go arbitrarily long without re-checking a
-// long-lived active DRBD resource against its desired state.
-//
-// 10s is chosen to be:
-//   - long enough that steady-state idle resources don't generate
-//     pointless apiserver round-trips;
-//   - short enough that any divergence between desired and observed
-//     converges within a single user-visible scenario tick (e2e
-//     tests poll at 1-2 s and budget ~30 s per assertion).
-//
-// It is the earliest a replica is re-checked, not a promise. The
-// re-check gate runs the re-checks one at a time, cools the slot down
-// after each, and holds them while an event pass runs, so on a node
-// with N replicas whose pass takes T the period is about
-// max(10s, N*(1+recheckCooldown)*T): with a hundred replicas at 0.1 s
-// a pass, about 20 s.
-const activeDRBDRequeue = 10 * time.Second
-
-// lowPriority is the queue priority of the periodic re-check, the one
-// controller-runtime gives events from the initial list.
-func lowPriority() *int {
-	priority := handler.LowPriority
-
-	return &priority
-}
-
-// lowPriorityRecheck is the result of a converged DRBD pass: the
-// periodic re-check, marked for the re-check gate, at low priority.
-func lowPriorityRecheck(ctx context.Context) ctrl.Result {
-	result := schedulePeriodicRecheck(ctx)
-	result.Priority = lowPriority()
-
-	return result
-}
 
 // normalPriority is the queue priority of a real event, and of every
 // retry of a pass that did not converge.
@@ -292,13 +248,15 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
 //
-// Every way an event reaches the queue goes through the re-check gate:
-// For and the kernel trigger through r.recheck.marker, every Watches
-// map function through r.recheck.mapFunc. A Watches added without it
-// still works, but the gate takes its passes for re-checks of replicas
-// that have one due and holds them for the re-check slot.
+// Every way an event reaches the queue is counted for the pass report:
+// For, the kernel trigger and the drift check through r.passes.marker,
+// every Watches map function through r.passes.mapFunc. A Watches added
+// without it still works, but its passes are counted as retries.
+//
+// A converged replica gets no periodic pass. The drift check (see
+// driftCheckInterval) passes the replicas drbdadm lists as adjustable.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.recheck = newRecheckGate()
+	r.passes = newPassCounter()
 
 	if r.bringUp == nil {
 		r.bringUp = newBringUpTracker()
@@ -310,16 +268,16 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				predicate.And(
 					nodeNamePredicate(r.Config.NodeName),
 					primaryWatchPredicate(),
-					r.recheck.marker(passResource),
+					r.passes.marker(passResource),
 				),
 			)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passPeer, r.enqueueLocalSiblings)),
+			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passPeer, r.enqueueLocalSiblings)),
 			builder.WithPredicates(siblingWatchPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
-			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passDefinition, r.enqueueResourcesForRD))).
+			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRD))).
 		Watches(&blockstoriov1alpha1.ResourceGroup{},
-			handler.EnqueueRequestsFromMapFunc(r.recheck.mapFunc(passDefinition, r.enqueueResourcesForRG))).
+			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRG))).
 		Named("satellite-resource").
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.Config.resourceWorkers(),
@@ -337,19 +295,41 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Config.ReconcileTrigger != nil {
 		bldr = bldr.WatchesRawSource(
 			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
-				source.WithPredicates[client.Object, reconcile.Request](r.recheck.marker(passKernel))),
+				source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passKernel))),
 		)
 	}
 
-	err := bldr.Complete(r.recheck.gate(r))
+	var drift *driftCheck
+
+	if r.Config.Exec != nil {
+		trigger := make(chan event.GenericEvent, reconcileTriggerBuffer)
+		drift = &driftCheck{
+			reader: mgr.GetClient(), exec: r.Config.Exec, node: r.Config.NodeName,
+			out: trigger, interval: r.Config.DriftCheckInterval,
+		}
+		bldr = bldr.WatchesRawSource(
+			source.Channel(trigger, &handler.EnqueueRequestForObject{},
+				source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passDrift))),
+		)
+	}
+
+	err := bldr.Complete(r.passes.counted(r))
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
 	}
 
-	err = mgr.Add(manager.RunnableFunc(r.recheck.reportEvery(passReportInterval,
-		mgr.GetLogger().WithName("satellite-resource"))))
+	logger := mgr.GetLogger().WithName("satellite-resource")
+
+	err = mgr.Add(manager.RunnableFunc(r.passes.reportEvery(passReportInterval, logger)))
 	if err != nil {
 		return errors.Wrap(err, "register resource pass report")
+	}
+
+	if drift != nil {
+		err = mgr.Add(manager.RunnableFunc(drift.run(logger.WithName("drift-check"))))
+		if err != nil {
+			return errors.Wrap(err, "register drift check")
+		}
 	}
 
 	return nil
@@ -734,34 +714,30 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
+	retry, retryAsked := r.Config.Apply.TakeRetry(desired.GetName())
+
 	outcome := r.afterApply(ctx, res, &rd, results, logger)
 
 	if requeue := r.applyRetryAfter(res.Name, results, outcome); requeue > 0 {
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
+	// A stamp that failed is retried the way a failed apply is: no
+	// periodic pass comes back for a device path the CSI node is
+	// waiting on, or for the volume-numbers record a later delete
+	// needs.
+	if outcome.stampFailed {
+		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
+	}
+
 	r.recordRecovery(res, r.retries.reset(res.Name), logger)
 
-	// Phase 11.7 safety net: schedule a periodic re-eval on
-	// active-DRBD resources. The primary-watch predicate drops
-	// pure observer Status noise and the observer-trigger channel
-	// only fires on lifecycle changes; combined, the reconciler no
-	// longer wakes on every kernel statistics tick. Without a
-	// belt-and-braces requeue, a missed events2 frame (drbdsetup
-	// restart, kernel stall) could leave the resource un-re-eval'd
-	// for arbitrarily long. Only fires on DRBD-stack RDs — pure
-	// STORAGE-only RDs have no kernel-state to drift against, so
-	// keeping them quiet preserves the predicate's no-op-on-idle
-	// property.
-	//
-	// The re-check runs at low priority. With one worker every
-	// replica's re-check otherwise competes first-come with new and
-	// changed Resources, and on a node holding a hundred replicas a
-	// new one waits minutes behind re-checks that find nothing to do.
-	// LINSTOR's satellite re-dispatches only resources with a pending
-	// change outside a full sync (DeviceManagerImpl.devMgrLoop).
-	if rdNeedsDRBD(&rd) {
-		return lowPriorityRecheck(ctx), nil
+	// A converged replica waits for its next event, the way LINSTOR's
+	// satellite dispatches only resources with a pending change. The
+	// one exception is work this pass put off for a while, a dwell
+	// window or a throttle, that no event is bound to bring back.
+	if retryAsked {
+		return ctrl.Result{RequeueAfter: retry}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -783,7 +759,7 @@ func (r *ResourceReconciler) afterApply(
 	anyFailed, waiting := r.recordPerResourceFailures(res, results, logger)
 	outcome := applyOutcome{failed: anyFailed, waiting: waiting}
 
-	r.stampPostApply(ctx, res, rd, results, outcome, logger)
+	outcome.stampFailed = r.stampPostApply(ctx, res, rd, results, outcome, logger)
 
 	if anyFailed {
 		r.recheckQuorumAfterFailedApply(ctx, res, rd, logger)
@@ -804,10 +780,10 @@ func (r *ResourceReconciler) afterApply(
 				"volume definition delete is waiting for this replica: %s", err.Error())
 		}
 
-		return applyOutcome{failed: true}
+		return applyOutcome{failed: true, stampFailed: outcome.stampFailed}
 	}
 
-	return applyOutcome{}
+	return applyOutcome{stampFailed: outcome.stampFailed}
 }
 
 // volumeDeleteFailedReason is the Event reason for a replica that could not
@@ -1206,15 +1182,20 @@ func eventNote(note string) string {
 // purge (Bug 355 followup), the Bug-107 volume-numbers annotation,
 // and the Bug-39 toggle-disk retry counter. Each helper is
 // independently fallible — we log and move on so a transient
-// apiserver hiccup on one stamp doesn't suppress the others.
-func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, outcome applyOutcome, logger logr.Logger) {
+// apiserver hiccup on one stamp doesn't suppress the others. It
+// reports whether any of them failed, so the pass asks for another.
+func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, outcome applyOutcome, logger logr.Logger) bool {
 	// Stamp per-volume DevicePath into Status.Volumes so
 	// linstor-csi / any consumer that reads the CRD sees the
 	// /dev path the satellite materialised. Done even when one
 	// volume's apply failed: a partial success is still useful
 	// to surface (volumes that did apply have a real device).
+	failed := false
+
 	err := r.stampVolumeStatus(ctx, res, results)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "stamp Status.Volumes")
 	}
 
@@ -1236,6 +1217,8 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// volumes and was reverted.
 	err = r.purgeStaleVolumeStatus(ctx, res, rd)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "purge stale Status.Volumes")
 	}
 
@@ -1248,6 +1231,8 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// the backing .img / ZVOL / LV leaks forever.
 	err = r.stampVolumeNumbersAnnotation(ctx, res, rd)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "stamp volume-numbers annotation")
 	}
 
@@ -1261,21 +1246,30 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	if !outcome.waiting {
 		err = r.recordToggleDiskOutcome(ctx, res, !outcome.failed)
 		if err != nil {
+			failed = true
+
 			logger.Error(err, "record toggle-disk outcome")
 		}
 	}
 
+	// A record left behind would end a resize wait on an error that
+	// is gone, or hide one, and no periodic pass rewrites it.
 	err = r.recordApplyFailure(ctx, res, rd, results)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "record apply failure")
 	}
+
+	return failed
 }
 
 // applyOutcome is how an apply pass ended: failed when a result came
 // back not Ok, and waiting when every such result only waits for the
-// controller to stamp the replica.
+// controller to stamp the replica. stampFailed is set when a status
+// stamp after the apply failed.
 type applyOutcome struct {
-	failed, waiting bool
+	failed, waiting, stampFailed bool
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the

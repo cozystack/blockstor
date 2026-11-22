@@ -19,6 +19,8 @@ limitations under the License.
 package controllers
 
 import (
+	"time"
+
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -142,6 +144,11 @@ type Config struct {
 	// ResourceWorkers is how many local Resources the satellite applies
 	// at once. Zero takes DefaultResourceWorkers.
 	ResourceWorkers int
+
+	// DriftCheckInterval is how often the satellite asks drbdadm which
+	// resources the kernel no longer runs as configured; zero means
+	// driftCheckInterval.
+	DriftCheckInterval time.Duration
 }
 
 // DefaultResourceWorkers is how many local Resources the satellite applies

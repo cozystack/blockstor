@@ -87,12 +87,18 @@ func TestNewResourceIsNotQueuedBehindIdleReplicas(t *testing.T) {
 		// idle passes run before it, not in wall time, so a loaded
 		// runner slows both sides alike.
 		budgetPasses = 3
+		// formerRecheck is the period at which every converged
+		// replica used to ask for a pass. The satellite asks for none
+		// now; the test waits it out so a periodic pass that came back
+		// would fill the queue again.
+		formerRecheck = 10 * time.Second
 	)
 
 	// Idle replicas take idle*perPass to go round, longer than the
-	// re-check interval: the queue is saturated by re-checks alone.
-	if idle*perPass <= activeDRBDRequeue {
-		t.Fatalf("test setup: %d replicas x %v does not saturate the %v re-check", idle, perPass, activeDRBDRequeue)
+	// former re-check interval: a periodic pass alone would saturate
+	// the queue.
+	if idle*perPass <= formerRecheck {
+		t.Fatalf("test setup: %d replicas x %v does not saturate the %v re-check", idle, perPass, formerRecheck)
 	}
 
 	cli, mgr := startSatelliteEnvtest(t)
@@ -169,9 +175,10 @@ func TestNewResourceIsNotQueuedBehindIdleReplicas(t *testing.T) {
 
 	wg.Go(func() { churnPeerStatus(churnCtx, cli, peers) })
 
-	// Let the re-checks come due: from here on the idle replicas alone
-	// keep the queue full.
-	time.Sleep(activeDRBDRequeue)
+	// Wait as long as a periodic re-check took to come due: were one
+	// to come back, from here on the idle replicas alone would keep the
+	// queue full.
+	time.Sleep(formerRecheck)
 
 	createDRBDDefinition(t, cli, "pvc-new")
 
