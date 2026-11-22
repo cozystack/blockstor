@@ -371,6 +371,13 @@ type Reconciler struct {
 	// for the residual CRD-status-vs-on-disk window. Process-memory
 	// only; a restart resets the counter (at worst a few extra requeues).
 	restoreSnapshotMissingTries map[string]int
+
+	// failedDRBDApply holds the resources whose last DRBD apply failed,
+	// so tearDownReidentifiedPeers reads the kernel on the next pass even
+	// when the .res already names every peer under its current node-id.
+	// Process memory only: after a restart the first failing pass sets it
+	// again.
+	failedDRBDApply map[string]bool
 }
 
 // recoveryPromoteThrottle bounds how often a single resource may fire
@@ -424,6 +431,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
+		failedDRBDApply:             map[string]bool{},
 	}
 }
 
@@ -1026,6 +1034,8 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 	withDRBD := r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack())
 	if withDRBD {
 		err := r.applyDRBD(ctx, dr, diskless, devices, resized, cloned)
+		r.recordDRBDApply(dr.GetName(), err)
+
 		if err != nil {
 			res.Ok = false
 			res.Message = err.Error()
@@ -2086,10 +2096,14 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 // decision to the next pass.
 //
 // The kernel is read only when the .res last rendered does not already
-// name every peer under its node-id, so a steady resource costs no extra
-// call.
+// name every peer under its node-id, or when the last DRBD apply of the
+// resource failed, so a steady resource costs no extra call. The second
+// condition keeps the check alive once the .res has been rewritten with
+// the new node-id by a pass that could not read the kernel, or by an
+// older satellite before an upgrade: the adjust then keeps failing on
+// the old connection while the .res already looks current.
 func (r *Reconciler) tearDownReidentifiedPeers(ctx context.Context, dr *intent.DesiredResource, resPath string, devices map[int32]string) error {
-	if !peerIdentitiesChanged(resPath, dr) {
+	if !peerIdentitiesChanged(resPath, dr) && !r.drbdApplyFailed(dr.GetName()) {
 		return nil
 	}
 
@@ -2150,6 +2164,29 @@ func (r *Reconciler) dropOldConnection(ctx context.Context, resource string, nod
 	}
 
 	return nil
+}
+
+// drbdApplyFailed reports whether the last DRBD apply of resource on
+// this satellite failed.
+func (r *Reconciler) drbdApplyFailed(resource string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.failedDRBDApply[resource]
+}
+
+// recordDRBDApply remembers whether the DRBD apply of resource failed.
+func (r *Reconciler) recordDRBDApply(resource string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err != nil {
+		r.failedDRBDApply[resource] = true
+
+		return
+	}
+
+	delete(r.failedDRBDApply, resource)
 }
 
 // peerIdentitiesChanged reports a peer the .res at resPath does not

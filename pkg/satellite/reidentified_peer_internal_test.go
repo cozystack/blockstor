@@ -33,6 +33,7 @@ import (
 )
 
 var (
+	errNameExists        = errors.New("(174) name already exists")
 	errUnknownConnection = errors.New("unknown connection")
 	errForgetPeer        = errors.New("forget-peer failed")
 )
@@ -183,6 +184,50 @@ func TestSteadyPeersReadNoKernelState(t *testing.T) {
 
 	if calls := fx.CommandLines(); len(calls) != 0 {
 		t.Errorf("want no command for unchanged peers; got %v", calls)
+	}
+}
+
+// A pass that could not read the kernel, or an older satellite before an
+// upgrade, may already have rewritten the .res with the peer's new
+// node-id while the kernel still holds the old connection. The .res then
+// looks current and the adjust keeps failing on "name already exists";
+// the failed apply must reopen the kernel check on the next pass.
+func TestFailedApplyReopensTheReidentifiedPeerCheck(t *testing.T) {
+	t.Parallel()
+
+	rec, fx := reidReconciler(t)
+
+	body := "resource pvc-reid {\n  on n1 {\n    node-id 0;\n  }\n  on n2 {\n    node-id 3;\n  }\n}\n"
+	if err := os.WriteFile(filepath.Join(rec.cfg.StateDir, "pvc-reid.res"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write .res: %v", err)
+	}
+
+	fx.ExpectSequence("drbdadm adjust pvc-reid", storage.FakeResponse{Err: errNameExists})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{reidentifiedDiskless()})
+	if err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+
+	if len(results) != 1 || results[0].Ok {
+		t.Fatalf("first Apply must report the failed adjust; got %+v", results)
+	}
+
+	if slices.Contains(fx.CommandLines(), "drbdsetup del-peer pvc-reid 1") {
+		t.Fatalf("a .res naming n2 under its new node-id must not read the kernel on a clean pass; got %v", fx.CommandLines())
+	}
+
+	if _, err := rec.Apply(t.Context(), []*intent.DesiredResource{reidentifiedDiskless()}); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	del := slices.Index(calls, "drbdsetup del-peer pvc-reid 1")
+	adjust := slices.IndexFunc(calls[max(del, 0):], func(c string) bool { return strings.HasPrefix(c, "drbdadm adjust") })
+
+	if del < 0 || adjust < 0 {
+		t.Fatalf("after a failed apply, want del-peer of node-id 1 before the next adjust; got %v", calls)
 	}
 }
 
