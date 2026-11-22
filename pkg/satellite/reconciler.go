@@ -942,7 +942,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		// sweeper's ownership marker — must be removed AFTER the
 		// kernel slot is gone so a concurrent sweeper tick sees a
 		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned"} {
+		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", bornSoloSuffix} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{
@@ -2902,13 +2902,29 @@ func (r *Reconciler) maybePromoteSelfHeals(ctx context.Context, dr *intent.Desir
 //     UpToDate and a PEER to be Inconsistent — the inverse of the solo
 //     wedge (local Inconsistent, zero peers).
 //
-// NeedsSoloPromote reads live kernel state (zero connections + diskful
-// local below UpToDate + not already Primary), so it is data-safe: with
-// no peer there is nothing to diverge from, and the operator's explicit
-// toggle to diskful IS the instruction to make this the authoritative
-// copy. runAutoPromote (primary --force → optional mkfs → secondary)
-// flips the lone slot Inconsistent → UpToDate. The predicate stops
-// holding once that happens, so the self-heal is self-limiting.
+// Zero connections alone does not make a replica the only copy: a
+// replica syncing from a peer loses its connections the moment that
+// peer is deleted, and is then Inconsistent precisely because the data
+// lives elsewhere. So the promote is held to the case where no other
+// copy can exist, the closest blockstor gets to LINSTOR, which forces
+// primary only on the replica it designates for a new definition's
+// initial sync. All of these must hold:
+//
+//   - no desired peer, no diskful replica on any other node in any
+//     state (deactivated, being deleted, unallocated), no peer known to
+//     hold data (soloByDesire);
+//   - neither the replica nor its definition is being deleted;
+//   - this satellite created the replica's metadata while all of the
+//     above already held, and no peer has appeared since (bornSolo);
+//   - the kernel agrees: NeedsSoloPromote sees zero connections, a
+//     diskful local below UpToDate and no Primary.
+//
+// For the toggled lone replica the operator's explicit toggle to
+// diskful IS the instruction to make this the authoritative copy, and
+// no other copy exists to diverge from. runAutoPromote (primary --force
+// → optional mkfs → secondary) flips the lone slot Inconsistent →
+// UpToDate. The predicate stops holding once that happens, so the
+// self-heal is self-limiting.
 //
 // Throttled via recoveryPromoteDue (shared with the Bug 366 path): the
 // promote churns kernel state and re-triggers this reconcile; firing on
@@ -2920,7 +2936,29 @@ func (r *Reconciler) maybeSoloPromote(ctx context.Context, dr *intent.DesiredRes
 		return nil
 	}
 
-	if len(dr.GetPeerNames()) != 0 {
+	if !soloByDesire(dr) {
+		// A replica that has, or had while below UpToDate, a peer that
+		// may hold newer data is not the only copy, however few
+		// connections it has right now. Forget that it was born alone.
+		r.forgetSoloBirth(dr.GetName())
+
+		return nil
+	}
+
+	// LINSTOR forces primary only on the replica it designated for the
+	// initial sync of a brand-new definition, and never on one it is
+	// deleting. Losing every peer to a delete is the intended end state
+	// of that delete, not a wedge to repair.
+	if dr.GetDeleting() {
+		return nil
+	}
+
+	// Only a replica whose metadata this satellite created while no other
+	// diskful replica existed can be the only copy there ever was. One
+	// that was syncing from a peer which then went (deleted, evacuated,
+	// forced out) is Inconsistent because the data is elsewhere: forcing
+	// it Primary would declare a partial copy UpToDate.
+	if !r.bornSolo(dr.GetName()) {
 		return nil
 	}
 
@@ -2936,6 +2974,73 @@ func (r *Reconciler) maybeSoloPromote(ctx context.Context, dr *intent.DesiredRes
 		"resource", dr.GetName())
 
 	return r.runAutoPromote(ctx, dr)
+}
+
+// bornSoloSuffix names the state file that records a replica whose
+// metadata this satellite created while the definition had no other
+// diskful replica and no peer. It is the only kind of replica
+// maybeSoloPromote may force Primary: nothing else ever held its data.
+// It lives next to `.md-created` and goes with it on DeleteResource.
+const bornSoloSuffix = ".born-solo"
+
+// soloByDesire reports whether the desired state leaves this replica
+// the definition's only copy: no desired peer, no diskful replica on any
+// other node in any state, and no peer known to hold data.
+func soloByDesire(dr *intent.DesiredResource) bool {
+	return len(dr.GetPeerNames()) == 0 && !dr.GetOtherDiskfulReplica() && !dr.GetPeerHasData()
+}
+
+// recordSoloBirth runs when create-md has just written fresh metadata
+// for this replica. It records the birth as solo when the desired state
+// has no other copy, and clears any earlier record otherwise. Without a
+// state dir nothing is recorded, and the solo-promote stays off.
+func (r *Reconciler) recordSoloBirth(dr *intent.DesiredResource) error {
+	if r.cfg.StateDir == "" {
+		return nil
+	}
+
+	path := filepath.Join(r.cfg.StateDir, dr.GetName()+bornSoloSuffix)
+
+	if !soloByDesire(dr) || dr.GetDeleting() {
+		err := os.Remove(path)
+		if err != nil && !os.IsNotExist(err) {
+			return errors.Wrapf(err, "remove %s", path)
+		}
+
+		return nil
+	}
+
+	err := os.WriteFile(path, nil, resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "write %s", path)
+	}
+
+	return nil
+}
+
+// bornSolo reports whether recordSoloBirth left a record for name.
+// Conservative: no state dir or an unreadable one reads as "not solo".
+func (r *Reconciler) bornSolo(name string) bool {
+	if r.cfg.StateDir == "" {
+		return false
+	}
+
+	_, err := os.Stat(filepath.Join(r.cfg.StateDir, name+bornSoloSuffix))
+
+	return err == nil
+}
+
+// forgetSoloBirth drops the solo-birth record of name once a peer, or a
+// diskful replica elsewhere, has appeared: from then on a peer may hold
+// data this replica lacks. Best effort: a record that survives a failed
+// remove is dropped again on the next pass, and the promote it would
+// allow still needs zero desired peers and zero kernel connections.
+func (r *Reconciler) forgetSoloBirth(name string) {
+	if r.cfg.StateDir == "" {
+		return
+	}
+
+	_ = os.Remove(filepath.Join(r.cfg.StateDir, name+bornSoloSuffix))
 }
 
 // resizeAssumeClean decides whether the pickup-time `drbdadm resize`
@@ -3765,6 +3870,13 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
+		}
+	}
+
+	if metadataFreshlyCreated {
+		err := r.recordSoloBirth(dr)
+		if err != nil {
+			return err
 		}
 	}
 
