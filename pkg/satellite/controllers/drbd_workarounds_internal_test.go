@@ -457,3 +457,86 @@ func TestStalledResyncOffLeavesAStallAlone(t *testing.T) {
 		t.Errorf("stall check off: reads=%d actions=%v, want some and none", adm.reads, adm.actions)
 	}
 }
+
+func failingIOConfig() WorkaroundsConfig {
+	return WorkaroundsConfig{Interval: 1, ForcedIOFailures: true}
+}
+
+func failingIOStatus(role string, open bool) string {
+	return fmt.Sprintf(`[{"name":"pvc-failio","role":%q,"force-io-failures":true,
+ "devices":[{"volume":0,"disk-state":"Outdated","open":%v}]}]`, role, open)
+}
+
+// A Secondary nobody has open that still forces I/O failures is taken
+// down and up on the second pass in a row.
+func TestForcedIOFailuresSecondaryIsRestarted(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{status: failingIOStatus("Secondary", false)}
+	w, recorder := newTestWorkarounds(t, adm, failingIOConfig(), "pvc-failio")
+
+	w.pass(t.Context(), logr.Discard())
+
+	if len(adm.actions) != 0 {
+		t.Fatalf("acted on the first pass: %v", adm.actions)
+	}
+
+	w.pass(t.Context(), logr.Discard())
+
+	if strings.Join(adm.actions, ",") != "down pvc-failio,up pvc-failio" {
+		t.Fatalf("actions = %v, want down and up", adm.actions)
+	}
+
+	evs := drainEvents(recorder)
+	if len(evs) != 1 || !strings.Contains(evs[0], "Warning DRBDForcedIOFailures") {
+		t.Errorf("events = %v, want one Warning DRBDForcedIOFailures", evs)
+	}
+}
+
+// Never a Primary, never a replica still open, never with the check off.
+func TestForcedIOFailuresLeavesOthersAlone(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		status string
+		cfg    WorkaroundsConfig
+	}{
+		{"primary", failingIOStatus("Primary", false), failingIOConfig()},
+		{"open", failingIOStatus("Secondary", true), failingIOConfig()},
+		{"off", failingIOStatus("Secondary", false), WorkaroundsConfig{Interval: 1, IdlePrimary: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			adm := &fakeWorkaroundAdm{status: tc.status}
+			w, _ := newTestWorkarounds(t, adm, tc.cfg, "pvc-failio")
+
+			for range 4 {
+				w.pass(t.Context(), logr.Discard())
+			}
+
+			for _, action := range adm.actions {
+				if strings.HasPrefix(action, "down") || strings.HasPrefix(action, "up") {
+					t.Errorf("took down a replica it must not: %v", adm.actions)
+				}
+			}
+		})
+	}
+}
+
+// The observer's force-io-failures hint has the status read.
+func TestForcedIOFailuresHintReadsTheStatus(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{status: failingIOStatus("Secondary", false)}
+	w, _ := newTestWorkarounds(t, adm, failingIOConfig(), "pvc-failio")
+	w.Hints = func() WorkaroundHints { return WorkaroundHints{ForcedIOFailures: true} }
+
+	w.pass(t.Context(), logr.Discard())
+	w.pass(t.Context(), logr.Discard())
+
+	if adm.reads != 2 || len(adm.actions) != 2 {
+		t.Errorf("reads=%d actions=%v, want 2 reads and down/up", adm.reads, adm.actions)
+	}
+}

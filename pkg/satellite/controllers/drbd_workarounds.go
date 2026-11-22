@@ -70,6 +70,10 @@ type WorkaroundsConfig struct {
 
 	// IdlePrimary demotes a Primary nobody uses (checkIdlePrimary).
 	IdlePrimary bool
+
+	// ForcedIOFailures takes down and up a Secondary nobody uses that
+	// still fails I/O (checkForcedIOFailures).
+	ForcedIOFailures bool
 }
 
 // The plunger's cadence: a pass every 30 s, a resync stalled for 4 of
@@ -86,6 +90,7 @@ func DefaultWorkaroundsConfig() WorkaroundsConfig {
 		StalledResync:       true,
 		StalledResyncPasses: defaultStalledResyncPasses,
 		IdlePrimary:         true,
+		ForcedIOFailures:    true,
 	}
 }
 
@@ -95,6 +100,8 @@ type workaroundAdm interface {
 	DisconnectPeer(ctx context.Context, resource, peer string) error
 	ConnectPeer(ctx context.Context, resource, peer string) error
 	Secondary(ctx context.Context, resource string) error
+	Down(ctx context.Context, resource string) error
+	Up(ctx context.Context, resource string) error
 }
 
 // DRBDWorkaroundsRunnable runs the DRBD workarounds on this node.
@@ -119,6 +126,10 @@ type DRBDWorkaroundsRunnable struct {
 
 	// idle counts the passes in a row each resource was an idle Primary.
 	idle map[string]int
+
+	// failingIO counts the passes in a row each resource was an unused
+	// Secondary failing I/O.
+	failingIO map[string]int
 }
 
 // newDRBDWorkaroundsRunnable builds the runnable the manager runs, gated
@@ -176,7 +187,7 @@ func (w *DRBDWorkaroundsRunnable) RegisterWithManager(mgr manager.Manager) error
 // pass runs every enabled check once.
 func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) {
 	if !w.kernelStatusWanted() {
-		w.stalls, w.idle = nil, nil
+		w.stalls, w.idle, w.failingIO = nil, nil, nil
 
 		return
 	}
@@ -190,6 +201,7 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 
 	stalls := map[string]resyncProgress{}
 	idle := map[string]int{}
+	failingIO := map[string]int{}
 
 	for i := range resources {
 		res := &resources[i]
@@ -214,9 +226,13 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 		if w.Config.IdlePrimary {
 			w.checkIdlePrimary(ctx, logger, res, replica, idle)
 		}
+
+		if w.Config.ForcedIOFailures {
+			w.checkForcedIOFailures(ctx, logger, res, replica, failingIO)
+		}
 	}
 
-	w.stalls, w.idle = stalls, idle
+	w.stalls, w.idle, w.failingIO = stalls, idle, failingIO
 }
 
 // kernelStatusWanted reports whether the observer's cache shows a shape an
@@ -229,7 +245,8 @@ func (w *DRBDWorkaroundsRunnable) kernelStatusWanted() bool {
 	hints := w.Hints()
 
 	return (w.Config.StalledResync && hints.Inconsistent) ||
-		(w.Config.IdlePrimary && hints.Primary)
+		(w.Config.IdlePrimary && hints.Primary) ||
+		(w.Config.ForcedIOFailures && hints.ForcedIOFailures)
 }
 
 // replica is blockstor's Resource of the kernel resource name on this
@@ -376,5 +393,59 @@ func (w *DRBDWorkaroundsRunnable) checkIdlePrimary(
 	err := w.Adm.Secondary(ctx, res.Name)
 	if err != nil {
 		w.failed(logger, err, res.Name, "demote an idle Primary")
+	}
+}
+
+// Workaround for a Secondary left failing I/O. When DRBD demotes a
+// Primary that something still holds open, because the Primary must
+// become SyncTarget of a peer with newer data ("I shall become
+// SyncTarget, but I am primary! ... force secondary!", see
+// https://github.com/LINBIT/drbd/issues/153) or because of a forced
+// demote, it sets force-io-failures so the opener gets I/O errors rather
+// than data that is no longer current. The kernel clears the flag when
+// the last opener closes the device (drbd_release). A Secondary that
+// nobody has open and still reports force-io-failures:yes missed that
+// clear, and whoever opens it next gets I/O errors. `drbdadm down` and
+// `up` of that Secondary clears it; only DRBD is restarted, the backing
+// device is not touched, and a resync it was part of continues from its
+// bitmap. Never done to a Primary or to a replica with a volume open, and
+// only after two passes in a row, so the moment between the last close
+// and the clear is not mistaken for it. Same check as the plunger.
+
+// failingIOPasses is how many passes in a row a Secondary must fail I/O
+// with nothing open before it is taken down and up.
+const failingIOPasses = 2
+
+// checkForcedIOFailures takes res down and up when it was an unused
+// Secondary failing I/O on failingIOPasses passes in a row.
+func (w *DRBDWorkaroundsRunnable) checkForcedIOFailures(
+	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
+	replica *blockstoriov1alpha1.Resource, failingIO map[string]int,
+) {
+	if !res.UnusedSecondaryFailingIO() {
+		return
+	}
+
+	passes := w.failingIO[res.Name] + 1
+	if passes < failingIOPasses {
+		failingIO[res.Name] = passes
+
+		return
+	}
+
+	w.acted(logger, replica, res.Name, "DRBDForcedIOFailures", fmt.Sprintf(
+		"Secondary with no volume open still forces I/O failures for %d passes: "+
+			"drbdadm down and up, backing device untouched (LINBIT/drbd#153)", passes))
+
+	err := w.Adm.Down(ctx, res.Name)
+	if err != nil {
+		w.failed(logger, err, res.Name, "take down a Secondary failing I/O")
+
+		return
+	}
+
+	err = w.Adm.Up(ctx, res.Name)
+	if err != nil {
+		w.failed(logger, err, res.Name, "bring up a Secondary that was failing I/O")
 	}
 }
