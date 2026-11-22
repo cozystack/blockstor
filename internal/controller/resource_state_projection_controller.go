@@ -20,84 +20,55 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	"github.com/cozystack/blockstor/pkg/naming"
 )
 
-// ResourceStateProjectionFieldOwner is the SSA field-manager identity
-// the controller uses when projecting `Status.DrbdState=Unknown` over
-// a Resource whose owning satellite is OFFLINE. Distinct from the
-// satellite's own `blockstor-satellite` owner so SSA can track the
-// two claims separately: while the satellite is offline the
-// projection owns the field; on heal, the controller releases its
-// claim (apply with no DrbdState set) so the satellite's next
-// observer write can re-claim it. Distinct from
-// `blockstor-controller` too — the latter owns allocator fields
-// (DRBDPort/Minor/NodeID) and cannot be re-used here without
-// dropping those claims when we release DrbdState.
+// ResourceStateProjectionFieldOwner is the SSA field manager under which
+// earlier controllers wrote `Status.DrbdState=Unknown`, with
+// ForceOwnership, over the replicas of an OFFLINE node.
 const ResourceStateProjectionFieldOwner = "blockstor-controller-resource-projection"
 
-// ResourceStateProjectionReconciler implements scenario 5.5's
-// resource-level Unknown projection (state-offline-unknown e2e).
+// ResourceStateProjectionReleaseReconciler gives `Status.DrbdState` back
+// to the satellite on every replica where an earlier controller still
+// holds it under ResourceStateProjectionFieldOwner.
 //
-// Contract:
+// The controller no longer writes a state of its own for an offline
+// replica. Like LINSTOR, which keeps no satellite state once the
+// connection closes, the read path answers such a replica with no
+// state at all (pkg/api/v1/offline.go), and keeps doing so until the
+// satellite process now running on the node has reported it. The
+// stored write was a second owner of a field the satellite is the
+// source of truth for: the satellite applies without ForceOwnership,
+// so a returning satellite's every status write conflicted until the
+// heartbeat watchdog flipped the node ONLINE and the claim was
+// released, and its replicas kept reading Unknown meanwhile.
 //
-//   - When a Resource's owning Node has `Status.ConnectionStatus=
-//     OFFLINE` (the heartbeat watchdog flips this past
-//     NodeMonitorGracePeriod), project `Status.DrbdState=Unknown` on
-//     the Resource. The satellite's last `DrbdState=UpToDate` write
-//     was made just before the pod died; without this projection the
-//     stale value lingers and operators can't tell whether the
-//     replica is still alive.
-//
-//   - The per-volume `Status.Volumes[i].DiskState` is intentionally
-//     LEFT UNTOUCHED. That field carries the "last we heard from
-//     the satellite" forensic snapshot ("UpToDate / Inconsistent /
-//     Failed at the time the satellite went silent"), which
-//     operators need for triage. The scenario brief
-//     (tests/e2e/state-offline-unknown.sh) requires both shapes at
-//     once: Unknown at the resource level + last-known DiskState
-//     at the volume level.
-//
-//   - When the Node returns ONLINE, the controller releases its
-//     claim on DrbdState by re-applying with an EMPTY Status — SSA
-//     drops fields no longer present in the manifest, freeing the
-//     satellite's next observer write to re-claim DrbdState with
-//     fresh evidence.
-//
-// Wire shape: this projection marks the stored object only. The REST
-// view and the CLI do not read it to decide what a replica on an
-// OFFLINE node shows; they answer such a replica with no satellite
-// state at all, the way LINSTOR does (pkg/api/v1/offline.go), so
-// `linstor r l` reads it Unknown and `--faulty` lists it.
-type ResourceStateProjectionReconciler struct {
+// A claim taken before the upgrade would make that conflict permanent,
+// since nothing else releases it. The release is an apply of an empty
+// status under the same manager: SSA drops the field the manager alone
+// owned, and the satellite's next write sets it again. It does not
+// depend on the node's state, so a replica whose node is still offline
+// is freed too and its satellite writes on the first try when it
+// returns.
+type ResourceStateProjectionReleaseReconciler struct {
 	client.Client
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources/status,verbs=get;patch;update
-// +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
 
-// Reconcile reads the Resource's owning Node, decides whether to
-// project Unknown or release the claim, and applies via SSA. No-op
-// when the Resource is being deleted (DeletionTimestamp non-zero)
-// or when the owning Node row is absent (treat the resource as
-// orphaned; the satellite-resource finalizer will eventually
-// clean it).
-func (r *ResourceStateProjectionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+// Reconcile releases the projection's claim on the replica, if any.
+func (r *ResourceStateProjectionReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var res blockstoriov1alpha1.Resource
 
 	err := r.Get(ctx, req.NamespacedName, &res)
@@ -109,207 +80,73 @@ func (r *ResourceStateProjectionReconciler) Reconcile(ctx context.Context, req c
 		return ctrl.Result{}, errors.Wrap(err, "get Resource")
 	}
 
-	if !res.DeletionTimestamp.IsZero() {
+	if !holdsProjectionClaim(&res) {
 		return ctrl.Result{}, nil
 	}
 
-	if res.Spec.NodeName == "" {
-		return ctrl.Result{}, nil
+	apply := &blockstoriov1alpha1.Resource{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       resourceProjectionResourceKind,
+			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: res.Name},
 	}
 
-	var node blockstoriov1alpha1.Node
-
-	// The Node CR is named from the folded name; a replica written before
-	// the store stored CR names may still carry the registered spelling.
-	err = r.Get(ctx, types.NamespacedName{Name: naming.Key(res.Spec.NodeName)}, &node)
+	err = r.Status().Patch(ctx, apply,
+		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
+		client.FieldOwner(ResourceStateProjectionFieldOwner))
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
 
-		return ctrl.Result{}, errors.Wrap(err, "get Node")
+		return ctrl.Result{}, errors.Wrapf(err, "release projection claim on %s", res.Name)
 	}
 
-	offline := node.Status.ConnectionStatus == blockstoriov1alpha1.NodeConnectionStatusOffline
-
-	if offline {
-		return ctrl.Result{}, r.projectUnknown(ctx, &res)
-	}
-
-	return ctrl.Result{}, r.releaseClaim(ctx, &res)
+	return ctrl.Result{}, nil
 }
 
-// projectUnknown SSA-applies `Status.DrbdState=Unknown` under the
-// projection FieldOwner, taking ownership of the field via
-// ForceOwnership (the satellite previously owned it with its last
-// `DrbdState=UpToDate` write — without ForceOwnership the apply
-// would conflict). Per-volume Status.Volumes is intentionally
-// omitted from the apply so the satellite's last-known DiskState
-// snapshot is preserved.
-//
-// Idempotent: SSA recognises a no-op apply (same field value, same
-// owner) and skips the write.
-func (r *ResourceStateProjectionReconciler) projectUnknown(ctx context.Context, res *blockstoriov1alpha1.Resource) error {
-	if res.Status.DrbdState == drbdStateUnknown {
-		return nil
-	}
-
-	apply := &blockstoriov1alpha1.Resource{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       resourceProjectionResourceKind,
-			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
-		},
-		ObjectMeta: metav1.ObjectMeta{Name: res.Name},
-		Status: blockstoriov1alpha1.ResourceStatus{
-			DrbdState: drbdStateUnknown,
-		},
-	}
-
-	err := r.Status().Patch(ctx, apply,
-		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
-		client.FieldOwner(ResourceStateProjectionFieldOwner),
-		client.ForceOwnership)
-	if err != nil {
-		return errors.Wrapf(err, "project Unknown on %s", res.Name)
-	}
-
-	return nil
-}
-
-// releaseClaim drops the projection's ownership of DrbdState by
-// applying an empty Status under the same FieldOwner. SSA removes
-// the manager's previous field claims that aren't repeated in the
-// new manifest, freeing the satellite's next observer write to
-// re-claim DrbdState with fresh evidence.
-//
-// Idempotent: if the projection never claimed any field (resource
-// never went OFFLINE during its lifetime), the SSA apply is a no-op
-// at the apiserver level.
-func (r *ResourceStateProjectionReconciler) releaseClaim(ctx context.Context, res *blockstoriov1alpha1.Resource) error {
-	// Cheap pre-check: if DrbdState isn't Unknown then either the
-	// satellite already overwrote it (we have no claim to release)
-	// or we never claimed it. Either way the release-apply is a
-	// no-op; skip the apiserver round-trip.
-	if res.Status.DrbdState != drbdStateUnknown {
-		return nil
-	}
-
-	apply := &blockstoriov1alpha1.Resource{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       resourceProjectionResourceKind,
-			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
-		},
-		ObjectMeta: metav1.ObjectMeta{Name: res.Name},
-		Status:     blockstoriov1alpha1.ResourceStatus{},
-	}
-
-	err := r.Status().Patch(ctx, apply,
-		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
-		client.FieldOwner(ResourceStateProjectionFieldOwner))
-	if err != nil {
-		return errors.Wrapf(err, "release projection claim on %s", res.Name)
-	}
-
-	return nil
-}
-
-// drbdStateUnknown is the resource-level state surfaced when the
-// satellite is OFFLINE, on the stored object. The canonical spelling
-// matches upstream LINSTOR's `DrbdConnState UNKNOWN`.
-const drbdStateUnknown = "Unknown"
-
-// resourceProjectionResourceKind mirrors the Resource CRD's Kind
-// for the SSA TypeMeta header. Kept distinct from the satellite-
-// side `resourceKind` constant (in `pkg/satellite/controllers`) to
-// avoid cross-package coupling — both intentionally name the same
-// string `"Resource"`.
-const resourceProjectionResourceKind = "Resource"
-
-// SetupWithManager wires the reconciler to fan out on:
-//
-//  1. Resource events (For) — every spec/status change re-evaluates
-//     the projection.
-//  2. Node events (Watches) — when ConnectionStatus flips, every
-//     Resource on that Node must re-reconcile so the projection
-//     follows the heartbeat verdict.
-func (r *ResourceStateProjectionReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	err := ctrl.NewControllerManagedBy(mgr).
-		Named("resource-state-projection").
-		For(&blockstoriov1alpha1.Resource{}).
-		Watches(&blockstoriov1alpha1.Node{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForNode),
-			builder.WithPredicates(nodeConnectionStatusChanged())).
-		Complete(r)
-	if err != nil {
-		return errors.Wrap(err, "register ResourceStateProjectionReconciler")
-	}
-
-	return nil
-}
-
-// enqueueResourcesForNode maps a Node event to every Resource whose
-// `Spec.NodeName` references that Node. Drives the projection to
-// re-evaluate on every ConnectionStatus flip.
-func (r *ResourceStateProjectionReconciler) enqueueResourcesForNode(ctx context.Context, obj client.Object) []reconcile.Request {
-	node, ok := obj.(*blockstoriov1alpha1.Node)
-	if !ok {
-		return nil
-	}
-
-	var resList blockstoriov1alpha1.ResourceList
-
-	err := r.List(ctx, &resList)
-	if err != nil {
-		return nil
-	}
-
-	out := make([]reconcile.Request, 0, len(resList.Items))
-
-	for i := range resList.Items {
-		if !naming.Same(resList.Items[i].Spec.NodeName, node.Name) {
+// holdsProjectionClaim reports whether the projection's field manager
+// still owns any status field of the replica.
+func holdsProjectionClaim(res *blockstoriov1alpha1.Resource) bool {
+	for i := range res.ManagedFields {
+		entry := &res.ManagedFields[i]
+		if entry.Manager != ResourceStateProjectionFieldOwner || entry.FieldsV1 == nil {
 			continue
 		}
 
-		out = append(out, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: resList.Items[i].Name},
-		})
+		var fields map[string]json.RawMessage
+
+		err := json.Unmarshal(entry.FieldsV1.Raw, &fields)
+		if err != nil || len(fields) > 0 {
+			// An entry that cannot be read is released all the same:
+			// the release is a no-op when nothing is held.
+			return true
+		}
 	}
 
-	return out
+	return false
 }
 
-// nodeConnectionStatusChanged returns a predicate that fires only
-// when a Node's `Status.ConnectionStatus` actually transitions. The
-// heartbeat watchdog re-applies the same Status every
-// NodeMonitorPeriod (5s) to refresh LastTransitionTime; without
-// this filter every refresh would fan out to every Resource on the
-// node, burning workqueue cycles for no behaviour change.
-func nodeConnectionStatusChanged() predicate.Predicate {
-	return predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			n, ok := e.Object.(*blockstoriov1alpha1.Node)
-			if !ok {
-				return false
-			}
+// resourceProjectionResourceKind mirrors the Resource CRD's Kind for
+// the SSA TypeMeta header.
+const resourceProjectionResourceKind = "Resource"
 
-			// Brand-new Node may already carry ConnectionStatus
-			// (controller restart re-reads existing state). Treat as
-			// a transition so the projection runs at least once.
-			return n.Status.ConnectionStatus != ""
-		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldNode, ok := e.ObjectOld.(*blockstoriov1alpha1.Node)
-			if !ok {
-				return false
-			}
+// SetupWithManager reconciles only replicas the projection still holds a
+// field of, so the release costs nothing once every claim is gone.
+func (r *ResourceStateProjectionReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	err := ctrl.NewControllerManagedBy(mgr).
+		Named("resource-state-projection").
+		For(&blockstoriov1alpha1.Resource{},
+			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				res, ok := obj.(*blockstoriov1alpha1.Resource)
 
-			newNode, ok := e.ObjectNew.(*blockstoriov1alpha1.Node)
-			if !ok {
-				return false
-			}
-
-			return oldNode.Status.ConnectionStatus != newNode.Status.ConnectionStatus
-		},
-		DeleteFunc: func(_ event.DeleteEvent) bool { return false },
+				return ok && holdsProjectionClaim(res)
+			}))).
+		Complete(r)
+	if err != nil {
+		return errors.Wrap(err, "register ResourceStateProjectionReleaseReconciler")
 	}
+
+	return nil
 }
