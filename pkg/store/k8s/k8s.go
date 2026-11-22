@@ -97,7 +97,7 @@ func NewWithAPIReader(c ctrlclient.Client, apiReader ctrlclient.Reader) *Store {
 	s.storagePools = &storagePools{c: c, apiReader: apiReader}
 	s.resourceGroups = &resourceGroups{c: c}
 	s.resourceDefinitions = &resourceDefinitions{c: c, apiReader: apiReader}
-	s.resources = &resources{c: c, apiReader: apiReader}
+	s.resources = &resources{c: c, apiReader: apiReader, rds: s.resourceDefinitions}
 	s.volumeDefinitions = &volumeDefinitions{c: c, apiReader: apiReader}
 	s.snapshots = &snapshots{c: c, apiReader: apiReader}
 	s.physicalDevices = &physicalDevices{c: c}

@@ -2850,10 +2850,6 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
 
-	// The replica's resource connections go with it, as LINSTOR's do:
-	// a replica created on the node later starts from none.
-	s.dropConnectionPropsOf(r.Context(), rdName, node)
-
 	// Bug 67: notify surviving sibling Resources of the peer change
 	// so satellite reconcilers re-derive their peer set without the
 	// dropped replica. Order ("delete first, bump second") ensures a

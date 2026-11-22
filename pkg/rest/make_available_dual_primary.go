@@ -321,24 +321,10 @@ func (s *Server) releaseAttachment(ctx context.Context, rdName, node string, rep
 	}
 
 	s.waitForResourceDeletionVisible(ctx, rdName, node)
-	s.dropConnectionPropsOf(ctx, rdName, node)
 	s.bumpPeerChangedOnSiblings(ctx, rdName, node)
 
 	return []apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
 		Message: "resource deleted: " + rdName + " on " + node,
 	}}, nil
-}
-
-// dropConnectionPropsOf removes the resource-connection props of a
-// replica that is gone. Best-effort: a connection prop left behind only
-// matters when a replica comes back on the node, and the next
-// unmake-available there clears allow-two-primaries anyway.
-func (s *Server) dropConnectionPropsOf(ctx context.Context, rdName, node string) {
-	_ = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
-		func(live *apiv1.ResourceDefinition) error {
-			apiv1.DropResourceConnectionProps(node, live.Props)
-
-			return nil
-		})
 }
