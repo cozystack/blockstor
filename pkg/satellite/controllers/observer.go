@@ -20,6 +20,7 @@ package controllers
 
 import (
 	"context"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -144,6 +145,16 @@ type volumeObservation struct {
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
+
+	// SyncPeer is the peer a peer-device frame's out-of-sync count is
+	// about (its `conn-name`).
+	SyncPeer string
+	// PeerOutOfSync is the cached count per peer; OutOfSyncKib is its
+	// largest. Kept in the cache only: with the count of whichever
+	// peer's frame came last, a replica with one peer in sync and one
+	// not flipped between zero and the count on every statistics
+	// frame, and each flip was a status write.
+	PeerOutOfSync map[string]int64
 
 	// Removed is an internal marker set by translateDeviceEvent for
 	// `destroy device` frames (drbdsetup emits one after a volume is
@@ -504,10 +515,14 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 
 	out := observation{ResourceName: name}
 
+	peer := ev.Fields["conn-name"]
+
 	//nolint:gosec // drbd-9 volume numbers fit in int32
 	out.Volumes = peerDeviceVolumeObservation(ev, int32(volNum))
+	for i := range out.Volumes {
+		out.Volumes[i].SyncPeer = peer
+	}
 
-	peer := ev.Fields["conn-name"]
 	if peer != "" {
 		conn := connectionObservation{
 			PeerNodeName:   peer,
@@ -1527,8 +1542,10 @@ func (o *ObserverRunnable) ingest(ctx context.Context, ev *observation) {
 	// Read before mergeResource puts the cached disk state on ev.
 	failed := ev.DrbdState == drbdDiskStateFailed
 
-	o.mergeConnections(ev)
+	// mergeVolumes reads a destroyed connection off ev before
+	// mergeConnections replaces ev.Connections with the cached peers.
 	o.mergeVolumes(ev)
+	o.mergeConnections(ev)
 	o.mergeResource(ev)
 
 	// mergeVolumes leaves ev.Volumes empty when the frame changed no
@@ -2141,6 +2158,12 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 
 	changed := false
 
+	for _, conn := range ev.Connections {
+		if conn.Removed && forgetPeerOutOfSync(cache, conn.PeerNodeName) {
+			changed = true
+		}
+	}
+
 	for _, incoming := range ev.Volumes {
 		if incoming.Removed {
 			// `destroy device` — evict the volume so the snapshot
@@ -2302,6 +2325,74 @@ func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolume
 	return out
 }
 
+// largestOutOfSync is the out-of-sync count a volume publishes: the
+// one of the peer it is furthest behind.
+func largestOutOfSync(peers map[string]int64) int64 {
+	var largest int64
+
+	for _, kib := range peers {
+		largest = max(largest, kib)
+	}
+
+	return largest
+}
+
+// forgetPeerOutOfSync drops a removed peer's out-of-sync count from
+// every cached volume, so a peer that is gone no longer holds the
+// volume's count up. Returns true if a published count changed.
+func forgetPeerOutOfSync(cache map[int32]volumeObservation, peer string) bool {
+	changed := false
+
+	for num, vol := range cache {
+		if _, ok := vol.PeerOutOfSync[peer]; !ok {
+			continue
+		}
+
+		peers := maps.Clone(vol.PeerOutOfSync)
+		delete(peers, peer)
+		vol.PeerOutOfSync = peers
+
+		if oos := largestOutOfSync(peers); oos != vol.OutOfSyncKib {
+			vol.OutOfSyncKib = oos
+			changed = true
+		}
+
+		cache[num] = vol
+	}
+
+	return changed
+}
+
+// mergeOutOfSyncInto records the out-of-sync count of a frame that
+// carried one, against its peer when the frame names it, and reports
+// whether the count the volume publishes changed.
+func mergeOutOfSyncInto(merged, incoming *volumeObservation) bool {
+	oos := incoming.OutOfSyncKib
+
+	if incoming.SyncPeer != "" {
+		if last, ok := merged.PeerOutOfSync[incoming.SyncPeer]; !ok || last != oos {
+			peers := maps.Clone(merged.PeerOutOfSync)
+			if peers == nil {
+				peers = map[string]int64{}
+			}
+
+			peers[incoming.SyncPeer] = oos
+			merged.PeerOutOfSync = peers
+		}
+
+		oos = largestOutOfSync(merged.PeerOutOfSync)
+	}
+
+	if merged.HasSync && merged.OutOfSyncKib == oos {
+		return false
+	}
+
+	merged.OutOfSyncKib = oos
+	merged.HasSync = true
+
+	return true
+}
+
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
 // to decide whether to emit a fresh Status snapshot.
@@ -2330,9 +2421,7 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 		changed = true
 	}
 
-	if incoming.HasSync && (!merged.HasSync || merged.OutOfSyncKib != incoming.OutOfSyncKib) {
-		merged.OutOfSyncKib = incoming.OutOfSyncKib
-		merged.HasSync = true
+	if incoming.HasSync && mergeOutOfSyncInto(&merged, incoming) {
 		changed = true
 	}
 

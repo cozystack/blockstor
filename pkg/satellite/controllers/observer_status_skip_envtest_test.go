@@ -20,6 +20,7 @@ package controllers
 
 import (
 	"context"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -251,5 +252,69 @@ func TestObserverWritesEveryOutOfSyncChangeOfARunningResync(t *testing.T) {
 				t.Fatalf("%s: outOfSyncKib = %d, want %d", phase.name, got.Volumes[0].OutOfSyncKib, kib)
 			}
 		}
+	}
+}
+
+func peerOutOfSync(t *testing.T, peer string, kib int64) *observation {
+	t.Helper()
+
+	ev, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: eventActionChange,
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name": statusTestRD, "volume": "0", "conn-name": peer,
+			"replication": "Established", "peer-disk": "UpToDate", "out-of-sync": strconv.FormatInt(kib, 10),
+		},
+	})
+	if !ok {
+		t.Fatalf("peer-device frame from %s rejected", peer)
+	}
+
+	return &ev
+}
+
+// A replica in sync with one peer and holding a drifting count towards
+// another writes nothing for the statistics frames of either. The
+// volume's count used to be whichever peer's frame came last, so it
+// went between zero and the drifting count on every frame and each
+// change crossed zero, which is written at once.
+func TestObserverCoalescesADriftingCountBesideAPeerInSync(t *testing.T) {
+	base := startStatusEnvtest(t)
+	name := createStatusReplica(t, base)
+
+	var applies atomic.Int64
+
+	cli := countStatusPatches(base, &applies)
+	o := &ObserverRunnable{Client: cli, Exec: storage.NewFakeExec(), NodeName: statusTestNode}
+	adm := drbd.NewAdm(o.Exec)
+	ctx := t.Context()
+
+	o.handleObservation(ctx, adm, deviceUpToDate())
+	o.handleObservation(ctx, adm, peerOutOfSync(t, "n3", 0))
+	o.handleObservation(ctx, adm, peerOutOfSync(t, "n2", 1380924))
+
+	before := applies.Load()
+
+	for i := range int64(5) {
+		o.handleObservation(ctx, adm, peerOutOfSync(t, "n3", 0))
+		o.handleObservation(ctx, adm, peerOutOfSync(t, "n2", 1380900-i*4))
+	}
+
+	if got := applies.Load() - before; got != 0 {
+		t.Fatalf("statistics frames of two peers were written %d times", got)
+	}
+
+	if got := getStatusReplica(t, base, name); got.Volumes[0].OutOfSyncKib != 1380924 {
+		t.Fatalf("outOfSyncKib = %d, want the stuck peer's 1380924", got.Volumes[0].OutOfSyncKib)
+	}
+
+	// The stuck peer leaving takes its count with it.
+	o.handleObservation(ctx, adm, &observation{
+		ResourceName: statusTestRD,
+		Connections:  []connectionObservation{{PeerNodeName: "n2", Removed: true}},
+	})
+
+	if got := getStatusReplica(t, base, name); got.Volumes[0].OutOfSyncKib != 0 {
+		t.Fatalf("outOfSyncKib = %d after the stuck peer left, want 0", got.Volumes[0].OutOfSyncKib)
 	}
 }
