@@ -173,3 +173,28 @@ func TestSteadyPeersReadNoKernelState(t *testing.T) {
 		t.Errorf("want no command for unchanged peers; got %v", calls)
 	}
 }
+
+// A connection that is up under a node-id the controller no longer gives
+// the peer is not the leftover of a removed replica: the ids disagree
+// some other way, and dropping it would cut a working peer.
+func TestConnectedPeerUnderAnOldNodeIDIsKept(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status -j pvc-reid", storage.FakeResponse{Stdout: []byte(`[{"name":"pvc-reid","node-id":0,"connections":[` +
+		`{"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0}]}]}]`)})
+	rec := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: t.TempDir(), NodeName: "n1"})
+
+	dr := &intent.DesiredResource{Name: "pvc-reid", NodeName: "n1", Peers: []intent.DesiredPeer{peerAt("n2", 3)}}
+
+	err := rec.tearDownReidentifiedPeers(context.Background(), dr, resWithPeer(t, rec), map[int32]string{0: "/dev/vg/pvc-reid_00000"})
+	if err != nil {
+		t.Fatalf("tearDownReidentifiedPeers: %v", err)
+	}
+
+	for _, c := range fx.CommandLines() {
+		if strings.Contains(c, "del-peer") || strings.Contains(c, "forget-peer") {
+			t.Errorf("a Connected peer was torn down: %s", c)
+		}
+	}
+}

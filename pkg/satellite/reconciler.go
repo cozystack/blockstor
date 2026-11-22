@@ -2079,8 +2079,11 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 // The old connection goes by node-id, as LINSTOR's satellite removes a
 // deleted peer, and its slot is forgotten when the local replica has
 // metadata. A peer the controller has not given a node-id yet is left
-// alone. A kernel that cannot be read leaves the decision to the next
-// pass. The kernel is read only when the .res last rendered does not
+// alone, and so is a connection that is up: the replica the node-id
+// belonged to is gone in the case this handles, so a Connected slot
+// under the old id means the ids disagree some other way, and dropping
+// it would cut a working peer. A kernel that cannot be read leaves the
+// decision to the next pass. The kernel is read only when the .res last rendered does not
 // already name every peer under its node-id, so a steady resource costs
 // no extra call.
 func (r *Reconciler) tearDownReidentifiedPeers(ctx context.Context, dr *intent.DesiredResource, resPath string, devices map[int32]string) error {
@@ -2099,7 +2102,7 @@ func (r *Reconciler) tearDownReidentifiedPeers(ctx context.Context, dr *intent.D
 		}
 
 		for name, slot := range slots {
-			if !naming.Same(name, peer.Name) || slot.NodeID == *peer.NodeID {
+			if !naming.Same(name, peer.Name) || slot.NodeID == *peer.NodeID || slot.ConnectionState == "Connected" {
 				continue
 			}
 
