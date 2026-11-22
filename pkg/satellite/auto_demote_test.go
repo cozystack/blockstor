@@ -281,3 +281,54 @@ func TestOwedDemoteOtherFailureDoesNotFailLaterApplies(t *testing.T) {
 		t.Errorf("apply within the pacing interval: ok=%v demotes=%d, want true, 0", ok, demotes)
 	}
 }
+
+// errPrimaryRefused is a promote DRBD refused.
+var errPrimaryRefused = errors.New("exit status 11: pvc-demote: State change failed: (-2) Need access to UpToDate data")
+
+// A refused promote leaves the role as it was: it creates no debt of its
+// own, and does not drop a debt an earlier promote left.
+func TestAutoPrimaryRefusedLeavesTheDebtAsItWas(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		owedBefore bool
+	}{
+		{"nothing owed", false},
+		{"owed from before", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec, fx, dr, owed := demoteFixture(t)
+			fx.ExpectSequence("drbdadm primary --force pvc-demote", storage.FakeResponse{Err: errPrimaryRefused})
+
+			if tc.owedBefore {
+				err := os.WriteFile(owed, nil, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				// The owed demote, tried first, finds the device held.
+				fx.ExpectSequence(demoteSecondary, storage.FakeResponse{Err: errHeldOpen})
+			}
+
+			results, err := rec.Apply(t.Context(), dr)
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			if results[0].GetOk() {
+				t.Error("a refused promote left the apply Ok")
+			}
+
+			if got := countLines(fx.CommandLines(), "drbdadm primary --force pvc-demote"); got != 1 {
+				t.Fatalf("%d promotes, want 1", got)
+			}
+
+			if got := demoteOwed(t, owed); got != tc.owedBefore {
+				t.Errorf("owed after the refused promote = %v, want %v", got, tc.owedBefore)
+			}
+		})
+	}
+}
