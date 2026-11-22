@@ -371,6 +371,10 @@ type Reconciler struct {
 	// for the residual CRD-status-vs-on-disk window. Process-memory
 	// only; a restart resets the counter (at worst a few extra requeues).
 	restoreSnapshotMissingTries map[string]int
+
+	// demotes paces the retry of a demote this satellite still owes a
+	// replica it promoted itself; see auto_demote.go.
+	demotes demoteRetry
 }
 
 // recoveryPromoteThrottle bounds how often a single resource may fire
@@ -424,6 +428,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
+		demotes:                     newDemoteRetry(),
 	}
 }
 
@@ -942,7 +947,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		// sweeper's ownership marker — must be removed AFTER the
 		// kernel slot is gone so a concurrent sweeper tick sees a
 		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned"} {
+		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", demotePendingSuffix} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{
@@ -2646,6 +2651,13 @@ func (r *Reconciler) reconcileKernelMyNodeID(ctx context.Context, dr *intent.Des
 // automatically when kern->disk=="none" but conf->disk points at a
 // real path. Matches upstream LINSTOR's DrbdLayer pipeline.
 func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredResource, diskless, firstActivation, resized, cloned bool, devices map[int32]string) error {
+	// A demote this satellite still owes the replica from an earlier
+	// auto-promote goes first: every promote below owes its own.
+	err := r.retryPendingDemote(ctx, dr.GetName())
+	if err != nil {
+		return err
+	}
+
 	// Pickup-time resize: the storage layer was just grown, drbdadm
 	// resize tells the kernel to extend the replicated device to
 	// match. Adjust on its own won't do this — only resize re-reads
@@ -4381,8 +4393,27 @@ func needsMkfs(dr *intent.DesiredResource) bool {
 }
 
 func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResource) error {
-	err := r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
+	// The demote is owed from the moment the promote may have happened,
+	// so a demote that fails, or a satellite that dies before it, still
+	// leaves the replica to be demoted by a later apply.
+	owedBefore := r.demoteOwed(dr.GetName())
+
+	err := r.owePendingDemote(dr.GetName())
 	if err != nil {
+		return err
+	}
+
+	err = r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
+	if err != nil {
+		// A refused role change leaves the role as it was: nothing
+		// new to demote.
+		if !owedBefore {
+			settleErr := r.settlePendingDemote(dr.GetName())
+			if settleErr != nil {
+				return settleErr
+			}
+		}
+
 		return errors.Wrapf(err, "auto-primary %s", dr.GetName())
 	}
 
@@ -4391,12 +4422,7 @@ func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResou
 		return errors.Wrapf(err, "auto-mkfs %s", dr.GetName())
 	}
 
-	err = r.cfg.Adm.Secondary(ctx, dr.GetName())
-	if err != nil {
-		return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
-	}
-
-	return nil
+	return r.autoSecondary(ctx, dr.GetName())
 }
 
 // drbdDevicesForMkfs builds the {volNumber → /dev/drbd<minor>} map

@@ -20,6 +20,7 @@ package satellite
 
 import (
 	"context"
+	"time"
 
 	"github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -50,4 +51,12 @@ func WipeDeviceForTest(ctx context.Context, exec storage.Exec, devicePath string
 // IsBitmapDropBothDisksErr signature is detected).
 func (r *Reconciler) RecoverFromBitmapBothDisksForTest(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
 	return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, skipNet)
+}
+
+// SetDemoteRetryForTest replaces the waits of the demote owed after an
+// auto-promote: backoff between the tries right after mkfs, and every,
+// the pacing of later applies' retries (zero retries on every apply).
+func (r *Reconciler) SetDemoteRetryForTest(backoff []time.Duration, every time.Duration) {
+	r.demotes.backoff = backoff
+	r.demotes.every = every
 }
