@@ -19,10 +19,13 @@ limitations under the License.
 package cli_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 )
 
 // typoKey is the key the alpha.14 report set on a definition with
@@ -126,6 +129,28 @@ func TestDrbdOptionsRefusesAValueTheRuleRefuses(t *testing.T) {
 
 	if _, stored := def.Props["DrbdOptions/Net/max-buffers"]; stored {
 		t.Errorf("the refused value was stored: %v", def.Props)
+	}
+}
+
+// TestDrbdOptionsOffersOnlyWhitelistedKnobs: every knob drbd-options
+// offers resolves to a key the whitelist lists for a definition. One it
+// does not list is refused on every noun, so offering it only advertises a
+// flag that can never be used.
+func TestDrbdOptionsOffersOnlyWhitelistedKnobs(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range drbd.FlagNames() {
+		key, ok := drbd.FlagKey(name)
+		if !ok {
+			t.Fatalf("--%s is offered but resolves to no key", name)
+		}
+
+		var refusal *propwhitelist.Error
+
+		err := propwhitelist.Check(propwhitelist.ResourceDefinition, key, "x")
+		if errors.As(err, &refusal) && !refusal.Known {
+			t.Errorf("--%s resolves to %s, which the whitelist refuses on a definition", name, key)
+		}
 	}
 }
 
