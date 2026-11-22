@@ -519,3 +519,31 @@ func TestResourceDeleteWithBalancingOffAndAPrimaryStaysGuarded(t *testing.T) {
 		t.Fatal("the Primary's last complete copy was deleted while a peer was still syncing")
 	}
 }
+
+// A definition read that fails refuses the delete rather than skipping the
+// guard.
+func TestResourceDeleteRefusedWhenTheDefinitionCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedDefinition(ctx, backend)
+
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-x", NodeName: "node-a",
+			Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: "UpToDate"}}},
+		})
+	})
+
+	backend := appStore(t, app)
+	app.StoreFor = func(context.Context) (store.Store, error) {
+		return storetest.FailingDefinitionGet{Store: backend}, nil
+	}
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "pvc-x"}); got == 0 {
+		t.Fatal("delete went through although the definition could not be read")
+	}
+
+	if _, err := backend.Resources().Get(t.Context(), "pvc-x", "node-a"); err != nil {
+		t.Errorf("node-a was deleted: %v", err)
+	}
+}

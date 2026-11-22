@@ -214,3 +214,23 @@ func TestReplicaDeleteWithBalancingOffAndAPrimaryStaysGuarded(t *testing.T) {
 		t.Fatalf("delete node-a: got %d, want 409 (the Primary's last complete copy)", code)
 	}
 }
+
+// The guard reads the definition to tell a teardown from a single delete.
+// A read it cannot make refuses the delete instead of letting it through.
+func TestReplicaDeleteRefusedWhenTheDefinitionCannotBeRead(t *testing.T) {
+	backend := store.NewInMemory()
+	rd := "pvc-unreadable"
+
+	seedInitialSyncVolume(t, backend, rd)
+
+	base, stop := startServerWithStore(t, storetest.FailingDefinitionGet{Store: backend})
+	defer stop()
+
+	if code := deleteReplica(t, base, rd, "node-a"); code == http.StatusOK {
+		t.Fatal("delete went through although the definition could not be read")
+	}
+
+	if _, err := backend.Resources().Get(t.Context(), rd, "node-a"); err != nil {
+		t.Errorf("node-a was deleted: %v", err)
+	}
+}
