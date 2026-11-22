@@ -22,6 +22,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -33,6 +36,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -538,5 +542,108 @@ func TestForcedIOFailuresHintReadsTheStatus(t *testing.T) {
 
 	if adm.reads != 2 || len(adm.actions) != 2 {
 		t.Errorf("reads=%d actions=%v, want 2 reads and down/up", adm.reads, adm.actions)
+	}
+}
+
+// fakeSysBlock lays out /sys/block with a loop device per entry of
+// backing (name → backing_file content); an empty content leaves the
+// loop device unattached (no loop/ directory).
+func fakeSysBlock(t *testing.T, backing map[string]string) string {
+	t.Helper()
+
+	root := t.TempDir()
+
+	for name, file := range backing {
+		dir := filepath.Join(root, name)
+		if file != "" {
+			dir = filepath.Join(dir, "loop")
+		}
+
+		err := os.MkdirAll(dir, 0o755)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if file == "" {
+			continue
+		}
+
+		err = os.WriteFile(filepath.Join(dir, "backing_file"), []byte(file+"\n"), 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return root
+}
+
+// A loop device whose backing file reads "/" or "/ (deleted)" is
+// detached, and the action recorded on this satellite's Node; loop
+// devices with a real backing file, and unattached ones, are left alone.
+// No kernel status is read for it.
+func TestStaleLoopDevicesAreDetached(t *testing.T) {
+	t.Parallel()
+
+	exec := storage.NewFakeExec()
+	adm := &fakeWorkaroundAdm{}
+	recorder := events.NewFakeRecorder(16)
+
+	w := &DRBDWorkaroundsRunnable{
+		Reader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(&blockstoriov1alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: workaroundNode},
+		}).Build(),
+		Adm:      adm,
+		Exec:     exec,
+		Recorder: recorder,
+		NodeName: workaroundNode,
+		Config:   WorkaroundsConfig{Interval: 1, StaleLoopDevices: true},
+		Hints:    func() WorkaroundHints { return WorkaroundHints{} },
+		SysBlock: fakeSysBlock(t, map[string]string{
+			"loop0": "/",
+			"loop1": "/ (deleted)",
+			"loop2": "/var/lib/blockstor/pool/pvc-a_00000.img",
+			"loop3": "",
+			"loop4": "/var/lib/kubelet/plugins/kubernetes.io/csi/volumeDevices/pvc-b/dev/0b5c (deleted)",
+		}),
+	}
+
+	w.pass(t.Context(), logr.Discard())
+
+	got := exec.CommandLines()
+	slices.Sort(got)
+
+	want := []string{"losetup --detach /dev/loop0", "losetup --detach /dev/loop1"}
+	if !slices.Equal(got, want) {
+		t.Errorf("commands = %q, want %q", got, want)
+	}
+
+	if adm.reads != 0 {
+		t.Errorf("read the kernel status %d times for loop devices", adm.reads)
+	}
+
+	evs := drainEvents(recorder)
+	if len(evs) != 2 || !strings.Contains(evs[0], "Warning StaleLoopDevice") {
+		t.Errorf("events = %v, want two Warning StaleLoopDevice", evs)
+	}
+}
+
+func TestStaleLoopDevicesOffDetachesNothing(t *testing.T) {
+	t.Parallel()
+
+	exec := storage.NewFakeExec()
+	w := &DRBDWorkaroundsRunnable{
+		Reader:   workaroundReader(t),
+		Adm:      &fakeWorkaroundAdm{},
+		Exec:     exec,
+		NodeName: workaroundNode,
+		Config:   WorkaroundsConfig{Interval: 1, IdlePrimary: true},
+		Hints:    func() WorkaroundHints { return WorkaroundHints{} },
+		SysBlock: fakeSysBlock(t, map[string]string{"loop0": "/"}),
+	}
+
+	w.pass(t.Context(), logr.Discard())
+
+	if got := exec.CommandLines(); len(got) != 0 {
+		t.Errorf("check off ran %q", got)
 	}
 }

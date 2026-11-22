@@ -21,6 +21,9 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -35,6 +38,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -74,6 +78,10 @@ type WorkaroundsConfig struct {
 	// ForcedIOFailures takes down and up a Secondary nobody uses that
 	// still fails I/O (checkForcedIOFailures).
 	ForcedIOFailures bool
+
+	// StaleLoopDevices detaches loop devices whose backing file is gone
+	// with its mount (detachStaleLoopDevices).
+	StaleLoopDevices bool
 }
 
 // The plunger's cadence: a pass every 30 s, a resync stalled for 4 of
@@ -91,6 +99,7 @@ func DefaultWorkaroundsConfig() WorkaroundsConfig {
 		StalledResyncPasses: defaultStalledResyncPasses,
 		IdlePrimary:         true,
 		ForcedIOFailures:    true,
+		StaleLoopDevices:    true,
 	}
 }
 
@@ -120,6 +129,10 @@ type DRBDWorkaroundsRunnable struct {
 	// Busy reports a resource an apply or delete is changing right now;
 	// nil reports none.
 	Busy func(name string) bool
+
+	// SysBlock is where the block devices are listed in sysfs; empty
+	// means /sys/block.
+	SysBlock string
 
 	// stalls is the resync progress of each resource across passes.
 	stalls map[string]resyncProgress
@@ -186,6 +199,10 @@ func (w *DRBDWorkaroundsRunnable) RegisterWithManager(mgr manager.Manager) error
 
 // pass runs every enabled check once.
 func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) {
+	if w.Config.StaleLoopDevices {
+		w.detachStaleLoopDevices(ctx, logger)
+	}
+
 	if !w.kernelStatusWanted() {
 		w.stalls, w.idle, w.failingIO = nil, nil, nil
 
@@ -448,4 +465,90 @@ func (w *DRBDWorkaroundsRunnable) checkForcedIOFailures(
 	if err != nil {
 		w.failed(logger, err, res.Name, "bring up a Secondary that was failing I/O")
 	}
+}
+
+// Workaround for loop devices left behind with their backing file gone.
+// For a raw block volume kubelet binds the device node to a file under
+// its plugin directory and attaches a loop device to that file to pin the
+// device while a pod uses it; when the bind mount is gone and the loop
+// device was not detached (kubelet leaving loop devices behind:
+// https://github.com/kubernetes/kubernetes/issues/102408), the loop
+// device keeps the DRBD device open, so the replica can neither be
+// demoted nor taken down, and the volume cannot move or be deleted. The
+// kernel then reports the loop device's backing file as "/" (or
+// "/ (deleted)"): the path of a file that was a mount of its own, once
+// that mount is gone (https://github.com/util-linux/util-linux/issues/4166).
+// A backing file that still exists is never "/", so such a loop device is
+// detached; the detach of one still open only marks it to go away on its
+// last close. Same check as the plunger, which reads the same sysfs file
+// through `losetup --json`; reading sysfs directly costs no command on a
+// node without such a loop device.
+
+// defaultSysBlock is where sysfs lists the block devices.
+const defaultSysBlock = "/sys/block"
+
+// staleLoopDevices lists the loop devices under sysBlock whose backing
+// file reads "/" or "/ (deleted)".
+func staleLoopDevices(sysBlock string) []string {
+	files, err := filepath.Glob(filepath.Join(sysBlock, "loop*", "loop", "backing_file"))
+	if err != nil {
+		return nil
+	}
+
+	var stale []string
+
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			// Detached between the glob and the read.
+			continue
+		}
+
+		switch strings.TrimRight(string(raw), "\n") {
+		case "/", "/ (deleted)":
+			stale = append(stale, "/dev/"+filepath.Base(filepath.Dir(filepath.Dir(file))))
+		}
+	}
+
+	return stale
+}
+
+// detachStaleLoopDevices detaches every loop device whose backing file is
+// gone with its mount.
+func (w *DRBDWorkaroundsRunnable) detachStaleLoopDevices(ctx context.Context, logger logr.Logger) {
+	sysBlock := w.SysBlock
+	if sysBlock == "" {
+		sysBlock = defaultSysBlock
+	}
+
+	stale := staleLoopDevices(sysBlock)
+	if len(stale) == 0 {
+		return
+	}
+
+	node := w.node(ctx)
+
+	for _, device := range stale {
+		w.acted(logger, node, device, "StaleLoopDevice", fmt.Sprintf(
+			"loop device %s has lost its backing file (reads as \"/\"): losetup --detach "+
+				"(kubernetes#102408)", device))
+
+		_, err := w.Exec.Run(ctx, "losetup", "--detach", device)
+		if err != nil {
+			w.failed(logger, err, device, "detach a stale loop device")
+		}
+	}
+}
+
+// node is blockstor's Node of this satellite, read from the cache, to
+// record node-wide actions on; nil when it cannot be read.
+func (w *DRBDWorkaroundsRunnable) node(ctx context.Context) runtime.Object {
+	var node blockstoriov1alpha1.Node
+
+	err := w.Reader.Get(ctx, client.ObjectKey{Name: naming.Key(w.NodeName)}, &node)
+	if err != nil {
+		return nil
+	}
+
+	return &node
 }
