@@ -222,8 +222,8 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	}
 
 	// Scenario 2.15 scheduled tick — only fires when no Node is
-	// inside its grace window. The placer's idempotent already-placed
-	// accounting keeps a clean cluster a no-op.
+	// inside its grace window. The gate's place-count check keeps a
+	// clean cluster a no-op that reads nothing past the cache.
 	if r.graceGateActive(gracePeriod) {
 		return nil
 	}
@@ -264,6 +264,10 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // rebalanceChildren. The gated passes leave out a definition without
 // DRBD before the balance checks, as LINSTOR's BalanceResources
 // ignores one before it reads anything else.
+//
+// It returns how many definitions the placer ran on. A definition
+// skipped by the gate is not counted, the settled ones included, so a
+// scheduled pass over a group that has every replica returns 0.
 func (r *RGRebalanceReconciler) rebalanceChildRDs(
 	ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, children rebalanceChildren, gated bool,
 ) (int, error) {

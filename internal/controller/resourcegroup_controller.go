@@ -73,17 +73,20 @@ type ResourceGroupReconciler struct {
 
 // Reconcile finds every RD spawned from this RG and runs the placer
 // to backfill replicas missing under the new spec. Idempotent: an
-// RG without any change still passes through, the placer's
-// already-placed accounting prevents extra Resources.
+// RG without any change still passes through, and a definition whose
+// diskful replicas already reach the place count is skipped before
+// the placer runs, so no extra Resources appear.
 //
 // Any RG event lands here, the initial list on a controller start
 // included, so this is a placement nobody asked for; LINSTOR places
 // nothing on an RG event at all. It leaves alone every definition
 // LINSTOR's balance task would (balanceGate.skipReason): one being
 // deleted, one with BalanceResourcesEnabled=false, which linstor-csi
-// sets while it deletes a volume's replicas, and one with no UpToDate
+// sets while it deletes a volume's replicas, one with no UpToDate
 // diskful replica on an online node, such as a volume deleted while its
-// snapshots keep the definition. An `rg modify` that names a place
+// snapshots keep the definition, and one whose diskful replicas already
+// reach the place count, which also keeps DisklessOnRemaining from
+// adding diskless replicas to it. An `rg modify` that names a place
 // count still reaches those through the rebalance-pending path, with
 // balancing on or off.
 func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

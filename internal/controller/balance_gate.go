@@ -41,16 +41,18 @@ const (
 	balanceSkipGone       = "definition is gone"
 	balanceSkipDisabled   = "BalanceResourcesEnabled is false"
 	balanceSkipNoUpToDate = "no diskful replica on an online node is UpToDate"
+	balanceSkipAtCount    = "diskful replicas already reach the place count"
 	modifySkipAtCount     = "replicas other than tiebreakers already reach the place count"
 )
 
 // balanceGate holds what one placement pass nobody asked for (the
 // scheduled rebalance tick, an RG watch event, an `rg modify` that did
 // not name a place count) reads once and applies to every child
-// definition: the controller-scope props and which nodes are online.
+// definition: the controller-scope props and the nodes.
 type balanceGate struct {
 	st        store.Store
 	ctrlProps map[string]string
+	nodes     []apiv1.Node
 	online    map[string]bool
 }
 
@@ -73,6 +75,8 @@ func newBalanceGate(ctx context.Context, st store.Store) (*balanceGate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
+
+	g.nodes = nodes
 
 	for i := range nodes {
 		if strings.EqualFold(nodes[i].ConnectionStatus, apiv1.NodeTypeOnline) {
@@ -97,14 +101,20 @@ func newBalanceGate(ctx context.Context, st store.Store) (*balanceGate, error) {
 //     reads that definition as short of its place count and gives it a
 //     full set of fresh, empty replicas. A replica on an offline node
 //     does not count: its DiskState is the last one its satellite sent,
-//     which LINSTOR does not hold for an offline peer either.
+//     which LINSTOR does not hold for an offline peer either;
+//   - a definition whose diskful replicas already reach the place count
+//     is skipped, as the task only adjusts one with fewer.
 //
 // The replicas are read from the cache first. A cache that shows no
-// UpToDate replica ends the check there: at worst a replica that just
-// went UpToDate waits for the next pass. Only a cache that shows one is
-// confirmed past the cache, because the window that matters is the one
-// right after the last replica went, which a stale cache still shows.
-// That keeps the uncached read to the definitions that get placed on.
+// UpToDate replica, or the place count reached, ends the check there:
+// at worst a replica that just went UpToDate, or the replacement for
+// one just deleted, waits for the next pass. Only a definition the
+// cache shows as one to place on is confirmed past the cache, because
+// the window that matters is the one right after the last replica
+// went, which a stale cache still shows. That keeps the uncached reads
+// to the definitions that get placed on: a settled cluster, where every
+// definition has its replicas, makes none, where a pass used to read
+// every definition and its replicas from the API server twice.
 //
 // The definition and group passed in, and the controller props, are
 // the ones the pass read when it started, and a pass over a large group
@@ -128,6 +138,10 @@ func (g *balanceGate) skipReason(ctx context.Context, rg *apiv1.ResourceGroup, r
 		return balanceSkipNoUpToDate, nil
 	}
 
+	if placer.DiskfulReplicaCount(cached, g.nodes) >= balancePlaceCount(rg) {
+		return balanceSkipAtCount, nil
+	}
+
 	reason, err := g.currentSkip(ctx, rg, rd.Name)
 	if err != nil || reason != "" {
 		return reason, err
@@ -143,6 +157,15 @@ func (g *balanceGate) skipReason(ctx context.Context, rg *apiv1.ResourceGroup, r
 	}
 
 	return "", nil
+}
+
+// balancePlaceCount is the place count a pass places rg's children to.
+func balancePlaceCount(rg *apiv1.ResourceGroup) int {
+	if rg.SelectFilter.PlaceCount == 0 {
+		return 1
+	}
+
+	return int(rg.SelectFilter.PlaceCount)
 }
 
 // definitionSkip is the part of skipReason that reads props and flags
