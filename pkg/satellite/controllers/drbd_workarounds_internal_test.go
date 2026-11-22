@@ -36,6 +36,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -645,5 +646,40 @@ func TestStaleLoopDevicesOffDetachesNothing(t *testing.T) {
 
 	if got := exec.CommandLines(); len(got) != 0 {
 		t.Errorf("check off ran %q", got)
+	}
+}
+
+// The manager's runnable reads its checks from the satellite's config,
+// its hints from the observer and its busy resources from the apply.
+func TestNewDRBDWorkaroundsRunnableWiresConfigHintsAndBusy(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{
+		NodeName:    workaroundNode,
+		Apply:       satellite.NewReconciler(satellite.ReconcilerConfig{NodeName: workaroundNode}),
+		Exec:        storage.NewFakeExec(),
+		Workarounds: DefaultWorkaroundsConfig(),
+	}
+	observer := &ObserverRunnable{}
+	observer.mergeResource(&observation{ResourceName: "a", HasResource: true, Role: drbdRolePrimary})
+
+	w := newDRBDWorkaroundsRunnable(workaroundReader(t).(client.Client), cfg, observer)
+
+	if w.Config != DefaultWorkaroundsConfig() || w.NodeName != workaroundNode || w.Exec == nil || w.Adm == nil {
+		t.Errorf("runnable = %+v, want the satellite's config", w)
+	}
+
+	if w.Hints == nil || !w.Hints().Primary {
+		t.Error("hints are not the observer's")
+	}
+
+	if w.Busy == nil || w.Busy("a") {
+		t.Error("busy is not the apply's")
+	}
+
+	// A zero interval registers nothing (and touches no manager).
+	off := &DRBDWorkaroundsRunnable{}
+	if err := off.RegisterWithManager(nil); err != nil {
+		t.Errorf("zero interval: %v", err)
 	}
 }
