@@ -64,6 +64,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/rest"
 	"github.com/cozystack/blockstor/pkg/store"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
@@ -204,6 +205,14 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 			"address", flags.restAddr)
 	}
 
+	// Every resource view derives the encryption state, and linstor-csi
+	// polls the view; the watches keep that off the API server while
+	// nothing changes.
+	encryptionWatches, err := passphrase.AddWatchedReader(mgr, namespace)
+	if err != nil {
+		return errors.Wrap(err, "add the passphrase watches")
+	}
+
 	err = mgr.Add(&rest.Server{
 		Addr:      flags.restAddr,
 		TLS:       tlsOptions(flags),
@@ -213,6 +222,7 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 		// The passphrase Secret is read past the cache, so no informer
 		// watches every Secret in the cluster for it.
 		SecretReader: mgr.GetAPIReader(),
+		StateReader:  encryptionWatches,
 		OnReady:      ready.MarkBound,
 	})
 	if err != nil {
