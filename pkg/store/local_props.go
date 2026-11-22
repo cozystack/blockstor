@@ -255,6 +255,18 @@ func TravellingProps(props map[string]string) map[string]string {
 	delete(out, CloneSnapshotReapingProp)
 	delete(out, SnapshotDeletingProp)
 
+	// A resource connection links the replicas of THIS definition on two
+	// nodes; a copy has replicas of its own, placed anew. LINSTOR does not
+	// copy a definition's connections either, so a clone or a restore of a
+	// volume caught mid live migration does not start out with a
+	// connection that allows two Primaries. The definition-level props of
+	// the migration (the Internal/Drbd/LiveMigrate marks, and
+	// allow-two-primaries when both ends were diskless) do travel, as they
+	// do in LINSTOR.
+	maps.DeleteFunc(out, func(key, _ string) bool {
+		return strings.HasPrefix(key, apiv1.ResourceConnectionPropsPrefix)
+	})
+
 	// A passphrase property left on a group or a definition from before the
 	// Secret was the only source is never read, and copying it would put the
 	// plaintext key into every definition a clone, a spawn, a snapshot or a
