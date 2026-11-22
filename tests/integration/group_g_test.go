@@ -825,6 +825,12 @@ func testGroupGSnapOrphanCleanup(t *testing.T, stack *harness.Stack, cli *harnes
 	// satellite tore down — that lives on the satellite side and
 	// is out of scope for this Tier 2 file (see the function-
 	// level doc above).
+	//
+	// This check runs a couple of seconds after the DELETE, inside
+	// the 10s wait budget, so it only shows the delete waits for the
+	// finalizer, which it did before the budget stopped applying to
+	// online nodes too. That a delete keeps waiting past the budget
+	// is pinned by the pkg/rest unit tests, which shorten it.
 	select {
 	case res := <-answered:
 		t.Fatalf("orphan: snapshot delete answered (%d, %v) while the satellite finalizer still held it",
