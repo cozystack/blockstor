@@ -27,26 +27,62 @@ import (
 )
 
 // A clone or a restore of a volume caught mid live migration gets the
-// definition's props, as LINSTOR copies them, but not the resource
-// connection that allowed two Primaries: the copy's replicas are its own.
-func TestTravellingPropsLeaveTheResourceConnectionsBehind(t *testing.T) {
+// definition's props, as LINSTOR copies them, but not the migration: the
+// copy runs on no VM and nobody will close a migration on it. The
+// connection that allowed two Primaries stays behind, and what the
+// migration wrote on the definition is reverted as unmake-available would.
+func TestTravellingPropsLeaveTheMigrationBehind(t *testing.T) {
 	t.Parallel()
 
-	src := map[string]string{
-		apiv1.ResourceConnectionPropKey("node-a", "node-b", "DrbdOptions/Net/allow-two-primaries"): "yes",
-		apiv1.ResourceConnectionPropKey("node-a", "node-b", "DrbdOptions/Net/protocol"):            "C",
-		"Internal/Drbd/LiveMigrate/SourceNode":                                                     "node-a",
-		"Internal/Drbd/LiveMigrate/TargetNode":                                                     "node-b",
-		"DrbdOptions/Net/protocol":                                                                 "A",
+	tests := []struct {
+		name string
+		src  map[string]string
+		want map[string]string
+	}{
+		{
+			name: "connection scope",
+			src: map[string]string{
+				apiv1.ResourceConnectionPropKey("node-a", "node-b", "DrbdOptions/Net/allow-two-primaries"): "yes",
+				apiv1.ResourceConnectionPropKey("node-a", "node-b", "DrbdOptions/Net/protocol"):            "C",
+				"Internal/Drbd/LiveMigrate/SourceNode":                                                     "node-a",
+				"Internal/Drbd/LiveMigrate/TargetNode":                                                     "node-b",
+				"Internal/Drbd/LiveMigrate/ProtocolSetOn":                                                  "RSC_CONN",
+				"DrbdOptions/Net/protocol":                                                                 "A",
+			},
+			want: map[string]string{"DrbdOptions/Net/protocol": "A"},
+		},
+		{
+			name: "two diskless ends, on the definition",
+			src: map[string]string{
+				"DrbdOptions/Net/allow-two-primaries":     "yes",
+				"DrbdOptions/Net/protocol":                "C",
+				"Internal/Drbd/LiveMigrate/SourceNode":    "node-a",
+				"Internal/Drbd/LiveMigrate/TargetNode":    "node-b",
+				"Internal/Drbd/LiveMigrate/ProtocolSetOn": "RSC_DFN",
+				"Internal/Drbd/LiveMigrate/PrevProtocol":  "A",
+			},
+			want: map[string]string{"DrbdOptions/Net/protocol": "A"},
+		},
+		{
+			name: "allow-two-primaries a client set, without marks",
+			src: map[string]string{
+				"DrbdOptions/Net/allow-two-primaries": "yes",
+				"DrbdOptions/Net/protocol":            "C",
+			},
+			want: map[string]string{
+				"DrbdOptions/Net/allow-two-primaries": "yes",
+				"DrbdOptions/Net/protocol":            "C",
+			},
+		},
 	}
 
-	want := map[string]string{
-		"Internal/Drbd/LiveMigrate/SourceNode": "node-a",
-		"Internal/Drbd/LiveMigrate/TargetNode": "node-b",
-		"DrbdOptions/Net/protocol":             "A",
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if got := store.TravellingProps(src); !maps.Equal(got, want) {
-		t.Fatalf("travelling props\n got %v\nwant %v", got, want)
+			if got := store.TravellingProps(tc.src); !maps.Equal(got, tc.want) {
+				t.Fatalf("travelling props\n got %v\nwant %v", got, tc.want)
+			}
+		})
 	}
 }
