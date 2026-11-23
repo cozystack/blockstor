@@ -197,17 +197,29 @@ func askRDRetry(ctx context.Context, d time.Duration) {
 
 // nextTiebreakerDeadline returns how long until the earliest of the
 // RD's witness deadlines (the suppression after a witness delete, the
-// keep-tiebreaker window) passes, when one is still ahead. The witness
-// decision changes when it passes, and no event marks the moment.
+// keep-tiebreaker window, the placement hold) passes, when one is still
+// ahead. The witness decision changes when it passes, and no event
+// marks the moment: a placement that dies before it removes its hold
+// writes nothing to the RD again.
 func nextTiebreakerDeadline(rd *blockstoriov1alpha1.ResourceDefinition, now time.Time) (time.Duration, bool) {
 	var (
 		earliest time.Duration
 		found    bool
 	)
 
+	// The witness waits for the last placement still holding the RD.
+	held, _ := apiv1.PlacementInProgressUntil(rd.Annotations, now)
+	deadlines := []time.Time{held}
+
 	for _, key := range []string{apiv1.AutoTiebreakerSuppressedUntilAnnotation, apiv1.KeepTiebreakerUntilAnnotation} {
 		deadline, err := time.Parse(time.RFC3339, rd.Annotations[key])
-		if err != nil || !deadline.After(now) {
+		if err == nil {
+			deadlines = append(deadlines, deadline)
+		}
+	}
+
+	for _, deadline := range deadlines {
+		if !deadline.After(now) {
 			continue
 		}
 
@@ -663,7 +675,9 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // is for: a three-replica placement two replicas in looks like the
 // even-diskful tie a witness breaks, and the witness would land on the
 // node the third replica is for. The placement removing the annotation
-// wakes the RD, and the decision is made on the replicas it placed.
+// wakes the RD, and the decision is made on the replicas it placed; a
+// hold nobody removes brings the RD back when it runs out
+// (nextTiebreakerDeadline).
 func isPlacementInProgress(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	_, ok := apiv1.PlacementInProgressUntil(rd.Annotations, time.Now())
 
@@ -1466,10 +1480,22 @@ func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context,
 		return err
 	}
 
+	hosting := make(map[string]bool, len(live))
+	for i := range live {
+		hosting[naming.Key(live[i].NodeName)] = true
+	}
+
 	for i := range live {
 		if !offline[naming.Key(live[i].NodeName)] {
 			for _, peer := range kernelPeersOf(&live[i]) {
 				excluded[naming.Key(peer)] = true
+
+				// The survivor dropping the old connection is a status
+				// write, which does not wake the RD (SetupWithManager),
+				// so come back for the witness once it is gone.
+				if !hosting[naming.Key(peer)] {
+					askRDRetry(ctx, rdReconcileRequeue)
+				}
 			}
 		}
 
