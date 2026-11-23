@@ -426,6 +426,10 @@ func aggregateRDStats(resList []apiv1.Resource) map[string]rdFaultyStats {
 // and the blockstor CLI list under `--faulty`. Skipping it for its
 // empty disk states hid exactly the replicas that hold no data.
 func isResourceFaulty(r *apiv1.Resource) bool {
+	// A nil InUse comes only from ForgetSatelliteState: the k8s store
+	// always answers a role, false when none was reported. Answering
+	// nil there for an unreported role would list every such replica
+	// here.
 	if r.State.InUse == nil && !anyReportedDiskState(r) {
 		return true
 	}
