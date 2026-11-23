@@ -72,7 +72,21 @@ type BlockSizeReleaseReconciler struct {
 	// last replica went while the controller was not watching. Zero is
 	// blockSizeSweepInterval.
 	SweepInterval time.Duration
+
+	// conflicts counts each definition's back-to-back releases that lost
+	// an optimistic-concurrency race, for releaseLoudAfter.
+	conflictsMu sync.Mutex
+	conflicts   map[string]int
 }
+
+// releaseLoudAfter is the run of back-to-back lost races on one
+// definition after which they are logged at the default verbosity. A
+// race from normal churn goes through within a retry or two; a run this
+// long means another writer keeps rewriting the definition and the
+// release is starving, and with the conflict kept out of the error log
+// and the reconcile-error metric this line is what still shows it. It
+// is conflict.LoudAfter of #316, which this branch does not carry.
+const releaseLoudAfter = 10
 
 // blockSizeSweepInterval is the default sweep period. A definition is
 // released on the second sweep that finds it empty, so a definition whose
@@ -86,7 +100,60 @@ const blockSizeSweepInterval = 10 * time.Minute
 // +kubebuilder:rbac:groups=blockstor.org,resources=controllerconfigs,verbs=get;list;watch
 
 // Reconcile runs for a definition one of whose replicas was deleted.
+//
+// A release whose patch carries an optimistic lock fails with a
+// Conflict when another writer updated the definition since the read,
+// which a burst of volume deletions does all the time. The next pass
+// re-reads the definition and decides again, so that is not a failure:
+// returned, controller-runtime logged it as "Reconciler error" at ERROR
+// on every such burst. Requeue, not RequeueAfter, keeps the per-object
+// backoff an error would get.
 func (r *BlockSizeReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	result, err := r.release(ctx, req)
+	if !apierrors.IsConflict(err) {
+		r.forgetConflicts(req.Name)
+
+		return result, err
+	}
+
+	streak := r.countConflict(req.Name)
+
+	level := 1
+	if streak >= releaseLoudAfter {
+		level = 0
+	}
+
+	logf.FromContext(ctx).V(level).Info("block size release raced another writer, retrying",
+		"resourceDefinition", req.Name, "conflicts", streak, "error", err.Error())
+
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// countConflict counts a lost race on the definition and returns the
+// run so far.
+func (r *BlockSizeReleaseReconciler) countConflict(name string) int {
+	r.conflictsMu.Lock()
+	defer r.conflictsMu.Unlock()
+
+	if r.conflicts == nil {
+		r.conflicts = map[string]int{}
+	}
+
+	r.conflicts[name]++
+
+	return r.conflicts[name]
+}
+
+// forgetConflicts ends the definition's run after any other outcome, a
+// deleted definition included, so the count does not outlive it.
+func (r *BlockSizeReleaseReconciler) forgetConflicts(name string) {
+	r.conflictsMu.Lock()
+	defer r.conflictsMu.Unlock()
+
+	delete(r.conflicts, name)
+}
+
+func (r *BlockSizeReleaseReconciler) release(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if r.Lock != nil {
 		mu := r.Lock(req.Name)
 		mu.Lock()
@@ -142,22 +209,11 @@ func (r *BlockSizeReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return r.patchRelease(ctx, &rd, base)
 }
 
-// patchRelease writes the released definition. The patch carries an
-// optimistic lock, and another writer updating the definition since the
-// read, which a burst of volume deletions does all the time, fails it
-// with a Conflict. The next pass re-reads the definition and decides
-// again, so that is not a failure: returned, controller-runtime logged
-// it as "Reconciler error" at ERROR on every such burst. Requeue, not
-// RequeueAfter, keeps the per-object backoff an error would get.
+// patchRelease writes the released definition under an optimistic
+// lock. The wrapped error still answers apierrors.IsConflict, which is
+// how Reconcile tells a lost race from a failure.
 func (r *BlockSizeReleaseReconciler) patchRelease(ctx context.Context, rd, base *blockstoriov1alpha1.ResourceDefinition) (ctrl.Result, error) {
 	err := r.Patch(ctx, rd, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
-	if apierrors.IsConflict(err) {
-		logf.FromContext(ctx).V(1).Info("block size release raced another writer, retrying",
-			"resourceDefinition", rd.Name, "error", err.Error())
-
-		return ctrl.Result{Requeue: true}, nil
-	}
-
 	if err != nil {
 		return ctrl.Result{}, cerrors.Wrapf(err, "release block size of %q", rd.Name)
 	}

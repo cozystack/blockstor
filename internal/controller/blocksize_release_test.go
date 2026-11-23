@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
@@ -336,4 +338,100 @@ func TestSweepGoesOnPastALostRace(t *testing.T) {
 	if !seen[raced.Name] {
 		t.Fatalf("the raced definition %q is no longer a candidate: %v", raced.Name, seen)
 	}
+}
+
+// raceLevels records the verbosity of every Info line.
+type raceLevels struct {
+	mu   sync.Mutex
+	info []int
+}
+
+func (l *raceLevels) last() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.info[len(l.info)-1]
+}
+
+type raceSink struct{ levels *raceLevels }
+
+func (raceSink) Init(logr.RuntimeInfo) {}
+func (raceSink) Enabled(int) bool      { return true }
+func (s raceSink) Info(level int, _ string, _ ...any) {
+	s.levels.mu.Lock()
+	defer s.levels.mu.Unlock()
+
+	s.levels.info = append(s.levels.info, level)
+}
+func (raceSink) Error(error, string, ...any)      {}
+func (s raceSink) WithValues(...any) logr.LogSink { return s }
+func (s raceSink) WithName(string) logr.LogSink   { return s }
+
+// TestReleaseStarvedByAWriterIsLogged: a release that keeps losing its
+// race to a writer rewriting the definition in a loop starves forever,
+// and with the conflict out of the error log and the reconcile-error
+// metric nothing showed it. The tenth lost race in a row on the same
+// definition is logged at the default verbosity; a pass that does not
+// conflict starts the count again.
+func TestReleaseStarvedByAWriterIsLogged(t *testing.T) {
+	t.Parallel()
+
+	var levels raceLevels
+
+	ctx := logf.IntoContext(context.Background(), logr.New(raceSink{levels: &levels}))
+
+	f := newBSFixture(map[string]string{blocksize.PropBlockSize: "4096", blocksize.PropFreeze: "True"})
+
+	var (
+		mu    sync.Mutex
+		raced = true
+	)
+
+	cli := releaseClient(t, func(name string) error {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if raced {
+			return releaseRaced(name)
+		}
+
+		return errBlockSizeReleaseBroken
+	}, f.rd)
+	rec := &controllerpkg.BlockSizeReleaseReconciler{Client: cli}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: bsRD}}
+
+	race := func(want int) {
+		t.Helper()
+
+		_, err := rec.Reconcile(ctx, req)
+		if err != nil {
+			t.Fatalf("Reconcile: %v, want the conflict retried", err)
+		}
+
+		if got := levels.last(); got != want {
+			t.Fatalf("lost race logged at V(%d), want V(%d)", got, want)
+		}
+	}
+
+	for range 9 {
+		race(1)
+	}
+
+	race(0)
+	race(0)
+
+	mu.Lock()
+	raced = false
+	mu.Unlock()
+
+	_, err := rec.Reconcile(ctx, req)
+	if !errors.Is(err, errBlockSizeReleaseBroken) {
+		t.Fatalf("Reconcile: %v, want the patch error", err)
+	}
+
+	mu.Lock()
+	raced = true
+	mu.Unlock()
+
+	race(1)
 }
