@@ -202,6 +202,12 @@ func TestLinstorCSIv113(t *testing.T) {
 		v113VolumeHealth(ctx, t, stack, c, "pvc-v113-a")
 	})
 
+	// v1.12+ consistency groups (--enable-consistency-groups): members
+	// share one deployed resource, one volume definition each.
+	t.Run("ConsistencyGroupMember", func(t *testing.T) {
+		v113ConsistencyGroupMember(ctx, t, c, "pvc-v113-a")
+	})
+
 	// Linstor.Resize.
 	t.Run("ControllerExpandVolume", func(t *testing.T) {
 		vd, err := c.ResourceDefinitions.GetVolumeDefinition(ctx, "pvc-v113-a", 0)
@@ -686,7 +692,135 @@ func v113Clone(ctx context.Context, t *testing.T, c *lapi.Client, src, target st
 		return err == nil && status.Status == clonestatus.Complete
 	}, "the clone of "+src+" to complete")
 
+	// linstor-csi after v1.13.2 puts every requested prop in the clone
+	// request and counts on the server applying them, and the deletes,
+	// right after copying the source's props.
+	rDef, err := c.ResourceDefinitions.Get(ctx, target)
+	if err != nil {
+		t.Fatalf("ResourceDefinitions.Get(%s): %v", target, err)
+	}
+
+	if rDef.Props["Aux/csi-volume-annotations"] != "{}" {
+		t.Errorf("clone override_props: Aux/csi-volume-annotations = %q, want {}", rDef.Props["Aux/csi-volume-annotations"])
+	}
+
+	if _, ok := rDef.Props[v113KeyCSI]; ok {
+		t.Errorf("clone delete_props: %s copied from the source", v113KeyCSI)
+	}
+
 	v113ReconcileInheritedProperties(ctx, t, c, target)
+	v113DropStaleFileSystemProps(ctx, t, c, target)
+}
+
+// v113DropStaleFileSystemProps is the tail of Linstor.reconcileVolumeDefinition
+// for a block volume made from a file system one, as linstor-csi sends it
+// after v1.13.2: a volume definition modify with delete_props only, which
+// must leave the size alone.
+func v113DropStaleFileSystemProps(ctx context.Context, t *testing.T, c *lapi.Client, rd string) {
+	t.Helper()
+
+	err := c.ResourceDefinitions.ModifyVolumeDefinition(ctx, rd, 0, lapi.VolumeDefinitionModify{
+		GenericPropsModify: lapi.GenericPropsModify{OverrideProps: map[string]string{"FileSystem/Type": "ext4"}},
+	})
+	if err != nil {
+		t.Fatalf("seed the inherited file system prop: %v", err)
+	}
+
+	before, err := c.ResourceDefinitions.GetVolumeDefinition(ctx, rd, 0)
+	if err != nil {
+		t.Fatalf("GetVolumeDefinition(%s): %v", rd, err)
+	}
+
+	err = c.ResourceDefinitions.ModifyVolumeDefinition(ctx, rd, 0, lapi.VolumeDefinitionModify{
+		GenericPropsModify: lapi.GenericPropsModify{DeleteProps: []string{"FileSystem/Type", "FileSystem/MkfsParams"}},
+	})
+	if err != nil {
+		t.Fatalf("ModifyVolumeDefinition with delete_props only: %v", err)
+	}
+
+	after, err := c.ResourceDefinitions.GetVolumeDefinition(ctx, rd, 0)
+	if err != nil {
+		t.Fatalf("GetVolumeDefinition(%s): %v", rd, err)
+	}
+
+	if after.SizeKib != before.SizeKib {
+		t.Errorf("a modify without size_kib changed the size: %d KiB, was %d", after.SizeKib, before.SizeKib)
+	}
+
+	if _, ok := after.Props["FileSystem/Type"]; ok {
+		t.Errorf("FileSystem/Type survived its delete_props")
+	}
+}
+
+// v113ConsistencyGroupMember is a consistency-group member's life on a
+// shared resource that is already deployed: reserveVolumeNumber creates
+// its volume definition without a volume number, a restore claims it with
+// a modify of override props only, and Delete of the member removes only
+// its volume definition.
+func v113ConsistencyGroupMember(ctx context.Context, t *testing.T, c *lapi.Client, rd string) {
+	t.Helper()
+
+	const (
+		csiVolumeName = "Aux/csi-volume-name"
+		member        = "pvc-v113-member"
+	)
+
+	err := c.ResourceDefinitions.CreateVolumeDefinition(ctx, rd, lapi.VolumeDefinitionCreate{
+		VolumeDefinition: lapi.VolumeDefinition{
+			SizeKib: v113SizeKiB,
+			Props:   map[string]string{csiVolumeName: member},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolumeDefinition without a volume number: %v", err)
+	}
+
+	vds, err := c.ResourceDefinitions.GetVolumeDefinitions(ctx, rd)
+	if err != nil {
+		t.Fatalf("GetVolumeDefinitions(%s): %v", rd, err)
+	}
+
+	vn := -1
+
+	for i := range vds {
+		if vds[i].VolumeNumber != nil && vds[i].Props[csiVolumeName] == member {
+			vn = int(*vds[i].VolumeNumber)
+		}
+	}
+
+	if vn <= 0 {
+		t.Fatalf("the member's volume definition: number %d in %+v, want a new one", vn, vds)
+	}
+
+	err = c.ResourceDefinitions.ModifyVolumeDefinition(ctx, rd, vn, lapi.VolumeDefinitionModify{
+		GenericPropsModify: lapi.GenericPropsModify{OverrideProps: map[string]string{csiVolumeName: member}},
+	})
+	if err != nil {
+		t.Fatalf("claim the restored volume number: %v", err)
+	}
+
+	vd, err := c.ResourceDefinitions.GetVolumeDefinition(ctx, rd, vn)
+	if err != nil || vd.SizeKib != v113SizeKiB {
+		t.Errorf("after the claim: size %d (%v), want %d", vd.SizeKib, err, v113SizeKiB)
+	}
+
+	if err := nil404(c.ResourceDefinitions.DeleteVolumeDefinition(ctx, rd, vn)); err != nil {
+		t.Fatalf("DeleteVolumeDefinition of the member: %v", err)
+	}
+
+	harness.Eventually(t, v113Timeout, func() bool {
+		_, err := c.ResourceDefinitions.GetVolumeDefinition(ctx, rd, vn)
+
+		return errors.Is(err, lapi.NotFoundError)
+	}, "the member's volume definition to go")
+
+	if _, err := c.ResourceDefinitions.GetVolumeDefinition(ctx, rd, 0); err != nil {
+		t.Errorf("the shared resource's other volume after the member went: %v", err)
+	}
+
+	if reses, err := c.Resources.GetAll(ctx, rd); err != nil || len(reses) == 0 {
+		t.Errorf("the shared resource's replicas after the member went: %d (%v)", len(reses), err)
+	}
 }
 
 // v113DeleteSnapshot is Linstor.DeleteSnapshot for an in-cluster snapshot.
