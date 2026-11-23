@@ -2014,7 +2014,9 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 		// of CreateVolume so the new replica starts populated with
 		// the snapshot's data. Idempotent: provider's clone op skips
 		// when the target volume already exists.
-		err := r.materializeVolume(ctx, provider, dr.GetName(), vol)
+		lowerDisk := lowerDiskKib(dr, vol)
+
+		err := r.materializeVolume(ctx, provider, dr.GetName(), vol, lowerDisk)
 		if err != nil {
 			return nil, false, false, errors.Wrapf(err, "create/restore volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
@@ -2097,6 +2099,45 @@ func (r *Reconciler) growBacking(
 	return step.retryResize, nil
 }
 
+// lowerDiskKib is the size, in KiB, of the lower disk a volume is
+// created at; a grow sizes it the same way (growBackingKib).
+//
+// Under DRBD with internal metadata the lower disk holds the data area
+// and the metadata after it, so it is sized like LINSTOR sizes it: the
+// data area plus the metadata blockstor writes on it (DefaultGeometry,
+// the most peer slots blockstor creates). A lower disk the definition's
+// size exposes a DRBD device smaller than the volume, and the kernel
+// refuses to attach it to a resource whose device is already larger.
+//
+// The data area is the definition's size or the largest device any
+// replica reports, whichever is larger. A volume adopted from LINSTOR
+// was sized for LINSTOR's peer slots and rounded up to its pool's
+// allocation unit, so its device can be a few KiB larger than the
+// definition, and a replica joining it must hold that.
+//
+// External metadata lives on its own volume and a resource without DRBD
+// has no metadata, so their lower disk is the definition's size.
+//
+// A LUKS layer sits between DRBD and the storage and takes its header
+// from the front of the storage volume, so the storage volume holds the
+// header on top of whatever the layer above needs, as LINSTOR sizes it.
+// A volume adopted from LINSTOR was sized that way, and a replica
+// joining it without the header could not attach.
+func lowerDiskKib(dr *intent.DesiredResource, vol *intent.DesiredVolume) int64 {
+	size := vol.GetSizeKib()
+
+	if needsDRBD(dr.GetLayerStack()) && vol.GetMetaPool() == "" {
+		data := max(vol.GetSizeKib(), vol.GetDeviceSizeKib())
+		size = drbd.InternalMetadataGrossKiB(data, drbd.DefaultGeometry())
+	}
+
+	if needsLUKS(dr.GetLayerStack()) {
+		size += luks.HeaderKiB
+	}
+
+	return size
+}
+
 // deviceWaitTimeoutDefault/deviceWaitPollDefault back the same-named
 // ReconcilerConfig knobs when those are left zero (the production path).
 const (
@@ -2171,11 +2212,11 @@ func (r *Reconciler) waitForBlockDevice(ctx context.Context, device string) erro
 // fall back to a blank CreateVolume — DRBD network resync will
 // populate the data, at the cost of a known cloned-metadata vs
 // fresh-metadata GI mismatch on the wire (see Phase 11 notes).
-func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *intent.DesiredVolume) error {
+func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *intent.DesiredVolume, sizeKib int64) error {
 	target := storage.Volume{
 		ResourceName: rdName,
 		VolumeNumber: vol.GetVolumeNumber(),
-		SizeKib:      vol.GetSizeKib(),
+		SizeKib:      sizeKib,
 	}
 
 	src := vol.GetSourceSnapshot()

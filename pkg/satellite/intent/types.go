@@ -448,6 +448,14 @@ type DesiredVolume struct {
 	// after the backing grew is retried rather than forgotten, and
 	// reports the size only once the device shows it.
 	AppliedSizeKib int64
+
+	// DeviceSizeKib is the largest DRBD device size, in KiB, any replica
+	// of the definition reports for this volume; 0 when none reports
+	// one. A new lower disk must hold at least this much: the kernel
+	// refuses to attach a disk smaller than the device the resource
+	// already exposes, and a volume adopted from LINSTOR exposes a few
+	// KiB more than its definition.
+	DeviceSizeKib int64
 }
 
 // GetDiskOptions returns the volume's own disk options.
@@ -466,6 +474,16 @@ func (x *DesiredVolume) GetAppliedSizeKib() int64 {
 	}
 
 	return x.AppliedSizeKib
+}
+
+// GetDeviceSizeKib returns the largest DRBD device size any replica
+// reports for this volume, or 0.
+func (x *DesiredVolume) GetDeviceSizeKib() int64 {
+	if x == nil {
+		return 0
+	}
+
+	return x.DeviceSizeKib
 }
 
 // GetObservedGI returns the GI last reported for this volume, or "".

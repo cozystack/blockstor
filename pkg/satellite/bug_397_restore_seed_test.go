@@ -217,7 +217,7 @@ func TestMaterializeVolumeBug397RecordsBlankFallback(t *testing.T) {
 
 		// Every call within the budget requeues, never blank-creates.
 		for i := range restoreSnapshotMissingBudget {
-			err := rec.materializeVolume(t.Context(), prov, "pvc-bf", vol)
+			err := rec.materializeVolume(t.Context(), prov, "pvc-bf", vol, vol.GetSizeKib())
 			if !errors.Is(err, storage.ErrNotFound) {
 				t.Fatalf("attempt %d: expected ErrNotFound requeue, got %v", i+1, err)
 			}
@@ -233,7 +233,7 @@ func TestMaterializeVolumeBug397RecordsBlankFallback(t *testing.T) {
 		}
 
 		// Budget exhausted: now it concedes to the blank fallback.
-		if err := rec.materializeVolume(t.Context(), prov, "pvc-bf", vol); err != nil {
+		if err := rec.materializeVolume(t.Context(), prov, "pvc-bf", vol, vol.GetSizeKib()); err != nil {
 			t.Fatalf("materializeVolume (budget exhausted): %v", err)
 		}
 
@@ -261,7 +261,7 @@ func TestMaterializeVolumeBug397RecordsBlankFallback(t *testing.T) {
 			SourceSnapshot: "pvc-src:snap-1",
 		}
 
-		if err := rec.materializeVolume(t.Context(), prov, "pvc-clone", vol); err != nil {
+		if err := rec.materializeVolume(t.Context(), prov, "pvc-clone", vol, vol.GetSizeKib()); err != nil {
 			t.Fatalf("materializeVolume: %v", err)
 		}
 
