@@ -4,6 +4,30 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.17 — 2026-11-23
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #316 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.16; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.16
+
+- **A stalled resync is broken on the paused peer first (#314).** After the configured stalled passes the satellite disconnects the peer that `resync-suspended:dependency` paused, which releases the resync requests the active peer's replies defer to, and `drbdadm adjust` connects it again on the next pass; the plunger's reconnect of the active peer follows only if the same stall comes back.
+- **Slow and growing stalls count as stalled (#314).** A pass is stalled when out-of-sync fell by less than the floor, or when the active link holds exactly as many outstanding requests as before with almost nothing received; `--drbd-workaround-stalled-resync-min-rate` sets the floor (200 KiB/s), and a thin or `csums-alg` resync is left alone.
+- **Breaking a stall keeps a Primary's data and quorum (#314).** No link is dropped that would leave a Primary without an UpToDate disk, or while another configured connection of the node is down, and the active-peer fallback skips a late-added volume next to a Primary.
+- **The satellite says at start which DRBD workarounds run (#314).** One INFO line lists the interval and every check, or says why they are disabled, and a pass logs whether it read the kernel status only when that changes.
+- **blockstor serves linstor-csi v1.13 and advertises REST API 1.29.0 (#315).** Truncate, `delete_empty_resource_definition`, `auto_manage_dual_primary`, `unmake-available`, regular expressions in name filters, `props` filters and the REST 1.28 toggle-disk body are served; database export, API tokens, the drbd-reactorctl passthrough, DRBD client replicas and clone `volume_sizes` answer 501. The reported LINSTOR version is 1.35.0 and golinstor moves to v0.65.4.
+- **A VM live migration gets its dual Primary from the controller (#315).** make-available with `auto_manage_dual_primary` opens `allow-two-primaries` and protocol C on the one connection between source and target and answers once both satellites applied it (10 s at most), and unmake-available puts it back and removes the diskless attachment; refusals carry LINSTOR's codes.
+- **Resource connections have props of their own (#315).** They live on the definition, the satellite renders their `DrbdOptions/Net/*` keys into that connection's `net` section, and `linstor resource-connection list`, `set-property` and `drbd-peer-options` work on them.
+- **A deleted volume with snapshots no longer leaves its definition behind (#315).** Truncate and snapshot delete with `delete_empty_resource_definition` remove a definition left with neither a replica nor a snapshot, also on a retry, and a snapshot delete limited to some nodes is refused with 501 instead of being widened.
+- **Node and resource lists honour their filters (#315).** The node list filters by name and props, so a volume is no longer accessible on every node and a topology segment no longer spans the cluster, and the resource view honours `storage_pools`.
+- **A local pool's `free_space_mgr_name` is LINSTOR's `node;pool` (#315).** linstor-csi v1.13 took every pool for shared storage before.
+- **Every failure code is LINSTOR's (#315).** Codes that carried blockstor's own numbers, among them duplicate creates that carried none, now match golinstor's, which linstor-csi relies on to tell a lost create race from a failure.
+- **The DRBD layer carries a promotion score (#315 with #278).** The resource view always sends `promotion_score` and `may_promote`, derived from the reported disk states until a satellite has reported the kernel's, so linstor-csi's volume health no longer reports every volume unhealthy.
+- **A new volume reports its device path and counts against its pool from the start (#315 with #278 and #291).** A volume read waits up to 10 s for the satellite to report the device path before it answers without one, and the STORAGE layer carries the volume's size, so `overProvision` no longer offers a pool's full size again for each volume.
+- **A clone, snapshot or restore does not carry a live migration (#315).** What the migration wrote on the source is reverted on the copy, and the controller no longer turns a migration target's diskless attachment into a diskful replica.
+- **A write that lost an optimistic-concurrency race is retried quietly (#316).** The satellite Resource and Snapshot reconcilers and the controller Resource and ResourceDefinition reconcilers requeue a 409 Conflict at V(1) instead of logging `Reconciler error` at ERROR, and the tenth conflict in a row on one object is logged at the default level.
+- **A definition deleted mid-pass ends the pass quietly (#316).** A tiebreaker step that finds its definition gone or being deleted no longer logs an error.
+- **Device discovery no longer probes zvols (#316).** The zvol filter runs before the signature probes, so a zvol destroyed during a scan no longer fails `wipefs` with ENOENT and every scan runs four commands less per zvol.
+
 ## v0.4.0-alpha.16 — 2026-11-23
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #314 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.15; the entries below are what changed since.
