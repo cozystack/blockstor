@@ -386,6 +386,16 @@ func TestDisklessReplicaMeantToHaveDisk(t *testing.T) {
 		t.Errorf("after failed attaches: State = %q, want %q", got, "AttachFailed")
 	}
 
+	twoVolumes := stuck
+	twoVolumes.Volumes = []apiv1.Volume{
+		{VolumeNumber: 0, State: apiv1.VolumeState{DiskState: "UpToDate"}},
+		{VolumeNumber: 1, State: apiv1.VolumeState{DiskState: "Diskless"}},
+	}
+
+	if got := cellAt(t, view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{twoVolumes}}), 0, "State"); got != "AttachFailed" {
+		t.Errorf("one volume failing to attach: State = %q, want %q", got, "AttachFailed")
+	}
+
 	intended := diskful("node-3", "Diskless", 0)
 	intended.Flags = []string{apiv1.ResourceFlagDiskless}
 	intended.State.ToggleDiskRetries = 3

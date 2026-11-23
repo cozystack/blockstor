@@ -214,6 +214,10 @@ func stateCell(res *apiv1.Resource) string {
 		return "Diskless"
 	}
 
+	if res.State.ToggleDiskRetries > 0 && hasDisklessVolume(res) {
+		return stateAttachFailed
+	}
+
 	vol := worstVolume(res)
 	if vol == nil || vol.State.DiskState == "" {
 		return stateUnknown
@@ -223,11 +227,18 @@ func stateCell(res *apiv1.Resource) string {
 		return apiv1.SyncProgressState(replicationStateSyncTarget, done)
 	}
 
-	if strings.EqualFold(vol.State.DiskState, diskStateDiskless) && res.State.ToggleDiskRetries > 0 {
-		return stateAttachFailed
+	return vol.State.DiskState
+}
+
+// hasDisklessVolume reports whether any volume reports Diskless.
+func hasDisklessVolume(res *apiv1.Resource) bool {
+	for i := range res.Volumes {
+		if strings.EqualFold(res.Volumes[i].State.DiskState, diskStateDiskless) {
+			return true
+		}
 	}
 
-	return vol.State.DiskState
+	return false
 }
 
 // wantsDisk reports whether the replica is meant to have a disk.
