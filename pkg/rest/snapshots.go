@@ -628,6 +628,8 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.waitForSnapshotCreateVisible(r.Context(), rd, snap.Name)
+
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "snapshot created: " + snap.Name,
