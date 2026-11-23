@@ -536,11 +536,13 @@ func setConnection(t *testing.T, st store.Store, node, peer string, connected bo
 // off from one never reports the new size until the link is back.
 // LINSTOR answers that resize; waiting for such a replica held the PUT
 // and kept `vd l` at the old size for as long as the partition lasted.
-// A down connection to a diskless peer does not cap the grow.
+// A down connection to a diskless peer does not cap the grow. b reports
+// its peer as "A": DRBD names a connection the way the peer's node was
+// spelled when it was created, which need not match the node's key.
 func TestVDGrowSkipsReplicaCutOffFromDiskfulPeer(t *testing.T) {
 	st := seedGrow(t, map[string]int64{"a": growOldKib, "b": growOldKib, "c": growOldKib})
 	setConnection(t, st, "a", "b", false)
-	setConnection(t, st, "b", "a", false)
+	setConnection(t, st, "b", "A", false)
 	setConnection(t, st, "c", "diskless", false)
 
 	base, stop := startServerWithStore(t, st)

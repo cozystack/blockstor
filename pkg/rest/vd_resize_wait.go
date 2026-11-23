@@ -29,6 +29,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -133,7 +134,9 @@ func holdsBitmapSlot(rsc *apiv1.Resource) bool {
 
 // disconnectedPeers returns the peers in diskful that rsc's satellite
 // reports its DRBD connection to as down. A peer with no reported
-// connection is not counted: there is nothing to say it is down.
+// connection is not counted: there is nothing to say it is down. The
+// satellite keys a connection by the peer name DRBD reports, which need
+// not be spelled like the node, so names are matched as keys.
 func disconnectedPeers(rsc *apiv1.Resource, diskful []string) []string {
 	if rsc.LayerObject == nil || rsc.LayerObject.Drbd == nil {
 		return nil
@@ -142,13 +145,16 @@ func disconnectedPeers(rsc *apiv1.Resource, diskful []string) []string {
 	var out []string
 
 	for _, peer := range diskful {
-		if peer == rsc.NodeName {
+		if naming.Same(peer, rsc.NodeName) {
 			continue
 		}
 
-		conn, ok := rsc.LayerObject.Drbd.Connections[peer]
-		if ok && !conn.Connected {
-			out = append(out, peer)
+		for name, conn := range rsc.LayerObject.Drbd.Connections {
+			if naming.Same(name, peer) && !conn.Connected {
+				out = append(out, peer)
+
+				break
+			}
 		}
 	}
 
