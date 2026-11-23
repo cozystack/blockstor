@@ -221,19 +221,19 @@ func (r *BlockSizeReleaseReconciler) release(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	return r.patchRelease(ctx, &rd, base)
+	return ctrl.Result{}, r.patchRelease(ctx, &rd, base)
 }
 
 // patchRelease writes the released definition under an optimistic
 // lock. The wrapped error still answers apierrors.IsConflict, which is
 // how Reconcile tells a lost race from a failure.
-func (r *BlockSizeReleaseReconciler) patchRelease(ctx context.Context, rd, base *blockstoriov1alpha1.ResourceDefinition) (ctrl.Result, error) {
+func (r *BlockSizeReleaseReconciler) patchRelease(ctx context.Context, rd, base *blockstoriov1alpha1.ResourceDefinition) error {
 	err := r.Patch(ctx, rd, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 	if err != nil {
-		return ctrl.Result{}, cerrors.Wrapf(err, "release block size of %q", rd.Name)
+		return cerrors.Wrapf(err, "release block size of %q", rd.Name)
 	}
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // hasReplica reports whether any replica names the definition.
