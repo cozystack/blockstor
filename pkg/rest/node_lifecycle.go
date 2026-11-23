@@ -417,6 +417,12 @@ func (s *Server) handleNodeRestore(w http.ResponseWriter, r *http.Request) {
 // ranking. Surviving peer replicas are left alone so the
 // TieBreaker reconciler can stamp.
 //
+// As in LINSTOR, nothing on the lost node's disks is touched: the
+// replicas' volumes and the node's snapshot copies stay where they
+// are, the satellite finalizers are released by the store (see
+// store.ReplicaAbandoner), and a satellite that turns out to be
+// running tears down DRBD without deleting the storage.
+//
 // Refuses with 409 + FAIL_IN_USE (Bug 111) when the satellite is
 // `ONLINE` and/or any Resource CRD still references the node.
 // Upstream LINSTOR documents `n lost` as the "satellite is gone
