@@ -145,9 +145,8 @@ type observation struct {
 // HasQuorum gates merge: a frame without the field (older
 // kernels, peer-device frames) leaves the cached value alone.
 type volumeObservation struct {
-	VolumeNumber int32
-	DiskState    string
-	CurrentUUID  string
+	DiskState   string
+	CurrentUUID string
 	// BackingDev is the lower-disk path from the events2 `device`
 	// frame's `backing_dev:` field. Used by the observer to read the
 	// on-disk current-UUID via drbdmeta get-gi when events2 doesn't
@@ -159,9 +158,23 @@ type volumeObservation struct {
 	// while DiskState is data-bearing.
 	ProbedGI     string
 	OutOfSyncKib int64
+	// VolumeNumber sits with the bools below so the struct packs into
+	// fewer words: the observer ranges over its caches by value.
+	VolumeNumber int32
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
+	// Removed is an internal marker set by translateDeviceEvent for
+	// `destroy device` frames (drbdsetup emits one after a volume is
+	// torn down from the kernel — e.g. the `vd d` cascade adjusts the
+	// resource without that volume). mergeVolumes drops the entry from
+	// the per-resource volCache so the observer stops re-emitting the
+	// stale Status.Volumes[i] snapshot on every subsequent tick. Without
+	// it the cache never forgets the volume (events2 only ever ADDs to
+	// the cache otherwise), and the observer keeps re-applying a phantom
+	// `vN:Diskless` entry that the controller/satellite purge just
+	// removed — a permanent Status flap (Bug 399).
+	Removed bool
 
 	// SyncPeer is the peer a peer-device frame's out-of-sync count is
 	// about (its `conn-name`).
@@ -176,18 +189,6 @@ type volumeObservation struct {
 	// empty when the frame did not carry it. Not published to Status:
 	// only the DRBD workarounds' hints read it (workaround_hints.go).
 	Open string
-
-	// Removed is an internal marker set by translateDeviceEvent for
-	// `destroy device` frames (drbdsetup emits one after a volume is
-	// torn down from the kernel — e.g. the `vd d` cascade adjusts the
-	// resource without that volume). mergeVolumes drops the entry from
-	// the per-resource volCache so the observer stops re-emitting the
-	// stale Status.Volumes[i] snapshot on every subsequent tick. Without
-	// it the cache never forgets the volume (events2 only ever ADDs to
-	// the cache otherwise), and the observer keeps re-applying a phantom
-	// `vN:Diskless` entry that the controller/satellite purge just
-	// removed — a permanent Status flap (Bug 399).
-	Removed bool
 }
 
 // peerVolumeObservation carries the peer's view of one volume's
