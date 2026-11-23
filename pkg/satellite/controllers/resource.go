@@ -470,18 +470,10 @@ func (r *ResourceReconciler) enqueueResourcesForRG(ctx context.Context, obj clie
 // up. Pulled out of Reconcile to keep the orchestration under the
 // cyclomatic / funlen budgets.
 func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, error) {
-	var rd blockstoriov1alpha1.ResourceDefinition
-
-	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-
-		return ctrl.Result{}, errors.Wrap(err, "get parent RD")
+	rd, found, err := r.definitionForApply(ctx, res, logger)
+	if !found || err != nil {
+		return ctrl.Result{}, err
 	}
-
-	r.refreshDefinitionForFirstApply(ctx, res, &rd, logger)
 
 	// Read peer Resources fresh via APIReader (uncached). The c-r
 	// informer cache trails the apiserver by hundreds of milliseconds,
@@ -513,7 +505,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// election relies on (Bug 80).
 	adoptAuthoritativeFlags(res, peers)
 
-	err = r.checkLayerStackPinned(ctx, &rd)
+	err = r.checkLayerStackPinned(ctx, rd)
 	if errors.Is(err, errLayerStackNotPinned) {
 		logger.Info("waiting for the controller to pin the layer stack", "rd", rd.Name)
 
@@ -529,13 +521,13 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// renders no .res and the kernel never sees a node-id, so waiting
 	// for the controller to stamp Status.DRBDNodeID/Port/Minor would
 	// block apply forever — they never come.
-	if rdNeedsDRBD(&rd) {
-		if waitResult, waitOK := r.prepareDRBDApply(ctx, res, &rd, peers, logger); !waitOK {
+	if rdNeedsDRBD(rd) {
+		if waitResult, waitOK := r.prepareDRBDApply(ctx, res, rd, peers, logger); !waitOK {
 			return waitResult, nil
 		}
 	}
 
-	desired, err := r.buildDesiredFromCRD(ctx, res, &rd, peers)
+	desired, err := r.buildDesiredFromCRD(ctx, res, rd, peers)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -548,7 +540,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	anyFailed := r.recordPerResourceFailures(res, results, logger)
 	r.recordDroppedOptions(res, results)
 
-	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
+	r.stampPostApply(ctx, res, rd, results, anyFailed, logger)
 
 	// Apply chain surfaces per-resource errors via results (e.g.
 	// drbdadm adjust failing on a stale .res rendered before the
@@ -571,7 +563,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// STORAGE-only RDs have no kernel-state to drift against, so
 	// keeping them quiet preserves the predicate's no-op-on-idle
 	// property.
-	if rdNeedsDRBD(&rd) {
+	if rdNeedsDRBD(rd) {
 		return ctrl.Result{RequeueAfter: activeDRBDRequeue}, nil
 	}
 
@@ -1446,6 +1438,29 @@ func (r *ResourceReconciler) waitForControllerAllocation(ctx context.Context, re
 	}
 
 	return ctrl.Result{}, true
+}
+
+// definitionForApply reads the replica's definition, past the cache
+// while the replica has never been applied here (see
+// refreshDefinitionForFirstApply). A definition that is gone is not
+// found and no error: there is nothing to apply.
+func (r *ResourceReconciler) definitionForApply(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger,
+) (*blockstoriov1alpha1.ResourceDefinition, bool, error) {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+
+		return nil, false, errors.Wrap(err, "get parent RD")
+	}
+
+	r.refreshDefinitionForFirstApply(ctx, res, &rd, logger)
+
+	return &rd, true, nil
 }
 
 // refreshDefinitionForFirstApply replaces the cached definition with the
