@@ -50,6 +50,8 @@ func demoteFixture(t *testing.T) (*satellite.Reconciler, *storage.FakeExec, []*i
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-demote_00000",
 		storage.FakeResponse{Stdout: []byte("")})
+	// blkid finds nothing on the fresh device, so the mkfs runs.
+	fx.Expect("blkid -p -o export /dev/drbd1000", storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
