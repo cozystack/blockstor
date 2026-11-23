@@ -528,8 +528,10 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 		return
 	}
 
+	// The kernel zeroes received on a reconnect (drbd_nl.c), so a drop
+	// means the link to the active peer is a new one: count afresh.
 	progress := resyncProgress{ResyncDependency: dep, At: w.now(), PausedTried: prev.PausedTried}
-	if seen && prev.Active == dep.Active && prev.Volume == dep.Volume {
+	if seen && prev.Active == dep.Active && prev.Volume == dep.Volume && dep.Received >= prev.Received {
 		progress.Passes = prev.Passes
 		if prev.stalled(&dep, progress.At.Sub(prev.At)) {
 			progress.Passes++

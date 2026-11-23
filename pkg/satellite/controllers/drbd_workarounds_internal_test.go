@@ -460,6 +460,25 @@ func TestStalledResyncLeavesAMovingResyncAlone(t *testing.T) {
 	})
 }
 
+// The kernel zeroes received when the link to the active peer connects
+// again, which makes the pass after it look like no data came in. That
+// link is a new one, so the count starts over there.
+func TestStalledResyncCountsAfreshWhenReceivedDrops(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	held := ramp(4, func(pass int64) resyncSample {
+		return resyncSample{oos: 900000 - pass*10000, received: 1_000_000 + pass*100, outstanding: 300}
+	})
+	reconnected := resyncSample{oos: 860000, received: 50, outstanding: 300}
+
+	if got := runResync(t, w, adm, "Secondary", append(held, reconnected)...); len(got) != 0 {
+		t.Errorf("counted the pass after a reconnect as stalled: %v", got)
+	}
+}
+
 // When disconnecting the paused peer did not get the resync moving, the
 // next action is the plunger's: disconnect and connect the active peer,
 // which also cleared a stall on the test cluster (alpha.7).
