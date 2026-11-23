@@ -86,6 +86,17 @@ func TestSatelliteRunsTheDRBDWorkaroundsByDefault(t *testing.T) {
 		!w.StalledResync || !w.IdlePrimary || !w.ForcedIOFailures || !w.StaleLoopDevices {
 		t.Errorf("defaults = %+v, want every check on, 30s, 4 passes, 200 KiB/s", w)
 	}
+
+	// A stalled-resync reconnect left a replica diverged from the
+	// Primary on the test cluster; it runs only when asked for.
+	if w.StalledResyncAct {
+		t.Errorf("defaults = %+v, want the stalled-resync check to report only", w)
+	}
+
+	opts, err = parseTestFlags("--node-name=n1", "--drbd-workaround-stalled-resync-act")
+	if err != nil || !opts.workarounds.StalledResyncAct {
+		t.Errorf("--drbd-workaround-stalled-resync-act = %+v, %v, want the action on", opts.workarounds, err)
+	}
 }
 
 // Each workaround has a flag of its own to turn it off.

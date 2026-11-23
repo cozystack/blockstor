@@ -20,6 +20,7 @@ package drbd_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -244,70 +245,52 @@ func TestKernelStatusResyncDependencyIsPerVolume(t *testing.T) {
 	}
 }
 
-// Dropping a peer is refused only where a Primary, here or the peer,
-// would be left with no UpToDate disk among this node and its other
-// connected peers.
-func TestKernelStatusMayDisconnect(t *testing.T) {
+// A Primary is ruled out only when this node is Secondary and sees every
+// configured peer Connected and Secondary: a peer that is not connected
+// may be Primary for all it knows.
+func TestKernelStatusPrimaryRuledOut(t *testing.T) {
 	t.Parallel()
 
-	// Shapes of the field stalls: this node Inconsistent, SyncTarget of
-	// a and paused toward b.
 	resources := kernelStatus(t, `[
-{"name":"secondaries","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
- "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
-  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]},
-{"name":"primary-peer-with-another","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
- "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
-  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]},
-{"name":"primary-peer-alone","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
- "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
-  {"name":"b","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
-{"name":"local-primary","role":"Primary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
- "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
-  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"Inconsistent"}]}]},
-{"name":"primary-peer-one-node-down","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
- "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
-  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
-  {"name":"c","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
-{"name":"local-primary-one-node-down","role":"Primary","devices":[{"volume":0,"disk-state":"UpToDate"}],
- "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
-  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"Inconsistent"}]},
-  {"name":"c","connection-state":"StandAlone","peer-role":"Unknown","peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
-{"name":"two-nodes","role":"Primary","devices":[{"volume":0,"disk-state":"UpToDate"}],
- "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]}
+{"name":"secondaries","role":"Secondary",
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary"},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary"}]},
+{"name":"primary-peer","role":"Secondary",
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary"},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary"}]},
+{"name":"local-primary","role":"Primary",
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary"}]},
+{"name":"peer-away","role":"Secondary",
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary"},
+  {"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]}
 ]`)
 
-	cases := []struct {
-		res  int
-		peer string
-		want bool
-	}{
-		{0, "a", true},
-		{0, "b", true},
-		// The Primary keeps b's copy.
-		{1, "a", true},
-		// b is no Primary, and this node is none either.
-		{1, "b", true},
-		// The Primary has no other UpToDate disk this node sees.
-		{2, "a", false},
-		// A local Inconsistent Primary reads from a alone.
-		{3, "a", false},
-		{3, "b", true},
-		// Four voters, c down: the Primary a sees three; without this
-		// node it would see two of four, no majority, although b keeps
-		// its data.
-		{4, "a", false},
-		// b is no Primary, and this node is none either.
-		{4, "b", true},
-		// This Primary's disk is good, but it would see two of four.
-		{5, "b", false},
-		// Two nodes: alone, a Primary has no majority.
-		{6, "a", false},
+	for i, want := range []bool{true, false, false, false} {
+		if got := resources[i].PrimaryRuledOut(); got != want {
+			t.Errorf("%s: PrimaryRuledOut() = %v, want %v", resources[i].Name, got, want)
+		}
 	}
+}
 
-	for _, c := range cases {
-		if got := resources[c.res].MayDisconnect(c.peer); got != c.want {
-			t.Errorf("%s: MayDisconnect(%s) = %v, want %v", resources[c.res].Name, c.peer, got, c.want)
+// The active peer of a resync dependency holds the only copy when the
+// paused peer, like this node, has no UpToDate disk of the volume: the
+// shape of an initial sync. An UpToDate paused peer is a second copy.
+func TestKernelStatusResyncDependencyActiveOnlyCopy(t *testing.T) {
+	t.Parallel()
+
+	shape := `{"name":"r","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
+ "connections":[
+  {"name":"a","connection-state":"Connected","peer-role":"Primary","peer_devices":[{"volume":0,
+   "replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":8}]},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,
+   "replication-state":"PausedSyncS","peer-disk-state":"%s","resync-suspended":"dependency","out-of-sync":8}]}]}`
+
+	for disk, want := range map[string]bool{"Inconsistent": true, "UpToDate": false} {
+		resources := kernelStatus(t, "["+fmt.Sprintf(shape, disk)+"]")
+
+		dep, ok := resources[0].ResyncDependency()
+		if !ok || dep.ActiveOnlyCopy != want {
+			t.Errorf("paused peer %s: dependency %+v, %v, want ActiveOnlyCopy %v", disk, dep, ok, want)
 		}
 	}
 }

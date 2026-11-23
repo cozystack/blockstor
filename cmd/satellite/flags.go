@@ -92,19 +92,25 @@ var errBadWorkaroundFlags = errors.New("--drbd-workarounds-interval must not be 
 // registerWorkaroundFlags registers the flags of the satellite's DRBD
 // workarounds (pkg/satellite/controllers/drbd_workarounds.go): all on by
 // default, each one can be turned off, and a zero interval turns off all.
+// The stalled-resync check only reports unless its act flag is set.
 func registerWorkaroundFlags(flagSet *flag.FlagSet, cfg *controllers.WorkaroundsConfig) {
 	def := controllers.DefaultWorkaroundsConfig()
 
 	flagSet.DurationVar(&cfg.Interval, "drbd-workarounds-interval", def.Interval,
 		"Time between passes of the DRBD workarounds; 0 turns them all off.")
 	flagSet.BoolVar(&cfg.StalledResync, "drbd-workaround-stalled-resync", def.StalledResync,
-		"Disconnect and connect again the peer whose resync waits on a stalled one, "+
-			"or failing that the peer the stalled resync pulls from (LINBIT/drbd#149).")
+		"Report a stalled resync (LINBIT/drbd#149) as a Warning Event with the drbdadm commands that would recover it.")
 	flagSet.IntVar(&cfg.StalledResyncPasses, "drbd-workaround-stalled-resync-passes", def.StalledResyncPasses,
-		"Passes in a row with too little resync progress before the stalled-resync workaround acts.")
+		"Passes in a row with too little resync progress before the stalled-resync workaround reports, or acts.")
 	flagSet.IntVar(&cfg.StalledResyncMinRate, "drbd-workaround-stalled-resync-min-rate", def.StalledResyncMinRate,
 		"Resync progress in KiB/s below which a pass counts as stalled; keep it under the resource's "+
 			"c-min-rate, or its resync-rate when the rate is fixed.")
+	flagSet.BoolVar(&cfg.StalledResyncAct, "drbd-workaround-stalled-resync-act", def.StalledResyncAct,
+		"RISKY: also run the commands --drbd-workaround-stalled-resync reports, where no Primary is in sight and the resync is not an initial sync: "+
+			"disconnect and connect again the peer whose resync waits on the stalled one, or failing that "+
+			"the peer the stalled resync pulls from. With a Primary writing, such a reconnect made a "+
+			"Secondary the SyncSource of another Secondary and left the two with different data while DRBD "+
+			"reported both UpToDate (LINBIT/drbd#153, LINBIT/drbd#143).")
 	flagSet.BoolVar(&cfg.IdlePrimary, "drbd-workaround-idle-primary", def.IdlePrimary,
 		"Demote a Primary with no volume open (DRBD auto-demote not firing, piraeus-operator#942).")
 	flagSet.BoolVar(&cfg.ForcedIOFailures, "drbd-workaround-forced-io-failures", def.ForcedIOFailures,

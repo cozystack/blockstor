@@ -160,6 +160,16 @@ type resyncSample struct {
 // is n2's role. percent-in-sync follows out-of-sync, as the kernel's
 // does.
 func resyncStatus(s resyncSample, n2Role string) string {
+	return stallShape{n1Role: "Secondary", n2Role: n2Role, n2Disk: "UpToDate"}.status(s)
+}
+
+// stallShape is the resyncStatus shape with the roles of both peers and
+// the paused peer's disk state set.
+type stallShape struct {
+	n1Role, n2Role, n2Disk string
+}
+
+func (shape stallShape) status(s resyncSample) string {
 	const sizeKiB = 50 << 20
 
 	percent := 100 * float64(sizeKiB-s.oos) / sizeKiB
@@ -167,13 +177,13 @@ func resyncStatus(s resyncSample, n2Role string) string {
 	return fmt.Sprintf(`[{"name":"pvc-stall","role":"Secondary",
  "devices":[{"volume":0,"disk-state":"Inconsistent","open":false}],
  "connections":[
-  {"name":"n1","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,
+  {"name":"n1","connection-state":"Connected","peer-role":%q,"peer_devices":[{"volume":0,
    "replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no",
    "received":%d,"out-of-sync":%d,"pending":0,"unacked":%d,"percent-in-sync":%.4f}]},
   {"name":"n2","connection-state":"Connected","peer-role":%q,"peer_devices":[{"volume":0,
-   "replication-state":"PausedSyncT","peer-disk-state":"UpToDate","resync-suspended":"dependency",
+   "replication-state":"PausedSyncT","peer-disk-state":%q,"resync-suspended":"dependency",
    "received":11840,"out-of-sync":2122972,"pending":0,"unacked":70,"percent-in-sync":0.58}]}]}]`,
-		s.received, s.oos, s.outstanding, percent, n2Role)
+		shape.n1Role, s.received, s.oos, s.outstanding, percent, shape.n2Role, shape.n2Disk)
 }
 
 // stalledStatus is the stall frozen: the same counts on every pass.
@@ -181,8 +191,9 @@ func stalledStatus(string) string {
 	return resyncStatus(resyncSample{oos: 14592, received: 113448, outstanding: 542}, "Secondary")
 }
 
+// stallConfig is the stalled-resync check with its action opted in.
 func stallConfig() WorkaroundsConfig {
-	return WorkaroundsConfig{Interval: 1, StalledResync: true, StalledResyncPasses: 4}
+	return WorkaroundsConfig{Interval: 1, StalledResync: true, StalledResyncPasses: 4, StalledResyncAct: true}
 }
 
 func drainEvents(recorder *events.FakeRecorder) []string {
@@ -294,42 +305,141 @@ func TestStalledResyncRetriesTheReconnectOfThePausedPeer(t *testing.T) {
 	}
 }
 
-// alpha.14: the paused peer was the Primary. It is still the one
-// disconnected, since the active source is another UpToDate copy the
-// Primary keeps.
-func TestStalledResyncDisconnectsAPausedPrimary(t *testing.T) {
+// By default the check only reports: one Warning Event, and the same
+// line in the log, with the commands that would do what it used to do,
+// for the node it runs on.
+func TestStalledResyncReportsOnlyByDefault(t *testing.T) {
 	t.Parallel()
 
-	adm := &fakeWorkaroundAdm{}
-	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+	cfg := stallConfig()
+	cfg.StalledResyncAct = false
 
-	got := runResync(t, w, adm, "Primary", frozen(5)...)
-	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
-		t.Errorf("actions = %v, want %v", got, want)
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, cfg, "pvc-stall")
+
+	if got := runResync(t, w, adm, "Secondary", frozen(5)...); len(got) != 0 {
+		t.Errorf("acted with --drbd-workaround-stalled-resync-act off: %v", got)
+	}
+
+	evs := drainEvents(recorder)
+	if len(evs) != 1 || !strings.Contains(evs[0], "Warning DRBDResyncStalled") ||
+		!strings.Contains(evs[0], "report-only") ||
+		!strings.Contains(evs[0], "by hand on n3: `drbdadm disconnect pvc-stall:n2`, "+
+			"then once the resync from n1 is done `drbdadm adjust pvc-stall`") {
+		t.Errorf("events = %v, want one report-only Warning with the manual commands", evs)
+	}
+
+	if DefaultWorkaroundsConfig().StalledResyncAct {
+		t.Error("the default config acts on a stalled resync")
 	}
 }
 
-// A Primary paused peer is not dropped while a node of the resource is
-// down: with four voters and one of them away, the Primary would see two
-// of four without this node and lose quorum. The active peer, no Primary,
-// is reconnected instead.
-func TestStalledResyncKeepsAPrimarysQuorum(t *testing.T) {
+// alpha.17 reboot test: the paused peer A was a Secondary and the active
+// one the Primary; after the disconnect of A and the reconnect, the
+// returning node became A's SyncSource while the Primary wrote, and A
+// ended up UpToDate with different data. With a Primary at either end,
+// here, or a peer that is not connected and could be one, the check
+// reports and does nothing, even opted in; the report names the hazard.
+func TestStalledResyncNeverActsWithAPrimaryInSight(t *testing.T) {
 	t.Parallel()
-
-	adm := &fakeWorkaroundAdm{}
-	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
 
 	down := `,{"name":"n4","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,
    "replication-state":"Off","peer-disk-state":"DUnknown","resync-suspended":"no"}]}]}]`
+	stall := frozen(1)[0]
 
-	for range 5 {
-		status := resyncStatus(frozen(1)[0], "Primary")
-		adm.status = strings.TrimSuffix(status, "]}]") + down
+	for name, status := range map[string]string{
+		"active Primary":     stallShape{n1Role: "Primary", n2Role: "Secondary", n2Disk: "UpToDate"}.status(stall),
+		"paused Primary":     resyncStatus(stall, "Primary"),
+		"local Primary":      strings.Replace(resyncStatus(stall, "Secondary"), `"role":"Secondary"`, `"role":"Primary"`, 1),
+		"peer not connected": strings.TrimSuffix(resyncStatus(stall, "Secondary"), "]}]") + down,
+	} {
+		adm := &fakeWorkaroundAdm{status: status}
+		w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		for range 9 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 {
+			t.Errorf("%s: actions = %v, want none", name, adm.actions)
+		}
+
+		evs := drainEvents(recorder)
+		if len(evs) != 2 || !strings.Contains(evs[0], "not acting, a Primary is in sight") ||
+			!strings.Contains(evs[0], "LINBIT/drbd#153") {
+			t.Errorf("%s: events = %v, want the stall reported on each count with the hazard", name, evs)
+		}
+	}
+}
+
+// alpha.17, issue 02: an initial sync from the importing Primary, the
+// paused peer as empty as this node. The active peer holds the only
+// UpToDate copy, and the check leaves it alone even with no Primary in
+// sight.
+func TestStalledResyncLeavesAnInitialSyncAlone(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	shape := stallShape{n1Role: "Secondary", n2Role: "Secondary", n2Disk: "Inconsistent"}
+
+	for _, sample := range frozen(9) {
+		adm.status = shape.status(sample)
 		w.pass(t.Context(), logr.Discard())
 	}
 
-	if want := []string{"disconnect pvc-stall:n1", "connect pvc-stall:n1"}; !slices.Equal(adm.actions, want) {
-		t.Errorf("actions = %v, want %v", adm.actions, want)
+	if len(adm.actions) != 0 {
+		t.Errorf("acted on an initial sync: %v", adm.actions)
+	}
+
+	evs := drainEvents(recorder)
+	if len(evs) != 2 || !strings.Contains(evs[0], "n1 holds the only UpToDate copy in sight, as in an initial sync") {
+		t.Errorf("events = %v, want the initial sync reported and left alone", evs)
+	}
+}
+
+// A paused peer the check disconnected is connected again only while no
+// Primary is in sight: a Primary that came up meanwhile is reported once
+// and waited out, and the reconnect follows once it is gone.
+func TestStalledResyncReconnectsThePausedPeerOnlyWithNoPrimaryInSight(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	if got := runResync(t, w, adm, "Secondary", frozen(5)...); !slices.Equal(got, []string{"disconnect pvc-stall:n2"}) {
+		t.Fatalf("actions = %v, want n2 disconnected", got)
+	}
+
+	drainEvents(recorder)
+
+	adm.actions = nil
+	adm.status = `[{"name":"pvc-stall","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"n1","connection-state":"Connected","peer-role":"Primary","peer_devices":[{"volume":0,
+  "replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0}]},
+  {"name":"n2","connection-state":"StandAlone","peer-role":"Unknown","peer_devices":[{"volume":0,
+  "replication-state":"Off","peer-disk-state":"DUnknown","resync-suspended":"no"}]}]}]`
+
+	w.pass(t.Context(), logr.Discard())
+	w.pass(t.Context(), logr.Discard())
+
+	if len(adm.actions) != 0 {
+		t.Errorf("connected n2 again with n1 Primary: %v", adm.actions)
+	}
+
+	evs := drainEvents(recorder)
+	if len(evs) != 1 || !strings.Contains(evs[0], "while a Primary is in sight") ||
+		!strings.Contains(evs[0], "`drbdadm adjust pvc-stall`") {
+		t.Errorf("events = %v, want the wait reported once with the manual command", evs)
+	}
+
+	adm.status = strings.Replace(adm.status, `"peer-role":"Primary"`, `"peer-role":"Secondary"`, 1)
+	w.pass(t.Context(), logr.Discard())
+	w.pass(t.Context(), logr.Discard())
+
+	if want := []string{"adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("actions once the Primary is gone = %v, want %v", adm.actions, want)
 	}
 }
 
@@ -352,22 +462,36 @@ func TestStalledResyncCatchesATrickle(t *testing.T) {
 	}
 }
 
-// alpha.7: application writes kept marking blocks out of sync, so
-// percent-in-sync went down, never the same twice, while the resync did
-// not move.
-func TestStalledResyncCatchesAGrowingOutOfSync(t *testing.T) {
+// alpha.17, issue 02: a writer outran the resync, so out-of-sync grew
+// for minutes while the resync was healthy. A pass on which it grew is no
+// stall, and it starts the count over: three stalled passes, a growing
+// one, three more stalled ones are no four in a row.
+func TestStalledResyncLeavesAGrowingOutOfSyncAlone(t *testing.T) {
 	t.Parallel()
 
 	adm := &fakeWorkaroundAdm{}
-	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
 
-	samples := ramp(5, func(pass int64) resyncSample {
-		return resyncSample{oos: 69132 + pass*600, received: 0, outstanding: 4278}
+	growing := ramp(9, func(pass int64) resyncSample {
+		return resyncSample{oos: 59_370_316 + pass*400_000, received: pass * 10_000, outstanding: 1328}
 	})
 
-	got := runResync(t, w, adm, "Secondary", samples...)
-	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
-		t.Errorf("actions = %v, want %v", got, want)
+	if got := runResync(t, w, adm, "Secondary", growing...); len(got) != 0 {
+		t.Errorf("acted while out-of-sync grew: %v", got)
+	}
+
+	adm.actions = nil
+
+	samples := frozen(4)
+	samples = append(samples, resyncSample{oos: 15592, received: 113448, outstanding: 542})
+	samples = append(samples, slices.Repeat([]resyncSample{{oos: 15592, received: 113448, outstanding: 542}}, 3)...)
+
+	if got := runResync(t, w, adm, "Secondary", samples...); len(got) != 0 {
+		t.Errorf("acted although out-of-sync grew in between: %v", got)
+	}
+
+	if evs := drainEvents(recorder); len(evs) != 0 {
+		t.Errorf("reported a growing out-of-sync as a stall: %v", evs)
 	}
 }
 
@@ -590,7 +714,7 @@ func lateAddStall(n2Role string) string {
 // On a volume added later, a reconnect of the active peer can end its
 // resync with the volume still Inconsistent, which only the late-add
 // kick recovers, and the kick waits while a replica is Primary. With a
-// Primary in sight the fallback is left out; without one it runs.
+// Primary in sight nothing is done; without one the fallback runs.
 func TestStalledResyncLeavesTheLateAddKickItsCase(t *testing.T) {
 	t.Parallel()
 
@@ -598,7 +722,7 @@ func TestStalledResyncLeavesTheLateAddKickItsCase(t *testing.T) {
 		n2Role string
 		want   []string
 	}{
-		{n2Role: "Primary", want: []string{"disconnect pvc-stall:n2", "adjust pvc-stall"}},
+		{n2Role: "Primary", want: nil},
 		{n2Role: "Secondary", want: []string{"disconnect pvc-stall:n2", "adjust pvc-stall", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}},
 	} {
 		adm := &fakeWorkaroundAdm{status: lateAddStall(tc.n2Role)}
@@ -613,7 +737,7 @@ func TestStalledResyncLeavesTheLateAddKickItsCase(t *testing.T) {
 		}
 
 		evs := drainEvents(recorder)
-		if left := slices.ContainsFunc(evs, func(ev string) bool { return strings.Contains(ev, "late-add kick") }); left != (tc.n2Role == "Primary") {
+		if left := slices.ContainsFunc(evs, func(ev string) bool { return strings.Contains(ev, "not acting") }); left != (tc.n2Role == "Primary") {
 			t.Errorf("n2 %s: events = %v", tc.n2Role, evs)
 		}
 	}
@@ -652,71 +776,6 @@ func TestStalledResyncRemembersThePausedPeerWasTried(t *testing.T) {
 			t.Errorf("after a pass with %s: actions = %v, want %s first", tc.between, got, tc.want)
 		}
 	}
-}
-
-// multiVolumeStall is the stall on volume 0 of a resource whose other
-// volumes have their only UpToDate copy on one peer each: volume 1 on
-// n2 alone, and, with both set, volume 2 on n1 alone.
-func multiVolumeStall(volume2 bool) string {
-	vol2Dev, vol2N1, vol2N2 := "", "", ""
-	if volume2 {
-		vol2Dev = `,{"volume":2,"disk-state":"Inconsistent"}`
-		vol2N1 = `,{"volume":2,"replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0}`
-		vol2N2 = `,{"volume":2,"replication-state":"Established","peer-disk-state":"Inconsistent","resync-suspended":"no","out-of-sync":0}`
-	}
-
-	return `[{"name":"pvc-stall","role":"Primary",
- "devices":[{"volume":0,"disk-state":"Inconsistent"},{"volume":1,"disk-state":"Inconsistent"}` + vol2Dev + `],
- "connections":[
-  {"name":"n1","connection-state":"Connected","peer-role":"Secondary","peer_devices":[
-   {"volume":0,"replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","received":1,"out-of-sync":14592,"unacked":542},
-   {"volume":1,"replication-state":"Established","peer-disk-state":"Inconsistent","resync-suspended":"no","out-of-sync":0}` + vol2N1 + `]},
-  {"name":"n2","connection-state":"Connected","peer-role":"Secondary","peer_devices":[
-   {"volume":0,"replication-state":"PausedSyncT","peer-disk-state":"UpToDate","resync-suspended":"dependency","out-of-sync":8},
-   {"volume":1,"replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0}` + vol2N2 + `]}]}]`
-}
-
-// This node is Primary: a link that is the only data path of one of its
-// volumes is never dropped. With the paused peer the only one, the active
-// one is reconnected instead; with both the only one of some volume,
-// nothing is done and the stall is reported.
-func TestStalledResyncNeverDropsAPrimarysOnlyDataPath(t *testing.T) {
-	t.Parallel()
-
-	t.Run("paused peer is the only path", func(t *testing.T) {
-		t.Parallel()
-
-		adm := &fakeWorkaroundAdm{status: multiVolumeStall(false)}
-		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
-
-		for range 5 {
-			w.pass(t.Context(), logr.Discard())
-		}
-
-		if want := []string{"disconnect pvc-stall:n1", "connect pvc-stall:n1"}; !slices.Equal(adm.actions, want) {
-			t.Errorf("actions = %v, want %v", adm.actions, want)
-		}
-	})
-
-	t.Run("both are", func(t *testing.T) {
-		t.Parallel()
-
-		adm := &fakeWorkaroundAdm{status: multiVolumeStall(true)}
-		w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
-
-		for range 5 {
-			w.pass(t.Context(), logr.Discard())
-		}
-
-		if len(adm.actions) != 0 {
-			t.Errorf("dropped a Primary's only data path: %v", adm.actions)
-		}
-
-		evs := drainEvents(recorder)
-		if len(evs) != 1 || !strings.Contains(evs[0], "left alone") {
-			t.Errorf("events = %v, want the stall reported and left alone", evs)
-		}
-	})
 }
 
 // The workarounds touch only resources blockstor has a replica of on this
@@ -1363,7 +1422,7 @@ func TestWorkaroundsLogTheirStateAtStart(t *testing.T) {
 			name: "enabled",
 			cfg:  cfg,
 			want: `"msg"="DRBD workarounds enabled" "interval"="30s" "stalledResync"=true "stalledResyncPasses"=4 ` +
-				`"stalledResyncMinRate"=200 "idlePrimary"=false "forcedIOFailures"=true "staleLoopDevices"=true`,
+				`"stalledResyncMinRate"=200 "stalledResyncAct"=false "idlePrimary"=false "forcedIOFailures"=true "staleLoopDevices"=true`,
 			runs: 1,
 		},
 		{
