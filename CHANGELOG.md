@@ -4,6 +4,20 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.16 — 2026-11-23
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #314 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.15; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.15
+
+- **The satellite runs the DRBD workarounds the LINSTOR-mode plunger sidecar ran (#314).** It reconnects the peer a resync stalled on (LINBIT/drbd#149), demotes a Primary nobody uses, takes down and up a Secondary nobody uses that still fails I/O, and detaches loop devices whose backing file is gone; nothing on disk is touched.
+- **Each workaround has its own flag (#314).** `--drbd-workaround-stalled-resync`, `--drbd-workaround-idle-primary`, `--drbd-workaround-forced-io-failures` and `--drbd-workaround-stale-loop-devices` are on by default, `--drbd-workaround-stalled-resync-passes` sets how many unchanged passes make a stall, and `--drbd-workarounds-interval` (30 s) set to `0` turns all of them off.
+- **The workarounds cost an idle node no command (#314).** A pass reads `drbdsetup status --json` only when the events2 observer's cache shows a Primary with no volume open, an Inconsistent volume or a resource failing I/O; loop devices are read from sysfs and replicas from the informer cache.
+- **A workaround acts only on a replica blockstor owns and nothing else is changing (#314).** It skips a replica being deleted, a resource an apply or delete holds, a volume whose open state the kernel does not report, and a replica that is the only UpToDate disk a connected Primary peer reaches; an apply that starts meanwhile waits for the workaround to finish.
+- **Every workaround action is a Warning Event (#314).** `DRBDResyncStalled`, `DRBDIdlePrimary`, `DRBDForcedIOFailures` and `DRBDWorkaroundUpFailed` land on the replica's Resource and `StaleLoopDevice` on the Node; an up that fails after a down is retried by every pass until it goes through.
+- **A replica promoted for mkfs is demoted even when the first demote fails (#314).** The satellite records the demote it owes before the promote and drops the record only once a demote went through, also across a restart; a device held open for a moment is waited for, and later applies retry every 30 seconds without failing.
+- **The demote after a failed mkfs is owed the same way (#314 with #269).** A replica whose mkfs was refused or failed is demoted at once, and a demote that does not go through then is retried by a later apply instead of leaving the replica Primary.
+
 ## v0.4.0-alpha.15 — 2026-11-22
 
 Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #313 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.14; the entries below are what changed since.
