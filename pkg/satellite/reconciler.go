@@ -3417,12 +3417,11 @@ func (r *Reconciler) allVolumesDay0Empty(ctx context.Context, dr *intent.Desired
 			return false
 		}
 
-		// backingHasUserFilesystem, NOT deviceHasFilesystem: the
-		// backing device of an internal-metadata DRBD volume always
-		// shows blkid TYPE=drbd (the meta superblock at its tail) —
-		// only a non-drbd signature is user data (stand forensics
-		// pinned this; the naive probe wedged the bypass forever).
-		if r.backingHasUserFilesystem(ctx, device) {
+		// The backing probe, NOT deviceHasFilesystem: a plain blkid on
+		// an internal-metadata backing device stops at the DRBD
+		// superblock at its tail. Only a probe that saw no filesystem
+		// at all lets the bypass through; Unknown refuses.
+		if r.probeBackingFilesystem(ctx, device) != filesystemAbsent {
 			return false
 		}
 	}
@@ -3458,18 +3457,30 @@ func (r *Reconciler) allVolumesDay0Empty(ctx context.Context, dr *intent.Desired
 //     in the SAME data generation as the local one, so the promote
 //     mints nothing unrelated and the mkfs writes replicate to peers
 //     that are by construction bit-identical to the local volume.
-//   - At least one local volume's backing device has NO USER
-//     filesystem signature (backingHasUserFilesystem — blkid that
-//     ignores TYPE=drbd, the internal-metadata superblock libblkid
-//     always sees at the backing device's tail; the naive probe
-//     wedged this gate forever on real hardware). Real data in the
-//     mkfs context means a filesystem (the RD requests
-//     FileSystem/Type; consumers only ever write through it), so a
-//     volume missing one both proves the retry is still needed and
-//     that there is nothing to destroy there; volumes that DO carry a
-//     filesystem are adopted untouched by runAutoMkfs's post-promote
-//     blkid probe on the replicated device (the Bug 311 partial-mkfs
-//     shape), which remains the per-volume double-mkfs safety net.
+//   - This replica was born empty here: its persisted
+//     Spec.SkipInitialSync is true, the controller's offline-safe
+//     record that it was created into a never-initialized RD
+//     generation, so its DRBD metadata and its bytes both started out
+//     as blockstor's own blank. A replica adopted from another storage
+//     controller (linstor-migrate stamps false on every replica),
+//     created into an already-initialized RD (relocate, extra
+//     replica), or not yet stamped (nil) refuses: its volume holds
+//     data blockstor never wrote, formatted or not, and the missing
+//     `.mkfs.done` marker says nothing about it (issue #265). This is
+//     the signal that tells such a volume apart: DRBD metadata on the
+//     backing device does not, since every blockstor volume has it.
+//   - Every local volume's backing device was probed and none is
+//     Unknown, and at least one has NO filesystem at all
+//     (probeBackingFilesystem, a `blkid -p` without the DRBD prober,
+//     which sees below the DRBD superblock). Real data in the mkfs
+//     context means a filesystem (the RD requests FileSystem/Type;
+//     consumers only ever write through it), so a volume missing one
+//     both proves the retry is still needed and that there is nothing
+//     to destroy there; volumes that DO carry a filesystem are adopted
+//     untouched by runAutoMkfs's post-promote blkid probe on the
+//     replicated device (the Bug 311 partial-mkfs shape). A volume the probe
+//     cannot read refuses the whole retry: the promote covers every
+//     volume of the resource.
 //   - Throttled through recoveryPromoteDue (shared with the Bug 366
 //     recovery-promote): the promote→demote dance churns kernel state
 //     and may race the external promoter's own cycle; one nudge per
@@ -3480,6 +3491,10 @@ func (r *Reconciler) allVolumesDay0Empty(ctx context.Context, dr *intent.Desired
 // that is genuinely missing its filesystem marker — never in steady
 // state.
 func (r *Reconciler) latchFreeMkfsRetryAllowed(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) bool {
+	if !bornEmptyReplica(dr) {
+		return false
+	}
+
 	if !r.isLowestDiskfulNodeID(dr) {
 		return false
 	}
@@ -3488,28 +3503,7 @@ func (r *Reconciler) latchFreeMkfsRetryAllowed(ctx context.Context, dr *intent.D
 		return false
 	}
 
-	// At least one desired volume must still be missing a USER
-	// filesystem (backing probe; TYPE=drbd is the internal-metadata
-	// signature, not user data) — otherwise there is nothing to retry.
-	// Volumes that already carry a filesystem are fine: runAutoMkfs's
-	// per-volume blkid probe on the promoted DRBD device adopts them
-	// untouched (the Bug 311 partial-mkfs shape).
-	anyVolumeNeedsMkfs := false
-
-	for _, vol := range dr.GetVolumes() {
-		device := devices[vol.GetVolumeNumber()]
-		if device == "" {
-			continue
-		}
-
-		if !r.backingHasUserFilesystem(ctx, device) {
-			anyVolumeNeedsMkfs = true
-
-			break
-		}
-	}
-
-	if !anyVolumeNeedsMkfs {
+	if !r.backingProvablyLacksFilesystem(ctx, dr, devices) {
 		return false
 	}
 
@@ -3528,6 +3522,42 @@ func (r *Reconciler) latchFreeMkfsRetryAllowed(ctx context.Context, dr *intent.D
 		"resource", dr.GetName())
 
 	return true
+}
+
+// bornEmptyReplica reports whether the controller recorded this replica
+// as created into a never-initialized RD generation
+// (Spec.SkipInitialSync=true). See latchFreeMkfsRetryAllowed for why
+// nothing else may be promoted for a filesystem retry.
+func bornEmptyReplica(dr *intent.DesiredResource) bool {
+	skip := dr.GetSkipInitialSync()
+
+	return skip != nil && *skip
+}
+
+// backingProvablyLacksFilesystem is the per-volume half of
+// latchFreeMkfsRetryAllowed: true when no volume's backing probe is
+// Unknown and at least one volume has no filesystem. A volume without
+// a device path has nothing to probe and nothing a promote could
+// format, so it is skipped.
+func (r *Reconciler) backingProvablyLacksFilesystem(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) bool {
+	anyVolumeNeedsMkfs := false
+
+	for _, vol := range dr.GetVolumes() {
+		device := devices[vol.GetVolumeNumber()]
+		if device == "" {
+			continue
+		}
+
+		switch r.probeBackingFilesystem(ctx, device) {
+		case filesystemAbsent:
+			anyVolumeNeedsMkfs = true
+		case filesystemPresent:
+		case filesystemUnknown:
+			return false
+		}
+	}
+
+	return anyVolumeNeedsMkfs
 }
 
 // isLowestDiskfulNodeID replicates the dispatcher's mkfs-winner
@@ -4385,12 +4415,20 @@ func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResou
 		return errors.Wrapf(err, "auto-primary %s", dr.GetName())
 	}
 
-	err = r.runAutoMkfs(ctx, dr, drbdDevicesForMkfs(dr))
-	if err != nil {
-		return errors.Wrapf(err, "auto-mkfs %s", dr.GetName())
+	// Demote whatever mkfs did, as LINSTOR's primaryAutoClose does: a
+	// refused or failed mkfs must not leave the replica Primary, where
+	// it blocks every other node from using the volume.
+	mkfsErr := r.runAutoMkfs(ctx, dr, drbdDevicesForMkfs(dr))
+	err = r.cfg.Adm.Secondary(ctx, dr.GetName())
+
+	if mkfsErr != nil {
+		if err != nil {
+			log.FromContext(ctx).Error(err, "auto-secondary after a failed mkfs", "resource", dr.GetName())
+		}
+
+		return errors.Wrapf(mkfsErr, "auto-mkfs %s", dr.GetName())
 	}
 
-	err = r.cfg.Adm.Secondary(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
 	}
@@ -4458,10 +4496,11 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 //  1. A per-RD `<rd>.mkfs.done` marker under StateDir (sibling to
 //     `.md-created`) records the durable "we already finished mkfs
 //     for every diskful volume" state. Cheap stat-only fast path.
-//  2. Per-volume `blkid -o export /dev/drbd<minor>` probe (mirroring
-//     upstream LINSTOR's `MkfsUtils.hasFileSystem`). When a volume
-//     already carries a filesystem we skip mkfs on that volume and
-//     adopt the existing fs — exactly upstream's behaviour. This
+//  2. Per-volume `blkid -p -o export /dev/drbd<minor>` probe
+//     (probeMkfsTarget, a fail-closed `MkfsUtils.hasFileSystem`).
+//     When a volume already carries a filesystem we skip mkfs on that
+//     volume and adopt the existing fs — exactly upstream's behaviour;
+//     when the probe cannot tell, nothing is formatted. This
 //     closes Bug 311: a previous reconcile that dropped `.md-created`
 //     but failed to write `.mkfs.done` (e.g. `drbdadm primary
 //     --force` raced the initial-sync handshake and returned a
@@ -4471,13 +4510,15 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 //     blkid probe makes that retry safe even on a volume that was
 //     partially mkfs'd before the failure.
 //
-// SAFETY: mkfs on a populated filesystem silently destroys data. The
-// blkid probe is what protects an already-formatted volume from
-// double-mkfs when the marker file is absent (manual `rm`, host
-// rebuild that wipes /etc/drbd.d). DeleteResource removes the marker
-// together with `.res` / `.md-created` so a re-created RD with the
-// same name correctly mkfs-s again — the blkid probe sees an empty
-// (freshly-carved) volume and lets mkfs run.
+// SAFETY: mkfs on a populated filesystem silently destroys data. A
+// replica that was not born empty (bornEmptyReplica) is never
+// formatted at all. On one that was, the blkid probe is what protects
+// an already-formatted volume from double-mkfs when the marker file is
+// absent (manual `rm`, host rebuild that wipes /etc/drbd.d).
+// DeleteResource removes the marker together with `.res` /
+// `.md-created` so a re-created RD with the same name correctly
+// mkfs-s again — the blkid probe sees an empty (freshly-carved)
+// volume and lets mkfs run.
 //
 // The devices parameter maps volNumber → device path mkfs should
 // target. DRBD-stacked callers pass `/dev/drbd<minor>` (mkfs MUST go
@@ -4489,6 +4530,17 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	fsType := strings.TrimSpace(dr.GetProps()["FileSystem/Type"])
 	if fsType == "" {
+		return nil
+	}
+
+	// Only a replica blockstor created empty is ever formatted, the way
+	// LINSTOR formats only at the creation of a resource. Every other
+	// replica (adopted from LINSTOR, created into an initialized RD,
+	// not stamped yet) holds bytes blockstor never wrote, and its
+	// missing `.mkfs.done` marker says nothing about them: the solo
+	// and recovery promotes and the storage-only path all reach here
+	// for it, and the probe below would be the only guard left.
+	if !bornEmptyReplica(dr) {
 		return nil
 	}
 
@@ -4525,44 +4577,12 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 		return nil
 	}
 
-	args := []string{}
-
-	if extra := strings.TrimSpace(dr.GetProps()["FileSystem/MkfsParams"]); extra != "" {
-		args = append(args, strings.Fields(extra)...)
+	err := r.mkfsVolumes(ctx, dr, devices, fsType)
+	if err != nil {
+		return err
 	}
 
-	for _, vol := range dr.GetVolumes() {
-		device := devices[vol.GetVolumeNumber()]
-		if device == "" {
-			// No device path for this volume → caller is a path that
-			// has nothing to mkfs (diskless replica, missing pickup).
-			// Storage-only callers always populate devices via
-			// applyStorage; DRBD callers always populate via
-			// drbdDevicesForMkfs. Skip rather than fail so this is a
-			// hot-path safety net, not a behavioural change.
-			continue
-		}
-
-		if r.deviceHasFilesystem(ctx, device) {
-			// Volume already carries a filesystem. Two cases land here:
-			// (a) a previous reconcile mkfs'd this volume but crashed
-			// before writing the marker — adopt the fs and continue;
-			// (b) the operator manually formatted the device — same
-			// treatment. Matches upstream LINSTOR's MkfsUtils.
-			// makeFileSystemOnMarked which short-circuits on a
-			// non-empty hasFileSystem result.
-			continue
-		}
-
-		cmdArgs := append(slices.Clone(args), device)
-
-		_, err := r.cfg.Exec.Run(ctx, "mkfs."+fsType, cmdArgs...)
-		if err != nil {
-			return errors.Wrapf(err, "mkfs.%s %s", fsType, device)
-		}
-	}
-
-	err := os.WriteFile(markerPath, nil, resFilePerm)
+	err = os.WriteFile(markerPath, nil, resFilePerm)
 	if err != nil {
 		return errors.Wrapf(err, "write %s", markerPath)
 	}
@@ -4598,72 +4618,175 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 	return nil
 }
 
-// deviceHasFilesystem reports whether the given DRBD device already
-// carries a recognised filesystem. Wraps `blkid -o export <device>`
-// the same way upstream LINSTOR's MkfsUtils.hasFileSystem does:
-// presence of a `TYPE=` line in the export-format output means the
-// kernel's libblkid detected a known filesystem signature. blkid's
-// exit-2 (no signature found) is folded into the FakeExec /
-// RealExec "non-zero exit → wrapped error" contract; we treat that
-// as "no filesystem" rather than propagating the error because the
-// caller's only sensible response is exactly the same: skip mkfs on
-// a populated volume, run it on an empty one.
-//
-// A real I/O failure (device gone, kernel returned EIO) also lands
-// in the error branch, but the subsequent mkfs.<type> on the same
-// device would fail just as loudly with a more actionable message
-// ("No such file or directory" / "Input/output error"), so the
-// fall-through to mkfs preserves the failure mode operators
-// already expect.
-func (r *Reconciler) deviceHasFilesystem(ctx context.Context, device string) bool {
-	out, err := r.cfg.Exec.Run(ctx, "blkid", "-o", "export", device)
-	if err != nil {
-		// Treat any blkid failure as "no recognised filesystem". The
-		// most common shape is exit-code 2 (no signature) which
-		// RealExec wraps into a generic error — the caller's only
-		// sensible reaction is to run mkfs, which is what the
-		// no-filesystem branch already does.
-		return false
+// errMkfsTargetUnknown is returned by mkfsVolumes for a device whose
+// probe could not prove it empty.
+var errMkfsTargetUnknown = errors.New("blkid cannot tell whether the device carries data")
+
+// mkfsVolumes is the per-volume half of runAutoMkfs: it formats every
+// volume of dr whose device the probe reads as empty, adopts every one
+// that already carries a filesystem, and stops at the first one it
+// cannot read.
+func (r *Reconciler) mkfsVolumes(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, fsType string) error {
+	args := []string{}
+
+	if extra := strings.TrimSpace(dr.GetProps()["FileSystem/MkfsParams"]); extra != "" {
+		args = append(args, strings.Fields(extra)...)
 	}
 
-	for line := range strings.SplitSeq(string(out), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "TYPE=") {
-			return true
+	for _, vol := range dr.GetVolumes() {
+		device := devices[vol.GetVolumeNumber()]
+		if device == "" {
+			// No device path for this volume → caller is a path that
+			// has nothing to mkfs (diskless replica, missing pickup).
+			// Storage-only callers always populate devices via
+			// applyStorage; DRBD callers always populate via
+			// drbdDevicesForMkfs. Skip rather than fail so this is a
+			// hot-path safety net, not a behavioural change.
+			continue
+		}
+
+		switch r.probeMkfsTarget(ctx, device) {
+		case filesystemPresent:
+			// Volume already carries a filesystem. Two cases land here:
+			// (a) a previous reconcile mkfs'd this volume but crashed
+			// before writing the marker — adopt the fs and continue;
+			// (b) the operator manually formatted the device — same
+			// treatment. Matches upstream LINSTOR's MkfsUtils.
+			// makeFileSystemOnMarked which short-circuits on a
+			// non-empty hasFileSystem result.
+			continue
+		case filesystemUnknown:
+			// No marker is written, so the next reconcile asks again.
+			return errors.Wrapf(errMkfsTargetUnknown, "refusing mkfs.%s %s", fsType, device)
+		case filesystemAbsent:
+		}
+
+		cmdArgs := append(slices.Clone(args), device)
+
+		_, err := r.cfg.Exec.Run(ctx, "mkfs."+fsType, cmdArgs...)
+		if err != nil {
+			return errors.Wrapf(err, "mkfs.%s %s", fsType, device)
 		}
 	}
 
-	return false
+	return nil
 }
 
-// backingHasUserFilesystem is the BACKING-device variant of
-// deviceHasFilesystem for the BUG-028 pre-promote probes. The backing
-// LV/zvol/loop of a DRBD-stacked volume with INTERNAL metadata always
-// carries the DRBD meta-data superblock at its tail, and libblkid
-// recognises it: `blkid -o export /dev/loopN` on a never-formatted
-// volume reports `TYPE=drbd`. Counting that as "a filesystem is
-// present" permanently wedged both BUG-028 probes on real hardware
-// (stand forensics: every fresh ganesha volume showed TYPE=drbd, the
-// bypass and the latch-free retry never fired, while the post-promote
-// probe on /dev/drbdN — which hides the metadata — correctly saw
-// nothing). Only a non-drbd TYPE counts as user data here; anything
-// else (no signature, probe failure, the drbd meta signature itself)
-// reads as "no filesystem". The post-promote blkid probe inside
-// runAutoMkfs on the DRBD device remains the authoritative
-// double-mkfs guard.
-func (r *Reconciler) backingHasUserFilesystem(ctx context.Context, device string) bool {
-	out, err := r.cfg.Exec.Run(ctx, "blkid", "-o", "export", device)
+// probeMkfsTarget is the last check before mkfs: a low-level `blkid
+// -p` on the device mkfs would write (`/dev/drbdN` while Primary, or
+// the raw or LUKS device of a storage-only stack), where no DRBD
+// superblock is visible. `-p` reads the device rather than the blkid
+// cache and reports several signatures at once as an error instead of
+// silently naming none. Upstream LINSTOR's MkfsUtils.hasFileSystem
+// reads any non-zero exit as "no filesystem" and formats; here only a
+// read-back "nothing found" does.
+func (r *Reconciler) probeMkfsTarget(ctx context.Context, device string) probedFilesystem {
+	return r.probeFilesystem(ctx, device, "-p")
+}
+
+// probedFilesystem is what a blkid probe could tell about a device.
+// Only filesystemAbsent licenses a promote or a mkfs; the zero value is
+// the conservative answer.
+type probedFilesystem int
+
+const (
+	// filesystemUnknown: the probe could not tell, or found something
+	// it cannot name (a partition table only, the DRBD signature
+	// itself, an ambivalent result).
+	filesystemUnknown probedFilesystem = iota
+	// filesystemAbsent: libblkid looked at every signature it was
+	// asked about, found none, and the start of the device reads back.
+	filesystemAbsent
+	// filesystemPresent: a filesystem or another non-DRBD signature
+	// (LUKS, an LVM PV, swap, a RAID member) is there.
+	filesystemPresent
+)
+
+// blkidNothingFound is the exit status `blkid -p` returns when it found
+// no signature; blkidErrorMarker prefixes its own error lines, which
+// storage.Exec folds into the returned error. Exit 2 alone does not
+// prove the device empty: util-linux 2.41 also exits 2 and prints
+// nothing for a path that does not exist and for a device whose reads
+// fail with EIO, so probeFilesystem reads the device back before it
+// believes the answer.
+const (
+	blkidNothingFound = 2
+	blkidErrorMarker  = "blkid: error:"
+)
+
+// signatureReadBackBytes is how much of the device probeFilesystem
+// reads with O_DIRECT to prove that a "nothing found" came from data
+// and not from failed reads. Every filesystem blockstor formats keeps
+// its superblock inside it (ext4 at 1 KiB, XFS at 0, btrfs at 64 KiB).
+const signatureReadBackBytes = "1M"
+
+// probeBackingFilesystem is the BACKING-device probe behind the BUG-028
+// pre-promote decisions: the DRBD device is unopenable while Secondary,
+// and with internal metadata the backing device carries the same data
+// bytes from offset 0.
+//
+// It has to leave the DRBD prober out. libblkid stops at the first
+// RAID-class signature it finds, and the DRBD meta-data superblock at
+// the device tail is one, so a plain `blkid` (or `blkid -p`) on an
+// internal-metadata volume reports TYPE=drbd and never the ext4 below
+// it. Reading that as "no filesystem" made every adopted LINSTOR volume
+// a promote+mkfs candidate (issue #265). `-n nodrbd` drops only that
+// prober, so LUKS, an LVM PV, swap or a RAID member a user put on the
+// volume is still seen (checked against util-linux 2.41.5 with real
+// drbdmeta metadata on loop devices: metadata alone exits 2, ext4,
+// crypto_LUKS, LVM2_member and swap under it report their TYPE, a
+// partition table under it reports PTTYPE only).
+//
+// DRBD keeps the backing device open, so the page cache libblkid reads
+// it through survives between probes, while replication from a peer
+// writes below that cache. `blockdev --flushbufs` drops the cached
+// pages first so a filesystem a peer formatted since the last probe is
+// seen; if it fails the answer is Unknown.
+func (r *Reconciler) probeBackingFilesystem(ctx context.Context, device string) probedFilesystem {
+	_, err := r.cfg.Exec.Run(ctx, "blockdev", "--flushbufs", device)
 	if err != nil {
-		return false
+		return filesystemUnknown
+	}
+
+	return r.probeFilesystem(ctx, device, "-p", "-n", "nodrbd")
+}
+
+// probeFilesystem runs `blkid <args> -o export device` and classifies
+// the answer. Only a clean "nothing found" on a device whose start
+// reads back is Absent. A TYPE other than drbd is Present. Any other
+// failure, a TYPE=drbd answer, or a find it cannot name is Unknown, and
+// no caller promotes or formats on Unknown.
+func (r *Reconciler) probeFilesystem(ctx context.Context, device string, args ...string) probedFilesystem {
+	out, err := r.cfg.Exec.Run(ctx, "blkid", append(slices.Clone(args), "-o", "export", device)...)
+	if err != nil {
+		var coded interface{ ExitCode() int }
+		if errors.As(err, &coded) && coded.ExitCode() == blkidNothingFound &&
+			!strings.Contains(err.Error(), blkidErrorMarker) && r.deviceReadsBack(ctx, device) {
+			return filesystemAbsent
+		}
+
+		return filesystemUnknown
 	}
 
 	for line := range strings.SplitSeq(string(out), "\n") {
 		value, ok := strings.CutPrefix(strings.TrimSpace(line), "TYPE=")
-		if ok && value != "drbd" {
-			return true
+		if ok && value != "" && value != "drbd" {
+			return filesystemPresent
 		}
 	}
 
-	return false
+	return filesystemUnknown
+}
+
+// deviceReadsBack reads the start of device with O_DIRECT, past any
+// page cache, and reports whether the read succeeded. It is what tells
+// blkid's "nothing found" apart from its identical answer for a missing
+// path or an EIO.
+func (r *Reconciler) deviceReadsBack(ctx context.Context, device string) bool {
+	_, err := r.cfg.Exec.Run(ctx, "dd", "if="+device, "of=/dev/null",
+		"bs="+signatureReadBackBytes, "count=1", "iflag=direct", "status=none")
+
+	return err == nil
 }
 
 // runApplyDRBDVerb is the per-reconcile dispatch for the bring-up
