@@ -33,21 +33,21 @@ import (
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
 )
 
-// countingReader stands in for the uncached apiserver reader and
+// roundTripCounter stands in for the uncached apiserver reader and
 // counts the round trips a reconcile makes through it.
-type countingReader struct {
+type roundTripCounter struct {
 	client.Reader
 
 	calls atomic.Int64
 }
 
-func (c *countingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+func (c *roundTripCounter) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	c.calls.Add(1)
 
 	return c.Reader.Get(ctx, key, obj, opts...)
 }
 
-func (c *countingReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+func (c *roundTripCounter) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
 	c.calls.Add(1)
 
 	return c.Reader.List(ctx, list, opts...)
@@ -96,7 +96,7 @@ func TestReconcileOfAllocatedReplicaSkipsApiserverReads(t *testing.T) {
 		WithObjects(rd, res).
 		Build()
 
-	reader := &countingReader{Reader: cli}
+	reader := &roundTripCounter{Reader: cli}
 	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme, APIReader: reader}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: resourceName}}
 
