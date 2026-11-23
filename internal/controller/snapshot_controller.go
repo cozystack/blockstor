@@ -20,12 +20,14 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -167,7 +169,16 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// unreachable in production; defensive guard so a hand-crafted
 	// Snapshot CRD with no Spec.Nodes doesn't hang the controller.
 	if len(snap.Spec.Nodes) == 0 {
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.failNodelessAutoSnapshot(ctx, &snap)
+	}
+
+	// The take is over on every node and every node confirmed the
+	// resume: record that
+	// on the Snapshot itself, as LINSTOR persists SUCCESSFUL on the
+	// snapshot definition. The record is what every reader trusts
+	// later, when the source replicas it was taken from may be gone.
+	if takeCompleted(siblings) {
+		return ctrl.Result{}, r.markSnapshotSuccessful(ctx, &snap)
 	}
 
 	next := r.nextPhase(&snap, siblings)
@@ -189,7 +200,8 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 	ctx context.Context, logger logr.Logger, snap *blockstoriov1alpha1.Snapshot,
 ) (ctrl.Result, error) {
-	if allNodesReady(snap.Status.NodeStatus, snap.Spec.Nodes) {
+	if allNodesReady(snap.Status.NodeStatus, snap.Spec.Nodes) &&
+		slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful) {
 		return ctrl.Result{}, nil
 	}
 
@@ -225,6 +237,14 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 			changed = true
 		}
 
+		// Migration only adopts snapshots LINSTOR had marked
+		// SUCCESSFUL, so the adopted copy carries the same record.
+		flags, marked := withSuccessfulFlag(current.Status.Flags)
+		if marked {
+			current.Status.Flags = flags
+			changed = true
+		}
+
 		if !changed {
 			return nil
 		}
@@ -238,6 +258,79 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 	logger.V(1).Info("backfilled adopted snapshot per-node status", "nodes", len(snap.Spec.Nodes))
 
 	return ctrl.Result{}, nil
+}
+
+// takeCompleted reports whether the orchestration of the batch has
+// finished successfully: every sibling's every targeted node took its
+// snapshot and has confirmed the resume. LINSTOR marks the snapshot
+// definitions SUCCESSFUL only once every satellite answered the
+// resume update; clearing Spec.SuspendIO is only the order, and a
+// node whose resume-io keeps failing is still frozen.
+// A failed node or an aborted take never gets here: the abort path
+// runs first and covers both.
+func takeCompleted(siblings []blockstoriov1alpha1.Snapshot) bool {
+	for i := range siblings {
+		if siblings[i].Spec.SuspendIO || siblings[i].Spec.TakeSnapshot {
+			return false
+		}
+	}
+
+	return allSiblingsReady(siblings) && allSiblingsSuspendCleared(siblings)
+}
+
+// withSuccessfulFlag adds SUCCESSFUL to a Snapshot's status flags.
+// The second result is false when nothing changed: the flag is
+// already there, or a failure marker is, which a later success
+// stamp must not contradict.
+func withSuccessfulFlag(flags []string) ([]string, bool) {
+	if slices.ContainsFunc(flags, isSnapshotOutcomeFlag) {
+		return flags, false
+	}
+
+	return append(slices.Clone(flags), blockstoriov1alpha1.SnapshotStatusFlagSuccessful), true
+}
+
+// markSnapshotSuccessful persists SUCCESSFUL on the Snapshot's status.
+// Idempotent, and retried against a fresh read so it converges with
+// the satellites' concurrent per-node status writes.
+func (r *SnapshotReconciler) markSnapshotSuccessful(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot,
+) error {
+	if _, marked := withSuccessfulFlag(snap.Status.Flags); !marked {
+		return nil
+	}
+
+	key := client.ObjectKeyFromObject(snap)
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var current blockstoriov1alpha1.Snapshot
+
+		getErr := r.Get(ctx, key, &current)
+		if getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				return nil
+			}
+
+			return errors.Wrap(getErr, "get Snapshot for SUCCESSFUL stamp")
+		}
+
+		// The pass may have decided on an older view of the snapshot
+		// than the abort that is now on record, in any of its copies.
+		if abortRecorded(&current) {
+			return nil
+		}
+
+		flags, marked := withSuccessfulFlag(current.Status.Flags)
+		if !marked {
+			return nil
+		}
+
+		current.Status.Flags = flags
+
+		return r.Status().Update(ctx, &current)
+	})
+
+	return errors.Wrap(err, "stamp Snapshot Status SUCCESSFUL")
 }
 
 // hasNodeStatusEntry reports whether a per-node status row for the
@@ -298,6 +391,20 @@ func (r *SnapshotReconciler) advancePhase(
 	// cycle — bounding the suspend-entry slip far under the ≤5s
 	// budget. Non-grouped (Bug-351 single-snap) Snapshots skip the
 	// barrier entirely and keep flipping their own flag.
+	// A take that has not suspended yet past its deadline is not
+	// started: it could only hold I/O for the moment the next pass
+	// aborts it. This is also where a take ends whose abort record was
+	// lost, e.g. to an Update by a satellite that predates the field
+	// while its status stamp had not landed.
+	if isPhase1Entry(snap, next) && suspendDeadlineExceeded(snap, time.Now()) {
+		logger.Info("aborting snapshot group: suspend deadline passed before the take started",
+			"group_id", snap.Spec.GroupID)
+
+		return r.abortGroupWithReason(ctx, siblings,
+			"snapshot aborted: the take did not start within the "+
+				snapshotSuspendDeadline.String()+" deadline; the take was not started")
+	}
+
 	if isPhase1Entry(snap, next) && snap.Spec.GroupID != "" {
 		return r.openGroupSuspendBarrier(ctx, logger, snap, siblings)
 	}
@@ -321,8 +428,7 @@ func (r *SnapshotReconciler) advancePhase(
 				"group_id", snap.Spec.GroupID, "node", offending)
 
 			return r.abortGroupWithReason(ctx, siblings,
-				"snapshot aborted: replica on node '"+offending+
-					"' is not UpToDate; resume of I/O requested")
+				notUpToDateAbortReason(offending, "resume of I/O requested"))
 		}
 	}
 
@@ -402,7 +508,35 @@ func (r *SnapshotReconciler) checkAbortConditions(
 			"group_id", snap.Spec.GroupID,
 			"failed_node", firstFailedNodeAcrossSiblings(siblings))
 
-		return true, ctrl.Result{}, r.abortGroup(ctx, siblings)
+		reason := "snapshot aborted: node '" + firstFailedNodeAcrossSiblings(siblings) +
+			"' failed to take its snapshot; resume of I/O requested"
+
+		err := r.abortGroup(ctx, siblings, reason)
+		if err != nil {
+			return true, ctrl.Result{}, err
+		}
+
+		err = r.stampGroupFailed(ctx, siblings, reason)
+		if err != nil || !groupRefusedNotUpToDate(siblings) {
+			return true, ctrl.Result{}, err
+		}
+
+		// A refusal on a non-UpToDate replica is deleted whatever else
+		// went wrong in the group, as LINSTOR deletes it.
+		return true, ctrl.Result{}, r.deleteRefusedGroup(ctx, logger, siblings)
+	}
+
+	// A take aborted on an earlier pass is over. Finish what that pass
+	// may have left undone: the resume on a sibling whose write did not
+	// land, and the status record. Without this the next pass would
+	// see a take that never started and freeze I/O again.
+	if reason, flag, ended := groupAbortReason(siblings); ended {
+		res, err := r.abortGroupWithFlag(ctx, siblings, flag, reason)
+		if err != nil || !isNotUpToDateAbort(reason) {
+			return true, res, err
+		}
+
+		return true, res, r.deleteRefusedGroup(ctx, logger, siblings)
 	}
 
 	if inSuspendPhase(snap, siblings) && suspendDeadlineExceeded(snap, time.Now()) {
@@ -475,8 +609,7 @@ func (r *SnapshotReconciler) openGroupSuspendBarrier(
 			"group_id", snap.Spec.GroupID, "node", offending)
 
 		return r.abortGroupWithReason(ctx, siblings,
-			"snapshot aborted: replica on node '"+offending+
-				"' is not UpToDate; I/O not suspended")
+			notUpToDateAbortReason(offending, "I/O not suspended"))
 	}
 
 	logger.V(1).Info("opening group suspend barrier",
@@ -581,6 +714,15 @@ type snapshotPhaseDecision struct {
 func (r *SnapshotReconciler) nextPhase(
 	snap *blockstoriov1alpha1.Snapshot, siblings []blockstoriov1alpha1.Snapshot,
 ) snapshotPhaseDecision {
+	// A take with a recorded outcome, or an abort on record, is over:
+	// the only move left is to resume. LINSTOR never starts the take
+	// of a snapshot definition again once it is SUCCESSFUL or failed.
+	for i := range siblings {
+		if takeEnded(&siblings[i]) {
+			return snapshotPhaseDecision{Advance: snap.Spec.SuspendIO || snap.Spec.TakeSnapshot}
+		}
+	}
+
 	switch {
 	case !snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot:
 		// Phase 1 not yet started (or already cleared post-abort
@@ -623,11 +765,26 @@ func (r *SnapshotReconciler) nextPhase(
 // Update entirely when the Spec already matches — pointless
 // ResourceVersion churn would race the satellite's Status.NodeStatus
 // stamps on every Reconcile pass.
+//
+// Once the take is over (takeEnded on the fresh read) it never sets
+// either flag again, whatever a pass working from an older view of
+// the batch asked for.
 func (r *SnapshotReconciler) maybeFlipSpec(
 	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, suspendIO, takeSnapshot bool,
 ) (ctrl.Result, error) {
-	if snap.Spec.SuspendIO == suspendIO && snap.Spec.TakeSnapshot == takeSnapshot {
-		return ctrl.Result{}, nil
+	return ctrl.Result{}, r.writeSpecFlags(ctx, snap, suspendIO, takeSnapshot, "")
+}
+
+// writeSpecFlags is maybeFlipSpec with an optional abort record: a
+// non-empty abortReason is stored in Spec.AbortReason by the same
+// update that clears the flags, so the resume and the record of the
+// abort land together or not at all.
+func (r *SnapshotReconciler) writeSpecFlags(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, suspendIO, takeSnapshot bool, abortReason string,
+) error {
+	if snap.Spec.SuspendIO == suspendIO && snap.Spec.TakeSnapshot == takeSnapshot &&
+		!needsAbortRecord(snap, abortReason) {
+		return nil
 	}
 
 	key := client.ObjectKeyFromObject(snap)
@@ -644,20 +801,97 @@ func (r *SnapshotReconciler) maybeFlipSpec(
 			return errors.Wrap(getErr, "get Snapshot for Spec flip")
 		}
 
-		if current.Spec.SuspendIO == suspendIO && current.Spec.TakeSnapshot == takeSnapshot {
+		if (suspendIO || takeSnapshot) && takeEnded(&current) {
+			return nil
+		}
+
+		record := needsAbortRecord(&current, abortReason)
+		if current.Spec.SuspendIO == suspendIO && current.Spec.TakeSnapshot == takeSnapshot && !record {
 			return nil
 		}
 
 		current.Spec.SuspendIO = suspendIO
 		current.Spec.TakeSnapshot = takeSnapshot
 
+		if record {
+			current.Spec.AbortReason = abortReason
+
+			if current.Annotations == nil {
+				current.Annotations = map[string]string{}
+			}
+
+			current.Annotations[blockstoriov1alpha1.AnnotationSnapshotAbortReason] = abortReason
+		}
+
 		return r.Update(ctx, &current)
 	})
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "flip Snapshot Spec flags")
+		return errors.Wrap(err, "flip Snapshot Spec flags")
 	}
 
-	return ctrl.Result{}, nil
+	return nil
+}
+
+// needsAbortRecord reports whether an abort with the given reason
+// still has to be recorded on snap: there is a reason, no abort is on
+// record yet in either copy, and the take did not already succeed. One
+// copy is enough: rewriting the spec copy an older CRD keeps pruning
+// would loop an Update on every pass.
+func needsAbortRecord(snap *blockstoriov1alpha1.Snapshot, abortReason string) bool {
+	return abortReason != "" && !abortRecorded(snap) &&
+		!slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful)
+}
+
+// recordedAbortReason is the abort on record for snap: Spec.AbortReason,
+// the annotation copy that survives a writer or CRD that drops the
+// field, or the SnapshotComplete=False condition the status stamp of an
+// abort sets, which no spec write touches.
+func recordedAbortReason(snap *blockstoriov1alpha1.Snapshot) string {
+	if snap.Spec.AbortReason != "" {
+		return snap.Spec.AbortReason
+	}
+
+	if reason := snap.Annotations[blockstoriov1alpha1.AnnotationSnapshotAbortReason]; reason != "" {
+		return reason
+	}
+
+	for i := range snap.Status.Conditions {
+		cond := &snap.Status.Conditions[i]
+		if cond.Type == blockstoriov1alpha1.SnapshotStatusConditionType && cond.Status == metav1.ConditionFalse {
+			if cond.Message != "" {
+				return cond.Message
+			}
+
+			return "snapshot aborted"
+		}
+	}
+
+	return ""
+}
+
+// abortRecorded reports whether an abort of snap is on record.
+func abortRecorded(snap *blockstoriov1alpha1.Snapshot) bool {
+	return recordedAbortReason(snap) != ""
+}
+
+// takeEnded reports whether a Snapshot's take is over for good: the
+// controller recorded an abort, or its status carries an outcome.
+func takeEnded(snap *blockstoriov1alpha1.Snapshot) bool {
+	return abortRecorded(snap) || slices.ContainsFunc(snap.Status.Flags, isSnapshotOutcomeFlag)
+}
+
+// failNodelessAutoSnapshot records FAILED on an auto-snapshot created
+// before auto-snapshots named their nodes. No satellite ever took it,
+// so it would otherwise stay without an outcome for good, and the
+// pruner, which deletes only finished takes, would keep it past the
+// budget. Any other Snapshot without nodes is left alone.
+func (r *SnapshotReconciler) failNodelessAutoSnapshot(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) error {
+	if snap.Labels[LabelAutoSnapshot] != labelTrueValue || takeEnded(snap) {
+		return nil
+	}
+
+	return r.stampSnapshotFailure(ctx, snap, blockstoriov1alpha1.SnapshotStatusFlagFailed,
+		"snapshot aborted: auto-snapshot created with no node to take it on; nothing was taken")
 }
 
 // allNodesSuspendAcked reports whether every targeted node has
@@ -876,7 +1110,8 @@ func firstFailedNodeAcrossSiblings(siblings []blockstoriov1alpha1.Snapshot) stri
 // abortGroup propagates the abort signal across every sibling in
 // the transactional batch — clearing Spec.SuspendIO and
 // Spec.TakeSnapshot on every Snapshot CRD that shares a GroupID
-// with the one that observed a Failed=true node. Without this
+// with the one that observed a Failed=true node, and recording the
+// reason in Spec.AbortReason in that same write. Without this
 // cascade, the un-failed siblings would stay in Phase 1 forever
 // waiting for the doomed sibling to ack — and their already-
 // suspended satellite peers would never resume I/O.
@@ -885,10 +1120,10 @@ func firstFailedNodeAcrossSiblings(siblings []blockstoriov1alpha1.Snapshot) stri
 // no-op when the sibling has already drained — so re-entering
 // abortGroup on a partially-drained group is idempotent.
 func (r *SnapshotReconciler) abortGroup(
-	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot,
+	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot, reason string,
 ) error {
 	for i := range siblings {
-		_, err := r.maybeFlipSpec(ctx, &siblings[i], false, false)
+		err := r.writeSpecFlags(ctx, &siblings[i], false, false, reason)
 		if err != nil {
 			return errors.Wrapf(err,
 				"abort cascade: clear SuspendIO on sibling %q", siblings[i].Name)

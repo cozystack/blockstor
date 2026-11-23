@@ -21,8 +21,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -34,7 +36,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // AutoSnapshot prop keys mirror upstream LINSTOR's namespaced keys
@@ -154,6 +159,12 @@ type AutoSnapshotRunnable struct {
 	// judges whether a restore from it is finished. Nil keeps every
 	// auto-snapshot a definition was restored from.
 	Store store.Store
+
+	// APIReader, when set, reads the replicas an auto-snapshot is
+	// taken from straight from the API server, as the store does on a
+	// REST create: a LUKS password a fresh replica was just given may
+	// not be in the cache yet. Nil reads through Client.
+	APIReader client.Reader
 }
 
 // NeedLeaderElection returns true: the cron writes Snapshot CRDs
@@ -218,7 +229,7 @@ func (r *AutoSnapshotRunnable) Tick(ctx context.Context) error {
 		// Skip RDs being torn down — creating a snapshot on a
 		// DeletionTimestamp-marked RD just produces a snapshot the
 		// downstream RD-delete will block on.
-		if !rd.DeletionTimestamp.IsZero() {
+		if !rd.DeletionTimestamp.IsZero() || slices.Contains(rd.Spec.Flags, rdFlagDelete) {
 			continue
 		}
 
@@ -260,9 +271,33 @@ func (r *AutoSnapshotRunnable) processRD(
 		return errors.Wrap(err, "parse NextAutoId")
 	}
 
+	skip, err := r.takeUnderWay(ctx, rd)
+	if err != nil {
+		return err
+	}
+
+	var target autoSnapshotTarget
+
+	if skip == "" {
+		target, skip, err = r.autoSnapshotTarget(ctx, rd)
+		if err != nil {
+			return err
+		}
+	}
+
+	if skip != "" {
+		// Nothing is booked, so the next tick tries again. Logged at
+		// V(1): the reason holds for as long as the node stays
+		// offline, and the tick runs every minute.
+		log.FromContext(ctx).WithName("auto-snapshot").V(1).Info("skipping auto-snapshot",
+			"rd", rd.Name, "reason", skip)
+
+		return r.pruneOldAutoSnapshots(ctx, rd)
+	}
+
 	snapName := formatAutoSnapshotName(id)
 
-	err = r.createAutoSnapshot(ctx, rd, snapName)
+	err = r.createAutoSnapshot(ctx, rd, snapName, &target)
 	if err != nil {
 		return errors.Wrapf(err, "create auto-snapshot %q", snapName)
 	}
@@ -281,6 +316,279 @@ func (r *AutoSnapshotRunnable) processRD(
 	return r.pruneOldAutoSnapshots(ctx, rd)
 }
 
+// takeUnderWay returns a skip reason when a snapshot of rd, automatic
+// or not, still holds I/O suspended or may: a second take would
+// suspend the same replicas, and whichever resumed first would unfreeze
+// the other in the middle of its take.
+func (r *AutoSnapshotRunnable) takeUnderWay(
+	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
+) (string, error) {
+	var snapList blockstoriov1alpha1.SnapshotList
+
+	err := r.Client.List(ctx, &snapList, client.MatchingLabels{labelResourceDefinition: rd.Name})
+	if err != nil {
+		return "", errors.Wrap(err, "list snapshots")
+	}
+
+	for i := range snapList.Items {
+		if takeInFlight(&snapList.Items[i]) {
+			return "snapshot " + snapList.Items[i].Spec.SnapshotName + " is still being taken", nil
+		}
+	}
+
+	return "", nil
+}
+
+// takeInFlight reports whether a snapshot's take may still hold I/O
+// suspended: it orders a suspend or a take, or it has no outcome yet
+// and a node still reports its suspend.
+func takeInFlight(snap *blockstoriov1alpha1.Snapshot) bool {
+	return snap.Spec.SuspendIO || snap.Spec.TakeSnapshot ||
+		(!takeEnded(snap) && anyNodeSuspendAcked(snap.Status.NodeStatus))
+}
+
+// prunable reports whether an auto-snapshot past the keep budget can be
+// deleted now. LINSTOR prunes only once the take finished; a snapshot
+// deleted mid-take is never resumed, because the orchestration stops at
+// the deletion, and its replicas would stay frozen. A finished take
+// whose resume a node has not confirmed waits too.
+func prunable(snap *blockstoriov1alpha1.Snapshot) bool {
+	return takeEnded(snap) && !snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot &&
+		!anyNodeSuspendAcked(snap.Status.NodeStatus)
+}
+
+// anyNodeSuspendAcked reports whether a node still reports its replica
+// suspended for the take.
+func anyNodeSuspendAcked(entries []blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
+	return slices.ContainsFunc(entries, func(e blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
+		return e.SuspendIOAcked
+	})
+}
+
+// autoSnapshotTarget is what an auto-snapshot is taken from: the
+// nodes, and the wrapped LUKS passwords of the replicas on them.
+type autoSnapshotTarget struct {
+	nodes    []string
+	luksKeys []blockstoriov1alpha1.SnapshotLUKSKey
+}
+
+// add takes a snapshot from res: its node, and the LUKS passwords of
+// its volumes.
+func (t *autoSnapshotTarget) add(res *blockstoriov1alpha1.Resource) {
+	t.nodes = append(t.nodes, res.Spec.NodeName)
+
+	for _, vol := range res.Spec.Volumes {
+		if vol.LUKSKey != nil {
+			t.luksKeys = append(t.luksKeys, blockstoriov1alpha1.SnapshotLUKSKey{
+				NodeName:     res.Spec.NodeName,
+				VolumeNumber: vol.VolumeNumber,
+				LUKSKey:      *vol.LUKSKey.DeepCopy(),
+			})
+		}
+	}
+}
+
+// autoSnapshotTarget returns what an auto-snapshot of rd is taken
+// from: every node with an active diskful replica, the set a REST
+// create defaults an empty node list to. The orchestration targets
+// exactly these nodes and records SUCCESSFUL once each took its
+// snapshot; with no node listed it never starts, and linstor-csi
+// waits on the snapshot forever. The replicas' LUKS passwords are
+// copied as the store copies them on a REST create: a satellite
+// refuses to take a snapshot that does not record its replica's.
+//
+// skip is non-empty when no auto-snapshot should be taken this tick,
+// as in LINSTOR's createAutoSnapshotInTransaction: a node of a replica
+// is offline, where a take could only freeze I/O on the reachable
+// replicas until the deadline aborts it, no replica can take one, or a
+// replica's pool cannot take snapshots. A replica on a node being
+// evacuated is no source, as LINSTOR leaves out a node flagged
+// EVACUATE; blockstor's evacuate flags the node EVICTED.
+func (r *AutoSnapshotRunnable) autoSnapshotTarget(
+	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
+) (autoSnapshotTarget, string, error) {
+	replicas, err := r.replicasOf(ctx, rd)
+	if err != nil {
+		return autoSnapshotTarget{}, "", err
+	}
+
+	var (
+		target  autoSnapshotTarget
+		offline []string
+		pools   []poolRef
+	)
+
+	for i := range replicas {
+		res := &replicas[i]
+
+		node, nodeErr := r.replicaNode(ctx, res.Spec.NodeName)
+		if nodeErr != nil {
+			return autoSnapshotTarget{}, "", nodeErr
+		}
+
+		if node.offline {
+			offline = append(offline, res.Spec.NodeName)
+		}
+
+		// A replica that holds no data, is down, or is being moved
+		// off its node is no source, as in LINSTOR's createSnapshots.
+		if node.evacuating || slices.ContainsFunc(res.Spec.Flags, isNoSnapshotSourceFlag) {
+			continue
+		}
+
+		target.add(res)
+
+		if pool := replicaPool(res); pool != "" {
+			pools = append(pools, poolRef{node: res.Spec.NodeName, pool: pool})
+		}
+	}
+
+	switch {
+	case len(offline) > 0:
+		sort.Strings(offline)
+
+		return autoSnapshotTarget{}, "node(s) " + strings.Join(offline, ", ") + " offline", nil
+	case len(target.nodes) == 0:
+		return autoSnapshotTarget{}, "no active diskful replica", nil
+	}
+
+	thick, err := r.poolsWithoutSnapshots(ctx, pools)
+	if err != nil {
+		return autoSnapshotTarget{}, "", err
+	}
+
+	if len(thick) > 0 {
+		return autoSnapshotTarget{}, "storage pool(s) " + strings.Join(thick, ", ") + " do not support snapshots", nil
+	}
+
+	sort.Strings(target.nodes)
+
+	return target, "", nil
+}
+
+// replicasOf lists the replicas of rd, through APIReader when set.
+func (r *AutoSnapshotRunnable) replicasOf(
+	ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition,
+) ([]blockstoriov1alpha1.Resource, error) {
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+
+	replicas, err := k8s.ResourceCRDsOfDefinition(ctx, reader, rd.Name)
+	if err != nil {
+		return nil, errors.Wrap(err, "list Resources")
+	}
+
+	return replicas, nil
+}
+
+// replicaPool is the storage pool a replica is on: the spec field, or
+// the StorPoolName prop a replica set up before the field records it
+// in, which the REST create reads through the merged props.
+func replicaPool(res *blockstoriov1alpha1.Resource) string {
+	if res.Spec.StoragePool != "" {
+		return res.Spec.StoragePool
+	}
+
+	return res.Spec.Props[propStorPoolName]
+}
+
+// propStorPoolName is the prop that named a replica's pool before
+// Spec.StoragePool did.
+const propStorPoolName = "StorPoolName"
+
+// rdFlagDelete marks a definition whose delete is under way.
+const rdFlagDelete = "DELETE"
+
+// isNoSnapshotSourceFlag reports whether a replica flag rules the
+// replica out as a snapshot source.
+func isNoSnapshotSourceFlag(flag string) bool {
+	switch flag {
+	case apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker,
+		apiv1.ResourceFlagInactive, resourceFlagEvacuate:
+		return true
+	}
+
+	return false
+}
+
+// resourceFlagEvacuate marks a replica being moved off its node.
+const resourceFlagEvacuate = "EVACUATE"
+
+// poolRef names a storage pool on a node.
+type poolRef struct {
+	node, pool string
+}
+
+// poolsWithoutSnapshots returns the "node/pool" of every pool in refs
+// whose provider reports it cannot take a snapshot, the refusal the
+// REST create and LINSTOR make for a thick pool. A pool not found is
+// not taken for one, as on the REST create.
+func (r *AutoSnapshotRunnable) poolsWithoutSnapshots(ctx context.Context, refs []poolRef) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	var list blockstoriov1alpha1.StoragePoolList
+
+	err := r.Client.List(ctx, &list)
+	if err != nil {
+		return nil, errors.Wrap(err, "list StoragePools")
+	}
+
+	var out []string
+
+	for _, ref := range refs {
+		for i := range list.Items {
+			pool := &list.Items[i]
+			if naming.Same(pool.Spec.NodeName, ref.node) && naming.Same(pool.Spec.PoolName, ref.pool) &&
+				!pool.Status.SupportsSnapshots {
+				out = append(out, ref.node+"/"+ref.pool)
+			}
+		}
+	}
+
+	sort.Strings(out)
+
+	return slices.Compact(out), nil
+}
+
+// replicaNodeState is what the node of a replica says about taking a
+// snapshot there.
+type replicaNodeState struct {
+	// offline: the heartbeat watchdog marked the node OFFLINE.
+	offline bool
+	// evacuating: the node is being emptied (EVICTED, or LINSTOR's
+	// EVACUATE).
+	evacuating bool
+}
+
+// replicaNode reads the state of the node named. A node with no record
+// is taken for neither, the same call the REST create makes.
+func (r *AutoSnapshotRunnable) replicaNode(ctx context.Context, name string) (replicaNodeState, error) {
+	var node blockstoriov1alpha1.Node
+
+	err := r.Client.Get(ctx, client.ObjectKey{Name: naming.Key(name)}, &node)
+	if apierrors.IsNotFound(err) {
+		return replicaNodeState{}, nil
+	}
+
+	if err != nil {
+		return replicaNodeState{}, errors.Wrapf(err, "get Node %q", name)
+	}
+
+	return replicaNodeState{
+		offline: isNodeOffline(&node),
+		evacuating: slices.ContainsFunc(node.Spec.Flags, func(f string) bool {
+			return f == apiv1.NodeFlagEvicted || f == nodeFlagEvacuate
+		}),
+	}, nil
+}
+
+// nodeFlagEvacuate is LINSTOR's flag on a node being evacuated.
+const nodeFlagEvacuate = "EVACUATE"
+
 // createAutoSnapshot constructs the Snapshot CRD with the
 // `LabelAutoSnapshot=true` marker so the prune step can find it.
 // Idempotent: an `IsAlreadyExists` from kube-apiserver is treated as
@@ -290,6 +598,7 @@ func (r *AutoSnapshotRunnable) createAutoSnapshot(
 	ctx context.Context,
 	rd *blockstoriov1alpha1.ResourceDefinition,
 	snapName string,
+	target *autoSnapshotTarget,
 ) error {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
@@ -303,22 +612,13 @@ func (r *AutoSnapshotRunnable) createAutoSnapshot(
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: rd.Name,
 			SnapshotName:           snapName,
-			// Nodes intentionally empty: the REST shim's
-			// hydrateSnapshotFromRD path defaults this to "every
-			// diskful replica" — but we go through a direct CRD
-			// create here (no REST round-trip), so the satellite
-			// reconciler needs an explicit node list. Leave the
-			// resolution to the satellite-side fan-out via the
-			// SnapshotReconciler's intent dispatch — see
-			// pkg/satellite/controllers/snapshot.go. If Spec.Nodes
-			// is empty the per-node predicate filters everyone out
-			// and the snapshot stays Incomplete; auto-snapshot's
-			// invariant is "best-effort on diskful replicas", and a
-			// later iteration may inline the listDiskfulNodes
-			// query, but for the W05 cycle pin we leave the
-			// semantic minimal — the e2e suite (out of scope here)
-			// verifies the diskful-replica selection.
+			Nodes:                  target.nodes,
+			// Created suspended, as the REST create stamps a
+			// single snapshot: the take starts at once and the
+			// suspend deadline runs from creation.
+			SuspendIO:         true,
 			VolumeDefinitions: volumeRefsFromRD(rd),
+			LUKSKeys:          target.luksKeys,
 		},
 	}
 
@@ -457,6 +757,12 @@ func (r *AutoSnapshotRunnable) pruneOldAutoSnapshots(
 			// Already being deleted — skip the redundant Delete
 			// call but DO count it against the excess so we don't
 			// also delete the next one in line.
+			continue
+		}
+
+		// A take not over yet is pruned on a later tick, and a newer
+		// snapshot is not deleted in its place.
+		if !prunable(snap) {
 			continue
 		}
 

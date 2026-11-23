@@ -653,15 +653,12 @@ func TestSnapshotDeleteScenarioW02IdempotentOnAbsentFinalizer(t *testing.T) {
 // SnapshotReconciler MUST upsert our node's entry in
 // Status.NodeStatus with Ready=true and a non-zero CreateTimestamp.
 //
-// Why this matters: the apiserver's `stampSnapshotSuccessful`
-// derivation (commit 3c593c5f7) walks `Snapshots[].CreateTimestamp`
-// to decide whether every diskful peer reported back, and the
-// store-side projection in pkg/store/k8s/snapshots.go reads
-// `crd.Status.NodeStatus[i].CreateTimestamp` to populate it. Before
-// this stamp landed, no code path ever wrote to Status.NodeStatus
-// on success, so the wire field stayed zero, the apiserver's
-// success denominator never closed, and `linstor s l` rendered
-// State=Incomplete forever on a perfectly-materialised snapshot.
+// Why this matters: the controller-side SnapshotReconciler resumes
+// I/O and records SUCCESSFUL only once every targeted node's entry
+// is Ready. Before this stamp landed, no code path ever wrote to
+// Status.NodeStatus on success, so the take never closed and
+// `linstor s l` rendered State=Incomplete forever on a
+// perfectly-materialised snapshot.
 //
 // Setup mirrors TestSnapshotReconcileDrainsOnDelete's seed (one
 // thin-pool provider on n1, RD `pvc-1` already applied) but with
