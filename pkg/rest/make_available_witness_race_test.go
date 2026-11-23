@@ -54,7 +54,7 @@ func (w *witnessRaceResources) Get(ctx context.Context, rdName, node string) (ap
 		return w.ResourceStore.Get(ctx, rdName, node) //nolint:wrapcheck // test helper
 	}
 
-	err := w.ResourceStore.Create(ctx, &apiv1.Resource{
+	err := w.Create(ctx, &apiv1.Resource{
 		Name:     rdName,
 		NodeName: node,
 		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},

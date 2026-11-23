@@ -1315,22 +1315,7 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	err := store.DeleteSnapshot(r.Context(), s.Store, rd, snapName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			// A retry of a delete that timed out lands here once the
-			// finalizer drained. Answer only after the cache has seen the
-			// snapshot go too, as the resource delete does: LINSTOR serves
-			// every read after the answer from the model the delete
-			// changed. Lag is not a stuck satellite, so the outcome of
-			// the wait does not change the answer.
-			_ = s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
-
-			s.answerSnapshotDeleted(w, r, rd, &apiv1.APICallRc{
-				RetCode: warnSnapshotNotFound,
-				Message: "snapshot already absent: " + snapName,
-				ObjRefs: map[string]string{
-					objRefRscDfn:      rd,
-					objRefSnapshotDfn: snapName,
-				},
-			})
+			s.answerSnapshotAbsent(w, r, rd, snapName)
 
 			return
 		}
@@ -1381,6 +1366,25 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	s.answerSnapshotDeleted(w, r, rd, &apiv1.APICallRc{
 		RetCode: maskInfo,
 		Message: "snapshot deleted: " + snapName,
+	})
+}
+
+// answerSnapshotAbsent answers a snapshot delete that found the snapshot
+// gone. A retry of a delete that timed out lands here once the finalizer
+// drained. It answers only after the cache has seen the snapshot go too,
+// as the resource delete does: LINSTOR serves every read after the
+// answer from the model the delete changed. Lag is not a stuck
+// satellite, so the outcome of the wait does not change the answer.
+func (s *Server) answerSnapshotAbsent(w http.ResponseWriter, r *http.Request, rd, snapName string) {
+	_ = s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
+
+	s.answerSnapshotDeleted(w, r, rd, &apiv1.APICallRc{
+		RetCode: warnSnapshotNotFound,
+		Message: "snapshot already absent: " + snapName,
+		ObjRefs: map[string]string{
+			objRefRscDfn:      rd,
+			objRefSnapshotDfn: snapName,
+		},
 	})
 }
 
