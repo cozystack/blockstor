@@ -89,11 +89,19 @@ const ConditionFilesystemFormatted = "FilesystemFormatted"
 // yet destroyed. Cached from the observer's events2 stream so the
 // reconciler's hot path can skip the `drbdsetup status` round-trip.
 //
-// SAFETY: like other Phase 11.3 Conditions, this is a hot-path
-// optimisation. A stale True value can only cause an extra adjust
-// (idempotent); a stale False causes the legacy probe path which
-// is correct but slow. The authoritative source remains the
-// kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+// SAFETY: for the reconciler, like other Phase 11.3 Conditions, this
+// is a hot-path optimisation. A stale True value can only cause an
+// extra adjust (idempotent); a stale False causes the legacy probe
+// path which is correct but slow. The authoritative source remains
+// the kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+//
+// The reads also answer a replica with no satellite state when this
+// is False, as LINSTOR does a replica whose kernel resource is gone,
+// but only while the stored status carries no disk state and no peer
+// link either. Nothing rewrites the Condition between events2
+// resource frames, so a False that outlived its replica's return
+// stays; the observer's resync rewrites the disk states every few
+// seconds, which keeps a stale False from hiding a running replica.
 const ConditionKernelLoaded = "KernelLoaded"
 
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the

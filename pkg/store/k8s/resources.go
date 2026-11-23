@@ -697,7 +697,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		},
 		ToggleDiskCancel:     crd.Spec.ToggleDiskCancel,
 		SatelliteIncarnation: crd.Status.SatelliteIncarnation,
-		KernelSlotDestroyed:  meta.IsStatusConditionFalse(crd.Status.Conditions, crdv1alpha1.ConditionKernelLoaded),
+		KernelSlotDestroyed:  kernelSlotDeparted(&crd.Status),
 		Volumes: volumesWithReplicationStates(
 			volumesFromStatus(crd.Status.Volumes),
 			crd.Status.Connections,
@@ -710,6 +710,28 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		// and the natural, persistence-free source for it.
 		CreateTimestamp: crdCreateTimestampMs(crd),
 	}
+}
+
+// kernelSlotDeparted reports whether the satellite saw the replica's
+// DRBD kernel resource destroyed and the stored status agrees: the
+// KernelLoaded Condition is False and no volume disk state or peer
+// link is left. The Condition is written only from events2 resource
+// frames, so a write that failed when the resource came back leaves it
+// False on a healthy replica; the observer's resync rewrites the disk
+// states and links every few seconds, so a replica the kernel holds
+// never matches, and the reads do not answer it as gone.
+func kernelSlotDeparted(status *crdv1alpha1.ResourceStatus) bool {
+	if !meta.IsStatusConditionFalse(status.Conditions, crdv1alpha1.ConditionKernelLoaded) {
+		return false
+	}
+
+	if len(status.Connections) > 0 {
+		return false
+	}
+
+	return !slices.ContainsFunc(status.Volumes, func(vol crdv1alpha1.ResourceVolumeStatus) bool {
+		return vol.DiskState != ""
+	})
 }
 
 // crdCreateTimestampMs translates a Resource CRD's
