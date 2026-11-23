@@ -123,3 +123,7 @@ const (
 // node" as a reason to refuse a delete has to skip it, or no node registered
 // through that path can ever be deleted.
 const DfltDisklessStorPoolName = "DfltDisklessStorPool"
+
+// KeyStorPoolName is the property that names the storage pool a replica,
+// a resource definition or a volume definition is placed in.
+const KeyStorPoolName = "StorPoolName"

@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +51,7 @@ func demoteFixture(t *testing.T) (*satellite.Reconciler, *storage.FakeExec, []*i
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-demote_00000",
 		storage.FakeResponse{Stdout: []byte("")})
+	expectBlankMkfsTarget(fx, "/dev/drbd1000")
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -279,6 +281,60 @@ func TestOwedDemoteOtherFailureDoesNotFailLaterApplies(t *testing.T) {
 
 	if ok, demotes := steadyApply(t, rec, fx, dr); !ok || demotes != 0 {
 		t.Errorf("apply within the pacing interval: ok=%v demotes=%d, want true, 0", ok, demotes)
+	}
+}
+
+// A mkfs that failed is followed by the demote all the same, under the
+// same debt as one after a mkfs that worked: a demote that goes through
+// settles it, and one that does not stays owed until a later apply
+// demotes the replica. The apply reports the mkfs error either way.
+func TestAutoSecondaryAfterAFailedMkfsSettlesTheDebt(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		demote    []storage.FakeResponse
+		owedAfter bool
+	}{
+		{"demote goes through", nil, false},
+		{"device held open", []storage.FakeResponse{{Err: errHeldOpen}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec, fx, dr, owed := demoteFixture(t)
+			rec.SetDemoteRetryForTest(nil, 0)
+			fx.Expect(mkfsTargetProbe("/dev/drbd1000"), storage.FakeResponse{})
+
+			if tc.demote != nil {
+				fx.ExpectSequence(demoteSecondary, tc.demote...)
+			}
+
+			results, err := rec.Apply(t.Context(), dr)
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			if results[0].GetOk() || !strings.Contains(results[0].GetMessage(), "auto-mkfs") {
+				t.Errorf("the failed mkfs must fail the apply: %q", results[0].GetMessage())
+			}
+
+			if got := countLines(fx.CommandLines(), demoteSecondary); got != 1 {
+				t.Errorf("%d demotes after the failed mkfs, want 1", got)
+			}
+
+			if got := demoteOwed(t, owed); got != tc.owedAfter {
+				t.Fatalf("demote owed after the failed mkfs = %v, want %v", got, tc.owedAfter)
+			}
+
+			if !tc.owedAfter {
+				return
+			}
+
+			if _, demotes := steadyApply(t, rec, fx, dr); demotes == 0 {
+				t.Error("the next apply did not demote the replica it owed a demote")
+			}
+		})
 	}
 }
 
