@@ -679,8 +679,10 @@ func TestStalledResyncFallsBackToTheActivePeer(t *testing.T) {
 	}
 }
 
-// A disconnect of the paused peer that failed was not tried: the next
-// stall tries it again before the active peer.
+// A disconnect of the paused peer that failed may still have gone
+// through, so the adjust that connects it is owed all the same and runs
+// first; the next stall then tries the paused peer again before the
+// active one.
 func TestStalledResyncRetriesAFailedDisconnectOfThePausedPeer(t *testing.T) {
 	t.Parallel()
 
@@ -692,8 +694,66 @@ func TestStalledResyncRetriesAFailedDisconnectOfThePausedPeer(t *testing.T) {
 	adm.actions = nil
 
 	got := runResync(t, w, adm, "Secondary", frozen(4)...)
-	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
+	if want := []string{"adjust pvc-stall", "disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
 		t.Errorf("actions after a failed disconnect = %v, want %v", got, want)
+	}
+}
+
+// A reconnect of the active peer whose connect failed after the
+// disconnect went through leaves that peer StandAlone, and the apply
+// keeps a StandAlone link down: the adjust that connects it is owed.
+func TestStalledResyncOwesTheConnectOfTheActivePeer(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{errs: map[string][]error{"connect pvc-stall:n1": {errAdjustBusy}}}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	runResync(t, w, adm, "Secondary", frozen(5)...)
+	runResync(t, w, adm, "Secondary", frozen(4)...)
+
+	adm.status = `[]`
+	adm.actions = nil
+
+	w.pass(t.Context(), logr.Discard())
+
+	if want := []string{"adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("pass after a failed connect: actions = %v, want %v", adm.actions, want)
+	}
+}
+
+// The reconnect owed after a disconnect outlives a satellite restart:
+// the next satellite reads it from the state dir and connects the peer
+// again, and the record goes once the adjust went through.
+func TestStalledResyncOwedReconnectOutlivesARestart(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	record := filepath.Join(dir, "pvc-stall"+satellite.ReconnectPendingSuffix)
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+	w.StateDir = dir
+
+	if got := runResync(t, w, adm, "Secondary", frozen(5)...); !slices.Equal(got, []string{"disconnect pvc-stall:n2"}) {
+		t.Fatalf("actions = %v, want the paused peer disconnected", got)
+	}
+
+	if _, err := os.Stat(record); err != nil {
+		t.Fatalf("the owed reconnect was not recorded: %v", err)
+	}
+
+	restarted := &fakeWorkaroundAdm{status: `[]`}
+	w2, _ := newTestWorkarounds(t, restarted, stallConfig(), "pvc-stall")
+	w2.StateDir = dir
+
+	w2.pass(t.Context(), logr.Discard())
+
+	if want := []string{"adjust pvc-stall"}; !slices.Equal(restarted.actions, want) {
+		t.Errorf("first pass after a restart: actions = %v, want %v", restarted.actions, want)
+	}
+
+	if _, err := os.Stat(record); !os.IsNotExist(err) {
+		t.Errorf("the record of a settled reconnect is still there: %v", err)
 	}
 }
 

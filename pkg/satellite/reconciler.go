@@ -960,7 +960,7 @@ func (r *Reconciler) deleteResource(ctx context.Context, req *intent.DeleteResou
 		// sweeper's ownership marker — must be removed AFTER the
 		// kernel slot is gone so a concurrent sweeper tick sees a
 		// clean post-state (kernel + marker both absent).
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", demotePendingSuffix} {
+		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", demotePendingSuffix, ReconnectPendingSuffix} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{

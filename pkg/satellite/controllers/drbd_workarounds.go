@@ -40,6 +40,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -207,6 +208,11 @@ type DRBDWorkaroundsRunnable struct {
 	// means /sys/block.
 	SysBlock string
 
+	// StateDir is the satellite's state dir, where a reconnect owed to a
+	// resource is recorded (satellite.ReconnectPendingSuffix) so it
+	// outlives a restart. Empty keeps the debt in process memory only.
+	StateDir string
+
 	// stalls is the resync progress of each resource across passes.
 	stalls map[string]resyncProgress
 
@@ -231,6 +237,10 @@ type DRBDWorkaroundsRunnable struct {
 	// (reconnectOwed).
 	owedReconnect map[string]bool
 
+	// owedReconnectLoaded is whether the reconnects recorded in StateDir
+	// were read into owedReconnect (loadOwedReconnects).
+	owedReconnectLoaded bool
+
 	// kernelRead is whether the last pass read the kernel status, and
 	// kernelReadLogged whether any pass has logged it yet (logKernelRead).
 	kernelRead       bool
@@ -251,6 +261,7 @@ func newDRBDWorkaroundsRunnable(cli client.Client, cfg *Config, observer *Observ
 		Hints:       observer.WorkaroundHints,
 		OpenUnknown: observer.OpenUnknown,
 		Hold:        cfg.Apply.Hold,
+		StateDir:    cfg.Apply.StateDir(),
 	}
 }
 
@@ -301,6 +312,7 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 	}
 
 	w.adjustOwed(ctx, logger)
+	w.loadOwedReconnects(logger)
 
 	wanted := w.kernelStatusWanted() || len(w.owedReconnect) > 0
 	w.logKernelRead(logger, wanted)
@@ -694,18 +706,18 @@ func (w *DRBDWorkaroundsRunnable) disconnectPausedPeer(
 		"%s: disconnecting %s, connecting it again on a later pass with no Primary in sight (LINBIT/drbd#149)",
 		stuck, dep.Paused))
 
+	// Owed before the disconnect: a disconnect that went through but
+	// returned an error, or a shutdown right after it, still leaves the
+	// peer StandAlone, and no apply connects it (shouldSkipNetOnAdjust).
+	// An adjust owed for nothing is a no-op.
+	w.oweReconnect(logger, res.Name)
+
 	err := w.Adm.DisconnectPeer(ctx, res.Name, dep.Paused)
 	if err != nil {
 		w.failed(logger, err, res.Name, "disconnect the peer a stalled resync waits on")
 
 		return false
 	}
-
-	if w.owedReconnect == nil {
-		w.owedReconnect = map[string]bool{}
-	}
-
-	w.owedReconnect[res.Name] = false
 
 	return true
 }
@@ -719,6 +731,11 @@ func (w *DRBDWorkaroundsRunnable) reconnectActivePeer(
 	w.acted(logger, replica, res.Name, "DRBDResyncStalled", fmt.Sprintf(
 		"%s: disconnecting and connecting %s (LINBIT/drbd#149)", stuck, dep.Active))
 
+	// Owed until the connect went through, for the reason
+	// disconnectPausedPeer gives; a reconnect already owed stays owed.
+	_, owed := w.owedReconnect[res.Name]
+	w.oweReconnect(logger, res.Name)
+
 	err := w.Adm.DisconnectPeer(ctx, res.Name, dep.Active)
 	if err == nil {
 		err = w.Adm.ConnectPeer(ctx, res.Name, dep.Active)
@@ -726,6 +743,90 @@ func (w *DRBDWorkaroundsRunnable) reconnectActivePeer(
 
 	if err != nil {
 		w.failed(logger, err, res.Name, "reconnect the peer a resync stalled on")
+
+		return
+	}
+
+	if !owed {
+		w.settleReconnect(logger, res.Name)
+	}
+}
+
+// reconnectPendingPath is the state file of name's owed reconnect, or ""
+// without a state dir.
+func (w *DRBDWorkaroundsRunnable) reconnectPendingPath(name string) string {
+	if w.StateDir == "" {
+		return ""
+	}
+
+	return filepath.Join(w.StateDir, name+satellite.ReconnectPendingSuffix)
+}
+
+// oweReconnect records that name owes the adjust that connects again a
+// peer a stalled-resync action disconnected (reconnectOwed), in memory
+// and in the state dir. A record that cannot be written is logged; the
+// debt still holds until the satellite restarts.
+func (w *DRBDWorkaroundsRunnable) oweReconnect(logger logr.Logger, name string) {
+	if w.owedReconnect == nil {
+		w.owedReconnect = map[string]bool{}
+	}
+
+	if _, ok := w.owedReconnect[name]; !ok {
+		w.owedReconnect[name] = false
+	}
+
+	path := w.reconnectPendingPath(name)
+	if path == "" {
+		return
+	}
+
+	err := os.WriteFile(path, nil, 0o600)
+	if err != nil {
+		logger.Error(err, "record the reconnect owed to a resource", "resource", name)
+	}
+}
+
+// settleReconnect drops name's owed reconnect.
+func (w *DRBDWorkaroundsRunnable) settleReconnect(logger logr.Logger, name string) {
+	delete(w.owedReconnect, name)
+
+	path := w.reconnectPendingPath(name)
+	if path == "" {
+		return
+	}
+
+	err := os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		logger.Error(err, "drop the reconnect owed to a resource", "resource", name)
+	}
+}
+
+// loadOwedReconnects reads, once, the reconnects an earlier run of the
+// satellite recorded in the state dir and did not settle.
+func (w *DRBDWorkaroundsRunnable) loadOwedReconnects(logger logr.Logger) {
+	if w.owedReconnectLoaded || w.StateDir == "" {
+		return
+	}
+
+	w.owedReconnectLoaded = true
+
+	files, err := filepath.Glob(filepath.Join(w.StateDir, "*"+satellite.ReconnectPendingSuffix))
+	if err != nil {
+		logger.Error(err, "list the reconnects owed to resources")
+
+		return
+	}
+
+	for _, file := range files {
+		name := strings.TrimSuffix(filepath.Base(file), satellite.ReconnectPendingSuffix)
+
+		if w.owedReconnect == nil {
+			w.owedReconnect = map[string]bool{}
+		}
+
+		if _, ok := w.owedReconnect[name]; !ok {
+			w.owedReconnect[name] = false
+		}
 	}
 }
 
@@ -756,7 +857,7 @@ func (w *DRBDWorkaroundsRunnable) reconnect(
 ) {
 	replica := w.replica(ctx, logger, name)
 	if replica == nil {
-		delete(w.owedReconnect, name)
+		w.settleReconnect(logger, name)
 
 		return
 	}
@@ -781,7 +882,7 @@ func (w *DRBDWorkaroundsRunnable) reconnect(
 		return
 	}
 
-	delete(w.owedReconnect, name)
+	w.settleReconnect(logger, name)
 	logger.Info("DRBD workaround: adjusted to connect again the peer a stalled resync waited on", "resource", name)
 }
 

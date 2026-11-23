@@ -66,6 +66,13 @@ import (
 // promoted a replica itself and has not yet seen it demoted.
 const demotePendingSuffix = ".demote-pending"
 
+// ReconnectPendingSuffix names the state file recording that a DRBD
+// workaround disconnected a peer of a replica and has not yet connected
+// it again (pkg/satellite/controllers drbd_workarounds.go). The apply
+// runs `adjust --skip-net` while that peer is StandAlone, so nothing
+// else connects it; the file carries the debt across a restart.
+const ReconnectPendingSuffix = ".reconnect-pending"
+
 // autoSecondaryBackoff is how long the demote right after mkfs waits
 // before each retry while the new device is held open. The opener seen
 // in the field (the host probing a new filesystem) lets go within a
