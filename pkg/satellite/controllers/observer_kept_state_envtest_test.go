@@ -19,7 +19,6 @@ limitations under the License.
 package controllers
 
 import (
-	"context"
 	"os"
 	"testing"
 
@@ -38,7 +37,6 @@ import (
 // writing its Status, fed events2 lines one by one.
 type keptStateFixture struct {
 	t   *testing.T
-	ctx context.Context
 	cli client.Client
 	o   *ObserverRunnable
 	adm *drbd.Adm
@@ -51,14 +49,12 @@ func newKeptStateFixture(t *testing.T) *keptStateFixture {
 		t.Skip("KUBEBUILDER_ASSETS not set; run via `make test` (needs envtest apiserver)")
 	}
 
-	ctx := t.Context()
-
 	cli, err := client.New(startRestartEnv(t), client.Options{Scheme: scheme})
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
 
-	err = cli.Create(ctx, &blockstoriov1alpha1.Resource{
+	err = cli.Create(t.Context(), &blockstoriov1alpha1.Resource{
 		ObjectMeta: metav1.ObjectMeta{Name: k8s.ResourceCRName("pvc-kept", "n1")},
 		Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-kept", NodeName: "n1"},
 	})
@@ -69,7 +65,7 @@ func newKeptStateFixture(t *testing.T) *keptStateFixture {
 	fx := storage.NewFakeExec()
 
 	return &keptStateFixture{
-		t: t, ctx: ctx, cli: cli,
+		t: t, cli: cli,
 		o:   &ObserverRunnable{Client: cli, Exec: fx, NodeName: "n1"},
 		adm: drbd.NewAdm(fx),
 	}
@@ -89,7 +85,7 @@ func (f *keptStateFixture) feed(lines ...string) {
 			f.t.Fatalf("translate %q", line)
 		}
 
-		f.o.handleObservation(f.ctx, f.adm, &obs)
+		f.o.handleObservation(f.t.Context(), f.adm, &obs)
 	}
 }
 
@@ -98,7 +94,7 @@ func (f *keptStateFixture) status() blockstoriov1alpha1.ResourceStatus {
 
 	var got blockstoriov1alpha1.Resource
 
-	err := f.cli.Get(f.ctx, client.ObjectKey{Name: k8s.ResourceCRName("pvc-kept", "n1")}, &got)
+	err := f.cli.Get(f.t.Context(), client.ObjectKey{Name: k8s.ResourceCRName("pvc-kept", "n1")}, &got)
 	if err != nil {
 		f.t.Fatalf("get resource: %v", err)
 	}
@@ -110,7 +106,7 @@ func (f *keptStateFixture) status() blockstoriov1alpha1.ResourceStatus {
 func (f *keptStateFixture) read() apiv1.Resource {
 	f.t.Helper()
 
-	resources, err := k8s.New(f.cli).Resources().List(f.ctx)
+	resources, err := k8s.New(f.cli).Resources().List(f.t.Context())
 	if err != nil {
 		f.t.Fatalf("list resources: %v", err)
 	}
@@ -122,10 +118,13 @@ func (f *keptStateFixture) read() apiv1.Resource {
 	return resources[0]
 }
 
-var keptStateUp = []string{
-	"exists resource name:pvc-kept role:Secondary suspended:no",
-	"exists connection name:pvc-kept peer-node-id:1 conn-name:n2 connection:Connected role:Secondary",
-	"exists device name:pvc-kept volume:0 minor:1000 disk:UpToDate client:no quorum:yes",
+// keptStateUp is what events2 prints for the running replica.
+func keptStateUp() []string {
+	return []string{
+		"exists resource name:pvc-kept role:Secondary suspended:no",
+		"exists connection name:pvc-kept peer-node-id:1 conn-name:n2 connection:Connected role:Secondary",
+		"exists device name:pvc-kept volume:0 minor:1000 disk:UpToDate client:no quorum:yes",
+	}
 }
 
 func diskStateOf(status *blockstoriov1alpha1.ResourceStatus) string {
@@ -145,7 +144,7 @@ func diskStateOf(status *blockstoriov1alpha1.ResourceStatus) string {
 // replica with no state.
 func TestObserverFrameWithoutVolumesKeepsStoredState(t *testing.T) {
 	f := newKeptStateFixture(t)
-	f.feed(keptStateUp...)
+	f.feed(keptStateUp()...)
 
 	f.feed("change resource name:pvc-kept role:Primary")
 
@@ -172,9 +171,9 @@ func TestObserverFrameWithoutVolumesKeepsStoredState(t *testing.T) {
 // frame here is one that does not.
 func TestObserverStaleKernelLoadedFalseRunningReplicaReadsPresent(t *testing.T) {
 	f := newKeptStateFixture(t)
-	f.feed(keptStateUp...)
+	f.feed(keptStateUp()...)
 
-	err := f.o.stampKernelLoaded(f.ctx, "pvc-kept", false)
+	err := f.o.stampKernelLoaded(t.Context(), "pvc-kept", false)
 	if err != nil {
 		t.Fatalf("stamp stale False: %v", err)
 	}
@@ -190,7 +189,7 @@ func TestObserverStaleKernelLoadedFalseRunningReplicaReadsPresent(t *testing.T) 
 // replica whose kernel resource is gone.
 func TestObserverDownFramesReadKernelResourceGone(t *testing.T) {
 	f := newKeptStateFixture(t)
-	f.feed(keptStateUp...)
+	f.feed(keptStateUp()...)
 
 	if f.read().KernelSlotDestroyed {
 		t.Fatal("a running replica reads as gone")
