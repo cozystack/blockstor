@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -134,5 +135,45 @@ func TestNewLowerDiskWithoutInternalMetadata(t *testing.T) {
 	}, []string{"STORAGE"})
 	if storageOnly != adoptedVolumeKiB {
 		t.Errorf("storage-only volume: got %d KiB, want the definition's %d", storageOnly, adoptedVolumeKiB)
+	}
+}
+
+// TestNewLowerDiskHoldsAdoptedLUKSDevice is the same toggle-disk on a
+// LUKS volume adopted from LINSTOR. LINSTOR put a 16 MiB LUKS2 header
+// under the DRBD lower disk, so its storage volume is 20992432 KiB and
+// the DRBD device again 41943056 sectors. The new storage volume must
+// hold the header and a DRBD lower disk holding that device; without
+// the header it is 16 MiB short.
+func TestNewLowerDiskHoldsAdoptedLUKSDevice(t *testing.T) {
+	t.Parallel()
+
+	zvol := createdZvolKiB(t, &intent.DesiredVolume{
+		VolumeNumber:  0,
+		SizeKib:       adoptedVolumeKiB,
+		StoragePool:   "data",
+		DeviceSizeKib: adoptedDeviceKiB,
+	}, []string{"DRBD", "LUKS", "STORAGE"})
+
+	data := drbd.InternalMetadataNetKiB(zvol-luks.HeaderKiB, drbd.DefaultGeometry())
+	if data < adoptedDeviceKiB {
+		t.Fatalf("zvol of %d KiB holds a %d KiB data area under the LUKS header, below the %d KiB device",
+			zvol, data, adoptedDeviceKiB)
+	}
+
+	if zvol != 20506*1024 {
+		t.Errorf("zvol: got %d KiB, want 20506 MiB", zvol)
+	}
+}
+
+// TestNewLowerDiskLUKSWithoutDRBD: a LUKS volume without DRBD gets the
+// header on top of the definition, as LINSTOR sizes it.
+func TestNewLowerDiskLUKSWithoutDRBD(t *testing.T) {
+	t.Parallel()
+
+	zvol := createdZvolKiB(t, &intent.DesiredVolume{
+		VolumeNumber: 0, SizeKib: adoptedVolumeKiB, StoragePool: "data",
+	}, []string{"LUKS", "STORAGE"})
+	if zvol != adoptedVolumeKiB+luks.HeaderKiB {
+		t.Errorf("zvol: got %d KiB, want the definition plus the 16 MiB header", zvol)
 	}
 }

@@ -70,6 +70,12 @@ func statBlockDevice(path string) (bool, error) {
 	return mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0, nil
 }
 
+// HeaderKiB is what a LUKS2 header Format writes takes from the front of
+// the device: cryptsetup's default LUKS2 data offset, 16 MiB. The opened
+// device is the lower one less this. LINSTOR assumes the same size for
+// LUKS2 when it sizes the volume under a LUKS layer.
+const HeaderKiB = 16 * 1024
+
 // Format runs `cryptsetup luksFormat` against device with the given
 // keyfile contents. Idempotent: if the device already carries a LUKS
 // header, we no-op.

@@ -1851,10 +1851,12 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 // lowerDiskKib asks for. The LUKS layer and `drbdadm resize` follow in
 // their own reconcile steps.
 //
-// A lower disk sized for metadata is larger than its definition, so a
-// small grow can stay below it while passing the device every replica
-// reports. That grow still needs the device resized, and the lower disk
-// grown first if it cannot hold the new data area. The case is told
+// A lower disk sized for metadata or a LUKS header is larger than its
+// definition, so a small grow can stay below it while passing what the
+// volume holds: the DRBD device every replica reports, or the storage
+// less its LUKS header without DRBD. That grow still needs the device
+// resized, and the lower disk grown first if it cannot hold the new
+// data area. The case is told
 // apart by the lower disk being larger than the definition: one created
 // before lower disks were sized for metadata is exactly the definition's
 // size, its device is smaller than the definition, and treating that as
@@ -1863,13 +1865,22 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 // alone.
 func growLowerDisk(ctx context.Context, provider storage.Provider, dr *intent.DesiredResource, vol *intent.DesiredVolume, onDiskKib, lowerDisk int64) (bool, error) {
 	want := vol.GetSizeKib()
-	device := vol.GetDeviceSizeKib()
+
+	// What the volume holds now: the DRBD device every replica reports,
+	// or, without DRBD, the storage volume less a LUKS header on it.
+	held := vol.GetDeviceSizeKib()
+	if !needsDRBD(dr.GetLayerStack()) {
+		held = onDiskKib
+		if needsLUKS(dr.GetLayerStack()) {
+			held -= luks.HeaderKiB
+		}
+	}
 
 	switch {
 	case onDiskKib <= 0:
 		return false, nil
 	case want > onDiskKib:
-	case device > 0 && want > device && onDiskKib > want:
+	case held > 0 && want > held && onDiskKib > want:
 		if lowerDisk <= onDiskKib {
 			return true, nil
 		}
@@ -1908,14 +1919,25 @@ func growLowerDisk(ctx context.Context, provider storage.Provider, dr *intent.De
 //
 // External metadata lives on its own volume and a resource without DRBD
 // has no metadata, so their lower disk is the definition's size.
+//
+// A LUKS layer sits between DRBD and the storage and takes its header
+// from the front of the storage volume, so the storage volume holds the
+// header on top of whatever the layer above needs, as LINSTOR sizes it.
+// A volume adopted from LINSTOR was sized that way, and a replica
+// joining it without the header could not attach.
 func lowerDiskKib(dr *intent.DesiredResource, vol *intent.DesiredVolume) int64 {
-	if !needsDRBD(dr.GetLayerStack()) || vol.GetMetaPool() != "" {
-		return vol.GetSizeKib()
+	size := vol.GetSizeKib()
+
+	if needsDRBD(dr.GetLayerStack()) && vol.GetMetaPool() == "" {
+		data := max(vol.GetSizeKib(), vol.GetDeviceSizeKib())
+		size = drbd.InternalMetadataGrossKiB(data, drbd.DefaultGeometry())
 	}
 
-	data := max(vol.GetSizeKib(), vol.GetDeviceSizeKib())
+	if needsLUKS(dr.GetLayerStack()) {
+		size += luks.HeaderKiB
+	}
 
-	return drbd.InternalMetadataGrossKiB(data, drbd.DefaultGeometry())
+	return size
 }
 
 // deviceWaitTimeoutDefault/deviceWaitPollDefault back the same-named
