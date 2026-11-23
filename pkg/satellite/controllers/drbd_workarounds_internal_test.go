@@ -404,6 +404,46 @@ func TestStalledResyncLeavesAMovingResyncAlone(t *testing.T) {
 		}
 	})
 
+	// A thin or csums resync clears ranges without receiving data
+	// (P_RS_DEALLOCATED, P_RS_IS_IN_SYNC), so received hardly moves
+	// while its pipeline stays full.
+	t.Run("thin", func(t *testing.T) {
+		t.Parallel()
+
+		for _, outstanding := range []func(pass int64) int64{
+			func(int64) int64 { return 2048 },
+			func(pass int64) int64 { return 2048 + pass%3 },
+		} {
+			adm := &fakeWorkaroundAdm{}
+			w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+			samples := ramp(10, func(pass int64) resyncSample {
+				return resyncSample{oos: 40_000_000 - pass*300_000, received: 5000 + pass*100, outstanding: outstanding(pass)}
+			})
+
+			if got := runResync(t, w, adm, "Secondary", samples...); len(got) != 0 {
+				t.Errorf("a thin resync clearing 10 MiB/s was acted on: %v", got)
+			}
+		}
+	})
+
+	// A pipeline whose count moves between passes is working, even when
+	// it never drops below the last pass.
+	t.Run("pipeline count moves", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{}
+		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		samples := ramp(10, func(pass int64) resyncSample {
+			return resyncSample{oos: 900000 - pass*20000, received: 5000 + pass*100, outstanding: 400 + pass}
+		})
+
+		if got := runResync(t, w, adm, "Secondary", samples...); len(got) != 0 {
+			t.Errorf("a moving pipeline was acted on: %v", got)
+		}
+	})
+
 	t.Run("moving pass resets", func(t *testing.T) {
 		t.Parallel()
 

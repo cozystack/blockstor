@@ -444,8 +444,9 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 //
 // A pass counts as stalled when, since the previous pass, the out-of-sync
 // count toward the active peer fell by less than stalledResyncMinRate,
-// or the active link still holds outstanding requests, no fewer than
-// before, while less than that rate of data came in. That catches the
+// or the active link still holds exactly as many outstanding requests as
+// before while less than that rate of data came in and out-of-sync did
+// not fall fast either (heldRequestsMaxClearFactor). That catches the
 // hard stop, the trickle, and a stall whose out-of-sync count grows with
 // application writes (alpha.7), none of which a "percent-in-sync did not
 // change" check sees reliably. After StalledResyncPasses stalled passes
@@ -461,6 +462,16 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 // (250 KiB/s) or faster even under application I/O; the trickle seen on
 // the test cluster ran at 100-150 KiB/s.
 const stalledResyncMinRate = 200
+
+// heldRequestsMaxClearFactor bounds the held-requests test: a resync that
+// cleared out-of-sync at this many times the floor or faster is moving,
+// whatever its other counters say. A thin volume (rs-discard-granularity)
+// resyncs zeroed ranges as P_RS_DEALLOCATED, and a csums-alg resync
+// answers matching blocks with P_RS_IS_IN_SYNC; neither adds to received
+// (recv_cnt grows only for resync and peer data in drbd_receiver.c), so
+// such a resync clears hundreds of MiB a pass with received hardly moving
+// and a full pipeline of requests outstanding.
+const heldRequestsMaxClearFactor = 8
 
 // resyncProgress is how far the resync of a resource from Active got
 // when it was last seen, and on how many passes in a row it stalled.
@@ -479,11 +490,16 @@ type resyncProgress struct {
 func (prev *resyncProgress) stalled(dep *drbd.ResyncDependency, elapsed time.Duration) bool {
 	floor := int64(elapsed.Seconds() * stalledResyncMinRate)
 
-	if prev.OutOfSync-dep.OutOfSync < floor {
+	cleared := prev.OutOfSync - dep.OutOfSync
+	if cleared < floor {
 		return true
 	}
 
-	return dep.Outstanding > 0 && dep.Outstanding >= prev.Outstanding && dep.Received-prev.Received < floor
+	// The held requests of the field stalls kept the same count for
+	// minutes; a working pipeline's count moves between passes.
+	return cleared < heldRequestsMaxClearFactor*floor &&
+		dep.Outstanding > 0 && dep.Outstanding == prev.Outstanding &&
+		dep.Received-prev.Received < floor
 }
 
 // now is the time of a pass.
