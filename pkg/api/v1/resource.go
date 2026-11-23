@@ -205,14 +205,15 @@ type VolumeState struct {
 	// full initial-sync (Phase 8.1).
 	CurrentGi string `json:"current_gi,omitempty"`
 
-	// OutOfSyncKib is the worst-case "how many KiB this replica is
-	// behind any peer" reported by `drbdsetup events2 --statistics`
-	// peer-device frames. UI/CLI compute a sync-progress %:
-	//   progress = (1 - OutOfSyncKib / VolumeDefinition.SizeKib) * 100
-	// 0 means fully in sync. While the volume is UpToDate and no peer
-	// resyncs with the replica, a change that keeps the count non-zero
-	// can arrive up to 5 minutes late; a change to or from 0, and any
-	// change during a resync, arrives at once.
+	// OutOfSyncKib is the largest out-of-sync count over this
+	// volume's peers, as `drbdsetup events2 --statistics` peer-device
+	// frames report it. 0 means in sync with every peer. It is not a
+	// resync progress once a replica has more than one peer; that is
+	// ReplicationStates[peer].DonePercentage. While the volume is
+	// UpToDate and no peer resyncs with the replica, a change that
+	// keeps the count non-zero can arrive up to 5 minutes late; a
+	// change to or from 0, and any change during a resync, arrives at
+	// once.
 	OutOfSyncKib int64 `json:"out_of_sync_kib,omitempty"`
 
 	// ReplicationStates is the per-peer replication-state map the
@@ -233,11 +234,10 @@ type ReplicationState struct {
 	// `VerifyS/T`, `Ahead`, `Behind`, `Off`, `WFBitMap*`, etc.
 	ReplicationState string `json:"replication_state,omitempty"`
 
-	// DonePercentage is a float in [0, 100] giving the syncing
-	// progress for `SyncTarget` / `PausedSync*` / `VerifyT` states.
-	// nil for `Established` (nothing to sync) — the JSON `omitempty`
-	// drops it when 0 too, which is fine: the CLI renders "?" when
-	// the field is absent.
+	// DonePercentage is DRBD's `done` for the resync running with
+	// this peer, in [0, 100], measured against that resync's total.
+	// nil while no resync with the peer runs; the CLI renders "?"
+	// for a syncing peer without it.
 	DonePercentage *float64 `json:"done_percentage,omitempty"`
 }
 
