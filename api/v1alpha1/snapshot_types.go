@@ -262,6 +262,23 @@ type SnapshotStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// deleteFailures records, per node, why the satellite's last
+	// attempt to delete its copy of a deleting snapshot failed. The
+	// delete call answers with it at once, as LINSTOR answers with the
+	// error its satellite returned, instead of waiting on a node that
+	// is alive but keeps failing.
+	// +listType=map
+	// +listMapKey=nodeName
+	// +optional
+	DeleteFailures []SnapshotDeleteFailure `json:"deleteFailures,omitempty"`
+}
+
+// SnapshotDeleteFailure is the error one satellite hit deleting its
+// copy of the snapshot.
+type SnapshotDeleteFailure struct {
+	NodeName string `json:"nodeName"`
+	Message  string `json:"message"`
 }
 
 // SnapshotPerNodeStatus is the satellite-reported state of one

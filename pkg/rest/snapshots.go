@@ -234,7 +234,14 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snaps, err := s.Store.Snapshots().ListByDefinition(r.Context(), rd)
+	// Past the cache: linstor-csi deletes the definition of a deleted volume
+	// only when this list, read right after a snapshot delete answered, has
+	// no snapshot left that is not being deleted. A delete retried after a
+	// timeout finds the snapshot gone on the API server and answers at once,
+	// and a cache that has not seen the snapshot go hands it back here as
+	// live, so the definition was kept for good. LINSTOR answers the delete
+	// and the list from one model, where the snapshot is gone for both.
+	snaps, err := s.Store.Snapshots().ListByDefinitionUncached(r.Context(), rd)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -1225,6 +1232,33 @@ func writeSnapshotDeleteRefusal(w http.ResponseWriter, rd, snapName string, err 
 	writeStoreError(w, err)
 }
 
+// snapshotDeleteFailureRcs is the answer to a snapshot delete that a
+// satellite failed: one error per failing node, carrying the
+// satellite's own message, as LINSTOR returns its satellite's error.
+// The satellite keeps retrying, so the snapshot stays in its deleting
+// state and a repeated delete reports the latest failure.
+func snapshotDeleteFailureRcs(rd, snapName string, failures []apiv1.SnapshotDeleteFailure) []apiv1.APICallRc {
+	rcs := make([]apiv1.APICallRc, 0, len(failures))
+
+	for _, failure := range failures {
+		rcs = append(rcs, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "(Node: '" + failure.NodeName + "') failed to delete snapshot '" +
+				snapName + "' of '" + rd + "'",
+			Cause: scrubImplDetails(failure.Message),
+			Correc: "fix the cause on that node; its satellite retries the " +
+				"delete, and the snapshot stays in the deleting state until then",
+			ObjRefs: map[string]string{
+				objRefRscDfn:      rd,
+				objRefSnapshotDfn: snapName,
+				objRefNode:        failure.NodeName,
+			},
+		})
+	}
+
+	return rcs
+}
+
 // handleSnapshotDelete answers `DELETE /v1/resource-definitions/{rd}/snapshots/{snap}`
 // with an idempotent 200 + ApiCallRc envelope. CSI spec §DeleteSnapshot
 // mandates idempotence: the driver retries until it sees success, so
@@ -1266,6 +1300,14 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	err := store.DeleteSnapshot(r.Context(), s.Store, rd, snapName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			// A retry of a delete that timed out lands here once the
+			// finalizer drained. Answer only after the cache has seen the
+			// snapshot go too, as the resource delete does: LINSTOR serves
+			// every read after the answer from the model the delete
+			// changed. Lag is not a stuck satellite, so the outcome of
+			// the wait does not change the answer.
+			_ = s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
+
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 				RetCode: warnSnapshotNotFound,
 				Message: "snapshot already absent: " + snapName,
@@ -1284,12 +1326,21 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug 193: wait until the Snapshot CRD is actually gone (finalizer
-	// drained, CRD reaped) before declaring success. A bounded budget
-	// caps the worst-case latency; on timeout we surface 504 + a
-	// stuck-satellite envelope so the operator gets a concrete next
-	// action instead of a silently-half-completed delete.
-	converged := s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
-	if !converged {
+	// drained, CRD reaped) before declaring success, as LINSTOR waits
+	// for its satellites. A satellite that reports its delete failed
+	// ends the wait with that error, as in LINSTOR. While every listed
+	// node is online the wait lasts as long as the satellites take;
+	// once one is offline or unknown the budget applies and we surface
+	// 504 + a stuck-satellite envelope so the operator gets a concrete
+	// next action instead of a silently-half-completed delete.
+	outcome, failures := s.waitForSnapshotDrained(r.Context(), rd, snapName)
+	if outcome == snapshotWaitFailed {
+		writeJSON(w, http.StatusInternalServerError, snapshotDeleteFailureRcs(rd, snapName, failures))
+
+		return
+	}
+
+	if outcome != snapshotWaitGone {
 		writeJSON(w, http.StatusGatewayTimeout, []apiv1.APICallRc{{
 			RetCode: apiCallRcError | apiCallRcFailSnapshotFinalizerStuck,
 			Message: "snapshot delete acked but satellite finalizer " +

@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -267,14 +268,15 @@ func vdDeletionVisible(ctx context.Context, st store.Store, rdName string, volum
 // concrete next action ("check satellite status") instead of a
 // silently-half-completed delete.
 
-// snapshotDeleteWaitBudget is the upper bound on how long
-// handleSnapshotDelete will block waiting for the Snapshot CRD to
-// disappear after issuing Delete. 10s leaves comfortable headroom
+// snapshotDeleteWaitBudget is how long handleSnapshotDelete waits
+// for the Snapshot CRD to disappear after issuing Delete before it
+// may give up. 10s leaves comfortable headroom
 // for a healthy satellite's reconcile loop (the satellite's own
 // snapshot finalizer requeue is 1s — pkg/satellite/controllers/
 // snapshot.go: `snapshotFinalizerRequeue = time.Second`) while
-// still capping the per-call worst-case latency. Past the budget
-// we conclude the satellite is stuck and surface 504.
+// still bounding the wait on a node that is gone. Past the budget
+// a delete gives up and surfaces 504 only once one of the
+// snapshot's nodes is offline or unknown; see waitForSnapshotDrained.
 const snapshotDeleteWaitBudget = 10 * time.Second
 
 // snapshotDeleteWaitPoll is the cadence between successive Get
@@ -284,28 +286,72 @@ const snapshotDeleteWaitBudget = 10 * time.Second
 // 3-replica apiserver.
 const snapshotDeleteWaitPoll = 500 * time.Millisecond
 
+// snapshotWait is how a wait for a deleted snapshot ended.
+type snapshotWait int
+
+const (
+	// snapshotWaitGone: the store no longer has the snapshot.
+	snapshotWaitGone snapshotWait = iota
+	// snapshotWaitPending: the snapshot is still there when the wait
+	// gave up (budget spent, or the caller went away).
+	snapshotWaitPending
+	// snapshotWaitFailed: a satellite reported that deleting its copy
+	// failed.
+	snapshotWaitFailed
+)
+
 // waitForSnapshotDeletionVisible blocks until the local Store
 // reports the Snapshot (rdName, snapName) is gone, OR the wait
 // budget elapses. Returns true if convergence was observed (the
 // snapshot is gone — finalizer drained, CRD reaped); returns false
 // on budget exhaustion or ctx cancellation (the snapshot is still
-// observable, satellite likely stuck).
-//
-// Unlike waitForRDDeletionVisible / waitForVDDeletionVisible (which
-// always return success because the apiserver write committed even
-// if the cache hasn't caught up), this helper's caller MUST
-// distinguish converged-vs-timeout: a stuck satellite is a real
-// failure mode the operator needs to know about, not a silently-
-// swallowed "still pending" cache lag.
+// observable). The retry of a delete uses it: the API server already
+// said the snapshot is gone, so only cache lag is waited out.
 //
 // Use the request context's deadline if shorter than the budget so
 // CSI-side gRPC deadlines cap our wait, not the other way around.
 func (s *Server) waitForSnapshotDeletionVisible(ctx context.Context, rdName, snapName string) bool {
+	outcome, _ := s.waitForSnapshotGone(ctx, rdName, snapName, false)
+
+	return outcome == snapshotWaitGone
+}
+
+// waitForSnapshotDrained is the wait of the delete that set the
+// deletion. It ends as soon as a satellite reports that deleting its
+// copy failed, returning those failures, as LINSTOR answers with the
+// error its satellite returned. Past the budget it keeps waiting for as
+// long as every node the snapshot lists is online: LINSTOR has no
+// deadline of its own for a connected satellite, so a satellite that is
+// merely slow (a burst of deletes on a CPU-limited pod) must not turn
+// the answer into a failure. linstor-csi removes the definition of a
+// deleted volume only after a delete that succeeded; its retry finds
+// the snapshot being deleted, or gone, and never sends the delete
+// again, so a 504 here left that definition behind for good. The budget
+// still applies once a listed node is offline or unknown: that node's
+// copy will not go until it is back.
+//
+// The CRD goes once the first listed satellite has deleted its copy and
+// dropped the finalizer the satellites share, so "gone" means that, not
+// that every node has.
+func (s *Server) waitForSnapshotDrained(
+	ctx context.Context, rdName, snapName string,
+) (snapshotWait, []apiv1.SnapshotDeleteFailure) {
+	return s.waitForSnapshotGone(ctx, rdName, snapName, true)
+}
+
+func (s *Server) waitForSnapshotGone(
+	ctx context.Context, rdName, snapName string, whileOnline bool,
+) (snapshotWait, []apiv1.SnapshotDeleteFailure) {
 	if s == nil || s.Store == nil {
-		return true
+		return snapshotWaitGone, nil
 	}
 
-	deadline := time.Now().Add(snapshotDeleteWaitBudget)
+	budget := s.snapshotDeleteBudget
+	if budget <= 0 {
+		budget = snapshotDeleteWaitBudget
+	}
+
+	deadline := time.Now().Add(budget)
 
 	// Honour the caller's deadline if it sits inside ours — a CSI
 	// driver with a tight gRPC timeout shouldn't get parked for a
@@ -315,40 +361,76 @@ func (s *Server) waitForSnapshotDeletionVisible(ctx context.Context, rdName, sna
 	}
 
 	for {
-		if snapshotDeletionVisible(ctx, s.Store, rdName, snapName) {
-			return true
-		}
-
-		if !time.Now().Before(deadline) {
-			return false
+		outcome, failures, done := s.probeDeletedSnapshot(ctx, rdName, snapName,
+			!time.Now().Before(deadline), whileOnline)
+		if done {
+			return outcome, failures
 		}
 
 		select {
 		case <-ctx.Done():
-			return false
+			return snapshotWaitPending, nil
 		case <-time.After(snapshotDeleteWaitPoll):
 		}
 	}
 }
 
-// snapshotDeletionVisible is the single-shot predicate behind
-// waitForSnapshotDeletionVisible: "does the local store agree that
-// this Snapshot is gone?". A NotFound from Get means converged
-// (finalizer drained, CRD reaped); a successful Get means the CRD
-// is still observable, almost certainly because the satellite
-// finalizer hasn't run yet. Any non-NotFound transport error counts
-// as "stop waiting" — we don't loop forever on a permanent
-// store-layer failure.
-func snapshotDeletionVisible(ctx context.Context, st store.Store, rdName, snapName string) bool {
-	_, err := st.Snapshots().Get(ctx, rdName, snapName)
-	if err == nil {
-		// CRD still observable — finalizer likely still set.
+// probeDeletedSnapshot reads the snapshot once for waitForSnapshotGone
+// and reports whether the wait is over, and how. spent says the budget
+// is used up.
+func (s *Server) probeDeletedSnapshot(
+	ctx context.Context, rdName, snapName string, spent, whileOnline bool,
+) (snapshotWait, []apiv1.SnapshotDeleteFailure, bool) {
+	snap, err := s.Store.Snapshots().Get(ctx, rdName, snapName)
+
+	switch {
+	case err == nil:
+		if whileOnline && len(snap.DeleteFailures) > 0 {
+			return snapshotWaitFailed, snap.DeleteFailures, true
+		}
+
+		if spent && (!whileOnline || !s.snapshotDrainCanProgress(ctx, &snap)) {
+			return snapshotWaitPending, nil, true
+		}
+	case errors.Is(err, store.ErrNotFound):
+		return snapshotWaitGone, nil, true
+	case ctx.Err() != nil:
+		// The caller went away (or the server is shutting down): the
+		// snapshot was not seen to go, so this is no success.
+		return snapshotWaitPending, nil, true
+	case spent:
+		// A read that keeps failing proves nothing either way.
+		return snapshotWaitPending, nil, true
+	}
+
+	return snapshotWaitPending, nil, false
+}
+
+// snapshotDrainCanProgress reports whether every node snap lists is
+// online, so each one still holding its copy can delete it. A snapshot
+// that lists no node has no satellite to drain it, and neither does a
+// node the store no longer knows: no satellite of that name will take
+// the finalizer off.
+func (s *Server) snapshotDrainCanProgress(ctx context.Context, snap *apiv1.Snapshot) bool {
+	if len(snap.Nodes) == 0 {
 		return false
 	}
 
-	// NotFound OR any other error: stop waiting. NotFound is the
-	// converged case; a transport error means we can't probe and
-	// looping won't help.
+	for _, name := range snap.Nodes {
+		node, err := s.Store.Nodes().Get(ctx, name)
+
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return false
+		case err != nil:
+			// A failed read does not show the node is gone; keep the
+			// best-effort reading isNodeOnline gives every other wait.
+			continue
+		case node.ConnectionStatus == apiv1.NodeTypeOffline:
+			return false
+		}
+	}
+
 	return true
 }
 
