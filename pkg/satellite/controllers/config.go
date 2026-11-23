@@ -65,10 +65,15 @@ type Config struct {
 	// nil and the reconciler falls back to the cached client.
 	APIReader client.Reader
 
-	// Recorder emits the Warning Event for an apply the satellite refused
-	// to carry out over data, so it reaches `kubectl describe` rather than
-	// only the satellite log. Production is wired from the manager in
-	// NewManager; nil skips the Event.
+	// Recorder emits the apply's Events on the Resource: a Warning for
+	// every failed apply, including one the satellite refused to carry
+	// out over data, a Normal one for an apply that went through after
+	// failures, a Warning for an apply that has waited more than a
+	// minute for the controller's stamp, and a Warning for a StandAlone
+	// connection the apply set up again because the kernel held it with
+	// a stale peer configuration, so they reach `kubectl describe`
+	// rather than only the satellite log. Production is wired
+	// from the manager in NewManager; nil skips the Events.
 	Recorder events.EventRecorder
 
 	// Namespace is where the controller-side Secrets live — in
