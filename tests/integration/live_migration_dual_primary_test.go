@@ -172,26 +172,23 @@ func TestLiveMigrationDualPrimaryRendersOnTheMigrationConnection(t *testing.T) {
 		t.Fatalf("the diskful source replica is gone: %v", err)
 	}
 
-	// The VM stops on the target: its diskless attachment goes. The
-	// definition's reconciler may put a tiebreaker on the node right
-	// after, under the same name, which is what LINSTOR's own
-	// unmake-available does with a diskless resource the definition
-	// needs as a tiebreaker.
+	// The VM stops on the target. Its diskless attachment is the third
+	// voter of the two diskful replicas, so it turns into their
+	// tiebreaker in place, as LINSTOR's unmake-available does, instead
+	// of being deleted and leaving them without one until the reconciler
+	// places a new one.
 	lmSetInUse(ctx, t, stack, lmTarget, false)
 
 	rcs = lmCall(t, http.MethodPost, base+lmRD+"/resources/"+lmTarget+"/unmake-available", http.StatusOK, nil)
-	if len(rcs) == 0 || rcs[0].RetCode != lmRscDeleted {
-		t.Fatalf("detach of the target: %+v, want the diskless attachment deleted", rcs)
+	if slices.ContainsFunc(rcs, func(rc apiv1.APICallRc) bool { return rc.RetCode == lmRscDeleted }) {
+		t.Fatalf("detach of the target: %+v, want the attachment kept as the tiebreaker", rcs)
 	}
 
-	harness.Eventually(t, lmWaitTimeout, func() bool {
-		var left blockstoriov1alpha1.Resource
-
-		err := stack.Env.Client.Get(ctx, types.NamespacedName{Name: lmRD + "." + lmTarget}, &left)
-
-		return apierrors.IsNotFound(err) || (err == nil &&
-			(left.DeletionTimestamp != nil || slices.Contains(left.Spec.Flags, apiv1.ResourceFlagTieBreaker)))
-	}, "the diskless attachment on the target to be deleted")
+	var witness blockstoriov1alpha1.Resource
+	if err := stack.Env.Client.Get(ctx, types.NamespacedName{Name: lmRD + "." + lmTarget}, &witness); err != nil ||
+		witness.DeletionTimestamp != nil || !slices.Contains(witness.Spec.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Fatalf("the attachment on the target: %+v, %v; want it kept as the tiebreaker", witness.Spec, err)
+	}
 }
 
 func lmCall(t *testing.T, method, url string, want int, payload any) []apiv1.APICallRc {

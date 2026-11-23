@@ -24,10 +24,12 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -377,7 +379,11 @@ func (s *Server) revertDualPrimaryOn(ctx context.Context, rdName, node string) (
 // releaseAttachment removes the replica make-available may have put on
 // node, when doing so cannot lose data: only a diskless replica goes. A
 // tiebreaker stays, it is the quorum of the replicas that hold the data,
-// and so does a diskful replica, which may be the last up-to-date one.
+// and so does a diskful replica, which may be the last up-to-date one. A
+// diskless replica that is the tie breaking voter of an even number of
+// diskful ones turns into the tiebreaker in place, as LINSTOR's delete
+// with keepTiebreaker does, instead of leaving them without one until
+// the reconciler places a new one.
 func (s *Server) releaseAttachment(ctx context.Context, rdName, node string, replica *apiv1.Resource) ([]apiv1.APICallRc, error) {
 	switch {
 	case replica == nil:
@@ -400,7 +406,16 @@ func (s *Server) releaseAttachment(ctx context.Context, rdName, node string, rep
 		}}, nil
 	}
 
-	err := s.Store.Resources().Delete(ctx, rdName, node)
+	keep, err := s.attachmentKeepsQuorum(ctx, rdName, node)
+	if err != nil {
+		return nil, err
+	}
+
+	if keep {
+		return s.keepAsTiebreaker(ctx, rdName, node)
+	}
+
+	err = s.Store.Resources().Delete(ctx, rdName, node)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, errors.Wrapf(err, "delete %s on %s", rdName, node)
 	}
@@ -411,5 +426,84 @@ func (s *Server) releaseAttachment(ctx context.Context, rdName, node string, rep
 	return []apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
 		Message: "resource deleted: " + rdName + " on " + node,
+	}}, nil
+}
+
+// attachmentKeepsQuorum reports whether the diskless replica on node is
+// the voter the auto-tiebreaker would put back the moment it went: the
+// definition runs DRBD with the auto-tiebreaker on and not suppressed, and
+// without node it would have an even number, at least two, of active
+// diskful replicas and no diskless one. The rule is the reconciler's
+// (shouldTieBreakerExist), so the two agree on which shape needs one.
+func (s *Server) attachmentKeepsQuorum(ctx context.Context, rdName, node string) (bool, error) {
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return false, errors.Wrapf(err, "get %s", rdName)
+	}
+
+	if strings.EqualFold(rd.Props[autoTiebreakerProp], "false") || tiebreakerSuppressed(&rd) {
+		return false, nil
+	}
+
+	stack, err := store.EffectiveLayerStack(ctx, s.Store, &rd)
+	if err != nil {
+		return false, errors.Wrapf(err, "layer stack of %s", rdName)
+	}
+
+	if !apiv1.ContainsReplicationLayer(stack) {
+		return false, nil
+	}
+
+	replicas, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return false, errors.Wrapf(err, "list replicas of %s", rdName)
+	}
+
+	diskful := 0
+
+	for i := range replicas {
+		replica := &replicas[i]
+
+		switch {
+		case naming.Same(replica.NodeName, node), slices.Contains(replica.Flags, apiv1.ResourceFlagInactive):
+		case drbdDiskless(replica):
+			return false, nil
+		default:
+			diskful++
+		}
+	}
+
+	return diskful >= 2 && diskful%2 == 0, nil
+}
+
+// autoTiebreakerProp turns the auto-tiebreaker off for a definition when
+// set to false.
+const autoTiebreakerProp = "DrbdOptions/AutoAddQuorumTiebreaker"
+
+// tiebreakerSuppressed reports whether a recent tiebreaker delete asked
+// the reconciler not to put one back yet.
+func tiebreakerSuppressed(rd *apiv1.ResourceDefinition) bool {
+	deadline, err := time.Parse(time.RFC3339, rd.Annotations[apiv1.AutoTiebreakerSuppressedUntilAnnotation])
+
+	return err == nil && time.Now().Before(deadline)
+}
+
+// keepAsTiebreaker turns the diskless replica on node into the
+// definition's tiebreaker.
+func (s *Server) keepAsTiebreaker(ctx context.Context, rdName, node string) ([]apiv1.APICallRc, error) {
+	err := s.Store.Resources().PatchResourceSpec(ctx, rdName, node, func(live *apiv1.Resource) error {
+		if !slices.Contains(live.Flags, apiv1.ResourceFlagTieBreaker) {
+			live.Flags = append(live.Flags, apiv1.ResourceFlagTieBreaker)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err, "make %s on %s a tiebreaker", rdName, node)
+	}
+
+	return []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: fmt.Sprintf("Resource '%s' on node '%s' is kept as the tiebreaker", rdName, node),
 	}}, nil
 }

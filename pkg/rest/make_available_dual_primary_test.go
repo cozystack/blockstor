@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/store"
@@ -188,7 +189,9 @@ func TestLiveMigrationMakeAvailableUnmakeAvailable(t *testing.T) {
 		t.Fatalf("the diskful source replica was removed: %v", err)
 	}
 
-	// Later the VM stops on node-b: its diskless attachment goes.
+	// Later the VM stops on node-b. Its diskless attachment is the
+	// third voter of the two diskful replicas, so it stays as their
+	// tiebreaker rather than leaving them without one.
 	setInUse(t, st, "node-b", false)
 
 	status, rcs = postRcs(t, url+"node-b/unmake-available", ``)
@@ -196,7 +199,34 @@ func TestLiveMigrationMakeAvailableUnmakeAvailable(t *testing.T) {
 		t.Fatalf("unmake-available on the target: %d %+v", status, rcs)
 	}
 
-	if _, err := st.Resources().Get(t.Context(), "vm-disk", "node-b"); err == nil {
+	kept, err := st.Resources().Get(t.Context(), "vm-disk", "node-b")
+	if err != nil || !slices.Contains(kept.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Fatalf("the attachment on node-b: %+v, %v; want it kept as the tiebreaker", kept, err)
+	}
+}
+
+// A diskless attachment that no quorum needs goes on unmake-available:
+// here the auto-tiebreaker is off for the definition.
+func TestUnmakeAvailableDeletesAnAttachmentNoQuorumNeeds(t *testing.T) {
+	st, base := liveMigrationFixture(t, nil)
+	setInUse(t, st, "node-a", false)
+	createDisklessReplica(t, st, "node-b")
+
+	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(t.Context(), "vm-disk", func(rd *apiv1.ResourceDefinition) error {
+		rd.Props = map[string]string{autoTiebreakerProp: "false"}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("turn the auto-tiebreaker off: %v", err)
+	}
+
+	status, rcs := postRcs(t, base+"/v1/resource-definitions/vm-disk/resources/node-b/unmake-available", ``)
+	if status != http.StatusOK {
+		t.Fatalf("unmake-available: %d %+v", status, rcs)
+	}
+
+	if _, err = st.Resources().Get(t.Context(), "vm-disk", "node-b"); err == nil {
 		t.Fatal("the diskless attachment on node-b is still there")
 	}
 }
