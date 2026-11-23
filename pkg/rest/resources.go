@@ -151,7 +151,7 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 	// Bug 137: a replica the satellite reports no storage for (a
 	// diskless or TIE_BREAKER one, or one not built yet) still lists a
 	// volume per parent-RD VolumeDefinition, as LINSTOR's view does.
-	annotated = ensureVolumesForView(annotated, rsc, s.placeholderPool(ctx, rsc), vdSizes)
+	annotated = ensureVolumesForView(annotated, s.placeholderPool(ctx, rsc), vdSizes)
 
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
 	if err != nil {
@@ -239,7 +239,7 @@ const disklessStorPoolName = "DfltDisklessStorPool"
 // sentinel `DfltDisklessStorPool` on a diskless or TIE_BREAKER
 // replica, see disklessStorPoolName). The result is never nil, so the
 // `volumes` key is always present on the wire.
-func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, poolFor func(int32) string, vdSizes map[int32]int64) []apiv1.Volume {
+func ensureVolumesForView(observed []apiv1.Volume, poolFor func(int32) string, vdSizes map[int32]int64) []apiv1.Volume {
 	out := make([]apiv1.Volume, 0, max(len(observed), len(vdSizes)))
 	out = append(out, observed...)
 

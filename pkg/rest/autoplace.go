@@ -161,7 +161,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 // ensureVolumesForView contract used by /v1/view/resources: a non-nil
 // (possibly empty) slice survives the JSON encode as `[]`.
 func wrapResourceWithVolumes(res *apiv1.Resource, poolFor func(int32) string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
-	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, res, poolFor, vdSizes)}
+	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, poolFor, vdSizes)}
 }
 
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
