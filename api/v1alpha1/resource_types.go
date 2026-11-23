@@ -470,6 +470,15 @@ type ResourceStatus struct {
 	// +listMapKey=volumeNumber
 	// +optional
 	DeletedVolumes []DeletedVolumeStatus `json:"deletedVolumes,omitempty"`
+
+	// applyFailure is the error of the satellite's last apply pass on
+	// this replica, with the volume sizes that pass was applying. The
+	// satellite sets it when a pass fails and removes it when one
+	// succeeds. A resize that waits for this replica to grow ends with
+	// this error instead of waiting for a pass that keeps failing, as
+	// LINSTOR returns its satellite's error.
+	// +optional
+	ApplyFailure *ResourceApplyFailure `json:"applyFailure,omitempty"`
 }
 
 // DeletedVolumeStatus is one replica's confirmation that it deleted the
@@ -483,6 +492,27 @@ type DeletedVolumeStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxLength=64
 	DeleteID string `json:"deleteID,omitempty"`
+}
+
+// ResourceApplyFailure is the error of a failed satellite apply pass.
+// +structType=atomic
+type ResourceApplyFailure struct {
+	// message is the error the pass failed with.
+	Message string `json:"message"`
+
+	// volumes lists the definition size of each volume the failed pass
+	// was applying.
+	// +optional
+	Volumes []ResourceApplyFailureVolume `json:"volumes,omitempty"`
+}
+
+// ResourceApplyFailureVolume is the size one volume had in a failed pass.
+type ResourceApplyFailureVolume struct {
+	// volumeNumber is the volume's number in the definition.
+	VolumeNumber int32 `json:"volumeNumber"`
+
+	// sizeKib is the volume definition size the pass was applying.
+	SizeKib int64 `json:"sizeKib"`
 }
 
 // ResourceConnectionStatus is the state of one DRBD peer connection
@@ -601,6 +631,22 @@ type ResourceVolumeStatus struct {
 	UsableKib int64 `json:"usableKib,omitempty"`
 	// +optional
 	DiskState string `json:"diskState,omitempty"`
+
+	// appliedSizeKib is the volume definition size this replica has
+	// finished applying: the satellite writes it after a pass in which
+	// every layer, the backing volume, LUKS and `drbdadm resize`,
+	// succeeded at that size and the device the consumer sees reads at
+	// least that size. A grow is complete once every diskful replica
+	// reports the new size here. The last replica to grow its
+	// backing runs its `drbdadm resize` after all the others have
+	// grown theirs, and DRBD commits a resize on every connected peer
+	// before the command returns, so at that point the device has the
+	// new size wherever it is attached. The REST API answers a resize
+	// only then, as LINSTOR does, and the satellite reruns
+	// `drbdadm resize` while this lags the definition. Unset until
+	// the first such pass.
+	// +optional
+	AppliedSizeKib int64 `json:"appliedSizeKib,omitempty"`
 
 	// currentGi is the DRBD-9 current generation identifier reported
 	// by `drbdsetup events2` for this replica's local volume. The

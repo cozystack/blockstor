@@ -707,6 +707,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		// metadata.creationTimestamp is the per-replica creation time
 		// and the natural, persistence-free source for it.
 		CreateTimestamp: crdCreateTimestampMs(crd),
+		ApplyFailure:    applyFailureFromStatus(crd.Status.ApplyFailure),
 	}
 }
 
@@ -720,6 +721,21 @@ func deletedVolumesFromStatus(in []crdv1alpha1.DeletedVolumeStatus) []apiv1.Dele
 	out := make([]apiv1.DeletedVolume, 0, len(in))
 	for _, d := range in {
 		out = append(out, apiv1.DeletedVolume{VolumeNumber: d.VolumeNumber, DeleteID: d.DeleteID})
+	}
+
+	return out
+}
+
+// applyFailureFromStatus projects the satellite's last apply error onto
+// the wire Resource, nil when the last pass succeeded.
+func applyFailureFromStatus(in *crdv1alpha1.ResourceApplyFailure) *apiv1.ApplyFailure {
+	if in == nil {
+		return nil
+	}
+
+	out := &apiv1.ApplyFailure{Message: in.Message, SizesKib: make(map[int32]int64, len(in.Volumes))}
+	for _, vol := range in.Volumes {
+		out.SizesKib[vol.VolumeNumber] = vol.SizeKib
 	}
 
 	return out
@@ -791,7 +807,8 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 				CurrentGi:    volStatus.CurrentGI,
 				OutOfSyncKib: volStatus.OutOfSyncKib,
 			},
-			LayerDataList: layerDataList,
+			LayerDataList:  layerDataList,
+			AppliedSizeKib: volStatus.AppliedSizeKib,
 		})
 	}
 

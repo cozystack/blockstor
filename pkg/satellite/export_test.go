@@ -57,3 +57,9 @@ func (r *Reconciler) RecoverFromBitmapBothDisksForTest(ctx context.Context, dr *
 func (r *Reconciler) RememberPoolForTest(resourceName, pool string) {
 	r.rememberPool(resourceName, pool)
 }
+
+// DrbdGrossKibForTest re-exports the backing size a grow gives a DRBD
+// volume with internal metadata.
+func DrbdGrossKibForTest(netKib int64) int64 {
+	return drbdGrossKib(netKib)
+}
