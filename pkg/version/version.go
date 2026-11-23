@@ -55,8 +55,10 @@ const (
 	// `_require_version()` gates, and linstor-csi from v1.13 refuses to
 	// start below 1.29 (MinimumRestApiMinor in its highlevelclient).
 	// History: 1.23.0 until Bug 222 raised it to 1.27.0, which stayed
-	// until truncate, delete_empty_resource_definition, make-available's
-	// auto_manage_dual_primary and unmake-available were served.
+	// until truncate and delete_empty_resource_definition (1.29.0) were
+	// served. make-available's auto_manage_dual_primary and
+	// unmake-available, which linstor-csi v1.13 also needs, are in
+	// LINSTOR 1.35.0's spec but in no CHANGELOG-OPENAPI.md entry.
 	//
 	// It is the highest version whose additions are all either served or
 	// refused with an explicit 501 because they have no meaning here
@@ -65,10 +67,17 @@ const (
 	// volume_sizes; blockstor refuses that one but could serve it, so the
 	// version stops at 1.29.0 and python-linstor keeps the flag gated.
 	//
+	// The spec is not vendored here any more: it went with the switch to
+	// golinstor's types, and `make rest-types` still names the regen
+	// script that went with it. 1.29.0 was checked against LINSTOR
+	// v1.35.0: docs/rest_v1_openapi.yaml, whose info.version is 1.29.1,
+	// and CHANGELOG-OPENAPI.md at the root.
+	//
 	// When bumping this string a future contributor MUST:
 	//   1. confirm every endpoint and field added up to the new version
-	//      in LINSTOR's docs/rest_v1_openapi.yaml is either wired or
-	//      refused with an explicit 501 envelope;
+	//      in CHANGELOG-OPENAPI.md and the rest_v1_openapi.yaml of the
+	//      LINSTOR release that serves it is either wired or refused
+	//      with an explicit 501 envelope;
 	//   2. update the compatibility matrix in docs/linstor-csi-compatibility.md
 	//      and pkg/rest/version_bug_222_test.go.
 	RestAPIVersion = "1.29.0"
