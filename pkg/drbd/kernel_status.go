@@ -208,6 +208,23 @@ func (r *KernelResource) ResyncDependency() (ResyncDependency, bool) {
 	return ResyncDependency{}, false
 }
 
+// UpToDateVolume reports whether some local volume of the resource is
+// UpToDate: the resource is past its first sync, and an Inconsistent
+// volume beside it was added later (the late-add gate of
+// Adm.LateAddResyncKickVolumes).
+func (r *KernelResource) UpToDateVolume() bool {
+	return slices.ContainsFunc(r.Devices, func(d KernelDevice) bool {
+		return d.DiskState == string(DiskStateUpToDate)
+	})
+}
+
+// HasPrimary reports whether this node or a connected peer is Primary.
+func (r *KernelResource) HasPrimary() bool {
+	return r.Role == string(RolePrimary) || slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
+		return c.ConnectionState == string(ConnectionStateConnected) && c.PeerRole == string(RolePrimary)
+	})
+}
+
 // ResyncDependency is one volume resyncing from Active while its resync
 // from Paused waits on it, with how far the resync from Active got.
 // OutOfSync and Received are in KiB; Outstanding is the resync requests

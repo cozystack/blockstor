@@ -573,6 +573,52 @@ func TestStalledResyncRetriesAFailedDisconnectOfThePausedPeer(t *testing.T) {
 	}
 }
 
+// lateAddStall is the stall on volume 1 of a resource whose volume 0 is
+// UpToDate here, the shape of a volume added later; n2Role is n2's role.
+func lateAddStall(n2Role string) string {
+	return fmt.Sprintf(`[{"name":"pvc-stall","role":"Secondary",
+ "devices":[{"volume":0,"disk-state":"UpToDate"},{"volume":1,"disk-state":"Inconsistent"}],
+ "connections":[
+  {"name":"n1","connection-state":"Connected","peer-role":"Secondary","peer_devices":[
+   {"volume":0,"replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0},
+   {"volume":1,"replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","received":1,"out-of-sync":14592,"unacked":542}]},
+  {"name":"n2","connection-state":"Connected","peer-role":%q,"peer_devices":[
+   {"volume":0,"replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0},
+   {"volume":1,"replication-state":"PausedSyncT","peer-disk-state":"UpToDate","resync-suspended":"dependency","out-of-sync":8}]}]}]`, n2Role)
+}
+
+// On a volume added later, a reconnect of the active peer can end its
+// resync with the volume still Inconsistent, which only the late-add
+// kick recovers, and the kick waits while a replica is Primary. With a
+// Primary in sight the fallback is left out; without one it runs.
+func TestStalledResyncLeavesTheLateAddKickItsCase(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		n2Role string
+		want   []string
+	}{
+		{n2Role: "Primary", want: []string{"disconnect pvc-stall:n2", "adjust pvc-stall"}},
+		{n2Role: "Secondary", want: []string{"disconnect pvc-stall:n2", "adjust pvc-stall", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}},
+	} {
+		adm := &fakeWorkaroundAdm{status: lateAddStall(tc.n2Role)}
+		w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		for range 9 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if !slices.Equal(adm.actions, tc.want) {
+			t.Errorf("n2 %s: actions = %v, want %v", tc.n2Role, adm.actions, tc.want)
+		}
+
+		evs := drainEvents(recorder)
+		if left := slices.ContainsFunc(evs, func(ev string) bool { return strings.Contains(ev, "late-add kick") }); left != (tc.n2Role == "Primary") {
+			t.Errorf("n2 %s: events = %v", tc.n2Role, evs)
+		}
+	}
+}
+
 // The fallback is remembered across the passes the paused peer is away
 // while the replica stays Inconsistent, and forgotten once it is in
 // sync: a later stall tries the paused peer first again.

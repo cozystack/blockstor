@@ -477,6 +477,18 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 // peers, or that the Primary's quorum could hang on: while a Primary is
 // at either end, every configured connection of this node must be
 // Connected (drbd.KernelResource.MayDisconnect).
+//
+// The late-add resync kick of the apply (pkg/satellite reconciler.go
+// maybeKickLateAddResync, BUG-048) never looks at the same state as this
+// check: it backs off while any peer of the volume is SyncTarget or
+// SyncSource, and this check needs one. It does look at what this check
+// leaves behind: on a late-added volume every replica can share the
+// day0 current UUID, and a reconnect of the active peer then finds no
+// resync to do and leaves the volume Inconsistent and Established. The
+// kick invalidates such a volume, but only while no replica is Primary.
+// So the active peer of a volume added beside an UpToDate one is not
+// reconnected while a Primary is in sight; disconnecting the paused peer
+// does not touch the active link and stays allowed.
 
 // heldRequestsMaxClearFactor bounds the held-requests test: a resync that
 // cleared out-of-sync at this many times the floor or faster is moving,
@@ -575,6 +587,10 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 		if w.disconnectPausedPeer(ctx, logger, res, replica, dep, stuck) {
 			stalls[res.Name] = resyncProgress{ResyncDependency: dep, At: progress.At, PausedTried: dep.Active}
 		}
+	case res.UpToDateVolume() && res.HasPrimary():
+		w.acted(logger, replica, res.Name, "DRBDResyncStalled", stuck+
+			": left alone, a reconnect of the active peer can end the resync of a volume added later "+
+			"while a Primary keeps the late-add kick from recovering it (LINBIT/drbd#149)")
 	case res.MayDisconnect(dep.Active):
 		w.reconnectActivePeer(ctx, logger, res, replica, dep, stuck)
 	default:
