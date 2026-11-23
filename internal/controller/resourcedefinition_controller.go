@@ -136,16 +136,12 @@ func (r *ResourceDefinitionReconciler) ReconcilePass(ctx context.Context, req ct
 
 	err = r.pinLayerStack(ctx, &rd)
 	if err != nil {
-		log.Error(err, "pin layer stack", "rd", rd.Name)
-
-		return ctrl.Result{}, err
+		return r.stepFailed(ctx, log, &rd, "pin layer stack", err)
 	}
 
 	err = r.ensureTiebreaker(ctx, &rd)
 	if err != nil {
-		log.Error(err, "ensure tiebreaker", "rd", rd.Name)
-
-		return ctrl.Result{}, err
+		return r.stepFailed(ctx, log, &rd, "ensure tiebreaker", err)
 	}
 
 	// Bug 148: stamp the per-volume resize-pending annotation on
@@ -159,9 +155,7 @@ func (r *ResourceDefinitionReconciler) ReconcilePass(ctx context.Context, req ct
 	// block device stays at the old size forever.
 	err = r.stampResizePending(ctx, &rd)
 	if err != nil {
-		log.Error(err, "stamp resize-pending", "rd", rd.Name)
-
-		return ctrl.Result{}, err
+		return r.stepFailed(ctx, log, &rd, "stamp resize-pending", err)
 	}
 
 	// Belt-and-braces re-enqueue: the witness-decision read in
