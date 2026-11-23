@@ -2582,6 +2582,16 @@ func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdNa
 		err = s.makeAvailableUpdate(r.Context(), &existing, req)
 	case errors.Is(err, store.ErrNotFound):
 		err = s.makeAvailableCreate(r.Context(), rdName, node, req)
+		if errors.Is(err, store.ErrAlreadyExists) {
+			// A replica appeared on the node since the read: the
+			// tiebreaker reconciler put a witness there. LINSTOR
+			// decides under its lock and would take the witness over,
+			// so do that rather than refuse the attach.
+			existing, err = s.Store.Resources().Get(r.Context(), rdName, node)
+			if err == nil {
+				err = s.makeAvailableUpdate(r.Context(), &existing, req)
+			}
+		}
 	}
 
 	if err != nil {
