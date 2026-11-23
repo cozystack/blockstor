@@ -130,6 +130,7 @@ func deleteEveryReplica(t *testing.T, stack *harness.Stack, rd string) {
 // looped on `unknown storage pool ""` on its satellite.
 func testGroupGSnapRestoreAfterSourceDeleted(t *testing.T, stack *harness.Stack) {
 	src := seedRDWithVolume(t, stack, "gone-src")
+	stack.Satellite.SimulateSnapshotsByHand(src)
 	takeSnapshotStandingIn(t, stack, src, "snap-1", "zfs-thin")
 	deleteEveryReplica(t, stack, src)
 
@@ -158,6 +159,7 @@ func testGroupGSnapRestoreAfterSourceDeleted(t *testing.T, stack *harness.Stack)
 // and the restore is refused before it writes anything.
 func testGroupGSnapRestoreAfterSourceDeletedNeedsAPool(t *testing.T, stack *harness.Stack) {
 	src := seedRDWithVolume(t, stack, "nopool-src")
+	stack.Satellite.SimulateSnapshotsByHand(src)
 	takeSnapshotStandingIn(t, stack, src, "snap-1", "")
 	deleteEveryReplica(t, stack, src)
 

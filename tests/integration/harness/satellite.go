@@ -100,6 +100,10 @@ type Satellite struct {
 	// SimulateVolumesUnreported.
 	volumesUnreported map[string]bool
 
+	// snapshotsByHand[rdName] true → the satellite leaves the
+	// definition's snapshots alone, see SimulateSnapshotsByHand.
+	snapshotsByHand map[string]bool
+
 	// failNext is the queue of pending FakeExec-style failures the
 	// satellite mock is asked to inject the next time it sees a
 	// matching command. Phase 0 stores them but does not consult
@@ -121,6 +125,7 @@ func NewSatellite(cli client.Client) *Satellite {
 		tickInterval: satelliteTickInterval,
 
 		volumesUnreported: map[string]bool{},
+		snapshotsByHand:   map[string]bool{},
 	}
 }
 
@@ -194,6 +199,17 @@ func (s *Satellite) SimulateVolumesUnreported(rdName string) {
 	defer s.mu.Unlock()
 
 	s.volumesUnreported[rdName] = true
+}
+
+// SimulateSnapshotsByHand makes the satellite leave the snapshots of
+// rdName alone. A test that plays each step of a take itself, stamping
+// the per-node status between the controller's orders, needs no second
+// writer acking and completing the take under it.
+func (s *Satellite) SimulateSnapshotsByHand(rdName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.snapshotsByHand[rdName] = true
 }
 
 // FailNext enqueues a FakeExec-style command match that the next
@@ -490,7 +506,7 @@ func (s *Satellite) reconcileSnapshots(ctx context.Context) {
 
 	for i := range snaps.Items {
 		snap := &snaps.Items[i]
-		if snap.DeletionTimestamp != nil {
+		if snap.DeletionTimestamp != nil || s.isSnapshotByHand(snap.Spec.ResourceDefinitionName) {
 			continue
 		}
 
@@ -607,6 +623,13 @@ func (s *Satellite) isPoolMissing(node, pool string) bool {
 	defer s.mu.Unlock()
 
 	return s.poolMissing[node][pool]
+}
+
+func (s *Satellite) isSnapshotByHand(rdName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.snapshotsByHand[rdName]
 }
 
 func (s *Satellite) isNodeOffline(node string) bool {
