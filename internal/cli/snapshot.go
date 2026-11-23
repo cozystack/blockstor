@@ -466,8 +466,8 @@ func restoreIntoExistingTarget(
 		return finishRestoreLeftover(ctx, run, existing.Name, snap, progress)
 	}
 
-	// A layer stack that is not the source's, or replicas still being
-	// deleted, refuse here, before the marker goes on a definition that is
+	// Replicas still being deleted, or a source whose stack is not decided
+	// yet, refuse here, before the marker goes on a definition that is
 	// the operator's; see store.PreparedRestoreTarget.
 	prepared, err := store.PreparedRestoreTarget(ctx, run.Store, &existing, snap)
 	if err != nil {
