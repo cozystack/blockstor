@@ -57,6 +57,7 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	// poll returns a non-empty list when the answer is yes.
 	nodeFilter := multiValueQuery(r, "nodes")
 	rdFilter := multiValueQuery(r, "resources")
+	propFilter := propsQuery(r)
 	faultyOnly := boolQuery(r, "faulty")
 
 	// Per-RD UpToDate tally — drives the `?faulty=true` filter and
@@ -77,6 +78,10 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !matchAnyName(rdFilter, resList[i].Name) {
+			continue
+		}
+
+		if !matchProps(propFilter, resList[i].Props) {
 			continue
 		}
 
@@ -710,15 +715,15 @@ func splitCSV(value string) []string {
 	return out
 }
 
-// matchAnyName reports whether candidate names the same object as any of
-// needles (naming.Same). Empty needles means "no filter — accept".
+// matchAnyName reports whether any of needles matches candidate, see
+// nameMatches. Empty needles means "no filter — accept".
 func matchAnyName(needles []string, candidate string) bool {
 	if len(needles) == 0 {
 		return true
 	}
 
 	for _, n := range needles {
-		if naming.Same(n, candidate) {
+		if nameMatches(n, candidate) {
 			return true
 		}
 	}

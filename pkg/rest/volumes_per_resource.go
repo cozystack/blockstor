@@ -73,9 +73,14 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	vols := res.Volumes
-	if vols == nil {
-		vols = []apiv1.Volume{}
+	// REST 1.28 added the `props` filter here, on the volumes' own props.
+	propFilter := propsQuery(r)
+	vols := make([]apiv1.Volume, 0, len(res.Volumes))
+
+	for i := range res.Volumes {
+		if matchProps(propFilter, res.Volumes[i].Props) {
+			vols = append(vols, res.Volumes[i])
+		}
 	}
 
 	writeJSON(w, http.StatusOK, vols)

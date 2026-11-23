@@ -60,11 +60,13 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 	// (naming.Same, case-insensitive inside RFC 1123),
 	// unknown names => empty list (NOT 404); missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_definitions")
-	if len(nameFilter) > 0 {
+	propFilter := propsQuery(r)
+
+	if len(nameFilter) > 0 || len(propFilter) > 0 {
 		filtered := rds[:0]
 
 		for i := range rds {
-			if matchAnyName(nameFilter, rds[i].Name) {
+			if matchAnyName(nameFilter, rds[i].Name) && matchProps(propFilter, rds[i].Props) {
 				filtered = append(filtered, rds[i])
 			}
 		}
