@@ -24,7 +24,7 @@ where it's the network leg).
 |-----------------------------|---------------------------------------------------------------------|
 | `["DRBD","STORAGE"]`        | Default. Replicated PVC, the cozystack production case.             |
 | `["LUKS","STORAGE"]`        | Single-replica encrypted PVC. No DRBD overhead.                     |
-| `["DRBD","LUKS","STORAGE"]` | Encrypted at-rest + replicated. Per-volume cipher.                  |
+| `["DRBD","LUKS","STORAGE"]` | Encrypted at-rest + replicated. Per-replica key.                    |
 | `["STORAGE"]`               | Single-replica local mode. Ephemeral cache, scratch, ZFS dataset.   |
 
 The default is `["DRBD","STORAGE"]`, used when neither the RD nor its resource group sets a stack.
