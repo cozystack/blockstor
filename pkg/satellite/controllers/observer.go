@@ -136,6 +136,9 @@ type volumeObservation struct {
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
+	// DeviceSizeKib is the DRBD device size from the `size:` token of
+	// a `device` frame; 0 when the frame did not carry one.
+	DeviceSizeKib int64
 
 	// Removed is an internal marker set by translateDeviceEvent for
 	// `destroy device` frames (drbdsetup emits one after a volume is
@@ -378,6 +381,13 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 	if q, ok := ev.Fields["quorum"]; ok {
 		vol.Quorum = q == drbdQuorumYes
 		vol.HasQuorum = true
+	}
+
+	// `size:<kib>` rides on device frames under --statistics --full. A
+	// device that is neither attached nor connected has no size yet
+	// and reports 0, which is not a size worth publishing.
+	if size, err := strconv.ParseInt(ev.Fields["size"], 10, 64); err == nil && size > 0 {
+		vol.DeviceSizeKib = size
 	}
 
 	out.Volumes = []volumeObservation{vol}
@@ -1691,6 +1701,11 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservati
 		changed = true
 	}
 
+	if incoming.DeviceSizeKib > 0 && merged.DeviceSizeKib != incoming.DeviceSizeKib {
+		merged.DeviceSizeKib = incoming.DeviceSizeKib
+		changed = true
+	}
+
 	// BackingDev is carried in the cache (so the snapshot the backfill
 	// reads has the lower-disk path) but never marks the volume
 	// `changed` on its own — it is an internal helper field, not a
@@ -2112,12 +2127,13 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 
 	for _, vol := range ev.Volumes {
 		out = append(out, blockstoriov1alpha1.ResourceVolumeStatus{
-			VolumeNumber: vol.VolumeNumber,
-			StoragePool:  storagePool,
-			DiskState:    vol.DiskState,
-			CurrentGI:    vol.CurrentUUID,
-			OutOfSyncKib: vol.OutOfSyncKib,
-			Quorum:       vol.Quorum,
+			VolumeNumber:  vol.VolumeNumber,
+			StoragePool:   storagePool,
+			DiskState:     vol.DiskState,
+			CurrentGI:     vol.CurrentUUID,
+			OutOfSyncKib:  vol.OutOfSyncKib,
+			Quorum:        vol.Quorum,
+			DeviceSizeKib: vol.DeviceSizeKib,
 		})
 	}
 
