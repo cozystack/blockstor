@@ -404,7 +404,11 @@ spec:
   resourceDefinitionName: pvc-vol1
   snapshotName: snap-good
   volumeDefinitions:
-  - sizeKib: 1048576
+  - props:
+      DrbdOptions/Disk/block-size: "4096"
+      Linstor/Drbd/freeze-block-size: "True"
+    sizeKib: 1048576
     volumeNumber: 0
-  - sizeKib: 307200
+  - props: {}
+    sizeKib: 307200
     volumeNumber: 1

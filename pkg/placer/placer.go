@@ -333,6 +333,11 @@ func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.
 		return nil, errors.Wrap(err, "list resources by definition")
 	}
 
+	candidates, err = p.filterByBlockSize(ctx, rdName, existing, candidates)
+	if err != nil {
+		return nil, err
+	}
+
 	disabled, err := p.disabledNodes(ctx)
 	if err != nil {
 		return nil, err
