@@ -153,6 +153,21 @@ func (r *BlockSizeReleaseReconciler) forgetConflicts(name string) {
 	delete(r.conflicts, name)
 }
 
+// forgetGoneConflicts drops the count of every definition no longer in
+// rds. A lost race in the sweep is retried by the next sweep, not by a
+// requeue, so a definition deleted in between never gets the pass that
+// would otherwise forget it.
+func (r *BlockSizeReleaseReconciler) forgetGoneConflicts(rds []blockstoriov1alpha1.ResourceDefinition) {
+	r.conflictsMu.Lock()
+	defer r.conflictsMu.Unlock()
+
+	for name := range r.conflicts {
+		if !slices.ContainsFunc(rds, func(rd blockstoriov1alpha1.ResourceDefinition) bool { return rd.Name == name }) {
+			delete(r.conflicts, name)
+		}
+	}
+}
+
 func (r *BlockSizeReleaseReconciler) release(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if r.Lock != nil {
 		mu := r.Lock(req.Name)
@@ -320,6 +335,8 @@ func (r *BlockSizeReleaseReconciler) Sweep(ctx context.Context, seen map[string]
 	if err != nil {
 		return seen, cerrors.Wrap(err, "list resource definitions")
 	}
+
+	r.forgetGoneConflicts(rds.Items)
 
 	candidates := map[string]bool{}
 

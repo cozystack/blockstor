@@ -435,3 +435,59 @@ func TestReleaseStarvedByAWriterIsLogged(t *testing.T) {
 
 	race(1)
 }
+
+// TestSweepForgetsTheRacesOfADeletedDefinition: a lost race in the
+// sweep is retried by the next sweep, not by a requeue, so a definition
+// deleted after its sweeps kept losing never got the pass that forgets
+// its count. The count then outlived it, and a definition recreated
+// under the same name started its first race already at the default
+// verbosity.
+func TestSweepForgetsTheRacesOfADeletedDefinition(t *testing.T) {
+	t.Parallel()
+
+	var levels raceLevels
+
+	ctx := logf.IntoContext(context.Background(), logr.New(raceSink{levels: &levels}))
+
+	rd := newBSFixture(map[string]string{blocksize.PropBlockSize: "4096", blocksize.PropFreeze: "True"}).rd
+	cli := releaseClient(t, releaseRaced, rd)
+	rec := &controllerpkg.BlockSizeReleaseReconciler{Client: cli}
+
+	var (
+		seen map[string]bool
+		err  error
+	)
+
+	for range 10 {
+		seen, err = rec.Sweep(ctx, seen)
+		if err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+	}
+
+	err = cli.Delete(ctx, rd.DeepCopy())
+	if err != nil {
+		t.Fatalf("delete rd: %v", err)
+	}
+
+	_, err = rec.Sweep(ctx, seen)
+	if err != nil {
+		t.Fatalf("sweep after the delete: %v", err)
+	}
+
+	again := newBSFixture(map[string]string{blocksize.PropBlockSize: "4096", blocksize.PropFreeze: "True"}).rd
+
+	err = cli.Create(ctx, again)
+	if err != nil {
+		t.Fatalf("recreate rd: %v", err)
+	}
+
+	_, err = rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: bsRD}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if got := levels.last(); got != 1 {
+		t.Fatalf("the recreated definition's first lost race logged at V(%d), want V(1)", got)
+	}
+}
