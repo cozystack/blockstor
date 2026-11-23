@@ -20,6 +20,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -174,7 +175,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; hasAnnotation {
 		// Operator intent: ignore per-RD shortfall grace and the
 		// per-node offline grace — a REST modify means "act now".
-		count, perr := r.rebalanceChildRDs(ctx, rg, 0)
+		count, perr := r.rebalanceChildRDs(ctx, rg, 0, false)
 		if perr != nil {
 			return perr
 		}
@@ -191,7 +192,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 		return nil
 	}
 
-	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod)
+	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod, true)
 	if perr != nil {
 		return perr
 	}
@@ -216,7 +217,17 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // same window). Pass 0 to disable the gate — the annotation-driven
 // path does this so an operator's `linstor rg modify` acts on every
 // child RD immediately.
-func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration) (int, error) {
+//
+// `scheduled` marks the periodic pass, LINSTOR's BalanceResourcesTask,
+// which leaves alone a definition being deleted and one with nothing
+// deployed to balance: a definition whose replicas were all deleted
+// (a truncate, or a CSI DeleteVolume) and that its snapshots keep is a
+// deleted volume, and re-placing it would bring that volume back. An
+// operator's `rg modify` / `rg adjust` places on every definition, as
+// LINSTOR's adjust does.
+func (r *RGRebalanceReconciler) rebalanceChildRDs(
+	ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, scheduled bool,
+) (int, error) {
 	log := logf.FromContext(ctx)
 
 	rds, err := r.Store.ResourceDefinitions().List(ctx)
@@ -240,6 +251,13 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 			continue
 		}
 
+		if scheduled && !r.hasSomethingToBalance(ctx, &rds[i]) {
+			log.V(1).Info("scheduled rebalance skipped (nothing deployed to balance)",
+				"rg", rg.Name, "rd", rds[i].Name)
+
+			continue
+		}
+
 		filter := rg.SelectFilter
 		if filter.PlaceCount == 0 {
 			filter.PlaceCount = 1
@@ -255,6 +273,25 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 	}
 
 	return processed, nil
+}
+
+// hasSomethingToBalance reports whether the scheduled pass may place
+// replicas for rd: it is not being deleted and holds at least one replica
+// with a disk that is not being deleted. A definition that cannot be read
+// is left to the placer, which reports it.
+func (r *RGRebalanceReconciler) hasSomethingToBalance(ctx context.Context, rd *apiv1.ResourceDefinition) bool {
+	if slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
+		return false
+	}
+
+	replicas, err := r.Store.Resources().ListByDefinition(ctx, rd.Name)
+	if err != nil {
+		return true
+	}
+
+	return slices.ContainsFunc(replicas, func(res apiv1.Resource) bool {
+		return store.HoldsData(&res) && !slices.Contains(res.Flags, apiv1.ResourceFlagDelete)
+	})
 }
 
 // shortfallWithinGrace reports whether an RD carries a still-fresh

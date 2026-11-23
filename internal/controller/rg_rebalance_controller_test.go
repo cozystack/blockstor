@@ -328,6 +328,9 @@ func TestRGRebalanceReconcilerNoAnnotationStillFiresScheduledTick(t *testing.T) 
 		Name:              "pvc-no-annot",
 		ResourceGroupName: "rg",
 	})
+	// A deployed volume short of its place count: the scheduled tick
+	// balances what is deployed, see the next test for what it leaves.
+	_ = st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-no-annot", NodeName: "n1"})
 
 	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
 
@@ -338,5 +341,37 @@ func TestRGRebalanceReconcilerNoAnnotationStillFiresScheduledTick(t *testing.T) 
 	got, _ := st.Resources().ListByDefinition(ctx, "pvc-no-annot")
 	if len(got) != 3 {
 		t.Errorf("scheduled tick must refill deficit even without annotation; got %d replicas, want 3", len(got))
+	}
+}
+
+// TestRGRebalanceScheduledTickLeavesAnEmptiedDefinition: a definition
+// whose replicas were all deleted, by a truncate or a CSI DeleteVolume,
+// and that its snapshots keep is a deleted volume. The scheduled tick
+// must not place it again, as LINSTOR's BalanceResourcesTask ignores a
+// definition without an UpToDate replica; linstor-csi from v1.13 relies on
+// it, it truncates and then deletes the volume definitions.
+func TestRGRebalanceScheduledTickLeavesAnEmptiedDefinition(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	st := store.NewInMemory()
+
+	seedIntervalFixture(t, ctx, st, 2, nil)
+
+	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-interval")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Fatalf("the scheduled tick placed %d replicas of an emptied definition", len(got))
 	}
 }
