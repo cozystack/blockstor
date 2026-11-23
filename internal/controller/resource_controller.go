@@ -498,8 +498,9 @@ func (r *ResourceReconciler) maybeAutoDiskful(
 
 // hasDiskfulDeficit reports whether the volume has fewer live diskful
 // replicas than its resource group's place count. Diskless replicas,
-// replicas flagged DELETE (or INACTIVE) and replicas being deleted
-// don't count. A definition without a resource group, a resource group
+// replicas flagged DELETE (or INACTIVE), replicas being deleted and
+// replicas on EVICTED or LOST nodes don't count, the same way the
+// auto-diskful timer drops them. A definition without a resource group, a resource group
 // that can't be read, or a missing definition yields false so nothing
 // is promoted on a guess. A place count of 0 (the default group ships
 // with it) reads as 1, the way the placer treats it.
@@ -526,10 +527,27 @@ func (r *ResourceReconciler) hasDiskfulDeficit(
 		placeCount = 1
 	}
 
+	nodes, err := r.Store.Nodes().List(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	disabled := make(map[string]struct{}, len(nodes))
+
+	for i := range nodes {
+		if isDisabledNode(&nodes[i]) {
+			disabled[naming.Key(nodes[i].Name)] = struct{}{}
+		}
+	}
+
 	diskful := 0
 
 	for i := range peers {
 		if peers[i].DeletionTimestamp != nil {
+			continue
+		}
+
+		if _, gone := disabled[naming.Key(peers[i].Spec.NodeName)]; gone {
 			continue
 		}
 

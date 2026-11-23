@@ -91,6 +91,22 @@ func TestAutoDisklessRefillsLostCopy(t *testing.T) {
 	}
 }
 
+// TestAutoDisklessRefillsAfterEviction: a diskful peer on an EVICTED
+// node is not a live copy, so the place count is not met and the node
+// using the volume is promoted.
+func TestAutoDisklessRefillsAfterEviction(t *testing.T) {
+	t.Parallel()
+
+	got := reconcileDisklessAttach(t, "pvc-evict", 2, []diskfulPeer{
+		{node: "n2"},
+		{node: "n3", evicted: true},
+	})
+
+	if slices.Contains(got.Spec.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("DISKLESS kept although a copy sits on an evicted node: %v", got.Spec.Flags)
+	}
+}
+
 // TestAutoDisklessDisklessPeersDoNotCount: diskless peers (including a
 // tiebreaker) are not diskful copies.
 func TestAutoDisklessDisklessPeersDoNotCount(t *testing.T) {
@@ -135,6 +151,7 @@ type diskfulPeer struct {
 	node     string
 	flags    []string
 	deleting bool
+	evicted  bool
 }
 
 // reconcileDisklessAttach seeds an InUse diskless replica on n1 (which
@@ -166,6 +183,20 @@ func reconcileDisklessAttach(
 		})
 		if err != nil {
 			t.Fatalf("seed resource group: %v", err)
+		}
+	}
+
+	for _, p := range peers {
+		if !p.evicted {
+			continue
+		}
+
+		err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  p.node,
+			Flags: []string{apiv1.NodeFlagEvicted},
+		})
+		if err != nil {
+			t.Fatalf("seed evicted node: %v", err)
 		}
 	}
 
