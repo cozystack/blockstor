@@ -259,8 +259,10 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // every Watches map function through r.passes.mapFunc. A Watches added
 // without it still works, but its passes are counted as retries.
 //
-// A converged replica gets no periodic pass. The drift check (see
-// driftCheckInterval) passes the replicas drbdadm lists as adjustable.
+// A converged replica gets no periodic pass. A change of anything else
+// a pass renders from reaches it through watchRenderInputs, and the
+// drift check (see driftCheckInterval) passes the replicas drbdadm
+// lists as adjustable.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.passes = newPassCounter()
 
@@ -280,6 +282,8 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRD))).
 		Named("satellite-resource").
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.resourceWorkers()})
+
+	bldr = r.watchRenderInputs(bldr)
 
 	// Phase 11.7 second leg: the observer-trigger channel wakes
 	// this reconciler on kernel-state changes that produce no

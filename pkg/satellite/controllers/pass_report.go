@@ -40,6 +40,7 @@ const (
 	passResource   = "resource"   // the replica's own Resource changed
 	passPeer       = "peer"       // another node's replica of the same definition changed
 	passDefinition = "definition" // the ResourceDefinition changed
+	passConfig     = "config"     // a group, the controller config, a node or a pool the replica renders changed
 	passKernel     = "kernel"     // the observer saw a kernel state change
 	passDrift      = "drift"      // drbdadm lists the replica as adjustable
 	passRetry      = "retry"      // the previous pass asked to be run again
@@ -112,7 +113,7 @@ func (c *passCounter) report() []any {
 
 	fields := make([]any, 0, 2*len(c.passes))
 
-	for _, reason := range []string{passResource, passPeer, passDefinition, passKernel, passDrift, passRetry} {
+	for _, reason := range []string{passResource, passPeer, passDefinition, passConfig, passKernel, passDrift, passRetry} {
 		fields = append(fields, reason, c.passes[reason])
 	}
 
