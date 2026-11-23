@@ -1337,6 +1337,7 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 		}
 	}
 
+	o.carryCachedState(ev)
 	o.backfillCurrentGI(ctx, adm, ev)
 
 	err := o.writeStatus(ctx, ev)
@@ -1349,6 +1350,29 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	}
 
 	logger.Error(err, "write Resource.Status", "resource", ev.ResourceName)
+}
+
+// carryCachedState fills the volumes and peer links a frame left out
+// from the caches. Status is written with server-side apply, which
+// removes every field the observer sent before and leaves out now:
+// a role change or an unchanged device frame used to erase the
+// replica's disk states and links until the next resync, and every
+// read in between showed it with no state at all. Run before
+// backfillCurrentGI so the carried volumes keep their CurrentGI.
+func (o *ObserverRunnable) carryCachedState(ev *observation) {
+	if len(ev.Volumes) > 0 && len(ev.Connections) > 0 {
+		return
+	}
+
+	cached := o.snapshotFor(ev.ResourceName)
+
+	if len(ev.Volumes) == 0 {
+		ev.Volumes = cached.Volumes
+	}
+
+	if len(ev.Connections) == 0 {
+		ev.Connections = cached.Connections
+	}
 }
 
 // backfillCurrentGI fills ev.Volumes[].CurrentUUID from the on-disk GI
