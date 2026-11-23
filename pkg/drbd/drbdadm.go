@@ -195,11 +195,7 @@ func (a *Adm) AdjustSkipNetSkipDisk(ctx context.Context, resource string) error 
 // `runFirstActivation` gates the call behind a `HasMD` pre-check so
 // this stays safe across satellite restarts / failed first attempts.
 func (a *Adm) CreateMD(ctx context.Context, resource string) error {
-	return a.run(ctx,
-		"create-md",
-		"--force",
-		fmt.Sprintf("--max-peers=%d", MaxPeers-1),
-		resource)
+	return a.CreateMDWithMaxPeers(ctx, resource, MaxPeers-1)
 }
 
 // HasMD reports whether DRBD-9 metadata already exists for the
@@ -323,6 +319,16 @@ var metadataAbsentMarkers = []string{
 // crashed with real data on it. Only the caller knows which one it is
 // looking at, so the probe names the state and refuses to guess.
 var ErrMetadataUnclean = errors.New("metadata is present but its activity log needs applying")
+
+// ErrUncleanMetadataUnrecorded reports metadata under an unapplied
+// activity log on a volume that its replica holds no record of: no GI
+// was ever seen on it, it is not the destination of a restore, and its
+// superblock does not carry this replica's node id, or that cannot be
+// read. Re-creating it could throw away the GI and dirty bitmap of a
+// replica that holds data, and LINSTOR never re-creates metadata that is
+// there; an operator decides instead.
+var ErrUncleanMetadataUnrecorded = errors.New(
+	"refusing to re-create metadata under an unapplied activity log on a volume with no recorded GI")
 
 // metadataUncleanMarkers are the exits that positively state that.
 //
