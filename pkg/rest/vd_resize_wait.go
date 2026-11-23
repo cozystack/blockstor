@@ -39,11 +39,6 @@ import (
 //nolint:gochecknoglobals // tunable; tests shorten it
 var resizeWaitPollInterval = 250 * time.Millisecond
 
-// warnNotConnected is LINSTOR's WARN_NOT_CONNECTED (1002 in the warning
-// band), the entry its controller adds for every satellite an update
-// could not reach.
-const warnNotConnected = maskWarn | int64(1002)
-
 // resizeReplicas sorts the replicas of a definition by what a grow of
 // one volume has to wait for.
 type resizeReplicas struct {
@@ -272,7 +267,7 @@ func (s *Server) waitForVolumeGrown(ctx context.Context, rd string, vn int32, ta
 	for {
 		state, err := s.classifyResizeReplicas(ctx, rd, vn, targetKib)
 		if err == nil && len(state.growing) == 0 {
-			return append(notConnectedWarnings(state.offline, rd, vn),
+			return append(volumeNotConnectedWarnings(state.offline, rd, vn),
 				peerDownWarnings(state.peerDown, rd, vn)...), outcomeGrown
 		}
 
@@ -352,8 +347,9 @@ func shutdownDuringResize(rd string, vn int32) []apiv1.APICallRc {
 	}}
 }
 
-// notConnectedWarnings builds one WARN_NOT_CONNECTED entry per node.
-func notConnectedWarnings(nodes []string, rd string, vn int32) []apiv1.APICallRc {
+// volumeNotConnectedWarnings builds one WARN_NOT_CONNECTED entry per
+// node, naming the volume the update was for.
+func volumeNotConnectedWarnings(nodes []string, rd string, vn int32) []apiv1.APICallRc {
 	out := make([]apiv1.APICallRc, 0, len(nodes))
 
 	for _, node := range nodes {
