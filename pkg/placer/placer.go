@@ -221,22 +221,7 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 		// Fail-fast: no pool can host the largest volume. Surface the
 		// actionable error so REST returns 409 instead of 200 + a
 		// downstream satellite failure (Bug 35 / 7.15 e2e).
-		//
-		// Precedence: the physical FreeCapacity floor (Bug 35) is the
-		// more fundamental gate, so a non-zero maxFreeKib wins over an
-		// oversub witness — operators see the hard floor first. Only
-		// when the floor was clean (every rejected pool tripped a ratio
-		// cap, not the floor) do we surface the OversubscriptionShortfall
-		// envelope so the relevant ratio (Free / Total / Master) is
-		// named in the 409 (scenarios 7.W10 / 7.W11).
-		if plan.maxFreeKib == 0 && plan.oversubShortfall != nil {
-			return 0, int(filter.PlaceCount), plan.oversubShortfall
-		}
-
-		return 0, int(filter.PlaceCount), &CapacityShortfallError{
-			RequiredKib: plan.requiredKib,
-			MaxFreeKib:  plan.maxFreeKib,
-		}
+		return 0, int(filter.PlaceCount), plan.shortfallError()
 	}
 
 	placed := countDiskfulReplicas(plan.existing, plan.disabled)
@@ -313,6 +298,26 @@ type placePlan struct {
 	// mutually exclusive so REST can render a single 409 naming the
 	// exact ratio the operator needs to tune.
 	oversubShortfall *OversubscriptionShortfallError
+}
+
+// shortfallError is the error of a plan with capacityShortfall set.
+//
+// Precedence: the physical FreeCapacity floor (Bug 35) is the more
+// fundamental gate, so a non-zero maxFreeKib wins over an oversub
+// witness — operators see the hard floor first. Only when the floor was
+// clean (every rejected pool tripped a ratio cap, not the floor) do we
+// surface the OversubscriptionShortfall envelope so the relevant ratio
+// (Free / Total / Master) is named in the 409 (scenarios 7.W10 /
+// 7.W11).
+func (pl *placePlan) shortfallError() error {
+	if pl.maxFreeKib == 0 && pl.oversubShortfall != nil {
+		return pl.oversubShortfall
+	}
+
+	return &CapacityShortfallError{
+		RequiredKib: pl.requiredKib,
+		MaxFreeKib:  pl.maxFreeKib,
+	}
 }
 
 // buildPlan does the read-side legwork: load VDs, candidate pools,
