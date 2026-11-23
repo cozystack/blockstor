@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package satellite_test
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/satellite"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
+	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/storage/zfs"
+)
+
+const (
+	adoptedVolumeKiB = 20 * 1024 * 1024
+	// adoptedDeviceKiB is the DRBD device of a 20 GiB volume LINSTOR
+	// v1.33.1 created on ZFS with a 16 KiB volblocksize: 41943056
+	// sectors, 8 KiB more than the definition.
+	adoptedDeviceKiB = 20971528
+)
+
+// createdZvolKiB applies one volume on a thin ZFS pool and returns the
+// size, in KiB, the zvol was created with.
+func createdZvolKiB(t *testing.T, vol *intent.DesiredVolume, layerStack []string) int64 {
+	t.Helper()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -o name data/pvc-adopted_00000", storage.FakeResponse{Stdout: []byte("")})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"data": zfs.NewProvider(zfs.Config{Pool: "data", Thin: true}, fx)},
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{{
+		Name:       "pvc-adopted",
+		NodeName:   "n2",
+		Volumes:    []*intent.DesiredVolume{vol},
+		LayerStack: layerStack,
+	}})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		var mib int64
+
+		_, scanErr := fmt.Sscanf(line, "zfs create -s -V %dM data/pvc-adopted_00000", &mib)
+		if scanErr == nil {
+			return mib * 1024
+		}
+	}
+
+	t.Fatalf("no zfs create in %v", fx.CommandLines())
+
+	return 0
+}
+
+// TestNewLowerDiskHoldsAdoptedDevice reproduces a diskless replica of a
+// volume adopted from LINSTOR turned diskful. The zvol used to be the
+// definition's size, exactly 20 GiB; with 15 peer slots of internal
+// metadata it held a 41923768-sector data area, and the kernel refused
+// to attach it under the 41943056-sector device the resource exposes.
+// The new zvol must hold that device.
+func TestNewLowerDiskHoldsAdoptedDevice(t *testing.T) {
+	t.Parallel()
+
+	zvol := createdZvolKiB(t, &intent.DesiredVolume{
+		VolumeNumber:  0,
+		SizeKib:       adoptedVolumeKiB,
+		StoragePool:   "data",
+		DeviceSizeKib: adoptedDeviceKiB,
+	}, nil)
+
+	if zvol == adoptedVolumeKiB {
+		t.Fatalf("zvol created at the definition's size, %d KiB, leaving no room for metadata", zvol)
+	}
+
+	data := drbd.InternalMetadataNetKiB(zvol, drbd.DefaultGeometry())
+	if data < adoptedDeviceKiB {
+		t.Fatalf("zvol of %d KiB holds a %d KiB data area, below the %d KiB device", zvol, data, adoptedDeviceKiB)
+	}
+
+	if zvol != 20490*1024 {
+		t.Errorf("zvol: got %d KiB, want 20490 MiB", zvol)
+	}
+}
+
+// TestNewLowerDiskHoldsLargestReportedDevice: when a replica reports a
+// device larger than the metadata arithmetic alone leaves room for, the
+// lower disk grows to hold it.
+func TestNewLowerDiskHoldsLargestReportedDevice(t *testing.T) {
+	t.Parallel()
+
+	device := int64(adoptedVolumeKiB + 2048)
+
+	zvol := createdZvolKiB(t, &intent.DesiredVolume{
+		VolumeNumber:  0,
+		SizeKib:       adoptedVolumeKiB,
+		StoragePool:   "data",
+		DeviceSizeKib: device,
+	}, nil)
+
+	data := drbd.InternalMetadataNetKiB(zvol, drbd.DefaultGeometry())
+	if data < device {
+		t.Fatalf("zvol of %d KiB holds a %d KiB data area, below the reported %d KiB device", zvol, data, device)
+	}
+}
+
+// TestNewLowerDiskWithoutInternalMetadata: a volume without DRBD keeps
+// the definition's size.
+func TestNewLowerDiskWithoutInternalMetadata(t *testing.T) {
+	t.Parallel()
+
+	storageOnly := createdZvolKiB(t, &intent.DesiredVolume{
+		VolumeNumber: 0, SizeKib: adoptedVolumeKiB, StoragePool: "data", DeviceSizeKib: adoptedDeviceKiB,
+	}, []string{"STORAGE"})
+	if storageOnly != adoptedVolumeKiB {
+		t.Errorf("storage-only volume: got %d KiB, want the definition's %d", storageOnly, adoptedVolumeKiB)
+	}
+}

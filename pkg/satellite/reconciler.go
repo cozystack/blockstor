@@ -1789,7 +1789,9 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 		// of CreateVolume so the new replica starts populated with
 		// the snapshot's data. Idempotent: provider's clone op skips
 		// when the target volume already exists.
-		err := r.materializeVolume(ctx, provider, dr.GetName(), vol)
+		lowerDisk := lowerDiskKib(dr, vol)
+
+		err := r.materializeVolume(ctx, provider, dr.GetName(), vol, lowerDisk)
 		if err != nil {
 			return nil, false, false, errors.Wrapf(err, "create/restore volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
@@ -1811,15 +1813,21 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 		// Call ResizeVolume to extend the LV/zvol/file; the LUKS
 		// layer (when present) and `drbdadm resize` are layered on
 		// top by their own reconcile steps.
+		//
+		// The trigger compares the definition, not the lower disk, with
+		// what is on disk: a lower disk created before it was sized for
+		// metadata is the definition's size, and growing every one of
+		// them on upgrade would resize every volume at once. The grow
+		// itself goes to the full lower disk.
 		if vol.GetSizeKib() > status.UsableKib && status.UsableKib > 0 {
 			err = provider.ResizeVolume(ctx, storage.Volume{
 				ResourceName: dr.GetName(),
 				VolumeNumber: vol.GetVolumeNumber(),
-				SizeKib:      vol.GetSizeKib(),
+				SizeKib:      lowerDisk,
 			})
 			if err != nil {
 				return nil, false, false, errors.Wrapf(err, "resize volume %s/%d to %d KiB",
-					dr.GetName(), vol.GetVolumeNumber(), vol.GetSizeKib())
+					dr.GetName(), vol.GetVolumeNumber(), lowerDisk)
 			}
 
 			resized = true
@@ -1851,6 +1859,34 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	}
 
 	return devices, resized, cloned, nil
+}
+
+// lowerDiskKib is the size, in KiB, of the lower disk a volume is
+// created or grown at.
+//
+// Under DRBD with internal metadata the lower disk holds the data area
+// and the metadata after it, so it is sized like LINSTOR sizes it: the
+// data area plus the metadata blockstor writes on it (DefaultGeometry,
+// the most peer slots blockstor creates). A lower disk the definition's
+// size exposes a DRBD device smaller than the volume, and the kernel
+// refuses to attach it to a resource whose device is already larger.
+//
+// The data area is the definition's size or the largest device any
+// replica reports, whichever is larger. A volume adopted from LINSTOR
+// was sized for LINSTOR's peer slots and rounded up to its pool's
+// allocation unit, so its device can be a few KiB larger than the
+// definition, and a replica joining it must hold that.
+//
+// External metadata lives on its own volume and a resource without DRBD
+// has no metadata, so their lower disk is the definition's size.
+func lowerDiskKib(dr *intent.DesiredResource, vol *intent.DesiredVolume) int64 {
+	if !needsDRBD(dr.GetLayerStack()) || vol.GetMetaPool() != "" {
+		return vol.GetSizeKib()
+	}
+
+	data := max(vol.GetSizeKib(), vol.GetDeviceSizeKib())
+
+	return drbd.InternalMetadataGrossKiB(data, drbd.DefaultGeometry())
 }
 
 // deviceWaitTimeoutDefault/deviceWaitPollDefault back the same-named
@@ -1927,11 +1963,11 @@ func (r *Reconciler) waitForBlockDevice(ctx context.Context, device string) erro
 // fall back to a blank CreateVolume — DRBD network resync will
 // populate the data, at the cost of a known cloned-metadata vs
 // fresh-metadata GI mismatch on the wire (see Phase 11 notes).
-func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *intent.DesiredVolume) error {
+func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *intent.DesiredVolume, sizeKib int64) error {
 	target := storage.Volume{
 		ResourceName: rdName,
 		VolumeNumber: vol.GetVolumeNumber(),
-		SizeKib:      vol.GetSizeKib(),
+		SizeKib:      sizeKib,
 	}
 
 	src := vol.GetSourceSnapshot()
