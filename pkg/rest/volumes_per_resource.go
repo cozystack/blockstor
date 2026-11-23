@@ -73,12 +73,9 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	vols := res.Volumes
-	if vols == nil {
-		vols = []apiv1.Volume{}
-	}
-
-	writeJSON(w, http.StatusOK, vols)
+	// Every volume definition is listed, built or not, as LINSTOR does;
+	// see ensureVolumesForView.
+	writeJSON(w, http.StatusOK, ensureVolumesForView(res.Volumes, &res, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)))
 }
 
 // handleVolumesPerResourceGet answers
@@ -106,9 +103,15 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	for i := range res.Volumes {
-		if res.Volumes[i].VolumeNumber == vlmNr {
-			writeJSON(w, http.StatusOK, res.Volumes[i])
+	// A volume the satellite has not built yet answers without a device
+	// path, as LINSTOR's does, rather than 404: linstor-csi's attach
+	// then reports "could not determine device path" and retries,
+	// instead of failing on a volume that does exist.
+	vols := ensureVolumesForView(res.Volumes, &res, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName))
+
+	for i := range vols {
+		if vols[i].VolumeNumber == vlmNr {
+			writeJSON(w, http.StatusOK, vols[i])
 
 			return
 		}
