@@ -19,8 +19,11 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
@@ -111,12 +114,10 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	for i := range res.Volumes {
-		if res.Volumes[i].VolumeNumber == vlmNr {
-			writeJSON(w, http.StatusOK, res.Volumes[i])
+	if vol, ok := s.awaitReportedVolume(r.Context(), &res, vlmNr); ok {
+		writeJSON(w, http.StatusOK, vol)
 
-			return
-		}
+		return
 	}
 
 	writeError(w, http.StatusNotFound, fmt.Sprintf(
@@ -229,4 +230,48 @@ func mergeVolumePropsPatch(vol *apiv1.Volume, patch *apiv1.GenericPropsModify) {
 	applyPropsModify(vol.Props, patch.OverrideProps, patch.DeleteProps)
 
 	deletePropNamespaces(vol.Props, patch.DeleteNamespace)
+}
+
+// volumeReportBudget bounds how long a volume read waits for the satellite
+// to report a volume its definition has. It stays well below the
+// external-attacher's timeout.
+const volumeReportBudget = 10 * time.Second
+
+// awaitReportedVolume answers volume vlmNr of the replica, waiting for its
+// satellite to report it when the replica is new: linstor-csi reads the
+// volume's device path right after make-available, and LINSTOR knows it
+// from the moment the replica exists. A volume number the definition does
+// not have, and a replica being deleted, are answered at once.
+func (s *Server) awaitReportedVolume(ctx context.Context, res *apiv1.Resource, vlmNr int32) (apiv1.Volume, bool) {
+	deadline := time.Now().Add(volumeReportBudget)
+
+	for {
+		for i := range res.Volumes {
+			if res.Volumes[i].VolumeNumber == vlmNr {
+				return res.Volumes[i], true
+			}
+		}
+
+		if slices.Contains(res.Flags, apiv1.ResourceFlagDelete) || time.Now().After(deadline) {
+			return apiv1.Volume{}, false
+		}
+
+		_, err := s.Store.VolumeDefinitions().Get(ctx, res.Name, vlmNr)
+		if err != nil {
+			return apiv1.Volume{}, false
+		}
+
+		select {
+		case <-ctx.Done():
+			return apiv1.Volume{}, false
+		case <-time.After(cacheConvergePollInterval):
+		}
+
+		next, err := s.Store.Resources().Get(ctx, res.Name, res.NodeName)
+		if err != nil {
+			return apiv1.Volume{}, false
+		}
+
+		*res = next
+	}
 }
