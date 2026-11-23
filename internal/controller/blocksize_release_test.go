@@ -23,6 +23,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -231,4 +234,106 @@ func volumeProps(t *testing.T, cli client.Client, name string) map[string]string
 	}
 
 	return rd.Spec.VolumeDefinitions[0].Props
+}
+
+var errBlockSizeReleaseBroken = errors.New("apiserver refused the write")
+
+// releaseClient fails every definition patch with what fail returns,
+// and lets the rest through.
+func releaseClient(t *testing.T, fail func(name string) error, objs ...client.Object) client.Client {
+	t.Helper()
+
+	base := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).Build()
+
+	return interceptor.NewClient(base, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if err := fail(obj.GetName()); err != nil {
+				return err
+			}
+
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+}
+
+func releaseRaced(name string) error {
+	return apierrors.NewConflict(schema.GroupResource{Group: "blockstor.org", Resource: "resourcedefinitions"}, name,
+		errors.New("the object has been modified; please apply your changes to the latest version and try again"))
+}
+
+// TestReleaseRetriesAPatchThatLostARace: a release whose patch lost an
+// optimistic-concurrency race is retried, not reported. Reported,
+// controller-runtime logged it as "Reconciler error" at ERROR on every
+// burst of volume deletions, and the next pass always went through.
+func TestReleaseRetriesAPatchThatLostARace(t *testing.T) {
+	t.Parallel()
+
+	f := newBSFixture(map[string]string{blocksize.PropBlockSize: "4096", blocksize.PropFreeze: "True"})
+	cli := releaseClient(t, releaseRaced, f.rd)
+
+	result, err := (&controllerpkg.BlockSizeReleaseReconciler{Client: cli}).
+		Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: bsRD}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v, want the conflict retried without an error", err)
+	}
+
+	if !result.Requeue { //nolint:staticcheck // the rate-limited retry an error would get
+		t.Fatalf("result %+v, want a requeue", result)
+	}
+}
+
+// TestReleaseReportsAPatchThatFailed: any other failed patch is still a
+// failure.
+func TestReleaseReportsAPatchThatFailed(t *testing.T) {
+	t.Parallel()
+
+	f := newBSFixture(map[string]string{blocksize.PropBlockSize: "4096", blocksize.PropFreeze: "True"})
+	cli := releaseClient(t, func(string) error { return errBlockSizeReleaseBroken }, f.rd)
+
+	_, err := (&controllerpkg.BlockSizeReleaseReconciler{Client: cli}).
+		Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: bsRD}})
+	if !errors.Is(err, errBlockSizeReleaseBroken) {
+		t.Fatalf("Reconcile: %v, want the patch error", err)
+	}
+}
+
+// TestSweepGoesOnPastALostRace: a definition whose release lost a race
+// does not end the sweep with "block size sweep failed" at ERROR, and
+// the definitions after it are still released.
+func TestSweepGoesOnPastALostRace(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	raced := newBSFixture(map[string]string{blocksize.PropBlockSize: "4096", blocksize.PropFreeze: "True"}).rd
+	raced.Name = "pvc-a-raced"
+	later := newBSFixture(map[string]string{blocksize.PropBlockSize: "4096", blocksize.PropFreeze: "True"}).rd
+	later.Name = "pvc-b-later"
+
+	cli := releaseClient(t, func(name string) error {
+		if name == raced.Name {
+			return releaseRaced(name)
+		}
+
+		return nil
+	}, raced, later)
+	rec := &controllerpkg.BlockSizeReleaseReconciler{Client: cli}
+
+	seen, err := rec.Sweep(ctx, nil)
+	if err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+
+	seen, err = rec.Sweep(ctx, seen)
+	if err != nil {
+		t.Fatalf("second sweep: %v, want the lost race retried later", err)
+	}
+
+	if props := volumeProps(t, cli, later.Name); len(props) != 0 {
+		t.Fatalf("a definition after the lost race kept %v", props)
+	}
+
+	if !seen[raced.Name] {
+		t.Fatalf("the raced definition %q is no longer a candidate: %v", raced.Name, seen)
+	}
 }

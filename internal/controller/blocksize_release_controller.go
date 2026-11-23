@@ -26,6 +26,7 @@ import (
 	"time"
 
 	cerrors "github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -138,7 +139,25 @@ func (r *BlockSizeReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	err = r.Patch(ctx, &rd, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	return r.patchRelease(ctx, &rd, base)
+}
+
+// patchRelease writes the released definition. The patch carries an
+// optimistic lock, and another writer updating the definition since the
+// read, which a burst of volume deletions does all the time, fails it
+// with a Conflict. The next pass re-reads the definition and decides
+// again, so that is not a failure: returned, controller-runtime logged
+// it as "Reconciler error" at ERROR on every such burst. Requeue, not
+// RequeueAfter, keeps the per-object backoff an error would get.
+func (r *BlockSizeReleaseReconciler) patchRelease(ctx context.Context, rd, base *blockstoriov1alpha1.ResourceDefinition) (ctrl.Result, error) {
+	err := r.Patch(ctx, rd, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	if apierrors.IsConflict(err) {
+		logf.FromContext(ctx).V(1).Info("block size release raced another writer, retrying",
+			"resourceDefinition", rd.Name, "error", err.Error())
+
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	if err != nil {
 		return ctrl.Result{}, cerrors.Wrapf(err, "release block size of %q", rd.Name)
 	}
