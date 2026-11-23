@@ -401,6 +401,11 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 	// Then the replicas. Dropping the definition alone leaves them with no
 	// parent to stamp a deletion on, so the satellite finalizer never runs
 	// and the DRBD minor, port and peer entries stay live on every node.
+	err = store.MarkDefinitionDeleting(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("delete resource definition %s: %w", name, err)
+	}
+
 	err = store.CascadeDeleteResources(ctx, run.Store, name)
 	if err != nil {
 		return fmt.Errorf("delete replicas of %s: %w", name, err)
