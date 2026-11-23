@@ -445,6 +445,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerStoragePools(mux)
 	s.registerResourceGroups(mux)
 	s.registerResourceDefinitions(mux)
+	s.registerRDTruncate(mux)
 	s.registerVolumeDefinitions(mux)
 	s.registerResources(mux)
 	s.registerKeyValueStore(mux)
