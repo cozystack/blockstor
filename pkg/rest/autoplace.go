@@ -856,12 +856,7 @@ func resolveCloneSourceProviderKind(ctx context.Context, st store.Store, rd *api
 		return ""
 	}
 
-	srcRD, _, ok := strings.Cut(stamp, ":")
-	if !ok || srcRD == "" {
-		return ""
-	}
-
-	return placer.SourceProviderKind(ctx, st, srcRD)
+	return placer.RestoreSourceProviderKind(ctx, st, stamp)
 }
 
 // constrainAutoplaceToSnapshotNodes restricts the filter's
@@ -1476,6 +1471,12 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		return nil, false
 	}
 
+	// The replicas are written one at a time, and LINSTOR writes them in
+	// one transaction: without the hold the tiebreaker reconciler sees
+	// the first two of `r c n1 n2 n3` as an even-diskful tie and puts a
+	// witness on n3 before its own create turns it diskful.
+	defer placer.HoldWitness(r.Context(), s.Store, rdName, countDiskfulEnvelopes(envelopes))()
+
 	created := make([]apiv1.Resource, 0, len(envelopes))
 
 	for i := range envelopes {
@@ -1488,6 +1489,21 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	}
 
 	return created, true
+}
+
+// countDiskfulEnvelopes counts the envelopes of a resource create that
+// ask for a diskful replica: neither spelling of the diskless flag.
+func countDiskfulEnvelopes(envelopes []apiv1.ResourceCreate) int {
+	n := 0
+
+	for i := range envelopes {
+		flags := envelopes[i].Resource.Flags
+		if !slices.Contains(flags, apiv1.ResourceFlagDiskless) && !slices.Contains(flags, rscFlagDrbdDiskless) {
+			n++
+		}
+	}
+
+	return n
 }
 
 // createOneResource runs the full per-envelope wire-boundary
@@ -2850,6 +2866,12 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// this apiserver replica reflects it. See
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
+
+	// Drop a witness the delete left without a tie to break before
+	// replying, as upstream does for the shapes where its helper no
+	// longer wants one, so the caller's next listing shows it as going.
+	// See resource_delete_orphan_witness.go.
+	s.reapUnneededWitnesses(r.Context(), rdName)
 
 	// Bug 67: notify surviving sibling Resources of the peer change
 	// so satellite reconcilers re-derive their peer set without the

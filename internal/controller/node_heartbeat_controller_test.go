@@ -162,6 +162,60 @@ func TestNodeHeartbeat_FreshStaysConnected(t *testing.T) {
 	}
 }
 
+// TestNodeHeartbeatOutlastsAPIEndpointFailover: a satellite whose API
+// connection sat on an API server that died silently gets no stamp
+// through until its client gives up on that connection, which takes
+// client-go up to 45 s (30 s read idle + 15 s ping). The node itself
+// is fine all along, so a heartbeat that old must not make it OFFLINE.
+func TestNodeHeartbeatOutlastsAPIEndpointFailover(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	now := time.Now()
+	last := now.Add(-46 * time.Second)
+
+	node := &blockstoriov1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-4"},
+		Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+		Status: blockstoriov1alpha1.NodeStatus{
+			LastHeartbeatTime: &metav1.Time{Time: last},
+			ConnectionStatus:  blockstoriov1alpha1.NodeConnectionStatusOnline,
+			Conditions: []metav1.Condition{{
+				Type:               blockstoriov1alpha1.NodeConditionReady,
+				Status:             metav1.ConditionTrue,
+				LastTransitionTime: metav1.Time{Time: last},
+			}},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&blockstoriov1alpha1.Node{}).
+		Build()
+
+	rec := &controller.NodeHeartbeatReconciler{Client: cli, Now: func() time.Time { return now }}
+
+	_, err := rec.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "worker-4"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got blockstoriov1alpha1.Node
+	if err := cli.Get(t.Context(), client.ObjectKey{Name: "worker-4"}, &got); err != nil {
+		t.Fatalf("Get post-reconcile: %v", err)
+	}
+
+	if got.Status.ConnectionStatus != blockstoriov1alpha1.NodeConnectionStatusOnline {
+		t.Errorf("a 46 s old heartbeat made the node %q; want %q until an API endpoint failover is over",
+			got.Status.ConnectionStatus, blockstoriov1alpha1.NodeConnectionStatusOnline)
+	}
+}
+
 // TestNodeHeartbeat_NilHeartbeatIsStale: a Node whose satellite has
 // never stamped LastHeartbeatTime is treated as stale immediately —
 // matches kubelet's "no NodeStatus yet" semantics.

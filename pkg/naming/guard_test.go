@@ -1408,7 +1408,6 @@ func excluded(rel string) bool {
 // allowed are reviewed sites the rule reports whose names all come from one
 // source and must stay as they are, and why.
 func allowed() map[string]string {
-	oneListing := "keys and lookups both come from one listing, so they spell each name alike"
 	oneIntent := "option keys the dispatcher writes and the satellite reads back by the intent's own peer " +
 		"names, the one list both sides iterate"
 	shownKeys := "a wire map whose keys are shown, filled from one listing"
@@ -1437,15 +1436,10 @@ func allowed() map[string]string {
 		"pkg/dispatcher/dispatcher.go: drbdOpts[\"peer.\"+peer+\".port\"]":     oneIntent,
 		"pkg/rest/snapshots.go: objRefs[\"CreateTimestamp/\"+node.NodeName]":   shownKeys,
 		"pkg/rest/snapshots.go: objRefs[\"SnapshotUuid/\"+node.NodeName]":      shownKeys,
-		"pkg/satellite/kernel_cleanup.go: expectedSet[n]": "" +
-			"the intent's peer names, against kernel peer slots the satellite named from the same intent",
 		"pkg/store/cascade.go: slices.Contains(spellings, spelling)": "" +
 			"the store's own list of the spellings it asks under, which differ on purpose; deduplicated as written",
 		"internal/cli/definition.go: seen[key]": "" +
 			"dedups the replicas of one definition, one per node, so no key meets another spelling of itself",
-		"internal/cli/handlers.go: seen[name]":                       oneListing,
-		"internal/cli/handlers.go: sizes[name]":                      oneListing,
-		"internal/cli/view/resource.go: in.VolumeSizesKib[res.Name]": oneListing,
 		"pkg/rest/node_connections.go: conn[key]": "" +
 			"the key is one storedPairKeys read off the same map",
 		"pkg/rest/node_connections.go: ctrlConfig.Spec.NodeConnections[pairKeyIn(ctrlConfig.Spec.NodeConnections, src, dst)]": "" +

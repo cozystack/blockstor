@@ -209,6 +209,62 @@
 "prop_value": "fast",
 "props_instance": "/STOR_POOLS/NODE-A/FAST"
 }
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/connect-int",
+"prop_value": "15",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/ping-int",
+"prop_value": "12",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/ping-timeout",
+"prop_value": "10",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/timeout",
+"prop_value": "90",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/verify-alg",
+"prop_value": "crc32c",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "Cluster/LocalID",
+"prop_value": "00000000-1111-2222-3333-444444444444",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/auto-verify-alg",
+"prop_value": "crc32c",
+"props_instance": "/RSC_DFNS/PVC-VOL3"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/sndbuf-size",
+"prop_value": "1048576",
+"props_instance": "/NODES/NODE-B"
+}
 }
 ]
 }
