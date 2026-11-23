@@ -1480,10 +1480,22 @@ func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context,
 		return err
 	}
 
+	hosting := make(map[string]bool, len(live))
+	for i := range live {
+		hosting[naming.Key(live[i].NodeName)] = true
+	}
+
 	for i := range live {
 		if !offline[naming.Key(live[i].NodeName)] {
 			for _, peer := range kernelPeersOf(&live[i]) {
 				excluded[naming.Key(peer)] = true
+
+				// The survivor dropping the old connection is a status
+				// write, which does not wake the RD (SetupWithManager),
+				// so come back for the witness once it is gone.
+				if !hosting[naming.Key(peer)] {
+					askRDRetry(ctx, rdReconcileRequeue)
+				}
 			}
 		}
 
