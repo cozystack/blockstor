@@ -438,3 +438,75 @@ func TestRGRebalanceReconcilerNoAnnotationStillFiresScheduledTick(t *testing.T) 
 		t.Errorf("scheduled tick must refill deficit even without annotation; got %d replicas, want 3", len(got))
 	}
 }
+
+// TestRGRebalanceScheduledTickLeavesAnEmptiedDefinition: a definition
+// whose replicas were all deleted, by a truncate or a CSI DeleteVolume,
+// and that its snapshots keep is a deleted volume. The scheduled tick
+// must not place it again, as LINSTOR's BalanceResourcesTask ignores a
+// definition without an UpToDate replica; linstor-csi from v1.13 relies on
+// it, it truncates and then deletes the volume definitions.
+func TestRGRebalanceScheduledTickLeavesAnEmptiedDefinition(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	st := store.NewInMemory()
+
+	seedIntervalFixture(t, ctx, st, 2, nil)
+
+	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-interval")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Fatalf("the scheduled tick placed %d replicas of an emptied definition", len(got))
+	}
+}
+
+// TestRGRebalanceAnnotationLeavesADeletingDefinition: an `rg modify` that
+// raises the place count places on every definition of the group, as
+// LINSTOR's does, but not on one being deleted. A replica placed there
+// races the deletion: delete_empty_resource_definition finds the
+// definition no longer empty and leaves it behind.
+func TestRGRebalanceAnnotationLeavesADeletingDefinition(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	st := store.NewInMemory()
+
+	seedRebalanceFixture(t, ctx, st, 2, nil)
+
+	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, "pvc-rebalance", func(rd *apiv1.ResourceDefinition) error {
+		rd.Flags = append(rd.Flags, apiv1.ResourceFlagDelete)
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("flag the definition DELETE: %v", err)
+	}
+
+	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-rebalance")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Fatalf("rg modify placed %d replicas of a definition being deleted", len(got))
+	}
+}

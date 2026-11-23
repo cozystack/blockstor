@@ -20,6 +20,7 @@ package rest
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -27,18 +28,15 @@ import (
 	"github.com/cozystack/blockstor/pkg/version"
 )
 
-// TestRestAPIVersion127 pins Bug 222: `rest_api_version` was advertised
-// as 1.23.0 on the controller-version endpoint, but the upstream Java
-// LINSTOR has rolled forward to 1.27.0 several minor releases ago.
-// python-linstor's `_require_version()` gates a chunk of CLI flags
-// (added between 1.24 and 1.27) client-side on this value — until we
-// bump it, the CLI refuses to even send the request, so blockstor
-// looks like it's missing features it actually serves.
+// TestRestAPIVersion pins the advertised `rest_api_version`. Bug 222:
+// it was 1.23.0 while python-linstor's `_require_version()` gates CLI
+// flags client-side on it, so blockstor looked like it was missing
+// features it served. linstor-csi from v1.13 refuses to start below
+// 1.29 in the 1.x series.
 //
 // Pinned at the wire layer: a future refactor of pkg/version must not
-// silently regress the constant below 1.27.0 without updating the
-// upstream-parity table.
-func TestRestAPIVersion127(t *testing.T) {
+// change the constant without updating the compatibility matrix.
+func TestRestAPIVersion(t *testing.T) {
 	base, stop := startServer(t)
 	defer stop()
 
@@ -62,11 +60,22 @@ func TestRestAPIVersion127(t *testing.T) {
 		t.Fatalf("decode: %v\nbody: %s", err, body)
 	}
 
-	const want = "1.27.0"
+	const want = "1.29.0"
 	if got.RestAPIVersion != want {
 		t.Errorf("rest_api_version on the wire: got %q, want %q "+
-			"(Bug 222: python-linstor's _require_version() gates "+
-			"1.24-1.27 CLI flags on this string)", got.RestAPIVersion, want)
+			"(python-linstor's _require_version() gates CLI flags on this string)",
+			got.RestAPIVersion, want)
+	}
+
+	// linstor-csi v1.13's EnsureMinimumApiVersion, verbatim in substance.
+	var major, minor int
+	if _, err := fmt.Sscanf(got.RestAPIVersion, "%d.%d", &major, &minor); err != nil {
+		t.Fatalf("linstor-csi cannot parse %q: %v", got.RestAPIVersion, err)
+	}
+
+	if major != 1 || minor < 29 {
+		t.Errorf("linstor-csi v1.13 refuses REST API %s: it needs 1.29 or newer in the 1.x series",
+			got.RestAPIVersion)
 	}
 
 	// Same expectation against the Go-side constant — the wire is

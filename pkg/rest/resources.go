@@ -58,8 +58,7 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	// match names as the store keys them (naming.Same), which is that for
 	// every name inside RFC 1123, so linstor-csi's "is this resource on this node?"
 	// poll returns a non-empty list when the answer is yes.
-	nodeFilter := multiValueQuery(r, "nodes")
-	rdFilter := multiValueQuery(r, "resources")
+	filter := resourceViewFilterOf(r)
 	faultyOnly := boolQuery(r, "faulty")
 
 	// Per-RD UpToDate tally — drives the `?faulty=true` filter and
@@ -75,11 +74,7 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	vdSizes := vdSizeIndex(r.Context(), s, resList)
 
 	for i := range resList {
-		if !matchAnyName(nodeFilter, resList[i].NodeName) {
-			continue
-		}
-
-		if !matchAnyName(rdFilter, resList[i].Name) {
+		if !filter.admits(&resList[i]) {
 			continue
 		}
 
@@ -92,6 +87,10 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, buildErr.Error())
 
 			return
+		}
+
+		if !volumesInPools(filter.pools, rwv.Volumes) {
+			continue
 		}
 
 		out = append(out, rwv)
@@ -182,6 +181,8 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 		apiv1.ApplyLayerStack(&rwv.Resource, rd.LayerStack)
 		apiv1.ApplyLayerStackToVolumes(rwv.Volumes, rd.LayerStack)
 	}
+
+	stampStorageLayerData(rwv.Volumes, rsc, vdSizes)
 
 	if len(eff) > 0 {
 		// Bug 115: scrub deny-listed sensitive keys before exposing
@@ -317,6 +318,71 @@ func (s *Server) placeholderPool(ctx context.Context, rsc *apiv1.Resource) func(
 	resolver := &viewPoolResolver{s: s, rsc: rsc}
 
 	return func(vn int32) string { return resolver.poolFor(ctx, vn) }
+}
+
+// resourceViewFilter is the name and props filters of the resource view.
+type resourceViewFilter struct {
+	nodes, resources, props, pools []string
+}
+
+func resourceViewFilterOf(r *http.Request) resourceViewFilter {
+	return resourceViewFilter{
+		nodes:     multiValueQuery(r, "nodes"),
+		resources: multiValueQuery(r, "resources"),
+		props:     propsQuery(r),
+		pools:     multiValueQuery(r, "storage_pools"),
+	}
+}
+
+// admits applies the filters a replica can be judged by before its view
+// is built; the storage pools are matched on the built view's volumes.
+func (f *resourceViewFilter) admits(res *apiv1.Resource) bool {
+	return matchAnyName(f.nodes, res.NodeName) && matchAnyName(f.resources, res.Name) && matchProps(f.props, res.Props)
+}
+
+// volumesInPools reports whether a replica has a volume in one of the
+// storage pools the `storage_pools` filter names. Empty filter accepts.
+func volumesInPools(pools []string, vols []apiv1.Volume) bool {
+	if len(pools) == 0 {
+		return true
+	}
+
+	return slices.ContainsFunc(vols, func(v apiv1.Volume) bool {
+		return matchAnyName(pools, v.StoragePool)
+	})
+}
+
+// stampStorageLayerData fills the STORAGE layer of each volume of a replica
+// with a disk with LINSTOR's StorageVolume data. The usable size is the one
+// the satellite reported, or the volume definition's size until it has:
+// linstor-csi adds these up as the capacity a pool has promised, and a
+// replica not reported yet has promised its full size.
+func stampStorageLayerData(vols []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) {
+	if isDisklessReplica(rsc) {
+		return
+	}
+
+	for i := range vols {
+		vol := &vols[i]
+
+		last := len(vol.LayerDataList) - 1
+		if last < 0 || vol.LayerDataList[last].Type != apiv1.LayerKindStorage {
+			continue
+		}
+
+		usable := vol.UsableKib
+		if usable == 0 {
+			usable = vdSizes[vol.VolumeNumber]
+		}
+
+		vol.LayerDataList[last].Data = &apiv1.StorageVolumeLayer{
+			VolumeNumber:     vol.VolumeNumber,
+			DevicePath:       vol.DevicePath,
+			AllocatedSizeKib: vol.AllocatedKib,
+			UsableSizeKib:    usable,
+			DiskState:        vol.State.DiskState,
+		}
+	}
 }
 
 // isDisklessReplica reports whether the replica carries a DISKLESS
@@ -670,15 +736,15 @@ func splitCSV(value string) []string {
 	return out
 }
 
-// matchAnyName reports whether candidate names the same object as any of
-// needles (naming.Same). Empty needles means "no filter — accept".
+// matchAnyName reports whether any of needles matches candidate, see
+// nameMatches. Empty needles means "no filter — accept".
 func matchAnyName(needles []string, candidate string) bool {
 	if len(needles) == 0 {
 		return true
 	}
 
 	for _, n := range needles {
-		if naming.Same(n, candidate) {
+		if nameMatches(n, candidate) {
 			return true
 		}
 	}

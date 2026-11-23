@@ -20,10 +20,14 @@ package dispatcher
 
 import (
 	"encoding/json"
+	"slices"
 	"sort"
 	"strings"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -39,8 +43,8 @@ import (
 const ResourceConnectionPathsPropPrefix = "Cozystack/ResourceConnectionPaths/"
 
 // connectionsFromRD walks rd.Spec.Props for entries under the
-// resource-connection-paths prefix and returns the decoded list of
-// DesiredConnections, sorted by (NodeA, NodeB) so the satellite .res
+// resource-connection-paths and resource-connection-props prefixes and
+// returns the decoded list of DesiredConnections, sorted by (NodeA, NodeB) so the satellite .res
 // render is deterministic regardless of map iteration order.
 //
 // Returns nil when rd has no connection props — the satellite falls
@@ -59,9 +63,7 @@ func connectionsFromRD(rd *blockstoriov1alpha1.ResourceDefinition) []intent.Desi
 		return nil
 	}
 
-	type key struct{ a, b string }
-
-	groups := map[key][]intent.DesiredConnectionPath{}
+	var out []intent.DesiredConnection
 
 	for propKey, propVal := range rd.Spec.Props {
 		nodeA, nodeB, ok := splitConnectionKey(propKey)
@@ -74,16 +76,6 @@ func connectionsFromRD(rd *blockstoriov1alpha1.ResourceDefinition) []intent.Desi
 			continue
 		}
 
-		groups[key{a: nodeA, b: nodeB}] = paths
-	}
-
-	if len(groups) == 0 {
-		return nil
-	}
-
-	out := make([]intent.DesiredConnection, 0, len(groups))
-
-	for pair, paths := range groups {
 		// Stable Name ordering inside a connection so the .res render
 		// is byte-identical across reconciles. The REST POST preserves
 		// declaration order on disk, but Go's map iteration scrambles
@@ -93,10 +85,16 @@ func connectionsFromRD(rd *blockstoriov1alpha1.ResourceDefinition) []intent.Desi
 		})
 
 		out = append(out, intent.DesiredConnection{
-			NodeA: pair.a,
-			NodeB: pair.b,
+			NodeA: nodeA,
+			NodeB: nodeB,
 			Paths: paths,
 		})
+	}
+
+	out = withConnectionOptions(out, rd.Spec.Props)
+
+	if len(out) == 0 {
+		return nil
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -108,6 +106,39 @@ func connectionsFromRD(rd *blockstoriov1alpha1.ResourceDefinition) []intent.Desi
 	})
 
 	return out
+}
+
+// withConnectionOptions joins the DRBD props of each resource connection
+// (apiv1.ResourceConnectionPropsPrefix) onto the connection entry for the
+// same pair, or adds an entry without paths when the pair has none. Only
+// DrbdOptions/* props reach the satellite: the rest of a connection's
+// props are for its readers, not for DRBD.
+func withConnectionOptions(conns []intent.DesiredConnection, props map[string]string) []intent.DesiredConnection {
+	for pair, connProps := range apiv1.ResourceConnectionProps(props) {
+		opts := map[string]string{}
+
+		for key, value := range connProps {
+			if strings.HasPrefix(key, drbd.PropPrefix) {
+				opts[key] = value
+			}
+		}
+
+		if len(opts) == 0 {
+			continue
+		}
+
+		idx := slices.IndexFunc(conns, func(c intent.DesiredConnection) bool {
+			return pair.Has(c.NodeA) && pair.Has(c.NodeB) && !naming.Same(c.NodeA, c.NodeB)
+		})
+		if idx < 0 {
+			conns = append(conns, intent.DesiredConnection{NodeA: pair.NodeA, NodeB: pair.NodeB})
+			idx = len(conns) - 1
+		}
+
+		conns[idx].DrbdOptions = opts
+	}
+
+	return conns
 }
 
 // decodePathList unmarshals the JSON-encoded path list (as written

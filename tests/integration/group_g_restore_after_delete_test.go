@@ -42,6 +42,8 @@ import (
 func takeSnapshotStandingIn(t *testing.T, stack *harness.Stack, rd, snap, pool string) {
 	t.Helper()
 
+	stack.Satellite.StandInForSnapshots(rd)
+
 	status, body := httpPostJSON(t, stack.RestURL+"/v1/resource-definitions/"+rd+"/snapshots",
 		map[string]any{"name": snap})
 	if status/100 != 2 {
@@ -175,7 +177,7 @@ func testGroupGSnapRestoreAfterSourceDeletedNeedsAPool(t *testing.T, stack *harn
 		t.Fatalf("decode the refusal %s: %v", body, err)
 	}
 
-	const failNotFoundStorPool = 550
+	const failNotFoundStorPool = 310
 	if rcs[0].RetCode&failNotFoundStorPool != failNotFoundStorPool {
 		t.Errorf("refusal ret_code %#x lacks FAIL_NOT_FOUND_STOR_POOL", rcs[0].RetCode)
 	}
