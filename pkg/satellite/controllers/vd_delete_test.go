@@ -424,7 +424,7 @@ func TestAFailedVolumeDeleteIsAWarningEvent(t *testing.T) {
 	f.rec.Config.Recorder = recorder
 
 	ok := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: true}}
-	if !f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()) {
+	if applyFailed, _ := f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()); !applyFailed {
 		t.Fatal("afterApply reported success for a delete that failed")
 	}
 
@@ -450,7 +450,7 @@ func TestAfterApplyDeletesNothingWhenTheApplyFailed(t *testing.T) {
 		})
 
 	failed := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: false, Message: "drbdadm adjust failed"}}
-	if !f.rec.afterApply(t.Context(), f.res, f.rd, failed, logr.Discard()) {
+	if applyFailed, _ := f.rec.afterApply(t.Context(), f.res, f.rd, failed, logr.Discard()); !applyFailed {
 		t.Error("afterApply reported success for a failed apply")
 	}
 
@@ -459,7 +459,7 @@ func TestAfterApplyDeletesNothingWhenTheApplyFailed(t *testing.T) {
 	}
 
 	ok := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: true}}
-	if f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()) {
+	if applyFailed, _ := f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()); applyFailed {
 		t.Error("afterApply reported a failure for an apply that went through")
 	}
 
@@ -523,7 +523,7 @@ func TestAfterAFailedApplyTheRemovedMinorsQuorumIsRechecked(t *testing.T) {
 				})
 
 			failed := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: false, Message: "drbdadm adjust failed"}}
-			if !f.rec.afterApply(t.Context(), f.res, f.rd, failed, logr.Discard()) {
+			if applyFailed, _ := f.rec.afterApply(t.Context(), f.res, f.rd, failed, logr.Discard()); !applyFailed {
 				t.Fatal("afterApply reported success for a failed apply")
 			}
 

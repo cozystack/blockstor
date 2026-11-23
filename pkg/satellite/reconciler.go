@@ -299,6 +299,10 @@ type SkipDiskClearer interface {
 type Reconciler struct {
 	cfg ReconcilerConfig
 
+	// ensureDeviceNode creates /dev/drbd<minor> where no udev does;
+	// drbd.EnsureDeviceNode, swapped out by tests.
+	ensureDeviceNode func(minor int) error
+
 	mu             sync.Mutex
 	resourceToPool map[string]string
 
@@ -416,6 +420,13 @@ type Reconciler struct {
 	// only; a restart resets the counter (at worst a few extra requeues).
 	restoreSnapshotMissingTries map[string]int
 
+	// retryAt is, per resource name, when a pass put off work that is
+	// due again with no event to bring it: a dwell window, a throttle,
+	// a best-effort step that failed. The satellite runs no periodic
+	// pass of a converged replica, so the controller asks for it with
+	// TakeRetry once the pass is done. Serialised by mu.
+	retryAt map[string]time.Time
+
 	// failedDRBDApply holds the resources whose last DRBD apply failed,
 	// so tearDownReidentifiedPeers reads the kernel on the next pass even
 	// when the .res already names every peer under its current node-id.
@@ -469,6 +480,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 
 	return &Reconciler{
 		cfg:                         cfg,
+		ensureDeviceNode:            drbd.EnsureDeviceNode,
 		resourceToPool:              map[string]string{},
 		seenStuckAt:                 map[string]time.Time{},
 		adoptionHeldSince:           map[string]time.Time{},
@@ -1077,7 +1089,9 @@ func (r *Reconciler) deleteVolumes(ctx context.Context, req *intent.DeleteResour
 }
 
 // provider looks the pool up under the lock RegisterProvider takes, so
-// a StoragePool reconciled concurrently cannot tear the read.
+// a StoragePool reconciled concurrently cannot tear the read: the
+// Resource workers apply in parallel with it, and an unguarded map read
+// racing that write is a fatal runtime error, not a recoverable one.
 func (r *Reconciler) provider(pool string) (storage.Provider, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1872,7 +1886,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	cloned := false
 
 	for _, vol := range dr.GetVolumes() {
-		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+		provider, ok := r.provider(vol.GetStoragePool())
 		if !ok {
 			return nil, false, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
 		}
@@ -2388,7 +2402,9 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 		// the MaxPeers-1 budget entries but the resource keeps serving
 		// I/O, and the next reconcile retries. del-peer errors still
 		// bubble (above): those leak a live kernel connection.
-		_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), peerID)
+		if r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), peerID) != nil {
+			r.retryLater(dr.GetName(), bestEffortRetry)
+		}
 	}
 
 	return nil
@@ -2792,7 +2808,10 @@ const ResFileCandidateSuffix = ".res.tmp"
 // name drbdadm does not include, checked with the live file excluded,
 // and renamed into place, so a refused body leaves the previous .res,
 // and every other resource, as it was. The refusal is this resource's
-// error to report.
+// error to report. The rename also keeps a drbdadm run for another
+// resource, which the satellite applies at the same time, from reading
+// a half-written body: it sees the old one or the new one, the way
+// LINSTOR moves its .res_tmp over the .res.
 func (r *Reconciler) installResFile(ctx context.Context, resPath, body string) error {
 	candidate := strings.TrimSuffix(resPath, ".res") + ResFileCandidateSuffix
 
@@ -3506,7 +3525,7 @@ func (r *Reconciler) resizeAssumeClean(dr *intent.DesiredResource) bool {
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
 			continue
 		}
@@ -3738,11 +3757,18 @@ func (r *Reconciler) lateAddStallDwellElapsed(name string) bool {
 	first, ok := r.firstLateAddStallAt[name]
 	if !ok {
 		r.firstLateAddStallAt[name] = now
+		r.retryLaterLocked(name, lateAddStallDwell)
 
 		return false
 	}
 
-	return now.Sub(first) >= lateAddStallDwell
+	if left := lateAddStallDwell - now.Sub(first); left > 0 {
+		r.retryLaterLocked(name, left)
+
+		return false
+	}
+
+	return true
 }
 
 // clearLateAddStall drops the recorded stall start for a resource, so a
@@ -3765,6 +3791,9 @@ func (r *Reconciler) recoveryPromoteDue(name string) bool {
 
 	now := time.Now()
 	if last, ok := r.lastRecoveryPromoteAt[name]; ok && now.Sub(last) < recoveryPromoteThrottle {
+		// The recovery is still wanted; it is only too soon for it.
+		r.retryLaterLocked(name, recoveryPromoteThrottle-now.Sub(last))
+
 		return false
 	}
 
@@ -5391,6 +5420,7 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 		// so no functional regression on a transient apiserver hiccup.
 		stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemFormatted(ctx, dr.GetName(), dr.GetNodeName())
 		if stampErr != nil {
+			r.retryLater(dr.GetName(), bestEffortRetry)
 			log.FromContext(ctx).Error(stampErr, "stamp FilesystemFormatted Condition; will retry next reconcile",
 				"resource", dr.GetName(), "node", dr.GetNodeName())
 		}
@@ -5673,7 +5703,7 @@ func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredReso
 	// or the backing zvol/loop/lvm). EnsureDeviceNode is the
 	// satellite-side replacement for the missing udev rule: idempotent,
 	// safe on real-udev nodes (no-op when path is already correct).
-	ensureDeviceNodes(ctx, dr)
+	r.ensureDeviceNodes(ctx, dr)
 
 	return nil
 }
@@ -5681,13 +5711,13 @@ func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredReso
 // ensureDeviceNodes invokes drbd.EnsureDeviceNode for every kernel
 // minor the resource owns, derived from the DrbdOptions["minor"] base
 // + per-volume offset (mirrors buildResVolumes' minor allocation). A
-// per-volume failure is logged and otherwise swallowed: the next
-// reconcile re-attempts, and a transient EPERM / I/O hiccup must not
-// strand the bring-up path. Real /dev/drbd<N> creation is best-effort
-// — if the satellite can't mknod (e.g. the container lacks CAP_MKNOD),
-// the consumer's open will fail loudly rather than silently writing to
-// a tmpfs file.
-func ensureDeviceNodes(ctx context.Context, dr *intent.DesiredResource) {
+// per-volume failure is logged and asks for another pass rather than
+// failing the apply: a transient EPERM / I/O hiccup must not strand
+// the bring-up path, and no periodic pass comes back for it. Real
+// /dev/drbd<N> creation is best-effort — if the satellite can't mknod
+// (e.g. the container lacks CAP_MKNOD), the consumer's open will fail
+// loudly rather than silently writing to a tmpfs file.
+func (r *Reconciler) ensureDeviceNodes(ctx context.Context, dr *intent.DesiredResource) {
 	baseMinor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
 
 	for _, vol := range dr.GetVolumes() {
@@ -5707,8 +5737,10 @@ func ensureDeviceNodes(ctx context.Context, dr *intent.DesiredResource) {
 			continue
 		}
 
-		err := drbd.EnsureDeviceNode(minor)
+		err := r.ensureDeviceNode(minor)
 		if err != nil {
+			r.retryLater(dr.GetName(), bestEffortRetry)
+
 			log.FromContext(ctx).Error(err, "ensure /dev/drbd device node",
 				"resource", dr.GetName(),
 				"volume", vol.GetVolumeNumber(),
@@ -5860,7 +5892,9 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 			// Best-effort: a clearer error doesn't strand the reconciler
 			// (the worst case is the same as not having the clearer at
 			// all — the prop stays pinned and the next pass re-tries).
-			_ = r.cfg.SkipDiskClearer.ClearSkipDisk(ctx, dr.GetName())
+			if r.cfg.SkipDiskClearer.ClearSkipDisk(ctx, dr.GetName()) != nil {
+				r.retryLater(dr.GetName(), bestEffortRetry)
+			}
 		}
 	}
 
@@ -5876,7 +5910,7 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		// via open(2) and the kernel creates a regular file in tmpfs.
 		// EnsureDeviceNode is idempotent on already-correct nodes so
 		// covering the steady-state-adjust path here costs nothing.
-		ensureDeviceNodes(ctx, dr)
+		r.ensureDeviceNodes(ctx, dr)
 
 		return nil
 	}
@@ -5892,7 +5926,7 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 			return errors.Wrapf(upErr, "drbdadm up %s (after adjust 158 fallback)", dr.GetName())
 		}
 
-		ensureDeviceNodes(ctx, dr)
+		r.ensureDeviceNodes(ctx, dr)
 
 		return nil
 	}
@@ -5953,7 +5987,7 @@ func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.
 		return errors.Wrapf(err, "adjust %s (after bitmap-bothdisks recovery)", dr.GetName())
 	}
 
-	ensureDeviceNodes(ctx, dr)
+	r.ensureDeviceNodes(ctx, dr)
 
 	return nil
 }
@@ -6604,7 +6638,7 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 		}, true
 	}
 
-	provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+	provider, ok := r.provider(vol.GetStoragePool())
 	if !ok || provider == nil {
 		return drbd.GISeed{}, false
 	}
@@ -6761,7 +6795,7 @@ func (r *Reconciler) poolForResource(name string) (string, storage.Provider, err
 		return "", nil, errors.Errorf("resource %q not known on this satellite", name)
 	}
 
-	provider, ok := r.cfg.Providers[pool]
+	provider, ok := r.provider(pool)
 	if !ok {
 		return "", nil, errors.Errorf("storage pool %q not registered", pool)
 	}

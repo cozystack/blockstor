@@ -171,7 +171,7 @@ func (r *Reconciler) autoDiskOptionsPerVolume(
 	sawVolume := false
 
 	for _, vol := range dr.GetVolumes() {
-		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+		provider, ok := r.provider(vol.GetStoragePool())
 		if !ok || provider == nil {
 			return nil, false
 		}
