@@ -62,6 +62,7 @@ type luksRun struct {
 	fx      *storage.FakeExec
 	message string
 	ok      bool
+	volumes []*intent.ResourceApplyVolumeResult
 }
 
 func (run *luksRun) apply(t *testing.T) {
@@ -120,6 +121,7 @@ func (run *luksRun) apply(t *testing.T) {
 	}
 
 	run.fx, run.ok, run.message = fx, results[0].GetOk(), results[0].GetMessage()
+	run.volumes = results[0].GetVolumes()
 }
 
 // stdinOf is what the first run of cmd read on stdin, and whether it ran.

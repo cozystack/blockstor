@@ -64,6 +64,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/apihealth"
 	"github.com/cozystack/blockstor/pkg/rest"
 	"github.com/cozystack/blockstor/pkg/store"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
@@ -140,7 +141,12 @@ func newScheme() *runtime.Scheme {
 // independently. Caches still warm up so the REST server's
 // cached-client reads are cheap.
 func buildManager(flags *apiserverFlags) (manager.Manager, *storek8s.Store, error) {
-	mgr, st, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restCfg, err := apihealth.GetConfig()
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "apiserver")
+	}
+
+	mgr, st, err := storek8s.NewManager(restCfg, ctrl.Options{
 		Scheme: newScheme(),
 		Metrics: metricsserver.Options{
 			BindAddress:   flags.metricsAddr,
