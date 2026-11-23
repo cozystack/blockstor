@@ -177,7 +177,8 @@ func testGroupGSnapRestoreAfterSourceDeletedNeedsAPool(t *testing.T, stack *harn
 		t.Fatalf("decode the refusal %s: %v", body, err)
 	}
 
-	const failNotFoundStorPool = 550
+	// LINSTOR's ApiConsts.FAIL_NOT_FOUND_STOR_POOL.
+	const failNotFoundStorPool = 310
 	if rcs[0].RetCode&failNotFoundStorPool != failNotFoundStorPool {
 		t.Errorf("refusal ret_code %#x lacks FAIL_NOT_FOUND_STOR_POOL", rcs[0].RetCode)
 	}
