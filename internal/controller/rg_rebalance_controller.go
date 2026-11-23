@@ -218,13 +218,13 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // path does this so an operator's `linstor rg modify` acts on every
 // child RD immediately.
 //
-// `scheduled` marks the periodic pass, LINSTOR's BalanceResourcesTask,
-// which leaves alone a definition being deleted and one with nothing
-// deployed to balance: a definition whose replicas were all deleted
-// (a truncate, or a CSI DeleteVolume) and that its snapshots keep is a
-// deleted volume, and re-placing it would bring that volume back. An
-// operator's `rg modify` / `rg adjust` places on every definition, as
-// LINSTOR's adjust does.
+// Neither pass places on a definition being deleted. `scheduled` marks
+// the periodic pass, LINSTOR's BalanceResourcesTask, which also leaves
+// alone one with nothing deployed to balance: a definition whose
+// replicas were all deleted (a truncate, or a CSI DeleteVolume) and
+// that its snapshots keep is a deleted volume, and re-placing it would
+// bring that volume back. An operator's `rg modify` / `rg adjust`
+// places on every other definition, as LINSTOR's does.
 func (r *RGRebalanceReconciler) rebalanceChildRDs(
 	ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, scheduled bool,
 ) (int, error) {
@@ -246,6 +246,16 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(
 
 		if shortfallGrace > 0 && r.shortfallWithinGrace(&rds[i], now, shortfallGrace) {
 			log.V(1).Info("scheduled rebalance skipped (shortfall grace active)",
+				"rg", rg.Name, "rd", rds[i].Name)
+
+			continue
+		}
+
+		// Neither pass places on a definition being deleted: a replica
+		// placed there races the deletion, and
+		// delete_empty_resource_definition then finds it not empty.
+		if slices.Contains(rds[i].Flags, apiv1.ResourceFlagDelete) {
+			log.V(1).Info("rebalance skipped (definition being deleted)",
 				"rg", rg.Name, "rd", rds[i].Name)
 
 			continue
@@ -276,14 +286,10 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(
 }
 
 // hasSomethingToBalance reports whether the scheduled pass may place
-// replicas for rd: it is not being deleted and holds at least one replica
-// with a disk that is not being deleted. A definition that cannot be read
-// is left to the placer, which reports it.
+// replicas for rd: it holds at least one replica with a disk that is not
+// being deleted. A definition that cannot be read is left to the placer,
+// which reports it.
 func (r *RGRebalanceReconciler) hasSomethingToBalance(ctx context.Context, rd *apiv1.ResourceDefinition) bool {
-	if slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
-		return false
-	}
-
 	replicas, err := r.Store.Resources().ListByDefinition(ctx, rd.Name)
 	if err != nil {
 		return true
