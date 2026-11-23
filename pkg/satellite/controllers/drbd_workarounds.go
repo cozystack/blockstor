@@ -173,9 +173,10 @@ type DRBDWorkaroundsRunnable struct {
 	// Secondary failing I/O.
 	failingIO map[string]int
 
-	// owedUp holds the resources checkForcedIOFailures took down and
-	// failed to bring up again; every pass retries them (bringUpOwed).
-	owedUp map[string]bool
+	// owedAdjust holds the resources a check left short of their
+	// configuration, each with what the adjust owed to it does; every
+	// pass retries them (adjustOwed).
+	owedAdjust map[string]string
 }
 
 // newDRBDWorkaroundsRunnable builds the runnable the manager runs, gated
@@ -240,7 +241,7 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 		w.detachStaleLoopDevices(ctx, logger)
 	}
 
-	w.bringUpOwed(ctx, logger)
+	w.adjustOwed(ctx, logger)
 
 	wanted := w.kernelStatusWanted()
 	logger.V(1).Info("DRBD workarounds pass", "kernelStatusRead", wanted)
@@ -559,28 +560,35 @@ func (w *DRBDWorkaroundsRunnable) checkForcedIOFailures(
 			"drbdadm up after the down failed, the replica is down: retrying with drbdadm adjust "+
 				"every pass: %v", err))
 
-		if w.owedUp == nil {
-			w.owedUp = map[string]bool{}
-		}
-
-		w.owedUp[res.Name] = true
+		w.oweAdjust(res.Name, "bring up a Secondary whose up failed")
 	}
 }
 
-// bringUpOwed brings up again every resource a forced-I/O restart took
-// down and failed to bring up. `drbdadm adjust` rather than `up`: it
-// also completes an up that stopped half way. A resource an apply is
-// changing is left to that apply and tried on the next pass; one
-// blockstor no longer has a replica of, or is deleting, is dropped.
-func (w *DRBDWorkaroundsRunnable) bringUpOwed(ctx context.Context, logger logr.Logger) {
-	for name := range w.owedUp {
+// oweAdjust records that name needs a `drbdadm adjust` to do what, which
+// adjustOwed runs from the next pass on.
+func (w *DRBDWorkaroundsRunnable) oweAdjust(name, what string) {
+	if w.owedAdjust == nil {
+		w.owedAdjust = map[string]string{}
+	}
+
+	w.owedAdjust[name] = what
+}
+
+// adjustOwed runs `drbdadm adjust` of every resource a check left short of
+// its configuration, such as one a forced-I/O restart took down and
+// failed to bring up (adjust rather than up also completes an up that
+// stopped half way). A resource an apply is changing is left to that
+// apply and tried on the next pass; one blockstor no longer has a
+// replica of, or is deleting, is dropped.
+func (w *DRBDWorkaroundsRunnable) adjustOwed(ctx context.Context, logger logr.Logger) {
+	for name, what := range w.owedAdjust {
 		release, ok := w.hold(name)
 		if !ok {
 			continue
 		}
 
 		if w.replica(ctx, logger, name) == nil {
-			delete(w.owedUp, name)
+			delete(w.owedAdjust, name)
 			release()
 
 			continue
@@ -591,13 +599,13 @@ func (w *DRBDWorkaroundsRunnable) bringUpOwed(ctx context.Context, logger logr.L
 		release()
 
 		if err != nil {
-			w.failed(logger, err, name, "bring up a Secondary whose up failed")
+			w.failed(logger, err, name, what)
 
 			continue
 		}
 
-		delete(w.owedUp, name)
-		logger.Info("DRBD workaround: brought up the Secondary whose up had failed", "resource", name)
+		delete(w.owedAdjust, name)
+		logger.Info("DRBD workaround: adjusted to "+what, "resource", name)
 	}
 }
 
