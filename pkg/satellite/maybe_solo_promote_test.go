@@ -172,6 +172,71 @@ func TestMaybeSoloPromote_ThrottlesRepeatFire(t *testing.T) {
 	}
 }
 
+// TestMaybeSoloPromote_FormatsOnlyABornEmptyReplica: the solo-promote
+// runs the same promote, mkfs, demote sequence as the first activation.
+// On a Filesystem RD whose replica blockstor did not create empty (an
+// adopted LINSTOR volume is stamped SkipInitialSync=false; nil is not
+// stamped yet) the `.mkfs.done` marker is always missing, so only the
+// post-promote probe stood between mkfs and the adopted data. Such a
+// replica is still promoted and demoted, but never formatted, even when
+// that probe reads the device as empty.
+func TestMaybeSoloPromote_FormatsOnlyABornEmptyReplica(t *testing.T) {
+	yes, no := true, false
+
+	cases := map[string]struct {
+		skip *bool
+		mkfs bool
+	}{
+		"born empty":      {skip: &yes, mkfs: true},
+		"adopted":         {skip: &no},
+		"not yet stamped": {skip: nil},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			fx := storage.NewFakeExec()
+			fx.Expect(soloStatusKey, storage.FakeResponse{Stdout: []byte(soloStatusInconsistent)})
+			fx.Expect("blkid -p -o export /dev/drbd1000", storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
+
+			dir := t.TempDir()
+			// The solo-promote fires only for a replica born alone.
+			err := os.WriteFile(filepath.Join(dir, "pvc-solo"+bornSoloSuffix), nil, 0o600)
+			if err != nil {
+				t.Fatalf("seed born-solo record: %v", err)
+			}
+
+			rec := NewReconciler(ReconcilerConfig{
+				Adm:      drbd.NewAdm(fx),
+				Exec:     fx,
+				StateDir: dir,
+				NodeName: "n1",
+			})
+
+			dr := soloDR()
+			dr.Props = map[string]string{"FileSystem/Type": "ext4"}
+			dr.SkipInitialSync = tc.skip
+
+			if err := rec.maybeSoloPromote(context.Background(), dr, false); err != nil {
+				t.Fatalf("maybeSoloPromote: %v", err)
+			}
+
+			cmds := fx.CommandLines()
+			if !slices.Contains(cmds, "drbdadm primary --force pvc-solo") || !slices.Contains(cmds, "drbdadm secondary pvc-solo") {
+				t.Errorf("the solo-promote itself must still run: %v", cmds)
+			}
+
+			if got := slices.Contains(cmds, "mkfs.ext4 /dev/drbd1000"); got != tc.mkfs {
+				t.Errorf("mkfs.ext4 ran = %v, want %v: %v", got, tc.mkfs, cmds)
+			}
+
+			_, statErr := os.Stat(filepath.Join(dir, "pvc-solo.mkfs.done"))
+			if (statErr == nil) != tc.mkfs {
+				t.Errorf(".mkfs.done written = %v, want %v", statErr == nil, tc.mkfs)
+			}
+		})
+	}
+}
+
 // Regression pins for the delete-mid-sync promote: a replica that was
 // syncing from peers which then went is Inconsistent because the data is
 // elsewhere, and LINSTOR never forces primary on it. Each case below has
