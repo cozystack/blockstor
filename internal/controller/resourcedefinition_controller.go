@@ -681,12 +681,28 @@ func isKeepTiebreakerActive(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // The cascade-side multi-pass list-then-delete (Bug 130 fix in
 // pkg/rest/resource_definitions.go) is the second half of the
 // invariant: it reaps any witness that slipped past this guard.
+//
+// A DELETE flag on the RD's spec counts the same way. Upstream's
+// definition delete marks the definition and never runs the
+// auto-tiebreaker helper on it again, so a definition carrying the
+// flag gets no new witness either. The guard stops all witness
+// management for it, removal and the quorum recount included, as
+// upstream does; a flag nothing ever clears therefore leaves the
+// definition's witness as it stands. linstor-migrate does not adopt a
+// definition flagged DELETE in the source cluster, so the flag reaches
+// a definition only through an explicit write.
 func (r *ResourceDefinitionReconciler) rdIsDeleting(_ context.Context, rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	if rd == nil {
 		return true
 	}
 
-	return !rd.DeletionTimestamp.IsZero()
+	return rdMarkedForDeletion(rd)
+}
+
+// rdMarkedForDeletion reports a DeletionTimestamp or a DELETE flag on
+// the definition.
+func rdMarkedForDeletion(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	return !rd.DeletionTimestamp.IsZero() || slices.Contains(rd.Spec.Flags, apiv1.ResourceFlagDelete)
 }
 
 // directOrCached returns the APIReader-direct reader when available
@@ -966,7 +982,7 @@ func (r *ResourceDefinitionReconciler) rollbackWitnessIfRDGone(ctx context.Conte
 	var fresh blockstoriov1alpha1.ResourceDefinition
 
 	err := r.APIReader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &fresh)
-	if err == nil && fresh.DeletionTimestamp.IsZero() {
+	if err == nil && !rdMarkedForDeletion(&fresh) {
 		// RD is still live and not mid-delete; witness is valid.
 		return
 	}
@@ -1335,29 +1351,16 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 		excluded[naming.Key(name)] = hosting
 	}
 
-	if rdName != "" {
-		// Defense-in-depth: re-probe the store for diskful Resources
-		// of this RD and exclude them. Caller's hostingReplica may be
-		// stale, but the store snapshot read inline here is the
-		// freshest signal the controller-side can get without a full
-		// reconcile fan-out.
-		live, err := r.Store.Resources().ListByDefinition(ctx, rdName)
-		if err != nil {
-			return "", err
-		}
-
-		for i := range live {
-			if slices.Contains(live[i].Flags, apiv1.ResourceFlagDiskless) {
-				continue
-			}
-
-			excluded[naming.Key(live[i].NodeName)] = true
-		}
-	}
-
 	nodes, err := r.Store.Nodes().List(ctx)
 	if err != nil {
 		return "", err
+	}
+
+	if rdName != "" {
+		err := r.excludeOccupiedNodes(ctx, rdName, excluded, offlineNodes(nodes))
+		if err != nil {
+			return "", err
+		}
 	}
 
 	candidates := make([]string, 0, len(nodes))
@@ -1392,6 +1395,79 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 	slices.Sort(candidates)
 
 	return candidates[0], nil
+}
+
+// excludeOccupiedNodes marks the nodes a tiebreaker of rdName must not
+// go to, from a fresh store read: every node hosting a diskful replica
+// (Bug 261 defense-in-depth against a stale caller snapshot, the
+// freshest signal the controller has without a full reconcile fan-out)
+// and every node a replica's kernel still holds a connection to.
+//
+// The connections of a replica whose node is offline do not count: they
+// are the last report of a satellite that is not there to drop them, and
+// upstream's resource delete does not wait for an offline satellite
+// either (the update to it ends in a not-connected warning and the
+// delete goes on). Counting them would keep the witness off the node for
+// as long as the satellite stays away. When it comes back it learns the
+// node's new node-id and drops the old connection itself.
+func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context, rdName string, excluded, offline map[string]bool) error {
+	live, err := r.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return err
+	}
+
+	for i := range live {
+		if !offline[naming.Key(live[i].NodeName)] {
+			for _, peer := range kernelPeersOf(&live[i]) {
+				excluded[naming.Key(peer)] = true
+			}
+		}
+
+		if slices.Contains(live[i].Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		excluded[naming.Key(live[i].NodeName)] = true
+	}
+
+	return nil
+}
+
+// offlineNodes returns the nodes whose satellite the controller has
+// marked OFFLINE, by naming key.
+func offlineNodes(nodes []apiv1.Node) map[string]bool {
+	offline := make(map[string]bool)
+
+	for i := range nodes {
+		if nodes[i].ConnectionStatus == apiv1.NodeTypeOffline {
+			offline[naming.Key(nodes[i].Name)] = true
+		}
+	}
+
+	return offline
+}
+
+// kernelPeersOf returns the nodes a replica's kernel still holds a
+// connection to. A node in that list that hosts no replica is one whose
+// replica was just removed and that some survivor has not yet run
+// del-peer for. Upstream keeps such a replica in the definition,
+// flagged DELETE, until every satellite has dropped it, so its
+// autoplacer never offers the node to a new tiebreaker in that window.
+// Placing one there anyway hands the node a new node-id while the
+// survivor's kernel still knows it under the old one, and the
+// survivor's new-peer then fails with "name already exists" until the
+// old connection goes.
+func kernelPeersOf(replica *apiv1.Resource) []string {
+	if replica.LayerObject == nil || replica.LayerObject.Drbd == nil {
+		return nil
+	}
+
+	peers := make([]string, 0, len(replica.LayerObject.Drbd.Connections))
+	for peer := range replica.LayerObject.Drbd.Connections {
+		peers = append(peers, peer)
+	}
+
+	return peers
 }
 
 // isDisabledNode mirrors placer.disabledNodes for the RD-level
