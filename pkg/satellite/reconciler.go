@@ -1808,30 +1808,12 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 			return nil, false, false, errors.Wrapf(err, "volume status %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
 
-		// Grow path: the controller's VolumeDefinition update set a
-		// new size that's larger than what the provider has on disk.
-		// Call ResizeVolume to extend the LV/zvol/file; the LUKS
-		// layer (when present) and `drbdadm resize` are layered on
-		// top by their own reconcile steps.
-		//
-		// The trigger compares the definition, not the lower disk, with
-		// what is on disk: a lower disk created before it was sized for
-		// metadata is the definition's size, and growing every one of
-		// them on upgrade would resize every volume at once. The grow
-		// itself goes to the full lower disk.
-		if vol.GetSizeKib() > status.UsableKib && status.UsableKib > 0 {
-			err = provider.ResizeVolume(ctx, storage.Volume{
-				ResourceName: dr.GetName(),
-				VolumeNumber: vol.GetVolumeNumber(),
-				SizeKib:      lowerDisk,
-			})
-			if err != nil {
-				return nil, false, false, errors.Wrapf(err, "resize volume %s/%d to %d KiB",
-					dr.GetName(), vol.GetVolumeNumber(), lowerDisk)
-			}
-
-			resized = true
+		grew, err := growLowerDisk(ctx, provider, dr, vol, status.UsableKib, lowerDisk)
+		if err != nil {
+			return nil, false, false, err
 		}
+
+		resized = resized || grew
 
 		devices[vol.GetVolumeNumber()] = status.DevicePath
 
@@ -1859,6 +1841,53 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	}
 
 	return devices, resized, cloned, nil
+}
+
+// growLowerDisk grows a volume whose definition outgrew it and reports
+// whether the device above it has to be resized. onDiskKib is the size
+// of the lower disk on this node, 0 when the provider reports none.
+//
+// A definition larger than the lower disk grows it, to the full size
+// lowerDiskKib asks for. The LUKS layer and `drbdadm resize` follow in
+// their own reconcile steps.
+//
+// A lower disk sized for metadata is larger than its definition, so a
+// small grow can stay below it while passing the device every replica
+// reports. That grow still needs the device resized, and the lower disk
+// grown first if it cannot hold the new data area. The case is told
+// apart by the lower disk being larger than the definition: one created
+// before lower disks were sized for metadata is exactly the definition's
+// size, its device is smaller than the definition, and treating that as
+// a grow would resize every such volume on upgrade. A lower disk grown
+// to exactly the new definition is indistinguishable from it and is left
+// alone.
+func growLowerDisk(ctx context.Context, provider storage.Provider, dr *intent.DesiredResource, vol *intent.DesiredVolume, onDiskKib, lowerDisk int64) (bool, error) {
+	want := vol.GetSizeKib()
+	device := vol.GetDeviceSizeKib()
+
+	switch {
+	case onDiskKib <= 0:
+		return false, nil
+	case want > onDiskKib:
+	case device > 0 && want > device && onDiskKib > want:
+		if lowerDisk <= onDiskKib {
+			return true, nil
+		}
+	default:
+		return false, nil
+	}
+
+	err := provider.ResizeVolume(ctx, storage.Volume{
+		ResourceName: dr.GetName(),
+		VolumeNumber: vol.GetVolumeNumber(),
+		SizeKib:      lowerDisk,
+	})
+	if err != nil {
+		return false, errors.Wrapf(err, "resize volume %s/%d to %d KiB",
+			dr.GetName(), vol.GetVolumeNumber(), lowerDisk)
+	}
+
+	return true, nil
 }
 
 // lowerDiskKib is the size, in KiB, of the lower disk a volume is
