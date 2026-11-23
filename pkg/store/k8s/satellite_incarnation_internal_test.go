@@ -48,3 +48,33 @@ func TestCrdToWireCarriesSatelliteIncarnation(t *testing.T) {
 		t.Errorf("replica incarnation = %q, want inc-1", rsc.SatelliteIncarnation)
 	}
 }
+
+// The reads answer a replica whose kernel resource the satellite saw
+// destroyed with no state, so the KernelLoaded Condition must reach
+// them; a replica the Condition was never written on says nothing.
+func TestCrdToWireCarriesDestroyedKernelSlot(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		conditions []metav1.Condition
+		want       bool
+	}{
+		{"destroyed", []metav1.Condition{{Type: crdv1alpha1.ConditionKernelLoaded, Status: metav1.ConditionFalse}}, true},
+		{"loaded", []metav1.Condition{{Type: crdv1alpha1.ConditionKernelLoaded, Status: metav1.ConditionTrue}}, false},
+		{"never written", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			rsc := crdToWireResource(&crdv1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-x.worker-1"},
+				Spec:       crdv1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-x", NodeName: "worker-1"},
+				Status:     crdv1alpha1.ResourceStatus{Conditions: tc.conditions},
+			})
+			if rsc.KernelSlotDestroyed != tc.want {
+				t.Errorf("KernelSlotDestroyed = %v, want %v", rsc.KernelSlotDestroyed, tc.want)
+			}
+		})
+	}
+}

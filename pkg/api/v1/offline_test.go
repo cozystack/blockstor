@@ -117,3 +117,48 @@ func TestForgetStaleSatelliteStateByIncarnation(t *testing.T) {
 		})
 	}
 }
+
+// A replica whose DRBD resource its satellite saw destroyed, on a node
+// that stays ONLINE, is answered with no state: the LINSTOR satellite
+// closes the resource's state stream on the destroy event, so the
+// controller answers it Unknown, as it does an offline node's replica.
+// What the satellite here stored for it, a cleared status that still
+// reads Secondary, read as a healthy unused replica. The node list is
+// not needed to tell.
+func TestForgetStaleSatelliteStateOfDestroyedKernelResource(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		destroyed bool
+		nodes     []apiv1.Node
+		want      bool
+	}{
+		{"kernel resource destroyed", true, []apiv1.Node{{Name: "n2", ConnectionStatus: apiv1.NodeTypeOnline}}, true},
+		{"kernel resource destroyed, nodes unread", true, nil, true},
+		{"kernel resource loaded", false, []apiv1.Node{{Name: "n2", ConnectionStatus: apiv1.NodeTypeOnline}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			unused := false
+			answered := []apiv1.Resource{{
+				Name: "pvc-x", NodeName: "n2", KernelSlotDestroyed: tc.destroyed,
+				State:   apiv1.ResourceState{InUse: &unused},
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: "Diskless"}}},
+				LayerObject: &apiv1.ResourceLayer{Type: apiv1.LayerKindDRBD, Drbd: &apiv1.DrbdResourceLayer{
+					Connections: map[string]apiv1.DrbdConnection{"n1": {Message: "StandAlone"}},
+				}},
+			}}
+
+			apiv1.ForgetStaleSatelliteState(answered, tc.nodes)
+
+			got := answered[0]
+			forgotten := got.State.InUse == nil && got.Volumes[0].State.DiskState == "" &&
+				got.LayerObject.Drbd.Connections == nil
+			if forgotten != tc.want {
+				t.Errorf("forgotten = %v, want %v: %+v", forgotten, tc.want, got)
+			}
+		})
+	}
+}

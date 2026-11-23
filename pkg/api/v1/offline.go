@@ -102,12 +102,21 @@ func ForgetSatelliteState(r *Resource) {
 // their state. The kernel still holds them then, so the new satellite
 // writes them all right after the initial events2 state, and that
 // lasts seconds.
+//
+// So does a replica whose DRBD resource the satellite saw destroyed
+// while the node stays up (`drbdsetup down`, a failed bring-up): the
+// LINSTOR satellite closes that resource's state stream on the destroy
+// event (DrbdEventPublisher.resourceDestroyed) and the controller then
+// answers it with no state. The satellite here stores the departure as
+// a cleared status that still reads Secondary, since the stored role
+// cannot be unset, so a diskful replica that held no data and no peer
+// link read Unused, and `?faulty=true` passed over it.
 func ForgetStaleSatelliteState(resources []Resource, nodes []Node) {
 	live := liveSatellites(nodes)
 
 	for i := range resources {
 		sat, ok := live[naming.Key(resources[i].NodeName)]
-		if ok && !sat.reported(&resources[i]) {
+		if resources[i].KernelSlotDestroyed || (ok && !sat.reported(&resources[i])) {
 			ForgetSatelliteState(&resources[i])
 		}
 	}

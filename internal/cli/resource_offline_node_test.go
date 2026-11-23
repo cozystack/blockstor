@@ -112,3 +112,48 @@ func TestResourceListOfflineNodeKeepsStoredState(t *testing.T) {
 		t.Errorf("listing rewrote the stored report: %+v", stored.Volumes)
 	}
 }
+
+// seedDestroyedKernelResource is a two-replica definition on two ONLINE
+// nodes whose second replica's DRBD kernel resource is gone: the
+// satellite left a cleared status that still reads Secondary, and said
+// the kernel resource was destroyed.
+func seedDestroyedKernelResource(ctx context.Context, backend store.Store) {
+	seedOfflinePeer(ctx, backend)
+
+	node, _ := backend.Nodes().Get(ctx, "node-2")
+	node.ConnectionStatus = apiv1.NodeTypeOnline
+	_ = backend.Nodes().Update(ctx, &node)
+
+	down, _ := backend.Resources().Get(ctx, "pvc-x", "node-2")
+	unused := false
+	down.State = apiv1.ResourceState{InUse: &unused}
+	down.Volumes = nil
+	down.LayerObject.Drbd.Connections = nil
+	down.KernelSlotDestroyed = true
+	_ = backend.Resources().Update(ctx, &down)
+}
+
+// A replica whose kernel resource is gone reads Unknown with blank
+// Usage and Conns, as linstor-client shows it against LINSTOR, which
+// answers it with no state. It read Unused, a healthy-looking
+// Secondary that holds no data and no peer link.
+func TestResourceListDestroyedKernelResourceReadsUnknown(t *testing.T) {
+	t.Parallel()
+
+	app, out, errBuf := newApp(t, seedDestroyedKernelResource)
+
+	if got := app.Run(t.Context(), []string{"r", "l"}); got != 0 {
+		t.Fatalf("exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	down := rowFor(t, out.String(), "node-2")
+	if !strings.Contains(down, "Unknown") {
+		t.Errorf("replica with no kernel resource does not read Unknown: %q", down)
+	}
+
+	for _, stale := range []string{"Unused", "Ok", "Diskless"} {
+		if strings.Contains(down, stale) {
+			t.Errorf("replica with no kernel resource reads %q: %q", stale, down)
+		}
+	}
+}

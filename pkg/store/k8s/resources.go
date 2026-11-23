@@ -25,6 +25,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -695,6 +696,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		},
 		ToggleDiskCancel:     crd.Spec.ToggleDiskCancel,
 		SatelliteIncarnation: crd.Status.SatelliteIncarnation,
+		KernelSlotDestroyed:  meta.IsStatusConditionFalse(crd.Status.Conditions, crdv1alpha1.ConditionKernelLoaded),
 		Volumes: volumesWithReplicationStates(
 			volumesFromStatus(crd.Status.Volumes),
 			crd.Status.Connections,

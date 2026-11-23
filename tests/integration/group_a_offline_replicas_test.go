@@ -28,6 +28,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -199,6 +200,95 @@ func TestGroupARestartedSatelliteReplicasReadUnknown(t *testing.T) {
 	if strings.Contains(table, harness.NodeWorker1) {
 		t.Errorf("`r l --faulty` still lists the replica the restarted satellite has reported:\n%s", table)
 	}
+}
+
+// TestGroupADestroyedKernelResourceReadsUnknown: while a replica's DRBD
+// resource is gone from the kernel of a node that stays ONLINE
+// (`drbdsetup down`, a bring-up that keeps failing), the LINSTOR
+// satellite has closed that resource's state stream, so the controller
+// answers it with no state and linstor-client shows a yellow Unknown
+// with a blank Usage that `r l --faulty` lists. blockstor answered the
+// cleared status the satellite leaves, which still reads Secondary:
+// the row read Unused, a healthy-looking replica that holds no data
+// and no peer link.
+func TestGroupADestroyedKernelResourceReadsUnknown(t *testing.T) {
+	stack := harness.StartStack(t)
+	harness.SeedThreeNodeCluster(t, stack)
+
+	ctx := context.Background()
+
+	const rdName = "rd-kernel-down"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec:       blockstoriov1alpha1.ResourceDefinitionSpec{ResourceGroupName: harness.FixtureDefaultRG},
+	}
+
+	err := stack.Env.Client.Create(ctx, rd)
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	cli := &harness.CLI{URL: stack.RestURL}
+	cli.Run(t, "volume-definition", "create", rdName, "10M")
+
+	peers := map[string]string{harness.NodeWorker1: harness.NodeWorker2, harness.NodeWorker2: harness.NodeWorker1}
+	for node := range peers {
+		res := &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: rdName + "." + node},
+			Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: rdName, NodeName: node},
+		}
+
+		err = stack.Env.Client.Create(ctx, res)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("seed Resource on %s: %v", node, err)
+		}
+	}
+
+	for node, peer := range peers {
+		reportHealthySecondary(t, stack, rdName+"."+node, peer)
+	}
+
+	reportKernelResourceDestroyed(t, stack, rdName+"."+harness.NodeWorker1)
+
+	table := faultyTable(t, stack, rdName)
+
+	row := faultyRow(table, harness.NodeWorker1)
+	if !strings.Contains(row, "Unknown") || strings.Contains(row, "Unused") {
+		t.Errorf("`r l --faulty` does not list the replica with no kernel resource as Unknown with no usage:\n%s", table)
+	}
+
+	if strings.Contains(table, harness.NodeWorker2) {
+		t.Errorf("`r l --faulty` lists the healthy replica on the other node:\n%s", table)
+	}
+}
+
+// reportKernelResourceDestroyed writes what the satellite's observer
+// leaves on a replica whose kernel resource it saw destroyed: no
+// observed volume or peer link, the role it cannot unset, and
+// KernelLoaded=False.
+func reportKernelResourceDestroyed(t *testing.T, stack *harness.Stack, name string) {
+	t.Helper()
+
+	harness.Eventually(t, 10*time.Second, func() bool {
+		var res blockstoriov1alpha1.Resource
+
+		err := stack.Env.Client.Get(context.Background(), types.NamespacedName{Name: name}, &res)
+		if err != nil {
+			return false
+		}
+
+		res.Status.InUse = false
+		res.Status.Volumes = nil
+		res.Status.Connections = nil
+		meta.SetStatusCondition(&res.Status.Conditions, metav1.Condition{
+			Type:   blockstoriov1alpha1.ConditionKernelLoaded,
+			Status: metav1.ConditionFalse,
+			Reason: "KernelSlotDestroyed",
+		})
+
+		return stack.Env.Client.Status().Update(context.Background(), &res) == nil
+	}, "report the kernel resource of "+name+" destroyed")
 }
 
 func faultyRow(table, node string) string {

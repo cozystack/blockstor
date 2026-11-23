@@ -244,3 +244,67 @@ func TestOfflineNodeReplicaIsFaulty(t *testing.T) {
 		t.Errorf("?faulty=true does not list the OFFLINE node's replica: %v", faulty)
 	}
 }
+
+// seedDestroyedKernelResource stores a two-replica definition on two
+// ONLINE nodes whose second replica lost its DRBD kernel resource
+// (`drbdsetup down`, or a bring-up that keeps failing): the satellite
+// left a cleared status that still reads Secondary, and the
+// KernelLoaded Condition False.
+func seedDestroyedKernelResource(t *testing.T) store.Store {
+	t.Helper()
+
+	backend := seedOfflinePeer(t)
+	ctx := t.Context()
+
+	node, err := backend.Nodes().Get(ctx, "n2")
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	node.ConnectionStatus = apiv1.NodeTypeOnline
+
+	if err := backend.Nodes().Update(ctx, &node); err != nil {
+		t.Fatalf("bring node up: %v", err)
+	}
+
+	down, err := backend.Resources().Get(ctx, "pvc-x", "n2")
+	if err != nil {
+		t.Fatalf("get replica: %v", err)
+	}
+
+	unused := false
+	down.State = apiv1.ResourceState{InUse: &unused}
+	down.Volumes = nil
+	down.LayerObject.Drbd.Connections = nil
+	down.LayerObject.Drbd.DrbdVolumes = nil
+	down.KernelSlotDestroyed = true
+
+	if err := backend.Resources().Update(ctx, &down); err != nil {
+		t.Fatalf("store the departed replica: %v", err)
+	}
+
+	return backend
+}
+
+// LINSTOR answers a replica whose kernel resource is gone with no
+// state, linstor-client's Unknown; the view answered in_use false,
+// which reads as a healthy unused replica, and `?faulty=true` passed
+// over it because it carried no disk state, though it holds no data
+// and no peer link.
+func TestDestroyedKernelResourceReadsUnknownAndFaulty(t *testing.T) {
+	base, stop := startServerWithStore(t, seedDestroyedKernelResource(t))
+	defer stop()
+
+	got := decodeReplicas(t, base+"/v1/view/resources")
+
+	down := got["n2"]
+	assertNoSatelliteState(t, "replica with no kernel resource", &down)
+
+	up := got["n1"]
+	assertSatelliteState(t, "replica on the other node", &up)
+
+	faulty := decodeReplicas(t, base+"/v1/view/resources?faulty=true")
+	if _, listed := faulty["n2"]; !listed {
+		t.Errorf("?faulty=true does not list the replica with no kernel resource: %v", faulty)
+	}
+}
