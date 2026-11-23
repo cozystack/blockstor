@@ -20,6 +20,7 @@ package controller_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
@@ -116,5 +118,46 @@ func TestSnapshotNeverSuspendedHasNoIOSuspendedCondition(t *testing.T) {
 
 	if cond := ioSuspendedCond(getSnap(t, cli, "pvc-1.snap-1")); cond != nil {
 		t.Errorf("IOSuspended on a snapshot no node suspended: %+v", cond)
+	}
+}
+
+var errStatusRefused = errors.New("status subresource refused the write")
+
+// The IOSuspended stamp runs first in a pass, and a status subresource
+// that refuses writes must not keep a take past its deadline frozen:
+// the abort's resume is a spec write and still goes out, and the stamp
+// error is reported once it has.
+func TestSnapshotAbortResumesWhenTheIOSuspendedStampFails(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotControllerScheme(t)
+
+	snap := suspendedSnapshot("pvc-1.snap-1", "pvc-1", "snap-1",
+		3*time.Minute, []string{"n1"}, false,
+		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
+			{NodeName: "n1", SuspendIOAcked: true},
+		})
+
+	cli := interceptor.NewClient(
+		fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).WithObjects(snap).Build(),
+		interceptor.Funcs{
+			SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+				return errStatusRefused
+			},
+			SubResourcePatch: func(context.Context, client.Client, string, client.Object, client.Patch, ...client.SubResourcePatchOption) error {
+				return errStatusRefused
+			},
+		},
+	)
+	r := &controller.SnapshotReconciler{Client: cli, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(snap)})
+	if !errors.Is(err, errStatusRefused) {
+		t.Errorf("Reconcile returned %v, want the refused status write reported", err)
+	}
+
+	if got := getSnap(t, cli, "pvc-1.snap-1"); got.Spec.SuspendIO {
+		t.Fatalf("a refused status write kept I/O suspended past the deadline: %+v", got.Spec)
 	}
 }
