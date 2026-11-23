@@ -22,7 +22,7 @@ import "testing"
 
 // A connection stored as Node-1/beta renders between the hosts node-1 and
 // beta, in either order.
-func TestLookupPathsMatchesAConnectionInAnotherSpelling(t *testing.T) {
+func TestLookupConnectionMatchesAConnectionInAnotherSpelling(t *testing.T) {
 	t.Parallel()
 
 	conns := []ResourceConnection{{
@@ -30,11 +30,11 @@ func TestLookupPathsMatchesAConnectionInAnotherSpelling(t *testing.T) {
 		Paths: []ResourcePath{{Name: "p1", AddressA: "10.0.0.1", AddressB: "10.0.0.2"}},
 	}}
 
-	if got := lookupPaths(conns, "node-1", "beta"); len(got) != 1 || got[0].AddressA != "10.0.0.1" {
+	if got := lookupConnection(conns, "node-1", "beta").Paths; len(got) != 1 || got[0].AddressA != "10.0.0.1" {
 		t.Errorf("node-1, beta: %+v", got)
 	}
 
-	if got := lookupPaths(conns, "beta", "node-1"); len(got) != 1 || got[0].AddressA != "10.0.0.2" {
+	if got := lookupConnection(conns, "beta", "node-1").Paths; len(got) != 1 || got[0].AddressA != "10.0.0.2" {
 		t.Errorf("beta, node-1: %+v", got)
 	}
 }

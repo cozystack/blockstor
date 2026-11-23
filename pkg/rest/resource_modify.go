@@ -69,6 +69,13 @@ func (s *Server) handleResourceModify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if patch.DrbdTiebreaker != nil || patch.DrbdClient != nil && *patch.DrbdClient {
+		writeError(w, http.StatusNotImplemented, "drbd_tiebreaker and drbd_client are not supported: "+
+			"blockstor manages tiebreakers itself and has no diskless replica without a quorum vote")
+
+		return
+	}
+
 	if refuseUnwhitelistedProps(w, propwhitelist.Resource, patch.OverrideProps) {
 		return
 	}

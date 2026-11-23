@@ -43,7 +43,7 @@ import (
 // already open against the original backend), so the cluster gave
 // no operator-visible signal until the next provisioning call.
 //
-// Post-fix: 400 + apiCallRcFailInvldStorPoolName (552), live row's
+// Post-fix: 400 + apiCallRcFailInvldStorPoolName (208), live row's
 // Props stay byte-identical to pre-call, operator gets actionable
 // "drop + recreate the pool with the new backing key" guidance.
 func TestBug373SPModifyRefusesZPoolOverride(t *testing.T) {

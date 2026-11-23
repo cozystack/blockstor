@@ -255,6 +255,26 @@ func TravellingProps(props map[string]string) map[string]string {
 	delete(out, CloneSnapshotReapingProp)
 	delete(out, SnapshotDeletingProp)
 
+	// A copy of a volume caught mid live migration is not migrating: no
+	// VM runs on it, and nobody will unmake-available it to close the
+	// migration. LINSTOR copies the marks and, when both ends were
+	// diskless, allow-two-primaries on the definition along; the copy
+	// would then allow two Primaries until its first detach, and refuse
+	// its own first migration with FAIL_EXISTS_LIVE_MIGRATE. Revert the
+	// migration on the copy as unmake-available would. An
+	// allow-two-primaries without marks was set by a client (linstor-csi
+	// before v1.13) and is the client's to clear, so it stays.
+	if hasLiveMigrationProps(out) {
+		apiv1.RevertLiveMigration("", out)
+	}
+
+	// A resource connection links the replicas of THIS definition on two
+	// nodes; a copy has replicas of its own, placed anew. LINSTOR does not
+	// copy a definition's connections either.
+	maps.DeleteFunc(out, func(key, _ string) bool {
+		return strings.HasPrefix(key, apiv1.ResourceConnectionPropsPrefix)
+	})
+
 	// A passphrase property left on a group or a definition from before the
 	// Secret was the only source is never read, and copying it would put the
 	// plaintext key into every definition a clone, a spawn, a snapshot or a
@@ -262,6 +282,18 @@ func TravellingProps(props map[string]string) map[string]string {
 	passphrase.DropPlaintextProps(out)
 
 	return out
+}
+
+// hasLiveMigrationProps reports whether props carry any live migration
+// mark.
+func hasLiveMigrationProps(props map[string]string) bool {
+	for key := range props {
+		if strings.HasPrefix(key, apiv1.LiveMigrateNamespace+"/") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // serverOwnedDefinitionProps are the props blockstor writes onto a definition

@@ -19,8 +19,11 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/propwhitelist"
@@ -76,9 +79,20 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 
 	s.forgetStaleReplica(r.Context(), &res)
 
+	// REST 1.28 added the `props` filter here, on the volumes' own props.
 	// Every volume definition is listed, built or not, as LINSTOR does;
 	// see ensureVolumesForView.
-	writeJSON(w, http.StatusOK, ensureVolumesForView(res.Volumes, &res, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)))
+	propFilter := propsQuery(r)
+	all := ensureVolumesForView(res.Volumes, &res, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName))
+	vols := make([]apiv1.Volume, 0, len(all))
+
+	for i := range all {
+		if matchProps(propFilter, all[i].Props) {
+			vols = append(vols, all[i])
+		}
+	}
+
+	writeJSON(w, http.StatusOK, vols)
 }
 
 // handleVolumesPerResourceGet answers
@@ -106,20 +120,19 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	s.awaitReportedVolume(r.Context(), &res, vlmNr)
 	s.forgetStaleReplica(r.Context(), &res)
 
-	// A volume the satellite has not built yet answers without a device
-	// path, as LINSTOR's does, rather than 404: linstor-csi's attach
-	// then reports "could not determine device path" and retries,
-	// instead of failing on a volume that does exist.
+	// A volume the satellite has not built within the wait answers
+	// without a device path, as LINSTOR's does, rather than 404:
+	// linstor-csi's attach then reports "could not determine device
+	// path" and retries, instead of failing on a volume that does exist.
 	vols := ensureVolumesForView(res.Volumes, &res, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName))
 
-	for i := range vols {
-		if vols[i].VolumeNumber == vlmNr {
-			writeJSON(w, http.StatusOK, vols[i])
+	if i := slices.IndexFunc(vols, func(v apiv1.Volume) bool { return v.VolumeNumber == vlmNr }); i >= 0 {
+		writeJSON(w, http.StatusOK, vols[i])
 
-			return
-		}
+		return
 	}
 
 	writeError(w, http.StatusNotFound, fmt.Sprintf(
@@ -236,4 +249,62 @@ func mergeVolumePropsPatch(vol *apiv1.Volume, patch *apiv1.GenericPropsModify) {
 	applyPropsModify(vol.Props, patch.OverrideProps, patch.DeleteProps)
 
 	deletePropNamespaces(vol.Props, patch.DeleteNamespace)
+}
+
+// volumeReportBudget bounds how long a volume read waits for the satellite
+// to report a volume its definition has. It stays well below the
+// external-attacher's timeout.
+const volumeReportBudget = 10 * time.Second
+
+// awaitReportedVolume waits, refreshing res, for its satellite to report
+// volume vlmNr with a device path when the replica is new: linstor-csi
+// reads the volume's device path right after make-available and fails the
+// attach on a missing volume or an empty path, and LINSTOR knows both from
+// the moment the replica exists. The observer reports the disk state before
+// the apply pass stamps the path, so the volume alone is not enough. Once
+// the budget runs out res is left as it stands. A volume number the
+// definition does not have, and a replica being deleted, return at once.
+func (s *Server) awaitReportedVolume(ctx context.Context, res *apiv1.Resource, vlmNr int32) {
+	deadline := time.Now().Add(volumeReportBudget)
+
+	for {
+		idx := findVolumeIndexByNumber(res.Volumes, vlmNr)
+		if idx >= 0 && res.Volumes[idx].DevicePath != "" {
+			return
+		}
+
+		if !s.awaitVolumeReport(ctx, res, vlmNr, deadline) {
+			return
+		}
+	}
+}
+
+// awaitVolumeReport waits one poll interval and re-reads the replica into
+// res. It reports false, leaving res as it was, when there is nothing left
+// to wait for: the budget ran out, the replica is being deleted, or its
+// definition has no such volume.
+func (s *Server) awaitVolumeReport(ctx context.Context, res *apiv1.Resource, vlmNr int32, deadline time.Time) bool {
+	if slices.Contains(res.Flags, apiv1.ResourceFlagDelete) || time.Now().After(deadline) {
+		return false
+	}
+
+	_, err := s.Store.VolumeDefinitions().Get(ctx, res.Name, vlmNr)
+	if err != nil {
+		return false
+	}
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(cacheConvergePollInterval):
+	}
+
+	next, err := s.Store.Resources().Get(ctx, res.Name, res.NodeName)
+	if err != nil {
+		return false
+	}
+
+	*res = next
+
+	return true
 }

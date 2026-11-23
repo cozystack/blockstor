@@ -118,6 +118,21 @@ const ConditionKernelLoaded = "KernelLoaded"
 // yaml | grep volume-numbers` and read it without parsing.
 const ResourceAnnotationVolumeNumbers = "blockstor.org/volume-numbers"
 
+// ResourceDefinitionAnnotationLiveMigrateToken is the token a live
+// migration's make-available writes onto the definition in the same patch
+// as its dual-Primary props. ResourceAnnotationLiveMigrateApplied is where
+// a satellite copies the token it found on the definition after an apply
+// pass that succeeded, so it has rendered and adjusted the .res those
+// props produce. make-available waits for both ends of the migration to
+// report the token before it answers, as LINSTOR waits for its
+// satellites, because linstor-csi starts the migration on the answer and
+// the target cannot become Primary before allow-two-primaries is in
+// effect on both ends.
+const (
+	ResourceDefinitionAnnotationLiveMigrateToken = "blockstor.org/live-migrate-token" //nolint:gosec // an annotation name, not a credential
+	ResourceAnnotationLiveMigrateApplied         = "blockstor.org/live-migrate-applied"
+)
+
 // ResourceSpec is the desired state of one replica of a ResourceDefinition
 // placed on a node. The composite key is (resourceDefinitionName, nodeName);
 // metadata.name encodes that as `<rd>.<node>`.
@@ -431,18 +446,18 @@ type ResourceStatus struct {
 	// +optional
 	Suspended string `json:"suspended,omitempty"`
 
-	// promotionScore is the kernel-reported DRBD-9 promotion score of
-	// this replica, parsed from the `promotion_score:` token in
-	// `drbdsetup events2` resource frames. Upstream LINSTOR publishes
-	// it as `layer_object.drbd.promotion_score`, and linstor-csi
-	// reports a volume abnormal on every node whose score is 0 or
-	// missing. Unset until the satellite has observed the resource.
+	// promotionScore is the kernel's score for promoting this
+	// replica, parsed from the `promotion_score:` token in
+	// `drbdsetup events2` resource frames. Zero means the kernel
+	// would refuse a promotion here: no reachable UpToDate data, or
+	// no quorum. linstor-csi's volume health reads it as LINSTOR
+	// reports it, so a replica with a score of 0 is an unhealthy
+	// one. Unset until the satellite has seen a resource frame.
 	// +optional
 	PromotionScore *int32 `json:"promotionScore,omitempty"`
 
-	// mayPromote is the kernel-reported DRBD-9 `may_promote:` flag
-	// from the same frames, published upstream as
-	// `layer_object.drbd.may_promote`. Unset until observed.
+	// mayPromote is the kernel's `may_promote:` token from the same
+	// frame: whether a promotion would succeed right now.
 	// +optional
 	MayPromote *bool `json:"mayPromote,omitempty"`
 

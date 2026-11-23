@@ -397,7 +397,8 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 	// whole cluster's pools when only one node is asked about.
 	out, err := s.listFilteredStoragePools(r.Context(),
 		multiValueQuery(r, "nodes"),
-		multiValueQuery(r, "storage_pools"))
+		multiValueQuery(r, "storage_pools"),
+		propsQuery(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -430,7 +431,7 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleNodeStoragePoolsList(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 
-	out, err := s.listFilteredStoragePools(r.Context(), []string{node}, nil)
+	out, err := s.listFilteredStoragePools(r.Context(), []string{node}, nil, propsQuery(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -460,7 +461,7 @@ func redactStoragePoolsInPlace(pools []apiv1.StoragePool) {
 // them (naming.Same). Empty filters
 // mean "no constraint on this dimension". The slice is always non-nil so
 // JSON encoding yields [] instead of null — linstor-csi rejects null bodies.
-func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolFilter []string) ([]apiv1.StoragePool, error) {
+func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolFilter, propFilter []string) ([]apiv1.StoragePool, error) {
 	pools, err := s.Store.StoragePools().List(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "list storage pools")
@@ -474,6 +475,12 @@ func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolF
 		}
 
 		if !matchAnyName(poolFilter, pools[i].StoragePoolName) {
+			continue
+		}
+
+		// Matched against the props the caller is shown, so a filter
+		// cannot probe a secret's value.
+		if len(propFilter) > 0 && !matchProps(propFilter, redactedProps(pools[i].Props)) {
 			continue
 		}
 

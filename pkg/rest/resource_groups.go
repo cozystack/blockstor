@@ -83,11 +83,13 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 	// list endpoint. Same semantics: names match as the store keys them,
 	// unknown names => empty list, missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_groups")
-	if len(nameFilter) > 0 {
+	propFilter := propsQuery(r)
+
+	if len(nameFilter) > 0 || len(propFilter) > 0 {
 		filtered := rgs[:0]
 
 		for i := range rgs {
-			if matchAnyName(nameFilter, rgs[i].Name) {
+			if matchAnyName(nameFilter, rgs[i].Name) && matchProps(propFilter, rgs[i].Props) {
 				filtered = append(filtered, rgs[i])
 			}
 		}
@@ -212,7 +214,9 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.ResourceGroups().Create(r.Context(), &rg)
 	if err != nil {
-		writeStoreError(w, err)
+		// FAIL_EXISTS_RSC_GRP on a duplicate: linstor-csi takes it for a
+		// concurrent CreateVolume that made the group first.
+		writeStoreErrorTyped(w, err, storeKindResourceGrp)
 
 		return
 	}

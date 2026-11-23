@@ -93,6 +93,8 @@ func (s *Server) registerAutoplace(mux *http.ServeMux) {
 		s.requireStore(s.handleResourceCreateOnNode))
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources/{node}/make-available",
 		s.requireStore(s.handleResourceMakeAvailable))
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources/{node}/unmake-available",
+		s.requireStore(s.handleResourceUnmakeAvailable))
 	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/resources/{node}",
 		s.requireStore(s.handleResourceDelete))
 }
@@ -1561,6 +1563,13 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	}
 
 	for i := range envelopes {
+		if client := envelopes[i].DrbdClient; client != nil && *client {
+			writeError(w, http.StatusNotImplemented, "drbd_client is not supported: blockstor has no diskless "+
+				"replica without a quorum vote, create a DRBD diskless replica instead")
+
+			return nil, false
+		}
+
 		if refuseUnwhitelistedProps(w, propwhitelist.Resource, envelopes[i].Resource.Props) {
 			return nil, false
 		}
@@ -2579,6 +2588,9 @@ func normalizeDisklessFlag(res *apiv1.Resource) {
 //     stamps the new StorPoolName.
 //   - If a diskful replica already lives on the node: no-op
 //     (already available).
+//   - With `auto_manage_dual_primary` (linstor-csi v1.13+ on every RWX
+//     block Attach) the call additionally prepares a live migration
+//     from the node the resource is in use on: see live_migrate.go.
 //
 // Always responds with the upstream `[]ApiCallRc` envelope — golinstor
 // discards the body but the Python CLI and `linstor` operator UI
@@ -2629,25 +2641,7 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	created, ok := s.applyMakeAvailable(w, r, rdName, node, &req)
-	if !ok {
-		return
-	}
-
-	// A replica make-available created goes through LINSTOR's
-	// createResource and so its deployResources: the answer comes once
-	// the satellite built it. linstor-csi's ControllerPublishVolume
-	// reads the replica's device path right after this call, and a
-	// replica the call only changed was built before.
-	var notReady []apiv1.APICallRc
-	if created {
-		notReady = s.waitMadeAvailableReplicaReady(r.Context(), rdName, node)
-	}
-
-	writeJSON(w, http.StatusOK, append([]apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "Resource '" + rdName + "' on node '" + node + "' made available",
-	}}, notReady...))
+	s.makeAvailableAndPrepareMigration(w, r, &rd, node, &req)
 }
 
 // decodeMakeAvailableBody parses the optional JSON body. Upstream
