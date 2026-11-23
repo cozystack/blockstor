@@ -68,6 +68,13 @@ func (s *Server) handleResourceModify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if patch.DrbdTiebreaker != nil || patch.DrbdClient != nil && *patch.DrbdClient {
+		writeError(w, http.StatusNotImplemented, "drbd_tiebreaker and drbd_client are not supported: "+
+			"blockstor manages tiebreakers itself and has no diskless replica without a quorum vote")
+
+		return
+	}
+
 	// Bug 204b: route through PatchResourceSpec so the override /
 	// delete delta is re-applied to the freshly-fetched Resource on
 	// every retry. The previous `Get → mutate → Update` path used

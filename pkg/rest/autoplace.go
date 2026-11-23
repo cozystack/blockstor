@@ -1480,6 +1480,15 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		return nil, false
 	}
 
+	for i := range envelopes {
+		if client := envelopes[i].DrbdClient; client != nil && *client {
+			writeError(w, http.StatusNotImplemented, "drbd_client is not supported: blockstor has no diskless "+
+				"replica without a quorum vote, create a DRBD diskless replica instead")
+
+			return nil, false
+		}
+	}
+
 	created := make([]apiv1.Resource, 0, len(envelopes))
 
 	for i := range envelopes {

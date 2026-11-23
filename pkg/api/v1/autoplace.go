@@ -68,6 +68,9 @@ type ResourceCreate struct {
 	DrbdTCPPortCount *int32   `json:"drbd_tcp_port_count,omitempty"`
 	CopyAllSnaps     bool     `json:"copy_all_snaps,omitempty"`
 	SnapNames        []string `json:"snap_names,omitempty"`
+	// DrbdClient (REST 1.28) asks for a diskless replica without a quorum
+	// vote. blockstor renders no such replica and refuses true.
+	DrbdClient *bool `json:"drbd_client,omitempty"`
 }
 
 // ResourceMakeAvailable is the body upstream LINSTOR uses on
