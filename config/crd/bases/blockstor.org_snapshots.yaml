@@ -326,6 +326,30 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              deleteFailures:
+                description: |-
+                  deleteFailures records, per node, why the satellite's last
+                  attempt to delete its copy of a deleting snapshot failed. The
+                  delete call answers with it at once, as LINSTOR answers with the
+                  error its satellite returned, instead of waiting on a node that
+                  is alive but keeps failing.
+                items:
+                  description: |-
+                    SnapshotDeleteFailure is the error one satellite hit deleting its
+                    copy of the snapshot.
+                  properties:
+                    message:
+                      type: string
+                    nodeName:
+                      type: string
+                  required:
+                  - message
+                  - nodeName
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - nodeName
+                x-kubernetes-list-type: map
               flags:
                 description: |-
                   flags carries terminal-state markers: "SUCCESSFUL" once the
@@ -360,6 +384,14 @@ spec:
                       type: string
                     ready:
                       type: boolean
+                    storagePool:
+                      description: |-
+                        storagePool is the pool that holds this node's copy: the pool of
+                        the replica it was taken from. The local satellite records it once
+                        its copy exists, because the copy outlives the replica and a
+                        restore has to be placed in the same pool, the way LINSTOR keeps
+                        the pool on each snapshot volume.
+                      type: string
                     suspendIOAcked:
                       description: |-
                         suspendIOAcked is stamped true by the local satellite once

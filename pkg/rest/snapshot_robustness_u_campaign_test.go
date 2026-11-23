@@ -134,6 +134,10 @@ func TestU282_RestoredResourcesPersistForSync(t *testing.T) {
 		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024},
 		},
+		Snapshots: []apiv1.SnapshotPerNode{
+			{NodeName: "n1", StoragePool: "data"},
+			{NodeName: "n2", StoragePool: "data"},
+		},
 	}); err != nil {
 		t.Fatalf("seed snap: %v", err)
 	}

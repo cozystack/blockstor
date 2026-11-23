@@ -131,6 +131,10 @@ type Server struct {
 	// replica answers alike.
 	encryption encryption
 
+	// snapshotDeleteBudget overrides snapshotDeleteWaitBudget when
+	// positive, so tests can outlast the budget without waiting 10s.
+	snapshotDeleteBudget time.Duration
+
 	// resolveHost is the DNS-lookup seam used by handleNodeCreate
 	// (scenario 4.W01) when the POST body omits a NetInterface
 	// address. Tests inject a stub via Server.SetResolveHost to keep

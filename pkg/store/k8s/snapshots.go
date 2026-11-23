@@ -479,6 +479,13 @@ func crdToWireSnapshot(
 
 	out.Snapshots = wirePerNodeSnapshots(crd)
 
+	for _, failure := range crd.Status.DeleteFailures {
+		out.DeleteFailures = append(out.DeleteFailures, apiv1.SnapshotDeleteFailure{
+			NodeName: failure.NodeName,
+			Message:  failure.Message,
+		})
+	}
+
 	return out
 }
 
@@ -531,6 +538,7 @@ func wirePerNodeSnapshots(crd *crdv1alpha1.Snapshot) []apiv1.SnapshotPerNode {
 				NodeName:        crd.Status.NodeStatus[i].NodeName,
 				CreateTimestamp: crd.Status.NodeStatus[i].CreateTimestamp,
 				SnapshotVolumes: snapshotVolumesFromVDs(crd.Spec.VolumeDefinitions),
+				StoragePool:     crd.Status.NodeStatus[i].StoragePool,
 			})
 		}
 
