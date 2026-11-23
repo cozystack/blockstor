@@ -242,10 +242,11 @@ const disklessStorPoolName = "DfltDisklessStorPool"
 //     disklessStorPoolName) so `linstor n describe` recognises the
 //     row as a diskless witness instead of crashing on
 //     `find_child(...)` returning None.
-//  2. Any other replica that happens to arrive with an empty
-//     Volumes slice (e.g. fresh diskful replica before the
-//     satellite has written Status.Volumes): emit `[]` rather than
-//     omitting the key. Same crash class, just less common.
+//  2. A diskful replica the satellite has not reported yet: the
+//     same placeholders in the replica's own storage pool, so the
+//     `storage_pools` filter finds it and linstor-csi counts its
+//     size against the pool. Without a pool to name, `[]` rather
+//     than the absent key. Same crash class, just less common.
 //
 // Diskful replicas with already-populated Volumes are passed
 // through verbatim — the placeholder path must not shadow real
@@ -255,10 +256,19 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 		return observed
 	}
 
+	pool := disklessStorPoolName
+
 	if !isDisklessReplica(rsc) {
-		// Empty slice instead of nil so the JSON encoder emits
-		// `[]` not the absent key. Bug 137 wire contract.
-		return []apiv1.Volume{}
+		// A diskful replica the satellite has not reported yet has
+		// its volumes in its storage pool all the same: LINSTOR knows
+		// them from the moment the replica exists, and linstor-csi
+		// counts their size against the pool, filtered by it. With
+		// no pool to name, an empty slice instead of nil so the JSON
+		// encoder emits `[]` not the absent key (Bug 137).
+		pool = rsc.Props["StorPoolName"]
+		if pool == "" {
+			return []apiv1.Volume{}
+		}
 	}
 
 	// Stable iteration over the VD index: map keys are
@@ -277,12 +287,17 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 	for _, vn := range volNums {
 		out = append(out, apiv1.Volume{
 			VolumeNumber: vn,
-			StoragePool:  disklessStorPoolName,
+			StoragePool:  pool,
 			// AllocatedKib defaults to 0 (the Bug 112 contract:
-			// always emit the key as an int >= 0). Diskless has
-			// no real allocation, so 0 is the truthful value.
+			// always emit the key as an int >= 0). Neither a
+			// diskless replica nor an unreported one has allocated
+			// anything yet, so 0 is the truthful value.
 		})
 	}
+
+	// The layer chain the store gives a reported volume; the parent
+	// definition's own stack replaces it later in the view.
+	apiv1.ApplyLayerStackToVolumes(out, apiv1.DefaultLayerStack())
 
 	return out
 }

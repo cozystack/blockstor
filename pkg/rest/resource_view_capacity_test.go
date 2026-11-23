@@ -40,6 +40,7 @@ func TestResourceViewCarriesReservedCapacity(t *testing.T) {
 
 	seedOnlineNodeWithPool(t, st, "n1")
 	seedRDWithVD(t, st, "pvc-cap", 4096)
+	seedRDWithVD(t, st, "pvc-new", 2048)
 
 	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, "pvc-cap", func(rd *apiv1.ResourceDefinition) error {
 		rd.LayerStack = apiv1.DefaultLayerStack()
@@ -55,6 +56,11 @@ func TestResourceViewCarriesReservedCapacity(t *testing.T) {
 			Name: "pvc-cap", NodeName: "n1", Props: map[string]string{"StorPoolName": "zfs-thin"},
 			Volumes: []apiv1.Volume{{VolumeNumber: 0, StoragePool: "zfs-thin"}},
 		},
+		// A diskful replica its satellite has not reported yet has
+		// promised its size all the same: LINSTOR knows its volumes
+		// from the moment it exists, and a burst of CreateVolume reads
+		// the capacity while the new replicas are in this state.
+		{Name: "pvc-new", NodeName: "n1", Props: map[string]string{"StorPoolName": "zfs-thin"}},
 	} {
 		if err := st.Resources().Create(ctx, &res); err != nil {
 			t.Fatalf("seed replica: %v", err)
@@ -85,8 +91,8 @@ func TestResourceViewCarriesReservedCapacity(t *testing.T) {
 		}
 	}
 
-	if reserved != 4096 {
-		t.Errorf("reserved capacity of zfs-thin on n1: %d KiB, want 4096", reserved)
+	if reserved != 4096+2048 {
+		t.Errorf("reserved capacity of zfs-thin on n1: %d KiB, want %d", reserved, 4096+2048)
 	}
 
 	other, err := newClient(t, base).Resources.GetResourceView(ctx,
