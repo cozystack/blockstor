@@ -239,7 +239,7 @@ func TestUnmakeAvailableNoOps(t *testing.T) {
 	_, base := liveMigrationFixture(t, nil)
 
 	status, rcs := postRcs(t, base+"/v1/resource-definitions/no-such-rd/resources/node-a/unmake-available", ``)
-	if status != http.StatusOK || len(rcs) == 0 || rcs[0].RetCode != warnRDNotFound {
+	if status != http.StatusOK || len(rcs) == 0 || rcs[0].RetCode != warnNotFound {
 		t.Fatalf("unknown definition: %d %+v, want a 200 not-found warning", status, rcs)
 	}
 

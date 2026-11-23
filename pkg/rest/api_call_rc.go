@@ -77,6 +77,13 @@ const warnRscNotFound = maskWarn | int64(2048)
 // two no-op replays.
 const warnRDNotFound = maskWarn | int64(2049)
 
+// warnNotFound is LINSTOR's generic WARN_NOT_FOUND (3000), the code
+// unmake-available answers for a definition that does not exist.
+// golinstor does not fail on a warning, so this only matters to a client
+// that matches the code itself, and to one comparing replies with
+// LINSTOR's.
+const warnNotFound = maskWarn | int64(3000)
+
 // warnRGNotFound flags a delete-of-missing on
 // `DELETE /v1/resource-groups/{rg}`. Bug 66: the Python linstor CLI
 // pipes the response body through its XML parser when the HTTP layer

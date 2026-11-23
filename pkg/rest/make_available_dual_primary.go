@@ -279,7 +279,7 @@ func (s *Server) handleResourceUnmakeAvailable(w http.ResponseWriter, r *http.Re
 	_, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
 	if errors.Is(err, store.ErrNotFound) {
 		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-			RetCode: warnRDNotFound,
+			RetCode: warnNotFound,
 			Message: fmt.Sprintf("Resource definition '%s' not found. Nothing to do.", rdName),
 		}})
 
