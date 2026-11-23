@@ -213,7 +213,9 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.ResourceGroups().Create(r.Context(), &rg)
 	if err != nil {
-		writeStoreError(w, err)
+		// FAIL_EXISTS_RSC_GRP on a duplicate: linstor-csi takes it for a
+		// concurrent CreateVolume that made the group first.
+		writeStoreErrorTyped(w, err, storeKindResourceGrp)
 
 		return
 	}

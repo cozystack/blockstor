@@ -345,7 +345,9 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
-		writeStoreError(w, err)
+		// FAIL_EXISTS_RSC_DFN on a duplicate: linstor-csi takes it for a
+		// concurrent CreateVolume that made the definition first.
+		writeStoreErrorTyped(w, err, storeKindResourceDfn)
 
 		return
 	}
