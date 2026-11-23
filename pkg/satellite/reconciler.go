@@ -68,6 +68,11 @@ type ReconcilerConfig struct {
 	DeviceWaitTimeout time.Duration
 	DeviceWaitPoll    time.Duration
 
+	// DeviceSizeKib reads a block device's size; a pass that grew a
+	// volume reports the size applied only once the device shows it.
+	// nil reads sysfs; tests inject a fake.
+	DeviceSizeKib func(ctx context.Context, device string) (int64, error)
+
 	// NodeName is this satellite's identifier; the reconciler uses it
 	// to know which Peer entries describe local vs. remote.
 	NodeName string
@@ -338,6 +343,18 @@ type Reconciler struct {
 	// pass, repopulating the marker, so the gate stays correct.
 	restoreBlankFallback map[string]bool
 
+	// growSteps records, per "<resource>/<volNumber>", the grow step
+	// this pass took for a grow the replica has not finished (planGrow).
+	// Written in applyStorage and read by buildVolumeResults in the same
+	// pass, which then reports the size applied only once the device
+	// shows it.
+	growSteps map[string]growStep
+
+	// resizeRetries counts, per "<resource>/<volNumber>", the passes in
+	// a row whose re-run resize left the device short (noteRetryInVain).
+	// Process memory only: a restart allows another resizeRetryLimit.
+	resizeRetries map[string]resizeRetry
+
 	// restoreClonedHere records, per "<resource>/<volNumber>", whether
 	// this process itself cloned or received the snapshot into a volume
 	// that was not on disk before (true), or first found the volume
@@ -452,6 +469,8 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		seenStuckAt:                 map[string]time.Time{},
 		adoptionHeldSince:           map[string]time.Time{},
 		restoreBlankFallback:        map[string]bool{},
+		growSteps:                   map[string]growStep{},
+		resizeRetries:               map[string]resizeRetry{},
 		restoreClonedHere:           map[string]bool{},
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
@@ -1113,7 +1132,7 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 		}
 	}
 
-	res.Volumes = buildVolumeResults(dr, devices, diskless, withDRBD)
+	res.Volumes, res.GrowPending = r.buildVolumeResults(ctx, dr, devices, diskless, withDRBD)
 
 	return res
 }
@@ -1806,24 +1825,12 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 			return nil, false, false, errors.Wrapf(err, "volume status %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
 
-		// Grow path: the controller's VolumeDefinition update set a
-		// new size that's larger than what the provider has on disk.
-		// Call ResizeVolume to extend the LV/zvol/file; the LUKS
-		// layer (when present) and `drbdadm resize` are layered on
-		// top by their own reconcile steps.
-		if vol.GetSizeKib() > status.UsableKib && status.UsableKib > 0 {
-			err = provider.ResizeVolume(ctx, storage.Volume{
-				ResourceName: dr.GetName(),
-				VolumeNumber: vol.GetVolumeNumber(),
-				SizeKib:      vol.GetSizeKib(),
-			})
-			if err != nil {
-				return nil, false, false, errors.Wrapf(err, "resize volume %s/%d to %d KiB",
-					dr.GetName(), vol.GetVolumeNumber(), vol.GetSizeKib())
-			}
-
-			resized = true
+		grew, err := r.growBacking(ctx, provider, dr, vol, status.UsableKib)
+		if err != nil {
+			return nil, false, false, err
 		}
+
+		resized = resized || grew
 
 		devices[vol.GetVolumeNumber()] = status.DevicePath
 
@@ -1851,6 +1858,37 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	}
 
 	return devices, resized, cloned, nil
+}
+
+// growBacking takes this pass's grow step for vol (planGrow): the
+// controller's VolumeDefinition update set a new size this replica has
+// not finished growing to. It extends the LV/zvol/file to what the
+// layers above need; the LUKS layer (when present) and `drbdadm resize`
+// are layered on top by their own reconcile steps, which run when this
+// reports true. That is also the case for a grow whose backing grew on
+// an earlier pass but whose `drbdadm resize` failed: nothing else would
+// ask for the resize again.
+func (r *Reconciler) growBacking(
+	ctx context.Context, provider storage.Provider, dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64,
+) (bool, error) {
+	step := r.planGrow(dr, vol, usableKib, r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack()))
+	r.recordGrowStep(dr.GetName(), vol.GetVolumeNumber(), step)
+
+	if step.backingKib > 0 {
+		err := provider.ResizeVolume(ctx, storage.Volume{
+			ResourceName: dr.GetName(),
+			VolumeNumber: vol.GetVolumeNumber(),
+			SizeKib:      step.backingKib,
+		})
+		if err != nil {
+			return false, errors.Wrapf(err, "resize volume %s/%d to %d KiB",
+				dr.GetName(), vol.GetVolumeNumber(), step.backingKib)
+		}
+
+		return true, nil
+	}
+
+	return step.retryResize, nil
 }
 
 // deviceWaitTimeoutDefault/deviceWaitPollDefault back the same-named
@@ -4355,7 +4393,12 @@ func (r *Reconciler) repairUncleanMetadata(
 		return false, nil
 	}
 
-	logger.Info("repaired the activity log left by an unclean shutdown")
+	// Not a sign of a crash on its own: DRBD clears the activity log's
+	// clean flag on every detach, a graceful `drbdsetup down` included
+	// (drbd_state.c, "always require a drbdmeta apply-al run"), and
+	// drbdadm attach applies it before it attaches. The probe merely
+	// meets the log before attach does.
+	logger.Info("applied the activity log the last detach left behind; DRBD asks for that after every detach, a clean one included")
 
 	return true, nil
 }
@@ -6992,39 +7035,62 @@ func isDiskless(flags []string) bool {
 //     holds after applyStorage + maybeLUKS.
 //   - DISKLESS replicas have no consumer-facing device; we emit
 //     no Volumes entries.
-func buildVolumeResults(dr *intent.DesiredResource, devices map[int32]string, diskless, withDRBD bool) []*intent.ResourceApplyVolumeResult {
+//
+// Each entry carries the size applied (appliedSizeKib); the bool reports
+// a volume whose grow has not reached its device yet.
+func (r *Reconciler) buildVolumeResults(
+	ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, diskless, withDRBD bool,
+) ([]*intent.ResourceApplyVolumeResult, bool) {
 	if diskless {
-		return nil
+		return nil, false
 	}
 
 	out := make([]*intent.ResourceApplyVolumeResult, 0, len(dr.GetVolumes()))
-
-	if withDRBD {
-		minor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
-
-		for _, vol := range dr.GetVolumes() {
-			out = append(out, &intent.ResourceApplyVolumeResult{
-				VolumeNumber: vol.GetVolumeNumber(),
-				DevicePath:   fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor)),
-			})
-		}
-
-		return out
-	}
+	growPending := false
 
 	for _, vol := range dr.GetVolumes() {
 		dev, ok := devices[vol.GetVolumeNumber()]
+
+		if withDRBD {
+			dev, ok = drbdDevicePath(dr, vol), true
+		}
+
 		if !ok {
 			continue
 		}
 
+		applied, pending := r.appliedSizeKib(ctx, dr, vol, dev, r.growStepOf(dr.GetName(), vol.GetVolumeNumber()))
+		growPending = growPending || pending
+
 		out = append(out, &intent.ResourceApplyVolumeResult{
-			VolumeNumber: vol.GetVolumeNumber(),
-			DevicePath:   dev,
+			VolumeNumber:   vol.GetVolumeNumber(),
+			DevicePath:     dev,
+			AppliedSizeKib: applied,
 		})
 	}
 
-	return out
+	return out, growPending
+}
+
+// recordGrowStep stores the grow step this pass took for the volume (see
+// growSteps).
+func (r *Reconciler) recordGrowStep(rdName string, vn int32, step growStep) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if step.pending {
+		r.growSteps[growKey(rdName, vn)] = step
+	} else {
+		delete(r.growSteps, growKey(rdName, vn))
+	}
+}
+
+// growStepOf returns what recordGrowStep stored this pass.
+func (r *Reconciler) growStepOf(rdName string, vn int32) growStep {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.growSteps[growKey(rdName, vn)]
 }
 
 // resFilePerm is the on-disk mode for /etc/drbd.d/<name>.res. drbd is
