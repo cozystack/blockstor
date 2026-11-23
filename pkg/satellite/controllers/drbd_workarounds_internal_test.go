@@ -501,6 +501,24 @@ func TestStalledResyncFallsBackToTheActivePeer(t *testing.T) {
 	}
 }
 
+// A disconnect of the paused peer that failed was not tried: the next
+// stall tries it again before the active peer.
+func TestStalledResyncRetriesAFailedDisconnectOfThePausedPeer(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{errs: map[string][]error{"disconnect pvc-stall:n2": {errAdjustBusy}}}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	runResync(t, w, adm, "Secondary", frozen(5)...)
+
+	adm.actions = nil
+
+	got := runResync(t, w, adm, "Secondary", frozen(4)...)
+	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
+		t.Errorf("actions after a failed disconnect = %v, want %v", got, want)
+	}
+}
+
 // The fallback is remembered across the passes the paused peer is away
 // while the replica stays Inconsistent, and forgotten once it is in
 // sync: a later stall tries the paused peer first again.

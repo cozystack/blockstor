@@ -557,9 +557,9 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 
 	switch {
 	case progress.PausedTried != dep.Active && res.MayDisconnect(dep.Paused):
-		w.disconnectPausedPeer(ctx, logger, res, replica, dep, stuck)
-
-		stalls[res.Name] = resyncProgress{ResyncDependency: dep, At: progress.At, PausedTried: dep.Active}
+		if w.disconnectPausedPeer(ctx, logger, res, replica, dep, stuck) {
+			stalls[res.Name] = resyncProgress{ResyncDependency: dep, At: progress.At, PausedTried: dep.Active}
+		}
 	case res.MayDisconnect(dep.Active):
 		w.reconnectActivePeer(ctx, logger, res, replica, dep, stuck)
 	default:
@@ -571,11 +571,12 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 // disconnectPausedPeer drops this node's connection to the peer whose
 // resync waits on the stalled one, and owes the resource an adjust on
 // the next pass that connects it again (adjustOwed). The pass in between
-// gives the active resync time to finish without the paused one.
+// gives the active resync time to finish without the paused one. It
+// reports whether the disconnect went through.
 func (w *DRBDWorkaroundsRunnable) disconnectPausedPeer(
 	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
 	replica *blockstoriov1alpha1.Resource, dep drbd.ResyncDependency, stuck string,
-) {
+) bool {
 	w.acted(logger, replica, res.Name, "DRBDResyncStalled", fmt.Sprintf(
 		"%s: disconnecting %s, connecting it again on the next pass (LINBIT/drbd#149)", stuck, dep.Paused))
 
@@ -583,10 +584,12 @@ func (w *DRBDWorkaroundsRunnable) disconnectPausedPeer(
 	if err != nil {
 		w.failed(logger, err, res.Name, "disconnect the peer a stalled resync waits on")
 
-		return
+		return false
 	}
 
 	w.oweAdjust(res.Name, "connect again the peer a stalled resync waited on")
+
+	return true
 }
 
 // reconnectActivePeer disconnects and connects the peer the stalled
