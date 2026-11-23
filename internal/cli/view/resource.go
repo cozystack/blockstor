@@ -50,6 +50,12 @@ const (
 	stateUnknown  = "Unknown"
 	flagDelete    = "DELETE"
 
+	// stateAttachFailed is a replica that should have a disk, reports
+	// none, and whose satellite has failed to attach one at least
+	// once.
+	stateAttachFailed = "AttachFailed"
+	diskStateDiskless = "diskless"
+
 	replicationStateSyncTarget = "SyncTarget"
 )
 
@@ -189,6 +195,12 @@ func connsCell(res *apiv1.Resource) string {
 // replica resyncs from more than one peer: the count is the last
 // peer's, so a replica half way through a full resync read
 // `Inconsistent(99%)` after a small resync from another peer.
+//
+// A replica that should have a disk but reports Diskless is what
+// LINSTOR's client paints red as an unintentional Diskless. Once its
+// satellite has failed to attach the disk it reads AttachFailed: the
+// failure repeats until someone acts, and a bare Diskless next to an
+// Ok connection column reads as a healthy diskless replica.
 func stateCell(res *apiv1.Resource) string {
 	if slices.Contains(res.Flags, flagDelete) {
 		return stateDeleting
@@ -211,7 +223,17 @@ func stateCell(res *apiv1.Resource) string {
 		return apiv1.SyncProgressState(replicationStateSyncTarget, done)
 	}
 
+	if strings.EqualFold(vol.State.DiskState, diskStateDiskless) && res.State.ToggleDiskRetries > 0 {
+		return stateAttachFailed
+	}
+
 	return vol.State.DiskState
+}
+
+// wantsDisk reports whether the replica is meant to have a disk.
+func wantsDisk(res *apiv1.Resource) bool {
+	return !slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) &&
+		!slices.Contains(res.Flags, apiv1.ResourceFlagTieBreaker)
 }
 
 // worstVolume picks the volume whose state the row should report: the
@@ -236,8 +258,8 @@ func worstVolume(res *apiv1.Resource) *apiv1.Volume {
 }
 
 // IsFaulty backs `--faulty`: a replica counts as faulty when a volume
-// has an observed disk state that has not converged, or when a peer
-// link is down. A replica the satellite has not reported on is NOT
+// has an observed disk state that has not converged, when a replica
+// meant to have a disk reports Diskless, or when a peer link is down. A replica the satellite has not reported on is NOT
 // faulty — absence of data is not evidence of breakage, and reporting
 // it as such would drown a real fault.
 func IsFaulty(res *apiv1.Resource) bool {
@@ -249,10 +271,16 @@ func IsFaulty(res *apiv1.Resource) bool {
 		return true
 	}
 
+	wantDisk := wantsDisk(res)
+
 	for i := range res.Volumes {
 		state := strings.ToLower(res.Volumes[i].State.DiskState)
 		if state == "" {
 			continue
+		}
+
+		if state == diskStateDiskless && wantDisk {
+			return true
 		}
 
 		if _, terminal := terminalStates[state]; !terminal {

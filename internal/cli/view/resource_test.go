@@ -353,3 +353,48 @@ func cellAt(t *testing.T, tbl *metav1.Table, row int, column string) string {
 
 	return s
 }
+
+// A replica toggled to diskful whose satellite cannot attach the new
+// disk keeps reporting Diskless with every connection up. It read as a
+// healthy diskless replica, and a conversion stuck on a refused attach
+// went unnoticed for hours. LINSTOR's client paints a Diskless replica
+// without the DISKLESS flag red; here it is faulty, and it reads
+// AttachFailed once the satellite has failed to attach.
+func TestDisklessReplicaMeantToHaveDisk(t *testing.T) {
+	t.Parallel()
+
+	converting := diskful("node-2", "Diskless", 0)
+
+	tbl := view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{converting}, FaultyOnly: true})
+	if len(tbl.Rows) != 1 {
+		t.Fatalf("a diskful replica reporting Diskless is not listed by --faulty")
+	}
+
+	if got := cellAt(t, tbl, 0, "State"); got != "Diskless" {
+		t.Errorf("before a failed attach: State = %q, want %q", got, "Diskless")
+	}
+
+	stuck := converting
+	stuck.State.ToggleDiskRetries = 3
+
+	tbl = view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{stuck}, FaultyOnly: true})
+	if len(tbl.Rows) != 1 {
+		t.Fatalf("a replica failing to attach is not listed by --faulty")
+	}
+
+	if got := cellAt(t, tbl, 0, "State"); got != "AttachFailed" {
+		t.Errorf("after failed attaches: State = %q, want %q", got, "AttachFailed")
+	}
+
+	intended := diskful("node-3", "Diskless", 0)
+	intended.Flags = []string{apiv1.ResourceFlagDiskless}
+	intended.State.ToggleDiskRetries = 3
+
+	if view.IsFaulty(&intended) {
+		t.Errorf("a replica meant to be diskless is reported faulty")
+	}
+
+	if got := cellAt(t, view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{intended}}), 0, "State"); got != "Diskless" {
+		t.Errorf("intended diskless: State = %q, want %q", got, "Diskless")
+	}
+}

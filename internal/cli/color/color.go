@@ -128,6 +128,7 @@ var brokenStates = map[string]struct{}{ //nolint:gochecknoglobals // static clas
 	"unconnected":    {},
 	"faulty":         {},
 	"error":          {},
+	"attachfailed":   {},
 }
 
 // ClassifyState buckets a state string. Matching is case-insensitive
