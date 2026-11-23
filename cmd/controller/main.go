@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	k8srest "k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -41,6 +42,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
+	"github.com/cozystack/blockstor/pkg/apihealth"
 	"github.com/cozystack/blockstor/pkg/rest"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 	// +kubebuilder:scaffold:imports
@@ -167,7 +169,7 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, st, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, st, err := storek8s.NewManager(mustLoadRESTConfig(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -390,4 +392,19 @@ func resolveControllerNamespace(flagValue string) string {
 	}
 
 	return "blockstor-system"
+}
+
+// mustLoadRESTConfig loads the API config with the shortened HTTP/2
+// health check, or ends the process. The watchdog judges heartbeats
+// from this process's cache, so a connection left on a silently dead
+// API server for client-go's 45 s would freeze that cache long enough
+// to call every node OFFLINE.
+func mustLoadRESTConfig() *k8srest.Config {
+	cfg, err := apihealth.GetConfig()
+	if err != nil {
+		setupLog.Error(err, "Failed to load Kubernetes config")
+		os.Exit(1)
+	}
+
+	return cfg
 }

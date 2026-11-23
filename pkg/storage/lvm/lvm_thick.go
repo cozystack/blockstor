@@ -270,6 +270,11 @@ func (t *Thick) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error
 	return nil
 }
 
+// HasSnapshot reports whether this pool holds the snapshot LV.
+func (t *Thick) HasSnapshot(ctx context.Context, snap storage.Snapshot) (bool, error) {
+	return t.lvExists(ctx, snapshotLVName(snap)), nil
+}
+
 // DeleteSnapshot mirrors Thin's, including the missing-LV idempotency
 // short-circuit so the satellite reconciler can strip the Snapshot
 // CRD's finalizer instead of looping on a "not found" surface error.

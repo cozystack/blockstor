@@ -48,6 +48,8 @@ func seedBlockSizeSnapshot(t *testing.T, vdProps map[string]string) *store.InMem
 		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, VolumeDefinitionProps: vdProps},
 		},
+		// A restore places a replica in the pool that holds the copy.
+		Snapshots: []apiv1.SnapshotPerNode{{NodeName: "n1", StoragePool: "data"}},
 	})
 	if err != nil {
 		t.Fatalf("seed snap: %v", err)
