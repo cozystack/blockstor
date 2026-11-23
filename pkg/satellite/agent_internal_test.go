@@ -39,7 +39,7 @@ import (
 //	linstor rd c <rd>; linstor rd sp <rd> FileSystem/Type ext4
 //	linstor vd c <rd> 256M; linstor r c <rd> --auto-place=2 -s lvm-thin
 //	# wait until UpToDate on every replica
-//	blkid -o export /dev/drbd<minor>   # → exit 2 (no signature)
+//	blkid -p -o export /dev/drbd<minor> # → exit 2 (no signature)
 //	ls /etc/drbd.d/*.mkfs.done         # → none
 //
 // Companion of TestApplyAutoMkfsRetryAfterMissedFirstActivation and

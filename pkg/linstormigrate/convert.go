@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/storage/zfs"
 	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
@@ -45,6 +46,12 @@ import (
 //
 //nolint:gosec // this is a property-name constant, not the secret value itself
 const drbdSharedSecretProp = "DrbdOptions/Net/shared-secret"
+
+// drbdCramHMACAlgProp is the RD property that turns DRBD peer
+// authentication on. blockstor renders it only when it is set, so the
+// converter writes it, next to the secret, on exactly the definitions
+// LINSTOR authenticated.
+const drbdCramHMACAlgProp = "DrbdOptions/Net/cram-hmac-alg"
 
 // nodeTypeController is the LINSTOR node type blockstor never adopts —
 // blockstor runs its own control plane.
@@ -288,6 +295,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 
 	conv.reportRemotes()
 	conv.reportUnmatchedPortNodes()
+	conv.reportDroppedProps()
 
 	err = checkPortCollisions(res.Resources)
 	if err != nil {
@@ -299,20 +307,58 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 	return res, nil
 }
 
-// convertControllerConfig distills the LINSTOR /CTRL property bag into
-// the blockstor ControllerConfig singleton. Only `DrbdOptions/*` keys
-// carry over — they set cluster-wide DRBD behaviour (auto tiebreaker,
-// verify-alg allow-list, ...) exactly like `linstor controller
-// set-property` would through blockstor's REST. Everything else under
-// /CTRL is LINSTOR runtime plumbing (NetCom connector ports, TLS
-// keystores, Cluster/LocalID, the master-passphrase crypto material)
-// that must NOT leak into blockstor.
+// convertControllerConfig distills the LINSTOR /CTRL and /STLT property
+// bags into the blockstor ControllerConfig singleton. Only `DrbdOptions/*`
+// keys carry over; everything else in either bag is LINSTOR runtime
+// plumbing (NetCom connector ports, TLS keystores, Cluster/LocalID, the
+// master-passphrase crypto material) and is listed in the report by
+// reportDroppedProps rather than written anywhere.
+//
+// Both bags are what an operator sets with `linstor controller
+// set-property`: LINSTOR keeps the keys its controller acts on (the auto
+// tiebreaker, the verify-alg allow-list, ...) in /CTRL and files every
+// other key, the `.res` knobs among them, under /STLT, which is the bag
+// the satellites render from. It sits below resource, definition, group
+// and node in their lookup, which is the rung ControllerConfig holds in
+// blockstor's (effectiveprops.Resolve), so the values keep their
+// precedence. Node is the one rung blockstor does not resolve, see
+// warnUnrenderedDRBDOptions.
+//
+// A key present in both bags with different values keeps the one LINSTOR
+// itself acted on: the /STLT value for a key with a section (it is what
+// the .res carried), the /CTRL value for a section-less controller key.
+// The other one is reported.
 func (c *converter) convertControllerConfig() *crdv1alpha1.ControllerConfig {
 	drbdProps := map[string]string{}
 
 	for key, val := range c.props.Controller {
-		if strings.HasPrefix(key, "DrbdOptions/") {
+		if strings.HasPrefix(key, drbd.PropPrefix) {
 			drbdProps[key] = val
+			c.props.carryKey(PropsInstanceController, key)
+		}
+	}
+
+	for _, key := range slices.Sorted(maps.Keys(c.props.Satellite)) {
+		if !strings.HasPrefix(key, drbd.PropPrefix) {
+			continue
+		}
+
+		val := c.props.Satellite[key]
+		c.props.carryKey(PropsInstanceSatellite, key)
+
+		ctrlVal, both := drbdProps[key]
+
+		switch {
+		case !both:
+			drbdProps[key] = val
+		case ctrlVal == val:
+		case drbd.SectionLess(key):
+			c.warnf("controller property %s: %s and %s disagree (%q vs %q) — kept the %s value, which LINSTOR's controller acts on",
+				key, PropsInstanceController, PropsInstanceSatellite, ctrlVal, val, PropsInstanceController)
+		default:
+			drbdProps[key] = val
+			c.warnf("controller property %s: %s and %s disagree (%q vs %q) — kept the %s value, which LINSTOR's satellites rendered",
+				key, PropsInstanceController, PropsInstanceSatellite, ctrlVal, val, PropsInstanceSatellite)
 		}
 	}
 
@@ -343,6 +389,45 @@ func (c *converter) convertControllerConfig() *crdv1alpha1.ControllerConfig {
 			ExtraProps:  extra,
 		},
 	}
+}
+
+// reportDroppedProps names every LINSTOR property no blockstor object
+// carries, one line per props instance, keys only: some of these hold
+// key material, and the key is enough to look the value up in LINSTOR.
+func (c *converter) reportDroppedProps() {
+	for _, dropped := range c.props.Dropped() {
+		if dropped.Withheld {
+			c.warnf("LINSTOR props %s: not migrated, would carry a passphrase in plaintext: %s",
+				dropped.Instance, strings.Join(dropped.Keys, ", "))
+
+			continue
+		}
+
+		c.warnf("LINSTOR props %s: not migrated, no blockstor object carries them: %s",
+			dropped.Instance, strings.Join(dropped.Keys, ", "))
+	}
+}
+
+// warnUnrenderedDRBDOptions reports the DrbdOptions/* keys of a bag that
+// is carried onto a blockstor object at a scope blockstor does not
+// resolve DRBD options from, so they reach the object but never a .res.
+func (c *converter) warnUnrenderedDRBDOptions(what string, props map[string]string) {
+	var keys []string
+
+	for key := range props {
+		if strings.HasPrefix(key, drbd.PropPrefix) {
+			keys = append(keys, key)
+		}
+	}
+
+	if len(keys) == 0 {
+		return
+	}
+
+	slices.Sort(keys)
+
+	c.warnf("%s: %s carried onto the object, but blockstor does not resolve DRBD options at this level — the adopted resources render without them; set them on the resource group, definition or controller instead",
+		what, strings.Join(keys, ", "))
 }
 
 // reportRemotes surfaces operator-created backup-shipping remotes,
@@ -676,12 +761,15 @@ func (c *converter) convertNodes() []crdv1alpha1.Node {
 			c.warnf("node %s: non-zero node_flags %d (DELETE/EVICTED markers are not decoded) — node migrated as-is, verify it should be adopted", dsp, row.NodeFlags)
 		}
 
+		props := c.props.Node(row.NodeName)
+		c.warnUnrenderedDRBDOptions("node "+dsp, props)
+
 		node := crdv1alpha1.Node{
 			TypeMeta:   typeMeta("Node"),
 			ObjectMeta: objectMeta(dsp),
 			Spec: crdv1alpha1.NodeSpec{
 				Type:  typeName,
-				Props: c.props.Node(row.NodeName),
+				Props: props,
 			},
 		}
 
@@ -777,13 +865,25 @@ func createsSparseZvols(driver, options string) bool {
 // only the pool bag then reports the pool as genuinely thick, migrates
 // it as ZFS, and walks straight into the pool-overflow during adoption
 // that createsSparseZvols exists to prevent.
+//
+// A value taken from /STLT or /CTRL is recorded as carried: it decides
+// the pool's provider kind, so the report must not list it among the
+// props nothing reads.
 func (c *converter) zfscreateOptions(node, pool string) string {
-	for _, bag := range []map[string]string{
-		c.props.StorPool(node, pool),
-		c.props.Node(node),
-		c.props.Controller,
+	for _, scope := range []struct {
+		bag      map[string]string
+		instance string
+	}{
+		{c.props.StorPool(node, pool), ""},
+		{c.props.Node(node), ""},
+		{c.props.Satellite, PropsInstanceSatellite},
+		{c.props.Controller, PropsInstanceController},
 	} {
-		if value, ok := bag[storDriverZfscreateOptions]; ok {
+		if value, ok := scope.bag[storDriverZfscreateOptions]; ok {
+			if scope.instance != "" {
+				c.props.carryKey(scope.instance, storDriverZfscreateOptions)
+			}
+
 			return value
 		}
 	}
@@ -808,6 +908,7 @@ func (c *converter) convertStoragePools() []crdv1alpha1.StoragePool {
 		}
 
 		props := c.props.StorPool(row.NodeName, row.PoolName)
+		c.warnUnrenderedDRBDOptions("storage pool "+poolDsp+"."+nodeDsp, props)
 
 		kind := row.DriverName
 		if kind == providerKindZFSThin {
@@ -1231,7 +1332,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 // terminal for the definition and for every replica of it, since
 // convertResources drops replicas whose parent did not convert.
 func (c *converter) rdConvertible(row *ResourceDefinitionRow, dsp string) bool {
-	if row.ResourceFlags&resourceFlagDelete != 0 {
+	if row.ResourceFlags&rscDfnFlagDelete != 0 {
 		c.warnf("resource definition %s: marked DELETE in the source cluster — skipped", dsp)
 
 		return false
@@ -1772,18 +1873,11 @@ func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
 }
 
 func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row *ResourceDefinitionRow, dsp string) {
-	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
-		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, drbd.TCPPort, dsp)
+	if layer, ok := c.drbdRD[row.ResourceName]; ok {
+		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, layer.TCPPort, dsp)
 
-		if drbd.Secret != "" {
-			if def.Spec.ExtraProps == nil {
-				def.Spec.ExtraProps = map[string]string{}
-			}
-			// Carried so the satellite renders the same `net {
-			// shared-secret }` the source cluster's kernels already
-			// run — adoption then re-applies an identical config
-			// instead of re-keying the mesh.
-			def.Spec.ExtraProps[drbdSharedSecretProp] = drbd.Secret
+		if layer.Secret != "" && c.carrySharedSecret(row, dsp) {
+			c.carryAuthentication(def, row.ResourceName, layer.Secret)
 		}
 	}
 
@@ -1794,6 +1888,108 @@ func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row
 			dsp, c.luksCount[row.ResourceName])
 	}
 }
+
+// carryAuthentication writes LINSTOR's authentication pair onto the
+// converted definition, so the satellite renders the same `net {
+// cram-hmac-alg; shared-secret }` the source cluster's kernels already
+// run and adoption re-applies an identical config instead of re-keying
+// the mesh. The digest is LINSTOR's hard-coded one unless the definition
+// names its own, which is then already among the carried props.
+func (c *converter) carryAuthentication(def *crdv1alpha1.ResourceDefinition, rdName, secret string) {
+	if def.Spec.ExtraProps == nil {
+		def.Spec.ExtraProps = map[string]string{}
+	}
+
+	def.Spec.ExtraProps[drbdSharedSecretProp] = secret
+
+	if !hasKeyFold(c.props.ResourceDefinition(rdName), drbdCramHMACAlgProp) {
+		def.Spec.ExtraProps[drbdCramHMACAlgProp] = drbd.DefaultCramHMACAlg
+	}
+}
+
+// carrySharedSecret says whether the definition's DRBD secret goes onto
+// the converted definition, which is whether LINSTOR put it in the .res.
+//
+// LINSTOR v1.33 writes `cram-hmac-alg sha1` and `shared-secret` into the
+// net section only for a replica whose DrbdOptions/auto-verify-alg
+// resolves, through the replica, definition, group, node and satellite
+// bags, to a value other than `windrbd`. Where it does not, the kernels
+// run with no peer authentication. Carrying the pair there would switch
+// authentication on during adoption, one node at a time, and a
+// connection re-established between a node already adjusted and one not
+// yet would fail the handshake. The secret is left off and the report
+// says how to turn authentication on afterwards.
+//
+// A definition with no live replica has nothing to keep in step with, and
+// keeps its secret; one whose replicas disagree keeps it too, since some
+// of its kernels authenticate already, and is reported: its other
+// replicas start authenticating during adoption, which is that same
+// window for them.
+func (c *converter) carrySharedSecret(row *ResourceDefinitionRow, dsp string) bool {
+	replicas := c.liveReplicas(row.ResourceName)
+
+	authenticated := 0
+
+	for _, replica := range replicas {
+		if c.linstorRendersAuth(row, replica.NodeName) {
+			authenticated++
+		}
+	}
+
+	switch {
+	case len(replicas) == 0, authenticated == len(replicas):
+		return true
+	case authenticated == 0:
+		c.warnf("resource definition %s: LINSTOR rendered no peer authentication for it (no %s resolves), so the DRBD shared secret is not carried and adoption leaves the connections as they are — to authenticate peers after the cutover set %s and %s together; each satellite applies them on its own, and a connection that re-establishes before both of its peers have does not come up until they have",
+			dsp, autoVerifyAlgProp, drbdSharedSecretProp, drbdCramHMACAlgProp)
+
+		return false
+	default:
+		c.warnf("resource definition %s: LINSTOR authenticated peers on %d of %d replicas (%s resolves on some only) — the shared secret is carried, so every replica authenticates after adoption; until every satellite of the definition has adjusted, a connection that re-establishes between a replica that switched and one that did not does not come up",
+			dsp, authenticated, len(replicas), autoVerifyAlgProp)
+
+		return true
+	}
+}
+
+// linstorRendersAuth resolves DrbdOptions/auto-verify-alg for one replica
+// the way LINSTOR's satellite does and reports whether it then writes the
+// authentication pair. See carrySharedSecret.
+func (c *converter) linstorRendersAuth(row *ResourceDefinitionRow, node string) bool {
+	for _, bag := range []map[string]string{
+		c.props.Resource(node, row.ResourceName),
+		c.props.ResourceDefinition(row.ResourceName),
+		c.resourceGroupProps(row.ResourceGroupName),
+		c.props.Node(node),
+		c.props.Satellite,
+	} {
+		if value, ok := bag[autoVerifyAlgProp]; ok {
+			return !strings.EqualFold(value, autoVerifyAlgWinDRBD)
+		}
+	}
+
+	return false
+}
+
+// hasKeyFold reports whether props has key in any letter case.
+func hasKeyFold(props map[string]string, key string) bool {
+	for name := range props {
+		if strings.EqualFold(name, key) {
+			return true
+		}
+	}
+
+	return false
+}
+
+const (
+	// autoVerifyAlgProp is the verify algorithm LINSTOR's controller
+	// picks for a definition from what every diskful node supports.
+	autoVerifyAlgProp = drbd.PropPrefix + drbd.AutoVerifyAlgKey
+	// autoVerifyAlgWinDRBD is the value LINSTOR reads as "a Windows peer
+	// is involved", which also turns its peer authentication off.
+	autoVerifyAlgWinDRBD = "windrbd"
+)
 
 // rdHasLuks reports whether any live replica of the RD carries a LUKS
 // layer volume (an encrypted passphrase row).
@@ -1828,7 +2024,7 @@ func (c *converter) volumeDefinitionsFor(rdName, rdDsp string) []crdv1alpha1.Res
 		out = append(out, crdv1alpha1.ResourceDefinitionVolume{
 			VolumeNumber: vd.VlmNr,
 			SizeKib:      vd.VlmSize,
-			Props:        c.props.VolumeDefinition(rdName, strconv.Itoa(int(vd.VlmNr))),
+			Props:        c.volumeDefinitionProps(rdName, rdDsp, vd.VlmNr),
 			DRBDMinor:    c.drbdMinor[volumeKey{rd: rdName, vlmNr: vd.VlmNr}],
 		})
 	}
@@ -1836,6 +2032,16 @@ func (c *converter) volumeDefinitionsFor(rdName, rdDsp string) []crdv1alpha1.Res
 	sort.Slice(out, func(i, j int) bool { return out[i].VolumeNumber < out[j].VolumeNumber })
 
 	return out
+}
+
+// volumeDefinitionProps is the carried bag of one volume definition.
+// LINSTOR renders a volume's own DrbdOptions/Disk/* into its volume
+// block; blockstor does not, which the report says.
+func (c *converter) volumeDefinitionProps(rdName, rdDsp string, vlmNr int32) map[string]string {
+	props := c.props.VolumeDefinition(rdName, strconv.Itoa(int(vlmNr)))
+	c.warnUnrenderedDRBDOptions(fmt.Sprintf("volume definition %s/%d", rdDsp, vlmNr), props)
+
+	return props
 }
 
 func (c *converter) convertResources() []crdv1alpha1.Resource {
@@ -1964,7 +2170,9 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 			Flags:                  flags,
 			DRBDNodeID:             c.drbdNode[replicaKey{node: row.NodeName, rd: row.ResourceName}],
 			// Adopted replicas carry real data (or are the witness of
-			// a data-bearing set): never allow the day0 skip.
+			// a data-bearing set): never allow the day0 skip. The
+			// satellite reads false as "not created empty here" too and
+			// never promotes such a replica to give it a filesystem.
 			SkipInitialSync: ptr(false),
 		},
 	}
@@ -1980,13 +2188,13 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 		resource.Spec.StoragePool = sp
 	}
 
-	if drbd, ok := c.drbdRD[row.ResourceName]; ok {
+	if layer, ok := c.drbdRD[row.ResourceName]; ok {
 		// blockstor's per-replica allocator honours a preset value
 		// verbatim. The live port map (when supplied) wins over the
 		// dump's often-empty tcp_port so the adopted mesh keeps its
 		// current endpoint, and a per-replica entry gives each replica
 		// its own node's port.
-		resource.Spec.DRBDPort = c.resolveReplicaDRBDPort(row, drbd.TCPPort, rdDsp, nodeDsp)
+		resource.Spec.DRBDPort = c.resolveReplicaDRBDPort(row, layer.TCPPort, rdDsp, nodeDsp)
 	}
 
 	return resource
@@ -2006,6 +2214,10 @@ func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
 		name := rdDsp + "." + snapDsp
 
 		switch {
+		case row.ResourceFlags&snapDfnFlagDelete != 0:
+			c.warnf("snapshot %s: marked DELETE in the source cluster — skipped", name)
+
+			continue
 		case row.ResourceFlags&snapDfnFlagFailedDeployment != 0:
 			c.warnf("snapshot %s: FAILED_DEPLOYMENT in the source cluster — skipped", name)
 
@@ -2036,7 +2248,7 @@ func (c *converter) convertSnapshots() []crdv1alpha1.Snapshot {
 }
 
 // buildSnapshot assembles one adopted Snapshot CRD (the caller has
-// applied the FAILED/SUCCESSFUL/parent/nodes skips).
+// applied the DELETE/FAILED/SUCCESSFUL/parent/nodes skips).
 func (c *converter) buildSnapshot(row *ResourceDefinitionRow, rdDsp, snapDsp, name string, nodes []string) crdv1alpha1.Snapshot {
 	snap := crdv1alpha1.Snapshot{
 		TypeMeta:   typeMeta("Snapshot"),
@@ -2326,14 +2538,23 @@ func (c *converter) snapshotCreatedAtFor(rdName, snapName string) int64 {
 // snapshotNodesFor lists the nodes an adopted Snapshot targets, dropping
 // any placement on a node that did not convert (CONTROLLER / unknown /
 // skipped). Keeping such a node would make the adopted Snapshot wait for
-// terminal readiness from a Node object that never exists. snapName is
-// used for the per-exclusion warning.
+// terminal readiness from a Node object that never exists. A placement
+// LINSTOR had marked DELETE is dropped too: its snapshot is on the way
+// out of that node, and adopting it there would bring it back.
+// snapName is used for the per-exclusion warning.
 func (c *converter) snapshotNodesFor(rdName, snapName, snapDsp string) []string {
 	var out []string
 
 	for i := range c.dump.Resources {
 		row := &c.dump.Resources[i]
 		if row.ResourceName != rdName || row.SnapshotName != snapName {
+			continue
+		}
+
+		if row.ResourceFlags&snapFlagDelete != 0 {
+			c.warnf("snapshot %s.%s: placement on node %s marked DELETE in the source cluster — dropped",
+				c.displayRD(rdName), snapDsp, c.displayNode(row.NodeName))
+
 			continue
 		}
 

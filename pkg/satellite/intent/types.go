@@ -692,6 +692,17 @@ type CreateSnapshotResponse struct {
 	Terminal            bool
 	Message             string
 	CreateTimestampUnix int64
+	// StoragePool is the pool the copy was taken in, set when Ok.
+	StoragePool string
+}
+
+// GetStoragePool returns the pool the copy was taken in.
+func (x *CreateSnapshotResponse) GetStoragePool() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.StoragePool
 }
 
 // GetOk reports whether the snapshot create succeeded.

@@ -28,7 +28,7 @@ kubectl get resources                             # one row per replica: node, p
 
 Use the full name `nodes.blockstor.org`, because plain `nodes` is the Kubernetes kind.
 
-A `Node` is `ONLINE` while its satellite stamps a heartbeat every 10 seconds. When the heartbeat is more than 40 seconds old, the controller sets the `Ready` condition to `Unknown` and the status to `OFFLINE`.
+A `Node` is `ONLINE` while its satellite stamps a heartbeat every 10 seconds. When the heartbeat is more than 50 seconds old, the controller sets the `Ready` condition to `Unknown` and the status to `OFFLINE`.
 
 The `State` column of `kubectl get resources` is the resource-level DRBD state. Per-volume disk state and per-peer connection state are in the status:
 

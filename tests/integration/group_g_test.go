@@ -244,6 +244,45 @@ func httpDeleteStatus(t *testing.T, url string) (int, []byte) {
 	return resp.StatusCode, body
 }
 
+// snapshotDeleteResult is what deleteSnapshotInBackground hands back.
+type snapshotDeleteResult struct {
+	status int
+	body   []byte
+	err    error
+}
+
+// deleteSnapshotInBackground sends a snapshot DELETE without waiting for
+// it: a delete answers only once the satellites have deleted their
+// copies, which a test that plays the satellite does after sending it.
+func deleteSnapshotInBackground(url string) <-chan snapshotDeleteResult {
+	answered := make(chan snapshotDeleteResult, 1)
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*groupGTimeout)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, http.NoBody)
+		if err != nil {
+			answered <- snapshotDeleteResult{err: err}
+
+			return
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			answered <- snapshotDeleteResult{err: err}
+
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		body, err := io.ReadAll(resp.Body)
+		answered <- snapshotDeleteResult{status: resp.StatusCode, body: body, err: err}
+	}()
+
+	return answered
+}
+
 // waitForSnapshotCRD polls the apiserver for a Snapshot CRD with the
 // composite name `<rd>.<snap>`. Different from harness.WaitForDRBDState
 // because the snapshot lifecycle does not run through the satellite
@@ -294,6 +333,10 @@ func TestGroupG(t *testing.T) {
 	t.Run("SnapRestoreCreatesNewRD", func(t *testing.T) { testGroupGSnapRestoreCreatesNewRD(t, stack, cli) })
 	t.Run("SnapRollbackOnExistingRD", func(t *testing.T) { testGroupGSnapRollbackOnExistingRD(t, stack, cli) })
 	t.Run("SnapRestoreSnapshotHolderOnly", func(t *testing.T) { testGroupGSnapRestoreSnapshotHolderOnly(t, stack, cli) })
+	t.Run("SnapRestoreAfterSourceDeleted", func(t *testing.T) { testGroupGSnapRestoreAfterSourceDeleted(t, stack) })
+	t.Run("SnapRestoreAfterSourceDeletedNeedsAPool", func(t *testing.T) {
+		testGroupGSnapRestoreAfterSourceDeletedNeedsAPool(t, stack)
+	})
 	t.Run("SnapOrphanCleanup", func(t *testing.T) { testGroupGSnapOrphanCleanup(t, stack, cli) })
 	t.Run("SnapDeleteBlockedByLater", func(t *testing.T) { testGroupGSnapDeleteBlockedByLater(t, stack, cli) })
 	t.Run("AutoSnapshotPeriodicTick", func(t *testing.T) { testGroupGAutoSnapshotPeriodicTick(t, stack) })
@@ -747,8 +790,10 @@ func testGroupGSnapOrphanCleanup(t *testing.T, stack *harness.Stack, cli *harnes
 	// keeps the object alive because of our finalizer. Bug 64's
 	// "orphan on the disk because handleDelete never ran"
 	// scenario would be visible here as the CRD vanishing
-	// immediately.
-	cli.Run(t, "snapshot", "delete", rd, "snap-orphan")
+	// immediately. The harness nodes are online, so the delete,
+	// like LINSTOR's, answers only once the "satellite" below has
+	// stripped its finalizer: send it in the background.
+	answered := deleteSnapshotInBackground(cli.URL + "/v1/resource-definitions/" + rd + "/snapshots/snap-orphan")
 
 	// 2s grace for the controller manager to propagate the
 	// delete intent. The CRD must STILL exist (finalizer holds it).
@@ -782,9 +827,32 @@ func testGroupGSnapOrphanCleanup(t *testing.T, stack *harness.Stack, cli *harnes
 	// An operator who force-strips before the satellite tore
 	// down leaves the on-disk snapshot behind: nothing deletes
 	// storage without its own delete request.
+	//
+	// This check runs a couple of seconds after the DELETE, inside
+	// the 10s wait budget, so it only shows the delete waits for the
+	// finalizer, which it did before the budget stopped applying to
+	// online nodes too. That a delete keeps waiting past the budget
+	// is pinned by the pkg/rest unit tests, which shorten it.
+	select {
+	case res := <-answered:
+		t.Fatalf("orphan: snapshot delete answered (%d, %v) while the satellite finalizer still held it",
+			res.status, res.err)
+	default:
+	}
+
 	terminating.Finalizers = nil
 	if err := stack.Env.Client.Update(ctx, &terminating); err != nil {
 		t.Fatalf("strip finalizer: %v", err)
+	}
+
+	select {
+	case res := <-answered:
+		if res.err != nil || res.status != http.StatusOK {
+			t.Fatalf("orphan: snapshot delete after the finalizer went: status %d, err %v, body %s",
+				res.status, res.err, res.body)
+		}
+	case <-time.After(groupGTimeout):
+		t.Fatalf("orphan: snapshot delete did not answer within %v after the finalizer went", groupGTimeout)
 	}
 
 	harness.Eventually(t, groupGTimeout, func() bool {
