@@ -203,14 +203,14 @@ func TestGroupARestartedSatelliteReplicasReadUnknown(t *testing.T) {
 }
 
 // TestGroupADestroyedKernelResourceReadsUnknown: while a replica's DRBD
-// resource is gone from the kernel of a node that stays ONLINE
-// (`drbdsetup down`, a bring-up that keeps failing), the LINSTOR
-// satellite has closed that resource's state stream, so the controller
-// answers it with no state and linstor-client shows a yellow Unknown
-// with a blank Usage that `r l --faulty` lists. blockstor answered the
-// cleared status the satellite leaves, which still reads Secondary:
-// the row read Unused, a healthy-looking replica that holds no data
-// and no peer link.
+// resource is gone from the kernel of a node that stays ONLINE after
+// it had been up (`drbdsetup down`), the LINSTOR satellite has closed
+// that resource's state stream, so the controller answers it with no
+// state and linstor-client shows a yellow Unknown with a blank Usage
+// that `r l --faulty` lists. blockstor answered the status the destroy
+// frames leave, no disk state or peer link but a role that still reads
+// Secondary: the row read Unused, a healthy-looking replica that holds
+// no data and no peer link.
 func TestGroupADestroyedKernelResourceReadsUnknown(t *testing.T) {
 	stack := harness.StartStack(t)
 	harness.SeedThreeNodeCluster(t, stack)
@@ -261,6 +261,80 @@ func TestGroupADestroyedKernelResourceReadsUnknown(t *testing.T) {
 	if strings.Contains(table, harness.NodeWorker2) {
 		t.Errorf("`r l --faulty` lists the healthy replica on the other node:\n%s", table)
 	}
+}
+
+// TestGroupAStaleKernelLoadedFalseReadsHealthy: the KernelLoaded
+// Condition is written only from events2 resource frames, so a write
+// lost when a downed replica came back leaves it False while the
+// observer's resync keeps reporting the replica UpToDate and connected.
+// That replica is up, and `r l --faulty` must not list it as Unknown.
+func TestGroupAStaleKernelLoadedFalseReadsHealthy(t *testing.T) {
+	stack := harness.StartStack(t)
+	harness.SeedThreeNodeCluster(t, stack)
+
+	ctx := context.Background()
+
+	const rdName = "rd-kernel-stale"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec:       blockstoriov1alpha1.ResourceDefinitionSpec{ResourceGroupName: harness.FixtureDefaultRG},
+	}
+
+	err := stack.Env.Client.Create(ctx, rd)
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	cli := &harness.CLI{URL: stack.RestURL}
+	cli.Run(t, "volume-definition", "create", rdName, "10M")
+
+	peers := map[string]string{harness.NodeWorker1: harness.NodeWorker2, harness.NodeWorker2: harness.NodeWorker1}
+	for node := range peers {
+		res := &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: rdName + "." + node},
+			Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: rdName, NodeName: node},
+		}
+
+		err = stack.Env.Client.Create(ctx, res)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("seed Resource on %s: %v", node, err)
+		}
+	}
+
+	for node, peer := range peers {
+		reportHealthySecondary(t, stack, rdName+"."+node, peer)
+	}
+
+	markKernelLoadedFalse(t, stack, rdName+"."+harness.NodeWorker1)
+
+	table := faultyTable(t, stack, rdName)
+	if strings.Contains(table, harness.NodeWorker1) {
+		t.Errorf("`r l --faulty` lists a replica still reported UpToDate and connected:\n%s", table)
+	}
+}
+
+// markKernelLoadedFalse sets KernelLoaded=False on a replica and leaves
+// the rest of its status as reported.
+func markKernelLoadedFalse(t *testing.T, stack *harness.Stack, name string) {
+	t.Helper()
+
+	harness.Eventually(t, 10*time.Second, func() bool {
+		var res blockstoriov1alpha1.Resource
+
+		err := stack.Env.Client.Get(context.Background(), types.NamespacedName{Name: name}, &res)
+		if err != nil {
+			return false
+		}
+
+		meta.SetStatusCondition(&res.Status.Conditions, metav1.Condition{
+			Type:   blockstoriov1alpha1.ConditionKernelLoaded,
+			Status: metav1.ConditionFalse,
+			Reason: "KernelSlotDestroyed",
+		})
+
+		return stack.Env.Client.Status().Update(context.Background(), &res) == nil
+	}, "mark KernelLoaded False on "+name)
 }
 
 // reportKernelResourceDestroyed writes what the satellite's observer
