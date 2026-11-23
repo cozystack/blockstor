@@ -113,7 +113,9 @@ func TestSatelliteTurnsEachDRBDWorkaroundOff(t *testing.T) {
 func TestSatelliteRefusesBadWorkaroundFlags(t *testing.T) {
 	t.Parallel()
 
-	for _, arg := range []string{"--drbd-workarounds-interval=-1s", "--drbd-workaround-stalled-resync-passes=0",
+	for _, arg := range []string{
+		"--drbd-workarounds-interval=-1s",
+		"--drbd-workaround-stalled-resync-passes=0",
 		"--drbd-workaround-stalled-resync-min-rate=0",
 	} {
 		_, err := parseTestFlags("--node-name=n1", arg)

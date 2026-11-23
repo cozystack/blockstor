@@ -538,6 +538,24 @@ func (w *DRBDWorkaroundsRunnable) now() time.Time {
 	return time.Now()
 }
 
+// progress is dep as seen on this pass, with the stalled passes in a row
+// counted on from prev when seen.
+func (w *DRBDWorkaroundsRunnable) progress(prev *resyncProgress, seen bool, dep drbd.ResyncDependency) resyncProgress {
+	progress := resyncProgress{ResyncDependency: dep, At: w.now(), PausedTried: prev.PausedTried}
+
+	// The kernel zeroes received on a reconnect (drbd_nl.c), so a drop
+	// means the link to the active peer is a new one: count afresh.
+	if !seen || prev.Active != dep.Active || prev.Volume != dep.Volume || dep.Received < prev.Received {
+		return progress
+	}
+
+	if prev.stalled(&dep, progress.At.Sub(prev.At), w.Config.stalledResyncMinRate()) {
+		progress.Passes = prev.Passes + 1
+	}
+
+	return progress
+}
+
 // checkStalledResync acts on a resync of res that stalled on
 // StalledResyncPasses passes in a row.
 func (w *DRBDWorkaroundsRunnable) checkStalledResync(
@@ -555,18 +573,7 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 		return
 	}
 
-	// The kernel zeroes received on a reconnect (drbd_nl.c), so a drop
-	// means the link to the active peer is a new one: count afresh.
-	progress := resyncProgress{ResyncDependency: dep, At: w.now(), PausedTried: prev.PausedTried}
-	if seen && prev.Active == dep.Active && prev.Volume == dep.Volume && dep.Received >= prev.Received {
-		progress.Passes = prev.Passes
-		if prev.stalled(&dep, progress.At.Sub(prev.At), w.Config.stalledResyncMinRate()) {
-			progress.Passes++
-		} else {
-			progress.Passes = 0
-		}
-	}
-
+	progress := w.progress(&prev, seen, dep)
 	if progress.Passes < w.Config.StalledResyncPasses {
 		stalls[res.Name] = progress
 
