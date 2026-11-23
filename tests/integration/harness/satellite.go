@@ -349,10 +349,13 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 }
 
 // missingVolumes answers the replica's volumes with one entry per volume
-// definition, as the satellite reports them after its first apply pass:
-// its storage pool, the device path of the DRBD minor and the disk state,
-// Diskless on a replica without a disk. The second result says whether
-// the replica lacked one of them.
+// definition, as the satellite reports them: its observer first reports
+// the volume with its storage pool and disk state, Diskless on a replica
+// without a disk, and the apply pass after it stamps the device path of
+// the DRBD minor, on a diskless replica as on a diskful one. Each tick
+// takes one of those steps, so a reader sees the volume without a path
+// in between, as it does on a real node. The second result says whether
+// the replica's volumes changed.
 func (s *Satellite) missingVolumes(
 	ctx context.Context, resource *blockstoriov1alpha1.Resource, want string,
 ) ([]blockstoriov1alpha1.ResourceVolumeStatus, bool) {
@@ -371,34 +374,36 @@ func (s *Satellite) missingVolumes(
 		return resource.Status.Volumes, false
 	}
 
-	volumes := resource.Status.Volumes
+	volumes := slices.Clone(resource.Status.Volumes)
 	missing := false
 
 	diskState := volumeDiskState(resource, want)
 
 	for _, vd := range rd.Spec.VolumeDefinitions {
-		if slices.ContainsFunc(volumes, func(v blockstoriov1alpha1.ResourceVolumeStatus) bool {
+		idx := slices.IndexFunc(volumes, func(v blockstoriov1alpha1.ResourceVolumeStatus) bool {
 			return v.VolumeNumber == vd.VolumeNumber
-		}) {
+		})
+
+		if idx < 0 {
+			pool := resource.Spec.StoragePool
+			if pool == "" {
+				pool = resource.Spec.Props["StorPoolName"]
+			}
+
+			volumes = append(volumes, blockstoriov1alpha1.ResourceVolumeStatus{
+				VolumeNumber: vd.VolumeNumber,
+				StoragePool:  pool,
+				DiskState:    diskState,
+			})
+			missing = true
+
 			continue
 		}
 
-		pool := resource.Spec.StoragePool
-		if pool == "" {
-			pool = resource.Spec.Props["StorPoolName"]
+		if volumes[idx].DevicePath == "" && vd.DRBDMinor != nil {
+			volumes[idx].DevicePath = fmt.Sprintf("/dev/drbd%d", *vd.DRBDMinor)
+			missing = true
 		}
-
-		vol := blockstoriov1alpha1.ResourceVolumeStatus{
-			VolumeNumber: vd.VolumeNumber,
-			StoragePool:  pool,
-			DiskState:    diskState,
-		}
-		if vd.DRBDMinor != nil {
-			vol.DevicePath = fmt.Sprintf("/dev/drbd%d", *vd.DRBDMinor)
-		}
-
-		volumes = append(slices.Clone(volumes), vol)
-		missing = true
 	}
 
 	return volumes, missing
