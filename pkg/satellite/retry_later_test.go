@@ -58,7 +58,7 @@ func TestStuckSlotGraceAsksForARetry(t *testing.T) {
 	r, _ := newKernelCleanupReconciler(t)
 
 	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1",
-		[]string{"worker-1", "worker-2"},
+		PeerExpectation{PeerNames: []string{"worker-1", "worker-2"}},
 		[]int32{0},
 		map[int32]string{0: "/dev/zvol/pool/pvc-1"})
 	if err != nil {
@@ -178,7 +178,7 @@ func TestFailedUnexpectedPeerTeardownAsksForARetry(t *testing.T) {
 	r, fx := newKernelCleanupReconciler(t)
 	fx.Expect("drbdadm del-peer worker-2:pvc-1", storage.FakeResponse{Err: storage.FakeExitError{Code: 10}})
 
-	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1", []string{"worker-1"}, []int32{0}, nil)
+	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1", PeerExpectation{PeerNames: []string{"worker-1"}}, []int32{0}, nil)
 	if err == nil {
 		t.Fatal("PruneStaleKernelSlots hid the failed del-peer")
 	}

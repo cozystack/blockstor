@@ -50,10 +50,13 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/satellite"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // kubeInternalNICName is the NetInterface name the dispatcher prefers
@@ -156,51 +159,19 @@ type ResourceReconciler struct {
 // Finalizer-aware: stamps `SatelliteResourceFinalizer` on
 // every live Resource so kube-apiserver waits for our tear-down
 // before allowing the object to disappear.
+//
+// Every retry (a failed apply, an error, a wait on the allocator, work
+// a pass put off) is pinned to normal priority: controller-runtime
+// otherwise keeps the priority the item was dequeued with, so a replica
+// first seen in the informer's initial list would be retried at low
+// priority, behind every other replica of the start-up.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithValues("resource", req.Name)
-
-	var res blockstoriov1alpha1.Resource
-
-	err := r.Get(ctx, req.NamespacedName, &res)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-
-		return ctrl.Result{}, errors.Wrap(err, "get Resource")
+	result, err := r.reconcileResource(ctx, req)
+	if result.Priority == nil {
+		result.Priority = normalPriority()
 	}
 
-	if !naming.Same(res.Spec.NodeName, r.Config.NodeName) {
-		// Predicate should have filtered this out — defensive
-		// check in case the watch cache is mid-resync.
-		return ctrl.Result{}, nil
-	}
-
-	if !res.DeletionTimestamp.IsZero() {
-		return r.handleDelete(ctx, &res)
-	}
-
-	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
-		res.Finalizers = append(res.Finalizers, SatelliteResourceFinalizer)
-
-		err := r.Update(ctx, &res)
-		if err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "add finalizer")
-		}
-
-		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
-	}
-
-	// Bug 40: REST shim sets Spec.ToggleDiskCancel when the operator
-	// passes `?cancel=true` to PUT toggle-disk. Honour it before
-	// the normal apply path so a cancel issued mid-conversion
-	// unwinds partial state instead of racing the same apply that
-	// caused the cancel.
-	if res.Spec.ToggleDiskCancel {
-		return r.handleToggleDiskCancel(ctx, &res, logger)
-	}
-
-	return r.runApply(ctx, &res, logger)
+	return result, err
 }
 
 // applyFailureRequeue is the backoff between satellite Apply
@@ -220,6 +191,16 @@ const applyFailureRequeue = 5 * time.Second
 // faster than the user-visible auto-place latency budget while
 // still giving the apiserver time to commit the Status patch.
 const peerAllocationRequeue = 2 * time.Second
+
+// normalPriority is the queue priority of a real event, and of every
+// retry of a pass that did not converge: an item first queued from the
+// informer's initial list carries handler.LowPriority, and
+// controller-runtime keeps the priority it was dequeued with.
+func normalPriority() *int {
+	priority := 0
+
+	return &priority
+}
 
 // resolveDeleteStoragePool picks the pool name the
 // satellite's DeleteVolume should route through. Phase 10.3
@@ -334,6 +315,55 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// reconcileResource is the body of Reconcile, which only settles the
+// queue priority of the result.
+func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("resource", req.Name)
+
+	var res blockstoriov1alpha1.Resource
+
+	err := r.Get(ctx, req.NamespacedName, &res)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, errors.Wrap(err, "get Resource")
+	}
+
+	if !naming.Same(res.Spec.NodeName, r.Config.NodeName) {
+		// Predicate should have filtered this out — defensive
+		// check in case the watch cache is mid-resync.
+		return ctrl.Result{}, nil
+	}
+
+	if !res.DeletionTimestamp.IsZero() {
+		return r.handleDelete(ctx, &res)
+	}
+
+	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
+		res.Finalizers = append(res.Finalizers, SatelliteResourceFinalizer)
+
+		err := r.Update(ctx, &res)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "add finalizer")
+		}
+
+		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
+	}
+
+	// Bug 40: REST shim sets Spec.ToggleDiskCancel when the operator
+	// passes `?cancel=true` to PUT toggle-disk. Honour it before
+	// the normal apply path so a cancel issued mid-conversion
+	// unwinds partial state instead of racing the same apply that
+	// caused the cancel.
+	if res.Spec.ToggleDiskCancel {
+		return r.handleToggleDiskCancel(ctx, &res, logger)
+	}
+
+	return r.runApply(ctx, &res, logger)
 }
 
 // primaryWatchPredicate filters Resource events on the primary For
@@ -634,9 +664,15 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// committed peer state. A stamp that failed is retried the same
 	// way: no periodic pass comes back for a device path the CSI
 	// node is waiting on, or for the volume-numbers record a later
-	// delete needs.
+	// delete needs. An apply whose only failures are refusals an
+	// operator must act on waits failureRequeue's longer interval.
 	if anyFailed || stampFailed {
-		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
+		requeue := applyFailureRequeue
+		if anyFailed && !stampFailed {
+			requeue = failureRequeue(results)
+		}
+
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	// A converged replica waits for its next event, the way LINSTOR's
@@ -686,7 +722,7 @@ func (r *ResourceReconciler) prepareDRBDApply(
 	pruneErr := r.Config.Apply.PruneStaleKernelSlots(
 		ctx,
 		rd.Name,
-		expectedPeerNamesFor(res, peers),
+		peerExpectationFor(res, peers),
 		volNumsOf(rd),
 		nil, // devices unknown at this layer; forget-peer skipped per-vol
 	)
@@ -694,16 +730,61 @@ func (r *ResourceReconciler) prepareDRBDApply(
 		logger.Error(pruneErr, "PruneStaleKernelSlots failed; continuing to allocation gate")
 	}
 
-	return r.waitForControllerAllocation(ctx, res, peers, logger)
+	waitResult, ok := r.waitForControllerAllocation(ctx, res, peers, logger)
+	if !ok {
+		return waitResult, false
+	}
+
+	return r.holdForAdoptedPeers(ctx, res, rd, peers, logger)
+}
+
+// holdForAdoptedPeers keeps the first render of an adopted resource
+// back while its kernel slot is connected to a peer whose Resource has
+// not been observed. That render's `drbdadm adjust` would delete the
+// connection, so a peer applied a moment after this one (a bulk
+// adoption delivers the Resources of a definition in name order) would
+// be disconnected and resynced. The hold is bounded: once it runs out
+// the render goes ahead without the peer and a Warning Event says so,
+// rather than leaving the replica unapplied for good.
+func (r *ResourceReconciler) holdForAdoptedPeers(
+	ctx context.Context,
+	res *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	peers []blockstoriov1alpha1.Resource,
+	logger logr.Logger,
+) (ctrl.Result, bool) {
+	hold := r.Config.Apply.AdoptedPeersWithoutResource(ctx, rd.Name, expectedPeerNamesFor(res, peers), time.Now())
+	if len(hold.Missing) == 0 {
+		return ctrl.Result{}, true
+	}
+
+	if hold.HoldsRender() {
+		logger.Info("holding the first render of an adopted resource until its kernel peers have Resources",
+			"missingPeers", hold.Missing, "since", hold.Since)
+
+		return ctrl.Result{RequeueAfter: peerAllocationRequeue}, false
+	}
+
+	logger.Info("adopted kernel peers still have no Resource; rendering without them",
+		"missingPeers", hold.Missing, "since", hold.Since)
+
+	if r.Config.Recorder != nil {
+		r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, "AdoptedPeerWithoutResource", "Apply",
+			"kernel peers %v have no Resource since %s; rendering without them disconnects them",
+			hold.Missing, hold.Since.Format(time.RFC3339))
+	}
+
+	return ctrl.Result{}, true
 }
 
 // recordPerResourceFailures logs each per-resource Apply failure and
 // returns whether any of the results came back not-Ok. Extracted from
 // runApply so the orchestration stays under the funlen budget.
 //
-// A LUKS layer that refused to format a device holding data also gets a
-// Warning Event on the Resource: the volume never comes up, and an Info
-// line in this log is not where an operator looks for why.
+// A refusal an operator must act on, the LUKS layer's or drbdmeta's over
+// data on the lower disk, also gets a Warning Event on the Resource: the
+// volume never comes up, and an Info line in this log is not where an
+// operator looks for why.
 func (r *ResourceReconciler) recordPerResourceFailures(
 	res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult, logger logr.Logger,
 ) bool {
@@ -722,7 +803,7 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 			continue
 		}
 
-		for _, refusal := range luksRefusals() {
+		for _, refusal := range applyRefusals() {
 			if strings.Contains(result.GetMessage(), refusal.err.Error()) {
 				r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, refusal.reason, "Apply",
 					"%s: %s", refusal.what, result.GetMessage())
@@ -739,18 +820,83 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 // a device that carries a signature.
 const deviceHoldsDataReason = "LUKSDeviceHoldsData"
 
-// luksRefusal is a LUKS layer refusal an operator must act on, and the
-// Warning Event reason it is reported under.
-type luksRefusal struct {
+// applyRefusal is a refusal of the apply an operator must act on, from the
+// LUKS layer or from drbdmeta, and the Warning Event reason it is reported
+// under.
+type applyRefusal struct {
 	err          error
 	reason, what string
+}
+
+// createMDRefusedReason is the Event reason for metadata drbdmeta refused
+// to write over the data on a lower disk.
+const createMDRefusedReason = "CreateMdRefused"
+
+// uncleanMetadataRefusedReason is the Event reason for metadata under an
+// unapplied activity log that the satellite would neither keep nor
+// re-create: no GI is recorded for the volume, and its superblock does
+// not carry this replica's node id.
+const uncleanMetadataRefusedReason = "UncleanMetadataRefused"
+
+// applyRefusals lists every refusal reported as a Warning Event.
+func applyRefusals() []applyRefusal {
+	return append(luksRefusals(), metadataRefusals()...)
+}
+
+// metadataRefusals are the refusals to write DRBD metadata. Each one is
+// answered the same way on every attempt until an operator acts on the
+// lower disk.
+func metadataRefusals() []applyRefusal {
+	return []applyRefusal{
+		{
+			drbd.ErrCreateMDRefused, createMDRefusedReason,
+			"drbdmeta refused to create metadata over the data on the lower disk",
+		},
+		{
+			drbd.ErrUncleanMetadataUnrecorded, uncleanMetadataRefusedReason,
+			"the volume's metadata was left with an unapplied activity log, no GI is recorded for it " +
+				"and its superblock does not carry this replica's node id",
+		},
+	}
+}
+
+// refusedApplyRequeue is the retry interval of an apply whose only failures
+// are metadata refusals. drbdmeta refuses the same lower disk the same way
+// every time, and so does the satellite a volume it has no record of, so
+// the 5 second retry of applyFailureRequeue only loops: it repeats the
+// command, the log line and the Event, and holds the satellite's work
+// queue, for nothing that can change by itself. A change to the Resource
+// or its definition still reconciles at once.
+const refusedApplyRequeue = 5 * time.Minute
+
+// failureRequeue picks the retry interval of an apply that failed.
+func failureRequeue(results []*intent.ResourceApplyResult) time.Duration {
+	for _, result := range results {
+		if !result.GetOk() && !isMetadataRefusal(result.GetMessage()) {
+			return applyFailureRequeue
+		}
+	}
+
+	return refusedApplyRequeue
+}
+
+// isMetadataRefusal reports whether an apply message carries one of the
+// metadataRefusals.
+func isMetadataRefusal(message string) bool {
+	for _, refusal := range metadataRefusals() {
+		if strings.Contains(message, refusal.err.Error()) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // luksRefusals lists the refusals the LUKS layer reports through the apply
 // message. Each leaves the volume down, and an Info line in this log is
 // not where an operator looks for why.
-func luksRefusals() []luksRefusal {
-	return []luksRefusal{
+func luksRefusals() []applyRefusal {
+	return []applyRefusal{
 		{luks.ErrDeviceHoldsData, deviceHoldsDataReason, "the LUKS layer refused to format a device that already holds data"},
 		{luks.ErrLUKSKeyMissing, "LUKSKeyMissing", "the device has a LUKS header but the replica carries no password for it"},
 		{luks.ErrLUKSKeyMismatch, "LUKSKeyMismatch", "the replica's password does not open the device's LUKS header"},
@@ -1331,24 +1477,17 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 // what produces Bug 80's stuck-Inconsistent outcome. Falls back to
 // the cached client when APIReader is nil (unit-test path).
 func (r *ResourceReconciler) listPeerResources(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]blockstoriov1alpha1.Resource, error) {
-	reader := r.peerReader()
-
 	var resList blockstoriov1alpha1.ResourceList
 
-	err := reader.List(ctx, &resList)
+	// Only the definition's replicas: every pass of every replica on the
+	// node runs this, and reading the whole cluster here took the
+	// satellite's CPU (storek8s.ReplicasOf).
+	err := storek8s.ReplicasOf(ctx, r.peerReader(), r.Client, target.Spec.ResourceDefinitionName, &resList)
 	if err != nil {
 		return nil, errors.Wrap(err, "list Resources for peer set")
 	}
 
-	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
-
-	for i := range resList.Items {
-		if naming.Same(resList.Items[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
-			peers = append(peers, resList.Items[i])
-		}
-	}
-
-	return peers, nil
+	return resList.Items, nil
 }
 
 // peerReader returns the APIReader (uncached) when the manager
@@ -1415,6 +1554,25 @@ func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blocksto
 	return out
 }
 
+// peerExpectationFor is what the prune may rely on about the RD's
+// peers: the observed peer names, the node-ids the observed replicas
+// hold, and whether they pass the same allocation gate the apply path
+// waits on. peers comes from listPeerResources and includes the target.
+func peerExpectationFor(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) satellite.PeerExpectation {
+	expect := satellite.PeerExpectation{
+		PeerNames: expectedPeerNamesFor(target, peers),
+		Allocated: allocationComplete(target, peers),
+	}
+
+	for i := range peers {
+		if id, ok := dispatcher.AllocatedNodeID(&peers[i]); ok {
+			expect.AllocatedNodeIDs = append(expect.AllocatedNodeIDs, id)
+		}
+	}
+
+	return expect
+}
+
 // volNumsOf extracts the volume-number set from
 // `rd.Spec.VolumeDefinitions`. The Bug 342 v3 Pass-3 stuck-slot
 // probe needs the set to query the kernel's peer-device
@@ -1429,6 +1587,22 @@ func volNumsOf(rd *blockstoriov1alpha1.ResourceDefinition) []int32 {
 	}
 
 	return out
+}
+
+// targetAllocated reports that the controller has stamped the
+// target's own DRBD node-id, port and minor on Status, the half of
+// the allocation gate that reads only the target.
+func targetAllocated(res *blockstoriov1alpha1.Resource) bool {
+	return res.Status.DRBDNodeID != nil && res.Status.DRBDPort != nil && res.Status.DRBDMinor != nil
+}
+
+// allocationComplete is the predicate waitForControllerAllocation
+// waits on: the target's Status allocation and a node-id on every
+// diskful replica. The gate itself also re-reads the target uncached
+// before it gives up; callers of this predicate take the view they
+// hold, which can only make it report false too early, never true.
+func allocationComplete(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) bool {
+	return targetAllocated(target) && dispatcher.DiskfulPeersAllocated(target, peers)
 }
 
 // waitForControllerAllocation gates the apply path on the
@@ -1475,7 +1649,7 @@ func volNumsOf(rd *blockstoriov1alpha1.ResourceDefinition) []int32 {
 // so the caller's downstream `dispatcher.BuildDesired` sees the
 // fresh allocation in the same reconcile.
 func (r *ResourceReconciler) waitForControllerAllocation(ctx context.Context, res *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, bool) {
-	if res.Status.DRBDNodeID == nil || res.Status.DRBDPort == nil || res.Status.DRBDMinor == nil {
+	if !targetAllocated(res) {
 		// APIReader fall-through (Bug 289): when the cached view
 		// reports nil DRBD-IDs, the controller may have already
 		// stamped them — re-fetch uncached before declaring the
