@@ -215,6 +215,11 @@ func (t *Thin) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error 
 	return nil
 }
 
+// HasSnapshot reports whether this pool holds the snapshot LV.
+func (t *Thin) HasSnapshot(ctx context.Context, snap storage.Snapshot) (bool, error) {
+	return t.lvExists(ctx, snapshotLVName(snap)), nil
+}
+
 // DeleteSnapshot mirrors DeleteVolume on the snapshot LV. Missing
 // snapshot LV → no-op so the satellite's reconcile loop can strip
 // the Snapshot CRD's finalizer instead of looping forever on a

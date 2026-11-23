@@ -4,13 +4,17 @@
 #
 # Tests Phase 8.3 "auto-diskful" promotion.
 # Setup:
-#   - 2 diskful replicas of an RD on workers 1+2
+#   - RG with place count 2, RD in that RG
+#   - 2 diskful replicas of the RD on workers 1+2
 #   - 1 DISKLESS replica on worker-3 (cluster-wide attachable pattern)
 # Steps:
 #   1. promote $N3 to Primary so Status.InUse=true on the DISKLESS replica
-#   2. ResourceReconciler sees: InUse + DISKLESS + non-tiebreaker + pool available
-#   3. removes DISKLESS flag, stamps StorPoolName onto Spec.Props
-#   4. satellite reconciler picks up the change, creates the LV / drbdadm attach
+#   2. the place count is met, so $N3 must stay DISKLESS
+#   3. raise the RG place count to 3: the volume now lacks a copy, so
+#      ResourceReconciler sees InUse + DISKLESS + non-tiebreaker + pool
+#      available + diskful deficit
+#   4. removes DISKLESS flag, stamps StorPoolName onto Spec.Props
+#   5. satellite reconciler picks up the change, creates the LV / drbdadm attach
 
 set -euo pipefail
 
@@ -24,11 +28,22 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 3
 
 RD=e2e-auto-diskful
+RG=e2e-auto-diskful-rg
 N1=$WORKER_1
 N2=$WORKER_2
 N3=$WORKER_3
 
-trap 'delete_rd "$RD"' EXIT
+trap 'delete_rd "$RD"; kubectl delete resourcegroups.blockstor.org "$RG" --ignore-not-found --timeout=10s >/dev/null 2>&1 || true' EXIT
+
+echo ">> apply RG with place count 2"
+cat <<EOF | kubectl apply -f -
+apiVersion: blockstor.org/v1alpha1
+kind: ResourceGroup
+metadata: {name: ${RG}}
+spec:
+  selectFilter:
+    placeCount: 2
+EOF
 
 echo ">> apply 2 diskful + 1 DISKLESS"
 # Disable the auto-tiebreaker — this test explicitly creates its
@@ -40,6 +55,7 @@ apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
+  resourceGroupName: ${RG}
   props:
     DrbdOptions/AutoAddQuorumTiebreaker: "false"
   volumeDefinitions:
@@ -82,6 +98,22 @@ wait_connection_state "$RD" "$N3" "$N2" "Connected|Established"
 
 # Drive InUse on $N3 by promoting it.
 on_node "$N3" drbdadm primary "$RD"
+
+echo ">> place count met: $N3 must stay DISKLESS"
+sleep 20
+flags=$(kubectl get "resources.blockstor.org/${RD}.${N3}" \
+    -o jsonpath='{.spec.flags}' 2>/dev/null || true)
+if [[ "$flags" != *"DISKLESS"* ]]; then
+    echo "FAIL: $N3 was promoted although the place count is met (flags: $flags)"
+    exit 1
+fi
+
+echo ">> raise place count to 3 so the volume lacks a diskful copy"
+kubectl patch resourcegroups.blockstor.org "$RG" --type merge \
+    -p '{"spec":{"selectFilter":{"placeCount":3}}}'
+# Touch the replica so the reconciler runs again right away.
+kubectl annotate "resources.blockstor.org/${RD}.${N3}" \
+    e2e-auto-diskful-touch="$(date +%s)" --overwrite
 
 echo ">> wait 90s for auto-diskful promotion"
 deadline=$(( $(date +%s) + 90 ))

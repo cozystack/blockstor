@@ -171,14 +171,15 @@ func (r *Reconciler) giHistoryPath(rdName string) string {
 	return filepath.Join(r.cfg.StateDir, rdName+giHistorySuffix)
 }
 
-// readGIHistory reads the file. A missing one is an empty history, which
-// leaves the volume to be initialised as before; one that cannot be read is
-// an error, never an empty history, since an empty one is what lets the
-// repair re-initialise a volume that has a record.
 // errDamagedGIRecord reports a generation record line this code did not
 // write.
 var errDamagedGIRecord = errors.New("damaged line")
 
+// readGIHistory reads the file. A missing one is an empty history, which
+// leaves an unclean volume to the node id its superblock was written for:
+// kept under this replica's, refused under another. One that cannot be
+// read is an error, never an empty history, since an empty one skips the
+// check that the superblock names a GI this replica was seen with.
 func (r *Reconciler) readGIHistory(rdName string) (map[int32][]string, error) {
 	out := map[int32][]string{}
 
