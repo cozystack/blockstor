@@ -67,13 +67,17 @@ type SnapshotReconciler struct {
 	client.Client
 
 	Config Config
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // Reconcile runs one pass and retries one that lost an
 // optimistic-concurrency race instead of reporting it as an error;
-// see conflict.Reconcile.
+// see conflict.Retrier.
 func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	return conflict.Reconcile(ctx, req, r.ReconcilePass) //nolint:wrapcheck // the pass's own error, already wrapped
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass) //nolint:wrapcheck // the pass's own error, already wrapped
 }
 
 // ReconcilePass handles the satellite-side snapshot lifecycle:

@@ -129,6 +129,10 @@ type ResourceReconciler struct {
 	// (Deployment replicas=1 + leader election in HA) is the
 	// supported topology, so an in-process mutex is sufficient.
 	clusterAllocMu sync.Mutex
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
@@ -139,9 +143,9 @@ type ResourceReconciler struct {
 
 // Reconcile runs one pass and retries one that lost an
 // optimistic-concurrency race instead of reporting it as an error;
-// see conflict.Reconcile.
+// see conflict.Retrier.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	return conflict.Reconcile(ctx, req, r.ReconcilePass)
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
 }
 
 // ReconcilePass reads a Resource and pushes the matching DesiredResource

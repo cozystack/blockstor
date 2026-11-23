@@ -32,7 +32,7 @@ import (
 // stepFailed reports a failed step of an RD pass. A NotFound from a
 // definition that has since been deleted is the pass racing that
 // delete: there is nothing left to do for it, so it ends the pass
-// quietly. A conflict goes back unlogged for conflict.Reconcile to
+// quietly. A conflict goes back unlogged for conflict.Retrier to
 // retry. Anything else is a real failure and is logged as one.
 func (r *ResourceDefinitionReconciler) stepFailed(
 	ctx context.Context,

@@ -27,6 +27,7 @@ import (
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -67,7 +68,9 @@ func run(t *testing.T, result reconcile.Result, err error) (logLevels, reconcile
 
 	ctx := logf.IntoContext(context.Background(), capture(&levels))
 
-	got, gotErr := conflict.Reconcile(ctx, reconcile.Request{}, func(context.Context, reconcile.Request) (reconcile.Result, error) {
+	var retrier conflict.Retrier
+
+	got, gotErr := retrier.Reconcile(ctx, reconcile.Request{}, func(context.Context, reconcile.Request) (reconcile.Result, error) {
 		return result, err
 	})
 
@@ -129,5 +132,86 @@ func TestSuccessKeepsItsResult(t *testing.T) {
 
 	if len(levels.info) != 0 || levels.errors != 0 {
 		t.Errorf("logged %v / %d errors for a clean pass", levels.info, levels.errors)
+	}
+}
+
+// passOn returns a pass that fails with err, and the request for the
+// object name.
+func passOn(name string, err error) (reconcile.Request, reconcile.Func) {
+	return reconcile.Request{NamespacedName: types.NamespacedName{Name: name}},
+		func(context.Context, reconcile.Request) (reconcile.Result, error) { return reconcile.Result{}, err }
+}
+
+func newConflict(name string) error {
+	return apierrors.NewConflict(schema.GroupResource{Group: "blockstor.org", Resource: "resources"}, name, errModified)
+}
+
+// Two writers that keep overwriting the same object would otherwise
+// retry silently forever: the error is gone from the log and from the
+// reconcile-error metric. A run of LoudAfter conflicts on one object is
+// logged at the default level, and earlier ones are not.
+func TestLongConflictRunIsLogged(t *testing.T) {
+	t.Parallel()
+
+	var (
+		levels  logLevels
+		retrier conflict.Retrier
+	)
+
+	ctx := logf.IntoContext(context.Background(), capture(&levels))
+	req, pass := passOn("pvc-c.n1", newConflict("pvc-c.n1"))
+
+	for range conflict.LoudAfter - 1 {
+		if _, err := retrier.Reconcile(ctx, req, pass); err != nil {
+			t.Fatalf("error %v, want none", err)
+		}
+	}
+
+	for i, level := range levels.info {
+		if level < 1 {
+			t.Fatalf("conflict %d logged at V(%d), want V(1) before %d in a row", i+1, level, conflict.LoudAfter)
+		}
+	}
+
+	if _, err := retrier.Reconcile(ctx, req, pass); err != nil {
+		t.Fatalf("error %v, want none", err)
+	}
+
+	if last := levels.info[len(levels.info)-1]; last != 0 {
+		t.Errorf("conflict %d logged at V(%d), want the default level", conflict.LoudAfter, last)
+	}
+}
+
+// The run is per object and ends with any pass that did not conflict,
+// so churn spread over many objects, or a conflict now and then on one,
+// stays below the default level.
+func TestConflictRunResets(t *testing.T) {
+	t.Parallel()
+
+	var (
+		levels  logLevels
+		retrier conflict.Retrier
+	)
+
+	ctx := logf.IntoContext(context.Background(), capture(&levels))
+	req, conflicted := passOn("pvc-a.n1", newConflict("pvc-a.n1"))
+	_, clean := passOn("pvc-a.n1", nil)
+	other, otherConflicted := passOn("pvc-b.n1", newConflict("pvc-b.n1"))
+
+	for range conflict.LoudAfter - 1 {
+		_, _ = retrier.Reconcile(ctx, req, conflicted)
+		_, _ = retrier.Reconcile(ctx, other, otherConflicted)
+	}
+
+	_, _ = retrier.Reconcile(ctx, req, clean)
+
+	for range conflict.LoudAfter - 1 {
+		_, _ = retrier.Reconcile(ctx, req, conflicted)
+	}
+
+	for i, level := range levels.info {
+		if level < 1 {
+			t.Fatalf("line %d logged at V(%d), want every line at V(1)", i+1, level)
+		}
 	}
 }

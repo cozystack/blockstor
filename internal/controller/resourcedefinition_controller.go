@@ -93,6 +93,10 @@ type ResourceDefinitionReconciler struct {
 	// layer stack because it already held data. Nil in tests that do
 	// not assert on Events.
 	Recorder events.EventRecorder
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
@@ -102,9 +106,9 @@ type ResourceDefinitionReconciler struct {
 
 // Reconcile runs one pass and retries one that lost an
 // optimistic-concurrency race instead of reporting it as an error;
-// see conflict.Reconcile.
+// see conflict.Retrier.
 func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	return conflict.Reconcile(ctx, req, r.ReconcilePass)
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
 }
 
 // ReconcilePass ensures the tiebreaker for a 2-replica RD. Idempotent:
