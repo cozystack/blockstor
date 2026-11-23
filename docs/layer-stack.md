@@ -112,6 +112,7 @@ The design is [encryption-keys.md](encryption-keys.md).
 - A passphrase is never read from a property. The REST API answers 400 to any write that would store `DrbdOptions/EncryptPassphrase`, `DrbdOptions/Encryption/passphrase` or `LuksPassphrase` (any case, on any object), and so does the bundled CLI's `set-property`: a property sits in plaintext on its CR. Deleting such a property is still allowed. This differs from upstream LINSTOR, where `linstor controller set-property DrbdOptions/EncryptPassphrase` is accepted.
 - New headers use PBKDF2 at its minimum cost: the password is random, and Argon2id would cost seconds and up to a GiB per open after a reboot.
 - Mapper name: `<rd>-<vol>-luks` → `/dev/mapper/<rd>-<vol>-luks`. Stable across reconciles so reopen on satellite restart re-uses it.
+- A replica adopted from LINSTOR can still run on LINSTOR's mapper, `Linstor-Crypt-<rd>_<vol, five digits>`. The satellite keeps it, and points DRBD's disk at it, while `dmsetup table` shows one crypt target over the replica's own device; it never opens a second mapper over a device one already holds, nor closes one under DRBD. Deactivating, toggling to diskless or deleting the replica closes it after DRBD is down, and the next open is under blockstor's name.
 - Volume grow: the satellite runs `cryptsetup resize` on the mapper after the storage layer has resized the underlying LV, before DRBD resizes the replicated device.
 
 ### Upgrading a cluster with LUKS volumes from the single cluster passphrase

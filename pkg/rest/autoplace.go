@@ -122,9 +122,11 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	vdSizes := s.definitionVolumeSizes(r.Context(), rdName)
+
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {
-		out = append(out, wrapResourceWithVolumes(&resList[i]))
+		out = append(out, wrapResourceWithVolumes(&resList[i], vdSizes))
 	}
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys (passphrase,
@@ -148,8 +150,9 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// wrapResourceWithVolumes wraps a Resource into ResourceWithVolumes so
-// the `volumes` JSON key is always present (never `null`). Bug-hunt
+// wrapResourceWithVolumes wraps a Resource into ResourceWithVolumes with
+// a volume for every volume definition (see ensureVolumesForView) and
+// the `volumes` JSON key always present (never `null`). Bug-hunt
 // v0.1.3 Finding 3: handleResourceList / handleResourceGet wrapped via
 // `ResourceWithVolumes{Resource: res}` leaving the outer Volumes nil,
 // which `encoding/json` serialises as `"volumes":null`. Upstream
@@ -158,13 +161,8 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 // unconditionally and crashes on `None.iter`. Mirrors the
 // ensureVolumesForView contract used by /v1/view/resources: a non-nil
 // (possibly empty) slice survives the JSON encode as `[]`.
-func wrapResourceWithVolumes(res *apiv1.Resource) apiv1.ResourceWithVolumes {
-	out := apiv1.ResourceWithVolumes{Resource: *res, Volumes: res.Volumes}
-	if out.Volumes == nil {
-		out.Volumes = []apiv1.Volume{}
-	}
-
-	return out
+func wrapResourceWithVolumes(res *apiv1.Resource, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
+	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, res, vdSizes)}
 }
 
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
@@ -227,7 +225,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// outer `volumes` JSON key serialises as `[]` instead of `null` when
 	// the Resource carries no Volumes; protects python-linstor's
 	// `rsc._rest_data['volumes']` dereference.
-	writeJSON(w, http.StatusOK, wrapResourceWithVolumes(&res))
+	writeJSON(w, http.StatusOK, wrapResourceWithVolumes(&res, s.definitionVolumeSizes(r.Context(), rdName)))
 }
 
 // handleAutoplace selects up to `place_count` nodes that have a storage
@@ -859,12 +857,7 @@ func resolveCloneSourceProviderKind(ctx context.Context, st store.Store, rd *api
 		return ""
 	}
 
-	srcRD, _, ok := strings.Cut(stamp, ":")
-	if !ok || srcRD == "" {
-		return ""
-	}
-
-	return placer.SourceProviderKind(ctx, st, srcRD)
+	return placer.RestoreSourceProviderKind(ctx, st, stamp)
 }
 
 // constrainAutoplaceToSnapshotNodes restricts the filter's
@@ -1485,6 +1478,12 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		}
 	}
 
+	// The replicas are written one at a time, and LINSTOR writes them in
+	// one transaction: without the hold the tiebreaker reconciler sees
+	// the first two of `r c n1 n2 n3` as an even-diskful tie and puts a
+	// witness on n3 before its own create turns it diskful.
+	defer placer.HoldWitness(r.Context(), s.Store, rdName, countDiskfulEnvelopes(envelopes))()
+
 	created := make([]apiv1.Resource, 0, len(envelopes))
 
 	for i := range envelopes {
@@ -1497,6 +1496,21 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	}
 
 	return created, true
+}
+
+// countDiskfulEnvelopes counts the envelopes of a resource create that
+// ask for a diskful replica: neither spelling of the diskless flag.
+func countDiskfulEnvelopes(envelopes []apiv1.ResourceCreate) int {
+	n := 0
+
+	for i := range envelopes {
+		flags := envelopes[i].Resource.Flags
+		if !slices.Contains(flags, apiv1.ResourceFlagDiskless) && !slices.Contains(flags, rscFlagDrbdDiskless) {
+			n++
+		}
+	}
+
+	return n
 }
 
 // createOneResource runs the full per-envelope wire-boundary
@@ -2859,6 +2873,12 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// this apiserver replica reflects it. See
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
+
+	// Drop a witness the delete left without a tie to break before
+	// replying, as upstream does for the shapes where its helper no
+	// longer wants one, so the caller's next listing shows it as going.
+	// See resource_delete_orphan_witness.go.
+	s.reapUnneededWitnesses(r.Context(), rdName)
 
 	// Bug 67: notify surviving sibling Resources of the peer change
 	// so satellite reconcilers re-derive their peer set without the

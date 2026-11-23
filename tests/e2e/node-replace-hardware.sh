@@ -250,9 +250,9 @@ fi
 # ConnectionStatus=OFFLINE. `linstor n lost` is gated by this — it
 # refuses with HTTP 409 ("Node cannot be lost while its satellite is
 # still reporting as ONLINE") as long as the controller believes the
-# satellite is reachable. Budget: 40 s heartbeat grace + 5 s watchdog
+# satellite is reachable. Budget: 50 s heartbeat grace + 5 s watchdog
 # requeue + apiserver/SSA slack on a busy QEMU stand.
-OFFLINE_TIMEOUT=75
+OFFLINE_TIMEOUT=85
 echo ">> wait up to ${OFFLINE_TIMEOUT}s for $WORKER_3 ConnectionStatus=OFFLINE"
 deadline=$(( $(date +%s) + OFFLINE_TIMEOUT ))
 got_offline=0

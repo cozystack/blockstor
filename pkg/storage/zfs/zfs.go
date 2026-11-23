@@ -329,6 +329,11 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return nil
 }
 
+// HasSnapshot reports whether this pool holds the snapshot.
+func (p *Provider) HasSnapshot(ctx context.Context, snap storage.Snapshot) (bool, error) {
+	return p.datasetExists(ctx, p.snapshotDataset(snap)), nil
+}
+
 // DeleteSnapshot removes the snapshot, with upstream LINSTOR's
 // "has dependent clones → rename to deferred-delete marker" fallback.
 //
@@ -902,7 +907,7 @@ func (p *Provider) snapshotDataset(snap storage.Snapshot) string {
 }
 
 const (
-	stateNotProvisioned = "NOT_PROVISIONED"
+	stateNotProvisioned = storage.StateNotProvisioned
 	mibPerKib           = 1024
 	bytesPerKib         = 1024
 	zfsListCols         = 3
