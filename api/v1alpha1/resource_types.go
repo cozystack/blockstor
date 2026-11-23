@@ -43,6 +43,23 @@ import (
 // Condition is absent.
 const ConditionMetadataCreated = "MetadataCreated"
 
+// Reasons of a true ConditionMetadataCreated. They tell a replica whose
+// metadata this satellite created apart from one whose metadata was
+// already on the volume, such as a replica adopted from LINSTOR, where
+// create-md never ran.
+const (
+	// MetadataCreatedReasonCreateMd: `drbdadm create-md` ran on at
+	// least one volume of the replica.
+	MetadataCreatedReasonCreateMd = "CreateMdSucceeded"
+
+	// MetadataCreatedReasonFound: `drbdadm dump-md` found metadata on
+	// every volume, so create-md was not run on that pass. The startup
+	// backfill also stamps it on a replica whose create-md stamp failed,
+	// since all it can see is that metadata is there; the satellite log
+	// of the create-md pass records which it was.
+	MetadataCreatedReasonFound = "MetadataFound"
+)
+
 // ConditionFilesystemFormatted is a Status Condition stamped by the
 // satellite after the RG-driven auto-mkfs path (scenario 9.W14)
 // reports every diskful volume of this Resource as carrying a
@@ -506,6 +523,27 @@ type PeerVolumeStatus struct {
 	// --statistics` peer-device frames.
 	// +optional
 	PeerDiskState string `json:"peerDiskState,omitempty"`
+
+	// done is the progress of the resync running with this peer, as
+	// the `done:<percent>` token of the peer-device frame carries it
+	// ("50.31"). DRBD measures it against that resync's own total,
+	// not the volume size, and prints it only while a resync with
+	// this peer runs; empty otherwise. It is what LINSTOR reports as
+	// the peer's `done_percentage` and renders in `SyncTarget(NN%)`.
+	// A string because a CRD has no portable float type.
+	// +optional
+	Done string `json:"done,omitempty"`
+
+	// replicationState is this volume's DRBD-9 replication state with
+	// this peer, the `replication:<state>` token of the volume's own
+	// peer-device frame. DRBD keeps it per peer and per volume, and
+	// so does LINSTOR (DrbdVolume.volReplState); the connection-level
+	// `replicationState` is whichever volume's frame came last. It is
+	// what `done` belongs to: a two-volume resource can have one
+	// volume in SyncTarget and the other Established or PausedSyncT
+	// on the same connection.
+	// +optional
+	ReplicationState string `json:"replicationState,omitempty"`
 }
 
 // ResourceVolumeStatus is the runtime state of one volume of a Resource.
@@ -539,16 +577,11 @@ type ResourceVolumeStatus struct {
 	// +optional
 	HistoryGI []string `json:"historyGI,omitempty"`
 
-	// outOfSyncKib is the worst-case "how many KiB this volume is
-	// behind any peer" reported by `drbdsetup events2 --statistics`
-	// peer-device frames. Combined with RD.Spec.VolumeDefinitions
-	// SizeKib, callers compute a sync-progress percentage:
-	//   progress = (1 - outOfSyncKib / sizeKib) * 100
-	//
-	// 0 means fully in sync; sizeKib (or close to it) means fresh
-	// resync hasn't started yet. Surfaced via the REST view layer
-	// so `linstor r l` / piraeus dashboards can render a CDI-style
-	// progress bar without polling drbdsetup themselves.
+	// outOfSyncKib is the largest out-of-sync count over this
+	// volume's peers, as `drbdsetup events2 --statistics` peer-device
+	// frames report it. 0 means in sync with every peer. It is not a
+	// resync progress once the replica has more than one peer: the
+	// progress is connections[].peerVolumes[].done.
 	//
 	// While the volume is UpToDate and no peer resyncs with this
 	// replica, a change that keeps the count non-zero can reach the
