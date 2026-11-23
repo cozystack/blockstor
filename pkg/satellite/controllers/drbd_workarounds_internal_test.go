@@ -48,18 +48,30 @@ import (
 const workaroundNode = "n3"
 
 // fakeWorkaroundAdm hands out one kernel status per pass and records the
-// actions taken.
+// actions taken. A peer it disconnected shows StandAlone in every status
+// it hands out until it connects that peer again, as the kernel's does.
 type fakeWorkaroundAdm struct {
 	status  string
 	reads   int
 	actions []string
 
+	// next, when set, are the statuses of the next reads, each becoming
+	// status as it is read.
+	next []string
+
 	// errs fails the next calls of an action ("up pvc-x"), in order.
 	errs map[string][]error
+
+	// away holds the links ("pvc-x:n2") this fake disconnected.
+	away map[string]bool
 }
 
 func (f *fakeWorkaroundAdm) KernelStatus(context.Context) ([]drbd.KernelResource, error) {
 	f.reads++
+
+	if len(f.next) > 0 {
+		f.status, f.next = f.next[0], f.next[1:]
+	}
 
 	var out []drbd.KernelResource
 
@@ -68,15 +80,38 @@ func (f *fakeWorkaroundAdm) KernelStatus(context.Context) ([]drbd.KernelResource
 		return nil, fmt.Errorf("fake kernel status: %w", err)
 	}
 
+	for i := range out {
+		for j := range out[i].Connections {
+			conn := &out[i].Connections[j]
+			if f.away[out[i].Name+":"+conn.Name] {
+				conn.ConnectionState, conn.PeerRole = "StandAlone", "Unknown"
+			}
+		}
+	}
+
 	return out, nil
 }
 
 func (f *fakeWorkaroundAdm) DisconnectPeer(_ context.Context, res, peer string) error {
-	return f.act("disconnect " + res + ":" + peer)
+	err := f.act("disconnect " + res + ":" + peer)
+	if err == nil {
+		if f.away == nil {
+			f.away = map[string]bool{}
+		}
+
+		f.away[res+":"+peer] = true
+	}
+
+	return err
 }
 
 func (f *fakeWorkaroundAdm) ConnectPeer(_ context.Context, res, peer string) error {
-	return f.act("connect " + res + ":" + peer)
+	err := f.act("connect " + res + ":" + peer)
+	if err == nil {
+		delete(f.away, res+":"+peer)
+	}
+
+	return err
 }
 
 func (f *fakeWorkaroundAdm) Secondary(_ context.Context, res string) error {
@@ -196,6 +231,20 @@ func stallConfig() WorkaroundsConfig {
 	return WorkaroundsConfig{Interval: 1, StalledResync: true, StalledResyncPasses: 4, StalledResyncAct: true}
 }
 
+// afterStall is the replica once the active resync from n1 is done,
+// UpToDate, with n2 Connected to a Secondary unless the fake dropped it;
+// n1 is the state and role of the link to n1.
+func afterStall(n1 string) string {
+	return fmt.Sprintf(`[{"name":"pvc-stall","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"n1",%s,"peer_devices":[{"volume":0,
+  "replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0}]},
+  {"name":"n2","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,
+  "replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0}]}]}]`, n1)
+}
+
+// n1Secondary is the link to n1 Connected to a Secondary.
+const n1Secondary = `"connection-state":"Connected","peer-role":"Secondary"`
+
 func drainEvents(recorder *events.FakeRecorder) []string {
 	var out []string
 
@@ -240,8 +289,7 @@ func frozen(n int) []resyncSample {
 // The field stalls (alpha.9, alpha.14, alpha.15): the resync from n1 is
 // frozen with its requests held while n2 waits on it. After four stalled
 // passes, compared with the one before each, the paused peer n2 is
-// disconnected, not the active n1; the next pass connects it again with
-// an adjust.
+// disconnected, not the active n1; the next pass connects it again.
 func TestStalledResyncDisconnectsThePausedPeer(t *testing.T) {
 	t.Parallel()
 
@@ -266,10 +314,10 @@ func TestStalledResyncDisconnectsThePausedPeer(t *testing.T) {
 
 	// The active resync finishes while n2 is away; the next pass
 	// connects n2 again.
-	adm.status = `[{"name":"pvc-stall","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],"connections":[]}]`
+	adm.status = afterStall(n1Secondary)
 	w.pass(t.Context(), logr.Discard())
 
-	if want := []string{"adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
+	if want := []string{"connect pvc-stall:n2"}; !slices.Equal(adm.actions, want) {
 		t.Errorf("pass after the disconnect: actions = %v, want %v", adm.actions, want)
 	}
 
@@ -277,31 +325,30 @@ func TestStalledResyncDisconnectsThePausedPeer(t *testing.T) {
 	w.pass(t.Context(), logr.Discard())
 
 	if len(adm.actions) != 0 {
-		t.Errorf("adjusted again after it went through: %v", adm.actions)
+		t.Errorf("connected again after it went through: %v", adm.actions)
 	}
 }
 
 var errAdjustBusy = errors.New("exit status 10: pvc-stall: Failure: (162) Invalid configuration request")
 
-// The adjust that connects the paused peer again is retried until it
-// goes through.
+// The connect of the paused peer is retried until it goes through.
 func TestStalledResyncRetriesTheReconnectOfThePausedPeer(t *testing.T) {
 	t.Parallel()
 
-	adm := &fakeWorkaroundAdm{errs: map[string][]error{"adjust pvc-stall": {errAdjustBusy}}}
+	adm := &fakeWorkaroundAdm{errs: map[string][]error{"connect pvc-stall:n2": {errAdjustBusy}}}
 	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
 
 	runResync(t, w, adm, "Secondary", frozen(5)...)
 
-	adm.status = `[]`
+	adm.status = afterStall(n1Secondary)
 	adm.actions = nil
 
 	w.pass(t.Context(), logr.Discard())
 	w.pass(t.Context(), logr.Discard())
 	w.pass(t.Context(), logr.Discard())
 
-	if want := []string{"adjust pvc-stall", "adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
-		t.Errorf("actions = %v, want a failed adjust retried once", adm.actions)
+	if want := []string{"connect pvc-stall:n2", "connect pvc-stall:n2"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("actions = %v, want a failed connect retried once", adm.actions)
 	}
 }
 
@@ -325,7 +372,7 @@ func TestStalledResyncReportsOnlyByDefault(t *testing.T) {
 	if len(evs) != 1 || !strings.Contains(evs[0], "Warning DRBDResyncStalled") ||
 		!strings.Contains(evs[0], "report-only") ||
 		!strings.Contains(evs[0], "by hand on n3: `drbdadm disconnect pvc-stall:n2`, "+
-			"then once the resync from n1 is done `drbdadm adjust pvc-stall`") {
+			"then once the resync from n1 is done `drbdadm connect pvc-stall:n2`") {
 		t.Errorf("events = %v, want one report-only Warning with the manual commands", evs)
 	}
 
@@ -430,7 +477,7 @@ func TestStalledResyncReconnectsThePausedPeerOnlyWithNoPrimaryInSight(t *testing
 
 	evs := drainEvents(recorder)
 	if len(evs) != 1 || !strings.Contains(evs[0], "while a Primary is in sight") ||
-		!strings.Contains(evs[0], "`drbdadm adjust pvc-stall`") {
+		!strings.Contains(evs[0], "`drbdadm connect pvc-stall:n2`") {
 		t.Errorf("events = %v, want the wait reported once with the manual command", evs)
 	}
 
@@ -438,7 +485,7 @@ func TestStalledResyncReconnectsThePausedPeerOnlyWithNoPrimaryInSight(t *testing
 	w.pass(t.Context(), logr.Discard())
 	w.pass(t.Context(), logr.Discard())
 
-	if want := []string{"adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
+	if want := []string{"connect pvc-stall:n2"}; !slices.Equal(adm.actions, want) {
 		t.Errorf("actions once the Primary is gone = %v, want %v", adm.actions, want)
 	}
 }
@@ -480,8 +527,171 @@ func TestStalledResyncReconnectWaitsForAPrimaryToBeRuledOut(t *testing.T) {
 		`"connection-state":"Connecting","peer-role":"Unknown"`, `"connection-state":"Connected","peer-role":"Secondary"`, 1)
 	w.pass(t.Context(), logr.Discard())
 
-	if want := []string{"adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
+	if want := []string{"connect pvc-stall:n2"}; !slices.Equal(adm.actions, want) {
 		t.Errorf("actions once n1 is a connected Secondary = %v, want %v", adm.actions, want)
+	}
+}
+
+// stallDisconnected runs w until the stall made it disconnect n2, and
+// drops what that pass recorded.
+func stallDisconnected(t *testing.T, w *DRBDWorkaroundsRunnable, adm *fakeWorkaroundAdm, recorder *events.FakeRecorder) {
+	t.Helper()
+
+	if got := runResync(t, w, adm, "Secondary", frozen(5)...); !slices.Equal(got, []string{"disconnect pvc-stall:n2"}) {
+		t.Fatalf("actions = %v, want n2 disconnected", got)
+	}
+
+	drainEvents(recorder)
+
+	adm.actions = nil
+}
+
+// Only the link the check dropped is skipped when a Primary is ruled out
+// for its reconnect: a second StandAlone link, dropped by a split brain
+// or by hand, may lead to a Primary as well, and `drbdadm adjust` would
+// have connected both at once. Nothing is connected while it is down.
+func TestStalledResyncReconnectWaitsOutAnotherStandAloneLink(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	stallDisconnected(t, w, adm, recorder)
+
+	adm.status = afterStall(`"connection-state":"StandAlone","peer-role":"Unknown"`)
+
+	for range 3 {
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if len(adm.actions) != 0 {
+		t.Errorf("connected n2 again with the link to n1 StandAlone: %v", adm.actions)
+	}
+
+	if evs := drainEvents(recorder); len(evs) != 1 || !strings.Contains(evs[0], "`drbdadm connect pvc-stall:n2`") {
+		t.Errorf("events = %v, want the wait reported once with the manual command", evs)
+	}
+}
+
+// A resource that is down when its reconnect is owed, as after a reboot,
+// is left to the apply, whose adjust brings it up connected to every
+// peer: this check runs nothing for it, and keeps the debt for a peer
+// that is StandAlone once the resource is up.
+func TestStalledResyncReconnectLeavesADownResourceToTheApply(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+	w.StateDir = dir
+
+	stallDisconnected(t, w, adm, recorder)
+
+	adm.status = `[]`
+
+	for range 3 {
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if len(adm.actions) != 0 {
+		t.Errorf("acted on a resource that is down: %v", adm.actions)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "pvc-stall"+satellite.ReconnectPendingSuffix)); err != nil {
+		t.Errorf("the debt of a resource that is down was dropped: %v", err)
+	}
+
+	adm.status = afterStall(n1Secondary)
+	w.pass(t.Context(), logr.Discard())
+
+	if want := []string{"connect pvc-stall:n2"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("actions once the resource is up with n2 StandAlone = %v, want %v", adm.actions, want)
+	}
+}
+
+// The status is read again right before the connect: a Primary that
+// turned up since the pass read it holds the connect off as well.
+func TestStalledResyncReconnectRereadsTheStatusBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	stallDisconnected(t, w, adm, recorder)
+
+	primary := afterStall(`"connection-state":"Connected","peer-role":"Primary"`)
+	adm.next = []string{afterStall(n1Secondary), primary}
+
+	w.pass(t.Context(), logr.Discard())
+
+	if len(adm.actions) != 0 {
+		t.Errorf("connected n2 again with n1 Primary on the second read: %v", adm.actions)
+	}
+
+	if evs := drainEvents(recorder); len(evs) != 1 || !strings.Contains(evs[0], "not ruled out") {
+		t.Errorf("events = %v, want the wait reported", evs)
+	}
+}
+
+// A reconnect kept waiting is reported again every reconnectReportEvery,
+// not once for good: the link stays down all that while, and an Event
+// expires.
+func TestStalledResyncReconnectWaitIsReportedAgain(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	stallDisconnected(t, w, adm, recorder)
+
+	adm.status = afterStall(`"connection-state":"Connected","peer-role":"Primary"`)
+
+	// Every pass looks at the test clock once, 30 s on.
+	passes := int(reconnectReportEvery/(30*time.Second)) + 1
+	for range passes {
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if evs := drainEvents(recorder); len(evs) != 2 {
+		t.Errorf("events over %d passes = %v, want the wait reported twice", passes, evs)
+	}
+
+	if len(adm.actions) != 0 {
+		t.Errorf("connected n2 again with n1 Primary: %v", adm.actions)
+	}
+}
+
+// A record an earlier satellite wrote without naming the peer is owed to
+// the one StandAlone peer, under the same gate; with two StandAlone
+// peers neither is connected.
+func TestStalledResyncReconnectReadsARecordNamingNoPeer(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		n1   string
+		want []string
+	}{
+		{n1: n1Secondary, want: []string{"connect pvc-stall:n2"}},
+		{n1: `"connection-state":"StandAlone","peer-role":"Unknown"`, want: nil},
+	} {
+		dir := t.TempDir()
+
+		err := os.WriteFile(filepath.Join(dir, "pvc-stall"+satellite.ReconnectPendingSuffix), nil, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		adm := &fakeWorkaroundAdm{status: afterStall(tc.n1), away: map[string]bool{"pvc-stall:n2": true}}
+		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+		w.StateDir = dir
+
+		w.pass(t.Context(), logr.Discard())
+		w.pass(t.Context(), logr.Discard())
+
+		if !slices.Equal(adm.actions, tc.want) {
+			t.Errorf("n1 %s: actions = %v, want %v", tc.n1, adm.actions, tc.want)
+		}
 	}
 }
 
@@ -710,11 +920,11 @@ func TestStalledResyncFallsBackToTheActivePeer(t *testing.T) {
 
 	runResync(t, w, adm, "Secondary", frozen(5)...)
 
-	// The adjust connects n2 back, and the same stall shows again.
+	// n2 is connected back, and the same stall shows again.
 	adm.actions = nil
 
 	got := runResync(t, w, adm, "Secondary", frozen(4)...)
-	want := []string{"adjust pvc-stall", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}
+	want := []string{"connect pvc-stall:n2", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}
 
 	if !slices.Equal(got, want) {
 		t.Errorf("actions = %v, want %v", got, want)
@@ -722,8 +932,9 @@ func TestStalledResyncFallsBackToTheActivePeer(t *testing.T) {
 }
 
 // A disconnect of the paused peer that failed may still have gone
-// through, so the adjust that connects it is owed all the same and runs
-// first; the next stall then tries the paused peer again before the
+// through, so its connect is owed all the same; here it did not go
+// through, the peer is still connected, and the debt settles with no
+// command. The next stall then tries the paused peer again before the
 // active one.
 func TestStalledResyncRetriesAFailedDisconnectOfThePausedPeer(t *testing.T) {
 	t.Parallel()
@@ -736,14 +947,15 @@ func TestStalledResyncRetriesAFailedDisconnectOfThePausedPeer(t *testing.T) {
 	adm.actions = nil
 
 	got := runResync(t, w, adm, "Secondary", frozen(4)...)
-	if want := []string{"adjust pvc-stall", "disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
+	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
 		t.Errorf("actions after a failed disconnect = %v, want %v", got, want)
 	}
 }
 
 // A reconnect of the active peer whose connect failed after the
 // disconnect went through leaves that peer StandAlone, and the apply
-// keeps a StandAlone link down: the adjust that connects it is owed.
+// keeps a StandAlone link down: its connect is owed, and runs on the
+// next pass with a Primary ruled out on the other links.
 func TestStalledResyncOwesTheConnectOfTheActivePeer(t *testing.T) {
 	t.Parallel()
 
@@ -751,21 +963,26 @@ func TestStalledResyncOwesTheConnectOfTheActivePeer(t *testing.T) {
 	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
 
 	runResync(t, w, adm, "Secondary", frozen(5)...)
-	runResync(t, w, adm, "Secondary", frozen(4)...)
 
-	adm.status = `[]`
+	got := runResync(t, w, adm, "Secondary", frozen(4)...)
+	if want := []string{"disconnect pvc-stall:n2", "connect pvc-stall:n2", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}; !slices.Equal(got, want) {
+		t.Fatalf("actions = %v, want the fallback with its connect failing", got)
+	}
+
+	adm.status = afterStall(n1Secondary)
 	adm.actions = nil
 
 	w.pass(t.Context(), logr.Discard())
 
-	if want := []string{"adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
+	if want := []string{"connect pvc-stall:n1"}; !slices.Equal(adm.actions, want) {
 		t.Errorf("pass after a failed connect: actions = %v, want %v", adm.actions, want)
 	}
 }
 
 // The reconnect owed after a disconnect outlives a satellite restart:
-// the next satellite reads it from the state dir and connects the peer
-// again, and the record goes once the adjust went through.
+// the next satellite reads it from the state dir, with the peer it names,
+// and connects that peer again; the record goes once the connect went
+// through.
 func TestStalledResyncOwedReconnectOutlivesARestart(t *testing.T) {
 	t.Parallel()
 
@@ -780,17 +997,17 @@ func TestStalledResyncOwedReconnectOutlivesARestart(t *testing.T) {
 		t.Fatalf("actions = %v, want the paused peer disconnected", got)
 	}
 
-	if _, err := os.Stat(record); err != nil {
-		t.Fatalf("the owed reconnect was not recorded: %v", err)
+	if got, err := os.ReadFile(record); err != nil || string(got) != "n2\n" {
+		t.Fatalf("the owed reconnect was not recorded with its peer: %q, %v", got, err)
 	}
 
-	restarted := &fakeWorkaroundAdm{status: `[]`}
+	restarted := &fakeWorkaroundAdm{status: afterStall(n1Secondary), away: map[string]bool{"pvc-stall:n2": true}}
 	w2, _ := newTestWorkarounds(t, restarted, stallConfig(), "pvc-stall")
 	w2.StateDir = dir
 
 	w2.pass(t.Context(), logr.Discard())
 
-	if want := []string{"adjust pvc-stall"}; !slices.Equal(restarted.actions, want) {
+	if want := []string{"connect pvc-stall:n2"}; !slices.Equal(restarted.actions, want) {
 		t.Errorf("first pass after a restart: actions = %v, want %v", restarted.actions, want)
 	}
 
@@ -825,7 +1042,7 @@ func TestStalledResyncLeavesTheLateAddKickItsCase(t *testing.T) {
 		want   []string
 	}{
 		{n2Role: "Primary", want: nil},
-		{n2Role: "Secondary", want: []string{"disconnect pvc-stall:n2", "adjust pvc-stall", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}},
+		{n2Role: "Secondary", want: []string{"disconnect pvc-stall:n2", "connect pvc-stall:n2", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}},
 	} {
 		adm := &fakeWorkaroundAdm{status: lateAddStall(tc.n2Role)}
 		w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
@@ -853,8 +1070,9 @@ func TestStalledResyncRemembersThePausedPeerWasTried(t *testing.T) {
 
 	away := `[{"name":"pvc-stall","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
  "connections":[{"name":"n1","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,
-  "replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":14592,"unacked":542}]}]}]`
-	inSync := `[{"name":"pvc-stall","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],"connections":[]}]`
+  "replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":14592,"unacked":542}]},
+  {"name":"n2","connection-state":"StandAlone","peer-role":"Unknown"}]}]`
+	inSync := afterStall(n1Secondary)
 
 	for _, tc := range []struct {
 		between string
@@ -1699,5 +1917,33 @@ func TestForcedIOFailuresLeavesTheSourceOfAPrimaryPeerUp(t *testing.T) {
 
 	if got := strings.Join(adm.actions, ","); got != "down pvc-failio,up pvc-failio" {
 		t.Errorf("actions once the peer demoted = %q, want down and up", got)
+	}
+}
+
+// A record of two peers settles the one that is connected already and
+// connects the other.
+func TestStalledResyncReconnectSettlesEachPeerOnItsOwn(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	record := filepath.Join(dir, "pvc-stall"+satellite.ReconnectPendingSuffix)
+
+	err := os.WriteFile(record, []byte("n1\nn2\n"), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adm := &fakeWorkaroundAdm{status: afterStall(n1Secondary), away: map[string]bool{"pvc-stall:n2": true}}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+	w.StateDir = dir
+
+	w.pass(t.Context(), logr.Discard())
+
+	if want := []string{"connect pvc-stall:n2"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("actions = %v, want %v", adm.actions, want)
+	}
+
+	if _, err := os.Stat(record); !os.IsNotExist(err) {
+		t.Errorf("the record of a settled reconnect is still there: %v", err)
 	}
 }

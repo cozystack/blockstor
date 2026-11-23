@@ -231,11 +231,16 @@ type DRBDWorkaroundsRunnable struct {
 	// pass retries them (adjustOwed).
 	owedAdjust map[string]string
 
-	// owedReconnect holds the resources whose paused peer a stalled
-	// resync waited on was disconnected, each with whether the wait for
-	// a Primary to go away was reported; every pass retries them
+	// owedReconnect holds the resources a stalled-resync action left
+	// with a peer disconnected, each with the peers to connect again; an
+	// empty list is a record that named none (an earlier satellite's),
+	// owed to whichever peer is StandAlone. Every pass retries them
 	// (reconnectOwed).
-	owedReconnect map[string]bool
+	owedReconnect map[string][]string
+
+	// reconnectReported is when the wait of each owed reconnect for a
+	// Primary to be ruled out was last reported (reconnectReportEvery).
+	reconnectReported map[string]time.Time
 
 	// owedReconnectLoaded is whether the reconnects recorded in StateDir
 	// were read into owedReconnect (loadOwedReconnects).
@@ -683,8 +688,8 @@ func (w *DRBDWorkaroundsRunnable) stalledResyncRefusal(res *drbd.KernelResource,
 // once the active resync is done, or reconnect the active peer.
 func stalledResyncCommand(name string, dep *drbd.ResyncDependency, paused bool) string {
 	if paused {
-		return fmt.Sprintf("`drbdadm disconnect %s:%s`, then once the resync from %s is done `drbdadm adjust %s`",
-			name, dep.Paused, dep.Active, name)
+		return fmt.Sprintf("`drbdadm disconnect %s:%s`, then once the resync from %s is done `drbdadm connect %s:%s`",
+			name, dep.Paused, dep.Active, name, dep.Paused)
 	}
 
 	return fmt.Sprintf("`drbdadm disconnect %s:%s && drbdadm connect %s:%s`", name, dep.Active, name, dep.Active)
@@ -703,14 +708,15 @@ func (w *DRBDWorkaroundsRunnable) disconnectPausedPeer(
 	replica *blockstoriov1alpha1.Resource, dep *drbd.ResyncDependency, stuck string,
 ) bool {
 	w.acted(logger, replica, res.Name, "DRBDResyncStalled", fmt.Sprintf(
-		"%s: disconnecting %s, connecting it again on a later pass with no Primary in sight (LINBIT/drbd#149)",
+		"%s: disconnecting %s, connecting it again on a later pass with a Primary ruled out (LINBIT/drbd#149)",
 		stuck, dep.Paused))
 
 	// Owed before the disconnect: a disconnect that went through but
 	// returned an error, or a shutdown right after it, still leaves the
 	// peer StandAlone, and no apply connects it (shouldSkipNetOnAdjust).
-	// An adjust owed for nothing is a no-op.
-	w.oweReconnect(logger, res.Name)
+	// A connect owed to a peer that is not StandAlone is settled without
+	// one.
+	w.oweReconnect(logger, res.Name, dep.Paused)
 
 	err := w.Adm.DisconnectPeer(ctx, res.Name, dep.Paused)
 	if err != nil {
@@ -732,9 +738,8 @@ func (w *DRBDWorkaroundsRunnable) reconnectActivePeer(
 		"%s: disconnecting and connecting %s (LINBIT/drbd#149)", stuck, dep.Active))
 
 	// Owed until the connect went through, for the reason
-	// disconnectPausedPeer gives; a reconnect already owed stays owed.
-	_, owed := w.owedReconnect[res.Name]
-	w.oweReconnect(logger, res.Name)
+	// disconnectPausedPeer gives.
+	w.oweReconnect(logger, res.Name, dep.Active)
 
 	err := w.Adm.DisconnectPeer(ctx, res.Name, dep.Active)
 	if err == nil {
@@ -747,14 +752,18 @@ func (w *DRBDWorkaroundsRunnable) reconnectActivePeer(
 		return
 	}
 
-	if !owed {
-		w.settleReconnect(logger, res.Name)
-	}
+	w.settleReconnect(logger, res.Name, dep.Active)
 }
 
-// reconnectPendingPerm is the mode of an owed-reconnect record: an empty
-// file only the satellite reads.
+// reconnectPendingPerm is the mode of an owed-reconnect record, the
+// peers to connect again one per line, which only the satellite reads.
 const reconnectPendingPerm = 0o600
+
+// reconnectReportEvery is how often a reconnect kept waiting for a
+// Primary to be ruled out is reported again. The link stays down all the
+// while, a vote short should another replica fail, and an Event outlives
+// its last report by about an hour only.
+const reconnectReportEvery = 30 * time.Minute
 
 // reconnectPendingPath is the state file of name's owed reconnect, or ""
 // without a state dir.
@@ -766,33 +775,38 @@ func (w *DRBDWorkaroundsRunnable) reconnectPendingPath(name string) string {
 	return filepath.Join(w.StateDir, name+satellite.ReconnectPendingSuffix)
 }
 
-// oweReconnect records that name owes the adjust that connects again a
-// peer a stalled-resync action disconnected (reconnectOwed), in memory
-// and in the state dir. A record that cannot be written is logged; the
-// debt still holds until the satellite restarts.
-func (w *DRBDWorkaroundsRunnable) oweReconnect(logger logr.Logger, name string) {
+// oweReconnect records that name owes the connect of peer, which a
+// stalled-resync action disconnected (reconnectOwed), in memory and in
+// the state dir. A record that cannot be written is logged; the debt
+// still holds until the satellite restarts.
+func (w *DRBDWorkaroundsRunnable) oweReconnect(logger logr.Logger, name, peer string) {
 	if w.owedReconnect == nil {
-		w.owedReconnect = map[string]bool{}
+		w.owedReconnect = map[string][]string{}
 	}
 
-	if _, ok := w.owedReconnect[name]; !ok {
-		w.owedReconnect[name] = false
+	peers := w.owedReconnect[name]
+	if !slices.Contains(peers, peer) {
+		peers = append(peers, peer)
+		slices.Sort(peers)
 	}
 
-	path := w.reconnectPendingPath(name)
-	if path == "" {
+	w.owedReconnect[name] = peers
+	w.recordReconnect(logger, name)
+}
+
+// settleReconnect drops the connect of peer from name's owed reconnect,
+// and the whole debt once no peer is left or peer is "".
+func (w *DRBDWorkaroundsRunnable) settleReconnect(logger logr.Logger, name, peer string) {
+	peers := slices.DeleteFunc(w.owedReconnect[name], func(p string) bool { return p == peer })
+	if len(peers) > 0 && peer != "" {
+		w.owedReconnect[name] = peers
+		w.recordReconnect(logger, name)
+
 		return
 	}
 
-	err := os.WriteFile(path, nil, reconnectPendingPerm)
-	if err != nil {
-		logger.Error(err, "record the reconnect owed to a resource", "resource", name)
-	}
-}
-
-// settleReconnect drops name's owed reconnect.
-func (w *DRBDWorkaroundsRunnable) settleReconnect(logger logr.Logger, name string) {
 	delete(w.owedReconnect, name)
+	delete(w.reconnectReported, name)
 
 	path := w.reconnectPendingPath(name)
 	if path == "" {
@@ -802,6 +816,21 @@ func (w *DRBDWorkaroundsRunnable) settleReconnect(logger logr.Logger, name strin
 	err := os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
 		logger.Error(err, "drop the reconnect owed to a resource", "resource", name)
+	}
+}
+
+// recordReconnect writes name's owed reconnect to the state dir.
+func (w *DRBDWorkaroundsRunnable) recordReconnect(logger logr.Logger, name string) {
+	path := w.reconnectPendingPath(name)
+	if path == "" {
+		return
+	}
+
+	record := strings.Join(w.owedReconnect[name], "\n") + "\n"
+
+	err := os.WriteFile(path, []byte(record), reconnectPendingPerm)
+	if err != nil {
+		logger.Error(err, "record the reconnect owed to a resource", "resource", name)
 	}
 }
 
@@ -824,72 +853,169 @@ func (w *DRBDWorkaroundsRunnable) loadOwedReconnects(logger logr.Logger) {
 	for _, file := range files {
 		name := strings.TrimSuffix(filepath.Base(file), satellite.ReconnectPendingSuffix)
 
-		if w.owedReconnect == nil {
-			w.owedReconnect = map[string]bool{}
+		record, err := os.ReadFile(file)
+		if err != nil {
+			logger.Error(err, "read the reconnect owed to a resource", "resource", name)
+
+			continue
 		}
 
-		if _, ok := w.owedReconnect[name]; !ok {
-			w.owedReconnect[name] = false
+		if w.owedReconnect == nil {
+			w.owedReconnect = map[string][]string{}
 		}
+
+		peers := w.owedReconnect[name]
+		for _, peer := range strings.Fields(string(record)) {
+			if !slices.Contains(peers, peer) {
+				peers = append(peers, peer)
+			}
+		}
+
+		slices.Sort(peers)
+		w.owedReconnect[name] = peers
 	}
 }
 
-// reconnectOwed connects again, with `drbdadm adjust`, the peers
-// disconnectPausedPeer dropped, once a Primary is ruled out: a Primary
-// may have come up since the disconnect, and the reconnect between this
-// node and that Secondary is the handshake that can make a Secondary the
-// SyncSource while the Primary writes. A link that is down or still
-// connecting may lead to such a Primary as well
-// (drbd.KernelResource.PrimaryRuledOutBesidesStandAlone). Such a
-// resource is reported once and kept owed; it is connected again when no
-// Primary can be in the way, or by an operator. One blockstor no longer has a replica of, or is deleting, is
-// dropped, and one an apply is changing is left to the next pass.
-// resources is this pass's kernel status.
+// reconnectOwed connects again, with `drbdadm connect <res>:<peer>`, the
+// peers a stalled-resync action dropped, each only once a Primary is
+// ruled out on every other link of the resource: a Primary may have come
+// up since the disconnect, and the reconnect between this node and a
+// Secondary of it is the handshake that can make a Secondary the
+// SyncSource while the Primary writes (LINBIT/drbd#153). A link that is
+// down, still connecting or StandAlone may lead to such a Primary too
+// (drbd.KernelResource.PrimaryRuledOutBesides), and the status is read
+// again right before the connect to narrow the window in which one
+// turns up. A connect kept waiting is reported, again every
+// reconnectReportEvery, and the peer stays owed until a Primary is ruled
+// out or an operator connects it. A peer no longer StandAlone needs
+// nothing. A resource that is down is left to the apply, whose adjust
+// brings it up connected to every peer whatever this check would decide.
+// One blockstor no longer has a replica of, or is deleting, is dropped,
+// and one an apply is changing is left to the next pass. resources is
+// this pass's kernel status.
 func (w *DRBDWorkaroundsRunnable) reconnectOwed(ctx context.Context, logger logr.Logger, resources []drbd.KernelResource) {
-	for name, reported := range w.owedReconnect {
+	for name := range w.owedReconnect {
 		release, ok := w.hold(name)
 		if !ok {
 			continue
 		}
 
-		w.reconnect(ctx, logger, name, reported, resources)
+		w.reconnect(ctx, logger, name, resources)
 		release()
 	}
 }
 
-// reconnect is reconnectOwed for the resource name, held.
-func (w *DRBDWorkaroundsRunnable) reconnect(
-	ctx context.Context, logger logr.Logger, name string, reported bool, resources []drbd.KernelResource,
-) {
+// reconnect is reconnectOwed for the resource name, held. It connects
+// one peer a pass at most: the next one's gate needs to see that link
+// Connected to a Secondary first.
+func (w *DRBDWorkaroundsRunnable) reconnect(ctx context.Context, logger logr.Logger, name string, resources []drbd.KernelResource) {
 	replica := w.replica(ctx, logger, name)
 	if replica == nil {
-		w.settleReconnect(logger, name)
+		w.settleReconnect(logger, name, "")
 
 		return
 	}
 
 	i := slices.IndexFunc(resources, func(r drbd.KernelResource) bool { return r.Name == name })
-	if i >= 0 && !resources[i].PrimaryRuledOutBesidesStandAlone() {
-		if !reported {
-			w.owedReconnect[name] = true
-			w.acted(logger, replica, name, "DRBDResyncStalled", fmt.Sprintf(
-				"not connecting again the peer a stalled resync waited on while a Primary is in sight or not ruled out "+
-					"(LINBIT/drbd#153); it is connected once none can be, or by hand on %s: `drbdadm adjust %s`",
-				w.NodeName, name))
+	if i < 0 {
+		return
+	}
+
+	res := &resources[i]
+
+	peers := w.owedPeers(name, res)
+	if len(peers) == 0 {
+		w.settleReconnect(logger, name, "")
+
+		return
+	}
+
+	var waiting []string
+
+	for _, peer := range peers {
+		if !res.StandAlone(peer) {
+			w.settleReconnect(logger, name, peer)
+
+			continue
 		}
 
+		if !res.PrimaryRuledOutBesides(peer) || !w.primaryStillRuledOut(ctx, logger, name, peer) {
+			waiting = append(waiting, peer)
+
+			continue
+		}
+
+		err := w.Adm.ConnectPeer(ctx, name, peer)
+		if err != nil {
+			w.failed(logger, err, name, "connect again the peer a stalled resync waited on")
+
+			return
+		}
+
+		w.settleReconnect(logger, name, peer)
+		logger.Info("DRBD workaround: connected again the peer a stalled resync waited on", "resource", name, "peer", peer)
+
 		return
 	}
 
-	err := w.Adm.Adjust(ctx, name)
+	if len(waiting) > 0 {
+		w.reportReconnectWait(logger, replica, name, waiting)
+	}
+}
+
+// owedPeers is the peers of res name owes a connect to. A record naming
+// no peer owes it to whichever is StandAlone, and the gate of reconnect
+// keeps two of them from connecting each other's way. A clone: settling
+// a peer shrinks the owed list in place.
+func (w *DRBDWorkaroundsRunnable) owedPeers(name string, res *drbd.KernelResource) []string {
+	if peers := w.owedReconnect[name]; len(peers) > 0 {
+		return slices.Clone(peers)
+	}
+
+	return res.StandAlonePeers()
+}
+
+// primaryStillRuledOut reads the kernel status again right before the
+// connect of peer, so a Primary that came up since the pass read it
+// holds the connect off too.
+func (w *DRBDWorkaroundsRunnable) primaryStillRuledOut(ctx context.Context, logger logr.Logger, name, peer string) bool {
+	resources, err := w.Adm.KernelStatus(ctx)
 	if err != nil {
-		w.failed(logger, err, name, "connect again the peer a stalled resync waited on")
+		logger.Error(err, "read the DRBD kernel status again before a reconnect", "resource", name)
 
+		return false
+	}
+
+	i := slices.IndexFunc(resources, func(r drbd.KernelResource) bool { return r.Name == name })
+
+	return i >= 0 && resources[i].StandAlone(peer) && resources[i].PrimaryRuledOutBesides(peer)
+}
+
+// reportReconnectWait reports that the connect of peers waits for a
+// Primary to be ruled out, on the first pass and every
+// reconnectReportEvery after.
+func (w *DRBDWorkaroundsRunnable) reportReconnectWait(logger logr.Logger, replica runtime.Object, name string, peers []string) {
+	now := w.now()
+
+	if last, ok := w.reconnectReported[name]; ok && now.Sub(last) < reconnectReportEvery {
 		return
 	}
 
-	w.settleReconnect(logger, name)
-	logger.Info("DRBD workaround: adjusted to connect again the peer a stalled resync waited on", "resource", name)
+	if w.reconnectReported == nil {
+		w.reconnectReported = map[string]time.Time{}
+	}
+
+	w.reconnectReported[name] = now
+
+	commands := make([]string, 0, len(peers))
+	for _, peer := range peers {
+		commands = append(commands, fmt.Sprintf("`drbdadm connect %s:%s`", name, peer))
+	}
+
+	w.acted(logger, replica, name, "DRBDResyncStalled", fmt.Sprintf(
+		"not connecting again %s, disconnected for a stalled resync, while a Primary is in sight or not ruled out "+
+			"(LINBIT/drbd#153); the link stays down until none can be, or connect it by hand on %s: %s",
+		strings.Join(peers, ", "), w.NodeName, strings.Join(commands, ", ")))
 }
 
 // Workaround for DRBD auto-demote not firing

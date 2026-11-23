@@ -235,28 +235,41 @@ type ResyncDependency struct {
 // connection is Connected to a Secondary. A peer that is not connected
 // may be Primary for all this node knows.
 func (r *KernelResource) PrimaryRuledOut() bool {
-	return r.primaryRuledOut(false)
+	return r.PrimaryRuledOutBesides("")
 }
 
-// PrimaryRuledOutBesidesStandAlone is PrimaryRuledOut over the
-// connections that are not StandAlone. A StandAlone peer is one this node
-// dropped itself and the peer a reconnect would connect; the Primary that
-// matters to that reconnect is a third node writing to both ends, and any
-// link that is down or still connecting may lead to one.
-func (r *KernelResource) PrimaryRuledOutBesidesStandAlone() bool {
-	return r.primaryRuledOut(true)
-}
-
-// primaryRuledOut is PrimaryRuledOut, skipping StandAlone connections
-// when skipStandAlone is set.
-func (r *KernelResource) primaryRuledOut(skipStandAlone bool) bool {
+// PrimaryRuledOutBesides is PrimaryRuledOut over every connection but the
+// one to peer: the peer a reconnect would connect, whose role cannot be
+// read while it is StandAlone. The Primary that matters to that reconnect
+// is a third node writing to both ends, and any other link that is not
+// Connected, StandAlone ones included, may lead to one.
+func (r *KernelResource) PrimaryRuledOutBesides(peer string) bool {
 	return r.Role == string(RoleSecondary) && !slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
-		if skipStandAlone && c.ConnectionState == string(ConnectionStateStandAlone) {
-			return false
-		}
-
-		return c.ConnectionState != string(ConnectionStateConnected) || c.PeerRole != string(RoleSecondary)
+		return c.Name != peer &&
+			(c.ConnectionState != string(ConnectionStateConnected) || c.PeerRole != string(RoleSecondary))
 	})
+}
+
+// StandAlone reports whether this node's connection to peer is
+// configured and StandAlone: dropped, and connected again by nothing but
+// a `drbdadm connect` or adjust.
+func (r *KernelResource) StandAlone(peer string) bool {
+	return slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
+		return c.Name == peer && c.ConnectionState == string(ConnectionStateStandAlone)
+	})
+}
+
+// StandAlonePeers is the peers whose connection is StandAlone.
+func (r *KernelResource) StandAlonePeers() []string {
+	var peers []string
+
+	for _, c := range r.Connections {
+		if c.ConnectionState == string(ConnectionStateStandAlone) {
+			peers = append(peers, c.Name)
+		}
+	}
+
+	return peers
 }
 
 // peerUpToDate reports whether a connected peer has an UpToDate disk of

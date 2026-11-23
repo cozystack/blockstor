@@ -21,6 +21,7 @@ package drbd_test
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -272,10 +273,11 @@ func TestKernelStatusPrimaryRuledOut(t *testing.T) {
 	}
 }
 
-// A reconnect of a peer this node dropped rules a Primary out over the
-// other links: the StandAlone peer is the one being connected, while a
-// link that is down or still connecting may lead to a Primary.
-func TestKernelStatusPrimaryRuledOutBesidesStandAlone(t *testing.T) {
+// A reconnect of a peer this node dropped rules a Primary out over every
+// other link: only that peer's link is skipped, and any other link that
+// is not Connected to a Secondary, a second StandAlone one included, may
+// lead to a Primary.
+func TestKernelStatusPrimaryRuledOutBesides(t *testing.T) {
 	t.Parallel()
 
 	resources := kernelStatus(t, `[
@@ -285,17 +287,30 @@ func TestKernelStatusPrimaryRuledOutBesidesStandAlone(t *testing.T) {
 {"name":"other-link-connecting","role":"Secondary",
  "connections":[{"name":"a","connection-state":"Connecting","peer-role":"Unknown"},
   {"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]},
+{"name":"other-link-standalone","role":"Secondary",
+ "connections":[{"name":"a","connection-state":"StandAlone","peer-role":"Unknown"},
+  {"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]},
 {"name":"primary-peer","role":"Secondary",
  "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary"},
   {"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]},
 {"name":"local-primary","role":"Primary",
+ "connections":[{"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]},
+{"name":"only-link","role":"Secondary",
  "connections":[{"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]}
 ]`)
 
-	for i, want := range []bool{true, false, false, false} {
-		if got := resources[i].PrimaryRuledOutBesidesStandAlone(); got != want {
-			t.Errorf("%s: PrimaryRuledOutBesidesStandAlone() = %v, want %v", resources[i].Name, got, want)
+	for i, want := range []bool{true, false, false, false, false, true} {
+		if got := resources[i].PrimaryRuledOutBesides("b"); got != want {
+			t.Errorf("%s: PrimaryRuledOutBesides(b) = %v, want %v", resources[i].Name, got, want)
 		}
+	}
+
+	if !resources[2].StandAlone("a") || resources[0].StandAlone("a") || resources[0].StandAlone("c") {
+		t.Errorf("StandAlone: want a StandAlone only in other-link-standalone, c in none")
+	}
+
+	if got := resources[2].StandAlonePeers(); !slices.Equal(got, []string{"a", "b"}) {
+		t.Errorf("StandAlonePeers() = %v, want [a b]", got)
 	}
 }
 
