@@ -139,6 +139,56 @@ func TestLinstorCSIv113(t *testing.T) {
 		}
 	})
 
+	// HighLevelClient.ReservedCapacity, which GetCapacity runs for a
+	// StorageClass with overProvision: what the volumes in a pool have
+	// promised, from their STORAGE layer data.
+	t.Run("ReservedCapacity", func(t *testing.T) {
+		cached := true
+
+		pools, err := c.Nodes.GetStoragePoolView(ctx, &lapi.ListOpts{Cached: &cached, StoragePool: []string{v113Pool}})
+		if err != nil || len(pools) == 0 {
+			t.Fatalf("GetStoragePoolView: %d pools, %v", len(pools), err)
+		}
+
+		nodes := make([]string, 0, len(pools))
+		for i := range pools {
+			nodes = append(nodes, pools[i].NodeName)
+		}
+
+		// The satellites report the volumes right after the replicas
+		// come up.
+		reserved := func() int64 {
+			reses, err := c.Resources.GetResourceView(ctx, &lapi.ListOpts{Node: nodes, StoragePool: []string{v113Pool}})
+			if err != nil {
+				t.Fatalf("GetResourceView: %v", err)
+			}
+
+			var sum int64
+
+			for i := range reses {
+				if reses[i].Name != "pvc-v113-a" {
+					continue
+				}
+
+				for j := range reses[i].Volumes {
+					layers := reses[i].Volumes[j].LayerDataList
+					if len(layers) == 0 {
+						continue
+					}
+
+					if sv, ok := layers[len(layers)-1].Data.(*lapi.StorageVolume); ok {
+						sum += sv.UsableSizeKib
+					}
+				}
+			}
+
+			return sum
+		}
+
+		harness.Eventually(t, v113Timeout, func() bool { return reserved() >= 2*v113SizeKiB },
+			"the two replicas of pvc-v113-a to reserve their size in "+v113Pool)
+	})
+
 	t.Run("AttachDetachRWXBlock", func(t *testing.T) {
 		v113AttachDetach(ctx, t, stack, c, "pvc-v113-a")
 	})
@@ -386,6 +436,12 @@ func v113AttachDetach(ctx context.Context, t *testing.T, stack *harness.Stack, c
 	if target == "" {
 		t.Fatalf("no node without a disk among %v", diskful)
 	}
+
+	// The target has no storage of its own, as in the live migration
+	// test: blockstor gives an in-use diskless replica on a node with a
+	// pool a disk, and a disk on the FILE pool would keep the volume
+	// from being snapshotted later on.
+	lmRemovePools(ctx, t, stack, target)
 
 	err := c.Resources.MakeAvailable(ctx, rd, target, lapi.ResourceMakeAvailable{AutoManageDualPrimary: true})
 	if err != nil {

@@ -350,9 +350,9 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 
 // missingVolumes answers the replica's volumes with one entry per volume
 // definition, as the satellite reports them after its first apply pass:
-// the device path of the DRBD minor and the disk state, Diskless on a
-// replica without a disk. The second result says whether the replica
-// lacked one of them.
+// its storage pool, the device path of the DRBD minor and the disk state,
+// Diskless on a replica without a disk. The second result says whether
+// the replica lacked one of them.
 func (s *Satellite) missingVolumes(
 	ctx context.Context, resource *blockstoriov1alpha1.Resource, want string,
 ) ([]blockstoriov1alpha1.ResourceVolumeStatus, bool) {
@@ -383,7 +383,16 @@ func (s *Satellite) missingVolumes(
 			continue
 		}
 
-		vol := blockstoriov1alpha1.ResourceVolumeStatus{VolumeNumber: vd.VolumeNumber, DiskState: diskState}
+		pool := resource.Spec.StoragePool
+		if pool == "" {
+			pool = resource.Spec.Props["StorPoolName"]
+		}
+
+		vol := blockstoriov1alpha1.ResourceVolumeStatus{
+			VolumeNumber: vd.VolumeNumber,
+			StoragePool:  pool,
+			DiskState:    diskState,
+		}
 		if vd.DRBDMinor != nil {
 			vol.DevicePath = fmt.Sprintf("/dev/drbd%d", *vd.DRBDMinor)
 		}
