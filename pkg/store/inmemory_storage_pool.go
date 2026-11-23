@@ -137,7 +137,7 @@ func withDerivedState(sp *apiv1.StoragePool) {
 		if sp.SharedSpaceID != "" {
 			sp.FreeSpaceMgrName = sp.SharedSpaceID
 		} else if sp.NodeName != "" && sp.StoragePoolName != "" {
-			sp.FreeSpaceMgrName = sp.NodeName + ":" + sp.StoragePoolName
+			sp.FreeSpaceMgrName = sp.NodeName + ";" + sp.StoragePoolName
 		}
 	}
 }

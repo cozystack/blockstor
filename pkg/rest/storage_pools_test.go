@@ -718,7 +718,7 @@ func TestPoolCreateRejectsNonCanonicalName(t *testing.T) {
 
 // TestSPListIncludesFreeSpaceMgrName pins Bug 59 / CLI parity audit
 // row #3: `linstor sp l` SharedName column reads from
-// `free_space_mgr_name`. Upstream LINSTOR sets it to `<node>:<pool>`
+// `free_space_mgr_name`. Upstream LINSTOR sets it to `<node>;<pool>`
 // for local pools and to the shared-space identifier for shared ones,
 // and the Python CLI's `':' not in free_space_mgr_name` check crashes
 // with TypeError when the field is null. Both store backends MUST
@@ -727,7 +727,7 @@ func TestSPListIncludesFreeSpaceMgrName(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	// Local pool (no shared space) → expect `<node>:<pool>`.
+	// Local pool (no shared space) → expect `<node>;<pool>`.
 	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
 		StoragePoolName: "zfs-thin",
 		NodeName:        "dev-kvaps-worker-1",
@@ -762,7 +762,7 @@ func TestSPListIncludesFreeSpaceMgrName(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"dev-kvaps-worker-1:zfs-thin": "dev-kvaps-worker-1:zfs-thin",
+		"dev-kvaps-worker-1:zfs-thin": "dev-kvaps-worker-1;zfs-thin",
 		"dev-kvaps-worker-2:san-pool": "shared-san-A",
 	}
 

@@ -323,12 +323,14 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 		}
 	}
 
-	// Upstream LINSTOR populates FreeSpaceMgrName with `<Node>:<Pool>`
-	// for local pools. The Python CLI does `':' not in
-	// free_space_mgr_name` and crashes with TypeError when the field
-	// is null. Mirror upstream — for shared pools, upstream uses the
-	// shared_space identifier; we follow the same convention.
-	fsmName := crd.Spec.NodeName + ":" + poolName
+	// Upstream LINSTOR populates FreeSpaceMgrName with `<Node>;<Pool>`
+	// for local pools (SharedStorPoolName's reserved connector) and
+	// with the shared_space identifier for shared ones. The Python CLI
+	// does `':' not in free_space_mgr_name` and crashes with TypeError
+	// when the field is null. linstor-csi from v1.13 tells a shared
+	// space by the absence of `;`, so any other separator makes every
+	// local pool look shared to it.
+	fsmName := crd.Spec.NodeName + ";" + poolName
 	if crd.Spec.SharedSpaceID != "" {
 		fsmName = crd.Spec.SharedSpaceID
 	}
