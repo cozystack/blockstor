@@ -217,6 +217,8 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	placed := countDiskfulReplicas(plan.existing, plan.disabled)
 	want := int(filter.PlaceCount)
 
+	defer p.holdWitness(ctx, rdName, want-placed)()
+
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.preferred, placed, want)
 	if err != nil {
 		return placed, want, err
@@ -733,30 +735,13 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		return false, nil
 	}
 
-	// corner-D2b: when the candidate node already hosts a diskless
-	// witness (recorded in `upgradeable` at newState time), promote it
-	// to diskful in place instead of creating a fresh Resource — a
-	// Create would hit ErrAlreadyExists and the witness would never gain
-	// a backing disk. The promote strips DISKLESS+TIE_BREAKER and stamps
-	// the chosen StorPoolName, the exact transition the explicit
-	// `r c <node> --storage-pool` toggle-disk path performs via
-	// pkg/rest.promoteDisklessReplica.
-	if _, isWitness := s.upgradeable[naming.Key(pool.NodeName)]; isWitness {
-		err := s.promoteWitness(ctx, st, rdName, pool)
-		if err != nil {
-			return false, err
-		}
-	} else {
-		res := apiv1.Resource{
-			Name:     rdName,
-			NodeName: pool.NodeName,
-			Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
-		}
+	err := s.writeReplica(ctx, st, rdName, pool)
+	if errors.Is(err, errReplicaTerminating) {
+		return false, nil
+	}
 
-		err := st.Resources().Create(ctx, &res)
-		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
-			return false, errors.Wrap(err, "create resource")
-		}
+	if err != nil {
+		return false, err
 	}
 
 	s.taken[naming.Key(pool.NodeName)] = struct{}{}
@@ -795,6 +780,36 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 	return true, nil
 }
 
+// writeReplica lands the diskful replica tryPlace chose on pool.
+//
+// corner-D2b: when the candidate node already hosts a diskless
+// witness (recorded in `upgradeable` at newState time), promote it
+// to diskful in place instead of creating a fresh Resource — a
+// Create would hit ErrAlreadyExists and the witness would never gain
+// a backing disk. The promote strips DISKLESS+TIE_BREAKER and stamps
+// the chosen StorPoolName, the exact transition the explicit
+// `r c <node> --storage-pool` toggle-disk path performs via
+// pkg/rest.promoteDisklessReplica. A create that finds a replica
+// written since newState goes through takeOverReplicaWrittenMeanwhile.
+func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
+	if _, isWitness := s.upgradeable[naming.Key(pool.NodeName)]; isWitness {
+		return s.promoteWitness(ctx, st, rdName, pool)
+	}
+
+	res := apiv1.Resource{
+		Name:     rdName,
+		NodeName: pool.NodeName,
+		Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
+	}
+
+	err := st.Resources().Create(ctx, &res)
+	if errors.Is(err, store.ErrAlreadyExists) {
+		err = s.takeOverReplicaWrittenMeanwhile(ctx, st, rdName, pool)
+	}
+
+	return errors.Wrap(err, "create resource")
+}
+
 // promoteWitness converts the diskless witness already on pool.NodeName
 // into a diskful replica backed by pool.StoragePoolName (corner-D2b).
 // It strips DISKLESS + TIE_BREAKER and stamps StorPoolName via
@@ -807,46 +822,106 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 // The patch is conflict-safe: PatchResourceSpec re-runs the closure
 // against the freshly-fetched live replica on every optimistic-
 // concurrency retry, so a racing satellite Status write converges
-// instead of clobbering the promote. A NotFound (the witness was
-// collapsed out from under us between newState and here) is treated as
-// "nothing to promote" and falls back to a fresh Create so the
-// placement still lands.
+// instead of clobbering the promote. The closure decides on that live
+// replica, not on what the placement read earlier:
+//
+//   - a replica that turned diskful meanwhile is left as it is and
+//     counts as placed;
+//   - a replica being deleted is not promoted: the patch would land on
+//     an object about to vanish, and the placement would count a
+//     replica that is gone a moment later. errReplicaTerminating tells
+//     the caller the node is not placed on;
+//   - a replica that is gone (a concurrent witness-collapse) gets a
+//     fresh diskful create so the placement still lands. When that
+//     create finds a replica again, written in between, the next round
+//     decides on it the same way rather than counting it unseen.
 func (s *state) promoteWitness(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
-	err := st.Resources().PatchResourceSpec(ctx, rdName, pool.NodeName, func(live *apiv1.Resource) error {
-		keep, _ := apiv1.PromoteWitnessFlags(live.Flags, true)
-		live.Flags = keep
+	for range witnessTakeOverRounds {
+		err := st.Resources().PatchResourceSpec(ctx, rdName, pool.NodeName, func(live *apiv1.Resource) error {
+			if slices.Contains(live.Flags, apiv1.ResourceFlagDelete) {
+				return errReplicaTerminating
+			}
 
-		if live.Props == nil {
-			live.Props = map[string]string{}
+			if !isDisklessReplica(live.Flags) {
+				return errReplicaDiskful
+			}
+
+			keep, _ := apiv1.PromoteWitnessFlags(live.Flags, true)
+			live.Flags = keep
+
+			if live.Props == nil {
+				live.Props = map[string]string{}
+			}
+
+			live.Props[storPoolNameProp] = pool.StoragePoolName
+
+			return nil
+		})
+
+		switch {
+		case err == nil, errors.Is(err, errReplicaDiskful):
+			return nil
+		case errors.Is(err, errReplicaTerminating):
+			return errReplicaTerminating
+		case !errors.Is(err, store.ErrNotFound):
+			return errors.Wrap(err, "promote witness to diskful")
 		}
 
-		live.Props[storPoolNameProp] = pool.StoragePoolName
+		res := apiv1.Resource{
+			Name:     rdName,
+			NodeName: pool.NodeName,
+			Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
+		}
 
-		return nil
-	})
-	if err == nil {
-		return nil
+		err = st.Resources().Create(ctx, &res)
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			return errors.Wrap(err, "create resource after witness vanished")
+		}
 	}
 
-	if !errors.Is(err, store.ErrNotFound) {
-		return errors.Wrap(err, "promote witness to diskful")
-	}
+	return errors.Wrapf(errReplicaKeptChanging, "replica of %s on %s", rdName, pool.NodeName)
+}
 
-	// The witness vanished between newState and the patch (e.g. a
-	// concurrent witness-collapse). Land a fresh diskful replica so the
-	// placement target is still met.
-	res := apiv1.Resource{
-		Name:     rdName,
-		NodeName: pool.NodeName,
-		Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
-	}
+// witnessTakeOverRounds bounds how often promoteWitness re-reads a
+// replica that vanished and reappeared under it. One writer, the
+// tiebreaker reconciler, can do that at most once per definition
+// change, so a few rounds settle it.
+const witnessTakeOverRounds = 3
 
-	createErr := st.Resources().Create(ctx, &res)
-	if createErr != nil && !errors.Is(createErr, store.ErrAlreadyExists) {
-		return errors.Wrap(createErr, "create resource after witness vanished")
-	}
+// errReplicaTerminating is a replica the placement would take over
+// that is being deleted. The node is not placed on.
+var errReplicaTerminating = errors.New("replica is being deleted")
 
-	return nil
+// errReplicaKeptChanging is a replica that vanished and came back on
+// every round of promoteWitness.
+var errReplicaKeptChanging = errors.New("kept changing during the placement")
+
+// errReplicaDiskful stops a witness promotion that finds the replica
+// diskful already: it is left as it is.
+var errReplicaDiskful = errors.New("replica is diskful already")
+
+// isDisklessReplica reports whether flags are those of a replica the
+// placement takes over: a diskless replica or a TieBreaker witness.
+func isDisklessReplica(flags []string) bool {
+	return slices.Contains(flags, apiv1.ResourceFlagDiskless) ||
+		slices.Contains(flags, apiv1.ResourceFlagTieBreaker)
+}
+
+// takeOverReplicaWrittenMeanwhile settles a create that found a replica
+// of rdName already on pool.NodeName, written after the placement read
+// the definition's replicas. The one writer that does that is the
+// controller's tiebreaker reconciler: it watches the replicas the
+// placement creates one by one, and at the two diskful replicas of a
+// three-replica placement puts a TIE_BREAKER witness on the very node
+// the third one is for. Counting that witness as the replica placed
+// left the definition one diskful replica short, with a witness in its
+// quorum, until a later placement promoted it minutes on. LINSTOR
+// places a diskful replica over a TieBreaker by taking the witness
+// over, as this placer does for a witness it saw before it started, so
+// the replica found here goes through the same promoteWitness, which
+// leaves a diskful one as it is.
+func (s *state) takeOverReplicaWrittenMeanwhile(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
+	return s.promoteWitness(ctx, st, rdName, pool)
 }
 
 // poolKey is the composite (node, pool) lookup key used to find a

@@ -43,6 +43,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // Bug148ResizePendingAnnotationPrefix is the per-volume annotation
@@ -400,7 +401,9 @@ func shouldKeepExistingWitness(diskful, _, witnessUnnecessaryDiskfulCount int) b
 //     breaks the tie. Suppression also gates this branch — the REST
 //     per-resource-delete handler stamps a short-lived annotation
 //     right before dropping the witness so the next reconcile
-//     doesn't put it back milliseconds later.
+//     doesn't put it back milliseconds later. So does a placement
+//     still writing its diskful replicas (isPlacementInProgress): the
+//     replicas it wrote so far are not the shape to decide on.
 //
 //  2. Keep branch (Bug 104): preserve an already-stamped TIE_BREAKER
 //     only at the even-diskful tie it defends (diskful == 2). Below
@@ -424,7 +427,7 @@ func shouldTieBreakerExist(
 
 	nonWitnessDiskless := len(diskless) - len(witness)
 
-	wantNewWitness := !isTiebreakerSuppressed(rd) &&
+	wantNewWitness := !isTiebreakerSuppressed(rd) && !isPlacementInProgress(rd) &&
 		len(diskful) >= 2 && len(diskful)%2 == 0 && nonWitnessDiskless == 0
 
 	const witnessUnnecessaryDiskfulCount = 3
@@ -606,6 +609,19 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	return time.Now().Before(deadline)
 }
 
+// isPlacementInProgress reports whether a placement is still writing
+// the RD's diskful replicas (PlacementInProgressUntilAnnotation). The
+// replicas it has written so far are not the shape the witness decision
+// is for: a three-replica placement two replicas in looks like the
+// even-diskful tie a witness breaks, and the witness would land on the
+// node the third replica is for. The placement removing the annotation
+// wakes the RD, and the decision is made on the replicas it placed.
+func isPlacementInProgress(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	_, ok := apiv1.PlacementInProgressUntil(rd.Annotations, time.Now())
+
+	return ok
+}
+
 // isKeepTiebreakerActive reports whether an operator recently ran
 // `linstor r d --keep-tiebreaker <diskful> <rd>` against this RD.
 // The REST per-resource-delete handler stamps an RFC3339 deadline on
@@ -698,18 +714,17 @@ func (r *ResourceDefinitionReconciler) listReplicasDirect(ctx context.Context, r
 		return r.Store.Resources().ListByDefinition(ctx, rdName)
 	}
 
+	// Only the definition's replicas: this runs on every pass of every
+	// definition, and reading the whole cluster here kept the controller
+	// at its CPU limit (storek8s.ReplicasOf).
 	var crdList blockstoriov1alpha1.ResourceList
-	if err := r.APIReader.List(ctx, &crdList); err != nil {
+	if err := storek8s.ReplicasOf(ctx, r.APIReader, r.Client, rdName, &crdList); err != nil {
 		return nil, err
 	}
 
 	out := make([]apiv1.Resource, 0, len(crdList.Items))
 
 	for i := range crdList.Items {
-		if !isReplicaOf(&crdList.Items[i], rdName) {
-			continue
-		}
-
 		out = append(out, apiv1.Resource{
 			Name:     crdList.Items[i].Spec.ResourceDefinitionName,
 			NodeName: crdList.Items[i].Spec.NodeName,
