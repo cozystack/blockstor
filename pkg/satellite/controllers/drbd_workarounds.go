@@ -455,7 +455,9 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 // paused peer, the active peer is disconnected and connected instead.
 // Neither is done to a link that would leave a Primary, here or the
 // peer, without an UpToDate disk among this node and its other connected
-// peers (drbd.KernelResource.MayDisconnect).
+// peers, or that the Primary's quorum could hang on: while a Primary is
+// at either end, every configured connection of this node must be
+// Connected (drbd.KernelResource.MayDisconnect).
 
 // stalledResyncMinRate is the resync progress, in KiB/s, below which a
 // pass counts as stalled. DRBD's defaults keep a resync at c-min-rate
@@ -564,7 +566,7 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 		w.reconnectActivePeer(ctx, logger, res, replica, dep, stuck)
 	default:
 		w.acted(logger, replica, res.Name, "DRBDResyncStalled", stuck+
-			": left alone, dropping either peer would leave a Primary without an UpToDate disk (LINBIT/drbd#149)")
+			": left alone, dropping either peer could leave a Primary without an UpToDate disk or quorum (LINBIT/drbd#149)")
 	}
 }
 

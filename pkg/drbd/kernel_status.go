@@ -223,11 +223,16 @@ type ResyncDependency struct {
 }
 
 // MayDisconnect reports whether this node can drop its connection to
-// peer without taking a Primary's last good copy away. It is false when
-// this node is Primary, or peer is, and some volume would then have no
-// UpToDate disk left among this node and its other connected peers.
-// This node sees only its own connections: for a Primary peer it reads
-// another connected UpToDate peer as the copy that Primary keeps.
+// peer without taking a Primary's last good copy or its quorum away. It
+// is false when this node is Primary, or peer is, and either some volume
+// would then have no UpToDate disk left among this node and its other
+// connected peers, or that Primary could lose its quorum. Every node
+// counts as a voter, an Inconsistent one too, so the Primary keeps a
+// majority only when every configured connection of this node is
+// Connected and the nodes left on its side outnumber the rest. This node
+// sees only its own connections: for a Primary peer it reads another
+// connected UpToDate peer as the copy that Primary keeps, and its own
+// links as the ones that Primary has.
 func (r *KernelResource) MayDisconnect(peer string) bool {
 	primaryPeer := slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
 		return c.Name == peer && c.PeerRole == string(RolePrimary)
@@ -236,6 +241,10 @@ func (r *KernelResource) MayDisconnect(peer string) bool {
 
 	if !primaryPeer && !localPrimary {
 		return true
+	}
+
+	if !r.keepsQuorumWithoutALink() {
+		return false
 	}
 
 	for _, dev := range r.Devices {
@@ -249,6 +258,22 @@ func (r *KernelResource) MayDisconnect(peer string) bool {
 	}
 
 	return true
+}
+
+// keepsQuorumWithoutALink reports whether, with one of this node's links
+// dropped, a Primary at either end of it still sees a majority of the
+// nodes: every configured connection is Connected, so the Primary sees
+// all of them but one, and that is more than half.
+func (r *KernelResource) keepsQuorumWithoutALink() bool {
+	if slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
+		return c.ConnectionState != string(ConnectionStateConnected)
+	}) {
+		return false
+	}
+
+	nodes := len(r.Connections) + 1
+
+	return 2*(nodes-1) > nodes
 }
 
 // peerUpToDate reports whether a connected peer has an UpToDate disk of

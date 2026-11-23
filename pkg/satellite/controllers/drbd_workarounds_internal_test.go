@@ -309,6 +309,30 @@ func TestStalledResyncDisconnectsAPausedPrimary(t *testing.T) {
 	}
 }
 
+// A Primary paused peer is not dropped while a node of the resource is
+// down: with four voters and one of them away, the Primary would see two
+// of four without this node and lose quorum. The active peer, no Primary,
+// is reconnected instead.
+func TestStalledResyncKeepsAPrimarysQuorum(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	down := `,{"name":"n4","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,
+   "replication-state":"Off","peer-disk-state":"DUnknown","resync-suspended":"no"}]}]}]`
+
+	for range 5 {
+		status := resyncStatus(frozen(1)[0], "Primary")
+		adm.status = strings.TrimSuffix(status, "]}]") + down
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if want := []string{"disconnect pvc-stall:n1", "connect pvc-stall:n1"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("actions = %v, want %v", adm.actions, want)
+	}
+}
+
 // alpha.15 before the freeze: the active resync ran at 100-150 KiB/s for
 // 14 minutes, percent still moving. Too slow is stalled too.
 func TestStalledResyncCatchesATrickle(t *testing.T) {

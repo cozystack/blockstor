@@ -264,7 +264,17 @@ func TestKernelStatusMayDisconnect(t *testing.T) {
   {"name":"b","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
 {"name":"local-primary","role":"Primary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
  "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
-  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"Inconsistent"}]}]}
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"Inconsistent"}]}]},
+{"name":"primary-peer-one-node-down","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"c","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
+{"name":"local-primary-one-node-down","role":"Primary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"Inconsistent"}]},
+  {"name":"c","connection-state":"StandAlone","peer-role":"Unknown","peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
+{"name":"two-nodes","role":"Primary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]}
 ]`)
 
 	cases := []struct {
@@ -283,6 +293,16 @@ func TestKernelStatusMayDisconnect(t *testing.T) {
 		// A local Inconsistent Primary reads from a alone.
 		{3, "a", false},
 		{3, "b", true},
+		// Four voters, c down: the Primary a sees three; without this
+		// node it would see two of four, no majority, although b keeps
+		// its data.
+		{4, "a", false},
+		// b is no Primary, and this node is none either.
+		{4, "b", true},
+		// This Primary's disk is good, but it would see two of four.
+		{5, "b", false},
+		// Two nodes: alone, a Primary has no majority.
+		{6, "a", false},
 	}
 
 	for _, c := range cases {
