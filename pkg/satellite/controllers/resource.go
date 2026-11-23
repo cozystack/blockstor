@@ -51,6 +51,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
@@ -166,13 +167,19 @@ type ResourceReconciler struct {
 
 	// waits reports an apply that waits too long for the controller.
 	waits controllerWaits
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // Reconcile reads a Resource and drives the satellite-side
 // apply chain when the Resource is placed on this node.
 // Finalizer-aware: stamps `SatelliteResourceFinalizer` on
 // every live Resource so kube-apiserver waits for our tear-down
-// before allowing the object to disappear.
+// before allowing the object to disappear. A pass that lost an
+// optimistic-concurrency race is retried instead of reported as an
+// error; see conflict.Retrier.
 //
 // Every retry (a failed apply, an error, a wait on the allocator) is
 // pinned to normal priority: controller-runtime otherwise keeps the
@@ -180,12 +187,12 @@ type ResourceReconciler struct {
 // initial list, which controller-runtime queues at low priority, would
 // be retried behind every other replica of a cold start.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	result, err := r.reconcileResource(ctx, req)
+	result, err := r.conflicts.Reconcile(ctx, req, r.reconcileResource)
 	if result.Priority == nil {
 		result.Priority = normalPriority()
 	}
 
-	return result, err
+	return result, err //nolint:wrapcheck // the pass's own error, already wrapped
 }
 
 // applyFailureRequeue is the first backoff between satellite Apply
