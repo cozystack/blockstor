@@ -104,12 +104,25 @@ func DefaultWorkaroundsConfig() WorkaroundsConfig {
 	}
 }
 
+// enabled is whether a pass has anything to do: an interval and at
+// least one check. With every check off a pass reads nothing and acts on
+// nothing, so ticking it only costs a wakeup and reads as running.
+func (c WorkaroundsConfig) enabled() bool {
+	return c.Interval > 0 &&
+		(c.StalledResync || c.IdlePrimary || c.ForcedIOFailures || c.StaleLoopDevices)
+}
+
 // logState logs at start which checks run and how often. A check logs
 // nothing until it acts, so without this line nothing in the log tells
 // whether a satellite runs a check at all.
 func (c WorkaroundsConfig) logState(logger logr.Logger) {
-	if c.Interval <= 0 {
-		logger.Info("DRBD workarounds disabled", "interval", c.Interval.String())
+	if !c.enabled() {
+		reason := "no check enabled"
+		if c.Interval <= 0 {
+			reason = "interval is 0"
+		}
+
+		logger.Info("DRBD workarounds disabled", "interval", c.Interval.String(), "reason", reason)
 
 		return
 	}
@@ -180,6 +193,11 @@ type DRBDWorkaroundsRunnable struct {
 	// configuration, each with what the adjust owed to it does; every
 	// pass retries them (adjustOwed).
 	owedAdjust map[string]string
+
+	// kernelRead is whether the last pass read the kernel status, and
+	// kernelReadLogged whether any pass has logged it yet (logKernelRead).
+	kernelRead       bool
+	kernelReadLogged bool
 }
 
 // newDRBDWorkaroundsRunnable builds the runnable the manager runs, gated
@@ -222,11 +240,12 @@ func (w *DRBDWorkaroundsRunnable) Start(ctx context.Context) error {
 }
 
 // RegisterWithManager adds the runnable to mgr when Config.Interval is
-// set, and logs which checks the satellite runs either way.
+// set and a check is on, and logs which checks the satellite runs either
+// way.
 func (w *DRBDWorkaroundsRunnable) RegisterWithManager(mgr manager.Manager) error {
 	w.Config.logState(mgr.GetLogger().WithName("drbd-workarounds"))
 
-	if w.Config.Interval <= 0 {
+	if !w.Config.enabled() {
 		return nil
 	}
 
@@ -247,7 +266,7 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 	w.adjustOwed(ctx, logger)
 
 	wanted := w.kernelStatusWanted()
-	logger.V(1).Info("DRBD workarounds pass", "kernelStatusRead", wanted)
+	w.logKernelRead(logger, wanted)
 
 	if !wanted {
 		w.stalls, w.idle, w.failingIO = nil, nil, nil
@@ -283,6 +302,20 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 	}
 
 	w.stalls, w.idle, w.failingIO = stalls, idle, failingIO
+}
+
+// logKernelRead logs at Info whether the pass reads the kernel status,
+// on the first pass and then only when that changes, so the log shows an
+// idle node running no command without a line every interval. Not V(1):
+// the satellite's log sink drops everything below Info.
+func (w *DRBDWorkaroundsRunnable) logKernelRead(logger logr.Logger, read bool) {
+	if w.kernelReadLogged && w.kernelRead == read {
+		return
+	}
+
+	w.kernelRead, w.kernelReadLogged = read, true
+
+	logger.Info("DRBD workarounds pass", "kernelStatusRead", read)
 }
 
 // hold claims name for this pass's checks; see Hold.

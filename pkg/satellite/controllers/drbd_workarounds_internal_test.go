@@ -1146,7 +1146,9 @@ func TestNewDRBDWorkaroundsRunnableWiresConfigHintsAndHold(t *testing.T) {
 }
 
 // logManager is a manager that records the runnables added to it and the
-// lines logged through its logger; every other method panics.
+// lines logged through its logger; every other method panics. Its logger
+// keeps Info and drops V(1), as the satellite's slog sink at LevelInfo
+// does, so a line logged only at V(1) is missing here as in production.
 type logManager struct {
 	manager.Manager
 
@@ -1163,7 +1165,7 @@ func (m *logManager) Add(r manager.Runnable) error {
 func (m *logManager) GetLogger() logr.Logger {
 	return funcr.New(func(prefix, args string) {
 		m.lines = append(m.lines, prefix+" "+args)
-	}, funcr.Options{Verbosity: 1})
+	}, funcr.Options{Verbosity: 0})
 }
 
 // The satellite says at start which DRBD workarounds it runs and how
@@ -1190,7 +1192,14 @@ func TestWorkaroundsLogTheirStateAtStart(t *testing.T) {
 		{
 			name: "disabled",
 			cfg:  WorkaroundsConfig{},
-			want: `"msg"="DRBD workarounds disabled" "interval"="0s"`,
+			want: `"msg"="DRBD workarounds disabled" "interval"="0s" "reason"="interval is 0"`,
+		},
+		{
+			// An interval with every check off would tick a pass that
+			// does nothing and log "enabled" with every check false.
+			name: "no check on",
+			cfg:  WorkaroundsConfig{Interval: defaultWorkaroundInterval, StalledResyncPasses: 4},
+			want: `"msg"="DRBD workarounds disabled" "interval"="30s" "reason"="no check enabled"`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1215,8 +1224,10 @@ func TestWorkaroundsLogTheirStateAtStart(t *testing.T) {
 	}
 }
 
-// Every pass says at V(1) whether it read the kernel status, so an idle
-// node running no command is visible in the log.
+// A pass says at Info whether it read the kernel status, on the first
+// pass and then only when that changes, so an idle node running no
+// command is visible in the satellite's Info-level log without a line
+// every interval.
 func TestWorkaroundPassLogsWhetherItReadTheKernel(t *testing.T) {
 	t.Parallel()
 
@@ -1228,10 +1239,10 @@ func TestWorkaroundPassLogsWhetherItReadTheKernel(t *testing.T) {
 
 	mgr := &logManager{}
 
-	w.pass(t.Context(), mgr.GetLogger())
-
-	hints.Inconsistent = true
-	w.pass(t.Context(), mgr.GetLogger())
+	for _, inconsistent := range []bool{false, false, true, true, false} {
+		hints.Inconsistent = inconsistent
+		w.pass(t.Context(), mgr.GetLogger())
+	}
 
 	var passes []string
 
@@ -1241,9 +1252,15 @@ func TestWorkaroundPassLogsWhetherItReadTheKernel(t *testing.T) {
 		}
 	}
 
-	if len(passes) != 2 || !strings.Contains(passes[0], `"kernelStatusRead"=false`) ||
-		!strings.Contains(passes[1], `"kernelStatusRead"=true`) || !strings.Contains(passes[0], `"level"=1`) {
-		t.Errorf("pass lines = %q, want a V(1) line without and then with the kernel read", passes)
+	want := []string{`"kernelStatusRead"=false`, `"kernelStatusRead"=true`, `"kernelStatusRead"=false`}
+	if len(passes) != len(want) {
+		t.Fatalf("pass lines = %q, want one per change: %q", passes, want)
+	}
+
+	for i := range want {
+		if !strings.Contains(passes[i], want[i]) || !strings.Contains(passes[i], `"level"=0`) {
+			t.Errorf("pass line %d = %q, want an Info line with %s", i, passes[i], want[i])
+		}
 	}
 }
 
