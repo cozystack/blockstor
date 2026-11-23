@@ -865,7 +865,7 @@ func (w *DRBDWorkaroundsRunnable) loadOwedReconnects(logger logr.Logger) {
 		}
 
 		peers := w.owedReconnect[name]
-		for _, peer := range strings.Fields(string(record)) {
+		for peer := range strings.FieldsSeq(string(record)) {
 			if !slices.Contains(peers, peer) {
 				peers = append(peers, peer)
 			}
