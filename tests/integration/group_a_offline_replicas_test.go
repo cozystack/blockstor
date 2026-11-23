@@ -314,6 +314,91 @@ func TestGroupAStaleKernelLoadedFalseReadsHealthy(t *testing.T) {
 	}
 }
 
+// TestGroupARecreatedWithoutDiskReadsFaulty: once the satellite has
+// brought a downed replica's kernel resource back but its adjust keeps
+// failing, the kernel holds the resource with no disk and its peer
+// links StandAlone. LINSTOR answers that state as reported, and
+// linstor-client shows a red Diskless, since the replica is not flagged
+// DISKLESS, with the StandAlone peers in Conns, and lists it under
+// `--faulty`. A provoked-failure test read this row as healthy; this
+// pins that the view gives linstor-client what it needs to flag it.
+func TestGroupARecreatedWithoutDiskReadsFaulty(t *testing.T) {
+	stack := harness.StartStack(t)
+	harness.SeedThreeNodeCluster(t, stack)
+
+	ctx := context.Background()
+
+	const rdName = "rd-kernel-diskless"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec:       blockstoriov1alpha1.ResourceDefinitionSpec{ResourceGroupName: harness.FixtureDefaultRG},
+	}
+
+	err := stack.Env.Client.Create(ctx, rd)
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	cli := &harness.CLI{URL: stack.RestURL}
+	cli.Run(t, "volume-definition", "create", rdName, "10M")
+
+	peers := map[string]string{harness.NodeWorker1: harness.NodeWorker2, harness.NodeWorker2: harness.NodeWorker1}
+	for node := range peers {
+		res := &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: rdName + "." + node},
+			Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: rdName, NodeName: node},
+		}
+
+		err = stack.Env.Client.Create(ctx, res)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("seed Resource on %s: %v", node, err)
+		}
+	}
+
+	for node, peer := range peers {
+		reportHealthySecondary(t, stack, rdName+"."+node, peer)
+	}
+
+	reportRecreatedWithoutDisk(t, stack, rdName+"."+harness.NodeWorker1, harness.NodeWorker2)
+
+	table := faultyTable(t, stack, rdName)
+
+	row := faultyRow(table, harness.NodeWorker1)
+	if !strings.Contains(row, "Diskless") || !strings.Contains(row, "StandAlone("+harness.NodeWorker2+")") {
+		t.Errorf("`r l --faulty` does not list the replica with no disk and a StandAlone peer as such:\n%s", table)
+	}
+}
+
+// reportRecreatedWithoutDisk writes what the satellite reports for a
+// kernel resource brought back without its disk whose peer link stays
+// StandAlone: a Diskless volume, the link down, KernelLoaded=True.
+func reportRecreatedWithoutDisk(t *testing.T, stack *harness.Stack, name, peer string) {
+	t.Helper()
+
+	harness.Eventually(t, 10*time.Second, func() bool {
+		var res blockstoriov1alpha1.Resource
+
+		err := stack.Env.Client.Get(context.Background(), types.NamespacedName{Name: name}, &res)
+		if err != nil {
+			return false
+		}
+
+		res.Status.InUse = false
+		res.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, DiskState: "Diskless"}}
+		res.Status.Connections = []blockstoriov1alpha1.ResourceConnectionStatus{
+			{PeerNodeName: peer, Connected: false, Message: "StandAlone"},
+		}
+		meta.SetStatusCondition(&res.Status.Conditions, metav1.Condition{
+			Type:   blockstoriov1alpha1.ConditionKernelLoaded,
+			Status: metav1.ConditionTrue,
+			Reason: "KernelSlotCreated",
+		})
+
+		return stack.Env.Client.Status().Update(context.Background(), &res) == nil
+	}, "report "+name+" brought back without its disk")
+}
+
 // markKernelLoadedFalse sets KernelLoaded=False on a replica and leaves
 // the rest of its status as reported.
 func markKernelLoadedFalse(t *testing.T, stack *harness.Stack, name string) {
