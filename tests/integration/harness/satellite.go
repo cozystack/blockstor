@@ -22,6 +22,8 @@ package harness
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -91,6 +93,11 @@ type Satellite struct {
 	// a satellite that no longer heartbeats).
 	nodeOffline map[string]bool
 
+	// volumesUnreported[rdName] true → the satellite reports no
+	// volumes for the definition's replicas, see
+	// SimulateVolumesUnreported.
+	volumesUnreported map[string]bool
+
 	// failNext is the queue of pending FakeExec-style failures the
 	// satellite mock is asked to inject the next time it sees a
 	// matching command. Phase 0 stores them but does not consult
@@ -110,6 +117,8 @@ func NewSatellite(cli client.Client) *Satellite {
 		drbdState:    map[string]map[string]string{},
 		nodeOffline:  map[string]bool{},
 		tickInterval: satelliteTickInterval,
+
+		volumesUnreported: map[string]bool{},
 	}
 }
 
@@ -173,6 +182,18 @@ func (s *Satellite) SimulateDRBDState(rdName, node, state string) {
 	s.drbdState[rdName][node] = state
 }
 
+// SimulateVolumesUnreported keeps the satellite from reporting the
+// volumes of rdName's replicas, which freezes the definition at day0: no
+// replica reports data yet. Use for tests of what the controller does
+// before the first apply pass reported back, such as the auto-primary
+// election, which ends once a replica reports UpToDate data.
+func (s *Satellite) SimulateVolumesUnreported(rdName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.volumesUnreported[rdName] = true
+}
+
 // FailNext enqueues a FakeExec-style command match that the next
 // satellite-side shell-out should fail with. Phase 0 stores it but
 // does not enforce — the mock never shells out. The slot exists so
@@ -195,6 +216,7 @@ func (s *Satellite) tickOnce(ctx context.Context) {
 	s.reconcileNodes(ctx)
 	s.reconcileStoragePools(ctx)
 	s.reconcileResources(ctx)
+	s.reconcileSnapshots(ctx)
 }
 
 // reconcileNodes stamps Conditions[Ready] and ConnectionStatus on
@@ -303,22 +325,134 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 		s.stampLiveMigrateApplied(ctx, resource)
 
 		want := s.desiredDrbdState(resource)
-		if resource.Status.DrbdState == want {
+		volumes, missing := s.missingVolumes(ctx, resource, want)
+
+		if resource.Status.DrbdState == want && !missing {
 			continue
 		}
 
 		patched := resource.DeepCopy()
 		patched.Status.DrbdState = want
+		patched.Status.Volumes = volumes
 
 		// Volumes follow the resource: the satellite reports
 		// UpToDate / Diskless on a per-volume DiskState. We
 		// project the resource-level value uniformly — sufficient
-		// for the smoke test and Phase 0.
+		// for the smoke test and Phase 0 — and Diskless on a
+		// replica without a disk.
 		for j := range patched.Status.Volumes {
-			patched.Status.Volumes[j].DiskState = want
+			patched.Status.Volumes[j].DiskState = volumeDiskState(resource, want)
 		}
 
 		_ = s.client.Status().Update(ctx, patched)
+	}
+}
+
+// missingVolumes answers the replica's volumes with one entry per volume
+// definition, as the satellite reports them after its first apply pass:
+// the device path of the DRBD minor and the disk state, Diskless on a
+// replica without a disk. The second result says whether the replica
+// lacked one of them.
+func (s *Satellite) missingVolumes(
+	ctx context.Context, resource *blockstoriov1alpha1.Resource, want string,
+) ([]blockstoriov1alpha1.ResourceVolumeStatus, bool) {
+	s.mu.Lock()
+	unreported := s.volumesUnreported[resource.Spec.ResourceDefinitionName]
+	s.mu.Unlock()
+
+	if unreported {
+		return resource.Status.Volumes, false
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := s.client.Get(ctx, client.ObjectKey{Name: naming.Key(resource.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		return resource.Status.Volumes, false
+	}
+
+	volumes := resource.Status.Volumes
+	missing := false
+
+	diskState := volumeDiskState(resource, want)
+
+	for _, vd := range rd.Spec.VolumeDefinitions {
+		if slices.ContainsFunc(volumes, func(v blockstoriov1alpha1.ResourceVolumeStatus) bool {
+			return v.VolumeNumber == vd.VolumeNumber
+		}) {
+			continue
+		}
+
+		vol := blockstoriov1alpha1.ResourceVolumeStatus{VolumeNumber: vd.VolumeNumber, DiskState: diskState}
+		if vd.DRBDMinor != nil {
+			vol.DevicePath = fmt.Sprintf("/dev/drbd%d", *vd.DRBDMinor)
+		}
+
+		volumes = append(slices.Clone(volumes), vol)
+		missing = true
+	}
+
+	return volumes, missing
+}
+
+// volumeDiskState is the disk state the satellite reports for each volume
+// of the replica: Diskless without a disk, the resource's state otherwise.
+func volumeDiskState(resource *blockstoriov1alpha1.Resource, want string) string {
+	if slices.Contains(resource.Spec.Flags, "DISKLESS") {
+		return "Diskless"
+	}
+
+	return want
+}
+
+// reconcileSnapshots plays the satellite's part of a snapshot: it acks
+// the I/O suspension the controller asks for, and reports the snapshot
+// taken on each of its nodes once the controller says to take it.
+func (s *Satellite) reconcileSnapshots(ctx context.Context) {
+	var snaps blockstoriov1alpha1.SnapshotList
+
+	err := s.client.List(ctx, &snaps)
+	if err != nil {
+		return
+	}
+
+	for i := range snaps.Items {
+		snap := &snaps.Items[i]
+		if snap.DeletionTimestamp != nil {
+			continue
+		}
+
+		patched := snap.DeepCopy()
+		changed := false
+
+		for _, node := range snap.Spec.Nodes {
+			idx := slices.IndexFunc(patched.Status.NodeStatus, func(n blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
+				return n.NodeName == node
+			})
+			if idx < 0 {
+				patched.Status.NodeStatus = append(patched.Status.NodeStatus,
+					blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: node})
+				idx = len(patched.Status.NodeStatus) - 1
+				changed = true
+			}
+
+			entry := &patched.Status.NodeStatus[idx]
+
+			if entry.SuspendIOAcked != snap.Spec.SuspendIO {
+				entry.SuspendIOAcked = snap.Spec.SuspendIO
+				changed = true
+			}
+
+			if snap.Spec.TakeSnapshot && !entry.Ready {
+				entry.Ready = true
+				entry.CreateTimestamp = time.Now().UnixMilli()
+				changed = true
+			}
+		}
+
+		if changed {
+			_ = s.client.Status().Update(ctx, patched)
+		}
 	}
 }
 
