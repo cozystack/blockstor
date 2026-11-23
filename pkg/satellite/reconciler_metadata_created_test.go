@@ -22,6 +22,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -39,20 +41,24 @@ import (
 type fakeMetadataStamper struct {
 	mu     sync.Mutex
 	calls  []string
+	found  []bool            // per call: true for StampMetadataFound
 	stamps func(string) bool // optional: returns true to fail the call
 }
 
-func (f *fakeMetadataStamper) StampMetadataCreated(_ context.Context, resourceName string) error {
+func (f *fakeMetadataStamper) StampMetadataCreated(_ context.Context, rdName, nodeName string) error {
+	return f.record(rdName, nodeName, false)
+}
+
+func (f *fakeMetadataStamper) StampMetadataFound(_ context.Context, rdName, nodeName string) error {
+	return f.record(rdName, nodeName, true)
+}
+
+// Found reports, per call, whether it was StampMetadataFound.
+func (f *fakeMetadataStamper) Found() []bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.calls = append(f.calls, resourceName)
-
-	if f.stamps != nil && f.stamps(resourceName) {
-		return os.ErrPermission
-	}
-
-	return nil
+	return slices.Clone(f.found)
 }
 
 func (f *fakeMetadataStamper) Calls() []string {
@@ -63,6 +69,22 @@ func (f *fakeMetadataStamper) Calls() []string {
 	copy(out, f.calls)
 
 	return out
+}
+
+func (f *fakeMetadataStamper) record(rdName, nodeName string, found bool) error {
+	resourceName := rdName + "." + nodeName
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.calls = append(f.calls, resourceName)
+	f.found = append(f.found, found)
+
+	if f.stamps != nil && f.stamps(resourceName) {
+		return os.ErrPermission
+	}
+
+	return nil
 }
 
 // TestEnsureMetadataStampsCondition pins Phase 11.3 Stage 1: a
@@ -136,10 +158,84 @@ func TestEnsureMetadataStampsCondition(t *testing.T) {
 		t.Errorf("stamper called with %q, want %q", calls[0], "pvc-stamp.n1")
 	}
 
+	if stamper.Found()[0] {
+		t.Errorf("create-md ran, but the Condition was stamped as metadata found")
+	}
+
 	// Belt-and-braces: file marker still written on the same path.
 	mdMarker := filepath.Join(dir, "pvc-stamp.md-created")
 	if _, err := os.Stat(mdMarker); err != nil {
 		t.Errorf("md-created file marker missing after Apply: %v — belt-and-braces lost", err)
+	}
+}
+
+// TestEnsureMetadataStampsFoundWhenMetadataExists pins the Reason of
+// a replica whose metadata was already on the volume, as on every
+// replica adopted from LINSTOR: dump-md finds it, create-md does not
+// run, and the Condition must not claim create-md succeeded.
+func TestEnsureMetadataStampsFoundWhenMetadataExists(t *testing.T) {
+	dir := t.TempDir()
+
+	resPath := filepath.Join(dir, "pvc-found.res")
+	if err := os.WriteFile(resPath, []byte("resource pvc-found {}\n"), 0o600); err != nil {
+		t.Fatalf("seed .res: %v", err)
+	}
+
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-found_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("drbdadm dump-md pvc-found/0",
+		storage.FakeResponse{Stdout: []byte("version \"v09\";\nmax-peers 7;\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeMetadataStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:              map[string]storage.Provider{"thin1": thin},
+		Adm:                    drbd.NewAdm(fx),
+		StateDir:               dir,
+		NodeName:               "n1",
+		MetadataCreatedStamper: stamper,
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-found",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
+			},
+		},
+	}
+
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, cmd := range fx.CommandLines() {
+		if strings.Contains(cmd, "create-md") {
+			t.Fatalf("create-md ran on a volume dump-md found metadata on: %v", fx.CommandLines())
+		}
+	}
+
+	calls, found := stamper.Calls(), stamper.Found()
+	if len(calls) != 1 || calls[0] != "pvc-found.n1" {
+		t.Fatalf("stamper calls = %v, want exactly [pvc-found.n1]", calls)
+	}
+
+	if !found[0] {
+		t.Errorf("create-md was skipped, but the Condition was stamped as created by create-md")
 	}
 }
 

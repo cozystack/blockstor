@@ -345,3 +345,18 @@ func TestRestoreRefusalKeepsTheOperatorsOrder(t *testing.T) {
 		t.Errorf("missing = %v, want %v (input order, deduped, empties dropped)", missing, want)
 	}
 }
+
+// The snapshot lists its nodes as registered, Node-1, and the operator may
+// name them otherwise: node-1 holds the snapshot, and two spellings of one
+// missing node are one refusal.
+func TestRestoreReadsTheSnapshotNodesInAnotherSpelling(t *testing.T) {
+	t.Parallel()
+
+	missing := validate.RestoreNodesMissingSnapshot(
+		[]string{"node-1", "NODE-2", "node-2"}, []string{"Node-1"})
+
+	want := []string{"NODE-2"}
+	if !slices.Equal(missing, want) {
+		t.Errorf("missing = %v, want %v", missing, want)
+	}
+}

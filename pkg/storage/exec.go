@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -134,6 +135,11 @@ type FakeExec struct {
 	// Responses maps "name arg1 arg2 …" → canned output.
 	// Falling back to empty stdout + nil error if absent.
 	Responses map[string]FakeResponse
+
+	// Sequences maps a command line to responses handed out one per call,
+	// in order, before Responses is consulted. For a command whose answer
+	// changes between calls, such as dump-md before and after apply-al.
+	Sequences map[string][]FakeResponse
 }
 
 // FakeCall records one invocation of FakeExec.Run.
@@ -148,9 +154,34 @@ type FakeResponse struct {
 	Err    error
 }
 
+// FakeExitError is a canned non-zero exit for FakeResponse.Err. It
+// carries the status the way *exec.ExitError does, so code that reads
+// a command's exit status (blkid's "nothing found" is 2) can be driven
+// without running the command.
+type FakeExitError struct {
+	Code int
+}
+
+func (e FakeExitError) Error() string { return "exit status " + strconv.Itoa(e.Code) }
+
+// ExitCode returns the canned status, as (*exec.ExitError).ExitCode does.
+func (e FakeExitError) ExitCode() int { return e.Code }
+
 // NewFakeExec returns a FakeExec ready for use.
 func NewFakeExec() *FakeExec {
 	return &FakeExec{Responses: map[string]FakeResponse{}}
+}
+
+// ExpectSequence queues responses for cmdLine, one per call.
+func (f *FakeExec) ExpectSequence(cmdLine string, responses ...FakeResponse) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.Sequences == nil {
+		f.Sequences = map[string][]FakeResponse{}
+	}
+
+	f.Sequences[cmdLine] = append(f.Sequences[cmdLine], responses...)
 }
 
 // Run looks up a pre-registered response (full command line) and falls
@@ -190,6 +221,12 @@ func (f *FakeExec) RunWithStdin(
 	key := name
 	if len(args) > 0 {
 		key += " " + strings.Join(args, " ")
+	}
+
+	if queue := f.Sequences[key]; len(queue) > 0 {
+		f.Sequences[key] = queue[1:]
+
+		return queue[0].Stdout, queue[0].Err
 	}
 
 	if resp, ok := f.Responses[key]; ok {

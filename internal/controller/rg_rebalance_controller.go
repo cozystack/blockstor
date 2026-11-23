@@ -30,6 +30,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -40,7 +41,7 @@ import (
 // REST-driven trigger and a periodic background tick:
 //
 //  1. REST `linstor rg modify` stamps the
-//     `blockstor.io/rebalance-pending` annotation on the RG CRD when
+//     `blockstor.org/rebalance-pending` annotation on the RG CRD when
 //     PlaceCount strictly increases or a placement-affecting
 //     SelectFilter changes (see pkg/rest/resource_groups.go).
 //  2. The controller-runtime watch on RG CRDs delivers a reconcile
@@ -61,7 +62,7 @@ import (
 //     its behalf. The annotation-driven path is NOT gated — an
 //     operator-driven REST modify still flows through.
 //  5. Scenario 2.20: every Reconcile also scans for RDs stamped with
-//     `blockstor.io/spawn-shortfall=<RFC3339>` by the 9.W05
+//     `blockstor.org/spawn-shortfall=<RFC3339>` by the 9.W05
 //     partial-fail spawn path; once GracePeriod has elapsed since the
 //     stamp, the placer re-runs against that RD and the annotation is
 //     stripped on success.
@@ -93,11 +94,11 @@ type RGRebalanceReconciler struct {
 	nodeOfflineSince   map[string]time.Time
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=controllerconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=controllerconfigs,verbs=get;list;watch
 
 // Reconcile is the explicit + periodic rebalance pass. See the type
 // comment for the five-step lifecycle. Returns `RequeueAfter =
@@ -146,16 +147,31 @@ func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 }
 
 // handleDisabledPass implements scenario 2.W02's "kill-switched" branch.
-// Both the annotation path AND the scheduled-tick path are suppressed;
-// a stamped annotation is stripped so a stale marker doesn't loop
-// forever against the disabled reconciler.
+// The scheduled tick is suppressed and a stamped annotation is stripped
+// so a stale marker doesn't loop forever against the disabled
+// reconciler.
+//
+// The kill switch stops the balance task, not an explicit `rg modify`:
+// LINSTOR reads it in BalanceResources alone and autoplaces every child
+// of a modified group without consulting it. So this pass places every
+// child before it strips the marker, whatever its layer stack. It does
+// not leave the DRBD children to the RG event path: that path is not
+// where LINSTOR's modify places, and it is free to apply the balance
+// checks, the switch among them.
 func (r *RGRebalanceReconciler) handleDisabledPass(ctx context.Context, rg *apiv1.ResourceGroup) error {
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; !hasAnnotation {
 		return nil
 	}
 
-	logf.FromContext(ctx).WithValues("rg", rg.Name).
-		Info("rebalance disabled by BalanceResourcesEnabled=false; stripping stale annotation")
+	log := logf.FromContext(ctx).WithValues("rg", rg.Name)
+
+	count, err := r.rebalanceChildRDs(ctx, rg, 0, allChildren)
+	if err != nil {
+		return err
+	}
+
+	log.Info("rebalance disabled by BalanceResourcesEnabled=false; placed the explicit modify, stripping annotation",
+		"rds_processed", count)
 
 	return r.stripRebalanceAnnotation(ctx, rg)
 }
@@ -173,7 +189,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; hasAnnotation {
 		// Operator intent: ignore per-RD shortfall grace and the
 		// per-node offline grace — a REST modify means "act now".
-		count, perr := r.rebalanceChildRDs(ctx, rg, 0)
+		count, perr := r.rebalanceChildRDs(ctx, rg, 0, allChildren)
 		if perr != nil {
 			return perr
 		}
@@ -190,7 +206,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 		return nil
 	}
 
-	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod)
+	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod, childrenWithDRBD)
 	if perr != nil {
 		return perr
 	}
@@ -210,12 +226,15 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // surface that breakage on their own paths.)
 //
 // `shortfallGrace` is the per-RD scenario-2.20 window: an RD whose
-// `blockstor.io/spawn-shortfall` stamp is younger than this duration
+// `blockstor.org/spawn-shortfall` stamp is younger than this duration
 // is skipped (the dedicated replay path owns the retry, gated by the
 // same window). Pass 0 to disable the gate — the annotation-driven
 // path does this so an operator's `linstor rg modify` acts on every
 // child RD immediately.
-func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration) (int, error) {
+//
+// `children` picks which definitions the pass places on; see
+// rebalanceChildren.
+func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, children rebalanceChildren) (int, error) {
 	log := logf.FromContext(ctx)
 
 	rds, err := r.Store.ResourceDefinitions().List(ctx)
@@ -228,7 +247,14 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 	now := r.now()
 
 	for i := range rds {
-		if rds[i].ResourceGroupName != rg.Name {
+		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
+			continue
+		}
+
+		if !children.includes(&rds[i], rg) {
+			log.V(1).Info("rebalance skipped (layer stack not in this pass)",
+				"rg", rg.Name, "rd", rds[i].Name)
+
 			continue
 		}
 
@@ -256,6 +282,43 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 	return processed, nil
 }
 
+// rebalanceChildren selects the child definitions a rebalance pass
+// places on.
+type rebalanceChildren int
+
+const (
+	// allChildren is the explicit `rg modify`, with balancing on or
+	// off: LINSTOR autoplaces every child of the group, whatever its
+	// layer stack.
+	allChildren rebalanceChildren = iota
+
+	// childrenWithDRBD is the scheduled balance pass. It leaves out a
+	// definition without a DRBD layer, as LINSTOR's BalanceResources
+	// does: such a replica has no peer to resync from, so a replica
+	// topped up here would only be an empty volume under its name.
+	childrenWithDRBD
+)
+
+func (c rebalanceChildren) includes(rd *apiv1.ResourceDefinition, rg *apiv1.ResourceGroup) bool {
+	switch c {
+	case childrenWithDRBD:
+		return definitionUsesDRBD(rd, rg)
+	case allChildren:
+		return true
+	}
+
+	return true
+}
+
+// definitionUsesDRBD reports whether the definition's layer stack, its
+// own or else its group's, has a DRBD layer. An empty stack at both
+// levels is the default stack, which does.
+func definitionUsesDRBD(rd *apiv1.ResourceDefinition, rg *apiv1.ResourceGroup) bool {
+	stack := apiv1.ResolveLayerStack(rd.LayerStack, rg.SelectFilter.LayerStack)
+
+	return apiv1.LayerInStack(stack, apiv1.LayerKindDRBD)
+}
+
 // shortfallWithinGrace reports whether an RD carries a still-fresh
 // spawn-shortfall annotation. A malformed / missing stamp falls
 // through to "no grace active" so the rebalance pass continues to
@@ -276,7 +339,7 @@ func (r *RGRebalanceReconciler) shortfallWithinGrace(rd *apiv1.ResourceDefinitio
 }
 
 // replaySpawnShortfalls handles scenario 2.20. Walks every RD in the
-// parent RG, looks for the `blockstor.io/spawn-shortfall` annotation,
+// parent RG, looks for the `blockstor.org/spawn-shortfall` annotation,
 // and once the stamped wall-clock + grace window has elapsed re-runs
 // the additive placer. The annotation is stripped on success so a
 // subsequent tick is a clean no-op; on continued failure the marker
@@ -290,7 +353,7 @@ func (r *RGRebalanceReconciler) replaySpawnShortfalls(ctx context.Context, rg *a
 	p := placer.New(r.Store)
 
 	for i := range rds {
-		if rds[i].ResourceGroupName != rg.Name {
+		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
 			continue
 		}
 
@@ -332,6 +395,10 @@ func (r *RGRebalanceReconciler) replayOneShortfall(ctx context.Context, p *place
 		return nil
 	}
 
+	// No layer-stack skip here, unlike the scheduled pass: this finishes
+	// a spawn that came up short, it does not top up a definition after
+	// a replica was deleted, so a storage-only definition is exempt on
+	// purpose.
 	filter := rg.SelectFilter
 	if filter.PlaceCount == 0 {
 		filter.PlaceCount = 1
@@ -462,17 +529,17 @@ func (r *RGRebalanceReconciler) refreshOfflineTracker(ctx context.Context) {
 	seen := map[string]bool{}
 
 	for i := range nodes {
-		seen[nodes[i].Name] = true
+		seen[naming.Key(nodes[i].Name)] = true
 
 		offline := nodes[i].ConnectionStatus == apiv1.NodeTypeOffline
 		if !offline {
-			delete(r.nodeOfflineSince, nodes[i].Name)
+			delete(r.nodeOfflineSince, naming.Key(nodes[i].Name))
 
 			continue
 		}
 
-		if _, already := r.nodeOfflineSince[nodes[i].Name]; !already {
-			r.nodeOfflineSince[nodes[i].Name] = now
+		if _, already := r.nodeOfflineSince[naming.Key(nodes[i].Name)]; !already {
+			r.nodeOfflineSince[naming.Key(nodes[i].Name)] = now
 		}
 	}
 

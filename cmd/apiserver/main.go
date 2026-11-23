@@ -25,7 +25,7 @@ limitations under the License.
 //     for goroutines with reconcile workers.
 //
 //  2. RBAC narrows. The reconciler still needs CRUD on every
-//     blockstor.cozystack.io CRD; the apiserver only needs read-mostly access
+//     blockstor.org CRD; the apiserver only needs read-mostly access
 //     plus the few create/delete verbs the upstream LINSTOR REST
 //     contract exposes (RD create, Resource create, Snapshot create,
 //     and so on).
@@ -64,6 +64,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/apihealth"
 	"github.com/cozystack/blockstor/pkg/rest"
 	"github.com/cozystack/blockstor/pkg/store"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
@@ -86,8 +87,9 @@ type apiserverFlags struct {
 func parseFlags() *apiserverFlags {
 	flags := &apiserverFlags{}
 
-	flag.StringVar(&flags.restAddr, "rest-bind-address", ":3370",
-		"Plain-HTTP debug bind address. NOT exposed by the in-cluster Service — reachable only via `kubectl port-forward` for local debugging.")
+	flag.StringVar(&flags.restAddr, "rest-bind-address", defaultPlainBindAddress,
+		"Plain-HTTP debug bind address. It serves the full API without authentication, so the default is loopback: "+
+			"`kubectl port-forward` still reaches it, other pods do not.")
 	flag.StringVar(&flags.tlsAddr, "tls-bind-address", ":3371",
 		"Mutual-TLS bind address (upstream LINSTOR HTTPS port). The in-cluster Service exposes ONLY this port. Requires --tls-cert-file/--tls-key-file/--tls-client-ca-file; empty disables the TLS listener.")
 	flag.StringVar(&flags.tlsCertFile, "tls-cert-file", "",
@@ -138,8 +140,13 @@ func newScheme() *runtime.Scheme {
 // election off — every apiserver replica serves reads
 // independently. Caches still warm up so the REST server's
 // cached-client reads are cheap.
-func buildManager(flags *apiserverFlags) (manager.Manager, error) {
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+func buildManager(flags *apiserverFlags) (manager.Manager, *storek8s.Store, error) {
+	restCfg, err := apihealth.GetConfig()
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "apiserver")
+	}
+
+	mgr, st, err := storek8s.NewManager(restCfg, ctrl.Options{
 		Scheme: newScheme(),
 		Metrics: metricsserver.Options{
 			BindAddress:   flags.metricsAddr,
@@ -150,10 +157,10 @@ func buildManager(flags *apiserverFlags) (manager.Manager, error) {
 		LeaderElection:         false,
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "new manager")
+		return nil, nil, errors.Wrap(err, "new manager")
 	}
 
-	return mgr, nil
+	return mgr, st, nil
 }
 
 // resolveNamespace mirrors the controller's namespace-resolution
@@ -192,13 +199,27 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 		return errors.Wrap(err, "add readyz check")
 	}
 
+	exposed, err := checkPlainBindAddress(flags.restAddr)
+	if err != nil {
+		return err
+	}
+
+	if exposed {
+		ctrl.Log.WithName("setup").Info("WARNING: the plain-HTTP listener serves the whole API without a "+
+			"client certificate and is bound off loopback; any pod that can reach this address can use it",
+			"address", flags.restAddr)
+	}
+
 	err = mgr.Add(&rest.Server{
 		Addr:      flags.restAddr,
 		TLS:       tlsOptions(flags),
 		Store:     st,
 		Client:    mgr.GetClient(),
 		Namespace: namespace,
-		OnReady:   ready.MarkBound,
+		// The passphrase Secret is read past the cache, so no informer
+		// watches every Secret in the cluster for it.
+		SecretReader: mgr.GetAPIReader(),
+		OnReady:      ready.MarkBound,
 	})
 	if err != nil {
 		return errors.Wrap(err, "add rest server")
@@ -248,23 +269,11 @@ func main() {
 	flags := parseFlags()
 	namespace := resolveNamespace(flags.controllerNamespace)
 
-	mgr, err := buildManager(flags)
+	mgr, st, err := buildManager(flags)
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
 		os.Exit(1)
 	}
-
-	// CRD-backed store is the only supported persistence layer
-	// post-Phase-11 — the apiserver/controller split made
-	// in-process state pointless across replicas.
-	//
-	// BUG-048: pass the manager's direct (uncached) API reader so the
-	// atomic VolumeNumber allocation re-reads live RD state on each
-	// conflict-retry. With only the informer-cached client, two
-	// concurrent `vd c` against one RD both retry against a stale cache,
-	// re-derive the same number, exhaust the retry budget, and silently
-	// drop the second volume.
-	st := storek8s.NewWithAPIReader(mgr.GetClient(), mgr.GetAPIReader())
 
 	ready := newReadyState()
 

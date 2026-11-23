@@ -28,6 +28,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -64,11 +65,11 @@ type ResourceGroupReconciler struct {
 	Store store.Store
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile finds every RD spawned from this RG and runs the placer
 // to backfill replicas missing under the new spec. Idempotent: an
@@ -94,7 +95,16 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	for i := range rds {
-		if rds[i].ResourceGroupName != rg.Name {
+		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
+			continue
+		}
+
+		// This runs on every group event, a controller start
+		// included, so it follows the balance pass: a definition
+		// without DRBD is left alone. An explicit `rg modify` reaches
+		// it through the rebalance annotation, which the rebalance
+		// reconciler places on whether balancing is on or off.
+		if !definitionUsesDRBD(&rds[i], &rg) {
 			continue
 		}
 

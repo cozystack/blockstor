@@ -21,6 +21,7 @@ package controllers
 import (
 	"context"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -46,7 +48,7 @@ import (
 //
 // Mirrors the per-satellite finalizer scheme used by
 // `SatelliteResourceFinalizer` and `StoragePoolFinalizer`.
-const SatelliteSnapshotFinalizer = "blockstor.cozystack.io/satellite-snapshot"
+const SatelliteSnapshotFinalizer = "blockstor.org/satellite-snapshot"
 
 // snapshotFinalizerRequeue is the short back-off between
 // stamping the finalizer and the next Reconcile pass that
@@ -87,7 +89,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Wrap(err, "get Snapshot")
 	}
 
-	if !slices.Contains(snap.Spec.Nodes, r.Config.NodeName) {
+	if !slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return naming.Same(n, r.Config.NodeName) }) {
 		return ctrl.Result{}, nil
 	}
 
@@ -171,6 +173,16 @@ func (r *SnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //     stamp lands, the controller flips Phase 3 once every node
 //     is Ready.
 func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	// Entries for this node under two spellings are folded into one
+	// before any phase reads them: the phase checks look at the first,
+	// the controller at the last, and an acknowledgment on one alias
+	// would otherwise never reach the other.
+	if nodeStatusHasAliases(snap.Status.NodeStatus, r.Config.NodeName) {
+		err := r.upsertPerNodeStatusField(ctx, snap, func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool { return false })
+
+		return ctrl.Result{RequeueAfter: time.Second}, err
+	}
+
 	// Phase 1: parent RD I/O suspend. Per-node ack lives on
 	// Status.NodeStatus[us].SuspendIOAcked. Idempotent — the
 	// helper short-circuits when already acked.
@@ -186,19 +198,20 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 		return r.handleResumePhase(ctx, snap)
 	}
 
+	// Already took our local snapshot: the controller is either still
+	// waiting on slow siblings, or the take is over and it cleared both
+	// flags. All that is left is to record which pool holds the copy,
+	// which a snapshot taken before that record gets here too.
+	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
+		return ctrl.Result{}, r.recordSnapshotPool(ctx, snap)
+	}
+
 	// Phase 2: take the per-node snapshot. Gated on Spec.TakeSnapshot
 	// (controller stamps it once every targeted node has acked Phase
 	// 1) AND on this node not having already succeeded.
 	if !snap.Spec.TakeSnapshot {
 		// Suspend acked, but the controller hasn't promoted to
 		// take-snapshot yet — siblings still suspending. Wait.
-		return ctrl.Result{}, nil
-	}
-
-	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
-		// Already took our local snapshot; the controller is
-		// either still waiting on slow siblings or hasn't
-		// observed our Ready stamp yet. No-op.
 		return ctrl.Result{}, nil
 	}
 
@@ -211,7 +224,7 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 // suspend stamps the per-node Failed=true so the controller-side
 // orchestrator drains the siblings.
 func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	err := r.Config.Apply.SuspendResource(ctx, snap.Spec.ResourceDefinitionName)
+	err := r.Config.Apply.SuspendResource(ctx, naming.Key(snap.Spec.ResourceDefinitionName))
 	if err != nil {
 		log.FromContext(ctx).Info("SuspendResource failed",
 			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
@@ -246,7 +259,7 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 // clearing the ack so the orchestrator keeps poking us until
 // the kernel actually accepts the unfreeze.
 func (r *SnapshotReconciler) handleResumePhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	err := r.Config.Apply.ResumeResource(ctx, snap.Spec.ResourceDefinitionName)
+	err := r.Config.Apply.ResumeResource(ctx, naming.Key(snap.Spec.ResourceDefinitionName))
 	if err != nil {
 		log.FromContext(ctx).Info("ResumeResource failed",
 			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
@@ -271,12 +284,26 @@ func (r *SnapshotReconciler) handleResumePhase(ctx context.Context, snap *blocks
 // step runs.
 func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
 	req := &intent.CreateSnapshotRequest{
-		ResourceName: snap.Spec.ResourceDefinitionName,
+		ResourceName: naming.Key(snap.Spec.ResourceDefinitionName),
 		SnapshotName: snap.Spec.SnapshotName,
 	}
 
 	for i := range snap.Spec.VolumeDefinitions {
 		req.VolumeNumbers = append(req.VolumeNumbers, snap.Spec.VolumeDefinitions[i].VolumeNumber)
+	}
+
+	missing, err := r.unrecordedLUKSKey(ctx, snap, req.VolumeNumbers)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if missing != "" {
+		// The snapshot's bytes on this node would be encrypted under a
+		// password it does not record, so they could never be restored.
+		log.FromContext(ctx).Info("refusing to take a snapshot that does not record this replica's LUKS password",
+			"snapshot", snap.Spec.SnapshotName, "volume", missing)
+
+		return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
 	}
 
 	// P0 fix for stale-snapshot bug: `drbdsetup suspend-io` (Phase 1)
@@ -298,7 +325,7 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 	// flush, and a stripped-down satellite environment (kernel
 	// without BLKFLSBUF, hostpath sandboxing) shouldn't block the
 	// snapshot from running.
-	err := r.Config.Apply.FlushBackingDevices(ctx, snap.Spec.ResourceDefinitionName, req.VolumeNumbers)
+	err = r.Config.Apply.FlushBackingDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName), req.VolumeNumbers)
 	if err != nil {
 		// FlushBackingDevices itself returns nil on best-effort
 		// per-device failures; a non-nil return signals a hard
@@ -319,7 +346,7 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 		// Bug 106: stamp Status.NodeStatus[us].Ready so the
 		// apiserver's success denominator can flip the snapshot
 		// from "Incomplete" to "Successful".
-		err = r.stampSnapshotPerNodeReady(ctx, snap, resp.CreateTimestampUnix)
+		err = r.stampSnapshotPerNodeReady(ctx, snap, resp.CreateTimestampUnix, resp.GetStoragePool())
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -358,7 +385,7 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 // Status subresource.
 func perNodeStatusSuspendIOAcked(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
 	for i := range entries {
-		if entries[i].NodeName != nodeName {
+		if !naming.Same(entries[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -527,12 +554,15 @@ func upsertPerNodeStatusInPlace(
 	nodeName string,
 	mutate func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
 ) bool {
-	for i := range *entries {
-		if (*entries)[i].NodeName != nodeName {
-			continue
+	collapsed, mine, folded := collapseNodeStatus(*entries, nodeName)
+	if mine >= 0 {
+		if !mutate(&collapsed[mine]) && !folded {
+			return false
 		}
 
-		return mutate(&(*entries)[i])
+		*entries = collapsed
+
+		return true
 	}
 
 	fresh := blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: nodeName}
@@ -543,6 +573,66 @@ func upsertPerNodeStatusInPlace(
 	*entries = append(*entries, fresh)
 
 	return true
+}
+
+// nodeStatusHasAliases reports whether entries hold more than one entry for
+// nodeName, in any spelling.
+func nodeStatusHasAliases(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
+	seen := false
+
+	for i := range entries {
+		if !naming.Same(entries[i].NodeName, nodeName) {
+			continue
+		}
+
+		if seen {
+			return true
+		}
+
+		seen = true
+	}
+
+	return false
+}
+
+// collapseNodeStatus folds every entry for one node, in whatever spelling
+// it was written, into the first of them. Entries written before under
+// Node-1 and node-1 are one node's: a writer that updated only the first
+// and a reader that kept only the last would never meet. Returns the
+// entries, the folded entry's index (-1 when the node has none), and
+// whether any alias was folded away.
+func collapseNodeStatus(
+	entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string,
+) ([]blockstoriov1alpha1.SnapshotPerNodeStatus, int, bool) {
+	out := make([]blockstoriov1alpha1.SnapshotPerNodeStatus, 0, len(entries))
+	mine := -1
+	folded := false
+
+	for i := range entries {
+		entry := entries[i]
+
+		switch {
+		case !naming.Same(entry.NodeName, nodeName):
+			out = append(out, entry)
+		case mine < 0:
+			mine = len(out)
+			out = append(out, entry)
+		default:
+			kept := &out[mine]
+			kept.Ready = kept.Ready || entry.Ready
+			kept.SuspendIOAcked = kept.SuspendIOAcked || entry.SuspendIOAcked
+			kept.Failed = kept.Failed || entry.Failed
+			kept.CreateTimestamp = max(kept.CreateTimestamp, entry.CreateTimestamp)
+
+			if kept.StoragePool == "" {
+				kept.StoragePool = entry.StoragePool
+			}
+
+			folded = true
+		}
+	}
+
+	return out, mine, folded
 }
 
 // stampSnapshotPerNodeReady upserts our node's entry in
@@ -562,8 +652,14 @@ func upsertPerNodeStatusInPlace(
 // converges in well under a second on a 3-node stand. After the
 // retry budget the caller's outer reconcile rate-limiter backs off
 // and we try again on the next pass.
+//
+// The same write records pool, the pool the copy was taken in. Written
+// apart from Ready, the record would miss whenever the source replica went
+// between the two writes, which is the usual CSI order (the PVC is deleted
+// as soon as its VolumeSnapshot is ready), and every restore of the copy
+// would then be refused.
 func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
-	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, createTimestamp int64,
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, createTimestamp int64, pool string,
 ) error {
 	key := client.ObjectKeyFromObject(snap)
 
@@ -591,6 +687,7 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
 
 		current.Status.NodeStatus = upsertPerNodeStatus(
 			current.Status.NodeStatus, r.Config.NodeName, createTimestamp)
+		recordPoolOnEntry(current.Status.NodeStatus, r.Config.NodeName, pool)
 
 		err = r.Status().Update(ctx, &current)
 		if err == nil {
@@ -624,8 +721,13 @@ const snapshotStatusUpdateRetries = 5
 // what the apiserver's success derivation actually reads, so any
 // non-zero stamp keeps the wire shape correct.
 func perNodeStatusReady(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
+	// Aliases still to fold are not stamped yet, whatever the first says.
+	if nodeStatusHasAliases(entries, nodeName) {
+		return false
+	}
+
 	for i := range entries {
-		if entries[i].NodeName != nodeName {
+		if !naming.Same(entries[i].NodeName, nodeName) {
 			continue
 		}
 
@@ -644,33 +746,18 @@ func perNodeStatusReady(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nod
 // (otherwise the controller-side orchestrator would see the ack
 // drop and mis-classify the snapshot as still mid-suspend).
 func upsertPerNodeStatus(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string, createTimestamp int64) []blockstoriov1alpha1.SnapshotPerNodeStatus {
-	out := make([]blockstoriov1alpha1.SnapshotPerNodeStatus, 0, len(entries)+1)
-	replaced := false
-
-	for i := range entries {
-		if entries[i].NodeName == nodeName {
-			merged := entries[i]
-			merged.NodeName = nodeName
-			merged.Ready = true
-			merged.CreateTimestamp = createTimestamp
-
-			out = append(out, merged)
-
-			replaced = true
-
-			continue
-		}
-
-		out = append(out, entries[i])
-	}
-
-	if !replaced {
-		out = append(out, blockstoriov1alpha1.SnapshotPerNodeStatus{
+	out, mine, _ := collapseNodeStatus(entries, nodeName)
+	if mine < 0 {
+		return append(out, blockstoriov1alpha1.SnapshotPerNodeStatus{
 			NodeName:        nodeName,
 			Ready:           true,
 			CreateTimestamp: createTimestamp,
 		})
 	}
+
+	out[mine].NodeName = nodeName
+	out[mine].Ready = true
+	out[mine].CreateTimestamp = createTimestamp
 
 	return out
 }
@@ -697,12 +784,17 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	}
 
 	req := &intent.DeleteSnapshotRequest{
-		ResourceName: snap.Spec.ResourceDefinitionName,
+		ResourceName: naming.Key(snap.Spec.ResourceDefinitionName),
 		SnapshotName: snap.Spec.SnapshotName,
 	}
 
 	resp, err := r.Config.Apply.DeleteSnapshot(ctx, req)
 	if err != nil {
+		stampErr := r.stampSnapshotDeleteFailure(ctx, snap, err.Error())
+		if stampErr != nil {
+			log.FromContext(ctx).Error(stampErr, "record snapshot delete failure")
+		}
+
 		return ctrl.Result{}, errors.Wrap(err, "DeleteSnapshot")
 	}
 
@@ -712,6 +804,11 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 		// CRD doesn't vanish before tear-down succeeds.
 		log.FromContext(ctx).Info("DeleteSnapshot per-snapshot failure",
 			"snapshot", snap.Spec.SnapshotName, "message", resp.GetMessage())
+
+		err = r.stampSnapshotDeleteFailure(ctx, snap, resp.GetMessage())
+		if err != nil {
+			log.FromContext(ctx).Error(err, "record snapshot delete failure")
+		}
 
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -727,6 +824,60 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	return ctrl.Result{}, nil
 }
 
+// stampSnapshotDeleteFailure records why this node failed to delete
+// its copy in Status.DeleteFailures. LINSTOR answers a snapshot delete
+// with the error its satellite returned; without the record the REST
+// call could only keep waiting on a node that is online but failing,
+// since the finalizer stays and nothing else tells the two apart.
+func (r *SnapshotReconciler) stampSnapshotDeleteFailure(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, message string,
+) error {
+	if message == "" {
+		message = "the satellite could not delete its copy of the snapshot"
+	}
+
+	key := client.ObjectKeyFromObject(snap)
+
+	for range snapshotStatusUpdateRetries {
+		var current blockstoriov1alpha1.Snapshot
+
+		err := r.Get(ctx, key, &current)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+
+			return errors.Wrap(err, "get Snapshot for delete failure stamp")
+		}
+
+		idx := slices.IndexFunc(current.Status.DeleteFailures,
+			func(f blockstoriov1alpha1.SnapshotDeleteFailure) bool {
+				return naming.Same(f.NodeName, r.Config.NodeName)
+			})
+
+		switch {
+		case idx < 0:
+			current.Status.DeleteFailures = append(current.Status.DeleteFailures,
+				blockstoriov1alpha1.SnapshotDeleteFailure{NodeName: r.Config.NodeName, Message: message})
+		case current.Status.DeleteFailures[idx].Message == message:
+			return nil
+		default:
+			current.Status.DeleteFailures[idx].Message = message
+		}
+
+		err = r.Status().Update(ctx, &current)
+		if err == nil {
+			return nil
+		}
+
+		if !apierrors.IsConflict(err) {
+			return errors.Wrap(err, "stamp Status.DeleteFailures")
+		}
+	}
+
+	return errors.New("Status.DeleteFailures stamp conflicted out of retries")
+}
+
 // snapshotNodePredicate filters Snapshot events to those whose
 // Spec.Nodes contains the given node name. Like
 // nodeNamePredicate but for the membership-list shape.
@@ -737,7 +888,7 @@ func snapshotNodePredicate(nodeName string) predicate.Predicate {
 			return false
 		}
 
-		return slices.Contains(snap.Spec.Nodes, nodeName)
+		return slices.ContainsFunc(snap.Spec.Nodes, func(n string) bool { return naming.Same(n, nodeName) })
 	}
 
 	return predicate.Funcs{
@@ -748,4 +899,49 @@ func snapshotNodePredicate(nodeName string) predicate.Predicate {
 		DeleteFunc:  func(e event.DeleteEvent) bool { return matches(e.Object) },
 		GenericFunc: func(e event.GenericEvent) bool { return matches(e.Object) },
 	}
+}
+
+// unrecordedLUKSKey names the first of vols whose replica on this node
+// carries a LUKS password the snapshot did not record, or returns "". The
+// snapshot copies the passwords when it is created; a replica formatted
+// after that, before the take, is the gap this closes. The replica is read
+// past the cache, as the store read it for the copy.
+func (r *SnapshotReconciler) unrecordedLUKSKey(ctx context.Context, snap *blockstoriov1alpha1.Snapshot, vols []int32) (string, error) {
+	reader := r.Config.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	name, err := replicaCRName(ctx, reader, snap.Spec.ResourceDefinitionName, r.Config.NodeName)
+	if err != nil {
+		return "", err
+	}
+
+	var res blockstoriov1alpha1.Resource
+
+	err = reader.Get(ctx, client.ObjectKey{Name: name}, &res)
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+
+	if err != nil {
+		return "", errors.Wrapf(err, "get replica %s", name)
+	}
+
+	self := naming.Key(r.Config.NodeName)
+
+	for _, vol := range vols {
+		if luksKeyOf(&res, vol) == nil {
+			continue
+		}
+
+		recorded := slices.ContainsFunc(snap.Spec.LUKSKeys, func(k blockstoriov1alpha1.SnapshotLUKSKey) bool {
+			return k.VolumeNumber == vol && naming.Key(k.NodeName) == self
+		})
+		if !recorded {
+			return name + "/" + strconv.Itoa(int(vol)), nil
+		}
+	}
+
+	return "", nil
 }

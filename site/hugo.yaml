@@ -1,0 +1,74 @@
+baseURL: https://blockstor.org/
+title: Blockstor
+enableGitInfo: true
+
+# Since Hugo v0.161.0 the Node asset tools (PostCSS here) run under Node's
+# permission model, with read access limited to the project directory. Docsy
+# arrives as a Hugo module and its SCSS is served from the module cache
+# outside the project tree, so read access is widened, as on cozystack.io.
+security:
+  node:
+    permissions:
+      allowRead:
+        - '*'
+
+module:
+  proxy: direct
+  hugoVersion:
+    extended: true
+  imports:
+    - path: github.com/google/docsy
+    - path: github.com/google/docsy/dependencies
+  mounts:
+    - source: content/en
+      target: content
+    - source: assets
+      target: assets
+    - source: layouts
+      target: layouts
+    - source: static
+      target: static
+
+markup:
+  goldmark:
+    renderer:
+      unsafe: true
+  highlight:
+    # Classes instead of inline colours, so the stylesheet can switch the
+    # palette with the light and dark theme.
+    noClasses: false
+
+menu:
+  main:
+    - name: GitHub
+      weight: 50
+      url: https://github.com/cozystack/blockstor
+      pre: <i class='fa-brands fa-github'></i>
+
+params:
+  description: A Kubernetes control plane for LVM and ZFS storage with DRBD replication.
+  copyright: Cozystack a Series of LF Projects, LLC
+  github_repo: https://github.com/cozystack/blockstor
+  github_subdir: site
+  github_branch: main
+  offlineSearch: true
+  # Diagrams on the docs pages. Pinned so a new Mermaid release cannot
+  # change how they render without a review.
+  mermaid:
+    version: 11.4.1
+  prism_syntax_highlighting: false
+  ui:
+    navbar_logo: true
+    navbar_translucent_over_cover_disable: false
+    sidebar_menu_compact: false
+    sidebar_search_disable: false
+    breadcrumb_disable: false
+    showLightDarkModeMenu: true
+    feedback:
+      enable: false
+  links:
+    developer:
+      - name: GitHub
+        url: https://github.com/cozystack/blockstor
+        icon: fa-brands fa-github
+        desc: Code, issues and releases

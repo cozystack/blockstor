@@ -37,7 +37,7 @@ import (
 // Kept here verbatim so the test does not import the production
 // constant from pkg/store/k8s (which would drag the whole store
 // package into the controller test build for one literal).
-const snapshotGroupIDLabel = "blockstor.io/snapshot-group-id"
+const snapshotGroupIDLabel = "blockstor.org/snapshot-group-id"
 
 // b353GroupedSnapshot builds a Snapshot CRD pre-stamped with the
 // shared GroupID + the label the controller uses to List

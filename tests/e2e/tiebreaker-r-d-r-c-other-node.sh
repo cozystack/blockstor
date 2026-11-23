@@ -83,7 +83,7 @@ dump_diag() {
     echo "---- dump: Resource.Status.connections ----"
     for n in "$N1" "$N2" "$N3"; do
         echo "  -- $n --"
-        kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
+        kubectl get "resources.blockstor.org/${RD}.${n}" \
             -o jsonpath='{range .status.connections[*]}{.peerNodeName}{"="}{.message}{"; "}{end}{"\n"}' \
             2>/dev/null || true
     done
@@ -181,7 +181,7 @@ echo ">> linstor r d $N2 $RD (delete the second diskful)"
 echo ">> wait for $N2 Resource to be gone from the controller"
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" >/dev/null 2>&1; then
+    if ! kubectl get "resources.blockstor.org/${RD}.${N2}" >/dev/null 2>&1; then
         break
     fi
     sleep 2
@@ -212,8 +212,8 @@ stable_since=0
 last_witness_count=-1
 deadline=$(( $(date +%s) + 20 ))
 while (( $(date +%s) < deadline )); do
-    witness_count=$(kubectl get resources.blockstor.cozystack.io \
-        -l "blockstor.cozystack.io/resource-definition=$RD" \
+    witness_count=$(kubectl get resources.blockstor.org \
+        -l "blockstor.org/resource-definition=$RD" \
         -o json 2>/dev/null \
         | jq '[.items[] | select(.spec.flags // [] | contains(["TIE_BREAKER"]))] | length' 2>/dev/null \
         || echo "0")

@@ -19,29 +19,57 @@ metadata:
 #   - emit Events (no reconcile-trigger writes from REST).
 #   - need leases (leader election is off — every apiserver
 #     replica serves independently).
-# What's left is plain CRUD on the blockstor.io CRDs themselves,
-# plus Secrets for the encryption-passphrase code path (Bug 110:
-# without `secrets` verbs the controller-runtime cache informer
-# stalls on a Forbidden list/watch and `PATCH /v1/encryption/
-# passphrase` hangs ~6s before dropping the connection).
+# What's left is plain CRUD on the blockstor.org CRDs themselves,
+# plus the passphrase Secret in this namespace (the Role below).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: blockstor-apiserver
 rules:
-  - apiGroups: [blockstor.cozystack.io]
+  - apiGroups: [blockstor.org]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
-  # Secrets — the cluster passphrase (sealed in
-  # `blockstor-cluster-passphrase` by default; override via
-  # ControllerConfig.Spec.PassphraseSecretRef) is read on every
-  # `linstor encryption enter-passphrase`, written on
-  # `create-passphrase` / `modify-passphrase`. Cluster-scoped
-  # because the cache informer needs cluster-wide list/watch to
-  # warm up; per-namespace Role is not enough.
+---
+# The encryption verbs read the passphrase Secret the ControllerConfig
+# names and the keyring Secret, and write the keyring and the generated
+# unlock Secret; the passphrase Secret itself is never written. All of it
+# is read past the controller-runtime cache (rest.Server.SecretReader), so
+# no informer lists or watches Secrets and a get in this namespace is all
+# the read needs.
+# resourceNames: the keyring, the unlock Secret blockstor generates when no
+# passphrase Secret is named, and the passphrase Secret under piraeus's
+# name, linstor-passphrase. A ControllerConfig that names another
+# passphrase Secret needs that name added here. Nothing else in the
+# namespace is readable: under Cozystack it is shared with piraeus.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blockstor-apiserver-secrets
+  namespace: blockstor-system
+rules:
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, list, watch, create, update, patch]
+    resourceNames: [blockstor-master-key, blockstor-unlock, linstor-passphrase]
+    verbs: [get, update]
+  # A create cannot be limited by name; see docs/encryption-keys.md for
+  # what that leaves open and how to close it.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blockstor-apiserver-secrets
+  namespace: blockstor-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blockstor-apiserver-secrets
+subjects:
+  - kind: ServiceAccount
+    name: blockstor-apiserver
+    namespace: blockstor-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -74,6 +102,10 @@ spec:
     metadata: {labels: {app: blockstor-apiserver}}
     spec:
       serviceAccountName: blockstor-apiserver
+      # The REST server's graceful-shutdown window is derived from the
+      # detached rollback budget (pkg/rest/rg_deleted_race.go); this has to
+      # outlive it, or a SIGTERM kills a compensation mid-cascade.
+      terminationGracePeriodSeconds: 21
       # Spread replicas across nodes when possible so a single
       # node loss doesn't take all apiserver pods at once.
       topologySpreadConstraints:
@@ -87,10 +119,10 @@ spec:
           image: __REGISTRY__/blockstor-apiserver:dev
           imagePullPolicy: Always
           args:
-            # Plain-HTTP debug listener. NOT exposed by the Service —
-            # reachable only via `kubectl port-forward` to this pod for
-            # local debugging / the `linstor` CLI during development.
-            - --rest-bind-address=:3370
+            # Plain-HTTP debug listener with no authentication. Bound to
+            # loopback, so only `kubectl port-forward` to this pod reaches
+            # it (local debugging, the `linstor` CLI); other pods cannot.
+            - --rest-bind-address=127.0.0.1:3370
             # Mutual-TLS listener. The ONLY port the Service exposes.
             # Requires + verifies client certs against the mounted CA;
             # hot-reloads cert/key/CA on cert-manager rotation without a
@@ -107,8 +139,6 @@ spec:
           ports:
             # rest-tls is the in-cluster endpoint (Service-exposed).
             - {name: rest-tls, containerPort: 3371}
-            # rest-debug stays pod-local (port-forward only).
-            - {name: rest-debug, containerPort: 3370}
             - {name: health, containerPort: 8081}
           volumeMounts:
             # cert-manager-issued serving material (tls.crt/tls.key/

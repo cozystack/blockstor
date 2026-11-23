@@ -31,9 +31,6 @@ import (
 	"net/http"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -98,23 +95,13 @@ func findResource(t *testing.T, view []apiv1.ResourceWithVolumes, name, node str
 	return apiv1.ResourceWithVolumes{}
 }
 
-// seedPassphraseSecret creates the cluster passphrase Secret directly
-// on the fake apiserver — analogous to a previous controller having
-// POSTed create-passphrase before the restart.
+// seedPassphraseSecret gives the server's cluster a keyring whose unlock
+// Secret holds value: testPassphrase unlocks it, anything else leaves it
+// locked, as a cluster whose Secret was edited would be.
 func seedPassphraseSecret(t *testing.T, srv *Server, value string) {
 	t.Helper()
 
-	err := srv.Client.Create(context.Background(), &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      defaultPassphraseSecretName,
-			Namespace: srv.Namespace,
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{passphraseSecretKey: []byte(value)},
-	})
-	if err != nil {
-		t.Fatalf("seed passphrase Secret: %v", err)
-	}
+	seedEncryption(t, srv.Client, value)
 }
 
 // newW13Server is the shared setup: Server with in-memory Store, fake
@@ -197,7 +184,7 @@ func TestPassphraseEnterBareKeyMismatch401(t *testing.T) {
 // does not. LUKS provisioning must stay blocked until PATCH lands.
 func TestResourceViewSurfacesSuspendedOnLUKSWhileLocked(t *testing.T) {
 	srv := newW13Server(t)
-	seedPassphraseSecret(t, srv, "op-secret")
+	seedPassphraseSecret(t, srv, "not-the-passphrase")
 
 	seed := luksResourceSeed("pvc-luks", "n1")
 	if err := srv.Store.Resources().Create(context.Background(), &seed); err != nil {
@@ -227,7 +214,7 @@ func TestResourceViewSurfacesSuspendedOnLUKSWhileLocked(t *testing.T) {
 // reconcile tick" pin.
 func TestResourceViewLUKSResumesAfterEnterPassphrase(t *testing.T) {
 	srv := newW13Server(t)
-	seedPassphraseSecret(t, srv, "op-secret")
+	seedPassphraseSecret(t, srv, "not-the-passphrase")
 
 	seed := luksResourceSeed("pvc-luks", "n1")
 	if err := srv.Store.Resources().Create(context.Background(), &seed); err != nil {
@@ -244,7 +231,7 @@ func TestResourceViewLUKSResumesAfterEnterPassphrase(t *testing.T) {
 	}
 
 	// PATCH the right passphrase.
-	enterBody, _ := json.Marshal(map[string]string{"passphrase": "op-secret"})
+	enterBody, _ := json.Marshal(map[string]string{"passphrase": testPassphrase})
 	enterResp := httpPatch(t, base+"/v1/encryption/passphrase", enterBody)
 	_ = enterResp.Body.Close()
 
@@ -269,7 +256,7 @@ func TestResourceViewLUKSResumesAfterEnterPassphrase(t *testing.T) {
 // provisioning to any caller after a single wrong-passphrase guess.
 func TestResourceViewWrongPassphraseKeepsSuspended(t *testing.T) {
 	srv := newW13Server(t)
-	seedPassphraseSecret(t, srv, "op-secret")
+	seedPassphraseSecret(t, srv, "not-the-passphrase")
 
 	seed := luksResourceSeed("pvc-luks", "n1")
 	if err := srv.Store.Resources().Create(context.Background(), &seed); err != nil {
@@ -294,83 +281,30 @@ func TestResourceViewWrongPassphraseKeepsSuspended(t *testing.T) {
 	}
 }
 
-// TestControllerRestartReSuspendsLUKS is the headline scenario-6.W13
-// pin: it simulates a controller restart by booting a second Server
-// instance against the SAME fake-apiserver client + the SAME Store.
-// The Secret + resource survive (apiserver-persisted); the in-memory
-// unlock flag is per-process and resets on the fresh Server. The
-// LUKS-stack resource MUST surface Suspended=true again until a fresh
-// PATCH lands, then flip back to Suspended=false.
-func TestControllerRestartReSuspendsLUKS(t *testing.T) {
+// TestControllerRestartKeepsLUKSAvailable: the state comes from the
+// Secrets, not from a per-process flag, so a restarted (or second)
+// apiserver reports an unlocked cluster as unlocked with no
+// enter-passphrase.
+func TestControllerRestartKeepsLUKSAvailable(t *testing.T) {
 	st := store.NewInMemory()
 	cli := newFakeRESTClient(t)
-
-	// Round 1: original controller, unlock it, observe Available.
-	srv1 := &Server{
-		Addr:      pickFreeAddr(t),
-		Store:     st,
-		Client:    cli,
-		Namespace: passphraseSecretTestNamespace,
-	}
-	seedPassphraseSecret(t, srv1, "op-secret")
+	seedEncryption(t, cli, testPassphrase)
 
 	seed := luksResourceSeed("pvc-luks", "n1")
 	if err := st.Resources().Create(context.Background(), &seed); err != nil {
 		t.Fatalf("seed resource: %v", err)
 	}
 
-	base1, stop1 := startServerCustom(t, srv1)
+	for round := range 2 {
+		base, stop := startServerCustom(t, &Server{Addr: pickFreeAddr(t), Store: st, Client: cli, Namespace: passphraseSecretTestNamespace})
 
-	enterBody, _ := json.Marshal(map[string]string{"passphrase": "op-secret"})
-	enterResp := httpPatch(t, base1+"/v1/encryption/passphrase", enterBody)
-	_ = enterResp.Body.Close()
+		got := findResource(t, fetchResourcesView(t, base), "pvc-luks", "n1")
 
-	if enterResp.StatusCode != http.StatusOK {
-		stop1()
-		t.Fatalf("round1 enter: got %d, want 200", enterResp.StatusCode)
-	}
+		stop()
 
-	preRestart := findResource(t, fetchResourcesView(t, base1), "pvc-luks", "n1")
-	stop1()
-
-	if preRestart.State.Suspended == nil || *preRestart.State.Suspended {
-		t.Fatalf("round1 post-PATCH: state.suspended=%v, want false (Available)",
-			preRestart.State.Suspended)
-	}
-
-	// Round 2: fresh Server against the SAME apiserver client + the
-	// SAME in-memory Store. Secret + resource survive; the unlock
-	// flag does not.
-	srv2 := &Server{
-		Addr:      pickFreeAddr(t),
-		Store:     st,
-		Client:    cli,
-		Namespace: passphraseSecretTestNamespace,
-	}
-
-	base2, stop2 := startServerCustom(t, srv2)
-	defer stop2()
-
-	postRestart := findResource(t, fetchResourcesView(t, base2), "pvc-luks", "n1")
-	if postRestart.State.Suspended == nil || !*postRestart.State.Suspended {
-		t.Errorf("post-restart: state.suspended=%v, want true (Suspended — fresh process, locked)",
-			postRestart.State.Suspended)
-	}
-
-	// PATCH the right passphrase against the fresh Server and
-	// confirm the view flips back to Available.
-	enter2Body, _ := json.Marshal(map[string]string{"passphrase": "op-secret"})
-	enter2Resp := httpPatch(t, base2+"/v1/encryption/passphrase", enter2Body)
-	_ = enter2Resp.Body.Close()
-
-	if enter2Resp.StatusCode != http.StatusOK {
-		t.Fatalf("round2 enter: got %d, want 200", enter2Resp.StatusCode)
-	}
-
-	resumed := findResource(t, fetchResourcesView(t, base2), "pvc-luks", "n1")
-	if resumed.State.Suspended == nil || *resumed.State.Suspended {
-		t.Errorf("post-restart resumed: state.suspended=%v, want false (Available)",
-			resumed.State.Suspended)
+		if got.State.Suspended == nil || *got.State.Suspended {
+			t.Errorf("round %d: state.suspended=%v, want false (Available)", round, got.State.Suspended)
+		}
 	}
 }
 

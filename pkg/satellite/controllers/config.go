@@ -19,10 +19,12 @@ limitations under the License.
 package controllers
 
 import (
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/satellite/stream"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -60,6 +62,12 @@ type Config struct {
 	// `mgr.GetAPIReader()` in NewManager; unit tests can leave it
 	// nil and the reconciler falls back to the cached client.
 	APIReader client.Reader
+
+	// Recorder emits the Warning Event for an apply the satellite refused
+	// to carry out over data, so it reaches `kubectl describe` rather than
+	// only the satellite log. Production is wired from the manager in
+	// NewManager; nil skips the Event.
+	Recorder events.EventRecorder
 
 	// Namespace is where the controller-side Secrets live — in
 	// particular the cluster master passphrase Secret stamped by
@@ -106,4 +114,9 @@ type Config struct {
 	// pin the burst-debounce / reacts-within-deadline behaviour
 	// without opening a real netlink socket.
 	UeventListener UeventNotifier
+
+	// StreamTLS is the mutual TLS the cross-node snapshot fetcher dials
+	// peer satellites with. Not configured, nothing is fetched and a
+	// restore on this node falls back to a DRBD resync.
+	StreamTLS stream.TLSFiles
 }

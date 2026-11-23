@@ -28,6 +28,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
+
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // Resource is the top-level drbd-9 resource definition. It maps 1:1 to
@@ -425,9 +427,21 @@ func isBareTokenByte(c byte) bool {
 // quoted string.
 const sharedSecretOption = "shared-secret"
 
+// DefaultCramHMACAlg is the digest LINSTOR writes next to the shared
+// secret of every resource it authenticates. The renderer never adds it
+// on its own: DRBD authenticates peers only once cram-hmac-alg is set,
+// and a satellite that started doing so for a resource whose peers have
+// not been rolled yet fails every handshake with them. It is written as
+// DrbdOptions/Net/cram-hmac-alg, by the LINSTOR converter for a
+// definition LINSTOR authenticated and by an operator for any other.
+const DefaultCramHMACAlg = "sha1"
+
 // writeNet emits the `net { … }` block when there is anything to emit
 // (a shared secret or any free-form option). drbd treats an empty `net
 // {}` as legal but noisy, so we skip it entirely when unused.
+//
+// cram-hmac-alg is rendered only as an option like any other, never
+// inferred from a shared secret; see DefaultCramHMACAlg.
 func writeNet(b *strings.Builder, n Net) {
 	if n.SharedSecret == "" && len(n.Options) == 0 {
 		return
@@ -630,12 +644,15 @@ func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []Resource
 // regardless of which order the operator stored on the
 // ResourceConnection — keeps the rendered `host a address …;`
 // line consistent with the on-block address we'd otherwise emit.
+//
+// A connection and a host may spell one node differently, so they are
+// matched as the store addresses nodes.
 func lookupPaths(conns []ResourceConnection, a, b string) []ResourcePath {
 	for i := range conns {
 		switch {
-		case conns[i].NodeA == a && conns[i].NodeB == b:
+		case naming.Same(conns[i].NodeA, a) && naming.Same(conns[i].NodeB, b):
 			return conns[i].Paths
-		case conns[i].NodeA == b && conns[i].NodeB == a:
+		case naming.Same(conns[i].NodeA, b) && naming.Same(conns[i].NodeB, a):
 			return swapPathSides(conns[i].Paths)
 		}
 	}

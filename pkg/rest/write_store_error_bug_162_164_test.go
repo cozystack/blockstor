@@ -47,7 +47,7 @@ var (
 	// literal "Operation cannot be fulfilled on …" message verbatim
 	// so the scrub test sees the exact byte sequence emitted in prod.
 	errApimachineryConflict = errors.New(
-		`Operation cannot be fulfilled on controllerconfigs.blockstor.cozystack.io "default": stale`)
+		`Operation cannot be fulfilled on controllerconfigs.blockstor.org "default": stale`)
 	errBug164ObjectModified = errors.New("the object has been modified")
 )
 
@@ -105,7 +105,7 @@ func TestBug162WriteStoreErrorScrubsEtcdString(t *testing.T) {
 
 // TestBug162WriteStoreErrorScrubsApimachineryString pins the second
 // Bug 162 flavor: apimachinery's NewConflict/NewAlreadyExists/etc.
-// embed the GroupResource ("controllerconfigs.blockstor.cozystack.io") in the
+// embed the GroupResource ("controllerconfigs.blockstor.org") in the
 // error string. Without scrubbing, the wire response leaks both the
 // CRD plural and the API group. We assert both substrings are gone.
 func TestBug162WriteStoreErrorScrubsApimachineryString(t *testing.T) {
@@ -113,7 +113,7 @@ func TestBug162WriteStoreErrorScrubsApimachineryString(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	// errApimachineryConflict mirrors the exact
-	// "controllerconfigs.blockstor.cozystack.io" fingerprint
+	// "controllerconfigs.blockstor.org" fingerprint
 	// apimachinery emits — qualifiedResource.String() is
 	// `<resource>.<group>`, and the resource itself often carries the
 	// group suffix, producing the double-suffix shape.
@@ -125,7 +125,7 @@ func TestBug162WriteStoreErrorScrubsApimachineryString(t *testing.T) {
 	}
 
 	for _, leak := range []string{
-		"controllerconfigs.blockstor.cozystack.io",
+		"controllerconfigs.blockstor.org",
 		"apimachinery",
 		"k8s.io",
 		"etcd",
@@ -147,7 +147,7 @@ func TestBug162WriteStoreErrorScrubsApimachineryString(t *testing.T) {
 func TestBug164IsConflictReturns409(t *testing.T) {
 	t.Parallel()
 
-	gr := schema.GroupResource{Group: "blockstor.cozystack.io", Resource: "resourcedefinitions.blockstor.cozystack.io"}
+	gr := schema.GroupResource{Group: "blockstor.org", Resource: "resourcedefinitions.blockstor.org"}
 	conflictErr := apierrors.NewConflict(gr, "rd-test", errBug164ObjectModified)
 
 	rr := httptest.NewRecorder()
@@ -178,7 +178,7 @@ func TestBug164IsConflictReturns409(t *testing.T) {
 	// The conflict path must also be scrubbed: apierrors.NewConflict
 	// embeds the GroupResource string.
 	for _, leak := range []string{
-		"resourcedefinitions.blockstor.cozystack.io",
+		"resourcedefinitions.blockstor.org",
 		"apimachinery",
 		"k8s.io",
 		"etcd",
@@ -198,7 +198,7 @@ func TestBug164IsConflictReturns409(t *testing.T) {
 func TestBug164IsAlreadyExistsReturns409(t *testing.T) {
 	t.Parallel()
 
-	gr := schema.GroupResource{Group: "blockstor.cozystack.io", Resource: "resourcedefinitions.blockstor.cozystack.io"}
+	gr := schema.GroupResource{Group: "blockstor.org", Resource: "resourcedefinitions.blockstor.org"}
 	existsErr := apierrors.NewAlreadyExists(gr, "rd-test")
 
 	rr := httptest.NewRecorder()

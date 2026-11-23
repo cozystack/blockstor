@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // SnapshotReconciler orchestrates the Bug-351 cross-satellite
@@ -72,10 +73,10 @@ type SnapshotReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=snapshots,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=snapshots/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=snapshots/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=snapshots,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=snapshots/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=snapshots/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch
 
 // Reconcile drives the Spec.SuspendIO / Spec.TakeSnapshot
 // transitions. Bug 351 (single-Snapshot orchestration) + Bug 353
@@ -236,7 +237,7 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 // existing row belongs to the satellite, never overwrite it).
 func hasNodeStatusEntry(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, node string) bool {
 	for i := range entries {
-		if entries[i].NodeName == node {
+		if naming.Same(entries[i].NodeName, node) {
 			return true
 		}
 	}
@@ -688,13 +689,16 @@ func allTargetsMatch(
 	targets []string,
 	pred func(blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
 ) bool {
+	// A satellite writes its entry under its own node name, and the
+	// snapshot's node list carries the registered spelling: Node-1 and
+	// node-1 are one node.
 	byNode := make(map[string]blockstoriov1alpha1.SnapshotPerNodeStatus, len(entries))
 	for i := range entries {
-		byNode[entries[i].NodeName] = entries[i]
+		byNode[naming.Key(entries[i].NodeName)] = entries[i]
 	}
 
 	for _, t := range targets {
-		entry, ok := byNode[t]
+		entry, ok := byNode[naming.Key(t)]
 		if !ok {
 			return false
 		}
@@ -738,7 +742,7 @@ func firstFailedNode(entries []blockstoriov1alpha1.SnapshotPerNodeStatus) string
 // non-empty GroupID. Duplicating the literal here rather than
 // importing pkg/store/k8s avoids a controller→store dependency that
 // the store does not otherwise have. b353.
-const snapshotGroupIDLabel = "blockstor.io/snapshot-group-id"
+const snapshotGroupIDLabel = "blockstor.org/snapshot-group-id"
 
 // fetchSiblings returns the transactional batch the Snapshot
 // belongs to — self + every same-GroupID peer. For an empty
@@ -777,7 +781,7 @@ func (r *SnapshotReconciler) fetchSiblings(
 	selfSeen := false
 
 	for i := range list.Items {
-		if list.Items[i].Name == snap.Name {
+		if naming.Same(list.Items[i].Name, snap.Name) {
 			selfSeen = true
 
 			// Use the freshly-fetched copy for self so the

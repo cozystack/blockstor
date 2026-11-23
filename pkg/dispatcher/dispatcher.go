@@ -28,6 +28,7 @@ package dispatcher
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -35,8 +36,9 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // drbdAddrAny is the placeholder address we put into the .res file
@@ -84,15 +86,20 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// unresolved replicas entirely and emit a real id (incl. 0) only
 	// when one is persisted — mirroring the nodeIDOf()==-1 skip
 	// contract end-to-end.
+	//
+	// idOf is keyed by node (naming.Key), so a peer row and the target that
+	// spell one node differently are one node; spelled keeps the spelling a
+	// peer's row stores, which is the name its DRBD connection carries.
 	idOf := map[string]*int32{}
+	spelled := map[string]string{}
 
 	if id := nodeIDOf(target); id >= 0 {
 		v := id
-		idOf[target.Spec.NodeName] = &v
+		idOf[naming.Key(target.Spec.NodeName)] = &v
 	}
 
 	for i := range peers {
-		if peers[i].Spec.NodeName == target.Spec.NodeName {
+		if naming.Same(peers[i].Spec.NodeName, target.Spec.NodeName) {
 			continue
 		}
 
@@ -110,16 +117,15 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 
 		if id := nodeIDOf(&peers[i]); id >= 0 {
 			v := id
-			idOf[peers[i].Spec.NodeName] = &v
+			idOf[naming.Key(peers[i].Spec.NodeName)] = &v
+			spelled[naming.Key(peers[i].Spec.NodeName)] = peers[i].Spec.NodeName
 		}
 	}
 
-	dropped := make([]string, 0, len(idOf))
+	dropped := make([]string, 0, len(spelled))
 
-	for name := range idOf {
-		if name != target.Spec.NodeName {
-			dropped = append(dropped, name)
-		}
+	for _, name := range spelled {
+		dropped = append(dropped, name)
 	}
 
 	slices.Sort(dropped)
@@ -219,44 +225,15 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 
 	wireProps := mergeEffectiveProps(target.Spec.Props, effectiveProps, drbdOpts)
 
-	// LUKS passphrase: lift the operator-set master passphrase onto
-	// the stable `LuksPassphrase` prop the satellite's LUKS layer
-	// reads. Two source keys are accepted, in order:
-	//
-	//  1. `DrbdOptions/EncryptPassphrase` — upstream LINSTOR's
-	//     canonical cluster-scope master-key name, stamped via
-	//     `linstor controller set-property DrbdOptions/
-	//     EncryptPassphrase <pass>`. Bug 95 enforces its presence
-	//     as a hard prerequisite for any LUKS-layered RD; this is
-	//     the key the REST layer surfaces through
-	//     effectiveprops.Resolve (it copies ControllerConfig.
-	//     ExtraProps onto the output map verbatim).
-	//
-	//  2. `DrbdOptions/Encryption/passphrase` — legacy per-RD shape
-	//     the early-Phase-9 dispatcher introduced (Bug 265 root cause:
-	//     this was the ONLY key the dispatcher read, while the
-	//     controller wrote the cluster master under the upstream
-	//     name in #1 → the operator-set master key never reached
-	//     the satellite and every LUKS RD looped on `Props.
-	//     LuksPassphrase empty`). Kept as a backwards-compat alias.
-	//
-	// The first non-empty wins; both keys are dropped from drbdOpts
-	// after lifting so splitDRBDOptions on the satellite side
-	// doesn't render either as a `passphrase` line in the .res file's
-	// options block (drbdadm create-md rejects unknown options with
-	// `expected: cpu-mask | ... but got 'passphrase'`). The
-	// passphrase reaches the LUKS layer via wireProps, not the .res
-	// file.
-	if pass := pickLUKSPassphrase(drbdOpts); pass != "" {
-		if wireProps == nil {
-			wireProps = map[string]string{}
-		}
-
-		wireProps["LuksPassphrase"] = pass
-	}
-
-	delete(drbdOpts, drbdEncryptionPassphraseKey)
-	delete(drbdOpts, drbdEncryptPassphraseKey)
+	// A passphrase property never reaches the satellite: each LUKS
+	// volume has its own password, stored wrapped on its replica, and a
+	// property is plaintext on its CR. Dropped from both maps so it never
+	// renders as a `passphrase` line in the .res options either.
+	// mergeEffectiveProps hands back the replica's own map when there is
+	// no resolved bag; clone it so the drop never edits the caller's CR.
+	wireProps = maps.Clone(wireProps)
+	passphrase.DropPlaintextProps(wireProps)
+	passphrase.DropPlaintextProps(drbdOpts)
 
 	var layerStack []string
 	if rd != nil {
@@ -264,7 +241,11 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 	}
 
 	return &intent.DesiredResource{
-		Name:        target.Spec.ResourceDefinitionName,
+		// The definition's CR name, whatever spelling an older row keeps
+		// in spec: the satellite names the DRBD resource, the volumes and
+		// the snapshots by it, and the snapshot and delete paths ask for
+		// it by the same name.
+		Name:        naming.Key(target.Spec.ResourceDefinitionName),
 		NodeName:    target.Spec.NodeName,
 		Flags:       target.Spec.Flags,
 		Props:       wireProps,
@@ -319,7 +300,7 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 
 	byName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
 	for i := range peers {
-		byName[peers[i].Spec.NodeName] = &peers[i]
+		byName[naming.Key(peers[i].Spec.NodeName)] = &peers[i]
 	}
 
 	out := make([]intent.DesiredPeer, 0, len(dropped))
@@ -327,7 +308,7 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 	for _, name := range dropped {
 		entry := intent.DesiredPeer{Name: name}
 
-		if peerCR, ok := byName[name]; ok {
+		if peerCR, ok := byName[naming.Key(name)]; ok {
 			// Bug 342 C3: store the pointer (nil = unallocated, never
 			// a spurious 0) so a peer legitimately on node-id 0 is
 			// distinguishable from an unallocated peer downstream.
@@ -341,41 +322,6 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 	}
 
 	return out
-}
-
-// drbdEncryptionPassphraseKey is the legacy per-RD shape the
-// early-Phase-9 dispatcher introduced. Kept as a backwards-compat
-// alias source key — operators on older clusters who set the
-// passphrase via the inner-namespace form should keep working
-// without re-stamping. Bug 265 root cause: the dispatcher used to
-// read ONLY this key, never the upstream master-key one below.
-//
-//nolint:gosec // not a credential value, the string is a prop key name
-const drbdEncryptionPassphraseKey = "DrbdOptions/Encryption/passphrase"
-
-// drbdEncryptPassphraseKey is upstream LINSTOR's canonical cluster-
-// scope master-key name. Operators set it via `linstor controller
-// set-property DrbdOptions/EncryptPassphrase <pass>`; Bug 95 enforces
-// its presence as a hard prerequisite for any LUKS-layered RD. The
-// REST/effectiveprops layer surfaces it under this exact key, so the
-// dispatcher MUST read it to receive the operator-set master key.
-//
-//nolint:gosec // not a credential value, the string is a prop key name
-const drbdEncryptPassphraseKey = "DrbdOptions/EncryptPassphrase"
-
-// pickLUKSPassphrase returns the LUKS passphrase from the resolved
-// options bag, preferring the upstream-canonical master-key shape
-// over the legacy per-RD alias. Empty when neither is set; the
-// caller suppresses the wire-prop stamp in that case so the
-// satellite surfaces the missing-passphrase failure at the LUKS
-// layer (the apply-time failure point that produces actionable
-// error messages on the resource Status.Conditions).
-func pickLUKSPassphrase(opts map[string]string) string {
-	if v := opts[drbdEncryptPassphraseKey]; v != "" {
-		return v
-	}
-
-	return opts[drbdEncryptionPassphraseKey]
 }
 
 // mergeEffectiveProps splits the resolver's output into:
@@ -430,7 +376,7 @@ func nodeIDOf(r *blockstoriov1alpha1.Resource) int32 {
 // wedge on luks-autoplace. Returns (id, true) when present, (0, false)
 // when absent.
 func idLookup(idOf map[string]*int32, name string) (int32, bool) {
-	p, ok := idOf[name]
+	p, ok := idOf[naming.Key(name)]
 	if !ok || p == nil {
 		return 0, false
 	}
@@ -465,7 +411,7 @@ func readDRBDPort(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1.
 		return int(*target.Status.DRBDPort)
 	}
 
-	return derivePort(target.Spec.ResourceDefinitionName)
+	return derivePort(naming.Key(target.Spec.ResourceDefinitionName))
 }
 
 // readDRBDMinor returns the BASE minor (volume 0) for the resource,
@@ -490,7 +436,7 @@ func readDRBDMinor(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1
 		return int(*target.Status.DRBDMinor)
 	}
 
-	return deriveMinor(target.Spec.ResourceDefinitionName)
+	return deriveMinor(naming.Key(target.Spec.ResourceDefinitionName))
 }
 
 // peerPortOf reads the persisted DRBDPort off a peer Resource. The
@@ -515,7 +461,7 @@ func peerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
 func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool, fallbackPort int, idOf map[string]*int32) {
 	peerByName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
 	for i := range peers {
-		peerByName[peers[i].Spec.NodeName] = &peers[i]
+		peerByName[naming.Key(peers[i].Spec.NodeName)] = &peers[i]
 	}
 
 	for _, peer := range dropped {
@@ -523,7 +469,7 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 
 		peerPool := ""
 
-		if p, ok := peerByName[peer]; ok {
+		if p, ok := peerByName[naming.Key(peer)]; ok {
 			peerPort = peerPortOf(p, fallbackPort)
 			peerPool = targetPoolName(p)
 		}
@@ -538,7 +484,7 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 		// Surface the peer's DISKLESS flag so the satellite's .res
 		// renderer can emit `disk none;` instead of the diskful
 		// placeholder for diskless peers.
-		if p, ok := peerByName[peer]; ok && slices.Contains(p.Spec.Flags, "DISKLESS") {
+		if p, ok := peerByName[naming.Key(peer)]; ok && slices.Contains(p.Spec.Flags, "DISKLESS") {
 			drbdOpts["peer."+peer+".diskless"] = boolPropTrue
 		}
 	}
@@ -608,11 +554,11 @@ func peerAddressWithPrefNic(nodeName, poolName string, nodes []blockstoriov1alph
 func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool) string {
 	if poolName != "" {
 		for i := range pools {
-			if pools[i].Spec.NodeName != nodeName {
+			if !naming.Same(pools[i].Spec.NodeName, nodeName) {
 				continue
 			}
 
-			if pools[i].Spec.PoolName != poolName {
+			if !naming.Same(pools[i].Spec.PoolName, poolName) {
 				continue
 			}
 
@@ -625,7 +571,7 @@ func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, 
 	}
 
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+		if nodes[i].Name != naming.Key(nodeName) {
 			continue
 		}
 
@@ -641,7 +587,7 @@ func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, 
 // source rather than 500-ing.
 func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+		if nodes[i].Name != naming.Key(nodeName) {
 			continue
 		}
 
@@ -710,7 +656,7 @@ func anyDiskfulPeerHasData(peers []blockstoriov1alpha1.Resource) bool {
 			continue
 		}
 
-		rdName := peers[i].Spec.ResourceDefinitionName
+		rdName := naming.Key(peers[i].Spec.ResourceDefinitionName)
 
 		for j := range peers[i].Status.Volumes {
 			vol := &peers[i].Status.Volumes[j]
@@ -845,6 +791,15 @@ func DiskfulPeersAllocated(target *blockstoriov1alpha1.Resource, peers []blockst
 	return diskfulPeersAllocated(target, peers)
 }
 
+// AllocatedNodeID is the exported façade over `nodeIDOf`: the replica's
+// DRBD node-id, Spec first, and false when neither Spec nor Status
+// carries one yet.
+func AllocatedNodeID(r *blockstoriov1alpha1.Resource) (int32, bool) {
+	id := nodeIDOf(r)
+
+	return id, id >= 0
+}
+
 // buildVolumes turns the parent ResourceDefinition's VolumeDefinitions
 // into DesiredVolumes for the satellite. DISKLESS replicas still get
 // volume entries — DRBD-9 needs a `volume { ... }` block per peer in
@@ -923,7 +878,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 
 	srcSnapshot := ""
 	if rd.Spec.Props != nil {
-		srcSnapshot = rd.Spec.Props[restoreFromKey]
+		srcSnapshot = restoreSourceOnDisk(rd.Spec.Props[restoreFromKey])
 	}
 
 	out := make([]*intent.DesiredVolume, 0, len(rd.Spec.VolumeDefinitions))
@@ -955,6 +910,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			SizeKib:        vd.SizeKib,
 			StoragePool:    pool,
 			SeedFromGI:     seedFromGI(target, vd.VolumeNumber),
+			ObservedGI:     observedGI(target, vd.VolumeNumber),
 			SourceSnapshot: srcSnapshot,
 			MetaPool:       metaPool,
 			Minor:          minor,
@@ -962,6 +918,21 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	}
 
 	return out
+}
+
+// restoreSourceOnDisk names a restore's source definition the way its
+// satellite named it on disk: by its CR name, as buildDesired does.
+// The prop carries the source as the REST request spelled it, and a
+// source registered as Pvc-Src was laid down as pvc-src. Anything that is
+// not <srcRD>:<snap>, such as the cross-cluster form, is left for the
+// satellite to refuse as it is.
+func restoreSourceOnDisk(value string) string {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 || parts[0] == "" {
+		return value
+	}
+
+	return naming.Key(parts[0]) + ":" + parts[1]
 }
 
 // StorPoolNameDrbdMetaKey is the upstream-LINSTOR prop key that
@@ -1014,6 +985,18 @@ func seedFromGI(target *blockstoriov1alpha1.Resource, volumeNumber int32) string
 	return ""
 }
 
+// observedGI is the current GI the satellite last reported for the given
+// volume of target, or "" when it never reported one.
+func observedGI(target *blockstoriov1alpha1.Resource, volumeNumber int32) string {
+	for i := range target.Status.Volumes {
+		if target.Status.Volumes[i].VolumeNumber == volumeNumber {
+			return target.Status.Volumes[i].CurrentGI
+		}
+	}
+
+	return ""
+}
+
 // kubeInternalNICName is the well-known NetInterface name carrying the
 // corev1.Node InternalIP (a host-routable address). Populated by the
 // register / label-sync path when blockstor knows the kube view of a
@@ -1048,11 +1031,11 @@ const defaultNICName = "default"
 //     legacy "first non-empty" behaviour so single-NIC clusters keep
 //     working unchanged. (Bug 48)
 //
-// Match is on the original LINSTOR name (annotation when slugified,
-// else metadata.Name) so non-RFC1123 LINSTOR names still resolve.
+// Match is by naming.Key, so a replica that stores the node's CR name and
+// one written before in the registered spelling both resolve.
 func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+		if nodes[i].Name != naming.Key(nodeName) {
 			continue
 		}
 

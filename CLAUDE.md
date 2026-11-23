@@ -13,25 +13,21 @@ Project-level guidance for AI agents working on `blockstor`. Read first.
 - **L7 operator-replay harness** — `tests/operator-harness/replay/<workflow>.yaml` workflows + `cli-parity-refresh.sh` BS↔upstream diff.
 - **L8 property-fuzz** — skeleton only, follow-up work.
 
-## CLI-bug-fix protocol
+## How a change is validated
 
-A user-reported CLI bug is **not closed** until ALL of the following land in the same PR:
+Every PR carries the L1 unit tests for what it changes, passes `make lint-config && make lint` and `go test ./...` with envtest, and runs the integration tests of its area (`go test -tags=integration ./tests/integration/...`). A bug fix comes with a test that fails without it.
 
-1. L1 / L2 regression test (the bog-standard mock unit / contract pin).
-2. L6 cli-matrix cell under `tests/e2e/cli-matrix/`.
-3. **L7 replay YAML** under `tests/operator-harness/replay/`. Codifies the exact operator sequence + convergence assertion. Without the YAML the bug counts as open.
+Changes that touch the satellite, DRBD, placement, deletion or the REST wire are then validated on a real cluster before they merge: open PR branches are combined into a dev pre-release (`vX.Y.Z-alpha.N`, built from main plus the PR branches on a `dev/vX.Y.Z-alpha.N` branch), rolled out node by node to a stand that runs real workloads, and checked with the scenario list of the release (volume create and delete, snapshot and restore, resize, live migration, a hard reset of one node). The release notes of the dev pre-release name the PRs it carries, and a PR body says in Testing which pre-release exercised it.
 
-**Before claiming a CLI bug fixed:** run `tests/operator-harness/replay-runner.sh <stand-name> <workflow.yaml>` on the live stand and verify PASS. Local unit tests are not sufficient — the bug repros were operator-CLI level, the fix MUST be validated at operator-CLI level.
+The full CI run on main after the merge is the final gate for the whole set.
 
-- If the fix touches `r c` / `r d` / `r td` / autoplace / tiebreaker paths, `cli-matrix/r-full-lifecycle.sh` MUST be run on stand and green. The lifecycle catcher is the ground-truth gate for that surface (user has reported regressions there 5+ times despite individual bug fixes).
-- If the fix touches `vd s` / volume size / DRBD resize / provider extend paths, `cli-matrix/vd-resize-full-lifecycle.sh` MUST be run on stand and green. The shrink-rejection contract `cli-matrix/vd-shrink-rejected.sh` and the L7 replay `replay/vd-resize-full-lifecycle.yaml` must also pass.
+## Operator-level tools
 
-## Adding a new CLI verb or wire-shape change
+The L6 cli-matrix scripts (`tests/e2e/cli-matrix/`) and the L7 operator harness (`tests/operator-harness/`) are available for reproducing a CLI bug at operator level and for parity checks against upstream LINSTOR. Use them when a bug is only visible through the `linstor` CLI or when a change alters the REST wire shape:
 
-1. Refresh `docs/cli-parity-known-deltas.md` with any intentional new divergence (row id, command, delta_kind, accepted_until, why).
-2. Run `tests/operator-harness/cli-parity-refresh.sh` against the stand. The script exits non-zero if any new non-PARITY row is not whitelisted. Either fix the controller or add the row.
-3. If the verb is novel (not a delta), add a happy-path replay YAML under `tests/operator-harness/replay/` in the same commit.
-4. If the upstream audit (`docs/cli-parity-audit-<date>.md`) is older than a month, regenerate it from the script's output.
+- For a CLI bug, a replay YAML under `tests/operator-harness/replay/` that reproduces it is welcome in the same PR; it is not a merge requirement when the fix is covered by tests and by a dev pre-release run.
+- For a wire-shape change, record intentional divergences in `docs/cli-parity-known-deltas.md` (row id, command, delta_kind, accepted_until, why). `tests/operator-harness/cli-parity-refresh.sh` against a stand helps find unlisted ones. If `docs/cli-parity-audit-<date>.md` is older than a month, regenerate it from the script's output.
+- `cli-matrix/r-full-lifecycle.sh` and `cli-matrix/vd-resize-full-lifecycle.sh` are good smoke tests for `r c` / `r d` / `r td` / autoplace / tiebreaker and for resize paths; run them on a stand when such a change is not going through a dev pre-release.
 
 ## Adding a new replay YAML
 
@@ -45,7 +41,7 @@ Copy the closest existing YAML and fill:
 - `teardown[]` — cleanup CLI invocations.
 - `invariants[]` — currently only `no_orphans` is implemented.
 
-Available `await.kind` values: `replica_count`, `disk_state`, `all_uptodate`, `replica_diskless`, `no_tiebreaker`, `sync_clean`, `resource_absent`, `rd_absent`, `vd_size_kib`, `vd_count`, `pvc_capacity`, `pod_md5_invariant`. See the header comment of `tests/operator-harness/replay-runner.sh` for the contract.
+Available `await.kind` values: `replica_count`, `disk_state`, `all_uptodate`, `replica_diskless`, `no_tiebreaker`, `sync_clean`, `resource_absent`, `rd_absent`, `vd_size_kib`, `vd_count`, `rd_layer_stack`, `rd_annotation`, `pvc_capacity`, `pod_md5_invariant`. See the header comment of `tests/operator-harness/replay-runner.sh` for the contract.
 
 ## Running the harness
 

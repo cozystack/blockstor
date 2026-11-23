@@ -157,11 +157,17 @@ func handleKVModify(w http.ResponseWriter, r *http.Request) {
 		kvBag[name] = bag
 	}
 
+	// An empty override value is stored, not read as a delete: upstream's
+	// key-value store sets every override it is given (only a null is
+	// refused), unlike the object props doors. A namespace takes the keys
+	// below it, read as every other door reads it.
 	maps.Copy(bag, patch.OverrideProps)
 
 	for _, key := range patch.DeleteProps {
 		delete(bag, key)
 	}
+
+	deletePropNamespaces(bag, patch.DeleteNamespace)
 
 	kvBagMu.Unlock()
 
@@ -206,7 +212,7 @@ func decodeKVModifyBody(w http.ResponseWriter, r *http.Request) (apiv1.GenericPr
 
 	for key := range raw {
 		switch key {
-		case "override_props", "delete_props", "delete_namespaces":
+		case fieldOverrideProps, fieldDeleteProps, fieldDeleteNamespaces:
 			continue
 		default:
 			writeError(w, http.StatusBadRequest,
@@ -218,7 +224,7 @@ func decodeKVModifyBody(w http.ResponseWriter, r *http.Request) (apiv1.GenericPr
 		}
 	}
 
-	if rawOverride, ok := raw["override_props"]; ok {
+	if rawOverride, ok := raw[fieldOverrideProps]; ok {
 		err = json.Unmarshal(rawOverride, &patch.OverrideProps)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "decode override_props: "+err.Error())
@@ -227,7 +233,7 @@ func decodeKVModifyBody(w http.ResponseWriter, r *http.Request) (apiv1.GenericPr
 		}
 	}
 
-	if rawDelete, ok := raw["delete_props"]; ok {
+	if rawDelete, ok := raw[fieldDeleteProps]; ok {
 		err = json.Unmarshal(rawDelete, &patch.DeleteProps)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "decode delete_props: "+err.Error())
@@ -236,7 +242,7 @@ func decodeKVModifyBody(w http.ResponseWriter, r *http.Request) (apiv1.GenericPr
 		}
 	}
 
-	if rawNS, ok := raw["delete_namespaces"]; ok {
+	if rawNS, ok := raw[fieldDeleteNamespaces]; ok {
 		err = json.Unmarshal(rawNS, &patch.DeleteNamespace)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "decode delete_namespaces: "+err.Error())

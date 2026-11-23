@@ -110,7 +110,7 @@ preflight_check() {
 
         # Orphan RD CRDs across all namespaces.
         local rd_count
-        rd_count=$(kubectl --request-timeout=3s get resourcedefinitions.blockstor.cozystack.io \
+        rd_count=$(kubectl --request-timeout=3s get resourcedefinitions.blockstor.org \
             -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
 
         if [ "$total" = "3" ] && [ "$running" = "3" ] && [ "$terminating" = "0" ] && [ "$rd_count" = "0" ]; then
@@ -129,7 +129,7 @@ preflight_check() {
         echo "preflight: NOT clean after 60s — ${reason}"
         kubectl --request-timeout=3s -n blockstor-system get pods -l app=blockstor-satellite \
             -o wide 2>/dev/null || true
-        kubectl --request-timeout=3s get resourcedefinitions.blockstor.cozystack.io -A 2>/dev/null || true
+        kubectl --request-timeout=3s get resourcedefinitions.blockstor.org -A 2>/dev/null || true
     } >> "$RESULTS"
     echo "$reason" > "$PREFLIGHT_REASON_FILE"
     return 1

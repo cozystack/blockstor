@@ -64,9 +64,9 @@ DEL_TIMEOUT=${DEL_TIMEOUT:-90}
 
 dump_diag() {
     echo "---- dump: resourcedefinitions / resources / snapshots ----"
-    kubectl get resourcedefinitions.blockstor.cozystack.io 2>/dev/null || true
-    kubectl get resources.blockstor.cozystack.io 2>/dev/null || true
-    kubectl get snapshots.blockstor.cozystack.io 2>/dev/null || true
+    kubectl get resourcedefinitions.blockstor.org 2>/dev/null || true
+    kubectl get resources.blockstor.org 2>/dev/null || true
+    kubectl get snapshots.blockstor.org 2>/dev/null || true
     echo "---- dump: satellite logs (grep dependent clones) ----"
     for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
         kubectl -n "$NS" logs "$pod" --tail=60 2>/dev/null | grep -i "dependent clones\|DeleteResource" || true
@@ -88,9 +88,9 @@ rd_gone() {
     while (( $(date +%s) < deadline )); do
         local count
         count=$( {
-            kubectl get "resourcedefinitions.blockstor.cozystack.io/${rd}" \
+            kubectl get "resourcedefinitions.blockstor.org/${rd}" \
                 --no-headers 2>/dev/null
-            kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+            kubectl get resources.blockstor.org --no-headers 2>/dev/null \
                 | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}'
         } | grep -cv '^$' || true )
         if [[ "$count" == "0" ]]; then
@@ -106,7 +106,7 @@ rd_gone() {
 # trips the clone).
 delete_all_rds 90 || {
     echo "FAIL: stand not idle at test start"
-    kubectl get resourcedefinitions.blockstor.cozystack.io 2>/dev/null || true
+    kubectl get resourcedefinitions.blockstor.org 2>/dev/null || true
     exit 1
 }
 

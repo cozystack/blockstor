@@ -74,7 +74,7 @@ import (
 // (pkg/store/k8s/resources.go::LabelResourceDefinition). We seed the
 // label directly because the cascade test bypasses the REST/CLI path
 // that would have done so naturally.
-const labelResourceDefinition = "blockstor.io/resource-definition"
+const labelResourceDefinition = "blockstor.org/resource-definition"
 
 // TestGroupD is the parent that owns the shared stack and dispatches
 // every Group D bug-guard as a subtest. Booting once dodges the

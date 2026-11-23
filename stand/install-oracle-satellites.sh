@@ -26,7 +26,7 @@
 #
 # All oracle resources are prefixed `orc-`. The satellite plain port is
 # 3366 (verified free on the workers — blockstor satellites only bind
-# hostPorts 9100/9101).
+# hostPorts 3372/9101).
 #
 # Talos specifics (learned from stand/install-piraeus.sh's
 # talos-loader-override): the upstream image's drbd-shutdown-guard /

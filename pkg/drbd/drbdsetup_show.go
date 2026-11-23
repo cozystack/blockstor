@@ -59,8 +59,8 @@ type KernelSlot struct {
 	Name string
 
 	// NodeID is the peer's DRBD-9 node-id observed by the kernel.
-	// Used as the `--node-id` argument to `drbdmeta forget-peer`
-	// when clearing the per-volume metadata slot.
+	// Used as the node-id argument to `drbdsetup forget-peer` when
+	// clearing the peer's metadata slot.
 	NodeID int32
 
 	// ConnectionState is the `.connections[].connection-state` token

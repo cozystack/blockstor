@@ -37,6 +37,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite"
 )
 
@@ -94,7 +95,7 @@ const physicalDeviceConditionDeviceMissing = "DeviceMissing"
 // stamps the finalizer on first observation of `Spec.AttachTo`,
 // and strips it just before its delete-as-completion call.
 // Phase 10.7 step 5 / 10.8 line 4.
-const PhysicalDeviceAttachFinalizer = "blockstor.cozystack.io/physicaldevice-attach"
+const PhysicalDeviceAttachFinalizer = "blockstor.org/physicaldevice-attach"
 
 // PhysicalDeviceReconciler runs the attach sequence on
 // PhysicalDevice CRDs scoped to this satellite's node. It is
@@ -132,7 +133,7 @@ func (r *PhysicalDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, errors.Wrap(err, "get PhysicalDevice")
 	}
 
-	if dev.Labels[blockstoriov1alpha1.PhysicalDeviceLabelNode] != r.Config.NodeName {
+	if !naming.Same(dev.Labels[blockstoriov1alpha1.PhysicalDeviceLabelNode], r.Config.NodeName) {
 		// Predicate should have filtered this out; defensive check
 		// for watch-cache resync windows.
 		return ctrl.Result{}, nil
@@ -348,7 +349,7 @@ func (r *PhysicalDeviceReconciler) recordAttachedKName(ctx context.Context, dev 
 
 	for i := range pools.Items {
 		p := &pools.Items[i]
-		if p.Spec.PoolName == poolName && p.Spec.NodeName == r.Config.NodeName {
+		if naming.Same(p.Spec.PoolName, poolName) && naming.Same(p.Spec.NodeName, r.Config.NodeName) {
 			target = p
 
 			break
@@ -494,7 +495,7 @@ func (r *PhysicalDeviceReconciler) handleDeviceMissing(ctx context.Context, dev 
 // PhysicalDevice CRD is stuck forever in Phase=Attaching with a
 // dangling Spec.AttachTo, invisible to `linstor ps l` and
 // un-re-usable without a manual `kubectl edit physicaldevices.
-// blockstor.io <name>`.
+// blockstor.org <name>`.
 //
 // We do NOT auto-wipe the device here — the operator may have
 // started writes during the partial attach. Going back to
@@ -528,7 +529,7 @@ func (r *PhysicalDeviceReconciler) clearStaleAttachTo(ctx context.Context, dev *
 		return ctrl.Result{}, errors.Wrap(err, "reset Phase to Available after stale AttachTo clear")
 	}
 
-	logger.Info("cleared stale AttachTo; target StoragePool gone (Bug 340 self-heal)",
+	logger.Info("cleared stale AttachTo: the target StoragePool is gone",
 		"missing-pool", missingPool)
 
 	return ctrl.Result{}, nil
@@ -635,8 +636,8 @@ func (r *PhysicalDeviceReconciler) targetPoolExists(ctx context.Context, poolNam
 	}
 
 	for i := range poolList.Items {
-		if poolList.Items[i].Spec.PoolName == poolName &&
-			poolList.Items[i].Spec.NodeName == r.Config.NodeName {
+		if naming.Same(poolList.Items[i].Spec.PoolName, poolName) &&
+			naming.Same(poolList.Items[i].Spec.NodeName, r.Config.NodeName) {
 			return true, nil
 		}
 	}
@@ -716,7 +717,7 @@ func physicalDeviceNodePredicate(nodeName string) predicate.Predicate {
 			return false
 		}
 
-		return dev.Labels[blockstoriov1alpha1.PhysicalDeviceLabelNode] == nodeName
+		return naming.Same(dev.Labels[blockstoriov1alpha1.PhysicalDeviceLabelNode], nodeName)
 	}
 
 	return predicate.Funcs{

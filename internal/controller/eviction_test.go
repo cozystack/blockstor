@@ -228,7 +228,7 @@ func TestNodeReconciler_LostDeletesSourceResource(t *testing.T) {
 // must NOT silently fall back to PlaceCount=1 (which would treat any
 // surviving replica as "enough" and skip the gap-fill). Instead it
 // refuses the migration and stamps the RD with
-// `blockstor.io/migration-blocked=no-rg` so an operator can spot the
+// `blockstor.org/migration-blocked=no-rg` so an operator can spot the
 // gap via `kubectl get rd -o ...` and decide whether to attach an RG
 // and re-trigger the eviction.
 //

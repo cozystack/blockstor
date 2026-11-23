@@ -50,7 +50,7 @@ data:
 ---
 # The satellite runs c-r reconcilers for ResourceDefinitions /
 # Resources / Snapshots / StoragePools and writes node-scoped Status
-# back via SSA — it needs full CRUD on blockstor.io CRDs and access
+# back via SSA — it needs full CRUD on blockstor.org CRDs and access
 # to Status / Finalizers subresources, same as the controller. Events
 # permission is for `EventRecorder` traces from reconcile loops.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -61,9 +61,9 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
-  - apiGroups: [""]
-    resources: [secrets]
-    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
   # Bug 283: enrichNodesWithInternalIP lists corev1.Node to synthesise
   # a k8s-internal NetInterface from each node's InternalIP. Without
   # this RBAC the helper falls back silently to pod-CIDR addresses,
@@ -76,10 +76,10 @@ rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [blockstor.cozystack.io]
+  - apiGroups: [blockstor.org]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [blockstor.cozystack.io]
+  - apiGroups: [blockstor.org]
     resources: ["*/status", "*/finalizers"]
     verbs: [get, update, patch]
 ---
@@ -91,6 +91,39 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: blockstor-satellite
+subjects:
+  - kind: ServiceAccount
+    name: blockstor-satellite
+    namespace: blockstor-system
+---
+# The master passphrase and the keyring are the only Secrets the
+# satellite reads, both here, by name and past the cache, so a get on
+# those names is all it is granted.
+# resourceNames: the keyring, the unlock Secret blockstor generates when no
+# passphrase Secret is named, and the passphrase Secret under piraeus's
+# name, linstor-passphrase. A ControllerConfig that names another
+# passphrase Secret needs that name added here. Nothing else in the
+# namespace is readable: under Cozystack it is shared with piraeus.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blockstor-satellite-secrets
+  namespace: blockstor-system
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [blockstor-master-key, blockstor-unlock, linstor-passphrase]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blockstor-satellite-secrets
+  namespace: blockstor-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: blockstor-satellite-secrets
 subjects:
   - kind: ServiceAccount
     name: blockstor-satellite
@@ -179,6 +212,15 @@ spec:
             # satellites instead of letting Node.Online lie via
             # stale heartbeat-reconciler timestamps.
             - --health-probe-bind-address=:9101
+            # Mutual TLS of the snapshot stream between satellites.
+            # Every satellite presents the same certificate, issued by
+            # the stream CA in blockstor-apiserver-tls.yaml, and accepts
+            # only peers that present one from that CA. Without these
+            # the stream is off and cross-node clone falls back to a
+            # DRBD initial sync.
+            - --stream-tls-cert-file=/etc/blockstor/stream-tls/tls.crt
+            - --stream-tls-key-file=/etc/blockstor/stream-tls/tls.key
+            - --stream-tls-ca-file=/etc/blockstor/stream-tls/ca.crt
           env:
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
@@ -192,20 +234,23 @@ spec:
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
           ports:
-            # Satellite-to-satellite snapshot stream (cross-node clone).
-            # The receiving satellite GETs the raw byte stream from a
-            # peer that hosts the snapshot locally; without this port
-            # open peers see ECONNREFUSED and cross-node clone falls
-            # back to DRBD initial-sync. hostNetwork=true means this
-            # is the node's real port — must stay outside the DRBD
-            # range (7000-7999) and any LINSTOR controller port.
+            # Satellite-to-satellite snapshot stream (cross-node clone),
+            # HTTPS with mutual TLS. The receiving satellite GETs the
+            # raw byte stream from a peer that hosts the snapshot
+            # locally. With this port closed a peer gets a connection
+            # error, tries the other nodes that hold the snapshot and
+            # retries the restore when none answers; only a satellite
+            # with no stream TLS falls back to a DRBD initial sync.
+            # hostNetwork=true means this is the node's real port, so it
+            # must stay outside the DRBD range (7000-7999), every LINSTOR
+            # port and node-exporter's 9100 (see stream.Port).
             - name: snap-stream
-              containerPort: 9100
-              hostPort: 9100
+              containerPort: 3372
+              hostPort: 3372
               protocol: TCP
             # Bug 207: kubelet health probe surface. hostNetwork=true
             # exposes this on the node, so the port must be unique
-            # across the host (snap-stream:9100, healthz:9101).
+            # across the host (snap-stream:3372, healthz:9101).
             - name: healthz
               containerPort: 9101
               hostPort: 9101
@@ -310,6 +355,7 @@ spec:
             # same host directory piraeus's own satellite sees fixes the
             # capacity report and unlocks rwx-ganesha.sh.
             - {name: piraeus-pool, mountPath: /var/lib/piraeus/file-thin}
+            - {name: stream-tls, mountPath: /etc/blockstor/stream-tls, readOnly: true}
           resources:
             requests: {cpu: 50m, memory: 64Mi}
             limits: {cpu: 500m, memory: 512Mi}
@@ -343,6 +389,11 @@ spec:
         # the upstream image + a /etc/drbd-reactor.d ConfigMap mount;
         # no other DaemonSet plumbing change is needed.
       volumes:
+        # Read on every stream handshake, so a certificate cert-manager
+        # rotates is picked up without a restart.
+        - name: stream-tls
+          secret:
+            secretName: blockstor-satellite-stream-tls
         - {name: dev, hostPath: {path: /dev, type: Directory}}
         - {name: modules, hostPath: {path: /lib/modules}}
         - {name: lvm-run, hostPath: {path: /run/lvm, type: DirectoryOrCreate}}

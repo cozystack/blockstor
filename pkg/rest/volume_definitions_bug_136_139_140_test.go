@@ -66,7 +66,7 @@ import (
 //
 // Per-volume to keep multi-volume RDs (rare today but on the
 // roadmap) distinguishable when several volumes grow at once.
-const bug136ResizePendingAnnotationPrefix = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-"
+const bug136ResizePendingAnnotationPrefix = "bug136.blockstor.org/resize-pending-size-kib-vol-"
 
 // TestBug136VDSetSizeTriggersSatelliteResize pins the REST→satellite
 // signal: a PUT that grows a VolumeDefinition stamps a per-resource

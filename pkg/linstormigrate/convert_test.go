@@ -20,6 +20,7 @@ package linstormigrate
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
@@ -65,9 +66,20 @@ func convertFixture(t *testing.T) *Result {
 		t.Fatalf("LoadDump: %v", err)
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
+	}
+
+	// The wrapped passwords carry random nonces under a random master
+	// key; luks_test.go checks them, the golden file only that they are
+	// there.
+	for i := range res.Resources {
+		for j := range res.Resources[i].Spec.Volumes {
+			if key := res.Resources[i].Spec.Volumes[j].LUKSKey; key != nil {
+				key.KeyID, key.Wrapped = "0000000000000000", []byte("wrapped")
+			}
+		}
 	}
 
 	return res
@@ -130,6 +142,20 @@ func findResource(t *testing.T, res *Result, name string) *crdv1alpha1.Resource 
 	return nil
 }
 
+func findRD(t *testing.T, res *Result, name string) *crdv1alpha1.ResourceDefinition {
+	t.Helper()
+
+	for i := range res.ResourceDefinitions {
+		if res.ResourceDefinitions[i].Name == name {
+			return &res.ResourceDefinitions[i]
+		}
+	}
+
+	t.Fatalf("converted output has no ResourceDefinition %q", name)
+
+	return nil
+}
+
 // TestTieBreakerFlagsRequireDiskless pins the flag-decode calibration:
 // the diskless witness keeps TIE_BREAKER while the STALE TIE_BREAKER
 // bit on a diskful replica (an auto-diskful leftover observed in
@@ -161,7 +187,10 @@ func TestTieBreakerFlagsRequireDiskless(t *testing.T) {
 
 // TestAdoptionSafetyLatches pins the two fields that make adopting
 // LINSTOR volumes data-safe: every RD arrives Initialized and every
-// replica arrives with the day0 skip disabled.
+// replica arrives with the day0 skip disabled. The satellite also reads
+// skipInitialSync=false as "not created empty here", which is what
+// keeps it from promoting an adopted Filesystem-mode volume to format
+// it (issue #265).
 func TestAdoptionSafetyLatches(t *testing.T) {
 	res := convertFixture(t)
 
@@ -329,6 +358,7 @@ func TestLiveDRBDPortWins(t *testing.T) {
 	// vol5 carries NO tcp_port in the fixture; vol1 carries 7001.
 	res, err := ConvertWithOptions(dump, Options{
 		DRBDPorts: map[string]int32{"pvc-vol5": 7042, "pvc-vol1": 7099},
+		LUKS:      fixtureLUKS(t),
 	})
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
@@ -388,19 +418,222 @@ func TestMissingDRBDPortReported(t *testing.T) {
 
 // TestParseDRBDPorts pins the port-file parser incl. rejection.
 func TestParseDRBDPorts(t *testing.T) {
-	ports, err := ParseDRBDPorts("# comment\nPVC-ABC 7001\n\npvc-def   7002\n")
+	ports, err := ParseDRBDPorts("# comment\nPVC-ABC 7001\n\npvc-def   7002\nPVC-GHI Node-A 7003\npvc-ghi node-b 7004\npvc-abc 7001\n")
 	if err != nil {
 		t.Fatalf("ParseDRBDPorts: %v", err)
 	}
 
-	if ports["pvc-abc"] != 7001 || ports["pvc-def"] != 7002 {
-		t.Errorf("parsed ports = %v", ports)
+	if ports.ByDefinition["pvc-abc"] != 7001 || ports.ByDefinition["pvc-def"] != 7002 {
+		t.Errorf("definition ports = %v", ports.ByDefinition)
 	}
 
-	for _, bad := range []string{"only-one-field", "rd 70000", "rd notaport", "rd 0"} {
-		if _, err := ParseDRBDPorts(bad); err == nil {
-			t.Errorf("ParseDRBDPorts(%q) accepted a malformed line", bad)
+	if ports.ByReplica["pvc-ghi"]["node-a"] != 7003 || ports.ByReplica["pvc-ghi"]["node-b"] != 7004 {
+		t.Errorf("replica ports = %v", ports.ByReplica)
+	}
+
+	for _, bad := range []string{"only-one-field", "rd 70000", "rd notaport", "rd 0", "rd node 0", "rd a b c"} {
+		if _, err := ParseDRBDPorts(bad); !errors.Is(err, ErrBadPortLine) {
+			t.Errorf("ParseDRBDPorts(%q) = %v, want ErrBadPortLine", bad, err)
 		}
+	}
+}
+
+// A definition-wide map that gives one definition two ports is what
+// concatenating the nodes' lists produces on a cluster whose nodes use
+// different ports for it. Keeping one of the values would give a
+// replica another node's port, so it is refused, and so is one replica
+// given two ports or a definition given in both forms.
+func TestParseDRBDPortsRefusesConflictingPorts(t *testing.T) {
+	for name, content := range map[string]string{
+		"one definition, two ports":     "pvc-x 7001\npvc-x 7002\n",
+		"one replica, two ports":        "pvc-x node-a 7001\npvc-x node-a 7002\n",
+		"definition-wide then per-node": "pvc-x 7001\npvc-x node-a 7001\n",
+		"per-node then definition-wide": "pvc-x node-a 7001\npvc-x 7001\n",
+	} {
+		if _, err := ParseDRBDPorts(content); !errors.Is(err, ErrConflictingPort) {
+			t.Errorf("%s: ParseDRBDPorts = %v, want ErrConflictingPort", name, err)
+		}
+	}
+}
+
+// Each replica gets the port of its own node when the map has one per
+// replica, and the definition carries a preferred port only when every
+// replica shares it.
+func TestEachReplicaKeepsItsOwnNodesPort(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		LUKS: fixtureLUKS(t),
+		ReplicaDRBDPorts: map[string]map[string]int32{
+			"pvc-vol5": {"node-a": 7042, "node-b": 7051},
+			"pvc-vol1": {"node-a": 7099, "node-b": 7099, "node-c": 7099},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	for name, want := range map[string]int32{"pvc-vol5.node-a": 7042, "pvc-vol5.node-b": 7051} {
+		if got := findResource(t, res, name).Spec.DRBDPort; got == nil || *got != want {
+			t.Errorf("%s DRBDPort = %v, want %d", name, got, want)
+		}
+	}
+
+	ports := map[string]*int32{}
+	for i := range res.ResourceDefinitions {
+		ports[res.ResourceDefinitions[i].Name] = res.ResourceDefinitions[i].Spec.DRBDPort
+	}
+
+	if ports["pvc-vol5"] != nil {
+		t.Errorf("pvc-vol5 DRBDPort = %v, want none: its replicas listen on different ports", *ports["pvc-vol5"])
+	}
+
+	if ports["pvc-vol1"] == nil || *ports["pvc-vol1"] != 7099 {
+		t.Errorf("pvc-vol1 DRBDPort = %v, want the shared 7099", ports["pvc-vol1"])
+	}
+}
+
+// A replica the per-replica map leaves out, while its peers are in it,
+// gets no preset port and is reported once.
+func TestAReplicaMissingFromThePerReplicaMapIsReported(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		LUKS:             fixtureLUKS(t),
+		ReplicaDRBDPorts: map[string]map[string]int32{"pvc-vol5": {"node-a": 7042}},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if got := findResource(t, res, "pvc-vol5.node-b").Spec.DRBDPort; got != nil {
+		t.Errorf("pvc-vol5.node-b DRBDPort = %d, want none", *got)
+	}
+
+	if !hasWarning(res, "pvc-vol5.node-b: no DRBD port for this replica in the live map") {
+		t.Errorf("missing replica port not reported; warnings %v", res.Warnings)
+	}
+
+	if got := findRD(t, res, "pvc-vol5").Spec.DRBDPort; got != nil {
+		t.Errorf("pvc-vol5 DRBDPort = %d, want none: the map does not cover node-b", *got)
+	}
+}
+
+// The tiebreaker replica of pvc-vol1 (node-c) keeps its own port like
+// any other replica, and a definition whose map skips it gets no
+// shared port.
+func TestADisklessReplicaKeepsItsOwnPort(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		LUKS: fixtureLUKS(t),
+		ReplicaDRBDPorts: map[string]map[string]int32{
+			"pvc-vol1": {"node-a": 7099, "node-b": 7099, "node-c": 7105},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if got := findResource(t, res, "pvc-vol1.node-c").Spec.DRBDPort; got == nil || *got != 7105 {
+		t.Errorf("pvc-vol1.node-c DRBDPort = %v, want 7105", got)
+	}
+
+	if got := findRD(t, res, "pvc-vol1").Spec.DRBDPort; got != nil {
+		t.Errorf("pvc-vol1 DRBDPort = %d, want none: node-c listens on another port", *got)
+	}
+}
+
+// The map may name a node by LINSTOR's key name rather than its
+// display name, in any case.
+func TestThePortMapMatchesTheNodesKeyName(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	for i := range dump.Nodes {
+		if dump.Nodes[i].NodeName == "NODE-B" {
+			dump.Nodes[i].NodeDspName = "Worker-B"
+		}
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		LUKS:             fixtureLUKS(t),
+		ReplicaDRBDPorts: map[string]map[string]int32{"pvc-vol5": {"node-a": 7042, "node-b": 7051}},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if got := findResource(t, res, "pvc-vol5.worker-b").Spec.DRBDPort; got == nil || *got != 7051 {
+		t.Errorf("pvc-vol5.worker-b DRBDPort = %v, want 7051 found by the key name NODE-B", got)
+	}
+}
+
+// Map entries for nodes without a replica are reported, with their own
+// wording when no entry of the definition matches at all.
+func TestPortMapNodesWithoutAReplicaAreReported(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	res, err := ConvertWithOptions(dump, Options{
+		LUKS: fixtureLUKS(t),
+		ReplicaDRBDPorts: map[string]map[string]int32{
+			"pvc-vol5": {"node-a": 7042, "node-b": 7051, "node-c": 7060},
+			"pvc-vol3": {"k8s-a": 7070, "k8s-b": 7071},
+			"pvc-vol4": {"node-b": 7080},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if !hasWarning(res, "pvc-vol5: the live port map names nodes without a replica of it (node-c)") {
+		t.Errorf("stray node entry not reported; warnings %v", res.Warnings)
+	}
+
+	if !hasWarning(res, "pvc-vol3: no DRBD port for any replica: no node in the live port map (k8s-a, k8s-b) hosts a replica of it") {
+		t.Errorf("fully unmatched map not reported; warnings %v", res.Warnings)
+	}
+
+	if hasWarning(res, "pvc-vol4: no DRBD port") {
+		t.Errorf("a definition that did not convert reported a port to capture; warnings %v", res.Warnings)
+	}
+
+	if hasWarning(res, "has ports for the other replicas of pvc-vol3") {
+		t.Errorf("fully unmatched map reported as a partial one; warnings %v", res.Warnings)
+	}
+}
+
+// Two replicas on one node preset to one port are refused: the port is
+// set once and one of them could not bind on adoption.
+func TestTwoReplicasOnOneNodePortAreRefused(t *testing.T) {
+	dump, err := LoadDump(filepath.Join("testdata", "dump"))
+	if err != nil {
+		t.Fatalf("LoadDump: %v", err)
+	}
+
+	_, err = ConvertWithOptions(dump, Options{
+		LUKS: fixtureLUKS(t),
+		ReplicaDRBDPorts: map[string]map[string]int32{
+			"pvc-vol5": {"node-a": 7042, "node-b": 7051},
+			"pvc-vol3": {"node-a": 7042, "node-b": 7052},
+		},
+	})
+	if !errors.Is(err, ErrPortCollision) {
+		t.Fatalf("Convert err = %v, want ErrPortCollision", err)
 	}
 }
 
@@ -794,8 +1027,8 @@ func TestLuksPassphraseWarning(t *testing.T) {
 		t.Errorf("pvc-vol3 layerStack = %v, want [DRBD LUKS STORAGE]", vol3.Spec.LayerStack)
 	}
 
-	if !hasWarning(res, "pvc-vol3: LUKS passphrase NOT migrated") {
-		t.Errorf("LUKS passphrase warning missing; warnings: %v", res.Warnings)
+	if !hasWarning(res, "pvc-vol3: 2 LUKS volume passwords migrated") {
+		t.Errorf("LUKS import count missing; warnings: %v", res.Warnings)
 	}
 }
 
@@ -847,7 +1080,7 @@ func TestLatchHoldsOnADiskfulReplicaWithAStaleTieBreakerBit(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -882,7 +1115,7 @@ func TestLatchDoesNotHoldOnAWitnessAlone(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -917,7 +1150,7 @@ func TestInitializedLatchNeedsAnAdoptedReplica(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -968,7 +1201,7 @@ func TestSparseZfsPoolMigratesAsThin(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1015,7 +1248,7 @@ func TestSparseFlagAtControllerScopeIsSeen(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1051,7 +1284,7 @@ func TestSparseFlagAtNodeScopeIsSeen(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1082,7 +1315,7 @@ func TestPoolScopeWinsOverControllerScope(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1126,7 +1359,7 @@ func TestRemapDoesNotAdmitADeliberatelyExcludedThinPool(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1196,7 +1429,7 @@ func TestSameNameDifferentDriverPerNode(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1246,7 +1479,7 @@ func TestRemapWidensWhenNoThinPoolExists(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1293,7 +1526,7 @@ func TestPinnedGroupNamingAThinPoolIsScopedNotWidened(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1350,7 +1583,7 @@ func TestPinnedGroupNamingASplitPoolIsNotWidened(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1385,7 +1618,7 @@ func TestPinnedGroupOnThickPoolsIsWidened(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1422,7 +1655,7 @@ func TestRemapLeavesUnrelatedGroupsAlone(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1475,7 +1708,7 @@ func TestVolumelessDefinitionIsSkipped(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1542,7 +1775,7 @@ func TestInitializedLatchSurvivesAnUnmigratedNode(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1597,7 +1830,7 @@ func TestSparseRemapWidensTheProviderAllowList(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1653,7 +1886,7 @@ func TestPinnedGroupNamingASplitNameIsNotScoped(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1704,7 +1937,7 @@ func TestUnresolvableGroupWithNoEligiblePoolSaysSo(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1736,7 +1969,7 @@ func TestDisklessOnlyDefinitionIsReportedAsSuch(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -1763,7 +1996,7 @@ func TestBothLatchReasonsAreReported(t *testing.T) {
 			{NodeName: "NODE-A", PoolName: "P2", DriverName: "ZFS", UUID: "sp-2"},
 		},
 		ResourceDefinitions: []ResourceDefinitionRow{
-			{ResourceName: "PVC-BOTH", ResourceDspName: "pvc-both", LayerStack: `["DRBD","STORAGE"]`, UUID: "rd-b"},
+			{ResourceName: "PVC-BOTH", ResourceDspName: "pvc-both", LayerStack: `["STORAGE"]`, UUID: "rd-b"},
 		},
 		VolumeDefinitions: []VolumeDefinitionRow{
 			{ResourceName: "PVC-BOTH", VlmNr: 0, VlmSize: 1048576, UUID: "vd-b"},
@@ -1790,7 +2023,7 @@ func TestBothLatchReasonsAreReported(t *testing.T) {
 		},
 	}
 
-	res, err := Convert(dump)
+	res, err := convertForTest(t, dump)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}

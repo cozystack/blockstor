@@ -32,7 +32,7 @@ import (
 // clone.sh / snapshot-restore-cross-node.sh source shape: a Resource
 // applied via `kubectl apply` carries the pool ONLY in Spec.Props
 // (raw "StorPoolName"), with NO typed Spec.StoragePool and NO
-// blockstor.io/resource-definition label (the store's Create() sets
+// blockstor.org/resource-definition label (the store's Create() sets
 // both, but a raw apply does not). The restore handler's
 // storPoolsByNodeFromSourceRD reads the wire .Props["StorPoolName"];
 // this probe confirms ListByDefinition surfaces it via the label-less

@@ -31,10 +31,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -130,12 +132,29 @@ func (e *OversubscriptionShortfallError) Error() string {
 // a backing storage pool. Mirrors the literal the REST handlers and the
 // satellite dispatcher key on; centralised here so the placer's
 // create-and-promote paths can't drift on the spelling.
-const storPoolNameProp = "StorPoolName"
+const storPoolNameProp = apiv1.KeyStorPoolName
 
 // Placer adds replicas to satisfy a placement filter. Construct via
 // New; one instance per autoplace call (it does no internal caching).
 type Placer struct {
 	store store.Store
+}
+
+// placing serializes placement per definition across every Placer in the
+// process. The REST autoplace, the resource-group reconcilers and node
+// replacement all place, each counting the replicas there are and adding
+// the rest; two at once each count the other's replicas as missing and
+// the definition ends up with more than it asked for.
+//
+//nolint:gochecknoglobals // one lock set for every Placer in the process
+var placing sync.Map
+
+func lockDefinition(rdName string) func() {
+	mu, _ := placing.LoadOrStore(naming.Key(rdName), &sync.Mutex{})
+	lock, _ := mu.(*sync.Mutex)
+	lock.Lock()
+
+	return lock.Unlock
 }
 
 // New constructs a Placer over the given store. The store reference
@@ -159,6 +178,8 @@ func New(st store.Store) *Placer {
 // the migration semantic: even if 2 replicas exist, if one is on an
 // evicted node the placer will create a third on a healthy peer.
 func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
+	defer lockDefinition(rdName)()
+
 	// Bug 038: an RD born from a snapshot restore / clone must never
 	// gain a diskful replica on a foreign backend or a snapshot-less
 	// node — enforce the restore-source constraints HERE so every
@@ -195,6 +216,8 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 
 	placed := countDiskfulReplicas(plan.existing, plan.disabled)
 	want := int(filter.PlaceCount)
+
+	defer p.holdWitness(ctx, rdName, want-placed)()
 
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.preferred, placed, want)
 	if err != nil {
@@ -297,13 +320,15 @@ func (p *Placer) buildPlan(ctx context.Context, rdName string, filter *apiv1.Aut
 		}, nil
 	}
 
+	candidates = p.pinRestoreCopyPools(ctx, rdName, candidates)
+
 	return p.assemblePlan(ctx, rdName, filter, candidates, requiredKib, gates)
 }
 
 // assemblePlan finishes off buildPlan once the capacity gate has
 // passed. Split out so buildPlan stays under the gocyclo budget.
 func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, candidates []apiv1.StoragePool, requiredKib int64, gates candidateGates) (*placePlan, error) {
-	existing, err := p.store.Resources().ListByDefinition(ctx, rdName)
+	existing, err := store.LiveReplicas(ctx, p.store, rdName)
 	if err != nil {
 		return nil, errors.Wrap(err, "list resources by definition")
 	}
@@ -402,7 +427,7 @@ func countDiskfulReplicas(existing []apiv1.Resource, disabled map[string]struct{
 	count := 0
 
 	for i := range existing {
-		if _, off := disabled[existing[i].NodeName]; off {
+		if _, off := disabled[naming.Key(existing[i].NodeName)]; off {
 			continue
 		}
 
@@ -452,7 +477,7 @@ func (p *Placer) placeDiskful(ctx context.Context, rdName string, state *state, 
 // met.
 func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, state *state) error {
 	for nodeName, hostProps := range state.nodes {
-		if _, busy := state.taken[nodeName]; busy {
+		if _, busy := state.taken[naming.Key(nodeName)]; busy {
 			continue
 		}
 
@@ -469,7 +494,7 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 			return errors.Wrap(err, "create diskless witness")
 		}
 
-		state.taken[nodeName] = struct{}{}
+		state.taken[naming.Key(nodeName)] = struct{}{}
 	}
 
 	return nil
@@ -541,6 +566,8 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 	}
 
 	for i := range existing {
+		replica := &existing[i]
+
 		// corner-D2b: a node whose only replica is a diskless witness
 		// (DISKLESS, typically also TIE_BREAKER) is NOT taken for
 		// diskful placement — it's an UPGRADE candidate. Record it so
@@ -548,13 +575,13 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		// NOT add it to `taken` (which would make candidateNodeProps
 		// reject it the way a real diskful peer is rejected). Diskful
 		// replicas still claim the node via `taken` below.
-		if slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
-			s.upgradeable[existing[i].NodeName] = existing[i].Props[storPoolNameProp]
+		if slices.Contains(replica.Flags, apiv1.ResourceFlagDiskless) {
+			s.upgradeable[naming.Key(replica.NodeName)] = replica.Props[storPoolNameProp]
 
 			continue
 		}
 
-		s.taken[existing[i].NodeName] = struct{}{}
+		s.taken[naming.Key(replica.NodeName)] = struct{}{}
 
 		// Seed XReplicasOnDifferentMap buckets from this diskful
 		// replica. DISKLESS witnesses (handled by the continue above)
@@ -562,7 +589,7 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		// attachments and upstream LINSTOR doesn't count them toward
 		// x-replicas either (mirrors place_count's diskful-only
 		// semantic).
-		nodeProps := nodes[existing[i].NodeName]
+		nodeProps := nodes[naming.Key(replica.NodeName)]
 		for key := range filter.XReplicasOnDifferentMap {
 			s.xBuckets[xBucketKey(key, nodeProps)]++
 		}
@@ -570,12 +597,12 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		// Pre-seed shared-space anti-affinity: if an existing replica
 		// already lives on a shared-LUN pool, no new replica may land
 		// on a pool sharing that LUN identifier.
-		stor := existing[i].Props[storPoolNameProp]
+		stor := replica.Props[storPoolNameProp]
 		if stor == "" {
 			continue
 		}
 
-		pool, ok := s.pools[poolKey(existing[i].NodeName, stor)]
+		pool, ok := s.pools[poolKey(replica.NodeName, stor)]
 		if !ok {
 			continue
 		}
@@ -606,11 +633,11 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 // Returns (nil, false) on rejection so the caller stays a single
 // if-not-ok-return.
 func (s *state) candidateNodeProps(pool *apiv1.StoragePool) (map[string]string, bool) {
-	if _, busy := s.taken[pool.NodeName]; busy {
+	if _, busy := s.taken[naming.Key(pool.NodeName)]; busy {
 		return nil, false
 	}
 
-	nodeProps := s.nodes[pool.NodeName]
+	nodeProps := s.nodes[naming.Key(pool.NodeName)]
 
 	if !matchesTuple(nodeProps, s.filter.ReplicasOnSame, s.sameTuple) {
 		return nil, false
@@ -708,34 +735,17 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		return false, nil
 	}
 
-	// corner-D2b: when the candidate node already hosts a diskless
-	// witness (recorded in `upgradeable` at newState time), promote it
-	// to diskful in place instead of creating a fresh Resource — a
-	// Create would hit ErrAlreadyExists and the witness would never gain
-	// a backing disk. The promote strips DISKLESS+TIE_BREAKER and stamps
-	// the chosen StorPoolName, the exact transition the explicit
-	// `r c <node> --storage-pool` toggle-disk path performs via
-	// pkg/rest.promoteDisklessReplica.
-	if _, isWitness := s.upgradeable[pool.NodeName]; isWitness {
-		err := s.promoteWitness(ctx, st, rdName, pool)
-		if err != nil {
-			return false, err
-		}
-	} else {
-		res := apiv1.Resource{
-			Name:     rdName,
-			NodeName: pool.NodeName,
-			Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
-		}
-
-		err := st.Resources().Create(ctx, &res)
-		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
-			return false, errors.Wrap(err, "create resource")
-		}
+	err := s.writeReplica(ctx, st, rdName, pool)
+	if errors.Is(err, errReplicaTerminating) {
+		return false, nil
 	}
 
-	s.taken[pool.NodeName] = struct{}{}
-	delete(s.upgradeable, pool.NodeName)
+	if err != nil {
+		return false, err
+	}
+
+	s.taken[naming.Key(pool.NodeName)] = struct{}{}
+	delete(s.upgradeable, naming.Key(pool.NodeName))
 
 	if s.sameTuple == nil && len(s.filter.ReplicasOnSame) > 0 {
 		s.sameTuple = lookupKeys(nodeProps, s.filter.ReplicasOnSame)
@@ -770,6 +780,36 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 	return true, nil
 }
 
+// writeReplica lands the diskful replica tryPlace chose on pool.
+//
+// corner-D2b: when the candidate node already hosts a diskless
+// witness (recorded in `upgradeable` at newState time), promote it
+// to diskful in place instead of creating a fresh Resource — a
+// Create would hit ErrAlreadyExists and the witness would never gain
+// a backing disk. The promote strips DISKLESS+TIE_BREAKER and stamps
+// the chosen StorPoolName, the exact transition the explicit
+// `r c <node> --storage-pool` toggle-disk path performs via
+// pkg/rest.promoteDisklessReplica. A create that finds a replica
+// written since newState goes through takeOverReplicaWrittenMeanwhile.
+func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
+	if _, isWitness := s.upgradeable[naming.Key(pool.NodeName)]; isWitness {
+		return s.promoteWitness(ctx, st, rdName, pool)
+	}
+
+	res := apiv1.Resource{
+		Name:     rdName,
+		NodeName: pool.NodeName,
+		Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
+	}
+
+	err := st.Resources().Create(ctx, &res)
+	if errors.Is(err, store.ErrAlreadyExists) {
+		err = s.takeOverReplicaWrittenMeanwhile(ctx, st, rdName, pool)
+	}
+
+	return errors.Wrap(err, "create resource")
+}
+
 // promoteWitness converts the diskless witness already on pool.NodeName
 // into a diskful replica backed by pool.StoragePoolName (corner-D2b).
 // It strips DISKLESS + TIE_BREAKER and stamps StorPoolName via
@@ -782,52 +822,114 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 // The patch is conflict-safe: PatchResourceSpec re-runs the closure
 // against the freshly-fetched live replica on every optimistic-
 // concurrency retry, so a racing satellite Status write converges
-// instead of clobbering the promote. A NotFound (the witness was
-// collapsed out from under us between newState and here) is treated as
-// "nothing to promote" and falls back to a fresh Create so the
-// placement still lands.
+// instead of clobbering the promote. The closure decides on that live
+// replica, not on what the placement read earlier:
+//
+//   - a replica that turned diskful meanwhile is left as it is and
+//     counts as placed;
+//   - a replica being deleted is not promoted: the patch would land on
+//     an object about to vanish, and the placement would count a
+//     replica that is gone a moment later. errReplicaTerminating tells
+//     the caller the node is not placed on;
+//   - a replica that is gone (a concurrent witness-collapse) gets a
+//     fresh diskful create so the placement still lands. When that
+//     create finds a replica again, written in between, the next round
+//     decides on it the same way rather than counting it unseen.
 func (s *state) promoteWitness(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
-	err := st.Resources().PatchResourceSpec(ctx, rdName, pool.NodeName, func(live *apiv1.Resource) error {
-		keep, _ := apiv1.PromoteWitnessFlags(live.Flags, true)
-		live.Flags = keep
+	for range witnessTakeOverRounds {
+		err := st.Resources().PatchResourceSpec(ctx, rdName, pool.NodeName, func(live *apiv1.Resource) error {
+			if slices.Contains(live.Flags, apiv1.ResourceFlagDelete) {
+				return errReplicaTerminating
+			}
 
-		if live.Props == nil {
-			live.Props = map[string]string{}
+			if !isDisklessReplica(live.Flags) {
+				return errReplicaDiskful
+			}
+
+			keep, _ := apiv1.PromoteWitnessFlags(live.Flags, true)
+			live.Flags = keep
+
+			if live.Props == nil {
+				live.Props = map[string]string{}
+			}
+
+			live.Props[storPoolNameProp] = pool.StoragePoolName
+
+			return nil
+		})
+
+		switch {
+		case err == nil, errors.Is(err, errReplicaDiskful):
+			return nil
+		case errors.Is(err, errReplicaTerminating):
+			return errReplicaTerminating
+		case !errors.Is(err, store.ErrNotFound):
+			return errors.Wrap(err, "promote witness to diskful")
 		}
 
-		live.Props[storPoolNameProp] = pool.StoragePoolName
+		res := apiv1.Resource{
+			Name:     rdName,
+			NodeName: pool.NodeName,
+			Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
+		}
 
-		return nil
-	})
-	if err == nil {
-		return nil
+		err = st.Resources().Create(ctx, &res)
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			return errors.Wrap(err, "create resource after witness vanished")
+		}
 	}
 
-	if !errors.Is(err, store.ErrNotFound) {
-		return errors.Wrap(err, "promote witness to diskful")
-	}
+	return errors.Wrapf(errReplicaKeptChanging, "replica of %s on %s", rdName, pool.NodeName)
+}
 
-	// The witness vanished between newState and the patch (e.g. a
-	// concurrent witness-collapse). Land a fresh diskful replica so the
-	// placement target is still met.
-	res := apiv1.Resource{
-		Name:     rdName,
-		NodeName: pool.NodeName,
-		Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
-	}
+// witnessTakeOverRounds bounds how often promoteWitness re-reads a
+// replica that vanished and reappeared under it. One writer, the
+// tiebreaker reconciler, can do that at most once per definition
+// change, so a few rounds settle it.
+const witnessTakeOverRounds = 3
 
-	createErr := st.Resources().Create(ctx, &res)
-	if createErr != nil && !errors.Is(createErr, store.ErrAlreadyExists) {
-		return errors.Wrap(createErr, "create resource after witness vanished")
-	}
+// errReplicaTerminating is a replica the placement would take over
+// that is being deleted. The node is not placed on.
+var errReplicaTerminating = errors.New("replica is being deleted")
 
-	return nil
+// errReplicaKeptChanging is a replica that vanished and came back on
+// every round of promoteWitness.
+var errReplicaKeptChanging = errors.New("kept changing during the placement")
+
+// errReplicaDiskful stops a witness promotion that finds the replica
+// diskful already: it is left as it is.
+var errReplicaDiskful = errors.New("replica is diskful already")
+
+// isDisklessReplica reports whether flags are those of a replica the
+// placement takes over: a diskless replica or a TieBreaker witness.
+func isDisklessReplica(flags []string) bool {
+	return slices.Contains(flags, apiv1.ResourceFlagDiskless) ||
+		slices.Contains(flags, apiv1.ResourceFlagTieBreaker)
+}
+
+// takeOverReplicaWrittenMeanwhile settles a create that found a replica
+// of rdName already on pool.NodeName, written after the placement read
+// the definition's replicas. The one writer that does that is the
+// controller's tiebreaker reconciler: it watches the replicas the
+// placement creates one by one, and at the two diskful replicas of a
+// three-replica placement puts a TIE_BREAKER witness on the very node
+// the third one is for. Counting that witness as the replica placed
+// left the definition one diskful replica short, with a witness in its
+// quorum, until a later placement promoted it minutes on. LINSTOR
+// places a diskful replica over a TieBreaker by taking the witness
+// over, as this placer does for a witness it saw before it started, so
+// the replica found here goes through the same promoteWitness, which
+// leaves a diskful one as it is.
+func (s *state) takeOverReplicaWrittenMeanwhile(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
+	return s.promoteWitness(ctx, st, rdName, pool)
 }
 
 // poolKey is the composite (node, pool) lookup key used to find a
-// StoragePool from a Resource's StorPoolName + NodeName pair.
+// StoragePool from a Resource's StorPoolName + NodeName pair. The
+// replica and the pool listing each spell the node their own way, so
+// both halves are keys.
 func poolKey(node, pool string) string {
-	return node + "\x1f" + pool
+	return naming.Key(node) + "\x1f" + naming.Key(pool)
 }
 
 func poolsByKey(pools []apiv1.StoragePool) map[string]apiv1.StoragePool {
@@ -874,18 +976,18 @@ func (p *Placer) applyNotPlaceWith(ctx context.Context, rdName string, filter *a
 	for i := range all {
 		// Skip resources of the RD being placed — otherwise the first
 		// replica we land locks every subsequent placement out.
-		if all[i].Name == rdName {
+		if naming.Same(all[i].Name, rdName) {
 			continue
 		}
 
 		if slices.Contains(filter.NotPlaceWithRsc, all[i].Name) {
-			excluded[all[i].NodeName] = struct{}{}
+			excluded[naming.Key(all[i].NodeName)] = struct{}{}
 
 			continue
 		}
 
 		if pattern != nil && pattern.MatchString(all[i].Name) {
-			excluded[all[i].NodeName] = struct{}{}
+			excluded[naming.Key(all[i].NodeName)] = struct{}{}
 		}
 	}
 
@@ -896,7 +998,7 @@ func (p *Placer) applyNotPlaceWith(ctx context.Context, rdName string, filter *a
 	out := candidates[:0:0]
 
 	for i := range candidates {
-		if _, blocked := excluded[candidates[i].NodeName]; blocked {
+		if _, blocked := excluded[naming.Key(candidates[i].NodeName)]; blocked {
 			continue
 		}
 
@@ -1138,7 +1240,7 @@ func (p *Placer) resourcesPerNode(ctx context.Context) (map[string]int, error) {
 
 	out := make(map[string]int, len(all))
 	for i := range all {
-		out[all[i].NodeName]++
+		out[naming.Key(all[i].NodeName)]++
 	}
 
 	return out, nil
@@ -1151,7 +1253,7 @@ func (p *Placer) resourcesPerNode(ctx context.Context) (map[string]int, error) {
 // strategy scored as:
 //   - MaxFreeSpace:     FreeCapacity / TotalCapacity, or 0 when total=0
 //   - MinReservedSpace: 1 - reservedKib/totalKib (reserved from
-//     pool.Props[Aux/blockstor.io/reserved-kib], 0 if absent)
+//     pool.Props[Aux/blockstor.org/reserved-kib], 0 if absent)
 //   - MinRscCount:      1 / (1 + numResourcesOnNode(pool.NodeName))
 //   - MaxThroughput:    throughput / maxThroughputInSet (0 when nobody
 //     advertises a hint, or when this pool's hint is 0)
@@ -1200,7 +1302,7 @@ func composite(pool *apiv1.StoragePool, w weights, rscPerNode map[string]int, ma
 	}
 
 	if w.minRscCount > 0 {
-		score += w.minRscCount * (1.0 / float64(1+rscPerNode[pool.NodeName]))
+		score += w.minRscCount * (1.0 / float64(1+rscPerNode[naming.Key(pool.NodeName)]))
 	}
 
 	if w.maxThroughput > 0 && maxThroughput > 0 {
@@ -1210,7 +1312,7 @@ func composite(pool *apiv1.StoragePool, w weights, rscPerNode map[string]int, ma
 	return score
 }
 
-// reservedKib reads the optional `Aux/blockstor.io/reserved-kib` pool
+// reservedKib reads the optional `Aux/blockstor.org/reserved-kib` pool
 // prop. Missing/unparseable values score 0 — the MinReservedSpace
 // strategy degrades to "no reservation reported", same as a literal 0.
 func reservedKib(pool *apiv1.StoragePool) int64 {
@@ -1267,7 +1369,7 @@ func matchesPoolFilter(pool *apiv1.StoragePool, filter *apiv1.AutoSelectFilter, 
 		return false
 	}
 
-	if _, off := disabled[pool.NodeName]; off {
+	if _, off := disabled[naming.Key(pool.NodeName)]; off {
 		return false
 	}
 
@@ -1280,15 +1382,15 @@ func matchesPoolFilter(pool *apiv1.StoragePool, filter *apiv1.AutoSelectFilter, 
 		return false
 	}
 
-	if filter.StoragePool != "" && pool.StoragePoolName != filter.StoragePool {
+	if filter.StoragePool != "" && !naming.Same(pool.StoragePoolName, filter.StoragePool) {
 		return false
 	}
 
-	if len(filter.StoragePoolList) > 0 && !slices.Contains(filter.StoragePoolList, pool.StoragePoolName) {
+	if len(filter.StoragePoolList) > 0 && !slices.ContainsFunc(filter.StoragePoolList, func(n string) bool { return naming.Same(n, pool.StoragePoolName) }) {
 		return false
 	}
 
-	if len(filter.NodeNameList) > 0 && !slices.Contains(filter.NodeNameList, pool.NodeName) {
+	if len(filter.NodeNameList) > 0 && !slices.ContainsFunc(filter.NodeNameList, func(n string) bool { return naming.Key(n) == naming.Key(pool.NodeName) }) {
 		return false
 	}
 
@@ -1343,7 +1445,7 @@ func (p *Placer) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 	for i := range nodes {
 		for _, f := range nodes[i].Flags {
 			if f == apiv1.NodeFlagEvicted || f == apiv1.NodeFlagLost {
-				out[nodes[i].Name] = struct{}{}
+				out[naming.Key(nodes[i].Name)] = struct{}{}
 
 				break
 			}
@@ -1386,7 +1488,7 @@ func (p *Placer) autoplaceExcludedNodes(ctx context.Context, disabled map[string
 
 		v, perr := strconv.ParseBool(raw)
 		if perr == nil && !v {
-			out[nodes[i].Name] = struct{}{}
+			out[naming.Key(nodes[i].Name)] = struct{}{}
 		}
 	}
 
@@ -1401,7 +1503,7 @@ func (p *Placer) nodesByName(ctx context.Context) (map[string]map[string]string,
 
 	out := make(map[string]map[string]string, len(list))
 	for i := range list {
-		out[list[i].Name] = list[i].Props
+		out[naming.Key(list[i].Name)] = list[i].Props
 	}
 
 	return out, nil
@@ -1414,7 +1516,7 @@ func topologyTuple(existing []apiv1.Resource, nodes map[string]map[string]string
 		return nil
 	}
 
-	return lookupKeys(nodes[existing[0].NodeName], keys)
+	return lookupKeys(nodes[naming.Key(existing[0].NodeName)], keys)
 }
 
 func topologySeen(existing []apiv1.Resource, nodes map[string]map[string]string, keys []string) map[string]struct{} {
@@ -1431,7 +1533,7 @@ func topologySeen(existing []apiv1.Resource, nodes map[string]map[string]string,
 		k := spec
 
 		for i := range existing {
-			value := nodes[existing[i].NodeName][auxKey(k)]
+			value := nodes[naming.Key(existing[i].NodeName)][auxKey(k)]
 			out[k+"="+value] = struct{}{}
 		}
 	}
@@ -1569,7 +1671,7 @@ func partitionByExclusion(candidates []apiv1.StoragePool, nodes map[string]map[s
 
 	for i := range candidates {
 		pool := candidates[i]
-		nodeProps := nodes[pool.NodeName]
+		nodeProps := nodes[naming.Key(pool.NodeName)]
 
 		if matchesAnyExcludedPair(nodeProps, keys) {
 			lastResort = append(lastResort, pool)
@@ -1626,7 +1728,7 @@ func filterSamePinned(candidates []apiv1.StoragePool, nodes map[string]map[strin
 	out := candidates[:0:0]
 
 	for i := range candidates {
-		nodeProps := nodes[candidates[i].NodeName]
+		nodeProps := nodes[naming.Key(candidates[i].NodeName)]
 
 		if matchesAllSamePins(nodeProps, keys) {
 			out = append(out, candidates[i])
@@ -1679,7 +1781,7 @@ func pickSameGroup(candidates []apiv1.StoragePool, nodes map[string]map[string]s
 
 	for i := range candidates {
 		pool := candidates[i]
-		tuple := lookupKeys(nodes[pool.NodeName], keys)
+		tuple := lookupKeys(nodes[naming.Key(pool.NodeName)], keys)
 		key := tupleKey(tuple)
 
 		grp, ok := byKey[key]
@@ -1689,7 +1791,7 @@ func pickSameGroup(candidates []apiv1.StoragePool, nodes map[string]map[string]s
 		}
 
 		grp.pools = append(grp.pools, pool)
-		grp.seen[pool.NodeName] = struct{}{}
+		grp.seen[naming.Key(pool.NodeName)] = struct{}{}
 		grp.free += pool.FreeCapacity
 	}
 
@@ -1751,7 +1853,9 @@ const restoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
 // constrainFilterToRestoreSource applies the restore-source BACKEND
 // pin for an RD that was materialised from a snapshot
 // (BlockstorRestoreFromSnapshot prop): candidate pools are pinned to
-// the source replica's ProviderKind. Returns the caller's filter
+// the source replica's ProviderKind, or once the source is gone, the
+// backend of the pool the snapshot records its copies in. Returns the
+// caller's filter
 // untouched when the RD carries no restore marker (the overwhelmingly
 // common case).
 //
@@ -1784,9 +1888,9 @@ const restoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
 // autoplacer's call, and the REST `--node-name` Bug 397 guard already
 // rejects an explicit diskful replica on a snapshot-less node up front.
 //
-// Every lookup is best-effort: when the marker is malformed, the
-// snapshot is gone, or the source has no diskful replica left, the
-// filter passes through unchanged and the regular placement gates
+// Every lookup is best-effort: when the marker is malformed, or neither
+// the source's live replicas nor the snapshot's recorded pools name a
+// backend, the filter passes through unchanged and the regular placement gates
 // apply (satellite-side Bug 397 blank-fallback seeding still protects
 // data integrity in those edge cases).
 func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) *apiv1.AutoSelectFilter {
@@ -1800,12 +1904,7 @@ func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName stri
 		return filter
 	}
 
-	srcRD, _, ok := strings.Cut(stamp, ":")
-	if !ok || srcRD == "" {
-		return filter
-	}
-
-	kind := SourceProviderKind(ctx, p.store, srcRD)
+	kind := RestoreSourceProviderKind(ctx, p.store, stamp)
 	if kind == "" {
 		return filter
 	}
@@ -1816,6 +1915,118 @@ func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName stri
 	out.ProviderList = []string{kind}
 
 	return &out
+}
+
+// RestoreSourceProviderKind is the ProviderKind a replica of a definition
+// restored from stamp (`<srcRD>:<snapName>`) has to be placed on: the
+// backend of the source's live replicas, or, once the source has none
+// left, the backend of the pool the snapshot records holding a copy in.
+// Without that fallback the backend pin disappeared exactly when the
+// source was deleted, and a clone could land on a pool of another backend
+// whose snapshot stream it cannot receive. "" when neither names one.
+func RestoreSourceProviderKind(ctx context.Context, st store.Store, stamp string) string {
+	srcRD, snapName, ok := strings.Cut(stamp, ":")
+	if !ok || srcRD == "" {
+		return ""
+	}
+
+	if kind := SourceProviderKind(ctx, st, srcRD); kind != "" {
+		return kind
+	}
+
+	if snapName == "" {
+		return ""
+	}
+
+	snap, err := st.Snapshots().Get(ctx, srcRD, snapName)
+	if err != nil {
+		return ""
+	}
+
+	for i := range snap.Snapshots {
+		kind := poolProviderKind(ctx, st, snap.Snapshots[i].NodeName, snap.Snapshots[i].StoragePool)
+		if kind != "" {
+			return kind
+		}
+	}
+
+	return ""
+}
+
+// RestoreCopyPools names, per node (keyed by naming.Key), the pool the
+// snapshot behind stamp records holding that node's copy in. A replica
+// placed on such a node is cloned from that copy, so it has to land in
+// that pool: on a node with two pools of one backend another pool holds
+// no snapshot to clone from. Nil when stamp names no snapshot or the
+// snapshot records no pool.
+func RestoreCopyPools(ctx context.Context, st store.Store, stamp string) map[string]string {
+	srcRD, snapName, ok := strings.Cut(stamp, ":")
+	if !ok || srcRD == "" || snapName == "" {
+		return nil
+	}
+
+	snap, err := st.Snapshots().Get(ctx, srcRD, snapName)
+	if err != nil {
+		return nil
+	}
+
+	var pools map[string]string
+
+	for i := range snap.Snapshots {
+		if pool := snap.Snapshots[i].StoragePool; pool != "" {
+			if pools == nil {
+				pools = map[string]string{}
+			}
+
+			pools[naming.Key(snap.Snapshots[i].NodeName)] = pool
+		}
+	}
+
+	return pools
+}
+
+// pinRestoreCopyPools drops, for a definition restored from a snapshot,
+// every candidate pool on a node whose copy the snapshot records in another
+// pool of that node. Nodes without a recorded copy are left to the backend
+// pin.
+func (p *Placer) pinRestoreCopyPools(ctx context.Context, rdName string, candidates []apiv1.StoragePool) []apiv1.StoragePool {
+	rd, err := p.store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return candidates
+	}
+
+	pinned := RestoreCopyPools(ctx, p.store, rd.Props[restoreFromSnapshotProp])
+	if len(pinned) == 0 {
+		return candidates
+	}
+
+	out := make([]apiv1.StoragePool, 0, len(candidates))
+
+	for i := range candidates {
+		pool, ok := pinned[naming.Key(candidates[i].NodeName)]
+		if ok && pool != candidates[i].StoragePoolName {
+			continue
+		}
+
+		out = append(out, candidates[i])
+	}
+
+	return out
+}
+
+// poolProviderKind is the backend of pool on node, or "" when it is not
+// known or is diskless.
+func poolProviderKind(ctx context.Context, st store.Store, node, pool string) string {
+	if pool == "" {
+		return ""
+	}
+
+	sp, err := st.StoragePools().Get(ctx, node, pool)
+	if err != nil || sp.ProviderKind == apiv1.StoragePoolKindDiskless {
+		return ""
+	}
+
+	return sp.ProviderKind
 }
 
 // SourceProviderKind returns the ProviderKind of the pool backing the

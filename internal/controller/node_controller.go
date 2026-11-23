@@ -31,6 +31,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -48,7 +49,7 @@ const evictionRequeue = 30 * time.Second
 // grep this annotation to find RDs that need manual intervention
 // (attach an RG, then re-trigger the node eviction) rather than
 // silently leaving replicas pinned to a draining node.
-const AnnotationMigrationBlocked = "blockstor.io/migration-blocked"
+const AnnotationMigrationBlocked = "blockstor.org/migration-blocked"
 
 // MigrationBlockedReasonNoRG is the value the NodeReconciler writes to
 // AnnotationMigrationBlocked when the parent RD has no
@@ -74,12 +75,12 @@ type NodeReconciler struct {
 	Store store.Store
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=nodes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=nodes/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch
 
 // Reconcile drives the eviction migration. On every Node change we
 // look for EVICTED; if set, every Resource on that node gets a
@@ -120,7 +121,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	for i := range resList {
-		if resList[i].NodeName != node.Name {
+		if !naming.Same(resList[i].NodeName, node.Name) {
 			continue
 		}
 
@@ -274,7 +275,7 @@ func (r *NodeReconciler) currentDiskfulTarget(ctx context.Context, rdName, evict
 	healthyNodes := 0
 
 	for i := range nodes {
-		if _, off := drained[nodes[i].Name]; off {
+		if _, off := drained[naming.Key(nodes[i].Name)]; off {
 			continue
 		}
 
@@ -293,8 +294,8 @@ func (r *NodeReconciler) currentDiskfulTarget(ctx context.Context, rdName, evict
 
 		// Other draining nodes don't count; the evacuated node does (it
 		// is the replica we are replacing).
-		if node != evictedNode {
-			if _, off := drained[node]; off {
+		if !naming.Same(node, evictedNode) {
+			if _, off := drained[naming.Key(node)]; off {
 				continue
 			}
 		}
@@ -322,7 +323,7 @@ func (r *NodeReconciler) currentDiskfulTarget(ctx context.Context, rdName, evict
 func (r *NodeReconciler) pruneSource(ctx context.Context, rdName, node string) error {
 	resCRD := &blockstoriov1alpha1.Resource{}
 
-	err := r.Get(ctx, client.ObjectKey{Name: resourceCRDName(rdName, node)}, resCRD)
+	err := getReplica(ctx, r.Client, rdName, node, resCRD)
 	if err != nil {
 		return client.IgnoreNotFound(err)
 	}
@@ -376,11 +377,11 @@ func (r *NodeReconciler) evacuationReplacementReady(ctx context.Context, filter 
 		// Skip the source on the evacuated node and any replica still
 		// pinned to a draining (EVICTED / LOST) peer — neither counts
 		// toward the post-drain redundancy we must reach first.
-		if node == evictedNode {
+		if naming.Same(node, evictedNode) {
 			continue
 		}
 
-		if _, off := drained[node]; off {
+		if _, off := drained[naming.Key(node)]; off {
 			continue
 		}
 
@@ -412,7 +413,7 @@ func (r *NodeReconciler) evacuationReplacementReady(ctx context.Context, filter 
 func (r *NodeReconciler) replicaUpToDate(ctx context.Context, rdName, node string) (bool, error) {
 	resCRD := &blockstoriov1alpha1.Resource{}
 
-	err := r.Get(ctx, client.ObjectKey{Name: resourceCRDName(rdName, node)}, resCRD)
+	err := getReplica(ctx, r.Client, rdName, node, resCRD)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
@@ -439,21 +440,15 @@ func (r *NodeReconciler) drainingNodes(ctx context.Context) (map[string]struct{}
 	for i := range nodes {
 		if slices.Contains(nodes[i].Flags, apiv1.NodeFlagEvicted) ||
 			slices.Contains(nodes[i].Flags, apiv1.NodeFlagLost) {
-			out[nodes[i].Name] = struct{}{}
+			out[naming.Key(nodes[i].Name)] = struct{}{}
 		}
 	}
 
 	return out, nil
 }
 
-// resourceCRDName mirrors the encoding used by the k8s store —
-// `<rd>.<node>` is the documented composite key.
-func resourceCRDName(rd, node string) string {
-	return rd + "." + node
-}
-
 // annotateMigrationBlocked stamps the parent RD with the
-// `blockstor.io/migration-blocked` annotation and the given reason so
+// `blockstor.org/migration-blocked` annotation and the given reason so
 // an operator (`kubectl get rd -o ...`) can surface every RD whose
 // eviction migration refused to run. Idempotent: re-stamping with the
 // same reason is a no-op write.

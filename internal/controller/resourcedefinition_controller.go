@@ -21,7 +21,6 @@ package controller
 import (
 	"context"
 	stderrors "errors"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,7 +41,9 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // Bug148ResizePendingAnnotationPrefix is the per-volume annotation
@@ -55,7 +57,7 @@ import (
 //
 // Per-volume key suffix so multi-volume RDs (rare today but on the
 // roadmap) keep concurrent grow-shrink decisions distinguishable.
-const Bug148ResizePendingAnnotationPrefix = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-"
+const Bug148ResizePendingAnnotationPrefix = "bug136.blockstor.org/resize-pending-size-kib-vol-"
 
 // ResourceDefinitionReconciler watches RD CRDs and maintains the
 // tiebreaker invariant: an RD with exactly 2 diskful replicas in a
@@ -86,12 +88,17 @@ type ResourceDefinitionReconciler struct {
 	// reconciler directly and skip this — the field is nil-safe
 	// and falls back to the cached client below.
 	APIReader client.Reader
+
+	// Recorder emits the warning Event for an RD that kept the default
+	// layer stack because it already held data. Nil in tests that do
+	// not assert on Events.
+	Recorder events.EventRecorder
 }
 
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile ensures the tiebreaker for a 2-replica RD. Idempotent:
 // re-running on an RD that already has its tiebreaker is a no-op.
@@ -101,6 +108,10 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if r.Store == nil {
 		return ctrl.Result{}, nil
 	}
+
+	var retry time.Duration
+
+	ctx = context.WithValue(ctx, rdRetryKey{}, &retry)
 
 	var rd blockstoriov1alpha1.ResourceDefinition
 
@@ -118,6 +129,13 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	if !rd.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
+	}
+
+	err = r.pinLayerStack(ctx, &rd)
+	if err != nil {
+		log.Error(err, "pin layer stack", "rd", rd.Name)
+
+		return ctrl.Result{}, err
 	}
 
 	err = r.ensureTiebreaker(ctx, &rd)
@@ -143,22 +161,66 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	// Belt-and-braces re-enqueue: the witness-decision read in
-	// ensureTiebreaker goes through the cached client, and an RD
-	// reconciled right when the second Resource arrives may see a
-	// stale 1-diskful view and skip witness creation. Watches on
-	// Resource events re-enqueue the RD as the cache fills, but if
-	// only one Resource event lands before the reconciler drains
-	// the queue we'd wait for the next periodic re-sync (minutes)
-	// before the witness appears. A short requeue closes that
-	// window without changing the steady-state behaviour: once the
-	// witness exists, the next ensureTiebreaker is a no-op.
-	return ctrl.Result{RequeueAfter: rdReconcileRequeue}, nil
+	// A settled RD waits for its next event: its own change, a
+	// replica's, a node's or its group's (SetupWithManager). It used
+	// to come back every 5 s, which on a cluster with a few hundred
+	// definitions kept the controller busy with uncached reads while
+	// nothing changed. Only a decision with a deadline, or one this
+	// pass deferred, comes back on its own.
+	if until, ok := nextTiebreakerDeadline(&rd, time.Now()); ok {
+		askRDRetry(ctx, until)
+	}
+
+	return ctrl.Result{RequeueAfter: retry}, nil
 }
 
-// rdReconcileRequeue is the cache-warmup safety net for the RD
-// reconciler. See the comment in Reconcile for why it exists.
+// rdReconcileRequeue is how soon an RD comes back when a pass deferred
+// its witness decision.
 const rdReconcileRequeue = 5 * time.Second
+
+// rdRetryKey carries, in the context of an RD pass, how soon the pass
+// wants the next one; zero means on the next event only.
+type rdRetryKey struct{}
+
+// askRDRetry asks for another pass of the RD in ctx after d. Of several
+// asks the earliest wins.
+func askRDRetry(ctx context.Context, d time.Duration) {
+	retry, ok := ctx.Value(rdRetryKey{}).(*time.Duration)
+	if !ok || d <= 0 {
+		return
+	}
+
+	if *retry == 0 || d < *retry {
+		*retry = d
+	}
+}
+
+// nextTiebreakerDeadline returns how long until the earliest of the
+// RD's witness deadlines (the suppression after a witness delete, the
+// keep-tiebreaker window) passes, when one is still ahead. The witness
+// decision changes when it passes, and no event marks the moment.
+func nextTiebreakerDeadline(rd *blockstoriov1alpha1.ResourceDefinition, now time.Time) (time.Duration, bool) {
+	var (
+		earliest time.Duration
+		found    bool
+	)
+
+	for _, key := range []string{apiv1.AutoTiebreakerSuppressedUntilAnnotation, apiv1.KeepTiebreakerUntilAnnotation} {
+		deadline, err := time.Parse(time.RFC3339, rd.Annotations[key])
+		if err != nil || !deadline.After(now) {
+			continue
+		}
+
+		// RFC3339 drops the fraction: come back just after the
+		// second the deadline names, not inside it.
+		left := deadline.Sub(now) + time.Second
+		if !found || left < earliest {
+			earliest, found = left, true
+		}
+	}
+
+	return earliest, found
+}
 
 // ensureTiebreaker keeps both invariants upstream LINSTOR maintains:
 //
@@ -267,6 +329,16 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	// also the forward-correct shape: when the INACTIVE replica returns
 	// (`r activate`) the cluster is immediately at the 2-diskful +
 	// 1-witness three-voter quorum with no recreate churn.
+	// A replica being deleted (DELETE flag, or DeletionTimestamp held
+	// open by the satellite's finalizer during a slow teardown) casts
+	// no vote either: upstream's isDrbdResource skips DELETE before it
+	// counts anything. Counting it here made a definition whose two
+	// diskful replicas were both being deleted look like "2 diskful, no
+	// witness" and grew a fresh TIE_BREAKER that linstor-csi then saw
+	// as live, so it left the definition behind. Dropped before the
+	// INACTIVE probe so a replica on its way out cannot hold a witness.
+	live = dropDeletingReplicas(live)
+
 	hasInactive := containsInactiveReplica(live)
 
 	live = filterActiveReplicas(live)
@@ -377,7 +449,9 @@ func shouldKeepExistingWitness(diskful, _, witnessUnnecessaryDiskfulCount int) b
 //     breaks the tie. Suppression also gates this branch — the REST
 //     per-resource-delete handler stamps a short-lived annotation
 //     right before dropping the witness so the next reconcile
-//     doesn't put it back milliseconds later.
+//     doesn't put it back milliseconds later. So does a placement
+//     still writing its diskful replicas (isPlacementInProgress): the
+//     replicas it wrote so far are not the shape to decide on.
 //
 //  2. Keep branch (Bug 104): preserve an already-stamped TIE_BREAKER
 //     only at the even-diskful tie it defends (diskful == 2). Below
@@ -401,7 +475,7 @@ func shouldTieBreakerExist(
 
 	nonWitnessDiskless := len(diskless) - len(witness)
 
-	wantNewWitness := !isTiebreakerSuppressed(rd) &&
+	wantNewWitness := !isTiebreakerSuppressed(rd) && !isPlacementInProgress(rd) &&
 		len(diskful) >= 2 && len(diskful)%2 == 0 && nonWitnessDiskless == 0
 
 	const witnessUnnecessaryDiskfulCount = 3
@@ -583,6 +657,19 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	return time.Now().Before(deadline)
 }
 
+// isPlacementInProgress reports whether a placement is still writing
+// the RD's diskful replicas (PlacementInProgressUntilAnnotation). The
+// replicas it has written so far are not the shape the witness decision
+// is for: a three-replica placement two replicas in looks like the
+// even-diskful tie a witness breaks, and the witness would land on the
+// node the third replica is for. The placement removing the annotation
+// wakes the RD, and the decision is made on the replicas it placed.
+func isPlacementInProgress(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	_, ok := apiv1.PlacementInProgressUntil(rd.Annotations, time.Now())
+
+	return ok
+}
+
 // isKeepTiebreakerActive reports whether an operator recently ran
 // `linstor r d --keep-tiebreaker <diskful> <rd>` against this RD.
 // The REST per-resource-delete handler stamps an RFC3339 deadline on
@@ -642,12 +729,28 @@ func isKeepTiebreakerActive(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // The cascade-side multi-pass list-then-delete (Bug 130 fix in
 // pkg/rest/resource_definitions.go) is the second half of the
 // invariant: it reaps any witness that slipped past this guard.
+//
+// A DELETE flag on the RD's spec counts the same way. Upstream's
+// definition delete marks the definition and never runs the
+// auto-tiebreaker helper on it again, so a definition carrying the
+// flag gets no new witness either. The guard stops all witness
+// management for it, removal and the quorum recount included, as
+// upstream does; a flag nothing ever clears therefore leaves the
+// definition's witness as it stands. linstor-migrate does not adopt a
+// definition flagged DELETE in the source cluster, so the flag reaches
+// a definition only through an explicit write.
 func (r *ResourceDefinitionReconciler) rdIsDeleting(_ context.Context, rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	if rd == nil {
 		return true
 	}
 
-	return !rd.DeletionTimestamp.IsZero()
+	return rdMarkedForDeletion(rd)
+}
+
+// rdMarkedForDeletion reports a DeletionTimestamp or a DELETE flag on
+// the definition.
+func rdMarkedForDeletion(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	return !rd.DeletionTimestamp.IsZero() || slices.Contains(rd.Spec.Flags, apiv1.ResourceFlagDelete)
 }
 
 // directOrCached returns the APIReader-direct reader when available
@@ -675,22 +778,21 @@ func (r *ResourceDefinitionReconciler) listReplicasDirect(ctx context.Context, r
 		return r.Store.Resources().ListByDefinition(ctx, rdName)
 	}
 
+	// Only the definition's replicas: this runs on every pass of every
+	// definition, and reading the whole cluster here kept the controller
+	// at its CPU limit (storek8s.ReplicasOf).
 	var crdList blockstoriov1alpha1.ResourceList
-	if err := r.APIReader.List(ctx, &crdList); err != nil {
+	if err := storek8s.ReplicasOf(ctx, r.APIReader, r.Client, rdName, &crdList); err != nil {
 		return nil, err
 	}
 
 	out := make([]apiv1.Resource, 0, len(crdList.Items))
 
 	for i := range crdList.Items {
-		if crdList.Items[i].Spec.ResourceDefinitionName != rdName {
-			continue
-		}
-
 		out = append(out, apiv1.Resource{
 			Name:     crdList.Items[i].Spec.ResourceDefinitionName,
 			NodeName: crdList.Items[i].Spec.NodeName,
-			Flags:    crdList.Items[i].Spec.Flags,
+			Flags:    flagsWithDeleting(&crdList.Items[i]),
 		})
 	}
 
@@ -833,7 +935,7 @@ func quorumPolicy(diskful, diskless int) string {
 func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, existing []apiv1.Resource) (bool, error) {
 	hostingReplica := map[string]bool{}
 	for i := range existing {
-		hostingReplica[existing[i].NodeName] = true
+		hostingReplica[naming.Key(existing[i].NodeName)] = true
 	}
 
 	// Bug 261: route through the RD-aware selector so a stale
@@ -861,8 +963,8 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 	// event, no finalizer). Re-validate the pick against the
 	// authoritative reader right before the write — the same shape
 	// as the REST layer's Bug 174 node-deleted-race guard. On a miss
-	// (or a freshly-stamped drain flag) skip this pass; the standing
-	// rdReconcileRequeue retries with a fresh candidate list.
+	// (or a freshly-stamped drain flag) skip this pass and ask for
+	// another after rdReconcileRequeue, with a fresh candidate list.
 	probe, err := r.probeNodeDirect(ctx, tiebreakerNode)
 	if err != nil {
 		return false, err
@@ -871,6 +973,8 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 	if !probe.found || probe.drained {
 		logf.FromContext(ctx).Info("witness candidate vanished or drained; deferring witness create",
 			"rd", rd.Name, "node", tiebreakerNode, "found", probe.found)
+
+		askRDRetry(ctx, rdReconcileRequeue)
 
 		return false, nil
 	}
@@ -927,8 +1031,8 @@ func (r *ResourceDefinitionReconciler) rollbackWitnessIfRDGone(ctx context.Conte
 
 	var fresh blockstoriov1alpha1.ResourceDefinition
 
-	err := r.APIReader.Get(ctx, client.ObjectKey{Name: rdName}, &fresh)
-	if err == nil && fresh.DeletionTimestamp.IsZero() {
+	err := r.APIReader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &fresh)
+	if err == nil && !rdMarkedForDeletion(&fresh) {
 		// RD is still live and not mid-delete; witness is valid.
 		return
 	}
@@ -941,10 +1045,10 @@ func (r *ResourceDefinitionReconciler) rollbackWitnessIfRDGone(ctx context.Conte
 }
 
 // resolveRDLayerStack returns the effective layer composition for
-// the RD by walking RD → RG → default. Mirrors the (unexported)
-// ResourceReconciler.resolveLayerStack but lives on the RD
-// reconciler so the witness gate (Bug 334) doesn't have to depend on
-// the resource-reconciler instance.
+// the RD by walking RD → RG → default, for the witness gate (Bug 334).
+// It runs before pinLayerStack has written the group's stack onto a
+// fresh RD, so it reads the group itself; it decides only whether a
+// witness is placed, never what goes to disk.
 //
 // Read order:
 //
@@ -978,7 +1082,7 @@ func (r *ResourceDefinitionReconciler) resolveRDLayerStack(ctx context.Context, 
 	reader := r.directOrCached()
 
 	var rg blockstoriov1alpha1.ResourceGroup
-	if err := reader.Get(ctx, client.ObjectKey{Name: rd.Spec.ResourceGroupName}, &rg); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Spec.ResourceGroupName)}, &rg); err != nil {
 		return apiv1.DefaultLayerStack()
 	}
 
@@ -1097,7 +1201,7 @@ func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blocks
 		}
 
 		// Refetch and retry.
-		err = r.Get(ctx, client.ObjectKey{Name: rd.Name}, rd)
+		err = r.Get(ctx, client.ObjectKey{Name: naming.Key(rd.Name)}, rd)
 		if err != nil {
 			return err
 		}
@@ -1191,6 +1295,34 @@ func (r *ResourceDefinitionReconciler) removeWitnesses(ctx context.Context, rdNa
 	return nil
 }
 
+// dropDeletingReplicas drops replicas flagged DELETE from the slice.
+// The Store path synthesises the flag from the CRD's DeletionTimestamp,
+// and listReplicasDirect does the same, so both readers agree.
+func dropDeletingReplicas(replicas []apiv1.Resource) []apiv1.Resource {
+	out := make([]apiv1.Resource, 0, len(replicas))
+
+	for i := range replicas {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagDelete) {
+			continue
+		}
+
+		out = append(out, replicas[i])
+	}
+
+	return out
+}
+
+// flagsWithDeleting returns the CRD's spec flags with DELETE appended
+// while the object carries a DeletionTimestamp, the same view the
+// Store's reader gives, without mutating the CRD's own slice.
+func flagsWithDeleting(crd *blockstoriov1alpha1.Resource) []string {
+	if crd.DeletionTimestamp.IsZero() || slices.Contains(crd.Spec.Flags, apiv1.ResourceFlagDelete) {
+		return crd.Spec.Flags
+	}
+
+	return append(slices.Clone(crd.Spec.Flags), apiv1.ResourceFlagDelete)
+}
+
 // filterActiveReplicas drops INACTIVE replicas from the slice. An
 // INACTIVE replica is one the operator deactivated with `drbdadm down`
 // (Bug 387): its DRBD device is not running, so it casts no vote in the
@@ -1265,26 +1397,8 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 	hostingReplica map[string]bool,
 ) (string, error) {
 	excluded := make(map[string]bool, len(hostingReplica))
-	maps.Copy(excluded, hostingReplica)
-
-	if rdName != "" {
-		// Defense-in-depth: re-probe the store for diskful Resources
-		// of this RD and exclude them. Caller's hostingReplica may be
-		// stale, but the store snapshot read inline here is the
-		// freshest signal the controller-side can get without a full
-		// reconcile fan-out.
-		live, err := r.Store.Resources().ListByDefinition(ctx, rdName)
-		if err != nil {
-			return "", err
-		}
-
-		for i := range live {
-			if slices.Contains(live[i].Flags, apiv1.ResourceFlagDiskless) {
-				continue
-			}
-
-			excluded[live[i].NodeName] = true
-		}
+	for name, hosting := range hostingReplica {
+		excluded[naming.Key(name)] = hosting
 	}
 
 	nodes, err := r.Store.Nodes().List(ctx)
@@ -1292,10 +1406,17 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 		return "", err
 	}
 
+	if rdName != "" {
+		err := r.excludeOccupiedNodes(ctx, rdName, excluded, offlineNodes(nodes))
+		if err != nil {
+			return "", err
+		}
+	}
+
 	candidates := make([]string, 0, len(nodes))
 
 	for i := range nodes {
-		if excluded[nodes[i].Name] {
+		if excluded[naming.Key(nodes[i].Name)] {
 			continue
 		}
 
@@ -1324,6 +1445,79 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 	slices.Sort(candidates)
 
 	return candidates[0], nil
+}
+
+// excludeOccupiedNodes marks the nodes a tiebreaker of rdName must not
+// go to, from a fresh store read: every node hosting a diskful replica
+// (Bug 261 defense-in-depth against a stale caller snapshot, the
+// freshest signal the controller has without a full reconcile fan-out)
+// and every node a replica's kernel still holds a connection to.
+//
+// The connections of a replica whose node is offline do not count: they
+// are the last report of a satellite that is not there to drop them, and
+// upstream's resource delete does not wait for an offline satellite
+// either (the update to it ends in a not-connected warning and the
+// delete goes on). Counting them would keep the witness off the node for
+// as long as the satellite stays away. When it comes back it learns the
+// node's new node-id and drops the old connection itself.
+func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context, rdName string, excluded, offline map[string]bool) error {
+	live, err := r.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return err
+	}
+
+	for i := range live {
+		if !offline[naming.Key(live[i].NodeName)] {
+			for _, peer := range kernelPeersOf(&live[i]) {
+				excluded[naming.Key(peer)] = true
+			}
+		}
+
+		if slices.Contains(live[i].Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		excluded[naming.Key(live[i].NodeName)] = true
+	}
+
+	return nil
+}
+
+// offlineNodes returns the nodes whose satellite the controller has
+// marked OFFLINE, by naming key.
+func offlineNodes(nodes []apiv1.Node) map[string]bool {
+	offline := make(map[string]bool)
+
+	for i := range nodes {
+		if nodes[i].ConnectionStatus == apiv1.NodeTypeOffline {
+			offline[naming.Key(nodes[i].Name)] = true
+		}
+	}
+
+	return offline
+}
+
+// kernelPeersOf returns the nodes a replica's kernel still holds a
+// connection to. A node in that list that hosts no replica is one whose
+// replica was just removed and that some survivor has not yet run
+// del-peer for. Upstream keeps such a replica in the definition,
+// flagged DELETE, until every satellite has dropped it, so its
+// autoplacer never offers the node to a new tiebreaker in that window.
+// Placing one there anyway hands the node a new node-id while the
+// survivor's kernel still knows it under the old one, and the
+// survivor's new-peer then fails with "name already exists" until the
+// old connection goes.
+func kernelPeersOf(replica *apiv1.Resource) []string {
+	if replica.LayerObject == nil || replica.LayerObject.Drbd == nil {
+		return nil
+	}
+
+	peers := make([]string, 0, len(replica.LayerObject.Drbd.Connections))
+	for peer := range replica.LayerObject.Drbd.Connections {
+		peers = append(peers, peer)
+	}
+
+	return peers
 }
 
 // isDisabledNode mirrors placer.disabledNodes for the RD-level
@@ -1407,9 +1601,11 @@ func (r *ResourceDefinitionReconciler) dropStrandedReplicas(
 	return live, nil
 }
 
-// nodeSets returns (disabled, known): the set of node names flagged
-// EVICTED / LOST and the set of ALL node names the store currently
-// lists. Bug 385: the RD-level witness / quorum decision must treat
+// nodeSets returns (disabled, known): the set of nodes flagged
+// EVICTED / LOST and the set of ALL nodes the store currently lists,
+// both keyed by CR name (k8s.Name). A replica names its node by the
+// CR name or by the spelling it was registered under, and the node
+// list by the registered one, so only the CR name compares them. Bug 385: the RD-level witness / quorum decision must treat
 // replicas on disabled nodes as draining placements, not live ones —
 // mirroring the placer's `disabledNodes` semantic. Bug-024 extends
 // the same idea to nodes that are gone entirely: a replica whose
@@ -1428,10 +1624,10 @@ func (r *ResourceDefinitionReconciler) nodeSets(ctx context.Context) (map[string
 	known := make(map[string]struct{}, len(nodes))
 
 	for i := range nodes {
-		known[nodes[i].Name] = struct{}{}
+		known[naming.Key(nodes[i].Name)] = struct{}{}
 
 		if isDisabledNode(&nodes[i]) {
-			disabled[nodes[i].Name] = struct{}{}
+			disabled[naming.Key(nodes[i].Name)] = struct{}{}
 		}
 	}
 
@@ -1454,7 +1650,7 @@ func (r *ResourceDefinitionReconciler) confirmGhostReplicas(
 	var live, ghosts []apiv1.Resource
 
 	for i := range replicas {
-		if _, ok := known[replicas[i].NodeName]; ok {
+		if _, ok := known[naming.Key(replicas[i].NodeName)]; ok {
 			live = append(live, replicas[i])
 
 			continue
@@ -1479,13 +1675,6 @@ func (r *ResourceDefinitionReconciler) confirmGhostReplicas(
 	return live, ghosts, nil
 }
 
-// linstorNameAnnotation mirrors pkg/store/k8s.AnnotationLinstorName.
-// The literal is duplicated (same pattern as snapshotGroupIDLabel in
-// snapshot_controller.go) to avoid a controller→store/k8s dependency.
-// Node CRDs whose LINSTOR name needed slugifying carry the original
-// wire name here; probeNodeDirect matches against both spellings.
-const linstorNameAnnotation = "blockstor.io/linstor-name"
-
 // nodeProbe is the answer probeNodeDirect returns about a node's
 // authoritative state.
 type nodeProbe struct {
@@ -1508,9 +1697,9 @@ type nodeProbe struct {
 // pinned node against the store right after the write.
 //
 // Production path: APIReader (direct apiserver reads, no cache).
-// LINSTOR node names are matched case-insensitively against both the
-// CRD name and the preserved original-name annotation, the same
-// resolution pkg/store/k8s applies. Unit tests construct the
+// A LINSTOR node name matches the CRD it maps to (k8s.Name), the same
+// resolution pkg/store/k8s applies, so My_Node and my_node stay two
+// nodes. Unit tests construct the
 // reconciler without APIReader — the Store fallback is authoritative
 // there (InMemory has no cache to lag).
 func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wireName string) (nodeProbe, error) {
@@ -1536,7 +1725,7 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 	}
 
 	for i := range list.Items {
-		if !nodeCRDMatchesWireName(&list.Items[i], wireName) {
+		if list.Items[i].Name != naming.Key(wireName) {
 			continue
 		}
 
@@ -1549,20 +1738,6 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 	return nodeProbe{}, nil
 }
 
-// nodeCRDMatchesWireName reports whether a Node CRD addresses the
-// given LINSTOR wire name: either directly via metadata.name or via
-// the preserved original-name annotation (slugified names). LINSTOR
-// identifiers are case-insensitive, so both comparisons fold case.
-func nodeCRDMatchesWireName(node *blockstoriov1alpha1.Node, wireName string) bool {
-	if strings.EqualFold(node.Name, wireName) {
-		return true
-	}
-
-	original, ok := node.Annotations[linstorNameAnnotation]
-
-	return ok && strings.EqualFold(original, wireName)
-}
-
 // splitByDisabledNode partitions replicas into (live, stranded) by the
 // disabled-node set. `live` is hosted on healthy (non-EVICTED/-LOST)
 // nodes and drives the witness / quorum decision; `stranded` sits on a
@@ -1571,7 +1746,7 @@ func splitByDisabledNode(replicas []apiv1.Resource, disabled map[string]struct{}
 	var live, stranded []apiv1.Resource
 
 	for i := range replicas {
-		if _, off := disabled[replicas[i].NodeName]; off {
+		if _, off := disabled[naming.Key(replicas[i].NodeName)]; off {
 			stranded = append(stranded, replicas[i])
 
 			continue
@@ -1655,12 +1830,16 @@ func (r *ResourceDefinitionReconciler) stampResizePending(ctx context.Context, r
 	}
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName != rd.Name {
+		if !isReplicaOf(&resList.Items[i], rd.Name) {
 			continue
 		}
 
 		err = r.stampResizePendingOnResource(ctx, rd, &resList.Items[i])
 		if err != nil && !apierrors.IsNotFound(err) {
+			// Usually a conflict with the satellite's write over the
+			// cached copy. The RD has no periodic pass to retry it in.
+			askRDRetry(ctx, rdReconcileRequeue)
+
 			logf.FromContext(ctx).Info("stampResizePending: update skipped",
 				"resource", resList.Items[i].Name, "err", err.Error())
 		}
@@ -1775,37 +1954,35 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		// the witness is only (re)placed on the next periodic re-sync —
 		// leaving two diskful UpToDate replicas with no quorum witness
 		// in between (split-brain risk on a subsequent failure). The
-		// nodeDrainFlagChanged predicate filters to the flag transition
-		// so unrelated Node Spec edits (props, net-interfaces) don't
-		// fan out to every RD.
+		// witnessCandidacyChanged predicate filters to what the witness
+		// pick reads, so unrelated Node Spec edits (net-interfaces,
+		// other props) don't fan out to every RD.
 		Watches(&blockstoriov1alpha1.Node{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsForNode),
-			builder.WithPredicates(nodeDrainFlagChanged())).
+			builder.WithPredicates(witnessCandidacyChanged())).
+		// A group that gains or drops a layer re-checks its RDs'
+		// unapplied-group annotation now, not at the next resync.
+		Watches(&blockstoriov1alpha1.ResourceGroup{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsInGroup),
+			builder.WithPredicates(groupLayerStackChanged())).
 		Named("resourcedefinition").
 		Complete(r)
 }
 
-// nodeDrainFlagChanged fires only when a Node's drain-signal flag set
-// (EVICTED / LOST) transitions. The REST `n rst` / `n evacuate` /
-// `n lost` handlers stamp these onto `Spec.Flags`; the satellite also
-// re-applies Node Spec on every reconcile with the flag set unchanged,
-// so a bare generation/Spec-equality watch would fan out to every RD
-// on every heartbeat. Restricting to the EVICTED/LOST membership delta
-// keeps the Bug 386 re-enqueue precise.
+// witnessCandidacyChanged fires when a Node changes whether it can take
+// a witness: it appears or goes, its drain-signal flag set (EVICTED /
+// LOST) transitions, its AutoplaceTarget opt-out or its type changes.
+// The REST `n rst` / `n evacuate` / `n lost` handlers stamp the flags
+// onto `Spec.Flags`; the satellite also re-applies Node Spec on every
+// reconcile with the flag set unchanged, so a bare generation/Spec-
+// equality watch would fan out to every RD on every heartbeat.
 //
-// Create fires when the node already carries a drain flag (controller
-// restart re-reads existing state) so the witness invariant runs at
-// least once against the recovered topology.
-func nodeDrainFlagChanged() predicate.Predicate {
+// The RD reconciler has no periodic pass any more, so a node that
+// joins has to start the one that gives a 2-diskful RD the witness a
+// third node allows.
+func witnessCandidacyChanged() predicate.Predicate {
 	return predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			n, ok := e.Object.(*blockstoriov1alpha1.Node)
-			if !ok {
-				return false
-			}
-
-			return nodeHasDrainFlag(n)
-		},
+		CreateFunc: func(event.CreateEvent) bool { return true },
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldNode, ok := e.ObjectOld.(*blockstoriov1alpha1.Node)
 			if !ok {
@@ -1817,15 +1994,16 @@ func nodeDrainFlagChanged() predicate.Predicate {
 				return false
 			}
 
-			return nodeHasDrainFlag(oldNode) != nodeHasDrainFlag(newNode)
+			return nodeHasDrainFlag(oldNode) != nodeHasDrainFlag(newNode) ||
+				oldNode.Spec.Type != newNode.Spec.Type ||
+				oldNode.Spec.Props[apiv1.PropAutoplaceTarget] != newNode.Spec.Props[apiv1.PropAutoplaceTarget]
 		},
 		// Bug-024: a node DELETE is the strongest drain signal there
 		// is — `n lost` removes the Node row outright. Re-running the
 		// witness invariant on it lets the ghost-repair leg
 		// (dropStrandedReplicas) reap a TIE_BREAKER stranded on the
-		// deleted node as soon as the event lands instead of waiting
-		// for the periodic requeue. Node deletion is rare, so the
-		// all-RD fan-out stays cheap.
+		// deleted node as soon as the event lands. Node deletion is
+		// rare, so the all-RD fan-out stays cheap.
 		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
 		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}
@@ -1870,13 +2048,14 @@ func nodeCRDAutoplaceExcluded(n *blockstoriov1alpha1.Node) bool {
 	return err == nil && !v
 }
 
-// enqueueRDsForNode maps a Node flag-change event to every
-// ResourceDefinition in the cluster. The tiebreaker invariant is a
-// cluster-wide candidate-set decision (any RD's witness might have
-// collapsed onto, or now want to re-land on, the toggled node), so a
-// per-node restore re-evaluates all RDs. The set of RDs is small
-// relative to Resources, and the nodeDrainFlagChanged predicate gates
-// the fan-out to genuine EVICTED/LOST transitions, so this stays cheap.
+// enqueueRDsForNode maps a Node event to every ResourceDefinition in
+// the cluster. The tiebreaker invariant is a cluster-wide candidate-set
+// decision (any RD's witness might have collapsed onto, or now want to
+// re-land on, the changed node), so a per-node change re-evaluates all
+// RDs. The set of RDs is small relative to Resources, and the
+// witnessCandidacyChanged predicate gates the fan-out to a node joining
+// or going and to the fields the witness pick reads, so this stays
+// cheap.
 func (r *ResourceDefinitionReconciler) enqueueRDsForNode(ctx context.Context, _ client.Object) []reconcile.Request {
 	var rdList blockstoriov1alpha1.ResourceDefinitionList
 
@@ -1904,6 +2083,8 @@ func (r *ResourceDefinitionReconciler) enqueueRDForResource(_ context.Context, o
 	}
 
 	return []reconcile.Request{
-		{NamespacedName: types.NamespacedName{Name: res.Spec.ResourceDefinitionName}},
+		// The RD CR lives under the folded name; the replica keeps the
+		// spelling it was written with.
+		{NamespacedName: types.NamespacedName{Name: naming.Key(res.Spec.ResourceDefinitionName)}},
 	}
 }

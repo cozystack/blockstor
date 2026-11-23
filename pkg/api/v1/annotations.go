@@ -31,7 +31,7 @@ package v1
 // controller reader (`isTiebreakerSuppressed`) share a single source
 // of truth without either package importing the other — pkg/api/v1
 // is the neutral, dependency-free shared layer both already import.
-const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.io/auto-tiebreaker-suppressed-until"
+const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.org/auto-tiebreaker-suppressed-until"
 
 // KeepTiebreakerUntilAnnotation is stamped on an RD when an operator
 // runs `linstor r d --keep-tiebreaker <diskful-node> <rd>`. Upstream
@@ -58,7 +58,32 @@ const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.io/auto-tiebreaker-su
 // the REST writer and controller reader share a single source of
 // truth without either package importing the other — pkg/api/v1 is
 // the neutral, dependency-free shared layer both already import.
-const KeepTiebreakerUntilAnnotation = "blockstor.io/keep-tiebreaker-until"
+const KeepTiebreakerUntilAnnotation = "blockstor.org/keep-tiebreaker-until"
+
+// PlacementInProgressUntilAnnotation is stamped on an RD by a placement
+// that writes more than one diskful replica, for as long as it writes
+// them. The placer creates the replicas one at a time, and the RD
+// reconciler, seeing the first two of a three-replica placement, would
+// put a TIE_BREAKER witness on the node the third one is for. The
+// placement takes that witness over, but the peers have set it up as a
+// diskless peer by then, and a peer that turns diskful under a
+// connection set up for a diskless one fails the handshake: the kernel
+// drops the connection and leaves it StandAlone. LINSTOR decides the
+// witness after the whole placement, in the same transaction, so it
+// never puts one there. While this annotation names a deadline in the
+// future the reconciler adds no witness; the placement removes it when
+// it is done, and the deadline only bounds a placement that never got
+// to remove it.
+//
+// The value lists one RFC3339 wall-clock deadline per placement in
+// progress, separated by spaces, fractional seconds allowed so that
+// each placement's stamp is its own: placements of one definition run
+// in more than one process (the REST server, the controller), and one
+// that finishes must not end the hold of another still writing. Read
+// and write it with PlacementInProgressUntil, AddPlacementHold and
+// RemovePlacementHold. Bad or unparseable entries count as no placement
+// in progress.
+const PlacementInProgressUntilAnnotation = "blockstor.org/placement-in-progress-until"
 
 // AutoDiskfulDeadlineAnnotation is stamped on an RD when the
 // AutoDiskfulReconciler first observes a diskful-replica deficit
@@ -78,7 +103,7 @@ const KeepTiebreakerUntilAnnotation = "blockstor.io/keep-tiebreaker-until"
 // 4349-4425). The prop hierarchy is Controller → RG → RD: lower scope
 // wins. AutoDiskfulPropKey + this annotation are defined here so the
 // REST writer and controller reader share a single source of truth.
-const AutoDiskfulDeadlineAnnotation = "blockstor.io/auto-diskful-deadline"
+const AutoDiskfulDeadlineAnnotation = "blockstor.org/auto-diskful-deadline"
 
 // AutoDiskfulPropKey is the upstream-LINSTOR property name for the
 // auto-diskful timer (minutes). Set on ControllerProps for cluster-
@@ -117,7 +142,7 @@ const AutoDiskfulAllowCleanupPropKey = "DrbdOptions/auto-diskful-allow-cleanup"
 // the K8s store, which surfaces it on the CRD's `metadata.annotations`
 // so the controller-runtime watch fires. The annotation is harmless to
 // the dispatcher / Python CLI (they ignore unknown keys).
-const PeerChangedAnnotation = "blockstor.io/peer-changed"
+const PeerChangedAnnotation = "blockstor.org/peer-changed"
 
 // RDSpawnShortfallAnnotation is stamped on a ResourceDefinition when
 // `rg spawn` placed strictly fewer replicas than the parent RG's
@@ -139,4 +164,15 @@ const PeerChangedAnnotation = "blockstor.io/peer-changed"
 // controller reader (RGRebalanceReconciler) share a single source of
 // truth without either package importing the other — pkg/api/v1 is
 // the neutral, dependency-free shared layer both already import.
-const RDSpawnShortfallAnnotation = "blockstor.io/spawn-shortfall"
+const RDSpawnShortfallAnnotation = "blockstor.org/spawn-shortfall"
+
+// UnappliedGroupLayerStackAnnotation is stamped on a ResourceDefinition
+// whose decided stack lacks a layer its resource group asks for now: one the
+// controller pinned to the default stack over data it found there, a clone
+// or restore of such bytes, a stack the operator set by hand, or a stack the
+// group outgrew after it was decided. The controller keeps it true to the
+// group's current stack on every reconcile and clears it once nothing is
+// missing. It records, comma-separated, the group's stack, so an operator
+// can find every volume that is short of what its group promises (for
+// example a plaintext volume in a LUKS group).
+const UnappliedGroupLayerStackAnnotation = "blockstor.org/unapplied-group-layer-stack"

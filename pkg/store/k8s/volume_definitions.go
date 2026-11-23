@@ -31,6 +31,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -60,12 +61,63 @@ func (s *volumeDefinitions) List(ctx context.Context, rdName string) ([]apiv1.Vo
 		return nil, err
 	}
 
+	return wireVDsOf(rd), nil
+}
+
+// ListUncached answers what List answers from the API server when the store
+// has a direct reader. A volume restore served by one replica of this server
+// and the resource restore after it served by another is linstor-csi's normal
+// sequence, and the second must not judge the first's volumes off a cache that
+// has not seen them.
+func (s *volumeDefinitions) ListUncached(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error) {
+	rd, err := s.fetchRDLive(ctx, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	return wireVDsOf(rd), nil
+}
+
+func wireVDsOf(rd *crdv1alpha1.ResourceDefinition) []apiv1.VolumeDefinition {
 	out := make([]apiv1.VolumeDefinition, 0, len(rd.Spec.VolumeDefinitions))
 	for i := range rd.Spec.VolumeDefinitions {
 		out = append(out, crdToWireVD(&rd.Spec.VolumeDefinitions[i]))
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].VolumeNumber < out[j].VolumeNumber })
+
+	return out
+}
+
+// ListAll reads every definition's inline volumes from one list of the
+// ResourceDefinition CRDs, so the request count does not grow with the number
+// of definitions.
+//
+// Keyed by naming.Key of the definition's LINSTOR name: the caller holds
+// whatever spelling its own objects carry, which for a replica is
+// Spec.ResourceDefinitionName and need not match the definition's own.
+func (s *volumeDefinitions) ListAll(ctx context.Context) (map[string][]apiv1.VolumeDefinition, error) {
+	var crdList crdv1alpha1.ResourceDefinitionList
+
+	err := s.c.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrap(err, "list ResourceDefinition CRDs")
+	}
+
+	out := make(map[string][]apiv1.VolumeDefinition, len(crdList.Items))
+
+	for i := range crdList.Items {
+		rd := &crdList.Items[i]
+
+		vds := make([]apiv1.VolumeDefinition, 0, len(rd.Spec.VolumeDefinitions))
+		for j := range rd.Spec.VolumeDefinitions {
+			vds = append(vds, crdToWireVD(&rd.Spec.VolumeDefinitions[j]))
+		}
+
+		sort.Slice(vds, func(a, b int) bool { return vds[a].VolumeNumber < vds[b].VolumeNumber })
+
+		out[naming.Key(OriginalName(&rd.ObjectMeta))] = vds
+	}
 
 	return out, nil
 }

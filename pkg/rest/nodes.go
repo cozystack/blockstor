@@ -474,7 +474,7 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 97: validate at the wire boundary, before pkg/store/k8s.Name()
+	// Bug 97: validate at the wire boundary, before pkg/naming.Key()
 	// slugifies + hash-prefixes the input. Same rationale as
 	// handleRDCreate; see pkg/rest/input_validation.go.
 	nameErr := validateLinstorName("node", n.Name)
@@ -945,11 +945,14 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0 {
+	// Any of the envelope's three halves makes this a props edit, a body
+	// carrying only delete_namespaces included.
+	if len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0 || len(patch.DeleteNamespace) > 0 {
 		err = s.Store.Nodes().PatchProps(r.Context(), name, func(props map[string]string) error {
 			// I1: route through the shared core so an empty
 			// override value deletes the key (set-property KEY "").
 			applyPropsModify(props, patch.OverrideProps, patch.DeleteProps)
+			deletePropNamespaces(props, patch.DeleteNamespace)
 
 			return nil
 		})
@@ -1125,13 +1128,18 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	spellings, ok := s.nodeDeleteSpellings(ctx, w, name, force)
+	if !ok {
+		return
+	}
+
 	(&deleteWithRollback[apiv1.Node]{
 		refuseIfReferenced: func() bool {
 			if force {
 				return false
 			}
 
-			return s.refuseNodeDeleteIfReferenced(w, r, name)
+			return s.refuseNodeDeleteIfReferenced(w, r, name, spellings)
 		},
 		capture: func() (apiv1.Node, bool) {
 			return s.captureNode(ctx, name)
@@ -1144,7 +1152,7 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 				return false
 			}
 
-			return s.rollbackNodeDeleteIfRaced(w, r, name, &captured)
+			return s.rollbackNodeDeleteIfRaced(w, r, name, spellings, &captured)
 		},
 		writeWarn: func() {
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
@@ -1161,6 +1169,27 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	}).run(w)
 }
 
+// nodeDeleteSpellings resolves, once and while the node row still exists, the
+// spellings both reference walks of a plain node delete ask in. The post-Delete
+// re-walk runs after the row is gone, and re-deriving them then loses the
+// registered spelling, which is the one a racing replica written under it is
+// found by. A forced delete walks nothing and needs none. False means an error
+// has been written.
+func (s *Server) nodeDeleteSpellings(ctx context.Context, w http.ResponseWriter, name string, force bool) ([]string, bool) {
+	if force {
+		return nil, true
+	}
+
+	spellings, err := store.NodeSpellings(ctx, s.Store, name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return nil, false
+	}
+
+	return spellings, true
+}
+
 // refuseNodeDeleteIfReferenced runs the pre-Delete Bug 92 / Bug 179
 // walk. Returns true when the HTTP error has already been written
 // (the caller must stop processing) and false when the delete may
@@ -1175,8 +1204,8 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 // autoplacer's free-space ranking then crashed on the nil-Node
 // lookup. Mirrors `n lost`'s cascadeOrphansForLostNode which
 // already walks both stores in lock-step.
-func (s *Server) refuseNodeDeleteIfReferenced(w http.ResponseWriter, r *http.Request, name string) bool {
-	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), name)
+func (s *Server) refuseNodeDeleteIfReferenced(w http.ResponseWriter, r *http.Request, name string, spellings []string) bool {
+	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), spellings)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -1241,15 +1270,16 @@ func (s *Server) refuseNodeDeleteIfEvicted(ctx context.Context, w http.ResponseW
 
 // referencesOnNode bundles the two reference walks the Bug 92 /
 // Bug 179 gates run in lock-step (Resources + StoragePools on the
-// target node). Returning both lists in one call keeps the
-// pre-walk and the post-Delete re-walk byte-identical — drift
-// between the two would let a racing dependent through the gate.
-func (s *Server) referencesOnNode(ctx context.Context, name string) ([]string, []string, error) {
+// target node). Returning both lists in one call, over spellings
+// handleNodeDelete resolved once before the Delete, keeps the
+// pre-walk and the post-Delete re-walk asking the same question —
+// drift between the two would let a racing dependent through the gate.
+func (s *Server) referencesOnNode(ctx context.Context, spellings []string) ([]string, []string, error) {
 	// One implementation with the CLI, which refuses on the same question.
 	// Keeping a second copy here is how the default-diskless-pool carve-out
 	// came to exist on one door only.
 	//nolint:wrapcheck // surfaced via writeStoreError
-	return store.ReferencesOnNode(ctx, s.Store, name)
+	return store.ReferencesUnderSpellings(ctx, s.Store, spellings)
 }
 
 // buildNodeDeleteRefusal assembles the 409 envelope for the Bug 92
@@ -1324,8 +1354,10 @@ func (s *Server) captureNode(ctx context.Context, name string) (apiv1.Node, bool
 // re-walk to ALSO catch a racing `sp c <node>` so an SP CRD
 // persisted during the TOCTOU window can't orphan into a deleted
 // Node either.
-func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Request, name string, captured *apiv1.Node) bool {
-	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), name)
+func (s *Server) rollbackNodeDeleteIfRaced(
+	w http.ResponseWriter, r *http.Request, name string, spellings []string, captured *apiv1.Node,
+) bool {
+	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), spellings)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -1365,7 +1397,11 @@ func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Reques
 // order on the K8s backend, and operators rerun `n d` to confirm
 // the refusal message after every replica drop).
 func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, error) {
-	resources, err := s.Store.Resources().List(ctx)
+	// The node-scoped read, not the whole cluster filtered here: the
+	// refusal decision already moved to it, and a message helper answering
+	// the same one-node question with a full List was the read this change
+	// exists to remove.
+	resources, err := store.ReplicasOnNode(ctx, s.Store, node)
 	if err != nil {
 		return nil, errors.Wrap(err, "list resources")
 	}
@@ -1373,9 +1409,7 @@ func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, er
 	var refs []string
 
 	for i := range resources {
-		if resources[i].NodeName == node {
-			refs = append(refs, resources[i].Name)
-		}
+		refs = append(refs, resources[i].Name)
 	}
 
 	sort.Strings(refs)
@@ -1389,7 +1423,7 @@ func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, er
 // Bug 162 (P0): every non-sentinel branch routes the message through
 // scrubImplDetails before emitting. Without scrubbing, an etcd-side
 // rejection ("etcdserver: request is too large") or an apimachinery
-// status error ("controllerconfigs.blockstor.cozystack.io ...")
+// status error ("controllerconfigs.blockstor.org ...")
 // reached the wire verbatim, leaking the persistence backend's
 // identity. Bug 146 already scrubbed the inbound JSON-decode path;
 // this is the matching outbound guard.
@@ -1472,67 +1506,71 @@ const (
 // IsAlreadyExists branches map to 409 with a generic message — the
 // raw apimachinery string is dropped to avoid the Bug 162 leak.
 func writeStoreErrorTyped(w http.ResponseWriter, err error, kind storeResourceKind) {
+	status, callRc := storeErrorRc(err, kind)
+	writeJSON(w, status, []apiv1.APICallRc{callRc})
+}
+
+// storeErrorRc is writeStoreErrorTyped's mapping without the envelope, for a
+// door whose wire shape is not the bare []ApiCallRc array: the clone POST
+// answers in CloneStarted, which python-linstor decodes whatever the status.
+func storeErrorRc(err error, kind storeResourceKind) (int, apiv1.APICallRc) {
 	switch {
+	case errors.Is(err, store.ErrRestoreSourceReaping), errors.Is(err, store.ErrRestoreSourceDeleting):
+		// A reap or a delete is judging the snapshot right now and may keep
+		// it: the restore retried once it is over can go through. Retryable,
+		// and no FAIL_EXISTS band: linstor-csi reads that as a volume already
+		// there.
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails(err.Error()),
+		}
 	case errors.Is(err, store.ErrAlreadyExists):
-		sub := existsSubCodeForKind(kind)
-		if sub == 0 {
-			writeError(w, http.StatusConflict, err.Error())
-
-			return
-		}
-
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | sub,
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError | existsSubCodeForKind(kind),
 			Message: scrubImplDetails(err.Error()),
-		}})
+		}
 	case errors.Is(err, store.ErrNotFound):
-		sub := notFoundSubCodeForKind(kind)
-		if sub == 0 {
-			writeError(w, http.StatusNotFound, err.Error())
-
-			return
-		}
-
-		writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | sub,
+		return http.StatusNotFound, apiv1.APICallRc{
+			RetCode: apiCallRcError | notFoundSubCodeForKind(kind),
 			Message: scrubImplDetails(err.Error()),
-		}})
+		}
+	case errors.Is(err, store.ErrLayerStackUndecided):
+		// Not the caller's to fix and not permanent: the controller pins the
+		// stack on its next pass over the definition, and linstor-csi retries
+		// a 503 with the same body.
+		return http.StatusServiceUnavailable, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails(err.Error()),
+			Cause: "the definition's volumes are laid down under its group's layer stack or the " +
+				"default one depending on whether it already holds data, and the controller " +
+				"has not decided that yet",
+			Correc: "retry shortly; the controller writes the layer stack onto the definition",
+		}
 	case apierrors.IsConflict(err):
 		// Optimistic-lock conflict. Generic message — the apimachinery
 		// error embeds the GroupResource string which leaks the CRD
 		// plural and API group. CSI retries on 409.
-		writeError(w, http.StatusConflict,
-			"conflict: store object was modified, retry the request")
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "conflict: store object was modified, retry the request",
+		}
 	case apierrors.IsAlreadyExists(err):
-		sub := existsSubCodeForKind(kind)
-		if sub == 0 {
-			writeError(w, http.StatusConflict,
-				"conflict: store object already exists")
-
-			return
-		}
-
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | sub,
+		return http.StatusConflict, apiv1.APICallRc{
+			RetCode: apiCallRcError | existsSubCodeForKind(kind),
 			Message: "conflict: store object already exists",
-		}})
-	case apierrors.IsNotFound(err):
-		sub := notFoundSubCodeForKind(kind)
-		if sub == 0 {
-			// Same shape as the local sentinel — keep the wire status
-			// uniform so CSI's 404-handling path fires the same way.
-			writeError(w, http.StatusNotFound, scrubbedNotFoundMessage)
-
-			return
 		}
-
-		writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | sub,
+	case apierrors.IsNotFound(err):
+		// Same shape as the local sentinel — keep the wire status
+		// uniform so CSI's 404-handling path fires the same way.
+		return http.StatusNotFound, apiv1.APICallRc{
+			RetCode: apiCallRcError | notFoundSubCodeForKind(kind),
 			Message: scrubbedNotFoundMessage,
-		}})
+		}
 	default:
-		writeError(w, http.StatusInternalServerError,
-			"store error: "+scrubImplDetails(err.Error()))
+		return http.StatusInternalServerError, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: scrubImplDetails("store error: " + scrubImplDetails(err.Error())),
+		}
 	}
 }
 
@@ -1590,7 +1628,7 @@ func notFoundSubCodeForKind(kind storeResourceKind) int64 {
 //
 // Bug 199 (P2): every message goes through `scrubImplDetails` before
 // hitting the wire. Bug 162 fixed `writeStoreError`'s default branch
-// to scrub etcd / apimachinery / k8s.io / `*.blockstor.cozystack.io` substrings
+// to scrub etcd / apimachinery / k8s.io / `*.blockstor.org` substrings
 // out of the response body, but 51 other call sites in pkg/rest/
 // reach `writeError` directly with the raw `err.Error()` from the
 // K8s-backed store (controller_props, snapshot_multi, autoplace,

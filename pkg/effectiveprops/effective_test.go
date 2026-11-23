@@ -205,6 +205,39 @@ func TestResolve_RGOverridesController_RDOverridesRG(t *testing.T) {
 	}
 }
 
+// TestResolve_RGFoundUnderAnotherCase: LINSTOR names are case-insensitive,
+// and an RD keeps its group's name as the operator spelled it while the
+// group's CR is stored under the folded one. The group's options still
+// apply.
+func TestResolve_RGFoundUnderAnotherCase(t *testing.T) {
+	rg := &blockstoriov1alpha1.ResourceGroup{
+		ObjectMeta: v1.ObjectMeta{Name: "rg-mixed"},
+		Spec: blockstoriov1alpha1.ResourceGroupSpec{
+			DRBDOptions: &blockstoriov1alpha1.DRBDOptions{
+				Net: &blockstoriov1alpha1.DRBDNetOptions{MaxBuffers: int32Ptr(2000)},
+			},
+		},
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: v1.ObjectMeta{Name: "rd1"},
+		Spec:       blockstoriov1alpha1.ResourceDefinitionSpec{ResourceGroupName: "RG-Mixed"},
+	}
+
+	res := &blockstoriov1alpha1.Resource{ObjectMeta: v1.ObjectMeta{Name: "rd1-node1"}}
+	cli := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(rg).Build()
+
+	got, err := effectiveprops.Resolve(context.Background(), client.Reader(cli), res, rd)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if got["DrbdOptions/Net/max-buffers"] != "2000" {
+		t.Fatalf("the group's option under a group named in another case: got max-buffers=%q, want 2000",
+			got["DrbdOptions/Net/max-buffers"])
+	}
+}
+
 // TestResolve_ControllerNonDRBDPropDropped pins that a controller-level
 // non-DRBD ExtraProp (something outside the DrbdOptions/ namespace) does
 // NOT leak onto the resource's effective props — only the resource's own

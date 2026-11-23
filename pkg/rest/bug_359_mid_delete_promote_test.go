@@ -80,6 +80,10 @@ func (v *midDeleteTBResources) ListByDefinition(ctx context.Context, rdName stri
 	return v.inner.ListByDefinition(ctx, rdName) //nolint:wrapcheck // test helper
 }
 
+func (v *midDeleteTBResources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
+	return v.inner.ListByNode(ctx, node) //nolint:wrapcheck // test helper
+}
+
 func (v *midDeleteTBResources) Get(ctx context.Context, rdName, node string) (apiv1.Resource, error) {
 	if [2]string{rdName, node} == v.raceKey && v.dyingPresent.Load() {
 		return apiv1.Resource{

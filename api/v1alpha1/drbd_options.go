@@ -172,21 +172,22 @@ type DRBDResourceOptions struct {
 // NOT IMPLEMENTED. It was intended to replace the
 // `Props["DrbdOptions/Encryption/passphrase"]` plaintext-in-spec
 // antipattern with a Secret reference, but no code path consumes it.
-// blockstor derives every LUKS key from the single cluster passphrase
-// configured via ControllerConfig. See docs/byok-design.md.
+// Every LUKS replica gets its own random password, wrapped under the
+// cluster master key that ControllerConfig unlocks. See
+// docs/encryption-keys.md.
 type EncryptionConfig struct {
 	// passphraseSecretRef names a Secret carrying a LUKS passphrase
 	// under the key `passphrase`.
 	//
-	// NOT IMPLEMENTED — setting this does NOT encrypt the volume with
-	// the referenced Secret. blockstor uses the cluster passphrase for
-	// every LUKS volume, so a resource definition that sets this field
-	// is encrypted with the CLUSTER key and the referenced Secret opens
-	// nothing.
+	// NOT IMPLEMENTED: setting this does NOT encrypt the volume with
+	// the referenced Secret. A resource definition that sets it gets
+	// per-replica passwords wrapped under the CLUSTER master key, like
+	// every other one, and the referenced Secret opens nothing.
 	//
-	// The field is kept, rather than removed, because it is the right
-	// shape for the per-volume key work in docs/byok-design.md and
-	// removing it would prune the reference out of stored objects.
+	// The field is kept, rather than removed, because it is reserved
+	// as the selector of a non-default key (docs/encryption-keys.md,
+	// stage 2) and removing it would prune the reference out of stored
+	// objects.
 	// While it does nothing, a LUKS-layered resource definition that
 	// sets it gets an `EncryptionKeyIgnored` Condition on each of its
 	// Resources saying so.

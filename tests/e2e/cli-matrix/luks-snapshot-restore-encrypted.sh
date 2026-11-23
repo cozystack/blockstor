@@ -69,10 +69,6 @@ fi
 
 echo ">> [Bug 333] set cluster passphrase"
 "${LCTL[@]}" encryption create-passphrase --passphrase "$PASSPHRASE" >/dev/null 2>&1 || true
-# LUKS-layered RDs additionally require the controller property
-# DrbdOptions/EncryptPassphrase, else rd-create is rejected with
-# "LUKS layer requires DrbdOptions/EncryptPassphrase to be set first".
-"${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase "$PASSPHRASE" >/dev/null 2>&1 || true
 
 echo ">> [Bug 333] create source encrypted RD"
 "${LCTL[@]}" resource-definition create "$RD_SRC" --layer-list drbd,luks,storage >/dev/null
@@ -168,7 +164,7 @@ for node in "$M1" "$M2"; do
         echo "FAIL (Bug 333): restored LV $node:$backing has no LUKS header" >&2
         exit 1
     fi
-    if ! assert_luks_passphrase_opens "$node" "$backing" "$PASSPHRASE"; then
+    if ! assert_luks_volume_keyed "$node" "$backing" "$PASSPHRASE"; then
         echo "FAIL (Bug 333): passphrase does not open restored $node:$backing" >&2
         exit 1
     fi

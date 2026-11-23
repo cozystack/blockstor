@@ -21,6 +21,8 @@ package satellite
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // defaultStuckSlotGrace is the in-memory debounce window the Bug 342
@@ -59,6 +62,27 @@ const (
 	pruneLogPass3 = 3
 )
 
+// PeerExpectation is what the Resource reconciler can vouch for about
+// an RD's peers at the moment the prune runs. It is a view of the
+// Resources observed so far, not of the RD's full replica set: nothing
+// in the API says how many replicas an RD will end up with, so a peer
+// whose Resource has not arrived yet (a bulk adoption delivers them in
+// name order) looks exactly like a peer that was deleted.
+type PeerExpectation struct {
+	// PeerNames are the node names of the observed peer Resources.
+	PeerNames []string
+
+	// AllocatedNodeIDs are the DRBD node-ids held by the local
+	// replica and by every observed peer that has one.
+	AllocatedNodeIDs []int32
+
+	// Allocated reports that the observed set passes the gate
+	// waitForControllerAllocation applies before a .res is rendered:
+	// the local replica's node-id, port and minor are on its Status,
+	// and every observed diskful replica carries a node-id.
+	Allocated bool
+}
+
 // PruneStaleKernelSlots is the Bug 342 v3 hook. It runs unconditionally
 // on every Resource reconcile, BEFORE the controller-side allocation
 // gate (waitForControllerAllocation) — kernel-state cleanup doesn't
@@ -74,7 +98,7 @@ const (
 // overengineered; this implementation aligns with upstream LINSTOR's
 // state+timing approach):
 //
-//	Pass 1 — kernel slot for a peer name not in `expectedPeerNames`
+//	Pass 1 — kernel slot for a peer name not in `expect.PeerNames`
 //	  → drbdadm del-peer + drbdmeta forget-peer (every volume that has
 //	  a device path). Equivalent to tearDownRemovedPeers but driven by
 //	  kernel state instead of the previously-rendered .res file —
@@ -93,6 +117,14 @@ const (
 //	  the entry so a flapping connection doesn't accumulate false
 //	  debounce credits.
 //
+// Neither pass touches a kernel slot blockstor has not rendered yet
+// (no `.owned` marker): that is adopted state, and until the
+// allocation-gated render takes it over, a peer missing from
+// `expect.PeerNames` is far more likely a Resource that has not
+// arrived than one that was deleted. Within an owned slot, Pass 1
+// removes an unexpected peer only when blockstor knows it is stale;
+// see unexpectedPeerIsStale.
+//
 // Returns nil on best-effort success:
 //   - Pass 1 del-peer errors bubble (a live kernel connection for a
 //     peer K8s no longer expects is a correctness issue that should
@@ -107,7 +139,7 @@ const (
 func (r *Reconciler) PruneStaleKernelSlots(
 	ctx context.Context,
 	rdName string,
-	expectedPeerNames []string,
+	expect PeerExpectation,
 	vols []int32,
 	devices map[int32]string,
 ) error {
@@ -139,12 +171,22 @@ func (r *Reconciler) PruneStaleKernelSlots(
 		return nil
 	}
 
-	expectedSet := make(map[string]struct{}, len(expectedPeerNames))
-	for _, n := range expectedPeerNames {
-		expectedSet[n] = struct{}{}
+	if !r.ownsKernelSlot(rdName) {
+		// Adopted (or foreign) kernel state: blockstor has never
+		// rendered this resource here, so it has no record of which
+		// peers belong to it. The first render, gated on allocation,
+		// stamps the marker and takes the slot over.
+		logger.V(1).Info("PruneStaleKernelSlots: kernel slot not rendered by blockstor yet, leaving its peers alone")
+
+		return nil
 	}
 
-	err = r.prunePass1Unexpected(ctx, rdName, slots, expectedSet, vols, devices, logger)
+	expectedSet := make(map[string]struct{}, len(expect.PeerNames))
+	for _, n := range expect.PeerNames {
+		expectedSet[naming.Key(n)] = struct{}{}
+	}
+
+	err = r.prunePass1Unexpected(ctx, rdName, slots, expectedSet, &expect, devices, logger)
 	if err != nil {
 		return err
 	}
@@ -156,7 +198,8 @@ func (r *Reconciler) PruneStaleKernelSlots(
 
 // prunePass1Unexpected fires `drbdadm del-peer` + `drbdmeta forget-peer`
 // for every kernel-resident slot whose peer name is not in the
-// K8s-supplied expected set. Bubbles del-peer errors because a live
+// K8s-supplied expected set and that unexpectedPeerIsStale vouches
+// for. Bubbles del-peer errors because a live
 // kernel connection for an unexpected peer is a correctness issue,
 // not a slow-leak forget-peer slot. forget-peer errors stay inside
 // teardownKernelSlot and don't bubble.
@@ -165,22 +208,104 @@ func (r *Reconciler) prunePass1Unexpected(
 	rdName string,
 	slots map[string]drbd.KernelSlot,
 	expectedSet map[string]struct{},
-	vols []int32,
+	expect *PeerExpectation,
 	devices map[int32]string,
 	logger logr.Logger,
 ) error {
+	rendered := r.renderedPeers(rdName)
+
 	for name, slot := range slots {
-		if _, expected := expectedSet[name]; expected {
+		if _, expected := expectedSet[naming.Key(name)]; expected {
 			continue
 		}
 
-		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, vols, devices, logger.WithValues("pass", pruneLogPass1, "peer", name))
+		if !unexpectedPeerIsStale(name, &slot, rendered, expect) {
+			logger.Info("PruneStaleKernelSlots: peer has no Resource but is not known to be stale, leaving it",
+				"peer", name,
+				"state", slot.ConnectionState,
+				"nodeID", slot.NodeID)
+
+			continue
+		}
+
+		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, devices, logger.WithValues("pass", pruneLogPass1, "peer", name))
 		if teardownErr != nil {
 			return errors.Wrapf(teardownErr, "PruneStaleKernelSlots pass 1 (unexpected peer %s)", name)
 		}
 	}
 
 	return nil
+}
+
+// unexpectedPeerIsStale decides whether a kernel peer with no observed
+// Resource may be torn down. Missing from the observed set is not
+// enough on its own: the Resource may simply not have arrived.
+//
+// The peer is stale when blockstor rendered it into this node's .res
+// and has since dropped it, which is the Bug 342 relocate: the peer's
+// Resource was deleted while a replacement waits for allocation.
+//
+// Without that record (the .res was wiped on a cold start, or never
+// named the peer), the observed set must pass the allocation gate,
+// the kernel must not hold the peer Connected, and its node-id must
+// belong to no observed replica. A departed peer has torn its side
+// down, so its slot is Connecting or StandAlone; a Connected peer is
+// a live replica whose Resource this node cannot see.
+func unexpectedPeerIsStale(
+	name string,
+	slot *drbd.KernelSlot,
+	rendered map[string]struct{},
+	expect *PeerExpectation,
+) bool {
+	if _, ok := rendered[naming.Key(name)]; ok {
+		return true
+	}
+
+	if !expect.Allocated {
+		return false
+	}
+
+	if slot.ConnectionState == string(drbd.ConnectionStateConnected) {
+		return false
+	}
+
+	return !slices.Contains(expect.AllocatedNodeIDs, slot.NodeID)
+}
+
+// ownsKernelSlot reports whether blockstor has rendered rdName on this
+// node, which the `.owned` marker records (Bug 432). It survives the
+// cold-start .res wipe, so a slot blockstor brought up keeps counting
+// as blockstor's after a satellite restart. No StateDir means no record.
+func (r *Reconciler) ownsKernelSlot(rdName string) bool {
+	if r.cfg.StateDir == "" {
+		return false
+	}
+
+	_, err := os.Stat(filepath.Join(r.cfg.StateDir, rdName+".owned"))
+
+	return err == nil
+}
+
+// renderedPeers returns the peers named in the .res blockstor last
+// rendered for rdName, keyed by naming.Key. Empty when the file is
+// missing or unreadable.
+func (r *Reconciler) renderedPeers(rdName string) map[string]struct{} {
+	out := map[string]struct{}{}
+
+	if r.cfg.StateDir == "" {
+		return out
+	}
+
+	body, err := os.ReadFile(filepath.Join(r.cfg.StateDir, rdName+".res"))
+	if err != nil {
+		return out
+	}
+
+	for _, peer := range extractResFilePeers(string(body)) {
+		out[naming.Key(peer)] = struct{}{}
+	}
+
+	return out
 }
 
 // prunePass3Stuck handles the Bug 342 zombie signature: a slot
@@ -203,8 +328,8 @@ func (r *Reconciler) prunePass3Stuck(
 	grace := stuckSlotGrace()
 
 	for name, slot := range slots {
-		if _, expected := expectedSet[name]; !expected {
-			// Already handled in Pass 1.
+		if _, expected := expectedSet[naming.Key(name)]; !expected {
+			// Pass 1 decides unexpected peers.
 			continue
 		}
 
@@ -227,7 +352,7 @@ func (r *Reconciler) prunePass3Stuck(
 			continue
 		}
 
-		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, vols, devices, logger.WithValues("pass", pruneLogPass3, "peer", name))
+		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, devices, logger.WithValues("pass", pruneLogPass3, "peer", name))
 		if teardownErr != nil {
 			logger.Info("Pass 3: teardown of stuck slot failed; will retry next reconcile",
 				"peer", name,
@@ -243,11 +368,9 @@ func (r *Reconciler) prunePass3Stuck(
 	}
 }
 
-// teardownKernelSlot is the per-slot del-peer + per-volume forget-peer
-// fan-out shared between Pass 1 and Pass 3. del-peer is mandatory;
-// forget-peer is per-volume best-effort because v09 metadata lives
-// in the per-volume block and a missing device path (DISKLESS local
-// replica) means there's no metadata to clean up for that volume.
+// teardownKernelSlot is the per-slot del-peer + forget-peer shared
+// between Pass 1 and Pass 3. del-peer is mandatory; forget-peer, through
+// the kernel and once for the resource, is best-effort.
 //
 // Mirrors tearDownRemovedPeers' del-peer-then-forget-peer ordering
 // without reusing it directly — that function is .res-file-driven and
@@ -256,7 +379,6 @@ func (r *Reconciler) teardownKernelSlot(
 	ctx context.Context,
 	rdName string,
 	slot *drbd.KernelSlot,
-	vols []int32,
 	devices map[int32]string,
 	logger logr.Logger,
 ) error {
@@ -269,26 +391,19 @@ func (r *Reconciler) teardownKernelSlot(
 		return errors.Wrapf(err, "drbdadm del-peer %s:%s", slot.Name, rdName)
 	}
 
-	// forget-peer is per-volume. Skip volumes without a resolved
-	// device path — that's the diskless-local case where no metadata
-	// exists to clean. Errors are non-fatal: a leaked metadata slot
-	// is a slow correctness drag (eats one of MaxPeers-1 budget
-	// entries) that the next reconcile will retry, while del-peer
-	// success above already closed the immediate kernel-connection
-	// leak.
-	for _, vol := range vols {
-		device, ok := devices[vol]
-		if !ok || device == "" {
-			continue
-		}
+	// forget-peer clears the peer's slot on every volume at once,
+	// through the kernel. A local replica with no device at all is
+	// DISKLESS and has no metadata to clean. Errors are non-fatal: a
+	// leaked slot eats one of the MaxPeers-1 budget entries and the next
+	// reconcile retries, while del-peer above already closed the kernel
+	// connection.
+	if !anyDevice(devices) {
+		return nil
+	}
 
-		forgetErr := r.cfg.Adm.ForgetPeer(ctx, rdName, vol, device, slot.NodeID)
-		if forgetErr != nil {
-			logger.Info("PruneStaleKernelSlots: forget-peer failed (non-fatal)",
-				"volume", vol,
-				"device", device,
-				"err", forgetErr.Error())
-		}
+	forgetErr := r.cfg.Adm.ForgetPeer(ctx, rdName, slot.NodeID)
+	if forgetErr != nil {
+		logger.Info("PruneStaleKernelSlots: forget-peer failed (non-fatal)", "err", forgetErr.Error())
 	}
 
 	return nil

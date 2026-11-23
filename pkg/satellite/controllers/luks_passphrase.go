@@ -31,69 +31,21 @@ import (
 	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
-// injectLUKSMasterPassphrase folds the cluster master passphrase
-// from the encryption Secret into the resolved effective-props bag
-// when a LUKS-layered RD would otherwise dispatch without one.
-//
-// Bug 023: the upstream-standard flow — `linstor encryption
-// create-passphrase` then `rd create --layer-list drbd,luks,storage`
-// — stores the passphrase in a Secret (pkg/rest/encryption.go), but
-// the dispatch chain only lifted it from the controller-scope props
-// (`DrbdOptions/EncryptPassphrase`, surfaced via ControllerConfig.
-// ExtraProps → effectiveprops.Resolve → dispatcher.BuildDesired →
-// the `LuksPassphrase` wire prop the satellite's LUKS layer reads).
-// A Secret-only cluster therefore passed the REST-side RD-create
-// gate but every replica apply looped on `LUKS in layer stack but
-// Props.LuksPassphrase empty`.
-//
-// The injection deliberately reuses the EXACT downstream channel the
-// legacy prop travels: the value lands under the canonical
-// `DrbdOptions/EncryptPassphrase` key in effectiveProps, so
-// BuildDesired's pickLUKSPassphrase lifts it onto `LuksPassphrase`
-// and strips it from the rendered .res options exactly as before.
-// Precedence is unchanged — an operator-set controller prop (either
-// spelling) wins over the Secret, so existing LUKS volumes keep
-// unlocking with the key they were formatted with.
-//
-// Failure posture: a Secret read error is logged and swallowed —
-// the apply chain then surfaces the established, actionable
-// `Props.LuksPassphrase empty` condition on the Resource instead of
-// wedging the whole reconcile on a transient apiserver blip.
-//
-// No-ops when:
-//   - the RD has no LUKS layer (the overwhelmingly common path —
-//     zero Secret round-trips);
-//   - either passphrase prop key is already present (legacy path);
-//   - Config.Namespace is empty (unit-test rigs without a
-//     controller namespace).
-func (r *ResourceReconciler) injectLUKSMasterPassphrase(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) {
-	if rd == nil || effectiveProps == nil || !layerStackHasLUKS(rd.Spec.LayerStack) {
+// dropPlaintextPassphraseProps removes every property that would carry a
+// LUKS passphrase from the resolved effective-props bag, and names the
+// ones that held a value in a log line, never the values. Each LUKS volume
+// has its own password, stored wrapped on its replica (luks_keys.go); a
+// passphrase in a property is never a key to anything, and a property is
+// plaintext on its CR.
+func dropPlaintextPassphraseProps(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) {
+	ignored := passphrase.DropPlaintextProps(effectiveProps)
+
+	if rd == nil || len(ignored) == 0 || !layerStackHasLUKS(rd.Spec.LayerStack) {
 		return
 	}
 
-	if effectiveProps[passphrase.PropKeyCanonical] != "" ||
-		effectiveProps[passphrase.PropKeyLegacy] != "" {
-		return
-	}
-
-	if r.Config.Namespace == "" {
-		return
-	}
-
-	pass, err := passphrase.Read(ctx, r.secretReader(), r.Config.Namespace)
-	if err != nil {
-		log.FromContext(ctx).Error(err,
-			"read cluster master passphrase Secret; LUKS apply will surface the missing key",
-			"namespace", r.Config.Namespace)
-
-		return
-	}
-
-	if pass == "" {
-		return
-	}
-
-	effectiveProps[passphrase.PropKeyCanonical] = pass
+	log.FromContext(ctx).Info("ignoring LUKS passphrase properties; every volume has its own password",
+		"resourceDefinition", rd.Name, "properties", ignored)
 }
 
 // perRDKeyFieldPath names the field in operator-facing messages.
@@ -106,8 +58,9 @@ const perRDKeyFieldPath = "spec.encryption.passphraseSecretRef"
 // implemented: nothing reads it. The only non-test code that touches
 // Spec.Encryption is pkg/store/k8s/resource_definitions.go, which
 // PRESERVES it across updates (Bug 209) so it survives a reconciler
-// write — a field defended against loss and never consumed. An RD that
-// sets it is silently encrypted with the CLUSTER passphrase.
+// write: a field defended against loss and never consumed. An RD that
+// sets it gets the same per-replica passwords, wrapped under the
+// cluster master key, as every other RD (docs/encryption-keys.md).
 //
 // Scoped to LUKS-layered RDs by the caller: on a stack without LUKS the
 // field is inert decoration and there is no wrong key to warn about.
@@ -128,8 +81,8 @@ func perRDKeySecretName(rd *blockstoriov1alpha1.ResourceDefinition) string {
 //
 // Deliberately NOT a refusal. An earlier revision failed the apply
 // here; review caught that it wedges RDs which reconcile correctly
-// today — the field has always been inert, so an existing cluster may
-// carry RDs that set it and run fine on the cluster key — and that the
+// today (the field has always been inert, so an existing cluster may
+// carry RDs that set it and run fine on the cluster key) and that the
 // wedge left nothing on the object saying why, because
 // buildDesiredFromCRD's error goes to controller-runtime's backoff and
 // never reaches Status. Moving a working volume to a failing one is
@@ -153,15 +106,15 @@ func (r *ResourceReconciler) noteIgnoredPerRDKey(ctx context.Context, target *bl
 	secret := perRDKeySecretName(rd)
 	want := metav1.ConditionFalse
 	reason := "NoPerResourceKey"
-	msg := "no per-resource key pinned; using the cluster passphrase"
+	msg := "no per-resource key pinned; using the cluster master key"
 
 	if secret != "" {
 		want = metav1.ConditionTrue
 		reason = "PerResourceKeyUnimplemented"
 		msg = perRDKeyFieldPath + " names Secret " + secret +
-			", but blockstor derives every LUKS key from the single cluster passphrase " +
-			"and does not read this field. This volume is encrypted with the CLUSTER " +
-			"passphrase, not the referenced Secret. See docs/byok-design.md"
+			", but blockstor does not read this field: this volume's password is " +
+			"wrapped under the CLUSTER master key, not a key from the referenced " +
+			"Secret. See docs/encryption-keys.md"
 	}
 
 	if conditionAlreadyIs(target.Status.Conditions, blockstoriov1alpha1.ConditionEncryptionKeyIgnored, want) {
@@ -212,19 +165,6 @@ func conditionAlreadyIs(conditions []metav1.Condition, typ string, status metav1
 	existing := meta.FindStatusCondition(conditions, typ)
 
 	return existing != nil && existing.Status == status
-}
-
-// secretReader picks the uncached APIReader when wired. The cached
-// client would spin up a cluster-wide Secret informer on first Get —
-// the exact Bug 110 stall class when RBAC scopes the satellite to
-// named Secrets only. The direct reader does one GET against the
-// apiserver instead.
-func (r *ResourceReconciler) secretReader() client.Reader {
-	if r.Config.APIReader != nil {
-		return r.Config.APIReader
-	}
-
-	return r.Client
 }
 
 // layerStackHasLUKS reports whether the RD's layer stack names LUKS

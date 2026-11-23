@@ -136,7 +136,7 @@ dl_deadline=$(( $(date +%s) + 120 ))
 dl_state=""
 dl_flags=""
 while (( $(date +%s) < dl_deadline )); do
-    dl_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${DLNODE}" \
+    dl_flags=$(kubectl get "resources.blockstor.org/${RD}.${DLNODE}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     dl_state="$(status_disk_state "$RD" "$DLNODE" 0)"
     # Converged once the DISKLESS flag is stamped and the state is not a

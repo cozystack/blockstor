@@ -19,7 +19,11 @@ limitations under the License.
 package satellite
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,25 +69,70 @@ func newKernelCleanupReconciler(t *testing.T) (*Reconciler, *storage.FakeExec) {
 		Stdout: []byte(kernelCleanupFixture),
 	})
 
+	stateDir := t.TempDir()
+
+	// blockstor brought pvc-1 up here with both peers rendered, so the
+	// slot is owned and worker-2 is on record: the Bug 342 relocate,
+	// where worker-2's Resource has since been deleted.
+	writeOwnedSlot(t, stateDir, "pvc-1", map[string]int32{"worker-1": 1, "worker-2": 2})
+
 	r := NewReconciler(ReconcilerConfig{
 		NodeName: "worker-0",
 		Adm:      drbd.NewAdm(fx),
+		StateDir: stateDir,
 	})
 
 	return r, fx
 }
 
+// expectPeers is a PeerExpectation that knows only the observed peer
+// names: allocation incomplete, no node-ids. The record in the .res is
+// the only thing that can make a peer stale under it.
+func expectPeers(names ...string) PeerExpectation {
+	return PeerExpectation{PeerNames: names}
+}
+
+// writeOwnedSlot stamps the `.owned` marker for rd and, when peers is
+// non-nil, a .res naming them the way renderResFile writes `on` blocks.
+func writeOwnedSlot(t *testing.T, dir, rd string, peers map[string]int32) {
+	t.Helper()
+
+	err := os.WriteFile(filepath.Join(dir, rd+".owned"), nil, 0o600)
+	if err != nil {
+		t.Fatalf("stamp .owned: %v", err)
+	}
+
+	if peers == nil {
+		return
+	}
+
+	var b strings.Builder
+
+	b.WriteString("resource " + rd + " {\n  on worker-0 {\n    node-id 0;\n  }\n")
+
+	for name, id := range peers {
+		b.WriteString("  on " + name + " {\n    node-id " + strconv.Itoa(int(id)) + ";\n  }\n")
+	}
+
+	b.WriteString("}\n")
+
+	err = os.WriteFile(filepath.Join(dir, rd+".res"), []byte(b.String()), 0o600)
+	if err != nil {
+		t.Fatalf("write .res: %v", err)
+	}
+}
+
 // TestPruneStaleKernelSlots_Pass1RemovesUnexpectedPeer: when a kernel
 // slot exists for a peer name K8s no longer expects, Pass 1 must
 // issue `drbdadm del-peer` (correctness — live connection) plus
-// `drbdmeta forget-peer` per volume (slow-leak — metadata slot).
+// `drbdsetup forget-peer` once for the resource (slow leak: metadata slot).
 // The healthy expected peer must NOT be touched.
 func TestPruneStaleKernelSlots_Pass1RemovesUnexpectedPeer(t *testing.T) {
 	r, fx := newKernelCleanupReconciler(t)
 
 	// Expect ONLY worker-1; worker-2 should be torn down.
 	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1",
-		[]string{"worker-1"},
+		expectPeers("worker-1"),
 		[]int32{0},
 		map[int32]string{0: "/dev/zvol/pool/pvc-1"})
 	if err != nil {
@@ -94,7 +143,7 @@ func TestPruneStaleKernelSlots_Pass1RemovesUnexpectedPeer(t *testing.T) {
 
 	// del-peer + forget-peer for worker-2, nothing for worker-1.
 	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
-	mustContain(t, cmds, "drbdmeta --force pvc-1/0 v09 /dev/zvol/pool/pvc-1 internal forget-peer 2")
+	mustContain(t, cmds, "drbdsetup forget-peer pvc-1 2")
 	mustNotContain(t, cmds, "drbdadm del-peer worker-1:pvc-1")
 }
 
@@ -108,7 +157,7 @@ func TestPruneStaleKernelSlots_Pass3DebouncesStuckSlot(t *testing.T) {
 	// Both peers expected — Pass 1 won't fire. Pass 3 sees worker-2
 	// (Connecting, no peer-device) match the zombie signature.
 	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1",
-		[]string{"worker-1", "worker-2"},
+		expectPeers("worker-1", "worker-2"),
 		[]int32{0},
 		map[int32]string{0: "/dev/zvol/pool/pvc-1"})
 	if err != nil {
@@ -140,7 +189,7 @@ func TestPruneStaleKernelSlots_Pass3DebouncesStuckSlot(t *testing.T) {
 	})
 
 	err = r.PruneStaleKernelSlots(t.Context(), "pvc-1",
-		[]string{"worker-1", "worker-2"},
+		expectPeers("worker-1", "worker-2"),
 		[]int32{0},
 		map[int32]string{0: "/dev/zvol/pool/pvc-1"})
 	if err != nil {
@@ -149,7 +198,7 @@ func TestPruneStaleKernelSlots_Pass3DebouncesStuckSlot(t *testing.T) {
 
 	cmds = fx.CommandLines()
 	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
-	mustContain(t, cmds, "drbdmeta --force pvc-1/0 v09 /dev/zvol/pool/pvc-1 internal forget-peer 2")
+	mustContain(t, cmds, "drbdsetup forget-peer pvc-1 2")
 
 	// After successful teardown, the debounce entry must be cleared
 	// so a re-incarnated peer of the same name starts a fresh timer.
@@ -172,7 +221,7 @@ func TestPruneStaleKernelSlots_Pass3HealthyClearsDebounce(t *testing.T) {
 
 	// First call: worker-2 is stuck, debounce entry created.
 	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1",
-		[]string{"worker-1", "worker-2"},
+		expectPeers("worker-1", "worker-2"),
 		[]int32{0},
 		map[int32]string{0: "/dev/zvol/pool/pvc-1"})
 	if err != nil {
@@ -215,7 +264,7 @@ func TestPruneStaleKernelSlots_Pass3HealthyClearsDebounce(t *testing.T) {
 	})
 
 	err = r.PruneStaleKernelSlots(t.Context(), "pvc-1",
-		[]string{"worker-1", "worker-2"},
+		expectPeers("worker-1", "worker-2"),
 		[]int32{0},
 		map[int32]string{0: "/dev/zvol/pool/pvc-1"})
 	if err != nil {
@@ -255,7 +304,7 @@ func TestPruneStaleKernelSlots_NoKernelSlotsIsNoop(t *testing.T) {
 	r.seenStuckAt["pvc-1/worker-2"] = time.Now()
 
 	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1",
-		[]string{"worker-1"}, []int32{0}, nil)
+		expectPeers("worker-1"), []int32{0}, nil)
 	if err != nil {
 		t.Fatalf("PruneStaleKernelSlots: %v", err)
 	}
@@ -278,7 +327,7 @@ func TestPruneStaleKernelSlots_NilAdmIsNoop(t *testing.T) {
 	r := NewReconciler(ReconcilerConfig{NodeName: "worker-0"})
 
 	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1",
-		[]string{"worker-1"}, []int32{0}, nil)
+		expectPeers("worker-1"), []int32{0}, nil)
 	if err != nil {
 		t.Fatalf("PruneStaleKernelSlots with nil Adm: %v", err)
 	}
@@ -294,7 +343,7 @@ func TestPruneStaleKernelSlots_Pass1ForgetPeerSkippedWithoutDevice(t *testing.T)
 	r, fx := newKernelCleanupReconciler(t)
 
 	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1",
-		[]string{"worker-1"},
+		expectPeers("worker-1"),
 		[]int32{0},
 		nil) // no devices map
 	if err != nil {

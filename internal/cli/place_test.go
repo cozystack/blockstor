@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli"
@@ -182,6 +183,43 @@ func TestResourceGroupSpawn(t *testing.T) {
 
 	if got := replicaCount(t, app, "pvc-x"); got != 2 {
 		t.Errorf("spawn placed %d replicas, want the group's place count of 2", got)
+	}
+}
+
+// A passphrase property a group kept from before the Secret was the only
+// source stays off what `rg spawn` creates, as it does on the REST spawn.
+func TestResourceGroupSpawnDoesNotCopyAPassphraseProp(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedCluster(2)(ctx, backend)
+		_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+			Name:         "grp",
+			SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2, StoragePool: "data"},
+			Props: map[string]string{
+				passphrase.PropKeyLegacy:   "left-over-plaintext",
+				"DrbdOptions/Net/protocol": "C",
+			},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"rg", "spawn-resources", "grp", "pvc-x", "32M"}); got != 0 {
+		t.Fatalf("spawn exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	def, err := appStore(t, app).ResourceDefinitions().Get(t.Context(), "pvc-x")
+	if err != nil {
+		t.Fatalf("get definition: %v", err)
+	}
+
+	for key := range def.Props {
+		if passphrase.IsPlaintextPropKey(key) {
+			t.Errorf("spawned definition carries %s from its group", key)
+		}
+	}
+
+	if def.Props["DrbdOptions/Net/protocol"] != "C" {
+		t.Errorf("spawned definition lost an ordinary group prop: %v", def.Props)
 	}
 }
 

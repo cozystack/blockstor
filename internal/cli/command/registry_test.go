@@ -327,21 +327,22 @@ func TestPropertyVerbsComeAsASet(t *testing.T) {
 //
 //nolint:gochecknoglobals // fixture for the drift guard below
 var noArgumentVerbs = map[string]bool{
-	"node list":                  true,
-	"node info":                  true,
-	"storage-pool list":          true,
-	"physical-storage list":      true,
-	"resource-definition list":   true,
-	"volume-definition list":     true,
-	"resource list":              true,
-	"resource list-volumes":      true,
-	"volume list":                true,
-	"snapshot list":              true,
-	"snapshot rollback":          true,
-	"resource-group list":        true,
-	"volume-group list":          true,
-	"controller version":         true,
-	"controller list-properties": true,
+	"encryption list-passphrases": true,
+	"node list":                   true,
+	"node info":                   true,
+	"storage-pool list":           true,
+	"physical-storage list":       true,
+	"resource-definition list":    true,
+	"volume-definition list":      true,
+	"resource list":               true,
+	"resource list-volumes":       true,
+	"volume list":                 true,
+	"snapshot list":               true,
+	"snapshot rollback":           true,
+	"resource-group list":         true,
+	"volume-group list":           true,
+	"controller version":          true,
+	"controller list-properties":  true,
 }
 
 // TestEveryVerbDocumentsItsArguments: per-command help is only useful if

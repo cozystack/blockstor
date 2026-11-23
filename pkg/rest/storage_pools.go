@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
@@ -119,15 +120,7 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 		// behaviour — the namespace separator is '/' and the prefix
 		// is matched literally (no glob). An entry "Aux" drops every
 		// "Aux/..." key.
-		for _, ns := range patch.DeleteNamespace {
-			prefix := ns + "/"
-
-			for k := range sp.Props {
-				if strings.HasPrefix(k, prefix) {
-					delete(sp.Props, k)
-				}
-			}
-		}
+		deletePropNamespaces(sp.Props, patch.DeleteNamespace)
 
 		return nil
 	})
@@ -377,7 +370,7 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 	var refs []string
 
 	for i := range all {
-		if all[i].NodeName != node {
+		if !naming.Same(all[i].NodeName, node) {
 			continue
 		}
 
@@ -385,7 +378,7 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 
 		for j := range all[i].Volumes {
 			vol := &all[i].Volumes[j]
-			if vol.StoragePool == pool {
+			if naming.Same(vol.StoragePool, pool) {
 				refs = append(refs,
 					all[i].Name+"/"+strconv.FormatInt(int64(vol.VolumeNumber), 10))
 
@@ -402,7 +395,7 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 		// post-delete re-scan would never see the racing
 		// resource and the SP delete would proceed even though
 		// the spec-only Resource is about to dangle.
-		if !matched && all[i].Props["StorPoolName"] == pool {
+		if !matched && naming.Same(all[i].Props["StorPoolName"], pool) {
 			refs = append(refs, all[i].Name+"/spec")
 		}
 	}
@@ -438,22 +431,16 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 // handleNodeStoragePoolsList serves GET /v1/nodes/{node}/storage-pools.
 //
 // Implementation note: we deliberately go through the same List()+filter
-// pipeline that /v1/view/storage-pools uses (rather than the store's
-// ListByNode shortcut) for two reasons:
+// pipeline that /v1/view/storage-pools uses rather than the store's
+// ListByNode shortcut. Java LINSTOR matches node names case-insensitively on
+// both paths, and ListByNode compares the stored spelling (see
+// pkg/store/k8s/spellings.go), so routing the per-node handler through the same
+// matchAnyName filter is what keeps the two endpoints in lockstep — a parity
+// invariant the storage_pools_test.go MatchesViewFiltering test pins.
 //
-//  1. The k8s backend's ListByNode relies on a label selector that is only
-//     populated when the CRD was created through our Create() path. Pools
-//     that land in the cluster via operator `kubectl apply -f` or a
-//     migration won't carry the label and would silently disappear from
-//     the per-node listing — but they show up correctly in the view.
-//     linstor-csi's autoplace probes /v1/nodes/{node}/storage-pools per
-//     node, so an empty per-node response means "no candidate nodes",
-//     leading to ResourceExhausted and stuck-Pending PVCs even though
-//     the pools are visible in the aggregate view.
-//  2. Java LINSTOR matches node names case-insensitively in both paths.
-//     Routing the per-node handler through the same matchAnyFold filter
-//     keeps the two endpoints in lockstep — a parity invariant the
-//     storage_pools_test.go MatchesViewFiltering test pins.
+// This used to give a second reason, that ListByNode ran a label selector a
+// hand-applied pool would not match. It selects on spec.nodeName now, which
+// every pool carries whoever wrote it, so that reason no longer holds.
 func (s *Server) handleNodeStoragePoolsList(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 
@@ -483,7 +470,8 @@ func redactStoragePoolsInPlace(pools []apiv1.StoragePool) {
 }
 
 // listFilteredStoragePools returns the wire-shape pool slice after applying
-// the case-insensitive node / pool filters Java LINSTOR uses. Empty filters
+// the node / pool filters Java LINSTOR uses, matching names as the store keys
+// them (naming.Same). Empty filters
 // mean "no constraint on this dimension". The slice is always non-nil so
 // JSON encoding yields [] instead of null — linstor-csi rejects null bodies.
 func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolFilter []string) ([]apiv1.StoragePool, error) {
@@ -495,11 +483,11 @@ func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolF
 	out := make([]apiv1.StoragePool, 0, len(pools))
 
 	for i := range pools {
-		if !matchAnyFold(nodeFilter, pools[i].NodeName) {
+		if !matchAnyName(nodeFilter, pools[i].NodeName) {
 			continue
 		}
 
-		if !matchAnyFold(poolFilter, pools[i].StoragePoolName) {
+		if !matchAnyName(poolFilter, pools[i].StoragePoolName) {
 			continue
 		}
 
@@ -797,10 +785,11 @@ func immutableSPDriverProps() []string {
 //
 //   - override_props: an explicit value for any immutable key.
 //   - delete_props: an explicit key in the immutable set.
-//   - delete_namespaces: a prefix that, with the '/' separator
-//     appended, would catch any immutable key. The shared "StorDriver"
-//     prefix means deleting the namespace would wipe the pool's
-//     backing identity wholesale, so refuse that too.
+//   - delete_namespaces: a namespace that covers any immutable key, read
+//     the way the delete reads it (store.NamespaceCovers), so every
+//     spelling the delete honours is refused here too. The shared
+//     "StorDriver" namespace would wipe the pool's backing identity
+//     wholesale.
 //
 // Returns ("", false) when the patch is clean (no immutable keys
 // touched). The caller writes the typed-envelope error on refuse.
@@ -829,10 +818,8 @@ func refuseSPDriverPropMutation(patch *apiv1.GenericPropsModify) (string, bool) 
 	// would otherwise nuke the backing identity wholesale. Flag the
 	// whole namespace so the operator sees the actionable name.
 	for _, ns := range patch.DeleteNamespace {
-		prefix := ns + "/"
-
 		for _, key := range keys {
-			if strings.HasPrefix(key, prefix) {
+			if store.NamespaceCovers(ns, key) {
 				hit = append(hit, "delete_namespaces:"+ns)
 
 				break

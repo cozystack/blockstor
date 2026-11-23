@@ -20,6 +20,8 @@ package k8s
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -28,14 +30,16 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // LabelSnapshot is the label that lets us List snapshots by parent RD.
-const LabelSnapshot = "blockstor.io/snapshot-name"
+const LabelSnapshot = "blockstor.org/snapshot-name"
 
 // LabelSnapshotGroupID is the label that lets the controller-side
 // SnapshotReconciler List sibling Snapshots in the same transactional
@@ -43,10 +47,15 @@ const LabelSnapshot = "blockstor.io/snapshot-name"
 // wire DTO carries a non-empty Spec.GroupID — empty GroupID means
 // "single-snap path" and the label is omitted entirely so the
 // b351 single-Snapshot orchestrator path stays unchanged.
-const LabelSnapshotGroupID = "blockstor.io/snapshot-group-id"
+const LabelSnapshotGroupID = "blockstor.org/snapshot-group-id"
 
 type snapshots struct {
 	c ctrlclient.Client
+
+	// apiReader is the manager's direct reader when the store has one.
+	// ListByDefinitionUncached and PatchSnapshotProps read through it, so a
+	// prop write never starts from a copy the cache has not caught up with.
+	apiReader ctrlclient.Reader
 }
 
 func snapshotCRDName(rdName, snapName string) string {
@@ -82,25 +91,40 @@ func (s *snapshots) List(ctx context.Context) ([]apiv1.Snapshot, error) {
 	return out, nil
 }
 
+// ListByDefinition returns the snapshots of one definition, narrowed on the
+// spec.resourceDefinitionName selectable field.
+//
+// It used to select on the definition LABEL, and a label is written by
+// whoever created the object: pkg/linstormigrate builds adopted Snapshots
+// from a LINSTOR dump with none. This list is what `rd d` is refused on and
+// what sweeps the leftovers behind it, so on an adopted cluster a snapshot the
+// selector could not see was a definition deleted with snapshots still on it,
+// and the mop-up missing them too. Same label blindness the Resource and
+// StoragePool reads were moved off, one kind over and on a delete gate.
 func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
-	var crdList crdv1alpha1.SnapshotList
+	return s.listByDefinitionThrough(ctx, s.c, rdName)
+}
 
-	err := s.c.List(ctx, &crdList,
-		ctrlclient.MatchingLabels{LabelResourceDefinition: rdName})
-	if err != nil {
-		return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+// ListByDefinitionUncached reads the definition's snapshots from the API server
+// when a direct reader is wired, and through the cache otherwise. The field
+// selector travels either way: the API server answers it from the selectable
+// field the CRD declares.
+//
+// A server that refuses the selector, which is what a cluster whose CRD
+// predates the selectable field does, is answered by the exhaustive read on
+// the same direct reader. Handing it to ListByDefinition instead put the read
+// back on the cache on exactly the cluster the fallback exists for, where the
+// index the binaries register serves it from the informer: a snapshot that
+// raced the delete and had not reached the informer was invisible to the `rd
+// d` refusal and to the sweep, and the definition went over it. The Resource
+// and StoragePool reads pass their reader into the exhaustive path the same
+// way.
+func (s *snapshots) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error) {
+	if s.apiReader == nil {
+		return s.ListByDefinition(ctx, rdName)
 	}
 
-	parent, _ := s.getParentRD(ctx, rdName)
-
-	out := make([]apiv1.Snapshot, 0, len(crdList.Items))
-	for i := range crdList.Items {
-		out = append(out, crdToWireSnapshot(&crdList.Items[i], parent))
-	}
-
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-
-	return out, nil
+	return s.listByDefinitionThrough(ctx, s.apiReader, rdName)
 }
 
 func (s *snapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
@@ -125,9 +149,28 @@ func (s *snapshots) Create(ctx context.Context, in *apiv1.Snapshot) error {
 		return errors.New("nil Snapshot")
 	}
 
-	crd := wireToCRDSnapshot(in)
+	// The spec stores the definition's CR name and the registered spelling
+	// is kept for display, as for a replica; see spellings.go.
+	rd, err := storedRDName(ctx, s.c, in.ResourceName)
+	if err != nil {
+		return err
+	}
 
-	err := s.c.Create(ctx, crd)
+	shown := *in
+	shown.ResourceName = rd.display
+
+	crd := wireToCRDSnapshot(&shown)
+	dropNameAnnotations(crd.Annotations)
+	crd.Spec.ResourceDefinitionName = rd.crName
+	crd.Labels[LabelResourceDefinition] = rd.crName
+	rd.annotate(&crd.ObjectMeta, AnnotationLinstorRDName)
+
+	crd.Spec.LUKSKeys, err = s.sourceLUKSKeys(ctx, rd.crName, crd.Spec.Nodes)
+	if err != nil {
+		return err
+	}
+
+	err = s.c.Create(ctx, crd)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return errors.Wrapf(store.ErrAlreadyExists, "snapshot %q on RD %q", in.Name, in.ResourceName)
@@ -188,16 +231,74 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		// clobber it — a lost GroupSize would let the barrier open early
 		// (or never) and break the cross-RD suspend-window invariant.
 		preservedGroupSize := existing.Spec.GroupSize
+		// The definition's CR name, fixed at Create; the wire carries the
+		// display spelling (see spellings.go).
+		preservedRD := existing.Spec.ResourceDefinitionName
+		// The source replicas' wrapped LUKS passwords, copied at Create:
+		// the snapshot's bytes cannot be read without them.
+		preservedLUKSKeys := existing.Spec.LUKSKeys
 
 		existing.Spec = wireToCRDSnapshotSpec(in)
+		existing.Spec.LUKSKeys = preservedLUKSKeys
 		existing.Spec.SuspendIO = preservedSuspendIO
 		existing.Spec.TakeSnapshot = preservedTakeSnapshot
 		existing.Spec.GroupID = preservedGroupID
 		existing.Spec.GroupSize = preservedGroupSize
-		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
+		existing.Spec.ResourceDefinitionName = preservedRD
+		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations), AnnotationLinstorRDName)
 
 		return s.c.Update(ctx, &existing)
 	}), "update Snapshot %s/%s", in.ResourceName, in.Name)
+}
+
+// PatchSnapshotProps reads the snapshot from the API server, runs mutate on
+// its props and updates it under the resourceVersion it read, so a write
+// that came in between makes the update conflict and mutate run again on
+// the fresh object instead of being written over.
+func (s *snapshots) PatchSnapshotProps(
+	ctx context.Context, rdName, snapName string, mutate func(map[string]string) error,
+) error {
+	reader := ctrlclient.Reader(s.c)
+	if s.apiReader != nil {
+		reader = s.apiReader
+	}
+
+	key := types.NamespacedName{Name: snapshotCRDName(rdName, snapName)}
+
+	var mutateErr error
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var crd crdv1alpha1.Snapshot
+
+		getErr := reader.Get(ctx, key, &crd)
+		if apierrors.IsNotFound(getErr) {
+			return errors.Wrapf(store.ErrNotFound, "snapshot %q on RD %q", snapName, rdName)
+		}
+
+		if getErr != nil {
+			return errors.Wrapf(getErr, "get Snapshot %s/%s", rdName, snapName)
+		}
+
+		props := maps.Clone(crd.Spec.Props)
+		if props == nil {
+			props = map[string]string{}
+		}
+
+		mutateErr = mutate(props)
+		if mutateErr != nil {
+			return nil //nolint:nilerr // mutate's refusal is returned below, not retried
+		}
+
+		crd.Spec.Props = props
+
+		return s.c.Update(ctx, &crd)
+	})
+
+	if mutateErr != nil {
+		return mutateErr
+	}
+
+	return errors.Wrapf(err, "patch the props of Snapshot %s/%s", rdName, snapName)
 }
 
 func (s *snapshots) Delete(ctx context.Context, rdName, snapName string) error {
@@ -213,6 +314,50 @@ func (s *snapshots) Delete(ctx context.Context, rdName, snapName string) error {
 	}
 
 	return nil
+}
+
+// listByDefinitionThrough lists the definition's snapshots under every
+// spelling of its name (see spellings.go), through one reader, and falls back
+// to the exhaustive read on that same reader when the server cannot select.
+func (s *snapshots) listByDefinitionThrough(
+	ctx context.Context, reader ctrlclient.Reader, rdName string,
+) ([]apiv1.Snapshot, error) {
+	spellings, err := rdSpellings(ctx, reader, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	var kept []crdv1alpha1.Snapshot
+
+	seen := map[string]struct{}{}
+
+	for _, spelling := range spellings {
+		var crdList crdv1alpha1.SnapshotList
+
+		err := reader.List(ctx, &crdList, ctrlclient.MatchingFields{FieldSnapshotDefinitionName: spelling})
+		if err != nil {
+			if !SelectorUnsupported(err) {
+				return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", spelling)
+			}
+
+			log.FromContext(ctx).V(1).Info("scoped Snapshot read unavailable; reading every snapshot instead",
+				"resourceDefinition", rdName, "reason", err.Error())
+
+			return s.listByDefinitionExhaustively(ctx, reader, rdName, spellings)
+		}
+
+		for i := range crdList.Items {
+			if _, dup := seen[crdList.Items[i].Name]; dup {
+				continue
+			}
+
+			seen[crdList.Items[i].Name] = struct{}{}
+
+			kept = append(kept, crdList.Items[i])
+		}
+	}
+
+	return s.wireSnapshots(ctx, rdName, kept)
 }
 
 // getParentRD fetches the parent ResourceDefinition for a Snapshot,
@@ -276,10 +421,10 @@ func crdToWireSnapshot(
 ) apiv1.Snapshot {
 	out := apiv1.Snapshot{
 		Name:                    crd.Spec.SnapshotName,
-		ResourceName:            crd.Spec.ResourceDefinitionName,
+		ResourceName:            shownName(&crd.ObjectMeta, AnnotationLinstorRDName, crd.Spec.ResourceDefinitionName),
 		Nodes:                   crd.Spec.Nodes,
 		Props:                   crd.Spec.Props,
-		Annotations:             userAnnotations(crd.Annotations),
+		Annotations:             withoutNameAnnotations(userAnnotations(crd.Annotations)),
 		UUID:                    string(crd.UID),
 		SnapshotDefinitionProps: crd.Spec.Props,
 	}
@@ -303,11 +448,26 @@ func crdToWireSnapshot(
 		copy(out.Flags, crd.Status.Flags)
 	}
 
+	// A delete only stamps a DeletionTimestamp while a satellite finalizer
+	// holds the snapshot, and that lasts until the on-disk delete succeeds.
+	// Served as a plain snapshot, a restore read it as live and was restored
+	// from data being destroyed. Same flag resources carry for the same state,
+	// and like theirs it outranks every other State: the REST view stamps no
+	// SUCCESSFUL beside it.
+	out.Flags = withDeletingFlag(out.Flags, crd.DeletionTimestamp != nil)
+
 	if len(crd.Spec.VolumeDefinitions) > 0 {
 		out.VolumeDefinitions = wireVolumeDefinitions(crd.Spec.VolumeDefinitions, vdPropsByNumber)
 	}
 
 	out.Snapshots = wirePerNodeSnapshots(crd)
+
+	for _, failure := range crd.Status.DeleteFailures {
+		out.DeleteFailures = append(out.DeleteFailures, apiv1.SnapshotDeleteFailure{
+			NodeName: failure.NodeName,
+			Message:  failure.Message,
+		})
+	}
 
 	return out
 }
@@ -361,6 +521,7 @@ func wirePerNodeSnapshots(crd *crdv1alpha1.Snapshot) []apiv1.SnapshotPerNode {
 				NodeName:        crd.Status.NodeStatus[i].NodeName,
 				CreateTimestamp: crd.Status.NodeStatus[i].CreateTimestamp,
 				SnapshotVolumes: snapshotVolumesFromVDs(crd.Spec.VolumeDefinitions),
+				StoragePool:     crd.Status.NodeStatus[i].StoragePool,
 			})
 		}
 
@@ -475,4 +636,134 @@ func wireToCRDSnapshotSpec(in *apiv1.Snapshot) crdv1alpha1.SnapshotSpec {
 	}
 
 	return spec
+}
+
+// listByDefinitionExhaustively filters every snapshot here, on the
+// authoritative Spec.ResourceDefinitionName, read through the reader the
+// scoped attempt used so a fallback never changes which one answers.
+func (s *snapshots) listByDefinitionExhaustively(
+	ctx context.Context, reader ctrlclient.Reader, rdName string, spellings []string,
+) ([]apiv1.Snapshot, error) {
+	var crdList crdv1alpha1.SnapshotList
+
+	err := reader.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
+	}
+
+	kept := make([]crdv1alpha1.Snapshot, 0, len(crdList.Items))
+
+	for i := range crdList.Items {
+		if slices.Contains(spellings, crdList.Items[i].Spec.ResourceDefinitionName) {
+			kept = append(kept, crdList.Items[i])
+		}
+	}
+
+	return s.wireSnapshots(ctx, rdName, kept)
+}
+
+// wireSnapshots converts a definition's snapshots, reading the parent once.
+//
+// The parent read's error is propagated rather than dropped. A snapshot whose
+// definition is GONE is not an error — getParentRD answers (nil, nil) for both
+// the missing name and the NotFound, because an orphan snapshot is a real
+// shape and must still list. What reaches here is a read that actually failed,
+// and swallowing it returned a successful listing with
+// ResourceDefinitionProps silently absent from every row: the caller cannot
+// tell "this definition has no props" from "nobody could read them".
+func (s *snapshots) wireSnapshots(
+	ctx context.Context, rdName string, items []crdv1alpha1.Snapshot,
+) ([]apiv1.Snapshot, error) {
+	parent, err := s.getParentRD(ctx, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]apiv1.Snapshot, 0, len(items))
+	for i := range items {
+		out = append(out, crdToWireSnapshot(&items[i], parent))
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
+}
+
+// sourceLUKSKeys copies the wrapped LUKS password of every volume of the
+// definition's replicas on nodes, or on every node when nodes is empty: the
+// snapshot's bytes on a node are encrypted under that node's replica's
+// password, and the replica may be gone before the snapshot is restored.
+//
+// The replicas are read from the API server when the store has a direct
+// reader: a replica formatted a moment ago may not have reached the cache,
+// and a snapshot that misses its key cannot be restored.
+func (s *snapshots) sourceLUKSKeys(ctx context.Context, rdCRName string, nodes []string) ([]crdv1alpha1.SnapshotLUKSKey, error) {
+	reader := ctrlclient.Reader(s.c)
+	if s.apiReader != nil {
+		reader = s.apiReader
+	}
+
+	replicas, err := resourceCRDsOfDefinition(ctx, reader, rdCRName)
+	if err != nil {
+		return nil, err
+	}
+
+	wanted := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		wanted[naming.Key(node)] = true
+	}
+
+	var out []crdv1alpha1.SnapshotLUKSKey
+
+	for i := range replicas {
+		replica := &replicas[i]
+		if len(wanted) > 0 && !wanted[naming.Key(replica.Spec.NodeName)] {
+			continue
+		}
+
+		for _, vol := range replica.Spec.Volumes {
+			if vol.LUKSKey == nil {
+				continue
+			}
+
+			out = append(out, crdv1alpha1.SnapshotLUKSKey{
+				NodeName:     replica.Spec.NodeName,
+				VolumeNumber: vol.VolumeNumber,
+				LUKSKey:      *vol.LUKSKey.DeepCopy(),
+			})
+		}
+	}
+
+	return out, nil
+}
+
+// resourceCRDsOfDefinition lists the Resource CRs whose spec names the
+// definition rdCRName, scoped by the selectable field where the server serves
+// it and by a full read otherwise.
+func resourceCRDsOfDefinition(ctx context.Context, reader ctrlclient.Reader, rdCRName string) ([]crdv1alpha1.Resource, error) {
+	var list crdv1alpha1.ResourceList
+
+	err := reader.List(ctx, &list, ctrlclient.MatchingFields{FieldResourceDefinitionName: rdCRName})
+	if err == nil {
+		return list.Items, nil
+	}
+
+	if !SelectorUnsupported(err) {
+		return nil, errors.Wrapf(err, "list the replicas of %q", rdCRName)
+	}
+
+	err = reader.List(ctx, &list)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list the replicas of %q", rdCRName)
+	}
+
+	out := list.Items[:0]
+
+	for i := range list.Items {
+		if list.Items[i].Spec.ResourceDefinitionName == rdCRName {
+			out = append(out, list.Items[i])
+		}
+	}
+
+	return out, nil
 }

@@ -2417,3 +2417,43 @@ func TestSnapshotCreateScopesGateToTargetNodes_G5(t *testing.T) {
 		t.Errorf("targeting thick n2: got %d, want 400 (thick pool refused)", badResp.StatusCode)
 	}
 }
+
+// A snapshot whose delete is in flight is Deleting: the python CLI checks the
+// DELETE flag first, and SUCCESSFUL stamped beside it reads as a usable
+// snapshot to any client that checks the flags in another order.
+func TestSnapshotStateNotMarkedSuccessfulWhileDeleting(t *testing.T) {
+	ctx := t.Context()
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "snap-deleting"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "snap-deleting", NodeName: "worker-1"}); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap1",
+		ResourceName: "snap-deleting",
+		Nodes:        []string{"worker-1"},
+		Flags:        []string{apiv1.SnapshotFlagDelete},
+		Snapshots: []apiv1.SnapshotPerNode{
+			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
+		},
+	}); err != nil {
+		t.Fatalf("seed Snapshot: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(got) != 1 {
+		t.Fatalf("view len: got %d, want 1", len(got))
+	}
+
+	if slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
+		t.Errorf("Flags: SUCCESSFUL stamped beside DELETE: %v", got[0].Flags)
+	}
+}

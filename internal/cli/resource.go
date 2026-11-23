@@ -25,6 +25,7 @@ import (
 	"slices"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
@@ -238,7 +239,7 @@ func migrateDisk(ctx context.Context, run *runContext, dst, rdName string) error
 	//
 	// There is no --force path for this: no argument makes deleting the
 	// copy you are migrating the intended outcome.
-	if src == dst {
+	if naming.Same(src, dst) {
 		return fmt.Errorf("migrate-disk: source and destination are both %s: %w", dst, errMigrateToSelf)
 	}
 

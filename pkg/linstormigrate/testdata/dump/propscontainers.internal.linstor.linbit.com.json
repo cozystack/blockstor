@@ -2,6 +2,27 @@
 "items": [
 {
 "spec": {
+"prop_key": "encrypted/masterkey",
+"prop_value": "YGFiY2RlZmdoaWprbG1ub5bVilcKH4i0OIPhTpxwW8Nd2jaxBs/yYutifx5pjM8E",
+"props_instance": "/CTRL"
+}
+},
+{
+"spec": {
+"prop_key": "encrypted/passphrasesalt",
+"prop_value": "QEFCQ0RFRkdISUpLTE1OTw==",
+"props_instance": "/CTRL"
+}
+},
+{
+"spec": {
+"prop_key": "encrypted/masterhash",
+"prop_value": "fUwo1VHOQnfLAHVKzly/Bhr5lBOgsAwojcocYiwNm2eLuLZ+HZsOVctGnaFVzwxjiWqj8nnqfWRcrt9Vf3462Q==",
+"props_instance": "/CTRL"
+}
+},
+{
+"spec": {
 "prop_key": "Aux/topology/kubernetes.io/hostname",
 "prop_value": "node-a",
 "props_instance": "/NODES/NODE-A"
@@ -187,6 +208,62 @@
 "prop_key": "StorDriver/StorPoolName",
 "prop_value": "fast",
 "props_instance": "/STOR_POOLS/NODE-A/FAST"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/connect-int",
+"prop_value": "15",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/ping-int",
+"prop_value": "12",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/ping-timeout",
+"prop_value": "10",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/timeout",
+"prop_value": "90",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/verify-alg",
+"prop_value": "crc32c",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "Cluster/LocalID",
+"prop_value": "00000000-1111-2222-3333-444444444444",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/auto-verify-alg",
+"prop_value": "crc32c",
+"props_instance": "/RSC_DFNS/PVC-VOL3"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/sndbuf-size",
+"prop_value": "1048576",
+"props_instance": "/NODES/NODE-B"
 }
 }
 ]

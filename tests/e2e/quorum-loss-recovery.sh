@@ -133,7 +133,7 @@ trap cleanup EXIT
 # --- step 1: apply 3-replica RD with explicit quorum policy --------
 echo ">> step 1: apply 3-replica RD ${RD} on ${N1}+${N2}+${N3}"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -146,7 +146,7 @@ spec:
 EOF
 for n in "$N1" "$N2" "$N3"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:

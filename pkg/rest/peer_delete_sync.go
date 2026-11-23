@@ -24,6 +24,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -48,8 +49,9 @@ var peerDeletePollInterval = 250 * time.Millisecond
 
 // peerForgetAckAnnotationPrefix names the per-peer ACK key the
 // satellite stamps after completing ActionForgetPeer for a given peer
-// name. Full key shape: `blockstor.io/peer-forget-acked.<peerNode>`
-// with an RFC3339Nano timestamp as the value. The REST handler's
+// name. Full key shape: `blockstor.org/peer-forget-acked.<peerNode>`
+// with an RFC3339Nano timestamp as the value; the peer is named by its
+// key, so every spelling of it asks after one annotation. The REST handler's
 // waitForPeerDeletionAcks polls the key for presence as the implicit
 // confirmation that del-peer + forget-peer have completed against
 // the OLD peer incarnation.
@@ -58,7 +60,7 @@ var peerDeletePollInterval = 250 * time.Millisecond
 // round-tripped through Store and already serve as the channel for
 // cross-satellite signals (Bug 67 PeerChangedAnnotation), so reusing
 // the same transport keeps the fix additive — no Store schema change.
-const peerForgetAckAnnotationPrefix = "blockstor.io/peer-forget-acked."
+const peerForgetAckAnnotationPrefix = "blockstor.org/peer-forget-acked."
 
 // waitForPeerDeletionAcks blocks until every online sibling Resource
 // of `rdName` has stamped a peer-forget ACK annotation for
@@ -105,7 +107,7 @@ func (s *Server) waitForPeerDeletionAcks(ctx context.Context, rdName, removedNod
 
 	for i := range siblings {
 		sib := &siblings[i]
-		if sib.NodeName == removedNode {
+		if naming.Same(sib.NodeName, removedNode) {
 			continue
 		}
 
@@ -120,7 +122,7 @@ func (s *Server) waitForPeerDeletionAcks(ctx context.Context, rdName, removedNod
 		return
 	}
 
-	ackKey := peerForgetAckAnnotationPrefix + removedNode
+	ackKey := peerForgetAckAnnotationPrefix + naming.Key(removedNode)
 	deadline := time.Now().Add(peerDeleteAckTimeout)
 
 	for {

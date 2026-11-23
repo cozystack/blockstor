@@ -29,6 +29,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 	"github.com/cozystack/blockstor/internal/cli/view"
@@ -156,7 +158,7 @@ func resourceDefinitionClone(ctx context.Context, run *runContext) error {
 
 	snapName := cloneSnapshotName(target)
 
-	err = ensureCloneSnapshot(ctx, run, &src, snapName)
+	err = ensureCloneSnapshot(ctx, run, &src, snapName, target)
 	if err != nil {
 		return err
 	}
@@ -234,7 +236,9 @@ func checkCloneSnapshotIsCurrent(
 	return nil
 }
 
-func ensureCloneSnapshot(ctx context.Context, run *runContext, src *apiv1.ResourceDefinition, snapName string) error {
+func ensureCloneSnapshot(
+	ctx context.Context, run *runContext, src *apiv1.ResourceDefinition, snapName, target string,
+) error {
 	existing, err := run.Store.Snapshots().Get(ctx, src.Name, snapName)
 	if err == nil {
 		return checkCloneSnapshotIsCurrent(ctx, run, src, &existing)
@@ -254,6 +258,14 @@ func ensureCloneSnapshot(ctx context.Context, run *runContext, src *apiv1.Resour
 	if err != nil {
 		return err
 	}
+
+	// Stamped as the clone's own, the way the REST door stamps it, so that
+	// deleting the clone may reap it; see store.CloneSnapshotOwnerProp.
+	if snap.Props == nil {
+		snap.Props = map[string]string{}
+	}
+
+	snap.Props[store.CloneSnapshotOwnerProp] = target
 
 	err = run.Store.Snapshots().Create(ctx, snap)
 	if err != nil {
@@ -354,11 +366,11 @@ func candidatePools(ctx context.Context, run *runContext, group *apiv1.ResourceG
 			continue
 		case !matchesAny(wanted, pool.StoragePoolName):
 			continue
-		case seen[pool.NodeName]:
+		case seen[naming.Key(pool.NodeName)]:
 			continue
 		}
 
-		seen[pool.NodeName] = true
+		seen[naming.Key(pool.NodeName)] = true
 
 		pools = append(pools, *pool)
 	}
@@ -377,7 +389,7 @@ func matchesAny(filter []string, name string) bool {
 		return true
 	}
 
-	return slices.Contains(filter, name)
+	return slices.ContainsFunc(filter, func(f string) bool { return naming.Same(f, name) })
 }
 
 // maxVolumeSizeKib is the smallest free capacity among the pools a

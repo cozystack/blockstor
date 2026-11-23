@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -161,14 +162,14 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
 	// from every snapshot. The reconcilers stamp the same
-	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` keys on
+	// `blockstor.org/*` + `bug<N>.blockstor.org/*` keys on
 	// Snapshot CRDs as on Resource / RD / RG; the wire shape must not
 	// carry them.
 	stripInternalAnnotationsFromSnapshots(snaps)
 
 	// Optional filters golinstor sends: ?resources=rd1,rd2 &
-	// snapshots=name1,name2 — case-insensitive set membership against
-	// Java LINSTOR's behaviour. Without filtering linstor-csi's "do
+	// snapshots=name1,name2 — set membership by naming.Same, Java
+	// LINSTOR's case-insensitive match for every name inside RFC 1123. Without filtering linstor-csi's "do
 	// any snapshots exist for this volume?" poll has to scan the
 	// whole cluster every cycle.
 	rdFilter := multiValueQuery(r, "resources")
@@ -177,11 +178,11 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 	filtered := make([]apiv1.Snapshot, 0, len(snaps))
 
 	for i := range snaps {
-		if !matchAnyFold(rdFilter, snaps[i].ResourceName) {
+		if !matchAnyName(rdFilter, snaps[i].ResourceName) {
 			continue
 		}
 
-		if !matchAnyFold(nameFilter, snaps[i].Name) {
+		if !matchAnyName(nameFilter, snaps[i].Name) {
 			continue
 		}
 
@@ -233,7 +234,14 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snaps, err := s.Store.Snapshots().ListByDefinition(r.Context(), rd)
+	// Past the cache: linstor-csi deletes the definition of a deleted volume
+	// only when this list, read right after a snapshot delete answered, has
+	// no snapshot left that is not being deleted. A delete retried after a
+	// timeout finds the snapshot gone on the API server and answers at once,
+	// and a cache that has not seen the snapshot go hands it back here as
+	// live, so the definition was kept for good. LINSTOR answers the delete
+	// and the list from one model, where the snapshot is gone for both.
+	snaps, err := s.Store.Snapshots().ListByDefinitionUncached(r.Context(), rd)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -367,7 +375,7 @@ func (s *Server) stampSnapshotSuccessful(ctx context.Context, snaps []apiv1.Snap
 			continue
 		}
 
-		diskful, ok := diskfulByRD[snap.ResourceName]
+		diskful, ok := diskfulByRD[naming.Key(snap.ResourceName)]
 		if !ok {
 			built, err := s.diskfulPeerSet(ctx, snap.ResourceName)
 			if err != nil {
@@ -375,7 +383,7 @@ func (s *Server) stampSnapshotSuccessful(ctx context.Context, snaps []apiv1.Snap
 			}
 
 			diskful = built
-			diskfulByRD[snap.ResourceName] = diskful
+			diskfulByRD[naming.Key(snap.ResourceName)] = diskful
 		}
 
 		if isSnapshotSuccessful(snap, diskful) {
@@ -396,9 +404,13 @@ const legacySnapshotFlagFailed = "FAILED"
 
 // isTerminalSnapshotFlag reports whether a flag value already pins the
 // snapshot to a non-Incomplete State that outranks `SUCCESSFUL`.
-// Mirrors the python CLI's elif-chain order in snapshot_cmds.show.
+// Mirrors the python CLI's elif-chain order in snapshot_cmds.show, where
+// DELETE comes first: a snapshot whose delete is in flight is Deleting, and
+// stamping SUCCESSFUL beside it hands a client that reads the flags in any
+// other order a snapshot being destroyed as a usable one.
 func isTerminalSnapshotFlag(flag string) bool {
-	return flag == apiv1.SnapshotFlagFailedDeployment ||
+	return flag == apiv1.SnapshotFlagDelete ||
+		flag == apiv1.SnapshotFlagFailedDeployment ||
 		flag == apiv1.SnapshotFlagFailedDisconnect ||
 		flag == apiv1.SnapshotFlagSuccessful ||
 		flag == legacySnapshotFlagFailed
@@ -442,11 +454,11 @@ func isSnapshotSuccessful(snap *apiv1.Snapshot, diskful map[string]struct{}) boo
 			continue
 		}
 
-		reported[entry.NodeName] = struct{}{}
+		reported[naming.Key(entry.NodeName)] = struct{}{}
 	}
 
 	for node := range denominator {
-		if _, ok := reported[node]; !ok {
+		if _, ok := reported[naming.Key(node)]; !ok {
 			return false
 		}
 	}
@@ -466,8 +478,8 @@ func successDenominator(snap *apiv1.Snapshot, diskful map[string]struct{}) map[s
 	out := make(map[string]struct{}, len(snap.Nodes))
 
 	for _, node := range snap.Nodes {
-		if _, ok := diskful[node]; ok {
-			out[node] = struct{}{}
+		if _, ok := diskful[naming.Key(node)]; ok {
+			out[naming.Key(node)] = struct{}{}
 		}
 	}
 
@@ -512,7 +524,7 @@ func (s *Server) diskfulPeerSet(ctx context.Context, rdName string) (map[string]
 			continue
 		}
 
-		out[resList[i].NodeName] = struct{}{}
+		out[naming.Key(resList[i].NodeName)] = struct{}{}
 	}
 
 	return out, nil
@@ -571,7 +583,7 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict,
 			"resource definition '"+rd+"' is being deleted "+
 				"(DELETE flag set): retry against a different RD or "+
-				"wait for the tear-down to complete (Bug 180)")
+				"wait for the tear-down to complete")
 
 		return
 	}
@@ -622,6 +634,8 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	if !s.refuseSnapshotCreateOnRDDeletedRace(w, r, &snap) {
 		return
 	}
+
+	s.waitForSnapshotCreateVisible(r.Context(), rd, snap.Name)
 
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
@@ -725,7 +739,7 @@ func validateSnapshotCreateBody(w http.ResponseWriter, r *http.Request, rd strin
 	//
 	// Bug 97: tighten further to the full RFC-1123 subdomain rule so
 	// `linstor s c <rd> "Foo Bar"` is refused with a LINSTOR envelope
-	// before pkg/store/k8s.Name() slugifies the input.
+	// before pkg/store/naming.Key() slugifies the input.
 	snapNameErr := validateLinstorName("snapshot", strings.TrimSpace(snap.Name))
 	if snapNameErr != nil {
 		writeError(w, http.StatusBadRequest, snapNameErr.Error())
@@ -790,7 +804,7 @@ func (s *Server) refuseSnapshotCreateOnRDDeletedRace(w http.ResponseWriter, r *h
 
 		writeError(w, http.StatusConflict,
 			"resource definition '"+snap.ResourceName+"' "+reason+
-				" concurrently with the snapshot create (Bug 180): "+
+				" concurrently with the snapshot create: "+
 				"retry after re-creating the resource definition, or "+
 				"pick a different RD")
 
@@ -951,7 +965,7 @@ func (s *Server) hydrateSnapshotFromRD(ctx context.Context, snap *apiv1.Snapshot
 	}
 
 	if snap.Props == nil {
-		snap.Props = srcRD.Props
+		snap.Props = store.TravellingProps(srcRD.Props)
 	}
 
 	if len(snap.Nodes) == 0 {
@@ -1041,7 +1055,7 @@ func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.
 			"can take copy-on-write snapshots",
 		Correc: "place the resource on a thin-provisioned snapshot-capable " +
 			"pool (LVM_THIN / ZFS_THIN / FILE_THIN); `linstor rd clone` also " +
-			"relies on snapshots (Bug-020) so it is no workaround on a thick pool",
+			"relies on snapshots, so it is no workaround on a thick pool",
 	}})
 
 	return false
@@ -1061,9 +1075,11 @@ func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.
 // mixed-provider RD is not falsely refused. An empty targetNodes means
 // "all diskful replicas" (the un-pinned default-fan-out case).
 func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.Resource, targetNodes []string) []string {
+	// Keyed by CR name: snap.Nodes lists a node as registered, and a
+	// replica written before the store stored CR names may spell it so too.
 	want := make(map[string]struct{}, len(targetNodes))
 	for _, n := range targetNodes {
-		want[n] = struct{}{}
+		want[naming.Key(n)] = struct{}{}
 	}
 
 	var offenders []poolOffender
@@ -1075,7 +1091,7 @@ func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.R
 
 		// Scope to the resolved target set when the caller pinned one.
 		if len(want) > 0 {
-			if _, ok := want[res.NodeName]; !ok {
+			if _, ok := want[naming.Key(res.NodeName)]; !ok {
 				continue
 			}
 		}
@@ -1197,6 +1213,52 @@ func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, erro
 	return out, nil
 }
 
+// writeSnapshotDeleteRefusal answers a snapshot delete that store.DeleteSnapshot
+// refused: a definition restored from the snapshot reads from it until its
+// restore is done.
+func writeSnapshotDeleteRefusal(w http.ResponseWriter, rd, snapName string, err error) {
+	if errors.Is(err, store.ErrRestoreSourceInUse) {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "snapshot '" + snapName + "' of '" + rd + "' cannot be deleted yet: " + scrubImplDetails(err.Error()),
+			Cause:   "a restore from this snapshot has not brought up a replica with every volume UpToDate",
+			Correc:  "retry the delete once that restore has finished",
+			ObjRefs: map[string]string{objRefRscDfn: rd, objRefSnapshotDfn: snapName},
+		}})
+
+		return
+	}
+
+	writeStoreError(w, err)
+}
+
+// snapshotDeleteFailureRcs is the answer to a snapshot delete that a
+// satellite failed: one error per failing node, carrying the
+// satellite's own message, as LINSTOR returns its satellite's error.
+// The satellite keeps retrying, so the snapshot stays in its deleting
+// state and a repeated delete reports the latest failure.
+func snapshotDeleteFailureRcs(rd, snapName string, failures []apiv1.SnapshotDeleteFailure) []apiv1.APICallRc {
+	rcs := make([]apiv1.APICallRc, 0, len(failures))
+
+	for _, failure := range failures {
+		rcs = append(rcs, apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "(Node: '" + failure.NodeName + "') failed to delete snapshot '" +
+				snapName + "' of '" + rd + "'",
+			Cause: scrubImplDetails(failure.Message),
+			Correc: "fix the cause on that node; its satellite retries the " +
+				"delete, and the snapshot stays in the deleting state until then",
+			ObjRefs: map[string]string{
+				objRefRscDfn:      rd,
+				objRefSnapshotDfn: snapName,
+				objRefNode:        failure.NodeName,
+			},
+		})
+	}
+
+	return rcs
+}
+
 // handleSnapshotDelete answers `DELETE /v1/resource-definitions/{rd}/snapshots/{snap}`
 // with an idempotent 200 + ApiCallRc envelope. CSI spec §DeleteSnapshot
 // mandates idempotence: the driver retries until it sees success, so
@@ -1233,9 +1295,19 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")
 
-	err := s.Store.Snapshots().Delete(r.Context(), rd, snapName)
+	// A missing snapshot is answered before any restore is judged: there is
+	// nothing to hold, and the idempotent 200 is what a CSI retry needs.
+	err := store.DeleteSnapshot(r.Context(), s.Store, rd, snapName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			// A retry of a delete that timed out lands here once the
+			// finalizer drained. Answer only after the cache has seen the
+			// snapshot go too, as the resource delete does: LINSTOR serves
+			// every read after the answer from the model the delete
+			// changed. Lag is not a stuck satellite, so the outcome of
+			// the wait does not change the answer.
+			_ = s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
+
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 				RetCode: warnSnapshotNotFound,
 				Message: "snapshot already absent: " + snapName,
@@ -1248,24 +1320,33 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		writeStoreError(w, err)
+		writeSnapshotDeleteRefusal(w, rd, snapName, err)
 
 		return
 	}
 
 	// Bug 193: wait until the Snapshot CRD is actually gone (finalizer
-	// drained, CRD reaped) before declaring success. A bounded budget
-	// caps the worst-case latency; on timeout we surface 504 + a
-	// stuck-satellite envelope so the operator gets a concrete next
-	// action instead of a silently-half-completed delete.
-	converged := s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
-	if !converged {
+	// drained, CRD reaped) before declaring success, as LINSTOR waits
+	// for its satellites. A satellite that reports its delete failed
+	// ends the wait with that error, as in LINSTOR. While every listed
+	// node is online the wait lasts as long as the satellites take;
+	// once one is offline or unknown the budget applies and we surface
+	// 504 + a stuck-satellite envelope so the operator gets a concrete
+	// next action instead of a silently-half-completed delete.
+	outcome, failures := s.waitForSnapshotDrained(r.Context(), rd, snapName)
+	if outcome == snapshotWaitFailed {
+		writeJSON(w, http.StatusInternalServerError, snapshotDeleteFailureRcs(rd, snapName, failures))
+
+		return
+	}
+
+	if outcome != snapshotWaitGone {
 		writeJSON(w, http.StatusGatewayTimeout, []apiv1.APICallRc{{
 			RetCode: apiCallRcError | apiCallRcFailSnapshotFinalizerStuck,
 			Message: "snapshot delete acked but satellite finalizer " +
 				"not removed within timeout: " + snapName,
 			Cause: "the satellite-side finalizer " +
-				"(blockstor.cozystack.io/satellite-snapshot) did " +
+				"(blockstor.org/satellite-snapshot) did " +
 				"not drain within the wait budget; the snapshot may " +
 				"still be present on disk and the Snapshot CRD will " +
 				"remain visible until the satellite reconciler runs",

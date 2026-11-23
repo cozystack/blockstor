@@ -94,7 +94,7 @@ while (( $(date +%s) < deadline )); do
     pair=()
     tb=""
     for n in "$N1" "$N2" "$N3"; do
-        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
+        flags=$(kubectl get "resources.blockstor.org/${RD}.${n}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" == *"TIE_BREAKER"* ]]; then
             tb=$n
@@ -146,7 +146,7 @@ echo ">> confirm $tb_node is flagged EVICTED"
 deadline=$(( $(date +%s) + 30 ))
 node_evicted=false
 while (( $(date +%s) < deadline )); do
-    nflags=$(kubectl get "nodes.blockstor.cozystack.io/${tb_node}" \
+    nflags=$(kubectl get "nodes.blockstor.org/${tb_node}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     if [[ "$nflags" == *"EVICTED"* ]]; then
         node_evicted=true
@@ -164,7 +164,7 @@ deadline=$(( $(date +%s) + 30 ))
 reaped=false
 while (( $(date +%s) < deadline )); do
     # The witness must no longer sit on the evicted node.
-    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${tb_node}" \
+    flags=$(kubectl get "resources.blockstor.org/${RD}.${tb_node}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "__absent__")
     if [[ "$flags" == "__absent__" ]] || [[ "$flags" != *"TIE_BREAKER"* ]]; then
         reaped=true
@@ -184,7 +184,7 @@ fi
 # went UpToDate → TieBreaker).
 echo ">> assert neither healthy diskful ($DISKFUL_A, $DISKFUL_B) was demoted to TIE_BREAKER"
 for n in "$DISKFUL_A" "$DISKFUL_B"; do
-    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
+    flags=$(kubectl get "resources.blockstor.org/${RD}.${n}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "__absent__")
     if [[ "$flags" == "__absent__" ]]; then
         echo "FAIL (Bug 385): healthy diskful on $n disappeared after evict; flags=$flags" >&2

@@ -20,11 +20,14 @@ package rest
 
 import (
 	"context"
+	"maps"
 	"net/http"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -53,14 +56,15 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 	// golinstor as the comma-joined `?resource_definitions=a,b` form.
 	// Without honouring this, `rd l --resource-definitions X` returns
 	// the full RD list and the CLI renders ALL RDs — Bug 61.
-	// Semantics mirror upstream: case-insensitive name match,
+	// Semantics mirror upstream: names match as the store keys them
+	// (naming.Same, case-insensitive inside RFC 1123),
 	// unknown names => empty list (NOT 404); missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_definitions")
 	if len(nameFilter) > 0 {
 		filtered := rds[:0]
 
 		for i := range rds {
-			if matchAnyFold(nameFilter, rds[i].Name) {
+			if matchAnyName(nameFilter, rds[i].Name) {
 				filtered = append(filtered, rds[i])
 			}
 		}
@@ -118,7 +122,7 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal
-	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` annotations
+	// `blockstor.org/*` + `bug<N>.blockstor.org/*` annotations
 	// from every RD before the JSON encode. See
 	// pkg/rest/internal_annotations.go.
 	stripInternalAnnotationsFromRDs(rds)
@@ -316,7 +320,7 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 	// rg-modify validation gate) would reach the store unchecked. Re-validate
 	// the resolved (possibly inherited) stack here, mirroring the create
 	// path's 400, so an unmaterialisable layer chain never persists onto an RD.
-	lsErr := validateLayerStack(rd.LayerStack)
+	lsErr := canonicalizeLayerStack(&rd.LayerStack)
 	if lsErr != nil {
 		writeError(w, http.StatusBadRequest, lsErr.Error())
 
@@ -402,8 +406,8 @@ func (s *Server) refuseRDCreateOnRGDeletedRace(w http.ResponseWriter, r *http.Re
 
 		writeError(w, http.StatusNotFound,
 			"resource group '"+rd.ResourceGroupName+"' was deleted "+
-				"concurrently with the resource-definition create "+
-				"(Bug 174): retry after re-creating the resource group, "+
+				"concurrently with the resource-definition create: "+
+				"retry after re-creating the resource group, "+
 				"or pick a different resource group")
 
 		return false
@@ -426,8 +430,12 @@ func (s *Server) refuseRDCreateOnRGDeletedRace(w http.ResponseWriter, r *http.Re
 // 60-line cap and so each new wire-boundary refusal lives in one
 // canonical spot rather than as another diff inside the parent.
 func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, body *apiv1.ResourceDefinitionCreate, rd *apiv1.ResourceDefinition) bool {
+	if refusePropsModifyOnCreate(w, "resource definition create", body.OverrideProps, body.DeleteProps, body.DeleteNamespace) {
+		return false
+	}
+
 	// Bug 97: refuse whitespace-only / RFC-1123-illegal names at the
-	// REST wire boundary, BEFORE pkg/store/k8s.Name() slugifies +
+	// REST wire boundary, BEFORE pkg/naming.Key() slugifies +
 	// hash-prefixes the input. Without this gate `linstor rd c "  "`
 	// leaked the raw apimachinery "metadata.name: Invalid value:
 	// \"<hex>-\"" error and exposed the internal hash-prefix scheme;
@@ -447,6 +455,21 @@ func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, bo
 	flagErr := validateResourceDefinitionFlags(rd.Flags)
 	if flagErr != nil {
 		writeError(w, http.StatusBadRequest, flagErr.Error())
+
+		return false
+	}
+
+	// The props blockstor reads back to decide what to do with a definition
+	// are refused on modify; a create carrying them would make a definition
+	// born restoring from somebody else's snapshot, or refused by every
+	// resume over a rollback that never ran.
+	if key := store.ServerOwnedPropEdit(rd.Props, nil, nil); key != "" {
+		writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "resource definition '" + rd.Name + "': props carry " + key + ", which blockstor sets itself",
+			Cause:   key + " records what blockstor did to this definition, and is read back to decide what to do next",
+			Correc:  "drop " + key + " from the definition's props",
+		}})
 
 		return false
 	}
@@ -482,34 +505,61 @@ func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, bo
 // caller may proceed, false when the HTTP error has already been
 // written.
 func (s *Server) refuseRDCreateOnUnknownRG(w http.ResponseWriter, r *http.Request, rd *apiv1.ResourceDefinition) bool {
-	if rd.ResourceGroupName == "" {
-		return true
-	}
-
-	// CreateVolume hot path: linstor-csi ensures the StorageClass's RG
-	// (POST /v1/resource-groups) and POSTs the RD referencing it
-	// back-to-back; the local informer cache may not have observed the
-	// RG write yet. Retry the NotFound under the standard budget so
-	// the Bug 134 gate doesn't refuse a perfectly valid create — see
-	// pkg/rest/cache_retry.go. A real typo still 404s after the budget.
-	_, err := getRGWithCacheRetry(r.Context(), s.Store, rd.ResourceGroupName)
-	if err == nil {
-		return true
-	}
-
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound,
-			"resource group '"+rd.ResourceGroupName+
-				"' not found: create the resource group first with "+
-				"`linstor rg c <name>` or pass a valid existing "+
-				"resource group name")
+	found, err := s.lookupPinnedRG(r.Context(), rd.ResourceGroupName)
+	if err != nil {
+		writeStoreError(w, err)
 
 		return false
 	}
 
-	writeStoreError(w, err)
+	if !found {
+		writeError(w, http.StatusNotFound, unknownRGMessage(rd.ResourceGroupName))
 
-	return false
+		return false
+	}
+
+	return true
+}
+
+// lookupPinnedRG resolves a resource group a caller pinned by name. found is
+// false with a nil error when the group simply is not there; a non-nil error
+// is a store failure, which is a different answer and deserves a different
+// response.
+//
+// CreateVolume hot path: linstor-csi ensures the StorageClass's RG (POST
+// /v1/resource-groups) and POSTs the RD referencing it back-to-back; the
+// local informer cache may not have observed the RG write yet. Retrying the
+// NotFound under the standard budget keeps the Bug 134 gate from refusing a
+// perfectly valid create — see pkg/rest/cache_retry.go. A real typo still
+// comes back unknown once the budget is spent.
+//
+// The empty name means the caller pinned no group, which is not an error on
+// any of the endpoints that ask.
+func (s *Server) lookupPinnedRG(ctx context.Context, rgName string) (bool, error) {
+	if rgName == "" {
+		return true, nil
+	}
+
+	_, err := getRGWithCacheRetry(ctx, s.Store, rgName)
+	if err == nil {
+		return true, nil
+	}
+
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+
+	return false, err
+}
+
+// unknownRGMessage is the single wording for a pinned group that is not
+// there, so an operator reads the same correction whichever endpoint refused
+// them for it.
+func unknownRGMessage(rgName string) string {
+	return "resource group '" + rgName +
+		"' not found: create the resource group first with " +
+		"`linstor rg c <name>` or pass a valid existing " +
+		"resource group name"
 }
 
 // refuseRDUpdateOnUnknownRG is Bug 372's gate, the symmetric pair to
@@ -547,7 +597,7 @@ func (s *Server) refuseRDUpdateOnUnknownRG(w http.ResponseWriter, r *http.Reques
 	}
 
 	current, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
-	if getErr == nil && current.ResourceGroupName == rgChange {
+	if getErr == nil && naming.Same(current.ResourceGroupName, rgChange) {
 		return true
 	}
 
@@ -604,17 +654,18 @@ func (s *Server) ensureDefaultRGAssignment(ctx context.Context, rd *apiv1.Resour
 
 // inheritLayerStackFromRG copies the parent RG's SelectFilter.LayerStack
 // onto the RD when the RD itself didn't carry one. Caller-supplied
-// rd.LayerStack wins (explicit > inherited), matching the same precedence
-// rule v1.ResolveLayerStack applies at the dispatch read-side. The result
-// is stamped onto the stored RD so a later `linstor rg modify` that flips
-// the parent's LayerStack does NOT retroactively re-layer existing RDs —
-// "sticky at create time", just like upstream LINSTOR's behaviour.
+// rd.LayerStack wins (explicit > inherited). The result is stamped onto
+// the stored RD so a later `linstor rg modify` that flips the parent's
+// LayerStack does NOT retroactively re-layer existing RDs — "sticky at
+// create time", just like upstream LINSTOR's behaviour. The satellite
+// reads only the stamped value and never resolves through the group.
 //
 // NotFound on the parent RG is swallowed: the lazily-created DfltRscGrp
 // in ensureDefaultRGAssignment may race with this lookup on a sibling
-// apiserver replica, and the default RG carries no SelectFilter anyway,
-// so silently falling through leaves rd.LayerStack empty (= the legacy
-// DRBD+STORAGE default, applied downstream).
+// apiserver replica, and the default RG carries no SelectFilter anyway.
+// An RD left empty here, or created outside REST, is pinned by the
+// controller (ResourceDefinitionReconciler.pinLayerStack) before the
+// satellite builds anything for it.
 func (s *Server) inheritLayerStackFromRG(ctx context.Context, rd *apiv1.ResourceDefinition) error {
 	if len(rd.LayerStack) > 0 {
 		return nil
@@ -678,6 +729,10 @@ func seedAutoQuorumDefaults(rd *apiv1.ResourceDefinition) {
 	}
 }
 
+// layerListField is the wire name of the layer stack, used where the value is
+// reported back to the caller rather than decoded.
+const layerListField = "layer_list"
+
 // mergeRDCreateLayerInputs reconciles the three wire shapes
 // `POST /v1/resource-definitions` accepts for the layer
 // composition:
@@ -709,7 +764,7 @@ func mergeRDCreateLayerInputs(body *apiv1.ResourceDefinitionCreate, rd *apiv1.Re
 	fromLayerData := layerStackFromLayerData(rd.LayerData)
 
 	views := []rdLayerInputView{
-		{label: "layer_list", stack: body.LayerList},
+		{label: layerListField, stack: body.LayerList},
 		{label: "resource_definition.layer_stack", stack: rd.LayerStack},
 		{label: "resource_definition.layer_data", stack: fromLayerData},
 	}
@@ -799,7 +854,7 @@ func (s *Server) validateRDLayerStackOnCreate(ctx context.Context, body *apiv1.R
 		return err
 	}
 
-	err = validateLayerStack(rd.LayerStack)
+	err = canonicalizeLayerStack(&rd.LayerStack)
 	if err != nil {
 		return err
 	}
@@ -840,59 +895,25 @@ func layerStackFromLayerData(data []apiv1.ResourceLayer) []string {
 	return out
 }
 
-// drbdEncryptPassphraseKey is the upstream LINSTOR controller-scope
-// property the operator sets via `linstor controller set-property
-// DrbdOptions/EncryptPassphrase <passphrase>` to seed the cluster's
-// LUKS master key material. Bug 95 requires SOME master passphrase
-// as a hard prerequisite for accepting an RD whose LayerStack
-// carries LUKS — without it, the satellite's `cryptsetup luksFormat`
-// has no key to format the volume with and the layer chain silently
-// fell back to plaintext-on-DRBD before this gate landed.
-//
-// Bug 023: this prop is the LEGACY mechanism — it stores the
-// passphrase in PLAINTEXT on the ControllerConfig CRD. The primary
-// (upstream-parity) mechanism is the encryption Secret stamped by
-// `linstor encryption create-passphrase`; the prop stays accepted
-// for clusters that provisioned before the Secret path existed.
-const drbdEncryptPassphraseKey = passphrase.PropKeyCanonical
-
 // ErrLUKSRequiresPassphrase is the static sentinel surfaced as a 400
 // when an RD-create body asks for a LUKS layer but the cluster has
-// no master passphrase — neither the encryption Secret (primary)
-// nor the legacy `DrbdOptions/EncryptPassphrase` controller prop.
+// no master passphrase in the encryption Secret.
 // Sentinel-shaped to match the layer-validation style; the handler
 // wraps it with the human-readable remediation hint.
 var ErrLUKSRequiresPassphrase = errors.New(
 	"LUKS layer requires the cluster master passphrase to be set first")
 
 // refuseLUKSWithoutPassphrase rejects an RD-create whose LayerStack
-// includes LUKS when the cluster has no master passphrase (Bug 95).
-// Returns nil for the happy path: non-LUKS stack, or LUKS stack with
-// the prerequisite already in place. The caller surfaces the
-// returned error as a 400 so the operator sees the missing
-// prerequisite immediately instead of waiting for replicas to come
-// up plaintext.
-//
-// Two accepted sources, checked in order (Bug 023):
-//
-//  1. The encryption Secret written by `linstor encryption
-//     create-passphrase` (POST /v1/encryption/passphrase) — the
-//     upstream-standard flow and the PRIMARY mechanism. Pre-fix the
-//     gate ignored it entirely, so the documented create-passphrase
-//     → LUKS-RD-create sequence 400'd and the hint told operators
-//     to stamp a PLAINTEXT passphrase into a controller prop.
-//  2. The legacy `DrbdOptions/EncryptPassphrase` controller prop —
-//     deprecated (plaintext on the CRD) but kept for backward
-//     compatibility with clusters provisioned before the Secret
-//     path existed. The satellite-facing dispatch keeps honouring
-//     it with unchanged precedence (props win over the Secret) so
-//     existing LUKS volumes keep unlocking with the same key.
+// includes LUKS when the cluster has no keyring (Bug 95): no replica
+// could get a password, and the operator should see the missing
+// prerequisite at once instead of replicas that never come up. A locked
+// keyring is not refused; replicas wait for it, as they do under
+// LINSTOR.
 //
 // Falls through (nil) when the controller client is unconfigured —
 // the test-only code paths that build a Server without a Client
-// can't read ControllerConfig anyway, and forcing a 400 there would
-// regress every unit-test that creates a LUKS RD against an in-memory
-// store. The k8s-deployed apiserver always has a real client wired.
+// can't read the Secrets anyway. The k8s-deployed apiserver always has
+// a real client wired.
 func (s *Server) refuseLUKSWithoutPassphrase(ctx context.Context, layers []string) error {
 	if !apiv1.LayerInStack(layers, apiv1.LayerKindLUKS) {
 		return nil
@@ -902,30 +923,18 @@ func (s *Server) refuseLUKSWithoutPassphrase(ctx context.Context, layers []strin
 		return nil
 	}
 
-	secretPass, err := s.readPassphrase(ctx)
+	status, err := s.encryptionStatus(ctx)
 	if err != nil {
-		return errors.Wrap(err, "read encryption Secret for LUKS prereq check")
+		return errors.Wrap(err, "read the keyring for the LUKS prerequisite check")
 	}
 
-	if secretPass != "" {
+	if status.State != passphrase.StateUnset {
 		return nil
 	}
 
-	ctrl, err := controllerScopeProps(ctx, s.Client)
-	if err != nil {
-		return errors.Wrap(err, "read controller props for LUKS prereq check")
-	}
-
-	if ctrl[drbdEncryptPassphraseKey] != "" {
-		return nil
-	}
-
-	return errors.Wrapf(ErrLUKSRequiresPassphrase,
-		"run `linstor encryption create-passphrase` "+
-			"before creating a LUKS-layered RD (legacy alternative: "+
-			"`linstor controller set-property %s <passphrase>`, "+
-			"deprecated — stores the passphrase in plaintext)",
-		drbdEncryptPassphraseKey)
+	return errors.Wrap(ErrLUKSRequiresPassphrase,
+		"run `linstor encryption create-passphrase`, or name a passphrase Secret in the ControllerConfig, "+
+			"before creating a LUKS-layered RD")
 }
 
 // resourceDefinitionModifyBody is the shape upstream golinstor sends
@@ -1055,18 +1064,22 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), name, func(rd *apiv1.ResourceDefinition) error {
-		// Corner-case B5 / I1: shared property-modify core — an empty
-		// override value deletes the key (upstream `set-property KEY ""`
-		// = delete-property), matching the RG path and the UG9 NOTE.
-		rd.Props = applyPropsModify(rd.Props, patch.OverrideProps, patch.DeleteProps)
+	if s.refuseOwnedPropEdits(w, r, name, &patch) {
+		return
+	}
 
-		if rgChange != "" {
-			rd.ResourceGroupName = rgChange
-		}
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), name,
+		func(rd *apiv1.ResourceDefinition) error { return applyRDModify(rd, &patch, rgChange) })
+	if errors.Is(err, store.ErrRollbackStepMarkKept) {
+		writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "resource definition '" + name + "': " + store.ErrRollbackStepMarkKept.Error(),
+			Correc:  "delete '" + name + "' by hand",
+		}})
 
-		return nil
-	})
+		return
+	}
+
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -1077,6 +1090,93 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource definition modified: " + name,
 	}})
+}
+
+// refuseOwnedPropEdits answers a modify that edits the props blockstor owns on
+// a definition and reports whether it did.
+func (s *Server) refuseOwnedPropEdits(
+	w http.ResponseWriter, r *http.Request, name string, patch *resourceDefinitionModifyBody,
+) bool {
+	// The props blockstor writes to record what a definition is, and reads
+	// back to decide what to do with it, are not the caller's to edit: a
+	// delete_namespaces of "Blockstor" mid-restore took the adoption mark
+	// with it, and a creator's rollback then reaped a definition a retry had
+	// already answered for. The clone door refuses the same edits.
+	if refuseServerOwnedModify(w, name, patch) {
+		return true
+	}
+
+	if store.DeletesRestoreMarker(patch.OverrideProps, patch.DeleteProps) {
+		err := store.RestoreMarkerClearRefusal(r.Context(), s.Store, name)
+		if errors.Is(err, store.ErrRestoreUnfinished) {
+			writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+				RetCode: apiCallRcError,
+				Message: "resource definition '" + name + "': " + err.Error(),
+				Cause:   store.RestoreFromSnapshotProp + " is what makes the satellite restore a volume from the snapshot",
+				Correc:  "finish the restore, then delete " + store.RestoreFromSnapshotProp,
+			}})
+
+			return true
+		}
+
+		if err != nil {
+			writeStoreError(w, err)
+
+			return true
+		}
+	}
+
+	return false
+}
+
+// refuseServerOwnedModify answers an `rd modify` that would edit a prop
+// blockstor sets itself; see store.ServerOwnedPropEditByOperator. True means
+// the refusal has been written.
+func refuseServerOwnedModify(w http.ResponseWriter, name string, patch *resourceDefinitionModifyBody) bool {
+	key := store.ServerOwnedPropEditByOperator(patch.OverrideProps, patch.DeleteProps, patch.DeleteNamespaces)
+	if key == "" {
+		return false
+	}
+
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: "resource definition '" + name + "': the prop edits would change " + key +
+			", which blockstor sets itself",
+		Cause:  key + " records what blockstor did to this definition, and is read back to decide what to do next",
+		Correc: "drop " + key + " from override_props, delete_props and delete_namespaces",
+	}})
+
+	return true
+}
+
+// applyRDModify applies an `rd modify` body to the definition inside its
+// patch.
+func applyRDModify(rd *apiv1.ResourceDefinition, patch *resourceDefinitionModifyBody, rgChange string) error {
+	// Corner-case B5 / I1: shared property-modify core — an empty
+	// override value deletes the key (upstream `set-property KEY ""`
+	// = delete-property), matching the RG path and the UG9 NOTE.
+	before := maps.Clone(rd.Props)
+
+	rd.Props = applyPropsModify(rd.Props, patch.OverrideProps, patch.DeleteProps)
+
+	// The body declares delete_namespaces, so it is honoured rather than
+	// accepted and dropped: answering 200 for an edit that did not happen
+	// is the reason the clone paths refuse what they cannot honour.
+	deletePropNamespaces(rd.Props, patch.DeleteNamespaces)
+
+	// Judged against the mark the definition holds now, inside the patch:
+	// only a mark over a definition the rollback left whole is the
+	// operator's to clear; see store.RollbackMarkClearRefusal.
+	err := store.RollbackMarkClearRefusal(before, rd.Props)
+	if err != nil {
+		return err //nolint:wrapcheck // answered as a 400 by the caller
+	}
+
+	if rgChange != "" {
+		rd.ResourceGroupName = rgChange
+	}
+
+	return nil
 }
 
 // handleRDDelete drops an RD plus cascades the per-replica teardown.
@@ -1100,21 +1200,16 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// stamps DeletionTimestamp on every replica, a failed RD-delete
 	// leaves the cluster half-torn-down (children gone, parent
 	// kept, snapshots orphaned) which no retry can reconcile.
-	snaps, err := s.Store.Snapshots().ListByDefinition(r.Context(), name)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		writeStoreError(w, err)
-
+	if !s.rdHasNoSnapshots(w, r, name) {
 		return
 	}
 
-	if len(snaps) > 0 {
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | apiCallRcFailExistsSnapshotDfn,
-			Message: "Cannot delete resource definition '" + name + "' because it has snapshots.",
-			ObjRefs: map[string]string{
-				objRefRscDfn: name,
-			},
-		}})
+	// Read before the delete, used after it: the definition's own props
+	// are the only record of the internal snapshot a clone left on its
+	// source.
+	clonedFrom, err := store.OwnedCloneSnapshot(r.Context(), s.Store, name)
+	if err != nil {
+		writeStoreError(w, err)
 
 		return
 	}
@@ -1133,7 +1228,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// DELETE on each. The satellite drives the teardown from
 	// there. Our equivalent is: per-child Resources().Delete()
 	// stamps DeletionTimestamp on the CRD; the satellite's
-	// existing `blockstor.cozystack.io/satellite-resource`
+	// existing `blockstor.org/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
 	err = s.cascadeDeleteResources(r.Context(), name)
@@ -1182,6 +1277,14 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// close: either ordering yields a clean cluster.
 	s.sweepOrphanSnapshotsAfterRDDelete(r.Context(), name)
 
+	// And the internal snapshot the clone of this definition took on its
+	// SOURCE. Nothing else reaps it: the operator-facing snapshot doors
+	// and the auto-snapshot reaper are all driven by a name or a label
+	// this one never carries, so it outlived the target it was taken for
+	// and left the source undeletable through this very handler, which
+	// refuses a definition that has snapshots.
+	reaped := reapClonedSnapshot(r.Context(), s.Store, name, clonedFrom)
+
 	// Bug 124: block the response until the local informer cache has
 	// observed the RD + child Resource deletions. Without this gate,
 	// `linstor rd d <rd>` returns SUCCESS and the very next
@@ -1189,10 +1292,83 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// catches up on its watch stream. See pkg/rest/cache_invalidation.go.
 	s.waitForRDDeletionVisible(r.Context(), name)
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
-	}})
+	}}
+	if reaped != nil {
+		answer = append(answer, *reaped)
+	}
+
+	writeJSON(w, http.StatusOK, answer)
+}
+
+// rdHasNoSnapshots is handleRDDelete's pre-walk: it refuses, and answers
+// false, while any Snapshot still hangs off the definition.
+func (s *Server) rdHasNoSnapshots(w http.ResponseWriter, r *http.Request, name string) bool {
+	// Uncached: a snapshot that raced the delete and has not reached the
+	// informer is exactly the one this refusal exists for.
+	snaps, err := s.Store.Snapshots().ListByDefinitionUncached(r.Context(), name)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if len(snaps) > 0 {
+		refusal := apiv1.APICallRc{
+			RetCode: apiCallRcError | apiCallRcFailExistsSnapshotDfn,
+			Message: "Cannot delete resource definition '" + name + "' because it has snapshots.",
+			ObjRefs: map[string]string{
+				objRefRscDfn: name,
+			},
+		}
+
+		// A snapshot a clone took for itself outlives the clone when its
+		// reap was skipped or failed, and a repeated delete of the clone
+		// cannot re-run it: the clone is already gone. This refusal is the
+		// one place that still sees it, so it names it.
+		left, leftErr := store.CloneSnapshotsLeftBehind(r.Context(), s.Store, snaps)
+		if leftErr != nil {
+			log.FromContext(r.Context()).V(1).Info("could not tell which snapshots clones left behind",
+				"resourceDefinition", name, "error", leftErr.Error())
+		} else if !left.Empty() {
+			refusal.Cause, refusal.Correc = left.Explain(name)
+		}
+
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{refusal})
+
+		return false
+	}
+
+	return true
+}
+
+// reapClonedSnapshot drops the internal snapshot the deleted definition was
+// cloned from, when the clone path stamped it as that definition's own; see
+// store.ReapClonedSnapshot. It runs after the definition is deleted and
+// before the answer goes out, bounded by the reap's own 30s budget.
+//
+// The delete stands whatever the reap does. A snapshot kept because another
+// definition was restored from it, or one whose delete failed, stays visible
+// in `linstor s l`, and the refusal a later delete of the source meets names
+// it; the answer to this delete carries it as a warning, which is returned
+// here, so the operator learns of it now rather than at that refusal.
+func reapClonedSnapshot(ctx context.Context, st store.Store, rdName string, ref store.ClonedSnapshotRef) *apiv1.APICallRc {
+	err := store.ReapClonedSnapshot(ctx, st, ref)
+	if err == nil {
+		return nil
+	}
+
+	log.FromContext(ctx).Info("internal clone snapshot kept",
+		"resourceDefinition", rdName, "source", ref.Source, "snapshot", ref.Snapshot, "reason", err.Error())
+
+	return &apiv1.APICallRc{
+		RetCode: maskWarn,
+		Message: "internal clone snapshot " + ref.Snapshot + " of " + ref.Source + " was kept: " +
+			scrubImplDetails(err.Error()),
+		Correc: "a later delete of " + ref.Source + " names what is still to be done about it",
+	}
 }
 
 // sweepOrphanSnapshotsAfterRDDelete drops any Snapshot rows that
@@ -1213,8 +1389,21 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 // primary": there's no RD to restore (rd-d's success was a deliberate
 // caller intent), so the right action is to mop up the orphan.
 func (s *Server) sweepOrphanSnapshotsAfterRDDelete(ctx context.Context, rdName string) {
-	leftovers, err := s.Store.Snapshots().ListByDefinition(ctx, rdName)
-	if err != nil || len(leftovers) == 0 {
+	leftovers, err := s.Store.Snapshots().ListByDefinitionUncached(ctx, rdName)
+	if err != nil {
+		// The sweep is best-effort, but silence here is not: the read that
+		// failed is the one that finds the orphan, so a transient failure
+		// leaves exactly the row this function exists to clear, and the
+		// operator has already been told the delete succeeded. Whether the
+		// mop-up ran is the one thing that would make them look.
+		log.FromContext(ctx).WithName("rest").
+			Error(err, "orphan-snapshot sweep skipped: a snapshot that raced the delete may survive",
+				"resourceDefinition", rdName)
+
+		return
+	}
+
+	if len(leftovers) == 0 {
 		return
 	}
 

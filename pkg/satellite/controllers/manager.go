@@ -29,9 +29,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/passphrase"
+	"github.com/cozystack/blockstor/pkg/satellite/stream"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // reconcileTriggerBuffer bounds the observer → reconciler trigger
@@ -101,25 +105,17 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	// stuck-state pattern from `memory/blockstor_drbd_stuck_state.md`.
 	gracefulShutdownTimeout := 10 * time.Second
 
-	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
-		Scheme: scheme,
-		// Satellite is per-node; leader election would require
-		// a cluster-wide Lease the satellite has no business
-		// holding. Skip it; the DaemonSet enforces
-		// one-pod-per-node already.
-		LeaderElection: false,
-		// HealthProbeBindAddress wires the manager's /healthz +
-		// /readyz HTTP endpoints. cmd/satellite/main.go sets this
-		// from --health-probe-bind-address so the DaemonSet's
-		// kubelet probes have something to talk to; an empty
-		// string disables the probe server entirely (the
-		// controller-runtime default), which is what tests rely on
-		// to avoid port-binding races between parallel runs.
-		HealthProbeBindAddress:  cfg.HealthProbeBindAddress,
-		GracefulShutdownTimeout: &gracefulShutdownTimeout,
-	})
+	mgr, err := ctrl.NewManager(restCfg, managerOptions(cfg, &gracefulShutdownTimeout))
 	if err != nil {
 		return nil, errors.Wrap(err, "create manager")
+	}
+
+	// Every pass looks up which spellings of its definition the cached
+	// replicas carry (storek8s.ReplicasOf). Without the index that is a
+	// copy of every Resource in the cache, per pass.
+	err = storek8s.RegisterReplicaKeyIndex(mgr.GetFieldIndexer())
+	if err != nil {
+		return nil, errors.Wrap(err, "index cached replicas by definition")
 	}
 
 	// Inject the manager's APIReader so reconcilers can bypass
@@ -128,6 +124,10 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	// left nil — see Config.APIReader.
 	if cfg.APIReader == nil {
 		cfg.APIReader = mgr.GetAPIReader()
+	}
+
+	if cfg.Recorder == nil {
+		cfg.Recorder = mgr.GetEventRecorder("blockstor-satellite")
 	}
 
 	// Phase 11.7: thread the observer-trigger channel through
@@ -139,29 +139,9 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	// the field nil to short-circuit both ends.
 	ensureWiredDefaults(cfg)
 
-	err = (&ResourceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	err = setupReconcilers(mgr, cfg)
 	if err != nil {
-		return nil, errors.Wrap(err, "setup ResourceReconciler")
-	}
-
-	err = (&ResourceDefinitionReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup ResourceDefinitionReconciler")
-	}
-
-	err = (&SnapshotReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup SnapshotReconciler")
-	}
-
-	err = (&StoragePoolReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup StoragePoolReconciler")
-	}
-
-	err = (&PhysicalDeviceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup PhysicalDeviceReconciler")
+		return nil, err
 	}
 
 	err = addBackgroundRunnables(mgr, cfg)
@@ -170,9 +150,41 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	}
 
 	wireCrossNodeFetcher(mgr, cfg)
+	wireLUKSKeys(mgr, cfg)
 	wireConditionStampers(mgr, cfg)
 
 	return mgr, nil
+}
+
+// setupReconcilers registers the satellite's reconcilers on mgr, each
+// with its own copy of cfg. Kept out of NewManager for its funlen budget.
+func setupReconcilers(mgr manager.Manager, cfg *Config) error {
+	err := (&ResourceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup ResourceReconciler")
+	}
+
+	err = (&ResourceDefinitionReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup ResourceDefinitionReconciler")
+	}
+
+	err = (&SnapshotReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup SnapshotReconciler")
+	}
+
+	err = (&StoragePoolReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup StoragePoolReconciler")
+	}
+
+	err = (&PhysicalDeviceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup PhysicalDeviceReconciler")
+	}
+
+	return nil
 }
 
 // validateConfig sanity-checks the NewManager input — keeps the
@@ -230,21 +242,21 @@ func ensureWiredDefaults(cfg *Config) {
 // budget — Scenario 5.34 added the third runnable and the
 // inline chain tipped over the limit.
 func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
-	err := mgr.Add(&ObserverRunnable{
-		Client:   mgr.GetClient(),
-		Exec:     cfg.Exec,
-		NodeName: cfg.NodeName,
-		// Phase 11.7: producer end of the observer-trigger channel.
-		// Fires on kernel-state changes (resource lifecycle, role,
-		// disk, conn, repl) so the ResourceReconciler wakes even
-		// when no apiserver write bumps Generation.
-		ReconcileTrigger: cfg.ReconcileTrigger,
-	})
+	err := mgr.Add(newObserverRunnableFromConfig(mgr.GetClient(), cfg))
 	if err != nil {
 		return errors.Wrap(err, "add ObserverRunnable")
 	}
 
-	err = (&HeartbeatRunnable{Client: mgr.GetClient(), NodeName: cfg.NodeName}).RegisterWithManager(mgr)
+	hbClient, resetHB, err := NewHeartbeatClient(mgr.GetConfig(), mgr.GetScheme(), mgr.GetRESTMapper())
+	if err != nil {
+		return err
+	}
+
+	err = (&HeartbeatRunnable{
+		Client:           hbClient,
+		NodeName:         cfg.NodeName,
+		ResetConnections: resetHB,
+	}).RegisterWithManager(mgr)
 	if err != nil {
 		return errors.Wrap(err, "register HeartbeatRunnable")
 	}
@@ -328,6 +340,23 @@ func wireCrossNodeFetcher(mgr manager.Manager, cfg *Config) {
 	cfg.Apply.SetCrossNodeFetcher(&SnapshotFetcher{
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
+		Stream:   stream.NewClient(cfg.StreamTLS),
+	})
+}
+
+// wireLUKSKeys injects the LUKS key provider into the Apply chain. It reads
+// the replica, the snapshot and the two Secrets past the cache: Secret
+// RBAC is a namespaced get, and a password stored a moment ago must be
+// the one read back.
+func wireLUKSKeys(mgr manager.Manager, cfg *Config) {
+	reader := cfg.APIReader
+
+	cfg.Apply.SetLUKSKeys(&LUKSKeys{
+		Client: mgr.GetClient(),
+		Reader: reader,
+		Unlocker: &passphrase.Unlocker{
+			Secrets: passphrase.Secrets{Reader: reader, Namespace: cfg.Namespace},
+		},
 	})
 }
 
@@ -365,4 +394,30 @@ func wireSkipDiskClearer(mgr manager.Manager, cfg *Config) {
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
 	})
+}
+
+// managerOptions is the satellite manager's configuration.
+func managerOptions(cfg *Config, gracefulShutdownTimeout *time.Duration) ctrl.Options {
+	return ctrl.Options{
+		Scheme: scheme,
+		// Satellite is per-node; leader election would require
+		// a cluster-wide Lease the satellite has no business
+		// holding. Skip it; the DaemonSet enforces
+		// one-pod-per-node already.
+		LeaderElection: false,
+		// HealthProbeBindAddress wires the manager's /healthz +
+		// /readyz HTTP endpoints. cmd/satellite/main.go sets this
+		// from --health-probe-bind-address so the DaemonSet's
+		// kubelet probes have something to talk to; an empty
+		// string disables the probe server entirely (the
+		// controller-runtime default), which is what tests rely on
+		// to avoid port-binding races between parallel runs.
+		HealthProbeBindAddress:  cfg.HealthProbeBindAddress,
+		GracefulShutdownTimeout: gracefulShutdownTimeout,
+		// No metrics listener: nothing scrapes the satellite, and on host
+		// networking controller-runtime's default, every address on
+		// :8080, is a port of the node itself, unauthenticated and free to
+		// collide with anything else the node runs there.
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	}
 }

@@ -2,7 +2,8 @@ name: luks-encrypted-rd
 description: |
   Bug-333 catcher. Exercises an encrypted RD lifecycle:
     1. encryption create-passphrase
-    2. controller set-property DrbdOptions/EncryptPassphrase <pp>
+    2. controller set-property DrbdOptions/EncryptPassphrase <pp> is
+       REFUSED (exit 10) and the prop stays absent
     3. rd create -l drbd,luks,storage
     4. vd create
     5. r create --auto-place=2
@@ -10,14 +11,15 @@ description: |
   Validates that the LUKS layer is included in the actual layer stack
   and snapshot path doesn't crash python-linstor.
 
-  NOTE: a LUKS-layered RD requires BOTH the cluster passphrase
-  (encryption create-passphrase) AND the controller property
-  DrbdOptions/EncryptPassphrase (the LUKS layer reads per-volume key
-  material from it). Without the property the controller correctly
-  rejects rd-create with "LUKS layer requires DrbdOptions/EncryptPassphrase
-  to be set first" (exit 10) -- an INTENTIONAL guard, not a product gap.
-  The green L6 cell tests/e2e/cli-matrix/luks-rd-create-encrypted.sh
-  sets the property the same way; this replay mirrors it.
+  NOTE: the cluster passphrase Secret written by encryption
+  create-passphrase is the only thing a LUKS-layered RD needs, and the
+  only place the master passphrase is read from. The controller
+  property DrbdOptions/EncryptPassphrase is never read; the REST API
+  refuses to store it, since a property sits in plaintext on its CR.
+  This is an intentional divergence from upstream LINSTOR (see
+  docs/cli-parity-known-deltas.md). The L6 cell
+  tests/e2e/cli-matrix/luks-rd-create-encrypted.sh runs the same
+  Secret-only flow.
 
 prerequisites:
   min_nodes: 2
@@ -38,16 +40,17 @@ steps:
     # rest of the workflow, so we accept it.
     cmd: ["encryption", "create-passphrase", "-p", "fuzz-passphrase-do-not-rely-on"]
     expect_exit: [0, 10]
-  - name: set-encrypt-passphrase-property
-    # A LUKS-layered RD additionally requires the controller property
-    # DrbdOptions/EncryptPassphrase; the cluster passphrase alone is not
-    # enough. Without it, rd-create below is correctly rejected with
-    # "LUKS layer requires DrbdOptions/EncryptPassphrase to be set first"
-    # (exit 10). Setting a controller property is idempotent, so this is
-    # safe to re-run on the shared stand. Mirrors the green L6 cell
-    # tests/e2e/cli-matrix/luks-rd-create-encrypted.sh.
-    cmd: ["controller", "set-property", "DrbdOptions/EncryptPassphrase", "fuzz-passphrase-do-not-rely-on"]
-    expect_exit: 0
+  - name: set-encrypt-passphrase-property-refused
+    # The passphrase never goes into a property: the controller answers
+    # 400 and the CLI exits 10; nothing is stored, and the rd-create
+    # below goes through on the Secret alone.
+    cmd: ["controller", "set-property", "DrbdOptions/EncryptPassphrase", "fuzz-passphrase-decoy"]
+    expect_exit: 10
+    await:
+      kind: prop_value
+      obj: controller
+      key: DrbdOptions/EncryptPassphrase
+      timeout_s: 10
   - name: create-rd-luks
     cmd: ["resource-definition", "create", "{{rd}}", "-l", "drbd,luks,storage"]
     expect_exit: 0

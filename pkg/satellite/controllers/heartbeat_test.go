@@ -128,3 +128,39 @@ func TestHeartbeatRunnable_NodeMissing(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 }
+
+// A satellite started under the node's registered spelling, Node-1, stamps
+// the Node the store keeps it under, node-1.
+func TestHeartbeatRunnableStampsTheNodeUnderItsKey(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(&blockstoriov1alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+			Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+		}).
+		WithStatusSubresource(&blockstoriov1alpha1.Node{}).
+		Build()
+
+	hb := &controllers.HeartbeatRunnable{Client: cli, NodeName: "Node-1", Period: 100 * time.Millisecond}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	if err := hb.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var got blockstoriov1alpha1.Node
+	if err := cli.Get(t.Context(), client.ObjectKey{Name: "node-1"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Status.LastHeartbeatTime == nil {
+		t.Error("node-1 was not stamped by a satellite started as Node-1")
+	}
+}

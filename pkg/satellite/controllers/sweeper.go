@@ -22,6 +22,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -32,6 +34,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // SweeperPeriod is the default cadence at which the orphan sweeper
@@ -131,22 +134,33 @@ const SweeperRDGrace = 60 * time.Second
 
 // SweeperSkipAnnotation is the annotation key the sweeper honours
 // on the LOCAL Node CRD (NOT the Resource CRD — orphans by
-// definition have no CRD). Setting it to "true" disables the
-// sweeper on this node entirely, which is the documented escape
-// hatch for the Bug 4 scenario where an operator needs the
+// definition have no CRD). Setting it to "true" (or any spelling
+// strconv.ParseBool reads as true) disables the sweeper on this node
+// entirely; a value it cannot parse stops the sweep too, with an
+// error, since it may be a mistyped opt-out. This is the documented
+// escape hatch for the Bug 4 scenario where an operator needs the
 // kernel-side `drbdsetup down` to NOT run while they are doing
 // manual recovery (e.g. exporting GI / bitmap state out of a
 // "stuck" resource that has no CRD but is intentionally being
 // preserved). Without this opt-out, an operator who deleted the
 // CRD as part of recovery would race the sweeper and lose the
 // kernel-state evidence they wanted to preserve.
-const SweeperSkipAnnotation = "blockstor.io/skip-orphan-sweeper"
+const SweeperSkipAnnotation = "blockstor.org/skip-orphan-sweeper"
 
-// sweeperSkipValue is the annotation value that turns the skip
-// switch on. Kept as a named constant rather than the bare
-// "true" literal so the test fixture and the production guard
-// share one source of truth (goconst).
+// sweeperSkipValue is the canonical annotation value that turns the
+// skip switch on, kept as a named constant for the tests that set it
+// (goconst).
 const sweeperSkipValue = "true"
+
+// errNoStateDir is reported on every cycle of a sweeper that has no
+// StateDir: without it the sweeper has no record of which kernel
+// slots blockstor provisioned, so it cannot tell its own orphan from
+// a live resource another DRBD manager runs on the same node.
+var errNoStateDir = errors.New("StateDir unset: kernel slot ownership unknown, not sweeping")
+
+// errNotPlainName marks a kernel resource name that cannot be joined
+// onto StateDir to find its markers without leaving StateDir.
+var errNotPlainName = errors.New("not a plain file name")
 
 // OrphanSweeperRunnable is a controller-runtime Runnable that
 // periodically reconciles kernel-resident DRBD resources against
@@ -176,12 +190,11 @@ type OrphanSweeperRunnable struct {
 	// in StateDir is treated as foreign and never torn down, even
 	// when no blockstor Resource CRD names it.
 	//
-	// Empty string disables the filter — the sweeper then falls
-	// back to pure CRD-based classification, the pre-Bug-299
-	// behaviour. Production always passes the real on-disk path
-	// from the reconciler's StateDir(); tests typically leave it
-	// empty to keep fixtures simple (foreign-resource coexistence
-	// is exercised by TestSweeperLeavesForeignKernelSlotsAlone).
+	// Empty string leaves the sweeper with no ownership record at
+	// all, so it tears nothing down and reports that on every
+	// cycle. It used to fall back to CRD-only classification, which
+	// downs every kernel slot without a blockstor Resource CRD,
+	// including live resources of a co-resident DRBD manager.
 	StateDir string
 
 	// Period overrides SweeperPeriod (test-only — production uses
@@ -228,6 +241,13 @@ type OrphanSweeperRunnable struct {
 	// that is (or is not) loaded from the stale .res without a real
 	// drbdsetup process. Production callers must leave this nil.
 	isLoadedFn func(ctx context.Context, resource string) (bool, error)
+
+	// lstatFn is a test-only hook for the ownership-marker probe.
+	// Defaults to os.Lstat when unset. Tests use it to simulate
+	// EACCES / EIO on the marker without depending on filesystem
+	// permissions or the uid the suite runs as. Production callers
+	// must leave this nil.
+	lstatFn func(name string) (os.FileInfo, error)
 }
 
 // NeedLeaderElection returns false. Every satellite must run its
@@ -303,14 +323,20 @@ func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logge
 	ctx, cancel := context.WithTimeout(ctx, period)
 	defer cancel()
 
+	if s.StateDir == "" {
+		return errNoStateDir
+	}
+
+	// The opt-out lives on the Node, so a Node we cannot read is an
+	// opt-out we cannot see. Sweeping anyway would tear down exactly
+	// what an operator asked us to keep; the cost of skipping is one
+	// cycle of delay on a genuine orphan.
 	skip, err := s.shouldSkip(ctx)
 	if err != nil {
-		// Read failures on the Node CRD shouldn't block the sweep —
-		// fall back to "not skipped" so a transient apiserver blip
-		// doesn't silently disable the safety net. Log so operators
-		// notice if it's persistent.
-		logger.Error(err, "check skip-sweeper annotation; proceeding without skip")
-	} else if skip {
+		return errors.Wrap(err, "skip-sweeper opt-out unknown; skipping sweep cycle")
+	}
+
+	if skip {
 		logger.V(1).Info("sweep skipped by Node annotation", "annotation", SweeperSkipAnnotation)
 
 		return nil
@@ -326,17 +352,13 @@ func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logge
 		return errors.Wrap(err, "list local Resource CRDs")
 	}
 
+	// Without the RD list the grace window cannot be applied, and
+	// a slot inside it is one the controller is still fanning out
+	// or the satellite is still deleting: not an orphan. Skip the
+	// cycle rather than read "unknown" as "past grace".
 	rdAges, err := s.listResourceDefinitionAges(ctx)
 	if err != nil {
-		// RD-read failures shouldn't abort the sweep — fall back to
-		// "no grace window" so a transient apiserver blip doesn't
-		// silently disable the safety net. The pre-grace behaviour
-		// is the safe-side default: at worst the sweeper tears down
-		// a slot that the reconciler then rebuilds, which is a
-		// recoverable loss.
-		logger.Error(err, "list ResourceDefinitions for grace window; proceeding without grace")
-
-		rdAges = nil
+		return errors.Wrap(err, "list ResourceDefinitions for grace window; skipping sweep cycle")
 	}
 
 	// Kernel-slot teardown first: the classified, rate-limited path
@@ -366,6 +388,24 @@ const (
 	sweepKeep sweepDecision = iota
 	sweepDefer
 	sweepTearDown
+	// sweepUnknown: ownership of the slot could not be established
+	// (marker unreadable, not a regular file, no StateDir). The slot
+	// is left alone and the reason reported.
+	sweepUnknown
+)
+
+// resOwnership is what the StateDir markers say about one kernel slot.
+type resOwnership int
+
+const (
+	// resForeign: neither marker exists, so blockstor never
+	// provisioned the slot.
+	resForeign resOwnership = iota
+	// resOwned: a marker blockstor writes exists as a regular file.
+	resOwned
+	// resUnknown: no marker was found, but at least one could not
+	// be checked, so the slot may be blockstor's or may not.
+	resUnknown
 )
 
 // classifyOrphan decides what to do with one kernel resource: keep
@@ -381,36 +421,47 @@ const (
 // (sweepKeep): blockstor never wrote the file, so the slot belongs
 // to a co-resident DRBD manager (upstream piraeus / linstor-satellite
 // on a coexistence stand) and tearing it down would race that
-// manager's own reconciler. Empty stateDir disables the filter —
-// callers that don't plumb StateDir (the legacy unit-test fixture)
-// keep the pre-fix CRD-only behaviour.
-func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]time.Time, now time.Time, grace time.Duration, stateDir string) (sweepDecision, time.Duration) {
-	if _, ok := owned[rsc]; ok {
-		return sweepKeep, 0
+// manager's own reconciler. A slot whose markers cannot be checked,
+// or an empty stateDir, yields sweepUnknown together with the reason:
+// only positive proof of ownership lets a slot be torn down.
+func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]time.Time, now time.Time, grace time.Duration, stateDir string, lstat func(string) (os.FileInfo, error)) (sweepDecision, time.Duration, error) {
+	if _, ok := owned[naming.Key(rsc)]; ok {
+		return sweepKeep, 0, nil
 	}
 
-	if stateDir != "" && !blockstorOwnsResFile(stateDir, rsc) {
-		return sweepKeep, 0
+	if stateDir == "" {
+		return sweepUnknown, 0, errNoStateDir
+	}
+
+	ownership, err := resFileOwnership(lstat, stateDir, rsc)
+
+	switch ownership {
+	case resForeign:
+		return sweepKeep, 0, nil
+	case resUnknown:
+		return sweepUnknown, 0, err
+	case resOwned:
+		// blockstor provisioned it: fall through to the grace check.
 	}
 
 	if grace <= 0 {
-		return sweepTearDown, 0
+		return sweepTearDown, 0, nil
 	}
 
-	anchor, ok := rdAges[rsc]
+	anchor, ok := rdAges[naming.Key(rsc)]
 	if !ok {
-		return sweepTearDown, 0
+		return sweepTearDown, 0, nil
 	}
 
 	age := now.Sub(anchor)
 	if age < grace {
-		return sweepDefer, age
+		return sweepDefer, age, nil
 	}
 
-	return sweepTearDown, age
+	return sweepTearDown, age, nil
 }
 
-// blockstorOwnsResFile reports whether blockstor previously
+// resFileOwnership reports whether blockstor previously
 // provisioned a kernel slot for `rsc`, by checking for either of two
 // ownership markers in stateDir:
 //
@@ -435,28 +486,48 @@ func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]tim
 // (Bug 299) is preserved: a kernel slot with NEITHER `.res` NOR
 // `.owned` is still left alone.
 //
-// Errors other than fs.ErrNotExist (permission denied, fs full,
-// transient I/O) on the first probe are conservatively treated as
-// "owned" — the sweeper then falls through to the CRD-based
-// classification and at worst tears down a slot the reconciler
-// immediately rebuilds, which is recoverable. Treating them as
-// "foreign" would mask real bugs by silently disabling the safety net.
-func blockstorOwnsResFile(stateDir, rsc string) bool {
-	for _, suffix := range []string{".res", ".owned"} {
-		_, err := os.Stat(filepath.Join(stateDir, rsc+suffix))
-		if err == nil {
-			return true
-		}
+// Only a marker that exists as a regular file counts: blockstor writes
+// both with os.WriteFile, so a symlink, a directory or any other kind
+// of entry under that name was put there by something else. A probe
+// that fails with anything but fs.ErrNotExist (EACCES, EIO, ...), a
+// marker of the wrong kind, or a kernel name that is not a plain file
+// name yields resUnknown with the reason. The tear-down it would
+// allow is not recoverable when the slot belongs to another manager,
+// so not knowing is never read as "owned".
+func resFileOwnership(lstat func(string) (os.FileInfo, error), stateDir, rsc string) (resOwnership, error) {
+	if rsc == "" || rsc == "." || rsc == ".." || strings.ContainsAny(rsc, `/\`) {
+		return resUnknown, errors.Wrapf(errNotPlainName, "kernel resource name %q", rsc)
+	}
 
-		if !errors.Is(err, os.ErrNotExist) {
-			// Non-ENOENT (EACCES, ENOSPC, EIO) — conservatively
-			// treat as owned to keep the safety net live. See
-			// function doc.
-			return true
+	if lstat == nil {
+		lstat = os.Lstat
+	}
+
+	var unknown error
+
+	for _, suffix := range []string{".res", ".owned"} {
+		path := filepath.Join(stateDir, rsc+suffix)
+
+		info, err := lstat(path)
+
+		switch {
+		case err == nil && info.Mode().IsRegular():
+			return resOwned, nil
+		case err == nil:
+			unknown = errors.CombineErrors(unknown,
+				errors.Newf("ownership marker %s is not a regular file (mode %s)", path, info.Mode()))
+		case errors.Is(err, os.ErrNotExist):
+			// This marker is absent; the other may still be there.
+		default:
+			unknown = errors.CombineErrors(unknown, errors.Wrapf(err, "probe ownership marker %s", path))
 		}
 	}
 
-	return false
+	if unknown != nil {
+		return resUnknown, errors.Wrapf(unknown, "ownership of %s", rsc)
+	}
+
+	return resForeign, nil
 }
 
 // tearDownOrphans iterates the kernel-resource list and applies the
@@ -483,10 +554,15 @@ func (s *OrphanSweeperRunnable) tearDownOrphans(ctx context.Context, logger logr
 	var torn int
 
 	for _, rsc := range kernel {
-		decision, age := classifyOrphan(rsc, owned, rdAges, now, grace, s.StateDir)
+		decision, age, reason := classifyOrphan(rsc, owned, rdAges, now, grace, s.StateDir, s.lstatFn)
 
 		switch decision {
 		case sweepKeep:
+			continue
+		case sweepUnknown:
+			logger.Error(reason, "ownership of kernel slot unknown; leaving it alone",
+				"resource", rsc)
+
 			continue
 		case sweepDefer:
 			logger.V(1).Info("orphan candidate within RD grace window; deferring",
@@ -564,24 +640,30 @@ func (s *OrphanSweeperRunnable) callSetupDown(ctx context.Context, resource stri
 }
 
 // shouldSkip checks the local Node CRD for the SweeperSkipAnnotation.
-// Returns false if the Node CRD is missing (operator hasn't bootstrapped
-// it yet) — we sweep by default on unconfigured nodes too, since
-// an unbootstrapped node with kernel-resident DRBD resources is
-// itself a bug-state we want cleaned up.
+// Any failure to read the Node, NotFound included, is returned as an
+// error and the caller skips the cycle: the annotation is the only
+// way an operator can stop the sweeper, and a Node we cannot read may
+// carry it. An annotation value strconv.ParseBool cannot read is an
+// error for the same reason; one it reads as true skips the sweep.
 func (s *OrphanSweeperRunnable) shouldSkip(ctx context.Context) (bool, error) {
 	var node blockstoriov1alpha1.Node
 
-	err := s.Client.Get(ctx, client.ObjectKey{Name: s.NodeName}, &node)
+	err := s.Client.Get(ctx, client.ObjectKey{Name: naming.Key(s.NodeName)}, &node)
 	if err != nil {
 		return false, errors.Wrap(err, "get Node")
 	}
 
-	v, ok := node.Annotations[SweeperSkipAnnotation]
+	value, ok := node.Annotations[SweeperSkipAnnotation]
 	if !ok {
 		return false, nil
 	}
 
-	return v == sweeperSkipValue, nil
+	skip, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, errors.Wrapf(err, "parse annotation %s=%q", SweeperSkipAnnotation, value)
+	}
+
+	return skip, nil
 }
 
 // listOwnedResourceNames returns the set of ResourceDefinition
@@ -601,11 +683,11 @@ func (s *OrphanSweeperRunnable) listOwnedResourceNames(ctx context.Context) (map
 
 	for i := range list.Items {
 		r := &list.Items[i]
-		if r.Spec.NodeName != s.NodeName {
+		if !naming.Same(r.Spec.NodeName, s.NodeName) {
 			continue
 		}
 
-		out[r.Spec.ResourceDefinitionName] = struct{}{}
+		out[naming.Key(r.Spec.ResourceDefinitionName)] = struct{}{}
 	}
 
 	return out, nil
@@ -644,7 +726,7 @@ func (s *OrphanSweeperRunnable) listResourceDefinitionAges(ctx context.Context) 
 			anchor = rd.DeletionTimestamp.Time
 		}
 
-		out[rd.Name] = anchor
+		out[naming.Key(rd.Name)] = anchor
 	}
 
 	return out, nil

@@ -30,6 +30,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // MetadataCreatedBackfillRunnable closes the Phase 11.3 Stage 1
@@ -140,7 +141,7 @@ func (b *MetadataCreatedBackfillRunnable) RegisterWithManager(mgr manager.Manage
 // (caller bumps the counter). Pulled out so Start stays under the
 // funlen budget.
 func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) bool {
-	if res.Spec.NodeName != b.NodeName {
+	if !naming.Same(res.Spec.NodeName, b.NodeName) {
 		return false
 	}
 
@@ -163,7 +164,9 @@ func (b *MetadataCreatedBackfillRunnable) backfillOne(ctx context.Context, res *
 		return false
 	}
 
-	stampErr := b.Stamper.StampMetadataCreated(ctx, res.Name)
+	// The backfill only probes: dump-md found the metadata, nothing
+	// here created it.
+	stampErr := b.Stamper.stampOn(ctx, res.Name, metadataCreatedFound())
 	if stampErr != nil {
 		logger.Info("stamp MetadataCreated (best-effort)", "err", stampErr.Error())
 

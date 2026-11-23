@@ -153,7 +153,7 @@ done
 
 echo ">> [331.B] 2 diskful + 1 explicit Diskless shape"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD_DISKLESS}}
 spec:
@@ -162,7 +162,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD_DISKLESS}.${N1}}
 spec:
@@ -170,7 +170,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD_DISKLESS}.${N2}}
 spec:
@@ -178,7 +178,7 @@ spec:
   nodeName: ${N2}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD_DISKLESS}.${N3}}
 spec:
@@ -227,7 +227,7 @@ deadline=$(( $(date +%s) + 60 ))
 tb_node=""
 while (( $(date +%s) < deadline )); do
     for n in "$N1" "$N2" "$N3"; do
-        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD_TB}.${n}" \
+        flags=$(kubectl get "resources.blockstor.org/${RD_TB}.${n}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" == *"TIE_BREAKER"* ]]; then
             tb_node=$n
@@ -239,7 +239,7 @@ done
 
 if [[ -z "$tb_node" ]]; then
     echo "FAIL (331.C): auto-tiebreaker never created within 60s" >&2
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="$RD_TB." '$1 ~ "^"rd' >&2
     exit 1
 fi
@@ -261,22 +261,17 @@ wait_conns_ok "$RD_TB" "$tb_node" "$N2" 60
 # ----------------------------------------------------------------------
 # Sub-test D — SyncTarget / SyncSource render shape (known-delta #85)
 #
-# A replica actively receiving data renders `SyncTarget(NN%)` and the
-# source `SyncSource(NN%)` while there is still data to copy — the
-# percent gives the operator resync progress (Bug 348 / Bug B).
+# A replica actively receiving data renders `SyncTarget(NN.NN%)`, the
+# percent being DRBD's per-peer `done` for that resync, as LINSTOR
+# shows it (Bug B). Without a `done` it keeps its disk state
+# (Inconsistent), as LINSTOR's DrbdVolume.diskStateInfo does.
 #
-# KNOWN DELTA (docs/cli-parity-known-deltas.md row 85): when the
-# per-volume OutOfSyncKib is <= 0 (or the VD size is unknown), BS
-# DELIBERATELY renders the BARE literal `SyncSource` / `SyncTarget`
-# with NO `(NN%)` suffix — `withSyncPercent` short-circuits on
-# OutOfSyncKib<=0 rather than emit a misleading `(0%)`/`(100%)`
-# (pkg/rest/resources.go: annotateSyncProgress → withSyncPercent).
-# This window is real: drbd briefly reports the SyncSource/SyncTarget
-# replication-state literal before/after the peer-device OutOfSyncKib
-# counter has a non-zero value to decorate with. A bare Sync* literal
-# is therefore the INTENDED BS shape, not a regression — so this cell
-# asserts the BS contract: a Sync* token may appear EITHER bare OR
-# with a `(NN%)` suffix, and never as the old stuck `UpToDate(NN%)`.
+# KNOWN DELTA (docs/cli-parity-known-deltas.md row 85): the source
+# side renders the BARE literal `SyncSource` where LINSTOR keeps
+# `UpToDate` (Bug 348). It never carries a percent, as LINSTOR puts
+# none on the source side. So this cell asserts: SyncTarget only with
+# a `(NN.NN%)` suffix, SyncSource only bare, and never the old stuck
+# `UpToDate(NN%)`.
 #
 # We dirty the bitmap (write data on the primary), then add a second
 # diskful replica so its initial resync is a real non-instant
@@ -284,7 +279,7 @@ wait_conns_ok "$RD_TB" "$tb_node" "$N2" 60
 # is best-effort (the sync can finish fast on a small stand).
 # ----------------------------------------------------------------------
 
-echo ">> [331.D / delta #85] SyncTarget/SyncSource render (bare OR (NN%), never UpToDate(NN%))"
+echo ">> [331.D / delta #85] SyncTarget(NN.NN%) / bare SyncSource render, never UpToDate(NN%)"
 
 RD_SYNC=cli-matrix-348-syncpct
 delete_rd "$RD_SYNC" 2>/dev/null || true
@@ -319,19 +314,23 @@ while (( $(date +%s) < deadline )); do
     # The REGRESSION is the legacy stuck `UpToDate(NN%)` shape — a
     # terminal disk_state must never carry a sync-progress suffix
     # (Bug A). Fail immediately if we ever see one.
-    if grep -qE '^UpToDate\([0-9]+%\)$' <<<"$state"; then
+    if grep -qE '^UpToDate\([0-9]+(\.[0-9]+)?%\)$' <<<"$state"; then
         echo "FAIL (331.D / delta #85): terminal UpToDate carries a (NN%) suffix — Bug A regression:" >&2
         echo "$state" >&2
         exit 1
     fi
 
-    # A Sync* token is the contract — accept it BOTH bare (delta #85:
-    # OutOfSyncKib<=0, withSyncPercent short-circuits) AND with a
-    # (NN%) suffix (OutOfSyncKib>0). Either shape proves the resync
-    # window rendered correctly.
-    if grep -qE '^(SyncTarget|SyncSource)(\([0-9]+%\))?$' <<<"$state"; then
+    # SyncSource with a percent or a bare SyncTarget is not a shape
+    # LINSTOR or delta #85 allows.
+    if grep -qE '^(SyncSource\(.*|SyncTarget)$' <<<"$state"; then
+        echo "FAIL (331.D / delta #85): Sync* literal in a shape LINSTOR never shows:" >&2
+        echo "$state" >&2
+        exit 1
+    fi
+
+    if grep -qE '^(SyncTarget\([0-9]+\.[0-9]{2}%\)|SyncSource)$' <<<"$state"; then
         sync_observed=1
-        echo "   observed Sync* literal (bare or with progress): $(grep -E '^(SyncTarget|SyncSource)' <<<"$state" | head -1)"
+        echo "   observed Sync* render: $(grep -E '^(SyncTarget|SyncSource)' <<<"$state" | head -1)"
         break
     fi
 
@@ -350,4 +349,4 @@ fi
 delete_rd "$RD_SYNC" 2>/dev/null || true
 assert_no_orphans "$RD_SYNC" 2>/dev/null || true
 
-echo ">> r-l-conns-shapes OK (Bug 331: Healthy / Diskless / TieBreaker; Bug 348/A/B: UpToDate bare, Sync* carries (NN%))"
+echo ">> r-l-conns-shapes OK (Bug 331: Healthy / Diskless / TieBreaker; Bug 348/A/B: UpToDate bare, SyncTarget carries (NN.NN%), SyncSource bare)"

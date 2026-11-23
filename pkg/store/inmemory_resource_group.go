@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 type inMemoryResourceGroups struct {
@@ -51,7 +52,7 @@ func (s *inMemoryResourceGroups) Get(_ context.Context, name string) (apiv1.Reso
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rg, ok := s.m[name]
+	rg, ok := s.m[naming.Key(name)]
 	if !ok {
 		return apiv1.ResourceGroup{}, errors.Wrapf(ErrNotFound, "resource group %q", name)
 	}
@@ -67,11 +68,11 @@ func (s *inMemoryResourceGroups) Create(_ context.Context, rg *apiv1.ResourceGro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[rg.Name]; exists {
+	if _, exists := s.m[naming.Key(rg.Name)]; exists {
 		return errors.Wrapf(ErrAlreadyExists, "resource group %q", rg.Name)
 	}
 
-	s.m[rg.Name] = *rg
+	s.m[naming.Key(rg.Name)] = *rg
 
 	return nil
 }
@@ -84,7 +85,7 @@ func (s *inMemoryResourceGroups) Update(_ context.Context, rg *apiv1.ResourceGro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	prev, exists := s.m[rg.Name]
+	prev, exists := s.m[naming.Key(rg.Name)]
 	if !exists {
 		return errors.Wrapf(ErrNotFound, "resource group %q", rg.Name)
 	}
@@ -93,7 +94,7 @@ func (s *inMemoryResourceGroups) Update(_ context.Context, rg *apiv1.ResourceGro
 	// Bug-021: nil wire annotations = "untouched"; empty = "clear".
 	// Mirrors the k8s store's mergeUserAnnotationsInto contract.
 	next.Annotations = carryAnnotationsOnNil(next.Annotations, prev.Annotations)
-	s.m[rg.Name] = next
+	s.m[naming.Key(rg.Name)] = next
 
 	return nil
 }
@@ -110,7 +111,7 @@ func (s *inMemoryResourceGroups) PatchResourceGroup(_ context.Context, name stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rg, ok := s.m[name]
+	rg, ok := s.m[naming.Key(name)]
 	if !ok {
 		return errors.Wrapf(ErrNotFound, "resource group %q", name)
 	}
@@ -130,7 +131,7 @@ func (s *inMemoryResourceGroups) PatchResourceGroup(_ context.Context, name stri
 	// Bug-021: same annotation contract as Update — a closure that
 	// nils the map means "untouched", not "clear".
 	working.Annotations = carryAnnotationsOnNil(working.Annotations, prevAnnotations)
-	s.m[name] = working
+	s.m[naming.Key(name)] = working
 
 	return nil
 }
@@ -139,11 +140,11 @@ func (s *inMemoryResourceGroups) Delete(_ context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[name]; !exists {
+	if _, exists := s.m[naming.Key(name)]; !exists {
 		return errors.Wrapf(ErrNotFound, "resource group %q", name)
 	}
 
-	delete(s.m, name)
+	delete(s.m, naming.Key(name))
 
 	return nil
 }

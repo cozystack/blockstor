@@ -40,7 +40,7 @@ type PhysicalDevice struct {
 	Name string `json:"name"`
 
 	// NodeName is the satellite that owns this device. Mirrors
-	// the CRD's `metadata.labels["blockstor.io/node"]` for fast
+	// the CRD's `metadata.labels["blockstor.org/node"]` for fast
 	// per-node listing.
 	NodeName string `json:"node_name"`
 

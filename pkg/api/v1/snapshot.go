@@ -23,7 +23,7 @@ package v1
 //
 // Phase 10.4: `Annotations` carries the K8s-native
 // metadata.annotations of the underlying CRD. Used by the REST
-// KV-store rewrite to surface `blockstor.io/csi-shipping-data`
+// KV-store rewrite to surface `blockstor.org/csi-shipping-data`
 // (linstor-csi-snapshot-shipper per-snapshot bookkeeping)
 // without going through the deprecated KVEntry CRD. Not part of
 // upstream LINSTOR's wire shape — golinstor ignores unknown JSON
@@ -68,6 +68,19 @@ type Snapshot struct {
 	// (Bug 046 / Bug-353 atomicity fix). Like GroupID it is an internal
 	// coordination field that never reaches the upstream LINSTOR wire.
 	GroupSize int32 `json:"group_size,omitempty"`
+
+	// DeleteFailures carries the per-node errors the satellites hit
+	// deleting their copies of a deleting snapshot, so the delete call
+	// can answer with them. Internal: LINSTOR has no such field and
+	// reports the error only in the answer to the delete.
+	DeleteFailures []SnapshotDeleteFailure `json:"-"`
+}
+
+// SnapshotDeleteFailure is the error one node hit deleting its copy
+// of a snapshot.
+type SnapshotDeleteFailure struct {
+	NodeName string
+	Message  string
 }
 
 // SnapshotVolumeDef is one volume slot inside a Snapshot. F20:
@@ -95,6 +108,11 @@ type SnapshotPerNode struct {
 	Flags           []string         `json:"flags,omitempty"`
 	SnapshotVolumes []SnapshotVolume `json:"snapshot_volumes,omitempty"`
 	UUID            string           `json:"uuid,omitempty"`
+
+	// StoragePool is the pool holding this node's copy, as the satellite
+	// recorded it. A restore places its replica there. Not part of the
+	// LINSTOR wire shape, which keeps the pool off the snapshot view.
+	StoragePool string `json:"-"`
 }
 
 // SnapshotVolume is one per-node, per-volume slot inside a
@@ -129,4 +147,7 @@ const (
 	SnapshotFlagFailedDeployment = "FAILED_DEPLOYMENT"
 	SnapshotFlagFailedDisconnect = "FAILED_DISCONNECT"
 	SnapshotFlagSuccessful       = "SUCCESSFUL"
+	// SnapshotFlagDelete marks a snapshot whose delete was issued and has
+	// not finished: a finalizer still holds it.
+	SnapshotFlagDelete = "DELETE"
 )

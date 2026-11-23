@@ -56,10 +56,10 @@ import (
 	"net/http"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
 // seedBug172Passphrase POSTs a known seed passphrase to the
@@ -78,41 +78,24 @@ func seedBug172Passphrase(t *testing.T, base string, cli client.Client, seed str
 		t.Fatalf("seed create: got %d, want 201", resp.StatusCode)
 	}
 
-	var sec corev1.Secret
-
-	err := cli.Get(context.Background(), client.ObjectKey{
-		Namespace: passphraseSecretTestNamespace,
-		Name:      defaultPassphraseSecretName,
-	}, &sec)
-	if err != nil {
-		t.Fatalf("seed Secret missing: %v", err)
-	}
-
-	if got := string(sec.Data[passphraseSecretKey]); got != seed {
-		t.Fatalf("seed Secret data: got %q, want %q", got, seed)
-	}
+	assertBug172SecretIntact(t, cli, seed)
 }
 
-// assertBug172SecretIntact reads the passphrase Secret and fails if
-// it doesn't still hold `want`. The whole point of Bug 172's
+// assertBug172SecretIntact fails unless the keyring still opens with
+// `want`. The whole point of Bug 172's
 // regression guards is to prove a PUT didn't silently rotate the
 // Secret to an empty/garbage value, so the assertion runs after every
 // rejection case.
 func assertBug172SecretIntact(t *testing.T, cli client.Client, want string) {
 	t.Helper()
 
-	var sec corev1.Secret
-
-	err := cli.Get(context.Background(), client.ObjectKey{
-		Namespace: passphraseSecretTestNamespace,
-		Name:      defaultPassphraseSecretName,
-	}, &sec)
-	if err != nil {
-		t.Fatalf("Secret missing after rejected PUT: %v", err)
+	ring, _, err := passphrase.Secrets{Reader: cli, Namespace: passphraseSecretTestNamespace}.Keyring(context.Background())
+	if err != nil || ring == nil {
+		t.Fatalf("keyring missing after the PUT: %v", err)
 	}
 
-	if got := string(sec.Data[passphraseSecretKey]); got != want {
-		t.Fatalf("Secret data after rejected PUT: got %q, want %q (Bug 172 — silent erase regression)", got, want)
+	if _, err := ring.Opens([]byte(want)); err != nil {
+		t.Fatalf("the keyring no longer opens with %q (Bug 172 — silent erase regression): %v", want, err)
 	}
 }
 

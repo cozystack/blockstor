@@ -20,8 +20,9 @@ limitations under the License.
 // visible when it is ignored — and must NOT wedge the volume.
 //
 // The field is declared in api/v1alpha1/drbd_options.go and nothing
-// reads it, so an RD that sets it is encrypted with the CLUSTER key
-// while the operator holds a Secret that opens nothing.
+// reads it, so an RD that sets it gets per-replica passwords wrapped
+// under the CLUSTER master key while the operator holds a Secret that
+// opens nothing.
 //
 // An earlier revision failed the apply. Review caught two problems
 // with that: it wedges RDs which reconcile correctly today (the field
@@ -94,17 +95,13 @@ func TestPerRDPassphraseSecretRefIsSurfacedNotRefused(t *testing.T) {
 
 	rd := withPerRDKey(luksRD(), "tenant-owned-key")
 	res := perRDKeyResource(rd.Name)
-	r := newPassphraseTestReconciler(t, passphraseSecret("cluster-master"), rd, res)
+	r := newPassphraseTestReconciler(t, rd, res)
 
-	desired, err := r.buildDesiredFromCRD(t.Context(), res, rd, nil)
+	// It still provisions, on the cluster's keys: that is the whole
+	// point of not refusing.
+	_, err := r.buildDesiredFromCRD(t.Context(), res, rd, nil)
 	if err != nil {
 		t.Fatalf("apply must NOT be wedged by an unimplemented per-RD key: %v", err)
-	}
-
-	// It still provisions, on the cluster key — that is the whole
-	// point of not refusing.
-	if got := desired.GetProps()["LuksPassphrase"]; got != "cluster-master" {
-		t.Errorf("LuksPassphrase wire prop: got %q, want the cluster passphrase", got)
 	}
 
 	cond := readKeyIgnoredCondition(t, r, res.Name)
@@ -133,7 +130,7 @@ func TestPerRDPassphraseConditionClearsWhenRefRemoved(t *testing.T) {
 
 	rd := withPerRDKey(luksRD(), "tenant-owned-key")
 	res := perRDKeyResource(rd.Name)
-	r := newPassphraseTestReconciler(t, passphraseSecret("cluster-master"), rd, res)
+	r := newPassphraseTestReconciler(t, rd, res)
 
 	_, err := r.buildDesiredFromCRD(t.Context(), res, rd, nil)
 	if err != nil {
@@ -178,15 +175,11 @@ func TestLUKSRDWithoutPerRDKeyStampsNothing(t *testing.T) {
 
 	rd := luksRD()
 	res := perRDKeyResource(rd.Name)
-	r := newPassphraseTestReconciler(t, passphraseSecret("cluster-master"), rd, res)
+	r := newPassphraseTestReconciler(t, rd, res)
 
-	desired, err := r.buildDesiredFromCRD(t.Context(), res, rd, nil)
+	_, err := r.buildDesiredFromCRD(t.Context(), res, rd, nil)
 	if err != nil {
-		t.Fatalf("LUKS RD on the cluster passphrase must build: %v", err)
-	}
-
-	if got := desired.GetProps()["LuksPassphrase"]; got != "cluster-master" {
-		t.Errorf("LuksPassphrase wire prop: got %q, want the cluster passphrase", got)
+		t.Fatalf("LUKS RD without a per-RD key must build: %v", err)
 	}
 
 	if cond := readKeyIgnoredCondition(t, r, res.Name); cond != nil {
@@ -204,7 +197,7 @@ func TestPerRDPassphraseIgnoredWithoutLUKS(t *testing.T) {
 	rd.Spec.LayerStack = []string{"DRBD", "STORAGE"}
 	rd = withPerRDKey(rd, "tenant-owned-key")
 	res := perRDKeyResource(rd.Name)
-	r := newPassphraseTestReconciler(t, passphraseSecret("cluster-master"), rd, res)
+	r := newPassphraseTestReconciler(t, rd, res)
 
 	_, err := r.buildDesiredFromCRD(t.Context(), res, rd, nil)
 	if err != nil {
@@ -224,7 +217,7 @@ func TestPerRDPassphraseEmptySecretNameStampsNothing(t *testing.T) {
 
 	rd := withPerRDKey(luksRD(), "")
 	res := perRDKeyResource(rd.Name)
-	r := newPassphraseTestReconciler(t, passphraseSecret("cluster-master"), rd, res)
+	r := newPassphraseTestReconciler(t, rd, res)
 
 	_, err := r.buildDesiredFromCRD(t.Context(), res, rd, nil)
 	if err != nil {

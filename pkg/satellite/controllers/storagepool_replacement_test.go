@@ -115,7 +115,7 @@ const (
 // private and pulling it in via a helper export would widen the
 // public API just for this test.
 const drvReplacementLvsCmd = "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } " +
-	"--noheadings --separator | -o lv_size,data_percent --units k --nosuffix " +
+	"--noheadings --separator | -o lv_size,data_percent,lv_attr --units k --nosuffix " +
 	drvReplacementVG + "/" + drvReplacementThin
 
 func newDrvReplacementPool() *blockstoriov1alpha1.StoragePool {
@@ -159,12 +159,12 @@ func reconcileDrvReplacement(t *testing.T, cli client.Client, fx *storage.FakeEx
 }
 
 // expectLvsOutput stubs the LVM thin pool's `lvs` invocation to
-// return a synthetic size + 0% used line. The reconciler's
+// return a synthetic size + 0% used line for an active pool. The reconciler's
 // `writeCapacity` therefore observes `TotalCapacityKib==sizeKib`
 // and `FreeCapacityKib==sizeKib`.
 func expectLvsOutput(fx *storage.FakeExec, sizeKib int64) {
 	fx.Expect(drvReplacementLvsCmd, storage.FakeResponse{
-		Stdout: []byte(fmt.Sprintf("%d.00|0.00\n", sizeKib)),
+		Stdout: []byte(fmt.Sprintf("%d.00|0.00|twi-aotz--\n", sizeKib)),
 	})
 }
 

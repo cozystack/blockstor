@@ -20,13 +20,16 @@ package rest
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
 // registerResources wires the /v1/view/resources aggregate. linstor-csi
@@ -50,7 +53,8 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	// `multiValueQuery` accepts both, so `linstor r l -r foo -n bar`
 	// and linstor-csi's existing requests land in the same filter.
 	// Java LINSTOR honours both as case-insensitive set-membership; we
-	// match that so linstor-csi's "is this resource on this node?"
+	// match names as the store keys them (naming.Same), which is that for
+	// every name inside RFC 1123, so linstor-csi's "is this resource on this node?"
 	// poll returns a non-empty list when the answer is yes.
 	nodeFilter := multiValueQuery(r, "nodes")
 	rdFilter := multiValueQuery(r, "resources")
@@ -69,19 +73,19 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	vdSizes := vdSizeIndex(r.Context(), s, resList)
 
 	for i := range resList {
-		if !matchAnyFold(nodeFilter, resList[i].NodeName) {
+		if !matchAnyName(nodeFilter, resList[i].NodeName) {
 			continue
 		}
 
-		if !matchAnyFold(rdFilter, resList[i].Name) {
+		if !matchAnyName(rdFilter, resList[i].Name) {
 			continue
 		}
 
-		if faultyOnly && !rdStats[resList[i].Name].faulty {
+		if faultyOnly && !rdStats[naming.Key(resList[i].Name)].faulty {
 			continue
 		}
 
-		rwv, buildErr := s.buildResourceView(r.Context(), &resList[i], vdSizes[resList[i].Name])
+		rwv, buildErr := s.buildResourceView(r.Context(), &resList[i], vdSizes[naming.Key(resList[i].Name)])
 		if buildErr != nil {
 			writeError(w, http.StatusInternalServerError, buildErr.Error())
 
@@ -112,7 +116,7 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Bug-hunt v0.1.3 Finding 2: scrub controller-internal
-	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` annotations
+	// `blockstor.org/*` + `bug<N>.blockstor.org/*` annotations
 	// from every entry before the JSON encode. The reconcilers stamp
 	// these onto the in-process Resource for their own bookkeeping
 	// (peer-changed timestamps, resize-pending size deltas, ...); the
@@ -130,9 +134,9 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 // hierarchy returns a usable response.
 //
 // Scenario 6.W13: a LUKS-stack replica also gets `state.suspended`
-// stamped here — true while the controller is locked (master
-// passphrase not yet entered in this process), false once unlocked.
-// stampSuspendedOnLUKS centralises the layer-walk + flag-read.
+// stamped here — true while the master key is locked, false once the
+// passphrase Secret opens it. stampSuspendedOnLUKS centralises the
+// layer-walk + state read.
 //
 // Bug 95: the resolved parent RD's LayerStack is re-stamped onto the
 // replica's LayerObject + per-volume LayerDataList here. The k8s
@@ -142,21 +146,11 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 // silently emits the default chain, so operators see plaintext while
 // believing they have encryption.
 func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
-	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
+	annotated := annotateSyncProgress(rsc.Volumes)
 
-	// Bug 137: diskless / TIE_BREAKER replicas never get a
-	// per-volume Status row written by the satellite (no local
-	// backing device, no usage to report). The CRD-to-wire
-	// projection therefore returns Volumes=nil, the JSON encoder
-	// drops the `volumes` key under `omitempty`, and python-linstor
-	// crashes on `rsc._rest_data['volumes'][0]` with AttributeError
-	// because the key is `None`. Synthesise one placeholder per
-	// parent-RD VolumeDefinition so the wire shape mirrors a
-	// diskful replica — same volume_number, same layer chain — but
-	// with no satellite-observed allocation. Non-diskless replicas
-	// with an empty Volumes slice still get a `[]` (the absent-key
-	// regression strikes them too: e.g. a freshly-created diskful
-	// replica before the satellite has reported usage).
+	// Bug 137: a replica the satellite reports no storage for (a
+	// diskless or TIE_BREAKER one, or one not built yet) still lists a
+	// volume per parent-RD VolumeDefinition, as LINSTOR's view does.
 	annotated = ensureVolumesForView(annotated, rsc, vdSizes)
 
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
@@ -203,7 +197,7 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 	// sensitive key.
 	redactSensitiveProps(rwv.Props)
 
-	s.stampSuspendedOnLUKS(&rwv)
+	s.stampSuspendedOnLUKS(ctx, &rwv)
 
 	return rwv, nil
 }
@@ -221,63 +215,85 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 // crashes the CLI with AttributeError.
 const disklessStorPoolName = "DfltDisklessStorPool"
 
-// ensureVolumesForView returns a non-nil Volume slice for the wire
-// view. Bug 137 follow-up: a nil slice OR a zero-length non-nil slice
-// both serialise as a missing JSON key when the field carries
-// `omitempty` (the initial fix kept the tag and only solved half the
-// case). The wire shape contract is now: `volumes` key always
-// present.
+// ensureVolumesForView returns the replica's volumes with one entry for
+// every volume definition of its parent, as LINSTOR does: the controller
+// creates a replica's Volume objects together with the replica
+// (CtrlRscCrtApiHelper), so its REST answers list them from that moment,
+// with no device path or disk state until the satellite reports.
+// blockstor's volumes come from what the satellite reported, so a replica
+// the satellite has not built yet, or a diskless one it never reports
+// storage for, would otherwise answer with no volumes at all. Clients
+// index into that list: linstor-scheduler-extender reads volumes[0] of
+// every replica in the view and panics on an empty one, linstor-csi's
+// attach gets a 404 for volume 0 instead of an answer without a device
+// path, and python-linstor's `rsc._rest_data['volumes'][0]` raises
+// (Bug 137).
 //
-// We solve the empty-slice case in two tiers:
-//
-//  1. Diskless / TIE_BREAKER replica with no observed Volumes:
-//     synthesise one placeholder per parent-RD VolumeDefinition so
-//     the wire entry has the same volume_number cardinality as a
-//     diskful replica. `storage_pool_name` is stamped with the
-//     upstream-LINSTOR sentinel `DfltDisklessStorPool` (see
-//     disklessStorPoolName) so `linstor n describe` recognises the
-//     row as a diskless witness instead of crashing on
-//     `find_child(...)` returning None.
-//  2. Any other replica that happens to arrive with an empty
-//     Volumes slice (e.g. fresh diskful replica before the
-//     satellite has written Status.Volumes): emit `[]` rather than
-//     omitting the key. Same crash class, just less common.
-//
-// Diskful replicas with already-populated Volumes are passed
-// through verbatim — the placeholder path must not shadow real
-// satellite-observed allocation / disk_state.
+// A volume the satellite reported is passed through verbatim; the
+// placeholders carry only the volume number, the pool and the layer
+// list. A diskless or
+// TIE_BREAKER replica's placeholder names the upstream sentinel pool
+// `DfltDisklessStorPool` (see disklessStorPoolName), so `linstor n
+// describe` recognises the row as a diskless witness. The result is
+// never nil, so the `volumes` key is always present on the wire.
 func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) []apiv1.Volume {
-	if len(observed) > 0 {
-		return observed
+	out := make([]apiv1.Volume, 0, max(len(observed), len(vdSizes)))
+	out = append(out, observed...)
+
+	pool := rsc.Props["StorPoolName"]
+	if isDisklessReplica(rsc) {
+		pool = disklessStorPoolName
 	}
 
-	if !isDisklessReplica(rsc) {
-		// Empty slice instead of nil so the JSON encoder emits
-		// `[]` not the absent key. Bug 137 wire contract.
-		return []apiv1.Volume{}
-	}
-
-	// Stable iteration over the VD index: map keys are
-	// non-deterministic and the wire order has to be stable across
-	// calls so paginated CLI consumers don't see volume_number
-	// jitter between requests.
-	volNums := make([]int32, 0, len(vdSizes))
 	for vn := range vdSizes {
-		volNums = append(volNums, vn)
-	}
+		if slices.ContainsFunc(observed, func(v apiv1.Volume) bool { return v.VolumeNumber == vn }) {
+			continue
+		}
 
-	slices.Sort(volNums)
-
-	out := make([]apiv1.Volume, 0, len(volNums))
-
-	for _, vn := range volNums {
 		out = append(out, apiv1.Volume{
 			VolumeNumber: vn,
-			StoragePool:  disklessStorPoolName,
+			StoragePool:  pool,
 			// AllocatedKib defaults to 0 (the Bug 112 contract:
-			// always emit the key as an int >= 0). Diskless has
-			// no real allocation, so 0 is the truthful value.
+			// always emit the key as an int >= 0); nothing has been
+			// allocated that the satellite reported.
 		})
+	}
+
+	// A placeholder carries the layer list a reported volume gets from
+	// the store, the default stack (the resource view re-stamps both
+	// from the definition's stack). LINSTOR emits layer_data_list for a
+	// volume from its creation, and clients that read the DRBD entry
+	// there would otherwise tell a placeholder from a built volume.
+	apiv1.ApplyLayerStackToVolumes(out[len(observed):], apiv1.DefaultLayerStack())
+
+	// Stable order: the VD index is a map, and paginated CLI consumers
+	// must not see volume_number jitter between requests.
+	slices.SortStableFunc(out, func(left, right apiv1.Volume) int {
+		return int(left.VolumeNumber) - int(right.VolumeNumber)
+	})
+
+	return out
+}
+
+// definitionVolumeSizes returns the parent definition's volume numbers
+// and sizes, the per-replica analogue of vdSizeIndex. A definition whose
+// volume definitions cannot be read yields none, so the caller answers
+// with the volumes the satellite reported rather than failing the read.
+// That answer is the one a client of a replica not built yet cannot
+// use (a 404 for volume 0, an empty volume list), so the failed read
+// is logged: nothing else would say why.
+func (s *Server) definitionVolumeSizes(ctx context.Context, rdName string) map[int32]int64 {
+	vds, err := s.Store.VolumeDefinitions().List(ctx, rdName)
+	if err != nil {
+		log.FromContext(ctx).WithName("rest").Error(err,
+			"list volume definitions; answering with the reported volumes only", "resourceDefinition", rdName)
+
+		return nil
+	}
+
+	out := make(map[int32]int64, len(vds))
+	for i := range vds {
+		out[vds[i].VolumeNumber] = vds[i].SizeKib
 	}
 
 	return out
@@ -298,17 +314,16 @@ func isDisklessReplica(rsc *apiv1.Resource) bool {
 }
 
 // stampSuspendedOnLUKS sets `state.suspended` on a resource that
-// carries a LUKS layer in its LayerObject chain. true while the
-// controller process is locked (no enter-passphrase yet), false
-// once unlocked. Non-LUKS resources are left with state.suspended
+// carries a LUKS layer in its LayerObject chain. true while the master
+// key is locked or unset, false once the passphrase Secret opens it. Non-LUKS resources are left with state.suspended
 // nil so the field is omitted on the wire — see ResourceState.Suspended
 // for the tri-state contract. Scenario 6.W13.
-func (s *Server) stampSuspendedOnLUKS(rwv *apiv1.ResourceWithVolumes) {
+func (s *Server) stampSuspendedOnLUKS(ctx context.Context, rwv *apiv1.ResourceWithVolumes) {
 	if !hasLUKSLayer(rwv.LayerObject) {
 		return
 	}
 
-	suspended := !s.passphraseUnlocked.Load()
+	suspended := s.encryptionState(ctx) != passphrase.StateUnlocked
 	rwv.State.Suspended = &suspended
 }
 
@@ -355,35 +370,13 @@ const diskStateUpToDate = "UpToDate"
 // replicationStateSyncSource / replicationStateSyncTarget are the
 // two transient drbd-9 replication-state tokens promoted to literal
 // State-column values by Bug 348. Constants because the literal is
-// used both in the activeSyncReplicationState gate and as the
-// returned override token — one source of truth keeps the gate and
-// the rendered output from ever disagreeing.
+// used both as the replication-state match and as the returned
+// override token, so the match and the rendered output never
+// disagree.
 const (
 	replicationStateSyncSource = "SyncSource"
 	replicationStateSyncTarget = "SyncTarget"
 )
-
-// terminalDiskStates are the disk_state tokens that must NEVER carry
-// a `(NN%)` sync-progress suffix. A replica in one of these states is
-// not actively receiving data, so a percentage is meaningless (and,
-// in the UpToDate case, actively misleading — see Bug A below).
-//
-//   - UpToDate / Diskless / TieBreaker are steady terminal states.
-//   - Outdated is a frozen last-known-good state, not a live resync.
-//
-// In a 3-replica topology a fully-UpToDate replica's per-volume
-// OutOfSyncKib can be > 0 because it reflects out-of-sync bytes
-// toward a still-syncing peer; the legacy fallthrough used to
-// decorate that as `UpToDate(22%)`, which the golden upstream shape
-// forbids — `UpToDate(NN%)` must never appear in healthy output.
-//
-//nolint:gochecknoglobals // immutable allow-list — `const` can't hold a map
-var terminalDiskStates = map[string]struct{}{
-	diskStateUpToDate: {},
-	"Diskless":        {},
-	"TieBreaker":      {},
-	"Outdated":        {},
-}
 
 // aggregateRDStats walks the flat per-replica resource list and
 // folds each entry into its parent-RD bucket. The Python CLI's
@@ -395,7 +388,7 @@ func aggregateRDStats(resList []apiv1.Resource) map[string]rdFaultyStats {
 	out := map[string]rdFaultyStats{}
 
 	for i := range resList {
-		stats := out[resList[i].Name]
+		stats := out[naming.Key(resList[i].Name)]
 
 		for j := range resList[i].Volumes {
 			disk := resList[i].Volumes[j].State.DiskState
@@ -412,7 +405,7 @@ func aggregateRDStats(resList []apiv1.Resource) map[string]rdFaultyStats {
 			stats.faulty = true
 		}
 
-		out[resList[i].Name] = stats
+		out[naming.Key(resList[i].Name)] = stats
 	}
 
 	return out
@@ -453,8 +446,8 @@ func isUpToDateDiskState(disk string) bool {
 // Returns 0 when both belong to RDs with identical UpToDate counts —
 // the caller falls back to the deterministic Name+NodeName tiebreak.
 func compareResourceFaulty(stats map[string]rdFaultyStats, a, b *apiv1.ResourceWithVolumes) int {
-	au := stats[a.Name].upToDate
-	bu := stats[b.Name].upToDate
+	au := stats[naming.Key(a.Name)].upToDate
+	bu := stats[naming.Key(b.Name)].upToDate
 
 	if au != bu {
 		return au - bu
@@ -520,7 +513,7 @@ func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[s
 	seen := map[string]struct{}{}
 
 	for i := range resList {
-		seen[resList[i].Name] = struct{}{}
+		seen[naming.Key(resList[i].Name)] = struct{}{}
 	}
 
 	for rd := range seen {
@@ -534,46 +527,33 @@ func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[s
 			idx[vds[j].VolumeNumber] = vds[j].SizeKib
 		}
 
-		out[rd] = idx
+		out[naming.Key(rd)] = idx
 	}
 
 	return out
 }
 
-// annotateSyncProgress decorates each Volume.State.DiskState with a
-// "(NN%)" sync-progress suffix for replicas that are genuinely
-// receiving data, matching the CDI/upstream-LINSTOR rendering style —
-// `linstor r list` users see e.g. `SyncTarget(45%)` or
-// `Inconsistent(45%)` instead of a bare label with no progress
-// feedback.
+// annotateSyncProgress renders the State column of a replica that is
+// resyncing, the way upstream LINSTOR does: `SyncTarget(50.31%)`, the
+// percentage being DRBD's own `done` for the resync with that peer.
 //
-// The percentage is ONLY appended to actively-syncing / inconsistent
-// states. Terminal states (UpToDate, Diskless, TieBreaker, Outdated)
-// are never decorated — see terminalDiskStates and the two bugs the
-// gate closes:
+// LINSTOR's satellite overrides a volume's disk state with
+// `SyncTarget(<done>%)` only when a peer is in SyncTarget AND its
+// frame carried `done` (DrbdVolume.diskStateInfo); without a `done`
+// it keeps the disk state, and it shows no percentage anywhere else.
+// blockstor used to compute one from the volume-wide OutOfSyncKib and
+// the volume size instead, on every non-terminal state. That number is
+// wrong on exactly the replica an operator watches: OutOfSyncKib is
+// whichever peer-device frame came last, so a replica that finished a
+// small resync from one peer and then ran a full one from another
+// showed `Inconsistent(99%)` while the kernel said `done:50.31`.
 //
-// Bug A — `(NN%)` wrongly decorating `UpToDate`. In a 3-replica
-// topology a fully-UpToDate replica's per-volume OutOfSyncKib can be
-// > 0 because it tracks out-of-sync bytes toward a still-syncing
-// peer. The old fallthrough gated only on `OutOfSyncKib <= 0`, so it
-// rendered `UpToDate(22%)`. The golden upstream shape says
-// `UpToDate(NN%)` must never appear; terminalDiskStates suppresses it.
-//
-// Bug B — `(NN%)` stripped from SyncSource / SyncTarget. Bug 348
-// promoted the two transient drbd-9 replication-state tokens to
-// literal State-column values (`SyncSource` on the source side,
-// `SyncTarget` on the target side, sourced from drbdsetup events2's
-// replication_state field), but over-corrected by dropping the
-// progress percent operators want during the resync window. The
-// syncLiteral branch now computes the percent from THIS replica's own
-// OutOfSyncKib + VD size and renders `SyncTarget(NN%)` /
-// `SyncSource(NN%)`, falling back to the bare literal when size /
-// out-of-sync data is unavailable.
-//
-// Other replication states (PausedSync*, VerifyS/T, Ahead, Behind,
-// Off, WFBitMap*) are not promoted to literals; they fall through to
-// the disk_state-with-progress path so existing feedback is preserved.
-func annotateSyncProgress(volumes []apiv1.Volume, sizes map[int32]int64) []apiv1.Volume {
+// Bug 348 keeps one blockstor addition: the source side shows the bare
+// `SyncSource` literal, where LINSTOR keeps `UpToDate`. It carries no
+// percentage, as LINSTOR puts none on the source side. Other
+// replication states (PausedSync*, VerifyS/T, Ahead, Behind, Off,
+// WFBitMap*) keep the observed disk state, bare, as in LINSTOR.
+func annotateSyncProgress(volumes []apiv1.Volume) []apiv1.Volume {
 	if len(volumes) == 0 {
 		return volumes
 	}
@@ -582,89 +562,30 @@ func annotateSyncProgress(volumes []apiv1.Volume, sizes map[int32]int64) []apiv1
 	copy(out, volumes)
 
 	for i := range out {
-		size := sizes[out[i].VolumeNumber]
-
-		if syncLiteral := activeSyncReplicationState(out[i].State.ReplicationStates); syncLiteral != "" {
-			// Bug 348 + Bug B: render the literal replication-state
-			// token (SyncSource / SyncTarget) WITH the live progress
-			// percent so operators see how far the resync has come.
-			// The percent comes from this replica's own OutOfSyncKib
-			// against the VD size — when that data is missing we fall
-			// back to the bare literal rather than emit a bogus 0%.
-			// Once the peer reports `Established`, ReplicationStates
-			// no longer carries SyncSource / SyncTarget and the loop
-			// falls through to the disk_state path below, collapsing
-			// the column cleanly back to `UpToDate`.
-			out[i].State.DiskState = withSyncPercent(syncLiteral, out[i].State.OutOfSyncKib, size)
+		if done, ok := out[i].State.SyncProgress(replicationStateSyncTarget); ok {
+			out[i].State.DiskState = apiv1.SyncProgressState(replicationStateSyncTarget, done)
 
 			continue
 		}
 
-		// Terminal states never carry a progress suffix even when
-		// OutOfSyncKib > 0 — see Bug A. Empty disk_state and unknown
-		// VD size are also left untouched.
-		if size <= 0 || out[i].State.OutOfSyncKib <= 0 || out[i].State.DiskState == "" {
-			continue
+		if hasReplicationState(out[i].State.ReplicationStates, replicationStateSyncSource) {
+			out[i].State.DiskState = replicationStateSyncSource
 		}
-
-		if _, terminal := terminalDiskStates[out[i].State.DiskState]; terminal {
-			continue
-		}
-
-		out[i].State.DiskState = withSyncPercent(out[i].State.DiskState, out[i].State.OutOfSyncKib, size)
 	}
 
 	return out
 }
 
-// withSyncPercent appends a `(NN%)` sync-progress suffix to a State
-// token. percent = max(0, 100 - oos*100/size); when size <= 0 or
-// oos <= 0 the data is unusable, so the bare token is returned
-// unchanged (never a misleading `(0%)`).
-func withSyncPercent(state string, outOfSyncKib, sizeKib int64) string {
-	if sizeKib <= 0 || outOfSyncKib <= 0 {
-		return state
-	}
-
-	percent := max(0, 100-(outOfSyncKib*100)/sizeKib)
-
-	return fmt.Sprintf("%s(%d%%)", state, percent)
-}
-
-// activeSyncReplicationState returns `SyncSource` or `SyncTarget`
-// when at least one peer in the per-peer ReplicationStates map
-// reports one of those tokens. Returns the empty string when no
-// peer is actively syncing — the legacy `(NN%)` annotation path
-// then takes over. Source wins over target when both are present
-// in the same map (3+ replica topology where one peer is mid-sync
-// to us and another is mid-sync from us — vanishingly rare in
-// practice, but the deterministic preference keeps the column
-// stable across calls). Only `SyncSource` and `SyncTarget` qualify
-// here; PausedSync* / VerifyS/T / Ahead / Behind / Off / WFBitMap*
-// are intentionally NOT promoted to literals because upstream
-// LINSTOR's CLI renders them via a different code path and Bug 348
-// is scoped to the two transient sync states only.
-func activeSyncReplicationState(states map[string]apiv1.ReplicationState) string {
-	if len(states) == 0 {
-		return ""
-	}
-
-	var sawTarget bool
-
+// hasReplicationState reports whether any peer in the per-peer
+// ReplicationStates map is in the given replication state.
+func hasReplicationState(states map[string]apiv1.ReplicationState, want string) bool {
 	for _, state := range states {
-		switch state.ReplicationState {
-		case replicationStateSyncSource:
-			return replicationStateSyncSource
-		case replicationStateSyncTarget:
-			sawTarget = true
+		if state.ReplicationState == want {
+			return true
 		}
 	}
 
-	if sawTarget {
-		return replicationStateSyncTarget
-	}
-
-	return ""
+	return false
 }
 
 // multiValueQuery returns the union of all values for a query
@@ -708,15 +629,15 @@ func splitCSV(value string) []string {
 	return out
 }
 
-// matchAnyFold reports whether candidate matches any of needles
-// case-insensitively. Empty needles means "no filter — accept".
-func matchAnyFold(needles []string, candidate string) bool {
+// matchAnyName reports whether candidate names the same object as any of
+// needles (naming.Same). Empty needles means "no filter — accept".
+func matchAnyName(needles []string, candidate string) bool {
 	if len(needles) == 0 {
 		return true
 	}
 
 	for _, n := range needles {
-		if strings.EqualFold(n, candidate) {
+		if naming.Same(n, candidate) {
 			return true
 		}
 	}

@@ -78,10 +78,35 @@ lctl_idempotent() {
 # them as $WORKER_1, $WORKER_2, $WORKER_3 instead of hardcoding a
 # specific cluster prefix (parallel stands name workers `<NAME>-worker-N`).
 # Sorted alphabetically so $WORKER_1 == worker-1, etc.
-mapfile -t _BS_WORKERS < <(
-    kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
-        -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | sort
-)
+#
+# What the cells actually need is nodes RUNNING A SATELLITE, and on the
+# project's own stands "not a control-plane node" answers that. It does not
+# answer it everywhere: a Cozystack cluster of three control-plane nodes runs
+# satellites on all three and has no node without the label, so the selector
+# returns nothing and every cell skips itself as unexercisable.
+#
+# So the satellite DaemonSet answers when the label selector cannot. It is the
+# authority on the question being asked, and it costs one extra call only on
+# the clusters where the first answer was empty. BS_WORKERS overrides both, for
+# a stand whose shape neither rule fits.
+if [[ -n "${BS_WORKERS:-}" ]]; then
+    # shellcheck disable=SC2086 # BS_WORKERS is a space-separated node list
+    mapfile -t _BS_WORKERS < <(printf '%s\n' $BS_WORKERS | sort)
+else
+    mapfile -t _BS_WORKERS < <(
+        kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
+            -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | sort
+    )
+
+    if (( ${#_BS_WORKERS[@]} == 0 )); then
+        mapfile -t _BS_WORKERS < <(
+            kubectl -n "$NS" get pods -l app=blockstor-satellite \
+                --field-selector status.phase=Running \
+                -o jsonpath='{.items[*].spec.nodeName}' 2>/dev/null \
+                | tr ' ' '\n' | grep -v '^$' | sort -u
+        )
+    fi
+fi
 WORKER_1="${_BS_WORKERS[0]:-}"
 WORKER_2="${_BS_WORKERS[1]:-}"
 WORKER_3="${_BS_WORKERS[2]:-}"
@@ -460,13 +485,13 @@ read_md5() {
 delete_rd() {
     local rd=$1
 
-    kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null \
+    kubectl get snapshots.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="$rd." '$1 ~ "^"rd {print $1}' \
-        | xargs -r kubectl delete --wait=true --timeout=30s snapshots.blockstor.cozystack.io 2>/dev/null || true
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+        | xargs -r kubectl delete --wait=true --timeout=30s snapshots.blockstor.org 2>/dev/null || true
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="$rd." '$1 ~ "^"rd {print $1}' \
-        | xargs -r kubectl delete --wait=true --timeout=30s resources.blockstor.cozystack.io 2>/dev/null || true
-    kubectl delete --wait=true --timeout=30s "resourcedefinitions.blockstor.cozystack.io/${rd}" 2>/dev/null || true
+        | xargs -r kubectl delete --wait=true --timeout=30s resources.blockstor.org 2>/dev/null || true
+    kubectl delete --wait=true --timeout=30s "resourcedefinitions.blockstor.org/${rd}" 2>/dev/null || true
 
     # Force-kill any lingering kernel-level state for this RD. The
     # marker-file cleanup is essential — leaving .md-created behind
@@ -512,7 +537,7 @@ delete_all_rds() {
 
     # Enumerate first; iterate by name so an empty list is a no-op.
     local rds
-    rds=$(kubectl get resourcedefinitions.blockstor.cozystack.io \
+    rds=$(kubectl get resourcedefinitions.blockstor.org \
         --no-headers 2>/dev/null | awk '{print $1}')
     if [[ -n "$rds" ]]; then
         echo ">> delete_all_rds: pre-test wipe of: $(echo "$rds" | tr '\n' ' ')"
@@ -527,19 +552,19 @@ delete_all_rds() {
     # only matches by RD prefix, so a hand-leaked `foo.node` without
     # a `foo` RD slips past it.
     local res
-    res=$(kubectl get resources.blockstor.cozystack.io \
+    res=$(kubectl get resources.blockstor.org \
         --no-headers 2>/dev/null | awk '{print $1}')
     if [[ -n "$res" ]]; then
         echo ">> delete_all_rds: orphan Resource sweep: $(echo "$res" | tr '\n' ' ')"
         echo "$res" | xargs -r kubectl delete --wait=true --timeout=30s \
-            resources.blockstor.cozystack.io 2>/dev/null || true
+            resources.blockstor.org 2>/dev/null || true
     fi
     local snaps
-    snaps=$(kubectl get snapshots.blockstor.cozystack.io \
+    snaps=$(kubectl get snapshots.blockstor.org \
         --no-headers 2>/dev/null | awk '{print $1}')
     if [[ -n "$snaps" ]]; then
         echo "$snaps" | xargs -r kubectl delete --wait=true --timeout=30s \
-            snapshots.blockstor.cozystack.io 2>/dev/null || true
+            snapshots.blockstor.org 2>/dev/null || true
     fi
 
     # Wait until the kernel + CRD state converges.
@@ -547,9 +572,9 @@ delete_all_rds() {
     while (( $(date +%s) < deadline )); do
         local crd_count
         crd_count=$( {
-            kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null
-            kubectl get resourcedefinitions.blockstor.cozystack.io --no-headers 2>/dev/null
-            kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null
+            kubectl get resources.blockstor.org --no-headers 2>/dev/null
+            kubectl get resourcedefinitions.blockstor.org --no-headers 2>/dev/null
+            kubectl get snapshots.blockstor.org --no-headers 2>/dev/null
         } | grep -cv '^$' || true )
 
         if [[ "$crd_count" == "0" ]]; then
@@ -560,8 +585,8 @@ delete_all_rds() {
     done
 
     echo "delete_all_rds: cluster still has CRDs after ${timeout}s:" >&2
-    kubectl get resourcedefinitions.blockstor.cozystack.io --no-headers 2>/dev/null >&2 || true
-    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null >&2 || true
+    kubectl get resourcedefinitions.blockstor.org --no-headers 2>/dev/null >&2 || true
+    kubectl get resources.blockstor.org --no-headers 2>/dev/null >&2 || true
     return 1
 }
 
@@ -579,9 +604,9 @@ wait_cluster_idle() {
     while (( $(date +%s) < deadline )); do
         local crd_count drbd_busy=0
         crd_count=$( {
-            kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null
-            kubectl get resourcedefinitions.blockstor.cozystack.io --no-headers 2>/dev/null
-            kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null
+            kubectl get resources.blockstor.org --no-headers 2>/dev/null
+            kubectl get resourcedefinitions.blockstor.org --no-headers 2>/dev/null
+            kubectl get snapshots.blockstor.org --no-headers 2>/dev/null
         } | grep -cv '^$' || true )
 
         for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
@@ -711,7 +736,7 @@ strict_cleanup_on_exit() {
 
     # Step 4: final invariant check.
     local rd_count running terminating_final total
-    rd_count=$(kubectl get resourcedefinitions.blockstor.cozystack.io \
+    rd_count=$(kubectl get resourcedefinitions.blockstor.org \
         -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
     total=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
         --no-headers 2>/dev/null | wc -l | tr -d ' ')
@@ -790,10 +815,10 @@ reset_cluster_state() {
     #    is left to clear the finalizer and `kubectl delete` would hang.
     #    Patching finalizers=[] makes the subsequent delete_all_rds
     #    actually complete instead of blocking on the apiserver.
-    kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null \
+    kubectl get resources.blockstor.org -o name 2>/dev/null \
         | xargs -r -I{} kubectl patch {} --type=merge \
             -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    kubectl get resourcedefinitions.blockstor.cozystack.io -o name 2>/dev/null \
+    kubectl get resourcedefinitions.blockstor.org -o name 2>/dev/null \
         | xargs -r -I{} kubectl patch {} --type=merge \
             -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
 
@@ -937,8 +962,20 @@ skip() {
 require_workers() {
     local want=$1
     local got
-    got=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' --no-headers 2>/dev/null \
-        | awk '$2 == "Ready"' | wc -l)
+    # Counted off the same discovery $WORKER_* came from, so a cluster whose
+    # satellites run on control-plane nodes is not reported as having none.
+    got=0
+    # The length test guards the expansion: under `set -u` a bash older than
+    # 4.4 treats "${empty[@]}" as an unbound variable and aborts, which would
+    # turn "this cluster has no satellites" into a crash inside the preflight
+    # that exists to report exactly that.
+    if (( ${#_BS_WORKERS[@]} > 0 )); then
+        for _w in "${_BS_WORKERS[@]}"; do
+            if [[ "$(kubectl get node "$_w" --no-headers 2>/dev/null | awk '{print $2}')" == "Ready" ]]; then
+                got=$(( got + 1 ))
+            fi
+        done
+    fi
 
     if (( got < want )); then
         skip "scenario needs $want satellite workers, found $got"
@@ -1058,14 +1095,14 @@ _wait_port_forward() {
 rd_apply() {
     local rd=$1 primary=$2 peer=$3 size=${4:-65536} pool=${5:-${STORPOOL:-stand}}
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${rd}}
 spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${size}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${rd}.${primary}}
 spec:
@@ -1073,7 +1110,7 @@ spec:
   nodeName: ${primary}
   props: {StorPoolName: ${pool}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${rd}.${peer}}
 spec:
@@ -1171,4 +1208,48 @@ unwire_linstor_csi_mtls() {
         -p='[{"op":"remove","path":"/spec/externalController"},
              {"op":"remove","path":"/spec/apiTLS"}]' \
         2>/dev/null || true
+}
+
+# ensure_passphrase_secret <passphrase> — make sure the cluster has a
+# master key that unlocks unattended, the way piraeus sets LINSTOR up: a
+# passphrase Secret with the key MASTER_PASSPHRASE, named by
+# ControllerConfig.spec.passphraseSecretRef, and the keyring the
+# controller creates from it on its next pass. A cluster that already
+# has a keyring is left alone: a new master key would leave every LUKS
+# volume wrapped under the old one unreadable.
+ensure_passphrase_secret() {
+    local pass=${1:?passphrase required} secret deadline
+    if kubectl -n "$NS" get secret blockstor-master-key >/dev/null 2>&1; then
+        return 0
+    fi
+    secret=$(kubectl get controllerconfigs.blockstor.org default \
+        -o jsonpath='{.spec.passphraseSecretRef.name}' 2>/dev/null || true)
+    if [[ -z "$secret" ]]; then
+        secret=linstor-passphrase
+        # The CRD requires spec, so a missing ControllerConfig is
+        # created with the reference in it rather than empty and then
+        # patched.
+        if kubectl get controllerconfigs.blockstor.org default >/dev/null 2>&1; then
+            kubectl patch controllerconfigs.blockstor.org default --type=merge \
+                -p "{\"spec\":{\"passphraseSecretRef\":{\"name\":\"$secret\"}}}" >/dev/null
+        else
+            printf '%s\n' 'apiVersion: blockstor.org/v1alpha1' 'kind: ControllerConfig' \
+                'metadata: {name: default}' "spec: {passphraseSecretRef: {name: $secret}}" |
+                kubectl create -f - >/dev/null
+        fi
+    fi
+    if ! kubectl -n "$NS" get secret "$secret" >/dev/null 2>&1; then
+        kubectl -n "$NS" create secret generic "$secret" \
+            --from-literal=MASTER_PASSPHRASE="$pass" >/dev/null
+    fi
+    # The controller looks at the Secrets every 30s.
+    deadline=$((SECONDS + 90))
+    until kubectl -n "$NS" get secret blockstor-master-key >/dev/null 2>&1; do
+        if ((SECONDS >= deadline)); then
+            echo "FAIL: no keyring 90s after Secret $secret was named; controller log:" >&2
+            kubectl -n "$NS" logs deploy/blockstor-controller --tail=50 2>&1 | grep -i 'keyring\|master-key' >&2 || true
+            return 1
+        fi
+        sleep 2
+    done
 }

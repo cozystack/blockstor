@@ -62,7 +62,7 @@ func withProbeTimeout(ctx context.Context) (context.Context, context.CancelFunc)
 // values that REST clients display via `linstor v list`.
 const (
 	stateProvisioned    = "PROVISIONED"
-	stateNotProvisioned = "NOT_PROVISIONED"
+	stateNotProvisioned = storage.StateNotProvisioned
 )
 
 // ConfigFilter is the inline `--config` argument passed to every
@@ -165,6 +165,12 @@ const RestoreIncompleteTag = "blockstor-restore-incomplete"
 // `blockstor-restore-incomplete-v2` would have matched a bare
 // `strings.Contains` check).
 func lvHasRestoreIncompleteTag(ctx context.Context, ex storage.Exec, vg, lvName string) bool {
+	return lvHasTag(ctx, ex, vg, lvName, RestoreIncompleteTag)
+}
+
+// lvHasTag reports whether the named LV carries tag, matching whole
+// tokens of the comma-separated `lv_tags` list. Errors fold into false.
+func lvHasTag(ctx context.Context, ex storage.Exec, vg, lvName, tag string) bool {
 	ctx, cancel := withProbeTimeout(ctx)
 	defer cancel()
 
@@ -176,8 +182,8 @@ func lvHasRestoreIncompleteTag(ctx context.Context, ex storage.Exec, vg, lvName 
 		return false
 	}
 
-	for tag := range strings.SplitSeq(strings.TrimSpace(string(out)), ",") {
-		if strings.TrimSpace(tag) == RestoreIncompleteTag {
+	for got := range strings.SplitSeq(strings.TrimSpace(string(out)), ",") {
+		if strings.TrimSpace(got) == tag {
 			return true
 		}
 	}

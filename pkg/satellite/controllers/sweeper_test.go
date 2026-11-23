@@ -78,9 +78,29 @@ func sweeperFixture(t *testing.T, nodeName string, kernelStatusOut string, resou
 		Client:   cli,
 		Adm:      drbd.NewAdm(fx),
 		NodeName: nodeName,
+		StateDir: t.TempDir(),
 	}
 
 	return sweeper, fx
+}
+
+// ownedStateDir returns a fresh StateDir holding the `.owned` marker
+// for every name given, i.e. a StateDir in which blockstor provisioned
+// exactly those kernel slots. `.owned` rather than `.res` keeps the
+// .res GC, which runs in the same sweep cycle, out of these tests.
+func ownedStateDir(t *testing.T, names ...string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	for _, name := range names {
+		err := os.WriteFile(filepath.Join(dir, name+".owned"), nil, 0o600)
+		if err != nil {
+			t.Fatalf("seed .owned marker for %s: %v", name, err)
+		}
+	}
+
+	return dir
 }
 
 // TestSweeperLeavesMatchingResourceAlone pins the core invariant:
@@ -102,6 +122,9 @@ func TestSweeperLeavesMatchingResourceAlone(t *testing.T) {
 	sweeper, fx := sweeperFixture(t, "n1",
 		"pvc-aaa role:Primary\n  volume:0 disk:UpToDate\n",
 		[]*blockstoriov1alpha1.Resource{res})
+	// Owned by blockstor too, so the matching CRD is the only thing
+	// that keeps the slot up.
+	sweeper.StateDir = ownedStateDir(t, "pvc-aaa")
 
 	err := sweeper.sweepOnce(t.Context(), logr.Discard())
 	if err != nil {
@@ -134,6 +157,7 @@ func TestSweeperDownsOrphan(t *testing.T) {
 	sweeper, fx := sweeperFixture(t, "n1",
 		"pvc-orphan role:Secondary\n  volume:0 disk:Diskless\n",
 		nil)
+	sweeper.StateDir = ownedStateDir(t, "pvc-orphan")
 
 	err := sweeper.sweepOnce(t.Context(), logr.Discard())
 	if err != nil {
@@ -180,6 +204,7 @@ func TestSweeperOnlyConsidersLocalResources(t *testing.T) {
 	sweeper, fx := sweeperFixture(t, "n1",
 		"pvc-xxx role:Secondary\n  volume:0 disk:Diskless\n",
 		[]*blockstoriov1alpha1.Resource{foreign})
+	sweeper.StateDir = ownedStateDir(t, "pvc-xxx")
 
 	err := sweeper.sweepOnce(t.Context(), logr.Discard())
 	if err != nil {
@@ -330,11 +355,16 @@ func TestSweeperRespectsRateLimit(t *testing.T) {
 
 	var b strings.Builder
 
+	names := make([]string, 0, 20)
+
 	for i := range 20 {
-		fmt.Fprintf(&b, "pvc-orphan-%02d role:Secondary\n  volume:0 disk:Diskless\n\n", i)
+		name := fmt.Sprintf("pvc-orphan-%02d", i)
+		names = append(names, name)
+		fmt.Fprintf(&b, "%s role:Secondary\n  volume:0 disk:Diskless\n\n", name)
 	}
 
 	sweeper, fx := sweeperFixture(t, "n1", b.String(), nil)
+	sweeper.StateDir = ownedStateDir(t, names...)
 	sweeper.MaxDownPerCycle = 2
 
 	err := sweeper.sweepOnce(t.Context(), logr.Discard())
@@ -388,6 +418,7 @@ func TestSweeperSkipAnnotationDisablesSweep(t *testing.T) {
 		Client:   cli,
 		Adm:      drbd.NewAdm(fx),
 		NodeName: "n1",
+		StateDir: ownedStateDir(t, "pvc-orphan"),
 	}
 
 	err := sweeper.sweepOnce(t.Context(), logr.Discard())
@@ -444,6 +475,7 @@ func TestSweeperBoundsPerResourceSetupDown(t *testing.T) {
 		Client:           cli,
 		Adm:              drbd.NewAdm(fx),
 		NodeName:         "n1",
+		StateDir:         ownedStateDir(t, "pvc-stuck", "pvc-other"),
 		SetupDownTimeout: 50 * time.Millisecond,
 		// Negative RDGrace disables the grace window so the
 		// table-driven orphan list lands in tear-down directly.
@@ -550,6 +582,7 @@ func TestSweeperGraceWindowDefersFreshRD(t *testing.T) {
 		Client:   cli,
 		Adm:      drbd.NewAdm(fx),
 		NodeName: "n1",
+		StateDir: ownedStateDir(t, "pvc-fresh"),
 		// Default 60s RDGrace applies — the test relies on the
 		// production constant matching the assertion.
 		now: func() time.Time { return frozenNow.Time },
@@ -615,6 +648,7 @@ func TestSweeperTearsDownAgedOrphan(t *testing.T) {
 		Client:   cli,
 		Adm:      drbd.NewAdm(fx),
 		NodeName: "n1",
+		StateDir: ownedStateDir(t, "pvc-aged"),
 		now:      func() time.Time { return frozenNow.Time },
 		setupDownFn: func(_ context.Context, _ string) error {
 			downCalls.Add(1)
@@ -657,7 +691,7 @@ func TestSweeperGraceWindowDefersRecentlyDeletedRD(t *testing.T) {
 			Name:              "pvc-deleting",
 			CreationTimestamp: metav1.NewTime(frozenNow.Add(-time.Hour)),
 			DeletionTimestamp: &delTS,
-			Finalizers:        []string{"blockstor.io/test"},
+			Finalizers:        []string{"blockstor.org/test"},
 		},
 	}
 
@@ -682,6 +716,7 @@ func TestSweeperGraceWindowDefersRecentlyDeletedRD(t *testing.T) {
 		Client:   cli,
 		Adm:      drbd.NewAdm(fx),
 		NodeName: "n1",
+		StateDir: ownedStateDir(t, "pvc-deleting"),
 		now:      func() time.Time { return frozenNow.Time },
 		setupDownFn: func(_ context.Context, _ string) error {
 			downCalls.Add(1)
@@ -736,6 +771,7 @@ func TestSweeperRunsImmediatelyOnStart(t *testing.T) {
 		// satisfy the assertion below.
 		Period:   time.Hour,
 		NodeName: "n1",
+		StateDir: ownedStateDir(t, "pvc-orphan"),
 		RDGrace:  -1,
 		setupDownFn: func(_ context.Context, resource string) error {
 			select {

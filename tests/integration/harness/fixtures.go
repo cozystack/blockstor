@@ -23,6 +23,7 @@ package harness
 import (
 	"context"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -102,6 +103,36 @@ func SeedThreeNodeCluster(t *testing.T, stack *Stack) {
 	}
 
 	seedDefaultResourceGroup(ctx, t, cli)
+
+	waitForSeededCapacity(t, stack)
+}
+
+// waitForSeededCapacity holds a test until the mock satellite has stamped
+// capacity on every seeded pool and the manager's cache, which the placer
+// reads, has seen it. A placement before that finds no pool with free
+// space, defers itself to the shortfall replay, and a test waiting for its
+// replicas times out.
+func waitForSeededCapacity(t *testing.T, stack *Stack) {
+	t.Helper()
+
+	want := len(FixtureNodes()) * len(FixtureProviders())
+
+	Eventually(t, seedCapacityTimeout, func() bool {
+		var pools blockstoriov1alpha1.StoragePoolList
+		if err := stack.Manager.GetClient().List(context.Background(), &pools); err != nil {
+			return false
+		}
+
+		stamped := 0
+
+		for i := range pools.Items {
+			if pools.Items[i].Status.FreeCapacity > 0 {
+				stamped++
+			}
+		}
+
+		return stamped >= want
+	}, "the mock satellite never stamped capacity on the seeded pools")
 }
 
 func seedNode(ctx context.Context, t *testing.T, cli client.Client, name string) {
@@ -128,6 +159,10 @@ func seedNode(ctx context.Context, t *testing.T, cli client.Client, name string)
 	}
 }
 
+// seedCapacityTimeout bounds the wait for the first capacity stamp; the
+// mock satellite ticks every satelliteTickInterval.
+const seedCapacityTimeout = 10 * time.Second
+
 func seedStoragePool(ctx context.Context, t *testing.T, cli client.Client, node, pool, kind string) {
 	t.Helper()
 
@@ -135,14 +170,15 @@ func seedStoragePool(ctx context.Context, t *testing.T, cli client.Client, node,
 		// Composite name pinned by the CEL XValidation rule on
 		// StoragePool — keep `<pool>.<node>` exactly.
 		//
-		// The `blockstor.io/node-name` label mirrors what
+		// The `blockstor.org/node-name` label mirrors what
 		// pkg/store/k8s.(*storagePools).Create stamps on every
-		// store-created pool: the store's ListByNode runs a label
-		// selector, so a fixture pool seeded without it is invisible
-		// to per-node store reads (e.g. the `n lost` SP cascade).
+		// store-created pool, so the fixture looks like a store write.
+		// Per-node store reads no longer depend on it: ListByNode
+		// selects on spec.nodeName, which a pool carries whoever
+		// wrote it.
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   pool + "." + node,
-			Labels: map[string]string{"blockstor.io/node-name": node},
+			Labels: map[string]string{"blockstor.org/node-name": node},
 		},
 		Spec: blockstoriov1alpha1.StoragePoolSpec{
 			NodeName:     node,

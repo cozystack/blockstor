@@ -39,17 +39,19 @@ func (s *Server) registerSpawn(mux *http.ServeMux) {
 }
 
 // handleSpawn creates a ResourceDefinition + VolumeDefinitions from a
-// ResourceGroup template. Replica placement (creating Resource objects on
-// satellites) is a separate Phase 3 concern owned by the autoplacer; this
-// handler only materialises the definition side, which is what linstor-csi
-// expects from the Spawn call before it issues separate placement
-// instructions.
+// ResourceGroup template and places replicas by the group's select filter,
+// as upstream `linstor rg spawn` does, unless the caller asks for the
+// definitions only.
 func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	rgName := r.PathValue("rg")
 
 	var req apiv1.ResourceGroupSpawn
 
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if refusePropsModifyOnCreate(w, "resource group spawn", req.OverrideProps, req.DeleteProps, req.DeleteNamespace) {
 		return
 	}
 
@@ -64,7 +66,9 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.ResourceDefinitionName == "" {
-		writeError(w, http.StatusBadRequest, "resource_definition_name is required (auto-naming Phase 6)")
+		writeError(w, http.StatusBadRequest,
+			"resource_definition_name is required: blockstor does not generate names, "+
+				"so a spawn by external name alone is refused; pass a resource definition name")
 
 		return
 	}
@@ -163,13 +167,22 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 		return
 	}
 
+	// definitions_only asks for the definition and its volumes without a
+	// placement (`linstor rg spawn --definition-only`).
+	if req.DefinitionsOnly {
+		writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "resource definition spawned without placement (definitions_only): " + rd.Name,
+		}})
+
+		return
+	}
+
 	// Upstream LINSTOR's `linstor rg spawn` autoplaces according to
 	// the RG's SelectFilter — that's the operator-visible contract:
 	// spawn = create RD + VDs + place replicas. Without this step,
 	// `r l` would be empty after spawn until the operator runs a
-	// separate `r c --auto-place=N`. The CSI flow follows the same
-	// contract (linstor-csi calls /spawn, then expects to find
-	// resources in /v1/view/resources on the next reconcile).
+	// separate `r c --auto-place=N`.
 	placeErr := spawnAutoplace(r.Context(), s, rd.Name, rg, req)
 	if placeErr != nil {
 		log.FromContext(r.Context()).WithName("rest").
@@ -238,9 +251,14 @@ func buildSpawnedRD(req *apiv1.ResourceGroupSpawn, rgName string, rg *apiv1.Reso
 		ResourceGroupName: rgName,
 	}
 
+	// The group's props come through laundered: the props blockstor reads
+	// back off a definition must not be inherited, or a group carrying one,
+	// which linstor-csi fills from StorageClass parameters verbatim, would
+	// mark every definition it spawns as restoring from another resource's
+	// snapshot.
 	if len(rg.Props) > 0 {
 		rd.Props = make(map[string]string, len(rg.Props))
-		maps.Copy(rd.Props, rg.Props)
+		maps.Copy(rd.Props, store.TravellingProps(rg.Props))
 	}
 
 	// Sticky LayerStack inheritance (Bug 54). Mirrors handleRDCreate's
@@ -292,10 +310,10 @@ func copyVolumeGroupProps(vgs []apiv1.VolumeGroup, volNumber int32) map[string]s
 			return nil
 		}
 
-		out := make(map[string]string, len(vgs[i].Props))
-		maps.Copy(out, vgs[i].Props)
-
-		return out
+		// The same filter as the group's own props: a passphrase
+		// property left on a volume group is never read, and copying it
+		// would put the plaintext key on every spawned volume.
+		return store.TravellingProps(vgs[i].Props)
 	}
 
 	return nil
@@ -304,8 +322,13 @@ func copyVolumeGroupProps(vgs []apiv1.VolumeGroup, volNumber int32) map[string]s
 // rollbackSpawn best-effort cleans up a half-spawned RD. Errors are
 // swallowed because we are already on an error path; the controller's
 // reconciler will sweep stale RDs on next pass.
+//
+// Detached like every other compensation, and bounded by the same budget, so
+// the graceful-shutdown window derived from that budget covers it too: an
+// unbounded delete against an apiserver that stopped answering would outlive
+// the window and be cut off by the kill instead.
 func rollbackSpawn(ctx context.Context, st store.Store, rdName string) {
-	deleteCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	deleteCtx, cancel := detachedCompensation(ctx)
 	defer cancel()
 
 	err := st.ResourceDefinitions().Delete(deleteCtx, rdName)

@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -230,15 +231,7 @@ func applySPDfnPropsPatch(def *store.StoragePoolDefinition, patch *apiv1.Generic
 	// I1: empty override value deletes the key (set-property KEY "").
 	applyPropsModify(def.Props, patch.OverrideProps, patch.DeleteProps)
 
-	for _, ns := range patch.DeleteNamespace {
-		prefix := ns + "/"
-
-		for k := range def.Props {
-			if strings.HasPrefix(k, prefix) {
-				delete(def.Props, k)
-			}
-		}
-	}
+	deletePropNamespaces(def.Props, patch.DeleteNamespace)
 }
 
 // handleStoragePoolDefinitionDelete serves DELETE /v1/storage-pool-definitions/{name}.
@@ -341,7 +334,7 @@ func (s *Server) refuseSPDfnDeleteIfReferenced(w http.ResponseWriter, r *http.Re
 	var refs []string
 
 	for i := range pools {
-		if pools[i].StoragePoolName != name {
+		if !naming.Same(pools[i].StoragePoolName, name) {
 			continue
 		}
 

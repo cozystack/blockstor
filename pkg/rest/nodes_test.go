@@ -1151,6 +1151,12 @@ func newClient(t *testing.T, base string) *lapi.Client {
 	return c
 }
 
+// pythonLinstorTestUserAgent is what python-linstor 1.27.1 sends
+// (linstorapi.py: "PythonLinstor/{v} (API{a})"). The suite's raw requests
+// stand in for the CLI, so they name themselves the way it does; the clone
+// door answers python-linstor in its own envelope.
+const pythonLinstorTestUserAgent = "PythonLinstor/1.27.1 (API1.0.4)"
+
 func httpPost(t *testing.T, addr string, body []byte) *http.Response {
 	t.Helper()
 
@@ -1159,6 +1165,7 @@ func httpPost(t *testing.T, addr string, body []byte) *http.Response {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", pythonLinstorTestUserAgent)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

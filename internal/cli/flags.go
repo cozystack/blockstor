@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
@@ -96,36 +97,42 @@ const (
 // valueFlags are the flags that consume the following argument when
 // written in the space-separated form.
 var valueFlags = map[string]struct{}{ //nolint:gochecknoglobals // static flag table
-	flagColor:          {},
-	flagNodesLong:      {},
-	flagNodesShort:     {},
-	flagRscLong:        {},
-	flagRscDefs:        {},
-	flagRscShort:       {},
-	"--storage-pool":   {},
-	"--storage-pools":  {},
-	"--place-count":    {},
-	"--auto-place":     {},
-	"--layer-list":     {},
-	"-l":               {},
-	"--resource-group": {},
-	"--size":           {},
-	"--vlmnr":          {},
-	"--limit":          {},
-	flagPassphrase:     {},
-	flagPassValue:      {},
-	"--migrate-from":   {},
-	"--from-resource":  {},
-	"--from-snapshot":  {},
-	"--to-resource":    {},
-	"--node-type":      {},
-	"--port":           {},
-	"--pool-name":      {},
-	"--provider-kind":  {},
-	"--controllers":    {},
-	"--output-fmt":     {},
-	"--output-version": {},
-	"-o":               {},
+	flagColor:               {},
+	flagNodesLong:           {},
+	flagNodesShort:          {},
+	flagRscLong:             {},
+	flagRscDefs:             {},
+	flagRscShort:            {},
+	"--storage-pool":        {},
+	"--storage-pools":       {},
+	"--place-count":         {},
+	"--auto-place":          {},
+	"--layer-list":          {},
+	"-l":                    {},
+	"--resource-group":      {},
+	"--size":                {},
+	"--vlmnr":               {},
+	"--limit":               {},
+	flagPassphrase:          {},
+	flagPassValue:           {},
+	"--old-passphrase":      {},
+	"--new-passphrase":      {},
+	"--passphrase-file":     {},
+	"--new-passphrase-file": {},
+	"--old-passphrase-file": {},
+	"--name":                {},
+	"--migrate-from":        {},
+	"--from-resource":       {},
+	"--from-snapshot":       {},
+	"--to-resource":         {},
+	"--node-type":           {},
+	"--port":                {},
+	"--pool-name":           {},
+	"--provider-kind":       {},
+	"--controllers":         {},
+	"--output-fmt":          {},
+	"--output-version":      {},
+	"-o":                    {},
 }
 
 // parseFlags walks the argument tail.
@@ -367,15 +374,15 @@ func splitList(value string) []string {
 	return out
 }
 
-// matches reports whether a value passes a filter list (empty filter
-// matches everything).
+// matches reports whether a name passes a filter list, comparing as the
+// store addresses objects (naming.Same); an empty filter matches everything.
 func matches(filter []string, value string) bool {
 	if len(filter) == 0 {
 		return true
 	}
 
 	for _, want := range filter {
-		if strings.EqualFold(want, value) {
+		if naming.Same(want, value) {
 			return true
 		}
 	}
@@ -397,8 +404,10 @@ func matches(filter []string, value string) bool {
 // -s3cret` is an ordinary thing to type, and the workaround that does work,
 // `--passphrase=-s3cret`, is not discoverable from the refusal.
 var opaqueValueFlags = map[string]struct{}{ //nolint:gochecknoglobals // static flag table
-	flagPassphrase: {},
-	flagPassValue:  {},
+	flagPassphrase:     {},
+	flagPassValue:      {},
+	"--old-passphrase": {},
+	"--new-passphrase": {},
 }
 
 func valueAfter(args []string, i int, arg string, opaque bool) (string, error) {

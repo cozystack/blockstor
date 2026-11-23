@@ -47,6 +47,32 @@ var (
 type NodeStore interface {
 	List(ctx context.Context) ([]apiv1.Node, error)
 	Get(ctx context.Context, name string) (apiv1.Node, error)
+
+	// GetUncached answers the same question as Get, from the API server
+	// rather than from a cache that may trail it.
+	//
+	// It exists for the one caller that cannot take the fast answer: a
+	// destructive decision made on the node's own status and acted on
+	// immediately. `n lost` refuses while the satellite still reports
+	// ONLINE, and unregisters the node plus cascades away its replicas
+	// when it does not — so a status a beat behind is wrong in both
+	// directions. A stale ONLINE refuses the cleanup a dead node needs;
+	// a stale OFFLINE tears down a node whose satellite is answering.
+	//
+	// The node-scoped listings behind the same decision already read this
+	// way (pkg/store/k8s/resources.go nodeScopedReader); this is the field
+	// the decision turns on, read from the same place.
+	//
+	// Where a store has no direct reader this is Get unchanged. That is
+	// the CLI's shape, whose client is uncached to begin with, and the
+	// in-memory store's, which has nothing to be behind. It is NOT a
+	// shape a manager-backed binary may take: a cached client without
+	// its manager's reader answers this from the cache and says nothing
+	// while it does, which is what the controller binary did to its own
+	// `--enable-rest-api` surface. Take the store pkg/store/k8s.NewManager
+	// returns with the manager; nothing else builds one.
+	GetUncached(ctx context.Context, name string) (apiv1.Node, error)
+
 	Create(ctx context.Context, n *apiv1.Node) error
 	Update(ctx context.Context, n *apiv1.Node) error
 	Delete(ctx context.Context, name string) error
@@ -150,10 +176,23 @@ type ResourceGroupStore interface {
 // ResourceGroupStore (nil = untouched, empty = clear).
 type ResourceDefinitionStore interface {
 	List(ctx context.Context) ([]apiv1.ResourceDefinition, error)
+
+	// ListUncached answers the same question from the API server when the
+	// store has a direct reader, bypassing a cache that can trail a create.
+	// For a decision that destroys something when the answer comes back
+	// short, like reaping a snapshot no definition seems to use.
+	ListUncached(ctx context.Context) ([]apiv1.ResourceDefinition, error)
+
 	Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error)
 	Create(ctx context.Context, rd *apiv1.ResourceDefinition) error
 	Update(ctx context.Context, rd *apiv1.ResourceDefinition) error
 	Delete(ctx context.Context, name string) error
+
+	// GetUncached answers the same question as Get from the API server when
+	// the store has a direct reader. Get falls back to it only on a cache
+	// NotFound, so a definition the cache holds stale comes back as is; a
+	// decision made on a prop another request has just written needs this.
+	GetUncached(ctx context.Context, name string) (apiv1.ResourceDefinition, error)
 
 	// PatchResourceDefinitionSpec runs `mutate` against the freshly-fetched
 	// ResourceDefinition wire value and persists the result. On 409 the
@@ -169,9 +208,27 @@ type ResourceDefinitionStore interface {
 // composite key is (resource_definition_name, node_name).
 // Update/Patch follow the annotation contract documented on
 // ResourceGroupStore (nil = untouched, empty = clear).
+// Eleven methods rather than ten because the node-scoped listing earns its
+// place: without it every `node delete` answers a question about one node by
+// listing every Resource in the cluster.
+//
+//nolint:interfacebloat // one read shape per question the callers actually ask
 type ResourceStore interface {
 	List(ctx context.Context) ([]apiv1.Resource, error)
 	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error)
+
+	// ListByNode returns the replicas hosted on one node.
+	//
+	// The node-scoped question is asked on every `node delete`, on the
+	// refusal path as well as under --force, and answering it by listing
+	// every Resource in the cluster and filtering client-side is what the
+	// REST refusal did before it.
+	//
+	// On the Kubernetes store the filtering happens outside this process:
+	// the read goes to an uncached reader, the CLI's client or a manager's
+	// API reader, which sends a fieldSelector the API server answers because
+	// the CRD declares spec.nodeName selectable.
+	ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error)
 	Get(ctx context.Context, rdName, node string) (apiv1.Resource, error)
 	Create(ctx context.Context, r *apiv1.Resource) error
 	Update(ctx context.Context, r *apiv1.Resource) error
@@ -248,6 +305,29 @@ type ResourceStore interface {
 // surface; the implementation stitches it onto the RD CRD.
 type VolumeDefinitionStore interface {
 	List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error)
+
+	// ListAll returns every definition's volumes in ONE request, keyed by
+	// naming.Key of the resource-definition name — look an entry up with
+	// naming.Key(name), not with the name as you hold it.
+	//
+	// The fold is not decoration. A replica names its definition in
+	// whatever case it was written with, and the definition itself is
+	// stored in whatever case IT was written with; LINSTOR treats the two
+	// as the same object and a map does not. Keyed raw, a caller holding
+	// the replica's spelling silently misses the entry and renders a
+	// definition as though it had no volumes.
+	//
+	// List answers for one definition, and a caller that needs the whole
+	// cluster's volumes has to call it once per name. On the Kubernetes
+	// store each of those is a GET of one ResourceDefinition — and the CLI
+	// client is deliberately uncached, so they are real sequential round
+	// trips. `resource list` did exactly that to fill its
+	// sync-percentage column: one LIST plus one GET per definition, which
+	// is the command an operator runs during an incident.
+	//
+	// The volumes live inline on the definition, so a single list already
+	// carries them.
+	ListAll(ctx context.Context) (map[string][]apiv1.VolumeDefinition, error)
 	Get(ctx context.Context, rdName string, volumeNumber int32) (apiv1.VolumeDefinition, error)
 	Create(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
 
@@ -292,10 +372,30 @@ type VolumeDefinitionStore interface {
 type SnapshotStore interface {
 	List(ctx context.Context) ([]apiv1.Snapshot, error)
 	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)
+
+	// ListByDefinitionUncached answers the same question from the API server
+	// when the store has a direct reader. It is for readers that act on the
+	// answer at once, where the row most likely to be missing from or stale
+	// in a cache is exactly the one that matters: `rd d` (the refusal over
+	// existing snapshots and the sweep for the one that raced the delete),
+	// the per-definition list linstor-csi reads right after a snapshot delete
+	// to decide whether the definition can go, the snapshot delete's own
+	// read, and the clone paths. The paginated /v1/view/snapshots stays on
+	// the cached List, since an uncached read beside a cached one is the
+	// pagination regression the store's constructor records.
+	ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)
 	Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error)
 	Create(ctx context.Context, snap *apiv1.Snapshot) error
 	Update(ctx context.Context, snap *apiv1.Snapshot) error
 	Delete(ctx context.Context, rdName, snapName string) error
+
+	// PatchSnapshotProps runs mutate on the props of the snapshot as the
+	// API server holds it now and writes them back only if nobody changed
+	// the snapshot in between, re-running mutate on a fresh read when
+	// somebody did. Update is last writer wins on props; a read-decide-write
+	// of a prop another writer races, a reap's mark say, needs this. An
+	// error from mutate aborts with nothing written and is returned as is.
+	PatchSnapshotProps(ctx context.Context, rdName, snapName string, mutate func(props map[string]string) error) error
 }
 
 // PhysicalDeviceStore persists PhysicalDevice objects (Phase 10.7).

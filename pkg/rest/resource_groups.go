@@ -27,9 +27,11 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/pkg/errors"
@@ -77,14 +79,14 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 	// Optional filter the upstream LINSTOR CLI sends on
 	// `linstor rg l --resource-groups <name>...` — mirrors the
 	// `resource_definitions` filter on `rd l` (Bug 61) for the RG
-	// list endpoint. Same semantics: case-insensitive name match,
+	// list endpoint. Same semantics: names match as the store keys them,
 	// unknown names => empty list, missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_groups")
 	if len(nameFilter) > 0 {
 		filtered := rgs[:0]
 
 		for i := range rgs {
-			if matchAnyFold(nameFilter, rgs[i].Name) {
+			if matchAnyName(nameFilter, rgs[i].Name) {
 				filtered = append(filtered, rgs[i])
 			}
 		}
@@ -153,8 +155,18 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A volume group's flags are refused on every door that takes one, so
+	// none reaches the store to be listed and do nothing.
+	for i := range rg.VolumeGroups {
+		if len(rg.VolumeGroups[i].Flags) > 0 {
+			writeVGFlagsNotImplemented(w)
+
+			return
+		}
+	}
+
 	// Bug 97: see pkg/rest/input_validation.go — RFC-1123 subdomain
-	// validation at the REST boundary, before pkg/store/k8s.Name()
+	// validation at the REST boundary, before pkg/naming.Key()
 	// mangles the input.
 	nameErr := validateLinstorName("resource group", rg.Name)
 	if nameErr != nil {
@@ -163,10 +175,14 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := validateLayerStack(rg.SelectFilter.LayerStack)
+	err := canonicalizeLayerStack(&rg.SelectFilter.LayerStack)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
+		return
+	}
+
+	if refuseServerOwnedGroupProps(w, rg.Name, rg.Props, rg.OverrideProps) {
 		return
 	}
 
@@ -232,22 +248,8 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	// it to PatchResourceGroup. See rgUpdateWireGate — keeps the
 	// wire-validation rules out of the store error path and the handler
 	// under the funlen budget.
-	gateErr := rgUpdateWireGate(raw, &patch)
-	if gateErr != nil {
-		writeError(w, http.StatusBadRequest, gateErr.Error())
-
+	if s.refuseRGUpdate(w, r, name, raw, &patch) {
 		return
-	}
-
-	// Guarding create alone leaves the stack patchable afterwards, which is
-	// the same door by another name.
-	if patch.SelectFilter.LayerStack != nil {
-		luksErr := s.refuseLUKSWithoutPassphrase(r.Context(), patch.SelectFilter.LayerStack)
-		if luksErr != nil {
-			writeError(w, http.StatusBadRequest, luksErr.Error())
-
-			return
-		}
 	}
 
 	err := s.Store.ResourceGroups().PatchResourceGroup(r.Context(), name, func(existing *apiv1.ResourceGroup) error {
@@ -260,7 +262,7 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		// filter. Phase 11.x split pushed reconcilers into a
 		// separate process, so the REST handler can't walk RDs
 		// inline — instead it stamps the
-		// `blockstor.io/rebalance-pending` annotation and the
+		// `blockstor.org/rebalance-pending` annotation and the
 		// RGRebalanceReconciler picks it up. Scale-DOWN
 		// intentionally does NOT trigger anything.
 		rebalanceScheduled = rgNeedsRebalance(&prevFilter, &existing.SelectFilter)
@@ -373,7 +375,7 @@ func countChildRDs(ctx context.Context, st store.Store, rgName string) int {
 	n := 0
 
 	for i := range rds {
-		if rds[i].ResourceGroupName == rgName {
+		if naming.Same(rds[i].ResourceGroupName, rgName) {
 			n++
 		}
 	}
@@ -413,7 +415,10 @@ func rgNeedsRebalance(prev, next *apiv1.AutoSelectFilter) bool {
 		return true
 	}
 
-	if !slices.Equal(prev.LayerStack, next.LayerStack) {
+	// Case-blind: a stack stored as drbd,storage before writes were
+	// canonicalised is the same stack as DRBD,STORAGE, and a modify that
+	// resends it must not rebalance every child.
+	if !slices.EqualFunc(prev.LayerStack, next.LayerStack, strings.EqualFold) {
 		return true
 	}
 
@@ -624,6 +629,79 @@ func rgSelectFilterClearTable() map[string]func(*apiv1.AutoSelectFilter) {
 	}
 }
 
+// refuseRGUpdate runs every refusal an `rg modify` body meets before it is
+// merged. True means the refusal has been written.
+func (s *Server) refuseRGUpdate(
+	w http.ResponseWriter, r *http.Request, name string, raw []byte, patch *apiv1.ResourceGroup,
+) bool {
+	gateErr := rgUpdateWireGate(raw, patch)
+	if gateErr != nil {
+		writeError(w, http.StatusBadRequest, gateErr.Error())
+
+		return true
+	}
+
+	if refuseServerOwnedGroupProps(w, name, patch.Props, patch.OverrideProps) {
+		return true
+	}
+
+	// Guarding create alone leaves the stack patchable afterwards, which is
+	// the same door by another name.
+	if patch.SelectFilter.LayerStack != nil {
+		luksErr := s.refuseLUKSWithoutPassphrase(r.Context(), patch.SelectFilter.LayerStack)
+		if luksErr != nil {
+			writeError(w, http.StatusBadRequest, luksErr.Error())
+
+			return true
+		}
+	}
+
+	return false
+}
+
+// refuseServerOwnedGroupProps answers a group create or modify that would set
+// one of the props blockstor reads back off a definition. Spawn no longer
+// copies them, but a group is where linstor-csi lands StorageClass
+// parameters, so refusing them here keeps the group from holding a value
+// that means something on a definition. Removing one stays allowed: that is
+// how an operator cleans a group written before this check, so an override to
+// an empty value, the upstream spelling of a delete (`set-property KEY ""`),
+// is let through with delete_props and delete_namespaces. True means the
+// refusal has been written.
+func refuseServerOwnedGroupProps(w http.ResponseWriter, name string, props, overrideProps map[string]string) bool {
+	key := store.ServerOwnedPropEdit(props, nil, nil)
+	if key == "" {
+		key = store.ServerOwnedPropEdit(settingOverrides(overrideProps), nil, nil)
+	}
+
+	if key == "" {
+		return false
+	}
+
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: "resource group '" + name + "': props carry " + key + ", which blockstor sets itself",
+		Cause:   key + " records what blockstor did to a resource definition, and is read back to decide what to do next",
+		Correc:  "drop " + key + " from the group's props",
+	}})
+
+	return true
+}
+
+// settingOverrides drops the overrides that delete a key, an empty value,
+// leaving the ones that set one.
+func settingOverrides(overrideProps map[string]string) map[string]string {
+	setting := make(map[string]string, len(overrideProps))
+
+	for key, value := range overrideProps {
+		if value != "" {
+			setting[key] = value
+		}
+	}
+
+	return setting
+}
+
 // mergeRGProps applies the OverrideProps / DeleteProps merge
 // semantic LINSTOR uses for any property-bag-bearing object:
 // override entries land first, then delete entries strip their keys.
@@ -632,8 +710,13 @@ func rgSelectFilterClearTable() map[string]func(*apiv1.AutoSelectFilter) {
 // so an override entry with an empty value DELETES the key — the
 // `linstor rg set-property g DrbdOptions/Resource/on-no-quorum`
 // (no value) = delete-property semantic the upstream UG9 NOTE pins.
+//
+// delete_namespaces is the third half of the same envelope, and the body
+// declares it, so it is honoured: a field the body accepts and then drops
+// answers 200 for an edit that did not happen.
 func mergeRGProps(existing, patch *apiv1.ResourceGroup) {
 	existing.Props = applyPropsModify(existing.Props, patch.OverrideProps, patch.DeleteProps)
+	deletePropNamespaces(existing.Props, patch.DeleteNamespace)
 }
 
 // handleRGDelete drops a ResourceGroup.
@@ -959,7 +1042,7 @@ func rgUpdateWireGate(raw []byte, patch *apiv1.ResourceGroup) error {
 	// nil); a nil/empty stack is the legitimate "clear to default" and
 	// validateLayerStack accepts it.
 	if patch.SelectFilter.LayerStack != nil {
-		err := validateLayerStack(patch.SelectFilter.LayerStack)
+		err := canonicalizeLayerStack(&patch.SelectFilter.LayerStack)
 		if err != nil {
 			return err
 		}

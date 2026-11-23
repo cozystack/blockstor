@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -338,7 +339,7 @@ func sameAttach(existing, wanted *apiv1.PhysicalDeviceAttachTo) bool {
 		return false
 	}
 
-	return existing.StoragePoolName == wanted.StoragePoolName &&
+	return naming.Same(existing.StoragePoolName, wanted.StoragePoolName) &&
 		existing.ProviderKind == wanted.ProviderKind &&
 		existing.VGName == wanted.VGName &&
 		existing.ThinPoolName == wanted.ThinPoolName &&

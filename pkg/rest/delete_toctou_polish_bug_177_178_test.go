@@ -193,6 +193,26 @@ func (t *twoPhaseResourceStore) List(_ context.Context) ([]apiv1.Resource, error
 	return t.withRef, nil
 }
 
+// ListByNode models the same two phases. The node-delete refusal asks the
+// node-scoped question now, and a double that overrides only List would let
+// the call fall through to the real store and lose the race this test exists
+// to reproduce.
+func (t *twoPhaseResourceStore) ListByNode(_ context.Context, node string) ([]apiv1.Resource, error) {
+	n := t.calls.Add(1)
+	if n == 1 {
+		return []apiv1.Resource{}, nil
+	}
+
+	out := make([]apiv1.Resource, 0, len(t.withRef))
+	for i := range t.withRef {
+		if t.withRef[i].NodeName == node {
+			out = append(out, t.withRef[i])
+		}
+	}
+
+	return out, nil
+}
+
 // bug178NodeStore composites the two flaky views with the real
 // InMemory backing for everything else.
 type bug178NodeStore struct {

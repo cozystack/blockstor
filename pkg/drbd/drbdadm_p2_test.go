@@ -176,7 +176,7 @@ func TestAdmWipeMdInvokesDrbdmeta(t *testing.T) {
 		t.Fatalf("WipeMd: %v", err)
 	}
 
-	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal wipe-md"
+	want := "drbdmeta --force - v09 /dev/dm-3 internal wipe-md"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -188,7 +188,7 @@ func TestAdmWipeMdInvokesDrbdmeta(t *testing.T) {
 // emits the terser machine-parseable tuple).
 func TestAdmShowGIInvokesDrbdmeta(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal show-gi", storage.FakeResponse{
+	fx.Expect("drbdmeta --force - v09 /dev/dm-3 internal show-gi", storage.FakeResponse{
 		Stdout: []byte(`+--<  Current data generation UUID  >-
 | 78A0DDDABCDEF000
 `),
@@ -201,7 +201,7 @@ func TestAdmShowGIInvokesDrbdmeta(t *testing.T) {
 		t.Fatalf("ShowGI: %v", err)
 	}
 
-	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal show-gi"
+	want := "drbdmeta --force - v09 /dev/dm-3 internal show-gi"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -221,7 +221,7 @@ func TestAdmGetGIInvokesDrbdmeta(t *testing.T) {
 	// `--node-id 0` is mandatory on DRBD 9.2+/9.3 ("get-gi requires the
 	// --node-id option"); the device-level current-UUID is identical in
 	// every node-id slot so 0 is representative.
-	fx.Expect("drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal get-gi --node-id 0", storage.FakeResponse{
+	fx.Expect("drbdmeta --force - v09 /dev/dm-3 internal get-gi --node-id 0", storage.FakeResponse{
 		Stdout: []byte("78A0DDDABCDEF000:78A0DDDABCDEF000:0:0\n"),
 	})
 
@@ -232,7 +232,7 @@ func TestAdmGetGIInvokesDrbdmeta(t *testing.T) {
 		t.Fatalf("GetGI: %v", err)
 	}
 
-	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal get-gi --node-id 0"
+	want := "drbdmeta --force - v09 /dev/dm-3 internal get-gi --node-id 0"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}

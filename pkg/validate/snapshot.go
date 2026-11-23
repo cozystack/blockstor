@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // ErrRestoreNodeLacksSnapshot refuses a restore onto a node that does not
@@ -70,9 +72,11 @@ func RestoreNodesMissingSnapshot(named, snapshotNodes []string) []string {
 		return nil
 	}
 
+	// Both lists are read by the CR name a node maps to: the snapshot lists
+	// its nodes as registered, Node-1, and the operator may name node-1.
 	holds := make(map[string]struct{}, len(snapshotNodes))
 	for _, n := range snapshotNodes {
-		holds[n] = struct{}{}
+		holds[naming.Key(n)] = struct{}{}
 	}
 
 	seen := make(map[string]struct{}, len(named))
@@ -83,13 +87,14 @@ func RestoreNodesMissingSnapshot(named, snapshotNodes []string) []string {
 			continue
 		}
 
-		if _, dup := seen[n]; dup {
+		key := naming.Key(n)
+		if _, dup := seen[key]; dup {
 			continue
 		}
 
-		seen[n] = struct{}{}
+		seen[key] = struct{}{}
 
-		if _, ok := holds[n]; !ok {
+		if _, ok := holds[key]; !ok {
 			missing = append(missing, n)
 		}
 	}

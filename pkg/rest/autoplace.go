@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -120,9 +121,11 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	vdSizes := s.definitionVolumeSizes(r.Context(), rdName)
+
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {
-		out = append(out, wrapResourceWithVolumes(&resList[i]))
+		out = append(out, wrapResourceWithVolumes(&resList[i], vdSizes))
 	}
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys (passphrase,
@@ -137,8 +140,8 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
-	// before the JSON encode. The reconcilers stamp `blockstor.io/*`
-	// and `bug<N>.blockstor.cozystack.io/*` keys for in-process
+	// before the JSON encode. The reconcilers stamp `blockstor.org/*`
+	// and `bug<N>.blockstor.org/*` keys for in-process
 	// bookkeeping; the wire shape must not carry them. See
 	// pkg/rest/internal_annotations.go.
 	stripInternalAnnotationsFromResourcesWithVolumes(out)
@@ -146,8 +149,9 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// wrapResourceWithVolumes wraps a Resource into ResourceWithVolumes so
-// the `volumes` JSON key is always present (never `null`). Bug-hunt
+// wrapResourceWithVolumes wraps a Resource into ResourceWithVolumes with
+// a volume for every volume definition (see ensureVolumesForView) and
+// the `volumes` JSON key always present (never `null`). Bug-hunt
 // v0.1.3 Finding 3: handleResourceList / handleResourceGet wrapped via
 // `ResourceWithVolumes{Resource: res}` leaving the outer Volumes nil,
 // which `encoding/json` serialises as `"volumes":null`. Upstream
@@ -156,13 +160,8 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 // unconditionally and crashes on `None.iter`. Mirrors the
 // ensureVolumesForView contract used by /v1/view/resources: a non-nil
 // (possibly empty) slice survives the JSON encode as `[]`.
-func wrapResourceWithVolumes(res *apiv1.Resource) apiv1.ResourceWithVolumes {
-	out := apiv1.ResourceWithVolumes{Resource: *res, Volumes: res.Volumes}
-	if out.Volumes == nil {
-		out.Volumes = []apiv1.Volume{}
-	}
-
-	return out
+func wrapResourceWithVolumes(res *apiv1.Resource, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
+	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, res, vdSizes)}
 }
 
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
@@ -225,7 +224,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// outer `volumes` JSON key serialises as `[]` instead of `null` when
 	// the Resource carries no Volumes; protects python-linstor's
 	// `rsc._rest_data['volumes']` dereference.
-	writeJSON(w, http.StatusOK, wrapResourceWithVolumes(&res))
+	writeJSON(w, http.StatusOK, wrapResourceWithVolumes(&res, s.definitionVolumeSizes(r.Context(), rdName)))
 }
 
 // handleAutoplace selects up to `place_count` nodes that have a storage
@@ -542,7 +541,7 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 		return true
 	}
 
-	rd.LayerStack = append([]string(nil), layerList...)
+	rd.LayerStack = storedLayerStack(layerList)
 
 	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — the
 	// closure mutates a freshly-fetched live RD on every retry, so
@@ -557,7 +556,7 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 			return nil
 		}
 
-		live.LayerStack = append([]string(nil), layerList...)
+		live.LayerStack = storedLayerStack(layerList)
 
 		return nil
 	})
@@ -643,7 +642,7 @@ func (s *Server) resolveAdditionalPlaceCount(ctx context.Context, rdName string,
 	diskful := 0
 
 	for i := range existing {
-		if _, off := disabled[existing[i].NodeName]; off {
+		if _, off := disabled[naming.Key(existing[i].NodeName)]; off {
 			continue
 		}
 
@@ -857,12 +856,7 @@ func resolveCloneSourceProviderKind(ctx context.Context, st store.Store, rd *api
 		return ""
 	}
 
-	srcRD, _, ok := strings.Cut(stamp, ":")
-	if !ok || srcRD == "" {
-		return ""
-	}
-
-	return placer.SourceProviderKind(ctx, st, srcRD)
+	return placer.RestoreSourceProviderKind(ctx, st, stamp)
 }
 
 // constrainAutoplaceToSnapshotNodes restricts the filter's
@@ -1434,7 +1428,7 @@ func (s *Server) handleResourceCreateOnNode(w http.ResponseWriter, r *http.Reque
 	switch {
 	case env.Resource.NodeName == "":
 		env.Resource.NodeName = node
-	case env.Resource.NodeName != node:
+	case !naming.Same(env.Resource.NodeName, node):
 		writeError(w, http.StatusBadRequest,
 			"single-node resource create: body node '"+env.Resource.NodeName+
 				"' does not match URL path node '"+node+"'")
@@ -1477,6 +1471,12 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		return nil, false
 	}
 
+	// The replicas are written one at a time, and LINSTOR writes them in
+	// one transaction: without the hold the tiebreaker reconciler sees
+	// the first two of `r c n1 n2 n3` as an even-diskful tie and puts a
+	// witness on n3 before its own create turns it diskful.
+	defer placer.HoldWitness(r.Context(), s.Store, rdName, countDiskfulEnvelopes(envelopes))()
+
 	created := make([]apiv1.Resource, 0, len(envelopes))
 
 	for i := range envelopes {
@@ -1489,6 +1489,21 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	}
 
 	return created, true
+}
+
+// countDiskfulEnvelopes counts the envelopes of a resource create that
+// ask for a diskful replica: neither spelling of the diskless flag.
+func countDiskfulEnvelopes(envelopes []apiv1.ResourceCreate) int {
+	n := 0
+
+	for i := range envelopes {
+		flags := envelopes[i].Resource.Flags
+		if !slices.Contains(flags, apiv1.ResourceFlagDiskless) && !slices.Contains(flags, rscFlagDrbdDiskless) {
+			n++
+		}
+	}
+
+	return n
 }
 
 // createOneResource runs the full per-envelope wire-boundary
@@ -1540,7 +1555,7 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 		_ = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
 			func(rd *apiv1.ResourceDefinition) error {
 				if len(rd.LayerStack) == 0 {
-					rd.LayerStack = append([]string(nil), env.LayerList...)
+					rd.LayerStack = storedLayerStack(env.LayerList)
 				}
 
 				return nil
@@ -1707,7 +1722,7 @@ func (s *Server) refuseResourceCreateOnSPDeletedRace(w http.ResponseWriter, r *h
 
 		writeError(w, http.StatusNotFound,
 			"storage pool '"+pool+"' was deleted on node '"+res.NodeName+
-				"' concurrently with the resource create (Bug 145): "+
+				"' concurrently with the resource create: "+
 				"retry after re-creating the pool, or pick a different pool")
 
 		return false
@@ -1745,7 +1760,7 @@ func (s *Server) refuseResourceCreateOnNodeDeletedRace(w http.ResponseWriter, r 
 
 		writeError(w, http.StatusNotFound,
 			"node '"+res.NodeName+"' was deleted concurrently with "+
-				"the resource create (Bug 174): retry after re-creating "+
+				"the resource create: retry after re-creating "+
 				"the node, or pick a different node")
 
 		return false
@@ -2041,7 +2056,7 @@ func (s *Server) resolveTakeoverStorPool(ctx context.Context, rdName, takeoverNo
 	siblings, listErr := s.Store.Resources().ListByDefinition(ctx, rdName)
 	if listErr == nil {
 		for i := range siblings {
-			if siblings[i].NodeName == takeoverNode {
+			if naming.Same(siblings[i].NodeName, takeoverNode) {
 				continue
 			}
 
@@ -2507,7 +2522,7 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 		err = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
 			func(live *apiv1.ResourceDefinition) error {
 				if len(live.LayerStack) == 0 {
-					live.LayerStack = append([]string(nil), req.LayerList...)
+					live.LayerStack = storedLayerStack(req.LayerList)
 				}
 
 				return nil
@@ -2852,6 +2867,12 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
 
+	// Drop a witness the delete left without a tie to break before
+	// replying, as upstream does for the shapes where its helper no
+	// longer wants one, so the caller's next listing shows it as going.
+	// See resource_delete_orphan_witness.go.
+	s.reapUnneededWitnesses(r.Context(), rdName)
+
 	// Bug 67: notify surviving sibling Resources of the peer change
 	// so satellite reconcilers re-derive their peer set without the
 	// dropped replica. Order ("delete first, bump second") ensures a
@@ -2914,7 +2935,7 @@ func (s *Server) bumpPeerChangedOnSiblings(ctx context.Context, rdName, removedN
 
 	for i := range siblings {
 		sib := &siblings[i]
-		if sib.NodeName == removedNode {
+		if naming.Same(sib.NodeName, removedNode) {
 			// Defensive: the deleted Resource should already be
 			// absent from the list, but a racing Create could
 			// surface a fresh replica on the same node — never

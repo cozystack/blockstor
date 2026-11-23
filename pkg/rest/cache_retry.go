@@ -209,6 +209,11 @@ func getResourceWithCacheRetry(ctx context.Context, st store.Store, rdName, node
 		})
 }
 
+// getResourceUncached reads one replica past the cache where the store can.
+func getResourceUncached(ctx context.Context, st store.Store, rdName, node string) (apiv1.Resource, error) {
+	return store.GetResourceUncached(ctx, st, rdName, node) //nolint:wrapcheck // the store wraps with the replica it names
+}
+
 // patchNodeSpecWithCacheRetry runs PatchNodeSpec, retrying on
 // store.ErrNotFound to absorb informer-cache lag. The only caller is
 // the node-register upsert fall-through: `Nodes().Create` just came

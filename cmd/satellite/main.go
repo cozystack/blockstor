@@ -43,8 +43,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/cozystack/blockstor/pkg/apihealth"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/satellite/controllers"
+	"github.com/cozystack/blockstor/pkg/satellite/stream"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/uevent"
 )
@@ -57,25 +59,13 @@ func main() {
 // only ever calls os.Exit(run()) so there are no defers in the same frame
 // as the os.Exit call.
 func run() int {
-	var (
-		nodeName            string
-		stateDir            string
-		probeAddr           string
-		controllerNamespace string
-	)
+	opts, err := parseFlags(flag.CommandLine, os.Args[1:])
 
-	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"),
-		"name this satellite registers under (defaults to NODE_NAME env)")
-	flag.StringVar(&stateDir, "state-dir", "/var/lib/blockstor-satellite",
-		"directory the satellite uses to persist DRBD .res files and per-resource state")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
-		"The address the /healthz and /readyz probe endpoints bind to.")
-	flag.StringVar(&controllerNamespace, "controller-namespace", "",
-		"Namespace where the controller's Secrets (cluster master passphrase) live (default: $POD_NAMESPACE, then 'blockstor-system').")
-
-	flag.Parse()
-
-	controllerNamespace = resolveControllerNamespace(controllerNamespace)
+	nodeName := opts.nodeName
+	stateDir := opts.stateDir
+	probeAddr := opts.probeAddr
+	controllerNamespace := resolveControllerNamespace(opts.controllerNamespace)
+	streamTLS := opts.streamTLS
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -87,6 +77,12 @@ func run() int {
 	// goroutine dump prints once on startup and reconciler errors
 	// disappear).
 	ctrl.SetLogger(logr.FromSlogHandler(logger.Handler()))
+
+	if err != nil {
+		logger.Error("invalid flags", "err", err)
+
+		return 1
+	}
 
 	if nodeName == "" {
 		logger.Error("node-name is required (pass --node-name or set NODE_NAME)")
@@ -160,13 +156,32 @@ func run() int {
 	// Outdated replica for the reconciler to adjust.
 	healthy := healthyKernelResources(ctx, logger)
 
+	restCfg, err := loadRESTConfig()
+	if err != nil {
+		logger.Error("no Kubernetes config", "err", err)
+
+		return 1
+	}
+
+	// The kernel is shared with whatever else runs DRBD on the node, LINSTOR
+	// during a migration among them, so only a resource blockstor has a
+	// replica of here is blockstor's to take down. A read that fails leaves
+	// that unknown, and then nothing is taken down.
+	owned, ownedErr := ownedKernelResources(ctx, restCfg, nodeName)
+	if ownedErr != nil {
+		logger.Info("cold-start: cannot read which DRBD resources are blockstor's; leaving the kernel as it is",
+			"err", ownedErr.Error())
+
+		owned = nil
+	}
+
 	// Tear down only the kernel resources that are NOT in the healthy
 	// set. Without this, a reconcile that re-allocates a node-id
 	// (e.g. the dispatcher picked a different id after a peer joined /
 	// left) would hit "peer node id cannot be my own node id" on a
 	// genuinely orphaned slot — but a live replica's node-id is
 	// reconciled by `drbdadm adjust`, not by a destructive down.
-	cleanKernelState(ctx, logger, healthy)
+	cleanKernelState(ctx, logger, healthy, owned)
 
 	// Wipe stale .res files, but PRESERVE the ones backing a healthy
 	// kernel resource. The c-r reconciler re-renders every Resource
@@ -175,13 +190,6 @@ func run() int {
 	// interim `drbdadm adjust` has something to read. Orphan .res
 	// files (no matching live kernel resource) are still wiped.
 	cleanStateDir(stateDir, healthy, logger)
-
-	restCfg, err := loadRESTConfig()
-	if err != nil {
-		logger.Error("no Kubernetes config", "err", err)
-
-		return 1
-	}
 
 	// readyState gates the /readyz probe: not-ready until the
 	// controller-runtime manager's cache has completed its initial
@@ -198,8 +206,9 @@ func run() int {
 		LocalAddress:           localAddress,
 		Logger:                 logger,
 		RESTConfig:             restCfg,
-		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace),
+		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace, streamTLS),
 		HealthProbeBindAddress: probeAddr,
+		StreamTLS:              streamTLS,
 		OnCacheSynced: func() {
 			logger.Info("satellite cache sync complete, marking ready")
 			ready.MarkReady()
@@ -228,12 +237,7 @@ func run() int {
 // now aborts startup rather than silently falling back to the
 // (removed) gRPC path.
 func loadRESTConfig() (*rest.Config, error) {
-	cfg, err := ctrl.GetConfig()
-	if err != nil {
-		return nil, errors.Wrap(err, "load Kubernetes config")
-	}
-
-	return cfg, nil
+	return apihealth.GetConfig() //nolint:wrapcheck // apihealth wraps it
 }
 
 // mgrFactory returns a satellite.ManagerFactory closure that builds
@@ -245,7 +249,10 @@ func loadRESTConfig() (*rest.Config, error) {
 // The factory shape lets the agent stay ignorant of the readyState
 // + logger plumbing — it only sees the standard
 // satellite.ManagerFactory signature.
-func mgrFactory(ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier, controllerNamespace string) satellite.ManagerFactory {
+func mgrFactory(
+	ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier,
+	controllerNamespace string, streamTLS stream.TLSFiles,
+) satellite.ManagerFactory {
 	return func(restCfg *rest.Config, nodeName, probeAddr string, rec *satellite.Reconciler) (manager.Manager, error) {
 		mgr, err := controllers.NewManager(restCfg, &controllers.Config{
 			NodeName:               nodeName,
@@ -261,6 +268,7 @@ func mgrFactory(ready *readyState, logger *slog.Logger, ueventListener controlle
 			// PhysicalDeviceDiscoveryRunnable falls back to pure-
 			// polling discovery.
 			UeventListener: ueventListener,
+			StreamTLS:      streamTLS,
 		})
 		if err != nil {
 			return nil, err //nolint:wrapcheck // controllers.NewManager already wraps
@@ -345,6 +353,11 @@ func cleanStateDir(dir string, healthy map[string]struct{}, logger *slog.Logger)
 // non-destructive way to reconcile a stale node-id on a live replica.
 // Best-effort: failures are logged + ignored.
 //
+// Only a resource in `owned`, one blockstor has a Resource object for on
+// this node, is taken down: the kernel is shared with any other DRBD user,
+// LINSTOR during a migration among them. A nil `owned`, the API server
+// unreadable, downs nothing.
+//
 // P0 safety (cold-start kernel handling): the previous version downed
 // *every* kernel resource unconditionally. A satellite restart during
 // initial-sync (rolling upgrade) therefore tore down a healthy replica
@@ -369,7 +382,11 @@ func cleanStateDir(dir string, healthy map[string]struct{}, logger *slog.Logger)
 // Bug 285 (P1): enumerate via `drbdsetup status` (kernel-state, no
 // .res files needed) and `drbdsetup down <name>` per resource with its
 // own short timeout so one wedged resource doesn't starve the rest.
-func cleanKernelState(ctx context.Context, logger *slog.Logger, healthy map[string]struct{}) {
+func cleanKernelState(ctx context.Context, logger *slog.Logger, healthy, owned map[string]struct{}) {
+	if owned == nil {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
@@ -384,14 +401,10 @@ func cleanKernelState(ctx context.Context, logger *slog.Logger, healthy map[stri
 		return
 	}
 
-	var orphans []string
-
-	for _, name := range names {
-		if _, ok := healthy[name]; ok {
-			continue
-		}
-
-		orphans = append(orphans, name)
+	orphans, foreign := selectOrphans(names, healthy, owned)
+	if len(foreign) > 0 {
+		logger.Info("cold-start: leaving DRBD resources blockstor has no replica of on this node",
+			"resources", foreign)
 	}
 
 	if len(orphans) == 0 {
@@ -513,14 +526,27 @@ func healthyKernelResources(ctx context.Context, logger *slog.Logger) map[string
 		return nil
 	}
 
+	return classifyKernelResources(ctx, logger, names, resourceIsHealthy)
+}
+
+// classifyKernelResources runs probe over names and returns the ones to keep.
+func classifyKernelResources(
+	ctx context.Context, logger *slog.Logger, names []string,
+	probe func(context.Context, string) (bool, error),
+) map[string]struct{} {
 	healthy := make(map[string]struct{}, len(names))
 
 	for _, name := range names {
-		ok, perr := resourceIsHealthy(ctx, name)
+		ok, perr := probe(ctx, name)
 		if perr != nil {
-			logger.Info("cold-start health probe failed; treating as orphan",
+			// A probe that cannot tell is not evidence of an orphan, and
+			// taking a replica down is the step that cannot be undone, so
+			// it stays for the reconciler.
+			logger.Info("cold-start health probe failed; keeping the resource",
 				"resource", name,
 				"err", perr.Error())
+
+			healthy[name] = struct{}{}
 
 			continue
 		}

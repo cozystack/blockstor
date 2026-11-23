@@ -165,7 +165,7 @@ trap 'delete_rd "$RD"' EXIT
 # throughout` would have to grow into a 3-way invariant).
 echo ">> apply 2-replica RD on $N1 + $N2 (no tiebreaker)"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -174,7 +174,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_KIB}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:
@@ -182,7 +182,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N2}}
 spec:
@@ -252,7 +252,7 @@ fi
 # (`drbdadm adjust --skip-disk`), so Diskless is durable. Step 5 relies
 # on this too; setting it here is idempotent.
 echo ">> pin DrbdOptions/SkipDisk=True on ${RD}.${N1} before detach (block reconciler re-attach race)"
-kubectl patch "resource.blockstor.cozystack.io/${RD}.${N1}" --type=merge \
+kubectl patch "resource.blockstor.org/${RD}.${N1}" --type=merge \
     -p '{"spec":{"props":{"DrbdOptions/SkipDisk":"True"}}}'
 sleep 5  # let the reconciler observe SkipDisk before we detach
 
@@ -328,7 +328,7 @@ window_start=$(date +%s)
 # lower disk alone". The prop is cleared after `drbdadm attach`
 # below so normal reconciliation resumes.
 echo ">> pin DrbdOptions/SkipDisk=True on ${RD}.${N1} (block reconciler re-attach race)"
-kubectl patch "resource.blockstor.cozystack.io/${RD}.${N1}" --type=merge \
+kubectl patch "resource.blockstor.org/${RD}.${N1}" --type=merge \
     -p '{"spec":{"props":{"DrbdOptions/SkipDisk":"True"}}}'
 
 # Run 29 deep-dive: drbdmeta create-md was failing with exit 20 (Device
@@ -387,7 +387,7 @@ if (( recipe_rc != 0 )); then
         echo "KNOWN-FLAKE: recipe lost the race against satellite reconciler on QEMU (rc=$recipe_rc) — counted as PASS"
         # Best-effort cleanup of the half-recreated state before the
         # EXIT trap deletes the RD.
-        kubectl patch "resource.blockstor.cozystack.io/${RD}.${N1}" --type=merge \
+        kubectl patch "resource.blockstor.org/${RD}.${N1}" --type=merge \
             -p '{"spec":{"props":{"DrbdOptions/SkipDisk":null}}}' 2>/dev/null || true
         exit 0
     fi
@@ -396,7 +396,7 @@ if (( recipe_rc != 0 )); then
 fi
 
 echo ">> clear DrbdOptions/SkipDisk on ${RD}.${N1} (resume normal reconciliation)"
-kubectl patch "resource.blockstor.cozystack.io/${RD}.${N1}" --type=merge \
+kubectl patch "resource.blockstor.org/${RD}.${N1}" --type=merge \
     -p '{"spec":{"props":{"DrbdOptions/SkipDisk":null}}}'
 
 # ---------- step 6: wait for N1 → UpToDate via bitmap resync ----------

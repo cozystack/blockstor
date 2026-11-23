@@ -77,6 +77,11 @@ func patchRetryBackoff() wait.Backoff {
 // nodes implements store.NodeStore against the Node CRD.
 type nodes struct {
 	c ctrlclient.Client
+
+	// apiReader is the manager's direct reader, when the store was built
+	// with one. Only GetUncached uses it — every other read here is on a
+	// path that either polls for convergence or does not act on the answer.
+	apiReader ctrlclient.Reader
 }
 
 // List returns all Node CRDs as wire-shape apiv1.Node values, sorted by name.
@@ -100,18 +105,18 @@ func (n *nodes) List(ctx context.Context) ([]apiv1.Node, error) {
 
 // Get returns the named Node CRD as an apiv1.Node, or ErrNotFound.
 func (n *nodes) Get(ctx context.Context, name string) (apiv1.Node, error) {
-	var crd crdv1alpha1.Node
+	return n.get(ctx, n.c, name)
+}
 
-	err := n.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &crd)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return apiv1.Node{}, errors.Wrapf(store.ErrNotFound, "node %q", name)
-		}
-
-		return apiv1.Node{}, errors.Wrapf(err, "get Node %q", name)
+// GetUncached reads the node from the API server when the store has a direct
+// reader, so a decision taken on ConnectionStatus is not taken on a cached
+// value the satellite has already moved past. See store.NodeStore.
+func (n *nodes) GetUncached(ctx context.Context, name string) (apiv1.Node, error) {
+	if n.apiReader != nil {
+		return n.get(ctx, n.apiReader, name)
 	}
 
-	return crdToWireNode(&crd), nil
+	return n.get(ctx, n.c, name)
 }
 
 // Create persists a new Node CRD from an apiv1.Node value.
@@ -391,11 +396,26 @@ func (n *nodes) Delete(ctx context.Context, name string) error {
 	return nil
 }
 
+func (n *nodes) get(ctx context.Context, reader ctrlclient.Reader, name string) (apiv1.Node, error) {
+	var crd crdv1alpha1.Node
+
+	err := reader.Get(ctx, types.NamespacedName{Name: Name(name)}, &crd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return apiv1.Node{}, errors.Wrapf(store.ErrNotFound, "node %q", name)
+		}
+
+		return apiv1.Node{}, errors.Wrapf(err, "get Node %q", name)
+	}
+
+	return crdToWireNode(&crd), nil
+}
+
 // crdToWireNode flattens a Node CRD into the LINSTOR REST shape.
 // Phase 10.3: re-emits typed `Spec.SatelliteEndpoint` back into the
 // wire `Props["SatelliteEndpoint"]` so golinstor + the dispatcher's
 // fallback path keep seeing the same shape on GET. Native
-// `topology.blockstor.io/<key>` labels on the Node CRD ALSO get
+// `topology.blockstor.org/<key>` labels on the Node CRD ALSO get
 // folded back into `Props["Aux/<key>"]` so the autoplacer's
 // existing replicas_on_same / replicas_on_different filters keep
 // working unchanged across the labels migration.
@@ -515,7 +535,7 @@ func wireToCRDNodeSpec(in *apiv1.Node) crdv1alpha1.NodeSpec {
 // Replaces upstream LINSTOR's `Props["Aux/<key>"]` shape so that
 // the autoplacer can use `client.MatchingLabels` selectors and the
 // keys feed into `topologySpreadConstraints` for free. Phase 10.3.
-const TopologyLabelPrefix = "topology.blockstor.io/"
+const TopologyLabelPrefix = "topology.blockstor.org/"
 
 // hasTopologyLabels reports whether any of the Node's metadata
 // labels lives under the blockstor topology prefix. Cheap pre-
@@ -531,7 +551,7 @@ func hasTopologyLabels(labels map[string]string) bool {
 	return false
 }
 
-// foldTopologyLabels copies every `topology.blockstor.io/<key>`
+// foldTopologyLabels copies every `topology.blockstor.org/<key>`
 // label into `props["Aux/<key>"]` so existing readers (autoplacer
 // auxKey lookups, golinstor over the wire) see the topology
 // information without any changes. Mutates props in place.

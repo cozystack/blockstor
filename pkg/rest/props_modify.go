@@ -18,6 +18,12 @@ limitations under the License.
 
 package rest
 
+import (
+	"net/http"
+
+	"github.com/cozystack/blockstor/pkg/store"
+)
+
 // applyPropsModify is the shared property-bag merge core. Every
 // LINSTOR object that accepts a `GenericPropsModify` envelope
 // (override_props + delete_props) applies the same semantic, and
@@ -64,4 +70,55 @@ func applyPropsModify(props, override map[string]string, del []string) map[strin
 	}
 
 	return props
+}
+
+// deletePropNamespaces strips every property under the named namespaces, the
+// `delete_namespaces` half of upstream's props-modify envelope, and is the one
+// implementation every door uses. A namespace covers the keys below it and not
+// a key that spells it exactly: `DrbdOptions` takes `DrbdOptions/Net/protocol`
+// and leaves both `DrbdOptions` and `DrbdOptionsOther` alone. That is
+// upstream's reading: its PropsContainer keeps a key and the namespace of the
+// same name apart, and removeNamespace clears only the namespace.
+func deletePropNamespaces(props map[string]string, namespaces []string) {
+	for _, ns := range namespaces {
+		for key := range props {
+			if store.NamespaceCovers(ns, key) {
+				delete(props, key)
+			}
+		}
+	}
+}
+
+// The wire names of the props-modify envelope's three fields.
+const (
+	fieldOverrideProps    = "override_props"
+	fieldDeleteProps      = "delete_props"
+	fieldDeleteNamespaces = "delete_namespaces"
+)
+
+// refusePropsModifyOnCreate answers a create door that received the
+// props-modify fields. Those fields edit props that already exist, and a
+// create has none yet; neither golinstor nor python-linstor sends them on
+// rd create or rg spawn. Honouring them would invent semantics, and dropping
+// them answers success for an edit that never happened, so they are refused
+// with the field named. Returns true when the request was answered.
+func refusePropsModifyOnCreate(w http.ResponseWriter, door string, override map[string]string, del, namespaces []string) bool {
+	var field string
+
+	switch {
+	case len(override) > 0:
+		field = fieldOverrideProps
+	case len(del) > 0:
+		field = fieldDeleteProps
+	case len(namespaces) > 0:
+		field = fieldDeleteNamespaces
+	default:
+		return false
+	}
+
+	writeError(w, http.StatusBadRequest,
+		door+" does not take "+field+": set the properties on the definition once it exists, "+
+			"with `linstor rd set-property` or a resource-definition modify")
+
+	return true
 }

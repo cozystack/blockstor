@@ -24,6 +24,7 @@ import (
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // registerQuerySizeInfo wires `linstor query-size-info` and the
@@ -179,11 +180,11 @@ func collectCandidates(pools []apiv1.StoragePool, disabled map[string]struct{}, 
 			continue
 		}
 
-		if _, off := disabled[pool.NodeName]; off {
+		if _, off := disabled[naming.Key(pool.NodeName)]; off {
 			continue
 		}
 
-		if filter != nil && filter.StoragePool != "" && pool.StoragePoolName != filter.StoragePool {
+		if filter != nil && filter.StoragePool != "" && !naming.Same(pool.StoragePoolName, filter.StoragePool) {
 			continue
 		}
 
@@ -357,7 +358,8 @@ func replicaCount(filter *apiv1.AutoSelectFilter) int {
 
 // disabledNodes mirrors placer's same-named helper for the
 // query-size-info path (we don't want to count EVICTED/LOST node
-// pools toward "available" capacity).
+// pools toward "available" capacity). It is keyed by CR name, so a
+// pool created as node-1 on a node registered as Node-1 is found.
 func (s *Server) disabledNodes(ctx context.Context) (map[string]struct{}, error) {
 	nodes, err := s.Store.Nodes().List(ctx)
 	if err != nil {
@@ -369,7 +371,7 @@ func (s *Server) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 	for i := range nodes {
 		for _, f := range nodes[i].Flags {
 			if f == apiv1.NodeFlagEvicted || f == apiv1.NodeFlagLost {
-				out[nodes[i].Name] = struct{}{}
+				out[naming.Key(nodes[i].Name)] = struct{}{}
 
 				break
 			}

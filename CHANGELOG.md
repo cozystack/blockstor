@@ -4,6 +4,66 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.3.0 — 2026-11-16
+
+Every LUKS volume gets its own password under a cluster master key that several passphrases can open, and the LINSTOR migration keeps each replica's DRBD port.
+
+### Breaking changes
+
+- **LUKS volumes get a password each, wrapped under a master key (#258).** The master key lives in the keyring Secret `blockstor-master-key`, wrapped once per master passphrase, and the passphrase comes from a Secret in piraeus's shape named by `ControllerConfig.spec.passphraseSecretRef` (key `MASTER_PASSPHRASE`). A LUKS volume formatted with the single cluster passphrase of earlier releases is neither opened nor re-formatted: its replica reports `LUKSKeyMissing` and the data stays on disk, so copy such volumes to volumes created after the upgrade. The Secret key `passphrase`, the default Secret `blockstor-cluster-passphrase` and the `LuksPassphrase` property are gone, and the satellite reads only three named Secrets in its namespace.
+
+### Added
+
+- `blockstor encryption add-passphrase`, `remove-passphrase` and `list-passphrases`, and `modify-passphrase` while LUKS volumes exist (#258). Changing a passphrase touches no volume.
+- `linstor-migrate` imports LINSTOR's LUKS volume passwords: it decrypts them with the LINSTOR master passphrase and re-wraps them under a blockstor keyring whose first passphrase is LINSTOR's, so the piraeus Secret keeps opening the cluster (#258, #257).
+
+### Fixed
+
+- **`linstor-migrate` gives each replica its own node's DRBD port (#256).** LINSTOR 1.33 can give each node its own port for one definition, and the converter kept one per definition, so a replica could be adopted on another node's port and reconnect under live I/O. The port map now takes `<rd> <node> <port>` lines, two replicas on one node port are refused, the capture script in the runbook covers IPv6, and every warning that ends in a fresh port says `no DRBD port` (#261).
+
+## v0.2.1 — 2026-11-12
+
+Bugfix release.
+
+### Fixed
+
+- **An LVM thin pool left inactive by a reboot is activated (#229).** After a node reboot a thin pool comes back as metadata only, `lvs` reports its size with an empty `data_percent`, and the satellite took that for a destroyed pool: it zeroed the pool's capacity and the placer skipped the node. On a rolling upgrade that left every LVM thin pool without capacity and volume creation failing cluster-wide with `Not enough available nodes`. The satellite now reads `lv_attr` with the capacity, activates an inactive pool once and probes it again. An active pool still costs a single `lvs`, and a pool that reports nothing is still marked missing.
+
+## v0.2.0 — 2026-11-12
+
+The API group moves to `blockstor.org`, so this release is installed from scratch: an installation of v0.1.17 or earlier is not upgraded in place. It also brings the native CLI, the LINSTOR migration converter and the project site.
+
+### Breaking changes
+
+- **API group is `blockstor.org` (#221).** Every kind moves to `blockstor.org/v1alpha1`, and label and annotation keys from `blockstor.io/` to `blockstor.org/`. The old group and keys are not read and there is no migration; see "Upgrading from v0.1.17 or earlier" on the site.
+- **The LUKS master passphrase is read from its Secret only (#222).**
+- **The snapshot stream between satellites moved to port 3372 (#190) and runs over mutual TLS with its own CA (#219).**
+- **The API server's plain HTTP port listens on loopback only (#215).**
+
+### Added
+
+- Native `blockstor` CLI that talks to Kubernetes directly (#181).
+- LINSTOR to blockstor migration converter (#180), with adoption fixes for live clusters (#183): definitions whose replicas disagree on the layer stack are skipped (#223), an unreadable layer stack is reported (#226), and replicas with external DRBD metadata are refused (#227).
+- The blockstor.org site (#205).
+- A clone reaps the internal snapshot it took on its source (#200).
+
+### Fixed
+
+- CSI clone and restore work again, and their retries are idempotent (#190). A clone or restore is rolled back when its parent group is deleted (#193). A restore keeps its source, refuses orphan targets and takes over stale rollback marks (#218).
+- A definition's layer stack is decided once, and LUKS never formats a device that already holds data (#206).
+- A crashed replica's activity log is repaired instead of the replica being re-initialised (#220), and only valid hex generations are recorded (#225).
+- A removed DRBD peer is forgotten through the kernel, and `drbdmeta` is addressed without a minor (#224).
+- Create endpoints refuse props edits and honour `definitions_only` (#216).
+- Replicas, snapshots and nodes are found under any spelling of their names, and layer stacks are stored in canonical case (#217).
+
+### Performance
+
+- The store and the CLI no longer read the whole cluster to answer narrow questions (#191).
+
+### Testing
+
+- The REST and e2e harnesses no longer depend on the project's own stands, and the `pkg/rest` "server did not stop within 2s" flake is fixed (#199).
+
 ## v0.1.17 — 2026-07-04
 
 Adversarial-hardening release. A red/blue agent loop attacked the control-plane / API / store / controller surface through the public REST + `linstor` CLI interfaces (concurrency, cache-lag, autoplace/tiebreaker/quorum, VolumeNumber races, snapshot bookkeeping, node evict/restore/lost/drain, input-boundary fuzzing, reconciler races). Two adversarial passes across the V1–V5 sweep, snapshot-restore, resource-connection-path, pagination-under-mutation and every CRD↔wire transcode surfaced THREE real breaks — all the same class: a `modify` path skipping the validation or field-carry-across the `create` path enforces — fixed below (that seam is now mined dry and guarded by a carry-across tripwire). DRBD-kernel scenarios (satellite mkfs/attach, split-brain, real sync) and two parity/product questions were deferred to the live stand (see "Deferred").
@@ -80,7 +140,7 @@ Release-gate hardening release. A full independent acceptance gate (default NO-G
 
 ### Known issues
 
-- **Concurrent rapid late `vd c` (BUG-048; "Bug 50" in `docs/known-issues.md`)** — two back-to-back manual `volume-definition create` calls on an existing multi-replica RD can intermittently drop or wedge the second volume. Operator-only (NOT reachable via CSI, which creates exactly one volume-definition per resource-definition), availability-only (no data loss, no node-reboot deadlock), recoverable by deleting and re-adding the volume-definition sequentially. A code fix is in progress.
+- **Concurrent rapid late `vd c` (BUG-048; "Bug 50" in `docs/known-issues.md`, since removed)** — two back-to-back manual `volume-definition create` calls on an existing multi-replica RD can intermittently drop or wedge the second volume. Operator-only (NOT reachable via CSI, which creates exactly one volume-definition per resource-definition), availability-only (no data loss, no node-reboot deadlock), recoverable by deleting and re-adding the volume-definition sequentially. A code fix is in progress.
 
 ### Testing & infrastructure
 

@@ -1,4 +1,4 @@
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Snapshot
 metadata:
   labels:

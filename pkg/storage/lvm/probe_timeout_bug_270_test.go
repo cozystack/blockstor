@@ -86,7 +86,7 @@ func TestPoolStatusBoundsBackendCall_Thin(t *testing.T) {
 	t.Parallel()
 
 	fx := newDeadlineRecorderExec()
-	fx.stdout["lvs --config "+lvm.ConfigFilter+" --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool"] = []byte("104857600.00|10.00\n")
+	fx.stdout["lvs --config "+lvm.ConfigFilter+" --noheadings --separator | -o lv_size,data_percent,lv_attr --units k --nosuffix vg/thinpool"] = []byte("104857600.00|10.00|twi-aotz--\n")
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
 

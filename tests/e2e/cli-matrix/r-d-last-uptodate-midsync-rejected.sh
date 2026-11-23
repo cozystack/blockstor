@@ -105,7 +105,7 @@ deadline=$(( $(date +%s) + 60 ))
 midsync=false
 while (( $(date +%s) < deadline )); do
     d2=$(status_disk_state "$RD" "$N2" 0)
-    r2=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
+    r2=$(kubectl get "resources.blockstor.org/${RD}.${N2}" \
         -o jsonpath='{.status.volumes[0].replicationState}' 2>/dev/null || echo "")
     if [[ "$d2" == "Inconsistent" || "$d2" == "SyncTarget" || "$r2" == "SyncTarget" ]]; then
         midsync=true
@@ -154,7 +154,7 @@ sed 's/^/     /' "$err_file" >&2 || true
 rm -f "$err_file"
 
 # N1 MUST still exist (the refusal blocked the destructive delete).
-if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${N1}" >/dev/null 2>&1; then
+if ! kubectl get "resources.blockstor.org/${RD}.${N1}" >/dev/null 2>&1; then
     echo "FAIL (U130): $N1 replica vanished despite the rejection" >&2
     exit 1
 fi

@@ -235,9 +235,14 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 		// preservedTakeSnapshot in snapshots.go::Update) so a
 		// REST prop-patch mid-orchestration doesn't clobber the
 		// in-flight suspend/take state.
+		// LUKSKeys are the source replicas' wrapped LUKS passwords,
+		// copied by the store at Create (snapshots.go::sourceLUKSKeys)
+		// with no wire counterpart; Update carries them across, and the
+		// CRD refuses to change them once set.
 		mustCarryAcross: map[string]bool{
 			"SuspendIO":    true,
 			"TakeSnapshot": true,
+			"LUKSKeys":     true,
 		},
 	},
 	"PhysicalDeviceSpec": {
@@ -414,7 +419,7 @@ func TestSpecClassificationsCover(t *testing.T) {
 
 // Bug 210 was: `resources.go::Update` wholesale-assigned
 // `existing.ObjectMeta.Annotations = wireAnnotations`, wiping the
-// satellite-stamped `blockstor.io/volume-numbers` key (Bug 107
+// satellite-stamped `blockstor.org/volume-numbers` key (Bug 107
 // cascade-delete fallback) on every routine REST modify. The fix
 // introduced `mergeUserAnnotationsInto` and migrated every wholesale-
 // replacing store writer onto it. The v17/v18 hand-audit established

@@ -22,11 +22,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 
@@ -323,7 +323,7 @@ func spawnDefinition(ctx context.Context, run *runContext, group *apiv1.Resource
 	}
 
 	if len(group.Props) > 0 {
-		def.Props = maps.Clone(group.Props)
+		def.Props = store.TravellingProps(group.Props)
 	}
 
 	err := run.Store.ResourceDefinitions().Create(ctx, def)
@@ -353,7 +353,7 @@ func resourceGroupAdjust(ctx context.Context, run *runContext) error {
 			continue
 		}
 
-		if wanted != "" && !strings.EqualFold(wanted, defs[i].ResourceGroupName) {
+		if wanted != "" && !naming.Same(wanted, defs[i].ResourceGroupName) {
 			continue
 		}
 

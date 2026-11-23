@@ -33,6 +33,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/validate"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // kibPerMib is the binary step between adjacent size suffixes. The
@@ -65,13 +66,11 @@ func parseInt32(text, what string) (int32, error) {
 // CLI writes the CRDs directly, and the field carries no enum or CEL rule, so
 // without this check there is no backstop anywhere on this path.
 //
-// The value is stored as the operator typed it, matching what REST persists;
-// the satellite compares case-insensitively, so only the spelling is at issue
-// here, not the case.
+// The value is stored in canonical case, as the REST doors store it: some
+// readers compare the stored stack exactly, so `drbd,storage` kept as typed
+// read as a stack without DRBD to them.
 func parseLayerList(raw string) ([]string, error) {
-	layers := splitList(raw)
-
-	err := validate.LayerStack(layers)
+	layers, err := validate.CanonicalLayerStack(splitList(raw))
 	if err != nil {
 		//nolint:wrapcheck // a semantic refusal; see checkVolumeSize
 		return nil, err
@@ -607,7 +606,9 @@ func snapshotDelete(ctx context.Context, run *runContext) error {
 
 	rdName, snapName := run.Flags.Positionals[0], run.Flags.Positionals[1]
 
-	err := run.Store.Snapshots().Delete(ctx, rdName, snapName)
+	// The same delete the REST door runs: see store.DeleteSnapshot. A
+	// snapshot that is not there is the idempotent no-op it always was.
+	err := store.DeleteSnapshot(ctx, run.Store, rdName, snapName)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete snapshot %s of %s: %w", snapName, rdName, err)
 	}
@@ -764,7 +765,7 @@ func resolveStorPool(ctx context.Context, run *runContext, rdName, node string) 
 	siblings, err := run.Store.Resources().ListByDefinition(ctx, rdName)
 	if err == nil {
 		for i := range siblings {
-			if siblings[i].NodeName == node ||
+			if naming.Same(siblings[i].NodeName, node) ||
 				slices.Contains(siblings[i].Flags, apiv1.ResourceFlagDiskless) {
 				continue
 			}

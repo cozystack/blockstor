@@ -398,7 +398,7 @@ func TestStoragePoolsPerNodeListMatchesViewFiltering(t *testing.T) {
 
 		// Same elements in same order — both endpoints sort the
 		// underlying slice consistently (List sorts by (node,pool)
-		// and matchAnyFold preserves order).
+		// and matchAnyName preserves order).
 		for i := range perNode {
 			if perNode[i].NodeName != viewFiltered[i].NodeName ||
 				perNode[i].StoragePoolName != viewFiltered[i].StoragePoolName {

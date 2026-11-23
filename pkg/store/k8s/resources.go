@@ -22,6 +22,7 @@ import (
 	"context"
 	"slices"
 	"sort"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -37,11 +39,16 @@ import (
 
 // Labels used to index Resource CRDs by their composite key.
 const (
-	LabelResourceDefinition = "blockstor.io/resource-definition"
+	LabelResourceDefinition = "blockstor.org/resource-definition"
 )
 
 type resources struct {
 	c ctrlclient.Client
+
+	// apiReader is the manager's direct, uncached reader. ListByNode uses
+	// it when it is there; see nodeScopedReader for why that read in
+	// particular cannot come from a cache.
+	apiReader ctrlclient.Reader
 }
 
 func resourceCRDName(rd, node string) string {
@@ -72,49 +79,67 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 	return out, nil
 }
 
-func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
-	// Scan-and-filter on the authoritative Spec.ResourceDefinitionName.
-	//
-	// Bug 038: an earlier "fast path" trusted a label-selector
-	// (`LabelResourceDefinition`) and only fell back to a full scan
-	// when the selector returned ZERO items, on the assumption that a
-	// partial-but-correct subset was impossible because "every REST
-	// writer sets the label". That assumption breaks for MIXED RDs: a
-	// source RD whose diskful replicas were applied via `kubectl apply`
-	// (e2e fixtures, operator-authored manifests — NO label) but whose
-	// auto-tiebreaker witness was stamped by the controller (WITH the
-	// label). The selector then returned only the labeled witness, the
-	// fallback was skipped, and the unlabeled diskful replicas became
-	// invisible. The snapshot-restore / clone handler reads this list
-	// to resolve the SOURCE pool (storPoolsByNodeFromSourceRD); with
-	// the diskful replicas hidden it stamped the clone replicas with an
-	// EMPTY StorPoolName and the satellite failed every reconcile with
-	// `unknown storage pool ""` (clone.sh never converges).
-	//
-	// The List below is served from the controller-runtime informer
-	// cache (no apiserver round-trip), so filtering on the spec field
-	// in-memory costs the same as a cache-side label index but is
-	// correct for labeled and unlabeled replicas alike.
-	var crdList crdv1alpha1.ResourceList
+// ListByNode asks the API server for the node's replicas instead of pulling
+// the whole cluster back and filtering here.
+//
+// The selector is on the spec.nodeName selectable field the CRD declares. That
+// is deliberately not the label the objects usually carry: a replica applied
+// by hand has no label, and a selector over it would return a
+// partial-but-correct subset — the Bug 038 shape, where the missing replicas
+// were invisible rather than an error.
+func (s *resources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
+	reader := s.nodeScopedReader()
 
-	err := s.c.List(ctx, &crdList)
+	spellings, err := nodeSpellings(ctx, reader, node)
 	if err != nil {
-		return nil, errors.Wrapf(err, "list Resource CRDs for RD %q", rdName)
+		return nil, err
 	}
 
-	out := make([]apiv1.Resource, 0, len(crdList.Items))
-
-	for i := range crdList.Items {
-		if crdList.Items[i].Spec.ResourceDefinitionName != rdName {
-			continue
-		}
-
-		out = append(out, crdToWireResource(&crdList.Items[i]))
+	out, err := s.listUnderSpellings(ctx, reader, FieldResourceNodeName, spellings,
+		func(r *crdv1alpha1.Resource, spelling string) bool { return r.Spec.NodeName == spelling })
+	if err != nil {
+		return nil, err
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
+	// Every replica here is on the same node, so the definition is what
+	// distinguishes them.
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 
 	return out, nil
+}
+
+func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
+	// Scoped on the authoritative Spec.ResourceDefinitionName, never on a
+	// label.
+	//
+	// Bug 038: an earlier "fast path" trusted a label-selector
+	// (`LabelResourceDefinition`) and only fell back to a full scan when the
+	// selector returned ZERO items, on the assumption that a
+	// partial-but-correct subset was impossible because "every REST writer
+	// sets the label". That assumption breaks for MIXED RDs: a source RD
+	// whose diskful replicas were applied via `kubectl apply` (e2e fixtures,
+	// operator-authored manifests — NO label) but whose auto-tiebreaker
+	// witness was stamped by the controller (WITH the label). The selector
+	// then returned only the labeled witness, the fallback was skipped, and
+	// the unlabeled diskful replicas became invisible. The snapshot-restore /
+	// clone handler reads this list to resolve the SOURCE pool
+	// (storPoolsByNodeFromSourceRD); with the diskful replicas hidden it
+	// stamped the clone replicas with an EMPTY StorPoolName and the satellite
+	// failed every reconcile with `unknown storage pool ""` (clone.sh never
+	// converges).
+	//
+	// A selectable FIELD does not have that failure mode: it selects on the
+	// spec value every replica carries, whoever wrote it, and a server that
+	// cannot serve the selector says so instead of answering short.
+	return s.listByDefinitionThrough(ctx, s.c, rdName)
+}
+
+// ListByDefinitionUncached answers what ListByDefinition answers from the API
+// server when the store has a direct reader, for a decision that cannot take a
+// cache's word: whether a definition another replica of this server just
+// prepared holds a live replica.
+func (s *resources) ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
+	return s.listByDefinitionThrough(ctx, s.nodeScopedReader(), rdName)
 }
 
 func (s *resources) Get(ctx context.Context, rdName, node string) (apiv1.Resource, error) {
@@ -132,14 +157,62 @@ func (s *resources) Get(ctx context.Context, rdName, node string) (apiv1.Resourc
 	return crdToWireResource(&crd), nil
 }
 
+// GetUncached answers what Get answers from the API server when the store has
+// a direct reader, for a decision that cannot take a cache's word: whether a
+// replica a Create collided with is still there, and whether it is going.
+func (s *resources) GetUncached(ctx context.Context, rdName, node string) (apiv1.Resource, error) {
+	if s.apiReader == nil {
+		return s.Get(ctx, rdName, node)
+	}
+
+	var crd crdv1alpha1.Resource
+
+	err := s.apiReader.Get(ctx, types.NamespacedName{Name: resourceCRDName(rdName, node)}, &crd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return apiv1.Resource{}, errors.Wrapf(store.ErrNotFound, "resource %q on node %q", rdName, node)
+		}
+
+		return apiv1.Resource{}, errors.Wrapf(err, "get Resource %s/%s live", rdName, node)
+	}
+
+	return crdToWireResource(&crd), nil
+}
+
 func (s *resources) Create(ctx context.Context, in *apiv1.Resource) error {
 	if in == nil {
 		return errors.New("nil Resource")
 	}
 
-	crd := wireToCRDResource(in)
+	// The spec stores the definition's and the node's CR names, which is
+	// what the controller and the satellite look them up and compare by,
+	// and the registered spellings are kept for display (see spellings.go).
+	// The object itself is named from the registered spellings, the way
+	// Get addresses it.
+	rd, err := storedRDName(ctx, s.c, in.Name)
+	if err != nil {
+		return err
+	}
 
-	err := s.c.Create(ctx, crd)
+	node, err := storedNodeName(ctx, s.c, in.NodeName)
+	if err != nil {
+		return err
+	}
+
+	shown := *in
+	shown.Name = rd.display
+	shown.NodeName = node.display
+
+	crd := wireToCRDResource(&shown)
+	dropNameAnnotations(crd.Annotations)
+	crd.Spec.ResourceDefinitionName = rd.crName
+	crd.Spec.NodeName = node.crName
+	crd.Labels[LabelResourceDefinition] = rd.crName
+	crd.Labels[LabelNodeName] = node.crName
+	rd.annotate(&crd.ObjectMeta, AnnotationLinstorRDName)
+	node.annotate(&crd.ObjectMeta, AnnotationLinstorNodeName)
+
+	err = s.c.Create(ctx, crd)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return errors.Wrapf(store.ErrAlreadyExists, "resource %q on node %q", in.Name, in.NodeName)
@@ -192,26 +265,30 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// a golinstor REST modify can't strip it and flip the satellite back
 	// to the unsafe day0-skip default (the offline-safety regression).
 	prevSkipInit := existing.Spec.SkipInitialSync
+	// The names in spec are the parents' CR names, fixed at Create; the
+	// wire carries the display spellings (see spellings.go).
+	prevRD, prevNode := existing.Spec.ResourceDefinitionName, existing.Spec.NodeName
 	existing.Spec = wireToCRDResourceSpec(in)
 	existing.Spec.Volumes = prevVolumes
 	existing.Spec.DRBDPort = prevPort
 	existing.Spec.DRBDNodeID = prevNodeID
 	existing.Spec.SkipInitialSync = prevSkipInit
+	existing.Spec.ResourceDefinitionName, existing.Spec.NodeName = prevRD, prevNode
 
 	// Bug 67: round-trip wire-side Annotations through metadata so the
-	// REST writer's `blockstor.io/peer-changed` bump actually reaches
+	// REST writer's `blockstor.org/peer-changed` bump actually reaches
 	// the CRD ObjectMeta — without this the bump would silently no-op
 	// and the satellite's local-Resource watch would never fire.
 	//
 	// Bug 210: merge rather than wholesale-replace so the satellite-
-	// stamped `blockstor.io/volume-numbers` annotation (Bug 107 cascade-
+	// stamped `blockstor.org/volume-numbers` annotation (Bug 107 cascade-
 	// delete fallback) survives a wire-snapshot that raced the stamp.
 	// Without this, a routine `linstor r <verb>` between Get and Update
 	// wipes the annotation; a concurrent RD cascade-delete that hits
 	// `lookupVolumeNumbers` during the harm window leaks the backing
 	// LV / zvol. Mirrors the RD / RG / Snapshot stores.
-	mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations,
-		crdv1alpha1.ResourceAnnotationVolumeNumbers)
+	mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations),
+		crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 	err = s.c.Update(ctx, &existing)
 	if err != nil {
@@ -274,14 +351,17 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// Skip-init-sync hardening: carry SkipInitialSync across — see
 		// the matching carry-across in `Update` above.
 		prevSkipInit := existing.Spec.SkipInitialSync
+		// The CR names in spec: see the matching carry-across in `Update`.
+		prevRD, prevNode := existing.Spec.ResourceDefinitionName, existing.Spec.NodeName
 		existing.Spec = wireToCRDResourceSpec(&wire)
 		existing.Spec.Volumes = prevVolumes
 		existing.Spec.DRBDPort = prevPort
 		existing.Spec.DRBDNodeID = prevNodeID
 		existing.Spec.SkipInitialSync = prevSkipInit
+		existing.Spec.ResourceDefinitionName, existing.Spec.NodeName = prevRD, prevNode
 
 		// Bug 210: merge rather than wholesale-replace so the
-		// satellite-stamped `blockstor.io/volume-numbers` (Bug 107)
+		// satellite-stamped `blockstor.org/volume-numbers` (Bug 107)
 		// survives even if the closure built `wire.Annotations`
 		// from a stale snapshot that pre-dated the satellite stamp.
 		// PatchResourceSpec already has 409-retry via
@@ -289,8 +369,8 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// annotation invariant uniform with the wholesale `Update`
 		// path and protects against future closures that explicitly
 		// reset live.Annotations.
-		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations,
-			crdv1alpha1.ResourceAnnotationVolumeNumbers)
+		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(wire.Annotations),
+			crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
 	}), "patch Resource %s/%s", rdName, node)
@@ -503,6 +583,27 @@ func (s *resources) ClearDRBDPort(ctx context.Context, rdName, node string) erro
 	return nil
 }
 
+func (s *resources) listByDefinitionThrough(
+	ctx context.Context, reader ctrlclient.Reader, rdName string,
+) ([]apiv1.Resource, error) {
+	spellings, err := rdSpellings(ctx, reader, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := s.listUnderSpellings(ctx, reader, FieldResourceDefinitionName, spellings,
+		func(r *crdv1alpha1.Resource, spelling string) bool { return r.Spec.ResourceDefinitionName == spelling })
+	if err != nil {
+		return nil, err
+	}
+
+	// Every replica here belongs to the same definition, so the node is what
+	// distinguishes them.
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
+
+	return out, nil
+}
+
 // buildVolumeStatusForApply turns a slice of per-volume
 // observations into the SSA-shaped Status.Volumes payload. Only
 // non-empty fields land in the apply object so SSA doesn't claim
@@ -577,8 +678,8 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 	}
 
 	return apiv1.Resource{
-		Name:     crd.Spec.ResourceDefinitionName,
-		NodeName: crd.Spec.NodeName,
+		Name:     shownName(&crd.ObjectMeta, AnnotationLinstorRDName, crd.Spec.ResourceDefinitionName),
+		NodeName: shownName(&crd.ObjectMeta, AnnotationLinstorNodeName, crd.Spec.NodeName),
 		Props:    props,
 		Flags:    withDeletingFlag(crd.Spec.Flags, crd.DeletionTimestamp != nil),
 		// Resource CRD has no LayerStack — that lives on the parent RD.
@@ -599,7 +700,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 			crd.Status.Connections,
 		),
 		UUID:        string(crd.UID),
-		Annotations: cloneAnnotations(crd.Annotations),
+		Annotations: withoutNameAnnotations(cloneAnnotations(crd.Annotations)),
 		// Upstream LINSTOR populates `create_timestamp` (the Python
 		// CLI's `CreatedOn` column). The Resource CRD's
 		// metadata.creationTimestamp is the per-replica creation time
@@ -687,6 +788,16 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 // — it cannot infer per-peer replication from
 // `layer_object.drbd.connections[].replication_state`, even though
 // blockstor stores the data there too.
+//
+// The replication state is the volume's own with that peer
+// (peerVolumes[].replicationState) and done_percentage that volume's
+// `done`, so a two-volume resource reports each volume's own resync,
+// as LINSTOR does from its per-peer, per-volume DrbdVolume. The
+// connection-level replicationState is whichever volume's frame came
+// last; it is only the fallback for a volume the satellite has not
+// reported per volume yet. LINSTOR fills done_percentage whenever the
+// satellite reported one (Json.apiToVolumeState), whatever the
+// replication state, and so does this.
 func volumesWithReplicationStates(
 	vols []apiv1.Volume,
 	conns []crdv1alpha1.ResourceConnectionStatus,
@@ -695,28 +806,62 @@ func volumesWithReplicationStates(
 		return vols
 	}
 
-	states := make(map[string]apiv1.ReplicationState, len(conns))
-
-	for i := range conns {
-		c := &conns[i]
-		if c.ReplicationState == "" {
-			continue
-		}
-
-		states[c.PeerNodeName] = apiv1.ReplicationState{
-			ReplicationState: c.ReplicationState,
-		}
-	}
-
-	if len(states) == 0 {
-		return vols
-	}
-
 	for i := range vols {
-		vols[i].State.ReplicationStates = states
+		states := make(map[string]apiv1.ReplicationState, len(conns))
+
+		for j := range conns {
+			c := &conns[j]
+			peerVol := findPeerVolume(c.PeerVolumes, vols[i].VolumeNumber)
+
+			repl := c.ReplicationState
+			if peerVol != nil && peerVol.ReplicationState != "" {
+				repl = peerVol.ReplicationState
+			}
+
+			if repl == "" {
+				continue
+			}
+
+			states[c.PeerNodeName] = apiv1.ReplicationState{
+				ReplicationState: repl,
+				DonePercentage:   peerVolumeDone(peerVol),
+			}
+		}
+
+		if len(states) > 0 {
+			vols[i].State.ReplicationStates = states
+		}
 	}
 
 	return vols
+}
+
+// findPeerVolume returns one volume's entry of a connection's
+// per-volume peer view, nil when the satellite reported none.
+func findPeerVolume(peerVolumes []crdv1alpha1.PeerVolumeStatus, volumeNumber int32) *crdv1alpha1.PeerVolumeStatus {
+	for i := range peerVolumes {
+		if peerVolumes[i].VolumeNumber == volumeNumber {
+			return &peerVolumes[i]
+		}
+	}
+
+	return nil
+}
+
+// peerVolumeDone parses the `done` token the satellite recorded for
+// one volume on one connection. nil when the volume has none or the
+// token does not parse: no progress is better than a made-up one.
+func peerVolumeDone(peerVol *crdv1alpha1.PeerVolumeStatus) *float64 {
+	if peerVol == nil || peerVol.Done == "" {
+		return nil
+	}
+
+	done, err := strconv.ParseFloat(peerVol.Done, 64)
+	if err != nil {
+		return nil
+	}
+
+	return &done
 }
 
 // volumeLayerDataFromStack mirrors the resource-level layer stack
@@ -996,4 +1141,137 @@ func wireToCRDResourceSpec(in *apiv1.Resource) crdv1alpha1.ResourceSpec {
 		// reconciler watches it and unwinds a partial conversion.
 		ToggleDiskCancel: in.ToggleDiskCancel,
 	}
+}
+
+// listScoped answers a scoped question with a scoped read, and falls back to
+// the exhaustive one when the server cannot serve the selector.
+//
+// The same call has two implementations behind it. Against an uncached reader
+// it becomes a fieldSelector on the wire and the API server filters; against
+// a manager's cached client it is served from the index NewManager registers
+// (see fieldIndexes). Either can be missing — a cluster whose CRD predates the
+// selectable field REJECTS the query, and a cache with no index for the field
+// fails it — and both fail loudly rather than answering partially, which is
+// what makes falling back to the exhaustive read safe rather than a silent
+// downgrade to a wrong answer.
+//
+// The fallback is logged because it is not free: it is the whole-cluster read
+// the scoped one exists to avoid, and an operator wondering why a large
+// cluster crawls deserves to find out from the logs rather than from a
+// profiler.
+func (s *resources) listScoped(
+	ctx context.Context, reader ctrlclient.Reader, field, value string,
+	keep func(*crdv1alpha1.Resource) bool,
+) ([]apiv1.Resource, error) {
+	var crdList crdv1alpha1.ResourceList
+
+	err := reader.List(ctx, &crdList, ctrlclient.MatchingFields{field: value})
+	if err == nil {
+		out := make([]apiv1.Resource, 0, len(crdList.Items))
+		for i := range crdList.Items {
+			out = append(out, crdToWireResource(&crdList.Items[i]))
+		}
+
+		return out, nil
+	}
+
+	if !SelectorUnsupported(err) {
+		return nil, errors.Wrapf(err, "list Resource CRDs for %s=%q", field, value)
+	}
+
+	log.FromContext(ctx).V(1).Info("scoped Resource read unavailable; reading every replica instead",
+		"field", field, "value", value, "reason", err.Error())
+
+	return s.listExhaustively(ctx, reader, field, value, keep)
+}
+
+// listUnderSpellings runs listScoped once per spelling and returns every
+// replica once. The CRD name folds the definition and the node, so two rows
+// with the same folded pair are one object.
+func (s *resources) listUnderSpellings(
+	ctx context.Context, reader ctrlclient.Reader, field string, spellings []string,
+	keep func(*crdv1alpha1.Resource, string) bool,
+) ([]apiv1.Resource, error) {
+	var out []apiv1.Resource
+
+	seen := map[string]struct{}{}
+
+	for _, spelling := range spellings {
+		found, err := s.listScoped(ctx, reader, field, spelling,
+			func(r *crdv1alpha1.Resource) bool { return keep(r, spelling) })
+		if err != nil {
+			return nil, err
+		}
+
+		for i := range found {
+			key := resourceCRDName(found[i].Name, found[i].NodeName)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+
+			seen[key] = struct{}{}
+
+			out = append(out, found[i])
+		}
+	}
+
+	if out == nil {
+		out = []apiv1.Resource{}
+	}
+
+	return out, nil
+}
+
+// listExhaustively is the pre-selectable-field read: every Resource, filtered
+// here. It is what listScoped falls back to, and it stays correct whatever the
+// server can or cannot select on.
+func (s *resources) listExhaustively(
+	ctx context.Context, reader ctrlclient.Reader, field, value string,
+	keep func(*crdv1alpha1.Resource) bool,
+) ([]apiv1.Resource, error) {
+	var crdList crdv1alpha1.ResourceList
+
+	err := reader.List(ctx, &crdList)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list Resource CRDs for %s=%q", field, value)
+	}
+
+	out := make([]apiv1.Resource, 0, len(crdList.Items))
+
+	for i := range crdList.Items {
+		if !keep(&crdList.Items[i]) {
+			continue
+		}
+
+		out = append(out, crdToWireResource(&crdList.Items[i]))
+	}
+
+	return out, nil
+}
+
+// nodeScopedReader answers the reads a node's fate is decided on.
+//
+// `node delete` refuses while anything still references the node, and
+// `--force` cascades away what does. Both decisions are made on one read and
+// then acted on destructively, so a cached answer that trails the API server
+// by a beat is not a slow answer, it is a wrong one in both directions: a
+// replica the read misses is a node deleted out from under it, and a pool the
+// read misses is left pointing at a node that no longer exists.
+//
+// There is no cache-retry poll behind these the way there is on the REST
+// create paths (get*WithCacheRetry), because there is nothing to converge
+// towards — the caller is about to delete, not to read again.
+//
+// This is not the uncached-Get fallback NewWithAPIReader warns against. That
+// warning is about raw Gets, where a fast cached NotFound is the contract and
+// a store-level bypass short-circuits the REST layer's convergence wait. This
+// is one List on two operator commands that run once per dead node, and the
+// field selector still travels: an uncached client sends it to the API server,
+// which answers it from the selectable field the CRD declares.
+func (s *resources) nodeScopedReader() ctrlclient.Reader {
+	if s.apiReader != nil {
+		return s.apiReader
+	}
+
+	return s.c
 }

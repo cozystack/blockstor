@@ -45,7 +45,7 @@ import (
 // Audit (2026-05-13): blockstor currently has the *reverse* shim
 // only — pkg/store/k8s/nodes.go.foldTopologyLabels copies labels
 // already set on the **blockstor Node CRD** under the
-// `topology.blockstor.io/<key>` prefix into `Props["Aux/<key>"]`
+// `topology.blockstor.org/<key>` prefix into `Props["Aux/<key>"]`
 // on the wire. There is no reconciler that watches `corev1.Node`
 // objects and propagates their labels onto the blockstor Node CRD
 // at all — see cmd/controller/main.go (only NodeReconciler +

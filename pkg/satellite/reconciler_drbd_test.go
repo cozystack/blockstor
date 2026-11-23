@@ -117,6 +117,13 @@ var (
 // expects the day0 skip / winner set-gi seed must mark its fixture
 // SkipInitialSync=true (the controller decided this is a genuinely-fresh
 // RD), exactly as the real controller stamps it on the initial set.
+
+// anyBlockDevice takes every path for a block device, since the LUKS
+// devices these tests format exist only in the fake Exec.
+func anyBlockDevice() luks.Option {
+	return luks.WithBlockDeviceCheck(func(string) (bool, error) { return true, nil })
+}
+
 func skipInitTrue() *bool  { v := true; return &v }
 func skipInitFalse() *bool { v := false; return &v }
 
@@ -907,6 +914,8 @@ func TestApplyLayersLUKS(t *testing.T) {
 	// cryptsetup isLuks fails on a fresh device → format runs.
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-luks_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -914,8 +923,9 @@ func TestApplyLayersLUKS(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -925,7 +935,6 @@ func TestApplyLayersLUKS(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {
@@ -951,10 +960,10 @@ func TestApplyLayersLUKS(t *testing.T) {
 	}
 }
 
-// TestApplyLUKSFailsWithoutPassphrase: explicit LUKS in stack but no
-// passphrase prop → apply fails fast rather than silently producing
-// an unencrypted volume.
-func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
+// TestApplyLUKSFailsUnderALockedMasterKey: explicit LUKS in stack but
+// the master key is locked → apply fails fast rather than silently
+// producing an unencrypted volume.
+func TestApplyLUKSFailsUnderALockedMasterKey(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-empty_00000",
@@ -966,8 +975,9 @@ func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(&fakeLUKSKeys{err: luks.ErrMasterKeyLocked})
 
 	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -988,11 +998,11 @@ func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
 	}
 
 	if results[0].GetOk() {
-		t.Errorf("expected LUKS-without-passphrase to fail")
+		t.Errorf("expected LUKS under a locked master key to fail")
 	}
 
-	if !strings.Contains(strings.ToLower(results[0].GetMessage()), "passphrase") {
-		t.Errorf("error message should mention passphrase; got %q", results[0].GetMessage())
+	if !strings.Contains(results[0].GetMessage(), luks.ErrMasterKeyLocked.Error()) {
+		t.Errorf("error message should say the master key is locked; got %q", results[0].GetMessage())
 	}
 }
 
@@ -1011,6 +1021,8 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 	// First reconcile: not yet a LUKS device → luksFormat will run.
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-only_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-luks-only_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -1018,8 +1030,9 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	dr := []*intent.DesiredResource{
 		{
@@ -1029,7 +1042,6 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	}
 
@@ -1102,6 +1114,8 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-stack_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-stack_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-stack_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -1109,8 +1123,9 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -1120,7 +1135,6 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack:      []string{"DRBD", "LUKS", "STORAGE"},
-			Props:           map[string]string{"LuksPassphrase": "topsecret"},
 			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
@@ -1560,7 +1574,6 @@ func TestApplyLUKSWithoutCryptsetupWrapper(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {
@@ -1611,8 +1624,9 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -1622,7 +1636,6 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {
@@ -1708,9 +1721,10 @@ func TestApplyLUKSConvergeResizeAfterCrashRecovery(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 		Exec:       fx,
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -1720,7 +1734,6 @@ func TestApplyLUKSConvergeResizeAfterCrashRecovery(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 			// Bug 360: an already-converged resource (this is a
 			// crash-recovery convergence pass) always carries the
 			// controller-allocated local node-id — the dispatcher
@@ -1805,9 +1818,10 @@ func TestApplyLUKSConvergeNoOpWhenMapperMatches(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 		Exec:       fx,
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -1817,7 +1831,6 @@ func TestApplyLUKSConvergeNoOpWhenMapperMatches(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {
@@ -2331,8 +2344,9 @@ func TestDeleteResourceClosesLUKSMapper(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{
 		Name:          "pvc-luks-del",
@@ -2601,10 +2615,12 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-format_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-format_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
+	fx.Expect("blkid -p -o export /dev/vg/pvc-luks-format_00000",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 	// luksFormat fails: simulate the device being busy. Post-Issue
 	// 175 the cryptsetup invocation is direct, so the Expect key is
 	// the cryptsetup argv verbatim with no shell pipeline wrapping.
-	fx.Expect("cryptsetup luksFormat --batch-mode /dev/vg/pvc-luks-format_00000 --key-file -",
+	fx.Expect("cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 /dev/vg/pvc-luks-format_00000 --key-file -",
 		storage.FakeResponse{Err: errLUKSFormatBusy})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -2613,8 +2629,9 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 		Adm:        drbd.NewAdm(fx),
 		StateDir:   dir,
 		NodeName:   "n1",
-		Cryptsetup: luks.NewCryptsetup(fx),
+		Cryptsetup: luks.NewCryptsetup(fx, anyBlockDevice()),
 	})
+	rec.SetLUKSKeys(storedLUKSKey("topsecret"))
 
 	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
@@ -2624,7 +2641,6 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
 		},
 	})
 	if err != nil {
@@ -2637,6 +2653,10 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 
 	if results[0].GetOk() {
 		t.Errorf("Ok: got true, want false on luksFormat failure")
+	}
+
+	if !strings.Contains(results[0].GetMessage(), errLUKSFormatBusy.Error()) {
+		t.Errorf("message %q is not the luksFormat failure", results[0].GetMessage())
 	}
 
 	if !strings.Contains(results[0].GetMessage(), "luks format") {
@@ -3262,11 +3282,11 @@ func TestApplyLateAddedVolumeWinnerSeedsUpToDate(t *testing.T) {
 
 	// THE FIX: vol-1's local-slot set-gi MUST carry the winner shape —
 	// current=day0, Consistent(idx4=1)+UpToDate(idx5=1). The set-gi
-	// target is `<rd>/1` (vol-1 only); vol-0 is never re-seeded.
+	// goes to vol-1's backing device only; vol-0 is never re-seeded.
 	var vol1LocalSlot string
 
 	for _, line := range calls {
-		if strings.Contains(line, "pvc-late-win/1 ") && strings.Contains(line, "set-gi --node-id 0 ") {
+		if strings.Contains(line, "pvc-late-win_00001 ") && strings.Contains(line, "set-gi --node-id 0 ") {
 			vol1LocalSlot = line
 		}
 	}
@@ -3299,7 +3319,7 @@ func TestApplyLateAddedVolumeWinnerSeedsUpToDate(t *testing.T) {
 	// HasMD=true, so it never joins the fresh-seed set. A set-gi against
 	// `<rd>/0` would wipe vol-0's live GI + bitmap state.
 	for _, line := range calls {
-		if strings.Contains(line, "pvc-late-win/0 ") && strings.Contains(line, "set-gi") {
+		if strings.Contains(line, "pvc-late-win_00000 ") && strings.Contains(line, "set-gi") {
 			t.Errorf("late-add seed re-stamped vol-0 GI (would wipe its live metadata): %s", line)
 		}
 	}
@@ -3394,7 +3414,7 @@ func TestApplyLateAddedVolumeNonWinnerTakesSkipInitSync(t *testing.T) {
 	var vol1LocalSlot string
 
 	for _, line := range calls {
-		if strings.Contains(line, "pvc-late-lose/1 ") && strings.Contains(line, "set-gi --node-id 2 ") {
+		if strings.Contains(line, "pvc-late-lose_00001 ") && strings.Contains(line, "set-gi --node-id 2 ") {
 			vol1LocalSlot = line
 		}
 	}
@@ -3537,7 +3557,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 	calls := fx.CommandLines()
 
 	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-seed", drbd.MaxPeers-1))
-	setGI := indexOfPrefix(calls, "drbdmeta --force pvc-seed/0 v09 ")
+	setGI := indexOfSetGI(calls, "pvc-seed")
 	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-seed")
 
 	if createMD < 0 {
@@ -3561,7 +3581,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 	// current_uuid in BOTH current_uuid and bitmap_uuid slots,
 	// stamped via `set-gi --node-id <peer>` (DRBD 9.2+ per-peer
 	// slot layout).
-	wantSetGI := "drbdmeta --force pvc-seed/0 v09 /dev/vg/pvc-seed_00000 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	wantSetGI := "drbdmeta --force - v09 /dev/vg/pvc-seed_00000 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
 	if !slices.Contains(calls, wantSetGI) {
 		t.Errorf("missing exact set-gi command %q in calls: %v", wantSetGI, calls)
 	}
@@ -4030,7 +4050,7 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 			calls := fx.CommandLines()
 
 			createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-zskip", drbd.MaxPeers-1))
-			setGI := indexOfPrefix(calls, "drbdmeta --force pvc-zskip/0 v09 ")
+			setGI := indexOfSetGI(calls, "pvc-zskip")
 			adjust := indexOfPrefix(calls, "drbdadm adjust pvc-zskip")
 
 			if createMD < 0 {
@@ -4060,7 +4080,7 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 			// the expected value in sync with
 			// pkg/satellite/providerkind.go's day0GiFor().
 			day0 := satellite.Day0GiForTest("pvc-zskip", 0)
-			wantSetGI := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi --node-id 1 %s:0:0:0:0:1",
+			wantSetGI := fmt.Sprintf("drbdmeta --force - v09 %s internal set-gi --node-id 1 %s:0:0:0:0:1",
 				tc.wantDevice, day0)
 			if !slices.Contains(calls, wantSetGI) {
 				t.Errorf("missing exact day0 set-gi command %q in calls: %v", wantSetGI, calls)
@@ -4140,8 +4160,8 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 	// emitted call sequence MUST follow GetPeers() iteration
 	// (n2 → n3) so both satellites visit slots in the same order
 	// (eliminates an FS-write ordering source of divergence).
-	wantN2 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 1 %s:0:0:0:0:1", day0)
-	wantN3 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 2 %s:0:0:0:0:1", day0)
+	wantN2 := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 1 %s:0:0:0:0:1", day0)
+	wantN3 := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 2 %s:0:0:0:0:1", day0)
 
 	if !slices.Contains(calls, wantN2) {
 		t.Errorf("missing per-peer set-gi for n2 (node-id 1): want %q in calls: %v", wantN2, calls)
@@ -4252,7 +4272,7 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	// including slot 2 (n3, whose node-id was NOT allocated) and slots
 	// 16..31 that no peer occupies.
 	for nodeID := 0; nodeID <= drbd.NodeIDMax; nodeID++ {
-		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0:0:1",
+		want := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0:0:1",
 			nodeID, day0)
 		if !slices.Contains(calls, want) {
 			t.Errorf("missing blanket set-gi for node-id %d: want %q in calls", nodeID, want)
@@ -4263,7 +4283,7 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	// fewer (no out-of-range node-id 32+, no skipped slot).
 	var setGiCount int
 	for _, c := range calls {
-		if strings.HasPrefix(c, "drbdmeta") && strings.Contains(c, "set-gi") && strings.Contains(c, "pvc-blanket/0") {
+		if strings.HasPrefix(c, "drbdmeta") && strings.Contains(c, "set-gi") && strings.Contains(c, "pvc-blanket_00000 ") {
 			setGiCount++
 		}
 	}
@@ -4294,7 +4314,7 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	}
 
 	for nodeID := 0; nodeID <= drbd.NodeIDMax; nodeID++ {
-		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0:0:1",
+		want := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0:0:1",
 			nodeID, day0)
 
 		idx := slices.Index(calls, want)
@@ -4380,7 +4400,7 @@ func TestApplyFirstActivationSeedsLocalSlotBug284(t *testing.T) {
 	// Without this call the local current_uuid stays at the random
 	// value drbdadm create-md generated → permanent unrelated-data on
 	// every future handshake against a later-joining peer.
-	wantLocal := fmt.Sprintf("drbdmeta --force pvc-b284/0 v09 /dev/vg/pvc-b284_00000 internal set-gi --node-id 0 %s:0:0:0:0:1",
+	wantLocal := fmt.Sprintf("drbdmeta --force - v09 /dev/vg/pvc-b284_00000 internal set-gi --node-id 0 %s:0:0:0:0:1",
 		day0)
 	if !slices.Contains(calls, wantLocal) {
 		t.Errorf("missing local-slot set-gi (Bug 284 fix): want %q in calls: %v", wantLocal, calls)
@@ -6191,6 +6211,7 @@ func TestTemporarySecondaryFailureAutoRecovers(t *testing.T) {
 func TestApplyAutoMkfsXfsFiresOnceOnFirstActivation(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd1000")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-mkfs_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
@@ -6296,6 +6317,7 @@ func TestApplyAutoMkfsXfsFiresOnceOnFirstActivation(t *testing.T) {
 func TestApplyAutoMkfsHonoursMkfsParams(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd2000")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-mkfsparams_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
@@ -6522,6 +6544,7 @@ func TestApplyAutoMkfsSkipsWhenNotPrimary(t *testing.T) {
 func TestApplyAutoMkfsRetryAfterMissedFirstActivation(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6000")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// Inject a transient failure into `drbdadm primary --force` on
@@ -6636,7 +6659,7 @@ func TestApplyAutoMkfsRetryAfterMissedFirstActivation(t *testing.T) {
 
 // TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume pins the per-volume
 // idempotency layer of the Bug 311 fix: a volume that already carries
-// a filesystem (TYPE= line in `blkid -o export <dev>` output) MUST
+// a filesystem (TYPE= line in `blkid -p -o export <dev>` output) MUST
 // NOT be re-mkfs'd, even when the `.mkfs.done` marker is absent.
 // Mirrors upstream LINSTOR's MkfsUtils.makeFileSystemOnMarked which
 // short-circuits on a non-empty `hasFileSystem` result, and prevents
@@ -6647,9 +6670,9 @@ func TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-blkid_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	// Pretend the device already has an ext4 filesystem — blkid -o
+	// Pretend the device already has an ext4 filesystem — blkid -p -o
 	// export returns the upstream-canonical TYPE= line.
-	fx.Expect("blkid -o export /dev/drbd6100",
+	fx.Expect("blkid -p -o export /dev/drbd6100",
 		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd6100\nTYPE=ext4\nUSAGE=filesystem\n")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -6711,6 +6734,7 @@ func TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume(t *testing.T) {
 func TestApplyAutoMkfsMultiVolumeMkfsBoth(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd7000", "/dev/drbd7001")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-ganesha_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-ganesha_00001",
@@ -7172,7 +7196,9 @@ type fakeFilesystemStamper struct {
 	stamps       func(string) bool // optional: return true to fail the call
 }
 
-func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, resourceName string) error {
+func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, rdName, nodeName string) error {
+	resourceName := rdName + "." + nodeName
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -7185,7 +7211,9 @@ func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, reso
 	return nil
 }
 
-func (f *fakeFilesystemStamper) StampFilesystemObserved(_ context.Context, resourceName string) error {
+func (f *fakeFilesystemStamper) StampFilesystemObserved(_ context.Context, rdName, nodeName string) error {
+	resourceName := rdName + "." + nodeName
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -7229,6 +7257,7 @@ func (f *fakeFilesystemStamper) Calls() []string {
 func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd8000", "/dev/drbd8001")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311m_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311m_00001",
@@ -7299,7 +7328,7 @@ func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 
 // TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume pins the
 // per-volume blkid safety net for multi-volume RDs: vol-0 already
-// carries an ext4 filesystem (blkid -o export reports TYPE=ext4),
+// carries an ext4 filesystem (blkid -p -o export reports TYPE=ext4),
 // vol-1 is blank. runAutoMkfs MUST skip mkfs on vol-0 (adopting the
 // existing fs) and run mkfs on vol-1 only — mirrors upstream
 // LINSTOR's MkfsUtils.makeFileSystemOnMarked which short-circuits on
@@ -7311,18 +7340,18 @@ func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 func TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd8501")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311s_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311s_00001",
 		storage.FakeResponse{Stdout: []byte("")})
-	// vol-0 already has an ext4 filesystem. blkid -o export returns
-	// the canonical TYPE= line; runAutoMkfs's deviceHasFilesystem
-	// scans for any TYPE= prefix and treats it as "populated".
-	fx.Expect("blkid -o export /dev/drbd8500",
+	// vol-0 already has an ext4 filesystem. blkid -p -o export returns
+	// the canonical TYPE= line; runAutoMkfs's probeMkfsTarget reads
+	// any non-drbd TYPE= as "populated".
+	fx.Expect("blkid -p -o export /dev/drbd8500",
 		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd8500\nTYPE=ext4\nUSAGE=filesystem\n")})
-	// vol-1 is blank: leave the blkid response unregistered so
-	// FakeExec returns empty stdout / nil err — deviceHasFilesystem
-	// finds no TYPE= prefix and falls through to mkfs.
+	// vol-1 is blank: expectBlankMkfsTarget above cans blkid's exit 2,
+	// so probeMkfsTarget reads it as empty and mkfs runs.
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -7402,6 +7431,7 @@ func TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume(t *testing.T) {
 func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd9000", "/dev/drbd9001")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00001",
@@ -7472,7 +7502,7 @@ func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("pvc-bug311c_00001\n")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-bug311c_00001",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-bug311c_00001|307200\n")})
-	fx.Expect("blkid -o export /dev/drbd9000",
+	fx.Expect("blkid -p -o export /dev/drbd9000",
 		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd9000\nTYPE=ext4\nUSAGE=filesystem\n")})
 	fx.Expect("mkfs.ext4 /dev/drbd9001", storage.FakeResponse{})
 
@@ -7746,6 +7776,7 @@ func TestBug278NoClearWhenKernelStillDiskless(t *testing.T) {
 func TestApplyAutoMkfsStorageOnlyFormatsRawDevice(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/vg/pvc-local_00000")
 
 	// lvExists probe (lvcreate idempotency check).
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-local_00000",
@@ -7777,6 +7808,8 @@ func TestApplyAutoMkfsStorageOnlyFormatsRawDevice(t *testing.T) {
 			},
 			LayerStack:  []string{"STORAGE"},
 			DrbdOptions: map[string]string{},
+			// Created empty by blockstor: only such a replica is formatted.
+			SkipInitialSync: skipInitTrue(),
 		},
 	}
 
@@ -7927,4 +7960,18 @@ func TestApplyAutoMkfsStorageOnlySkipsDisklessReplica(t *testing.T) {
 			t.Errorf("DISKLESS storage-only replica must skip mkfs; saw %q", line)
 		}
 	}
+}
+
+// indexOfSetGI finds the first drbdmeta set-gi on a backing device of rd's
+// first volume. drbdmeta is given `-` for the device, so the volume shows
+// only in the backing device path.
+func indexOfSetGI(calls []string, rd string) int {
+	for i, c := range calls {
+		if strings.HasPrefix(c, "drbdmeta --force - v09 ") && strings.Contains(c, rd+"_00000") &&
+			strings.Contains(c, " internal set-gi ") {
+			return i
+		}
+	}
+
+	return -1
 }

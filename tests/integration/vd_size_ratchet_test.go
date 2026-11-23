@@ -157,7 +157,7 @@ func withSizeBound(
 ) {
 	t.Helper()
 
-	const crdName = "resourcedefinitions.blockstor.cozystack.io"
+	const crdName = "resourcedefinitions.blockstor.org"
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var crd apiextensionsv1.CustomResourceDefinition

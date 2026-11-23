@@ -174,7 +174,7 @@ echo ">> apply 3-replica RD $RD (${SIZE_KIB} KiB) on $N1 + $N2 + $N3"
 # so a DISKLESS witness would only pollute the peer list and
 # the satellite-log "adjust" search later.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -185,7 +185,7 @@ spec:
 EOF
 for n in "$N1" "$N2" "$N3"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:
@@ -289,10 +289,10 @@ echo ">> heal partition on $N3 (iptables -F)"
 cleanup_partition
 
 # Sample the observer surface during the sync window. We want to
-# see EITHER Inconsistent OR SyncTarget on $N3 (the CLI/observer
-# annotates the disk state with a sync-progress percentage like
-# `Inconsistent(28%)` while bitmap-resync runs; both prefixes
-# match the post-Bug-29 observer fix). State=Unknown must NEVER
+# see EITHER Inconsistent OR SyncTarget on $N3 (the CLI renders
+# `SyncTarget(28.00%)` from DRBD's `done` while bitmap-resync runs,
+# and the bare `Inconsistent` before the first progress frame; both
+# prefixes match the post-Bug-29 observer fix). State=Unknown must NEVER
 # appear — that signals the observer pipeline lost the row during
 # the reconnect handshake.
 echo ">> sample $N3 disk state during reconnect+resync (deadline ${RESYNC_DEADLINE_SECS}s)"

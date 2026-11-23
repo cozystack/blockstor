@@ -180,8 +180,10 @@ func TestBug175LUKSFormatPassphraseWithShellMetacharsSafe(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("cryptsetup isLuks /dev/sda",
 		storage.FakeResponse{Err: errBug175NotLuks})
+	fx.Expect("blkid -p -o export /dev/sda",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Format(t.Context(), "/dev/sda", []byte(payloadFormat))
 	if err != nil {
@@ -198,7 +200,7 @@ func TestBug175LUKSFormatPassphraseWithShellMetacharsSafe(t *testing.T) {
 func TestBug175LUKSOpenPassphraseWithShellMetacharsSafe(t *testing.T) {
 	fx := storage.NewFakeExec()
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Open(t.Context(), "/dev/sda", "pvc-1-crypt", []byte(payloadOpen))
 	if err != nil {
@@ -215,7 +217,7 @@ func TestBug175LUKSOpenPassphraseWithShellMetacharsSafe(t *testing.T) {
 func TestBug175LUKSResizePassphraseWithShellMetacharsSafe(t *testing.T) {
 	fx := storage.NewFakeExec()
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	err := c.Resize(t.Context(), "pvc-grow-0-luks", []byte(payloadResize))
 	if err != nil {
@@ -235,8 +237,10 @@ func TestBug175LUKSPassphraseStdinNotArgv(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("cryptsetup isLuks /dev/sda",
 		storage.FakeResponse{Err: errBug175NotLuks})
+	fx.Expect("blkid -p -o export /dev/sda",
+		storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 
-	c := luks.NewCryptsetup(fx)
+	c := luks.NewCryptsetup(fx, anyBlockDevice())
 
 	// Mix of three distinct injection shapes — if any single one
 	// leaks via argv we want a localised failure.

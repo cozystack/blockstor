@@ -212,8 +212,8 @@ dump_diag() {
     echo "---- writer stdout (tail 20) ----"
     tail -n 20 "$WRITER_LOG" 2>/dev/null || true
     echo "---- Resource CRDs ----"
-    kubectl get resourcedefinitions.blockstor.cozystack.io "$RD" -o yaml 2>/dev/null || true
-    kubectl get resources.blockstor.cozystack.io -o yaml 2>/dev/null \
+    kubectl get resourcedefinitions.blockstor.org "$RD" -o yaml 2>/dev/null || true
+    kubectl get resources.blockstor.org -o yaml 2>/dev/null \
         | sed -n '/name: '"$RD"'\./,/^---/p' | head -120 || true
     local n
     for n in "$N1" "$N2" "$N3"; do
@@ -253,10 +253,10 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 echo ">> step 1: preflight — ${POOL} (providerKind=ZFS) on all 3 workers + headroom"
 for n in "$N1" "$N2" "$N3"; do
-    if ! kubectl get storagepools.blockstor.cozystack.io "${POOL}.${n}" >/dev/null 2>&1; then
+    if ! kubectl get storagepools.blockstor.org "${POOL}.${n}" >/dev/null 2>&1; then
         skip "StoragePool ${POOL}.${n} absent — 2TiB quorum-loss gate is stand-'big'-specific (3 workers, zpool blockstor-zfs on 2.2T disks, ${POOL} CRs staged)"
     fi
-    kind=$(kubectl get storagepools.blockstor.cozystack.io "${POOL}.${n}" \
+    kind=$(kubectl get storagepools.blockstor.org "${POOL}.${n}" \
         -o jsonpath='{.spec.providerKind}' 2>/dev/null)
     if [[ "$kind" != "ZFS" ]]; then
         skip "StoragePool ${POOL}.${n} has providerKind='${kind}', need ZFS (thick zvols) — not stand 'big'"
@@ -267,10 +267,10 @@ done
 # status; fall back to asking the zpool directly when the projection
 # has not populated yet (fresh satellite deploy at test time).
 for n in "$N1" "$N2"; do
-    free_kib=$(kubectl get storagepools.blockstor.cozystack.io "${POOL}.${n}" \
+    free_kib=$(kubectl get storagepools.blockstor.org "${POOL}.${n}" \
         -o jsonpath='{.status.freeCapacity}' 2>/dev/null)
     if [[ -z "$free_kib" || "$free_kib" == "0" ]]; then
-        zp=$(kubectl get storagepools.blockstor.cozystack.io "${POOL}.${n}" -o json \
+        zp=$(kubectl get storagepools.blockstor.org "${POOL}.${n}" -o json \
             | jq -r '.spec.props["StorDriver/ZPool"] // .spec.props["StorDriver/ZPoolThin"] // empty')
         if [[ -n "$zp" ]]; then
             free_bytes=$(on_node "$n" zpool list -Hpo free "$zp" 2>/dev/null || echo "")
@@ -292,7 +292,7 @@ done
 echo ">> step 2: apply ${RD} (${SIZE_KIB} KiB, pool=${POOL}) on ${N1}+${N2} + auto-TB"
 create_t0=$(date +%s)
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -303,7 +303,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_KIB}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:
@@ -311,7 +311,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: ${POOL}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N2}}
 spec:
@@ -384,7 +384,7 @@ if (( tb_ok != 1 )); then
     echo "FAIL: witness on ${N3} never came up Diskless+Connected within ${WITNESS_TIMEOUT}s"
     exit 1
 fi
-tb_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
+tb_flags=$(kubectl get "resources.blockstor.org/${RD}.${N3}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || true)
 if [[ "$tb_flags" != *"TIE_BREAKER"* ]]; then
     echo "FAIL: ${RD}.${N3} is not a TIE_BREAKER witness (flags=$tb_flags)"
@@ -754,8 +754,8 @@ assert_no_orphans() {
     local leftover="" line
     while (( $(date +%s) < deadline )); do
         leftover=$( {
-            kubectl get resourcedefinitions.blockstor.cozystack.io "$RD" --no-headers 2>/dev/null
-            kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+            kubectl get resourcedefinitions.blockstor.org "$RD" --no-headers 2>/dev/null
+            kubectl get resources.blockstor.org --no-headers 2>/dev/null \
                 | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}'
         } | grep -v '^$' || true )
         [[ -z "$leftover" ]] && break

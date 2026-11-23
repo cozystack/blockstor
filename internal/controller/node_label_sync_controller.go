@@ -46,7 +46,7 @@ import (
 // node-watchdog manager so the apiserver merges cleanly: each owns
 // the slice of fields it actually authors, and a re-org of one path
 // never accidentally steps on the other.
-const LabelSyncFieldOwner = "blockstor.io/label-sync"
+const LabelSyncFieldOwner = "blockstor.org/label-sync"
 
 // nodeKind is the TypeMeta Kind string for the blockstor Node CRD,
 // shared across SSA patch constructors in this package.
@@ -108,7 +108,7 @@ var syncedLabelExactKeys = map[string]struct{}{
 // This is intentionally distinct from
 // pkg/store/k8s/nodes.go.foldTopologyLabels, which is the inverse
 // shim: it copies labels set on the **blockstor Node CRD itself**
-// (under prefix `topology.blockstor.io/`) into Props on GET. That
+// (under prefix `topology.blockstor.org/`) into Props on GET. That
 // path operates on the CRD's own labels and only on the wire; it
 // never reads corev1.Node and never persists to Spec.Props.
 type NodeLabelSyncReconciler struct {

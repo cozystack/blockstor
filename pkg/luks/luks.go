@@ -24,6 +24,7 @@ package luks
 
 import (
 	"context"
+	"os"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -33,30 +34,207 @@ import (
 
 // Cryptsetup is a thin wrapper around the `cryptsetup` binary.
 type Cryptsetup struct {
-	exec storage.Exec
+	exec          storage.Exec
+	isBlockDevice func(path string) (bool, error)
+}
+
+// Option configures a Cryptsetup.
+type Option func(*Cryptsetup)
+
+// WithBlockDeviceCheck replaces the check Format makes that a device
+// blkid found empty is a block device. Tests whose devices exist only
+// in a fake Exec use it.
+func WithBlockDeviceCheck(check func(path string) (bool, error)) Option {
+	return func(c *Cryptsetup) { c.isBlockDevice = check }
 }
 
 // NewCryptsetup constructs a wrapper with the given Exec.
-func NewCryptsetup(ex storage.Exec) *Cryptsetup {
-	return &Cryptsetup{exec: ex}
+func NewCryptsetup(ex storage.Exec, opts ...Option) *Cryptsetup {
+	c := &Cryptsetup{exec: ex, isBlockDevice: statBlockDevice}
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	return c
+}
+
+// statBlockDevice reports whether path names a block device.
+func statBlockDevice(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, errors.Wrapf(err, "stat %s", path)
+	}
+
+	mode := info.Mode()
+
+	return mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0, nil
 }
 
 // Format runs `cryptsetup luksFormat` against device with the given
 // keyfile contents. Idempotent: if the device already carries a LUKS
 // header, we no-op.
+//
+// A device that is not LUKS but carries any other signature is refused
+// with ErrDeviceHoldsData rather than formatted: luksFormat over it
+// destroys what is there. See probeSignatures.
 func (c *Cryptsetup) Format(ctx context.Context, device string, key []byte) error {
 	err := c.runProbe(ctx, "isLuks", device)
 	if err == nil {
 		return nil
 	}
 
-	err = c.runWithKey(ctx, key, "luksFormat", "--batch-mode", device, "--key-file", "-")
+	signatures, err := c.probeSignatures(ctx, device)
+	if err != nil {
+		return err
+	}
+
+	if len(signatures) > 0 {
+		return errors.Wrapf(ErrDeviceHoldsData,
+			"%s carries %s; refusing luksFormat. Only if nothing was ever written to this volume and the signature is left over from an earlier one on the same extents, clear it with wipefs; DRBD metadata on a volume already in use is its own",
+			device, strings.Join(signatures, ", "))
+	}
+
+	// LUKS2 is named rather than left to the host's default, which is
+	// LUKS1 on older distributions. The key is a 256-bit random password, so the header's own KDF
+	// protects nothing a guess could reach; cryptsetup's default Argon2id
+	// would cost seconds and up to a GiB per open, inside the satellite's
+	// cgroup, for every volume after a node reboot. PBKDF2 at its minimum
+	// keeps opening cheap.
+	err = c.runWithKey(ctx, key, "luksFormat", "--batch-mode", "--type", "luks2",
+		"--pbkdf", "pbkdf2", "--pbkdf-force-iterations", "1000", device, "--key-file", "-")
 	if err != nil {
 		return errors.Wrapf(err, "luksFormat %s", device)
 	}
 
 	return nil
 }
+
+// IsLUKS reports whether device carries a LUKS header. A probe that fails
+// for any reason counts as no header; a caller about to format still runs
+// EnsureEmpty, which fails closed.
+func (c *Cryptsetup) IsLUKS(ctx context.Context, device string) bool {
+	return c.runProbe(ctx, "isLuks", device) == nil
+}
+
+// IsActive reports whether the dm-crypt mapping dmName is active.
+// `cryptsetup status` exits 0 and describes the mapping when it is, and
+// exits non-zero when it is not. A probe that fails or prints nothing
+// counts as not active: the caller then takes the path that opens the
+// device, which answers ErrAlreadyOpen for a mapping that is active after
+// all, so a wrong "no" costs a password read and never a format.
+func (c *Cryptsetup) IsActive(ctx context.Context, dmName string) bool {
+	out, err := c.exec.Run(ctx, "cryptsetup", "status", dmName)
+
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
+// MapsDevice reports whether dmName is an active dm-crypt mapping whose
+// one target encrypts device itself. It is how the satellite recognises
+// a mapping another stack opened over one of its volumes, so it answers
+// yes only on evidence: the live table must hold exactly one crypt
+// target, and that target's device number must be device's. Anything
+// else, a probe that fails included, is no.
+//
+// The table is read without --showkeys, so the volume key never leaves
+// the kernel; the key field is not looked at.
+func (c *Cryptsetup) MapsDevice(ctx context.Context, dmName, device string) bool {
+	out, err := c.exec.Run(ctx, "dmsetup", "table", dmName)
+	if err != nil {
+		return false
+	}
+
+	// <start> <length> crypt <cipher> <key> <iv_offset> <major:minor> <offset> [<opts>]
+	const (
+		targetField = 2
+		deviceField = 6
+	)
+
+	table := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(table) != 1 {
+		return false
+	}
+
+	fields := strings.Fields(table[0])
+	if len(fields) <= deviceField || fields[targetField] != "crypt" {
+		return false
+	}
+
+	number, err := c.exec.Run(ctx, "lsblk", "--nodeps", "--noheadings", "--output", "MAJ:MIN", device)
+	if err != nil {
+		return false
+	}
+
+	return strings.TrimSpace(string(number)) == fields[deviceField]
+}
+
+// EnsureEmpty returns nil only for a block device blkid finds no
+// signature on, and ErrDeviceHoldsData for one that carries any. It is
+// the probe Format runs, for a caller that must commit to formatting,
+// by storing the device's new password, before it formats.
+func (c *Cryptsetup) EnsureEmpty(ctx context.Context, device string) error {
+	signatures, err := c.probeSignatures(ctx, device)
+	if err != nil {
+		return err
+	}
+
+	if len(signatures) > 0 {
+		return errors.Wrapf(ErrDeviceHoldsData, "%s carries %s", device, strings.Join(signatures, ", "))
+	}
+
+	return nil
+}
+
+// TestKey reports whether key opens one of device's key slots, without
+// activating anything. A wrong key is (false, nil).
+func (c *Cryptsetup) TestKey(ctx context.Context, device string, key []byte) (bool, error) {
+	err := c.runWithKey(ctx, key, "luksOpen", "--test-passphrase", device, "--key-file", "-")
+	if err == nil {
+		return true, nil
+	}
+
+	if wrongKey(err) {
+		return false, nil
+	}
+
+	return false, errors.Wrapf(err, "test a key on %s", device)
+}
+
+// cryptsetupWrongKey is the exit status cryptsetup gives when no key slot
+// opens with the key it was handed ("No key available with this
+// passphrase").
+const cryptsetupWrongKey = 2
+
+func wrongKey(err error) bool {
+	var coded interface{ ExitCode() int }
+
+	return errors.As(err, &coded) && coded.ExitCode() == cryptsetupWrongKey
+}
+
+// ErrDeviceHoldsData marks a device Format refused because it already
+// carries a filesystem, DRBD metadata, a partition table or any other
+// signature libblkid recognises.
+var ErrDeviceHoldsData = errors.New("luks: device already holds data")
+
+// ErrNoLUKSKey is a replica that carries no wrapped password for a
+// volume.
+var ErrNoLUKSKey = errors.New("luks: the replica carries no password for this volume")
+
+// ErrLUKSKeyMissing is a device with a LUKS header and no password on its
+// replica. It is neither opened nor formatted: formatting would destroy
+// the data the header guards.
+var ErrLUKSKeyMissing = errors.New("luks: the device has a LUKS header but its replica carries no password for it")
+
+// ErrLUKSKeyMismatch is a device whose header the replica's password does
+// not open. It is never re-formatted.
+var ErrLUKSKeyMismatch = errors.New("luks: the replica's password does not open the device's LUKS header")
+
+// ErrMasterKeyMismatch is a replica password wrapped under a master key
+// other than the one the cluster unlocked.
+var ErrMasterKeyMismatch = errors.New("luks: the replica's password is wrapped under another master key")
+
+// ErrMasterKeyLocked is a cluster whose master key the passphrase Secret
+// does not open, or that has none yet.
+var ErrMasterKeyLocked = errors.New("luks: the master key is locked")
 
 // ErrAlreadyOpen marks the cryptsetup EEXIST class — the dm-crypt
 // mapper is already active for this device. Returned by Open wrapped
@@ -82,6 +260,10 @@ func (c *Cryptsetup) Open(ctx context.Context, device, dmName string, key []byte
 	err := c.runWithKey(ctx, key, "luksOpen", device, dmName, "--key-file", "-")
 	if err == nil {
 		return nil
+	}
+
+	if wrongKey(err) {
+		return errors.Wrapf(errors.WithSecondaryError(ErrLUKSKeyMismatch, err), "luksOpen %s -> %s", device, dmName)
 	}
 
 	if classifyAlreadyOpen(err) {
@@ -148,6 +330,79 @@ func (c *Cryptsetup) Close(ctx context.Context, dmName string) error {
 
 	return nil
 }
+
+// blkidNothingFound is the exit status `blkid -p` returns when the
+// device carries no signature at all. Every other non-zero status,
+// including 8 (several signatures, ambivalent), is either data or a
+// probe that could not tell.
+//
+// blkid also exits 2 when it cannot open the device. It usually says so
+// on stderr with blkidErrorMarker, but not for every path: for one that
+// does not exist it can exit 2 and print nothing. So exit 2 counts as
+// empty only without the marker and for a path that stats as a block
+// device; anything else is a probe that could not tell.
+const blkidNothingFound = 2
+
+// blkidErrorMarker prefixes blkid's own error lines on stderr, which
+// storage.Exec folds into the returned error.
+const blkidErrorMarker = "blkid: error:"
+
+// probeSignatures lists the signatures on device with a low-level
+// `blkid -p` probe, which reads the device itself rather than the
+// cache and sees DRBD internal metadata (TYPE=drbd) as well as
+// filesystems. A volume that held data under a stack without LUKS
+// shows one or the other.
+//
+// It fails closed: a probe that errors for any reason other than
+// finding nothing returns that error, so Format formats only a device
+// it has seen to be empty.
+func (c *Cryptsetup) probeSignatures(ctx context.Context, device string) ([]string, error) {
+	out, err := c.exec.Run(ctx, "blkid", "-p", "-o", "export", device)
+	if err != nil {
+		var coded interface{ ExitCode() int }
+		if errors.As(err, &coded) && coded.ExitCode() == blkidNothingFound &&
+			!strings.Contains(err.Error(), blkidErrorMarker) {
+			return nil, c.requireBlockDevice(device)
+		}
+
+		return nil, errors.Wrapf(err, "probe %s for existing data before luksFormat", device)
+	}
+
+	var signatures []string
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok && (key == "TYPE" || key == "PTTYPE") {
+			signatures = append(signatures, key+"="+value)
+		}
+	}
+
+	if len(signatures) == 0 {
+		// blkid reported a find without naming it; still a find.
+		signatures = append(signatures, "an unnamed signature")
+	}
+
+	return signatures, nil
+}
+
+// requireBlockDevice stands between blkid's "nothing found" and
+// luksFormat: blkid gives the same answer for a path it could not open.
+func (c *Cryptsetup) requireBlockDevice(device string) error {
+	ok, err := c.isBlockDevice(device)
+	if err != nil {
+		return errors.Wrapf(err, "probe %s for existing data before luksFormat", device)
+	}
+
+	if !ok {
+		return errors.Wrapf(ErrNotABlockDevice, "probe %s for existing data before luksFormat", device)
+	}
+
+	return nil
+}
+
+// ErrNotABlockDevice marks a device path blkid found empty that is not
+// a block device, so its answer says nothing about the volume.
+var ErrNotABlockDevice = errors.New("luks: not a block device")
 
 // runProbe runs a status-check subcommand whose exit code is what
 // matters (cryptsetup isLuks: 0 yes, !=0 no).

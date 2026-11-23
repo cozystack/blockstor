@@ -27,7 +27,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // SSA unstructured field-name constants used by both writeSkipDiskProp
@@ -94,7 +93,10 @@ func (s *SkipDiskClearer) ClearSkipDisk(ctx context.Context, resourceName string
 		return nil
 	}
 
-	name := k8s.Name(resourceName + "." + s.NodeName)
+	name, err := replicaCRName(ctx, s.Client, resourceName, s.NodeName)
+	if err != nil {
+		return err
+	}
 
 	// Read the existing Resource to carry the immutable required
 	// scalars (`resourceDefinitionName`, `nodeName`) on the SSA apply
@@ -105,7 +107,7 @@ func (s *SkipDiskClearer) ClearSkipDisk(ctx context.Context, resourceName string
 	// clear; silently no-op.
 	var existing blockstoriov1alpha1.Resource
 
-	err := s.Client.Get(ctx, client.ObjectKey{Name: name}, &existing)
+	err = s.Client.Get(ctx, client.ObjectKey{Name: name}, &existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil

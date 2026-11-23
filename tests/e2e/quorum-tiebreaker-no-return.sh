@@ -156,7 +156,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 echo ">> apply 2-diskful RD on $N1 + $N2 with AutoAddQuorumTiebreaker=true"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -165,7 +165,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:
@@ -173,7 +173,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: ${STORPOOL}}
 ---
-apiVersion: blockstor.cozystack.io/v1alpha1
+apiVersion: blockstor.org/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N2}}
 spec:
@@ -206,7 +206,7 @@ done
 if (( tb_ok != 1 )); then
     echo "FAIL: auto-tiebreaker witness on $N3 never came up Connected within ${WITNESS_TIMEOUT}s"
     echo "   N3 disk-state=$(status_disk_state "$RD" "$N3"), N1->N3 conn=$(status_connection_state "$RD" "$N1" "$N3")"
-    kubectl get resources.blockstor.cozystack.io -o wide 2>/dev/null | grep "^${RD}" || true
+    kubectl get resources.blockstor.org -o wide 2>/dev/null | grep "^${RD}" || true
     on_node "$N1" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/   N1: /' || true
     exit 1
 fi

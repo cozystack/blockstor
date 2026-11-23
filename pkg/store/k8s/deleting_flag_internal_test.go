@@ -113,7 +113,7 @@ func TestCrdToWireRDSurfacesDeletingFlag(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "deleting-rd",
 			DeletionTimestamp: &now,
-			Finalizers:        []string{"blockstor.cozystack.io/satellite-resource"},
+			Finalizers:        []string{"blockstor.org/satellite-resource"},
 		},
 	}
 	SetOriginalName(&crd.ObjectMeta, "deleting-rd")
@@ -146,7 +146,7 @@ func TestCrdToWireResourceSurfacesDeletingFlag(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "deleting-rsc",
 			DeletionTimestamp: &now,
-			Finalizers:        []string{"blockstor.cozystack.io/satellite-resource"},
+			Finalizers:        []string{"blockstor.org/satellite-resource"},
 		},
 		Spec: crdv1alpha1.ResourceSpec{
 			ResourceDefinitionName: "deleting-rd",
@@ -167,5 +167,33 @@ func TestCrdToWireResourceSurfacesDeletingFlag(t *testing.T) {
 	}
 	if slices.Contains(crdToWireResource(live).Flags, apiv1.ResourceFlagDelete) {
 		t.Fatalf("crdToWireResource surfaced DELETE on a live Resource")
+	}
+}
+
+// A snapshot delete only stamps a DeletionTimestamp while a satellite
+// finalizer holds it, and a restore that read it as live was restored from
+// data being destroyed.
+func TestCrdToWireSnapshotSurfacesDeletingFlag(t *testing.T) {
+	t.Parallel()
+
+	now := metav1.NewTime(time.Now())
+	crd := &crdv1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "src.clone-dst",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"blockstor.org/satellite-snapshot"},
+		},
+		Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "src", SnapshotName: "clone-dst"},
+	}
+
+	if wire := crdToWireSnapshot(crd, nil); !slices.Contains(wire.Flags, apiv1.SnapshotFlagDelete) {
+		t.Fatalf("crdToWireSnapshot did not surface DELETE on a deleting Snapshot: flags=%v", wire.Flags)
+	}
+
+	live := &crdv1alpha1.Snapshot{
+		Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "src", SnapshotName: "snap"},
+	}
+	if slices.Contains(crdToWireSnapshot(live, nil).Flags, apiv1.SnapshotFlagDelete) {
+		t.Fatalf("crdToWireSnapshot surfaced DELETE on a live Snapshot")
 	}
 }

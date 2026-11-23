@@ -25,7 +25,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -144,6 +143,10 @@ var handlers = map[string]handler{
 
 	"encryption create-passphrase": encryptionCreatePassphrase,
 	"encryption enter-passphrase":  encryptionEnterPassphrase,
+	"encryption modify-passphrase": encryptionModifyPassphrase,
+	"encryption add-passphrase":    encryptionAddPassphrase,
+	"encryption remove-passphrase": encryptionRemovePassphrase,
+	"encryption list-passphrases":  encryptionListPassphrases,
 
 	"resource-definition modify":     resourceDefinitionModify,
 	"resource-definition clone":      resourceDefinitionClone,
@@ -302,11 +305,14 @@ func volumeDefinitionList(ctx context.Context, run *runContext) error {
 
 // resourceList implements `resource list`.
 //
-// It fetches the volume sizes as well as the replicas, because the
-// State column renders `SyncTarget(NN%)` from them. Without the sizes
-// the percentage silently disappeared during exactly the resync an
-// operator is watching, while the design doc promised it and the
-// colour classifier went to the trouble of stripping it.
+// The replicas are read whole and filtered in process, `-n` and `-r`
+// included. The filter compares names as the store addresses them
+// (naming.Same), and a replica's spec keeps whatever case its writer used:
+// an adoption run or linstor-csi can store `NODE-1` for a node the operator
+// types as `node-1`. The node- and definition-scoped reads compare the stored
+// spelling verbatim, as a field selector does (pkg/store/k8s/spellings.go),
+// so answering a narrowed listing with them returned fewer rows than this
+// filter finds, with exit status zero; the listing stays whole.
 func resourceList(ctx context.Context, run *runContext) error {
 	resources, err := fetchResources(ctx, run.Store)
 	if err != nil {
@@ -328,43 +334,9 @@ func resourceList(ctx context.Context, run *runContext) error {
 	}
 
 	return run.render(view.ResourceList(view.ResourceListInput{
-		Resources:      kept,
-		VolumeSizesKib: volumeSizesFor(ctx, run, kept),
-		FaultyOnly:     run.Flags.Faulty,
+		Resources:  kept,
+		FaultyOnly: run.Flags.Faulty,
 	}), "State", "Conns")
-}
-
-// volumeSizesFor collects the per-volume sizes of the definitions in a
-// listing, keyed the way the view expects. A definition whose sizes
-// cannot be read is skipped rather than failing the listing: a missing
-// percentage is a cosmetic loss, an unreadable `resource list` during
-// an incident is not.
-func volumeSizesFor(ctx context.Context, run *runContext, resources []apiv1.Resource) map[string]map[int32]int64 {
-	seen := make(map[string]struct{}, len(resources))
-	sizes := make(map[string]map[int32]int64, len(resources))
-
-	for i := range resources {
-		name := resources[i].Name
-		if _, done := seen[name]; done {
-			continue
-		}
-
-		seen[name] = struct{}{}
-
-		vds, err := run.Store.VolumeDefinitions().List(ctx, name)
-		if err != nil {
-			continue
-		}
-
-		perVolume := make(map[int32]int64, len(vds))
-		for j := range vds {
-			perVolume[vds[j].VolumeNumber] = vds[j].SizeKib
-		}
-
-		sizes[name] = perVolume
-	}
-
-	return sizes
 }
 
 // machineOut writes the machine-readable envelope.

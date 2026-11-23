@@ -73,6 +73,10 @@ func (v *vanishingTBResources) ListByDefinition(ctx context.Context, rdName stri
 	return v.inner.ListByDefinition(ctx, rdName) //nolint:wrapcheck // test helper
 }
 
+func (v *vanishingTBResources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
+	return v.inner.ListByNode(ctx, node) //nolint:wrapcheck // test helper
+}
+
 func (v *vanishingTBResources) Get(ctx context.Context, rdName, node string) (apiv1.Resource, error) {
 	if [2]string{rdName, node} == v.raceKey {
 		// Witness already finalized — Get sees the gap.
@@ -398,6 +402,10 @@ func (v *alwaysVanishingTBResources) List(ctx context.Context) ([]apiv1.Resource
 
 func (v *alwaysVanishingTBResources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
 	return v.inner.ListByDefinition(ctx, rdName) //nolint:wrapcheck // test helper
+}
+
+func (v *alwaysVanishingTBResources) ListByNode(ctx context.Context, node string) ([]apiv1.Resource, error) {
+	return v.inner.ListByNode(ctx, node) //nolint:wrapcheck // test helper
 }
 
 func (v *alwaysVanishingTBResources) Get(ctx context.Context, rdName, node string) (apiv1.Resource, error) {

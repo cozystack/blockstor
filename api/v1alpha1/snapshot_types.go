@@ -25,6 +25,7 @@ import (
 // SnapshotSpec is the desired state of a LINSTOR Snapshot. The composite
 // key is (resource definition, snapshot name); metadata.name encodes that
 // as `<rd>.<snap>`.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.luksKeys) || (has(self.luksKeys) && self.luksKeys == oldSelf.luksKeys)",message="luksKeys is set once, when the snapshot is created"
 type SnapshotSpec struct {
 	// resourceDefinitionName is the parent ResourceDefinition.
 	// +required
@@ -146,6 +147,30 @@ type SnapshotSpec struct {
 	// makes progress instead of hanging on a missing denominator.
 	// +optional
 	GroupSize int32 `json:"groupSize,omitempty"`
+
+	// luksKeys are the wrapped LUKS passwords of the source replicas,
+	// copied when the snapshot is created: a snapshot's bytes are
+	// encrypted under the password of the replica they were taken from,
+	// and that replica may be gone by the time the snapshot is restored.
+	// +listType=map
+	// +listMapKey=nodeName
+	// +listMapKey=volumeNumber
+	// +optional
+	LUKSKeys []SnapshotLUKSKey `json:"luksKeys,omitempty"`
+}
+
+// SnapshotLUKSKey is the wrapped password of one source replica's volume.
+type SnapshotLUKSKey struct {
+	// nodeName is the CR name of the node the replica is on.
+	// +required
+	NodeName string `json:"nodeName"`
+
+	// volumeNumber is the volume within the replica.
+	// +required
+	VolumeNumber int32 `json:"volumeNumber"`
+
+	// LUKSKey is the password as the replica carries it.
+	LUKSKey `json:",inline"`
 }
 
 // SnapshotVolumeRef is one volume slot inside a Snapshot.
@@ -176,7 +201,7 @@ type SnapshotVolumeRef struct {
 // instead: short-circuiting there would leave every diskful peer
 // holding `drbdsetup suspend-io` with nothing left to resume it —
 // frozen production I/O with no error surfaced.
-const AnnotationSnapshotAdopted = "blockstor.io/adopted"
+const AnnotationSnapshotAdopted = "blockstor.org/adopted"
 
 // AnnotationSnapshotAdoptedCreatedAt optionally carries the original
 // creation time of an adopted snapshot as milliseconds since the Unix
@@ -184,7 +209,7 @@ const AnnotationSnapshotAdopted = "blockstor.io/adopted"
 // The SnapshotReconciler copies it into the backfilled per-node
 // CreateTimestamp entries so `linstor s l` keeps showing the REAL
 // snapshot age instead of the adoption time.
-const AnnotationSnapshotAdoptedCreatedAt = "blockstor.io/adopted-created-at"
+const AnnotationSnapshotAdoptedCreatedAt = "blockstor.org/adopted-created-at"
 
 // SnapshotStatusFlagFailed is stamped on Status.Flags by the
 // satellite reconciler when CreateSnapshot returned a terminal
@@ -237,6 +262,23 @@ type SnapshotStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// deleteFailures records, per node, why the satellite's last
+	// attempt to delete its copy of a deleting snapshot failed. The
+	// delete call answers with it at once, as LINSTOR answers with the
+	// error its satellite returned, instead of waiting on a node that
+	// is alive but keeps failing.
+	// +listType=map
+	// +listMapKey=nodeName
+	// +optional
+	DeleteFailures []SnapshotDeleteFailure `json:"deleteFailures,omitempty"`
+}
+
+// SnapshotDeleteFailure is the error one satellite hit deleting its
+// copy of the snapshot.
+type SnapshotDeleteFailure struct {
+	NodeName string `json:"nodeName"`
+	Message  string `json:"message"`
 }
 
 // SnapshotPerNodeStatus is the satellite-reported state of one
@@ -268,12 +310,26 @@ type SnapshotPerNodeStatus struct {
 	// Snapshot's Status.Flags with FAILED. Bug 351.
 	// +optional
 	Failed bool `json:"failed,omitempty"`
+
+	// storagePool is the pool that holds this node's copy: the pool of
+	// the replica it was taken from. The local satellite records it once
+	// its copy exists, because the copy outlives the replica and a
+	// restore has to be placed in the same pool, the way LINSTOR keeps
+	// the pool on each snapshot volume.
+	// +optional
+	StoragePool string `json:"storagePool,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.resourceDefinitionName + '.' + self.spec.snapshotName).lowerAscii()",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.snapshotName> (case-insensitive)",optionalOldSelf=true
+// spec.resourceDefinitionName is selectable so a definition-scoped snapshot
+// read is a definition-scoped query. A field, not the label the objects
+// usually carry: a Snapshot adopted from a LINSTOR dump has no labels, and a
+// label selector would answer partial-but-correct on the read that refuses
+// `rd d` and sweeps the leftovers after it.
+// +kubebuilder:selectablefield:JSONPath=`.spec.resourceDefinitionName`
 // +kubebuilder:printcolumn:name="Definition",type=string,JSONPath=`.spec.resourceDefinitionName`
 // +kubebuilder:printcolumn:name="Snapshot",type=string,JSONPath=`.spec.snapshotName`
 // +kubebuilder:printcolumn:name="Nodes",type=string,JSONPath=`.spec.nodes`

@@ -21,11 +21,15 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
+	"slices"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // registerResourceConnections wires the resource-connection / paths
@@ -116,25 +120,47 @@ type resourceConnectionPath struct {
 }
 
 // canonicalConnectionKey returns (sortedA, sortedB, swap) where
-// sortedA <= sortedB lexicographically. swap is true when the caller
+// sortedA's key sorts before sortedB's. swap is true when the caller
 // passed the pair in reverse order; the handler uses that to flip
 // A/B addresses on the way in/out so the stored entry always lives
 // under the canonical order.
 func canonicalConnectionKey(a, b string) (string, string, bool) {
-	if a <= b {
+	if naming.Key(a) <= naming.Key(b) {
 		return a, b, false
 	}
 
 	return b, a, true
 }
 
-// propKey is the full RD-prop key for a (nodeA, nodeB) pair. The pair
-// is canonicalised before joining so the key is identical whether
-// the operator posted under (a, b) or (b, a).
-func propKey(nodeA, nodeB string) string {
-	sortedA, sortedB, _ := canonicalConnectionKey(nodeA, nodeB)
+// pairPropKey is the RD-prop key rd keeps the (nodeA, nodeB) paths
+// under: the one already stored for the pair, in whatever spelling and
+// order it was posted, or a new one in canonical order. swap is true
+// when the key names nodeB first. Looking the pair up by key keeps a
+// second spelling of a node from opening a second entry for one pair,
+// which would hand the satellite two connections between two hosts.
+func pairPropKey(rd *apiv1.ResourceDefinition, nodeA, nodeB string) (string, bool) {
+	for _, key := range slices.Sorted(maps.Keys(rd.Props)) {
+		pair, ok := strings.CutPrefix(key, resourceConnectionPathsPropKey)
+		if !ok {
+			continue
+		}
 
-	return resourceConnectionPathsPropKey + sortedA + "/" + sortedB
+		first, second, ok := strings.Cut(pair, "/")
+		if !ok {
+			continue
+		}
+
+		switch {
+		case naming.Same(first, nodeA) && naming.Same(second, nodeB):
+			return key, false
+		case naming.Same(first, nodeB) && naming.Same(second, nodeA):
+			return key, true
+		}
+	}
+
+	sortedA, sortedB, swap := canonicalConnectionKey(nodeA, nodeB)
+
+	return resourceConnectionPathsPropKey + sortedA + "/" + sortedB, swap
 }
 
 // loadPaths reads + decodes the stored path list for the (nodeA,
@@ -142,9 +168,9 @@ func propKey(nodeA, nodeB string) string {
 // canonicalConnectionKey's third return so callers know whether to
 // flip A/B before encoding the response.
 func loadPaths(rd *apiv1.ResourceDefinition, nodeA, nodeB string) ([]resourceConnectionPath, bool, error) {
-	_, _, swap := canonicalConnectionKey(nodeA, nodeB)
+	key, swap := pairPropKey(rd, nodeA, nodeB)
 
-	raw, ok := rd.Props[propKey(nodeA, nodeB)]
+	raw, ok := rd.Props[key]
 	if !ok || raw == "" {
 		return nil, swap, nil
 	}
@@ -163,7 +189,7 @@ func loadPaths(rd *apiv1.ResourceDefinition, nodeA, nodeB string) ([]resourceCon
 // slice to delete the prop key entirely (so an emptied connection
 // doesn't leak as a zombie `[]` value in storage).
 func storePaths(rd *apiv1.ResourceDefinition, nodeA, nodeB string, paths []resourceConnectionPath) error {
-	key := propKey(nodeA, nodeB)
+	key, _ := pairPropKey(rd, nodeA, nodeB)
 
 	if len(paths) == 0 {
 		delete(rd.Props, key)

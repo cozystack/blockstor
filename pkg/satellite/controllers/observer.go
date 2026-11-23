@@ -19,7 +19,9 @@ limitations under the License.
 package controllers
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -155,9 +157,23 @@ type volumeObservation struct {
 // volume under the same listMap key on Status. Distinct from
 // volumeObservation because the data plane is different: this is
 // the PEER's view of our volume, not our local kernel's view.
+//
+// Done is the `done:<percent>` token of the same frame: the progress
+// of the resync running with this peer. It is per peer on purpose. A
+// replica can resync from two peers one after the other, and the
+// volume-wide OutOfSyncKib is whichever peer-device frame came last,
+// so it can show the finished small resync while the large one is
+// half done.
+//
+// ReplicationState is the `replication:<state>` token of the same
+// frame. DRBD keeps it per peer and per volume; the connection-level
+// ReplicationState is whichever volume's frame came last, so `done`
+// is only read against this one.
 type peerVolumeObservation struct {
-	VolumeNumber  int32
-	PeerDiskState string
+	VolumeNumber     int32
+	PeerDiskState    string
+	Done             string
+	ReplicationState string
 }
 
 // connectionObservation carries one per-peer DRBD connection state.
@@ -514,10 +530,19 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 		// this node's local kernel view); under partition the two
 		// views diverge, which is exactly what the partition e2e
 		// tests assert.
-		if pd := ev.Fields["peer-disk"]; pd != "" {
+		//
+		// The volume's own replication state and resync progress
+		// ride on the same entry. A peer-device frame carrying either
+		// token is a full statement of that volume's state with that
+		// peer (events2 runs with --full), so a missing `done` on it
+		// means no resync runs, whether or not it carries peer-disk.
+		pd, repl := ev.Fields["peer-disk"], ev.Fields["replication"]
+		if pd != "" || repl != "" {
 			conn.PeerVolumes = []peerVolumeObservation{{
-				VolumeNumber:  int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
-				PeerDiskState: pd,
+				VolumeNumber:     int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
+				PeerDiskState:    pd,
+				Done:             ev.Fields["done"],
+				ReplicationState: repl,
 			}}
 		}
 
@@ -657,6 +682,24 @@ const (
 	drbdQuorumYes = "yes"
 )
 
+// newObserverRunnableFromConfig builds the observer the manager runs, so the
+// wiring from cfg (the GI record above all, which nothing else would notice
+// missing) lives where a unit test can drive it. Production caller:
+// manager.go addBackgroundRunnables.
+func newObserverRunnableFromConfig(cli client.Client, cfg *Config) *ObserverRunnable {
+	return &ObserverRunnable{
+		Client:   cli,
+		Exec:     cfg.Exec,
+		NodeName: cfg.NodeName,
+		RecordGI: cfg.Apply.RecordObservedGI,
+		// Phase 11.7: producer end of the observer-trigger channel.
+		// Fires on kernel-state changes (resource lifecycle, role,
+		// disk, conn, repl) so the ResourceReconciler wakes even
+		// when no apiserver write bumps Generation.
+		ReconcileTrigger: cfg.ReconcileTrigger,
+	}
+}
+
 // ObserverRunnable tails `drbdsetup events2` and writes the parsed
 // observations onto matching Resource CRDs' Status subresource
 // via SSA. Phase 10.6: replaces the retired gRPC
@@ -676,6 +719,11 @@ type ObserverRunnable struct {
 	// onto Resource.Status as the host signal the controller
 	// uses to route observations to the right CRD.
 	NodeName string
+
+	// RecordGI keeps the GI of every data-bearing volume it is called
+	// with in the satellite's own record, which outlives the status
+	// field (satellite.Reconciler.RecordObservedGI). Nil records nothing.
+	RecordGI func(rdName string, vol int32, gi string)
 
 	// connCache holds the latest observed per-peer connection state
 	// keyed by `<resource>/<peer>`. We apply the full snapshot per
@@ -1091,7 +1139,7 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	// doesn't suppress the wake-up — the recovery decision only
 	// needs the kernel-state change to land in the reconcile queue,
 	// not the corresponding Status PATCH to commit.
-	o.emitReconcileTrigger(ev)
+	o.emitReconcileTrigger(ctx, ev)
 
 	// Phase 11.3 Stage 3: stamp the KernelLoaded Condition off the
 	// resource-kind frame lifecycle. Gated on HasKernelLoaded so
@@ -1146,20 +1194,20 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 	for i := range ev.Volumes {
 		vol := &ev.Volumes[i]
 
-		if vol.CurrentUUID != "" || vol.BackingDev == "" {
-			continue
-		}
-
 		if !isDataBearingDiskState(drbd.DiskState(vol.DiskState)) {
 			continue
 		}
 
-		current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
-		if err != nil || current == "" {
-			continue
+		if vol.CurrentUUID == "" && vol.BackingDev != "" {
+			current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
+			if err == nil {
+				vol.CurrentUUID = current
+			}
 		}
 
-		vol.CurrentUUID = current
+		if vol.CurrentUUID != "" && o.RecordGI != nil {
+			o.RecordGI(ev.ResourceName, vol.VolumeNumber, vol.CurrentUUID)
+		}
 	}
 }
 
@@ -1197,7 +1245,7 @@ func isDataBearingDiskState(s drbd.DiskState) bool {
 // SetupWithManager registers the channel as a raw source whose
 // handler enqueues the named Resource for reconciliation, no
 // per-event field inspection required.
-func (o *ObserverRunnable) emitReconcileTrigger(ev *observation) {
+func (o *ObserverRunnable) emitReconcileTrigger(ctx context.Context, ev *observation) {
 	if o.ReconcileTrigger == nil || ev == nil || ev.ResourceName == "" {
 		return
 	}
@@ -1224,7 +1272,11 @@ func (o *ObserverRunnable) emitReconcileTrigger(ev *observation) {
 	o.lifecycleCache[ev.ResourceName] = want
 	o.lifecycleMu.Unlock()
 
-	name := k8s.Name(ev.ResourceName + "." + o.NodeName)
+	name, err := replicaCRName(ctx, o.Client, ev.ResourceName, o.NodeName)
+	if err != nil {
+		// The 5-second resync re-enqueues every local Resource anyway.
+		return
+	}
 
 	trigger := event.GenericEvent{
 		Object: &blockstoriov1alpha1.Resource{
@@ -1475,7 +1527,7 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 // re-emit.
 //
 // The reconciler stamps the live RD volume set onto the Resource CRD's
-// `blockstor.io/volume-numbers` annotation on every successful apply
+// `blockstor.org/volume-numbers` annotation on every successful apply
 // pass, so it is the authoritative desired set for both diskful and
 // diskless replicas. Prune the cache against it: drop every cached
 // volume whose number is absent from the annotation.
@@ -1550,10 +1602,19 @@ func (o *ObserverRunnable) pruneVolumeCacheToDesired(ev *observation, res *block
 // applies are deterministic (test stability + idempotent re-emit
 // during resync).
 //
-// Per-volume merge: an incoming PeerDiskState=="" leaves the
-// cached value alone (frame didn't carry the token). A non-empty
-// value updates the cached entry for that VolumeNumber, adding a
-// new entry if this is the first frame for that volume.
+// Per-volume merge: an incoming PeerDiskState or ReplicationState
+// of "" leaves that cached value alone (frame didn't carry the
+// token). A non-empty value updates the cached entry for that
+// VolumeNumber, adding a new entry if this is the first frame for
+// that volume. An entry carrying neither token is not a peer-device
+// state and is skipped.
+//
+// Done is replaced on every entry that is merged, absent included.
+// events2 runs with --full, so every peer-device frame carries the
+// whole state, and drbdsetup prints `done` on it exactly while a
+// resync with that peer runs: a frame without it means the resync
+// is over. LINSTOR's DrbdVolume.update clears its done percentage on
+// any frame without one the same way.
 func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolumeObservation {
 	byVol := map[int32]peerVolumeObservation{}
 	for _, peerVol := range cached {
@@ -1561,13 +1622,22 @@ func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolume
 	}
 
 	for _, peerVol := range incoming {
-		if peerVol.PeerDiskState == "" {
+		if peerVol.PeerDiskState == "" && peerVol.ReplicationState == "" {
 			continue
 		}
 
 		entry := byVol[peerVol.VolumeNumber]
 		entry.VolumeNumber = peerVol.VolumeNumber
-		entry.PeerDiskState = peerVol.PeerDiskState
+
+		if peerVol.PeerDiskState != "" {
+			entry.PeerDiskState = peerVol.PeerDiskState
+		}
+
+		if peerVol.ReplicationState != "" {
+			entry.ReplicationState = peerVol.ReplicationState
+		}
+
+		entry.Done = peerVol.Done
 		byVol[peerVol.VolumeNumber] = entry
 	}
 
@@ -1737,7 +1807,10 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		return nil
 	}
 
-	name := k8s.Name(ev.ResourceName + "." + o.NodeName)
+	name, err := replicaCRName(ctx, o.Client, ev.ResourceName, o.NodeName)
+	if err != nil {
+		return err
+	}
 
 	// Best-effort lookup for `Spec.StoragePool` so the observer's
 	// per-volume Status entries carry the pool name on every tick
@@ -1763,7 +1836,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		// evicted by the event path and the observer re-emits a
 		// phantom Status.Volumes[n] on every tick (a permanent flap).
 		// The reconciler stamps the authoritative live volume set on
-		// `blockstor.io/volume-numbers`; prune the cache against it so
+		// `blockstor.org/volume-numbers`; prune the cache against it so
 		// the diskless replica's Status.Volumes converges to exactly
 		// the surviving set without waiting for a destroy event that
 		// never comes. Idempotent: rebuilds ev.Volumes only when the
@@ -1801,7 +1874,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 	// volumes[volumeNumber=0]; ForceOwnership on either side would
 	// kick the other's subfield claims off the listMap entry.
 	// SSA's per-field merge already covers what we need.
-	err := o.Client.Status().Patch(ctx, apply,
+	err = o.Client.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
 		client.FieldOwner(k8s.SatelliteFieldOwner))
 	if err != nil {
@@ -1878,7 +1951,10 @@ func (o *ObserverRunnable) writeSkipDiskProp(ctx context.Context, resourceName s
 		return nil
 	}
 
-	name := k8s.Name(resourceName + "." + o.NodeName)
+	name, err := replicaCRName(ctx, o.Client, resourceName, o.NodeName)
+	if err != nil {
+		return err
+	}
 
 	// Read the existing Resource so the SSA apply object can carry
 	// the immutable required scalars (`resourceDefinitionName`,
@@ -1894,7 +1970,7 @@ func (o *ObserverRunnable) writeSkipDiskProp(ctx context.Context, resourceName s
 	// IsNotFound branch silences the event.
 	var existing blockstoriov1alpha1.Resource
 
-	err := o.Client.Get(ctx, client.ObjectKey{Name: name}, &existing)
+	err = o.Client.Get(ctx, client.ObjectKey{Name: name}, &existing)
 	if err != nil {
 		return errors.Wrapf(err, "get Resource %s", name)
 	}
@@ -1966,7 +2042,10 @@ func (o *ObserverRunnable) stampKernelLoaded(ctx context.Context, resourceName s
 		return nil
 	}
 
-	name := k8s.Name(resourceName + "." + o.NodeName)
+	name, err := replicaCRName(ctx, o.Client, resourceName, o.NodeName)
+	if err != nil {
+		return err
+	}
 
 	status := metav1.ConditionFalse
 	reason := kernelLoadedReasonDestroyed
@@ -2001,7 +2080,7 @@ func (o *ObserverRunnable) stampKernelLoaded(ctx context.Context, resourceName s
 	// writer own only the KernelLoaded entry. The MetadataCreated
 	// and FilesystemFormatted stampers keep their own entries
 	// alive under their own field-managers.
-	err := o.Client.Status().Patch(ctx, apply,
+	err = o.Client.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
 		client.FieldOwner(observerKernelLoadedFieldOwner))
 	if err != nil {
@@ -2042,6 +2121,13 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 		})
 	}
 
+	// Every snapshot is built from a map, and SSA keeps the order of
+	// the list it is sent: unsorted, an unchanged volume set is a real
+	// write whenever the map comes out in a different order.
+	slices.SortFunc(out, func(left, right blockstoriov1alpha1.ResourceVolumeStatus) int {
+		return cmp.Compare(left.VolumeNumber, right.VolumeNumber)
+	})
+
 	return out
 }
 
@@ -2076,6 +2162,15 @@ func buildObserverConnectionStatus(ev *observation) []blockstoriov1alpha1.Resour
 		})
 	}
 
+	// Sorted here, where every path to the apply passes (the event
+	// merge and the 5 s resync both snapshot a map): SSA keeps the
+	// order of the list it is sent, so an unchanged peer set in a new
+	// map order is a real write, and it wakes every other informer
+	// watching Resources.
+	slices.SortFunc(out, func(left, right blockstoriov1alpha1.ResourceConnectionStatus) int {
+		return cmp.Compare(left.PeerNodeName, right.PeerNodeName)
+	})
+
 	return out
 }
 
@@ -2092,8 +2187,10 @@ func buildPeerVolumeStatus(in []peerVolumeObservation) []blockstoriov1alpha1.Pee
 	out := make([]blockstoriov1alpha1.PeerVolumeStatus, 0, len(in))
 	for _, peerVol := range in {
 		out = append(out, blockstoriov1alpha1.PeerVolumeStatus{
-			VolumeNumber:  peerVol.VolumeNumber,
-			PeerDiskState: peerVol.PeerDiskState,
+			VolumeNumber:     peerVol.VolumeNumber,
+			PeerDiskState:    peerVol.PeerDiskState,
+			Done:             peerVol.Done,
+			ReplicationState: peerVol.ReplicationState,
 		})
 	}
 

@@ -28,7 +28,7 @@ description: |
   from the RD (pruneStaleResourceVolumes); the observer evicts the
   removed volume from volCache on the `destroy device` frame (diskful
   path) AND converges the diskless replica's cached volume set to the
-  RD's live volume-number set via the `blockstor.io/volume-numbers`
+  RD's live volume-number set via the `blockstor.org/volume-numbers`
   annotation (pruneVolumeCacheToDesired) so a missing destroy event no
   longer strands a phantom. spec.volumes + status.volumes converge to
   exactly [vol-0] on every replica and the flap stops.

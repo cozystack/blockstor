@@ -16,100 +16,76 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package passphrase centralises access to the cluster master
-// passphrase Secret — the value `linstor encryption
-// create-passphrase` stamps (POST /v1/encryption/passphrase, served
-// by pkg/rest/encryption.go) and the LUKS layer consumes.
+// Package passphrase is the cluster's master passphrase plumbing: the
+// passphrase Secret it unlocks from (piraeus's shape, MASTER_PASSPHRASE,
+// or a Secret blockstor generates), the keyring Secret that holds the
+// master key's slots, the unlocked state every component derives from the
+// two, and the passphrase operations the REST verbs and the CLI share.
 //
-// Bug 023: before this package, the Secret was written by the REST
-// layer but never read outside it — the LUKS RD-create gate and the
-// satellite-facing dispatch chain only consulted the legacy
-// plaintext controller property `DrbdOptions/EncryptPassphrase`, so
-// the upstream-standard `encryption create-passphrase` →
-// `rd create --layer-list ...,luks,...` flow dead-ended with a hint
-// telling operators to put a PLAINTEXT passphrase into a controller
-// prop. Both the REST gate (pkg/rest) and the satellite-side
-// dispatch (pkg/satellite/controllers) now resolve the passphrase
-// through this single implementation.
+// It also refuses the properties that once carried a passphrase in
+// plaintext: no passphrase is ever read from a property.
 package passphrase
 
 import (
-	"context"
-
-	"github.com/cockroachdb/errors"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"slices"
+	"strings"
 )
-
-// DefaultSecretName is the Secret the controller falls back to when
-// ControllerConfig.Spec.PassphraseSecretRef is unset. Operators
-// override via the ControllerConfig CRD.
-const DefaultSecretName = "blockstor-cluster-passphrase"
-
-// SecretKey is the data key inside the Secret carrying the cluster
-// passphrase. Matches the upstream-LINSTOR-on-k8s convention so
-// existing Secret YAML manifests continue to work.
-const SecretKey = "passphrase"
 
 // PropKeyCanonical is upstream LINSTOR's cluster-scope master-key
 // property name (`linstor controller set-property
-// DrbdOptions/EncryptPassphrase <pass>`). Bug 023: this LEGACY path
-// stores the passphrase in PLAINTEXT on the ControllerConfig CRD —
-// kept working for backward compatibility, but the Secret written
-// by `encryption create-passphrase` is the primary mechanism.
+// DrbdOptions/EncryptPassphrase <pass>`). blockstor never reads the
+// passphrase from a property: a property is stored in plaintext on its
+// CR, and any dump of the CRs for a backup would carry the key to every
+// LUKS volume. The REST API refuses to store it, and the satellite drops
+// it from a definition's properties before it adds the Secret's value
+// under this key for the dispatcher.
 const PropKeyCanonical = "DrbdOptions/EncryptPassphrase"
 
-// PropKeyLegacy is the early-Phase-9 per-RD alias the dispatcher
-// still alias-reads (Bug 265 history, pkg/dispatcher). Deprecated.
+// PropKeyLegacy is the early per-RD alias of PropKeyCanonical. It is
+// refused and dropped the same way.
 const PropKeyLegacy = "DrbdOptions/Encryption/passphrase"
 
-// SecretName resolves the passphrase Secret's name from the
-// singleton ControllerConfig, falling back to DefaultSecretName when
-// the ControllerConfig is absent or doesn't pin a reference. The
-// fallback lets operators get a working cluster without first
-// applying a ControllerConfig CRD.
-func SecretName(ctx context.Context, reader client.Reader) (string, error) {
-	var ctrlConfig blockstoriov1alpha1.ControllerConfig
+// PropKeyVolume is upstream LINSTOR's per-volume passphrase property,
+// stamped by `linstor vd modify-passphrase`. blockstor has no per-volume
+// keys: every LUKS volume uses the cluster passphrase, so the door that
+// wrote it is refused and the key is refused and dropped like the others.
+const PropKeyVolume = "DrbdOptions/Encrypt/Passphrase"
 
-	err := reader.Get(ctx, client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &ctrlConfig)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return DefaultSecretName, nil
+// WirePropKey is the property the satellite's LUKS layer once read the
+// cluster passphrase from. Nothing reads it now that every volume has its
+// own password; a property of that name is still refused and dropped.
+const WirePropKey = "LuksPassphrase"
+
+// IsPlaintextPropKey reports whether key would carry the master
+// passphrase in a property. Matched without regard to case, so no
+// spelling slips through.
+func IsPlaintextPropKey(key string) bool {
+	for _, k := range []string{PropKeyCanonical, PropKeyLegacy, PropKeyVolume, WirePropKey} {
+		if strings.EqualFold(key, k) {
+			return true
 		}
-
-		return "", errors.Wrap(err, "get ControllerConfig")
 	}
 
-	if ctrlConfig.Spec.PassphraseSecretRef != nil && ctrlConfig.Spec.PassphraseSecretRef.Name != "" {
-		return ctrlConfig.Spec.PassphraseSecretRef.Name, nil
-	}
-
-	return DefaultSecretName, nil
+	return false
 }
 
-// Read returns the cluster master passphrase from the encryption
-// Secret in the given namespace. Empty string (not an error) means
-// "not yet set" — the Secret is missing or carries an empty value;
-// that's the explicit signal the create/enter handshake relies on.
-func Read(ctx context.Context, reader client.Reader, namespace string) (string, error) {
-	name, err := SecretName(ctx, reader)
-	if err != nil {
-		return "", err
-	}
+// DropPlaintextProps removes every property that would carry the
+// master passphrase from props, and returns the keys it removed that
+// held a value, sorted, for the caller to name in a log line.
+func DropPlaintextProps(props map[string]string) []string {
+	var dropped []string
 
-	var sec corev1.Secret
+	for key, value := range props {
+		if IsPlaintextPropKey(key) {
+			delete(props, key)
 
-	err = reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &sec)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", nil
+			if value != "" {
+				dropped = append(dropped, key)
+			}
 		}
-
-		return "", errors.Wrap(err, "get passphrase Secret")
 	}
 
-	return string(sec.Data[SecretKey]), nil
+	slices.Sort(dropped)
+
+	return dropped
 }

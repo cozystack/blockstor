@@ -86,7 +86,7 @@ while (( $(date +%s) < deadline )); do
     pair=()
     tb=""
     for n in "$N1" "$N2" "$N3"; do
-        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
+        flags=$(kubectl get "resources.blockstor.org/${RD}.${n}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" == *"TIE_BREAKER"* ]]; then
             tb=$n
@@ -134,7 +134,7 @@ deadline=$(( $(date +%s) + 30 ))
 reaped=false
 last_rows=""
 while (( $(date +%s) < deadline )); do
-    rows=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+    rows=$(kubectl get resources.blockstor.org --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}' || true)
     n_rows=$(printf '%s\n' "$rows" | grep -cv '^$' || true)
     last_rows="$rows"

@@ -254,45 +254,27 @@ func TestAdmSetGIInvokesDrbdmeta(t *testing.T) {
 		t.Fatalf("SetGI: %v", err)
 	}
 
-	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	want := "drbdmeta --force - v09 /dev/dm-3 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
 }
 
-// TestAdmForgetPeerInvokesDrbdmeta pins the on-disk slot
-// reclaim command shape: `drbdmeta --force <res>/<vol> v09
-// <device> internal forget-peer <peer-node-id>`.
-//
-// Without forget-peer, `drbdadm del-peer` only severs the kernel
-// connection; the metadata block still records the departed
-// peer's GI / bitmap slot. After enough permanent node-removal
-// cycles the v09 metadata layout exhausts its
-// `--max-peers=MaxPeers-1` slot pool and the next replica add
-// fails with drbdmeta refusing to allocate.
-//
-// Two invariants pinned:
-//
-//   - `<peer-node-id>` MUST be passed as the trailing positional
-//     argument (not `--node-id`). The forget-peer subcommand
-//     takes the node-id positionally; a regression that copied
-//     SetGI's `--node-id <N>` shape would surface as drbdmeta
-//     refusing the call with a usage error.
-//   - The `--force` flag MUST be present so drbdmeta accepts the
-//     mutation against in-use metadata (the resource is still
-//     loaded when forget-peer runs).
-func TestAdmForgetPeerInvokesDrbdmeta(t *testing.T) {
+// ForgetPeer reclaims a removed peer's metadata slot through the kernel:
+// `drbdsetup forget-peer <res> <peer-node-id>`, once for the resource.
+// drbdmeta is never used for it: on an attached disk it would rewrite the
+// superblock under the kernel.
+func TestAdmForgetPeerGoesThroughTheKernel(t *testing.T) {
 	fx := storage.NewFakeExec()
 	adm := drbd.NewAdm(fx)
 
-	err := adm.ForgetPeer(t.Context(), "pvc-1", 0, "/dev/dm-3", 2)
+	err := adm.ForgetPeer(t.Context(), "pvc-1", 2)
 	if err != nil {
 		t.Fatalf("ForgetPeer: %v", err)
 	}
 
-	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal forget-peer 2"
-	if !slices.Contains(fx.CommandLines(), want) {
-		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	if got := fx.CommandLines(); !slices.Equal(got, []string{"drbdsetup forget-peer pvc-1 2"}) {
+		t.Errorf("calls %v, want exactly drbdsetup forget-peer pvc-1 2", got)
 	}
 }
 

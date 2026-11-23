@@ -96,6 +96,15 @@ var extendedObjectMetaWriteAllowList = []extendedObjectMetaWriteAllowListEntry{
 		file:          "resource_groups.go",
 		lineSubstring: "rg.Annotations = stripInternalAnnotations(rg.Annotations)",
 	},
+	// The volume-less clone builds a NEW definition from a value copy of
+	// its source and hands it to Create, so there is nothing stored to
+	// wipe. withoutUnappliedGroupStack returns a fresh map, which keeps the
+	// source's own map, possibly the in-memory store's, untouched.
+	{
+		dir:           "pkg/rest",
+		file:          "rd_clone.go",
+		lineSubstring: "clone.Annotations = withoutUnappliedGroupStack(src.Annotations)",
+	},
 }
 
 type extendedObjectMetaWriteAllowListEntry struct {

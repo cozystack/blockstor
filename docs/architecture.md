@@ -134,7 +134,7 @@ device — hours on multi-TiB volumes. The skip pipeline (Phase
 4. Satellite reconciler's `applyDRBD` runs
 
    ```
-   drbdmeta --force <res>/<vol> v09 <device> internal set-gi <gi>:<gi>:0:0
+   drbdmeta --force - v09 <device> internal set-gi <gi>:<gi>:0:0
    ```
 
    between `drbdadm create-md` and `drbdadm adjust` on first

@@ -43,6 +43,23 @@ import (
 // Condition is absent.
 const ConditionMetadataCreated = "MetadataCreated"
 
+// Reasons of a true ConditionMetadataCreated. They tell a replica whose
+// metadata this satellite created apart from one whose metadata was
+// already on the volume, such as a replica adopted from LINSTOR, where
+// create-md never ran.
+const (
+	// MetadataCreatedReasonCreateMd: `drbdadm create-md` ran on at
+	// least one volume of the replica.
+	MetadataCreatedReasonCreateMd = "CreateMdSucceeded"
+
+	// MetadataCreatedReasonFound: `drbdadm dump-md` found metadata on
+	// every volume, so create-md was not run on that pass. The startup
+	// backfill also stamps it on a replica whose create-md stamp failed,
+	// since all it can see is that metadata is there; the satellite log
+	// of the create-md pass records which it was.
+	MetadataCreatedReasonFound = "MetadataFound"
+)
+
 // ConditionFilesystemFormatted is a Status Condition stamped by the
 // satellite after the RG-driven auto-mkfs path (scenario 9.W14)
 // reports every diskful volume of this Resource as carrying a
@@ -81,14 +98,14 @@ const ConditionKernelLoaded = "KernelLoaded"
 
 // ConditionEncryptionKeyIgnored is stamped True when the parent
 // ResourceDefinition pins its own LUKS key through
-// `spec.encryption.passphraseSecretRef` — a field blockstor declares
-// but does not implement (docs/byok-design.md §3.2). The volume is
-// encrypted with the CLUSTER passphrase instead, so the operator holds
-// a Secret that opens nothing.
+// `spec.encryption.passphraseSecretRef`, a field blockstor declares
+// but does not implement (docs/encryption-keys.md). The volume's
+// password is wrapped under the CLUSTER master key instead, so the
+// operator holds a Secret that opens nothing.
 //
 // It is a Condition rather than a refusal on purpose. Refusing the
 // apply would wedge resource definitions that reconcile correctly
-// today — the field has always been inert, so a cluster may well carry
+// today: the field has always been inert, so a cluster may well carry
 // RDs that set it and run fine on the cluster key. Moving a working
 // volume to a failing one to punish a misleading field is the wrong
 // trade in a storage system. The volume keeps working; the object now
@@ -118,7 +135,7 @@ const ConditionEncryptionKeyIgnored = "EncryptionKeyIgnored"
 // volumes that haven't been materialised yet. Comma-separated rather
 // than JSON so a human operator can `kubectl get resource <r> -o
 // yaml | grep volume-numbers` and read it without parsing.
-const ResourceAnnotationVolumeNumbers = "blockstor.io/volume-numbers"
+const ResourceAnnotationVolumeNumbers = "blockstor.org/volume-numbers"
 
 // ResourceSpec is the desired state of one replica of a ResourceDefinition
 // placed on a node. The composite key is (resourceDefinitionName, nodeName);
@@ -274,6 +291,7 @@ type ResourceSpec struct {
 // Distinct from ResourceVolumeStatus: this carries one-shot seeding
 // hints the satellite consumes during first activation, the Status
 // counterpart carries observed runtime state.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.luksKey) || (has(self.luksKey) && self.luksKey == oldSelf.luksKey)",message="luksKey is set once: it may go from unset to a value but not be changed or removed, the replica's data is readable only with it"
 type ResourceVolumeSpec struct {
 	// volumeNumber matches the corresponding ResourceDefinition
 	// VolumeDefinition. +required when this struct is populated.
@@ -291,6 +309,52 @@ type ResourceVolumeSpec struct {
 	// re-stamping).
 	// +optional
 	SeedFromGI string `json:"seedFromGI,omitempty"`
+
+	// luksKey is this replica's LUKS password, wrapped under the cluster
+	// master key. It is the only key in the volume's LUKS header, so it
+	// lives in spec, where backups restore it, and it is set once.
+	// +optional
+	LUKSKey *LUKSKey `json:"luksKey,omitempty"`
+}
+
+// LUKSKeyOrigin says where a volume password came from.
+// +kubebuilder:validation:Enum=Generated;LinstorImport
+type LUKSKeyOrigin string
+
+const (
+	// LUKSKeyOriginGenerated is a password blockstor generated before
+	// formatting the volume.
+	LUKSKeyOriginGenerated LUKSKeyOrigin = "Generated"
+
+	// LUKSKeyOriginLinstorImport is a password linstor-migrate carried
+	// over from LINSTOR's database.
+	LUKSKeyOriginLinstorImport LUKSKeyOrigin = "LinstorImport"
+)
+
+// LUKSKey is one volume password wrapped under a master key.
+type LUKSKey struct {
+	// keyID is the public ID of the master key the password is wrapped
+	// under.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{16}$`
+	// +required
+	KeyID string `json:"keyID"`
+
+	// The schema declares wrapped a plain standard-base64 string, not
+	// format byte: the API server's CEL decodes format byte as URL-safe
+	// base64, so the set-once rules over it would fail on nearly every
+	// real key ('+' or '/') and refuse every write to the object, its
+	// finalizer strip on delete included.
+
+	// wrapped is nonce || AES-256-GCM ciphertext || tag.
+	// +kubebuilder:validation:Format=""
+	// +kubebuilder:validation:Pattern=`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Wrapped []byte `json:"wrapped"`
+
+	// origin says where the password came from.
+	// +required
+	Origin LUKSKeyOrigin `json:"origin"`
 }
 
 // ResourceStatus is the observed state of a placed resource.
@@ -478,6 +542,27 @@ type PeerVolumeStatus struct {
 	// --statistics` peer-device frames.
 	// +optional
 	PeerDiskState string `json:"peerDiskState,omitempty"`
+
+	// done is the progress of the resync running with this peer, as
+	// the `done:<percent>` token of the peer-device frame carries it
+	// ("50.31"). DRBD measures it against that resync's own total,
+	// not the volume size, and prints it only while a resync with
+	// this peer runs; empty otherwise. It is what LINSTOR reports as
+	// the peer's `done_percentage` and renders in `SyncTarget(NN%)`.
+	// A string because a CRD has no portable float type.
+	// +optional
+	Done string `json:"done,omitempty"`
+
+	// replicationState is this volume's DRBD-9 replication state with
+	// this peer, the `replication:<state>` token of the volume's own
+	// peer-device frame. DRBD keeps it per peer and per volume, and
+	// so does LINSTOR (DrbdVolume.volReplState); the connection-level
+	// `replicationState` is whichever volume's frame came last. It is
+	// what `done` belongs to: a two-volume resource can have one
+	// volume in SyncTarget and the other Established or PausedSyncT
+	// on the same connection.
+	// +optional
+	ReplicationState string `json:"replicationState,omitempty"`
 }
 
 // ResourceVolumeStatus is the runtime state of one volume of a Resource.
@@ -511,16 +596,13 @@ type ResourceVolumeStatus struct {
 	// +optional
 	HistoryGI []string `json:"historyGI,omitempty"`
 
-	// outOfSyncKib is the worst-case "how many KiB this volume is
-	// behind any peer" reported by `drbdsetup events2 --statistics`
-	// peer-device frames. Combined with RD.Spec.VolumeDefinitions
-	// SizeKib, callers compute a sync-progress percentage:
-	//   progress = (1 - outOfSyncKib / sizeKib) * 100
-	//
-	// 0 means fully in sync; sizeKib (or close to it) means fresh
-	// resync hasn't started yet. Surfaced via the REST view layer
-	// so `linstor r l` / piraeus dashboards can render a CDI-style
-	// progress bar without polling drbdsetup themselves.
+	// outOfSyncKib is the out-of-sync count of the last
+	// `drbdsetup events2 --statistics` peer-device frame for this
+	// volume, whichever peer it was about. 0 means in sync with that
+	// peer. It is not a resync progress once the replica has more
+	// than one peer: a finished resync with one peer can be the last
+	// frame while a full one with another runs. The progress is
+	// connections[].peerVolumes[].done.
 	// +optional
 	OutOfSyncKib int64 `json:"outOfSyncKib,omitempty"`
 
@@ -542,6 +624,12 @@ type ResourceVolumeStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.resourceDefinitionName + '.' + self.spec.nodeName).lowerAscii()",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.nodeName> (case-insensitive)",optionalOldSelf=true
+// Server-side field selectors. Without these the API server refuses a
+// selector on these paths outright, which is the failure mode we want: a
+// selector that silently returned a subset is the Bug 038 shape, where a
+// partial-but-correct answer hid the replicas an operator applied by hand.
+// +kubebuilder:selectablefield:JSONPath=`.spec.nodeName`
+// +kubebuilder:selectablefield:JSONPath=`.spec.resourceDefinitionName`
 // +kubebuilder:printcolumn:name="Definition",type=string,JSONPath=`.spec.resourceDefinitionName`
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.spec.nodeName`
 // +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.storagePool`

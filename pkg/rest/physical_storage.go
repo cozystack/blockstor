@@ -31,6 +31,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -442,7 +443,7 @@ func setStoragePoolOwnership(ctx context.Context, c ctrlclient.Client, deviceNam
 func findStoragePoolByName(pools *crdv1alpha1.StoragePoolList, nodeName, poolName string) *crdv1alpha1.StoragePool {
 	for i := range pools.Items {
 		p := &pools.Items[i]
-		if p.Spec.NodeName == nodeName && p.Spec.PoolName == poolName {
+		if naming.Same(p.Spec.NodeName, nodeName) && naming.Same(p.Spec.PoolName, poolName) {
 			return p
 		}
 	}

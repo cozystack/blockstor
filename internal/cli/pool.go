@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 	"github.com/cozystack/blockstor/internal/cli/view"
@@ -257,7 +258,7 @@ func volumeGroupList(ctx context.Context, run *runContext) error {
 	rows := make([]volumeGroupRow, 0)
 
 	for i := range groups {
-		if wanted != "" && !strings.EqualFold(wanted, groups[i].Name) {
+		if wanted != "" && !naming.Same(wanted, groups[i].Name) {
 			continue
 		}
 

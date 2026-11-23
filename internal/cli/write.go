@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -59,12 +60,12 @@ type propertyAccessor struct {
 	// touched. The edit guards judge the resulting state, which cannot
 	// see an operator setting an immutable key to the value it already
 	// has — REST refuses that, so this door has to as well.
-	namedKey func(key string) error
+	namedKey func(key string, deleting bool) error
 }
 
 // withNamedKeyGuard attaches a named-key guard to an accessor built by
 // objectProps, whose signature carries only the state-comparing guards.
-func withNamedKeyGuard(accessor propertyAccessor, guard func(string) error) propertyAccessor {
+func withNamedKeyGuard(accessor propertyAccessor, guard func(string, bool) error) propertyAccessor {
 	accessor.namedKey = guard
 
 	return accessor
@@ -87,16 +88,20 @@ func setProperty(accessor propertyAccessor) handler {
 		ident := run.Flags.Positionals[:accessor.args]
 		key := run.Flags.Positionals[accessor.args]
 
-		if accessor.namedKey != nil {
-			named := accessor.namedKey(key)
-			if named != nil {
-				return named
-			}
-		}
-
 		value := ""
 		if len(run.Flags.Positionals) > want {
 			value = run.Flags.Positionals[want]
+		}
+
+		if value != "" && passphrase.IsPlaintextPropKey(key) {
+			return fmt.Errorf("%w: %s", errPlaintextPassphraseProp, key)
+		}
+
+		if accessor.namedKey != nil {
+			named := accessor.namedKey(key, value == "")
+			if named != nil {
+				return named
+			}
 		}
 
 		return accessor.edit(ctx, run.Store, ident, func(props map[string]string) error {
@@ -211,18 +216,72 @@ func objectProps[T any](
 	}
 }
 
-// rdProps accesses a resource definition's property bag.
+// rdProps accesses a resource definition's property bag. The props blockstor
+// writes to record what a definition is are refused here as on the REST door.
 //
-//nolint:gochecknoglobals,dupl // static accessor table; the parallel shape is the point
-var rdProps = objectProps("resource definition", 1,
+//nolint:gochecknoglobals // static accessor table
+var rdProps = withNamedKeyGuard(objectProps("resource definition", 1,
 	func(ctx context.Context, st store.Store, ident []string) (apiv1.ResourceDefinition, error) {
 		return st.ResourceDefinitions().Get(ctx, ident[0])
 	},
 	func(def *apiv1.ResourceDefinition) *map[string]string { return &def.Props },
-	func(ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.ResourceDefinition) error) error {
-		return st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, ident[0], mutate)
-	},
-)
+	patchDefinitionProps,
+	store.RollbackMarkClearRefusal,
+), refuseServerOwnedDefinitionProp)
+
+// patchDefinitionProps applies an operator's prop edit to a definition. One
+// that deletes the restore marker is first tried on a copy, and goes through
+// only once the restore the marker drives is finished; see
+// store.RestoreMarkerClearRefusal. The check reads the store, which a patch
+// closure must not, so it runs before the patch.
+func patchDefinitionProps(
+	ctx context.Context, st store.Store, ident []string, mutate func(*apiv1.ResourceDefinition) error,
+) error {
+	current, err := st.ResourceDefinitions().GetUncached(ctx, ident[0])
+	if err == nil && current.Props[store.RestoreFromSnapshotProp] != "" {
+		trial := current
+		trial.Props = maps.Clone(current.Props)
+
+		if mutate(&trial) == nil && trial.Props[store.RestoreFromSnapshotProp] == "" {
+			refusal := store.RestoreMarkerClearRefusal(ctx, st, ident[0])
+			if refusal != nil {
+				return fmt.Errorf("delete %s of %s: %w", store.RestoreFromSnapshotProp, ident[0], refusal)
+			}
+		}
+	}
+
+	return st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, ident[0], mutate) //nolint:wrapcheck // the accessor wraps with the object
+}
+
+// errServerOwnedProp refuses an operator's edit of a prop blockstor sets on a
+// definition itself.
+var errServerOwnedProp = errors.New("blockstor sets this property itself")
+
+// errPlaintextPassphraseProp refuses a set-property that would store the
+// LUKS master passphrase in a property. A property is kept in plaintext on
+// its CR and blockstor never reads the passphrase from one; REST refuses the
+// same write. Deleting such a property stays allowed.
+var errPlaintextPassphraseProp = errors.New("refusing to store the LUKS master passphrase in a property, " +
+	"which is kept in plaintext on its resource; run `encryption create-passphrase`, which keeps it in a Secret")
+
+// refuseServerOwnedDefinitionProp is the named-key guard for rdProps. A
+// delete of the rollback mark goes through; see
+// store.ServerOwnedPropEditByOperator.
+func refuseServerOwnedDefinitionProp(key string, deleting bool) error {
+	// The value is not judged, only that one is set; an empty override is
+	// read as a delete, so a set is spelled with a value.
+	var overrides map[string]string
+	if !deleting {
+		overrides = map[string]string{key: aSetValue}
+	}
+
+	if store.ServerOwnedPropEditByOperator(overrides, []string{key}, nil) != "" {
+		return fmt.Errorf("%w: %s records what blockstor did to this definition and is read back "+
+			"to decide what to do next", errServerOwnedProp, key)
+	}
+
+	return nil
+}
 
 // nodeProps accesses a node's property bag.
 //
@@ -315,8 +374,28 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 	}
 
 	if len(snaps) > 0 {
+		// A snapshot a clone took for itself outlives the clone when its
+		// reap was skipped, failed or kept it for a restore; nothing else
+		// names it now.
+		left, leftErr := store.CloneSnapshotsLeftBehind(ctx, run.Store, snaps)
+		if leftErr != nil {
+			_, _ = fmt.Fprintf(run.Err, "warning: could not tell which snapshots clones left behind: %v\n", leftErr)
+		} else if !left.Empty() {
+			cause, correction := left.Explain(name)
+
+			return fmt.Errorf("%w: %s has %d snapshot(s): %s; %s",
+				errDefinitionHasSnapshots, name, len(snaps), cause, correction)
+		}
+
 		return fmt.Errorf("%w: %s has %d snapshot(s); delete them first",
 			errDefinitionHasSnapshots, name, len(snaps))
+	}
+
+	// Read before the delete: the definition's own props are the only record
+	// of the internal snapshot a clone took on its source.
+	clonedFrom, err := store.OwnedCloneSnapshot(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("delete resource definition %s: %w", name, err)
 	}
 
 	// Then the replicas. Dropping the definition alone leaves them with no
@@ -330,6 +409,15 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 	err = run.Store.ResourceDefinitions().Delete(ctx, name)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete resource definition %s: %w", name, err)
+	}
+
+	// The internal snapshot the clone took on its source goes with it, the
+	// way the REST door reaps it, or the source could never be deleted again.
+	// Not fatal: the definition is gone, and a kept snapshot is named by the
+	// refusal a later delete of the source meets.
+	reapErr := store.ReapClonedSnapshot(ctx, run.Store, clonedFrom)
+	if reapErr != nil {
+		_, _ = fmt.Fprintf(run.Err, "warning: internal clone snapshot kept: %v\n", reapErr)
 	}
 
 	return nil

@@ -38,6 +38,10 @@ import (
 // itself (the snapshot stream) is unbounded and can take minutes.
 const readHeaderTimeout = 10 * time.Second
 
+// idleTimeout closes a connection a peer left open after its stream. The
+// client closes its own; this bounds one that does not.
+const idleTimeout = time.Minute
+
 // PoolResolver returns the storage.Provider for a (rd, vol) pair on
 // this satellite. The satellite's Reconciler keeps a resource→pool
 // map populated by Apply; this is the gate that lets the stream
@@ -147,14 +151,19 @@ func closeQuietly(c io.Closer) {
 	_ = c.Close()
 }
 
-// ListenAndServe binds an HTTP server on addr serving the snapshot
-// stream endpoint. Caller is responsible for cancelling ctx to stop
+// ListenAndServe binds an HTTPS server on addr serving the snapshot
+// stream endpoint, with mutual TLS from files: a peer without a certificate
+// signed by the cluster's CA is refused at the handshake. Caller is responsible for cancelling ctx to stop
 // the server. The Server type doesn't manage its own goroutine —
 // this helper is the canonical wiring for cmd/satellite.
 //
 // Returns http.ErrServerClosed on a clean ctx-cancel shutdown so
 // callers can distinguish that from a real bind error.
-func ListenAndServe(ctx context.Context, addr string, s *Server) error {
+func ListenAndServe(ctx context.Context, addr string, s *Server, files TLSFiles) error {
+	if !files.Configured() {
+		return ErrTLSIncomplete
+	}
+
 	mux := http.NewServeMux()
 	s.Register(mux)
 
@@ -162,6 +171,8 @@ func ListenAndServe(ctx context.Context, addr string, s *Server) error {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: readHeaderTimeout, // CWE-400: bound the slowloris window
+		IdleTimeout:       idleTimeout,
+		TLSConfig:         files.serverConfig(),
 	}
 
 	var (
@@ -170,7 +181,8 @@ func ListenAndServe(ctx context.Context, addr string, s *Server) error {
 	)
 
 	wg.Go(func() {
-		serveErr = srv.ListenAndServe()
+		// The certificate comes from TLSConfig, read per handshake.
+		serveErr = srv.ListenAndServeTLS("", "")
 	})
 
 	<-ctx.Done()

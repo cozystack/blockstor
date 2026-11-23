@@ -273,7 +273,7 @@ func TestResourceGroupsUpdateBadJSON(t *testing.T) {
 
 // TestRGModifyStampsRebalanceAnnotationOnPlaceCountIncrease: Bug 60.
 // Raising PlaceCount on `linstor rg modify` must stamp the
-// `blockstor.io/rebalance-pending` annotation onto the persisted RG
+// `blockstor.org/rebalance-pending` annotation onto the persisted RG
 // so the controller-side reconciler picks up the deferred autoplace
 // pass. Mirrors upstream LINSTOR's `CtrlRscGrpApiCallHandler.modify`
 // RescheduleAutoPlace hook — see docs/cli-parity-audit-2026-05-14.md
