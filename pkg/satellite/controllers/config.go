@@ -116,6 +116,16 @@ type Config struct {
 	// locked.
 	ApplyLocks *ResourceLocks
 
+	// Incarnation names this satellite process. The heartbeat stamps it
+	// on the Node and the observer on every Resource status it writes,
+	// so a read can tell the running satellite's reports from those an
+	// earlier process left behind before a crash or reboot.
+	//
+	// Production wires a fresh random value from
+	// `NewManager.ensureWiredDefaults`. Left empty, nothing is stamped
+	// and reads treat every stored report as current.
+	Incarnation string
+
 	// UeventListener is the optional source of kernel block-device
 	// uevents the PhysicalDeviceDiscoveryRunnable reacts to. The
 	// satellite's cmd/satellite/main.go opens

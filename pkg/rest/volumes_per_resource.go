@@ -73,6 +73,8 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	s.forgetStaleReplica(r.Context(), &res)
+
 	// Every volume definition is listed, built or not, as LINSTOR does;
 	// see ensureVolumesForView.
 	writeJSON(w, http.StatusOK, ensureVolumesForView(res.Volumes, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)))
@@ -102,6 +104,8 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 
 		return
 	}
+
+	s.forgetStaleReplica(r.Context(), &res)
 
 	// A volume the satellite has not built yet answers without a device
 	// path, as LINSTOR's does, rather than 404: linstor-csi's attach
