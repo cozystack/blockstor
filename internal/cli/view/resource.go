@@ -75,16 +75,6 @@ const (
 // while it is true.
 const propSkipDisk = "DrbdOptions/SkipDisk"
 
-// State cells that are terminal — a converged replica never carries a
-// sync percentage, which a harness asserts by grepping for the absence
-// of `UpToDate(NN%)`.
-var terminalStates = map[string]struct{}{ //nolint:gochecknoglobals // static classification table
-	"uptodate":   {},
-	"diskless":   {},
-	"tiebreaker": {},
-	"created":    {},
-}
-
 // ResourceListInput is everything `resource list` renders from.
 type ResourceListInput struct {
 	// Resources are the replicas, already filtered by node/resource if
