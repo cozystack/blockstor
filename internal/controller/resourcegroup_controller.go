@@ -118,6 +118,16 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			continue
 		}
 
+		// This runs on every group event, a controller start
+		// included, so it follows the balance pass: a definition
+		// without DRBD is left alone. An `rg modify` that names a
+		// place count reaches it through the rebalance annotation,
+		// which the rebalance reconciler places on whether balancing
+		// is on or off.
+		if !definitionUsesDRBD(&rds[i], &rg) {
+			continue
+		}
+
 		reason, err := gate.skipReason(ctx, &rg, &rds[i])
 		if err != nil {
 			log.Error(err, "RG placement skipped: replicas unreadable", "rg", rg.Name, "rd", rds[i].Name)
