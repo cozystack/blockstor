@@ -96,9 +96,10 @@ func registerWorkaroundFlags(flagSet *flag.FlagSet, cfg *controllers.Workarounds
 	flagSet.DurationVar(&cfg.Interval, "drbd-workarounds-interval", def.Interval,
 		"Time between passes of the DRBD workarounds; 0 turns them all off.")
 	flagSet.BoolVar(&cfg.StalledResync, "drbd-workaround-stalled-resync", def.StalledResync,
-		"Disconnect and connect the peer a resync stalled on while another peer waits on it (LINBIT/drbd#149).")
+		"Disconnect and connect again the peer whose resync waits on a stalled one, "+
+			"or failing that the peer the stalled resync pulls from (LINBIT/drbd#149).")
 	flagSet.IntVar(&cfg.StalledResyncPasses, "drbd-workaround-stalled-resync-passes", def.StalledResyncPasses,
-		"Passes in a row without resync progress before the stalled-resync workaround acts.")
+		"Passes in a row with too little resync progress before the stalled-resync workaround acts.")
 	flagSet.BoolVar(&cfg.IdlePrimary, "drbd-workaround-idle-primary", def.IdlePrimary,
 		"Demote a Primary with no volume open (DRBD auto-demote not firing, piraeus-operator#942).")
 	flagSet.BoolVar(&cfg.ForcedIOFailures, "drbd-workaround-forced-io-failures", def.ForcedIOFailures,

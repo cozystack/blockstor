@@ -54,14 +54,22 @@ type KernelConnection struct {
 	PeerDevices     []KernelPeerDevice `json:"peer_devices"`
 }
 
-// KernelPeerDevice is one volume of a peer connection. PercentInSync is
-// nil when drbd-utils did not report it.
+// KernelPeerDevice is one volume of a peer connection. PercentInSync and
+// OutOfSync are nil when drbd-utils did not report them. Received and
+// OutOfSync are in KiB. Pending counts the requests this node sent the
+// peer that wait for its answer, Unacked the ones the peer sent this
+// node that this node has not completed yet (the kernel's
+// ap_pending+rs_pending and unacked_cnt).
 type KernelPeerDevice struct {
 	Volume           int32    `json:"volume"`
 	ReplicationState string   `json:"replication-state"`
 	PeerDiskState    string   `json:"peer-disk-state"`
 	ResyncSuspended  string   `json:"resync-suspended"`
 	PercentInSync    *float64 `json:"percent-in-sync"`
+	Received         int64    `json:"received"`
+	OutOfSync        *int64   `json:"out-of-sync"`
+	Pending          int64    `json:"pending"`
+	Unacked          int64    `json:"unacked"`
 }
 
 // yesNo is a drbd-utils flag: a JSON boolean, or "yes"/"no" as some
@@ -148,52 +156,115 @@ func (r *KernelResource) SoleUpToDateOfAPrimaryPeer() bool {
 	})
 }
 
-// ResyncSource is the peer a local Inconsistent volume of the resource
-// is resyncing from, with how far that resync got, while the resync from
-// another peer waits on it (resync-suspended:dependency). ok is false
-// when the resource is not in that shape.
-func (r *KernelResource) ResyncSource() (ResyncFrom, bool) {
-	inconsistent := slices.ContainsFunc(r.Devices, func(d KernelDevice) bool {
-		return d.DiskState == "Inconsistent"
+// Inconsistent reports whether some local volume of the resource is
+// Inconsistent.
+func (r *KernelResource) Inconsistent() bool {
+	return slices.ContainsFunc(r.Devices, func(d KernelDevice) bool {
+		return d.DiskState == string(DiskStateInconsistent)
 	})
-	if !inconsistent {
-		return ResyncFrom{}, false
-	}
+}
 
-	var (
-		from    ResyncFrom
-		found   bool
-		waiting bool
-	)
+// ResyncDependency is the shape of a resync that can stall on another
+// peer: a local Inconsistent volume of the resource is SyncTarget of one
+// peer (Active) while its resync from another one (Paused) waits on it
+// (resync-suspended:dependency). ok is false when the resource is not in
+// that shape, or drbd-utils did not report out-of-sync for the active
+// peer.
+func (r *KernelResource) ResyncDependency() (ResyncDependency, bool) {
+	for _, dev := range r.Devices {
+		if dev.DiskState != string(DiskStateInconsistent) {
+			continue
+		}
 
-	for _, conn := range r.Connections {
-		for _, peerDevice := range conn.PeerDevices {
-			if slices.Contains(strings.Split(peerDevice.ResyncSuspended, ","), "dependency") {
-				waiting = true
+		dep := ResyncDependency{Volume: dev.Volume}
+
+		for _, conn := range r.Connections {
+			for _, peerDevice := range conn.PeerDevices {
+				if peerDevice.Volume != dev.Volume {
+					continue
+				}
+
+				switch {
+				case dep.Active == "" && peerDevice.ReplicationState == "SyncTarget" && peerDevice.OutOfSync != nil:
+					dep.Active = conn.Name
+					dep.OutOfSync = *peerDevice.OutOfSync
+					dep.Received = peerDevice.Received
+					dep.Outstanding = peerDevice.Pending + peerDevice.Unacked
+
+					if peerDevice.PercentInSync != nil {
+						dep.PercentInSync = *peerDevice.PercentInSync
+					}
+				case dep.Paused == "" && slices.Contains(strings.Split(peerDevice.ResyncSuspended, ","), "dependency"):
+					dep.Paused = conn.Name
+				}
 			}
+		}
 
-			if !found && peerDevice.ReplicationState == "SyncTarget" && peerDevice.PercentInSync != nil {
-				from, found = ResyncFrom{Peer: conn.Name, PercentInSync: *peerDevice.PercentInSync}, true
-			}
+		if dep.Active != "" && dep.Paused != "" {
+			return dep, true
 		}
 	}
 
-	return from, found && waiting
+	return ResyncDependency{}, false
 }
 
-// ResyncFrom is the peer a resync pulls from and how far it got.
-type ResyncFrom struct {
-	Peer          string
+// ResyncDependency is one volume resyncing from Active while its resync
+// from Paused waits on it, with how far the resync from Active got.
+// OutOfSync and Received are in KiB; Outstanding is the resync requests
+// and replies of the Active link not completed yet (pending + unacked).
+type ResyncDependency struct {
+	Volume        int32
+	Active        string
+	Paused        string
 	PercentInSync float64
+	OutOfSync     int64
+	Received      int64
+	Outstanding   int64
+}
+
+// MayDisconnect reports whether this node can drop its connection to
+// peer without taking a Primary's last good copy away. It is false when
+// this node is Primary, or peer is, and some volume would then have no
+// UpToDate disk left among this node and its other connected peers.
+// This node sees only its own connections: for a Primary peer it reads
+// another connected UpToDate peer as the copy that Primary keeps.
+func (r *KernelResource) MayDisconnect(peer string) bool {
+	primaryPeer := slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
+		return c.Name == peer && c.PeerRole == string(RolePrimary)
+	})
+	localPrimary := r.Role == string(RolePrimary)
+
+	if !primaryPeer && !localPrimary {
+		return true
+	}
+
+	for _, dev := range r.Devices {
+		if localPrimary && dev.DiskState == string(DiskStateUpToDate) {
+			continue
+		}
+
+		if !r.peerUpToDateExcept(dev.Volume, peer) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // peerUpToDate reports whether a connected peer has an UpToDate disk of
 // volume.
 func (r *KernelResource) peerUpToDate(volume int32) bool {
+	return r.peerUpToDateExcept(volume, "")
+}
+
+// peerUpToDateExcept reports whether a connected peer other than skip has
+// an UpToDate disk of volume.
+func (r *KernelResource) peerUpToDateExcept(volume int32, skip string) bool {
 	return slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
-		return c.ConnectionState == string(ConnectionStateConnected) && slices.ContainsFunc(c.PeerDevices, func(p KernelPeerDevice) bool {
-			return p.Volume == volume && p.PeerDiskState == string(DiskStateUpToDate)
-		})
+		return c.Name != skip && c.ConnectionState == string(ConnectionStateConnected) &&
+			slices.ContainsFunc(c.PeerDevices, func(p KernelPeerDevice) bool {
+				return p.Volume == volume && p.PeerDiskState == string(DiskStateUpToDate)
+			})
 	})
 }
 

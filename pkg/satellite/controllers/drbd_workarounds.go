@@ -67,9 +67,9 @@ type WorkaroundsConfig struct {
 	// Interval is the time between passes. Zero turns every check off.
 	Interval time.Duration
 
-	// StalledResync reconnects the peer a resync stalled on
-	// (checkStalledResync), after StalledResyncPasses passes in a row
-	// with no progress.
+	// StalledResync disconnects the peer a stalled resync waits on, or
+	// reconnects the one it pulls from (checkStalledResync), after
+	// StalledResyncPasses passes in a row with too little progress.
 	StalledResync       bool
 	StalledResyncPasses int
 
@@ -172,6 +172,9 @@ type DRBDWorkaroundsRunnable struct {
 	// failingIO counts the passes in a row each resource was an unused
 	// Secondary failing I/O.
 	failingIO map[string]int
+
+	// Clock is the time of a pass; nil is time.Now.
+	Clock func() time.Time
 
 	// owedAdjust holds the resources a check left short of their
 	// configuration, each with what the adjust owed to it does; every
@@ -383,37 +386,107 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 // Workaround for a DRBD 9 resync that stalls on one of several sources
 // (https://github.com/LINBIT/drbd/issues/149; the older report
 // https://github.com/LINBIT/drbd/issues/40 has the same shape). A replica
-// resyncing from several peers at once stays SyncTarget toward one of them
-// with percent-in-sync no longer moving, while its resync from the other
-// peers waits on that one (resync-suspended:dependency), so the replica
-// stays Inconsistent and the whole resync makes no progress. Hit on the
-// blockstor test cluster after node resets (v0.4.0-alpha.5, alpha.7 and
-// alpha.14). Disconnecting and connecting that one peer lets another peer
-// take over and the resync completes; nothing on disk is touched. Same
-// trigger as the plunger: the same percent on StalledResyncPasses passes
-// in a row (4 x 30 s).
+// that is SyncTarget of two peers resyncs from one at a time: DRBD picks
+// one (Active) and pauses the other (Paused, resync-suspended:dependency;
+// drbd_select_sync_target in drbd_state.c sets resync_susp_other_c).
+// Resync requests this replica already sent the paused peer stay in its
+// interval tree; a resync reply from the active peer, and a write from a
+// Primary peer, that overlaps one of them defers to it (the
+// drbd_should_defer_to_* rules in drbd_int.h), and when the paused one
+// does not complete either, the active resync slows to a trickle or stops
+// with its requests held: on the blockstor test cluster (v0.4.0-alpha.7,
+// alpha.9, alpha.14, alpha.15) the active source held hundreds of
+// replies unacknowledged (pending on the source, unacked here, the same
+// count for minutes), the paused link held some too, and on alpha.15 the
+// Primary's guest writes waited with it. Each time, disconnecting the
+// paused peer on this node let the active resync finish within seconds:
+// the disconnect cancels the requests toward that peer that wait on a
+// conflict and drops their intervals (drain_resync_activity,
+// drbd_cancel_conflicting_resync_requests in drbd_receiver.c), which
+// releases everything deferring to them. `drbdadm adjust` afterwards
+// connected the peer again, and it resynced normally. On alpha.7 a
+// disconnect and connect of the active peer, which is what the LINSTOR
+// plunger sidecar does, also cleared it. Nothing on disk is touched
+// either way.
+//
+// A pass counts as stalled when, since the previous pass, the out-of-sync
+// count toward the active peer fell by less than stalledResyncMinRate,
+// or the active link still holds outstanding requests, no fewer than
+// before, while less than that rate of data came in. That catches the
+// hard stop, the trickle, and a stall whose out-of-sync count grows with
+// application writes (alpha.7), none of which a "percent-in-sync did not
+// change" check sees reliably. After StalledResyncPasses stalled passes
+// in a row the paused peer is disconnected and connected again on the
+// next pass. When that did not help, or this node may not drop the
+// paused peer, the active peer is disconnected and connected instead.
+// Neither is done to a link that would leave a Primary, here or the
+// peer, without an UpToDate disk among this node and its other connected
+// peers (drbd.KernelResource.MayDisconnect).
 
-// resyncProgress is how far the resync of a resource from Peer got, and
-// on how many passes in a row it stayed there.
+// stalledResyncMinRate is the resync progress, in KiB/s, below which a
+// pass counts as stalled. DRBD's defaults keep a resync at c-min-rate
+// (250 KiB/s) or faster even under application I/O; the trickle seen on
+// the test cluster ran at 100-150 KiB/s.
+const stalledResyncMinRate = 200
+
+// resyncProgress is how far the resync of a resource from Active got
+// when it was last seen, and on how many passes in a row it stalled.
+// PausedTried is the active peer a disconnect of the paused peer was
+// already tried for, kept while the resource is Inconsistent.
 type resyncProgress struct {
-	Peer    string
-	Percent float64
-	Passes  int
+	drbd.ResyncDependency
+
+	At          time.Time
+	Passes      int
+	PausedTried string
 }
 
-// checkStalledResync reconnects the peer res's resync stalled on.
+// stalled reports whether the resync moved too little from prev to dep
+// in elapsed to count as moving; see stalledResyncMinRate.
+func (prev *resyncProgress) stalled(dep *drbd.ResyncDependency, elapsed time.Duration) bool {
+	floor := int64(elapsed.Seconds() * stalledResyncMinRate)
+
+	if prev.OutOfSync-dep.OutOfSync < floor {
+		return true
+	}
+
+	return dep.Outstanding > 0 && dep.Outstanding >= prev.Outstanding && dep.Received-prev.Received < floor
+}
+
+// now is the time of a pass.
+func (w *DRBDWorkaroundsRunnable) now() time.Time {
+	if w.Clock != nil {
+		return w.Clock()
+	}
+
+	return time.Now()
+}
+
+// checkStalledResync acts on a resync of res that stalled on
+// StalledResyncPasses passes in a row.
 func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
 	replica *blockstoriov1alpha1.Resource, stalls map[string]resyncProgress,
 ) {
-	from, ok := res.ResyncSource()
+	prev, seen := w.stalls[res.Name]
+
+	dep, ok := res.ResyncDependency()
 	if !ok {
+		if prev.PausedTried != "" && res.Inconsistent() {
+			stalls[res.Name] = resyncProgress{PausedTried: prev.PausedTried}
+		}
+
 		return
 	}
 
-	progress := resyncProgress{Peer: from.Peer, Percent: from.PercentInSync, Passes: 1}
-	if prev, seen := w.stalls[res.Name]; seen && prev.Peer == from.Peer && prev.Percent == from.PercentInSync {
-		progress.Passes = prev.Passes + 1
+	progress := resyncProgress{ResyncDependency: dep, At: w.now(), PausedTried: prev.PausedTried}
+	if seen && prev.Active == dep.Active && prev.Volume == dep.Volume {
+		progress.Passes = prev.Passes
+		if prev.stalled(&dep, progress.At.Sub(prev.At)) {
+			progress.Passes++
+		} else {
+			progress.Passes = 0
+		}
 	}
 
 	if progress.Passes < w.Config.StalledResyncPasses {
@@ -422,23 +495,66 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 		return
 	}
 
-	w.acted(logger, replica, res.Name, "DRBDResyncStalled", fmt.Sprintf(
-		"resync from %s stalled at %.2f%% for %d passes while another peer waits on it: "+
-			"disconnecting and connecting %s (LINBIT/drbd#149)",
-		from.Peer, from.PercentInSync, progress.Passes, from.Peer))
+	// Counting starts over whatever happens: the action needs passes of
+	// its own to show whether the resync moves again.
+	progress.Passes = 0
+	stalls[res.Name] = progress
 
-	err := w.Adm.DisconnectPeer(ctx, res.Name, from.Peer)
+	stuck := fmt.Sprintf("resync of volume %d from %s stalled for %d passes at %.2f%% "+
+		"(out-of-sync %d KiB, %d requests outstanding) while %s waits on it",
+		dep.Volume, dep.Active, w.Config.StalledResyncPasses, dep.PercentInSync, dep.OutOfSync, dep.Outstanding, dep.Paused)
+
+	switch {
+	case progress.PausedTried != dep.Active && res.MayDisconnect(dep.Paused):
+		w.disconnectPausedPeer(ctx, logger, res, replica, dep, stuck)
+
+		stalls[res.Name] = resyncProgress{ResyncDependency: dep, At: progress.At, PausedTried: dep.Active}
+	case res.MayDisconnect(dep.Active):
+		w.reconnectActivePeer(ctx, logger, res, replica, dep, stuck)
+	default:
+		w.acted(logger, replica, res.Name, "DRBDResyncStalled", stuck+
+			": left alone, dropping either peer would leave a Primary without an UpToDate disk (LINBIT/drbd#149)")
+	}
+}
+
+// disconnectPausedPeer drops this node's connection to the peer whose
+// resync waits on the stalled one, and owes the resource an adjust on
+// the next pass that connects it again (adjustOwed). The pass in between
+// gives the active resync time to finish without the paused one.
+func (w *DRBDWorkaroundsRunnable) disconnectPausedPeer(
+	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
+	replica *blockstoriov1alpha1.Resource, dep drbd.ResyncDependency, stuck string,
+) {
+	w.acted(logger, replica, res.Name, "DRBDResyncStalled", fmt.Sprintf(
+		"%s: disconnecting %s, connecting it again on the next pass (LINBIT/drbd#149)", stuck, dep.Paused))
+
+	err := w.Adm.DisconnectPeer(ctx, res.Name, dep.Paused)
+	if err != nil {
+		w.failed(logger, err, res.Name, "disconnect the peer a stalled resync waits on")
+
+		return
+	}
+
+	w.oweAdjust(res.Name, "connect again the peer a stalled resync waited on")
+}
+
+// reconnectActivePeer disconnects and connects the peer the stalled
+// resync pulls from, as the LINSTOR plunger does.
+func (w *DRBDWorkaroundsRunnable) reconnectActivePeer(
+	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,
+	replica *blockstoriov1alpha1.Resource, dep drbd.ResyncDependency, stuck string,
+) {
+	w.acted(logger, replica, res.Name, "DRBDResyncStalled", fmt.Sprintf(
+		"%s: disconnecting and connecting %s (LINBIT/drbd#149)", stuck, dep.Active))
+
+	err := w.Adm.DisconnectPeer(ctx, res.Name, dep.Active)
 	if err == nil {
-		err = w.Adm.ConnectPeer(ctx, res.Name, from.Peer)
+		err = w.Adm.ConnectPeer(ctx, res.Name, dep.Active)
 	}
 
 	if err != nil {
 		w.failed(logger, err, res.Name, "reconnect the peer a resync stalled on")
 	}
-
-	// Counting starts over either way: the reconnect needs passes of
-	// its own to show whether the resync moves again.
-	stalls[res.Name] = resyncProgress{Peer: from.Peer, Percent: from.PercentInSync}
 }
 
 // Workaround for DRBD auto-demote not firing
@@ -575,9 +691,11 @@ func (w *DRBDWorkaroundsRunnable) oweAdjust(name, what string) {
 }
 
 // adjustOwed runs `drbdadm adjust` of every resource a check left short of
-// its configuration, such as one a forced-I/O restart took down and
-// failed to bring up (adjust rather than up also completes an up that
-// stopped half way). A resource an apply is changing is left to that
+// its configuration: one a forced-I/O restart took down and failed to
+// bring up (adjust rather than up also completes an up that stopped half
+// way), and one whose peer a stalled resync waited on was disconnected
+// (adjust connects it again, and does nothing to a peer an apply
+// connected meanwhile). A resource an apply is changing is left to that
 // apply and tried on the next pass; one blockstor no longer has a
 // replica of, or is deleting, is dropped.
 func (w *DRBDWorkaroundsRunnable) adjustOwed(ctx context.Context, logger logr.Logger) {
