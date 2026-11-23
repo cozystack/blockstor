@@ -76,13 +76,16 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// REST 1.28 added the `props` filter here, on the volumes' own props.
+	// Every volume definition is listed, built or not, as LINSTOR does
+	// (see ensureVolumesForView). REST 1.28 added the `props` filter
+	// here, on the volumes' own props.
 	propFilter := propsQuery(r)
-	vols := make([]apiv1.Volume, 0, len(res.Volumes))
+	listed := ensureVolumesForView(res.Volumes, &res, s.definitionVolumeSizes(r.Context(), rdName))
+	vols := make([]apiv1.Volume, 0, len(listed))
 
-	for i := range res.Volumes {
-		if matchProps(propFilter, res.Volumes[i].Props) {
-			vols = append(vols, res.Volumes[i])
+	for i := range listed {
+		if matchProps(propFilter, listed[i].Props) {
+			vols = append(vols, listed[i])
 		}
 	}
 
@@ -115,6 +118,16 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 	}
 
 	if vol, ok := s.awaitReportedVolume(r.Context(), &res, vlmNr); ok {
+		writeJSON(w, http.StatusOK, vol)
+
+		return
+	}
+
+	// A volume the satellite has still not built answers without a
+	// device path, as LINSTOR's does, rather than 404: linstor-csi's
+	// attach then reports "could not determine device path" and
+	// retries, instead of failing on a volume that does exist.
+	if vol, ok := placeholderVolume(&res, vlmNr, s.definitionVolumeSizes(r.Context(), rdName)); ok {
 		writeJSON(w, http.StatusOK, vol)
 
 		return
@@ -230,6 +243,19 @@ func mergeVolumePropsPatch(vol *apiv1.Volume, patch *apiv1.GenericPropsModify) {
 	applyPropsModify(vol.Props, patch.OverrideProps, patch.DeleteProps)
 
 	deletePropNamespaces(vol.Props, patch.DeleteNamespace)
+}
+
+// placeholderVolume is volume vlmNr of the replica as the volume list
+// answers it (ensureVolumesForView), and whether that list has it.
+func placeholderVolume(res *apiv1.Resource, vlmNr int32, vdSizes map[int32]int64) (apiv1.Volume, bool) {
+	vols := ensureVolumesForView(res.Volumes, res, vdSizes)
+
+	idx := findVolumeIndexByNumber(vols, vlmNr)
+	if idx < 0 {
+		return apiv1.Volume{}, false
+	}
+
+	return vols[idx], true
 }
 
 // volumeReportBudget bounds how long a volume read waits for the satellite

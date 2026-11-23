@@ -6210,6 +6210,7 @@ func TestTemporarySecondaryFailureAutoRecovers(t *testing.T) {
 func TestApplyAutoMkfsXfsFiresOnceOnFirstActivation(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd1000")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-mkfs_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
@@ -6315,6 +6316,7 @@ func TestApplyAutoMkfsXfsFiresOnceOnFirstActivation(t *testing.T) {
 func TestApplyAutoMkfsHonoursMkfsParams(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd2000")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-mkfsparams_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
@@ -6541,6 +6543,7 @@ func TestApplyAutoMkfsSkipsWhenNotPrimary(t *testing.T) {
 func TestApplyAutoMkfsRetryAfterMissedFirstActivation(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6000")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// Inject a transient failure into `drbdadm primary --force` on
@@ -6655,7 +6658,7 @@ func TestApplyAutoMkfsRetryAfterMissedFirstActivation(t *testing.T) {
 
 // TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume pins the per-volume
 // idempotency layer of the Bug 311 fix: a volume that already carries
-// a filesystem (TYPE= line in `blkid -o export <dev>` output) MUST
+// a filesystem (TYPE= line in `blkid -p -o export <dev>` output) MUST
 // NOT be re-mkfs'd, even when the `.mkfs.done` marker is absent.
 // Mirrors upstream LINSTOR's MkfsUtils.makeFileSystemOnMarked which
 // short-circuits on a non-empty `hasFileSystem` result, and prevents
@@ -6666,9 +6669,9 @@ func TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-blkid_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	// Pretend the device already has an ext4 filesystem — blkid -o
+	// Pretend the device already has an ext4 filesystem — blkid -p -o
 	// export returns the upstream-canonical TYPE= line.
-	fx.Expect("blkid -o export /dev/drbd6100",
+	fx.Expect("blkid -p -o export /dev/drbd6100",
 		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd6100\nTYPE=ext4\nUSAGE=filesystem\n")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -6730,6 +6733,7 @@ func TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume(t *testing.T) {
 func TestApplyAutoMkfsMultiVolumeMkfsBoth(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd7000", "/dev/drbd7001")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-ganesha_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-ganesha_00001",
@@ -7252,6 +7256,7 @@ func (f *fakeFilesystemStamper) Calls() []string {
 func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd8000", "/dev/drbd8001")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311m_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311m_00001",
@@ -7322,7 +7327,7 @@ func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 
 // TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume pins the
 // per-volume blkid safety net for multi-volume RDs: vol-0 already
-// carries an ext4 filesystem (blkid -o export reports TYPE=ext4),
+// carries an ext4 filesystem (blkid -p -o export reports TYPE=ext4),
 // vol-1 is blank. runAutoMkfs MUST skip mkfs on vol-0 (adopting the
 // existing fs) and run mkfs on vol-1 only — mirrors upstream
 // LINSTOR's MkfsUtils.makeFileSystemOnMarked which short-circuits on
@@ -7334,18 +7339,18 @@ func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 func TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd8501")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311s_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311s_00001",
 		storage.FakeResponse{Stdout: []byte("")})
-	// vol-0 already has an ext4 filesystem. blkid -o export returns
-	// the canonical TYPE= line; runAutoMkfs's deviceHasFilesystem
-	// scans for any TYPE= prefix and treats it as "populated".
-	fx.Expect("blkid -o export /dev/drbd8500",
+	// vol-0 already has an ext4 filesystem. blkid -p -o export returns
+	// the canonical TYPE= line; runAutoMkfs's probeMkfsTarget reads
+	// any non-drbd TYPE= as "populated".
+	fx.Expect("blkid -p -o export /dev/drbd8500",
 		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd8500\nTYPE=ext4\nUSAGE=filesystem\n")})
-	// vol-1 is blank: leave the blkid response unregistered so
-	// FakeExec returns empty stdout / nil err — deviceHasFilesystem
-	// finds no TYPE= prefix and falls through to mkfs.
+	// vol-1 is blank: expectBlankMkfsTarget above cans blkid's exit 2,
+	// so probeMkfsTarget reads it as empty and mkfs runs.
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -7425,6 +7430,7 @@ func TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume(t *testing.T) {
 func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd9000", "/dev/drbd9001")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00001",
@@ -7495,7 +7501,7 @@ func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("pvc-bug311c_00001\n")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-bug311c_00001",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-bug311c_00001|307200\n")})
-	fx.Expect("blkid -o export /dev/drbd9000",
+	fx.Expect("blkid -p -o export /dev/drbd9000",
 		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd9000\nTYPE=ext4\nUSAGE=filesystem\n")})
 	fx.Expect("mkfs.ext4 /dev/drbd9001", storage.FakeResponse{})
 
@@ -7769,6 +7775,7 @@ func TestBug278NoClearWhenKernelStillDiskless(t *testing.T) {
 func TestApplyAutoMkfsStorageOnlyFormatsRawDevice(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/vg/pvc-local_00000")
 
 	// lvExists probe (lvcreate idempotency check).
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-local_00000",
@@ -7800,6 +7807,8 @@ func TestApplyAutoMkfsStorageOnlyFormatsRawDevice(t *testing.T) {
 			},
 			LayerStack:  []string{"STORAGE"},
 			DrbdOptions: map[string]string{},
+			// Created empty by blockstor: only such a replica is formatted.
+			SkipInitialSync: skipInitTrue(),
 		},
 	}
 

@@ -148,16 +148,31 @@ func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 }
 
 // handleDisabledPass implements scenario 2.W02's "kill-switched" branch.
-// Both the annotation path AND the scheduled-tick path are suppressed;
-// a stamped annotation is stripped so a stale marker doesn't loop
-// forever against the disabled reconciler.
+// The scheduled tick is suppressed and a stamped annotation is stripped
+// so a stale marker doesn't loop forever against the disabled
+// reconciler.
+//
+// The kill switch stops the balance task, not an explicit `rg modify`:
+// LINSTOR reads it in BalanceResources alone and autoplaces every child
+// of a modified group without consulting it. So this pass places every
+// child before it strips the marker, whatever its layer stack. It does
+// not leave the DRBD children to the RG event path: that path is not
+// where LINSTOR's modify places, and it is free to apply the balance
+// checks, the switch among them.
 func (r *RGRebalanceReconciler) handleDisabledPass(ctx context.Context, rg *apiv1.ResourceGroup) error {
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; !hasAnnotation {
 		return nil
 	}
 
-	logf.FromContext(ctx).WithValues("rg", rg.Name).
-		Info("rebalance disabled by BalanceResourcesEnabled=false; stripping stale annotation")
+	log := logf.FromContext(ctx).WithValues("rg", rg.Name)
+
+	count, err := r.rebalanceChildRDs(ctx, rg, 0, allChildren)
+	if err != nil {
+		return err
+	}
+
+	log.Info("rebalance disabled by BalanceResourcesEnabled=false; placed the explicit modify, stripping annotation",
+		"rds_processed", count)
 
 	return r.stripRebalanceAnnotation(ctx, rg)
 }
@@ -175,7 +190,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; hasAnnotation {
 		// Operator intent: ignore per-RD shortfall grace and the
 		// per-node offline grace — a REST modify means "act now".
-		count, perr := r.rebalanceChildRDs(ctx, rg, 0, false)
+		count, perr := r.rebalanceChildRDs(ctx, rg, 0, allChildren)
 		if perr != nil {
 			return perr
 		}
@@ -192,7 +207,7 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 		return nil
 	}
 
-	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod, true)
+	count, perr := r.rebalanceChildRDs(ctx, rg, gracePeriod, childrenWithDRBD)
 	if perr != nil {
 		return perr
 	}
@@ -218,16 +233,15 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // path does this so an operator's `linstor rg modify` acts on every
 // child RD immediately.
 //
-// Neither pass places on a definition being deleted. `scheduled` marks
-// the periodic pass, LINSTOR's BalanceResourcesTask, which also leaves
-// alone one with nothing deployed to balance: a definition whose
-// replicas were all deleted (a truncate, or a CSI DeleteVolume) and
-// that its snapshots keep is a deleted volume, and re-placing it would
-// bring that volume back. An operator's `rg modify` / `rg adjust`
+// `children` picks which definitions the pass places on; see
+// rebalanceChildren. Neither pass places on a definition being deleted.
+// The scheduled pass (childrenWithDRBD), LINSTOR's BalanceResourcesTask,
+// also leaves alone one with nothing deployed to balance: a definition
+// whose replicas were all deleted (a truncate, or a CSI DeleteVolume)
+// and that its snapshots keep is a deleted volume, and re-placing it
+// would bring that volume back. An operator's `rg modify` / `rg adjust`
 // places on every other definition, as LINSTOR's does.
-func (r *RGRebalanceReconciler) rebalanceChildRDs(
-	ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, scheduled bool,
-) (int, error) {
+func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, children rebalanceChildren) (int, error) {
 	log := logf.FromContext(ctx)
 
 	rds, err := r.Store.ResourceDefinitions().List(ctx)
@@ -241,6 +255,13 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(
 
 	for i := range rds {
 		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
+			continue
+		}
+
+		if !children.includes(&rds[i], rg) {
+			log.V(1).Info("rebalance skipped (layer stack not in this pass)",
+				"rg", rg.Name, "rd", rds[i].Name)
+
 			continue
 		}
 
@@ -261,7 +282,7 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(
 			continue
 		}
 
-		if scheduled && !r.hasSomethingToBalance(ctx, &rds[i]) {
+		if children == childrenWithDRBD && !r.hasSomethingToBalance(ctx, &rds[i]) {
 			log.V(1).Info("scheduled rebalance skipped (nothing deployed to balance)",
 				"rg", rg.Name, "rd", rds[i].Name)
 
@@ -298,6 +319,43 @@ func (r *RGRebalanceReconciler) hasSomethingToBalance(ctx context.Context, rd *a
 	return slices.ContainsFunc(replicas, func(res apiv1.Resource) bool {
 		return store.HoldsData(&res) && !slices.Contains(res.Flags, apiv1.ResourceFlagDelete)
 	})
+}
+
+// rebalanceChildren selects the child definitions a rebalance pass
+// places on.
+type rebalanceChildren int
+
+const (
+	// allChildren is the explicit `rg modify`, with balancing on or
+	// off: LINSTOR autoplaces every child of the group, whatever its
+	// layer stack.
+	allChildren rebalanceChildren = iota
+
+	// childrenWithDRBD is the scheduled balance pass. It leaves out a
+	// definition without a DRBD layer, as LINSTOR's BalanceResources
+	// does: such a replica has no peer to resync from, so a replica
+	// topped up here would only be an empty volume under its name.
+	childrenWithDRBD
+)
+
+func (c rebalanceChildren) includes(rd *apiv1.ResourceDefinition, rg *apiv1.ResourceGroup) bool {
+	switch c {
+	case childrenWithDRBD:
+		return definitionUsesDRBD(rd, rg)
+	case allChildren:
+		return true
+	}
+
+	return true
+}
+
+// definitionUsesDRBD reports whether the definition's layer stack, its
+// own or else its group's, has a DRBD layer. An empty stack at both
+// levels is the default stack, which does.
+func definitionUsesDRBD(rd *apiv1.ResourceDefinition, rg *apiv1.ResourceGroup) bool {
+	stack := apiv1.ResolveLayerStack(rd.LayerStack, rg.SelectFilter.LayerStack)
+
+	return apiv1.LayerInStack(stack, apiv1.LayerKindDRBD)
 }
 
 // shortfallWithinGrace reports whether an RD carries a still-fresh
@@ -376,6 +434,10 @@ func (r *RGRebalanceReconciler) replayOneShortfall(ctx context.Context, p *place
 		return nil
 	}
 
+	// No layer-stack skip here, unlike the scheduled pass: this finishes
+	// a spawn that came up short, it does not top up a definition after
+	// a replica was deleted, so a storage-only definition is exempt on
+	// purpose.
 	filter := rg.SelectFilter
 	if filter.PlaceCount == 0 {
 		filter.PlaceCount = 1

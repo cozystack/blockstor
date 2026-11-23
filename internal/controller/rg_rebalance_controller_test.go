@@ -194,11 +194,11 @@ func TestRGRebalanceReconcilerIsAdditiveOnly(t *testing.T) {
 // TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled: scenario
 // 2.W02 — operator sets controller-scope
 // `BalanceResourcesEnabled=false` to suppress the periodic rebalance
-// pass cluster-wide. Even with the `rebalance-pending` annotation
-// stamped on the RG, the reconciler MUST NOT spawn additional
-// replicas; existing placements are left untouched. The annotation
-// is stripped so a re-watch on the same event doesn't loop, matching
-// the no-op return contract.
+// pass cluster-wide (TestRebalanceHonoursDisabled pins the tick). The
+// switch is read by LINSTOR's balance task alone; its `rg modify`
+// autoplaces the children short of the place count without consulting
+// it, so the `rebalance-pending` annotation still places. The
+// annotation is stripped so a re-watch on the same event doesn't loop.
 func TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled(t *testing.T) {
 	t.Parallel()
 
@@ -207,9 +207,8 @@ func TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled(t *testing.T) {
 	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
 	st := store.NewInMemory()
 
-	// Two existing replicas, RG wants three — without the kill-switch
-	// the reconciler would add a third. The seed annotation simulates
-	// a fresh `linstor rg modify` increasing PlaceCount.
+	// Two existing replicas, RG wants three. The seed annotation
+	// simulates a fresh `linstor rg modify` increasing PlaceCount.
 	seedRebalanceFixture(t, ctx, st, 3, []string{"n1", "n2"})
 
 	// Flip the controller-scope kill-switch BEFORE the reconcile fires.
@@ -230,12 +229,10 @@ func TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("BalanceResourcesEnabled=false must short-circuit; got %d replicas, want 2 (entries=%v)", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("rg modify with BalanceResourcesEnabled=false placed %d replicas, want 3 (entries=%v)", len(got), got)
 	}
 
-	// Annotation must still be stripped — a stale marker that survives
-	// a kill-switched pass would loop forever on the next RG event.
 	rg, err := st.ResourceGroups().Get(ctx, "rg")
 	if err != nil {
 		t.Fatalf("Get rg: %v", err)

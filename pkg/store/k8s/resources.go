@@ -23,6 +23,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -807,6 +808,16 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 // — it cannot infer per-peer replication from
 // `layer_object.drbd.connections[].replication_state`, even though
 // blockstor stores the data there too.
+//
+// The replication state is the volume's own with that peer
+// (peerVolumes[].replicationState) and done_percentage that volume's
+// `done`, so a two-volume resource reports each volume's own resync,
+// as LINSTOR does from its per-peer, per-volume DrbdVolume. The
+// connection-level replicationState is whichever volume's frame came
+// last; it is only the fallback for a volume the satellite has not
+// reported per volume yet. LINSTOR fills done_percentage whenever the
+// satellite reported one (Json.apiToVolumeState), whatever the
+// replication state, and so does this.
 func volumesWithReplicationStates(
 	vols []apiv1.Volume,
 	conns []crdv1alpha1.ResourceConnectionStatus,
@@ -815,28 +826,62 @@ func volumesWithReplicationStates(
 		return vols
 	}
 
-	states := make(map[string]apiv1.ReplicationState, len(conns))
-
-	for i := range conns {
-		c := &conns[i]
-		if c.ReplicationState == "" {
-			continue
-		}
-
-		states[c.PeerNodeName] = apiv1.ReplicationState{
-			ReplicationState: c.ReplicationState,
-		}
-	}
-
-	if len(states) == 0 {
-		return vols
-	}
-
 	for i := range vols {
-		vols[i].State.ReplicationStates = states
+		states := make(map[string]apiv1.ReplicationState, len(conns))
+
+		for j := range conns {
+			c := &conns[j]
+			peerVol := findPeerVolume(c.PeerVolumes, vols[i].VolumeNumber)
+
+			repl := c.ReplicationState
+			if peerVol != nil && peerVol.ReplicationState != "" {
+				repl = peerVol.ReplicationState
+			}
+
+			if repl == "" {
+				continue
+			}
+
+			states[c.PeerNodeName] = apiv1.ReplicationState{
+				ReplicationState: repl,
+				DonePercentage:   peerVolumeDone(peerVol),
+			}
+		}
+
+		if len(states) > 0 {
+			vols[i].State.ReplicationStates = states
+		}
 	}
 
 	return vols
+}
+
+// findPeerVolume returns one volume's entry of a connection's
+// per-volume peer view, nil when the satellite reported none.
+func findPeerVolume(peerVolumes []crdv1alpha1.PeerVolumeStatus, volumeNumber int32) *crdv1alpha1.PeerVolumeStatus {
+	for i := range peerVolumes {
+		if peerVolumes[i].VolumeNumber == volumeNumber {
+			return &peerVolumes[i]
+		}
+	}
+
+	return nil
+}
+
+// peerVolumeDone parses the `done` token the satellite recorded for
+// one volume on one connection. nil when the volume has none or the
+// token does not parse: no progress is better than a made-up one.
+func peerVolumeDone(peerVol *crdv1alpha1.PeerVolumeStatus) *float64 {
+	if peerVol == nil || peerVol.Done == "" {
+		return nil
+	}
+
+	done, err := strconv.ParseFloat(peerVol.Done, 64)
+	if err != nil {
+		return nil
+	}
+
+	return &done
 }
 
 // volumeLayerDataFromStack mirrors the resource-level layer stack
