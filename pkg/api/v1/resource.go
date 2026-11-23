@@ -65,9 +65,10 @@ type Resource struct {
 
 	// KernelSlotDestroyed is set when the satellite last saw the
 	// replica's DRBD kernel resource destroyed (CRD Condition
-	// KernelLoaded=False). Not on the wire: like SatelliteIncarnation
-	// it only tells a read to answer the replica with no satellite
-	// state (ForgetStaleSatelliteState).
+	// KernelLoaded=False) and the stored status agrees: no volume
+	// keeps a disk state and no peer link is left. Not on the wire:
+	// like SatelliteIncarnation it only tells a read to answer the
+	// replica with no satellite state (ForgetStaleSatelliteState).
 	KernelSlotDestroyed bool `json:"-"`
 
 	// Volumes is the per-replica volume slice — sourced from

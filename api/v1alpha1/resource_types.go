@@ -100,8 +100,8 @@ const ConditionFilesystemFormatted = "FilesystemFormatted"
 // but only while the stored status carries no disk state and no peer
 // link either. Nothing rewrites the Condition between events2
 // resource frames, so a False that outlived its replica's return
-// stays; the observer's resync rewrites the disk states every few
-// seconds, which keeps a stale False from hiding a running replica.
+// stays; every status write the observer makes carries the replica's
+// disk states, which keeps a stale False from hiding a running replica.
 const ConditionKernelLoaded = "KernelLoaded"
 
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the
