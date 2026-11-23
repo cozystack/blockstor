@@ -25,6 +25,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -48,11 +50,35 @@ const drbdmetaNoMinor = "-"
 // storage.FakeExec and assert the exact command lines.
 type Adm struct {
 	exec storage.Exec
+
+	// schemaMu guards schemas, the per-section schemas read once from
+	// this node's drbdsetup (OptionSchema), and schemaFailures, the last
+	// failed read of each, kept for schemaRetryAfter.
+	schemaMu       sync.Mutex
+	schemas        map[string]*OptionSchema
+	schemaFailures map[string]schemaFailure
+
+	// now is the clock schemaFailures are aged by; time.Now unless a
+	// test sets it.
+	now func() time.Time
 }
+
+// schemaFailure is a failed schema read and when it failed.
+type schemaFailure struct {
+	at  time.Time
+	err error
+}
+
+// schemaRetryAfter is how long a failed schema read is answered from
+// memory before drbdsetup is asked again. Every .res render reads each
+// section's schema, so without it a node whose drbdsetup cannot answer
+// runs the failing xml-help calls again on every render of every
+// resource, adding their latency to each create.
+const schemaRetryAfter = time.Minute
 
 // NewAdm constructs an Adm with the given Exec.
 func NewAdm(ex storage.Exec) *Adm {
-	return &Adm{exec: ex}
+	return &Adm{exec: ex, now: time.Now}
 }
 
 // Up activates the resource: `drbdadm up <res>`. Idempotent on the DRBD
@@ -101,6 +127,91 @@ func (a *Adm) SetupDown(ctx context.Context, resource string) error {
 // changes (added/removed peers, new options).
 func (a *Adm) Adjust(ctx context.Context, resource string) error {
 	return a.run(ctx, "adjust", resource)
+}
+
+// CheckResFile asks drbdadm whether the node's configuration still parses
+// with candidate in place of live: `drbdadm --config-to-test <candidate>
+// --config-to-exclude <live> sh-nop`.
+//
+// LINSTOR's satellite does not run it: its DrbdAdm.checkResFile has no
+// caller, and DrbdResourceFileUtils moves a new body into place
+// unchecked. blockstor checks deliberately, which is stricter, and
+// docs/cli-parity-known-deltas.md lists it as a divergence.
+//
+// It matters beyond the one resource because drbdadm reads every .res
+// on the node for any command. A file it cannot parse stops adjust,
+// dump-md and every other drbdadm call for all resources there, not just
+// its own, so it has to be caught before it lands under its real name.
+// live need not exist: a resource's first .res excludes nothing.
+func (a *Adm) CheckResFile(ctx context.Context, candidate, live string) error {
+	_, err := a.exec.Run(ctx, "drbdadm", "--config-to-test", candidate, "--config-to-exclude", live, "sh-nop")
+	if err != nil {
+		return errors.Wrapf(err, "drbdadm refuses %s", candidate)
+	}
+
+	return nil
+}
+
+// DiskOptionSchema returns what this node's drbd-utils accepts inside a
+// `disk { }` section; see OptionSchema.
+func (a *Adm) DiskOptionSchema(ctx context.Context) (*OptionSchema, error) {
+	return a.OptionSchema(ctx, SectionDisk)
+}
+
+// OptionSchema returns what this node's drbd-utils accepts inside one
+// `.res` section, read from `drbdsetup xml-help` for each of its
+// SectionCommands, the way LINSTOR's satellite builds its option
+// whitelist when it starts. The answer is kept for the life of the
+// process: drbd-utils ships in the image, so it cannot change under a
+// running satellite.
+//
+// A failure is kept only for schemaRetryAfter, so a drbdsetup that could
+// not answer once is asked again a minute later, not on every render; it
+// returns a nil schema, which
+// accepts every option: the render then goes ahead unfiltered, as it did
+// before the schema existed, and CheckResFile still stands between a
+// body drbdadm refuses and the live file. A section xml-help does not
+// describe has a nil schema too.
+func (a *Adm) OptionSchema(ctx context.Context, section string) (*OptionSchema, error) {
+	commands := SectionCommands(section)
+	if len(commands) == 0 {
+		return nil, nil //nolint:nilnil // a nil schema is the documented "check nothing"
+	}
+
+	a.schemaMu.Lock()
+	defer a.schemaMu.Unlock()
+
+	// The disk and peer-device sections share their commands, so they
+	// share one schema and one round of drbdsetup calls.
+	cacheKey := strings.Join(commands, ",")
+
+	if schema, ok := a.schemas[cacheKey]; ok {
+		return schema, nil
+	}
+
+	if failed, ok := a.schemaFailures[cacheKey]; ok && a.now().Sub(failed.at) < schemaRetryAfter {
+		return nil, failed.err
+	}
+
+	schema, err := a.readOptionSchema(ctx, commands)
+	if err != nil {
+		if a.schemaFailures == nil {
+			a.schemaFailures = map[string]schemaFailure{}
+		}
+
+		a.schemaFailures[cacheKey] = schemaFailure{at: a.now(), err: err}
+
+		return nil, err
+	}
+
+	if a.schemas == nil {
+		a.schemas = map[string]*OptionSchema{}
+	}
+
+	a.schemas[cacheKey] = schema
+	delete(a.schemaFailures, cacheKey)
+
+	return schema, nil
 }
 
 // InvalidateVolume runs `drbdadm invalidate <resource>/<vol>` — marks the
@@ -2448,4 +2559,21 @@ func (a *Adm) run(ctx context.Context, args ...string) error {
 	}
 
 	return nil
+}
+
+// readOptionSchema asks drbdsetup to describe commands and parses the
+// answers into one schema.
+func (a *Adm) readOptionSchema(ctx context.Context, commands []string) (*OptionSchema, error) {
+	docs := make([][]byte, 0, len(commands))
+
+	for _, cmd := range commands {
+		out, err := a.exec.Run(ctx, "drbdsetup", "xml-help", cmd)
+		if err != nil {
+			return nil, errors.Wrapf(err, "drbdsetup xml-help %s", cmd)
+		}
+
+		docs = append(docs, out)
+	}
+
+	return ParseOptionSchema(docs...)
 }

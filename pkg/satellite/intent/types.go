@@ -390,6 +390,22 @@ type DesiredVolume struct {
 	// log on a volume with one is a crash to repair with apply-al, not a
 	// foreign superblock to re-initialise over.
 	ObservedGI string
+
+	// DiskOptions are the volume's own DRBD disk options, keyed by bare
+	// option name (block-size, rs-discard-granularity): those set on its
+	// volume definition or volume group, resolved by
+	// effectiveprops.VolumeDiskOptions. The .res renders them inside the
+	// volume, where they override the resource-scope disk section.
+	DiskOptions map[string]string
+}
+
+// GetDiskOptions returns the volume's own disk options.
+func (x *DesiredVolume) GetDiskOptions() map[string]string {
+	if x == nil {
+		return nil
+	}
+
+	return x.DiskOptions
 }
 
 // GetObservedGI returns the GI last reported for this volume, or "".
@@ -485,6 +501,12 @@ type ResourceApplyResult struct {
 	// so linstor-csi / consumers reading the CRD can resolve the
 	// backing /dev path without an extra round-trip.
 	Volumes []*ResourceApplyVolumeResult
+
+	// DroppedOptions says why each option the satellite left out of the
+	// resource's .res went: drbdadm would have refused the whole file
+	// over it. The c-r reconciler reports each as a Warning Event on the
+	// Resource, since the operator set it and it does not take effect.
+	DroppedOptions []string
 }
 
 // ResourceApplyVolumeResult is the per-volume slice item the
