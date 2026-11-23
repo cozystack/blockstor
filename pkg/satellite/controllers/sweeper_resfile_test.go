@@ -41,9 +41,15 @@ type fakeDirEntry struct {
 	dir  bool
 }
 
-func (f fakeDirEntry) Name() string      { return f.name }
-func (f fakeDirEntry) IsDir() bool       { return f.dir }
-func (f fakeDirEntry) Type() os.FileMode { return 0 }
+func (f fakeDirEntry) Name() string { return f.name }
+func (f fakeDirEntry) IsDir() bool  { return f.dir }
+func (f fakeDirEntry) Type() os.FileMode {
+	if f.dir {
+		return os.ModeDir
+	}
+
+	return 0
+}
 
 // Info is never called by orphanResForRemoval (it only reads Name/IsDir);
 // return a sentinel so the contract is satisfied without the nilnil lint.

@@ -1633,7 +1633,7 @@ func TestEnsureTiebreakerRelocateOntoTiebreakerConverges(t *testing.T) {
 // hazard on a subsequent failure.
 //
 // `linstor n rst n3` clears the EVICTED flag. The fix wires a Node
-// watch (nodeDrainFlagChanged → enqueueRDsForNode) so the restore
+// watch (witnessCandidacyChanged → enqueueRDsForNode) so the restore
 // re-enqueues the RD and ensureTiebreaker re-runs. This test pins the
 // reconcile-level outcome: with EVICTED cleared, the witness must be
 // (re)placed on n3 so the resource regains the diskful+diskful+TB
@@ -1844,5 +1844,70 @@ func TestBug386EnqueueRDsForNode(t *testing.T) {
 		if !got[want] {
 			t.Errorf("enqueueRDsForNode: missing RD %q in fan-out; reqs=%v", want, reqs)
 		}
+	}
+}
+
+// A placement still writing a three-replica definition's diskful
+// replicas holds the witness back: two replicas in, the definition
+// looks like the even-diskful tie a witness breaks, and the witness
+// would land on the node the third replica is for. The peers set it up
+// as a diskless peer, and when the placement took it over as diskful
+// their kernel dropped the connection to it. Once the placement is
+// done, or its stamp has expired because it never got to remove it,
+// the witness decision runs as before.
+func TestEnsureTiebreakerWaitsForAPlacementInProgress(t *testing.T) {
+	t.Parallel()
+
+	stamp := func(d time.Duration) string { return time.Now().Add(d).UTC().Format(time.RFC3339Nano) }
+
+	for _, tc := range []struct {
+		name        string
+		holds       string
+		wantWitness bool
+	}{
+		{name: "in progress", holds: stamp(time.Minute), wantWitness: false},
+		{name: "stamp expired", holds: stamp(-time.Minute), wantWitness: true},
+		{name: "one of two placements in progress", holds: stamp(-time.Minute) + " " + stamp(time.Minute), wantWitness: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			scheme := newScheme(t)
+			st := store.NewInMemory()
+			ctx := t.Context()
+
+			for _, n := range []string{"n1", "n2", "n3"} {
+				if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}); err != nil {
+					t.Fatalf("seed node %s: %v", n, err)
+				}
+			}
+
+			for _, n := range []string{"n1", "n2"} {
+				if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-placing", NodeName: n}); err != nil {
+					t.Fatalf("seed replica %s: %v", n, err)
+				}
+			}
+
+			rd := &blockstoriov1alpha1.ResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pvc-placing",
+					Annotations: map[string]string{
+						apiv1.PlacementInProgressUntilAnnotation: tc.holds,
+					},
+				},
+			}
+
+			cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+			rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme, Store: st}
+
+			if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+				t.Fatalf("EnsureTiebreaker: %v", err)
+			}
+
+			_, err := st.Resources().Get(ctx, "pvc-placing", "n3")
+			if gotWitness := err == nil; gotWitness != tc.wantWitness {
+				t.Errorf("witness on n3: got %v, want %v", gotWitness, tc.wantWitness)
+			}
+		})
 	}
 }
