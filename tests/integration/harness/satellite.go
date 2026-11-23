@@ -98,6 +98,10 @@ type Satellite struct {
 	// SimulateVolumesUnreported.
 	volumesUnreported map[string]bool
 
+	// snapshotsByHand[rdName] true → the satellite leaves the snapshots
+	// of the definition to the test, see StandInForSnapshots.
+	snapshotsByHand map[string]bool
+
 	// failNext is the queue of pending FakeExec-style failures the
 	// satellite mock is asked to inject the next time it sees a
 	// matching command. Phase 0 stores them but does not consult
@@ -119,6 +123,7 @@ func NewSatellite(cli client.Client) *Satellite {
 		tickInterval: satelliteTickInterval,
 
 		volumesUnreported: map[string]bool{},
+		snapshotsByHand:   map[string]bool{},
 	}
 }
 
@@ -192,6 +197,16 @@ func (s *Satellite) SimulateVolumesUnreported(rdName string) {
 	defer s.mu.Unlock()
 
 	s.volumesUnreported[rdName] = true
+}
+
+// StandInForSnapshots keeps the satellite from playing its part in the
+// snapshots of rdName, for a test that acks, takes and records them
+// itself, such as one that controls the pool a node records for its copy.
+func (s *Satellite) StandInForSnapshots(rdName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.snapshotsByHand[rdName] = true
 }
 
 // FailNext enqueues a FakeExec-style command match that the next
@@ -447,7 +462,7 @@ func (s *Satellite) reconcileSnapshots(ctx context.Context) {
 
 	for i := range snaps.Items {
 		snap := &snaps.Items[i]
-		if snap.DeletionTimestamp != nil {
+		if snap.DeletionTimestamp != nil || s.leftToTest(snap.Spec.ResourceDefinitionName) {
 			continue
 		}
 
@@ -483,6 +498,15 @@ func (s *Satellite) reconcileSnapshots(ctx context.Context) {
 			_ = s.client.Status().Update(ctx, patched)
 		}
 	}
+}
+
+// leftToTest reports whether the test stands in for the snapshots of
+// rdName (StandInForSnapshots).
+func (s *Satellite) leftToTest(rdName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.snapshotsByHand[rdName]
 }
 
 // stampLiveMigrateApplied reports the definition's live migration token
