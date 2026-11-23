@@ -349,13 +349,13 @@ func (r *SnapshotReconciler) mustNotWaitFor(ctx context.Context, snap *blockstor
 
 // snapshotBefore orders snapshots by creation, then by name, the same
 // way on every satellite.
-func snapshotBefore(a, b *blockstoriov1alpha1.Snapshot) bool {
-	at, bt := a.CreationTimestamp.Time, b.CreationTimestamp.Time
-	if !at.Equal(bt) {
-		return at.Before(bt)
+func snapshotBefore(first, second *blockstoriov1alpha1.Snapshot) bool {
+	firstAt, secondAt := first.CreationTimestamp.Time, second.CreationTimestamp.Time
+	if !firstAt.Equal(secondAt) {
+		return firstAt.Before(secondAt)
 	}
 
-	return a.Name < b.Name
+	return first.Name < second.Name
 }
 
 // heldByOther reports whether a live window of another snapshot holds
