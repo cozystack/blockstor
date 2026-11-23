@@ -153,6 +153,11 @@ func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target str
 		return nil, err
 	}
 
+	err = plan.refuseShadowedOverride()
+	if err != nil {
+		return nil, err
+	}
+
 	var (
 		msgs      []apiv1.APICallRc
 		migrating bool

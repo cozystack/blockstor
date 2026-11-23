@@ -199,7 +199,7 @@ func TestDualPrimaryPlanOpensTheConnection(t *testing.T) {
 			name: "two diskless ends are configured on the definition",
 			plan: dualPrimaryPlan{
 				source: "node-a", target: "node-b", bothDiskless: true,
-				ends: [2]protocolSources{{}, {resource: "A"}},
+				ends: [2]protocolSources{{}, {inherited: "A"}},
 			},
 			props: map[string]string{},
 			want: map[string]string{
@@ -339,5 +339,31 @@ func TestRevertDualPrimary(t *testing.T) {
 				t.Fatalf("changed %v, want %v", changed, tc.wantChanged)
 			}
 		})
+	}
+}
+
+// Two diskless ends take protocol C from the definition, and a protocol a
+// replica sets on itself is rendered over the definition's: the override
+// could not take effect, so the migration is refused before anything is
+// written. Between a diskful and a diskless end the connection carries
+// the override, which wins over both replicas.
+func TestDualPrimaryPlanRefusesAShadowedOverride(t *testing.T) {
+	t.Parallel()
+
+	shadowed := dualPrimaryPlan{
+		rdName: "vm-disk", source: "node-a", target: "node-b", bothDiskless: true,
+		ends: [2]protocolSources{{}, {resource: "A"}},
+	}
+	if code := refusalCode(t, shadowed.refuseShadowedOverride()); code != apiCallRcError|apiCallRcFailInvldProp {
+		t.Fatalf("rc %d, want FAIL_INVLD_PROP", code)
+	}
+
+	for _, plan := range []dualPrimaryPlan{
+		{rdName: "vm-disk", source: "node-a", target: "node-b", ends: [2]protocolSources{{}, {resource: "A"}}},
+		{rdName: "vm-disk", source: "node-a", target: "node-b", bothDiskless: true, ends: [2]protocolSources{{resource: "c"}, {inherited: "A"}}},
+	} {
+		if err := plan.refuseShadowedOverride(); err != nil {
+			t.Errorf("plan %+v refused: %v", plan, err)
+		}
 	}
 }

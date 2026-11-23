@@ -79,6 +79,7 @@ const (
 const (
 	apiCallRcFailExistsLiveMigrate int64 = 901
 	apiCallRcFailInvldLayerStack   int64 = 225
+	apiCallRcFailInvldProp         int64 = 213
 )
 
 // dualPrimaryRefusalError is a make-available or unmake-available the server
@@ -286,6 +287,40 @@ type dualPrimaryPlan struct {
 	target       string
 	bothDiskless bool
 	ends         [2]protocolSources
+}
+
+// refuseShadowedOverride refuses a migration between two diskless ends
+// when either replica sets a protocol other than C itself. Such a
+// migration has no connection to override and takes protocol C from the
+// definition, but the satellite renders a replica's own protocol over the
+// definition's, so the override would not take effect, DRBD would refuse
+// allow-two-primaries without protocol C, and the adjust on both ends
+// would fail with the migration half prepared.
+func (p *dualPrimaryPlan) refuseShadowedOverride() error {
+	if !p.bothDiskless {
+		return nil
+	}
+
+	for i, node := range []string{p.source, p.target} {
+		protocol := p.ends[i].resource
+		if protocol == "" || strings.EqualFold(protocol, drbdProtocolC) {
+			continue
+		}
+
+		return &dualPrimaryRefusalError{
+			status: http.StatusBadRequest,
+			rc: apiv1.APICallRc{
+				RetCode: apiCallRcError | apiCallRcFailInvldProp,
+				Message: fmt.Sprintf("Resource '%s' on node '%s' sets DRBD protocol '%s' on itself, "+
+					"which a live migration between two diskless nodes cannot override", p.rdName, node, protocol),
+				Cause:   "allow-two-primaries needs protocol C, and the protocol set on a resource wins over the definition's.",
+				Correc:  fmt.Sprintf("Remove %s from the resource on node '%s' or set it to C.", drbdProtocolProp, node),
+				ObjRefs: map[string]string{objRefRscDfn: p.rdName, objRefNode: node},
+			},
+		}
+	}
+
+	return nil
 }
 
 // is reports whether the migration from source to target is this plan's.
