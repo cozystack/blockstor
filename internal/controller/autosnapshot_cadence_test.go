@@ -41,7 +41,7 @@ func TestAutoSnapshotRunEveryOneTakesOnePerMinute(t *testing.T) {
 	const rdName = "pvc-cadence"
 
 	cli := fake.NewClientBuilder().WithScheme(newScheme(t)).
-		WithObjects(makeRDWithAutoSnapshot(t, rdName, 1, "100")).
+		WithObjects(withReplicas(makeRDWithAutoSnapshot(t, rdName, 1, "100"))...).
 		Build()
 
 	start := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
@@ -65,6 +65,8 @@ func TestAutoSnapshotRunEveryOneTakesOnePerMinute(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Tick #%d: %v", k, err)
 		}
+
+		finishTakes(t, cli, rdName)
 
 		// Every slot reached so far is taken by the first poll at or
 		// after it, not one poll later.
@@ -98,7 +100,7 @@ func TestAutoSnapshotAfterDowntimeTakesOneNotABurst(t *testing.T) {
 		controllerpkg.AnnotationAutoSnapshotLastAt: start.Add(-3 * time.Hour).Format(time.RFC3339Nano),
 	}
 
-	cli := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(rd).Build()
+	cli := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(withReplicas(rd)...).Build()
 
 	clk := &stubClock{t: start}
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
@@ -111,6 +113,8 @@ func TestAutoSnapshotAfterDowntimeTakesOneNotABurst(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Tick #%d: %v", k, err)
 		}
+
+		finishTakes(t, cli, rdName)
 	}
 
 	if got := len(listAutoSnapshotsByRD(t, cli, rdName)); got != 1 {
