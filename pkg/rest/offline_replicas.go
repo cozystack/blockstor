@@ -33,11 +33,13 @@ import (
 // and connected, so neither `r l` nor `r l --faulty` showed them while
 // the node was down, nor while it brought them back up.
 //
-// A node list that fails leaves the replicas as stored: the read still
-// answers, with the state last reported, rather than failing outright:
-// linstor-csi reads replicas here, and a node list error must not stop
-// its volume operations. The blockstor CLI fails instead (see
-// fetchResources there), since it serves a person reading the state.
+// A node list that fails leaves the replicas as stored, except those
+// whose kernel resource the satellite saw destroyed, which need no node
+// list to tell: the read still answers, with the state last reported,
+// rather than failing outright: linstor-csi reads replicas here, and a
+// node list error must not stop its volume operations. The blockstor
+// CLI fails instead (see fetchResources there), since it serves a
+// person reading the state.
 func (s *Server) forgetStaleReplicas(ctx context.Context, resources []apiv1.Resource) {
 	if len(resources) == 0 {
 		return
@@ -47,7 +49,7 @@ func (s *Server) forgetStaleReplicas(ctx context.Context, resources []apiv1.Reso
 	if err != nil {
 		log.FromContext(ctx).Error(err, "list nodes to find which satellite reported each replica; answering the stored replica state")
 
-		return
+		nodes = nil
 	}
 
 	apiv1.ForgetStaleSatelliteState(resources, nodes)

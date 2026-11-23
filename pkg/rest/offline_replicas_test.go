@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -307,4 +309,35 @@ func TestDestroyedKernelResourceReadsUnknownAndFaulty(t *testing.T) {
 	if _, listed := faulty["n2"]; !listed {
 		t.Errorf("?faulty=true does not list the replica with no kernel resource: %v", faulty)
 	}
+}
+
+// nodeListFails is a store whose node list always fails.
+type nodeListFails struct {
+	store.Store
+}
+
+func (s nodeListFails) Nodes() store.NodeStore { return failingNodeList{s.Store.Nodes()} }
+
+type failingNodeList struct {
+	store.NodeStore
+}
+
+func (failingNodeList) List(context.Context) ([]apiv1.Node, error) {
+	return nil, errors.New("node list unavailable")
+}
+
+// Telling a replica's kernel resource is gone takes no node list, so a
+// node list that fails must not bring back the Unused the replica read
+// before; it still answers the other replica as stored.
+func TestDestroyedKernelResourceReadsUnknownWithoutNodeList(t *testing.T) {
+	base, stop := startServerWithStore(t, nodeListFails{seedDestroyedKernelResource(t)})
+	defer stop()
+
+	got := decodeReplicas(t, base+"/v1/view/resources")
+
+	down := got["n2"]
+	assertNoSatelliteState(t, "replica with no kernel resource", &down)
+
+	up := got["n1"]
+	assertSatelliteState(t, "replica on the other node", &up)
 }
