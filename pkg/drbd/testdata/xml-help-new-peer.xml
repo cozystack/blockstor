@@ -1,0 +1,183 @@
+<command name="new-peer">
+	<summary>Make a peer host known to a resource.</summary>
+	<argument>resource</argument>
+	<argument>peer_node_id</argument>
+	<option name="transport" type="string">
+	</option>
+	<option name="load-balance-paths" type="boolean">
+		<default>no</default>
+	</option>
+	<option name="protocol" type="handler">
+		<handler>A</handler>
+		<handler>B</handler>
+		<handler>C</handler>
+	</option>
+	<option name="timeout" type="numeric">
+		<min>1</min>
+		<max>600</max>
+		<default>60</default>
+		<unit_prefix>1</unit_prefix>
+		<unit>1/10 seconds</unit>
+	</option>
+	<option name="max-epoch-size" type="numeric">
+		<min>1</min>
+		<max>20000</max>
+		<default>2048</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="connect-int" type="numeric">
+		<min>1</min>
+		<max>120</max>
+		<default>10</default>
+		<unit_prefix>1</unit_prefix>
+		<unit>seconds</unit>
+	</option>
+	<option name="ping-int" type="numeric">
+		<min>1</min>
+		<max>120</max>
+		<default>10</default>
+		<unit_prefix>1</unit_prefix>
+		<unit>seconds</unit>
+	</option>
+	<option name="sndbuf-size" type="numeric">
+		<min>0</min>
+		<max>134217728</max>
+		<default>0</default>
+		<unit_prefix>1</unit_prefix>
+		<unit>bytes</unit>
+	</option>
+	<option name="rcvbuf-size" type="numeric">
+		<min>0</min>
+		<max>134217728</max>
+		<default>0</default>
+		<unit_prefix>1</unit_prefix>
+		<unit>bytes</unit>
+	</option>
+	<option name="ko-count" type="numeric">
+		<min>0</min>
+		<max>200</max>
+		<default>7</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="allow-two-primaries" type="boolean">
+		<default>no</default>
+	</option>
+	<option name="cram-hmac-alg" type="string">
+	</option>
+	<option name="shared-secret" type="string">
+	</option>
+	<option name="after-sb-0pri" type="handler">
+		<handler>disconnect</handler>
+		<handler>discard-younger-primary</handler>
+		<handler>discard-older-primary</handler>
+		<handler>discard-zero-changes</handler>
+		<handler>discard-least-changes</handler>
+		<handler>discard-local</handler>
+		<handler>discard-remote</handler>
+	</option>
+	<option name="after-sb-1pri" type="handler">
+		<handler>disconnect</handler>
+		<handler>consensus</handler>
+		<handler>discard-secondary</handler>
+		<handler>call-pri-lost-after-sb</handler>
+		<handler>violently-as0p</handler>
+	</option>
+	<option name="after-sb-2pri" type="handler">
+		<handler>disconnect</handler>
+		<handler>call-pri-lost-after-sb</handler>
+		<handler>violently-as0p</handler>
+	</option>
+	<option name="always-asbp" type="boolean">
+		<default>no</default>
+	</option>
+	<option name="rr-conflict" type="handler">
+		<handler>disconnect</handler>
+		<handler>call-pri-lost</handler>
+		<handler>violently</handler>
+		<handler>retry-connect</handler>
+		<handler>auto-discard</handler>
+	</option>
+	<option name="ping-timeout" type="numeric">
+		<min>1</min>
+		<max>300</max>
+		<default>5</default>
+		<unit_prefix>1</unit_prefix>
+		<unit>1/10 seconds</unit>
+	</option>
+	<option name="data-integrity-alg" type="string">
+	</option>
+	<option name="tcp-cork" type="boolean">
+		<default>yes</default>
+	</option>
+	<option name="on-congestion" type="handler">
+		<handler>block</handler>
+		<handler>pull-ahead</handler>
+		<handler>disconnect</handler>
+	</option>
+	<option name="congestion-fill" type="numeric">
+		<min>0</min>
+		<max>20971520</max>
+		<default>0</default>
+		<unit_prefix>s</unit_prefix>
+		<unit>bytes</unit>
+	</option>
+	<option name="congestion-extents" type="numeric">
+		<min>67</min>
+		<max>65534</max>
+		<default>1237</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="csums-alg" type="string">
+	</option>
+	<option name="csums-after-crash-only" type="boolean">
+		<default>no</default>
+	</option>
+	<option name="verify-alg" type="string">
+	</option>
+	<option name="use-rle" type="boolean">
+		<default>yes</default>
+	</option>
+	<option name="socket-check-timeout" type="numeric">
+		<min>0</min>
+		<max>300</max>
+		<default>0</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="fencing" type="handler">
+		<handler>dont-care</handler>
+		<handler>resource-only</handler>
+		<handler>resource-and-stonith</handler>
+	</option>
+	<option name="max-buffers" type="numeric">
+		<min>32</min>
+		<max>131072</max>
+		<default>2048</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="allow-remote-read" type="boolean">
+		<default>yes</default>
+	</option>
+	<option name="tls" type="boolean">
+		<default>no</default>
+	</option>
+	<option name="tls-keyring" type="string">
+	</option>
+	<option name="tls-privkey" type="string">
+	</option>
+	<option name="tls-certificate" type="string">
+	</option>
+	<option name="rdma-ctrl-rcvbuf-size" type="numeric">
+		<min>0</min>
+		<max>10485760</max>
+		<default>0</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="rdma-ctrl-sndbuf-size" type="numeric">
+		<min>0</min>
+		<max>10485760</max>
+		<default>0</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="_name" type="string">
+	</option>
+</command>

@@ -505,3 +505,39 @@ func TestApplyBug028FalseLatchRetryRefusedWhenFsPresent(t *testing.T) {
 
 	assertNoPromoteNoMkfs(t, fx.CommandLines())
 }
+
+// TestApplyResultCarriesTheOptionsLeftOutOfTheRes: an option the .res left
+// out goes back on the apply result, whatever path the apply ends on, so
+// the c-r reconciler can raise a Warning Event for it on the Resource.
+func TestApplyResultCarriesTheOptionsLeftOutOfTheRes(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	device := expectThinBacking(fx, "pvc-typo")
+	fx.Expect("drbdsetup status pvc-typo --json",
+		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-typo"))})
+	expectGetGI(fx, "pvc-typo", device, "2BCB1C8F00B058AE")
+
+	rec := newThinReconciler(fx, dir)
+
+	drs := bug028WinnerDR("pvc-typo", "6530")
+	drs[0].DrbdOptions["DrbdOptions/AutoSnapshot/Keep"] = "2"
+
+	results, err := rec.Apply(t.Context(), drs)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || len(results[0].DroppedOptions) != 1 ||
+		!strings.Contains(results[0].DroppedOptions[0], "DrbdOptions/AutoSnapshot/Keep") {
+		t.Fatalf("apply result does not report the key left out of the .res: %+v", results)
+	}
+
+	again, err := rec.Apply(t.Context(), bug028WinnerDR("pvc-typo", "6530"))
+	if err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	if len(again[0].DroppedOptions) != 0 {
+		t.Errorf("a later apply without the key still reports it: %q", again[0].DroppedOptions)
+	}
+}

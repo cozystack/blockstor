@@ -134,7 +134,9 @@ func TestAnAcceptedResBodyIsCheckedThenInstalled(t *testing.T) {
 func expectXMLHelp(t *testing.T, fx *storage.FakeExec) {
 	t.Helper()
 
-	for _, cmd := range drbd.DiskSectionCommands() {
+	commands := append(drbd.DiskSectionCommands(), "new-peer", "resource-options")
+
+	for _, cmd := range commands {
 		doc, err := os.ReadFile(filepath.Join("..", "drbd", "testdata", "xml-help-"+cmd+".xml"))
 		if err != nil {
 			t.Fatal(err)
@@ -217,5 +219,90 @@ func TestDeleteResourceRemovesALeftoverCandidateRes(t *testing.T) {
 		if strings.HasPrefix(e.Name(), "pvc-gone.") {
 			t.Errorf("%s outlived the resource's delete", e.Name())
 		}
+	}
+}
+
+// A key under a DrbdOptions section no .res block takes, such as the typo
+// DrbdOptions/AutoSnapshot/Keep stored on a definition before REST checked
+// keys, used to land in options{}, where drbdadm refused the whole file and
+// every replica failed each apply until it was deleted. It is left out,
+// and so is an option or value this node's drbd-utils refuses in any
+// section, as LINSTOR's satellite does; the rest of the file lands, and
+// the apply result says what went.
+func TestAnOptionDrbdadmWouldRefuseIsLeftOutOfEverySection(t *testing.T) {
+	t.Parallel()
+
+	rec, fx, dir := checkedReconciler(t, "pvc-typo", nil)
+	expectXMLHelp(t, fx)
+
+	dr, devices := renderResFileFixture("pvc-typo")
+	dr.DrbdOptions["DrbdOptions/AutoSnapshot/Keep"] = "2"
+	dr.DrbdOptions["DrbdOptions/Resource/some-future-option"] = "1"
+	dr.DrbdOptions["DrbdOptions/Resource/on-no-quorum"] = "explode"
+	dr.DrbdOptions["DrbdOptions/Resource/quorum"] = "majority"
+	dr.DrbdOptions["DrbdOptions/Net/max-buffers"] = "8"
+	dr.DrbdOptions["DrbdOptions/Net/verify-alg"] = "crc32c"
+	dr.DrbdOptions["DrbdOptions/PeerDevice/c-max-rate"] = "100"
+	dr.DrbdOptions["DrbdOptions/PeerDevice/resync-rate"] = "250M"
+	dr.DrbdOptions["DrbdOptions/Handlers/no-such-handler"] = "/bin/true"
+	dr.DrbdOptions["DrbdOptions/Handlers/fence-peer"] = "/bin/true"
+
+	if err := rec.renderResFile(context.Background(), dr, devices); err != nil {
+		t.Fatalf("renderResFile: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "pvc-typo.res"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, gone := range []string{"Keep", "some-future-option", "explode", "max-buffers", "c-max-rate", "no-such-handler"} {
+		if strings.Contains(string(body), gone) {
+			t.Errorf(".res still carries %s, which drbdadm would refuse:\n%s", gone, body)
+		}
+	}
+
+	for _, kept := range []string{"quorum majority;", "verify-alg", "resync-rate 250M;", "fence-peer"} {
+		if !strings.Contains(string(body), kept) {
+			t.Errorf(".res lost %q, which drbdadm accepts:\n%s", kept, body)
+		}
+	}
+
+	dropped := rec.takeDroppedOptions("pvc-typo")
+	if len(dropped) != 6 {
+		t.Errorf("dropped options reported: got %d, want 6: %q", len(dropped), dropped)
+	}
+
+	if len(dropped) == 0 || !strings.Contains(dropped[0], "DrbdOptions/AutoSnapshot/Keep") {
+		t.Errorf("the key no section takes is not reported first: %q", dropped)
+	}
+}
+
+// A satellite whose drbdsetup cannot describe its options still leaves
+// out a key no .res section takes: that needs no schema, and drbdadm
+// refuses it whatever its version.
+func TestAKeyNoSectionTakesIsLeftOutWithoutASchema(t *testing.T) {
+	t.Parallel()
+
+	dr, devices := renderResFileFixture("pvc-typo")
+	dr.DrbdOptions["DrbdOptions/AutoSnapshot/Keep"] = "2"
+	dr.DrbdOptions["DrbdOptions/Net/nested/key"] = "1"
+	dr.DrbdOptions["DrbdOptions/Resource/on-no-quorum"] = "suspend-io"
+
+	body, dropped, err := buildResFileChecked(dr, "n1", "10.0.0.1", devices, nil, nil, resOptionSchemas{})
+	if err != nil {
+		t.Fatalf("buildResFileChecked: %v", err)
+	}
+
+	if strings.Contains(body, "Keep") || strings.Contains(body, "nested") {
+		t.Errorf(".res carries a key no section takes:\n%s", body)
+	}
+
+	if !strings.Contains(body, "on-no-quorum suspend-io;") {
+		t.Errorf(".res lost on-no-quorum:\n%s", body)
+	}
+
+	if len(dropped) != 2 {
+		t.Errorf("dropped: got %q, want the two keys", dropped)
 	}
 }

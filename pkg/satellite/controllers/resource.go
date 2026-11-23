@@ -546,6 +546,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	}
 
 	anyFailed := r.recordPerResourceFailures(res, results, logger)
+	r.recordDroppedOptions(res, results)
 
 	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
@@ -660,6 +661,29 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 	}
 
 	return anyFailed
+}
+
+// droppedOptionReason is the Event reason for an option the satellite left
+// out of a replica's .res.
+const droppedOptionReason = "DrbdOptionIgnored"
+
+// recordDroppedOptions reports each option the satellite left out of the
+// replica's .res as a Warning Event on the Resource. The option is one
+// drbdadm would refuse, so leaving it out keeps the rest of the
+// configuration applying, but the operator set it and it does not take
+// effect; a satellite log line is not where they would look for why. The
+// recorder folds a repeat of the same Event into its count.
+func (r *ResourceReconciler) recordDroppedOptions(res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult) {
+	if r.Config.Recorder == nil {
+		return
+	}
+
+	for _, result := range results {
+		for _, why := range result.DroppedOptions {
+			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, droppedOptionReason, "Apply",
+				"option left out of the .res, drbdadm would refuse it: %s", why)
+		}
+	}
 }
 
 // deviceHoldsDataReason is the Event reason for a LUKS format refused over

@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -119,13 +120,29 @@ func TestNilOptionSchemaAcceptsEverything(t *testing.T) {
 	}
 }
 
-// DiskOptionSchema asks drbdsetup once and keeps the answer, but a
-// failure is not kept: the next render asks again.
+// DiskOptionSchema asks drbdsetup once and keeps the answer. A failure is
+// kept for a minute, so a node whose drbdsetup cannot answer does not run
+// the failing calls again on every render, and is asked again after it.
 func TestAdmDiskOptionSchemaIsReadOnceFromDrbdsetup(t *testing.T) {
 	t.Parallel()
 
 	fx := storage.NewFakeExec()
 	adm := drbd.NewAdm(fx)
+
+	clock := time.Date(2026, 11, 22, 0, 0, 0, 0, time.UTC)
+	drbd.SetAdmClock(adm, func() time.Time { return clock })
+
+	asked := func() int {
+		n := 0
+
+		for _, line := range fx.CommandLines() {
+			if line == "drbdsetup xml-help new-minor" {
+				n++
+			}
+		}
+
+		return n
+	}
 
 	if _, err := adm.DiskOptionSchema(t.Context()); err == nil {
 		t.Fatal("DiskOptionSchema with a silent drbdsetup succeeded")
@@ -135,10 +152,22 @@ func TestAdmDiskOptionSchemaIsReadOnceFromDrbdsetup(t *testing.T) {
 		fx.Expect("drbdsetup xml-help "+cmd, storage.FakeResponse{Stdout: xmlHelp(t)[i]})
 	}
 
+	clock = clock.Add(drbd.SchemaRetryAfter - time.Second)
+
+	if _, err := adm.DiskOptionSchema(t.Context()); err == nil {
+		t.Fatal("a failed read was not kept: DiskOptionSchema succeeded inside the retry window")
+	}
+
+	if got := asked(); got != 1 {
+		t.Fatalf("drbdsetup xml-help new-minor asked %d times inside the retry window, want 1", got)
+	}
+
+	clock = clock.Add(time.Second)
+
 	for range 2 {
 		schema, err := adm.DiskOptionSchema(t.Context())
 		if err != nil {
-			t.Fatalf("DiskOptionSchema: %v", err)
+			t.Fatalf("DiskOptionSchema after the retry window: %v", err)
 		}
 
 		if err := schema.Check("block-size", "4096"); err != nil {
@@ -146,17 +175,62 @@ func TestAdmDiskOptionSchemaIsReadOnceFromDrbdsetup(t *testing.T) {
 		}
 	}
 
-	asked := 0
+	// Once for the failed try, once after the window, never again.
+	if got := asked(); got != 2 {
+		t.Errorf("drbdsetup xml-help new-minor asked %d times, want 2 (failure kept, success kept)", got)
+	}
+}
 
-	for _, line := range fx.CommandLines() {
-		if line == "drbdsetup xml-help new-minor" {
-			asked++
+// Each section is held against the drbdsetup commands that describe it:
+// net against new-peer, the resource options block against
+// resource-options. A section xml-help does not describe has no schema.
+func TestAdmOptionSchemaPerSection(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	for _, cmd := range []string{"new-peer", "resource-options"} {
+		doc, err := os.ReadFile(filepath.Join("testdata", "xml-help-"+cmd+".xml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fx.Expect("drbdsetup xml-help "+cmd, storage.FakeResponse{Stdout: doc})
+	}
+
+	cases := []struct {
+		section, name, value string
+		ok                   bool
+	}{
+		{drbd.SectionNet, "max-buffers", "8000", true},
+		{drbd.SectionNet, "max-buffers", "8", false},
+		{drbd.SectionNet, "verify-alg", "crc32c", true},
+		{drbd.SectionNet, "quorum", "majority", false}, // a resource option
+		{drbd.SectionOptions, "quorum", "majority", true},
+		{drbd.SectionOptions, "quorum", "2", true},
+		{drbd.SectionOptions, "on-no-quorum", "explode", false},
+		{drbd.SectionOptions, "Keep", "2", false},
+	}
+
+	for _, tc := range cases {
+		schema, err := adm.OptionSchema(t.Context(), tc.section)
+		if err != nil {
+			t.Fatalf("OptionSchema(%s): %v", tc.section, err)
+		}
+
+		err = schema.Check(tc.name, tc.value)
+		if tc.ok && err != nil {
+			t.Errorf("%s: Check(%s, %s) = %v, want accepted", tc.section, tc.name, tc.value, err)
+		}
+
+		if !tc.ok && !errors.Is(err, drbd.ErrOptionRejected) {
+			t.Errorf("%s: Check(%s, %s) = %v, want ErrOptionRejected", tc.section, tc.name, tc.value, err)
 		}
 	}
 
-	// Once for the try whose empty answers failed to parse, once for the
-	// success, and never again.
-	if asked != 2 {
-		t.Errorf("drbdsetup xml-help new-minor asked %d times, want 2 (failure retried, success kept)", asked)
+	handlers, err := adm.OptionSchema(t.Context(), drbd.SectionHandlers)
+	if err != nil || handlers != nil {
+		t.Errorf("handlers schema = %v, %v; want none", handlers, err)
 	}
 }
