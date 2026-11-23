@@ -30,10 +30,12 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -810,10 +812,118 @@ func TestNewDRBDWorkaroundsRunnableWiresConfigHintsAndHold(t *testing.T) {
 
 	release()
 
-	// A zero interval registers nothing (and touches no manager).
+	// A zero interval registers nothing.
+	mgr := &logManager{}
+
 	off := &DRBDWorkaroundsRunnable{}
-	if err := off.RegisterWithManager(nil); err != nil {
+	if err := off.RegisterWithManager(mgr); err != nil {
 		t.Errorf("zero interval: %v", err)
+	}
+
+	if len(mgr.added) != 0 {
+		t.Errorf("zero interval added %d runnables", len(mgr.added))
+	}
+}
+
+// logManager is a manager that records the runnables added to it and the
+// lines logged through its logger; every other method panics.
+type logManager struct {
+	manager.Manager
+
+	added []manager.Runnable
+	lines []string
+}
+
+func (m *logManager) Add(r manager.Runnable) error {
+	m.added = append(m.added, r)
+
+	return nil
+}
+
+func (m *logManager) GetLogger() logr.Logger {
+	return funcr.New(func(prefix, args string) {
+		m.lines = append(m.lines, prefix+" "+args)
+	}, funcr.Options{Verbosity: 1})
+}
+
+// The satellite says at start which DRBD workarounds it runs and how
+// often, since a check logs nothing until it acts.
+func TestWorkaroundsLogTheirStateAtStart(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultWorkaroundsConfig()
+	cfg.IdlePrimary = false
+
+	for _, tc := range []struct {
+		name string
+		cfg  WorkaroundsConfig
+		want string
+		runs int
+	}{
+		{
+			name: "enabled",
+			cfg:  cfg,
+			want: `"msg"="DRBD workarounds enabled" "interval"="30s" "stalledResync"=true "stalledResyncPasses"=4 ` +
+				`"idlePrimary"=false "forcedIOFailures"=true "staleLoopDevices"=true`,
+			runs: 1,
+		},
+		{
+			name: "disabled",
+			cfg:  WorkaroundsConfig{},
+			want: `"msg"="DRBD workarounds disabled" "interval"="0s"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			mgr := &logManager{}
+
+			err := (&DRBDWorkaroundsRunnable{Config: tc.cfg}).RegisterWithManager(mgr)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(mgr.added) != tc.runs {
+				t.Errorf("added %d runnables, want %d", len(mgr.added), tc.runs)
+			}
+
+			if len(mgr.lines) != 1 || !strings.HasPrefix(mgr.lines[0], "drbd-workarounds ") ||
+				!strings.Contains(mgr.lines[0], tc.want) {
+				t.Errorf("logged %q, want one drbd-workarounds line with %s", mgr.lines, tc.want)
+			}
+		})
+	}
+}
+
+// Every pass says at V(1) whether it read the kernel status, so an idle
+// node running no command is visible in the log.
+func TestWorkaroundPassLogsWhetherItReadTheKernel(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{status: stalledStatus("42.17")}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	hints := WorkaroundHints{}
+	w.Hints = func() WorkaroundHints { return hints }
+
+	mgr := &logManager{}
+
+	w.pass(t.Context(), mgr.GetLogger())
+
+	hints.Inconsistent = true
+	w.pass(t.Context(), mgr.GetLogger())
+
+	var passes []string
+
+	for _, line := range mgr.lines {
+		if strings.Contains(line, `"msg"="DRBD workarounds pass"`) {
+			passes = append(passes, line)
+		}
+	}
+
+	if len(passes) != 2 || !strings.Contains(passes[0], `"kernelStatusRead"=false`) ||
+		!strings.Contains(passes[1], `"kernelStatusRead"=true`) || !strings.Contains(passes[0], `"level"=1`) {
+		t.Errorf("pass lines = %q, want a V(1) line without and then with the kernel read", passes)
 	}
 }
 

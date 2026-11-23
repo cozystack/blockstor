@@ -104,6 +104,25 @@ func DefaultWorkaroundsConfig() WorkaroundsConfig {
 	}
 }
 
+// logState logs at start which checks run and how often. A check logs
+// nothing until it acts, so without this line nothing in the log tells
+// whether a satellite runs a check at all.
+func (c WorkaroundsConfig) logState(logger logr.Logger) {
+	if c.Interval <= 0 {
+		logger.Info("DRBD workarounds disabled", "interval", c.Interval.String())
+
+		return
+	}
+
+	logger.Info("DRBD workarounds enabled",
+		"interval", c.Interval.String(),
+		"stalledResync", c.StalledResync,
+		"stalledResyncPasses", c.StalledResyncPasses,
+		"idlePrimary", c.IdlePrimary,
+		"forcedIOFailures", c.ForcedIOFailures,
+		"staleLoopDevices", c.StaleLoopDevices)
+}
+
 // workaroundAdm is the part of drbd.Adm the workarounds drive.
 type workaroundAdm interface {
 	KernelStatus(ctx context.Context) ([]drbd.KernelResource, error)
@@ -198,8 +217,11 @@ func (w *DRBDWorkaroundsRunnable) Start(ctx context.Context) error {
 	}
 }
 
-// RegisterWithManager adds the runnable to mgr when Config.Interval is set.
+// RegisterWithManager adds the runnable to mgr when Config.Interval is
+// set, and logs which checks the satellite runs either way.
 func (w *DRBDWorkaroundsRunnable) RegisterWithManager(mgr manager.Manager) error {
+	w.Config.logState(mgr.GetLogger().WithName("drbd-workarounds"))
+
 	if w.Config.Interval <= 0 {
 		return nil
 	}
@@ -220,7 +242,10 @@ func (w *DRBDWorkaroundsRunnable) pass(ctx context.Context, logger logr.Logger) 
 
 	w.bringUpOwed(ctx, logger)
 
-	if !w.kernelStatusWanted() {
+	wanted := w.kernelStatusWanted()
+	logger.V(1).Info("DRBD workarounds pass", "kernelStatusRead", wanted)
+
+	if !wanted {
 		w.stalls, w.idle, w.failingIO = nil, nil, nil
 
 		return
