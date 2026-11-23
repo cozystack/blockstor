@@ -330,15 +330,15 @@ func TestSnapshotCreateWaitIsBounded(t *testing.T) {
 	}
 }
 
-// trailingCacheStore hides a snapshot from Get for a while after its create, the
+// takeWaitLagStore hides a snapshot from Get for a while after its create, the
 // way the informer cache trails a write.
-type trailingCacheStore struct {
+type takeWaitLagStore struct {
 	store.Store
 
 	snaps *trailingCacheSnapshots
 }
 
-func (l trailingCacheStore) Snapshots() store.SnapshotStore { return l.snaps }
+func (l takeWaitLagStore) Snapshots() store.SnapshotStore { return l.snaps }
 
 type trailingCacheSnapshots struct {
 	store.SnapshotStore
@@ -375,7 +375,7 @@ func TestSnapshotCreateWaitsOutACacheThatTrailsTheCreate(t *testing.T) {
 	t.Parallel()
 
 	inner := store.NewInMemory()
-	st := trailingCacheStore{Store: inner, snaps: &trailingCacheSnapshots{SnapshotStore: inner.Snapshots()}}
+	st := takeWaitLagStore{Store: inner, snaps: &trailingCacheSnapshots{SnapshotStore: inner.Snapshots()}}
 	base := startTakeWaitServer(t, st, 10*time.Second)
 	settleAfterTake(t, inner, apiv1.SnapshotFlagSuccessful)
 
