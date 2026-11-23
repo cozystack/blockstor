@@ -207,18 +207,15 @@ func nextTiebreakerDeadline(rd *blockstoriov1alpha1.ResourceDefinition, now time
 		found    bool
 	)
 
-	deadlines := make([]time.Time, 0, 3)
+	// The witness waits for the last placement still holding the RD.
+	held, _ := apiv1.PlacementInProgressUntil(rd.Annotations, now)
+	deadlines := []time.Time{held}
 
 	for _, key := range []string{apiv1.AutoTiebreakerSuppressedUntilAnnotation, apiv1.KeepTiebreakerUntilAnnotation} {
 		deadline, err := time.Parse(time.RFC3339, rd.Annotations[key])
 		if err == nil {
 			deadlines = append(deadlines, deadline)
 		}
-	}
-
-	// The witness waits for the last placement still holding the RD.
-	if held, ok := apiv1.PlacementInProgressUntil(rd.Annotations, now); ok {
-		deadlines = append(deadlines, held)
 	}
 
 	for _, deadline := range deadlines {
