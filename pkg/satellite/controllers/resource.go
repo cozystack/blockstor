@@ -47,6 +47,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/luks"
@@ -144,12 +145,19 @@ type ResourceReconciler struct {
 	Config Config
 }
 
-// Reconcile reads a Resource and drives the satellite-side
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Reconcile.
+func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return conflict.Reconcile(ctx, req, r.ReconcilePass) //nolint:wrapcheck // the pass's own error, already wrapped
+}
+
+// ReconcilePass reads a Resource and drives the satellite-side
 // apply chain when the Resource is placed on this node.
 // Finalizer-aware: stamps `SatelliteResourceFinalizer` on
 // every live Resource so kube-apiserver waits for our tear-down
 // before allowing the object to disappear.
-func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("resource", req.Name)
 
 	var res blockstoriov1alpha1.Resource

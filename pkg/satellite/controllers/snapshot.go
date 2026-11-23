@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
@@ -68,14 +69,21 @@ type SnapshotReconciler struct {
 	Config Config
 }
 
-// Reconcile handles the satellite-side snapshot lifecycle:
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Reconcile.
+func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return conflict.Reconcile(ctx, req, r.ReconcilePass) //nolint:wrapcheck // the pass's own error, already wrapped
+}
+
+// ReconcilePass handles the satellite-side snapshot lifecycle:
 // create on first appearance, delete on `DeletionTimestamp`.
 // Finalizer-aware: stamps `SatelliteSnapshotFinalizer` on
 // every observed Snapshot scoped to this node so kube-apiserver
 // waits for our `DeleteSnapshot` before allowing the CRD to
 // disappear. Idempotent — re-runs on a snapshot that already
 // exists are safe.
-func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("snapshot", req.Name)
 
 	var snap blockstoriov1alpha1.Snapshot

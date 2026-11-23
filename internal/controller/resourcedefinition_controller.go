@@ -41,6 +41,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -99,9 +100,16 @@ type ResourceDefinitionReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile ensures the tiebreaker for a 2-replica RD. Idempotent:
-// re-running on an RD that already has its tiebreaker is a no-op.
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Reconcile.
 func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return conflict.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass ensures the tiebreaker for a 2-replica RD. Idempotent:
+// re-running on an RD that already has its tiebreaker is a no-op.
+func (r *ResourceDefinitionReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if r.Store == nil {

@@ -402,8 +402,8 @@ func TestPinLayerStackDoesNotOverwriteARacingWriter(t *testing.T) {
 	})
 
 	got := reconcilePin(t, cli)
-	if got.err == nil {
-		t.Fatal("reconcile succeeded over a racing writer")
+	if got.err != nil || !got.result.Requeue { //nolint:staticcheck // the rate-limited retry an error would get
+		t.Fatalf("reconcile: %+v, %v, want the lost race retried without an error", got.result, got.err)
 	}
 
 	if !slices.Equal(got.rd.Spec.LayerStack, []string{"DRBD", "STORAGE"}) {
