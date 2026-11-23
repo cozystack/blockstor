@@ -247,9 +247,9 @@ func TestOfflineNodeReplicaIsFaulty(t *testing.T) {
 
 // seedDestroyedKernelResource stores a two-replica definition on two
 // ONLINE nodes whose second replica lost its DRBD kernel resource
-// (`drbdsetup down`, or a bring-up that keeps failing): the satellite
-// left a cleared status that still reads Secondary, and the
-// KernelLoaded Condition False.
+// after it had been up (`drbdsetup down`): the destroy frames left no
+// disk state and no peer link, the role still reads Secondary, and the
+// KernelLoaded Condition is False.
 func seedDestroyedKernelResource(t *testing.T) store.Store {
 	t.Helper()
 
