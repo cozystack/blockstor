@@ -619,3 +619,271 @@ func TestObserverWritesADumpThatNeverEnds(t *testing.T) {
 		return healthyStatus(&status) && status.Connections[0].PeerVolumes[0].PeerDiskState == "Outdated"
 	})
 }
+
+// A dump taken as ended may still send the rest of its lines. The
+// change kept back behind it is replayed when the dump is taken as
+// ended, and the dump's own line for the same object, older than the
+// change, must not go over it when it comes after all.
+func TestObserverKeepsAReplayedChangeOverALateDumpLine(t *testing.T) {
+	cli := startStatusEnvtest(t)
+	name := createStatusReplica(t, cli)
+
+	lines := strings.SplitAfter(healthyDump, "\n")
+
+	const change = "change peer-device name:pvc-status peer-node-id:1 conn-name:n2 volume:0 " +
+		"replication:Established peer-disk:Outdated\n"
+
+	const quiet = 200 * time.Millisecond
+
+	live, feed := io.Pipe()
+
+	o := &ObserverRunnable{
+		Client:            cli,
+		Exec:              storage.NewFakeExec(),
+		NodeName:          statusTestNode,
+		initialStateQuiet: quiet,
+		startEvents2: func(context.Context) (*drbd.Watcher, func(), error) {
+			go func() {
+				_, _ = io.WriteString(feed, lines[0]+change)
+				time.Sleep(3 * quiet)
+				_, _ = io.WriteString(feed, strings.Join(lines[1:], ""))
+			}()
+
+			return drbd.NewWatcher(live), func() {}, nil
+		},
+	}
+
+	runObserver(t, o, feed)
+
+	waitFor(t, "the rest of the dump written", func() bool {
+		status := getStatusReplica(t, cli, name)
+
+		return healthyStatus(&status)
+	})
+
+	// Let a pass carrying a later frame, if any, land.
+	time.Sleep(300 * time.Millisecond)
+
+	status := getStatusReplica(t, cli, name)
+	if got := status.Connections[0].PeerVolumes[0].PeerDiskState; got != "Outdated" {
+		t.Fatalf("peer disk %q: the dump's late, older line went over the replayed change", got)
+	}
+}
+
+// A replica the ended stream knew is written as gone only once the new
+// dump has ended without it. A dump taken as ended before it restated
+// the replica has not said that, and a healthy replica must not be
+// cleared for the time the rest of the dump takes.
+func TestObserverClearsNothingForADumpTakenAsEnded(t *testing.T) {
+	base := startStatusEnvtest(t)
+	name := createStatusReplica(t, base)
+
+	var applies statusApplies
+
+	cli := recordStatusApplies(base, &applies, nil)
+
+	firstEnded := &closeOnce{ch: make(chan struct{})}
+	live, feed := io.Pipe()
+	t.Cleanup(func() { _ = feed.Close() })
+
+	var starts atomic.Int64
+
+	const quiet = 200 * time.Millisecond
+
+	o := &ObserverRunnable{
+		Client:            cli,
+		Exec:              storage.NewFakeExec(),
+		NodeName:          statusTestNode,
+		restartDelay:      10 * time.Millisecond,
+		initialStateQuiet: quiet,
+		startEvents2: func(context.Context) (*drbd.Watcher, func(), error) {
+			if starts.Add(1) == 1 {
+				first, firstFeed := io.Pipe()
+
+				go func() {
+					_, _ = io.WriteString(firstFeed, healthyDump)
+					<-firstEnded.ch
+					_ = firstFeed.Close()
+				}()
+
+				return drbd.NewWatcher(first), func() {}, nil
+			}
+
+			return drbd.NewWatcher(live), func() {}, nil
+		},
+	}
+
+	runObserver(t, o, firstEnded, feed)
+
+	waitFor(t, "the first stream's state on the replica", func() bool {
+		status := getStatusReplica(t, base, name)
+
+		return healthyStatus(&status)
+	})
+
+	before := len(applies.snapshot())
+
+	_ = firstEnded.Close()
+
+	waitFor(t, "the second stream", func() bool { return starts.Load() > 1 })
+
+	// Long enough for the new dump to be taken as ended and for a
+	// pass to write whatever that owed.
+	time.Sleep(5 * quiet)
+
+	_, err := io.WriteString(feed, healthyDump)
+	if err != nil {
+		t.Fatalf("feed: %v", err)
+	}
+
+	waitFor(t, "a write after the new dump", func() bool { return len(applies.snapshot()) > before })
+
+	// Let a pass clearing departed replicas, if any, land.
+	time.Sleep(300 * time.Millisecond)
+
+	for _, sent := range applies.snapshot()[before:] {
+		if !healthyStatus(&sent) {
+			t.Fatalf("a dump taken as ended cleared a replica it had not reached: %+v", sent)
+		}
+	}
+
+	status := getStatusReplica(t, base, name)
+	if meta.IsStatusConditionFalse(status.Conditions, blockstoriov1alpha1.ConditionKernelLoaded) {
+		t.Fatalf("a dump taken as ended stamped KernelLoaded=False on a replica it had not reached")
+	}
+}
+
+// Changes kept back behind the dump show the stream is alive. A dump
+// interleaved with them for longer than the quiet period is not taken
+// as ended while they come, and nothing is written before its end line.
+func TestObserverWaitsForADumpWhileChangesCome(t *testing.T) {
+	base := startStatusEnvtest(t)
+	name := createStatusReplica(t, base)
+
+	var applies statusApplies
+
+	cli := recordStatusApplies(base, &applies, nil)
+
+	firstEnded := &closeOnce{ch: make(chan struct{})}
+	live, feed := io.Pipe()
+	t.Cleanup(func() { _ = feed.Close() })
+
+	var starts atomic.Int64
+
+	const quiet = 300 * time.Millisecond
+
+	o := &ObserverRunnable{
+		Client:            cli,
+		Exec:              storage.NewFakeExec(),
+		NodeName:          statusTestNode,
+		restartDelay:      10 * time.Millisecond,
+		initialStateQuiet: quiet,
+		startEvents2: func(context.Context) (*drbd.Watcher, func(), error) {
+			if starts.Add(1) == 1 {
+				first, firstFeed := io.Pipe()
+
+				go func() {
+					_, _ = io.WriteString(firstFeed, healthyDump)
+					<-firstEnded.ch
+					_ = firstFeed.Close()
+				}()
+
+				return drbd.NewWatcher(first), func() {}, nil
+			}
+
+			return drbd.NewWatcher(live), func() {}, nil
+		},
+	}
+
+	runObserver(t, o, firstEnded, feed)
+
+	waitFor(t, "the first stream's state on the replica", func() bool {
+		status := getStatusReplica(t, base, name)
+
+		return healthyStatus(&status)
+	})
+
+	before := len(applies.snapshot())
+
+	_ = firstEnded.Close()
+
+	lines := strings.SplitAfter(healthyDump, "\n")
+
+	_, err := io.WriteString(feed, lines[0])
+	if err != nil {
+		t.Fatalf("feed: %v", err)
+	}
+
+	const change = "change resource name:pvc-status role:Secondary suspended:no\n"
+
+	for range 10 {
+		time.Sleep(quiet / 3)
+
+		_, err = io.WriteString(feed, change)
+		if err != nil {
+			t.Fatalf("feed: %v", err)
+		}
+	}
+
+	if got := applies.snapshot()[before:]; len(got) != 0 {
+		t.Fatalf("status written while the dump was still coming: %+v", got)
+	}
+
+	_, err = io.WriteString(feed, strings.Join(lines[1:], ""))
+	if err != nil {
+		t.Fatalf("feed: %v", err)
+	}
+
+	waitFor(t, "a write after the new dump", func() bool { return len(applies.snapshot()) > before })
+
+	for _, sent := range applies.snapshot()[before:] {
+		if !healthyStatus(&sent) {
+			t.Fatalf("a partial view of a healthy replica was written: %+v", sent)
+		}
+	}
+}
+
+// A dump taken as ended clears nothing, but its end line, once it comes
+// after all, tells what went away while no stream ran: a replica the
+// ended stream knew and the dump left out is then written as gone.
+func TestObserverClearsAResourceALateDumpLeftOut(t *testing.T) {
+	cli := startStatusEnvtest(t)
+	name := createStatusReplica(t, cli)
+
+	var starts atomic.Int64
+
+	const quiet = 200 * time.Millisecond
+
+	live, feed := io.Pipe()
+	t.Cleanup(func() { _ = feed.Close() })
+
+	o := &ObserverRunnable{
+		Client:            cli,
+		Exec:              storage.NewFakeExec(),
+		NodeName:          statusTestNode,
+		restartDelay:      10 * time.Millisecond,
+		initialStateQuiet: quiet,
+		startEvents2: func(context.Context) (*drbd.Watcher, func(), error) {
+			if starts.Add(1) == 1 {
+				return drbd.NewWatcher(strings.NewReader(healthyDump)), func() {}, nil
+			}
+
+			go func() {
+				time.Sleep(3 * quiet)
+				_, _ = io.WriteString(feed, "exists -\n")
+			}()
+
+			return drbd.NewWatcher(live), func() {}, nil
+		},
+	}
+
+	runObserver(t, o, feed)
+
+	waitFor(t, "the departed resource cleared", func() bool {
+		status := getStatusReplica(t, cli, name)
+
+		return starts.Load() > 1 && len(status.Connections) == 0 &&
+			len(status.Volumes) == 1 && status.Volumes[0].DiskState == "" &&
+			meta.IsStatusConditionFalse(status.Conditions, blockstoriov1alpha1.ConditionKernelLoaded)
+	})
+}

@@ -20,6 +20,7 @@ package controllers
 
 import (
 	"context"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -145,6 +146,16 @@ type volumeObservation struct {
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
+
+	// SyncPeer is the peer a peer-device frame's out-of-sync count is
+	// about (its `conn-name`).
+	SyncPeer string
+	// PeerOutOfSync is the cached count per peer; OutOfSyncKib is its
+	// largest. Kept in the cache only: with the count of whichever
+	// peer's frame came last, a replica with one peer in sync and one
+	// not flipped between zero and the count on every statistics
+	// frame, and each flip was a status write.
+	PeerOutOfSync map[string]int64
 
 	// Removed is an internal marker set by translateDeviceEvent for
 	// `destroy device` frames (drbdsetup emits one after a volume is
@@ -514,10 +525,14 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 
 	out := observation{ResourceName: name}
 
+	peer := ev.Fields["conn-name"]
+
 	//nolint:gosec // drbd-9 volume numbers fit in int32
 	out.Volumes = peerDeviceVolumeObservation(ev, int32(volNum))
+	for i := range out.Volumes {
+		out.Volumes[i].SyncPeer = peer
+	}
 
-	peer := ev.Fields["conn-name"]
 	if peer != "" {
 		conn := connectionObservation{
 			PeerNodeName:   peer,
@@ -605,6 +620,9 @@ const (
 	// where the local `device` frame's `disk:UpToDate` is missing or
 	// stale on a Secondary SyncSource (see peerDeviceVolumeObservation).
 	drbdReplStateSyncSource = "SyncSource"
+	// drbdReplStateSyncTarget is the per-peer replication-state token
+	// of the replica a resync is writing to.
+	drbdReplStateSyncTarget = "SyncTarget"
 	// drbdDiskStateUpToDate is the DRBD-9 device disk_state token
 	// meaning the local replica holds a complete, current copy. Used
 	// as the value the SyncSource invariant stamps onto the local
@@ -793,14 +811,29 @@ type appliedStatus struct {
 	uid             types.UID
 	resourceVersion string
 	status          blockstoriov1alpha1.ResourceStatus
+	at              time.Time
 }
+
+// outOfSyncRefresh is how long a replica whose only change is the
+// size of a non-zero out-of-sync count goes without a status write.
+// DRBD moves that count on every write to a volume whose bitmap a
+// peer never cleared, with both sides UpToDate and nothing else
+// changing, and the statistics frames carrying it arrive every few
+// seconds: written each time, a few such volumes were most of an
+// idle satellite's API requests. LINSTOR does not keep the count at
+// all. Going to or from zero is written at once, and so is any
+// other change, which carries the current count with it. A volume
+// that is not UpToDate, or a replica resyncing with a peer, writes
+// every change: the REST view and the CLI render the count as the
+// percentage in `SyncTarget(NN%)` / `Inconsistent(NN%)`.
+const outOfSyncRefresh = 5 * time.Minute
 
 // observerWriters bounds the resources one write pass writes at once.
 // The pass that follows a stream's initial dump writes every replica on
 // the node, and reads that hide the replicas of a satellite that just
 // started show none of them until it has. One at a time, with a status
 // write, a get-gi and a Condition write each, that kept every replica
-// of a node with ~110 of them Unknown for tens of seconds; LINSTOR
+// of a node with ~140 of them Unknown for tens of seconds; LINSTOR
 // sends a reconnected node's state in one batch after the full sync.
 const observerWriters = 8
 
@@ -942,8 +975,11 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 //
 // The dump comes in one burst. Should its end line never come, writes
 // would stay held and the node's replicas hidden for as long as the
-// stream runs, so once no dump line has come for initialStateWait the
-// dump is taken as ended.
+// stream runs, so once the stream has sent no line for
+// initialStateWait the dump is taken as ended. The rest of the dump
+// may still come after that: until its end line does, no resource is
+// taken as gone, and a dump line does not overwrite an object a frame
+// applied since has set.
 func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, stream *drbd.Watcher) {
 	events := make(chan drbd.Event, observerEventBuffer)
 
@@ -954,21 +990,7 @@ func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, strea
 		}
 	}()
 
-	var deferred []drbd.Event
-
-	dumped := false
-
-	endDump := func() {
-		dumped = true
-
-		for _, held := range deferred {
-			o.ingestEvent(ctx, held)
-		}
-
-		deferred = nil
-
-		o.releaseWrites(ctx)
-	}
+	dump := &initialDump{o: o}
 
 	quiet := time.NewTimer(o.initialStateWait())
 	defer quiet.Stop()
@@ -980,25 +1002,151 @@ func (o *ObserverRunnable) follow(ctx context.Context, logger logr.Logger, strea
 				return
 			}
 
-			switch {
-			case dumped:
-				o.ingestEvent(ctx, ev)
-			case ev.EndsInitialState():
-				endDump()
-			case ev.Action == eventActionExists:
-				o.ingestEvent(ctx, ev)
+			if dump.take(ctx, ev) {
 				quiet.Reset(o.initialStateWait())
-			default:
-				deferred = append(deferred, ev)
 			}
 		case <-quiet.C:
-			if !dumped {
+			if !dump.dumped {
 				logger.Info("drbdsetup events2 sent no end of its initial state; writing the state read so far",
-					"quiet", o.initialStateWait(), "held", len(deferred))
-				endDump()
+					"quiet", o.initialStateWait(), "held", len(dump.deferred))
+				dump.end(ctx, false)
 			}
 		}
 	}
+}
+
+// initialDump is where follow is in one stream's initial dump.
+type initialDump struct {
+	o *ObserverRunnable
+
+	// deferred holds the change and destroy frames kept back behind
+	// the dump; dumped is set once it has ended or been taken as ended.
+	deferred []drbd.Event
+	dumped   bool
+
+	// late is set from when the dump is taken as ended until its end
+	// line comes after all.
+	late *lateDump
+}
+
+// take applies or keeps back one frame, and reports whether the dump
+// is still being read, so the quiet timer starts again.
+func (d *initialDump) take(ctx context.Context, ev drbd.Event) bool {
+	switch {
+	case d.late != nil:
+		d.late = d.o.ingestLate(ctx, d.late, ev)
+	case d.dumped:
+		d.o.ingestEvent(ctx, ev)
+	case ev.EndsInitialState():
+		d.end(ctx, true)
+	case ev.Action == eventActionExists:
+		d.o.ingestEvent(ctx, ev)
+
+		return true
+	default:
+		// A change kept back shows the stream is alive as much as a
+		// dump line does.
+		d.deferred = append(d.deferred, ev)
+
+		return true
+	}
+
+	return false
+}
+
+// end ends the dump, or takes it as ended (whole false): the frames
+// kept back are replayed and writes released.
+func (d *initialDump) end(ctx context.Context, whole bool) {
+	d.dumped = true
+
+	if !whole {
+		d.late = &lateDump{}
+	}
+
+	for _, held := range d.deferred {
+		d.late.record(held)
+		d.o.ingestEvent(ctx, held)
+	}
+
+	d.deferred = nil
+
+	d.o.releaseWrites(ctx, whole)
+}
+
+// ingestLate applies a frame that came after the dump was taken as
+// ended, and returns nil once the dump's end line has come.
+func (o *ObserverRunnable) ingestLate(ctx context.Context, late *lateDump, ev drbd.Event) *lateDump {
+	switch {
+	case ev.EndsInitialState():
+		o.clearDeparted()
+
+		return nil
+	case ev.Action == eventActionExists:
+		if !late.covers(ev) {
+			o.ingestEvent(ctx, ev)
+		}
+	default:
+		late.record(ev)
+		o.ingestEvent(ctx, ev)
+	}
+
+	return late
+}
+
+// lateDump holds the objects that frames applied after a dump was
+// taken as ended have set, and whether they destroyed them. A dump
+// line that comes later for such an object, or for a part of one
+// destroyed, is older than the frame.
+type lateDump struct {
+	set map[dumpObject]bool
+}
+
+// dumpObject names the kernel object an events2 frame is about.
+type dumpObject struct {
+	kind, name, peer, volume, local, remote string
+}
+
+func objectOf(ev drbd.Event) dumpObject {
+	return dumpObject{
+		kind:   ev.Kind,
+		name:   ev.Fields["name"],
+		peer:   ev.Fields["peer-node-id"],
+		volume: ev.Fields["volume"],
+		local:  ev.Fields["local"],
+		remote: ev.Fields["remote"],
+	}
+}
+
+// record notes a frame that is not a dump line. A nil lateDump, that
+// of a dump which ended whole, records nothing.
+func (l *lateDump) record(ev drbd.Event) {
+	if l == nil {
+		return
+	}
+
+	if l.set == nil {
+		l.set = map[dumpObject]bool{}
+	}
+
+	obj := objectOf(ev)
+	l.set[obj] = l.set[obj] || ev.Action == eventActionDestroy
+}
+
+// covers reports whether a dump line is older than a frame recorded
+// for its object, or for the connection or resource it belongs to and
+// that the frame destroyed.
+func (l *lateDump) covers(ev drbd.Event) bool {
+	obj := objectOf(ev)
+
+	if _, ok := l.set[obj]; ok {
+		return true
+	}
+
+	if l.set[dumpObject{kind: eventKindResource, name: obj.name}] {
+		return true
+	}
+
+	return obj.peer != "" && l.set[dumpObject{kind: eventKindConnection, name: obj.name, peer: obj.peer}]
 }
 
 // restartEvents2 starts a new stream after the restart delay, retrying
@@ -1076,12 +1224,13 @@ func (o *ObserverRunnable) holdWrites() {
 	o.holding = true
 }
 
-// releaseWrites runs when a stream's initial dump has ended. Every
-// resource the dump restated is written once from its complete view;
-// one the ended stream knew and the dump did not restate went away
-// while no stream ran, and is written as gone. The reconciler is woken
+// releaseWrites runs when a stream's initial dump has ended, or has
+// been taken as ended (whole false). Every resource the dump restated
+// is written once from its complete view, and the reconciler is woken
 // for each, which the dump's frames did not do while writes were held.
-func (o *ObserverRunnable) releaseWrites(ctx context.Context) {
+// Only a dump that ended whole tells what went away; for one taken as
+// ended, clearDeparted waits for its end line.
+func (o *ObserverRunnable) releaseWrites(ctx context.Context, whole bool) {
 	current := o.cachedResourceNames()
 
 	o.pendingMu.Lock()
@@ -1090,23 +1239,16 @@ func (o *ObserverRunnable) releaseWrites(ctx context.Context) {
 		o.pending = map[string]pendingWrite{}
 	}
 
-	restated := make(map[string]struct{}, len(current))
-
 	for _, name := range current {
-		restated[name] = struct{}{}
-
 		entry := o.pending[name]
 		entry.probeGI = true
 		o.pending[name] = entry
 	}
 
-	for name := range o.previous {
-		if _, ok := restated[name]; !ok {
-			o.pending[name] = pendingWrite{departed: true}
-		}
+	if whole {
+		o.markDepartedLocked(current)
 	}
 
-	o.previous = nil
 	o.holding = false
 	o.releasedAt = time.Now()
 	o.pendingMu.Unlock()
@@ -1116,6 +1258,41 @@ func (o *ObserverRunnable) releaseWrites(ctx context.Context) {
 	for _, name := range current {
 		o.emitReconcileTrigger(ctx, &observation{ResourceName: name})
 	}
+}
+
+// clearDeparted runs when the end line of a dump taken as ended comes
+// after all, and writes as gone what the dump did not restate.
+func (o *ObserverRunnable) clearDeparted() {
+	current := o.cachedResourceNames()
+
+	o.pendingMu.Lock()
+
+	if o.pending == nil {
+		o.pending = map[string]pendingWrite{}
+	}
+
+	o.markDepartedLocked(current)
+	o.pendingMu.Unlock()
+
+	o.signalWriter()
+}
+
+// markDepartedLocked marks as gone each resource the ended stream knew
+// and the new dump did not restate: it went away while no stream ran.
+// pendingMu must be held.
+func (o *ObserverRunnable) markDepartedLocked(current []string) {
+	restated := make(map[string]struct{}, len(current))
+	for _, name := range current {
+		restated[name] = struct{}{}
+	}
+
+	for name := range o.previous {
+		if _, ok := restated[name]; !ok {
+			o.pending[name] = pendingWrite{departed: true}
+		}
+	}
+
+	o.previous = nil
 }
 
 func (o *ObserverRunnable) isHolding() bool {
@@ -1468,8 +1645,10 @@ func (o *ObserverRunnable) ingest(ctx context.Context, ev *observation) {
 	// cached roles on ev.
 	role := carriesRole(ev)
 
-	o.mergeConnections(ev)
+	// mergeVolumes reads a destroyed connection off ev before
+	// mergeConnections replaces ev.Connections with the cached peers.
 	o.mergeVolumes(ev)
+	o.mergeConnections(ev)
 	o.mergeResource(ev)
 
 	// mergeVolumes leaves ev.Volumes empty when the frame changed no
@@ -1609,7 +1788,8 @@ func (o *ObserverRunnable) flush(ctx context.Context, adm *drbd.Adm) {
 
 	o.forEachPending(ctx, names, func(name string) { o.writeResource(ctx, adm, name, batch[name]) })
 
-	if !released.IsZero() {
+	// A pass cut short by shutdown did not write them all.
+	if !released.IsZero() && ctx.Err() == nil {
 		log.FromContext(ctx).WithName("observer").Info("DRBD state written after the events2 dump",
 			"resources", len(names), "took", time.Since(released))
 	}
@@ -2130,6 +2310,12 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 
 	changed := false
 
+	for _, conn := range ev.Connections {
+		if conn.Removed && forgetPeerOutOfSync(cache, conn.PeerNodeName) {
+			changed = true
+		}
+	}
+
 	for _, incoming := range ev.Volumes {
 		if incoming.Removed {
 			// `destroy device` — evict the volume so the snapshot
@@ -2291,6 +2477,74 @@ func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolume
 	return out
 }
 
+// largestOutOfSync is the out-of-sync count a volume publishes: the
+// one of the peer it is furthest behind.
+func largestOutOfSync(peers map[string]int64) int64 {
+	var largest int64
+
+	for _, kib := range peers {
+		largest = max(largest, kib)
+	}
+
+	return largest
+}
+
+// forgetPeerOutOfSync drops a removed peer's out-of-sync count from
+// every cached volume, so a peer that is gone no longer holds the
+// volume's count up. Returns true if a published count changed.
+func forgetPeerOutOfSync(cache map[int32]volumeObservation, peer string) bool {
+	changed := false
+
+	for num, vol := range cache {
+		if _, ok := vol.PeerOutOfSync[peer]; !ok {
+			continue
+		}
+
+		peers := maps.Clone(vol.PeerOutOfSync)
+		delete(peers, peer)
+		vol.PeerOutOfSync = peers
+
+		if oos := largestOutOfSync(peers); oos != vol.OutOfSyncKib {
+			vol.OutOfSyncKib = oos
+			changed = true
+		}
+
+		cache[num] = vol
+	}
+
+	return changed
+}
+
+// mergeOutOfSyncInto records the out-of-sync count of a frame that
+// carried one, against its peer when the frame names it, and reports
+// whether the count the volume publishes changed.
+func mergeOutOfSyncInto(merged, incoming *volumeObservation) bool {
+	oos := incoming.OutOfSyncKib
+
+	if incoming.SyncPeer != "" {
+		if last, ok := merged.PeerOutOfSync[incoming.SyncPeer]; !ok || last != oos {
+			peers := maps.Clone(merged.PeerOutOfSync)
+			if peers == nil {
+				peers = map[string]int64{}
+			}
+
+			peers[incoming.SyncPeer] = oos
+			merged.PeerOutOfSync = peers
+		}
+
+		oos = largestOutOfSync(merged.PeerOutOfSync)
+	}
+
+	if merged.HasSync && merged.OutOfSyncKib == oos {
+		return false
+	}
+
+	merged.OutOfSyncKib = oos
+	merged.HasSync = true
+
+	return true
+}
+
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
 // to decide whether to emit a fresh Status snapshot.
@@ -2319,9 +2573,7 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 		changed = true
 	}
 
-	if incoming.HasSync && (!merged.HasSync || merged.OutOfSyncKib != incoming.OutOfSyncKib) {
-		merged.OutOfSyncKib = incoming.OutOfSyncKib
-		merged.HasSync = true
+	if incoming.HasSync && mergeOutOfSyncInto(&merged, incoming) {
 		changed = true
 	}
 
@@ -2660,9 +2912,62 @@ func (o *ObserverRunnable) alreadyApplied(name string, current *blockstoriov1alp
 	defer o.appliedMu.Unlock()
 
 	last, ok := o.applied[name]
+	if !ok || last.uid != current.UID || last.resourceVersion != current.ResourceVersion {
+		return false
+	}
 
-	return ok && last.uid == current.UID && last.resourceVersion == current.ResourceVersion &&
-		equality.Semantic.DeepEqual(&last.status, status)
+	if equality.Semantic.DeepEqual(&last.status, status) {
+		return true
+	}
+
+	if time.Since(last.at) >= outOfSyncRefresh {
+		return false
+	}
+
+	return equality.Semantic.DeepEqual(&last.status, withAppliedOutOfSync(status, &last.status))
+}
+
+// withAppliedOutOfSync returns a copy of status in which each UpToDate
+// volume of a replica that resyncs with no peer carries the
+// out-of-sync count last applied, when that count and the new one are
+// both non-zero. If the copy equals the applied status, the only
+// change is the size of such a count, which can wait.
+func withAppliedOutOfSync(status, applied *blockstoriov1alpha1.ResourceStatus) *blockstoriov1alpha1.ResourceStatus {
+	out := status.DeepCopy()
+
+	if resyncRunning(status) {
+		return out
+	}
+
+	for i := range out.Volumes {
+		vol := &out.Volumes[i]
+		if vol.DiskState != drbdDiskStateUpToDate || vol.OutOfSyncKib == 0 {
+			continue
+		}
+
+		for j := range applied.Volumes {
+			prev := &applied.Volumes[j]
+			if prev.VolumeNumber == vol.VolumeNumber && prev.OutOfSyncKib != 0 {
+				vol.OutOfSyncKib = prev.OutOfSyncKib
+			}
+		}
+	}
+
+	return out
+}
+
+// resyncRunning reports whether the replica is the source or the
+// target of a resync with any peer: the states in which the REST view
+// renders the out-of-sync count as progress.
+func resyncRunning(status *blockstoriov1alpha1.ResourceStatus) bool {
+	for i := range status.Connections {
+		switch status.Connections[i].ReplicationState {
+		case drbdReplStateSyncSource, drbdReplStateSyncTarget:
+			return true
+		}
+	}
+
+	return false
 }
 
 // rememberApplied records what was sent and the version the apiserver
@@ -2675,7 +2980,9 @@ func (o *ObserverRunnable) rememberApplied(name string, written *blockstoriov1al
 		o.applied = map[string]appliedStatus{}
 	}
 
-	o.applied[name] = appliedStatus{uid: written.UID, resourceVersion: written.ResourceVersion, status: *sent}
+	o.applied[name] = appliedStatus{
+		uid: written.UID, resourceVersion: written.ResourceVersion, status: *sent, at: time.Now(),
+	}
 }
 
 func (o *ObserverRunnable) forgetApplied(name string) {

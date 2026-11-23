@@ -549,6 +549,11 @@ type ResourceVolumeStatus struct {
 	// resync hasn't started yet. Surfaced via the REST view layer
 	// so `linstor r l` / piraeus dashboards can render a CDI-style
 	// progress bar without polling drbdsetup themselves.
+	//
+	// While the volume is UpToDate and no peer resyncs with this
+	// replica, a change that keeps the count non-zero can reach the
+	// status up to 5 minutes late. A change to or from 0, and any
+	// change during a resync, is written at once.
 	// +optional
 	OutOfSyncKib int64 `json:"outOfSyncKib,omitempty"`
 
