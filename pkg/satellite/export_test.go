@@ -20,6 +20,7 @@ package satellite
 
 import (
 	"context"
+	"time"
 
 	"github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -62,4 +63,12 @@ func (r *Reconciler) RememberPoolForTest(resourceName, pool string) {
 // volume with internal metadata.
 func DrbdGrossKibForTest(netKib int64) int64 {
 	return drbdGrossKib(netKib)
+}
+
+// SetDemoteRetryForTest replaces the waits of the demote owed after an
+// auto-promote: backoff between the tries right after mkfs, and every,
+// the pacing of later applies' retries (zero retries on every apply).
+func (r *Reconciler) SetDemoteRetryForTest(backoff []time.Duration, every time.Duration) {
+	r.demotes.backoff = backoff
+	r.demotes.every = every
 }

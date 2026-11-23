@@ -23,6 +23,7 @@ import (
 	"flag"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/cozystack/blockstor/pkg/satellite/controllers"
 	"github.com/cozystack/blockstor/pkg/satellite/stream"
@@ -94,6 +95,59 @@ func TestSatelliteRefusesNoResourceWorkers(t *testing.T) {
 		_, err := parseTestFlags("--node-name=n1", arg)
 		if err == nil {
 			t.Errorf("%s accepted, want refused", arg)
+		}
+	}
+}
+
+// The DRBD workarounds the LINSTOR-mode plunger runs are all on by
+// default, at the plunger's cadence.
+func TestSatelliteRunsTheDRBDWorkaroundsByDefault(t *testing.T) {
+	t.Parallel()
+
+	opts, err := parseTestFlags("--node-name=n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if opts.workarounds != controllers.DefaultWorkaroundsConfig() {
+		t.Errorf("workarounds = %+v, want the defaults %+v", opts.workarounds, controllers.DefaultWorkaroundsConfig())
+	}
+
+	w := opts.workarounds
+	if w.Interval != 30*time.Second || w.StalledResyncPasses != 4 ||
+		!w.StalledResync || !w.IdlePrimary || !w.ForcedIOFailures || !w.StaleLoopDevices {
+		t.Errorf("defaults = %+v, want every check on, 30s, 4 passes", w)
+	}
+}
+
+// Each workaround has a flag of its own to turn it off.
+func TestSatelliteTurnsEachDRBDWorkaroundOff(t *testing.T) {
+	t.Parallel()
+
+	opts, err := parseTestFlags("--node-name=n1",
+		"--drbd-workaround-stalled-resync=false",
+		"--drbd-workaround-idle-primary=false",
+		"--drbd-workaround-forced-io-failures=false",
+		"--drbd-workaround-stale-loop-devices=false",
+		"--drbd-workaround-stalled-resync-passes=6",
+		"--drbd-workarounds-interval=1m")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := controllers.WorkaroundsConfig{Interval: time.Minute, StalledResyncPasses: 6}
+	if opts.workarounds != want {
+		t.Errorf("workarounds = %+v, want %+v", opts.workarounds, want)
+	}
+}
+
+func TestSatelliteRefusesBadWorkaroundFlags(t *testing.T) {
+	t.Parallel()
+
+	for _, arg := range []string{"--drbd-workarounds-interval=-1s", "--drbd-workaround-stalled-resync-passes=0"} {
+		_, err := parseTestFlags("--node-name=n1", arg)
+		if !errors.Is(err, errBadWorkaroundFlags) {
+			t.Errorf("%s = %v, want errBadWorkaroundFlags", arg, err)
 		}
 	}
 }

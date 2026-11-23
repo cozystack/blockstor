@@ -40,6 +40,7 @@ type options struct {
 	controllerNamespace string
 	streamTLS           stream.TLSFiles
 	resourceWorkers     int
+	workarounds         controllers.WorkaroundsConfig
 }
 
 // parseFlags registers the satellite's flags on flagSet, parses args and
@@ -69,6 +70,8 @@ func parseFlags(flagSet *flag.FlagSet, args []string) (options, error) {
 	flagSet.IntVar(&opts.resourceWorkers, "resource-workers", controllers.DefaultResourceWorkers,
 		"How many local resources the satellite applies at once, for instance when it brings every replica of the node up after a reboot.")
 
+	registerWorkaroundFlags(flagSet, &opts.workarounds)
+
 	err := flagSet.Parse(args)
 	if err != nil {
 		return opts, errors.Wrap(err, "parse flags")
@@ -78,10 +81,40 @@ func parseFlags(flagSet *flag.FlagSet, args []string) (options, error) {
 		return opts, errors.Wrapf(errNoResourceWorkers, "--resource-workers=%d", opts.resourceWorkers)
 	}
 
+	if opts.workarounds.Interval < 0 || opts.workarounds.StalledResyncPasses < 1 {
+		return opts, errors.Wrapf(errBadWorkaroundFlags, "interval %s, stalled resync passes %d",
+			opts.workarounds.Interval, opts.workarounds.StalledResyncPasses)
+	}
+
 	err = opts.streamTLS.Validate()
 	if err != nil {
 		return opts, errors.Wrap(err, "snapshot stream TLS flags")
 	}
 
 	return opts, nil
+}
+
+// errBadWorkaroundFlags refuses a negative workaround interval or a
+// stalled-resync check that would act without seeing a stall.
+var errBadWorkaroundFlags = errors.New("--drbd-workarounds-interval must not be negative " +
+	"and --drbd-workaround-stalled-resync-passes must be at least 1")
+
+// registerWorkaroundFlags registers the flags of the satellite's DRBD
+// workarounds (pkg/satellite/controllers/drbd_workarounds.go): all on by
+// default, each one can be turned off, and a zero interval turns off all.
+func registerWorkaroundFlags(flagSet *flag.FlagSet, cfg *controllers.WorkaroundsConfig) {
+	def := controllers.DefaultWorkaroundsConfig()
+
+	flagSet.DurationVar(&cfg.Interval, "drbd-workarounds-interval", def.Interval,
+		"Time between passes of the DRBD workarounds; 0 turns them all off.")
+	flagSet.BoolVar(&cfg.StalledResync, "drbd-workaround-stalled-resync", def.StalledResync,
+		"Disconnect and connect the peer a resync stalled on while another peer waits on it (LINBIT/drbd#149).")
+	flagSet.IntVar(&cfg.StalledResyncPasses, "drbd-workaround-stalled-resync-passes", def.StalledResyncPasses,
+		"Passes in a row without resync progress before the stalled-resync workaround acts.")
+	flagSet.BoolVar(&cfg.IdlePrimary, "drbd-workaround-idle-primary", def.IdlePrimary,
+		"Demote a Primary with no volume open (DRBD auto-demote not firing, piraeus-operator#942).")
+	flagSet.BoolVar(&cfg.ForcedIOFailures, "drbd-workaround-forced-io-failures", def.ForcedIOFailures,
+		"Take down and up a Secondary with no volume open that still forces I/O failures (LINBIT/drbd#153).")
+	flagSet.BoolVar(&cfg.StaleLoopDevices, "drbd-workaround-stale-loop-devices", def.StaleLoopDevices,
+		"Detach loop devices whose backing file reads \"/\" or \"/ (deleted)\" (kubernetes#102408).")
 }
