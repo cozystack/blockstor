@@ -121,11 +121,10 @@ func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 
 	// Report which replicas still hold I/O suspended before anything
 	// else, so an abort is never read as a resume the kernels have not
-	// confirmed.
-	err = r.stampIOSuspendedCondition(ctx, &snap)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	// confirmed. A failed stamp still lets an abort below order the
+	// resume: frozen I/O outranks a stale condition, and the error is
+	// returned once that write is done.
+	stampErr := r.stampIOSuspendedCondition(ctx, &snap)
 
 	// Adopted snapshots (imported from another storage controller by
 	// a migration tool; see AnnotationSnapshotAdopted) already exist
@@ -148,7 +147,9 @@ func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 			logger.Info("ignoring adopted annotation on an in-flight snapshot; completing normal orchestration so suspended I/O resumes",
 				"suspendIO", true)
 		} else {
-			return r.backfillAdoptedSnapshot(ctx, logger, &snap)
+			res, backfillErr := r.backfillAdoptedSnapshot(ctx, logger, &snap)
+
+			return res, errors.Join(backfillErr, stampErr)
 		}
 	}
 
@@ -159,7 +160,7 @@ func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 	// the aggregate predicates reduce to the self-only walks.
 	siblings, err := r.fetchSiblings(ctx, &snap)
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, errors.Join(err, stampErr)
 	}
 
 	// Abort paths take priority over phase advancement and force us
@@ -171,7 +172,11 @@ func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 	// has driven the abort, in which case Reconcile is done.
 	aborted, result, err := r.checkAbortConditions(ctx, logger, &snap, siblings)
 	if aborted || err != nil {
-		return result, err
+		return result, errors.Join(err, stampErr)
+	}
+
+	if stampErr != nil {
+		return ctrl.Result{}, stampErr
 	}
 
 	// A Snapshot whose Spec.Nodes is empty is degenerate at the
