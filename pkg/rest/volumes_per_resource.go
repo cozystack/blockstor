@@ -238,40 +238,59 @@ func mergeVolumePropsPatch(vol *apiv1.Volume, patch *apiv1.GenericPropsModify) {
 const volumeReportBudget = 10 * time.Second
 
 // awaitReportedVolume answers volume vlmNr of the replica, waiting for its
-// satellite to report it when the replica is new: linstor-csi reads the
-// volume's device path right after make-available, and LINSTOR knows it
-// from the moment the replica exists. A volume number the definition does
-// not have, and a replica being deleted, are answered at once.
+// satellite to report it with a device path when the replica is new:
+// linstor-csi reads the volume's device path right after make-available
+// and fails the attach on a missing volume or an empty path, and LINSTOR
+// knows both from the moment the replica exists. The observer reports the
+// disk state before the apply pass stamps the path, so the volume alone is
+// not enough. Once the budget runs out the volume is answered as it
+// stands. A volume number the definition does not have, and a replica
+// being deleted, are answered at once.
 func (s *Server) awaitReportedVolume(ctx context.Context, res *apiv1.Resource, vlmNr int32) (apiv1.Volume, bool) {
 	deadline := time.Now().Add(volumeReportBudget)
 
 	for {
-		for i := range res.Volumes {
-			if res.Volumes[i].VolumeNumber == vlmNr {
-				return res.Volumes[i], true
+		idx := findVolumeIndexByNumber(res.Volumes, vlmNr)
+		if idx >= 0 && res.Volumes[idx].DevicePath != "" {
+			return res.Volumes[idx], true
+		}
+
+		if !s.awaitVolumeReport(ctx, res, vlmNr, deadline) {
+			if idx >= 0 {
+				return res.Volumes[idx], true
 			}
-		}
 
-		if slices.Contains(res.Flags, apiv1.ResourceFlagDelete) || time.Now().After(deadline) {
 			return apiv1.Volume{}, false
 		}
-
-		_, err := s.Store.VolumeDefinitions().Get(ctx, res.Name, vlmNr)
-		if err != nil {
-			return apiv1.Volume{}, false
-		}
-
-		select {
-		case <-ctx.Done():
-			return apiv1.Volume{}, false
-		case <-time.After(cacheConvergePollInterval):
-		}
-
-		next, err := s.Store.Resources().Get(ctx, res.Name, res.NodeName)
-		if err != nil {
-			return apiv1.Volume{}, false
-		}
-
-		*res = next
 	}
+}
+
+// awaitVolumeReport waits one poll interval and re-reads the replica into
+// res. It reports false, leaving res as it was, when there is nothing left
+// to wait for: the budget ran out, the replica is being deleted, or its
+// definition has no such volume.
+func (s *Server) awaitVolumeReport(ctx context.Context, res *apiv1.Resource, vlmNr int32, deadline time.Time) bool {
+	if slices.Contains(res.Flags, apiv1.ResourceFlagDelete) || time.Now().After(deadline) {
+		return false
+	}
+
+	_, err := s.Store.VolumeDefinitions().Get(ctx, res.Name, vlmNr)
+	if err != nil {
+		return false
+	}
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(cacheConvergePollInterval):
+	}
+
+	next, err := s.Store.Resources().Get(ctx, res.Name, res.NodeName)
+	if err != nil {
+		return false
+	}
+
+	*res = next
+
+	return true
 }
