@@ -53,6 +53,12 @@ type resizeReplicas struct {
 	// not connected. They catch up when it reconnects, so a resize does
 	// not wait for them, as in LINSTOR.
 	offline []string
+	// peerDown are the online diskful replicas whose DRBD connection
+	// to another diskful replica is down. DRBD 9 caps a grow at the
+	// last agreed size while a peer holding a bitmap slot is not
+	// connected (drbd_new_dev_size), so their device grows only once
+	// the peer reconnects; LINSTOR answers the resize meanwhile.
+	peerDown []disconnectedReplica
 	// failed are the growing replicas whose satellite's last pass, at
 	// the target size or above, failed: the grow is not progressing
 	// there, and LINSTOR answers with the satellite's error.
@@ -60,6 +66,13 @@ type resizeReplicas struct {
 	// appliedKib is the smallest size an awaited replica reports as
 	// applied, 0 when none reports one.
 	appliedKib int64
+}
+
+// disconnectedReplica is a replica with the diskful peers it has no
+// DRBD connection to.
+type disconnectedReplica struct {
+	node  string
+	peers []string
 }
 
 // failedReplica is a replica whose last apply pass failed, with its error.
@@ -108,6 +121,40 @@ func isSatelliteConnected(ctx context.Context, nodes store.NodeStore, nodeName s
 	return strings.EqualFold(node.ConnectionStatus, apiv1.NodeTypeOnline)
 }
 
+// holdsBitmapSlot reports whether rsc is a replica its peers keep a
+// bitmap slot for: a diskful, active replica that is not being
+// deleted. A grow on a peer is capped while such a replica is not
+// connected to it.
+func holdsBitmapSlot(rsc *apiv1.Resource) bool {
+	return !isDisklessReplica(rsc) &&
+		!slices.Contains(rsc.Flags, "INACTIVE") &&
+		!slices.Contains(rsc.Flags, apiv1.ResourceFlagDelete)
+}
+
+// disconnectedPeers returns the peers in diskful that rsc's satellite
+// reports its DRBD connection to as down. A peer with no reported
+// connection is not counted: there is nothing to say it is down.
+func disconnectedPeers(rsc *apiv1.Resource, diskful []string) []string {
+	if rsc.LayerObject == nil || rsc.LayerObject.Drbd == nil {
+		return nil
+	}
+
+	var out []string
+
+	for _, peer := range diskful {
+		if peer == rsc.NodeName {
+			continue
+		}
+
+		conn, ok := rsc.LayerObject.Drbd.Connections[peer]
+		if ok && !conn.Connected {
+			out = append(out, peer)
+		}
+	}
+
+	return out
+}
+
 // passFailedAt returns the error of the replica's last apply pass when
 // that pass failed while applying volume vn at targetKib or above, the
 // size this grow waits for.
@@ -129,6 +176,14 @@ func (s *Server) classifyResizeReplicas(ctx context.Context, rd string, vn int32
 		return out, err //nolint:wrapcheck // the store error is the answer
 	}
 
+	diskful := make([]string, 0, len(resources))
+
+	for i := range resources {
+		if holdsBitmapSlot(&resources[i]) {
+			diskful = append(diskful, resources[i].NodeName)
+		}
+	}
+
 	for i := range resources {
 		rsc := &resources[i]
 
@@ -139,6 +194,12 @@ func (s *Server) classifyResizeReplicas(ctx context.Context, rd string, vn int32
 
 		if !isSatelliteConnected(ctx, s.Store.Nodes(), rsc.NodeName) {
 			out.offline = append(out.offline, rsc.NodeName)
+
+			continue
+		}
+
+		if peers := disconnectedPeers(rsc, diskful); len(peers) > 0 {
+			out.peerDown = append(out.peerDown, disconnectedReplica{node: rsc.NodeName, peers: peers})
 
 			continue
 		}
@@ -160,6 +221,7 @@ func (s *Server) classifyResizeReplicas(ctx context.Context, rd string, vn int32
 
 	sort.Strings(out.growing)
 	sort.Strings(out.offline)
+	sort.Slice(out.peerDown, func(i, j int) bool { return out.peerDown[i].node < out.peerDown[j].node })
 	sort.Slice(out.failed, func(i, j int) bool { return out.failed[i].node < out.failed[j].node })
 
 	return out, nil
@@ -195,15 +257,17 @@ const (
 // so a resize slower than the CSI timeout is not acknowledged early
 // either.
 //
-// On outcomeGrown the entries are LINSTOR's not-connected warnings for the
-// diskful replicas the wait skipped; on outcomeFailed they are the errors.
+// On outcomeGrown the entries are not-connected warnings for the diskful
+// replicas the wait skipped, on an offline node or cut off from a diskful
+// peer; on outcomeFailed they are the errors.
 func (s *Server) waitForVolumeGrown(ctx context.Context, rd string, vn int32, targetKib int64) ([]apiv1.APICallRc, growOutcome) {
 	logged := false
 
 	for {
 		state, err := s.classifyResizeReplicas(ctx, rd, vn, targetKib)
 		if err == nil && len(state.growing) == 0 {
-			return notConnectedWarnings(state.offline, rd, vn), outcomeGrown
+			return append(notConnectedWarnings(state.offline, rd, vn),
+				peerDownWarnings(state.peerDown, rd, vn)...), outcomeGrown
 		}
 
 		if err == nil && len(state.failed) > 0 {
@@ -293,6 +357,28 @@ func notConnectedWarnings(nodes []string, rd string, vn int32) []apiv1.APICallRc
 			Details: "The controller stored the change; the satellite receives it once it is connected.",
 			ObjRefs: map[string]string{
 				objRefNode:   node,
+				objRefRscDfn: rd,
+				objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+			},
+		})
+	}
+
+	return out
+}
+
+// peerDownWarnings builds one WARN_NOT_CONNECTED entry per replica whose
+// device waits for a DRBD peer to reconnect before it can grow.
+func peerDownWarnings(replicas []disconnectedReplica, rd string, vn int32) []apiv1.APICallRc {
+	out := make([]apiv1.APICallRc, 0, len(replicas))
+
+	for _, replica := range replicas {
+		out = append(out, apiv1.APICallRc{
+			RetCode: warnNotConnected,
+			Message: fmt.Sprintf("(Node: '%s') Volume %d of resource '%s' is not connected to %s",
+				replica.node, vn, rd, strings.Join(replica.peers, ", ")),
+			Details: "DRBD grows the device once every diskful peer is connected again.",
+			ObjRefs: map[string]string{
+				objRefNode:   replica.node,
 				objRefRscDfn: rd,
 				objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
 			},

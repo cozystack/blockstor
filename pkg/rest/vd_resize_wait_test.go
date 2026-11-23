@@ -499,3 +499,84 @@ func TestVDGrowSkipsReplicaNotOnline(t *testing.T) {
 		}
 	}
 }
+
+// setConnection records what the satellite on node reports about its
+// DRBD connection to peer.
+func setConnection(t *testing.T, st store.Store, node, peer string, connected bool) {
+	t.Helper()
+
+	rsc, err := st.Resources().Get(t.Context(), growRD, node)
+	if err != nil {
+		t.Fatalf("get replica %s: %v", node, err)
+	}
+
+	if rsc.LayerObject == nil {
+		rsc.LayerObject = &apiv1.ResourceLayer{Type: apiv1.LayerKindDRBD}
+	}
+
+	if rsc.LayerObject.Drbd == nil {
+		rsc.LayerObject.Drbd = &apiv1.DrbdResourceLayer{}
+	}
+
+	if rsc.LayerObject.Drbd.Connections == nil {
+		rsc.LayerObject.Drbd.Connections = map[string]apiv1.DrbdConnection{}
+	}
+
+	rsc.LayerObject.Drbd.Connections[peer] = apiv1.DrbdConnection{Connected: connected}
+
+	err = st.Resources().Update(t.Context(), &rsc)
+	if err != nil {
+		t.Fatalf("update replica %s: %v", node, err)
+	}
+}
+
+// TestVDGrowSkipsReplicaCutOffFromDiskfulPeer: while a diskful peer is
+// not connected, DRBD 9 caps a grow at the last agreed size
+// (drbd_new_dev_size without --assume-peer-has-space), so a replica cut
+// off from one never reports the new size until the link is back.
+// LINSTOR answers that resize; waiting for such a replica held the PUT
+// and kept `vd l` at the old size for as long as the partition lasted.
+// A down connection to a diskless peer does not cap the grow.
+func TestVDGrowSkipsReplicaCutOffFromDiskfulPeer(t *testing.T) {
+	st := seedGrow(t, map[string]int64{"a": growOldKib, "b": growOldKib, "c": growOldKib})
+	setConnection(t, st, "a", "b", false)
+	setConnection(t, st, "b", "a", false)
+	setConnection(t, st, "c", "diskless", false)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	done := putGrow(t, base, growNewKib)
+
+	expectPending(t, done, "a replica with every diskful peer connected was still at the old size")
+
+	setApplied(t, st, "c", growNewKib)
+
+	rcs := expectAnswered(t, done)
+
+	warned := map[string]bool{}
+
+	for _, rc := range rcs {
+		if rc.RetCode == warnNotConnected {
+			warned[rc.ObjRefs[objRefNode]] = true
+		}
+	}
+
+	if !warned["a"] || !warned["b"] || warned["c"] {
+		t.Fatalf("want WARN_NOT_CONNECTED for a and b only: %+v", rcs)
+	}
+
+	var vd apiv1.VolumeDefinition
+
+	resp := httpGet(t, fmt.Sprintf("%s/v1/resource-definitions/%s/volume-definitions/0", base, growRD))
+	decodeErr := json.NewDecoder(resp.Body).Decode(&vd)
+	_ = resp.Body.Close()
+
+	if decodeErr != nil {
+		t.Fatalf("decode VD: %v", decodeErr)
+	}
+
+	if vd.SizeKib != growNewKib {
+		t.Fatalf("vd size %d while the cut-off replicas wait for their peer, want %d", vd.SizeKib, growNewKib)
+	}
+}
