@@ -162,8 +162,9 @@ Last sync against handler list: 2026-05-09 (Phase 8.5 close).
 | `/v1/node-connections` | GET | 🟡 (empty list) |
 | `/v1/node-connections/{a}/{b}` | GET | 🟡 (empty list) |
 | `/v1/node-connections/{a}/{b}` | PUT | ⬜ |
-| `/v1/resource-definitions/{rd}/resource-connections` | GET | ⬜ |
-| `/v1/resource-definitions/{rd}/resource-connections/{a}/{b}` | GET / PUT | ⬜ |
+| `/v1/resource-definitions/{rd}/resource-connections` | GET | ✅ (connections that carry props) |
+| `/v1/resource-definitions/{rd}/resource-connections/{a}/{b}` | GET | ⬜ |
+| `/v1/resource-definitions/{rd}/resource-connections/{a}/{b}` | PUT | ✅ (props; `rc sp`, `rc drbd-peer-options`) |
 
 ## Multi-snapshot actions
 

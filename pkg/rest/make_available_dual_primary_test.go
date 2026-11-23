@@ -561,3 +561,46 @@ func TestMakeAvailableWarnsWhenAnEndDoesNotApply(t *testing.T) {
 		t.Fatalf("last answer %+v, want a warning naming node-a and node-b", last)
 	}
 }
+
+// An allow-two-primaries a live migration left on a connection shows in
+// `linstor resource-connection list`, and `linstor resource-connection
+// set-property` takes it off again, as on LINSTOR.
+func TestResourceConnectionModify(t *testing.T) {
+	st, base := liveMigrationFixture(t, nil)
+	url := base + "/v1/resource-definitions/vm-disk/resource-connections/node-c/node-a"
+	conn := func(key string) string { return apiv1.ResourceConnectionPropKey("node-a", "node-c", key) }
+
+	resp := httpPut(t, url, []byte(`{"override_props":{"DrbdOptions/Net/allow-two-primaries":"yes","DrbdOptions/Net/protocol":"C"}}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set: %d", resp.StatusCode)
+	}
+
+	props := rdProps(t, st)
+	if props[conn(allowTwoPrimariesProp)] != "yes" || props[conn(drbdProtocolProp)] != "C" {
+		t.Fatalf("after set: %v", props)
+	}
+
+	resp = httpPut(t, url, []byte(`{"delete_props":["DrbdOptions/Net/allow-two-primaries"],"delete_namespaces":["DrbdOptions/Net"]}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete: %d", resp.StatusCode)
+	}
+
+	for key := range rdProps(t, st) {
+		if propInNamespace(key, "Cozystack/ResourceConnectionProps") {
+			t.Errorf("connection prop %s survived the delete", key)
+		}
+	}
+
+	// A connection is one between two replicas: node-b has none.
+	resp = httpPut(t, base+"/v1/resource-definitions/vm-disk/resource-connections/node-a/node-b",
+		[]byte(`{"override_props":{"DrbdOptions/Net/protocol":"C"}}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("connection to a node without a replica: %d, want 404", resp.StatusCode)
+	}
+}

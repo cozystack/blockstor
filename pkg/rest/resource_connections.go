@@ -63,6 +63,88 @@ func (s *Server) registerResourceConnections(mux *http.ServeMux) {
 		s.requireStore(s.handleResourceConnectionList))
 	mux.HandleFunc("GET /v1/resource-connections/{rd}",
 		s.requireStore(s.handleResourceConnectionList))
+	// `linstor resource-connection set-property` and `linstor
+	// resource-connection drbd-peer-options` both send a props modify
+	// here; it is also how an operator takes off an allow-two-primaries
+	// a live migration left behind.
+	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resource-connections/{nodeA}/{nodeB}",
+		s.requireStore(s.handleResourceConnectionModify))
+}
+
+// handleResourceConnectionModify answers a props modify on the connection
+// between nodeA and nodeB. As in LINSTOR, the connection is one between
+// two replicas, so both have to exist; its props are written as
+// definition props under apiv1.ResourceConnectionPropsPrefix and go away
+// with either replica.
+func (s *Server) handleResourceConnectionModify(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	rdName, nodeA, nodeB := r.PathValue("rd"), r.PathValue("nodeA"), r.PathValue("nodeB")
+
+	var modify apiv1.GenericPropsModify
+	if !decodeJSON(w, r, &modify) {
+		return
+	}
+
+	if naming.Same(nodeA, nodeB) {
+		writeError(w, http.StatusBadRequest, "a resource connection needs two different nodes")
+
+		return
+	}
+
+	if _, ok := modify.OverrideProps[""]; ok {
+		writeError(w, http.StatusBadRequest, "empty property key")
+
+		return
+	}
+
+	for _, node := range []string{nodeA, nodeB} {
+		_, err := s.Store.Resources().Get(ctx, rdName, node)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+	}
+
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(live *apiv1.ResourceDefinition) error {
+		applyConnectionPropsModify(live, nodeA, nodeB, &modify)
+
+		return nil
+	})
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "Successfully updated properties of the resource connection between nodes '" + nodeA +
+			"' and '" + nodeB + "' of resource '" + rdName + "'",
+		ObjRefs: map[string]string{objRefRscDfn: rdName},
+	}})
+}
+
+// applyConnectionPropsModify applies a props modify to the props of the
+// connection between nodeA and nodeB in a definition.
+func applyConnectionPropsModify(rd *apiv1.ResourceDefinition, nodeA, nodeB string, modify *apiv1.GenericPropsModify) {
+	if rd.Props == nil {
+		rd.Props = map[string]string{}
+	}
+
+	for key, value := range modify.OverrideProps {
+		rd.Props[apiv1.ResourceConnectionPropKey(nodeA, nodeB, key)] = value
+	}
+
+	for _, key := range modify.DeleteProps {
+		delete(rd.Props, apiv1.ResourceConnectionPropKey(nodeA, nodeB, key))
+	}
+
+	for _, ns := range modify.DeleteNamespace {
+		prefix := apiv1.ResourceConnectionPropKey(nodeA, nodeB, strings.TrimSuffix(ns, "/")+"/")
+
+		maps.DeleteFunc(rd.Props, func(key, _ string) bool { return strings.HasPrefix(key, prefix) })
+	}
 }
 
 // resourceConnectionListEntry is the wire shape python-linstor's
