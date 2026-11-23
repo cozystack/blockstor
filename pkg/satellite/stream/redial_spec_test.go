@@ -166,6 +166,7 @@ func TestSatelliteFlagsLackControllerBindAddress(t *testing.T) {
 		"node-name", "state-dir", "health-probe-bind-address", "controller-namespace",
 		"stream-tls-cert-file", "stream-tls-key-file", "stream-tls-ca-file",
 		"drbd-workarounds-interval", "drbd-workaround-stalled-resync", "drbd-workaround-stalled-resync-passes",
+		"drbd-workaround-stalled-resync-min-rate",
 		"drbd-workaround-idle-primary", "drbd-workaround-forced-io-failures", "drbd-workaround-stale-loop-devices",
 	}
 	if !equalStringSlices(flags, want) {
