@@ -28,6 +28,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -908,5 +909,58 @@ func TestRefreshTargetFromAPIReaderHonorsRealNilAllocation(t *testing.T) {
 		target.Status.DRBDPort != nil ||
 		target.Status.DRBDMinor != nil {
 		t.Errorf("target.Status DRBD-IDs unexpectedly mutated: %+v", target.Status)
+	}
+}
+
+// After an apply pass that succeeded, the satellite reports the live
+// migration token of the definition it applied, which make-available waits
+// for before it lets the migration start. A pass that failed (an adjust
+// DRBD refused) reports nothing, so the wait does not end on settings that
+// are not in effect.
+func TestStampPostApplyReportsTheLiveMigrateToken(t *testing.T) {
+	t.Parallel()
+
+	const (
+		node   = "n-lm"
+		rdName = "pvc-lm-token"
+		token  = "0123456789abcdef"
+	)
+
+	for _, tc := range []struct {
+		name      string
+		anyFailed bool
+		want      string
+	}{
+		{name: "applied", want: token},
+		{name: "failed", anyFailed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res := &blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: rdName + "." + node},
+				Spec:       blockstoriov1alpha1.ResourceSpec{NodeName: node, ResourceDefinitionName: rdName},
+			}
+			rd := &blockstoriov1alpha1.ResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        rdName,
+					Annotations: map[string]string{blockstoriov1alpha1.ResourceDefinitionAnnotationLiveMigrateToken: token},
+				},
+			}
+
+			cli := fake.NewClientBuilder().WithScheme(newToggleDiskTestScheme(t)).WithObjects(res, rd).Build()
+			reconciler := &ResourceReconciler{Client: cli, Config: Config{NodeName: node}}
+
+			reconciler.stampPostApply(context.Background(), res, rd, nil, tc.anyFailed, logr.Discard())
+
+			var after blockstoriov1alpha1.Resource
+			if err := cli.Get(context.Background(), client.ObjectKey{Name: res.Name}, &after); err != nil {
+				t.Fatalf("get: %v", err)
+			}
+
+			if got := after.Annotations[blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied]; got != tc.want {
+				t.Fatalf("applied token %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

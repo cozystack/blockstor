@@ -101,6 +101,21 @@ const ConditionKernelLoaded = "KernelLoaded"
 // yaml | grep volume-numbers` and read it without parsing.
 const ResourceAnnotationVolumeNumbers = "blockstor.org/volume-numbers"
 
+// ResourceDefinitionAnnotationLiveMigrateToken is the token a live
+// migration's make-available writes onto the definition in the same patch
+// as its dual-Primary props. ResourceAnnotationLiveMigrateApplied is where
+// a satellite copies the token it found on the definition after an apply
+// pass that succeeded, so it has rendered and adjusted the .res those
+// props produce. make-available waits for both ends of the migration to
+// report the token before it answers, as LINSTOR waits for its
+// satellites, because linstor-csi starts the migration on the answer and
+// the target cannot become Primary before allow-two-primaries is in
+// effect on both ends.
+const (
+	ResourceDefinitionAnnotationLiveMigrateToken = "blockstor.org/live-migrate-token" //nolint:gosec // an annotation name, not a credential
+	ResourceAnnotationLiveMigrateApplied         = "blockstor.org/live-migrate-applied"
+)
+
 // ResourceSpec is the desired state of one replica of a ResourceDefinition
 // placed on a node. The composite key is (resourceDefinitionName, nodeName);
 // metadata.name encodes that as `<rd>.<node>`.

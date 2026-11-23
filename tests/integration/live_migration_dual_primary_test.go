@@ -51,6 +51,8 @@ const (
 
 	// LINSTOR's FAIL_IN_USE, ORed with MASK_ERROR.
 	lmFailInUse = -0x4000_0000_0000_0000 | 997
+	// blockstor's warning band.
+	lmMaskWarn = 0x0002_0000_0000
 	// MASK_INFO | RC_RSC_DELETED, the answer of a replica delete.
 	lmRscDeleted = 0x0040_0000_0000_0000 | 0x4200
 )
@@ -103,9 +105,15 @@ func TestLiveMigrationDualPrimaryRendersOnTheMigrationConnection(t *testing.T) {
 	lmAssertNoMigrationProps(t, stack)
 	lmSetInUse(ctx, t, stack, lmSource, true)
 
-	// Attach on the target while the VM runs on the source.
-	lmCall(t, http.MethodPost, base+lmRD+"/resources/"+lmTarget+"/make-available", http.StatusOK,
-		map[string]any{"diskful": false, "auto_manage_dual_primary": true})
+	// Attach on the target while the VM runs on the source. It answers
+	// once the satellites of both ends reported they applied the props,
+	// so the answer carries no warning about them.
+	for _, rc := range lmCall(t, http.MethodPost, base+lmRD+"/resources/"+lmTarget+"/make-available", http.StatusOK,
+		map[string]any{"diskful": false, "auto_manage_dual_primary": true}) {
+		if rc.RetCode&lmMaskWarn != 0 {
+			t.Errorf("target attach warned: %+v", rc)
+		}
+	}
 
 	props := lmRDProps(ctx, t, stack)
 	for key, want := range map[string]string{

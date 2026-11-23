@@ -292,7 +292,8 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// `lookupVolumeNumbers` during the harm window leaks the backing
 	// LV / zvol. Mirrors the RD / RG / Snapshot stores.
 	mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations),
-		crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
+		crdv1alpha1.ResourceAnnotationVolumeNumbers, crdv1alpha1.ResourceAnnotationLiveMigrateApplied,
+		AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 	err = s.c.Update(ctx, &existing)
 	if err != nil {
@@ -374,7 +375,8 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// path and protects against future closures that explicitly
 		// reset live.Annotations.
 		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(wire.Annotations),
-			crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
+			crdv1alpha1.ResourceAnnotationVolumeNumbers, crdv1alpha1.ResourceAnnotationLiveMigrateApplied,
+			AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
 	}), "patch Resource %s/%s", rdName, node)

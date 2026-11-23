@@ -709,6 +709,42 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	if err != nil {
 		logger.Error(err, "record toggle-disk outcome")
 	}
+
+	if !anyFailed {
+		err = r.stampLiveMigrateApplied(ctx, res, rd)
+		if err != nil {
+			logger.Error(err, "stamp live-migrate-applied annotation")
+		}
+	}
+}
+
+// stampLiveMigrateApplied copies the definition's live migration token
+// onto the Resource after an apply pass that succeeded: the .res this pass
+// rendered and adjusted came from that definition, so the dual-Primary
+// props written with the token are in effect on this node. make-available
+// waits for this before it answers (see
+// ResourceDefinitionAnnotationLiveMigrateToken).
+func (r *ResourceReconciler) stampLiveMigrateApplied(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) error {
+	token := rd.Annotations[blockstoriov1alpha1.ResourceDefinitionAnnotationLiveMigrateToken]
+	if token == "" || res.Annotations[blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied] == token {
+		return nil
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]string{blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied: token},
+		},
+	})
+	if err != nil {
+		return errors.Wrap(err, "encode live-migrate-applied patch")
+	}
+
+	err = r.Patch(ctx, res, client.RawPatch(types.MergePatchType, body))
+	if err != nil {
+		return errors.Wrap(err, "merge-patch annotation "+blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied)
+	}
+
+	return nil
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the

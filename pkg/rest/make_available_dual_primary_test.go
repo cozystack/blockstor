@@ -19,15 +19,19 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/cozystack/blockstor/pkg/store"
-
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // liveMigrationFixture is a definition with a diskful replica on node-a,
@@ -447,5 +451,113 @@ func TestDualPrimaryIgnoresTheInUseOfAnOfflineNode(t *testing.T) {
 	status, rcs = postRcs(t, url+"node-a/unmake-available", ``)
 	if status != http.StatusOK {
 		t.Fatalf("unmake-available on the offline node: %d %+v, want 200", status, rcs)
+	}
+}
+
+func markOnline(t *testing.T, st store.Store, nodes ...string) {
+	t.Helper()
+
+	for _, node := range nodes {
+		if err := st.Nodes().SetConnectionStatus(t.Context(), node, apiv1.NodeTypeOnline); err != nil {
+			t.Fatalf("mark %s online: %v", node, err)
+		}
+	}
+}
+
+// reportApplied stamps the definition's live migration token on the
+// replica of node, as its satellite does after it applied the definition.
+func reportApplied(t *testing.T, st store.Store, node string) {
+	t.Helper()
+
+	rd, err := st.ResourceDefinitions().Get(context.Background(), "vm-disk")
+	if err != nil {
+		t.Errorf("get RD: %v", err)
+
+		return
+	}
+
+	token := rd.Annotations[blockstoriov1alpha1.ResourceDefinitionAnnotationLiveMigrateToken]
+
+	err = st.Resources().PatchResourceSpec(context.Background(), "vm-disk", node, func(res *apiv1.Resource) error {
+		if res.Annotations == nil {
+			res.Annotations = map[string]string{}
+		}
+
+		res.Annotations[blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied] = token
+
+		return nil
+	})
+	if err != nil {
+		t.Errorf("report applied on %s: %v", node, err)
+	}
+}
+
+// linstor-csi starts the migration when the attach answers, and the target
+// can only become Primary once allow-two-primaries is in effect on both
+// ends. make-available therefore answers only after the satellites of
+// both ends reported they applied the definition carrying its props, as
+// LINSTOR's answers after its satellites applied the change.
+func TestMakeAvailableWaitsForBothEndsToApply(t *testing.T) {
+	st, base := liveMigrationFixture(t, nil)
+	markOnline(t, st, "node-a", "node-b", "node-c")
+
+	var reported atomic.Bool
+
+	go func() {
+		// The satellites take their time: report only once the
+		// migration props are written, and a while after.
+		for range 200 {
+			rd, err := st.ResourceDefinitions().Get(context.Background(), "vm-disk")
+			if err == nil && rd.Annotations[blockstoriov1alpha1.ResourceDefinitionAnnotationLiveMigrateToken] != "" {
+				break
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		time.Sleep(300 * time.Millisecond)
+		reportApplied(t, st, "node-a")
+		reportApplied(t, st, "node-b")
+		reported.Store(true)
+	}()
+
+	status, rcs := postRcs(t, base+"/v1/resource-definitions/vm-disk/resources/node-b/make-available",
+		`{"diskful":false,"auto_manage_dual_primary":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("make-available: %d %+v", status, rcs)
+	}
+
+	if !reported.Load() {
+		t.Fatal("make-available answered before both ends applied the dual-primary props")
+	}
+
+	for _, rc := range rcs {
+		if rc.RetCode == maskWarn {
+			t.Errorf("unexpected warning %+v", rc)
+		}
+	}
+}
+
+// A satellite that never reports (one that predates the report, or one
+// whose adjust keeps failing) does not fail the attach: the bound runs out
+// and the answer carries a warning naming the node.
+func TestMakeAvailableWarnsWhenAnEndDoesNotApply(t *testing.T) {
+	prev := dualPrimaryApplyTimeout
+	dualPrimaryApplyTimeout = 300 * time.Millisecond
+
+	t.Cleanup(func() { dualPrimaryApplyTimeout = prev })
+
+	st, base := liveMigrationFixture(t, nil)
+	markOnline(t, st, "node-a", "node-b")
+
+	status, rcs := postRcs(t, base+"/v1/resource-definitions/vm-disk/resources/node-b/make-available",
+		`{"diskful":false,"auto_manage_dual_primary":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("make-available: %d %+v", status, rcs)
+	}
+
+	last := rcs[len(rcs)-1]
+	if last.RetCode != maskWarn || !strings.Contains(last.Message, "node-a, node-b") {
+		t.Fatalf("last answer %+v, want a warning naming node-a and node-b", last)
 	}
 }

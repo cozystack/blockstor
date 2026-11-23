@@ -31,6 +31,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 const (
@@ -299,6 +300,8 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 	for i := range resources.Items {
 		resource := &resources.Items[i]
 
+		s.stampLiveMigrateApplied(ctx, resource)
+
 		want := s.desiredDrbdState(resource)
 		if resource.Status.DrbdState == want {
 			continue
@@ -317,6 +320,38 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 
 		_ = s.client.Status().Update(ctx, patched)
 	}
+}
+
+// stampLiveMigrateApplied reports the definition's live migration token
+// as applied, as the real satellite does after an apply pass that
+// succeeded, unless the node is offline: make-available waits for it.
+func (s *Satellite) stampLiveMigrateApplied(ctx context.Context, resource *blockstoriov1alpha1.Resource) {
+	if s.isNodeOffline(resource.Spec.NodeName) {
+		return
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := s.client.Get(ctx, client.ObjectKey{Name: naming.Key(resource.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		return
+	}
+
+	token := rd.Annotations[blockstoriov1alpha1.ResourceDefinitionAnnotationLiveMigrateToken]
+	if token == "" || resource.Annotations[blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied] == token {
+		return
+	}
+
+	// Patched in place, so the status update that follows in the same
+	// tick carries the new resourceVersion.
+	base := resource.DeepCopy()
+	if resource.Annotations == nil {
+		resource.Annotations = map[string]string{}
+	}
+
+	resource.Annotations[blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied] = token
+
+	_ = s.client.Patch(ctx, resource, client.MergeFrom(base))
 }
 
 // desiredPoolStatus computes the status we want stamped on a

@@ -20,6 +20,8 @@ package rest
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"slices"
@@ -28,6 +30,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -142,13 +145,15 @@ func (s *Server) liveMigrationSource(ctx context.Context, rd *apiv1.ResourceDefi
 //     migration to prepare any more (an unmake-available on the source
 //     ran in between), and nothing is written.
 //
-// Unlike LINSTOR, the call does not wait for the satellites to apply the
-// change: no definition prop write in blockstor does. The satellites of
-// both ends re-render their resource file from the definition watch.
+// The props reach the satellites through the definition watch, not
+// through the call; waitDualPrimaryApplied holds the answer until both
+// ends report they applied them, as LINSTOR's call does.
 func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target string) ([]apiv1.APICallRc, error) {
 	if source == "" {
 		return notMigrating(rdName), nil
 	}
+
+	token := newApplyToken()
 
 	plan, err := s.planDualPrimary(ctx, rdName, source, target)
 	if err != nil {
@@ -183,6 +188,12 @@ func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target str
 
 			msgs = plan.apply(live.Props)
 
+			if live.Annotations == nil {
+				live.Annotations = map[string]string{}
+			}
+
+			live.Annotations[blockstoriov1alpha1.ResourceDefinitionAnnotationLiveMigrateToken] = token
+
 			return nil
 		})
 	if err != nil {
@@ -193,7 +204,81 @@ func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target str
 		return notMigrating(rdName), nil
 	}
 
-	return msgs, nil
+	return append(msgs, s.waitDualPrimaryApplied(ctx, rdName, token, source, target)...), nil
+}
+
+// dualPrimaryApplyTimeout bounds how long make-available waits for the
+// satellites of both ends to apply the dual-Primary props, and
+// dualPrimaryApplyPoll how often it looks. CSI's external-attacher gives
+// up on a ControllerPublish after 15s by default and retries it, and the
+// retry repeats the prepared migration and waits again, so the bound
+// stays below that.
+//
+//nolint:gochecknoglobals // tests shorten them
+var (
+	dualPrimaryApplyTimeout = 10 * time.Second
+	dualPrimaryApplyPoll    = 100 * time.Millisecond
+)
+
+// newApplyToken answers a token unique to one make-available.
+func newApplyToken() string {
+	var raw [8]byte
+
+	_, _ = rand.Read(raw[:])
+
+	return hex.EncodeToString(raw[:])
+}
+
+// waitDualPrimaryApplied waits until the satellites of source and target
+// both report they applied the definition that carried token, as LINSTOR
+// waits for its satellites before it answers: linstor-csi starts the
+// migration on the answer, and the target cannot become Primary until
+// allow-two-primaries is in effect on both ends. A node that is not
+// ONLINE is not waited for, it applies nothing. When the bound runs out
+// the call still succeeds, with a warning naming the nodes that have not
+// reported: the props are written and will be applied, and refusing would
+// make a satellite that predates the report fail every migration.
+func (s *Server) waitDualPrimaryApplied(ctx context.Context, rdName, token, source, target string) []apiv1.APICallRc {
+	pending := make([]string, 0, 2)
+
+	for _, node := range []string{source, target} {
+		n, err := s.Store.Nodes().Get(ctx, node)
+		if err == nil && strings.EqualFold(n.ConnectionStatus, apiv1.NodeTypeOnline) {
+			pending = append(pending, node)
+		}
+	}
+
+	deadline := time.Now().Add(dualPrimaryApplyTimeout)
+
+	for {
+		pending = slices.DeleteFunc(pending, func(node string) bool {
+			res, err := s.Store.Resources().Get(ctx, rdName, node)
+
+			return err == nil && res.Annotations[blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied] == token
+		})
+
+		if len(pending) == 0 {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(dualPrimaryApplyPoll):
+		}
+	}
+
+	return []apiv1.APICallRc{{
+		RetCode: maskWarn,
+		Message: fmt.Sprintf("The satellites on %s have not confirmed the dual-primary settings of resource '%s' yet",
+			strings.Join(pending, ", "), rdName),
+		Cause:  "The live migration may fail to promote the target until they do.",
+		Correc: "Check the satellite logs on those nodes for a failed drbdadm adjust.",
+	}}
 }
 
 // planDualPrimary reads what the protocol of each end depends on below and
