@@ -234,6 +234,8 @@ kubectl get resource "${rd}.${node}" -o json \
 
 Combined with `ResourceDefinition.Spec.VolumeDefinitions[].SizeKib`, callers compute sync-progress percentage. Useful for "wait until sync finishes" loops that today poll `disk:UpToDate` repeatedly — `outOfSyncKib==0` is the cleaner predicate.
 
+The field is whichever peer-device frame came last, so it is not a resync progress once a replica has more than one peer. The progress of a running resync is DRBD's per-peer `done`, recorded on `.status.connections[].peerVolumes[].done` (empty when no resync with that peer runs); `r l` renders it as `SyncTarget(NN.NN%)`.
+
 ---
 
 ## DRBD IDs (TCP port, minor, node-id)
@@ -528,7 +530,7 @@ Phase 11.5.b backlog. P0 already landed; P1/P2 still need schema additions:
 - **`Status.MayPromote`** (P2, not in schema). Tests use `may_promote:no` as a quorum-suspension probe today; with Suspended shipped MayPromote is largely redundant — defer until a concrete test needs it.
 - **`Connections[*].PeerDrbdNodeId`** (P1, not in schema). The workaround "read the peer's own Resource CRD's `Status.DRBDNodeID`" returns the same answer today.
 - **`Connections[*].PeerVolumes[*].PeerDiskState`** (P1, not in schema). Distinct from "the peer's own diskState" — this is the LOCAL kernel's VIEW of the peer's disk, which can diverge under partition. Needed by `network-partition.sh` and `state-standalone-partition.sh`.
-- **`Connections[*].PeerVolumes[*].OutOfSyncKib`** (P2, not in schema). Per-peer (vs worst-case) sync-progress.
+- **`Connections[*].PeerVolumes[*].Done`**: **SHIPPED**. Per-peer resync progress, DRBD's `done` token (the per-peer out-of-sync count is still not in schema).
 
 The `kernel_role` / `kernel_suspended` fallback helpers in the `lib.sh` section below are now **vestigial** — keep them out of new tests. They are documented only as a reference for what the `drbdsetup` parse used to look like.
 
