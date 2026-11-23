@@ -188,11 +188,14 @@ type Volume struct {
 }
 
 // VolumeLayerData mirrors upstream LINSTOR's per-volume layer
-// descriptor: a `type` (DRBD/STORAGE/LUKS/…) plus an opaque
-// `data` blob (we leave it empty for now — the CLI only reads
-// the type discriminator to gate the disk_state trust path).
+// descriptor: a `type` (DRBD/STORAGE/LUKS/…) plus the layer's `data`.
+// Only the STORAGE layer of a replica with a disk carries data: the
+// sizes linstor-csi adds up to the capacity a thin pool has promised
+// (ReservedCapacity) when a StorageClass sets overProvision. The CLI
+// only reads the type discriminator to gate the disk_state trust path.
 type VolumeLayerData struct {
-	Type string `json:"type"`
+	Type string              `json:"type"`
+	Data *StorageVolumeLayer `json:"data,omitempty"`
 }
 
 // VolumeState is the runtime state surface of a Volume.
