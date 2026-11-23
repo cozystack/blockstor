@@ -752,6 +752,10 @@ func (w *DRBDWorkaroundsRunnable) reconnectActivePeer(
 	}
 }
 
+// reconnectPendingPerm is the mode of an owed-reconnect record: an empty
+// file only the satellite reads.
+const reconnectPendingPerm = 0o600
+
 // reconnectPendingPath is the state file of name's owed reconnect, or ""
 // without a state dir.
 func (w *DRBDWorkaroundsRunnable) reconnectPendingPath(name string) string {
@@ -780,7 +784,7 @@ func (w *DRBDWorkaroundsRunnable) oweReconnect(logger logr.Logger, name string) 
 		return
 	}
 
-	err := os.WriteFile(path, nil, 0o600)
+	err := os.WriteFile(path, nil, reconnectPendingPerm)
 	if err != nil {
 		logger.Error(err, "record the reconnect owed to a resource", "resource", name)
 	}
