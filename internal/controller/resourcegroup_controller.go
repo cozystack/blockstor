@@ -28,6 +28,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -63,6 +64,10 @@ type ResourceGroupReconciler struct {
 	// the REST server and the other reconcilers). Required for the
 	// placer integration.
 	Store store.Store
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch;create;update;patch;delete
@@ -71,11 +76,18 @@ type ResourceGroupReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile finds every RD spawned from this RG and runs the placer
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass finds every RD spawned from this RG and runs the placer
 // to backfill replicas missing under the new spec. Idempotent: an
 // RG without any change still passes through, the placer's
 // already-placed accounting prevents extra Resources.
-func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ResourceGroupReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if r.Store == nil {

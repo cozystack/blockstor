@@ -37,6 +37,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite"
 )
@@ -115,13 +116,24 @@ type PhysicalDeviceReconciler struct {
 	client.Client
 
 	Config Config
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
-// Reconcile is the per-event driver. Returns:
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *PhysicalDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass) //nolint:wrapcheck // the pass's own error, already wrapped
+}
+
+// ReconcilePass is the per-event driver. Returns:
 //   - {}, nil          — nothing to do (no AttachTo, foreign node, already gone).
 //   - {Requeue:true}   — Attach failed; controller-runtime back-off retries.
 //   - {}, error        — apiserver-level failure (Get/Update/Delete).
-func (r *PhysicalDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PhysicalDeviceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var dev blockstoriov1alpha1.PhysicalDevice
 
 	err := r.Get(ctx, req.NamespacedName, &dev)

@@ -71,9 +71,22 @@ func reconcileWithFailingFinalizerWrite(t *testing.T, kind string, err error) (c
 			Nodes:                  []string{"n1"},
 		},
 	}
+	pool := &blockstoriov1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "thin.n1"},
+		Spec:       blockstoriov1alpha1.StoragePoolSpec{NodeName: "n1", PoolName: "thin", ProviderKind: "LVM_THIN"},
+	}
+	dev := &blockstoriov1alpha1.PhysicalDevice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "n1.wwn-0xc",
+			Labels: map[string]string{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n1"},
+		},
+		Spec: blockstoriov1alpha1.PhysicalDeviceSpec{
+			AttachTo: &blockstoriov1alpha1.AttachToPool{StoragePoolName: "thin", ProviderKind: "LVM_THIN", VGName: "vg", ThinPoolName: "tp"},
+		},
+	}
 
 	cli := interceptor.NewClient(
-		fake.NewClientBuilder().WithScheme(newSnapshotScheme(t)).WithObjects(res, snap).Build(),
+		fake.NewClientBuilder().WithScheme(newSnapshotScheme(t)).WithObjects(res, snap, pool, dev).Build(),
 		failUpdates(err),
 	)
 	cfg := controllers.Config{NodeName: "n1", Exec: storage.NewFakeExec()}
@@ -85,11 +98,20 @@ func reconcileWithFailingFinalizerWrite(t *testing.T, kind string, err error) (c
 	switch kind {
 	case "resource":
 		reconciler = &controllers.ResourceReconciler{Client: cli, Config: cfg}
+	case "storagepool":
+		reconciler = &controllers.StoragePoolReconciler{Client: cli, Config: cfg}
+	case "physicaldevice":
+		reconciler = &controllers.PhysicalDeviceReconciler{Client: cli, Config: cfg}
 	default:
 		reconciler = &controllers.SnapshotReconciler{Client: cli, Config: cfg}
 	}
 
-	name := map[string]string{"resource": "pvc-c.n1", "snapshot": "pvc-c.snap-c"}[kind]
+	name := map[string]string{
+		"resource":       "pvc-c.n1",
+		"snapshot":       "pvc-c.snap-c",
+		"storagepool":    "thin.n1",
+		"physicaldevice": "n1.wwn-0xc",
+	}[kind]
 
 	return reconciler.Reconcile(context.Background(), ctrl.Request{ //nolint:wrapcheck // the result under test
 		NamespacedName: types.NamespacedName{Name: name},
@@ -102,7 +124,12 @@ func reconcileWithFailingFinalizerWrite(t *testing.T, kind string, err error) (c
 func TestSatelliteRetriesAFinalizerWriteThatLostARace(t *testing.T) {
 	t.Parallel()
 
-	for kind, resource := range map[string]string{"resource": "resources", "snapshot": "snapshots"} {
+	for kind, resource := range map[string]string{
+		"resource":       "resources",
+		"snapshot":       "snapshots",
+		"storagepool":    "storagepools",
+		"physicaldevice": "physicaldevices",
+	} {
 		t.Run(kind, func(t *testing.T) {
 			t.Parallel()
 
@@ -122,7 +149,7 @@ func TestSatelliteRetriesAFinalizerWriteThatLostARace(t *testing.T) {
 func TestSatelliteReportsAFinalizerWriteThatFailed(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []string{"resource", "snapshot"} {
+	for _, kind := range []string{"resource", "snapshot", "storagepool", "physicaldevice"} {
 		t.Run(kind, func(t *testing.T) {
 			t.Parallel()
 
