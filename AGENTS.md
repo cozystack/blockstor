@@ -29,6 +29,8 @@ and you must not reproduce their structure in blockstor.
 - Every blockstor-authored Go source file carries an
   `// SPDX-License-Identifier: Apache-2.0` header at the top.
 
+**One exception, for interface data:** `third_party/linstor-common` (LINBIT's linstor-common, a submodule of linstor-server with no license file of its own) may be read by a tool as data. Its `drbdoptions.json` is the output of `gendrbdoptions.py` over `drbdsetup xml-help`, the machine form of the option list the drbdsetup man pages document, and its `properties.json` lists the property keys LINSTOR accepts. A tool may carry over from them the facts a client depends on: key names, value types, enum values, ranges and units, as `hack/gen-drbd-whitelist` does for `pkg/propwhitelist/drbdoptions.json` and as `pkg/drbd/options.go` does by hand. Nothing else crosses: no descriptions or help text, no code, no comments, and nothing `genproperties.py` writes (it stamps GPLv3 on its Java and Python output, `GeneratedPropertyRules.java` among them). A file built this way names its linstor-common commit.
+
 **Apache-2.0 references that are safe to study, adapt, and depend on:**
 
 - [`github.com/LINBIT/golinstor`](https://github.com/LINBIT/golinstor)

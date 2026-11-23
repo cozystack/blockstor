@@ -26,6 +26,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -191,6 +192,10 @@ func (s *Server) handleStoragePoolDefinitionModify(w http.ResponseWriter, r *htt
 
 			return
 		}
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.StoragePoolDefinition, body.OverrideProps) {
+		return
 	}
 
 	applySPDfnPropsPatch(&def, &body)
