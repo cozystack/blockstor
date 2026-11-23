@@ -283,6 +283,13 @@ func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *block
 	case errors.Is(err, errResourceBusy):
 		// Another suspend holds the resource; its resume would end
 		// ours. Nothing is suspended for this one yet.
+		if r.mustNotWaitFor(ctx, snap) {
+			log.FromContext(ctx).Info("resource held by a later snapshot; failing this one instead of waiting",
+				"snapshot", snap.Spec.SnapshotName)
+
+			return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
+		}
+
 		return ctrl.Result{RequeueAfter: snapshotBusyRetry}, nil
 	case errors.Is(err, errSatelliteStopping):
 		return ctrl.Result{}, err

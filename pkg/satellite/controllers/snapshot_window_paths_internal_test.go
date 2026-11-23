@@ -250,7 +250,7 @@ func TestSnapshotWindowsOfOneResourceDoNotEndEachOther(t *testing.T) {
 
 	rig := newWindowRig(t)
 	rig.r.timing.windowDeadline = time.Minute
-	rig.create(windowSnapshot(other, windowTestResource))
+	rig.create(laterSnapshot(other))
 
 	rig.reconcile()
 
@@ -288,6 +288,68 @@ func TestSnapshotWindowsOfOneResourceDoNotEndEachOther(t *testing.T) {
 	if !rig.kernel.isSuspended() || rig.r.windowsFor().get(other) == nil {
 		t.Errorf("second window did not open once the resource was free")
 	}
+}
+
+// laterSnapshot is a Snapshot of the test resource created after the
+// rig's own one.
+func laterSnapshot(name string) *blockstoriov1alpha1.Snapshot {
+	snap := windowSnapshot(name, windowTestResource)
+	snap.CreationTimestamp = metav1.NewTime(time.Now())
+
+	return snap
+}
+
+// Two snapshots of one resource reach two satellites in opposite order:
+// each holds the resource on one node and is refused on the other. If
+// both waited, I/O would stay frozen on both nodes until the deadline.
+// Only a wait for an earlier snapshot is allowed, so the earlier one
+// fails where a later one holds the resource, instead of waiting, and
+// the later one goes on; a later one that is already taking is waited
+// for, since it resumes without anything from this node.
+func TestSnapshotHeldOffByALaterOneFailsInsteadOfWaiting(t *testing.T) {
+	t.Parallel()
+
+	const later = windowTestResource + ".snap-2"
+
+	t.Run("later one still suspending", func(t *testing.T) {
+		t.Parallel()
+
+		rig := newWindowRig(t)
+		rig.r.timing.windowDeadline = time.Minute
+		rig.create(laterSnapshot(later))
+		rig.reconcileName(later)
+
+		res := rig.reconcileName(windowTestSnapshot)
+
+		if !rig.node().Failed || res.RequeueAfter != 0 {
+			t.Errorf("earlier snapshot waits for a later one: res=%+v node=%+v", res, rig.node())
+		}
+
+		if n := rig.kernel.count(suspendCmd); n != 1 || rig.r.windowsFor().get(windowTestSnapshot) != nil {
+			t.Errorf("earlier snapshot suspended over a later one: suspends=%d", n)
+		}
+
+		if rig.r.windowsFor().get(later) == nil || !rig.kernel.isSuspended() {
+			t.Errorf("the later snapshot's window was ended")
+		}
+	})
+
+	t.Run("later one already taking", func(t *testing.T) {
+		t.Parallel()
+
+		rig := newWindowRig(t)
+		rig.r.timing.windowDeadline = time.Minute
+		rig.create(laterSnapshot(later))
+		rig.reconcileName(later)
+		rig.controllerSetsOn(later, true, true)
+
+		res := rig.reconcileName(windowTestSnapshot)
+
+		if rig.node().Failed || res.RequeueAfter == 0 {
+			t.Errorf("earlier snapshot does not wait for a later one that is taking: res=%+v node=%+v",
+				res, rig.node())
+		}
+	})
 }
 
 // A STORAGE-only resource on a satellite that runs DRBD for others has

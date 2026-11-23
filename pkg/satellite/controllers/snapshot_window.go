@@ -291,24 +291,71 @@ func (set *snapshotWindows) names() []string {
 // flag per resource, so the resume of one would end the other. The
 // caller holds set.mu and read markers from disk.
 func (set *snapshotWindows) busyLocked(resource, snapshot string, markers []suspendMarker) bool {
-	if set.resumingResources[resource] {
-		return true
-	}
+	return set.resumingResources[resource] || set.holderLocked(resource, snapshot, markers) != ""
+}
 
+// holderLocked returns the other snapshot whose live window or
+// unresumed marker holds the resource, or "" when none does.
+func (set *snapshotWindows) holderLocked(resource, snapshot string, markers []suspendMarker) string {
 	for name, w := range set.windows {
 		if name != snapshot && w.marker.Resource == resource {
-			return true
+			return name
 		}
 	}
 
 	for i := range markers {
 		m := &markers[i]
 		if m.Snapshot != snapshot && m.Resource == resource && !m.Resumed {
-			return true
+			return m.Snapshot
 		}
 	}
 
-	return false
+	return ""
+}
+
+// mustNotWaitFor reports whether snap, refused a suspend because another
+// snapshot of its resource holds it, has to fail instead of waiting.
+//
+// The controller does not serialize snapshots of one resource, and each
+// satellite works through its own queue, so two snapshots can each hold
+// the resource on one node and wait for it on the other until the
+// deadline, with I/O frozen on both. Waiting only for an earlier
+// snapshot keeps every wait pointing one way, so the waits never form a
+// cycle and one snapshot always gets through: a snapshot held off by a
+// later one that has not reached its take fails here, the later one is
+// taken, and the caller retries. A holder already taking has every node's ack and
+// resumes on its own, so it is waited for.
+func (r *SnapshotReconciler) mustNotWaitFor(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) bool {
+	set := r.windowsFor()
+	markers := r.listMarkers()
+
+	set.mu.Lock()
+	holder := set.holderLocked(naming.Key(snap.Spec.ResourceDefinitionName), snap.Name, markers)
+	set.mu.Unlock()
+
+	if holder == "" {
+		return false
+	}
+
+	var other blockstoriov1alpha1.Snapshot
+
+	err := r.Get(ctx, types.NamespacedName{Name: holder}, &other)
+	if err != nil {
+		return false
+	}
+
+	return other.Spec.SuspendIO && !other.Spec.TakeSnapshot && snapshotBefore(snap, &other)
+}
+
+// snapshotBefore orders snapshots by creation, then by name, the same
+// way on every satellite.
+func snapshotBefore(a, b *blockstoriov1alpha1.Snapshot) bool {
+	at, bt := a.CreationTimestamp.Time, b.CreationTimestamp.Time
+	if !at.Equal(bt) {
+		return at.Before(bt)
+	}
+
+	return a.Name < b.Name
 }
 
 // heldByOther reports whether a live window of another snapshot holds
