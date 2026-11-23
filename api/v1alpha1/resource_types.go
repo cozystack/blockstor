@@ -423,6 +423,21 @@ type ResourceStatus struct {
 	// +optional
 	Suspended string `json:"suspended,omitempty"`
 
+	// promotionScore is the kernel's score for promoting this
+	// replica, parsed from the `promotion_score:` token in
+	// `drbdsetup events2` resource frames. Zero means the kernel
+	// would refuse a promotion here: no reachable UpToDate data, or
+	// no quorum. linstor-csi's volume health reads it as LINSTOR
+	// reports it, so a replica with a score of 0 is an unhealthy
+	// one. Unset until the satellite has seen a resource frame.
+	// +optional
+	PromotionScore *int32 `json:"promotionScore,omitempty"`
+
+	// mayPromote is the kernel's `may_promote:` token from the same
+	// frame: whether a promotion would succeed right now.
+	// +optional
+	MayPromote *bool `json:"mayPromote,omitempty"`
+
 	// toggleDiskRetries counts how many times the satellite
 	// reconciler has failed mid-conversion while running the
 	// diskless→diskful chain (storage carve → drbdmeta create-md

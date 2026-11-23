@@ -78,6 +78,11 @@ type observation struct {
 	// a recoverable quorum suspend (auto-clears when quorum returns)
 	// from a user-issued or fencing-handler suspend.
 	Suspended string
+	// PromotionScore and MayPromote mirror the `promotion_score:` and
+	// `may_promote:` tokens of resource frames; nil when the frame
+	// carries none. linstor-csi's volume health reads the score.
+	PromotionScore *int32
+	MayPromote     *bool
 	// HasResource marks observations that carry a fresh resource-
 	// kind frame (role transition → InUse, disk transition →
 	// DrbdState). mergeResource only updates its cache from
@@ -284,10 +289,45 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		InUse:           ev.Fields["role"] == drbdRolePrimary,
 		Role:            ev.Fields["role"],
 		Suspended:       normalizeSuspended(ev.Fields["suspended"]),
+		PromotionScore:  parsePromotionScore(ev.Fields["promotion_score"]),
+		MayPromote:      parseYesNo(ev.Fields["may_promote"]),
 		HasResource:     true,
 		KernelLoaded:    normalizeKernelLoaded(ev.Action),
 		HasKernelLoaded: true,
 	}, true
+}
+
+// parsePromotionScore reads the `promotion_score:` token of a resource
+// frame; nil when the frame has none or it is not a number.
+func parsePromotionScore(raw string) *int32 {
+	if raw == "" {
+		return nil
+	}
+
+	score, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil {
+		return nil
+	}
+
+	out := int32(score)
+
+	return &out
+}
+
+// parseYesNo reads a drbdsetup yes/no token; nil when it is neither.
+func parseYesNo(raw string) *bool {
+	var out bool
+
+	switch raw {
+	case drbdQuorumYes:
+		out = true
+	case "no":
+		out = false
+	default:
+		return nil
+	}
+
+	return &out
 }
 
 // normalizeKernelLoaded maps an events2 resource-kind verb to the
@@ -810,10 +850,12 @@ type connectionLifecycle struct {
 // without caching the next non-resource event would strip f:role /
 // f:suspended off the observer's owner claim.
 type resourceObservation struct {
-	InUse     bool
-	DrbdState string
-	Role      string
-	Suspended string
+	InUse          bool
+	DrbdState      string
+	Role           string
+	Suspended      string
+	PromotionScore *int32
+	MayPromote     *bool
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -980,6 +1022,8 @@ func (o *ObserverRunnable) snapshotFor(name string) observation {
 		out.DrbdState = r.DrbdState
 		out.Role = r.Role
 		out.Suspended = r.Suspended
+		out.PromotionScore = r.PromotionScore
+		out.MayPromote = r.MayPromote
 	}
 	o.resMu.Unlock()
 
@@ -1015,6 +1059,16 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 		cur.InUse = ev.InUse
 		cur.Role = ev.Role
 		cur.Suspended = normalizeSuspended(ev.Suspended)
+
+		// A resource frame without the tokens (a destroy frame, an
+		// older drbd-utils) keeps the last value seen.
+		if ev.PromotionScore != nil {
+			cur.PromotionScore = ev.PromotionScore
+		}
+
+		if ev.MayPromote != nil {
+			cur.MayPromote = ev.MayPromote
+		}
 	}
 
 	// DrbdState flows from device-kind events (translateDeviceEvent
@@ -1035,6 +1089,8 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 	ev.DrbdState = cur.DrbdState
 	ev.Role = cur.Role
 	ev.Suspended = cur.Suspended
+	ev.PromotionScore = cur.PromotionScore
+	ev.MayPromote = cur.MayPromote
 }
 
 // handleObservation runs the per-event side-effects: the
@@ -1815,12 +1871,14 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		TypeMeta:   metav1.TypeMeta{Kind: resourceKind, APIVersion: blockstoriov1alpha1.GroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Status: blockstoriov1alpha1.ResourceStatus{
-			InUse:       ev.InUse,
-			DrbdState:   ev.DrbdState,
-			Role:        ev.Role,
-			Suspended:   normalizeSuspended(ev.Suspended),
-			Volumes:     buildObserverVolumeStatus(ev, storagePool),
-			Connections: buildObserverConnectionStatus(ev),
+			InUse:          ev.InUse,
+			DrbdState:      ev.DrbdState,
+			Role:           ev.Role,
+			Suspended:      normalizeSuspended(ev.Suspended),
+			PromotionScore: ev.PromotionScore,
+			MayPromote:     ev.MayPromote,
+			Volumes:        buildObserverVolumeStatus(ev, storagePool),
+			Connections:    buildObserverConnectionStatus(ev),
 		},
 	}
 

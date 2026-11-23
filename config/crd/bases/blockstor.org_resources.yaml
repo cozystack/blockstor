@@ -687,6 +687,22 @@ spec:
                 description: inUse is whether DRBD reports the resource as primary
                   anywhere.
                 type: boolean
+              mayPromote:
+                description: |-
+                  mayPromote is the kernel's `may_promote:` token from the same
+                  frame: whether a promotion would succeed right now.
+                type: boolean
+              promotionScore:
+                description: |-
+                  promotionScore is the kernel's score for promoting this
+                  replica, parsed from the `promotion_score:` token in
+                  `drbdsetup events2` resource frames. Zero means the kernel
+                  would refuse a promotion here: no reachable UpToDate data, or
+                  no quorum. linstor-csi's volume health reads it as LINSTOR
+                  reports it, so a replica with a score of 0 is an unhealthy
+                  one. Unset until the satellite has seen a resource frame.
+                format: int32
+                type: integer
               role:
                 description: |-
                   role is the kernel-reported DRBD-9 role on this node, parsed
