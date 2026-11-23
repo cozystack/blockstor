@@ -1206,14 +1206,37 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read before the delete, used after it: the definition's own props
-	// are the only record of the internal snapshot a clone left on its
-	// source.
-	clonedFrom, err := store.OwnedCloneSnapshot(r.Context(), s.Store, name)
+	answer, err := s.deleteDefinitionData(r.Context(), name)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: warnRDNotFound,
+				Message: "resource definition already absent: " + name,
+			}})
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return
+	}
+
+	writeJSON(w, http.StatusOK, answer)
+}
+
+// deleteDefinitionData deletes a resource definition whose snapshots the
+// caller has already ruled out: its replicas, then the definition, then
+// what a racing snapshot or the definition's own clone left behind. It
+// answers the response entries, or an error wrapping store.ErrNotFound
+// when the definition is already gone.
+func (s *Server) deleteDefinitionData(ctx context.Context, name string) ([]apiv1.APICallRc, error) {
+	// Read before the delete, used after it: the definition's own props
+	// are the only record of the internal snapshot a clone left on its
+	// source.
+	clonedFrom, err := store.OwnedCloneSnapshot(ctx, s.Store, name)
+	if err != nil {
+		return nil, errors.Wrapf(err, "read the clone snapshot %s holds", name)
 	}
 
 	// Cascade the delete to all child Resource replicas BEFORE
@@ -1233,14 +1256,12 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// existing `blockstor.org/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
-	err = s.cascadeDeleteResources(r.Context(), name)
+	err = s.cascadeDeleteResources(ctx, name)
 	if err != nil {
-		writeStoreError(w, err)
-
-		return
+		return nil, err
 	}
 
-	err = s.Store.ResourceDefinitions().Delete(r.Context(), name)
+	err = s.Store.ResourceDefinitions().Delete(ctx, name)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			// Bug 124: even on the idempotent-no-op branch, drain the
@@ -1248,23 +1269,15 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 			// here on a sibling replica whose informer cache still
 			// has the RD; the user expects the follow-up `r l` to
 			// reflect the (already-committed) deletion.
-			s.waitForRDDeletionVisible(r.Context(), name)
-
-			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-				RetCode: warnRDNotFound,
-				Message: "resource definition already absent: " + name,
-			}})
-
-			return
+			s.waitForRDDeletionVisible(ctx, name)
 		}
 
-		writeStoreError(w, err)
-
-		return
+		//nolint:wrapcheck // the caller tells ErrNotFound from the rest
+		return nil, err
 	}
 
 	// Bug 180 post-Delete snapshot sweep — symmetric close of the
-	// snap-create / rd-delete TOCTOU window. The pre-walk above
+	// snap-create / rd-delete TOCTOU window. The pre-walk
 	// refused on a non-empty snapshot set, but the walk and the
 	// final Delete are not atomic: a concurrent
 	// `linstor s c <rd> <snap>` can slip between the snapshot
@@ -1277,7 +1290,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// committed, mop up any snapshot rows that slipped through the
 	// pre-walk so no orphan survives. Mirrors Bug 174's two-sided
 	// close: either ordering yields a clean cluster.
-	s.sweepOrphanSnapshotsAfterRDDelete(r.Context(), name)
+	s.sweepOrphanSnapshotsAfterRDDelete(ctx, name)
 
 	// And the internal snapshot the clone of this definition took on its
 	// SOURCE. Nothing else reaps it: the operator-facing snapshot doors
@@ -1285,14 +1298,14 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// this one never carries, so it outlived the target it was taken for
 	// and left the source undeletable through this very handler, which
 	// refuses a definition that has snapshots.
-	reaped := reapClonedSnapshot(r.Context(), s.Store, name, clonedFrom)
+	reaped := reapClonedSnapshot(ctx, s.Store, name, clonedFrom)
 
 	// Bug 124: block the response until the local informer cache has
 	// observed the RD + child Resource deletions. Without this gate,
 	// `linstor rd d <rd>` returns SUCCESS and the very next
 	// `linstor r l` shows phantom rows for 5–30 s until the cache
 	// catches up on its watch stream. See pkg/rest/cache_invalidation.go.
-	s.waitForRDDeletionVisible(r.Context(), name)
+	s.waitForRDDeletionVisible(ctx, name)
 
 	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
@@ -1302,7 +1315,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 		answer = append(answer, *reaped)
 	}
 
-	writeJSON(w, http.StatusOK, answer)
+	return answer, nil
 }
 
 // rdHasNoSnapshots is handleRDDelete's pre-walk: it refuses, and answers
