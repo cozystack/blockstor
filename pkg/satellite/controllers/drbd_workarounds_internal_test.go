@@ -390,6 +390,36 @@ func TestStalledResyncCatchesHeldRequests(t *testing.T) {
 	}
 }
 
+// A cluster with a lower c-min-rate or a low fixed resync-rate sets a
+// lower floor, and a slow but healthy resync there is left alone; at the
+// default floor, the same resync counts as stalled.
+func TestStalledResyncMinRateFollowsTheConfig(t *testing.T) {
+	t.Parallel()
+
+	// 120 KiB/s, a resync-rate of 120k.
+	samples := ramp(10, func(pass int64) resyncSample {
+		return resyncSample{oos: 100000 - pass*3600, received: pass * 3600, outstanding: 16 + pass%2}
+	})
+
+	for _, tc := range []struct {
+		minRate int
+		acted   bool
+	}{
+		{minRate: 100, acted: false},
+		{minRate: 0, acted: true},
+	} {
+		cfg := stallConfig()
+		cfg.StalledResyncMinRate = tc.minRate
+
+		adm := &fakeWorkaroundAdm{}
+		w, _ := newTestWorkarounds(t, adm, cfg, "pvc-stall")
+
+		if got := runResync(t, w, adm, "Secondary", samples...); (len(got) != 0) != tc.acted {
+			t.Errorf("min rate %d: actions = %v, want acted %v", tc.minRate, got, tc.acted)
+		}
+	}
+}
+
 // A resync that moves is left alone, however long it takes, even with a
 // steady number of requests in flight; one moving pass starts the count
 // over.
@@ -1287,7 +1317,7 @@ func TestWorkaroundsLogTheirStateAtStart(t *testing.T) {
 			name: "enabled",
 			cfg:  cfg,
 			want: `"msg"="DRBD workarounds enabled" "interval"="30s" "stalledResync"=true "stalledResyncPasses"=4 ` +
-				`"idlePrimary"=false "forcedIOFailures"=true "staleLoopDevices"=true`,
+				`"stalledResyncMinRate"=200 "idlePrimary"=false "forcedIOFailures"=true "staleLoopDevices"=true`,
 			runs: 1,
 		},
 		{

@@ -69,9 +69,10 @@ func parseFlags(flagSet *flag.FlagSet, args []string) (options, error) {
 		return opts, errors.Wrap(err, "parse flags")
 	}
 
-	if opts.workarounds.Interval < 0 || opts.workarounds.StalledResyncPasses < 1 {
-		return opts, errors.Wrapf(errBadWorkaroundFlags, "interval %s, stalled resync passes %d",
-			opts.workarounds.Interval, opts.workarounds.StalledResyncPasses)
+	if opts.workarounds.Interval < 0 || opts.workarounds.StalledResyncPasses < 1 ||
+		opts.workarounds.StalledResyncMinRate < 1 {
+		return opts, errors.Wrapf(errBadWorkaroundFlags, "interval %s, stalled resync passes %d, min rate %d",
+			opts.workarounds.Interval, opts.workarounds.StalledResyncPasses, opts.workarounds.StalledResyncMinRate)
 	}
 
 	err = opts.streamTLS.Validate()
@@ -83,9 +84,10 @@ func parseFlags(flagSet *flag.FlagSet, args []string) (options, error) {
 }
 
 // errBadWorkaroundFlags refuses a negative workaround interval or a
-// stalled-resync check that would act without seeing a stall.
-var errBadWorkaroundFlags = errors.New("--drbd-workarounds-interval must not be negative " +
-	"and --drbd-workaround-stalled-resync-passes must be at least 1")
+// stalled-resync check that would act without seeing a stall, or never
+// see one.
+var errBadWorkaroundFlags = errors.New("--drbd-workarounds-interval must not be negative, " +
+	"--drbd-workaround-stalled-resync-passes and --drbd-workaround-stalled-resync-min-rate must be at least 1")
 
 // registerWorkaroundFlags registers the flags of the satellite's DRBD
 // workarounds (pkg/satellite/controllers/drbd_workarounds.go): all on by
@@ -100,6 +102,9 @@ func registerWorkaroundFlags(flagSet *flag.FlagSet, cfg *controllers.Workarounds
 			"or failing that the peer the stalled resync pulls from (LINBIT/drbd#149).")
 	flagSet.IntVar(&cfg.StalledResyncPasses, "drbd-workaround-stalled-resync-passes", def.StalledResyncPasses,
 		"Passes in a row with too little resync progress before the stalled-resync workaround acts.")
+	flagSet.IntVar(&cfg.StalledResyncMinRate, "drbd-workaround-stalled-resync-min-rate", def.StalledResyncMinRate,
+		"Resync progress in KiB/s below which a pass counts as stalled; keep it under the resource's "+
+			"c-min-rate, or its resync-rate when the rate is fixed.")
 	flagSet.BoolVar(&cfg.IdlePrimary, "drbd-workaround-idle-primary", def.IdlePrimary,
 		"Demote a Primary with no volume open (DRBD auto-demote not firing, piraeus-operator#942).")
 	flagSet.BoolVar(&cfg.ForcedIOFailures, "drbd-workaround-forced-io-failures", def.ForcedIOFailures,

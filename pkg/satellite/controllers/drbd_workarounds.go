@@ -69,9 +69,11 @@ type WorkaroundsConfig struct {
 
 	// StalledResync disconnects the peer a stalled resync waits on, or
 	// reconnects the one it pulls from (checkStalledResync), after
-	// StalledResyncPasses passes in a row with too little progress.
-	StalledResync       bool
-	StalledResyncPasses int
+	// StalledResyncPasses passes in a row with less progress than
+	// StalledResyncMinRate KiB/s; zero is the default rate.
+	StalledResync        bool
+	StalledResyncPasses  int
+	StalledResyncMinRate int
 
 	// IdlePrimary demotes a Primary nobody uses (checkIdlePrimary).
 	IdlePrimary bool
@@ -86,21 +88,27 @@ type WorkaroundsConfig struct {
 }
 
 // The plunger's cadence: a pass every 30 s, a resync stalled for 4 of
-// them.
+// them. A resync counts as stalled below 200 KiB/s: DRBD's defaults keep
+// one at c-min-rate (250 KiB/s) or faster even under application I/O,
+// and the trickle seen on the test cluster ran at 100-150 KiB/s. A
+// cluster that lowers c-min-rate or sets a low fixed resync-rate lowers
+// this too.
 const (
-	defaultWorkaroundInterval  = 30 * time.Second
-	defaultStalledResyncPasses = 4
+	defaultWorkaroundInterval   = 30 * time.Second
+	defaultStalledResyncPasses  = 4
+	defaultStalledResyncMinRate = 200
 )
 
 // DefaultWorkaroundsConfig is every check on, at the plunger's cadence.
 func DefaultWorkaroundsConfig() WorkaroundsConfig {
 	return WorkaroundsConfig{
-		Interval:            defaultWorkaroundInterval,
-		StalledResync:       true,
-		StalledResyncPasses: defaultStalledResyncPasses,
-		IdlePrimary:         true,
-		ForcedIOFailures:    true,
-		StaleLoopDevices:    true,
+		Interval:             defaultWorkaroundInterval,
+		StalledResync:        true,
+		StalledResyncPasses:  defaultStalledResyncPasses,
+		StalledResyncMinRate: defaultStalledResyncMinRate,
+		IdlePrimary:          true,
+		ForcedIOFailures:     true,
+		StaleLoopDevices:     true,
 	}
 }
 
@@ -110,6 +118,16 @@ func DefaultWorkaroundsConfig() WorkaroundsConfig {
 func (c WorkaroundsConfig) enabled() bool {
 	return c.Interval > 0 &&
 		(c.StalledResync || c.IdlePrimary || c.ForcedIOFailures || c.StaleLoopDevices)
+}
+
+// stalledResyncMinRate is StalledResyncMinRate, or the default when it
+// is not set.
+func (c WorkaroundsConfig) stalledResyncMinRate() int {
+	if c.StalledResyncMinRate <= 0 {
+		return defaultStalledResyncMinRate
+	}
+
+	return c.StalledResyncMinRate
 }
 
 // logState logs at start which checks run and how often. A check logs
@@ -131,6 +149,7 @@ func (c WorkaroundsConfig) logState(logger logr.Logger) {
 		"interval", c.Interval.String(),
 		"stalledResync", c.StalledResync,
 		"stalledResyncPasses", c.StalledResyncPasses,
+		"stalledResyncMinRate", c.stalledResyncMinRate(),
 		"idlePrimary", c.IdlePrimary,
 		"forcedIOFailures", c.ForcedIOFailures,
 		"staleLoopDevices", c.StaleLoopDevices)
@@ -443,7 +462,7 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 // either way.
 //
 // A pass counts as stalled when, since the previous pass, the out-of-sync
-// count toward the active peer fell by less than stalledResyncMinRate,
+// count toward the active peer fell by less than StalledResyncMinRate,
 // or the active link still holds exactly as many outstanding requests as
 // before while less than that rate of data came in and out-of-sync did
 // not fall fast either (heldRequestsMaxClearFactor). That catches the
@@ -458,12 +477,6 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 // peers, or that the Primary's quorum could hang on: while a Primary is
 // at either end, every configured connection of this node must be
 // Connected (drbd.KernelResource.MayDisconnect).
-
-// stalledResyncMinRate is the resync progress, in KiB/s, below which a
-// pass counts as stalled. DRBD's defaults keep a resync at c-min-rate
-// (250 KiB/s) or faster even under application I/O; the trickle seen on
-// the test cluster ran at 100-150 KiB/s.
-const stalledResyncMinRate = 200
 
 // heldRequestsMaxClearFactor bounds the held-requests test: a resync that
 // cleared out-of-sync at this many times the floor or faster is moving,
@@ -488,9 +501,9 @@ type resyncProgress struct {
 }
 
 // stalled reports whether the resync moved too little from prev to dep
-// in elapsed to count as moving; see stalledResyncMinRate.
-func (prev *resyncProgress) stalled(dep *drbd.ResyncDependency, elapsed time.Duration) bool {
-	floor := int64(elapsed.Seconds() * stalledResyncMinRate)
+// in elapsed to count as moving at minRate KiB/s.
+func (prev *resyncProgress) stalled(dep *drbd.ResyncDependency, elapsed time.Duration, minRate int) bool {
+	floor := int64(elapsed.Seconds() * float64(minRate))
 
 	cleared := prev.OutOfSync - dep.OutOfSync
 	if cleared < floor {
@@ -535,7 +548,7 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 	progress := resyncProgress{ResyncDependency: dep, At: w.now(), PausedTried: prev.PausedTried}
 	if seen && prev.Active == dep.Active && prev.Volume == dep.Volume && dep.Received >= prev.Received {
 		progress.Passes = prev.Passes
-		if prev.stalled(&dep, progress.At.Sub(prev.At)) {
+		if prev.stalled(&dep, progress.At.Sub(prev.At), w.Config.stalledResyncMinRate()) {
 			progress.Passes++
 		} else {
 			progress.Passes = 0
