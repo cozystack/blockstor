@@ -219,11 +219,11 @@ type VolumeState struct {
 	// full initial-sync (Phase 8.1).
 	CurrentGi string `json:"current_gi,omitempty"`
 
-	// OutOfSyncKib is the worst-case "how many KiB this replica is
-	// behind any peer" reported by `drbdsetup events2 --statistics`
-	// peer-device frames. UI/CLI compute a sync-progress %:
-	//   progress = (1 - OutOfSyncKib / VolumeDefinition.SizeKib) * 100
-	// 0 means fully in sync.
+	// OutOfSyncKib is the out-of-sync count of the last
+	// `drbdsetup events2 --statistics` peer-device frame for this
+	// volume, whichever peer it was about. 0 means in sync with that
+	// peer. It is not a resync progress once a replica has more than
+	// one peer; that is ReplicationStates[peer].DonePercentage.
 	OutOfSyncKib int64 `json:"out_of_sync_kib,omitempty"`
 
 	// ReplicationStates is the per-peer replication-state map the
@@ -244,11 +244,10 @@ type ReplicationState struct {
 	// `VerifyS/T`, `Ahead`, `Behind`, `Off`, `WFBitMap*`, etc.
 	ReplicationState string `json:"replication_state,omitempty"`
 
-	// DonePercentage is a float in [0, 100] giving the syncing
-	// progress for `SyncTarget` / `PausedSync*` / `VerifyT` states.
-	// nil for `Established` (nothing to sync) — the JSON `omitempty`
-	// drops it when 0 too, which is fine: the CLI renders "?" when
-	// the field is absent.
+	// DonePercentage is DRBD's `done` for the resync running with
+	// this peer, in [0, 100], measured against that resync's total.
+	// nil while no resync with the peer runs; the CLI renders "?"
+	// for a syncing peer without it.
 	DonePercentage *float64 `json:"done_percentage,omitempty"`
 }
 
