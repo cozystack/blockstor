@@ -4194,6 +4194,28 @@ func (r *Reconciler) shouldEnsurePerVolumeMetadata(ctx context.Context, dr *inte
 		!r.isDisklessToDiskfulFlip(ctx, dr, diskless)
 }
 
+// createFreshMD creates one volume's metadata. Before the resource's
+// first create-md (first) it settles the solo-birth record: settled
+// after the last one instead, a crash in between would find the
+// metadata present on restart, never record the birth, and leave a
+// lone replica Inconsistent for good. The record alone promotes
+// nothing.
+func (r *Reconciler) createFreshMD(ctx context.Context, dr *intent.DesiredResource, target string, plan metadataPlan, first bool) error {
+	if first {
+		err := r.recordSoloBirth(dr)
+		if err != nil {
+			return err
+		}
+	}
+
+	err := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, plan.geometry)
+	if err != nil {
+		return errors.Wrapf(err, "create-md %s", target)
+	}
+
+	return nil
+}
+
 // ensureMetadata is the upstream-aligned create-md entry point. It
 // runs in three cases:
 //
@@ -4278,32 +4300,19 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 			continue
 		}
 
-		// The solo-birth record is settled before the first create-md,
-		// not after the last: a crash in between would find the
-		// metadata present on restart, never record the birth, and
-		// leave a lone replica Inconsistent for good. The record alone
-		// promotes nothing.
-		if !metadataFreshlyCreated {
-			err := r.recordSoloBirth(dr)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Why (Bug 347): capture "at least one volume's metadata is
-		// about to be freshly created" so the downstream GI-seed
-		// gate fires. Mirrors the pre-CreateMD HasMD signal the
-		// previous per-resource probe captured. `firstActivation`
-		// alone is too narrow — it's false on tieB→diskful even
-		// though the tiebreaker has no DRBD-9 superblock to inherit
-		// GI from, so the seed must still run to dodge a full
-		// resync.
-		metadataFreshlyCreated = true
-
-		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target, plan.geometry)
+		createErr := r.createFreshMD(ctx, dr, target, plan, !metadataFreshlyCreated)
 		if createErr != nil {
-			return errors.Wrapf(createErr, "create-md %s", target)
+			return createErr
 		}
+
+		// Why (Bug 347): capture "at least one volume's metadata was
+		// freshly created" so the downstream GI-seed gate fires.
+		// Mirrors the pre-CreateMD HasMD signal the previous
+		// per-resource probe captured. `firstActivation` alone is too
+		// narrow — it's false on tieB→diskful even though the
+		// tiebreaker has no DRBD-9 superblock to inherit GI from, so
+		// the seed must still run to dodge a full resync.
+		metadataFreshlyCreated = true
 	}
 
 	err := os.WriteFile(mdMarkerPath, nil, resFilePerm)
