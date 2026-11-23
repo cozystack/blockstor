@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 )
 
 // ResourceStateProjectionFieldOwner is the SSA field manager under which
@@ -62,13 +63,24 @@ const ResourceStateProjectionFieldOwner = "blockstor-controller-resource-project
 // returns.
 type ResourceStateProjectionReleaseReconciler struct {
 	client.Client
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources/status,verbs=get;patch;update
 
-// Reconcile releases the projection's claim on the replica, if any.
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
 func (r *ResourceStateProjectionReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass releases the projection's claim on the replica, if any.
+func (r *ResourceStateProjectionReleaseReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var res blockstoriov1alpha1.Resource
 
 	err := r.Get(ctx, req.NamespacedName, &res)

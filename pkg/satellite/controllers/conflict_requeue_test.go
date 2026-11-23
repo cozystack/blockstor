@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/satellite/controllers"
+	"github.com/cozystack/blockstor/pkg/storage"
+)
+
+var (
+	errUpdateBroken   = errors.New("apiserver refused the write")
+	errObjectModified = errors.New("the object has been modified; please apply your changes to the latest version and try again")
+)
+
+// failUpdates makes every Update return err, the way a finalizer write
+// fails when another writer bumped the object since our read.
+func failUpdates(err error) interceptor.Funcs {
+	return interceptor.Funcs{
+		Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+			return err
+		},
+	}
+}
+
+func objectModified(resource, name string) error {
+	return apierrors.NewConflict(schema.GroupResource{Group: "blockstor.org", Resource: resource}, name, errObjectModified)
+}
+
+func reconcileWithFailingFinalizerWrite(t *testing.T, kind string, err error) (ctrl.Result, error) {
+	t.Helper()
+
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-c.n1"},
+		Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-c", NodeName: "n1"},
+	}
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-c.snap-c"},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-c",
+			SnapshotName:           "snap-c",
+			Nodes:                  []string{"n1"},
+		},
+	}
+	pool := &blockstoriov1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "thin.n1"},
+		Spec:       blockstoriov1alpha1.StoragePoolSpec{NodeName: "n1", PoolName: "thin", ProviderKind: "LVM_THIN"},
+	}
+	dev := &blockstoriov1alpha1.PhysicalDevice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "n1.wwn-0xc",
+			Labels: map[string]string{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n1"},
+		},
+		Spec: blockstoriov1alpha1.PhysicalDeviceSpec{
+			AttachTo: &blockstoriov1alpha1.AttachToPool{StoragePoolName: "thin", ProviderKind: "LVM_THIN", VGName: "vg", ThinPoolName: "tp"},
+		},
+	}
+
+	cli := interceptor.NewClient(
+		fake.NewClientBuilder().WithScheme(newSnapshotScheme(t)).WithObjects(res, snap, pool, dev).Build(),
+		failUpdates(err),
+	)
+	cfg := controllers.Config{NodeName: "n1", Exec: storage.NewFakeExec()}
+
+	var reconciler interface {
+		Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error)
+	}
+
+	switch kind {
+	case "resource":
+		reconciler = &controllers.ResourceReconciler{Client: cli, Config: cfg}
+	case "storagepool":
+		reconciler = &controllers.StoragePoolReconciler{Client: cli, Config: cfg}
+	case "physicaldevice":
+		reconciler = &controllers.PhysicalDeviceReconciler{Client: cli, Config: cfg}
+	default:
+		reconciler = &controllers.SnapshotReconciler{Client: cli, Config: cfg}
+	}
+
+	name := map[string]string{
+		"resource":       "pvc-c.n1",
+		"snapshot":       "pvc-c.snap-c",
+		"storagepool":    "thin.n1",
+		"physicaldevice": "n1.wwn-0xc",
+	}[kind]
+
+	return reconciler.Reconcile(context.Background(), ctrl.Request{ //nolint:wrapcheck // the result under test
+		NamespacedName: types.NamespacedName{Name: name},
+	})
+}
+
+// A finalizer write that lost an optimistic-concurrency race is retried,
+// not reported: reported, controller-runtime logs it as "Reconciler
+// error" at ERROR on every volume create and delete.
+func TestSatelliteRetriesAFinalizerWriteThatLostARace(t *testing.T) {
+	t.Parallel()
+
+	for kind, resource := range map[string]string{
+		"resource":       "resources",
+		"snapshot":       "snapshots",
+		"storagepool":    "storagepools",
+		"physicaldevice": "physicaldevices",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+
+			result, err := reconcileWithFailingFinalizerWrite(t, kind, objectModified(resource, "pvc-c"))
+			if err != nil {
+				t.Fatalf("reconcile returned %v, want the conflict retried without an error", err)
+			}
+
+			if !result.Requeue { //nolint:staticcheck // the rate-limited retry an error would get
+				t.Errorf("result %+v, want a requeue", result)
+			}
+		})
+	}
+}
+
+// Any other failed write is still a failure.
+func TestSatelliteReportsAFinalizerWriteThatFailed(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []string{"resource", "snapshot", "storagepool", "physicaldevice"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := reconcileWithFailingFinalizerWrite(t, kind, errUpdateBroken)
+			if !errors.Is(err, errUpdateBroken) {
+				t.Fatalf("reconcile returned %v, want the write error", err)
+			}
+		})
+	}
+}
