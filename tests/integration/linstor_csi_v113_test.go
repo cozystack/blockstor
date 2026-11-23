@@ -32,6 +32,7 @@ import (
 	lapiconsts "github.com/LINBIT/golinstor"
 	lapi "github.com/LINBIT/golinstor/client"
 	"github.com/LINBIT/golinstor/clonestatus"
+	"github.com/LINBIT/golinstor/devicelayerkind"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/tests/integration/harness"
@@ -191,6 +192,14 @@ func TestLinstorCSIv113(t *testing.T) {
 
 	t.Run("AttachDetachRWXBlock", func(t *testing.T) {
 		v113AttachDetach(ctx, t, stack, c, "pvc-v113-a")
+	})
+
+	// Linstor.GetVolumeHealthIssue (ControllerGetVolumeHealth) and the
+	// health ListAll attaches to every volume (ListVolumes,
+	// ControllerListVolumeHealth): a healthy volume has no issue, and a
+	// replica that cannot be promoted makes it degraded.
+	t.Run("VolumeHealth", func(t *testing.T) {
+		v113VolumeHealth(ctx, t, stack, c, "pvc-v113-a")
 	})
 
 	// Linstor.Resize.
@@ -764,4 +773,120 @@ func v113DeleteResourceGroupIfUnused(ctx context.Context, t *testing.T, c *lapi.
 	if nil404(err) != nil {
 		t.Fatalf("ResourceGroups.Delete(%s): %v", rg, err)
 	}
+}
+
+// v113HealthIssue is linstor-csi's HealthIssueFromResource: a replica is
+// abnormal unless it has a state and a DRBD layer, if any, with a
+// non-zero promotion score. It answers "" for a healthy volume.
+func v113HealthIssue(ress []lapi.ResourceWithVolumes) string {
+	if len(ress) == 0 {
+		return "NoReplicas"
+	}
+
+	abnormal := 0
+
+	for i := range ress {
+		drbd := v113DrbdLayer(ress[i].LayerObject)
+		if ress[i].State == nil || (drbd != nil && drbd.PromotionScore == 0) {
+			abnormal++
+		}
+	}
+
+	switch abnormal {
+	case 0:
+		return ""
+	case len(ress):
+		return "NoHealthyReplicas"
+	default:
+		return "UnhealthyReplicas"
+	}
+}
+
+// v113DrbdLayer is linstor-csi's util.GetDrbdLayer.
+func v113DrbdLayer(layer *lapi.ResourceLayer) *lapi.DrbdResource {
+	if layer == nil {
+		return nil
+	}
+
+	if layer.Type == devicelayerkind.Drbd {
+		return layer.Drbd
+	}
+
+	for i := range layer.Children {
+		if drbd := v113DrbdLayer(&layer.Children[i]); drbd != nil {
+			return drbd
+		}
+	}
+
+	return nil
+}
+
+func v113VolumeHealth(ctx context.Context, t *testing.T, stack *harness.Stack, c *lapi.Client, rd string) {
+	t.Helper()
+
+	health := func() string {
+		ress, err := c.Resources.GetResourceView(ctx, &lapi.ListOpts{Resource: []string{rd}})
+		if err != nil {
+			t.Fatalf("GetResourceView(%s): %v", rd, err)
+		}
+
+		return v113HealthIssue(ress)
+	}
+
+	listAll := func() string {
+		if _, err := c.ResourceDefinitions.GetAll(ctx, lapi.RDGetAllRequest{WithVolumeDefinitions: true}); err != nil {
+			t.Fatalf("ResourceDefinitions.GetAll: %v", err)
+		}
+
+		all, err := c.Resources.GetResourceView(ctx)
+		if err != nil {
+			t.Fatalf("GetResourceView: %v", err)
+		}
+
+		var ress []lapi.ResourceWithVolumes
+
+		for i := range all {
+			if all[i].Name == rd {
+				ress = append(ress, all[i])
+			}
+		}
+
+		return v113HealthIssue(ress)
+	}
+
+	// Every replica reports a DRBD layer once the satellite has
+	// reported it, and a healthy one has a non-zero score there.
+	harness.Eventually(t, v113Timeout, func() bool {
+		ress, err := c.Resources.GetResourceView(ctx, &lapi.ListOpts{Resource: []string{rd}})
+		if err != nil || len(ress) == 0 {
+			return false
+		}
+
+		for i := range ress {
+			if v113DrbdLayer(ress[i].LayerObject) == nil {
+				return false
+			}
+		}
+
+		return true
+	}, "every replica of "+rd+" to report its DRBD layer")
+
+	if issue := health(); issue != "" {
+		t.Errorf("ControllerGetVolumeHealth of a healthy volume: %s", issue)
+	}
+
+	if issue := listAll(); issue != "" {
+		t.Errorf("ListAll health of a healthy volume: %s", issue)
+	}
+
+	node := v113DiskfulNodes(ctx, t, c, rd)[0]
+	stack.Satellite.SimulateDRBDState(rd, node, "Outdated")
+
+	harness.Eventually(t, v113Timeout, func() bool { return health() == "UnhealthyReplicas" },
+		"an Outdated replica of "+rd+" to make it degraded")
+
+	stack.Satellite.SimulateDRBDState(rd, node, "UpToDate")
+
+	harness.Eventually(t, v113Timeout, func() bool { return health() == "" },
+		rd+" to be healthy again")
 }

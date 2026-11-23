@@ -326,14 +326,17 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 
 		want := s.desiredDrbdState(resource)
 		volumes, missing := s.missingVolumes(ctx, resource, want)
+		score := promotionScore(want)
 
-		if resource.Status.DrbdState == want && !missing {
+		if resource.Status.DrbdState == want && !missing &&
+			resource.Status.PromotionScore != nil && *resource.Status.PromotionScore == score {
 			continue
 		}
 
 		patched := resource.DeepCopy()
 		patched.Status.DrbdState = want
 		patched.Status.Volumes = volumes
+		patched.Status.PromotionScore = &score
 
 		// Volumes follow the resource: the satellite reports
 		// UpToDate / Diskless on a per-volume DiskState. We
@@ -407,6 +410,18 @@ func (s *Satellite) missingVolumes(
 	}
 
 	return volumes, missing
+}
+
+// promotionScore is the promotion score the satellite reports from the
+// kernel: non-zero while the replica can reach UpToDate data, which every
+// replica of a healthy resource can, diskless ones included, and 0 once
+// the simulated state says it cannot.
+func promotionScore(want string) int32 {
+	if want == drbdStateUpToDate {
+		return 10102
+	}
+
+	return 0
 }
 
 // volumeDiskState is the disk state the satellite reports for each volume
