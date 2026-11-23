@@ -104,21 +104,13 @@ spec:
 
 **At rest, on each node. Not the replication link.**
 
-In `["DRBD","LUKS","STORAGE"]` the satellite hands DRBD the dm-crypt
-mapper as its lower disk (`maybeLUKS` rewrites the device map before
-`applyDRBD`, `pkg/satellite/reconciler.go`; `tests/e2e/drbd-luks-stack.sh`
-asserts the `.res` `disk` line points at `/dev/mapper/<rd>-<vol>-luks`).
-The mapper is the *plaintext* side of the crypt device. So:
+In `["DRBD","LUKS","STORAGE"]` the satellite hands DRBD the dm-crypt mapper as its lower disk (`maybeLUKS` rewrites the device map before `applyDRBD`, `pkg/satellite/reconciler.go`; `tests/e2e/drbd-luks-stack.sh` asserts the `.res` `disk` line points at `/dev/mapper/<rd>-<vol>-luks`). The mapper is the *plaintext* side of the crypt device. So:
 
 - the pod writes plaintext into `/dev/drbdN`;
 - DRBD replicates **plaintext** to its peers;
-- each node encrypts independently on the way to its own LV/zvol, and
-  only the backing device holds ciphertext.
+- each node encrypts independently on the way to its own LV/zvol, and only the backing device holds ciphertext.
 
-Anyone who needs the replication traffic protected has to secure it
-separately — the layer stack does not do it. Several comments in this
-repository used to claim the opposite ("DRBD ships ciphertext between
-peers"); they were wrong and are corrected.
+Anyone who needs the replication traffic protected has to secure it separately; the layer stack does not do it.
 
 ## LUKS specifics
 
