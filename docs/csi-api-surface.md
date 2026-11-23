@@ -1,5 +1,7 @@
 # LINSTOR REST API surface — CSI MVP scope
 
+For which linstor-csi versions work against blockstor, the advertised REST API version and how each call of linstor-csi v1.13 is answered, see [linstor-csi-compatibility.md](linstor-csi-compatibility.md).
+
 This is the minimum subset of the LINSTOR REST contract that blockstor must
 implement before any real Kubernetes client can drive it. It is derived from
 two surveys:
@@ -90,7 +92,7 @@ Last sync against handler list: 2026-05-09 (Phase 8.5 close).
 | `/v1/resource-definitions/{rd}/snapshot-restore-volume-definition/{snap}` | POST | ⬜ |
 | `/v1/resource-definitions/{rd}/snapshot-rollback/{snap}` | POST | ⬜ |
 | `/v1/resource-definitions/{rd}/snapshots` | GET / POST | ✅ |
-| `/v1/resource-definitions/{rd}/snapshots/{snap}` | GET / DELETE | ✅ |
+| `/v1/resource-definitions/{rd}/snapshots/{snap}` | GET / DELETE | ✅ (DELETE incl. `delete_empty_resource_definition`) |
 | `/v1/resource-definitions/{rd}/adjust` | POST | ✅ |
 | `/v1/resource-definitions/{rd}/advise` | GET | ✅ |
 | `/v1/resource-definitions/{rd}/encryption-passphrase` | POST | ✅ |
@@ -101,6 +103,7 @@ Last sync against handler list: 2026-05-09 (Phase 8.5 close).
 |---|---|---|
 | `/v1/resource-definitions/{rd}/resources` | GET | ✅ |
 | `/v1/resource-definitions/{rd}/resources` | POST | ✅ |
+| `/v1/resource-definitions/{rd}/resources` | DELETE | ✅ truncate, incl. `delete_empty_resource_definition` (REST 1.29, linstor-csi v1.13 DeleteVolume) |
 | `/v1/resource-definitions/{rd}/resources/{node}` | GET | ✅ |
 | `/v1/resource-definitions/{rd}/resources/{node}` | DELETE | ✅ |
 | `/v1/resource-definitions/{rd}/resources/{node}` | PUT | ⬜ |

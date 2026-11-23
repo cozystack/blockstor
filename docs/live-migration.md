@@ -45,11 +45,6 @@ A clone, a snapshot and a restore copy the definition's props, but not a migrati
 
 linstor-csi up to v1.12 manages dual Primary client-side: it sets `allow-two-primaries` on the resource definition before the second attach and deletes it on the detach that leaves one user. That path is unchanged and still works against blockstor. An unmake-available on such a definition also clears that definition-level `allow-two-primaries`.
 
-## What linstor-csi v1.13 needs beyond this
+## linstor-csi v1.13
 
-linstor-csi v1.13 refuses to start against a controller whose `rest_api_version` (`GET /v1/controller/version`) is below 1.29 in the 1.x series. blockstor advertises 1.27.0 and keeps doing so until the rest of what 1.29 promises is served, because the version also opens python-linstor's client-side `_require_version` gates. Still missing:
-
-- `DELETE /v1/resource-definitions/{rd}/resources` (truncate) with `delete_empty_resource_definition`, which DeleteVolume uses;
-- `delete_empty_resource_definition` on `DELETE /v1/resource-definitions/{rd}/snapshots/{snap}`, which DeleteSnapshot uses; blockstor ignores it today and leaves an empty definition behind;
-- the REST 1.28 additions the python client gates on (`/v1/controller/database/export`, the `/v1/controller/auth` API, `drbd_client` on resource create and modify, external-file status);
-- live migration of RWX block volumes on shared storage without DRBD (linstor-csi v1.13.0), which LINSTOR serves by activating the resource on both nodes; blockstor has no shared activation and refuses `auto_manage_dual_primary` without DRBD.
+linstor-csi v1.13 refuses to start against a controller whose `rest_api_version` (`GET /v1/controller/version`) is below 1.29 in the 1.x series. blockstor advertises 1.29.0 and serves the rest of what v1.13 relies on: truncate and `delete_empty_resource_definition` for DeleteVolume and DeleteSnapshot, among others. [linstor-csi-compatibility.md](linstor-csi-compatibility.md) has the full compatibility matrix and what is not served, live migration of RWX block volumes on shared storage without DRBD among it: LINSTOR activates such a resource on both nodes, and blockstor has no shared activation, so `auto_manage_dual_primary` without DRBD is refused.
