@@ -42,9 +42,11 @@ const kernelStatusSample = `[
  "devices":[{"volume":0,"minor":1001,"disk-state":"Inconsistent","client":false,"open":false,"quorum":true}],
  "connections":[
   {"peer-node-id":0,"name":"n1","connection-state":"Connected","peer-role":"Secondary",
-   "peer_devices":[{"volume":0,"replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","percent-in-sync":42.17}]},
+   "peer_devices":[{"volume":0,"replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no",
+     "received":113448,"sent":0,"out-of-sync":14592,"pending":0,"unacked":542,"percent-in-sync":42.17}]},
   {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer-role":"Secondary",
-   "peer_devices":[{"volume":0,"replication-state":"PausedSyncT","peer-disk-state":"UpToDate","resync-suspended":"dependency","percent-in-sync":42.17}]}]},
+   "peer_devices":[{"volume":0,"replication-state":"PausedSyncT","peer-disk-state":"UpToDate","resync-suspended":"dependency",
+     "received":11840,"sent":0,"out-of-sync":2122972,"pending":0,"unacked":70,"percent-in-sync":0.58}]}]},
 {"name":"pvc-failio","node-id":1,"role":"Secondary","suspended":false,"force-io-failures":true,
  "devices":[{"volume":0,"minor":1002,"disk-state":"Outdated","client":false,"open":false,"quorum":true}],
  "connections":[]}
@@ -84,13 +86,22 @@ func TestKernelStatusReadsTheWorkaroundShapes(t *testing.T) {
 			idle.UnusedSecondaryFailingIO(), stall.UnusedSecondaryFailingIO(), failio.UnusedSecondaryFailingIO())
 	}
 
-	from, ok := stall.ResyncSource()
-	if !ok || from.Peer != "n1" || from.PercentInSync != 42.17 {
-		t.Errorf("ResyncSource = %+v, %v; want n1 at 42.17", from, ok)
+	dep, ok := stall.ResyncDependency()
+
+	want := drbd.ResyncDependency{
+		Volume: 0, Active: "n1", Paused: "n2", PercentInSync: 42.17,
+		OutOfSync: 14592, Received: 113448, Outstanding: 542,
+	}
+	if !ok || dep != want {
+		t.Errorf("ResyncDependency = %+v, %v; want %+v", dep, ok, want)
 	}
 
-	if _, ok := idle.ResyncSource(); ok {
-		t.Error("an UpToDate resource has a resync source")
+	if _, ok := idle.ResyncDependency(); ok {
+		t.Error("an UpToDate resource has a resync dependency")
+	}
+
+	if !stall.Inconsistent() || idle.Inconsistent() {
+		t.Errorf("Inconsistent: stall %v, idle %v; want true, false", stall.Inconsistent(), idle.Inconsistent())
 	}
 }
 
@@ -112,7 +123,8 @@ func TestKernelStatusReadsYesNoFlags(t *testing.T) {
 }
 
 // A resource in use is never idle, never a Secondary to take down, and a
-// resync nothing waits on is not the stall.
+// resync nothing waits on, or one drbd-utils reports no statistics of, is
+// not the stall shape.
 func TestKernelStatusLeavesResourcesInUseAlone(t *testing.T) {
 	t.Parallel()
 
@@ -120,8 +132,8 @@ func TestKernelStatusLeavesResourcesInUseAlone(t *testing.T) {
 {"name":"open-primary","role":"Primary","devices":[{"volume":0,"disk-state":"UpToDate","open":false},{"volume":1,"disk-state":"UpToDate","open":true}]},
 {"name":"open-failio","role":"Secondary","force-io-failures":true,"devices":[{"volume":0,"disk-state":"Outdated","open":true}]},
 {"name":"lone-resync","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent","open":false}],
- "connections":[{"name":"n1","peer_devices":[{"volume":0,"replication-state":"SyncTarget","resync-suspended":"no","percent-in-sync":10}]}]},
-{"name":"no-percent","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent","open":false}],
+ "connections":[{"name":"n1","peer_devices":[{"volume":0,"replication-state":"SyncTarget","resync-suspended":"no","out-of-sync":8,"percent-in-sync":10}]}]},
+{"name":"no-statistics","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent","open":false}],
  "connections":[{"name":"n1","peer_devices":[{"volume":0,"replication-state":"SyncTarget","resync-suspended":"no"}]},
   {"name":"n2","peer_devices":[{"volume":0,"replication-state":"PausedSyncT","resync-suspended":"peer,dependency"}]}]}
 ]`)
@@ -134,12 +146,12 @@ func TestKernelStatusLeavesResourcesInUseAlone(t *testing.T) {
 		t.Error("a Secondary failing I/O to an opener reads as unused")
 	}
 
-	if _, ok := resources[2].ResyncSource(); ok {
-		t.Error("a resync no other peer waits on reads as the stall")
+	if _, ok := resources[2].ResyncDependency(); ok {
+		t.Error("a resync no other peer waits on reads as the stall shape")
 	}
 
-	if _, ok := resources[3].ResyncSource(); ok {
-		t.Error("a SyncTarget without percent-in-sync reads as the stall")
+	if _, ok := resources[3].ResyncDependency(); ok {
+		t.Error("a SyncTarget without out-of-sync reads as the stall shape")
 	}
 }
 
@@ -210,6 +222,92 @@ func TestKernelStatusSoleUpToDateOfAPrimaryPeer(t *testing.T) {
 	for i := range resources {
 		if got := resources[i].SoleUpToDateOfAPrimaryPeer(); got != want[i] {
 			t.Errorf("%s: SoleUpToDateOfAPrimaryPeer = %v, want %v", resources[i].Name, got, want[i])
+		}
+	}
+}
+
+// The resync dependency is read per volume: a SyncTarget of one volume
+// and a dependency pause of another are not the shape.
+func TestKernelStatusResyncDependencyIsPerVolume(t *testing.T) {
+	t.Parallel()
+
+	resources := kernelStatus(t, `[{"name":"r","role":"Secondary",
+ "devices":[{"volume":0,"disk-state":"Inconsistent"},{"volume":1,"disk-state":"Inconsistent"}],
+ "connections":[
+  {"name":"n1","peer_devices":[{"volume":0,"replication-state":"SyncTarget","resync-suspended":"no","out-of-sync":8},
+   {"volume":1,"replication-state":"Established","resync-suspended":"no","out-of-sync":0}]},
+  {"name":"n2","peer_devices":[{"volume":0,"replication-state":"Established","resync-suspended":"no","out-of-sync":0},
+   {"volume":1,"replication-state":"PausedSyncT","resync-suspended":"dependency","out-of-sync":8}]}]}]`)
+
+	if dep, ok := resources[0].ResyncDependency(); ok {
+		t.Errorf("volumes mixed into one dependency: %+v", dep)
+	}
+}
+
+// Dropping a peer is refused only where a Primary, here or the peer,
+// would be left with no UpToDate disk among this node and its other
+// connected peers.
+func TestKernelStatusMayDisconnect(t *testing.T) {
+	t.Parallel()
+
+	// Shapes of the field stalls: this node Inconsistent, SyncTarget of
+	// a and paused toward b.
+	resources := kernelStatus(t, `[
+{"name":"secondaries","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]},
+{"name":"primary-peer-with-another","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]},
+{"name":"primary-peer-alone","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"b","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
+{"name":"local-primary","role":"Primary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"Inconsistent"}]}]},
+{"name":"primary-peer-one-node-down","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"c","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
+{"name":"local-primary-one-node-down","role":"Primary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"name":"b","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"Inconsistent"}]},
+  {"name":"c","connection-state":"StandAlone","peer-role":"Unknown","peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]}]},
+{"name":"two-nodes","role":"Primary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]}
+]`)
+
+	cases := []struct {
+		res  int
+		peer string
+		want bool
+	}{
+		{0, "a", true},
+		{0, "b", true},
+		// The Primary keeps b's copy.
+		{1, "a", true},
+		// b is no Primary, and this node is none either.
+		{1, "b", true},
+		// The Primary has no other UpToDate disk this node sees.
+		{2, "a", false},
+		// A local Inconsistent Primary reads from a alone.
+		{3, "a", false},
+		{3, "b", true},
+		// Four voters, c down: the Primary a sees three; without this
+		// node it would see two of four, no majority, although b keeps
+		// its data.
+		{4, "a", false},
+		// b is no Primary, and this node is none either.
+		{4, "b", true},
+		// This Primary's disk is good, but it would see two of four.
+		{5, "b", false},
+		// Two nodes: alone, a Primary has no majority.
+		{6, "a", false},
+	}
+
+	for _, c := range cases {
+		if got := resources[c.res].MayDisconnect(c.peer); got != c.want {
+			t.Errorf("%s: MayDisconnect(%s) = %v, want %v", resources[c.res].Name, c.peer, got, c.want)
 		}
 	}
 }

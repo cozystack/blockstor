@@ -28,12 +28,15 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -127,23 +130,55 @@ func newTestWorkarounds(t *testing.T, adm *fakeWorkaroundAdm, cfg WorkaroundsCon
 
 	recorder := events.NewFakeRecorder(16)
 
+	// Every look at the clock is the next pass, 30 s on.
+	now := time.Date(2026, 11, 22, 22, 0, 0, 0, time.UTC)
+
 	return &DRBDWorkaroundsRunnable{
 		Reader:   workaroundReader(t, rds...),
 		Adm:      adm,
 		Recorder: recorder,
 		NodeName: workaroundNode,
 		Config:   cfg,
+		Clock: func() time.Time {
+			now = now.Add(30 * time.Second)
+
+			return now
+		},
 	}, recorder
 }
 
-// stalledStatus is a replica resyncing from n1 at percent while its resync
-// from n2 waits on that one.
-func stalledStatus(percent string) string {
-	return `[{"name":"pvc-stall","role":"Secondary",
+// resyncSample is what the stalled replica reports of its resync from
+// the active peer n1 on one pass: out-of-sync and received in KiB, and
+// the requests of that link not completed yet.
+type resyncSample struct {
+	oos, received, outstanding int64
+}
+
+// resyncStatus is a replica, Secondary, of a 50 GiB volume resyncing
+// from n1 while its resync from n2 waits on it
+// (resync-suspended:dependency), the shape of the field stalls; n2Role
+// is n2's role. percent-in-sync follows out-of-sync, as the kernel's
+// does.
+func resyncStatus(s resyncSample, n2Role string) string {
+	const sizeKiB = 50 << 20
+
+	percent := 100 * float64(sizeKiB-s.oos) / sizeKiB
+
+	return fmt.Sprintf(`[{"name":"pvc-stall","role":"Secondary",
  "devices":[{"volume":0,"disk-state":"Inconsistent","open":false}],
  "connections":[
-  {"name":"n1","peer_devices":[{"volume":0,"replication-state":"SyncTarget","resync-suspended":"no","percent-in-sync":` + percent + `}]},
-  {"name":"n2","peer_devices":[{"volume":0,"replication-state":"PausedSyncT","resync-suspended":"dependency","percent-in-sync":` + percent + `}]}]}]`
+  {"name":"n1","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,
+   "replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no",
+   "received":%d,"out-of-sync":%d,"pending":0,"unacked":%d,"percent-in-sync":%.4f}]},
+  {"name":"n2","connection-state":"Connected","peer-role":%q,"peer_devices":[{"volume":0,
+   "replication-state":"PausedSyncT","peer-disk-state":"UpToDate","resync-suspended":"dependency",
+   "received":11840,"out-of-sync":2122972,"pending":0,"unacked":70,"percent-in-sync":0.58}]}]}]`,
+		s.received, s.oos, s.outstanding, percent, n2Role)
+}
+
+// stalledStatus is the stall frozen: the same counts on every pass.
+func stalledStatus(string) string {
+	return resyncStatus(resyncSample{oos: 14592, received: 113448, outstanding: 542}, "Secondary")
 }
 
 func stallConfig() WorkaroundsConfig {
@@ -163,61 +198,525 @@ func drainEvents(recorder *events.FakeRecorder) []string {
 	}
 }
 
-// LINBIT/drbd#149: the resync from n1 sits at the same percent while n2
-// waits on it. The fourth pass in a row reconnects n1, and not before.
-func TestStalledResyncReconnectsTheStuckSourceAfterFourPasses(t *testing.T) {
-	t.Parallel()
+// runResync runs one pass per sample and returns the actions taken.
+func runResync(t *testing.T, w *DRBDWorkaroundsRunnable, adm *fakeWorkaroundAdm, n2Role string, samples ...resyncSample) []string {
+	t.Helper()
 
-	adm := &fakeWorkaroundAdm{status: stalledStatus("42.17")}
-	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
-
-	for pass := 1; pass <= 3; pass++ {
+	for _, sample := range samples {
+		adm.status = resyncStatus(sample, n2Role)
 		w.pass(t.Context(), logr.Discard())
-
-		if len(adm.actions) != 0 {
-			t.Fatalf("pass %d acted early: %v", pass, adm.actions)
-		}
 	}
 
-	w.pass(t.Context(), logr.Discard())
+	return adm.actions
+}
 
-	want := []string{"disconnect pvc-stall:n1", "connect pvc-stall:n1"}
-	if strings.Join(adm.actions, ",") != strings.Join(want, ",") {
-		t.Fatalf("actions = %v, want %v", adm.actions, want)
+// ramp is n samples, the one of each pass from sample.
+func ramp(n int64, sample func(pass int64) resyncSample) []resyncSample {
+	samples := make([]resyncSample, 0, n)
+
+	for pass := range n {
+		samples = append(samples, sample(pass))
+	}
+
+	return samples
+}
+
+// frozen is n samples of the alpha.15 freeze: nothing moves.
+func frozen(n int) []resyncSample {
+	return slices.Repeat([]resyncSample{{oos: 14592, received: 113448, outstanding: 542}}, n)
+}
+
+// The field stalls (alpha.9, alpha.14, alpha.15): the resync from n1 is
+// frozen with its requests held while n2 waits on it. After four stalled
+// passes, compared with the one before each, the paused peer n2 is
+// disconnected, not the active n1; the next pass connects it again with
+// an adjust.
+func TestStalledResyncDisconnectsThePausedPeer(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	if got := runResync(t, w, adm, "Secondary", frozen(4)...); len(got) != 0 {
+		t.Fatalf("acted before four stalled passes: %v", got)
+	}
+
+	got := runResync(t, w, adm, "Secondary", frozen(1)...)
+	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
+		t.Fatalf("actions = %v, want %v", got, want)
 	}
 
 	evs := drainEvents(recorder)
-	if len(evs) != 1 || !strings.Contains(evs[0], "Warning DRBDResyncStalled") {
-		t.Errorf("events = %v, want one Warning DRBDResyncStalled", evs)
+	if len(evs) != 1 || !strings.Contains(evs[0], "Warning DRBDResyncStalled") || !strings.Contains(evs[0], "disconnecting n2") {
+		t.Errorf("events = %v, want one Warning DRBDResyncStalled naming n2", evs)
 	}
 
-	// The reconnect starts the count over.
 	adm.actions = nil
 
-	for range 3 {
-		w.pass(t.Context(), logr.Discard())
+	// The active resync finishes while n2 is away; the next pass
+	// connects n2 again.
+	adm.status = `[{"name":"pvc-stall","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],"connections":[]}]`
+	w.pass(t.Context(), logr.Discard())
+
+	if want := []string{"adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("pass after the disconnect: actions = %v, want %v", adm.actions, want)
 	}
 
+	adm.actions = nil
+	w.pass(t.Context(), logr.Discard())
+
 	if len(adm.actions) != 0 {
-		t.Errorf("reconnected again before four more passes: %v", adm.actions)
+		t.Errorf("adjusted again after it went through: %v", adm.actions)
 	}
 }
 
-// A resync that moves is left alone, however long it takes.
-func TestStalledResyncLeavesAMovingResyncAlone(t *testing.T) {
+var errAdjustBusy = errors.New("exit status 10: pvc-stall: Failure: (162) Invalid configuration request")
+
+// The adjust that connects the paused peer again is retried until it
+// goes through.
+func TestStalledResyncRetriesTheReconnectOfThePausedPeer(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{errs: map[string][]error{"adjust pvc-stall": {errAdjustBusy}}}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	runResync(t, w, adm, "Secondary", frozen(5)...)
+
+	adm.status = `[]`
+	adm.actions = nil
+
+	w.pass(t.Context(), logr.Discard())
+	w.pass(t.Context(), logr.Discard())
+	w.pass(t.Context(), logr.Discard())
+
+	if want := []string{"adjust pvc-stall", "adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("actions = %v, want a failed adjust retried once", adm.actions)
+	}
+}
+
+// alpha.14: the paused peer was the Primary. It is still the one
+// disconnected, since the active source is another UpToDate copy the
+// Primary keeps.
+func TestStalledResyncDisconnectsAPausedPrimary(t *testing.T) {
 	t.Parallel()
 
 	adm := &fakeWorkaroundAdm{}
 	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
 
-	for _, percent := range []string{"10.00", "10.00", "10.00", "11.50", "11.50", "11.50", "12.00"} {
-		adm.status = stalledStatus(percent)
+	got := runResync(t, w, adm, "Primary", frozen(5)...)
+	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
+		t.Errorf("actions = %v, want %v", got, want)
+	}
+}
+
+// A Primary paused peer is not dropped while a node of the resource is
+// down: with four voters and one of them away, the Primary would see two
+// of four without this node and lose quorum. The active peer, no Primary,
+// is reconnected instead.
+func TestStalledResyncKeepsAPrimarysQuorum(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	down := `,{"name":"n4","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,
+   "replication-state":"Off","peer-disk-state":"DUnknown","resync-suspended":"no"}]}]}]`
+
+	for range 5 {
+		status := resyncStatus(frozen(1)[0], "Primary")
+		adm.status = strings.TrimSuffix(status, "]}]") + down
 		w.pass(t.Context(), logr.Discard())
 	}
 
-	if len(adm.actions) != 0 {
-		t.Errorf("a moving resync was reconnected: %v", adm.actions)
+	if want := []string{"disconnect pvc-stall:n1", "connect pvc-stall:n1"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("actions = %v, want %v", adm.actions, want)
 	}
+}
+
+// alpha.15 before the freeze: the active resync ran at 100-150 KiB/s for
+// 14 minutes, percent still moving. Too slow is stalled too.
+func TestStalledResyncCatchesATrickle(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	// 130 KiB/s over 30 s passes; outstanding moves both ways.
+	samples := ramp(5, func(pass int64) resyncSample {
+		return resyncSample{oos: 120000 - pass*3900, received: 100000 + pass*3900, outstanding: 200 + (pass%2)*300}
+	})
+
+	got := runResync(t, w, adm, "Secondary", samples...)
+	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
+		t.Errorf("actions = %v, want %v", got, want)
+	}
+}
+
+// alpha.7: application writes kept marking blocks out of sync, so
+// percent-in-sync went down, never the same twice, while the resync did
+// not move.
+func TestStalledResyncCatchesAGrowingOutOfSync(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	samples := ramp(5, func(pass int64) resyncSample {
+		return resyncSample{oos: 69132 + pass*600, received: 0, outstanding: 4278}
+	})
+
+	got := runResync(t, w, adm, "Secondary", samples...)
+	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
+		t.Errorf("actions = %v, want %v", got, want)
+	}
+}
+
+// Writes that clear out-of-sync blocks can make the count fall while the
+// resync itself is frozen: its requests stay outstanding, no fewer, and
+// hardly any resync data comes in.
+func TestStalledResyncCatchesHeldRequests(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	samples := ramp(5, func(pass int64) resyncSample {
+		return resyncSample{oos: 900000 - pass*20000, received: 5000 + pass*100, outstanding: 431}
+	})
+
+	got := runResync(t, w, adm, "Secondary", samples...)
+	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
+		t.Errorf("actions = %v, want %v", got, want)
+	}
+}
+
+// A cluster with a lower c-min-rate or a low fixed resync-rate sets a
+// lower floor, and a slow but healthy resync there is left alone; at the
+// default floor, the same resync counts as stalled.
+func TestStalledResyncMinRateFollowsTheConfig(t *testing.T) {
+	t.Parallel()
+
+	// 120 KiB/s, a resync-rate of 120k.
+	samples := ramp(10, func(pass int64) resyncSample {
+		return resyncSample{oos: 100000 - pass*3600, received: pass * 3600, outstanding: 16 + pass%2}
+	})
+
+	for _, tc := range []struct {
+		minRate int
+		acted   bool
+	}{
+		{minRate: 100, acted: false},
+		{minRate: 0, acted: true},
+	} {
+		cfg := stallConfig()
+		cfg.StalledResyncMinRate = tc.minRate
+
+		adm := &fakeWorkaroundAdm{}
+		w, _ := newTestWorkarounds(t, adm, cfg, "pvc-stall")
+
+		if got := runResync(t, w, adm, "Secondary", samples...); (len(got) != 0) != tc.acted {
+			t.Errorf("min rate %d: actions = %v, want acted %v", tc.minRate, got, tc.acted)
+		}
+	}
+}
+
+// A resync that moves is left alone, however long it takes, even with a
+// steady number of requests in flight; one moving pass starts the count
+// over.
+func TestStalledResyncLeavesAMovingResyncAlone(t *testing.T) {
+	t.Parallel()
+
+	t.Run("fast", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{}
+		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		// ~90 MB/s, the normal rate on the test cluster.
+		samples := ramp(10, func(pass int64) resyncSample {
+			return resyncSample{oos: 40_000_000 - pass*2_700_000, received: pass * 2_700_000, outstanding: 2048}
+		})
+
+		if got := runResync(t, w, adm, "Secondary", samples...); len(got) != 0 {
+			t.Errorf("a moving resync was acted on: %v", got)
+		}
+	})
+
+	t.Run("slow but above the floor", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{}
+		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		// c-min-rate, 250 KiB/s.
+		samples := ramp(10, func(pass int64) resyncSample {
+			return resyncSample{oos: 100000 - pass*7500, received: pass * 7500, outstanding: 64}
+		})
+
+		if got := runResync(t, w, adm, "Secondary", samples...); len(got) != 0 {
+			t.Errorf("a resync at c-min-rate was acted on: %v", got)
+		}
+	})
+
+	// A thin or csums resync clears ranges without receiving data
+	// (P_RS_DEALLOCATED, P_RS_IS_IN_SYNC), so received hardly moves
+	// while its pipeline stays full.
+	t.Run("thin", func(t *testing.T) {
+		t.Parallel()
+
+		for _, outstanding := range []func(pass int64) int64{
+			func(int64) int64 { return 2048 },
+			func(pass int64) int64 { return 2048 + pass%3 },
+		} {
+			adm := &fakeWorkaroundAdm{}
+			w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+			samples := ramp(10, func(pass int64) resyncSample {
+				return resyncSample{oos: 40_000_000 - pass*300_000, received: 5000 + pass*100, outstanding: outstanding(pass)}
+			})
+
+			if got := runResync(t, w, adm, "Secondary", samples...); len(got) != 0 {
+				t.Errorf("a thin resync clearing 10 MiB/s was acted on: %v", got)
+			}
+		}
+	})
+
+	// A pipeline whose count moves between passes is working, even when
+	// it never drops below the last pass.
+	t.Run("pipeline count moves", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{}
+		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		samples := ramp(10, func(pass int64) resyncSample {
+			return resyncSample{oos: 900000 - pass*20000, received: 5000 + pass*100, outstanding: 400 + pass}
+		})
+
+		if got := runResync(t, w, adm, "Secondary", samples...); len(got) != 0 {
+			t.Errorf("a moving pipeline was acted on: %v", got)
+		}
+	})
+
+	t.Run("moving pass resets", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{}
+		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		samples := frozen(4)
+		samples = append(samples, resyncSample{oos: 4592, received: 123448, outstanding: 10})
+		samples = append(samples, slices.Repeat([]resyncSample{{oos: 4592, received: 123448, outstanding: 10}}, 3)...)
+
+		if got := runResync(t, w, adm, "Secondary", samples...); len(got) != 0 {
+			t.Errorf("acted although a pass in between moved: %v", got)
+		}
+	})
+}
+
+// The kernel zeroes received when the link to the active peer connects
+// again, which makes the pass after it look like no data came in. That
+// link is a new one, so the count starts over there.
+func TestStalledResyncCountsAfreshWhenReceivedDrops(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	held := ramp(4, func(pass int64) resyncSample {
+		return resyncSample{oos: 900000 - pass*10000, received: 1_000_000 + pass*100, outstanding: 300}
+	})
+	reconnected := resyncSample{oos: 860000, received: 50, outstanding: 300}
+
+	if got := runResync(t, w, adm, "Secondary", append(held, reconnected)...); len(got) != 0 {
+		t.Errorf("counted the pass after a reconnect as stalled: %v", got)
+	}
+}
+
+// When disconnecting the paused peer did not get the resync moving, the
+// next action is the plunger's: disconnect and connect the active peer,
+// which also cleared a stall on the test cluster (alpha.7).
+func TestStalledResyncFallsBackToTheActivePeer(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	runResync(t, w, adm, "Secondary", frozen(5)...)
+
+	// The adjust connects n2 back, and the same stall shows again.
+	adm.actions = nil
+
+	got := runResync(t, w, adm, "Secondary", frozen(4)...)
+	want := []string{"adjust pvc-stall", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}
+
+	if !slices.Equal(got, want) {
+		t.Errorf("actions = %v, want %v", got, want)
+	}
+}
+
+// A disconnect of the paused peer that failed was not tried: the next
+// stall tries it again before the active peer.
+func TestStalledResyncRetriesAFailedDisconnectOfThePausedPeer(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{errs: map[string][]error{"disconnect pvc-stall:n2": {errAdjustBusy}}}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	runResync(t, w, adm, "Secondary", frozen(5)...)
+
+	adm.actions = nil
+
+	got := runResync(t, w, adm, "Secondary", frozen(4)...)
+	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(got, want) {
+		t.Errorf("actions after a failed disconnect = %v, want %v", got, want)
+	}
+}
+
+// lateAddStall is the stall on volume 1 of a resource whose volume 0 is
+// UpToDate here, the shape of a volume added later; n2Role is n2's role.
+func lateAddStall(n2Role string) string {
+	return fmt.Sprintf(`[{"name":"pvc-stall","role":"Secondary",
+ "devices":[{"volume":0,"disk-state":"UpToDate"},{"volume":1,"disk-state":"Inconsistent"}],
+ "connections":[
+  {"name":"n1","connection-state":"Connected","peer-role":"Secondary","peer_devices":[
+   {"volume":0,"replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0},
+   {"volume":1,"replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","received":1,"out-of-sync":14592,"unacked":542}]},
+  {"name":"n2","connection-state":"Connected","peer-role":%q,"peer_devices":[
+   {"volume":0,"replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0},
+   {"volume":1,"replication-state":"PausedSyncT","peer-disk-state":"UpToDate","resync-suspended":"dependency","out-of-sync":8}]}]}]`, n2Role)
+}
+
+// On a volume added later, a reconnect of the active peer can end its
+// resync with the volume still Inconsistent, which only the late-add
+// kick recovers, and the kick waits while a replica is Primary. With a
+// Primary in sight the fallback is left out; without one it runs.
+func TestStalledResyncLeavesTheLateAddKickItsCase(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		n2Role string
+		want   []string
+	}{
+		{n2Role: "Primary", want: []string{"disconnect pvc-stall:n2", "adjust pvc-stall"}},
+		{n2Role: "Secondary", want: []string{"disconnect pvc-stall:n2", "adjust pvc-stall", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}},
+	} {
+		adm := &fakeWorkaroundAdm{status: lateAddStall(tc.n2Role)}
+		w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		for range 9 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if !slices.Equal(adm.actions, tc.want) {
+			t.Errorf("n2 %s: actions = %v, want %v", tc.n2Role, adm.actions, tc.want)
+		}
+
+		evs := drainEvents(recorder)
+		if left := slices.ContainsFunc(evs, func(ev string) bool { return strings.Contains(ev, "late-add kick") }); left != (tc.n2Role == "Primary") {
+			t.Errorf("n2 %s: events = %v", tc.n2Role, evs)
+		}
+	}
+}
+
+// The fallback is remembered across the passes the paused peer is away
+// while the replica stays Inconsistent, and forgotten once it is in
+// sync: a later stall tries the paused peer first again.
+func TestStalledResyncRemembersThePausedPeerWasTried(t *testing.T) {
+	t.Parallel()
+
+	away := `[{"name":"pvc-stall","role":"Secondary","devices":[{"volume":0,"disk-state":"Inconsistent"}],
+ "connections":[{"name":"n1","connection-state":"Connected","peer-role":"Secondary","peer_devices":[{"volume":0,
+  "replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":14592,"unacked":542}]}]}]`
+	inSync := `[{"name":"pvc-stall","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],"connections":[]}]`
+
+	for _, tc := range []struct {
+		between string
+		want    string
+	}{
+		{between: away, want: "disconnect pvc-stall:n1"},
+		{between: inSync, want: "disconnect pvc-stall:n2"},
+	} {
+		adm := &fakeWorkaroundAdm{}
+		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		runResync(t, w, adm, "Secondary", frozen(5)...)
+
+		adm.status = tc.between
+		w.pass(t.Context(), logr.Discard())
+
+		adm.actions = nil
+
+		got := runResync(t, w, adm, "Secondary", frozen(5)...)
+		if len(got) == 0 || got[0] != tc.want {
+			t.Errorf("after a pass with %s: actions = %v, want %s first", tc.between, got, tc.want)
+		}
+	}
+}
+
+// multiVolumeStall is the stall on volume 0 of a resource whose other
+// volumes have their only UpToDate copy on one peer each: volume 1 on
+// n2 alone, and, with both set, volume 2 on n1 alone.
+func multiVolumeStall(volume2 bool) string {
+	vol2Dev, vol2N1, vol2N2 := "", "", ""
+	if volume2 {
+		vol2Dev = `,{"volume":2,"disk-state":"Inconsistent"}`
+		vol2N1 = `,{"volume":2,"replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0}`
+		vol2N2 = `,{"volume":2,"replication-state":"Established","peer-disk-state":"Inconsistent","resync-suspended":"no","out-of-sync":0}`
+	}
+
+	return `[{"name":"pvc-stall","role":"Primary",
+ "devices":[{"volume":0,"disk-state":"Inconsistent"},{"volume":1,"disk-state":"Inconsistent"}` + vol2Dev + `],
+ "connections":[
+  {"name":"n1","connection-state":"Connected","peer-role":"Secondary","peer_devices":[
+   {"volume":0,"replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","received":1,"out-of-sync":14592,"unacked":542},
+   {"volume":1,"replication-state":"Established","peer-disk-state":"Inconsistent","resync-suspended":"no","out-of-sync":0}` + vol2N1 + `]},
+  {"name":"n2","connection-state":"Connected","peer-role":"Secondary","peer_devices":[
+   {"volume":0,"replication-state":"PausedSyncT","peer-disk-state":"UpToDate","resync-suspended":"dependency","out-of-sync":8},
+   {"volume":1,"replication-state":"Established","peer-disk-state":"UpToDate","resync-suspended":"no","out-of-sync":0}` + vol2N2 + `]}]}]`
+}
+
+// This node is Primary: a link that is the only data path of one of its
+// volumes is never dropped. With the paused peer the only one, the active
+// one is reconnected instead; with both the only one of some volume,
+// nothing is done and the stall is reported.
+func TestStalledResyncNeverDropsAPrimarysOnlyDataPath(t *testing.T) {
+	t.Parallel()
+
+	t.Run("paused peer is the only path", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{status: multiVolumeStall(false)}
+		w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		for range 5 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if want := []string{"disconnect pvc-stall:n1", "connect pvc-stall:n1"}; !slices.Equal(adm.actions, want) {
+			t.Errorf("actions = %v, want %v", adm.actions, want)
+		}
+	})
+
+	t.Run("both are", func(t *testing.T) {
+		t.Parallel()
+
+		adm := &fakeWorkaroundAdm{status: multiVolumeStall(true)}
+		w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+		for range 5 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 {
+			t.Errorf("dropped a Primary's only data path: %v", adm.actions)
+		}
+
+		evs := drainEvents(recorder)
+		if len(evs) != 1 || !strings.Contains(evs[0], "left alone") {
+			t.Errorf("events = %v, want the stall reported and left alone", evs)
+		}
+	})
 }
 
 // The workarounds touch only resources blockstor has a replica of on this
@@ -810,10 +1309,135 @@ func TestNewDRBDWorkaroundsRunnableWiresConfigHintsAndHold(t *testing.T) {
 
 	release()
 
-	// A zero interval registers nothing (and touches no manager).
+	// A zero interval registers nothing.
+	mgr := &logManager{}
+
 	off := &DRBDWorkaroundsRunnable{}
-	if err := off.RegisterWithManager(nil); err != nil {
+	if err := off.RegisterWithManager(mgr); err != nil {
 		t.Errorf("zero interval: %v", err)
+	}
+
+	if len(mgr.added) != 0 {
+		t.Errorf("zero interval added %d runnables", len(mgr.added))
+	}
+}
+
+// logManager is a manager that records the runnables added to it and the
+// lines logged through its logger; every other method panics. Its logger
+// keeps Info and drops V(1), as the satellite's slog sink at LevelInfo
+// does, so a line logged only at V(1) is missing here as in production.
+type logManager struct {
+	manager.Manager
+
+	added []manager.Runnable
+	lines []string
+}
+
+func (m *logManager) Add(r manager.Runnable) error {
+	m.added = append(m.added, r)
+
+	return nil
+}
+
+func (m *logManager) GetLogger() logr.Logger {
+	return funcr.New(func(prefix, args string) {
+		m.lines = append(m.lines, prefix+" "+args)
+	}, funcr.Options{Verbosity: 0})
+}
+
+// The satellite says at start which DRBD workarounds it runs and how
+// often, since a check logs nothing until it acts.
+func TestWorkaroundsLogTheirStateAtStart(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultWorkaroundsConfig()
+	cfg.IdlePrimary = false
+
+	for _, tc := range []struct {
+		name string
+		cfg  WorkaroundsConfig
+		want string
+		runs int
+	}{
+		{
+			name: "enabled",
+			cfg:  cfg,
+			want: `"msg"="DRBD workarounds enabled" "interval"="30s" "stalledResync"=true "stalledResyncPasses"=4 ` +
+				`"stalledResyncMinRate"=200 "idlePrimary"=false "forcedIOFailures"=true "staleLoopDevices"=true`,
+			runs: 1,
+		},
+		{
+			name: "disabled",
+			cfg:  WorkaroundsConfig{},
+			want: `"msg"="DRBD workarounds disabled" "interval"="0s" "reason"="interval is 0"`,
+		},
+		{
+			// An interval with every check off would tick a pass that
+			// does nothing and log "enabled" with every check false.
+			name: "no check on",
+			cfg:  WorkaroundsConfig{Interval: defaultWorkaroundInterval, StalledResyncPasses: 4},
+			want: `"msg"="DRBD workarounds disabled" "interval"="30s" "reason"="no check enabled"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			mgr := &logManager{}
+
+			err := (&DRBDWorkaroundsRunnable{Config: tc.cfg}).RegisterWithManager(mgr)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(mgr.added) != tc.runs {
+				t.Errorf("added %d runnables, want %d", len(mgr.added), tc.runs)
+			}
+
+			if len(mgr.lines) != 1 || !strings.HasPrefix(mgr.lines[0], "drbd-workarounds ") ||
+				!strings.Contains(mgr.lines[0], tc.want) {
+				t.Errorf("logged %q, want one drbd-workarounds line with %s", mgr.lines, tc.want)
+			}
+		})
+	}
+}
+
+// A pass says at Info whether it read the kernel status, on the first
+// pass and then only when that changes, so an idle node running no
+// command is visible in the satellite's Info-level log without a line
+// every interval.
+func TestWorkaroundPassLogsWhetherItReadTheKernel(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{status: stalledStatus("42.17")}
+	w, _ := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	hints := WorkaroundHints{}
+	w.Hints = func() WorkaroundHints { return hints }
+
+	mgr := &logManager{}
+
+	for _, inconsistent := range []bool{false, false, true, true, false} {
+		hints.Inconsistent = inconsistent
+		w.pass(t.Context(), mgr.GetLogger())
+	}
+
+	var passes []string
+
+	for _, line := range mgr.lines {
+		if strings.Contains(line, `"msg"="DRBD workarounds pass"`) {
+			passes = append(passes, line)
+		}
+	}
+
+	want := []string{`"kernelStatusRead"=false`, `"kernelStatusRead"=true`, `"kernelStatusRead"=false`}
+	if len(passes) != len(want) {
+		t.Fatalf("pass lines = %q, want one per change: %q", passes, want)
+	}
+
+	for i := range want {
+		if !strings.Contains(passes[i], want[i]) || !strings.Contains(passes[i], `"level"=0`) {
+			t.Errorf("pass line %d = %q, want an Info line with %s", i, passes[i], want[i])
+		}
 	}
 }
 
