@@ -272,6 +272,33 @@ func TestKernelStatusPrimaryRuledOut(t *testing.T) {
 	}
 }
 
+// A reconnect of a peer this node dropped rules a Primary out over the
+// other links: the StandAlone peer is the one being connected, while a
+// link that is down or still connecting may lead to a Primary.
+func TestKernelStatusPrimaryRuledOutBesidesStandAlone(t *testing.T) {
+	t.Parallel()
+
+	resources := kernelStatus(t, `[
+{"name":"dropped-peer","role":"Secondary",
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Secondary"},
+  {"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]},
+{"name":"other-link-connecting","role":"Secondary",
+ "connections":[{"name":"a","connection-state":"Connecting","peer-role":"Unknown"},
+  {"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]},
+{"name":"primary-peer","role":"Secondary",
+ "connections":[{"name":"a","connection-state":"Connected","peer-role":"Primary"},
+  {"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]},
+{"name":"local-primary","role":"Primary",
+ "connections":[{"name":"b","connection-state":"StandAlone","peer-role":"Unknown"}]}
+]`)
+
+	for i, want := range []bool{true, false, false, false} {
+		if got := resources[i].PrimaryRuledOutBesidesStandAlone(); got != want {
+			t.Errorf("%s: PrimaryRuledOutBesidesStandAlone() = %v, want %v", resources[i].Name, got, want)
+		}
+	}
+}
+
 // The active peer of a resync dependency holds the only copy when the
 // paused peer, like this node, has no UpToDate disk of the volume: the
 // shape of an initial sync. An UpToDate paused peer is a second copy.

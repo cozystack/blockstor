@@ -212,13 +212,6 @@ func (r *KernelResource) ResyncDependency() (ResyncDependency, bool) {
 	return ResyncDependency{}, false
 }
 
-// HasPrimary reports whether this node or a connected peer is Primary.
-func (r *KernelResource) HasPrimary() bool {
-	return r.Role == string(RolePrimary) || slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
-		return c.ConnectionState == string(ConnectionStateConnected) && c.PeerRole == string(RolePrimary)
-	})
-}
-
 // ResyncDependency is one volume resyncing from Active while its resync
 // from Paused waits on it, with how far the resync from Active got.
 // OutOfSync and Received are in KiB; Outstanding is the resync requests
@@ -242,7 +235,26 @@ type ResyncDependency struct {
 // connection is Connected to a Secondary. A peer that is not connected
 // may be Primary for all this node knows.
 func (r *KernelResource) PrimaryRuledOut() bool {
+	return r.primaryRuledOut(false)
+}
+
+// PrimaryRuledOutBesidesStandAlone is PrimaryRuledOut over the
+// connections that are not StandAlone. A StandAlone peer is one this node
+// dropped itself and the peer a reconnect would connect; the Primary that
+// matters to that reconnect is a third node writing to both ends, and any
+// link that is down or still connecting may lead to one.
+func (r *KernelResource) PrimaryRuledOutBesidesStandAlone() bool {
+	return r.primaryRuledOut(true)
+}
+
+// primaryRuledOut is PrimaryRuledOut, skipping StandAlone connections
+// when skipStandAlone is set.
+func (r *KernelResource) primaryRuledOut(skipStandAlone bool) bool {
 	return r.Role == string(RoleSecondary) && !slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
+		if skipStandAlone && c.ConnectionState == string(ConnectionStateStandAlone) {
+			return false
+		}
+
 		return c.ConnectionState != string(ConnectionStateConnected) || c.PeerRole != string(RoleSecondary)
 	})
 }

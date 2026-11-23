@@ -519,8 +519,8 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 // (drbd.KernelResource.PrimaryRuledOut: this node Secondary, every
 // connection Connected to a Secondary), where the active peer does not
 // hold the only UpToDate copy, as it does in an initial sync, and a
-// paused peer it disconnected is connected again only while no Primary
-// is in sight (reconnectOwed).
+// paused peer it disconnected is connected again only while a Primary is
+// ruled out on every other link (reconnectOwed).
 //
 // A pass counts as stalled when, since the previous pass, the out-of-sync
 // count toward the active peer fell by less than StalledResyncMinRate,
@@ -835,12 +835,14 @@ func (w *DRBDWorkaroundsRunnable) loadOwedReconnects(logger logr.Logger) {
 }
 
 // reconnectOwed connects again, with `drbdadm adjust`, the peers
-// disconnectPausedPeer dropped, once no Primary is in sight: a Primary
+// disconnectPausedPeer dropped, once a Primary is ruled out: a Primary
 // may have come up since the disconnect, and the reconnect between this
 // node and that Secondary is the handshake that can make a Secondary the
-// SyncSource while the Primary writes. Such a resource is reported once
-// and kept owed; it is connected again when the Primary is gone, or by an
-// operator. One blockstor no longer has a replica of, or is deleting, is
+// SyncSource while the Primary writes. A link that is down or still
+// connecting may lead to such a Primary as well
+// (drbd.KernelResource.PrimaryRuledOutBesidesStandAlone). Such a
+// resource is reported once and kept owed; it is connected again when no
+// Primary can be in the way, or by an operator. One blockstor no longer has a replica of, or is deleting, is
 // dropped, and one an apply is changing is left to the next pass.
 // resources is this pass's kernel status.
 func (w *DRBDWorkaroundsRunnable) reconnectOwed(ctx context.Context, logger logr.Logger, resources []drbd.KernelResource) {
@@ -867,12 +869,12 @@ func (w *DRBDWorkaroundsRunnable) reconnect(
 	}
 
 	i := slices.IndexFunc(resources, func(r drbd.KernelResource) bool { return r.Name == name })
-	if i >= 0 && resources[i].HasPrimary() {
+	if i >= 0 && !resources[i].PrimaryRuledOutBesidesStandAlone() {
 		if !reported {
 			w.owedReconnect[name] = true
 			w.acted(logger, replica, name, "DRBDResyncStalled", fmt.Sprintf(
-				"not connecting again the peer a stalled resync waited on while a Primary is in sight "+
-					"(LINBIT/drbd#153); it is connected once none is, or by hand on %s: `drbdadm adjust %s`",
+				"not connecting again the peer a stalled resync waited on while a Primary is in sight or not ruled out "+
+					"(LINBIT/drbd#153); it is connected once none can be, or by hand on %s: `drbdadm adjust %s`",
 				w.NodeName, name))
 		}
 

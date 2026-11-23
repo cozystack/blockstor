@@ -443,6 +443,48 @@ func TestStalledResyncReconnectsThePausedPeerOnlyWithNoPrimaryInSight(t *testing
 	}
 }
 
+// A link to a third node that is down or still connecting may lead to a
+// Primary, so the paused peer is not connected again until that link is
+// back and shows a Secondary.
+func TestStalledResyncReconnectWaitsForAPrimaryToBeRuledOut(t *testing.T) {
+	t.Parallel()
+
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
+
+	if got := runResync(t, w, adm, "Secondary", frozen(5)...); !slices.Equal(got, []string{"disconnect pvc-stall:n2"}) {
+		t.Fatalf("actions = %v, want n2 disconnected", got)
+	}
+
+	drainEvents(recorder)
+
+	adm.actions = nil
+	adm.status = `[{"name":"pvc-stall","role":"Secondary","devices":[{"volume":0,"disk-state":"UpToDate"}],
+ "connections":[{"name":"n1","connection-state":"Connecting","peer-role":"Unknown","peer_devices":[{"volume":0,
+  "replication-state":"Off","peer-disk-state":"DUnknown","resync-suspended":"no"}]},
+  {"name":"n2","connection-state":"StandAlone","peer-role":"Unknown","peer_devices":[{"volume":0,
+  "replication-state":"Off","peer-disk-state":"DUnknown","resync-suspended":"no"}]}]}]`
+
+	w.pass(t.Context(), logr.Discard())
+	w.pass(t.Context(), logr.Discard())
+
+	if len(adm.actions) != 0 {
+		t.Errorf("connected n2 again while n1 was connecting: %v", adm.actions)
+	}
+
+	if evs := drainEvents(recorder); len(evs) != 1 || !strings.Contains(evs[0], "not ruled out") {
+		t.Errorf("events = %v, want the wait reported once", evs)
+	}
+
+	adm.status = strings.Replace(adm.status,
+		`"connection-state":"Connecting","peer-role":"Unknown"`, `"connection-state":"Connected","peer-role":"Secondary"`, 1)
+	w.pass(t.Context(), logr.Discard())
+
+	if want := []string{"adjust pvc-stall"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("actions once n1 is a connected Secondary = %v, want %v", adm.actions, want)
+	}
+}
+
 // alpha.15 before the freeze: the active resync ran at 100-150 KiB/s for
 // 14 minutes, percent still moving. Too slow is stalled too.
 func TestStalledResyncCatchesATrickle(t *testing.T) {
