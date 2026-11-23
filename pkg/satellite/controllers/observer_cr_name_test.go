@@ -264,3 +264,44 @@ func TestTheConditionStampersReachAHashedDefinitionsReplica(t *testing.T) {
 		}
 	}
 }
+
+// The MetadataCreated Reason says whether create-md ran: an adopted
+// replica's metadata was found by dump-md, and its Condition must not
+// read CreateMdSucceeded.
+func TestTheMetadataCreatedReasonSaysWhetherCreateMdRan(t *testing.T) {
+	t.Parallel()
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"}}
+	node := &blockstoriov1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	crName := k8s.ResourceCRName("pvc-1", "n1")
+	replica := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: crName},
+		Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: rd.Name, NodeName: node.Name},
+	}
+
+	for want, stamp := range map[string]func(*MetadataCreatedStamper) error{
+		blockstoriov1alpha1.MetadataCreatedReasonCreateMd: func(s *MetadataCreatedStamper) error {
+			return s.StampMetadataCreated(context.Background(), rd.Name, node.Name)
+		},
+		blockstoriov1alpha1.MetadataCreatedReasonFound: func(s *MetadataCreatedStamper) error {
+			return s.StampMetadataFound(context.Background(), rd.Name, node.Name)
+		},
+	} {
+		cli := fake.NewClientBuilder().WithScheme(crNameScheme(t)).WithObjects(rd.DeepCopy(), node.DeepCopy(), replica.DeepCopy()).
+			WithStatusSubresource(&blockstoriov1alpha1.Resource{}).Build()
+
+		if err := stamp(&MetadataCreatedStamper{Client: cli}); err != nil {
+			t.Fatalf("%s: %v", want, err)
+		}
+
+		var got blockstoriov1alpha1.Resource
+		if err := cli.Get(context.Background(), client.ObjectKey{Name: crName}, &got); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+
+		cond := meta.FindStatusCondition(got.Status.Conditions, blockstoriov1alpha1.ConditionMetadataCreated)
+		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != want {
+			t.Errorf("MetadataCreated = %+v; want True with Reason %s", cond, want)
+		}
+	}
+}

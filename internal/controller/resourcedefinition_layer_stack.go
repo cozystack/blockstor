@@ -244,13 +244,19 @@ func (r *ResourceDefinitionReconciler) rdHoldsData(ctx context.Context, rdName s
 }
 
 // groupLayerStackChanged fires on a group update that changes its layer
-// stack, the only group edit the unapplied-group annotation depends on.
-// Creates and deletes are left to the RD's own reconcile: a new group has
-// no pinned RDs yet, and a deleted one is read as gone there.
+// stack, the only group edit the unapplied-group annotation depends on,
+// on a group's creation, since an RD that names a group not created yet
+// is pinned once it is, and on its deletion, which drops the annotation
+// from the RDs that still name it. The RD has no periodic pass to read
+// either change in.
 func groupLayerStackChanged() predicate.Predicate {
 	return predicate.Funcs{
-		CreateFunc:  func(event.CreateEvent) bool { return false },
-		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		// An RD can name a group before it exists, and nothing else
+		// brings it back once the group comes.
+		CreateFunc: func(event.CreateEvent) bool { return true },
+		// REST refuses to delete a group RDs name, but the CR can be
+		// deleted directly.
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
 		GenericFunc: func(event.GenericEvent) bool { return false },
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldGroup, okOld := e.ObjectOld.(*blockstoriov1alpha1.ResourceGroup)

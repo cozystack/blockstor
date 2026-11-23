@@ -158,9 +158,19 @@ func TestRestorePoolKeepsTwoNodesOfOneLowercaseApart(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("seed replica on %s: %v", node, err)
 		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{StoragePoolName: pool, NodeName: node}); err != nil {
+			t.Fatalf("seed pool on %s: %v", node, err)
+		}
 	}
 
-	byNode, _ := storPoolsByNodeFromSourceRD(ctx, st, "pvc-two")
+	snap := &apiv1.Snapshot{Name: "snap", ResourceName: "pvc-two", Nodes: []string{"My_Node", "my_node"}}
+
+	byNode, err := store.RestorePools(ctx, st, snap, snap.Nodes)
+	if err != nil {
+		t.Fatalf("restore pools: %v", err)
+	}
+
 	if got := byNode[naming.Key("My_Node")]; got != "pool-upper" {
 		t.Errorf("pool for My_Node = %q, want pool-upper", got)
 	}
