@@ -20,13 +20,61 @@ package controller_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
 )
+
+// snapshotFlagSuccessful is the status flag of a finished take, the
+// value LINSTOR reports for a snapshot that completed.
+const snapshotFlagSuccessful = "SUCCESSFUL"
+
+// withCadenceReplicas returns rd followed by one diskful replica of it
+// on each of n1 and n2. An auto-snapshot is taken on the definition's
+// diskful replicas, and a tick for a definition without one is skipped.
+func withCadenceReplicas(rd *blockstoriov1alpha1.ResourceDefinition) []client.Object {
+	objs := []client.Object{rd}
+
+	for _, node := range []string{"n1", "n2"} {
+		objs = append(objs, &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: rd.Name + "." + node},
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: rd.Name,
+				NodeName:               node,
+			},
+		})
+	}
+
+	return objs
+}
+
+// finishCadenceTakes records every auto-snapshot of the definition as
+// a finished take, the way the satellites leave it, so the next tick is
+// not held back by a take that still holds I/O suspended.
+func finishCadenceTakes(t *testing.T, cli client.Client, rdName string) {
+	t.Helper()
+
+	for _, snap := range listAutoSnapshotsByRD(t, cli, rdName) {
+		if slices.Contains(snap.Status.Flags, snapshotFlagSuccessful) {
+			continue
+		}
+
+		snap.Spec.SuspendIO = false
+		snap.Spec.TakeSnapshot = false
+		snap.Status.Flags = append(snap.Status.Flags, snapshotFlagSuccessful)
+
+		if err := cli.Update(context.Background(), &snap); err != nil {
+			t.Fatalf("finish the take of %s: %v", snap.Name, err)
+		}
+	}
+}
 
 // TestAutoSnapshotRunEveryOneTakesOnePerMinute drives the runnable the
 // way the production ticker does, one Tick per AutoSnapshotPeriod with
@@ -41,7 +89,7 @@ func TestAutoSnapshotRunEveryOneTakesOnePerMinute(t *testing.T) {
 	const rdName = "pvc-cadence"
 
 	cli := fake.NewClientBuilder().WithScheme(newScheme(t)).
-		WithObjects(makeRDWithAutoSnapshot(t, rdName, 1, "100")).
+		WithObjects(withCadenceReplicas(makeRDWithAutoSnapshot(t, rdName, 1, "100"))...).
 		Build()
 
 	start := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
@@ -65,6 +113,8 @@ func TestAutoSnapshotRunEveryOneTakesOnePerMinute(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Tick #%d: %v", k, err)
 		}
+
+		finishCadenceTakes(t, cli, rdName)
 
 		// Every slot reached so far is taken by the first poll at or
 		// after it, not one poll later.
@@ -98,7 +148,7 @@ func TestAutoSnapshotAfterDowntimeTakesOneNotABurst(t *testing.T) {
 		controllerpkg.AnnotationAutoSnapshotLastAt: start.Add(-3 * time.Hour).Format(time.RFC3339Nano),
 	}
 
-	cli := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(rd).Build()
+	cli := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(withCadenceReplicas(rd)...).Build()
 
 	clk := &stubClock{t: start}
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
@@ -111,6 +161,8 @@ func TestAutoSnapshotAfterDowntimeTakesOneNotABurst(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Tick #%d: %v", k, err)
 		}
+
+		finishCadenceTakes(t, cli, rdName)
 	}
 
 	if got := len(listAutoSnapshotsByRD(t, cli, rdName)); got != 1 {
