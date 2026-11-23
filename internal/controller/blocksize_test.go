@@ -231,6 +231,27 @@ func TestAutoBlockSizeOffLeavesDefinition(t *testing.T) {
 	}
 }
 
+// TestMixedSwitchFirstReplicaSetsNoSize pins LINSTOR's resource create
+// for a definition with no replica: it passes the definition-wide switch
+// to rscMinIoSizeCheck (CtrlRscCrtApiHelper.createResourceDb, v1.33.1),
+// not canChangeMinIoSize. With the switch off on volume 1 only, volume 0
+// may not take the pool's 4096 and LINSTOR refuses the replica; blockstor
+// leaves the size alone and reports it instead.
+func TestMixedSwitchFirstReplicaSetsNoSize(t *testing.T) {
+	t.Parallel()
+
+	f := newBSFixture(nil)
+	f.rd.Spec.VolumeDefinitions = append(f.rd.Spec.VolumeDefinitions, blockstoriov1alpha1.ResourceDefinitionVolume{
+		VolumeNumber: 1, SizeKib: 1 << 20, Props: map[string]string{blocksize.PropAuto: "false"},
+	})
+
+	props := f.reconcile(t, bsReplica(bsNode))
+
+	if got, ok := props[blocksize.PropBlockSize]; ok {
+		t.Fatalf("volume 0 block-size = %q, want none: LINSTOR refuses this replica", got)
+	}
+}
+
 // TestNewReplicaOfRunningVolumeWithoutSizeKeepsDefault: a volume created
 // before the rule has replicas running at DRBD's default and no size on
 // its definition. A new replica gets the default written down instead of

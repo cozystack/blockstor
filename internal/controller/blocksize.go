@@ -326,8 +326,14 @@ func (r *ResourceReconciler) reportIncompatibleBlockSize(
 		vd.VolumeNumber, current, replicaSize)
 }
 
-// canChangeBlockSize is LINSTOR's canChangeMinIoSize over the replicas
-// the definition already has.
+// canChangeBlockSize is what LINSTOR's resource create (createResourceDb)
+// passes to rscMinIoSizeCheck: canChangeMinIoSize once the definition has
+// a replica, and the definition-wide switch while it has none. The
+// autoplacer calls canChangeMinIoSize on an empty definition too, which
+// is true there whatever the switches say (blocksize.CanChange, used by
+// the placer); the create path is stricter, so with one volume's switch
+// off the first replica may not set any volume's size and LINSTOR
+// refuses it on a pool that needs more than the default.
 func canChangeBlockSize(scope *blockSizeScope, peers []blockstoriov1alpha1.Resource) bool {
 	if !scope.allAuto() {
 		return false
