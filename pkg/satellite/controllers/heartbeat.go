@@ -20,12 +20,18 @@ package controllers
 
 import (
 	"context"
+	"io"
+	"net"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/connrotation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -41,6 +47,23 @@ import (
 // period, long enough that the apiserver doesn't sink under the
 // write load on a real cluster.
 const HeartbeatPeriod = 10 * time.Second
+
+// HeartbeatTimeout bounds one stamp. Without it a stamp sent down a
+// connection whose API server endpoint died without a FIN or RST
+// waits for TCP or the HTTP/2 health check to give up, which can be
+// longer than the controller's grace period: a node that is alive
+// gets marked OFFLINE because a different node went down. It is no
+// shorter than kubelet's bound on a node status update, one period,
+// so an API server that is alive but slow to commit, an etcd that
+// is catching up after it lost a member, still gets the stamp in.
+const HeartbeatTimeout = HeartbeatPeriod
+
+// HeartbeatRetryPeriod is how soon a stamp that failed to reach an
+// API server is retried. Waiting a full HeartbeatPeriod after such a
+// failure would spend a fifth of the grace period on one lost write.
+// A stamp the API server answered with an error backs off from here
+// instead, up to HeartbeatPeriod.
+const HeartbeatRetryPeriod = time.Second
 
 // HeartbeatFieldOwner is the SSA field-manager the heartbeat
 // runnable uses. Distinct from the satellite-reconciler owner so
@@ -105,6 +128,20 @@ type HeartbeatRunnable struct {
 	NodeName string
 	Period   time.Duration
 
+	// Timeout bounds one stamp; zero means HeartbeatTimeout.
+	Timeout time.Duration
+
+	// RetryPeriod is the wait after a failed stamp; zero means
+	// HeartbeatRetryPeriod.
+	RetryPeriod time.Duration
+
+	// ResetConnections, when set, closes every connection Client
+	// holds, the busy ones included. A stamp that did not reach an API
+	// server calls it so the retry dials again instead of queueing
+	// behind a connection to an API server that is gone (see
+	// NewHeartbeatClient).
+	ResetConnections func()
+
 	// missCount tracks consecutive NotFound observations. Reset
 	// on the first successful stamp. Internal — exposed only so
 	// the controller-package tests can pin the rate-limit behaviour
@@ -131,25 +168,95 @@ func (h *HeartbeatRunnable) Start(ctx context.Context) error {
 
 	logger := log.FromContext(ctx).WithValues("node", h.NodeName)
 
-	err := h.stamp(ctx, logger)
-	if err != nil {
-		logger.Error(err, "initial heartbeat stamp")
+	retry := h.RetryPeriod
+	if retry == 0 {
+		retry = HeartbeatRetryPeriod
 	}
 
-	ticker := time.NewTicker(period)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	backoff := retry
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			err = h.stamp(ctx, logger)
-			if err != nil {
-				logger.Error(err, "heartbeat stamp")
+		case <-timer.C:
+			next := period
+
+			err := h.stampWithin(ctx, logger)
+			switch {
+			case err == nil:
+				backoff = retry
+			case unreachable(err):
+				logger.Error(err, "heartbeat stamp did not reach an API server")
+
+				if h.ResetConnections != nil {
+					h.ResetConnections()
+				}
+
+				next = retry
+			default:
+				// The API server is there and said no: overloaded, a
+				// revoked grant, a CRD mid-upgrade. A new connection
+				// would get the same answer, and every satellite
+				// redialling and resending each second would load an
+				// API server that may already be shedding requests.
+				logger.Error(err, "heartbeat stamp refused")
+
+				next = backoff
+				backoff = min(2*backoff, period)
 			}
+
+			timer.Reset(next)
 		}
 	}
+}
+
+// unreachable reports whether a stamp failed for want of a working
+// connection to an API server, rather than on an answer from one.
+// Only then does a new connection, and a quick retry, help.
+func unreachable(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
+		return true
+	}
+
+	var netErr net.Error
+
+	return errors.As(err, &netErr)
+}
+
+// NewHeartbeatClient builds the client the heartbeat stamps with and
+// the function that drops its connections.
+//
+// The heartbeat must not share the manager's connections. Those carry
+// the watches, and an HTTP/2 connection to an API server endpoint that
+// died silently stays in use until the health check gives up on it:
+// a stamp that times out on it would be retried on the very same
+// connection. A dialer of its own keeps the stamp on a transport no
+// one else uses, and lets a failed stamp close it, busy or not, so the
+// retry reaches an API server that is still there. kubelet guards its
+// node status updates the same way.
+func NewHeartbeatClient(
+	restCfg *rest.Config, scheme *runtime.Scheme, mapper meta.RESTMapper,
+) (client.Client, func(), error) {
+	dialer := connrotation.NewDialer((&net.Dialer{
+		Timeout:   HeartbeatTimeout,
+		KeepAlive: HeartbeatPeriod,
+	}).DialContext)
+
+	cfg := rest.CopyConfig(restCfg)
+	cfg.Dial = dialer.DialContext
+
+	cli, err := client.New(cfg, client.Options{Scheme: scheme, Mapper: mapper})
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "build heartbeat client")
+	}
+
+	return cli, dialer.CloseAll, nil
 }
 
 // RegisterWithManager adds the runnable to mgr. Used by NewManager
@@ -162,6 +269,19 @@ func (h *HeartbeatRunnable) RegisterWithManager(mgr manager.Manager) error {
 	}
 
 	return nil
+}
+
+// stampWithin runs one stamp bounded by the runnable's timeout.
+func (h *HeartbeatRunnable) stampWithin(ctx context.Context, logger logr.Logger) error {
+	timeout := h.Timeout
+	if timeout == 0 {
+		timeout = HeartbeatTimeout
+	}
+
+	stampCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	return h.stamp(stampCtx, logger)
 }
 
 // stamp SSA-applies the current heartbeat onto the satellite's Node CRD.

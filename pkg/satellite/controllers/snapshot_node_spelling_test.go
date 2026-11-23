@@ -203,7 +203,7 @@ func TestTheReadyStampFoldsAnAliasBehindAReadyEntry(t *testing.T) {
 		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).WithObjects(snap).Build()
 	r := &SnapshotReconciler{Client: cli, Config: Config{NodeName: "Node-1"}}
 
-	if err := r.stampSnapshotPerNodeReady(t.Context(), snap, 9); err != nil {
+	if err := r.stampSnapshotPerNodeReady(t.Context(), snap, 9, ""); err != nil {
 		t.Fatalf("stamp: %v", err)
 	}
 

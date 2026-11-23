@@ -10,6 +10,8 @@ import (
 	"time"
 
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 )
 
 var (
@@ -119,4 +121,19 @@ func TestIndexRegistrationAbandonsAnAttemptThatOutlivesTheBudget(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("registration was still waiting on a hung attempt 5s into a 200ms budget")
 	}
+}
+
+// ReplicasOf asks the manager's cache which spellings a definition's
+// replicas carry on every pass of every definition. Without the index that
+// question copies every cached Resource each time.
+func TestManagerIndexesReplicasByDefinitionKey(t *testing.T) {
+	t.Parallel()
+
+	for _, index := range fieldIndexes() {
+		if _, ok := index.object.(*crdv1alpha1.Resource); ok && index.field == FieldResourceDefinitionKey {
+			return
+		}
+	}
+
+	t.Errorf("NewManager registers no %s index on Resource", FieldResourceDefinitionKey)
 }

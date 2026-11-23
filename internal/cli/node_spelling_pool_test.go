@@ -45,7 +45,16 @@ func TestPoolInferenceReadsTheNodeInAnotherSpelling(t *testing.T) {
 		}
 	}
 
-	if pool, err := sourcePoolOn(ctx, run, "pvc-mix", "node-2"); err != nil || pool != "pool-Node-2" {
+	for _, node := range []string{"Node-1", "Node-2"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool-Node-2", NodeName: node,
+		}); err != nil {
+			t.Fatalf("seed pool on %s: %v", node, err)
+		}
+	}
+
+	snap := &apiv1.Snapshot{Name: "snap", ResourceName: "pvc-mix", Nodes: []string{"Node-1", "Node-2"}}
+	if pool, err := sourcePoolOn(ctx, run, snap, "node-2"); err != nil || pool != "pool-Node-2" {
 		t.Errorf("sourcePoolOn(node-2) = %q, %v; want the pool of the replica on Node-2", pool, err)
 	}
 
