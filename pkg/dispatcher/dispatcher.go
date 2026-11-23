@@ -884,6 +884,14 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	out := make([]*intent.DesiredVolume, 0, len(rd.Spec.VolumeDefinitions))
 
 	for _, vd := range rd.Spec.VolumeDefinitions {
+		// A volume definition flagged DELETE is no volume of this replica
+		// any more: leaving it out of the .res is what drops it from DRBD,
+		// and the satellite deletes its storage once the apply went
+		// through.
+		if vd.Deleting() {
+			continue
+		}
+
 		// Per-VD `StorPoolName` (scenario 4.W26) is the most-specific
 		// scope and overrides the RD/Resource default. Empty value
 		// falls through to the RD-level pool resolved above.

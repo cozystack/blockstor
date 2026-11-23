@@ -261,6 +261,8 @@ func TestBug186VDDeleteForceTrueBypasses(t *testing.T) {
 		t.Fatalf("seed Resource: %v", err)
 	}
 
+	fakeSatellites(t, st, rdName, nodeA)
+
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 

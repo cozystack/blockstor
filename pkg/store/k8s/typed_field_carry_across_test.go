@@ -263,6 +263,7 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			"SizeKib":      true,
 			"Props":        true,
 			"Flags":        true,
+			"DeleteID":     true,
 		},
 		mustCarryAcross: map[string]bool{
 			// Bug 433: the per-volume DRBDMinor is the /dev/drbd<N>
