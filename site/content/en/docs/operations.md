@@ -109,7 +109,7 @@ blockstor node lost worker-2
 
 This deletes the node's replicas and pools, then the `Node`. It is refused while the satellite still reports `ONLINE`, unless you pass `--force`. Surviving replicas are left alone, and the controller places replacements for them. A satellite pod that restarts on that host afterwards does not re-create the `Node`; register it again with `node create` if the node returns.
 
-As in LINSTOR, nothing on the lost node's disks is touched. Its replicas' volumes and its copies of snapshots stay where they are: the replicas are removed without waiting for a satellite that will never run again, and the node's hold on its snapshots is dropped. A satellite that turns out to be running after all, with `--force`, tears down DRBD for those replicas and keeps their volumes. If the disks come back, delete what you do not need on them by hand.
+As in LINSTOR, nothing on the lost node's disks is touched. Its replicas' volumes and its copies of snapshots stay where they are: the replicas are removed without waiting for a satellite that will never run again, and the node is dropped from the snapshots it had a copy of, as LINSTOR drops its snapshots. A snapshot whose only copy was on that node is deleted. A satellite that turns out to be running after all, with `--force`, tears down DRBD for those replicas and keeps their volumes. If the disks come back, delete what you do not need on them by hand.
 
 `blockstor node delete` removes only the `Node` object and refuses while replicas or pools still point at it, or snapshots still have a copy on it. With `--force` it deletes them too, like `node lost`.
 

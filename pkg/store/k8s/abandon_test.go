@@ -78,12 +78,36 @@ func TestLostNodeReleasesWhatOnlyItsSatelliteWouldHave(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "pvc-lost.unmigrated", Finalizers: []string{finalizers.SharedSatelliteSnapshot}},
 			Spec:       crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "pvc-lost", SnapshotName: "unmigrated", Nodes: []string{"node-lost", "node-c"}},
 		},
+		// node-a still runs an older satellite and holds no own finalizer
+		// yet, so the shared one stays; it must not wait on node-lost.
+		&crdv1alpha1.Snapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-lost.upgrading", Finalizers: []string{
+				finalizers.SharedSatelliteSnapshot, finalizers.SnapshotNode("node-b"),
+			}},
+			Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "pvc-lost", SnapshotName: "upgrading", Nodes: []string{"node-a", "node-b", "node-lost"}},
+		},
+		&crdv1alpha1.Snapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-lost.only", Finalizers: []string{finalizers.SnapshotNode("node-lost")}},
+			Spec:       crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "pvc-lost", SnapshotName: "only", Nodes: []string{"node-lost"}},
+		},
 	}
 
 	for _, obj := range objs {
 		if err := cli.Create(ctx, obj); err != nil {
 			t.Fatalf("create %s: %v", obj.GetName(), err)
 		}
+	}
+
+	var upgrading crdv1alpha1.Snapshot
+	if err := cli.Get(ctx, client.ObjectKey{Name: "pvc-lost.upgrading"}, &upgrading); err != nil {
+		t.Fatalf("get pvc-lost.upgrading: %v", err)
+	}
+
+	upgrading.Status.NodeStatus = []crdv1alpha1.SnapshotPerNodeStatus{
+		{NodeName: "node-a", Ready: true}, {NodeName: "node-b", Ready: true}, {NodeName: "node-lost", Ready: true},
+	}
+	if err := cli.Status().Update(ctx, &upgrading); err != nil {
+		t.Fatalf("stamp node status: %v", err)
 	}
 
 	// Runs before wipeAll: the objects left holding finalizers would
@@ -126,20 +150,47 @@ func TestLostNodeReleasesWhatOnlyItsSatelliteWouldHave(t *testing.T) {
 		}
 	}
 
-	want := map[string][]string{
-		"pvc-lost.both":       {finalizers.SnapshotNode("node-b")},
-		"pvc-lost.shared":     {finalizers.SnapshotNode("node-b")},
-		"pvc-lost.unmigrated": {finalizers.SharedSatelliteSnapshot},
+	type snapWant struct {
+		finalizers, nodes []string
 	}
 
-	for name, finals := range want {
+	want := map[string]snapWant{
+		"pvc-lost.both":       {[]string{finalizers.SnapshotNode("node-b")}, []string{"node-b"}},
+		"pvc-lost.shared":     {[]string{finalizers.SnapshotNode("node-b")}, []string{"node-b"}},
+		"pvc-lost.unmigrated": {[]string{finalizers.SharedSatelliteSnapshot}, []string{"node-c"}},
+		"pvc-lost.upgrading": {
+			[]string{finalizers.SharedSatelliteSnapshot, finalizers.SnapshotNode("node-b")},
+			[]string{"node-a", "node-b"},
+		},
+	}
+
+	for name, w := range want {
 		var snap crdv1alpha1.Snapshot
 		if err := cli.Get(ctx, client.ObjectKey{Name: name}, &snap); err != nil {
 			t.Fatalf("get %s: %v", name, err)
 		}
 
-		if !slices.Equal(snap.Finalizers, finals) {
-			t.Errorf("%s finalizers %v, want %v", name, snap.Finalizers, finals)
+		if !slices.Equal(snap.Finalizers, w.finalizers) || !slices.Equal(snap.Spec.Nodes, w.nodes) {
+			t.Errorf("%s finalizers %v nodes %v, want %v and %v", name, snap.Finalizers, snap.Spec.Nodes, w.finalizers, w.nodes)
 		}
+	}
+
+	if err := cli.Get(ctx, client.ObjectKey{Name: "pvc-lost.upgrading"}, &upgrading); err != nil {
+		t.Fatalf("get pvc-lost.upgrading: %v", err)
+	}
+
+	if slices.ContainsFunc(upgrading.Status.NodeStatus, func(st crdv1alpha1.SnapshotPerNodeStatus) bool { return st.NodeName == "node-lost" }) {
+		t.Errorf("pvc-lost.upgrading still reports node-lost: %+v", upgrading.Status.NodeStatus)
+	}
+
+	// Once node-a stamps its own, every listed node holds one and the shared
+	// finalizer can go: the lost node no longer blocks that.
+	if !finalizers.OthersHoldTheirOwn(upgrading.Spec.Nodes, append(upgrading.Finalizers, finalizers.SnapshotNode("node-a")), "node-a") {
+		t.Errorf("pvc-lost.upgrading: the shared finalizer still waits on a node that is gone (nodes %v)", upgrading.Spec.Nodes)
+	}
+
+	var only crdv1alpha1.Snapshot
+	if err := cli.Get(ctx, client.ObjectKey{Name: "pvc-lost.only"}, &only); !apierrors.IsNotFound(err) {
+		t.Errorf("pvc-lost.only, whose only copy was on the lost node, still there: err=%v finalizers=%v", err, only.Finalizers)
 	}
 }

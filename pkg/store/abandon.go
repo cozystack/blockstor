@@ -45,10 +45,12 @@ type PoolAbandoner interface {
 	AbandonPool(ctx context.Context, node, pool string) error
 }
 
-// SnapshotNodeReleaser drops a node's hold on every Snapshot it is listed on,
-// leaving that node's copies on its disk. A Snapshot that still carries the
-// old shared finalizer loses it too once every other node it lists holds its
-// own, since the released node was the last one that had not.
+// SnapshotNodeReleaser removes a node from every Snapshot it is listed on,
+// leaving that node's copies on its disk: its hold is dropped, it leaves the
+// list, and a Snapshot it was the last copy of is deleted. A Snapshot that
+// still carries the old shared finalizer loses it too once every other node
+// it lists holds its own, since the released node was the last one that had
+// not.
 type SnapshotNodeReleaser interface {
 	ReleaseSnapshotsOnNode(ctx context.Context, node string) error
 }
