@@ -20,6 +20,8 @@ package v1
 
 import (
 	"strings"
+
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // The props a live migration writes onto a resource definition, by
@@ -51,6 +53,30 @@ const (
 // migration.
 func LiveMigrationMarked(props map[string]string) bool {
 	return props[LiveMigrateSourceProp] != "" && props[LiveMigrateTargetProp] != ""
+}
+
+// DualPrimaryOpen reports whether a definition's props let node be Primary
+// next to another node right now: a live migration is prepared from or to
+// it, or allow-two-primaries is set on the definition (a client such as
+// linstor-csi before v1.13 sets it there) or on a connection of node.
+func DualPrimaryOpen(props map[string]string, node string) bool {
+	if strings.EqualFold(props[AllowTwoPrimariesProp], "yes") {
+		return true
+	}
+
+	if LiveMigrationMarked(props) &&
+		(naming.Same(props[LiveMigrateSourceProp], node) || naming.Same(props[LiveMigrateTargetProp], node)) {
+		return true
+	}
+
+	for prop, value := range props {
+		pair, key, ok := ParseResourceConnectionPropKey(prop)
+		if ok && key == AllowTwoPrimariesProp && pair.Has(node) && strings.EqualFold(value, "yes") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // RevertLiveMigration takes what a live migration wrote back out of a
