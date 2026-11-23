@@ -231,3 +231,16 @@ func TestReplicaNotReportedSinceRestartCarriesNoSatelliteState(t *testing.T) {
 	online := got["n1"]
 	assertSatelliteState(t, "replica on the other node", &online)
 }
+
+// The view answers an OFFLINE node's replica with no state, which
+// linstor-client and the blockstor CLI read as Unknown and list under
+// `--faulty`; `?faulty=true` passed over it for carrying no disk state.
+func TestOfflineNodeReplicaIsFaulty(t *testing.T) {
+	base, stop := startServerWithStore(t, seedOfflinePeer(t))
+	defer stop()
+
+	faulty := decodeReplicas(t, base+"/v1/view/resources?faulty=true")
+	if _, listed := faulty["n2"]; !listed {
+		t.Errorf("?faulty=true does not list the OFFLINE node's replica: %v", faulty)
+	}
+}
