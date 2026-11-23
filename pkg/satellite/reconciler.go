@@ -6165,6 +6165,8 @@ type drbdOptionSections struct {
 // those into the .res file makes drbdadm fail with "expected:
 // cpu-mask | on-no-data-accessible | ... but got: <name>". Drop
 // them on the satellite side; the convention upstream is the same.
+// The exception is DrbdOptions/auto-verify-alg, which upstream renders
+// as `verify-alg` when none is set explicitly (drbd.FillAutoVerifyAlg).
 //
 // Bug 258: prior to this routing rewrite, `Disk`, `Handlers` and
 // `PeerDevice` keys all collapsed onto the resource-level options{}
@@ -6211,6 +6213,10 @@ func splitDRBDOptions(opts map[string]string) drbdOptionSections {
 			out.Resource[rawKey] = value
 		}
 	}
+
+	// The one section-less key that does reach the .res: LINSTOR's
+	// automatic verify algorithm stands in for an unset verify-alg.
+	drbd.FillAutoVerifyAlg(out.Net, opts)
 
 	return out
 }
