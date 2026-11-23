@@ -281,19 +281,7 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		)
 	}
 
-	var drift *driftCheck
-
-	if r.Config.Exec != nil {
-		trigger := make(chan event.GenericEvent, reconcileTriggerBuffer)
-		drift = &driftCheck{
-			reader: mgr.GetClient(), exec: r.Config.Exec, node: r.Config.NodeName,
-			out: trigger, interval: r.Config.DriftCheckInterval,
-		}
-		bldr = bldr.WatchesRawSource(
-			source.Channel(trigger, &handler.EnqueueRequestForObject{},
-				source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passDrift))),
-		)
-	}
+	bldr, drift := r.watchDrift(mgr, bldr)
 
 	err := bldr.Complete(r.passes.counted(r))
 	if err != nil {
@@ -315,6 +303,26 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// watchDrift wires the drift check (see driftCheckInterval) into the
+// builder; it returns nil when the satellite has no exec to ask drbdadm
+// with.
+func (r *ResourceReconciler) watchDrift(mgr ctrl.Manager, bldr *builder.Builder) (*builder.Builder, *driftCheck) {
+	if r.Config.Exec == nil {
+		return bldr, nil
+	}
+
+	trigger := make(chan event.GenericEvent, reconcileTriggerBuffer)
+	drift := &driftCheck{
+		reader: mgr.GetClient(), exec: r.Config.Exec, node: r.Config.NodeName,
+		out: trigger, interval: r.Config.DriftCheckInterval,
+	}
+
+	return bldr.WatchesRawSource(
+		source.Channel(trigger, &handler.EnqueueRequestForObject{},
+			source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passDrift))),
+	), drift
 }
 
 // reconcileResource is the body of Reconcile, which only settles the
@@ -656,34 +664,38 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	stampFailed := r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
-	// Apply chain surfaces per-resource errors via results (e.g.
-	// drbdadm adjust failing on a stale .res rendered before the
-	// peer's Status caught up). Returning nil here would let c-r
-	// stop until an external event drove another reconcile;
-	// RequeueAfter ensures the next attempt sees the freshly-
-	// committed peer state. A stamp that failed is retried the same
-	// way: no periodic pass comes back for a device path the CSI
-	// node is waiting on, or for the volume-numbers record a later
-	// delete needs. An apply whose only failures are refusals an
-	// operator must act on waits failureRequeue's longer interval.
-	if anyFailed || stampFailed {
-		requeue := applyFailureRequeue
-		if anyFailed && !stampFailed {
-			requeue = failureRequeue(results)
-		}
+	return ctrl.Result{RequeueAfter: applyRequeue(results, anyFailed, stampFailed, retry, retryAsked)}, nil
+}
 
-		return ctrl.Result{RequeueAfter: requeue}, nil
+// applyRequeue is when the pass after an apply comes, zero for none.
+//
+// Apply chain surfaces per-resource errors via results (e.g. drbdadm
+// adjust failing on a stale .res rendered before the peer's Status
+// caught up). Returning nil here would let c-r stop until an external
+// event drove another reconcile; RequeueAfter ensures the next attempt
+// sees the freshly-committed peer state. A stamp that failed is retried
+// the same way: no periodic pass comes back for a device path the CSI
+// node is waiting on, or for the volume-numbers record a later delete
+// needs. An apply whose only failures are refusals an operator must act
+// on waits failureRequeue's longer interval.
+//
+// A converged replica waits for its next event, the way LINSTOR's
+// satellite dispatches only resources with a pending change. The one
+// exception is work this pass put off for a while, a dwell window or a
+// throttle, that no event is bound to bring back.
+func applyRequeue(
+	results []*intent.ResourceApplyResult, anyFailed, stampFailed bool, retry time.Duration, retryAsked bool,
+) time.Duration {
+	switch {
+	case anyFailed && !stampFailed:
+		return failureRequeue(results)
+	case anyFailed || stampFailed:
+		return applyFailureRequeue
+	case retryAsked:
+		return retry
+	default:
+		return 0
 	}
-
-	// A converged replica waits for its next event, the way LINSTOR's
-	// satellite dispatches only resources with a pending change. The
-	// one exception is work this pass put off for a while, a dwell
-	// window or a throttle, that no event is bound to bring back.
-	if retryAsked {
-		return ctrl.Result{RequeueAfter: retry}, nil
-	}
-
-	return ctrl.Result{}, nil
 }
 
 // prepareDRBDApply runs the DRBD-only pre-apply sequence: stale
