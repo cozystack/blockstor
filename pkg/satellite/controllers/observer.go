@@ -386,7 +386,8 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 	// `size:<kib>` rides on device frames under --statistics --full. A
 	// device that is neither attached nor connected has no size yet
 	// and reports 0, which is not a size worth publishing.
-	if size, err := strconv.ParseInt(ev.Fields["size"], 10, 64); err == nil && size > 0 {
+	size, err := strconv.ParseInt(ev.Fields["size"], 10, 64)
+	if err == nil && size > 0 {
 		vol.DeviceSizeKib = size
 	}
 
@@ -1501,7 +1502,7 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 			continue
 		}
 
-		if mergeVolumeInto(cache, incoming) {
+		if mergeVolumeInto(cache, &incoming) {
 			changed = true
 		}
 	}
@@ -1668,7 +1669,7 @@ func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolume
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
 // to decide whether to emit a fresh Status snapshot.
-func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservation) bool {
+func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservation) bool {
 	merged := cache[incoming.VolumeNumber]
 	merged.VolumeNumber = incoming.VolumeNumber
 
