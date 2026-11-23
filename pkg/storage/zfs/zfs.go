@@ -101,7 +101,7 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 		return p.ensureRefreservation(ctx, dataset)
 	}
 
-	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+	sizeMiB := storage.SizeMiB(vol.SizeKib)
 
 	args := []string{"create"}
 	if p.cfg.Thin {
@@ -142,7 +142,7 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 // grow, call ensureRefreservation so the refreservation tracks the
 // new volsize. Thin mode no-ops inside the helper.
 func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
-	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+	sizeMiB := storage.SizeMiB(vol.SizeKib)
 	dataset := p.volumeDataset(vol)
 
 	_, err := p.exec.Run(ctx, "zfs", "set",
@@ -908,7 +908,6 @@ func (p *Provider) snapshotDataset(snap storage.Snapshot) string {
 
 const (
 	stateNotProvisioned = storage.StateNotProvisioned
-	mibPerKib           = 1024
 	bytesPerKib         = 1024
 	zfsListCols         = 3
 	zpoolListCols       = 2
