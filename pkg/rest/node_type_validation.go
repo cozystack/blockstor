@@ -121,10 +121,7 @@ func resolveAndValidateNodeType(w http.ResponseWriter, n *apiv1.Node) bool {
 }
 
 // apiCallRcFailInvldNodeType mirrors upstream LINSTOR's
-// `ApiConsts.FAIL_INVLD_NODE_TYPE` (430). Emitted by
-// `POST /v1/nodes` when the body carries a `type` outside the
-// upstream enum. Choosing 430 (rather than a fresh sub-code in
-// blockstor's 996+ band) lets audit-log greppers that already
-// classify upstream's FAIL_INVLD_NODE_TYPE traffic catch
-// blockstor's equivalent without a separate rule.
-const apiCallRcFailInvldNodeType int64 = 430
+// `ApiConsts.FAIL_INVLD_NODE_TYPE` (201; it was 430, which LINSTOR
+// leaves unassigned). Emitted by `POST /v1/nodes` when the body
+// carries a `type` outside the upstream enum.
+const apiCallRcFailInvldNodeType int64 = 201

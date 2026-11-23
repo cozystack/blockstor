@@ -500,7 +500,7 @@ func TestPerNodeStoragePoolPostCreatesPool(t *testing.T) {
 
 // TestPerNodeStoragePoolPostDuplicateRefused pins the duplicate-POST
 // contract: a second `POST /v1/nodes/{n}/storage-pools` against an
-// existing (node, pool) must return 409 + (MASK_ERROR | 508) and
+// existing (node, pool) must return 409 + (MASK_ERROR | 510) and
 // MUST NOT mutate the stored row's Spec fields. Bug-hunt v0.1.3
 // Finding 1: the pre-fix handler silently overwrote `Props` /
 // `ProviderKind` / `FreeSpaceMgrName` from the POST body and returned
@@ -553,7 +553,7 @@ func TestPerNodeStoragePoolPostDuplicateRefused(t *testing.T) {
 		t.Fatalf("duplicate POST: got %d, want 409", resp2.StatusCode)
 	}
 
-	// Envelope shape: MASK_ERROR | FAIL_EXISTS_STOR_POOL (508).
+	// Envelope shape: MASK_ERROR | FAIL_EXISTS_STOR_POOL (510).
 	var env []apiv1.APICallRc
 	if err := json.NewDecoder(resp2.Body).Decode(&env); err != nil {
 		t.Fatalf("decode envelope: %v", err)
@@ -567,8 +567,8 @@ func TestPerNodeStoragePoolPostDuplicateRefused(t *testing.T) {
 		t.Errorf("ret_code: missing MASK_ERROR bit, got %d", env[0].RetCode)
 	}
 
-	if env[0].RetCode&apiCallRcFailExistsStorPool == 0 {
-		t.Errorf("ret_code: missing FAIL_EXISTS_STOR_POOL (508) sub-code, got %d", env[0].RetCode)
+	if env[0].RetCode != apiCallRcError|apiCallRcFailExistsStorPool {
+		t.Errorf("ret_code: want FAIL_EXISTS_STOR_POOL (510), got %d", env[0].RetCode)
 	}
 
 	// Stored row MUST be untouched — no Props swap, no ProviderKind
