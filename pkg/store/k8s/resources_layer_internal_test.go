@@ -389,3 +389,73 @@ func TestWireToCRDResourceProducesCanonicalName(t *testing.T) {
 			crd.Name, crd.Spec.ResourceDefinitionName+"."+crd.Spec.NodeName)
 	}
 }
+
+// TestDrbdLayerPromotionScore: linstor-csi's volume health counts a
+// replica whose DRBD layer has a promotion score of 0 as unhealthy, so
+// every layer the wire carries has the satellite's score, or one derived
+// from the reported disk states while the satellite has not reported it.
+func TestDrbdLayerPromotionScore(t *testing.T) {
+	score := int32(10102)
+	yes := true
+	port := int32(7000)
+	connected := []crdv1alpha1.ResourceConnectionStatus{{PeerNodeName: "n2", Connected: true}}
+
+	cases := []struct {
+		name      string
+		st        crdv1alpha1.ResourceStatus
+		wantScore int32
+	}{
+		{
+			name:      "reported by the satellite",
+			st:        crdv1alpha1.ResourceStatus{DRBDPort: &port, PromotionScore: &score, MayPromote: &yes},
+			wantScore: 10102,
+		},
+		{
+			name: "unreported, diskful and UpToDate",
+			st: crdv1alpha1.ResourceStatus{
+				DRBDPort: &port,
+				Volumes:  []crdv1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, DiskState: "UpToDate"}},
+			},
+			wantScore: 1,
+		},
+		{
+			name: "unreported, diskless with a connected peer",
+			st: crdv1alpha1.ResourceStatus{
+				DRBDPort:    &port,
+				Connections: connected,
+				Volumes:     []crdv1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, DiskState: "Diskless"}},
+			},
+			wantScore: 1,
+		},
+		{
+			name: "unreported, diskless and alone",
+			st: crdv1alpha1.ResourceStatus{
+				DRBDPort: &port,
+				Volumes:  []crdv1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, DiskState: "Diskless"}},
+			},
+			wantScore: 0,
+		},
+		{
+			name: "unreported, still syncing",
+			st: crdv1alpha1.ResourceStatus{
+				DRBDPort:    &port,
+				Connections: connected,
+				Volumes:     []crdv1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, DiskState: "Inconsistent"}},
+			},
+			wantScore: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			layer := drbdLayerFromStatus(&tc.st)
+			if layer == nil {
+				t.Fatal("no DRBD layer")
+			}
+
+			if layer.PromotionScore != tc.wantScore {
+				t.Errorf("promotion_score = %d, want %d", layer.PromotionScore, tc.wantScore)
+			}
+		})
+	}
+}

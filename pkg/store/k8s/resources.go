@@ -34,6 +34,7 @@ import (
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -1016,7 +1017,51 @@ func drbdLayerFromStatus(st *crdv1alpha1.ResourceStatus) *apiv1.DrbdResourceLaye
 		return nil
 	}
 
+	out.PromotionScore, out.MayPromote = promotionOf(st)
+
 	return &out
+}
+
+// promotionOf answers the replica's promotion score and may-promote as
+// the satellite reported them. A satellite that has not reported them
+// yet (one older than the field, or before its first resource frame)
+// gets a score derived from what it has reported: 1 for a replica whose
+// volumes are all UpToDate, or all Diskless with a connected peer, and 0
+// otherwise. A layer sent with no score at all reads as 0, which
+// linstor-csi counts as an unhealthy replica.
+func promotionOf(st *crdv1alpha1.ResourceStatus) (int32, bool) {
+	if st.PromotionScore != nil {
+		return *st.PromotionScore, st.MayPromote != nil && *st.MayPromote
+	}
+
+	if replicaLooksPromotable(st) {
+		return 1, !st.InUse
+	}
+
+	return 0, false
+}
+
+// replicaLooksPromotable reports whether every reported volume holds
+// UpToDate data, or is Diskless and can reach a peer for it.
+func replicaLooksPromotable(st *crdv1alpha1.ResourceStatus) bool {
+	if len(st.Volumes) == 0 {
+		return false
+	}
+
+	connected := slices.ContainsFunc(st.Connections, func(c crdv1alpha1.ResourceConnectionStatus) bool {
+		return c.Connected
+	})
+
+	for i := range st.Volumes {
+		switch state := drbd.DiskState(st.Volumes[i].DiskState); {
+		case state == drbd.DiskStateUpToDate:
+		case state == drbd.DiskStateDiskless && connected:
+		default:
+			return false
+		}
+	}
+
+	return true
 }
 
 // layerObjectFromStack assembles the upstream-LINSTOR `layer_object`

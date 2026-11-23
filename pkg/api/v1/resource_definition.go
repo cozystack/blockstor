@@ -160,6 +160,13 @@ type DrbdResourceLayer struct {
 	// regardless of the volumes[i].state.disk_state we'd already
 	// computed. Mirrors upstream LINSTOR's `DrbdRscData.drbdVlmList`.
 	DrbdVolumes []DrbdVolume `json:"drbd_volumes,omitempty"`
+
+	// PromotionScore and MayPromote are the kernel's `promotion_score`
+	// and `may_promote` for this replica. linstor-csi's volume health
+	// counts a replica whose DRBD layer has a score of 0 as unhealthy,
+	// so the score is always sent alongside the layer.
+	PromotionScore int32 `json:"promotion_score"`
+	MayPromote     bool  `json:"may_promote"`
 }
 
 // DrbdVolume is one volume's DRBD-layer-specific state. The Python
