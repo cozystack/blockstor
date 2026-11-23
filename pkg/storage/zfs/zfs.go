@@ -73,11 +73,6 @@ func (p *Provider) Kind() string {
 func (*Provider) ResizeZeroFills() bool { return true }
 
 // Pool returns the underlying ZFS pool name (`zpool list` identifier).
-// The satellite Reconciler's FlushBackingDevices uses this to issue
-// `zpool sync <pool>` between drbdadm suspend-io and `zfs snapshot`
-// — without that TXG-commit barrier the snapshot captures a
-// pre-commit dataset state and misses up to one TXG (default 5s)
-// worth of writes (P0 stale-snapshot bug, 2026-05-23).
 func (p *Provider) Pool() string {
 	return p.cfg.Pool
 }

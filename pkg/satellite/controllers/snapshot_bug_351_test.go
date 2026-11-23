@@ -279,6 +279,11 @@ func TestSnapshotReconcileBug351ResumesWhenSuspendCleared(t *testing.T) {
 
 	fx := storage.NewFakeExec()
 	fx.Expect("drbdadm resume-io pvc-1", storage.FakeResponse{Stdout: []byte("")})
+	// The kernel reports the resource suspended until the resume, and
+	// resumed after it: the ack is cleared on the second answer only.
+	fx.ExpectSequence("drbdsetup status pvc-1 --json",
+		storage.FakeResponse{Stdout: []byte(`[{"name":"pvc-1","role":"Secondary","suspended-user":true}]`)},
+		storage.FakeResponse{Stdout: []byte(`[{"name":"pvc-1","role":"Secondary","suspended-user":false}]`)})
 
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
 		Providers: map[string]storage.Provider{},
