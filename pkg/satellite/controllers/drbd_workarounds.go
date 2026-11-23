@@ -602,7 +602,11 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 // disconnectPausedPeer drops this node's connection to the peer whose
 // resync waits on the stalled one, and owes the resource an adjust on
 // the next pass that connects it again (adjustOwed). The pass in between
-// gives the active resync time to finish without the paused one. It
+// gives the active resync time to finish without the paused one. The
+// apply does not connect it sooner: it runs `adjust --skip-net` while a
+// peer is StandAlone with its volumes still registered, which is how a
+// disconnect leaves it (pkg/satellite reconciler.go
+// shouldSkipNetOnAdjust), so the owed adjust is the reconnect. It
 // reports whether the disconnect went through.
 func (w *DRBDWorkaroundsRunnable) disconnectPausedPeer(
 	ctx context.Context, logger logr.Logger, res *drbd.KernelResource,

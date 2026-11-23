@@ -56,10 +56,12 @@ type KernelConnection struct {
 
 // KernelPeerDevice is one volume of a peer connection. PercentInSync and
 // OutOfSync are nil when drbd-utils did not report them. Received and
-// OutOfSync are in KiB. Pending counts the requests this node sent the
-// peer that wait for its answer, Unacked the ones the peer sent this
-// node that this node has not completed yet (the kernel's
-// ap_pending+rs_pending and unacked_cnt).
+// OutOfSync are in KiB: the kernel reports both in sectors
+// (peer_dev_received is recv_cnt in drbd_nl.c), and drbdsetup halves
+// them when it prints the JSON (user/v9/drbdsetup.c). Pending counts the
+// requests this node sent the peer that wait for its answer, Unacked the
+// ones the peer sent this node that this node has not completed yet (the
+// kernel's ap_pending+rs_pending and unacked_cnt).
 type KernelPeerDevice struct {
 	Volume           int32    `json:"volume"`
 	ReplicationState string   `json:"replication-state"`
