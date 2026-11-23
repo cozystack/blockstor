@@ -62,7 +62,7 @@ func withProbeTimeout(ctx context.Context) (context.Context, context.CancelFunc)
 // values that REST clients display via `linstor v list`.
 const (
 	stateProvisioned    = "PROVISIONED"
-	stateNotProvisioned = "NOT_PROVISIONED"
+	stateNotProvisioned = storage.StateNotProvisioned
 )
 
 // ConfigFilter is the inline `--config` argument passed to every

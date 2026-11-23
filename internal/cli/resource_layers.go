@@ -24,6 +24,7 @@ import (
 	"slices"
 
 	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
@@ -39,8 +40,8 @@ import (
 // for a layer that is not there. The REST view re-stamps the same way,
 // so `linstor r l` and this CLI read one shape.
 //
-// The reads follow the volume-size reads: per definition up to the
-// cutoff, one listing past it. A definition that cannot be read keeps
+// The reads are per definition up to definitionsBulkCutoff, one
+// listing past it. A definition that cannot be read keeps
 // the default stack, which is how the listing looked before, rather
 // than failing it.
 //
@@ -90,7 +91,7 @@ func factsOf(def *apiv1.ResourceDefinition) definitionFacts {
 // definitionsFor reads the layer stack and properties of each named
 // definition, keyed by naming.Key.
 func definitionsFor(ctx context.Context, run *runContext, names []string) map[string]definitionFacts {
-	if len(names) <= volumeSizesBulkCutoff {
+	if len(names) <= definitionsBulkCutoff {
 		return definitionsPerName(ctx, run, names)
 	}
 
@@ -155,4 +156,71 @@ func warnLayerStacksUnavailable(run *runContext, err error) {
 	}
 
 	fmt.Fprintf(run.Err, "warning: layer stacks unavailable, every replica is shown as DRBD: %v\n", err)
+}
+
+// definitionsBulkCutoff is where reading the definitions one at a time stops
+// being the cheaper of the two reads. Below it a listing narrowed by `-r`,
+// `-n` or `--limit` pays that many GETs; above it, one request for the lot.
+//
+// It counts the definitions the rendered rows cover, not the definitions in
+// the cluster. The replica read behind those rows is whole whatever the
+// filter (see resourceList), so this is the one read a narrowing makes
+// cheaper, and the choice is between two costs rather than a guess about
+// the cluster: up to the cutoff, that many sequential GETs; past it, one
+// LIST that carries every definition, those without a replica included.
+// So `-n` on a node holding more definitions than the cutoff takes the
+// LIST to render its rows. That is the trade, not an oversight, and
+// removing it means making the per-definition read concurrent rather than
+// moving this number.
+const definitionsBulkCutoff = 16
+
+// perDefinitionCanAnswer says whether reading the definitions one at a time
+// can answer what the single read could not.
+//
+// SelectorUnsupported (pkg/store/k8s) draws the same line one layer down, and
+// for the same reason: a fallback is worth taking when the first read failed
+// on its shape, not when it ran out of the budget the second read spends
+// again. A cancelled context and a refusal aimed at the caller rather than at
+// the request repeat identically once per definition, so the retry buys the
+// same answer at N times the cost, in the command an operator is running
+// because something is already wrong.
+//
+// A server that asked the caller to slow down is the same case as a refusal,
+// by the same rule: 429 and 503 say the budget is the problem, and answering
+// them with one narrow request per definition sends N requests to the server
+// that just asked for fewer.
+//
+// A timeout is deliberately on the other side. One request covering every
+// definition in the cluster is the read most likely to exceed a deadline, and
+// the narrow ones after it are each small enough to land.
+func perDefinitionCanAnswer(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	if apierrors.IsTooManyRequests(err) || apierrors.IsServiceUnavailable(err) {
+		return false
+	}
+
+	return !apierrors.IsForbidden(err) && !apierrors.IsUnauthorized(err)
+}
+
+// distinctDefinitionNames is the set of definitions a listing covers, in
+// first-seen order — every replica of one definition asks the same question.
+func distinctDefinitionNames(resources []apiv1.Resource) []string {
+	seen := make(map[string]struct{}, len(resources))
+	names := make([]string, 0, len(resources))
+
+	for i := range resources {
+		name := resources[i].Name
+		if _, dup := seen[name]; dup {
+			continue
+		}
+
+		seen[name] = struct{}{}
+
+		names = append(names, name)
+	}
+
+	return names
 }

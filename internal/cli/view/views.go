@@ -304,7 +304,7 @@ func VolumeList(resources []apiv1.Resource, definitionProps map[string]map[strin
 
 			state := color.Cell{Text: apiv1.ResourceFlagInactive, Class: color.Transitional}
 			if !inactive {
-				state = volumeState(res, vol, nil)
+				state = volumeState(res, vol)
 			}
 
 			if linkDown {
