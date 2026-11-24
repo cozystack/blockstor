@@ -83,7 +83,7 @@ func TestRenderResFileWritesBody(t *testing.T) {
 
 	autoDisk := rec.autoDiskOptionsForResource(context.Background(), dr, devices)
 
-	want, err := buildResFile(dr, rec.cfg.NodeName, rec.cfg.LocalAddress, devices, autoDisk)
+	want, err := buildResFile(dr, rec.cfg.NodeName, rec.cfg.LocalAddress, devices, autoDisk, nil)
 	if err != nil {
 		t.Fatalf("buildResFile: %v", err)
 	}
@@ -135,5 +135,83 @@ func TestRenderResFileIdempotent(t *testing.T) {
 	if !info1.ModTime().Equal(info2.ModTime()) {
 		t.Errorf("mtime advanced on identical-content reconcile: before=%v after=%v — helper is not content-idempotent",
 			info1.ModTime(), info2.ModTime())
+	}
+}
+
+// TestRenderResFileReplacesTheFileWhole pins that a changed .res is
+// renamed into place rather than rewritten in place. drbdadm reads every
+// .res on the node for any command, and the satellite applies several
+// resources at once, so a drbdadm for another resource must never read
+// this one empty or half written. A reader that opened the old file keeps
+// the old body whole: here a hard link stands in for it, and it would show
+// the new body if the file had been truncated and rewritten.
+func TestRenderResFileReplacesTheFileWhole(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewReconciler(ReconcilerConfig{
+		StateDir:     dir,
+		NodeName:     "n1",
+		LocalAddress: "10.0.0.1",
+	})
+
+	dr, devices := renderResFileFixture("pvc-swap")
+	resPath := filepath.Join(dir, "pvc-swap.res")
+
+	const old = "# the body a concurrent drbdadm is reading\n"
+
+	err := os.WriteFile(resPath, []byte(old), 0o644)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	reader := filepath.Join(t.TempDir(), "open-old-file")
+
+	err = os.Link(resPath, reader)
+	if err != nil {
+		t.Skipf("hard links not available here: %v", err)
+	}
+
+	err = rec.renderResFile(context.Background(), dr, devices)
+	if err != nil {
+		t.Fatalf("renderResFile: %v", err)
+	}
+
+	seen, err := os.ReadFile(reader)
+	if err != nil {
+		t.Fatalf("read the old file: %v", err)
+	}
+
+	if string(seen) != old {
+		t.Errorf("the open .res changed under its reader: the new body was written in place, not renamed in")
+	}
+
+	got, err := os.ReadFile(resPath)
+	if err != nil || string(got) == old {
+		t.Errorf("the .res was not replaced: %q, %v", got, err)
+	}
+
+	leftovers, _ := filepath.Glob(filepath.Join(dir, "*"+ResFileCandidateSuffix))
+	if len(leftovers) != 0 {
+		t.Errorf("candidate left behind: %v", leftovers)
+	}
+}
+
+// A crash between writing the candidate and renaming it leaves the
+// candidate behind. Deleting the resource takes it along with the .res, so
+// nothing of a deleted resource stays in the state dir.
+func TestDeleteResourceRemovesALeftoverCandidate(t *testing.T) {
+	rec := uncleanReconciler(t)
+
+	candidate := filepath.Join(rec.cfg.StateDir, "pvc-unclean"+ResFileCandidateSuffix)
+	if err := os.WriteFile(candidate, []byte("resource pvc-unclean {}\n"), 0o600); err != nil {
+		t.Fatalf("write the candidate: %v", err)
+	}
+
+	resp, err := rec.DeleteResource(context.Background(), &intent.DeleteResourceRequest{Name: "pvc-unclean"})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteResource: %v, %+v", err, resp)
+	}
+
+	if _, err := os.Stat(candidate); !os.IsNotExist(err) {
+		t.Errorf("the deleted resource left %s behind (stat: %v)", filepath.Base(candidate), err)
 	}
 }

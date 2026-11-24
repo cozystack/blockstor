@@ -26,21 +26,28 @@ import (
 	"sync"
 
 	cerrors "github.com/cockroachdb/errors"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -52,7 +59,7 @@ import (
 // code stay so the controller strips the legacy finalizer off
 // any Resource that still carries it (rolling upgrade case);
 // the controller no longer stamps it on new Resources.
-const resourceFinalizer = "blockstor.org/resource"
+const resourceFinalizer = finalizers.LegacyResource
 
 // Raw-merge-patch key/kind literals, factored out so the several
 // raw-merge-patch helpers in this file share one spelling (goconst).
@@ -103,6 +110,10 @@ type ResourceReconciler struct {
 	// Wired from `mgr.GetAPIReader()` in SetupWithManager.
 	APIReader client.Reader
 
+	// Recorder raises the Warning Event for a replica whose pool needs a
+	// larger block size than its volume definition may take. Optional.
+	Recorder events.EventRecorder
+
 	// allocMu serialises DRBD-ID allocation across replicas of the
 	// same RD. APIReader bypasses the informer cache but doesn't
 	// help if two goroutines fan-read simultaneously — both still
@@ -139,6 +150,10 @@ type ResourceReconciler struct {
 	// Workers is how many Resources reconcile at once; zero means
 	// DefaultResourceWorkers.
 	Workers int
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // DefaultResourceWorkers is how many Resources the controller
@@ -169,10 +184,17 @@ func (r *ResourceReconciler) workers() int {
 // +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
 
-// Reconcile reads a Resource and pushes the matching DesiredResource
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass reads a Resource and pushes the matching DesiredResource
 // to the satellite that hosts it. Per-replica errors land in the
 // log; transport faults trigger a 10s requeue.
-func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var target blockstoriov1alpha1.Resource
 
 	err := r.Get(ctx, req.NamespacedName, &target)
@@ -278,17 +300,24 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return result, err
 	}
 
-	return r.runApply(ctx, &target)
+	// A freeze that fails is retried, but does not hold up the rest of
+	// the replica's housekeeping: the stamp only stops a later size
+	// change, and an in-use replica whose freeze keeps being refused
+	// still needs its apply.
+	freezeErr := r.freezeBlockSize(ctx, &target)
+
+	result, err = r.runApply(ctx, &target)
+	if freezeErr != nil {
+		return ctrl.Result{}, cerrors.Join(err, freezeErr)
+	}
+
+	return result, err
 }
 
-// satelliteResourceFinalizer mirrors the
-// `pkg/satellite/controllers.SatelliteResourceFinalizer` constant
-// without an import — the satellite package imports
-// `internal/controller` for shared helpers, so the reverse direction
-// is forbidden to avoid a cycle. Duplicating one string is the
-// pragmatic fix; a rename on either side breaks compile here via the
-// related tests, which reference the same literal.
-const satelliteResourceFinalizer = "blockstor.org/satellite-resource"
+// satelliteResourceFinalizer is the satellite's replica finalizer, shared
+// through pkg/finalizers: the satellite package imports
+// `internal/controller`, so the constant cannot come from there.
+const satelliteResourceFinalizer = finalizers.SatelliteResource
 
 // handleOrphan checks whether the Resource's parent ResourceDefinition
 // CRD still exists. When the RD is gone — the kubectl-cascade-orphan
@@ -681,6 +710,15 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 // Status update is rejected by Kube's optimistic concurrency check
 // and the next reconcile picks the next free port.
 func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
+	// Nearly every reconcile lands on a replica allocated long ago.
+	// Its identities are never rewritten once set, so the cached view
+	// is enough to see there is nothing to do; the uncached reads and
+	// the process-wide allocation lock below are for the replicas that
+	// still need a value.
+	if r.identitiesSettled(ctx, target) {
+		return false, nil
+	}
+
 	// Serialise allocation across replicas of the same RD. The
 	// APIReader-direct read alone doesn't fix the race — two
 	// goroutines can both observe taken=[] simultaneously and
@@ -726,6 +764,34 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 	}
 
 	return mutated, nil
+}
+
+// identitiesSettled reports, from the cached client, whether target
+// already carries everything allocateAndApplyDRBDIDs would write: the
+// Spec node id, port and skip-initial-sync decision, their Status
+// mirrors, and a minor for every volume of the parent definition with
+// the volume-0 one mirrored on Status. A value the allocator writes is
+// never changed afterwards, so a cache that shows all of them cannot
+// be hiding a missing one. Anything absent, or a definition the cache
+// cannot return, sends the caller down the uncached allocation path.
+func (r *ResourceReconciler) identitiesSettled(ctx context.Context, target *blockstoriov1alpha1.Resource) bool {
+	spec := &target.Spec
+	if spec.DRBDNodeID == nil || spec.DRBDPort == nil || spec.SkipInitialSync == nil {
+		return false
+	}
+
+	if !ptrEqI32(spec.DRBDNodeID, target.Status.DRBDNodeID) || !ptrEqI32(spec.DRBDPort, target.Status.DRBDPort) {
+		return false
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(spec.ResourceDefinitionName)}, &rd)
+	if err != nil || len(rd.Spec.VolumeDefinitions) == 0 || !rdVolumeMinorsComplete(&rd) {
+		return false
+	}
+
+	return ptrEqI32(vol0MinorOf(&rd), target.Status.DRBDMinor)
 }
 
 // allocateDRBDFields fills in any missing DRBD-{NodeID,Port,Minor}
@@ -2303,22 +2369,84 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.APIReader = mgr.GetAPIReader()
 	}
 
+	// The block size this reconciler writes for a new replica is dropped
+	// with the definition's last replica; the two halves of the rule are
+	// wired together.
+	err := (&BlockSizeReleaseReconciler{Client: r.Client, APIReader: r.APIReader, Lock: r.rdAllocMu}).SetupWithManager(mgr)
+	if err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&blockstoriov1alpha1.Resource{}).
+		For(&blockstoriov1alpha1.Resource{},
+			builder.WithPredicates(resourceChangedPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings)).
+			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings),
+			builder.WithPredicates(resourceChangedPredicate())).
 		Named("resource").
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.workers()}).
 		Complete(r)
+}
+
+// resourceChangedPredicate drops a Resource update that changed
+// nothing but the write bookkeeping: the resource version and the
+// managed-fields entries.
+//
+// Satellites apply their status with server-side apply, and an apply
+// that leaves every value as it was can still move a field manager's
+// entry and so produce a write. On an idle cluster with a hundred or
+// so replicas per node that is several writes a second, and each one
+// reached this single-worker reconciler three times over: once
+// through For and once per sibling. A new Resource then waited behind
+// the whole set of replicas before it got its DRBD identities, which
+// the satellites need before they can build it.
+//
+// Only an update whose objects are otherwise equal is dropped; any
+// change to spec, status, labels, annotations, finalizers or the
+// deletion timestamp still passes.
+func resourceChangedPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return resourceUpdateCarriesChange(e.ObjectOld, e.ObjectNew)
+		},
+	}
+}
+
+// resourceUpdateCarriesChange reports whether the new object differs
+// from the old one in anything besides the resource version and the
+// managed fields. An object of an unexpected type counts as changed,
+// and so does the informer's periodic resync, which delivers the same
+// revision twice and is meant to reach the reconciler.
+func resourceUpdateCarriesChange(oldObj, newObj client.Object) bool {
+	oldRes, okOld := oldObj.(*blockstoriov1alpha1.Resource)
+	newRes, okNew := newObj.(*blockstoriov1alpha1.Resource)
+
+	if !okOld || !okNew || oldRes == nil || newRes == nil {
+		return true
+	}
+
+	if oldRes.ResourceVersion == newRes.ResourceVersion {
+		return true
+	}
+
+	left := oldRes.DeepCopy()
+	right := newRes.DeepCopy()
+
+	left.ResourceVersion, right.ResourceVersion = "", ""
+	left.ManagedFields, right.ManagedFields = nil, nil
+
+	return !equality.Semantic.DeepEqual(left, right)
 }
 
 // rdAllocMu returns the per-RD allocation mutex, lazily creating
 // one on first use. Different RDs see different mutexes so they
 // allocate in parallel; replicas of the same RD serialise.
 func (r *ResourceReconciler) rdAllocMu(rdName string) *sync.Mutex {
-	loaded, _ := r.allocMu.LoadOrStore(rdName, &sync.Mutex{})
+	// Keyed by the folded name: replicas spell their definition as it
+	// was given, and the block size release only has the CR name.
+	loaded, _ := r.allocMu.LoadOrStore(naming.Key(rdName), &sync.Mutex{})
 
 	muTyped, _ := loaded.(*sync.Mutex)
 

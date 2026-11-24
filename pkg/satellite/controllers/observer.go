@@ -43,6 +43,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -83,6 +84,16 @@ type observation struct {
 	// a recoverable quorum suspend (auto-clears when quorum returns)
 	// from a user-issued or fencing-handler suspend.
 	Suspended string
+	// PromotionScore and MayPromote mirror the resource-frame
+	// `promotion_score:` and `may_promote:` fields. nil when the
+	// frame does not carry them, so the cached value survives.
+	PromotionScore *int32
+	MayPromote     *bool
+	// PromotionScoreInvalid marks a frame whose `promotion_score:`
+	// token is present but unparsable. LINSTOR drops the score
+	// then (DrbdResource.java), so the cached one is cleared rather
+	// than reported as current.
+	PromotionScoreInvalid bool
 	// HasResource marks observations that carry a fresh resource-
 	// kind frame (role transition → InUse, disk transition →
 	// DrbdState). mergeResource only updates its cache from
@@ -220,6 +231,11 @@ type peerVolumeObservation struct {
 // volume number. Stitched per-volume by mergeConnections so a
 // peer-device frame covering one volume doesn't blank the cached
 // view of the other.
+//
+// PeerRole is the peer's DRBD role (the `role:` field of connection
+// frames), empty when unknown. It is not published. A change of it
+// wakes the local replica (lifecycleSignature), and the resync reads it
+// to tell whether a day0 GI can still move (giMayMove).
 type connectionObservation struct {
 	PeerNodeName     string
 	Connected        bool
@@ -227,6 +243,7 @@ type connectionObservation struct {
 	ReplicationState string
 	PeerDRBDNodeID   *int32
 	PeerVolumes      []peerVolumeObservation
+	PeerRole         string
 
 	Removed bool
 }
@@ -280,7 +297,10 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 			}, true
 		}
 
-		if state == "" {
+		// A change frame carries only what changed: a peer promoted
+		// while connected sends its role alone.
+		role := ev.Fields["role"]
+		if state == "" && role == "" {
 			return observation{}, false
 		}
 
@@ -291,6 +311,7 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 				Connected:      state == drbdStateConnected,
 				Message:        state,
 				PeerDRBDNodeID: parsePeerNodeID(ev.Fields["peer-node-id"]),
+				PeerRole:       role,
 			}},
 		}, true
 	}
@@ -315,16 +336,64 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		return observation{}, false
 	}
 
+	score, scoreInvalid := parsePromotionScore(ev.Fields["promotion_score"])
+
 	return observation{
-		ResourceName:    name,
-		InUse:           ev.Fields["role"] == drbdRolePrimary,
-		Role:            ev.Fields["role"],
-		Suspended:       normalizeSuspended(ev.Fields["suspended"]),
-		HasResource:     true,
-		KernelLoaded:    normalizeKernelLoaded(ev.Action),
-		HasKernelLoaded: true,
-		Destroyed:       ev.Action == eventActionDestroy,
+		ResourceName:          name,
+		InUse:                 ev.Fields["role"] == drbdRolePrimary,
+		Role:                  ev.Fields["role"],
+		Suspended:             normalizeSuspended(ev.Fields["suspended"]),
+		PromotionScore:        score,
+		PromotionScoreInvalid: scoreInvalid,
+		MayPromote:            parseMayPromote(ev.Fields["may_promote"]),
+		HasResource:           true,
+		KernelLoaded:          normalizeKernelLoaded(ev.Action),
+		HasKernelLoaded:       true,
+		Destroyed:             ev.Action == eventActionDestroy,
 	}, true
+}
+
+// parsePromotionScore reads the events2 `promotion_score:` token.
+// An absent token yields (nil, false), which leaves the cached score
+// in place, the way LINSTOR's satellite treats a missing label. A
+// present but unparsable one yields (nil, true): LINSTOR clears the
+// score on it, and so does mergeResource.
+func parsePromotionScore(raw string) (*int32, bool) {
+	if raw == "" {
+		return nil, false
+	}
+
+	score, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil {
+		return nil, true
+	}
+
+	out := int32(score)
+
+	return &out, false
+}
+
+// The two values the kernel writes for `may_promote:`.
+const (
+	mayPromoteYes = "yes"
+	mayPromoteNo  = "no"
+)
+
+// parseMayPromote reads the events2 `may_promote:` token. Absent or
+// any other value yields nil.
+func parseMayPromote(raw string) *bool {
+	var out bool
+
+	switch raw {
+	case mayPromoteYes:
+		out = true
+	case mayPromoteNo:
+		out = false
+	default:
+		return nil
+	}
+
+	return &out
 }
 
 // normalizeKernelLoaded maps an events2 resource-kind verb to the
@@ -818,6 +887,13 @@ type ObserverRunnable struct {
 	// line before it is taken as ended; zero means
 	// observerInitialStateQuiet. For tests.
 	initialStateQuiet time.Duration
+
+	// overflow holds the replicas whose wake-up found the trigger
+	// channel full, each once, and overflowSending is set while the
+	// one goroutine that hands them over runs (sendOverflow).
+	overflowMu      sync.Mutex
+	overflow        map[string]struct{}
+	overflowSending bool
 }
 
 // appliedStatus is one entry of ObserverRunnable.applied.
@@ -856,10 +932,9 @@ const observerWriters = 8
 // whether the new observation represents a kernel-state lifecycle
 // change worth waking the reconciler on. Out-of-sync deltas and
 // other statistics-tick values are intentionally NOT part of the
-// signature — they fire too often to be a useful trigger, and the
-// observer's 5-second resync ticker + the reconciler's
-// RequeueAfter cover any wake-up that would otherwise have come
-// from a missed statistics frame.
+// signature — they fire too often to be a useful trigger, and no
+// local decision waits on one. Nothing periodic wakes the reconciler,
+// so a field a decision does wait on belongs in the signature.
 type lifecycleSignature struct {
 	// Role, DrbdState, Suspended come from resource / device kind
 	// frames. Role transitions (Secondary → Primary) and disk-state
@@ -893,10 +968,16 @@ type volumeLifecycle struct {
 }
 
 // connectionLifecycle is the per-peer slice of lifecycleSignature.
+//
+// PeerRole is in it because several local decisions refuse while a
+// peer is Primary (the latch-free mkfs retry, the recovery and late-add
+// promotes) and wait for the peer to step down; no other frame and no
+// write to the peer's Resource reports that step-down to this node.
 type connectionLifecycle struct {
 	Connected        bool
 	Message          string
 	ReplicationState string
+	PeerRole         string
 	// peerDisk keyed by VolumeNumber. The peer's view of a
 	// volume's disk-state matters for partition recovery: a peer
 	// disk flipping to Outdated is the signal that triggers our
@@ -911,10 +992,12 @@ type connectionLifecycle struct {
 // without caching the next non-resource event would strip f:role /
 // f:suspended off the observer's owner claim.
 type resourceObservation struct {
-	InUse     bool
-	DrbdState string
-	Role      string
-	Suspended string
+	InUse          bool
+	DrbdState      string
+	Role           string
+	Suspended      string
+	PromotionScore *int32
+	MayPromote     *bool
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -1380,19 +1463,105 @@ func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
 	}
 }
 
-// resyncOnce marks every known resource pending, reading its GI from
-// disk afresh, and writes them. The pass waits for one the writer has
-// in flight, and writes nothing while a stream's dump is being read.
-//
-// The GI is read here too, not only when a frame changes a volume: the
-// 5 s resync guarantees a data-state volume's CurrentGI converges even
-// when no further events2 frame fires after it reached UpToDate.
+// resyncOnce marks every known resource pending and writes them,
+// reading afresh the GI of those whose GI may have moved with no frame
+// (giMayMove). The pass waits for one the writer has in flight, and
+// writes nothing while a stream's dump is being read.
 func (o *ObserverRunnable) resyncOnce(ctx context.Context) {
 	for _, name := range o.cachedResourceNames() {
-		o.markPending(name, func(entry *pendingWrite) { entry.probeGI = true })
+		probe := o.giMayMove(name)
+		o.markPending(name, func(entry *pendingWrite) { entry.probeGI = entry.probeGI || probe })
 	}
 
 	o.flush(ctx, drbd.NewAdm(o.Exec))
+}
+
+// giMayMove reports whether the resync has to read the GI of name: a
+// data-bearing volume whose GI was never read, or one still at its day0
+// GI while some replica of name is Primary.
+//
+// DRBD moves a GI with no events2 frame: a replica promoted mints a new
+// current UUID on its first write after, and its connected peers take
+// it then. A GI read once and kept could leave a written volume showing
+// day0, and the seed gates (isDay0SeededVolume) would let a new replica
+// skip the sync of data written since. That is the only reading of the
+// GI that can go wrong, and only from a day0 GI: one that left day0
+// never comes back to it, and the gates treat every other GI alike. A
+// day0 GI moves only once a replica is Primary, which a frame reports.
+// So a volume whose GI left day0, or that no replica writes to, needs
+// no read until a frame changes it; reading every data-bearing volume
+// every 5 s cost a drbdsetup run per volume, twenty a second on a node
+// with a hundred replicas, while nothing happened.
+func (o *ObserverRunnable) giMayMove(name string) bool {
+	day0 := false
+
+	o.volMu.Lock()
+
+	for _, vol := range o.volCache[name] {
+		if !isDataBearingDiskState(drbd.DiskState(vol.DiskState)) || vol.CurrentUUID != "" {
+			continue
+		}
+
+		if vol.ProbedGI == "" {
+			o.volMu.Unlock()
+
+			return true
+		}
+
+		if isDay0GI(name, vol.VolumeNumber, vol.ProbedGI) {
+			day0 = true
+		}
+	}
+
+	o.volMu.Unlock()
+
+	return day0 && o.anyPrimary(name)
+}
+
+// carriesRole reports whether a frame carried a role, the local
+// replica's or a peer's.
+func carriesRole(ev *observation) bool {
+	if ev.HasResource && ev.Role != "" {
+		return true
+	}
+
+	for _, c := range ev.Connections {
+		if c.PeerRole != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isDay0GI reports whether gi is the day0 GI of volume vol of name,
+// under either spelling of the name the GI may have been stamped with.
+func isDay0GI(name string, vol int32, gi string) bool {
+	return strings.EqualFold(gi, drbd.Day0GIFor(name, vol)) ||
+		strings.EqualFold(gi, drbd.Day0GIFor(naming.Key(name), vol))
+}
+
+// anyPrimary reports whether the local replica of name or a peer it is
+// connected to is Primary.
+func (o *ObserverRunnable) anyPrimary(name string) bool {
+	o.resMu.Lock()
+	local := o.resCache[name].Role
+	o.resMu.Unlock()
+
+	if strings.EqualFold(local, drbdRolePrimary) {
+		return true
+	}
+
+	o.connMu.Lock()
+	defer o.connMu.Unlock()
+
+	for _, peer := range o.connCache[name] {
+		if strings.EqualFold(peer.PeerRole, drbdRolePrimary) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // cachedResourceNames returns the union of resource keys held by
@@ -1456,10 +1625,36 @@ func (o *ObserverRunnable) snapshotFor(name string) observation {
 		out.DrbdState = r.DrbdState
 		out.Role = r.Role
 		out.Suspended = r.Suspended
+		out.PromotionScore = r.PromotionScore
+		out.MayPromote = r.MayPromote
 	}
 	o.resMu.Unlock()
 
 	return out
+}
+
+// mergePromotion folds a resource frame's promotion tokens into the
+// cache. A frame without them keeps the cached values; a `destroy`
+// frame clears both, because the slot that had the score is gone and
+// LINSTOR drops the volatile state on stream close
+// (ResourceStateEventHandler). Keeping them would leave the view
+// calling a torn-down replica promotable, which hides it from
+// linstor-csi's health check.
+func mergePromotion(cur *resourceObservation, ev *observation) {
+	if ev.HasKernelLoaded && !ev.KernelLoaded {
+		cur.PromotionScore = nil
+		cur.MayPromote = nil
+
+		return
+	}
+
+	if ev.PromotionScore != nil || ev.PromotionScoreInvalid {
+		cur.PromotionScore = ev.PromotionScore
+	}
+
+	if ev.MayPromote != nil {
+		cur.MayPromote = ev.MayPromote
+	}
 }
 
 // mergeResource caches the resource-kind observation (InUse,
@@ -1491,6 +1686,8 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 		cur.InUse = ev.InUse
 		cur.Role = ev.Role
 		cur.Suspended = normalizeSuspended(ev.Suspended)
+
+		mergePromotion(&cur, ev)
 	}
 
 	// DrbdState flows from device-kind events (translateDeviceEvent
@@ -1511,6 +1708,8 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 	ev.DrbdState = cur.DrbdState
 	ev.Role = cur.Role
 	ev.Suspended = cur.Suspended
+	ev.PromotionScore = cur.PromotionScore
+	ev.MayPromote = cur.MayPromote
 }
 
 // pendingWrite is what the writer owes one resource.
@@ -1566,6 +1765,13 @@ func (o *ObserverRunnable) ingest(ctx context.Context, ev *observation) {
 	// Read before mergeResource puts the cached disk state on ev.
 	failed := ev.DrbdState == drbdDiskStateFailed
 
+	// A frame that carries a role, the local one or a peer's, reads the
+	// GI: a replica that wrote while Primary moved the GI with no frame
+	// of its own, and once no replica is Primary the resync no longer
+	// reads a day0 GI (giMayMove). Read before the merges put the
+	// cached roles on ev.
+	role := carriesRole(ev)
+
 	// mergeVolumes reads a destroyed connection off ev before
 	// mergeConnections replaces ev.Connections with the cached peers.
 	o.mergeVolumes(ev)
@@ -1574,7 +1780,7 @@ func (o *ObserverRunnable) ingest(ctx context.Context, ev *observation) {
 
 	// mergeVolumes leaves ev.Volumes empty when the frame changed no
 	// volume; a statistics tick then costs no get-gi.
-	volumesChanged := len(ev.Volumes) > 0
+	probe := len(ev.Volumes) > 0 || role
 
 	// Phase 11.7: wake the ResourceReconciler on every kernel-state
 	// lifecycle change (resource lifecycle, role, disk, conn, repl).
@@ -1590,7 +1796,7 @@ func (o *ObserverRunnable) ingest(ctx context.Context, ev *observation) {
 
 	o.markPending(ev.ResourceName, func(entry *pendingWrite) {
 		entry.departed = false
-		entry.probeGI = entry.probeGI || volumesChanged
+		entry.probeGI = entry.probeGI || probe
 		entry.detachFailed = entry.detachFailed || failed
 
 		if ev.HasKernelLoaded {
@@ -1876,10 +2082,7 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 		}
 
 		if vol.CurrentUUID == "" && vol.BackingDev != "" {
-			current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
-			if err != nil {
-				current = ""
-			}
+			current := o.readCurrentGI(ctx, adm, ev.ResourceName, vol)
 
 			vol.CurrentUUID = current
 			o.rememberProbedGI(ev.ResourceName, vol.VolumeNumber, current)
@@ -1889,6 +2092,58 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 			o.RecordGI(ev.ResourceName, vol.VolumeNumber, vol.CurrentUUID)
 		}
 	}
+}
+
+// readCurrentGI reads one volume's current-UUID, from the kernel
+// when the replica has a peer to name the volume by, else from the
+// backing device. It returns empty when neither read found one.
+//
+// The resync reads the volumes whose GI may have moved with no events2
+// frame (giMayMove).
+//
+// drbdmeta opens the backing device read-write, and udev answers the
+// close with a change uevent for the device and each of its
+// partitions. Read that way on every resync, a hundred replicas held
+// a satellite at its CPU limit, with the disk rescans the uevents set
+// off. drbdsetup asks the kernel over netlink and opens nothing.
+func (o *ObserverRunnable) readCurrentGI(ctx context.Context, adm *drbd.Adm, name string, vol *volumeObservation) string {
+	if peer, ok := o.anyPeerNodeID(name); ok {
+		current, err := adm.KernelCurrentGI(ctx, name, peer, vol.VolumeNumber)
+		if err == nil && current != "" {
+			return current
+		}
+	}
+
+	current, err := adm.CurrentGI(ctx, name, vol.VolumeNumber, vol.BackingDev)
+	if err != nil {
+		return ""
+	}
+
+	return current
+}
+
+// anyPeerNodeID returns the lowest DRBD node-id of name's peers the
+// observer has seen, for naming a peer device to drbdsetup.
+func (o *ObserverRunnable) anyPeerNodeID(name string) (int32, bool) {
+	o.connMu.Lock()
+	defer o.connMu.Unlock()
+
+	var (
+		lowest int32
+		found  bool
+	)
+
+	for _, peer := range o.connCache[name] {
+		if peer.PeerDRBDNodeID == nil {
+			continue
+		}
+
+		if !found || *peer.PeerDRBDNodeID < lowest {
+			lowest, found = *peer.PeerDRBDNodeID, true
+		}
+	}
+
+	return lowest, found
 }
 
 // rememberProbedGI keeps a get-gi result on the cached volume, so the
@@ -1931,11 +2186,11 @@ func isDataBearingDiskState(s drbd.DiskState) bool {
 // channel would re-add the very Reconcile noise the predicate
 // just removed.
 //
-// Non-blocking: a full channel is treated as "reconciler is already
-// behind, drop this wake-up" rather than back-pressuring the events2
-// loop. The observer's 5-second resync ticker re-emits cached state
-// onto Status so a coalesced wake-up still arrives within the same
-// window; reconciler's RequeueAfter covers any per-resource hand-off.
+// Non-blocking: a wake-up the full channel has no room for waits in
+// the overflow set (queueOverflow) rather than back-pressuring the
+// events2 loop. Nothing periodic would make up for one dropped here:
+// the resync re-stamps Status but wakes no reconcile, and a converged
+// replica asks for no further pass.
 //
 // The emitted object carries only `Name` — the ResourceReconciler's
 // SetupWithManager registers the channel as a raw source whose
@@ -1980,23 +2235,99 @@ func (o *ObserverRunnable) sendReconcileTrigger(ctx context.Context, rdName stri
 
 	name, err := replicaCRName(ctx, o.Client, rdName, o.NodeName)
 	if err != nil {
-		// The 5-second resync re-enqueues every local Resource anyway.
+		// The definition or node read failed (a missing object is no
+		// error). The signature is already cached, so an identical
+		// next frame would be taken for one already delivered: forget
+		// it, and the next frame wakes the replica.
+		o.lifecycleMu.Lock()
+		delete(o.lifecycleCache, rdName)
+		o.lifecycleMu.Unlock()
+
+		log.FromContext(ctx).Error(err, "name the local replica to wake", "resource", rdName)
+
 		return
 	}
 
-	trigger := event.GenericEvent{
+	select {
+	case o.ReconcileTrigger <- wakeUp(name):
+	default:
+		// Channel full. No periodic pass of the replica makes up for a
+		// wake-up dropped here, so it waits for room without holding
+		// up the events2 reader.
+		o.queueOverflow(ctx, name)
+	}
+}
+
+// wakeUp is the trigger event for the local replica name.
+func wakeUp(name string) event.GenericEvent {
+	return event.GenericEvent{
 		Object: &blockstoriov1alpha1.Resource{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
 		},
 	}
+}
 
-	select {
-	case o.ReconcileTrigger <- trigger:
-	default:
-		// Channel full — reconciler is already behind. Drop this
-		// wake-up; the 5-second resync ticker plus c-r's
-		// per-resource debouncer guarantee a follow-up.
+// queueOverflow keeps a wake-up the trigger channel had no room for.
+// A replica waits in the overflow set at most once, however many
+// wake-ups it gets meanwhile, besides the one wake-up being handed
+// over, and one goroutine hands the set over: in
+// a reconnect storm of hundreds of resources a goroutine per dropped
+// wake-up piled up without bound, most of them for the same replicas.
+func (o *ObserverRunnable) queueOverflow(ctx context.Context, name string) {
+	o.overflowMu.Lock()
+	defer o.overflowMu.Unlock()
+
+	if o.overflow == nil {
+		o.overflow = map[string]struct{}{}
 	}
+
+	o.overflow[name] = struct{}{}
+
+	if o.overflowSending {
+		return
+	}
+
+	o.overflowSending = true
+
+	go o.sendOverflow(ctx)
+}
+
+// sendOverflow hands the overflow set to the trigger channel, waiting
+// for room, until the set is empty or ctx ends.
+func (o *ObserverRunnable) sendOverflow(ctx context.Context) {
+	for {
+		o.overflowMu.Lock()
+
+		name, ok := anyKey(o.overflow)
+		if !ok {
+			o.overflowSending = false
+			o.overflowMu.Unlock()
+
+			return
+		}
+
+		delete(o.overflow, name)
+		o.overflowMu.Unlock()
+
+		select {
+		case o.ReconcileTrigger <- wakeUp(name):
+		case <-ctx.Done():
+			o.overflowMu.Lock()
+			o.overflowSending = false
+			o.overflowMu.Unlock()
+
+			return
+		}
+	}
+}
+
+// anyKey returns some key of set, and false when it is empty.
+func anyKey(set map[string]struct{}) (string, bool) {
+	for key := range set {
+		return key, true
+	}
+
+	return "", false
 }
 
 // lifecycleSnapshotLocked builds the current lifecycle signature for
@@ -2048,6 +2379,7 @@ func (o *ObserverRunnable) lifecycleSnapshotLocked(name string) lifecycleSignatu
 				Connected:        c.Connected,
 				Message:          c.Message,
 				ReplicationState: c.ReplicationState,
+				PeerRole:         c.PeerRole,
 				PeerDisk:         peerDisk,
 			}
 		}
@@ -2120,7 +2452,8 @@ func connectionLifecycleMapsEqual(left, right map[string]connectionLifecycle) bo
 
 		if leftConn.Connected != rightConn.Connected ||
 			leftConn.Message != rightConn.Message ||
-			leftConn.ReplicationState != rightConn.ReplicationState {
+			leftConn.ReplicationState != rightConn.ReplicationState ||
+			leftConn.PeerRole != rightConn.PeerRole {
 			return false
 		}
 
@@ -2524,44 +2857,8 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 	// also removes its per-volume `peer-disk` view, so the partition
 	// e2e tests don't see a stale PeerDiskState lingering on a peer
 	// that has been del-peer'd.
-	for _, c := range ev.Connections {
-		if c.Removed {
-			delete(peers, c.PeerNodeName)
-
-			continue
-		}
-
-		merged := peers[c.PeerNodeName]
-		merged.PeerNodeName = c.PeerNodeName
-
-		if c.Message != "" {
-			merged.Connected = c.Connected
-			merged.Message = c.Message
-		}
-
-		if c.ReplicationState != "" {
-			merged.ReplicationState = c.ReplicationState
-		}
-
-		// PeerDRBDNodeID arrives on both connection-kind and
-		// peer-device-kind frames. nil means "frame didn't carry
-		// the field" — preserve the cached value so a partial
-		// peer-device frame after a connection event doesn't
-		// blank the id.
-		if c.PeerDRBDNodeID != nil {
-			merged.PeerDRBDNodeID = c.PeerDRBDNodeID
-		}
-
-		// PeerVolumes merges per-volume so a peer-device frame
-		// covering volume 0 doesn't blank the cached peer-disk
-		// view of volume 1 on the same peer. Stitch by
-		// VolumeNumber into a per-peer map and re-emit a sorted
-		// slice deterministically (test predictability).
-		if len(c.PeerVolumes) > 0 {
-			merged.PeerVolumes = mergePeerVolumesInto(merged.PeerVolumes, c.PeerVolumes)
-		}
-
-		peers[c.PeerNodeName] = merged
+	for i := range ev.Connections {
+		mergeConnectionInto(peers, &ev.Connections[i])
 	}
 
 	// Only overwrite the slice when this event actually carried
@@ -2577,6 +2874,69 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 	}
 
 	ev.Connections = snapshot
+}
+
+// mergeConnectionInto folds connection frame c into peers.
+func mergeConnectionInto(peers map[string]connectionObservation, c *connectionObservation) {
+	if c.Removed {
+		delete(peers, c.PeerNodeName)
+
+		return
+	}
+
+	merged, known := peers[c.PeerNodeName]
+	if !known && c.Message == "" && c.ReplicationState == "" && len(c.PeerVolumes) == 0 {
+		// A role alone does not make a peer: the frame that
+		// creates the connection carries its state.
+		return
+	}
+
+	merged.PeerNodeName = c.PeerNodeName
+
+	if c.Message != "" {
+		merged.Connected = c.Connected
+		merged.Message = c.Message
+	}
+
+	merged.PeerRole = mergePeerRole(merged.PeerRole, c)
+
+	if c.ReplicationState != "" {
+		merged.ReplicationState = c.ReplicationState
+	}
+
+	// PeerDRBDNodeID arrives on both connection-kind and
+	// peer-device-kind frames. nil means "frame didn't carry
+	// the field" — preserve the cached value so a partial
+	// peer-device frame after a connection event doesn't
+	// blank the id.
+	if c.PeerDRBDNodeID != nil {
+		merged.PeerDRBDNodeID = c.PeerDRBDNodeID
+	}
+
+	// PeerVolumes merges per-volume so a peer-device frame
+	// covering volume 0 doesn't blank the cached peer-disk
+	// view of volume 1 on the same peer. Stitch by
+	// VolumeNumber into a per-peer map and re-emit a sorted
+	// slice deterministically (test predictability).
+	if len(c.PeerVolumes) > 0 {
+		merged.PeerVolumes = mergePeerVolumesInto(merged.PeerVolumes, c.PeerVolumes)
+	}
+
+	peers[c.PeerNodeName] = merged
+}
+
+// mergePeerRole is the peer role cached after frame c: the role c
+// carries, none once c reports the peer out of reach without one, else
+// the cached one.
+func mergePeerRole(cached string, c *connectionObservation) string {
+	switch {
+	case c.PeerRole != "":
+		return c.PeerRole
+	case c.Message != "" && !c.Connected:
+		return ""
+	default:
+		return cached
+	}
 }
 
 // completeFromCache replaces ev's state with everything the observer
@@ -2722,12 +3082,14 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		TypeMeta:   metav1.TypeMeta{Kind: resourceKind, APIVersion: blockstoriov1alpha1.GroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Status: blockstoriov1alpha1.ResourceStatus{
-			InUse:       ev.InUse,
-			DrbdState:   ev.DrbdState,
-			Role:        ev.Role,
-			Suspended:   normalizeSuspended(ev.Suspended),
-			Volumes:     buildObserverVolumeStatus(ev, storagePool),
-			Connections: buildObserverConnectionStatus(ev),
+			InUse:          ev.InUse,
+			DrbdState:      ev.DrbdState,
+			Role:           ev.Role,
+			Suspended:      normalizeSuspended(ev.Suspended),
+			PromotionScore: ev.PromotionScore,
+			MayPromote:     ev.MayPromote,
+			Volumes:        buildObserverVolumeStatus(ev, storagePool),
+			Connections:    buildObserverConnectionStatus(ev),
 		},
 	}
 

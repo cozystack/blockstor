@@ -1,4 +1,4 @@
 {"items":[
-{"spec":{"encrypted_password":"cHFyc3R1dnd4eXp7fH1+fy80DDtnOEBOEb0MkGfMu5+dQHXvyvr5aX79LVGZ5huD","layer_resource_id":9,"vlm_nr":0}},
-{"spec":{"encrypted_password":"gIGCg4SFhoeIiYqLjI2Oj/20yjvnVLV7rURgBa4QxReQqEvpPwT1frvscomWhqDV","layer_resource_id":12,"vlm_nr":0}}
+{"apiVersion":"internal.linstor.linbit.com/v1-31-1","spec":{"encrypted_password":"cHFyc3R1dnd4eXp7fH1+fy80DDtnOEBOEb0MkGfMu5+dQHXvyvr5aX79LVGZ5huD","layer_resource_id":9,"vlm_nr":0}},
+{"apiVersion":"internal.linstor.linbit.com/v1-31-1","spec":{"encrypted_password":"gIGCg4SFhoeIiYqLjI2Oj/20yjvnVLV7rURgBa4QxReQqEvpPwT1frvscomWhqDV","layer_resource_id":12,"vlm_nr":0}}
 ]}

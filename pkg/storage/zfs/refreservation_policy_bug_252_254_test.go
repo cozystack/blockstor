@@ -293,6 +293,7 @@ func TestThickRecvIdempotentSkipStillEnsuresRefreservation(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"},
 		src,
 	)
 	if err != nil {
@@ -334,6 +335,7 @@ func TestThinRecvIdempotentSkipNoRefreservation(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"},
 		src,
 	)
 	if err != nil {

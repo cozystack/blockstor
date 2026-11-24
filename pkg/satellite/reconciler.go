@@ -304,8 +304,16 @@ type SkipDiskClearer interface {
 type Reconciler struct {
 	cfg ReconcilerConfig
 
+	// ensureDeviceNode creates /dev/drbd<minor> where no udev does;
+	// drbd.EnsureDeviceNode, swapped out by tests.
+	ensureDeviceNode func(minor int) error
+
 	mu             sync.Mutex
 	resourceToPool map[string]string
+
+	// droppedOptions is why the .res rendered for each resource during
+	// the apply in flight left options out; see noteDroppedOptions.
+	droppedOptions map[string][]string
 
 	// seenStuckAt is the in-memory debounce table for the Bug 342
 	// v3 proactive kernel cleanup (Pass 3 stuck-slot probe). Keyed
@@ -417,6 +425,12 @@ type Reconciler struct {
 	// only; a restart resets the counter (at worst a few extra requeues).
 	restoreSnapshotMissingTries map[string]int
 
+	// retryAt is, per resource name, when a pass put off work that is
+	// due again with no event to bring it: a dwell window, a throttle,
+	// a best-effort step that failed. The satellite runs no periodic
+	// pass of a converged replica, so the controller asks for it with
+	// TakeRetry once the pass is done. Serialised by mu.
+	retryAt map[string]time.Time
 	// adjustFailed records the resources whose last adjust failed, so
 	// the next one is a full adjust (adjustFailedBefore). The marker file
 	// beside the .res carries it across a satellite restart. A delete
@@ -493,6 +507,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 
 	return &Reconciler{
 		cfg:                         cfg,
+		ensureDeviceNode:            drbd.EnsureDeviceNode,
 		resourceToPool:              map[string]string{},
 		seenStuckAt:                 map[string]time.Time{},
 		adoptionHeldSince:           map[string]time.Time{},
@@ -533,24 +548,6 @@ func (r *Reconciler) RegisterProvider(pool string, provider storage.Provider) {
 	}
 
 	r.cfg.Providers[pool] = provider
-}
-
-// SnapshotProviders returns a snapshot of the pool→provider map the
-// reconciler currently holds. Used by the orphan-storage sweeper (Bug
-// 43) which walks every registered provider for VolumeLister-capable
-// backends. The map is copied under the same lock RegisterProvider
-// takes so a concurrent registration can't tear the snapshot.
-//
-// Callers must treat the returned map as read-only — modifying it
-// races every subsequent RegisterProvider call.
-func (r *Reconciler) SnapshotProviders() map[string]storage.Provider {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	out := make(map[string]storage.Provider, len(r.cfg.Providers))
-	maps.Copy(out, r.cfg.Providers)
-
-	return out
 }
 
 // SetCrossNodeFetcher injects the cross-node fetcher post-construction.
@@ -730,20 +727,29 @@ func (r *Reconciler) SnapshotPools(ctx context.Context, rdName, snapName string)
 
 // DeleteSnapshot mirrors CreateSnapshot. Idempotency lives at the
 // provider layer (lvremove on missing LV is non-fatal there).
+//
+// The snapshot outlives its replica: deleting the replica keeps the
+// snapshots on disk, and the satellite then no longer knows which pool the
+// resource used. The request's pools are searched instead, and every one of
+// them must be registered, so a satellite that has not reconciled its pools
+// yet keeps the Snapshot's finalizer rather than reporting nothing to delete.
 func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *intent.DeleteSnapshotRequest) (*intent.DeleteSnapshotResponse, error) {
-	provider, err := r.providerForResource(req.GetResourceName())
+	providers, err := r.snapshotProviders(req)
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
 		return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
 	}
 
-	err = provider.DeleteSnapshot(ctx, storage.Snapshot{
-		ResourceName: req.GetResourceName(),
-		SnapshotName: req.GetSnapshotName(),
-	})
-	if err != nil {
-		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
-		return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+	for _, provider := range providers {
+		err = provider.DeleteSnapshot(ctx, storage.Snapshot{
+			ResourceName:  req.GetResourceName(),
+			SnapshotName:  req.GetSnapshotName(),
+			DeletedSuffix: req.GetDeletedSuffix(),
+		})
+		if err != nil {
+			//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
+			return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+		}
 	}
 
 	return &intent.DeleteSnapshotResponse{Ok: true}, nil
@@ -1017,26 +1023,13 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		}
 	}
 
-	if pool := req.GetStoragePool(); pool != "" {
-		provider, ok := r.cfg.Providers[pool]
-		if ok {
-			for _, n := range req.GetVolumeNumbers() {
-				err := provider.DeleteVolume(ctx, storage.Volume{
-					ResourceName: req.GetName(),
-					VolumeNumber: n,
-				})
-				if err != nil {
-					//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
-					return &intent.DeleteResourceResponse{
-						Ok:      false,
-						Message: err.Error(),
-					}, nil
-				}
-			}
-		}
+	err := r.deleteVolumes(ctx, req)
+	if err != nil {
+		//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
+		return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
 	}
 
-	err := r.removeResourceState(req.GetName())
+	err = r.removeResourceState(req.GetName())
 	if err != nil {
 		//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
 		return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
@@ -1046,6 +1039,102 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	r.clearUnresolvedPool(req.GetName())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
+}
+
+// snapshotProviders is every diskful pool the request names, which is every
+// one this node has, plus the resource's own pool when the satellite knows
+// it. The resource's current pool is not enough: a replica that moved to
+// another pool on this node left the snapshot, under the zvol its delete
+// renamed, in the pool it moved from. A pool that is named but not
+// registered yet (the satellite just started) may hold the snapshot, so the
+// delete waits for it. A node without any diskful pool has nowhere to hold a
+// copy.
+func (r *Reconciler) snapshotProviders(req *intent.DeleteSnapshotRequest) ([]storage.Provider, error) {
+	pools := slices.Clone(req.GetStoragePools())
+
+	own, known := r.poolOf(req.GetResourceName())
+
+	if known && !slices.Contains(pools, own) {
+		if _, ok := r.provider(own); ok {
+			pools = append(pools, own)
+		}
+	}
+
+	providers := make([]storage.Provider, 0, len(pools))
+
+	for _, pool := range pools {
+		provider, ok := r.provider(pool)
+		if !ok {
+			return nil, errors.Errorf("storage pool %q is not registered on this satellite; snapshot %s of %s is not deleted yet",
+				pool, req.GetSnapshotName(), req.GetResourceName())
+		}
+
+		providers = append(providers, provider)
+	}
+
+	return providers, nil
+}
+
+// deleteVolumes deletes every requested volume through the replica's pool.
+// A diskful replica's pool that is not registered yet (the satellite just
+// started and its StoragePool has not been reconciled) or no longer (the pool
+// was removed) cannot delete anything. Reporting success then would release
+// the finalizer over storage that is still on disk, so the delete stays
+// pending until the pool is back.
+func (r *Reconciler) deleteVolumes(ctx context.Context, req *intent.DeleteResourceRequest) error {
+	pool := req.GetStoragePool()
+	if pool == "" {
+		return nil
+	}
+
+	provider, ok := r.provider(pool)
+	if !ok {
+		return errors.Errorf("storage pool %q is not registered on this satellite; its volumes are not deleted yet", pool)
+	}
+
+	for _, n := range req.GetVolumeNumbers() {
+		vol := storage.Volume{ResourceName: req.GetName(), VolumeNumber: n}
+
+		var err error
+
+		if suffixed, ok := provider.(storage.SuffixedDeleter); ok {
+			err = suffixed.DeleteVolumeWithSuffix(ctx, vol, req.GetDeletedSuffix())
+		} else {
+			err = provider.DeleteVolume(ctx, vol)
+		}
+
+		if err != nil {
+			return errors.Wrapf(err, "delete volume %s/%d", req.GetName(), n)
+		}
+	}
+
+	return nil
+}
+
+// noteDroppedOptions records why the last .res rendered for a resource
+// left options out, for the apply result to carry to the replica's
+// Warning event.
+func (r *Reconciler) noteDroppedOptions(resourceName string, dropped []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.droppedOptions == nil {
+		r.droppedOptions = map[string][]string{}
+	}
+
+	r.droppedOptions[resourceName] = dropped
+}
+
+// takeDroppedOptions returns and forgets what noteDroppedOptions recorded
+// for a resource during this apply.
+func (r *Reconciler) takeDroppedOptions(resourceName string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	dropped := r.droppedOptions[resourceName]
+	delete(r.droppedOptions, resourceName)
+
+	return dropped
 }
 
 // removeResourceState drops what this satellite keeps about a deleted
@@ -1065,8 +1154,12 @@ func (r *Reconciler) removeResourceState(name string) error {
 	// "No valid meta data found". `.owned` (Bug 432) is the
 	// sweeper's ownership marker — must be removed AFTER the
 	// kernel slot is gone so a concurrent sweeper tick sees a
-	// clean post-state (kernel + marker both absent).
-	for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned", bornSoloSuffix, adjustFailedSuffix} {
+	// clean post-state (kernel + marker both absent). A
+	// candidate .res a crash left between write and rename goes
+	// too: nothing reads it, but nothing else would remove it.
+	for _, suffix := range []string{
+		".res", ResFileCandidateSuffix, ".md-created", ".mkfs.done", ".owned", bornSoloSuffix, adjustFailedSuffix,
+	} {
 		err := os.Remove(filepath.Join(r.cfg.StateDir, name+suffix))
 		if err != nil && !os.IsNotExist(err) {
 			return errors.WithStack(err)
@@ -1105,6 +1198,9 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 		Ok:       true,
 	}
 
+	// Whatever path the apply ends on, the options a .res rendered on
+	// the way left out go back with the result.
+	defer func() { res.DroppedOptions = r.takeDroppedOptions(dr.GetName()) }()
 	ctx = withApplyResult(ctx, res)
 
 	diskless := isDiskless(dr.GetFlags())
@@ -1824,10 +1920,10 @@ func (r *Reconciler) hasReclaimableVolume(dr *intent.DesiredResource) bool {
 // volumes, so a re-reconcile after a partial first pass safely
 // finishes the cleanup.
 //
-// An unknown pool is silently skipped — the dispatcher may stamp a
-// historical pool the satellite no longer has registered (e.g.
-// after a pool rename). The orphan-storage sweeper backstops with
-// its own scan in that edge case.
+// An unknown pool is an error, not a skip: nothing else deletes the
+// volume later, so the toggle stays pending until the pool is
+// registered (a satellite that just started has not reconciled its
+// StoragePools yet).
 func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.DesiredResource) error {
 	for _, vol := range dr.GetVolumes() {
 		pool := vol.GetStoragePool()
@@ -1835,9 +1931,10 @@ func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.D
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
-			continue
+			return errors.Errorf("reclaim volume %s/%d on diskless toggle: storage pool %q is not registered on this satellite",
+				dr.GetName(), vol.GetVolumeNumber(), pool)
 		}
 
 		err := provider.DeleteVolume(ctx, storage.Volume{
@@ -1869,7 +1966,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	}
 
 	for _, vol := range dr.GetVolumes() {
-		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+		provider, ok := r.provider(vol.GetStoragePool())
 		if !ok {
 			return nil, false, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
 		}
@@ -2264,7 +2361,7 @@ func (r *Reconciler) crossNodeClone(
 
 	defer func() { _ = body.Close() }()
 
-	err = shipper.RecvSnapshot(ctx, target, body)
+	err = shipper.RecvSnapshot(ctx, target, storage.Snapshot{ResourceName: srcRD, SnapshotName: snapName}, body)
 	if err != nil {
 		return errors.Wrapf(err, "recv %s/%s from %s", srcRD, snapName, peer)
 	}
@@ -2385,7 +2482,9 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 		// the MaxPeers-1 budget entries but the resource keeps serving
 		// I/O, and the next reconcile retries. del-peer errors still
 		// bubble (above): those leak a live kernel connection.
-		_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), peerID)
+		if r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), peerID) != nil {
+			r.retryLater(dr.GetName(), bestEffortRetry)
+		}
 	}
 
 	return nil
@@ -2457,8 +2556,14 @@ func (r *Reconciler) dropOldConnection(ctx context.Context, resource string, nod
 	delErr := r.cfg.Adm.DelPeerByNodeID(ctx, resource, nodeID)
 
 	forgotten := false
+
 	if withMetadata {
-		forgotten = r.cfg.Adm.ForgetPeer(ctx, resource, nodeID) == nil
+		forgetErr := r.cfg.Adm.ForgetPeer(ctx, resource, nodeID)
+		forgotten = forgetErr == nil
+
+		if forgetErr != nil {
+			log.FromContext(ctx).Info("forget-peer failed (non-fatal)", "nodeID", nodeID, "err", forgetErr.Error())
+		}
 	}
 
 	if delErr == nil || forgotten {
@@ -2734,11 +2839,19 @@ func (r *Reconciler) stampOwnershipMarker(name string) error {
 // LVM-shaped guess.
 func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	autoDisk := r.autoDiskOptionsForResource(ctx, dr, devices)
+	autoVolumeDisk := r.autoDiskOptionsForVolumes(ctx, dr, devices)
 
-	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices, autoDisk)
+	body, dropped, err := buildResFileChecked(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices, autoDisk, autoVolumeDisk, r.optionSchemas(ctx))
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
 	}
+
+	for _, why := range dropped {
+		log.FromContext(ctx).Info("option left out of .res: drbdadm would refuse it",
+			"resource", dr.GetName(), "reason", why)
+	}
+
+	r.noteDroppedOptions(dr.GetName(), dropped)
 
 	// Bug 432: stamp the ownership marker every time we render
 	// `.res`. The marker survives aggressive cleanup paths that
@@ -2760,7 +2873,46 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 		return nil
 	}
 
-	return errors.Wrapf(os.WriteFile(resPath, []byte(body), resFilePerm), "write %s", resPath)
+	return r.installResFile(ctx, resPath, body)
+}
+
+// ResFileCandidateSuffix names the file a new .res body is checked in
+// before it replaces the live one. It must not end in .res: drbd.conf
+// includes drbd.d/*.res, and a candidate that matched would be parsed as
+// a second definition of the resource by every drbdadm call on the node.
+// A candidate outlives its render only when the satellite dies between
+// the write and the rename, so the resource's delete and the satellite's
+// startup both remove it.
+const ResFileCandidateSuffix = ".res.tmp"
+
+// installResFile puts body at resPath only once drbdadm accepts it.
+//
+// drbdadm parses every .res on the node for any command, so a body it
+// cannot read, such as an option this drbd-utils does not know, would
+// stop adjust and dump-md for every resource here the moment it landed,
+// not just for its own. The body is written beside the live file under a
+// name drbdadm does not include, checked with the live file excluded,
+// and renamed into place, so a refused body leaves the previous .res,
+// and every other resource, as it was. The refusal is this resource's
+// error to report.
+func (r *Reconciler) installResFile(ctx context.Context, resPath, body string) error {
+	candidate := strings.TrimSuffix(resPath, ".res") + ResFileCandidateSuffix
+
+	err := os.WriteFile(candidate, []byte(body), resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "write %s", candidate)
+	}
+
+	if r.cfg.Adm != nil {
+		err = r.cfg.Adm.CheckResFile(ctx, candidate, resPath)
+		if err != nil {
+			_ = os.Remove(candidate)
+
+			return errors.Wrapf(err, "new .res for %s not installed", filepath.Base(resPath))
+		}
+	}
+
+	return errors.Wrapf(os.Rename(candidate, resPath), "install %s", resPath)
 }
 
 // applyDRBD renders the .res file from dr's metadata and (re)applies
@@ -3560,7 +3712,7 @@ func (r *Reconciler) resizeAssumeClean(dr *intent.DesiredResource) bool {
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
 			continue
 		}
@@ -3792,11 +3944,18 @@ func (r *Reconciler) lateAddStallDwellElapsed(name string) bool {
 	first, ok := r.firstLateAddStallAt[name]
 	if !ok {
 		r.firstLateAddStallAt[name] = now
+		r.retryLaterLocked(name, lateAddStallDwell)
 
 		return false
 	}
 
-	return now.Sub(first) >= lateAddStallDwell
+	if left := lateAddStallDwell - now.Sub(first); left > 0 {
+		r.retryLaterLocked(name, left)
+
+		return false
+	}
+
+	return true
 }
 
 // clearLateAddStall drops the recorded stall start for a resource, so a
@@ -3819,6 +3978,9 @@ func (r *Reconciler) recoveryPromoteDue(name string) bool {
 
 	now := time.Now()
 	if last, ok := r.lastRecoveryPromoteAt[name]; ok && now.Sub(last) < recoveryPromoteThrottle {
+		// The recovery is still wanted; it is only too soon for it.
+		r.retryLaterLocked(name, recoveryPromoteThrottle-now.Sub(last))
+
 		return false
 	}
 
@@ -5466,6 +5628,7 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 		// so no functional regression on a transient apiserver hiccup.
 		stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemFormatted(ctx, dr.GetName(), dr.GetNodeName())
 		if stampErr != nil {
+			r.retryLater(dr.GetName(), bestEffortRetry)
 			log.FromContext(ctx).Error(stampErr, "stamp FilesystemFormatted Condition; will retry next reconcile",
 				"resource", dr.GetName(), "node", dr.GetNodeName())
 		}
@@ -5748,7 +5911,7 @@ func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredReso
 	// or the backing zvol/loop/lvm). EnsureDeviceNode is the
 	// satellite-side replacement for the missing udev rule: idempotent,
 	// safe on real-udev nodes (no-op when path is already correct).
-	ensureDeviceNodes(ctx, dr)
+	r.ensureDeviceNodes(ctx, dr)
 
 	return nil
 }
@@ -5756,13 +5919,13 @@ func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredReso
 // ensureDeviceNodes invokes drbd.EnsureDeviceNode for every kernel
 // minor the resource owns, derived from the DrbdOptions["minor"] base
 // + per-volume offset (mirrors buildResVolumes' minor allocation). A
-// per-volume failure is logged and otherwise swallowed: the next
-// reconcile re-attempts, and a transient EPERM / I/O hiccup must not
-// strand the bring-up path. Real /dev/drbd<N> creation is best-effort
-// — if the satellite can't mknod (e.g. the container lacks CAP_MKNOD),
-// the consumer's open will fail loudly rather than silently writing to
-// a tmpfs file.
-func ensureDeviceNodes(ctx context.Context, dr *intent.DesiredResource) {
+// per-volume failure is logged and asks for another pass rather than
+// failing the apply: a transient EPERM / I/O hiccup must not strand
+// the bring-up path, and no periodic pass comes back for it. Real
+// /dev/drbd<N> creation is best-effort — if the satellite can't mknod
+// (e.g. the container lacks CAP_MKNOD), the consumer's open will fail
+// loudly rather than silently writing to a tmpfs file.
+func (r *Reconciler) ensureDeviceNodes(ctx context.Context, dr *intent.DesiredResource) {
 	baseMinor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
 
 	for _, vol := range dr.GetVolumes() {
@@ -5782,8 +5945,10 @@ func ensureDeviceNodes(ctx context.Context, dr *intent.DesiredResource) {
 			continue
 		}
 
-		err := drbd.EnsureDeviceNode(minor)
+		err := r.ensureDeviceNode(minor)
 		if err != nil {
+			r.retryLater(dr.GetName(), bestEffortRetry)
+
 			log.FromContext(ctx).Error(err, "ensure /dev/drbd device node",
 				"resource", dr.GetName(),
 				"volume", vol.GetVolumeNumber(),
@@ -5935,11 +6100,13 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 			// Best-effort: a clearer error doesn't strand the reconciler
 			// (the worst case is the same as not having the clearer at
 			// all — the prop stays pinned and the next pass re-tries).
-			_ = r.cfg.SkipDiskClearer.ClearSkipDisk(ctx, dr.GetName())
+			if r.cfg.SkipDiskClearer.ClearSkipDisk(ctx, dr.GetName()) != nil {
+				r.retryLater(dr.GetName(), bestEffortRetry)
+			}
 		}
 	}
 
-	skipNet, stale := r.shouldSkipNetOnAdjust(ctx, dr.GetName())
+	skipNet, stale := r.shouldSkipNetOnAdjust(ctx, dr)
 	skipNet = skipNet && !r.adjustFailedBefore(dr.GetName())
 
 	err := r.adjustAndRecover(ctx, dr, skipDisk, skipNet)
@@ -5966,7 +6133,7 @@ func (r *Reconciler) adjustAndRecover(ctx context.Context, dr *intent.DesiredRes
 		// via open(2) and the kernel creates a regular file in tmpfs.
 		// EnsureDeviceNode is idempotent on already-correct nodes so
 		// covering the steady-state-adjust path here costs nothing.
-		ensureDeviceNodes(ctx, dr)
+		r.ensureDeviceNodes(ctx, dr)
 
 		return nil
 	}
@@ -5982,70 +6149,107 @@ func (r *Reconciler) adjustAndRecover(ctx context.Context, dr *intent.DesiredRes
 			return errors.Wrapf(upErr, "drbdadm up %s (after adjust 158 fallback)", dr.GetName())
 		}
 
-		ensureDeviceNodes(ctx, dr)
+		r.ensureDeviceNodes(ctx, dr)
 
 		return nil
 	}
 
-	// Recover from the tiebreaker-relocate StandAlone wedge:
-	// when the controller re-allocates DRBDNodeID for a returning
-	// TIE_BREAKER onto a fresh peer-slot, the surviving diskful's
-	// v09 metadata for that slot reads back as
-	// `peer-disk:Outdated` (default-initialised bitmap-uuid). The
-	// failing adjust hits `peer-device-options --bitmap=no` and
-	// the kernel refuses with `(162) Can not drop the bitmap when
-	// both sides have a disk`. recoverFromBitmapBothDisks below
-	// runs a full down + up + adjust cycle so the next adjust
-	// reads peer-disk from a fresh handshake (DUnknown) rather
-	// than from the stale metadata default — see
-	// tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
+	// Recover from the tiebreaker-relocate StandAlone wedge: a
+	// diskless peer came up under a node-id whose metadata slot
+	// still reads its diskful predecessor as `peer-disk:Outdated`,
+	// and the kernel refuses `peer-device-options --bitmap=no` with
+	// `(162) Can not drop the bitmap when both sides have a disk`
+	// — see tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
 	if drbd.IsBitmapDropBothDisksErr(err) {
-		return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, skipNet)
+		return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, err)
 	}
 
 	return errors.Wrapf(err, "adjust %s", dr.GetName())
 }
 
-// recoverFromBitmapBothDisks executes the down + up + adjust
-// recovery for the tiebreaker-relocate StandAlone wedge.
-// Without this recovery the first failed adjust leaves the
-// returning TB's kernel slot StandAlone with peer-device entries
-// kernel-registered (the new-peer call ran before peer-device-
-// options failed); shouldSkipNetOnAdjust then permanently
-// latches `--skip-net` for that slot and the slot stays
-// StandAlone forever.
+// recoverFromBitmapBothDisks answers the kernel's refusal to drop the
+// bitmap of a peer the .res names diskless. The refusal comes from the
+// peer's metadata slot, which still describes the diskful replica that
+// held its node-id before: nothing forgot that slot when the replica
+// went. LINSTOR's satellite forgets a deleted peer's slot (del-peer,
+// then forget-peer); this does the same for the node-ids adjustErr
+// names, then adjusts again.
 //
-// Bounded to a single bounce per adjust pass: the recovery
-// retries dispatchAdjust once; if the second adjust still
-// fails, bubble the error so the reconciler retry loop
-// re-converges on the next tick instead of looping in-place.
+// Only a connection that is not Connected is dropped. Nothing flows
+// over it, so dropping it touches neither the local disk nor its role:
+// a Primary keeps its device open, and the local replica stays up even
+// when it holds the only UpToDate copy. A Connected peer's disk state is
+// live rather than read from the slot, so the refusal is real (the peer
+// has not detached yet) and the error goes back to the retry loop, as
+// LINSTOR leaves a failed adjust. The resource is never taken down here:
+// a `drbdadm down` would demote a Primary, or detach the last good
+// copy, and the refusal of a device held open is the only thing that
+// kept it from doing so.
 //
-// Down on a Primary-Open resource would block, but the
-// signature only fires on the moment a returning TB joins —
-// the wedge surfaces on the surviving diskful side which is
-// Secondary (unmounted at the moment the TB respawns).
-func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
-	log.FromContext(ctx).Info("adjust failed with bitmap-bothdisks; recovering via down + up + adjust",
-		"resource", dr.GetName())
-
-	err := r.cfg.Adm.Down(ctx, dr.GetName())
+// A single pass: if the second adjust still fails, the error goes to
+// the reconciler retry loop instead of looping in place.
+func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.DesiredResource, skipDisk bool, adjustErr error) error {
+	dropped, err := r.forgetStalePeerSlots(ctx, dr.GetName(), drbd.BitmapDropPeerNodeIDs(adjustErr))
 	if err != nil {
-		return errors.Wrapf(err, "drbdadm down %s (recovery from bitmap-bothdisks)", dr.GetName())
+		return errors.Wrapf(err, "adjust %s: %s", dr.GetName(), adjustErr.Error())
 	}
 
-	err = r.upRecorded(ctx, dr.GetName())
-	if err != nil {
-		return errors.Wrapf(err, "drbdadm up %s (recovery from bitmap-bothdisks)", dr.GetName())
+	if len(dropped) == 0 {
+		return errors.Wrapf(adjustErr, "adjust %s", dr.GetName())
 	}
+
+	log.FromContext(ctx).Info("adjust failed with bitmap-bothdisks; forgot the peer slots and adjusting again",
+		"resource", dr.GetName(), "nodeIDs", dropped)
+
+	// The dropped slots no longer count toward --skip-net, so the
+	// adjust re-adds their peers unless another peer is held
+	// StandAlone on purpose.
+	skipNet, _ := r.shouldSkipNetOnAdjust(ctx, dr)
 
 	err = r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
 	if err != nil {
-		return errors.Wrapf(err, "adjust %s (after bitmap-bothdisks recovery)", dr.GetName())
+		return errors.Wrapf(err, "adjust %s (after forgetting peer slots %v)", dr.GetName(), dropped)
 	}
 
-	ensureDeviceNodes(ctx, dr)
+	r.ensureDeviceNodes(ctx, dr)
 
 	return nil
+}
+
+// forgetStalePeerSlots drops and forgets the kernel connection of each
+// node-id in nodeIDs that is not Connected, and returns the node-ids it
+// dropped. A node-id the kernel holds no connection for is skipped.
+func (r *Reconciler) forgetStalePeerSlots(ctx context.Context, resource string, nodeIDs []int32) ([]int32, error) {
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+
+	slots, err := r.cfg.Adm.Show(ctx, resource)
+	if err != nil {
+		return nil, errors.Wrap(err, "read the kernel connections")
+	}
+
+	var dropped []int32
+
+	for _, slot := range slots {
+		if !slices.Contains(nodeIDs, slot.NodeID) ||
+			slot.ConnectionState == string(drbd.ConnectionStateConnected) {
+			continue
+		}
+
+		// The refusal means the local replica has a disk, so its
+		// metadata holds the slot.
+		err := r.dropOldConnection(ctx, resource, slot.NodeID, true)
+		if err != nil {
+			return dropped, errors.Wrapf(err, "drop the connection to node-id %d", slot.NodeID)
+		}
+
+		dropped = append(dropped, slot.NodeID)
+	}
+
+	slices.Sort(dropped)
+
+	return dropped, nil
 }
 
 // dispatchAdjust picks the right `drbdadm adjust` variant for the
@@ -6119,6 +6323,9 @@ func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDi
 // re-issues `drbdsetup connect` and unwedges scenario 5.32
 // (`tests/e2e/recovery-down-reverses.sh`).
 //
+// A StandAlone slot the bitmap refusal left behind is not counted
+// either; see isStaleDisklessPeerSlot.
+//
 // Best-effort: a probe error returns false so adjust falls through
 // to the existing full-adjust path (failing closed would freeze
 // adjust on any transient drbdsetup hiccup). The probe is
@@ -6137,7 +6344,9 @@ func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDi
 // full adjust: for a peer the operator disconnected it is the connect
 // and nothing else, for this one it resets the peer's options first.
 // Those connections come back as stale, and the adjust is a full one.
-func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string) (bool, []string) {
+func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, dr *intent.DesiredResource) (bool, []string) {
+	resource := dr.GetName()
+
 	slots, probeErr := r.cfg.Adm.Show(ctx, resource)
 	if probeErr != nil {
 		return false, nil
@@ -6147,6 +6356,10 @@ func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string)
 
 	for _, slot := range slots {
 		if slot.ConnectionState != string(drbd.ConnectionStateStandAlone) {
+			continue
+		}
+
+		if isStaleDisklessPeerSlot(dr, slot) {
 			continue
 		}
 		// Recovery-down-reverses disambiguator: a StandAlone slot with
@@ -6199,6 +6412,41 @@ func (r *Reconciler) standAloneWithStaleConfig(ctx context.Context, resource str
 	slices.Sort(stale)
 
 	return stale
+}
+
+// isStaleDisklessPeerSlot reports whether slot is the StandAlone
+// connection a refused `peer-device-options --bitmap=no` leaves: the
+// .res names the peer diskless, yet the kernel reads a disk for it,
+// because new-peer took Outdated from the metadata slot of the diskful
+// replica that held the node-id before. Adjust stops at the refusal
+// before it connects, so the slot stays StandAlone with its peer
+// devices registered, which is also what an operator's disconnect
+// looks like. Counted toward --skip-net, it kept every later adjust
+// from re-issuing the options, so the refusal, and with it the
+// recovery, never fired again once a recovery had failed or the
+// satellite had restarted in between: the peer stayed cut off for good.
+//
+// An operator's disconnect of a diskless peer never looks like this: a
+// connection that is not established drops a Diskless peer disk to
+// DUnknown (drbd_state.c sanitize_state), so only the stale slot reads
+// Inconsistent or Outdated for a peer the .res names diskless.
+func isStaleDisklessPeerSlot(dr *intent.DesiredResource, slot drbd.KernelSlot) bool {
+	if dr.GetDrbdOptions()["peer."+slot.Name+".diskless"] != drbdBoolPropTrue {
+		return false
+	}
+
+	withDisk := []drbd.DiskState{
+		drbd.DiskStateInconsistent, drbd.DiskStateOutdated,
+		drbd.DiskStateConsistent, drbd.DiskStateUpToDate,
+	}
+
+	for _, state := range slot.PeerDiskStates {
+		if slices.Contains(withDisk, drbd.DiskState(state)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isUnknownResourceErr reports whether a drbdadm error is the
@@ -6828,7 +7076,7 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 		}, true
 	}
 
-	provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+	provider, ok := r.provider(vol.GetStoragePool())
 	if !ok || provider == nil {
 		return drbd.GISeed{}, false
 	}
@@ -6925,6 +7173,19 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 	return drbd.GISeed{Current: day0, WasUpToDate: true}, true
 }
 
+// provider returns the provider registered for pool. The StoragePool
+// controller registers pools while the Resource workers apply, and an
+// unguarded map read racing that write is a fatal runtime error, not a
+// recoverable one.
+func (r *Reconciler) provider(pool string) (storage.Provider, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	provider, ok := r.cfg.Providers[pool]
+
+	return provider, ok
+}
+
 // restoredCloneSeed is the seed of a replica of the restore set that was
 // cloned or received here from the snapshot: it holds the snapshot's data,
 // so it comes up UpToDate on its own, the way LINSTOR keeps the snapshot's
@@ -6979,20 +7240,28 @@ func (r *Reconciler) providerForResource(name string) (storage.Provider, error) 
 
 // poolForResource is providerForResource that also names the pool.
 func (r *Reconciler) poolForResource(name string) (string, storage.Provider, error) {
-	r.mu.Lock()
-	pool, ok := r.resourceToPool[name]
-	r.mu.Unlock()
+	pool, ok := r.poolOf(name)
 
 	if !ok {
 		return "", nil, errors.Errorf("resource %q not known on this satellite", name)
 	}
 
-	provider, ok := r.cfg.Providers[pool]
+	provider, ok := r.provider(pool)
 	if !ok {
 		return "", nil, errors.Errorf("storage pool %q not registered", pool)
 	}
 
 	return pool, provider, nil
+}
+
+// poolOf is the pool an applied replica of the resource was recorded in.
+func (r *Reconciler) poolOf(name string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pool, ok := r.resourceToPool[name]
+
+	return pool, ok
 }
 
 // rememberPool records the pool that backs a resource, so subsequent
@@ -7019,7 +7288,32 @@ func (r *Reconciler) rememberPool(resourceName, pool string) {
 // disk path. Empty / missing → fall back to the LVM/ZFS-shaped
 // `/dev/<pool>/<rd>_<vol>` guess, which is what works for those
 // providers.
-func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string) (string, error) {
+//
+// autoDisk is the satellite-derived resource-scope disk options,
+// autoVolumeDisk the per-volume ones (see autoDiskOptionsForVolumes);
+// either may be nil.
+func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string, autoVolumeDisk map[int32]map[string]string) (string, error) {
+	body, _, err := buildResFileChecked(dr, localNode, localAddr, devices, autoDisk, autoVolumeDisk, resOptionSchemas{})
+
+	return body, err
+}
+
+// resOptionSchemas is what this node's drbd-utils accepts in each `.res`
+// section that carries operator options. A nil schema checks nothing; the
+// disk one also judges the peer-device options, which drbdadm reads in a
+// disk section.
+type resOptionSchemas struct {
+	Net     *drbd.OptionSchema
+	Options *drbd.OptionSchema
+	Disk    *drbd.OptionSchema
+}
+
+// buildResFileChecked is buildResFile with the options held against
+// schemas, what this node's drbd-utils accepts (see dropRejectedOptions).
+// It also returns why each option it left out was left out. A key no
+// `.res` section takes is always left out (see splitDRBDOptions); a nil
+// schema keeps every option of its section.
+func buildResFileChecked(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string, autoVolumeDisk map[int32]map[string]string, schemas resOptionSchemas) (string, []string, error) {
 	opts := dr.GetDrbdOptions()
 	port, _ := strconv.Atoi(opts["port"])
 	nodeID, _ := strconv.Atoi(opts["node-id"])
@@ -7052,6 +7346,8 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 
 	sections := splitDRBDOptions(opts)
 	mergeAutoDiskOptions(sections.Disk, autoDisk)
+	mergeAutoVolumeDiskOptions(vols, sections.Disk, autoVolumeDisk)
+	dropped := slices.Concat(sections.Dropped, dropRejectedOptions(schemas, &sections, vols))
 
 	out, err := drbd.Build(drbd.Resource{
 		Name:        dr.GetName(),
@@ -7065,10 +7361,135 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 		Connections: buildResConnections(dr, hosts),
 	})
 	if err != nil {
-		return "", errors.Wrap(err, "drbd.Build")
+		return "", nil, errors.Wrap(err, "drbd.Build")
 	}
 
-	return out, nil
+	return out, dropped, nil
+}
+
+// optionSchemas is what this node's drbd-utils accepts in each section,
+// a nil schema where drbdsetup could not say. nil accepts everything, so
+// a satellite that cannot ask renders what it rendered before.
+func (r *Reconciler) optionSchemas(ctx context.Context) resOptionSchemas {
+	if r.cfg.Adm == nil {
+		return resOptionSchemas{}
+	}
+
+	read := func(section string) *drbd.OptionSchema {
+		schema, err := r.cfg.Adm.OptionSchema(ctx, section)
+		if err != nil {
+			log.FromContext(ctx).Info("options rendered unchecked: drbdsetup did not describe them",
+				"section", section, "err", err.Error())
+
+			return nil
+		}
+
+		return schema
+	}
+
+	return resOptionSchemas{
+		Net:     read(drbd.SectionNet),
+		Options: read(drbd.SectionOptions),
+		Disk:    read(drbd.SectionDisk),
+	}
+}
+
+// dropRejectedOptions holds every operator section against what this
+// node's drbd-utils accepts and returns why each option it left out went:
+// the disk sections against the disk schema (dropRejectedDiskOptions), the
+// peer-device options against it too, net and the resource options block
+// against their own, and the handlers against the names drbdadm runs.
+func dropRejectedOptions(schemas resOptionSchemas, sections *drbdOptionSections, vols []drbd.Volume) []string {
+	dropped := dropRejectedDiskOptions(schemas.Disk, sections.Disk, vols)
+	dropped = append(dropped, dropRejectedSectionOptions(schemas.Disk, "peer-device", sections.PeerDevice)...)
+	dropped = append(dropped, dropRejectedSectionOptions(schemas.Net, drbd.SectionNet, sections.Net)...)
+	dropped = append(dropped, dropRejectedSectionOptions(schemas.Options, drbd.SectionOptions, sections.Resource)...)
+
+	for _, name := range slices.Sorted(maps.Keys(sections.Handlers)) {
+		if !slices.Contains(drbd.HandlerNames(), name) {
+			delete(sections.Handlers, name)
+
+			dropped = append(dropped, "handlers: "+name+" is not a handler drbdadm runs")
+		}
+	}
+
+	return dropped
+}
+
+// dropRejectedSectionOptions removes from one section's options every one
+// schema says this node's drbd-utils rejects, and returns why each went,
+// named by section. A nil schema keeps them all.
+func dropRejectedSectionOptions(schema *drbd.OptionSchema, section string, options map[string]string) []string {
+	if schema == nil {
+		return nil
+	}
+
+	var dropped []string
+
+	for _, name := range slices.Sorted(maps.Keys(options)) {
+		err := schema.Check(name, options[name])
+		if err != nil {
+			delete(options, name)
+
+			dropped = append(dropped, section+": "+err.Error())
+		}
+	}
+
+	return dropped
+}
+
+// dropRejectedDiskOptions removes from the resource-scope disk section
+// and from each volume's own one every option schema says this node's
+// drbd-utils rejects, by name or by value, and returns why each went.
+//
+// drbdadm reads every .res on the node for any command, so one option it
+// cannot parse fails the whole file, and CheckResFile then keeps the
+// resource from ever getting a .res. That is the case for an option a
+// LINSTOR cluster stamped from a newer drbd-utils, or a value outside
+// this one's range, on an adopted definition. LINSTOR's satellite drops
+// such an option with a warning and writes the rest
+// (ConfFileBuilder.checkValidDrbdOption); this does the same. A volume's
+// options map is replaced, not edited, since it is the intent's.
+func dropRejectedDiskOptions(schema *drbd.OptionSchema, resourceDisk map[string]string, vols []drbd.Volume) []string {
+	if schema == nil {
+		return nil
+	}
+
+	var dropped []string
+
+	for _, k := range slices.Sorted(maps.Keys(resourceDisk)) {
+		err := schema.Check(k, resourceDisk[k])
+		if err != nil {
+			delete(resourceDisk, k)
+
+			dropped = append(dropped, err.Error())
+		}
+	}
+
+	for i := range vols {
+		var kept map[string]string
+
+		for _, key := range slices.Sorted(maps.Keys(vols[i].Options)) {
+			err := schema.Check(key, vols[i].Options[key])
+			if err == nil {
+				continue
+			}
+
+			if kept == nil {
+				kept = maps.Clone(vols[i].Options)
+			}
+
+			delete(kept, key)
+
+			dropped = append(dropped, fmt.Sprintf("volume %d: %s", vols[i].Number, err.Error()))
+		}
+
+		if kept != nil {
+			vols[i].Options = kept
+		}
+	}
+
+	return dropped
 }
 
 // buildResConnections translates the DesiredResource's logical
@@ -7183,6 +7604,7 @@ func buildResVolumes(dr *intent.DesiredResource, devices map[int32]string, minor
 			Disk:     disk,
 			MetaDisk: metaDisk,
 			Minor:    volMinor,
+			Options:  vol.GetDiskOptions(),
 		})
 	}
 
@@ -7199,6 +7621,10 @@ type drbdOptionSections struct {
 	Disk       map[string]string
 	PeerDevice map[string]string
 	Handlers   map[string]string
+
+	// Dropped says why each DrbdOptions key no section takes was left
+	// out of the .res.
+	Dropped []string
 }
 
 // splitDRBDOptions partitions the satellite-received drbd_options bag
@@ -7212,8 +7638,15 @@ type drbdOptionSections struct {
 //   - `DrbdOptions/Disk/*`    → `disk { }`        at resource scope
 //   - `DrbdOptions/Handlers/*` → `handlers { }`   at resource scope
 //   - `DrbdOptions/PeerDevice/*` → `disk { }`     inside each connection
-//   - `DrbdOptions/Resource/*` (and unknown sections) → `options { }`
-//     (drbd's catch-all top-level block)
+//   - `DrbdOptions/Resource/*` → `options { }`
+//
+// A key under any other section (`DrbdOptions/AutoSnapshot/Keep`, a typo
+// of `AutoSnapshot/Keep`), or with a further `/` in its option name, is
+// left out and reported in Dropped. It used to land in options{}, where
+// drbdadm refused the whole file, so every replica of the definition
+// failed each apply until the key was deleted. LINSTOR's satellite renders
+// only those five namespaces and drops what its whitelist does not list
+// (ConfFileBuilder.checkValidDrbdOption).
 //
 // The renderer writes the keys verbatim with the
 // `DrbdOptions/<Section>/` prefix stripped — that's the form drbdadm
@@ -7250,36 +7683,50 @@ func splitDRBDOptions(opts map[string]string) drbdOptionSections {
 			continue
 		}
 
-		_, rawKey, hasSection := strings.Cut(rest, "/")
+		section, rawKey, hasSection := strings.Cut(rest, "/")
 		if !hasSection {
 			// LINSTOR-only key (no DRBD section subpath); these
 			// don't belong in the rendered .res. See doc comment.
 			continue
 		}
 
-		switch drbd.SectionFor(key) {
-		case drbd.SectionNet:
-			out.Net[rawKey] = value
-		case drbd.SectionDisk:
-			out.Disk[rawKey] = value
-		case drbd.SectionPeerDevice:
-			out.PeerDevice[rawKey] = value
-		case drbd.SectionHandlers:
-			out.Handlers[rawKey] = value
-		default:
-			// SectionOptions — drbd's catch-all top-level block.
-			// Covers `DrbdOptions/Resource/*` plus any unknown
-			// section so a future upstream key still lands
-			// somewhere sensible (matches SectionFor's fallback).
-			out.Resource[rawKey] = value
+		target := out.sectionMap(section)
+		if target == nil || strings.Contains(rawKey, "/") {
+			out.Dropped = append(out.Dropped, key+": no .res section takes it")
+
+			continue
 		}
+
+		target[rawKey] = value
 	}
 
 	// The one section-less key that does reach the .res: LINSTOR's
 	// automatic verify algorithm stands in for an unset verify-alg.
 	drbd.FillAutoVerifyAlg(out.Net, opts)
 
+	slices.Sort(out.Dropped)
+
 	return out
+}
+
+// sectionMap is the map a `DrbdOptions/<section>/` key renders into, nil
+// for a section the .res has no block for. The section is matched without
+// regard to case, as drbd.SectionFor matches it.
+func (s *drbdOptionSections) sectionMap(section string) map[string]string {
+	switch strings.ToLower(section) {
+	case "net":
+		return s.Net
+	case "disk":
+		return s.Disk
+	case "peerdevice", "peer-device":
+		return s.PeerDevice
+	case "handlers":
+		return s.Handlers
+	case "resource":
+		return s.Resource
+	default:
+		return nil
+	}
 }
 
 // mergeAutoDiskOptions folds the satellite-derived thin-aware-resync
@@ -7300,6 +7747,37 @@ func mergeAutoDiskOptions(dst, auto map[string]string) {
 		}
 
 		dst[k] = v
+	}
+}
+
+// mergeAutoVolumeDiskOptions folds the per-volume derived disk options
+// into each volume's own disk section. A value the operator set at
+// resource scope wins over the derived one, the same rule
+// mergeAutoDiskOptions keeps; one set for the volume itself cannot
+// collide, since a volume whose definition sets a discard option has
+// nothing derived (definitionDecidesDiscard). The volume's options map
+// is replaced, not edited, since it is the intent's.
+func mergeAutoVolumeDiskOptions(vols []drbd.Volume, resourceDisk map[string]string, auto map[int32]map[string]string) {
+	for i := range vols {
+		derived := auto[int32(vols[i].Number)] //nolint:gosec // a DRBD volume number fits int32
+		if len(derived) == 0 {
+			continue
+		}
+
+		opts := maps.Clone(vols[i].Options)
+		if opts == nil {
+			opts = map[string]string{}
+		}
+
+		for k, v := range derived {
+			if _, set := resourceDisk[k]; set {
+				continue
+			}
+
+			opts[k] = v
+		}
+
+		vols[i].Options = opts
 	}
 }
 
@@ -7398,15 +7876,20 @@ func isDiskless(flags []string) bool {
 //     ["LUKS","STORAGE"]), the consumer sees the raw storage /
 //     dm-crypt device — that's exactly what `devices` already
 //     holds after applyStorage + maybeLUKS.
-//   - DISKLESS replicas have no consumer-facing device; we emit
-//     no Volumes entries.
+//   - A DISKLESS replica with DRBD gets the same `/dev/drbd<minor>`:
+//     the DRBD device is the consumer-facing one whether the data is
+//     local or reached over the network, and LINSTOR reports it for a
+//     diskless volume too. linstor-csi's ControllerPublishVolume of a
+//     remote (diskless) attach reads exactly that path and fails the
+//     attach without one. A DISKLESS replica without DRBD has no
+//     device at all, so it gets no Volumes entries.
 //
 // Each entry carries the size applied (appliedSizeKib); the bool reports
 // a volume whose grow has not reached its device yet.
 func (r *Reconciler) buildVolumeResults(
 	ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, diskless, withDRBD bool,
 ) ([]*intent.ResourceApplyVolumeResult, bool) {
-	if diskless {
+	if diskless && !withDRBD {
 		return nil, false
 	}
 

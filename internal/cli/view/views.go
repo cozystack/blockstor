@@ -184,22 +184,24 @@ func SnapshotList(snaps []apiv1.Snapshot) *metav1.Table {
 	return tbl
 }
 
-// snapshotState reports the terminal marker the satellite or the
-// controller stamped, defaulting to Successful for a snapshot that
-// carries no failure flag.
+// snapshotState renders the State column as the python CLI does: a
+// delete in flight first, then a failure marker, then the SUCCESSFUL
+// the controller recorded when the take completed. A snapshot that
+// carries none of them is still being taken.
 func snapshotState(snap *apiv1.Snapshot) string {
-	for _, flag := range snap.Flags {
-		switch flag {
-		case "FAILED":
-			return "Failed"
-		case "FAILED_DISCONNECT":
-			return "Satellite disconnected"
-		case flagDelete:
-			return stateDeleting
-		}
+	switch {
+	case slices.Contains(snap.Flags, flagDelete):
+		return stateDeleting
+	case slices.Contains(snap.Flags, "FAILED"),
+		slices.Contains(snap.Flags, apiv1.SnapshotFlagFailedDeployment):
+		return "Failed"
+	case slices.Contains(snap.Flags, apiv1.SnapshotFlagFailedDisconnect):
+		return "Satellite disconnected"
+	case slices.Contains(snap.Flags, apiv1.SnapshotFlagSuccessful):
+		return "Successful"
 	}
 
-	return "Successful"
+	return "Incomplete"
 }
 
 // snapshotCreated renders the newest per-node creation time.

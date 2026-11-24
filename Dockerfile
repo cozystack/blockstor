@@ -74,14 +74,38 @@ USER 65532:65532
 ENTRYPOINT ["/apiserver"]
 
 FROM debian:trixie-slim AS satellite
+# drbd-utils comes from LINBIT's public repository, the one the LINSTOR
+# satellite image is built from, and which that image installs unpinned.
+# Debian's own package is 9.22, whose drbdadm predates the device options
+# (block-size, discard-granularity) LINSTOR writes into a volume's disk
+# section: it refuses such a .res as a parse error, and since drbdadm
+# reads every .res on the node, one adopted volume carrying block-size
+# stops adjust for every resource there.
+# 9.36.0 is the first drbdmeta that keeps the bitmap provenance feature
+# DRBD 9.3.4 writes into the superblock. Older ones clear it, so the
+# apply-al run after every crash makes the kernel count a crashed
+# Secondary's activity log bits as bits its peers lack: at equal current
+# UUIDs the crashed node then becomes a resync source, or a Primary peer
+# refuses the connection as a SyncTarget.
+ARG DRBD_UTILS_VERSION=9.36.0-1
 # zfsutils-linux is in contrib on trixie — enable it so we can pull
 # zpool/zfs alongside drbd-utils, lvm2, cryptsetup. Note: the kernel
 # module is provided by the host (Talos siderolabs/zfs extension);
 # this image only ships the userspace tools.
-RUN sed -i 's|^Components: main$|Components: main contrib|' /etc/apt/sources.list.d/debian.sources && \
+# The keyring is the root of trust for every LINBIT package, so it is
+# pinned by digest rather than trusted on TLS alone: a changed file
+# fails the build instead of installing a key nobody reviewed.
+ARG LINBIT_KEYRING_SHA256=4d5d50224d5e2da0d0afa3ccf56e4ea9c1afa07d690ac458b445481584cd3947
+ADD https://packages.linbit.com/public/linbit-keyring.deb /tmp/linbit-keyring.deb
+RUN echo "${LINBIT_KEYRING_SHA256}  /tmp/linbit-keyring.deb" | sha256sum -c - && \
+    sed -i 's|^Components: main$|Components: main contrib|' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates && \
+    dpkg -i /tmp/linbit-keyring.deb && rm /tmp/linbit-keyring.deb && \
+    echo "deb https://packages.linbit.com/public trixie misc" > /etc/apt/sources.list.d/linbit.list && \
     apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        drbd-utils lvm2 cryptsetup-bin zfsutils-linux gdisk parted ca-certificates \
+        drbd-utils="${DRBD_UTILS_VERSION}" lvm2 cryptsetup-bin zfsutils-linux gdisk parted \
         iptables \
         e2fsprogs xfsprogs && \
     rm -rf /var/lib/apt/lists/*

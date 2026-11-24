@@ -21,6 +21,7 @@ package controller_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -72,6 +73,24 @@ func makeRDWithAutoSnapshot(t *testing.T, name string, runEveryMinutes int, keep
 	}
 }
 
+// withReplicas returns rd followed by one diskful replica of it on each
+// of n1 and n2, the replicas an auto-snapshot is taken on.
+func withReplicas(rd *blockstoriov1alpha1.ResourceDefinition, extra ...client.Object) []client.Object {
+	objs := []client.Object{rd}
+
+	for _, node := range []string{"n1", "n2"} {
+		objs = append(objs, &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: rd.Name + "." + node},
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: rd.Name,
+				NodeName:               node,
+			},
+		})
+	}
+
+	return append(objs, extra...)
+}
+
 // listAutoSnapshotsByRD returns the auto-snapshot CRDs labelled for
 // the given RD, sorted by snapshot name for stable assertions.
 func listAutoSnapshotsByRD(t *testing.T, cli client.Client, rdName string) []blockstoriov1alpha1.Snapshot {
@@ -94,6 +113,28 @@ func listAutoSnapshotsByRD(t *testing.T, cli client.Client, rdName string) []blo
 	return snaps.Items
 }
 
+// finishTakes stands in for the take orchestration: every auto-snapshot
+// of the definition finishes its take and is recorded SUCCESSFUL, so the
+// next tick is not held back by a take still under way, and the pruner
+// may delete it.
+func finishTakes(t *testing.T, cli client.Client, rdName string) {
+	t.Helper()
+
+	for _, snap := range listAutoSnapshotsByRD(t, cli, rdName) {
+		if slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful) {
+			continue
+		}
+
+		snap.Spec.SuspendIO = false
+		snap.Spec.TakeSnapshot = false
+		snap.Status.Flags = append(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful)
+
+		if err := cli.Update(context.Background(), &snap); err != nil {
+			t.Fatalf("finish the take of %s: %v", snap.Name, err)
+		}
+	}
+}
+
 // TestAutoSnapshotFirstTickCreatesOne: RunEvery=15, no existing
 // state — the first Tick allocates id=1 and creates `auto-snap-00001`.
 // Pins the cadence semantic the scenario doc spells out ("set
@@ -105,7 +146,7 @@ func TestAutoSnapshotFirstTickCreatesOne(t *testing.T) {
 	rd := makeRDWithAutoSnapshot(t, "pvc-w05-first", 15, "")
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rd).
+		WithObjects(withReplicas(rd)...).
 		Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
@@ -158,7 +199,7 @@ func TestAutoSnapshotFiveIntervalsProduceFiveSnapshots(t *testing.T) {
 	rd := makeRDWithAutoSnapshot(t, "pvc-w05-five", 15, "")
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rd).
+		WithObjects(withReplicas(rd)...).
 		Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
@@ -169,6 +210,8 @@ func TestAutoSnapshotFiveIntervalsProduceFiveSnapshots(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 		// Advance just past 15 minutes so the next tick is due.
 		clk.advance(15*time.Minute + time.Second)
 	}
@@ -197,7 +240,7 @@ func TestAutoSnapshotTickBeforeIntervalIsNoOp(t *testing.T) {
 	rd := makeRDWithAutoSnapshot(t, "pvc-w05-noop", 15, "")
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rd).
+		WithObjects(withReplicas(rd)...).
 		Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
@@ -232,7 +275,7 @@ func TestAutoSnapshotKeepPrunesOldestBeyondBudget(t *testing.T) {
 	rd := makeRDWithAutoSnapshot(t, "pvc-w05-keep", 15, "3")
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rd).
+		WithObjects(withReplicas(rd)...).
 		Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
@@ -242,6 +285,8 @@ func TestAutoSnapshotKeepPrunesOldestBeyondBudget(t *testing.T) {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 
 		clk.advance(15*time.Minute + time.Second)
 	}
@@ -295,7 +340,7 @@ func TestAutoSnapshotManualSnapshotsNotPruned(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rd, manual("nightly"), manual("preupgrade")).
+		WithObjects(withReplicas(rd, manual("nightly"), manual("preupgrade"))...).
 		Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
@@ -305,6 +350,8 @@ func TestAutoSnapshotManualSnapshotsNotPruned(t *testing.T) {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 
 		clk.advance(15*time.Minute + time.Second)
 	}
@@ -404,7 +451,7 @@ func TestAutoSnapshotKeepZeroFallsBackToDefault10(t *testing.T) {
 	rd := makeRDWithAutoSnapshot(t, "pvc-w05-keep0", 15, "0")
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rd).
+		WithObjects(withReplicas(rd)...).
 		Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
@@ -415,6 +462,8 @@ func TestAutoSnapshotKeepZeroFallsBackToDefault10(t *testing.T) {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 
 		clk.advance(15*time.Minute + time.Second)
 	}
@@ -436,7 +485,7 @@ func TestAutoSnapshotKeepNegativeFallsBackToDefault10(t *testing.T) {
 	rd := makeRDWithAutoSnapshot(t, "pvc-w05-keepneg", 15, "-3")
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rd).
+		WithObjects(withReplicas(rd)...).
 		Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
@@ -446,6 +495,8 @@ func TestAutoSnapshotKeepNegativeFallsBackToDefault10(t *testing.T) {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 
 		clk.advance(15*time.Minute + time.Second)
 	}
@@ -467,7 +518,7 @@ func TestAutoSnapshotDefaultKeepIs10(t *testing.T) {
 	rd := makeRDWithAutoSnapshot(t, "pvc-w05-default", 15, "")
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rd).
+		WithObjects(withReplicas(rd)...).
 		Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
@@ -478,6 +529,8 @@ func TestAutoSnapshotDefaultKeepIs10(t *testing.T) {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
+
+		finishTakes(t, cli, rd.Name)
 
 		clk.advance(15*time.Minute + time.Second)
 	}
@@ -506,7 +559,7 @@ func TestAutoSnapshotSkipsDeletingRD(t *testing.T) {
 	rd.Finalizers = []string{"test/keep"}
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rd).
+		WithObjects(withReplicas(rd)...).
 		Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
