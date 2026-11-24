@@ -152,7 +152,16 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName string, rg *apiv1.ResourceGroup, req *apiv1.ResourceGroupSpawn) {
 	rd := buildSpawnedRD(req, rgName, rg)
 
-	err := s.Store.ResourceDefinitions().Create(r.Context(), &rd)
+	// The peer slots the spawned definition's replicas get: the spawn's
+	// peer_slots, else the group's, as LINSTOR's spawn resolves them.
+	err := store.ResolvePeerSlots(r.Context(), s.Store, &rd, req.PeerSlots)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
 		writeStoreError(w, err)
 

@@ -252,6 +252,11 @@ type ResourceDefinitionCreate struct {
 	DrbdResourceDefinition *DrbdResourceDefinitionData `json:"drbd_resource_definition,omitempty"`
 	DrbdPort               int32                       `json:"drbd_port,omitempty"`
 	DrbdTransportType      string                      `json:"drbd_transport_type,omitempty"`
+
+	// DrbdPeerSlots is the peer-slot count the request names for the
+	// definition (`linstor rd c --peer-slots`); zero leaves it to the
+	// group and PeerSlotsNewResource, as in LINSTOR.
+	DrbdPeerSlots int32 `json:"drbd_peer_slots,omitempty"`
 }
 
 // DrbdResourceDefinitionData is the per-create DRBD-layer hint

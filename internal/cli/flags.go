@@ -108,6 +108,7 @@ var valueFlags = map[string]struct{}{ //nolint:gochecknoglobals // static flag t
 	"--place-count":         {},
 	"--auto-place":          {},
 	"--layer-list":          {},
+	"--peer-slots":          {},
 	"-l":                    {},
 	"--resource-group":      {},
 	"--size":                {},

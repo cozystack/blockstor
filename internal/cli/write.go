@@ -24,12 +24,14 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strconv"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/store"
 
@@ -319,6 +321,35 @@ var controllerProps = propertyAccessor{
 	},
 }
 
+// resolvePeerSlots records on a definition about to be created the peer
+// slots its replicas get: `--peer-slots`, else the group's, else
+// PeerSlotsNewResource, else 7, as LINSTOR resolves them
+// (store.ResolvePeerSlots).
+func resolvePeerSlots(ctx context.Context, run *runContext, def *apiv1.ResourceDefinition) error {
+	var requested int32
+
+	if raw := run.Flags.Values["peer-slots"]; raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil {
+			return fmt.Errorf("%w: --peer-slots %q is not a number", command.ErrUsage, raw)
+		}
+
+		requested = int32(n)
+
+		err = drbd.ValidatePeerSlots(n)
+		if err != nil {
+			return fmt.Errorf("%w: %w", command.ErrUsage, err)
+		}
+	}
+
+	err := store.ResolvePeerSlots(ctx, run.Store, def, requested)
+	if err != nil {
+		return fmt.Errorf("peer slots of %s: %w", def.Name, err)
+	}
+
+	return nil
+}
+
 // resourceDefinitionCreate implements `resource-definition create`.
 func resourceDefinitionCreate(ctx context.Context, run *runContext) error {
 	if len(run.Flags.Positionals) < 1 {
@@ -344,7 +375,12 @@ func resourceDefinitionCreate(ctx context.Context, run *runContext) error {
 		def.LayerStack = parsed
 	}
 
-	err := run.Store.ResourceDefinitions().Create(ctx, def)
+	err := resolvePeerSlots(ctx, run, def)
+	if err != nil {
+		return err
+	}
+
+	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if err != nil {
 		return fmt.Errorf("create resource definition %s: %w", def.Name, err)
 	}
