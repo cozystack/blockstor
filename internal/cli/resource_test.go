@@ -522,3 +522,81 @@ func TestNodeCreateRefusesAMalformedAddress(t *testing.T) {
 		t.Fatal("a malformed address was accepted")
 	}
 }
+
+// seedWitness is a definition whose replica on node-2 is the
+// TIE_BREAKER witness the controller placed while a replica was being
+// replaced there.
+func seedWitness(ctx context.Context, backend store.Store) {
+	_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+	_ = backend.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-x", NodeName: "node-1",
+		Props: map[string]string{"StorPoolName": "data"},
+	})
+	_ = backend.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-x", NodeName: "node-2",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	})
+}
+
+// `r c <node> <rd> --storage-pool <pool>` on a node that holds a
+// TIE_BREAKER witness turns the witness into the diskful replica asked
+// for, as LINSTOR's resource create does, instead of failing with
+// "object already exists" and leaving the witness where the replica
+// was meant to go.
+func TestResourceCreateTakesOverTheWitness(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedWitness)
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-2", "pvc-x", "--storage-pool", "data"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	res := getResource(t, app, "node-2")
+
+	if containsFlag(res.Flags, apiv1.ResourceFlagDiskless) || containsFlag(res.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("flags = %v, want the witness promoted to diskful", res.Flags)
+	}
+
+	if pool := res.Props["StorPoolName"]; pool != "data" {
+		t.Errorf("StorPoolName = %q, want data", pool)
+	}
+}
+
+// `r c --diskless` on the witness's node keeps it diskless and makes it
+// an ordinary diskless replica, no longer the controller's witness.
+func TestResourceCreateDisklessTakesOverTheWitness(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedWitness)
+
+	if got := app.Run(t.Context(), []string{"r", "c", "--diskless", "node-2", "pvc-x"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	res := getResource(t, app, "node-2")
+
+	if !containsFlag(res.Flags, apiv1.ResourceFlagDiskless) || containsFlag(res.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("flags = %v, want DISKLESS without TIE_BREAKER", res.Flags)
+	}
+}
+
+// A diskful replica already on the node is a real conflict: the create
+// fails and the replica is left as it is.
+func TestResourceCreateOnADiskfulReplicaStillFails(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedWitness)
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-1", "pvc-x", "--storage-pool", "other"}); got == 0 {
+		t.Fatal("resource create on a diskful replica succeeded, want a conflict")
+	}
+
+	if !strings.Contains(errBuf.String(), "already exists") {
+		t.Errorf("stderr = %q, want the conflict reported", errBuf.String())
+	}
+
+	if pool := getResource(t, app, "node-1").Props["StorPoolName"]; pool != "data" {
+		t.Errorf("StorPoolName = %q, want the replica left on data", pool)
+	}
+}

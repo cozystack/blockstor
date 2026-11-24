@@ -494,6 +494,10 @@ func resourceCreate(ctx context.Context, run *runContext) error {
 		}
 
 		err := run.Store.Resources().Create(ctx, res)
+		if errors.Is(err, store.ErrAlreadyExists) {
+			err = takeOverWitness(ctx, run.Store, res, err)
+		}
+
 		if err != nil {
 			return fmt.Errorf("create resource %s on %s: %w", rdName, node, err)
 		}
@@ -501,6 +505,57 @@ func resourceCreate(ctx context.Context, run *runContext) error {
 
 	return nil
 }
+
+// takeOverWitness turns the diskless replica or TIE_BREAKER witness a
+// create found on its node into the replica the create asked for, as
+// LINSTOR's `resource create` does. A replace (r d, then r c on the same
+// node) races the controller, which puts a witness on that node as soon
+// as two diskful replicas are left; without this the operator got
+// "object already exists" and a witness in place of the replica.
+//
+// A diskful request promotes the witness to diskful on res's pool; a
+// diskless one keeps it diskless and only drops TIE_BREAKER. A replica
+// that is diskful already, or being deleted, is left as it is and
+// createErr is returned.
+func takeOverWitness(ctx context.Context, st store.Store, res *apiv1.Resource, createErr error) error {
+	wantDiskful := !slices.Contains(res.Flags, apiv1.ResourceFlagDiskless)
+
+	err := st.Resources().PatchResourceSpec(ctx, res.Name, res.NodeName, func(live *apiv1.Resource) error {
+		keep, wasDiskless := apiv1.PromoteWitnessFlags(live.Flags, wantDiskful)
+		if !wasDiskless || slices.Contains(live.Flags, apiv1.ResourceFlagDelete) {
+			return errNoWitnessToTakeOver
+		}
+
+		live.Flags = keep
+
+		if pool := res.Props[storPoolNameProp]; wantDiskful && pool != "" {
+			if live.Props == nil {
+				live.Props = map[string]string{}
+			}
+
+			live.Props[storPoolNameProp] = pool
+		}
+
+		return nil
+	})
+
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errNoWitnessToTakeOver):
+		return createErr
+	case errors.Is(err, store.ErrNotFound):
+		// The witness went between the create and the patch: the
+		// controller collapsed it. The node is free again.
+		return st.Resources().Create(ctx, res) //nolint:wrapcheck // the caller wraps
+	default:
+		return fmt.Errorf("take over the replica already there: %w", err)
+	}
+}
+
+// errNoWitnessToTakeOver stops takeOverWitness on a replica that is
+// diskful already or being deleted.
+var errNoWitnessToTakeOver = errors.New("the replica there is no witness to take over")
 
 // resourceDelete implements `resource delete <node> <rd>`,
 // idempotently.
