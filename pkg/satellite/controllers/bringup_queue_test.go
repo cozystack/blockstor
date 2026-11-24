@@ -100,15 +100,15 @@ func TestBringUpQueueDropsTheRankAfterTheFirstPass(t *testing.T) {
 		}
 
 		tracker.started(name)
-		queue.AddWithOpts(priorityqueue.AddOpts{After: activeDRBDRequeue, Priority: priorityPtr(bringUpPriority)}, bringUpRequest(name))
+		queue.AddWithOpts(priorityqueue.AddOpts{After: applyFailureRequeue, Priority: priorityPtr(bringUpPriority)}, bringUpRequest(name))
 	}
 
-	if got := inner.adds["listed"]; priorityOf(got) != handler.LowPriority || got.After != activeDRBDRequeue {
-		t.Errorf("requeue of a replica from the initial list: %+v, want priority %d after %v", got, handler.LowPriority, activeDRBDRequeue)
+	if got := inner.adds["listed"]; priorityOf(got) != handler.LowPriority || got.After != applyFailureRequeue {
+		t.Errorf("requeue of a replica from the initial list: %+v, want priority %d after %v", got, handler.LowPriority, applyFailureRequeue)
 	}
 
-	if got := inner.adds["created"]; priorityOf(got) != 0 || got.After != activeDRBDRequeue {
-		t.Errorf("requeue of a replica created while the satellite runs: %+v, want normal priority after %v", got, activeDRBDRequeue)
+	if got := inner.adds["created"]; priorityOf(got) != 0 || got.After != applyFailureRequeue {
+		t.Errorf("requeue of a replica created while the satellite runs: %+v, want normal priority after %v", got, applyFailureRequeue)
 	}
 
 	// A failed first pass is retried like any other pass.
