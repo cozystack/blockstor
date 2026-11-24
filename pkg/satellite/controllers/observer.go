@@ -158,6 +158,9 @@ type volumeObservation struct {
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
+	// DeviceSizeKib is the DRBD device size from the `size:` token of
+	// a `device` frame; 0 when the frame did not carry one.
+	DeviceSizeKib int64
 
 	// SyncPeer is the peer a peer-device frame's out-of-sync count is
 	// about (its `conn-name`).
@@ -468,6 +471,14 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 	if q, ok := ev.Fields["quorum"]; ok {
 		vol.Quorum = q == drbdQuorumYes
 		vol.HasQuorum = true
+	}
+
+	// `size:<kib>` rides on device frames under --statistics --full. A
+	// device that is neither attached nor connected has no size yet
+	// and reports 0, which is not a size worth publishing.
+	size, err := strconv.ParseInt(ev.Fields["size"], 10, 64)
+	if err == nil && size > 0 {
+		vol.DeviceSizeKib = size
 	}
 
 	out.Volumes = []volumeObservation{vol}
@@ -1504,7 +1515,9 @@ func (o *ObserverRunnable) giMayMove(name string) bool {
 
 	o.volMu.Lock()
 
-	for _, vol := range o.volCache[name] {
+	cache := o.volCache[name]
+	for volNum := range cache {
+		vol := cache[volNum]
 		if !isDataBearingDiskState(drbd.DiskState(vol.DiskState)) || vol.CurrentUUID != "" {
 			continue
 		}
@@ -1612,8 +1625,8 @@ func (o *ObserverRunnable) snapshotFor(name string) observation {
 
 	o.volMu.Lock()
 	if cache, ok := o.volCache[name]; ok {
-		for _, v := range cache {
-			out.Volumes = append(out.Volumes, v)
+		for volNum := range cache {
+			out.Volumes = append(out.Volumes, cache[volNum])
 		}
 	}
 	o.volMu.Unlock()
@@ -2364,7 +2377,8 @@ func (o *ObserverRunnable) lifecycleSnapshotLocked(name string) lifecycleSignatu
 
 	o.volMu.Lock()
 	if cache, ok := o.volCache[name]; ok {
-		for volNum, v := range cache {
+		for volNum := range cache {
+			v := cache[volNum]
 			sig.PerVolume[volNum] = volumeLifecycle{
 				DiskState: v.DiskState,
 				Quorum:    v.Quorum,
@@ -2528,7 +2542,8 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 		}
 	}
 
-	for _, incoming := range ev.Volumes {
+	for i := range ev.Volumes {
+		incoming := &ev.Volumes[i]
 		if incoming.Removed {
 			// `destroy device` — evict the volume so the snapshot
 			// stops carrying it. Only counts as a change when the
@@ -2543,7 +2558,7 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 			continue
 		}
 
-		if mergeVolumeInto(cache, &incoming) {
+		if mergeVolumeInto(cache, incoming) {
 			changed = true
 		}
 	}
@@ -2555,8 +2570,8 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 	}
 
 	snapshot := make([]volumeObservation, 0, len(cache))
-	for _, entry := range cache {
-		snapshot = append(snapshot, entry)
+	for volNum := range cache {
+		snapshot = append(snapshot, cache[volNum])
 	}
 
 	ev.Volumes = snapshot
@@ -2641,8 +2656,8 @@ func (o *ObserverRunnable) pruneVolumeCacheToDesired(ev *observation, res *block
 	// nil ev.Volumes mergeVolumes left when the kernel frame itself was
 	// idempotent: the prune is the change that must reach the apiserver.
 	snapshot := make([]volumeObservation, 0, len(cache))
-	for _, entry := range cache {
-		snapshot = append(snapshot, entry)
+	for volNum := range cache {
+		snapshot = append(snapshot, cache[volNum])
 	}
 
 	ev.Volumes = snapshot
@@ -2725,7 +2740,8 @@ func largestOutOfSync(peers map[string]int64) int64 {
 func forgetPeerOutOfSync(cache map[int32]volumeObservation, peer string) bool {
 	changed := false
 
-	for num, vol := range cache {
+	for num := range cache {
+		vol := cache[num]
 		if _, ok := vol.PeerOutOfSync[peer]; !ok {
 			continue
 		}
@@ -2818,6 +2834,10 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 		changed = true
 	}
 
+	if mergeDeviceSizeInto(&merged, incoming) {
+		changed = true
+	}
+
 	// BackingDev is carried in the cache (so the snapshot the backfill
 	// reads has the lower-disk path) but never marks the volume
 	// `changed` on its own — it is an internal helper field, not a
@@ -2830,6 +2850,18 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 	cache[incoming.VolumeNumber] = merged
 
 	return changed
+}
+
+// mergeDeviceSizeInto takes the device size a frame carried; a frame
+// without one leaves the cached size alone.
+func mergeDeviceSizeInto(merged, incoming *volumeObservation) bool {
+	if incoming.DeviceSizeKib <= 0 || merged.DeviceSizeKib == incoming.DeviceSizeKib {
+		return false
+	}
+
+	merged.DeviceSizeKib = incoming.DeviceSizeKib
+
+	return true
 }
 
 // mergeConnections updates the per-resource peer-state cache from
@@ -2967,7 +2999,8 @@ func (o *ObserverRunnable) completeFromCache(ev *observation) {
 	}
 
 	read := make(map[int32]string, len(ev.Volumes))
-	for _, vol := range ev.Volumes {
+	for i := range ev.Volumes {
+		vol := &ev.Volumes[i]
 		if vol.CurrentUUID != "" {
 			read[vol.VolumeNumber] = vol.CurrentUUID
 		}
@@ -3452,14 +3485,16 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 
 	out := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(ev.Volumes))
 
-	for _, vol := range ev.Volumes {
+	for i := range ev.Volumes {
+		vol := &ev.Volumes[i]
 		out = append(out, blockstoriov1alpha1.ResourceVolumeStatus{
-			VolumeNumber: vol.VolumeNumber,
-			StoragePool:  storagePool,
-			DiskState:    vol.DiskState,
-			CurrentGI:    vol.CurrentUUID,
-			OutOfSyncKib: vol.OutOfSyncKib,
-			Quorum:       vol.Quorum,
+			VolumeNumber:  vol.VolumeNumber,
+			StoragePool:   storagePool,
+			DiskState:     vol.DiskState,
+			CurrentGI:     vol.CurrentUUID,
+			OutOfSyncKib:  vol.OutOfSyncKib,
+			Quorum:        vol.Quorum,
+			DeviceSizeKib: vol.DeviceSizeKib,
 		})
 	}
 
