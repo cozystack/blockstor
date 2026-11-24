@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
@@ -159,6 +160,12 @@ type ResourceReconciler struct {
 	// process ahead of every other pass (bringUpQueue). SetupWithManager
 	// creates it.
 	bringUp *bringUpTracker
+
+	// retries spaces the retries of a replica whose apply keeps failing.
+	retries applyBackoff
+
+	// waits reports an apply that waits too long for the controller.
+	waits controllerWaits
 }
 
 // Reconcile reads a Resource and drives the satellite-side
@@ -181,8 +188,9 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return result, err
 }
 
-// applyFailureRequeue is the backoff between satellite Apply
-// retries when at least one per-resource result reported failure.
+// applyFailureRequeue is the first backoff between satellite Apply
+// retries when at least one per-resource result reported failure;
+// applyBackoff doubles it for each retry that came due and failed.
 // Short enough that a transient stale-peer .res renders converge
 // within a couple of ticks; long enough that a permanently failing
 // drbdadm command (e.g. missing kernel module) doesn't flood the
@@ -352,6 +360,8 @@ func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Req
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			r.bringUp.forget(req.Name)
+			r.retries.reset(req.Name)
+			r.waits.forget(req.Name)
 
 			return ctrl.Result{}, nil
 		}
@@ -712,41 +722,76 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	retry, retryAsked := r.Config.Apply.TakeRetry(desired.GetName())
 
-	anyFailed, stampFailed := r.afterApply(ctx, res, rd, results, logger)
+	outcome := r.afterApply(ctx, res, rd, results, logger)
 
-	return ctrl.Result{RequeueAfter: applyRequeue(results, anyFailed, stampFailed, retry, retryAsked)}, nil
+	return r.nextPass(res, results, outcome, retry, retryAsked, logger), nil
 }
 
-// applyRequeue is when the pass after an apply comes, zero for none.
+// nextPass is the result of an apply pass: a retry of what failed, or,
+// for a converged replica, nothing but the retry work it put off asked
+// for (retryAsked, after retry).
 //
-// Apply chain surfaces per-resource errors via results (e.g. drbdadm
-// adjust failing on a stale .res rendered before the peer's Status
-// caught up). Returning nil here would let c-r stop until an external
-// event drove another reconcile; RequeueAfter ensures the next attempt
-// sees the freshly-committed peer state. A stamp that failed is retried
-// the same way: no periodic pass comes back for a device path the CSI
-// node is waiting on, or for the volume-numbers record a later delete
-// needs. An apply whose only failures are refusals an operator must act
-// on waits failureRequeue's longer interval, unless a grow waits for its
-// device too (growPending): that is retried at applyFailureRequeue, so a
-// refusal elsewhere in the apply does not hold the grow back.
+// A stamp that failed is retried the way a failed apply is: no periodic
+// pass comes back for a device path the CSI node is waiting on, or for
+// the volume-numbers record a later delete needs.
 //
 // A converged replica waits for its next event, the way LINSTOR's
 // satellite dispatches only resources with a pending change. The one
 // exception is work this pass put off for a while, a dwell window or a
 // throttle, that no event is bound to bring back.
-func applyRequeue(
-	results []*intent.ResourceApplyResult, anyFailed, stampFailed bool, retry time.Duration, retryAsked bool,
+func (r *ResourceReconciler) nextPass(
+	res *blockstoriov1alpha1.Resource,
+	results []*intent.ResourceApplyResult,
+	outcome applyOutcome,
+	retry time.Duration,
+	retryAsked bool,
+	logger logr.Logger,
+) ctrl.Result {
+	if requeue := r.retryAfterApply(res.Name, results, outcome.failed, outcome.waiting); requeue > 0 {
+		return ctrl.Result{RequeueAfter: requeue}
+	}
+
+	if outcome.stampFailed {
+		return ctrl.Result{RequeueAfter: applyFailureRequeue}
+	}
+
+	r.recordRecovery(res, r.retries.reset(res.Name), logger)
+
+	if retryAsked {
+		return ctrl.Result{RequeueAfter: retry}
+	}
+
+	return ctrl.Result{}
+}
+
+// retryAfterApply is how soon a pass whose apply did not go through
+// runs again, and zero after one that did.
+//
+// Apply chain surfaces per-resource errors via results (e.g. drbdadm
+// adjust failing on a stale .res rendered before the peer's Status
+// caught up). Returning nil here would let c-r stop until an external
+// event drove another reconcile; RequeueAfter ensures the next attempt
+// sees the freshly-committed peer state. A failure that persists, a
+// DRBD port another resource holds say, is retried with back-off rather
+// than every applyFailureRequeue, and one whose only failures are
+// metadata refusals no sooner than refusedApplyRequeue (failureRequeue).
+//
+// An apply held until the controller stamps the replica is a wait like
+// the allocation waits ahead of it: retried on the short timer and on
+// the update the stamp makes, and kept out of the back-off and of the
+// failures a recovery reports. A grow the apply left unfinished is
+// retried on the same short timer, failed or not, so the resize waiting
+// on it is not held back by the back-off.
+func (r *ResourceReconciler) retryAfterApply(
+	name string, results []*intent.ResourceApplyResult, anyFailed, waiting bool,
 ) time.Duration {
 	grow := growPending(results)
 
 	switch {
-	case anyFailed && !stampFailed && !grow:
-		return failureRequeue(results)
-	case anyFailed || stampFailed || grow:
+	case waiting, grow:
 		return applyFailureRequeue
-	case retryAsked:
-		return retry
+	case anyFailed:
+		return max(r.retries.next(name), failureRequeue(results))
 	default:
 		return 0
 	}
@@ -763,8 +808,7 @@ func (r *ResourceReconciler) applyLocked(ctx context.Context, desired *intent.De
 }
 
 // afterApply records the apply's outcome on the Resource and reports
-// whether anything failed, and apart from that whether a post-apply
-// stamp did. The volumes of definitions flagged DELETE are
+// how the pass ended (applyOutcome). The volumes of definitions flagged DELETE are
 // deleted only after an apply that went through, since that apply is what
 // took them out of DRBD. A failed apply may still have removed their
 // minors, so the quorum recheck that removal needs runs either way.
@@ -774,16 +818,18 @@ func (r *ResourceReconciler) afterApply(
 	rd *blockstoriov1alpha1.ResourceDefinition,
 	results []*intent.ResourceApplyResult,
 	logger logr.Logger,
-) (bool, bool) {
-	anyFailed := r.recordPerResourceFailures(res, results, logger)
+) applyOutcome {
+	anyFailed, waiting := r.recordPerResourceFailures(res, results, logger)
 	r.recordDroppedOptions(res, results)
 
-	stampFailed := r.stampPostApply(ctx, res, rd, results, anyFailed, logger)
+	outcome := applyOutcome{failed: anyFailed, waiting: waiting}
+
+	outcome.stampFailed = r.stampPostApply(ctx, res, rd, results, outcome, logger)
 
 	if anyFailed {
 		r.recheckQuorumAfterFailedApply(ctx, res, rd, logger)
 
-		return true, stampFailed
+		return outcome
 	}
 
 	err := r.deleteFlaggedVolumes(ctx, res, rd)
@@ -799,10 +845,10 @@ func (r *ResourceReconciler) afterApply(
 				"volume definition delete is waiting for this replica: %s", err.Error())
 		}
 
-		return true, stampFailed
+		return applyOutcome{failed: true, stampFailed: outcome.stampFailed}
 	}
 
-	return false, stampFailed
+	return applyOutcome{stampFailed: outcome.stampFailed}
 }
 
 // volumeDeleteFailedReason is the Event reason for a replica that could not
@@ -903,17 +949,29 @@ func (r *ResourceReconciler) holdForAdoptedPeers(
 }
 
 // recordPerResourceFailures logs each per-resource Apply failure and
-// returns whether any of the results came back not-Ok. Extracted from
-// runApply so the orchestration stays under the funlen budget.
+// returns whether any of the results came back not-Ok, and whether
+// every one of those is only waiting for the controller to stamp the
+// replica (WaitingForController). Extracted from runApply so
+// the orchestration stays under the funlen budget.
 //
-// A refusal an operator must act on, the LUKS layer's or drbdmeta's over
-// data on the lower disk, also gets a Warning Event on the Resource: the
-// volume never comes up, and an Info line in this log is not where an
-// operator looks for why.
+// Each failure also gets a Warning Event on the Resource, under the
+// reason of the refusal it carries when it carries one (applyRefusals:
+// the LUKS layer's, or drbdmeta's over data on the lower disk): an Info
+// line in this log is not where an operator looks for why a replica
+// does not come up. A wait gets neither the Event nor the failure
+// line: it is part of every fresh replica's bring-up, and a Warning
+// for it reads as a fault that is not there. Only a wait that lasts
+// past a minute is reported, once (trackControllerWait).
+//
+// A peer the apply reconnected after the kernel dropped it is reported
+// here as well (recordReconnectedPeers), whether the apply went through
+// or not.
 func (r *ResourceReconciler) recordPerResourceFailures(
 	res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult, logger logr.Logger,
-) bool {
-	var anyFailed bool
+) (bool, bool) {
+	var anyFailed, anyFault bool
+
+	r.recordReconnectedPeers(res, results)
 
 	for _, result := range results {
 		if result.GetOk() {
@@ -922,46 +980,29 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 
 		anyFailed = true
 
+		if result.GetWaitingForController() {
+			logger.Info("waiting for the controller to stamp the replica", "name", result.GetName(),
+				"message", result.GetMessage())
+
+			continue
+		}
+
+		anyFault = true
+
 		logger.Info("Apply per-resource failure", "name", result.GetName(), "message", result.GetMessage())
 
 		if r.Config.Recorder == nil {
 			continue
 		}
 
-		for _, refusal := range applyRefusals() {
-			if strings.Contains(result.GetMessage(), refusal.err.Error()) {
-				r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, refusal.reason, "Apply",
-					"%s: %s", refusal.what, result.GetMessage())
-
-				break
-			}
-		}
+		reason, note := applyFailureEvent(result.GetMessage())
+		r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, reason, "Apply", "%s", note)
 	}
 
-	return anyFailed
-}
+	waiting := anyFailed && !anyFault
+	r.trackControllerWait(res, results, waiting)
 
-// droppedOptionReason is the Event reason for an option the satellite left
-// out of a replica's .res.
-const droppedOptionReason = "DrbdOptionIgnored"
-
-// recordDroppedOptions reports each option the satellite left out of the
-// replica's .res as a Warning Event on the Resource. The option is one
-// drbdadm would refuse, so leaving it out keeps the rest of the
-// configuration applying, but the operator set it and it does not take
-// effect; a satellite log line is not where they would look for why. The
-// recorder folds a repeat of the same Event into its count.
-func (r *ResourceReconciler) recordDroppedOptions(res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult) {
-	if r.Config.Recorder == nil {
-		return
-	}
-
-	for _, result := range results {
-		for _, why := range result.DroppedOptions {
-			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, droppedOptionReason, "Apply",
-				"option left out of the .res, drbdadm would refuse it: %s", why)
-		}
-	}
+	return anyFailed, waiting
 }
 
 // recordApplyFailure keeps Status.ApplyFailure in step with the pass
@@ -1024,6 +1065,29 @@ func growPending(results []*intent.ResourceApplyResult) bool {
 	}
 
 	return false
+}
+
+// droppedOptionReason is the Event reason for an option the satellite left
+// out of a replica's .res.
+const droppedOptionReason = "DrbdOptionIgnored"
+
+// recordDroppedOptions reports each option the satellite left out of the
+// replica's .res as a Warning Event on the Resource. The option is one
+// drbdadm would refuse, so leaving it out keeps the rest of the
+// configuration applying, but the operator set it and it does not take
+// effect; a satellite log line is not where they would look for why. The
+// recorder folds a repeat of the same Event into its count.
+func (r *ResourceReconciler) recordDroppedOptions(res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult) {
+	if r.Config.Recorder == nil {
+		return
+	}
+
+	for _, result := range results {
+		for _, why := range result.DroppedOptions {
+			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, droppedOptionReason, "Apply",
+				"option left out of the .res, drbdadm would refuse it: %s", why)
+		}
+	}
 }
 
 // deviceHoldsDataReason is the Event reason for a LUKS format refused over
@@ -1115,6 +1179,100 @@ func luksRefusals() []applyRefusal {
 	}
 }
 
+// applyFailedReason is the Event reason for a failed apply that is not
+// one of the applyRefusals.
+const applyFailedReason = "ApplyFailed"
+
+// applySucceededReason is the Event reason for an apply that went
+// through after failures.
+const applySucceededReason = "ApplySucceeded"
+
+// recordRecovery reports an apply that went through after `failures`
+// failed applies: an Info line and a Normal Event on the Resource. The
+// Warning Events of the failures stay on the Resource until they
+// expire and would otherwise read as a replica still down; LINSTOR
+// likewise logs a failed resource leaving its retry task and clears the
+// volume's error reports once the satellite reports it applied.
+func (r *ResourceReconciler) recordRecovery(res *blockstoriov1alpha1.Resource, failures int, logger logr.Logger) {
+	if failures == 0 {
+		return
+	}
+
+	logger.Info("Apply succeeded after failures", "failedApplies", failures)
+
+	if r.Config.Recorder == nil {
+		return
+	}
+
+	r.Config.Recorder.Eventf(res, nil, corev1.EventTypeNormal, applySucceededReason, "Apply",
+		"apply succeeded after %d failed attempts", failures)
+}
+
+// staleConnectionReason is the Event reason for a StandAlone connection
+// the apply set up again because the kernel held it with a peer
+// configuration the resource no longer has.
+const staleConnectionReason = "StaleConnectionReconnected"
+
+// recordReconnectedPeers reports each peer an apply reconnected after
+// the kernel had dropped the connection to it over a stale peer
+// configuration: a Warning Event on the Resource. Until that apply the
+// replica was StandAlone towards the peer while its own disk stayed
+// UpToDate, and nothing but this Event says why it was.
+func (r *ResourceReconciler) recordReconnectedPeers(res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult) {
+	if r.Config.Recorder == nil {
+		return
+	}
+
+	for _, result := range results {
+		for _, peer := range result.GetReconnectedPeers() {
+			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, staleConnectionReason, "Apply",
+				"%s", eventNote("the connection to "+peer+" was StandAlone with a peer configuration "+
+					"the resource no longer has; a full adjust set it up again"))
+		}
+	}
+}
+
+// applyFailureEvent is the Warning Event reason and note for a failed
+// apply with message: those of the refusal it carries (applyRefusals),
+// or ApplyFailed. Every failure gets one: a replica left StandAlone
+// because its adjust failed looks healthy from the definition's other
+// replicas, and LINSTOR reports such a failure to the client rather
+// than only to its satellite log.
+func applyFailureEvent(message string) (string, string) {
+	for _, refusal := range applyRefusals() {
+		if strings.Contains(message, refusal.err.Error()) {
+			return refusal.reason, eventNote(refusal.what + ": " + message)
+		}
+	}
+
+	return applyFailedReason, eventNote("apply failed, retrying with back-off: " + message)
+}
+
+// eventNoteLimit is the longest note the apiserver accepts on an
+// events.k8s.io/v1 Event.
+const eventNoteLimit = 1024
+
+// eventNoteEllipsis marks a note cut to eventNoteLimit.
+const eventNoteEllipsis = "..."
+
+// eventNote cuts note to eventNoteLimit bytes, on a rune boundary. The
+// apiserver rejects a longer one and the recorder drops the Event
+// without a word, and a drbdadm failure carries the whole command line
+// and stderr, past the limit with a few peers. The head names the
+// failing step; the satellite log keeps the rest.
+func eventNote(note string) string {
+	if len(note) <= eventNoteLimit {
+		return note
+	}
+
+	cut := eventNoteLimit - len(eventNoteEllipsis)
+	for cut > 0 && !utf8.RuneStart(note[cut]) {
+		cut--
+	}
+
+	return note[:cut] + eventNoteEllipsis
+}
+
 // stampPostApply runs the four best-effort post-apply stamps:
 // Status.Volumes (per-volume DevicePath), the stale-Status.Volumes
 // purge (Bug 355 followup), the Bug-107 volume-numbers annotation,
@@ -1122,7 +1280,7 @@ func luksRefusals() []applyRefusal {
 // independently fallible — we log and move on so a transient
 // apiserver hiccup on one stamp doesn't suppress the others. It
 // reports whether any of them failed, so the pass asks for another.
-func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) bool {
+func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, outcome applyOutcome, logger logr.Logger) bool {
 	// Stamp per-volume DevicePath into Status.Volumes so
 	// linstor-csi / any consumer that reads the CRD sees the
 	// /dev path the satellite materialised. Done even when one
@@ -1177,12 +1335,17 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// Bug 39: bump or clear Status.ToggleDiskRetries based on the
 	// per-resource result. The helper is a no-op when the Resource
 	// isn't mid diskless→diskful conversion, so it's safe to call
-	// unconditionally on every apply pass.
-	err = r.recordToggleDiskOutcome(ctx, res, !anyFailed)
-	if err != nil {
-		failed = true
+	// unconditionally on every apply pass. A wait for the controller's
+	// stamp is neither: a witness promoted before the controller
+	// stamped it meets that wait, and counting it as a failed attempt
+	// would spend the conversion's retries on a replica with no fault.
+	if !outcome.waiting {
+		err = r.recordToggleDiskOutcome(ctx, res, !outcome.failed)
+		if err != nil {
+			failed = true
 
-		logger.Error(err, "record toggle-disk outcome")
+			logger.Error(err, "record toggle-disk outcome")
+		}
 	}
 
 	err = r.recordApplyFailure(ctx, res, rd, results)
@@ -1193,6 +1356,14 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	}
 
 	return failed
+}
+
+// applyOutcome is how an apply pass ended: failed when a result came
+// back not Ok, waiting when every such result only waits for the
+// controller to stamp the replica, and stampFailed when a post-apply
+// stamp did not land.
+type applyOutcome struct {
+	failed, waiting, stampFailed bool
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the

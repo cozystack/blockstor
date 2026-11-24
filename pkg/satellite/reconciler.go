@@ -152,6 +152,11 @@ type ReconcilerConfig struct {
 	// and demotes via Adm, but a configured `FileSystem/Type` prop
 	// becomes a no-op rather than panicking.
 	Exec storage.Exec
+
+	// UnresolvedPoolDwell is how long a diskful replica whose volumes
+	// name no storage pool waits for one before its apply fails.
+	// Zero means unresolvedPoolDwellDefault.
+	UnresolvedPoolDwell time.Duration
 }
 
 // CrossNodeFetcher abstracts the "fetch a snapshot from a peer that
@@ -427,6 +432,19 @@ type Reconciler struct {
 	// TakeRetry once the pass is done. Serialised by mu.
 	retryAt map[string]time.Time
 
+	// adjustFailed records the resources whose last adjust failed, so
+	// the next one is a full adjust (adjustFailedBefore). The marker file
+	// beside the .res carries it across a satellite restart. A delete
+	// drops both, so a resource re-created under the name does not
+	// inherit the record.
+	adjustFailed map[string]bool
+
+	// firstUnresolvedPoolAt records, per resource name, when an apply
+	// first met the diskful replica without a storage pool. The apply
+	// waits for the pool until unresolvedPoolDwell has passed, then
+	// fails. Process-memory only; a restart starts the wait over.
+	firstUnresolvedPoolAt map[string]time.Time
+
 	// failedDRBDApply holds the resources whose last DRBD apply failed,
 	// so tearDownReidentifiedPeers reads the kernel on the next pass even
 	// when the .res already names every peer under its current node-id.
@@ -434,6 +452,16 @@ type Reconciler struct {
 	// again.
 	failedDRBDApply map[string]bool
 }
+
+// unresolvedPoolDwellDefault is how long a diskful replica without a
+// storage pool waits for one. A fresh replica the satellite sees a beat
+// before the write that gives it its pool gets the pool within seconds.
+// One still without a pool after this was created or promoted without
+// one, which nothing on the controller side fills in later, so its
+// apply fails, with the Event and the back-off that tell the operator.
+// Kept under controllerWaitReportAfter, so the wait never reads as a
+// controller that cannot stamp the replica.
+const unresolvedPoolDwellDefault = 30 * time.Second
 
 // recoveryPromoteThrottle bounds how often a single resource may fire
 // the Bug 366 recovery-promote self-heal. Generous relative to a
@@ -491,6 +519,8 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
+		adjustFailed:                map[string]bool{},
+		firstUnresolvedPoolAt:       map[string]time.Time{},
 		failedDRBDApply:             map[string]bool{},
 	}
 }
@@ -1000,35 +1030,14 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
 	}
 
-	if r.cfg.StateDir != "" {
-		// Drop the per-resource state files together. Leaving
-		// `.md-created` behind would make a re-created RD with the
-		// same name see firstActivation=false on its first apply,
-		// skip create-md, and fail drbdadm adjust with
-		// "No valid meta data found". `.owned` (Bug 432) is the
-		// sweeper's ownership marker — must be removed AFTER the
-		// kernel slot is gone so a concurrent sweeper tick sees a
-		// clean post-state (kernel + marker both absent). A
-		// candidate .res a crash left between write and rename goes
-		// too: nothing reads it, but nothing else would remove it.
-		for _, suffix := range []string{".res", ResFileCandidateSuffix, ".md-created", ".mkfs.done", ".owned", bornSoloSuffix} {
-			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
-			if err != nil && !os.IsNotExist(err) {
-				return &intent.DeleteResourceResponse{
-					Ok:      false,
-					Message: err.Error(),
-				}, nil
-			}
-		}
-
-		err := r.forgetGIHistory(req.GetName())
-		if err != nil {
-			//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
-			return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
-		}
+	err = r.removeResourceState(req.GetName())
+	if err != nil {
+		//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
+		return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
 	}
 
 	r.forgetResource(req.GetName(), req.GetVolumeNumbers())
+	r.clearUnresolvedPool(req.GetName())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
 }
@@ -1142,6 +1151,36 @@ func (r *Reconciler) takeDroppedOptions(resourceName string) []string {
 	return dropped
 }
 
+// removeResourceState drops what this satellite keeps about a deleted
+// resource beside its kernel slot and volumes: the failed-adjust record
+// and, with a StateDir, the per-resource state files and GI history.
+func (r *Reconciler) removeResourceState(name string) error {
+	r.forgetAdjustFailed(name)
+
+	if r.cfg.StateDir == "" {
+		return nil
+	}
+
+	// Drop the per-resource state files together. Leaving
+	// `.md-created` behind would make a re-created RD with the
+	// same name see firstActivation=false on its first apply,
+	// skip create-md, and fail drbdadm adjust with
+	// "No valid meta data found". `.owned` (Bug 432) is the
+	// sweeper's ownership marker — must be removed AFTER the
+	// kernel slot is gone so a concurrent sweeper tick sees a
+	// clean post-state (kernel + marker both absent). A
+	// candidate .res a crash left between write and rename goes
+	// too: nothing reads it, but nothing else would remove it.
+	for _, suffix := range []string{".res", ResFileCandidateSuffix, ".md-created", ".mkfs.done", ".owned", bornSoloSuffix, adjustFailedSuffix} {
+		err := os.Remove(filepath.Join(r.cfg.StateDir, name+suffix))
+		if err != nil && !os.IsNotExist(err) {
+			return errors.WithStack(err)
+		}
+	}
+
+	return r.forgetGIHistory(name)
+}
+
 // forgetPool drops the resource from the resource→pool map so a
 // future Apply with a different pool starts clean.
 func (r *Reconciler) forgetPool(resourceName string) {
@@ -1149,6 +1188,14 @@ func (r *Reconciler) forgetPool(resourceName string) {
 	defer r.mu.Unlock()
 
 	delete(r.resourceToPool, resourceName)
+}
+
+// failApply records err as the outcome of res, and whether it only
+// waits for the controller's stamp (WaitsForController).
+func failApply(res *intent.ResourceApplyResult, err error) {
+	res.Ok = false
+	res.Message = err.Error()
+	res.WaitingForController = WaitsForController(err)
 }
 
 // applyOne reconciles a single DesiredResource. Diskless replicas skip
@@ -1167,6 +1214,8 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 	// the way left out go back with the result.
 	defer func() { res.DroppedOptions = r.takeDroppedOptions(dr.GetName()) }()
 
+	ctx = withApplyResult(ctx, res)
+
 	diskless := isDiskless(dr.GetFlags())
 
 	r.keepGIHistoryOf(dr.GetName(), desiredVolumeNumbers(dr))
@@ -1179,16 +1228,14 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 
 	devices, resized, cloned, err := r.applyStorageIfDiskful(ctx, dr, diskless)
 	if err != nil {
-		res.Ok = false
-		res.Message = err.Error()
+		failApply(res, err)
 
 		return res
 	}
 
 	devices, luksGrew, err := r.maybeLUKS(ctx, dr, diskless, devices, resized)
 	if err != nil {
-		res.Ok = false
-		res.Message = err.Error()
+		failApply(res, err)
 
 		return res
 	}
@@ -1211,8 +1258,7 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 		r.recordDRBDApply(dr.GetName(), err)
 
 		if err != nil {
-			res.Ok = false
-			res.Message = err.Error()
+			failApply(res, err)
 
 			return res
 		}
@@ -1229,8 +1275,7 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 		// path against the raw device map from applyStorage.
 		err := r.runStorageOnlyMkfs(ctx, dr, diskless, devices)
 		if err != nil {
-			res.Ok = false
-			res.Message = err.Error()
+			failApply(res, err)
 
 			return res
 		}
@@ -1736,6 +1781,8 @@ func (r *Reconciler) applyInactive(ctx context.Context, dr *intent.DesiredResour
 // StoragePool empty) hit the no-op short-circuit at the top.
 func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.DesiredResource, diskless bool) (map[int32]string, bool, bool, error) {
 	if diskless {
+		r.clearUnresolvedPool(dr.GetName())
+
 		// Bug 330 (P1, real stand): `linstor r td --diskless` returned
 		// REST SUCCESS but `linstor r l` kept reporting the replica as
 		// `UpToDate`. Root cause: the reconciler had no detach path —
@@ -1799,19 +1846,27 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 // volume. This is the satellite's response to `linstor r td
 // --diskless` on a previously-diskful replica (Bug 330).
 //
-// Probe order matters: IsLoaded → HasDisklessVolume. A slot that
+// Probe order matters: IsLoaded → HasAttachedDisk. A slot that
 // isn't loaded at all (never brought up, or torn down by an earlier
 // DeleteResource) has nothing to detach; a slot already reporting
 // disk:Diskless has converged to the target state and re-issuing
 // detach would be a no-op shell-out but still costs a netlink
 // round-trip on every reconcile pass.
 //
-// Probe errors fall through to a best-effort detach: a transient
-// netlink hiccup shouldn't strand the toggle — the kernel will
-// either accept the detach (state already matches) or surface a
-// real error the caller wraps. The detach itself runs with --force
-// so the kernel doesn't block on outstanding I/O references when
-// the satellite has already declared the replica diskless at the
+// A slot that goes away between the two probes, as it does while an
+// operator takes the kernel resource down, is not a failed probe:
+// HasAttachedDisk reads drbdsetup's "No such resource" as no disk
+// attached, so nothing is detached, whatever the volumes name. Any
+// other failed probe falls through to a best-effort detach only when
+// the replica has a volume to reclaim, one whose pool has a provider
+// on this node: a transient netlink hiccup shouldn't strand the
+// toggle, and the LV must not be reclaimed under a disk that may
+// still be attached. A replica with nothing to reclaim, such as a
+// TieBreaker or a witness migrated from LINSTOR on the diskless pool,
+// has no disk to detach, and drbdadm refuses the detach anyway
+// because its configuration gives none. The detach itself runs with
+// --force so the kernel doesn't block on outstanding I/O references
+// when the satellite has already declared the replica diskless at the
 // REST layer.
 //
 // Why not gate inside the FSM transition table: the FSM currently
@@ -1834,13 +1889,18 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 		return nil //nolint:nilerr // probe failure is "no-op" by design
 	}
 
-	disklessVol, err := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
-	if err == nil && disklessVol {
+	attached, err := r.cfg.Adm.HasAttachedDisk(ctx, dr.GetName())
+	if err != nil && !r.hasReclaimableVolume(dr) {
+		return nil
+	}
+
+	if err == nil && !attached {
 		// Kernel has already converged to Diskless (operator-driven
-		// detach, prior reconcile pass, or a peer-driven event). No
-		// further work — re-issuing detach is harmless but the
-		// shell-out cost adds up on every reconcile of a steady-
-		// state diskless replica.
+		// detach, prior reconcile pass, or a peer-driven event), or
+		// shows no local volume at all, as a TieBreaker's slot did
+		// after its kernel resource was taken down by hand. drbdadm
+		// refuses a detach on a resource configured without a disk,
+		// and that refusal failed the apply of a diskless witness.
 		return nil
 	}
 
@@ -1850,6 +1910,19 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 	}
 
 	return nil
+}
+
+// hasReclaimableVolume reports whether reclaimVolumesForDiskless would
+// delete a volume of the diskless replica: one that names a pool with a
+// provider on this node. A pool name alone does not mean a disk, since
+// a witness migrated from LINSTOR names the diskless pool, which
+// registers no provider.
+func (r *Reconciler) hasReclaimableVolume(dr *intent.DesiredResource) bool {
+	return slices.ContainsFunc(dr.GetVolumes(), func(vol *intent.DesiredVolume) bool {
+		_, ok := r.cfg.Providers[vol.GetStoragePool()]
+
+		return ok
+	})
 }
 
 // reclaimVolumesForDiskless iterates the DesiredResource's volumes
@@ -1899,6 +1972,11 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	devices := map[int32]string{}
 	resized := false
 	cloned := false
+
+	err := r.checkStoragePoolsResolved(dr)
+	if err != nil {
+		return nil, false, false, err
+	}
 
 	for _, vol := range dr.GetVolumes() {
 		provider, ok := r.provider(vol.GetStoragePool())
@@ -5847,7 +5925,7 @@ func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredRes
 // (Stage 2), createMetadata (Stage 3a), and adjustResource (Stage
 // 3b) shadows.
 func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredResource) error {
-	err := r.cfg.Adm.Up(ctx, dr.GetName())
+	err := r.upRecorded(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "drbdadm up %s", dr.GetName())
 	}
@@ -6056,8 +6134,23 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	skipNet := r.shouldSkipNetOnAdjust(ctx, dr.GetName())
+	skipNet, stale := r.shouldSkipNetOnAdjust(ctx, dr.GetName())
+	skipNet = skipNet && !r.adjustFailedBefore(dr.GetName())
 
+	err := r.adjustAndRecover(ctx, dr, skipDisk, skipNet)
+	r.recordAdjustOutcome(ctx, dr.GetName(), skipNet, err)
+
+	if err == nil && len(stale) > 0 {
+		reportReconnectedPeers(ctx, dr.GetName(), stale)
+	}
+
+	return err
+}
+
+// adjustAndRecover runs the adjust runAdjust chose, and the recoveries
+// from the two kernel races it knows (Bug 287, the tiebreaker-relocate
+// bitmap wedge).
+func (r *Reconciler) adjustAndRecover(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
 	err := r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
 	if err == nil {
 		// Talos / minimal-distro fix: same rationale as bringUpResource.
@@ -6079,7 +6172,7 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 	// metadata; surface its error directly so the reconciler retry
 	// loop can re-converge if up also fails.
 	if isUnknownResourceErr(err) {
-		upErr := r.cfg.Adm.Up(ctx, dr.GetName())
+		upErr := r.upRecorded(ctx, dr.GetName())
 		if upErr != nil {
 			return errors.Wrapf(upErr, "drbdadm up %s (after adjust 158 fallback)", dr.GetName())
 		}
@@ -6135,7 +6228,7 @@ func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.
 		return errors.Wrapf(err, "drbdadm down %s (recovery from bitmap-bothdisks)", dr.GetName())
 	}
 
-	err = r.cfg.Adm.Up(ctx, dr.GetName())
+	err = r.upRecorded(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "drbdadm up %s (recovery from bitmap-bothdisks)", dr.GetName())
 	}
@@ -6226,11 +6319,26 @@ func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDi
 // adjust on any transient drbdsetup hiccup). The probe is
 // per-resource, so a healthy peer on a multi-peer RD still gets
 // reconnected when its own slot is in Connecting/Timeout/etc.
-func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string) bool {
+//
+// A StandAlone connection with peer devices is also what the kernel
+// leaves when it drops a connection whose handshake its own
+// configuration refused: a peer set up as diskless ("The peer is
+// configured to be diskless but presents Inconsistent") that has
+// turned diskful since, the witness a placement took over. Nobody
+// disconnected that one, and --skip-net leaves both the stale peer
+// options and the connection as they are, for good: the drift check
+// lists the resource every interval and every pass skips the very
+// change it lists. Such a connection is told apart by the plan of a
+// full adjust: for a peer the operator disconnected it is the connect
+// and nothing else, for this one it resets the peer's options first.
+// Those connections come back as stale, and the adjust is a full one.
+func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string) (bool, []string) {
 	slots, probeErr := r.cfg.Adm.Show(ctx, resource)
 	if probeErr != nil {
-		return false
+		return false, nil
 	}
+
+	var standAlone []drbd.KernelSlot
 
 	for _, slot := range slots {
 		if slot.ConnectionState != string(drbd.ConnectionStateStandAlone) {
@@ -6247,10 +6355,45 @@ func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string)
 			continue
 		}
 
-		return true
+		standAlone = append(standAlone, slot)
 	}
 
-	return false
+	if len(standAlone) == 0 {
+		return false, nil
+	}
+
+	stale := r.standAloneWithStaleConfig(ctx, resource, standAlone)
+	if len(stale) > 0 {
+		return false, stale
+	}
+
+	return true, nil
+}
+
+// standAloneWithStaleConfig names the StandAlone connections of
+// resource whose peer configuration a full adjust would change, sorted.
+// A plan that cannot be read names none, which keeps the --skip-net an
+// operator's disconnect has always had.
+func (r *Reconciler) standAloneWithStaleConfig(ctx context.Context, resource string, standAlone []drbd.KernelSlot) []string {
+	plan, err := r.cfg.Adm.AdjustPlan(ctx, resource)
+	if err != nil {
+		log.FromContext(ctx).Info("cannot read the adjust plan; keeping StandAlone connections as they are",
+			"resource", resource, "error", err.Error())
+
+		return nil
+	}
+
+	var stale []string
+
+	for _, slot := range standAlone {
+		if drbd.PlanReconfiguresPeer(plan, resource, slot.NodeID) {
+			stale = append(stale, slot.Name)
+		}
+	}
+
+	slices.Sort(stale)
+
+	return stale
 }
 
 // isUnknownResourceErr reports whether a drbdadm error is the
@@ -6463,7 +6606,8 @@ func localNodeIDFromOpts(dr *intent.DesiredResource) (int32, bool) {
 // rather than treating it as a hard, non-retryable failure — the id
 // always arrives on a subsequent reconcile once the controller's
 // allocator stamps Status.DRBDNodeID.
-var errUnresolvedLocalNodeID = errors.New("local DRBD node-id not yet allocated by controller")
+var errUnresolvedLocalNodeID = errors.Mark(
+	errors.New("local DRBD node-id not yet allocated by controller"), ErrWaitingForController)
 
 // refuseUnresolvedLocalNodeID is the Bug 360 prevention gate: it
 // returns errUnresolvedLocalNodeID when the DesiredResource carries no
@@ -6485,7 +6629,7 @@ var errUnresolvedLocalNodeID = errors.New("local DRBD node-id not yet allocated 
 // "0" (ok=true) from an absent/empty key (ok=false).
 func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 	if _, ok := localNodeIDFromOpts(dr); !ok {
-		return errUnresolvedLocalNodeID
+		return errors.WithStack(errUnresolvedLocalNodeID)
 	}
 
 	return nil
@@ -6498,7 +6642,8 @@ func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 // always arrives on a subsequent reconcile once the controller's
 // allocateResourceSpecFields / ensureSkipInitSyncDecision pass commits
 // it. Mirrors errUnresolvedLocalNodeID.
-var errUnresolvedSkipInitialSync = errors.New("Resource.Spec.SkipInitialSync not yet stamped by controller")
+var errUnresolvedSkipInitialSync = errors.Mark(
+	errors.New("Resource.Spec.SkipInitialSync not yet stamped by controller"), ErrWaitingForController)
 
 // refuseUnresolvedSkipInitialSync is the skip-init-sync prevention
 // gate: it returns errUnresolvedSkipInitialSync when this satellite is
@@ -6526,10 +6671,92 @@ var errUnresolvedSkipInitialSync = errors.New("Resource.Spec.SkipInitialSync not
 // "not stamped yet" (requeue).
 func refuseUnresolvedSkipInitialSync(dr *intent.DesiredResource, freshActivation bool) error {
 	if freshActivation && dr.GetSkipInitialSync() == nil {
-		return errUnresolvedSkipInitialSync
+		return errors.WithStack(errUnresolvedSkipInitialSync)
 	}
 
 	return nil
+}
+
+// errUnresolvedStoragePool is what applyStorage returns for a diskful
+// replica whose volumes name no storage pool yet, while it is still
+// within unresolvedPoolDwell. The satellite can see a fresh replica
+// before the write that gives it its pool, and the pool then lands as
+// an update of the Resource that runs the apply again. A pool that is
+// named but has no provider on this node stays a failure: that is a
+// pool this node cannot serve, not one on its way.
+var errUnresolvedStoragePool = errors.Mark(
+	errors.New("storage pool not yet set on the diskful replica"), ErrWaitingForController)
+
+// checkStoragePoolsResolved holds the apply of a diskful replica any of
+// whose volumes names no storage pool, before any volume is touched, so
+// a replica with some pools resolved does not half-materialise. The
+// hold is a wait (errUnresolvedStoragePool) for unresolvedPoolDwell and
+// a failed apply after it: an empty pool is either the beat before the
+// pool's write lands or a replica created or promoted without one,
+// which only the operator can fix.
+func (r *Reconciler) checkStoragePoolsResolved(dr *intent.DesiredResource) error {
+	name := dr.GetName()
+
+	unresolved := slices.ContainsFunc(dr.GetVolumes(), func(vol *intent.DesiredVolume) bool {
+		return vol.GetStoragePool() == ""
+	})
+	if !unresolved {
+		r.clearUnresolvedPool(name)
+
+		return nil
+	}
+
+	dwell := r.cfg.UnresolvedPoolDwell
+	if dwell <= 0 {
+		dwell = unresolvedPoolDwellDefault
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+
+	first, ok := r.firstUnresolvedPoolAt[name]
+	if !ok {
+		r.firstUnresolvedPoolAt[name] = now
+
+		return errors.WithStack(errUnresolvedStoragePool)
+	}
+
+	waited := now.Sub(first)
+	if waited < dwell {
+		return errors.WithStack(errUnresolvedStoragePool)
+	}
+
+	return errors.Errorf("no storage pool resolved for the diskful replica after %s: "+
+		"name one with `linstor r td <node> <rd> --storage-pool <pool>`, "+
+		"or set StorPoolName on the resource definition", waited.Round(time.Second))
+}
+
+// clearUnresolvedPool ends the wait for the storage pool of name: the
+// pool arrived, the replica went diskless, or it is gone.
+func (r *Reconciler) clearUnresolvedPool(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.firstUnresolvedPoolAt, name)
+}
+
+// ErrWaitingForController marks the errors of the gates above that
+// hold the apply until the controller stamps the replica: its DRBD
+// node-id, the SkipInitialSync decision, or, for a bounded time, a
+// diskful replica's storage pool. A fresh replica routinely meets them,
+// since the satellite sees the Resource before the controller's pass
+// that stamps it is through, and the stamp is an update of the Resource
+// that runs the apply again. The apply result carries it as WaitingForController,
+// and the caller treats such a result as a wait, not as a failed apply.
+var ErrWaitingForController = errors.New("waiting for the controller to stamp the replica")
+
+// WaitsForController reports whether err is one of the gates holding
+// the apply until the controller stamps the replica. It goes by the
+// error's identity, not its text, so a reworded gate stays a wait.
+func WaitsForController(err error) bool {
+	return errors.Is(err, ErrWaitingForController)
 }
 
 // gateBringUpReadiness refuses (requeues) the DRBD apply while a

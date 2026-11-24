@@ -548,6 +548,16 @@ type ResourceApplyResult struct {
 	Ok       bool
 	Message  string
 
+	// WaitingForController is set on a result that is not Ok only
+	// because the apply waits for the controller to stamp the replica
+	// (satellite.ErrWaitingForController): a wait, not a failed apply.
+	WaitingForController bool
+
+	// ReconnectedPeers names the peers whose StandAlone connection this
+	// apply set up again because the kernel held it with a peer
+	// configuration the resource no longer has.
+	ReconnectedPeers []string
+
 	// Volumes carries per-volume DevicePath the satellite materialised
 	// during this apply. Empty when the resource is DISKLESS or the
 	// apply chain failed before assigning a device. The c-r reconciler
@@ -599,6 +609,26 @@ func (v *ResourceApplyVolumeResult) GetAppliedSizeKib() int64 {
 	}
 
 	return v.AppliedSizeKib
+}
+
+// GetWaitingForController reports whether the result is only a wait
+// for the controller's stamp — nil-safe.
+func (x *ResourceApplyResult) GetWaitingForController() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.WaitingForController
+}
+
+// GetReconnectedPeers returns the peers this apply reconnected after
+// the kernel dropped them — nil-safe.
+func (x *ResourceApplyResult) GetReconnectedPeers() []string {
+	if x == nil {
+		return nil
+	}
+
+	return x.ReconnectedPeers
 }
 
 // GetVolumes returns the per-volume slice — nil-safe.
