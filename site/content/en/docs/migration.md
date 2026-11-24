@@ -15,13 +15,13 @@ Converted:
 
 - nodes, storage pools, resource groups, resource definitions with their volumes, replicas, and successful snapshots;
 - cluster-wide DRBD options, both the ones LINSTOR's controller acts on and the ones it keeps for its satellites, which is where `linstor controller set-property DrbdOptions/Net/...` and piraeus-operator's `LinstorCluster.spec.properties` put them;
-- DRBD minor numbers and node IDs, unchanged;
-- the shared secret, wherever LINSTOR used it to authenticate peers (see below);
-- DRBD ports, if you capture them from the running nodes (step 3 below).
+- DRBD minor numbers, node IDs and ports, unchanged;
+- the shared secret, wherever LINSTOR used it to authenticate peers (see below).
 
 Not converted, and listed in the tool's report:
 
 - Backup shipping remotes, and replicas or snapshots that LINSTOR marked as deleted or failed.
+- A resource group's `x_replicas_on_different`, the most replicas that may share one value of a node property. Blockstor has no such setting, so replicas it places from that group later are not held to it.
 - Snapshots of definitions with more than one volume are adopted with their first volume only.
 - Properties blockstor has no place for, one line per LINSTOR props container, keys only: controller runtime state such as connector ports and the cluster ID, volume and volume-group props, connection props, and the props LINSTOR freezes into a snapshot.
 - DRBD options set on a node, a storage pool or a volume definition. They are kept on the object, but blockstor renders DRBD options only from the controller, resource group, definition and replica, so the adopted resources lose them. Move them to one of those levels first.
@@ -32,16 +32,28 @@ LINSTOR writes `cram-hmac-alg sha1` and the shared secret into a resource only w
 
 1. **Check that the cluster is healthy.** `linstor resource list --faulty` is empty, every replica with data is `UpToDate`, and no node is offline. A degraded replica is adopted as it is and stays degraded.
 
-2. **Dump the LINSTOR database.** LINSTOR on Kubernetes keeps it in custom resources:
+2. **Dump the LINSTOR database.** LINSTOR on Kubernetes keeps it in custom resources. Read each one at the version its CRD stores:
 
    ```sh
    mkdir dump && cd dump
-   kubectl get crds | grep -o ".*.internal.linstor.linbit.com" \
-     | xargs -I{} sh -c 'kubectl get {} -ojson > {}.json'
+   kubectl get crds -o json \
+     | jq -r '.items[] | select(.spec.group == "internal.linstor.linbit.com")
+              | "\(.metadata.name) \(.spec.names.plural) \(.spec.versions[] | select(.storage) | .name)"' \
+     | while read -r crd plural version; do
+         kubectl get "$plural.$version.internal.linstor.linbit.com" -o json > "$crd.json" \
+           || { echo "failed to dump $crd" >&2; exit 1; }
+       done
+   jq -r '.items[].apiVersion' *.json | sort | uniq -c
    cd ..
    ```
 
-3. **Capture the DRBD ports.** LINSTOR 1.33 does not store them in its database, and it can give each node its own port for one volume. Without them, blockstor would assign new ports, and every replica would reconnect under load. Collect the port each replica listens on, from the kernel on every satellite:
+   Name the version every time. LINSTOR's CRDs serve several versions of their schema, and a plain `kubectl get <crd>` picks the oldest one, `v1-15-0`. Kubernetes then leaves out every field that version does not have, without an error. On LINSTOR 1.33 that drops the DRBD port of every replica and two fields of resource groups, so LINSTOR could not load such a dump back, and `linstor-migrate` refuses it. The last command should list one version for all files, `internal.linstor.linbit.com/v1-31-1` on LINSTOR 1.33, and `internal.linstor.linbit.com/v1` for the `linstorversion` file alone.
+
+   The dump contains the DRBD shared secrets and the encrypted LUKS passwords. Store it as carefully as the master passphrase.
+
+   **Do not delete the LINSTOR CRDs** after the migration, for as long as you might want to roll back. Their objects in the cluster are the only complete copy of the LINSTOR database, and rolling back starts LINSTOR on them.
+
+3. **Capture the DRBD ports to check them.** LINSTOR stores the port of every replica in its database, and each node can have its own port for one volume. The tool takes the ports from the dump and checks them against what the kernel listens on. If blockstor adopted a replica with a different port, the replica would reconnect under load, so when the two disagree the tool keeps the kernel's port and reports the replica. Collect the port each replica listens on, from the kernel on every satellite:
 
    ```sh
    for pod in $(kubectl -n cozy-linstor get pods -l app.kubernetes.io/component=linstor-satellite \
@@ -97,6 +109,10 @@ Read the whole report it prints. Each `warning:` line is something the tool refu
 - `keeps its DRBD metadata on a separate volume`, or `would put its DRBD metadata on a separate volume` for a replica the dump has no layer chain for. The definition is skipped with its replicas: blockstor keeps DRBD metadata on the data device, and adopted as it is the replica would get new metadata over the end of its data. Changing the property does not move existing metadata. For a replica without a chain, check in LINSTOR where its metadata is first. If it is on the data device, remove the property and convert again. Otherwise, copy the data to a volume with internal metadata in LINSTOR and convert that one.
 - `keep their DRBD metadata on the data device, though StorPoolNameDrbdMeta ... is set`. Nothing to do: the metadata is internal, because LINSTOR applies the property only to replicas created after it was set, and `.internal` asks for internal metadata. The definition converts, and the property is not carried over to the definition or its replicas, so blockstor does not look for a separate metadata volume.
 - `no DRBD port`, for a definition, for one replica, or for every replica when no node in the port map hosts one. Each replica it names gets a fresh port and reconnects on adoption, and `spec.drbdPort` cannot be changed after apply. Capture the missing ports, or fix the node names in the map, and convert again.
+- `LINSTOR's database gives DRBD port`. The database and the kernel disagree about the port of a running replica. The kernel's port is carried; find out why they differ before you cut over.
+- `no node in the live port map`. The map's node names match no replica of the definition, so its ports from the dump were not checked. Fix the node names and convert again.
+
+If the tool stops with `the LINSTOR dump was not read at its CRDs' storage version`, take the dump again as step 2 shows. A port map does not make the old dump usable, because the resource group fields are still missing from it.
 - `skipped with its replicas`. The definition's replicas cannot be adopted under one layer stack: they were built two ways, a diskful replica has no layer chain in the dump, or a replica was built otherwise than the stack the definition names. The reason in the line says which. An unreadable `layer_stack` column counts as no stack, and the line names its value. Adopted as it is, such a replica would come up under a stack it was not built with, which for a LUKS volume writes DRBD metadata over its ciphertext. Settle the stack in LINSTOR and convert again.
 - `unreadable layer_stack`. The definition's `layer_stack` column is not a list the converter can read. When its replicas agree, it takes the stack they were built with and the line names it; check that this is the stack you expect. With no diskful replica the stack is left unset and the controller pins one; see [How the stack is pinned](../layer-stack/#how-the-stack-is-pinned).
 
@@ -134,3 +150,5 @@ A definition with no layer stack whose replicas all agree takes their stack with
 ## Roll back
 
 Until CSI has been pointed at blockstor and checked, rolling back means: scale blockstor to zero, scale `linstor-controller` back up, and point CSI at LINSTOR again. Blockstor did not touch the data on disk or the running DRBD devices, so this undoes only the control plane. The pool snapshots from step 4 are the last-resort rollback for the data itself.
+
+LINSTOR comes back on the database objects that are still in the cluster. That is why step 2 says to keep the LINSTOR CRDs: a dump taken without naming the version cannot replace them, because LINSTOR refuses DRBD replicas stored without their ports.
