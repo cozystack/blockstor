@@ -72,7 +72,7 @@ func TestSnapshotReconcileBug351SuspendsAndAcks(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-1",
@@ -162,7 +162,7 @@ func TestSnapshotReconcileBug351TakeSnapshotAfterAck(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-1",
@@ -255,7 +255,7 @@ func TestSnapshotReconcileBug351ResumesWhenSuspendCleared(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-1",
@@ -347,7 +347,7 @@ func TestSnapshotReconcileBug351AbortStampsFailedOnSuspendError(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-1",

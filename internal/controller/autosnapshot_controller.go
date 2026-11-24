@@ -522,7 +522,7 @@ func (r *AutoSnapshotRunnable) restoreReadsFrom(ctx context.Context, rdName, sna
 
 // RegisterWithManager wires the runnable into the controller-runtime
 // manager. Symmetrical to other Runnables in this package
-// (storage_sweeper, ObserverRunnable).
+// (OrphanSweeperRunnable, ObserverRunnable).
 func (r *AutoSnapshotRunnable) RegisterWithManager(mgr manager.Manager) error {
 	err := mgr.Add(r)
 	if err != nil {

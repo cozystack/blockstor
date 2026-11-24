@@ -50,6 +50,12 @@ func (r *Reconciler) RecoverFromBitmapBothDisksForTest(ctx context.Context, dr *
 	return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, adjustErr)
 }
 
+// RememberPoolForTest records the pool backing a resource, as an applied
+// replica does.
+func (r *Reconciler) RememberPoolForTest(resourceName, pool string) {
+	r.rememberPool(resourceName, pool)
+}
+
 // DrbdGrossKibForTest re-exports the backing size a grow gives a DRBD
 // volume with internal metadata.
 func DrbdGrossKibForTest(netKib int64) int64 {

@@ -82,6 +82,7 @@ type restoreCall struct {
 
 type recvCall struct {
 	Target storage.Volume
+	Source storage.Snapshot
 	Body   string
 }
 
@@ -167,13 +168,13 @@ func (f *fakeShipperProvider) SendSnapshot(_ context.Context, snap storage.Snaps
 
 // RecvSnapshot — storage.SnapshotShipper half. Drains the stream
 // (so EOF is reached) and records the bytes for assertion.
-func (f *fakeShipperProvider) RecvSnapshot(_ context.Context, target storage.Volume, src io.Reader) error {
+func (f *fakeShipperProvider) RecvSnapshot(_ context.Context, target storage.Volume, source storage.Snapshot, src io.Reader) error {
 	body, _ := io.ReadAll(src)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.recvCalls = append(f.recvCalls, recvCall{Target: target, Body: string(body)})
+	f.recvCalls = append(f.recvCalls, recvCall{Target: target, Source: source, Body: string(body)})
 
 	return f.recvErr
 }
@@ -335,6 +336,12 @@ func TestCrossNodeCloneDispatchesToZFSShipper(t *testing.T) {
 
 	if got, want := prov.recvCalls[0].Body, "zfs-send-stream-bytes"; got != want {
 		t.Errorf("RecvSnapshot body: got %q, want %q", got, want)
+	}
+
+	// The receiver is told which snapshot the stream carries, so a ZFS
+	// receive can remove the copy of it that `zfs recv` leaves behind.
+	if got, want := prov.recvCalls[0].Source, (storage.Snapshot{ResourceName: "pvc-src", SnapshotName: "snap-1"}); got != want {
+		t.Errorf("RecvSnapshot source: got %+v, want %+v", got, want)
 	}
 
 	if got := len(prov.createCalls); got != 0 {

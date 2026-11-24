@@ -141,6 +141,14 @@ const warnStoragePoolNotFound = maskWarn | int64(2055)
 // filters can match the whole class with `(ret_code & 0xFFFE) >= 2048`.
 const warnSnapshotNotFound = maskWarn | int64(2056)
 
+// warnDeleteInProgress is the second entry of a replica or definition
+// delete answer when a replica is still there once the answer is due: its
+// satellite has not confirmed yet that the replica's storage is gone, and the
+// replica stays, flagged DELETE, until it does. LINSTOR's answer to the same
+// situation is a warning too; nothing is removed early to make the answer
+// look finished.
+const warnDeleteInProgress = maskWarn | int64(2061)
+
 // warnNoSatelliteConnection is emitted as a SECOND envelope entry on
 // `POST /v1/nodes` when the node was created in the controller's view
 // of the cluster but no satellite has registered itself for the named
