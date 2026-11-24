@@ -1028,12 +1028,42 @@ func (a *Adm) CurrentGI(ctx context.Context, resource string, volume int32, devi
 		return "", err
 	}
 
-	current, _, found := strings.Cut(tuple, ":")
-	if !found || current == "" {
-		return "", nil
+	return currentOfGITuple(tuple), nil
+}
+
+// KernelCurrentGI returns the current-UUID the kernel holds for one
+// volume, through `drbdsetup get-gi <resource> <peer-node-id>
+// <volume>`. drbdsetup answers from the device statistics over
+// netlink; it does not open the backing device, so udev sees no close
+// and sends no change uevent. drbdmeta does, for the device and each
+// of its partitions.
+//
+// The kernel copy is also the one DRBD acts on. A write that mints a
+// new current UUID syncs it to disk at once, but other GI changes
+// reach the disk only with md_sync_timer, up to 5 s later.
+//
+// drbdsetup needs a peer device to name the volume by, so a replica
+// with no peer has to be read with CurrentGI. Empty string (not an
+// error) when the tuple can't be parsed, as CurrentGI.
+func (a *Adm) KernelCurrentGI(ctx context.Context, resource string, peerNodeID, volume int32) (string, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "get-gi", resource,
+		strconv.Itoa(int(peerNodeID)), strconv.Itoa(int(volume)))
+	if err != nil {
+		return "", errors.Wrapf(err, "drbdsetup get-gi %s/%d peer %d", resource, volume, peerNodeID)
 	}
 
-	return strings.ToUpper(current), nil
+	return currentOfGITuple(strings.TrimSpace(string(out))), nil
+}
+
+// currentOfGITuple returns the current-UUID of a get-gi tuple, upper
+// case, or empty when the tuple has none.
+func currentOfGITuple(tuple string) string {
+	current, _, found := strings.Cut(tuple, ":")
+	if !found || current == "" {
+		return ""
+	}
+
+	return strings.ToUpper(current)
 }
 
 // StatusResources runs `drbdsetup status` and returns the names of
