@@ -44,8 +44,10 @@ func TestLowerDiskKibExternalMetadata(t *testing.T) {
 
 // TestGrowLowerDisk covers when a definition grow resizes the lower disk
 // and the device, and that volumes created before lower disks were sized
-// for metadata are not resized by an upgrade alone. The grow step is the
-// satellite's (growBacking), with DRBD on for the volumes that have it.
+// for metadata are not resized by an upgrade alone, nor by a replica
+// added to them later. The grow step is the satellite's (growBacking),
+// with DRBD on for the volumes that have it. applied is the size the
+// replica last reported applied, 0 for one that never reported.
 func TestGrowLowerDisk(t *testing.T) {
 	t.Parallel()
 
@@ -58,16 +60,23 @@ func TestGrowLowerDisk(t *testing.T) {
 	cases := []struct {
 		name               string
 		definition, device int64
-		onDisk             int64
+		onDisk, applied    int64
 		wantResized        bool
 		wantStorageGrow    bool
 	}{
-		{"unchanged volume sized for metadata", gib20, 20972116, sizedDisk, false, false},
-		{"volume adopted from LINSTOR", gib20, adoptedDev, 20976048, false, false},
-		{"volume created at the definition's size", gib20, 20961884, gib20, false, false},
-		{"small grow the lower disk already holds", gib20 + 100, 20972116 - 1000, sizedDisk, true, false},
-		{"small grow past the data the lower disk holds", gib20 + 4096, gib20, sizedDisk, true, true},
-		{"grow past the lower disk", 21 * 1024 * 1024, 20972116, sizedDisk, true, true},
+		{"unchanged volume sized for metadata", gib20, 20972116, sizedDisk, gib20, false, false},
+		{"volume adopted from LINSTOR", gib20, adoptedDev, 20976048, gib20, false, false},
+		{"volume created at the definition's size", gib20, 20961884, gib20, gib20, false, false},
+		{"small grow the lower disk already holds", gib20 + 100, 20972116 - 1000, sizedDisk, gib20, true, false},
+		{"small grow past the data the lower disk holds", gib20 + 4096, gib20, sizedDisk, gib20, true, true},
+		{"grow past the lower disk", 21 * 1024 * 1024, 20972116, sizedDisk, gib20, true, true},
+		// A replica added to a volume whose other backings are exactly
+		// the definition: its own backing is sized for metadata, the
+		// device stays short of the definition, and nothing resized the
+		// definition. LINSTOR leaves the device alone, before and after
+		// the replica first reports its size.
+		{"new replica of a volume created at the definition's size", gib20, 20961884, sizedDisk, 0, false, false},
+		{"replica of a volume created at the definition's size", gib20, 20961884, sizedDisk, gib20, false, false},
 	}
 
 	luksOnly := []struct {
@@ -89,7 +98,7 @@ func TestGrowLowerDisk(t *testing.T) {
 			fx := storage.NewFakeExec()
 			provider := zfs.NewProvider(zfs.Config{Pool: "data", Thin: true}, fx)
 			dr := &intent.DesiredResource{Name: "pvc-l", LayerStack: []string{"LUKS", "STORAGE"}}
-			vol := &intent.DesiredVolume{SizeKib: tc.definition}
+			vol := &intent.DesiredVolume{SizeKib: tc.definition, AppliedSizeKib: gib20}
 
 			r := NewReconciler(ReconcilerConfig{})
 
@@ -112,7 +121,7 @@ func TestGrowLowerDisk(t *testing.T) {
 			fx := storage.NewFakeExec()
 			provider := zfs.NewProvider(zfs.Config{Pool: "data", Thin: true}, fx)
 			dr := &intent.DesiredResource{Name: "pvc-g"}
-			vol := &intent.DesiredVolume{SizeKib: tc.definition, DeviceSizeKib: tc.device}
+			vol := &intent.DesiredVolume{SizeKib: tc.definition, DeviceSizeKib: tc.device, AppliedSizeKib: tc.applied}
 
 			r := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(storage.NewFakeExec())})
 

@@ -143,8 +143,7 @@ type growStep struct {
 // planGrow decides the grow step for vol, whose backing has usableKib.
 //
 // A grow is pending when the definition is larger than the backing, or
-// than the size the replica last reported applied, or than what the
-// volume holds while the backing is larger (grownPastHeld). The backing is then
+// than the size the replica last reported applied. The backing is then
 // grown to what the layers above need (growBackingKib): growing it only
 // to the definition size left a DRBD device short of the definition by
 // its metadata, and an adopted LINSTOR volume, whose backing already
@@ -152,6 +151,16 @@ type growStep struct {
 // in the old backing. When the backing is large enough, the layers are
 // resized again (an earlier pass grew the backing but its resize
 // failed), unless resizeRetryLimit passes already did so in vain.
+//
+// Only a change of the definition grows the device, as LINSTOR resizes
+// a DRBD volume only while its definition is being resized. A device
+// smaller than the definition with no such change is the volume's size:
+// a volume created before backings were sized for metadata has backings
+// of exactly the definition, so its device is short of the definition
+// by the metadata. A replica added to it later gets a backing sized for
+// metadata, larger than the definition, and resizing the device from
+// that replica would fail while it resyncs and, once enough replicas
+// were replaced, grow the volume nobody resized.
 func (r *Reconciler) planGrow(dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64, withDRBD bool) growStep {
 	applied := vol.GetAppliedSizeKib()
 	lagging := applied > 0 && vol.GetSizeKib() > applied
@@ -159,9 +168,7 @@ func (r *Reconciler) planGrow(dr *intent.DesiredResource, vol *intent.DesiredVol
 	// A provider that cannot tell the backing size (usableKib 0) gives
 	// no grow signal of its own; the replica's report still does.
 	backingShort := usableKib > 0 && vol.GetSizeKib() > usableKib
-	held := grownPastHeld(dr, vol, usableKib)
-
-	if !backingShort && !lagging && !held {
+	if !backingShort && !lagging {
 		r.forgetGrow(dr.GetName(), vol.GetVolumeNumber())
 
 		return growStep{}
@@ -181,37 +188,9 @@ func (r *Reconciler) planGrow(dr *intent.DesiredResource, vol *intent.DesiredVol
 		return step
 	}
 
-	step.retryResize = (lagging || held) && r.resizeRetriesLeft(dr.GetName(), vol)
+	step.retryResize = lagging && r.resizeRetriesLeft(dr.GetName(), vol)
 
 	return step
-}
-
-// grownPastHeld reports a grow the size the replica last applied does not
-// show: the definition passed what the volume holds, while the backing,
-// sized for metadata or a LUKS header, is still larger than the
-// definition. What the volume holds is the DRBD device every replica
-// reports, or, without DRBD, the backing less a LUKS header on it. Such
-// a grow stays inside the backing and still needs the device resized,
-// the backing grown first when it cannot hold the new data area.
-//
-// It is told apart by the backing being larger than the definition: one
-// created before backings were sized for metadata is exactly the
-// definition's size, its device is smaller than the definition, and
-// taking that for a grow would resize every such volume on upgrade. A
-// backing grown to exactly the new definition is indistinguishable from
-// it and is left alone.
-func grownPastHeld(dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64) bool {
-	want := vol.GetSizeKib()
-
-	held := vol.GetDeviceSizeKib()
-	if !needsDRBD(dr.GetLayerStack()) {
-		held = usableKib
-		if needsLUKS(dr.GetLayerStack()) {
-			held -= luks2HeaderKib
-		}
-	}
-
-	return usableKib > want && held > 0 && want > held
 }
 
 // resizeRetry counts the passes that re-ran the resize for one size and
