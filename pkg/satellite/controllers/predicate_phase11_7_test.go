@@ -20,13 +20,19 @@ package controllers
 
 import (
 	"context"
+	"maps"
+	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -258,6 +264,120 @@ func TestPrimaryWatchFiresOnAllocatorStamp(t *testing.T) {
 }
 
 // -----------------------------------------------------------------
+// siblingWatchPredicate tests.
+// -----------------------------------------------------------------
+
+// TestSiblingWatchDropsObserverChurn pins the filter on other nodes'
+// Resources: the writes a peer's observer makes on every kernel frame
+// (connections, role, in-use, out-of-sync, conditions) must not
+// re-queue this node's replica. On a node holding a hundred replicas
+// they kept the queue full and a new Resource waited minutes.
+func TestSiblingWatchDropsObserverChurn(t *testing.T) {
+	t.Parallel()
+
+	pred := siblingWatchPredicate()
+
+	base := func() *blockstoriov1alpha1.Resource {
+		return &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.n2", Generation: 3},
+			Status: blockstoriov1alpha1.ResourceStatus{
+				DRBDNodeID: int32Ptr(1),
+				DRBDPort:   int32Ptr(7000),
+				DRBDMinor:  int32Ptr(1000),
+				Volumes: []blockstoriov1alpha1.ResourceVolumeStatus{
+					{VolumeNumber: 0, DiskState: "UpToDate", CurrentGI: "AB", OutOfSyncKib: 0},
+				},
+				Connections: []blockstoriov1alpha1.ResourceConnectionStatus{
+					{PeerNodeName: "n1", Connected: true, Message: "Connected"},
+					{PeerNodeName: "n3", Connected: true, Message: "Connected"},
+				},
+			},
+		}
+	}
+
+	churn := map[string]func(*blockstoriov1alpha1.Resource){
+		"connections reordered": func(r *blockstoriov1alpha1.Resource) {
+			slices.Reverse(r.Status.Connections)
+		},
+		"connection state": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Connections[0].Connected = false
+			r.Status.Connections[0].Message = "Connecting"
+		},
+		"role and in-use": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Role = "Primary"
+			r.Status.InUse = true
+		},
+		"out-of-sync counter": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Volumes[0].OutOfSyncKib = 4096
+		},
+		"condition": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Conditions = []metav1.Condition{{Type: "MetadataCreated", Status: metav1.ConditionTrue}}
+		},
+	}
+
+	for name, mutate := range churn {
+		newR := base()
+		mutate(newR)
+
+		if pred.Update(event.UpdateEvent{ObjectOld: base(), ObjectNew: newR}) {
+			t.Errorf("%s: predicate re-queued the local replica", name)
+		}
+	}
+}
+
+// TestSiblingWatchPassesWhatTheApplyReads pins the other half: every
+// peer change the local apply derives something from still wakes the
+// local replica.
+func TestSiblingWatchPassesWhatTheApplyReads(t *testing.T) {
+	t.Parallel()
+
+	pred := siblingWatchPredicate()
+
+	base := func() *blockstoriov1alpha1.Resource {
+		return &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.n2", Generation: 3},
+			Status: blockstoriov1alpha1.ResourceStatus{
+				DRBDNodeID: int32Ptr(1),
+				DRBDPort:   int32Ptr(7000),
+				DRBDMinor:  int32Ptr(1000),
+				Volumes: []blockstoriov1alpha1.ResourceVolumeStatus{
+					{VolumeNumber: 0, DiskState: "Inconsistent", CurrentGI: "AB"},
+				},
+			},
+		}
+	}
+
+	now := metav1.Now()
+
+	relevant := map[string]func(*blockstoriov1alpha1.Resource){
+		"spec change":      func(r *blockstoriov1alpha1.Resource) { r.Generation++ },
+		"deletion started": func(r *blockstoriov1alpha1.Resource) { r.DeletionTimestamp = &now },
+		"node id":          func(r *blockstoriov1alpha1.Resource) { r.Status.DRBDNodeID = int32Ptr(2) },
+		"port":             func(r *blockstoriov1alpha1.Resource) { r.Status.DRBDPort = nil },
+		"minor":            func(r *blockstoriov1alpha1.Resource) { r.Status.DRBDMinor = int32Ptr(1001) },
+		"disk state":       func(r *blockstoriov1alpha1.Resource) { r.Status.Volumes[0].DiskState = "UpToDate" },
+		"current gi":       func(r *blockstoriov1alpha1.Resource) { r.Status.Volumes[0].CurrentGI = "CD" },
+		"volume added": func(r *blockstoriov1alpha1.Resource) {
+			r.Status.Volumes = append(r.Status.Volumes, blockstoriov1alpha1.ResourceVolumeStatus{VolumeNumber: 1})
+		},
+		"volume renumbered": func(r *blockstoriov1alpha1.Resource) { r.Status.Volumes[0].VolumeNumber = 1 },
+	}
+
+	for name, mutate := range relevant {
+		newR := base()
+		mutate(newR)
+
+		if !pred.Update(event.UpdateEvent{ObjectOld: base(), ObjectNew: newR}) {
+			t.Errorf("%s: predicate dropped a change the local apply reads", name)
+		}
+	}
+
+	if !pred.Create(event.CreateEvent{Object: base()}) || !pred.Delete(event.DeleteEvent{Object: base()}) {
+		t.Errorf("peer create/delete must always wake the local replica")
+	}
+}
+
+// -----------------------------------------------------------------
 // Observer-trigger tests (Phase 11.7 second leg).
 // -----------------------------------------------------------------
 
@@ -284,6 +404,152 @@ func TestObserverEmitsTriggerOnRoleChange(t *testing.T) {
 	}
 }
 
+// TestObserverKeepsTheWakeUpWhenTheTriggerIsFull: the observer must not
+// block the events2 reader on a full trigger channel, and must not drop
+// the wake-up either. It used to drop it and count on the periodic
+// re-check to pass the replica later; with no periodic pass the replica
+// would keep a kernel state change unanswered until its next event.
+func TestObserverKeepsTheWakeUpWhenTheTriggerIsFull(t *testing.T) {
+	t.Parallel()
+
+	observer, ch, adm := newTriggerObserver(t, 1)
+
+	ch <- event.GenericEvent{Object: &blockstoriov1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: "filler"}}}
+
+	done := make(chan struct{})
+
+	go func() {
+		observer.handleObservation(t.Context(), adm, &observation{
+			ResourceName: "pvc-1",
+			InUse:        true,
+			Role:         "Primary",
+			HasResource:  true,
+		})
+
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(triggerTestTimeout):
+		t.Fatal("the observer blocked on a full trigger channel")
+	}
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "filler" {
+		t.Fatalf("first trigger %q, want the one that filled the channel", got.Object.GetName())
+	}
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "pvc-1.n1" {
+		t.Errorf("trigger %q, want pvc-1.n1", got.Object.GetName())
+	}
+}
+
+// TestObserverCoalescesWakeUpsTheTriggerHasNoRoomFor: in a reconnect
+// storm the trigger channel fills, and the same replica changes state
+// many times before there is room again. It waits at most once besides
+// the wake-up being handed over: a pass reads the state it acts on when
+// it runs, so one covers every change before it, where a goroutine per
+// dropped wake-up both piled up without bound and ran the replica once
+// per change.
+func TestObserverCoalescesWakeUpsTheTriggerHasNoRoomFor(t *testing.T) {
+	t.Parallel()
+
+	observer, ch, adm := newTriggerObserver(t, 1)
+
+	ch <- event.GenericEvent{Object: &blockstoriov1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: "filler"}}}
+
+	for i := range 50 {
+		state := "UpToDate"
+		if i%2 == 1 {
+			state = "Inconsistent"
+		}
+
+		observer.handleObservation(t.Context(), adm, &observation{
+			ResourceName: "pvc-1",
+			DrbdState:    state,
+			Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: state}},
+		})
+	}
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "filler" {
+		t.Fatalf("first trigger %q, want the one that filled the channel", got.Object.GetName())
+	}
+
+	// The wake-up being handed over when the channel filled, and at
+	// most one more for the changes that came while it waited.
+	wakeUps := 0
+
+	for {
+		select {
+		case got := <-ch:
+			if got.Object.GetName() != "pvc-1.n1" {
+				t.Fatalf("trigger %q, want pvc-1.n1", got.Object.GetName())
+			}
+
+			wakeUps++
+
+			continue
+		case <-time.After(triggerTestTimeout):
+		}
+
+		break
+	}
+
+	if wakeUps < 1 || wakeUps > 2 {
+		t.Errorf("%d wake-ups of pvc-1.n1 for 50 changes behind a full channel, want 1 or 2", wakeUps)
+	}
+}
+
+// TestObserverWakesAfterAFailedNameRead: the observer names the local
+// replica to wake from the definition and node it reads. When that read
+// fails the wake-up cannot go out, and the next frame with the same
+// state must not be taken for one already delivered: nothing periodic
+// would wake the replica after it.
+func TestObserverWakesAfterAFailedNameRead(t *testing.T) {
+	t.Parallel()
+
+	var failing atomic.Bool
+
+	failing.Store(true)
+
+	cli := fake.NewClientBuilder().
+		WithScheme(newToggleDiskTestScheme(t)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*blockstoriov1alpha1.ResourceDefinition); ok && failing.Load() {
+					return apierrors.NewServiceUnavailable("apiserver hiccup")
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	fx := storage.NewFakeExec()
+	ch := make(chan event.GenericEvent, 4)
+	observer := &ObserverRunnable{Client: cli, Exec: fx, NodeName: "n1", ReconcileTrigger: ch}
+	adm := drbd.NewAdm(fx)
+
+	frame := func() *observation {
+		return &observation{
+			ResourceName: "pvc-1",
+			DrbdState:    "UpToDate",
+			Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: "UpToDate"}},
+		}
+	}
+
+	observer.handleObservation(t.Context(), adm, frame())
+	assertNoTrigger(t, ch)
+
+	failing.Store(false)
+
+	observer.handleObservation(t.Context(), adm, frame())
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "pvc-1.n1" {
+		t.Errorf("trigger %q, want pvc-1.n1", got.Object.GetName())
+	}
+}
+
 // TestObserverEmitsTriggerOnDiskChange pins the device-kind path: a
 // per-volume disk-state frame (UpToDate / Inconsistent / Diskless)
 // emits a trigger. Without the wake-up the satellite's recovery
@@ -304,6 +570,74 @@ func TestObserverEmitsTriggerOnDiskChange(t *testing.T) {
 	got := readOneTrigger(t, ch)
 	if got.Object.GetName() != "pvc-1.n1" {
 		t.Errorf("trigger object name: got %q, want pvc-1.n1", got.Object.GetName())
+	}
+}
+
+// TestObserverEmitsTriggerOnPeerRoleChange: the latch-free mkfs retry
+// and the recovery and late-add promotes refuse while a connected peer
+// is Primary and wait for it to step down. The step-down reaches this
+// node only as a connection frame carrying the peer's role, and the
+// periodic re-check that used to come back for the refused step is
+// gone; so a peer's role change wakes the local replica, and a frame
+// that repeats the role does not.
+func TestObserverEmitsTriggerOnPeerRoleChange(t *testing.T) {
+	t.Parallel()
+
+	observer, ch, adm := newTriggerObserver(t, 4)
+
+	frame := func(fields map[string]string) *observation {
+		t.Helper()
+
+		all := map[string]string{"name": "pvc-1", "peer-node-id": "1", "conn-name": "n2"}
+		maps.Copy(all, fields)
+
+		obs, ok := translateEvent(drbd.Event{Action: eventActionChange, Kind: eventKindConnection, Fields: all})
+		if !ok {
+			t.Fatalf("frame %v dropped", fields)
+		}
+
+		return &obs
+	}
+
+	observer.handleObservation(context.Background(), adm,
+		frame(map[string]string{"connection": "Connected", "role": "Primary"}))
+	readOneTrigger(t, ch)
+
+	// drbd-reactor demotes after a failed mount: a change frame that
+	// carries the role alone.
+	observer.handleObservation(context.Background(), adm, frame(map[string]string{"role": "Secondary"}))
+
+	if got := readOneTrigger(t, ch); got.Object.GetName() != "pvc-1.n1" {
+		t.Errorf("trigger %q, want pvc-1.n1", got.Object.GetName())
+	}
+
+	if c := observer.connCache["pvc-1"]["n2"]; !c.Connected || c.Message != "Connected" {
+		t.Errorf("a role-only frame changed the connection state: %+v", c)
+	}
+
+	observer.handleObservation(context.Background(), adm, frame(map[string]string{"role": "Secondary"}))
+	assertNoTrigger(t, ch)
+}
+
+// TestObserverRoleFrameNeedsAKnownPeer: a role alone does not make a
+// peer, and a peer that drops its connection has no role the observer
+// knows.
+func TestObserverRoleFrameNeedsAKnownPeer(t *testing.T) {
+	t.Parallel()
+
+	peers := map[string]connectionObservation{}
+
+	mergeConnectionInto(peers, &connectionObservation{PeerNodeName: "n2", PeerRole: "Primary"})
+
+	if _, ok := peers["n2"]; ok {
+		t.Fatal("a role-only frame created a peer")
+	}
+
+	mergeConnectionInto(peers, &connectionObservation{PeerNodeName: "n2", Connected: true, Message: "Connected", PeerRole: "Primary"})
+	mergeConnectionInto(peers, &connectionObservation{PeerNodeName: "n2", Message: "Connecting"})
+
+	if role := peers["n2"].PeerRole; role != "" {
+		t.Errorf("a disconnected peer kept the role %q", role)
 	}
 }
 
@@ -386,19 +720,63 @@ func TestObserverHandlesNilTriggerChannel(t *testing.T) {
 }
 
 // -----------------------------------------------------------------
-// RequeueAfter safety-net test (Phase 11.7 third leg).
+// Converged apply test (Phase 11.7 third leg, retired).
 // -----------------------------------------------------------------
 
-// TestRunApplyReturnsRequeueAfterForActiveDrbd pins the safety-net
-// invariant: a successful apply on a DRBD-stacked Resource MUST
-// schedule a periodic re-eval via RequeueAfter so the reconciler
-// self-evaluates against current kernel state even when the events2
-// stream misses a frame. Without this, the predicate's noise filter
-// + the trigger channel's lifecycle-only emit could leave an active
-// DRBD resource un-re-eval'd for arbitrarily long after a frame
-// drop.
-func TestRunApplyReturnsRequeueAfterForActiveDrbd(t *testing.T) {
+// TestConvergedDrbdApplyAsksForNoRequeue: a successful apply on a
+// DRBD-stacked Resource that put nothing off schedules no further pass.
+// The periodic re-check it used to schedule ran a full pass of every
+// replica every ten seconds; on a node with a hundred replicas that was
+// about half a core spent while nothing changed. Kernel drift reaches
+// the replica through the drift check instead.
+func TestConvergedDrbdApplyAsksForNoRequeue(t *testing.T) {
 	t.Parallel()
+
+	reconciler, req := convergedDrbdFixture(t, interceptor.Funcs{})
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter: got %v, want none for a converged replica", result.RequeueAfter)
+	}
+}
+
+// TestFailedStampAsksForARetry: the stamps after a successful apply are
+// best effort, and a failed one used to wait for the periodic re-check.
+// With none left, a pass whose volume-numbers stamp hit an apiserver
+// hiccup has to ask for another itself, or the record a later delete
+// needs (Bug 107) is never written while nothing else happens to the
+// replica.
+func TestFailedStampAsksForARetry(t *testing.T) {
+	t.Parallel()
+
+	reconciler, req := convergedDrbdFixture(t, interceptor.Funcs{
+		Patch: func(ctx context.Context, cli client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*blockstoriov1alpha1.Resource); ok {
+				return apierrors.NewServiceUnavailable("apiserver hiccup")
+			}
+
+			return cli.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if result.RequeueAfter <= 0 {
+		t.Errorf("RequeueAfter: got %v, want a retry after a failed stamp", result.RequeueAfter)
+	}
+}
+
+// convergedDrbdFixture is a DRBD-stacked replica whose allocator stamp
+// is in place, so a pass runs the whole apply and the stamps after it.
+func convergedDrbdFixture(t *testing.T, funcs interceptor.Funcs) (*ResourceReconciler, ctrl.Request) {
+	t.Helper()
 
 	const (
 		node   = "n1"
@@ -456,6 +834,7 @@ func TestRunApplyReturnsRequeueAfterForActiveDrbd(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(rd, res, storagePool, nodeObj).
 		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		WithInterceptorFuncs(funcs).
 		Build()
 
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -473,23 +852,13 @@ func TestRunApplyReturnsRequeueAfterForActiveDrbd(t *testing.T) {
 		},
 	}
 
-	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: rdName + "." + node},
-	})
-	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if result.RequeueAfter != activeDRBDRequeue {
-		t.Errorf("RequeueAfter: got %v, want %v (Phase 11.7 safety net)",
-			result.RequeueAfter, activeDRBDRequeue)
-	}
+	return reconciler, ctrl.Request{NamespacedName: types.NamespacedName{Name: rdName + "." + node}}
 }
 
 // noopProvider is the smallest storage.Provider implementation that
 // satisfies the satellite reconciler's contract for the
 // "happy-path apply" tests: every per-volume operation is a no-op.
-// Used by the active-DRBD-RequeueAfter test where we care only
+// Used by the converged-DRBD apply test where we care only
 // about the post-apply control flow, not the underlying storage
 // provider's behaviour.
 type noopProvider struct{}

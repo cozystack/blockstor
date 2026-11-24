@@ -374,13 +374,15 @@ type SnapshotStore interface {
 	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)
 
 	// ListByDefinitionUncached answers the same question from the API server
-	// when the store has a direct reader. It exists for `rd d`: the refusal
-	// over existing snapshots and the sweep for the one that raced the delete
-	// are both acted on at once, and the row most likely to be missing from a
-	// cache at that moment is exactly the one that raced. Every other listing
-	// stays on ListByDefinition, since the snapshot view paginates through it
-	// and an uncached read beside a cached one is the pagination regression
-	// the store's constructor records.
+	// when the store has a direct reader. It is for readers that act on the
+	// answer at once, where the row most likely to be missing from or stale
+	// in a cache is exactly the one that matters: `rd d` (the refusal over
+	// existing snapshots and the sweep for the one that raced the delete),
+	// the per-definition list linstor-csi reads right after a snapshot delete
+	// to decide whether the definition can go, the snapshot delete's own
+	// read, and the clone paths. The paginated /v1/view/snapshots stays on
+	// the cached List, since an uncached read beside a cached one is the
+	// pagination regression the store's constructor records.
 	ListByDefinitionUncached(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)
 	Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error)
 	Create(ctx context.Context, snap *apiv1.Snapshot) error
