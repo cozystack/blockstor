@@ -1073,6 +1073,11 @@ func (w *DRBDWorkaroundsRunnable) reportReconnectWait(logger logr.Logger, replic
 // nothing open until its mkfs opens the device. The demote the satellite
 // owes after its own auto-promote is retried by the apply itself
 // (pkg/satellite auto_demote.go); this check covers the kernel's.
+// It does not ask what promoted the replica: a `drbdadm primary --force`
+// nobody opens looks the same as a stuck auto-promote, and the
+// LINSTOR-mode plunger demotes both, so an operator who keeps a forced
+// Primary keeps it open (tests/e2e/recovery-primary-force.sh) or turns
+// the check off.
 
 // idlePrimaryPasses is how many passes in a row a resource must be an
 // idle Primary before it is demoted.

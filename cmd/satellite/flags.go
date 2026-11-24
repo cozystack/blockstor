@@ -117,7 +117,10 @@ func registerWorkaroundFlags(flagSet *flag.FlagSet, cfg *controllers.Workarounds
 			"the connect stays owed, and with three replicas neither Secondary has quorum to be promoted until an "+
 			"operator runs the `drbdadm connect` the Warning Event names.")
 	flagSet.BoolVar(&cfg.IdlePrimary, "drbd-workaround-idle-primary", def.IdlePrimary,
-		"Demote a Primary with no volume open (DRBD auto-demote not firing, piraeus-operator#942).")
+		"Demote a Primary with no volume open on two passes in a row (DRBD auto-demote not firing, "+
+			"piraeus-operator#942). This includes a Primary an operator raised with `drbdadm primary --force`: "+
+			"the kernel shows no difference, and the LINSTOR-mode plunger demotes it too. Keep the device open, "+
+			"or turn this off, to keep such a Primary.")
 	flagSet.BoolVar(&cfg.ForcedIOFailures, "drbd-workaround-forced-io-failures", def.ForcedIOFailures,
 		"Take down and up a Secondary with no volume open that still forces I/O failures (LINBIT/drbd#153).")
 	flagSet.BoolVar(&cfg.StaleLoopDevices, "drbd-workaround-stale-loop-devices", def.StaleLoopDevices,
