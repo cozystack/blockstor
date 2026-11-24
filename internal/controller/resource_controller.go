@@ -45,6 +45,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/conflict"
+	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/finalizers"
@@ -1360,6 +1361,13 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 
 	for i := range peers {
 		if naming.Same(peers[i].Name, targetName) {
+			continue
+		}
+
+		// A peer being deleted may be the replica of an earlier
+		// definition under this name: its UpToDate generation is that
+		// volume's, and seeding from it skips the seed this one needs.
+		if dispatcher.ReplicaLeaving(&peers[i]) {
 			continue
 		}
 

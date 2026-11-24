@@ -48,6 +48,11 @@ type resourceDefinitions struct {
 	// NotFound we re-read live before concluding the RD is absent. nil in
 	// non-production stores (in-memory / unit) → keep the cached result.
 	apiReader ctrlclient.Reader
+
+	// replicas is read past the cache before a create: a name whose
+	// replicas of an earlier definition are still being deleted is
+	// refused (store.RefuseOverDrainingReplicas).
+	replicas *resources
 }
 
 func (s *resourceDefinitions) List(ctx context.Context) ([]apiv1.ResourceDefinition, error) {
@@ -95,6 +100,18 @@ func (s *resourceDefinitions) GetUncached(ctx context.Context, name string) (api
 func (s *resourceDefinitions) Create(ctx context.Context, in *apiv1.ResourceDefinition) error {
 	if in == nil {
 		return errors.New("nil ResourceDefinition")
+	}
+
+	if s.replicas != nil {
+		replicas, err := s.replicas.ListByDefinitionUncached(ctx, in.Name)
+		if err != nil {
+			return errors.Wrapf(err, "list the replicas under %q", in.Name)
+		}
+
+		err = store.RefuseOverDrainingReplicas(in.Name, replicas)
+		if err != nil {
+			return err //nolint:wrapcheck // already names the definition and wraps store.ErrAlreadyExists
+		}
 	}
 
 	crd := wireToCRDRD(in)

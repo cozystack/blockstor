@@ -347,8 +347,9 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
-		// FAIL_EXISTS_RSC_DFN on a duplicate: linstor-csi takes it for a
-		// concurrent CreateVolume that made the definition first.
+		// Typed, so a duplicate name, or one whose earlier definition is
+		// still draining replicas, carries FAIL_EXISTS_RSC_DFN as LINSTOR's
+		// does.
 		writeStoreErrorTyped(w, err, storeKindResourceDfn)
 
 		return
@@ -1263,11 +1264,20 @@ func (s *Server) deleteDefinitionData(ctx context.Context, name string) ([]apiv1
 	// Upstream LINSTOR does this server-side too: deleting an RD
 	// flags the RD with DELETE, then walks Resources and stamps
 	// DELETE on each. The satellite drives the teardown from
-	// there. Our equivalent is: per-child Resources().Delete()
-	// stamps DeletionTimestamp on the CRD; the satellite's
+	// there. Our equivalent is: the RD is flagged DELETE first
+	// (store.MarkDefinitionDeleting, which keeps the tiebreaker
+	// reconciler off it and lifts the mid-sync replica guard), then
+	// per-child Resources().Delete() stamps DeletionTimestamp on the
+	// CRD; the satellite's
 	// existing `blockstor.org/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
+	err = store.MarkDefinitionDeleting(ctx, s.Store, name)
+	if err != nil {
+		//nolint:wrapcheck // MarkDefinitionDeleting names the definition
+		return nil, err
+	}
+
 	err = s.cascadeDeleteResources(ctx, name)
 	if err != nil {
 		return nil, err
@@ -1317,7 +1327,10 @@ func (s *Server) deleteDefinitionData(ctx context.Context, name string) ([]apiv1
 	// `linstor rd d <rd>` returns SUCCESS and the very next
 	// `linstor r l` shows phantom rows for 5–30 s until the cache
 	// catches up on its watch stream. See pkg/rest/cache_invalidation.go.
-	converged := s.waitForRDDeletionVisible(ctx, name)
+	// Before that, the reachable satellites tear their replicas down, as
+	// LINSTOR waits for them, so a create of the same name that follows
+	// is not refused over them (waitForOnlineReplicasDrained).
+	converged := s.waitForRDTeardown(ctx, name)
 
 	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
