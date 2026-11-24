@@ -224,7 +224,7 @@ func TestVolumeList(t *testing.T) {
 			AllocatedKib: 1 << 20,
 			State:        apiv1.VolumeState{DiskState: "UpToDate"},
 		}},
-	}})
+	}}, nil)
 
 	assertColumns(t, tbl, []string{"Node", "Resource", "StoragePool", "VolumeNr", "MinorNr", "DeviceName", "Allocated", "InUse", "State"})
 
