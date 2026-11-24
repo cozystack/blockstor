@@ -20,6 +20,8 @@ package validate
 
 import (
 	"errors"
+	"slices"
+	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
@@ -72,6 +74,12 @@ func MidSyncDeleteRefusal(target *apiv1.Resource, siblings []apiv1.Resource) boo
 			continue
 		}
 
+		// A peer already on its way out is not stranded by losing its
+		// source: nothing will ever read what it was syncing.
+		if slices.Contains(sib.Flags, apiv1.ResourceFlagDelete) {
+			continue
+		}
+
 		switch {
 		case resourceIsConfirmedUpToDateSource(sib):
 			confirmedSources++
@@ -87,6 +95,75 @@ func MidSyncDeleteRefusal(target *apiv1.Resource, siblings []apiv1.Resource) boo
 	}
 
 	return midSyncPeers > 0
+}
+
+// DefinitionBeingDeleted reports whether the whole definition is being
+// taken apart, as opposed to one replica of a volume that stays. replicas
+// are the definition's replicas as they stand.
+//
+// MidSyncDeleteRefusal protects the data of a volume that outlives the
+// delete. LINSTOR has no such check on any delete path; blockstor keeps it
+// for a single replica dropped from a live volume, and nowhere else. When
+// every replica is going, a peer left Inconsistent is about to go too, and
+// refusing the source only strands the delete: the volume can then never
+// be removed at all.
+//
+// Two shapes say the definition is going. The DELETE flag is LINSTOR's own
+// mark for `rd d`, and it settles the question. linstor-csi's DeleteVolume
+// never sends `rd d` first: it sets BalanceResourcesEnabled=False on the
+// definition, waits until no replica is InUse, then deletes the replicas
+// one by one and the volume definitions after them; the definition itself
+// goes only when no snapshot still needs it (pkg/client/linstor.go,
+// Delete). That property write is the only notice the replica deletes get
+// that they are one volume teardown.
+//
+// The same property is what an operator sets to place replicas by hand,
+// and a hand placement is exactly where U130 happens: a second diskful
+// added next to a diskless Primary and the original dropped before the
+// sync finishes. So the property alone counts only while nothing is
+// InUse, which is the state DeleteVolume waits for and a volume with a
+// Primary is never in.
+func DefinitionBeingDeleted(rd *apiv1.ResourceDefinition, replicas []apiv1.Resource) bool {
+	if rd == nil {
+		return false
+	}
+
+	if slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
+		return true
+	}
+
+	if !strings.EqualFold(rd.Props[apiv1.PropBalanceResourcesEnabled], "false") {
+		return false
+	}
+
+	return !slices.ContainsFunc(replicas, func(res apiv1.Resource) bool {
+		return res.State.InUse != nil && *res.State.InUse
+	})
+}
+
+// SortForDeletion orders replicas the way they are safe to delete one at a
+// time: the diskful replicas that are not complete copies yet first, every
+// other replica after them in its original order.
+//
+// It matters where the mid-sync guard runs between two deletes, which is
+// `r d` naming several nodes: naming a source before the replica syncing
+// from it would have the guard refuse the source over a peer the same
+// command was about to delete. Once the incomplete replica is deleted it
+// carries DELETE, and MidSyncDeleteRefusal no longer counts it. It does not
+// order the teardown itself: a delete only stamps the replica, and the
+// satellites take DRBD down in parallel.
+func SortForDeletion(replicas []apiv1.Resource) {
+	slices.SortStableFunc(replicas, func(a, b apiv1.Resource) int {
+		return deletionRank(&a) - deletionRank(&b)
+	})
+}
+
+func deletionRank(res *apiv1.Resource) int {
+	if ResourceIsDiskful(res) && resourceIsMidSync(res) {
+		return 0
+	}
+
+	return 1
 }
 
 // ResourceIsDiskful reports whether a replica carries real backing storage

@@ -609,7 +609,10 @@ func (s *Server) writeRestoreMaterialiseFailed(
 //
 // A replica still being deleted, or one holding no data, carries no
 // FAIL_EXISTS band: the replica it names is not one that exists for the
-// caller to use, and the 409 is the retryable failure it is.
+// caller to use, and the 409 is the retryable failure it is. A definition
+// whose predecessor is still draining replicas does carry
+// FAIL_EXISTS_RSC_DFN: LINSTOR still holds that definition, flagged DELETE,
+// and answers a create of its name with that band.
 func materialiseRefusalKind(err error) (storeResourceKind, bool) {
 	var partial *materialiseAfterCreateError
 	if errors.As(err, &partial) {
@@ -619,7 +622,7 @@ func materialiseRefusalKind(err error) (storeResourceKind, bool) {
 	switch {
 	case errors.Is(err, errReplicaStillDeleting):
 		return storeKindUnknown, true
-	case errors.Is(err, errAdoptedLeftoverRollingBack):
+	case errors.Is(err, errAdoptedLeftoverRollingBack), errors.Is(err, store.ErrDefinitionReplicasDraining):
 		return storeKindResourceDfn, true
 	default:
 		return storeKindUnknown, true
@@ -1550,7 +1553,10 @@ func (s *Server) createOrAdoptRestoredRD(ctx context.Context, newRD *apiv1.Resou
 		return true, "", nil
 	}
 
-	if !errors.Is(err, store.ErrAlreadyExists) {
+	// A name whose earlier definition is still draining replicas has no
+	// definition to adopt: read as a leftover, the refusal turned into a
+	// NotFound for a definition that is still being deleted.
+	if !errors.Is(err, store.ErrAlreadyExists) || errors.Is(err, store.ErrDefinitionReplicasDraining) {
 		return false, "", err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 

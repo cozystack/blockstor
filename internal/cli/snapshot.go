@@ -448,6 +448,12 @@ func restoreIntoExistingTarget(
 ) error {
 	rdName := args.toResource
 
+	// No definition to restore into: its predecessor is still draining
+	// replicas, and the refusal names their nodes.
+	if store.IsReplicasDraining(createErr) {
+		return fmt.Errorf("restore %s onto %s: %w", snap.Name, rdName, createErr)
+	}
+
 	existing, err := run.Store.ResourceDefinitions().Get(ctx, rdName)
 	if err != nil {
 		return fmt.Errorf("get resource definition %s: %w", rdName, err)

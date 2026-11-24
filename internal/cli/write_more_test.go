@@ -25,6 +25,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	"github.com/cozystack/blockstor/pkg/store/storetest"
 )
 
 func seedDefinition(ctx context.Context, backend store.Store) {
@@ -356,5 +357,192 @@ func TestResourceGroupSpawnEnforcesBounds(t *testing.T) {
 
 	if got := app.Run(t.Context(), []string{"rg", "spawn", "grp", "pvc-x", "1024K"}); got == 0 {
 		t.Error("spawn accepted a sub-floor volume size")
+	}
+}
+
+// `r d` naming every replica of a volume still in its initial sync, the
+// source first: the Inconsistent replica is deleted before the copies it
+// depends on, so the last complete copy is never refused over a peer the
+// same command was about to delete.
+func TestResourceDeleteOfEveryReplicaMidInitialSync(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedDefinition(ctx, backend)
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "node-b", "pvc-x"}); got != 0 {
+		t.Fatalf("delete exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	resources, err := appStore(t, app).Resources().List(t.Context())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(resources) != 0 {
+		t.Errorf("replicas survived the delete: %+v", resources)
+	}
+}
+
+// The last complete copy of a volume that stays is still refused.
+func TestResourceDeleteOfLastCompleteCopyStaysGuarded(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedDefinition(ctx, backend)
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "pvc-x"}); got == 0 {
+		t.Fatal("the last complete copy was deleted while a peer was still syncing")
+	}
+}
+
+// A replica delete on a definition linstor-csi's DeleteVolume is tearing
+// down (balancing switched off first) is not guarded: every replica is
+// going, so the Inconsistent one is not stranded.
+func TestResourceDeleteDuringVolumeTeardownIsNotGuarded(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:  "pvc-x",
+			Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"},
+		})
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "pvc-x"}); got != 0 {
+		t.Fatalf("delete exit = %d (stderr: %s)", got, errBuf.String())
+	}
+}
+
+// `rd d` flags the definition DELETE before the first replica goes, the
+// way the REST door does.
+func TestDefinitionDeleteFlagsDefinitionBeforeItsReplicas(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedDefinition(ctx, backend)
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+	})
+
+	rec := storetest.NewDeleteRecorder(appStore(t, app))
+	app.StoreFor = func(context.Context) (store.Store, error) { return rec, nil }
+
+	if got := app.Run(t.Context(), []string{"rd", "d", "pvc-x"}); got != 0 {
+		t.Fatalf("delete exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	deletes := rec.Deletes()
+	if len(deletes) != 2 {
+		t.Errorf("deletes = %+v, want both replicas", deletes)
+	}
+
+	for _, d := range deletes {
+		if !d.DefinitionFlagged {
+			t.Errorf("replica on %s deleted before the definition was flagged DELETE", d.Node)
+		}
+	}
+}
+
+// U130 on a definition placed by hand: balancing off, a diskless Primary,
+// a diskful replica still syncing. Deleting the complete copy stays
+// refused; only a teardown with nothing InUse lifts the guard.
+func TestResourceDeleteWithBalancingOffAndAPrimaryStaysGuarded(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:  "pvc-x",
+			Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"},
+		})
+
+		for node, disk := range map[string]string{
+			"node-a": "UpToDate",
+			"node-b": "Inconsistent",
+		} {
+			_ = backend.Resources().Create(ctx, &apiv1.Resource{
+				Name: "pvc-x", NodeName: node,
+				Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: disk}}},
+			})
+		}
+
+		inUse := true
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-x", NodeName: "node-p",
+			Flags: []string{apiv1.ResourceFlagDiskless},
+			State: apiv1.ResourceState{InUse: &inUse},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "pvc-x"}); got == 0 {
+		t.Fatal("the Primary's last complete copy was deleted while a peer was still syncing")
+	}
+}
+
+// A definition read that fails refuses the delete rather than skipping the
+// guard.
+func TestResourceDeleteRefusedWhenTheDefinitionCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedDefinition(ctx, backend)
+
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-x", NodeName: "node-a",
+			Volumes: []apiv1.Volume{{State: apiv1.VolumeState{DiskState: "UpToDate"}}},
+		})
+	})
+
+	backend := appStore(t, app)
+	app.StoreFor = func(context.Context) (store.Store, error) {
+		return storetest.FailingDefinitionGet{Store: backend}, nil
+	}
+
+	if got := app.Run(t.Context(), []string{"r", "d", "node-a", "pvc-x"}); got == 0 {
+		t.Fatal("delete went through although the definition could not be read")
+	}
+
+	if _, err := backend.Resources().Get(t.Context(), "pvc-x", "node-a"); err != nil {
+		t.Errorf("node-a was deleted: %v", err)
 	}
 }
