@@ -33,6 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/satellite/controllers"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
@@ -158,5 +160,66 @@ func TestSatelliteReportsAFinalizerWriteThatFailed(t *testing.T) {
 				t.Fatalf("reconcile returned %v, want the write error", err)
 			}
 		})
+	}
+}
+
+// A snapshot status stamp retries its write a bounded number of times.
+// Every satellite of the snapshot stamps its own entry in the same
+// status at about the same moment, so on a busy take the budget can
+// run out; that is still a lost race, retried like any other, and not
+// a "Reconciler error" at ERROR.
+func TestSatelliteRetriesASnapshotStatusStampThatRanOutOfRetries(t *testing.T) {
+	t.Parallel()
+
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pvc-c.snap-c",
+			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-c",
+			SnapshotName:           "snap-c",
+			Nodes:                  []string{"n1"},
+			SuspendIO:              true,
+		},
+	}
+
+	cli := interceptor.NewClient(
+		fake.NewClientBuilder().
+			WithScheme(newSnapshotScheme(t)).
+			WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+			WithObjects(snap).
+			Build(),
+		interceptor.Funcs{
+			SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+				return objectModified("snapshots", "pvc-c.snap-c")
+			},
+		},
+	)
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm suspend-io pvc-c", storage.FakeResponse{})
+
+	reconciler := &controllers.SnapshotReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "n1",
+			Apply: satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{},
+				Adm:       drbd.NewAdm(fx),
+			}),
+			Exec: fx,
+		},
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-c.snap-c"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile returned %v, want the exhausted stamp retried without an error", err)
+	}
+
+	if !result.Requeue { //nolint:staticcheck // the rate-limited retry an error would get
+		t.Errorf("result %+v, want a requeue", result)
 	}
 }

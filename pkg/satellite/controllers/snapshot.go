@@ -459,6 +459,8 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeFailed(
 ) error {
 	key := client.ObjectKeyFromObject(snap)
 
+	var lastConflict error
+
 	for attempt := range snapshotStatusUpdateRetries {
 		_ = attempt
 
@@ -504,9 +506,11 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeFailed(
 		if !apierrors.IsConflict(err) {
 			return errors.Wrap(err, "stamp Status.Flags=FAILED + NodeStatus.Failed")
 		}
+
+		lastConflict = err
 	}
 
-	return errors.New("Status FAILED stamp conflicted out of retries")
+	return errors.Wrap(lastConflict, "Status FAILED stamp conflicted out of retries")
 }
 
 // upsertPerNodeStatusField is the Status.NodeStatus
@@ -522,6 +526,8 @@ func (r *SnapshotReconciler) upsertPerNodeStatusField(
 	mutate func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
 ) error {
 	key := client.ObjectKeyFromObject(snap)
+
+	var lastConflict error
 
 	for attempt := range snapshotStatusUpdateRetries {
 		_ = attempt
@@ -550,9 +556,11 @@ func (r *SnapshotReconciler) upsertPerNodeStatusField(
 		if !apierrors.IsConflict(err) {
 			return errors.Wrap(err, "stamp Status.NodeStatus")
 		}
+
+		lastConflict = err
 	}
 
-	return errors.New("Status.NodeStatus update conflicted out of retries")
+	return errors.Wrap(lastConflict, "Status.NodeStatus update conflicted out of retries")
 }
 
 // upsertPerNodeStatusInPlace finds the per-node entry for
@@ -675,6 +683,8 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
 ) error {
 	key := client.ObjectKeyFromObject(snap)
 
+	var lastConflict error
+
 	for attempt := range snapshotStatusUpdateRetries {
 		_ = attempt
 
@@ -710,11 +720,13 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
 			return errors.Wrap(err, "stamp Status.NodeStatus")
 		}
 
+		lastConflict = err
+
 		// Conflict — sibling satellite raced our write. Re-fetch
 		// and try again. The loop budget bounds the worst case.
 	}
 
-	return errors.New("Status.NodeStatus update conflicted out of retries")
+	return errors.Wrap(lastConflict, "Status.NodeStatus update conflicted out of retries")
 }
 
 // snapshotStatusUpdateRetries bounds the optimistic-lock retry
@@ -850,6 +862,8 @@ func (r *SnapshotReconciler) stampSnapshotDeleteFailure(
 
 	key := client.ObjectKeyFromObject(snap)
 
+	var lastConflict error
+
 	for range snapshotStatusUpdateRetries {
 		var current blockstoriov1alpha1.Snapshot
 
@@ -885,9 +899,11 @@ func (r *SnapshotReconciler) stampSnapshotDeleteFailure(
 		if !apierrors.IsConflict(err) {
 			return errors.Wrap(err, "stamp Status.DeleteFailures")
 		}
+
+		lastConflict = err
 	}
 
-	return errors.New("Status.DeleteFailures stamp conflicted out of retries")
+	return errors.Wrap(lastConflict, "Status.DeleteFailures stamp conflicted out of retries")
 }
 
 // snapshotNodePredicate filters Snapshot events to those whose
