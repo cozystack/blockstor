@@ -280,11 +280,12 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 // created with and its lower disk sized for: the replica's own, which
 // the controller copies from the definition when it allocates the
 // replica's identities, else the definition's, which is what the
-// controller is about to copy. nil, for a replica and definition that
-// both predate the count, is read as the 15 they were created with.
+// controller is about to copy. nil, for a replica that had a node id
+// before counts were recorded or whose definition has none either, is
+// read as the 15 it was created with.
 func replicaPeerSlots(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) *int32 {
 	slots := target.Spec.PeerSlots
-	if slots == nil && rd != nil {
+	if slots == nil && rd != nil && !target.PeerSlotsPredateRecord() {
 		slots = rd.Spec.PeerSlots
 	}
 

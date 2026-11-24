@@ -113,3 +113,67 @@ func TestReplicaPeerSlotsAreNotRestamped(t *testing.T) {
 		t.Errorf("got %v, want the replica's own 7", got)
 	}
 }
+
+// A replica that already had a node id when the controller first sees it
+// without a count predates the record: a blockstor that kept no count
+// created its metadata with 15, so it is stamped 15 whatever its
+// definition says now. Its identities are otherwise settled, so the pass
+// that stamps it must not take the settled-identities shortcut.
+func TestPreexistingReplicaIsStampedFifteen(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	const (
+		rdName       = "old-rd"
+		resourceName = rdName + ".n1"
+	)
+
+	seven, nodeID, port, minor := int32(7), int32(0), int32(7000), int32(1000)
+	skip := false
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			PeerSlots: &seven,
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024, DRBDMinor: &minor},
+			},
+		},
+	}
+
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               "n1",
+			DRBDNodeID:             &nodeID,
+			DRBDPort:               &port,
+			SkipInitialSync:        &skip,
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			DRBDNodeID: &nodeID,
+			DRBDPort:   &port,
+			DRBDMinor:  &minor,
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}, &blockstoriov1alpha1.ResourceDefinition{}).
+		WithObjects(rd, res).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+
+	reconcileToSteadyState(t, ctx, rec, resourceName)
+
+	got := &blockstoriov1alpha1.Resource{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: resourceName}, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if got.Spec.PeerSlots == nil || *got.Spec.PeerSlots != 15 {
+		t.Errorf("got %v, want 15, the count its metadata was created with", got.Spec.PeerSlots)
+	}
+}

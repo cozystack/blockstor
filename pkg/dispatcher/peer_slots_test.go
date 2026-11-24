@@ -25,11 +25,12 @@ import (
 )
 
 // TestReplicaPeerSlots: the satellite gets the replica's own count; a
-// replica the controller has not stamped yet gets its definition's, which
-// is what the controller stamps; one whose definition has none either is
-// left without, which the satellite reads as the 15 it was created with.
-// A count changed on the definition does not reach a replica that has
-// its own.
+// new replica the controller has not stamped yet gets its definition's,
+// which is what the controller stamps; one whose definition has none
+// either, or one that already had a node id before the count was
+// recorded, is left without, which the satellite reads as the 15 it was
+// created with. A count changed on the definition does not reach a
+// replica that has its own.
 func TestReplicaPeerSlots(t *testing.T) {
 	t.Parallel()
 
@@ -37,8 +38,10 @@ func TestReplicaPeerSlots(t *testing.T) {
 
 	for name, tc := range map[string]struct {
 		replica, definition *int32
+		nodeID              *int32
 		want                *int32
 	}{
+		"predates the record":                {definition: ptr(7), nodeID: ptr(0)},
 		"replica's own":                      {replica: ptr(7), definition: ptr(12), want: ptr(7)},
 		"definition's before stamp":          {definition: ptr(12), want: ptr(12)},
 		"neither":                            {},
@@ -49,6 +52,7 @@ func TestReplicaPeerSlots(t *testing.T) {
 
 			target := &blockstoriov1alpha1.Resource{}
 			target.Spec.PeerSlots = tc.replica
+			target.Spec.DRBDNodeID = tc.nodeID
 
 			rd := &blockstoriov1alpha1.ResourceDefinition{}
 			rd.Spec.PeerSlots = tc.definition

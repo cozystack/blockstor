@@ -714,17 +714,23 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		// and the natural, persistence-free source for it.
 		CreateTimestamp: crdCreateTimestampMs(crd),
 		ApplyFailure:    applyFailureFromStatus(crd.Status.ApplyFailure),
-		PeerSlots:       peerSlotsOf(crd.Spec.PeerSlots),
+		PeerSlots:       peerSlotsOf(crd),
 	}
 }
 
-// peerSlotsOf is a recorded peer-slot count on the wire, zero for none.
-func peerSlotsOf(stored *int32) int32 {
-	if stored == nil {
+// peerSlotsOf is a replica's peer-slot count on the wire: the recorded
+// one, 15 for a replica that had a node id before counts were recorded,
+// zero for a new replica not stamped yet.
+func peerSlotsOf(crd *crdv1alpha1.Resource) int32 {
+	if crd.PeerSlotsPredateRecord() {
+		return drbd.LegacyPeerSlots
+	}
+
+	if crd.Spec.PeerSlots == nil {
 		return 0
 	}
 
-	return *stored
+	return *crd.Spec.PeerSlots
 }
 
 // applyFailureFromStatus projects the satellite's last apply error onto

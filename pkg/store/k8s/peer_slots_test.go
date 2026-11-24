@@ -151,3 +151,31 @@ func TestReplicaPeerSlotsSurviveAWireWrite(t *testing.T) {
 			old.PeerSlots, old.LayerObject.Drbd, err)
 	}
 }
+
+// A replica that had a node id before its count was recorded reads as
+// the 15 its metadata was created with, not as its definition's count,
+// until the controller stamps it: the peer-slot check counts it so.
+func TestReplicaThatPredatesTheRecordReadsFifteen(t *testing.T) {
+	t.Parallel()
+
+	nodeID := int32(1)
+	res := &crdv1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-a.n1"},
+		Spec: crdv1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-a",
+			NodeName:               "n1",
+			DRBDNodeID:             &nodeID,
+		},
+	}
+
+	st, _ := peerSlotsStore(t, res)
+
+	got, err := st.Resources().Get(t.Context(), "pvc-a", "n1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if got.PeerSlots != 15 {
+		t.Errorf("got %d, want 15", got.PeerSlots)
+	}
+}

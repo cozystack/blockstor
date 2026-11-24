@@ -752,6 +752,15 @@ type ResourceList struct {
 	Items           []Resource `json:"items"`
 }
 
+// PeerSlotsPredateRecord reports a replica that got its DRBD node id
+// before blockstor recorded its peer slots: such a replica's metadata was
+// created with 15, whatever its definition's count is now. A new replica
+// gets its count in the same write as its node id, so it never has one
+// without the other.
+func (r *Resource) PeerSlotsPredateRecord() bool {
+	return r.Spec.PeerSlots == nil && (r.Spec.DRBDNodeID != nil || r.Status.DRBDNodeID != nil)
+}
+
 func init() {
 	SchemeBuilder.Register(&Resource{}, &ResourceList{})
 }
