@@ -2681,8 +2681,14 @@ func (r *Reconciler) dropOldConnection(ctx context.Context, resource string, nod
 	delErr := r.cfg.Adm.DelPeerByNodeID(ctx, resource, nodeID)
 
 	forgotten := false
+
 	if withMetadata {
-		forgotten = r.cfg.Adm.ForgetPeer(ctx, resource, nodeID) == nil
+		forgetErr := r.cfg.Adm.ForgetPeer(ctx, resource, nodeID)
+		forgotten = forgetErr == nil
+
+		if forgetErr != nil {
+			log.FromContext(ctx).Info("forget-peer failed (non-fatal)", "nodeID", nodeID, "err", forgetErr.Error())
+		}
 	}
 
 	if delErr == nil || forgotten {
@@ -6271,7 +6277,7 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	skipNet, stale := r.shouldSkipNetOnAdjust(ctx, dr.GetName())
+	skipNet, stale := r.shouldSkipNetOnAdjust(ctx, dr)
 	skipNet = skipNet && !r.adjustFailedBefore(dr.GetName())
 
 	err := r.adjustAndRecover(ctx, dr, skipDisk, skipNet)
@@ -6319,65 +6325,102 @@ func (r *Reconciler) adjustAndRecover(ctx context.Context, dr *intent.DesiredRes
 		return nil
 	}
 
-	// Recover from the tiebreaker-relocate StandAlone wedge:
-	// when the controller re-allocates DRBDNodeID for a returning
-	// TIE_BREAKER onto a fresh peer-slot, the surviving diskful's
-	// v09 metadata for that slot reads back as
-	// `peer-disk:Outdated` (default-initialised bitmap-uuid). The
-	// failing adjust hits `peer-device-options --bitmap=no` and
-	// the kernel refuses with `(162) Can not drop the bitmap when
-	// both sides have a disk`. recoverFromBitmapBothDisks below
-	// runs a full down + up + adjust cycle so the next adjust
-	// reads peer-disk from a fresh handshake (DUnknown) rather
-	// than from the stale metadata default — see
-	// tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
+	// Recover from the tiebreaker-relocate StandAlone wedge: a
+	// diskless peer came up under a node-id whose metadata slot
+	// still reads its diskful predecessor as `peer-disk:Outdated`,
+	// and the kernel refuses `peer-device-options --bitmap=no` with
+	// `(162) Can not drop the bitmap when both sides have a disk`
+	// — see tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
 	if drbd.IsBitmapDropBothDisksErr(err) {
-		return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, skipNet)
+		return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, err)
 	}
 
 	return errors.Wrapf(err, "adjust %s", dr.GetName())
 }
 
-// recoverFromBitmapBothDisks executes the down + up + adjust
-// recovery for the tiebreaker-relocate StandAlone wedge.
-// Without this recovery the first failed adjust leaves the
-// returning TB's kernel slot StandAlone with peer-device entries
-// kernel-registered (the new-peer call ran before peer-device-
-// options failed); shouldSkipNetOnAdjust then permanently
-// latches `--skip-net` for that slot and the slot stays
-// StandAlone forever.
+// recoverFromBitmapBothDisks answers the kernel's refusal to drop the
+// bitmap of a peer the .res names diskless. The refusal comes from the
+// peer's metadata slot, which still describes the diskful replica that
+// held its node-id before: nothing forgot that slot when the replica
+// went. LINSTOR's satellite forgets a deleted peer's slot (del-peer,
+// then forget-peer); this does the same for the node-ids adjustErr
+// names, then adjusts again.
 //
-// Bounded to a single bounce per adjust pass: the recovery
-// retries dispatchAdjust once; if the second adjust still
-// fails, bubble the error so the reconciler retry loop
-// re-converges on the next tick instead of looping in-place.
+// Only a connection that is not Connected is dropped. Nothing flows
+// over it, so dropping it touches neither the local disk nor its role:
+// a Primary keeps its device open, and the local replica stays up even
+// when it holds the only UpToDate copy. A Connected peer's disk state is
+// live rather than read from the slot, so the refusal is real (the peer
+// has not detached yet) and the error goes back to the retry loop, as
+// LINSTOR leaves a failed adjust. The resource is never taken down here:
+// a `drbdadm down` would demote a Primary, or detach the last good
+// copy, and the refusal of a device held open is the only thing that
+// kept it from doing so.
 //
-// Down on a Primary-Open resource would block, but the
-// signature only fires on the moment a returning TB joins —
-// the wedge surfaces on the surviving diskful side which is
-// Secondary (unmounted at the moment the TB respawns).
-func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
-	log.FromContext(ctx).Info("adjust failed with bitmap-bothdisks; recovering via down + up + adjust",
-		"resource", dr.GetName())
-
-	err := r.cfg.Adm.Down(ctx, dr.GetName())
+// A single pass: if the second adjust still fails, the error goes to
+// the reconciler retry loop instead of looping in place.
+func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.DesiredResource, skipDisk bool, adjustErr error) error {
+	dropped, err := r.forgetStalePeerSlots(ctx, dr.GetName(), drbd.BitmapDropPeerNodeIDs(adjustErr))
 	if err != nil {
-		return errors.Wrapf(err, "drbdadm down %s (recovery from bitmap-bothdisks)", dr.GetName())
+		return errors.Wrapf(err, "adjust %s: %s", dr.GetName(), adjustErr.Error())
 	}
 
-	err = r.upRecorded(ctx, dr.GetName())
-	if err != nil {
-		return errors.Wrapf(err, "drbdadm up %s (recovery from bitmap-bothdisks)", dr.GetName())
+	if len(dropped) == 0 {
+		return errors.Wrapf(adjustErr, "adjust %s", dr.GetName())
 	}
+
+	log.FromContext(ctx).Info("adjust failed with bitmap-bothdisks; forgot the peer slots and adjusting again",
+		"resource", dr.GetName(), "nodeIDs", dropped)
+
+	// The dropped slots no longer count toward --skip-net, so the
+	// adjust re-adds their peers unless another peer is held
+	// StandAlone on purpose.
+	skipNet, _ := r.shouldSkipNetOnAdjust(ctx, dr)
 
 	err = r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
 	if err != nil {
-		return errors.Wrapf(err, "adjust %s (after bitmap-bothdisks recovery)", dr.GetName())
+		return errors.Wrapf(err, "adjust %s (after forgetting peer slots %v)", dr.GetName(), dropped)
 	}
 
 	r.ensureDeviceNodes(ctx, dr)
 
 	return nil
+}
+
+// forgetStalePeerSlots drops and forgets the kernel connection of each
+// node-id in nodeIDs that is not Connected, and returns the node-ids it
+// dropped. A node-id the kernel holds no connection for is skipped.
+func (r *Reconciler) forgetStalePeerSlots(ctx context.Context, resource string, nodeIDs []int32) ([]int32, error) {
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+
+	slots, err := r.cfg.Adm.Show(ctx, resource)
+	if err != nil {
+		return nil, errors.Wrap(err, "read the kernel connections")
+	}
+
+	var dropped []int32
+
+	for _, slot := range slots {
+		if !slices.Contains(nodeIDs, slot.NodeID) ||
+			slot.ConnectionState == string(drbd.ConnectionStateConnected) {
+			continue
+		}
+
+		// The refusal means the local replica has a disk, so its
+		// metadata holds the slot.
+		err := r.dropOldConnection(ctx, resource, slot.NodeID, true)
+		if err != nil {
+			return dropped, errors.Wrapf(err, "drop the connection to node-id %d", slot.NodeID)
+		}
+
+		dropped = append(dropped, slot.NodeID)
+	}
+
+	slices.Sort(dropped)
+
+	return dropped, nil
 }
 
 // dispatchAdjust picks the right `drbdadm adjust` variant for the
@@ -6451,6 +6494,9 @@ func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDi
 // re-issues `drbdsetup connect` and unwedges scenario 5.32
 // (`tests/e2e/recovery-down-reverses.sh`).
 //
+// A StandAlone slot the bitmap refusal left behind is not counted
+// either; see isStaleDisklessPeerSlot.
+//
 // Best-effort: a probe error returns false so adjust falls through
 // to the existing full-adjust path (failing closed would freeze
 // adjust on any transient drbdsetup hiccup). The probe is
@@ -6469,7 +6515,9 @@ func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDi
 // full adjust: for a peer the operator disconnected it is the connect
 // and nothing else, for this one it resets the peer's options first.
 // Those connections come back as stale, and the adjust is a full one.
-func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string) (bool, []string) {
+func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, dr *intent.DesiredResource) (bool, []string) {
+	resource := dr.GetName()
+
 	slots, probeErr := r.cfg.Adm.Show(ctx, resource)
 	if probeErr != nil {
 		return false, nil
@@ -6481,6 +6529,11 @@ func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string)
 		if slot.ConnectionState != string(drbd.ConnectionStateStandAlone) {
 			continue
 		}
+
+		if isStaleDisklessPeerSlot(dr, slot) {
+			continue
+		}
+
 		// Recovery-down-reverses disambiguator: a StandAlone slot with
 		// NO peer-device entry is a fresh slot that has not completed a
 		// connect handshake (post-`drbdadm up` revive window). Treat
@@ -6531,6 +6584,41 @@ func (r *Reconciler) standAloneWithStaleConfig(ctx context.Context, resource str
 	slices.Sort(stale)
 
 	return stale
+}
+
+// isStaleDisklessPeerSlot reports whether slot is the StandAlone
+// connection a refused `peer-device-options --bitmap=no` leaves: the
+// .res names the peer diskless, yet the kernel reads a disk for it,
+// because new-peer took Outdated from the metadata slot of the diskful
+// replica that held the node-id before. Adjust stops at the refusal
+// before it connects, so the slot stays StandAlone with its peer
+// devices registered, which is also what an operator's disconnect
+// looks like. Counted toward --skip-net, it kept every later adjust
+// from re-issuing the options, so the refusal, and with it the
+// recovery, never fired again once a recovery had failed or the
+// satellite had restarted in between: the peer stayed cut off for good.
+//
+// An operator's disconnect of a diskless peer never looks like this: a
+// connection that is not established drops a Diskless peer disk to
+// DUnknown (drbd_state.c sanitize_state), so only the stale slot reads
+// Inconsistent or Outdated for a peer the .res names diskless.
+func isStaleDisklessPeerSlot(dr *intent.DesiredResource, slot drbd.KernelSlot) bool {
+	if dr.GetDrbdOptions()["peer."+slot.Name+".diskless"] != drbdBoolPropTrue {
+		return false
+	}
+
+	withDisk := []drbd.DiskState{
+		drbd.DiskStateInconsistent, drbd.DiskStateOutdated,
+		drbd.DiskStateConsistent, drbd.DiskStateUpToDate,
+	}
+
+	for _, state := range slot.PeerDiskStates {
+		if slices.Contains(withDisk, drbd.DiskState(state)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isUnknownResourceErr reports whether a drbdadm error is the
