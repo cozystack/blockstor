@@ -107,6 +107,14 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	// Report which replicas still hold I/O suspended before anything
+	// else, so an abort is never read as a resume the kernels have not
+	// confirmed.
+	err = r.stampIOSuspendedCondition(ctx, &snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Adopted snapshots (imported from another storage controller by
 	// a migration tool; see AnnotationSnapshotAdopted) already exist
 	// on disk. NEVER run the suspend→take→resume orchestration for

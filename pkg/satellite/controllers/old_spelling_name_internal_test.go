@@ -225,8 +225,10 @@ func TestAnOldMixedCaseSnapshotRowDrivesTheResourceByItsCRName(t *testing.T) {
 		t.Fatalf("runApply: %v", err)
 	}
 
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-mix_00000",
-		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-mix_00000|4096\n")})
+	// The kernel keeps reporting the resource Primary and suspended, so
+	// every phase reaches its command whatever ran before it.
+	fx.Expect("drbdsetup status pvc-mix --json", storage.FakeResponse{Stdout: []byte(
+		`[{"name":"pvc-mix","role":"Primary","suspended-user":true,"devices":[{"volume":0,"minor":1000}]}]`)})
 
 	spec := blockstoriov1alpha1.SnapshotSpec{
 		ResourceDefinitionName: "Pvc-Mix",
@@ -242,7 +244,7 @@ func TestAnOldMixedCaseSnapshotRowDrivesTheResourceByItsCRName(t *testing.T) {
 		want   string
 	}{
 		{"suspend", func(s *blockstoriov1alpha1.SnapshotSpec) { s.SuspendIO = true }, blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "node-a"}, "drbdadm suspend-io pvc-mix"},
-		{"flush", func(s *blockstoriov1alpha1.SnapshotSpec) { s.SuspendIO, s.TakeSnapshot = true, true }, blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "node-a", SuspendIOAcked: true}, "blockdev --flushbufs /dev/vg/pvc-mix_00000"},
+		{"flush", func(s *blockstoriov1alpha1.SnapshotSpec) { s.SuspendIO = true }, blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "node-a"}, "blockdev --flushbufs /dev/drbd1000"},
 		{"resume", func(*blockstoriov1alpha1.SnapshotSpec) {}, blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "node-a", Ready: true, CreateTimestamp: 1, SuspendIOAcked: true}, "drbdadm resume-io pvc-mix"},
 	} {
 		s := spec

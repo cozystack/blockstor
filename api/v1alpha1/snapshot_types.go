@@ -291,6 +291,15 @@ func IsSnapshotAbortNotUpToDate(reason string) bool {
 // satellite-unreachable) alongside the terminal Flags marker.
 const SnapshotStatusConditionType = "SnapshotComplete"
 
+// SnapshotIOSuspendedConditionType is the Status.Conditions[] type the
+// controller-side SnapshotReconciler keeps in step with the per-node
+// suspendIOAcked bits: True, naming the nodes, while any replica's
+// kernel still holds I/O suspended for this snapshot, and False once
+// none does. A satellite clears its bit only after the kernel reports
+// the resource resumed, so this is the place to read whether an
+// aborted snapshot really let I/O go, not the abort message.
+const SnapshotIOSuspendedConditionType = "IOSuspended"
+
 // SnapshotStatus is the observed state of a Snapshot.
 type SnapshotStatus struct {
 	// nodeStatus reports per-node readiness from the satellites.
