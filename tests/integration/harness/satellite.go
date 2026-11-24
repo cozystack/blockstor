@@ -22,6 +22,7 @@ package harness
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -34,7 +35,6 @@ import (
 	"github.com/cozystack/blockstor/internal/controller"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
-	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 const (
@@ -94,6 +94,15 @@ type Satellite struct {
 	// a satellite that no longer heartbeats).
 	nodeOffline map[string]bool
 
+	// volumesUnreported[rdName] true → the satellite reports no
+	// volumes for the definition's replicas, see
+	// SimulateVolumesUnreported.
+	volumesUnreported map[string]bool
+
+	// snapshotsByHand[rdName] true → the satellite leaves the snapshots
+	// of the definition to the test, see StandInForSnapshots.
+	snapshotsByHand map[string]bool
+
 	// kernelDestroyed[rdName][node] true → the satellite leaves that
 	// replica's status alone, as the real one reports no volume for a
 	// kernel resource it saw destroyed.
@@ -119,7 +128,9 @@ func NewSatellite(cli client.Client) *Satellite {
 		nodeOffline:  map[string]bool{},
 		tickInterval: satelliteTickInterval,
 
-		kernelDestroyed: map[string]map[string]bool{},
+		volumesUnreported: map[string]bool{},
+		snapshotsByHand:   map[string]bool{},
+		kernelDestroyed:   map[string]map[string]bool{},
 	}
 }
 
@@ -183,6 +194,28 @@ func (s *Satellite) SimulateDRBDState(rdName, node, state string) {
 	s.drbdState[rdName][node] = state
 }
 
+// SimulateVolumesUnreported keeps the satellite from reporting the
+// volumes of rdName's replicas, which freezes the definition at day0: no
+// replica reports data yet. Use for tests of what the controller does
+// before the first apply pass reported back, such as the auto-primary
+// election, which ends once a replica reports UpToDate data.
+func (s *Satellite) SimulateVolumesUnreported(rdName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.volumesUnreported[rdName] = true
+}
+
+// StandInForSnapshots keeps the satellite from playing its part in the
+// snapshots of rdName, for a test that acks, takes and records them
+// itself, such as one that controls the pool a node records for its copy.
+func (s *Satellite) StandInForSnapshots(rdName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.snapshotsByHand[rdName] = true
+}
+
 // SimulateKernelResourceDestroyed stops the satellite reporting
 // (rdName, node): the real one writes no volume or disk state for a
 // replica whose kernel resource is gone, so a test that writes that
@@ -227,6 +260,7 @@ func (s *Satellite) tickOnce(ctx context.Context) {
 	s.reconcileNodes(ctx)
 	s.reconcileStoragePools(ctx)
 	s.reconcileResources(ctx)
+	s.reconcileSnapshots(ctx)
 }
 
 // reconcileNodes stamps Conditions[Ready] and ConnectionStatus on
@@ -336,11 +370,15 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 			continue
 		}
 
-		want := s.desiredDrbdState(resource)
-		volumes := s.reportedVolumes(ctx, resource, want)
-		deleted := s.confirmedVolumeDeletes(ctx, resource)
+		s.stampLiveMigrateApplied(ctx, resource)
 
-		if resource.Status.DrbdState == want && volumesReported(resource.Status.Volumes, volumes) &&
+		want := s.desiredDrbdState(resource)
+		volumes, missing := s.missingVolumes(ctx, resource, want)
+		deleted := s.confirmedVolumeDeletes(ctx, resource)
+		score := promotionScore(want)
+
+		if resource.Status.DrbdState == want && !missing &&
+			resource.Status.PromotionScore != nil && *resource.Status.PromotionScore == score &&
 			slices.Equal(resource.Status.DeletedVolumes, deleted) {
 			continue
 		}
@@ -349,6 +387,16 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 		patched.Status.DrbdState = want
 		patched.Status.DeletedVolumes = deleted
 		patched.Status.Volumes = volumes
+		patched.Status.PromotionScore = &score
+
+		// Volumes follow the resource: the satellite reports
+		// UpToDate / Diskless on a per-volume DiskState. We
+		// project the resource-level value uniformly — sufficient
+		// for the smoke test and Phase 0 — and Diskless on a
+		// replica without a disk.
+		for j := range patched.Status.Volumes {
+			patched.Status.Volumes[j].DiskState = volumeDiskState(resource, want)
+		}
 
 		_ = s.client.Status().Update(ctx, patched)
 	}
@@ -363,7 +411,7 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 func (s *Satellite) confirmedVolumeDeletes(ctx context.Context, resource *blockstoriov1alpha1.Resource) []blockstoriov1alpha1.DeletedVolumeStatus {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := s.client.Get(ctx, client.ObjectKey{Name: storek8s.Name(resource.Spec.ResourceDefinitionName)}, &rd)
+	err := s.client.Get(ctx, client.ObjectKey{Name: naming.Key(resource.Spec.ResourceDefinitionName)}, &rd)
 	if err != nil {
 		return resource.Status.DeletedVolumes
 	}
@@ -380,59 +428,194 @@ func (s *Satellite) confirmedVolumeDeletes(ctx context.Context, resource *blocks
 	return out
 }
 
-// reportedVolumes is the per-volume status a real satellite reports for
-// the replica: one entry for each volume definition of its resource
-// definition, carrying the disk state. Without the entries a replica
+// missingVolumes answers the replica's volumes with one entry per volume
+// definition, as the satellite reports them: its observer first reports
+// the volume with its storage pool and disk state, Diskless on a replica
+// without a disk, and the apply pass after it stamps the device path of
+// the DRBD minor, on a diskless replica as on a diskful one. Each tick
+// takes one of those steps, so a reader sees the volume without a path
+// in between, as it does on a real node. Without the entries a replica
 // reads as having no volumes, which no check of a replica's disk state
-// counts as UpToDate. The resource-level state is projected onto every
-// volume, as before; entries the replica already has keep their other
-// fields. A volume with no generation identifier gets the day0 one, as
-// a fresh replica the real satellite seeded carries, so its peers still
-// read it as holding no data yet.
-func (s *Satellite) reportedVolumes(ctx context.Context, resource *blockstoriov1alpha1.Resource, state string) []blockstoriov1alpha1.ResourceVolumeStatus {
-	var rd blockstoriov1alpha1.ResourceDefinition
+// counts as UpToDate. The second result says whether the replica's
+// volumes changed.
+func (s *Satellite) missingVolumes(
+	ctx context.Context, resource *blockstoriov1alpha1.Resource, want string,
+) ([]blockstoriov1alpha1.ResourceVolumeStatus, bool) {
+	s.mu.Lock()
+	unreported := s.volumesUnreported[resource.Spec.ResourceDefinitionName]
+	s.mu.Unlock()
 
-	err := s.client.Get(ctx, client.ObjectKey{Name: storek8s.Name(resource.Spec.ResourceDefinitionName)}, &rd)
-	if err != nil {
-		return resource.Status.Volumes
+	if unreported {
+		return resource.Status.Volumes, false
 	}
 
-	out := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(rd.Spec.VolumeDefinitions))
+	var rd blockstoriov1alpha1.ResourceDefinition
 
-	for i := range rd.Spec.VolumeDefinitions {
-		vol := blockstoriov1alpha1.ResourceVolumeStatus{VolumeNumber: rd.Spec.VolumeDefinitions[i].VolumeNumber}
+	err := s.client.Get(ctx, client.ObjectKey{Name: naming.Key(resource.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		return resource.Status.Volumes, false
+	}
 
-		for j := range resource.Status.Volumes {
-			if resource.Status.Volumes[j].VolumeNumber == vol.VolumeNumber {
-				vol = resource.Status.Volumes[j]
+	volumes := slices.Clone(resource.Status.Volumes)
+	missing := false
+
+	diskState := volumeDiskState(resource, want)
+
+	for _, vd := range rd.Spec.VolumeDefinitions {
+		idx := slices.IndexFunc(volumes, func(v blockstoriov1alpha1.ResourceVolumeStatus) bool {
+			return v.VolumeNumber == vd.VolumeNumber
+		})
+
+		if idx < 0 {
+			pool := resource.Spec.StoragePool
+			if pool == "" {
+				pool = resource.Spec.Props["StorPoolName"]
+			}
+
+			volumes = append(volumes, blockstoriov1alpha1.ResourceVolumeStatus{
+				VolumeNumber: vd.VolumeNumber,
+				StoragePool:  pool,
+				DiskState:    diskState,
+				CurrentGI:    drbd.Day0GIFor(naming.Key(resource.Spec.ResourceDefinitionName), vd.VolumeNumber),
+			})
+			missing = true
+
+			continue
+		}
+
+		// A volume with no generation identifier gets the day0 one, as a
+		// fresh replica the real satellite seeded carries, so its peers
+		// still read it as holding no data yet.
+		if volumes[idx].CurrentGI == "" {
+			volumes[idx].CurrentGI = drbd.Day0GIFor(naming.Key(resource.Spec.ResourceDefinitionName), vd.VolumeNumber)
+			missing = true
+		}
+
+		if volumes[idx].DiskState != diskState {
+			missing = true
+		}
+
+		if volumes[idx].DevicePath == "" && vd.DRBDMinor != nil {
+			volumes[idx].DevicePath = fmt.Sprintf("/dev/drbd%d", *vd.DRBDMinor)
+			missing = true
+		}
+	}
+
+	return volumes, missing
+}
+
+// promotionScore is the promotion score the satellite reports from the
+// kernel: non-zero while the replica can reach UpToDate data, which every
+// replica of a healthy resource can, diskless ones included, and 0 once
+// the simulated state says it cannot.
+func promotionScore(want string) int32 {
+	if want == drbdStateUpToDate {
+		return 10102
+	}
+
+	return 0
+}
+
+// volumeDiskState is the disk state the satellite reports for each volume
+// of the replica: Diskless without a disk, the resource's state otherwise.
+func volumeDiskState(resource *blockstoriov1alpha1.Resource, want string) string {
+	if slices.Contains(resource.Spec.Flags, "DISKLESS") {
+		return "Diskless"
+	}
+
+	return want
+}
+
+// reconcileSnapshots plays the satellite's part of a snapshot: it acks
+// the I/O suspension the controller asks for, and reports the snapshot
+// taken on each of its nodes once the controller says to take it.
+func (s *Satellite) reconcileSnapshots(ctx context.Context) {
+	var snaps blockstoriov1alpha1.SnapshotList
+
+	err := s.client.List(ctx, &snaps)
+	if err != nil {
+		return
+	}
+
+	for i := range snaps.Items {
+		snap := &snaps.Items[i]
+		if snap.DeletionTimestamp != nil || s.leftToTest(snap.Spec.ResourceDefinitionName) {
+			continue
+		}
+
+		patched := snap.DeepCopy()
+		changed := false
+
+		for _, node := range snap.Spec.Nodes {
+			idx := slices.IndexFunc(patched.Status.NodeStatus, func(n blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
+				return n.NodeName == node
+			})
+			if idx < 0 {
+				patched.Status.NodeStatus = append(patched.Status.NodeStatus,
+					blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: node})
+				idx = len(patched.Status.NodeStatus) - 1
+				changed = true
+			}
+
+			entry := &patched.Status.NodeStatus[idx]
+
+			if entry.SuspendIOAcked != snap.Spec.SuspendIO {
+				entry.SuspendIOAcked = snap.Spec.SuspendIO
+				changed = true
+			}
+
+			if snap.Spec.TakeSnapshot && !entry.Ready {
+				entry.Ready = true
+				entry.CreateTimestamp = time.Now().UnixMilli()
+				changed = true
 			}
 		}
 
-		vol.DiskState = state
-		if vol.CurrentGI == "" {
-			vol.CurrentGI = drbd.Day0GIFor(naming.Key(resource.Spec.ResourceDefinitionName), vol.VolumeNumber)
+		if changed {
+			_ = s.client.Status().Update(ctx, patched)
 		}
-
-		out = append(out, vol)
 	}
-
-	return out
 }
 
-// volumesReported reports whether the replica already shows the volumes
-// the mock would report, so an unchanged replica is not written again.
-func volumesReported(have, want []blockstoriov1alpha1.ResourceVolumeStatus) bool {
-	if len(have) != len(want) {
-		return false
+// leftToTest reports whether the test stands in for the snapshots of
+// rdName (StandInForSnapshots).
+func (s *Satellite) leftToTest(rdName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.snapshotsByHand[rdName]
+}
+
+// stampLiveMigrateApplied reports the definition's live migration token
+// as applied, as the real satellite does after an apply pass that
+// succeeded, unless the node is offline: make-available waits for it.
+func (s *Satellite) stampLiveMigrateApplied(ctx context.Context, resource *blockstoriov1alpha1.Resource) {
+	if s.isNodeOffline(resource.Spec.NodeName) {
+		return
 	}
 
-	for i := range have {
-		if have[i].VolumeNumber != want[i].VolumeNumber || have[i].DiskState != want[i].DiskState {
-			return false
-		}
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := s.client.Get(ctx, client.ObjectKey{Name: naming.Key(resource.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		return
 	}
 
-	return true
+	token := rd.Annotations[blockstoriov1alpha1.ResourceDefinitionAnnotationLiveMigrateToken]
+	if token == "" || resource.Annotations[blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied] == token {
+		return
+	}
+
+	// Patched in place, so the status update that follows in the same
+	// tick carries the new resourceVersion.
+	base := resource.DeepCopy()
+	if resource.Annotations == nil {
+		resource.Annotations = map[string]string{}
+	}
+
+	resource.Annotations[blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied] = token
+
+	_ = s.client.Patch(ctx, resource, client.MergeFrom(base))
 }
 
 // desiredPoolStatus computes the status we want stamped on a

@@ -20,6 +20,7 @@ package k8s
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -45,6 +46,10 @@ const (
 
 type resources struct {
 	c ctrlclient.Client
+
+	// rds lets a replica delete take the resource-connection props of
+	// its node off the definition (see dropConnectionProps).
+	rds *resourceDefinitions
 
 	// apiReader is the manager's direct, uncached reader. ListByNode uses
 	// it when it is there; see nodeScopedReader for why that read in
@@ -289,7 +294,8 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// `lookupVolumeNumbers` during the harm window leaks the backing
 	// LV / zvol. Mirrors the RD / RG / Snapshot stores.
 	mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations),
-		crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
+		crdv1alpha1.ResourceAnnotationVolumeNumbers, crdv1alpha1.ResourceAnnotationLiveMigrateApplied,
+		AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 	err = s.c.Update(ctx, &existing)
 	if err != nil {
@@ -371,16 +377,24 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// path and protects against future closures that explicitly
 		// reset live.Annotations.
 		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(wire.Annotations),
-			crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
+			crdv1alpha1.ResourceAnnotationVolumeNumbers, crdv1alpha1.ResourceAnnotationLiveMigrateApplied,
+			AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
 	}), "patch Resource %s/%s", rdName, node)
 }
 
 func (s *resources) Delete(ctx context.Context, rdName, node string) error {
+	// The connection props go first, so a failure to drop them leaves
+	// the replica in place and a retried delete drops them still.
+	err := s.dropConnectionProps(ctx, rdName, node)
+	if err != nil {
+		return err
+	}
+
 	crd := &crdv1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: resourceCRDName(rdName, node)}}
 
-	err := s.c.Delete(ctx, crd)
+	err = s.c.Delete(ctx, crd)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return errors.Wrapf(store.ErrNotFound, "resource %q on node %q", rdName, node)
@@ -454,6 +468,11 @@ func (s *resources) DeleteIfTieBreaker(ctx context.Context, rdName, node string)
 
 		return false, errors.Wrapf(err, "delete Resource %s/%s", rdName, node)
 	}
+
+	// After the delete, not before: the precondition may yet refuse
+	// it. A witness carries no connection props of its own in
+	// practice, so a failure here is not worth failing the reap for.
+	_ = s.dropConnectionProps(ctx, rdName, node)
 
 	return true, nil
 }
@@ -1338,4 +1357,39 @@ func (s *resources) nodeScopedReader() ctrlclient.Reader {
 	}
 
 	return s.c
+}
+
+// dropConnectionProps takes the resource-connection props of node off
+// the definition, as LINSTOR deletes the connections of a resource with
+// it: a replica created on the node later starts from none, and does not
+// pick up a stale allow-two-primaries or protocol. Every delete path
+// (REST, CLI, the tiebreaker and lost-node reapers) goes through here.
+func (s *resources) dropConnectionProps(ctx context.Context, rdName, node string) error {
+	if s.rds == nil {
+		return nil
+	}
+
+	rd, err := s.rds.Get(ctx, rdName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+
+		return errors.Wrapf(err, "get ResourceDefinition %s", rdName)
+	}
+
+	if !apiv1.DropResourceConnectionProps(node, maps.Clone(rd.Props)) {
+		return nil
+	}
+
+	err = s.rds.PatchResourceDefinitionSpec(ctx, rdName, func(live *apiv1.ResourceDefinition) error {
+		apiv1.DropResourceConnectionProps(node, live.Props)
+
+		return nil
+	})
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return errors.Wrapf(err, "drop connection props of %s from %s", node, rdName)
+	}
+
+	return nil
 }

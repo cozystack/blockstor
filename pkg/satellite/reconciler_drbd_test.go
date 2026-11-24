@@ -8355,6 +8355,58 @@ func indexOfSetGI(calls []string, rd string) int {
 	return -1
 }
 
+// TestApplyDisklessDevicePathFollowsResourceMinor: a diskless replica
+// still has a DRBD device the consumer opens, which is the whole point of
+// attaching it. linstor-csi reads that path off the volume right after
+// make-available creates the replica and refuses to publish without it.
+// A volume with no minor of its own takes the resource's plus its number.
+func TestApplyDisklessDevicePathFollowsResourceMinor(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-1",
+			NodeName: "n1",
+			Flags:    []string{"DISKLESS"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+				{VolumeNumber: 1, SizeKib: 1024 * 1024},
+			},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply results = %+v, want one ok result", results)
+	}
+
+	got := map[int32]string{}
+	for _, v := range results[0].GetVolumes() {
+		got[v.GetVolumeNumber()] = v.GetDevicePath()
+	}
+
+	want := map[int32]string{0: "/dev/drbd1000", 1: "/dev/drbd1001"}
+	if !maps.Equal(got, want) {
+		t.Errorf("diskless volume device paths = %v, want %v", got, want)
+	}
+}
+
 // poolWaitFixture is a reconciler with one thin pool, for the tests of
 // a diskful replica whose volumes name no pool.
 func poolWaitFixture(t *testing.T, dwell time.Duration) (*satellite.Reconciler, *storage.FakeExec) {
