@@ -51,3 +51,31 @@ func TestBuildVolumesCarriesTheReportedGI(t *testing.T) {
 		t.Errorf("volume 1 never reported a GI and carries %q", vols[1].GetObservedGI())
 	}
 }
+
+// A grow is pending on a replica while the size it reported applied lags
+// the definition, so every desired volume carries that size.
+func TestBuildVolumesCarriesTheAppliedSize(t *testing.T) {
+	t.Parallel()
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{}
+	rd.Spec.VolumeDefinitions = []blockstoriov1alpha1.ResourceDefinitionVolume{
+		{VolumeNumber: 0, SizeKib: 8192},
+		{VolumeNumber: 1, SizeKib: 8192},
+	}
+
+	target := &blockstoriov1alpha1.Resource{}
+	target.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, AppliedSizeKib: 4096}}
+
+	vols := buildVolumes(rd, target)
+	if len(vols) != 2 {
+		t.Fatalf("got %d volumes, want 2", len(vols))
+	}
+
+	if vols[0].GetAppliedSizeKib() != 4096 {
+		t.Errorf("volume 0 carries %d, want the reported 4096", vols[0].GetAppliedSizeKib())
+	}
+
+	if vols[1].GetAppliedSizeKib() != 0 {
+		t.Errorf("volume 1 never reported and carries %d", vols[1].GetAppliedSizeKib())
+	}
+}

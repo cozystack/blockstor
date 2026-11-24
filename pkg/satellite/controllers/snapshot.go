@@ -22,6 +22,7 @@ import (
 	"context"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -66,6 +67,10 @@ type SnapshotReconciler struct {
 	client.Client
 
 	Config Config
+
+	windowsOnce sync.Once
+	windows     *snapshotWindows
+	timing      snapshotWindowTiming
 }
 
 // Reconcile handles the satellite-side snapshot lifecycle:
@@ -128,6 +133,11 @@ func (r *SnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return errors.Wrap(err, "register SnapshotReconciler")
 	}
 
+	err = mgr.Add(&SnapshotSuspendWatchdog{Reconciler: r})
+	if err != nil {
+		return errors.Wrap(err, "register SnapshotSuspendWatchdog")
+	}
+
 	return nil
 }
 
@@ -183,10 +193,18 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 		return ctrl.Result{RequeueAfter: time.Second}, err
 	}
 
+	acked := perNodeStatusSuspendIOAcked(snap.Status.NodeStatus, r.Config.NodeName)
+
+	// This node gave up on the snapshot. Make sure its window is
+	// closed and never open another one for it: the controller is
+	// about to abort, and a second suspend would only freeze I/O again.
+	if snap.Spec.SuspendIO && perNodeStatusFailed(snap.Status.NodeStatus, r.Config.NodeName) {
+		return r.handleResumePhase(ctx, snap)
+	}
+
 	// Phase 1: parent RD I/O suspend. Per-node ack lives on
-	// Status.NodeStatus[us].SuspendIOAcked. Idempotent — the
-	// helper short-circuits when already acked.
-	if snap.Spec.SuspendIO && !perNodeStatusSuspendIOAcked(snap.Status.NodeStatus, r.Config.NodeName) {
+	// Status.NodeStatus[us].SuspendIOAcked.
+	if snap.Spec.SuspendIO && !acked {
 		return r.handleSuspendPhase(ctx, snap)
 	}
 
@@ -194,7 +212,7 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	// after every diskful peer either succeeded or one of them
 	// Failed. Drain our local suspend regardless — see the
 	// "resume on abort" note on Spec.SuspendIO.
-	if !snap.Spec.SuspendIO && perNodeStatusSuspendIOAcked(snap.Status.NodeStatus, r.Config.NodeName) {
+	if !snap.Spec.SuspendIO && (acked || r.windowsFor().get(snap.Name) != nil) {
 		return r.handleResumePhase(ctx, snap)
 	}
 
@@ -218,140 +236,297 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	return r.handleTakeSnapshotPhase(ctx, snap)
 }
 
-// handleSuspendPhase dispatches Phase 1 of the Bug-351
-// orchestration: drive `drbdsetup suspend-io` for the parent RD
-// and stamp Status.NodeStatus[us].SuspendIOAcked=true. A failed
-// suspend stamps the per-node Failed=true so the controller-side
-// orchestrator drains the siblings.
+// handleSuspendPhase dispatches Phase 1: flush, suspend I/O for the
+// parent RD and stamp Status.NodeStatus[us].SuspendIOAcked=true. A
+// failed suspend stamps the per-node Failed=true so the
+// controller-side orchestrator drains the siblings.
 func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	err := r.Config.Apply.SuspendResource(ctx, naming.Key(snap.Spec.ResourceDefinitionName))
-	if err != nil {
-		log.FromContext(ctx).Info("SuspendResource failed",
-			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
-
-		// Suspend failure is treated as terminal on this
-		// satellite — the kernel-side suspend-io is a no-op on
-		// an already-frozen resource, so a non-zero exit
-		// indicates either a missing kernel module or a
-		// permanently-broken resource, neither of which a
-		// retry would resolve.
-		stampErr := r.stampSnapshotPerNodeFailed(ctx, snap)
-		if stampErr != nil {
-			return ctrl.Result{}, stampErr
-		}
-
-		return ctrl.Result{}, nil
-	}
-
-	err = r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
+	layers, err := r.snapshotLayers(ctx, snap)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Don't fall through: wait for the controller to flip
-	// Spec.TakeSnapshot once every node has acked.
-	return ctrl.Result{}, nil
-}
-
-// handleResumePhase dispatches Phase 3 of the orchestration:
-// `drbdsetup resume-io` after the controller flipped
-// Spec.SuspendIO=false. A failed resume requeues without
-// clearing the ack so the orchestrator keeps poking us until
-// the kernel actually accepts the unfreeze.
-func (r *SnapshotReconciler) handleResumePhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	err := r.Config.Apply.ResumeResource(ctx, naming.Key(snap.Spec.ResourceDefinitionName))
-	if err != nil {
-		log.FromContext(ctx).Info("ResumeResource failed",
-			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
-
-		return ctrl.Result{Requeue: true}, nil
+	if !layers.drbd {
+		// Nothing to suspend without DRBD; the take is point-in-time
+		// on its own.
+		return ctrl.Result{}, r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
 	}
 
-	err = r.stampSnapshotPerNodeSuspendCleared(ctx, snap)
-	if err != nil {
-		return ctrl.Result{}, err
+	if r.windowsFor().get(snap.Name) != nil {
+		// Suspended on an earlier pass whose ack stamp did not land.
+		return ctrl.Result{}, r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
 	}
 
-	return ctrl.Result{}, nil
-}
-
-// handleTakeSnapshotPhase dispatches Phase 2 of the
-// orchestration: invoke `provider.CreateSnapshot` via the
-// satellite Reconciler and stamp Status.NodeStatus[us].Ready.
-// Routes the Ok/Terminal/Transient three-way verdict from
-// CreateSnapshotResponse the same way the pre-Bug-351 single-step
-// path did (Bug 106 / F18) — orchestration just gates when this
-// step runs.
-func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	req := &intent.CreateSnapshotRequest{
-		ResourceName: naming.Key(snap.Spec.ResourceDefinitionName),
-		SnapshotName: snap.Spec.SnapshotName,
+	if r.windowEnded(snap.Name) {
+		return r.refuseReopen(ctx, snap)
 	}
 
-	for i := range snap.Spec.VolumeDefinitions {
-		req.VolumeNumbers = append(req.VolumeNumbers, snap.Spec.VolumeDefinitions[i].VolumeNumber)
-	}
-
-	missing, err := r.unrecordedLUKSKey(ctx, snap, req.VolumeNumbers)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if missing != "" {
-		// The snapshot's bytes on this node would be encrypted under a
-		// password it does not record, so they could never be restored.
-		log.FromContext(ctx).Info("refusing to take a snapshot that does not record this replica's LUKS password",
-			"snapshot", snap.Spec.SnapshotName, "volume", missing)
-
-		return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
-	}
-
-	// P0 fix for stale-snapshot bug: `drbdsetup suspend-io` (Phase 1)
-	// quiesces NEW writes at the DRBD layer but does NOT issue a
-	// writeback barrier to the backing zvol / loop / LV. Without an
-	// explicit flush, in-flight dirty pages sit in the kernel page
-	// cache while provider.CreateSnapshot fires below — the captured
-	// snap (and any clone / `zfs send | recv` payload derived from
-	// it) ends up carrying empty / stale content. Empirical: 256 KiB
-	// urandom written through /dev/drbdN shows only ~16 KiB
-	// `used` on the ZFS zvol after the snapshot, and clone.sh /
-	// snapshot-restore-cross-node.sh / snap-ship-cross-node.sh
-	// fail with md5 mismatch.
-	//
-	// Mirrors upstream LINSTOR's `Controller/.../snapshot/*`
-	// step that fsyncs the backing device between suspend-io and
-	// the storage-layer snapshot. Best-effort: per-device failures
-	// don't abort the snapshot — degraded flush still beats no
-	// flush, and a stripped-down satellite environment (kernel
-	// without BLKFLSBUF, hostpath sandboxing) shouldn't block the
-	// snapshot from running.
-	err = r.Config.Apply.FlushBackingDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName), req.VolumeNumbers)
-	if err != nil {
-		// FlushBackingDevices itself returns nil on best-effort
-		// per-device failures; a non-nil return signals a hard
-		// programming error (panic-equivalent). Surface it as a
-		// transient requeue rather than wedging the orchestration.
-		log.FromContext(ctx).Info("FlushBackingDevices failed",
-			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
-
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	resp, err := r.Config.Apply.CreateSnapshot(ctx, req)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "CreateSnapshot")
-	}
-
-	if resp.GetOk() {
-		// Bug 106: stamp Status.NodeStatus[us].Ready so the
-		// apiserver's success denominator can flip the snapshot
-		// from "Incomplete" to "Successful".
-		err = r.stampSnapshotPerNodeReady(ctx, snap, resp.CreateTimestampUnix, resp.GetStoragePool())
+	// What the take needs from the API is read before the suspend, so
+	// the take inside the window is the storage command alone, as in
+	// LINSTOR, and a node that would refuse the take refuses it without
+	// freezing anything. The reads are still not free: a sibling that
+	// suspended first is frozen while this node reads, so they are
+	// made only for a resource that can carry a LUKS password.
+	if layers.luks {
+		refused, err := r.refusesUnrecordedLUKSKey(ctx, snap)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
+		if refused {
+			return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
+		}
+	}
+
+	err = r.openWindow(ctx, snap)
+
+	switch {
+	case errors.Is(err, errResourceBusy):
+		// Another suspend holds the resource; its resume would end
+		// ours. Nothing is suspended for this one yet.
+		if r.mustNotWaitFor(ctx, snap) {
+			log.FromContext(ctx).Info("resource held by a later snapshot; failing this one instead of waiting",
+				"snapshot", snap.Spec.SnapshotName)
+
+			return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
+		}
+
+		return ctrl.Result{RequeueAfter: snapshotBusyRetry}, nil
+	case errors.Is(err, errSatelliteStopping):
+		return ctrl.Result{}, err
+	case err != nil:
+		log.FromContext(ctx).Info("SuspendResource failed",
+			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+
+		// Terminal on this satellite: suspend-io on an already
+		// frozen resource is a no-op, so a failure means a missing
+		// kernel module or a broken resource, which a retry would
+		// not fix.
+		return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
+	}
+
+	// Don't fall through: wait for the controller to flip
+	// Spec.TakeSnapshot once every node has acked.
+	return ctrl.Result{}, r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
+}
+
+// refuseReopen answers a suspend request for a snapshot whose window on
+// this node is already over. The Snapshot can still ask for it when the
+// stamp that ended the window did not land, as when the API is cut off
+// at the deadline; suspending again would freeze I/O for another full
+// window, and again after that, for as long as the stamps fail. The
+// node fails the snapshot instead, unless its take already succeeded.
+func (r *SnapshotReconciler) refuseReopen(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
 		return ctrl.Result{}, nil
+	}
+
+	if marker, ok := r.readMarker(snap.Name); ok {
+		err := r.resumeLeftover(ctx, &marker)
+		if err != nil {
+			log.FromContext(ctx).Info("settle an ended suspend window; retrying",
+				"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+
+			return ctrl.Result{RequeueAfter: snapshotResumeRetry}, nil
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	return ctrl.Result{}, r.stampSnapshotPerNodeFailed(ctx, snap)
+}
+
+// needsWindow reports whether snap's resource has a DRBD layer on this
+// satellite to suspend. The answer is per resource, as LINSTOR only
+// suspends layers that support it: a STORAGE or LUKS,STORAGE resource
+// on a node that runs DRBD for others has nothing to suspend, and
+// suspend-io on it would fail the snapshot. An RD that is not found
+// keeps the default stack, which has DRBD.
+func (r *SnapshotReconciler) needsWindow(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (bool, error) {
+	layers, err := r.snapshotLayers(ctx, snap)
+
+	return layers.drbd, err
+}
+
+// snapshotResourceLayers is what a snapshot's resource stacks on this
+// satellite: drbd when it has a DRBD layer to suspend, luks when it can
+// carry a LUKS password.
+type snapshotResourceLayers struct {
+	drbd bool
+	luks bool
+}
+
+// snapshotLayers reads snap's layer stack from the cached definition.
+// An RD that is not found, or whose stack is empty and may still come
+// from its group, is assumed to carry LUKS, so the LUKS record is
+// checked whenever the stack does not rule it out.
+func (r *SnapshotReconciler) snapshotLayers(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot,
+) (snapshotResourceLayers, error) {
+	if !r.Config.Apply.DRBDEnabled() {
+		return snapshotResourceLayers{luks: true}, nil
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(snap.Spec.ResourceDefinitionName)}, &rd)
+	if apierrors.IsNotFound(err) {
+		return snapshotResourceLayers{drbd: true, luks: true}, nil
+	}
+
+	if err != nil {
+		return snapshotResourceLayers{}, errors.Wrapf(err, "get ResourceDefinition %s", snap.Spec.ResourceDefinitionName)
+	}
+
+	return snapshotResourceLayers{
+		drbd: rdNeedsDRBD(&rd),
+		luks: len(rd.Spec.LayerStack) == 0 || layerStackHasLUKS(rd.Spec.LayerStack),
+	}, nil
+}
+
+// handleResumePhase closes this node's window for the snapshot: the
+// controller flipped Spec.SuspendIO=false, or this node failed it. The
+// ack is cleared only once the kernel reports the resource resumed; a
+// resume it does not confirm keeps the ack, which is what the
+// controller reports as I/O still suspended, and is retried.
+func (r *SnapshotReconciler) handleResumePhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	var err error
+
+	if r.windowsFor().get(snap.Name) != nil {
+		err = r.closeWindow(ctx, snap.Name, false, "")
+	} else if perNodeStatusSuspendIOAcked(snap.Status.NodeStatus, r.Config.NodeName) {
+		marker := r.markerFor(snap)
+		err = r.resumeLeftover(ctx, &marker)
+	}
+
+	if err != nil {
+		log.FromContext(ctx).Info("ResumeResource failed",
+			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+
+		return ctrl.Result{RequeueAfter: snapshotResumeRetry}, nil
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// markerFor returns the marker recorded for snap, or one naming its
+// resource when none was recorded.
+func (r *SnapshotReconciler) markerFor(snap *blockstoriov1alpha1.Snapshot) suspendMarker {
+	marker, ok := r.readMarker(snap.Name)
+	if !ok || marker.Resource == "" {
+		marker.Resource = naming.Key(snap.Spec.ResourceDefinitionName)
+		marker.Snapshot = snap.Name
+	}
+
+	return marker
+}
+
+// handleTakeSnapshotPhase dispatches Phase 2. With DRBD the take runs
+// on the window's own goroutine under the window's deadline, and this
+// pass does not wait for it: the watchdog stamps the verdict and closes
+// the window if the take outlives it. A node that acked a suspend no
+// window here remembers lost it to a restart; the snapshot it would
+// take is no longer point-in-time, so the node resumes and fails it,
+// which is what LINSTOR's controller does when a satellite drops out of
+// the take (CtrlSnapshotCrtApiCallHandler abortSnapshotInTransaction).
+func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	needed, err := r.needsWindow(ctx, snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !needed {
+		return r.takeWithoutWindow(ctx, snap)
+	}
+
+	if r.windowsFor().get(snap.Name) == nil {
+		marker := r.markerFor(snap)
+
+		err := r.resumeLeftover(ctx, &marker)
+		if err != nil {
+			log.FromContext(ctx).Info("resume of an interrupted suspend window not confirmed; retrying",
+				"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+
+			return ctrl.Result{RequeueAfter: snapshotResumeRetry}, nil
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	r.startTake(ctx, snap)
+
+	return ctrl.Result{}, nil
+}
+
+// takeWithoutWindow takes the snapshot of a resource no DRBD layer
+// sits on. Nothing is suspended, so the storage device is flushed right
+// before the take and the take runs on this pass.
+func (r *SnapshotReconciler) takeWithoutWindow(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	r.Config.Apply.FlushStorageDevices(ctx, naming.Key(snap.Spec.ResourceDefinitionName),
+		snapshotVolumeNumbers(snap))
+
+	verdict, taken, err := r.takeVerdict(ctx, snap, true)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if verdict == takeTransient {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	return ctrl.Result{}, r.reportTake(ctx, snap, verdict, taken)
+}
+
+// takeOutcome is the three-way verdict of one storage-layer take.
+type takeOutcome int
+
+const (
+	takeOK takeOutcome = iota
+	takeTransient
+	takeTerminal
+)
+
+// takenCopy is what a successful take reports about the copy: when it
+// was taken and the pool that holds it.
+type takenCopy struct {
+	createdAt int64
+	pool      string
+}
+
+// takeVerdict invokes provider.CreateSnapshot via the satellite
+// Reconciler and classifies the result the way the pre-Bug-351
+// single-step path did (Bug 106 / F18): Ok, a transient failure worth
+// retrying, or a terminal one. It stamps nothing. checkLUKS reads
+// whether the snapshot records this replica's LUKS password; a take in
+// a suspend window passes false, its window was opened only after that
+// read.
+func (r *SnapshotReconciler) takeVerdict(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, checkLUKS bool,
+) (takeOutcome, takenCopy, error) {
+	req := &intent.CreateSnapshotRequest{
+		ResourceName:  naming.Key(snap.Spec.ResourceDefinitionName),
+		SnapshotName:  snap.Spec.SnapshotName,
+		VolumeNumbers: snapshotVolumeNumbers(snap),
+	}
+
+	if checkLUKS {
+		refused, err := r.refusesUnrecordedLUKSKey(ctx, snap)
+		if err != nil {
+			return takeTransient, takenCopy{}, err
+		}
+
+		if refused {
+			return takeTerminal, takenCopy{}, nil
+		}
+	}
+
+	resp, err := r.Config.Apply.CreateSnapshot(ctx, req)
+	if err != nil {
+		return takeTransient, takenCopy{}, errors.Wrap(err, "CreateSnapshot")
+	}
+
+	if resp.GetOk() {
+		return takeOK, takenCopy{createdAt: resp.CreateTimestampUnix, pool: resp.GetStoragePool()}, nil
 	}
 
 	log.FromContext(ctx).Info("CreateSnapshot per-snapshot failure",
@@ -360,18 +535,30 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 		"terminal", resp.GetTerminal())
 
 	if !resp.GetTerminal() {
-		// Transient — back off and try again.
-		return ctrl.Result{Requeue: true}, nil
+		return takeTransient, takenCopy{}, nil
 	}
 
-	// Terminal failure — stamp FAILED + per-node Failed=true so
-	// the orchestrator drains the suspended siblings.
-	err = r.stampSnapshotPerNodeFailed(ctx, snap)
+	return takeTerminal, takenCopy{}, nil
+}
+
+// refusesUnrecordedLUKSKey reports whether this node must refuse the
+// take because the snapshot does not record the LUKS password of the
+// replica it would copy: the copy would be encrypted under a password
+// nothing keeps, so it could never be restored.
+func (r *SnapshotReconciler) refusesUnrecordedLUKSKey(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (bool, error) {
+	missing, err := r.unrecordedLUKSKey(ctx, snap, snapshotVolumeNumbers(snap))
 	if err != nil {
-		return ctrl.Result{}, err
+		return false, err
 	}
 
-	return ctrl.Result{}, nil
+	if missing == "" {
+		return false, nil
+	}
+
+	log.FromContext(ctx).Info("refusing to take a snapshot that does not record this replica's LUKS password",
+		"snapshot", snap.Spec.SnapshotName, "volume", missing)
+
+	return true, nil
 }
 
 // perNodeStatusSuspendIOAcked reports whether the NodeStatus
@@ -781,6 +968,30 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 		// Either way, nothing for us to do — let the apiserver
 		// finalise.
 		return ctrl.Result{}, nil
+	}
+
+	// Close this node's window before the snapshot goes: a deleted CR
+	// is the one signal the watchdog cannot read back. The resume does
+	// not wait for the take; the delete does. A take still running,
+	// even one whose window the watchdog already closed, would create
+	// the storage snapshot after the delete, and nothing would remove
+	// it once the finalizer is gone.
+	if w := r.windowsFor().get(snap.Name); w != nil {
+		err := r.closeWindow(ctx, snap.Name, false, "")
+		if err != nil {
+			log.FromContext(ctx).Info("resume before delete not confirmed; the watchdog retries it",
+				"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+		}
+	} else if marker, ok := r.readMarker(snap.Name); ok {
+		err := r.resumeLeftover(ctx, &marker)
+		if err != nil {
+			log.FromContext(ctx).Info("resume before delete not confirmed; the watchdog retries it",
+				"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+		}
+	}
+
+	if r.takeInFlight(snap.Name) {
+		return ctrl.Result{RequeueAfter: snapshotResumeRetry}, nil
 	}
 
 	req := &intent.DeleteSnapshotRequest{

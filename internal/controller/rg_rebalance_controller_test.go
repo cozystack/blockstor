@@ -60,6 +60,8 @@ func seedRebalanceFixture(t *testing.T, ctx context.Context, st store.Store, pla
 		},
 		Annotations: map[string]string{
 			apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
+			// The `rg modify` behind it raised the place count.
+			apiv1.AnnotationRGRebalancePlaceCount: "2026-05-14T00:00:00Z",
 		},
 	}); err != nil {
 		t.Fatalf("seed rg: %v", err)
@@ -194,11 +196,12 @@ func TestRGRebalanceReconcilerIsAdditiveOnly(t *testing.T) {
 // TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled: scenario
 // 2.W02 — operator sets controller-scope
 // `BalanceResourcesEnabled=false` to suppress the periodic rebalance
-// pass cluster-wide (TestRebalanceHonoursDisabled pins the tick). The
-// switch is read by LINSTOR's balance task alone; its `rg modify`
-// autoplaces the children short of the place count without consulting
-// it, so the `rebalance-pending` annotation still places. The
-// annotation is stripped so a re-watch on the same event doesn't loop.
+// pass cluster-wide. An `rg modify` that changed only a placement
+// constraint has no placement of its own in LINSTOR, so with the
+// kill-switch on its rebalance-pending annotation spawns nothing;
+// existing placements are left untouched. The annotation is stripped
+// so a re-watch on the same event doesn't loop, matching the no-op
+// return contract.
 func TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled(t *testing.T) {
 	t.Parallel()
 
@@ -207,9 +210,10 @@ func TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled(t *testing.T) {
 	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
 	st := store.NewInMemory()
 
-	// Two existing replicas, RG wants three. The seed annotation
-	// simulates a fresh `linstor rg modify` increasing PlaceCount.
+	// Two existing replicas, RG wants three, and the annotation
+	// stands for a constraint-only `rg modify`: no place count named.
 	seedRebalanceFixture(t, ctx, st, 3, []string{"n1", "n2"})
+	dropPlaceCountMarker(t, ctx, st)
 
 	// Flip the controller-scope kill-switch BEFORE the reconcile fires.
 	if err := st.ControllerProps().Set(ctx, map[string]string{
@@ -229,10 +233,12 @@ func TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 
-	if len(got) != 3 {
-		t.Fatalf("rg modify with BalanceResourcesEnabled=false placed %d replicas, want 3 (entries=%v)", len(got), got)
+	if len(got) != 2 {
+		t.Fatalf("BalanceResourcesEnabled=false must short-circuit; got %d replicas, want 2 (entries=%v)", len(got), got)
 	}
 
+	// Annotation must still be stripped — a stale marker that survives
+	// a kill-switched pass would loop forever on the next RG event.
 	rg, err := st.ResourceGroups().Get(ctx, "rg")
 	if err != nil {
 		t.Fatalf("Get rg: %v", err)
@@ -243,15 +249,107 @@ func TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled(t *testing.T) {
 	}
 }
 
+// TestRGModifyPlaceCountPlacesWithBalancingDisabled: LINSTOR reads
+// BalanceResourcesEnabled in its balance task alone. Its `rg modify`
+// runs the autoplacer on every child short of the named place count
+// whatever the switch says at any scope, so blockstor's pass for such a
+// modify places with the switch off too, and strips both markers.
+func TestRGModifyPlaceCountPlacesWithBalancingDisabled(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		ctrl    map[string]string
+		rgProps map[string]string
+		rdProps map[string]string
+	}{
+		"controller":                      {ctrl: map[string]string{apiv1.PropBalanceResourcesEnabled: "false"}},
+		"controller False":                {ctrl: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"}},
+		"group":                           {rgProps: map[string]string{apiv1.PropBalanceResourcesEnabled: "false"}},
+		"definition, as linstor-csi sets": {rdProps: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"}},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := store.NewInMemory()
+
+			seedRebalanceFixture(t, ctx, st, 3, []string{"n1", "n2"})
+
+			if tc.ctrl != nil {
+				if err := st.ControllerProps().Set(ctx, tc.ctrl); err != nil {
+					t.Fatalf("set controller props: %v", err)
+				}
+			}
+
+			rg, err := st.ResourceGroups().Get(ctx, "rg")
+			if err != nil {
+				t.Fatalf("get rg: %v", err)
+			}
+
+			rg.Props = tc.rgProps
+			if err := st.ResourceGroups().Update(ctx, &rg); err != nil {
+				t.Fatalf("set rg props: %v", err)
+			}
+
+			rd, err := st.ResourceDefinitions().Get(ctx, "pvc-rebalance")
+			if err != nil {
+				t.Fatalf("get rd: %v", err)
+			}
+
+			rd.Props = tc.rdProps
+			if err := st.ResourceDefinitions().Update(ctx, &rd); err != nil {
+				t.Fatalf("set rd props: %v", err)
+			}
+
+			reconcileRebalance(t, ctx, st)
+
+			if n := replicaCount(t, ctx, st, "pvc-rebalance"); n != 3 {
+				t.Fatalf("got %d replicas after rg modify --place-count 3 with balancing off; want 3", n)
+			}
+
+			got, err := st.ResourceGroups().Get(ctx, "rg")
+			if err != nil {
+				t.Fatalf("get rg: %v", err)
+			}
+
+			for _, key := range []string{apiv1.AnnotationRGRebalancePending, apiv1.AnnotationRGRebalancePlaceCount} {
+				if _, ok := got.Annotations[key]; ok {
+					t.Errorf("%s not stripped: %v", key, got.Annotations)
+				}
+			}
+		})
+	}
+}
+
+// dropPlaceCountMarker turns the seeded annotation into the one a
+// constraint-only `rg modify` leaves: rebalance-pending without the
+// place-count marker.
+func dropPlaceCountMarker(t *testing.T, ctx context.Context, st store.Store) {
+	t.Helper()
+
+	rg, err := st.ResourceGroups().Get(ctx, "rg")
+	if err != nil {
+		t.Fatalf("get rg: %v", err)
+	}
+
+	delete(rg.Annotations, apiv1.AnnotationRGRebalancePlaceCount)
+
+	if err := st.ResourceGroups().Update(ctx, &rg); err != nil {
+		t.Fatalf("drop the place-count marker: %v", err)
+	}
+}
+
 // TestRGRebalanceReconcilerIgnoresNonFalseValues: 2.W02 contract pin
-// — only the explicit string "false" disables the reconciler. Other
+// — only "false", in any letter case, disables the reconciler. Other
 // values (empty, "true", "0", typo) keep it armed, matching upstream
 // LINSTOR's "default = enabled" semantics so an unconfigured cluster
 // behaves the same way it did before the kill-switch landed.
 func TestRGRebalanceReconcilerIgnoresNonFalseValues(t *testing.T) {
 	t.Parallel()
 
-	for _, val := range []string{"", "true", "True", "0", "FALSE", "no"} {
+	for _, val := range []string{"", "true", "True", "0", "no", "off"} {
 		t.Run("value="+val, func(t *testing.T) {
 			t.Parallel()
 
@@ -325,9 +423,9 @@ func TestRGRebalanceReconcilerNoAnnotationStillFiresScheduledTick(t *testing.T) 
 		Name:              "pvc-no-annot",
 		ResourceGroupName: "rg",
 	})
-	// A deployed volume short of its place count: the scheduled tick
-	// balances what is deployed, see the next test for what it leaves.
-	_ = st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-no-annot", NodeName: "n1"})
+	_ = st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-no-annot", NodeName: "n1", Volumes: upToDateVolumes(),
+	})
 
 	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
 

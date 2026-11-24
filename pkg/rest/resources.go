@@ -621,8 +621,8 @@ func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[s
 // it keeps the disk state, and it shows no percentage anywhere else.
 // blockstor used to compute one from the volume-wide OutOfSyncKib and
 // the volume size instead, on every non-terminal state. That number is
-// wrong on exactly the replica an operator watches: OutOfSyncKib is
-// whichever peer-device frame came last, so a replica that finished a
+// wrong on exactly the replica an operator watches: OutOfSyncKib
+// was whichever peer-device frame came last, so a replica that finished a
 // small resync from one peer and then ran a full one from another
 // showed `Inconsistent(99%)` while the kernel said `done:50.31`.
 //

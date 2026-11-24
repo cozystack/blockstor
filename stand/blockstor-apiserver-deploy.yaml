@@ -32,15 +32,20 @@ rules:
 ---
 # The encryption verbs read the passphrase Secret the ControllerConfig
 # names and the keyring Secret, and write the keyring and the generated
-# unlock Secret; the passphrase Secret itself is never written. All of it
-# is read past the controller-runtime cache (rest.Server.SecretReader), so
-# no informer lists or watches Secrets and a get in this namespace is all
-# the read needs.
+# unlock Secret; the passphrase Secret itself is never written. None of
+# it goes through the manager's cache, which would watch every Secret:
+# the verbs read by name (rest.Server.SecretReader), and the encryption
+# state of the resource view comes from one watch per Secret
+# (rest.Server.StateReader).
 # resourceNames: the keyring, the unlock Secret blockstor generates when no
 # passphrase Secret is named, and the passphrase Secret under piraeus's
 # name, linstor-passphrase. A ControllerConfig that names another
 # passphrase Secret needs that name added here. Nothing else in the
 # namespace is readable: under Cozystack it is shared with piraeus.
+# list and watch are limited by the same names: the API server allows them
+# only for a request that selects one of these Secrets by
+# metadata.name, which is all the watch the encryption state is read
+# from asks for. Without them the reads fall back to a get each time.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -50,7 +55,7 @@ rules:
   - apiGroups: [""]
     resources: [secrets]
     resourceNames: [blockstor-master-key, blockstor-unlock, linstor-passphrase]
-    verbs: [get, update]
+    verbs: [get, list, watch, update]
   # A create cannot be limited by name; see docs/encryption-keys.md for
   # what that leaves open and how to close it.
   - apiGroups: [""]

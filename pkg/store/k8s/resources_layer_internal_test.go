@@ -47,6 +47,8 @@ func TestVolumesFromStatus(t *testing.T) {
 			UsableKib:    1024,
 			DiskState:    "UpToDate",
 			CurrentGI:    "1234ABCD",
+
+			AppliedSizeKib: 1024,
 		},
 		{
 			VolumeNumber: 1,
@@ -66,6 +68,12 @@ func TestVolumesFromStatus(t *testing.T) {
 
 	if got[0].State.CurrentGi != "1234ABCD" {
 		t.Errorf("vol[0] CurrentGI: got %q, want 1234ABCD", got[0].State.CurrentGi)
+	}
+
+	// The REST layer reads the applied size to answer a resize only
+	// once the replicas have grown.
+	if got[0].AppliedSizeKib != 1024 {
+		t.Errorf("vol[0] AppliedSizeKib: got %d, want 1024", got[0].AppliedSizeKib)
 	}
 
 	if got[1].VolumeNumber != 1 || got[1].State.DiskState != "Inconsistent" {
@@ -387,6 +395,22 @@ func TestWireToCRDResourceProducesCanonicalName(t *testing.T) {
 	if crd.Name != crd.Spec.ResourceDefinitionName+"."+crd.Spec.NodeName {
 		t.Errorf("CEL invariant broken: name=%q, expected %q",
 			crd.Name, crd.Spec.ResourceDefinitionName+"."+crd.Spec.NodeName)
+	}
+}
+
+// TestApplyFailureFromStatus: the REST layer reads the satellite's last
+// apply error through the wire Resource, keyed by volume number.
+func TestApplyFailureFromStatus(t *testing.T) {
+	if got := applyFailureFromStatus(nil); got != nil {
+		t.Fatalf("no failure: got %+v, want nil", got)
+	}
+
+	got := applyFailureFromStatus(&crdv1alpha1.ResourceApplyFailure{
+		Message: "boom",
+		Volumes: []crdv1alpha1.ResourceApplyFailureVolume{{VolumeNumber: 1, SizeKib: 4096}},
+	})
+	if got == nil || got.Message != "boom" || got.SizesKib[1] != 4096 {
+		t.Fatalf("failure: got %+v", got)
 	}
 }
 

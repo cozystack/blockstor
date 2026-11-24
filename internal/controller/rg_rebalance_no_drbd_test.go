@@ -88,9 +88,9 @@ func replicasOf(t *testing.T, ctx context.Context, st store.Store, rd string) in
 }
 
 // withOneOfTwoReplicas raises the group's place count to two and gives
-// pvc-local one diskful replica on n1: a definition the scheduled pass
-// tops up, once its stack has DRBD, since something is deployed to
-// balance and it is one replica short.
+// pvc-local one UpToDate replica on n1: a definition the balance task
+// tops up, once its stack has DRBD, since it still holds its data and
+// is one replica short.
 func withOneOfTwoReplicas(t *testing.T, ctx context.Context, st store.Store) {
 	t.Helper()
 
@@ -109,9 +109,24 @@ func withOneOfTwoReplicas(t *testing.T, ctx context.Context, st store.Store) {
 		Name:     "pvc-local",
 		NodeName: "n1",
 		Props:    map[string]string{"StorPoolName": "pool"},
+		Volumes:  upToDateVolumes(),
 	}); err != nil {
-		t.Fatalf("seed the diskful replica: %v", err)
+		t.Fatalf("seed the UpToDate replica: %v", err)
 	}
+}
+
+// placeCountModify and constraintOnlyModify return the markers the REST
+// handler leaves for an `rg modify` that named a place count, and for
+// one that changed only a placement constraint.
+func placeCountModify() map[string]string {
+	return map[string]string{
+		apiv1.AnnotationRGRebalancePending:    "2026-05-14T00:00:00Z",
+		apiv1.AnnotationRGRebalancePlaceCount: "2026-05-14T00:00:00Z",
+	}
+}
+
+func constraintOnlyModify() map[string]string {
+	return map[string]string{apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z"}
 }
 
 // TestRGRebalanceScheduledSkipsDefinitionWithoutDRBD: LINSTOR's balance
@@ -155,9 +170,9 @@ func TestRGRebalanceScheduledSkipsDefinitionWithoutDRBD(t *testing.T) {
 }
 
 // TestRGRebalanceScheduledStillPlacesDRBDDefinition is the control: the
-// same fixture with the default stack is topped up as before. It holds
-// a diskful replica, or the scheduled pass would leave it alone as a
-// definition with nothing deployed.
+// same fixture with the default stack is topped up as before. Its one
+// replica is UpToDate, or the balance checks would skip it (a
+// definition with no data left is never topped up).
 func TestRGRebalanceScheduledStillPlacesDRBDDefinition(t *testing.T) {
 	t.Parallel()
 
@@ -180,9 +195,10 @@ func TestRGRebalanceScheduledStillPlacesDRBDDefinition(t *testing.T) {
 	}
 }
 
-// TestRGRebalanceAnnotationPlacesDefinitionWithoutDRBD: an explicit
-// `rg modify` is not the balance task. LINSTOR autoplaces every child
-// definition on it whatever its stack, and so does blockstor.
+// TestRGRebalanceAnnotationPlacesDefinitionWithoutDRBD: an `rg modify`
+// that names a place count is not the balance task. LINSTOR autoplaces
+// every child definition short of the count whatever its stack, and so
+// does blockstor.
 func TestRGRebalanceAnnotationPlacesDefinitionWithoutDRBD(t *testing.T) {
 	t.Parallel()
 
@@ -191,9 +207,7 @@ func TestRGRebalanceAnnotationPlacesDefinitionWithoutDRBD(t *testing.T) {
 	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
 	st := store.NewInMemory()
 
-	seedNoDRBDRebalance(t, ctx, st, []string{apiv1.LayerKindStorage}, nil, map[string]string{
-		apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
-	})
+	seedNoDRBDRebalance(t, ctx, st, []string{apiv1.LayerKindStorage}, nil, placeCountModify())
 
 	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
 
@@ -219,6 +233,7 @@ func TestRGEventSkipsDefinitionWithoutDRBD(t *testing.T) {
 	st := store.NewInMemory()
 
 	seedNoDRBDRebalance(t, ctx, st, []string{apiv1.LayerKindStorage}, nil, nil)
+	withOneOfTwoReplicas(t, ctx, st)
 
 	rec := &controllerpkg.ResourceGroupReconciler{Client: cli, Scheme: scheme, Store: st}
 
@@ -226,22 +241,92 @@ func TestRGEventSkipsDefinitionWithoutDRBD(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	if n := replicasOf(t, ctx, st, "pvc-local"); n != 0 {
-		t.Errorf("RG event placed %d replicas on a definition without DRBD, want 0", n)
+	if n := replicasOf(t, ctx, st, "pvc-local"); n != 1 {
+		t.Errorf("RG event left %d replicas on a definition without DRBD, want its 1", n)
 	}
 }
 
-// TestRGModifyPlacesEveryChildWithBalancingOff: `BalanceResourcesEnabled`
-// switches off LINSTOR's balance task, not an explicit `rg modify`,
-// which autoplaces every child whatever its stack. Each child ends up
-// with its replica, in whichever order the RG event and the rebalance
-// reconciler run.
-func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
-	t.Parallel()
+// seedModifyWithBalancingOff extends the no-DRBD fixture (pvc-local,
+// storage only, no replica) with a DRBD child without a replica
+// (pvc-drbd), a child already holding two replicas against the place
+// count of one (pvc-full), and BalanceResourcesEnabled=false on the
+// controller.
+func seedModifyWithBalancingOff(t *testing.T, ctx context.Context, st store.Store, annotations map[string]string) {
+	t.Helper()
+
+	seedNoDRBDRebalance(t, ctx, st, nil, []string{apiv1.LayerKindStorage}, annotations)
+
+	for _, rd := range []string{"pvc-drbd", "pvc-full"} {
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:              rd,
+			ResourceGroupName: "rg",
+		}); err != nil {
+			t.Fatalf("seed rd %q: %v", rd, err)
+		}
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name:     "pvc-full",
+			NodeName: n,
+			Props:    map[string]string{"StorPoolName": "pool"},
+		}); err != nil {
+			t.Fatalf("seed pvc-full on %q: %v", n, err)
+		}
+	}
+
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropBalanceResourcesEnabled: "false",
+	}); err != nil {
+		t.Fatalf("set BalanceResourcesEnabled=false: %v", err)
+	}
+}
+
+// reconcileModify runs the RG event and the rebalance reconciler on
+// the group, in either order.
+func reconcileModify(t *testing.T, ctx context.Context, st store.Store, rgEventFirst bool) {
+	t.Helper()
 
 	type reconciler interface {
 		Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error)
 	}
+
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	order := []reconciler{
+		&controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st},
+		&controllerpkg.ResourceGroupReconciler{Client: cli, Scheme: scheme, Store: st},
+	}
+	if rgEventFirst {
+		order[0], order[1] = order[1], order[0]
+	}
+
+	for _, rec := range order {
+		if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+	}
+
+	rg, err := st.ResourceGroups().Get(ctx, "rg")
+	if err != nil {
+		t.Fatalf("get rg: %v", err)
+	}
+
+	if _, ok := rg.Annotations[apiv1.AnnotationRGRebalancePending]; ok {
+		t.Errorf("annotation not stripped with balancing off: %v", rg.Annotations)
+	}
+}
+
+// TestRGModifyPlacesEveryChildWithBalancingOff: `BalanceResourcesEnabled`
+// switches off LINSTOR's balance task, not an `rg modify` that names a
+// place count, which autoplaces every child with fewer non-tiebreaker
+// replicas than the count, whatever its stack, and leaves the others
+// alone (CtrlRscGrpApiCallHandler.java:577-620 in LINSTOR v1.33.1).
+// Each short child ends up with its replica, in whichever order the RG
+// event and the rebalance reconciler run.
+func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
+	t.Parallel()
 
 	for name, rgEventFirst := range map[string]bool{
 		"RG event first":  true,
@@ -251,61 +336,52 @@ func TestRGModifyPlacesEveryChildWithBalancingOff(t *testing.T) {
 			t.Parallel()
 
 			ctx := context.Background()
-			scheme := newScheme(t)
-			cli := fake.NewClientBuilder().WithScheme(scheme).Build()
 			st := store.NewInMemory()
 
-			seedNoDRBDRebalance(t, ctx, st, nil, []string{apiv1.LayerKindStorage}, map[string]string{
-				apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
-			})
+			seedModifyWithBalancingOff(t, ctx, st, placeCountModify())
+			reconcileModify(t, ctx, st, rgEventFirst)
 
-			if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-				Name:              "pvc-drbd",
-				ResourceGroupName: "rg",
-			}); err != nil {
-				t.Fatalf("seed drbd rd: %v", err)
-			}
-
-			if err := st.ControllerProps().Set(ctx, map[string]string{
-				apiv1.PropBalanceResourcesEnabled: "false",
-			}); err != nil {
-				t.Fatalf("set BalanceResourcesEnabled=false: %v", err)
-			}
-
-			order := []reconciler{
-				&controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st},
-				&controllerpkg.ResourceGroupReconciler{Client: cli, Scheme: scheme, Store: st},
-			}
-			if rgEventFirst {
-				order[0], order[1] = order[1], order[0]
-			}
-
-			for _, rec := range order {
-				if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
-					t.Fatalf("Reconcile: %v", err)
+			for rd, want := range map[string]int{"pvc-local": 1, "pvc-drbd": 1, "pvc-full": 2} {
+				if n := replicasOf(t, ctx, st, rd); n != want {
+					t.Errorf("rg modify with balancing off left %d replicas on %q, want %d", n, rd, want)
 				}
 			}
+		})
+	}
+}
 
-			for _, rd := range []string{"pvc-local", "pvc-drbd"} {
-				if n := replicasOf(t, ctx, st, rd); n != 1 {
-					t.Errorf("rg modify with balancing off placed %d replicas on %q, want 1", n, rd)
+// TestRGConstraintOnlyModifyPlacesNothingWithBalancingOff: LINSTOR's
+// `rg modify` autoplaces only when the request carries a replica count
+// (CtrlRscGrpApiCallHandler.java:577-620 in v1.33.1). A modify that
+// changed only a placement constraint places nothing, and with the
+// balance task switched off nothing else places either, on any child.
+func TestRGConstraintOnlyModifyPlacesNothingWithBalancingOff(t *testing.T) {
+	t.Parallel()
+
+	for name, rgEventFirst := range map[string]bool{
+		"RG event first":  true,
+		"rebalance first": false,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := store.NewInMemory()
+
+			seedModifyWithBalancingOff(t, ctx, st, constraintOnlyModify())
+			reconcileModify(t, ctx, st, rgEventFirst)
+
+			for rd, want := range map[string]int{"pvc-local": 0, "pvc-drbd": 0, "pvc-full": 2} {
+				if n := replicasOf(t, ctx, st, rd); n != want {
+					t.Errorf("constraint-only rg modify with balancing off left %d replicas on %q, want %d", n, rd, want)
 				}
-			}
-
-			rg, err := st.ResourceGroups().Get(ctx, "rg")
-			if err != nil {
-				t.Fatalf("get rg: %v", err)
-			}
-
-			if _, ok := rg.Annotations[apiv1.AnnotationRGRebalancePending]; ok {
-				t.Errorf("annotation not stripped with balancing off: %v", rg.Annotations)
 			}
 		})
 	}
 }
 
 // TestRGRebalanceDisabledPlacesDRBDChildItself: with balancing off the
-// rebalance reconciler places the explicit modify on a DRBD child too,
+// rebalance reconciler places a place-count modify on a DRBD child too,
 // without the RG event path. Leaving that child to the RG event path
 // made the placement depend on a path LINSTOR does not place from, and
 // that path may make the balance checks and skip it.
@@ -317,9 +393,7 @@ func TestRGRebalanceDisabledPlacesDRBDChildItself(t *testing.T) {
 	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
 	st := store.NewInMemory()
 
-	seedNoDRBDRebalance(t, ctx, st, nil, nil, map[string]string{
-		apiv1.AnnotationRGRebalancePending: "2026-05-14T00:00:00Z",
-	})
+	seedNoDRBDRebalance(t, ctx, st, nil, nil, placeCountModify())
 
 	if err := st.ControllerProps().Set(ctx, map[string]string{
 		apiv1.PropBalanceResourcesEnabled: "false",

@@ -95,6 +95,7 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			s.reportAppliedSizes(r.Context(), rds[i].Name, vds)
 			rds[i].VolumeDefinitions = vds
 		}
 	}

@@ -33,6 +33,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
@@ -372,8 +373,10 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 // without a disk, and the apply pass after it stamps the device path of
 // the DRBD minor, on a diskless replica as on a diskful one. Each tick
 // takes one of those steps, so a reader sees the volume without a path
-// in between, as it does on a real node. The second result says whether
-// the replica's volumes changed.
+// in between, as it does on a real node. Without the entries a replica
+// reads as having no volumes, which no check of a replica's disk state
+// counts as UpToDate. The second result says whether the replica's
+// volumes changed.
 func (s *Satellite) missingVolumes(
 	ctx context.Context, resource *blockstoriov1alpha1.Resource, want string,
 ) ([]blockstoriov1alpha1.ResourceVolumeStatus, bool) {
@@ -412,10 +415,23 @@ func (s *Satellite) missingVolumes(
 				VolumeNumber: vd.VolumeNumber,
 				StoragePool:  pool,
 				DiskState:    diskState,
+				CurrentGI:    drbd.Day0GIFor(naming.Key(resource.Spec.ResourceDefinitionName), vd.VolumeNumber),
 			})
 			missing = true
 
 			continue
+		}
+
+		// A volume with no generation identifier gets the day0 one, as a
+		// fresh replica the real satellite seeded carries, so its peers
+		// still read it as holding no data yet.
+		if volumes[idx].CurrentGI == "" {
+			volumes[idx].CurrentGI = drbd.Day0GIFor(naming.Key(resource.Spec.ResourceDefinitionName), vd.VolumeNumber)
+			missing = true
+		}
+
+		if volumes[idx].DiskState != diskState {
+			missing = true
 		}
 
 		if volumes[idx].DevicePath == "" && vd.DRBDMinor != nil {
