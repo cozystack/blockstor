@@ -44,7 +44,8 @@ func TestLowerDiskKibExternalMetadata(t *testing.T) {
 
 // TestGrowLowerDisk covers when a definition grow resizes the lower disk
 // and the device, and that volumes created before lower disks were sized
-// for metadata are not resized by an upgrade alone.
+// for metadata are not resized by an upgrade alone. The grow step is the
+// satellite's (growBacking), with DRBD on for the volumes that have it.
 func TestGrowLowerDisk(t *testing.T) {
 	t.Parallel()
 
@@ -90,9 +91,11 @@ func TestGrowLowerDisk(t *testing.T) {
 			dr := &intent.DesiredResource{Name: "pvc-l", LayerStack: []string{"LUKS", "STORAGE"}}
 			vol := &intent.DesiredVolume{SizeKib: tc.definition}
 
-			resized, err := growLowerDisk(t.Context(), provider, dr, vol, tc.onDisk, lowerDiskKib(dr, vol))
+			r := NewReconciler(ReconcilerConfig{})
+
+			resized, err := r.growBacking(t.Context(), provider, dr, vol, tc.onDisk)
 			if err != nil {
-				t.Fatalf("growLowerDisk: %v", err)
+				t.Fatalf("growBacking: %v", err)
 			}
 
 			if resized != tc.wantResized || (len(fx.CommandLines()) > 0) != tc.wantStorageGrow {
@@ -111,9 +114,11 @@ func TestGrowLowerDisk(t *testing.T) {
 			dr := &intent.DesiredResource{Name: "pvc-g"}
 			vol := &intent.DesiredVolume{SizeKib: tc.definition, DeviceSizeKib: tc.device}
 
-			resized, err := growLowerDisk(t.Context(), provider, dr, vol, tc.onDisk, lowerDiskKib(dr, vol))
+			r := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(storage.NewFakeExec())})
+
+			resized, err := r.growBacking(t.Context(), provider, dr, vol, tc.onDisk)
 			if err != nil {
-				t.Fatalf("growLowerDisk: %v", err)
+				t.Fatalf("growBacking: %v", err)
 			}
 
 			if resized != tc.wantResized {
