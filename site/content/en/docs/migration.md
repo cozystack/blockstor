@@ -55,7 +55,7 @@ LINSTOR writes `cram-hmac-alg sha1` and the shared secret into a resource only w
 
    Change the namespace and label to match your installation. Each line is `<volume> <node> <port>`, so replicas of one volume on different ports keep their own. If your LINSTOR node names differ from the Kubernetes ones, put the LINSTOR name in the second column. The converter refuses a map that gives one replica two ports, and refuses manifests that would put two replicas on one port on the same node. It reports a replica it has no port for while it has its peers', and map entries for nodes that host no replica of the definition.
 
-4. **Take pool snapshots.** A recursive `zfs snapshot` of every pool gives you a rollback point that does not depend on either control plane.
+4. **Take pool snapshots.** A recursive `zfs snapshot` of every pool gives you a rollback point that does not depend on either control plane. Blockstor does not track these snapshots. A volume deleted while it holds one is renamed to `_deleted_<name>_<time>` and kept, as LINSTOR does, so destroy the pool snapshots once you no longer need the rollback point and then remove those renamed volumes by hand.
 
 5. **Check the volume names on disk.** Blockstor finds existing volumes by name: `<pool>/<definition CR name>_<volume number, five digits>`, for example `data/pvc-1234_00000`. The CR name is the definition's `metadata.name` in the converted manifests: its LINSTOR name in lowercase, or, for a name that is not a valid Kubernetes name once lowercased, a hashed slug such as `35d21682-my-res` for `my_res`. A volume of such a definition never matches its LINSTOR name on disk, so rename the definition or the volume before you switch over. If the name does not match exactly, blockstor creates a new empty volume next to the real one. Replicated volumes would heal from their peers, but a volume with a single replica and no DRBD would come up empty. On every node, compare the list of volumes with the names the converted manifests expect:
 
@@ -65,6 +65,8 @@ LINSTOR writes `cram-hmac-alg sha1` and the shared secret into a resource only w
    ```
 
    Snapshots are found as `<pool>/<definition CR name>_00000@<snapshot>`. Do not continue while any single-replica volume is missing under its expected name.
+
+   The same comparison the other way round lists the volumes no converted replica names, usually leftovers of earlier LINSTOR deletes. Blockstor never deletes a volume that no replica claims, so they stay until you remove them; `linstor-migrate` cannot list them, since it reads only the dump. Volumes named `_deleted_*` are ones LINSTOR renamed because they still had snapshots. Blockstor finishes them the way LINSTOR would: deleting the last of a migrated `Snapshot`'s copies on that node destroys the renamed volume with it. One whose snapshots no `Snapshot` tracks stays.
 
 6. **Record the DRBD configuration.** Blockstor applies the configuration it renders as soon as it adopts a resource, without comparing it with what the kernel runs, so keep a copy to compare against afterwards:
 

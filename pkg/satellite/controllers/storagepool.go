@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -40,7 +41,7 @@ import (
 // registered on this satellite. Strips on delete so the
 // apiserver finalises only after the in-memory provider has
 // been deregistered. Phase 10.8.
-const StoragePoolFinalizer = "blockstor.org/satellite-storagepool"
+const StoragePoolFinalizer = finalizers.SatelliteStoragePool
 
 // capacityResyncInterval is the cadence the StoragePoolReconciler
 // reschedules itself at to refresh `Status.FreeCapacity` /
