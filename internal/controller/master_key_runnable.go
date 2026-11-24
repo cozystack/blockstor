@@ -31,8 +31,8 @@ import (
 )
 
 // MasterKeyPeriod is how often the controller looks at the passphrase and
-// keyring Secrets. They are read by name, not watched: Secret RBAC is a
-// namespaced get.
+// keyring Secrets. With Reader a passphrase.WatchedReader a pass reads
+// them from its watches, so an idle pass sends no request.
 const MasterKeyPeriod = 30 * time.Second
 
 // MasterKeyRunnable keeps the keyring in step with the passphrase Secret.
@@ -54,9 +54,15 @@ type MasterKeyRunnable struct {
 	// Client writes the keyring Secret.
 	Client client.Client
 
-	// Reader reads the Secrets, the ControllerConfig and the replicas
-	// past the cache. Production wires mgr.GetAPIReader().
+	// Reader reads the Secrets and the ControllerConfig a pass looks
+	// at. Production wires a passphrase.WatchedReader, so a pass that
+	// finds nothing to do sends no request.
 	Reader client.Reader
+
+	// Direct reads the keyring before a write to it, and the replicas
+	// before a keyring is created: Reader trails the API server.
+	// Production wires mgr.GetAPIReader(). Nil is Reader.
+	Direct client.Reader
 
 	// Namespace is blockstor's own namespace, where both Secrets live.
 	Namespace string
@@ -105,7 +111,7 @@ func (r *MasterKeyRunnable) Pass(ctx context.Context) {
 		now = r.Now
 	}
 
-	secrets := passphrase.Secrets{Reader: r.Reader, Namespace: r.Namespace}
+	secrets := passphrase.Secrets{Reader: r.Reader, Namespace: r.Namespace, Direct: r.Direct}
 
 	created, err := passphrase.Bootstrap(ctx, r.Client, secrets, now())
 	if err != nil {
