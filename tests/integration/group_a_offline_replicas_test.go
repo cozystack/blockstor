@@ -249,6 +249,7 @@ func TestGroupADestroyedKernelResourceReadsUnknown(t *testing.T) {
 		reportHealthySecondary(t, stack, rdName+"."+node, peer)
 	}
 
+	stack.Satellite.SimulateKernelResourceDestroyed(rdName, harness.NodeWorker1)
 	reportKernelResourceDestroyed(t, stack, rdName+"."+harness.NodeWorker1)
 
 	table := faultyTable(t, stack, rdName)
