@@ -2384,6 +2384,7 @@ func (r *Reconciler) dropOldConnection(ctx context.Context, resource string, nod
 	delErr := r.cfg.Adm.DelPeerByNodeID(ctx, resource, nodeID)
 
 	forgotten := false
+
 	if withMetadata {
 		forgetErr := r.cfg.Adm.ForgetPeer(ctx, resource, nodeID)
 		forgotten = forgetErr == nil
@@ -5988,12 +5989,14 @@ func isStaleDisklessPeerSlot(dr *intent.DesiredResource, slot drbd.KernelSlot) b
 		return false
 	}
 
+	withDisk := []drbd.DiskState{
+		drbd.DiskStateInconsistent, drbd.DiskStateOutdated,
+		drbd.DiskStateConsistent, drbd.DiskStateUpToDate,
+	}
+
 	for _, state := range slot.PeerDiskStates {
-		switch drbd.DiskState(state) {
-		case drbd.DiskStateInconsistent, drbd.DiskStateOutdated,
-			drbd.DiskStateConsistent, drbd.DiskStateUpToDate:
+		if slices.Contains(withDisk, drbd.DiskState(state)) {
 			return true
-		default:
 		}
 	}
 

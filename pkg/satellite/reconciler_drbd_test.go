@@ -7355,7 +7355,7 @@ func TestRecoverFromBitmapBothDisksBubblesDelPeerErr(t *testing.T) {
 // Failures of the drop in TestRecoverFromBitmapBothDisksBubblesDelPeerErr.
 var (
 	errDelPeerFailed       = errors.New("del-peer failed")
-	errForgetPeerConnected = errors.New("Failure: (102) Device has a net-config (use disconnect first)")
+	errForgetPeerConnected = errors.New("pvc-tb-relocate: Failure: (125) Device has a net-config (use disconnect first)")
 )
 
 // TestIsBitmapDropBothDisksErr pins the predicate that drives the
