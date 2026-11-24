@@ -2231,6 +2231,49 @@ func (a *Adm) EvaluateDownVeto(ctx context.Context, resource string) DownVeto {
 	return DownAllowed
 }
 
+// HasAttachedDisk reports whether any of the named resource's local
+// volumes has a disk attached in the kernel: a `disk:` state other
+// than Diskless, Detaching or Failed in `drbdsetup status --verbose`.
+// A slot with no volume at all, which a diskless replica's slot is
+// between `new-resource` and its minors, has none, where
+// HasDisklessVolume finds no not-attached volume either and so cannot
+// tell it from an attached one. A detach is only for an attached disk:
+// drbdadm refuses one on a resource whose configuration has no disk.
+//
+// The convention matches HasDisklessVolume, except that a failed
+// probe is returned: the caller decides what an unknown state means.
+// A slot that is not loaded is not a failed probe: drbdsetup says so
+// in words ("No such resource" while a down is in flight), and a
+// resource the kernel no longer holds has no disk attached, whatever
+// the replica's configuration says.
+func (a *Adm) HasAttachedDisk(ctx context.Context, resource string) (bool, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose", resource)
+	if isResourceNotLoadedErr(err, out) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, errors.Wrapf(err, "drbdsetup status --verbose %s", resource)
+	}
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		for field := range strings.FieldsSeq(line) {
+			state, local := strings.CutPrefix(field, "disk:")
+			if !local {
+				continue
+			}
+
+			switch state {
+			case "Diskless", "Detaching", "Failed":
+			default:
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
 // HasDisklessVolume reports whether any of the named resource's
 // volumes are currently in a "not-attached" disk state in the
 // kernel — specifically `Diskless`, `Detaching`, or `Failed`. Used
