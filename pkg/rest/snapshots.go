@@ -732,6 +732,8 @@ func (s *Server) hydrateSnapshotFromRD(ctx context.Context, snap *apiv1.Snapshot
 		return err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
+	vds = apiv1.LiveVolumeDefinitions(vds)
+
 	vdPropsByNumber := make(map[int32]map[string]string, len(vds))
 	for _, vd := range vds {
 		if len(vd.Props) > 0 {

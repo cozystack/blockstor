@@ -152,6 +152,12 @@ type drbdsetupStatusResource struct {
 	// so a snapshot's resume is only reported once the kernel agrees.
 	// Pointer so a drbd-utils that omits the key reads as unknown.
 	SuspendedUser *bool `json:"suspended-user"`
+	// The other suspension reasons the kernel holds the resource's I/O
+	// for. RemoveMinorsKeepingQuorum relaxes the quorum policy only on
+	// a resource that has none of them, nor SuspendedUser.
+	SuspendedNoData  bool `json:"suspended-no-data"`
+	SuspendedFencing bool `json:"suspended-fencing"`
+	SuspendedQuorum  bool `json:"suspended-quorum"`
 	// Devices is the local per-volume state. The Bug 366
 	// recovery-promote reads `disk-state` to confirm THIS node is
 	// locally UpToDate (a viable SyncSource) before promoting.
@@ -172,6 +178,11 @@ type drbdsetupStatusDevice struct {
 	// target `drbdsetup new-current-uuid --clear-bitmap <minor>` at the
 	// specific stuck volume.
 	Minor int32 `json:"minor"`
+	// Quorum is whether DRBD counts the volume as having quorum. A
+	// pointer, so an output without the key is not read as false or true.
+	Quorum *bool `json:"quorum"`
+	// Open is whether the volume's device has an opener.
+	Open bool `json:"open"`
 }
 
 // drbdsetupStatusConnection is one peer connection slot, as emitted by
@@ -440,4 +451,15 @@ func attachedVolumeSet(devices []drbdsetupStatusDevice) map[int32]struct{} {
 	}
 
 	return out
+}
+
+// drbdsetupShowResource is the part of `drbdsetup show <res> --json` the
+// quorum recheck reads. drbdsetup leaves an option at its default out, so
+// an empty string is the default: quorum off and on-no-quorum suspend-io
+// (DRBD_QUORUM_DEF and DRBD_ON_NO_QUORUM_DEF in drbd_limits.h).
+type drbdsetupShowResource struct {
+	Options struct {
+		Quorum     string `json:"quorum"`
+		OnNoQuorum string `json:"on-no-quorum"`
+	} `json:"options"`
 }

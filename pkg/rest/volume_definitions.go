@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -1039,34 +1040,31 @@ func mergeVolumeDefinitionPatch(existing *apiv1.VolumeDefinition, patch *volumeD
 	deletePropNamespaces(existing.Props, patch.DeleteNamespaces)
 }
 
-// handleVDDelete drops a VolumeDefinition under an RD.
+// handleVDDelete deletes a VolumeDefinition the way LINSTOR's
+// CtrlVlmDfnDeleteApiCallHandler does: refused while a replica is in use,
+// and under `StorDriver/Zfs/DeleteStrategy` DELETE while the definition has
+// snapshots; otherwise the definition is flagged DELETE, every replica's
+// satellite deletes its own volume of it (ZFS renaming a zvol that still has
+// snapshots, as a replica delete does), and the definition leaves the
+// resource definition once every replica has confirmed. The answer waits
+// for that the way LINSTOR's waits for its satellites, up to the same budget
+// a replica delete waits, and says which nodes it is still waiting on when
+// the budget runs out. The definition stays, flagged DELETE, until they
+// confirm or `node lost` takes their replicas away; the controller finishes
+// the delete then. A definition with no replicas goes at once.
 //
-// Idempotent on NotFound (Bug 66): both NotFound shapes — the parent
-// RD missing AND the (rd, vn) pair missing inside an extant RD — fold
-// into a 200 + warn-mask envelope. linstor-csi's ControllerExpand /
-// shrink paths re-issue `vd d` on retry; the bare 404 used to crash
-// the Python CLI on its XML decoder fallback (see Bug 56 commentary).
+// Idempotent on NotFound (Bug 66): both NotFound shapes, the parent RD
+// missing and the (rd, vn) pair missing inside an extant RD, fold into a
+// 200 + warn-mask envelope. linstor-csi's ControllerExpand / shrink paths
+// re-issue `vd d` on retry. A repeated delete of a definition still
+// flagged joins the delete in flight.
 //
-// Bug 355 (P2): refuses with 409 + FAIL_IN_USE | MASK_ERROR ONLY when
-// at least one Resource on the parent RD is observed in-use
-// (`state.in_use == true`, i.e. DRBD Primary with a mounted consumer).
-// Mirrors upstream LINSTOR's CtrlVlmDfnDeleteApiCallHandler:
-// `anyResourceInUsePrivileged` is the sole refusal cause; otherwise
-// upstream cascades markDeleted(vlm) per replica, markDeleted(vlmDfn),
-// and updateSatellites triggers per-node teardown. The mere existence
-// of Secondary replicas is NOT a refusal cause.
-//
-// Earlier Bug 186 hardening (task #329) refused on ANY referencing
-// Resource — stricter than upstream and broke `linstor vd d <rd> 0`
-// on every multi-replica RD. The surfaced Correction suggested
-// `?force=true`, a query parameter the REST handler honoured but
-// for which linstor-client offers no flag — the operator was left
-// with no escape hatch via the standard CLI.
-//
-// `?force=true` is preserved as a transport-level escape so curl
-// scripts can still bypass the refusal, but the surfaced Correction
-// now points at operator-actionable remedies (demote the Primary,
-// unmount the consumer) instead of the hidden flag.
+// Bug 355 (P2): refuses with 409 + FAIL_IN_USE | MASK_ERROR only when at
+// least one Resource on the parent RD is observed in-use (DRBD Primary with
+// a mounted consumer), LINSTOR's `anyResourceInUsePrivileged`. Secondary
+// replicas are no refusal cause. `?force=true` is a transport-level escape
+// from that refusal for curl scripts; linstor-client has no flag for it.
+// Nothing escapes the ZFS strategy refusal, as in LINSTOR.
 func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	force := isForce(r)
@@ -1079,16 +1077,9 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug 365 (P2, hunt-caught 2026-06-02): reject out-of-range
-	// volume_number before the store-level Delete masks it as
-	// "already absent". Pre-fix `vd d <rd> -1`, `vd d <rd> 65536`
-	// and `vd d <rd> 99999` all returned 200 + warnVDNotFound,
-	// silently telling operators their bogus input was valid (the
-	// store can never have persisted such a row because Bug 363
-	// rejects it at vd c). The mismatch confused tooling that
-	// audits idempotent deletes for "the row was there but now
-	// isn't" semantics. Bug 363 already pins the [0, 65535] range
-	// at create-time; this gate mirrors it at the DELETE wire
-	// boundary so the contract is symmetric.
+	// volume_number before the store masks it as "already absent". Bug 363
+	// pins the [0, 65535] range at create-time; this gate mirrors it at
+	// the DELETE wire boundary so the contract is symmetric.
 	vnErr := validateVolumeNumber(vn)
 	if vnErr != nil {
 		writeVDNumberRejection(w, rd, vn, vnErr)
@@ -1096,164 +1087,167 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 355: pre-Delete walk of in-use Resources. Runs BEFORE the
-	// store-level Delete so a refused call leaves the VD spec and
-	// every dependent Resource.Volumes row untouched — partial-state
-	// after a rejected DELETE would be a worse failure mode than the
-	// bug itself.
+	// Both refusals run before anything is written: a refused delete
+	// leaves the definition exactly as it was.
 	if !force && s.refuseVDDeleteIfReferenced(w, r, rd, vn) {
 		return
 	}
 
-	// LINSTOR's ZFS delete strategy applies to a volume definition delete
-	// as to a replica's.
 	if s.refuseZFSDeleteStrategy(w, r, rd) {
 		return
 	}
 
-	// Bug 202: capture the VD pre-Delete so the post-Delete re-walk
-	// has something to restore if a racing `r c` slipped between the
-	// pre-walk and the store-level Delete. Capture-after-refuse
-	// matches the Bug 174 ordering (deleteWithRollback in
-	// pkg/rest/delete_toctou.go) — a refused call discards the
-	// snapshot anyway, so we don't waste the Get on the refusal path.
-	captured, capturedOK := s.captureVolumeDefinition(r.Context(), rd, vn)
-
-	err = s.Store.VolumeDefinitions().Delete(r.Context(), rd, vn)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		writeStoreError(w, err)
-
-		return
-	}
-
+	_, _, err = store.MarkVolumeDefinitionDeleted(r.Context(), s.Store, rd, vn)
 	if err != nil {
-		// Bug 139: even on the idempotent no-op branch, drain the
-		// local cache so a re-issued DELETE during a real delete-in-
-		// flight is still read-your-writes on the follow-up view.
+		if !errors.Is(err, store.ErrNotFound) {
+			writeStoreError(w, err)
+
+			return
+		}
+
+		// Bug 139: even on the idempotent no-op branch, drain the local
+		// cache so a re-issued DELETE during a real delete in flight is
+		// still read-your-writes on the follow-up view.
 		s.waitForVDDeletionVisible(r.Context(), rd, vn)
 
 		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 			RetCode: warnVDNotFound,
-			Message: fmt.Sprintf("volume definition already absent: %s/%d", rd, vn),
+			Message: "Resource definition: " + rd + ", Volume number: " + strconv.FormatInt(int64(vn), 10) + " not found.",
+			ObjRefs: vdObjRefs(rd, vn),
 		}})
 
 		return
 	}
 
-	// Bug 202: post-Delete re-walk. A racing `r c <rd>.<node>` +
-	// Primary promotion may have slipped between the pre-walk and the
-	// Delete above: the pre-walk saw no in-use Resource, then the
-	// racing create + Primary promotion persisted, then we dropped the
-	// VD spec out from under a now-mounted Primary. The post-walk
-	// catches that ordering, restores the captured VD via store
-	// Create, and surfaces the same 409 envelope the pre-walk would
-	// have emitted. Narrowed alongside Bug 355: only an in-use racer
-	// rolls back; a Secondary-only racer is part of the upstream
-	// cascade. Skipped on the explicit `?force=true` bypass and on
-	// the capture-miss path (idempotent-delete replay — nothing to
-	// roll back to).
-	if !force && capturedOK && s.rollbackVDDeleteIfRaced(w, r, rd, vn, &captured) {
-		return
-	}
-
-	// Bug 139: prune the deleted VolumeNumber off each child
-	// Resource's Status.Volumes, then wait for the VD delete to be
-	// observable on the local store. The satellite reconciler
-	// eventually re-stamps Status.Volumes when it re-applies after
-	// the RD spec change, but the gap surfaces the dropped volume
-	// on `view/resources` for tens of seconds. Pre-stamping the
-	// Status.Volumes update here closes the gap synchronously.
-	s.pruneVolumesFromResources(r.Context(), rd, vn)
-	s.waitForVDDeletionVisible(r.Context(), rd, vn)
-
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: fmt.Sprintf("volume definition deleted: %s/%d", rd, vn),
-	}})
-}
-
-// captureVolumeDefinition grabs a snapshot of the VD spec so the
-// Bug 202 post-Delete re-walk has something to restore when a racing
-// `r c <rd>.<node>` slipped past the Bug 186 pre-walk. The second
-// return is false when the VD no longer exists at capture time
-// (benign idempotent-delete replay) — the rollback path is skipped
-// in that case.
-func (s *Server) captureVolumeDefinition(ctx context.Context, rd string, vn int32) (apiv1.VolumeDefinition, bool) {
-	vd, err := s.Store.VolumeDefinitions().Get(ctx, rd, vn)
-	if err != nil {
-		return apiv1.VolumeDefinition{}, false
-	}
-
-	return vd, true
-}
-
-// rollbackVDDeleteIfRaced runs the Bug 202 post-Delete re-walk.
-// If a racing `r c <rd>.<node>` + Primary promotion landed between
-// the pre-walk and the Delete, restore the captured VD via store
-// Create and write the 409 envelope the pre-walk would have
-// written. Returns true when the rollback fired (HTTP error already
-// written, caller must stop) and false when the delete is safe to
-// commit. Mirrors Bug 174's `rollbackRGDeleteIfRaced` shape — same
-// Bug 178 5xx envelope when the restore Create itself fails so the
-// operator gets an actionable signal that the deleted primary may
-// need manual restoration.
-//
-// Bug 355: re-walk uses the same narrowed in-use signal as the
-// pre-walk. A Secondary-only racer is part of the upstream cascade
-// path and MUST NOT trigger rollback; only an in-use racer (Primary
-// + mounted consumer that appeared during the TOCTOU window) signals
-// "this delete is unsafe, restore the VD and refuse".
-func (s *Server) rollbackVDDeleteIfRaced(
-	w http.ResponseWriter,
-	r *http.Request,
-	rd string,
-	vn int32,
-	captured *apiv1.VolumeDefinition,
-) bool {
-	inUse, err := s.resourcesInUseOnDefinition(r.Context(), rd)
+	progress, err := s.waitForVDDeleteFinished(r.Context(), rd, vn)
 	if err != nil {
 		writeStoreError(w, err)
 
-		return true
+		return
 	}
 
-	if len(inUse) == 0 {
+	if progress.Removed {
+		// Bug 139: prune the deleted VolumeNumber off each child
+		// Resource's Volumes and wait for the removal to be observable on
+		// the local store, so the next `v l` on this replica does not
+		// still show the volume.
+		s.pruneVolumesFromResources(r.Context(), rd, vn)
+		s.waitForVDDeletionVisible(r.Context(), rd, vn)
+	}
+
+	writeJSON(w, http.StatusOK, vdDeleteAnswer(rd, vn, progress))
+}
+
+// vdDescription is LINSTOR's inline name of a volume definition, capitalised
+// as its answers start with it.
+func vdDescription(rd string, vn int32) string {
+	return "Volume definition with number '" + strconv.FormatInt(int64(vn), 10) +
+		"' of resource definition '" + rd + "'"
+}
+
+func vdObjRefs(rd string, vn int32) map[string]string {
+	return map[string]string{
+		objRefRscDfn: rd,
+		objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+	}
+}
+
+// vdDeleteAnswer is the delete's answer in LINSTOR's order: the definition
+// marked for deletion, each replica that deleted its volume, and then either
+// the definition deleted or the nodes it still waits on.
+func vdDeleteAnswer(rd string, vn int32, progress store.VolumeDefinitionDeleteProgress) []apiv1.APICallRc {
+	answer := []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: vdDescription(rd, vn) + " marked for deletion.",
+		ObjRefs: vdObjRefs(rd, vn),
+	}}
+
+	for _, node := range progress.Confirmed {
+		answer = append(answer, apiv1.APICallRc{
+			RetCode: maskInfo,
+			Message: "Deleted volume " + strconv.FormatInt(int64(vn), 10) + " of '" + rd + "' on '" + node + "'",
+			ObjRefs: vdObjRefs(rd, vn),
+		})
+	}
+
+	if progress.Removed {
+		return append(answer, apiv1.APICallRc{
+			RetCode: maskInfo,
+			Message: vdDescription(rd, vn) + " deleted.",
+			ObjRefs: vdObjRefs(rd, vn),
+		})
+	}
+
+	return append(answer, apiv1.APICallRc{
+		RetCode: warnDeleteInProgress,
+		Message: "deletion of volume " + strconv.FormatInt(int64(vn), 10) + " of '" + rd + "' is in progress on " +
+			strings.Join(progress.Pending, ", ") + ": the satellite has not confirmed yet that the volume's storage is gone",
+		Details: "The volume definition stays listed with the DELETE flag until every replica's satellite has deleted its volume. " +
+			"A satellite that is not running holds it until it starts again; for a node that is gone for good, use `node lost`.",
+		ObjRefs: vdObjRefs(rd, vn),
+	})
+}
+
+// vdDeleteWaitBudget bounds how long `vd d` waits for the replicas to
+// confirm before it answers "in progress". One confirmation is a chain: the
+// definition update reaches the satellite, its reconcile runs `drbdadm
+// adjust`, deletes the storage and writes the status, and the controller
+// wakes on it. That often takes longer than a cache convergence, and an
+// answer given early sends an immediate `vd c` of the same number into a
+// refusal. LINSTOR answers once its satellites have.
+const vdDeleteWaitBudget = 30 * time.Second
+
+// vdDeleteFirstPoll and vdDeleteMaxPoll bound the back-off between the
+// attempts to finish the delete. Each attempt reads the definition, its
+// spellings and its replicas uncached, so a fast confirmation is seen
+// quickly while a slow one costs a few dozen calls rather than hundreds.
+const (
+	vdDeleteFirstPoll = 100 * time.Millisecond
+	vdDeleteMaxPoll   = time.Second
+)
+
+// waitForVDDeleteFinished tries to finish the delete until it holds, the
+// budget runs out, or every replica it still waits for is on a node whose
+// satellite is OFFLINE, which will not confirm before it is back. The
+// controller keeps trying after that; a later answer is not needed for the
+// delete to complete.
+func (s *Server) waitForVDDeleteFinished(ctx context.Context, rd string, vn int32) (store.VolumeDefinitionDeleteProgress, error) {
+	deadline := time.Now().Add(vdDeleteWaitBudget)
+	poll := vdDeleteFirstPoll
+
+	for {
+		progress, err := store.FinishVolumeDefinitionDelete(ctx, s.Store, rd, vn)
+		if err != nil {
+			return progress, fmt.Errorf("finish the delete of volume definition %s/%d: %w", rd, vn, err)
+		}
+
+		if progress.Removed || time.Now().After(deadline) || s.allOffline(ctx, progress.Pending) {
+			return progress, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return progress, nil
+		case <-time.After(poll):
+		}
+
+		poll = min(2*poll, vdDeleteMaxPoll)
+	}
+}
+
+// allOffline reports whether every named node's satellite is explicitly
+// OFFLINE. A node it cannot read counts as online, so the wait is never cut
+// short on a guess.
+func (s *Server) allOffline(ctx context.Context, nodes []string) bool {
+	if len(nodes) == 0 {
 		return false
 	}
 
-	// Bug 178: a Create error here used to be silently swallowed in
-	// sibling rollback paths, so the cluster ended up with the VD
-	// deleted, a racing Resource still on the parent RD, and the
-	// operator handed a 409 "still referenced" envelope while
-	// staring at a cluster whose VD row no longer exists. Surface
-	// a 5xx envelope that names the rollback failure explicitly.
-	createErr := s.Store.VolumeDefinitions().Create(r.Context(), rd, captured)
-	if createErr != nil {
-		writeRollbackRestoreFailure(r.Context(), w, createErr,
-			"volume definition", fmt.Sprintf("%s/%d", rd, vn),
-			"linstor vd l "+rd)
-
-		return true
+	for _, node := range nodes {
+		if isNodeOnline(ctx, s.Store.Nodes(), node) {
+			return false
+		}
 	}
-
-	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-		RetCode: apiCallRcError | apiCallRcFailInUse,
-		Message: fmt.Sprintf(
-			"Volume definition %d on resource definition %q cannot be "+
-				"deleted because the resource is in use on %s.",
-			vn, rd, strings.Join(inUse, ", ")),
-		Cause: fmt.Sprintf(
-			"%d resource replica(s) on %q report in_use=true (DRBD "+
-				"Primary with a mounted consumer): %s",
-			len(inUse), rd, strings.Join(inUse, ", ")),
-		Correc: "Demote the Primary on the listed node(s) first " +
-			"(`linstor r role-demote " + rd + " <node>`) or unmount " +
-			"the consumer of the PVC backed by " + rd + ", then retry.",
-		ObjRefs: map[string]string{
-			objRefRscDfn: rd,
-			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
-		},
-	}})
 
 	return true
 }

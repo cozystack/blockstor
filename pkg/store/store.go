@@ -353,6 +353,14 @@ type VolumeDefinitionStore interface {
 	Update(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
 	Delete(ctx context.Context, rdName string, volumeNumber int32) error
 
+	// RemoveDeleted removes the volume definition only while it is the one
+	// flagged DELETE under deleteID, the last step of a volume definition
+	// delete (see FinishVolumeDefinitionDelete). A definition re-created
+	// under the same number since is another volume, and this refuses it
+	// with ErrVolumeDefinitionNotDeleting rather than delete it unasked.
+	// An absent definition is ErrNotFound.
+	RemoveDeleted(ctx context.Context, rdName string, volumeNumber int32, deleteID string) error
+
 	// PatchVolumeDefinitionSpec runs `mutate` against the freshly-
 	// fetched VolumeDefinition wire value (resolved out of the parent
 	// RD's spec.volumeDefinitions[] by volumeNumber) and persists the

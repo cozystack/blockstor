@@ -954,7 +954,15 @@ func volumeRefsFromRD(rd *blockstoriov1alpha1.ResourceDefinition) []blockstoriov
 
 	out := make([]blockstoriov1alpha1.SnapshotVolumeRef, 0, len(rd.Spec.VolumeDefinitions))
 
-	for _, vd := range rd.Spec.VolumeDefinitions {
+	for i := range rd.Spec.VolumeDefinitions {
+		vd := &rd.Spec.VolumeDefinitions[i]
+
+		// A volume flagged DELETE is gone on the replicas that already
+		// confirmed it; asking them for it would fail the snapshot.
+		if vd.Deleting() {
+			continue
+		}
+
 		props := store.TravellingProps(vd.Props)
 		if props == nil {
 			props = map[string]string{}

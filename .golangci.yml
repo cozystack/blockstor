@@ -74,6 +74,7 @@ linters:
           - GroupID
           - SharedSpaceID
           - KeyID
+          - DeleteID
     dupl:
       threshold: 100
     goconst:
