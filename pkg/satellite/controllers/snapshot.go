@@ -233,6 +233,15 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 		return r.handleResumePhase(ctx, snap)
 	}
 
+	// The controller recorded how the take ended. A suspend order next
+	// to that record is stale, written by a pass that never saw it, and
+	// a window opened for it would freeze I/O for a take that is over;
+	// it is read as the resume the controller has already decided on,
+	// which also closes a window this node still holds for it.
+	if snap.Spec.SuspendIO && snapshotTakeEnded(snap) {
+		return r.handleResumePhase(ctx, snap)
+	}
+
 	// Phase 1: parent RD I/O suspend. Per-node ack lives on
 	// Status.NodeStatus[us].SuspendIOAcked.
 	if snap.Spec.SuspendIO && !acked {
@@ -265,6 +274,27 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	}
 
 	return r.handleTakeSnapshotPhase(ctx, snap)
+}
+
+// snapshotTakeEnded reports whether the controller recorded an outcome
+// for snap's take: an abort reason, in the spec or in the annotation an
+// older writer cannot drop, or an outcome flag on the status. The
+// controller never orders a suspend for such a snapshot again.
+func snapshotTakeEnded(snap *blockstoriov1alpha1.Snapshot) bool {
+	if snap.Spec.AbortReason != "" || snap.Annotations[blockstoriov1alpha1.AnnotationSnapshotAbortReason] != "" {
+		return true
+	}
+
+	return slices.ContainsFunc(snap.Status.Flags, func(flag string) bool {
+		switch flag {
+		case blockstoriov1alpha1.SnapshotStatusFlagSuccessful,
+			blockstoriov1alpha1.SnapshotStatusFlagFailed,
+			blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect:
+			return true
+		}
+
+		return false
+	})
 }
 
 // handleSuspendPhase dispatches Phase 1: flush, suspend I/O for the
@@ -855,14 +885,10 @@ func collapseNodeStatus(
 
 // stampSnapshotPerNodeReady upserts our node's entry in
 // Status.NodeStatus with Ready=true and the satellite-reported
-// CreateTimestamp. This is the missing half of the Bug 106 fix:
-// the apiserver's `stampSnapshotSuccessful` derivation reads
-// `Snapshots[].CreateTimestamp` to decide whether every diskful
-// peer reported back, and without this write nothing ever populates
-// it (commit 3c593c5f7 shipped the apiserver-side derivation but
-// no code path was writing the stamp). Once every diskful peer has
-// upserted, the apiserver flips the snapshot from "Incomplete" to
-// "Successful" in the wire view.
+// CreateTimestamp. Once every targeted node has upserted, the
+// controller-side SnapshotReconciler resumes I/O and records
+// SUCCESSFUL on the Snapshot's status, which the wire view serves
+// from then on.
 //
 // Concurrent satellites race against each other on the same Status
 // subresource — the optimistic-lock conflict is retried up to

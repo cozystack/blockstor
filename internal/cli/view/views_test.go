@@ -156,6 +156,7 @@ func TestSnapshotList(t *testing.T) {
 		ResourceName:      "pvc-x",
 		Nodes:             []string{"node-1", "node-2"},
 		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 1 << 20}},
+		Flags:             []string{apiv1.SnapshotFlagSuccessful},
 	}})
 
 	assertColumns(t, tbl, []string{"ResourceName", "SnapshotName", "NodeNames", "Volumes", "Created", "State"})
@@ -170,6 +171,26 @@ func TestSnapshotList(t *testing.T) {
 
 	if got := cellAt(t, tbl, 0, "State"); got != "Successful" {
 		t.Errorf("State = %q, want Successful", got)
+	}
+
+	// No SUCCESSFUL recorded yet: the take is not over, whatever the
+	// nodes have reported so far.
+	taking := view.SnapshotList([]apiv1.Snapshot{{
+		Name: "snap-new", ResourceName: "pvc-x", Nodes: []string{"node-1"},
+		Snapshots: []apiv1.SnapshotPerNode{{NodeName: "node-1", CreateTimestamp: 1}},
+	}})
+
+	if got := cellAt(t, taking, 0, "State"); got != "Incomplete" {
+		t.Errorf("State for a snapshot with no SUCCESSFUL recorded = %q, want Incomplete", got)
+	}
+
+	deleting := view.SnapshotList([]apiv1.Snapshot{{
+		Name: "snap-old", ResourceName: "pvc-x",
+		Flags: []string{apiv1.SnapshotFlagSuccessful, apiv1.SnapshotFlagDelete},
+	}})
+
+	if got := cellAt(t, deleting, 0, "State"); got != "DELETING" {
+		t.Errorf("State for a deleting snapshot = %q, want DELETING", got)
 	}
 
 	failed := view.SnapshotList([]apiv1.Snapshot{{
