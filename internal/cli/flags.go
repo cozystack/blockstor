@@ -133,6 +133,8 @@ var valueFlags = map[string]struct{}{ //nolint:gochecknoglobals // static flag t
 	"--output-fmt":          {},
 	"--output-version":      {},
 	"-o":                    {},
+	"--kubeconfig":          {},
+	"--context":             {},
 }
 
 // parseFlags walks the argument tail.

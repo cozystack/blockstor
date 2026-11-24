@@ -108,6 +108,12 @@ type Config struct {
 	// short-circuits — neither Watches consumer nor producer fires.
 	ReconcileTrigger chan event.GenericEvent
 
+	// ApplyLocks keeps the startup MetadataCreated backfill off a
+	// resource while its apply pass runs; see ResourceLocks.
+	// NewManager wires one shared by both. Left nil, nothing is
+	// locked.
+	ApplyLocks *ResourceLocks
+
 	// UeventListener is the optional source of kernel block-device
 	// uevents the PhysicalDeviceDiscoveryRunnable reacts to. The
 	// satellite's cmd/satellite/main.go opens
