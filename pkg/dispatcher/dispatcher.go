@@ -267,7 +267,29 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		// Threaded verbatim (pointer tri-state preserved): nil/false →
 		// no skip, true → skip.
 		SkipInitialSync: copyBoolPtr(target.Spec.SkipInitialSync),
+		PeerSlots:       replicaPeerSlots(target, rd),
 	}
+}
+
+// replicaPeerSlots is the peer-slot count the replica's metadata is
+// created with and its lower disk sized for: the replica's own, which
+// the controller copies from the definition when it allocates the
+// replica's identities, else the definition's, which is what the
+// controller is about to copy. nil, for a replica and definition that
+// both predate the count, is read as the 15 they were created with.
+func replicaPeerSlots(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) *int32 {
+	slots := target.Spec.PeerSlots
+	if slots == nil && rd != nil {
+		slots = rd.Spec.PeerSlots
+	}
+
+	if slots == nil {
+		return nil
+	}
+
+	v := *slots
+
+	return &v
 }
 
 // copyBoolPtr returns a fresh copy of a *bool so the DesiredResource

@@ -103,6 +103,12 @@ type Resource struct {
 	// the call that triggered the pass, and this is what lets a
 	// resize do the same.
 	ApplyFailure *ApplyFailure `json:"-"`
+
+	// PeerSlots is the replica's DRBD peer-slot count, zero when it has
+	// none recorded (created before blockstor recorded one, with 15).
+	// Set on reads only: the controller records it, copying it from the
+	// definition. It reaches the wire in `layer_object.drbd.peer_slots`.
+	PeerSlots int32 `json:"-"`
 }
 
 // ApplyFailure is the error of a failed satellite apply pass, with the

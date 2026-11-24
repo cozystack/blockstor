@@ -63,6 +63,7 @@ const (
 	patchKeyDRBDPort           = "drbdPort"
 	patchKeyDRBDMinor          = "drbdMinor"
 	patchKeySkipInitialSync    = "skipInitialSync"
+	patchKeyPeerSlots          = "peerSlots"
 	resourceDefinitionKindName = "ResourceDefinition"
 )
 
@@ -982,6 +983,18 @@ func (r *ResourceReconciler) allocateResourceSpecFields(
 		target.Spec.SkipInitialSync = &v
 	}
 
+	// The replica's peer slots, copied from the definition as LINSTOR
+	// copies DrbdRscDfnData.peerSlots onto each DrbdRscData it creates,
+	// so a later `rd modify --peer-slots` leaves this replica's metadata
+	// and sizing alone. Stamped in the same patch as the node id, which
+	// the satellite waits for before it creates anything. A replica of a
+	// definition without a count was created with 15 and is stamped so,
+	// which is what the satellite already reads for it. Set-if-nil.
+	if target.Spec.PeerSlots == nil && rd != nil {
+		v := int32(drbd.EffectivePeerSlots(rd.Spec.PeerSlots))
+		target.Spec.PeerSlots = &v
+	}
+
 	return nil
 }
 
@@ -1025,6 +1038,7 @@ func (r *ResourceReconciler) patchResourceSpecIdentities(ctx context.Context, ta
 		patchKeyDRBDNodeID:      target.Spec.DRBDNodeID,
 		patchKeyDRBDPort:        target.Spec.DRBDPort,
 		patchKeySkipInitialSync: target.Spec.SkipInitialSync,
+		patchKeyPeerSlots:       target.Spec.PeerSlots,
 	}}
 
 	patchBytes, err := json.Marshal(body)
@@ -1068,7 +1082,8 @@ func (r *ResourceReconciler) patchResourceStatusIdentities(ctx context.Context, 
 func equalResourceIdentitySpec(a, b *blockstoriov1alpha1.ResourceSpec) bool {
 	return ptrEqI32(a.DRBDNodeID, b.DRBDNodeID) &&
 		ptrEqI32(a.DRBDPort, b.DRBDPort) &&
-		ptrEqBool(a.SkipInitialSync, b.SkipInitialSync)
+		ptrEqBool(a.SkipInitialSync, b.SkipInitialSync) &&
+		ptrEqI32(a.PeerSlots, b.PeerSlots)
 }
 
 func ptrEqBool(a, b *bool) bool {

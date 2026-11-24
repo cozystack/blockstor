@@ -164,7 +164,9 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 		// otherwise undo it, and the RD reconcile would then judge the
 		// volume built under the default and re-pin that over LUKS data.
 		prevLayerStack := existing.Spec.LayerStack
+		prevPeerSlots := existing.Spec.PeerSlots
 		existing.Spec = wireToCRDRDSpec(in)
+		keepPeerSlots(&existing.Spec, prevPeerSlots)
 
 		if len(existing.Spec.LayerStack) == 0 {
 			existing.Spec.LayerStack = prevLayerStack
@@ -284,7 +286,9 @@ func (s *resourceDefinitions) PatchResourceDefinitionSpec(ctx context.Context, n
 		// Skip-init-sync hardening: preserve the append-only initialized
 		// latch across the wire rebuild (mirrors `Update`).
 		prevInitialized := existing.Spec.Initialized
+		prevPeerSlots := existing.Spec.PeerSlots
 		existing.Spec = wireToCRDRDSpec(&wire)
+		keepPeerSlots(&existing.Spec, prevPeerSlots)
 		existing.Spec.VolumeDefinitions = prevVDs
 		existing.Spec.Encryption = prevEncryption
 		// Identity-to-spec: preserve the optional DRBD preferred-port
@@ -404,6 +408,10 @@ func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
 		UUID:              string(crd.UID),
 	}
 
+	if crd.Spec.PeerSlots != nil {
+		out.PeerSlots = *crd.Spec.PeerSlots
+	}
+
 	return out
 }
 
@@ -468,7 +476,7 @@ func wireToCRDRDSpec(in *apiv1.ResourceDefinition) crdv1alpha1.ResourceDefinitio
 	typed, extras := propsToTyped(in.Props)
 	residual := stripDRBDProps(in.Props)
 
-	return crdv1alpha1.ResourceDefinitionSpec{
+	spec := crdv1alpha1.ResourceDefinitionSpec{
 		ExternalName:      in.ExternalName,
 		ResourceGroupName: in.ResourceGroupName,
 		Props:             residual,
@@ -476,5 +484,23 @@ func wireToCRDRDSpec(in *apiv1.ResourceDefinition) crdv1alpha1.ResourceDefinitio
 		LayerStack:        in.LayerStack,
 		DRBDOptions:       typed,
 		ExtraProps:        extras,
+	}
+
+	if in.PeerSlots > 0 {
+		slots := in.PeerSlots
+		spec.PeerSlots = &slots
+	}
+
+	return spec
+}
+
+// keepPeerSlots carries the recorded peer-slot count across a spec
+// rebuilt from a wire value that does not name one. A writer that read
+// the definition carries the count anyway; one that built its value from
+// scratch, as a full-shape PUT does, must not reset a definition whose
+// replicas were created with its count to the 15 a missing count means.
+func keepPeerSlots(spec *crdv1alpha1.ResourceDefinitionSpec, prev *int32) {
+	if spec.PeerSlots == nil {
+		spec.PeerSlots = prev
 	}
 }

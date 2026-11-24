@@ -61,6 +61,14 @@ type ResourceDefinition struct {
 	// the inherited entry rather than thinking the controller-scope
 	// prop never propagated.
 	EffectiveProps EffectiveProperties `json:"effective_props,omitempty"`
+
+	// PeerSlots is the DRBD peer-slot count new replicas of the
+	// definition get; zero when it has none recorded, as a definition
+	// blockstor created before it recorded one has. Stores keep the
+	// recorded count when a write leaves this zero. It reaches the wire
+	// in `layer_data[].data.peer_slots` of the DRBD layer, where LINSTOR
+	// reports it.
+	PeerSlots int32 `json:"-"`
 }
 
 // Layer kind constants — the strings LINSTOR uses on the wire.
@@ -142,6 +150,10 @@ type StorageVolumeLayer struct {
 // to the REST CLI. Subset of upstream LINSTOR's `DrbdRscData` — we
 // only fill in the fields the CLI / linstor-csi actually read.
 type DrbdResourceLayer struct {
+	// PeerSlots is the replica's DRBD peer-slot count, as LINSTOR's
+	// `DrbdResource.peer_slots`.
+	PeerSlots int32 `json:"peer_slots,omitempty"`
+
 	// TCPPorts is the list of DRBD listen ports for this replica;
 	// upstream surfaces this as a list because multi-volume / proxy
 	// setups can advertise more than one. We typically have exactly

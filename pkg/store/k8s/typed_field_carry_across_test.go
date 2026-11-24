@@ -121,6 +121,10 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			"LayerStack":        true,
 			"DRBDOptions":       true, // typed-split out of Props
 			"ExtraProps":        true, // forward-compat shim from Props
+			// Set from the wire's PeerSlots; a write that leaves it
+			// zero keeps the recorded count (keepPeerSlots), since a
+			// missing count reads as the 15 of a legacy definition.
+			"PeerSlots": true,
 		},
 		mustCarryAcross: map[string]bool{
 			// Bug 206: addressed via the separate
@@ -187,6 +191,11 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			// golinstor REST modify can't strip it and flip the
 			// satellite back to the unsafe day0-skip default.
 			"SkipInitialSync": true,
+			// Controller-stamped, settable-once peer-slot count the
+			// replica's metadata was created with. No wire write;
+			// wiping it would make the replica follow a later change
+			// of its definition's count.
+			"PeerSlots": true,
 		},
 	},
 	"StoragePoolSpec": {

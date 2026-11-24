@@ -229,6 +229,22 @@ type ResourceSpec struct {
 	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value()",optionalOldSelf=true,message="drbdNodeID is settable-once: it may go from unset to a value but not be changed once set"
 	DRBDNodeID *int32 `json:"drbdNodeID,omitempty"`
 
+	// peerSlots is the DRBD peer-slot count this replica's metadata is
+	// created with (`create-md --max-peers`) and its lower disk is sized
+	// for. The controller copies it from the definition when it
+	// allocates the replica's identities, as LINSTOR copies the
+	// definition's count to each replica it creates, so changing the
+	// definition's count later leaves the replicas already there alone.
+	//
+	// Unset means a replica created before blockstor recorded a count,
+	// which was created with 15; the satellite reads it so. Settable
+	// once: the metadata on disk does not change with it.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=31
+	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value()",optionalOldSelf=true,message="peerSlots is settable-once: the replica's metadata was created with it"
+	PeerSlots *int32 `json:"peerSlots,omitempty"`
+
 	// skipInitialSync is the controller-authoritative, persisted decision
 	// of whether THIS replica may skip the DRBD initial sync (come up
 	// instantly UpToDate via the day0 `set-gi` seed) or MUST run a real

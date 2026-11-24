@@ -106,6 +106,11 @@ func (s *inMemoryResourceDefinitions) Update(_ context.Context, rd *apiv1.Resour
 	if len(next.LayerStack) == 0 {
 		next.LayerStack = prev.LayerStack
 	}
+	// A write that names no peer-slot count keeps the recorded one, as
+	// on the k8s store.
+	if next.PeerSlots == 0 {
+		next.PeerSlots = prev.PeerSlots
+	}
 	// Bug-021: nil wire annotations = "untouched"; empty = "clear".
 	// Mirrors the k8s store's mergeUserAnnotationsInto contract.
 	next.Annotations = carryAnnotationsOnNil(next.Annotations, prev.Annotations)

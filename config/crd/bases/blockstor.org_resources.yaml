@@ -314,6 +314,27 @@ spec:
               nodeName:
                 description: nodeName is the satellite hosting this replica.
                 type: string
+              peerSlots:
+                description: |-
+                  peerSlots is the DRBD peer-slot count this replica's metadata is
+                  created with (`create-md --max-peers`) and its lower disk is sized
+                  for. The controller copies it from the definition when it
+                  allocates the replica's identities, as LINSTOR copies the
+                  definition's count to each replica it creates, so changing the
+                  definition's count later leaves the replicas already there alone.
+
+                  Unset means a replica created before blockstor recorded a count,
+                  which was created with 15; the satellite reads it so. Settable
+                  once: the metadata on disk does not change with it.
+                format: int32
+                maximum: 31
+                minimum: 1
+                type: integer
+                x-kubernetes-validations:
+                - message: 'peerSlots is settable-once: the replica''s metadata was
+                    created with it'
+                  optionalOldSelf: true
+                  rule: '!oldSelf.hasValue() || self == oldSelf.value()'
               props:
                 additionalProperties:
                   type: string
