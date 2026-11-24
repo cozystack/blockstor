@@ -110,3 +110,52 @@ func seedDiskful(t *testing.T, st store.Store, nodes ...string) {
 		}
 	}
 }
+
+// A create that finds a witness the tiebreaker reconciler wrote during
+// the placement takes it over, and the autoplace has to wait for it as
+// for any replica it placed: LINSTOR's autoplace takes a TieBreaker over
+// and keeps it in deployedResources. A witness already being deleted is
+// not taken over, so it is not waited for either.
+func TestPlaceDeployedCountsWitnessTakenOverMidPlacement(t *testing.T) {
+	t.Parallel()
+
+	nodes := []string{"n1", "n2", "n3"}
+
+	for _, tc := range []struct {
+		name  string
+		build func(inner store.Store) store.Store
+		want  []string
+	}{
+		{
+			name:  "witness taken over after already exists",
+			build: func(inner store.Store) store.Store { return witnessOnSecondReplica{Store: inner, nodes: nodes} },
+			want:  nodes,
+		},
+		{
+			name: "witness being deleted is not deployed to",
+			build: func(inner store.Store) store.Store {
+				return witnessDuringPlacement{Store: inner, node: "n1", flags: terminatingWitness()}
+			},
+			want: []string{"n2", "n3"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			inner := store.NewInMemory()
+			seedStore(t, inner, nodes)
+
+			got, err := placer.New(tc.build(inner)).PlaceDeployed(t.Context(), "pvc-1", &apiv1.AutoSelectFilter{PlaceCount: 3})
+			if err != nil {
+				t.Fatalf("PlaceDeployed: %v", err)
+			}
+
+			deployed := slices.Clone(got.Deployed)
+			slices.Sort(deployed)
+
+			if !slices.Equal(deployed, tc.want) {
+				t.Errorf("deployed: got %v, want %v", deployed, tc.want)
+			}
+		})
+	}
+}
