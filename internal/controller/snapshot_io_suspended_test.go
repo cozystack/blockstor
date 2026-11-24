@@ -164,7 +164,10 @@ func TestSnapshotAbortResumesWhenTheIOSuspendedStampFails(t *testing.T) {
 	}
 }
 
-var errSiblingListBroken = errors.New("sibling list broken")
+var (
+	errSiblingListBroken = errors.New("sibling list broken")
+	errSnapshotModified  = errors.New("object has been modified")
+)
 
 // A failed stamp is reported beside a pass's own failure, never folded
 // into it: a stamp that lost to a concurrent write is a 409, and a 409
@@ -184,7 +187,7 @@ func TestSnapshotStampConflictDoesNotMaskThePassError(t *testing.T) {
 
 	conflict := apierrors.NewConflict(
 		schema.GroupResource{Group: blockstoriov1alpha1.GroupVersion.Group, Resource: "snapshots"},
-		snap.Name, errors.New("object has been modified"))
+		snap.Name, errSnapshotModified)
 
 	cli := interceptor.NewClient(
 		fake.NewClientBuilder().WithScheme(scheme).
