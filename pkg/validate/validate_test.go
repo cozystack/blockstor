@@ -357,6 +357,13 @@ func TestMidSyncDeleteRefusalLiftedWhileDefinitionIsDeleted(t *testing.T) {
 		"balancing off by hand with a Primary": {
 			balancingOff, append([]apiv1.Resource{primary}, stranded...), false,
 		},
+		// A hand move of a volume nothing has attached looks like
+		// DeleteVolume from the definition, so the guard is lifted and
+		// dropping the only UpToDate copy mid-sync goes through, as it
+		// does in LINSTOR. Deliberate; see DefinitionBeingDeleted.
+		"balancing off by hand, nothing InUse": {
+			balancingOff, append([]apiv1.Resource{secondary}, stranded...), true,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

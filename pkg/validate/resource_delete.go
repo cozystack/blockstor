@@ -118,11 +118,17 @@ func MidSyncDeleteRefusal(target *apiv1.Resource, siblings []apiv1.Resource) boo
 // that they are one volume teardown.
 //
 // The same property is what an operator sets to place replicas by hand,
-// and a hand placement is exactly where U130 happens: a second diskful
-// added next to a diskless Primary and the original dropped before the
-// sync finishes. So the property alone counts only while nothing is
-// InUse, which is the state DeleteVolume waits for and a volume with a
-// Primary is never in.
+// and a hand placement is where U130 happens: a second diskful added and
+// the original dropped before the sync finishes. So the property alone
+// counts only while nothing is InUse, which is the state DeleteVolume
+// waits for. That keeps the guard for a hand placement next to a
+// Primary, and only for that one. An operator who switches balancing
+// off to move a volume nothing has attached, adds a diskful and drops
+// the only UpToDate copy before the sync finishes is not guarded: from
+// the definition alone that is DeleteVolume's shape, and LINSTOR, which
+// has no such guard on any path, lets the delete through as well. The
+// choice is deliberate; the "balancing off by hand, nothing InUse" case
+// of TestMidSyncDeleteRefusalLiftedWhileDefinitionIsDeleted pins it.
 func DefinitionBeingDeleted(rd *apiv1.ResourceDefinition, replicas []apiv1.Resource) bool {
 	if rd == nil {
 		return false
