@@ -36,6 +36,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -1557,6 +1558,12 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	// reconcile (no RD to read VolumeDefinitions from).
 	if !s.refuseResourceCreateOnUnknownRD(w, r, rdName) {
 		return nil, false
+	}
+
+	for i := range envelopes {
+		if refuseUnwhitelistedProps(w, propwhitelist.Resource, envelopes[i].Resource.Props) {
+			return nil, false
+		}
 	}
 
 	// The replicas are written one at a time, and LINSTOR writes them in

@@ -19,7 +19,6 @@ limitations under the License.
 package rest
 
 import (
-	"net/http"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -59,16 +58,11 @@ func TestResourceConnectionDrbdPeerOptionsRouteAbsent(t *testing.T) {
 	}
 }
 
-// TestVolumeDefinitionAcceptsNetOptionPermissively pins corner-case C6
-// as a documented delta (#58): blockstor does NOT enforce DRBD option
-// classes per object level. A `net{}`-class option (`DrbdOptions/Net/
-// protocol`) set on a volume-definition — which upstream LINSTOR
-// rejects with a typed FAIL_INVLD_PROP because a VD only accepts
-// disk/peer-device classes — is accepted permissively and stored.
-//
-// When the per-object-class validator lands, this expectation flips to
-// a 400 + typed envelope and row #58 leaves the accept-list.
-func TestVolumeDefinitionAcceptsNetOptionPermissively(t *testing.T) {
+// TestVolumeDefinitionRefusesNetOption pins corner-case C6: a volume
+// definition takes DRBD disk options only, so a `net{}`-class option
+// (`DrbdOptions/Net/protocol`) set on one is refused with LINSTOR's
+// FAIL_INVLD_PROP envelope and nothing is stored, as upstream does.
+func TestVolumeDefinitionRefusesNetOption(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
@@ -84,27 +78,21 @@ func TestVolumeDefinitionAcceptsNetOptionPermissively(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	// `vd drbd-options --protocol C` routes through the VD PUT with an
-	// override_props envelope. protocol is a net{} option, NOT valid on
-	// a volume-definition.
 	body := []byte(`{"override_props":{"DrbdOptions/Net/protocol":"C"}}`)
 	resp := httpPut(t, base+"/v1/resource-definitions/pvc-c6/volume-definitions/0", body)
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("C6 delta drift: VD net-option PUT returned %d, expected the permissive 200 "+
-			"(if option-class validation now rejects it, remove known-deltas #58 and assert the "+
-			"typed FAIL_INVLD_PROP envelope instead)", resp.StatusCode)
+	rcs := decodeInvalidPropRefusal(t, resp)
+	if rcs[0].Message != "Invalid property key: DrbdOptions/Net/protocol" {
+		t.Errorf("message: got %q", rcs[0].Message)
 	}
 
-	// The permissive accept must actually persist the prop (the delta is
-	// "accepted + stored", not "accepted + dropped").
 	vd, err := st.VolumeDefinitions().Get(ctx, "pvc-c6", 0)
 	if err != nil {
 		t.Fatalf("get VD: %v", err)
 	}
 
-	if vd.Props["DrbdOptions/Net/protocol"] != "C" {
-		t.Fatalf("C6: expected the net option stored permissively on the VD, got props=%v", vd.Props)
+	if _, stored := vd.Props["DrbdOptions/Net/protocol"]; stored {
+		t.Fatalf("C6: the refused net option was stored on the VD: %v", vd.Props)
 	}
 }
