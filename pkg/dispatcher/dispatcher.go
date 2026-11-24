@@ -267,7 +267,46 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		// Threaded verbatim (pointer tri-state preserved): nil/false →
 		// no skip, true → skip.
 		SkipInitialSync: copyBoolPtr(target.Spec.SkipInitialSync),
+		// The satellite's solo-promote reads these two to stay inside
+		// LINSTOR's case: never promote a replica that is being deleted,
+		// and never one whose definition has another diskful replica.
+		Deleting:            isDeleting(target, rd),
+		OtherDiskfulReplica: anyOtherDiskfulReplica(target, peers),
 	}
+}
+
+// isDeleting reports whether the target replica or its definition is
+// being deleted: a deletion timestamp on either, the DELETE flag LINSTOR
+// and the `rd d` path set on a definition before its replicas are
+// walked, or the DELETING mark `r d` puts on a replica it is removing.
+func isDeleting(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	if target.DeletionTimestamp != nil ||
+		slices.Contains(target.Spec.Flags, apiv1.ResourceFlagDelete) ||
+		slices.Contains(target.Spec.Flags, apiv1.ResourceFlagDeleting) {
+		return true
+	}
+
+	return rd != nil && (rd.DeletionTimestamp != nil || slices.Contains(rd.Spec.Flags, apiv1.ResourceFlagDelete))
+}
+
+// anyOtherDiskfulReplica reports whether any sibling Resource on another
+// node is diskful. Unlike the desired peer list it counts deactivated
+// replicas, replicas being deleted and replicas without a node-id yet:
+// each of them holds or may hold data the target does not have.
+func anyOtherDiskfulReplica(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) bool {
+	for i := range peers {
+		if naming.Same(peers[i].Spec.NodeName, target.Spec.NodeName) {
+			continue
+		}
+
+		flags := peers[i].Spec.Flags
+		if !slices.Contains(flags, apiv1.ResourceFlagDiskless) &&
+			!slices.Contains(flags, apiv1.ResourceFlagTieBreaker) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // copyBoolPtr returns a fresh copy of a *bool so the DesiredResource
@@ -928,6 +967,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			StoragePool:    pool,
 			SeedFromGI:     seedFromGI(target, vd.VolumeNumber),
 			ObservedGI:     observedGI(target, vd.VolumeNumber),
+			AppliedSizeKib: appliedSizeKib(target, vd.VolumeNumber),
 			SourceSnapshot: srcSnapshot,
 			MetaPool:       metaPool,
 			Minor:          minor,
@@ -1012,6 +1052,18 @@ func observedGI(target *blockstoriov1alpha1.Resource, volumeNumber int32) string
 	}
 
 	return ""
+}
+
+// appliedSizeKib returns the size the satellite last finished applying
+// for this volume on the target replica, or 0 when it never reported one.
+func appliedSizeKib(target *blockstoriov1alpha1.Resource, volumeNumber int32) int64 {
+	for i := range target.Status.Volumes {
+		if target.Status.Volumes[i].VolumeNumber == volumeNumber {
+			return target.Status.Volumes[i].AppliedSizeKib
+		}
+	}
+
+	return 0
 }
 
 // kubeInternalNICName is the well-known NetInterface name carrying the

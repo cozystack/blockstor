@@ -26,19 +26,24 @@ import (
 	"sync"
 
 	cerrors "github.com/cockroachdb/errors"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
@@ -140,6 +145,10 @@ type ResourceReconciler struct {
 	// Workers is how many Resources reconcile at once; zero means
 	// DefaultResourceWorkers.
 	Workers int
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // DefaultResourceWorkers is how many Resources the controller
@@ -170,10 +179,17 @@ func (r *ResourceReconciler) workers() int {
 // +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
 
-// Reconcile reads a Resource and pushes the matching DesiredResource
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass reads a Resource and pushes the matching DesiredResource
 // to the satellite that hosts it. Per-replica errors land in the
 // log; transport faults trigger a 10s requeue.
-func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var target blockstoriov1alpha1.Resource
 
 	err := r.Get(ctx, req.NamespacedName, &target)
@@ -429,13 +445,14 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	}
 
 	// Auto-diskful: when a DISKLESS replica is actively used by a
-	// consumer (InUse=true on this node) AND the hosting node has
-	// a viable storage pool, promote it to diskful so reads stay
-	// local. Cleanup (demote on idle) is intentionally not
-	// automated yet — needs hysteresis to avoid flapping on
-	// transient opens; operators demote via `linstor r d` until
-	// then.
-	promoted, err := r.maybeAutoDiskful(ctx, target)
+	// consumer (InUse=true on this node), the hosting node has a
+	// viable storage pool AND the volume has fewer diskful replicas
+	// than its resource group's place count, promote it to diskful
+	// so the lost copy is refilled where the volume is used. Cleanup
+	// (demote on idle) is intentionally not automated yet — needs
+	// hysteresis to avoid flapping on transient opens; operators
+	// demote via `linstor r d` until then.
+	promoted, err := r.maybeAutoDiskful(ctx, target, peers, rdPtr)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -459,7 +476,20 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 // satellite reconciler picks up the spec change on the next pass
 // and creates the LV/zvol + attach. Returns true when Spec was
 // mutated so the caller can requeue.
-func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *blockstoriov1alpha1.Resource) (bool, error) {
+//
+// A volume that already has its resource group's place count of
+// diskful replicas keeps the diskless attach diskless: a pod or a VM
+// moving to a node without a replica would otherwise copy the whole
+// volume there and leave it with more diskful replicas than the
+// storage class asks for. Only a deficit (a copy was lost) is refilled
+// through the node that uses the volume. When the place count can't
+// be read nothing is promoted.
+func (r *ResourceReconciler) maybeAutoDiskful(
+	ctx context.Context,
+	target *blockstoriov1alpha1.Resource,
+	peers []blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+) (bool, error) {
 	if !slices.Contains(target.Spec.Flags, apiv1.ResourceFlagDiskless) {
 		return false, nil
 	}
@@ -472,6 +502,15 @@ func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *block
 		// Tiebreaker witnesses must stay diskless — they're chosen
 		// for the network presence, not local storage. Promoting a
 		// tiebreaker would defeat the quorum semantic.
+		return false, nil
+	}
+
+	hasDeficit, err := r.hasDiskfulDeficit(ctx, peers, rd)
+	if err != nil {
+		return false, err
+	}
+
+	if !hasDeficit {
 		return false, nil
 	}
 
@@ -505,6 +544,75 @@ func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *block
 	}
 
 	return true, nil
+}
+
+// hasDiskfulDeficit reports whether the volume has fewer live diskful
+// replicas than its resource group's place count. Diskless replicas,
+// replicas flagged DELETE (or INACTIVE), replicas being deleted and
+// replicas on EVICTED or LOST nodes don't count, the same way the
+// auto-diskful timer drops them. A definition without a resource group, a resource group
+// that can't be read, or a missing definition yields false so nothing
+// is promoted on a guess. A place count of 0 (the default group ships
+// with it) reads as 1, the way the placer treats it.
+func (r *ResourceReconciler) hasDiskfulDeficit(
+	ctx context.Context,
+	peers []blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+) (bool, error) {
+	if rd == nil || rd.Spec.ResourceGroupName == "" {
+		return false, nil
+	}
+
+	rg, err := r.Store.ResourceGroups().Get(ctx, rd.Spec.ResourceGroupName)
+	if err != nil {
+		if cerrors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	placeCount := int(rg.SelectFilter.PlaceCount)
+	if placeCount == 0 {
+		placeCount = 1
+	}
+
+	nodes, err := r.Store.Nodes().List(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	disabled := make(map[string]struct{}, len(nodes))
+
+	for i := range nodes {
+		if isDisabledNode(&nodes[i]) {
+			disabled[naming.Key(nodes[i].Name)] = struct{}{}
+		}
+	}
+
+	diskful := 0
+
+	for i := range peers {
+		if peers[i].DeletionTimestamp != nil {
+			continue
+		}
+
+		if _, gone := disabled[naming.Key(peers[i].Spec.NodeName)]; gone {
+			continue
+		}
+
+		if slices.ContainsFunc(peers[i].Spec.Flags, func(f string) bool {
+			return f == apiv1.ResourceFlagDiskless ||
+				f == apiv1.ResourceFlagDelete ||
+				f == apiv1.ResourceFlagInactive
+		}) {
+			continue
+		}
+
+		diskful++
+	}
+
+	return diskful < placeCount, nil
 }
 
 // firstAvailablePool returns any non-diskless storage pool present on
@@ -590,6 +698,15 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 // Status update is rejected by Kube's optimistic concurrency check
 // and the next reconcile picks the next free port.
 func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
+	// Nearly every reconcile lands on a replica allocated long ago.
+	// Its identities are never rewritten once set, so the cached view
+	// is enough to see there is nothing to do; the uncached reads and
+	// the process-wide allocation lock below are for the replicas that
+	// still need a value.
+	if r.identitiesSettled(ctx, target) {
+		return false, nil
+	}
+
 	// Serialise allocation across replicas of the same RD. The
 	// APIReader-direct read alone doesn't fix the race — two
 	// goroutines can both observe taken=[] simultaneously and
@@ -635,6 +752,34 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 	}
 
 	return mutated, nil
+}
+
+// identitiesSettled reports, from the cached client, whether target
+// already carries everything allocateAndApplyDRBDIDs would write: the
+// Spec node id, port and skip-initial-sync decision, their Status
+// mirrors, and a minor for every volume of the parent definition with
+// the volume-0 one mirrored on Status. A value the allocator writes is
+// never changed afterwards, so a cache that shows all of them cannot
+// be hiding a missing one. Anything absent, or a definition the cache
+// cannot return, sends the caller down the uncached allocation path.
+func (r *ResourceReconciler) identitiesSettled(ctx context.Context, target *blockstoriov1alpha1.Resource) bool {
+	spec := &target.Spec
+	if spec.DRBDNodeID == nil || spec.DRBDPort == nil || spec.SkipInitialSync == nil {
+		return false
+	}
+
+	if !ptrEqI32(spec.DRBDNodeID, target.Status.DRBDNodeID) || !ptrEqI32(spec.DRBDPort, target.Status.DRBDPort) {
+		return false
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(spec.ResourceDefinitionName)}, &rd)
+	if err != nil || len(rd.Spec.VolumeDefinitions) == 0 || !rdVolumeMinorsComplete(&rd) {
+		return false
+	}
+
+	return ptrEqI32(vol0MinorOf(&rd), target.Status.DRBDMinor)
 }
 
 // allocateDRBDFields fills in any missing DRBD-{NodeID,Port,Minor}
@@ -2220,14 +2365,66 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&blockstoriov1alpha1.Resource{}).
+		For(&blockstoriov1alpha1.Resource{},
+			builder.WithPredicates(resourceChangedPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings)).
+			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings),
+			builder.WithPredicates(resourceChangedPredicate())).
 		Named("resource").
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.workers()}).
 		Complete(r)
+}
+
+// resourceChangedPredicate drops a Resource update that changed
+// nothing but the write bookkeeping: the resource version and the
+// managed-fields entries.
+//
+// Satellites apply their status with server-side apply, and an apply
+// that leaves every value as it was can still move a field manager's
+// entry and so produce a write. On an idle cluster with a hundred or
+// so replicas per node that is several writes a second, and each one
+// reached this single-worker reconciler three times over: once
+// through For and once per sibling. A new Resource then waited behind
+// the whole set of replicas before it got its DRBD identities, which
+// the satellites need before they can build it.
+//
+// Only an update whose objects are otherwise equal is dropped; any
+// change to spec, status, labels, annotations, finalizers or the
+// deletion timestamp still passes.
+func resourceChangedPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return resourceUpdateCarriesChange(e.ObjectOld, e.ObjectNew)
+		},
+	}
+}
+
+// resourceUpdateCarriesChange reports whether the new object differs
+// from the old one in anything besides the resource version and the
+// managed fields. An object of an unexpected type counts as changed,
+// and so does the informer's periodic resync, which delivers the same
+// revision twice and is meant to reach the reconciler.
+func resourceUpdateCarriesChange(oldObj, newObj client.Object) bool {
+	oldRes, okOld := oldObj.(*blockstoriov1alpha1.Resource)
+	newRes, okNew := newObj.(*blockstoriov1alpha1.Resource)
+
+	if !okOld || !okNew || oldRes == nil || newRes == nil {
+		return true
+	}
+
+	if oldRes.ResourceVersion == newRes.ResourceVersion {
+		return true
+	}
+
+	left := oldRes.DeepCopy()
+	right := newRes.DeepCopy()
+
+	left.ResourceVersion, right.ResourceVersion = "", ""
+	left.ManagedFields, right.ManagedFields = nil, nil
+
+	return !equality.Semantic.DeepEqual(left, right)
 }
 
 // rdAllocMu returns the per-RD allocation mutex, lazily creating

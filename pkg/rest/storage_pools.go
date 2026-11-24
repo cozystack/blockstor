@@ -29,6 +29,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
@@ -97,6 +98,10 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 	if msg, refused := refuseSPDriverPropMutation(&patch); refused {
 		writeSPDriverPropMutationRefusal(w, node, pool, msg)
 
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.StoragePool, patch.OverrideProps) {
 		return
 	}
 

@@ -41,6 +41,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
@@ -93,6 +94,10 @@ type ResourceDefinitionReconciler struct {
 	// layer stack because it already held data. Nil in tests that do
 	// not assert on Events.
 	Recorder events.EventRecorder
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
@@ -100,9 +105,16 @@ type ResourceDefinitionReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile ensures the tiebreaker for a 2-replica RD. Idempotent:
-// re-running on an RD that already has its tiebreaker is a no-op.
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
 func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass ensures the tiebreaker for a 2-replica RD. Idempotent:
+// re-running on an RD that already has its tiebreaker is a no-op.
+func (r *ResourceDefinitionReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if r.Store == nil {
@@ -133,16 +145,12 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	err = r.pinLayerStack(ctx, &rd)
 	if err != nil {
-		log.Error(err, "pin layer stack", "rd", rd.Name)
-
-		return ctrl.Result{}, err
+		return r.stepFailed(ctx, log, &rd, "pin layer stack", err)
 	}
 
 	err = r.ensureTiebreaker(ctx, &rd)
 	if err != nil {
-		log.Error(err, "ensure tiebreaker", "rd", rd.Name)
-
-		return ctrl.Result{}, err
+		return r.stepFailed(ctx, log, &rd, "ensure tiebreaker", err)
 	}
 
 	// Bug 148: stamp the per-volume resize-pending annotation on
@@ -156,9 +164,7 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// block device stays at the old size forever.
 	err = r.stampResizePending(ctx, &rd)
 	if err != nil {
-		log.Error(err, "stamp resize-pending", "rd", rd.Name)
-
-		return ctrl.Result{}, err
+		return r.stepFailed(ctx, log, &rd, "stamp resize-pending", err)
 	}
 
 	// A settled RD waits for its next event: its own change, a
@@ -197,17 +203,29 @@ func askRDRetry(ctx context.Context, d time.Duration) {
 
 // nextTiebreakerDeadline returns how long until the earliest of the
 // RD's witness deadlines (the suppression after a witness delete, the
-// keep-tiebreaker window) passes, when one is still ahead. The witness
-// decision changes when it passes, and no event marks the moment.
+// keep-tiebreaker window, the placement hold) passes, when one is still
+// ahead. The witness decision changes when it passes, and no event
+// marks the moment: a placement that dies before it removes its hold
+// writes nothing to the RD again.
 func nextTiebreakerDeadline(rd *blockstoriov1alpha1.ResourceDefinition, now time.Time) (time.Duration, bool) {
 	var (
 		earliest time.Duration
 		found    bool
 	)
 
+	// The witness waits for the last placement still holding the RD.
+	held, _ := apiv1.PlacementInProgressUntil(rd.Annotations, now)
+	deadlines := []time.Time{held}
+
 	for _, key := range []string{apiv1.AutoTiebreakerSuppressedUntilAnnotation, apiv1.KeepTiebreakerUntilAnnotation} {
 		deadline, err := time.Parse(time.RFC3339, rd.Annotations[key])
-		if err != nil || !deadline.After(now) {
+		if err == nil {
+			deadlines = append(deadlines, deadline)
+		}
+	}
+
+	for _, deadline := range deadlines {
+		if !deadline.After(now) {
 			continue
 		}
 
@@ -663,7 +681,9 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // is for: a three-replica placement two replicas in looks like the
 // even-diskful tie a witness breaks, and the witness would land on the
 // node the third replica is for. The placement removing the annotation
-// wakes the RD, and the decision is made on the replicas it placed.
+// wakes the RD, and the decision is made on the replicas it placed; a
+// hold nobody removes brings the RD back when it runs out
+// (nextTiebreakerDeadline).
 func isPlacementInProgress(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	_, ok := apiv1.PlacementInProgressUntil(rd.Annotations, time.Now())
 
@@ -1471,10 +1491,22 @@ func (r *ResourceDefinitionReconciler) excludeOccupiedNodes(ctx context.Context,
 		return err
 	}
 
+	hosting := make(map[string]bool, len(live))
+	for i := range live {
+		hosting[naming.Key(live[i].NodeName)] = true
+	}
+
 	for i := range live {
 		if !offline[naming.Key(live[i].NodeName)] {
 			for _, peer := range kernelPeersOf(&live[i]) {
 				excluded[naming.Key(peer)] = true
+
+				// The survivor dropping the old connection is a status
+				// write, which does not wake the RD (SetupWithManager),
+				// so come back for the witness once it is gone.
+				if !hosting[naming.Key(peer)] {
+					askRDRetry(ctx, rdReconcileRequeue)
+				}
 			}
 		}
 

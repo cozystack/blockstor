@@ -19,8 +19,11 @@ limitations under the License.
 package main
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -28,6 +31,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/cozystack/blockstor/pkg/keyring"
+	"github.com/cozystack/blockstor/pkg/linstormigrate"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
@@ -157,5 +161,46 @@ func TestBuildOptionsLoadsBothPortForms(t *testing.T) {
 
 	if got := opts.DRBDPorts["pvc-b"]; got != 7010 {
 		t.Errorf("DRBDPorts[pvc-b] = %d, want 7010", got)
+	}
+}
+
+// A dump whose DRBD rows lost tcp_port_list, as a read at a version
+// other than the storage version leaves them, is refused before any
+// manifest is written.
+func TestAPrunedDumpWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	dump := t.TempDir()
+
+	entries, err := os.ReadDir(fixtureDump)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, entry := range entries {
+		raw, err := os.ReadFile(filepath.Join(fixtureDump, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if strings.HasPrefix(entry.Name(), "layerdrbdresources.") {
+			raw = regexp.MustCompile(`,"tcp_port_list":"[^"]*"`).ReplaceAll(raw, nil)
+		}
+
+		err = os.WriteFile(filepath.Join(dump, entry.Name()), raw, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out := filepath.Join(t.TempDir(), "manifests.yaml")
+
+	err = convertToOutput(dump, out, "", &luksFlags{})
+	if !errors.Is(err, linstormigrate.ErrDumpNotAtStorageVersion) {
+		t.Fatalf("convert err = %v, want ErrDumpNotAtStorageVersion", err)
+	}
+
+	if _, statErr := os.Stat(out); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("manifests written for a refused dump (stat: %v)", statErr)
 	}
 }

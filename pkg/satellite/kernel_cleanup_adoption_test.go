@@ -144,8 +144,8 @@ func TestPruneStaleKernelSlots_AdoptedSlotWaitsForRender(t *testing.T) {
 	})
 
 	cmds := fx.CommandLines()
-	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
-	mustNotContain(t, cmds, "drbdadm del-peer worker-1:pvc-1")
+	mustContain(t, cmds, "drbdsetup del-peer pvc-1 2")
+	mustNotContain(t, cmds, "drbdsetup del-peer pvc-1 1")
 }
 
 // TestPruneStaleKernelSlots_OwnedRenderedPeerPrunedWhileConnected: a
@@ -161,8 +161,8 @@ func TestPruneStaleKernelSlots_OwnedRenderedPeerPrunedWhileConnected(t *testing.
 	prune(t, r, expectPeers("worker-1", "worker-3"))
 
 	cmds := fx.CommandLines()
-	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
-	mustNotContain(t, cmds, "drbdadm del-peer worker-1:pvc-1")
+	mustContain(t, cmds, "drbdsetup del-peer pvc-1 2")
+	mustNotContain(t, cmds, "drbdsetup del-peer pvc-1 1")
 }
 
 // TestPruneStaleKernelSlots_OwnedUnrecordedPeer covers an owned slot
@@ -225,10 +225,10 @@ func TestPruneStaleKernelSlots_OwnedUnrecordedPeer(t *testing.T) {
 			prune(t, r, tc.expect)
 
 			cmds := fx.CommandLines()
-			mustNotContain(t, cmds, "drbdadm del-peer worker-1:pvc-1")
+			mustNotContain(t, cmds, "drbdsetup del-peer pvc-1 1")
 
 			if tc.pruned {
-				mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
+				mustContain(t, cmds, "drbdsetup del-peer pvc-1 2")
 				mustContain(t, cmds, "drbdsetup forget-peer pvc-1 2")
 
 				return
@@ -251,6 +251,6 @@ func TestPruneStaleKernelSlots_RenderedPeerMatchedThroughNaming(t *testing.T) {
 	prune(t, r, expectPeers("WORKER-1"))
 
 	cmds := fx.CommandLines()
-	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
-	mustNotContain(t, cmds, "drbdadm del-peer worker-1:pvc-1")
+	mustContain(t, cmds, "drbdsetup del-peer pvc-1 2")
+	mustNotContain(t, cmds, "drbdsetup del-peer pvc-1 1")
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
@@ -164,6 +165,7 @@ func (s *Server) handleVDView(w http.ResponseWriter, r *http.Request) {
 		rdProps := rds[i].Props
 		redactSensitiveProps(rdProps)
 		redactVolumeDefinitionsInPlace(vds)
+		s.reportAppliedSizes(r.Context(), rds[i].Name, vds)
 
 		out = append(out, rdWithVDs{
 			Name:              rds[i].Name,
@@ -220,6 +222,7 @@ func (s *Server) handleVDList(w http.ResponseWriter, r *http.Request) {
 
 	// Bug 185: scrub sensitive Props on every VD before emit.
 	redactVolumeDefinitionsInPlace(vds)
+	s.reportAppliedSizes(r.Context(), rd, vds)
 
 	writeJSON(w, http.StatusOK, vds)
 }
@@ -262,7 +265,10 @@ func (s *Server) handleVDGet(w http.ResponseWriter, r *http.Request) {
 	// to this response — the store cache stays un-redacted.
 	redactSensitiveProps(vd.Props)
 
-	writeJSON(w, http.StatusOK, vd)
+	one := []apiv1.VolumeDefinition{vd}
+	s.reportAppliedSizes(r.Context(), rd, one)
+
+	writeJSON(w, http.StatusOK, one[0])
 }
 
 // handleVDCreate accepts either the upstream `VolumeDefinitionCreate`
@@ -338,6 +344,10 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	if sizeErr != nil {
 		writeVDSizeRejection(w, rd, vd.VolumeNumber, vd.SizeKib, sizeErr)
 
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, vd.Props) {
 		return
 	}
 
@@ -718,6 +728,11 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, patch.OverrideProps) ||
+		refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, patch.Props) {
+		return
+	}
+
 	// Bug 204b: route the merge-write through PatchVolumeDefinitionSpec
 	// so the modify delta is re-applied to the freshly-fetched VD on
 	// every retry. The previous `Get → mutate → Update` path's retry
@@ -744,14 +759,36 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		s.stampResizePendingOnResources(r.Context(), rd, vn, *patch.SizeKib)
 	}
 
+	entries, outcome := s.waitForVDPatchGrown(r.Context(), rd, vn, patch.SizeKib, previousSizeKib)
+
+	writeVDUpdateAnswer(w, &patch, rd, vn, previousSizeKib, entries, outcome)
+}
+
+// writeVDUpdateAnswer answers a volume definition modify after its grow
+// wait, by how that wait ended.
+func writeVDUpdateAnswer(
+	w http.ResponseWriter, patch *volumeDefinitionModifyBody, rd string, vn int32, previousSizeKib int64,
+	entries []apiv1.APICallRc, outcome growOutcome,
+) {
 	envelope := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "volume definition modified",
 	}}
 
-	envelope = appendForceShrinkAdvisory(envelope, &patch, rd, vn, previousSizeKib)
+	switch outcome {
+	case outcomeCancelled:
+		// Answer even though the caller may be gone: when it is this
+		// server shutting down, the connection is still open, and an
+		// empty 200 reads as a finished grow. A gone caller drops it.
+		writeJSON(w, http.StatusServiceUnavailable, shutdownDuringResize(rd, vn))
+	case outcomeFailed:
+		writeJSON(w, http.StatusInternalServerError, append(envelope, entries...))
+	case outcomeGrown:
+		envelope = appendForceShrinkAdvisory(envelope, patch, rd, vn, previousSizeKib)
+		envelope = append(envelope, entries...)
 
-	writeJSON(w, http.StatusOK, envelope)
+		writeJSON(w, http.StatusOK, envelope)
+	}
 }
 
 // appendForceShrinkAdvisory appends the force-shrink warning entry

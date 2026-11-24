@@ -1,6 +1,7 @@
 {
 "items": [
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL1",
 "snapshot_name": "",
@@ -11,6 +12,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL2",
 "snapshot_name": "",
@@ -21,6 +23,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL3",
 "snapshot_name": "",
@@ -31,6 +34,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL4",
 "snapshot_name": "",
@@ -41,6 +45,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL5",
 "snapshot_name": "",
@@ -51,6 +56,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL1",
 "snapshot_name": "SNAP-GOOD",
@@ -61,6 +67,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL1",
 "snapshot_name": "SNAP-BAD",
@@ -71,6 +78,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL1",
 "snapshot_name": "",
@@ -81,6 +89,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL6",
 "snapshot_name": "",
@@ -91,6 +100,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL7",
 "snapshot_name": "",
@@ -101,6 +111,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL7",
 "snapshot_name": "",
@@ -111,6 +122,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL1",
 "snapshot_name": "SNAP-GOOD",

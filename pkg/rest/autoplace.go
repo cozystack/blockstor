@@ -36,6 +36,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -107,14 +108,14 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	// ControllerPublishVolume right after the spawn; a sibling
 	// apiserver replica's cache may still trail the spawn write.
 	// See pkg/rest/cache_retry.go.
-	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	resList, err := s.Store.Resources().ListByDefinition(r.Context(), rdName)
+	resList, err := s.definitionReplicas(r.Context(), &rd)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -125,7 +126,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {
-		out = append(out, wrapResourceWithVolumes(&resList[i], vdSizes))
+		out = append(out, wrapResourceWithLayers(&resList[i], rd.LayerStack, s.placeholderPool(r.Context(), &resList[i]), vdSizes))
 	}
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys (passphrase,
@@ -149,6 +150,47 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// definitionReplicas lists rd's replicas for handleResourceList: from
+// the cache, unless balancing is switched off for rd or rd is being
+// deleted, and then from the API server.
+//
+// linstor-csi deletes a volume by switching balancing off on its
+// definition, listing its replicas and deleting each one it listed. A
+// placement pass can create a replica right before the switch, and
+// LINSTOR answers that list with it, since it reads under the lock the
+// placement holds. A cache that has not seen the create yet answers
+// without it, the replica is never deleted, and it keeps the definition,
+// a kernel resource and its ports for good. The pass re-reads the
+// definition after it placed, so everything it created before the
+// switch exists on the API server by the time linstor-csi lists.
+//
+// The definition is read past the cache too, unless the cached copy
+// already shows the switch: the switch may have been written through
+// another replica of this server, whose write this cache has not seen
+// either. A definition that cannot be read that way is listed past the
+// cache as well.
+func (s *Server) definitionReplicas(ctx context.Context, rd *apiv1.ResourceDefinition) ([]apiv1.Resource, error) {
+	stopped := balancingStopped(rd)
+	if !stopped {
+		current, err := s.Store.ResourceDefinitions().GetUncached(ctx, rd.Name)
+		stopped = err != nil || balancingStopped(&current)
+	}
+
+	if stopped {
+		return store.LiveReplicas(ctx, s.Store, rd.Name) //nolint:wrapcheck // the handler reports it as is
+	}
+
+	return s.Store.Resources().ListByDefinition(ctx, rd.Name) //nolint:wrapcheck // the handler reports it as is
+}
+
+// balancingStopped reports whether rd is being deleted or carries
+// BalanceResourcesEnabled=false itself, which is where linstor-csi
+// writes it for the length of a volume delete.
+func balancingStopped(rd *apiv1.ResourceDefinition) bool {
+	return slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) ||
+		strings.EqualFold(rd.Props[apiv1.PropBalanceResourcesEnabled], "false")
+}
+
 // wrapResourceWithVolumes wraps a Resource into ResourceWithVolumes with
 // a volume for every volume definition (see ensureVolumesForView) and
 // the `volumes` JSON key always present (never `null`). Bug-hunt
@@ -160,8 +202,31 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 // unconditionally and crashes on `None.iter`. Mirrors the
 // ensureVolumesForView contract used by /v1/view/resources: a non-nil
 // (possibly empty) slice survives the JSON encode as `[]`.
-func wrapResourceWithVolumes(res *apiv1.Resource, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
-	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, res, vdSizes)}
+func wrapResourceWithVolumes(res *apiv1.Resource, poolFor func(int32) string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
+	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, poolFor, vdSizes)}
+}
+
+// wrapResourceWithLayers wraps a replica re-stamped with its
+// definition's layer stack. The store hands every replica back as DRBD
+// over STORAGE, and `/v1/view/resources` re-stamps it; without the same
+// step here the two endpoints described one replica two ways, this one
+// with a DRBD layer a STORAGE-only replica does not have and an
+// `in_use: false` nothing observed.
+//
+// The volumes are copied before the re-stamp: a store may hand back a
+// slice it still holds.
+func wrapResourceWithLayers(res *apiv1.Resource, stack []string, poolFor func(int32) string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
+	if len(stack) == 0 {
+		return wrapResourceWithVolumes(res, poolFor, vdSizes)
+	}
+
+	stamped := *res
+	stamped.Volumes = slices.Clone(res.Volumes)
+
+	apiv1.ApplyLayerStack(&stamped, stack)
+	apiv1.ApplyLayerStackToVolumes(stamped.Volumes, stack)
+
+	return wrapResourceWithVolumes(&stamped, poolFor, vdSizes)
 }
 
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
@@ -189,7 +254,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// the replica back immediately; both the RD probe and the replica
 	// read may be served by a cache that still trails those writes —
 	// see pkg/rest/cache_retry.go.
-	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound,
@@ -224,7 +289,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// outer `volumes` JSON key serialises as `[]` instead of `null` when
 	// the Resource carries no Volumes; protects python-linstor's
 	// `rsc._rest_data['volumes']` dereference.
-	writeJSON(w, http.StatusOK, wrapResourceWithVolumes(&res, s.definitionVolumeSizes(r.Context(), rdName)))
+	writeJSON(w, http.StatusOK, wrapResourceWithLayers(&res, rd.LayerStack, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)))
 }
 
 // handleAutoplace selects up to `place_count` nodes that have a storage
@@ -345,19 +410,30 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.runPlaceAndReport(w, r, rdName, &filter, srcKind) {
+	deployed, ok := s.runPlaceAndReport(w, r, rdName, &filter, srcKind)
+	if !ok {
 		return
 	}
 
-	// Java LINSTOR replies with a `[]ApiCallRc` envelope on success.
-	// golinstor's RD.Autoplace ignores an empty body, but tools that
-	// surface API messages (e.g. the linstor CLI) want a real result
-	// to log. Return MASK_INFO + RC_PLACEMENT_DONE-style entry so the
-	// shape matches the oracle's.
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	s.writeAutoplaceDone(w, r, rdName, deployed)
+}
+
+// writeAutoplaceDone answers a successful autoplace once the
+// satellites brought up the replicas it deployed, as LINSTOR does;
+// see waitDeployedReplicasReady.
+//
+// Java LINSTOR replies with a `[]ApiCallRc` envelope on success.
+// golinstor's RD.Autoplace ignores an empty body, but tools that
+// surface API messages (e.g. the linstor CLI) want a real result
+// to log. Return MASK_INFO + RC_PLACEMENT_DONE-style entry so the
+// shape matches the oracle's.
+func (s *Server) writeAutoplaceDone(w http.ResponseWriter, r *http.Request, rdName string, deployed []string) {
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, deployed)
+
+	writeJSON(w, http.StatusOK, append([]apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRDAutoplaceDone,
 		Message: "Resource definition '" + rdName + "' auto-placed",
-	}})
+	}}, notReady...))
 }
 
 // refuseAutoplaceMultiPlaceWithoutReplication is Bug 335's
@@ -570,8 +646,9 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 }
 
 // runPlaceAndReport drives the placer and writes the appropriate
-// HTTP error on shortfall. Returns true on success (caller writes
-// the success body), false on any error path (caller returns).
+// HTTP error on shortfall. On success it returns the nodes this call
+// deployed a replica to and true (caller writes the success body);
+// on any error path it returns false (caller returns).
 // Pulled out of handleAutoplace to keep that function under the
 // cyclomatic / funlen budget once the snapshot-clone provider-kind
 // constraint was added.
@@ -584,8 +661,8 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 // path now emit the full envelope shape so the CLI surfaces the
 // same diagnostic upstream Java LINSTOR does (criteria bullet list +
 // "Auto-place configuration details" block).
-func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) bool {
-	placed, want, err := placer.New(s.Store).Place(r.Context(), rdName, filter)
+func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) ([]string, bool) {
+	placement, err := placer.New(s.Store).PlaceDeployed(r.Context(), rdName, filter)
 	if err != nil {
 		// Capacity-shortfall (Bug 35) is operator-actionable, not a
 		// 500. Surface as a structured 409 envelope so the Python
@@ -595,21 +672,21 @@ func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdNam
 		if errors.As(err, &capErr) {
 			writeAutoplaceShortfall(w, filter, srcKind, capErr)
 
-			return false
+			return nil, false
 		}
 
 		writeError(w, http.StatusInternalServerError, err.Error())
 
-		return false
+		return nil, false
 	}
 
-	if placed < want {
+	if placement.Placed < placement.Want {
 		writeAutoplaceShortfall(w, filter, srcKind, nil)
 
-		return false
+		return nil, false
 	}
 
-	return true
+	return placement.Deployed, true
 }
 
 // resolveAdditionalPlaceCount implements the W17 `--auto-place +N`
@@ -1360,12 +1437,16 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
 	}
 
+	// LINSTOR answers an explicit create after the same wait as an
+	// autoplace (CtrlRscCrtApiCallHandler → deployResources).
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, replicaNodes(created))
+
 	// Python CLI demands an ApiCallRc list envelope; upstream's
 	// `linstor r c` walks it on every reply.
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	writeJSON(w, http.StatusCreated, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource(s) created on resource-definition: " + rdName,
-	}})
+	}}, notReady...))
 }
 
 // handleResourceCreateOnNode answers `POST /v1/resource-definitions/
@@ -1448,11 +1529,15 @@ func (s *Server) handleResourceCreateOnNode(w http.ResponseWriter, r *http.Reque
 		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	// The create linstor-csi's Manual scheduler posts: answer it after
+	// the same wait as an autoplace, as LINSTOR does.
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, replicaNodes(created))
+
+	writeJSON(w, http.StatusCreated, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource created on resource-definition: " + rdName +
 			" / node: " + node,
-	}})
+	}}, notReady...))
 }
 
 // createResources walks the envelopes from a POST to
@@ -1469,6 +1554,12 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	// reconcile (no RD to read VolumeDefinitions from).
 	if !s.refuseResourceCreateOnUnknownRD(w, r, rdName) {
 		return nil, false
+	}
+
+	for i := range envelopes {
+		if refuseUnwhitelistedProps(w, propwhitelist.Resource, envelopes[i].Resource.Props) {
+			return nil, false
+		}
 	}
 
 	// The replicas are written one at a time, and LINSTOR writes them in
@@ -2534,15 +2625,25 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	ok = s.applyMakeAvailable(w, r, rdName, node, &req)
+	created, ok := s.applyMakeAvailable(w, r, rdName, node, &req)
 	if !ok {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	// A replica make-available created goes through LINSTOR's
+	// createResource and so its deployResources: the answer comes once
+	// the satellite built it. linstor-csi's ControllerPublishVolume
+	// reads the replica's device path right after this call, and a
+	// replica the call only changed was built before.
+	var notReady []apiv1.APICallRc
+	if created {
+		notReady = s.waitMadeAvailableReplicaReady(r.Context(), rdName, node)
+	}
+
+	writeJSON(w, http.StatusOK, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "Resource '" + rdName + "' on node '" + node + "' made available",
-	}})
+	}}, notReady...))
 }
 
 // decodeMakeAvailableBody parses the optional JSON body. Upstream
@@ -2580,25 +2681,29 @@ func decodeMakeAvailableBody(w http.ResponseWriter, r *http.Request) (apiv1.Reso
 }
 
 // applyMakeAvailable dispatches to update-or-create depending on
-// whether a Resource already lives on the target node. Writes the
-// HTTP error response on failure and returns false.
-func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdName, node string, req *apiv1.ResourceMakeAvailable) bool {
+// whether a Resource already lives on the target node, and reports
+// whether it created one. Writes the HTTP error response on failure
+// and returns false.
+func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdName, node string, req *apiv1.ResourceMakeAvailable) (bool, bool) {
 	existing, err := s.Store.Resources().Get(r.Context(), rdName, node)
+
+	created := false
 
 	switch {
 	case err == nil:
 		err = s.makeAvailableUpdate(r.Context(), &existing, req)
 	case errors.Is(err, store.ErrNotFound):
 		err = s.makeAvailableCreate(r.Context(), rdName, node, req)
+		created = err == nil
 	}
 
 	if err != nil {
 		writeStoreError(w, err)
 
-		return false
+		return false, false
 	}
 
-	return true
+	return created, true
 }
 
 // makeAvailableUpdate mutates an existing replica to match the

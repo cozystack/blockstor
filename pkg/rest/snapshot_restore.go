@@ -567,7 +567,15 @@ func (s *Server) materializeRestore(
 		return
 	}
 
-	writeRestoreDone(w, restoreDoneMessage(resume, snap.Name, made.Name), uncheckedRG)
+	// LINSTOR answers a restore after the same wait as a resource create
+	// (CtrlSnapshotRestoreApiCallHandler → deployResources). linstor-csi
+	// restores onto the node the volume is attached on and autoplaces the
+	// rest after this answer; that autoplace waits only for what it placed.
+	// A resumed restore's replicas may not be built either, so every node
+	// the restore names is awaited, not only those this call stamped.
+	notReady := s.waitDeployedReplicasReady(ctx, made.Name, canonicalRestoreNodeList(req))
+
+	writeRestoreDone(w, restoreDoneMessage(resume, snap.Name, made.Name), uncheckedRG, notReady...)
 }
 
 // writeRestoreMaterialiseFailed answers a restore whose materialisation failed.
@@ -658,7 +666,7 @@ func (s *Server) restoreReplayState(
 	}
 
 	if finished {
-		s.writeFinishedRestoreReplay(ctx, w, snap.Name, req.ToResource, !prepared)
+		s.writeFinishedRestoreReplay(ctx, w, snap.Name, req, !prepared)
 
 		return false, true
 	}
@@ -685,9 +693,15 @@ func (s *Server) restoreReplayState(
 // The leftover is adopted, not this request's, so the group guard over it
 // refuses rather than rolls back when its group is gone, the same answer the
 // resume of an unfinished one gets.
+//
+// Finished means written, not built: a client that gave up during the first
+// answer's deploy wait left replicas the satellites may still be building, so
+// the replay waits for them as the first answer does.
 func (s *Server) writeFinishedRestoreReplay(
-	ctx context.Context, w http.ResponseWriter, snapName, rdName string, resumed bool,
+	ctx context.Context, w http.ResponseWriter, snapName string, req *snapshotRestoreRequest, resumed bool,
 ) {
+	rdName := req.ToResource
+
 	existing, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
 	if err != nil {
 		writeStoreError(w, err)
@@ -717,7 +731,9 @@ func (s *Server) writeFinishedRestoreReplay(
 		return
 	}
 
-	writeRestoreDone(w, restoreDoneMessage(resumed, snapName, rdName), nil)
+	notReady := s.waitDeployedReplicasReady(ctx, rdName, canonicalRestoreNodeList(req))
+
+	writeRestoreDone(w, restoreDoneMessage(resumed, snapName, rdName), nil, notReady...)
 }
 
 // restoreLeftoverIsFinished answers a retry over a leftover of this restore
@@ -881,7 +897,7 @@ func (s *Server) replayWithoutSnapshot(
 	}
 
 	if finished {
-		s.writeFinishedRestoreReplay(ctx, w, snapName, req.ToResource, true)
+		s.writeFinishedRestoreReplay(ctx, w, snapName, req, true)
 
 		return
 	}
@@ -908,8 +924,9 @@ func restoreDoneMessage(resumed bool, snapName, rdName string) string {
 }
 
 // writeRestoreDone emits the restore's success envelope, with any warning the
-// post-write checks want to ride back alongside it.
-func writeRestoreDone(w http.ResponseWriter, message string, warn *apiv1.APICallRc) {
+// post-write checks want to ride back alongside it and those of the deploy
+// wait.
+func writeRestoreDone(w http.ResponseWriter, message string, warn *apiv1.APICallRc, notReady ...apiv1.APICallRc) {
 	rcs := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: message,
@@ -919,7 +936,7 @@ func writeRestoreDone(w http.ResponseWriter, message string, warn *apiv1.APICall
 		rcs = append(rcs, *warn)
 	}
 
-	writeJSON(w, http.StatusCreated, rcs)
+	writeJSON(w, http.StatusCreated, append(rcs, notReady...))
 }
 
 // restoreTargetState decides what an existing definition under the target
@@ -1819,7 +1836,8 @@ func (s *Server) placeRestoredResources(ctx context.Context, newRD *apiv1.Resour
 	// would hang the restore until the client deadline whenever the
 	// snapshot is slow / never Ready (and deadlocks envtest, which has no
 	// satellite to stamp the timestamp at all) — so the handler does NOT
-	// wait.
+	// wait for the snapshot. The bounded wait for the replica to be built
+	// comes after placement (materializeRestore), as a create's does.
 	return s.stampRestoredResourcesOnNodes(ctx, snap, newRD.Name, nodes)
 }
 
