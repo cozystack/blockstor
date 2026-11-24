@@ -205,11 +205,11 @@ func runControllerListProperties(t *testing.T, stack *harness.Stack, cli *harnes
 
 // runControllerSetProperty pins controller→RD prop propagation:
 //
-//   - set `DrbdOptions/Net/ping-timeout = 500` via `linstor c sp`
+//   - set `DrbdOptions/Net/ping-timeout = 250` via `linstor c sp`
 //   - spawn an RD with the default RG via `rg sr default <rd> 50M`
 //   - poll /v1/view/resources until at least one resource for the new
 //     RD exposes `effective_props["DrbdOptions/Net/ping-timeout"]` with
-//     {value: "500", scope: Controller}
+//     {value: "250", scope: Controller}
 //
 // This walks the full Controller → RG → RD → Resource merge implemented
 // in pkg/rest/effective_props.go. A regression that lost controller-
@@ -225,7 +225,7 @@ func runControllerSetProperty(t *testing.T, stack *harness.Stack, cli *harness.C
 
 	const (
 		propKey   = "DrbdOptions/Net/ping-timeout"
-		propValue = "500"
+		propValue = "250"
 	)
 
 	// 1. Set the controller-scope property. Use the Python CLI's
@@ -234,7 +234,7 @@ func runControllerSetProperty(t *testing.T, stack *harness.Stack, cli *harness.C
 	_ = cli.Run(t, "controller", "set-property", propKey, propValue)
 
 	// 2. Confirm the set landed via `c lp` round-trip. The CLI prints
-	// `[[{"key":"DrbdOptions/Net/ping-timeout","value":"500"}, ...]]`
+	// `[[{"key":"DrbdOptions/Net/ping-timeout","value":"250"}, ...]]`
 	// under `--machine-readable`; harness.CLI.JSON flattens one
 	// level so we get `[{...}, ...]`.
 	gotProps := cli.JSON(t, "controller", "list-properties")

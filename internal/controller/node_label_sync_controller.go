@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 )
 
 // LabelSyncFieldOwner is the SSA field-manager the label-sync
@@ -114,17 +115,28 @@ var syncedLabelExactKeys = map[string]struct{}{
 type NodeLabelSyncReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
-// Reconcile pulls the corev1.Node's labels into the matching
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *NodeLabelSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass pulls the corev1.Node's labels into the matching
 // blockstor Node CRD's `Spec.Props["Aux/<full-key>"]` under the
 // allow-list. Missing corev1.Node or missing blockstor Node are
 // both no-ops — when the satellite exists for a k8s node, it'll
 // show up here; when the k8s node is being deleted, the satellite
 // teardown path takes over.
-func (r *NodeLabelSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *NodeLabelSyncReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx).WithValues("node", req.Name)
 
 	// Fetch the corev1.Node. NotFound → either the node was just

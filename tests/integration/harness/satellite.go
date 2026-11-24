@@ -31,6 +31,9 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
+	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 const (
@@ -300,23 +303,73 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 		resource := &resources.Items[i]
 
 		want := s.desiredDrbdState(resource)
-		if resource.Status.DrbdState == want {
+		volumes := s.reportedVolumes(ctx, resource, want)
+
+		if resource.Status.DrbdState == want && volumesReported(resource.Status.Volumes, volumes) {
 			continue
 		}
 
 		patched := resource.DeepCopy()
 		patched.Status.DrbdState = want
-
-		// Volumes follow the resource: the satellite reports
-		// UpToDate / Diskless on a per-volume DiskState. We
-		// project the resource-level value uniformly — sufficient
-		// for the smoke test and Phase 0.
-		for j := range patched.Status.Volumes {
-			patched.Status.Volumes[j].DiskState = want
-		}
+		patched.Status.Volumes = volumes
 
 		_ = s.client.Status().Update(ctx, patched)
 	}
+}
+
+// reportedVolumes is the per-volume status a real satellite reports for
+// the replica: one entry for each volume definition of its resource
+// definition, carrying the disk state. Without the entries a replica
+// reads as having no volumes, which no check of a replica's disk state
+// counts as UpToDate. The resource-level state is projected onto every
+// volume, as before; entries the replica already has keep their other
+// fields. A volume with no generation identifier gets the day0 one, as
+// a fresh replica the real satellite seeded carries, so its peers still
+// read it as holding no data yet.
+func (s *Satellite) reportedVolumes(ctx context.Context, resource *blockstoriov1alpha1.Resource, state string) []blockstoriov1alpha1.ResourceVolumeStatus {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := s.client.Get(ctx, client.ObjectKey{Name: storek8s.Name(resource.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		return resource.Status.Volumes
+	}
+
+	out := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(rd.Spec.VolumeDefinitions))
+
+	for i := range rd.Spec.VolumeDefinitions {
+		vol := blockstoriov1alpha1.ResourceVolumeStatus{VolumeNumber: rd.Spec.VolumeDefinitions[i].VolumeNumber}
+
+		for j := range resource.Status.Volumes {
+			if resource.Status.Volumes[j].VolumeNumber == vol.VolumeNumber {
+				vol = resource.Status.Volumes[j]
+			}
+		}
+
+		vol.DiskState = state
+		if vol.CurrentGI == "" {
+			vol.CurrentGI = drbd.Day0GIFor(naming.Key(resource.Spec.ResourceDefinitionName), vol.VolumeNumber)
+		}
+
+		out = append(out, vol)
+	}
+
+	return out
+}
+
+// volumesReported reports whether the replica already shows the volumes
+// the mock would report, so an unchanged replica is not written again.
+func volumesReported(have, want []blockstoriov1alpha1.ResourceVolumeStatus) bool {
+	if len(have) != len(want) {
+		return false
+	}
+
+	for i := range have {
+		if have[i].VolumeNumber != want[i].VolumeNumber || have[i].DiskState != want[i].DiskState {
+			return false
+		}
+	}
+
+	return true
 }
 
 // desiredPoolStatus computes the status we want stamped on a

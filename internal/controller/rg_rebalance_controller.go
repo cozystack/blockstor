@@ -30,6 +30,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -42,8 +43,11 @@ import (
 //
 //  1. REST `linstor rg modify` stamps the
 //     `blockstor.org/rebalance-pending` annotation on the RG CRD when
-//     PlaceCount strictly increases or a placement-affecting
-//     SelectFilter changes (see pkg/rest/resource_groups.go).
+//     the request names a place count or changes a placement-affecting
+//     SelectFilter (see pkg/rest/resource_groups.go). A named place
+//     count also stamps `blockstor.org/rebalance-place-count`, and that
+//     pass places with BalanceResourcesEnabled=false too, as LINSTOR's
+//     `rg modify` does.
 //  2. The controller-runtime watch on RG CRDs delivers a reconcile
 //     request. The annotation-driven path runs the additive placer
 //     for every child RD, then strips the marker so the next event
@@ -92,6 +96,10 @@ type RGRebalanceReconciler struct {
 	// race on the map.
 	nodeOfflineSinceMu sync.Mutex
 	nodeOfflineSince   map[string]time.Time
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch;update;patch
@@ -100,12 +108,19 @@ type RGRebalanceReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=controllerconfigs,verbs=get;list;watch
 
-// Reconcile is the explicit + periodic rebalance pass. See the type
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass is the explicit + periodic rebalance pass. See the type
 // comment for the five-step lifecycle. Returns `RequeueAfter =
 // BalanceResourcesInterval` on every path (annotation-driven,
 // scheduled-tick, kill-switched, grace-gated) so the cadence is
 // stable regardless of branch taken.
-func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *RGRebalanceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if r.Store == nil {
 		return ctrl.Result{}, nil
 	}
@@ -147,17 +162,21 @@ func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 }
 
 // handleDisabledPass implements scenario 2.W02's "kill-switched" branch.
-// The scheduled tick is suppressed and a stamped annotation is stripped
-// so a stale marker doesn't loop forever against the disabled
-// reconciler.
+// The scheduled tick is suppressed, and so is the pass for an
+// `rg modify` that changed only a placement constraint. A stamped
+// annotation is stripped so a stale marker doesn't loop forever against
+// the disabled reconciler.
 //
-// The kill switch stops the balance task, not an explicit `rg modify`:
-// LINSTOR reads it in BalanceResources alone and autoplaces every child
-// of a modified group without consulting it. So this pass places every
-// child before it strips the marker, whatever its layer stack. It does
-// not leave the DRBD children to the RG event path: that path is not
-// where LINSTOR's modify places, and it is free to apply the balance
-// checks, the switch among them.
+// An `rg modify` that names a place count still places, on every child
+// short of the count, whatever its layer stack. The switch is read by
+// LINSTOR's balance task alone (BalanceResources.isRscDfnDisabled); its
+// `rg modify` autoplaces only when the request carries a replica count,
+// and then every child with fewer non-tiebreaker replicas, without
+// consulting the switch (LINSTOR v1.33.1,
+// CtrlRscGrpApiCallHandler.java:577-620). This pass places those
+// children itself rather than leaving the DRBD ones to the RG event
+// path: that path is not where LINSTOR's modify places, and it makes
+// the balance checks, the switch among them.
 func (r *RGRebalanceReconciler) handleDisabledPass(ctx context.Context, rg *apiv1.ResourceGroup) error {
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; !hasAnnotation {
 		return nil
@@ -165,12 +184,18 @@ func (r *RGRebalanceReconciler) handleDisabledPass(ctx context.Context, rg *apiv
 
 	log := logf.FromContext(ctx).WithValues("rg", rg.Name)
 
+	if _, placeCount := rg.Annotations[apiv1.AnnotationRGRebalancePlaceCount]; !placeCount {
+		log.Info("rebalance disabled by BalanceResourcesEnabled=false; stripping stale annotation")
+
+		return r.stripRebalanceAnnotation(ctx, rg)
+	}
+
 	count, err := r.rebalanceChildRDs(ctx, rg, 0, allChildren)
 	if err != nil {
 		return err
 	}
 
-	log.Info("rebalance disabled by BalanceResourcesEnabled=false; placed the explicit modify, stripping annotation",
+	log.Info("rebalance pass complete (rg modify place count; BalanceResourcesEnabled=false stops only the balance task)",
 		"rds_processed", count)
 
 	return r.stripRebalanceAnnotation(ctx, rg)
@@ -189,7 +214,16 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	if _, hasAnnotation := rg.Annotations[apiv1.AnnotationRGRebalancePending]; hasAnnotation {
 		// Operator intent: ignore per-RD shortfall grace and the
 		// per-node offline grace — a REST modify means "act now".
-		count, perr := r.rebalanceChildRDs(ctx, rg, 0, allChildren)
+		// Only a modify that named a place count is the placement
+		// LINSTOR's own `rg modify` runs, on every child; one that
+		// changed a placement constraint alone is the balance pass,
+		// run now.
+		children := childrenWithDRBD
+		if _, placeCount := rg.Annotations[apiv1.AnnotationRGRebalancePlaceCount]; placeCount {
+			children = allChildren
+		}
+
+		count, perr := r.rebalanceChildRDs(ctx, rg, 0, children)
 		if perr != nil {
 			return perr
 		}
@@ -200,8 +234,8 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 	}
 
 	// Scenario 2.15 scheduled tick — only fires when no Node is
-	// inside its grace window. The placer's idempotent already-placed
-	// accounting keeps a clean cluster a no-op.
+	// inside its grace window. The gate's place-count check keeps a
+	// clean cluster a no-op that reads nothing past the cache.
 	if r.graceGateActive(gracePeriod) {
 		return nil
 	}
@@ -232,14 +266,30 @@ func (r *RGRebalanceReconciler) runRebalancePass(ctx context.Context, rg *apiv1.
 // path does this so an operator's `linstor rg modify` acts on every
 // child RD immediately.
 //
-// `children` picks which definitions the pass places on; see
-// rebalanceChildren.
+// `children` picks the pass (rebalanceChildren): the balance pass
+// applies the checks LINSTOR's balance task makes before it touches a
+// definition (balanceGate.skipReason); the place-count modify leaves
+// them off and places on the definitions modifyPlaceCountSkip lets
+// through.
+//
+// It returns how many definitions the placer ran on. A definition
+// skipped by the gate is not counted, the settled ones included, so a
+// scheduled pass over a group that has every replica returns 0.
 func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1.ResourceGroup, shortfallGrace time.Duration, children rebalanceChildren) (int, error) {
 	log := logf.FromContext(ctx)
 
 	rds, err := r.Store.ResourceDefinitions().List(ctx)
 	if err != nil {
 		return 0, err
+	}
+
+	var gate *balanceGate
+
+	if children.balanceChecks() {
+		gate, err = newBalanceGate(ctx, r.Store)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	p := placer.New(r.Store)
@@ -265,16 +315,11 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 			continue
 		}
 
-		filter := rg.SelectFilter
-		if filter.PlaceCount == 0 {
-			filter.PlaceCount = 1
+		if r.skipRD(ctx, gate, rg, &rds[i]) {
+			continue
 		}
 
-		_, _, perr := p.Place(ctx, rds[i].Name, &filter)
-		if perr != nil {
-			log.Error(perr, "placer call failed during RG rebalance",
-				"rg", rg.Name, "rd", rds[i].Name)
-		}
+		r.placeChild(ctx, p, gate, rg, rds[i].Name)
 
 		processed++
 	}
@@ -282,22 +327,86 @@ func (r *RGRebalanceReconciler) rebalanceChildRDs(ctx context.Context, rg *apiv1
 	return processed, nil
 }
 
+// placeChild runs the placer on one child definition with the group's
+// filter, through the gate when the pass makes the balance checks. A
+// failure is logged and the pass goes on to the next child.
+func (r *RGRebalanceReconciler) placeChild(ctx context.Context, p *placer.Placer, gate *balanceGate, rg *apiv1.ResourceGroup, rdName string) {
+	filter := rg.SelectFilter
+	if filter.PlaceCount == 0 {
+		filter.PlaceCount = 1
+	}
+
+	var err error
+	if gate != nil {
+		err = gate.place(ctx, p, rg, rdName, &filter)
+	} else {
+		_, _, err = p.Place(ctx, rdName, &filter)
+	}
+
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "placer call failed during RG rebalance",
+			"rg", rg.Name, "rd", rdName)
+	}
+}
+
+// skipRD reports whether the pass leaves rd alone. Without a gate
+// (an `rg modify` that named a place count) modifyPlaceCountSkip
+// decides. The reason goes to the debug log; a definition whose
+// replicas cannot be read is skipped.
+func (r *RGRebalanceReconciler) skipRD(ctx context.Context, gate *balanceGate, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) bool {
+	log := logf.FromContext(ctx).WithValues("rg", rg.Name, "rd", rd.Name)
+
+	var (
+		reason string
+		err    error
+	)
+
+	if gate == nil {
+		reason, err = modifyPlaceCountSkip(ctx, r.Store, rg, rd)
+	} else {
+		reason, err = gate.skipReason(ctx, rg, rd)
+	}
+
+	if err != nil {
+		log.Error(err, "rebalance skipped: replicas unreadable")
+
+		return true
+	}
+
+	if reason != "" {
+		log.V(1).Info("rebalance skipped", "reason", reason)
+
+		return true
+	}
+
+	return false
+}
+
 // rebalanceChildren selects the child definitions a rebalance pass
 // places on.
 type rebalanceChildren int
 
 const (
-	// allChildren is the explicit `rg modify`, with balancing on or
-	// off: LINSTOR autoplaces every child of the group, whatever its
-	// layer stack.
+	// allChildren is an `rg modify` that named a place count, with
+	// balancing on or off: LINSTOR autoplaces every child of the group
+	// short of the count, whatever its layer stack, without the balance
+	// checks (CtrlRscGrpApiCallHandler.java:577-620 in v1.33.1).
 	allChildren rebalanceChildren = iota
 
-	// childrenWithDRBD is the scheduled balance pass. It leaves out a
-	// definition without a DRBD layer, as LINSTOR's BalanceResources
-	// does: such a replica has no peer to resync from, so a replica
-	// topped up here would only be an empty volume under its name.
+	// childrenWithDRBD is the balance pass: the scheduled tick, and an
+	// `rg modify` that changed only a placement constraint. It leaves
+	// out a definition without a DRBD layer, as LINSTOR's
+	// BalanceResources does: such a replica has no peer to resync from,
+	// so a replica topped up here would only be an empty volume under
+	// its name. It makes the balance checks (balanceGate.skipReason).
 	childrenWithDRBD
 )
+
+// balanceChecks reports whether the pass makes the checks of LINSTOR's
+// balance task.
+func (c rebalanceChildren) balanceChecks() bool {
+	return c == childrenWithDRBD
+}
 
 func (c rebalanceChildren) includes(rd *apiv1.ResourceDefinition, rg *apiv1.ResourceGroup) bool {
 	switch c {
@@ -457,6 +566,7 @@ func (r *RGRebalanceReconciler) stripRebalanceAnnotation(ctx context.Context, rg
 	}
 
 	delete(rg.Annotations, apiv1.AnnotationRGRebalancePending)
+	delete(rg.Annotations, apiv1.AnnotationRGRebalancePlaceCount)
 
 	// Keep the now-empty map NON-nil (Bug-021). An earlier revision
 	// nil-ed it "for wire-envelope round-trip stability", but the
@@ -587,11 +697,11 @@ func (r *RGRebalanceReconciler) now() time.Time {
 }
 
 // balanceResourcesDisabled returns true when the controller-scope
-// `BalanceResourcesEnabled` prop is explicitly set to "false". Any
-// other value (including missing, empty, or a typo) keeps the
-// rebalance reconciler armed — matches upstream LINSTOR's "default
-// = enabled" semantics so an unconfigured cluster behaves the same
-// way it did before scenario 2.W02 landed.
+// `BalanceResourcesEnabled` prop is "false" in any letter case, which
+// is how LINSTOR compares it. Any other value (including missing,
+// empty, or a typo) keeps the rebalance reconciler armed — matches
+// upstream LINSTOR's "default = enabled" semantics so an unconfigured
+// cluster behaves the same way it did before scenario 2.W02 landed.
 func balanceResourcesDisabled(ctx context.Context, st store.Store) bool {
 	if st == nil {
 		return false
@@ -606,7 +716,7 @@ func balanceResourcesDisabled(ctx context.Context, st store.Store) bool {
 		return false
 	}
 
-	return props[apiv1.PropBalanceResourcesEnabled] == "false"
+	return balanceDisabled(nil, nil, props)
 }
 
 // SetupWithManager wires the reconciler into the manager. We share

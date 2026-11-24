@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
@@ -71,6 +72,10 @@ import (
 type SnapshotReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=snapshots,verbs=get;list;watch;create;update;patch;delete
@@ -78,10 +83,17 @@ type SnapshotReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.org,resources=snapshots/finalizers,verbs=update
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch
 
-// Reconcile drives the Spec.SuspendIO / Spec.TakeSnapshot
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass drives the Spec.SuspendIO / Spec.TakeSnapshot
 // transitions. Bug 351 (single-Snapshot orchestration) + Bug 353
 // (cross-Snapshot transactional batch via Spec.GroupID).
-func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("snapshot", req.Name)
 
 	var snap blockstoriov1alpha1.Snapshot
@@ -105,6 +117,13 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	// Report which replicas still hold I/O suspended before anything
+	// else, so an abort is never read as a resume the kernels have not
+	// confirmed. A failed stamp still lets an abort below order the
+	// resume: frozen I/O outranks a stale condition, and the error is
+	// returned once that write is done.
+	stampErr := r.stampIOSuspendedCondition(ctx, &snap)
+
 	// Adopted snapshots (imported from another storage controller by
 	// a migration tool; see AnnotationSnapshotAdopted) already exist
 	// on disk. NEVER run the suspend→take→resume orchestration for
@@ -126,7 +145,9 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			logger.Info("ignoring adopted annotation on an in-flight snapshot; completing normal orchestration so suspended I/O resumes",
 				"suspendIO", true)
 		} else {
-			return r.backfillAdoptedSnapshot(ctx, logger, &snap)
+			backfillErr := r.backfillAdoptedSnapshot(ctx, logger, &snap)
+
+			return ctrl.Result{}, withStampError(logger, backfillErr, stampErr)
 		}
 	}
 
@@ -137,7 +158,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// the aggregate predicates reduce to the self-only walks.
 	siblings, err := r.fetchSiblings(ctx, &snap)
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, withStampError(logger, err, stampErr)
 	}
 
 	// Abort paths take priority over phase advancement and force us
@@ -149,7 +170,11 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// has driven the abort, in which case Reconcile is done.
 	aborted, result, err := r.checkAbortConditions(ctx, logger, &snap, siblings)
 	if aborted || err != nil {
-		return result, err
+		return result, withStampError(logger, err, stampErr)
+	}
+
+	if stampErr != nil {
+		return ctrl.Result{}, stampErr
 	}
 
 	// A Snapshot whose Spec.Nodes is empty is degenerate at the
@@ -180,9 +205,9 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // ends in (allSiblingsReady) without any satellite involvement.
 func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 	ctx context.Context, logger logr.Logger, snap *blockstoriov1alpha1.Snapshot,
-) (ctrl.Result, error) {
+) error {
 	if allNodesReady(snap.Status.NodeStatus, snap.Spec.Nodes) {
-		return ctrl.Result{}, nil
+		return nil
 	}
 
 	createdAt := adoptedCreatedAt(logger, snap)
@@ -224,12 +249,12 @@ func (r *SnapshotReconciler) backfillAdoptedSnapshot(
 		return r.Status().Update(ctx, &current)
 	})
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "backfill adopted Snapshot status")
+		return errors.Wrap(err, "backfill adopted Snapshot status")
 	}
 
 	logger.V(1).Info("backfilled adopted snapshot per-node status", "nodes", len(snap.Spec.Nodes))
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // hasNodeStatusEntry reports whether a per-node status row for the
@@ -314,7 +339,7 @@ func (r *SnapshotReconciler) advancePhase(
 
 			return r.abortGroupWithReason(ctx, siblings,
 				"snapshot aborted: replica on node '"+offending+
-					"' is not UpToDate; I/O resumed")
+					"' is not UpToDate; resume of I/O requested")
 		}
 	}
 
@@ -405,7 +430,7 @@ func (r *SnapshotReconciler) checkAbortConditions(
 
 		res, err := r.abortGroupWithReason(ctx, siblings,
 			"snapshot aborted: suspend/take exceeded the "+
-				snapshotSuspendDeadline.String()+" deadline; I/O resumed")
+				snapshotSuspendDeadline.String()+" deadline; resume of I/O requested")
 
 		return true, res, err
 	}
@@ -743,6 +768,22 @@ func firstFailedNode(entries []blockstoriov1alpha1.SnapshotPerNodeStatus) string
 // importing pkg/store/k8s avoids a controller→store dependency that
 // the store does not otherwise have. b353.
 const snapshotGroupIDLabel = "blockstor.org/snapshot-group-id"
+
+// withStampError returns a pass's own failure ahead of a failed
+// IOSuspended stamp and only logs the stamp beside it. Joining the two
+// would let the stamp's 409 make a real failure read as a benign
+// conflict, which the conflict-aware error path then requeues quietly.
+func withStampError(logger logr.Logger, err, stampErr error) error {
+	if err == nil {
+		return stampErr
+	}
+
+	if stampErr != nil {
+		logger.Info("IOSuspended condition stamp also failed", "stampError", stampErr.Error())
+	}
+
+	return err
+}
 
 // fetchSiblings returns the transactional batch the Snapshot
 // belongs to — self + every same-GroupID peer. For an empty

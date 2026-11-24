@@ -141,6 +141,11 @@ type encryption struct {
 	once     sync.Once
 	unlocker *passphrase.Unlocker
 
+	// viewOnce and viewUnlocker derive the view's state through
+	// Server.StateReader.
+	viewOnce     sync.Once
+	viewUnlocker *passphrase.Unlocker
+
 	// attempts bounds the passphrase operations in flight: each tries a
 	// passphrase against up to eight slots at 64 MiB of Argon2id apiece.
 	attemptsOnce sync.Once
@@ -203,6 +208,24 @@ func (s *Server) encryptionStatus(ctx context.Context) (passphrase.Status, error
 	return s.encryption.unlocker.Unlock(ctx) //nolint:wrapcheck // pkg/passphrase names the Secret it failed on
 }
 
+// viewEncryptionStatus is encryptionStatus read through StateReader.
+func (s *Server) viewEncryptionStatus(ctx context.Context) (passphrase.Status, error) {
+	if s.Client == nil {
+		return passphrase.Status{}, errNoEncryptionClient
+	}
+
+	s.encryption.viewOnce.Do(func() {
+		secrets := s.passphraseSecrets()
+		if s.StateReader != nil {
+			secrets.Reader = s.StateReader
+		}
+
+		s.encryption.viewUnlocker = &passphrase.Unlocker{Secrets: secrets}
+	})
+
+	return s.encryption.viewUnlocker.Unlock(ctx) //nolint:wrapcheck // pkg/passphrase names the Secret it failed on
+}
+
 // encryptionState is the cluster's encryption state for the resource
 // view, reused for encryptionStateTTL. A state that cannot be read counts
 // as locked: the view then says `Suspended`, which is what an operator
@@ -215,7 +238,7 @@ func (s *Server) encryptionState(ctx context.Context) passphrase.State {
 		return s.encryption.state
 	}
 
-	status, err := s.encryptionStatus(ctx)
+	status, err := s.viewEncryptionStatus(ctx)
 	if err != nil {
 		status.State = passphrase.StateLocked
 	}
