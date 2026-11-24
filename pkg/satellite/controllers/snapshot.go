@@ -816,7 +816,7 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	if err != nil {
 		stampErr := r.stampSnapshotDeleteFailure(ctx, snap, err.Error())
 		if stampErr != nil {
-			log.FromContext(ctx).Error(stampErr, "record snapshot delete failure")
+			conflict.LogFailure(ctx, stampErr, "record snapshot delete failure")
 		}
 
 		return ctrl.Result{}, errors.Wrap(err, "DeleteSnapshot")
@@ -831,7 +831,7 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 
 		err = r.stampSnapshotDeleteFailure(ctx, snap, resp.GetMessage())
 		if err != nil {
-			log.FromContext(ctx).Error(err, "record snapshot delete failure")
+			conflict.LogFailure(ctx, err, "record snapshot delete failure")
 		}
 
 		return ctrl.Result{Requeue: true}, nil

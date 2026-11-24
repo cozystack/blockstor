@@ -83,6 +83,23 @@ func (r *Retrier) Reconcile(ctx context.Context, req reconcile.Request, pass rec
 	return reconcile.Result{Requeue: true}, nil
 }
 
+// LogFailure logs a side write that failed next to a pass's own
+// outcome, such as a status stamp recording why the pass failed. The
+// pass does not return that error, so the Retrier never sees it; a
+// conflict there is the same lost race and goes to V(1), and any other
+// failure is logged at ERROR.
+func LogFailure(ctx context.Context, err error, msg string) {
+	logger := logf.FromContext(ctx)
+
+	if apierrors.IsConflict(err) {
+		logger.V(1).Info(msg, "error", err.Error())
+
+		return
+	}
+
+	logger.Error(err, msg)
+}
+
 func (r *Retrier) record(key types.NamespacedName) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

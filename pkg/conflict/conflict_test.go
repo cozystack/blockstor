@@ -20,6 +20,7 @@ package conflict_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -213,5 +214,37 @@ func TestConflictRunResets(t *testing.T) {
 		if level < 1 {
 			t.Fatalf("line %d logged at V(%d), want every line at V(1)", i+1, level)
 		}
+	}
+}
+
+// A side write that failed next to a pass's own outcome never reaches
+// the Retrier, so LogFailure itself keeps a lost race out of the ERROR
+// log and still reports any other failure there.
+func TestLogFailureLogsAConflictAtV1AndAnythingElseAtError(t *testing.T) {
+	t.Parallel()
+
+	modified := apierrors.NewConflict(schema.GroupResource{Group: "blockstor.org", Resource: "snapshots"}, "s", errModified)
+
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantErrors int
+		wantInfo   []int
+	}{
+		{name: "conflict", err: errors.Wrap(modified, "stamp"), wantInfo: []int{1}},
+		{name: "other", err: errBroken, wantErrors: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var levels logLevels
+
+			conflict.LogFailure(logf.IntoContext(context.Background(), capture(&levels)), tc.err, "record failure")
+
+			if levels.errors != tc.wantErrors || !slices.Equal(levels.info, tc.wantInfo) {
+				t.Errorf("logged %d errors and info at %v, want %d errors and info at %v",
+					levels.errors, levels.info, tc.wantErrors, tc.wantInfo)
+			}
+		})
 	}
 }

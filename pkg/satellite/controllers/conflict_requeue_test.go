@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -221,5 +223,82 @@ func TestSatelliteRetriesASnapshotStatusStampThatRanOutOfRetries(t *testing.T) {
 
 	if !result.Requeue { //nolint:staticcheck // the rate-limited retry an error would get
 		t.Errorf("result %+v, want a requeue", result)
+	}
+}
+
+// errorCountSink counts the ERROR lines a reconcile writes.
+type errorCountSink struct{ count *int }
+
+func (errorCountSink) Init(logr.RuntimeInfo)            {}
+func (errorCountSink) Enabled(int) bool                 { return true }
+func (errorCountSink) Info(int, string, ...any)         {}
+func (s errorCountSink) Error(error, string, ...any)    { *s.count++ }
+func (s errorCountSink) WithValues(...any) logr.LogSink { return s }
+func (s errorCountSink) WithName(string) logr.LogSink   { return s }
+
+// A snapshot delete that failed on this node is recorded in the status
+// before the pass retries it, and that stamp races the other nodes'
+// stamps of the same status. Losing that race is not an error anyone
+// can act on, so it stays out of the ERROR log like any other conflict.
+func TestSatelliteLogsALostDeleteFailureStampBelowError(t *testing.T) {
+	t.Parallel()
+
+	now := metav1.Now()
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pvc-c.snap-c",
+			Finalizers:        []string{controllers.SatelliteSnapshotFinalizer},
+			DeletionTimestamp: &now,
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-c",
+			SnapshotName:           "snap-c",
+			Nodes:                  []string{"n1"},
+		},
+	}
+
+	cli := interceptor.NewClient(
+		fake.NewClientBuilder().
+			WithScheme(newSnapshotScheme(t)).
+			WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+			WithObjects(snap).
+			Build(),
+		interceptor.Funcs{
+			SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+				return objectModified("snapshots", "pvc-c.snap-c")
+			},
+		},
+	)
+
+	fx := storage.NewFakeExec()
+	reconciler := &controllers.SnapshotReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "n1",
+			Apply: satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{},
+				Adm:       drbd.NewAdm(fx),
+			}),
+			Exec: fx,
+		},
+	}
+
+	var errorLines int
+
+	ctx := logf.IntoContext(context.Background(), logr.New(errorCountSink{count: &errorLines}))
+
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-c.snap-c"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile returned %v, want the failed delete retried", err)
+	}
+
+	if !result.Requeue { //nolint:staticcheck // the retry of the failed delete
+		t.Errorf("result %+v, want a requeue", result)
+	}
+
+	if errorLines != 0 {
+		t.Errorf("a lost delete-failure stamp wrote %d ERROR lines, want none", errorLines)
 	}
 }
