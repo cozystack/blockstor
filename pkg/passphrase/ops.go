@@ -494,6 +494,19 @@ func (o *Ops) CleanupSuperseded(ctx context.Context) (bool, error) {
 	removed := false
 
 	err = o.mutate(ctx, func(ring *keyring.Keyring) error {
+		// The state may have been read from a watch that has not seen
+		// the ControllerConfig move to another Secret yet, one that
+		// opens a slot this would remove. The next pass decides on
+		// the ref the API server holds.
+		ref, refErr := ResolveRef(ctx, o.Secrets.direct().Reader)
+		if refErr != nil {
+			return refErr
+		}
+
+		if ref != status.Ref {
+			return errNothingToWrite
+		}
+
 		// The Secret may have moved back to the superseded passphrase
 		// since the state was read; the slot it opens now, in the
 		// keyring about to be written, is the one to keep.
@@ -539,7 +552,7 @@ func (o *Ops) unlocker() *Unlocker {
 // unlockSlotIn is the slot of ring the passphrase Secret ref opens now, or
 // ErrLocked when it opens none.
 func (o *Ops) unlockSlotIn(ctx context.Context, ring *keyring.Keyring, ref Ref) (string, error) {
-	pass, _, err := o.Secrets.Passphrase(ctx, ref)
+	pass, _, err := o.Secrets.direct().Passphrase(ctx, ref)
 	if err != nil {
 		return "", err
 	}
@@ -575,7 +588,7 @@ func (o *Ops) mutate(ctx context.Context, change func(*keyring.Keyring) error) e
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error { //nolint:wrapcheck // change's errors and the update's are wrapped inside
 		var sec corev1.Secret
 
-		err := o.Secrets.Reader.Get(ctx, client.ObjectKey{Namespace: o.Secrets.Namespace, Name: KeyringSecretName}, &sec)
+		err := o.Secrets.direct().Reader.Get(ctx, client.ObjectKey{Namespace: o.Secrets.Namespace, Name: KeyringSecretName}, &sec)
 		if apierrors.IsNotFound(err) {
 			return ErrNoKeyring
 		}
@@ -626,7 +639,7 @@ func (o *Ops) writeUnlockSecret(ctx context.Context, generated []byte) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error { //nolint:wrapcheck // the update's error is wrapped inside
 		var cur corev1.Secret
 
-		getErr := o.Secrets.Reader.Get(ctx, client.ObjectKeyFromObject(sec), &cur)
+		getErr := o.Secrets.direct().Reader.Get(ctx, client.ObjectKeyFromObject(sec), &cur)
 		if getErr != nil {
 			return errors.Wrap(getErr, "get the unlock Secret")
 		}

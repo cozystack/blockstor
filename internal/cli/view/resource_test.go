@@ -26,6 +26,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 
+	"github.com/cozystack/blockstor/internal/cli/color"
 	"github.com/cozystack/blockstor/internal/cli/view"
 )
 
@@ -341,17 +342,38 @@ func cellAt(t *testing.T, tbl *metav1.Table, row int, column string) string {
 		t.Fatalf("row %d out of range (%d rows)", row, len(tbl.Rows))
 	}
 
-	cell := tbl.Rows[row].Cells[idx]
-	if cell == nil {
+	switch cell := tbl.Rows[row].Cells[idx].(type) {
+	case nil:
+		return ""
+	case string:
+		return cell
+	case color.Cell:
+		return cell.Text
+	default:
+		t.Fatalf("cell %q is %T, want string or color.Cell", column, cell)
+
 		return ""
 	}
+}
 
-	s, ok := cell.(string)
-	if !ok {
-		t.Fatalf("cell %q is %T, want string", column, cell)
+// classAt returns the colour class the view decided for a cell; a
+// plain string cell decided none and reads Neutral.
+func classAt(t *testing.T, tbl *metav1.Table, row int, column string) color.Class {
+	t.Helper()
+
+	cellAt(t, tbl, row, column) // bounds and column checks
+
+	for i := range tbl.ColumnDefinitions {
+		if tbl.ColumnDefinitions[i].Name != column {
+			continue
+		}
+
+		if cell, ok := tbl.Rows[row].Cells[i].(color.Cell); ok {
+			return cell.Class
+		}
 	}
 
-	return s
+	return color.Neutral
 }
 
 // A replica toggled to diskful whose satellite cannot attach the new
@@ -400,7 +422,7 @@ func TestDisklessReplicaMeantToHaveDisk(t *testing.T) {
 	intended.Flags = []string{apiv1.ResourceFlagDiskless}
 	intended.State.ToggleDiskRetries = 3
 
-	if view.IsFaulty(&intended) {
+	if view.IsFaulty(&intended, nil) {
 		t.Errorf("a replica meant to be diskless is reported faulty")
 	}
 

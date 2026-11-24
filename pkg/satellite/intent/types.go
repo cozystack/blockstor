@@ -158,6 +158,22 @@ type DesiredResource struct {
 	// a replica blockstor created before it recorded one, which was
 	// created with 15 (drbd.EffectivePeerSlots reads it so).
 	PeerSlots *int32
+
+	// Deleting is true when this replica or its definition is on its way
+	// out: either carries a deletion timestamp, the replica is flagged
+	// DELETE or DELETING, or the definition is flagged DELETE. A replica that is being deleted is never promoted
+	// by a self-heal: losing its peers is the intended end state of the
+	// delete, not a wedge to repair. LINSTOR never promotes a resource
+	// it is deleting either.
+	Deleting bool
+
+	// OtherDiskfulReplica is true when the definition has a diskful
+	// replica on another node, counted over every sibling Resource:
+	// deactivated ones, ones being deleted and ones the allocator has not
+	// stamped yet included, all of which Peers leaves out. Any of them
+	// holds, or may hold, data this replica does not, so a replica that
+	// has one is never force-promoted as the definition's only copy.
+	OtherDiskfulReplica bool
 }
 
 // DesiredConnection is one (peer-pair, paths) entry on a
@@ -331,6 +347,26 @@ func (x *DesiredResource) GetPeerHasData() bool {
 	}
 
 	return x.PeerHasData
+}
+
+// GetDeleting reports whether this replica or its definition is being
+// deleted. Nil-safe.
+func (x *DesiredResource) GetDeleting() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.Deleting
+}
+
+// GetOtherDiskfulReplica reports whether the definition has a diskful
+// replica on another node, whatever its state. Nil-safe.
+func (x *DesiredResource) GetOtherDiskfulReplica() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.OtherDiskfulReplica
 }
 
 // GetSkipInitialSync returns the controller-authoritative skip-initial-
