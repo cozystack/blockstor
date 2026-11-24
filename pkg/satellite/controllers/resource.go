@@ -626,9 +626,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
-	anyFailed := r.recordPerResourceFailures(res, results, logger)
-
-	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
+	anyFailed := r.afterApply(ctx, res, &rd, results, logger)
 
 	// Apply chain surfaces per-resource errors via results (e.g.
 	// drbdadm adjust failing on a stale .res rendered before the
@@ -675,6 +673,51 @@ func (r *ResourceReconciler) applyLocked(ctx context.Context, desired *intent.De
 	return r.Config.Apply.Apply(ctx, []*intent.DesiredResource{desired}) //nolint:wrapcheck // the caller wraps it
 }
 
+// afterApply records the apply's outcome on the Resource and reports
+// whether anything failed. The volumes of definitions flagged DELETE are
+// deleted only after an apply that went through, since that apply is what
+// took them out of DRBD. A failed apply may still have removed their
+// minors, so the quorum recheck that removal needs runs either way.
+func (r *ResourceReconciler) afterApply(
+	ctx context.Context,
+	res *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	results []*intent.ResourceApplyResult,
+	logger logr.Logger,
+) bool {
+	anyFailed := r.recordPerResourceFailures(res, results, logger)
+
+	r.stampPostApply(ctx, res, rd, results, anyFailed, logger)
+
+	if anyFailed {
+		r.recheckQuorumAfterFailedApply(ctx, res, rd, logger)
+
+		return true
+	}
+
+	err := r.deleteFlaggedVolumes(ctx, res, rd)
+	if err != nil {
+		logger.Info("volume definition delete not done yet", "error", err.Error())
+
+		// The definition stays flagged DELETE until this replica
+		// confirms, so a delete that keeps failing here holds it for
+		// good; the Event is where the operator learns which node and
+		// why.
+		if r.Config.Recorder != nil {
+			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, volumeDeleteFailedReason, "DeleteVolume",
+				"volume definition delete is waiting for this replica: %s", err.Error())
+		}
+
+		return true
+	}
+
+	return false
+}
+
+// volumeDeleteFailedReason is the Event reason for a replica that could not
+// delete the volume of a definition flagged DELETE.
+const volumeDeleteFailedReason = "VolumeDeleteFailed"
+
 // prepareDRBDApply runs the DRBD-only pre-apply sequence: stale
 // kernel slot prune (Bug 342 v3) and the controller-allocation wait
 // gate. Returns (result, false) when the caller should bail out and
@@ -718,6 +761,8 @@ func (r *ResourceReconciler) prepareDRBDApply(
 	if pruneErr != nil {
 		logger.Error(pruneErr, "PruneStaleKernelSlots failed; continuing to allocation gate")
 	}
+
+	r.removeFlaggedVolumesFromDRBD(ctx, res, rd, logger)
 
 	waitResult, ok := r.waitForControllerAllocation(ctx, res, peers, logger)
 	if !ok {
@@ -1234,10 +1279,15 @@ type staleVolumeStatus struct {
 
 // desiredVolumeNumbers returns the set of VolumeNumbers the parent
 // RD's VolumeDefinitions currently declare — i.e. every volume that
-// MUST survive in `Status.Volumes`.
+// MUST survive in `Status.Volumes`. A volume definition flagged DELETE is
+// not one of them: its volume is on its way out of this replica.
 func desiredVolumeNumbers(rd *blockstoriov1alpha1.ResourceDefinition) map[int32]struct{} {
 	out := make(map[int32]struct{}, len(rd.Spec.VolumeDefinitions))
 	for i := range rd.Spec.VolumeDefinitions {
+		if rd.Spec.VolumeDefinitions[i].Deleting() {
+			continue
+		}
+
 		out[rd.Spec.VolumeDefinitions[i].VolumeNumber] = struct{}{}
 	}
 
@@ -1646,6 +1696,10 @@ func volNumsOf(rd *blockstoriov1alpha1.ResourceDefinition) []int32 {
 	out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
 
 	for i := range rd.Spec.VolumeDefinitions {
+		if rd.Spec.VolumeDefinitions[i].Deleting() {
+			continue
+		}
+
 		out = append(out, rd.Spec.VolumeDefinitions[i].VolumeNumber)
 	}
 

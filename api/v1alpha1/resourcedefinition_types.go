@@ -19,6 +19,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"slices"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -156,7 +158,17 @@ type ResourceDefinitionSpec struct {
 	Initialized *bool `json:"initialized,omitempty"`
 }
 
+// VolumeDefinitionFlagDelete is LINSTOR's DELETE flag on a volume
+// definition: `vd d` asked for the volume to go. Each replica's satellite
+// then deletes its volume, and the definition is removed from the RD only
+// once every replica has confirmed that in Status.DeletedVolumes. Once set it
+// is never cleared, as in LINSTOR: a satellite may already have deleted its
+// volume, and clearing the flag would bring the volume back empty.
+const VolumeDefinitionFlagDelete = "DELETE"
+
 // ResourceDefinitionVolume is one volume slot inside an RD.
+//
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.flags) || !('DELETE' in oldSelf.flags) || (has(self.flags) && 'DELETE' in self.flags)",message="the DELETE flag of a volume definition is never cleared: a replica may already have deleted its volume"
 type ResourceDefinitionVolume struct {
 	VolumeNumber int32 `json:"volumeNumber"`
 
@@ -201,8 +213,22 @@ type ResourceDefinitionVolume struct {
 	SizeKib int64 `json:"sizeKib"`
 	// +optional
 	Props map[string]string `json:"props,omitempty"`
+	// flags carries LINSTOR's volume definition flags; DELETE is the one
+	// blockstor acts on, see VolumeDefinitionFlagDelete.
 	// +optional
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MaxLength=64
 	Flags []string `json:"flags,omitempty"`
+
+	// deleteID tells this delete of the volume apart from an earlier one of
+	// a volume with the same number. It is written together with the
+	// DELETE flag, and a replica's confirmation in Status.DeletedVolumes
+	// counts only when it carries the same value: a confirmation left over
+	// from the earlier volume must not stand for this one, whose storage
+	// would then never be deleted.
+	// +optional
+	// +kubebuilder:validation:MaxLength=64
+	DeleteID string `json:"deleteID,omitempty"`
 
 	// drbdMinor is the /dev/drbd<N> device minor for THIS volume,
 	// identical on every node that hosts a replica (the minor is the
@@ -234,6 +260,11 @@ type ResourceDefinitionVolume struct {
 	// and RD.Spec.DRBDPort fields.
 	// +optional
 	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
+}
+
+// Deleting reports whether the volume definition is flagged DELETE.
+func (v *ResourceDefinitionVolume) Deleting() bool {
+	return v != nil && slices.Contains(v.Flags, VolumeDefinitionFlagDelete)
 }
 
 // ResourceDefinitionStatus is the observed state.

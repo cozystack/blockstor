@@ -210,6 +210,8 @@ func hydrateSnapshot(ctx context.Context, run *runContext, snap *apiv1.Snapshot)
 			return fmt.Errorf("list volume definitions of %s: %w", snap.ResourceName, vdErr)
 		}
 
+		vds = apiv1.LiveVolumeDefinitions(vds)
+
 		snap.VolumeDefinitions = make([]apiv1.SnapshotVolumeDef, 0, len(vds))
 		for i := range vds {
 			snap.VolumeDefinitions = append(snap.VolumeDefinitions, apiv1.SnapshotVolumeDef{

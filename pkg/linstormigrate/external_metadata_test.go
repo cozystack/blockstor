@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 )
 
 // A replica whose DRBD metadata lives on a separate volume is never adopted:
@@ -489,15 +491,15 @@ func TestAnUnreadableStackStillDropsTheMetaPool(t *testing.T) {
 	}
 }
 
-// A volume marked DELETE is not converted, so its meta pool does not stop the
-// live volumes: the definition converts with the live volume alone.
+// A volume marked DELETE is carried as a delete in flight, which no replica
+// builds, so its meta pool does not stop the live volumes.
 func TestADeletedVolumesMetaPoolDoesNotStopTheLiveOnes(t *testing.T) {
 	t.Parallel()
 
 	dump := withProps(stackDump(`["DRBD","STORAGE"]`),
 		PropsContainerRow{PropsInstance: "/VLM_DFNS/PVC-S/0", PropKey: "StorPoolNameDrbdMeta", PropValue: "meta"},
 		PropsContainerRow{PropsInstance: "/VLM_DFNS/PVC-S/1", PropKey: "StorPoolNameDrbdMeta", PropValue: ".internal"})
-	dump.VolumeDefinitions[0].VlmFlags = resourceFlagDelete
+	dump.VolumeDefinitions[0].VlmFlags = vlmDfnFlagDelete
 	dump.VolumeDefinitions = append(dump.VolumeDefinitions, VolumeDefinitionRow{ResourceName: "PVC-S", VlmNr: 1, VlmSize: 1048576, UUID: "vd-s1"})
 
 	res := convertTwoReplicas(t, dump)
@@ -506,10 +508,7 @@ func TestADeletedVolumesMetaPoolDoesNotStopTheLiveOnes(t *testing.T) {
 			len(res.ResourceDefinitions), len(res.Resources), res.Warnings)
 	}
 
-	vds := res.ResourceDefinitions[0].Spec.VolumeDefinitions
-	if len(vds) != 1 || vds[0].VolumeNumber != 1 {
-		t.Errorf("volumes %+v, want volume 1 alone", vds)
-	}
+	assertDeletedThenLive(t, res.ResourceDefinitions[0].Spec.VolumeDefinitions)
 }
 
 // The layout of a volume marked DELETE does not stop its live neighbour
@@ -519,7 +518,7 @@ func TestADeletedVolumesLayoutDoesNotStopTheLiveOnes(t *testing.T) {
 	t.Parallel()
 
 	twoVolumes := func(d *Dump) *Dump {
-		d.VolumeDefinitions[0].VlmFlags = resourceFlagDelete
+		d.VolumeDefinitions[0].VlmFlags = vlmDfnFlagDelete
 		d.VolumeDefinitions = append(d.VolumeDefinitions, VolumeDefinitionRow{ResourceName: "PVC-S", VlmNr: 1, VlmSize: 1048576, UUID: "vd-s1"})
 
 		return d
@@ -559,10 +558,7 @@ func TestADeletedVolumesLayoutDoesNotStopTheLiveOnes(t *testing.T) {
 					len(res.ResourceDefinitions), len(res.Resources), res.Warnings)
 			}
 
-			vds := res.ResourceDefinitions[0].Spec.VolumeDefinitions
-			if len(vds) != 1 || vds[0].VolumeNumber != 1 {
-				t.Errorf("volumes %+v, want volume 1 alone", vds)
-			}
+			assertDeletedThenLive(t, res.ResourceDefinitions[0].Spec.VolumeDefinitions)
 		})
 	}
 }
@@ -573,7 +569,7 @@ func TestAMetaChildHoldingALiveVolumeStillSkips(t *testing.T) {
 
 	d := stackDump(`["DRBD","STORAGE"]`,
 		layerChain(1, "NODE-A", "PVC-S", "DRBD", "STORAGE"), layerChain(10, "NODE-B", "PVC-S", "DRBD", "STORAGE"))
-	d.VolumeDefinitions[0].VlmFlags = resourceFlagDelete
+	d.VolumeDefinitions[0].VlmFlags = vlmDfnFlagDelete
 	d.VolumeDefinitions = append(d.VolumeDefinitions, VolumeDefinitionRow{ResourceName: "PVC-S", VlmNr: 1, VlmSize: 1048576, UUID: "vd-s1"})
 	d.LayerResourceIDs = append(d.LayerResourceIDs, LayerResourceIDRow{
 		LayerResourceID: 30, LayerResourceKind: "STORAGE", LayerResourceParentID: ptr(int32(1)),
@@ -587,5 +583,23 @@ func TestAMetaChildHoldingALiveVolumeStillSkips(t *testing.T) {
 	if len(res.ResourceDefinitions) != 0 {
 		t.Fatalf("converted %d definitions, want none: volume 1 keeps its metadata on a separate volume; warnings %v",
 			len(res.ResourceDefinitions), res.Warnings)
+	}
+}
+
+// assertDeletedThenLive checks that volume 0 came over flagged DELETE, so
+// its replicas' volumes get deleted, and volume 1 came over live.
+func assertDeletedThenLive(t *testing.T, vds []crdv1alpha1.ResourceDefinitionVolume) {
+	t.Helper()
+
+	if len(vds) != 2 || vds[0].VolumeNumber != 0 || vds[1].VolumeNumber != 1 {
+		t.Fatalf("volumes %+v, want volume 0 and volume 1", vds)
+	}
+
+	if !vds[0].Deleting() || vds[0].DeleteID == "" {
+		t.Errorf("volume 0 = %+v, want it flagged DELETE with a deleteID", vds[0])
+	}
+
+	if vds[1].Deleting() {
+		t.Errorf("volume 1 = %+v, want it live", vds[1])
 	}
 }

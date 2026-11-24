@@ -2730,6 +2730,17 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 	return errors.Wrapf(os.WriteFile(resPath, []byte(body), resFilePerm), "write %s", resPath)
 }
 
+// removeStaleResFile removes a resource's .res; one that is not there is
+// fine.
+func removeStaleResFile(path string) error {
+	err := os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "remove %s", path)
+	}
+
+	return nil
+}
+
 // applyDRBD renders the .res file from dr's metadata and (re)applies
 // it via drbdadm. create-md runs only on first activation (we detect
 // "first" by absence of the .res file before this run); diskless
@@ -2751,8 +2762,15 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// with no DRBD metadata — the kernel then reports disk:Diskless
 	// while Spec.Flags lacks DISKLESS, surfacing as "Unintentional
 	// Diskless" in `linstor r l`.
+	//
+	// A resource whose last volume was deleted lands here too, with the
+	// .res of the volume it had. That file still names the deleted disk
+	// and its minor, and `drbdadm adjust` of any resource parses every
+	// .res in the directory: once the minor goes to another resource, the
+	// stale file refuses that resource's adjust with "conflicting use of
+	// device-minor". So it goes; the next volume renders it again.
 	if len(dr.GetVolumes()) == 0 {
-		return nil
+		return removeStaleResFile(filepath.Join(r.cfg.StateDir, dr.GetName()+".res"))
 	}
 
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")

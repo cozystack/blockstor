@@ -2722,6 +2722,42 @@ func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
 
 var errCreateMDFailed = errors.New("drbdadm: create-md kernel module missing")
 
+// A resource whose last volume was deleted keeps no .res naming that
+// volume: `drbdadm adjust` of any resource parses every .res in the
+// directory, and the stale minor would refuse the adjust of whichever
+// resource gets that minor next. Nothing runs drbdadm for it either.
+func TestApplyDRBDWithoutVolumesDropsTheStaleResFile(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	resPath := dir + "/pvc-novol.res"
+	if err := os.WriteFile(resPath, []byte("resource \"pvc-novol\" { volume 0 { device minor 1000; } }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{Adm: drbd.NewAdm(fx), StateDir: dir, NodeName: "n1"})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{{
+		Name:            "pvc-novol",
+		NodeName:        "n1",
+		SkipInitialSync: skipInitTrue(),
+		DrbdOptions:     map[string]string{"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000"},
+	}})
+	if err != nil || !results[0].GetOk() {
+		t.Fatalf("Apply: %v %v", err, results)
+	}
+
+	if _, err := os.Stat(resPath); !os.IsNotExist(err) {
+		t.Errorf(".res of a resource without volumes is still there (stat: %v)", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm ") {
+			t.Errorf("ran %q for a resource without volumes", line)
+		}
+	}
+}
+
 // TestApplyDRBDLateVDDoesNotPinDiskless pins Bug 79: an operator
 // who creates an RD and Resources before adding any VolumeDefinition
 // must not get stuck in "Unintentional Diskless" once the VD lands.
