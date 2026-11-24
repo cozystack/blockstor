@@ -119,9 +119,13 @@ type observation struct {
 	HasKernelLoaded bool
 	// Destroyed marks a `destroy resource` frame: the kernel slot is
 	// gone, and with it everything the observer knew about it.
-	Destroyed   bool
-	Volumes     []volumeObservation
-	Connections []connectionObservation
+	Destroyed bool
+	// ForceIOFailures mirrors `force-io-failures:` on resource frames.
+	// Not written to Status: only the DRBD workarounds read it, from
+	// the cache (workaround_hints.go).
+	ForceIOFailures bool
+	Volumes         []volumeObservation
+	Connections     []connectionObservation
 }
 
 // volumeObservation carries per-volume DiskState + the
@@ -141,9 +145,8 @@ type observation struct {
 // HasQuorum gates merge: a frame without the field (older
 // kernels, peer-device frames) leaves the cached value alone.
 type volumeObservation struct {
-	VolumeNumber int32
-	DiskState    string
-	CurrentUUID  string
+	DiskState   string
+	CurrentUUID string
 	// BackingDev is the lower-disk path from the events2 `device`
 	// frame's `backing_dev:` field. Used by the observer to read the
 	// on-disk current-UUID via drbdmeta get-gi when events2 doesn't
@@ -155,20 +158,12 @@ type volumeObservation struct {
 	// while DiskState is data-bearing.
 	ProbedGI     string
 	OutOfSyncKib int64
+	// VolumeNumber sits with the bools below so the struct packs into
+	// fewer words: the observer ranges over its caches by value.
+	VolumeNumber int32
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
-
-	// SyncPeer is the peer a peer-device frame's out-of-sync count is
-	// about (its `conn-name`).
-	SyncPeer string
-	// PeerOutOfSync is the cached count per peer; OutOfSyncKib is its
-	// largest. Kept in the cache only: with the count of whichever
-	// peer's frame came last, a replica with one peer in sync and one
-	// not flipped between zero and the count on every statistics
-	// frame, and each flip was a status write.
-	PeerOutOfSync map[string]int64
-
 	// Removed is an internal marker set by translateDeviceEvent for
 	// `destroy device` frames (drbdsetup emits one after a volume is
 	// torn down from the kernel — e.g. the `vd d` cascade adjusts the
@@ -180,6 +175,20 @@ type volumeObservation struct {
 	// `vN:Diskless` entry that the controller/satellite purge just
 	// removed — a permanent Status flap (Bug 399).
 	Removed bool
+
+	// SyncPeer is the peer a peer-device frame's out-of-sync count is
+	// about (its `conn-name`).
+	SyncPeer string
+	// PeerOutOfSync is the cached count per peer; OutOfSyncKib is its
+	// largest. Kept in the cache only: with the count of whichever
+	// peer's frame came last, a replica with one peer in sync and one
+	// not flipped between zero and the count on every statistics
+	// frame, and each flip was a status write.
+	PeerOutOfSync map[string]int64
+	// Open is the `open:yes|no|unknown` of the events2 `device` frame,
+	// empty when the frame did not carry it. Not published to Status:
+	// only the DRBD workarounds' hints read it (workaround_hints.go).
+	Open string
 }
 
 // peerVolumeObservation carries the peer's view of one volume's
@@ -350,6 +359,7 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		KernelLoaded:          normalizeKernelLoaded(ev.Action),
 		HasKernelLoaded:       true,
 		Destroyed:             ev.Action == eventActionDestroy,
+		ForceIOFailures:       ev.Fields["force-io-failures"] == drbdFlagYes,
 	}, true
 }
 
@@ -459,6 +469,7 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 		DiskState:    disk,
 		CurrentUUID:  ev.Fields["current-uuid"],
 		BackingDev:   ev.Fields["backing_dev"],
+		Open:         ev.Fields["open"],
 	}
 
 	// `quorum:yes|no` is emitted on every `device` frame on
@@ -756,6 +767,9 @@ const (
 	// volume has lost quorum — the CSI plugin's mount path keys
 	// off this signal.
 	drbdQuorumYes = "yes"
+	// drbdFlagYes is how events2 prints any set flag, such as
+	// `force-io-failures:yes` on resource frames.
+	drbdFlagYes = "yes"
 )
 
 // newObserverRunnableFromConfig builds the observer the manager runs, so the
@@ -1005,6 +1019,12 @@ type resourceObservation struct {
 	Suspended      string
 	PromotionScore *int32
 	MayPromote     *bool
+
+	// ForceIOFailures and Unloaded feed the DRBD workarounds' hints
+	// only (workaround_hints.go); Unloaded marks a resource whose
+	// kernel slot was destroyed.
+	ForceIOFailures bool
+	Unloaded        bool
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -1693,6 +1713,8 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 		cur.InUse = ev.InUse
 		cur.Role = ev.Role
 		cur.Suspended = normalizeSuspended(ev.Suspended)
+		cur.ForceIOFailures = ev.ForceIOFailures
+		cur.Unloaded = ev.HasKernelLoaded && !ev.KernelLoaded
 
 		mergePromotion(&cur, ev)
 	}
@@ -2825,6 +2847,12 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 	// Status SSA write.
 	if incoming.BackingDev != "" {
 		merged.BackingDev = incoming.BackingDev
+	}
+
+	// Open, like BackingDev, is cached for the workarounds' hints only
+	// and never marks the volume changed.
+	if incoming.Open != "" {
+		merged.Open = incoming.Open
 	}
 
 	cache[incoming.VolumeNumber] = merged
