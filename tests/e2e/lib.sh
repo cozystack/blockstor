@@ -789,7 +789,7 @@ reset_cluster_state() {
     #    back execution a satellite pod can wedge in Terminating for tens
     #    of minutes — a kubelet/containerd stuck-stop, NOT a finalizer
     #    block (the pod carries no finalizer), so the finalizer-strip in
-    #    step 1 cannot clear it. A dead-but-present pod makes the next
+    #    step 2 cannot clear it. A dead-but-present pod makes the next
     #    scenario (e.g. satellite-utils-smoke) exec into it and fail every
     #    probe. Scope strictly to app=blockstor-satellite so we never nuke
     #    healthy workloads, and only force-delete pods whose
@@ -810,23 +810,35 @@ reset_cluster_state() {
     done < <(kubectl -n "$NS" get pods -l app=blockstor-satellite \
         -o 'jsonpath={range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null)
 
-    # 1. Strip stuck satellite-resource finalizers BEFORE the RD wipe.
-    #    If a previous scenario force-deleted its satellite pods, nothing
-    #    is left to clear the finalizer and `kubectl delete` would hang.
-    #    Patching finalizers=[] makes the subsequent delete_all_rds
-    #    actually complete instead of blocking on the apiserver.
-    kubectl get resources.blockstor.org -o name 2>/dev/null \
-        | xargs -r -I{} kubectl patch {} --type=merge \
-            -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    kubectl get resourcedefinitions.blockstor.org -o name 2>/dev/null \
-        | xargs -r -I{} kubectl patch {} --type=merge \
-            -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-
-    # 2. Tear down RDs / Resources / Snapshots and wait for the CRD layer
+    # 1. Tear down RDs / Resources / Snapshots and wait for the CRD layer
     #    + per-RD kernel teardown (delete_rd runs drbdsetup down + .res /
-    #    .md-created removal for each enumerated RD) to converge.
+    #    .md-created removal for each enumerated RD) to converge. This
+    #    goes through the satellites, so every running satellite deletes
+    #    the storage of its own replicas before it releases them.
     local rc=0
     delete_all_rds "$timeout" || rc=$?
+
+    # 2. What is still there now is held by a satellite that is not
+    #    running: a previous scenario force-deleted its pod, and nothing
+    #    else will ever release the finalizer. Strip those and wait again.
+    #    Stripping BEFORE the wipe (as this used to) released replicas
+    #    whose satellites were healthy too, and their volumes stayed on
+    #    disk; nothing reaps leftover volumes any more, so a stripped
+    #    replica's storage is left behind and only the stuck ones are.
+    if (( rc != 0 )); then
+        echo ">> reset_cluster_state: stripping finalizers the satellites did not release"
+        kubectl get resources.blockstor.org -o name 2>/dev/null \
+            | xargs -r -I{} kubectl patch {} --type=merge \
+                -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+        kubectl get resourcedefinitions.blockstor.org -o name 2>/dev/null \
+            | xargs -r -I{} kubectl patch {} --type=merge \
+                -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+        kubectl get snapshots.blockstor.org -o name 2>/dev/null \
+            | xargs -r -I{} kubectl patch {} --type=merge \
+                -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+        rc=0
+        delete_all_rds 30 || rc=$?
+    fi
 
     # 3. Sweep any DRBD resource the kernel still holds that delete_all_rds
     #    couldn't enumerate (its owning RD was already gone, so delete_rd

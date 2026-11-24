@@ -157,3 +157,45 @@ func TestNodeDeleteIgnoresTheDefaultDisklessPool(t *testing.T) {
 			"exit = %d (stderr: %s)", got, errBuf.String())
 	}
 }
+
+// A pool or a node that may still hold a snapshot's copy is refused by the
+// CLI as by the REST door: with either gone, the node's hold on the Snapshot
+// is never released.
+func TestPoolAndNodeDeleteRefusedWhileASnapshotIsOnTheNode(t *testing.T) {
+	t.Parallel()
+
+	seed := func(withPool bool) func(ctx context.Context, backend store.Store) {
+		return func(ctx context.Context, backend store.Store) {
+			_ = backend.Nodes().Create(ctx, &apiv1.Node{Name: "node-1"})
+			_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+			_ = backend.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "s1", ResourceName: "pvc-x", Nodes: []string{"node-1"}})
+
+			if withPool {
+				_ = backend.StoragePools().Create(ctx, &apiv1.StoragePool{
+					NodeName: "node-1", StoragePoolName: "zfs1", ProviderKind: apiv1.StoragePoolKindZFS,
+				})
+			}
+		}
+	}
+
+	app, _, _ := newApp(t, seed(true))
+	if got := app.Run(t.Context(), []string{"sp", "d", "node-1", "zfs1"}); got == 0 {
+		t.Errorf("sp d of a pool that may hold pvc-x/s1 exited 0")
+	}
+
+	app, _, _ = newApp(t, seed(false))
+	if got := app.Run(t.Context(), []string{"n", "d", "node-1"}); got == 0 {
+		t.Errorf("n d of a node holding pvc-x/s1 exited 0")
+	}
+
+	// A diskless pool holds no copy, so it is not refused.
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		seed(false)(ctx, backend)
+		_ = backend.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: "node-1", StoragePoolName: "dl", ProviderKind: apiv1.StoragePoolKindDiskless,
+		})
+	})
+	if got := app.Run(t.Context(), []string{"sp", "d", "node-1", "dl"}); got != 0 {
+		t.Errorf("sp d of a diskless pool exited %d (stderr: %s)", got, errBuf.String())
+	}
+}

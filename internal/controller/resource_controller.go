@@ -46,6 +46,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -57,7 +58,7 @@ import (
 // code stay so the controller strips the legacy finalizer off
 // any Resource that still carries it (rolling upgrade case);
 // the controller no longer stamps it on new Resources.
-const resourceFinalizer = "blockstor.org/resource"
+const resourceFinalizer = finalizers.LegacyResource
 
 // Raw-merge-patch key/kind literals, factored out so the several
 // raw-merge-patch helpers in this file share one spelling (goconst).
@@ -297,14 +298,10 @@ func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 	return r.runApply(ctx, &target)
 }
 
-// satelliteResourceFinalizer mirrors the
-// `pkg/satellite/controllers.SatelliteResourceFinalizer` constant
-// without an import — the satellite package imports
-// `internal/controller` for shared helpers, so the reverse direction
-// is forbidden to avoid a cycle. Duplicating one string is the
-// pragmatic fix; a rename on either side breaks compile here via the
-// related tests, which reference the same literal.
-const satelliteResourceFinalizer = "blockstor.org/satellite-resource"
+// satelliteResourceFinalizer is the satellite's replica finalizer, shared
+// through pkg/finalizers: the satellite package imports
+// `internal/controller`, so the constant cannot come from there.
+const satelliteResourceFinalizer = finalizers.SatelliteResource
 
 // handleOrphan checks whether the Resource's parent ResourceDefinition
 // CRD still exists. When the RD is gone — the kubectl-cascade-orphan
