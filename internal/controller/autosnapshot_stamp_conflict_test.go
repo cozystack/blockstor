@@ -66,7 +66,10 @@ func TestAutoSnapshotStampSurvivesRDUpdateConflict(t *testing.T) {
 	conflicted := false
 	cli := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(rd).
+		WithObjects(rd, &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: "rd-stamp-conflict.n1"},
+			Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "rd-stamp-conflict", NodeName: "n1"},
+		}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
 				_, isRD := obj.(*blockstoriov1alpha1.ResourceDefinition)

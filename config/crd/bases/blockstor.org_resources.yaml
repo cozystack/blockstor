@@ -747,6 +747,22 @@ spec:
                 description: inUse is whether DRBD reports the resource as primary
                   anywhere.
                 type: boolean
+              mayPromote:
+                description: |-
+                  mayPromote is the kernel-reported DRBD-9 `may_promote:` flag
+                  from the same frames, published upstream as
+                  `layer_object.drbd.may_promote`. Unset until observed.
+                type: boolean
+              promotionScore:
+                description: |-
+                  promotionScore is the kernel-reported DRBD-9 promotion score of
+                  this replica, parsed from the `promotion_score:` token in
+                  `drbdsetup events2` resource frames. Upstream LINSTOR publishes
+                  it as `layer_object.drbd.promotion_score`, and linstor-csi
+                  reports a volume abnormal on every node whose score is 0 or
+                  missing. Unset until the satellite has observed the resource.
+                format: int32
+                type: integer
               role:
                 description: |-
                   role is the kernel-reported DRBD-9 role on this node, parsed
@@ -758,6 +774,12 @@ spec:
                   up to one Primary and two Secondaries, all on different nodes.
                   ~15 e2e tests `grep role:` from `drbdsetup status`; surfacing
                   it on Status lets them switch to a k8s-native read.
+                type: string
+              satelliteIncarnation:
+                description: |-
+                  satelliteIncarnation is the node's status.satelliteIncarnation of
+                  the satellite process that wrote the runtime state above. Written
+                  by the satellite observer with that state; do not hand-set.
                 type: string
               suspended:
                 description: |-
@@ -843,13 +865,16 @@ spec:
                       type: array
                     outOfSyncKib:
                       description: |-
-                        outOfSyncKib is the out-of-sync count of the last
-                        `drbdsetup events2 --statistics` peer-device frame for this
-                        volume, whichever peer it was about. 0 means in sync with that
-                        peer. It is not a resync progress once the replica has more
-                        than one peer: a finished resync with one peer can be the last
-                        frame while a full one with another runs. The progress is
-                        connections[].peerVolumes[].done.
+                        outOfSyncKib is the largest out-of-sync count over this
+                        volume's peers, as `drbdsetup events2 --statistics` peer-device
+                        frames report it. 0 means in sync with every peer. It is not a
+                        resync progress once the replica has more than one peer: the
+                        progress is connections[].peerVolumes[].done.
+
+                        While the volume is UpToDate and no peer resyncs with this
+                        replica, a change that keeps the count non-zero can reach the
+                        status up to 5 minutes late. A change to or from 0, and any
+                        change during a resync, is written at once.
                       format: int64
                       type: integer
                     quorum:

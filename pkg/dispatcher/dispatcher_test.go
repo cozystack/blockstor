@@ -1184,8 +1184,9 @@ func TestAutoQuorumDisabledPassesManualSettings(t *testing.T) {
 // (pkg/satellite/reconciler.go) lights up `applyLUKS` for the
 // cryptsetup layer between DRBD and the underlying storage.
 //
-// The order matters: DRBD-above-LUKS means DRBD replicates ciphertext
-// (the whole point of the allowed ordering), and STORAGE-terminal
+// The order matters: DRBD-above-LUKS is the arrangement in which each
+// node encrypts its own storage independently (DRBD's lower disk is the
+// mapper, so the wire carries plaintext), and STORAGE-terminal
 // anchors the backing disk at the bottom of the chain. A regression
 // that flipped the slot order or dropped LUKS entirely would silently
 // fall back to needsLUKS=false → no encryption layer, which is a

@@ -29,6 +29,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/passphrase"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -344,7 +345,10 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
-		writeStoreError(w, err)
+		// Typed, so a duplicate name, or one whose earlier definition is
+		// still draining replicas, carries FAIL_EXISTS_RSC_DFN as LINSTOR's
+		// does.
+		writeStoreErrorTyped(w, err, storeKindResourceDfn)
 
 		return
 	}
@@ -446,6 +450,10 @@ func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, bo
 	if nameErr != nil {
 		writeError(w, http.StatusBadRequest, nameErr.Error())
 
+		return false
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, rd.Props) {
 		return false
 	}
 
@@ -1107,6 +1115,10 @@ func (s *Server) refuseOwnedPropEdits(
 		return true
 	}
 
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.OverrideProps) {
+		return true
+	}
+
 	if store.DeletesRestoreMarker(patch.OverrideProps, patch.DeleteProps) {
 		err := store.RestoreMarkerClearRefusal(r.Context(), s.Store, name)
 		if errors.Is(err, store.ErrRestoreUnfinished) {
@@ -1227,11 +1239,21 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// Upstream LINSTOR does this server-side too: deleting an RD
 	// flags the RD with DELETE, then walks Resources and stamps
 	// DELETE on each. The satellite drives the teardown from
-	// there. Our equivalent is: per-child Resources().Delete()
-	// stamps DeletionTimestamp on the CRD; the satellite's
+	// there. Our equivalent is: the RD is flagged DELETE first
+	// (store.MarkDefinitionDeleting, which keeps the tiebreaker
+	// reconciler off it and lifts the mid-sync replica guard), then
+	// per-child Resources().Delete() stamps DeletionTimestamp on the
+	// CRD; the satellite's
 	// existing `blockstor.org/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
+	err = store.MarkDefinitionDeleting(r.Context(), s.Store, name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
 	err = s.cascadeDeleteResources(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
@@ -1291,12 +1313,21 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// `linstor rd d <rd>` returns SUCCESS and the very next
 	// `linstor r l` shows phantom rows for 5–30 s until the cache
 	// catches up on its watch stream. See pkg/rest/cache_invalidation.go.
-	s.waitForRDDeletionVisible(r.Context(), name)
+	// Before that, the reachable satellites tear their replicas down, as
+	// LINSTOR waits for them, so a create of the same name that follows
+	// is not refused over them (waitForOnlineReplicasDrained).
+	converged := s.waitForRDTeardown(r.Context(), name)
 
 	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
 	}}
+	if !converged {
+		if pending := s.replicasStillDeleting(r.Context(), name); len(pending) > 0 {
+			answer = append(answer, deleteInProgress(name, pending))
+		}
+	}
+
 	if reaped != nil {
 		answer = append(answer, *reaped)
 	}

@@ -28,13 +28,19 @@ package v1
 // `linstor r list`, so emitting nothing crashes the CLI with
 // AttributeError.
 type Resource struct {
-	Name        string            `json:"name"`
-	NodeName    string            `json:"node_name"`
-	Props       map[string]string `json:"props,omitempty"`
-	Flags       []string          `json:"flags,omitempty"`
-	State       ResourceState     `json:"state,omitzero"`
-	UUID        string            `json:"uuid,omitempty"`
-	LayerObject *ResourceLayer    `json:"layer_object,omitempty"`
+	Name     string            `json:"name"`
+	NodeName string            `json:"node_name"`
+	Props    map[string]string `json:"props,omitempty"`
+	Flags    []string          `json:"flags,omitempty"`
+
+	// State is always sent, as `{}` when nothing in it is known.
+	// linstor-csi counts a replica without a state object as faulty
+	// and raises VolumeConditionAbnormal for its volume. LINSTOR
+	// sends `{}` for a STORAGE-topped replica, whose in_use it never
+	// learns, so an empty state must stay on the wire.
+	State       ResourceState  `json:"state"`
+	UUID        string         `json:"uuid,omitempty"`
+	LayerObject *ResourceLayer `json:"layer_object,omitempty"`
 
 	// Annotations carries the K8s-native metadata.annotations of the
 	// backing Resource CRD. Used by Bug 67's `PeerChangedAnnotation`
@@ -55,6 +61,21 @@ type Resource struct {
 	// Bug 40. The CSI driver never sets this; only the REST surface
 	// flips it.
 	ToggleDiskCancel bool `json:"toggle_disk_cancel,omitempty"`
+
+	// SatelliteIncarnation names the satellite process that reported
+	// the runtime state this replica carries (CRD
+	// `Status.SatelliteIncarnation`). Not on the wire: it only lets a
+	// read tell a report from the running satellite from one an earlier
+	// process left behind (ForgetStaleSatelliteState).
+	SatelliteIncarnation string `json:"-"`
+
+	// KernelSlotDestroyed is set when the satellite last saw the
+	// replica's DRBD kernel resource destroyed (CRD Condition
+	// KernelLoaded=False) and the stored status agrees: no volume
+	// keeps a disk state and no peer link is left. Not on the wire:
+	// like SatelliteIncarnation it only tells a read to answer the
+	// replica with no satellite state (ForgetStaleSatelliteState).
+	KernelSlotDestroyed bool `json:"-"`
 
 	// Volumes is the per-replica volume slice — sourced from
 	// Resource.Status.Volumes which the satellite observer writes.
@@ -226,11 +247,15 @@ type VolumeState struct {
 	// full initial-sync (Phase 8.1).
 	CurrentGi string `json:"current_gi,omitempty"`
 
-	// OutOfSyncKib is the out-of-sync count of the last
-	// `drbdsetup events2 --statistics` peer-device frame for this
-	// volume, whichever peer it was about. 0 means in sync with that
-	// peer. It is not a resync progress once a replica has more than
-	// one peer; that is ReplicationStates[peer].DonePercentage.
+	// OutOfSyncKib is the largest out-of-sync count over this
+	// volume's peers, as `drbdsetup events2 --statistics` peer-device
+	// frames report it. 0 means in sync with every peer. It is not a
+	// resync progress once a replica has more than one peer; that is
+	// ReplicationStates[peer].DonePercentage. While the volume is
+	// UpToDate and no peer resyncs with the replica, a change that
+	// keeps the count non-zero can arrive up to 5 minutes late; a
+	// change to or from 0, and any change during a resync, arrives at
+	// once.
 	OutOfSyncKib int64 `json:"out_of_sync_kib,omitempty"`
 
 	// ReplicationStates is the per-peer replication-state map the

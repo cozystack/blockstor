@@ -89,12 +89,39 @@ const ConditionFilesystemFormatted = "FilesystemFormatted"
 // yet destroyed. Cached from the observer's events2 stream so the
 // reconciler's hot path can skip the `drbdsetup status` round-trip.
 //
-// SAFETY: like other Phase 11.3 Conditions, this is a hot-path
-// optimisation. A stale True value can only cause an extra adjust
-// (idempotent); a stale False causes the legacy probe path which
-// is correct but slow. The authoritative source remains the
-// kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+// SAFETY: for the reconciler, like other Phase 11.3 Conditions, this
+// is a hot-path optimisation. A stale True value can only cause an
+// extra adjust (idempotent); a stale False causes the legacy probe
+// path which is correct but slow. The authoritative source remains
+// the kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+//
+// The reads also answer a replica with no satellite state when this
+// is False, as LINSTOR does a replica whose kernel resource is gone,
+// but only while the stored status carries no disk state and no peer
+// link either. Nothing rewrites the Condition between events2
+// resource frames, so a False that outlived its replica's return
+// stays; every status write the observer makes carries the replica's
+// disk states, which keeps a stale False from hiding a running replica.
 const ConditionKernelLoaded = "KernelLoaded"
+
+// ConditionEncryptionKeyIgnored is stamped True when the parent
+// ResourceDefinition pins its own LUKS key through
+// `spec.encryption.passphraseSecretRef`, a field blockstor declares
+// but does not implement (docs/encryption-keys.md). The volume's
+// password is wrapped under the CLUSTER master key instead, so the
+// operator holds a Secret that opens nothing.
+//
+// It is a Condition rather than a refusal on purpose. Refusing the
+// apply would wedge resource definitions that reconcile correctly
+// today: the field has always been inert, so a cluster may well carry
+// RDs that set it and run fine on the cluster key. Moving a working
+// volume to a failing one to punish a misleading field is the wrong
+// trade in a storage system. The volume keeps working; the object now
+// says why the operator's key is not the one in use.
+//
+// Cleared (False) when the reference is removed, so the Condition
+// tracks the live spec rather than latching on the first sighting.
+const ConditionEncryptionKeyIgnored = "EncryptionKeyIgnored"
 
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the
 // satellite reconciler stamps on a Resource CRD after every successful
@@ -393,6 +420,12 @@ type ResourceStatus struct {
 	// +optional
 	Connections []ResourceConnectionStatus `json:"connections,omitempty"`
 
+	// satelliteIncarnation is the node's status.satelliteIncarnation of
+	// the satellite process that wrote the runtime state above. Written
+	// by the satellite observer with that state; do not hand-set.
+	// +optional
+	SatelliteIncarnation string `json:"satelliteIncarnation,omitempty"`
+
 	// conditions represent the current state of the Resource.
 	// +listType=map
 	// +listMapKey=type
@@ -424,6 +457,21 @@ type ResourceStatus struct {
 	// recoverable quorum suspend from a user/fencing suspend.
 	// +optional
 	Suspended string `json:"suspended,omitempty"`
+
+	// promotionScore is the kernel-reported DRBD-9 promotion score of
+	// this replica, parsed from the `promotion_score:` token in
+	// `drbdsetup events2` resource frames. Upstream LINSTOR publishes
+	// it as `layer_object.drbd.promotion_score`, and linstor-csi
+	// reports a volume abnormal on every node whose score is 0 or
+	// missing. Unset until the satellite has observed the resource.
+	// +optional
+	PromotionScore *int32 `json:"promotionScore,omitempty"`
+
+	// mayPromote is the kernel-reported DRBD-9 `may_promote:` flag
+	// from the same frames, published upstream as
+	// `layer_object.drbd.may_promote`. Unset until observed.
+	// +optional
+	MayPromote *bool `json:"mayPromote,omitempty"`
 
 	// toggleDiskRetries counts how many times the satellite
 	// reconciler has failed mid-conversion while running the
@@ -623,13 +671,16 @@ type ResourceVolumeStatus struct {
 	// +optional
 	HistoryGI []string `json:"historyGI,omitempty"`
 
-	// outOfSyncKib is the out-of-sync count of the last
-	// `drbdsetup events2 --statistics` peer-device frame for this
-	// volume, whichever peer it was about. 0 means in sync with that
-	// peer. It is not a resync progress once the replica has more
-	// than one peer: a finished resync with one peer can be the last
-	// frame while a full one with another runs. The progress is
-	// connections[].peerVolumes[].done.
+	// outOfSyncKib is the largest out-of-sync count over this
+	// volume's peers, as `drbdsetup events2 --statistics` peer-device
+	// frames report it. 0 means in sync with every peer. It is not a
+	// resync progress once the replica has more than one peer: the
+	// progress is connections[].peerVolumes[].done.
+	//
+	// While the volume is UpToDate and no peer resyncs with this
+	// replica, a change that keeps the count non-zero can reach the
+	// status up to 5 minutes late. A change to or from 0, and any
+	// change during a resync, is written at once.
 	// +optional
 	OutOfSyncKib int64 `json:"outOfSyncKib,omitempty"`
 

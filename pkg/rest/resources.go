@@ -46,6 +46,8 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.forgetStaleReplicas(r.Context(), resList)
+
 	// Optional filters. Two wire dialects in the wild:
 	//   - golinstor (csi side): comma-joined `?nodes=a,b`
 	//   - python-linstor CLI:   repeat-key `?nodes=a&nodes=b` (via
@@ -151,7 +153,7 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 	// Bug 137: a replica the satellite reports no storage for (a
 	// diskless or TIE_BREAKER one, or one not built yet) still lists a
 	// volume per parent-RD VolumeDefinition, as LINSTOR's view does.
-	annotated = ensureVolumesForView(annotated, rsc, vdSizes)
+	annotated = ensureVolumesForView(annotated, s.placeholderPool(ctx, rsc), vdSizes)
 
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
 	if err != nil {
@@ -216,34 +218,32 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 const disklessStorPoolName = "DfltDisklessStorPool"
 
 // ensureVolumesForView returns the replica's volumes with one entry for
-// every volume definition of its parent, as LINSTOR does: the controller
-// creates a replica's Volume objects together with the replica
-// (CtrlRscCrtApiHelper), so its REST answers list them from that moment,
-// with no device path or disk state until the satellite reports.
-// blockstor's volumes come from what the satellite reported, so a replica
-// the satellite has not built yet, or a diskless one it never reports
-// storage for, would otherwise answer with no volumes at all. Clients
-// index into that list: linstor-scheduler-extender reads volumes[0] of
-// every replica in the view and panics on an empty one, linstor-csi's
-// attach gets a 404 for volume 0 instead of an answer without a device
-// path, and python-linstor's `rsc._rest_data['volumes'][0]` raises
-// (Bug 137).
+// every volume definition of its parent, in volume-number order, as
+// LINSTOR does: the controller creates a replica's Volume objects
+// together with the replica (CtrlRscCrtApiHelper), and the view builds
+// the list from them (Json.apiToResourceWithVolumes), so its REST
+// answers list them from that moment, with no device path or disk state
+// until the satellite reports. blockstor's volumes come from what the
+// satellite reported, so a replica the satellite has not built yet, or a
+// diskless one it never reports storage for, would otherwise answer with
+// no volumes at all. Clients index into that list:
+// linstor-scheduler-extender reads `volumes[0].state.disk_state` of
+// every DRBD replica in the view and panics on an empty one,
+// linstor-csi's attach gets a 404 for volume 0 instead of an answer
+// without a device path, and python-linstor's
+// `rsc._rest_data['volumes'][0]` raises (Bug 137).
 //
-// A volume the satellite reported is passed through verbatim; the
+// A volume the satellite reported is passed through verbatim, so a
+// placeholder never shadows reported allocation or disk state; the
 // placeholders carry only the volume number, the pool and the layer
-// list. A diskless or
-// TIE_BREAKER replica's placeholder names the upstream sentinel pool
-// `DfltDisklessStorPool` (see disklessStorPoolName), so `linstor n
-// describe` recognises the row as a diskless witness. The result is
-// never nil, so the `volumes` key is always present on the wire.
-func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) []apiv1.Volume {
+// list. poolFor names a placeholder's pool by volume number and is
+// called only for a volume that gets one (placeholderPool: LINSTOR's
+// sentinel `DfltDisklessStorPool` on a diskless or TIE_BREAKER
+// replica, see disklessStorPoolName). The result is never nil, so the
+// `volumes` key is always present on the wire.
+func ensureVolumesForView(observed []apiv1.Volume, poolFor func(int32) string, vdSizes map[int32]int64) []apiv1.Volume {
 	out := make([]apiv1.Volume, 0, max(len(observed), len(vdSizes)))
 	out = append(out, observed...)
-
-	pool := rsc.Props["StorPoolName"]
-	if isDisklessReplica(rsc) {
-		pool = disklessStorPoolName
-	}
 
 	for vn := range vdSizes {
 		if slices.ContainsFunc(observed, func(v apiv1.Volume) bool { return v.VolumeNumber == vn }) {
@@ -252,7 +252,7 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 
 		out = append(out, apiv1.Volume{
 			VolumeNumber: vn,
-			StoragePool:  pool,
+			StoragePool:  poolFor(vn),
 			// AllocatedKib defaults to 0 (the Bug 112 contract:
 			// always emit the key as an int >= 0); nothing has been
 			// allocated that the satellite reported.
@@ -297,6 +297,26 @@ func (s *Server) definitionVolumeSizes(ctx context.Context, rdName string) map[i
 	}
 
 	return out
+}
+
+// placeholderPool returns the pool a placeholder volume of rsc lists,
+// by volume number: LINSTOR's diskless sentinel on a diskless replica,
+// the pool on the replica's spec on a diskful one, and for a diskful
+// replica with no pool on its spec (a restore that read the pool off a
+// deleted source can leave one) what viewPoolResolver resolves. The
+// resolver only runs for a volume that needs a placeholder.
+func (s *Server) placeholderPool(ctx context.Context, rsc *apiv1.Resource) func(int32) string {
+	if isDisklessReplica(rsc) {
+		return func(int32) string { return disklessStorPoolName }
+	}
+
+	if pool := rsc.Props[storPoolPropKey]; pool != "" {
+		return func(int32) string { return pool }
+	}
+
+	resolver := &viewPoolResolver{s: s, rsc: rsc}
+
+	return func(vn int32) string { return resolver.poolFor(ctx, vn) }
 }
 
 // isDisklessReplica reports whether the replica carries a DISKLESS
@@ -412,11 +432,26 @@ func aggregateRDStats(resList []apiv1.Resource) map[string]rdFaultyStats {
 }
 
 // isResourceFaulty reports whether THIS single replica looks broken
-// (any non-empty volume disk_state that isn't UpToDate). The
-// RD-level aggregation in aggregateRDStats folds these per-replica
-// verdicts into a single per-RD faulty flag — one bad replica is
-// enough to mark the whole RD as needing operator attention.
+// (any non-empty volume disk_state that isn't UpToDate, or no
+// satellite state at all). The RD-level aggregation in
+// aggregateRDStats folds these per-replica verdicts into a single
+// per-RD faulty flag — one bad replica is enough to mark the whole RD
+// as needing operator attention.
+//
+// A replica answered with no satellite state (forgetStaleReplicas: its
+// node is OFFLINE, its satellite has not reported it since a restart,
+// or its kernel resource is gone) is the Unknown that linstor-client
+// and the blockstor CLI list under `--faulty`. Skipping it for its
+// empty disk states hid exactly the replicas that hold no data.
 func isResourceFaulty(r *apiv1.Resource) bool {
+	// A nil InUse comes only from ForgetSatelliteState: the k8s store
+	// always answers a role, false when none was reported. Answering
+	// nil there for an unreported role would list every such replica
+	// here.
+	if r.State.InUse == nil && !anyReportedDiskState(r) {
+		return true
+	}
+
 	for i := range r.Volumes {
 		disk := r.Volumes[i].State.DiskState
 		if disk == "" {
@@ -429,6 +464,12 @@ func isResourceFaulty(r *apiv1.Resource) bool {
 	}
 
 	return false
+}
+
+// anyReportedDiskState reports whether any volume of r carries a disk
+// state.
+func anyReportedDiskState(r *apiv1.Resource) bool {
+	return slices.ContainsFunc(r.Volumes, func(vol apiv1.Volume) bool { return vol.State.DiskState != "" })
 }
 
 // isUpToDateDiskState matches "UpToDate" plus the sync-progress-
@@ -543,8 +584,8 @@ func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[s
 // it keeps the disk state, and it shows no percentage anywhere else.
 // blockstor used to compute one from the volume-wide OutOfSyncKib and
 // the volume size instead, on every non-terminal state. That number is
-// wrong on exactly the replica an operator watches: OutOfSyncKib is
-// whichever peer-device frame came last, so a replica that finished a
+// wrong on exactly the replica an operator watches: OutOfSyncKib
+// was whichever peer-device frame came last, so a replica that finished a
 // small resync from one peer and then ran a full one from another
 // showed `Inconsistent(99%)` while the kernel said `done:50.31`.
 //

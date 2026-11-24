@@ -28,7 +28,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
@@ -97,6 +97,10 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 	if msg, refused := refuseSPDriverPropMutation(&patch); refused {
 		writeSPDriverPropMutationRefusal(w, node, pool, msg)
 
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.StoragePool, patch.OverrideProps) {
 		return
 	}
 
@@ -248,8 +252,28 @@ func (s *Server) refuseSPDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 		return true
 	}
 
-	if len(refs) == 0 {
+	// A snapshot's copy can only be deleted through the pool that holds
+	// it; with the pool gone the node's hold on the Snapshot is never
+	// released.
+	snapRefs, err := store.SnapshotsInPool(r.Context(), s.Store, node, pool)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	if len(refs) == 0 && len(snapRefs) == 0 {
 		return false
+	}
+
+	var details []string
+
+	if len(refs) > 0 {
+		details = append(details, "Volumes that are still using the storage pool: "+strings.Join(refs, ", "))
+	}
+
+	if len(snapRefs) > 0 {
+		details = append(details, "Snapshots that may have a copy in the storage pool: "+strings.Join(snapRefs, ", "))
 	}
 
 	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
@@ -257,9 +281,8 @@ func (s *Server) refuseSPDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 		Message: "The specified storage pool '" + pool +
 			"' on node '" + node + "' can not be deleted as " +
 			"volumes / snapshot-volumes are still using it.",
-		Details: "Volumes that are still using the storage pool: " +
-			strings.Join(refs, ", "),
-		Correc: "Delete the listed volumes first, or pass " +
+		Details: strings.Join(details, "; "),
+		Correc: "Delete the listed volumes and snapshots first, or pass " +
 			"`?force=true` to bypass the refusal and accept " +
 			"the orphan replicas.",
 		ObjRefs: map[string]string{
@@ -362,45 +385,8 @@ func (s *Server) rollbackSPDeleteIfRaced(w http.ResponseWriter, r *http.Request,
 // been materialized has no provider objects bound to the pool
 // either.
 func (s *Server) referencingResources(ctx context.Context, node, pool string) ([]string, error) {
-	all, err := s.Store.Resources().List(ctx)
-	if err != nil {
-		return nil, errors.Wrap(err, "list resources")
-	}
-
-	var refs []string
-
-	for i := range all {
-		if !naming.Same(all[i].NodeName, node) {
-			continue
-		}
-
-		matched := false
-
-		for j := range all[i].Volumes {
-			vol := &all[i].Volumes[j]
-			if naming.Same(vol.StoragePool, pool) {
-				refs = append(refs,
-					all[i].Name+"/"+strconv.FormatInt(int64(vol.VolumeNumber), 10))
-
-				matched = true
-
-				break
-			}
-		}
-
-		// Bug 145: pick up specs whose Volumes haven't been
-		// observed yet — a freshly-created `r c -s <pool>`
-		// carries the pool name in Props["StorPoolName"] before
-		// the satellite reports any Volumes. Without this the
-		// post-delete re-scan would never see the racing
-		// resource and the SP delete would proceed even though
-		// the spec-only Resource is about to dangle.
-		if !matched && naming.Same(all[i].Props["StorPoolName"], pool) {
-			refs = append(refs, all[i].Name+"/spec")
-		}
-	}
-
-	return refs, nil
+	//nolint:wrapcheck // surfaced via writeStoreError
+	return store.ReplicasInPool(ctx, s.Store, node, pool)
 }
 
 func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) {

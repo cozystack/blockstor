@@ -1,0 +1,43 @@
+<command name="disk-options">
+	<summary>Change the disk options of an attached lower-level device.</summary>
+	<argument>minor</argument>
+	<option name="set-defaults" type="flag">
+	</option>
+	<option name="on-io-error" type="handler">
+		<handler>pass_on</handler>
+		<handler>call-local-io-error</handler>
+		<handler>detach</handler>
+	</option>
+	<option name="disk-barrier" type="boolean">
+		<default>no</default>
+	</option>
+	<option name="resync-after" type="numeric">
+		<min>-1</min>
+		<max>1048575</max>
+		<default>-1</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="al-extents" type="numeric">
+		<min>67</min>
+		<max>65534</max>
+		<default>1237</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="discard-zeroes-if-aligned" type="boolean">
+		<default>yes</default>
+	</option>
+	<option name="rs-discard-granularity" type="numeric">
+		<min>0</min>
+		<max>1048576</max>
+		<default>0</default>
+		<unit_prefix>1</unit_prefix>
+		<unit>bytes</unit>
+	</option>
+	<option name="disk-timeout" type="numeric">
+		<min>0</min>
+		<max>6000</max>
+		<default>0</default>
+		<unit_prefix>1</unit_prefix>
+		<unit>1/10 seconds</unit>
+	</option>
+</command>

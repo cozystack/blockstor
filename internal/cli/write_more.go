@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -246,22 +247,51 @@ func nodeDelete(ctx context.Context, run *runContext) error {
 			return fmt.Errorf("delete objects on %s: %w", name, cascadeErr)
 		}
 	} else {
-		rscRefs, poolRefs, refErr := store.ReferencesOnNode(ctx, run.Store, name)
+		refErr := refuseNodeDeleteIfReferenced(ctx, run, name)
 		if refErr != nil {
-			return fmt.Errorf("list objects on %s: %w", name, refErr)
-		}
-
-		if len(rscRefs) > 0 || len(poolRefs) > 0 {
-			return fmt.Errorf("%w: %s still carries replicas of [%s] and storage pools [%s]; "+
-				"remove them or pass --force",
-				errNodeStillReferenced, name,
-				strings.Join(rscRefs, ", "), strings.Join(poolRefs, ", "))
+			return refErr
 		}
 	}
 
 	err := run.Store.Nodes().Delete(ctx, name)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete node %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// refuseNodeDeleteIfReferenced refuses a plain node delete while replicas or
+// pools still point at the node, or snapshots still have a copy on it, which
+// the node holds until its satellite has deleted them. The REST door refuses
+// on the same.
+func refuseNodeDeleteIfReferenced(ctx context.Context, run *runContext, name string) error {
+	rscRefs, poolRefs, err := store.ReferencesOnNode(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("list objects on %s: %w", name, err)
+	}
+
+	if len(rscRefs) > 0 || len(poolRefs) > 0 {
+		return fmt.Errorf("%w: %s still carries replicas of [%s] and storage pools [%s]; "+
+			"remove them or pass --force",
+			errNodeStillReferenced, name,
+			strings.Join(rscRefs, ", "), strings.Join(poolRefs, ", "))
+	}
+
+	spellings, err := store.NodeSpellings(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("list objects on %s: %w", name, err)
+	}
+
+	snapRefs, err := store.SnapshotsOnNode(ctx, run.Store, spellings)
+	if err != nil {
+		return fmt.Errorf("list snapshots on %s: %w", name, err)
+	}
+
+	if len(snapRefs) > 0 {
+		return fmt.Errorf("%w: %s still holds copies of snapshots [%s]; "+
+			"delete them, or pass --force if the node is gone",
+			errNodeStillReferenced, name, strings.Join(snapRefs, ", "))
 	}
 
 	return nil
@@ -329,6 +359,11 @@ func volumeDefinitionDelete(ctx context.Context, run *runContext) error {
 	rdName := run.Flags.Positionals[0]
 
 	number, err := parseInt32(run.Flags.Positionals[1], "volume number")
+	if err != nil {
+		return err
+	}
+
+	err = checkZFSDeleteStrategy(ctx, run, rdName)
 	if err != nil {
 		return err
 	}
@@ -493,14 +528,118 @@ func resourceCreate(ctx context.Context, run *runContext) error {
 			return poolErr
 		}
 
-		err := run.Store.Resources().Create(ctx, res)
+		err := createOrTakeOver(ctx, run.Store, res)
 		if err != nil {
-			return fmt.Errorf("create resource %s on %s: %w", rdName, node, err)
+			return err
 		}
 	}
 
 	return nil
 }
+
+// Bounds on waiting for a witness the controller is deleting to go,
+// the same as the REST door's.
+const (
+	witnessGoneAttempts = 5
+	witnessGoneDelay    = 200 * time.Millisecond
+)
+
+// createOrTakeOver creates res, or takes over the witness already on
+// its node. A witness the controller is collapsing at that moment
+// still holds the node while its finalizer runs; patching it would be
+// lost with it, so wait, within a bound, for it to go and create res
+// fresh, as the REST door does, instead of handing the operator the
+// conflict to retry by hand.
+func createOrTakeOver(ctx context.Context, st store.Store, res *apiv1.Resource) error {
+	for attempt := 1; ; attempt++ {
+		err := st.Resources().Create(ctx, res)
+		if errors.Is(err, store.ErrAlreadyExists) {
+			err = takeOverWitness(ctx, st, res, err)
+		}
+
+		switch {
+		case err == nil:
+			return nil
+		case !errors.Is(err, errWitnessGoing):
+			return fmt.Errorf("create resource %s on %s: %w", res.Name, res.NodeName, err)
+		case attempt == witnessGoneAttempts:
+			return fmt.Errorf("create resource %s on %s: the witness there is still being deleted, retry the create: %w",
+				res.Name, res.NodeName, store.ErrAlreadyExists)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("create resource %s on %s: wait for the witness there to go: %w",
+				res.Name, res.NodeName, ctx.Err())
+		case <-time.After(witnessGoneDelay):
+		}
+	}
+}
+
+// takeOverWitness turns the diskless replica or TIE_BREAKER witness a
+// create found on its node into the replica the create asked for, as
+// LINSTOR's `resource create` does. Moving a replica (r d on one node,
+// then r c on another) races the controller, which places a witness as
+// soon as two diskful replicas are left, possibly on the very node the
+// create names; without this the operator got "object already exists"
+// and a witness in place of the replica.
+//
+// A diskful request promotes the witness to diskful on res's pool; a
+// diskless one keeps it diskless and only drops TIE_BREAKER. So does a
+// diskful request that resolved no pool, as the REST door does: the
+// witness keeps its own pool, which for one adopted from LINSTOR is the
+// diskless one, and dropping DISKLESS there would ask for a diskful
+// replica on a pool with no storage. A replica that is diskful already
+// is left as it is and createErr is returned; one being deleted, or
+// gone already, returns errWitnessGoing.
+func takeOverWitness(ctx context.Context, st store.Store, res *apiv1.Resource, createErr error) error {
+	pool := res.Props[storPoolNameProp]
+	wantDiskful := pool != "" && !slices.Contains(res.Flags, apiv1.ResourceFlagDiskless)
+
+	err := st.Resources().PatchResourceSpec(ctx, res.Name, res.NodeName, func(live *apiv1.Resource) error {
+		if slices.Contains(live.Flags, apiv1.ResourceFlagDelete) {
+			return errWitnessGoing
+		}
+
+		keep, wasDiskless := apiv1.PromoteWitnessFlags(live.Flags, wantDiskful)
+		if !wasDiskless {
+			return errNoWitnessToTakeOver
+		}
+
+		live.Flags = keep
+
+		if wantDiskful {
+			if live.Props == nil {
+				live.Props = map[string]string{}
+			}
+
+			live.Props[storPoolNameProp] = pool
+		}
+
+		return nil
+	})
+
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errNoWitnessToTakeOver):
+		return createErr
+	case errors.Is(err, errWitnessGoing), errors.Is(err, store.ErrNotFound):
+		// The controller is collapsing the witness, or collapsed it
+		// between the create and the patch: the node frees up.
+		return errWitnessGoing
+	default:
+		return fmt.Errorf("take over the replica already there: %w", err)
+	}
+}
+
+// errNoWitnessToTakeOver stops takeOverWitness on a replica that is
+// diskful already.
+var errNoWitnessToTakeOver = errors.New("the replica there is no witness to take over")
+
+// errWitnessGoing reports a replica in the way that is being deleted or
+// already gone, so the create is worth another try.
+var errWitnessGoing = errors.New("the replica there is being deleted")
 
 // resourceDelete implements `resource delete <node> <rd>`,
 // idempotently.
@@ -512,7 +651,17 @@ func resourceDelete(ctx context.Context, run *runContext) error {
 	last := len(run.Flags.Positionals) - 1
 	rdName := run.Flags.Positionals[last]
 
-	for _, node := range run.Flags.Positionals[:last] {
+	err := checkZFSDeleteStrategy(ctx, run, rdName)
+	if err != nil {
+		return err
+	}
+
+	nodes, err := deletionOrder(ctx, run, rdName, run.Flags.Positionals[:last])
+	if err != nil {
+		return err
+	}
+
+	for _, node := range nodes {
 		err := checkDeletable(ctx, run, rdName, node)
 		if err != nil {
 			return err
@@ -525,6 +674,65 @@ func resourceDelete(ctx context.Context, run *runContext) error {
 	}
 
 	return nil
+}
+
+// checkZFSDeleteStrategy refuses a replica or volume definition delete the
+// REST door refuses: LINSTOR's `StorDriver/Zfs/DeleteStrategy` DELETE while
+// the definition has snapshots. --force does not override it, as in LINSTOR.
+func checkZFSDeleteStrategy(ctx context.Context, run *runContext, rdName string) error {
+	refused, err := store.ZFSDeleteRefused(ctx, run.Store, rdName)
+	if err != nil {
+		return fmt.Errorf("check the ZFS delete strategy of %s: %w", rdName, err)
+	}
+
+	if refused {
+		return fmt.Errorf("refusing to delete under %s: %w", rdName, validate.ErrZFSDeleteStrategy)
+	}
+
+	return nil
+}
+
+// deletionOrder puts the named replicas in the order they are safe to
+// delete one at a time (validate.SortForDeletion): `r d a b c <rd>` naming a
+// syncing replica after its source would otherwise drop the source first and
+// be refused on the replica it was about to delete anyway.
+func deletionOrder(ctx context.Context, run *runContext, rdName string, named []string) ([]string, error) {
+	if len(named) < 2 {
+		return named, nil
+	}
+
+	replicas, err := run.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		if isNotFound(err) {
+			return named, nil
+		}
+
+		return nil, fmt.Errorf("list replicas of %s: %w", rdName, err)
+	}
+
+	validate.SortForDeletion(replicas)
+
+	ordered := make([]string, 0, len(named))
+	taken := make([]bool, len(named))
+
+	for i := range replicas {
+		for j, node := range named {
+			if !taken[j] && naming.Same(node, replicas[i].NodeName) {
+				ordered = append(ordered, node)
+				taken[j] = true
+			}
+		}
+	}
+
+	// Names with no replica behind them keep their place at the end; the
+	// delete is idempotent for them.
+	for j, node := range named {
+		if !taken[j] {
+			ordered = append(ordered, node)
+		}
+	}
+
+	return ordered, nil
 }
 
 // checkDeletable refuses a delete that would strand a peer still resyncing
@@ -554,9 +762,22 @@ func checkDeletable(ctx context.Context, run *runContext, rdName, node string) e
 		return fmt.Errorf("get resource %s on %s: %w", rdName, node, err)
 	}
 
+	rd, err := run.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("get resource definition %s: %w", rdName, err)
+	}
+
+	rdFound := err == nil
+
 	siblings, err := run.Store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
 		return fmt.Errorf("list replicas of %s: %w", rdName, err)
+	}
+
+	// Only a replica dropped from a volume that stays is guarded; see
+	// validate.DefinitionBeingDeleted.
+	if rdFound && validate.DefinitionBeingDeleted(&rd, siblings) {
+		return nil
 	}
 
 	if validate.MidSyncDeleteRefusal(&target, siblings) {

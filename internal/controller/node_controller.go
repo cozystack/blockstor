@@ -31,6 +31,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -73,6 +74,10 @@ type NodeReconciler struct {
 	// migration uses the same data path as REST autoplace. Same
 	// instance the rest of the controller manager wires.
 	Store store.Store
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch;create;update;patch;delete
@@ -82,7 +87,14 @@ type NodeReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch
 
-// Reconcile drives the eviction migration. On every Node change we
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass drives the eviction migration. On every Node change we
 // look for EVICTED; if set, every Resource on that node gets a
 // replacement scheduled elsewhere via the placer. LOST adds a delete
 // of the source Resource so the cluster doesn't keep waiting on a
@@ -91,7 +103,7 @@ type NodeReconciler struct {
 // Idempotent: extra peers (>= placeCount) are not created on each
 // pass — placer.Place treats existing replicas as already-placed and
 // only fills the gap.
-func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *NodeReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if r.Store == nil {

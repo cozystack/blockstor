@@ -181,6 +181,12 @@ func (idx *PropsIndex) SnapshotDefinition(rd, snap string) map[string]string {
 	return idx.get("SNAP_DFNS", rd, snap)
 }
 
+// Snapshot returns the /SNAPS/<node>/<rd>/<snap> props, one node's
+// snapshot.
+func (idx *PropsIndex) Snapshot(node, rd, snap string) map[string]string {
+	return idx.get("SNAPS", node, rd, snap)
+}
+
 // SnapshotRDFrozen returns the /SNAP_DFNS_RSC_DFN/<rd>/<snap> props —
 // the parent RD's property bag frozen at snapshot time.
 func (idx *PropsIndex) SnapshotRDFrozen(rd, snap string) map[string]string {
@@ -196,20 +202,22 @@ func (idx *PropsIndex) SnapshotVDFrozen(rd, snap, vlmNr string) map[string]strin
 
 // wholeBagKinds are the instance kinds whose bag the converter writes
 // onto the matching blockstor object as it is: node, storage pool,
-// resource group, definition, volume definition, replica and snapshot
-// definition. An instance of one of them that reaches no object belongs
+// resource group, definition, volume definition, replica, snapshot
+// definition and the volume definition props a snapshot froze (carried
+// onto the Snapshot's volume refs). An instance of one of them that reaches no object belongs
 // to an object that did not convert, which the report already names
 // with its reason; its props go with it.
 //
 //nolint:gochecknoglobals // immutable lookup table
 var wholeBagKinds = map[string]bool{
-	"NODES":      true,
-	"STOR_POOLS": true,
-	"RSC_GRPS":   true,
-	"RSC_DFNS":   true,
-	"VLM_DFNS":   true,
-	"RSCS":       true,
-	"SNAP_DFNS":  true,
+	"NODES":                 true,
+	"STOR_POOLS":            true,
+	"RSC_GRPS":              true,
+	"RSC_DFNS":              true,
+	"VLM_DFNS":              true,
+	"RSCS":                  true,
+	"SNAP_DFNS":             true,
+	"SNAP_VLM_DFNS_VLM_DFN": true,
 }
 
 // Dropped lists, by instance, every key no blockstor object carries:

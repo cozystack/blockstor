@@ -20,6 +20,7 @@ package satellite
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -93,45 +94,133 @@ const (
 //
 // A diskless local replica (no diskful volumes) returns nil — there is
 // no backing device to discard against.
+//
+// Nor does a resource with a volume whose definition already decides its
+// discard options (definitionDecidesDiscard): a resource-scope value
+// would reach that volume too wherever its definition is silent. The
+// other volumes then get theirs from autoDiskOptionsForVolumes.
 func (r *Reconciler) autoDiskOptionsForResource(
 	ctx context.Context,
 	dr *intent.DesiredResource,
 	devices map[int32]string,
 ) map[string]string {
-	exec := r.cfg.Exec
-	if exec == nil {
-		// No exec wired (some unit harnesses) — can't probe DISC-GRAN.
-		// Returning nil omits the auto disk block: safe full resync.
+	if anyDefinitionDecidesDiscard(dr) {
 		return nil
 	}
 
-	if isDiskless(dr.GetFlags()) {
+	perVolume, ok := r.autoDiskOptionsPerVolume(ctx, dr, devices)
+	if !ok {
 		return nil
 	}
 
 	out := map[string]string{}
+
+	for _, vol := range dr.GetVolumes() {
+		mergeResourceDiscardOptions(out, perVolume[vol.GetVolumeNumber()])
+	}
+
+	return out
+}
+
+// autoDiskOptionsForVolumes resolves the same derived options per
+// volume, for a resource where some volume's definition decides its own
+// (see autoDiskOptionsForResource, which then yields nothing). A volume
+// whose definition decides gets nothing derived, the way LINSTOR's
+// ConfFileBuilder renders rs-discard-granularity for a volume from its
+// volume definition alone; the rest get what their device reports, in
+// their own disk section. Returns nil when no definition decides.
+func (r *Reconciler) autoDiskOptionsForVolumes(
+	ctx context.Context,
+	dr *intent.DesiredResource,
+	devices map[int32]string,
+) map[int32]map[string]string {
+	if !anyDefinitionDecidesDiscard(dr) {
+		return nil
+	}
+
+	perVolume, ok := r.autoDiskOptionsPerVolume(ctx, dr, devices)
+	if !ok {
+		return nil
+	}
+
+	return perVolume
+}
+
+// autoDiskOptionsPerVolume probes each local diskful volume the
+// satellite derives discard options for, skipping a volume whose
+// definition decides them. ok is false when there is nothing to derive
+// against: no exec to probe with, a diskless replica, a volume on a pool
+// this satellite does not serve, or no volume at all.
+func (r *Reconciler) autoDiskOptionsPerVolume(
+	ctx context.Context,
+	dr *intent.DesiredResource,
+	devices map[int32]string,
+) (map[int32]map[string]string, bool) {
+	exec := r.cfg.Exec
+	if exec == nil {
+		// No exec wired (some unit harnesses) — can't probe DISC-GRAN.
+		// Returning nil omits the auto disk block: safe full resync.
+		return nil, false
+	}
+
+	if isDiskless(dr.GetFlags()) {
+		return nil, false
+	}
+
+	out := map[int32]map[string]string{}
 	sawVolume := false
 
 	for _, vol := range dr.GetVolumes() {
-		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+		provider, ok := r.provider(vol.GetStoragePool())
 		if !ok || provider == nil {
-			return nil
+			return nil, false
+		}
+
+		sawVolume = true
+
+		if definitionDecidesDiscard(vol) {
+			continue
 		}
 
 		device := devices[vol.GetVolumeNumber()]
 
-		volOpts := autoDiskOptions(ctx, exec, provider.Kind(), device)
-
-		mergeResourceDiscardOptions(out, volOpts)
-
-		sawVolume = true
+		out[vol.GetVolumeNumber()] = autoDiskOptions(ctx, exec, provider.Kind(), device)
 	}
 
 	if !sawVolume {
-		return nil
+		return nil, false
 	}
 
-	return out
+	return out, true
+}
+
+// definitionDecidesDiscard reports whether the volume's own disk options,
+// set on its volume definition or volume group, carry either discard
+// option. Such a volume's discard behaviour is its definition's, and the
+// satellite derives none for it.
+//
+// That is the shape of every volume LINSTOR created with DRBD on top of
+// storage: it stamps discard-zeroes-if-aligned on the volume definition
+// when the first replica is placed, and keeps rs-discard-granularity
+// there too, computed by its controller from what the replicas reported,
+// or absent where it never computed one. Its ConfFileBuilder renders a
+// volume's rs-discard-granularity from the volume definition only, so an
+// absent one renders nothing. Deriving one here from the device would
+// add an option LINSTOR never set on that volume, which is what an
+// adopted clone got before.
+func definitionDecidesDiscard(vol *intent.DesiredVolume) bool {
+	opts := vol.GetDiskOptions()
+
+	_, zeroes := opts[diskOptDiscardZeroesAligned]
+	_, gran := opts[diskOptRsDiscardGranularity]
+
+	return zeroes || gran
+}
+
+// anyDefinitionDecidesDiscard reports whether some volume of dr has
+// definitionDecidesDiscard.
+func anyDefinitionDecidesDiscard(dr *intent.DesiredResource) bool {
+	return slices.ContainsFunc(dr.GetVolumes(), definitionDecidesDiscard)
 }
 
 // mergeResourceDiscardOptions folds one volume's auto disk options into

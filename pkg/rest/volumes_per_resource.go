@@ -23,6 +23,7 @@ import (
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 )
 
 // registerVolumesPerResource wires the per-Resource Volume routes
@@ -73,9 +74,11 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	s.forgetStaleReplica(r.Context(), &res)
+
 	// Every volume definition is listed, built or not, as LINSTOR does;
 	// see ensureVolumesForView.
-	writeJSON(w, http.StatusOK, ensureVolumesForView(res.Volumes, &res, s.definitionVolumeSizes(r.Context(), rdName)))
+	writeJSON(w, http.StatusOK, ensureVolumesForView(res.Volumes, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)))
 }
 
 // handleVolumesPerResourceGet answers
@@ -103,11 +106,13 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	s.forgetStaleReplica(r.Context(), &res)
+
 	// A volume the satellite has not built yet answers without a device
 	// path, as LINSTOR's does, rather than 404: linstor-csi's attach
 	// then reports "could not determine device path" and retries,
 	// instead of failing on a volume that does exist.
-	vols := ensureVolumesForView(res.Volumes, &res, s.definitionVolumeSizes(r.Context(), rdName))
+	vols := ensureVolumesForView(res.Volumes, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName))
 
 	for i := range vols {
 		if vols[i].VolumeNumber == vlmNr {
@@ -158,6 +163,10 @@ func (s *Server) handleVolumesPerResourceModify(w http.ResponseWriter, r *http.R
 	var patch apiv1.GenericPropsModify
 
 	if !decodeJSON(w, r, &patch) {
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.Volume, patch.OverrideProps) {
 		return
 	}
 

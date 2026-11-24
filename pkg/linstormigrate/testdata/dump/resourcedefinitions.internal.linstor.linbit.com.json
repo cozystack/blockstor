@@ -1,6 +1,7 @@
 {
 "items": [
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_stack": "[\"DRBD\",\"STORAGE\"]",
 "resource_dsp_name": "pvc-vol1",
@@ -13,6 +14,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_stack": "[\"STORAGE\"]",
 "resource_dsp_name": "pvc-vol2",
@@ -25,6 +27,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_stack": "[\"DRBD\",\"LUKS\",\"STORAGE\"]",
 "resource_dsp_name": "pvc-vol3",
@@ -37,6 +40,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_stack": "[\"DRBD\",\"STORAGE\"]",
 "resource_dsp_name": "pvc-vol4",
@@ -49,6 +53,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_stack": "[\"DRBD\",\"STORAGE\"]",
 "resource_dsp_name": "pvc-vol5",
@@ -61,6 +66,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_stack": "[]",
 "parent_uuid": "60000000-0000-0000-0000-000000000001",
@@ -74,6 +80,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_stack": "[]",
 "parent_uuid": "60000000-0000-0000-0000-000000000001",
@@ -87,6 +94,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_stack": "[\"STORAGE\"]",
 "resource_dsp_name": "pvc-vol6",
@@ -99,6 +107,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_stack": "[\"STORAGE\"]",
 "resource_dsp_name": "pvc-vol7",
