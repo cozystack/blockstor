@@ -227,9 +227,11 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 		Namespace: namespace,
 		// The passphrase Secret is read past the cache, so no informer
 		// watches every Secret in the cluster for it.
-		SecretReader: mgr.GetAPIReader(),
-		StateReader:  encryptionWatches,
-		OnReady:      ready.MarkBound,
+		SecretReader:       mgr.GetAPIReader(),
+		StateReader:        encryptionWatches,
+		OnReady:            ready.MarkBound,
+		ResourceReadyWait:  rest.DefaultResourceReadyWait,
+		ResourceDeployWait: rest.DefaultResourceDeployWait,
 	})
 	if err != nil {
 		return errors.Wrap(err, "add rest server")

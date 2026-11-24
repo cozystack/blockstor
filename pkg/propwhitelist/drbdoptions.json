@@ -1,0 +1,845 @@
+{
+  "source": "linstor-common 64240e34a6e2 (linstor-server v1.33.1)",
+  "rules": {
+    "DrbdOptions/AutoEvictAfterTime": {
+      "type": "long"
+    },
+    "DrbdOptions/AutoEvictAllowEviction": {
+      "type": "boolean_true_false"
+    },
+    "DrbdOptions/AutoEvictMaxDisconnectedNodes": {
+      "type": "range",
+      "min": 0,
+      "max": 100
+    },
+    "DrbdOptions/AutoEvictMinReplicaCount": {
+      "type": "long"
+    },
+    "DrbdOptions/Disk/al-extents": {
+      "type": "range",
+      "min": 67,
+      "max": 65534
+    },
+    "DrbdOptions/Disk/al-updates": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Disk/block-size": {
+      "type": "range",
+      "min": 512,
+      "max": 4096
+    },
+    "DrbdOptions/Disk/disable-write-same": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Disk/discard-zeroes-if-aligned": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Disk/disk-barrier": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Disk/disk-drain": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Disk/disk-flushes": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Disk/disk-timeout": {
+      "type": "range",
+      "min": 0,
+      "max": 6000,
+      "unit": "1/10 seconds"
+    },
+    "DrbdOptions/Disk/diskless": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Disk/max-bio-size": {
+      "type": "range",
+      "min": 512,
+      "max": 1048576
+    },
+    "DrbdOptions/Disk/md-flushes": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Disk/on-io-error": {
+      "type": "symbol",
+      "values": [
+        "call-local-io-error",
+        "detach",
+        "pass_on"
+      ]
+    },
+    "DrbdOptions/Disk/read-balancing": {
+      "type": "symbol",
+      "values": [
+        "128K-striping",
+        "1M-striping",
+        "256K-striping",
+        "32K-striping",
+        "512K-striping",
+        "64K-striping",
+        "least-pending",
+        "prefer-local",
+        "prefer-remote",
+        "round-robin",
+        "when-congested-remote"
+      ]
+    },
+    "DrbdOptions/Disk/resync-after": {
+      "type": "string"
+    },
+    "DrbdOptions/Disk/rs-discard-granularity": {
+      "type": "range",
+      "min": 0,
+      "max": 1048576,
+      "unit": "bytes"
+    },
+    "DrbdOptions/ExactSize": {
+      "type": "boolean_true_false"
+    },
+    "DrbdOptions/ForceInitialSync": {
+      "type": "boolean_true_false"
+    },
+    "DrbdOptions/Handlers/after-resync-target": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/before-resync-source": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/before-resync-target": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/fence-peer": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/initial-split-brain": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/local-io-error": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/out-of-sync": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/pri-lost": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/pri-lost-after-sb": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/pri-on-incon-degr": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/quorum-lost": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/split-brain": {
+      "type": "string"
+    },
+    "DrbdOptions/Handlers/unfence-peer": {
+      "type": "string"
+    },
+    "DrbdOptions/Net/after-sb-0pri": {
+      "type": "symbol",
+      "values": [
+        "discard-least-changes",
+        "discard-local",
+        "discard-older-primary",
+        "discard-remote",
+        "discard-younger-primary",
+        "discard-zero-changes",
+        "disconnect"
+      ]
+    },
+    "DrbdOptions/Net/after-sb-1pri": {
+      "type": "symbol",
+      "values": [
+        "call-pri-lost-after-sb",
+        "consensus",
+        "discard-secondary",
+        "disconnect",
+        "violently-as0p"
+      ]
+    },
+    "DrbdOptions/Net/after-sb-2pri": {
+      "type": "symbol",
+      "values": [
+        "call-pri-lost-after-sb",
+        "disconnect",
+        "violently-as0p"
+      ]
+    },
+    "DrbdOptions/Net/allow-remote-read": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Net/allow-two-primaries": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Net/always-asbp": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Net/congestion-extents": {
+      "type": "range",
+      "min": 67,
+      "max": 65534
+    },
+    "DrbdOptions/Net/congestion-fill": {
+      "type": "range",
+      "min": 0,
+      "max": 20971520,
+      "unit": "bytes"
+    },
+    "DrbdOptions/Net/connect-int": {
+      "type": "range",
+      "min": 1,
+      "max": 120,
+      "unit": "seconds"
+    },
+    "DrbdOptions/Net/cram-hmac-alg": {
+      "type": "string"
+    },
+    "DrbdOptions/Net/csums-after-crash-only": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Net/csums-alg": {
+      "type": "string"
+    },
+    "DrbdOptions/Net/data-integrity-alg": {
+      "type": "string"
+    },
+    "DrbdOptions/Net/fencing": {
+      "type": "symbol",
+      "values": [
+        "dont-care",
+        "resource-and-stonith",
+        "resource-only"
+      ]
+    },
+    "DrbdOptions/Net/ko-count": {
+      "type": "range",
+      "min": 0,
+      "max": 200
+    },
+    "DrbdOptions/Net/load-balance-paths": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Net/max-buffers": {
+      "type": "range",
+      "min": 32,
+      "max": 131072
+    },
+    "DrbdOptions/Net/max-epoch-size": {
+      "type": "range",
+      "min": 1,
+      "max": 20000
+    },
+    "DrbdOptions/Net/on-congestion": {
+      "type": "symbol",
+      "values": [
+        "block",
+        "disconnect",
+        "pull-ahead"
+      ]
+    },
+    "DrbdOptions/Net/ping-int": {
+      "type": "range",
+      "min": 1,
+      "max": 120,
+      "unit": "seconds"
+    },
+    "DrbdOptions/Net/ping-timeout": {
+      "type": "range",
+      "min": 1,
+      "max": 300,
+      "unit": "1/10 seconds"
+    },
+    "DrbdOptions/Net/protocol": {
+      "type": "symbol",
+      "values": [
+        "A",
+        "B",
+        "C"
+      ]
+    },
+    "DrbdOptions/Net/rcvbuf-size": {
+      "type": "range",
+      "min": 0,
+      "max": 134217728,
+      "unit": "bytes"
+    },
+    "DrbdOptions/Net/rdma-ctrl-rcvbuf-size": {
+      "type": "range",
+      "min": 0,
+      "max": 10485760
+    },
+    "DrbdOptions/Net/rdma-ctrl-sndbuf-size": {
+      "type": "range",
+      "min": 0,
+      "max": 10485760
+    },
+    "DrbdOptions/Net/rr-conflict": {
+      "type": "symbol",
+      "values": [
+        "auto-discard",
+        "call-pri-lost",
+        "disconnect",
+        "retry-connect",
+        "violently"
+      ]
+    },
+    "DrbdOptions/Net/shared-secret": {
+      "type": "string"
+    },
+    "DrbdOptions/Net/sndbuf-size": {
+      "type": "range",
+      "min": 0,
+      "max": 134217728,
+      "unit": "bytes"
+    },
+    "DrbdOptions/Net/socket-check-timeout": {
+      "type": "range",
+      "min": 0,
+      "max": 300
+    },
+    "DrbdOptions/Net/tcp-cork": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Net/timeout": {
+      "type": "range",
+      "min": 1,
+      "max": 600,
+      "unit": "1/10 seconds"
+    },
+    "DrbdOptions/Net/tls": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Net/tls-certificate": {
+      "type": "string"
+    },
+    "DrbdOptions/Net/tls-keyring": {
+      "type": "string"
+    },
+    "DrbdOptions/Net/tls-privkey": {
+      "type": "string"
+    },
+    "DrbdOptions/Net/transport": {
+      "type": "string"
+    },
+    "DrbdOptions/Net/use-rle": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Net/verify-alg": {
+      "type": "string"
+    },
+    "DrbdOptions/PeerDevice/bitmap": {
+      "type": "boolean"
+    },
+    "DrbdOptions/PeerDevice/c-delay-target": {
+      "type": "range",
+      "min": 1,
+      "max": 100,
+      "unit": "1/10 seconds"
+    },
+    "DrbdOptions/PeerDevice/c-fill-target": {
+      "type": "range",
+      "min": 0,
+      "max": 1048576,
+      "unit": "bytes"
+    },
+    "DrbdOptions/PeerDevice/c-max-rate": {
+      "type": "range",
+      "min": 0,
+      "max": 4194304,
+      "unit": "bytes/second"
+    },
+    "DrbdOptions/PeerDevice/c-min-rate": {
+      "type": "range",
+      "min": 0,
+      "max": 4194304,
+      "unit": "bytes/second"
+    },
+    "DrbdOptions/PeerDevice/c-plan-ahead": {
+      "type": "range",
+      "min": 0,
+      "max": 300,
+      "unit": "1/10 seconds"
+    },
+    "DrbdOptions/PeerDevice/resync-rate": {
+      "type": "range",
+      "min": 1,
+      "max": 8388608,
+      "unit": "bytes/second"
+    },
+    "DrbdOptions/PeerDevice/resync-without-replication": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Resource/auto-promote": {
+      "type": "boolean"
+    },
+    "DrbdOptions/Resource/auto-promote-timeout": {
+      "type": "range",
+      "min": 0,
+      "max": 600,
+      "unit": "1/10 seconds"
+    },
+    "DrbdOptions/Resource/cpu-mask": {
+      "type": "string"
+    },
+    "DrbdOptions/Resource/max-io-depth": {
+      "type": "range",
+      "min": 4,
+      "max": 4294967295
+    },
+    "DrbdOptions/Resource/on-no-data-accessible": {
+      "type": "symbol",
+      "values": [
+        "io-error",
+        "suspend-io"
+      ]
+    },
+    "DrbdOptions/Resource/on-no-quorum": {
+      "type": "symbol",
+      "values": [
+        "io-error",
+        "suspend-io"
+      ]
+    },
+    "DrbdOptions/Resource/on-suspended-primary-outdated": {
+      "type": "symbol",
+      "values": [
+        "disconnect",
+        "force-secondary"
+      ]
+    },
+    "DrbdOptions/Resource/peer-ack-delay": {
+      "type": "range",
+      "min": 1,
+      "max": 10000,
+      "unit": "milliseconds"
+    },
+    "DrbdOptions/Resource/peer-ack-window": {
+      "type": "range",
+      "min": 2048,
+      "max": 204800,
+      "unit": "bytes"
+    },
+    "DrbdOptions/Resource/quorum": {
+      "type": "numeric-or-symbol",
+      "values": [
+        "all",
+        "majority",
+        "off"
+      ],
+      "min": 1,
+      "max": 32
+    },
+    "DrbdOptions/Resource/quorum-minimum-redundancy": {
+      "type": "numeric-or-symbol",
+      "values": [
+        "all",
+        "majority",
+        "off"
+      ],
+      "min": 1,
+      "max": 32
+    },
+    "DrbdOptions/Resource/twopc-retry-timeout": {
+      "type": "range",
+      "min": 1,
+      "max": 50,
+      "unit": "1/10 seconds"
+    },
+    "DrbdOptions/Resource/twopc-timeout": {
+      "type": "range",
+      "min": 50,
+      "max": 600,
+      "unit": "1/10 seconds"
+    },
+    "DrbdOptions/SkipDisk": {
+      "type": "symbol",
+      "values": [
+        "True"
+      ]
+    },
+    "DrbdOptions/auto-add-quorum-tiebreaker": {
+      "type": "boolean_true_false"
+    },
+    "DrbdOptions/auto-diskful": {
+      "type": "long"
+    },
+    "DrbdOptions/auto-diskful-allow-cleanup": {
+      "type": "boolean_true_false"
+    },
+    "DrbdOptions/auto-quorum": {
+      "type": "symbol",
+      "values": [
+        "disabled",
+        "io-error",
+        "suspend-io"
+      ]
+    },
+    "DrbdOptions/auto-resync-after-disable": {
+      "type": "boolean_true_false"
+    },
+    "DrbdOptions/auto-rs-discard-granularity": {
+      "type": "string"
+    },
+    "DrbdOptions/auto-verify-algo-allowed-user-list": {
+      "type": "string"
+    },
+    "DrbdOptions/auto-verify-algo-disable": {
+      "type": "boolean_true_false"
+    }
+  },
+  "objects": {
+    "controller": [
+      "DrbdOptions/AutoEvictAfterTime",
+      "DrbdOptions/AutoEvictAllowEviction",
+      "DrbdOptions/AutoEvictMaxDisconnectedNodes",
+      "DrbdOptions/AutoEvictMinReplicaCount",
+      "DrbdOptions/Disk/al-extents",
+      "DrbdOptions/Disk/al-updates",
+      "DrbdOptions/Disk/block-size",
+      "DrbdOptions/Disk/disable-write-same",
+      "DrbdOptions/Disk/discard-zeroes-if-aligned",
+      "DrbdOptions/Disk/disk-barrier",
+      "DrbdOptions/Disk/disk-drain",
+      "DrbdOptions/Disk/disk-flushes",
+      "DrbdOptions/Disk/disk-timeout",
+      "DrbdOptions/Disk/diskless",
+      "DrbdOptions/Disk/max-bio-size",
+      "DrbdOptions/Disk/md-flushes",
+      "DrbdOptions/Disk/on-io-error",
+      "DrbdOptions/Disk/read-balancing",
+      "DrbdOptions/Disk/resync-after",
+      "DrbdOptions/Disk/rs-discard-granularity",
+      "DrbdOptions/ForceInitialSync",
+      "DrbdOptions/Handlers/after-resync-target",
+      "DrbdOptions/Handlers/before-resync-source",
+      "DrbdOptions/Handlers/before-resync-target",
+      "DrbdOptions/Handlers/fence-peer",
+      "DrbdOptions/Handlers/initial-split-brain",
+      "DrbdOptions/Handlers/local-io-error",
+      "DrbdOptions/Handlers/out-of-sync",
+      "DrbdOptions/Handlers/pri-lost",
+      "DrbdOptions/Handlers/pri-lost-after-sb",
+      "DrbdOptions/Handlers/pri-on-incon-degr",
+      "DrbdOptions/Handlers/quorum-lost",
+      "DrbdOptions/Handlers/split-brain",
+      "DrbdOptions/Handlers/unfence-peer",
+      "DrbdOptions/Net/after-sb-0pri",
+      "DrbdOptions/Net/after-sb-1pri",
+      "DrbdOptions/Net/after-sb-2pri",
+      "DrbdOptions/Net/allow-remote-read",
+      "DrbdOptions/Net/allow-two-primaries",
+      "DrbdOptions/Net/always-asbp",
+      "DrbdOptions/Net/congestion-extents",
+      "DrbdOptions/Net/congestion-fill",
+      "DrbdOptions/Net/connect-int",
+      "DrbdOptions/Net/cram-hmac-alg",
+      "DrbdOptions/Net/csums-after-crash-only",
+      "DrbdOptions/Net/csums-alg",
+      "DrbdOptions/Net/data-integrity-alg",
+      "DrbdOptions/Net/fencing",
+      "DrbdOptions/Net/ko-count",
+      "DrbdOptions/Net/load-balance-paths",
+      "DrbdOptions/Net/max-buffers",
+      "DrbdOptions/Net/max-epoch-size",
+      "DrbdOptions/Net/on-congestion",
+      "DrbdOptions/Net/ping-int",
+      "DrbdOptions/Net/ping-timeout",
+      "DrbdOptions/Net/protocol",
+      "DrbdOptions/Net/rcvbuf-size",
+      "DrbdOptions/Net/rdma-ctrl-rcvbuf-size",
+      "DrbdOptions/Net/rdma-ctrl-sndbuf-size",
+      "DrbdOptions/Net/rr-conflict",
+      "DrbdOptions/Net/shared-secret",
+      "DrbdOptions/Net/sndbuf-size",
+      "DrbdOptions/Net/socket-check-timeout",
+      "DrbdOptions/Net/tcp-cork",
+      "DrbdOptions/Net/timeout",
+      "DrbdOptions/Net/tls",
+      "DrbdOptions/Net/tls-certificate",
+      "DrbdOptions/Net/tls-keyring",
+      "DrbdOptions/Net/tls-privkey",
+      "DrbdOptions/Net/transport",
+      "DrbdOptions/Net/use-rle",
+      "DrbdOptions/Net/verify-alg",
+      "DrbdOptions/PeerDevice/bitmap",
+      "DrbdOptions/PeerDevice/c-delay-target",
+      "DrbdOptions/PeerDevice/c-fill-target",
+      "DrbdOptions/PeerDevice/c-max-rate",
+      "DrbdOptions/PeerDevice/c-min-rate",
+      "DrbdOptions/PeerDevice/c-plan-ahead",
+      "DrbdOptions/PeerDevice/resync-rate",
+      "DrbdOptions/PeerDevice/resync-without-replication",
+      "DrbdOptions/Resource/auto-promote",
+      "DrbdOptions/Resource/auto-promote-timeout",
+      "DrbdOptions/Resource/cpu-mask",
+      "DrbdOptions/Resource/max-io-depth",
+      "DrbdOptions/Resource/on-no-data-accessible",
+      "DrbdOptions/Resource/on-no-quorum",
+      "DrbdOptions/Resource/on-suspended-primary-outdated",
+      "DrbdOptions/Resource/peer-ack-delay",
+      "DrbdOptions/Resource/peer-ack-window",
+      "DrbdOptions/Resource/quorum",
+      "DrbdOptions/Resource/quorum-minimum-redundancy",
+      "DrbdOptions/Resource/twopc-retry-timeout",
+      "DrbdOptions/Resource/twopc-timeout",
+      "DrbdOptions/SkipDisk",
+      "DrbdOptions/auto-add-quorum-tiebreaker",
+      "DrbdOptions/auto-diskful",
+      "DrbdOptions/auto-diskful-allow-cleanup",
+      "DrbdOptions/auto-quorum",
+      "DrbdOptions/auto-resync-after-disable",
+      "DrbdOptions/auto-rs-discard-granularity",
+      "DrbdOptions/auto-verify-algo-allowed-user-list",
+      "DrbdOptions/auto-verify-algo-disable"
+    ],
+    "node": [
+      "DrbdOptions/AutoEvictAfterTime",
+      "DrbdOptions/AutoEvictAllowEviction",
+      "DrbdOptions/SkipDisk",
+      "DrbdOptions/auto-diskful-allow-cleanup"
+    ],
+    "node-conn": [
+      "DrbdOptions/Net/after-sb-0pri",
+      "DrbdOptions/Net/after-sb-1pri",
+      "DrbdOptions/Net/after-sb-2pri",
+      "DrbdOptions/Net/allow-remote-read",
+      "DrbdOptions/Net/allow-two-primaries",
+      "DrbdOptions/Net/always-asbp",
+      "DrbdOptions/Net/congestion-extents",
+      "DrbdOptions/Net/congestion-fill",
+      "DrbdOptions/Net/connect-int",
+      "DrbdOptions/Net/cram-hmac-alg",
+      "DrbdOptions/Net/csums-after-crash-only",
+      "DrbdOptions/Net/csums-alg",
+      "DrbdOptions/Net/data-integrity-alg",
+      "DrbdOptions/Net/fencing",
+      "DrbdOptions/Net/ko-count",
+      "DrbdOptions/Net/load-balance-paths",
+      "DrbdOptions/Net/max-buffers",
+      "DrbdOptions/Net/max-epoch-size",
+      "DrbdOptions/Net/on-congestion",
+      "DrbdOptions/Net/ping-int",
+      "DrbdOptions/Net/ping-timeout",
+      "DrbdOptions/Net/protocol",
+      "DrbdOptions/Net/rcvbuf-size",
+      "DrbdOptions/Net/rdma-ctrl-rcvbuf-size",
+      "DrbdOptions/Net/rdma-ctrl-sndbuf-size",
+      "DrbdOptions/Net/rr-conflict",
+      "DrbdOptions/Net/shared-secret",
+      "DrbdOptions/Net/sndbuf-size",
+      "DrbdOptions/Net/socket-check-timeout",
+      "DrbdOptions/Net/tcp-cork",
+      "DrbdOptions/Net/timeout",
+      "DrbdOptions/Net/tls",
+      "DrbdOptions/Net/tls-certificate",
+      "DrbdOptions/Net/tls-keyring",
+      "DrbdOptions/Net/tls-privkey",
+      "DrbdOptions/Net/transport",
+      "DrbdOptions/Net/use-rle",
+      "DrbdOptions/Net/verify-alg",
+      "DrbdOptions/PeerDevice/bitmap",
+      "DrbdOptions/PeerDevice/c-delay-target",
+      "DrbdOptions/PeerDevice/c-fill-target",
+      "DrbdOptions/PeerDevice/c-max-rate",
+      "DrbdOptions/PeerDevice/c-min-rate",
+      "DrbdOptions/PeerDevice/c-plan-ahead",
+      "DrbdOptions/PeerDevice/resync-rate",
+      "DrbdOptions/PeerDevice/resync-without-replication"
+    ],
+    "resource": [
+      "DrbdOptions/SkipDisk",
+      "DrbdOptions/auto-diskful-allow-cleanup"
+    ],
+    "resource-definition": [
+      "DrbdOptions/AutoEvictMinReplicaCount",
+      "DrbdOptions/Disk/al-extents",
+      "DrbdOptions/Disk/al-updates",
+      "DrbdOptions/Disk/block-size",
+      "DrbdOptions/Disk/disable-write-same",
+      "DrbdOptions/Disk/discard-zeroes-if-aligned",
+      "DrbdOptions/Disk/disk-barrier",
+      "DrbdOptions/Disk/disk-drain",
+      "DrbdOptions/Disk/disk-flushes",
+      "DrbdOptions/Disk/disk-timeout",
+      "DrbdOptions/Disk/diskless",
+      "DrbdOptions/Disk/max-bio-size",
+      "DrbdOptions/Disk/md-flushes",
+      "DrbdOptions/Disk/on-io-error",
+      "DrbdOptions/Disk/read-balancing",
+      "DrbdOptions/Disk/resync-after",
+      "DrbdOptions/Disk/rs-discard-granularity",
+      "DrbdOptions/ExactSize",
+      "DrbdOptions/ForceInitialSync",
+      "DrbdOptions/Handlers/after-resync-target",
+      "DrbdOptions/Handlers/before-resync-source",
+      "DrbdOptions/Handlers/before-resync-target",
+      "DrbdOptions/Handlers/fence-peer",
+      "DrbdOptions/Handlers/initial-split-brain",
+      "DrbdOptions/Handlers/local-io-error",
+      "DrbdOptions/Handlers/out-of-sync",
+      "DrbdOptions/Handlers/pri-lost",
+      "DrbdOptions/Handlers/pri-lost-after-sb",
+      "DrbdOptions/Handlers/pri-on-incon-degr",
+      "DrbdOptions/Handlers/quorum-lost",
+      "DrbdOptions/Handlers/split-brain",
+      "DrbdOptions/Handlers/unfence-peer",
+      "DrbdOptions/Net/after-sb-0pri",
+      "DrbdOptions/Net/after-sb-1pri",
+      "DrbdOptions/Net/after-sb-2pri",
+      "DrbdOptions/Net/allow-remote-read",
+      "DrbdOptions/Net/allow-two-primaries",
+      "DrbdOptions/Net/always-asbp",
+      "DrbdOptions/Net/congestion-extents",
+      "DrbdOptions/Net/congestion-fill",
+      "DrbdOptions/Net/connect-int",
+      "DrbdOptions/Net/cram-hmac-alg",
+      "DrbdOptions/Net/csums-after-crash-only",
+      "DrbdOptions/Net/csums-alg",
+      "DrbdOptions/Net/data-integrity-alg",
+      "DrbdOptions/Net/fencing",
+      "DrbdOptions/Net/ko-count",
+      "DrbdOptions/Net/load-balance-paths",
+      "DrbdOptions/Net/max-buffers",
+      "DrbdOptions/Net/max-epoch-size",
+      "DrbdOptions/Net/on-congestion",
+      "DrbdOptions/Net/ping-int",
+      "DrbdOptions/Net/ping-timeout",
+      "DrbdOptions/Net/protocol",
+      "DrbdOptions/Net/rcvbuf-size",
+      "DrbdOptions/Net/rdma-ctrl-rcvbuf-size",
+      "DrbdOptions/Net/rdma-ctrl-sndbuf-size",
+      "DrbdOptions/Net/rr-conflict",
+      "DrbdOptions/Net/shared-secret",
+      "DrbdOptions/Net/sndbuf-size",
+      "DrbdOptions/Net/socket-check-timeout",
+      "DrbdOptions/Net/tcp-cork",
+      "DrbdOptions/Net/timeout",
+      "DrbdOptions/Net/tls",
+      "DrbdOptions/Net/tls-certificate",
+      "DrbdOptions/Net/tls-keyring",
+      "DrbdOptions/Net/tls-privkey",
+      "DrbdOptions/Net/transport",
+      "DrbdOptions/Net/use-rle",
+      "DrbdOptions/Net/verify-alg",
+      "DrbdOptions/PeerDevice/bitmap",
+      "DrbdOptions/PeerDevice/c-delay-target",
+      "DrbdOptions/PeerDevice/c-fill-target",
+      "DrbdOptions/PeerDevice/c-max-rate",
+      "DrbdOptions/PeerDevice/c-min-rate",
+      "DrbdOptions/PeerDevice/c-plan-ahead",
+      "DrbdOptions/PeerDevice/resync-rate",
+      "DrbdOptions/PeerDevice/resync-without-replication",
+      "DrbdOptions/Resource/auto-promote",
+      "DrbdOptions/Resource/auto-promote-timeout",
+      "DrbdOptions/Resource/cpu-mask",
+      "DrbdOptions/Resource/max-io-depth",
+      "DrbdOptions/Resource/on-no-data-accessible",
+      "DrbdOptions/Resource/on-no-quorum",
+      "DrbdOptions/Resource/on-suspended-primary-outdated",
+      "DrbdOptions/Resource/peer-ack-delay",
+      "DrbdOptions/Resource/peer-ack-window",
+      "DrbdOptions/Resource/quorum",
+      "DrbdOptions/Resource/quorum-minimum-redundancy",
+      "DrbdOptions/Resource/twopc-retry-timeout",
+      "DrbdOptions/Resource/twopc-timeout",
+      "DrbdOptions/SkipDisk",
+      "DrbdOptions/auto-add-quorum-tiebreaker",
+      "DrbdOptions/auto-diskful",
+      "DrbdOptions/auto-diskful-allow-cleanup",
+      "DrbdOptions/auto-quorum",
+      "DrbdOptions/auto-rs-discard-granularity",
+      "DrbdOptions/auto-verify-algo-disable"
+    ],
+    "rsc-conn": [
+      "DrbdOptions/Net/after-sb-0pri",
+      "DrbdOptions/Net/after-sb-1pri",
+      "DrbdOptions/Net/after-sb-2pri",
+      "DrbdOptions/Net/allow-remote-read",
+      "DrbdOptions/Net/allow-two-primaries",
+      "DrbdOptions/Net/always-asbp",
+      "DrbdOptions/Net/congestion-extents",
+      "DrbdOptions/Net/congestion-fill",
+      "DrbdOptions/Net/connect-int",
+      "DrbdOptions/Net/cram-hmac-alg",
+      "DrbdOptions/Net/csums-after-crash-only",
+      "DrbdOptions/Net/csums-alg",
+      "DrbdOptions/Net/data-integrity-alg",
+      "DrbdOptions/Net/fencing",
+      "DrbdOptions/Net/ko-count",
+      "DrbdOptions/Net/load-balance-paths",
+      "DrbdOptions/Net/max-buffers",
+      "DrbdOptions/Net/max-epoch-size",
+      "DrbdOptions/Net/on-congestion",
+      "DrbdOptions/Net/ping-int",
+      "DrbdOptions/Net/ping-timeout",
+      "DrbdOptions/Net/protocol",
+      "DrbdOptions/Net/rcvbuf-size",
+      "DrbdOptions/Net/rdma-ctrl-rcvbuf-size",
+      "DrbdOptions/Net/rdma-ctrl-sndbuf-size",
+      "DrbdOptions/Net/rr-conflict",
+      "DrbdOptions/Net/shared-secret",
+      "DrbdOptions/Net/sndbuf-size",
+      "DrbdOptions/Net/socket-check-timeout",
+      "DrbdOptions/Net/tcp-cork",
+      "DrbdOptions/Net/timeout",
+      "DrbdOptions/Net/tls",
+      "DrbdOptions/Net/tls-certificate",
+      "DrbdOptions/Net/tls-keyring",
+      "DrbdOptions/Net/tls-privkey",
+      "DrbdOptions/Net/transport",
+      "DrbdOptions/Net/use-rle",
+      "DrbdOptions/Net/verify-alg",
+      "DrbdOptions/PeerDevice/bitmap",
+      "DrbdOptions/PeerDevice/c-delay-target",
+      "DrbdOptions/PeerDevice/c-fill-target",
+      "DrbdOptions/PeerDevice/c-max-rate",
+      "DrbdOptions/PeerDevice/c-min-rate",
+      "DrbdOptions/PeerDevice/c-plan-ahead",
+      "DrbdOptions/PeerDevice/resync-rate",
+      "DrbdOptions/PeerDevice/resync-without-replication"
+    ],
+    "storagepool": [
+      "DrbdOptions/SkipDisk"
+    ],
+    "volume": [
+      "DrbdOptions/Disk/al-extents",
+      "DrbdOptions/Disk/al-updates",
+      "DrbdOptions/Disk/block-size",
+      "DrbdOptions/Disk/disable-write-same",
+      "DrbdOptions/Disk/discard-zeroes-if-aligned",
+      "DrbdOptions/Disk/disk-barrier",
+      "DrbdOptions/Disk/disk-drain",
+      "DrbdOptions/Disk/disk-flushes",
+      "DrbdOptions/Disk/disk-timeout",
+      "DrbdOptions/Disk/diskless",
+      "DrbdOptions/Disk/max-bio-size",
+      "DrbdOptions/Disk/md-flushes",
+      "DrbdOptions/Disk/on-io-error",
+      "DrbdOptions/Disk/read-balancing",
+      "DrbdOptions/Disk/resync-after",
+      "DrbdOptions/Disk/rs-discard-granularity"
+    ],
+    "volume-definition": [
+      "DrbdOptions/Disk/al-extents",
+      "DrbdOptions/Disk/al-updates",
+      "DrbdOptions/Disk/block-size",
+      "DrbdOptions/Disk/disable-write-same",
+      "DrbdOptions/Disk/discard-zeroes-if-aligned",
+      "DrbdOptions/Disk/disk-barrier",
+      "DrbdOptions/Disk/disk-drain",
+      "DrbdOptions/Disk/disk-flushes",
+      "DrbdOptions/Disk/disk-timeout",
+      "DrbdOptions/Disk/diskless",
+      "DrbdOptions/Disk/max-bio-size",
+      "DrbdOptions/Disk/md-flushes",
+      "DrbdOptions/Disk/on-io-error",
+      "DrbdOptions/Disk/read-balancing",
+      "DrbdOptions/Disk/resync-after",
+      "DrbdOptions/Disk/rs-discard-granularity",
+      "DrbdOptions/auto-rs-discard-granularity"
+    ]
+  }
+}

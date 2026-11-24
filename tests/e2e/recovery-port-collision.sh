@@ -153,11 +153,17 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 # Phase 3: POST N autoplace requests in parallel. This is the
 # allocator's worst case — N RDs all reaching the controller
 # reconcile at the same instant.
+#
+# An autoplace answers only after the placed replicas are built and
+# ready, as LINSTOR's does: up to DefaultResourceDeployWait (30 s) plus
+# DefaultResourceReadyWait (15 s) in pkg/rest/autoplace_ready.go. Ten
+# 2-replica builds at once take longer than 10 s, so the client
+# timeout sits past that bound instead of cutting the answer off.
 echo ">> POST $NUM_RDS autoplace requests in parallel"
 pids=()
 for i in $(seq 1 "$NUM_RDS"); do
     rd="${RD_PREFIX}-${i}"
-    curl -sf -X POST -m 10 \
+    curl -sf -X POST -m 60 \
         -H 'Content-Type: application/json' \
         -d '{"select_filter":{"place_count":2}}' \
         "${API}/v1/resource-definitions/${rd}/autoplace" \

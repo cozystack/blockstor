@@ -26,6 +26,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -173,14 +174,23 @@ var handlers = map[string]handler{
 //
 //nolint:gochecknoglobals // static dispatch table
 var propertyNouns = map[string]propertyAccessor{
-	"resource-definition": rdProps,
-	"node":                nodeProps,
-	"controller":          controllerProps,
-	"resource":            resourceProps,
-	"storage-pool":        storagePoolProps,
-	"resource-group":      resourceGroupProps,
-	"volume-definition":   volumeDefinitionProps,
-	"volume-group":        volumeGroupProps,
+	"resource-definition": withWhitelist(rdProps, propwhitelist.ResourceDefinition),
+	"node":                withWhitelist(nodeProps, propwhitelist.Node),
+	"controller":          withWhitelist(controllerProps, propwhitelist.Controller),
+	"resource":            withWhitelist(resourceProps, propwhitelist.Resource),
+	"storage-pool":        withWhitelist(storagePoolProps, propwhitelist.StoragePool),
+	// A group is judged as what it is copied onto, as LINSTOR does.
+	"resource-group":    withWhitelist(resourceGroupProps, propwhitelist.ResourceDefinition),
+	"volume-definition": withWhitelist(volumeDefinitionProps, propwhitelist.VolumeDefinition),
+	"volume-group":      withWhitelist(volumeGroupProps, propwhitelist.VolumeDefinition),
+}
+
+// withWhitelist names the LINSTOR whitelist object an accessor's bag is
+// judged against.
+func withWhitelist(accessor propertyAccessor, obj propwhitelist.Object) propertyAccessor {
+	accessor.whitelist = obj
+
+	return accessor
 }
 
 //nolint:gochecknoinits // wires one static table into another

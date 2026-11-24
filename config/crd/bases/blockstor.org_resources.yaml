@@ -747,6 +747,22 @@ spec:
                 description: inUse is whether DRBD reports the resource as primary
                   anywhere.
                 type: boolean
+              mayPromote:
+                description: |-
+                  mayPromote is the kernel-reported DRBD-9 `may_promote:` flag
+                  from the same frames, published upstream as
+                  `layer_object.drbd.may_promote`. Unset until observed.
+                type: boolean
+              promotionScore:
+                description: |-
+                  promotionScore is the kernel-reported DRBD-9 promotion score of
+                  this replica, parsed from the `promotion_score:` token in
+                  `drbdsetup events2` resource frames. Upstream LINSTOR publishes
+                  it as `layer_object.drbd.promotion_score`, and linstor-csi
+                  reports a volume abnormal on every node whose score is 0 or
+                  missing. Unset until the satellite has observed the resource.
+                format: int32
+                type: integer
               role:
                 description: |-
                   role is the kernel-reported DRBD-9 role on this node, parsed
