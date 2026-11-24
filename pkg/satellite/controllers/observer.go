@@ -1495,7 +1495,9 @@ func (o *ObserverRunnable) giMayMove(name string) bool {
 
 	o.volMu.Lock()
 
-	for _, vol := range o.volCache[name] {
+	cache := o.volCache[name]
+	for volNum := range cache {
+		vol := cache[volNum]
 		if !isDataBearingDiskState(drbd.DiskState(vol.DiskState)) || vol.CurrentUUID != "" {
 			continue
 		}
@@ -2470,8 +2472,8 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 	}
 
 	snapshot := make([]volumeObservation, 0, len(cache))
-	for _, entry := range cache {
-		snapshot = append(snapshot, entry)
+	for volNum := range cache {
+		snapshot = append(snapshot, cache[volNum])
 	}
 
 	ev.Volumes = snapshot
@@ -2556,8 +2558,8 @@ func (o *ObserverRunnable) pruneVolumeCacheToDesired(ev *observation, res *block
 	// nil ev.Volumes mergeVolumes left when the kernel frame itself was
 	// idempotent: the prune is the change that must reach the apiserver.
 	snapshot := make([]volumeObservation, 0, len(cache))
-	for _, entry := range cache {
-		snapshot = append(snapshot, entry)
+	for volNum := range cache {
+		snapshot = append(snapshot, cache[volNum])
 	}
 
 	ev.Volumes = snapshot
@@ -2898,7 +2900,8 @@ func (o *ObserverRunnable) completeFromCache(ev *observation) {
 	}
 
 	read := make(map[int32]string, len(ev.Volumes))
-	for _, vol := range ev.Volumes {
+	for i := range ev.Volumes {
+		vol := &ev.Volumes[i]
 		if vol.CurrentUUID != "" {
 			read[vol.VolumeNumber] = vol.CurrentUUID
 		}
@@ -3381,7 +3384,8 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 
 	out := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(ev.Volumes))
 
-	for _, vol := range ev.Volumes {
+	for i := range ev.Volumes {
+		vol := &ev.Volumes[i]
 		out = append(out, blockstoriov1alpha1.ResourceVolumeStatus{
 			VolumeNumber:  vol.VolumeNumber,
 			StoragePool:   storagePool,
