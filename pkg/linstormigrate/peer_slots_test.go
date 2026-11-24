@@ -34,8 +34,8 @@ func peerSlotsDump(rdSlots, replicaSlots int32) *Dump {
 	}
 
 	dump.LayerDrbdResources = []LayerDrbdResourceRow{
-		{LayerResourceID: 1, NodeID: 0, PeerSlots: replicaSlots, AlStripes: 1, AlStripeSize: 32},
-		{LayerResourceID: 10, NodeID: 1, PeerSlots: replicaSlots, AlStripes: 1, AlStripeSize: 32},
+		{LayerResourceID: 1, NodeID: 0, PeerSlots: replicaSlots, AlStripes: 1, AlStripeSize: 32, TCPPortList: ptr("[7000]")},
+		{LayerResourceID: 10, NodeID: 1, PeerSlots: replicaSlots, AlStripes: 1, AlStripeSize: 32, TCPPortList: ptr("[7000]")},
 	}
 
 	return dump
