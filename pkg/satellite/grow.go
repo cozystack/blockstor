@@ -153,7 +153,7 @@ func drbdGrossKib(netKib int64, peerSlots int) int64 {
 // device the consumer sees to have the definition size: the size plus
 // DRBD's internal metadata when DRBD keeps it on this device, plus the
 // LUKS header when LUKS sits under it. The metadata is sized for the
-// replica's peer slots but never for fewer than 15 (grownPeerSlots). LINSTOR sizes the backing the
+// slots its superblock holds (grownPeerSlots). LINSTOR sizes the backing the
 // same way, so an adopted volume's backing already carries both. Under
 // DRBD the data area is the definition or the largest device any
 // replica reports, whichever is larger, as for a new lower disk
@@ -176,14 +176,25 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 }
 
 // grownPeerSlots is the peer-slot count a grow sizes the metadata of an
-// existing device for. The superblock can hold more slots than the
-// replica records: a satellite that predates the record creates 15
-// whatever the controller stamped, as during a rolling upgrade. Sized
-// for the record alone, the grow would leave the device short of the
-// definition by the difference; sized for 15 when the record is lower,
-// it only oversizes the bitmap, by 32 KiB per GiB for each slot too
-// many.
+// existing device for: the count its superblock holds, which the
+// satellite read once and published (Status.MetadataPeerSlots).
+//
+// `drbdadm resize` runs without --size, so DRBD gives the data area all
+// of the lower disk beyond the metadata the superblock holds. Sized for
+// more slots than that, the grow enlarges the device past the
+// definition, by 32 KiB per GiB for each slot too many, past what a
+// clone or a restore created at the definition's size provides; sized
+// for fewer, it leaves the device short of the definition.
+//
+// Until the superblock was read, the replica's record is not enough: a
+// satellite that predates the record creates 15 whatever the controller
+// stamped, as during a rolling upgrade. So it is sized for at least 15
+// then, which can only leave the device larger, never short.
 func grownPeerSlots(dr *intent.DesiredResource) int {
+	if read := dr.GetMetadataPeerSlots(); read != nil {
+		return int(*read)
+	}
+
 	return int(max(drbd.EffectivePeerSlots(dr.GetPeerSlots()), drbd.LegacyPeerSlots))
 }
 

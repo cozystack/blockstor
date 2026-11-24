@@ -159,11 +159,15 @@ type DesiredResource struct {
 	// (drbd.EffectivePeerSlots) until its superblock says otherwise.
 	PeerSlots *int32
 
+	// MetadataPeerSlots is the peer-slot count the replica's superblock
+	// holds, as the satellite read it before; nil until then. A grow
+	// sizes the metadata for it.
+	MetadataPeerSlots *int32
+
 	// ReadMetadataPeerSlots asks for the peer-slot count of the
-	// replica's superblock: a diskful replica created before counts
-	// were recorded, by blockstor with 15 or by LINSTOR with its own,
-	// whose count nobody has read yet. The apply result carries it
-	// back (ResourceApplyResult.MetadataPeerSlots).
+	// replica's superblock: a diskful replica whose count nobody has
+	// read yet. The apply result carries it back
+	// (ResourceApplyResult.MetadataPeerSlots).
 	ReadMetadataPeerSlots bool
 
 	// Deleting is true when this replica or its definition is on its way
@@ -397,6 +401,16 @@ func (x *DesiredResource) GetPeerSlots() *int32 {
 	}
 
 	return x.PeerSlots
+}
+
+// GetMetadataPeerSlots returns the peer-slot count read from the
+// replica's superblock, nil when it was not read. Nil-safe.
+func (x *DesiredResource) GetMetadataPeerSlots() *int32 {
+	if x == nil {
+		return nil
+	}
+
+	return x.MetadataPeerSlots
 }
 
 // GetReadMetadataPeerSlots reports whether the apply is to read the

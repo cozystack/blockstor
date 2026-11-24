@@ -77,8 +77,8 @@ func TestReplicaPeerSlots(t *testing.T) {
 }
 
 // TestReadMetadataPeerSlots: the satellite is asked to read the count of
-// the superblock of a diskful replica that predates the record and whose
-// count nobody read yet, and of no other.
+// the superblock of a diskful replica with a node id whose count nobody
+// read yet, and of no other; the count read reaches the satellite.
 func TestReadMetadataPeerSlots(t *testing.T) {
 	t.Parallel()
 
@@ -91,7 +91,8 @@ func TestReadMetadataPeerSlots(t *testing.T) {
 	}{
 		"predates the record":       {nodeID: ptr(0), want: true},
 		"read already":              {nodeID: ptr(0), metadata: ptr(7)},
-		"recorded":                  {nodeID: ptr(0), replica: ptr(7)},
+		"recorded, not read":        {nodeID: ptr(0), replica: ptr(7), want: true},
+		"recorded, read":            {nodeID: ptr(0), replica: ptr(7), metadata: ptr(7)},
 		"new":                       {},
 		"diskless":                  {nodeID: ptr(0), flags: []string{"DISKLESS"}},
 		"tiebreaker":                {nodeID: ptr(0), flags: []string{"DISKLESS", "TIE_BREAKER"}},
@@ -106,10 +107,14 @@ func TestReadMetadataPeerSlots(t *testing.T) {
 			target.Spec.Flags = tc.flags
 			target.Status.MetadataPeerSlots = tc.metadata
 
-			got := assembleDesired(target, nil, &blockstoriov1alpha1.ResourceDefinition{}, nil, map[string]string{}, nil).
-				GetReadMetadataPeerSlots()
-			if got != tc.want {
+			desired := assembleDesired(target, nil, &blockstoriov1alpha1.ResourceDefinition{}, nil, map[string]string{}, nil)
+			if got := desired.GetReadMetadataPeerSlots(); got != tc.want {
 				t.Errorf("got %v, want %v", got, tc.want)
+			}
+
+			read := desired.GetMetadataPeerSlots()
+			if (read == nil) != (tc.metadata == nil) || (read != nil && (*read != *tc.metadata || read == tc.metadata)) {
+				t.Errorf("superblock count %v, want a copy of %v", read, tc.metadata)
 			}
 		})
 	}

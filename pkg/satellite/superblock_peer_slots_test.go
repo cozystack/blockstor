@@ -35,9 +35,9 @@ var errDumpFailed = errors.New("exit status 10")
 // A replica adopted from LINSTOR by a linstor-migrate older than the
 // count records none, and its superblock holds LINSTOR's 7 slots, not the
 // 15 blockstor created its own replicas with. Asked for it, the apply
-// reads the count every volume's superblock holds and reports the least;
-// unasked, on a pass that grows a volume, or when a volume cannot be read,
-// it reads nothing and reports nothing.
+// reads the count every volume's superblock holds and reports it; unasked,
+// on a pass that grows a volume or failed, or when a volume cannot be read
+// or the volumes disagree, it reports nothing.
 func TestSuperblockPeerSlots(t *testing.T) {
 	t.Parallel()
 
@@ -53,6 +53,7 @@ func TestSuperblockPeerSlots(t *testing.T) {
 		}
 	}
 
+	seven := storage.FakeResponse{Stdout: dumpWithPeerSlots(drbd.DefaultPeerSlots)}
 	fifteen := storage.FakeResponse{Stdout: dumpWithPeerSlots(15)}
 	passed := &intent.ResourceApplyResult{Ok: true}
 
@@ -66,8 +67,9 @@ func TestSuperblockPeerSlots(t *testing.T) {
 		want     int32
 		wantRead bool
 	}{
-		{"asked", true, nil, 1 << 20, passed, fifteen, 7, true},
-		{"asked, never applied before", true, nil, 0, passed, fifteen, 7, true},
+		{"asked", true, nil, 1 << 20, passed, seven, 7, true},
+		{"asked, never applied before", true, nil, 0, passed, seven, 7, true},
+		{"volumes disagree", true, nil, 1 << 20, passed, fifteen, 0, true},
 		{"not asked", false, nil, 1 << 20, passed, fifteen, 0, false},
 		{"growing", true, nil, 1 << 19, passed, fifteen, 0, false},
 		{"grow pending", true, nil, 1 << 20, &intent.ResourceApplyResult{Ok: true, GrowPending: true}, fifteen, 0, false},

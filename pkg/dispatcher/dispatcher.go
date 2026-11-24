@@ -271,6 +271,7 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		// A replica with no count recorded and none read yet has its
 		// superblock read, so the controller records the count it was
 		// created with rather than guess 15.
+		MetadataPeerSlots:     copyInt32Ptr(target.Status.MetadataPeerSlots),
 		ReadMetadataPeerSlots: readsMetadataPeerSlots(target),
 		// The satellite's solo-promote reads these two to stay inside
 		// LINSTOR's case: never promote a replica that is being deleted,
@@ -341,11 +342,25 @@ func anyOtherDiskfulReplica(target *blockstoriov1alpha1.Resource, peers []blocks
 	return false
 }
 
-// readsMetadataPeerSlots reports a diskful replica that predates the
-// peer-slot record and whose superblock nobody read yet.
+// readsMetadataPeerSlots reports a diskful replica with a node id whose
+// superblock nobody read yet. Read once, its count sizes every grow,
+// and records the count of a replica that predates the record.
 func readsMetadataPeerSlots(target *blockstoriov1alpha1.Resource) bool {
-	return target.PeerSlotsPredateRecord() && target.Status.MetadataPeerSlots == nil &&
-		!isDisklessFlags(target.Spec.Flags)
+	hasNodeID := target.Spec.DRBDNodeID != nil || target.Status.DRBDNodeID != nil
+
+	return hasNodeID && target.Status.MetadataPeerSlots == nil && !isDisklessFlags(target.Spec.Flags)
+}
+
+// copyInt32Ptr returns a fresh copy of an *int32, so the payload does not
+// alias the caller's Resource.
+func copyInt32Ptr(v *int32) *int32 {
+	if v == nil {
+		return nil
+	}
+
+	out := *v
+
+	return &out
 }
 
 // isDisklessFlags reports a replica that keeps no disk: DISKLESS, or a

@@ -59,12 +59,12 @@ func TestDrbdInternalMetaCoversLinstorDefault(t *testing.T) {
 	}
 }
 
-// TestGrowBackingKibNeverSizesBelowFifteenPeerSlots: a grow sizes the
-// backing of a device that already exists, whose superblock may hold
-// more slots than the replica records: a satellite that predates the
-// record creates 15 whatever the controller stamped. Sized for the
-// record alone, a 7-slot grow on such a disk would leave the device
-// short of the definition; sized for 15 it only oversizes the bitmap.
+// TestGrowBackingKibNeverSizesBelowFifteenPeerSlots: until its
+// superblock was read, a grow sizes the backing of a device that already
+// exists for at least 15 slots, since the superblock may hold more than
+// the replica records: a satellite that predates the record creates 15
+// whatever the controller stamped. Sized for the record alone, a 7-slot
+// grow on such a disk would leave the device short of the definition.
 func TestGrowBackingKibNeverSizesBelowFifteenPeerSlots(t *testing.T) {
 	const definition = 20 << 20
 
@@ -85,5 +85,46 @@ func TestGrowBackingKibNeverSizesBelowFifteenPeerSlots(t *testing.T) {
 	got := growBackingKib(&intent.DesiredResource{PeerSlots: &thirtyOne}, vol, true)
 	if want := drbdGrossKib(definition, 31); got != want {
 		t.Errorf("31 recorded peer slots: got %d KiB, want %d", got, want)
+	}
+}
+
+// TestGrowBackingKibFollowsTheSuperblock: once the superblock was read, a
+// grow sizes the metadata for the slots it holds. `drbdadm resize` gives
+// the data area everything beyond that metadata, so a 7-slot volume grown
+// for 15 slots got a device larger than its definition, by 25 MiB on 100
+// GiB, which a clone or a restore created at the definition's size does
+// not hold. Sized for the superblock, the grown backing is the lower disk
+// a new 7-slot replica of the definition gets, and its device is the
+// definition.
+func TestGrowBackingKibFollowsTheSuperblock(t *testing.T) {
+	const definition = 100 << 20
+
+	seven, fifteen := int32(7), int32(15)
+	vol := &intent.DesiredVolume{SizeKib: definition}
+
+	for _, tc := range []struct {
+		name               string
+		recorded, metadata *int32
+	}{
+		{"7 recorded, 7 in the superblock", &seven, &seven},
+		{"7 recorded, 15 in the superblock", &seven, &fifteen},
+		{"adopted, 7 in the superblock", nil, &seven},
+	} {
+		dr := &intent.DesiredResource{PeerSlots: tc.recorded, MetadataPeerSlots: tc.metadata}
+		geometry := drbd.GeometryForPeerSlots(int(*tc.metadata))
+
+		got := growBackingKib(dr, vol, true)
+		if want := drbdGrossKib(definition, int(*tc.metadata)); got != want {
+			t.Errorf("%s: got %d KiB, want %d", tc.name, got, want)
+		}
+
+		if device := drbd.InternalMetadataNetKiB(got, geometry); device != definition {
+			t.Errorf("%s: device %d KiB after the grow, want the definition's %d", tc.name, device, definition)
+		}
+
+		copyDisk := lowerDiskKib(&intent.DesiredResource{PeerSlots: tc.metadata}, vol)
+		if got != copyDisk {
+			t.Errorf("%s: grown to %d KiB, a definition-sized copy with the same slots gets %d", tc.name, got, copyDisk)
+		}
 	}
 }

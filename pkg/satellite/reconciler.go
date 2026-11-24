@@ -1171,22 +1171,26 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 }
 
 // superblockPeerSlots reads the peer-slot count of the replica's
-// superblock when the controller asks for it: a replica created before
-// counts were recorded, whose metadata blockstor created with 15 or
+// superblock when the dispatcher asks for it, once per diskful replica.
+// A grow sizes the metadata for it, so the device stays at the
+// definition. For a replica created before counts were recorded it is
+// the only way to tell whether blockstor created its metadata with 15 or
 // LINSTOR with its definition's count, 7 by default, before it was
-// adopted. Reading it is the only way to tell the two apart; the
-// controller records what it reads, so the read is done once.
+// adopted; the controller records what it reads.
 //
-// The least count over the volumes is the one the replica can serve.
-// Zero when any volume cannot be read, to be asked again on a later
-// pass, after a pass that failed, and on one that grows a volume:
-// dump-md is kept off a device in the middle of a resize (BUG-048).
+// The volumes of a replica are created with one count. When they hold
+// different ones, nothing is reported: one count would undersize the
+// grow of a volume with more slots, and the grow keeps sizing for at
+// least 15. Zero also when any volume cannot be read, to be asked again
+// on a later pass, after a pass that failed, and on one that grows a
+// volume: dump-md is kept off a device in the middle of a resize
+// (BUG-048).
 func (r *Reconciler) superblockPeerSlots(ctx context.Context, dr *intent.DesiredResource, res *intent.ResourceApplyResult) int32 {
 	if !r.readsSuperblockPeerSlots(dr, res) {
 		return 0
 	}
 
-	var least int32
+	var read int32
 
 	for _, vol := range dr.GetVolumes() {
 		if vol.GetAppliedSizeKib() > 0 && vol.GetSizeKib() > vol.GetAppliedSizeKib() {
@@ -1207,12 +1211,17 @@ func (r *Reconciler) superblockPeerSlots(ctx context.Context, dr *intent.Desired
 			return 0
 		}
 
-		if least == 0 || slots < least {
-			least = slots
+		if read != 0 && slots != read {
+			log.FromContext(ctx).Info("the volumes' superblocks hold different peer-slot counts; not reported",
+				"resource", dr.GetName(), "counts", []int32{read, slots})
+
+			return 0
 		}
+
+		read = slots
 	}
 
-	return least
+	return read
 }
 
 // readsSuperblockPeerSlots reports whether the pass that produced res
