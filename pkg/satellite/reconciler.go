@@ -1201,6 +1201,7 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 	// Whatever path the apply ends on, the options a .res rendered on
 	// the way left out go back with the result.
 	defer func() { res.DroppedOptions = r.takeDroppedOptions(dr.GetName()) }()
+
 	ctx = withApplyResult(ctx, res)
 
 	diskless := isDiskless(dr.GetFlags())
