@@ -135,7 +135,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		} else {
 			res, backfillErr := r.backfillAdoptedSnapshot(ctx, logger, &snap)
 
-			return res, errors.Join(backfillErr, stampErr)
+			return res, withStampError(logger, backfillErr, stampErr)
 		}
 	}
 
@@ -146,7 +146,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// the aggregate predicates reduce to the self-only walks.
 	siblings, err := r.fetchSiblings(ctx, &snap)
 	if err != nil {
-		return ctrl.Result{}, errors.Join(err, stampErr)
+		return ctrl.Result{}, withStampError(logger, err, stampErr)
 	}
 
 	// Abort paths take priority over phase advancement and force us
@@ -158,7 +158,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// has driven the abort, in which case Reconcile is done.
 	aborted, result, err := r.checkAbortConditions(ctx, logger, &snap, siblings)
 	if aborted || err != nil {
-		return result, errors.Join(err, stampErr)
+		return result, withStampError(logger, err, stampErr)
 	}
 
 	if stampErr != nil {
@@ -756,6 +756,22 @@ func firstFailedNode(entries []blockstoriov1alpha1.SnapshotPerNodeStatus) string
 // importing pkg/store/k8s avoids a controller→store dependency that
 // the store does not otherwise have. b353.
 const snapshotGroupIDLabel = "blockstor.org/snapshot-group-id"
+
+// withStampError returns a pass's own failure ahead of a failed
+// IOSuspended stamp and only logs the stamp beside it. Joining the two
+// would let the stamp's 409 make a real failure read as a benign
+// conflict, which the conflict-aware error path then requeues quietly.
+func withStampError(logger logr.Logger, err, stampErr error) error {
+	if err == nil {
+		return stampErr
+	}
+
+	if stampErr != nil {
+		logger.Info("IOSuspended condition stamp also failed", "stampError", stampErr.Error())
+	}
+
+	return err
+}
 
 // fetchSiblings returns the transactional batch the Snapshot
 // belongs to — self + every same-GroupID peer. For an empty

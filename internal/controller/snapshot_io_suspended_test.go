@@ -25,7 +25,9 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -159,5 +161,54 @@ func TestSnapshotAbortResumesWhenTheIOSuspendedStampFails(t *testing.T) {
 
 	if got := getSnap(t, cli, "pvc-1.snap-1"); got.Spec.SuspendIO {
 		t.Fatalf("a refused status write kept I/O suspended past the deadline: %+v", got.Spec)
+	}
+}
+
+var errSiblingListBroken = errors.New("sibling list broken")
+
+// A failed stamp is reported beside a pass's own failure, never folded
+// into it: a stamp that lost to a concurrent write is a 409, and a 409
+// in the returned error makes the conflict-aware error path requeue the
+// pass quietly, hiding the failure that actually stopped it.
+func TestSnapshotStampConflictDoesNotMaskThePassError(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotControllerScheme(t)
+
+	snap := suspendedSnapshot("pvc-1.snap-1", "pvc-1", "snap-1",
+		3*time.Minute, []string{"n1"}, false,
+		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
+			{NodeName: "n1", SuspendIOAcked: true},
+		})
+	snap.Spec.GroupID = "group-1"
+
+	conflict := apierrors.NewConflict(
+		schema.GroupResource{Group: blockstoriov1alpha1.GroupVersion.Group, Resource: "snapshots"},
+		snap.Name, errors.New("object has been modified"))
+
+	cli := interceptor.NewClient(
+		fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).WithObjects(snap).Build(),
+		interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return errSiblingListBroken
+			},
+			SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+				return conflict
+			},
+			SubResourcePatch: func(context.Context, client.Client, string, client.Object, client.Patch, ...client.SubResourcePatchOption) error {
+				return conflict
+			},
+		},
+	)
+	r := &controller.SnapshotReconciler{Client: cli, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(snap)})
+	if !errors.Is(err, errSiblingListBroken) {
+		t.Fatalf("Reconcile returned %v, want the sibling list failure", err)
+	}
+
+	if apierrors.IsConflict(err) {
+		t.Errorf("the stamp's conflict made the list failure read as a conflict: %v", err)
 	}
 }
