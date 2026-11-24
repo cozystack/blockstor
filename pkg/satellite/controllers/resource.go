@@ -284,8 +284,6 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(siblingWatchPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRD))).
-		Watches(&blockstoriov1alpha1.ResourceGroup{},
-			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRG))).
 		Named("satellite-resource").
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.Config.resourceWorkers(),
@@ -620,37 +618,6 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 	}
 
 	return nil
-}
-
-// enqueueResourcesForRG maps a ResourceGroup event to the local
-// Resources whose definition is in that group. A group's props and its
-// volume groups' props reach the .res (Resolve, VolumeDiskOptions), so
-// `linstor rg sp` or `linstor vg sp`, block-size on a volume group say,
-// has to re-render the replicas it applies to rather than wait for an
-// unrelated reconcile to pick it up.
-func (r *ResourceReconciler) enqueueResourcesForRG(ctx context.Context, obj client.Object) []reconcile.Request {
-	rg, ok := obj.(*blockstoriov1alpha1.ResourceGroup)
-	if !ok {
-		return nil
-	}
-
-	var rdList blockstoriov1alpha1.ResourceDefinitionList
-
-	err := r.List(ctx, &rdList)
-	if err != nil {
-		return nil
-	}
-
-	var reqs []reconcile.Request
-
-	for i := range rdList.Items {
-		rd := &rdList.Items[i]
-		if rd.Spec.ResourceGroupName != "" && naming.Same(rd.Spec.ResourceGroupName, rg.Name) {
-			reqs = append(reqs, r.enqueueResourcesForRD(ctx, rd)...)
-		}
-	}
-
-	return reqs
 }
 
 // runApply gates on the controller-side allocation, builds the
