@@ -38,6 +38,13 @@ var rdReplicaDrainBudget = 20 * time.Second
 //nolint:gochecknoglobals // tunable
 var rdReplicaDrainPoll = 250 * time.Millisecond
 
+// waitForRDTeardown is what a definition delete waits for before it answers:
+// the replicas on reachable nodes torn down, then the local cache caught up.
+func (s *Server) waitForRDTeardown(ctx context.Context, name string) {
+	s.waitForOnlineReplicasDrained(ctx, name)
+	s.waitForRDDeletionVisible(ctx, name)
+}
+
 // waitForOnlineReplicasDrained holds a definition delete until no replica of
 // it is left on a node that is reachable, or rdReplicaDrainBudget runs out.
 //
