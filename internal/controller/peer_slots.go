@@ -163,8 +163,12 @@ func (r *ResourceReconciler) recordDefinitionPeerSlots(ctx context.Context, rdNa
 	var rd blockstoriov1alpha1.ResourceDefinition
 
 	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
-	if err != nil || rd.Spec.PeerSlots != nil {
-		return client.IgnoreNotFound(err)
+	if err != nil {
+		return cerrors.Wrapf(client.IgnoreNotFound(err), "read %q for its peer slots", rdName)
+	}
+
+	if rd.Spec.PeerSlots != nil {
+		return nil
 	}
 
 	known, err := r.definitionKnownPeerSlots(ctx, rdName, "")

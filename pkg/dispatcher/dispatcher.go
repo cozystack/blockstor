@@ -271,8 +271,7 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		// A replica with no count recorded and none read yet has its
 		// superblock read, so the controller records the count it was
 		// created with rather than guess 15.
-		ReadMetadataPeerSlots: target.PeerSlotsPredateRecord() && target.Status.MetadataPeerSlots == nil &&
-			!isDisklessFlags(target.Spec.Flags),
+		ReadMetadataPeerSlots: readsMetadataPeerSlots(target),
 		// The satellite's solo-promote reads these two to stay inside
 		// LINSTOR's case: never promote a replica that is being deleted,
 		// and never one whose definition has another diskful replica.
@@ -340,6 +339,13 @@ func anyOtherDiskfulReplica(target *blockstoriov1alpha1.Resource, peers []blocks
 	}
 
 	return false
+}
+
+// readsMetadataPeerSlots reports a diskful replica that predates the
+// peer-slot record and whose superblock nobody read yet.
+func readsMetadataPeerSlots(target *blockstoriov1alpha1.Resource) bool {
+	return target.PeerSlotsPredateRecord() && target.Status.MetadataPeerSlots == nil &&
+		!isDisklessFlags(target.Spec.Flags)
 }
 
 // isDisklessFlags reports a replica that keeps no disk: DISKLESS, or a

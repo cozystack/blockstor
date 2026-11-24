@@ -50,19 +50,27 @@ func TestSuperblockPeerSlots(t *testing.T) {
 		}
 	}
 
+	fifteen := storage.FakeResponse{Stdout: dumpWithPeerSlots(15)}
+	passed := &intent.ResourceApplyResult{Ok: true}
+
 	cases := []struct {
 		name     string
 		ask      bool
+		flags    []string
 		applied  int64
+		res      *intent.ResourceApplyResult
 		vol1     storage.FakeResponse
 		want     int32
 		wantRead bool
 	}{
-		{"asked", true, 1 << 20, storage.FakeResponse{Stdout: dumpWithPeerSlots(15)}, 7, true},
-		{"asked, never applied before", true, 0, storage.FakeResponse{Stdout: dumpWithPeerSlots(15)}, 7, true},
-		{"not asked", false, 1 << 20, storage.FakeResponse{Stdout: dumpWithPeerSlots(15)}, 0, false},
-		{"growing", true, 1 << 19, storage.FakeResponse{Stdout: dumpWithPeerSlots(15)}, 0, false},
-		{"a volume unreadable", true, 1 << 20, storage.FakeResponse{Err: errors.New("exit status 10")}, 0, true},
+		{"asked", true, nil, 1 << 20, passed, fifteen, 7, true},
+		{"asked, never applied before", true, nil, 0, passed, fifteen, 7, true},
+		{"not asked", false, nil, 1 << 20, passed, fifteen, 0, false},
+		{"growing", true, nil, 1 << 19, passed, fifteen, 0, false},
+		{"grow pending", true, nil, 1 << 20, &intent.ResourceApplyResult{Ok: true, GrowPending: true}, fifteen, 0, false},
+		{"pass failed", true, nil, 1 << 20, &intent.ResourceApplyResult{}, fifteen, 0, false},
+		{"diskless", true, []string{"DISKLESS"}, 1 << 20, passed, fifteen, 0, false},
+		{"a volume unreadable", true, nil, 1 << 20, passed, storage.FakeResponse{Err: errors.New("exit status 10")}, 0, true},
 	}
 
 	for _, tc := range cases {
@@ -77,9 +85,10 @@ func TestSuperblockPeerSlots(t *testing.T) {
 
 			got := r.superblockPeerSlots(t.Context(), &intent.DesiredResource{
 				Name:                  "pvc-adopted",
+				Flags:                 tc.flags,
 				Volumes:               volumes(tc.applied),
 				ReadMetadataPeerSlots: tc.ask,
-			})
+			}, tc.res)
 			if got != tc.want {
 				t.Errorf("got %d, want %d", got, tc.want)
 			}

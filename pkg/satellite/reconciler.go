@@ -625,7 +625,9 @@ func (r *Reconciler) Apply(ctx context.Context, res []*intent.DesiredResource) (
 			continue
 		}
 
-		results = append(results, r.applyOne(ctx, dr))
+		res := r.applyOne(ctx, dr)
+		res.MetadataPeerSlots = r.superblockPeerSlots(ctx, dr, res)
+		results = append(results, res)
 	}
 
 	return results, nil
@@ -1165,10 +1167,6 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 
 	res.Volumes, res.GrowPending = r.buildVolumeResults(ctx, dr, devices, diskless, withDRBD)
 
-	if withDRBD && !diskless && !res.GrowPending {
-		res.MetadataPeerSlots = r.superblockPeerSlots(ctx, dr)
-	}
-
 	return res
 }
 
@@ -1181,10 +1179,10 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 //
 // The least count over the volumes is the one the replica can serve.
 // Zero when any volume cannot be read, to be asked again on a later
-// pass, and on a pass that grows a volume: dump-md is kept off a device
-// in the middle of a resize (BUG-048).
-func (r *Reconciler) superblockPeerSlots(ctx context.Context, dr *intent.DesiredResource) int32 {
-	if !dr.GetReadMetadataPeerSlots() || len(dr.GetVolumes()) == 0 {
+// pass, after a pass that failed, and on one that grows a volume:
+// dump-md is kept off a device in the middle of a resize (BUG-048).
+func (r *Reconciler) superblockPeerSlots(ctx context.Context, dr *intent.DesiredResource, res *intent.ResourceApplyResult) int32 {
+	if !r.readsSuperblockPeerSlots(dr, res) {
 		return 0
 	}
 
@@ -1215,6 +1213,14 @@ func (r *Reconciler) superblockPeerSlots(ctx context.Context, dr *intent.Desired
 	}
 
 	return least
+}
+
+// readsSuperblockPeerSlots reports whether the pass that produced res
+// reads the superblock's peer slots: asked to, on a diskful DRBD replica
+// whose pass succeeded and grows nothing.
+func (r *Reconciler) readsSuperblockPeerSlots(dr *intent.DesiredResource, res *intent.ResourceApplyResult) bool {
+	return dr.GetReadMetadataPeerSlots() && r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack()) &&
+		!isDiskless(dr.GetFlags()) && res.GetOk() && !res.GetGrowPending()
 }
 
 // maybeLUKS conditionally layers cryptsetup over the raw storage
