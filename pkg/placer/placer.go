@@ -252,6 +252,23 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	placed := countDiskfulReplicas(plan.existing, plan.disabled)
 	want := int(filter.PlaceCount)
 
+	// Every replica with a disk takes a DRBD peer slot on every replica
+	// of the definition. LINSTOR places all of them in one transaction,
+	// through the check a single resource create runs, so a placement
+	// the slots cannot hold fails whole, with nothing created
+	// (CtrlRscCrtApiHelper.checkPeerSlotsForNewPeer). Checked here for
+	// all of them at once: the replicas this call writes are not in the
+	// cache the per-replica check reads until a moment later. A count no
+	// candidate set can reach is checked for the replicas it can place,
+	// and fails as a shortfall, as LINSTOR's fails for want of nodes
+	// before it creates anything.
+	if n := min(want-placed, candidateNodeCount(plan.preferred, plan.lastResort)); n > 0 {
+		err = store.CheckPeerSlotsForNewPeers(ctx, p.store, rdName, make([]string, n))
+		if err != nil {
+			return Placement{Want: want}, errors.Wrapf(err, "place %d replicas of %s", n, rdName)
+		}
+	}
+
 	defer p.holdWitness(ctx, rdName, want-placed)()
 
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.preferred, placed, want)
@@ -272,6 +289,20 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	}
 
 	return plan.state.placement(placed, want), plan.partialShortfall(placed, want)
+}
+
+// candidateNodeCount is the number of nodes the candidate pools are on,
+// the most replicas a placement can add.
+func candidateNodeCount(sets ...[]apiv1.StoragePool) int {
+	nodes := map[string]struct{}{}
+
+	for _, set := range sets {
+		for i := range set {
+			nodes[naming.Key(set[i].NodeName)] = struct{}{}
+		}
+	}
+
+	return len(nodes)
 }
 
 // placePlan bundles everything Place needs after the read-side

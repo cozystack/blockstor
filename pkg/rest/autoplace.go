@@ -1570,6 +1570,18 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		}
 	}
 
+	// LINSTOR creates the replicas in one transaction, each through the
+	// peer-slot check, so the first one the slots cannot hold fails the
+	// request with none created. Checked for all of them before the
+	// first is written: the cache the per-replica check reads does not
+	// show the ones written a moment earlier.
+	err := store.CheckPeerSlotsForNewPeers(r.Context(), s.Store, rdName, diskfulEnvelopeNodes(envelopes))
+	if err != nil {
+		writeStoreError(w, err)
+
+		return nil, false
+	}
+
 	// The replicas are written one at a time, and LINSTOR writes them in
 	// one transaction: without the hold the tiebreaker reconciler sees
 	// the first two of `r c n1 n2 n3` as an even-diskful tie and puts a
@@ -1593,16 +1605,22 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 // countDiskfulEnvelopes counts the envelopes of a resource create that
 // ask for a diskful replica: neither spelling of the diskless flag.
 func countDiskfulEnvelopes(envelopes []apiv1.ResourceCreate) int {
-	n := 0
+	return len(diskfulEnvelopeNodes(envelopes))
+}
+
+// diskfulEnvelopeNodes lists, in order, the nodes of the envelopes of a
+// resource create that ask for a diskful replica.
+func diskfulEnvelopeNodes(envelopes []apiv1.ResourceCreate) []string {
+	nodes := make([]string, 0, len(envelopes))
 
 	for i := range envelopes {
 		flags := envelopes[i].Resource.Flags
 		if !slices.Contains(flags, apiv1.ResourceFlagDiskless) && !slices.Contains(flags, rscFlagDrbdDiskless) {
-			n++
+			nodes = append(nodes, envelopes[i].Resource.NodeName)
 		}
 	}
 
-	return n
+	return nodes
 }
 
 // createOneResource runs the full per-envelope wire-boundary

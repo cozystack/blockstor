@@ -193,6 +193,17 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 	// `r l` would be empty after spawn until the operator runs a
 	// separate `r c --auto-place=N`.
 	deployed, placeErr := spawnAutoplace(r.Context(), s, rd.Name, rg, req)
+
+	// LINSTOR spawns the definition and places its replicas in one
+	// transaction: a placement the peer slots cannot hold fails the
+	// spawn whole, and the definition is not left behind.
+	if errors.Is(placeErr, store.ErrInsufficientPeerSlots) {
+		rollbackSpawn(r.Context(), s.Store, rd.Name)
+		writeStoreError(w, placeErr)
+
+		return
+	}
+
 	if placeErr != nil {
 		log.FromContext(r.Context()).WithName("rest").
 			Error(placeErr, "spawn autoplace", "rd", rd.Name)

@@ -20,6 +20,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
 	"github.com/cockroachdb/errors"
@@ -123,52 +124,99 @@ var ErrInsufficientPeerSlots = drbd.ErrInsufficientPeerSlots
 // definition's.
 // A definition that uses no DRBD keeps no bitmaps and is not checked.
 func CheckPeerSlotsForNewPeer(ctx context.Context, st Store, rdName, node string) error {
+	return CheckPeerSlotsForNewPeers(ctx, st, rdName, []string{node})
+}
+
+// CheckPeerSlotsForNewPeers refuses a request that creates several
+// replicas with a disk, on nodes in the order given, when any of them
+// would be refused once the ones before it exist. An empty node is a
+// replica whose node is not chosen yet, as in a placement, which takes
+// the definition's count.
+//
+// LINSTOR creates the replicas of a placement, a spawn or a multi-node
+// `r c` one by one in a single transaction, each through the check a
+// single create runs, so the first one the slots cannot hold fails the
+// request and none of them is created. Checking each replica against
+// the replicas stored before it does not do that here: the replicas the
+// same request wrote a moment earlier are not in the cache yet, and
+// every one passes.
+func CheckPeerSlotsForNewPeers(ctx context.Context, st Store, rdName string, nodes []string) error {
+	rd, existing, ok, err := peerSlotReplicas(ctx, st, rdName)
+	if err != nil || !ok {
+		return err
+	}
+
+	for i, node := range nodes {
+		name := node
+		if name == "" {
+			name = fmt.Sprintf("new replica %d", i+1)
+		}
+
+		// A replica already on node, as on toggle-disk or a witness the
+		// placement takes over, keeps the count its metadata will be
+		// created with; a new one gets the definition's.
+		slots := int(ReplicaPeerSlots(0, rd.PeerSlots))
+		at := slices.IndexFunc(existing, func(replica drbd.PeerSlotReplica) bool {
+			return node != "" && naming.Same(replica.Node, node)
+		})
+
+		if at >= 0 {
+			name = existing[at].Node
+			slots = existing[at].PeerSlots
+		}
+
+		err = drbd.CheckPeerSlotsForNewPeer(existing, name, slots)
+		if err != nil {
+			return errors.Wrapf(err, "resource definition %q", rdName)
+		}
+
+		if at >= 0 {
+			existing[at].Diskful = true
+
+			continue
+		}
+
+		existing = append(existing, drbd.PeerSlotReplica{Node: name, Diskful: true, PeerSlots: slots})
+	}
+
+	return nil
+}
+
+// peerSlotReplicas reads the definition and what the peer-slot checks
+// need of its replicas. ok is false for a definition that is gone or
+// uses no DRBD, which keeps no bitmaps and is not checked.
+func peerSlotReplicas(ctx context.Context, st Store, rdName string) (apiv1.ResourceDefinition, []drbd.PeerSlotReplica, bool, error) {
 	rd, err := st.ResourceDefinitions().Get(ctx, rdName)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			return nil
+			return rd, nil, false, nil
 		}
 
-		return errors.Wrapf(err, "read resource definition %q for its peer slots", rdName)
+		return rd, nil, false, errors.Wrapf(err, "read resource definition %q for its peer slots", rdName)
 	}
 
 	if len(rd.LayerStack) > 0 && !slices.Contains(rd.LayerStack, apiv1.LayerKindDRBD) {
-		return nil
+		return rd, nil, false, nil
 	}
 
 	replicas, err := st.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
-		return errors.Wrapf(err, "list the replicas of %q for their peer slots", rdName)
+		return rd, nil, false, errors.Wrapf(err, "list the replicas of %q for their peer slots", rdName)
 	}
 
 	existing := make([]drbd.PeerSlotReplica, 0, len(replicas))
 
-	// A replica that turns diskful, as on toggle-disk, already carries
-	// the count its metadata will be created with; a new one gets the
-	// definition's.
-	newPeerSlots := ReplicaPeerSlots(0, rd.PeerSlots)
-
 	for i := range replicas {
 		replica := &replicas[i]
-		slots := ReplicaPeerSlots(replica.PeerSlots, rd.PeerSlots)
-
-		if naming.Same(replica.NodeName, node) {
-			newPeerSlots = slots
-		}
 
 		existing = append(existing, drbd.PeerSlotReplica{
 			Node:      replica.NodeName,
 			Diskful:   !replicaIsDiskless(replica.Flags),
-			PeerSlots: int(slots),
+			PeerSlots: int(ReplicaPeerSlots(replica.PeerSlots, rd.PeerSlots)),
 		})
 	}
 
-	err = drbd.CheckPeerSlotsForNewPeer(existing, node, int(newPeerSlots))
-	if err != nil {
-		return errors.Wrapf(err, "resource definition %q", rdName)
-	}
-
-	return nil
+	return rd, existing, true, nil
 }
 
 // ReplicaPeerSlots is the peer-slot count of a replica: its recorded
