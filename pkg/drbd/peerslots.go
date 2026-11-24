@@ -65,12 +65,12 @@ var ErrInvalidPeerSlots = errors.New("invalid peer slots")
 
 // EffectivePeerSlots is the count a stored value stands for: the value
 // itself, or LegacyPeerSlots for one never recorded.
-func EffectivePeerSlots(stored *int32) int {
+func EffectivePeerSlots(stored *int32) int32 {
 	if stored == nil || *stored <= 0 {
 		return LegacyPeerSlots
 	}
 
-	return int(*stored)
+	return *stored
 }
 
 // ValidatePeerSlots refuses a count no superblock can carry. LINSTOR

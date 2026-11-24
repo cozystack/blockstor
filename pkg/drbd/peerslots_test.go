@@ -81,7 +81,7 @@ func TestParsePeerSlotsProp(t *testing.T) {
 }
 
 func replicas(slots int, diskful int, diskless int) []drbd.PeerSlotReplica {
-	var out []drbd.PeerSlotReplica
+	out := make([]drbd.PeerSlotReplica, 0, diskful+diskless)
 
 	for i := range diskful {
 		out = append(out, drbd.PeerSlotReplica{Node: fmt.Sprintf("d%02d", i), Diskful: true, PeerSlots: slots})

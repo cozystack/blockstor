@@ -2016,7 +2016,7 @@ func lowerDiskKib(dr *intent.DesiredResource, vol *intent.DesiredVolume) int64 {
 // of the replica's own: its peer slots, which LINSTOR copies from the
 // definition when it creates the replica, and the default activity log.
 func replicaGeometry(dr *intent.DesiredResource) drbd.MetadataGeometry {
-	return drbd.GeometryForPeerSlots(drbd.EffectivePeerSlots(dr.GetPeerSlots()))
+	return drbd.GeometryForPeerSlots(int(drbd.EffectivePeerSlots(dr.GetPeerSlots())))
 }
 
 // deviceWaitTimeoutDefault/deviceWaitPollDefault back the same-named

@@ -405,7 +405,7 @@ func newRestoredDefinition(
 		Props:             store.TravellingProps(snap.Props),
 		// The source's peer slots, which LINSTOR restores from the
 		// snapshot's DRBD layer.
-		PeerSlots: int32(store.ReplicaPeerSlots(0, src.PeerSlots)),
+		PeerSlots: store.ReplicaPeerSlots(0, src.PeerSlots),
 	}
 
 	if unapplied != "" {

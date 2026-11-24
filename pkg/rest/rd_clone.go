@@ -2250,7 +2250,7 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	clone.Annotations = withoutUnappliedGroupStack(src.Annotations)
 	// The source's peer slots, as LINSTOR's clone carries the source's
 	// DRBD layer over (createRscDfnPayload).
-	clone.PeerSlots = int32(store.ReplicaPeerSlots(0, src.PeerSlots))
+	clone.PeerSlots = store.ReplicaPeerSlots(0, src.PeerSlots)
 
 	if req.ResourceGroup != "" {
 		clone.ResourceGroupName = req.ResourceGroup

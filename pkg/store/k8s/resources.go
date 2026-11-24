@@ -948,7 +948,7 @@ func layerObjectFromCRD(crd *crdv1alpha1.Resource) *apiv1.ResourceLayer {
 			top.Drbd = &apiv1.DrbdResourceLayer{}
 		}
 
-		top.Drbd.PeerSlots = int32(drbd.EffectivePeerSlots(crd.Spec.PeerSlots))
+		top.Drbd.PeerSlots = drbd.EffectivePeerSlots(crd.Spec.PeerSlots)
 	}
 
 	// Hydrate the STORAGE leaf for diskful replicas — F19 keeps the

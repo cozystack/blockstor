@@ -1961,7 +1961,8 @@ func (c *converter) rgPeerSlots(row *ResourceGroupRow, dsp string) int32 {
 		return 0
 	}
 
-	if err := drbd.ValidatePeerSlots(int64(*row.PeerSlots)); err != nil {
+	err := drbd.ValidatePeerSlots(int64(*row.PeerSlots))
+	if err != nil {
 		c.warnf("resource group %s: %v; not migrated", dsp, err)
 
 		return 0

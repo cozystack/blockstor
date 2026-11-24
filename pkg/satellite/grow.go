@@ -187,7 +187,7 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 // it only oversizes the bitmap, by 32 KiB per GiB for each slot too
 // many.
 func grownPeerSlots(dr *intent.DesiredResource) int {
-	return max(drbd.EffectivePeerSlots(dr.GetPeerSlots()), drbd.LegacyPeerSlots)
+	return int(max(drbd.EffectivePeerSlots(dr.GetPeerSlots()), drbd.LegacyPeerSlots))
 }
 
 // growKey builds the key of the per-volume grow tables.

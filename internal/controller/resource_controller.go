@@ -1064,7 +1064,7 @@ func stampedPeerSlots(rd *blockstoriov1alpha1.ResourceDefinition, predatesRecord
 	case predatesRecord:
 		v = drbd.LegacyPeerSlots
 	case rd != nil:
-		v = int32(drbd.EffectivePeerSlots(rd.Spec.PeerSlots))
+		v = drbd.EffectivePeerSlots(rd.Spec.PeerSlots)
 	default:
 		return nil
 	}

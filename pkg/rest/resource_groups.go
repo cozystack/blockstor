@@ -150,6 +150,24 @@ func (s *Server) handleRGGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rg)
 }
 
+// validateRGCreateBounds refuses the counts of a new group that are out
+// of range. Bug 367 / 361: a negative or absurdly large place_count, by
+// the rule handleRGUpdate shares (validateRGSelectFilterPlaceCount). A
+// peer-slot count no superblock holds, which LINSTOR refuses
+// (ResourceGroups.parsePeerSlots); zero is none.
+func validateRGCreateBounds(rg *apiv1.ResourceGroup) error {
+	err := validateRGSelectFilterPlaceCount(rg.SelectFilter.PlaceCount, rg.SelectFilter.AdditionalPlaceCount)
+	if err != nil {
+		return err
+	}
+
+	if rg.PeerSlots == 0 {
+		return nil
+	}
+
+	return drbd.ValidatePeerSlots(int64(rg.PeerSlots)) //nolint:wrapcheck // the message is LINSTOR's, for the caller to show
+}
+
 func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 	var rg apiv1.ResourceGroup
 
@@ -200,26 +218,11 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 367 / 361: refuse negative or absurdly-large place_count
-	// at the wire boundary. See validateRGSelectFilterPlaceCount —
-	// shared with handleRGUpdate so POST and PUT enforce the same
-	// rule.
-	pcErr := validateRGSelectFilterPlaceCount(rg.SelectFilter.PlaceCount, rg.SelectFilter.AdditionalPlaceCount)
-	if pcErr != nil {
-		writeError(w, http.StatusBadRequest, pcErr.Error())
+	boundsErr := validateRGCreateBounds(&rg)
+	if boundsErr != nil {
+		writeError(w, http.StatusBadRequest, boundsErr.Error())
 
 		return
-	}
-
-	// LINSTOR refuses a group peer-slot count no superblock holds
-	// (ResourceGroups.parsePeerSlots); zero is none.
-	if rg.PeerSlots != 0 {
-		slotsErr := drbd.ValidatePeerSlots(int64(rg.PeerSlots))
-		if slotsErr != nil {
-			writeError(w, http.StatusBadRequest, slotsErr.Error())
-
-			return
-		}
 	}
 
 	err = s.Store.ResourceGroups().Create(r.Context(), &rg)

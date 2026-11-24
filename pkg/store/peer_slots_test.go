@@ -68,7 +68,7 @@ func TestReplicaPeerSlots(t *testing.T) {
 		{definition: 12, want: 12},
 		{want: 15},
 	} {
-		if got := store.ReplicaPeerSlots(tc.replica, tc.definition); got != int(tc.want) {
+		if got := store.ReplicaPeerSlots(tc.replica, tc.definition); got != tc.want {
 			t.Errorf("ReplicaPeerSlots(%d, %d) = %d, want %d", tc.replica, tc.definition, got, tc.want)
 		}
 	}
