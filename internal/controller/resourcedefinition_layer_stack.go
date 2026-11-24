@@ -181,11 +181,25 @@ func (r *ResourceDefinitionReconciler) refreshUnappliedGroupStack(
 
 	if recorded == "" && r.Recorder != nil {
 		r.Recorder.Eventf(rd, nil, corev1.EventTypeWarning, layerStackNotInheritedReason, layerStackPinAction,
-			"layer stack %s lacks a layer of the stack %s its resource group %s asks for",
-			strings.Join(rd.Spec.LayerStack, ","), want, rd.Spec.ResourceGroupName)
+			"layer stack %s lacks a layer of the stack %s its resource group %s asks for%s",
+			strings.Join(rd.Spec.LayerStack, ","), want, rd.Spec.ResourceGroupName,
+			unreplicatedNote(rd.Spec.LayerStack, want))
 	}
 
 	return nil
+}
+
+// unreplicatedNote completes the warning for a stack without DRBD in a group
+// that replicates. A storage-only snapshot restored into a replicated class
+// lands here: the class still places as many replicas as it asks for, but
+// without DRBD each is a separate copy, so a pod moved to another node's
+// replica reads data that stopped at the restore.
+func unreplicatedNote(stack []string, groupStack string) string {
+	if apiv1.LayerInStack(stack, "DRBD") || !apiv1.LayerInStack(strings.Split(groupStack, ","), "DRBD") {
+		return ""
+	}
+
+	return "; without DRBD every further replica is a separate copy that does not receive this one's writes"
 }
 
 // stackToPin is the group's stack for an RD with nothing on disk, and
