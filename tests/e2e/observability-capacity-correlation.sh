@@ -460,7 +460,10 @@ AUTO_BODY=$(cat <<EOF
 {"select_filter":{"place_count":1,"storage_pool":"${FILL_POOL}","node_name_list":["${FILL_NODE}"]}}
 EOF
 )
-auto_out=$(curl -sS -m 30 -o /tmp/cap-corr-autoplace.json -w '%{http_code}' \
+# The gate refuses at once. If it fails to fire, the autoplace waits
+# for the build and ready steps (up to 30 s + 15 s), so the timeout
+# sits past them and the report shows the real answer, not curl's 28.
+auto_out=$(curl -sS -m 60 -o /tmp/cap-corr-autoplace.json -w '%{http_code}' \
     -XPOST -H 'Content-Type: application/json' \
     "http://127.0.0.1:${PF_PORT}/v1/resource-definitions/${PROBE_RD}/autoplace" \
     -d "$AUTO_BODY" 2>&1 || true)

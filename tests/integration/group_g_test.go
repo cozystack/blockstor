@@ -48,11 +48,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -340,6 +342,238 @@ func TestGroupG(t *testing.T) {
 	t.Run("SnapOrphanCleanup", func(t *testing.T) { testGroupGSnapOrphanCleanup(t, stack, cli) })
 	t.Run("SnapDeleteBlockedByLater", func(t *testing.T) { testGroupGSnapDeleteBlockedByLater(t, stack, cli) })
 	t.Run("AutoSnapshotPeriodicTick", func(t *testing.T) { testGroupGAutoSnapshotPeriodicTick(t, stack) })
+	t.Run("SnapSuccessfulOutlivesSource", func(t *testing.T) { testGroupGSnapSuccessfulOutlivesSource(t, stack, cli) })
+	t.Run("SnapAbortedTakeStaysOver", func(t *testing.T) { testGroupGSnapAbortedTakeStaysOver(t, stack, cli) })
+}
+
+// testGroupGSnapSuccessfulOutlivesSource drives a snapshot through the
+// controller's suspend, take and resume, standing in for the satellites,
+// then deletes every replica of the source. In LINSTOR the snapshot
+// definition keeps the SUCCESSFUL it got when the take completed, and
+// linstor-csi waits for that flag before restoring from it. Derived from
+// the source's current replicas, it vanished with them, and every restore
+// of a deleted volume timed out.
+func testGroupGSnapSuccessfulOutlivesSource(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
+	rd := seedRDWithVolume(t, stack, "outlives")
+	cli.Run(t, "snapshot", "create", rd, "snap-1")
+	waitForSnapshotCRD(t, stack, rd, "snap-1")
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: rd + ".snap-1"}
+
+	driveSnapshotTake(t, stack, key)
+
+	restFlags := func() []string { return restSnapshotFlags(t, stack, rd, "snap-1") }
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		return slices.Contains(restFlags(), "SUCCESSFUL")
+	}, "snapshot not served SUCCESSFUL after a completed take")
+
+	// The source volume goes: every replica is deleted, the definition
+	// stays because it has a snapshot.
+	for _, res := range listResourcesByRD(t, stack, rd) {
+		if err := stack.Env.Client.Delete(ctx, &res); err != nil {
+			t.Fatalf("delete Resource %s: %v", res.Name, err)
+		}
+	}
+
+	stripResourceFinalizers(t, stack, rd)
+
+	harness.Eventually(t, groupGTimeout, func() bool { return len(listResourcesByRD(t, stack, rd)) == 0 },
+		"source replicas were not deleted")
+
+	if flags := restFlags(); !slices.Contains(flags, "SUCCESSFUL") {
+		t.Fatalf("snapshot of a deleted volume served with flags %v, want SUCCESSFUL: "+
+			"linstor-csi would never restore from it", flags)
+	}
+
+	got := listSnapshotsViaCLI(t, cli, rd)
+	if len(got) != 1 {
+		t.Fatalf("snapshot list: got %d snapshots, want 1", len(got))
+	}
+
+	if flags, _ := got[0]["flags"].([]any); !slices.Contains(flags, any("SUCCESSFUL")) {
+		t.Fatalf("snapshot list serves flags %v for the snapshot of a deleted volume, want SUCCESSFUL", got[0]["flags"])
+	}
+}
+
+// getSnapshotCRD reads a Snapshot CRD straight from the API server.
+func getSnapshotCRD(t *testing.T, stack *harness.Stack, key types.NamespacedName) blockstoriov1alpha1.Snapshot {
+	t.Helper()
+
+	var snap blockstoriov1alpha1.Snapshot
+	if err := stack.Env.Client.Get(context.Background(), key, &snap); err != nil {
+		t.Fatalf("get Snapshot %s: %v", key.Name, err)
+	}
+
+	return snap
+}
+
+// stampSnapshotNodes writes what each targeted satellite reports at a
+// phase of the take: the suspend acknowledged, the snapshot taken.
+func stampSnapshotNodes(t *testing.T, stack *harness.Stack, key types.NamespacedName, acked, ready bool) {
+	t.Helper()
+
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		snap := getSnapshotCRD(t, stack, key)
+		snap.Status.NodeStatus = nil
+
+		var taken int64
+		if ready {
+			taken = time.Now().UnixMilli()
+		}
+
+		for _, node := range snap.Spec.Nodes {
+			snap.Status.NodeStatus = append(snap.Status.NodeStatus, blockstoriov1alpha1.SnapshotPerNodeStatus{
+				NodeName:        node,
+				SuspendIOAcked:  acked,
+				Ready:           ready,
+				CreateTimestamp: taken,
+			})
+		}
+
+		return stack.Env.Client.Status().Update(context.Background(), &snap)
+	})
+	if err != nil {
+		t.Fatalf("stamp per-node status: %v", err)
+	}
+}
+
+// driveSnapshotTake walks a snapshot through the controller's suspend,
+// take and resume, standing in for the satellites of every replica the
+// controller targeted.
+func driveSnapshotTake(t *testing.T, stack *harness.Stack, key types.NamespacedName) {
+	t.Helper()
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnapshotCRD(t, stack, key)
+
+		return snap.Spec.SuspendIO && len(snap.Spec.Nodes) == len(harness.FixtureNodes())
+	}, "snapshot did not enter the suspend phase on every replica's node")
+
+	stampSnapshotNodes(t, stack, key, true, false)
+
+	harness.Eventually(t, groupGTimeout, func() bool { return getSnapshotCRD(t, stack, key).Spec.TakeSnapshot },
+		"controller did not order the take once every node suspended")
+
+	stampSnapshotNodes(t, stack, key, true, true)
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnapshotCRD(t, stack, key)
+
+		return !snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot
+	}, "controller did not resume I/O once every node took the snapshot")
+
+	stampSnapshotNodes(t, stack, key, false, true)
+}
+
+// restSnapshotFlags returns the flags the REST API serves for a snapshot.
+func restSnapshotFlags(t *testing.T, stack *harness.Stack, rd, snapName string) []string {
+	t.Helper()
+
+	status, body := httpGetStatus(t, stack.RestURL+"/v1/resource-definitions/"+rd+"/snapshots/"+snapName)
+	if status != http.StatusOK {
+		t.Fatalf("GET snapshot: status %d: %s", status, body)
+	}
+
+	var wire struct {
+		Flags []string `json:"flags"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+
+	return wire.Flags
+}
+
+// testGroupGSnapAbortedTakeStaysOver aborts a take the way LINSTOR does
+// when a replica is not UpToDate, then lets the satellites catch up
+// late: their suspend acks linger before the resume lands, and the take
+// reports Ready afterwards. LINSTOR resumes I/O and deletes the snapshot
+// it refused to take. The controller must not order a new suspend, nor
+// delete the snapshot, while the acks linger; once every node resumed
+// it deletes it, never having served it SUCCESSFUL.
+func testGroupGSnapAbortedTakeStaysOver(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
+	ctx := context.Background()
+	rd := seedRDWithVolume(t, stack, "aborted")
+	resKey := types.NamespacedName{Name: rd + "." + harness.NodeWorker1}
+
+	stack.Satellite.SimulateDRBDState(rd, harness.NodeWorker1, "Inconsistent")
+
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var res blockstoriov1alpha1.Resource
+		if gErr := stack.Env.Client.Get(ctx, resKey, &res); gErr != nil {
+			return fmt.Errorf("get Resource: %w", gErr)
+		}
+
+		res.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, DiskState: "Inconsistent"}}
+
+		return stack.Env.Client.Status().Update(ctx, &res)
+	})
+	if err != nil {
+		t.Fatalf("report worker-1 Inconsistent: %v", err)
+	}
+
+	cli.Run(t, "snapshot", "create", rd, "snap-1")
+	waitForSnapshotCRD(t, stack, rd, "snap-1")
+
+	key := types.NamespacedName{Name: rd + ".snap-1"}
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnapshotCRD(t, stack, key)
+
+		return snap.Spec.SuspendIO && len(snap.Spec.Nodes) == len(harness.FixtureNodes())
+	}, "snapshot did not enter the suspend phase on every replica's node")
+
+	stampSnapshotNodes(t, stack, key, true, false)
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		snap := getSnapshotCRD(t, stack, key)
+
+		return !snap.Spec.SuspendIO &&
+			slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect)
+	}, "controller did not abort the take of a replica that is not UpToDate")
+
+	// The acks linger: no satellite confirmed the resume yet, so the
+	// snapshot stays, flagged, and I/O is not frozen again.
+	holdsFor(t, 3*time.Second, func() bool {
+		snap := getSnapshotCRD(t, stack, key)
+
+		return !snap.Spec.SuspendIO && snap.DeletionTimestamp.IsZero()
+	}, "controller froze I/O again, or deleted the snapshot before its nodes resumed")
+
+	if flags := restSnapshotFlags(t, stack, rd, "snap-1"); !slices.Contains(flags, "FAILED_DISCONNECT") {
+		t.Errorf("aborted take served with flags %v, want FAILED_DISCONNECT", flags)
+	}
+
+	// The take returns late on every node, and every node resumes.
+	stampSnapshotNodes(t, stack, key, false, true)
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		var snap blockstoriov1alpha1.Snapshot
+
+		err := stack.Env.Client.Get(ctx, key, &snap)
+		if apierrors.IsNotFound(err) {
+			return true
+		}
+
+		if slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagSuccessful) {
+			t.Fatal("an aborted take was recorded SUCCESSFUL once its nodes reported Ready")
+		}
+
+		return err == nil && !snap.DeletionTimestamp.IsZero()
+	}, "snapshot refused on a non-UpToDate replica was kept after every node resumed")
+}
+
+// holdsFor fails the test the first time predicate turns false within d.
+func holdsFor(t *testing.T, d time.Duration, predicate func() bool, msg string) {
+	t.Helper()
+
+	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if !predicate() {
+			t.Fatal(msg)
+		}
+	}
 }
 
 // testGroupGSnapCreateListDelete is the basic CRUD wire-shape pin.
@@ -747,7 +981,7 @@ func testGroupGSnapRestoreSnapshotHolderOnly(t *testing.T, stack *harness.Stack,
 	}, "ship-dst RD missing BlockstorRestoreFromSnapshot=<src>:<snap>")
 }
 
-// testGroupGSnapOrphanCleanup pins Bug 64 + Bug 43: the satellite
+// testGroupGSnapOrphanCleanup pins Bug 64: the satellite
 // finalizer-strip lifecycle. A Snapshot CRD with the
 // `satellite-snapshot` finalizer must NOT disappear from the
 // apiserver while the finalizer is present, even on `kubectl
@@ -758,11 +992,11 @@ func testGroupGSnapRestoreSnapshotHolderOnly(t *testing.T, stack *harness.Stack,
 // pkg/satellite/controllers stack, so we simulate the finalizer
 // lifecycle by hand: stamp the finalizer manually, delete (CRD
 // goes Terminating), strip the finalizer, verify the CRD is
-// reaped. The orphan-storage sweeper (Bug 43) lives on the
-// satellite side and runs against real provider state — not
-// reachable from this harness without touching it (which the
-// playbook forbids). Asserting the controller-side invariant is
-// the closest Tier 2 can get; the kernel-state half is Tier 4.
+// reaped. The satellite-side delete runs against real provider
+// state — not reachable from this harness without touching it
+// (which the playbook forbids). Asserting the controller-side
+// invariant is the closest Tier 2 can get; the kernel-state half
+// is Tier 4.
 func testGroupGSnapOrphanCleanup(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
 	rd := seedRDWithVolume(t, stack, "orphan")
 	cli.Run(t, "snapshot", "create", rd, "snap-orphan")
@@ -824,11 +1058,9 @@ func testGroupGSnapOrphanCleanup(t *testing.T, stack *harness.Stack, cli *harnes
 
 	// Now strip the finalizer (mimics the satellite finishing
 	// its teardown after the on-disk ZFS/LVM snapshot is gone).
-	// The orphan-storage-sweeper (Bug 43) is what catches the
-	// inverse scenario — operator force-strips before the
-	// satellite tore down — that lives on the satellite side and
-	// is out of scope for this Tier 2 file (see the function-
-	// level doc above).
+	// An operator who force-strips before the satellite tore
+	// down leaves the on-disk snapshot behind: nothing deletes
+	// storage without its own delete request.
 	//
 	// This check runs a couple of seconds after the DELETE, inside
 	// the 10s wait budget, so it only shows the delete waits for the
@@ -1010,4 +1242,19 @@ func testGroupGAutoSnapshotPeriodicTick(t *testing.T, stack *harness.Stack) {
 	if updated.Annotations[controller.AnnotationAutoSnapshotLastAt] == "" {
 		t.Errorf("AnnotationAutoSnapshotLastAt unset after first tick; runnable would re-fire on next pass")
 	}
+
+	// LINSTOR takes an auto-snapshot through the same suspend, take and
+	// resume as any other, on every diskful replica, and marks it
+	// SUCCESSFUL, which linstor-csi waits for before restoring from it.
+	key := types.NamespacedName{Name: rdName + "." + wantFirstSnapName}
+
+	if nodes := getSnapshotCRD(t, stack, key).Spec.Nodes; len(nodes) != len(harness.FixtureNodes()) {
+		t.Fatalf("auto-snapshot targets nodes %v, want every replica's node %v", nodes, harness.FixtureNodes())
+	}
+
+	driveSnapshotTake(t, stack, key)
+
+	harness.Eventually(t, groupGTimeout, func() bool {
+		return slices.Contains(restSnapshotFlags(t, stack, rdName, wantFirstSnapName), "SUCCESSFUL")
+	}, "auto-snapshot not served SUCCESSFUL after a completed take")
 }

@@ -283,11 +283,8 @@ func TestCornerB_DefaultQuorumPairIsDeliberateDelta(t *testing.T) {
 // `DrbdOptions/Resource/quorum-minimum-redundancy` is a generic DRBD
 // option. Oracle evidence (piraeus-server 1.33.2): upstream VALIDATES
 // the value against the DRBD schema `(1-32)|all|majority|off` and
-// rejects `bogus` with FAIL_INVLD_PROP. blockstor's property bag is
-// permissive — it accepts and stores any DrbdOptions value verbatim
-// (no per-key value validator exists; the satellite/drbdadm rejects a
-// truly invalid value at .res render time). This is a DELIBERATE
-// DELTA recorded in docs/cli-parity-known-deltas.md.
+// rejects `bogus` with FAIL_INVLD_PROP; so does blockstor, see
+// TestRDModifyRefusesAValueTheRuleRefuses.
 //
 // This test pins the accepted-and-stored behaviour for a VALID value
 // (passthrough works → the satellite renders it into options{}), which

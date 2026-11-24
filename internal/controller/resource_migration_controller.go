@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
@@ -74,16 +75,27 @@ const migrationRequeueInterval = 5 * time.Second
 type ResourceMigrationReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources/status,verbs=get
 
-// Reconcile drives one pass over the destination Resource:
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *ResourceMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass drives one pass over the destination Resource:
 // no-op if the migrating-from prop is absent (or stale),
 // requeue while dst Volumes are not yet UpToDate, prune src
 // and clear the prop once UpToDate is observed.
-func (r *ResourceMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ResourceMigrationReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName("resource-migration")
 
 	var dst blockstoriov1alpha1.Resource

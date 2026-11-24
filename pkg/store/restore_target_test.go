@@ -130,7 +130,7 @@ func TestPreparedRestoreTargetReadsTheDefinitionPastTheCache(t *testing.T) {
 	}
 
 	prepared, err := store.PreparedRestoreTarget(t.Context(), backend, &stale, snap)
-	if prepared || errors.Is(err, store.ErrRestoreTargetLayers) {
+	if prepared || err != nil {
 		t.Errorf("a target marked since the caller read it was taken (%v)", err)
 	}
 }

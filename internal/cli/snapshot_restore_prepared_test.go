@@ -79,10 +79,11 @@ func TestSnapshotRestoreRefusesATargetWithALiveReplica(t *testing.T) {
 	}
 }
 
-// A prepared target of another layer stack would hold the source's bytes
-// under layers that did not write them, so the CLI refuses it the way the REST
-// door does, in both directions, and leaves the operator's definition unmarked.
-func TestSnapshotRestoreRefusesAPreparedTargetOfAnotherLayerStack(t *testing.T) {
+// A prepared target of another layer stack takes the source's stack, the way
+// LINSTOR builds a restored resource from the snapshot's layer data, so the
+// bytes are read back through the layers that wrote them; the CLI restores
+// into it the way the REST door does, in every direction.
+func TestSnapshotRestoreGivesAPreparedTargetOfAnotherLayerStackTheSourceStack(t *testing.T) {
 	t.Parallel()
 
 	luks := []string{"DRBD", "LUKS", "STORAGE"}
@@ -91,20 +92,20 @@ func TestSnapshotRestoreRefusesAPreparedTargetOfAnotherLayerStack(t *testing.T) 
 		name           string
 		source, target []string
 	}{
+		{name: "drbd-source-into-storage-only", source: []string{"DRBD", "STORAGE"}, target: []string{"STORAGE"}},
 		{name: "plaintext-source-into-luks", source: []string{"DRBD", "STORAGE"}, target: luks},
-		{name: "luks-source-into-plaintext", source: luks},
+		{name: "luks-source-into-plaintext", source: luks, target: []string{"DRBD", "STORAGE"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
-				_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-					Name: "pvc-src", LayerStack: tc.source,
-				})
-				_ = backend.Snapshots().Create(ctx, &apiv1.Snapshot{
-					Name: "snap-1", ResourceName: "pvc-src", Nodes: []string{"node-1"},
-					VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 1 << 20}},
-				})
+				seedSnapshotSource(ctx, backend)
+
+				src, _ := backend.ResourceDefinitions().Get(ctx, "pvc-x")
+				src.LayerStack = tc.source
+				_ = backend.ResourceDefinitions().Update(ctx, &src)
+
 				_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
 					Name: "pvc-dst", LayerStack: tc.target,
 				})
@@ -112,24 +113,19 @@ func TestSnapshotRestoreRefusesAPreparedTargetOfAnotherLayerStack(t *testing.T) 
 					&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1 << 20})
 			})
 
-			if got := app.Run(t.Context(), []string{
-				"s", "resource", "restore", "--from-resource", "pvc-src", "--from-snapshot", "snap-1",
-				"--to-resource", "pvc-dst", "--storage-pool", "pool-1",
-			}); got == 0 {
-				t.Fatal("restore into a target of another layer stack succeeded")
+			if got := app.Run(t.Context(), restoreResourceArgv("pvc-dst", "--nodes", "node-1")); got != 0 {
+				t.Fatalf("restore into a target of another layer stack exit = %d (stderr: %s)", got, errBuf.String())
 			}
 
-			if !strings.Contains(errBuf.String(), "layer stack") {
-				t.Errorf("refusal %q does not name the layer stack", errBuf.String())
-			}
+			assertRestoredInto(t, appStore(t, app), "pvc-dst", "node-1")
 
 			rd, err := appStore(t, app).ResourceDefinitions().Get(t.Context(), "pvc-dst")
 			if err != nil {
 				t.Fatalf("read the target: %v", err)
 			}
 
-			if marker := rd.Props[store.RestoreFromSnapshotProp]; marker != "" {
-				t.Errorf("the refused target was marked %q", marker)
+			if !slices.Equal(rd.LayerStack, tc.source) {
+				t.Errorf("restored target stack = %v, want the source's %v", rd.LayerStack, tc.source)
 			}
 		})
 	}
