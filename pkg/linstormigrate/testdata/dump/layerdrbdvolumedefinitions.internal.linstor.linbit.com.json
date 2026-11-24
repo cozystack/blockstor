@@ -1,6 +1,7 @@
 {
 "items": [
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL1",
 "resource_name_suffix": "",
@@ -10,6 +11,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL3",
 "resource_name_suffix": "",
@@ -19,6 +21,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL5",
 "resource_name_suffix": "",
@@ -28,6 +31,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL1",
 "resource_name_suffix": "",
@@ -36,6 +40,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "resource_name": "PVC-VOL1",
 "resource_name_suffix": "",

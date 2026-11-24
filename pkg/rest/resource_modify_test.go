@@ -58,7 +58,7 @@ func TestResourceSetPropertyMerges(t *testing.T) {
 
 	body, err := json.Marshal(apiv1.GenericPropsModify{
 		OverrideProps: map[string]string{
-			"DrbdOptions/Net/ping-timeout": "500",
+			"DrbdOptions/SkipDisk": "True",
 		},
 	})
 	if err != nil {
@@ -77,8 +77,8 @@ func TestResourceSetPropertyMerges(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if got.Props["DrbdOptions/Net/ping-timeout"] != "500" {
-		t.Errorf("DrbdOptions/Net/ping-timeout: got %v, want 500", got.Props)
+	if got.Props["DrbdOptions/SkipDisk"] != "True" {
+		t.Errorf("DrbdOptions/SkipDisk: got %v, want True", got.Props)
 	}
 
 	if got.Props["keep-me"] != "stay" {
@@ -178,7 +178,7 @@ func TestResourceSetPropertyNilPropsInitialised(t *testing.T) {
 
 	body, err := json.Marshal(apiv1.GenericPropsModify{
 		OverrideProps: map[string]string{
-			"DrbdOptions/Net/ping-timeout": "500",
+			"DrbdOptions/SkipDisk": "True",
 		},
 	})
 	if err != nil {
@@ -197,8 +197,8 @@ func TestResourceSetPropertyNilPropsInitialised(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if got.Props["DrbdOptions/Net/ping-timeout"] != "500" {
-		t.Errorf("DrbdOptions/Net/ping-timeout never landed (nil-map guard): %v", got.Props)
+	if got.Props["DrbdOptions/SkipDisk"] != "True" {
+		t.Errorf("DrbdOptions/SkipDisk never landed (nil-map guard): %v", got.Props)
 	}
 }
 

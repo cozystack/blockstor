@@ -19,12 +19,13 @@ limitations under the License.
 // Command linstor-migrate converts a LINSTOR k8s-backend database dump
 // into blockstor CRD manifests.
 //
-// Input is a directory of `kubectl get <table> -ojson` dumps of the
-// `*.internal.linstor.linbit.com` CRDs LINSTOR uses as its database
-// when running with the k8s connector:
-//
-//	kubectl get crds | grep -o ".*.internal.linstor.linbit.com" | \
-//	  xargs -I{} sh -c "kubectl get {} -ojson > {}.json"
+// Input is a directory of `kubectl get <plural>.<version>.<group> -ojson`
+// dumps of the `*.internal.linstor.linbit.com` CRDs LINSTOR uses as its
+// database when running with the k8s connector, each read at its CRD's
+// storage version (the migration runbook has the command). A plain
+// `kubectl get <crd>` reads the oldest version the CRD serves, where
+// the API server prunes columns such as tcp_port_list, and a dump read
+// that way is refused.
 //
 // Output is a multi-document YAML stream of blockstor
 // `blockstor.org/v1alpha1` objects in apply order (nodes,
@@ -86,7 +87,7 @@ func run() int {
 	var (
 		inDir     = flag.String("in", "", "directory with *.internal.linstor.linbit.com.json table dumps (required)")
 		outPath   = flag.String("out", "-", "write manifests to this file ('-' = stdout)")
-		portsPath = flag.String("drbd-ports", "", "optional file of LIVE DRBD ports, '<rd-name> <node> <port>' per replica or '<rd-name> <port>' per definition (see runbook); preserves the running mesh endpoints so adoption doesn't reconnect")
+		portsPath = flag.String("drbd-ports", "", "optional file of LIVE DRBD ports, '<rd-name> <node> <port>' per replica or '<rd-name> <port>' per definition (see runbook); cross-checks the database's ports against the running mesh endpoints, which win, so adoption doesn't reconnect")
 		luks      luksFlags
 	)
 

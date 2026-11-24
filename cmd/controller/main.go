@@ -254,9 +254,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ResourceReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Store:  st,
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Store:    st,
+		Recorder: mgr.GetEventRecorder("blockstor-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resource")
 		os.Exit(1)
@@ -282,8 +283,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.AutoSnapshotRunnable{
-		Client: mgr.GetClient(),
-		Store:  st,
+		Client:    mgr.GetClient(),
+		Store:     st,
+		APIReader: mgr.GetAPIReader(),
 	}).RegisterWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to register runnable", "runnable", "auto-snapshot")
 		os.Exit(1)
@@ -339,8 +341,12 @@ func main() {
 			Namespace: controllerNamespace,
 			// As in cmd/apiserver: the passphrase Secret is read past the cache.
 			SecretReader: mgr.GetAPIReader(),
-			StateReader:  encryptionWatches,
-			OnReady:      ready.MarkBound,
+			// As in cmd/apiserver: a snapshot create answers once its take is over.
+			SnapshotTakeWait:   rest.SnapshotTakeWait,
+			StateReader:        encryptionWatches,
+			OnReady:            ready.MarkBound,
+			ResourceReadyWait:  rest.DefaultResourceReadyWait,
+			ResourceDeployWait: rest.DefaultResourceDeployWait,
 		}); err != nil {
 			setupLog.Error(err, "Failed to register REST API server")
 			os.Exit(1)

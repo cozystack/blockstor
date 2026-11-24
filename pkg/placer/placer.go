@@ -178,9 +178,31 @@ func New(st store.Store) *Placer {
 // the migration semantic: even if 2 replicas exist, if one is on an
 // evicted node the placer will create a third on a healthy peer.
 func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
-	_, placed, want, err := p.PlaceCreating(ctx, rdName, filter)
+	res, err := p.PlaceDeployed(ctx, rdName, filter)
 
-	return placed, want, err
+	return res.Placed, res.Want, err
+}
+
+// Placement is what a Place call did: the diskful count it reached,
+// the count it was asked for, and the nodes whose replica this call
+// created or promoted from a diskless witness.
+type Placement struct {
+	Placed int
+	Want   int
+	// Deployed lists the nodes this call put a replica on, as LINSTOR's
+	// autoplace collects its deployedResources: the replicas that were
+	// there before the call are not in it.
+	Deployed []string
+}
+
+// PlaceDeployed is Place that also reports which nodes it deployed to,
+// so the REST autoplace can wait for those replicas only, as LINSTOR
+// waits for the resources the call created and not for the ones the
+// definition already had.
+func (p *Placer) PlaceDeployed(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (Placement, error) {
+	var created []string
+
+	return p.place(ctx, rdName, filter, &created)
 }
 
 // PlaceCreating is Place that also names the nodes it created a replica
@@ -191,12 +213,15 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 func (p *Placer) PlaceCreating(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) ([]string, int, int, error) {
 	var created []string
 
-	placed, want, err := p.place(ctx, rdName, filter, &created)
+	res, err := p.place(ctx, rdName, filter, &created)
 
-	return created, placed, want, err
+	return created, res.Placed, res.Want, err
 }
 
-func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, created *[]string) (int, int, error) {
+// place runs one placement. created receives the nodes the call
+// created a replica on, which is narrower than Placement.Deployed: a
+// witness promoted in place is deployed to but not created.
+func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, created *[]string) (Placement, error) {
 	defer lockDefinition(rdName)()
 
 	// Bug 038: an RD born from a snapshot restore / clone must never
@@ -208,7 +233,7 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 
 	plan, err := p.buildPlan(ctx, rdName, filter)
 	if err != nil {
-		return 0, 0, err
+		return Placement{}, err
 	}
 
 	defer func() {
@@ -221,7 +246,7 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 		// Fail-fast: no pool can host the largest volume. Surface the
 		// actionable error so REST returns 409 instead of 200 + a
 		// downstream satellite failure (Bug 35 / 7.15 e2e).
-		return 0, int(filter.PlaceCount), plan.shortfallError()
+		return Placement{Want: int(filter.PlaceCount)}, plan.shortfallError()
 	}
 
 	placed := countDiskfulReplicas(plan.existing, plan.disabled)
@@ -231,46 +256,22 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.preferred, placed, want)
 	if err != nil {
-		return placed, want, err
+		return plan.state.placement(placed, want), err
 	}
 
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.lastResort, placed, want)
 	if err != nil {
-		return placed, want, err
+		return plan.state.placement(placed, want), err
 	}
 
 	if filter.DisklessOnRemaining && placed >= want {
 		err = p.placeDisklessOnRemaining(ctx, rdName, plan.state)
 		if err != nil {
-			return placed, want, err
+			return plan.state.placement(placed, want), err
 		}
 	}
 
-	// Partial-shortfall path (Bug 35 + scenarios 7.W10 / 7.W11): the
-	// diskful loop ran out of candidates because the capacity or
-	// over-subscription gate dropped pools that would otherwise have
-	// qualified. Surface the actionable error so the REST 409 names
-	// the missing capacity OR the over-subscription cap. We only fire
-	// when one of those gates was actually the rejecter; a shortfall
-	// caused purely by topology/anti-affinity still falls through to
-	// the generic "not enough candidate storage pools" path.
-	//
-	// Precedence: physical floor (maxFreeKib > 0) wins over oversub —
-	// see the capacityShortfall branch above for the rationale.
-	if placed < want && plan.requiredKib > 0 {
-		if plan.maxFreeKib > 0 {
-			return placed, want, &CapacityShortfallError{
-				RequiredKib: plan.requiredKib,
-				MaxFreeKib:  plan.maxFreeKib,
-			}
-		}
-
-		if plan.oversubShortfall != nil {
-			return placed, want, plan.oversubShortfall
-		}
-	}
-
-	return placed, want, nil
+	return plan.state.placement(placed, want), plan.partialShortfall(placed, want)
 }
 
 // placePlan bundles everything Place needs after the read-side
@@ -320,6 +321,36 @@ func (pl *placePlan) shortfallError() error {
 	}
 }
 
+// partialShortfall is the error a placement that fell short of want
+// returns (Bug 35 + scenarios 7.W10 / 7.W11): the diskful loop ran out
+// of candidates because the capacity or over-subscription gate dropped
+// pools that would otherwise have qualified, so the REST 409 names the
+// missing capacity OR the over-subscription cap. It is nil when
+// neither gate was the rejecter; a shortfall caused purely by
+// topology/anti-affinity still falls through to the generic "not
+// enough candidate storage pools" path.
+//
+// Precedence: physical floor (maxFreeKib > 0) wins over oversub, see
+// the capacityShortfall branch of place for the rationale.
+func (pl *placePlan) partialShortfall(placed, want int) error {
+	if placed >= want || pl.requiredKib <= 0 {
+		return nil
+	}
+
+	if pl.maxFreeKib > 0 {
+		return &CapacityShortfallError{
+			RequiredKib: pl.requiredKib,
+			MaxFreeKib:  pl.maxFreeKib,
+		}
+	}
+
+	if pl.oversubShortfall != nil {
+		return pl.oversubShortfall
+	}
+
+	return nil
+}
+
 // buildPlan does the read-side legwork: load VDs, candidate pools,
 // existing resources, disabled / node-prop maps, and the topology-
 // partitioned candidate buckets. When the capacity gate has already
@@ -361,6 +392,11 @@ func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.
 	existing, err := store.LiveReplicas(ctx, p.store, rdName)
 	if err != nil {
 		return nil, errors.Wrap(err, "list resources by definition")
+	}
+
+	candidates, err = p.filterByBlockSize(ctx, rdName, existing, candidates)
+	if err != nil {
+		return nil, err
 	}
 
 	disabled, err := p.disabledNodes(ctx)
@@ -525,6 +561,7 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 		}
 
 		if err == nil {
+			state.deployed = append(state.deployed, nodeName)
 			state.created = append(state.created, nodeName)
 		}
 
@@ -585,6 +622,15 @@ type state struct {
 	// exact transition pkg/rest.promoteDisklessReplica performs for the
 	// explicit `r c <node> --storage-pool` toggle-disk path.
 	upgradeable map[string]string
+	// deployed lists, in order, the nodes this call created a replica
+	// on or promoted a witness on. A Create that found the replica
+	// already there does not count.
+	deployed []string
+}
+
+// placement renders the call's result.
+func (s *state) placement(placed, want int) Placement {
+	return Placement{Placed: placed, Want: want, Deployed: s.deployed}
 }
 
 func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string, pools []apiv1.StoragePool, allowPoolDriverMixing bool) *state {
@@ -771,13 +817,22 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		return false, nil
 	}
 
-	err := s.writeReplica(ctx, st, rdName, pool)
+	created, err := s.writeReplica(ctx, st, rdName, pool)
 	if errors.Is(err, errReplicaTerminating) {
 		return false, nil
 	}
 
 	if err != nil {
 		return false, err
+	}
+
+	// A witness taken over, whether seen before the placement or found
+	// by the create, is deployed to but not created: the autoplace
+	// waits for it, and a caller taking back what this call created
+	// leaves it alone.
+	s.deployed = append(s.deployed, pool.NodeName)
+	if created {
+		s.created = append(s.created, pool.NodeName)
 	}
 
 	s.taken[naming.Key(pool.NodeName)] = struct{}{}
@@ -827,9 +882,9 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 // `r c <node> --storage-pool` toggle-disk path performs via
 // pkg/rest.promoteDisklessReplica. A create that finds a replica
 // written since newState goes through takeOverReplicaWrittenMeanwhile.
-func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
+func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) (bool, error) {
 	if _, isWitness := s.upgradeable[naming.Key(pool.NodeName)]; isWitness {
-		return s.promoteWitness(ctx, st, rdName, pool)
+		return false, s.promoteWitness(ctx, st, rdName, pool)
 	}
 
 	res := apiv1.Resource{
@@ -840,16 +895,14 @@ func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string,
 
 	err := st.Resources().Create(ctx, &res)
 	if err == nil {
-		s.created = append(s.created, pool.NodeName)
-
-		return nil
+		return true, nil
 	}
 
 	if errors.Is(err, store.ErrAlreadyExists) {
 		err = s.takeOverReplicaWrittenMeanwhile(ctx, st, rdName, pool)
 	}
 
-	return errors.Wrap(err, "create resource")
+	return false, errors.Wrap(err, "create resource")
 }
 
 // promoteWitness converts the diskless witness already on pool.NodeName

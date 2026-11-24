@@ -18,6 +18,8 @@ limitations under the License.
 
 package v1
 
+import "strings"
+
 // ApplyLayerStack re-stamps a Resource's `LayerObject` chain and every
 // volume's `LayerDataList` from the supplied RD-resolved layer stack.
 //
@@ -44,12 +46,22 @@ package v1
 //     layer, matching the upstream LINSTOR wire shape the Python CLI's
 //     `_walk(layer_data, type==LUKS)` predicate relies on for State /
 //     `--faulty` rendering.
+//   - A stack topped by STORAGE clears `state.in_use`. Nothing observes
+//     whether a bare storage volume is open: blockstor learns InUse
+//     from DRBD role events alone, so the `false` the store projects
+//     for such a replica was never observed, and upstream LINSTOR
+//     reports the same replica's usage as unknown. Left in place, the
+//     Usage column read `Unused` for a volume a pod may be writing to.
 func ApplyLayerStack(r *Resource, stack []string) {
 	if r == nil || len(stack) == 0 {
 		return
 	}
 
 	r.LayerObject = rebuildLayerObject(r.LayerObject, stack)
+
+	if strings.EqualFold(stack[0], LayerKindStorage) {
+		r.State.InUse = nil
+	}
 }
 
 // ApplyLayerStackToVolumes rewrites each volume's `layer_data_list`

@@ -1,6 +1,7 @@
 {
 "items": [
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "pool_dsp_name": "DfltDisklessStorPool",
 "pool_name": "DFLTDISKLESSSTORPOOL",
@@ -8,6 +9,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "pool_dsp_name": "data",
 "pool_name": "DATA",
@@ -15,6 +17,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "pool_dsp_name": "fast",
 "pool_name": "FAST",

@@ -86,6 +86,12 @@ type Server struct {
 	// reader, so the passphrase rotation also lists definitions through it.
 	SecretReader client.Reader
 
+	// SnapshotTakeWait bounds how long a snapshot create holds its answer
+	// for the take to settle, as LINSTOR's does; see the constant of the
+	// same name. Zero answers at once, which tests without a controller
+	// rely on.
+	SnapshotTakeWait time.Duration
+
 	// StateReader reads the ControllerConfig and the Secrets the
 	// encryption state of the resource view is derived from. The view is
 	// polled, by linstor-csi among others, so production wires a
@@ -159,6 +165,21 @@ type Server struct {
 	// invokes the callback inline on its own goroutine and any
 	// blocking work delays the serve loop entry.
 	OnReady func()
+
+	// ResourceReadyWait bounds how long a resource create or autoplace
+	// waits for the replicas it deployed to become ready before it
+	// answers, as LINSTOR waits for its satellites before it answers
+	// a resource create. Zero answers at once, which unit tests that
+	// run no satellite rely on; the binaries set
+	// DefaultResourceReadyWait.
+	ResourceReadyWait time.Duration
+
+	// ResourceDeployWait bounds how long a resource create or autoplace
+	// waits for the satellites to build the replicas it deployed, the
+	// step LINSTOR takes before it waits for them to become ready. It
+	// only applies while ResourceReadyWait is set. Zero skips it; the
+	// binaries set DefaultResourceDeployWait.
+	ResourceDeployWait time.Duration
 
 	// eventBrokersInit gates the lazy initialisation of the SSE
 	// brokers below. The two brokers back `/v1/events/drbd/promotion`

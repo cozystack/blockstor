@@ -50,9 +50,11 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite"
@@ -127,7 +129,7 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 // distinct key (`blockstor.org/resource`) so the
 // two paths coexist during the Phase 10.6 cutover without
 // stepping on each other.
-const SatelliteResourceFinalizer = "blockstor.org/satellite-resource"
+const SatelliteResourceFinalizer = finalizers.SatelliteResource
 
 // resourceKind is the apiserver Kind for the blockstor Resource
 // CRD. Defined once so SSA Patch payloads in this package share
@@ -158,13 +160,15 @@ type ResourceReconciler struct {
 	// process ahead of every other pass (bringUpQueue). SetupWithManager
 	// creates it.
 	bringUp *bringUpTracker
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
-// Reconcile reads a Resource and drives the satellite-side
-// apply chain when the Resource is placed on this node.
-// Finalizer-aware: stamps `SatelliteResourceFinalizer` on
-// every live Resource so kube-apiserver waits for our tear-down
-// before allowing the object to disappear.
+// Reconcile runs one pass of reconcileResource, retries one that lost
+// an optimistic-concurrency race instead of reporting it as an error
+// (see conflict.Retrier), and settles the queue priority of the
+// result.
 //
 // Every retry (a failed apply, an error, a wait on the allocator, work
 // a pass put off) is pinned to normal priority: controller-runtime
@@ -172,12 +176,12 @@ type ResourceReconciler struct {
 // first seen in the informer's initial list would be retried at low
 // priority, behind every other replica of the start-up.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	result, err := r.reconcileResource(ctx, req)
+	result, err := r.conflicts.Reconcile(ctx, req, r.reconcileResource)
 	if result.Priority == nil {
 		result.Priority = normalPriority()
 	}
 
-	return result, err
+	return result, err //nolint:wrapcheck // the pass's own error, already wrapped
 }
 
 // applyFailureRequeue is the backoff between satellite Apply
@@ -271,6 +275,8 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(siblingWatchPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRD))).
+		Watches(&blockstoriov1alpha1.ResourceGroup{},
+			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRG))).
 		Named("satellite-resource").
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.Config.resourceWorkers(),
@@ -338,8 +344,11 @@ func (r *ResourceReconciler) watchDrift(mgr ctrl.Manager, bldr *builder.Builder)
 	), drift
 }
 
-// reconcileResource is the body of Reconcile, which only settles the
-// queue priority of the result.
+// reconcileResource reads a Resource and drives the satellite-side
+// apply chain when the Resource is placed on this node.
+// Finalizer-aware: stamps `SatelliteResourceFinalizer` on
+// every live Resource so kube-apiserver waits for our tear-down
+// before allowing the object to disappear.
 func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("resource", req.Name)
 
@@ -602,6 +611,37 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 	return nil
 }
 
+// enqueueResourcesForRG maps a ResourceGroup event to the local
+// Resources whose definition is in that group. A group's props and its
+// volume groups' props reach the .res (Resolve, VolumeDiskOptions), so
+// `linstor rg sp` or `linstor vg sp`, block-size on a volume group say,
+// has to re-render the replicas it applies to rather than wait for an
+// unrelated reconcile to pick it up.
+func (r *ResourceReconciler) enqueueResourcesForRG(ctx context.Context, obj client.Object) []reconcile.Request {
+	rg, ok := obj.(*blockstoriov1alpha1.ResourceGroup)
+	if !ok {
+		return nil
+	}
+
+	var rdList blockstoriov1alpha1.ResourceDefinitionList
+
+	err := r.List(ctx, &rdList)
+	if err != nil {
+		return nil
+	}
+
+	var reqs []reconcile.Request
+
+	for i := range rdList.Items {
+		rd := &rdList.Items[i]
+		if rd.Spec.ResourceGroupName != "" && naming.Same(rd.Spec.ResourceGroupName, rg.Name) {
+			reqs = append(reqs, r.enqueueResourcesForRD(ctx, rd)...)
+		}
+	}
+
+	return reqs
+}
+
 // runApply gates on the controller-side allocation, builds the
 // DesiredResource for this satellite, and drives the apply chain.
 // Returns RequeueAfter when allocation is stale or any per-resource
@@ -609,15 +649,9 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 // up. Pulled out of Reconcile to keep the orchestration under the
 // cyclomatic / funlen budgets.
 func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, error) {
-	var rd blockstoriov1alpha1.ResourceDefinition
-
-	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-
-		return ctrl.Result{}, errors.Wrap(err, "get parent RD")
+	rd, found, err := r.definitionForApply(ctx, res, logger)
+	if !found || err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Read peer Resources fresh via APIReader (uncached). The c-r
@@ -650,7 +684,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// election relies on (Bug 80).
 	adoptAuthoritativeFlags(res, peers)
 
-	err = r.checkLayerStackPinned(ctx, &rd)
+	err = r.checkLayerStackPinned(ctx, rd)
 	if errors.Is(err, errLayerStackNotPinned) {
 		logger.Info("waiting for the controller to pin the layer stack", "rd", rd.Name)
 
@@ -666,13 +700,13 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// renders no .res and the kernel never sees a node-id, so waiting
 	// for the controller to stamp Status.DRBDNodeID/Port/Minor would
 	// block apply forever — they never come.
-	if rdNeedsDRBD(&rd) {
-		if waitResult, waitOK := r.prepareDRBDApply(ctx, res, &rd, peers, logger); !waitOK {
+	if rdNeedsDRBD(rd) {
+		if waitResult, waitOK := r.prepareDRBDApply(ctx, res, rd, peers, logger); !waitOK {
 			return waitResult, nil
 		}
 	}
 
-	desired, err := r.buildDesiredFromCRD(ctx, res, &rd, peers)
+	desired, err := r.buildDesiredFromCRD(ctx, res, rd, peers)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -685,8 +719,9 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	retry, retryAsked := r.Config.Apply.TakeRetry(desired.GetName())
 
 	anyFailed := r.recordPerResourceFailures(res, results, logger)
+	r.recordDroppedOptions(res, results)
 
-	stampFailed := r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
+	stampFailed := r.stampPostApply(ctx, res, rd, results, anyFailed, logger)
 
 	return ctrl.Result{RequeueAfter: applyRequeue(results, anyFailed, stampFailed, retry, retryAsked)}, nil
 }
@@ -774,7 +809,7 @@ func (r *ResourceReconciler) prepareDRBDApply(
 		rd.Name,
 		peerExpectationFor(res, peers),
 		volNumsOf(rd),
-		nil, // devices unknown at this layer; forget-peer skipped per-vol
+		nil, // devices unknown here: Pass 1 still forgets, Pass 3 does not
 	)
 	if pruneErr != nil {
 		logger.Error(pruneErr, "PruneStaleKernelSlots failed; continuing to allocation gate")
@@ -864,6 +899,29 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 	}
 
 	return anyFailed
+}
+
+// droppedOptionReason is the Event reason for an option the satellite left
+// out of a replica's .res.
+const droppedOptionReason = "DrbdOptionIgnored"
+
+// recordDroppedOptions reports each option the satellite left out of the
+// replica's .res as a Warning Event on the Resource. The option is one
+// drbdadm would refuse, so leaving it out keeps the rest of the
+// configuration applying, but the operator set it and it does not take
+// effect; a satellite log line is not where they would look for why. The
+// recorder folds a repeat of the same Event into its count.
+func (r *ResourceReconciler) recordDroppedOptions(res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult) {
+	if r.Config.Recorder == nil {
+		return
+	}
+
+	for _, result := range results {
+		for _, why := range result.DroppedOptions {
+			r.Config.Recorder.Eventf(res, nil, corev1.EventTypeWarning, droppedOptionReason, "Apply",
+				"option left out of the .res, drbdadm would refuse it: %s", why)
+		}
+	}
 }
 
 // recordApplyFailure keeps Status.ApplyFailure in step with the pass
@@ -1558,6 +1616,15 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 
 	desired := dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps)
 
+	volumeDisk, err := effectiveprops.VolumeDiskOptions(ctx, r.Client, target, rd, effectiveProps)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve volume disk options")
+	}
+
+	for _, vol := range desired.Volumes {
+		vol.DiskOptions = volumeDisk[vol.VolumeNumber]
+	}
+
 	// Phase 11.3 Stage 1: carry the `MetadataCreated=True` Status
 	// Condition from the Resource CRD into the apply chain so the
 	// satellite reconciler's `firstActivation` predicate (and the
@@ -1806,6 +1873,62 @@ func (r *ResourceReconciler) waitForControllerAllocation(ctx context.Context, re
 	return ctrl.Result{}, true
 }
 
+// definitionForApply reads the replica's definition, past the cache
+// while the replica has never been applied here (see
+// refreshDefinitionForFirstApply). A definition that is gone is not
+// found and no error: there is nothing to apply.
+func (r *ResourceReconciler) definitionForApply(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger,
+) (*blockstoriov1alpha1.ResourceDefinition, bool, error) {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+
+		return nil, false, errors.Wrap(err, "get parent RD")
+	}
+
+	r.refreshDefinitionForFirstApply(ctx, res, &rd, logger)
+
+	return &rd, true, nil
+}
+
+// refreshDefinitionForFirstApply replaces the cached definition with the
+// API server's copy while the replica has never been applied here. The
+// controller writes the volume block size onto the definition before it
+// gives the replica its DRBD identity, but the two objects reach this
+// satellite through separate watches, so the cached definition can still
+// predate the size when the identity arrives. The first apply attaches
+// the device, and drbdsetup never changes the block size of an attached
+// device, so a size read late is a size lost until the next detach. A
+// failed read keeps the cached copy.
+func (r *ResourceReconciler) refreshDefinitionForFirstApply(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, logger logr.Logger,
+) {
+	if _, applied := res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]; applied {
+		return
+	}
+
+	reader := r.peerReader()
+	if reader == nil {
+		return
+	}
+
+	var fresh blockstoriov1alpha1.ResourceDefinition
+
+	err := reader.Get(ctx, client.ObjectKey{Name: rd.Name}, &fresh)
+	if err != nil {
+		logger.V(1).Info("definition refresh before the first apply failed; using the cached copy", "err", err.Error())
+
+		return
+	}
+
+	*rd = fresh
+}
+
 // refreshTargetFromAPIReader does an uncached Get on the target
 // Resource and overwrites `res` in place when the APIReader reports
 // non-nil DRBD-IDs. Returns true iff every DRBD-ID is now populated,
@@ -1903,9 +2026,9 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //  4. Storage Provider's DeleteVolume is idempotent on missing
 //     volumes — a second handleDelete pass after a partial first
 //     pass (DeleteResource succeeded, Update failed) re-issues
-//     the storage tear-down safely. Bug 43's storage sweeper is
-//     the wider-scope backstop; this ordering fix is the
-//     per-resource source-of-truth path.
+//     the storage tear-down safely. Nothing else deletes the
+//     storage: the finalizer stays until DeleteResource reports
+//     that every volume is gone.
 //
 // Phase 10.1. Once Phase 10.6 retires the gRPC contract,
 // `internal/controller.ResourceReconciler.runDelete` and its
@@ -1929,6 +2052,19 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 		Name:          naming.Key(res.Spec.ResourceDefinitionName),
 		StoragePool:   resolveDeleteStoragePool(res),
 		VolumeNumbers: volumeNumbers,
+	}
+
+	if res.Annotations[finalizers.StorageAbandoned] != "" {
+		// `node lost` removed this replica because the node is gone;
+		// LINSTOR leaves the storage of a lost node in place, and so
+		// does a satellite that turns out to be running after all: it
+		// tears down DRBD and keeps the volumes.
+		req.StoragePool = ""
+	} else {
+		req.DeletedSuffix, err = r.recordRenameSuffix(ctx, res)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	resp, err := r.Config.Apply.DeleteResource(ctx, req)
@@ -1995,7 +2131,7 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 
 // lookupVolumeNumbers resolves the per-RD volume-number set the
 // satellite's DeleteResource walks to drop matching LVs / loopfiles.
-// It tries three sources in descending order of authority:
+// It joins three sources:
 //
 //  1. The parent RD's VolumeDefinitions (the source of truth while
 //     the RD CRD still exists).
@@ -2025,29 +2161,30 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 func (r *ResourceReconciler) lookupVolumeNumbers(ctx context.Context, res *blockstoriov1alpha1.Resource) ([]int32, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
+	var fromRD []int32
+
 	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
-	if err == nil {
-		out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
+
+	switch {
+	case err == nil:
 		for i := range rd.Spec.VolumeDefinitions {
-			out = append(out, rd.Spec.VolumeDefinitions[i].VolumeNumber)
+			fromRD = append(fromRD, rd.Spec.VolumeDefinitions[i].VolumeNumber)
 		}
-
-		return out, nil
-	}
-
-	if !apierrors.IsNotFound(err) {
+	case !apierrors.IsNotFound(err):
 		return nil, errors.Wrap(err, "get parent RD for delete")
 	}
 
-	// Source 2: the annotation stamped on the last successful apply.
-	if nums := parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]); len(nums) > 0 {
-		return nums, nil
-	}
+	// The three sources are joined rather than tried in turn: a volume any
+	// of them names belongs to this replica, and one the delete skips is
+	// left on disk with nothing to delete it later. Deleting a volume that
+	// is already gone is a no-op.
+	nums := slices.Concat(fromRD,
+		parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]),
+		volumeNumbersFromStatus(res))
+	slices.Sort(nums)
+	nums = slices.Compact(nums)
 
-	// Source 3: the observer-stamped Status.Volumes. Covers the
-	// rolling-deploy race where the delete fires before the first
-	// apply stamped the annotation.
-	if nums := volumeNumbersFromStatus(res); len(nums) > 0 {
+	if len(nums) > 0 {
 		return nums, nil
 	}
 

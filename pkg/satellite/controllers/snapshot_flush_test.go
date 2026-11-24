@@ -85,7 +85,7 @@ func TestSnapshotReconcileFlushesBackingDeviceBeforeCreate(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-1",

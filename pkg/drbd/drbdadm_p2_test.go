@@ -244,3 +244,31 @@ func TestAdmGetGIInvokesDrbdmeta(t *testing.T) {
 		t.Errorf("GetGI: got %q, want trimmed tuple", tuple)
 	}
 }
+
+// TestAdmKernelCurrentGIInvokesDrbdsetup pins the kernel read:
+// `drbdsetup get-gi <resource> <peer-node-id> <volume>`, which answers
+// from the device statistics and opens no device, and its parse to
+// the upper-case current UUID.
+func TestAdmKernelCurrentGIInvokesDrbdsetup(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup get-gi pvc-1 2 0", storage.FakeResponse{
+		Stdout: []byte("78a0dddabcdef001:0000000000000000:0:0:1:1:0:0:0:0:0:0:0:0:0:0\n"),
+	})
+	fx.Expect("drbdsetup get-gi pvc-1 3 0", storage.FakeResponse{Err: storage.FakeExitError{Code: 10}})
+
+	adm := drbd.NewAdm(fx)
+
+	current, err := adm.KernelCurrentGI(t.Context(), "pvc-1", 2, 0)
+	if err != nil {
+		t.Fatalf("KernelCurrentGI: %v", err)
+	}
+
+	if current != "78A0DDDABCDEF001" {
+		t.Errorf("KernelCurrentGI: got %q, want 78A0DDDABCDEF001", current)
+	}
+
+	_, err = adm.KernelCurrentGI(t.Context(), "pvc-1", 3, 0)
+	if err == nil {
+		t.Errorf("KernelCurrentGI: no error for a peer device drbdsetup does not know")
+	}
+}

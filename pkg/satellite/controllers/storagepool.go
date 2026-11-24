@@ -31,6 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -40,7 +42,7 @@ import (
 // registered on this satellite. Strips on delete so the
 // apiserver finalises only after the in-memory provider has
 // been deregistered. Phase 10.8.
-const StoragePoolFinalizer = "blockstor.org/satellite-storagepool"
+const StoragePoolFinalizer = finalizers.SatelliteStoragePool
 
 // capacityResyncInterval is the cadence the StoragePoolReconciler
 // reschedules itself at to refresh `Status.FreeCapacity` /
@@ -61,13 +63,24 @@ type StoragePoolReconciler struct {
 	client.Client
 
 	Config Config
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
-// Reconcile materialises one StoragePool. Idempotent —
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *StoragePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass) //nolint:wrapcheck // the pass's own error, already wrapped
+}
+
+// ReconcilePass materialises one StoragePool. Idempotent —
 // re-registering an already-registered provider replaces the
 // in-memory entry, which is the desired behaviour after a pool
 // config edit.
-func (r *StoragePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *StoragePoolReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("storagepool", req.Name)
 
 	var pool blockstoriov1alpha1.StoragePool

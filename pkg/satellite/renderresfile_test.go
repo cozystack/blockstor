@@ -83,7 +83,7 @@ func TestRenderResFileWritesBody(t *testing.T) {
 
 	autoDisk := rec.autoDiskOptionsForResource(context.Background(), dr, devices)
 
-	want, err := buildResFile(dr, rec.cfg.NodeName, rec.cfg.LocalAddress, devices, autoDisk)
+	want, err := buildResFile(dr, rec.cfg.NodeName, rec.cfg.LocalAddress, devices, autoDisk, nil)
 	if err != nil {
 		t.Fatalf("buildResFile: %v", err)
 	}

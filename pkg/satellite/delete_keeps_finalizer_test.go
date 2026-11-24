@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package satellite_test
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/satellite/intent"
+	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/storage/lvm"
+)
+
+var errVGBusy = errors.New("exit status 5: Volume group vg is locked by another process")
+
+// DeleteResource answers Ok only once the storage is gone, because Ok is what
+// releases the satellite finalizer and nothing deletes the volume after that.
+// A pool that is not registered yet (a satellite that just started) cannot
+// delete anything, so the answer is not Ok.
+func TestDeleteResourceWithAnUnregisteredPoolIsNotOk(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		StateDir:  t.TempDir(),
+		NodeName:  "n1",
+	})
+
+	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{
+		Name:          "pvc-a",
+		StoragePool:   "thin1",
+		VolumeNumbers: []int32{0},
+	})
+	if err != nil {
+		t.Fatalf("DeleteResource: %v", err)
+	}
+
+	if resp.GetOk() {
+		t.Fatalf("DeleteResource Ok=true with pool thin1 unregistered; the finalizer would go over a volume still on disk")
+	}
+
+	if !strings.Contains(resp.GetMessage(), "thin1") {
+		t.Errorf("message %q does not name the pool", resp.GetMessage())
+	}
+
+	if got := fx.CommandLines(); len(got) != 0 {
+		t.Errorf("commands ran: %v", got)
+	}
+}
+
+// A provider probe that fails is not "volume gone" either.
+func TestDeleteResourceWithAFailingProbeIsNotOk(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-a_00000",
+		storage.FakeResponse{Err: errVGBusy})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)},
+		StateDir:  t.TempDir(),
+		NodeName:  "n1",
+	})
+
+	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{
+		Name:          "pvc-a",
+		StoragePool:   "thin1",
+		VolumeNumbers: []int32{0},
+	})
+	if err != nil {
+		t.Fatalf("DeleteResource: %v", err)
+	}
+
+	if resp.GetOk() {
+		t.Fatalf("DeleteResource Ok=true on a failed probe")
+	}
+}
+
+// A diskless replica has no pool and nothing to delete: still Ok.
+func TestDeleteResourceDisklessIsOk(t *testing.T) {
+	t.Parallel()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		StateDir:  t.TempDir(),
+		NodeName:  "n1",
+	})
+
+	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{Name: "pvc-a"})
+	if err != nil {
+		t.Fatalf("DeleteResource: %v", err)
+	}
+
+	if !resp.GetOk() {
+		t.Fatalf("diskless DeleteResource Ok=false: %s", resp.GetMessage())
+	}
+}
+
+// Turning a replica diskless reclaims its volume through the historical pool.
+// A pool that is not registered cannot reclaim anything, and nothing reclaims
+// the volume later, so the toggle fails and is retried instead of skipping it.
+func TestDisklessToggleWithAnUnregisteredPoolFails(t *testing.T) {
+	t.Parallel()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		StateDir:  t.TempDir(),
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{{
+		Name:     "pvc-a",
+		NodeName: "n1",
+		Flags:    []string{"DISKLESS"},
+		Volumes:  []*intent.DesiredVolume{{VolumeNumber: 0, SizeKib: 1024, StoragePool: "thin1"}},
+	}})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || results[0].GetOk() || !strings.Contains(results[0].GetMessage(), "thin1") {
+		t.Errorf("Apply results %+v, want one failure naming pool thin1", results)
+	}
+}
+
+const snapLVLookupVG1 = "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg1/pvc-a_s1_00000"
+
+// A replica that moved to another pool on this node left its snapshot in the
+// pool it moved from. The snapshot delete looks in every pool of the node,
+// not only the one the replica is in now, or it would answer Ok over a copy
+// still on disk.
+func TestDeleteSnapshotSearchesEveryPoolOfTheNode(t *testing.T) {
+	t.Parallel()
+
+	fx1 := storage.NewFakeExec()
+	fx1.Expect(snapLVLookupVG1, storage.FakeResponse{Stdout: []byte("pvc-a_s1_00000\n")})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{
+			"thin1": lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg1", ThinPool: "tp"}, fx1),
+			"thin2": lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg2", ThinPool: "tp"}, storage.NewFakeExec()),
+		},
+		NodeName: "n1",
+	})
+	rec.RememberPoolForTest("pvc-a", "thin2")
+
+	resp, err := rec.DeleteSnapshot(t.Context(), &intent.DeleteSnapshotRequest{
+		ResourceName: "pvc-a",
+		SnapshotName: "s1",
+		StoragePools: []string{"thin1", "thin2"},
+	})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteSnapshot: err=%v resp=%+v", err, resp)
+	}
+
+	removed := false
+
+	for _, line := range fx1.CommandLines() {
+		if strings.HasPrefix(line, "lvremove ") && strings.HasSuffix(line, "vg1/pvc-a_s1_00000") {
+			removed = true
+		}
+	}
+
+	if !removed {
+		t.Errorf("the copy in the pool the replica moved from was not deleted: %v", fx1.CommandLines())
+	}
+}
+
+// A node with no diskful pool left has nowhere to hold a copy, so a snapshot
+// delete there is done. Answering not Ok would keep the node's hold on the
+// Snapshot for good once its pool was removed.
+func TestDeleteSnapshotOnANodeWithoutPoolsIsOk(t *testing.T) {
+	t.Parallel()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		NodeName:  "n1",
+	})
+
+	resp, err := rec.DeleteSnapshot(t.Context(), &intent.DeleteSnapshotRequest{ResourceName: "pvc-a", SnapshotName: "s1"})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteSnapshot with no pools: err=%v resp=%+v, want Ok", err, resp)
+	}
+}
