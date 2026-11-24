@@ -7099,6 +7099,117 @@ func TestApplyRecoversBitmapBothDisksWithoutDown(t *testing.T) {
 	}
 }
 
+// staleDisklessPeerStatus is `drbdsetup status -j pvc-tb-relocate`
+// after an earlier pass hit the refusal and its recovery did not
+// finish: node-id 2 (n3), which the .res names diskless, sits
+// StandAlone with its peer device registered and the peer disk read as
+// peerDisk from the stale metadata slot.
+func staleDisklessPeerStatus(peerDisk string) []byte {
+	return []byte(`[{"name":"pvc-tb-relocate","connections":[
+  {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"peer-node-id":2,"name":"n3","connection-state":"StandAlone","peer_devices":[{"volume":0,"peer-disk-state":"` + peerDisk + `"}]}
+]}]`)
+}
+
+// applyOverStandAlonePeer runs Apply on n1, whose kernel shows n3 as
+// statusJSON describes, and returns the commands it issued. n3 is
+// diskless in the intent. The first plain adjust is refused for
+// node-id 2 and the next succeeds; an adjust --skip-net succeeds.
+func applyOverStandAlonePeer(t *testing.T, statusJSON []byte) []string {
+	t.Helper()
+
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	lvName := "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-tb-relocate_00000"
+
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-tb-relocate",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"peer.n3.diskless": "true",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil || len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply (first activation): err=%v results=%+v", err, results)
+	}
+
+	fx.Reset()
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("pvc-tb-relocate_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-tb-relocate_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-tb-relocate_00000|1048576\n")})
+	fx.Expect("drbdsetup status pvc-tb-relocate", storage.FakeResponse{
+		Stdout: []byte("pvc-tb-relocate role:Primary\n  volume:0 disk:UpToDate open:yes\n"),
+	})
+	fx.Expect("drbdsetup status -j pvc-tb-relocate", storage.FakeResponse{Stdout: statusJSON})
+	fx.ExpectSequence("drbdadm adjust pvc-tb-relocate",
+		storage.FakeResponse{Err: errDrbdadmAdjust162BitmapBothDisks},
+		storage.FakeResponse{})
+	fx.Expect("drbdadm adjust --skip-net pvc-tb-relocate", storage.FakeResponse{})
+
+	_, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (StandAlone peer): %v", err)
+	}
+
+	return fx.CommandLines()
+}
+
+// TestApplyDoesNotLatchSkipNetOnAStaleDisklessPeer: a pass that hit the
+// bitmap refusal and did not finish its recovery (a failed del-peer or
+// adjust, a satellite restart) leaves the diskless peer StandAlone with
+// its peer device registered, the way an operator's disconnect does.
+// The next pass must still run a full adjust, so the refusal and the
+// recovery fire again, instead of adjusting with --skip-net and leaving
+// the peer cut off for good.
+func TestApplyDoesNotLatchSkipNetOnAStaleDisklessPeer(t *testing.T) {
+	cmds := applyOverStandAlonePeer(t, staleDisklessPeerStatus("Outdated"))
+
+	for _, line := range cmds {
+		if strings.Contains(line, "--skip-net") {
+			t.Errorf("adjusted with --skip-net over the stale slot: %q in %v", line, cmds)
+		}
+	}
+
+	mustContainLine(t, cmds, "drbdsetup del-peer pvc-tb-relocate 2")
+	mustContainLine(t, cmds, "drbdsetup forget-peer pvc-tb-relocate 2")
+}
+
+// TestApplyKeepsSkipNetForADisconnectedDisklessPeer: an operator who
+// disconnected a diskless peer leaves it StandAlone with its peer disk
+// DUnknown. That disconnect is still honoured with --skip-net and the
+// peer is neither dropped nor forgotten.
+func TestApplyKeepsSkipNetForADisconnectedDisklessPeer(t *testing.T) {
+	cmds := applyOverStandAlonePeer(t, staleDisklessPeerStatus("DUnknown"))
+
+	mustContainLine(t, cmds, "drbdadm adjust --skip-net pvc-tb-relocate")
+
+	for _, line := range cmds {
+		if strings.Contains(line, "del-peer") || strings.Contains(line, "forget-peer") {
+			t.Errorf("an operator's disconnect was undone: %q in %v", line, cmds)
+		}
+	}
+}
+
 // mustContainLine fails t unless want is one of the command lines.
 func mustContainLine(t *testing.T, cmds []string, want string) {
 	t.Helper()

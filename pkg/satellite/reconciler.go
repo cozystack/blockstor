@@ -5723,7 +5723,7 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	skipNet := r.shouldSkipNetOnAdjust(ctx, dr.GetName())
+	skipNet := r.shouldSkipNetOnAdjust(ctx, dr)
 
 	err := r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
 	if err == nil {
@@ -5806,7 +5806,7 @@ func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.
 	// The dropped slots no longer count toward --skip-net, so the
 	// adjust re-adds their peers unless another peer is held
 	// StandAlone on purpose.
-	err = r.dispatchAdjust(ctx, dr.GetName(), skipDisk, r.shouldSkipNetOnAdjust(ctx, dr.GetName()))
+	err = r.dispatchAdjust(ctx, dr.GetName(), skipDisk, r.shouldSkipNetOnAdjust(ctx, dr))
 	if err != nil {
 		return errors.Wrapf(err, "adjust %s (after forgetting peer slots %v)", dr.GetName(), dropped)
 	}
@@ -5923,19 +5923,26 @@ func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDi
 // re-issues `drbdsetup connect` and unwedges scenario 5.32
 // (`tests/e2e/recovery-down-reverses.sh`).
 //
+// A StandAlone slot the bitmap refusal left behind is not counted
+// either; see isStaleDisklessPeerSlot.
+//
 // Best-effort: a probe error returns false so adjust falls through
 // to the existing full-adjust path (failing closed would freeze
 // adjust on any transient drbdsetup hiccup). The probe is
 // per-resource, so a healthy peer on a multi-peer RD still gets
 // reconnected when its own slot is in Connecting/Timeout/etc.
-func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string) bool {
-	slots, probeErr := r.cfg.Adm.Show(ctx, resource)
+func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, dr *intent.DesiredResource) bool {
+	slots, probeErr := r.cfg.Adm.Show(ctx, dr.GetName())
 	if probeErr != nil {
 		return false
 	}
 
 	for _, slot := range slots {
 		if slot.ConnectionState != string(drbd.ConnectionStateStandAlone) {
+			continue
+		}
+
+		if isStaleDisklessPeerSlot(dr, slot) {
 			continue
 		}
 		// Recovery-down-reverses disambiguator: a StandAlone slot with
@@ -5950,6 +5957,39 @@ func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string)
 		}
 
 		return true
+	}
+
+	return false
+}
+
+// isStaleDisklessPeerSlot reports whether slot is the StandAlone
+// connection a refused `peer-device-options --bitmap=no` leaves: the
+// .res names the peer diskless, yet the kernel reads a disk for it,
+// because new-peer took Outdated from the metadata slot of the diskful
+// replica that held the node-id before. Adjust stops at the refusal
+// before it connects, so the slot stays StandAlone with its peer
+// devices registered, which is also what an operator's disconnect
+// looks like. Counted toward --skip-net, it kept every later adjust
+// from re-issuing the options, so the refusal, and with it the
+// recovery, never fired again once a recovery had failed or the
+// satellite had restarted in between: the peer stayed cut off for good.
+//
+// An operator's disconnect of a diskless peer never looks like this: a
+// connection that is not established drops a Diskless peer disk to
+// DUnknown (drbd_state.c sanitize_state), so only the stale slot reads
+// Inconsistent or Outdated for a peer the .res names diskless.
+func isStaleDisklessPeerSlot(dr *intent.DesiredResource, slot drbd.KernelSlot) bool {
+	if dr.GetDrbdOptions()["peer."+slot.Name+".diskless"] != drbdBoolPropTrue {
+		return false
+	}
+
+	for _, state := range slot.PeerDiskStates {
+		switch drbd.DiskState(state) {
+		case drbd.DiskStateInconsistent, drbd.DiskStateOutdated,
+			drbd.DiskStateConsistent, drbd.DiskStateUpToDate:
+			return true
+		default:
+		}
 	}
 
 	return false
