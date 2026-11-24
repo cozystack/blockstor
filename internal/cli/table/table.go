@@ -77,8 +77,12 @@ func Render(w io.Writer, tbl *metav1.Table, opts Options) error {
 	// enter the width arithmetic and a painted table lines up exactly
 	// like an unpainted one.
 	rows := make([][]string, 0, len(tbl.Rows))
+	classes := make([][]decided, 0, len(tbl.Rows))
+
 	for i := range tbl.Rows {
-		rows = append(rows, formatRow(tbl.Rows[i].Cells, len(headers)))
+		texts, decisions := formatRow(tbl.Rows[i].Cells, len(headers))
+		rows = append(rows, texts)
+		classes = append(classes, decisions)
 	}
 
 	widths := columnWidths(headers, rows)
@@ -90,14 +94,14 @@ func Render(w io.Writer, tbl *metav1.Table, opts Options) error {
 		buf.WriteString(rule(widths, '-'))
 	}
 
-	buf.WriteString(opts.line(headers, headers, widths, nil))
+	buf.WriteString(opts.line(headers, nil, headers, widths, nil))
 
 	if !opts.Pastable {
 		buf.WriteString(rule(widths, '='))
 	}
 
-	for _, row := range rows {
-		buf.WriteString(opts.line(row, headers, widths, painted))
+	for i, row := range rows {
+		buf.WriteString(opts.line(row, classes[i], headers, widths, painted))
 	}
 
 	if !opts.Pastable {
@@ -113,8 +117,8 @@ func Render(w io.Writer, tbl *metav1.Table, opts Options) error {
 }
 
 // line renders one row, bordered or bare.
-func (o Options) line(cells, headers []string, widths []int, painted map[string]struct{}) string {
-	rendered := line(cells, headers, widths, painted, o.Color)
+func (o Options) line(cells []string, classes []decided, headers []string, widths []int, painted map[string]struct{}) string {
+	rendered := line(cells, classes, headers, widths, painted, o.Color)
 	if !o.Pastable {
 		return rendered
 	}
@@ -142,18 +146,32 @@ func (o Options) stateColumnSet() map[string]struct{} {
 	return set
 }
 
+// decided is the colour class a view chose for one cell, if it chose.
+type decided struct {
+	class color.Class
+	set   bool
+}
+
 // formatRow renders each cell, padding the row out to the header count
 // so a short row cannot shift the field positions the harnesses read.
-func formatRow(cells []any, columns int) []string {
+// A color.Cell also hands back the class its view decided.
+func formatRow(cells []any, columns int) ([]string, []decided) {
 	out := make([]string, columns)
+	classes := make([]decided, columns)
 
 	for i := range out {
-		if i < len(cells) {
-			out[i] = sanitizeCell(formatCell(cells[i]))
+		if i >= len(cells) {
+			continue
+		}
+
+		out[i] = sanitizeCell(formatCell(cells[i]))
+
+		if cell, ok := cells[i].(color.Cell); ok {
+			classes[i] = decided{class: cell.Class, set: true}
 		}
 	}
 
-	return out
+	return out, classes
 }
 
 // asciiEscape starts every ANSI sequence, and asciiDelete is the other
@@ -282,7 +300,10 @@ func rule(widths []int, fill byte) string {
 // colour is wrapped around the value only, so the escapes sit outside
 // the measured region and a painted table lines up with an unpainted
 // one byte for byte once the escapes are stripped.
-func line(cells, headers []string, widths []int, painted map[string]struct{}, paint color.Writer) string {
+func line(
+	cells []string, classes []decided, headers []string, widths []int,
+	painted map[string]struct{}, paint color.Writer,
+) string {
 	var b strings.Builder
 
 	b.WriteByte('|')
@@ -294,7 +315,10 @@ func line(cells, headers []string, widths []int, painted map[string]struct{}, pa
 
 		value := cell
 
-		if painted != nil && i < len(headers) {
+		switch {
+		case i < len(classes) && classes[i].set:
+			value = paint.Paint(cell, classes[i].class)
+		case painted != nil && i < len(headers):
 			if _, ok := painted[headers[i]]; ok {
 				value = paint.PaintState(cell)
 			}
