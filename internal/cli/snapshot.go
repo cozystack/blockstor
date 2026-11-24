@@ -343,6 +343,12 @@ func snapshotRestoreResource(ctx context.Context, run *runContext) error {
 	}
 
 	err = run.Store.ResourceDefinitions().Create(ctx, def)
+	if store.IsReplicasDraining(err) {
+		// No definition to restore into: its predecessor is still
+		// draining replicas, and the refusal names their nodes.
+		return fmt.Errorf("restore %s onto %s: %w", snap.Name, args.toResource, err)
+	}
+
 	if errors.Is(err, store.ErrAlreadyExists) {
 		return restoreIntoExistingTarget(ctx, run, args, &snap, err)
 	}

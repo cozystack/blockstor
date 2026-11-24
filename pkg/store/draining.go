@@ -67,3 +67,10 @@ func RefuseOverDrainingReplicas(name string, replicas []apiv1.Resource) error {
 		"resource definition %q is still being deleted: its replicas on %s are not gone yet; retry once they are",
 		name, strings.Join(draining, ", "))
 }
+
+// IsReplicasDraining reports whether err is RefuseOverDrainingReplicas'
+// refusal. The refusal is a cockroachdb mark, which the standard library's
+// errors.Is does not see; callers on that package ask here.
+func IsReplicasDraining(err error) bool {
+	return errors.Is(err, ErrDefinitionReplicasDraining)
+}
