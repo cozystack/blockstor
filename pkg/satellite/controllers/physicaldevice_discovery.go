@@ -435,6 +435,26 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 			continue
 		}
 
+		// Bug 70: ZFS zvols (KName like zd0, zd16, …) come from an
+		// existing zpool — they're already in use as block devices for
+		// blockstor's own DRBD volumes (or operator-managed zvols).
+		// They MUST NOT appear in `linstor ps l` as candidates for new
+		// pools; the operator would otherwise see a list dominated by
+		// zvol entries instead of the few real disks they can pool.
+		// Upstream LINSTOR doesn't filter them explicitly but their
+		// `lsblk --paths` typically renders zvols differently or
+		// excludes them through fstype detection — we exclude by kname
+		// prefix to avoid wiring up MAJ:MIN parsing.
+		//
+		// Skip them before the signature probes, not after: a zvol
+		// destroyed between lsblk and the probe makes wipefs fail
+		// with ENOENT, and that failure was logged at ERROR on every
+		// volume delete, for a device that was never going to be
+		// published anyway.
+		if isZVOLKName(row.KName) {
+			continue
+		}
+
 		// Skip devices already consumed into a local
 		// StoragePool. Without this filter the discovery loop would
 		// re-create a Free=False PhysicalDevice CRD for the device
@@ -571,20 +591,6 @@ func collectBusyChildren(rows []satellite.LsblkDevice) map[string]*satellite.Lsb
 // REST shim / operator is preserved (we never touch Spec here;
 // discovery owns Status only).
 func (p *PhysicalDeviceDiscoveryRunnable) publishDeviceWithReason(ctx context.Context, logger logr.Logger, row *satellite.LsblkDevice, free bool, reason, message string) (string, bool) {
-	// Bug 70: ZFS zvols (KName like zd0, zd16, …) come from an
-	// existing zpool — they're already in use as block devices for
-	// blockstor's own DRBD volumes (or operator-managed zvols).
-	// They MUST NOT appear in `linstor ps l` as candidates for new
-	// pools; the operator would otherwise see a list dominated by
-	// zvol entries instead of the few real disks they can pool.
-	// Upstream LINSTOR doesn't filter them explicitly but their
-	// `lsblk --paths` typically renders zvols differently or
-	// excludes them through fstype detection — we exclude by kname
-	// prefix to avoid wiring up MAJ:MIN parsing.
-	if isZVOLKName(row.KName) {
-		return "", false
-	}
-
 	stableID := satellite.PickStableID(row)
 	if stableID == "" {
 		// No stable signal at all — virtio without serial /

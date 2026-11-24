@@ -31,6 +31,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -83,16 +84,27 @@ type AutoDiskfulReconciler struct {
 	// `time.Now`; tests override it so the deadline transition can
 	// be exercised without a real sleep. Nil defaults to time.Now.
 	Now func() time.Time
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;update;patch
 
-// Reconcile drives the auto-diskful timer for one ResourceDefinition.
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *AutoDiskfulReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass drives the auto-diskful timer for one ResourceDefinition.
 // The body is intentionally thin: configuration, deficit-evaluation,
 // and timer-state branches are each one helper so the funlen budget
 // + the per-step early returns stay readable.
-func (r *AutoDiskfulReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *AutoDiskfulReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if r.Store == nil {
 		return ctrl.Result{}, nil
 	}
