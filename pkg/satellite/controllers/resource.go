@@ -368,7 +368,7 @@ func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Req
 	// requeues is the one that brings the replica up.
 	hasFinalizer := slices.Contains(res.Finalizers, SatelliteResourceFinalizer)
 	if hasFinalizer || !res.DeletionTimestamp.IsZero() {
-		r.bringUp.started(res.Name)
+		r.bringUp.start(res.Name)
 	}
 
 	if !res.DeletionTimestamp.IsZero() {

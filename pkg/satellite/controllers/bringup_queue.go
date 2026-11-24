@@ -25,7 +25,6 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/controller/priorityqueue"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -48,20 +47,11 @@ const bringUpPriority = 100
 // once and retries a failure as an ordinary update.
 type bringUpTracker struct {
 	mu      sync.Mutex
-	entries map[string]bringUpEntry
-}
-
-// bringUpEntry is what the tracker knows about one Resource: whether its
-// first pass started, and the priority its adds asked for while it was
-// raised, which is the priority it would have run at without the rank.
-type bringUpEntry struct {
-	started  bool
-	asked    int
-	hasAsked bool
+	started map[string]struct{}
 }
 
 func newBringUpTracker() *bringUpTracker {
-	return &bringUpTracker{entries: map[string]bringUpEntry{}}
+	return &bringUpTracker{started: map[string]struct{}{}}
 }
 
 // pending reports whether the Resource still waits for its first pass.
@@ -74,11 +64,13 @@ func (t *bringUpTracker) pending(name string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	return !t.entries[name].started
+	_, started := t.started[name]
+
+	return !started
 }
 
-// started marks the first pass of the Resource begun.
-func (t *bringUpTracker) started(name string) {
+// start marks the first pass of the Resource begun.
+func (t *bringUpTracker) start(name string) {
 	if t == nil {
 		return
 	}
@@ -86,49 +78,7 @@ func (t *bringUpTracker) started(name string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	entry := t.entries[name]
-	entry.started = true
-	t.entries[name] = entry
-}
-
-// raised records the priority an add of a pending Resource asked for
-// before the rank replaced it. Priorities at or above the rank are the
-// rank itself coming back from a requeue and say nothing.
-func (t *bringUpTracker) raised(name string, priority int) {
-	if t == nil || priority >= bringUpPriority {
-		return
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	entry := t.entries[name]
-	if !entry.hasAsked || priority > entry.asked {
-		entry.asked = priority
-		entry.hasAsked = true
-	}
-
-	t.entries[name] = entry
-}
-
-// unranked is the priority a requeue of the Resource returns to when it
-// comes back at the rank: the highest one its adds asked for while it
-// was pending, or handler.LowPriority, where a Resource of the initial
-// list runs, when none did.
-func (t *bringUpTracker) unranked(name string) int {
-	if t == nil {
-		return handler.LowPriority
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	entry := t.entries[name]
-	if !entry.hasAsked {
-		return handler.LowPriority
-	}
-
-	return entry.asked
+	t.started[name] = struct{}{}
 }
 
 // forget drops a Resource that is gone, so one created again under the
@@ -141,7 +91,7 @@ func (t *bringUpTracker) forget(name string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	delete(t.entries, name)
+	delete(t.started, name)
 }
 
 // bringUpQueue raises every add of a pending Resource to bringUpPriority.
@@ -200,11 +150,12 @@ func (q *bringUpQueue) AddRateLimited(item reconcile.Request) {
 // AddWithOpts ranks each item by whether it is pending.
 //
 // A first pass is dequeued at bringUpPriority, and controller-runtime
-// queues the pass's own requeue (a failure retry, the periodic re-check)
-// at the priority it dequeued, so the replica would keep the rank for
-// good. That requeue goes back to the priority the replica's adds asked
-// for while it was pending: handler.LowPriority for a replica of the
-// initial list, normal priority for one an event queued.
+// queues the pass's own requeue at the priority it dequeued unless the
+// pass names one. ResourceReconciler.Reconcile names normal priority on
+// every result, the priority every retry runs at, so the rank does not
+// come back with it. A pass that ends without a result of its own, a
+// recovered panic, would bring the rank back for good; such an add goes
+// to normal priority here too.
 //
 // An event that comes in after a first pass is dequeued and before the
 // pass marks the replica started is still queued at the rank, and gives
@@ -215,7 +166,6 @@ func (q *bringUpQueue) AddWithOpts(opts priorityqueue.AddOpts, items ...reconcil
 
 	for _, item := range items {
 		if q.tracker.pending(item.Name) {
-			q.tracker.raised(item.Name, priorityOf(opts))
 			raised = append(raised, item)
 		} else {
 			rest = append(rest, item)
@@ -228,13 +178,13 @@ func (q *bringUpQueue) AddWithOpts(opts priorityqueue.AddOpts, items ...reconcil
 		q.PriorityQueue.AddWithOpts(up, raised...)
 	}
 
-	for _, item := range rest {
+	if len(rest) > 0 {
 		down := opts
 		if priorityOf(opts) >= bringUpPriority {
-			down.Priority = priorityPtr(q.tracker.unranked(item.Name))
+			down.Priority = normalPriority()
 		}
 
-		q.PriorityQueue.AddWithOpts(down, item)
+		q.PriorityQueue.AddWithOpts(down, rest...)
 	}
 }
 

@@ -47,7 +47,7 @@ func bringUpRequest(name string) reconcile.Request {
 
 func TestBringUpQueueRanksPendingReplicasFirst(t *testing.T) {
 	tracker := newBringUpTracker()
-	tracker.started("up")
+	tracker.start("up")
 
 	inner := &recordingQueue{adds: map[string]priorityqueue.AddOpts{}}
 	queue := &bringUpQueue{PriorityQueue: inner, tracker: tracker}
@@ -81,11 +81,11 @@ func TestBringUpQueueRanksPendingReplicasFirst(t *testing.T) {
 	}
 }
 
-// A first pass was dequeued at bringUpPriority, and controller-runtime
-// queues its requeue at that priority. The requeue must not keep the
-// rank: it goes back to the priority the replica would have run at
-// without it, low for a replica of the initial list, normal for one an
-// event queued.
+// A first pass was dequeued at bringUpPriority. Its requeue must not keep
+// the rank: Reconcile names normal priority on every result, and an add
+// that still carries the rank, a pass that ended in a recovered panic,
+// goes to normal priority too, whether the replica came from the initial
+// list or from an event.
 func TestBringUpQueueDropsTheRankAfterTheFirstPass(t *testing.T) {
 	tracker := newBringUpTracker()
 	inner := &recordingQueue{adds: map[string]priorityqueue.AddOpts{}}
@@ -99,23 +99,21 @@ func TestBringUpQueueDropsTheRankAfterTheFirstPass(t *testing.T) {
 			t.Fatalf("first pass of %s: priority %d, want %d", name, got, bringUpPriority)
 		}
 
-		tracker.started(name)
-		queue.AddWithOpts(priorityqueue.AddOpts{After: applyFailureRequeue, Priority: priorityPtr(bringUpPriority)}, bringUpRequest(name))
+		tracker.start(name)
 	}
 
-	if got := inner.adds["listed"]; priorityOf(got) != handler.LowPriority || got.After != applyFailureRequeue {
-		t.Errorf("requeue of a replica from the initial list: %+v, want priority %d after %v", got, handler.LowPriority, applyFailureRequeue)
+	queue.AddWithOpts(priorityqueue.AddOpts{After: applyFailureRequeue, Priority: normalPriority()}, bringUpRequest("listed"))
+
+	if got := inner.adds["listed"]; priorityOf(got) != 0 || got.After != applyFailureRequeue {
+		t.Errorf("requeue Reconcile asked for: %+v, want normal priority after %v", got, applyFailureRequeue)
 	}
 
-	if got := inner.adds["created"]; priorityOf(got) != 0 || got.After != applyFailureRequeue {
-		t.Errorf("requeue of a replica created while the satellite runs: %+v, want normal priority after %v", got, applyFailureRequeue)
-	}
+	queue.AddWithOpts(priorityqueue.AddOpts{RateLimited: true, Priority: priorityPtr(bringUpPriority)}, bringUpRequest("listed"), bringUpRequest("created"))
 
-	// A failed first pass is retried like any other pass.
-	queue.AddWithOpts(priorityqueue.AddOpts{RateLimited: true, Priority: priorityPtr(bringUpPriority)}, bringUpRequest("created"))
-
-	if got := inner.adds["created"]; priorityOf(got) != 0 || !got.RateLimited {
-		t.Errorf("retry of a failed first pass: %+v, want normal priority", got)
+	for _, name := range []string{"listed", "created"} {
+		if got := inner.adds[name]; priorityOf(got) != 0 || !got.RateLimited {
+			t.Errorf("retry of %s carrying the rank back: %+v, want normal priority", name, got)
+		}
 	}
 
 	tracker.forget("listed")
@@ -123,25 +121,5 @@ func TestBringUpQueueDropsTheRankAfterTheFirstPass(t *testing.T) {
 
 	if got := priorityOf(inner.adds["listed"]); got != bringUpPriority {
 		t.Errorf("replica created again under a deleted one's name: priority %d, want %d", got, bringUpPriority)
-	}
-}
-
-// The rank a requeue carries back says nothing about the priority the
-// replica would have had; only what its adds asked for counts.
-func TestBringUpTrackerIgnoresTheRankItself(t *testing.T) {
-	tracker := newBringUpTracker()
-
-	tracker.raised("r1", bringUpPriority)
-
-	if got := tracker.unranked("r1"); got != handler.LowPriority {
-		t.Errorf("only the rank was asked for: unranked %d, want %d", got, handler.LowPriority)
-	}
-
-	tracker.raised("r1", handler.LowPriority)
-	tracker.raised("r1", 0)
-	tracker.raised("r1", handler.LowPriority)
-
-	if got := tracker.unranked("r1"); got != 0 {
-		t.Errorf("low then normal asked for: unranked %d, want the highest, 0", got)
 	}
 }
