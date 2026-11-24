@@ -19,6 +19,7 @@ limitations under the License.
 package rest
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -51,10 +52,24 @@ func TestRDCreateWaitsForTheDeletedDefinitionsReplicas(t *testing.T) {
 	body := []byte(`{"resource_definition":{"name":"pvc-retry"}}`)
 
 	resp := httpPost(t, base+"/v1/resource-definitions", body)
+
+	var rcs []apiv1.APICallRc
+
+	decodeErr := json.NewDecoder(resp.Body).Decode(&rcs)
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("create over a draining replica: status %d, want 409", resp.StatusCode)
+	}
+
+	// linstor-csi only needs an error to retry on, but golinstor and the
+	// python client key a duplicate definition on this band.
+	if decodeErr != nil || len(rcs) == 0 {
+		t.Fatalf("decode the refusal: %v (%d entries)", decodeErr, len(rcs))
+	}
+
+	if rcs[0].RetCode&apiCallRcFailExistsRscDfn != apiCallRcFailExistsRscDfn {
+		t.Errorf("ret_code %#x lacks FAIL_EXISTS_RSC_DFN", rcs[0].RetCode)
 	}
 
 	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-retry"); err == nil {

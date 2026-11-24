@@ -343,7 +343,10 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
-		writeStoreError(w, err)
+		// Typed, so a duplicate name, or one whose earlier definition is
+		// still draining replicas, carries FAIL_EXISTS_RSC_DFN as LINSTOR's
+		// does.
+		writeStoreErrorTyped(w, err, storeKindResourceDfn)
 
 		return
 	}
