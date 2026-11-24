@@ -177,6 +177,18 @@ type SnapshotLUKSKey struct {
 type SnapshotVolumeRef struct {
 	VolumeNumber int32 `json:"volumeNumber"`
 	SizeKib      int64 `json:"sizeKib"`
+
+	// props is the volume definition's property map as it was when the
+	// snapshot was taken, which a restore copies onto the volume it
+	// creates, as LINSTOR does. The block size LINSTOR keeps there is
+	// the one the snapshot's data was written at. A snapshot recorded
+	// before this field existed has none, and its volume definition's
+	// current props stand in. Serialised without omitempty so a volume
+	// definition that had no props is recorded as {} and stays told
+	// apart from a snapshot that recorded nothing.
+	// +optional
+	// +nullable
+	Props map[string]string `json:"props"`
 }
 
 // AnnotationSnapshotAdopted marks a Snapshot whose on-disk
