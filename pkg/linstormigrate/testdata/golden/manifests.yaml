@@ -167,6 +167,7 @@ spec:
   layerStack:
   - DRBD
   - STORAGE
+  peerSlots: 7
   props:
     Aux/csi.storage.k8s.io/pvc/name: app-data
     Aux/csi.storage.k8s.io/pvc/namespace: tenant-fixture
@@ -190,6 +191,7 @@ spec:
   initialized: true
   layerStack:
   - STORAGE
+  peerSlots: 7
   resourceGroupName: DfltRscGrp
   volumeDefinitions:
   - sizeKib: 524288
@@ -209,6 +211,7 @@ spec:
   - DRBD
   - LUKS
   - STORAGE
+  peerSlots: 7
   resourceGroupName: sc-encrypted
   volumeDefinitions:
   - drbdMinor: 1003
@@ -227,6 +230,7 @@ spec:
   layerStack:
   - DRBD
   - STORAGE
+  peerSlots: 7
   resourceGroupName: sc-replicated
   volumeDefinitions:
   - drbdMinor: 1005
@@ -241,6 +245,7 @@ spec:
   initialized: true
   layerStack:
   - STORAGE
+  peerSlots: 7
   volumeDefinitions:
   - sizeKib: 1048576
     volumeNumber: 0
@@ -253,6 +258,7 @@ spec:
   initialized: true
   layerStack:
   - STORAGE
+  peerSlots: 7
   resourceGroupName: DfltRscGrp
   volumeDefinitions:
   - sizeKib: 1048576
@@ -270,6 +276,7 @@ spec:
   extraProps:
     StorPoolName: data
   nodeName: node-a
+  peerSlots: 7
   props:
     StorPoolName: data
   resourceDefinitionName: pvc-vol1
@@ -286,6 +293,7 @@ spec:
   extraProps:
     StorPoolName: data
   nodeName: node-b
+  peerSlots: 7
   props:
     StorPoolName: data
   resourceDefinitionName: pvc-vol1
@@ -306,6 +314,7 @@ spec:
   - DRBD_DISKLESS
   - TIE_BREAKER
   nodeName: node-c
+  peerSlots: 7
   props:
     StorPoolName: DfltDisklessStorPool
   resourceDefinitionName: pvc-vol1
@@ -329,6 +338,7 @@ metadata:
 spec:
   drbdNodeID: 0
   nodeName: node-a
+  peerSlots: 7
   resourceDefinitionName: pvc-vol3
   skipInitialSync: false
   storagePool: data
@@ -346,6 +356,7 @@ metadata:
 spec:
   drbdNodeID: 1
   nodeName: node-b
+  peerSlots: 7
   resourceDefinitionName: pvc-vol3
   skipInitialSync: false
   storagePool: data
@@ -363,6 +374,7 @@ metadata:
 spec:
   drbdNodeID: 0
   nodeName: node-a
+  peerSlots: 7
   resourceDefinitionName: pvc-vol5
   skipInitialSync: false
   storagePool: data
@@ -374,6 +386,7 @@ metadata:
 spec:
   drbdNodeID: 1
   nodeName: node-b
+  peerSlots: 7
   resourceDefinitionName: pvc-vol5
   skipInitialSync: false
   storagePool: data

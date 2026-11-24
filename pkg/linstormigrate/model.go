@@ -85,6 +85,8 @@ type ResourceGroupRow struct {
 	ReplicasOnDifferent  string `json:"replicas_on_different,omitempty"`
 	AllowedProviderList  string `json:"allowed_provider_list,omitempty"`
 	UUID                 string `json:"uuid"`
+	// PeerSlots is the group's `--peer-slots`, null when it has none.
+	PeerSlots *int32 `json:"peer_slots,omitempty"`
 }
 
 // VolumeGroupRow is one row of the VOLUME_GROUPS table.

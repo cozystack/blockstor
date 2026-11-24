@@ -147,6 +147,7 @@ type converter struct {
 	drbdRD    map[string]LayerDrbdResourceDefinitionRow // by resource_name
 	drbdMinor map[volumeKey]*int32                      // by (rd, vlmNr)
 	drbdNode  map[replicaKey]*int32                     // node-id by (node, rd)
+	drbdSlots map[replicaKey]*int32                     // peer slots by (node, rd)
 	storVol   map[volumeReplicaKey]LayerStorageVolumeRow
 	luksVol   map[volumeReplicaKey]LayerLuksVolumeRow
 	// luksKeys are the imported volume passwords, wrapped under the
@@ -255,6 +256,7 @@ func ConvertWithOptions(dump *Dump, opts Options) (*Result, error) {
 		drbdRD:            map[string]LayerDrbdResourceDefinitionRow{},
 		drbdMinor:         map[volumeKey]*int32{},
 		drbdNode:          map[replicaKey]*int32{},
+		drbdSlots:         map[replicaKey]*int32{},
 		storVol:           map[volumeReplicaKey]LayerStorageVolumeRow{},
 		luksVol:           map[volumeReplicaKey]LayerLuksVolumeRow{},
 		luksKeys:          map[luksKeyAt]crdv1alpha1.LUKSKey{},
@@ -515,7 +517,14 @@ func (c *converter) buildLayerInstanceIndexes() {
 	for i := range c.dump.LayerDrbdResources {
 		row := &c.dump.LayerDrbdResources[i]
 		if lri, ok := baseLayer(row.LayerResourceID); ok {
-			c.drbdNode[replicaKey{node: lri.NodeName, rd: lri.ResourceName}] = ptr(row.NodeID)
+			key := replicaKey{node: lri.NodeName, rd: lri.ResourceName}
+			c.drbdNode[key] = ptr(row.NodeID)
+
+			// The count this replica's metadata was created with: kept,
+			// so a grow sizes its lower disk for the metadata it has.
+			if drbd.ValidatePeerSlots(int64(row.PeerSlots)) == nil {
+				c.drbdSlots[key] = ptr(row.PeerSlots)
+			}
 		}
 	}
 
@@ -954,6 +963,7 @@ func (c *converter) convertResourceGroups() []crdv1alpha1.ResourceGroup {
 				Props:       residual,
 				DRBDOptions: typed,
 				ExtraProps:  extra,
+				PeerSlots:   c.rgPeerSlots(row, dsp),
 				SelectFilter: crdv1alpha1.ResourceGroupSelectFilter{
 					PlaceCount:              row.ReplicaCount,
 					StoragePoolList:         poolPins,
@@ -1283,6 +1293,7 @@ func (c *converter) convertResourceDefinitions() []crdv1alpha1.ResourceDefinitio
 				DRBDOptions:       typed,
 				ExtraProps:        extra,
 				LayerStack:        c.rdLayerStack(row, dsp),
+				PeerSlots:         c.rdPeerSlots(row, dsp),
 				// The volumes already hold committed data in the source
 				// cluster: latch Initialized so any replica added AFTER
 				// the migration must SyncTarget the real data instead of
@@ -1857,6 +1868,62 @@ func (c *converter) rdInitializedLatch(rdName string) rdLatchState {
 	return state
 }
 
+// rdPeerSlots is the peer-slot count a converted definition's new
+// replicas get: the count on its DRBD layer, which LINSTOR resolved when
+// it created that layer and copied to each replica. A definition with no
+// DRBD layer yet, one no replica was ever placed for, gets what LINSTOR
+// would resolve when it creates one: PeerSlotsNewResource on the
+// definition, its group and the controller, else 7
+// (RscDrbdLayerHelper.getPeerSlotsForNewResource). Without a count it
+// would be read as the 15 of a definition blockstor created before it
+// recorded one.
+func (c *converter) rdPeerSlots(row *ResourceDefinitionRow, dsp string) *int32 {
+	if layer, ok := c.drbdRD[row.ResourceName]; ok {
+		if drbd.ValidatePeerSlots(int64(layer.PeerSlots)) == nil {
+			return ptr(layer.PeerSlots)
+		}
+
+		c.warnf("resource definition %s: DRBD layer peer_slots %d out of range; resolved as for a new definition",
+			dsp, layer.PeerSlots)
+	}
+
+	for _, props := range []map[string]string{
+		c.props.ResourceDefinition(row.ResourceName),
+		c.resourceGroupProps(row.ResourceGroupName),
+		c.props.Controller,
+	} {
+		value, ok := props[drbd.PeerSlotsNewResourceProp]
+		if !ok {
+			continue
+		}
+
+		slots, err := drbd.ParsePeerSlotsProp(value)
+		if err == nil {
+			return ptr(slots)
+		}
+
+		c.warnf("resource definition %s: %v; the next scope decides", dsp, err)
+	}
+
+	return ptr(int32(drbd.DefaultPeerSlots))
+}
+
+// rgPeerSlots carries a group's `--peer-slots`, which definitions spawned
+// from it get.
+func (c *converter) rgPeerSlots(row *ResourceGroupRow, dsp string) int32 {
+	if row.PeerSlots == nil {
+		return 0
+	}
+
+	if err := drbd.ValidatePeerSlots(int64(*row.PeerSlots)); err != nil {
+		c.warnf("resource group %s: %v; not migrated", dsp, err)
+
+		return 0
+	}
+
+	return *row.PeerSlots
+}
+
 func (c *converter) attachRDLayerFields(def *crdv1alpha1.ResourceDefinition, row *ResourceDefinitionRow, dsp string) {
 	if layer, ok := c.drbdRD[row.ResourceName]; ok {
 		def.Spec.DRBDPort = c.resolveDefinitionDRBDPort(row.ResourceName, layer.TCPPort, dsp)
@@ -2154,6 +2221,7 @@ func (c *converter) buildResource(row *ResourceRow, rdDsp, nodeDsp, replicaName 
 			ExtraProps:             extra,
 			Flags:                  flags,
 			DRBDNodeID:             c.drbdNode[replicaKey{node: row.NodeName, rd: row.ResourceName}],
+			PeerSlots:              c.drbdSlots[replicaKey{node: row.NodeName, rd: row.ResourceName}],
 			// Adopted replicas carry real data (or are the witness of
 			// a data-bearing set): never allow the day0 skip. The
 			// satellite reads false as "not created empty here" too and
