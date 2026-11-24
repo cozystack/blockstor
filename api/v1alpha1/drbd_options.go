@@ -167,15 +167,30 @@ type DRBDResourceOptions struct {
 	AutoTieBreaker *bool `json:"autoTieBreaker,omitempty"`
 }
 
-// EncryptionConfig configures LUKS encryption for a ResourceDefinition.
-// Replaces the `Props["DrbdOptions/Encryption/passphrase"]` plaintext-
-// in-spec antipattern with a Secret reference. Cluster-wide encryption
-// (single passphrase per cluster) is configured via ControllerConfig.
+// EncryptionConfig is the per-ResourceDefinition encryption block.
+//
+// NOT IMPLEMENTED. It was intended to replace the
+// `Props["DrbdOptions/Encryption/passphrase"]` plaintext-in-spec
+// antipattern with a Secret reference, but no code path consumes it.
+// Every LUKS replica gets its own random password, wrapped under the
+// cluster master key that ControllerConfig unlocks. See
+// docs/encryption-keys.md.
 type EncryptionConfig struct {
-	// passphraseSecretRef references the Secret carrying the LUKS
-	// passphrase under the key `passphrase`. The satellite reads it
-	// via the apiserver during reconcile; the passphrase never lands
-	// on Spec in plaintext.
+	// passphraseSecretRef names a Secret carrying a LUKS passphrase
+	// under the key `passphrase`.
+	//
+	// NOT IMPLEMENTED: setting this does NOT encrypt the volume with
+	// the referenced Secret. A resource definition that sets it gets
+	// per-replica passwords wrapped under the CLUSTER master key, like
+	// every other one, and the referenced Secret opens nothing.
+	//
+	// The field is kept, rather than removed, because it is reserved
+	// as the selector of a non-default key (docs/encryption-keys.md,
+	// stage 2) and removing it would prune the reference out of stored
+	// objects.
+	// While it does nothing, a LUKS-layered resource definition that
+	// sets it gets an `EncryptionKeyIgnored` Condition on each of its
+	// Resources saying so.
 	// +optional
 	PassphraseSecretRef *corev1.LocalObjectReference `json:"passphraseSecretRef,omitempty"`
 }
