@@ -1298,6 +1298,11 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// refuses a definition that has snapshots.
 	reaped := reapClonedSnapshot(r.Context(), s.Store, name, clonedFrom)
 
+	// Answered once the reachable satellites have torn their replicas
+	// down, as LINSTOR answers it, so a create of the same name that
+	// follows is not refused over them.
+	s.waitForOnlineReplicasDrained(r.Context(), name)
+
 	// Bug 124: block the response until the local informer cache has
 	// observed the RD + child Resource deletions. Without this gate,
 	// `linstor rd d <rd>` returns SUCCESS and the very next
