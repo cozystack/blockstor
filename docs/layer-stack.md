@@ -24,7 +24,7 @@ where it's the network leg).
 |-----------------------------|---------------------------------------------------------------------|
 | `["DRBD","STORAGE"]`        | Default. Replicated PVC, the cozystack production case.             |
 | `["LUKS","STORAGE"]`        | Single-replica encrypted PVC. No DRBD overhead.                     |
-| `["DRBD","LUKS","STORAGE"]` | Encrypted at-rest + replicated. Per-volume cipher.                  |
+| `["DRBD","LUKS","STORAGE"]` | Encrypted at-rest + replicated. Per-replica key.                    |
 | `["STORAGE"]`               | Single-replica local mode. Ephemeral cache, scratch, ZFS dataset.   |
 
 The default is `["DRBD","STORAGE"]`, used when neither the RD nor its resource group sets a stack.
@@ -100,6 +100,18 @@ spec:
     - {volumeNumber: 0, sizeKib: 1048576}
 ```
 
+## What LUKS in this stack actually protects
+
+**At rest, on each node. Not the replication link.**
+
+In `["DRBD","LUKS","STORAGE"]` the satellite hands DRBD the dm-crypt mapper as its lower disk (`maybeLUKS` rewrites the device map before `applyDRBD`, `pkg/satellite/reconciler.go`; `tests/e2e/drbd-luks-stack.sh` asserts the `.res` `disk` line points at `/dev/mapper/<rd>-<vol>-luks`). The mapper is the *plaintext* side of the crypt device. So:
+
+- the pod writes plaintext into `/dev/drbdN`;
+- DRBD replicates **plaintext** to its peers;
+- each node encrypts independently on the way to its own LV/zvol, and only the backing device holds ciphertext.
+
+Anyone who needs the replication traffic protected has to secure it separately; the layer stack does not do it.
+
 ## LUKS specifics
 
 The design is [encryption-keys.md](encryption-keys.md).
@@ -126,6 +138,16 @@ Before this release every LUKS volume was formatted with the one cluster passphr
   with LUKS-over-DRBD instead of DRBD-over-LUKS) aren't yet validated
   or rendered.
 - **Changing a volume's own password**: `linstor vd modify-passphrase` answers 400; a volume keeps the password it was formatted with. Re-keying a header (`luksChangeKey`) is a follow-up.
+- **Per-RD key Secrets**: `ResourceDefinition.spec.encryption.passphraseSecretRef` exists in the CRD but is **not implemented**: nothing reads it, and the RD's replicas get their own passwords wrapped under the cluster master key like those of every other RD. A LUKS-layered RD that sets it gets an `EncryptionKeyIgnored` Condition on each of its Resources saying so:
+
+  ```bash
+  kubectl get resources.blockstor.org -o json \
+    | jq -r '.items[] | select(.status.conditions[]?
+        | select(.type=="EncryptionKeyIgnored" and .status=="True"))
+        | .metadata.name'
+  ```
+
+  It is a Condition and not a refusal on purpose: the field has always been inert, so a live cluster may carry RDs that set it and run fine. Failing their applies would move working volumes to broken ones. Clear the field to silence the Condition.
 - **Mid-stack changes**: editing `layerStack` after a Resource is
   active doesn't re-encrypt or unwrap existing data. Treat it as
   set-once-per-RD until migration support lands.
