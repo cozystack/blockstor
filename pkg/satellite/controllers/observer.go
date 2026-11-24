@@ -1603,8 +1603,8 @@ func (o *ObserverRunnable) snapshotFor(name string) observation {
 
 	o.volMu.Lock()
 	if cache, ok := o.volCache[name]; ok {
-		for _, v := range cache {
-			out.Volumes = append(out.Volumes, v)
+		for volNum := range cache {
+			out.Volumes = append(out.Volumes, cache[volNum])
 		}
 	}
 	o.volMu.Unlock()
@@ -2279,7 +2279,8 @@ func (o *ObserverRunnable) lifecycleSnapshotLocked(name string) lifecycleSignatu
 
 	o.volMu.Lock()
 	if cache, ok := o.volCache[name]; ok {
-		for volNum, v := range cache {
+		for volNum := range cache {
+			v := cache[volNum]
 			sig.PerVolume[volNum] = volumeLifecycle{
 				DiskState: v.DiskState,
 				Quorum:    v.Quorum,
@@ -2441,7 +2442,8 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 		}
 	}
 
-	for _, incoming := range ev.Volumes {
+	for i := range ev.Volumes {
+		incoming := &ev.Volumes[i]
 		if incoming.Removed {
 			// `destroy device` — evict the volume so the snapshot
 			// stops carrying it. Only counts as a change when the
@@ -2456,7 +2458,7 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 			continue
 		}
 
-		if mergeVolumeInto(cache, &incoming) {
+		if mergeVolumeInto(cache, incoming) {
 			changed = true
 		}
 	}
@@ -2731,8 +2733,7 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 		changed = true
 	}
 
-	if incoming.DeviceSizeKib > 0 && merged.DeviceSizeKib != incoming.DeviceSizeKib {
-		merged.DeviceSizeKib = incoming.DeviceSizeKib
+	if mergeDeviceSizeInto(&merged, incoming) {
 		changed = true
 	}
 
@@ -2748,6 +2749,18 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 	cache[incoming.VolumeNumber] = merged
 
 	return changed
+}
+
+// mergeDeviceSizeInto takes the device size a frame carried; a frame
+// without one leaves the cached size alone.
+func mergeDeviceSizeInto(merged, incoming *volumeObservation) bool {
+	if incoming.DeviceSizeKib <= 0 || merged.DeviceSizeKib == incoming.DeviceSizeKib {
+		return false
+	}
+
+	merged.DeviceSizeKib = incoming.DeviceSizeKib
+
+	return true
 }
 
 // mergeConnections updates the per-resource peer-state cache from
