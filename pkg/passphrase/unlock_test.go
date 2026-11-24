@@ -353,6 +353,51 @@ func TestBootstrapCreatesTheKeyringFromTheSecret(t *testing.T) {
 	}
 }
 
+// A keyring is created from the passphrase the API server holds, not from
+// the one a watch saw: the ControllerConfig may have moved to another
+// Secret, or the Secret to another passphrase, since the watch listed it.
+func TestBootstrapCreatesFromWhatTheAPIServerHolds(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name          string
+		watch, direct []client.Object
+	}{
+		{
+			name:   "the ControllerConfig moved",
+			watch:  []client.Object{refConfig("old", ""), passSecret("old", "MASTER_PASSPHRASE", "stale")},
+			direct: []client.Object{refConfig("new", ""), passSecret("new", "MASTER_PASSPHRASE", "fresh")},
+		},
+		{
+			name:   "the Secret changed",
+			watch:  []client.Object{refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "stale")},
+			direct: []client.Object{refConfig("p", ""), passSecret("p", "MASTER_PASSPHRASE", "fresh")},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			watch := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.watch...).Build()
+			direct := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.direct...).Build()
+			secrets := passphrase.Secrets{Reader: watch, Namespace: ns, Direct: direct}
+
+			created, err := passphrase.Bootstrap(t.Context(), direct, secrets, time.Now())
+			if err != nil || !created {
+				t.Fatalf("created %v, %v", created, err)
+			}
+
+			ring, _, err := passphrase.Secrets{Reader: direct, Namespace: ns}.Keyring(t.Context())
+			if err != nil || ring == nil {
+				t.Fatalf("keyring %v, %v", ring, err)
+			}
+
+			if _, err := ring.Opens([]byte("fresh")); err != nil {
+				t.Fatalf("the passphrase the API server holds does not open the new keyring: %v", err)
+			}
+		})
+	}
+}
+
 // Nothing is created without a named Secret, with an empty one, or when a
 // keyring exists; and none is created while a replica carries a password
 // wrapped under a keyring that is gone.
@@ -860,6 +905,56 @@ func TestCleanupKeepsTheSlotTheSecretOpensNow(t *testing.T) {
 
 	if stateOf(t, setup).State != passphrase.StateUnlocked {
 		t.Fatal("the cluster is locked")
+	}
+}
+
+// The cleanup decides on the ControllerConfig the API server holds, not
+// on the one a watch saw: a Secret the operator has switched back to, but
+// the watch has not seen yet, keeps the slot it opens, and the cluster
+// stays unlocked.
+func TestCleanupKeepsTheSlotOfASecretTheWatchHasNotSeen(t *testing.T) {
+	t.Parallel()
+
+	direct := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(
+		refConfig("a", ""), passSecret("a", "MASTER_PASSPHRASE", "one"),
+		passSecret("b", "MASTER_PASSPHRASE", "two")).Build()
+	setup := &passphrase.Ops{Client: direct, Secrets: passphrase.Secrets{Reader: direct, Namespace: ns}}
+
+	_, err := passphrase.Bootstrap(t.Context(), direct, setup.Secrets, time.Now())
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	// The rotation: slot X, opened by a, is superseded by slot Y, opened
+	// by b, and the operator points the ControllerConfig at b.
+	_, err = setup.Modify(t.Context(), []byte("one"), []byte("two"))
+	if err != nil {
+		t.Fatalf("modify: %v", err)
+	}
+
+	var ringSec corev1.Secret
+
+	err = direct.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: passphrase.KeyringSecretName}, &ringSec)
+	if err != nil {
+		t.Fatalf("get keyring: %v", err)
+	}
+
+	ringSec.ResourceVersion = ""
+
+	// The watch still holds b; the operator has since switched back to a.
+	watch := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(
+		refConfig("b", ""), passSecret("a", "MASTER_PASSPHRASE", "one"),
+		passSecret("b", "MASTER_PASSPHRASE", "two"), &ringSec).Build()
+
+	ops := &passphrase.Ops{Client: direct, Secrets: passphrase.Secrets{Reader: watch, Namespace: ns, Direct: direct}}
+
+	removed, err := ops.CleanupSuperseded(t.Context())
+	if err != nil || removed {
+		t.Fatalf("cleanup: %v, %v; want the slot Secret a opens kept", removed, err)
+	}
+
+	if stateOf(t, setup).State != passphrase.StateUnlocked {
+		t.Fatal("the cluster is locked: Secret a opens no slot")
 	}
 }
 
