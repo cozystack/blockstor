@@ -20,6 +20,21 @@
 # would defeat the entire purpose of the recipe — it's an
 # *emergency* override and the human operator owns the demote step.
 #
+# What the operator does own is a Primary that something uses. The
+# satellite's idle-Primary workaround (checkIdlePrimary in
+# pkg/satellite/controllers/drbd_workarounds.go, on by default)
+# demotes a Primary with no volume open on two passes in a row, 30 s
+# apart, whatever promoted it: the kernel cannot tell an emergency
+# promote from an auto-promote whose auto-demote did not fire
+# (piraeus-operator#942), and the LINSTOR-mode plunger it replaces
+# demotes every such Primary on each pass too. A forced Primary that
+# nobody opens is therefore demoted 30 to 60 s after the promote. So
+# the scenario holds the device open on the forced side for the whole
+# window, as the recovered workload would, and the open is confirmed
+# in the kernel before the window starts. The idle pass count resets
+# on any pass that sees the device open, so the result no longer
+# depends on where the workaround timer is when the promote lands.
+#
 # Setup:
 #   - 2-replica RD on workers 1+2, 64 MiB, autoplace disabled.
 #   - DRBD reaches UpToDate on both peers.
@@ -39,13 +54,15 @@
 #      config with allow-two-primaries=yes the second promote would
 #      succeed and the scenario would naturally extend to dual-
 #      Primary without any other change.
-#   3. Watch for $OBSERVE_WINDOW seconds. The reconciler must NOT
+#   3. Hold the forced side's device open (read-only, from the
+#      satellite pod) and wait until the kernel reports it open.
+#   4. Watch for $OBSERVE_WINDOW seconds. The reconciler must NOT
 #      issue `drbdadm secondary` on either side. We watch role
 #      directly (sampling every second) AND scrape satellite logs
 #      for the substring `drbdadm secondary` referencing this RD.
-#   4. Prove the forced-Primary side is actually writable: dd a
+#   5. Prove the forced-Primary side is actually writable: dd a
 #      small marker through the raw /dev/drbdN device.
-#   5. Cleanup: demote both sides via `drbdadm secondary --force`
+#   6. Cleanup: release the holder, demote both sides via `drbdadm secondary --force`
 #      from the operator side (test cleanup mirrors what the human
 #      operator would do post-recovery), then trap-delete the RD.
 
@@ -70,7 +87,23 @@ OBSERVE_WINDOW=30          # reconciler must NOT demote within this window
 # the EXIT path doesn't race a still-Primary peer trying to release
 # the open device. `secondary --force` is idempotent — a peer that
 # was already Secondary just no-ops.
+HOLD_PIDFILE=/tmp/${RD}-hold.pid
+HOLD_LOCAL_PID=""
+
+# release_hold ends the opener the scenario keeps on the forced side,
+# so the demote below does not leave it with force-io-failures.
+release_hold() {
+    on_node "$N2" bash -c "[ -f ${HOLD_PIDFILE} ] && kill \$(cat ${HOLD_PIDFILE}); rm -f ${HOLD_PIDFILE}" \
+        2>/dev/null || true
+    if [[ -n "$HOLD_LOCAL_PID" ]]; then
+        kill "$HOLD_LOCAL_PID" 2>/dev/null || true
+        wait "$HOLD_LOCAL_PID" 2>/dev/null || true
+        HOLD_LOCAL_PID=""
+    fi
+}
+
 cleanup() {
+    release_hold
     on_node "$N1" drbdadm secondary --force "$RD" 2>/dev/null || true
     on_node "$N2" drbdadm secondary --force "$RD" 2>/dev/null || true
     delete_rd "$RD"
@@ -153,6 +186,29 @@ if [[ "$n2_role_post" != "Primary" ]]; then
     exit 1
 fi
 
+# Hold the device open on the forced side, as the workload the
+# operator recovered would, so the idle-Primary workaround leaves it
+# alone (see the header). The open must be visible in the kernel
+# within 20 s: one idle pass may have counted before it, and a demote
+# needs a second one 30 s later.
+DEV_N2=$(device_for_rd "$RD" "$N2")
+echo ">> hold $DEV_N2 open on $N2 for the observe window"
+on_node "$N2" bash -c "test -b ${DEV_N2} && echo \$\$ > ${HOLD_PIDFILE} && exec 3<${DEV_N2} && exec sleep 600" &
+HOLD_LOCAL_PID=$!
+
+held=false
+for _ in $(seq 1 20); do
+    if on_node "$N2" drbdsetup status "$RD" --json 2>/dev/null | grep -qE '"open": *true'; then
+        held=true
+        break
+    fi
+    sleep 1
+done
+if [[ "$held" != "true" ]]; then
+    echo "FAIL: $DEV_N2 on $N2 not reported open within 20s"
+    exit 1
+fi
+
 # Observe window: sample roles every second. If at any point N2
 # (or N1, if dual-Primary was achieved) drops to Secondary, the
 # reconciler has demoted us — emergency recovery defeated. Record
@@ -206,7 +262,6 @@ fi
 # reconciler had partially undone the promote (e.g. demote+repromote
 # leaving a stale device handle), this dd would EIO out.
 echo ">> prove $N2 is writable post-force-promote"
-DEV_N2=$(device_for_rd "$RD" "$N2")
 echo "   device on $N2 = $DEV_N2"
 blocks=$(( (SIZE_BYTES + 4095) / 4096 ))
 md5_written=$(on_node "$N2" bash -c "
