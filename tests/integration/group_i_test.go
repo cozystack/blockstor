@@ -464,7 +464,7 @@ func groupIEffectivePropsAtAllLevels(t *testing.T, stack *harness.Stack) {
 
 		ctrlVal = "60"
 		rgVal   = "16384"
-		rdVal   = "512K"
+		rdVal   = "524288"
 		rscVal  = "256K"
 	)
 

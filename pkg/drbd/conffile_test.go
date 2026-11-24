@@ -824,3 +824,66 @@ func TestNeedsQuotingFollowsTheBareTokenRule(t *testing.T) {
 		}
 	}
 }
+
+// TestVolumeOptionsRenderInsideTheLocalVolume: a volume's own disk
+// options (LINSTOR's volume-definition DrbdOptions/Disk/*, block-size
+// first among them) belong in a `disk { }` block inside that volume,
+// where LINSTOR's ConfFileBuilder writes them. Rendered anywhere else
+// they either apply to every volume or, on a peer's block, to nothing.
+func TestVolumeOptionsRenderInsideTheLocalVolume(t *testing.T) {
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Hosts: []drbd.Host{
+			{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0, IsLocal: true},
+			{NodeName: "n2", Address: "10.0.0.2", Port: 7000, NodeID: 1},
+		},
+		Volumes: []drbd.Volume{
+			{
+				Number: 0, Device: "/dev/drbd1000", Disk: "/dev/zvol/p/pvc-1_00000", Minor: 1000,
+				Options: map[string]string{"block-size": "4096", "discard-zeroes-if-aligned": "yes"},
+			},
+			{Number: 1, Device: "/dev/drbd1001", Disk: "/dev/zvol/p/pvc-1_00001", Minor: 1001},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	want := "    volume 0 {\n" +
+		"      device /dev/drbd1000 minor 1000;\n" +
+		"      disk /dev/zvol/p/pvc-1_00000;\n" +
+		"      meta-disk internal;\n" +
+		"      disk {\n" +
+		"        block-size 4096;\n" +
+		"        discard-zeroes-if-aligned yes;\n" +
+		"      }\n" +
+		"    }\n" +
+		"    volume 1 {\n" +
+		"      device /dev/drbd1001 minor 1001;\n" +
+		"      disk /dev/zvol/p/pvc-1_00001;\n" +
+		"      meta-disk internal;\n" +
+		"    }\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("volume 0 must carry its own disk block and volume 1 none; got:\n%s", got)
+	}
+
+	if strings.Count(got, "block-size") != 1 {
+		t.Errorf("block-size must render once, in the local volume only; got:\n%s", got)
+	}
+}
+
+// TestVolumeOptionValueWithNoSpellingIsRefused: a volume's options go
+// through the same value check as every other block.
+func TestVolumeOptionValueWithNoSpellingIsRefused(t *testing.T) {
+	_, err := drbd.Build(drbd.Resource{
+		Name:  "pvc-1",
+		Hosts: []drbd.Host{{NodeName: "n1", Address: "10.0.0.1", Port: 7000, IsLocal: true}},
+		Volumes: []drbd.Volume{{
+			Number: 0, Device: "/dev/drbd1000", Disk: "/dev/x", Minor: 1000,
+			Options: map[string]string{"block-size": "4096\n}"},
+		}},
+	})
+	if !errors.Is(err, drbd.ErrUnrepresentableValue) {
+		t.Fatalf("Build = %v, want ErrUnrepresentableValue", err)
+	}
+}
