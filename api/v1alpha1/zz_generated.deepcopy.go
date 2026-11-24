@@ -1290,15 +1290,15 @@ func (in *ResourceStatus) DeepCopyInto(out *ResourceStatus) {
 		*out = new(bool)
 		**out = **in
 	}
-	if in.ApplyFailure != nil {
-		in, out := &in.ApplyFailure, &out.ApplyFailure
-		*out = new(ResourceApplyFailure)
-		(*in).DeepCopyInto(*out)
-	}
 	if in.DeletedVolumes != nil {
 		in, out := &in.DeletedVolumes, &out.DeletedVolumes
 		*out = make([]DeletedVolumeStatus, len(*in))
 		copy(*out, *in)
+	}
+	if in.ApplyFailure != nil {
+		in, out := &in.ApplyFailure, &out.ApplyFailure
+		*out = new(ResourceApplyFailure)
+		(*in).DeepCopyInto(*out)
 	}
 }
 
