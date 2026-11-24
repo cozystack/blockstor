@@ -137,6 +137,7 @@ spec:
       protocol: A
     resource:
       quorum: majority
+  peerSlots: 7
   selectFilter:
     layerStack:
     - DRBD
