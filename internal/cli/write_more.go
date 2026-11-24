@@ -247,22 +247,51 @@ func nodeDelete(ctx context.Context, run *runContext) error {
 			return fmt.Errorf("delete objects on %s: %w", name, cascadeErr)
 		}
 	} else {
-		rscRefs, poolRefs, refErr := store.ReferencesOnNode(ctx, run.Store, name)
+		refErr := refuseNodeDeleteIfReferenced(ctx, run, name)
 		if refErr != nil {
-			return fmt.Errorf("list objects on %s: %w", name, refErr)
-		}
-
-		if len(rscRefs) > 0 || len(poolRefs) > 0 {
-			return fmt.Errorf("%w: %s still carries replicas of [%s] and storage pools [%s]; "+
-				"remove them or pass --force",
-				errNodeStillReferenced, name,
-				strings.Join(rscRefs, ", "), strings.Join(poolRefs, ", "))
+			return refErr
 		}
 	}
 
 	err := run.Store.Nodes().Delete(ctx, name)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete node %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// refuseNodeDeleteIfReferenced refuses a plain node delete while replicas or
+// pools still point at the node, or snapshots still have a copy on it, which
+// the node holds until its satellite has deleted them. The REST door refuses
+// on the same.
+func refuseNodeDeleteIfReferenced(ctx context.Context, run *runContext, name string) error {
+	rscRefs, poolRefs, err := store.ReferencesOnNode(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("list objects on %s: %w", name, err)
+	}
+
+	if len(rscRefs) > 0 || len(poolRefs) > 0 {
+		return fmt.Errorf("%w: %s still carries replicas of [%s] and storage pools [%s]; "+
+			"remove them or pass --force",
+			errNodeStillReferenced, name,
+			strings.Join(rscRefs, ", "), strings.Join(poolRefs, ", "))
+	}
+
+	spellings, err := store.NodeSpellings(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("list objects on %s: %w", name, err)
+	}
+
+	snapRefs, err := store.SnapshotsOnNode(ctx, run.Store, spellings)
+	if err != nil {
+		return fmt.Errorf("list snapshots on %s: %w", name, err)
+	}
+
+	if len(snapRefs) > 0 {
+		return fmt.Errorf("%w: %s still holds copies of snapshots [%s]; "+
+			"delete them, or pass --force if the node is gone",
+			errNodeStillReferenced, name, strings.Join(snapRefs, ", "))
 	}
 
 	return nil
@@ -330,6 +359,11 @@ func volumeDefinitionDelete(ctx context.Context, run *runContext) error {
 	rdName := run.Flags.Positionals[0]
 
 	number, err := parseInt32(run.Flags.Positionals[1], "volume number")
+	if err != nil {
+		return err
+	}
+
+	err = checkZFSDeleteStrategy(ctx, run, rdName)
 	if err != nil {
 		return err
 	}
@@ -617,6 +651,11 @@ func resourceDelete(ctx context.Context, run *runContext) error {
 	last := len(run.Flags.Positionals) - 1
 	rdName := run.Flags.Positionals[last]
 
+	err := checkZFSDeleteStrategy(ctx, run, rdName)
+	if err != nil {
+		return err
+	}
+
 	for _, node := range run.Flags.Positionals[:last] {
 		err := checkDeletable(ctx, run, rdName, node)
 		if err != nil {
@@ -627,6 +666,22 @@ func resourceDelete(ctx context.Context, run *runContext) error {
 		if err != nil && !isNotFound(err) {
 			return fmt.Errorf("delete resource %s on %s: %w", rdName, node, err)
 		}
+	}
+
+	return nil
+}
+
+// checkZFSDeleteStrategy refuses a replica or volume definition delete the
+// REST door refuses: LINSTOR's `StorDriver/Zfs/DeleteStrategy` DELETE while
+// the definition has snapshots. --force does not override it, as in LINSTOR.
+func checkZFSDeleteStrategy(ctx context.Context, run *runContext, rdName string) error {
+	refused, err := store.ZFSDeleteRefused(ctx, run.Store, rdName)
+	if err != nil {
+		return fmt.Errorf("check the ZFS delete strategy of %s: %w", rdName, err)
+	}
+
+	if refused {
+		return fmt.Errorf("refusing to delete under %s: %w", rdName, validate.ErrZFSDeleteStrategy)
 	}
 
 	return nil

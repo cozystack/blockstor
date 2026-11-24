@@ -340,6 +340,7 @@ func TestThinRecvSetsSentinelTagBeforeDDAndClearsAfter(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{},
 		strings.NewReader("fake stream"),
 	)
 	if err != nil {
@@ -400,6 +401,7 @@ func TestThinRecvIdempotentSkipWithTagRerunsRecv(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{},
 		strings.NewReader("fake stream"),
 	)
 	if err != nil {
@@ -447,6 +449,7 @@ func TestThinRecvIdempotentSkipWithoutTagIsNoop(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{},
 		strings.NewReader("fake stream"),
 	)
 	if err != nil {

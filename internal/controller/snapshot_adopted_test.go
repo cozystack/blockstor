@@ -118,6 +118,9 @@ var _ = Describe("Snapshot Controller adopted-snapshot gate", func() {
 				Expect(entry.SuspendIOAcked).To(BeFalse())
 			}
 
+			By("recording SUCCESSFUL, which LINSTOR had set on every snapshot it adopts")
+			Expect(snap.Status.Flags).To(ConsistOf(blockstoriov1alpha1.SnapshotStatusFlagSuccessful))
+
 			By("staying terminal on a second reconcile (idempotent)")
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
@@ -127,6 +130,7 @@ var _ = Describe("Snapshot Controller adopted-snapshot gate", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, &snap)).To(Succeed())
 			Expect(snap.Spec.SuspendIO).To(BeFalse())
 			Expect(snap.Status.NodeStatus).To(HaveLen(2))
+			Expect(snap.Status.Flags).To(ConsistOf(blockstoriov1alpha1.SnapshotStatusFlagSuccessful))
 		})
 	})
 })

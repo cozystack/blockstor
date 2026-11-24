@@ -172,7 +172,7 @@ Total Tier 2 tests: 108. Tier 3: 5. Tier 4 retained: 53 scripts (will reach 57 o
 | `TestSnapRestoreCreatesNewRD` | `snap restore` → new RD with cloned VD | F1 |
 | `TestSnapRollbackOnExistingRD` | `snap rollback` → existing RD reverts | F1, Bug 21 |
 | `TestSnapShipCrossNode` | satellite FakeExec captures send-recv | F8 |
-| `TestSnapOrphanCleanup` | finalizer-strip → orphan ZFS snap detected by sweeper | Bug 64, Bug 43 |
+| `TestSnapOrphanCleanup` | the Snapshot CR stays while the satellite finalizer holds it | Bug 64 |
 | `TestSnapDeleteBlockedByLater` | snap ordering: delete of older blocked by newer | wave2 |
 | `TestAutoSnapshotPeriodicTick` | RG `AutoSnapshot/Run` prop → snapshots created | basic |
 

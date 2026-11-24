@@ -230,6 +230,12 @@ func (r *Reconciler) prunePass1Unexpected(
 
 		teardownErr := r.dropDepartedSlot(ctx, rdName, &slot, expectedSet, mayHoldPeerSlots(devices), logger.WithValues("pass", pruneLogPass1, "peer", name))
 		if teardownErr != nil {
+			// The caller logs the error and goes on with the apply,
+			// and a replica that converges asks for no further pass:
+			// without this ask the connection stays up until some
+			// other event reaches the replica.
+			r.retryLater(rdName, bestEffortRetry)
+
 			return errors.Wrapf(teardownErr, "PruneStaleKernelSlots pass 1 (unexpected peer %s)", name)
 		}
 	}
@@ -343,6 +349,8 @@ func (r *Reconciler) prunePass3Stuck(
 
 		first, ready := r.observeStuck(key, now, grace)
 		if !ready {
+			r.retryLater(rdName, grace-now.Sub(first))
+
 			logger.V(1).Info("Pass 3: slot stuck but inside grace window",
 				"peer", name,
 				"state", slot.ConnectionState,
@@ -354,6 +362,8 @@ func (r *Reconciler) prunePass3Stuck(
 
 		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, anyDevice(devices), logger.WithValues("pass", pruneLogPass3, "peer", name))
 		if teardownErr != nil {
+			r.retryLater(rdName, bestEffortRetry)
+
 			logger.Info("Pass 3: teardown of stuck slot failed; will retry next reconcile",
 				"peer", name,
 				"err", teardownErr.Error())

@@ -1300,12 +1300,18 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// `linstor rd d <rd>` returns SUCCESS and the very next
 	// `linstor r l` shows phantom rows for 5–30 s until the cache
 	// catches up on its watch stream. See pkg/rest/cache_invalidation.go.
-	s.waitForRDDeletionVisible(r.Context(), name)
+	converged := s.waitForRDDeletionVisible(r.Context(), name)
 
 	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
 	}}
+	if !converged {
+		if pending := s.replicasStillDeleting(r.Context(), name); len(pending) > 0 {
+			answer = append(answer, deleteInProgress(name, pending))
+		}
+	}
+
 	if reaped != nil {
 		answer = append(answer, *reaped)
 	}

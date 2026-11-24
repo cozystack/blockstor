@@ -49,7 +49,7 @@ func TestAutoSnapshotPruneKeepsTheSourceOfARestore(t *testing.T) {
 		},
 	}
 
-	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd, restored).Build()
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(withReplicas(rd, restored)...).Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
@@ -91,7 +91,7 @@ func TestAutoSnapshotPruneWithAStoreKeepsTheSourceOfAnUnfinishedRestore(t *testi
 		},
 	}
 
-	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd, restored).Build()
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(withReplicas(rd, restored)...).Build()
 
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk, Store: storek8s.New(cli)}
