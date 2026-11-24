@@ -65,6 +65,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/apihealth"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/rest"
 	"github.com/cozystack/blockstor/pkg/store"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
@@ -210,6 +211,14 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 			"address", flags.restAddr)
 	}
 
+	// Every resource view derives the encryption state, and linstor-csi
+	// polls the view; the watches keep that off the API server while
+	// nothing changes.
+	encryptionWatches, err := passphrase.AddWatchedReader(mgr, namespace)
+	if err != nil {
+		return errors.Wrap(err, "add the passphrase watches")
+	}
+
 	err = mgr.Add(&rest.Server{
 		Addr:      flags.restAddr,
 		TLS:       tlsOptions(flags),
@@ -221,6 +230,7 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 		SecretReader: mgr.GetAPIReader(),
 		// A snapshot create answers once its take is over, as LINSTOR's.
 		SnapshotTakeWait: rest.SnapshotTakeWait,
+		StateReader:      encryptionWatches,
 		OnReady:          ready.MarkBound,
 	})
 	if err != nil {
