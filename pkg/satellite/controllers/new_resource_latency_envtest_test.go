@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -230,9 +231,16 @@ func startSatelliteEnvtest(t *testing.T) (client.Client, ctrl.Manager) {
 		t.Fatalf("client: %v", err)
 	}
 
+	// Controller names are registered process-wide for their metrics,
+	// and other tests in this package build the satellite's own
+	// manager, whose ResourceReconciler carries the same name. The
+	// satellite process builds one manager, so only tests collide.
+	skipNameValidation := true
+
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:  scheme,
-		Metrics: metricsserver.Options{BindAddress: "0"},
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: &skipNameValidation},
 	})
 	if err != nil {
 		t.Fatalf("manager: %v", err)

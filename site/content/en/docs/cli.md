@@ -17,6 +17,8 @@ go install github.com/cozystack/blockstor/cmd/blockstor@v<VERSION>
 
 The tool uses the same kubeconfig as `kubectl`: the `KUBECONFIG` variable, then `~/.kube/config`, or the service account when it runs inside a pod.
 
+To pick a cluster on the command line, pass `--kubeconfig <file>` or `--context <name>` after the command, as with `kubectl`, for example `blockstor resource list --context staging`. With either flag the tool uses only that file or context and never falls back to the service account.
+
 ## Getting help
 
 ```sh

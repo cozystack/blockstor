@@ -60,3 +60,9 @@ func (r *Reconciler) SetDemoteRetryForTest(backoff []time.Duration, every time.D
 	r.demotes.backoff = backoff
 	r.demotes.every = every
 }
+
+// DrbdGrossKibForTest re-exports the backing size a grow gives a DRBD
+// volume with internal metadata.
+func DrbdGrossKibForTest(netKib int64) int64 {
+	return drbdGrossKib(netKib)
+}

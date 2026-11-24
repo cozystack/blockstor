@@ -96,6 +96,20 @@ type Resource struct {
 	// time, matching upstream's per-resource timestamp. Set only on
 	// the read path (crdToWireResource); ignored on writes.
 	CreateTimestamp int64 `json:"create_timestamp,omitempty"`
+
+	// ApplyFailure is the error of the satellite's last apply pass on
+	// this replica, nil when that pass succeeded (Resource status).
+	// Internal: LINSTOR reports a satellite's error in the answer to
+	// the call that triggered the pass, and this is what lets a
+	// resize do the same.
+	ApplyFailure *ApplyFailure `json:"-"`
+}
+
+// ApplyFailure is the error of a failed satellite apply pass, with the
+// definition size of each volume that pass was applying.
+type ApplyFailure struct {
+	Message  string
+	SizesKib map[int32]int64
 }
 
 // ResourceState is the runtime state surface of a Resource.
@@ -185,6 +199,13 @@ type Volume struct {
 	// to a literal "Created" regardless of what disk_state we set.
 	// listMapKey type matches upstream's repeated layer_data shape.
 	LayerDataList []VolumeLayerData `json:"layer_data_list,omitempty"`
+
+	// AppliedSizeKib is the volume definition size the satellite has
+	// finished applying on this replica (Resource status), 0 when it
+	// never reported one. Internal: LINSTOR has no such field, it is
+	// what the REST layer reads to answer a resize only once the
+	// device has grown.
+	AppliedSizeKib int64 `json:"-"`
 }
 
 // VolumeLayerData mirrors upstream LINSTOR's per-volume layer
@@ -205,11 +226,15 @@ type VolumeState struct {
 	// full initial-sync (Phase 8.1).
 	CurrentGi string `json:"current_gi,omitempty"`
 
-	// OutOfSyncKib is the out-of-sync count of the last
-	// `drbdsetup events2 --statistics` peer-device frame for this
-	// volume, whichever peer it was about. 0 means in sync with that
-	// peer. It is not a resync progress once a replica has more than
-	// one peer; that is ReplicationStates[peer].DonePercentage.
+	// OutOfSyncKib is the largest out-of-sync count over this
+	// volume's peers, as `drbdsetup events2 --statistics` peer-device
+	// frames report it. 0 means in sync with every peer. It is not a
+	// resync progress once a replica has more than one peer; that is
+	// ReplicationStates[peer].DonePercentage. While the volume is
+	// UpToDate and no peer resyncs with the replica, a change that
+	// keeps the count non-zero can arrive up to 5 minutes late; a
+	// change to or from 0, and any change during a resync, arrives at
+	// once.
 	OutOfSyncKib int64 `json:"out_of_sync_kib,omitempty"`
 
 	// ReplicationStates is the per-peer replication-state map the
