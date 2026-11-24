@@ -77,7 +77,7 @@ The scheduled rebalance leaves alone a definition with no replica that holds dat
 
 ## Not served
 
-- RWX block volumes without DRBD on shared storage (linstor-csi v1.13.0). LINSTOR activates such a resource on both nodes; blockstor has no shared activation. Every blockstor pool now reads as local to the driver, so it refuses such a volume at CreateVolume with "ReadWriteMany volumes require a DRBD layer or shared storage" instead of failing at attach.
+- RWX block volumes without DRBD on shared storage (linstor-csi v1.13.0). LINSTOR activates such a resource on both nodes; blockstor has no shared activation. A pool without `shared_space` reads as local to the driver, so it refuses such a volume at CreateVolume with "ReadWriteMany volumes require a DRBD layer or shared storage". A pool registered with `shared_space` reads as shared, as it does on LINSTOR, so CreateVolume succeeds there and every attach then fails with `FAIL_INVLD_LAYER_STACK`; see row 113 of `cli-parity-known-deltas.md`.
 - Clone `volume_sizes` (REST 1.29.1), see above.
 - Backups and shipping to remotes.
 
