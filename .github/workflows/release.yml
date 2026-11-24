@@ -27,8 +27,14 @@ name: Release Images
 # whole pipeline is exercised, but the merge job only prints the index it
 # would create, no tag is written, and no GitHub Release is cut.
 #
+# Alongside the images, the cli job cross-compiles the blockstor CLI
+# (cmd/blockstor) for linux, darwin and windows on amd64 and arm64. It is
+# pure Go with CGO off, so one runner builds every target. On a dry run
+# the binaries and their SHA256SUMS are kept as a workflow artifact only.
+#
 # After the images publish, the workflow ALSO cuts the GitHub Release object
-# for the tag (body taken from the matching CHANGELOG.md section).
+# for the tag (body taken from the matching CHANGELOG.md section) and
+# attaches the CLI binaries and SHA256SUMS to it.
 
 on:
   push:
@@ -249,6 +255,54 @@ jobs:
             exit 1
           fi
 
+  cli:
+    name: Build the blockstor CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Cross-compile
+        env:
+          # `blockstor controller version` prints this. A dry run has no tag,
+          # so it says which commit it came from instead.
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            ext=""
+            [ "$os" = windows ] && ext=".exe"
+            echo "building blockstor-$os-$arch$ext"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -buildvcs=false -trimpath \
+              -ldflags "-s -w -X github.com/cozystack/blockstor/internal/cli.Version=$VERSION" \
+              -o "dist/blockstor-$os-$arch$ext" ./cmd/blockstor
+          done
+          (cd dist && sha256sum blockstor-* > SHA256SUMS)
+          cat dist/SHA256SUMS
+          # Proves the stamp landed, on the one target this runner can execute.
+          ./dist/blockstor-linux-amd64 controller version
+
+      - name: Upload the binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blockstor-cli
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   github-release:
     name: Create GitHub Release
     # After all three images publish, cut the GitHub Release for the tag:
@@ -256,7 +310,7 @@ jobs:
     # CHANGELOG.md (the same content used for prior releases). Pre-release tags
     # (vMAJOR.MINOR.PATCH-rc.N / -alpha / -beta) are marked pre-release and not
     # "Latest". Idempotent: updates the release if it already exists (re-run).
-    needs: merge
+    needs: [merge, cli]
     # A dry run (not a tag) publishes nothing, so there is nothing to release.
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
@@ -267,6 +321,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Download the CLI binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: blockstor-cli
+          path: ${{ runner.temp }}/cli
 
       - name: Cut the GitHub Release from the CHANGELOG section
         env:
@@ -304,3 +364,6 @@ jobs:
             echo "::warning::CHANGELOG.md has no section for $TAG; using auto-generated notes."
             gh release create "$TAG" --title "$TAG" --verify-tag --generate-notes "${prerelease[@]}" "${latest[@]}"
           fi
+
+          # --clobber so a re-run replaces the assets of the release it updated.
+          gh release upload "$TAG" "$RUNNER_TEMP"/cli/* --clobber

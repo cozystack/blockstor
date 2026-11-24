@@ -21,6 +21,7 @@ package drbd_test
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -276,3 +277,48 @@ func TestIsUnknownResourceErr(t *testing.T) {
 		})
 	}
 }
+
+// TestBitmapDropPeerNodeIDs pins the node-ids read off a bitmap-drop
+// refusal: the recovery forgets exactly those slots, so a wrong or
+// missing id either leaves the wedge or drops a working peer.
+func TestBitmapDropPeerNodeIDs(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want []int32
+	}{
+		{"nil", nil, nil},
+		{"two volumes of one peer and another peer", errBitmapRefusalTwoPeers, []int32{2, 12}},
+		{"other (162) reason", errOther162WithBitmapCmd, nil},
+		{"refusal without the command", errBitmapRefusalNoCmd, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := drbd.BitmapDropPeerNodeIDs(tc.err)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("BitmapDropPeerNodeIDs = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Fixtures for TestBitmapDropPeerNodeIDs, in the shape drbdadm adjust
+// reports a failed peer-device-options.
+var (
+	errBitmapRefusalTwoPeers = errors.New("pvc-x: Failure: (162) Invalid configuration request\n" +
+		"additional info from kernel:\nCan not drop the bitmap when both sides have a disk\n" +
+		"Command 'drbdsetup peer-device-options pvc-x 2 0 --set-defaults --bitmap=no' terminated with exit code 10: exit status 1\n" +
+		"pvc-x: Failure: (162) Invalid configuration request\n" +
+		"additional info from kernel:\nCan not drop the bitmap when both sides have a disk\n" +
+		"Command 'drbdsetup peer-device-options pvc-x 2 1 --set-defaults --bitmap=no' terminated with exit code 10: exit status 1\n" +
+		"Command 'drbdsetup peer-device-options pvc-x 12 0 --set-defaults --bitmap=no' terminated with exit code 10: exit status 1")
+	errOther162WithBitmapCmd = errors.New("pvc-x: Failure: (162) Invalid configuration request\n" +
+		"Command 'drbdsetup peer-device-options pvc-x 2 0 --set-defaults --bitmap=no' terminated")
+	errBitmapRefusalNoCmd = errors.New("pvc-x: Failure: (162) Invalid configuration request\n" +
+		"additional info from kernel:\nCan not drop the bitmap when both sides have a disk")
+)

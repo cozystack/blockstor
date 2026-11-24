@@ -40,6 +40,12 @@ func (r *ResourceReconciler) EnqueueSiblings(ctx context.Context, obj client.Obj
 	return r.enqueueSiblings(ctx, obj)
 }
 
+// ResourceUpdateCarriesChange exposes the Resource watch filter the
+// controller applies to updates, so tests can pin which writes reach it.
+func ResourceUpdateCarriesChange(oldObj, newObj client.Object) bool {
+	return resourceUpdateCarriesChange(oldObj, newObj)
+}
+
 // EnqueueRDForResource exposes the RD-side parent lookup for tests.
 // Production wiring stays unexported via SetupWithManager.
 func (r *ResourceDefinitionReconciler) EnqueueRDForResource(ctx context.Context, obj client.Object) []reconcile.Request {
