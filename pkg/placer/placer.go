@@ -332,20 +332,20 @@ func (pl *placePlan) shortfallError() error {
 //
 // Precedence: physical floor (maxFreeKib > 0) wins over oversub, see
 // the capacityShortfall branch of place for the rationale.
-func (plan *placePlan) partialShortfall(placed, want int) error {
-	if placed >= want || plan.requiredKib <= 0 {
+func (pl *placePlan) partialShortfall(placed, want int) error {
+	if placed >= want || pl.requiredKib <= 0 {
 		return nil
 	}
 
-	if plan.maxFreeKib > 0 {
+	if pl.maxFreeKib > 0 {
 		return &CapacityShortfallError{
-			RequiredKib: plan.requiredKib,
-			MaxFreeKib:  plan.maxFreeKib,
+			RequiredKib: pl.requiredKib,
+			MaxFreeKib:  pl.maxFreeKib,
 		}
 	}
 
-	if plan.oversubShortfall != nil {
-		return plan.oversubShortfall
+	if pl.oversubShortfall != nil {
+		return pl.oversubShortfall
 	}
 
 	return nil
