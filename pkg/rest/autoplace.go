@@ -125,7 +125,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {
-		out = append(out, wrapResourceWithLayers(&resList[i], rd.LayerStack, vdSizes))
+		out = append(out, wrapResourceWithLayers(&resList[i], rd.LayerStack, s.placeholderPool(r.Context(), &resList[i]), vdSizes))
 	}
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys (passphrase,
@@ -201,8 +201,8 @@ func balancingStopped(rd *apiv1.ResourceDefinition) bool {
 // unconditionally and crashes on `None.iter`. Mirrors the
 // ensureVolumesForView contract used by /v1/view/resources: a non-nil
 // (possibly empty) slice survives the JSON encode as `[]`.
-func wrapResourceWithVolumes(res *apiv1.Resource, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
-	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, res, vdSizes)}
+func wrapResourceWithVolumes(res *apiv1.Resource, poolFor func(int32) string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
+	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, poolFor, vdSizes)}
 }
 
 // wrapResourceWithLayers wraps a replica re-stamped with its
@@ -214,9 +214,9 @@ func wrapResourceWithVolumes(res *apiv1.Resource, vdSizes map[int32]int64) apiv1
 //
 // The volumes are copied before the re-stamp: a store may hand back a
 // slice it still holds.
-func wrapResourceWithLayers(res *apiv1.Resource, stack []string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
+func wrapResourceWithLayers(res *apiv1.Resource, stack []string, poolFor func(int32) string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
 	if len(stack) == 0 {
-		return wrapResourceWithVolumes(res, vdSizes)
+		return wrapResourceWithVolumes(res, poolFor, vdSizes)
 	}
 
 	stamped := *res
@@ -225,7 +225,7 @@ func wrapResourceWithLayers(res *apiv1.Resource, stack []string, vdSizes map[int
 	apiv1.ApplyLayerStack(&stamped, stack)
 	apiv1.ApplyLayerStackToVolumes(stamped.Volumes, stack)
 
-	return wrapResourceWithVolumes(&stamped, vdSizes)
+	return wrapResourceWithVolumes(&stamped, poolFor, vdSizes)
 }
 
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
@@ -288,7 +288,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// outer `volumes` JSON key serialises as `[]` instead of `null` when
 	// the Resource carries no Volumes; protects python-linstor's
 	// `rsc._rest_data['volumes']` dereference.
-	writeJSON(w, http.StatusOK, wrapResourceWithLayers(&res, rd.LayerStack, s.definitionVolumeSizes(r.Context(), rdName)))
+	writeJSON(w, http.StatusOK, wrapResourceWithLayers(&res, rd.LayerStack, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)))
 }
 
 // handleAutoplace selects up to `place_count` nodes that have a storage

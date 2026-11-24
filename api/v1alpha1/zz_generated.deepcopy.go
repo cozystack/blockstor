@@ -1270,6 +1270,16 @@ func (in *ResourceStatus) DeepCopyInto(out *ResourceStatus) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.PromotionScore != nil {
+		in, out := &in.PromotionScore, &out.PromotionScore
+		*out = new(int32)
+		**out = **in
+	}
+	if in.MayPromote != nil {
+		in, out := &in.MayPromote, &out.MayPromote
+		*out = new(bool)
+		**out = **in
+	}
 	if in.ApplyFailure != nil {
 		in, out := &in.ApplyFailure, &out.ApplyFailure
 		*out = new(ResourceApplyFailure)

@@ -75,7 +75,7 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 
 	// Every volume definition is listed, built or not, as LINSTOR does;
 	// see ensureVolumesForView.
-	writeJSON(w, http.StatusOK, ensureVolumesForView(res.Volumes, &res, s.definitionVolumeSizes(r.Context(), rdName)))
+	writeJSON(w, http.StatusOK, ensureVolumesForView(res.Volumes, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)))
 }
 
 // handleVolumesPerResourceGet answers
@@ -107,7 +107,7 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 	// path, as LINSTOR's does, rather than 404: linstor-csi's attach
 	// then reports "could not determine device path" and retries,
 	// instead of failing on a volume that does exist.
-	vols := ensureVolumesForView(res.Volumes, &res, s.definitionVolumeSizes(r.Context(), rdName))
+	vols := ensureVolumesForView(res.Volumes, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName))
 
 	for i := range vols {
 		if vols[i].VolumeNumber == vlmNr {
