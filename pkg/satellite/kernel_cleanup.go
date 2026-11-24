@@ -135,7 +135,8 @@ type PeerExpectation struct {
 // Show probe failure (kernel queryable but JSON malformed / drbdsetup
 // missing) returns nil immediately — no kernel state observed means
 // no cleanup to do, fall through to the normal apply path. devices
-// may be nil; forget-peer is skipped for volumes without a device path.
+// may be nil when the caller does not know them: Pass 1 then forgets
+// through the kernel anyway (see mayHoldPeerSlots), Pass 3 does not.
 func (r *Reconciler) PruneStaleKernelSlots(
 	ctx context.Context,
 	rdName string,
@@ -228,7 +229,7 @@ func (r *Reconciler) prunePass1Unexpected(
 			continue
 		}
 
-		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, devices, logger.WithValues("pass", pruneLogPass1, "peer", name))
+		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, mayHoldPeerSlots(devices), logger.WithValues("pass", pruneLogPass1, "peer", name))
 		if teardownErr != nil {
 			return errors.Wrapf(teardownErr, "PruneStaleKernelSlots pass 1 (unexpected peer %s)", name)
 		}
@@ -352,7 +353,7 @@ func (r *Reconciler) prunePass3Stuck(
 			continue
 		}
 
-		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, devices, logger.WithValues("pass", pruneLogPass3, "peer", name))
+		teardownErr := r.teardownKernelSlot(ctx, rdName, &slot, anyDevice(devices), logger.WithValues("pass", pruneLogPass3, "peer", name))
 		if teardownErr != nil {
 			logger.Info("Pass 3: teardown of stuck slot failed; will retry next reconcile",
 				"peer", name,
@@ -370,7 +371,8 @@ func (r *Reconciler) prunePass3Stuck(
 
 // teardownKernelSlot is the per-slot del-peer + forget-peer shared
 // between Pass 1 and Pass 3. del-peer is mandatory; forget-peer, through
-// the kernel and once for the resource, is best-effort.
+// the kernel and once for the resource, runs when forget is set and is
+// best-effort.
 //
 // Mirrors tearDownRemovedPeers' del-peer-then-forget-peer ordering
 // without reusing it directly — that function is .res-file-driven and
@@ -379,7 +381,7 @@ func (r *Reconciler) teardownKernelSlot(
 	ctx context.Context,
 	rdName string,
 	slot *drbd.KernelSlot,
-	devices map[int32]string,
+	forget bool,
 	logger logr.Logger,
 ) error {
 	logger.Info("PruneStaleKernelSlots: tearing down kernel slot",
@@ -392,12 +394,10 @@ func (r *Reconciler) teardownKernelSlot(
 	}
 
 	// forget-peer clears the peer's slot on every volume at once,
-	// through the kernel. A local replica with no device at all is
-	// DISKLESS and has no metadata to clean. Errors are non-fatal: a
-	// leaked slot eats one of the MaxPeers-1 budget entries and the next
-	// reconcile retries, while del-peer above already closed the kernel
-	// connection.
-	if !anyDevice(devices) {
+	// through the kernel. Errors are non-fatal: a leaked slot eats one
+	// of the MaxPeers-1 budget entries and the next reconcile retries,
+	// while del-peer above already closed the kernel connection.
+	if !forget {
 		return nil
 	}
 
@@ -407,6 +407,22 @@ func (r *Reconciler) teardownKernelSlot(
 	}
 
 	return nil
+}
+
+// mayHoldPeerSlots reports whether the local replica may have metadata
+// a departed peer's slot is kept in: devices names a disk, or devices
+// is nil because the caller does not know.
+//
+// Pass 1 forgets a deleted peer whenever that is possible, as LINSTOR's
+// satellite does. A slot left behind keeps the departed replica's flags
+// under its node-id, and the node-id goes back into the pool with the
+// connection: the next replica given it inherits them. A diskless one
+// then comes up as `peer-disk:Outdated`, and adjust fails on it with
+// "Can not drop the bitmap when both sides have a disk". When the
+// local replica has no disk after all, the kernel skips every volume
+// without one and still answers success, so asking costs nothing.
+func mayHoldPeerSlots(devices map[int32]string) bool {
+	return devices == nil || anyDevice(devices)
 }
 
 // shouldPruneStuckSlot returns true when `slot` matches the Pass-3

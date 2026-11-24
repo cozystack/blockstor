@@ -712,7 +712,7 @@ func (r *ResourceReconciler) prepareDRBDApply(
 		rd.Name,
 		peerExpectationFor(res, peers),
 		volNumsOf(rd),
-		nil, // devices unknown at this layer; forget-peer skipped per-vol
+		nil, // devices unknown here: Pass 1 still forgets, Pass 3 does not
 	)
 	if pruneErr != nil {
 		logger.Error(pruneErr, "PruneStaleKernelSlots failed; continuing to allocation gate")
