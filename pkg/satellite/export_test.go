@@ -51,3 +51,9 @@ func WipeDeviceForTest(ctx context.Context, exec storage.Exec, devicePath string
 func (r *Reconciler) RecoverFromBitmapBothDisksForTest(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
 	return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, skipNet)
 }
+
+// DrbdGrossKibForTest re-exports the backing size a grow gives a DRBD
+// volume with internal metadata.
+func DrbdGrossKibForTest(netKib int64) int64 {
+	return drbdGrossKib(netKib)
+}

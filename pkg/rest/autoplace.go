@@ -107,14 +107,14 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	// ControllerPublishVolume right after the spawn; a sibling
 	// apiserver replica's cache may still trail the spawn write.
 	// See pkg/rest/cache_retry.go.
-	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	resList, err := s.Store.Resources().ListByDefinition(r.Context(), rdName)
+	resList, err := s.definitionReplicas(r.Context(), &rd)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -147,6 +147,47 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	stripInternalAnnotationsFromResourcesWithVolumes(out)
 
 	writeJSON(w, http.StatusOK, out)
+}
+
+// definitionReplicas lists rd's replicas for handleResourceList: from
+// the cache, unless balancing is switched off for rd or rd is being
+// deleted, and then from the API server.
+//
+// linstor-csi deletes a volume by switching balancing off on its
+// definition, listing its replicas and deleting each one it listed. A
+// placement pass can create a replica right before the switch, and
+// LINSTOR answers that list with it, since it reads under the lock the
+// placement holds. A cache that has not seen the create yet answers
+// without it, the replica is never deleted, and it keeps the definition,
+// a kernel resource and its ports for good. The pass re-reads the
+// definition after it placed, so everything it created before the
+// switch exists on the API server by the time linstor-csi lists.
+//
+// The definition is read past the cache too, unless the cached copy
+// already shows the switch: the switch may have been written through
+// another replica of this server, whose write this cache has not seen
+// either. A definition that cannot be read that way is listed past the
+// cache as well.
+func (s *Server) definitionReplicas(ctx context.Context, rd *apiv1.ResourceDefinition) ([]apiv1.Resource, error) {
+	stopped := balancingStopped(rd)
+	if !stopped {
+		current, err := s.Store.ResourceDefinitions().GetUncached(ctx, rd.Name)
+		stopped = err != nil || balancingStopped(&current)
+	}
+
+	if stopped {
+		return store.LiveReplicas(ctx, s.Store, rd.Name) //nolint:wrapcheck // the handler reports it as is
+	}
+
+	return s.Store.Resources().ListByDefinition(ctx, rd.Name) //nolint:wrapcheck // the handler reports it as is
+}
+
+// balancingStopped reports whether rd is being deleted or carries
+// BalanceResourcesEnabled=false itself, which is where linstor-csi
+// writes it for the length of a volume delete.
+func balancingStopped(rd *apiv1.ResourceDefinition) bool {
+	return slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) ||
+		strings.EqualFold(rd.Props[apiv1.PropBalanceResourcesEnabled], "false")
 }
 
 // wrapResourceWithVolumes wraps a Resource into ResourceWithVolumes with
@@ -868,12 +909,7 @@ func resolveCloneSourceProviderKind(ctx context.Context, st store.Store, rd *api
 		return ""
 	}
 
-	srcRD, _, ok := strings.Cut(stamp, ":")
-	if !ok || srcRD == "" {
-		return ""
-	}
-
-	return placer.SourceProviderKind(ctx, st, srcRD)
+	return placer.RestoreSourceProviderKind(ctx, st, stamp)
 }
 
 // constrainAutoplaceToSnapshotNodes restricts the filter's
@@ -1496,6 +1532,12 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		return nil, false
 	}
 
+	// The replicas are written one at a time, and LINSTOR writes them in
+	// one transaction: without the hold the tiebreaker reconciler sees
+	// the first two of `r c n1 n2 n3` as an even-diskful tie and puts a
+	// witness on n3 before its own create turns it diskful.
+	defer placer.HoldWitness(r.Context(), s.Store, rdName, countDiskfulEnvelopes(envelopes))()
+
 	created := make([]apiv1.Resource, 0, len(envelopes))
 
 	for i := range envelopes {
@@ -1508,6 +1550,21 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	}
 
 	return created, true
+}
+
+// countDiskfulEnvelopes counts the envelopes of a resource create that
+// ask for a diskful replica: neither spelling of the diskless flag.
+func countDiskfulEnvelopes(envelopes []apiv1.ResourceCreate) int {
+	n := 0
+
+	for i := range envelopes {
+		flags := envelopes[i].Resource.Flags
+		if !slices.Contains(flags, apiv1.ResourceFlagDiskless) && !slices.Contains(flags, rscFlagDrbdDiskless) {
+			n++
+		}
+	}
+
+	return n
 }
 
 // createOneResource runs the full per-envelope wire-boundary
@@ -2884,6 +2941,12 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// this apiserver replica reflects it. See
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
+
+	// Drop a witness the delete left without a tie to break before
+	// replying, as upstream does for the shapes where its helper no
+	// longer wants one, so the caller's next listing shows it as going.
+	// See resource_delete_orphan_witness.go.
+	s.reapUnneededWitnesses(r.Context(), rdName)
 
 	// Bug 67: notify surviving sibling Resources of the peer change
 	// so satellite reconcilers re-derive their peer set without the
