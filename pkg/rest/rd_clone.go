@@ -34,6 +34,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
@@ -257,6 +258,10 @@ func cloneRequestDropsNothing(w http.ResponseWriter, srcName string, req *rdClon
 			Correc: "drop " + key + " from override_props, delete_props and delete_namespaces",
 		})
 
+		return false
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, req.OverrideProps) {
 		return false
 	}
 
