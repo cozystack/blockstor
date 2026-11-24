@@ -117,6 +117,14 @@ func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
+	// Report which replicas still hold I/O suspended before anything
+	// else, so an abort is never read as a resume the kernels have not
+	// confirmed.
+	err = r.stampIOSuspendedCondition(ctx, &snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Adopted snapshots (imported from another storage controller by
 	// a migration tool; see AnnotationSnapshotAdopted) already exist
 	// on disk. NEVER run the suspend→take→resume orchestration for
@@ -326,7 +334,7 @@ func (r *SnapshotReconciler) advancePhase(
 
 			return r.abortGroupWithReason(ctx, siblings,
 				"snapshot aborted: replica on node '"+offending+
-					"' is not UpToDate; I/O resumed")
+					"' is not UpToDate; resume of I/O requested")
 		}
 	}
 
@@ -417,7 +425,7 @@ func (r *SnapshotReconciler) checkAbortConditions(
 
 		res, err := r.abortGroupWithReason(ctx, siblings,
 			"snapshot aborted: suspend/take exceeded the "+
-				snapshotSuspendDeadline.String()+" deadline; I/O resumed")
+				snapshotSuspendDeadline.String()+" deadline; resume of I/O requested")
 
 		return true, res, err
 	}
