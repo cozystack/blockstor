@@ -25,8 +25,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/propwhitelist"
-
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -72,12 +72,7 @@ var handlers = map[string]handler{
 
 	"resource list": resourceList,
 
-	"volume list": listing("resources",
-		fetchResources,
-		keepResource,
-		func(resources []apiv1.Resource, _ *runContext) *metav1.Table { return view.VolumeList(resources) },
-		"State",
-	),
+	"volume list": volumeList,
 
 	"snapshot list": listing("snapshots",
 		func(ctx context.Context, st store.Store) ([]apiv1.Snapshot, error) { return st.Snapshots().List(ctx) },
@@ -130,12 +125,7 @@ var handlers = map[string]handler{
 	"resource activate":    resourceActivate,
 	"resource deactivate":  resourceDeactivate,
 
-	"resource list-volumes": listing("resources",
-		fetchResources,
-		keepResource,
-		func(resources []apiv1.Resource, _ *runContext) *metav1.Table { return view.VolumeList(resources) },
-		"State",
-	),
+	"resource list-volumes": volumeList,
 
 	"storage-pool create": storagePoolCreate,
 	"storage-pool delete": storagePoolDelete,
@@ -263,16 +253,73 @@ func keepResource(res *apiv1.Resource, flags *flagSet) bool {
 	return matches(flags.Nodes, res.NodeName) && matches(flags.Resources, res.Name)
 }
 
-// keepFaultyResource applies --faulty as part of the FILTER, not as a
-// rendering decision. Filtering during render would leave `-m` — which
-// skips the renderer — returning every replica for a command whose
-// whole point is to narrow to the broken ones.
-func keepFaultyResource(res *apiv1.Resource, flags *flagSet) bool {
-	if !keepResource(res, flags) {
-		return false
+// keepFaulty applies --faulty as part of the FILTER, not as a rendering
+// decision. Filtering during render would leave `-m` — which skips the
+// renderer — returning every replica for a command whose whole point is
+// to narrow to the broken ones.
+func keepFaulty(resources []apiv1.Resource, defProps map[string]map[string]string, flags *flagSet) []apiv1.Resource {
+	if !flags.Faulty {
+		return resources
 	}
 
-	return !flags.Faulty || view.IsFaulty(res)
+	kept := resources[:0]
+
+	for i := range resources {
+		if view.IsFaulty(&resources[i], defProps[naming.Key(resources[i].Name)]) {
+			kept = append(kept, resources[i])
+		}
+	}
+
+	return kept
+}
+
+// explainSkipDisk prints what a SkipDisk marker in the table means, on
+// stderr so the table on stdout stays the contract `awk -F'|'` parses.
+func explainSkipDisk(run *runContext, resources []apiv1.Resource, defProps map[string]map[string]string) {
+	if run.Err == nil {
+		return
+	}
+
+	for i := range resources {
+		if view.SkipDisk(&resources[i], defProps[naming.Key(resources[i].Name)]) {
+			fmt.Fprint(run.Err, view.SkipDiskHelp)
+
+			return
+		}
+	}
+}
+
+// volumeList implements `volume list` and `resource list-volumes`: the
+// shared listing shape, with the replicas stamped with their layer
+// stacks before either output reads them.
+func volumeList(ctx context.Context, run *runContext) error {
+	resources, err := fetchResources(ctx, run.Store)
+	if err != nil {
+		return fmt.Errorf("list resources: %w", err)
+	}
+
+	kept := make([]apiv1.Resource, 0, len(resources))
+
+	for i := range resources {
+		if keepResource(&resources[i], run.Flags) {
+			kept = append(kept, resources[i])
+		}
+	}
+
+	kept = applyLimit(kept, run.Flags)
+
+	defProps := withLayerStacks(ctx, run, kept)
+
+	if run.Flags.Machine {
+		return machineOut(run, kept)
+	}
+
+	err = run.render(view.VolumeList(kept, defProps), "State")
+	if err == nil {
+		explainSkipDisk(run, kept, defProps)
+	}
+
+	return err
 }
 
 // volumeDefinitionList implements `volume-definition list` (`vd l`).
@@ -333,10 +380,20 @@ func resourceList(ctx context.Context, run *runContext) error {
 	kept := make([]apiv1.Resource, 0, len(resources))
 
 	for i := range resources {
-		if keepFaultyResource(&resources[i], run.Flags) {
+		if keepResource(&resources[i], run.Flags) {
 			kept = append(kept, resources[i])
 		}
 	}
+
+	// Stamped before --faulty reads them: whether a replica is faulty
+	// depends on which layers it has.
+	defProps := withLayerStacks(ctx, run, kept)
+
+	// Counted before --faulty narrows the rows: a faulty primary whose
+	// second primary is healthy is still one of two.
+	primaries := view.PrimariesByDefinition(kept)
+
+	kept = keepFaulty(kept, defProps, run.Flags)
 
 	kept = applyLimit(kept, run.Flags)
 
@@ -344,10 +401,17 @@ func resourceList(ctx context.Context, run *runContext) error {
 		return machineOut(run, kept)
 	}
 
-	return run.render(view.ResourceList(view.ResourceListInput{
-		Resources:  kept,
-		FaultyOnly: run.Flags.Faulty,
+	err = run.render(view.ResourceList(view.ResourceListInput{
+		Resources:       kept,
+		DefinitionProps: defProps,
+		Primaries:       primaries,
+		FaultyOnly:      run.Flags.Faulty,
 	}), "State", "Conns")
+	if err == nil {
+		explainSkipDisk(run, kept, defProps)
+	}
+
+	return err
 }
 
 // machineOut writes the machine-readable envelope.
