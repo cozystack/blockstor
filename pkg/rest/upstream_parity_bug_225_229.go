@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -135,19 +136,16 @@ func (s *Server) handleSpaceReport(w http.ResponseWriter, r *http.Request) {
 }
 
 // resourceDefinitionSyncStatus mirrors upstream Java's
-// JsonGenTypes.ResourceDefinitionSyncStatus — a single boolean
-// `synced_on_all` reflecting whether every replica reports the
-// healthy DRBD `UpToDate` state.
+// JsonGenTypes.ResourceDefinitionSyncStatus: a single boolean
+// `synced_on_all`.
 type resourceDefinitionSyncStatus struct {
 	SyncedOnAll bool `json:"synced_on_all"`
 }
 
 // handleResourceDefinitionSyncStatus serves Bug 227. Validates the
-// RD exists (404 otherwise), then walks every replica and
-// short-circuits on the first non-`UpToDate` DRBD state. An RD with
-// no replicas is reported as synced (vacuously true) — matches the
-// upstream behaviour where `isResourceSynced` returns true for a
-// zero-placement RD.
+// RD exists (404 otherwise), then answers whether every diskful
+// replica is UpToDate, by the rule of LINSTOR's isResourceSynced
+// (see replicaSynced). An RD with no diskful replica is synced.
 func (s *Server) handleResourceDefinitionSyncStatus(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 
@@ -165,16 +163,16 @@ func (s *Server) handleResourceDefinitionSyncStatus(w http.ResponseWriter, r *ht
 		return
 	}
 
+	// The store keeps a satellite's last report after the satellite is
+	// gone. LINSTOR answers from the live connection only, so a replica
+	// on an OFFLINE node, or one the restarted satellite has not
+	// reported yet, has no state there rather than its stale one.
+	s.forgetStaleReplicas(r.Context(), resources)
+
 	synced := true
 
 	for i := range resources {
-		// An empty state means the satellite hasn't reported yet —
-		// treat that as not-synced so the snapshot pre-check (which
-		// is what `linstor rd sync-status` typically gates on)
-		// doesn't run before the satellite has had a chance to
-		// report `UpToDate`. Once every replica has reported
-		// `UpToDate`, the response flips to true.
-		if resources[i].State.DrbdState != diskStateUpToDate {
+		if !replicaSynced(&resources[i]) {
 			synced = false
 
 			break
@@ -182,6 +180,47 @@ func (s *Server) handleResourceDefinitionSyncStatus(w http.ResponseWriter, r *ht
 	}
 
 	writeJSON(w, http.StatusOK, resourceDefinitionSyncStatus{SyncedOnAll: synced})
+}
+
+// replicaSynced is LINSTOR's
+// SatelliteResourceStateDrbdUtils.allVolumesUpToDate with
+// defaultIfUnknown=true, applied to the diskful replicas only.
+//
+// A diskless replica, tie-breaker included, has no disk to sync and
+// is skipped. A replica whose state is unknown, because its node is
+// OFFLINE or its satellite has not reported it yet, counts as synced:
+// LINSTOR gives an unknown replica the benefit of the doubt, and
+// piraeus-operator's evacuation waits on this answer, so reading
+// unknown as not synced would stall it for as long as a node is down.
+// Otherwise every volume the satellite reported must be UpToDate.
+func replicaSynced(res *apiv1.Resource) bool {
+	if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) ||
+		slices.Contains(res.Flags, apiv1.ResourceFlagTieBreaker) {
+		return true
+	}
+
+	reported := false
+
+	for i := range res.Volumes {
+		disk := res.Volumes[i].State.DiskState
+		if disk == "" {
+			continue
+		}
+
+		reported = true
+
+		if !strings.EqualFold(disk, diskStateUpToDate) {
+			return false
+		}
+	}
+
+	// A replica written before the satellite stamped per-volume state
+	// carries only the resource-level disk state.
+	if !reported && res.State.DrbdState != "" {
+		return strings.EqualFold(res.State.DrbdState, diskStateUpToDate)
+	}
+
+	return true
 }
 
 // satelliteConfigNet mirrors upstream Java's
