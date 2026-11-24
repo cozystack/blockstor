@@ -6,7 +6,7 @@ All notable changes to blockstor are recorded here. The format follows
 
 ## v0.4.0-alpha.19 — 2026-11-24
 
-Pre-release for testing the LINSTOR adoption. It is built from main, which now carries #280, #281, #282, #297 and #311 next to the pull requests merged before alpha.18, and from the open pull requests #271 to #324 that are not merged into main yet, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.18; the entries below are what changed since.
+Pre-release for testing the LINSTOR adoption. It is built from main, which now carries #280, #281, #282, #297, #311 and #312 next to the pull requests merged before alpha.18, and from the open pull requests #271 to #324 that are not merged into main yet, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.18; the entries below are what changed since.
 
 ### Changes since v0.4.0-alpha.18
 
