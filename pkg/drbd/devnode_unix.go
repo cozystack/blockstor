@@ -23,12 +23,14 @@ package drbd
 import (
 	"os"
 	"syscall"
+
+	"github.com/cockroachdb/errors"
 )
 
 const sIFBLK = syscall.S_IFBLK
 
 func mknod(path string, mode uint32, dev uint64) error {
-	return syscall.Mknod(path, mode, int(dev)) //nolint:gosec // dev encodes major=147 + minor<=65535; int conversion never truncates
+	return errors.WithStack(syscall.Mknod(path, mode, int(dev))) //nolint:gosec // dev encodes major=147 + minor<=65535; int conversion never truncates
 }
 
 func statRdev(info os.FileInfo) (uint64, bool) {
@@ -37,5 +39,5 @@ func statRdev(info os.FileInfo) (uint64, bool) {
 		return 0, false
 	}
 
-	return uint64(stat.Rdev), true //nolint:gosec,unconvert // Rdev type varies by OS and arch
+	return uint64(stat.Rdev), true //nolint:unconvert // Rdev type varies by OS and arch
 }
