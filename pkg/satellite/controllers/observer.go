@@ -2642,7 +2642,8 @@ func largestOutOfSync(peers map[string]int64) int64 {
 func forgetPeerOutOfSync(cache map[int32]volumeObservation, peer string) bool {
 	changed := false
 
-	for num, vol := range cache {
+	for num := range cache {
+		vol := cache[num]
 		if _, ok := vol.PeerOutOfSync[peer]; !ok {
 			continue
 		}
