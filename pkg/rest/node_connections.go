@@ -33,6 +33,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -252,6 +253,10 @@ func (s *Server) handleNodeConnectionModify(w http.ResponseWriter, r *http.Reque
 	}
 
 	if !s.refuseNodeConnectionOnUnknownNode(w, r, dst) {
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.NodeConnection, modify.OverrideProps) {
 		return
 	}
 

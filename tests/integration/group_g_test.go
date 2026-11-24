@@ -981,7 +981,7 @@ func testGroupGSnapRestoreSnapshotHolderOnly(t *testing.T, stack *harness.Stack,
 	}, "ship-dst RD missing BlockstorRestoreFromSnapshot=<src>:<snap>")
 }
 
-// testGroupGSnapOrphanCleanup pins Bug 64 + Bug 43: the satellite
+// testGroupGSnapOrphanCleanup pins Bug 64: the satellite
 // finalizer-strip lifecycle. A Snapshot CRD with the
 // `satellite-snapshot` finalizer must NOT disappear from the
 // apiserver while the finalizer is present, even on `kubectl
@@ -992,11 +992,11 @@ func testGroupGSnapRestoreSnapshotHolderOnly(t *testing.T, stack *harness.Stack,
 // pkg/satellite/controllers stack, so we simulate the finalizer
 // lifecycle by hand: stamp the finalizer manually, delete (CRD
 // goes Terminating), strip the finalizer, verify the CRD is
-// reaped. The orphan-storage sweeper (Bug 43) lives on the
-// satellite side and runs against real provider state — not
-// reachable from this harness without touching it (which the
-// playbook forbids). Asserting the controller-side invariant is
-// the closest Tier 2 can get; the kernel-state half is Tier 4.
+// reaped. The satellite-side delete runs against real provider
+// state — not reachable from this harness without touching it
+// (which the playbook forbids). Asserting the controller-side
+// invariant is the closest Tier 2 can get; the kernel-state half
+// is Tier 4.
 func testGroupGSnapOrphanCleanup(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
 	rd := seedRDWithVolume(t, stack, "orphan")
 	cli.Run(t, "snapshot", "create", rd, "snap-orphan")
@@ -1058,11 +1058,9 @@ func testGroupGSnapOrphanCleanup(t *testing.T, stack *harness.Stack, cli *harnes
 
 	// Now strip the finalizer (mimics the satellite finishing
 	// its teardown after the on-disk ZFS/LVM snapshot is gone).
-	// The orphan-storage-sweeper (Bug 43) is what catches the
-	// inverse scenario — operator force-strips before the
-	// satellite tore down — that lives on the satellite side and
-	// is out of scope for this Tier 2 file (see the function-
-	// level doc above).
+	// An operator who force-strips before the satellite tore
+	// down leaves the on-disk snapshot behind: nothing deletes
+	// storage without its own delete request.
 	//
 	// This check runs a couple of seconds after the DELETE, inside
 	// the 10s wait budget, so it only shows the delete waits for the

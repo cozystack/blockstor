@@ -229,9 +229,11 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 		// watches every Secret in the cluster for it.
 		SecretReader: mgr.GetAPIReader(),
 		// A snapshot create answers once its take is over, as LINSTOR's.
-		SnapshotTakeWait: rest.SnapshotTakeWait,
-		StateReader:      encryptionWatches,
-		OnReady:          ready.MarkBound,
+		SnapshotTakeWait:   rest.SnapshotTakeWait,
+		StateReader:        encryptionWatches,
+		OnReady:            ready.MarkBound,
+		ResourceReadyWait:  rest.DefaultResourceReadyWait,
+		ResourceDeployWait: rest.DefaultResourceDeployWait,
 	})
 	if err != nil {
 		return errors.Wrap(err, "add rest server")

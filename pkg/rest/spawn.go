@@ -183,7 +183,7 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 	// spawn = create RD + VDs + place replicas. Without this step,
 	// `r l` would be empty after spawn until the operator runs a
 	// separate `r c --auto-place=N`.
-	placeErr := spawnAutoplace(r.Context(), s, rd.Name, rg, req)
+	deployed, placeErr := spawnAutoplace(r.Context(), s, rd.Name, rg, req)
 	if placeErr != nil {
 		log.FromContext(r.Context()).WithName("rest").
 			Error(placeErr, "spawn autoplace", "rd", rd.Name)
@@ -196,10 +196,14 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	// LINSTOR's spawn places through the same autoplace, and so answers
+	// once deployResources saw the satellites build the replicas.
+	notReady := s.waitDeployedReplicasReady(r.Context(), rd.Name, deployed)
+
+	writeJSON(w, http.StatusCreated, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition spawned: " + rd.Name,
-	}})
+	}}, notReady...))
 }
 
 // spawnAutoplace runs the same placer/select-filter merge that
@@ -207,8 +211,8 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 // of the spawn call. Mirrors upstream LINSTOR's "spawn = create +
 // place" semantic. PartialPlaceCount=0 (no RG constraint) skips
 // placement entirely so plain-CRD spawns without a SelectFilter
-// stay definition-only.
-func spawnAutoplace(ctx context.Context, s *Server, rdName string, rg *apiv1.ResourceGroup, req *apiv1.ResourceGroupSpawn) error {
+// stay definition-only. Returns the nodes the placement deployed to.
+func spawnAutoplace(ctx context.Context, s *Server, rdName string, rg *apiv1.ResourceGroup, req *apiv1.ResourceGroupSpawn) ([]string, error) {
 	// CreateVolume hot path — the RD we just wrote on `s.Store` may not
 	// be visible yet on a sibling apiserver replica's informer cache if
 	// the Spawn POST was load-balanced across pods mid-request. The
@@ -216,7 +220,7 @@ func spawnAutoplace(ctx context.Context, s *Server, rdName string, rg *apiv1.Res
 	// read goes through the informer cache. Retry on NotFound.
 	rd, err := getRDWithCacheRetry(ctx, s.Store, rdName)
 	if err != nil {
-		return errors.Wrap(err, "get spawned RD")
+		return nil, errors.Wrap(err, "get spawned RD")
 	}
 
 	// Merge spawn-time PartialFilter overrides on top of the RG's
@@ -229,19 +233,19 @@ func spawnAutoplace(ctx context.Context, s *Server, rdName string, rg *apiv1.Res
 	}
 
 	if filter.PlaceCount == 0 {
-		return nil
+		return nil, nil
 	}
 
-	placed, want, err := placer.New(s.Store).Place(ctx, rdName, &filter)
+	placement, err := placer.New(s.Store).PlaceDeployed(ctx, rdName, &filter)
 	if err != nil {
-		return errors.Wrap(err, "autoplace")
+		return nil, errors.Wrap(err, "autoplace")
 	}
 
-	if placed < want {
-		return errors.Errorf("not enough candidate storage pools: placed %d of %d", placed, want)
+	if placement.Placed < placement.Want {
+		return nil, errors.Errorf("not enough candidate storage pools: placed %d of %d", placement.Placed, placement.Want)
 	}
 
-	return nil
+	return placement.Deployed, nil
 }
 
 func buildSpawnedRD(req *apiv1.ResourceGroupSpawn, rgName string, rg *apiv1.ResourceGroup) apiv1.ResourceDefinition {

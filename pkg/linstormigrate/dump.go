@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 // dumpFileSuffix is the file-name suffix each table dump carries:
@@ -36,18 +37,21 @@ const dumpFileSuffix = ".internal.linstor.linbit.com.json"
 var ErrEmptyDump = errors.New("no LINSTOR table dumps found")
 
 // listEnvelope is the kubectl `-ojson` List wrapper. Each item's spec
-// is one SQL row; everything else (metadata, apiVersion) is transport.
+// is one SQL row. Its apiVersion is the version the API server served
+// the row at, which decides the fields it kept; the rest is transport.
 type listEnvelope struct {
 	Items []struct {
-		Spec json.RawMessage `json:"spec"`
+		APIVersion string          `json:"apiVersion"`
+		Spec       json.RawMessage `json:"spec"`
 	} `json:"items"`
 }
 
 // loadTable reads `<dir>/<table>.internal.linstor.linbit.com.json` and
 // decodes every item's spec into out (a pointer to a slice of row
-// structs). A missing file is not an error — older LINSTOR schemas
+// structs), and records the apiVersions the rows were read at in
+// versions. A missing file is not an error — older LINSTOR schemas
 // lack some tables and empty tables may be omitted from a dump.
-func loadTable[T any](dir, table string, out *[]T) error {
+func loadTable[T any](dir, table string, out *[]T, versions map[string][]string) error {
 	path := filepath.Join(dir, table+dumpFileSuffix)
 
 	data, err := os.ReadFile(path)
@@ -67,8 +71,14 @@ func loadTable[T any](dir, table string, out *[]T) error {
 	}
 
 	rows := make([]T, 0, len(list.Items))
+	seen := map[string]bool{}
 
 	for i, item := range list.Items {
+		if item.APIVersion != "" && !seen[item.APIVersion] {
+			seen[item.APIVersion] = true
+			versions[table] = append(versions[table], item.APIVersion)
+		}
+
 		var row T
 
 		err = json.Unmarshal(item.Spec, &row)
@@ -79,6 +89,8 @@ func loadTable[T any](dir, table string, out *[]T) error {
 		rows = append(rows, row)
 	}
 
+	slices.Sort(versions[table])
+
 	*out = rows
 
 	return nil
@@ -86,28 +98,29 @@ func loadTable[T any](dir, table string, out *[]T) error {
 
 // LoadDump reads every table the converter consumes from dir.
 func LoadDump(dir string) (*Dump, error) {
-	dump := &Dump{}
+	dump := &Dump{APIVersions: map[string][]string{}}
+	versions := dump.APIVersions
 
 	err := errors.Join(
-		loadTable(dir, "nodes", &dump.Nodes),
-		loadTable(dir, "nodenetinterfaces", &dump.NodeNetInterfaces),
-		loadTable(dir, "nodestorpool", &dump.NodeStorPools),
-		loadTable(dir, "storpooldefinitions", &dump.StorPoolDefinitions),
-		loadTable(dir, "resourcegroups", &dump.ResourceGroups),
-		loadTable(dir, "volumegroups", &dump.VolumeGroups),
-		loadTable(dir, "resourcedefinitions", &dump.ResourceDefinitions),
-		loadTable(dir, "volumedefinitions", &dump.VolumeDefinitions),
-		loadTable(dir, "resources", &dump.Resources),
-		loadTable(dir, "volumes", &dump.Volumes),
-		loadTable(dir, "propscontainers", &dump.PropsContainers),
-		loadTable(dir, "layerresourceids", &dump.LayerResourceIDs),
-		loadTable(dir, "layerdrbdresourcedefinitions", &dump.LayerDrbdResourceDefinitions),
-		loadTable(dir, "layerdrbdresources", &dump.LayerDrbdResources),
-		loadTable(dir, "layerdrbdvolumedefinitions", &dump.LayerDrbdVolumeDefinitions),
-		loadTable(dir, "layerdrbdvolumes", &dump.LayerDrbdVolumes),
-		loadTable(dir, "layerstoragevolumes", &dump.LayerStorageVolumes),
-		loadTable(dir, "layerluksvolumes", &dump.LayerLuksVolumes),
-		loadTable(dir, "linstorremotes", &dump.LinstorRemotes),
+		loadTable(dir, "nodes", &dump.Nodes, versions),
+		loadTable(dir, "nodenetinterfaces", &dump.NodeNetInterfaces, versions),
+		loadTable(dir, "nodestorpool", &dump.NodeStorPools, versions),
+		loadTable(dir, "storpooldefinitions", &dump.StorPoolDefinitions, versions),
+		loadTable(dir, "resourcegroups", &dump.ResourceGroups, versions),
+		loadTable(dir, "volumegroups", &dump.VolumeGroups, versions),
+		loadTable(dir, "resourcedefinitions", &dump.ResourceDefinitions, versions),
+		loadTable(dir, "volumedefinitions", &dump.VolumeDefinitions, versions),
+		loadTable(dir, "resources", &dump.Resources, versions),
+		loadTable(dir, "volumes", &dump.Volumes, versions),
+		loadTable(dir, "propscontainers", &dump.PropsContainers, versions),
+		loadTable(dir, "layerresourceids", &dump.LayerResourceIDs, versions),
+		loadTable(dir, "layerdrbdresourcedefinitions", &dump.LayerDrbdResourceDefinitions, versions),
+		loadTable(dir, "layerdrbdresources", &dump.LayerDrbdResources, versions),
+		loadTable(dir, "layerdrbdvolumedefinitions", &dump.LayerDrbdVolumeDefinitions, versions),
+		loadTable(dir, "layerdrbdvolumes", &dump.LayerDrbdVolumes, versions),
+		loadTable(dir, "layerstoragevolumes", &dump.LayerStorageVolumes, versions),
+		loadTable(dir, "layerluksvolumes", &dump.LayerLuksVolumes, versions),
+		loadTable(dir, "linstorremotes", &dump.LinstorRemotes, versions),
 	)
 	if err != nil {
 		return nil, err

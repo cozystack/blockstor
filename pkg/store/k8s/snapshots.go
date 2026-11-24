@@ -505,7 +505,9 @@ func vdPropsMap(parent *crdv1alpha1.ResourceDefinition) map[int32]map[string]str
 }
 
 // wireVolumeDefinitions builds the on-wire snapshot volume-definition
-// list, attaching the parent RD's per-volume Props.
+// list. Each volume carries the props recorded when the snapshot was
+// taken; a snapshot recorded before they were kept falls back to the
+// parent RD's current per-volume Props.
 func wireVolumeDefinitions(
 	vds []crdv1alpha1.SnapshotVolumeRef,
 	vdPropsByNumber map[int32]map[string]string,
@@ -513,10 +515,15 @@ func wireVolumeDefinitions(
 	out := make([]apiv1.SnapshotVolumeDef, 0, len(vds))
 
 	for i := range vds {
+		props := vds[i].Props
+		if props == nil {
+			props = vdPropsByNumber[vds[i].VolumeNumber]
+		}
+
 		out = append(out, apiv1.SnapshotVolumeDef{
 			VolumeNumber:          vds[i].VolumeNumber,
 			SizeKib:               vds[i].SizeKib,
-			VolumeDefinitionProps: vdPropsByNumber[vds[i].VolumeNumber],
+			VolumeDefinitionProps: props,
 		})
 	}
 
@@ -648,11 +655,26 @@ func wireToCRDSnapshotSpec(in *apiv1.Snapshot) crdv1alpha1.SnapshotSpec {
 			spec.VolumeDefinitions = append(spec.VolumeDefinitions, crdv1alpha1.SnapshotVolumeRef{
 				VolumeNumber: in.VolumeDefinitions[i].VolumeNumber,
 				SizeKib:      in.VolumeDefinitions[i].SizeKib,
+				Props:        recordedVolumeProps(in.VolumeDefinitions[i].VolumeDefinitionProps),
 			})
 		}
 	}
 
 	return spec
+}
+
+// recordedVolumeProps is the copy of a volume definition's props a
+// snapshot keeps: the props that travel with a definition's data, never
+// a passphrase. An empty map is recorded as empty rather than absent, so
+// a snapshot of a volume definition without props does not fall back to
+// whatever the definition carries later.
+func recordedVolumeProps(props map[string]string) map[string]string {
+	out := store.TravellingProps(props)
+	if out == nil {
+		out = map[string]string{}
+	}
+
+	return out
 }
 
 // listByDefinitionExhaustively filters every snapshot here, on the

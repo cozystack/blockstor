@@ -828,7 +828,7 @@ func (r *AutoSnapshotRunnable) restoreReadsFrom(ctx context.Context, rdName, sna
 
 // RegisterWithManager wires the runnable into the controller-runtime
 // manager. Symmetrical to other Runnables in this package
-// (storage_sweeper, ObserverRunnable).
+// (OrphanSweeperRunnable, ObserverRunnable).
 func (r *AutoSnapshotRunnable) RegisterWithManager(mgr manager.Manager) error {
 	err := mgr.Add(r)
 	if err != nil {
@@ -913,7 +913,8 @@ func readLastAutoSnapshotAt(rd *blockstoriov1alpha1.ResourceDefinition) (time.Ti
 }
 
 // volumeRefsFromRD projects the RD's VolumeDefinitions slot array
-// into the Snapshot CRD shape. Matches what
+// into the Snapshot CRD shape, each volume with its props as they are
+// now, which a restore of the snapshot copies. Matches what
 // `pkg/rest/snapshots.go#hydrateSnapshotFromRD` builds for the
 // REST-driven path; kept inline so the runnable doesn't need to
 // reach into the REST store layer.
@@ -925,9 +926,15 @@ func volumeRefsFromRD(rd *blockstoriov1alpha1.ResourceDefinition) []blockstoriov
 	out := make([]blockstoriov1alpha1.SnapshotVolumeRef, 0, len(rd.Spec.VolumeDefinitions))
 
 	for _, vd := range rd.Spec.VolumeDefinitions {
+		props := store.TravellingProps(vd.Props)
+		if props == nil {
+			props = map[string]string{}
+		}
+
 		out = append(out, blockstoriov1alpha1.SnapshotVolumeRef{
 			VolumeNumber: vd.VolumeNumber,
 			SizeKib:      vd.SizeKib,
+			Props:        props,
 		})
 	}
 

@@ -232,3 +232,56 @@ func volumeStatusViaLVS(ctx context.Context, exec storage.Exec, vgLV string) (st
 		State:        stateProvisioned,
 	}, nil
 }
+
+// errOriginHasSnapshots refuses to remove a thick LV that still has
+// snapshots: they are copy-on-write over the origin and lvremove would take
+// them with it.
+var errOriginHasSnapshots = errors.New("thick LV still has snapshots")
+
+// lvPresent is lvExists for the paths that delete: only LVM saying the LV is
+// not there counts as absent. A probe that times out or fails otherwise is an
+// error, because a delete that took it for "absent" would report storage gone
+// that is still there.
+func lvPresent(ctx context.Context, ex storage.Exec, vg, lvName string) (bool, error) {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
+	out, err := ex.Run(ctx, "lvs",
+		Args("--noheadings",
+			"-o", "lv_name",
+			vg+"/"+lvName)...)
+	if err != nil {
+		if strings.Contains(err.Error(), "Failed to find logical volume") {
+			return false, nil
+		}
+
+		return false, errors.Wrapf(err, "lvs %s/%s", vg, lvName)
+	}
+
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// lvSnapshots lists the snapshots taken of the LV.
+func lvSnapshots(ctx context.Context, ex storage.Exec, vg, lvName string) ([]string, error) {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
+	out, err := ex.Run(ctx, "lvs",
+		Args("--noheadings",
+			"-o", "lv_name",
+			"-S", "origin="+lvName,
+			vg)...)
+	if err != nil {
+		return nil, errors.Wrapf(err, "lvs snapshots of %s/%s", vg, lvName)
+	}
+
+	var names []string
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			names = append(names, name)
+		}
+	}
+
+	return names, nil
+}

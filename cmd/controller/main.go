@@ -254,9 +254,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ResourceReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Store:  st,
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Store:    st,
+		Recorder: mgr.GetEventRecorder("blockstor-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resource")
 		os.Exit(1)
@@ -341,9 +342,11 @@ func main() {
 			// As in cmd/apiserver: the passphrase Secret is read past the cache.
 			SecretReader: mgr.GetAPIReader(),
 			// As in cmd/apiserver: a snapshot create answers once its take is over.
-			SnapshotTakeWait: rest.SnapshotTakeWait,
-			StateReader:      encryptionWatches,
-			OnReady:          ready.MarkBound,
+			SnapshotTakeWait:   rest.SnapshotTakeWait,
+			StateReader:        encryptionWatches,
+			OnReady:            ready.MarkBound,
+			ResourceReadyWait:  rest.DefaultResourceReadyWait,
+			ResourceDeployWait: rest.DefaultResourceDeployWait,
 		}); err != nil {
 			setupLog.Error(err, "Failed to register REST API server")
 			os.Exit(1)

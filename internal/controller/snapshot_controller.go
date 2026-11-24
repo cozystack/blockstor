@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
@@ -73,6 +74,10 @@ import (
 type SnapshotReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=snapshots,verbs=get;list;watch;create;update;patch;delete
@@ -80,10 +85,17 @@ type SnapshotReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.org,resources=snapshots/finalizers,verbs=update
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch
 
-// Reconcile drives the Spec.SuspendIO / Spec.TakeSnapshot
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass drives the Spec.SuspendIO / Spec.TakeSnapshot
 // transitions. Bug 351 (single-Snapshot orchestration) + Bug 353
 // (cross-Snapshot transactional batch via Spec.GroupID).
-func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("snapshot", req.Name)
 
 	var snap blockstoriov1alpha1.Snapshot
