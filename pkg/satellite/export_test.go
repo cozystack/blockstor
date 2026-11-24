@@ -43,13 +43,11 @@ func WipeDeviceForTest(ctx context.Context, exec storage.Exec, devicePath string
 
 // RecoverFromBitmapBothDisksForTest re-exports the package-private
 // `recoverFromBitmapBothDisks` recovery helper so the external test
-// package can pin the down + up + adjust contract that breaks the
-// tiebreaker-relocate StandAlone wedge — without exposing the
-// helper on the production Reconciler surface (it is intentionally
-// only callable from `runAdjust` after the specific
-// IsBitmapDropBothDisksErr signature is detected).
-func (r *Reconciler) RecoverFromBitmapBothDisksForTest(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
-	return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, skipNet)
+// package can pin what it does after the IsBitmapDropBothDisksErr
+// signature, without exposing the helper on the production
+// Reconciler surface.
+func (r *Reconciler) RecoverFromBitmapBothDisksForTest(ctx context.Context, dr *intent.DesiredResource, skipDisk bool, adjustErr error) error {
+	return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, adjustErr)
 }
 
 // DrbdGrossKibForTest re-exports the backing size a grow gives a DRBD

@@ -1,0 +1,26 @@
+<command name="new-minor">
+	<summary>Create a new replicated device within a resource.</summary>
+	<argument>resource</argument>
+	<argument>minor</argument>
+	<argument>volume</argument>
+	<option name="max-bio-size" type="numeric">
+		<min>4096</min>
+		<max>1048576</max>
+		<default>1048576</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="diskless" type="flag">
+	</option>
+	<option name="block-size" type="numeric">
+		<min>512</min>
+		<max>4096</max>
+		<default>512</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+	<option name="discard-granularity" type="numeric">
+		<min>0</min>
+		<max>4294967295</max>
+		<default>4294967295</default>
+		<unit_prefix>1</unit_prefix>
+	</option>
+</command>

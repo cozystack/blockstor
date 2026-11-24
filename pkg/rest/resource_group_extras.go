@@ -31,6 +31,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -242,6 +243,10 @@ func (s *Server) handleVGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, in.Props) {
+		return
+	}
+
 	// Bug 204b shape: typed-Patch with retry-on-conflict — the
 	// duplicate check and the append both re-run against the live
 	// RG on every retry, so a concurrent reconciler / sibling write
@@ -303,6 +308,32 @@ func writeVGFlagsNotImplemented(w http.ResponseWriter) {
 			"GROSS_SIZE would change nothing; see docs/cli-parity-known-deltas.md")
 }
 
+// refuseVGModify runs the refusals a `vg m` body meets before any write, so
+// a body refused on one half does not land the other, and returns the flags
+// it removes. True means the refusal has been written.
+//
+// The one volume-group flag upstream has is GROSS_SIZE, and nothing here
+// sizes a spawned volume gross, so setting a flag would answer 200 for a
+// request that changes nothing. Removing one, which upstream spells with a
+// leading '-', is honoured: it is the only way to clear a flag a volume
+// group already carries. A volume group's props are copied onto the volume
+// definitions spawned from it, so LINSTOR's whitelist judges them as a
+// volume definition's.
+func refuseVGModify(w http.ResponseWriter, flags []string, override map[string]string) ([]string, bool) {
+	removeFlags, setsFlag := vgFlagRemovals(flags)
+	if setsFlag {
+		writeVGFlagsNotImplemented(w)
+
+		return nil, true
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, override) {
+		return nil, true
+	}
+
+	return removeFlags, false
+}
+
 func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 	rgName := r.PathValue("rg")
 
@@ -324,16 +355,8 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The one volume-group flag upstream has is GROSS_SIZE, and nothing here
-	// sizes a spawned volume gross, so setting a flag would answer 200 for a
-	// request that changes nothing. Refused before any write, so a body that
-	// also edits props does not land half of itself. Removing one, which
-	// upstream spells with a leading '-', is honoured: it is the only way to
-	// clear a flag a volume group already carries.
-	removeFlags, setsFlag := vgFlagRemovals(in.Flags)
-	if setsFlag {
-		writeVGFlagsNotImplemented(w)
-
+	removeFlags, refused := refuseVGModify(w, in.Flags, in.OverrideProps)
+	if refused {
 		return
 	}
 

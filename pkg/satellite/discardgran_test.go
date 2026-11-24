@@ -502,7 +502,7 @@ func TestBuildResFile_RendersDiscardDiskBlock(t *testing.T) {
 		diskOptRsDiscardGranularity: "16384",
 	}
 
-	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, autoDisk)
+	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, autoDisk, nil)
 	if err != nil {
 		t.Fatalf("buildResFile: %v", err)
 	}
@@ -564,7 +564,7 @@ func TestBuildResFile_FileThinDay0SkipRender(t *testing.T) {
 
 	autoDisk := rec.autoDiskOptionsForResource(context.Background(), dr, devices)
 
-	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, autoDisk)
+	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, autoDisk, nil)
 	if err != nil {
 		t.Fatalf("buildResFile: %v", err)
 	}
@@ -612,7 +612,7 @@ func TestBuildResFile_LvmThinDay0SkipRender(t *testing.T) {
 
 	autoDisk := rec.autoDiskOptionsForResource(context.Background(), dr, devices)
 
-	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, autoDisk)
+	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, autoDisk, nil)
 	if err != nil {
 		t.Fatalf("buildResFile: %v", err)
 	}
@@ -644,7 +644,7 @@ func TestBuildResFile_NoAutoDiskNoBlock(t *testing.T) {
 	}
 	devices := map[int32]string{0: "/dev/vg/pvc-nodisc_00000"}
 
-	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, nil)
+	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, nil, nil)
 	if err != nil {
 		t.Fatalf("buildResFile: %v", err)
 	}
