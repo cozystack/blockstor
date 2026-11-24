@@ -1504,7 +1504,9 @@ func (o *ObserverRunnable) giMayMove(name string) bool {
 
 	o.volMu.Lock()
 
-	for _, vol := range o.volCache[name] {
+	cache := o.volCache[name]
+	for num := range cache {
+		vol := cache[num]
 		if !isDataBearingDiskState(drbd.DiskState(vol.DiskState)) || vol.CurrentUUID != "" {
 			continue
 		}

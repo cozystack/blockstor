@@ -1104,6 +1104,11 @@ func (r *Reconciler) forgetPool(resourceName string) {
 func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *intent.ResourceApplyResult {
 	defer r.inflight.enter(dr.GetName())()
 
+	return r.applyResource(ctx, dr)
+}
+
+// applyResource is applyOne while the resource is marked busy.
+func (r *Reconciler) applyResource(ctx context.Context, dr *intent.DesiredResource) *intent.ResourceApplyResult {
 	res := &intent.ResourceApplyResult{
 		Name:     dr.GetName(),
 		NodeName: dr.GetNodeName(),
