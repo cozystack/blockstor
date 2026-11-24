@@ -532,10 +532,18 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 // or the active link still holds exactly as many outstanding requests as
 // before while less than that rate of data came in and out-of-sync did
 // not fall fast either (heldRequestsMaxClearFactor). That catches the
-// hard stop and the trickle. A pass on which out-of-sync grew starts the
-// count over: application writes outrunning a resync that yields to them
-// (c-min-rate, c-fill-target) grow it too, as an initial sync under a
-// writing import did on alpha.17, and nothing there is stuck. After
+// hard stop and the trickle. Application writes outrunning a resync that
+// yields to them (c-min-rate, c-fill-target) grow out-of-sync, as an
+// initial sync under a writing import did on alpha.17, and nothing there
+// is stuck: a pass on which it grew counts as stalled only when the
+// resync showed no traffic of its own, less than that rate of data in
+// and the outstanding count unchanged. On alpha.19 a resync from the
+// Primary stopped with 1436 replies held while the guest kept writing a
+// little: the writes grew out-of-sync on every pass, received did not
+// move, and a rule that let any growth start the count over never
+// reported it. The LINSTOR plunger counts a pass as stalled when
+// percent-in-sync is exactly the same, which misses that case too, as
+// each write that grows out-of-sync moves it. After
 // StalledResyncPasses stalled passes in a row the paused peer is
 // disconnected and connected again on the next pass. When that did not
 // help, the active peer is disconnected and connected instead.
@@ -567,16 +575,23 @@ type resyncProgress struct {
 func (prev *resyncProgress) stalled(dep *drbd.ResyncDependency, elapsed time.Duration, minRate int) bool {
 	floor := int64(elapsed.Seconds() * float64(minRate))
 
-	cleared := prev.OutOfSync - dep.OutOfSync
-	if cleared < floor {
-		return true
-	}
-
 	// The held requests of the field stalls kept the same count for
 	// minutes; a working pipeline's count moves between passes.
-	return cleared < heldRequestsMaxClearFactor*floor &&
-		dep.Outstanding > 0 && dep.Outstanding == prev.Outstanding &&
-		dep.Received-prev.Received < floor
+	idle := dep.Outstanding == prev.Outstanding && dep.Received-prev.Received < floor
+
+	cleared := prev.OutOfSync - dep.OutOfSync
+
+	switch {
+	case cleared < 0:
+		// Writes grew out-of-sync. They outran a resync that moves when
+		// resync data still came in or the pipeline moved; with neither,
+		// the writes landed on a resync that does not move.
+		return idle
+	case cleared < floor:
+		return true
+	default:
+		return cleared < heldRequestsMaxClearFactor*floor && dep.Outstanding > 0 && idle
+	}
 }
 
 // now is the time of a pass.
@@ -596,11 +611,6 @@ func (w *DRBDWorkaroundsRunnable) progress(prev *resyncProgress, seen bool, dep 
 	// The kernel zeroes received on a reconnect (drbd_nl.c), so a drop
 	// means the link to the active peer is a new one: count afresh.
 	if !seen || prev.Active != dep.Active || prev.Volume != dep.Volume || dep.Received < prev.Received {
-		return progress
-	}
-
-	// Writes outran the resync; that is no stall to act on.
-	if dep.OutOfSync > prev.OutOfSync {
 		return progress
 	}
 

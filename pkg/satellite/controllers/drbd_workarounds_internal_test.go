@@ -715,9 +715,10 @@ func TestStalledResyncCatchesATrickle(t *testing.T) {
 }
 
 // alpha.17, issue 02: a writer outran the resync, so out-of-sync grew
-// for minutes while the resync was healthy. A pass on which it grew is no
-// stall, and it starts the count over: three stalled passes, a growing
-// one, three more stalled ones are no four in a row.
+// for minutes while the resync was healthy, resync data coming in all
+// along. A pass on which it grew that way is no stall, and it starts the
+// count over: three stalled passes, a growing one, three more stalled
+// ones are no four in a row.
 func TestStalledResyncLeavesAGrowingOutOfSyncAlone(t *testing.T) {
 	t.Parallel()
 
@@ -735,8 +736,8 @@ func TestStalledResyncLeavesAGrowingOutOfSyncAlone(t *testing.T) {
 	adm.actions = nil
 
 	samples := frozen(4)
-	samples = append(samples, resyncSample{oos: 15592, received: 113448, outstanding: 542})
-	samples = append(samples, slices.Repeat([]resyncSample{{oos: 15592, received: 113448, outstanding: 542}}, 3)...)
+	samples = append(samples, resyncSample{oos: 15592, received: 513448, outstanding: 542})
+	samples = append(samples, slices.Repeat([]resyncSample{{oos: 15592, received: 513448, outstanding: 542}}, 3)...)
 
 	if got := runResync(t, w, adm, "Secondary", samples...); len(got) != 0 {
 		t.Errorf("acted although out-of-sync grew in between: %v", got)
@@ -744,6 +745,39 @@ func TestStalledResyncLeavesAGrowingOutOfSyncAlone(t *testing.T) {
 
 	if evs := drainEvents(recorder); len(evs) != 0 {
 		t.Errorf("reported a growing out-of-sync as a stall: %v", evs)
+	}
+}
+
+// alpha.19, issue 14: the resync from the Primary n1 stopped with its
+// replies held, received and the outstanding count fixed, while the
+// guest kept writing a little: every pass grew out-of-sync. That is a
+// stall all the same, and it is reported.
+func TestStalledResyncCatchesAStallThePrimaryWritesInto(t *testing.T) {
+	t.Parallel()
+
+	cfg := stallConfig()
+	cfg.StalledResyncAct = false
+
+	adm := &fakeWorkaroundAdm{}
+	w, recorder := newTestWorkarounds(t, adm, cfg, "pvc-stall")
+
+	shape := stallShape{n1Role: "Primary", n2Role: "Secondary", n2Disk: "UpToDate"}
+
+	for _, sample := range ramp(5, func(pass int64) resyncSample {
+		return resyncSample{oos: 23340 + pass*44, received: 349988, outstanding: 1436}
+	}) {
+		adm.status = shape.status(sample)
+		w.pass(t.Context(), logr.Discard())
+	}
+
+	if len(adm.actions) != 0 {
+		t.Errorf("acted in report-only mode: %v", adm.actions)
+	}
+
+	evs := drainEvents(recorder)
+	if len(evs) != 1 || !strings.Contains(evs[0], "Warning DRBDResyncStalled") ||
+		!strings.Contains(evs[0], "resync of volume 0 from n1 stalled for 4 passes") {
+		t.Errorf("events = %v, want one Warning reporting the stall", evs)
 	}
 }
 
