@@ -68,7 +68,7 @@ func TestDrbdInternalMetaCoversLinstorDefault(t *testing.T) {
 func TestGrowBackingKibNeverSizesBelowFifteenPeerSlots(t *testing.T) {
 	const definition = 20 << 20
 
-	fifteen := alignUp(drbdGrossKib(definition, drbd.LegacyPeerSlots), kibPerMib)
+	fifteen := drbdGrossKib(definition, drbd.LegacyPeerSlots)
 	vol := &intent.DesiredVolume{SizeKib: definition}
 
 	seven := int32(7)
@@ -83,7 +83,7 @@ func TestGrowBackingKibNeverSizesBelowFifteenPeerSlots(t *testing.T) {
 	thirtyOne := int32(31)
 
 	got := growBackingKib(&intent.DesiredResource{PeerSlots: &thirtyOne}, vol, true)
-	if want := alignUp(drbdGrossKib(definition, 31), kibPerMib); got != want {
+	if want := drbdGrossKib(definition, 31); got != want {
 		t.Errorf("31 recorded peer slots: got %d KiB, want %d", got, want)
 	}
 }

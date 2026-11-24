@@ -513,11 +513,11 @@ func TestApplyTriggersResizeOnGrow(t *testing.T) {
 	// `--config` that carries the device filter — a repeated `--config`
 	// is rejected by the LVM CLI, which had blocked the resize.
 	//
-	// 2049MiB, not 2048MiB: the backing grows to the definition size
+	// 2098152k, not 2 GiB: the backing grows to the definition size
 	// plus DRBD's internal metadata, as LINSTOR sizes it, so the DRBD
 	// device ends at the definition size rather than short of it.
 	want := []string{
-		"lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2049MiB vg/pvc-grow_00000",
+		"lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2098152k vg/pvc-grow_00000",
 		"drbdadm resize --assume-clean pvc-grow",
 	}
 
@@ -581,7 +581,7 @@ func TestApplyThickResizeOmitsAssumeClean(t *testing.T) {
 	// lvextend must run (the grow happened, to the definition size plus
 	// DRBD's metadata) and drbdadm resize must follow WITHOUT
 	// --assume-clean.
-	wantLvextend := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2049MiB vg/pvc-grow_00000"
+	wantLvextend := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2098152k vg/pvc-grow_00000"
 	if !slices.Contains(fx.CommandLines(), wantLvextend) {
 		t.Errorf("expected %q in calls; got %v", wantLvextend, fx.CommandLines())
 	}

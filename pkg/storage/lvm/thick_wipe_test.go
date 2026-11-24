@@ -19,7 +19,7 @@ const (
 	wipeFinal  = "wipefs --all --force /dev/vg/pvc-1_00000"
 	renameLV   = "lvrename --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } vg pvc-1_00000.bsnew pvc-1_00000"
 	lvremove   = "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_00000"
-	lvcreateLV = "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 1024MiB --name pvc-1_00000.bsnew -Wn -Zn vg"
+	lvcreateLV = "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 1048576k --name pvc-1_00000.bsnew -Wn -Zn vg"
 )
 
 var (

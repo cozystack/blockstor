@@ -96,14 +96,14 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 		return p.ensureRefreservation(ctx, dataset)
 	}
 
-	sizeMiB := storage.SizeMiB(vol.SizeKib)
+	sizeKib := alignUpKib(vol.SizeKib, p.defaultVolblocksizeKib(ctx))
 
 	args := []string{"create"}
 	if p.cfg.Thin {
 		args = append(args, "-s")
 	}
 
-	args = append(args, "-V", strconv.FormatInt(sizeMiB, 10)+"M", dataset)
+	args = append(args, "-V", strconv.FormatInt(sizeKib, 10)+"K", dataset)
 
 	_, err := p.exec.Run(ctx, "zfs", args...)
 	if err != nil {
@@ -124,8 +124,8 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	return nil
 }
 
-// ResizeVolume sets the zvol's volsize to vol.SizeKib (rounded up
-// to MiB). zfs is happy to set the same size twice, so the call is
+// ResizeVolume sets the zvol's volsize to vol.SizeKib rounded up to the
+// zvol's own volblocksize, which `zfs set volsize` requires. zfs is happy to set the same size twice, so the call is
 // idempotent. Shrinks are rejected by ZFS itself when the existing
 // volume already holds more data — the CSI grow-only contract makes
 // the no-shrink invariant a non-issue here.
@@ -137,11 +137,11 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 // grow, call ensureRefreservation so the refreservation tracks the
 // new volsize. Thin mode no-ops inside the helper.
 func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
-	sizeMiB := storage.SizeMiB(vol.SizeKib)
 	dataset := p.volumeDataset(vol)
+	sizeKib := alignUpKib(vol.SizeKib, p.volblocksizeKib(ctx, dataset))
 
 	_, err := p.exec.Run(ctx, "zfs", "set",
-		"volsize="+strconv.FormatInt(sizeMiB, 10)+"M",
+		"volsize="+strconv.FormatInt(sizeKib, 10)+"K",
 		dataset)
 	if err != nil {
 		return errors.Wrapf(err, "zfs set volsize %s", dataset)
@@ -780,6 +780,61 @@ func (p *Provider) datasetVolsize(ctx context.Context, dataset string) (int64, e
 	return bytes, nil
 }
 
+// volblocksizeProbe is the name a dry-run `zfs create` is asked about
+// to learn the volblocksize a new zvol in the pool gets. Nothing is
+// created under it.
+const volblocksizeProbe = "blockstor-volblocksize-probe"
+
+// defaultVolblocksizeKib is the volblocksize, in KiB, a zvol created in
+// the pool gets: the size a dry-run creation of a 1 KiB zvol reports,
+// which ZFS rounds up to it. LINSTOR learns its ZFS extent size the same
+// way (ZfsUtils.getZfsExtentSize) and rounds every volume up to it. A
+// ZFS that cannot answer is given whole MiB, which every volblocksize up
+// to 1 MiB divides.
+func (p *Provider) defaultVolblocksizeKib(ctx context.Context) int64 {
+	out, err := p.exec.Run(ctx, "zfs", "create", "-n", "-P", "-V", "1K", p.cfg.Pool+"/"+volblocksizeProbe)
+	if err != nil {
+		return fallbackAllocationKib
+	}
+
+	for line := range strings.Lines(string(out)) {
+		fields := strings.Fields(line)
+		if len(fields) == dryRunPropertyCols && fields[0] == "property" && fields[1] == "volsize" {
+			return bytesToAllocationKib(fields[2])
+		}
+	}
+
+	return fallbackAllocationKib
+}
+
+// volblocksizeKib is the volblocksize, in KiB, of an existing zvol. A
+// zvol adopted from LINSTOR or cloned from a snapshot keeps the one it
+// was created with, whatever the pool default is now.
+func (p *Provider) volblocksizeKib(ctx context.Context, dataset string) int64 {
+	out, err := p.exec.Run(ctx, "zfs", "get", "-Hp", "-o", "value", "volblocksize", dataset)
+	if err != nil {
+		return fallbackAllocationKib
+	}
+
+	return bytesToAllocationKib(strings.TrimSpace(string(out)))
+}
+
+// bytesToAllocationKib reads a volblocksize in bytes as KiB, or the MiB
+// fallback for anything that is not a whole, positive number of KiB.
+func bytesToAllocationKib(value string) int64 {
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n < bytesPerKib || n%bytesPerKib != 0 {
+		return fallbackAllocationKib
+	}
+
+	return n / bytesPerKib
+}
+
+// alignUpKib rounds kib up to a whole number of unitKib, at least one.
+func alignUpKib(kib, unitKib int64) int64 {
+	return max((kib+unitKib-1)/unitKib, 1) * unitKib
+}
+
 // datasetRefreservation reads the zvol's `refreservation` property in
 // bytes. ZFS reports an unset refreservation as the literal string
 // "none" (and as "0" on some versions or after `zfs set
@@ -904,6 +959,12 @@ func (p *Provider) snapshotDataset(snap storage.Snapshot) string {
 const (
 	stateNotProvisioned = storage.StateNotProvisioned
 	bytesPerKib         = 1024
-	zfsListCols         = 3
-	zpoolListCols       = 2
+	// fallbackAllocationKib is the unit a size is rounded to when the
+	// volblocksize cannot be read.
+	fallbackAllocationKib = 1024
+	// dryRunPropertyCols are the fields of a `property <name> <value>`
+	// line of `zfs create -n -P`.
+	dryRunPropertyCols = 3
+	zfsListCols        = 3
+	zpoolListCols      = 2
 )

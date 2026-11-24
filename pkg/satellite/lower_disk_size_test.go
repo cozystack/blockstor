@@ -43,16 +43,21 @@ const (
 func createdZvolKiB(t *testing.T, vol *intent.DesiredVolume, layerStack []string) int64 {
 	t.Helper()
 
-	return createdZvolKiBWithPeerSlots(t, vol, layerStack, nil)
+	return createdZvolKiBWithPeerSlots(t, vol, layerStack, nil, "")
 }
 
 // createdZvolKiBWithPeerSlots is createdZvolKiB for a replica with the
-// given peer-slot count, nil for one without a recorded count.
-func createdZvolKiBWithPeerSlots(t *testing.T, vol *intent.DesiredVolume, layerStack []string, peerSlots *int32) int64 {
+// given peer-slot count, nil for one without a recorded count, on a pool
+// whose dry-run creation reports dryRun; an empty one leaves the
+// provider on whole MiB.
+func createdZvolKiBWithPeerSlots(
+	t *testing.T, vol *intent.DesiredVolume, layerStack []string, peerSlots *int32, dryRun string,
+) int64 {
 	t.Helper()
 
 	fx := storage.NewFakeExec()
 	fx.Expect("zfs list -H -o name data/pvc-adopted_00000", storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("zfs create -n -P -V 1K data/blockstor-volblocksize-probe", storage.FakeResponse{Stdout: []byte(dryRun)})
 
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
 		Providers: map[string]storage.Provider{"data": zfs.NewProvider(zfs.Config{Pool: "data", Thin: true}, fx)},
@@ -70,11 +75,11 @@ func createdZvolKiBWithPeerSlots(t *testing.T, vol *intent.DesiredVolume, layerS
 	}
 
 	for _, line := range fx.CommandLines() {
-		var mib int64
+		var kib int64
 
-		_, scanErr := fmt.Sscanf(line, "zfs create -s -V %dM data/pvc-adopted_00000", &mib)
+		_, scanErr := fmt.Sscanf(line, "zfs create -s -V %dK data/pvc-adopted_00000", &kib)
 		if scanErr == nil {
-			return mib * 1024
+			return kib
 		}
 	}
 
@@ -128,7 +133,7 @@ func TestNewLowerDiskIsSizedForTheReplicaPeerSlots(t *testing.T) {
 		SizeKib:       adoptedVolumeKiB,
 		StoragePool:   "data",
 		DeviceSizeKib: adoptedDeviceKiB,
-	}, nil, &seven)
+	}, nil, &seven, "")
 
 	if want := int64(20485 * 1024); zvol != want {
 		t.Errorf("zvol for 7 peer slots: got %d KiB, want %d (20976040 KiB rounded up to MiB)", zvol, want)
@@ -211,5 +216,44 @@ func TestNewLowerDiskLUKSWithoutDRBD(t *testing.T) {
 	}, []string{"LUKS", "STORAGE"})
 	if zvol != adoptedVolumeKiB+luks.HeaderKiB {
 		t.Errorf("zvol: got %d KiB, want the definition plus the 16 MiB header", zvol)
+	}
+}
+
+// TestNewLowerDiskIsRoundedToTheVolblocksize: a new lower disk is the
+// data plus its metadata rounded up to the pool's volblocksize, as
+// LINSTOR sizes it, not to whole MiB. On a 16 KiB volblocksize a 1 GiB
+// volume with 7 peer slots needs 1048836 KiB and gets 1048848 KiB, the
+// 1074020352 B zvol LINSTOR creates for it; rounded to MiB it got
+// 1049600 KiB, and a LINSTOR replica added after a return to LINSTOR,
+// sized the LINSTOR way, could not attach under the larger device the
+// other replicas then exposed. A replica with no recorded count is
+// sized for the 15 slots it was created with.
+func TestNewLowerDiskIsRoundedToTheVolblocksize(t *testing.T) {
+	t.Parallel()
+
+	const gib = 1024 * 1024
+
+	seven := int32(drbd.DefaultPeerSlots)
+
+	cases := []struct {
+		name      string
+		peerSlots *int32
+		want      int64
+	}{
+		{"7 peer slots", &seven, 1048848},
+		{"no recorded count", nil, 1049104},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			zvol := createdZvolKiBWithPeerSlots(t, &intent.DesiredVolume{VolumeNumber: 0, SizeKib: gib, StoragePool: "data"},
+				nil, tc.peerSlots, "create\tdata/blockstor-volblocksize-probe\nproperty\tvolsize\t16384\n")
+
+			if zvol != tc.want {
+				t.Errorf("zvol: got %d KiB, want %d KiB on a 16 KiB volblocksize", zvol, tc.want)
+			}
+		})
 	}
 }

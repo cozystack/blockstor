@@ -57,36 +57,31 @@ func TestThinCreateVolumeIssuesLvcreate(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 vg/thinpool"
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1048576k --name pvc-1_00000 vg/thinpool"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
 }
 
-// TestThinCreateVolumeGrossSizeRounding pins the provider's KiB to MiB
-// conversion: the size is rounded UP to whole MiB, with a 1 MiB floor.
+// TestThinCreateVolumeGrossSizeRounding pins the size the provider asks
+// LVM for: the size in KiB, which LVM rounds up to a whole extent of the
+// volume group, the unit LINSTOR rounds an LVM volume up to. Rounded to
+// whole MiB first, a lower disk sized for DRBD metadata came out larger
+// than LINSTOR makes it wherever the extent is under a MiB.
 //
-//   - MiB-aligned requests pass through exactly (1 GiB -> 1024 MiB,
-//     100 MiB -> 100 MiB). These are the common CDI/CSI cases.
-//   - An odd-KiB request rounds up to the next MiB (1500 KiB -> 2 MiB,
-//     2 MiB+1 KiB -> 3 MiB). LINSTOR rounds a volume up to the
-//     allocation unit of its pool the same way, and a lower disk sized
-//     for DRBD internal metadata is not a whole number of MiB: rounded
-//     down, it would lose the metadata it was sized for and expose a
-//     DRBD device smaller than the volume.
-//   - The floor keeps a tiny request (< 1 MiB) from collapsing to a
-//     0-extent lvcreate the LVM CLI would reject.
+// The floor keeps a zero request from reaching lvcreate as a 0-extent
+// volume the LVM CLI would reject.
 func TestThinCreateVolumeGrossSizeRounding(t *testing.T) {
 	cases := []struct {
 		name    string
 		sizeKib int64
-		wantMiB string
+		wantArg string
 	}{
-		{"1GiB-aligned", 1024 * 1024, "1024MiB"},
-		{"100MiB-aligned", 100 * 1024, "100MiB"},
-		{"odd-subMiB-rounds-up", 1500, "2MiB"},
-		{"odd-2MiB-plus-1KiB-rounds-up", 2*1024 + 1, "3MiB"},
-		{"tiny-4KiB-hits-1MiB-floor", 4, "1MiB"},
+		{"1GiB-aligned", 1024 * 1024, "1048576k"},
+		{"100MiB-aligned", 100 * 1024, "102400k"},
+		{"metadata-sized-lower-disk", 1048836, "1048836k"},
+		{"odd-subMiB", 1500, "1500k"},
+		{"zero-hits-floor", 0, "1k"},
 	}
 
 	for _, tc := range cases {
@@ -107,7 +102,7 @@ func TestThinCreateVolumeGrossSizeRounding(t *testing.T) {
 			}
 
 			want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize " +
-				tc.wantMiB + " --name pvc-1_00000 vg/thinpool"
+				tc.wantArg + " --name pvc-1_00000 vg/thinpool"
 			if !slices.Contains(fx.CommandLines(), want) {
 				t.Errorf("size_kib=%d expected lvcreate %q; got %v",
 					tc.sizeKib, want, fx.CommandLines())
@@ -389,7 +384,7 @@ func TestThinExecError(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")}) // not exists
-	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 vg/thinpool",
+	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1048576k --name pvc-1_00000 vg/thinpool",
 		storage.FakeResponse{Err: errLVCreateFailed})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -408,7 +403,7 @@ var errLVCreateFailed = errors.New("lvcreate: insufficient free space")
 
 // TestThinResizeVolumeIssuesLvextend pins the lvextend command shape.
 // CSI ControllerExpandVolume → REST PUT → reconciler ResizeVolume,
-// so the wire-visible behaviour is "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size <newMiB>MiB
+// so the wire-visible behaviour is "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size <newKiB>k
 // vg/lv". Refactors that change the args will fail loudly here.
 func TestThinResizeVolumeIssuesLvextend(t *testing.T) {
 	fx := storage.NewFakeExec()
@@ -426,7 +421,7 @@ func TestThinResizeVolumeIssuesLvextend(t *testing.T) {
 	// Bug 305: the udev-less activation section shares the SINGLE
 	// `--config` that also carries the device filter — a repeated
 	// `--config` is rejected by the LVM CLI.
-	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2048MiB vg/pvc-1_00000"
+	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2097152k vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}

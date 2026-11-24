@@ -69,7 +69,7 @@ func applyFreshReplica(t *testing.T, peerSlots *int32) []string {
 // A replica's metadata is created with its own peer slots, which LINSTOR
 // copies from the definition (`create-md --max-peers` = peerSlots), and its
 // lower disk is sized for them: 20 GiB of data with LINSTOR's seven slots
-// is 20976040 KiB, 20485 MiB once rounded up to the provider's unit.
+// is 20976040 KiB, which LVM rounds up to a whole extent.
 func TestANewReplicaIsCreatedWithItsPeerSlots(t *testing.T) {
 	seven := int32(drbd.DefaultPeerSlots)
 	calls := applyFreshReplica(t, &seven)
@@ -79,9 +79,9 @@ func TestANewReplicaIsCreatedWithItsPeerSlots(t *testing.T) {
 	}
 
 	if !slices.ContainsFunc(calls, func(c string) bool {
-		return strings.HasPrefix(c, "lvcreate ") && strings.Contains(c, "--virtualsize 20485MiB")
+		return strings.HasPrefix(c, "lvcreate ") && strings.Contains(c, "--virtualsize 20976040k")
 	}) {
-		t.Errorf("want a 20485 MiB lower disk for 7 peer slots; cmds:\n%s", strings.Join(calls, "\n"))
+		t.Errorf("want a 20976040 KiB lower disk for 7 peer slots; cmds:\n%s", strings.Join(calls, "\n"))
 	}
 }
 
@@ -95,8 +95,8 @@ func TestAReplicaWithoutARecordedCountKeepsFifteenPeerSlots(t *testing.T) {
 	}
 
 	if !slices.ContainsFunc(calls, func(c string) bool {
-		return strings.HasPrefix(c, "lvcreate ") && strings.Contains(c, "--virtualsize 20490MiB")
+		return strings.HasPrefix(c, "lvcreate ") && strings.Contains(c, "--virtualsize 20981164k")
 	}) {
-		t.Errorf("want the 20490 MiB lower disk 15 peer slots get; cmds:\n%s", strings.Join(calls, "\n"))
+		t.Errorf("want the 20981164 KiB lower disk 15 peer slots get; cmds:\n%s", strings.Join(calls, "\n"))
 	}
 }
