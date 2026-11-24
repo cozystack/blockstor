@@ -106,3 +106,51 @@ func TestNodeDeleteRefusedWhileASnapshotIsOnTheNode(t *testing.T) {
 		t.Errorf("node removed despite the refusal: %v", err)
 	}
 }
+
+// A snapshot whose copy the satellite recorded in one pool holds only that
+// pool: LINSTOR refuses a pool delete over the snapshot-volumes in the pool,
+// so another diskful pool of the same node goes.
+func TestStoragePoolDeleteOnlyRefusedForThePoolHoldingTheCopy(t *testing.T) {
+	t.Parallel()
+
+	st := seedSnapshotOnNode(t, true)
+	ctx := t.Context()
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "thin1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props:           map[string]string{"StorDriver/LvmVg": "vg", "StorDriver/ThinPool": "tp"},
+	}); err != nil {
+		t.Fatalf("seed second pool: %v", err)
+	}
+
+	snap, err := st.Snapshots().Get(ctx, "pvc-x", "s1")
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+
+	snap.Snapshots = []apiv1.SnapshotPerNode{{SnapshotName: "s1", NodeName: "n1", StoragePool: "zfs1"}}
+	if err := st.Snapshots().Update(ctx, &snap); err != nil {
+		t.Fatalf("record copy pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/nodes/n1/storage-pools/thin1")
+	got, _ := readAllBody(resp)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200: the copy of pvc-x/s1 is in zfs1, not thin1. Body: %s", resp.StatusCode, got)
+	}
+
+	resp = httpDelete(t, base+"/v1/nodes/n1/storage-pools/zfs1")
+	got, _ = readAllBody(resp)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status %d, want 409 while the copy of pvc-x/s1 is in zfs1. Body: %s", resp.StatusCode, got)
+	}
+}

@@ -247,9 +247,9 @@ func (s *Server) refuseSPDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 		return true
 	}
 
-	// A snapshot's copy on this node can only be deleted through the
-	// node's pool; with the pool gone the node's hold on the Snapshot is
-	// never released.
+	// A snapshot's copy can only be deleted through the pool that holds
+	// it; with the pool gone the node's hold on the Snapshot is never
+	// released.
 	snapRefs, err := store.SnapshotsInPool(r.Context(), s.Store, node, pool)
 	if err != nil {
 		writeStoreError(w, err)
@@ -268,7 +268,7 @@ func (s *Server) refuseSPDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 	}
 
 	if len(snapRefs) > 0 {
-		details = append(details, "Snapshots with a copy on the node: "+strings.Join(snapRefs, ", "))
+		details = append(details, "Snapshots that may have a copy in the storage pool: "+strings.Join(snapRefs, ", "))
 	}
 
 	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{

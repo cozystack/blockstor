@@ -359,11 +359,12 @@ func SnapshotsOnNode(ctx context.Context, st Store, spellings []string) ([]strin
 	return refs, nil
 }
 
-// SnapshotsInPool is SnapshotsOnNode for a pool delete: the snapshots a
-// diskful pool of the node may hold. A Snapshot does not record which pool
-// of a node its copy is in, so every snapshot on the node counts, as LINSTOR
-// refuses a pool delete over the snapshot-volumes in it. A diskless pool, or
-// one that does not exist, holds none.
+// SnapshotsInPool is SnapshotsOnNode for a pool delete: the snapshots whose
+// copy on the node is in the pool, as LINSTOR refuses a pool delete over the
+// snapshot-volumes in it. The satellite records the pool of its copy once the
+// copy exists; a copy with no pool recorded yet may be in any diskful pool of
+// the node, so it counts for each of them. A diskless pool, or one that does
+// not exist, holds none.
 func SnapshotsInPool(ctx context.Context, st Store, node, pool string) ([]string, error) {
 	sp, err := st.StoragePools().Get(ctx, node, pool)
 	if errors.Is(err, ErrNotFound) {
@@ -383,7 +384,44 @@ func SnapshotsInPool(ctx context.Context, st Store, node, pool string) ([]string
 		return nil, err
 	}
 
-	return SnapshotsOnNode(ctx, st, spellings)
+	snapshots, err := st.Snapshots().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+
+	isNode := func(n string) bool {
+		return slices.ContainsFunc(spellings, func(s string) bool { return naming.Same(n, s) })
+	}
+
+	var refs []string
+
+	for i := range snapshots {
+		if !slices.ContainsFunc(snapshots[i].Nodes, isNode) {
+			continue
+		}
+
+		if copyPool := recordedCopyPool(&snapshots[i], isNode); copyPool != "" && !naming.Same(copyPool, pool) {
+			continue
+		}
+
+		refs = append(refs, snapshots[i].ResourceName+"/"+snapshots[i].Name)
+	}
+
+	sort.Strings(refs)
+
+	return refs, nil
+}
+
+// recordedCopyPool is the pool the satellite recorded for the snapshot's copy
+// on the node, empty while none is recorded.
+func recordedCopyPool(snap *apiv1.Snapshot, isNode func(string) bool) string {
+	for i := range snap.Snapshots {
+		if isNode(snap.Snapshots[i].NodeName) {
+			return snap.Snapshots[i].StoragePool
+		}
+	}
+
+	return ""
 }
 
 // ReplicasInPool returns the `<rd>/<vol_nr>` keys of every volume on the node
