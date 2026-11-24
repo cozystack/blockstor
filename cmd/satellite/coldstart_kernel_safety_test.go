@@ -283,7 +283,7 @@ func TestCleanStateDir_PreservesHealthyRes(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	files := []string{"pvc-healthy.res", "pvc-orphan.res", "global_common.conf"}
+	files := []string{"pvc-healthy.res", "pvc-orphan.res", "global_common.conf", "pvc-healthy.res.tmp"}
 	for _, f := range files {
 		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o600); err != nil {
 			t.Fatalf("seed %s: %v", f, err)
@@ -305,6 +305,9 @@ func TestCleanStateDir_PreservesHealthyRes(t *testing.T) {
 	assertExists("pvc-healthy.res", true)    // preserved: backs a healthy resource
 	assertExists("pvc-orphan.res", false)    // wiped: no matching live kernel resource
 	assertExists("global_common.conf", true) // never touched: not a .res file
+	// A candidate .res is mid-render or a crash's leftover, and no
+	// render has run yet: it goes even for a healthy resource.
+	assertExists("pvc-healthy.res.tmp", false)
 }
 
 // TestCleanStateDir_EmptyHealthyWipesAll — when nothing is healthy

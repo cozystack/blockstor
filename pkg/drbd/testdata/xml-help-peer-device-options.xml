@@ -1,0 +1,25 @@
+<command name="peer-device-options">
+	<summary>Change peer-device options.</summary>
+	<argument>resource</argument>
+	<argument>peer_node_id</argument>
+	<argument>volume</argument>
+	<option name="set-defaults" type="flag">
+	</option>
+	<option name="resync-rate" type="numeric">
+		<min>1</min>
+		<max>8388608</max>
+		<default>250</default>
+		<unit_prefix>k</unit_prefix>
+		<unit>bytes/second</unit>
+	</option>
+	<option name="c-max-rate" type="numeric">
+		<min>250</min>
+		<max>8388608</max>
+		<default>102400</default>
+		<unit_prefix>k</unit_prefix>
+		<unit>bytes/second</unit>
+	</option>
+	<option name="bitmap" type="boolean">
+		<default>yes</default>
+	</option>
+</command>
