@@ -93,6 +93,17 @@ type VolumeStatus struct {
 	State        string // PROVISIONED / ERROR / NOT_PROVISIONED
 }
 
+// SizeMiB is a volume size in KiB rounded up to whole MiB, the unit
+// the LVM and ZFS providers create and grow volumes in, and at least
+// 1 MiB. It rounds up because a caller asks for the least it needs: a
+// lower disk sized for DRBD metadata is not a whole number of MiB, and
+// rounded down it would lose the metadata it was sized for.
+func SizeMiB(kib int64) int64 {
+	const kibPerMiB = 1024
+
+	return max((kib+kibPerMiB-1)/kibPerMiB, 1)
+}
+
 // StateNotProvisioned is the VolumeStatus.State of a volume that is not on
 // disk.
 const StateNotProvisioned = "NOT_PROVISIONED"

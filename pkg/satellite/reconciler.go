@@ -1365,6 +1365,11 @@ func needsLUKS(stack []string) bool {
 // (Format-then-Open path) always lines up with the underlying size
 // out of cryptsetup luksFormat's geometry so the probe is skipped.
 //
+// A third trigger grows an open mapper too small for the device the
+// replicas report while the kernel holds the volume Diskless, whatever
+// it lags its backing by; that grow lets the disk attach and is not
+// reported as one (luksMapperTooSmallForDevice).
+//
 // Each volume's password is its own, stored wrapped on the replica (see
 // luksPassword); a device is formatted only after its password is stored.
 // A mapper that is already open and has nothing to grow is left alone
@@ -1378,31 +1383,33 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, 
 		return nil, false, errors.New("LUKS in layer stack but no LUKS key provider configured")
 	}
 
-	sources := make(map[int32]string, len(dr.GetVolumes()))
+	volumes := make(map[int32]*intent.DesiredVolume, len(dr.GetVolumes()))
 	for _, vol := range dr.GetVolumes() {
-		sources[vol.GetVolumeNumber()] = vol.GetSourceSnapshot()
+		volumes[vol.GetVolumeNumber()] = vol
 	}
 
 	out := make(map[int32]string, len(devices))
 	mapperGrew := false
+	kernel := newDisklessProbe(r.cfg.Adm, dr.GetName())
 
 	for vol, dev := range devices {
 		dmName, active := r.luksMapperOf(ctx, dr.GetName(), vol, dev)
 
-		if r.luksMapperSettled(ctx, dmName, dev, active, resized) {
+		settled, toAttach := r.luksMapperState(ctx, dr, volumes[vol], dmName, dev, active, resized, kernel)
+		if settled {
 			out[vol] = luks.DevicePath(dmName)
 
 			continue
 		}
 
 		key, err := r.luksPassword(ctx, LUKSVolume{
-			Resource: dr.GetName(), Node: dr.GetNodeName(), Volume: vol, SourceSnapshot: sources[vol],
+			Resource: dr.GetName(), Node: dr.GetNodeName(), Volume: vol, SourceSnapshot: volumes[vol].GetSourceSnapshot(),
 		}, dev)
 		if err != nil {
 			return nil, false, errors.Wrapf(err, "luks volume %d", vol)
 		}
 
-		mapperPath, grew, err := r.openLUKS(ctx, dmName, dev, key, resized)
+		mapperPath, grew, err := r.openLUKS(ctx, dmName, dev, key, resized || toAttach)
 
 		clear(key)
 
@@ -1410,7 +1417,9 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, 
 			return nil, false, err
 		}
 
-		mapperGrew = mapperGrew || grew
+		// A mapper grown only so the kernel can attach it leaves the
+		// device's size alone (luksMapperTooSmallForDevice).
+		mapperGrew = mapperGrew || (grew && !toAttach)
 		out[vol] = mapperPath
 	}
 
@@ -1443,18 +1452,31 @@ func (r *Reconciler) luksMapperOf(ctx context.Context, rdName string, vol int32,
 	return own, false
 }
 
-// luksMapperSettled reports whether dmName is already open and has nothing
-// to grow, so the reconcile needs no password for it. Only opening,
-// formatting and resizing take the password: reading it costs API reads
-// and, on a cold cache, an Argon2id unlock, and on a locked cluster it
-// fails. An open mapper keeps serving whether or not the master key is
-// unlocked, so its replica reconciles as usual.
-func (r *Reconciler) luksMapperSettled(ctx context.Context, dmName, dev string, active, resized bool) bool {
+// luksMapperState reports whether dmName is already open and has nothing
+// to grow, so the reconcile needs no password for it, and whether it has
+// to grow only so the kernel can attach it (luksMapperTooSmallForDevice).
+// Only opening, formatting and resizing take the password: reading it
+// costs API reads and, on a cold cache, an Argon2id unlock, and on a
+// locked cluster it fails. An open mapper keeps serving whether or not
+// the master key is unlocked, so its replica reconciles as usual.
+func (r *Reconciler) luksMapperState(
+	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume,
+	dmName, dev string, active, resized bool, kernel *disklessProbe,
+) (bool, bool) {
 	if resized || !active {
-		return false
+		return false, false
 	}
 
-	return !r.luksMapperBehindUnderlying(ctx, dev, luks.DevicePath(dmName))
+	devBytes, mapperBytes, ok := r.luksSizes(ctx, dev, luks.DevicePath(dmName))
+	if !ok {
+		return true, false
+	}
+
+	if r.luksMapperTooSmallForDevice(ctx, dr, vol, mapperBytes/bytesPerKib, kernel) {
+		return false, true
+	}
+
+	return !luksMapperBehind(devBytes, mapperBytes), false
 }
 
 // luksPassword returns the password dev opens with, formatting dev first
@@ -1614,20 +1636,34 @@ func (r *Reconciler) openLUKS(ctx context.Context, dmName, dev string, key []byt
 // drift detection" pattern used by readDeviceSizeMiB elsewhere in
 // this file.
 func (r *Reconciler) luksMapperBehindUnderlying(ctx context.Context, devicePath, mapperPath string) bool {
+	devSize, mapperSize, ok := r.luksSizes(ctx, devicePath, mapperPath)
+
+	return ok && luksMapperBehind(devSize, mapperSize)
+}
+
+// luksSizes reads the sizes, in bytes, of the device under a LUKS mapper
+// and of the mapper, reporting false when either probe fails.
+func (r *Reconciler) luksSizes(ctx context.Context, devicePath, mapperPath string) (int64, int64, bool) {
 	if r.cfg.Exec == nil {
-		return false
+		return 0, 0, false
 	}
 
 	devSize, ok := readDeviceSizeBytes(ctx, r.cfg.Exec, devicePath)
 	if !ok {
-		return false
+		return 0, 0, false
 	}
 
 	mapperSize, ok := readDeviceSizeBytes(ctx, r.cfg.Exec, mapperPath)
 	if !ok {
-		return false
+		return 0, 0, false
 	}
 
+	return devSize, mapperSize, true
+}
+
+// luksMapperBehind reports whether a mapper of mapperSize bytes lags the
+// devSize bytes under it by more than a LUKS header.
+func luksMapperBehind(devSize, mapperSize int64) bool {
 	// 32 MiB covers the largest possible LUKS2 header (16 MiB default,
 	// some LUKS2 variants 4 MiB with extended secondary header) with
 	// margin for cryptsetup's per-volume alignment rounding. A real
@@ -1995,6 +2031,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 	devices := map[int32]string{}
 	resized := false
 	cloned := false
+	kernel := newDisklessProbe(r.cfg.Adm, dr.GetName())
 
 	err := r.checkStoragePoolsResolved(dr)
 	if err != nil {
@@ -2014,7 +2051,9 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 		// of CreateVolume so the new replica starts populated with
 		// the snapshot's data. Idempotent: provider's clone op skips
 		// when the target volume already exists.
-		err := r.materializeVolume(ctx, provider, dr.GetName(), vol)
+		lowerDisk := lowerDiskKib(dr, vol)
+
+		err := r.materializeVolume(ctx, provider, dr.GetName(), vol, lowerDisk)
 		if err != nil {
 			return nil, false, false, errors.Wrapf(err, "create/restore volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
@@ -2031,7 +2070,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 			return nil, false, false, errors.Wrapf(err, "volume status %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
 
-		grew, err := r.growBacking(ctx, provider, dr, vol, status.UsableKib)
+		grew, err := r.growBacking(ctx, provider, dr, vol, status, kernel)
 		if err != nil {
 			return nil, false, false, err
 		}
@@ -2074,10 +2113,21 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 // reports true. That is also the case for a grow whose backing grew on
 // an earlier pass but whose `drbdadm resize` failed: nothing else would
 // ask for the resize again.
+//
+// With no grow pending, a backing too small to attach to the device the
+// replicas report grows before the attach (planAttachGrow). That leaves
+// the device's size alone, so it reports false.
 func (r *Reconciler) growBacking(
-	ctx context.Context, provider storage.Provider, dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64,
+	ctx context.Context, provider storage.Provider, dr *intent.DesiredResource, vol *intent.DesiredVolume,
+	status storage.VolumeStatus, kernel *disklessProbe,
 ) (bool, error) {
-	step := r.planGrow(dr, vol, usableKib, r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack()))
+	withDRBD := r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack())
+
+	step := r.planGrow(dr, vol, status.UsableKib, withDRBD)
+	if !step.pending && withDRBD {
+		step = r.planAttachGrow(ctx, dr, vol, status, kernel)
+	}
+
 	r.recordGrowStep(dr.GetName(), vol.GetVolumeNumber(), step)
 
 	if step.backingKib > 0 {
@@ -2091,10 +2141,49 @@ func (r *Reconciler) growBacking(
 				dr.GetName(), vol.GetVolumeNumber(), step.backingKib)
 		}
 
-		return true, nil
+		return !step.beforeAttach, nil
 	}
 
 	return step.retryResize, nil
+}
+
+// lowerDiskKib is the size, in KiB, of the lower disk a volume is
+// created at; a grow sizes it the same way (growBackingKib).
+//
+// Under DRBD with internal metadata the lower disk holds the data area
+// and the metadata after it, so it is sized like LINSTOR sizes it: the
+// data area plus the metadata blockstor writes on it (DefaultGeometry,
+// the most peer slots blockstor creates). A lower disk the definition's
+// size exposes a DRBD device smaller than the volume, and the kernel
+// refuses to attach it to a resource whose device is already larger.
+//
+// The data area is the definition's size or the largest device any
+// replica reports, whichever is larger. A volume adopted from LINSTOR
+// was sized for LINSTOR's peer slots and rounded up to its pool's
+// allocation unit, so its device can be a few KiB larger than the
+// definition, and a replica joining it must hold that.
+//
+// External metadata lives on its own volume and a resource without DRBD
+// has no metadata, so their lower disk is the definition's size.
+//
+// A LUKS layer sits between DRBD and the storage and takes its header
+// from the front of the storage volume, so the storage volume holds the
+// header on top of whatever the layer above needs, as LINSTOR sizes it.
+// A volume adopted from LINSTOR was sized that way, and a replica
+// joining it without the header could not attach.
+func lowerDiskKib(dr *intent.DesiredResource, vol *intent.DesiredVolume) int64 {
+	size := vol.GetSizeKib()
+
+	if needsDRBD(dr.GetLayerStack()) && vol.GetMetaPool() == "" {
+		data := max(vol.GetSizeKib(), vol.GetDeviceSizeKib())
+		size = drbd.InternalMetadataGrossKiB(data, drbd.DefaultGeometry())
+	}
+
+	if needsLUKS(dr.GetLayerStack()) {
+		size += luks.HeaderKiB
+	}
+
+	return size
 }
 
 // deviceWaitTimeoutDefault/deviceWaitPollDefault back the same-named
@@ -2171,11 +2260,11 @@ func (r *Reconciler) waitForBlockDevice(ctx context.Context, device string) erro
 // fall back to a blank CreateVolume — DRBD network resync will
 // populate the data, at the cost of a known cloned-metadata vs
 // fresh-metadata GI mismatch on the wire (see Phase 11 notes).
-func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *intent.DesiredVolume) error {
+func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *intent.DesiredVolume, sizeKib int64) error {
 	target := storage.Volume{
 		ResourceName: rdName,
 		VolumeNumber: vol.GetVolumeNumber(),
-		SizeKib:      vol.GetSizeKib(),
+		SizeKib:      sizeKib,
 	}
 
 	src := vol.GetSourceSnapshot()

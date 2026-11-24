@@ -31,6 +31,7 @@ import (
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
+	"github.com/cozystack/blockstor/pkg/storage"
 )
 
 // Sizes a grow reserves under the definition size, in KiB, as LINSTOR's
@@ -84,6 +85,63 @@ func drbdInternalMetaKib(backingKib int64) int64 {
 	return drbdMetaSuperblockKib + drbdMetaActivityLogKib + bitmapKib
 }
 
+// drbdLeastMetaKib is the least internal metadata DRBD can keep at the
+// end of a backing device of backingKib: the superblock, the activity
+// log and a bitmap for a single peer slot.
+func drbdLeastMetaKib(backingKib int64) int64 {
+	bits := alignUp(ceilDiv(backingKib, kibPerBitmapBit), 64)
+
+	return drbdMetaSuperblockKib + drbdMetaActivityLogKib + alignUp(ceilDiv(bits/bitsPerByte, bytesPerKib), drbdMetaAlignKib)
+}
+
+// backingTooSmallForDevice reports whether vol's backing of usableKib,
+// of which a LUKS header takes headerKib from the front, cannot hold the
+// DRBD device the replicas report even with the least metadata DRBD
+// keeps on it, so the kernel refuses to attach it ("cannot attach
+// smaller disk"). Such a backing was never attached at that device
+// size: a replica attached to it would have kept the device within it.
+func backingTooSmallForDevice(vol *intent.DesiredVolume, usableKib, headerKib int64) bool {
+	device := vol.GetDeviceSizeKib()
+	if usableKib <= 0 || device <= 0 || vol.GetMetaPool() != "" {
+		return false
+	}
+
+	data := usableKib - headerKib
+
+	return data-drbdLeastMetaKib(data) < device
+}
+
+// disklessProbe asks the kernel, at most once per pass and only when a
+// size check calls for it, which volumes of a resource it holds Diskless
+// (drbd.Adm.DisklessVolumes): every volume of a resource is answered by
+// the same `drbdsetup status`.
+type disklessProbe struct {
+	adm      *drbd.Adm
+	resource string
+	volumes  map[int32]struct{}
+	asked    bool
+}
+
+func newDisklessProbe(adm *drbd.Adm, resource string) *disklessProbe {
+	return &disklessProbe{adm: adm, resource: resource}
+}
+
+// holds reports whether the kernel holds volume vn Diskless.
+func (p *disklessProbe) holds(ctx context.Context, vn int32) bool {
+	if p == nil || p.adm == nil {
+		return false
+	}
+
+	if !p.asked {
+		p.volumes = p.adm.DisklessVolumes(ctx, p.resource)
+		p.asked = true
+	}
+
+	_, diskless := p.volumes[vn]
+
+	return diskless
+}
+
 // drbdGrossKib is the backing size a DRBD volume with internal metadata
 // needs to offer netKib: the bitmap covers the whole backing device, so
 // the smallest size whose metadata leaves netKib for data.
@@ -100,12 +158,17 @@ func drbdGrossKib(netKib int64) int64 {
 // device the consumer sees to have the definition size: the size plus
 // DRBD's internal metadata when DRBD keeps it on this device, plus the
 // LUKS header when LUKS sits under it. LINSTOR sizes the backing the
-// same way, so an adopted volume's backing already carries both.
+// same way, so an adopted volume's backing already carries both. Under
+// DRBD the data area is the definition or the largest device any
+// replica reports, whichever is larger, as for a new lower disk
+// (lowerDiskKib): a volume adopted from LINSTOR exposes a few KiB more
+// than its definition, and a backing grown short of that could not be
+// attached.
 func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withDRBD bool) int64 {
 	size := vol.GetSizeKib()
 
 	if withDRBD && vol.GetMetaPool() == "" {
-		size = drbdGrossKib(size)
+		size = drbdGrossKib(max(size, vol.GetDeviceSizeKib()))
 	}
 
 	if needsLUKS(dr.GetLayerStack()) {
@@ -133,6 +196,88 @@ type growStep struct {
 	// retryResize: the backing needs no growing, but the layers above
 	// have not caught up, so they are resized again.
 	retryResize bool
+	// beforeAttach: the backing grows so the kernel can attach it to
+	// a device that is already larger (planAttachGrow); the device keeps
+	// its size, so nothing above is resized.
+	beforeAttach bool
+}
+
+// planAttachGrow decides a grow of the backing of a replica the kernel
+// holds without its disk, when that backing cannot hold the device the
+// replicas report. An older satellite created such backings at the
+// definition's size for volumes adopted from LINSTOR, whose device is a
+// few KiB larger than the definition, and the kernel refused each attach
+// with "cannot attach smaller disk". The definition never changed, so
+// planGrow sees no grow, and the attach would be retried and refused
+// for good.
+//
+// The backing grows to what a new one would be created at
+// (growBackingKib), so the next attach succeeds and the replica syncs
+// from its peers. It grows only while the kernel positively reports the
+// volume Diskless: a backing it cannot attach holds no data the device
+// serves, and a replica the kernel does not hold yet, as after a reboot,
+// is left alone. An attached backing is never grown here, so volumes
+// whose backings are exactly the definition keep them. The kernel is
+// asked only once the sizes call for it, so a backing that holds the
+// device costs no exec. Under LUKS the mapper grows after it
+// (luksMapperTooSmallForDevice).
+func (r *Reconciler) planAttachGrow(
+	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, status storage.VolumeStatus, kernel *disklessProbe,
+) growStep {
+	usableKib := status.UsableKib
+
+	header := int64(0)
+	if needsLUKS(dr.GetLayerStack()) {
+		header = luks2HeaderKib
+	}
+
+	if !backingTooSmallForDevice(vol, usableKib, header) {
+		return growStep{}
+	}
+
+	// A LUKS1 header, or one some LUKS2 builds wrote, is smaller than
+	// the 16 MiB a new one takes; read the one on the backing rather
+	// than grow a backing that holds the device.
+	if header > 0 && r.cfg.Cryptsetup != nil {
+		actual, ok := r.cfg.Cryptsetup.DataOffsetKiB(ctx, status.DevicePath)
+		if ok && !backingTooSmallForDevice(vol, usableKib, actual) {
+			return growStep{}
+		}
+	}
+
+	if !kernel.holds(ctx, vol.GetVolumeNumber()) {
+		return growStep{}
+	}
+
+	target := growBackingKib(dr, vol, true)
+	if target <= usableKib {
+		return growStep{}
+	}
+
+	log.FromContext(ctx).Info("growing a backing too small for the device before attaching it",
+		"resource", dr.GetName(), "volume", vol.GetVolumeNumber(),
+		"backingKib", usableKib, "deviceSizeKib", vol.GetDeviceSizeKib(), "targetKib", target)
+
+	return growStep{backingKib: target, beforeAttach: true}
+}
+
+// luksMapperTooSmallForDevice reports whether the open LUKS mapper of
+// vol, of mapperKib, cannot hold the DRBD device the replicas report
+// while the kernel holds the volume Diskless. Its backing grew before
+// the attach (planAttachGrow) on this pass or an earlier one, and the
+// mapper, which does not follow its backing on its own, has to grow too
+// for the attach to succeed. As for the backing, the device keeps its
+// size: the grow is not one `drbdadm resize` should follow, and that
+// resize would fail while the replica syncs and later grow a volume
+// nobody resized.
+func (r *Reconciler) luksMapperTooSmallForDevice(
+	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, mapperKib int64, kernel *disklessProbe,
+) bool {
+	if r.cfg.Adm == nil || !needsDRBD(dr.GetLayerStack()) {
+		return false
+	}
+
+	return backingTooSmallForDevice(vol, mapperKib, 0) && kernel.holds(ctx, vol.GetVolumeNumber())
 }
 
 // planGrow decides the grow step for vol, whose backing has usableKib.
@@ -146,6 +291,26 @@ type growStep struct {
 // in the old backing. When the backing is large enough, the layers are
 // resized again (an earlier pass grew the backing but its resize
 // failed), unless resizeRetryLimit passes already did so in vain.
+//
+// Only a change of the definition grows the device, as LINSTOR resizes
+// a DRBD volume only while its definition is being resized. A device
+// smaller than the definition with no such change is the volume's size:
+// a volume created before backings were sized for metadata has backings
+// of exactly the definition, so its device is short of the definition
+// by the metadata. A replica added to it later gets a backing sized for
+// metadata, larger than the definition, and resizing the device from
+// that replica would fail while it resyncs and, once enough replicas
+// were replaced, grow the volume nobody resized.
+//
+// The change is read from the size the replica last applied, so a
+// replica that has never reported one cannot see a grow that stays
+// inside its backing: that is a volume adopted from LINSTOR, or a
+// replica created before the size was reported, whose definition grows
+// by less than the room its backing keeps for metadata before its
+// satellite's first pass. Its sizes are those of a new replica of a
+// volume created at the definition's size, which must not resize; only
+// a resize signal from the controller, as LINSTOR's RESIZE flags are,
+// would tell the two apart.
 func (r *Reconciler) planGrow(dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64, withDRBD bool) growStep {
 	applied := vol.GetAppliedSizeKib()
 	lagging := applied > 0 && vol.GetSizeKib() > applied

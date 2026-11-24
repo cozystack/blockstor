@@ -56,6 +56,12 @@ const (
 	stateDiskless = "Diskless"
 	flagDelete    = "DELETE"
 
+	// stateAttachFailed is a replica that should have a disk, reports
+	// none, and whose satellite has failed to attach one at least
+	// once.
+	stateAttachFailed = "AttachFailed"
+	diskStateDiskless = "diskless"
+
 	replicationStateSyncTarget = "SyncTarget"
 )
 
@@ -405,10 +411,15 @@ func volumeState(res *apiv1.Resource, vol *apiv1.Volume) color.Cell {
 		return color.Cell{Text: stateUnknown, Class: color.Transitional}
 	case "diskless":
 		// Diskless on purpose is healthy; a replica that was given a
-		// disk and reports none has lost it.
+		// disk and reports none has lost it. Once its satellite has
+		// failed to attach the disk it reads AttachFailed: the failure
+		// repeats until someone acts, and a bare Diskless next to an Ok
+		// connection column reads as a healthy diskless replica.
 		class = color.Broken
 		if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) {
 			class = color.Healthy
+		} else if res.State.ToggleDiskRetries > 0 {
+			return color.Cell{Text: stateAttachFailed, Class: color.Broken}
 		}
 	case "inconsistent", "failed", "to: creating", "to: attachable", "to: attaching":
 		class = color.Broken
