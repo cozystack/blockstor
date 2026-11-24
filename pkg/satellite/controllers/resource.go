@@ -28,6 +28,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -676,7 +677,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, err
 	}
 
-	results, err := r.Config.Apply.Apply(ctx, []*intent.DesiredResource{desired})
+	results, err := r.applyLocked(ctx, desired)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
@@ -700,7 +701,9 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 // the same way: no periodic pass comes back for a device path the CSI
 // node is waiting on, or for the volume-numbers record a later delete
 // needs. An apply whose only failures are refusals an operator must act
-// on waits failureRequeue's longer interval.
+// on waits failureRequeue's longer interval, unless a grow waits for its
+// device too (growPending): that is retried at applyFailureRequeue, so a
+// refusal elsewhere in the apply does not hold the grow back.
 //
 // A converged replica waits for its next event, the way LINSTOR's
 // satellite dispatches only resources with a pending change. The one
@@ -709,16 +712,28 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 func applyRequeue(
 	results []*intent.ResourceApplyResult, anyFailed, stampFailed bool, retry time.Duration, retryAsked bool,
 ) time.Duration {
+	grow := growPending(results)
+
 	switch {
-	case anyFailed && !stampFailed:
+	case anyFailed && !stampFailed && !grow:
 		return failureRequeue(results)
-	case anyFailed || stampFailed:
+	case anyFailed || stampFailed || grow:
 		return applyFailureRequeue
 	case retryAsked:
 		return retry
 	default:
 		return 0
 	}
+}
+
+// applyLocked runs one apply pass under the resource's ApplyLocks
+// entry, so the startup backfill does not probe the lower disks while
+// this pass may be creating their metadata.
+func (r *ResourceReconciler) applyLocked(ctx context.Context, desired *intent.DesiredResource) ([]*intent.ResourceApplyResult, error) {
+	unlock := r.Config.ApplyLocks.Lock(desired.GetName())
+	defer unlock()
+
+	return r.Config.Apply.Apply(ctx, []*intent.DesiredResource{desired}) //nolint:wrapcheck // the caller wraps it
 }
 
 // prepareDRBDApply runs the DRBD-only pre-apply sequence: stale
@@ -849,6 +864,68 @@ func (r *ResourceReconciler) recordPerResourceFailures(
 	}
 
 	return anyFailed
+}
+
+// recordApplyFailure keeps Status.ApplyFailure in step with the pass
+// that just ran: the error and the volume sizes it was applying when it
+// failed, nothing once one succeeds. A resize waiting for this replica
+// reads it, so a pass that keeps failing ends the wait with its error
+// rather than leaving the caller to time out. Only a change is written,
+// so a steady replica costs no extra API call.
+func (r *ResourceReconciler) recordApplyFailure(
+	ctx context.Context, res *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult,
+) error {
+	want := applyFailureOf(rd, results)
+	if equality.Semantic.DeepEqual(want, res.Status.ApplyFailure) {
+		return nil
+	}
+
+	base := res.DeepCopy()
+	res.Status.ApplyFailure = want
+
+	err := r.Status().Patch(ctx, res, client.MergeFrom(base))
+	if err != nil {
+		return errors.Wrap(err, "patch Status.ApplyFailure")
+	}
+
+	return nil
+}
+
+// applyFailureOf is the Status.ApplyFailure a pass leaves: nil when it
+// succeeded, its error and the sizes it was applying otherwise. The
+// pass applied the definition's sizes (buildVolumes).
+func applyFailureOf(rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult) *blockstoriov1alpha1.ResourceApplyFailure {
+	for _, result := range results {
+		if result.GetOk() {
+			continue
+		}
+
+		out := &blockstoriov1alpha1.ResourceApplyFailure{Message: result.GetMessage()}
+		for _, vd := range rd.Spec.VolumeDefinitions {
+			out.Volumes = append(out.Volumes, blockstoriov1alpha1.ResourceApplyFailureVolume{
+				VolumeNumber: vd.VolumeNumber,
+				SizeKib:      vd.SizeKib,
+			})
+		}
+
+		return out
+	}
+
+	return nil
+}
+
+// growPending reports a pass that left a grow short of its device. The
+// device grows when a peer's resize does, which wakes nothing here, so
+// the pass is repeated to report the size once it shows.
+func growPending(results []*intent.ResourceApplyResult) bool {
+	for _, result := range results {
+		if result.GetGrowPending() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // deviceHoldsDataReason is the Event reason for a LUKS format refused over
@@ -1010,6 +1087,13 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 		logger.Error(err, "record toggle-disk outcome")
 	}
 
+	err = r.recordApplyFailure(ctx, res, rd, results)
+	if err != nil {
+		failed = true
+
+		logger.Error(err, "record apply failure")
+	}
+
 	return failed
 }
 
@@ -1037,9 +1121,10 @@ func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockst
 	vols := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(results[0].GetVolumes()))
 	for _, v := range results[0].GetVolumes() {
 		vols = append(vols, blockstoriov1alpha1.ResourceVolumeStatus{
-			VolumeNumber: v.GetVolumeNumber(),
-			StoragePool:  pool,
-			DevicePath:   v.GetDevicePath(),
+			VolumeNumber:   v.GetVolumeNumber(),
+			StoragePool:    pool,
+			DevicePath:     v.GetDevicePath(),
+			AppliedSizeKib: v.GetAppliedSizeKib(),
 		})
 	}
 
@@ -1545,11 +1630,22 @@ func (r *ResourceReconciler) peerReader() client.Reader {
 // target isn't found in the list (peer list built from a different
 // reader in a unit test, or the target's CRD was just deleted) — the
 // cached flags then stand, which is the pre-fix behaviour.
+//
+// The deletion timestamp is adopted the same way. A `rd d` stamps every
+// replica of the definition at once, so the uncached read that already
+// misses the peers torn down first also shows this replica's own
+// deletion; the cached copy can still lack it, and the desired state
+// built from it would call a replica in the middle of its delete a lone
+// survivor (dispatcher Deleting).
 func adoptAuthoritativeFlags(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) {
 	for i := range peers {
 		if naming.Same(peers[i].Spec.NodeName, target.Spec.NodeName) &&
 			naming.Same(peers[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			target.Spec.Flags = peers[i].Spec.Flags
+
+			if target.DeletionTimestamp == nil && peers[i].DeletionTimestamp != nil {
+				target.DeletionTimestamp = peers[i].DeletionTimestamp.DeepCopy()
+			}
 
 			return
 		}
