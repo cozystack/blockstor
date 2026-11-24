@@ -19,6 +19,7 @@ limitations under the License.
 package store_test
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -70,5 +71,36 @@ func TestReplicaPeerSlots(t *testing.T) {
 		if got := store.ReplicaPeerSlots(tc.replica, tc.definition); got != int(tc.want) {
 			t.Errorf("ReplicaPeerSlots(%d, %d) = %d, want %d", tc.replica, tc.definition, got, tc.want)
 		}
+	}
+}
+
+// A replica that turns diskful keeps the count its metadata will be
+// created with, its own, not the definition's current one: a witness
+// stamped 7 under a definition since raised to 15 cannot take a disk
+// next to eight diskful peers.
+func TestToggleDiskChecksTheReplicaOwnPeerSlots(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	st := store.NewInMemory()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-a", PeerSlots: 15}); err != nil {
+		t.Fatalf("create rd: %v", err)
+	}
+
+	for i := range 8 {
+		node := "n" + strconv.Itoa(i)
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-a", NodeName: node, PeerSlots: 15}); err != nil {
+			t.Fatalf("create %s: %v", node, err)
+		}
+	}
+
+	witness := &apiv1.Resource{Name: "pvc-a", NodeName: "w", PeerSlots: 7, Flags: []string{apiv1.ResourceFlagDiskless}}
+	if err := st.Resources().Create(ctx, witness); err != nil {
+		t.Fatalf("create witness: %v", err)
+	}
+
+	if err := store.CheckPeerSlotsForNewPeer(ctx, st, "pvc-a", "w"); !errors.Is(err, store.ErrInsufficientPeerSlots) {
+		t.Errorf("got %v, want ErrInsufficientPeerSlots for the witness's 7 slots", err)
 	}
 }

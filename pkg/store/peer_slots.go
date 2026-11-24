@@ -116,7 +116,9 @@ var ErrInsufficientPeerSlots = drbd.ErrInsufficientPeerSlots
 //
 // A replica is counted with its recorded count, or with the definition's
 // when the controller has not copied it on yet, the way the satellite
-// reads it (ReplicaPeerSlots); the new one gets the definition's.
+// reads it (ReplicaPeerSlots). A diskless replica on node that turns
+// diskful keeps its own count; a replica not there yet gets the
+// definition's.
 // A definition that uses no DRBD keeps no bitmaps and is not checked.
 func CheckPeerSlotsForNewPeer(ctx context.Context, st Store, rdName, node string) error {
 	rd, err := st.ResourceDefinitions().Get(ctx, rdName)
@@ -139,16 +141,27 @@ func CheckPeerSlotsForNewPeer(ctx context.Context, st Store, rdName, node string
 
 	existing := make([]drbd.PeerSlotReplica, 0, len(replicas))
 
+	// A replica that turns diskful, as on toggle-disk, already carries
+	// the count its metadata will be created with; a new one gets the
+	// definition's.
+	newPeerSlots := ReplicaPeerSlots(0, rd.PeerSlots)
+
 	for i := range replicas {
 		replica := &replicas[i]
+		slots := ReplicaPeerSlots(replica.PeerSlots, rd.PeerSlots)
+
+		if replica.NodeName == node {
+			newPeerSlots = slots
+		}
+
 		existing = append(existing, drbd.PeerSlotReplica{
 			Node:      replica.NodeName,
 			Diskful:   !replicaIsDiskless(replica.Flags),
-			PeerSlots: ReplicaPeerSlots(replica.PeerSlots, rd.PeerSlots),
+			PeerSlots: slots,
 		})
 	}
 
-	err = drbd.CheckPeerSlotsForNewPeer(existing, node, ReplicaPeerSlots(0, rd.PeerSlots))
+	err = drbd.CheckPeerSlotsForNewPeer(existing, node, newPeerSlots)
 	if err != nil {
 		return errors.Wrapf(err, "resource definition %q", rdName)
 	}
