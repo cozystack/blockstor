@@ -743,10 +743,27 @@ func lowestDiskfulID(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 	consider(target)
 
 	for i := range peers {
+		// A peer on its way out is not this volume's replica to elect:
+		// under a name whose earlier definition is still draining it
+		// carries that volume's node id, and holding the lowest it kept
+		// either new replica from seeding the initial Primary.
+		if ReplicaLeaving(&peers[i]) {
+			continue
+		}
+
 		consider(&peers[i])
 	}
 
 	return low
+}
+
+// ReplicaLeaving reports whether a replica is being deleted: its object
+// carries a deletion timestamp, held by the satellite finalizer while DRBD
+// tears it down, or the DELETE flag LINSTOR stamps on it. Such a replica
+// still answers reads, with the node id, disk state and generation it had,
+// and is no source for a decision about the replicas that stay.
+func ReplicaLeaving(r *blockstoriov1alpha1.Resource) bool {
+	return !r.DeletionTimestamp.IsZero() || slices.Contains(r.Spec.Flags, apiv1.ResourceFlagDelete)
 }
 
 // diskfulPeersAllocated reports whether every diskful replica (target
