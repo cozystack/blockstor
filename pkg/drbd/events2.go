@@ -47,44 +47,22 @@ type Event struct {
 	Fields map[string]string
 }
 
-// ErrStreamSyncMarker is the sentinel ParseEvent returns when the
-// line is the `exists -` marker drbdsetup emits at the boundary
-// between its initial-state flush and the live event stream. The
-// marker carries no per-resource state, so ParseEvent does not hand
-// it out as an ordinary frame; the Watcher passes it on as
-// InitialStateDone instead.
-var ErrStreamSyncMarker = errors.New("drbd: events2 stream-sync marker")
-
-// KindInitialStateDone is the Kind of the Event the Watcher emits for
-// the `exists -` marker: every object the kernel held when the stream
-// started has been reported, and live changes follow. A consumer that
-// batches the initial state flushes it here.
-const KindInitialStateDone = "-"
-
-// InitialStateDone is the Event the Watcher emits for the `exists -`
-// marker.
-func InitialStateDone() Event {
-	return Event{Action: "exists", Kind: KindInitialStateDone}
+// EndsInitialState reports whether ev is the `exists -` line drbdsetup
+// prints once it has dumped every object the kernel holds, before the
+// live changes. A consumer that publishes what it saw holds back until
+// this line: before it, a resource may have arrived without its
+// devices or connections, and publishing that would show the missing
+// parts as gone. LINSTOR's DrbdEventsMonitor waits for it the same way.
+func (ev Event) EndsInitialState() bool {
+	return ev.Action == "exists" && ev.Kind == "-"
 }
 
 // ParseEvent parses one drbdsetup events2 line. Returns an error for
 // blank or single-token lines so the caller can log and continue.
-// Returns ErrStreamSyncMarker on the `exists -` initial-state
-// boundary so Watch can skip it without emitting a no-op event.
 func ParseEvent(line string) (Event, error) {
 	parts := strings.Fields(line)
 	if len(parts) < eventMinTokens {
 		return Event{}, errors.Errorf("drbd: malformed events2 line %q", line)
-	}
-
-	// `exists -` is drbdsetup's marker between the initial-state
-	// dump and the live event stream. No per-resource fields; if it
-	// reached the observer's switch it would fall through as an
-	// unhandled event and (with future logging) spam a no-op line
-	// on every satellite restart. Filter at the parser layer so
-	// every consumer (Watcher, ad-hoc trace replays) benefits.
-	if parts[0] == "exists" && parts[1] == "-" {
-		return Event{}, ErrStreamSyncMarker
 	}
 
 	ev := Event{
@@ -121,8 +99,7 @@ func NewWatcher(src io.Reader) *Watcher {
 
 // Watch streams events into ch until ctx is cancelled or the source
 // EOFs. Malformed lines are skipped (they would otherwise stall the
-// pipeline on a single kernel quirk); the `exists -` marker arrives
-// as InitialStateDone. The channel is closed on return.
+// pipeline on a single kernel quirk). The channel is closed on return.
 func (w *Watcher) Watch(ctx context.Context, ch chan<- Event) error {
 	defer close(ch)
 
@@ -136,10 +113,6 @@ func (w *Watcher) Watch(ctx context.Context, ch chan<- Event) error {
 		}
 
 		ev, err := ParseEvent(scanner.Text())
-		if errors.Is(err, ErrStreamSyncMarker) {
-			ev, err = InitialStateDone(), nil
-		}
-
 		if err != nil {
 			continue
 		}

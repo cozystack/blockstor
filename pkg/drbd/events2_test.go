@@ -19,7 +19,6 @@ limitations under the License.
 package drbd_test
 
 import (
-	"errors"
 	"strings"
 	"testing"
 
@@ -76,18 +75,30 @@ func TestParseEventChangeDeviceLine(t *testing.T) {
 	}
 }
 
-// TestEvents2ParserSkipsExistsMarker: `exists -` is drbdsetup's
-// boundary marker between the initial-state flush and the live
-// event stream. The parser returns ErrStreamSyncMarker so the
-// Watcher filters it from the channel — emitting it as a kind=-
-// frame would fall through the satellite observer's switch as an
-// unhandled no-op (and, with future logging, spam every satellite
-// restart). Mirrors drbd-reactor's `exists -` filter; public
-// protocol behaviour.
-func TestEvents2ParserSkipsExistsMarker(t *testing.T) {
-	_, err := drbd.ParseEvent("exists -")
-	if !errors.Is(err, drbd.ErrStreamSyncMarker) {
-		t.Fatalf("ParseEvent(\"exists -\"): err = %v, want ErrStreamSyncMarker", err)
+// TestEvents2EndOfInitialStateReachesTheConsumer: `exists -` is the
+// line after which drbdsetup has told everything the kernel holds. The
+// satellite observer publishes nothing before it, so a resource that
+// arrived without its devices and connections yet is not written as if
+// they were gone; dropping the line here would leave it waiting.
+func TestEvents2EndOfInitialStateReachesTheConsumer(t *testing.T) {
+	ev, err := drbd.ParseEvent("exists -")
+	if err != nil {
+		t.Fatalf("ParseEvent(\"exists -\"): %v", err)
+	}
+
+	if !ev.EndsInitialState() {
+		t.Fatalf("`exists -` not recognised as the end of the initial state: %+v", ev)
+	}
+
+	for _, line := range []string{"exists resource name:pvc-1", "change -", "destroy resource name:pvc-1"} {
+		other, err := drbd.ParseEvent(line)
+		if err != nil {
+			t.Fatalf("ParseEvent(%q): %v", line, err)
+		}
+
+		if other.EndsInitialState() {
+			t.Errorf("%q taken for the end of the initial state", line)
+		}
 	}
 }
 
@@ -136,9 +147,8 @@ func TestParseEventValueWithColon(t *testing.T) {
 
 // TestEventStreamReplay feeds a captured trace through the parser and
 // checks the event count + selected fields. Smoke test for the typical
-// "two-peer resource comes up" sequence. The `exists -` marker is
-// filtered (ErrStreamSyncMarker) so consumers don't see a no-op
-// frame between initial-state and live stream.
+// "two-peer resource comes up" sequence, with the `exists -` line
+// between the initial state and the live stream.
 func TestEventStreamReplay(t *testing.T) {
 	trace := strings.Join([]string{
 		"exists resource name:pvc-1 role:Secondary suspended:no",
@@ -154,22 +164,22 @@ func TestEventStreamReplay(t *testing.T) {
 	for _, line := range lines {
 		ev, err := drbd.ParseEvent(line)
 		if err != nil {
-			if errors.Is(err, drbd.ErrStreamSyncMarker) {
-				continue
-			}
-
 			t.Fatalf("line %q: %v", line, err)
 		}
 
 		got = append(got, ev)
 	}
 
-	if len(got) != 4 {
-		t.Errorf("len: got %d, want 4 (exists - marker must be filtered)", len(got))
+	if len(got) != 5 {
+		t.Fatalf("len: got %d, want 5", len(got))
 	}
 
-	if got[3].Action != "change" || got[3].Fields["disk"] != "Outdated" {
-		t.Errorf("got[3]: %+v", got[3])
+	if !got[3].EndsInitialState() {
+		t.Errorf("got[3]: %+v, want the end of the initial state", got[3])
+	}
+
+	if got[4].Action != "change" || got[4].Fields["disk"] != "Outdated" {
+		t.Errorf("got[4]: %+v", got[4])
 	}
 }
 
@@ -187,8 +197,7 @@ func TestWatcherStreamsEvents(t *testing.T) {
 		"exists resource name:pvc-1 role:Primary",
 		"change device name:pvc-1 minor:1000 disk:UpToDate",
 		"",         // blank line — must be skipped, not abort the pipeline
-		"exists -", // end of the initial state
-		"change resource name:pvc-1 role:Secondary",
+		"exists -", // end of the initial state — passed on
 	}, "\n") + "\n")
 
 	w := drbd.NewWatcher(src)
@@ -203,8 +212,12 @@ func TestWatcherStreamsEvents(t *testing.T) {
 		got = append(got, ev)
 	}
 
-	if len(got) != 4 {
-		t.Fatalf("event count: got %d, want 4 (blank line skipped, exists - passed on); %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("event count: got %d, want 3 (only the blank line is skipped); %+v", len(got), got)
+	}
+
+	if !got[2].EndsInitialState() {
+		t.Errorf("event[2]: got %+v, want the end of the initial state", got[2])
 	}
 
 	if got[0].Action != "exists" || got[0].Kind != "resource" || got[0].Fields["name"] != "pvc-1" {
@@ -213,16 +226,6 @@ func TestWatcherStreamsEvents(t *testing.T) {
 
 	if got[1].Action != "change" || got[1].Fields["disk"] != "UpToDate" {
 		t.Errorf("event[1]: got %+v", got[1])
-	}
-
-	// A consumer batching the initial state needs to know where it
-	// ends, in order with the frames around it.
-	if got[2].Kind != drbd.KindInitialStateDone {
-		t.Errorf("event[2]: got %+v, want the end of the initial state", got[2])
-	}
-
-	if got[3].Action != "change" || got[3].Fields["role"] != "Secondary" {
-		t.Errorf("event[3]: got %+v", got[3])
 	}
 }
 

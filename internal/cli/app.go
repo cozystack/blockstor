@@ -182,6 +182,8 @@ func (a *App) dispatch(ctx context.Context, cmd command.Command, run handler, fl
 
 	var backend store.Store
 
+	ctx = withKubeTarget(ctx, flags)
+
 	// A command that answers from the binary alone must not need a
 	// cluster to do it. Opening the store unconditionally made
 	// `controller version` exit 10 on a host with no kubeconfig —
@@ -269,7 +271,7 @@ func (a *App) help() int {
 func (a *App) noteIgnoredFlags(flags *flagSet) {
 	if flags.IgnoredControllers {
 		fmt.Fprintln(a.Err,
-			"note: --controllers is ignored; this client reads the cluster named by your kubeconfig")
+			"note: --controllers is ignored; this client reads the cluster named by your kubeconfig (pick another with --kubeconfig or --context)")
 	}
 }
 

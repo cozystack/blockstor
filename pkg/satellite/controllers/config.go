@@ -103,6 +103,12 @@ type Config struct {
 	// short-circuits — neither Watches consumer nor producer fires.
 	ReconcileTrigger chan event.GenericEvent
 
+	// ApplyLocks keeps the startup MetadataCreated backfill off a
+	// resource while its apply pass runs; see ResourceLocks.
+	// NewManager wires one shared by both. Left nil, nothing is
+	// locked.
+	ApplyLocks *ResourceLocks
+
 	// Incarnation names this satellite process. The heartbeat stamps it
 	// on the Node and the observer on every Resource status it writes,
 	// so a read can tell the running satellite's reports from those an
