@@ -2385,7 +2385,12 @@ func (r *Reconciler) dropOldConnection(ctx context.Context, resource string, nod
 
 	forgotten := false
 	if withMetadata {
-		forgotten = r.cfg.Adm.ForgetPeer(ctx, resource, nodeID) == nil
+		forgetErr := r.cfg.Adm.ForgetPeer(ctx, resource, nodeID)
+		forgotten = forgetErr == nil
+
+		if forgetErr != nil {
+			log.FromContext(ctx).Info("forget-peer failed (non-fatal)", "nodeID", nodeID, "err", forgetErr.Error())
+		}
 	}
 
 	if delErr == nil || forgotten {

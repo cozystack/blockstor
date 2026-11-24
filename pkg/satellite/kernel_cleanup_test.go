@@ -124,7 +124,7 @@ func writeOwnedSlot(t *testing.T, dir, rd string, peers map[string]int32) {
 
 // TestPruneStaleKernelSlots_Pass1RemovesUnexpectedPeer: when a kernel
 // slot exists for a peer name K8s no longer expects, Pass 1 must
-// issue `drbdadm del-peer` (correctness — live connection) plus
+// issue `drbdsetup del-peer` by node-id (correctness — live connection) plus
 // `drbdsetup forget-peer` once for the resource (slow leak: metadata slot).
 // The healthy expected peer must NOT be touched.
 func TestPruneStaleKernelSlots_Pass1RemovesUnexpectedPeer(t *testing.T) {
@@ -142,9 +142,9 @@ func TestPruneStaleKernelSlots_Pass1RemovesUnexpectedPeer(t *testing.T) {
 	cmds := fx.CommandLines()
 
 	// del-peer + forget-peer for worker-2, nothing for worker-1.
-	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
+	mustContain(t, cmds, "drbdsetup del-peer pvc-1 2")
 	mustContain(t, cmds, "drbdsetup forget-peer pvc-1 2")
-	mustNotContain(t, cmds, "drbdadm del-peer worker-1:pvc-1")
+	mustNotContain(t, cmds, "drbdsetup del-peer pvc-1 1")
 }
 
 // TestPruneStaleKernelSlots_Pass3DebouncesStuckSlot: a slot that
@@ -353,7 +353,7 @@ func TestPruneStaleKernelSlots_Pass1ForgetsWithoutDeviceMap(t *testing.T) {
 
 	cmds := fx.CommandLines()
 
-	del := slices.Index(cmds, "drbdadm del-peer worker-2:pvc-1")
+	del := slices.Index(cmds, "drbdsetup del-peer pvc-1 2")
 	forget := slices.Index(cmds, "drbdsetup forget-peer pvc-1 2")
 
 	if del < 0 || forget < del {
@@ -375,7 +375,7 @@ func TestPruneStaleKernelSlots_Pass1KnownDisklessForgetsNothing(t *testing.T) {
 	}
 
 	cmds := fx.CommandLines()
-	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
+	mustContain(t, cmds, "drbdsetup del-peer pvc-1 2")
 	mustNotContain(t, cmds, "drbdsetup forget-peer pvc-1 2")
 }
 
