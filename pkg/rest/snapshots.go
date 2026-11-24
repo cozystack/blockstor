@@ -1138,24 +1138,7 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if outcome != snapshotWaitGone {
-		writeJSON(w, http.StatusGatewayTimeout, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | apiCallRcFailSnapshotFinalizerStuck,
-			Message: "snapshot delete acked but satellite finalizer " +
-				"not removed within timeout: " + snapName,
-			Cause: "the satellite-side finalizer " +
-				"(blockstor.org/satellite-snapshot) did " +
-				"not drain within the wait budget; the snapshot may " +
-				"still be present on disk and the Snapshot CRD will " +
-				"remain visible until the satellite reconciler runs",
-			Correc: "check satellite status on the affected nodes " +
-				"(satellite pod alive, reconciler not crash-looping, " +
-				"network reachability to the apiserver); re-issue " +
-				"the delete once the satellite is healthy",
-			ObjRefs: map[string]string{
-				objRefRscDfn:      rd,
-				objRefSnapshotDfn: snapName,
-			},
-		}})
+		writeJSON(w, http.StatusGatewayTimeout, snapshotFinalizerStuckRcs(rd, snapName))
 
 		return
 	}
@@ -1183,6 +1166,29 @@ func (s *Server) answerSnapshotAbsent(w http.ResponseWriter, r *http.Request, rd
 			objRefSnapshotDfn: snapName,
 		},
 	})
+}
+
+// snapshotFinalizerStuckRcs is the 504 answer of a snapshot delete whose
+// satellite finalizer did not drain within the wait budget.
+func snapshotFinalizerStuckRcs(rd, snapName string) []apiv1.APICallRc {
+	return []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailSnapshotFinalizerStuck,
+		Message: "snapshot delete acked but satellite finalizer " +
+			"not removed within timeout: " + snapName,
+		Cause: "the satellite-side finalizer " +
+			"(blockstor.org/satellite-snapshot) did " +
+			"not drain within the wait budget; the snapshot may " +
+			"still be present on disk and the Snapshot CRD will " +
+			"remain visible until the satellite reconciler runs",
+		Correc: "check satellite status on the affected nodes " +
+			"(satellite pod alive, reconciler not crash-looping, " +
+			"network reachability to the apiserver); re-issue " +
+			"the delete once the satellite is healthy",
+		ObjRefs: map[string]string{
+			objRefRscDfn:      rd,
+			objRefSnapshotDfn: snapName,
+		},
+	}}
 }
 
 // answerSnapshotDeleted answers a snapshot delete that went through, or
