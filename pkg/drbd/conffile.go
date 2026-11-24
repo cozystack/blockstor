@@ -109,6 +109,11 @@ type ResourceConnection struct {
 	// means "fall back to the default render" (renderer treats it
 	// the same as the connection not being present).
 	Paths []ResourcePath
+	// Net carries the `net { … }` options of this one connection
+	// (allow-two-primaries, protocol, …). drbd-9 applies them over the
+	// resource-wide `net` section for this peer pair only, which is how
+	// a live migration opens a single connection to two Primaries.
+	Net map[string]string
 }
 
 // ResourcePath is one `path { … }` sub-block inside a multi-path
@@ -383,6 +388,10 @@ func checkValues(r *Resource) error {
 		blocks = append(blocks, optionBlock{fmt.Sprintf("volume %d %s", vol.Number, SectionDisk), vol.Options})
 	}
 
+	for i := range r.Connections {
+		blocks = append(blocks, optionBlock{SectionNet, r.Connections[i].Net})
+	}
+
 	for _, block := range blocks {
 		for _, key := range sortedKeys(block.opts) {
 			err := ValidateOptionValue(block.name, key, block.opts[key])
@@ -647,11 +656,23 @@ func writeConnectionMesh(b *strings.Builder, hosts []Host, conns []ResourceConne
 func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []ResourceConnection, peerDevice map[string]string) {
 	b.WriteString("  connection {\n")
 
-	if paths := lookupPaths(conns, hostA.NodeName, hostB.NodeName); len(paths) > 0 {
+	conn := lookupConnection(conns, hostA.NodeName, hostB.NodeName)
+
+	if paths := conn.Paths; len(paths) > 0 {
 		writePathBlocks(b, hostA, hostB, paths)
 	} else {
 		fmt.Fprintf(b, "    host %s address %s:%d;\n", hostA.NodeName, hostA.Address, hostA.Port)
 		fmt.Fprintf(b, "    host %s address %s:%d;\n", hostB.NodeName, hostB.Address, hostB.Port)
+	}
+
+	if len(conn.Net) > 0 {
+		b.WriteString("    net {\n")
+
+		for _, k := range sortedKeys(conn.Net) {
+			writeOption(b, "      ", k, conn.Net[k])
+		}
+
+		b.WriteString("    }\n")
 	}
 
 	if len(peerDevice) > 0 {
@@ -667,28 +688,32 @@ func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []Resource
 	b.WriteString("  }\n")
 }
 
-// lookupPaths returns the explicit Paths for the (a, b) host pair,
-// matching either (NodeA=a, NodeB=b) or the swapped form. Returns
-// nil when no entry matches or the entry carries no paths. The
-// returned slice is oriented so each Path's AddressA belongs to
-// `a` (the lexicographically-first host of the rendered mesh pair),
-// regardless of which order the operator stored on the
-// ResourceConnection — keeps the rendered `host a address …;`
-// line consistent with the on-block address we'd otherwise emit.
+// lookupConnection returns the per-pair override for the (a, b) host
+// pair, matching either (NodeA=a, NodeB=b) or the swapped form, or the
+// zero ResourceConnection when there is none. The returned Paths are
+// oriented so each Path's AddressA belongs to `a` (the
+// lexicographically-first host of the rendered mesh pair), regardless
+// of which order the operator stored on the ResourceConnection — keeps
+// the rendered `host a address …;` line consistent with the on-block
+// address we'd otherwise emit. Net options are symmetric and returned
+// as stored.
 //
 // A connection and a host may spell one node differently, so they are
 // matched as the store addresses nodes.
-func lookupPaths(conns []ResourceConnection, a, b string) []ResourcePath {
+func lookupConnection(conns []ResourceConnection, a, b string) ResourceConnection {
 	for i := range conns {
 		switch {
 		case naming.Same(conns[i].NodeA, a) && naming.Same(conns[i].NodeB, b):
-			return conns[i].Paths
+			return conns[i]
 		case naming.Same(conns[i].NodeA, b) && naming.Same(conns[i].NodeB, a):
-			return swapPathSides(conns[i].Paths)
+			swapped := conns[i]
+			swapped.Paths = swapPathSides(conns[i].Paths)
+
+			return swapped
 		}
 	}
 
-	return nil
+	return ResourceConnection{}
 }
 
 // swapPathSides returns a copy of paths with AddressA/AddressB
@@ -718,12 +743,6 @@ func writePathBlocks(b *strings.Builder, hostA, hostB *Host, paths []ResourcePat
 		b.WriteString("    }\n")
 	}
 }
-
-// (lookupConnection + writeConnectionNet from 5.W04 dropped on
-// cherry-pick conflict with wave1 3.7's ResourceConnection type —
-// per-pair NetOptions can be reintroduced by extending
-// ResourceConnection.NetOptions in a follow-up; both 5.W04 and wave1
-// 3.7 tests still pass without these helpers.)
 
 // sortedKeys returns the keys of m in deterministic order. We don't
 // bother with a heap or anything fancy — option maps are tiny (a

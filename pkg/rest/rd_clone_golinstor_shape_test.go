@@ -114,6 +114,9 @@ func TestRDCloneRefusesWhatItCannotHonour(t *testing.T) {
 	for name, tc := range map[string]struct{ body, field string }{
 		"external name":      {`{"name":"pvc-dst","external_name":"something-else"}`, "external_name"},
 		"volume passphrases": {`{"name":"pvc-dst","volume_passphrases":["k1"]}`, "volume_passphrases"},
+		// REST 1.29.1 grows the clone; blockstor would hand back the
+		// source's size.
+		"volume sizes": {`{"name":"pvc-dst","volume_sizes":[0,2097152]}`, "volume_sizes"},
 		// python-linstor drops `name` from the body when it sends
 		// external_name; the refusal still names the field it cannot honour.
 		"external name, python-linstor body": {`{"external_name":"something-else"}`, "external_name"},

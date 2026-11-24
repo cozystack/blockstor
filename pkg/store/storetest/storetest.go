@@ -23,9 +23,11 @@ limitations under the License.
 package storetest
 
 import (
+	"maps"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -689,6 +691,7 @@ func testSnapshotUpdateNilArg(t *testing.T, newStore Factory) {
 func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Helper()
 	t.Run("AnySpellingAddressesOneReplica", func(t *testing.T) { testAnySpellingAddressesOneReplica(t, newStore) })
+	t.Run("DeleteDropsConnectionProps", func(t *testing.T) { testResourceDeleteDropsConnectionProps(t, newStore) })
 	t.Run("ListEmpty", func(t *testing.T) {
 		got, err := newStore(t).Resources().List(t.Context())
 		if err != nil {
@@ -2543,4 +2546,77 @@ func testListByNodeUnderAnySpelling(t *testing.T, newStore Factory) {
 			t.Errorf("ListByNode %q found %d replica(s), want 1", asked, len(got))
 		}
 	}
+}
+
+// testResourceDeleteDropsConnectionProps pins that a replica delete takes
+// the resource-connection props of its node along, on whichever path it
+// runs (CLI, lost-node cascade, tiebreaker reap), not only on the REST
+// one: a replica created on the node later must not inherit a stale
+// allow-two-primaries. The connections of the other nodes stay.
+func testResourceDeleteDropsConnectionProps(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	st := newStore(t)
+	ctx := t.Context()
+
+	ab := apiv1.ResourceConnectionPropKey("n1", "n2", "DrbdOptions/Net/allow-two-primaries")
+	ac := apiv1.ResourceConnectionPropKey("n1", "n3", "DrbdOptions/Net/protocol")
+	bc := apiv1.ResourceConnectionPropKey("n2", "n3", "DrbdOptions/Net/protocol")
+
+	err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:  "pvc-conn",
+		Props: map[string]string{ab: "yes", ac: "C", bc: "C", "DrbdOptions/Net/protocol": "A"},
+	})
+	if err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, node := range []string{"n1", "n2", "n3"} {
+		flags := []string{}
+		if node == "n3" {
+			flags = []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker}
+		}
+
+		err = st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-conn", NodeName: node, Flags: flags})
+		if err != nil {
+			t.Fatalf("seed replica on %s: %v", node, err)
+		}
+	}
+
+	if err = st.Resources().Delete(ctx, "pvc-conn", "n2"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	waitForProps(t, st, "pvc-conn", map[string]string{ac: "C", "DrbdOptions/Net/protocol": "A"})
+
+	reaped, err := st.Resources().DeleteIfTieBreaker(ctx, "pvc-conn", "n3")
+	if err != nil || !reaped {
+		t.Fatalf("DeleteIfTieBreaker: %v, %v", reaped, err)
+	}
+
+	waitForProps(t, st, "pvc-conn", map[string]string{"DrbdOptions/Net/protocol": "A"})
+}
+
+// waitForProps polls the definition until its props are want: a
+// Kubernetes-backed store reads through an informer cache.
+func waitForProps(t *testing.T, st store.Store, rdName string, want map[string]string) {
+	t.Helper()
+
+	var got map[string]string
+
+	for range 100 {
+		rd, err := st.ResourceDefinitions().Get(t.Context(), rdName)
+		if err != nil {
+			t.Fatalf("Get RD: %v", err)
+		}
+
+		got = rd.Props
+		if maps.Equal(got, want) {
+			return
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	t.Fatalf("RD props\n got %v\nwant %v", got, want)
 }

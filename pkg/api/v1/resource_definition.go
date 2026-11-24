@@ -163,14 +163,12 @@ type DrbdResourceLayer struct {
 	// computed. Mirrors upstream LINSTOR's `DrbdRscData.drbdVlmList`.
 	DrbdVolumes []DrbdVolume `json:"drbd_volumes,omitempty"`
 
-	// PromotionScore and MayPromote are the kernel's view of whether
-	// this replica could become Primary, as upstream's DrbdRscData
-	// carries them. Both are absent until the satellite has observed
-	// the resource, as upstream's are. linstor-csi's volume-condition
-	// check reports every replica whose score is 0 as a node with
-	// issues, so an absent score marks the volume abnormal.
-	PromotionScore *int32 `json:"promotion_score,omitempty"`
-	MayPromote     *bool  `json:"may_promote,omitempty"`
+	// PromotionScore and MayPromote are the kernel's `promotion_score`
+	// and `may_promote` for this replica. linstor-csi's volume health
+	// counts a replica whose DRBD layer has a score of 0 as unhealthy,
+	// so the score is always sent alongside the layer.
+	PromotionScore int32 `json:"promotion_score"`
+	MayPromote     bool  `json:"may_promote"`
 }
 
 // DrbdVolume is one volume's DRBD-layer-specific state. The Python

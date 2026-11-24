@@ -2769,3 +2769,54 @@ func TestObserverSyncSourceStampDoesNotDowngradeRealFrame(t *testing.T) {
 			syncSourceEv.Volumes)
 	}
 }
+
+// TestObserverCarriesPromotionScore: linstor-csi's volume health counts a
+// replica whose DRBD layer reports a promotion score of 0 as unhealthy, so
+// the observer carries the kernel's score from the resource frame, and
+// keeps it across the frames of other kinds and resource frames that
+// lack the token.
+func TestObserverCarriesPromotionScore(t *testing.T) {
+	obs, ok := translateResourceEvent(drbd.Event{
+		Kind:   eventKindResource,
+		Action: "exists",
+		Fields: map[string]string{
+			"name":            "pvc-score",
+			"role":            "Secondary",
+			"suspended":       "no",
+			"may_promote":     "yes",
+			"promotion_score": "10102",
+		},
+	})
+	if !ok {
+		t.Fatal("translateResourceEvent rejected the frame")
+	}
+
+	if obs.PromotionScore == nil || *obs.PromotionScore != 10102 {
+		t.Fatalf("PromotionScore = %v, want 10102", obs.PromotionScore)
+	}
+
+	if obs.MayPromote == nil || !*obs.MayPromote {
+		t.Fatalf("MayPromote = %v, want true", obs.MayPromote)
+	}
+
+	o := &ObserverRunnable{}
+	o.mergeResource(&obs)
+
+	connEvent := observation{ResourceName: "pvc-score"}
+	o.mergeResource(&connEvent)
+
+	if connEvent.PromotionScore == nil || *connEvent.PromotionScore != 10102 {
+		t.Errorf("after a connection frame: PromotionScore = %v, want 10102", connEvent.PromotionScore)
+	}
+
+	bare := observation{ResourceName: "pvc-score", Role: "Secondary", HasResource: true}
+	o.mergeResource(&bare)
+
+	if bare.PromotionScore == nil || *bare.PromotionScore != 10102 {
+		t.Errorf("after a resource frame without the token: PromotionScore = %v, want 10102", bare.PromotionScore)
+	}
+
+	if bare.MayPromote == nil || !*bare.MayPromote {
+		t.Errorf("after a resource frame without the token: MayPromote = %v, want true", bare.MayPromote)
+	}
+}

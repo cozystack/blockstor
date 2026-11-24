@@ -116,6 +116,10 @@ type rdCloneRequest struct {
 	ResourceGroup     string   `json:"resource_group,omitempty"`
 	ExternalName      string   `json:"external_name,omitempty"`
 	VolumePassphrases []string `json:"volume_passphrases,omitempty"`
+	// VolumeSizes (REST 1.29.1) grows the cloned volumes, in KiB per volume
+	// number, 0 keeping the source size. Refused unless every entry is 0,
+	// see cloneRequestDropsNothing.
+	VolumeSizes []int64 `json:"volume_sizes,omitempty"`
 }
 
 // registerRDClone wires the /v1/resource-definitions/{rd}/clone endpoints.
@@ -224,6 +228,17 @@ func cloneRequestDropsNothing(w http.ResponseWriter, srcName string, req *rdClon
 			Message: "clone of resource definition '" + srcName + "': external_name is not implemented",
 			Cause:   "blockstor names a cloned definition by `name`; honouring external_name would change the identity the caller asked for",
 			Correc:  "omit external_name, or clone under the name you want",
+		})
+
+		return false
+	}
+
+	if slices.ContainsFunc(req.VolumeSizes, func(size int64) bool { return size != 0 }) {
+		writeCloneRefused(w, http.StatusNotImplemented, srcName, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + srcName + "': volume_sizes is not implemented",
+			Cause:   "the clone would come back at the source's size, and report success",
+			Correc:  "clone at the source's size, then grow the volume definitions with `linstor vd set-size`",
 		})
 
 		return false

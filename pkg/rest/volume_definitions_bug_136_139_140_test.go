@@ -417,10 +417,10 @@ func TestBug140VDCreateConflictReturnsErrorMask(t *testing.T) {
 			rcs[0].RetCode, apiCallRcError)
 	}
 
-	// Sub-code must be FAIL_EXISTS_VLM_DFN (upstream 502 | MASK_ERROR).
+	// Sub-code must be FAIL_EXISTS_VLM_DFN (upstream 503 | MASK_ERROR).
 	// Audit-log greppers that route on the upstream catalogue need
 	// the same sub-code, not a generic "high-bit set" error.
-	if rcs[0].RetCode&apiCallRcFailExistsVlmDfn == 0 {
+	if rcs[0].RetCode != apiCallRcError|apiCallRcFailExistsVlmDfn {
 		t.Errorf("ret_code: got %#x, want FAIL_EXISTS_VLM_DFN (%#x) sub-code set",
 			rcs[0].RetCode, apiCallRcFailExistsVlmDfn)
 	}
