@@ -97,6 +97,32 @@ func TestCreateVolumeThin(t *testing.T) {
 	}
 }
 
+// TestCreateVolumeRoundsUp: a size that is not a whole number of MiB is
+// rounded up. A lower disk sized for DRBD metadata asks for the least it
+// needs; rounded down, a 20 GiB volume's 20981164 KiB disk became 20489
+// MiB, too small for the data area it was sized for.
+func TestCreateVolumeRoundsUp(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -o name tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, fx)
+
+	err := p.CreateVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      20981164,
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	want := "zfs create -s -V 20490M tank/pvc-1_00000"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+}
+
 // TestCreateVolumeIdempotent: existing dataset → no `zfs create`, but
 // ensureRefreservation still runs (Bug 255). The volsize lookup +
 // refreservation lookup are wired so the helper observes a thick-correct

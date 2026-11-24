@@ -191,7 +191,7 @@ func TestRestoreOntoAVolumeAlreadyOnDiskIsNotSeededAsAClone(t *testing.T) {
 	rec := restoreSeedReconciler(t)
 	rec.cfg.Providers["zfsthin1"] = prov
 
-	err := rec.materializeVolume(t.Context(), prov, "pvc-restored", restoredVolume())
+	err := rec.materializeVolume(t.Context(), prov, "pvc-restored", restoredVolume(), restoredVolume().GetSizeKib())
 	if err != nil {
 		t.Fatalf("materializeVolume: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestRestoreCloneMadeHereIsSeededAsAClone(t *testing.T) {
 	rec.cfg.Providers["zfsthin1"] = prov
 
 	for pass := range 2 {
-		err := rec.materializeVolume(t.Context(), prov, "pvc-restored", restoredVolume())
+		err := rec.materializeVolume(t.Context(), prov, "pvc-restored", restoredVolume(), restoredVolume().GetSizeKib())
 		if err != nil {
 			t.Fatalf("materializeVolume pass %d: %v", pass, err)
 		}
@@ -250,7 +250,7 @@ func TestDeleteResourceForgetsTheRestoreRecord(t *testing.T) {
 	prov := &restoreSeedFakeProvider{kind: ProviderKindZFSThin, absent: true}
 	rec.cfg.Providers["zfsthin1"] = prov
 
-	err = rec.materializeVolume(t.Context(), prov, "pvc-restored", restoredVolume())
+	err = rec.materializeVolume(t.Context(), prov, "pvc-restored", restoredVolume(), restoredVolume().GetSizeKib())
 	if err != nil {
 		t.Fatalf("materializeVolume: %v", err)
 	}

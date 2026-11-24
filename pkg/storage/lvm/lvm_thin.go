@@ -85,7 +85,7 @@ func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	}
 
 	// LINSTOR rounds to MiB internally; we follow.
-	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+	sizeMiB := storage.SizeMiB(vol.SizeKib)
 
 	_, err := t.exec.Run(ctx, "lvcreate",
 		Args("--thin",
@@ -118,7 +118,7 @@ func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 // which the LVM CLI rejects ("Option --config may not be repeated."),
 // so lvextend never ran and the resize hot-looped forever.
 func (t *Thin) ResizeVolume(ctx context.Context, vol storage.Volume) error {
-	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+	sizeMiB := storage.SizeMiB(vol.SizeKib)
 
 	_, err := t.exec.Run(ctx, "lvextend",
 		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
@@ -375,7 +375,7 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, _ storag
 	// present from the first byte of the LV's existence; a crash BEFORE
 	// dd cannot leave an un-tagged LV that would be mis-trusted on the
 	// next reconcile (Bug 257).
-	sizeMiB := max(target.SizeKib/mibPerKib, 1)
+	sizeMiB := storage.SizeMiB(target.SizeKib)
 
 	_, err := t.exec.Run(ctx, "lvcreate",
 		Args("--thin",
@@ -445,9 +445,8 @@ func (t *Thin) lvExists(ctx context.Context, lvName string) bool {
 }
 
 const (
-	mibPerKib = 1024
-	pctMax    = 100.0
-	lvsCols   = 2
+	pctMax  = 100.0
+	lvsCols = 2
 	// poolStatusCols are the fields PoolStatus reads: lv_size,
 	// data_percent and lv_attr. The attribute is what separates a pool
 	// that is merely inactive, and whose data_percent lvs leaves empty,
