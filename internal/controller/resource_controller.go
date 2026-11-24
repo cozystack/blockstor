@@ -428,13 +428,14 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	}
 
 	// Auto-diskful: when a DISKLESS replica is actively used by a
-	// consumer (InUse=true on this node) AND the hosting node has
-	// a viable storage pool, promote it to diskful so reads stay
-	// local. Cleanup (demote on idle) is intentionally not
-	// automated yet — needs hysteresis to avoid flapping on
-	// transient opens; operators demote via `linstor r d` until
-	// then.
-	promoted, err := r.maybeAutoDiskful(ctx, target)
+	// consumer (InUse=true on this node), the hosting node has a
+	// viable storage pool AND the volume has fewer diskful replicas
+	// than its resource group's place count, promote it to diskful
+	// so the lost copy is refilled where the volume is used. Cleanup
+	// (demote on idle) is intentionally not automated yet — needs
+	// hysteresis to avoid flapping on transient opens; operators
+	// demote via `linstor r d` until then.
+	promoted, err := r.maybeAutoDiskful(ctx, target, peers, rdPtr)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -458,7 +459,20 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 // satellite reconciler picks up the spec change on the next pass
 // and creates the LV/zvol + attach. Returns true when Spec was
 // mutated so the caller can requeue.
-func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *blockstoriov1alpha1.Resource) (bool, error) {
+//
+// A volume that already has its resource group's place count of
+// diskful replicas keeps the diskless attach diskless: a pod or a VM
+// moving to a node without a replica would otherwise copy the whole
+// volume there and leave it with more diskful replicas than the
+// storage class asks for. Only a deficit (a copy was lost) is refilled
+// through the node that uses the volume. When the place count can't
+// be read nothing is promoted.
+func (r *ResourceReconciler) maybeAutoDiskful(
+	ctx context.Context,
+	target *blockstoriov1alpha1.Resource,
+	peers []blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+) (bool, error) {
 	if !slices.Contains(target.Spec.Flags, apiv1.ResourceFlagDiskless) {
 		return false, nil
 	}
@@ -471,6 +485,15 @@ func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *block
 		// Tiebreaker witnesses must stay diskless — they're chosen
 		// for the network presence, not local storage. Promoting a
 		// tiebreaker would defeat the quorum semantic.
+		return false, nil
+	}
+
+	hasDeficit, err := r.hasDiskfulDeficit(ctx, peers, rd)
+	if err != nil {
+		return false, err
+	}
+
+	if !hasDeficit {
 		return false, nil
 	}
 
@@ -504,6 +527,75 @@ func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *block
 	}
 
 	return true, nil
+}
+
+// hasDiskfulDeficit reports whether the volume has fewer live diskful
+// replicas than its resource group's place count. Diskless replicas,
+// replicas flagged DELETE (or INACTIVE), replicas being deleted and
+// replicas on EVICTED or LOST nodes don't count, the same way the
+// auto-diskful timer drops them. A definition without a resource group, a resource group
+// that can't be read, or a missing definition yields false so nothing
+// is promoted on a guess. A place count of 0 (the default group ships
+// with it) reads as 1, the way the placer treats it.
+func (r *ResourceReconciler) hasDiskfulDeficit(
+	ctx context.Context,
+	peers []blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+) (bool, error) {
+	if rd == nil || rd.Spec.ResourceGroupName == "" {
+		return false, nil
+	}
+
+	rg, err := r.Store.ResourceGroups().Get(ctx, rd.Spec.ResourceGroupName)
+	if err != nil {
+		if cerrors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	placeCount := int(rg.SelectFilter.PlaceCount)
+	if placeCount == 0 {
+		placeCount = 1
+	}
+
+	nodes, err := r.Store.Nodes().List(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	disabled := make(map[string]struct{}, len(nodes))
+
+	for i := range nodes {
+		if isDisabledNode(&nodes[i]) {
+			disabled[naming.Key(nodes[i].Name)] = struct{}{}
+		}
+	}
+
+	diskful := 0
+
+	for i := range peers {
+		if peers[i].DeletionTimestamp != nil {
+			continue
+		}
+
+		if _, gone := disabled[naming.Key(peers[i].Spec.NodeName)]; gone {
+			continue
+		}
+
+		if slices.ContainsFunc(peers[i].Spec.Flags, func(f string) bool {
+			return f == apiv1.ResourceFlagDiskless ||
+				f == apiv1.ResourceFlagDelete ||
+				f == apiv1.ResourceFlagInactive
+		}) {
+			continue
+		}
+
+		diskful++
+	}
+
+	return diskful < placeCount, nil
 }
 
 // firstAvailablePool returns any non-diskless storage pool present on
