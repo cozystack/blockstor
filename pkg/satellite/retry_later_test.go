@@ -176,7 +176,11 @@ func TestFailedDeviceNodeAsksForARetry(t *testing.T) {
 // replica.
 func TestFailedUnexpectedPeerTeardownAsksForARetry(t *testing.T) {
 	r, fx := newKernelCleanupReconciler(t)
-	fx.Expect("drbdadm del-peer worker-2:pvc-1", storage.FakeResponse{Err: storage.FakeExitError{Code: 10}})
+	// The departed peer is dropped by its kernel node-id. A forget-peer
+	// that went through would prove the connection gone, so it fails too:
+	// the kernel refuses it while the connection is still there.
+	fx.Expect("drbdsetup del-peer pvc-1 2", storage.FakeResponse{Err: storage.FakeExitError{Code: 10}})
+	fx.Expect("drbdsetup forget-peer pvc-1 2", storage.FakeResponse{Err: storage.FakeExitError{Code: 10}})
 
 	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1", PeerExpectation{PeerNames: []string{"worker-1"}}, []int32{0}, nil)
 	if err == nil {
