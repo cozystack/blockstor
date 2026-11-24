@@ -166,6 +166,18 @@ func (r *KernelResource) Inconsistent() bool {
 	})
 }
 
+// InconsistentSecondary reports whether the resource is Secondary here
+// and every local volume is Inconsistent. Such a node cannot be the
+// SyncSource of a handshake it makes, a resync only ever takes an
+// Inconsistent disk as its target, so a reconnect it runs cannot make it
+// the source of a Secondary while a Primary writes (LINBIT/drbd#153).
+func (r *KernelResource) InconsistentSecondary() bool {
+	return r.Role == string(RoleSecondary) && len(r.Devices) > 0 &&
+		!slices.ContainsFunc(r.Devices, func(d KernelDevice) bool {
+			return d.DiskState != string(DiskStateInconsistent)
+		})
+}
+
 // ResyncDependency is the shape of a resync that can stall on another
 // peer: a local Inconsistent volume of the resource is SyncTarget of one
 // peer (Active) while its resync from another one (Paused) waits on it
