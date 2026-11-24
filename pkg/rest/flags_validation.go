@@ -51,7 +51,7 @@ const (
 	rdFlagDelete        = "DELETE"
 	rdFlagRestoreTarget = "RESTORE_TARGET"
 	rdFlagCloning       = "CLONING"
-	rdFlagFailed        = legacySnapshotFlagFailed // "FAILED" — reuse existing const
+	rdFlagFailed        = "FAILED"
 )
 
 // Resource flag enum literals — see upstream `Resource.java::Flags`.

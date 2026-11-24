@@ -19,6 +19,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"strings"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -157,6 +159,16 @@ type SnapshotSpec struct {
 	// +listMapKey=volumeNumber
 	// +optional
 	LUKSKeys []SnapshotLUKSKey `json:"luksKeys,omitempty"`
+
+	// abortReason, once set, records that the controller aborted the
+	// take, and why. It is written in the same update that clears
+	// suspendIO and takeSnapshot, so the abort is on record before any
+	// satellite resumes and holds even if the status write that
+	// follows never lands. An aborted take is over: suspendIO is never
+	// set again and the snapshot is never marked SUCCESSFUL, as LINSTOR
+	// keeps an aborted snapshot definition failed for good.
+	// +optional
+	AbortReason string `json:"abortReason,omitempty"`
 }
 
 // SnapshotLUKSKey is the wrapped password of one source replica's volume.
@@ -223,6 +235,13 @@ const AnnotationSnapshotAdopted = "blockstor.org/adopted"
 // snapshot age instead of the adoption time.
 const AnnotationSnapshotAdoptedCreatedAt = "blockstor.org/adopted-created-at"
 
+// AnnotationSnapshotAbortReason carries the same record as
+// Spec.AbortReason, written by the same update. A writer that predates
+// the field drops it from the spec it writes back, and an API server
+// still serving the older CRD prunes it, but both keep metadata
+// annotations; the controller trusts either copy.
+const AnnotationSnapshotAbortReason = "blockstor.org/abort-reason"
+
 // SnapshotStatusFlagFailed is stamped on Status.Flags by the
 // satellite reconciler when CreateSnapshot returned a terminal
 // error (e.g. parent volume missing, unknown resource, source
@@ -231,7 +250,10 @@ const AnnotationSnapshotAdoptedCreatedAt = "blockstor.org/adopted-created-at"
 // to the `State="Failed"` column in `linstor s l`. Matches
 // upstream LINSTOR's `FAILED_DEPLOYMENT` SnapshotDefinition
 // flag — same semantic ("the satellite tried and gave up"),
-// shorter name. Once stamped, the reconciler does NOT requeue:
+// shorter name. The controller-side SnapshotReconciler stamps it on
+// every other Snapshot of the same GroupID too, as LINSTOR flags
+// every snapshot definition of an aborted multi-snapshot request.
+// Once stamped, the reconciler does NOT requeue:
 // a terminal failure is a dead-letter that an operator must
 // either delete or recreate.
 const SnapshotStatusFlagFailed = "FAILED"
@@ -250,6 +272,30 @@ const SnapshotStatusFlagFailed = "FAILED"
 // the "distinguish failure reasons" half of the upstream safety
 // contract — operators see *why* the snapshot aborted.
 const SnapshotStatusFlagFailedDisconnect = "FAILED_DISCONNECT"
+
+// SnapshotStatusFlagSuccessful is stamped on Status.Flags by the
+// controller-side SnapshotReconciler once the take has completed on
+// every targeted node and I/O has been resumed, and on an adopted
+// Snapshot once its per-node state is backfilled. It is never cleared.
+// Mirrors LINSTOR's SnapshotDefinition SUCCESSFUL flag, which is
+// persisted at the same point and outlives the source resources: a
+// snapshot whose source volume has been deleted is still restorable,
+// so its success cannot be read off the replicas that are left.
+const SnapshotStatusFlagSuccessful = "SUCCESSFUL"
+
+// SnapshotAbortNotUpToDateMark is the part of an abort reason that
+// says the take was refused because a targeted replica was not
+// UpToDate. Every controller that recorded such an abort wrote it, so
+// a record left by an earlier version is recognised as well. The
+// controller deletes such a snapshot, and the REST create answers it
+// the way LINSTOR answers FAIL_SNAPSHOT_NOT_UPTODATE.
+const SnapshotAbortNotUpToDateMark = "' is not UpToDate; "
+
+// IsSnapshotAbortNotUpToDate reports whether an abort reason records a
+// take refused because a targeted replica was not UpToDate.
+func IsSnapshotAbortNotUpToDate(reason string) bool {
+	return strings.Contains(reason, SnapshotAbortNotUpToDateMark)
+}
 
 // SnapshotStatusConditionType is the well-known Status.Conditions[]
 // type the controller-side SnapshotReconciler stamps to record a
@@ -272,9 +318,10 @@ type SnapshotStatus struct {
 	// +optional
 	NodeStatus []SnapshotPerNodeStatus `json:"nodeStatus,omitempty"`
 
-	// flags carries terminal-state markers. Currently only
-	// "FAILED" is meaningful — stamped by the satellite when
-	// CreateSnapshot returns a non-retryable error class.
+	// flags carries terminal-state markers: "SUCCESSFUL" once the
+	// take completed on every targeted node, "FAILED" when a
+	// satellite's CreateSnapshot returned a non-retryable error, and
+	// "FAILED_DISCONNECT" when the controller aborted a take that hung.
 	// +optional
 	Flags []string `json:"flags,omitempty"`
 

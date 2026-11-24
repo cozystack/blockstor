@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -137,4 +138,20 @@ func head(s string, n int) string {
 	}
 
 	return s[:n]
+}
+
+// TestRequestDurationBucketsReachTheTakeWait: a snapshot create held for
+// the whole take wait, or given up by a CSI sidecar at its minute, is
+// counted in a finite bucket, not lumped into +Inf.
+func TestRequestDurationBucketsReachTheTakeWait(t *testing.T) {
+	t.Parallel()
+
+	last := requestDurationBuckets[len(requestDurationBuckets)-1]
+	if last < SnapshotTakeWait.Seconds() {
+		t.Errorf("largest bucket %vs is below the %v take wait", last, SnapshotTakeWait)
+	}
+
+	if !slices.Contains(requestDurationBuckets, 60) {
+		t.Errorf("no bucket at the CSI sidecar's 60s timeout: %v", requestDurationBuckets)
+	}
 }

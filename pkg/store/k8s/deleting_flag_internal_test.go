@@ -197,3 +197,35 @@ func TestCrdToWireSnapshotSurfacesDeletingFlag(t *testing.T) {
 		t.Fatalf("crdToWireSnapshot surfaced DELETE on a live Snapshot")
 	}
 }
+
+// SUCCESSFUL is the flag the controller persists when the take completes,
+// and the wire view serves it as stored: no replica of the source has to be
+// left for it. A snapshot being deleted is served as Deleting only, so a
+// client that checks SUCCESSFUL before DELETE does not restore from it.
+func TestCrdToWireSnapshotServesThePersistedSuccessfulFlag(t *testing.T) {
+	t.Parallel()
+
+	live := &crdv1alpha1.Snapshot{
+		Spec:   crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "src", SnapshotName: "snap"},
+		Status: crdv1alpha1.SnapshotStatus{Flags: []string{crdv1alpha1.SnapshotStatusFlagSuccessful}},
+	}
+
+	if wire := crdToWireSnapshot(live, nil); !slices.Contains(wire.Flags, apiv1.SnapshotFlagSuccessful) {
+		t.Fatalf("crdToWireSnapshot dropped the persisted SUCCESSFUL: flags=%v", wire.Flags)
+	}
+
+	now := metav1.NewTime(time.Now())
+	deleting := live.DeepCopy()
+	deleting.DeletionTimestamp = &now
+	deleting.Finalizers = []string{"blockstor.org/satellite-snapshot"}
+
+	wire := crdToWireSnapshot(deleting, nil)
+	if !slices.Contains(wire.Flags, apiv1.SnapshotFlagDelete) ||
+		slices.Contains(wire.Flags, apiv1.SnapshotFlagSuccessful) {
+		t.Fatalf("a deleting snapshot is served with flags=%v, want DELETE and no SUCCESSFUL", wire.Flags)
+	}
+
+	if !slices.Contains(deleting.Status.Flags, crdv1alpha1.SnapshotStatusFlagSuccessful) {
+		t.Fatalf("crdToWireSnapshot mutated the CRD's flags: %v", deleting.Status.Flags)
+	}
+}
