@@ -17,19 +17,23 @@
 # finalizer never releases, the RD never finishes deleting, and the
 # node is left degraded for later scenarios.
 #
-# The fix `zfs promote`s the dependent clone(s) before destroying the
-# source (NOT `zfs destroy -R`, which would cascade-destroy the
-# surviving clone = data loss). After promotion the origin snapshot
-# reparents onto the clone, making it independent, and the source
-# destroys cleanly.
+# The fix follows LINSTOR's ZFS provider, never `zfs destroy -r` or
+# `-R`: the snapshot the clone hangs off is marked
+# `linstor:marked_for_deletion` and renamed to `@_deleted_<snap>_<time>`
+# when its Snapshot is deleted, and the source zvol, which still has that
+# snapshot, is marked and renamed to `_deleted_<src>_00000_<suffix>`
+# instead of destroyed. Both go when the clone is deleted: the clone's
+# destroy cascades to its marked origin, and the origin's to its marked,
+# now empty, zvol.
 #
-# Expected after fix:
+# Expected:
 #   1. delete SOURCE RD          → fully deletes, no "has dependent
 #                                  clones" loop, finalizers release.
 #   2. dst clone survives        → its volume is still readable and the
 #                                  bytes match what was written to src.
-#   3. delete DST RD             → also clean (promote is a no-op when
-#                                  the source has no remaining clones).
+#   3. delete DST RD             → also clean, and the renamed source
+#                                  and its snapshot go with it: nothing
+#                                  named after either RD is left.
 #
 # ZFS pool required: same-node clone uses `zfs clone`, which only the
 # ZFS provider implements. We place on the worker pair that has the
@@ -152,7 +156,7 @@ fi
 echo ">> SOURCE RD fully deleted, finalizers released"
 
 # The surviving clone must still be UpToDate and its bytes intact —
-# the promote must have reparented the data, not destroyed it.
+# the renamed source still backs it.
 RD=$RD_DST
 wait_uptodate "$RD_DST" "$N1" "$N2"
 DEV_DST=$(device_for_rd "$RD_DST" "$N1")
@@ -164,8 +168,8 @@ if [[ "$md5_src" != "$md5_dst" ]]; then
 fi
 echo ">> clone ${RD_DST} survived with intact data (md5=${md5_dst})"
 
-# Reverse case: deleting the clone after the source is gone must also
-# be clean (promote is a no-op — the clone owns its data now).
+# Deleting the clone after the source is gone must also be clean, and
+# must take the renamed source and its snapshot with it.
 echo ">> delete DST RD ${RD_DST}"
 delete_rd "$RD_DST"
 
@@ -173,5 +177,14 @@ if ! rd_gone "$RD_DST" "$DEL_TIMEOUT"; then
     echo "FAIL: clone RD ${RD_DST} did not finish deleting within ${DEL_TIMEOUT}s"
     exit 1
 fi
+
+for node in "$N1" "$N2"; do
+    left=$(on_node "$node" bash -c "zfs list -H -t all -o name 2>/dev/null | grep -E 'zcsd-(src|dst)' || true")
+    if [[ -n "$left" ]]; then
+        echo "FAIL: datasets left on ${node} after both deletes (the cascade did not finish):"
+        echo "$left"
+        exit 1
+    fi
+done
 
 echo ">> ZFS-CLONE-SOURCE-DELETE OK"

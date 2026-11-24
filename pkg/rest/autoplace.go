@@ -2871,7 +2871,8 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// on the witness path, which the guard skips (diskful-only). An
 	// explicit `?force=true` overrides. See
 	// resource_delete_last_uptodate_u130.go.
-	if !s.refuseLastUpToDateDiskfulMidSyncDelete(r.Context(), w, rdName, &existing, queryFlag(r, "force")) {
+	if s.refuseZFSDeleteStrategy(w, r, rdName) ||
+		!s.refuseLastUpToDateDiskfulMidSyncDelete(r.Context(), w, rdName, &existing, queryFlag(r, "force")) {
 		return
 	}
 
@@ -2929,7 +2930,7 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// per-replica drop so the very next `r l` / `view/resources` on
 	// this apiserver replica reflects it. See
 	// pkg/rest/cache_invalidation.go.
-	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
+	converged := s.waitForResourceDeletionVisible(r.Context(), rdName, node)
 
 	// Drop a witness the delete left without a tie to break before
 	// replying, as upstream does for the shapes where its helper no
@@ -2943,10 +2944,22 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// reconciler woken by the annotation observes post-delete state.
 	s.bumpPeerChangedOnSiblings(r.Context(), rdName, node)
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	writeJSON(w, http.StatusOK, resourceDeletedAnswer(rdName, node, converged))
+}
+
+// resourceDeletedAnswer is the replica delete's answer, with the in-progress
+// warning when the replica was still there once the answer was due.
+func resourceDeletedAnswer(rdName, node string, converged bool) []apiv1.APICallRc {
+	answer := []apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
 		Message: "resource deleted: " + rdName + " on " + node,
-	}})
+	}}
+
+	if !converged {
+		answer = append(answer, deleteInProgress(rdName, []string{node}))
+	}
+
+	return answer
 }
 
 // maybeStampTiebreakerSuppressionOnDelete stamps the

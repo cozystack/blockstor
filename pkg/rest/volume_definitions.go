@@ -1095,6 +1095,12 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// LINSTOR's ZFS delete strategy applies to a volume definition delete
+	// as to a replica's.
+	if s.refuseZFSDeleteStrategy(w, r, rd) {
+		return
+	}
+
 	// Bug 202: capture the VD pre-Delete so the post-Delete re-walk
 	// has something to restore if a racing `r c` slipped between the
 	// pre-walk and the store-level Delete. Capture-after-refuse

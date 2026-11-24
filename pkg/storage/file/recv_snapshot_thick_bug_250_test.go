@@ -69,6 +69,7 @@ func TestRecvSnapshotThickFallocates(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024, // 1 GiB
 		},
+		storage.Snapshot{},
 		src,
 	)
 	if err != nil {
@@ -105,6 +106,7 @@ func TestRecvSnapshotThinNoFallocate(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{},
 		src,
 	)
 	if err != nil {

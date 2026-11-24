@@ -51,6 +51,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite"
@@ -125,7 +126,7 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 // distinct key (`blockstor.org/resource`) so the
 // two paths coexist during the Phase 10.6 cutover without
 // stepping on each other.
-const SatelliteResourceFinalizer = "blockstor.org/satellite-resource"
+const SatelliteResourceFinalizer = finalizers.SatelliteResource
 
 // resourceKind is the apiserver Kind for the blockstor Resource
 // CRD. Defined once so SSA Patch payloads in this package share
@@ -1845,9 +1846,9 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //  4. Storage Provider's DeleteVolume is idempotent on missing
 //     volumes — a second handleDelete pass after a partial first
 //     pass (DeleteResource succeeded, Update failed) re-issues
-//     the storage tear-down safely. Bug 43's storage sweeper is
-//     the wider-scope backstop; this ordering fix is the
-//     per-resource source-of-truth path.
+//     the storage tear-down safely. Nothing else deletes the
+//     storage: the finalizer stays until DeleteResource reports
+//     that every volume is gone.
 //
 // Phase 10.1. Once Phase 10.6 retires the gRPC contract,
 // `internal/controller.ResourceReconciler.runDelete` and its
@@ -1871,6 +1872,19 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 		Name:          naming.Key(res.Spec.ResourceDefinitionName),
 		StoragePool:   resolveDeleteStoragePool(res),
 		VolumeNumbers: volumeNumbers,
+	}
+
+	if res.Annotations[finalizers.StorageAbandoned] != "" {
+		// `node lost` removed this replica because the node is gone;
+		// LINSTOR leaves the storage of a lost node in place, and so
+		// does a satellite that turns out to be running after all: it
+		// tears down DRBD and keeps the volumes.
+		req.StoragePool = ""
+	} else {
+		req.DeletedSuffix, err = r.recordRenameSuffix(ctx, res)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	resp, err := r.Config.Apply.DeleteResource(ctx, req)
@@ -1937,7 +1951,7 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 
 // lookupVolumeNumbers resolves the per-RD volume-number set the
 // satellite's DeleteResource walks to drop matching LVs / loopfiles.
-// It tries three sources in descending order of authority:
+// It joins three sources:
 //
 //  1. The parent RD's VolumeDefinitions (the source of truth while
 //     the RD CRD still exists).
@@ -1967,29 +1981,30 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 func (r *ResourceReconciler) lookupVolumeNumbers(ctx context.Context, res *blockstoriov1alpha1.Resource) ([]int32, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
+	var fromRD []int32
+
 	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
-	if err == nil {
-		out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
+
+	switch {
+	case err == nil:
 		for i := range rd.Spec.VolumeDefinitions {
-			out = append(out, rd.Spec.VolumeDefinitions[i].VolumeNumber)
+			fromRD = append(fromRD, rd.Spec.VolumeDefinitions[i].VolumeNumber)
 		}
-
-		return out, nil
-	}
-
-	if !apierrors.IsNotFound(err) {
+	case !apierrors.IsNotFound(err):
 		return nil, errors.Wrap(err, "get parent RD for delete")
 	}
 
-	// Source 2: the annotation stamped on the last successful apply.
-	if nums := parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]); len(nums) > 0 {
-		return nums, nil
-	}
+	// The three sources are joined rather than tried in turn: a volume any
+	// of them names belongs to this replica, and one the delete skips is
+	// left on disk with nothing to delete it later. Deleting a volume that
+	// is already gone is a no-op.
+	nums := slices.Concat(fromRD,
+		parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]),
+		volumeNumbersFromStatus(res))
+	slices.Sort(nums)
+	nums = slices.Compact(nums)
 
-	// Source 3: the observer-stamped Status.Volumes. Covers the
-	// rolling-deploy race where the delete fires before the first
-	// apply stamped the annotation.
-	if nums := volumeNumbersFromStatus(res); len(nums) > 0 {
+	if len(nums) > 0 {
 		return nums, nil
 	}
 

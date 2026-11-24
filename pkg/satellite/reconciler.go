@@ -505,24 +505,6 @@ func (r *Reconciler) RegisterProvider(pool string, provider storage.Provider) {
 	r.cfg.Providers[pool] = provider
 }
 
-// SnapshotProviders returns a snapshot of the pool→provider map the
-// reconciler currently holds. Used by the orphan-storage sweeper (Bug
-// 43) which walks every registered provider for VolumeLister-capable
-// backends. The map is copied under the same lock RegisterProvider
-// takes so a concurrent registration can't tear the snapshot.
-//
-// Callers must treat the returned map as read-only — modifying it
-// races every subsequent RegisterProvider call.
-func (r *Reconciler) SnapshotProviders() map[string]storage.Provider {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	out := make(map[string]storage.Provider, len(r.cfg.Providers))
-	maps.Copy(out, r.cfg.Providers)
-
-	return out
-}
-
 // SetCrossNodeFetcher injects the cross-node fetcher post-construction.
 // Called by the agent after the controller-runtime manager is built —
 // the fetcher needs the manager's cached client to look up Snapshot +
@@ -700,20 +682,29 @@ func (r *Reconciler) SnapshotPools(ctx context.Context, rdName, snapName string)
 
 // DeleteSnapshot mirrors CreateSnapshot. Idempotency lives at the
 // provider layer (lvremove on missing LV is non-fatal there).
+//
+// The snapshot outlives its replica: deleting the replica keeps the
+// snapshots on disk, and the satellite then no longer knows which pool the
+// resource used. The request's pools are searched instead, and every one of
+// them must be registered, so a satellite that has not reconciled its pools
+// yet keeps the Snapshot's finalizer rather than reporting nothing to delete.
 func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *intent.DeleteSnapshotRequest) (*intent.DeleteSnapshotResponse, error) {
-	provider, err := r.providerForResource(req.GetResourceName())
+	providers, err := r.snapshotProviders(req)
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
 		return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
 	}
 
-	err = provider.DeleteSnapshot(ctx, storage.Snapshot{
-		ResourceName: req.GetResourceName(),
-		SnapshotName: req.GetSnapshotName(),
-	})
-	if err != nil {
-		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
-		return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+	for _, provider := range providers {
+		err = provider.DeleteSnapshot(ctx, storage.Snapshot{
+			ResourceName:  req.GetResourceName(),
+			SnapshotName:  req.GetSnapshotName(),
+			DeletedSuffix: req.GetDeletedSuffix(),
+		})
+		if err != nil {
+			//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
+			return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+		}
 	}
 
 	return &intent.DeleteSnapshotResponse{Ok: true}, nil
@@ -987,23 +978,10 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		}
 	}
 
-	if pool := req.GetStoragePool(); pool != "" {
-		provider, ok := r.cfg.Providers[pool]
-		if ok {
-			for _, n := range req.GetVolumeNumbers() {
-				err := provider.DeleteVolume(ctx, storage.Volume{
-					ResourceName: req.GetName(),
-					VolumeNumber: n,
-				})
-				if err != nil {
-					//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
-					return &intent.DeleteResourceResponse{
-						Ok:      false,
-						Message: err.Error(),
-					}, nil
-				}
-			}
-		}
+	err := r.deleteVolumes(ctx, req)
+	if err != nil {
+		//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
+		return &intent.DeleteResourceResponse{Ok: false, Message: err.Error()}, nil
 	}
 
 	if r.cfg.StateDir != "" {
@@ -1035,6 +1013,87 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	r.forgetResource(req.GetName(), req.GetVolumeNumbers())
 
 	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
+}
+
+// snapshotProviders is every diskful pool the request names, which is every
+// one this node has, plus the resource's own pool when the satellite knows
+// it. The resource's current pool is not enough: a replica that moved to
+// another pool on this node left the snapshot, under the zvol its delete
+// renamed, in the pool it moved from. A pool that is named but not
+// registered yet (the satellite just started) may hold the snapshot, so the
+// delete waits for it. A node without any diskful pool has nowhere to hold a
+// copy.
+func (r *Reconciler) snapshotProviders(req *intent.DeleteSnapshotRequest) ([]storage.Provider, error) {
+	pools := slices.Clone(req.GetStoragePools())
+
+	own, known := r.poolOf(req.GetResourceName())
+
+	if known && !slices.Contains(pools, own) {
+		if _, ok := r.provider(own); ok {
+			pools = append(pools, own)
+		}
+	}
+
+	providers := make([]storage.Provider, 0, len(pools))
+
+	for _, pool := range pools {
+		provider, ok := r.provider(pool)
+		if !ok {
+			return nil, errors.Errorf("storage pool %q is not registered on this satellite; snapshot %s of %s is not deleted yet",
+				pool, req.GetSnapshotName(), req.GetResourceName())
+		}
+
+		providers = append(providers, provider)
+	}
+
+	return providers, nil
+}
+
+// deleteVolumes deletes every requested volume through the replica's pool.
+// A diskful replica's pool that is not registered yet (the satellite just
+// started and its StoragePool has not been reconciled) or no longer (the pool
+// was removed) cannot delete anything. Reporting success then would release
+// the finalizer over storage that is still on disk, so the delete stays
+// pending until the pool is back.
+func (r *Reconciler) deleteVolumes(ctx context.Context, req *intent.DeleteResourceRequest) error {
+	pool := req.GetStoragePool()
+	if pool == "" {
+		return nil
+	}
+
+	provider, ok := r.provider(pool)
+	if !ok {
+		return errors.Errorf("storage pool %q is not registered on this satellite; its volumes are not deleted yet", pool)
+	}
+
+	for _, n := range req.GetVolumeNumbers() {
+		vol := storage.Volume{ResourceName: req.GetName(), VolumeNumber: n}
+
+		var err error
+
+		if suffixed, ok := provider.(storage.SuffixedDeleter); ok {
+			err = suffixed.DeleteVolumeWithSuffix(ctx, vol, req.GetDeletedSuffix())
+		} else {
+			err = provider.DeleteVolume(ctx, vol)
+		}
+
+		if err != nil {
+			return errors.Wrapf(err, "delete volume %s/%d", req.GetName(), n)
+		}
+	}
+
+	return nil
+}
+
+// provider looks the pool up under the lock RegisterProvider takes, so
+// a StoragePool reconciled concurrently cannot tear the read.
+func (r *Reconciler) provider(pool string) (storage.Provider, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	provider, ok := r.cfg.Providers[pool]
+
+	return provider, ok
 }
 
 // forgetPool drops the resource from the resource→pool map so a
@@ -1751,10 +1810,10 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 // volumes, so a re-reconcile after a partial first pass safely
 // finishes the cleanup.
 //
-// An unknown pool is silently skipped — the dispatcher may stamp a
-// historical pool the satellite no longer has registered (e.g.
-// after a pool rename). The orphan-storage sweeper backstops with
-// its own scan in that edge case.
+// An unknown pool is an error, not a skip: nothing else deletes the
+// volume later, so the toggle stays pending until the pool is
+// registered (a satellite that just started has not reconciled its
+// StoragePools yet).
 func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.DesiredResource) error {
 	for _, vol := range dr.GetVolumes() {
 		pool := vol.GetStoragePool()
@@ -1762,9 +1821,10 @@ func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.D
 			continue
 		}
 
-		provider, ok := r.cfg.Providers[pool]
+		provider, ok := r.provider(pool)
 		if !ok {
-			continue
+			return errors.Errorf("reclaim volume %s/%d on diskless toggle: storage pool %q is not registered on this satellite",
+				dr.GetName(), vol.GetVolumeNumber(), pool)
 		}
 
 		err := provider.DeleteVolume(ctx, storage.Volume{
@@ -2186,7 +2246,7 @@ func (r *Reconciler) crossNodeClone(
 
 	defer func() { _ = body.Close() }()
 
-	err = shipper.RecvSnapshot(ctx, target, body)
+	err = shipper.RecvSnapshot(ctx, target, storage.Snapshot{ResourceName: srcRD, SnapshotName: snapName}, body)
 	if err != nil {
 		return errors.Wrapf(err, "recv %s/%s from %s", srcRD, snapName, peer)
 	}
@@ -6752,9 +6812,7 @@ func (r *Reconciler) providerForResource(name string) (storage.Provider, error) 
 
 // poolForResource is providerForResource that also names the pool.
 func (r *Reconciler) poolForResource(name string) (string, storage.Provider, error) {
-	r.mu.Lock()
-	pool, ok := r.resourceToPool[name]
-	r.mu.Unlock()
+	pool, ok := r.poolOf(name)
 
 	if !ok {
 		return "", nil, errors.Errorf("resource %q not known on this satellite", name)
@@ -6766,6 +6824,16 @@ func (r *Reconciler) poolForResource(name string) (string, storage.Provider, err
 	}
 
 	return pool, provider, nil
+}
+
+// poolOf is the pool an applied replica of the resource was recorded in.
+func (r *Reconciler) poolOf(name string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pool, ok := r.resourceToPool[name]
+
+	return pool, ok
 }
 
 // rememberPool records the pool that backs a resource, so subsequent
