@@ -1,6 +1,7 @@
 {
 "items": [
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "encrypted/masterkey",
 "prop_value": "YGFiY2RlZmdoaWprbG1ub5bVilcKH4i0OIPhTpxwW8Nd2jaxBs/yYutifx5pjM8E",
@@ -8,6 +9,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "encrypted/passphrasesalt",
 "prop_value": "QEFCQ0RFRkdISUpLTE1OTw==",
@@ -15,6 +17,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "encrypted/masterhash",
 "prop_value": "fUwo1VHOQnfLAHVKzly/Bhr5lBOgsAwojcocYiwNm2eLuLZ+HZsOVctGnaFVzwxjiWqj8nnqfWRcrt9Vf3462Q==",
@@ -22,6 +25,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "Aux/topology/kubernetes.io/hostname",
 "prop_value": "node-a",
@@ -29,6 +33,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "CurStltConnName",
 "prop_value": "default-ipv4",
@@ -36,6 +41,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "StorDriver/StorPoolName",
 "prop_value": "data",
@@ -43,6 +49,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "StorDriver/internal/AllocationGranularity",
 "prop_value": "16",
@@ -50,6 +57,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "StorDriver/StorPoolName",
 "prop_value": "data",
@@ -57,6 +65,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "StorDriver/internal/AllocationGranularity",
 "prop_value": "16",
@@ -64,6 +73,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "DrbdOptions/Net/protocol",
 "prop_value": "A",
@@ -71,6 +81,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "DrbdOptions/Resource/quorum",
 "prop_value": "majority",
@@ -78,6 +89,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "Aux/csi.storage.k8s.io/pvc/name",
 "prop_value": "app-data",
@@ -85,6 +97,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "Aux/csi.storage.k8s.io/pvc/namespace",
 "prop_value": "tenant-fixture",
@@ -92,6 +105,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "DrbdOptions/Resource/quorum",
 "prop_value": "majority",
@@ -99,6 +113,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "DrbdOptions/auto-verify-alg",
 "prop_value": "crct10dif",
@@ -106,6 +121,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "FileSystem/Type",
 "prop_value": "ext4",
@@ -113,6 +129,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "DrbdOptions/Net/allow-two-primaries",
 "prop_value": "yes",
@@ -120,6 +137,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "DrbdCurrentGi",
 "prop_value": "F1E2D3C4B5A69788",
@@ -127,6 +145,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "StorPoolName",
 "prop_value": "data",
@@ -134,6 +153,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "StorPoolName",
 "prop_value": "data",
@@ -141,6 +161,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "StorPoolName",
 "prop_value": "DfltDisklessStorPool",
@@ -148,6 +169,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "StorPoolName",
 "prop_value": "data",
@@ -155,6 +177,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "SequenceNumber",
 "prop_value": "1",
@@ -162,10 +185,26 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "Aux/csi.storage.k8s.io/pvc/name",
 "prop_value": "app-data",
 "props_instance": "/SNAP_DFNS_RSC_DFN/PVC-VOL1/SNAP-GOOD"
+}
+},
+{
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
+"spec": {
+"prop_key": "DrbdOptions/Disk/block-size",
+"prop_value": "4096",
+"props_instance": "/SNAP_VLM_DFNS_VLM_DFN/PVC-VOL1/SNAP-GOOD/0"
+}
+},
+{
+"spec": {
+"prop_key": "Linstor/Drbd/freeze-block-size",
+"prop_value": "True",
+"props_instance": "/SNAP_VLM_DFNS_VLM_DFN/PVC-VOL1/SNAP-GOOD/0"
 }
 },
 {
@@ -176,6 +215,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "DrbdOptions/auto-verify-algo-allowed-list",
 "prop_value": "crct10dif;crc32c;sha256",
@@ -183,6 +223,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "NetCom/SslConnector/Port",
 "prop_value": "3377",
@@ -190,6 +231,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "Cluster/LocalID",
 "prop_value": "00000000-1111-2222-3333-444444444444",
@@ -197,6 +239,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "encryptedMasterKey",
 "prop_value": "fixture-master-crypto-material",
@@ -204,10 +247,67 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "prop_key": "StorDriver/StorPoolName",
 "prop_value": "fast",
 "props_instance": "/STOR_POOLS/NODE-A/FAST"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/connect-int",
+"prop_value": "15",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/ping-int",
+"prop_value": "12",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/ping-timeout",
+"prop_value": "10",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/timeout",
+"prop_value": "90",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/verify-alg",
+"prop_value": "crc32c",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "Cluster/LocalID",
+"prop_value": "00000000-1111-2222-3333-444444444444",
+"props_instance": "/STLT"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/auto-verify-alg",
+"prop_value": "crc32c",
+"props_instance": "/RSC_DFNS/PVC-VOL3"
+}
+},
+{
+"spec": {
+"prop_key": "DrbdOptions/Net/sndbuf-size",
+"prop_value": "1048576",
+"props_instance": "/NODES/NODE-B"
 }
 }
 ]

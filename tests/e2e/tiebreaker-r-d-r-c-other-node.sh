@@ -62,8 +62,8 @@ N2=$WORKER_2
 N3=$WORKER_3
 
 # Per-step convergence budget. Worst observed re-converge after
-# the wedge fix is ~25s on a healthy QEMU stand (down + up +
-# adjust + handshake + bitmap-no acceptance); 90s gives 3x
+# the wedge fix is ~25s on a healthy QEMU stand (del-peer +
+# forget-peer + adjust + handshake + bitmap-no acceptance); 90s gives 3x
 # headroom for CI noise.
 CONVERGE=${CONVERGE:-90}
 

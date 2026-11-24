@@ -62,6 +62,24 @@ drbdadm connect <definition>
 
 The victim resyncs from the survivor. While the slot is `StandAlone` the satellite still adjusts it, but with `--skip-net`, so it leaves the connection to you. The victim's independent writes are lost, so if you are not sure which side is right, stop and copy the data off first.
 
+## StandAlone after a failed apply
+
+A replica whose `drbdadm adjust` or `drbdadm up` failed half way is also left `StandAlone`, with nothing to do with a split: the satellite created its connections but never connected them. The usual cause is a port another DRBD resource on the node still holds, a leftover of a deleted definition for example. The failure is a Warning Event on the Resource, under the Resource's name as `kubectl get resources` lists it:
+
+```sh
+kubectl get events -A --field-selector involvedObject.name=<resource>,reason=ApplyFailed
+```
+
+The satellite retries the apply with a full `drbdadm adjust`, never with `--skip-net`, first after five seconds and then at doubling intervals up to five minutes, until one goes through. Remove the cause, and the replica connects and resyncs at the next retry, which leaves a Normal `ApplySucceeded` Event on the Resource with the number of failed attempts before it; the `ApplyFailed` Warnings stay listed until they expire, so read them against that Event rather than as a replica still down. The satellite counts the failed attempts in memory, as LINSTOR keeps its retry list, so a retry that goes through after the satellite restarted leaves no `ApplySucceeded` Event; read the replica's state on the Resource then. The satellite does keep, across a restart, the record that the last adjust failed, so the retry after it is a full one too. The full adjust connects every peer, so a `drbdadm disconnect` you make while the retries keep failing is undone by the next one; wait until the apply goes through, or remove the cause first, before you start the split-brain recovery above.
+
+A new replica whose apply waits for the controller to give it its DRBD node id or its initial-sync decision is not a failed apply: it leaves no Event, does not count toward the back-off, and is tried again every five seconds and as soon as the controller writes the Resource. A wait that lasts more than a minute leaves one Warning `WaitingForController` Event on the Resource, naming what it waits for: the controller is then down, or cannot stamp the replica, and the controller log says why.
+
+A diskful replica that names no storage pool waits for one the same way, but for 30 seconds only. A new replica can be seen a moment before the write that gives it its pool, and that write lands within seconds. A replica still without a pool after that was created or converted to diskful without one, and nothing gives it one later, so its apply fails with an `ApplyFailed` Warning, `no storage pool resolved for the diskful replica`, and is retried with the back-off above. Name the pool with `linstor r td <node> <rd> --storage-pool <pool>`, or set `StorPoolName` on the resource definition, and the next retry goes through.
+
+## StandAlone towards a peer that changed
+
+The kernel itself drops a connection whose handshake its configuration refuses, and leaves it `StandAlone`. The case seen in practice is a new replica whose peer was set up as a diskless witness and came up diskful: the kernel log on the node that dropped it says `The peer is configured to be diskless but presents Inconsistent`. Nobody disconnected that peer, so the satellite does not keep it as it keeps yours: before it adjusts a resource with a `StandAlone` peer it reads the plan of a full adjust (`drbdadm -d adjust <definition>`), and when the plan changes that peer's options rather than only connecting it again, the adjust is a full one. It resets the options and connects the peer at the next pass of the resource, and leaves a Warning `StaleConnectionReconnected` Event on the Resource naming the peer.
+
 ## Inconsistent or SyncTarget that never finishes
 
 Look at the disk state of each replica and at the replication state towards the peer that should be the source:
@@ -251,7 +269,7 @@ The readiness probe answers `/readyz` only after the satellite has started and s
 - The pod stays in `ContainerCreating` with a `FailedMount` event. The Secret `blockstor-satellite-stream-tls` with the snapshot stream's certificate does not exist yet. Check `kubectl -n blockstor-system get certificate blockstor-satellite-stream`; the Certificate comes from `rendered/blockstor-apiserver-tls.yaml`, see [Snapshot stream between satellites](../networking/#snapshot-stream-between-satellites).
 - The satellite exits at start and logs `invalid flags`. Only some of the `--stream-tls-*` flags are set, or their files do not load.
 - The node is not registered. The satellite logs that the `Node` object is missing and that it will not create it. Run `blockstor node create <name> <address>`. This also happens after `node lost`.
-- The pod is running but the node shows `OFFLINE`. The heartbeat is more than 40 seconds old. The satellite may be wedged; the liveness probe restarts it after three failures. If it stays `OFFLINE` for an hour the node gets evacuated automatically unless you turned that off. See [Taking a node out of service](../operations/#taking-a-node-out-of-service).
+- The pod is running but the node shows `OFFLINE`. The heartbeat is more than 50 seconds old. The satellite may be wedged; the liveness probe restarts it after three failures. If it stays `OFFLINE` for an hour the node gets evacuated automatically unless you turned that off. See [Taking a node out of service](../operations/#taking-a-node-out-of-service).
 
 ## Storage pool shows no capacity
 

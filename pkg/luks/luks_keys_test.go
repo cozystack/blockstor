@@ -21,6 +21,7 @@ package luks_test
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/luks"
@@ -92,6 +93,43 @@ func TestIsActive(t *testing.T) {
 		if c.IsActive(t.Context(), name) {
 			t.Errorf("%s is reported active", name)
 		}
+	}
+}
+
+// MapsDevice answers yes only for a live table holding one crypt target
+// over the device itself; every other table, and a probe that fails,
+// answers no.
+func TestMapsDevice(t *testing.T) {
+	t.Parallel()
+
+	const (
+		crypt  = "0 2064384 crypt aes-xts-plain64 :64:logon:cryptsetup:0f0e-d0 0 253:7 32768\n"
+		number = "lsblk --nodeps --noheadings --output MAJ:MIN /dev/zd16"
+	)
+
+	for name, tc := range map[string]struct {
+		table, device storage.FakeResponse
+		want          bool
+	}{
+		"crypt over the device": {table: storage.FakeResponse{Stdout: []byte(crypt)}, device: storage.FakeResponse{Stdout: []byte(" 253:7\n")}, want: true},
+		"crypt over another":    {table: storage.FakeResponse{Stdout: []byte(crypt)}, device: storage.FakeResponse{Stdout: []byte("253:70\n")}},
+		"not crypt":             {table: storage.FakeResponse{Stdout: []byte(strings.Replace(crypt, " crypt ", " integrity ", 1))}, device: storage.FakeResponse{Stdout: []byte("253:7\n")}},
+		"two targets":           {table: storage.FakeResponse{Stdout: []byte(crypt + crypt)}, device: storage.FakeResponse{Stdout: []byte("253:7\n")}},
+		"no such mapping":       {table: storage.FakeResponse{Err: storage.FakeExitError{Code: 1}}, device: storage.FakeResponse{Stdout: []byte("253:7\n")}},
+		"empty table":           {device: storage.FakeResponse{Stdout: []byte("253:7\n")}},
+		"device probe fails":    {table: storage.FakeResponse{Stdout: []byte(crypt)}, device: storage.FakeResponse{Stdout: []byte("253:7\n"), Err: storage.FakeExitError{Code: 32}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			fx := storage.NewFakeExec()
+			fx.Expect("dmsetup table mapper", tc.table)
+			fx.Expect(number, tc.device)
+
+			if got := luks.NewCryptsetup(fx).MapsDevice(t.Context(), "mapper", "/dev/zd16"); got != tc.want {
+				t.Fatalf("MapsDevice %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -131,13 +131,17 @@ func (t *Thin) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 }
 
 // DeleteVolume idempotently removes the LV. Missing → no-op (reconcile
-// loops re-call this).
+// loops re-call this); a probe that fails is an error, never "missing".
+//
+// Thin snapshots are independent thin LVs, so they survive their origin's
+// removal, as with LINSTOR's LVM_THIN provider.
 func (t *Thin) DeleteVolume(ctx context.Context, vol storage.Volume) error {
-	if !t.lvExists(ctx, volumeLVName(vol)) {
-		return nil
+	present, err := lvPresent(ctx, t.exec, t.cfg.VolumeGroup, volumeLVName(vol))
+	if err != nil || !present {
+		return err
 	}
 
-	_, err := t.exec.Run(ctx, "lvremove",
+	_, err = t.exec.Run(ctx, "lvremove",
 		Args("--force",
 			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
@@ -215,16 +219,22 @@ func (t *Thin) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error 
 	return nil
 }
 
+// HasSnapshot reports whether this pool holds the snapshot LV.
+func (t *Thin) HasSnapshot(ctx context.Context, snap storage.Snapshot) (bool, error) {
+	return t.lvExists(ctx, snapshotLVName(snap)), nil
+}
+
 // DeleteSnapshot mirrors DeleteVolume on the snapshot LV. Missing
 // snapshot LV → no-op so the satellite's reconcile loop can strip
 // the Snapshot CRD's finalizer instead of looping forever on a
 // "not found" surface error.
 func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
-	if !t.lvExists(ctx, snapshotLVName(snap)) {
-		return nil
+	present, err := lvPresent(ctx, t.exec, t.cfg.VolumeGroup, snapshotLVName(snap))
+	if err != nil || !present {
+		return err
 	}
 
-	_, err := t.exec.Run(ctx, "lvremove",
+	_, err = t.exec.Run(ctx, "lvremove",
 		Args("--force",
 			t.cfg.VolumeGroup+"/"+snapshotLVName(snap))...)
 	if err != nil {
@@ -346,7 +356,7 @@ func (r *lvmDDReader) Close() error {
 // runs, and post-dd `lvchange --deltag` clears the sentinel. The
 // idempotent-skip path inspects the tag: present → re-run the dd;
 // absent → previous run completed cleanly.
-func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, _ storage.Snapshot, src io.Reader) error {
 	tgtName := volumeLVName(target)
 
 	if t.lvExists(ctx, tgtName) {
@@ -378,29 +388,6 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 	}
 
 	return t.ddRecvAndClearSentinel(ctx, target, src)
-}
-
-// ListVolumeNames enumerates every LV in the configured VG that
-// matches blockstor's `<resource>_<vol5digits>` naming. Used by the
-// orphan-storage sweeper (Bug 43) to GC LVs whose owning Resource
-// CRD has been force-deleted without the satellite's DeleteVolume
-// running.
-//
-// Snapshot LVs (named `<rd>_<snap>_00000` — see snapshotLVName) live
-// in the same VG; we filter them out via the lv_attr column. Volume
-// LVs have type '-' (thick) or 'V' (thin virtual); snapshot LVs use
-// 's' (regular) or carry origin metadata differentiable through
-// lv_attr.
-// Bug 276 (P1, class-extension of Bug 270): bound the ctx here too.
-// ListVolumeNames runs from the storage orphan-sweeper ticker (every
-// SweeperPeriod) and bypassed the lvExists-level wrap that catches
-// other lvs calls. A suspended VG would silently kill the sweep
-// loop without the bound.
-func (t *Thin) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
-	ctx, cancel := withProbeTimeout(ctx)
-	defer cancel()
-
-	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
 }
 
 // ddRecvAndClearSentinel runs the dd byte-copy from src into the
@@ -437,90 +424,6 @@ func (t *Thin) ddRecvAndClearSentinel(ctx context.Context, target storage.Volume
 
 	return nil
 }
-
-// listLVMVolumes is the shared LV-enumeration helper used by both
-// Thin and Thick providers. Both backends use the same per-VG `lvs`
-// invocation; only the VG name differs.
-func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.VolumeRef, error) {
-	out, err := ex.Run(ctx, "lvs",
-		Args("--noheadings",
-			"-o", "lv_name,lv_attr",
-			"--separator", "\t",
-			vg)...)
-	if err != nil {
-		return nil, errors.Wrapf(err, "lvs %s", vg)
-	}
-
-	refs := make([]storage.VolumeRef, 0)
-
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		parts := strings.Split(line, "\t")
-		if len(parts) < 2 {
-			continue
-		}
-
-		name := strings.TrimSpace(parts[0])
-		attr := strings.TrimSpace(parts[1])
-
-		// First lv_attr char is the volume type. Snapshot LVs
-		// (origin 's' or thin-snapshot variants) live in the
-		// same VG; we don't manage them through DeleteVolume
-		// so the sweeper skips them. Volume LVs have type '-'
-		// (thick) or 'V' (thin virtual).
-		if attr == "" {
-			continue
-		}
-
-		volType := attr[0]
-		if volType != '-' && volType != 'V' {
-			continue
-		}
-
-		resource, vol, ok := parseLVName(name)
-		if !ok {
-			continue
-		}
-
-		refs = append(refs, storage.VolumeRef{
-			ResourceName: resource,
-			VolumeNumber: vol,
-		})
-	}
-
-	return refs, nil
-}
-
-// parseLVName splits `<resource>_<vol5digits>` into (resource, vol).
-// Mirrors zfs.parseVolumeName; kept package-local so each backend
-// owns its naming convention.
-func parseLVName(name string) (string, int32, bool) {
-	idx := strings.LastIndex(name, "_")
-	if idx == -1 {
-		return "", 0, false
-	}
-
-	suffix := name[idx+1:]
-	if len(suffix) != lvNumberDigits {
-		return "", 0, false
-	}
-
-	n, err := strconv.Atoi(suffix)
-	if err != nil {
-		return "", 0, false
-	}
-
-	// suffix is `lvNumberDigits` digits (<=99999), so int->int32 is lossless.
-	return name[:idx], int32(n), true //nolint:gosec // bounded by lvNumberDigits=5
-}
-
-// lvNumberDigits is the fixed-width volume-number suffix length —
-// matches the zero-padding in volumeLVName.
-const lvNumberDigits = 5
 
 // lvExists is the idempotency primitive used by Create/Delete. Errors
 // from `lvs` are folded into "missing": we can't distinguish "lv not

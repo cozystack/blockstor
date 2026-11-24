@@ -152,6 +152,22 @@ type DesiredResource struct {
 	// but keeping the tri-state matches the clusterIP append-only model
 	// and lets a future caller tell them apart.
 	SkipInitialSync *bool
+
+	// Deleting is true when this replica or its definition is on its way
+	// out: either carries a deletion timestamp, the replica is flagged
+	// DELETE or DELETING, or the definition is flagged DELETE. A replica that is being deleted is never promoted
+	// by a self-heal: losing its peers is the intended end state of the
+	// delete, not a wedge to repair. LINSTOR never promotes a resource
+	// it is deleting either.
+	Deleting bool
+
+	// OtherDiskfulReplica is true when the definition has a diskful
+	// replica on another node, counted over every sibling Resource:
+	// deactivated ones, ones being deleted and ones the allocator has not
+	// stamped yet included, all of which Peers leaves out. Any of them
+	// holds, or may hold, data this replica does not, so a replica that
+	// has one is never force-promoted as the definition's only copy.
+	OtherDiskfulReplica bool
 }
 
 // DesiredConnection is one (peer-pair, paths) entry on a
@@ -327,6 +343,26 @@ func (x *DesiredResource) GetPeerHasData() bool {
 	return x.PeerHasData
 }
 
+// GetDeleting reports whether this replica or its definition is being
+// deleted. Nil-safe.
+func (x *DesiredResource) GetDeleting() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.Deleting
+}
+
+// GetOtherDiskfulReplica reports whether the definition has a diskful
+// replica on another node, whatever its state. Nil-safe.
+func (x *DesiredResource) GetOtherDiskfulReplica() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.OtherDiskfulReplica
+}
+
 // GetSkipInitialSync returns the controller-authoritative skip-initial-
 // sync decision (true → may skip, false → must SyncTarget, nil → not
 // yet stamped). Nil-safe at the receiver level; the *bool tri-state is
@@ -390,6 +426,40 @@ type DesiredVolume struct {
 	// log on a volume with one is a crash to repair with apply-al, not a
 	// foreign superblock to re-initialise over.
 	ObservedGI string
+
+	// DiskOptions are the volume's own DRBD disk options, keyed by bare
+	// option name (block-size, rs-discard-granularity): those set on its
+	// volume definition or volume group, resolved by
+	// effectiveprops.VolumeDiskOptions. The .res renders them inside the
+	// volume, where they override the resource-scope disk section.
+	DiskOptions map[string]string
+
+	// AppliedSizeKib is the size this replica last finished applying
+	// (Resource status), 0 when none was reported. While it is below
+	// SizeKib a grow is still pending here: the satellite grows the
+	// backing to what the layers need, runs `drbdadm resize` again when
+	// the backing needs no growing on this pass, so a resize that failed
+	// after the backing grew is retried rather than forgotten, and
+	// reports the size only once the device shows it.
+	AppliedSizeKib int64
+}
+
+// GetDiskOptions returns the volume's own disk options.
+func (x *DesiredVolume) GetDiskOptions() map[string]string {
+	if x == nil {
+		return nil
+	}
+
+	return x.DiskOptions
+}
+
+// GetAppliedSizeKib returns the size last applied on this replica, or 0.
+func (x *DesiredVolume) GetAppliedSizeKib() int64 {
+	if x == nil {
+		return 0
+	}
+
+	return x.AppliedSizeKib
 }
 
 // GetObservedGI returns the GI last reported for this volume, or "".
@@ -478,6 +548,16 @@ type ResourceApplyResult struct {
 	Ok       bool
 	Message  string
 
+	// WaitingForController is set on a result that is not Ok only
+	// because the apply waits for the controller to stamp the replica
+	// (satellite.ErrWaitingForController): a wait, not a failed apply.
+	WaitingForController bool
+
+	// ReconnectedPeers names the peers whose StandAlone connection this
+	// apply set up again because the kernel held it with a peer
+	// configuration the resource no longer has.
+	ReconnectedPeers []string
+
 	// Volumes carries per-volume DevicePath the satellite materialised
 	// during this apply. Empty when the resource is DISKLESS or the
 	// apply chain failed before assigning a device. The c-r reconciler
@@ -485,6 +565,26 @@ type ResourceApplyResult struct {
 	// so linstor-csi / consumers reading the CRD can resolve the
 	// backing /dev path without an extra round-trip.
 	Volumes []*ResourceApplyVolumeResult
+
+	// DroppedOptions says why each option the satellite left out of the
+	// resource's .res went: drbdadm would have refused the whole file
+	// over it. The c-r reconciler reports each as a Warning Event on the
+	// Resource, since the operator set it and it does not take effect.
+	DroppedOptions []string
+
+	// GrowPending reports a volume whose grow has not reached its device
+	// yet, typically because a peer's backing has not grown: the pass
+	// is to be repeated so the size applied is reported once it has.
+	GrowPending bool
+}
+
+// GetGrowPending reports a volume whose grow has not reached its device.
+func (x *ResourceApplyResult) GetGrowPending() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.GrowPending
 }
 
 // ResourceApplyVolumeResult is the per-volume slice item the
@@ -494,6 +594,41 @@ type ResourceApplyResult struct {
 type ResourceApplyVolumeResult struct {
 	VolumeNumber int32
 	DevicePath   string
+
+	// AppliedSizeKib is the volume definition size this pass applied
+	// through every layer: the definition size when no grow was pending
+	// or the device has grown to it, the size reported before otherwise.
+	// Set only on a pass that succeeded.
+	AppliedSizeKib int64
+}
+
+// GetAppliedSizeKib returns the size this pass applied, or 0.
+func (v *ResourceApplyVolumeResult) GetAppliedSizeKib() int64 {
+	if v == nil {
+		return 0
+	}
+
+	return v.AppliedSizeKib
+}
+
+// GetWaitingForController reports whether the result is only a wait
+// for the controller's stamp — nil-safe.
+func (x *ResourceApplyResult) GetWaitingForController() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.WaitingForController
+}
+
+// GetReconnectedPeers returns the peers this apply reconnected after
+// the kernel dropped them — nil-safe.
+func (x *ResourceApplyResult) GetReconnectedPeers() []string {
+	if x == nil {
+		return nil
+	}
+
+	return x.ReconnectedPeers
 }
 
 // GetVolumes returns the per-volume slice — nil-safe.
@@ -567,6 +702,19 @@ type DeleteResourceRequest struct {
 	Name          string
 	StoragePool   string
 	VolumeNumbers []int32
+
+	// DeletedSuffix is the rename suffix recorded for this replica's
+	// zvols; see storage.SuffixedDeleter.
+	DeletedSuffix string
+}
+
+// GetDeletedSuffix returns the recorded rename suffix.
+func (x *DeleteResourceRequest) GetDeletedSuffix() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.DeletedSuffix
 }
 
 // GetName returns the RD name.
@@ -679,6 +827,17 @@ type CreateSnapshotResponse struct {
 	Terminal            bool
 	Message             string
 	CreateTimestampUnix int64
+	// StoragePool is the pool the copy was taken in, set when Ok.
+	StoragePool string
+}
+
+// GetStoragePool returns the pool the copy was taken in.
+func (x *CreateSnapshotResponse) GetStoragePool() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.StoragePool
 }
 
 // GetOk reports whether the snapshot create succeeded.
@@ -714,6 +873,34 @@ func (x *CreateSnapshotResponse) GetMessage() string {
 type DeleteSnapshotRequest struct {
 	ResourceName string
 	SnapshotName string
+
+	// StoragePools are the satellite's diskful pools, asked when the
+	// satellite does not know the resource's pool: after the replica was
+	// deleted, or after a restart before the replica was applied again.
+	StoragePools []string
+
+	// DeletedSuffix is the rename suffix recorded on the Snapshot for
+	// this node; see storage.Snapshot.DeletedSuffix.
+	DeletedSuffix string
+}
+
+// GetDeletedSuffix returns the recorded rename suffix.
+func (x *DeleteSnapshotRequest) GetDeletedSuffix() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.DeletedSuffix
+}
+
+// GetStoragePools returns the pools to search when the resource's own
+// pool is not known.
+func (x *DeleteSnapshotRequest) GetStoragePools() []string {
+	if x == nil {
+		return nil
+	}
+
+	return x.StoragePools
 }
 
 // GetResourceName returns the source RD name.

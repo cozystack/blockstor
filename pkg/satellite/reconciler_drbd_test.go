@@ -22,12 +22,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
@@ -409,6 +411,57 @@ func TestApplyDisklessNoCreateMD(t *testing.T) {
 	}
 }
 
+// TestApplyDisklessReportsDRBDDevicePath pins the device path of a
+// diskless DRBD replica: /dev/drbd<minor>, as LINSTOR reports it. The
+// REST view copies it into the volume linstor-csi reads on a remote
+// attach; without it ControllerPublishVolume fails with "could not
+// determine device path" on every attempt.
+func TestApplyDisklessReportsDRBDDevicePath(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  t.TempDir(),
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-remote",
+			NodeName: "n1",
+			Flags:    []string{"DISKLESS"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1 << 20},
+				{VolumeNumber: 1, SizeKib: 1 << 20, Minor: 1007},
+			},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply results: %+v", results)
+	}
+
+	got := map[int32]string{}
+	for _, v := range results[0].GetVolumes() {
+		got[v.GetVolumeNumber()] = v.GetDevicePath()
+	}
+
+	want := map[int32]string{0: "/dev/drbd1000", 1: "/dev/drbd1007"}
+	if !maps.Equal(got, want) {
+		t.Errorf("diskless device paths: got %v, want %v", got, want)
+	}
+}
+
 // TestApplyTriggersResizeOnGrow simulates the satellite picking up a
 // VolumeDefinition update that grew the volume: lvs reports the LV
 // already exists at 1 GiB, the desired size is 2 GiB → reconciler
@@ -460,8 +513,12 @@ func TestApplyTriggersResizeOnGrow(t *testing.T) {
 	// Bug 305: the udev-less activation section shares the single
 	// `--config` that carries the device filter — a repeated `--config`
 	// is rejected by the LVM CLI, which had blocked the resize.
+	//
+	// 2049MiB, not 2048MiB: the backing grows to the definition size
+	// plus DRBD's internal metadata, as LINSTOR sizes it, so the DRBD
+	// device ends at the definition size rather than short of it.
 	want := []string{
-		"lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2048MiB vg/pvc-grow_00000",
+		"lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2049MiB vg/pvc-grow_00000",
 		"drbdadm resize --assume-clean pvc-grow",
 	}
 
@@ -522,9 +579,10 @@ func TestApplyThickResizeOmitsAssumeClean(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	// lvextend must run (the grow happened) and drbdadm resize must
-	// follow WITHOUT --assume-clean.
-	wantLvextend := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2048MiB vg/pvc-grow_00000"
+	// lvextend must run (the grow happened, to the definition size plus
+	// DRBD's metadata) and drbdadm resize must follow WITHOUT
+	// --assume-clean.
+	wantLvextend := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2049MiB vg/pvc-grow_00000"
 	if !slices.Contains(fx.CommandLines(), wantLvextend) {
 		t.Errorf("expected %q in calls; got %v", wantLvextend, fx.CommandLines())
 	}
@@ -1285,11 +1343,63 @@ func TestApplyUnknownStoragePool(t *testing.T) {
 			results[0].GetMessage())
 	}
 
+	if results[0].GetWaitingForController() {
+		t.Errorf("a named pool this node has no provider for read as a wait; want a failed apply")
+	}
+
 	// No DRBD commands should fire — we bail before applyDRBD.
 	for _, line := range fx.CommandLines() {
 		if strings.HasPrefix(line, "drbdadm ") {
 			t.Errorf("drbdadm should not run when storage step fails: %s", line)
 		}
+	}
+}
+
+// A diskful replica whose volumes name no pool yet waits for it, like
+// the other stamps a fresh replica can be seen without: no storage is
+// touched and the result is a wait, not a failed apply. Reported as a
+// failure, it put an ApplyFailed Warning on a replica that came up a
+// second later.
+func TestApplyWithoutAPoolYetWaits(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-no-pool-yet",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply outer error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	if results[0].GetOk() || !results[0].GetWaitingForController() {
+		t.Fatalf("result Ok=%v WaitingForController=%v (%q); want a wait",
+			results[0].GetOk(), results[0].GetWaitingForController(), results[0].GetMessage())
+	}
+
+	if lines := fx.CommandLines(); len(lines) != 0 {
+		t.Errorf("a replica without a pool ran %v; want nothing run", lines)
 	}
 }
 
@@ -6209,6 +6319,7 @@ func TestTemporarySecondaryFailureAutoRecovers(t *testing.T) {
 func TestApplyAutoMkfsXfsFiresOnceOnFirstActivation(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd1000")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-mkfs_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
@@ -6299,9 +6410,19 @@ func TestApplyAutoMkfsXfsFiresOnceOnFirstActivation(t *testing.T) {
 		t.Fatalf("Apply (2nd): %v", err)
 	}
 
-	if got := count(fx.CommandLines(), "mkfs."); got != 0 {
+	// Counted by command name: the resource is called pvc-mkfs, so its
+	// .res path also contains "mkfs.".
+	mkfsRuns := 0
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "mkfs.") {
+			mkfsRuns++
+		}
+	}
+
+	if mkfsRuns != 0 {
 		t.Errorf("idempotent reconcile must NOT re-run mkfs; got %d mkfs.* call(s) in %v",
-			got, fx.CommandLines())
+			mkfsRuns, fx.CommandLines())
 	}
 }
 
@@ -6314,6 +6435,7 @@ func TestApplyAutoMkfsXfsFiresOnceOnFirstActivation(t *testing.T) {
 func TestApplyAutoMkfsHonoursMkfsParams(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd2000")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-mkfsparams_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
@@ -6540,6 +6662,7 @@ func TestApplyAutoMkfsSkipsWhenNotPrimary(t *testing.T) {
 func TestApplyAutoMkfsRetryAfterMissedFirstActivation(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6000")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// Inject a transient failure into `drbdadm primary --force` on
@@ -6654,7 +6777,7 @@ func TestApplyAutoMkfsRetryAfterMissedFirstActivation(t *testing.T) {
 
 // TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume pins the per-volume
 // idempotency layer of the Bug 311 fix: a volume that already carries
-// a filesystem (TYPE= line in `blkid -o export <dev>` output) MUST
+// a filesystem (TYPE= line in `blkid -p -o export <dev>` output) MUST
 // NOT be re-mkfs'd, even when the `.mkfs.done` marker is absent.
 // Mirrors upstream LINSTOR's MkfsUtils.makeFileSystemOnMarked which
 // short-circuits on a non-empty `hasFileSystem` result, and prevents
@@ -6665,9 +6788,9 @@ func TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-blkid_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	// Pretend the device already has an ext4 filesystem — blkid -o
+	// Pretend the device already has an ext4 filesystem — blkid -p -o
 	// export returns the upstream-canonical TYPE= line.
-	fx.Expect("blkid -o export /dev/drbd6100",
+	fx.Expect("blkid -p -o export /dev/drbd6100",
 		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd6100\nTYPE=ext4\nUSAGE=filesystem\n")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -6729,6 +6852,7 @@ func TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume(t *testing.T) {
 func TestApplyAutoMkfsMultiVolumeMkfsBoth(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd7000", "/dev/drbd7001")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-ganesha_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-ganesha_00001",
@@ -7014,117 +7138,340 @@ func TestApplyFallsBackToUpOnAdjust158(t *testing.T) {
 	}
 }
 
-// TestRecoverFromBitmapBothDisks pins the tiebreaker-relocate
-// StandAlone wedge recovery contract: the recovery helper called
-// from runAdjust when adjust fails with the (162) "Can not drop
-// the bitmap when both sides have a disk" signature MUST issue
-// `drbdadm down` → `drbdadm up` → retry `drbdadm adjust` in that
-// order, so the kernel re-reads peer-disk from a fresh handshake
-// (DUnknown) rather than from the stale-default metadata
-// (Outdated) on the second adjust pass.
-//
-// Without this recovery the first failed adjust leaves the slot
-// StandAlone with kernel-registered peer-device entries (new-peer
-// runs before peer-device-options fails), at which point
-// shouldSkipNetOnAdjust permanently latches `--skip-net` for that
-// slot — the slot stays StandAlone forever.
-//
-// We drive the helper directly via the export_test re-export
-// rather than through Apply because the package's FakeExec map
-// is keyed on the full command line and not sequence-aware —
-// staging two distinct responses for the same `drbdadm adjust`
-// invocation isn't possible. The end-to-end coverage lives in
-// tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
-func TestRecoverFromBitmapBothDisks(t *testing.T) {
+// TestApplyRecoversBitmapBothDisksWithoutDown drives the refusal
+// through Apply on a Primary whose filesystem is mounted: adjust fails
+// with "Can not drop the bitmap when both sides have a disk" for
+// node-id 2, a peer that is not connected. The reconciler forgets that
+// peer's slot and adjusts again; it must not run `drbdadm down`, which
+// would demote the Primary (refused while the device is held open, and
+// carried out on an idle one).
+func TestApplyRecoversBitmapBothDisksWithoutDown(t *testing.T) {
+	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 
-	// Stage all three recovery commands as plain successes. The
-	// helper itself doesn't trigger the failing adjust — that
-	// branch lives in runAdjust above the call site — so we only
-	// care that down + up + retry-adjust fire in order.
-	fx.Expect("drbdadm down pvc-tb-relocate", storage.FakeResponse{})
-	fx.Expect("drbdadm up pvc-tb-relocate", storage.FakeResponse{})
-	fx.Expect("drbdadm adjust pvc-tb-relocate", storage.FakeResponse{})
+	lvName := "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-tb-relocate_00000"
 
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-tb-relocate",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil || len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply (first activation): err=%v results=%+v", err, results)
+	}
+
+	fx.Reset()
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("pvc-tb-relocate_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-tb-relocate_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-tb-relocate_00000|1048576\n")})
+	fx.Expect("drbdsetup status pvc-tb-relocate", storage.FakeResponse{
+		Stdout: []byte("pvc-tb-relocate role:Primary\n  volume:0 disk:UpToDate open:yes\n"),
+	})
+	fx.Expect("drbdsetup status -j pvc-tb-relocate", storage.FakeResponse{Stdout: bitmapBothDisksStatus("Connecting")})
+	fx.ExpectSequence("drbdadm adjust pvc-tb-relocate",
+		storage.FakeResponse{Err: errDrbdadmAdjust162BitmapBothDisks},
+		storage.FakeResponse{})
+	fx.Expect("drbdadm down pvc-tb-relocate", storage.FakeResponse{Err: errDrbdadmPrimaryStateChange})
+
+	results, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (refusal): %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	for _, line := range cmds {
+		if strings.Contains(line, "down pvc-tb-relocate") {
+			t.Errorf("the recovery must not take a Primary down; saw %q in %v", line, cmds)
+		}
+	}
+
+	mustContainLine(t, cmds, "drbdsetup del-peer pvc-tb-relocate 2")
+	mustContainLine(t, cmds, "drbdsetup forget-peer pvc-tb-relocate 2")
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Errorf("expected Ok=true after forgetting the slot; got results=%+v", results)
+	}
+}
+
+// staleDisklessPeerStatus is `drbdsetup status -j pvc-tb-relocate`
+// after an earlier pass hit the refusal and its recovery did not
+// finish: node-id 2 (n3), which the .res names diskless, sits
+// StandAlone with its peer device registered and the peer disk read as
+// peerDisk from the stale metadata slot.
+func staleDisklessPeerStatus(peerDisk string) []byte {
+	return []byte(`[{"name":"pvc-tb-relocate","connections":[
+  {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"peer-node-id":2,"name":"n3","connection-state":"StandAlone","peer_devices":[{"volume":0,"peer-disk-state":"` + peerDisk + `"}]}
+]}]`)
+}
+
+// applyOverStandAlonePeer runs Apply on n1, whose kernel shows n3 as
+// statusJSON describes, and returns the commands it issued. n3 is
+// diskless in the intent. The first plain adjust is refused for
+// node-id 2 and the next succeeds; an adjust --skip-net succeeds.
+func applyOverStandAlonePeer(t *testing.T, statusJSON []byte) []string {
+	t.Helper()
+
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	lvName := "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-tb-relocate_00000"
+
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-tb-relocate",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"peer.n3.diskless": "true",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil || len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply (first activation): err=%v results=%+v", err, results)
+	}
+
+	fx.Reset()
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("pvc-tb-relocate_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-tb-relocate_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-tb-relocate_00000|1048576\n")})
+	fx.Expect("drbdsetup status pvc-tb-relocate", storage.FakeResponse{
+		Stdout: []byte("pvc-tb-relocate role:Primary\n  volume:0 disk:UpToDate open:yes\n"),
+	})
+	fx.Expect("drbdsetup status -j pvc-tb-relocate", storage.FakeResponse{Stdout: statusJSON})
+	fx.ExpectSequence("drbdadm adjust pvc-tb-relocate",
+		storage.FakeResponse{Err: errDrbdadmAdjust162BitmapBothDisks},
+		storage.FakeResponse{})
+	fx.Expect("drbdadm adjust --skip-net pvc-tb-relocate", storage.FakeResponse{})
+
+	_, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (StandAlone peer): %v", err)
+	}
+
+	return fx.CommandLines()
+}
+
+// TestApplyDoesNotLatchSkipNetOnAStaleDisklessPeer: a pass that hit the
+// bitmap refusal and did not finish its recovery (a failed del-peer or
+// adjust, a satellite restart) leaves the diskless peer StandAlone with
+// its peer device registered, the way an operator's disconnect does.
+// The next pass must still run a full adjust, so the refusal and the
+// recovery fire again, instead of adjusting with --skip-net and leaving
+// the peer cut off for good.
+func TestApplyDoesNotLatchSkipNetOnAStaleDisklessPeer(t *testing.T) {
+	cmds := applyOverStandAlonePeer(t, staleDisklessPeerStatus("Outdated"))
+
+	for _, line := range cmds {
+		if strings.Contains(line, "--skip-net") {
+			t.Errorf("adjusted with --skip-net over the stale slot: %q in %v", line, cmds)
+		}
+	}
+
+	mustContainLine(t, cmds, "drbdsetup del-peer pvc-tb-relocate 2")
+	mustContainLine(t, cmds, "drbdsetup forget-peer pvc-tb-relocate 2")
+}
+
+// TestApplyKeepsSkipNetForADisconnectedDisklessPeer: an operator who
+// disconnected a diskless peer leaves it StandAlone with its peer disk
+// DUnknown. That disconnect is still honoured with --skip-net and the
+// peer is neither dropped nor forgotten.
+func TestApplyKeepsSkipNetForADisconnectedDisklessPeer(t *testing.T) {
+	cmds := applyOverStandAlonePeer(t, staleDisklessPeerStatus("DUnknown"))
+
+	mustContainLine(t, cmds, "drbdadm adjust --skip-net pvc-tb-relocate")
+
+	for _, line := range cmds {
+		if strings.Contains(line, "del-peer") || strings.Contains(line, "forget-peer") {
+			t.Errorf("an operator's disconnect was undone: %q in %v", line, cmds)
+		}
+	}
+}
+
+// mustContainLine fails t unless want is one of the command lines.
+func mustContainLine(t *testing.T, cmds []string, want string) {
+	t.Helper()
+
+	if !slices.Contains(cmds, want) {
+		t.Errorf("missing %q in %v", want, cmds)
+	}
+}
+
+// bitmapBothDisksStatus is `drbdsetup status -j pvc-tb-relocate` on
+// the diskful replica that hit the refusal: node-id 1 is a working
+// peer, node-id 3 a diskful one that is away for now, and node-id 2 the
+// returning diskless one whose new-peer ran before peer-device-options
+// failed, so it is StandAlone with its peer device registered.
+func bitmapBothDisksStatus(stateOfTwo string) []byte {
+	return []byte(`[{"name":"pvc-tb-relocate","connections":[
+  {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0}]},
+  {"peer-node-id":3,"name":"n4","connection-state":"Connecting","peer_devices":[{"volume":0}]},
+  {"peer-node-id":2,"name":"n3","connection-state":"` + stateOfTwo + `","peer_devices":[{"volume":0}]}
+]}]`)
+}
+
+// newBitmapBothDisksReconciler wires a Reconciler to fx for the
+// recovery tests.
+func newBitmapBothDisksReconciler(t *testing.T, fx *storage.FakeExec) *satellite.Reconciler {
+	t.Helper()
+
+	return satellite.NewReconciler(satellite.ReconcilerConfig{
 		Adm:      drbd.NewAdm(fx),
 		StateDir: t.TempDir(),
 		NodeName: "n1",
 	})
+}
 
-	dr := &intent.DesiredResource{
-		Name:     "pvc-tb-relocate",
-		NodeName: "n1",
-	}
+// TestRecoverFromBitmapBothDisksForgetsTheStaleSlot pins the recovery
+// from the tiebreaker-relocate wedge: the kernel refused to drop the
+// bitmap of node-id 2 because the metadata slot still describes the
+// diskful replica that had that node-id before. The recovery drops and
+// forgets that one connection, as LINSTOR's satellite does for a
+// deleted peer, and adjusts again. It never runs `drbdadm down`: the
+// local replica may be a Primary with a mounted filesystem, or hold the
+// only UpToDate copy, and the working peer on node-id 1 is left alone.
+func TestRecoverFromBitmapBothDisksForgetsTheStaleSlot(t *testing.T) {
+	fx := storage.NewFakeExec()
 
-	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, false)
+	// Before the drop the slot is there; after it, gone.
+	fx.ExpectSequence("drbdsetup status -j pvc-tb-relocate",
+		storage.FakeResponse{Stdout: bitmapBothDisksStatus("StandAlone")},
+		storage.FakeResponse{Stdout: []byte(`[{"name":"pvc-tb-relocate","connections":[
+  {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0}]},
+  {"peer-node-id":3,"name":"n4","connection-state":"Connecting","peer_devices":[{"volume":0}]}]}]`)})
+
+	rec := newBitmapBothDisksReconciler(t, fx)
+	dr := &intent.DesiredResource{Name: "pvc-tb-relocate", NodeName: "n1"}
+
+	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, errDrbdadmAdjust162BitmapBothDisks)
 	if err != nil {
 		t.Fatalf("recovery returned error: %v", err)
 	}
 
 	cmds := fx.CommandLines()
 
-	downIdx, upIdx, adjustIdx := -1, -1, -1
+	delIdx, forgetIdx, adjustIdx := -1, -1, -1
 
 	for i, line := range cmds {
 		switch {
-		case strings.Contains(line, "drbdadm down pvc-tb-relocate"):
-			downIdx = i
-		case strings.Contains(line, "drbdadm up pvc-tb-relocate"):
-			upIdx = i
-		case strings.Contains(line, "drbdadm adjust pvc-tb-relocate"):
+		case strings.Contains(line, "drbdadm down"), strings.Contains(line, "drbdadm up"),
+			strings.Contains(line, "drbdsetup down"), strings.Contains(line, "detach"),
+			strings.Contains(line, "secondary"):
+			t.Errorf("recovery must not take the resource down, detach or demote it; saw %q", line)
+		case (strings.Contains(line, "del-peer") || strings.Contains(line, "forget-peer")) && !strings.HasSuffix(line, " 2"):
+			t.Errorf("recovery must drop and forget only node-id 2; saw %q", line)
+		case line == "drbdsetup del-peer pvc-tb-relocate 2":
+			delIdx = i
+		case line == "drbdsetup forget-peer pvc-tb-relocate 2":
+			forgetIdx = i
+		case strings.HasPrefix(line, "drbdadm") && strings.Contains(line, "adjust pvc-tb-relocate"):
 			adjustIdx = i
 		}
 	}
 
-	if downIdx == -1 || upIdx == -1 || adjustIdx == -1 {
-		t.Fatalf("expected recovery to issue down + up + adjust; got %v", cmds)
+	if delIdx == -1 || forgetIdx == -1 || adjustIdx == -1 {
+		t.Fatalf("expected del-peer + forget-peer of node-id 2, then adjust; got %v", cmds)
 	}
 
-	if downIdx >= upIdx || upIdx >= adjustIdx {
-		t.Errorf("recovery sequence out of order: down=%d up=%d adjust=%d; got %v",
-			downIdx, upIdx, adjustIdx, cmds)
+	if delIdx >= forgetIdx || forgetIdx >= adjustIdx {
+		t.Errorf("recovery out of order: del-peer=%d forget-peer=%d adjust=%d; got %v",
+			delIdx, forgetIdx, adjustIdx, cmds)
+	}
+
+	if strings.Contains(cmds[adjustIdx], "--skip-net") {
+		t.Errorf("the adjust after the drop must re-add the peer, got %q", cmds[adjustIdx])
 	}
 }
 
-// TestRecoverFromBitmapBothDisksBubblesDownErr pins the
-// fail-loud contract on the recovery's first step: if
-// `drbdadm down` itself fails the recovery surfaces the error
-// (rather than charging into `drbdadm up` against unknown
-// kernel state).
-func TestRecoverFromBitmapBothDisksBubblesDownErr(t *testing.T) {
+// TestRecoverFromBitmapBothDisksLeavesAConnectedPeer: when the peer the
+// refusal names is Connected, its disk state is the live one (it has
+// not detached yet), not the slot's. Nothing is dropped, the resource
+// is not touched, and the adjust error goes back to the retry loop.
+func TestRecoverFromBitmapBothDisksLeavesAConnectedPeer(t *testing.T) {
 	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status -j pvc-tb-relocate", storage.FakeResponse{Stdout: bitmapBothDisksStatus("Connected")})
 
-	fx.Expect("drbdadm down pvc-tb-relocate", storage.FakeResponse{
-		Err: errDrbdadmDownNotInConfig,
-	})
+	rec := newBitmapBothDisksReconciler(t, fx)
+	dr := &intent.DesiredResource{Name: "pvc-tb-relocate", NodeName: "n1"}
 
-	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
-		Adm:      drbd.NewAdm(fx),
-		StateDir: t.TempDir(),
-		NodeName: "n1",
-	})
-
-	dr := &intent.DesiredResource{
-		Name:     "pvc-tb-relocate",
-		NodeName: "n1",
+	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, errDrbdadmAdjust162BitmapBothDisks)
+	if err == nil || !strings.Contains(err.Error(), "Can not drop the bitmap") {
+		t.Fatalf("expected the adjust error back, got %v", err)
 	}
 
-	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, false)
-	if err == nil {
-		t.Fatal("expected recovery to bubble drbdadm down failure; got nil")
-	}
-
-	// Up + adjust must NOT fire after a failed down — they
-	// would race a half-torn kernel state and the next
-	// reconcile would loop on the same wedge signature.
 	for _, line := range fx.CommandLines() {
-		if strings.Contains(line, "drbdadm up pvc-tb-relocate") ||
-			strings.Contains(line, "drbdadm adjust pvc-tb-relocate") {
-			t.Errorf("recovery must stop after a failed down; saw %q", line)
+		if line != "drbdsetup status -j pvc-tb-relocate" {
+			t.Errorf("recovery must only read the kernel for a Connected peer; saw %q", line)
 		}
 	}
 }
+
+// TestRecoverFromBitmapBothDisksBubblesDelPeerErr: a del-peer that
+// fails while the connection is still there stops the recovery before
+// the second adjust, which would hit the same refusal.
+func TestRecoverFromBitmapBothDisksBubblesDelPeerErr(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status -j pvc-tb-relocate", storage.FakeResponse{Stdout: bitmapBothDisksStatus("StandAlone")})
+	fx.Expect("drbdsetup del-peer pvc-tb-relocate 2", storage.FakeResponse{Err: errDelPeerFailed})
+	fx.Expect("drbdsetup forget-peer pvc-tb-relocate 2", storage.FakeResponse{Err: errForgetPeerConnected})
+
+	rec := newBitmapBothDisksReconciler(t, fx)
+	dr := &intent.DesiredResource{Name: "pvc-tb-relocate", NodeName: "n1"}
+
+	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, errDrbdadmAdjust162BitmapBothDisks)
+	if err == nil {
+		t.Fatal("expected the recovery to fail when the connection cannot be dropped")
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "adjust") || strings.Contains(line, "down") {
+			t.Errorf("recovery must stop after a failed drop; saw %q", line)
+		}
+	}
+}
+
+// Failures of the drop in TestRecoverFromBitmapBothDisksBubblesDelPeerErr.
+var (
+	errDelPeerFailed       = errors.New("del-peer failed")
+	errForgetPeerConnected = errors.New("pvc-tb-relocate: Failure: (125) Device has a net-config (use disconnect first)")
+)
 
 // TestIsBitmapDropBothDisksErr pins the predicate that drives the
 // reactive recovery in runAdjust. The (162) code alone is not
@@ -7251,6 +7598,7 @@ func (f *fakeFilesystemStamper) Calls() []string {
 func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd8000", "/dev/drbd8001")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311m_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311m_00001",
@@ -7321,7 +7669,7 @@ func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 
 // TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume pins the
 // per-volume blkid safety net for multi-volume RDs: vol-0 already
-// carries an ext4 filesystem (blkid -o export reports TYPE=ext4),
+// carries an ext4 filesystem (blkid -p -o export reports TYPE=ext4),
 // vol-1 is blank. runAutoMkfs MUST skip mkfs on vol-0 (adopting the
 // existing fs) and run mkfs on vol-1 only — mirrors upstream
 // LINSTOR's MkfsUtils.makeFileSystemOnMarked which short-circuits on
@@ -7333,18 +7681,18 @@ func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 func TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd8501")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311s_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311s_00001",
 		storage.FakeResponse{Stdout: []byte("")})
-	// vol-0 already has an ext4 filesystem. blkid -o export returns
-	// the canonical TYPE= line; runAutoMkfs's deviceHasFilesystem
-	// scans for any TYPE= prefix and treats it as "populated".
-	fx.Expect("blkid -o export /dev/drbd8500",
+	// vol-0 already has an ext4 filesystem. blkid -p -o export returns
+	// the canonical TYPE= line; runAutoMkfs's probeMkfsTarget reads
+	// any non-drbd TYPE= as "populated".
+	fx.Expect("blkid -p -o export /dev/drbd8500",
 		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd8500\nTYPE=ext4\nUSAGE=filesystem\n")})
-	// vol-1 is blank: leave the blkid response unregistered so
-	// FakeExec returns empty stdout / nil err — deviceHasFilesystem
-	// finds no TYPE= prefix and falls through to mkfs.
+	// vol-1 is blank: expectBlankMkfsTarget above cans blkid's exit 2,
+	// so probeMkfsTarget reads it as empty and mkfs runs.
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -7424,6 +7772,7 @@ func TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume(t *testing.T) {
 func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd9000", "/dev/drbd9001")
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00001",
@@ -7494,7 +7843,7 @@ func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("pvc-bug311c_00001\n")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-bug311c_00001",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-bug311c_00001|307200\n")})
-	fx.Expect("blkid -o export /dev/drbd9000",
+	fx.Expect("blkid -p -o export /dev/drbd9000",
 		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd9000\nTYPE=ext4\nUSAGE=filesystem\n")})
 	fx.Expect("mkfs.ext4 /dev/drbd9001", storage.FakeResponse{})
 
@@ -7768,6 +8117,7 @@ func TestBug278NoClearWhenKernelStillDiskless(t *testing.T) {
 func TestApplyAutoMkfsStorageOnlyFormatsRawDevice(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/vg/pvc-local_00000")
 
 	// lvExists probe (lvcreate idempotency check).
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-local_00000",
@@ -7799,6 +8149,8 @@ func TestApplyAutoMkfsStorageOnlyFormatsRawDevice(t *testing.T) {
 			},
 			LayerStack:  []string{"STORAGE"},
 			DrbdOptions: map[string]string{},
+			// Created empty by blockstor: only such a replica is formatted.
+			SkipInitialSync: skipInitTrue(),
 		},
 	}
 
@@ -7963,4 +8315,125 @@ func indexOfSetGI(calls []string, rd string) int {
 	}
 
 	return -1
+}
+
+// poolWaitFixture is a reconciler with one thin pool, for the tests of
+// a diskful replica whose volumes name no pool.
+func poolWaitFixture(t *testing.T, dwell time.Duration) (*satellite.Reconciler, *storage.FakeExec) {
+	t.Helper()
+
+	fx := storage.NewFakeExec()
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+
+	return satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:           map[string]storage.Provider{"thin1": thin},
+		Adm:                 drbd.NewAdm(fx),
+		StateDir:            t.TempDir(),
+		NodeName:            "n1",
+		UnresolvedPoolDwell: dwell,
+	}), fx
+}
+
+func poolWaitReplica(pools ...string) *intent.DesiredResource {
+	dr := &intent.DesiredResource{
+		Name:            "pvc-pool-wait",
+		NodeName:        "n1",
+		SkipInitialSync: skipInitTrue(),
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+		},
+	}
+
+	for i, pool := range pools {
+		dr.Volumes = append(dr.Volumes, &intent.DesiredVolume{
+			VolumeNumber: int32(i), SizeKib: 1024 * 1024, StoragePool: pool,
+		})
+	}
+
+	return dr
+}
+
+func applyOneResult(t *testing.T, rec *satellite.Reconciler, dr *intent.DesiredResource) *intent.ResourceApplyResult {
+	t.Helper()
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{dr})
+	if err != nil {
+		t.Fatalf("Apply outer error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	return results[0]
+}
+
+// A diskful replica created or promoted without a pool keeps none:
+// nothing on the controller side fills one in later. Its wait for the
+// pool is bounded, and past it the apply fails and says how to name
+// the pool, so the operator gets the ApplyFailed Warning and the
+// back-off instead of a wait that never ends.
+func TestApplyWithoutAPoolFailsOnceTheWaitIsOver(t *testing.T) {
+	const dwell = 20 * time.Millisecond
+
+	rec, fx := poolWaitFixture(t, dwell)
+
+	first := applyOneResult(t, rec, poolWaitReplica(""))
+	if first.GetOk() || !first.GetWaitingForController() {
+		t.Fatalf("first pass Ok=%v WaitingForController=%v (%q); want a wait",
+			first.GetOk(), first.GetWaitingForController(), first.GetMessage())
+	}
+
+	time.Sleep(2 * dwell)
+
+	late := applyOneResult(t, rec, poolWaitReplica(""))
+	if late.GetOk() || late.GetWaitingForController() {
+		t.Fatalf("pass past the wait Ok=%v WaitingForController=%v (%q); want a failed apply",
+			late.GetOk(), late.GetWaitingForController(), late.GetMessage())
+	}
+
+	if !strings.Contains(late.GetMessage(), "--storage-pool") {
+		t.Errorf("failure %q does not say how to name the pool", late.GetMessage())
+	}
+
+	if lines := fx.CommandLines(); len(lines) != 0 {
+		t.Errorf("a replica without a pool ran %v; want nothing run", lines)
+	}
+}
+
+// The wait is per spell without a pool: once a pass sees the pool, a
+// later pass without one waits afresh rather than failing on the time
+// the earlier wait had run up.
+func TestAPoolThatArrivedEndsTheWait(t *testing.T) {
+	const dwell = 50 * time.Millisecond
+
+	rec, _ := poolWaitFixture(t, dwell)
+
+	applyOneResult(t, rec, poolWaitReplica(""))
+	time.Sleep(2 * dwell)
+	applyOneResult(t, rec, poolWaitReplica("thin1"))
+
+	again := applyOneResult(t, rec, poolWaitReplica(""))
+	if again.GetOk() || !again.GetWaitingForController() {
+		t.Fatalf("pass after the pool was seen Ok=%v WaitingForController=%v (%q); want a fresh wait",
+			again.GetOk(), again.GetWaitingForController(), again.GetMessage())
+	}
+}
+
+// A replica one of whose volumes has its pool and another not yet
+// touches no storage while it waits: materialising volume 0 alone
+// would leave a half-built replica behind a wait that may end in a
+// failure.
+func TestAReplicaWithAVolumeWithoutAPoolTouchesNoStorage(t *testing.T) {
+	rec, fx := poolWaitFixture(t, 0)
+
+	result := applyOneResult(t, rec, poolWaitReplica("thin1", ""))
+	if result.GetOk() || !result.GetWaitingForController() {
+		t.Fatalf("result Ok=%v WaitingForController=%v (%q); want a wait",
+			result.GetOk(), result.GetWaitingForController(), result.GetMessage())
+	}
+
+	if lines := fx.CommandLines(); len(lines) != 0 {
+		t.Errorf("a replica with a volume without a pool ran %v; want nothing run", lines)
+	}
 }

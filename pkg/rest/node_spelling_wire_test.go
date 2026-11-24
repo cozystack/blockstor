@@ -163,43 +163,23 @@ func TestSingleNodeCreateTakesTheBodyNodeInAnotherSpelling(t *testing.T) {
 	}
 }
 
-// A satellite reports its snapshot entry under its own node name, node-1,
-// while the snapshot lists the node as registered, Node-1, and the replica
-// listing does too. The snapshot is successful.
-func TestSnapshotIsSuccessfulWithAnEntryInAnotherNodeSpelling(t *testing.T) {
-	t.Parallel()
-
-	st := store.NewInMemory()
-	ctx := t.Context()
-
-	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-mix", NodeName: "Node-1"}); err != nil {
-		t.Fatalf("seed replica: %v", err)
-	}
-
-	diskful, err := (&Server{Store: st}).diskfulPeerSet(ctx, "pvc-mix")
-	if err != nil {
-		t.Fatalf("diskfulPeerSet: %v", err)
-	}
-
-	for _, reporter := range []string{"node-1", "NODE-1"} {
-		snap := &apiv1.Snapshot{
-			Nodes:     []string{"Node-1"},
-			Snapshots: []apiv1.SnapshotPerNode{{NodeName: reporter, CreateTimestamp: 1}},
-		}
-
-		if !isSnapshotSuccessful(snap, diskful) {
-			t.Errorf("the snapshot taken on %s for Node-1 reads as not successful", reporter)
-		}
-	}
-}
-
 // A restore onto node-1 takes the pool of the source's replica on Node-1.
 func TestRestorePoolIsTheSourceReplicasOnAnotherNodeSpelling(t *testing.T) {
 	t.Parallel()
 
-	byNode, _ := storPoolsByNodeFromSourceRD(t.Context(), nodeSpellingStore(t), "pvc-mix")
-	if pool := byNode[naming.Key("node-1")]; pool != "pool-Node-1" {
-		t.Errorf("pool for node-1 = %q, want pool-Node-1", pool)
+	st := nodeSpellingStore(t)
+
+	if err := st.StoragePools().Create(t.Context(), &apiv1.StoragePool{
+		StoragePoolName: "pool-Node-1", NodeName: "Node-1",
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	snap := &apiv1.Snapshot{Name: "snap", ResourceName: "pvc-mix", Nodes: []string{"Node-1", "Node-2"}}
+
+	byNode, err := store.RestorePools(t.Context(), st, snap, []string{"node-1"})
+	if pool := byNode[naming.Key("node-1")]; err != nil || pool != "pool-Node-1" {
+		t.Errorf("pool for node-1 = %q, %v; want pool-Node-1", pool, err)
 	}
 }
 

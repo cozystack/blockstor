@@ -76,7 +76,7 @@ func TestAnOldMixedCaseReplicaIsSnapshottedUnderItsCRName(t *testing.T) {
 		}
 
 		snap := &blockstoriov1alpha1.Snapshot{
-			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{SatelliteSnapshotFinalizer}},
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{snapshotNodeFinalizer("node-a")}},
 			Spec: blockstoriov1alpha1.SnapshotSpec{
 				ResourceDefinitionName: snapSpelling,
 				SnapshotName:           "snap-1",
@@ -225,8 +225,10 @@ func TestAnOldMixedCaseSnapshotRowDrivesTheResourceByItsCRName(t *testing.T) {
 		t.Fatalf("runApply: %v", err)
 	}
 
-	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-mix_00000",
-		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-mix_00000|4096\n")})
+	// The kernel keeps reporting the resource Primary and suspended, so
+	// every phase reaches its command whatever ran before it.
+	fx.Expect("drbdsetup status pvc-mix --json", storage.FakeResponse{Stdout: []byte(
+		`[{"name":"pvc-mix","role":"Primary","suspended-user":true,"devices":[{"volume":0,"minor":1000}]}]`)})
 
 	spec := blockstoriov1alpha1.SnapshotSpec{
 		ResourceDefinitionName: "Pvc-Mix",
@@ -242,14 +244,14 @@ func TestAnOldMixedCaseSnapshotRowDrivesTheResourceByItsCRName(t *testing.T) {
 		want   string
 	}{
 		{"suspend", func(s *blockstoriov1alpha1.SnapshotSpec) { s.SuspendIO = true }, blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "node-a"}, "drbdadm suspend-io pvc-mix"},
-		{"flush", func(s *blockstoriov1alpha1.SnapshotSpec) { s.SuspendIO, s.TakeSnapshot = true, true }, blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "node-a", SuspendIOAcked: true}, "blockdev --flushbufs /dev/vg/pvc-mix_00000"},
+		{"flush", func(s *blockstoriov1alpha1.SnapshotSpec) { s.SuspendIO = true }, blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "node-a"}, "blockdev --flushbufs /dev/drbd1000"},
 		{"resume", func(*blockstoriov1alpha1.SnapshotSpec) {}, blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: "node-a", Ready: true, CreateTimestamp: 1, SuspendIOAcked: true}, "drbdadm resume-io pvc-mix"},
 	} {
 		s := spec
 		phase.spec(&s)
 
 		snap := &blockstoriov1alpha1.Snapshot{
-			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{SatelliteSnapshotFinalizer}},
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.snap-1", Finalizers: []string{snapshotNodeFinalizer("node-a")}},
 			Spec:       s,
 			Status:     blockstoriov1alpha1.SnapshotStatus{NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{phase.status}},
 		}
@@ -268,9 +270,9 @@ func TestAnOldMixedCaseSnapshotRowDrivesTheResourceByItsCRName(t *testing.T) {
 	}
 }
 
-// The orphan sweepers count an old mixed-case replica as owning the DRBD
-// resource and the volumes it runs under, which carry the CR name.
-func TestTheSweepersOwnAnOldMixedCaseReplicaByItsCRName(t *testing.T) {
+// The DRBD orphan sweeper counts an old mixed-case replica as owning the
+// DRBD resource it runs under, which carries the CR name.
+func TestTheDRBDSweeperOwnsAnOldMixedCaseReplicaByItsCRName(t *testing.T) {
 	t.Parallel()
 
 	rd := &blockstoriov1alpha1.ResourceDefinition{
@@ -285,15 +287,6 @@ func TestTheSweepersOwnAnOldMixedCaseReplicaByItsCRName(t *testing.T) {
 	}
 
 	cli := newPassphraseTestReconciler(t, rd, res).Client
-
-	volumes, err := (&StorageOrphanSweeperRunnable{Client: cli, NodeName: "node-a"}).listOwnedVolumeRefs(t.Context())
-	if err != nil {
-		t.Fatalf("owned volumes: %v", err)
-	}
-
-	if _, ok := volumes[ownedKey("pvc-mix", 0)]; !ok {
-		t.Errorf("owned volumes %v; want pvc-mix volume 0", volumes)
-	}
 
 	resources, err := (&OrphanSweeperRunnable{Client: cli, NodeName: "node-a"}).listOwnedResourceNames(t.Context())
 	if err != nil {

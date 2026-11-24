@@ -21,7 +21,6 @@ package drbd
 import (
 	"fmt"
 	"os"
-	"syscall"
 
 	"github.com/cockroachdb/errors"
 )
@@ -134,10 +133,10 @@ func EnsureDeviceNode(minor int) error {
 	// same value. The umask applies, so we always follow up with an
 	// explicit chmod to get the literal devNodeMode we asked for
 	// regardless of the inherited umask.
-	mode := uint32(syscall.S_IFBLK | devNodeMode)
+	mode := uint32(sIFBLK | devNodeMode)
 	dev := mkdev(DRBDMajor, minor)
 
-	err = syscall.Mknod(path, mode, int(dev)) //nolint:gosec // dev encodes major=147 + minor<=65535; int conversion never truncates
+	err = mknod(path, mode, dev)
 	if err != nil {
 		return errors.Wrapf(err, "ensure %s: mknod b %d %d", path, DRBDMajor, minor)
 	}
@@ -158,16 +157,14 @@ func isCorrectBlockDevice(info os.FileInfo, minor int) bool {
 		return false
 	}
 
-	stat, ok := info.Sys().(*syscall.Stat_t)
+	rdev, ok := statRdev(info)
 	if !ok {
 		// Should never happen on Linux. Treat as wrong-pointed to be
 		// safe — the recreate path is idempotent.
 		return false
 	}
 
-	wantRdev := mkdev(DRBDMajor, minor)
-
-	return uint64(stat.Rdev) == wantRdev //nolint:gosec // Rdev type varies by arch (uint32 on some platforms); uint64 cast is safe
+	return rdev == mkdev(DRBDMajor, minor)
 }
 
 // mkdev encodes a (major, minor) pair into the Linux kernel's dev_t

@@ -4,7 +4,14 @@ kind: ControllerConfig
 metadata:
   name: default
 spec:
+  drbdOptions:
+    net: {}
   extraProps:
+    DrbdOptions/Net/connect-int: "15"
+    DrbdOptions/Net/ping-int: "12"
+    DrbdOptions/Net/ping-timeout: "10"
+    DrbdOptions/Net/timeout: "90"
+    DrbdOptions/Net/verify-alg: crc32c
     DrbdOptions/auto-add-quorum-tiebreaker: "True"
     DrbdOptions/auto-verify-algo-allowed-list: crct10dif;crc32c;sha256
 ---
@@ -33,6 +40,8 @@ spec:
     name: default-ipv4
     satelliteEncryptionType: SSL
     satellitePort: 3367
+  props:
+    DrbdOptions/Net/sndbuf-size: "1048576"
   type: SATELLITE
 ---
 apiVersion: blockstor.org/v1alpha1
@@ -128,6 +137,7 @@ spec:
       protocol: A
     resource:
       quorum: majority
+  peerSlots: 7
   selectFilter:
     layerStack:
     - DRBD
@@ -150,6 +160,7 @@ spec:
   extraProps:
     Aux/csi.storage.k8s.io/pvc/name: app-data
     Aux/csi.storage.k8s.io/pvc/namespace: tenant-fixture
+    DrbdOptions/Net/cram-hmac-alg: sha1
     DrbdOptions/Net/shared-secret: fixture-secret-vol1
     DrbdOptions/auto-verify-alg: crct10dif
     FileSystem/Type: ext4
@@ -191,7 +202,9 @@ metadata:
   name: pvc-vol3
 spec:
   extraProps:
+    DrbdOptions/Net/cram-hmac-alg: sha1
     DrbdOptions/Net/shared-secret: fixture-secret-vol3
+    DrbdOptions/auto-verify-alg: crc32c
   initialized: true
   layerStack:
   - DRBD
@@ -211,8 +224,6 @@ spec:
   drbdOptions:
     net:
       allowTwoPrimaries: true
-  extraProps:
-    DrbdOptions/Net/shared-secret: fixture-secret-vol5
   initialized: true
   layerStack:
   - DRBD
@@ -394,7 +405,11 @@ spec:
   resourceDefinitionName: pvc-vol1
   snapshotName: snap-good
   volumeDefinitions:
-  - sizeKib: 1048576
+  - props:
+      DrbdOptions/Disk/block-size: "4096"
+      Linstor/Drbd/freeze-block-size: "True"
+    sizeKib: 1048576
     volumeNumber: 0
-  - sizeKib: 307200
+  - props: {}
+    sizeKib: 307200
     volumeNumber: 1

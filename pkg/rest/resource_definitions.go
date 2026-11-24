@@ -29,6 +29,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/passphrase"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -93,6 +94,7 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			s.reportAppliedSizes(r.Context(), rds[i].Name, vds)
 			rds[i].VolumeDefinitions = vds
 		}
 	}
@@ -445,6 +447,10 @@ func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, bo
 	if nameErr != nil {
 		writeError(w, http.StatusBadRequest, nameErr.Error())
 
+		return false
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, rd.Props) {
 		return false
 	}
 
@@ -1106,6 +1112,10 @@ func (s *Server) refuseOwnedPropEdits(
 		return true
 	}
 
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.OverrideProps) {
+		return true
+	}
+
 	if store.DeletesRestoreMarker(patch.OverrideProps, patch.DeleteProps) {
 		err := store.RestoreMarkerClearRefusal(r.Context(), s.Store, name)
 		if errors.Is(err, store.ErrRestoreUnfinished) {
@@ -1290,12 +1300,18 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// `linstor rd d <rd>` returns SUCCESS and the very next
 	// `linstor r l` shows phantom rows for 5–30 s until the cache
 	// catches up on its watch stream. See pkg/rest/cache_invalidation.go.
-	s.waitForRDDeletionVisible(r.Context(), name)
+	converged := s.waitForRDDeletionVisible(r.Context(), name)
 
 	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
 	}}
+	if !converged {
+		if pending := s.replicasStillDeleting(r.Context(), name); len(pending) > 0 {
+			answer = append(answer, deleteInProgress(name, pending))
+		}
+	}
+
 	if reaped != nil {
 		answer = append(answer, *reaped)
 	}

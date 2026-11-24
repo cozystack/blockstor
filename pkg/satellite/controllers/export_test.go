@@ -26,7 +26,7 @@ import (
 
 // ScanOnceForTest is the test-only entry point that drives one
 // PhysicalDevice discovery cycle without starting the ticker
-// goroutine. Mirrors the storage-sweeper's `sweepOnce(ctx, logger)`
+// goroutine. Mirrors the DRBD orphan sweeper's `sweepOnce(ctx, logger)`
 // pattern — kept exported via this file (only compiled into the
 // _test binary) so the test package can pin per-tick behaviour
 // without exporting an API for production callers.

@@ -37,6 +37,7 @@ func seedGroups(t *testing.T, st store.Store) {
 		{Name: "grp-luks", SelectFilter: apiv1.AutoSelectFilter{LayerStack: []string{"DRBD", "LUKS", "STORAGE"}}},
 		{Name: "grp-plain"},
 		{Name: "grp-drbd", SelectFilter: apiv1.AutoSelectFilter{LayerStack: []string{"DRBD", "STORAGE"}}},
+		{Name: "grp-local", SelectFilter: apiv1.AutoSelectFilter{LayerStack: []string{"STORAGE"}}},
 	} {
 		if err := st.ResourceGroups().Create(t.Context(), &rg); err != nil {
 			t.Fatalf("seed group %q: %v", rg.Name, err)
@@ -123,18 +124,123 @@ func TestUnappliedGroupStack(t *testing.T) {
 	}
 }
 
-func seedGroupedPreparedTarget(t *testing.T, st store.Store, group string, stack []string) *apiv1.Snapshot {
+// A prepared target is restored under the source's stack, whatever stack it
+// was created with, the way LINSTOR builds a restored resource from the
+// snapshot's layer data: Velero's data mover restores a DRBD volume's snapshot
+// into a storage-only class, a LUKS one into a plaintext class, and the other
+// way round. Nothing is on the target yet, so no layer it named has written
+// anything, and the copy is read back through the layers it was written under.
+func TestRestoreIntoAPreparedTargetTakesTheSourceStack(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		group  string
+		target []string
+		source []string
+	}{
+		{"storage-only target of a DRBD source", "grp-local", []string{"STORAGE"}, []string{"DRBD", "STORAGE"}},
+		{"plaintext target of a LUKS source", "grp-drbd", []string{"DRBD", "STORAGE"}, []string{"DRBD", "LUKS", "STORAGE"}},
+		{"LUKS target of a plaintext source", "grp-luks", []string{"DRBD", "LUKS", "STORAGE"}, []string{"DRBD", "STORAGE"}},
+		{"DRBD target of a storage-only source", "grp-drbd", []string{"DRBD", "STORAGE"}, []string{"STORAGE"}},
+		{"undecided target", "grp-luks", nil, []string{"DRBD", "STORAGE"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewInMemory()
+			seedGroups(t, st)
+			snap := seedPreparedTargetOf(t, st, tc.source, tc.group, tc.target)
+
+			target, _ := st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
+
+			prepared, err := store.PreparedRestoreTarget(t.Context(), st, &target, snap)
+			if err != nil || !prepared {
+				t.Fatalf("PreparedRestoreTarget = %v, %v; want a prepared target", prepared, err)
+			}
+
+			adopted, err := store.AdoptPreparedRestoreTarget(t.Context(), st, "pvc-dst", snap)
+			if err != nil || !adopted {
+				t.Fatalf("AdoptPreparedRestoreTarget = %v, %v; want adopted", adopted, err)
+			}
+
+			got, _ := st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
+			if !slices.Equal(got.LayerStack, tc.source) {
+				t.Errorf("restored target stack = %v, want the source's %v", got.LayerStack, tc.source)
+			}
+
+			if got.Props[store.RestoreFromSnapshotProp] == "" {
+				t.Errorf("the adopted target carries no restore marker: %v", got.Props)
+			}
+		})
+	}
+}
+
+// A source whose stack its group has yet to decide gives the restore no stack
+// to inherit: the target is not taken and nothing is written to it until the
+// controller decides it.
+func TestRestoreWaitsForAnUndecidedSourceStack(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedGroups(t, st)
+	snap := seedPreparedTargetOf(t, st, nil, "grp-local", []string{"STORAGE"})
+
+	src, _ := st.ResourceDefinitions().Get(t.Context(), "pvc-src")
+	src.ResourceGroupName = "grp-luks"
+	_ = st.ResourceDefinitions().Update(t.Context(), &src)
+
+	target, _ := st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
+
+	if _, err := store.PreparedRestoreTarget(t.Context(), st, &target, snap); !errors.Is(err, store.ErrLayerStackUndecided) {
+		t.Errorf("a target of an undecided source = %v, want ErrLayerStackUndecided", err)
+	}
+
+	if _, err := store.AdoptPreparedRestoreTarget(t.Context(), st, "pvc-dst", snap); !errors.Is(err, store.ErrLayerStackUndecided) {
+		t.Errorf("marking a target of an undecided source = %v, want ErrLayerStackUndecided", err)
+	}
+
+	got, _ := st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
+	if got.Props[store.RestoreFromSnapshotProp] != "" || !slices.Equal(got.LayerStack, []string{"STORAGE"}) {
+		t.Errorf("the refused mark wrote %v / %v", got.Props, got.LayerStack)
+	}
+}
+
+// The target's stack can be rewritten between the judgement and the stamp;
+// the stamp writes the source's stack over whatever it finds, in the same
+// patch as the marker, so the marker never lands over another stack.
+func TestRestoreMarkerWritesTheSourceStackOverARewrite(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedGroups(t, st)
+	snap := seedPreparedTargetOf(t, st, apiv1.DefaultLayerStack(), "grp-plain", apiv1.DefaultLayerStack())
+
+	rewritten := claimPatchHookStore{Store: st, hook: claimPatchHook{before: func() {
+		rd, _ := st.ResourceDefinitions().Get(context.Background(), "pvc-dst")
+		rd.LayerStack = []string{"DRBD", "LUKS", "STORAGE"}
+		rd.ResourceGroupName = "grp-luks"
+		_ = st.ResourceDefinitions().Update(context.Background(), &rd)
+	}}}
+
+	if _, err := store.AdoptPreparedRestoreTarget(t.Context(), rewritten, "pvc-dst", snap); err != nil {
+		t.Fatalf("marking a target rewritten under the patch: %v", err)
+	}
+
+	rd, _ := st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
+	if !slices.Equal(rd.LayerStack, apiv1.DefaultLayerStack()) || rd.Props[store.RestoreFromSnapshotProp] == "" {
+		t.Errorf("marked target = %v / %v, want the source's stack %v under the marker",
+			rd.LayerStack, rd.Props, apiv1.DefaultLayerStack())
+	}
+}
+
+func seedPreparedTargetOf(t *testing.T, st store.Store, source []string, group string, stack []string) *apiv1.Snapshot {
 	t.Helper()
 
 	ctx := t.Context()
 
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src", LayerStack: apiv1.DefaultLayerStack()}); err != nil {
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src", LayerStack: source}); err != nil {
 		t.Fatalf("seed source: %v", err)
-	}
-
-	snap := &apiv1.Snapshot{
-		Name: "snap-1", ResourceName: "pvc-src",
-		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 1024}},
 	}
 
 	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
@@ -147,91 +253,8 @@ func seedGroupedPreparedTarget(t *testing.T, st store.Store, group string, stack
 		t.Fatalf("seed target volume: %v", err)
 	}
 
-	return snap
-}
-
-// A prepared target whose stack its group has yet to decide is not judged
-// prepared and nothing is written to it; a decided one of the source's stack is.
-func TestPreparedRestoreTargetWaitsForAnUndecidedStack(t *testing.T) {
-	t.Parallel()
-
-	st := store.NewInMemory()
-	seedGroups(t, st)
-	snap := seedGroupedPreparedTarget(t, st, "grp-luks", nil)
-
-	target, _ := st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
-
-	if _, err := store.PreparedRestoreTarget(t.Context(), st, &target, snap); !errors.Is(err, store.ErrLayerStackUndecided) {
-		t.Errorf("an undecided target = %v, want ErrLayerStackUndecided", err)
-	}
-
-	if _, err := store.AdoptPreparedRestoreTarget(t.Context(), st, "pvc-dst", snap); !errors.Is(err, store.ErrLayerStackUndecided) {
-		t.Errorf("marking an undecided target = %v, want ErrLayerStackUndecided", err)
-	}
-
-	target, _ = st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
-	if target.Props[store.RestoreFromSnapshotProp] != "" || len(target.LayerStack) > 0 {
-		t.Errorf("the refused mark wrote %v / %v", target.Props, target.LayerStack)
-	}
-}
-
-// The target is marked with the stack its group resolves to, read before the
-// patch; a target moved to another group in between is answered as undecided
-// rather than stamped with the old group's answer.
-func TestRestoreMarkerResolvesTheStackItIsWrittenWith(t *testing.T) {
-	t.Parallel()
-
-	st := store.NewInMemory()
-	seedGroups(t, st)
-	snap := seedGroupedPreparedTarget(t, st, "grp-plain", nil)
-
-	moved := claimPatchHookStore{Store: st, hook: claimPatchHook{before: func() {
-		rd, _ := st.ResourceDefinitions().Get(context.Background(), "pvc-dst")
-		rd.ResourceGroupName = "grp-luks"
-		_ = st.ResourceDefinitions().Update(context.Background(), &rd)
-	}}}
-
-	if _, err := store.AdoptPreparedRestoreTarget(t.Context(), moved, "pvc-dst", snap); !errors.Is(err, store.ErrLayerStackUndecided) {
-		t.Errorf("a target moved under the patch = %v, want ErrLayerStackUndecided", err)
-	}
-
-	rd, _ := st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
-	rd.ResourceGroupName = "grp-plain"
-	_ = st.ResourceDefinitions().Update(t.Context(), &rd)
-
-	if _, err := store.AdoptPreparedRestoreTarget(t.Context(), st, "pvc-dst", snap); err != nil {
-		t.Fatalf("marking a target under a group that sets no stack: %v", err)
-	}
-
-	rd, _ = st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
-	if !slices.Equal(rd.LayerStack, apiv1.DefaultLayerStack()) {
-		t.Errorf("marked target stack = %v, want %v", rd.LayerStack, apiv1.DefaultLayerStack())
-	}
-}
-
-// The target's stack is judged against the source's before the marker is
-// stamped, and can be rewritten in between; the stamp checks it again against
-// the state it applies to and refuses a stack the snapshot's bytes were not
-// laid down under, leaving the target unmarked.
-func TestRestoreMarkerRefusesAStackRewrittenUnderThePatch(t *testing.T) {
-	t.Parallel()
-
-	st := store.NewInMemory()
-	seedGroups(t, st)
-	snap := seedGroupedPreparedTarget(t, st, "grp-plain", apiv1.DefaultLayerStack())
-
-	rewritten := claimPatchHookStore{Store: st, hook: claimPatchHook{before: func() {
-		rd, _ := st.ResourceDefinitions().Get(context.Background(), "pvc-dst")
-		rd.LayerStack = []string{"DRBD", "LUKS", "STORAGE"}
-		_ = st.ResourceDefinitions().Update(context.Background(), &rd)
-	}}}
-
-	if _, err := store.AdoptPreparedRestoreTarget(t.Context(), rewritten, "pvc-dst", snap); !errors.Is(err, store.ErrRestoreTargetLayers) {
-		t.Errorf("a target whose stack was rewritten under the patch = %v, want ErrRestoreTargetLayers", err)
-	}
-
-	rd, _ := st.ResourceDefinitions().Get(t.Context(), "pvc-dst")
-	if rd.Props[store.RestoreFromSnapshotProp] != "" {
-		t.Errorf("the refused stamp wrote the marker: %v", rd.Props)
+	return &apiv1.Snapshot{
+		Name: "snap-1", ResourceName: "pvc-src",
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 1024}},
 	}
 }

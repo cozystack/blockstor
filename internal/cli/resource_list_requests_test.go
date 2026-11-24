@@ -15,7 +15,7 @@ import (
 	"github.com/cozystack/blockstor/internal/cli"
 )
 
-// countingVDs records how the command reaches the volume sizes. Embedding the
+// countingVDs records whether the command reads the volume definitions. Embedding the
 // real store keeps every other method behaviourally identical, so the only
 // difference between this and the plain in-memory store is the counters.
 type countingVDs struct {
@@ -98,52 +98,27 @@ func runCountedList(t *testing.T, counted *countingStore, args ...string) {
 	}
 }
 
-// `resource list` fills its sync-percentage column from the volume sizes, and
-// it used to read them one definition at a time. On the Kubernetes store each
-// of those is a GET of one ResourceDefinition against an uncached client, so
-// the command an operator runs while watching a resync cost one LIST plus one
-// round trip per definition.
-//
-// The acceptance is a request count that does not grow with the number of
-// definitions, so the test asserts it across two cluster sizes rather than
-// against a fixed number: a per-definition read would make the count track the
-// seed size, and no single expected value could catch that.
-func TestResourceListDoesNotReadPerDefinition(t *testing.T) {
+// `resource list` used to read the volume sizes to derive a sync percentage,
+// one definition at a time or the whole cluster at once. The State column now
+// shows DRBD's own per-peer `done`, which arrives with the replicas, so the
+// command reads no volume definition at all, wide or narrowed: on the
+// Kubernetes store each such read is a round trip against an uncached client,
+// in the command an operator runs while watching a resync.
+func TestResourceListReadsNoVolumeDefinitions(t *testing.T) {
 	t.Parallel()
 
-	for _, definitions := range []int{40, 200} {
-		counted := seedCountedCluster(t, definitions)
+	for _, args := range [][]string{
+		{"resource", "list"},
+		{"resource", "list", "-r", "pvc-7"},
+		{"resource", "list", "--faulty"},
+	} {
+		counted := seedCountedCluster(t, 40)
 
-		runCountedList(t, counted, "resource", "list")
+		runCountedList(t, counted, args...)
 
-		if n := counted.vds.perDefinition.Load(); n != 0 {
-			t.Errorf("%d definitions: %d per-definition reads, want none — the count would "+
-				"track the cluster size", definitions, n)
+		if n := counted.vds.perDefinition.Load() + counted.vds.wholeCluster.Load(); n != 0 {
+			t.Errorf("%v: %d volume-definition reads, want none", args, n)
 		}
-
-		if n := counted.vds.wholeCluster.Load(); n != 1 {
-			t.Errorf("%d definitions: %d whole-cluster reads, want exactly 1", definitions, n)
-		}
-	}
-}
-
-// The other side of the same trade. A listing narrowed to one definition asked
-// about one definition, and answering it by reading every definition in the
-// cluster is the cost the wide case was optimised out of, moved onto the
-// operator who was already being specific.
-func TestResourceListNarrowedDoesNotReadTheWholeCluster(t *testing.T) {
-	t.Parallel()
-
-	counted := seedCountedCluster(t, 200)
-
-	runCountedList(t, counted, "resource", "list", "-r", "pvc-7")
-
-	if n := counted.vds.wholeCluster.Load(); n != 0 {
-		t.Errorf("%d whole-cluster reads for a one-definition listing, want none", n)
-	}
-
-	if n := counted.vds.perDefinition.Load(); n != 1 {
-		t.Errorf("%d per-definition reads, want exactly 1 — the listing covers one definition", n)
 	}
 }
 

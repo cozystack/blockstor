@@ -32,6 +32,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/pkg/errors"
@@ -182,7 +183,7 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if refuseServerOwnedGroupProps(w, rg.Name, rg.Props, rg.OverrideProps) {
+	if refuseRGCreateProps(w, &rg) {
 		return
 	}
 
@@ -227,6 +228,30 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
+// refuseRGCreateProps runs the refusals an `rg c` body's props meet: the
+// props blockstor owns, and LINSTOR's whitelist, which judges a group's
+// props as a definition's and its volume groups' as a volume definition's,
+// since that is what they are copied onto. True means the refusal has been
+// written.
+func refuseRGCreateProps(w http.ResponseWriter, rg *apiv1.ResourceGroup) bool {
+	if refuseServerOwnedGroupProps(w, rg.Name, rg.Props, rg.OverrideProps) {
+		return true
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, rg.Props) ||
+		refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, rg.OverrideProps) {
+		return true
+	}
+
+	for i := range rg.VolumeGroups {
+		if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, rg.VolumeGroups[i].Props) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rg")
 
@@ -257,21 +282,29 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		applyRGUpdatePatch(existing, &patch, raw)
 
 		// Bug 60 (cli-parity-audit row #41): upstream LINSTOR
-		// re-runs autoplace on every child RD when `rg modify`
-		// raises PlaceCount or changes a placement-affecting
-		// filter. Phase 11.x split pushed reconcilers into a
+		// re-runs autoplace on every child RD short of the place
+		// count an `rg modify` names; a changed placement-affecting
+		// filter schedules the gated pass. Phase 11.x split pushed reconcilers into a
 		// separate process, so the REST handler can't walk RDs
 		// inline — instead it stamps the
 		// `blockstor.org/rebalance-pending` annotation and the
-		// RGRebalanceReconciler picks it up. Scale-DOWN
-		// intentionally does NOT trigger anything.
-		rebalanceScheduled = rgNeedsRebalance(&prevFilter, &existing.SelectFilter)
+		// RGRebalanceReconciler picks it up. No pass removes
+		// replicas, so a lowered place count only tops up the
+		// children below it, as LINSTOR's does.
+		placeCount := rgModifyCarriesPlaceCount(raw, &existing.SelectFilter)
+
+		rebalanceScheduled = placeCount || rgNeedsRebalance(&prevFilter, &existing.SelectFilter)
 		if rebalanceScheduled {
 			if existing.Annotations == nil {
 				existing.Annotations = map[string]string{}
 			}
 
-			existing.Annotations[apiv1.AnnotationRGRebalancePending] = time.Now().UTC().Format(time.RFC3339Nano)
+			stamp := time.Now().UTC().Format(time.RFC3339Nano)
+			existing.Annotations[apiv1.AnnotationRGRebalancePending] = stamp
+
+			if placeCount {
+				existing.Annotations[apiv1.AnnotationRGRebalancePlaceCount] = stamp
+			}
 		}
 
 		return nil
@@ -394,13 +427,30 @@ func rebalanceMessage(count int) string {
 	return fmt.Sprintf("rebalance scheduled for %d RDs", count)
 }
 
+// rgModifyCarriesPlaceCount reports whether an `rg modify` is the one
+// LINSTOR places replicas for: its request names a place count. LINSTOR
+// then runs the autoplacer on every child definition with fewer
+// replicas than that count, whether the count went up, down or stayed
+// the same (CtrlRscGrpApiCallHandler.modifyInTransaction, the
+// `newReplicaCount != null` branch). A zero count is the cleared field,
+// which LINSTOR refuses as a place count, so it marks nothing.
+func rgModifyCarriesPlaceCount(raw []byte, merged *apiv1.AutoSelectFilter) bool {
+	if _, ok := rgSelectFilterKeys(raw)["place_count"]; !ok {
+		return false
+	}
+
+	return merged.PlaceCount > 0
+}
+
 // rgNeedsRebalance reports whether the placement-affecting subset of
 // the SelectFilter changed in a way that should re-run autoplace on
 // the RG's child RDs. The decision is additive-only:
 //
-//   - PlaceCount: trigger only when the NEW value strictly exceeds
-//     the old one. Scale-down is a no-op (upstream LINSTOR forces the
-//     operator to remove replicas explicitly via `linstor r d`).
+//   - PlaceCount: a raise always triggers. A request that names a
+//     lower or the same place count triggers through
+//     rgModifyCarriesPlaceCount instead; no pass ever removes a
+//     replica (upstream LINSTOR forces the operator to remove replicas
+//     explicitly via `linstor r d`).
 //   - LayerStack / ReplicasOnSame / NotPlaceWithRsc /
 //     NotPlaceWithRscRegex: trigger on ANY change. The placer's next
 //     pass honours the new constraint; existing replicas that violate
@@ -642,6 +692,11 @@ func (s *Server) refuseRGUpdate(
 	}
 
 	if refuseServerOwnedGroupProps(w, name, patch.Props, patch.OverrideProps) {
+		return true
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.Props) ||
+		refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.OverrideProps) {
 		return true
 	}
 

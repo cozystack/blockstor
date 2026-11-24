@@ -1,6 +1,7 @@
 {
 "items": [
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 1,
 "layer_resource_kind": "DRBD",
@@ -12,6 +13,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 2,
 "layer_resource_kind": "STORAGE",
@@ -24,6 +26,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 3,
 "layer_resource_kind": "DRBD",
@@ -35,6 +38,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 4,
 "layer_resource_kind": "STORAGE",
@@ -47,6 +51,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 5,
 "layer_resource_kind": "DRBD",
@@ -58,6 +63,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 6,
 "layer_resource_kind": "STORAGE",
@@ -70,6 +76,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 7,
 "layer_resource_kind": "STORAGE",
@@ -81,6 +88,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 8,
 "layer_resource_kind": "DRBD",
@@ -92,6 +100,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 9,
 "layer_resource_kind": "LUKS",
@@ -104,6 +113,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 10,
 "layer_resource_kind": "STORAGE",
@@ -116,6 +126,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 11,
 "layer_resource_kind": "DRBD",
@@ -127,6 +138,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 12,
 "layer_resource_kind": "LUKS",
@@ -139,6 +151,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 13,
 "layer_resource_kind": "STORAGE",
@@ -151,6 +164,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 14,
 "layer_resource_kind": "DRBD",
@@ -162,6 +176,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 15,
 "layer_resource_kind": "STORAGE",
@@ -174,6 +189,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 16,
 "layer_resource_kind": "DRBD",
@@ -185,6 +201,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 17,
 "layer_resource_kind": "STORAGE",
@@ -197,6 +214,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 18,
 "layer_resource_kind": "STORAGE",
@@ -208,6 +226,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 19,
 "layer_resource_kind": "STORAGE",
@@ -219,6 +238,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 30,
 "layer_resource_kind": "STORAGE",
@@ -230,6 +250,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "layer_resource_id": 31,
 "layer_resource_kind": "STORAGE",

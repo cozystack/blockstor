@@ -318,6 +318,20 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return nil
 }
 
+// HasSnapshot reports whether this pool holds the snapshot's .img copy.
+func (p *Provider) HasSnapshot(_ context.Context, snap storage.Snapshot) (bool, error) {
+	_, err := os.Stat(p.snapshotPath(snap))
+	if err == nil {
+		return true, nil
+	}
+
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+
+	return false, errors.Wrapf(err, "stat %s", p.snapshotPath(snap))
+}
+
 // DeleteSnapshot removes the .img copy. Missing → no-op.
 //
 // The path MUST be resolved through the provider's configured pool
@@ -452,7 +466,7 @@ func (p *Provider) SendSnapshot(_ context.Context, snap storage.Snapshot) (io.Re
 // divergent write could ENOSPC even though the file's apparent size
 // looked fine. Thin path skips fallocate (sparse / overcommit is the
 // FILE_THIN contract).
-func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, _ storage.Snapshot, src io.Reader) error {
 	finalPath := p.volumePath(target)
 	partialPath := finalPath + ".partial"
 
@@ -702,7 +716,7 @@ func (p *Provider) volumePath(vol storage.Volume) string {
 }
 
 const (
-	stateNotProvisioned = "NOT_PROVISIONED"
+	stateNotProvisioned = storage.StateNotProvisioned
 	bytesPerKib         = 1024
 	// volumeFilePerm — owner-only read+write. The FILE storage pool
 	// dir already restricts access; the satellite runs as root.

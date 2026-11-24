@@ -132,7 +132,7 @@ func (e *OversubscriptionShortfallError) Error() string {
 // a backing storage pool. Mirrors the literal the REST handlers and the
 // satellite dispatcher key on; centralised here so the placer's
 // create-and-promote paths can't drift on the spelling.
-const storPoolNameProp = "StorPoolName"
+const storPoolNameProp = apiv1.KeyStorPoolName
 
 // Placer adds replicas to satisfy a placement filter. Construct via
 // New; one instance per autoplace call (it does no internal caching).
@@ -178,6 +178,50 @@ func New(st store.Store) *Placer {
 // the migration semantic: even if 2 replicas exist, if one is on an
 // evicted node the placer will create a third on a healthy peer.
 func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
+	res, err := p.PlaceDeployed(ctx, rdName, filter)
+
+	return res.Placed, res.Want, err
+}
+
+// Placement is what a Place call did: the diskful count it reached,
+// the count it was asked for, and the nodes whose replica this call
+// created or promoted from a diskless witness.
+type Placement struct {
+	Placed int
+	Want   int
+	// Deployed lists the nodes this call put a replica on, as LINSTOR's
+	// autoplace collects its deployedResources: the replicas that were
+	// there before the call are not in it.
+	Deployed []string
+}
+
+// PlaceDeployed is Place that also reports which nodes it deployed to,
+// so the REST autoplace can wait for those replicas only, as LINSTOR
+// waits for the resources the call created and not for the ones the
+// definition already had.
+func (p *Placer) PlaceDeployed(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (Placement, error) {
+	var created []string
+
+	return p.place(ctx, rdName, filter, &created)
+}
+
+// PlaceCreating is Place that also names the nodes it created a replica
+// on, for a caller that may have to take back what this call did and
+// nothing else: a replica that was already there, one another writer
+// created meanwhile, and a diskless witness promoted in place are not
+// on the list. It holds whatever was created before an error, too.
+func (p *Placer) PlaceCreating(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) ([]string, int, int, error) {
+	var created []string
+
+	res, err := p.place(ctx, rdName, filter, &created)
+
+	return created, res.Placed, res.Want, err
+}
+
+// place runs one placement. created receives the nodes the call
+// created a replica on, which is narrower than Placement.Deployed: a
+// witness promoted in place is deployed to but not created.
+func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, created *[]string) (Placement, error) {
 	defer lockDefinition(rdName)()
 
 	// Bug 038: an RD born from a snapshot restore / clone must never
@@ -189,76 +233,45 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 
 	plan, err := p.buildPlan(ctx, rdName, filter)
 	if err != nil {
-		return 0, 0, err
+		return Placement{}, err
 	}
+
+	defer func() {
+		if plan.state != nil {
+			*created = plan.state.created
+		}
+	}()
 
 	if plan.capacityShortfall {
 		// Fail-fast: no pool can host the largest volume. Surface the
 		// actionable error so REST returns 409 instead of 200 + a
 		// downstream satellite failure (Bug 35 / 7.15 e2e).
-		//
-		// Precedence: the physical FreeCapacity floor (Bug 35) is the
-		// more fundamental gate, so a non-zero maxFreeKib wins over an
-		// oversub witness — operators see the hard floor first. Only
-		// when the floor was clean (every rejected pool tripped a ratio
-		// cap, not the floor) do we surface the OversubscriptionShortfall
-		// envelope so the relevant ratio (Free / Total / Master) is
-		// named in the 409 (scenarios 7.W10 / 7.W11).
-		if plan.maxFreeKib == 0 && plan.oversubShortfall != nil {
-			return 0, int(filter.PlaceCount), plan.oversubShortfall
-		}
-
-		return 0, int(filter.PlaceCount), &CapacityShortfallError{
-			RequiredKib: plan.requiredKib,
-			MaxFreeKib:  plan.maxFreeKib,
-		}
+		return Placement{Want: int(filter.PlaceCount)}, plan.shortfallError()
 	}
 
 	placed := countDiskfulReplicas(plan.existing, plan.disabled)
 	want := int(filter.PlaceCount)
 
+	defer p.holdWitness(ctx, rdName, want-placed)()
+
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.preferred, placed, want)
 	if err != nil {
-		return placed, want, err
+		return plan.state.placement(placed, want), err
 	}
 
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.lastResort, placed, want)
 	if err != nil {
-		return placed, want, err
+		return plan.state.placement(placed, want), err
 	}
 
 	if filter.DisklessOnRemaining && placed >= want {
 		err = p.placeDisklessOnRemaining(ctx, rdName, plan.state)
 		if err != nil {
-			return placed, want, err
+			return plan.state.placement(placed, want), err
 		}
 	}
 
-	// Partial-shortfall path (Bug 35 + scenarios 7.W10 / 7.W11): the
-	// diskful loop ran out of candidates because the capacity or
-	// over-subscription gate dropped pools that would otherwise have
-	// qualified. Surface the actionable error so the REST 409 names
-	// the missing capacity OR the over-subscription cap. We only fire
-	// when one of those gates was actually the rejecter; a shortfall
-	// caused purely by topology/anti-affinity still falls through to
-	// the generic "not enough candidate storage pools" path.
-	//
-	// Precedence: physical floor (maxFreeKib > 0) wins over oversub —
-	// see the capacityShortfall branch above for the rationale.
-	if placed < want && plan.requiredKib > 0 {
-		if plan.maxFreeKib > 0 {
-			return placed, want, &CapacityShortfallError{
-				RequiredKib: plan.requiredKib,
-				MaxFreeKib:  plan.maxFreeKib,
-			}
-		}
-
-		if plan.oversubShortfall != nil {
-			return placed, want, plan.oversubShortfall
-		}
-	}
-
-	return placed, want, nil
+	return plan.state.placement(placed, want), plan.partialShortfall(placed, want)
 }
 
 // placePlan bundles everything Place needs after the read-side
@@ -286,6 +299,56 @@ type placePlan struct {
 	// mutually exclusive so REST can render a single 409 naming the
 	// exact ratio the operator needs to tune.
 	oversubShortfall *OversubscriptionShortfallError
+}
+
+// shortfallError is the error of a plan with capacityShortfall set.
+//
+// Precedence: the physical FreeCapacity floor (Bug 35) is the more
+// fundamental gate, so a non-zero maxFreeKib wins over an oversub
+// witness — operators see the hard floor first. Only when the floor was
+// clean (every rejected pool tripped a ratio cap, not the floor) do we
+// surface the OversubscriptionShortfall envelope so the relevant ratio
+// (Free / Total / Master) is named in the 409 (scenarios 7.W10 /
+// 7.W11).
+func (pl *placePlan) shortfallError() error {
+	if pl.maxFreeKib == 0 && pl.oversubShortfall != nil {
+		return pl.oversubShortfall
+	}
+
+	return &CapacityShortfallError{
+		RequiredKib: pl.requiredKib,
+		MaxFreeKib:  pl.maxFreeKib,
+	}
+}
+
+// partialShortfall is the error a placement that fell short of want
+// returns (Bug 35 + scenarios 7.W10 / 7.W11): the diskful loop ran out
+// of candidates because the capacity or over-subscription gate dropped
+// pools that would otherwise have qualified, so the REST 409 names the
+// missing capacity OR the over-subscription cap. It is nil when
+// neither gate was the rejecter; a shortfall caused purely by
+// topology/anti-affinity still falls through to the generic "not
+// enough candidate storage pools" path.
+//
+// Precedence: physical floor (maxFreeKib > 0) wins over oversub, see
+// the capacityShortfall branch of place for the rationale.
+func (pl *placePlan) partialShortfall(placed, want int) error {
+	if placed >= want || pl.requiredKib <= 0 {
+		return nil
+	}
+
+	if pl.maxFreeKib > 0 {
+		return &CapacityShortfallError{
+			RequiredKib: pl.requiredKib,
+			MaxFreeKib:  pl.maxFreeKib,
+		}
+	}
+
+	if pl.oversubShortfall != nil {
+		return pl.oversubShortfall
+	}
+
+	return nil
 }
 
 // buildPlan does the read-side legwork: load VDs, candidate pools,
@@ -318,6 +381,8 @@ func (p *Placer) buildPlan(ctx context.Context, rdName string, filter *apiv1.Aut
 		}, nil
 	}
 
+	candidates = p.pinRestoreCopyPools(ctx, rdName, candidates)
+
 	return p.assemblePlan(ctx, rdName, filter, candidates, requiredKib, gates)
 }
 
@@ -327,6 +392,11 @@ func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.
 	existing, err := store.LiveReplicas(ctx, p.store, rdName)
 	if err != nil {
 		return nil, errors.Wrap(err, "list resources by definition")
+	}
+
+	candidates, err = p.filterByBlockSize(ctx, rdName, existing, candidates)
+	if err != nil {
+		return nil, err
 	}
 
 	disabled, err := p.disabledNodes(ctx)
@@ -490,6 +560,11 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 			return errors.Wrap(err, "create diskless witness")
 		}
 
+		if err == nil {
+			state.deployed = append(state.deployed, nodeName)
+			state.created = append(state.created, nodeName)
+		}
+
 		state.taken[naming.Key(nodeName)] = struct{}{}
 	}
 
@@ -499,6 +574,8 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 // state holds the per-call lookup tables. Pulled out of Placer so a
 // concurrent Placer call doesn't share the mutable bookkeeping.
 type state struct {
+	// created names the nodes this Place call created a replica on.
+	created    []string
 	nodes      map[string]map[string]string
 	taken      map[string]struct{}
 	sameTuple  map[string]string
@@ -545,6 +622,15 @@ type state struct {
 	// exact transition pkg/rest.promoteDisklessReplica performs for the
 	// explicit `r c <node> --storage-pool` toggle-disk path.
 	upgradeable map[string]string
+	// deployed lists, in order, the nodes this call created a replica
+	// on or promoted a witness on. A Create that found the replica
+	// already there does not count.
+	deployed []string
+}
+
+// placement renders the call's result.
+func (s *state) placement(placed, want int) Placement {
+	return Placement{Placed: placed, Want: want, Deployed: s.deployed}
 }
 
 func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string, pools []apiv1.StoragePool, allowPoolDriverMixing bool) *state {
@@ -731,30 +817,22 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		return false, nil
 	}
 
-	// corner-D2b: when the candidate node already hosts a diskless
-	// witness (recorded in `upgradeable` at newState time), promote it
-	// to diskful in place instead of creating a fresh Resource — a
-	// Create would hit ErrAlreadyExists and the witness would never gain
-	// a backing disk. The promote strips DISKLESS+TIE_BREAKER and stamps
-	// the chosen StorPoolName, the exact transition the explicit
-	// `r c <node> --storage-pool` toggle-disk path performs via
-	// pkg/rest.promoteDisklessReplica.
-	if _, isWitness := s.upgradeable[naming.Key(pool.NodeName)]; isWitness {
-		err := s.promoteWitness(ctx, st, rdName, pool)
-		if err != nil {
-			return false, err
-		}
-	} else {
-		res := apiv1.Resource{
-			Name:     rdName,
-			NodeName: pool.NodeName,
-			Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
-		}
+	created, err := s.writeReplica(ctx, st, rdName, pool)
+	if errors.Is(err, errReplicaTerminating) {
+		return false, nil
+	}
 
-		err := st.Resources().Create(ctx, &res)
-		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
-			return false, errors.Wrap(err, "create resource")
-		}
+	if err != nil {
+		return false, err
+	}
+
+	// A witness taken over, whether seen before the placement or found
+	// by the create, is deployed to but not created: the autoplace
+	// waits for it, and a caller taking back what this call created
+	// leaves it alone.
+	s.deployed = append(s.deployed, pool.NodeName)
+	if created {
+		s.created = append(s.created, pool.NodeName)
 	}
 
 	s.taken[naming.Key(pool.NodeName)] = struct{}{}
@@ -793,6 +871,40 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 	return true, nil
 }
 
+// writeReplica lands the diskful replica tryPlace chose on pool.
+//
+// corner-D2b: when the candidate node already hosts a diskless
+// witness (recorded in `upgradeable` at newState time), promote it
+// to diskful in place instead of creating a fresh Resource — a
+// Create would hit ErrAlreadyExists and the witness would never gain
+// a backing disk. The promote strips DISKLESS+TIE_BREAKER and stamps
+// the chosen StorPoolName, the exact transition the explicit
+// `r c <node> --storage-pool` toggle-disk path performs via
+// pkg/rest.promoteDisklessReplica. A create that finds a replica
+// written since newState goes through takeOverReplicaWrittenMeanwhile.
+func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) (bool, error) {
+	if _, isWitness := s.upgradeable[naming.Key(pool.NodeName)]; isWitness {
+		return false, s.promoteWitness(ctx, st, rdName, pool)
+	}
+
+	res := apiv1.Resource{
+		Name:     rdName,
+		NodeName: pool.NodeName,
+		Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
+	}
+
+	err := st.Resources().Create(ctx, &res)
+	if err == nil {
+		return true, nil
+	}
+
+	if errors.Is(err, store.ErrAlreadyExists) {
+		err = s.takeOverReplicaWrittenMeanwhile(ctx, st, rdName, pool)
+	}
+
+	return false, errors.Wrap(err, "create resource")
+}
+
 // promoteWitness converts the diskless witness already on pool.NodeName
 // into a diskful replica backed by pool.StoragePoolName (corner-D2b).
 // It strips DISKLESS + TIE_BREAKER and stamps StorPoolName via
@@ -805,46 +917,106 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 // The patch is conflict-safe: PatchResourceSpec re-runs the closure
 // against the freshly-fetched live replica on every optimistic-
 // concurrency retry, so a racing satellite Status write converges
-// instead of clobbering the promote. A NotFound (the witness was
-// collapsed out from under us between newState and here) is treated as
-// "nothing to promote" and falls back to a fresh Create so the
-// placement still lands.
+// instead of clobbering the promote. The closure decides on that live
+// replica, not on what the placement read earlier:
+//
+//   - a replica that turned diskful meanwhile is left as it is and
+//     counts as placed;
+//   - a replica being deleted is not promoted: the patch would land on
+//     an object about to vanish, and the placement would count a
+//     replica that is gone a moment later. errReplicaTerminating tells
+//     the caller the node is not placed on;
+//   - a replica that is gone (a concurrent witness-collapse) gets a
+//     fresh diskful create so the placement still lands. When that
+//     create finds a replica again, written in between, the next round
+//     decides on it the same way rather than counting it unseen.
 func (s *state) promoteWitness(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
-	err := st.Resources().PatchResourceSpec(ctx, rdName, pool.NodeName, func(live *apiv1.Resource) error {
-		keep, _ := apiv1.PromoteWitnessFlags(live.Flags, true)
-		live.Flags = keep
+	for range witnessTakeOverRounds {
+		err := st.Resources().PatchResourceSpec(ctx, rdName, pool.NodeName, func(live *apiv1.Resource) error {
+			if slices.Contains(live.Flags, apiv1.ResourceFlagDelete) {
+				return errReplicaTerminating
+			}
 
-		if live.Props == nil {
-			live.Props = map[string]string{}
+			if !isDisklessReplica(live.Flags) {
+				return errReplicaDiskful
+			}
+
+			keep, _ := apiv1.PromoteWitnessFlags(live.Flags, true)
+			live.Flags = keep
+
+			if live.Props == nil {
+				live.Props = map[string]string{}
+			}
+
+			live.Props[storPoolNameProp] = pool.StoragePoolName
+
+			return nil
+		})
+
+		switch {
+		case err == nil, errors.Is(err, errReplicaDiskful):
+			return nil
+		case errors.Is(err, errReplicaTerminating):
+			return errReplicaTerminating
+		case !errors.Is(err, store.ErrNotFound):
+			return errors.Wrap(err, "promote witness to diskful")
 		}
 
-		live.Props[storPoolNameProp] = pool.StoragePoolName
+		res := apiv1.Resource{
+			Name:     rdName,
+			NodeName: pool.NodeName,
+			Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
+		}
 
-		return nil
-	})
-	if err == nil {
-		return nil
+		err = st.Resources().Create(ctx, &res)
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			return errors.Wrap(err, "create resource after witness vanished")
+		}
 	}
 
-	if !errors.Is(err, store.ErrNotFound) {
-		return errors.Wrap(err, "promote witness to diskful")
-	}
+	return errors.Wrapf(errReplicaKeptChanging, "replica of %s on %s", rdName, pool.NodeName)
+}
 
-	// The witness vanished between newState and the patch (e.g. a
-	// concurrent witness-collapse). Land a fresh diskful replica so the
-	// placement target is still met.
-	res := apiv1.Resource{
-		Name:     rdName,
-		NodeName: pool.NodeName,
-		Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
-	}
+// witnessTakeOverRounds bounds how often promoteWitness re-reads a
+// replica that vanished and reappeared under it. One writer, the
+// tiebreaker reconciler, can do that at most once per definition
+// change, so a few rounds settle it.
+const witnessTakeOverRounds = 3
 
-	createErr := st.Resources().Create(ctx, &res)
-	if createErr != nil && !errors.Is(createErr, store.ErrAlreadyExists) {
-		return errors.Wrap(createErr, "create resource after witness vanished")
-	}
+// errReplicaTerminating is a replica the placement would take over
+// that is being deleted. The node is not placed on.
+var errReplicaTerminating = errors.New("replica is being deleted")
 
-	return nil
+// errReplicaKeptChanging is a replica that vanished and came back on
+// every round of promoteWitness.
+var errReplicaKeptChanging = errors.New("kept changing during the placement")
+
+// errReplicaDiskful stops a witness promotion that finds the replica
+// diskful already: it is left as it is.
+var errReplicaDiskful = errors.New("replica is diskful already")
+
+// isDisklessReplica reports whether flags are those of a replica the
+// placement takes over: a diskless replica or a TieBreaker witness.
+func isDisklessReplica(flags []string) bool {
+	return slices.Contains(flags, apiv1.ResourceFlagDiskless) ||
+		slices.Contains(flags, apiv1.ResourceFlagTieBreaker)
+}
+
+// takeOverReplicaWrittenMeanwhile settles a create that found a replica
+// of rdName already on pool.NodeName, written after the placement read
+// the definition's replicas. The one writer that does that is the
+// controller's tiebreaker reconciler: it watches the replicas the
+// placement creates one by one, and at the two diskful replicas of a
+// three-replica placement puts a TIE_BREAKER witness on the very node
+// the third one is for. Counting that witness as the replica placed
+// left the definition one diskful replica short, with a witness in its
+// quorum, until a later placement promoted it minutes on. LINSTOR
+// places a diskful replica over a TieBreaker by taking the witness
+// over, as this placer does for a witness it saw before it started, so
+// the replica found here goes through the same promoteWitness, which
+// leaves a diskful one as it is.
+func (s *state) takeOverReplicaWrittenMeanwhile(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
+	return s.promoteWitness(ctx, st, rdName, pool)
 }
 
 // poolKey is the composite (node, pool) lookup key used to find a
@@ -1363,6 +1535,19 @@ func (p *Placer) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 		return nil, errors.Wrap(err, "list nodes")
 	}
 
+	return disabledNodeSet(nodes), nil
+}
+
+// DiskfulReplicaCount is how many of a definition's replicas Place
+// counts toward the place count, given the cluster's nodes. A caller
+// that already holds both can tell from it, without a read of its own,
+// that Place would add no diskful replica.
+func DiskfulReplicaCount(existing []apiv1.Resource, nodes []apiv1.Node) int {
+	return countDiskfulReplicas(existing, disabledNodeSet(nodes))
+}
+
+// disabledNodeSet is disabledNodes over a node list already read.
+func disabledNodeSet(nodes []apiv1.Node) map[string]struct{} {
 	out := make(map[string]struct{}, len(nodes))
 
 	for i := range nodes {
@@ -1375,7 +1560,7 @@ func (p *Placer) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 		}
 	}
 
-	return out, nil
+	return out
 }
 
 // autoplaceExcludedNodes returns the set of nodes that may not host a
@@ -1776,7 +1961,9 @@ const restoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
 // constrainFilterToRestoreSource applies the restore-source BACKEND
 // pin for an RD that was materialised from a snapshot
 // (BlockstorRestoreFromSnapshot prop): candidate pools are pinned to
-// the source replica's ProviderKind. Returns the caller's filter
+// the source replica's ProviderKind, or once the source is gone, the
+// backend of the pool the snapshot records its copies in. Returns the
+// caller's filter
 // untouched when the RD carries no restore marker (the overwhelmingly
 // common case).
 //
@@ -1809,9 +1996,9 @@ const restoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
 // autoplacer's call, and the REST `--node-name` Bug 397 guard already
 // rejects an explicit diskful replica on a snapshot-less node up front.
 //
-// Every lookup is best-effort: when the marker is malformed, the
-// snapshot is gone, or the source has no diskful replica left, the
-// filter passes through unchanged and the regular placement gates
+// Every lookup is best-effort: when the marker is malformed, or neither
+// the source's live replicas nor the snapshot's recorded pools name a
+// backend, the filter passes through unchanged and the regular placement gates
 // apply (satellite-side Bug 397 blank-fallback seeding still protects
 // data integrity in those edge cases).
 func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) *apiv1.AutoSelectFilter {
@@ -1825,12 +2012,7 @@ func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName stri
 		return filter
 	}
 
-	srcRD, _, ok := strings.Cut(stamp, ":")
-	if !ok || srcRD == "" {
-		return filter
-	}
-
-	kind := SourceProviderKind(ctx, p.store, srcRD)
+	kind := RestoreSourceProviderKind(ctx, p.store, stamp)
 	if kind == "" {
 		return filter
 	}
@@ -1841,6 +2023,118 @@ func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName stri
 	out.ProviderList = []string{kind}
 
 	return &out
+}
+
+// RestoreSourceProviderKind is the ProviderKind a replica of a definition
+// restored from stamp (`<srcRD>:<snapName>`) has to be placed on: the
+// backend of the source's live replicas, or, once the source has none
+// left, the backend of the pool the snapshot records holding a copy in.
+// Without that fallback the backend pin disappeared exactly when the
+// source was deleted, and a clone could land on a pool of another backend
+// whose snapshot stream it cannot receive. "" when neither names one.
+func RestoreSourceProviderKind(ctx context.Context, st store.Store, stamp string) string {
+	srcRD, snapName, ok := strings.Cut(stamp, ":")
+	if !ok || srcRD == "" {
+		return ""
+	}
+
+	if kind := SourceProviderKind(ctx, st, srcRD); kind != "" {
+		return kind
+	}
+
+	if snapName == "" {
+		return ""
+	}
+
+	snap, err := st.Snapshots().Get(ctx, srcRD, snapName)
+	if err != nil {
+		return ""
+	}
+
+	for i := range snap.Snapshots {
+		kind := poolProviderKind(ctx, st, snap.Snapshots[i].NodeName, snap.Snapshots[i].StoragePool)
+		if kind != "" {
+			return kind
+		}
+	}
+
+	return ""
+}
+
+// RestoreCopyPools names, per node (keyed by naming.Key), the pool the
+// snapshot behind stamp records holding that node's copy in. A replica
+// placed on such a node is cloned from that copy, so it has to land in
+// that pool: on a node with two pools of one backend another pool holds
+// no snapshot to clone from. Nil when stamp names no snapshot or the
+// snapshot records no pool.
+func RestoreCopyPools(ctx context.Context, st store.Store, stamp string) map[string]string {
+	srcRD, snapName, ok := strings.Cut(stamp, ":")
+	if !ok || srcRD == "" || snapName == "" {
+		return nil
+	}
+
+	snap, err := st.Snapshots().Get(ctx, srcRD, snapName)
+	if err != nil {
+		return nil
+	}
+
+	var pools map[string]string
+
+	for i := range snap.Snapshots {
+		if pool := snap.Snapshots[i].StoragePool; pool != "" {
+			if pools == nil {
+				pools = map[string]string{}
+			}
+
+			pools[naming.Key(snap.Snapshots[i].NodeName)] = pool
+		}
+	}
+
+	return pools
+}
+
+// pinRestoreCopyPools drops, for a definition restored from a snapshot,
+// every candidate pool on a node whose copy the snapshot records in another
+// pool of that node. Nodes without a recorded copy are left to the backend
+// pin.
+func (p *Placer) pinRestoreCopyPools(ctx context.Context, rdName string, candidates []apiv1.StoragePool) []apiv1.StoragePool {
+	rd, err := p.store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return candidates
+	}
+
+	pinned := RestoreCopyPools(ctx, p.store, rd.Props[restoreFromSnapshotProp])
+	if len(pinned) == 0 {
+		return candidates
+	}
+
+	out := make([]apiv1.StoragePool, 0, len(candidates))
+
+	for i := range candidates {
+		pool, ok := pinned[naming.Key(candidates[i].NodeName)]
+		if ok && pool != candidates[i].StoragePoolName {
+			continue
+		}
+
+		out = append(out, candidates[i])
+	}
+
+	return out
+}
+
+// poolProviderKind is the backend of pool on node, or "" when it is not
+// known or is diskless.
+func poolProviderKind(ctx context.Context, st store.Store, node, pool string) string {
+	if pool == "" {
+		return ""
+	}
+
+	sp, err := st.StoragePools().Get(ctx, node, pool)
+	if err != nil || sp.ProviderKind == apiv1.StoragePoolKindDiskless {
+		return ""
+	}
+
+	return sp.ProviderKind
 }
 
 // SourceProviderKind returns the ProviderKind of the pool backing the

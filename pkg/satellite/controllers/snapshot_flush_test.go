@@ -38,7 +38,7 @@ import (
 )
 
 // seedThinResourceWithExec mirrors seedThinResource but also wires
-// `Exec: fx` onto the ReconcilerConfig so FlushBackingDevices'
+// `Exec: fx` onto the ReconcilerConfig so FlushBeforeSuspend's
 // `r.cfg.Exec.Run("blockdev", ...)` actually shells out through
 // the FakeExec the test asserts against. The plain
 // seedThinResource left Exec nil because the pre-flush
@@ -68,29 +68,12 @@ func seedThinResourceWithExec(t *testing.T, fx *storage.FakeExec, resourceName, 
 	return rec
 }
 
-// TestSnapshotReconcileFlushesBackingDeviceBeforeCreate pins the
-// P0 stale-snapshot fix: Phase 2 (TakeSnapshot=true, SuspendIOAcked
-// already stamped) MUST flush the kernel writeback cache to the
-// backing block device BEFORE `provider.CreateSnapshot` fires.
-// Without the flush, in-flight dirty pages sit in the kernel page
-// cache while the storage-layer snapshot is taken, so the snap
-// (and any clone / `zfs send | recv` payload derived from it)
-// carries empty / stale content.
-//
-// Empirical motivation (ZFS-switch stand, 2026-05-23): a 256 KiB
-// urandom payload written through /dev/drbdN showed only ~16 KiB
-// `used` on the post-snapshot ZFS zvol; clone.sh,
-// snapshot-restore-cross-node.sh, snap-ship-cross-node.sh ALL
-// failed with md5 mismatch. The flush forces the writeback layer
-// to drain to the zvol/loop/LV before the snapshot captures it.
-//
-// Asserted shape: `blockdev --flushbufs <devPath>` lands AFTER the
-// FakeExec sees `lvs … pvc-1_00000` (volumeStatus probe) and
-// BEFORE `lvcreate --snapshot`. Storage layer is LVM-thin in this
-// test for parity with the existing Bug-351 Phase-2 test; the
-// production code path is provider-agnostic — VolumeStatus returns
-// the live DevicePath whether the backing is /dev/zvol/...,
-// /dev/loopN (FILE_THIN), or /dev/vg/lv (LVM).
+// TestSnapshotReconcileFlushesBackingDeviceBeforeCreate pins the flush
+// on a satellite without a DRBD layer: nothing is suspended there, so
+// the storage device, which is the top of the stack, is flushed right
+// before `provider.CreateSnapshot`. With DRBD the flush moves in front
+// of suspend-io and targets the DRBD device instead; see
+// TestSnapshotWindowFlushesBeforeSuspendAndNeverWhileSuspended.
 func TestSnapshotReconcileFlushesBackingDeviceBeforeCreate(t *testing.T) {
 	t.Parallel()
 
@@ -102,7 +85,7 @@ func TestSnapshotReconcileFlushesBackingDeviceBeforeCreate(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-1",
