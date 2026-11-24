@@ -155,6 +155,11 @@ type ResourceReconciler struct {
 	// counts Reconcile through it; a test calling Reconcile directly goes
 	// around it.
 	passes *passCounter
+
+	// bringUp ranks the first pass of every local Resource in this
+	// process ahead of every other pass (bringUpQueue). SetupWithManager
+	// creates it.
+	bringUp *bringUpTracker
 	// conflicts retries a pass that lost an optimistic-concurrency
 	// race and counts such races per object.
 	conflicts conflict.Retrier
@@ -252,6 +257,10 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.passes = newPassCounter()
 
+	if r.bringUp == nil {
+		r.bringUp = newBringUpTracker()
+	}
+
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
 			builder.WithPredicates(
@@ -269,7 +278,10 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&blockstoriov1alpha1.ResourceGroup{},
 			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRG))).
 		Named("satellite-resource").
-		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.resourceWorkers()})
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: r.Config.resourceWorkers(),
+			NewQueue:                newBringUpQueueFunc(r.bringUp, mgr.GetControllerOptions().Logger),
+		})
 
 	bldr = r.watchRenderInputs(bldr)
 
@@ -345,6 +357,8 @@ func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Req
 	err := r.Get(ctx, req.NamespacedName, &res)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.bringUp.forget(req.Name)
+
 			return ctrl.Result{}, nil
 		}
 
@@ -357,11 +371,20 @@ func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
+	// From here a pass of the replica counts as its first one, whatever
+	// it ends with, so it gives up the bring-up rank (bringUpTracker).
+	// A pass that only stamps the finalizer does not: the pass it
+	// requeues is the one that brings the replica up.
+	hasFinalizer := slices.Contains(res.Finalizers, SatelliteResourceFinalizer)
+	if hasFinalizer || !res.DeletionTimestamp.IsZero() {
+		r.bringUp.start(res.Name)
+	}
+
 	if !res.DeletionTimestamp.IsZero() {
 		return r.handleDelete(ctx, &res)
 	}
 
-	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
+	if !hasFinalizer {
 		res.Finalizers = append(res.Finalizers, SatelliteResourceFinalizer)
 
 		err := r.Update(ctx, &res)
