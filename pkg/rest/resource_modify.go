@@ -22,6 +22,7 @@ import (
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 )
 
 // registerResourceModify wires `PUT /v1/resource-definitions/{rd}/resources/{node}`
@@ -65,6 +66,10 @@ func (s *Server) handleResourceModify(w http.ResponseWriter, r *http.Request) {
 	var patch apiv1.ResourceModify
 
 	if !decodeJSON(w, r, &patch) {
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.Resource, patch.OverrideProps) {
 		return
 	}
 

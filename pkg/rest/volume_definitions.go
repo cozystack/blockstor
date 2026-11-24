@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
@@ -343,6 +344,10 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	if sizeErr != nil {
 		writeVDSizeRejection(w, rd, vd.VolumeNumber, vd.SizeKib, sizeErr)
 
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, vd.Props) {
 		return
 	}
 
@@ -723,6 +728,11 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, patch.OverrideProps) ||
+		refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, patch.Props) {
+		return
+	}
+
 	// Bug 204b: route the merge-write through PatchVolumeDefinitionSpec
 	// so the modify delta is re-applied to the freshly-fetched VD on
 	// every retry. The previous `Get → mutate → Update` path's retry
@@ -1092,6 +1102,12 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	// after a rejected DELETE would be a worse failure mode than the
 	// bug itself.
 	if !force && s.refuseVDDeleteIfReferenced(w, r, rd, vn) {
+		return
+	}
+
+	// LINSTOR's ZFS delete strategy applies to a volume definition delete
+	// as to a replica's.
+	if s.refuseZFSDeleteStrategy(w, r, rd) {
 		return
 	}
 

@@ -94,7 +94,7 @@ func TestPrunedSlotIsForgottenAfterDelPeer(t *testing.T) {
 	slot := &drbd.KernelSlot{Name: "n2", NodeID: 1, ConnectionState: "StandAlone"}
 	devices := map[int32]string{0: "/dev/vg/pvc-fp_00000"}
 
-	if err := rec.teardownKernelSlot(context.Background(), "pvc-fp", slot, devices, logr.Discard()); err != nil {
+	if err := rec.teardownKernelSlot(context.Background(), "pvc-fp", slot, mayHoldPeerSlots(devices), logr.Discard()); err != nil {
 		t.Fatalf("teardownKernelSlot: %v", err)
 	}
 
@@ -131,7 +131,7 @@ func TestADisklessReplicaForgetsNoPeer(t *testing.T) {
 	}
 
 	slot := &drbd.KernelSlot{Name: "n3", NodeID: 2, ConnectionState: "StandAlone"}
-	if err := rec.teardownKernelSlot(context.Background(), "pvc-fp", slot, diskless, logr.Discard()); err != nil {
+	if err := rec.teardownKernelSlot(context.Background(), "pvc-fp", slot, mayHoldPeerSlots(diskless), logr.Discard()); err != nil {
 		t.Fatalf("teardownKernelSlot: %v", err)
 	}
 

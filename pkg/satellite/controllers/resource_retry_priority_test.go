@@ -23,7 +23,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -57,6 +59,13 @@ func TestRetriesRunAtNormalPriority(t *testing.T) {
 		"error": {
 			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				return errTransientRead
+			},
+		},
+		// A pass that lost a write race is retried by the conflict
+		// Retrier, whose Result names no priority of its own.
+		"conflict": {
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				return apierrors.NewConflict(schema.GroupResource{Resource: "resources"}, key.Name, errTransientRead)
 			},
 		},
 	}
