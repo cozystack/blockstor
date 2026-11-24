@@ -155,9 +155,16 @@ type DesiredResource struct {
 
 	// PeerSlots is the replica's DRBD peer-slot count, the count its
 	// metadata is created with and its lower disk is sized for. nil is
-	// a replica blockstor created before it recorded one, which was
-	// created with 15 (drbd.EffectivePeerSlots reads it so).
+	// a replica created before blockstor recorded one, read as 15
+	// (drbd.EffectivePeerSlots) until its superblock says otherwise.
 	PeerSlots *int32
+
+	// ReadMetadataPeerSlots asks for the peer-slot count of the
+	// replica's superblock: a diskful replica created before counts
+	// were recorded, by blockstor with 15 or by LINSTOR with its own,
+	// whose count nobody has read yet. The apply result carries it
+	// back (ResourceApplyResult.MetadataPeerSlots).
+	ReadMetadataPeerSlots bool
 
 	// Deleting is true when this replica or its definition is on its way
 	// out: either carries a deletion timestamp, the replica is flagged
@@ -392,6 +399,16 @@ func (x *DesiredResource) GetPeerSlots() *int32 {
 	return x.PeerSlots
 }
 
+// GetReadMetadataPeerSlots reports whether the apply is to read the
+// peer-slot count of the replica's superblock. Nil-safe.
+func (x *DesiredResource) GetReadMetadataPeerSlots() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.ReadMetadataPeerSlots
+}
+
 // DesiredVolume describes one of an RD's volumes from the apply
 // payload's perspective: which volume number, what size, which
 // pool to provision on, and (Phase 8.1) the GI seed an existing
@@ -600,6 +617,22 @@ type ResourceApplyResult struct {
 	// yet, typically because a peer's backing has not grown: the pass
 	// is to be repeated so the size applied is reported once it has.
 	GrowPending bool
+
+	// MetadataPeerSlots is the peer-slot count the replica's superblock
+	// holds, the least over its volumes, when the apply was asked for
+	// it (DesiredResource.ReadMetadataPeerSlots) and could read it;
+	// zero otherwise.
+	MetadataPeerSlots int32
+}
+
+// GetMetadataPeerSlots returns the superblock's peer-slot count the
+// apply read, or 0.
+func (x *ResourceApplyResult) GetMetadataPeerSlots() int32 {
+	if x == nil {
+		return 0
+	}
+
+	return x.MetadataPeerSlots
 }
 
 // GetGrowPending reports a volume whose grow has not reached its device.

@@ -136,6 +136,13 @@ func (r *ResourceReconciler) allocateDRBDIDsIfUsed(
 		return ctrl.Result{}, true, err
 	}
 
+	// A definition adopted or created before counts were recorded gets
+	// one once its replicas have told theirs.
+	err = r.recordDefinitionPeerSlots(ctx, target.Spec.ResourceDefinitionName)
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+
 	if allocated {
 		return ctrl.Result{Requeue: true}, true, nil
 	}

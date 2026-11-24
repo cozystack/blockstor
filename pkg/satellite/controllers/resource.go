@@ -1101,6 +1101,38 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	if err != nil {
 		logger.Error(err, "record apply failure")
 	}
+
+	err = r.recordMetadataPeerSlots(ctx, res, results)
+	if err != nil {
+		logger.Error(err, "record the superblock's peer slots")
+	}
+}
+
+// recordMetadataPeerSlots publishes the peer-slot count the pass read
+// from the replica's superblock (Status.MetadataPeerSlots), for the
+// controller to record as the replica's count. Written once: a value
+// already there is the one the superblock holds.
+func (r *ResourceReconciler) recordMetadataPeerSlots(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult,
+) error {
+	if len(results) == 0 || res.Status.MetadataPeerSlots != nil {
+		return nil
+	}
+
+	slots := results[0].GetMetadataPeerSlots()
+	if slots == 0 {
+		return nil
+	}
+
+	base := res.DeepCopy()
+	res.Status.MetadataPeerSlots = &slots
+
+	err := r.Status().Patch(ctx, res, client.MergeFrom(base))
+	if err != nil {
+		return errors.Wrap(err, "patch Status.MetadataPeerSlots")
+	}
+
+	return nil
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the

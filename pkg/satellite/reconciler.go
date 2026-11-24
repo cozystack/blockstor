@@ -1165,7 +1165,56 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 
 	res.Volumes, res.GrowPending = r.buildVolumeResults(ctx, dr, devices, diskless, withDRBD)
 
+	if withDRBD && !diskless && !res.GrowPending {
+		res.MetadataPeerSlots = r.superblockPeerSlots(ctx, dr)
+	}
+
 	return res
+}
+
+// superblockPeerSlots reads the peer-slot count of the replica's
+// superblock when the controller asks for it: a replica created before
+// counts were recorded, whose metadata blockstor created with 15 or
+// LINSTOR with its definition's count, 7 by default, before it was
+// adopted. Reading it is the only way to tell the two apart; the
+// controller records what it reads, so the read is done once.
+//
+// The least count over the volumes is the one the replica can serve.
+// Zero when any volume cannot be read, to be asked again on a later
+// pass, and on a pass that grows a volume: dump-md is kept off a device
+// in the middle of a resize (BUG-048).
+func (r *Reconciler) superblockPeerSlots(ctx context.Context, dr *intent.DesiredResource) int32 {
+	if !dr.GetReadMetadataPeerSlots() || len(dr.GetVolumes()) == 0 {
+		return 0
+	}
+
+	var least int32
+
+	for _, vol := range dr.GetVolumes() {
+		if vol.GetAppliedSizeKib() > 0 && vol.GetSizeKib() > vol.GetAppliedSizeKib() {
+			return 0
+		}
+
+		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
+
+		found, err := r.cfg.Adm.MetadataGeometry(ctx, target)
+		if err != nil {
+			log.FromContext(ctx).V(1).Info("cannot read the peer slots of the superblock yet", "volume", target, "error", err.Error())
+
+			return 0
+		}
+
+		slots, ok := drbd.PeerSlotCount(found.MaxPeers)
+		if !ok {
+			return 0
+		}
+
+		if least == 0 || slots < least {
+			least = slots
+		}
+	}
+
+	return least
 }
 
 // maybeLUKS conditionally layers cryptsetup over the raw storage

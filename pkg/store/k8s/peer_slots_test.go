@@ -179,3 +179,37 @@ func TestReplicaThatPredatesTheRecordReadsFifteen(t *testing.T) {
 		t.Errorf("got %d, want 15", got.PeerSlots)
 	}
 }
+
+// A replica adopted from LINSTOR by a linstor-migrate older than the
+// count reads as the count its superblock holds once its satellite read
+// it, on the wire and on its DRBD layer, as LINSTOR reported it, and as
+// 15 no longer: the peer-slot check counts it so.
+func TestReplicaThatPredatesTheRecordReadsItsSuperblock(t *testing.T) {
+	t.Parallel()
+
+	nodeID, seven := int32(1), int32(7)
+	res := &crdv1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-a.n1"},
+		Spec: crdv1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-a",
+			NodeName:               "n1",
+			DRBDNodeID:             &nodeID,
+		},
+		Status: crdv1alpha1.ResourceStatus{MetadataPeerSlots: &seven},
+	}
+
+	st, _ := peerSlotsStore(t, res)
+
+	got, err := st.Resources().Get(t.Context(), "pvc-a", "n1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if got.PeerSlots != 7 {
+		t.Errorf("wire: got %d, want 7", got.PeerSlots)
+	}
+
+	if got.LayerObject == nil || got.LayerObject.Drbd == nil || got.LayerObject.Drbd.PeerSlots != 7 {
+		t.Errorf("DRBD layer: got %+v, want peer_slots 7", got.LayerObject)
+	}
+}

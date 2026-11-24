@@ -236,9 +236,11 @@ type ResourceSpec struct {
 	// definition's count to each replica it creates, so changing the
 	// definition's count later leaves the replicas already there alone.
 	//
-	// Unset means a replica created before blockstor recorded a count,
-	// which was created with 15; the satellite reads it so. Settable
-	// once: the metadata on disk does not change with it.
+	// Unset means a replica created before blockstor recorded a count:
+	// by blockstor with 15, or by LINSTOR, whose count only the
+	// superblock tells (status.metadataPeerSlots). The controller
+	// records it from there. Settable once: the metadata on disk does
+	// not change with it.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=31
@@ -391,6 +393,18 @@ type ResourceStatus struct {
 	// Status keep working during the migration window.
 	// +optional
 	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
+
+	// metadataPeerSlots is the peer-slot count the replica's DRBD
+	// metadata holds, read once from its superblock by the satellite
+	// for a diskful replica whose spec.peerSlots was never recorded.
+	// Such a replica was created before blockstor recorded counts: by
+	// blockstor with 15, or by LINSTOR with its definition's count,
+	// 7 by default, when it was adopted. The controller records this
+	// value as spec.peerSlots, never a guess.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=31
+	MetadataPeerSlots *int32 `json:"metadataPeerSlots,omitempty"`
 
 	// volumes is the per-volume runtime state reported by the satellite.
 	// +listType=map
@@ -753,10 +767,11 @@ type ResourceList struct {
 }
 
 // PeerSlotsPredateRecord reports a replica that got its DRBD node id
-// before blockstor recorded its peer slots: such a replica's metadata was
-// created with 15, whatever its definition's count is now. A new replica
-// gets its count in the same write as its node id, so it never has one
-// without the other.
+// before blockstor recorded its peer slots: its metadata was created by a
+// blockstor that kept no count, with 15, or by LINSTOR, with the count of
+// its definition there, and only its superblock says which
+// (Status.MetadataPeerSlots). A new replica gets its count in the same
+// write as its node id, so it never has one without the other.
 func (r *Resource) PeerSlotsPredateRecord() bool {
 	return r.Spec.PeerSlots == nil && (r.Spec.DRBDNodeID != nil || r.Status.DRBDNodeID != nil)
 }

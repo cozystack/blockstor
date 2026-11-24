@@ -365,7 +365,11 @@ spec:
                   replicas created afterwards.
 
                   Unset means a definition created before blockstor recorded a
-                  count, whose replicas were all created with 15; it is read as 15.
+                  count: by blockstor, whose replicas have 15, or by LINSTOR before
+                  an older linstor-migrate adopted it, whose replicas have
+                  LINSTOR's count. The controller records the least count the
+                  superblocks of its replicas with a disk hold once all of them
+                  have told it; until then it is read as 15.
                 format: int32
                 maximum: 31
                 minimum: 1

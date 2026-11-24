@@ -1244,6 +1244,11 @@ func (in *ResourceStatus) DeepCopyInto(out *ResourceStatus) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.MetadataPeerSlots != nil {
+		in, out := &in.MetadataPeerSlots, &out.MetadataPeerSlots
+		*out = new(int32)
+		**out = **in
+	}
 	if in.Volumes != nil {
 		in, out := &in.Volumes, &out.Volumes
 		*out = make([]ResourceVolumeStatus, len(*in))

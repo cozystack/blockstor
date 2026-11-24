@@ -719,18 +719,23 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 }
 
 // peerSlotsOf is a replica's peer-slot count on the wire: the recorded
-// one, 15 for a replica that had a node id before counts were recorded,
+// one; for a replica that had a node id before counts were recorded, the
+// count its superblock holds once its satellite read it, 15 until then;
 // zero for a new replica not stamped yet.
 func peerSlotsOf(crd *crdv1alpha1.Resource) int32 {
-	if crd.PeerSlotsPredateRecord() {
-		return drbd.LegacyPeerSlots
+	if crd.Spec.PeerSlots != nil {
+		return *crd.Spec.PeerSlots
 	}
 
-	if crd.Spec.PeerSlots == nil {
+	if !crd.PeerSlotsPredateRecord() {
 		return 0
 	}
 
-	return *crd.Spec.PeerSlots
+	if crd.Status.MetadataPeerSlots != nil {
+		return *crd.Status.MetadataPeerSlots
+	}
+
+	return drbd.LegacyPeerSlots
 }
 
 // applyFailureFromStatus projects the satellite's last apply error onto
@@ -942,13 +947,15 @@ func layerObjectFromCRD(crd *crdv1alpha1.Resource) *apiv1.ResourceLayer {
 	if top.Type == apiv1.LayerKindDRBD {
 		top.Drbd = drbdLayerFromStatus(&crd.Status)
 
-		// LINSTOR reports the replica's peer slots on its DRBD layer;
-		// one without a recorded count was created with 15.
+		// LINSTOR reports the replica's peer slots on its DRBD layer.
 		if top.Drbd == nil {
 			top.Drbd = &apiv1.DrbdResourceLayer{}
 		}
 
-		top.Drbd.PeerSlots = drbd.EffectivePeerSlots(crd.Spec.PeerSlots)
+		top.Drbd.PeerSlots = peerSlotsOf(crd)
+		if top.Drbd.PeerSlots == 0 {
+			top.Drbd.PeerSlots = drbd.LegacyPeerSlots
+		}
 	}
 
 	// Hydrate the STORAGE leaf for diskful replicas — F19 keeps the

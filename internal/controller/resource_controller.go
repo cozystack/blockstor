@@ -747,6 +747,12 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 
 		return inner
 	})
+	if cerrors.Is(err, errAwaitingPeerSlots) {
+		ctrl.LoggerFrom(ctx).V(1).Info("a new replica waits for the peer slots its definition's replicas hold", "resource", target.Name)
+
+		return false, nil
+	}
+
 	if err != nil {
 		return false, cerrors.Wrap(err, "allocate DRBD ids")
 	}
@@ -1004,7 +1010,19 @@ func (r *ResourceReconciler) allocateResourceSpecFields(
 ) error {
 	// Read before a node id is allocated below: one allocated now comes
 	// with the definition's count, one already there predates the record.
-	predatesPeerSlots := target.PeerSlotsPredateRecord()
+	// Decided before the node id too: a new replica that has to wait for
+	// its count gets neither, since the satellite builds a replica with a
+	// node id and no count as one created with 15.
+	var peerSlots *int32
+
+	if target.Spec.PeerSlots == nil {
+		var err error
+
+		peerSlots, err = r.peerSlotsToStamp(ctx, target, rd, target.PeerSlotsPredateRecord())
+		if err != nil {
+			return err
+		}
+	}
 
 	if target.Spec.DRBDNodeID == nil {
 		id, err := r.allocateNodeIDLocked(ctx, target)
@@ -1044,32 +1062,14 @@ func (r *ResourceReconciler) allocateResourceSpecFields(
 	// copies DrbdRscDfnData.peerSlots onto each DrbdRscData it creates,
 	// so a later `rd modify --peer-slots` leaves this replica's metadata
 	// and sizing alone. Stamped in the same patch as the node id, which
-	// the satellite waits for before it creates anything. A replica of a
-	// definition without a count, or one that had a node id before counts
-	// were recorded, was created with 15 and is stamped so, which is what
-	// the satellite already reads for it. Set-if-nil.
+	// the satellite waits for before it creates anything; a replica that
+	// had a node id before counts were recorded gets the count its
+	// superblock holds (peerSlotsToStamp). Set-if-nil.
 	if target.Spec.PeerSlots == nil {
-		target.Spec.PeerSlots = stampedPeerSlots(rd, predatesPeerSlots)
+		target.Spec.PeerSlots = peerSlots
 	}
 
 	return nil
-}
-
-// stampedPeerSlots is the count a replica without one is stamped with,
-// nil while its definition is not readable.
-func stampedPeerSlots(rd *blockstoriov1alpha1.ResourceDefinition, predatesRecord bool) *int32 {
-	var v int32
-
-	switch {
-	case predatesRecord:
-		v = drbd.LegacyPeerSlots
-	case rd != nil:
-		v = drbd.EffectivePeerSlots(rd.Spec.PeerSlots)
-	default:
-		return nil
-	}
-
-	return &v
 }
 
 // mirrorIdentitiesToStatus copies the authoritative Spec identities

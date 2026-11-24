@@ -28,9 +28,10 @@ import (
 // new replica the controller has not stamped yet gets its definition's,
 // which is what the controller stamps; one whose definition has none
 // either, or one that already had a node id before the count was
-// recorded, is left without, which the satellite reads as the 15 it was
-// created with. A count changed on the definition does not reach a
-// replica that has its own.
+// recorded, gets the count its superblock holds once its satellite read
+// it, and is left without until then, which the satellite reads as 15.
+// A count changed on the definition does not reach a replica that has
+// its own.
 func TestReplicaPeerSlots(t *testing.T) {
 	t.Parallel()
 
@@ -38,10 +39,11 @@ func TestReplicaPeerSlots(t *testing.T) {
 
 	for name, tc := range map[string]struct {
 		replica, definition *int32
-		nodeID              *int32
+		nodeID, metadata    *int32
 		want                *int32
 	}{
-		"predates the record":                {definition: ptr(7), nodeID: ptr(0)},
+		"predates the record":                {definition: ptr(15), nodeID: ptr(0)},
+		"predates the record, read":          {definition: ptr(15), nodeID: ptr(0), metadata: ptr(7), want: ptr(7)},
 		"replica's own":                      {replica: ptr(7), definition: ptr(12), want: ptr(7)},
 		"definition's before stamp":          {definition: ptr(12), want: ptr(12)},
 		"neither":                            {},
@@ -53,6 +55,7 @@ func TestReplicaPeerSlots(t *testing.T) {
 			target := &blockstoriov1alpha1.Resource{}
 			target.Spec.PeerSlots = tc.replica
 			target.Spec.DRBDNodeID = tc.nodeID
+			target.Status.MetadataPeerSlots = tc.metadata
 
 			rd := &blockstoriov1alpha1.ResourceDefinition{}
 			rd.Spec.PeerSlots = tc.definition
@@ -68,6 +71,45 @@ func TestReplicaPeerSlots(t *testing.T) {
 
 			if got != nil && got == tc.replica {
 				t.Errorf("the payload aliases the replica's spec")
+			}
+		})
+	}
+}
+
+// TestReadMetadataPeerSlots: the satellite is asked to read the count of
+// the superblock of a diskful replica that predates the record and whose
+// count nobody read yet, and of no other.
+func TestReadMetadataPeerSlots(t *testing.T) {
+	t.Parallel()
+
+	ptr := func(v int32) *int32 { return &v }
+
+	for name, tc := range map[string]struct {
+		replica, nodeID, metadata *int32
+		flags                     []string
+		want                      bool
+	}{
+		"predates the record":       {nodeID: ptr(0), want: true},
+		"read already":              {nodeID: ptr(0), metadata: ptr(7)},
+		"recorded":                  {nodeID: ptr(0), replica: ptr(7)},
+		"new":                       {},
+		"diskless":                  {nodeID: ptr(0), flags: []string{"DISKLESS"}},
+		"tiebreaker":                {nodeID: ptr(0), flags: []string{"DISKLESS", "TIE_BREAKER"}},
+		"predates, has a disk flag": {nodeID: ptr(0), flags: []string{"INACTIVE"}, want: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			target := &blockstoriov1alpha1.Resource{}
+			target.Spec.PeerSlots = tc.replica
+			target.Spec.DRBDNodeID = tc.nodeID
+			target.Spec.Flags = tc.flags
+			target.Status.MetadataPeerSlots = tc.metadata
+
+			got := assembleDesired(target, nil, &blockstoriov1alpha1.ResourceDefinition{}, nil, map[string]string{}, nil).
+				GetReadMetadataPeerSlots()
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
 	}

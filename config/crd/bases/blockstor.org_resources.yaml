@@ -323,9 +323,11 @@ spec:
                   definition's count to each replica it creates, so changing the
                   definition's count later leaves the replicas already there alone.
 
-                  Unset means a replica created before blockstor recorded a count,
-                  which was created with 15; the satellite reads it so. Settable
-                  once: the metadata on disk does not change with it.
+                  Unset means a replica created before blockstor recorded a count:
+                  by blockstor with 15, or by LINSTOR, whose count only the
+                  superblock tells (status.metadataPeerSlots). The controller
+                  records it from there. Settable once: the metadata on disk does
+                  not change with it.
                 format: int32
                 maximum: 31
                 minimum: 1
@@ -774,6 +776,19 @@ spec:
                   from the same frames, published upstream as
                   `layer_object.drbd.may_promote`. Unset until observed.
                 type: boolean
+              metadataPeerSlots:
+                description: |-
+                  metadataPeerSlots is the peer-slot count the replica's DRBD
+                  metadata holds, read once from its superblock by the satellite
+                  for a diskful replica whose spec.peerSlots was never recorded.
+                  Such a replica was created before blockstor recorded counts: by
+                  blockstor with 15, or by LINSTOR with its definition's count,
+                  7 by default, when it was adopted. The controller records this
+                  value as spec.peerSlots, never a guess.
+                format: int32
+                maximum: 31
+                minimum: 1
+                type: integer
               promotionScore:
                 description: |-
                   promotionScore is the kernel-reported DRBD-9 promotion score of

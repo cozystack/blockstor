@@ -268,6 +268,11 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		// no skip, true → skip.
 		SkipInitialSync: copyBoolPtr(target.Spec.SkipInitialSync),
 		PeerSlots:       replicaPeerSlots(target, rd),
+		// A replica with no count recorded and none read yet has its
+		// superblock read, so the controller records the count it was
+		// created with rather than guess 15.
+		ReadMetadataPeerSlots: target.PeerSlotsPredateRecord() && target.Status.MetadataPeerSlots == nil &&
+			!isDisklessFlags(target.Spec.Flags),
 		// The satellite's solo-promote reads these two to stay inside
 		// LINSTOR's case: never promote a replica that is being deleted,
 		// and never one whose definition has another diskful replica.
@@ -280,12 +285,19 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 // created with and its lower disk sized for: the replica's own, which
 // the controller copies from the definition when it allocates the
 // replica's identities, else the definition's, which is what the
-// controller is about to copy. nil, for a replica that had a node id
-// before counts were recorded or whose definition has none either, is
-// read as the 15 it was created with.
+// controller is about to copy. A replica that had a node id before
+// counts were recorded has the count its superblock holds; nil, for one
+// whose superblock was not read yet or a definition with no count, is
+// read as 15.
 func replicaPeerSlots(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) *int32 {
 	slots := target.Spec.PeerSlots
-	if slots == nil && rd != nil && !target.PeerSlotsPredateRecord() {
+
+	switch {
+	case target.PeerSlotsPredateRecord():
+		// The count its superblock holds, once read, until the
+		// controller records it.
+		slots = target.Status.MetadataPeerSlots
+	case slots == nil && rd != nil:
 		slots = rd.Spec.PeerSlots
 	}
 
@@ -322,14 +334,18 @@ func anyOtherDiskfulReplica(target *blockstoriov1alpha1.Resource, peers []blocks
 			continue
 		}
 
-		flags := peers[i].Spec.Flags
-		if !slices.Contains(flags, apiv1.ResourceFlagDiskless) &&
-			!slices.Contains(flags, apiv1.ResourceFlagTieBreaker) {
+		if !isDisklessFlags(peers[i].Spec.Flags) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// isDisklessFlags reports a replica that keeps no disk: DISKLESS, or a
+// TIE_BREAKER witness.
+func isDisklessFlags(flags []string) bool {
+	return slices.Contains(flags, apiv1.ResourceFlagDiskless) || slices.Contains(flags, apiv1.ResourceFlagTieBreaker)
 }
 
 // copyBoolPtr returns a fresh copy of a *bool so the DesiredResource

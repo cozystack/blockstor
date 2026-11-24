@@ -90,6 +90,16 @@ func ValidatePeerSlots(n int64) error {
 	return nil
 }
 
+// PeerSlotCount returns n as a peer-slot count, false for a count no
+// superblock holds.
+func PeerSlotCount(n int) (int32, bool) {
+	if n < 1 || n > MaxPeerSlots {
+		return 0, false
+	}
+
+	return int32(n), true
+}
+
 // ParsePeerSlotsProp reads a PeerSlotsNewResource value. LINSTOR parses
 // it as a number and fails the creation on anything else.
 func ParsePeerSlotsProp(value string) (int32, error) {
