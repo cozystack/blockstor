@@ -40,9 +40,12 @@ const snapshotFlagSuccessful = "SUCCESSFUL"
 // on each of n1 and n2. An auto-snapshot is taken on the definition's
 // diskful replicas, and a tick for a definition without one is skipped.
 func withCadenceReplicas(rd *blockstoriov1alpha1.ResourceDefinition) []client.Object {
-	objs := []client.Object{rd}
+	nodes := []string{"n1", "n2"}
 
-	for _, node := range []string{"n1", "n2"} {
+	objs := make([]client.Object, 0, 1+len(nodes))
+	objs = append(objs, rd)
+
+	for _, node := range nodes {
 		objs = append(objs, &blockstoriov1alpha1.Resource{
 			ObjectMeta: metav1.ObjectMeta{Name: rd.Name + "." + node},
 			Spec: blockstoriov1alpha1.ResourceSpec{
