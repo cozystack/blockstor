@@ -1,0 +1,40 @@
+name: rd-sp-unwhitelisted-drbd-option-rejected
+description: |
+  `rd sp` of a DrbdOptions key LINSTOR's whitelist does not list, or of a
+  value its rule refuses, is rejected with FAIL_INVLD_PROP and stores
+  nothing, as LINSTOR does.
+
+  Before the check the typo DrbdOptions/AutoSnapshot/Keep was stored, every
+  satellite rendered it into the .res, drbdadm refused the file and each
+  replica reported ApplyFailed until the key was deleted. That nothing was
+  stored is asserted at the L6 layer in
+  tests/e2e/cli-matrix/rd-sp-unwhitelisted-drbd-option-rejected.sh, which
+  reads the RD's properties back.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: whitelist-rd
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: unknown-section-rejected
+    cmd: ["resource-definition", "set-property", "{{rd}}", "DrbdOptions/AutoSnapshot/Keep", "2"]
+    expect_exit: [1, 10]
+  - name: invalid-value-rejected
+    cmd: ["resource-definition", "set-property", "{{rd}}", "DrbdOptions/Resource/quorum-minimum-redundancy", "bogus"]
+    expect_exit: [1, 10]
+  - name: whitelisted-option-accepted
+    cmd: ["resource-definition", "set-property", "{{rd}}", "DrbdOptions/Resource/on-no-quorum", "suspend-io"]
+    expect_exit: 0
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
