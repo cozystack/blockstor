@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -47,6 +48,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -58,7 +60,7 @@ import (
 // code stay so the controller strips the legacy finalizer off
 // any Resource that still carries it (rolling upgrade case);
 // the controller no longer stamps it on new Resources.
-const resourceFinalizer = "blockstor.org/resource"
+const resourceFinalizer = finalizers.LegacyResource
 
 // Raw-merge-patch key/kind literals, factored out so the several
 // raw-merge-patch helpers in this file share one spelling (goconst).
@@ -108,6 +110,10 @@ type ResourceReconciler struct {
 	// nodeID off the cache and pick the same lowest-free value.
 	// Wired from `mgr.GetAPIReader()` in SetupWithManager.
 	APIReader client.Reader
+
+	// Recorder raises the Warning Event for a replica whose pool needs a
+	// larger block size than its volume definition may take. Optional.
+	Recorder events.EventRecorder
 
 	// allocMu serialises DRBD-ID allocation across replicas of the
 	// same RD. APIReader bypasses the informer cache but doesn't
@@ -295,17 +301,24 @@ func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 		return result, err
 	}
 
-	return r.runApply(ctx, &target)
+	// A freeze that fails is retried, but does not hold up the rest of
+	// the replica's housekeeping: the stamp only stops a later size
+	// change, and an in-use replica whose freeze keeps being refused
+	// still needs its apply.
+	freezeErr := r.freezeBlockSize(ctx, &target)
+
+	result, err = r.runApply(ctx, &target)
+	if freezeErr != nil {
+		return ctrl.Result{}, cerrors.Join(err, freezeErr)
+	}
+
+	return result, err
 }
 
-// satelliteResourceFinalizer mirrors the
-// `pkg/satellite/controllers.SatelliteResourceFinalizer` constant
-// without an import — the satellite package imports
-// `internal/controller` for shared helpers, so the reverse direction
-// is forbidden to avoid a cycle. Duplicating one string is the
-// pragmatic fix; a rename on either side breaks compile here via the
-// related tests, which reference the same literal.
-const satelliteResourceFinalizer = "blockstor.org/satellite-resource"
+// satelliteResourceFinalizer is the satellite's replica finalizer, shared
+// through pkg/finalizers: the satellite package imports
+// `internal/controller`, so the constant cannot come from there.
+const satelliteResourceFinalizer = finalizers.SatelliteResource
 
 // handleOrphan checks whether the Resource's parent ResourceDefinition
 // CRD still exists. When the RD is gone — the kubectl-cascade-orphan
@@ -2364,6 +2377,14 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.APIReader = mgr.GetAPIReader()
 	}
 
+	// The block size this reconciler writes for a new replica is dropped
+	// with the definition's last replica; the two halves of the rule are
+	// wired together.
+	err := (&BlockSizeReleaseReconciler{Client: r.Client, APIReader: r.APIReader, Lock: r.rdAllocMu}).SetupWithManager(mgr)
+	if err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
 			builder.WithPredicates(resourceChangedPredicate())).
@@ -2431,7 +2452,9 @@ func resourceUpdateCarriesChange(oldObj, newObj client.Object) bool {
 // one on first use. Different RDs see different mutexes so they
 // allocate in parallel; replicas of the same RD serialise.
 func (r *ResourceReconciler) rdAllocMu(rdName string) *sync.Mutex {
-	loaded, _ := r.allocMu.LoadOrStore(rdName, &sync.Mutex{})
+	// Keyed by the folded name: replicas spell their definition as it
+	// was given, and the block size release only has the CR name.
+	loaded, _ := r.allocMu.LoadOrStore(naming.Key(rdName), &sync.Mutex{})
 
 	muTyped, _ := loaded.(*sync.Mutex)
 

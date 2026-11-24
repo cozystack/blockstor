@@ -34,11 +34,15 @@ func assertTargetUntouched(t *testing.T, st store.Store, target string) {
 	}
 }
 
-// A restore puts the source's bytes under the target's stack. A layer the
-// source did not have writes its own metadata across them, and one it had is
-// missing on read; through linstor-csi this is a VolumeSnapshot restored into
-// a PVC of another StorageClass.
-func TestSnapshotRestoreRefusesAPreparedTargetOfAnotherLayerStack(t *testing.T) {
+// A VolumeSnapshot restored into a PVC of another StorageClass reaches the
+// server as a target created with that class's layer list. LINSTOR builds the
+// restored resource from the snapshot's layer data, not from the target's
+// list, so the bytes come back through the layers they were written under; a
+// target given its own list instead would have a layer the source did not
+// have write its metadata across them, or miss one it had on read. The target
+// takes the source's stack and the restore goes through, the way Velero's data
+// mover needs it for a replicated volume restored into a storage-only class.
+func TestSnapshotRestoreGivesAPreparedTargetOfAnotherLayerStackTheSourceStack(t *testing.T) {
 	t.Parallel()
 
 	luks := []string{"DRBD", "LUKS", "STORAGE"}
@@ -47,6 +51,7 @@ func TestSnapshotRestoreRefusesAPreparedTargetOfAnotherLayerStack(t *testing.T) 
 		name          string
 		source, class []string
 	}{
+		{name: "drbd-source-into-storage-only", class: []string{"STORAGE"}},
 		{name: "plaintext-source-into-luks", class: luks},
 		{name: "luks-source-into-plaintext", source: luks},
 	} {
@@ -65,11 +70,20 @@ func TestSnapshotRestoreRefusesAPreparedTargetOfAnotherLayerStack(t *testing.T) 
 
 			if code := restoreOnce(t, base, "src-layers", "snap-layers", map[string]any{
 				"to_resource": "pvc-layers", "nodes": []string{"node-a"},
-			}); code != http.StatusConflict {
-				t.Errorf("restore into a target of another layer stack = %d, want 409", code)
+			}); code != http.StatusCreated {
+				t.Fatalf("restore into a target of another layer stack = %d, want 201", code)
 			}
 
-			assertTargetUntouched(t, st, "pvc-layers")
+			want := tc.source
+			if len(want) == 0 {
+				want = apiv1.DefaultLayerStack()
+			}
+
+			assertStack(t, st, "pvc-layers", want)
+
+			if _, err := st.Resources().Get(t.Context(), "pvc-layers", "node-a"); err != nil {
+				t.Errorf("the restored replica on node-a: %v", err)
+			}
 		})
 	}
 }

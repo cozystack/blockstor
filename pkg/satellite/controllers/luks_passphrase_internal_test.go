@@ -48,7 +48,8 @@ func newPassphraseTestReconciler(t *testing.T, objs ...client.Object) *ResourceR
 		t.Fatalf("blockstor to scheme: %v", err)
 	}
 
-	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).Build()
 
 	return &ResourceReconciler{
 		Client: cli,

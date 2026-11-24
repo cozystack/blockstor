@@ -1316,12 +1316,18 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// Before that, the reachable satellites tear their replicas down, as
 	// LINSTOR waits for them, so a create of the same name that follows
 	// is not refused over them (waitForOnlineReplicasDrained).
-	s.waitForRDTeardown(r.Context(), name)
+	converged := s.waitForRDTeardown(r.Context(), name)
 
 	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
 	}}
+	if !converged {
+		if pending := s.replicasStillDeleting(r.Context(), name); len(pending) > 0 {
+			answer = append(answer, deleteInProgress(name, pending))
+		}
+	}
+
 	if reaped != nil {
 		answer = append(answer, *reaped)
 	}

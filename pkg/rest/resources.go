@@ -46,6 +46,8 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.forgetStaleReplicas(r.Context(), resList)
+
 	// Optional filters. Two wire dialects in the wild:
 	//   - golinstor (csi side): comma-joined `?nodes=a,b`
 	//   - python-linstor CLI:   repeat-key `?nodes=a&nodes=b` (via
@@ -430,11 +432,26 @@ func aggregateRDStats(resList []apiv1.Resource) map[string]rdFaultyStats {
 }
 
 // isResourceFaulty reports whether THIS single replica looks broken
-// (any non-empty volume disk_state that isn't UpToDate). The
-// RD-level aggregation in aggregateRDStats folds these per-replica
-// verdicts into a single per-RD faulty flag — one bad replica is
-// enough to mark the whole RD as needing operator attention.
+// (any non-empty volume disk_state that isn't UpToDate, or no
+// satellite state at all). The RD-level aggregation in
+// aggregateRDStats folds these per-replica verdicts into a single
+// per-RD faulty flag — one bad replica is enough to mark the whole RD
+// as needing operator attention.
+//
+// A replica answered with no satellite state (forgetStaleReplicas: its
+// node is OFFLINE, its satellite has not reported it since a restart,
+// or its kernel resource is gone) is the Unknown that linstor-client
+// and the blockstor CLI list under `--faulty`. Skipping it for its
+// empty disk states hid exactly the replicas that hold no data.
 func isResourceFaulty(r *apiv1.Resource) bool {
+	// A nil InUse comes only from ForgetSatelliteState: the k8s store
+	// always answers a role, false when none was reported. Answering
+	// nil there for an unreported role would list every such replica
+	// here.
+	if r.State.InUse == nil && !anyReportedDiskState(r) {
+		return true
+	}
+
 	for i := range r.Volumes {
 		disk := r.Volumes[i].State.DiskState
 		if disk == "" {
@@ -447,6 +464,12 @@ func isResourceFaulty(r *apiv1.Resource) bool {
 	}
 
 	return false
+}
+
+// anyReportedDiskState reports whether any volume of r carries a disk
+// state.
+func anyReportedDiskState(r *apiv1.Resource) bool {
+	return slices.ContainsFunc(r.Volumes, func(vol apiv1.Volume) bool { return vol.State.DiskState != "" })
 }
 
 // isUpToDateDiskState matches "UpToDate" plus the sync-progress-

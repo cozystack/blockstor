@@ -43,6 +43,11 @@ type Node struct {
 	StorageProviders     []string            `json:"storage_providers,omitempty"`
 	UnsupportedLayers    map[string][]string `json:"unsupported_layers,omitempty"`
 	UnsupportedProviders map[string][]string `json:"unsupported_providers,omitempty"`
+
+	// SatelliteIncarnation names the satellite process now running on
+	// the node (CRD `Status.SatelliteIncarnation`). Not on the wire;
+	// see Resource.SatelliteIncarnation.
+	SatelliteIncarnation string `json:"-"`
 }
 
 // NodeModify is the upstream payload for `linstor n set-property` /
