@@ -83,13 +83,14 @@ const (
 	// step depends on. Bug 84.
 	AutoSnapshotPrefix = "auto-snap-"
 
-	// AnnotationAutoSnapshotLastAt stamps the wall-clock time of the
-	// last auto-snapshot creation onto the parent RD's annotations.
-	// The runnable reads this to decide whether enough time has
-	// elapsed since the previous tick — avoids relying on the
-	// freshly-created Snapshot CRD's metadata.creationTimestamp
-	// (which lags by the kube-apiserver's stamp time and would
-	// require a fresh GET each pass).
+	// AnnotationAutoSnapshotLastAt stamps the schedule slot the last
+	// auto-snapshot was booked at onto the parent RD's annotations;
+	// the next one is due RunEvery after it. The slot can precede the
+	// Snapshot's creation by up to one poll, or equal it when a whole
+	// interval was missed (see scheduledAt). Keeping it here avoids
+	// relying on the freshly-created Snapshot CRD's
+	// metadata.creationTimestamp (which lags by the kube-apiserver's
+	// stamp time and would require a fresh GET each pass).
 	AnnotationAutoSnapshotLastAt = "blockstor.org/auto-snapshot-last-at"
 
 	// LabelAutoSnapshot is the marker the runnable stamps on every
@@ -122,11 +123,14 @@ type RealClock struct{}
 // Now returns the current wall-clock time.
 func (RealClock) Now() time.Time { return time.Now() }
 
-// AutoSnapshotPeriod is the default poll cadence for the runnable.
-// Upstream LINSTOR's auto-snapshot service polls minute-aligned, so
-// 60s is the smallest cadence the `AutoSnapshot/RunEvery` value
-// (minutes) can meaningfully resolve. Tests override via .Period.
-const AutoSnapshotPeriod = 1 * time.Minute
+// AutoSnapshotPeriod is the default poll cadence for the runnable,
+// LINSTOR's AutoSnapshotTask TASK_TIMEOUT. It must stay well below
+// the smallest `AutoSnapshot/RunEvery` (one minute): a poll as long
+// as the interval lands just short of the deadline about half the
+// time and only takes the snapshot one poll later, so RunEvery 1
+// produced one snapshot every two minutes. Tests override via
+// .Period.
+const AutoSnapshotPeriod = 10 * time.Second
 
 // AutoSnapshotRunnable is the cluster-wide cron that creates and
 // prunes local-only auto-snapshots for every ResourceDefinition
@@ -258,7 +262,7 @@ func (r *AutoSnapshotRunnable) processRD(
 	now time.Time,
 ) error {
 	lastAt, hasLast := readLastAutoSnapshotAt(rd)
-	if hasLast && now.Sub(lastAt) < runEvery {
+	if hasLast && now.Before(lastAt.Add(runEvery)) {
 		// Not due yet — but still prune in case Keep was lowered
 		// since the last tick (operator typed `set-property
 		// AutoSnapshot/Keep 3` on an RD with 10 existing
@@ -302,7 +306,7 @@ func (r *AutoSnapshotRunnable) processRD(
 		return errors.Wrapf(err, "create auto-snapshot %q", snapName)
 	}
 
-	err = r.stampRDAfterCreate(ctx, rd, id+1, now)
+	err = r.stampRDAfterCreate(ctx, rd, id+1, scheduledAt(lastAt, hasLast, runEvery, now))
 	if err != nil {
 		// The Snapshot is already created at this point — a failure
 		// to stamp the RD only means the next tick will retry the
@@ -891,6 +895,31 @@ func nextAutoSnapshotID(rd *blockstoriov1alpha1.ResourceDefinition) (int64, erro
 // Yields `auto-snap-00001`, `auto-snap-00002`, ... Bug 84.
 func formatAutoSnapshotName(id int64) string {
 	return fmt.Sprintf("%s%05d", AutoSnapshotPrefix, id)
+}
+
+// scheduledAt returns the time an auto-snapshot taken now is booked
+// at, which the next one is due RunEvery after. As LINSTOR's
+// AutoSnapshotConfig.next() it is the slot that fell due, not the
+// moment a poll noticed it, so the poll delay does not add to every
+// interval. A slot missed by a whole interval or more, while the
+// controller was down say, books now instead: a slot-by-slot
+// catch-up would take one snapshot per poll and only rotate older
+// snapshots out of Keep. LINSTOR keeps its schedule in memory and
+// after downtime restarts it at start + RunEvery + one poll; keeping
+// the slot across a failover shorter than RunEvery is deliberate.
+// As in LINSTOR, a take delayed by almost a whole interval leaves
+// the next one due as little as one poll later.
+func scheduledAt(lastAt time.Time, hasLast bool, runEvery time.Duration, now time.Time) time.Time {
+	if !hasLast {
+		return now
+	}
+
+	due := lastAt.Add(runEvery)
+	if now.Sub(due) >= runEvery {
+		return now
+	}
+
+	return due
 }
 
 // readLastAutoSnapshotAt parses the RD's last-auto-snapshot

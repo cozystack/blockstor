@@ -103,6 +103,11 @@ type Satellite struct {
 	// of the definition to the test, see StandInForSnapshots.
 	snapshotsByHand map[string]bool
 
+	// kernelDestroyed[rdName][node] true → the satellite leaves that
+	// replica's status alone, as the real one reports no volume for a
+	// kernel resource it saw destroyed.
+	kernelDestroyed map[string]map[string]bool
+
 	// failNext is the queue of pending FakeExec-style failures the
 	// satellite mock is asked to inject the next time it sees a
 	// matching command. Phase 0 stores them but does not consult
@@ -125,6 +130,7 @@ func NewSatellite(cli client.Client) *Satellite {
 
 		volumesUnreported: map[string]bool{},
 		snapshotsByHand:   map[string]bool{},
+		kernelDestroyed:   map[string]map[string]bool{},
 	}
 }
 
@@ -208,6 +214,28 @@ func (s *Satellite) StandInForSnapshots(rdName string) {
 	defer s.mu.Unlock()
 
 	s.snapshotsByHand[rdName] = true
+}
+
+// SimulateKernelResourceDestroyed stops the satellite reporting
+// (rdName, node): the real one writes no volume or disk state for a
+// replica whose kernel resource is gone, so a test that writes that
+// shape must not have it rewritten as UpToDate behind its back.
+func (s *Satellite) SimulateKernelResourceDestroyed(rdName, node string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.kernelDestroyed[rdName] == nil {
+		s.kernelDestroyed[rdName] = map[string]bool{}
+	}
+
+	s.kernelDestroyed[rdName][node] = true
+}
+
+func (s *Satellite) isKernelDestroyed(resource *blockstoriov1alpha1.Resource) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.kernelDestroyed[resource.Spec.ResourceDefinitionName][resource.Spec.NodeName]
 }
 
 // FailNext enqueues a FakeExec-style command match that the next
@@ -337,6 +365,10 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 
 	for i := range resources.Items {
 		resource := &resources.Items[i]
+
+		if s.isKernelDestroyed(resource) {
+			continue
+		}
 
 		s.stampLiveMigrateApplied(ctx, resource)
 

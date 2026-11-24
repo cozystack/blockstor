@@ -62,6 +62,21 @@ type Resource struct {
 	// flips it.
 	ToggleDiskCancel bool `json:"toggle_disk_cancel,omitempty"`
 
+	// SatelliteIncarnation names the satellite process that reported
+	// the runtime state this replica carries (CRD
+	// `Status.SatelliteIncarnation`). Not on the wire: it only lets a
+	// read tell a report from the running satellite from one an earlier
+	// process left behind (ForgetStaleSatelliteState).
+	SatelliteIncarnation string `json:"-"`
+
+	// KernelSlotDestroyed is set when the satellite last saw the
+	// replica's DRBD kernel resource destroyed (CRD Condition
+	// KernelLoaded=False) and the stored status agrees: no volume
+	// keeps a disk state and no peer link is left. Not on the wire:
+	// like SatelliteIncarnation it only tells a read to answer the
+	// replica with no satellite state (ForgetStaleSatelliteState).
+	KernelSlotDestroyed bool `json:"-"`
+
 	// Volumes is the per-replica volume slice — sourced from
 	// Resource.Status.Volumes which the satellite observer writes.
 	// Upstream LINSTOR's `Resource` carries volumes inline; the

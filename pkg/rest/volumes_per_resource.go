@@ -77,6 +77,8 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	s.forgetStaleReplica(r.Context(), &res)
+
 	// Every volume definition is listed, built or not, as LINSTOR does
 	// (see ensureVolumesForView). REST 1.28 added the `props` filter
 	// here, on the volumes' own props.
@@ -117,6 +119,8 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 
 		return
 	}
+
+	s.forgetStaleReplica(r.Context(), &res)
 
 	if vol, ok := s.awaitReportedVolume(r.Context(), &res, vlmNr); ok {
 		writeJSON(w, http.StatusOK, vol)
@@ -321,6 +325,7 @@ func (s *Server) awaitVolumeReport(ctx context.Context, res *apiv1.Resource, vlm
 		return false
 	}
 
+	s.forgetStaleReplica(ctx, &next)
 	*res = next
 
 	return true
