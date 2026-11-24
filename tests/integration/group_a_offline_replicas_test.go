@@ -219,6 +219,10 @@ func TestGroupADestroyedKernelResourceReadsUnknown(t *testing.T) {
 
 	const rdName = "rd-kernel-down"
 
+	// The test reports the replicas' volumes itself; the harness satellite
+	// would overwrite them with its own healthy view on its next tick.
+	stack.Satellite.SimulateVolumesUnreported(rdName)
+
 	rd := &blockstoriov1alpha1.ResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: rdName},
 		Spec:       blockstoriov1alpha1.ResourceDefinitionSpec{ResourceGroupName: harness.FixtureDefaultRG},
@@ -329,6 +333,10 @@ func TestGroupARecreatedWithoutDiskReadsFaulty(t *testing.T) {
 	ctx := context.Background()
 
 	const rdName = "rd-kernel-diskless"
+
+	// The test reports the replicas' volumes itself; the harness satellite
+	// would overwrite them with its own healthy view on its next tick.
+	stack.Satellite.SimulateVolumesUnreported(rdName)
 
 	rd := &blockstoriov1alpha1.ResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: rdName},
