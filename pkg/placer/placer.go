@@ -828,6 +828,15 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 // pkg/rest.promoteDisklessReplica. A create that finds a replica
 // written since newState goes through takeOverReplicaWrittenMeanwhile.
 func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
+	// Each replica with a disk takes a DRBD peer slot on every replica of
+	// the definition. LINSTOR's autoplace creates its replicas through the
+	// resource create, which refuses the one the slots cannot hold; the
+	// placement stops there, with the replicas before it in place.
+	err := store.CheckPeerSlotsForNewPeer(ctx, st, rdName, pool.NodeName)
+	if err != nil {
+		return errors.Wrapf(err, "place a replica of %s on %s", rdName, pool.NodeName)
+	}
+
 	if _, isWitness := s.upgradeable[naming.Key(pool.NodeName)]; isWitness {
 		return s.promoteWitness(ctx, st, rdName, pool)
 	}
@@ -838,7 +847,7 @@ func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string,
 		Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
 	}
 
-	err := st.Resources().Create(ctx, &res)
+	err = st.Resources().Create(ctx, &res)
 	if err == nil {
 		s.created = append(s.created, pool.NodeName)
 
