@@ -5756,65 +5756,100 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		return nil
 	}
 
-	// Recover from the tiebreaker-relocate StandAlone wedge:
-	// when the controller re-allocates DRBDNodeID for a returning
-	// TIE_BREAKER onto a fresh peer-slot, the surviving diskful's
-	// v09 metadata for that slot reads back as
-	// `peer-disk:Outdated` (default-initialised bitmap-uuid). The
-	// failing adjust hits `peer-device-options --bitmap=no` and
-	// the kernel refuses with `(162) Can not drop the bitmap when
-	// both sides have a disk`. recoverFromBitmapBothDisks below
-	// runs a full down + up + adjust cycle so the next adjust
-	// reads peer-disk from a fresh handshake (DUnknown) rather
-	// than from the stale metadata default — see
-	// tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
+	// Recover from the tiebreaker-relocate StandAlone wedge: a
+	// diskless peer came up under a node-id whose metadata slot
+	// still reads its diskful predecessor as `peer-disk:Outdated`,
+	// and the kernel refuses `peer-device-options --bitmap=no` with
+	// `(162) Can not drop the bitmap when both sides have a disk`
+	// — see tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
 	if drbd.IsBitmapDropBothDisksErr(err) {
-		return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, skipNet)
+		return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, err)
 	}
 
 	return errors.Wrapf(err, "adjust %s", dr.GetName())
 }
 
-// recoverFromBitmapBothDisks executes the down + up + adjust
-// recovery for the tiebreaker-relocate StandAlone wedge.
-// Without this recovery the first failed adjust leaves the
-// returning TB's kernel slot StandAlone with peer-device entries
-// kernel-registered (the new-peer call ran before peer-device-
-// options failed); shouldSkipNetOnAdjust then permanently
-// latches `--skip-net` for that slot and the slot stays
-// StandAlone forever.
+// recoverFromBitmapBothDisks answers the kernel's refusal to drop the
+// bitmap of a peer the .res names diskless. The refusal comes from the
+// peer's metadata slot, which still describes the diskful replica that
+// held its node-id before: nothing forgot that slot when the replica
+// went. LINSTOR's satellite forgets a deleted peer's slot (del-peer,
+// then forget-peer); this does the same for the node-ids adjustErr
+// names, then adjusts again.
 //
-// Bounded to a single bounce per adjust pass: the recovery
-// retries dispatchAdjust once; if the second adjust still
-// fails, bubble the error so the reconciler retry loop
-// re-converges on the next tick instead of looping in-place.
+// Only a connection that is not Connected is dropped. Nothing flows
+// over it, so dropping it touches neither the local disk nor its role:
+// a Primary keeps its device open, and the local replica stays up even
+// when it holds the only UpToDate copy. A Connected peer's disk state is
+// live rather than read from the slot, so the refusal is real (the peer
+// has not detached yet) and the error goes back to the retry loop, as
+// LINSTOR leaves a failed adjust. The resource is never taken down here:
+// a `drbdadm down` would demote a Primary, or detach the last good
+// copy, and the refusal of a device held open is the only thing that
+// kept it from doing so.
 //
-// Down on a Primary-Open resource would block, but the
-// signature only fires on the moment a returning TB joins —
-// the wedge surfaces on the surviving diskful side which is
-// Secondary (unmounted at the moment the TB respawns).
-func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
-	log.FromContext(ctx).Info("adjust failed with bitmap-bothdisks; recovering via down + up + adjust",
-		"resource", dr.GetName())
-
-	err := r.cfg.Adm.Down(ctx, dr.GetName())
+// A single pass: if the second adjust still fails, the error goes to
+// the reconciler retry loop instead of looping in place.
+func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.DesiredResource, skipDisk bool, adjustErr error) error {
+	dropped, err := r.forgetStalePeerSlots(ctx, dr.GetName(), drbd.BitmapDropPeerNodeIDs(adjustErr))
 	if err != nil {
-		return errors.Wrapf(err, "drbdadm down %s (recovery from bitmap-bothdisks)", dr.GetName())
+		return errors.Wrapf(err, "adjust %s: %s", dr.GetName(), adjustErr.Error())
 	}
 
-	err = r.cfg.Adm.Up(ctx, dr.GetName())
-	if err != nil {
-		return errors.Wrapf(err, "drbdadm up %s (recovery from bitmap-bothdisks)", dr.GetName())
+	if len(dropped) == 0 {
+		return errors.Wrapf(adjustErr, "adjust %s", dr.GetName())
 	}
 
-	err = r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
+	log.FromContext(ctx).Info("adjust failed with bitmap-bothdisks; forgot the peer slots and adjusting again",
+		"resource", dr.GetName(), "nodeIDs", dropped)
+
+	// The dropped slots no longer count toward --skip-net, so the
+	// adjust re-adds their peers unless another peer is held
+	// StandAlone on purpose.
+	err = r.dispatchAdjust(ctx, dr.GetName(), skipDisk, r.shouldSkipNetOnAdjust(ctx, dr.GetName()))
 	if err != nil {
-		return errors.Wrapf(err, "adjust %s (after bitmap-bothdisks recovery)", dr.GetName())
+		return errors.Wrapf(err, "adjust %s (after forgetting peer slots %v)", dr.GetName(), dropped)
 	}
 
 	ensureDeviceNodes(ctx, dr)
 
 	return nil
+}
+
+// forgetStalePeerSlots drops and forgets the kernel connection of each
+// node-id in nodeIDs that is not Connected, and returns the node-ids it
+// dropped. A node-id the kernel holds no connection for is skipped.
+func (r *Reconciler) forgetStalePeerSlots(ctx context.Context, resource string, nodeIDs []int32) ([]int32, error) {
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+
+	slots, err := r.cfg.Adm.Show(ctx, resource)
+	if err != nil {
+		return nil, errors.Wrap(err, "read the kernel connections")
+	}
+
+	var dropped []int32
+
+	for _, slot := range slots {
+		if !slices.Contains(nodeIDs, slot.NodeID) ||
+			slot.ConnectionState == string(drbd.ConnectionStateConnected) {
+			continue
+		}
+
+		// The refusal means the local replica has a disk, so its
+		// metadata holds the slot.
+		err := r.dropOldConnection(ctx, resource, slot.NodeID, true)
+		if err != nil {
+			return dropped, errors.Wrapf(err, "drop the connection to node-id %d", slot.NodeID)
+		}
+
+		dropped = append(dropped, slot.NodeID)
+	}
+
+	slices.Sort(dropped)
+
+	return dropped, nil
 }
 
 // dispatchAdjust picks the right `drbdadm adjust` variant for the
