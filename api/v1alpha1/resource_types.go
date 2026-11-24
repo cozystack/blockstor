@@ -219,7 +219,7 @@ type ResourceSpec struct {
 	// drbdNodeID is the DRBD-9 node-id assigned to this replica.
 	// Per-replica, allocated once and stable for the replica's life —
 	// re-numbering a live replica re-maps its DRBD bitmaps and
-	// corrupts peer-to-peer resync. Range 0..15 (drbd-9 max-peers).
+	// corrupts peer-to-peer resync. Range 0..31 (DRBD 9 node ids).
 	//
 	// clusterIP-style allocation: nil means "controller, allocate";
 	// non-nil is authoritative and NEVER overwritten (restore-safe).

@@ -20,40 +20,34 @@ package drbd
 
 import "github.com/cockroachdb/errors"
 
-// MaxPeers is the upstream drbd-9 connection-mesh limit. node-id values
-// that go past this won't be accepted by the kernel module; the
-// allocator refuses to hand out 16+.
-const MaxPeers = 16
-
-// NodeIDMax is DRBD-9 v09 metadata's hard upper bound for a node-id
-// slot. `drbdmeta ... set-gi --node-id N` accepts N in 0..31
-// REGARDLESS of the `--max-peers` value create-md was given, and
-// hard-errors `node-id out of range (0...31)` for N>=32 (verified
-// empirically on drbd-utils 9.22 against a v09 loop device created
-// with `create-md 15`). It is distinct from MaxPeers (the mesh /
-// allocator budget, which only governs how many ids we hand out):
-// GI seeding stamps the FULL 0..NodeIDMax slot range so no slot is
-// ever left with a stale per-peer bitmap-UUID. See seedPerPeerGI.
+// NodeIDMax is the highest DRBD 9 node id. The kernel and drbdmeta
+// accept 0..31 whatever peer-slot count create-md was given (verified
+// empirically on drbd-utils 9.22 against a v09 loop device created with
+// `create-md 15`): the peer slots bound how many peers with a disk a
+// replica keeps a bitmap for, not the node ids. LINSTOR hands out node
+// ids from the same range (NodeId.NODE_ID_MAX). GI seeding stamps the
+// full 0..NodeIDMax range so no slot is ever left with a stale per-peer
+// bitmap UUID; see seedPerPeerGI.
 const NodeIDMax = 31
 
-// ErrNodeIDExhausted means no free id remains in 0..MaxPeers-1 for a
-// new replica. Means the RD is at the max-peers limit and we'd need a
-// dedicated tiebreaker eviction or a higher max-peers compile.
-var ErrNodeIDExhausted = errors.New("DRBD node-id pool exhausted (max 16 peers per RD)")
+// ErrNodeIDExhausted means no free id remains in 0..NodeIDMax for a new
+// replica: the definition already has as many replicas as DRBD has node
+// ids.
+var ErrNodeIDExhausted = errors.New("DRBD node-id pool exhausted (max 32 replicas per resource definition)")
 
 // LowestFreeNodeID returns the smallest non-negative id not present in
 // taken. The result is deterministic so two reconciles that see the
 // same taken set produce the same id — important when two satellites
 // race to allocate; the eventual conflict resolves to the same value.
 //
-// Returns ErrNodeIDExhausted when taken covers 0..MaxPeers-1.
+// Returns ErrNodeIDExhausted when taken covers 0..NodeIDMax.
 func LowestFreeNodeID(taken []int32) (int32, error) {
 	used := make(map[int32]bool, len(taken))
 	for _, id := range taken {
 		used[id] = true
 	}
 
-	for i := range int32(MaxPeers) {
+	for i := range int32(NodeIDMax + 1) {
 		if !used[i] {
 			return i, nil
 		}
