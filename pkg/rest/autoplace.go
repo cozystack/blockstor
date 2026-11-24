@@ -122,6 +122,8 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.forgetStaleReplicas(r.Context(), resList)
+
 	vdSizes := s.definitionVolumeSizes(r.Context(), rdName)
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
@@ -275,6 +277,8 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	s.forgetStaleReplica(r.Context(), &res)
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys before emit.
 	// Resources().Get returns a value copy, so the in-place mutation

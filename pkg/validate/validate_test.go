@@ -308,6 +308,130 @@ func TestMidSyncDeleteRefusal(t *testing.T) {
 	}
 }
 
+// The shape a volume deleted during its initial sync is left in: the sync
+// source is gone, one complete copy remains, and the other replica stays
+// Inconsistent on an Established connection to it. The guard is for a
+// volume that stays; once the definition is being deleted the remaining
+// replicas have to be deletable, or the volume never goes away.
+func TestMidSyncDeleteRefusalLiftedWhileDefinitionIsDeleted(t *testing.T) {
+	t.Parallel()
+
+	target := diskful("node-b", "UpToDate")
+	stranded := []apiv1.Resource{diskful("node-c", "Inconsistent")}
+
+	if !validate.MidSyncDeleteRefusal(&target, stranded) {
+		t.Fatal("a single replica delete of the last complete copy must stay guarded")
+	}
+
+	inUse := true
+	primary := apiv1.Resource{
+		NodeName: "node-p",
+		Flags:    []string{apiv1.ResourceFlagDiskless},
+		State:    apiv1.ResourceState{InUse: &inUse},
+	}
+	notInUse := false
+	secondary := primary
+	secondary.State = apiv1.ResourceState{InUse: &notInUse}
+
+	balancingOff := apiv1.ResourceDefinition{Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "False"}}
+	flagged := apiv1.ResourceDefinition{Flags: []string{apiv1.ResourceFlagDelete}}
+
+	for name, tc := range map[string]struct {
+		rd       apiv1.ResourceDefinition
+		replicas []apiv1.Resource
+		deleted  bool
+	}{
+		"a live definition": {apiv1.ResourceDefinition{}, nil, false},
+		"balancing switched on": {
+			apiv1.ResourceDefinition{Props: map[string]string{apiv1.PropBalanceResourcesEnabled: "true"}}, nil, false,
+		},
+		"rd d flagged it DELETE": {flagged, nil, true},
+		"rd d flagged it DELETE with a Primary left": {
+			flagged, []apiv1.Resource{primary}, true,
+		},
+		"linstor-csi DeleteVolume switched balancing off": {
+			balancingOff, append([]apiv1.Resource{secondary}, stranded...), true,
+		},
+		// U130 on a hand-placed definition: a Primary still runs on it,
+		// which DeleteVolume never leaves behind.
+		"balancing off by hand with a Primary": {
+			balancingOff, append([]apiv1.Resource{primary}, stranded...), false,
+		},
+		// A hand move of a volume nothing has attached looks like
+		// DeleteVolume from the definition, so the guard is lifted and
+		// dropping the only UpToDate copy mid-sync goes through, as it
+		// does in LINSTOR. Deliberate; see DefinitionBeingDeleted.
+		"balancing off by hand, nothing InUse": {
+			balancingOff, append([]apiv1.Resource{secondary}, stranded...), true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rd := tc.rd
+			if got := validate.DefinitionBeingDeleted(&rd, tc.replicas); got != tc.deleted {
+				t.Errorf("DefinitionBeingDeleted = %v, want %v", got, tc.deleted)
+			}
+		})
+	}
+}
+
+// A peer that is itself being deleted cannot be stranded: deleting the
+// source after it is the order SortForDeletion produces.
+func TestMidSyncDeleteRefusalIgnoresPeerBeingDeleted(t *testing.T) {
+	t.Parallel()
+
+	target := diskful("node-b", "UpToDate")
+	going := diskful("node-c", "Inconsistent")
+	going.Flags = []string{apiv1.ResourceFlagDelete}
+
+	if validate.MidSyncDeleteRefusal(&target, []apiv1.Resource{going}) {
+		t.Error("refused over a peer that is already being deleted")
+	}
+}
+
+// A complete copy that is itself being deleted is no source for the peer
+// still syncing: `r d` of the source, then `r d` of the other complete
+// copy, must not pass on the strength of the first one.
+func TestMidSyncDeleteRefusalDoesNotCountDeletingSource(t *testing.T) {
+	t.Parallel()
+
+	target := diskful("node-b", "UpToDate")
+	going := diskful("node-a", "UpToDate")
+	going.Flags = []string{apiv1.ResourceFlagDelete}
+
+	if !validate.MidSyncDeleteRefusal(&target, []apiv1.Resource{going, diskful("node-c", "Inconsistent")}) {
+		t.Error("counted a source that is being deleted, stranding the syncing peer")
+	}
+}
+
+// `r d` naming several replicas deletes the incomplete ones first, so the
+// guard never refuses a source over a peer the same command removes.
+func TestSortForDeletionPutsIncompleteReplicasFirst(t *testing.T) {
+	t.Parallel()
+
+	witness := apiv1.Resource{NodeName: "node-d", Flags: []string{apiv1.ResourceFlagTieBreaker}}
+	replicas := []apiv1.Resource{
+		diskful("node-a", "UpToDate"),
+		diskful("node-b", "UpToDate"),
+		witness,
+		diskful("node-c", "Inconsistent"),
+		diskful("node-e", "SyncTarget"),
+	}
+
+	validate.SortForDeletion(replicas)
+
+	got := make([]string, 0, len(replicas))
+	for i := range replicas {
+		got = append(got, replicas[i].NodeName)
+	}
+
+	want := []string{"node-c", "node-e", "node-a", "node-b", "node-d"}
+	if !slices.Equal(got, want) {
+		t.Errorf("delete order = %v, want %v", got, want)
+	}
+}
+
 func TestResourceIsDiskful(t *testing.T) {
 	t.Parallel()
 
