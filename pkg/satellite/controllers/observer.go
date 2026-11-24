@@ -117,6 +117,10 @@ type observation struct {
 	// listMap entry on the apiserver or (worse) emit False frames
 	// the next reconcile would treat as "kernel slot gone".
 	HasKernelLoaded bool
+	// ForceIOFailures mirrors `force-io-failures:` on resource frames.
+	// Not written to Status: only the DRBD workarounds read it, from
+	// the cache (workaround_hints.go).
+	ForceIOFailures bool
 	// Destroyed marks a `destroy resource` frame: the kernel slot is
 	// gone, and with it everything the observer knew about it.
 	Destroyed   bool
@@ -158,6 +162,11 @@ type volumeObservation struct {
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
+
+	// Open is the `open:yes|no|unknown` of the events2 `device` frame,
+	// empty when the frame did not carry it. Not published to Status:
+	// only the DRBD workarounds' hints read it (workaround_hints.go).
+	Open string
 
 	// SyncPeer is the peer a peer-device frame's out-of-sync count is
 	// about (its `conn-name`).
@@ -349,6 +358,7 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		HasResource:           true,
 		KernelLoaded:          normalizeKernelLoaded(ev.Action),
 		HasKernelLoaded:       true,
+		ForceIOFailures:       ev.Fields["force-io-failures"] == drbdFlagYes,
 		Destroyed:             ev.Action == eventActionDestroy,
 	}, true
 }
@@ -459,6 +469,7 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 		DiskState:    disk,
 		CurrentUUID:  ev.Fields["current-uuid"],
 		BackingDev:   ev.Fields["backing_dev"],
+		Open:         ev.Fields["open"],
 	}
 
 	// `quorum:yes|no` is emitted on every `device` frame on
@@ -756,6 +767,9 @@ const (
 	// volume has lost quorum — the CSI plugin's mount path keys
 	// off this signal.
 	drbdQuorumYes = "yes"
+	// drbdFlagYes is how events2 prints any set flag, such as
+	// `force-io-failures:yes` on resource frames.
+	drbdFlagYes = "yes"
 )
 
 // newObserverRunnableFromConfig builds the observer the manager runs, so the
@@ -1005,6 +1019,12 @@ type resourceObservation struct {
 	Suspended      string
 	PromotionScore *int32
 	MayPromote     *bool
+
+	// ForceIOFailures and Unloaded feed the DRBD workarounds' hints
+	// only (workaround_hints.go); Unloaded marks a resource whose
+	// kernel slot was destroyed.
+	ForceIOFailures bool
+	Unloaded        bool
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -1612,8 +1632,8 @@ func (o *ObserverRunnable) snapshotFor(name string) observation {
 
 	o.volMu.Lock()
 	if cache, ok := o.volCache[name]; ok {
-		for _, v := range cache {
-			out.Volumes = append(out.Volumes, v)
+		for volNum := range cache {
+			out.Volumes = append(out.Volumes, cache[volNum])
 		}
 	}
 	o.volMu.Unlock()
@@ -1693,6 +1713,8 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 		cur.InUse = ev.InUse
 		cur.Role = ev.Role
 		cur.Suspended = normalizeSuspended(ev.Suspended)
+		cur.ForceIOFailures = ev.ForceIOFailures
+		cur.Unloaded = ev.HasKernelLoaded && !ev.KernelLoaded
 
 		mergePromotion(&cur, ev)
 	}
@@ -2364,7 +2386,8 @@ func (o *ObserverRunnable) lifecycleSnapshotLocked(name string) lifecycleSignatu
 
 	o.volMu.Lock()
 	if cache, ok := o.volCache[name]; ok {
-		for volNum, v := range cache {
+		for volNum := range cache {
+			v := cache[volNum]
 			sig.PerVolume[volNum] = volumeLifecycle{
 				DiskState: v.DiskState,
 				Quorum:    v.Quorum,
@@ -2528,7 +2551,8 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 		}
 	}
 
-	for _, incoming := range ev.Volumes {
+	for i := range ev.Volumes {
+		incoming := &ev.Volumes[i]
 		if incoming.Removed {
 			// `destroy device` — evict the volume so the snapshot
 			// stops carrying it. Only counts as a change when the
@@ -2543,7 +2567,7 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 			continue
 		}
 
-		if mergeVolumeInto(cache, &incoming) {
+		if mergeVolumeInto(cache, incoming) {
 			changed = true
 		}
 	}
@@ -2555,8 +2579,8 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 	}
 
 	snapshot := make([]volumeObservation, 0, len(cache))
-	for _, entry := range cache {
-		snapshot = append(snapshot, entry)
+	for num := range cache {
+		snapshot = append(snapshot, cache[num])
 	}
 
 	ev.Volumes = snapshot
@@ -2641,8 +2665,8 @@ func (o *ObserverRunnable) pruneVolumeCacheToDesired(ev *observation, res *block
 	// nil ev.Volumes mergeVolumes left when the kernel frame itself was
 	// idempotent: the prune is the change that must reach the apiserver.
 	snapshot := make([]volumeObservation, 0, len(cache))
-	for _, entry := range cache {
-		snapshot = append(snapshot, entry)
+	for num := range cache {
+		snapshot = append(snapshot, cache[num])
 	}
 
 	ev.Volumes = snapshot
@@ -2725,7 +2749,8 @@ func largestOutOfSync(peers map[string]int64) int64 {
 func forgetPeerOutOfSync(cache map[int32]volumeObservation, peer string) bool {
 	changed := false
 
-	for num, vol := range cache {
+	for num := range cache {
+		vol := cache[num]
 		if _, ok := vol.PeerOutOfSync[peer]; !ok {
 			continue
 		}
@@ -2825,6 +2850,12 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 	// Status SSA write.
 	if incoming.BackingDev != "" {
 		merged.BackingDev = incoming.BackingDev
+	}
+
+	// Open, like BackingDev, is cached for the workarounds' hints only
+	// and never marks the volume changed.
+	if incoming.Open != "" {
+		merged.Open = incoming.Open
 	}
 
 	cache[incoming.VolumeNumber] = merged
@@ -2967,7 +2998,8 @@ func (o *ObserverRunnable) completeFromCache(ev *observation) {
 	}
 
 	read := make(map[int32]string, len(ev.Volumes))
-	for _, vol := range ev.Volumes {
+	for i := range ev.Volumes {
+		vol := &ev.Volumes[i]
 		if vol.CurrentUUID != "" {
 			read[vol.VolumeNumber] = vol.CurrentUUID
 		}
@@ -3452,7 +3484,8 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 
 	out := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(ev.Volumes))
 
-	for _, vol := range ev.Volumes {
+	for i := range ev.Volumes {
+		vol := &ev.Volumes[i]
 		out = append(out, blockstoriov1alpha1.ResourceVolumeStatus{
 			VolumeNumber: vol.VolumeNumber,
 			StoragePool:  storagePool,

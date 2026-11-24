@@ -286,6 +286,12 @@ linters:
       - linters:
           - tagliatelle
         path: pkg/drbd/drbdsetup_show
+      # pkg/drbd/kernel_status.go reads `drbdsetup status --json`, whose
+      # keys drbd-utils prints in kebab case (and peer_devices in snake
+      # case). The JSON tags MUST match verbatim.
+      - linters:
+          - tagliatelle
+        path: pkg/drbd/kernel_status
       # cmd/{controller,satellite}/main.go is kubebuilder manager scaffold —
       # don't lint its boilerplate (TODOs, function length, globals, inline
       # err checks, wsl). tagliatelle/goconst/mnd are excluded too: the
