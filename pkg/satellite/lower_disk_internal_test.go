@@ -287,7 +287,7 @@ func TestGrowBackingBeforeAttach(t *testing.T) {
 
 			want := ""
 			if tc.wantGrow {
-				want = fmt.Sprintf("zfs set volsize=%dM data/pvc-a_00000", growBackingKib(dr, vol, true)/kibPerMib)
+				want = fmt.Sprintf("zfs set volsize=%dK data/pvc-a_00000", alignUp(growBackingKib(dr, vol, true), 1024))
 			}
 
 			got := ""

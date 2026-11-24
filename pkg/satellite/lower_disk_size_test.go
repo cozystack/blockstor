@@ -43,8 +43,17 @@ const (
 func createdZvolKiB(t *testing.T, vol *intent.DesiredVolume, layerStack []string) int64 {
 	t.Helper()
 
+	return createdZvolKiBOn(t, vol, layerStack, "")
+}
+
+// createdZvolKiBOn is createdZvolKiB on a pool whose dry-run creation
+// reports dryRun; an empty one leaves the provider on whole MiB.
+func createdZvolKiBOn(t *testing.T, vol *intent.DesiredVolume, layerStack []string, dryRun string) int64 {
+	t.Helper()
+
 	fx := storage.NewFakeExec()
 	fx.Expect("zfs list -H -o name data/pvc-adopted_00000", storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("zfs create -n -P -V 1K data/blockstor-volblocksize-probe", storage.FakeResponse{Stdout: []byte(dryRun)})
 
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
 		Providers: map[string]storage.Provider{"data": zfs.NewProvider(zfs.Config{Pool: "data", Thin: true}, fx)},
@@ -61,11 +70,11 @@ func createdZvolKiB(t *testing.T, vol *intent.DesiredVolume, layerStack []string
 	}
 
 	for _, line := range fx.CommandLines() {
-		var mib int64
+		var kib int64
 
-		_, scanErr := fmt.Sscanf(line, "zfs create -s -V %dM data/pvc-adopted_00000", &mib)
+		_, scanErr := fmt.Sscanf(line, "zfs create -s -V %dK data/pvc-adopted_00000", &kib)
 		if scanErr == nil {
-			return mib * 1024
+			return kib
 		}
 	}
 
@@ -175,5 +184,25 @@ func TestNewLowerDiskLUKSWithoutDRBD(t *testing.T) {
 	}, []string{"LUKS", "STORAGE"})
 	if zvol != adoptedVolumeKiB+luks.HeaderKiB {
 		t.Errorf("zvol: got %d KiB, want the definition plus the 16 MiB header", zvol)
+	}
+}
+
+// TestNewLowerDiskIsRoundedToTheVolblocksize: a new lower disk is the
+// data plus its metadata rounded up to the pool's volblocksize, as
+// LINSTOR sizes it, not to whole MiB. On a 16 KiB volblocksize a 1 GiB
+// volume with 15 peer slots needs 1049096 KiB and gets 1049104 KiB;
+// rounded to MiB it got 1049600 KiB, and a LINSTOR replica added after
+// a return to LINSTOR, sized the LINSTOR way, could not attach under
+// the larger device the other replicas then exposed.
+func TestNewLowerDiskIsRoundedToTheVolblocksize(t *testing.T) {
+	t.Parallel()
+
+	const gib = 1024 * 1024
+
+	zvol := createdZvolKiBOn(t, &intent.DesiredVolume{VolumeNumber: 0, SizeKib: gib, StoragePool: "data"}, nil,
+		"create\tdata/blockstor-volblocksize-probe\nproperty\tvolsize\t16384\n")
+
+	if zvol != 1049104 {
+		t.Errorf("zvol: got %d KiB, want 1049104 KiB, the 1049096 KiB lower disk on a 16 KiB volblocksize", zvol)
 	}
 }

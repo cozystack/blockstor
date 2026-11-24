@@ -88,8 +88,8 @@ func TestGrowBeforeAttachAttachesWithoutResizingTheDevice(t *testing.T) {
 			}
 
 			// The size the backing grows to: what a new one is created
-			// at for the adopted device, in whole MiB.
-			grownKib := (drbd.InternalMetadataGrossKiB(adoptedDev, drbd.DefaultGeometry()) + header + 1023) / 1024 * 1024
+			// at for the adopted device, which LVM rounds to an extent.
+			grownKib := drbd.InternalMetadataGrossKiB(adoptedDev, drbd.DefaultGeometry()) + header
 			bytes := func(kib int64) storage.FakeResponse {
 				return storage.FakeResponse{Stdout: []byte(strconv.FormatInt(kib*1024, 10) + "\n")}
 			}
@@ -151,7 +151,7 @@ func TestGrowBeforeAttachAttachesWithoutResizingTheDevice(t *testing.T) {
 			at := func(match func(string) bool) int { return slices.IndexFunc(calls, match) }
 
 			grown := at(func(line string) bool {
-				return strings.HasPrefix(line, "lvextend") && strings.Contains(line, " --size "+strconv.FormatInt(grownKib/1024, 10)+"MiB ")
+				return strings.HasPrefix(line, "lvextend") && strings.Contains(line, " --size "+strconv.FormatInt(grownKib, 10)+"k ")
 			})
 			mapper := slices.Index(calls, keyResize)
 			created := at(func(line string) bool { return strings.HasPrefix(line, "drbdadm create-md ") })

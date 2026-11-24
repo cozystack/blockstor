@@ -140,7 +140,7 @@ func TestThickRestoreVolumeFromSnapshotIssuesFullSizeLvcreateAndDD(t *testing.T)
 	}
 
 	// lvcreate must be sized at the origin's full size (1 GiB == 1024 MiB).
-	if lvcreateLine != "" && !strings.Contains(lvcreateLine, "--size 1024MiB") {
+	if lvcreateLine != "" && !strings.Contains(lvcreateLine, "--size 1048576k") {
 		t.Errorf("Bug 245 fix: lvcreate must size the new LV at the origin's full size "+
 			"(1024MiB); got %q", lvcreateLine)
 	}

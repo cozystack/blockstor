@@ -68,7 +68,7 @@ func TestCreateVolumeThick(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "zfs create -V 1024M tank/pvc-1_00000"
+	want := "zfs create -V 1048576K tank/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -91,7 +91,7 @@ func TestCreateVolumeThin(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "zfs create -s -V 1024M tank/pvc-1_00000"
+	want := "zfs create -s -V 1048576K tank/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -117,7 +117,70 @@ func TestCreateVolumeRoundsUp(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "zfs create -s -V 20490M tank/pvc-1_00000"
+	want := "zfs create -s -V 20981760K tank/pvc-1_00000"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+}
+
+// TestCreateVolumeRoundsToVolblocksize: a new zvol is rounded up to the
+// volblocksize the pool gives a new zvol, not to whole MiB. LINSTOR does
+// the same (ZfsUtils.getZfsExtentSize, AbsStorageProvider.updateGrossSize),
+// so a 1 GiB volume with 7 peer slots, whose lower disk needs 1048836
+// KiB, gets LINSTOR's 1048848 KiB zvol on a 16 KiB volblocksize, and a
+// LINSTOR replica added after a return to LINSTOR still fits next to it.
+func TestCreateVolumeRoundsToVolblocksize(t *testing.T) {
+	cases := []struct {
+		name   string
+		dryRun string
+		want   string
+	}{
+		{"16KiB", "create\ttank/blockstor-volblocksize-probe\nproperty\tvolsize\t16384\n", "1048848K"},
+		{"8KiB", "create\ttank/blockstor-volblocksize-probe\nproperty\tvolsize\t8192\nproperty\trefreservation\t1843200\n", "1048840K"},
+		{"unreadable falls back to MiB", "", "1049600K"},
+		{"not whole KiB falls back to MiB", "property\tvolsize\t512\n", "1049600K"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := storage.NewFakeExec()
+			fx.Expect("zfs list -H -o name tank/pvc-1_00000",
+				storage.FakeResponse{Stdout: []byte("")})
+			fx.Expect("zfs create -n -P -V 1K tank/blockstor-volblocksize-probe",
+				storage.FakeResponse{Stdout: []byte(tc.dryRun)})
+
+			p := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, fx)
+
+			err := p.CreateVolume(t.Context(), storage.Volume{ResourceName: "pvc-1", SizeKib: 1048836})
+			if err != nil {
+				t.Fatalf("CreateVolume: %v", err)
+			}
+
+			want := "zfs create -s -V " + tc.want + " tank/pvc-1_00000"
+			if !slices.Contains(fx.CommandLines(), want) {
+				t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+			}
+		})
+	}
+}
+
+// TestResizeVolumeRoundsToOwnVolblocksize: a grow is rounded up to the
+// zvol's own volblocksize, which `zfs set volsize` requires and which a
+// zvol adopted from LINSTOR or cloned from a snapshot keeps whatever the
+// pool default is now.
+func TestResizeVolumeRoundsToOwnVolblocksize(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs get -Hp -o value volblocksize tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("8192\n")})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, fx)
+
+	err := p.ResizeVolume(t.Context(), storage.Volume{ResourceName: "pvc-1", SizeKib: 2097412})
+	if err != nil {
+		t.Fatalf("ResizeVolume: %v", err)
+	}
+
+	want := "zfs set volsize=2097416K tank/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -303,7 +366,7 @@ func TestZFSResizeVolumeIssuesZfsSet(t *testing.T) {
 		t.Fatalf("ResizeVolume: %v", err)
 	}
 
-	want := "zfs set volsize=2048M tank/pvc-1_00000"
+	want := "zfs set volsize=2097152K tank/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -533,7 +596,7 @@ func TestZFSThickCreateOmitsSparseFlag(t *testing.T) {
 	var createCmd string
 
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "zfs create ") {
+		if strings.HasPrefix(line, "zfs create ") && !strings.Contains(line, " -n ") {
 			createCmd = line
 
 			break
@@ -546,8 +609,8 @@ func TestZFSThickCreateOmitsSparseFlag(t *testing.T) {
 
 	// The line must contain `-V <size>M <dataset>` and must NOT
 	// contain ` -s ` (sparse) — the THICK invariant.
-	if !strings.Contains(createCmd, " -V 1024M tank/pvc-1_00000") {
-		t.Errorf("create cmd missing `-V 1024M tank/pvc-1_00000`: %q", createCmd)
+	if !strings.Contains(createCmd, " -V 1048576K tank/pvc-1_00000") {
+		t.Errorf("create cmd missing `-V 1048576K tank/pvc-1_00000`: %q", createCmd)
 	}
 
 	if strings.Contains(createCmd, " -s ") || strings.HasSuffix(createCmd, " -s") {
@@ -580,7 +643,7 @@ func TestZFSThinCreateIncludesSparseFlag(t *testing.T) {
 	var createCmd string
 
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "zfs create ") {
+		if strings.HasPrefix(line, "zfs create ") && !strings.Contains(line, " -n ") {
 			createCmd = line
 
 			break
@@ -596,8 +659,8 @@ func TestZFSThinCreateIncludesSparseFlag(t *testing.T) {
 		t.Errorf("THIN CreateVolume must include `-s` (sparse) flag; got %q", createCmd)
 	}
 
-	if !strings.Contains(createCmd, " -V 1024M tank/pvc-1_00000") {
-		t.Errorf("create cmd missing `-V 1024M tank/pvc-1_00000`: %q", createCmd)
+	if !strings.Contains(createCmd, " -V 1048576K tank/pvc-1_00000") {
+		t.Errorf("create cmd missing `-V 1048576K tank/pvc-1_00000`: %q", createCmd)
 	}
 }
 

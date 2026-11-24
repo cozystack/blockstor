@@ -53,10 +53,8 @@ const (
 	drbdMetaAlignKib = 4
 	// kibPerBitmapBit is the data one bit of DRBD's bitmap tracks.
 	kibPerBitmapBit = 4
-	// kibPerMib is the unit the providers resize in.
-	kibPerMib   = 1024
-	bitsPerByte = 8
-	bytesPerKib = 1024
+	bitsPerByte     = 8
+	bytesPerKib     = 1024
 )
 
 // sysClassBlock is where sysfs lists every block device by kernel name.
@@ -175,9 +173,8 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 		size += luks2HeaderKib
 	}
 
-	// The LVM and ZFS providers resize in whole MiB, rounding down, so
-	// an unaligned size would lose the margin added above.
-	return alignUp(size, kibPerMib)
+	// The provider rounds it up to its allocation unit, as LINSTOR does.
+	return size
 }
 
 // growKey builds the key of the per-volume grow tables.
