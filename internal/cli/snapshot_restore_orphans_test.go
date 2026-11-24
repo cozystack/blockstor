@@ -21,6 +21,7 @@ package cli_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -52,5 +53,33 @@ func TestSnapshotRestoreRefusesATargetWithOrphanReplicas(t *testing.T) {
 
 	if _, err := st.ResourceDefinitions().Get(t.Context(), "pvc-orph"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("the refusal left a definition behind: err=%v", err)
+	}
+}
+
+// A restore into a name whose earlier definition is still draining a replica
+// on a node that is down is refused as the plain create is: the definition is
+// still being deleted, and the refusal names the node. Read as an existing
+// target instead, it answered that the definition was not found.
+func TestSnapshotRestoreIntoANameStillBeingDeletedSaysSo(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		seedSnapshotSource(ctx, backend)
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-drain", NodeName: "node-down", Flags: []string{apiv1.ResourceFlagDelete},
+		})
+	})
+
+	if got := app.Run(t.Context(), restoreResourceArgv("pvc-drain")); got == 0 {
+		t.Fatal("restore over a draining replica succeeded")
+	}
+
+	msg := errBuf.String()
+	if !strings.Contains(msg, "still being deleted") || !strings.Contains(msg, "node-down") {
+		t.Fatalf("refusal = %q, want it to say the definition is still being deleted on node-down", msg)
+	}
+
+	if strings.Contains(msg, "not found") {
+		t.Fatalf("refusal = %q, answered as a missing definition", msg)
 	}
 }

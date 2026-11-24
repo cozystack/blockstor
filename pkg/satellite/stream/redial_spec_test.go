@@ -69,7 +69,7 @@ package stream_test
 // Tracking:
 //
 //   - tests/scenarios/03-networking.md §3.10
-//   - docs/cli-parity-known-deltas.md → row 86, "node interface
+//   - docs/cli-parity-known-deltas.md → row 98, "node interface
 //     modify --active" (formerly Bug 49, deferred from scenario 3.10)
 //
 // Outcome A (active re-dial loop) was considered and rejected: the
@@ -160,9 +160,10 @@ func TestSatelliteFlagsLackControllerBindAddress(t *testing.T) {
 	// controller-wire question this spec guards.
 	// The stream-tls-* files are the mutual TLS of the snapshot stream
 	// between satellites; they carry no controller address either.
+	// resource-workers is how many local resources are applied at once.
 	want := []string{
 		"node-name", "state-dir", "health-probe-bind-address", "controller-namespace",
-		"stream-tls-cert-file", "stream-tls-key-file", "stream-tls-ca-file",
+		"stream-tls-cert-file", "stream-tls-key-file", "stream-tls-ca-file", "resource-workers",
 	}
 	if !equalStringSlices(flags, want) {
 		t.Fatalf("satellite flag set drifted: got %v, want %v. "+

@@ -46,12 +46,13 @@ type Config struct {
 type Provider struct {
 	cfg  Config
 	exec storage.Exec
+	now  func() time.Time
 }
 
 // NewProvider constructs a Provider. The Exec is injected so unit tests
 // can drive it without ZFS installed.
 func NewProvider(cfg Config, ex storage.Exec) *Provider {
-	return &Provider{cfg: cfg, exec: ex}
+	return &Provider{cfg: cfg, exec: ex, now: time.Now}
 }
 
 // Kind returns "ZFS" or "ZFS_THIN" depending on Config.Thin.
@@ -150,55 +151,6 @@ func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	err = p.ensureRefreservation(ctx, dataset)
 	if err != nil {
 		return errors.Wrapf(err, "ensure refreservation after resize %s", dataset)
-	}
-
-	return nil
-}
-
-// DeleteVolume `zfs destroy -r`s the zvol (recursive to clean up any
-// dependent snapshots automatically). Missing → no-op.
-//
-// Why: a same-node `zfs clone` (RestoreVolumeFromSnapshot) leaves the
-// clone's `origin` pointing at a snapshot UNDER this dataset. ZFS
-// refuses to `zfs destroy` a snapshot that still has dependent
-// clones, so deleting a clone *source* before its clone wedges with
-// "volume has dependent clones" and the satellite reconciler loops
-// forever. We must NOT `zfs destroy -R` (that would cascade-destroy
-// the surviving clone = data loss). Instead `zfs promote` every
-// dependent clone first — promotion reparents the origin snapshot
-// onto the clone, making the clone independent and freeing this
-// dataset's snapshots for destruction.
-//
-// Before the destroy we also read the volume's `origin` property — if
-// it points at a deferred-delete marker (DeleteSnapshot's
-// `__DELETED__<ts>` rename), drop the marker after the volume is
-// gone. That's the GC half of upstream's deferred-delete pattern:
-// snapshots blocked by clones get renamed; when the last clone goes
-// away the marker becomes destroyable. Best-effort — sweep errors
-// don't bubble because the snapshot is now an internal artefact.
-func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
-	tgtDS := p.volumeDataset(vol)
-	if !p.datasetExists(ctx, tgtDS) {
-		return nil
-	}
-
-	origin := p.volumeOrigin(ctx, tgtDS)
-
-	// Why: detach any surviving clones that depend on this dataset's
-	// snapshots before the destroy, so `zfs destroy -r` doesn't fail
-	// with "has dependent clones". No-op when there are no clones.
-	err := p.promoteDependentClones(ctx, tgtDS)
-	if err != nil {
-		return errors.Wrapf(err, "promote dependent clones of %s", tgtDS)
-	}
-
-	_, err = p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
-	if err != nil {
-		return errors.Wrapf(err, "zfs destroy %s", tgtDS)
-	}
-
-	if origin != "" && strings.Contains(origin, "__DELETED__") {
-		_, _ = p.exec.Run(ctx, "zfs", "destroy", origin)
 	}
 
 	return nil
@@ -313,7 +265,20 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	dataset := p.snapshotDataset(snap)
 
 	if p.datasetExists(ctx, dataset) {
-		return nil
+		// A receive interrupted before its cleanup left the source's
+		// snapshot on the zvol, and it may carry this name: skipping
+		// would keep the restore's data under the new snapshot.
+		zvol, _, _ := strings.Cut(dataset, "@")
+
+		received, err := p.receivedSnapshot(ctx, zvol)
+		if err != nil || received != dataset {
+			return err
+		}
+
+		err = p.finishReceive(ctx, zvol)
+		if err != nil {
+			return err
+		}
 	}
 
 	_, err := p.exec.Run(ctx, "zfs", "snapshot", dataset)
@@ -324,56 +289,21 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return nil
 }
 
-// HasSnapshot reports whether this pool holds the snapshot.
+// HasSnapshot reports whether this pool holds the snapshot, under its
+// resource's zvol or under one a delete renamed (locateSnapshot), so a copy
+// whose source volume is gone is still found. Several renamed copies of one
+// name still mean the pool holds it.
 func (p *Provider) HasSnapshot(ctx context.Context, snap storage.Snapshot) (bool, error) {
-	return p.datasetExists(ctx, p.snapshotDataset(snap)), nil
-}
-
-// DeleteSnapshot removes the snapshot, with upstream LINSTOR's
-// "has dependent clones → rename to deferred-delete marker" fallback.
-//
-// `zfs destroy` fails when a clone still references the snapshot
-// (cross-node clone, snapshot-restore-resource); upstream renames
-// the snapshot to `<dataset>@<orig>__DELETED__<unix-ts>` so it
-// disappears from the LINSTOR view while staying on disk to keep
-// the dependent clone alive. When the last clone is destroyed, the
-// marker is swept by DeleteVolume's origin check.
-//
-// Missing snapshot → no-op so the satellite reconciler can strip
-// the Snapshot CRD's finalizer instead of looping on a "dataset
-// does not exist" surface error.
-func (p *Provider) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
-	src := p.snapshotDataset(snap)
-
-	if !p.datasetExists(ctx, src) {
-		return nil
+	dataset, err := p.locateSnapshot(ctx, snap)
+	if errors.Is(err, errAmbiguousSnapshot) {
+		return true, nil
 	}
 
-	out, err := p.exec.Run(ctx, "zfs", "destroy", src)
-	if err == nil {
-		return nil
+	if err != nil {
+		return false, err
 	}
 
-	if !hasDependentClonesError(string(out), err.Error()) {
-		return errors.Wrapf(err, "zfs destroy %s", src)
-	}
-
-	marker := fmt.Sprintf("%s__DELETED__%d", src, time.Now().Unix())
-
-	_, rErr := p.exec.Run(ctx, "zfs", "rename", src, marker)
-	if rErr != nil {
-		return errors.Wrapf(rErr, "zfs rename %s → %s (deferred delete)", src, marker)
-	}
-
-	return nil
-}
-
-// hasDependentClonesError matches zfs destroy's "has dependent
-// clones" error text. ZFS prints it in stdout (combined-output) or
-// stderr depending on the version; both substrings are checked.
-func hasDependentClonesError(stdout, stderr string) bool {
-	return strings.Contains(stdout, "has dependent clones") ||
-		strings.Contains(stderr, "has dependent clones")
+	return dataset != "", nil
 }
 
 // RestoreVolumeFromSnapshot materialises target as a `zfs clone` of
@@ -407,17 +337,30 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 	tgtDS := p.volumeDataset(target)
 
 	if p.datasetExists(ctx, tgtDS) {
+		// A cross-node receive into this zvol may have stopped before it
+		// removed the snapshot it brought.
+		err := p.finishReceive(ctx, tgtDS)
+		if err != nil {
+			return err
+		}
+
 		// Bug 253 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the dataset sparse-thick.
 		return p.ensureRefreservation(ctx, tgtDS)
 	}
 
-	srcDS := p.snapshotDataset(src)
-	if !p.datasetExists(ctx, srcDS) {
-		return errors.Wrapf(storage.ErrNotFound, "snapshot %s for clone", srcDS)
+	// The snapshot may outlive its replica: a replica delete renames a
+	// zvol that has snapshots, and they stay restorable under the new name.
+	srcDS, err := p.locateSnapshot(ctx, src)
+	if err != nil {
+		return err
 	}
 
-	_, err := p.exec.Run(ctx, "zfs", "clone", srcDS, tgtDS)
+	if srcDS == "" {
+		return errors.Wrapf(storage.ErrNotFound, "snapshot %s for clone", p.snapshotDataset(src))
+	}
+
+	_, err = p.exec.Run(ctx, "zfs", "clone", srcDS, tgtDS)
 	if err != nil {
 		return errors.Wrapf(err, "zfs clone %s → %s", srcDS, tgtDS)
 	}
@@ -455,19 +398,14 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 // re-sets refreservation too (in case the peer sender is an old
 // un-patched binary), see RecvSnapshot.
 func (p *Provider) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.ReadCloser, error) {
-	srcDS := p.snapshotDataset(snap)
-	if !p.datasetExists(ctx, srcDS) {
-		return nil, errors.Wrapf(storage.ErrNotFound, "snapshot %s for send", srcDS)
+	argv, err := p.SendSnapshotArgs(ctx, snap)
+	if err != nil {
+		return nil, err
 	}
 
-	// G204 is a false positive here: SendSnapshotArgs is a closed-form
-	// constructor over an internal `storage.Snapshot` (no user-supplied
-	// strings reach argv), and the previous inline call had the same
-	// shape — extracting it into a helper just makes the test seam
-	// explicit. The original `exec.CommandContext(ctx, "zfs", "send",
-	// srcDS)` form did not trip gosec because the third arg was a plain
-	// string literal-concat; the variadic spread now flags it.
-	cmd := exec.CommandContext(ctx, "zfs", p.SendSnapshotArgs(snap)...) //nolint:gosec // G204: argv built from internal Snapshot struct
+	srcDS := argv[len(argv)-1]
+
+	cmd := exec.CommandContext(ctx, "zfs", argv...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -486,9 +424,20 @@ func (p *Provider) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.
 // binary) that SendSnapshot would pass to `exec.CommandContext` for
 // the given snapshot. Exposed so unit tests can assert command-line
 // shape (notably the `-p` flag from Bug 251) without spawning a real
-// `zfs send` process.
-func (p *Provider) SendSnapshotArgs(snap storage.Snapshot) []string {
-	return []string{"send", "-p", p.snapshotDataset(snap)}
+// `zfs send` process. The snapshot is looked up where a replica delete
+// may have left it, under the renamed zvol, the same way a restore and a
+// delete find it.
+func (p *Provider) SendSnapshotArgs(ctx context.Context, snap storage.Snapshot) ([]string, error) {
+	srcDS, err := p.locateSnapshot(ctx, snap)
+	if err != nil {
+		return nil, err
+	}
+
+	if srcDS == "" {
+		return nil, errors.Wrapf(storage.ErrNotFound, "snapshot %s for send", p.snapshotDataset(snap))
+	}
+
+	return []string{"send", "-p", srcDS}, nil
 }
 
 // zfsSendReader bundles the zfs-send process with its stdout pipe
@@ -544,23 +493,57 @@ func (r *zfsSendReader) Close() error {
 // permanently sparse-thick across reconciles. Even on the
 // idempotent-skip path, ensureRefreservation is called so the thick
 // guarantee is restored on every reconcile.
-func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+//
+// The stream is a full send of the source snapshot, so `zfs recv` leaves a
+// copy of that snapshot on the new zvol. No Snapshot of the restored
+// resource names it, so nothing would ever delete it, and a zvol that has a
+// snapshot is renamed rather than destroyed when its replica goes: the
+// restored volume's delete left `_deleted_<zvol>_<time>` and its snapshot
+// behind for good. It is removed once the receive is done, as LINSTOR's
+// clone service removes every snapshot of a volume it filled by send and
+// receive (CloneService.doZFSCloneTargetCleanup). The zvol records its name
+// in receivedSnapshotProp until then, so a receive that stopped half way is
+// finished by the next restore, receive or snapshot of that name.
+func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, source storage.Snapshot, src io.Reader) error {
 	tgtDS := p.volumeDataset(target)
 
-	if p.datasetExists(ctx, tgtDS) {
+	// Strict probe: `zfs recv -F` over a dataset that exists, and the
+	// cleanup below, would both destroy it, so a probe that failed must
+	// not read as "absent".
+	present, err := p.datasetPresent(ctx, tgtDS)
+	if err != nil {
+		return err
+	}
+
+	if present {
+		err = p.finishReceive(ctx, tgtDS)
+		if err != nil {
+			return err
+		}
+
 		// Bug 254 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the recv'd dataset sparse-thick.
 		return p.ensureRefreservation(ctx, tgtDS)
 	}
 
-	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F", tgtDS)
+	// The zvol is created already carrying the name of the snapshot to
+	// remove, so a receive that stops after `zfs recv` still says what it
+	// brought, and a retry finishes the cleanup instead of keeping it.
+	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F",
+		"-o", receivedSnapshotProp+"="+source.SnapshotName, tgtDS)
 	if err != nil {
 		// On failure leave nothing behind — `zfs recv -F` may have
-		// partially created the dataset; nuke it so the next
-		// reconcile re-streams cleanly.
+		// partially created the dataset; destroy it so the next
+		// reconcile re-streams cleanly. It did not exist before this
+		// call, so everything under it came from this stream.
 		_, _ = p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
 
 		return errors.Wrapf(err, "zfs recv %s: %s", tgtDS, strings.TrimSpace(string(out)))
+	}
+
+	err = p.finishReceive(ctx, tgtDS)
+	if err != nil {
+		return err
 	}
 
 	// THICK mode: restore the space guarantee even if the peer sender
@@ -573,187 +556,6 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	}
 
 	return nil
-}
-
-// ListVolumeNames enumerates every zvol in the configured pool that
-// matches the blockstor naming convention `<pool>/<resource>_<vol5digits>`.
-// Used by the orphan-storage sweeper (Bug 43) to find zvols whose
-// owning Resource CRD has been force-deleted without the satellite's
-// DeleteVolume ever running.
-//
-// Skips:
-//   - Datasets outside the configured pool (defensive — `zfs list -r`
-//     with `-d 1` should only return direct children, but the parse
-//     guards anyway).
-//   - Deferred-delete markers (names containing `__DELETED__`) — those
-//     are upstream LINSTOR's "clone still references this snapshot"
-//     gravestones, NOT user volumes; the sweep MUST NOT GC them.
-//   - Datasets whose suffix isn't a 5-digit volume number — we don't
-//     manage hand-created datasets in the pool and silently leaving
-//     them alone is the right call (operator may have placed them
-//     there intentionally).
-func (p *Provider) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
-	// Bug 276 (P1, class-extension of Bug 271/273): the orphan-
-	// storage sweeper ticker calls this on every cycle; a suspended
-	// pool would otherwise wedge the sweep loop forever — same
-	// surface as the other ZFS probe sites.
-	ctx, cancel := withProbeTimeout(ctx)
-	defer cancel()
-
-	out, err := p.exec.Run(ctx, "zfs",
-		"list", "-H", "-r", "-d", "1",
-		"-o", "name", "-t", "volume",
-		p.cfg.Pool)
-	if err != nil {
-		return nil, errors.Wrapf(err, "zfs list pool %s", p.cfg.Pool)
-	}
-
-	refs := make([]storage.VolumeRef, 0)
-
-	prefix := p.cfg.Pool + "/"
-
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		if !strings.HasPrefix(line, prefix) {
-			continue
-		}
-
-		// Skip deferred-delete markers — they look like
-		// `<pool>/<rsc>_00000@<snap>__DELETED__<ts>` and aren't
-		// even zvols (they're tagged volumes by `-t volume` only
-		// because the origin dataset is one). Defensive belt-and-
-		// braces — the filter substring catches the rename pattern
-		// even if upstream's naming shifts a character.
-		if strings.Contains(line, "__DELETED__") {
-			continue
-		}
-
-		base := strings.TrimPrefix(line, prefix)
-
-		resource, vol, ok := parseVolumeName(base)
-		if !ok {
-			continue
-		}
-
-		refs = append(refs, storage.VolumeRef{
-			ResourceName: resource,
-			VolumeNumber: vol,
-		})
-	}
-
-	return refs, nil
-}
-
-// parseVolumeName splits "<resource>_<vol5digits>" into its parts.
-// Returns ok=false when the suffix isn't a 5-digit decimal number;
-// the orphan sweeper relies on that to skip operator-created
-// datasets that happen to share the pool.
-func parseVolumeName(name string) (string, int32, bool) {
-	idx := strings.LastIndex(name, "_")
-	if idx == -1 {
-		return "", 0, false
-	}
-
-	suffix := name[idx+1:]
-	if len(suffix) != volNumberDigits {
-		return "", 0, false
-	}
-
-	n, err := strconv.Atoi(suffix)
-	if err != nil {
-		return "", 0, false
-	}
-
-	// suffix is `volNumberDigits` digits (<=99999), so int->int32 is lossless.
-	return name[:idx], int32(n), true //nolint:gosec // bounded by volNumberDigits=5
-}
-
-// volNumberDigits is the fixed-width digit count blockstor uses for
-// the per-RD volume index in dataset / LV names. Keep in sync with
-// volumeDataset / volumeLVName.
-const volNumberDigits = 5
-
-// promoteDependentClones reparents every clone whose `origin` is a
-// snapshot of dataset `ds` onto itself via `zfs promote`, so `ds`'s
-// snapshots are no longer referenced and `ds` can be destroyed.
-//
-// Why: blockstor's same-node clone is `zfs clone <ds>@<snap> <clone>`,
-// so the clone's origin lives under the source dataset. ZFS blocks
-// `zfs destroy` of a snapshot that still has dependent clones; this is
-// the canonical detach (promote, NOT `destroy -R`, which would take
-// the surviving clone with it).
-//
-// Idempotent + safe with no clones: the `zfs list` enumeration finds
-// nothing and we issue zero promotes. Discovery errors don't bubble
-// — they fall through to the destroy, which surfaces the real
-// "has dependent clones" error if a clone truly blocks it.
-func (p *Provider) promoteDependentClones(ctx context.Context, ds string) error {
-	clones := p.dependentClones(ctx, ds)
-	for _, clone := range clones {
-		_, err := p.exec.Run(ctx, "zfs", "promote", clone)
-		if err != nil {
-			return errors.Wrapf(err, "zfs promote %s", clone)
-		}
-	}
-
-	return nil
-}
-
-// dependentClones lists datasets whose `origin` is a snapshot of `ds`
-// (i.e. origin starts with `<ds>@`). These are the clones that must be
-// promoted before `ds` can be destroyed. Best-effort: any enumeration
-// error yields an empty list (the subsequent destroy still reports the
-// true blocking error).
-func (p *Provider) dependentClones(ctx context.Context, dataset string) []string {
-	out, err := p.exec.Run(ctx, "zfs",
-		"list", "-H", "-o", "name,origin", "-t", "filesystem,volume")
-	if err != nil {
-		return nil
-	}
-
-	prefix := dataset + "@"
-
-	var clones []string
-
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-
-		name, originSnap := fields[0], fields[1]
-		if name == dataset {
-			continue
-		}
-
-		if strings.HasPrefix(originSnap, prefix) {
-			clones = append(clones, name)
-		}
-	}
-
-	return clones
-}
-
-// volumeOrigin reads the zvol's `origin` property — the snapshot
-// dataset name when this volume was created via `zfs clone`, or
-// `-` for a standalone dataset. Returns "" on either case + on any
-// error (best-effort lookup for the deferred-delete sweep).
-func (p *Provider) volumeOrigin(ctx context.Context, ds string) string {
-	out, err := p.exec.Run(ctx, "zfs", "get", "-H", "-o", "value", "origin", ds)
-	if err != nil {
-		return ""
-	}
-
-	value := strings.TrimSpace(string(out))
-	if value == "" || value == "-" {
-		return ""
-	}
-
-	return value
 }
 
 // datasetVolsize reads the zvol's `volsize` property in bytes. Used

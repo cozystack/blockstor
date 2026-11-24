@@ -116,11 +116,29 @@ func (s *Server) handleSnapshotCreateMulti(w http.ResponseWriter, r *http.Reques
 	// controller never sees more siblings than were created).
 	groupSize := clampInt32(len(body.Snapshots))
 
+	created := make([]snapshotRef, 0, len(body.Snapshots))
+
 	for i := range body.Snapshots {
-		results = append(results, s.createOneFromMulti(r.Context(), &body.Snapshots[i], groupID, groupSize))
+		rc := s.createOneFromMulti(r.Context(), &body.Snapshots[i], groupID, groupSize)
+		if rc.RetCode&apiCallRcError == 0 {
+			created = append(created, snapshotRef{rd: body.Snapshots[i].ResourceName, name: body.Snapshots[i].Name})
+		}
+
+		results = append(results, rc)
 	}
 
-	writeJSON(w, http.StatusCreated, results)
+	// Answer once the takes are over, as LINSTOR does: linstor-csi caches
+	// the view it reads right after this call. A batch with a refused
+	// entry is answered at once: its siblings were stamped with the full
+	// GroupSize, so the group never assembles and no take starts until
+	// the controller's suspend deadline aborts it, past the point a
+	// client still waits for the refusal.
+	var failures []apiv1.APICallRc
+	if len(created) == len(body.Snapshots) {
+		failures = takeFailureRcs(created, s.waitSnapshotsSettled(r.Context(), created))
+	}
+
+	writeSnapshotCreateAnswer(w, results, failures)
 }
 
 // clampInt32 narrows a non-negative count to int32, saturating at

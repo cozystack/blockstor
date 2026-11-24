@@ -143,7 +143,7 @@ func TestEveryControllerReconcilerRetriesAConflict(t *testing.T) {
 		"resource state projection": {"pvc-c.n1", func(t *testing.T) reconcile.Reconciler {
 			t.Helper()
 
-			return &controllerpkg.ResourceStateProjectionReconciler{Client: conflictingClient(t)}
+			return &controllerpkg.ResourceStateProjectionReleaseReconciler{Client: conflictingClient(t)}
 		}},
 		"auto-diskful": {"pvc-c", func(t *testing.T) reconcile.Reconciler {
 			t.Helper()

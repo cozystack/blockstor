@@ -24,6 +24,7 @@ package storetest
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -1244,6 +1245,9 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
 		}
 	})
+	t.Run("CreateRefusedOverDrainingReplicas", func(t *testing.T) {
+		testRDCreateRefusedOverDrainingReplicas(t, newStore)
+	})
 	t.Run("GetMissing", func(t *testing.T) {
 		_, err := newStore(t).ResourceDefinitions().Get(t.Context(), "ghost")
 		if !errors.Is(err, store.ErrNotFound) {
@@ -2301,6 +2305,56 @@ func testAnySpellingAddressesOneNode(t *testing.T, newStore Factory) {
 
 	if err := s.Nodes().Create(ctx, &apiv1.Node{Name: "Node-1", Type: apiv1.NodeTypeSatellite}); !errors.Is(err, store.ErrAlreadyExists) {
 		t.Errorf("Create Node-1 over node-1 = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// testRDCreateRefusedOverDrainingReplicas: a definition deleted while one of
+// its nodes is down leaves that node's replica draining under the name. A new
+// definition of the same name is refused until it is gone, as LINSTOR, which
+// keeps the old definition until then, refuses it; a replica that is not
+// being deleted does not hold the name.
+func testRDCreateRefusedOverDrainingReplicas(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-d"}); err != nil {
+		t.Fatalf("Create definition: %v", err)
+	}
+
+	draining := apiv1.Resource{Name: "pvc-d", NodeName: "node-down", Flags: []string{apiv1.ResourceFlagDelete}}
+	if err := s.Resources().Create(ctx, &draining); err != nil {
+		t.Fatalf("Create draining replica: %v", err)
+	}
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-d", NodeName: "node-up"}); err != nil {
+		t.Fatalf("Create orphan replica: %v", err)
+	}
+
+	if err := s.ResourceDefinitions().Delete(ctx, "pvc-d"); err != nil {
+		t.Fatalf("Delete definition: %v", err)
+	}
+
+	err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-d"})
+	if !errors.Is(err, store.ErrDefinitionReplicasDraining) || !errors.Is(err, store.ErrAlreadyExists) {
+		t.Fatalf("Create over a draining replica = %v, want ErrDefinitionReplicasDraining and ErrAlreadyExists", err)
+	}
+
+	if !strings.Contains(err.Error(), "node-down") || strings.Contains(err.Error(), "node-up") {
+		t.Errorf("refusal %q should name the draining replica's node and only it", err)
+	}
+
+	if _, getErr := s.ResourceDefinitions().Get(ctx, "pvc-d"); !errors.Is(getErr, store.ErrNotFound) {
+		t.Errorf("Get after the refused create = %v, want ErrNotFound", getErr)
+	}
+
+	if err := s.Resources().Delete(ctx, "pvc-d", "node-down"); err != nil {
+		t.Fatalf("Delete draining replica: %v", err)
+	}
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-d"}); err != nil {
+		t.Errorf("Create once the draining replica is gone: %v", err)
 	}
 }
 

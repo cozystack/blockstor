@@ -393,8 +393,6 @@ func (*fakeProvider) RestoreVolumeFromSnapshot(context.Context, storage.Volume, 
 	return nil
 }
 
-func (*fakeProvider) ListVolumeNames(context.Context) ([]storage.VolumeRef, error) { return nil, nil }
-
 func (p *fakeProvider) deleteCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -492,7 +490,7 @@ func newWindowRigIn(t *testing.T, stateDir string, kernel *fakeKernel, cli clien
 // windowSnapshot is a Snapshot CR of resource in Phase 1 on n1.
 func windowSnapshot(name, resource string) *blockstoriov1alpha1.Snapshot {
 	return &blockstoriov1alpha1.Snapshot{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Finalizers: []string{SatelliteSnapshotFinalizer}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Finalizers: []string{snapshotNodeFinalizer("n1")}},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: resource,
 			SnapshotName:           strings.TrimPrefix(name, resource+"."),

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
@@ -85,6 +86,33 @@ func CascadeDeleteResources(ctx context.Context, st Store, rdName string) error 
 				return fmt.Errorf("delete replica %s on %s: %w", rdName, children[i].NodeName, err)
 			}
 		}
+	}
+
+	return nil
+}
+
+// MarkDefinitionDeleting flags the definition DELETE before its replicas
+// are walked, the way LINSTOR flags a definition it is deleting. The two
+// `rd d` doors call it ahead of CascadeDeleteResources; a clone rollback
+// does not, because it may keep the definition it cascades.
+//
+// The flag is what tells everything else the definition is going as a
+// whole: the RD reconciler stops creating and removing tiebreakers on it,
+// so a witness does not land between two replica deletes only to be reaped
+// by the next pass, and validate.DefinitionBeingDeleted lifts the mid-sync
+// delete guard, which protects a volume that stays. A definition that is
+// already gone has nothing to mark.
+func MarkDefinitionDeleting(ctx context.Context, st Store, rdName string) error {
+	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
+		func(rd *apiv1.ResourceDefinition) error {
+			if !slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
+				rd.Flags = append(rd.Flags, apiv1.ResourceFlagDelete)
+			}
+
+			return nil
+		})
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("mark %s for deletion: %w", rdName, err)
 	}
 
 	return nil
@@ -203,6 +231,12 @@ func inEverySpelling[T any](
 // CascadeOrphansForLostNode deletes every Resource replica and StoragePool
 // that references the named node, which is what makes a forced node delete
 // leave nothing pointing at an object that is gone.
+//
+// The node is gone, so its satellite never deletes anything: as LINSTOR's
+// `node lost`, the objects are removed and the storage stays on the node.
+// A store whose objects carry satellite finalizers releases them here (see
+// ReplicaAbandoner), since nothing else ever would, and drops the node's hold
+// on the Snapshots it is listed on.
 func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error {
 	spellings, err := NodeSpellings(ctx, st, node)
 	if err != nil {
@@ -214,10 +248,27 @@ func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error
 		return err
 	}
 
+	replicas := st.Resources()
+	abandoner, abandons := replicas.(ReplicaAbandoner)
+
 	for i := range resources {
-		err = st.Resources().Delete(ctx, resources[i].Name, resources[i].NodeName)
+		if abandons {
+			err = abandoner.AbandonReplica(ctx, resources[i].Name, resources[i].NodeName)
+		} else {
+			err = replicas.Delete(ctx, resources[i].Name, resources[i].NodeName)
+		}
+
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return fmt.Errorf("delete replica %s on %s: %w", resources[i].Name, node, err)
+		}
+	}
+
+	if releaser, ok := st.Snapshots().(SnapshotNodeReleaser); ok {
+		for _, spelling := range spellings {
+			err = releaser.ReleaseSnapshotsOnNode(ctx, spelling)
+			if err != nil {
+				return fmt.Errorf("release snapshots on %s: %w", node, err)
+			}
 		}
 	}
 
@@ -226,8 +277,16 @@ func CascadeOrphansForLostNode(ctx context.Context, st Store, node string) error
 		return err
 	}
 
+	poolStore := st.StoragePools()
+	poolAbandoner, abandonsPools := poolStore.(PoolAbandoner)
+
 	for i := range pools {
-		err = st.StoragePools().Delete(ctx, pools[i].NodeName, pools[i].StoragePoolName)
+		if abandonsPools {
+			err = poolAbandoner.AbandonPool(ctx, pools[i].NodeName, pools[i].StoragePoolName)
+		} else {
+			err = poolStore.Delete(ctx, pools[i].NodeName, pools[i].StoragePoolName)
+		}
+
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return fmt.Errorf("delete storage pool %s on %s: %w", pools[i].StoragePoolName, node, err)
 		}
@@ -298,4 +357,134 @@ func ReferencesUnderSpellings(ctx context.Context, st Store, spellings []string)
 	sort.Strings(poolRefs)
 
 	return rscRefs, poolRefs, nil
+}
+
+// SnapshotsOnNode lists, as `<rd>/<snapshot>` and sorted, the snapshots that
+// keep a copy on a node under any of the spellings. Each such node holds the
+// Snapshot until its satellite has deleted that copy, so the node, and the
+// pool the copy lives in, have to stay until then: with the pool gone the
+// copy cannot be deleted, and with the node gone nothing ever runs there.
+func SnapshotsOnNode(ctx context.Context, st Store, spellings []string) ([]string, error) {
+	snapshots, err := st.Snapshots().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+
+	var refs []string
+
+	for i := range snapshots {
+		onNode := slices.ContainsFunc(snapshots[i].Nodes, func(n string) bool {
+			return slices.ContainsFunc(spellings, func(s string) bool { return naming.Same(n, s) })
+		})
+		if onNode {
+			refs = append(refs, snapshots[i].ResourceName+"/"+snapshots[i].Name)
+		}
+	}
+
+	sort.Strings(refs)
+
+	return refs, nil
+}
+
+// SnapshotsInPool is SnapshotsOnNode for a pool delete: the snapshots whose
+// copy on the node is in the pool, as LINSTOR refuses a pool delete over the
+// snapshot-volumes in it. The satellite records the pool of its copy once the
+// copy exists; a copy with no pool recorded yet may be in any diskful pool of
+// the node, so it counts for each of them. A diskless pool, or one that does
+// not exist, holds none.
+func SnapshotsInPool(ctx context.Context, st Store, node, pool string) ([]string, error) {
+	sp, err := st.StoragePools().Get(ctx, node, pool)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("get storage pool %s on %s: %w", pool, node, err)
+	}
+
+	if sp.ProviderKind == apiv1.StoragePoolKindDiskless {
+		return nil, nil
+	}
+
+	spellings, err := NodeSpellings(ctx, st, node)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshots, err := st.Snapshots().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+
+	isNode := func(n string) bool {
+		return slices.ContainsFunc(spellings, func(s string) bool { return naming.Same(n, s) })
+	}
+
+	var refs []string
+
+	for i := range snapshots {
+		if !slices.ContainsFunc(snapshots[i].Nodes, isNode) {
+			continue
+		}
+
+		if copyPool := recordedCopyPool(&snapshots[i], isNode); copyPool != "" && !naming.Same(copyPool, pool) {
+			continue
+		}
+
+		refs = append(refs, snapshots[i].ResourceName+"/"+snapshots[i].Name)
+	}
+
+	sort.Strings(refs)
+
+	return refs, nil
+}
+
+// recordedCopyPool is the pool the satellite recorded for the snapshot's copy
+// on the node, empty while none is recorded.
+func recordedCopyPool(snap *apiv1.Snapshot, isNode func(string) bool) string {
+	for i := range snap.Snapshots {
+		if isNode(snap.Snapshots[i].NodeName) {
+			return snap.Snapshots[i].StoragePool
+		}
+	}
+
+	return ""
+}
+
+// ReplicasInPool returns the `<rd>/<vol_nr>` keys of every volume on the node
+// whose pool is the one named, and `<rd>/spec` for a replica that has not
+// reported volumes yet but already pins the pool in `StorPoolName`. A pool
+// delete is refused on them: a replica whose pool is gone cannot have its
+// storage deleted, so its delete never finishes.
+func ReplicasInPool(ctx context.Context, st Store, node, pool string) ([]string, error) {
+	all, err := st.Resources().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list resources: %w", err)
+	}
+
+	var refs []string
+
+	for i := range all {
+		if !naming.Same(all[i].NodeName, node) {
+			continue
+		}
+
+		matched := false
+
+		for j := range all[i].Volumes {
+			vol := &all[i].Volumes[j]
+			if naming.Same(vol.StoragePool, pool) {
+				refs = append(refs, all[i].Name+"/"+strconv.FormatInt(int64(vol.VolumeNumber), 10))
+				matched = true
+
+				break
+			}
+		}
+
+		if !matched && naming.Same(all[i].Props["StorPoolName"], pool) {
+			refs = append(refs, all[i].Name+"/spec")
+		}
+	}
+
+	return refs, nil
 }

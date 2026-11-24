@@ -89,12 +89,39 @@ const ConditionFilesystemFormatted = "FilesystemFormatted"
 // yet destroyed. Cached from the observer's events2 stream so the
 // reconciler's hot path can skip the `drbdsetup status` round-trip.
 //
-// SAFETY: like other Phase 11.3 Conditions, this is a hot-path
-// optimisation. A stale True value can only cause an extra adjust
-// (idempotent); a stale False causes the legacy probe path which
-// is correct but slow. The authoritative source remains the
-// kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+// SAFETY: for the reconciler, like other Phase 11.3 Conditions, this
+// is a hot-path optimisation. A stale True value can only cause an
+// extra adjust (idempotent); a stale False causes the legacy probe
+// path which is correct but slow. The authoritative source remains
+// the kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+//
+// The reads also answer a replica with no satellite state when this
+// is False, as LINSTOR does a replica whose kernel resource is gone,
+// but only while the stored status carries no disk state and no peer
+// link either. Nothing rewrites the Condition between events2
+// resource frames, so a False that outlived its replica's return
+// stays; every status write the observer makes carries the replica's
+// disk states, which keeps a stale False from hiding a running replica.
 const ConditionKernelLoaded = "KernelLoaded"
+
+// ConditionEncryptionKeyIgnored is stamped True when the parent
+// ResourceDefinition pins its own LUKS key through
+// `spec.encryption.passphraseSecretRef`, a field blockstor declares
+// but does not implement (docs/encryption-keys.md). The volume's
+// password is wrapped under the CLUSTER master key instead, so the
+// operator holds a Secret that opens nothing.
+//
+// It is a Condition rather than a refusal on purpose. Refusing the
+// apply would wedge resource definitions that reconcile correctly
+// today: the field has always been inert, so a cluster may well carry
+// RDs that set it and run fine on the cluster key. Moving a working
+// volume to a failing one to punish a misleading field is the wrong
+// trade in a storage system. The volume keeps working; the object now
+// says why the operator's key is not the one in use.
+//
+// Cleared (False) when the reference is removed, so the Condition
+// tracks the live spec rather than latching on the first sighting.
+const ConditionEncryptionKeyIgnored = "EncryptionKeyIgnored"
 
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the
 // satellite reconciler stamps on a Resource CRD after every successful
@@ -392,6 +419,12 @@ type ResourceStatus struct {
 	// +listMapKey=peerNodeName
 	// +optional
 	Connections []ResourceConnectionStatus `json:"connections,omitempty"`
+
+	// satelliteIncarnation is the node's status.satelliteIncarnation of
+	// the satellite process that wrote the runtime state above. Written
+	// by the satellite observer with that state; do not hand-set.
+	// +optional
+	SatelliteIncarnation string `json:"satelliteIncarnation,omitempty"`
 
 	// conditions represent the current state of the Resource.
 	// +listType=map

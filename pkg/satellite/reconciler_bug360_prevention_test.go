@@ -93,6 +93,12 @@ func TestApplyRefusesCreateMdWhenLocalNodeIDUnresolved(t *testing.T) {
 		t.Errorf("result Ok=true; want false (apply must be deferred until node-id is allocated)")
 	}
 
+	// The refusal is a wait for the controller's stamp, which the
+	// caller tells from a failed apply by this flag, not by the text.
+	if !results[0].GetWaitingForController() {
+		t.Errorf("result WaitingForController=false for %q; want the wait for the node-id flagged", results[0].Message)
+	}
+
 	// No .res file may exist — buildResFile must never have rendered
 	// the ambiguous node-id 0 onto disk.
 	resPath := filepath.Join(dir, "pvc-b360.res")
