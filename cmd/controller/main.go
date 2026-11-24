@@ -43,6 +43,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
 	"github.com/cozystack/blockstor/pkg/apihealth"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/rest"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 	// +kubebuilder:scaffold:imports
@@ -295,11 +296,8 @@ func main() {
 		setupLog.Error(err, "Failed to register runnable", "runnable", "auto-evict")
 		os.Exit(1)
 	}
-	if err := (&controller.MasterKeyRunnable{
-		Client:    mgr.GetClient(),
-		Reader:    mgr.GetAPIReader(),
-		Namespace: controllerNamespace,
-	}).RegisterWithManager(mgr); err != nil {
+	encryptionWatches, err := registerMasterKey(mgr, controllerNamespace)
+	if err != nil {
 		setupLog.Error(err, "Failed to register runnable", "runnable", "master-key")
 		os.Exit(1)
 	}
@@ -345,6 +343,7 @@ func main() {
 			SecretReader: mgr.GetAPIReader(),
 			// As in cmd/apiserver: a snapshot create answers once its take is over.
 			SnapshotTakeWait:   rest.SnapshotTakeWait,
+			StateReader:        encryptionWatches,
 			OnReady:            ready.MarkBound,
 			ResourceReadyWait:  rest.DefaultResourceReadyWait,
 			ResourceDeployWait: rest.DefaultResourceDeployWait,
@@ -397,6 +396,29 @@ func resolveControllerNamespace(flagValue string) string {
 	}
 
 	return "blockstor-system"
+}
+
+// registerMasterKey adds the master-key runnable and the watches it, and
+// the resource view, derive the encryption state from: both derive it
+// over and over, and the watches keep that off the API server while
+// nothing changes.
+func registerMasterKey(mgr ctrl.Manager, namespace string) (*passphrase.WatchedReader, error) {
+	watches, err := passphrase.AddWatchedReader(mgr, namespace)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // AddWatchedReader says what it added
+	}
+
+	err = (&controller.MasterKeyRunnable{
+		Client:    mgr.GetClient(),
+		Reader:    watches,
+		Direct:    mgr.GetAPIReader(),
+		Namespace: namespace,
+	}).RegisterWithManager(mgr)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // RegisterWithManager says what it added
+	}
+
+	return watches, nil
 }
 
 // mustLoadRESTConfig loads the API config with the shortened HTTP/2
