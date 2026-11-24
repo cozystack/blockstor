@@ -20,11 +20,13 @@ package store
 
 import (
 	"context"
+	"slices"
 
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/naming"
 )
 
 // ResolvePeerSlots records on rd, a definition about to be created, the
@@ -130,7 +132,7 @@ func CheckPeerSlotsForNewPeer(ctx context.Context, st Store, rdName, node string
 		return errors.Wrapf(err, "read resource definition %q for its peer slots", rdName)
 	}
 
-	if len(rd.LayerStack) > 0 && !containsLayer(rd.LayerStack, apiv1.LayerKindDRBD) {
+	if len(rd.LayerStack) > 0 && !slices.Contains(rd.LayerStack, apiv1.LayerKindDRBD) {
 		return nil
 	}
 
@@ -150,18 +152,18 @@ func CheckPeerSlotsForNewPeer(ctx context.Context, st Store, rdName, node string
 		replica := &replicas[i]
 		slots := ReplicaPeerSlots(replica.PeerSlots, rd.PeerSlots)
 
-		if replica.NodeName == node {
+		if naming.Same(replica.NodeName, node) {
 			newPeerSlots = slots
 		}
 
 		existing = append(existing, drbd.PeerSlotReplica{
 			Node:      replica.NodeName,
 			Diskful:   !replicaIsDiskless(replica.Flags),
-			PeerSlots: slots,
+			PeerSlots: int(slots),
 		})
 	}
 
-	err = drbd.CheckPeerSlotsForNewPeer(existing, node, newPeerSlots)
+	err = drbd.CheckPeerSlotsForNewPeer(existing, node, int(newPeerSlots))
 	if err != nil {
 		return errors.Wrapf(err, "resource definition %q", rdName)
 	}
@@ -173,25 +175,15 @@ func CheckPeerSlotsForNewPeer(ctx context.Context, st Store, rdName, node string
 // count, else its definition's, which the controller copies onto it,
 // else the 15 a replica of a definition without a count was created
 // with. Zero stands for no count.
-func ReplicaPeerSlots(replica, definition int32) int {
+func ReplicaPeerSlots(replica, definition int32) int32 {
 	switch {
 	case replica > 0:
-		return int(replica)
+		return replica
 	case definition > 0:
-		return int(definition)
+		return definition
 	default:
 		return drbd.LegacyPeerSlots
 	}
-}
-
-func containsLayer(stack []string, kind string) bool {
-	for _, layer := range stack {
-		if layer == kind {
-			return true
-		}
-	}
-
-	return false
 }
 
 // replicaIsDiskless reports a replica that keeps no disk: DISKLESS, or a
