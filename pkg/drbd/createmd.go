@@ -40,13 +40,20 @@ var ErrCreateMDRefused = errors.New("drbdmeta refused to create metadata over th
 // 40 out of check_for_existing_data.
 const drbdmetaRefused = "Operation refused."
 
-// CreateMDWithMaxPeers is CreateMD with the peer-slot count given, and
-// the default activity-log layout.
+// CreateMDWithMaxPeers initialises metadata with the peer-slot count
+// given and the default activity-log layout.
 func (a *Adm) CreateMDWithMaxPeers(ctx context.Context, resource string, maxPeers int) error {
-	return a.CreateMDWithGeometry(ctx, resource, DefaultGeometry().WithMaxPeers(maxPeers))
+	return a.CreateMDWithGeometry(ctx, resource, GeometryForPeerSlots(maxPeers))
 }
 
-// CreateMDWithGeometry is CreateMD with the layout of the metadata given.
+// CreateMDWithGeometry initialises on-disk metadata for the resource in
+// the layout given.
+//
+// `--force` is always passed: a freshly allocated volume may carry
+// leftover signature bytes from its previous tenant, and drbdmeta bails
+// without it. It also overwrites whatever metadata is there, so a caller
+// must know no valid metadata is: the satellite gates the call behind a
+// HasMD probe.
 //
 // The size of internal metadata grows with its peer slots and its activity
 // log, and it sits at the end of the lower disk, so the layout decides how
@@ -120,8 +127,7 @@ type MetadataGeometry struct {
 }
 
 // MetadataMaxPeerSlots is the largest peer-slot count a v09 superblock can
-// carry (DRBD_PEERS_MAX - 1). LINSTOR lets a resource have this many;
-// blockstor creates at most MaxPeers-1.
+// carry (DRBD_PEERS_MAX - 1), and the most LINSTOR lets a definition have.
 const MetadataMaxPeerSlots = 31
 
 // The default activity-log layout drbdmeta uses without --al-stripes and
@@ -132,29 +138,24 @@ const (
 	alStripeUnitKiB       = 4
 )
 
-// DefaultGeometry is the layout blockstor creates metadata with on a lower
-// disk of its own.
-func DefaultGeometry() MetadataGeometry {
+// GeometryForPeerSlots is the layout blockstor creates metadata with on a
+// lower disk of its own: the replica's peer slots and the default
+// activity log, as LINSTOR creates it (DrbdLayer.createMetaData).
+func GeometryForPeerSlots(peerSlots int) MetadataGeometry {
 	return MetadataGeometry{
-		MaxPeers:       MaxPeers - 1,
+		MaxPeers:       peerSlots,
 		ALStripes:      defaultALStripes,
 		ALStripeSize4k: defaultALStripeSize4k,
 		NodeID:         -1,
 	}
 }
 
-// WithMaxPeers returns g with the peer-slot count set.
-func (g MetadataGeometry) WithMaxPeers(maxPeers int) MetadataGeometry {
-	g.MaxPeers = maxPeers
-
-	return g
-}
-
-// Clamped returns g with no more peer slots than blockstor creates. Fewer
-// slots make smaller metadata, so a lower disk laid out for more still holds
-// it; the data area grows by the difference.
-func (g MetadataGeometry) Clamped() MetadataGeometry {
-	g.MaxPeers = min(g.MaxPeers, MaxPeers-1)
+// ClampedTo returns g with no more than peerSlots peer slots, the count
+// the replica creates metadata with. Fewer slots make smaller metadata,
+// so a lower disk laid out for more still holds it; the data area grows
+// by the difference.
+func (g MetadataGeometry) ClampedTo(peerSlots int) MetadataGeometry {
+	g.MaxPeers = min(g.MaxPeers, peerSlots)
 
 	return g
 }

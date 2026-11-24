@@ -2788,7 +2788,7 @@ func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-md-fail_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// drbdadm create-md fails. Bug B.4: per-volume target.
-	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-md-fail/0", drbd.MaxPeers-1),
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-md-fail/0", drbd.LegacyPeerSlots),
 		storage.FakeResponse{Err: errCreateMDFailed})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -2888,7 +2888,7 @@ func TestApplyDRBDLateVDDoesNotPinDiskless(t *testing.T) {
 	// + drbdadm adjust. No drbdadm calls at all on the first pass.
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-late-vd_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late-vd", drbd.MaxPeers-1),
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late-vd", drbd.LegacyPeerSlots),
 		storage.FakeResponse{})
 	fx.Expect("drbdadm adjust pvc-late-vd", storage.FakeResponse{})
 
@@ -3023,7 +3023,7 @@ func TestApplyDRBDAllocatesBackingForLateAddedVolume(t *testing.T) {
 
 	// Per-volume create-md for vol-1 only — vol-0 keeps its existing
 	// GI + bitmap state untouched.
-	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late/1", drbd.MaxPeers-1),
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late/1", drbd.LegacyPeerSlots),
 		storage.FakeResponse{})
 
 	// Kernel slot already loaded (vol-0 is UpToDate from the
@@ -3107,7 +3107,7 @@ func TestApplyDRBDAllocatesBackingForLateAddedVolume(t *testing.T) {
 	}
 
 	// (b) per-volume create-md for vol-1 (the Bug 332 fix).
-	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late/1", drbd.MaxPeers-1)
+	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late/1", drbd.LegacyPeerSlots)
 
 	var sawCreateMDVol1 bool
 
@@ -3126,14 +3126,14 @@ func TestApplyDRBDAllocatesBackingForLateAddedVolume(t *testing.T) {
 	// vol-0's metadata MUST NOT be re-created (would wipe GI + bitmap
 	// → loses claim on replicated data). The per-volume HasMD probe
 	// returned true for vol-0, so create-md on vol-0 is forbidden.
-	forbiddenCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late/0", drbd.MaxPeers-1)
+	forbiddenCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late/0", drbd.LegacyPeerSlots)
 	for _, line := range calls {
 		if line == forbiddenCreateMD {
 			t.Errorf("re-ran create-md on vol-0 despite HasMD=true (would wipe operator-stamped metadata): %v", calls)
 		}
 	}
 
-	rdScopedCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late", drbd.MaxPeers-1)
+	rdScopedCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late", drbd.LegacyPeerSlots)
 	for _, line := range calls {
 		if line == rdScopedCreateMD {
 			t.Errorf("RD-scoped create-md ran (would wipe vol-0 metadata); per-volume scoping required: %v", calls)
@@ -3235,7 +3235,7 @@ func TestApplyLateAddedVolumePerVolumeMetadataRunsDespitePreRenderedRes(t *testi
 		storage.FakeResponse{Err: errDrbdadmDumpMdNoMeta})
 
 	// The fix MUST still create-md vol-1 despite the pre-rendered .res.
-	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race/1", drbd.MaxPeers-1),
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race/1", drbd.LegacyPeerSlots),
 		storage.FakeResponse{})
 
 	fx.Expect("drbdsetup status pvc-race",
@@ -3294,7 +3294,7 @@ func TestApplyLateAddedVolumePerVolumeMetadataRunsDespitePreRenderedRes(t *testi
 
 	calls := fx.CommandLines()
 
-	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race/1", drbd.MaxPeers-1)
+	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race/1", drbd.LegacyPeerSlots)
 	if !slices.Contains(calls, wantCreateMD) {
 		t.Errorf("BUG-048: per-volume create-md for vol-1 SKIPPED despite pre-rendered .res — "+
 			"the late-added volume gets no metadata + no winner seed and wedges Inconsistent; "+
@@ -3302,7 +3302,7 @@ func TestApplyLateAddedVolumePerVolumeMetadataRunsDespitePreRenderedRes(t *testi
 	}
 
 	// vol-0 must NOT be re-created (would wipe its GI + bitmap).
-	forbidden := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race/0", drbd.MaxPeers-1)
+	forbidden := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race/0", drbd.LegacyPeerSlots)
 	if slices.Contains(calls, forbidden) {
 		t.Errorf("re-ran create-md on vol-0 (would wipe operator-stamped metadata): %v", calls)
 	}
@@ -3356,7 +3356,7 @@ func TestApplyLateAddedVolumeWinnerSeedsUpToDate(t *testing.T) {
 		storage.FakeResponse{Err: errDrbdadmDumpMdNoMeta})
 
 	// Per-volume create-md for vol-1 only.
-	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late-win/1", drbd.MaxPeers-1),
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late-win/1", drbd.LegacyPeerSlots),
 		storage.FakeResponse{})
 
 	// Kernel slot already loaded (vol-0 UpToDate). drbdsetup status
@@ -3492,7 +3492,7 @@ func TestApplyLateAddedVolumeNonWinnerTakesSkipInitSync(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("version \"v09\";\nla-size-sect 2048;\n")})
 	fx.Expect("drbdadm dump-md pvc-late-lose/1",
 		storage.FakeResponse{Err: errDrbdadmDumpMdNoMeta})
-	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late-lose/1", drbd.MaxPeers-1),
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late-lose/1", drbd.LegacyPeerSlots),
 		storage.FakeResponse{})
 	fx.Expect("drbdsetup status pvc-late-lose",
 		storage.FakeResponse{Stdout: []byte("pvc-late-lose role:Secondary\n  volume:0 disk:UpToDate\n")})
@@ -3700,7 +3700,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 
 	calls := fx.CommandLines()
 
-	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-seed", drbd.MaxPeers-1))
+	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-seed", drbd.LegacyPeerSlots))
 	setGI := indexOfSetGI(calls, "pvc-seed")
 	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-seed")
 
@@ -3833,7 +3833,7 @@ func TestApplyFirstActivationDiskReplaceInternalMetadata(t *testing.T) {
 	// cluster's eventual peer count, not drbd-utils' default of 7,
 	// or future replicas would fail to attach with
 	// "peer-id out of range".
-	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-w09-replace", drbd.MaxPeers-1)
+	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-w09-replace", drbd.LegacyPeerSlots)
 	wantAdjust := "drbdadm adjust pvc-w09-replace"
 
 	createMD := indexOfPrefix(calls, wantCreateMD)
@@ -4193,7 +4193,7 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 
 			calls := fx.CommandLines()
 
-			createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-zskip", drbd.MaxPeers-1))
+			createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-zskip", drbd.LegacyPeerSlots))
 			setGI := indexOfSetGI(calls, "pvc-zskip")
 			adjust := indexOfPrefix(calls, "drbdadm adjust pvc-zskip")
 
@@ -4335,7 +4335,7 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 	// Ordering: both per-peer set-gi calls land between create-md
 	// and adjust (drbdmeta must not run on a non-existent or
 	// already-attached metadata block).
-	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race", drbd.MaxPeers-1))
+	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race", drbd.LegacyPeerSlots))
 	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-race")
 
 	for _, want := range []string{wantN2, wantN3} {
@@ -4451,7 +4451,7 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	}
 
 	// Every blanket set-gi must land between create-md and adjust.
-	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-blanket", drbd.MaxPeers-1))
+	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-blanket", drbd.LegacyPeerSlots))
 	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-blanket")
 	if createMD < 0 || adjust < 0 {
 		t.Fatalf("missing create-md@%d / adjust@%d in calls: %v", createMD, adjust, calls)
@@ -4553,7 +4553,7 @@ func TestApplyFirstActivationSeedsLocalSlotBug284(t *testing.T) {
 	// Ordering: the local set-gi MUST land between create-md
 	// (which writes the fresh metadata block) and adjust (which
 	// reads the metadata into kernel state).
-	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-b284", drbd.MaxPeers-1))
+	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-b284", drbd.LegacyPeerSlots))
 	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-b284")
 	setGI := slices.Index(calls, wantLocal)
 

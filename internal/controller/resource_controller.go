@@ -71,6 +71,7 @@ const (
 	patchKeyDRBDPort           = "drbdPort"
 	patchKeyDRBDMinor          = "drbdMinor"
 	patchKeySkipInitialSync    = "skipInitialSync"
+	patchKeyPeerSlots          = "peerSlots"
 	resourceDefinitionKindName = "ResourceDefinition"
 )
 
@@ -724,7 +725,7 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 // values on Status. Returns true when Status was changed; the caller
 // requeues so the next reconcile dispatches with the committed values.
 //
-// node-id allocation is the lowest free 0..MaxPeers-1 not held by
+// node-id allocation is the lowest free 0..NodeIDMax not held by
 // any sibling Resource of the same RD — sibling ids stay put, only
 // the unallocated target gets a new value. This is the load-bearing
 // invariant: re-using ids on a different node would re-map DRBD
@@ -1075,6 +1076,18 @@ func (r *ResourceReconciler) allocateResourceSpecFields(
 		target.Spec.SkipInitialSync = &v
 	}
 
+	// The replica's peer slots, copied from the definition as LINSTOR
+	// copies DrbdRscDfnData.peerSlots onto each DrbdRscData it creates,
+	// so a later `rd modify --peer-slots` leaves this replica's metadata
+	// and sizing alone. Stamped in the same patch as the node id, which
+	// the satellite waits for before it creates anything. A replica of a
+	// definition without a count was created with 15 and is stamped so,
+	// which is what the satellite already reads for it. Set-if-nil.
+	if target.Spec.PeerSlots == nil && rd != nil {
+		v := int32(drbd.EffectivePeerSlots(rd.Spec.PeerSlots))
+		target.Spec.PeerSlots = &v
+	}
+
 	return nil
 }
 
@@ -1118,6 +1131,7 @@ func (r *ResourceReconciler) patchResourceSpecIdentities(ctx context.Context, ta
 		patchKeyDRBDNodeID:      target.Spec.DRBDNodeID,
 		patchKeyDRBDPort:        target.Spec.DRBDPort,
 		patchKeySkipInitialSync: target.Spec.SkipInitialSync,
+		patchKeyPeerSlots:       target.Spec.PeerSlots,
 	}}
 
 	patchBytes, err := json.Marshal(body)
@@ -1161,7 +1175,8 @@ func (r *ResourceReconciler) patchResourceStatusIdentities(ctx context.Context, 
 func equalResourceIdentitySpec(a, b *blockstoriov1alpha1.ResourceSpec) bool {
 	return ptrEqI32(a.DRBDNodeID, b.DRBDNodeID) &&
 		ptrEqI32(a.DRBDPort, b.DRBDPort) &&
-		ptrEqBool(a.SkipInitialSync, b.SkipInitialSync)
+		ptrEqBool(a.SkipInitialSync, b.SkipInitialSync) &&
+		ptrEqI32(a.PeerSlots, b.PeerSlots)
 }
 
 func ptrEqBool(a, b *bool) bool {
@@ -2541,7 +2556,7 @@ func (r *ResourceReconciler) allocateNodeIDLocked(ctx context.Context, target *b
 //
 // Tradeoff (acceptable): if a forget-peer is stuck, or a sibling is
 // offline with a stale Status still listing the id, that id stays
-// occupied longer — id-burn is bounded toward drbd.MaxPeers=16. This
+// occupied longer — id-burn is bounded toward drbd.NodeIDMax+1. This
 // is conservative and self-healing; strictly better than the
 // permanent wedge a premature reuse causes.
 func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]int32, error) {

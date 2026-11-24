@@ -31,6 +31,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -210,6 +211,17 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, pcErr.Error())
 
 		return
+	}
+
+	// LINSTOR refuses a group peer-slot count no superblock holds
+	// (ResourceGroups.parsePeerSlots); zero is none.
+	if rg.PeerSlots != 0 {
+		slotsErr := drbd.ValidatePeerSlots(int64(rg.PeerSlots))
+		if slotsErr != nil {
+			writeError(w, http.StatusBadRequest, slotsErr.Error())
+
+			return
+		}
 	}
 
 	err = s.Store.ResourceGroups().Create(r.Context(), &rg)
@@ -395,6 +407,13 @@ func applyRGUpdatePatch(existing, patch *apiv1.ResourceGroup, raw []byte) {
 
 	if patch.Description != "" {
 		existing.Description = patch.Description
+	}
+
+	// `rg modify --peer-slots`: the count definitions spawned from the
+	// group afterwards get, as in LINSTOR; the ones already there keep
+	// theirs.
+	if patch.PeerSlots != 0 {
+		existing.PeerSlots = patch.PeerSlots
 	}
 }
 
@@ -702,6 +721,15 @@ func (s *Server) refuseRGUpdate(
 	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.Props) ||
 		refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.OverrideProps) {
 		return true
+	}
+
+	if patch.PeerSlots != 0 {
+		slotsErr := drbd.ValidatePeerSlots(int64(patch.PeerSlots))
+		if slotsErr != nil {
+			writeError(w, http.StatusBadRequest, slotsErr.Error())
+
+			return true
+		}
 	}
 
 	// Guarding create alone leaves the stack patchable afterwards, which is

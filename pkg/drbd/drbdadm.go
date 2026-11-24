@@ -288,27 +288,6 @@ func (a *Adm) AdjustSkipNetSkipDisk(ctx context.Context, resource string) error 
 	return a.run(ctx, "adjust", "--skip-net", "--skip-disk", resource)
 }
 
-// CreateMD initialises on-disk metadata for the resource. We always use
-// --force: a freshly-allocated LV may carry leftover signature bytes
-// from its previous tenant, and DRBD bails without --force.
-//
-// `--max-peers` is pinned to `MaxPeers - 1` (the kernel counts the
-// local node separately from peers, so a 16-replica RD needs
-// `--max-peers=15`). Without this we'd inherit drbd-utils' default
-// of 7, which silently caps every RD at 8 nodes total regardless of
-// what the allocator says — and a later `drbdadm adjust` on the 9th
-// replica would fail with a confusing "peer-id out of range" error.
-//
-// DANGER: `--force` overwrites whatever metadata is on the underlying
-// disk. Callers MUST guarantee no valid DRBD metadata is already there
-// — `--force` will happily wipe a healthy replica's GI/bitmap state,
-// dropping the node's claim on its replicated data. The satellite's
-// `runFirstActivation` gates the call behind a `HasMD` pre-check so
-// this stays safe across satellite restarts / failed first attempts.
-func (a *Adm) CreateMD(ctx context.Context, resource string) error {
-	return a.CreateMDWithMaxPeers(ctx, resource, MaxPeers-1)
-}
-
 // HasMD reports whether DRBD-9 metadata already exists for the
 // resource. `drbdadm dump-md <res>` exits 0 + prints a multi-line
 // dump when there's a parseable metadata block on the lower disk;
@@ -639,7 +618,7 @@ func (a *Adm) SetGIString(ctx context.Context, resource string, volume int32, de
 // Without it, `del-peer` only severs the kernel connection; the metadata
 // still records the departed peer's GI and bitmap slot. After enough
 // permanent node removals the v09 layout runs out of its
-// `--max-peers=MaxPeers-1` slots and the next replica add fails.
+// `--max-peers` slots and the next replica add fails.
 //
 // The kernel clears the slot in memory on every volume and syncs the
 // metadata itself, and refuses while a connection to that node still

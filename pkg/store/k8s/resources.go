@@ -272,6 +272,9 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// a golinstor REST modify can't strip it and flip the satellite back
 	// to the unsafe day0-skip default (the offline-safety regression).
 	prevSkipInit := existing.Spec.SkipInitialSync
+	// The peer-slot count is controller-stamped and settable once, with
+	// no wire write either.
+	prevPeerSlots := existing.Spec.PeerSlots
 	// The names in spec are the parents' CR names, fixed at Create; the
 	// wire carries the display spellings (see spellings.go).
 	prevRD, prevNode := existing.Spec.ResourceDefinitionName, existing.Spec.NodeName
@@ -279,6 +282,7 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	existing.Spec.Volumes = prevVolumes
 	existing.Spec.DRBDPort = prevPort
 	existing.Spec.DRBDNodeID = prevNodeID
+	existing.Spec.PeerSlots = prevPeerSlots
 	existing.Spec.SkipInitialSync = prevSkipInit
 	existing.Spec.ResourceDefinitionName, existing.Spec.NodeName = prevRD, prevNode
 
@@ -359,12 +363,14 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// Skip-init-sync hardening: carry SkipInitialSync across — see
 		// the matching carry-across in `Update` above.
 		prevSkipInit := existing.Spec.SkipInitialSync
+		prevPeerSlots := existing.Spec.PeerSlots
 		// The CR names in spec: see the matching carry-across in `Update`.
 		prevRD, prevNode := existing.Spec.ResourceDefinitionName, existing.Spec.NodeName
 		existing.Spec = wireToCRDResourceSpec(&wire)
 		existing.Spec.Volumes = prevVolumes
 		existing.Spec.DRBDPort = prevPort
 		existing.Spec.DRBDNodeID = prevNodeID
+		existing.Spec.PeerSlots = prevPeerSlots
 		existing.Spec.SkipInitialSync = prevSkipInit
 		existing.Spec.ResourceDefinitionName, existing.Spec.NodeName = prevRD, prevNode
 
@@ -731,6 +737,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		// and the natural, persistence-free source for it.
 		CreateTimestamp: crdCreateTimestampMs(crd),
 		ApplyFailure:    applyFailureFromStatus(crd.Status.ApplyFailure),
+		PeerSlots:       peerSlotsOf(crd.Spec.PeerSlots),
 	}
 }
 
@@ -769,6 +776,15 @@ func kernelSlotDeparted(status *crdv1alpha1.ResourceStatus) bool {
 	return !slices.ContainsFunc(status.Volumes, func(vol crdv1alpha1.ResourceVolumeStatus) bool {
 		return vol.DiskState != ""
 	})
+}
+
+// peerSlotsOf is a recorded peer-slot count on the wire, zero for none.
+func peerSlotsOf(stored *int32) int32 {
+	if stored == nil {
+		return 0
+	}
+
+	return *stored
 }
 
 // applyFailureFromStatus projects the satellite's last apply error onto
@@ -979,6 +995,14 @@ func layerObjectFromCRD(crd *crdv1alpha1.Resource) *apiv1.ResourceLayer {
 	// CLI renders an empty Conns column for that resource.
 	if top.Type == apiv1.LayerKindDRBD {
 		top.Drbd = drbdLayerFromStatus(&crd.Status)
+
+		// LINSTOR reports the replica's peer slots on its DRBD layer;
+		// one without a recorded count was created with 15.
+		if top.Drbd == nil {
+			top.Drbd = &apiv1.DrbdResourceLayer{}
+		}
+
+		top.Drbd.PeerSlots = int32(drbd.EffectivePeerSlots(crd.Spec.PeerSlots))
 	}
 
 	// Hydrate the STORAGE leaf for diskful replicas — F19 keeps the

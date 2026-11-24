@@ -151,13 +151,13 @@ func TestRealDrbdmetaRecreatesMetadataInTheLayoutItReads(t *testing.T) {
 		t.Fatalf("MetadataGeometry = %+v, %v; want %+v", geometry, err, want)
 	}
 
-	err = adm.CreateMDWithGeometry(ctx, "pvc-1/0", drbd.DefaultGeometry())
+	err = adm.CreateMDWithGeometry(ctx, "pvc-1/0", drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots))
 	// Older drbdmeta names an ext4 without the newer features ext3.
 	if !errors.Is(err, drbd.ErrCreateMDRefused) || !strings.Contains(err.Error(), "Device size would be truncated") {
 		t.Fatalf("create-md with 15 slots over the filesystem = %v, want ErrCreateMDRefused with drbdmeta's reason", err)
 	}
 
-	if err := adm.CreateMDWithGeometry(ctx, "pvc-1/0", geometry.Clamped()); err != nil {
+	if err := adm.CreateMDWithGeometry(ctx, "pvc-1/0", geometry.ClampedTo(drbd.LegacyPeerSlots)); err != nil {
 		t.Fatalf("create-md in the layout read off the superblock: %v", err)
 	}
 }

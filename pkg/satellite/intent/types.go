@@ -153,6 +153,12 @@ type DesiredResource struct {
 	// and lets a future caller tell them apart.
 	SkipInitialSync *bool
 
+	// PeerSlots is the replica's DRBD peer-slot count, the count its
+	// metadata is created with and its lower disk is sized for. nil is
+	// a replica blockstor created before it recorded one, which was
+	// created with 15 (drbd.EffectivePeerSlots reads it so).
+	PeerSlots *int32
+
 	// Deleting is true when this replica or its definition is on its way
 	// out: either carries a deletion timestamp, the replica is flagged
 	// DELETE or DELETING, or the definition is flagged DELETE. A replica that is being deleted is never promoted
@@ -380,6 +386,16 @@ func (x *DesiredResource) GetSkipInitialSync() *bool {
 	}
 
 	return x.SkipInitialSync
+}
+
+// GetPeerSlots returns the replica's recorded peer-slot count, nil when
+// it has none. Nil-safe.
+func (x *DesiredResource) GetPeerSlots() *int32 {
+	if x == nil {
+		return nil
+	}
+
+	return x.PeerSlots
 }
 
 // DesiredVolume describes one of an RD's volumes from the apply

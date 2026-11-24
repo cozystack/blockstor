@@ -283,7 +283,7 @@ func TestCreateMDWithCollisionRecoveryFreesForeignZombie(t *testing.T) {
 		Adm: drbd.NewAdm(seq),
 	})
 
-	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol", drbd.DefaultGeometry())
+	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol", drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots))
 	if err != nil {
 		t.Fatalf("createMDWithCollisionRecovery: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestCreateMDWithCollisionRecoveryRefusesSelfTearDown(t *testing.T) {
 		Adm: drbd.NewAdm(fx),
 	})
 
-	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol", drbd.DefaultGeometry())
+	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol", drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots))
 	if err == nil {
 		t.Fatalf("createMDWithCollisionRecovery: expected error on self-owned collision, got nil")
 	}

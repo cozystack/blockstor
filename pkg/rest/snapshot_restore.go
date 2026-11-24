@@ -1441,6 +1441,9 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		ResourceGroupName: srcRDObj.ResourceGroupName,
 		Props:             store.TravellingProps(snap.Props),
 		LayerStack:        stack,
+		// The source's peer slots, which LINSTOR restores from the
+		// snapshot's DRBD layer (RscDrbdLayerHelper.restoreRscDfnData).
+		PeerSlots: int32(store.ReplicaPeerSlots(0, srcRDObj.PeerSlots)),
 	}
 
 	if newRD.Props == nil {

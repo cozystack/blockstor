@@ -404,7 +404,7 @@ func (r *Reconciler) teardownKernelSlot(
 
 	// forget-peer clears the peer's slot on every volume at once,
 	// through the kernel. Errors are non-fatal: a leaked slot eats one
-	// of the MaxPeers-1 budget entries and the next reconcile retries,
+	// of the peer-slot budget entries and the next reconcile retries,
 	// while del-peer above already closed the kernel connection.
 	if !forget {
 		return nil

@@ -117,6 +117,25 @@ type ResourceDefinitionSpec struct {
 	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value()",optionalOldSelf=true,message="drbdPort is settable-once"
 	DRBDPort *int32 `json:"drbdPort,omitempty"`
 
+	// peerSlots is the DRBD peer-slot count new replicas of this
+	// definition get, LINSTOR's DrbdRscDfnData.peerSlots. A replica
+	// keeps one bitmap per slot and a peer with a disk takes one, so a
+	// definition holds one replica with a disk more than its slots.
+	//
+	// Resolved once when the definition is created, as LINSTOR resolves
+	// it when the definition's DRBD layer is created: the count the
+	// request names, else the group's peerSlots, else the
+	// PeerSlotsNewResource property of the definition, its group or the
+	// controller, else 7. `rd modify --peer-slots` changes it for
+	// replicas created afterwards.
+	//
+	// Unset means a definition created before blockstor recorded a
+	// count, whose replicas were all created with 15; it is read as 15.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=31
+	PeerSlots *int32 `json:"peerSlots,omitempty"`
+
 	// initialized is the durable "this RD has completed its initial
 	// replica-set establishment and now holds (or has held) committed
 	// data" latch. The controller flips it true ONCE, append-only, the

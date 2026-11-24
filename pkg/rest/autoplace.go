@@ -681,6 +681,14 @@ func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdNam
 			return nil, false
 		}
 
+		// A replica the definition has no peer slot for is refused the
+		// way the resource create refuses it.
+		if errors.Is(err, store.ErrInsufficientPeerSlots) {
+			writeStoreError(w, err)
+
+			return nil, false
+		}
+
 		writeError(w, http.StatusInternalServerError, err.Error())
 
 		return nil, false
@@ -1713,6 +1721,19 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 	// remains 13 GiB.
 	if !s.rejectResourceCreateIfPoolFull(w, r, rdName, &res) {
 		return nil, false
+	}
+
+	// A replica with a disk takes a DRBD peer slot on every replica of
+	// the definition; LINSTOR refuses one the slots cannot hold
+	// (CtrlRscCrtApiHelper.checkPeerSlotsForNewPeer), and so does this,
+	// for a new replica and for a witness promoted to one alike.
+	if !isDisklessReplica(&res) {
+		err := store.CheckPeerSlotsForNewPeer(r.Context(), s.Store, rdName, res.NodeName)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return nil, false
+		}
 	}
 
 	out, ok := s.createOrPromoteResource(w, r, &res)

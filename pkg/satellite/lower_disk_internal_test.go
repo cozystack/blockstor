@@ -161,7 +161,7 @@ func TestGrowLowerDisk(t *testing.T) {
 func TestLUKSUnderDRBDMatchesLinstor(t *testing.T) {
 	t.Parallel()
 
-	geometry := drbd.DefaultGeometry().WithMaxPeers(7)
+	geometry := drbd.GeometryForPeerSlots(drbd.DefaultPeerSlots)
 
 	storage := drbd.InternalMetadataGrossKiB(20971520, geometry) + luks.HeaderKiB
 	storage = (storage + 15) / 16 * 16
@@ -174,10 +174,19 @@ func TestLUKSUnderDRBDMatchesLinstor(t *testing.T) {
 		t.Fatalf("DRBD device: got %d sectors, want 41943056", dev*2)
 	}
 
-	got := lowerDiskKib(&intent.DesiredResource{LayerStack: []string{"DRBD", "LUKS", "STORAGE"}},
+	seven := int32(drbd.DefaultPeerSlots)
+
+	got := lowerDiskKib(&intent.DesiredResource{LayerStack: []string{"DRBD", "LUKS", "STORAGE"}, PeerSlots: &seven},
+		&intent.DesiredVolume{SizeKib: 20971520})
+	if got != 20976040+luks.HeaderKiB {
+		t.Fatalf("lowerDiskKib under LUKS with 7 peer slots: got %d, want LINSTOR's %d before the volblocksize",
+			got, 20976040+luks.HeaderKiB)
+	}
+
+	got = lowerDiskKib(&intent.DesiredResource{LayerStack: []string{"DRBD", "LUKS", "STORAGE"}},
 		&intent.DesiredVolume{SizeKib: 20971520, DeviceSizeKib: 20971528})
-	if want := drbd.InternalMetadataGrossKiB(20971528, drbd.DefaultGeometry()) + luks.HeaderKiB; got != want {
-		t.Fatalf("lowerDiskKib under LUKS: got %d, want %d", got, want)
+	if want := drbd.InternalMetadataGrossKiB(20971528, drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots)) + luks.HeaderKiB; got != want {
+		t.Fatalf("lowerDiskKib under LUKS without a recorded count: got %d, want %d", got, want)
 	}
 }
 

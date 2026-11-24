@@ -852,6 +852,11 @@ func (in *ResourceDefinitionSpec) DeepCopyInto(out *ResourceDefinitionSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.PeerSlots != nil {
+		in, out := &in.PeerSlots, &out.PeerSlots
+		*out = new(int32)
+		**out = **in
+	}
 	if in.Initialized != nil {
 		in, out := &in.Initialized, &out.Initialized
 		*out = new(bool)
@@ -1211,6 +1216,11 @@ func (in *ResourceSpec) DeepCopyInto(out *ResourceSpec) {
 	}
 	if in.DRBDNodeID != nil {
 		in, out := &in.DRBDNodeID, &out.DRBDNodeID
+		*out = new(int32)
+		**out = **in
+	}
+	if in.PeerSlots != nil {
+		in, out := &in.PeerSlots, &out.PeerSlots
 		*out = new(int32)
 		**out = **in
 	}

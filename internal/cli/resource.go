@@ -26,6 +26,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
 )
@@ -167,7 +168,27 @@ func toggleDiskful(ctx context.Context, run *runContext, node, rdName string) er
 		return setDiskless(ctx, run, node, rdName, true)
 	}
 
+	if wasDiskless {
+		err = checkPeerSlotFor(ctx, run, rdName, node)
+		if err != nil {
+			return err
+		}
+	}
+
 	return setDiskless(ctx, run, node, rdName, false)
+}
+
+// checkPeerSlotFor refuses a disk for the replica on node that its
+// definition has no DRBD peer slot left for, as LINSTOR's resource
+// create, toggle-disk and migrate-disk refuse it
+// (store.CheckPeerSlotsForNewPeer).
+func checkPeerSlotFor(ctx context.Context, run *runContext, rdName, node string) error {
+	err := store.CheckPeerSlotsForNewPeer(ctx, run.Store, rdName, node)
+	if err != nil {
+		return fmt.Errorf("a disk for %s on %s: %w", rdName, node, err)
+	}
+
+	return nil
 }
 
 // checkDemotable refuses a demotion that would leave the definition
@@ -258,13 +279,21 @@ func migrateDisk(ctx context.Context, run *runContext, dst, rdName string) error
 			rdName, src, errSourceInUse)
 	}
 
-	_, err = run.Store.Resources().Get(ctx, rdName, dst)
-	if isNotFound(err) {
-		return createMigrationTarget(ctx, run, dst, rdName, pool, src)
+	dstRes, err := run.Store.Resources().Get(ctx, rdName, dst)
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("get resource %s on %s: %w", rdName, dst, err)
 	}
 
-	if err != nil {
-		return fmt.Errorf("get resource %s on %s: %w", rdName, dst, err)
+	// The destination joins with a disk while the source keeps its own.
+	if err != nil || slices.Contains(dstRes.Flags, apiv1.ResourceFlagDiskless) {
+		slotErr := checkPeerSlotFor(ctx, run, rdName, dst)
+		if slotErr != nil {
+			return slotErr
+		}
+	}
+
+	if isNotFound(err) {
+		return createMigrationTarget(ctx, run, dst, rdName, pool, src)
 	}
 
 	return patchResource(ctx, run, dst, rdName, func(res *apiv1.Resource) {
