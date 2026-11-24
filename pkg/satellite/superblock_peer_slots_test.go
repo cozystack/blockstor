@@ -29,6 +29,9 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
+// errDumpFailed is a dump-md that exits non-zero.
+var errDumpFailed = errors.New("exit status 10")
+
 // A replica adopted from LINSTOR by a linstor-migrate older than the
 // count records none, and its superblock holds LINSTOR's 7 slots, not the
 // 15 blockstor created its own replicas with. Asked for it, the apply
@@ -70,7 +73,7 @@ func TestSuperblockPeerSlots(t *testing.T) {
 		{"grow pending", true, nil, 1 << 20, &intent.ResourceApplyResult{Ok: true, GrowPending: true}, fifteen, 0, false},
 		{"pass failed", true, nil, 1 << 20, &intent.ResourceApplyResult{}, fifteen, 0, false},
 		{"diskless", true, []string{"DISKLESS"}, 1 << 20, passed, fifteen, 0, false},
-		{"a volume unreadable", true, nil, 1 << 20, passed, storage.FakeResponse{Err: errors.New("exit status 10")}, 0, true},
+		{"a volume unreadable", true, nil, 1 << 20, passed, storage.FakeResponse{Err: errDumpFailed}, 0, true},
 	}
 
 	for _, tc := range cases {

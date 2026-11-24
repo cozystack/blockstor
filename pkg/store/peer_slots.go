@@ -156,13 +156,13 @@ func CheckPeerSlotsForNewPeers(ctx context.Context, st Store, rdName string, nod
 		// placement takes over, keeps the count its metadata will be
 		// created with; a new one gets the definition's.
 		slots := int(ReplicaPeerSlots(0, rd.PeerSlots))
-		at := slices.IndexFunc(existing, func(replica drbd.PeerSlotReplica) bool {
+		found := slices.IndexFunc(existing, func(replica drbd.PeerSlotReplica) bool {
 			return node != "" && naming.Same(replica.Node, node)
 		})
 
-		if at >= 0 {
-			name = existing[at].Node
-			slots = existing[at].PeerSlots
+		if found >= 0 {
+			name = existing[found].Node
+			slots = existing[found].PeerSlots
 		}
 
 		err = drbd.CheckPeerSlotsForNewPeer(existing, name, slots)
@@ -170,8 +170,8 @@ func CheckPeerSlotsForNewPeers(ctx context.Context, st Store, rdName string, nod
 			return errors.Wrapf(err, "resource definition %q", rdName)
 		}
 
-		if at >= 0 {
-			existing[at].Diskful = true
+		if found >= 0 {
+			existing[found].Diskful = true
 
 			continue
 		}
