@@ -980,6 +980,25 @@ func upsertPerNodeStatus(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, no
 	return out
 }
 
+// resumeBeforeDelete closes this node's window, or resumes a suspend an
+// earlier window left behind, before the snapshot goes: a deleted CR is
+// the one signal the watchdog cannot read back. A resume that is not
+// confirmed is left to the watchdog.
+func (r *SnapshotReconciler) resumeBeforeDelete(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) {
+	var err error
+
+	if w := r.windowsFor().get(snap.Name); w != nil {
+		err = r.closeWindow(ctx, snap.Name, false, "")
+	} else if marker, ok := r.readMarker(snap.Name); ok {
+		err = r.resumeLeftover(ctx, &marker)
+	}
+
+	if err != nil {
+		log.FromContext(ctx).Info("resume before delete not confirmed; the watchdog retries it",
+			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+	}
+}
+
 // handleDelete mirrors handleCreate for the DeletionTimestamp
 // case. Drives `Apply.DeleteSnapshot` (which routes to the
 // provider's `DeleteSnapshot` — `zfs destroy …@<snap>` for ZFS,
@@ -1011,25 +1030,11 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 		return ctrl.Result{}, nil
 	}
 
-	// Close this node's window before the snapshot goes: a deleted CR
-	// is the one signal the watchdog cannot read back. The resume does
-	// not wait for the take; the delete does. A take still running,
-	// even one whose window the watchdog already closed, would create
-	// the storage snapshot after the delete, and nothing would remove
-	// it once the finalizer is gone.
-	if w := r.windowsFor().get(snap.Name); w != nil {
-		err := r.closeWindow(ctx, snap.Name, false, "")
-		if err != nil {
-			log.FromContext(ctx).Info("resume before delete not confirmed; the watchdog retries it",
-				"snapshot", snap.Spec.SnapshotName, "error", err.Error())
-		}
-	} else if marker, ok := r.readMarker(snap.Name); ok {
-		err := r.resumeLeftover(ctx, &marker)
-		if err != nil {
-			log.FromContext(ctx).Info("resume before delete not confirmed; the watchdog retries it",
-				"snapshot", snap.Spec.SnapshotName, "error", err.Error())
-		}
-	}
+	// The resume does not wait for the take; the delete does. A take
+	// still running, even one whose window the watchdog already closed,
+	// would create the storage snapshot after the delete, and nothing
+	// would remove it once the finalizer is gone.
+	r.resumeBeforeDelete(ctx, snap)
 
 	if r.takeInFlight(snap.Name) {
 		return ctrl.Result{RequeueAfter: snapshotResumeRetry}, nil
